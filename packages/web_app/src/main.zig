@@ -4,6 +4,7 @@ const std = @import("std");
 
 const config_mod = @import("config.zig");
 const daemon_mod = @import("daemon.zig");
+const directory_browser = @import("directory_browser.zig");
 const http_mod = @import("http.zig");
 const mock = @import("mock.zig");
 const theme_mod = @import("theme.zig");
@@ -40,6 +41,7 @@ test {
     std.testing.refAllDecls(@This());
     _ = config_mod;
     _ = daemon_mod;
+    _ = directory_browser;
     _ = http_mod;
     _ = mock;
     _ = theme_mod;

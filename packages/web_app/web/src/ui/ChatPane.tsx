@@ -3,7 +3,7 @@ import { marked } from 'marked'
 
 import { store } from '../lib/store'
 import { type LivePane, type Message } from '../lib/types'
-import { effortLabel, effortOptionsIn, modelOptionsFor, variantOptionsIn } from '../lib/models'
+import { effortLabel, effortOptionsIn, modelOptionsFor, modelSupportsFast, variantOptionsIn } from '../lib/models'
 import { ProviderGlyph, ZoomButton } from './Icons'
 
 marked.setOptions({ gfm: true, breaks: true })
@@ -768,33 +768,64 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
 /// Composer model + reasoning pickers: desktop-parity dropdowns over the
 /// static provider tables in lib/models.ts. Selecting persists onto the
 /// daemon thread and applies from the next turn.
+const PROVIDER_OPTIONS = [
+  { value: 'codex', label: 'Codex' },
+  { value: 'claude', label: 'Claude' },
+  { value: 'cursor', label: 'Cursor' },
+  { value: 'opencode', label: 'OpenCode' },
+] as const
+
 function ComposerPickers(props: { pane: LivePane }) {
-  const [open, setOpen] = createSignal<'model' | 'effort' | 'variant' | null>(null)
+  const [open, setOpen] = createSignal<'model' | 'effort' | 'variant' | 'fast' | 'access' | null>(null)
+  const [pickerProvider, setPickerProvider] = createSignal(props.pane.provider ?? 'codex')
   // Daemon catalog (provider.models.list) when the provider is reachable,
   // otherwise the static desktop-parity tables.
   createEffect(() => store.ensureProviderModels(props.pane.provider))
-  const models = () => store.providerModels(props.pane.provider) ?? modelOptionsFor(props.pane.provider)
+  createEffect(() => store.ensureProviderModels(pickerProvider()))
+  const modelsFor = (provider: string | null | undefined) =>
+    store.providerModels(provider) ?? modelOptionsFor(provider)
+  const models = () => modelsFor(props.pane.provider)
   const efforts = () => effortOptionsIn(models(), props.pane.model)
   const variants = () => variantOptionsIn(models(), props.pane.model)
+  const selectedModel = () => models().find((option) => option.value === props.pane.model) ?? models()[0]
+  const showsFast = () => modelSupportsFast(props.pane.provider, selectedModel())
+  // Match desktop: only a fresh, never-sent thread may switch providers.
+  const allowsProviderChoice = () =>
+    store.messagesFor(props.pane).length === 0 &&
+    !props.pane.provider_thread_id &&
+    !store.paneWorking(props.pane)
   const currentModelLabel = () => {
     const match = models().find((option) => option.value === props.pane.model)
-    return match?.label ?? shortModel(props.pane.model)
+    return match?.label ?? models()[0]?.label ?? shortModel(props.pane.model)
   }
-  const pickModel = (value: string) => {
+  const toggleModelPicker = () => {
+    if (open() === 'model') {
+      setOpen(null)
+      return
+    }
+    setPickerProvider(props.pane.provider ?? 'codex')
+    setOpen('model')
+  }
+  const pickModel = (provider: string, value: string) => {
     setOpen(null)
-    if (value === props.pane.model) return
+    const provider_changed = provider !== props.pane.provider
+    if (!provider_changed && value === props.pane.model) return
     // A model switch can invalidate the stored effort/variant (e.g. Claude →
     // Haiku), so re-clamp both against the new model, like the desktop.
-    const next = models().find((option) => option.value === value)
-    const effort_still_valid = (next?.efforts ?? []).some(
+    const next = modelsFor(provider).find((option) => option.value === value)
+    const effort_still_valid = !provider_changed && (next?.efforts ?? []).some(
       (option) => option.value === (props.pane.reasoning_effort ?? null),
     )
     const variant_still_valid =
-      !props.pane.reasoning_variant || (next?.variants ?? []).includes(props.pane.reasoning_variant)
+      !provider_changed &&
+      (!props.pane.reasoning_variant || (next?.variants ?? []).includes(props.pane.reasoning_variant))
+    const fast_still_valid = modelSupportsFast(provider, next)
     void store.updateThreadSettings(props.pane, {
+      ...(provider_changed ? { provider } : {}),
       model_ref: value,
       ...(effort_still_valid ? {} : { reasoning_effort: null }),
       ...(variant_still_valid ? {} : { reasoning_variant: null }),
+      ...(fast_still_valid ? {} : { fast_mode: 'off' }),
     })
   }
   const pickEffort = (value: string | null) => {
@@ -806,6 +837,16 @@ function ComposerPickers(props: { pane: LivePane }) {
     setOpen(null)
     if (value === (props.pane.reasoning_variant ?? null)) return
     void store.updateThreadSettings(props.pane, { reasoning_variant: value })
+  }
+  const pickFast = (value: 'off' | 'on') => {
+    setOpen(null)
+    if ((props.pane.fast_mode ? 'on' : 'off') === value) return
+    void store.updateThreadSettings(props.pane, { fast_mode: value })
+  }
+  const pickAccess = (value: 'supervised' | 'full_access') => {
+    setOpen(null)
+    if ((props.pane.access_mode ?? 'supervised') === value) return
+    void store.updateThreadSettings(props.pane, { access_mode: value })
   }
   const menuClass =
     'absolute bottom-full left-0 z-30 mb-1.5 max-h-[50vh] min-w-[12rem] overflow-y-auto rounded-[10px] border border-[var(--border-muted)] bg-[var(--panel)] py-1 shadow-lg'
@@ -828,8 +869,8 @@ function ComposerPickers(props: { pane: LivePane }) {
           type="button"
           class="flex items-center gap-1.5 rounded-full bg-[var(--panel-alt)] px-2.5 py-1 text-[12px] text-[var(--text-muted)]"
           disabled={models().length === 0}
-          onClick={() => setOpen(open() === 'model' ? null : 'model')}
-          aria-label="Choose model"
+          onClick={toggleModelPicker}
+          aria-label="Choose provider and model"
         >
           <ProviderGlyph provider={props.pane.provider} class="h-4 w-4 object-contain" />
           <span class="max-w-[9rem] truncate">{currentModelLabel()}</span>
@@ -838,14 +879,52 @@ function ComposerPickers(props: { pane: LivePane }) {
           </Show>
         </button>
         <Show when={open() === 'model'}>
-          <div class={menuClass} role="menu">
-            <For each={models()}>
-              {(option) => (
-                <button type="button" class={rowClass(option.value === props.pane.model)} onClick={() => pickModel(option.value)}>
-                  {option.label}
-                </button>
-              )}
-            </For>
+          <div
+            class="absolute bottom-full left-0 z-30 mb-1.5 flex max-h-[55vh] min-w-[25rem] overflow-hidden rounded-[10px] border border-[var(--border-muted)] bg-[var(--panel)] shadow-lg max-sm:min-w-[calc(100vw-3rem)]"
+            role="menu"
+          >
+            <Show when={allowsProviderChoice()}>
+              <div class="w-[9rem] shrink-0 border-r border-[var(--border-muted)] p-1">
+                <For each={PROVIDER_OPTIONS}>
+                  {(provider) => (
+                    <button
+                      type="button"
+                      class={`flex w-full items-center gap-2 rounded-[6px] px-2.5 py-2 text-left text-[13px] ${
+                        pickerProvider() === provider.value
+                          ? 'bg-[var(--accent-row)] text-[var(--text)]'
+                          : 'text-[var(--text-muted)] hover:bg-[var(--accent-hover)]'
+                      }`}
+                      onClick={() => setPickerProvider(provider.value)}
+                    >
+                      <ProviderGlyph provider={provider.value} class="h-4 w-4 object-contain" />
+                      <span>{provider.label}</span>
+                    </button>
+                  )}
+                </For>
+              </div>
+            </Show>
+            <div class="min-w-0 flex-1 overflow-y-auto py-1">
+              <div class="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wide text-[var(--text-subtle)]">
+                {PROVIDER_OPTIONS.find((provider) => provider.value === pickerProvider())?.label ?? pickerProvider()}
+              </div>
+              <For
+                each={modelsFor(allowsProviderChoice() ? pickerProvider() : props.pane.provider)}
+                fallback={<p class="px-3 py-4 text-xs text-[var(--text-subtle)]">No models available.</p>}
+              >
+                {(option) => {
+                  const provider = () => allowsProviderChoice() ? pickerProvider() : (props.pane.provider ?? 'codex')
+                  return (
+                    <button
+                      type="button"
+                      class={rowClass(provider() === props.pane.provider && option.value === props.pane.model)}
+                      onClick={() => pickModel(provider(), option.value)}
+                    >
+                      {option.label}
+                    </button>
+                  )
+                }}
+              </For>
+            </div>
           </div>
         </Show>
       </div>
@@ -908,6 +987,58 @@ function ComposerPickers(props: { pane: LivePane }) {
           </Show>
         </div>
       </Show>
+      <Show when={showsFast()}>
+        <div class="relative">
+          <button
+            type="button"
+            class="flex items-center gap-1 rounded-full bg-[var(--panel-alt)] px-2.5 py-1 text-[12px] text-[var(--text-muted)]"
+            onClick={() => setOpen(open() === 'fast' ? null : 'fast')}
+            aria-label="Choose service speed"
+          >
+            {props.pane.fast_mode ? 'Fast' : 'Default speed'}
+            <span aria-hidden="true" class="text-[10px]">▾</span>
+          </button>
+          <Show when={open() === 'fast'}>
+            <div class={menuClass} role="menu">
+              <button type="button" class={rowClass(!props.pane.fast_mode)} onClick={() => pickFast('off')}>
+                Default
+              </button>
+              <button type="button" class={rowClass(props.pane.fast_mode === true)} onClick={() => pickFast('on')}>
+                Fast
+              </button>
+            </div>
+          </Show>
+        </div>
+      </Show>
+      <div class="relative">
+        <button
+          type="button"
+          class="flex items-center gap-1 rounded-full bg-[var(--panel-alt)] px-2.5 py-1 text-[12px] text-[var(--text-muted)]"
+          onClick={() => setOpen(open() === 'access' ? null : 'access')}
+          aria-label="Choose permissions"
+        >
+          {props.pane.access_mode === 'full_access' ? 'Full access' : 'Supervised'}
+          <span aria-hidden="true" class="text-[10px]">▾</span>
+        </button>
+        <Show when={open() === 'access'}>
+          <div class={menuClass} role="menu">
+            <button
+              type="button"
+              class={rowClass((props.pane.access_mode ?? 'supervised') === 'supervised')}
+              onClick={() => pickAccess('supervised')}
+            >
+              Supervised
+            </button>
+            <button
+              type="button"
+              class={rowClass(props.pane.access_mode === 'full_access')}
+              onClick={() => pickAccess('full_access')}
+            >
+              Full access
+            </button>
+          </div>
+        </Show>
+      </div>
     </>
   )
 }

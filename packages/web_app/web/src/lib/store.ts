@@ -76,6 +76,11 @@ function mintId(prefix: string): string {
   return `${prefix}${Date.now()}-${hex}`
 }
 
+function methodUnavailable(response: { error?: { code: string } }): boolean {
+  const code = response.error?.code
+  return code === 'unknown_method' || code === 'method_not_found' || code === 'capability_unavailable'
+}
+
 function stablePaneId(kind: 'chat' | 'term' | 'browser', key: string): number {
   let hash = 2166136261
   const input = `${kind}:${key}`
@@ -107,6 +112,65 @@ function threadListFrom(raw: unknown): Thread[] {
   if (listed.length > 0) return listed
   if (Array.isArray(result)) return result as Thread[]
   return []
+}
+
+const THREAD_SETTING_KEYS = [
+  'reasoning_effort',
+  'reasoning_variant',
+  'fast_mode',
+  'access_mode',
+] as const satisfies ReadonlyArray<keyof Thread>
+const THREAD_SETTINGS_CACHE_KEY = 'verde:web:thread-settings:v1'
+
+type CachedThreadSettings = Pick<Thread, (typeof THREAD_SETTING_KEYS)[number]>
+type ThreadSettingsCache = Record<string, Record<string, CachedThreadSettings>>
+
+function readThreadSettingsCache(): ThreadSettingsCache {
+  try {
+    const raw = localStorage.getItem(THREAD_SETTINGS_CACHE_KEY)
+    return raw ? (JSON.parse(raw) as ThreadSettingsCache) : {}
+  } catch {
+    return {}
+  }
+}
+
+function cachedThreadSettings(workspaceId: string, threadId: string): CachedThreadSettings | undefined {
+  return readThreadSettingsCache()[workspaceId]?.[threadId]
+}
+
+function rememberThreadSettings(workspaceId: string, threadId: string, settings: CachedThreadSettings) {
+  try {
+    const cache = readThreadSettingsCache()
+    cache[workspaceId] = { ...(cache[workspaceId] ?? {}), [threadId]: settings }
+    localStorage.setItem(THREAD_SETTINGS_CACHE_KEY, JSON.stringify(cache))
+  } catch {
+    // Storage can be unavailable in hardened/private browser contexts.
+  }
+}
+
+/// Older daemons persisted run controls but omitted them from chat.thread.list.
+/// Keep the values from the preceding core.snapshot (or an optimistic click)
+/// when enriching that snapshot with the bounded thread catalog.
+function mergeThreadCatalogSettings(
+  workspaceId: string,
+  listed: Thread[],
+  snapshot: Thread[] | undefined,
+  previous: Thread[] | undefined,
+): Thread[] {
+  return listed.map((thread) => {
+    const source =
+      snapshot?.find((row) => row.local_thread_id === thread.local_thread_id) ??
+      previous?.find((row) => row.local_thread_id === thread.local_thread_id)
+    const cached = cachedThreadSettings(workspaceId, thread.local_thread_id)
+    if (!source && !cached) return thread
+    const merged = { ...thread }
+    for (const key of THREAD_SETTING_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(thread, key)) continue
+      if (source && Object.prototype.hasOwnProperty.call(source, key)) merged[key] = source[key] as never
+      else if (cached && Object.prototype.hasOwnProperty.call(cached, key)) merged[key] = cached[key] as never
+    }
+    return merged
+  })
 }
 
 function mapTranscriptRows(raw: unknown, fallbackId: string): Message[] {
@@ -197,6 +261,7 @@ interface PersistedPaneRow {
   provider_thread_id?: string
   model?: string
   reasoning_effort?: string | null
+  reasoning_variant?: string | null
   fast_mode?: boolean
   /// Live activity flags from the desktop; absent in persisted layouts. They
   /// override the store-derived guesses so the ACTIVE cluster matches the
@@ -318,11 +383,14 @@ function chatPane(workspace: Workspace, thread: Thread, turns: SnapshotTurn[]): 
     workspace_id: workspace.workspace_id,
     kind: 'chat',
     thread_id: thread.local_thread_id,
+    provider_thread_id: thread.provider_thread_id,
     thread_title: thread.title || 'Chat',
     provider: thread.provider ?? workspace.provider,
     model: thread.model_ref ?? null,
     reasoning_effort: thread.reasoning_effort ?? null,
     reasoning_variant: thread.reasoning_variant ?? null,
+    fast_mode: thread.fast_mode === 'on',
+    access_mode: thread.access_mode ?? 'supervised',
     send_pending: active,
     completion_pending: active,
   }
@@ -391,8 +459,9 @@ export function panesForWorkspace(
             provider: pane.provider ?? thread.provider ?? workspace.provider,
             model: pane.model ?? thread.model_ref ?? null,
             reasoning_effort: pane.reasoning_effort ?? thread.reasoning_effort ?? null,
-            reasoning_variant: thread.reasoning_variant ?? null,
-            fast_mode: pane.fast_mode ?? null,
+            reasoning_variant: pane.reasoning_variant ?? thread.reasoning_variant ?? null,
+            fast_mode: pane.fast_mode ?? thread.fast_mode === 'on',
+            access_mode: thread.access_mode ?? 'supervised',
             // Live desktop activity beats the store-turn heuristic, which can
             // report long-finished turns as active while the flush lags.
             ...(pane.send_pending !== undefined
@@ -530,6 +599,7 @@ function createAppStore() {
   const [drafts, setDrafts] = createSignal<DraftMap>({})
   const [paletteOpen, setPaletteOpen] = createSignal(false)
   const [settingsOpen, setSettingsOpen] = createSignal(false)
+  const [workspaceDialogOpen, setWorkspaceDialogOpen] = createSignal(false)
   const [drawerOpen, setDrawerOpen] = createSignal(false)
   const [sidebarCollapsed, setSidebarCollapsed] = createSignal(false)
   const [sending, setSending] = createSignal(false)
@@ -797,6 +867,7 @@ function createAppStore() {
                   provider_thread_id?: string | null
                   model?: string | null
                   reasoning_effort?: string | null
+                  reasoning_variant?: string | null
                   fast_mode?: boolean | null
                 }
               }>(status)?.thread
@@ -804,6 +875,7 @@ function createAppStore() {
               if (thread.provider_thread_id) pane.provider_thread_id = thread.provider_thread_id
               if (typeof thread.model === 'string') pane.model = thread.model
               if (thread.reasoning_effort !== undefined) pane.reasoning_effort = thread.reasoning_effort
+              if (thread.reasoning_variant !== undefined) pane.reasoning_variant = thread.reasoning_variant
               if (typeof thread.fast_mode === 'boolean') pane.fast_mode = thread.fast_mode
             }),
           )
@@ -862,7 +934,17 @@ function createAppStore() {
       )
       setThreadsByWorkspace((prev) => {
         const next = { ...prev }
-        for (const catalog of catalogs) next[catalog.workspace_id] = catalog.threads
+        const snapshots = workspaces()
+        for (const catalog of catalogs) {
+          const snapshot = snapshots.find((item) => item.workspace_id === catalog.workspace_id)?.threads
+          next[catalog.workspace_id] = mergeThreadCatalogSettings(
+            catalog.workspace_id,
+            catalog.threads,
+            snapshot,
+            prev[catalog.workspace_id],
+          )
+          catalog.threads = next[catalog.workspace_id]
+        }
         return sameJson(prev, next) ? prev : next
       })
       setWorkspaces((prev) => {
@@ -1441,11 +1523,11 @@ function createAppStore() {
         provider: thread?.provider ?? current.provider ?? 'codex',
         harness: thread?.harness ?? 'local_cli',
         model_ref: thread?.model_ref ?? current.model,
-        reasoning_effort: thread?.reasoning_effort,
-        opencode_reasoning_variant: thread?.reasoning_variant,
-        fast_mode: thread?.fast_mode === 'on',
+        reasoning_effort: thread?.reasoning_effort ?? current.reasoning_effort,
+        opencode_reasoning_variant: thread?.reasoning_variant ?? current.reasoning_variant,
+        fast_mode: (thread?.fast_mode ?? (current.fast_mode ? 'on' : 'off')) === 'on',
         provider_thread_id: thread?.provider_thread_id,
-        access_mode: thread?.access_mode,
+        access_mode: thread?.access_mode ?? current.access_mode,
       })
       if (sent.error || sent.ok === false) {
         rollback()
@@ -1515,9 +1597,18 @@ function createAppStore() {
   /// merges the patch over a fresh chat.thread.get before writing. The next
   /// chat.turn.start re-reads the thread, so the change applies to the next
   /// send — same contract as the desktop composer pickers.
-  const updateThreadSettings = async (
+  const settingsUpdateQueues = new Map<string, Promise<void>>()
+
+  const persistThreadSettings = async (
     pane: LivePane,
-    patch: { model_ref?: string | null; reasoning_effort?: string | null; reasoning_variant?: string | null },
+    patch: {
+      provider?: string
+      model_ref?: string | null
+      reasoning_effort?: string | null
+      reasoning_variant?: string | null
+      fast_mode?: string | null
+      access_mode?: string | null
+    },
   ) => {
     if (pane.kind !== 'chat' || !pane.thread_id) return
     setNotice(null)
@@ -1528,6 +1619,7 @@ function createAppStore() {
       })
       if (got.error || got.ok === false) {
         setNotice(got.error?.message ?? 'thread is not on the daemon')
+        void refreshProjection()
         return
       }
       const thread_root = unwrapResult<{ thread?: Thread } & Thread>(got)
@@ -1536,12 +1628,18 @@ function createAppStore() {
         setNotice('thread is not on the daemon')
         return
       }
+      const provider = patch.provider ?? thread.provider ?? pane.provider ?? 'codex'
+      const provider_changed = provider !== (thread.provider ?? pane.provider ?? 'codex')
       const merged = {
+        provider,
         model_ref: patch.model_ref !== undefined ? patch.model_ref : thread.model_ref ?? null,
         reasoning_effort:
           patch.reasoning_effort !== undefined ? patch.reasoning_effort : thread.reasoning_effort ?? null,
         reasoning_variant:
           patch.reasoning_variant !== undefined ? patch.reasoning_variant : thread.reasoning_variant ?? null,
+        fast_mode:
+          patch.fast_mode !== undefined ? patch.fast_mode : provider_changed ? 'off' : thread.fast_mode ?? 'off',
+        access_mode: patch.access_mode !== undefined ? patch.access_mode : thread.access_mode ?? 'supervised',
       }
       const client_id = await ensureClientId()
       const saved = await client.call('chat.thread.upsert', {
@@ -1555,19 +1653,23 @@ function createAppStore() {
           title: thread.title ?? pane.thread_title ?? 'Chat',
           archived: thread.archived ?? false,
           last_activity_at: thread.last_activity_at ?? Date.now(),
-          provider_thread_id: thread.provider_thread_id ?? null,
-          provider: thread.provider ?? pane.provider ?? 'codex',
+          provider_thread_id: provider_changed ? null : thread.provider_thread_id ?? null,
           harness: thread.harness ?? 'local_cli',
-          fast_mode: thread.fast_mode ?? null,
-          access_mode: thread.access_mode ?? null,
           draft: thread.draft ?? '',
           ...merged,
         },
       })
       if (saved.error || saved.ok === false) {
         setNotice(saved.error?.message ?? 'model change did not apply')
+        void refreshProjection()
         return
       }
+      rememberThreadSettings(pane.workspace_id, pane.thread_id, {
+        reasoning_effort: merged.reasoning_effort,
+        reasoning_variant: merged.reasoning_variant,
+        fast_mode: merged.fast_mode,
+        access_mode: merged.access_mode,
+      })
       setThreadsByWorkspace((prev) => ({
         ...prev,
         [pane.workspace_id]: (prev[pane.workspace_id] ?? []).map((row) =>
@@ -1577,14 +1679,95 @@ function createAppStore() {
       void refreshProjection()
     } catch (err) {
       setNotice(err instanceof Error ? err.message : 'model change failed')
+      void refreshProjection()
     }
   }
 
-  const newThread = async () => {
-    const current = workspace()
-    if (!current) return
-    const provider =
-      focusedChat()?.provider ?? openPanes().find((pane) => pane.kind === 'chat')?.provider ?? current.provider ?? 'codex'
+  /// Model, provider, and run-control clicks can happen faster than their
+  /// durable round trips. Serialize per thread so every merge reads the row
+  /// committed by the preceding click instead of restoring stale defaults.
+  const updateThreadSettings = (
+    pane: LivePane,
+    patch: {
+      provider?: string
+      model_ref?: string | null
+      reasoning_effort?: string | null
+      reasoning_variant?: string | null
+      fast_mode?: string | null
+      access_mode?: string | null
+    },
+  ): Promise<void> => {
+    const key = paneKey(pane.workspace_id, pane.pane_id)
+    const optimistic_patch: Partial<Thread> = {
+      ...patch,
+      ...(patch.provider && patch.provider !== pane.provider ? { provider_thread_id: null } : {}),
+    }
+    setThreadsByWorkspace((prev) => ({
+      ...prev,
+      [pane.workspace_id]: (prev[pane.workspace_id] ?? []).map((row) =>
+        row.local_thread_id === pane.thread_id ? { ...row, ...optimistic_patch } : row,
+      ),
+    }))
+    publishPanes(workspaces())
+    const previous = settingsUpdateQueues.get(key) ?? Promise.resolve()
+    const next = previous.catch(() => {}).then(() => persistThreadSettings(pane, patch))
+    settingsUpdateQueues.set(key, next)
+    void next.finally(() => {
+      if (settingsUpdateQueues.get(key) === next) settingsUpdateQueues.delete(key)
+    })
+    return next
+  }
+
+  const createWorkspace = async (path: string): Promise<boolean> => {
+    const trimmed_path = path.trim()
+    if (!trimmed_path) {
+      setNotice('enter a workspace path')
+      return false
+    }
+    setNotice(null)
+    try {
+      const created = await client.call('workspace.create', { path: trimmed_path })
+      let workspace_id: string | undefined
+      if (created.error || created.ok === false) {
+        if (!methodUnavailable(created)) {
+          setNotice(created.error?.message ?? 'could not add workspace')
+          return false
+        }
+        workspace_id = linuxWorkspaceId(trimmed_path)
+        const client_id = await ensureClientId()
+        const saved = await client.call('workspace.upsert', {
+          mutation: {
+            request_key: `web:workspace.add:${workspace_id}`,
+            client_id,
+          },
+          workspace: {
+            workspace_id,
+            label: labelFromPath(trimmed_path),
+            path: trimmed_path,
+          },
+        })
+        if (saved.error || saved.ok === false) {
+          setNotice(saved.error?.message ?? 'could not add workspace')
+          return false
+        }
+      } else {
+        const rows = workspacesFromLiveListing(created)
+        workspace_id = rows?.find((item) => item.path === trimmed_path)?.workspace_id ?? rows?.at(-1)?.workspace_id
+      }
+      liveWorkspaces = null
+      liveLayouts = {}
+      pinnedWorkspaceId = workspace_id ?? null
+      await refreshProjection()
+      if (workspace_id) selectWorkspace(workspace_id)
+      setWorkspaceDialogOpen(false)
+      return true
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : 'could not add workspace')
+      return false
+    }
+  }
+
+  const createHeadlessThread = async (current: Workspace, provider: string): Promise<number | null> => {
     const client_id = await ensureClientId()
     const local_thread_id = mintId('web-thread-')
     const opened = await client.call('chat.thread.upsert', {
@@ -1603,7 +1786,7 @@ function createAppStore() {
     })
     if (opened.error || opened.ok === false) {
       setNotice(opened.error?.message ?? 'could not open chat')
-      return
+      return null
     }
     localThreadIds.add(local_thread_id)
     const created: Thread = {
@@ -1616,8 +1799,35 @@ function createAppStore() {
       ...prev,
       [current.workspace_id]: [created, ...(prev[current.workspace_id] ?? [])],
     }))
+    return stablePaneId('chat', local_thread_id)
+  }
+
+  const newThread = async (workspace_id?: string) => {
+    const current = workspaces().find((item) => item.workspace_id === workspace_id) ?? workspace()
+    if (!current) return
+    const provider =
+      (current.workspace_id === workspace()?.workspace_id ? focusedChat()?.provider : undefined) ??
+      (panesByWorkspace()[current.workspace_id] ?? []).find((pane) => pane.kind === 'chat')?.provider ??
+      current.provider ??
+      'codex'
+    setNotice(null)
+    const opened = await client.call('chat.open', {
+      workspace_id: current.workspace_id,
+      provider,
+      focus: true,
+    })
+    if ((opened.error || opened.ok === false) && !methodUnavailable(opened)) {
+      setNotice(opened.error?.message ?? 'could not open chat')
+      return
+    }
+    const pane_id = opened.error || opened.ok === false
+      ? await createHeadlessThread(current, provider)
+      : unwrapResult<{ pane_id?: number }>(opened)?.pane_id ?? null
+    if (pane_id == null) return
+    pinnedWorkspaceId = current.workspace_id
+    setWorkspaceId(current.workspace_id)
     await refreshProjection()
-    setFocusedPaneId(stablePaneId('chat', local_thread_id))
+    setFocusedPaneId(pane_id)
     setComposerNonce((value) => value + 1)
   }
 
@@ -1755,11 +1965,11 @@ function createAppStore() {
     dispatchAction(action)
   }
 
-  const runCommand = async (id: string) => {
+  const runCommand = async (id: string, workspace_id?: string) => {
     setPaletteOpen(false)
     switch (id) {
       case 'new-thread':
-        await newThread()
+        await newThread(workspace_id)
         break
       case 'new-terminal':
         await newTerminal()
@@ -1824,6 +2034,8 @@ function createAppStore() {
     setPaletteOpen,
     settingsOpen,
     setSettingsOpen,
+    workspaceDialogOpen,
+    setWorkspaceDialogOpen,
     drawerOpen,
     setDrawerOpen,
     sidebarCollapsed,
@@ -1843,6 +2055,7 @@ function createAppStore() {
     stopTurn,
     paneWorking,
     updateThreadSettings,
+    createWorkspace,
     providerModels,
     ensureProviderModels,
     runCommand,

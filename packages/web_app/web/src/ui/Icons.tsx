@@ -1,7 +1,7 @@
 import { store } from '../lib/store'
 import type { LivePane } from '../lib/types'
 
-import logoUrl from '../../../../desktop/src/assets/verde_logo.png'
+import logoMaskUrl from '../../../../desktop/src/assets/verde_logo_mask.png'
 import openaiUrl from '../../../../desktop/src/assets/OpenAI-white-monoblossom.png'
 import claudeUrl from '../../../../desktop/src/assets/claude-logo.png'
 import opencodeUrl from '../../../../desktop/src/assets/opencode-logo-dark.png'
@@ -10,7 +10,23 @@ import grokUrl from '../../../../desktop/src/assets/grok-logo.png'
 import ampUrl from '../../../../desktop/src/assets/amp-logo.png'
 
 export function VerdeLogo(props: { class?: string }) {
-  return <img src={logoUrl} alt="" class={props.class ?? 'h-7 w-7'} />
+  return (
+    <span
+      aria-label="Verde"
+      class={`inline-block shrink-0 bg-[var(--accent)] ${props.class ?? 'h-7 w-7'}`}
+      role="img"
+      style={{
+        'mask-image': `url(${logoMaskUrl})`,
+        'mask-position': 'center',
+        'mask-repeat': 'no-repeat',
+        'mask-size': 'contain',
+        '-webkit-mask-image': `url(${logoMaskUrl})`,
+        '-webkit-mask-position': 'center',
+        '-webkit-mask-repeat': 'no-repeat',
+        '-webkit-mask-size': 'contain',
+      }}
+    />
+  )
 }
 
 export function ProviderGlyph(props: { provider?: string; class?: string }) {

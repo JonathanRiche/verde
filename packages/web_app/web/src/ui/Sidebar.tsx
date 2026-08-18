@@ -12,7 +12,7 @@ export function Sidebar() {
           <VerdeLogo class="h-7 w-7" />
           <Show when={!store.sidebarCollapsed()}>
             <div class="ml-auto flex items-center gap-1">
-              <IconButton label="Add workspace" onClick={() => store.setNotice('Import a project from the desktop client.')}>
+              <IconButton label="Add workspace" onClick={() => { store.setNotice(null); store.setWorkspaceDialogOpen(true) }}>
                 <Icon name="plus" class="h-3.5 w-3.5" />
               </IconButton>
               <IconButton label="Collapse sidebar" onClick={() => store.setSidebarCollapsed(true)}>
@@ -78,24 +78,26 @@ function WorkspaceGroup(props: { workspace: Workspace }) {
       <Show when={selected()}>
         <span class="absolute top-1 bottom-1 -left-3 w-[3px] rounded-full bg-[var(--accent)]" />
       </Show>
-      <button
-        type="button"
-        class="group flex h-[30px] w-full items-center rounded-[6px] pr-1 text-left hover:bg-[var(--accent-hover)]"
-        onClick={() => store.selectWorkspace(props.workspace.workspace_id)}
-      >
-        <Icon
-          name={selected() ? 'chevronDown' : 'chevron'}
-          class={`h-3.5 w-3.5 ${selected() ? 'text-white' : 'text-[var(--text-subtle)]'}`}
-        />
-        <Icon
-          name="folder"
-          class={`ml-1 h-3.5 w-3.5 ${selected() ? 'text-[var(--accent)]' : 'text-[var(--text-subtle)]'}`}
-        />
-        <span class={`ml-2 min-w-0 flex-1 truncate text-[15px] ${selected() ? 'text-white' : 'text-[var(--text-muted)]'}`}>
-          {props.workspace.label}
-        </span>
+      <div class="group flex h-[30px] w-full items-center rounded-[6px] pr-1 hover:bg-[var(--accent-hover)]">
+        <button
+          type="button"
+          class="flex h-full min-w-0 flex-1 items-center text-left"
+          onClick={() => store.selectWorkspace(props.workspace.workspace_id)}
+        >
+          <Icon
+            name={selected() ? 'chevronDown' : 'chevron'}
+            class={`h-3.5 w-3.5 ${selected() ? 'text-white' : 'text-[var(--text-subtle)]'}`}
+          />
+          <Icon
+            name="folder"
+            class={`ml-1 h-3.5 w-3.5 ${selected() ? 'text-[var(--accent)]' : 'text-[var(--text-subtle)]'}`}
+          />
+          <span class={`ml-2 min-w-0 flex-1 truncate text-[15px] ${selected() ? 'text-white' : 'text-[var(--text-muted)]'}`}>
+            {props.workspace.label}
+          </span>
+        </button>
         <span class="hidden items-center gap-0.5 group-hover:flex">
-          <TinyIcon label="New chat" onClick={(event) => { event.stopPropagation(); void store.runCommand('new-thread') }}>
+          <TinyIcon label="New chat" onClick={(event) => { event.stopPropagation(); void store.runCommand('new-thread', props.workspace.workspace_id) }}>
             <Icon name="chat" class="h-3.5 w-3.5" />
           </TinyIcon>
           <TinyIcon label="New terminal" onClick={(event) => { event.stopPropagation(); void store.runCommand('new-terminal') }}>
@@ -105,7 +107,7 @@ function WorkspaceGroup(props: { workspace: Workspace }) {
             <Icon name="history" class="h-3.5 w-3.5" />
           </TinyIcon>
         </span>
-      </button>
+      </div>
       <Show when={selected()}>
         <div class="mt-1 ml-4">
           <For each={selected() ? store.openPanes() : []}>

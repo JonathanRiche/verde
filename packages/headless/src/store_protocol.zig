@@ -343,6 +343,10 @@ pub const ThreadListItem = struct {
     last_activity_at: ?i64 = null,
     provider_thread_id: ?[]const u8 = null,
     model_ref: ?[]const u8 = null,
+    reasoning_effort: ?[]const u8 = null,
+    reasoning_variant: ?[]const u8 = null,
+    fast_mode: ?[]const u8 = null,
+    access_mode: ?[]const u8 = null,
     provider: []const u8 = "opencode",
     harness: []const u8 = "local_cli",
 };

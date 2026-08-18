@@ -2,7 +2,7 @@ import { Show, onCleanup, onMount } from 'solid-js'
 
 import { store } from '../lib/store'
 import { Icon } from './Icons'
-import { Palette, Settings } from './Overlays'
+import { Palette, Settings, WorkspaceDialog } from './Overlays'
 import { Sidebar } from './Sidebar'
 import { WorkspaceCanvas } from './WorkspaceCanvas'
 
@@ -57,6 +57,7 @@ export function App() {
 
       <Palette />
       <Settings />
+      <WorkspaceDialog />
     </div>
   )
 }

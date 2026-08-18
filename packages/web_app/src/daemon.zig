@@ -4,6 +4,7 @@ const std = @import("std");
 const headless = @import("headless");
 
 const config_mod = @import("config.zig");
+const directory_browser = @import("directory_browser.zig");
 const mock = @import("mock.zig");
 
 const protocol = headless.protocol;
@@ -32,11 +33,16 @@ pub const Daemon = struct {
     }
 
     pub fn callRaw(self: *Daemon, request_json: []const u8) !CallResult {
+        if (try directory_browser.respond(self.allocator, self.io, request_json)) |json| {
+            return .{ .json = json, .source = .daemon };
+        }
         // Detached UIs read the headless daemon. Live is only a last-resort
         // fallback for methods the sessionizer does not implement.
+        var daemon_unknown: ?[]u8 = null;
+        defer if (daemon_unknown) |json| self.allocator.free(json);
         if (tryUnix(self.io, self.allocator, self.config.sessionizer_endpoint, request_json)) |json| {
             if (isUnknownMethod(json)) {
-                self.allocator.free(json);
+                daemon_unknown = json;
             } else {
                 return .{ .json = json, .source = .daemon };
             }
@@ -45,6 +51,13 @@ pub const Daemon = struct {
         if (tryUnix(self.io, self.allocator, self.config.live_endpoint, request_json)) |json| {
             return .{ .json = json, .source = .live };
         } else |_| {}
+
+        // An online daemon's unknown-method response is more truthful than
+        // unrelated review-mode mock data when Desktop Live is unavailable.
+        if (daemon_unknown) |json| {
+            daemon_unknown = null;
+            return .{ .json = json, .source = .daemon };
+        }
 
         if (!self.config.allow_mock) return error.DaemonUnavailable;
         return .{
