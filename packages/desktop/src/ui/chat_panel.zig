@@ -113,6 +113,20 @@ const MAX_DIFF_FILE_OPEN_HITS = 64;
 var diff_file_open_hit_count: usize = 0;
 var diff_file_open_hits: [MAX_DIFF_FILE_OPEN_HITS]DiffFileOpenHit = [_]DiffFileOpenHit{.{}} ** MAX_DIFF_FILE_OPEN_HITS;
 
+/// One "Comment" hit per diff-card file row; carries the row's +/- counts so
+/// the prefilled composer draft can name the specific edit being discussed.
+const DiffFileCommentHit = struct {
+    rect: palette.Rect = .{},
+    path: []const u8 = "",
+    additions: i64 = 0,
+    deletions: i64 = 0,
+    /// Unified-diff patch for this file (slice into the persisted message
+    /// body); the draft prefill derives edited line ranges from its hunks.
+    patch: []const u8 = "",
+};
+var diff_file_comment_hit_count: usize = 0;
+var diff_file_comment_hits: [MAX_DIFF_FILE_OPEN_HITS]DiffFileCommentHit = [_]DiffFileCommentHit{.{}} ** MAX_DIFF_FILE_OPEN_HITS;
+
 const DiffLayoutHit = struct {
     rect: palette.Rect = .{},
     split: bool = false,
@@ -212,6 +226,7 @@ pub fn resetTranscriptHitCache() void {
     followup_pin_hit_count = 0;
     usage_action_hit_count = 0;
     diff_file_open_hit_count = 0;
+    diff_file_comment_hit_count = 0;
     diff_layout_hit_count = 0;
     bang_retry_hit_count = 0;
     transcript_image_hit_count = 0;
@@ -670,6 +685,7 @@ pub fn transcriptActionWantsPointerAt(x: f32, y: f32) bool {
 const TranscriptAction = union(enum) {
     usage,
     diff_file_open: []const u8,
+    diff_file_comment: DiffFileCommentHit,
     diff_layout: bool,
     retry_command: []const u8,
     image_open: [:0]const u8,
@@ -684,6 +700,11 @@ fn transcriptActionAt(x: f32, y: f32) ?TranscriptAction {
     while (index < diff_file_open_hit_count) : (index += 1) {
         const hit = diff_file_open_hits[index];
         if (rectContains(hit.rect, x, y)) return .{ .diff_file_open = hit.path };
+    }
+    index = 0;
+    while (index < diff_file_comment_hit_count) : (index += 1) {
+        const hit = diff_file_comment_hits[index];
+        if (rectContains(hit.rect, x, y)) return .{ .diff_file_comment = hit };
     }
     index = 0;
     while (index < diff_layout_hit_count) : (index += 1) {
@@ -761,6 +782,23 @@ test "transcript action hit testing preserves usage and diff open actions" {
     const open = transcriptActionAt(110.0, 130.0) orelse return error.TestExpectedEqual;
     switch (open) {
         .diff_file_open => |path| try std.testing.expectEqualStrings("src/main.zig", path),
+        else => return error.TestExpectedEqual,
+    }
+
+    diff_file_comment_hits[0] = .{
+        .rect = .{ .x = 400.0, .y = 120.0, .w = 60.0, .h = 20.0 },
+        .path = "src/main.zig",
+        .additions = 5,
+        .deletions = 2,
+    };
+    diff_file_comment_hit_count = 1;
+    const comment = transcriptActionAt(410.0, 130.0) orelse return error.TestExpectedEqual;
+    switch (comment) {
+        .diff_file_comment => |hit| {
+            try std.testing.expectEqualStrings("src/main.zig", hit.path);
+            try std.testing.expectEqual(@as(i64, 5), hit.additions);
+            try std.testing.expectEqual(@as(i64, 2), hit.deletions);
+        },
         else => return error.TestExpectedEqual,
     }
 
@@ -1298,6 +1336,7 @@ pub fn handleTranscriptPaletteMouseButton(state: *app_state.AppState, x: f32, y:
             switch (action) {
                 .usage => _ = state.showCurrentProviderUsage(),
                 .diff_file_open => |path| state.openTranscriptFileReference(path),
+                .diff_file_comment => |comment| state.beginDiffCommentDraft(comment.path, comment.additions, comment.deletions, comment.patch),
                 .diff_layout => |split| state.setDiffLayoutPreference(if (split) .split else .stacked),
                 .retry_command => |command| state.retryBangCommand(command),
                 .image_open => |path| state.openImageModal(path),
@@ -4804,10 +4843,12 @@ fn renderDiffSummaryCard(
         // Path
         const path_x = chev_x + theme.scaledUi(14.0);
         const action_w = theme.scaledUi(54.0);
+        // "Comment" is the longest action label; give it a wider touch target.
+        const comment_w = theme.scaledUi(76.0);
         const action_h = theme.scaledUi(28.0);
         const action_gap = theme.scaledUi(6.0);
         const counts_w = theme.scaledUi(92.0);
-        const actions_w = action_w * 2.0 + action_gap;
+        const actions_w = action_w * 2.0 + comment_w + action_gap * 2.0;
         const path_right = bubble.x + bubble.w - pad_x - counts_w - action_gap - actions_w;
         const path_w = @max(path_right - path_x, theme.scaledUi(40.0));
         const path_display = truncateMonoToWidth(state.allocator, file.path, path_w, file_font);
@@ -4836,6 +4877,13 @@ fn renderDiffSummaryCard(
             .w = action_w,
             .h = open_rect.h,
         };
+        const comment_rect = palette.Rect{
+            .x = copy_rect.x - action_gap - comment_w,
+            .y = open_rect.y,
+            .w = comment_w,
+            .h = open_rect.h,
+        };
+        renderDiffFileActionButton(state, comment_rect, "Comment", false, clip);
         renderDiffFileActionButton(state, copy_rect, "Copy", false, clip);
         renderDiffFileActionButton(state, open_rect, "Open", true, clip);
         state.recordTranscriptCopyHit(copy_rect, file.patch, diffCopyIdentity(message_index, file.path, file.patch));
@@ -4843,8 +4891,18 @@ fn renderDiffSummaryCard(
             diff_file_open_hits[diff_file_open_hit_count] = .{ .rect = open_rect, .path = file.path };
             diff_file_open_hit_count += 1;
         }
+        if (diff_file_comment_hit_count < diff_file_comment_hits.len) {
+            diff_file_comment_hits[diff_file_comment_hit_count] = .{
+                .rect = comment_rect,
+                .path = file.path,
+                .additions = file.additions,
+                .deletions = file.deletions,
+                .patch = file.patch,
+            };
+            diff_file_comment_hit_count += 1;
+        }
 
-        const counts_right = copy_rect.x - action_gap;
+        const counts_right = comment_rect.x - action_gap;
         const dels_w = counts_w * 0.5;
         const adds_w = counts_w * 0.5;
         queueFixedTextLine(state, snapRect(.{

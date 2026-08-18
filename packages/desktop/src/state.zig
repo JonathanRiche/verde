@@ -5511,6 +5511,101 @@ pub const AppState = struct {
         }
     }
 
+    /// Prefills the composer with an @-mention of a diff-card file plus that
+    /// row's +/- counts and edited line ranges so the user can comment on the
+    /// specific edit and steer the agent. Appends to any in-progress draft
+    /// instead of replacing it.
+    pub fn beginDiffCommentDraft(self: *AppState, file_path: []const u8, additions: i64, deletions: i64, patch: []const u8) void {
+        if (self.project_controller.projects.items.len == 0) return;
+
+        // Diff cards carry absolute paths; mentions use project-relative ones.
+        var mention_path = file_path;
+        const project_path = self.currentProject().path;
+        if (std.fs.path.isAbsolute(mention_path) and std.mem.startsWith(u8, mention_path, project_path)) {
+            const rest = mention_path[project_path.len..];
+            if (rest.len > 1 and rest[0] == '/') mention_path = rest[1..];
+        }
+
+        const line_summary = diffCommentLineSummary(self.allocator, patch);
+        defer if (line_summary) |summary| self.allocator.free(summary);
+
+        const draft = self.currentDraft();
+        const separator: []const u8 = if (draft.len == 0 or std.mem.endsWith(u8, draft, "\n")) "" else "\n";
+        const next_draft = std.fmt.allocPrint(
+            self.allocator,
+            "{s}{s}About your edit to @{s} (+{d}/-{d}{s}{s}): ",
+            .{
+                draft,
+                separator,
+                mention_path,
+                additions,
+                deletions,
+                if (line_summary != null) ", " else "",
+                line_summary orelse "",
+            },
+        ) catch |err| {
+            log.warn("failed to build diff comment draft: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to start diff comment.");
+            return;
+        };
+        defer self.allocator.free(next_draft);
+
+        self.setDraft(next_draft);
+        self.resetComposerInputWidget();
+        self.composer_controller.composer.focused = true;
+        self.composer_controller.focused = true;
+        self.markDirty();
+        self.setSidebarNotice("Commenting on a file edit. Finish the note and send it.");
+    }
+
+    /// Formats the new-file line ranges touched by a unified-diff patch, e.g.
+    /// "lines 12-18, 40", so a diff comment names the exact edit. Lists at
+    /// most four hunks and rolls the rest up as "+N more". Returns null when
+    /// the patch has no parseable `@@` hunk headers.
+    fn diffCommentLineSummary(allocator: std.mem.Allocator, patch: []const u8) ?[]u8 {
+        // Beyond this many ranges the prefix stops reading as a pointer and
+        // starts crowding out the user's actual comment.
+        const max_listed_hunks: usize = 4;
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(allocator);
+
+        var hunk_count: usize = 0;
+        var lines_it = std.mem.splitScalar(u8, patch, '\n');
+        while (lines_it.next()) |line| {
+            if (!std.mem.startsWith(u8, line, "@@")) continue;
+            // The first '+' in a valid header starts the new-side "+start,count".
+            const plus = std.mem.indexOfScalar(u8, line, '+') orelse continue;
+            const rest = line[plus + 1 ..];
+            var digits: usize = 0;
+            while (digits < rest.len and std.ascii.isDigit(rest[digits])) digits += 1;
+            if (digits == 0) continue;
+            const start = std.fmt.parseInt(u32, rest[0..digits], 10) catch continue;
+            var count: u32 = 1;
+            if (digits < rest.len and rest[digits] == ',') {
+                var end = digits + 1;
+                while (end < rest.len and std.ascii.isDigit(rest[end])) end += 1;
+                count = std.fmt.parseInt(u32, rest[digits + 1 .. end], 10) catch 1;
+            }
+
+            hunk_count += 1;
+            if (hunk_count > max_listed_hunks) continue;
+
+            var piece_buf: [48]u8 = undefined;
+            const piece = if (count <= 1)
+                std.fmt.bufPrint(&piece_buf, "{s}{d}", .{ if (hunk_count == 1) "lines " else ", ", start }) catch continue
+            else
+                std.fmt.bufPrint(&piece_buf, "{s}{d}-{d}", .{ if (hunk_count == 1) "lines " else ", ", start, start + count - 1 }) catch continue;
+            out.appendSlice(allocator, piece) catch return null;
+        }
+        if (hunk_count == 0 or out.items.len == 0) return null;
+        if (hunk_count > max_listed_hunks) {
+            var more_buf: [32]u8 = undefined;
+            const more = std.fmt.bufPrint(&more_buf, ", +{d} more", .{hunk_count - max_listed_hunks}) catch return null;
+            out.appendSlice(allocator, more) catch return null;
+        }
+        return out.toOwnedSlice(allocator) catch null;
+    }
+
     fn openTranscriptFileReferenceInNeovimPane(self: *AppState, file_path: []const u8, location: utils.FileLocation) bool {
         const command = utils.configuredNeovimFileCommandAlloc(self.allocator, file_path, location) catch |err| {
             log.warn("failed to build workspace Neovim file command: {s}", .{@errorName(err)});
@@ -15830,6 +15925,30 @@ test "M5-P4 cursor loop shutdown flag interrupts sleeps and join is idempotent" 
     const waited_ms = platform_runtime.unixTimestampMs() - started_ms;
     try std.testing.expect(waited_ms < 5_000);
     try std.testing.expect(loop.worker == null);
+}
+
+test "diff comment line summary lists new-side hunk ranges" {
+    const allocator = std.testing.allocator;
+
+    const summary = AppState.diffCommentLineSummary(
+        allocator,
+        "@@ -1,3 +1,4 @@ fn a()\n+x\n@@ -10,2 +11 @@\n-y\n@@ -20 +22,0 @@\n-z\n",
+    ) orelse return error.TestExpectedEqual;
+    defer allocator.free(summary);
+    try std.testing.expectEqualStrings("lines 1-4, 11, 22", summary);
+
+    // Hunks past the cap roll up instead of flooding the prefix.
+    const many = AppState.diffCommentLineSummary(
+        allocator,
+        "@@ -1 +1,2 @@\n@@ -5 +6 @@\n@@ -9 +10 @@\n@@ -13 +14 @@\n@@ -17 +18 @@\n@@ -21 +22 @@\n",
+    ) orelse return error.TestExpectedEqual;
+    defer allocator.free(many);
+    try std.testing.expectEqualStrings("lines 1-2, 6, 10, 14, +2 more", many);
+
+    try std.testing.expectEqual(
+        @as(?[]u8, null),
+        AppState.diffCommentLineSummary(allocator, "no hunk headers here"),
+    );
 }
 
 test "browser context-menu payload retains an optional link disposition target" {
