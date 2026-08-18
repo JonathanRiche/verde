@@ -1163,7 +1163,15 @@ pub const WorkspaceLayout = struct {
         if (root_value.object.get("root")) |node_value| {
             next_layout.root = try parseWorkspaceNodeJson(allocator, node_value);
         }
-        if (next_layout.panes.items.len == 0) return;
+        if (next_layout.panes.items.len == 0) {
+            // An explicitly empty v2 layout is the durable no-open-panes
+            // state. Invalid layouts that still reference panes remain
+            // ignored so they cannot replace a usable in-memory layout.
+            if (next_layout.root != null or next_layout.quick_pane != null) return;
+            self.deinit(allocator);
+            self.* = next_layout;
+            return;
+        }
         _ = try next_layout.repairVisibleRoot(allocator);
         if (next_layout.root == null) return;
 
@@ -1567,6 +1575,28 @@ test "workspace layout persists floating quick pane geometry and state" {
     try std.testing.expect(quick.maximized);
     try std.testing.expect(quick.pinned);
     try std.testing.expect(restored.rootContainsPane(quick.pane_id));
+}
+
+test "workspace layout persists an empty pane set" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+
+    var removed_ref = layout.closePane(allocator, 1) orelse return error.TestExpectedEqual;
+    deinitWorkspacePaneRef(&removed_ref, allocator);
+    try std.testing.expectEqual(@as(usize, 0), layout.panes.items.len);
+    try std.testing.expect(layout.root == null);
+    try std.testing.expect(layout.focused_pane_id == null);
+
+    const persisted = try layout.persistedWorkspaceJson(allocator);
+    defer allocator.free(persisted);
+    var restored = try WorkspaceLayout.initDefaultChat(allocator);
+    defer restored.deinit(allocator);
+    try restored.applyPersistedWorkspaceJson(allocator, persisted);
+
+    try std.testing.expectEqual(@as(usize, 0), restored.panes.items.len);
+    try std.testing.expect(restored.root == null);
+    try std.testing.expect(restored.focused_pane_id == null);
 }
 
 test "detached quick pane stays out of tiled root across repair and persistence" {

@@ -1457,7 +1457,8 @@ pub fn formatCtrlShiftKeyTipAt(buf: []u8, bindings: []const Keybind, index: usiz
     return buf[0..count];
 }
 
-fn formatKeybind(buf: []u8, binding: Keybind) []const u8 {
+/// Formats a keybind for compact UI shortcut hints.
+pub fn formatKeybind(buf: []u8, binding: Keybind) []const u8 {
     var count: usize = 0;
     if (binding.primary or binding.ctrl) count += copyInto(buf[count..], "Ctrl+");
     if (binding.meta) count += copyInto(buf[count..], "Meta+");

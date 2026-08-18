@@ -4823,6 +4823,23 @@ pub const AppState = struct {
         if (self.app_config.new_chat_pane_behavior == .new_pane) {
             self.project_controller.selected_index = index;
             var layout = &self.project_controller.projects.items[index].workspace_layout;
+            if (layout.visiblePaneCount() == 0) {
+                const project = &self.project_controller.projects.items[index];
+                const thread_index = project.addThread(self.allocator) catch {
+                    self.setSidebarNotice("Failed to create a new thread.");
+                    return;
+                };
+                self.focusProjectThreadInWorkspace(index, thread_index) catch |err| {
+                    log.err("failed to open new thread in empty workspace: {s}", .{@errorName(err)});
+                    self.setSidebarNotice("Failed to create chat pane.");
+                    return;
+                };
+                self.requestComposerFocus();
+                self.syncRenameBuffer();
+                self.setSidebarNotice("New chat pane ready.");
+                self.markDirty();
+                return;
+            }
             _ = layout.ensureDefaultChat(self.allocator) catch |err| {
                 log.err("failed to prepare workspace for new chat pane: {s}", .{@errorName(err)});
                 self.setSidebarNotice("Failed to prepare the workspace.");
@@ -4876,7 +4893,7 @@ pub const AppState = struct {
         var project = &self.project_controller.projects.items[project_index];
         if (thread_index >= project.threads.items.len) return;
         var layout = &project.workspace_layout;
-        _ = try layout.ensureDefaultChat(self.allocator);
+        if (layout.panes.items.len > 0) _ = try layout.repairVisibleRoot(self.allocator);
 
         var chat_pane_id = layout.visibleChatPaneIdForThread(thread_index) orelse
             layout.retargetPreferredChatPane(thread_index);
@@ -12533,6 +12550,13 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
     try std.testing.expect(state.composer_controller.focused);
     try std.testing.expect(state.composer_controller.composer.focused);
     try std.testing.expect(!state.terminal_controller.focused);
+
+    try std.testing.expect(state.closeCurrentProjectWorkspacePane(result.pane_id));
+    try std.testing.expect(state.closeCurrentProjectWorkspacePane(chat_pane_id));
+    try std.testing.expectEqual(@as(usize, 0), layout.visiblePaneCount());
+    try std.testing.expect(layout.focused_pane_id == null);
+    try std.testing.expect(!state.composer_controller.focused);
+    try std.testing.expect(!state.composer_controller.composer.focused);
 }
 
 test "sidebar pane selection restores a sibling browser URL snapshot" {

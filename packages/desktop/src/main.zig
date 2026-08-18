@@ -1602,6 +1602,17 @@ const HotkeyPaneKind = enum { chat, terminal };
 // workspace is maximized) it falls back to splitting the focused pane along the
 // requested axis.
 fn openHotkeyWorkspacePane(state: *AppState, kind: HotkeyPaneKind, fallback_axis: native_state.WorkspaceSplitAxis) bool {
+    if (state.project_controller.projects.items.len == 0) return false;
+    const project_index = state.project_controller.selected_index;
+    if (state.project_controller.projects.items[project_index].workspace_layout.focused_pane_id == null) {
+        return switch (kind) {
+            .chat => blk: {
+                state.createThreadForProject(project_index);
+                break :blk true;
+            },
+            .terminal => state.openTerminalPaneForProjectIndex(project_index),
+        };
+    }
     if (workspace_panes_ui.gridNewPanePlacement(state)) |p| {
         return switch (kind) {
             .chat => state.splitCurrentProjectWorkspacePaneWithChatPlacement(p.pane_id, p.axis, p.new_after),
@@ -2801,7 +2812,14 @@ fn handleKeyboardAction(
         .open_default => state.openCurrentProjectEditor(.configured),
         .open_editor => state.openCurrentProjectEditor(.configured),
         .new_thread => _ = openHotkeyWorkspaceChatThread(state),
-        .command_palette => state.openCommandPalette(null),
+        .command_palette => {
+            const scope_project = if (state.project_controller.projects.items.len > 0 and
+                state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout.visiblePaneCount() == 0)
+                state.project_controller.selected_index
+            else
+                null;
+            state.openCommandPalette(scope_project);
+        },
         .companion => state.toggleCompanion(),
         .toggle_sidebar => state.toggleSidebarCollapsed(),
         .toggle_sidebar_hidden => state.toggleSidebarHidden(),
