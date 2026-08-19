@@ -1,4 +1,4 @@
-import type { RpcEnvelope, Source } from './types'
+import type { Attachment, RpcEnvelope, Source } from './types'
 
 export type EventHandler = (message: RpcEnvelope) => void
 
@@ -100,6 +100,54 @@ export async function fetchRpc(method: string, params: unknown = {}): Promise<Rp
     body: JSON.stringify({ id: Date.now(), method, params }),
   })
   return (await response.json()) as RpcEnvelope
+}
+
+export async function uploadChatImage(file: File, mime: string): Promise<Attachment> {
+  const token = readToken()
+  const response = await fetch('/api/attachment', {
+    method: 'POST',
+    headers: {
+      'content-type': mime,
+      ...(token ? { 'x-verde-token': token } : {}),
+    },
+    body: file,
+  })
+  const payload = (await response.json().catch(() => null)) as
+    | { attachment?: Attachment; error?: string }
+    | null
+  if (!response.ok || !payload?.attachment) {
+    const reason = payload?.error?.replaceAll('_', ' ') ?? `upload failed (${response.status})`
+    throw new Error(reason)
+  }
+  return { ...payload.attachment, name: file.name }
+}
+
+export async function deleteChatImage(attachment: Attachment): Promise<void> {
+  const id = webChatAttachmentId(attachment)
+  if (!id) return
+  const token = readToken()
+  await fetch(`/api/attachment?id=${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+    headers: token ? { 'x-verde-token': token } : {},
+  })
+}
+
+export function chatImageUrl(attachment: Attachment): string | null {
+  const id = webChatAttachmentId(attachment)
+  if (!id) return null
+  const token = readToken()
+  const query = new URLSearchParams({ id })
+  if (token) query.set('token', token)
+  return `/api/attachment?${query.toString()}`
+}
+
+function webChatAttachmentId(attachment: Attachment): string | null {
+  if (attachment.attachment_id?.startsWith('web-')) return attachment.attachment_id
+  const marker = '/web-chat-images/'
+  const offset = attachment.path.lastIndexOf(marker)
+  if (offset < 0) return null
+  const id = attachment.path.slice(offset + marker.length)
+  return id.startsWith('web-') && !id.includes('/') ? id : null
 }
 
 function parseEnvelope(raw: string): RpcEnvelope | null {

@@ -10,10 +10,13 @@ const theme_mod = @import("theme.zig");
 
 const log = std.log.scoped(.web_http);
 
+const WEB_CHAT_IMAGE_DIR = "web-chat-images";
+const MAX_CHAT_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+
 const CORS_HEADERS = [_]std.http.Header{
     .{ .name = "access-control-allow-origin", .value = "*" },
     .{ .name = "access-control-allow-headers", .value = "authorization, content-type, x-verde-token" },
-    .{ .name = "access-control-allow-methods", .value = "GET, POST, OPTIONS" },
+    .{ .name = "access-control-allow-methods", .value = "GET, POST, DELETE, OPTIONS" },
 };
 
 pub fn serve(
@@ -165,6 +168,71 @@ fn handleRequest(
         const result = try daemon.callMethod("core.snapshot", SnapshotParams{});
         defer allocator.free(result.json);
         try respondJson(request, .ok, result.json);
+        return;
+    }
+
+    if (std.mem.eql(u8, split.path, "/api/attachment") and request.head.method == .POST) {
+        const mime = supportedImageMime(requestContentType(request)) orelse {
+            try respondJson(request, .unsupported_media_type, "{\"ok\":false,\"error\":\"unsupported_image_type\"}");
+            return;
+        };
+        const body_reader = try request.readerExpectContinue(&.{});
+        const body = body_reader.allocRemaining(allocator, .limited(MAX_CHAT_IMAGE_BYTES)) catch {
+            try respondJson(request, .payload_too_large, "{\"ok\":false,\"error\":\"image_too_large\"}");
+            return;
+        };
+        defer allocator.free(body);
+        if (!imageBytesMatchMime(mime, body)) {
+            try respondJson(request, .bad_request, "{\"ok\":false,\"error\":\"invalid_image\"}");
+            return;
+        }
+
+        const stored = try storeChatImage(allocator, io, config.pref_path, mime, body);
+        defer stored.deinit(allocator);
+        var writer: std.Io.Writer.Allocating = .init(allocator);
+        defer writer.deinit();
+        try std.json.Stringify.value(.{
+            .ok = true,
+            .attachment = .{
+                .path = stored.path,
+                .mime = mime,
+                .byte_size = body.len,
+                .attachment_id = stored.attachment_id,
+            },
+        }, .{}, &writer.writer);
+        const response = try writer.toOwnedSlice();
+        defer allocator.free(response);
+        try respondJson(request, .created, response);
+        return;
+    }
+
+    if (std.mem.eql(u8, split.path, "/api/attachment") and
+        (request.head.method == .GET or request.head.method == .DELETE))
+    {
+        const attachment_id = queryValue(split.query, "id") orelse {
+            try respondJson(request, .bad_request, "{\"ok\":false,\"error\":\"missing_attachment_id\"}");
+            return;
+        };
+        if (!validAttachmentId(attachment_id)) {
+            try respondJson(request, .bad_request, "{\"ok\":false,\"error\":\"invalid_attachment_id\"}");
+            return;
+        }
+        const path = try std.fs.path.join(allocator, &.{ config.pref_path, WEB_CHAT_IMAGE_DIR, attachment_id });
+        defer allocator.free(path);
+        if (request.head.method == .DELETE) {
+            std.Io.Dir.deleteFileAbsolute(io, path) catch {
+                try respondJson(request, .not_found, "{\"ok\":false,\"error\":\"attachment_not_found\"}");
+                return;
+            };
+            try respondJson(request, .ok, "{\"ok\":true}");
+            return;
+        }
+        const bytes = readFileLimited(allocator, io, path) catch {
+            try respondJson(request, .not_found, "{\"ok\":false,\"error\":\"attachment_not_found\"}");
+            return;
+        };
+        defer allocator.free(bytes);
+        try respondText(request, .ok, mimeType(path), bytes);
         return;
     }
 
@@ -400,6 +468,117 @@ fn queryValue(query: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
+fn requestContentType(request: *const std.http.Server.Request) ?[]const u8 {
+    var headers = request.iterateHeaders();
+    while (headers.next()) |header| {
+        if (!std.ascii.eqlIgnoreCase(header.name, "content-type")) continue;
+        const value = if (std.mem.indexOfScalar(u8, header.value, ';')) |separator|
+            header.value[0..separator]
+        else
+            header.value;
+        return std.mem.trim(u8, value, &std.ascii.whitespace);
+    }
+    return null;
+}
+
+fn supportedImageMime(value: ?[]const u8) ?[]const u8 {
+    const mime = value orelse return null;
+    if (std.ascii.eqlIgnoreCase(mime, "image/png")) return "image/png";
+    if (std.ascii.eqlIgnoreCase(mime, "image/jpeg")) return "image/jpeg";
+    if (std.ascii.eqlIgnoreCase(mime, "image/webp")) return "image/webp";
+    if (std.ascii.eqlIgnoreCase(mime, "image/gif")) return "image/gif";
+    if (std.ascii.eqlIgnoreCase(mime, "image/bmp")) return "image/bmp";
+    return null;
+}
+
+fn imageExtension(mime: []const u8) []const u8 {
+    if (std.mem.eql(u8, mime, "image/png")) return "png";
+    if (std.mem.eql(u8, mime, "image/jpeg")) return "jpg";
+    if (std.mem.eql(u8, mime, "image/webp")) return "webp";
+    if (std.mem.eql(u8, mime, "image/gif")) return "gif";
+    if (std.mem.eql(u8, mime, "image/bmp")) return "bmp";
+    unreachable;
+}
+
+fn imageBytesMatchMime(mime: []const u8, bytes: []const u8) bool {
+    if (std.mem.eql(u8, mime, "image/png"))
+        return bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], "\x89PNG\r\n\x1a\n");
+    if (std.mem.eql(u8, mime, "image/jpeg"))
+        return bytes.len >= 3 and bytes[0] == 0xff and bytes[1] == 0xd8 and bytes[2] == 0xff;
+    if (std.mem.eql(u8, mime, "image/webp"))
+        return bytes.len >= 12 and std.mem.eql(u8, bytes[0..4], "RIFF") and std.mem.eql(u8, bytes[8..12], "WEBP");
+    if (std.mem.eql(u8, mime, "image/gif"))
+        return bytes.len >= 6 and (std.mem.eql(u8, bytes[0..6], "GIF87a") or std.mem.eql(u8, bytes[0..6], "GIF89a"));
+    if (std.mem.eql(u8, mime, "image/bmp"))
+        return bytes.len >= 2 and bytes[0] == 'B' and bytes[1] == 'M';
+    return false;
+}
+
+fn validAttachmentId(value: []const u8) bool {
+    if (value.len == 0 or value.len > 96) return false;
+    for (value) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '.') return false;
+    }
+    return std.mem.startsWith(u8, value, "web-");
+}
+
+const StoredChatImage = struct {
+    path: []u8,
+    attachment_id: []u8,
+
+    fn deinit(self: StoredChatImage, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.attachment_id);
+    }
+};
+
+fn storeChatImage(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    pref_path: []const u8,
+    mime: []const u8,
+    bytes: []const u8,
+) !StoredChatImage {
+    const directory = try std.fs.path.join(allocator, &.{ pref_path, WEB_CHAT_IMAGE_DIR });
+    defer allocator.free(directory);
+    std.Io.Dir.createDirAbsolute(io, directory, .default_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    const timestamp = std.Io.Clock.real.now(io);
+    const timestamp_ns: u128 = @intCast(@max(timestamp.nanoseconds, 0));
+    const content_hash = std.hash.Wyhash.hash(0, bytes);
+    var attempt: usize = 0;
+    while (attempt < 256) : (attempt += 1) {
+        const attachment_id = if (attempt == 0)
+            try std.fmt.allocPrint(allocator, "web-{x}-{x}.{s}", .{ timestamp_ns, content_hash, imageExtension(mime) })
+        else
+            try std.fmt.allocPrint(allocator, "web-{x}-{x}-{d}.{s}", .{ timestamp_ns, content_hash, attempt, imageExtension(mime) });
+        errdefer allocator.free(attachment_id);
+        const path = try std.fs.path.join(allocator, &.{ directory, attachment_id });
+        errdefer allocator.free(path);
+
+        const file = std.Io.Dir.createFileAbsolute(io, path, .{ .exclusive = true });
+        if (file) |created| {
+            defer created.close(io);
+            var write_buffer: [8 * 1024]u8 = undefined;
+            var writer = created.writer(io, &write_buffer);
+            try writer.interface.writeAll(bytes);
+            try writer.interface.flush();
+            return .{ .path = path, .attachment_id = attachment_id };
+        } else |err| switch (err) {
+            error.PathAlreadyExists => {
+                allocator.free(path);
+                allocator.free(attachment_id);
+                continue;
+            },
+            else => return err,
+        }
+    }
+    return error.PathAlreadyExists;
+}
+
 fn respondJson(request: *std.http.Server.Request, status: std.http.Status, body: []const u8) !void {
     var headers = CORS_HEADERS ++ [_]std.http.Header{
         .{ .name = "content-type", .value = "application/json; charset=utf-8" },
@@ -481,6 +660,10 @@ fn mimeType(path: []const u8) []const u8 {
     if (std.mem.endsWith(u8, path, ".css")) return "text/css; charset=utf-8";
     if (std.mem.endsWith(u8, path, ".svg")) return "image/svg+xml";
     if (std.mem.endsWith(u8, path, ".png")) return "image/png";
+    if (std.mem.endsWith(u8, path, ".jpg") or std.mem.endsWith(u8, path, ".jpeg")) return "image/jpeg";
+    if (std.mem.endsWith(u8, path, ".webp")) return "image/webp";
+    if (std.mem.endsWith(u8, path, ".gif")) return "image/gif";
+    if (std.mem.endsWith(u8, path, ".bmp")) return "image/bmp";
     if (std.mem.endsWith(u8, path, ".woff2")) return "font/woff2";
     if (std.mem.endsWith(u8, path, ".ttf")) return "font/ttf";
     if (std.mem.endsWith(u8, path, ".json")) return "application/json";
@@ -492,6 +675,17 @@ test "target split and query" {
     const split = splitTarget("/ws?token=abc&x=1");
     try std.testing.expectEqualStrings("/ws", split.path);
     try std.testing.expectEqualStrings("abc", queryValue(split.query, "token").?);
+}
+
+test "web chat image upload validation accepts supported signatures only" {
+    try std.testing.expectEqualStrings("image/jpeg", supportedImageMime("IMAGE/JPEG").?);
+    try std.testing.expect(supportedImageMime("application/pdf") == null);
+    try std.testing.expect(imageBytesMatchMime("image/png", "\x89PNG\r\n\x1a\nrest"));
+    try std.testing.expect(imageBytesMatchMime("image/webp", "RIFF1234WEBPrest"));
+    try std.testing.expect(!imageBytesMatchMime("image/png", "not an image"));
+    try std.testing.expect(validAttachmentId("web-abc-123.png"));
+    try std.testing.expect(!validAttachmentId("../state.sqlite"));
+    try std.testing.expect(!validAttachmentId("web-a/b.png"));
 }
 
 test {
