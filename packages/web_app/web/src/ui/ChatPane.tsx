@@ -218,7 +218,7 @@ export function ChatPane(props: { pane: LivePane }) {
             {(item) =>
               item.kind === 'group'
                 ? <ToolCallGroup items={item.items} workingSince={workingSince()} />
-                : <TranscriptRow message={item.message} />}
+                : <TranscriptRow message={item.message} pane={props.pane} />}
           </For>
           <Show when={messages().length === 0}>
             <EmptyTranscript />
@@ -543,7 +543,7 @@ function diffLineClass(line: string): string {
   return 'text-[var(--text-muted)]'
 }
 
-function DiffFileRow(props: { file: DiffFileEntry; cardId: string }) {
+function DiffFileRow(props: { file: DiffFileEntry; cardId: string; pane: LivePane }) {
   const [expanded, toggleExpanded] = usePersistedFlag(
     () => `diff:${props.cardId}:${props.file.path}`,
     () => false,
@@ -561,6 +561,16 @@ function DiffFileRow(props: { file: DiffFileEntry; cardId: string }) {
           <span class="mono shrink-0 text-[12px] text-[#34e094]">+{props.file.additions}</span>
           <span class="mono shrink-0 text-[12px] text-[var(--danger)]">-{props.file.deletions}</span>
         </button>
+        <button
+          type="button"
+          class="shrink-0 rounded-[5px] bg-[rgba(56,57,62,0.34)] px-2.5 py-1 text-[11px] text-[var(--text-muted)] hover:bg-[rgba(72,73,79,0.82)] hover:text-white"
+          onClick={(event) => {
+            event.stopPropagation()
+            store.beginDiffComment(props.pane, props.file)
+          }}
+        >
+          Comment
+        </button>
         <CopyPill payload={props.file.patch} />
       </div>
       <Show when={expanded()}>
@@ -574,7 +584,7 @@ function DiffFileRow(props: { file: DiffFileEntry; cardId: string }) {
   )
 }
 
-function DiffCard(props: { message: Message }) {
+function DiffCard(props: { message: Message; pane: LivePane }) {
   const files = createMemo(() => parseDiffSummary(props.message.body))
   const totals = createMemo(() => {
     let additions = 0
@@ -615,7 +625,7 @@ function DiffCard(props: { message: Message }) {
             </div>
           </Show>
           <For each={parsed()}>
-            {(file) => <DiffFileRow file={file} cardId={props.message.message_id} />}
+            {(file) => <DiffFileRow file={file} cardId={props.message.message_id} pane={props.pane} />}
           </For>
         </div>
       )}
@@ -625,12 +635,12 @@ function DiffCard(props: { message: Message }) {
 
 // ---- Rows ------------------------------------------------------------------
 
-function TranscriptRow(props: { message: Message }) {
+function TranscriptRow(props: { message: Message; pane: LivePane }) {
   if (props.message.message_id.endsWith('-stream')) {
     return <WorkingRow message={props.message} />
   }
   if (isDiffSummaryRow(props.message)) {
-    return <DiffCard message={props.message} />
+    return <DiffCard message={props.message} pane={props.pane} />
   }
   if (isCommandCardRow(props.message)) {
     return <CommandCard message={props.message} />

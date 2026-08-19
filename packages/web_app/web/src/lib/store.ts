@@ -197,6 +197,32 @@ function mergeThreadCatalogSettings(
   })
 }
 
+/// Formats the new-file line ranges touched by a unified-diff patch, e.g.
+/// "lines 12-18, 40", so a diff comment names the exact edit (desktop
+/// diffCommentLineSummary parity). Lists at most four hunks and rolls the
+/// rest up as "+N more". Returns null when no `@@` hunk headers parse.
+export function diffCommentLineSummary(patch: string): string | null {
+  // Beyond this many ranges the prefix stops reading as a pointer and starts
+  // crowding out the user's actual comment.
+  const MAX_LISTED_HUNKS = 4
+  const pieces: string[] = []
+  let hunk_count = 0
+  for (const line of patch.split('\n')) {
+    if (!line.startsWith('@@')) continue
+    // The first '+' in a valid header starts the new-side "+start,count".
+    const match = /\+(\d+)(?:,(\d+))?/.exec(line)
+    if (!match) continue
+    const start = Number(match[1])
+    const count = match[2] === undefined ? 1 : Number(match[2])
+    hunk_count += 1
+    if (hunk_count > MAX_LISTED_HUNKS) continue
+    pieces.push(count <= 1 ? `${start}` : `${start}-${start + count - 1}`)
+  }
+  if (hunk_count === 0) return null
+  const more = hunk_count > MAX_LISTED_HUNKS ? `, +${hunk_count - MAX_LISTED_HUNKS} more` : ''
+  return `lines ${pieces.join(', ')}${more}`
+}
+
 function mapTranscriptRows(raw: unknown, fallbackId: string): Message[] {
   const root = unwrapResult<Record<string, unknown>>(raw) ?? asRecord(raw)
   const thread = (root?.thread && typeof root.thread === 'object' ? root.thread : root) as
@@ -1518,6 +1544,30 @@ function createAppStore() {
     setDrafts((prev) => ({ ...prev, [key]: text }))
   }
 
+  /// Prefills the pane's composer with an @-mention of a diff-card file plus
+  /// its +/- counts and edited line ranges so the user can steer the agent on
+  /// that specific edit (desktop beginDiffCommentDraft parity). Appends to an
+  /// in-progress draft instead of replacing it.
+  const beginDiffComment = (
+    pane: LivePane,
+    file: { path: string; additions: number; deletions: number; patch: string },
+  ) => {
+    // Diff cards carry absolute paths; mentions use workspace-relative ones.
+    let mention = file.path
+    const root = workspaces().find((item) => item.workspace_id === pane.workspace_id)?.path ?? ''
+    if (root && mention.startsWith(`${root}/`)) mention = mention.slice(root.length + 1)
+    const ranges = diffCommentLineSummary(file.patch)
+    const draft = draftFor(pane)
+    const separator = draft.length === 0 || draft.endsWith('\n') ? '' : '\n'
+    const lines = ranges ? `, ${ranges}` : ''
+    setDraftFor(
+      pane,
+      `${draft}${separator}About your edit to @${mention} (+${file.additions}/-${file.deletions}${lines}): `,
+    )
+    focusPane(pane)
+    setComposerNonce((value) => value + 1)
+  }
+
   const attachmentsFor = (pane: LivePane | null | undefined) => {
     if (!pane) return []
     return draftAttachments()[paneKey(pane.workspace_id, pane.pane_id)] ?? []
@@ -2196,6 +2246,7 @@ function createAppStore() {
     compact,
     draftFor,
     setDraftFor,
+    beginDiffComment,
     attachmentsFor,
     uploadingAttachmentsFor,
     attachFiles,
