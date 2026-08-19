@@ -9,6 +9,7 @@ export interface Attachment {
   mime: string
   byte_size?: number
   attachment_id?: string | null
+  name?: string
 }
 
 export interface Message {
@@ -30,6 +31,7 @@ export interface Thread {
   /// layout JSON references chat panes by this index.
   sort_index?: number
   archived?: boolean
+  committed?: boolean
   last_activity_at?: number | null
   model_ref?: string | null
   access_mode?: string | null

@@ -1,10 +1,11 @@
 import { For, Show, createEffect, createMemo, createSignal, onCleanup } from 'solid-js'
 import { marked } from 'marked'
 
+import { chatImageUrl } from '../lib/live'
 import { store } from '../lib/store'
-import { type LivePane, type Message } from '../lib/types'
+import { type Attachment, type LivePane, type Message } from '../lib/types'
 import { effortLabel, effortOptionsIn, modelOptionsFor, modelSupportsFast, variantOptionsIn } from '../lib/models'
-import { ProviderGlyph, ZoomButton } from './Icons'
+import { Icon, ProviderGlyph, ZoomButton } from './Icons'
 
 marked.setOptions({ gfm: true, breaks: true })
 
@@ -641,7 +642,10 @@ function TranscriptRow(props: { message: Message }) {
       <article class="flex justify-center">
         <div class="w-full max-w-full rounded-[10px] bg-[var(--user-bubble)] px-3 py-2 text-[15px] leading-[21px] break-words [overflow-wrap:anywhere] text-[var(--text)] lg:max-w-[36rem] lg:px-4 lg:py-2.5">
           <div class="mb-1 text-[11px] text-[var(--time)]">You</div>
-          <div class="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{props.message.body}</div>
+          <MessageAttachments images={props.message.images ?? []} />
+          <Show when={props.message.body.length > 0}>
+            <div class="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{props.message.body}</div>
+          </Show>
         </div>
       </article>
     )
@@ -653,6 +657,42 @@ function TranscriptRow(props: { message: Message }) {
       <div class="markdown" innerHTML={html()} />
     </article>
   )
+}
+
+function MessageAttachments(props: { images: Attachment[] }) {
+  return (
+    <Show when={props.images.length > 0}>
+      <div class="mb-2 grid grid-cols-2 gap-2 sm:grid-cols-3">
+        <For each={props.images}>
+          {(image) => {
+            const src = chatImageUrl(image)
+            return (
+              <Show
+                when={src}
+                fallback={
+                  <div class="flex min-h-16 items-center gap-2 rounded-[8px] bg-black/15 px-3 text-[12px] text-[var(--text-muted)]">
+                    <Icon name="paperclip" class="h-4 w-4 shrink-0" />
+                    <span class="truncate">{attachmentLabel(image)}</span>
+                  </div>
+                }
+              >
+                <img
+                  src={src!}
+                  alt={attachmentLabel(image)}
+                  class="max-h-48 w-full rounded-[8px] bg-black/20 object-contain"
+                  loading="lazy"
+                />
+              </Show>
+            )
+          }}
+        </For>
+      </div>
+    </Show>
+  )
+}
+
+function attachmentLabel(attachment: Attachment): string {
+  return attachment.name || attachment.path.split(/[\\/]/).filter(Boolean).at(-1) || 'Image attachment'
 }
 
 /// The streaming assistant bubble: author slot carries the desktop's ticking
@@ -695,6 +735,10 @@ function WorkingRow(props: { message: Message }) {
 
 function Composer(props: { pane: LivePane; focused: boolean }) {
   let field: HTMLTextAreaElement | undefined
+  let filePicker: HTMLInputElement | undefined
+
+  const attachments = () => store.attachmentsFor(props.pane)
+  const uploading = () => store.uploadingAttachmentsFor(props.pane)
 
   createEffect(() => {
     if (props.focused && store.composerNonce() > 0) field?.focus()
@@ -703,6 +747,7 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
   const onKeyDown = (event: KeyboardEvent) => {
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault()
+      if (uploading()) return
       void store.sendDraft(props.pane)
     }
   }
@@ -712,6 +757,7 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
       class="min-w-0 bg-[var(--chat-black)] px-3 pb-[max(12px,var(--safe-bottom))] lg:px-5 lg:pb-[max(16px,var(--safe-bottom))]"
       onSubmit={(event) => {
         event.preventDefault()
+        if (uploading()) return
         void store.sendDraft(props.pane)
       }}
     >
@@ -719,6 +765,33 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
         <p class="mx-auto mb-2 max-w-[900px] text-right text-xs text-[var(--warning)]">{store.notice()}</p>
       </Show>
       <div class="mx-auto w-full max-w-[900px] rounded-[14px] bg-[var(--panel)] px-4 pt-3 pb-3">
+        <Show when={attachments().length > 0}>
+          <div class="mb-2 flex gap-2 overflow-x-auto pb-1">
+            <For each={attachments()}>
+              {(attachment) => (
+                <div class="group relative h-20 w-24 shrink-0 overflow-hidden rounded-[8px] border border-[var(--border-muted)] bg-[var(--panel-alt)]">
+                  <img
+                    src={chatImageUrl(attachment) ?? ''}
+                    alt={attachmentLabel(attachment)}
+                    class="h-full w-full object-cover"
+                  />
+                  <button
+                    type="button"
+                    class="absolute right-1 top-1 grid h-6 w-6 place-items-center rounded-full bg-black/75 text-white hover:bg-black"
+                    onClick={() => store.removeAttachment(props.pane, attachment)}
+                    aria-label={`Remove ${attachmentLabel(attachment)}`}
+                    title="Remove attachment"
+                  >
+                    <Icon name="close" class="h-3.5 w-3.5" />
+                  </button>
+                  <div class="absolute inset-x-0 bottom-0 truncate bg-black/70 px-1.5 py-1 text-[10px] text-white">
+                    {attachmentLabel(attachment)}
+                  </div>
+                </div>
+              )}
+            </For>
+          </div>
+        </Show>
         <textarea
           ref={(node) => { field = node }}
           class="min-h-[52px] w-full bg-transparent text-[16px] leading-[21px] outline-none placeholder:text-[var(--text-subtle)] lg:min-h-[88px] lg:text-[18px] lg:leading-[22px]"
@@ -729,6 +802,33 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
           onFocus={() => store.focusPane(props.pane)}
         />
         <div class="mt-1 flex flex-wrap items-center gap-1.5">
+          <input
+            ref={(node) => { filePicker = node }}
+            type="file"
+            class="hidden"
+            accept="image/png,image/jpeg,image/webp,image/gif,image/bmp"
+            multiple
+            onChange={(event) => {
+              const files = Array.from(event.currentTarget.files ?? [])
+              event.currentTarget.value = ''
+              void store.attachFiles(props.pane, files)
+            }}
+          />
+          <button
+            type="button"
+            class="grid h-8 w-8 shrink-0 place-items-center rounded-full text-[var(--text-muted)] hover:bg-[var(--panel-alt)] hover:text-[var(--text)] disabled:opacity-35"
+            disabled={uploading() || store.sending()}
+            onClick={() => filePicker?.click()}
+            aria-label="Attach image"
+            title="Attach image (PNG, JPEG, WebP, GIF, or BMP; up to 10 MB)"
+          >
+            <Show
+              when={!uploading()}
+              fallback={<span class="cmd-dot-pulse h-2.5 w-2.5 rounded-full bg-[var(--accent)]" />}
+            >
+              <Icon name="paperclip" class="h-[18px] w-[18px]" />
+            </Show>
+          </button>
           <ComposerPickers pane={props.pane} />
           <Show when={props.pane.fast_mode}>
             <span class="rounded-full bg-[var(--panel-alt)] px-2.5 py-1 text-[12px] text-[var(--text-muted)]">Fast</span>
@@ -751,7 +851,11 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
             <button
               type="submit"
               class="grid h-8 w-8 place-items-center rounded-full bg-[var(--accent)] text-[#06210f] disabled:opacity-35"
-              disabled={store.sending() || store.draftFor(props.pane).trim().length === 0}
+              disabled={
+                store.sending() ||
+                uploading() ||
+                (store.draftFor(props.pane).trim().length === 0 && attachments().length === 0)
+              }
               aria-label="Send"
             >
               <svg class="h-4 w-4" viewBox="0 0 24 24" aria-hidden="true">

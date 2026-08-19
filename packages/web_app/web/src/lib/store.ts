@@ -2,13 +2,23 @@ import { createMemo, createRoot, createSignal, onCleanup } from 'solid-js'
 
 import { matchKeyAction, type KeyAction } from './keybinds'
 import { dynamicModelOptions, type DynamicModelRow, type ModelOption } from './models'
-import { LiveClient, fetchRpc, unwrapList, unwrapResult, type EventHandler } from './live'
+import { makeThreadTitle } from './thread_title'
+import {
+  LiveClient,
+  deleteChatImage,
+  fetchRpc,
+  unwrapList,
+  unwrapResult,
+  uploadChatImage,
+  type EventHandler,
+} from './live'
 import { linuxWorkspaceId } from './wyhash'
 import {
   paneIsActive,
   paneKey,
   paneTitle,
   synthesizeSplit,
+  type Attachment,
   type LayoutNode,
   type LivePane,
   type Message,
@@ -60,6 +70,10 @@ interface SnapshotPayload {
 
 type TranscriptMap = Record<string, Message[]>
 type DraftMap = Record<string, string>
+type DraftAttachmentMap = Record<string, Attachment[]>
+type AttachmentUploadMap = Record<string, number>
+
+const MAX_CHAT_IMAGE_BYTES = 10 * 1024 * 1024
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' ? (value as Record<string, unknown>) : null
@@ -74,6 +88,11 @@ function mintId(prefix: string): string {
   crypto.getRandomValues(bytes)
   const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('')
   return `${prefix}${Date.now()}-${hex}`
+}
+
+function isOpeningThread(thread: Thread | null, title: string): boolean {
+  if ((thread?.messages?.length ?? 0) > 0) return false
+  return thread?.committed === false || title === 'New Chat' || title === 'New chat' || title === 'New thread'
 }
 
 function methodUnavailable(response: { error?: { code: string } }): boolean {
@@ -92,7 +111,12 @@ function stablePaneId(kind: 'chat' | 'term' | 'browser', key: string): number {
 }
 
 function sameMessage(a: Message, b: Message): boolean {
-  return a.role === b.role && a.author === b.author && a.body === b.body
+  return (
+    a.role === b.role &&
+    a.author === b.author &&
+    a.body === b.body &&
+    JSON.stringify(a.images ?? []) === JSON.stringify(b.images ?? [])
+  )
 }
 
 function mergeMessages(previous: Message[] | undefined, next: Message[]): Message[] {
@@ -182,15 +206,49 @@ function mapTranscriptRows(raw: unknown, fallbackId: string): Message[] {
   return rows.map((row, index) => {
     const record = row as Record<string, unknown>
     const body = record.body ?? record.content ?? record.text ?? record.prompt ?? ''
+    const images = transcriptAttachments(record)
     return {
       message_id: String(record.message_id ?? `${fallbackId}-${index}`),
       role: String(record.role ?? 'assistant'),
       author: String(record.author ?? ''),
       body: typeof body === 'string' ? body : JSON.stringify(body),
+      ...(images.length > 0 ? { images } : {}),
       tool_call_kind: typeof record.tool_call_kind === 'string' ? record.tool_call_kind : null,
       tool_call_status: typeof record.tool_call_status === 'string' ? record.tool_call_status : null,
     }
   })
+}
+
+function transcriptAttachments(record: Record<string, unknown>): Attachment[] {
+  const out: Attachment[] = []
+  const append = (raw: unknown) => {
+    const value = asRecord(raw)
+    if (!value || typeof value.path !== 'string' || !value.path) return
+    const attachment: Attachment = {
+      path: value.path,
+      mime: typeof value.mime === 'string' ? value.mime : '',
+      byte_size: typeof value.byte_size === 'number' ? value.byte_size : undefined,
+      attachment_id: typeof value.attachment_id === 'string' ? value.attachment_id : null,
+    }
+    if (!out.some((existing) => existing.path === attachment.path)) out.push(attachment)
+  }
+  append(record.image)
+  if (Array.isArray(record.images)) for (const image of record.images) append(image)
+  return out
+}
+
+function imageMimeForFile(file: File): string | null {
+  const declared = file.type.toLowerCase()
+  if (['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/bmp'].includes(declared)) {
+    return declared
+  }
+  const extension = file.name.split('.').at(-1)?.toLowerCase()
+  if (extension === 'png') return 'image/png'
+  if (extension === 'jpg' || extension === 'jpeg') return 'image/jpeg'
+  if (extension === 'webp') return 'image/webp'
+  if (extension === 'gif') return 'image/gif'
+  if (extension === 'bmp') return 'image/bmp'
+  return null
 }
 
 function turnIsActive(status: string | undefined): boolean {
@@ -597,6 +655,8 @@ function createAppStore() {
   const [maximizedPaneId, setMaximizedPaneId] = createSignal<number | null>(null)
   const [transcripts, setTranscripts] = createSignal<TranscriptMap>({})
   const [drafts, setDrafts] = createSignal<DraftMap>({})
+  const [draftAttachments, setDraftAttachments] = createSignal<DraftAttachmentMap>({})
+  const [attachmentUploads, setAttachmentUploads] = createSignal<AttachmentUploadMap>({})
   const [paletteOpen, setPaletteOpen] = createSignal(false)
   const [settingsOpen, setSettingsOpen] = createSignal(false)
   const [workspaceDialogOpen, setWorkspaceDialogOpen] = createSignal(false)
@@ -1294,6 +1354,7 @@ function createAppStore() {
         // contains everything the overlay showed.
         finishedTurns.add(tail.turn_id)
         await loadTranscript(pane)
+        await refreshProjection({ scope: 'selected' })
         clearOverlay(key)
         return
       }
@@ -1457,6 +1518,67 @@ function createAppStore() {
     setDrafts((prev) => ({ ...prev, [key]: text }))
   }
 
+  const attachmentsFor = (pane: LivePane | null | undefined) => {
+    if (!pane) return []
+    return draftAttachments()[paneKey(pane.workspace_id, pane.pane_id)] ?? []
+  }
+
+  const uploadingAttachmentsFor = (pane: LivePane | null | undefined) => {
+    if (!pane) return false
+    return (attachmentUploads()[paneKey(pane.workspace_id, pane.pane_id)] ?? 0) > 0
+  }
+
+  const attachFiles = async (pane: LivePane, selected: File[]) => {
+    if (selected.length === 0) return
+    const key = paneKey(pane.workspace_id, pane.pane_id)
+    const accepted: Array<{ file: File; mime: string }> = []
+    for (const file of selected) {
+      const mime = imageMimeForFile(file)
+      if (!mime) {
+        setNotice(`${file.name || 'That file'} is not a supported image.`)
+        continue
+      }
+      if (file.size > MAX_CHAT_IMAGE_BYTES) {
+        setNotice(`${file.name || 'That image'} is larger than 10 MB.`)
+        continue
+      }
+      accepted.push({ file, mime })
+    }
+    if (accepted.length === 0) return
+    setAttachmentUploads((prev) => ({ ...prev, [key]: (prev[key] ?? 0) + accepted.length }))
+    setNotice(null)
+    try {
+      const results = await Promise.allSettled(
+        accepted.map(({ file, mime }) => uploadChatImage(file, mime)),
+      )
+      const uploaded: Attachment[] = []
+      let failure: string | null = null
+      for (const result of results) {
+        if (result.status === 'fulfilled') uploaded.push(result.value)
+        else failure ??= result.reason instanceof Error ? result.reason.message : 'image upload failed'
+      }
+      if (uploaded.length > 0) {
+        setDraftAttachments((prev) => ({ ...prev, [key]: [...(prev[key] ?? []), ...uploaded] }))
+      }
+      if (failure) setNotice(failure)
+    } finally {
+      setAttachmentUploads((prev) => {
+        const next = { ...prev }
+        delete next[key]
+        return next
+      })
+    }
+  }
+
+  const removeAttachment = (pane: LivePane, attachment: Attachment) => {
+    const key = paneKey(pane.workspace_id, pane.pane_id)
+    setDraftAttachments((prev) => ({
+      ...prev,
+      [key]: (prev[key] ?? []).filter((item) => item.path !== attachment.path),
+    }))
+    void deleteChatImage(attachment).catch(() => {})
+  }
+
   const messagesFor = (pane: LivePane | null | undefined) => {
     if (!pane) return []
     const key = paneKey(pane.workspace_id, pane.pane_id)
@@ -1469,8 +1591,10 @@ function createAppStore() {
     const current = pane
     const ws = workspace()
     if (!current || current.kind !== 'chat' || !current.thread_id || !ws) return
+    if (uploadingAttachmentsFor(current) || sending()) return
     const text = draftFor(current).trim()
-    if (!text) return
+    const images = [...attachmentsFor(current)]
+    if (!text && images.length === 0) return
     setSending(true)
     setNotice(null)
     // Optimistic send: clear the box and show the user row before any RPC.
@@ -1479,6 +1603,7 @@ function createAppStore() {
     const key = paneKey(current.workspace_id, current.pane_id)
     const local_message_id = mintId('local-user-')
     setDraftFor(current, '')
+    setDraftAttachments((prev) => ({ ...prev, [key]: [] }))
     setTranscripts((prev) => ({
       ...prev,
       [key]: [
@@ -1488,6 +1613,7 @@ function createAppStore() {
           role: 'user',
           author: 'You',
           body: text,
+          images,
           created_at_ms: Date.now(),
         },
       ],
@@ -1499,6 +1625,9 @@ function createAppStore() {
       }))
       // Only restore if the user has not started typing a new draft.
       if (!draftFor(current)) setDraftFor(current, text)
+      if (attachmentsFor(current).length === 0) {
+        setDraftAttachments((prev) => ({ ...prev, [key]: images }))
+      }
     }
     try {
       const got = await client.call('chat.thread.get', {
@@ -1512,6 +1641,11 @@ function createAppStore() {
       }
       const thread_root = unwrapResult<{ thread?: Thread } & Thread>(got)
       const thread = thread_root?.thread ?? (thread_root as Thread | null)
+      const stored_title = thread?.title ?? current.thread_title ?? 'New Chat'
+      const fallback_prompt = text || (images.length > 0 ? 'Image' : '')
+      const thread_title = isOpeningThread(thread, stored_title)
+        ? makeThreadTitle(fallback_prompt)
+        : stored_title
       const turn_id = mintId('web-turn-')
       const sent = await client.call('chat.turn.start', {
         turn_id,
@@ -1519,7 +1653,13 @@ function createAppStore() {
         local_thread_id: current.thread_id,
         project_path: ws.path,
         prompt: text,
-        thread_title: thread?.title ?? current.thread_title ?? 'Chat',
+        image_paths: images.map((image) => image.path),
+        images: images.map((image) => ({
+          path: image.path,
+          mime: image.mime,
+          byte_size: image.byte_size ?? 0,
+        })),
+        thread_title,
         provider: thread?.provider ?? current.provider ?? 'codex',
         harness: thread?.harness ?? 'local_cli',
         model_ref: thread?.model_ref ?? current.model,
@@ -1533,6 +1673,15 @@ function createAppStore() {
         rollback()
         setNotice(sent.error?.message ?? 'send did not apply')
         return
+      }
+      if (thread_title !== stored_title) {
+        setThreadsByWorkspace((prev) => ({
+          ...prev,
+          [current.workspace_id]: (prev[current.workspace_id] ?? []).map((row) =>
+            row.local_thread_id === current.thread_id ? { ...row, title: thread_title, committed: true } : row,
+          ),
+        }))
+        publishPanes(workspaces())
       }
       // Register the turn locally and start its streaming loop right away
       // instead of waiting for the projection poll to surface its record.
@@ -2047,6 +2196,10 @@ function createAppStore() {
     compact,
     draftFor,
     setDraftFor,
+    attachmentsFor,
+    uploadingAttachmentsFor,
+    attachFiles,
+    removeAttachment,
     messagesFor,
     ensureTranscript,
     selectWorkspace,

@@ -76,6 +76,7 @@ export function Icon(props: { name: string; class?: string }) {
     zoom: 'M9 5H5v4 M19 9V5h-4 M5 15v4h4 M15 19h4v-4',
     unzoom: 'M9 5v4H5 M15 5v4h4 M9 19v-4H5 M15 19v-4h4',
     lock: 'M8 11h8v7H8z M9.4 11V8.8a2.6 2.6 0 0 1 5.2 0V11',
+    paperclip: 'M8.5 12.5l5.8-5.8a3 3 0 0 1 4.2 4.2l-7.2 7.2a4.5 4.5 0 0 1-6.4-6.4l7-7 M9.2 14.8l6.6-6.6',
   }
   return (
     <svg class={props.class ?? 'h-4 w-4'} viewBox="0 0 24 24" aria-hidden="true">
