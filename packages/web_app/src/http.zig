@@ -6,12 +6,16 @@ const headless = @import("headless");
 const config_mod = @import("config.zig");
 const daemon_mod = @import("daemon.zig");
 const mock = @import("mock.zig");
+const office_preview = @import("office_preview.zig");
 const theme_mod = @import("theme.zig");
 
 const log = std.log.scoped(.web_http);
 
 const WEB_CHAT_IMAGE_DIR = "web-chat-images";
 const MAX_CHAT_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+// Workspace files (transcript citations) served for viewing/downloading are
+// read fully into memory, so cap them well below the daemon transport limits.
+const MAX_SERVED_FILE_BYTES: usize = 32 * 1024 * 1024;
 
 const CORS_HEADERS = [_]std.http.Header{
     .{ .name = "access-control-allow-origin", .value = "*" },
@@ -233,6 +237,87 @@ fn handleRequest(
         };
         defer allocator.free(bytes);
         try respondText(request, .ok, mimeType(path), bytes);
+        return;
+    }
+
+    if (std.mem.eql(u8, split.path, "/api/file") and request.head.method == .GET) {
+        // Token-authenticated file read for transcript file citations. The
+        // gateway already proxies arbitrary daemon RPC for the same token, so
+        // this adds no authority beyond what /api/rpc grants; validation only
+        // rejects malformed paths, not locations.
+        const raw_path = queryValue(split.query, "path") orelse {
+            try respondJson(request, .bad_request, "{\"ok\":false,\"error\":\"missing_path\"}");
+            return;
+        };
+        const decoded = try decodeQueryComponent(allocator, raw_path);
+        defer allocator.free(decoded);
+        if (!validServedFilePath(decoded)) {
+            try respondJson(request, .bad_request, "{\"ok\":false,\"error\":\"invalid_path\"}");
+            return;
+        }
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, decoded, allocator, .limited(MAX_SERVED_FILE_BYTES)) catch |err| switch (err) {
+            error.StreamTooLong => {
+                try respondJson(request, .payload_too_large, "{\"ok\":false,\"error\":\"file_too_large\"}");
+                return;
+            },
+            else => {
+                try respondJson(request, .not_found, "{\"ok\":false,\"error\":\"file_not_found\"}");
+                return;
+            },
+        };
+        defer allocator.free(bytes);
+        if (queryValue(split.query, "download") != null) {
+            const disposition = try attachmentDisposition(allocator, decoded);
+            defer allocator.free(disposition);
+            try respondDownload(request, mimeType(decoded), disposition, bytes);
+            return;
+        }
+        try respondText(request, .ok, mimeType(decoded), bytes);
+        return;
+    }
+
+    if (std.mem.eql(u8, split.path, "/api/preview") and request.head.method == .GET) {
+        // Office documents (pptx/docx/xlsx/…) preview as PDFs converted by
+        // LibreOffice headless and cached per document state; the client
+        // renders the result through the same viewer as native PDFs.
+        const raw_path = queryValue(split.query, "path") orelse {
+            try respondJson(request, .bad_request, "{\"ok\":false,\"error\":\"missing_path\"}");
+            return;
+        };
+        const decoded = try decodeQueryComponent(allocator, raw_path);
+        defer allocator.free(decoded);
+        if (!validServedFilePath(decoded)) {
+            try respondJson(request, .bad_request, "{\"ok\":false,\"error\":\"invalid_path\"}");
+            return;
+        }
+        if (!office_preview.convertible(decoded)) {
+            try respondJson(request, .bad_request, "{\"ok\":false,\"error\":\"unsupported_document_type\"}");
+            return;
+        }
+        const pdf_path = office_preview.previewPdf(allocator, io, config.pref_path, env_map, decoded) catch |err| switch (err) {
+            error.SourceNotFound => {
+                try respondJson(request, .not_found, "{\"ok\":false,\"error\":\"file_not_found\"}");
+                return;
+            },
+            error.ConverterUnavailable => {
+                try respondJson(request, .not_implemented, "{\"ok\":false,\"error\":\"preview_needs_libreoffice_on_the_verde_host\"}");
+                return;
+            },
+            error.ConversionFailed => {
+                try respondJson(request, .internal_server_error, "{\"ok\":false,\"error\":\"preview_conversion_failed\"}");
+                return;
+            },
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        defer allocator.free(pdf_path);
+        // Converted decks can exceed the 8 MiB static-file limit; use the
+        // same ceiling as directly served workspace files.
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, pdf_path, allocator, .limited(MAX_SERVED_FILE_BYTES)) catch {
+            try respondJson(request, .internal_server_error, "{\"ok\":false,\"error\":\"preview_conversion_failed\"}");
+            return;
+        };
+        defer allocator.free(bytes);
+        try respondText(request, .ok, "application/pdf", bytes);
         return;
     }
 
@@ -468,6 +553,48 @@ fn queryValue(query: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Decodes one query-string component: '+' means space (URLSearchParams
+/// convention; a literal '+' arrives as %2B) and %XX escapes are resolved.
+fn decodeQueryComponent(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    const buffer = try allocator.dupe(u8, raw);
+    for (buffer) |*byte| {
+        if (byte.* == '+') byte.* = ' ';
+    }
+    const decoded = std.Uri.percentDecodeInPlace(buffer);
+    if (decoded.len == buffer.len) return buffer;
+    const shrunk = try allocator.dupe(u8, decoded);
+    allocator.free(buffer);
+    return shrunk;
+}
+
+/// Served file paths must be absolute and free of traversal segments so a
+/// citation link can never be a relative escape from a logged path.
+fn validServedFilePath(path: []const u8) bool {
+    if (path.len == 0 or !std.fs.path.isAbsolute(path)) return false;
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return false;
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |component| {
+        if (std.mem.eql(u8, component, "..")) return false;
+    }
+    return true;
+}
+
+/// content-disposition value advertising the file's basename; header-unsafe
+/// bytes are replaced so the value never breaks out of the quoted string.
+fn attachmentDisposition(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const basename = std.fs.path.basename(path);
+    const name = if (basename.len == 0) "download" else basename;
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    try writer.writer.writeAll("attachment; filename=\"");
+    for (name) |byte| {
+        const safe = byte >= 0x20 and byte != '"' and byte != '\\' and byte != 0x7f;
+        try writer.writer.writeByte(if (safe) byte else '_');
+    }
+    try writer.writer.writeByte('"');
+    return try writer.toOwnedSlice();
+}
+
 fn requestContentType(request: *const std.http.Server.Request) ?[]const u8 {
     var headers = request.iterateHeaders();
     while (headers.next()) |header| {
@@ -608,6 +735,25 @@ fn respondText(
     });
 }
 
+fn respondDownload(
+    request: *std.http.Server.Request,
+    content_type: []const u8,
+    disposition: []const u8,
+    body: []const u8,
+) !void {
+    const extra = [_]std.http.Header{
+        CORS_HEADERS[0],
+        CORS_HEADERS[1],
+        CORS_HEADERS[2],
+        .{ .name = "content-type", .value = content_type },
+        .{ .name = "content-disposition", .value = disposition },
+    };
+    try request.respond(body, .{
+        .status = .ok,
+        .extra_headers = &extra,
+    });
+}
+
 fn serveStatic(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -655,6 +801,13 @@ fn readFileLimited(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !
 }
 
 fn mimeType(path: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, path, ".pdf")) return "application/pdf";
+    if (std.mem.endsWith(u8, path, ".pptx")) return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+    if (std.mem.endsWith(u8, path, ".docx")) return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    if (std.mem.endsWith(u8, path, ".xlsx")) return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    if (std.mem.endsWith(u8, path, ".md") or std.mem.endsWith(u8, path, ".markdown")) return "text/markdown; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".txt") or std.mem.endsWith(u8, path, ".log")) return "text/plain; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".csv")) return "text/csv; charset=utf-8";
     if (std.mem.endsWith(u8, path, ".html")) return "text/html; charset=utf-8";
     if (std.mem.endsWith(u8, path, ".js")) return "text/javascript; charset=utf-8";
     if (std.mem.endsWith(u8, path, ".css")) return "text/css; charset=utf-8";
@@ -688,6 +841,30 @@ test "web chat image upload validation accepts supported signatures only" {
     try std.testing.expect(!validAttachmentId("web-a/b.png"));
 }
 
+test "served file path validation rejects traversal and relative paths" {
+    try std.testing.expect(validServedFilePath("/home/user/deliverables/report.pdf"));
+    try std.testing.expect(!validServedFilePath("deliverables/report.pdf"));
+    try std.testing.expect(!validServedFilePath("/home/user/../../etc/passwd"));
+    try std.testing.expect(!validServedFilePath(""));
+}
+
+test "query component decoding resolves percent escapes and plus" {
+    const decoded = try decodeQueryComponent(std.testing.allocator, "/home/rtg/My%20Files/a%2Bb.pdf");
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualStrings("/home/rtg/My Files/a+b.pdf", decoded);
+
+    const plus = try decodeQueryComponent(std.testing.allocator, "/tmp/a+b.txt");
+    defer std.testing.allocator.free(plus);
+    try std.testing.expectEqualStrings("/tmp/a b.txt", plus);
+}
+
+test "attachment disposition quotes and sanitizes the basename" {
+    const disposition = try attachmentDisposition(std.testing.allocator, "/tmp/Report \"final\".pdf");
+    defer std.testing.allocator.free(disposition);
+    try std.testing.expectEqualStrings("attachment; filename=\"Report _final_.pdf\"", disposition);
+}
+
 test {
     _ = mock;
+    _ = office_preview;
 }

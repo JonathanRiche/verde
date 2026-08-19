@@ -132,6 +132,25 @@ export async function deleteChatImage(attachment: Attachment): Promise<void> {
   })
 }
 
+/// Gateway URL that serves a workspace file for inline viewing, or as a
+/// browser download when `download` is set (content-disposition attachment).
+export function workspaceFileUrl(path: string, download = false): string {
+  const query = new URLSearchParams({ path })
+  if (download) query.set('download', '1')
+  const token = readToken()
+  if (token) query.set('token', token)
+  return `/api/file?${query.toString()}`
+}
+
+/// Gateway URL that serves an office document (pptx/docx/xlsx/…) as a PDF
+/// converted by LibreOffice on the Verde host.
+export function officePreviewUrl(path: string): string {
+  const query = new URLSearchParams({ path })
+  const token = readToken()
+  if (token) query.set('token', token)
+  return `/api/preview?${query.toString()}`
+}
+
 export function chatImageUrl(attachment: Attachment): string | null {
   const id = webChatAttachmentId(attachment)
   if (!id) return null
