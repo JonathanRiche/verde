@@ -1,6 +1,7 @@
 import { Show, onCleanup, onMount } from 'solid-js'
 
 import { store } from '../lib/store'
+import { FileViewer } from './FileViewer'
 import { Icon } from './Icons'
 import { Palette, Settings, WorkspaceDialog } from './Overlays'
 import { Sidebar } from './Sidebar'
@@ -58,6 +59,7 @@ export function App() {
       <Palette />
       <Settings />
       <WorkspaceDialog />
+      <FileViewer />
     </div>
   )
 }
