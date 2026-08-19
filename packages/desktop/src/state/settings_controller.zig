@@ -450,7 +450,9 @@ pub fn saveSettingsModal(self: anytype) !void {
     self.app_config.font_size = theme.clampf(self.settings_controller.draft.font_size, app_config.MIN_FONT_SIZE, app_config.MAX_FONT_SIZE);
     self.app_config.terminal_font_size = theme.clampf(self.settings_controller.draft.terminal_font_size, app_config.MIN_TERMINAL_FONT_SIZE, app_config.MAX_TERMINAL_FONT_SIZE);
     self.app_config.workspace_pane_gap = theme.clampf(self.settings_controller.draft.workspace_pane_gap, app_config.MIN_WORKSPACE_PANE_GAP, app_config.MAX_WORKSPACE_PANE_GAP);
-    self.app_config.workspace_panes_per_view = std.math.clamp(self.settings_controller.draft.workspace_panes_per_view, app_config.MIN_WORKSPACE_PANES_PER_VIEW, app_config.MAX_WORKSPACE_PANES_PER_VIEW);
+    const next_panes_per_view = std.math.clamp(self.settings_controller.draft.workspace_panes_per_view, app_config.MIN_WORKSPACE_PANES_PER_VIEW, app_config.MAX_WORKSPACE_PANES_PER_VIEW);
+    const panes_per_view_changed = next_panes_per_view != self.app_config.workspace_panes_per_view;
+    self.app_config.workspace_panes_per_view = next_panes_per_view;
     self.app_config.workspace_scroll_direction = self.settings_controller.draft.workspace_scroll_direction;
     self.app_config.unzoom_on_pane_navigation = self.settings_controller.draft.unzoom_on_pane_navigation;
     self.app_config.reduced_motion = self.settings_controller.draft.reduced_motion;
@@ -489,6 +491,14 @@ pub fn saveSettingsModal(self: anytype) !void {
         } else {
             layout.scroll_mode_override = null;
             layout.scroll_threshold_override = null;
+        }
+    }
+    if (panes_per_view_changed) {
+        // Editing the global density is an explicit request for that width;
+        // stale manual pane widths must not keep silently overriding it, and
+        // the setting has no per-workspace override, so clear every workspace.
+        for (self.project_controller.projects.items) |*project| {
+            project.workspace_layout.clearScrollPaneExtents();
         }
     }
     self.applyTerminalFontSizesFromConfig();
