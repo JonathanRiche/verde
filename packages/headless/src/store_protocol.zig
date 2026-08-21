@@ -267,6 +267,9 @@ pub const SNAPSHOT_SCOPE_TURNS: []const u8 = "turns";
 /// threads or messages, so detached UIs can read open-pane layout without
 /// tripping the transport cap the full `store` scope hits.
 pub const SNAPSHOT_SCOPE_WORKSPACES: []const u8 = "workspaces";
+/// User `verde.json` settings that every daemon client should honor, starting
+/// with workspace strip geometry (`ui.workspace_panes_per_view` and friends).
+pub const SNAPSHOT_SCOPE_CONFIG: []const u8 = "config";
 
 /// Optional filters for a coherent daemon snapshot read.
 pub const CoreSnapshotRequest = struct {
@@ -294,6 +297,22 @@ pub const SessionSummary = struct {
     exit_status: ?i64 = null,
 };
 
+/// Workspace-layout slice of `verde.json` `ui`. Detached clients size the
+/// scrolling strip from these values instead of local defaults.
+pub const ConfigUiSnapshot = struct {
+    workspace_pane_gap: f32 = 12.0,
+    workspace_panes_per_view: u8 = 2,
+    workspace_scroll_direction: []const u8 = "horizontal",
+    workspace_scroll_mode: []const u8 = "automatic",
+    workspace_scroll_threshold: u8 = 2,
+    unzoom_on_pane_navigation: bool = false,
+    reduced_motion: bool = false,
+};
+
+pub const ConfigSnapshot = struct {
+    ui: ConfigUiSnapshot = .{},
+};
+
 pub const CoreSnapshotResult = struct {
     snapshot: Snapshot,
     store_revision: u64,
@@ -307,6 +326,9 @@ pub const CoreSnapshotResult = struct {
     leases: []const registry_protocol.LeaseRecord = &.{},
     sessions: []const SessionSummary = &.{},
     turns: []const TurnRecord = &.{},
+    /// Present when the `config` scope was requested. Null keeps older
+    /// composite replies decode-compatible.
+    config: ?ConfigSnapshot = null,
     /// Scopes the daemon could not fully serve yet (e.g. chat before the
     /// M4-P4 authority flip).  Honest partial snapshots instead of blocking.
     incomplete_scopes: []const []const u8 = &.{},
@@ -607,6 +629,7 @@ test "store DTOs round trip every wire shape" {
                 .status = "running",
             }},
             .turns = &.{turn_record},
+            .config = .{ .ui = .{ .workspace_panes_per_view = 1, .workspace_scroll_mode = "always" } },
             .incomplete_scopes = &.{SNAPSHOT_SCOPE_TURNS},
         },
         StoreStatusRequest{},
@@ -800,6 +823,7 @@ test "store method names and error codes are pinned" {
     try std.testing.expectEqualStrings("sessions", SNAPSHOT_SCOPE_SESSIONS);
     try std.testing.expectEqualStrings("turns", SNAPSHOT_SCOPE_TURNS);
     try std.testing.expectEqualStrings("workspaces", SNAPSHOT_SCOPE_WORKSPACES);
+    try std.testing.expectEqualStrings("config", SNAPSHOT_SCOPE_CONFIG);
     try std.testing.expectEqualStrings("conflict", ERR_CONFLICT);
     try std.testing.expectEqualStrings("store_busy", ERR_STORE_BUSY);
     try std.testing.expectEqualStrings("schema_too_new", ERR_SCHEMA_TOO_NEW);

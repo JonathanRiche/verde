@@ -213,6 +213,8 @@ textarea { resize: none; }
 }
 
 .niri-strip {
+  --workspace-pane-gap: 12px;
+  --workspace-panes-per-view: 2;
   scroll-snap-type: x mandatory;
   overscroll-behavior-x: contain;
   -webkit-overflow-scrolling: touch;
@@ -220,10 +222,10 @@ textarea { resize: none; }
   padding-bottom: env(safe-area-inset-bottom, 0px);
   background: var(--chat-black);
 }
-/* Desktop split: 12px workspace gutter, matching ui.workspace_pane_gap. */
+/* Desktop split: workspace_pane_gap from verde.json, matching ui.workspace_pane_gap. */
 .niri-strip.niri-inset {
-  padding: 12px;
-  gap: 12px;
+  padding: var(--workspace-pane-gap, 12px);
+  gap: var(--workspace-pane-gap, 12px);
 }
 .niri-column {
   display: flex;
@@ -242,18 +244,13 @@ textarea { resize: none; }
   border-radius: 8px;
 }
 @media (min-width: 1024px) {
+  /* Fit `workspace_panes_per_view` columns in the strip content box, then
+     scroll the rest. n=1 is desktop scrolling mode with one pane on screen. */
   .niri-strip:has(.niri-column:nth-child(2)) .niri-column {
-    flex-basis: 50%;
-    width: 50%;
-    min-width: 50%;
-    max-width: 50%;
-  }
-  /* 12px strip padding + 12px gap → two visible columns: (100% - 36px) / 2 */
-  .niri-strip.niri-inset:has(.niri-column:nth-child(2)) .niri-column {
-    flex-basis: calc(50% - 18px);
-    width: calc(50% - 18px);
-    min-width: calc(50% - 18px);
-    max-width: calc(50% - 18px);
+    flex-basis: calc((100% - (var(--workspace-panes-per-view, 2) - 1) * var(--workspace-pane-gap, 0px)) / var(--workspace-panes-per-view, 2));
+    width: calc((100% - (var(--workspace-panes-per-view, 2) - 1) * var(--workspace-pane-gap, 0px)) / var(--workspace-panes-per-view, 2));
+    min-width: calc((100% - (var(--workspace-panes-per-view, 2) - 1) * var(--workspace-pane-gap, 0px)) / var(--workspace-panes-per-view, 2));
+    max-width: calc((100% - (var(--workspace-panes-per-view, 2) - 1) * var(--workspace-pane-gap, 0px)) / var(--workspace-panes-per-view, 2));
   }
 }
 

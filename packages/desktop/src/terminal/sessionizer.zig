@@ -2990,6 +2990,7 @@ pub const Daemon = struct {
         var include_registry = false;
         var include_sessions = false;
         var include_turns = false;
+        var include_config = false;
         var incomplete: std.ArrayList([]const u8) = .empty;
         if (request.scopes) |names| {
             include_store = false;
@@ -2999,6 +3000,7 @@ pub const Daemon = struct {
                 if (std.mem.eql(u8, name, store_protocol.SNAPSHOT_SCOPE_REGISTRY)) include_registry = true;
                 if (std.mem.eql(u8, name, store_protocol.SNAPSHOT_SCOPE_SESSIONS)) include_sessions = true;
                 if (std.mem.eql(u8, name, store_protocol.SNAPSHOT_SCOPE_TURNS)) include_turns = true;
+                if (std.mem.eql(u8, name, store_protocol.SNAPSHOT_SCOPE_CONFIG)) include_config = true;
                 if (scopeIsIncomplete(name, CHAT_AUTHORITY_LANDED)) {
                     try incomplete.append(arena, try arena.dupe(u8, name));
                 }
@@ -3069,6 +3071,10 @@ pub const Daemon = struct {
             try writeRawFragment(&s, sessions_json);
             try s.objectField("turns");
             try writeRawFragment(&s, turns_json);
+            if (include_config) {
+                try s.objectField("config");
+                try writeConfigSnapshot(&s, self.allocator);
+            }
             try s.objectField("incomplete_scopes");
             try s.beginArray();
             for (incomplete.items) |name| try s.write(name);
@@ -7266,7 +7272,8 @@ fn scopeIsIncomplete(scope_name: []const u8, chat_authority_landed: bool) bool {
         std.mem.eql(u8, scope_name, store_protocol.SNAPSHOT_SCOPE_WORKSPACES) or
         std.mem.eql(u8, scope_name, store_protocol.SNAPSHOT_SCOPE_REGISTRY) or
         std.mem.eql(u8, scope_name, store_protocol.SNAPSHOT_SCOPE_SESSIONS) or
-        std.mem.eql(u8, scope_name, store_protocol.SNAPSHOT_SCOPE_TURNS);
+        std.mem.eql(u8, scope_name, store_protocol.SNAPSHOT_SCOPE_TURNS) or
+        std.mem.eql(u8, scope_name, store_protocol.SNAPSHOT_SCOPE_CONFIG);
     if (!known) return true;
     if (!chat_authority_landed and std.mem.eql(u8, scope_name, store_protocol.SNAPSHOT_SCOPE_STORE)) return true;
     return false;
@@ -7288,6 +7295,32 @@ fn writeRawFragment(s: *std.json.Stringify, fragment: []const u8) !void {
     try s.beginWriteRaw();
     try s.writer.writeAll(fragment);
     s.endWriteRaw();
+}
+
+fn configSnapshotFromApp(config: *const app_config.AppConfig) store_protocol.ConfigSnapshot {
+    return .{
+        .ui = .{
+            .workspace_pane_gap = config.workspace_pane_gap,
+            .workspace_panes_per_view = config.workspace_panes_per_view,
+            .workspace_scroll_direction = @tagName(config.workspace_scroll_direction),
+            .workspace_scroll_mode = @tagName(config.workspace_scroll_mode),
+            .workspace_scroll_threshold = config.workspace_scroll_threshold,
+            .unzoom_on_pane_navigation = config.unzoom_on_pane_navigation,
+            .reduced_motion = config.reduced_motion,
+        },
+    };
+}
+
+/// Load verde.json off the daemon lock and project the client-visible UI
+/// slice. Missing or unreadable files fall back to AppConfig defaults so a
+/// detached UI still gets a coherent strip instead of omitting the field.
+fn writeConfigSnapshot(s: *std.json.Stringify, allocator: std.mem.Allocator) !void {
+    var config = app_config.loadAppConfig(allocator) catch {
+        try s.write(store_protocol.ConfigSnapshot{});
+        return;
+    };
+    defer config.deinit(allocator);
+    try s.write(configSnapshotFromApp(&config));
 }
 
 /// Serialize the registry envelope object into an arena string. Caller holds
@@ -7407,18 +7440,41 @@ fn serializeTurnsFragment(arena: std.mem.Allocator, daemon: *Daemon, workspace_f
 test "incomplete scope policy pins both chat-authority arms" {
     // Landed arm (runtime): every frozen scope name is complete.
     try std.testing.expect(!scopeIsIncomplete("store", true));
+    try std.testing.expect(!scopeIsIncomplete("workspaces", true));
     try std.testing.expect(!scopeIsIncomplete("registry", true));
     try std.testing.expect(!scopeIsIncomplete("sessions", true));
     try std.testing.expect(!scopeIsIncomplete("turns", true));
+    try std.testing.expect(!scopeIsIncomplete("config", true));
     // Pre-M4 arm (scenario 6): the store scope must be honestly incomplete
     // while chat authority is still GUI-side; volatile scopes are unaffected.
     try std.testing.expect(scopeIsIncomplete("store", false));
     try std.testing.expect(!scopeIsIncomplete("registry", false));
+    try std.testing.expect(!scopeIsIncomplete("config", false));
     // Unknown scope names are incomplete in both arms.
     try std.testing.expect(scopeIsIncomplete("chat", true));
     try std.testing.expect(scopeIsIncomplete("chat", false));
     // The runtime constant documents the landed authority flip.
     try std.testing.expect(CHAT_AUTHORITY_LANDED);
+}
+
+test "config snapshot projects workspace strip settings" {
+    const config: app_config.AppConfig = .{
+        .workspace_pane_gap = 8.0,
+        .workspace_panes_per_view = 1,
+        .workspace_scroll_direction = .vertical,
+        .workspace_scroll_mode = .always,
+        .workspace_scroll_threshold = 4,
+        .unzoom_on_pane_navigation = true,
+        .reduced_motion = true,
+    };
+    const snapshot = configSnapshotFromApp(&config);
+    try std.testing.expectEqual(@as(f32, 8.0), snapshot.ui.workspace_pane_gap);
+    try std.testing.expectEqual(@as(u8, 1), snapshot.ui.workspace_panes_per_view);
+    try std.testing.expectEqualStrings("vertical", snapshot.ui.workspace_scroll_direction);
+    try std.testing.expectEqualStrings("always", snapshot.ui.workspace_scroll_mode);
+    try std.testing.expectEqual(@as(u8, 4), snapshot.ui.workspace_scroll_threshold);
+    try std.testing.expect(snapshot.ui.unzoom_on_pane_navigation);
+    try std.testing.expect(snapshot.ui.reduced_motion);
 }
 
 test "registry bump topics map onto the frozen journal topic set" {
@@ -9032,9 +9088,19 @@ fn boundedTitleUtf8Prefix(value: []const u8, max_len: usize) []const u8 {
     return value[0..end];
 }
 
+fn automaticTitleExpectedTitle(requested_title: []const u8, fallback_title: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, requested_title, fallback_title) or
+        chat_threads.isPlaceholderThreadTitle(requested_title))
+    {
+        return requested_title;
+    }
+    return null;
+}
+
 /// Generate an opening-exchange title under the same durable identity guard
 /// for GUI and headless turns. A manual rename changes the stored title away
-/// from `fallback_title`, so the terminal commit cannot overwrite it.
+/// from the accepted fallback/placeholder, so the terminal commit cannot
+/// overwrite it.
 fn maybeGenerateAutomaticChatTurnTitle(daemon: *Daemon, turn: *ChatTurn) void {
     if (turn.use_stub) return;
 
@@ -9060,7 +9126,7 @@ fn maybeGenerateAutomaticChatTurnTitle(daemon: *Daemon, turn: *ChatTurn) void {
         return;
     };
     defer daemon.allocator.free(fallback_title);
-    if (!std.mem.eql(u8, turn.request.thread_title, fallback_title)) return;
+    const expected_title = automaticTitleExpectedTitle(turn.request.thread_title, fallback_title) orelse return;
 
     lockDaemon(daemon);
     const service = daemon.store_service;
@@ -9073,7 +9139,7 @@ fn maybeGenerateAutomaticChatTurnTitle(daemon: *Daemon, turn: *ChatTurn) void {
     const eligible = svc.store.canGenerateAutomaticTitle(
         turn.workspace_id,
         turn.local_thread_id,
-        fallback_title,
+        expected_title,
     ) catch |err| blk: {
         log.warn("automatic chat title eligibility failed err={s}", .{@errorName(err)});
         break :blk false;
@@ -9123,6 +9189,26 @@ fn maybeGenerateAutomaticChatTurnTitle(daemon: *Daemon, turn: *ChatTurn) void {
     if (turn.generated_title) |old| daemon.allocator.free(old);
     turn.generated_title = generated_title;
     turn.mutex.unlock();
+}
+
+test "automatic title eligibility accepts every empty-thread presentation label" {
+    try std.testing.expectEqualStrings(
+        "Opening prompt",
+        automaticTitleExpectedTitle("Opening prompt", "Opening prompt").?,
+    );
+    try std.testing.expectEqualStrings(
+        "New thread",
+        automaticTitleExpectedTitle("New thread", "Opening prompt").?,
+    );
+    try std.testing.expectEqualStrings(
+        "New Chat",
+        automaticTitleExpectedTitle("New Chat", "Opening prompt").?,
+    );
+    try std.testing.expectEqualStrings(
+        "New chat",
+        automaticTitleExpectedTitle("New chat", "Opening prompt").?,
+    );
+    try std.testing.expect(automaticTitleExpectedTitle("My Manual Title", "Opening prompt") == null);
 }
 
 fn chatTurnThread(daemon: *Daemon, turn: *ChatTurn) void {

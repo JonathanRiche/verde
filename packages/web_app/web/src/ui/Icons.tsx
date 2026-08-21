@@ -1,3 +1,5 @@
+import { Show } from 'solid-js'
+
 import { store } from '../lib/store'
 import type { LivePane } from '../lib/types'
 
@@ -49,11 +51,20 @@ export function ProviderGlyph(props: { provider?: string; class?: string }) {
         return null
     }
   }
-  const href = src()
-  if (href) {
-    return <img src={href} alt="" class={props.class ?? 'h-[18px] w-[18px] object-contain opacity-90'} />
-  }
-  return <Icon name="chat" class={props.class ?? 'h-[22px] w-[22px] text-[var(--text-subtle)]'} />
+  // Keep the asset lookup inside Solid's reactive graph. ProviderGlyph stays
+  // mounted in the composer, pane header, and sidebar while an optimistic
+  // provider change updates its prop; resolving `src()` once at mount left
+  // all three locations displaying the previous provider's logo.
+  return (
+    <Show
+      when={src()}
+      fallback={<Icon name="chat" class={props.class ?? 'h-[22px] w-[22px] text-[var(--text-subtle)]'} />}
+    >
+      {(href) => (
+        <img src={href()} alt="" class={props.class ?? 'h-[18px] w-[18px] object-contain opacity-90'} />
+      )}
+    </Show>
+  )
 }
 
 export function Icon(props: { name: string; class?: string }) {

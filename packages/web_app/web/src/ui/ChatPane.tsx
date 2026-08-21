@@ -197,8 +197,13 @@ export function ChatPane(props: { pane: LivePane }) {
         </Show>
         <ZoomButton pane={props.pane} />
       </header>
+      {/* [overflow-anchor:none]: the browser's own scroll anchoring repositions
+          the viewport a frame late when a tall card collapses (visible jitter)
+          and would double-compensate the manual anchoring in showEarlier and
+          DiffFileRow, so all anchoring here is done by hand. */}
       <div
-        class="min-h-0 flex-1 overflow-y-auto px-3 py-3 scrollbar-thin lg:px-5 lg:py-5"
+        class="min-h-0 flex-1 overflow-y-auto px-3 py-3 scrollbar-thin lg:px-5 lg:py-5 [overflow-anchor:none]"
+        data-chat-scroller
         ref={(node) => { scroller = node }}
         onScroll={onScroll}
         onMouseDown={() => store.focusPane(props.pane)}
@@ -548,13 +553,27 @@ function DiffFileRow(props: { file: DiffFileEntry; cardId: string; pane: LivePan
     () => `diff:${props.cardId}:${props.file.path}`,
     () => false,
   )
+  let row_el: HTMLDivElement | undefined
+  // Toggling a tall patch changes the transcript height by hundreds of pixels;
+  // Solid updates the DOM synchronously, so measuring the row before and after
+  // and re-adjusting scrollTop in the same task keeps this header stationary
+  // in the viewport with no intermediate paint (no collapse jitter).
+  const toggleAnchored = () => {
+    const scroll_host = row_el?.closest<HTMLElement>('[data-chat-scroller]') ?? null
+    const top_before = row_el?.getBoundingClientRect().top
+    toggleExpanded()
+    if (row_el && scroll_host && top_before !== undefined) {
+      const drift = row_el.getBoundingClientRect().top - top_before
+      if (drift !== 0) scroll_host.scrollTop += drift
+    }
+  }
   return (
-    <div>
+    <div ref={(node) => { row_el = node }}>
       <div class="flex h-11 min-w-0 items-center gap-2">
         <button
           type="button"
           class="flex h-full min-w-0 flex-1 items-center gap-2 text-left"
-          onClick={toggleExpanded}
+          onClick={toggleAnchored}
         >
           <Chevron open={expanded()} />
           <span class="mono min-w-0 flex-1 truncate text-[13px] text-[var(--text)]">{props.file.path}</span>
@@ -776,7 +795,13 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
       <Show when={props.focused && store.notice()}>
         <p class="mx-auto mb-2 max-w-[900px] text-right text-xs text-[var(--warning)]">{store.notice()}</p>
       </Show>
-      <div class="mx-auto w-full max-w-[900px] rounded-[14px] bg-[var(--panel)] px-4 pt-3 pb-3">
+      {/* Desktop prompt-box parity (state.zig paletteComposerStyle): panel-
+          muted 1px border at rest, 1.5px accent border while focused — the
+          extra 0.5px focus weight comes from a ring shadow so the border
+          swap never shifts layout. @container lets the toolbar shrink the
+          model label in a split column instead of wrapping a second row and
+          making side-by-side composers different heights. */}
+      <div class="@container mx-auto w-full max-w-[900px] rounded-[14px] border border-[var(--panel-muted)] bg-[var(--panel)] px-4 pt-3 pb-3 transition-colors focus-within:border-[var(--accent)] focus-within:shadow-[0_0_0_0.5px_var(--accent)]">
         <Show when={attachments().length > 0}>
           <div class="mb-2 flex gap-2 overflow-x-auto pb-1">
             <For each={attachments()}>
@@ -813,7 +838,7 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
           onKeyDown={onKeyDown}
           onFocus={() => store.focusPane(props.pane)}
         />
-        <div class="mt-1 flex flex-wrap items-center gap-1.5">
+        <div class="mt-1 flex h-8 min-w-0 flex-nowrap items-center gap-1.5">
           <input
             ref={(node) => { filePicker = node }}
             type="file"
@@ -841,17 +866,15 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
               <Icon name="paperclip" class="h-[18px] w-[18px]" />
             </Show>
           </button>
-          <ComposerPickers pane={props.pane} />
-          <Show when={props.pane.fast_mode}>
-            <span class="rounded-full bg-[var(--panel-alt)] px-2.5 py-1 text-[12px] text-[var(--text-muted)]">Fast</span>
-          </Show>
-          <div class="flex-1" />
+          <div class="flex min-w-0 flex-1 items-center gap-1.5">
+            <ComposerPickers pane={props.pane} />
+          </div>
           <Show
             when={!store.paneWorking(props.pane)}
             fallback={
               <button
                 type="button"
-                class="composer-stop grid h-8 w-8 place-items-center rounded-full bg-[var(--warning)]"
+                class="composer-stop grid h-8 w-8 shrink-0 place-items-center rounded-full bg-[var(--warning)]"
                 onClick={() => void store.stopTurn(props.pane)}
                 aria-label="Stop"
                 title="Stop this turn"
@@ -862,7 +885,7 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
           >
             <button
               type="submit"
-              class="grid h-8 w-8 place-items-center rounded-full bg-[var(--accent)] text-[#06210f] disabled:opacity-35"
+              class="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-[var(--accent)] text-[#06210f] disabled:opacity-35"
               disabled={
                 store.sending() ||
                 uploading() ||
@@ -893,49 +916,69 @@ const PROVIDER_OPTIONS = [
 
 function ComposerPickers(props: { pane: LivePane }) {
   const [open, setOpen] = createSignal<'model' | 'effort' | 'variant' | 'fast' | 'access' | null>(null)
-  const [pickerProvider, setPickerProvider] = createSignal(props.pane.provider ?? 'codex')
+  const [selectedProvider, setSelectedProvider] = createSignal(props.pane.provider ?? 'codex')
+  const [selectedModel, setSelectedModel] = createSignal<string | null>(props.pane.model ?? null)
+  const [selectedEffort, setSelectedEffort] = createSignal<string | null>(props.pane.reasoning_effort ?? null)
+  const [selectedVariant, setSelectedVariant] = createSignal<string | null>(props.pane.reasoning_variant ?? null)
+  const [selectedFast, setSelectedFast] = createSignal(props.pane.fast_mode === true)
+  const [selectedAccess, setSelectedAccess] = createSignal(props.pane.access_mode ?? 'supervised')
+  const [pickerProvider, setPickerProvider] = createSignal(selectedProvider())
+  // Picker feedback is local and synchronous; the pane projection catches up
+  // after the durable daemon write. Reconcile external/desktop changes when a
+  // fresh pane value arrives without making the click wait on that round trip.
+  createEffect(() => setSelectedProvider(props.pane.provider ?? 'codex'))
+  createEffect(() => setSelectedModel(props.pane.model ?? null))
+  createEffect(() => setSelectedEffort(props.pane.reasoning_effort ?? null))
+  createEffect(() => setSelectedVariant(props.pane.reasoning_variant ?? null))
+  createEffect(() => setSelectedFast(props.pane.fast_mode === true))
+  createEffect(() => setSelectedAccess(props.pane.access_mode ?? 'supervised'))
   // Daemon catalog (provider.models.list) when the provider is reachable,
   // otherwise the static desktop-parity tables.
-  createEffect(() => store.ensureProviderModels(props.pane.provider))
+  createEffect(() => store.ensureProviderModels(selectedProvider()))
   createEffect(() => store.ensureProviderModels(pickerProvider()))
   const modelsFor = (provider: string | null | undefined) =>
     store.providerModels(provider) ?? modelOptionsFor(provider)
-  const models = () => modelsFor(props.pane.provider)
-  const efforts = () => effortOptionsIn(models(), props.pane.model)
-  const variants = () => variantOptionsIn(models(), props.pane.model)
-  const selectedModel = () => models().find((option) => option.value === props.pane.model) ?? models()[0]
-  const showsFast = () => modelSupportsFast(props.pane.provider, selectedModel())
+  const models = () => modelsFor(selectedProvider())
+  const efforts = () => effortOptionsIn(models(), selectedModel())
+  const variants = () => variantOptionsIn(models(), selectedModel())
+  const selectedModelOption = () => models().find((option) => option.value === selectedModel()) ?? models()[0]
+  const showsFast = () => modelSupportsFast(selectedProvider(), selectedModelOption())
   // Match desktop: only a fresh, never-sent thread may switch providers.
   const allowsProviderChoice = () =>
     store.messagesFor(props.pane).length === 0 &&
     !props.pane.provider_thread_id &&
     !store.paneWorking(props.pane)
   const currentModelLabel = () => {
-    const match = models().find((option) => option.value === props.pane.model)
-    return match?.label ?? models()[0]?.label ?? shortModel(props.pane.model)
+    const match = models().find((option) => option.value === selectedModel())
+    return match?.label ?? models()[0]?.label ?? shortModel(selectedModel())
   }
   const toggleModelPicker = () => {
     if (open() === 'model') {
       setOpen(null)
       return
     }
-    setPickerProvider(props.pane.provider ?? 'codex')
+    setPickerProvider(selectedProvider())
     setOpen('model')
   }
   const pickModel = (provider: string, value: string) => {
     setOpen(null)
-    const provider_changed = provider !== props.pane.provider
-    if (!provider_changed && value === props.pane.model) return
+    const provider_changed = provider !== selectedProvider()
+    if (!provider_changed && value === selectedModel()) return
     // A model switch can invalidate the stored effort/variant (e.g. Claude →
     // Haiku), so re-clamp both against the new model, like the desktop.
     const next = modelsFor(provider).find((option) => option.value === value)
     const effort_still_valid = !provider_changed && (next?.efforts ?? []).some(
-      (option) => option.value === (props.pane.reasoning_effort ?? null),
+      (option) => option.value === selectedEffort(),
     )
     const variant_still_valid =
       !provider_changed &&
-      (!props.pane.reasoning_variant || (next?.variants ?? []).includes(props.pane.reasoning_variant))
+      (!selectedVariant() || (next?.variants ?? []).includes(selectedVariant()!))
     const fast_still_valid = modelSupportsFast(provider, next)
+    setSelectedProvider(provider)
+    setSelectedModel(value)
+    if (!effort_still_valid) setSelectedEffort(null)
+    if (!variant_still_valid) setSelectedVariant(null)
+    if (!fast_still_valid) setSelectedFast(false)
     void store.updateThreadSettings(props.pane, {
       ...(provider_changed ? { provider } : {}),
       model_ref: value,
@@ -946,22 +989,26 @@ function ComposerPickers(props: { pane: LivePane }) {
   }
   const pickEffort = (value: string | null) => {
     setOpen(null)
-    if (value === (props.pane.reasoning_effort ?? null)) return
+    if (value === selectedEffort()) return
+    setSelectedEffort(value)
     void store.updateThreadSettings(props.pane, { reasoning_effort: value })
   }
   const pickVariant = (value: string | null) => {
     setOpen(null)
-    if (value === (props.pane.reasoning_variant ?? null)) return
+    if (value === selectedVariant()) return
+    setSelectedVariant(value)
     void store.updateThreadSettings(props.pane, { reasoning_variant: value })
   }
   const pickFast = (value: 'off' | 'on') => {
     setOpen(null)
-    if ((props.pane.fast_mode ? 'on' : 'off') === value) return
+    if ((selectedFast() ? 'on' : 'off') === value) return
+    setSelectedFast(value === 'on')
     void store.updateThreadSettings(props.pane, { fast_mode: value })
   }
   const pickAccess = (value: 'supervised' | 'full_access') => {
     setOpen(null)
-    if ((props.pane.access_mode ?? 'supervised') === value) return
+    if (selectedAccess() === value) return
+    setSelectedAccess(value)
     void store.updateThreadSettings(props.pane, { access_mode: value })
   }
   const menuClass =
@@ -980,16 +1027,16 @@ function ComposerPickers(props: { pane: LivePane }) {
           onClick={() => setOpen(null)}
         />
       </Show>
-      <div class="relative">
+      <div class="relative min-w-0 shrink">
         <button
           type="button"
-          class="flex items-center gap-1.5 rounded-full bg-[var(--panel-alt)] px-2.5 py-1 text-[12px] text-[var(--text-muted)]"
+          class="flex max-w-full items-center gap-1.5 rounded-full bg-[var(--panel-alt)] px-2.5 py-1 text-[12px] text-[var(--text-muted)]"
           disabled={models().length === 0}
           onClick={toggleModelPicker}
           aria-label="Choose provider and model"
         >
-          <ProviderGlyph provider={props.pane.provider} class="h-4 w-4 object-contain" />
-          <span class="max-w-[9rem] truncate">{currentModelLabel()}</span>
+          <ProviderGlyph provider={selectedProvider()} class="h-4 w-4 shrink-0 object-contain" />
+          <span class="min-w-0 max-w-[5rem] truncate @[28rem]:max-w-[9rem]">{currentModelLabel()}</span>
           <Show when={models().length > 0}>
             <span aria-hidden="true" class="text-[10px]">▾</span>
           </Show>
@@ -1024,15 +1071,15 @@ function ComposerPickers(props: { pane: LivePane }) {
                 {PROVIDER_OPTIONS.find((provider) => provider.value === pickerProvider())?.label ?? pickerProvider()}
               </div>
               <For
-                each={modelsFor(allowsProviderChoice() ? pickerProvider() : props.pane.provider)}
+                each={modelsFor(allowsProviderChoice() ? pickerProvider() : selectedProvider())}
                 fallback={<p class="px-3 py-4 text-xs text-[var(--text-subtle)]">No models available.</p>}
               >
                 {(option) => {
-                  const provider = () => allowsProviderChoice() ? pickerProvider() : (props.pane.provider ?? 'codex')
+                  const provider = () => allowsProviderChoice() ? pickerProvider() : selectedProvider()
                   return (
                     <button
                       type="button"
-                      class={rowClass(provider() === props.pane.provider && option.value === props.pane.model)}
+                      class={rowClass(provider() === selectedProvider() && option.value === selectedModel())}
                       onClick={() => pickModel(provider(), option.value)}
                     >
                       {option.label}
@@ -1045,14 +1092,14 @@ function ComposerPickers(props: { pane: LivePane }) {
         </Show>
       </div>
       <Show when={efforts().length > 0}>
-        <div class="relative">
+        <div class="relative shrink-0">
           <button
             type="button"
             class="flex items-center gap-1 rounded-full bg-[var(--panel-alt)] px-2.5 py-1 text-[12px] text-[var(--text-muted)]"
             onClick={() => setOpen(open() === 'effort' ? null : 'effort')}
             aria-label="Choose reasoning effort"
           >
-            {effortLabel(props.pane.reasoning_effort)}
+            {effortLabel(selectedEffort())}
             <span aria-hidden="true" class="text-[10px]">▾</span>
           </button>
           <Show when={open() === 'effort'}>
@@ -1061,7 +1108,7 @@ function ComposerPickers(props: { pane: LivePane }) {
                 {(option) => (
                   <button
                     type="button"
-                    class={rowClass(option.value === (props.pane.reasoning_effort ?? null))}
+                    class={rowClass(option.value === selectedEffort())}
                     onClick={() => pickEffort(option.value)}
                   >
                     {option.label}
@@ -1073,26 +1120,26 @@ function ComposerPickers(props: { pane: LivePane }) {
         </div>
       </Show>
       <Show when={variants().length > 0}>
-        <div class="relative">
+        <div class="relative shrink-0">
           <button
             type="button"
             class="flex items-center gap-1 rounded-full bg-[var(--panel-alt)] px-2.5 py-1 text-[12px] capitalize text-[var(--text-muted)]"
             onClick={() => setOpen(open() === 'variant' ? null : 'variant')}
             aria-label="Choose reasoning variant"
           >
-            {props.pane.reasoning_variant ?? 'Default'}
+            {selectedVariant() ?? 'Default'}
             <span aria-hidden="true" class="text-[10px]">▾</span>
           </button>
           <Show when={open() === 'variant'}>
             <div class={menuClass} role="menu">
-              <button type="button" class={rowClass(!props.pane.reasoning_variant)} onClick={() => pickVariant(null)}>
+              <button type="button" class={rowClass(!selectedVariant())} onClick={() => pickVariant(null)}>
                 Default
               </button>
               <For each={variants()}>
                 {(variant) => (
                   <button
                     type="button"
-                    class={`${rowClass(variant === props.pane.reasoning_variant)} capitalize`}
+                    class={`${rowClass(variant === selectedVariant())} capitalize`}
                     onClick={() => pickVariant(variant)}
                   >
                     {variant}
@@ -1104,50 +1151,61 @@ function ComposerPickers(props: { pane: LivePane }) {
         </div>
       </Show>
       <Show when={showsFast()}>
-        <div class="relative">
+        <div class="relative shrink-0">
           <button
             type="button"
             class="flex items-center gap-1 rounded-full bg-[var(--panel-alt)] px-2.5 py-1 text-[12px] text-[var(--text-muted)]"
             onClick={() => setOpen(open() === 'fast' ? null : 'fast')}
             aria-label="Choose service speed"
           >
-            {props.pane.fast_mode ? 'Fast' : 'Default speed'}
+            <span class="max-w-[5.5rem] truncate @[28rem]:max-w-none">
+              {selectedFast() ? 'Fast' : 'Default speed'}
+            </span>
             <span aria-hidden="true" class="text-[10px]">▾</span>
           </button>
           <Show when={open() === 'fast'}>
             <div class={menuClass} role="menu">
-              <button type="button" class={rowClass(!props.pane.fast_mode)} onClick={() => pickFast('off')}>
+              <button type="button" class={rowClass(!selectedFast())} onClick={() => pickFast('off')}>
                 Default
               </button>
-              <button type="button" class={rowClass(props.pane.fast_mode === true)} onClick={() => pickFast('on')}>
+              <button type="button" class={rowClass(selectedFast())} onClick={() => pickFast('on')}>
                 Fast
               </button>
             </div>
           </Show>
         </div>
       </Show>
-      <div class="relative">
+      {/* The speed picker already reads "Fast" when fast mode is on; this
+          static pill only appears when the picker is hidden (model without a
+          fast tier but a persisted fast_mode flag), so composers never carry
+          a duplicate pill that wraps the row and unevens pane heights. */}
+      <Show when={!showsFast() && selectedFast()}>
+        <span class="shrink-0 rounded-full bg-[var(--panel-alt)] px-2.5 py-1 text-[12px] text-[var(--text-muted)]">Fast</span>
+      </Show>
+      <div class="relative shrink-0">
         <button
           type="button"
-          class="flex items-center gap-1 rounded-full bg-[var(--panel-alt)] px-2.5 py-1 text-[12px] text-[var(--text-muted)]"
+          class="flex max-w-full items-center gap-1 rounded-full bg-[var(--panel-alt)] px-2.5 py-1 text-[12px] text-[var(--text-muted)]"
           onClick={() => setOpen(open() === 'access' ? null : 'access')}
           aria-label="Choose permissions"
         >
-          {props.pane.access_mode === 'full_access' ? 'Full access' : 'Supervised'}
+          <span class="max-w-[5.5rem] truncate @[28rem]:max-w-none">
+            {selectedAccess() === 'full_access' ? 'Full access' : 'Supervised'}
+          </span>
           <span aria-hidden="true" class="text-[10px]">▾</span>
         </button>
         <Show when={open() === 'access'}>
           <div class={menuClass} role="menu">
             <button
               type="button"
-              class={rowClass((props.pane.access_mode ?? 'supervised') === 'supervised')}
+              class={rowClass(selectedAccess() === 'supervised')}
               onClick={() => pickAccess('supervised')}
             >
               Supervised
             </button>
             <button
               type="button"
-              class={rowClass(props.pane.access_mode === 'full_access')}
+              class={rowClass(selectedAccess() === 'full_access')}
               onClick={() => pickAccess('full_access')}
             >
               Full access

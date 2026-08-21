@@ -15,3 +15,8 @@ export function makeThreadTitle(prompt: string): string {
   }
   return title.trimEnd() || 'New chat'
 }
+
+/// Empty-thread labels emitted by the daemon, native desktop, and web app.
+export function isPlaceholderThreadTitle(title: string): boolean {
+  return title === 'New Chat' || title === 'New chat' || title === 'New thread'
+}

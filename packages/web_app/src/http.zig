@@ -466,9 +466,10 @@ fn pollChanges(session: *WsSession) void {
 const SnapshotParams = struct {
     // The durable store snapshot exceeds the daemon's 8 MiB transport cap.
     // Detached UIs take the lightweight workspaces scope (rows + persisted
-    // layout, no messages) plus volatile scopes, and read threads via
-    // chat.thread.*. Older daemons report "workspaces" via incomplete_scopes.
-    scopes: [4][]const u8 = .{ "workspaces", "registry", "sessions", "turns" },
+    // layout, no messages) plus volatile scopes and the shared verde.json
+    // UI slice, and read threads via chat.thread.*. Older daemons report
+    // unknown scopes via incomplete_scopes.
+    scopes: [5][]const u8 = .{ "workspaces", "registry", "sessions", "turns", "config" },
 };
 
 fn pushSnapshot(session: *WsSession) !void {

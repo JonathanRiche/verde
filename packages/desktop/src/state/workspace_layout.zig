@@ -137,6 +137,8 @@ pub const WorkspaceLayout = struct {
     /// placing the selected pane at the strip's leading edge.
     scroll_leading_pane_id: ?WorkspacePaneId = null,
     scroll_animation_last_ms: i64 = 0,
+    /// Transient wheel-settle deadline. Zero means no pane snap is pending.
+    scroll_snap_deadline_ms: i64 = 0,
     scroll_axis_vertical: bool = false,
     /// Null values inherit the global app configuration. Both fields are
     /// persisted with the workspace layout so a local pin/threshold survives
@@ -1804,6 +1806,7 @@ test "workspace layout persists the scrolling target" {
     layout.scroll_target_y = 96.25;
     layout.requestLeadingScrollReveal(1);
     layout.scroll_animation_last_ms = 900;
+    layout.scroll_snap_deadline_ms = 1200;
 
     try std.testing.expectEqual(@as(?WorkspacePaneId, 1), layout.scroll_leading_pane_id);
 
@@ -1820,6 +1823,7 @@ test "workspace layout persists the scrolling target" {
     try std.testing.expectEqual(@as(?WorkspacePaneId, null), restored.scroll_revealed_pane_id);
     try std.testing.expectEqual(@as(?WorkspacePaneId, null), restored.scroll_leading_pane_id);
     try std.testing.expectEqual(@as(i64, 0), restored.scroll_animation_last_ms);
+    try std.testing.expectEqual(@as(i64, 0), restored.scroll_snap_deadline_ms);
 }
 
 test "workspace layout round-trips nonuniform split and explicit focus exactly" {

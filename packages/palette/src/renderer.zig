@@ -257,6 +257,18 @@ pub const Renderer = struct {
     pub fn claimWindow(self: *Renderer, window: *sdl.Window) !void {
         const device = self.device orelse return error.SdlGpuCreateDeviceFailed;
         if (!c.SDL_ClaimWindowForGPUDevice(device, @ptrCast(window))) return error.SdlGpuClaimWindowFailed;
+        // FIFO VSYNC can hold the UI thread inside swapchain acquisition when
+        // the compositor is busy (screen capture is a common trigger). MAILBOX
+        // keeps tear-free presentation while replacing stale queued frames,
+        // so pointer/wheel input does not accumulate into visible jumps.
+        if (c.SDL_WindowSupportsGPUPresentMode(device, @ptrCast(window), c.SDL_GPU_PRESENTMODE_MAILBOX)) {
+            if (!c.SDL_SetGPUSwapchainParameters(
+                device,
+                @ptrCast(window),
+                c.SDL_GPU_SWAPCHAINCOMPOSITION_SDR,
+                c.SDL_GPU_PRESENTMODE_MAILBOX,
+            )) return error.SdlGpuSwapchainParametersFailed;
+        }
     }
 
     pub fn releaseWindow(self: *Renderer, window: *sdl.Window) void {

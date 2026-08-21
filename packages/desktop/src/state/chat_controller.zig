@@ -1125,8 +1125,8 @@ test "failed dispatch restores retryable draft; async acceptance arms one addres
     // M4-P3 via 7.5: durability is the acceptance receipt, now awaited on a
     // worker. A dispatch failure restores the draft (nothing reached the
     // daemon); a successful dispatch stages exactly one user row, arms one
-    // pending send, and leaves the draft in the composer until the receipt
-    // commits (commitAcceptanceDispatch is covered separately below).
+    // pending send, and clears the visible draft once the worker is running
+    // (commitAcceptanceDispatch is covered separately below).
     const allocator = std.testing.allocator;
     const FakeState = struct {
         allocator: std.mem.Allocator,
@@ -1177,7 +1177,7 @@ test "failed dispatch restores retryable draft; async acceptance arms one addres
             prompt: []const u8,
             _: ProviderExecutionTarget,
             _: *InitialSendSnapshot,
-            _: bool,
+            selected: bool,
         ) !void {
             try std.testing.expectEqualStrings("retryable prompt", prompt);
             self.handoff_attempts += 1;
@@ -1191,6 +1191,9 @@ test "failed dispatch restores retryable draft; async acceptance arms one addres
             send_state.daemon_owned = true;
             send_state.acceptance_pending = true;
             self.provider_handoffs += 1;
+            thread.clearDraft();
+            self.markDirty();
+            if (selected) self.resetComposerInputWidget();
         }
 
         pub fn appendInitialSendFailure(self: *@This(), _: *ChatThread, _: []const u8) void {
@@ -1234,9 +1237,9 @@ test "failed dispatch restores retryable draft; async acceptance arms one addres
     try std.testing.expect(try sendThreadDraft(&state, 0, 0));
     try std.testing.expectEqual(@as(usize, 1), state.provider_handoffs);
     try std.testing.expectEqual(@as(usize, 2), state.handoff_attempts);
-    // Async acceptance (7.5): the composer keeps the submitted draft until
-    // the receipt commits, and the pending send blocks a duplicate submit.
-    try std.testing.expectEqualStrings("retryable prompt", thread.currentDraft());
+    // Async acceptance (7.5): spawning the worker clears the composer without
+    // waiting for the receipt, and the pending send blocks a duplicate submit.
+    try std.testing.expectEqualStrings("", thread.currentDraft());
     try std.testing.expectEqual(@as(usize, 1), thread.messages.items.len);
     try std.testing.expectEqualStrings("retryable prompt", thread.messages.items[0].body);
     try std.testing.expect(thread.isSendAcceptancePending());
@@ -1249,7 +1252,7 @@ test "failed dispatch restores retryable draft; async acceptance arms one addres
     thread.send_state.mutex.unlock();
 }
 
-test "acceptance commit clears unchanged draft, retains message id, and restores on rejection" {
+test "acceptance keeps the optimistic clear, retains message id, and restores rejection" {
     const allocator = std.testing.allocator;
     const FakeState = struct {
         allocator: std.mem.Allocator,
@@ -1373,16 +1376,21 @@ test "acceptance commit clears unchanged draft, retains message id, and restores
         }
     }.call;
 
-    // Accepted: message id retained on the staged row, unchanged draft cleared.
+    // Accepted: the worker-start boundary clears text and image immediately;
+    // the later receipt only retains the staged message identity.
     thread.setDraft("submitted prompt");
+    try thread.setDraftImage(allocator, "/tmp/submitted.png", "image/png", 17);
     try thread.messages.append(allocator, .{
         .role = .user,
         .author = try allocator.dupeZ(u8, "You"),
         .body = try allocator.dupeZ(u8, "submitted prompt"),
         .extra_images = try allocator.alloc(ChatImageAttachment, 0),
     });
-    try armThread(&state.chat_controller, thread);
     const accepted = try makeDispatch(project_id, thread.local_thread_id, "submitted prompt", .accepted);
+    clearComposerForAcceptance(&state, thread, accepted, true);
+    try std.testing.expectEqualStrings("", thread.currentDraft());
+    try std.testing.expectEqual(@as(usize, 0), thread.draftImageCount());
+    try armThread(&state.chat_controller, thread);
     try std.testing.expect(commitAcceptanceDispatch(&state, accepted));
     accepted.destroy(allocator);
     try std.testing.expectEqualStrings("", thread.currentDraft());
@@ -1392,31 +1400,40 @@ test "acceptance commit clears unchanged draft, retains message id, and restores
     try std.testing.expect(thread.isSendPending());
     try std.testing.expectEqual(@as(usize, 0), state.failure_rows);
 
-    // Rejected: staged row popped, send disarmed, failure row + flush emitted.
+    // Rejected: staged row popped, send disarmed, and the dispatch transfers
+    // the submitted text/image back into an otherwise untouched composer.
     thread.send_state.mutex.lock();
     thread.send_state.status = .idle;
     thread.send_state.daemon_owned = false;
     thread.send_state.mutex.unlock();
     state.chat_controller.finishSend();
     thread.setDraft("second prompt");
+    try thread.setDraftImage(allocator, "/tmp/retry.png", "image/png", 23);
     try thread.messages.append(allocator, .{
         .role = .user,
         .author = try allocator.dupeZ(u8, "You"),
         .body = try allocator.dupeZ(u8, "second prompt"),
         .extra_images = try allocator.alloc(ChatImageAttachment, 0),
     });
-    try armThread(&state.chat_controller, thread);
     const rejected = try makeDispatch(project_id, thread.local_thread_id, "second prompt", .rejected);
+    clearComposerForAcceptance(&state, thread, rejected, true);
+    try std.testing.expectEqualStrings("", thread.currentDraft());
+    try std.testing.expectEqual(@as(usize, 0), thread.draftImageCount());
+    try armThread(&state.chat_controller, thread);
     rejected.snapshot.message_count = 1;
     rejected.snapshot.committed = thread.committed;
     rejected.snapshot.last_activity_at = thread.last_activity_at;
     try std.testing.expect(commitAcceptanceDispatch(&state, rejected));
     rejected.destroy(allocator);
     try std.testing.expectEqualStrings("second prompt", thread.currentDraft());
+    try std.testing.expectEqual(@as(usize, 1), thread.draftImageCount());
+    try std.testing.expectEqualStrings("/tmp/retry.png", thread.draft_image.?.path);
     try std.testing.expectEqual(@as(usize, 1), thread.messages.items.len);
     try std.testing.expect(!thread.isSendPending());
     try std.testing.expectEqual(@as(usize, 1), state.failure_rows);
     try std.testing.expectEqual(@as(usize, 1), state.flushes);
+    try std.testing.expectEqual(@as(usize, 3), state.dirty_marks);
+    try std.testing.expectEqual(@as(usize, 3), state.composer_resets);
     try std.testing.expectEqual(@as(usize, 0), state.chat_controller.pending_send_count);
 }
 
@@ -1722,8 +1739,8 @@ pub fn sendThreadDraftWithUiPolicy(self: anytype, project_index: usize, thread_i
     // provider work; do not pre-flush via persistThreadBlocking. The RPC now
     // runs on an acceptance worker (7.5) so a busy daemon cannot stall the
     // event thread; the receipt commits in pollSend with the same
-    // rejected/ambiguous classification, and the draft stays in the composer
-    // until acceptance so failure leaves it retryable.
+    // rejected/ambiguous classification. Once the worker exists it clears the
+    // composer immediately and owns the submitted attachments for rollback.
     self.dispatchDaemonAcceptance(project_index, thread, draft, execution_target, &snapshot, selected_target) catch |err| {
         // Dispatch failures happen before anything reaches the daemon, so
         // restoring the staged user row is safe and the draft stays intact.
@@ -1858,8 +1875,8 @@ pub fn storeDraftDuringSend(self: anytype, kind: FollowupKind) void {
         self.setSidebarNotice("This chat is not running.");
         return;
     }
-    // The composer still holds the just-submitted prompt while its acceptance
-    // receipt is in flight (7.5); queueing it now would double-send.
+    // The just-submitted prompt is staged while its acceptance receipt is in
+    // flight (7.5); queueing during this boundary could double-send it.
     if (thread.isSendAcceptancePending()) {
         self.setSidebarNotice("Still confirming the previous send...");
         return;
@@ -2172,18 +2189,56 @@ pub const AcceptanceDispatch = struct {
     params: AcceptanceTurnStartParams,
     /// Owned pre-submit rollback state; allocated with the state allocator.
     snapshot: InitialSendSnapshot,
+    /// Submitted attachments move here when the visible composer clears.
+    /// Keeping ownership in the dispatch makes rejection rollback infallible
+    /// without adding allocations or file I/O to the submit path.
+    submitted_image: ?ChatImageAttachment = null,
+    submitted_extra_images: std.ArrayList(ChatImageAttachment) = .empty,
     rpc_elapsed_ms: i64 = 0,
     outcome: AcceptanceOutcome = .ambiguous,
     err: ?anyerror = null,
     done: std.atomic.Value(bool) = .init(false),
     worker: ?std.Thread = null,
 
+    fn takeSubmittedComposer(self: *AcceptanceDispatch, thread: *ChatThread) void {
+        thread.clearDraft();
+        self.submitted_image = thread.draft_image;
+        thread.draft_image = null;
+        std.mem.swap(std.ArrayList(ChatImageAttachment), &self.submitted_extra_images, &thread.draft_extra_images);
+    }
+
+    fn restoreSubmittedComposer(self: *AcceptanceDispatch, thread: *ChatThread) bool {
+        // A background/MCP caller may have staged another draft while the
+        // receipt was in flight. Never replace independently authored input.
+        if (thread.currentDraft().len != 0 or thread.draftImageCount() != 0) return false;
+        thread.setDraft(self.params.prompt);
+        thread.draft_image = self.submitted_image;
+        self.submitted_image = null;
+        std.mem.swap(std.ArrayList(ChatImageAttachment), &thread.draft_extra_images, &self.submitted_extra_images);
+        return true;
+    }
+
     fn destroy(self: *AcceptanceDispatch, allocator: std.mem.Allocator) void {
         self.snapshot.deinit(allocator);
+        if (self.submitted_image) |*image| image.deinit(allocator);
+        for (self.submitted_extra_images.items) |*image| image.deinit(allocator);
+        self.submitted_extra_images.deinit(allocator);
         self.arena.deinit();
         std.heap.page_allocator.destroy(self);
     }
 };
+
+fn clearComposerForAcceptance(self: anytype, thread: *ChatThread, dispatch: *AcceptanceDispatch, selected: bool) void {
+    dispatch.takeSubmittedComposer(thread);
+    self.markDirty();
+    if (selected) self.resetComposerInputWidget();
+}
+
+fn restoreComposerAfterRejectedAcceptance(self: anytype, thread: *ChatThread, dispatch: *AcceptanceDispatch, selected: bool) void {
+    if (!dispatch.restoreSubmittedComposer(thread)) return;
+    self.markDirty();
+    if (selected) self.resetComposerInputWidget();
+}
 
 fn acceptanceWorkerMain(dispatch: *AcceptanceDispatch) void {
     const alloc = std.heap.page_allocator;
@@ -2213,11 +2268,11 @@ fn classifyAcceptanceFailure(alloc: std.mem.Allocator, dispatch: *AcceptanceDisp
     return if (err == error.DaemonRequestFailed) .rejected else .ambiguous;
 }
 
-/// Stages the daemon acceptance for a just-appended user row without blocking
-/// the event thread: arms the pending send (draft intentionally NOT cleared —
-/// the acceptance receipt commit clears it, preserving M4-P3), snapshots the
-/// wire params, and spawns the worker. Errors mean nothing was sent, so the
-/// caller may treat them as confirmed-safe failures.
+/// Stages daemon acceptance for a just-appended user row without blocking the
+/// event thread. The pending send is armed before worker spawn; after a
+/// successful spawn the composer clears immediately and this dispatch owns
+/// its attachments until the receipt is classified. Spawn errors mean nothing
+/// was sent, so the caller may treat them as confirmed-safe failures.
 pub fn dispatchDaemonAcceptance(
     self: anytype,
     project_index: usize,
@@ -2227,7 +2282,6 @@ pub fn dispatchDaemonAcceptance(
     snapshot: *InitialSendSnapshot,
     selected_target: bool,
 ) !void {
-    _ = selected_target;
     const page_alloc = std.heap.page_allocator;
     const project = &self.project_controller.projects.items[project_index];
     const now_ms = unixTimestampMs();
@@ -2322,6 +2376,11 @@ pub fn dispatchDaemonAcceptance(
         dispatch.destroy(self.allocator);
         return err;
     };
+    // Once the worker exists, submission is visibly complete. Clear the
+    // composer immediately instead of holding its text/images hostage to a
+    // potentially slow daemon receipt. The dispatch owns the attachments for
+    // rejection rollback, so this remains infallible and non-blocking.
+    clearComposerForAcceptance(self, thread, dispatch, selected_target);
 }
 
 fn disarmSendStateAfterFailedDispatch(self: anytype, thread: *ChatThread) void {
@@ -2361,11 +2420,11 @@ pub fn pollAcceptanceDispatches(self: anytype) bool {
     return changed;
 }
 
-/// Applies one acceptance outcome with the synchronous path's exact M4-P3
-/// semantics: accepted retains the staged message id and clears the composer
-/// only when it still holds the submitted draft; confirmed rejection restores
-/// the pre-submit thread state and leaves the draft retryable; ambiguous
-/// keeps the staged row and surfaces the preserved-message failure.
+/// Applies one acceptance outcome with the synchronous path's M4-P3 safety:
+/// accepted retains the staged message id and the optimistic composer clear;
+/// confirmed rejection restores the pre-submit state and submitted composer;
+/// ambiguous keeps the staged row and leaves the composer clear so a blind
+/// retry cannot duplicate a possibly accepted turn.
 pub fn commitAcceptanceDispatch(self: anytype, dispatch: *AcceptanceDispatch) bool {
     const resolved = self.projectThreadIndexByLocalId(dispatch.project_id, dispatch.local_thread_id) orelse return false;
     const project = &self.project_controller.projects.items[resolved.project_index];
@@ -2405,14 +2464,6 @@ pub fn commitAcceptanceDispatch(self: anytype, dispatch: *AcceptanceDispatch) bo
                     user_row.message_id = self.allocator.dupe(u8, dispatch.params.message_id) catch null;
                 }
             }
-            // Acceptance may land after the user resumed typing; only clear a
-            // composer that still holds exactly the submitted prompt/images.
-            if (acceptanceDraftUnchanged(thread, dispatch)) {
-                thread.clearDraft();
-                thread.clearDraftImage(self.allocator);
-                self.markDirty();
-                if (selected) self.resetComposerInputWidget();
-            }
             runtime_log.diagnostic("chat submit accepted daemon_start_ms={d} thread_messages={d}", .{
                 dispatch.rpc_elapsed_ms,
                 thread.messages.items.len,
@@ -2421,6 +2472,7 @@ pub fn commitAcceptanceDispatch(self: anytype, dispatch: *AcceptanceDispatch) bo
         .rejected => {
             self.chat_controller.finishSend();
             dispatch.snapshot.restore(self, thread);
+            restoreComposerAfterRejectedAcceptance(self, thread, dispatch, selected);
             self.appendInitialSendFailure(thread, initialSendStartFailureMessage(dispatch.err orelse error.DaemonRequestFailed));
             project.invalidateSidebarThreadCache();
             if (selected) self.requestTranscriptScrollToBottom();
@@ -2428,15 +2480,9 @@ pub fn commitAcceptanceDispatch(self: anytype, dispatch: *AcceptanceDispatch) bo
         },
         .ambiguous => {
             self.chat_controller.finishSend();
-            // Keep the in-memory user row (the daemon may have staged it);
-            // clear the still-unchanged composer so a blind retry cannot
-            // duplicate the provider turn.
-            if (acceptanceDraftUnchanged(thread, dispatch)) {
-                thread.clearDraft();
-                thread.clearDraftImage(self.allocator);
-                self.markDirty();
-                if (selected) self.resetComposerInputWidget();
-            }
+            // Keep the in-memory user row (the daemon may have staged it) and
+            // leave the optimistically cleared composer empty so a blind retry
+            // cannot duplicate the provider turn.
             self.appendInitialSendFailure(thread, ambiguousInitialSendFailureMessage());
             project.invalidateSidebarThreadCache();
             if (selected) self.requestTranscriptScrollToBottom();
@@ -2444,22 +2490,6 @@ pub fn commitAcceptanceDispatch(self: anytype, dispatch: *AcceptanceDispatch) bo
         },
     }
     return true;
-}
-
-fn acceptanceDraftUnchanged(thread: *const ChatThread, dispatch: *const AcceptanceDispatch) bool {
-    if (!std.mem.eql(u8, thread.currentDraft(), dispatch.params.prompt)) return false;
-    var live_index: usize = 0;
-    if (thread.draft_image) |image| {
-        if (live_index >= dispatch.params.image_paths.len) return false;
-        if (!std.mem.eql(u8, image.path, dispatch.params.image_paths[live_index])) return false;
-        live_index += 1;
-    }
-    for (thread.draft_extra_images.items) |image| {
-        if (live_index >= dispatch.params.image_paths.len) return false;
-        if (!std.mem.eql(u8, image.path, dispatch.params.image_paths[live_index])) return false;
-        live_index += 1;
-    }
-    return live_index == dispatch.params.image_paths.len;
 }
 
 pub fn beginSendForThread(
@@ -3020,6 +3050,32 @@ fn consumeReconciledTerminalTurn(args: *TerminalTurnConsumeArgs) void {
     finishTerminalConsume(args.reservation_key, disposition);
 }
 
+/// Move a reattached runtime send to the durable terminal state carried by a
+/// composite snapshot. Projection replacement preserves live SendState by
+/// thread identity, so reconnect must retire that state by turn identity too.
+fn reconcileAttachedTerminalTurn(thread: *ChatThread, turn: headless.store.TurnRecord) void {
+    const send_state = thread.send_state;
+    send_state.mutex.lock();
+    defer send_state.mutex.unlock();
+    if (send_state.status != .pending or !send_state.daemon_owned) return;
+    const attached_turn_id = send_state.daemon_turn_id orelse return;
+    if (!std.mem.eql(u8, attached_turn_id, turn.turn_id)) return;
+
+    if (std.mem.eql(u8, turn.status, "completed")) {
+        send_state.status = .completed;
+    } else if (std.mem.eql(u8, turn.status, "failed")) {
+        if (send_state.error_message) |old| std.heap.page_allocator.free(old);
+        send_state.error_message = std.heap.page_allocator.dupe(
+            u8,
+            turn.error_message orelse "Provider request failed.",
+        ) catch null;
+        send_state.status = .failed;
+    } else if (std.mem.eql(u8, turn.status, "aborted")) {
+        send_state.status = .aborted;
+    } else return;
+    send_state.ui_revision +%= 1;
+}
+
 /// Bounded reconnect presentation for terminal rows already carried by the
 /// cursor worker. Failure status/error is shown locally; retention cleanup is
 /// dispatched asynchronously so the SDL frame performs no daemon I/O.
@@ -3032,7 +3088,8 @@ pub fn reconcileTerminalDaemonChatTurnsSnapshot(self: anytype, turns: []const he
             std.mem.eql(u8, turn.status, "failed") or
             std.mem.eql(u8, turn.status, "aborted");
         if (!terminal) continue;
-        if (retryAdoptionThreadByLocalId(self, turn.workspace_id, turn.local_thread_id) == null) continue;
+        const thread = retryAdoptionThreadByLocalId(self, turn.workspace_id, turn.local_thread_id) orelse continue;
+        reconcileAttachedTerminalTurn(thread, turn);
         if (std.mem.eql(u8, turn.status, "failed")) {
             log.warn(
                 "chat turn {s} failed while the GUI was closed: {s}",
@@ -3186,6 +3243,37 @@ test "launch reconciliation reattaches a live daemon turn once" {
 
     try applyDaemonChatTurnsSnapshotWithAllocator(&state, &turns, std.heap.page_allocator);
     try std.testing.expectEqual(@as(usize, 1), state.chat_controller.pending_send_count);
+}
+
+test "terminal snapshot retires only its matching reattached send" {
+    const allocator = std.testing.allocator;
+    var thread = try ChatThread.init(allocator, "restored terminal turn");
+    defer thread.deinit(allocator);
+    const send_state = thread.send_state;
+    send_state.status = .pending;
+    send_state.daemon_owned = true;
+    send_state.daemon_turn_id = try std.heap.page_allocator.dupe(u8, "turn-restored");
+
+    reconcileAttachedTerminalTurn(&thread, .{
+        .turn_id = "turn-other",
+        .workspace_id = "ws-restored",
+        .local_thread_id = "thread-restored",
+        .status = "aborted",
+        .started_at_ms = 1,
+        .provider = "codex",
+    });
+    try std.testing.expectEqual(SendStatus.pending, send_state.status);
+
+    reconcileAttachedTerminalTurn(&thread, .{
+        .turn_id = "turn-restored",
+        .workspace_id = "ws-restored",
+        .local_thread_id = "thread-restored",
+        .status = "aborted",
+        .started_at_ms = 1,
+        .provider = "codex",
+    });
+    try std.testing.expectEqual(SendStatus.aborted, send_state.status);
+    try std.testing.expectEqual(@as(u64, 1), send_state.ui_revision);
 }
 
 test "M5-P4 reconnect consume deduplicates and validates accepted or not_found" {

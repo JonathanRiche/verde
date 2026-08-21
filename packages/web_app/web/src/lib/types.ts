@@ -199,6 +199,17 @@ export interface SnapshotResult {
   change_cursor?: number | null
   sessions?: SessionSummary[]
   turns?: TurnRecord[]
+  config?: {
+    ui?: {
+      workspace_pane_gap?: number
+      workspace_panes_per_view?: number
+      workspace_scroll_direction?: string
+      workspace_scroll_mode?: string
+      workspace_scroll_threshold?: number
+      unzoom_on_pane_navigation?: boolean
+      reduced_motion?: boolean
+    }
+  }
 }
 
 export interface RpcError {

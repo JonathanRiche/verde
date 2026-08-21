@@ -49,6 +49,7 @@ const QUICK_PANE_MARGIN_CSS: f32 = 12.0;
 const QUICK_PANE_DRAG_H_CSS: f32 = 28.0;
 const QUICK_PANE_RESIZE_GRIP_CSS: f32 = 18.0;
 const SCROLLING_WHEEL_STEP_CSS: f32 = 72.0;
+const SCROLLING_SNAP_IDLE_MS: i64 = 120;
 const SCROLLING_ANIMATION_DURATION_MS: i64 = 150;
 const SCROLLING_ANIMATION_MAX_STEP_MS: i64 = 50;
 const SCROLLING_ANIMATION_EPSILON: f32 = 0.5;
@@ -291,7 +292,9 @@ pub fn handlePaletteWheel(state: *runtime.AppState, x: f32, y: f32, wheel_x: f32
     );
     if (@abs(next_target - target.*) > 0.001) {
         target.* = next_target;
-        layout.scroll_animation_last_ms = nowMs();
+        const timestamp = nowMs();
+        layout.scroll_animation_last_ms = timestamp;
+        layout.scroll_snap_deadline_ms = timestamp + SCROLLING_SNAP_IDLE_MS;
         state.markDirty();
     }
     layout.scroll_revealed_pane_id = layout.focused_pane_id;
@@ -1463,6 +1466,7 @@ fn renderScrollingStrip(
         layout.scroll_axis_vertical = vertical;
         layout.scroll_revealed_pane_id = null;
         layout.scroll_animation_last_ms = 0;
+        layout.scroll_snap_deadline_ms = 0;
     }
 
     const gap = theme.scaledUi(state.app_config.workspace_pane_gap);
@@ -1508,9 +1512,12 @@ fn renderScrollingStrip(
     clampScrollingOffsets(offset, target, max_offset);
 
     // A live edge drag owns scroll; don't let focus-reveal fight the pointer.
-    if (resize_drag == null) {
+    if (resize_drag != null) {
+        layout.scroll_snap_deadline_ms = 0;
+    } else {
         if (layout.focused_pane_id) |focused_id| {
             if (layout.rootContainsPane(focused_id) and layout.scroll_revealed_pane_id != focused_id) {
+                layout.scroll_snap_deadline_ms = 0;
                 if (paneIndexInSidebarOrder(layout, focused_id)) |focused_index| {
                     const revealed_target = revealedScrollTargetForPane(
                         target.*,
@@ -1531,9 +1538,23 @@ fn renderScrollingStrip(
                 layout.scroll_revealed_pane_id = focused_id;
             }
         }
+        if (scrollSnapTargetAfterIdle(
+            layout.scroll_snap_deadline_ms,
+            nowMs(),
+            target.*,
+            extents[0..pane_count],
+            gap,
+            max_offset,
+        )) |snap_target| {
+            layout.scroll_snap_deadline_ms = 0;
+            setScrollingTarget(state, target, &layout.scroll_animation_last_ms, snap_target);
+        }
     }
 
     tickScrollingAnimation(offset, target.*, &layout.scroll_animation_last_ms);
+    // Keep frame pacing active until the idle deadline can settle even a
+    // sub-pixel wheel gesture that finished easing early.
+    if (layout.scroll_snap_deadline_ms != 0) scrolling_animating = true;
     // The strip owns pane-region motion until it reaches its target. A chat
     // pane rendered below consumes this flag by presenting resident transcript
     // content directly, avoiding a compounded slide-plus-fade.
@@ -1906,6 +1927,36 @@ fn revealedColumnScrollTarget(current: f32, viewport_extent: f32, column_left: f
 
 fn leadingScrollTargetForPane(extents: []const f32, gap: f32, pane_index: usize, max_offset: f32) f32 {
     return std.math.clamp(scrollingPaneOrigin(extents, gap, pane_index), 0.0, max_offset);
+}
+
+fn scrollSnapTargetAfterIdle(
+    deadline_ms: i64,
+    timestamp_ms: i64,
+    current_target: f32,
+    extents: []const f32,
+    gap: f32,
+    max_offset: f32,
+) ?f32 {
+    if (deadline_ms == 0 or timestamp_ms < deadline_ms) return null;
+    return nearestPaneScrollTarget(current_target, extents, gap, max_offset);
+}
+
+fn nearestPaneScrollTarget(current_target: f32, extents: []const f32, gap: f32, max_offset: f32) f32 {
+    if (extents.len == 0) return std.math.clamp(current_target, 0.0, max_offset);
+
+    var origin: f32 = 0.0;
+    var closest = std.math.clamp(origin, 0.0, max_offset);
+    var closest_distance = @abs(current_target - closest);
+    for (extents, 0..) |_, index| {
+        if (index > 0) origin += extents[index - 1] + gap;
+        const candidate = std.math.clamp(origin, 0.0, max_offset);
+        const distance = @abs(current_target - candidate);
+        if (distance < closest_distance) {
+            closest = candidate;
+            closest_distance = distance;
+        }
+    }
+    return closest;
 }
 
 fn scrollingPaneExtentFromTrailingDrag(position: f32, scroll_offset: f32, origin: f32, ui_scale: f32) f32 {
@@ -3240,11 +3291,14 @@ test "scrolling wheel routing preserves ordinary vertical pane scrolling" {
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), scrollingWheelDelta(.vertical, 0.0, -2.0, true).?, 0.0001);
 }
 
-test "manual scrolling intentionally preserves partial column positions" {
-    const pane_stride: f32 = 512.0;
-    const target = freeScrollTarget(0.0, 0.5, SCROLLING_WHEEL_STEP_CSS, 1200.0);
-    try std.testing.expectApproxEqAbs(@as(f32, 36.0), target, 0.0001);
-    try std.testing.expect(@mod(target, pane_stride) != 0.0);
+test "manual scrolling settles partial positions to the nearest pane" {
+    const extents = [_]f32{ 500.0, 360.0, 640.0 };
+    const target = freeScrollTarget(0.0, 4.5, SCROLLING_WHEEL_STEP_CSS, 884.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 324.0), target, 0.0001);
+    try std.testing.expect(scrollSnapTargetAfterIdle(120, 119, target, &extents, 12.0, 884.0) == null);
+    try std.testing.expectApproxEqAbs(@as(f32, 512.0), scrollSnapTargetAfterIdle(120, 120, target, &extents, 12.0, 884.0).?, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), nearestPaneScrollTarget(200.0, &extents, 12.0, 884.0), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 884.0), nearestPaneScrollTarget(800.0, &extents, 12.0, 884.0), 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 1200.0), freeScrollTarget(1190.0, 1.0, SCROLLING_WHEEL_STEP_CSS, 1200.0), 0.0001);
 }
 

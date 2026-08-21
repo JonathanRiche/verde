@@ -75,6 +75,7 @@ const WorkerArgs = struct {
 
 pub const State = struct {
     pending: std.ArrayList(Acknowledgement) = .empty,
+    chat_suppressions: std.ArrayList(ChatAcknowledgement) = .empty,
     worker: ?std.Thread = null,
     worker_args: ?*WorkerArgs = null,
 };
@@ -134,6 +135,11 @@ pub fn queueChat(
 ) bool {
     const state = &self.acknowledgement_controller;
     if (containsChat(state, workspace_id, local_thread_id)) return true;
+    const outstanding_chat_count = countPendingChats(state);
+    state.chat_suppressions.ensureTotalCapacity(
+        self.allocator,
+        state.chat_suppressions.items.len + outstanding_chat_count + 1,
+    ) catch return false;
     const owned_workspace_id = self.allocator.dupe(u8, workspace_id) catch return false;
     const owned_thread_id = self.allocator.dupe(u8, local_thread_id) catch {
         self.allocator.free(owned_workspace_id);
@@ -202,11 +208,47 @@ pub fn poll(self: anytype) void {
     state.worker.?.join();
     state.worker = null;
     state.worker_args = null;
-    if (!args.success) restoreFailed(self, args.acknowledgement);
     var acknowledgement = args.acknowledgement;
-    acknowledgement.deinit(args.allocator);
+    if (!args.success) {
+        restoreFailed(self, acknowledgement);
+        acknowledgement.deinit(args.allocator);
+    } else switch (acknowledgement) {
+        .chat => |ack| state.chat_suppressions.appendAssumeCapacity(ack),
+        .surface => acknowledgement.deinit(args.allocator),
+    }
     args.allocator.destroy(args);
     startNext(self);
+}
+
+/// Keep an acknowledged completion hidden while an older daemon projection
+/// can still carry it. A genuinely later completion remains visible.
+pub fn applyChatCompletionSuppressions(self: anytype, projects: anytype) void {
+    const collections = .{ &projects.projects, &projects.archived_projects };
+    inline for (collections) |project_list| {
+        for (project_list.items) |*project| {
+            clearSuppressedThreads(self, project.id, project.threads.items);
+            clearSuppressedThreads(self, project.id, project.archived_threads.items);
+        }
+    }
+}
+
+/// Retire tombstones only after a projection omits the acknowledged row or
+/// replaces it with a later completion.
+pub fn reconcileChatCompletionSuppressions(self: anytype, completions: anytype) void {
+    const state = &self.acknowledgement_controller;
+    var index: usize = 0;
+    while (index < state.chat_suppressions.items.len) {
+        const suppression = state.chat_suppressions.items[index];
+        const projected = projectedChatCompletion(completions, suppression.workspace_id, suppression.local_thread_id);
+        if (projected != null and projected.?.completed_at_ms <= suppression.completed_at_ms) {
+            index += 1;
+            continue;
+        }
+        var removed = state.chat_suppressions.orderedRemove(index);
+        self.allocator.free(removed.workspace_id);
+        self.allocator.free(removed.local_thread_id);
+        removed = undefined;
+    }
 }
 
 /// Join the one owned request and release queued best-effort work during teardown.
@@ -224,6 +266,11 @@ pub fn deinit(self: anytype) void {
     }
     for (state.pending.items) |*acknowledgement| acknowledgement.deinit(self.allocator);
     state.pending.deinit(self.allocator);
+    for (state.chat_suppressions.items) |suppression| {
+        self.allocator.free(suppression.workspace_id);
+        self.allocator.free(suppression.local_thread_id);
+    }
+    state.chat_suppressions.deinit(self.allocator);
     state.* = .{};
 }
 
@@ -332,6 +379,72 @@ fn containsChat(state: *const State, workspace_id: []const u8, local_thread_id: 
         if (acknowledgement.matchesChat(workspace_id, local_thread_id)) return true;
     }
     return false;
+}
+
+fn countPendingChats(state: *const State) usize {
+    var count: usize = 0;
+    if (state.worker_args) |args| switch (args.acknowledgement) {
+        .chat => count += 1,
+        .surface => {},
+    };
+    for (state.pending.items) |acknowledgement| switch (acknowledgement) {
+        .chat => count += 1,
+        .surface => {},
+    };
+    return count;
+}
+
+fn matchingChatAcknowledgement(
+    state: *const State,
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
+    completed_at_ms: i64,
+) bool {
+    if (state.worker_args) |args| switch (args.acknowledgement) {
+        .chat => |ack| if (chatAcknowledgementCovers(ack, workspace_id, local_thread_id, completed_at_ms)) return true,
+        .surface => {},
+    };
+    for (state.pending.items) |acknowledgement| switch (acknowledgement) {
+        .chat => |ack| if (chatAcknowledgementCovers(ack, workspace_id, local_thread_id, completed_at_ms)) return true,
+        .surface => {},
+    };
+    for (state.chat_suppressions.items) |ack| {
+        if (chatAcknowledgementCovers(ack, workspace_id, local_thread_id, completed_at_ms)) return true;
+    }
+    return false;
+}
+
+fn chatAcknowledgementCovers(
+    ack: ChatAcknowledgement,
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
+    completed_at_ms: i64,
+) bool {
+    return std.mem.eql(u8, ack.workspace_id, workspace_id) and
+        std.mem.eql(u8, ack.local_thread_id, local_thread_id) and
+        completed_at_ms <= ack.completed_at_ms;
+}
+
+fn clearSuppressedThreads(self: anytype, workspace_id: []const u8, threads: anytype) void {
+    for (threads) |*thread| {
+        if (!thread.completion_pending) continue;
+        if (!matchingChatAcknowledgement(
+            &self.acknowledgement_controller,
+            workspace_id,
+            thread.local_thread_id,
+            thread.completed_at_ms,
+        )) continue;
+        thread.completion_pending = false;
+        thread.completed_at_ms = 0;
+    }
+}
+
+fn projectedChatCompletion(completions: anytype, workspace_id: []const u8, local_thread_id: []const u8) ?@TypeOf(completions[0]) {
+    for (completions) |completion| {
+        if (std.mem.eql(u8, completion.workspace_id, workspace_id) and
+            std.mem.eql(u8, completion.local_thread_id, local_thread_id)) return completion;
+    }
+    return null;
 }
 
 test "surface acknowledgement queue coalesces exact identity but orders same-session replacement" {

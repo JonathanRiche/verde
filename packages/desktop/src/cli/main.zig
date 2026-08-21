@@ -194,7 +194,7 @@ fn printHelp(out: output.Output) !void {
         \\Core commands:
         \\  status [--json]
         \\  capabilities [--json]
-        \\  snapshot [--scope <store|registry|sessions|turns>]... [--json]
+        \\  snapshot [--scope <store|workspaces|registry|sessions|turns|config>]... [--json]
         \\  changes [--cursor <seq>] [--wait-ms <ms>] [--topic <topic>]... [--json]
         \\
         \\Live commands:
@@ -1287,7 +1287,7 @@ pub fn handleCore(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
             \\Usage:
             \\  verde core status [--json]
             \\  verde core capabilities [--json]
-            \\  verde core snapshot [--scope <store|registry|sessions|turns>]... [--json]
+            \\  verde core snapshot [--scope <store|workspaces|registry|sessions|turns|config>]... [--json]
             \\  verde core changes [--cursor <seq>] [--wait-ms <ms>] [--topic <topic>]... [--json]
             \\
             \\Queries the GUI-free session daemon over its local socket.
@@ -5585,7 +5585,7 @@ fn chatDaemonSendEnvelopeAlloc(allocator: std.mem.Allocator, io: std.Io, send: C
     // open_chat must be durable before a prompt exists, so it starts with a
     // pinned placeholder. The accepted turn owns the same first-prompt
     // fallback used by GUI-created threads.
-    const thread_title = if (thread.messages.len == 0 and std.mem.eql(u8, thread.title, CHAT_DAEMON_OPEN_TITLE))
+    const thread_title = if (thread.messages.len == 0 and chat_threads.isPlaceholderThreadTitle(thread.title))
         try chat_threads.makeThreadTitle(arena, send.prompt)
     else
         thread.title;

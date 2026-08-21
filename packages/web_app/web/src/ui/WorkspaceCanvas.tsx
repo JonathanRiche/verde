@@ -2,6 +2,7 @@ import { For, Show, createEffect, onCleanup, onMount } from 'solid-js'
 
 import { store } from '../lib/store'
 import type { LivePane } from '../lib/types'
+import { effectivePanesPerView } from '../lib/ui_config'
 import { ChatPane } from './ChatPane'
 import { Icon, ZoomButton } from './Icons'
 import { TerminalView } from './Terminals'
@@ -69,10 +70,17 @@ export function WorkspaceCanvas() {
   })
 
   const inset = () => store.maximizedPaneId() == null && !store.compact()
+  const panes_per_view = () =>
+    effectivePanesPerView(store.uiConfig(), panes().length, store.maximizedPaneId() != null)
+  const pane_gap = () => store.uiConfig().workspace_pane_gap
 
   return (
     <div
       class={`niri-strip flex min-h-0 min-w-0 flex-1 overflow-x-auto overflow-y-hidden ${inset() ? 'niri-inset' : 'niri-zoomed'}`}
+      style={{
+        '--workspace-pane-gap': inset() ? `${pane_gap()}px` : '0px',
+        '--workspace-panes-per-view': String(Math.max(1, panes_per_view())),
+      }}
       ref={(node) => {
         scroller = node
       }}
