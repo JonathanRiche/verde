@@ -2,7 +2,7 @@ import { createMemo, createRoot, createSignal, onCleanup } from 'solid-js'
 
 import { matchKeyAction, type KeyAction } from './keybinds'
 import { dynamicModelOptions, type DynamicModelRow, type ModelOption } from './models'
-import { makeThreadTitle } from './thread_title'
+import { isPlaceholderThreadTitle, makeThreadTitle } from './thread_title'
 import {
   LiveClient,
   deleteChatImage,
@@ -13,6 +13,7 @@ import {
   type EventHandler,
 } from './live'
 import { linuxWorkspaceId } from './wyhash'
+import { DEFAULT_UI_CONFIG, parseUiConfig, type UiConfig } from './ui_config'
 import {
   paneIsActive,
   paneKey,
@@ -22,12 +23,13 @@ import {
   type LayoutNode,
   type LivePane,
   type Message,
+  type RpcEnvelope,
   type Source,
   type Thread,
   type Workspace,
 } from './types'
 
-const SNAPSHOT_SCOPES = ['workspaces', 'registry', 'sessions', 'turns'] as const
+const SNAPSHOT_SCOPES = ['workspaces', 'registry', 'sessions', 'turns', 'config'] as const
 /// Fallback pane cap for daemons without the `workspaces` snapshot scope.
 const MAX_OPEN_THREADS = 16
 /// Thread metadata rows are small; fetch enough that persisted layout pane
@@ -66,6 +68,7 @@ interface SnapshotPayload {
   selected_workspace_index?: number
   sessions?: SnapshotSession[]
   turns?: SnapshotTurn[]
+  config?: unknown
 }
 
 type TranscriptMap = Record<string, Message[]>
@@ -92,12 +95,33 @@ function mintId(prefix: string): string {
 
 function isOpeningThread(thread: Thread | null, title: string): boolean {
   if ((thread?.messages?.length ?? 0) > 0) return false
-  return thread?.committed === false || title === 'New Chat' || title === 'New chat' || title === 'New thread'
+  return thread?.committed === false || isPlaceholderThreadTitle(title)
 }
 
 function methodUnavailable(response: { error?: { code: string } }): boolean {
   const code = response.error?.code
   return code === 'unknown_method' || code === 'method_not_found' || code === 'capability_unavailable'
+}
+
+export async function requestTerminalOpen(
+  call: (method: string, params: unknown) => Promise<RpcEnvelope>,
+  workspace: Pick<Workspace, 'workspace_id' | 'path'>,
+  session_id: string,
+): Promise<{ response: RpcEnvelope; native: boolean }> {
+  const opened = await call('terminal.open', { workspace_id: workspace.workspace_id })
+  if (!(opened.error || opened.ok === false) || !methodUnavailable(opened)) {
+    return { response: opened, native: true }
+  }
+  return {
+    response: await call('session.create', {
+      id: session_id,
+      cwd: workspace.path,
+      workspace_path: workspace.path,
+      workspace_id: workspace.workspace_id,
+      label: 'Terminal',
+    }),
+    native: false,
+  }
 }
 
 function stablePaneId(kind: 'chat' | 'term' | 'browser', key: string): number {
@@ -534,17 +558,35 @@ export function panesForWorkspace(
           titled[0] ??
           (pane.title ? undefined : threads.find((item) => item.sort_index === pane.thread))
         if (thread && (!thread.archived || pane.title)) {
+          // The daemon thread is the authority for the next turn's settings.
+          // Desktop chat.status can lag a web click by several projection
+          // cycles, so letting the live pane win here makes every picker look
+          // inert until the desktop catches up (and can revert optimistic
+          // values on each poll). Preserve explicit nulls because they select
+          // provider defaults rather than meaning "missing".
+          const model = Object.prototype.hasOwnProperty.call(thread, 'model_ref')
+            ? thread.model_ref ?? null
+            : pane.model ?? null
+          const reasoning_effort = Object.prototype.hasOwnProperty.call(thread, 'reasoning_effort')
+            ? thread.reasoning_effort ?? null
+            : pane.reasoning_effort ?? null
+          const reasoning_variant = Object.prototype.hasOwnProperty.call(thread, 'reasoning_variant')
+            ? thread.reasoning_variant ?? null
+            : pane.reasoning_variant ?? null
+          const fast_mode = Object.prototype.hasOwnProperty.call(thread, 'fast_mode')
+            ? thread.fast_mode === 'on'
+            : pane.fast_mode ?? false
           used_threads.add(thread.local_thread_id)
           rows.push({
             ...chatPane(workspace, thread, turns),
             focused,
             thread_index: pane.thread,
             thread_title: pane.title || thread.title || 'Chat',
-            provider: pane.provider ?? thread.provider ?? workspace.provider,
-            model: pane.model ?? thread.model_ref ?? null,
-            reasoning_effort: pane.reasoning_effort ?? thread.reasoning_effort ?? null,
-            reasoning_variant: pane.reasoning_variant ?? thread.reasoning_variant ?? null,
-            fast_mode: pane.fast_mode ?? thread.fast_mode === 'on',
+            provider: thread.provider ?? pane.provider ?? workspace.provider,
+            model,
+            reasoning_effort,
+            reasoning_variant,
+            fast_mode,
             access_mode: thread.access_mode ?? 'supervised',
             // Live desktop activity beats the store-turn heuristic, which can
             // report long-finished turns as active while the flush lags.
@@ -692,6 +734,7 @@ function createAppStore() {
   const [notice, setNotice] = createSignal<string | null>(null)
   const [composerNonce, setComposerNonce] = createSignal(0)
   const [compact, setCompact] = createSignal(false)
+  const [uiConfig, setUiConfig] = createSignal<UiConfig>(DEFAULT_UI_CONFIG)
   let pinnedWorkspaceId: string | null = null
   let storeClientId: string | null = null
   let lastSessions: SnapshotSession[] = []
@@ -828,6 +871,10 @@ function createAppStore() {
     const snapshot = root.snapshot ?? root
     if (root.sessions) lastSessions = root.sessions
     if (root.turns) lastTurns = root.turns
+    if (root.config !== undefined) {
+      const next = parseUiConfig(root.config)
+      setUiConfig((prev) => (sameJson(prev, next) ? prev : next))
+    }
     const stored = snapshot.workspaces ?? root.workspaces ?? []
     // The desktop live listing decides which workspaces are open whenever the
     // desktop app is reachable; store rows only contribute their persisted
@@ -2034,18 +2081,26 @@ function createAppStore() {
     const ws = workspace()
     if (!ws) return
     const session_id = mintId('web-sess-')
-    const created = await client.call('session.create', {
-      id: session_id,
-      cwd: ws.path,
-      workspace_path: ws.path,
-      workspace_id: ws.workspace_id,
-      label: 'Terminal',
-    })
-    if (created.error || created.ok === false) {
-      setNotice(created.error?.message ?? 'could not create session')
+    const opened = await requestTerminalOpen(client.call.bind(client), ws, session_id)
+    if (opened.response.error || opened.response.ok === false) {
+      setNotice(opened.response.error?.message ?? 'could not create session')
       return
     }
-    await refreshProjection()
+    if (opened.native) {
+      pinnedWorkspaceId = ws.workspace_id
+      setWorkspaceId(ws.workspace_id)
+      const layout = layoutFromLivePanes(opened.response)
+      if (layout) {
+        liveLayouts = { ...liveLayouts, [ws.workspace_id]: layout }
+        // Let the desktop-focused pane from the terminal.open response win
+        // instead of retaining the web pane that was focused before creation.
+        setFocusedPaneId(null)
+        publishPanes(workspaces())
+      }
+      await refreshProjection({ scope: 'selected' })
+      return
+    }
+    await refreshProjection({ scope: 'selected' })
     setFocusedPaneId(stablePaneId('term', session_id))
   }
 
@@ -2244,6 +2299,7 @@ function createAppStore() {
     setNotice,
     composerNonce,
     compact,
+    uiConfig,
     draftFor,
     setDraftFor,
     beginDiffComment,

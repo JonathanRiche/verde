@@ -2741,6 +2741,86 @@ fn transcriptLayoutVariantHash(state: *app_state.AppState) u64 {
     return hasher.final();
 }
 
+/// Applies a single-row height change to a tail-relative layout in place and
+/// returns the height delta. The patched row's own `top` moves by -delta (its
+/// distance from the tail grows with its height), as do all older rows; newer
+/// rows keep their distance from the tail.
+fn applyTranscriptRowHeightPatch(items: []chat_types.TranscriptLayoutItem, index: usize, new_height: f32) f32 {
+    const delta = new_height - items[index].height;
+    if (delta == 0.0) return 0.0;
+    items[index].height = new_height;
+    for (items[index..]) |*item| item.top -= delta;
+    return delta;
+}
+
+test "in-place row height patch keeps the toggled row's content position" {
+    var items = [_]chat_types.TranscriptLayoutItem{
+        .{ .message_index = 12, .group_end = 13, .top = -80.0, .height = 68.0 },
+        .{ .message_index = 11, .group_end = 12, .top = -992.0, .height = 900.0 },
+        .{ .message_index = 10, .group_end = 11, .top = -1_072.0, .height = 68.0 },
+    };
+    // Collapsing the 900px diff card down to its 44px header row.
+    const delta = applyTranscriptRowHeightPatch(&items, 1, 44.0);
+    try std.testing.expectApproxEqAbs(@as(f32, -856.0), delta, 0.001);
+    // With a fully materialized thread the estimate moves by the same delta,
+    // so `estimate + top` (the row's content coordinate) is invariant for the
+    // patched row and everything above it — the clicked header stays put.
+    try std.testing.expectApproxEqAbs(@as(f32, -136.0), items[1].top, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, -216.0), items[2].top, 0.001);
+    // Rows newer than the toggle keep their distance from the tail.
+    try std.testing.expectApproxEqAbs(@as(f32, -80.0), items[0].top, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 44.0), items[1].height, 0.001);
+}
+
+/// One-shot fast path for a card expand/collapse: re-measure only the toggled
+/// row and rebase saved scroll offsets so the clicked header stays pixel-
+/// stationary. Returns false (anchored full reset fallback) whenever the hint
+/// does not match this thread's materialized layout.
+fn tryPatchToggledCardLayout(
+    state: *app_state.AppState,
+    thread: *chat_types.ChatThread,
+    width: f32,
+    scale: f32,
+    variant_hash: u64,
+) bool {
+    const patch = state.pending_card_toggle_layout_patch orelse return false;
+    if (state.project_controller.projects.items.len == 0) return false;
+    if (patch.project_index != state.project_controller.selected_index) return false;
+    if (patch.thread_index != state.currentProject().selected_thread_index) return false;
+    // The hint belongs to this thread: consume it even when the patch cannot
+    // apply, so the fallback reset does not replay it on a later frame.
+    state.pending_card_toggle_layout_patch = null;
+    if (@abs(thread.transcript_layout_width - width) > 0.5) return false;
+    if (@abs(thread.transcript_layout_scale - scale) > 0.001) return false;
+    if (thread.transcript_layout_first_message_index + thread.transcript_layout_message_count != thread.messages.items.len) return false;
+    const items = thread.transcript_layout_items.items;
+    const found = for (items, 0..) |item, index| {
+        if (patch.message_index >= item.message_index and patch.message_index < item.group_end) break index;
+    } else return false;
+    const item = items[found];
+    const messages = thread.messages.items;
+    // Mirror the build loop's measurement exactly so patched and rebuilt
+    // geometry can never disagree.
+    const new_height = if (item.group_end - item.message_index >= 2)
+        toolCallGroupHeight(state, messages, item.message_index, item.group_end, 0, width)
+    else
+        transcriptCommittedMessageHeight(state, item.message_index, messages[item.message_index], width);
+    const estimate_before = estimatedPartialTranscriptHeight(thread);
+    const delta = applyTranscriptRowHeightPatch(items, found, new_height);
+    thread.transcript_layout_committed_height += delta;
+    thread.transcript_layout_variant_hash = variant_hash;
+    if (delta != 0.0) {
+        // Keeping the toggled header stationary requires `estimate + top -
+        // scroll` to stay constant for its row. `top` moved by -delta, so
+        // saved offsets shift by the estimate delta minus the row delta —
+        // zero once the whole thread is materialized, nonzero while the
+        // average-based estimate extrapolates unmaterialized history.
+        const estimate_delta = estimatedPartialTranscriptHeight(thread) - estimate_before;
+        if (estimate_delta - delta != 0.0) state.shiftCurrentTranscriptScroll(estimate_delta - delta);
+    }
+    return true;
+}
+
 fn ensureTranscriptLayout(
     state: *app_state.AppState,
     width: f32,
@@ -2760,6 +2840,12 @@ fn ensureTranscriptLayout(
     {
         return;
     }
+
+    // A card toggle changes exactly one materialized row's height. Patch that
+    // row in place instead of resetting: the full reset's partially
+    // materialized frames render at clamped offsets for a frame or two, which
+    // the user sees as the transcript jittering when a diff card collapses.
+    if (tryPatchToggledCardLayout(state, thread, width, scale, variant_hash)) return;
 
     const estimate_before = estimatedPartialTranscriptHeight(thread);
     const layout_covers_current_tail = thread.transcript_layout_first_message_index + thread.transcript_layout_message_count == thread.messages.items.len;
@@ -4833,7 +4919,7 @@ fn renderDiffSummaryCard(
         if (state.transcript_controller.palette_mouse_in_workspace and rectContains(row_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y)) {
             queueRectClipped(state, row_rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 90)), clip);
         }
-        state.recordCardToggleHit(.{ .rect = row_rect, .key = key, .kind = .diff_file });
+        state.recordCardToggleHit(.{ .rect = row_rect, .key = key, .kind = .diff_file, .message_index = message_index });
 
         // Chevron at left
         const chev_x = bubble.x + pad_x + theme.scaledUi(6.0);
@@ -5592,6 +5678,7 @@ fn renderToolCallGroup(
         .key = key,
         .kind = .tool_call_group,
         .default_expanded = default_expanded,
+        .message_index = base_message_index + start,
     });
 
     if (!expanded) return;
@@ -5864,6 +5951,7 @@ fn renderCommandEventRow(
         .key = key,
         .kind = .command_card,
         .default_expanded = default_expanded,
+        .message_index = message_index,
     });
 
     if (expanded) {
@@ -5911,7 +5999,7 @@ fn renderCommandEventRow(
                 .w = more_rect.w - more_pad_x * 2.0,
                 .h = more_rect.h,
             }, more_label, paletteColor(theme.COLOR_GREEN), more_font, clip);
-            state.recordCardToggleHit(.{ .rect = more_rect, .key = output_key, .kind = .tool_output });
+            state.recordCardToggleHit(.{ .rect = more_rect, .key = output_key, .kind = .tool_output, .message_index = message_index });
         }
     }
 }

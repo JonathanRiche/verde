@@ -413,11 +413,12 @@ fn capabilitiesResponse(allocator: std.mem.Allocator, id_value: std.json.Value) 
             "browser.overlay.sidebarMenuClose",    "browser.overlay.composerMenuOpen",    "browser.overlay.composerMenuClose",    "browser.overlay.workspaceModalOpen",
             "browser.overlay.workspaceModalClose", "browser.overlay.threadModalOpen",     "browser.overlay.threadModalClose",     "browser.overlay.imageModalOpen",
             "browser.overlay.imageModalClose",     "browser.overlay.transcriptModalOpen", "browser.overlay.transcriptModalClose", "palette.list",
-            "palette.run",                         "terminal.write",                      "terminal.key",                         "terminal.tail",
-            "terminal.screen",                     "process.list",                        "process.inspect",                      "process.start",
-            "process.stop",                        "process.restart",                     "process.logs",                         "agent.open",
-            "stack.status",                        "stack.start",                         "stack.stop",                           "stack.restart",
-            "workspace.processes",                 "workspace.checkCommand",              "workspace.acquireLease",               "workspace.releaseLease",
+            "palette.run",                         "terminal.open",                       "terminal.write",                       "terminal.key",
+            "terminal.tail",                       "terminal.screen",                     "process.list",                         "process.inspect",
+            "process.start",                       "process.stop",                        "process.restart",                      "process.logs",
+            "agent.open",                          "stack.status",                        "stack.start",                          "stack.stop",
+            "stack.restart",                       "workspace.processes",                 "workspace.checkCommand",               "workspace.acquireLease",
+            "workspace.releaseLease",
         },
         .events = &.{},
         .encodings = &.{"json"},
@@ -1622,6 +1623,15 @@ fn paletteCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value
 }
 
 fn terminalCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value, command: []const u8) ![]u8 {
+    if (std.mem.eql(u8, command, "open")) {
+        const project_index = resolveProjectIndex(state, params) orelse
+            return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
+        if (!state.openTerminalPaneForProjectIndex(project_index)) {
+            return try errorResponseAlloc(allocator, id_value, "rejected", "terminal open did not apply");
+        }
+        return try panesResponseForProject(allocator, id_value, state, project_index);
+    }
+
     const target = resolvePaneTarget(state, params) orelse
         return try errorResponseAlloc(allocator, id_value, "not_found", "terminal pane not found");
     if (!targetIsTerminal(state, target)) return try errorResponseAlloc(allocator, id_value, "invalid_target", "target pane is not a terminal pane");

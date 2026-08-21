@@ -338,9 +338,9 @@ pub const ChatThread = struct {
     }
 
     /// True while the async chat.turn.start acceptance receipt is still in
-    /// flight for this thread's pending send (7.5). Follow-up queueing and
-    /// steer/stop issuance defer on this so the still-staged composer draft
-    /// cannot be double-sent before acceptance commits.
+    /// flight for this thread's pending send (7.5). Composer editing,
+    /// follow-up queueing, and steer/stop issuance defer on this so rejection
+    /// rollback stays lossless and the staged prompt cannot be double-sent.
     pub fn isSendAcceptancePending(self: *const ChatThread) bool {
         self.send_state.mutex.lock();
         defer self.send_state.mutex.unlock();

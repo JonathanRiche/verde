@@ -118,6 +118,13 @@ pub fn makeThreadTitle(allocator: std.mem.Allocator, prompt: []const u8) ![:0]co
     return try allocator.dupeZ(u8, compact[0..count]);
 }
 
+/// Returns whether a title is one of Verde's reserved empty-thread labels.
+pub fn isPlaceholderThreadTitle(title: []const u8) bool {
+    return std.mem.eql(u8, title, "New Chat") or
+        std.mem.eql(u8, title, "New chat") or
+        std.mem.eql(u8, title, "New thread");
+}
+
 /// Normalizes a model response into one concise, single-line thread title.
 pub fn makeGeneratedThreadTitle(allocator: std.mem.Allocator, response: []const u8) !?[:0]const u8 {
     const first_line_end = std.mem.findScalar(u8, response, '\n') orelse response.len;
@@ -182,6 +189,13 @@ test "generated thread title strips response framing" {
     defer std.testing.allocator.free(title);
 
     try std.testing.expectEqualStrings("Fix flaky auth tests", title);
+}
+
+test "placeholder thread titles cover daemon desktop and web defaults" {
+    try std.testing.expect(isPlaceholderThreadTitle("New Chat"));
+    try std.testing.expect(isPlaceholderThreadTitle("New chat"));
+    try std.testing.expect(isPlaceholderThreadTitle("New thread"));
+    try std.testing.expect(!isPlaceholderThreadTitle("My Manual Title"));
 }
 
 test "generated thread title rejects an empty first line" {

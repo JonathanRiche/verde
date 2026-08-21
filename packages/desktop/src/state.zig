@@ -854,7 +854,20 @@ fn mergeCurrentThreads(
         const baseline_index = threadIndexById(baseline_threads, id);
         const remote_index = threadIndexById(merged.items, id);
         if (baseline_index == null) {
-            if (remote_index == null) try merged.append(allocator, current_thread);
+            if (remote_index) |index| {
+                // The first save of a locally created thread can reach the
+                // daemon before the projection baseline observes its identity.
+                // A later conflict refresh then contains the same thread on
+                // both sides but has no per-field baseline for its composer.
+                // Keep the live draft (including an acceptance clear) while
+                // leaving the daemon's transcript and provider identity
+                // authoritative.
+                merged.items[index].draft = current_thread.draft;
+                merged.items[index].draft_image = current_thread.draft_image;
+                merged.items[index].draft_extra_images = current_thread.draft_extra_images;
+            } else {
+                try merged.append(allocator, current_thread);
+            }
             continue;
         }
         if (remote_index) |index| {
@@ -1386,6 +1399,7 @@ fn preserveWorkspaceViewportRuntime(
     next_layout.scroll_offset_x = current_layout.scroll_offset_x;
     next_layout.scroll_offset_y = current_layout.scroll_offset_y;
     next_layout.scroll_animation_last_ms = current_layout.scroll_animation_last_ms;
+    next_layout.scroll_snap_deadline_ms = current_layout.scroll_snap_deadline_ms;
     next_layout.scroll_revealed_pane_id = current_layout.scroll_revealed_pane_id;
     next_layout.scroll_leading_pane_id = current_layout.scroll_leading_pane_id;
 }
@@ -1814,12 +1828,26 @@ pub const CardToggleKind = enum(u8) {
 
 /// Per-frame hit-test entry for a collapsible card header (command bubble,
 /// diff file row). The `key` identifies the card across frames and is also the
-/// lookup into `expanded_cards`.
+/// lookup into `expanded_cards`. `message_index` is the first transcript row
+/// the toggle re-measures; project/thread identity is captured at record time
+/// because pane rendering temporarily switches the selected thread.
 pub const CardToggleHit = struct {
     rect: palette.Rect,
     key: u64,
     kind: CardToggleKind,
     default_expanded: bool = false,
+    message_index: usize = 0,
+    project_index: usize = 0,
+    thread_index: usize = 0,
+};
+
+/// One-shot hint that the last card toggle changed exactly one transcript
+/// row's height, letting the layout patch that row in place instead of a full
+/// reset (whose partially materialized frames read as a visible jitter).
+pub const PendingCardToggleLayoutPatch = struct {
+    project_index: usize,
+    thread_index: usize,
+    message_index: usize,
 };
 
 pub const BackgroundTaskAction = enum { stop, output };
@@ -3198,6 +3226,7 @@ pub const AppState = struct {
     code_copy_recent_identity: u64,
     code_copy_recent_until_ms: i64,
     card_toggle_hits: std.ArrayList(CardToggleHit),
+    pending_card_toggle_layout_patch: ?PendingCardToggleLayoutPatch,
     background_task_action_hits: std.ArrayList(BackgroundTaskActionHit),
     expanded_cards: std.AutoHashMap(u64, bool),
     // Bumped on every card expand/collapse so per-frame layout variant hashing
@@ -3365,6 +3394,7 @@ pub const AppState = struct {
             .code_copy_recent_identity = 0,
             .code_copy_recent_until_ms = 0,
             .card_toggle_hits = .empty,
+            .pending_card_toggle_layout_patch = null,
             .background_task_action_hits = .empty,
             .expanded_cards = std.AutoHashMap(u64, bool).init(allocator),
             .expanded_cards_revision = 0,
@@ -4886,6 +4916,10 @@ pub const AppState = struct {
         self.focusProjectThreadInWorkspace(project_index, thread_index) catch |err| {
             log.err("failed to focus selected thread workspace pane: {s}", .{@errorName(err)});
         };
+        // Sidebar thread selection is also a focus acknowledgement. The pane
+        // click routes already clear completions, but this direct navigation
+        // path previously left the ACTIVE-cluster Done badge latched forever.
+        _ = self.clearChatCompletion(project_index, thread_index);
         self.noteTranscriptSelectionChanged();
         if (project.workspace_layout.focused_pane_id) |pane_id| self.prepareTranscriptPaneFocus(project_index, pane_id);
         self.requestComposerFocus();
@@ -4983,6 +5017,8 @@ pub const AppState = struct {
     pub const queueSurfaceAcknowledgement = acknowledgement_controller.queueSurface;
     pub const containsSurfaceCompletionAcknowledgement = acknowledgement_controller.containsSurfaceCompletion;
     pub const pollAcknowledgements = acknowledgement_controller.poll;
+    pub const applyChatCompletionSuppressions = acknowledgement_controller.applyChatCompletionSuppressions;
+    pub const reconcileChatCompletionSuppressions = acknowledgement_controller.reconcileChatCompletionSuppressions;
     pub fn beginClosePreflight(self: *AppState) void {
         // Let an in-flight core.changes wait drain while durability handoff is
         // running instead of serializing that wait after the handoff.
@@ -5683,8 +5719,16 @@ pub const AppState = struct {
         self.setSidebarNotice(notice);
     }
 
+    fn paletteComposerEditBlockedByAcceptance(self: *AppState) bool {
+        if (self.project_controller.projects.items.len == 0) return false;
+        if (!self.currentThread().isSendAcceptancePending()) return false;
+        self.setSidebarNotice("Still confirming the previous send...");
+        return true;
+    }
+
     pub fn attachClipboardImageToCurrentDraft(self: *AppState) bool {
         if (self.project_controller.projects.items.len == 0) return false;
+        if (self.paletteComposerEditBlockedByAcceptance()) return true;
         const capture = captureClipboardImage(self.allocator) catch |err| {
             log.err("failed to capture clipboard image: {s}", .{@errorName(err)});
             runtime_log.diagnostic("clipboard image capture failed: {s}", .{@errorName(err)});
@@ -5730,6 +5774,7 @@ pub const AppState = struct {
             );
             return false;
         }
+        if (self.paletteComposerEditBlockedByAcceptance()) return true;
         const text = self.readClipboardTextForPaste() orelse {
             runtime_log.diagnostic("palette paste clipboard text unavailable", .{});
             return false;
@@ -5813,6 +5858,7 @@ pub const AppState = struct {
 
     fn insertTextIntoPaletteComposer(self: *AppState, text: []const u8) bool {
         if (text.len == 0) return false;
+        if (self.paletteComposerEditBlockedByAcceptance()) return true;
         self.composer_controller.composer.focused = true;
         self.composer_controller.focused = true;
         self.terminal_controller.focused = false;
@@ -8902,7 +8948,9 @@ pub const AppState = struct {
         self.composer_controller.composer.setShowFastToggle(false);
         self.composer_controller.composer.setShowAccessToggle(false);
         const hide_placeholder = thread.draftImageCount() > 0;
-        const placeholder = if (self.composerInBangCommandMode())
+        const placeholder = if (thread.isSendAcceptancePending())
+            "Confirming send..."
+        else if (self.composerInBangCommandMode())
             "Enter a shell command..."
         else if (!hide_placeholder)
             "Ask anything, or use / to show available commands"
@@ -9423,6 +9471,7 @@ pub const AppState = struct {
         }
         if (self.terminal_controller.focused) return false;
         if (!self.composer_controller.composer.focused) return false;
+        if (self.paletteComposerEditBlockedByAcceptance()) return true;
         const insert_text = self.clampPaletteComposerInsertText(text);
         if (insert_text.len == 0) return true;
         const handled = self.composer_controller.composer.handleInput(self.allocator, .{ .text = insert_text }) catch |err| {
@@ -9474,6 +9523,7 @@ pub const AppState = struct {
         }
         if (self.routeRunConfigKey(palette_key)) return true;
         if (palette_key.primary and palette_key.code == .v) {
+            if (self.paletteComposerEditBlockedByAcceptance()) return true;
             runtime_log.diagnostic(
                 "palette composer received primary-v focused={} draft_len={d}",
                 .{ self.composer_controller.composer.focused, self.currentDraft().len },
@@ -9481,6 +9531,7 @@ pub const AppState = struct {
             return self.pasteClipboardTextIntoPaletteComposer();
         }
         if (!self.composer_controller.composer.focused) return false;
+        if (self.paletteComposerEditBlockedByAcceptance()) return true;
         if (self.routeSlashCommandPickerKey(palette_key)) return true;
         if (self.recallBangCommand(palette_key)) {
             self.noteInteraction();
@@ -10572,6 +10623,7 @@ pub const AppState = struct {
         var staged_owned = true;
         errdefer if (staged_owned) deinitProjectionContainers(self.allocator, &staged.project_controller, &staged.surface_controller);
         try staged.applyPersisted(persisted);
+        self.applyChatCompletionSuppressions(&staged.project_controller);
         try staged.applyDaemonRegistryProjection(result.processes, result.leases);
         try staged.applyDaemonSessionProjection(result.sessions);
         try staged.applyDaemonChatTurnsSnapshot(result.turns);
@@ -10616,6 +10668,7 @@ pub const AppState = struct {
         // swap are complete before cursor/write-guard/freshness advance.
         self.storage.commitPreparedCompositeSnapshotSeed(prepared_seed);
         seed_owned = false;
+        self.reconcileChatCompletionSuppressions(persisted.chat_completions);
         // Reconciliation derives consume reservations from Storage's current
         // nonce, so publish the validated replacement seed first. The first
         // refresh after daemon replacement must never reserve under the old
@@ -10980,7 +11033,14 @@ pub const AppState = struct {
     /// Use `isCardExpanded` to read the persistent state during rendering and
     /// `consumeCardToggleClick` from the click handler.
     pub fn recordCardToggleHit(self: *AppState, hit: CardToggleHit) void {
-        self.card_toggle_hits.append(self.allocator, hit) catch |err| {
+        var stamped = hit;
+        // Pane rendering temporarily selects the pane's thread, so record time
+        // is the only moment the hit's owning thread is the selected one.
+        if (self.project_controller.projects.items.len > 0) {
+            stamped.project_index = self.project_controller.selected_index;
+            stamped.thread_index = self.currentProject().selected_thread_index;
+        }
+        self.card_toggle_hits.append(self.allocator, stamped) catch |err| {
             log.warn("failed to retain card toggle hit: {s}", .{@errorName(err)});
         };
     }
@@ -11321,10 +11381,29 @@ pub const AppState = struct {
             if (y < hit.rect.y or y > hit.rect.y + hit.rect.h) continue;
             const expanded = !self.isCardExpandedDefault(hit.key, hit.default_expanded);
             self.setCardExpanded(hit.key, expanded);
+            // Remember-last flips the default for every group card, so only a
+            // full layout reset re-measures them all. Any other toggle changes
+            // exactly one row; hint the layout so it patches that row in place
+            // instead of resetting (the reset's transient frames are visible
+            // as a scroll jitter). A second toggle before the patch is consumed
+            // means more than one row changed — drop the hint and let both fall
+            // back to the anchored full reset.
+            const flips_group_default = hit.kind == .tool_call_group and
+                self.app_config.tool_call_group_preference == .remember_last and
+                self.app_config.tool_call_groups_last_expanded != expanded;
             if (hit.kind == .tool_call_group and self.app_config.tool_call_group_preference == .remember_last) {
                 self.app_config.tool_call_groups_last_expanded = expanded;
                 app_config.saveAppConfig(self.allocator, &self.app_config) catch |err| {
                     log.warn("failed to save tool call group expansion preference: {s}", .{@errorName(err)});
+                };
+            }
+            if (flips_group_default or self.pending_card_toggle_layout_patch != null) {
+                self.pending_card_toggle_layout_patch = null;
+            } else {
+                self.pending_card_toggle_layout_patch = .{
+                    .project_index = hit.project_index,
+                    .thread_index = hit.thread_index,
+                    .message_index = hit.message_index,
                 };
             }
             self.markDirty();
@@ -14900,6 +14979,82 @@ test "M5-P4 three-way conflict merge keeps post-capture edits and local addition
     try std.testing.expectEqualStrings("draft B", threads[0].draft);
     try std.testing.expectEqualStrings("thread-local", threads[1].local_thread_id.?);
     try std.testing.expect(threadIndexById(threads, "thread-deleted") == null);
+}
+
+test "three-way merge preserves live composer state for a new thread already visible remotely" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const current_attachment: PersistedImageAttachment = .{
+        .path = "/tmp/live-draft.png",
+        .mime = "image/png",
+        .byte_size = 42,
+    };
+    const current_threads = [_]PersistedThread{
+        .{
+            .title = "Typed locally",
+            .local_thread_id = "thread-new-typed",
+            .draft = "draft typed after creation",
+            .draft_image = current_attachment,
+        },
+        .{
+            .title = "Submitted locally",
+            .local_thread_id = "thread-new-submitted",
+            .draft = "",
+        },
+    };
+    const remote_message: PersistedMessage = .{
+        .role = .user,
+        .author = "You",
+        .body = "submitted prompt",
+        .message_id = "remote-message",
+    };
+    const remote_threads = [_]PersistedThread{
+        .{
+            .title = "Typed remotely",
+            .local_thread_id = "thread-new-typed",
+            .draft = "",
+        },
+        .{
+            .title = "Submitted remotely",
+            .local_thread_id = "thread-new-submitted",
+            .draft = "submitted prompt",
+            .messages = &.{remote_message},
+        },
+    };
+    const baseline_projects = [_]PersistedProject{.{
+        .id = "workspace-new-thread",
+        .label = "workspace",
+        .path = "/tmp/workspace-new-thread",
+        .threads = &.{},
+    }};
+    const current_projects = [_]PersistedProject{.{
+        .id = "workspace-new-thread",
+        .label = "workspace",
+        .path = "/tmp/workspace-new-thread",
+        .threads = &current_threads,
+    }};
+    const remote_projects = [_]PersistedProject{.{
+        .id = "workspace-new-thread",
+        .label = "workspace",
+        .path = "/tmp/workspace-new-thread",
+        .threads = &remote_threads,
+    }};
+    var remote: PersistedState = .{ .projects = &remote_projects };
+
+    try mergeCurrentLocalEdits(
+        arena.allocator(),
+        &remote,
+        .{ .projects = &baseline_projects },
+        .{ .projects = &current_projects },
+    );
+
+    const threads = remote.projects[0].threads.?;
+    try std.testing.expectEqualStrings("draft typed after creation", threads[0].draft);
+    try std.testing.expectEqualStrings("/tmp/live-draft.png", threads[0].draft_image.?.path);
+    try std.testing.expectEqualStrings("", threads[1].draft);
+    try std.testing.expectEqualStrings("Submitted remotely", threads[1].title);
+    try std.testing.expectEqual(@as(usize, 1), threads[1].messages.len);
+    try std.testing.expectEqualStrings("remote-message", threads[1].messages[0].message_id.?);
 }
 
 test "M5-P4 acknowledged-save baseline preserves later edit on the same new thread" {
