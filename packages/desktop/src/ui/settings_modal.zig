@@ -40,6 +40,9 @@ pub const Control = enum(u8) {
     automatic_chat_titles,
     chat_title_provider_dropdown,
     chat_title_model_dropdown,
+    new_chat_provider_dropdown,
+    new_chat_model_dropdown,
+    new_chat_reasoning_dropdown,
     new_chat_new_pane,
     new_chat_replace_pane,
     open_folder,
@@ -157,6 +160,10 @@ const SettingsLayout = struct {
     chat_title_provider_dropdown: palette.Rect,
     chat_title_model_dropdown: palette.Rect,
     chat_hint_y: f32,
+    new_chat_provider_dropdown: palette.Rect,
+    new_chat_model_dropdown: palette.Rect,
+    new_chat_reasoning_dropdown: palette.Rect,
+    new_chat_defaults_hint_y: f32,
     terminal_card: palette.Rect,
     terminal_font_dec: palette.Rect,
     terminal_font_inc: palette.Rect,
@@ -322,7 +329,9 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const transcript_h = m.card_pad * 2.0 + m.title_h + m.row_gap +
         m.label_h + m.inner_gap + m.row_h + m.row_gap +
         m.label_h + m.inner_gap + m.row_h;
-    const chat_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
+    const chat_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h +
+        m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h +
+        m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
     const terminal_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.row_h + m.inner_gap + m.label_h + m.row_gap + m.label_h + m.inner_gap + m.row_h;
     const browser_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
     const experimental_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.row_h + m.inner_gap + m.label_h;
@@ -446,6 +455,30 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .h = m.row_h,
     };
     const chat_hint_y = title_generator_y + m.row_h + m.inner_gap;
+    const new_chat_defaults_label_y = chat_hint_y + m.label_h + m.row_gap;
+    const new_chat_defaults_y = new_chat_defaults_label_y + m.label_h + m.inner_gap;
+    const new_chat_defaults_w = content_w - m.card_pad * 2.0;
+    const default_provider_w = (new_chat_defaults_w - m.inner_gap * 2.0) * 0.31;
+    const default_reasoning_w = (new_chat_defaults_w - m.inner_gap * 2.0) * 0.23;
+    const new_chat_provider_dropdown: palette.Rect = .{
+        .x = chat_card.x + m.card_pad,
+        .y = new_chat_defaults_y,
+        .w = default_provider_w,
+        .h = m.row_h,
+    };
+    const new_chat_model_dropdown: palette.Rect = .{
+        .x = new_chat_provider_dropdown.x + new_chat_provider_dropdown.w + m.inner_gap,
+        .y = new_chat_defaults_y,
+        .w = new_chat_defaults_w - default_provider_w - default_reasoning_w - m.inner_gap * 2.0,
+        .h = m.row_h,
+    };
+    const new_chat_reasoning_dropdown: palette.Rect = .{
+        .x = new_chat_model_dropdown.x + new_chat_model_dropdown.w + m.inner_gap,
+        .y = new_chat_defaults_y,
+        .w = default_reasoning_w,
+        .h = m.row_h,
+    };
+    const new_chat_defaults_hint_y = new_chat_defaults_y + m.row_h + m.inner_gap;
 
     y += chat_h + m.card_gap;
 
@@ -626,6 +659,10 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .chat_title_provider_dropdown = chat_title_provider_dropdown,
         .chat_title_model_dropdown = chat_title_model_dropdown,
         .chat_hint_y = chat_hint_y,
+        .new_chat_provider_dropdown = new_chat_provider_dropdown,
+        .new_chat_model_dropdown = new_chat_model_dropdown,
+        .new_chat_reasoning_dropdown = new_chat_reasoning_dropdown,
+        .new_chat_defaults_hint_y = new_chat_defaults_hint_y,
         .terminal_card = terminal_card,
         .terminal_font_dec = terminal_stepper.dec,
         .terminal_font_inc = terminal_stepper.inc,
@@ -853,6 +890,63 @@ fn registerTitleOptionHits(
     }
 }
 
+const NewChatMenuKind = enum { provider, model, reasoning };
+
+fn newChatMenuCount(state: *const runtime.AppState, kind: NewChatMenuKind) usize {
+    return switch (kind) {
+        .provider => state.settingsNewChatProviderCount(),
+        .model => state.settingsNewChatModelCount(),
+        .reasoning => state.settingsNewChatReasoningCount(),
+    };
+}
+
+fn newChatModelMenuVisibleCount(state: *const runtime.AppState) usize {
+    return @min(state.settingsNewChatModelCount(), TITLE_MENU_MAX_ROWS);
+}
+
+fn newChatModelMenuMaxScroll(state: *const runtime.AppState) usize {
+    return state.settingsNewChatModelCount() - newChatModelMenuVisibleCount(state);
+}
+
+fn newChatMenuRect(state: *const runtime.AppState, layout: SettingsLayout, kind: NewChatMenuKind) palette.Rect {
+    const dropdown = switch (kind) {
+        .provider => layout.new_chat_provider_dropdown,
+        .model => layout.new_chat_model_dropdown,
+        .reasoning => layout.new_chat_reasoning_dropdown,
+    };
+    const count = if (kind == .model) newChatModelMenuVisibleCount(state) else @min(newChatMenuCount(state, kind), TITLE_MENU_MAX_ROWS);
+    return dropdownMenuRect(dropdown, count);
+}
+
+fn registerNewChatOptionHits(
+    state: *runtime.AppState,
+    layout: SettingsLayout,
+    queue_hit: *const fn (*runtime.AppState, palette.Rect, runtime.PaletteModalAction, usize) void,
+) void {
+    const kinds = [_]NewChatMenuKind{ .provider, .model, .reasoning };
+    for (kinds) |kind| {
+        const open = switch (kind) {
+            .provider => state.settings_controller.new_chat_provider_dropdown_open,
+            .model => state.settings_controller.new_chat_model_dropdown_open,
+            .reasoning => state.settings_controller.new_chat_reasoning_dropdown_open,
+        };
+        if (!open) continue;
+        if (kind == .model) state.settings_controller.new_chat_model_menu_scroll = @min(state.settings_controller.new_chat_model_menu_scroll, newChatModelMenuMaxScroll(state));
+        const scroll = if (kind == .model) state.settings_controller.new_chat_model_menu_scroll else 0;
+        const visible_count = if (kind == .model) newChatModelMenuVisibleCount(state) else @min(newChatMenuCount(state, kind), TITLE_MENU_MAX_ROWS);
+        const action: runtime.PaletteModalAction = switch (kind) {
+            .provider => .settings_new_chat_provider_option,
+            .model => .settings_new_chat_model_option,
+            .reasoning => .settings_new_chat_reasoning_option,
+        };
+        const menu = newChatMenuRect(state, layout, kind);
+        for (0..visible_count) |visible_index| {
+            const rect = intersectRect(dropdownOptionRect(menu, visible_index), layout.body_clip) orelse continue;
+            queue_hit(state, rect, action, scroll + visible_index);
+        }
+    }
+}
+
 /// Registers palette hit targets for the settings modal.
 pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit: *const fn (*runtime.AppState, palette.Rect, runtime.PaletteModalAction, usize) void) void {
     if (!state.settings_controller.modal_visible) return;
@@ -882,6 +976,9 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     queueControlHit(state, layout.automatic_chat_titles, layout.body_clip, .automatic_chat_titles, queue_hit);
     queueControlHit(state, layout.chat_title_provider_dropdown, layout.body_clip, .chat_title_provider_dropdown, queue_hit);
     queueControlHit(state, layout.chat_title_model_dropdown, layout.body_clip, .chat_title_model_dropdown, queue_hit);
+    queueControlHit(state, layout.new_chat_provider_dropdown, layout.body_clip, .new_chat_provider_dropdown, queue_hit);
+    queueControlHit(state, layout.new_chat_model_dropdown, layout.body_clip, .new_chat_model_dropdown, queue_hit);
+    queueControlHit(state, layout.new_chat_reasoning_dropdown, layout.body_clip, .new_chat_reasoning_dropdown, queue_hit);
     queueControlHit(state, layout.terminal_font_dec, layout.body_clip, .terminal_font_dec, queue_hit);
     queueControlHit(state, layout.terminal_font_inc, layout.body_clip, .terminal_font_inc, queue_hit);
     queueControlHit(state, layout.links_verde_browser, layout.body_clip, .links_verde_browser, queue_hit);
@@ -930,6 +1027,7 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     registerThemeOptionHits(state, layout, queue_hit);
     registerCompanionCharacterOptionHits(state, layout, queue_hit);
     registerTitleOptionHits(state, layout, queue_hit);
+    registerNewChatOptionHits(state, layout, queue_hit);
 }
 
 /// Renders the settings modal over the workspace.
@@ -1019,6 +1117,19 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         .w = layout.chat_card.w - m.card_pad * 2.0,
         .h = m.label_h,
     }, "Default: GPT-5.6 Luna from Codex / ChatGPT", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
+    const new_chat_defaults_label_y = layout.new_chat_provider_dropdown.y - m.inner_gap - m.label_h;
+    queueText(state, .{ .x = layout.new_chat_provider_dropdown.x, .y = new_chat_defaults_label_y, .w = layout.new_chat_provider_dropdown.w, .h = m.label_h }, "New chat provider", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
+    queueText(state, .{ .x = layout.new_chat_model_dropdown.x, .y = new_chat_defaults_label_y, .w = layout.new_chat_model_dropdown.w, .h = m.label_h }, "Model", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
+    queueText(state, .{ .x = layout.new_chat_reasoning_dropdown.x, .y = new_chat_defaults_label_y, .w = layout.new_chat_reasoning_dropdown.w, .h = m.label_h }, "Reasoning", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
+    drawChatTitleDropdown(state, layout.new_chat_provider_dropdown, state.settingsNewChatProviderLabel(state.settingsNewChatProviderSelectedIndex()), .new_chat_provider_dropdown, state.settings_controller.new_chat_provider_dropdown_open, layout.body_clip);
+    drawChatTitleDropdown(state, layout.new_chat_model_dropdown, state.settingsNewChatModelSelectedLabel(), .new_chat_model_dropdown, state.settings_controller.new_chat_model_dropdown_open, layout.body_clip);
+    drawChatTitleDropdown(state, layout.new_chat_reasoning_dropdown, state.settingsNewChatReasoningSelectedLabel(), .new_chat_reasoning_dropdown, state.settings_controller.new_chat_reasoning_dropdown_open, layout.body_clip);
+    queueText(state, .{
+        .x = layout.chat_card.x + m.card_pad,
+        .y = layout.new_chat_defaults_hint_y,
+        .w = layout.chat_card.w - m.card_pad * 2.0,
+        .h = m.label_h,
+    }, "Applied whenever the GUI creates a new chat", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
 
     // Terminal
     drawCardTitle(state, layout.terminal_card, "Terminal", layout.body_clip);
@@ -1320,6 +1431,9 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     drawCompanionCharacterDropdownMenu(state, layout);
     drawChatTitleDropdownMenu(state, layout, true);
     drawChatTitleDropdownMenu(state, layout, false);
+    drawNewChatDropdownMenu(state, layout, .provider);
+    drawNewChatDropdownMenu(state, layout, .model);
+    drawNewChatDropdownMenu(state, layout, .reasoning);
     drawFooterBar(state, layout, dirty);
 }
 
@@ -1361,6 +1475,20 @@ pub fn handleWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y:
         }
         return true;
     }
+    if (state.settings_controller.new_chat_model_dropdown_open and rectContains(newChatMenuRect(state, layout, .model), x, y)) {
+        const max_scroll = newChatModelMenuMaxScroll(state);
+        const next = if (wheel_y < 0.0)
+            @min(state.settings_controller.new_chat_model_menu_scroll + 1, max_scroll)
+        else if (wheel_y > 0.0)
+            state.settings_controller.new_chat_model_menu_scroll -| 1
+        else
+            state.settings_controller.new_chat_model_menu_scroll;
+        if (next != state.settings_controller.new_chat_model_menu_scroll) {
+            state.settings_controller.new_chat_model_menu_scroll = next;
+            state.markDirty();
+        }
+        return true;
+    }
     if (layout.max_scroll_y <= 0.0) return true;
     if (!rectContains(layout.body_clip, x, y)) return true;
 
@@ -1376,12 +1504,13 @@ pub fn handleWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y:
 /// Updates settings-modal hover using hits from `refreshPaletteModalHits`.
 pub fn updateHover(state: *runtime.AppState, x: f32, y: f32) void {
     if (!state.settings_controller.modal_visible) {
-        if (state.settings_controller.hover_control != null or state.settings_controller.close_hovered or state.settings_controller.theme_hover_index != null or state.settings_controller.companion_character_hover_index != null or state.settings_controller.title_menu_hover_index != null) {
+        if (state.settings_controller.hover_control != null or state.settings_controller.close_hovered or state.settings_controller.theme_hover_index != null or state.settings_controller.companion_character_hover_index != null or state.settings_controller.title_menu_hover_index != null or state.settings_controller.new_chat_menu_hover_index != null) {
             state.settings_controller.hover_control = null;
             state.settings_controller.close_hovered = false;
             state.settings_controller.theme_hover_index = null;
             state.settings_controller.companion_character_hover_index = null;
             state.settings_controller.title_menu_hover_index = null;
+            state.settings_controller.new_chat_menu_hover_index = null;
             state.markDirty();
         }
         return;
@@ -1391,6 +1520,7 @@ pub fn updateHover(state: *runtime.AppState, x: f32, y: f32) void {
     var theme_hover: ?usize = null;
     var companion_hover: ?usize = null;
     var title_hover: ?usize = null;
+    var new_chat_hover: ?usize = null;
     var close_hovered = false;
     var i = state.palette_modal_hits.items.len;
     while (i > 0) {
@@ -1412,18 +1542,23 @@ pub fn updateHover(state: *runtime.AppState, x: f32, y: f32) void {
             title_hover = hit.index;
             break;
         }
+        if ((hit.action == .settings_new_chat_provider_option or hit.action == .settings_new_chat_model_option or hit.action == .settings_new_chat_reasoning_option) and rectContains(hit.rect, x, y)) {
+            new_chat_hover = hit.index;
+            break;
+        }
         if (hit.action != .settings_control) continue;
         if (!rectContains(hit.rect, x, y)) continue;
         new_hover = @intCast(hit.index);
         break;
     }
 
-    if (state.settings_controller.hover_control == new_hover and state.settings_controller.close_hovered == close_hovered and state.settings_controller.theme_hover_index == theme_hover and state.settings_controller.companion_character_hover_index == companion_hover and state.settings_controller.title_menu_hover_index == title_hover) return;
+    if (state.settings_controller.hover_control == new_hover and state.settings_controller.close_hovered == close_hovered and state.settings_controller.theme_hover_index == theme_hover and state.settings_controller.companion_character_hover_index == companion_hover and state.settings_controller.title_menu_hover_index == title_hover and state.settings_controller.new_chat_menu_hover_index == new_chat_hover) return;
     state.settings_controller.hover_control = new_hover;
     state.settings_controller.close_hovered = close_hovered;
     state.settings_controller.theme_hover_index = theme_hover;
     state.settings_controller.companion_character_hover_index = companion_hover;
     state.settings_controller.title_menu_hover_index = title_hover;
+    state.settings_controller.new_chat_menu_hover_index = new_chat_hover;
     state.markDirty();
 }
 
@@ -1474,6 +1609,10 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
     if (control != .chat_title_provider_dropdown) state.settings_controller.title_provider_dropdown_open = false;
     if (control != .chat_title_model_dropdown) state.settings_controller.title_model_dropdown_open = false;
     if (control != .chat_title_provider_dropdown and control != .chat_title_model_dropdown) state.settings_controller.title_menu_hover_index = null;
+    if (control != .new_chat_provider_dropdown) state.settings_controller.new_chat_provider_dropdown_open = false;
+    if (control != .new_chat_model_dropdown) state.settings_controller.new_chat_model_dropdown_open = false;
+    if (control != .new_chat_reasoning_dropdown) state.settings_controller.new_chat_reasoning_dropdown_open = false;
+    if (control != .new_chat_provider_dropdown and control != .new_chat_model_dropdown and control != .new_chat_reasoning_dropdown) state.settings_controller.new_chat_menu_hover_index = null;
     switch (control) {
         .ui_font_dec => state.settings_controller.draft.font_size = theme.clampf(state.settings_controller.draft.font_size - 1.0, app_config.MIN_FONT_SIZE, app_config.MAX_FONT_SIZE),
         .ui_font_inc => state.settings_controller.draft.font_size = theme.clampf(state.settings_controller.draft.font_size + 1.0, app_config.MIN_FONT_SIZE, app_config.MAX_FONT_SIZE),
@@ -1549,6 +1688,22 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
             } else {
                 state.settings_controller.title_menu_hover_index = null;
             }
+        },
+        .new_chat_provider_dropdown => {
+            state.settings_controller.new_chat_provider_dropdown_open = !state.settings_controller.new_chat_provider_dropdown_open;
+            state.settings_controller.new_chat_menu_hover_index = if (state.settings_controller.new_chat_provider_dropdown_open) state.settingsNewChatProviderSelectedIndex() else null;
+        },
+        .new_chat_model_dropdown => {
+            state.settings_controller.new_chat_model_dropdown_open = !state.settings_controller.new_chat_model_dropdown_open;
+            if (state.settings_controller.new_chat_model_dropdown_open) {
+                const selected = state.settingsNewChatModelSelectedIndex() orelse 0;
+                state.settings_controller.new_chat_menu_hover_index = selected;
+                ensureNewChatModelChoiceVisible(state, selected);
+            } else state.settings_controller.new_chat_menu_hover_index = null;
+        },
+        .new_chat_reasoning_dropdown => {
+            state.settings_controller.new_chat_reasoning_dropdown_open = !state.settings_controller.new_chat_reasoning_dropdown_open;
+            state.settings_controller.new_chat_menu_hover_index = if (state.settings_controller.new_chat_reasoning_dropdown_open) state.settingsNewChatReasoningSelectedIndex() else null;
         },
         .new_chat_new_pane => state.settings_controller.draft.new_chat_pane_behavior = .new_pane,
         .new_chat_replace_pane => state.settings_controller.draft.new_chat_pane_behavior = .replace_pane,
@@ -1647,6 +1802,18 @@ pub fn applyChatTitleModelOption(state: *runtime.AppState, option_index: usize) 
     state.selectSettingsChatTitleModel(option_index);
 }
 
+pub fn applyNewChatProviderOption(state: *runtime.AppState, option_index: usize) void {
+    state.selectSettingsNewChatProvider(option_index);
+}
+
+pub fn applyNewChatModelOption(state: *runtime.AppState, option_index: usize) void {
+    state.selectSettingsNewChatModel(option_index);
+}
+
+pub fn applyNewChatReasoningOption(state: *runtime.AppState, option_index: usize) void {
+    state.selectSettingsNewChatReasoning(option_index);
+}
+
 /// Handles navigation while a settings dropdown owns keyboard focus.
 pub fn handleKeyDown(state: *runtime.AppState, key: sdl.Keycode) bool {
     if (!state.settings_controller.modal_visible) return false;
@@ -1654,6 +1821,9 @@ pub fn handleKeyDown(state: *runtime.AppState, key: sdl.Keycode) bool {
     if (state.settings_controller.companion_character_dropdown_open) return handleCompanionCharacterKeyDown(state, key);
     if (state.settings_controller.title_provider_dropdown_open) return handleTitleProviderKeyDown(state, key);
     if (state.settings_controller.title_model_dropdown_open) return handleTitleModelKeyDown(state, key);
+    if (state.settings_controller.new_chat_provider_dropdown_open) return handleNewChatMenuKeyDown(state, key, .provider);
+    if (state.settings_controller.new_chat_model_dropdown_open) return handleNewChatMenuKeyDown(state, key, .model);
+    if (state.settings_controller.new_chat_reasoning_dropdown_open) return handleNewChatMenuKeyDown(state, key, .reasoning);
     return false;
 }
 
@@ -1785,6 +1955,56 @@ fn ensureTitleModelChoiceVisible(state: *runtime.AppState, option_index: usize) 
         }
     }
     state.settings_controller.title_model_menu_scroll = @min(state.settings_controller.title_model_menu_scroll, titleModelMenuMaxScroll(state));
+}
+
+fn handleNewChatMenuKeyDown(state: *runtime.AppState, key: sdl.Keycode, kind: NewChatMenuKind) bool {
+    const count = newChatMenuCount(state, kind);
+    if (count == 0) return false;
+    const selected = switch (kind) {
+        .provider => state.settingsNewChatProviderSelectedIndex(),
+        .model => state.settingsNewChatModelSelectedIndex() orelse 0,
+        .reasoning => state.settingsNewChatReasoningSelectedIndex(),
+    };
+    const current = @min(state.settings_controller.new_chat_menu_hover_index orelse selected, count - 1);
+    const next = switch (key) {
+        .up => current -| 1,
+        .down => @min(current + 1, count - 1),
+        .home => 0,
+        .end => count - 1,
+        .escape => {
+            state.settings_controller.new_chat_provider_dropdown_open = false;
+            state.settings_controller.new_chat_model_dropdown_open = false;
+            state.settings_controller.new_chat_reasoning_dropdown_open = false;
+            state.settings_controller.new_chat_menu_hover_index = null;
+            state.markDirty();
+            return true;
+        },
+        .@"return", .kp_enter => {
+            switch (kind) {
+                .provider => state.selectSettingsNewChatProvider(current),
+                .model => state.selectSettingsNewChatModel(current),
+                .reasoning => state.selectSettingsNewChatReasoning(current),
+            }
+            return true;
+        },
+        else => return false,
+    };
+    state.settings_controller.new_chat_menu_hover_index = next;
+    if (kind == .model) ensureNewChatModelChoiceVisible(state, next);
+    state.markDirty();
+    return true;
+}
+
+fn ensureNewChatModelChoiceVisible(state: *runtime.AppState, option_index: usize) void {
+    if (option_index < state.settings_controller.new_chat_model_menu_scroll) {
+        state.settings_controller.new_chat_model_menu_scroll = option_index;
+    } else {
+        const visible_count = newChatModelMenuVisibleCount(state);
+        if (option_index >= state.settings_controller.new_chat_model_menu_scroll + visible_count) {
+            state.settings_controller.new_chat_model_menu_scroll = option_index - visible_count + 1;
+        }
+    }
+    state.settings_controller.new_chat_model_menu_scroll = @min(state.settings_controller.new_chat_model_menu_scroll, newChatModelMenuMaxScroll(state));
 }
 
 const NOTES_FONT_SIZE = 12.0;
@@ -2178,6 +2398,46 @@ fn drawChatTitleDropdownMenu(state: *runtime.AppState, layout: SettingsLayout, p
         const progress = @as(f32, @floatFromInt(scroll)) / @as(f32, @floatFromInt(titleModelMenuMaxScroll(state)));
         queueRoundedRectClipped(state, track, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 20)), theme.scaledUi(1.0), layout.body_clip);
         queueRoundedRectClipped(state, .{ .x = track.x, .y = track.y + travel * progress, .w = track.w, .h = thumb_h }, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 100)), theme.scaledUi(1.0), layout.body_clip);
+    }
+}
+
+// Renders one new-chat default dropdown menu over the Chat settings card.
+fn drawNewChatDropdownMenu(state: *runtime.AppState, layout: SettingsLayout, kind: NewChatMenuKind) void {
+    const open = switch (kind) {
+        .provider => state.settings_controller.new_chat_provider_dropdown_open,
+        .model => state.settings_controller.new_chat_model_dropdown_open,
+        .reasoning => state.settings_controller.new_chat_reasoning_dropdown_open,
+    };
+    if (!open) return;
+    const count = newChatMenuCount(state, kind);
+    const visible_count = if (kind == .model) newChatModelMenuVisibleCount(state) else @min(count, TITLE_MENU_MAX_ROWS);
+    const scroll = if (kind == .model) state.settings_controller.new_chat_model_menu_scroll else 0;
+    const menu = newChatMenuRect(state, layout, kind);
+    queueRoundedRectClipped(state, menu, paletteColor(raisedSurface(0.14)), radiusSm(), layout.body_clip);
+    queueBorderClipped(state, menu, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 34)), radiusSm(), theme.scaledUi(1.0), layout.body_clip);
+
+    const selected_index = switch (kind) {
+        .provider => state.settingsNewChatProviderSelectedIndex(),
+        .model => state.settingsNewChatModelSelectedIndex() orelse std.math.maxInt(usize),
+        .reasoning => state.settingsNewChatReasoningSelectedIndex(),
+    };
+    for (0..visible_count) |visible_index| {
+        const option_index = scroll + visible_index;
+        const row = dropdownOptionRect(menu, visible_index);
+        const selected = option_index == selected_index;
+        const hovered = state.settings_controller.new_chat_menu_hover_index == option_index;
+        if (selected or hovered) queueRoundedRectClipped(state, row, paletteColor(if (selected) theme.withAlpha(theme.accent(), 38) else controlHoverSurface()), theme.scaledUi(4.0), layout.body_clip);
+        const label = switch (kind) {
+            .provider => state.settingsNewChatProviderLabel(option_index),
+            .model => state.settingsNewChatModelLabel(option_index),
+            .reasoning => state.settingsNewChatReasoningLabel(option_index),
+        };
+        queueText(state, .{
+            .x = row.x + theme.scaledUi(10.0),
+            .y = row.y + (row.h - theme.scaledUi(15.0)) * 0.5,
+            .w = row.w - theme.scaledUi(20.0),
+            .h = theme.scaledUi(15.0),
+        }, label, paletteColor(if (selected or hovered) theme.COLOR_WHITE else textLabel()), theme.scaledUi(13.0), layout.body_clip);
     }
 }
 

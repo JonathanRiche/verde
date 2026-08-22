@@ -1528,6 +1528,9 @@ pub fn splitWorkspacePaneWithChatPlacement(self: anytype, project_index: usize, 
         self.setSidebarNotice("Failed to create a new thread.");
         return false;
     };
+    self.applyNewChatDefaults(project_index, thread_index) catch |err| {
+        log.warn("failed to apply new-chat defaults: {s}", .{@errorName(err)});
+    };
     const new_pane_id = layout.createChatPane(self.allocator, thread_index) catch |err| {
         log.err("failed to create chat workspace pane: {s}", .{@errorName(err)});
         self.setSidebarNotice("Failed to create chat pane.");

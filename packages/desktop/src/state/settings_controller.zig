@@ -24,12 +24,23 @@ const CHAT_TITLE_PROVIDER_OPTIONS = [_]app_config.ChatTitleProvider{
     .cursor,
     .opencode,
 };
+const NEW_CHAT_PROVIDER_OPTIONS = [_]app_config.ChatProvider{ .codex, .claude, .cursor, .opencode };
+const NEW_CHAT_REASONING_OPTIONS = [_]app_config.ChatReasoning{ .provider_default, .low, .medium, .high, .xhigh, .max };
 
 fn monotonicMs() i64 {
     return @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
 }
 
 fn dbProviderForChatTitleProvider(provider: app_config.ChatTitleProvider) Provider {
+    return switch (provider) {
+        .codex => .codex,
+        .claude => .claude,
+        .cursor => .cursor,
+        .opencode => .opencode,
+    };
+}
+
+fn dbProviderForChatProvider(provider: app_config.ChatProvider) Provider {
     return switch (provider) {
         .codex => .codex,
         .claude => .claude,
@@ -70,6 +81,8 @@ pub const Draft = struct {
     diff_layout_preference: app_config.DiffLayoutPreference = .stacked,
     automatic_chat_titles_enabled: bool = true,
     chat_title_provider: app_config.ChatTitleProvider = .codex,
+    new_chat_provider: app_config.ChatProvider = .codex,
+    new_chat_reasoning: app_config.ChatReasoning = .low,
     new_chat_pane_behavior: app_config.NewChatPaneBehavior = .new_pane,
     check_for_updates_automatically: bool = true,
     notifications_enabled: bool = true,
@@ -139,6 +152,7 @@ pub const State = struct {
     modal_closing: bool = false,
     draft: Draft = .{},
     chat_title_model: ?[]u8 = null,
+    new_chat_model: ?[]u8 = null,
     hook_claude_installed: bool = false,
     hook_codex_installed: bool = false,
     hook_cursor_installed: bool = false,
@@ -161,6 +175,11 @@ pub const State = struct {
     title_model_dropdown_open: bool = false,
     title_menu_hover_index: ?usize = null,
     title_model_menu_scroll: usize = 0,
+    new_chat_provider_dropdown_open: bool = false,
+    new_chat_model_dropdown_open: bool = false,
+    new_chat_reasoning_dropdown_open: bool = false,
+    new_chat_menu_hover_index: ?usize = null,
+    new_chat_model_menu_scroll: usize = 0,
     update_notes_expanded: bool = false,
     update: updater.State = .{},
     update_installer_started: bool = false,
@@ -241,6 +260,7 @@ pub fn toggleProviderGlobalHooks(self: anytype, provider: HookKind, installed: *
 pub fn replaceAppConfig(self: anytype, next_config: app_config.AppConfig) void {
     self.app_config.deinit(self.allocator);
     self.app_config = next_config;
+    self.composer_controller.model_picker.invalidateItems();
     self.reconcileCompanionAvailability();
 }
 
@@ -288,6 +308,8 @@ pub fn syncSettingsDraftFromConfig(self: anytype) void {
         .diff_layout_preference = self.app_config.diff_layout_preference,
         .automatic_chat_titles_enabled = self.app_config.automatic_chat_titles_enabled,
         .chat_title_provider = self.app_config.chat_title_provider,
+        .new_chat_provider = self.app_config.new_chat_provider,
+        .new_chat_reasoning = self.app_config.new_chat_reasoning,
         .new_chat_pane_behavior = self.app_config.new_chat_pane_behavior,
         .check_for_updates_automatically = self.app_config.check_for_updates_automatically,
         .notifications_enabled = self.app_config.notifications_enabled,
@@ -296,6 +318,11 @@ pub fn syncSettingsDraftFromConfig(self: anytype) void {
     replaceSettingsChatTitleModel(self, self.app_config.chatTitleModel()) catch {
         if (self.settings_controller.chat_title_model) |model| self.allocator.free(model);
         self.settings_controller.chat_title_model = null;
+    };
+    const new_chat_model = self.app_config.new_chat_model orelse defaultNewChatModelRef(self, self.app_config.new_chat_provider);
+    replaceSettingsNewChatModel(self, new_chat_model) catch {
+        if (self.settings_controller.new_chat_model) |model| self.allocator.free(model);
+        self.settings_controller.new_chat_model = null;
     };
 }
 
@@ -330,6 +357,10 @@ pub fn isSettingsDraftDirty(self: anytype) bool {
     if (draft.diff_layout_preference != self.app_config.diff_layout_preference) return true;
     if (draft.automatic_chat_titles_enabled != self.app_config.automatic_chat_titles_enabled) return true;
     if (draft.chat_title_provider != self.app_config.chat_title_provider) return true;
+    if (draft.new_chat_provider != self.app_config.new_chat_provider) return true;
+    if (draft.new_chat_reasoning != self.app_config.new_chat_reasoning) return true;
+    const configured_new_chat_model = self.app_config.new_chat_model orelse defaultNewChatModelRef(self, self.app_config.new_chat_provider);
+    if (!std.mem.eql(u8, self.settingsNewChatModelRef(), configured_new_chat_model)) return true;
     if (draft.new_chat_pane_behavior != self.app_config.new_chat_pane_behavior) return true;
     if (!std.mem.eql(u8, self.settingsChatTitleModelRef(), self.app_config.chatTitleModel())) return true;
     if (draft.check_for_updates_automatically != self.app_config.check_for_updates_automatically) return true;
@@ -363,6 +394,11 @@ pub fn openSettingsModal(self: anytype) void {
     self.settings_controller.title_model_dropdown_open = false;
     self.settings_controller.title_menu_hover_index = null;
     self.settings_controller.title_model_menu_scroll = 0;
+    self.settings_controller.new_chat_provider_dropdown_open = false;
+    self.settings_controller.new_chat_model_dropdown_open = false;
+    self.settings_controller.new_chat_reasoning_dropdown_open = false;
+    self.settings_controller.new_chat_menu_hover_index = null;
+    self.settings_controller.new_chat_model_menu_scroll = 0;
     self.settings_controller.update_notes_expanded = false;
     self.settings_controller.modal_closing = false;
     self.settings_controller.modal_anim_progress = 0.0;
@@ -435,6 +471,10 @@ pub fn cancelSettingsModal(self: anytype) void {
     self.settings_controller.title_provider_dropdown_open = false;
     self.settings_controller.title_model_dropdown_open = false;
     self.settings_controller.title_menu_hover_index = null;
+    self.settings_controller.new_chat_provider_dropdown_open = false;
+    self.settings_controller.new_chat_model_dropdown_open = false;
+    self.settings_controller.new_chat_reasoning_dropdown_open = false;
+    self.settings_controller.new_chat_menu_hover_index = null;
     self.syncSettingsDraftFromConfig();
     self.palette_modal_text_focus = .none;
     self.markDirty();
@@ -473,8 +513,11 @@ pub fn saveSettingsModal(self: anytype) !void {
     self.app_config.diff_layout_preference = self.settings_controller.draft.diff_layout_preference;
     self.app_config.automatic_chat_titles_enabled = self.settings_controller.draft.automatic_chat_titles_enabled;
     self.app_config.chat_title_provider = self.settings_controller.draft.chat_title_provider;
+    self.app_config.new_chat_provider = self.settings_controller.draft.new_chat_provider;
+    self.app_config.new_chat_reasoning = self.settings_controller.draft.new_chat_reasoning;
     self.app_config.new_chat_pane_behavior = self.settings_controller.draft.new_chat_pane_behavior;
     try self.app_config.setChatTitleModel(self.allocator, self.settingsChatTitleModelRef());
+    try self.app_config.setNewChatModel(self.allocator, self.settingsNewChatModelRef());
     const previous_auto_update_check = self.app_config.check_for_updates_automatically;
     errdefer self.app_config.check_for_updates_automatically = previous_auto_update_check;
     self.app_config.check_for_updates_automatically = self.settings_controller.draft.check_for_updates_automatically;
@@ -737,6 +780,214 @@ fn replaceSettingsChatTitleModel(self: anytype, model_ref: []const u8) !void {
     const owned_model = try self.allocator.dupe(u8, model_ref);
     if (self.settings_controller.chat_title_model) |previous| self.allocator.free(previous);
     self.settings_controller.chat_title_model = owned_model;
+}
+
+pub fn settingsNewChatProviderCount(self: anytype) usize {
+    _ = self;
+    return NEW_CHAT_PROVIDER_OPTIONS.len;
+}
+
+pub fn settingsNewChatProviderSelectedIndex(self: anytype) usize {
+    for (NEW_CHAT_PROVIDER_OPTIONS, 0..) |provider, index| {
+        if (provider == self.settings_controller.draft.new_chat_provider) return index;
+    }
+    return 0;
+}
+
+pub fn settingsNewChatProviderLabel(self: anytype, option_index: usize) []const u8 {
+    _ = self;
+    if (option_index >= NEW_CHAT_PROVIDER_OPTIONS.len) return "Unknown provider";
+    return switch (NEW_CHAT_PROVIDER_OPTIONS[option_index]) {
+        .codex => "Codex / ChatGPT",
+        .claude => "Claude",
+        .cursor => "Cursor",
+        .opencode => "OpenCode",
+    };
+}
+
+fn settingsNewChatModelOptions(self: anytype) []const ModelOption {
+    return chat_threads.modelOptions(
+        ModelOption,
+        dbProviderForChatProvider(self.settings_controller.draft.new_chat_provider),
+        self.opencodeModelOptionsSnapshot(),
+        provider_models.CODEX_MODEL_OPTIONS[0..],
+        self.claudeModelOptionsSnapshot(),
+        self.cursorModelOptionsSnapshot(),
+    );
+}
+
+fn defaultNewChatModelRef(self: anytype, provider: app_config.ChatProvider) []const u8 {
+    return switch (dbProviderForChatProvider(provider)) {
+        .codex => provider_models.DEFAULT_CODEX_MODEL,
+        .opencode => self.cachedDefaultModelRefForProvider(.opencode),
+        .claude => provider_models.DEFAULT_CLAUDE_MODEL,
+        .cursor => provider_models.DEFAULT_CURSOR_MODEL,
+    };
+}
+
+pub fn settingsNewChatModelRef(self: anytype) []const u8 {
+    return self.settings_controller.new_chat_model orelse defaultNewChatModelRef(self, self.settings_controller.draft.new_chat_provider);
+}
+
+pub fn settingsNewChatModelCount(self: anytype) usize {
+    return settingsNewChatModelOptions(self).len;
+}
+
+pub fn settingsNewChatModelLabel(self: anytype, option_index: usize) []const u8 {
+    const options = settingsNewChatModelOptions(self);
+    if (option_index >= options.len) return "Unknown model";
+    return options[option_index].label;
+}
+
+pub fn settingsNewChatModelSelectedIndex(self: anytype) ?usize {
+    const selected = self.settingsNewChatModelRef();
+    for (settingsNewChatModelOptions(self), 0..) |option, index| {
+        const value = option.value orelse continue;
+        if (std.mem.eql(u8, value, selected)) return index;
+    }
+    return null;
+}
+
+pub fn settingsNewChatModelSelectedLabel(self: anytype) []const u8 {
+    if (self.settingsNewChatModelSelectedIndex()) |index| return self.settingsNewChatModelLabel(index);
+    return self.settingsNewChatModelRef();
+}
+
+fn replaceSettingsNewChatModel(self: anytype, model_ref: []const u8) !void {
+    const owned_model = try self.allocator.dupe(u8, model_ref);
+    if (self.settings_controller.new_chat_model) |previous| self.allocator.free(previous);
+    self.settings_controller.new_chat_model = owned_model;
+}
+
+fn selectedNewChatModelOption(self: anytype) ?ModelOption {
+    const index = self.settingsNewChatModelSelectedIndex() orelse return null;
+    const options = settingsNewChatModelOptions(self);
+    if (index >= options.len) return null;
+    return options[index];
+}
+
+fn reasoningValueMatches(value: []const u8, reasoning: app_config.ChatReasoning) bool {
+    if (reasoning == .provider_default) return false;
+    if (std.mem.eql(u8, value, reasoning.configValue())) return true;
+    return reasoning == .xhigh and std.mem.eql(u8, value, "extra-high");
+}
+
+fn settingsNewChatReasoningSupported(self: anytype, reasoning: app_config.ChatReasoning) bool {
+    if (reasoning == .provider_default) return true;
+    const provider = self.settings_controller.draft.new_chat_provider;
+    const option = selectedNewChatModelOption(self) orelse return false;
+    return switch (provider) {
+        .codex => blk: {
+            const effort = provider_models.parseReasoningEffort(reasoning.configValue()) orelse break :blk false;
+            for (provider_models.codexReasoningOptions(option.value)) |candidate| {
+                if (candidate.value != null and candidate.value.? == effort) break :blk true;
+            }
+            break :blk false;
+        },
+        .claude => blk: {
+            if (!option.reasoning_supported) break :blk false;
+            const values = option.claude_effort_values orelse provider_models.CLAUDE_STANDARD_EFFORT_VALUES[0..];
+            for (values) |value| if (reasoningValueMatches(value, reasoning)) break :blk true;
+            break :blk false;
+        },
+        .cursor => blk: {
+            const values = option.cursor_reasoning_values orelse break :blk false;
+            for (values) |value| if (reasoningValueMatches(value, reasoning)) break :blk true;
+            break :blk false;
+        },
+        .opencode => blk: {
+            if (!option.reasoning_supported) break :blk false;
+            const values = option.reasoning_variant_keys orelse break :blk false;
+            for (values) |value| if (reasoningValueMatches(value, reasoning)) break :blk true;
+            break :blk false;
+        },
+    };
+}
+
+fn settingsNewChatReasoningOptionAt(self: anytype, option_index: usize) ?app_config.ChatReasoning {
+    var visible_index: usize = 0;
+    for (NEW_CHAT_REASONING_OPTIONS) |reasoning| {
+        if (!settingsNewChatReasoningSupported(self, reasoning)) continue;
+        if (visible_index == option_index) return reasoning;
+        visible_index += 1;
+    }
+    return null;
+}
+
+pub fn settingsNewChatReasoningCount(self: anytype) usize {
+    var count: usize = 0;
+    for (NEW_CHAT_REASONING_OPTIONS) |reasoning| if (settingsNewChatReasoningSupported(self, reasoning)) {
+        count += 1;
+    };
+    return count;
+}
+
+pub fn settingsNewChatReasoningLabel(self: anytype, option_index: usize) []const u8 {
+    const reasoning = settingsNewChatReasoningOptionAt(self, option_index) orelse return "Unknown";
+    return switch (reasoning) {
+        .provider_default => "Default",
+        .low => "Low",
+        .medium => "Medium",
+        .high => "High",
+        .xhigh => "Xhigh",
+        .max => "Max",
+    };
+}
+
+pub fn settingsNewChatReasoningSelectedIndex(self: anytype) usize {
+    const selected = self.settings_controller.draft.new_chat_reasoning;
+    var visible_index: usize = 0;
+    for (NEW_CHAT_REASONING_OPTIONS) |reasoning| {
+        if (!settingsNewChatReasoningSupported(self, reasoning)) continue;
+        if (reasoning == selected) return visible_index;
+        visible_index += 1;
+    }
+    return 0;
+}
+
+pub fn settingsNewChatReasoningSelectedLabel(self: anytype) []const u8 {
+    return self.settingsNewChatReasoningLabel(self.settingsNewChatReasoningSelectedIndex());
+}
+
+pub fn selectSettingsNewChatProvider(self: anytype, option_index: usize) void {
+    if (option_index >= NEW_CHAT_PROVIDER_OPTIONS.len) return;
+    const provider = NEW_CHAT_PROVIDER_OPTIONS[option_index];
+    if (provider != self.settings_controller.draft.new_chat_provider) {
+        replaceSettingsNewChatModel(self, defaultNewChatModelRef(self, provider)) catch return;
+        self.settings_controller.draft.new_chat_provider = provider;
+        self.settings_controller.draft.new_chat_reasoning = .provider_default;
+        switch (provider) {
+            .codex => {},
+            .claude => self.startClaudeModelOptionsRefresh(),
+            .cursor => self.startCursorModelOptionsRefresh(),
+            .opencode => self.startOpencodeModelOptionsRefresh(),
+        }
+    }
+    self.settings_controller.new_chat_provider_dropdown_open = false;
+    self.settings_controller.new_chat_menu_hover_index = null;
+    self.settings_controller.new_chat_model_menu_scroll = 0;
+    self.markDirty();
+}
+
+pub fn selectSettingsNewChatModel(self: anytype, option_index: usize) void {
+    const options = settingsNewChatModelOptions(self);
+    if (option_index >= options.len) return;
+    const model_ref = options[option_index].value orelse return;
+    replaceSettingsNewChatModel(self, model_ref) catch return;
+    if (!settingsNewChatReasoningSupported(self, self.settings_controller.draft.new_chat_reasoning)) {
+        self.settings_controller.draft.new_chat_reasoning = .provider_default;
+    }
+    self.settings_controller.new_chat_model_dropdown_open = false;
+    self.settings_controller.new_chat_menu_hover_index = null;
+    self.markDirty();
+}
+
+pub fn selectSettingsNewChatReasoning(self: anytype, option_index: usize) void {
+    const reasoning = settingsNewChatReasoningOptionAt(self, option_index) orelse return;
+    self.settings_controller.draft.new_chat_reasoning = reasoning;
+    self.settings_controller.new_chat_reasoning_dropdown_open = false;
+    self.settings_controller.new_chat_menu_hover_index = null;
+    self.markDirty();
 }
 
 pub fn startUpdateCheck(self: anytype) void {

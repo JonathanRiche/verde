@@ -54,6 +54,12 @@ file. It is read on startup and on app refresh.
     "automatic_titles": true,
     "title_provider": "codex",
     "title_model": "gpt-5.6-luna",
+    "default_provider": "codex",
+    "default_model": "gpt-5.6-sol",
+    "default_reasoning": "low",
+    "favorite_models": [
+      { "provider": "codex", "model": "gpt-5.6-sol" }
+    ],
     "new_pane_behavior": "new_pane"
   },
   "updates": {
@@ -156,6 +162,18 @@ assistant exchange completes. `chat.title_provider` accepts `codex`, `claude`,
 `cursor`, or `opencode`; `chat.title_model` is the model reference understood
 by that provider. The default is GPT-5.6 Luna from Codex / ChatGPT. A title
 generation failure leaves Verde's prompt-derived fallback title unchanged.
+
+## New chat defaults and favorite models
+
+New GUI chats start with `chat.default_provider`, `chat.default_model`, and
+`chat.default_reasoning`. Providers accept `codex`, `claude`, `cursor`, or
+`opencode`; reasoning accepts `default`, `low`, `medium`, `high`, `xhigh`, or
+`max` when the chosen model supports it. These values are also available under
+**Settings → Chat → New chat defaults**.
+
+The model picker’s star tab shows only `chat.favorite_models`. Use the star on
+any provider/model row to add or remove it; provider tabs continue to show the
+full model list for that provider.
 
 Ctrl+T and the workspace pencil button create and focus a new chat pane by
 default. Set `chat.new_pane_behavior` to `replace_pane`, or choose **Replace
