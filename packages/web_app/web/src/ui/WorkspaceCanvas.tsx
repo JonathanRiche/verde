@@ -1,4 +1,4 @@
-import { For, Show, createEffect, onCleanup, onMount } from 'solid-js'
+import { For, Show, createEffect, createMemo, onCleanup, onMount } from 'solid-js'
 
 import { store } from '../lib/store'
 import type { LivePane } from '../lib/types'
@@ -11,6 +11,8 @@ export function WorkspaceCanvas() {
   let scroller: HTMLDivElement | undefined
   let ignore_scroll = false
   let scroll_timer = 0
+  let focus_timer = 0
+  let last_focused_id: number | null = null
 
   // Zoom renders only the maximized pane; the single column then naturally
   // fills the strip and other panes remount from daemon state on unzoom.
@@ -24,17 +26,23 @@ export function WorkspaceCanvas() {
     return all
   }
 
+  const pane_order = createMemo(() => panes().map((pane) => pane.pane_id).join(','))
+
   createEffect(() => {
+    pane_order()
     const id = store.focusedPaneId()
     const root = scroller
     if (!root || id == null) return
     const column = root.querySelector(`[data-pane-id="${id}"]`)
     if (!(column instanceof HTMLElement)) return
+    const instant = store.takeInstantFocus(id) || last_focused_id === id
+    last_focused_id = id
     ignore_scroll = true
-    column.scrollIntoView({ inline: 'start', block: 'nearest', behavior: 'smooth' })
-    window.setTimeout(() => {
+    window.clearTimeout(focus_timer)
+    column.scrollIntoView({ inline: 'start', block: 'nearest', behavior: instant ? 'auto' : 'smooth' })
+    focus_timer = window.setTimeout(() => {
       ignore_scroll = false
-    }, 450)
+    }, instant ? 120 : 450)
   })
 
   onMount(() => {
@@ -63,6 +71,7 @@ export function WorkspaceCanvas() {
     root.addEventListener('wheel', onWheel, { passive: false })
     root.addEventListener('scroll', onScroll, { passive: true })
     onCleanup(() => {
+      window.clearTimeout(focus_timer)
       window.clearTimeout(scroll_timer)
       root.removeEventListener('wheel', onWheel)
       root.removeEventListener('scroll', onScroll)
@@ -76,7 +85,7 @@ export function WorkspaceCanvas() {
 
   return (
     <div
-      class={`niri-strip flex min-h-0 min-w-0 flex-1 overflow-x-auto overflow-y-hidden ${inset() ? 'niri-inset' : 'niri-zoomed'}`}
+      class={`niri-strip flex min-h-0 min-w-0 flex-1 overflow-x-auto overflow-y-hidden ${store.initialViewReady() ? '' : 'invisible'} ${inset() ? 'niri-inset' : 'niri-zoomed'}`}
       style={{
         '--workspace-pane-gap': inset() ? `${pane_gap()}px` : '0px',
         '--workspace-panes-per-view': String(Math.max(1, panes_per_view())),

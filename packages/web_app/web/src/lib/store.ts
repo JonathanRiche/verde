@@ -169,9 +169,93 @@ const THREAD_SETTING_KEYS = [
   'access_mode',
 ] as const satisfies ReadonlyArray<keyof Thread>
 const THREAD_SETTINGS_CACHE_KEY = 'verde:web:thread-settings:v1'
+const LAST_CHAT_PANE_CACHE_KEY = 'verde:web:last-chat-pane:v1'
 
 type CachedThreadSettings = Pick<Thread, (typeof THREAD_SETTING_KEYS)[number]>
 type ThreadSettingsCache = Record<string, Record<string, CachedThreadSettings>>
+
+export interface LastChatPaneLocation {
+  workspace_id: string
+  pane_id: number
+  thread_id?: string
+  thread_index?: number
+  thread_title?: string
+}
+
+function readLastChatPaneLocation(): LastChatPaneLocation | null {
+  try {
+    const parsed = asRecord(JSON.parse(localStorage.getItem(LAST_CHAT_PANE_CACHE_KEY) ?? 'null'))
+    if (
+      !parsed ||
+      typeof parsed.workspace_id !== 'string' ||
+      typeof parsed.pane_id !== 'number' ||
+      !Number.isFinite(parsed.pane_id)
+    ) return null
+    return {
+      workspace_id: parsed.workspace_id,
+      pane_id: parsed.pane_id,
+      ...(typeof parsed.thread_id === 'string' ? { thread_id: parsed.thread_id } : {}),
+      ...(typeof parsed.thread_index === 'number' ? { thread_index: parsed.thread_index } : {}),
+      ...(typeof parsed.thread_title === 'string' ? { thread_title: parsed.thread_title } : {}),
+    }
+  } catch {
+    return null
+  }
+}
+
+function writeLastChatPaneLocation(pane: LivePane): void {
+  if (pane.kind !== 'chat') return
+  const location: LastChatPaneLocation = {
+    workspace_id: pane.workspace_id,
+    pane_id: pane.pane_id,
+    ...(pane.thread_id ? { thread_id: pane.thread_id } : {}),
+    ...(pane.thread_index !== undefined ? { thread_index: pane.thread_index } : {}),
+    ...(pane.thread_title ? { thread_title: pane.thread_title } : {}),
+  }
+  try {
+    localStorage.setItem(LAST_CHAT_PANE_CACHE_KEY, JSON.stringify(location))
+  } catch {
+    // Storage can be unavailable in hardened/private browser contexts.
+  }
+}
+
+/// Resolves a persisted chat semantically because live-layout placeholders
+/// can receive a stable thread-derived pane id after the catalog loads.
+export function findLastChatPane(
+  panes: readonly LivePane[],
+  location: LastChatPaneLocation,
+): LivePane | null {
+  const chats = panes.filter(
+    (pane) => pane.kind === 'chat' && pane.workspace_id === location.workspace_id,
+  )
+  if (location.thread_id) {
+    const thread = chats.find((pane) => pane.thread_id === location.thread_id)
+    if (thread) return thread
+    const exact = chats.find((pane) => pane.pane_id === location.pane_id)
+    if (exact) return exact
+    if (location.thread_index !== undefined && location.thread_title) {
+      return chats.find(
+        (pane) =>
+          pane.thread_index === location.thread_index && pane.thread_title === location.thread_title,
+      ) ?? null
+    }
+    return null
+  }
+  const exact = chats.find((pane) => pane.pane_id === location.pane_id)
+  if (exact) return exact
+  if (location.thread_index !== undefined && location.thread_title) {
+    const indexed = chats.find(
+      (pane) =>
+        pane.thread_index === location.thread_index && pane.thread_title === location.thread_title,
+    )
+    if (indexed) return indexed
+  }
+  if (location.thread_title) {
+    const titled = chats.filter((pane) => pane.thread_title === location.thread_title)
+    return titled.length === 1 ? titled[0]! : null
+  }
+  return null
+}
 
 function readThreadSettingsCache(): ThreadSettingsCache {
   try {
@@ -199,13 +283,14 @@ function rememberThreadSettings(workspaceId: string, threadId: string, settings:
 /// Older daemons persisted run controls but omitted them from chat.thread.list.
 /// Keep the values from the preceding core.snapshot (or an optimistic click)
 /// when enriching that snapshot with the bounded thread catalog.
-function mergeThreadCatalogSettings(
+export function mergeThreadCatalogSettings(
   workspaceId: string,
   listed: Thread[],
   snapshot: Thread[] | undefined,
   previous: Thread[] | undefined,
+  retainedIds?: ReadonlySet<string>,
 ): Thread[] {
-  return listed.map((thread) => {
+  const merged = listed.map((thread) => {
     const source =
       snapshot?.find((row) => row.local_thread_id === thread.local_thread_id) ??
       previous?.find((row) => row.local_thread_id === thread.local_thread_id)
@@ -219,6 +304,15 @@ function mergeThreadCatalogSettings(
     }
     return merged
   })
+  // Fresh GUI threads are intentionally absent from chat.thread.list until
+  // their first turn commits. Keep the stable row returned by chat.open so
+  // the web composer retains its local_thread_id during that opening turn.
+  const retained = previous?.filter(
+    (thread) =>
+      retainedIds?.has(thread.local_thread_id) &&
+      !merged.some((listed_thread) => listed_thread.local_thread_id === thread.local_thread_id),
+  ) ?? []
+  return retained.length > 0 ? [...retained, ...merged] : merged
 }
 
 /// Formats the new-file line ranges touched by a unified-diff patch, e.g.
@@ -303,6 +397,16 @@ function imageMimeForFile(file: File): string | null {
 
 function turnIsActive(status: string | undefined): boolean {
   return status === 'working' || status === 'waiting' || status === 'accepted' || status === 'running'
+}
+
+/// Completion-pending is an unread/acknowledgement state, not live work. The
+/// composer only shows Stop while a turn is actually in flight or its local
+/// streaming overlay is still present.
+export function chatPaneHasLiveTurn(
+  pane: LivePane | null | undefined,
+  has_streaming_overlay: boolean,
+): boolean {
+  return Boolean(pane?.kind === 'chat' && (has_streaming_overlay || pane.send_pending))
 }
 
 function sessionKey(session: SnapshotSession): string {
@@ -536,6 +640,7 @@ export function panesForWorkspace(
   const workspace_sessions = sessions.filter(
     (session) => sessionKey(session) && sessionMatchesWorkspace(session, workspace),
   )
+  const has_live_layout = live_layout != null
   const layout = live_layout ?? parseWorkspaceLayout(workspace.workspace_layout_json)
   const rows: LivePane[] = []
   const used_threads = new Set<string>()
@@ -547,16 +652,20 @@ export function panesForWorkspace(
         // Layout references chat panes by position in the desktop thread
         // array, which the store mirrors as thread sort_index — but store
         // rows lag the desktop, so index and title both drift. Binding order:
-        // provider thread id (rename-proof), exact title, and bare sort_index
-        // only for persisted layouts, where index and rows are one snapshot.
+        // provider thread id (rename-proof), exact title + sort index, then
+        // title/index fallbacks only for persisted layouts. A live pane whose
+        // thread is absent from the bounded catalog must stay a placeholder;
+        // binding it by a shared title can make two panes project one thread.
         const titled = pane.title ? threads.filter((item) => item.title === pane.title) : []
         const thread =
           (pane.provider_thread_id
             ? threads.find((item) => item.provider_thread_id === pane.provider_thread_id)
             : undefined) ??
           titled.find((item) => item.sort_index === pane.thread) ??
-          titled[0] ??
-          (pane.title ? undefined : threads.find((item) => item.sort_index === pane.thread))
+          (has_live_layout ? undefined : titled[0]) ??
+          (has_live_layout || pane.title
+            ? undefined
+            : threads.find((item) => item.sort_index === pane.thread))
         if (thread && (!thread.archived || pane.title)) {
           // The daemon thread is the authority for the next turn's settings.
           // Desktop chat.status can lag a web click by several projection
@@ -735,6 +844,11 @@ function createAppStore() {
   const [composerNonce, setComposerNonce] = createSignal(0)
   const [compact, setCompact] = createSignal(false)
   const [uiConfig, setUiConfig] = createSignal<UiConfig>(DEFAULT_UI_CONFIG)
+  const startupLastChatPane = readLastChatPaneLocation()
+  const restoreLastChatOnStartup = startupLastChatPane != null
+  const [initialViewReady, setInitialViewReady] = createSignal(!restoreLastChatOnStartup)
+  let pendingLastChatPane = startupLastChatPane
+  let instantFocusPaneId: number | null = null
   let pinnedWorkspaceId: string | null = null
   let storeClientId: string | null = null
   let lastSessions: SnapshotSession[] = []
@@ -852,11 +966,24 @@ function createAppStore() {
     setPanesByWorkspace((prev) => (sameJson(prev, panes) ? prev : panes))
     const keep = workspaceId() ?? list[0]?.workspace_id ?? null
     const current_panes = keep ? panes[keep] ?? [] : []
-    if (focusedPaneId() == null || !current_panes.some((pane) => pane.pane_id === focusedPaneId())) {
+    const restored = pendingLastChatPane && keep === pendingLastChatPane.workspace_id
+      ? findLastChatPane(current_panes, pendingLastChatPane)
+      : null
+    if (restored) {
+      // Startup restoration should place the strip before paint, not animate
+      // across every pane between the default and the persisted chat.
+      instantFocusPaneId = restored.pane_id
+      setFocusedPaneId(restored.pane_id)
+      // A live-layout placeholder has no durable thread id yet. Keep the
+      // stronger persisted identity until the catalog resolves it.
+      if (restored.thread_id) writeLastChatPaneLocation(restored)
+      pendingLastChatPane = null
+    } else if (focusedPaneId() == null || !current_panes.some((pane) => pane.pane_id === focusedPaneId())) {
       const preferred =
         current_panes.find((pane) => pane.focused) ??
         current_panes.find((pane) => pane.kind === 'chat') ??
         current_panes[0]
+      if (!initialViewReady() && preferred) instantFocusPaneId = preferred.pane_id
       setFocusedPaneId(preferred?.pane_id ?? null)
     }
     if (maximizedPaneId() != null && !current_panes.some((pane) => pane.pane_id === maximizedPaneId())) {
@@ -891,10 +1018,14 @@ function createAppStore() {
     setWorkspaces((prev) => (sameJson(prev, list) ? prev : list))
 
     const selectedIndex = typeof snapshot.selected_workspace_index === 'number' ? snapshot.selected_workspace_index : 0
+    const restore_workspace_id = pendingLastChatPane?.workspace_id
     const keep =
       (pinnedWorkspaceId && list.some((item) => item.workspace_id === pinnedWorkspaceId) && pinnedWorkspaceId) ||
       (preferId && list.some((item) => item.workspace_id === preferId) && preferId) ||
-      workspaceId() ||
+      (restore_workspace_id &&
+        list.some((item) => item.workspace_id === restore_workspace_id) &&
+        restore_workspace_id) ||
+      (workspaceId() && list.some((item) => item.workspace_id === workspaceId()) && workspaceId()) ||
       list[selectedIndex]?.workspace_id ||
       list[0]?.workspace_id ||
       null
@@ -948,6 +1079,10 @@ function createAppStore() {
       return
     }
     if (message.method === 'core.snapshot') {
+      // The pushed startup snapshot has no thread catalog and can therefore
+      // project a terminal-only workspace. The explicit initial refresh below
+      // builds the remembered chat first; ignore this incomplete preview.
+      if (restoreLastChatOnStartup && !initialViewReady()) return
       applySnapshot(message.params, workspaceId())
       return
     }
@@ -965,7 +1100,10 @@ function createAppStore() {
   /// round-trips and made the whole UI feel seconds behind; the routine tick
   /// now enriches only the selected workspace and a periodic full sweep
   /// keeps the background ones fresh.
-  const refreshLive = async (only_workspace_id: string | null = null) => {
+  const refreshLive = async (
+    only_workspace_id: string | null = null,
+    enrich_chat_status = true,
+  ) => {
     try {
       const listing = await client.call('workspaces', {})
       const rows = workspacesFromLiveListing(listing)
@@ -983,7 +1121,7 @@ function createAppStore() {
           const panes = await client.call('panes', { workspace: row.workspace_id })
           const layout = layoutFromLivePanes(panes)
           layouts[row.workspace_id] = layout
-          if (!layout?.panes) return
+          if (!layout?.panes || !enrich_chat_status) return
           // The pane listing has no thread ids; chat.status carries the
           // provider-side thread id plus the model/effort controls, which is
           // what lets a pane bind to the right store thread even when the
@@ -1036,7 +1174,9 @@ function createAppStore() {
   /// selected one, bounding staleness of background workspaces to ~20s.
   const PROJECTION_FULL_SWEEP_EVERY = 5
 
-  const refreshProjection = async (opts: { scope?: 'selected' | 'full' } = {}) => {
+  const refreshProjection = async (
+    opts: { scope?: 'selected' | 'full'; enrich_chat_status?: boolean } = {},
+  ) => {
     if (projectionInFlight) {
       projectionQueued = true
       return
@@ -1044,8 +1184,10 @@ function createAppStore() {
     projectionInFlight = true
     try {
       const scope = opts.scope ?? (projectionTick++ % PROJECTION_FULL_SWEEP_EVERY === 0 ? 'full' : 'selected')
-      const only = scope === 'selected' ? workspaceId() : null
-      await refreshLive(only)
+      const only = scope === 'selected'
+        ? workspaceId() ?? pendingLastChatPane?.workspace_id ?? null
+        : null
+      await refreshLive(only, opts.enrich_chat_status ?? true)
       const response = await client.call('core.snapshot', { scopes: SNAPSHOT_SCOPES })
       if (response.error || response.ok === false) return
       applySnapshot(response, workspaceId())
@@ -1075,6 +1217,7 @@ function createAppStore() {
             catalog.threads,
             snapshot,
             prev[catalog.workspace_id],
+            localThreadIds,
           )
           catalog.threads = next[catalog.workspace_id]
         }
@@ -1095,6 +1238,49 @@ function createAppStore() {
         projectionQueued = false
         void refreshProjection({ scope: 'selected' })
       }
+    }
+  }
+
+  /// Build the remembered startup pane without waiting for the desktop Live
+  /// bridge. The durable snapshot and lightweight catalog are independent, so
+  /// fetching them in parallel removes several sequential round-trips from
+  /// the first useful paint. Live pane/status reconciliation follows in the
+  /// background after the restored pane is visible.
+  const restoreInitialProjection = async () => {
+    const location = startupLastChatPane
+    if (!location) return
+    const [snapshot_response, catalog_response] = await Promise.all([
+      fetchRpc('core.snapshot', { scopes: SNAPSHOT_SCOPES }),
+      fetchRpc('chat.thread.list', {
+        workspace_id: location.workspace_id,
+        limit: THREAD_LIST_LIMIT,
+      }),
+    ])
+    if (
+      snapshot_response.error ||
+      snapshot_response.ok === false ||
+      catalog_response.error ||
+      catalog_response.ok === false
+    ) {
+      await refreshProjection({ scope: 'selected', enrich_chat_status: false })
+      return
+    }
+    const listed = threadListFrom(catalog_response)
+    setThreadsByWorkspace((prev) => ({
+      ...prev,
+      [location.workspace_id]: mergeThreadCatalogSettings(
+        location.workspace_id,
+        listed,
+        undefined,
+        prev[location.workspace_id],
+        localThreadIds,
+      ),
+    }))
+    applySnapshot(snapshot_response, location.workspace_id)
+    if (pendingLastChatPane) {
+      // The persisted layout can lag a newly opened pane; fall back to the
+      // live listing only when the durable projection cannot resolve it.
+      await refreshProjection({ scope: 'selected', enrich_chat_status: false })
     }
   }
 
@@ -1504,7 +1690,7 @@ function createAppStore() {
       tailActiveTurn(pane)
       const key = paneKey(pane.workspace_id, pane.pane_id)
       const uncached = !transcripts()[key]?.length
-      const live = turnTails.has(key) || Boolean(pane.send_pending || pane.completion_pending)
+      const live = turnTails.has(key) || Boolean(pane.send_pending)
       if (uncached || live) await loadTranscript(pane)
     }
   }
@@ -1522,8 +1708,7 @@ function createAppStore() {
   const paneWorking = (pane: LivePane | null | undefined): boolean => {
     if (!pane || pane.kind !== 'chat') return false
     const key = paneKey(pane.workspace_id, pane.pane_id)
-    if (overlays()[key]?.length) return true
-    return Boolean(pane.send_pending || pane.completion_pending)
+    return chatPaneHasLiveTurn(pane, Boolean(overlays()[key]?.length))
   }
 
   /// Abort the pane's active turn, mirroring the desktop's composer stop
@@ -1560,25 +1745,35 @@ function createAppStore() {
   }
 
   const selectWorkspace = (id: string) => {
+    pendingLastChatPane = null
     pinnedWorkspaceId = id
     setWorkspaceId(id)
     setDrawerOpen(false)
     const first = panesByWorkspace()[id]?.[0]
     setFocusedPaneId(first?.pane_id ?? null)
+    if (first?.kind === 'chat') writeLastChatPaneLocation(first)
     // The switch itself renders instantly from cached panes/transcripts; the
     // scoped refresh only reconciles this workspace in the background.
     void refreshProjection({ scope: 'selected' }).then(() => refreshTranscripts())
   }
 
   const focusPane = (pane: LivePane) => {
+    pendingLastChatPane = null
     pinnedWorkspaceId = pane.workspace_id
     setWorkspaceId(pane.workspace_id)
     setFocusedPaneId(pane.pane_id)
+    writeLastChatPaneLocation(pane)
     // Zoom follows focus like the desktop: pane navigation while zoomed keeps
     // the zoom and shows the newly focused pane instead of pinning the old one.
     if (maximizedPaneId() != null) setMaximizedPaneId(pane.pane_id)
     setDrawerOpen(false)
     void loadTranscript(pane)
+  }
+
+  const takeInstantFocus = (pane_id: number): boolean => {
+    if (instantFocusPaneId !== pane_id) return false
+    instantFocusPaneId = null
+    return true
   }
 
   const draftFor = (pane: LivePane | null | undefined) => {
@@ -1727,6 +1922,11 @@ function createAppStore() {
       }
     }
     try {
+      // A model click persists asynchronously. Keep the optimistic submit
+      // immediate, but read/start only after that queued write has landed so
+      // a quick mobile tap cannot race the selected settings.
+      const pending_settings = settingsUpdateQueues.get(key)
+      if (pending_settings) await pending_settings
       const got = await client.call('chat.thread.get', {
         workspace_id: current.workspace_id,
         local_thread_id: current.thread_id,
@@ -2049,6 +2249,7 @@ function createAppStore() {
   }
 
   const newThread = async (workspace_id?: string) => {
+    pendingLastChatPane = null
     const current = workspaces().find((item) => item.workspace_id === workspace_id) ?? workspace()
     if (!current) return
     const provider =
@@ -2066,14 +2267,60 @@ function createAppStore() {
       setNotice(opened.error?.message ?? 'could not open chat')
       return
     }
-    const pane_id = opened.error || opened.ok === false
-      ? await createHeadlessThread(current, provider)
-      : unwrapResult<{ pane_id?: number }>(opened)?.pane_id ?? null
+    let opened_thread_id: string | null = null
+    let pane_id: number | null
+    if (opened.error || opened.ok === false) {
+      pane_id = await createHeadlessThread(current, provider)
+    } else {
+      const result = unwrapResult<{
+        pane_id?: number
+        thread_id?: string
+        local_thread_id?: string
+        thread_index?: number
+        provider?: string
+        model?: string | null
+        reasoning_effort?: string | null
+        reasoning_variant?: string | null
+        fast_mode?: boolean | null
+      }>(opened)
+      pane_id = result?.pane_id ?? null
+      opened_thread_id = result?.local_thread_id ?? result?.thread_id ?? null
+      if (opened_thread_id) {
+        localThreadIds.add(opened_thread_id)
+        const created: Thread = {
+          local_thread_id: opened_thread_id,
+          title: 'New thread',
+          sort_index: result?.thread_index,
+          committed: false,
+          last_activity_at: null,
+          provider: result?.provider ?? provider,
+          harness: 'local_cli',
+          model_ref: result?.model ?? null,
+          reasoning_effort: result?.reasoning_effort ?? null,
+          reasoning_variant: result?.reasoning_variant ?? null,
+          fast_mode: result?.fast_mode ? 'on' : 'off',
+        }
+        setThreadsByWorkspace((prev) => ({
+          ...prev,
+          [current.workspace_id]: [
+            created,
+            ...(prev[current.workspace_id] ?? []).filter(
+              (thread) => thread.local_thread_id !== opened_thread_id,
+            ),
+          ],
+        }))
+      }
+    }
     if (pane_id == null) return
     pinnedWorkspaceId = current.workspace_id
     setWorkspaceId(current.workspace_id)
     await refreshProjection()
-    setFocusedPaneId(pane_id)
+    const focused_id = opened_thread_id ? stablePaneId('chat', opened_thread_id) : pane_id
+    setFocusedPaneId(focused_id)
+    const focused = (panesByWorkspace()[current.workspace_id] ?? []).find(
+      (pane) => pane.pane_id === focused_id,
+    )
+    if (focused) writeLastChatPaneLocation(focused)
     setComposerNonce((value) => value + 1)
   }
 
@@ -2258,7 +2505,18 @@ function createAppStore() {
     const projectionTick = window.setInterval(() => {
       if (client.connected) void refreshProjection()
     }, 4000)
-    void refreshProjection().then(() => refreshTranscripts())
+    const initial_projection = restoreLastChatOnStartup
+      ? restoreInitialProjection()
+      : refreshProjection()
+    void initial_projection
+      .catch(() => {})
+      .finally(() => {
+        // Pane identity/layout is ready. Reveal it now; the potentially large
+        // transcript continues loading without holding the first useful paint.
+        setInitialViewReady(true)
+        void refreshTranscripts()
+        if (restoreLastChatOnStartup) void refreshProjection({ scope: 'selected' })
+      })
     onCleanup(() => {
       window.clearInterval(tick)
       window.clearInterval(transcriptsTick)
@@ -2272,6 +2530,7 @@ function createAppStore() {
     client,
     source,
     connected,
+    initialViewReady,
     workspaces,
     workspace,
     workspaceId,
@@ -2311,6 +2570,7 @@ function createAppStore() {
     ensureTranscript,
     selectWorkspace,
     focusPane,
+    takeInstantFocus,
     sendDraft,
     stopTurn,
     paneWorking,

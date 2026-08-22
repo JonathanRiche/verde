@@ -1,4 +1,4 @@
-const CACHE = 'verde-web-v2'
+const CACHE = 'verde-web-v4'
 
 const PRECACHE = [
   '/',
@@ -36,9 +36,36 @@ self.addEventListener('fetch', (event) => {
   if (url.pathname.startsWith('/@') || url.pathname.startsWith('/src/') || url.pathname.startsWith('/node_modules/')) return
   if (url.pathname.includes('vite') || url.search.includes('t=')) return
 
+  // Vite fingerprints production assets. Reusing those immutable JS, CSS,
+  // font, image, and WASM responses removes the network round-trip from
+  // repeat PWA launches without risking a stale app shell after a deploy.
+  if (url.pathname.startsWith('/assets/')) {
+    event.respondWith(
+      caches.match(request).then((cached) => {
+        if (cached) return cached
+        return fetch(request).then((response) => {
+          if (response.ok) {
+            const copy = response.clone()
+            void caches.open(CACHE).then((cache) => cache.put(request, copy))
+          }
+          return response
+        })
+      }),
+    )
+    return
+  }
+
   if (request.mode === 'navigate') {
     event.respondWith(
-      fetch(request).catch(async () => (await caches.match('/offline.html')) ?? (await caches.match('/index.html'))),
+      fetch(request)
+        .then((response) => {
+          if (response.ok) {
+            const copy = response.clone()
+            void caches.open(CACHE).then((cache) => cache.put('/index.html', copy))
+          }
+          return response
+        })
+        .catch(async () => (await caches.match('/offline.html')) ?? (await caches.match('/index.html'))),
     )
     return
   }

@@ -32,14 +32,14 @@ export function App() {
             aria-label="Close workspace drawer"
             onClick={() => store.setDrawerOpen(false)}
           />
-          <div class="absolute inset-y-0 left-0 w-[min(300px,88vw)] bg-[var(--panel)] shadow-[8px_0_40px_rgba(0,0,0,0.45)]">
+          <div class="mobile-safe-panel absolute inset-y-0 left-0 w-[min(300px,88vw)] bg-[var(--panel)] shadow-[8px_0_40px_rgba(0,0,0,0.45)]">
             <Sidebar />
           </div>
         </div>
       </Show>
 
       <div class="flex min-w-0 flex-1 flex-col overflow-hidden">
-        <div class="flex h-11 shrink-0 items-center gap-2 border-b border-[var(--border-muted)] bg-[var(--panel)] px-2 lg:hidden">
+        <div class="mobile-app-bar flex shrink-0 items-center gap-2 border-b border-[var(--border-muted)] bg-[var(--panel)] lg:hidden">
           <button
             type="button"
             class="grid h-10 w-10 place-items-center text-[var(--text-subtle)]"
