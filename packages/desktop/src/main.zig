@@ -1743,6 +1743,18 @@ fn eventWaitBaseTimeoutForActivity(activity: PacingActivity) c_int {
 }
 
 fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, ui_scale: f32, event: *sdl.Event) bool {
+    // Deliberate-interaction events stamp input recency (tmux `window-size
+    // latest`): terminal size re-assertion only fires near real user input,
+    // so a focused-but-idle desktop cannot tug the shared PTY size away from
+    // a web/mobile client. Focus gain counts as interaction so returning to
+    // the GUI heals a drifted pane without a keypress; passive mouse motion
+    // does not.
+    switch (event.type) {
+        .key_down, .text_input, .mouse_button_down, .mouse_wheel, .window_focus_gained => {
+            state.last_user_input_ms = platform_runtime.unixTimestampMs();
+        },
+        else => {},
+    }
     switch (event.type) {
         .quit => {
             runtime_log.diagnostic("shutdown requested by SDL quit event", .{});

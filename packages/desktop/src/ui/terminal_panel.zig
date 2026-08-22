@@ -10,6 +10,7 @@ const colors = @import("colors.zig");
 const theme = @import("theme.zig");
 const terminal = @import("../terminal/terminal.zig");
 const runtime_log = @import("../runtime/log.zig");
+const platform_runtime = @import("platform_runtime");
 
 const log = std.log.scoped(.terminal_panel);
 
@@ -23,6 +24,11 @@ const TERMINAL_SCROLLBAR_TRACK_WIDTH_CSS: f32 = 3.0;
 const TERMINAL_SCROLLBAR_EDGE_PAD_CSS: f32 = 2.0;
 const TERMINAL_SCROLLBAR_VERTICAL_PAD_CSS: f32 = 4.0;
 const MAX_TERMINAL_LINK_BYTES: usize = 2048;
+/// How long after the last local input the desktop still counts as the
+/// actively-used client for PTY size re-assertion. Long enough to cover
+/// reading pauses at the desk, short enough that stepping away hands size
+/// ownership to a web/mobile client within one think-break.
+const TERMINAL_SIZE_REASSERT_INPUT_WINDOW_MS: i64 = 30_000;
 const MAX_TERMINAL_IMAGE_TEXTURES: usize = 128;
 
 const TerminalContextMenuKind = enum {
@@ -670,6 +676,20 @@ fn renderPane(state: *app_state.AppState, dock: anytype, pane_id: u32, rect: pal
     dock.resizePaneToFit(state.allocator, pane_id, grid_rect.w, grid_rect.h) catch |err| {
         runtime_log.diagnostic("terminal resizePaneToFit failed pane={d} err={s}", .{ pane_id, @errorName(err) });
     };
+    // Another client (the web app) may have resized the shared daemon PTY.
+    // Re-assert this client's grid only when the window is focused AND the
+    // user recently interacted with it — tmux `window-size latest` semantics.
+    // Focus alone is not enough: a desktop left focused-but-idle would
+    // otherwise win the PTY size back every poll from a phone/browser client
+    // the user is actively using (size tug-of-war). Web behaves symmetrically
+    // by re-sending its size only on its own focus/layout events.
+    if (state.window_input_focus and
+        platform_runtime.unixTimestampMs() - state.last_user_input_ms < TERMINAL_SIZE_REASSERT_INPUT_WINDOW_MS)
+    {
+        dock.reassertPaneDaemonSize(state.allocator, pane_id) catch |err| {
+            runtime_log.diagnostic("terminal size reassert failed pane={d} err={s}", .{ pane_id, @errorName(err) });
+        };
+    }
     const focused = if (dock.activePaneConst()) |active| active.id == pane_id and state.terminal_controller.focused else false;
     const render_state = dock.renderStateForPane(pane_id) orelse {
         var status_buf: [192]u8 = undefined;

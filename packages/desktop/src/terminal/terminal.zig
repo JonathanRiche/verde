@@ -1029,6 +1029,11 @@ pub const Dock = struct {
         }
     }
 
+    pub fn reassertPaneDaemonSize(self: *Dock, allocator: std.mem.Allocator, pane_id: u32) !void {
+        const pane = self.findPaneById(pane_id) orelse return;
+        if (pane.session) |session| try session.reassertDaemonSizeIfDrifted(allocator);
+    }
+
     pub fn activeRenderState(self: *const Dock) ?*const ghostty_vt.RenderState {
         if (self.activePaneConst()) |pane| {
             if (pane.session) |session| return session.renderState();
@@ -2664,6 +2669,8 @@ const UnsupportedSession = struct {
 
     pub fn resize(_: *UnsupportedSession, _: std.mem.Allocator, _: u16, _: u16, _: u32, _: u32) !void {}
 
+    pub fn reassertDaemonSizeIfDrifted(_: *UnsupportedSession, _: std.mem.Allocator) !void {}
+
     pub fn retheme(_: *UnsupportedSession, _: std.mem.Allocator) !void {}
 
     pub fn displayText(_: *const UnsupportedSession) []const u8 {
@@ -2821,6 +2828,13 @@ const UnixSession = struct {
     daemon_session_recreated: bool = false,
     daemon_prefetched: bool = false,
     daemon_prefetched_changed: bool = false,
+    /// PTY grid last reported by a daemon tail response. Another client (the
+    /// web app) can resize the shared PTY underneath this session; when the
+    /// reported grid disagrees with the local one, the stream being replayed
+    /// was painted for a different size and renders wrapped/garbled until
+    /// this client re-asserts its own grid (reassertDaemonSizeIfDrifted).
+    daemon_reported_cols: ?u16 = null,
+    daemon_reported_rows: ?u16 = null,
     last_daemon_tail_response: std.ArrayList(u8) = .empty,
     /// Set when this session attached to an already-running daemon PTY (app
     /// restart or revive). Cleared after the first sized resize kicks the
@@ -3866,6 +3880,8 @@ const UnixSession = struct {
         else
             null;
         const next_offset = jsonUsize(result.object.get("next_offset") orelse .null) orelse self.remote_output_offset;
+        if (jsonU16(result.object.get("cols") orelse .null)) |reported_cols| self.daemon_reported_cols = reported_cols;
+        if (jsonU16(result.object.get("rows") orelse .null)) |reported_rows| self.daemon_reported_rows = reported_rows;
         self.daemon_shell_pid = shell_pid;
         self.daemon_foreground_process_group = foreground_process_group;
         const stale_alt_screen_replay = suppress_replay_responses and
@@ -3987,6 +4003,10 @@ const UnixSession = struct {
         if (jsonUsize(result.object.get("foreground_process_group") orelse .null)) |pgrp| {
             self.daemon_foreground_process_group = pgrp;
         }
+        // The daemon PTY now has this client's grid; record it so drift
+        // detection does not immediately re-fire against a stale tail report.
+        self.daemon_reported_cols = self.cols;
+        self.daemon_reported_rows = self.rows;
         const text = jsonString(result.object.get("text") orelse .null) orelse "";
         const next_offset = jsonUsize(result.object.get("next_offset") orelse .null);
         log.info(
@@ -4015,6 +4035,33 @@ const UnixSession = struct {
         // untouched lets the drainDaemonOutput call that every resizeDaemon
         // call site performs after the model resize replay those same bytes
         // into the correctly-sized grid instead.
+    }
+
+    /// Re-asserts this client's grid on the shared daemon PTY when a tail
+    /// response reported that another client (the web app) resized it. The
+    /// caller gates this on window input focus so the actively-used client
+    /// wins ownership of the single PTY size and an idle desktop GUI does not
+    /// stomp a phone/browser session's grid every poll.
+    pub fn reassertDaemonSizeIfDrifted(self: *UnixSession, allocator: std.mem.Allocator) !void {
+        if (self.backend != .daemon or self.daemon_state != .attached) return;
+        const reported_cols = self.daemon_reported_cols orelse return;
+        const reported_rows = self.daemon_reported_rows orelse return;
+        if (reported_cols == self.cols and reported_rows == self.rows) return;
+        // Clear before the fallible IPC: a failed re-assert must wait for the
+        // next tail report instead of retrying every rendered frame.
+        self.daemon_reported_cols = null;
+        self.daemon_reported_rows = null;
+        runtime_log.diagnostic(
+            "terminal daemon size drift session_len={d} local={d}x{d} daemon={d}x{d} reasserting",
+            .{ if (self.session_id) |session_id| session_id.len else 0, self.cols, self.rows, reported_cols, reported_rows },
+        );
+        try self.resizeDaemon(allocator);
+        _ = try self.drainDaemonOutput(allocator);
+        // The foreground TUI repainted for the other client's grid; kick it so
+        // the pane recovers without waiting for user input.
+        self.kickAttachedTuiRepaint(allocator);
+        try self.refreshRenderState(allocator);
+        self.render_state.dirty = .full;
     }
 
     fn killDaemon(self: *UnixSession) !void {
@@ -4924,6 +4971,14 @@ fn jsonUsize(value: std.json.Value) ?usize {
     return switch (value) {
         .integer => |int| if (int >= 0) @intCast(int) else null,
         .number_string => |text| std.fmt.parseInt(usize, text, 10) catch null,
+        else => null,
+    };
+}
+
+fn jsonU16(value: std.json.Value) ?u16 {
+    return switch (value) {
+        .integer => |int| if (int >= 0 and int <= std.math.maxInt(u16)) @intCast(int) else null,
+        .number_string => |text| std.fmt.parseInt(u16, text, 10) catch null,
         else => null,
     };
 }
