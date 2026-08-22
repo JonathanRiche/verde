@@ -838,7 +838,7 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
           onKeyDown={onKeyDown}
           onFocus={() => store.focusPane(props.pane)}
         />
-        <div class="mt-1 flex h-8 min-w-0 flex-nowrap items-center gap-1.5">
+        <div class="mt-1 flex min-w-0 flex-wrap items-center gap-1.5 lg:h-8 lg:flex-nowrap">
           <input
             ref={(node) => { filePicker = node }}
             type="file"
@@ -866,9 +866,13 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
               <Icon name="paperclip" class="h-[18px] w-[18px]" />
             </Show>
           </button>
-          <div class="flex min-w-0 flex-1 items-center gap-1.5">
+          {/* Compact composers let controls wrap as direct toolbar children;
+              keeping them inside a shrinking row made the permission chip
+              overlap the send target on narrow phones. */}
+          <div class="contents lg:flex lg:min-w-0 lg:flex-1 lg:items-center lg:gap-1.5">
             <ComposerPickers pane={props.pane} />
           </div>
+          <div class="min-w-0 flex-1 lg:hidden" />
           <Show
             when={!store.paneWorking(props.pane)}
             fallback={

@@ -1,6 +1,105 @@
 import { describe, expect, test } from 'bun:test'
 
-import { panesForWorkspace, requestTerminalOpen } from './store.ts'
+import {
+  chatPaneHasLiveTurn,
+  findLastChatPane,
+  mergeThreadCatalogSettings,
+  panesForWorkspace,
+  requestTerminalOpen,
+} from './store.ts'
+
+describe('findLastChatPane', () => {
+  const chats = [
+    {
+      pane_id: 101,
+      workspace_id: 'workspace-1',
+      kind: 'chat',
+      thread_id: 'thread-1',
+      thread_index: 2,
+      thread_title: 'First chat',
+    },
+    {
+      pane_id: 202,
+      workspace_id: 'workspace-1',
+      kind: 'chat',
+      thread_id: 'thread-2',
+      thread_index: 5,
+      thread_title: 'Last chat',
+    },
+  ]
+
+  test('restores the thread instead of the desktop-focused chat', () => {
+    expect(findLastChatPane(chats, {
+      workspace_id: 'workspace-1',
+      pane_id: 202,
+      thread_id: 'thread-2',
+    })).toBe(chats[1])
+  })
+
+  test('survives a placeholder pane id changing when its thread resolves', () => {
+    expect(findLastChatPane(chats, {
+      workspace_id: 'workspace-1',
+      pane_id: 999,
+      thread_index: 5,
+      thread_title: 'Last chat',
+    })).toBe(chats[1])
+  })
+
+  test('resolves the live placeholder before the thread catalog arrives', () => {
+    const placeholder = {
+      pane_id: 999,
+      workspace_id: 'workspace-1',
+      kind: 'chat',
+      thread_index: 5,
+      thread_title: 'Last chat',
+    }
+    expect(findLastChatPane([placeholder], {
+      workspace_id: 'workspace-1',
+      pane_id: 202,
+      thread_id: 'thread-2',
+      thread_index: 5,
+      thread_title: 'Last chat',
+    })).toBe(placeholder)
+  })
+
+  test('does not restore a same-named pane from another workspace', () => {
+    expect(findLastChatPane(chats, {
+      workspace_id: 'workspace-2',
+      pane_id: 202,
+      thread_id: 'thread-2',
+      thread_title: 'Last chat',
+    })).toBeNull()
+  })
+
+  test('does not guess between duplicate placeholder titles', () => {
+    expect(findLastChatPane([
+      ...chats,
+      { ...chats[1], pane_id: 303, thread_id: undefined, thread_index: 8 },
+    ], {
+      workspace_id: 'workspace-1',
+      pane_id: 999,
+      thread_title: 'Last chat',
+    })).toBeNull()
+  })
+})
+
+describe('chatPaneHasLiveTurn', () => {
+  const pane = {
+    pane_id: 1,
+    workspace_id: 'workspace-1',
+    kind: 'chat',
+    thread_id: 'thread-1',
+  }
+
+  test('does not treat an unacknowledged completion as live work', () => {
+    expect(chatPaneHasLiveTurn({ ...pane, completion_pending: true }, false)).toBe(false)
+  })
+
+  test('keeps the turn live for a pending send or streaming overlay', () => {
+    expect(chatPaneHasLiveTurn({ ...pane, send_pending: true }, false)).toBe(true)
+    expect(chatPaneHasLiveTurn(pane, true)).toBe(true)
+  })
+})
 
 describe('panesForWorkspace', () => {
   test('keeps daemon thread settings ahead of a stale live pane', () => {
@@ -48,6 +147,67 @@ describe('panesForWorkspace', () => {
       fast_mode: true,
       send_pending: true,
     })
+  })
+
+  test('keeps an unmatched same-title live pane separate from the current thread', () => {
+    const current_thread = {
+      local_thread_id: 'thread-current',
+      provider_thread_id: 'provider-current',
+      title: 'New thread',
+      sort_index: 250,
+      provider: 'codex',
+    }
+    const workspace = {
+      workspace_id: 'workspace-1',
+      label: 'Workspace',
+      path: '/workspace',
+      threads: [current_thread],
+    }
+    const live_layout = {
+      focused: 901,
+      panes: [
+        { id: 897, kind: 'chat', thread: 246, title: 'New thread', provider: 'codex' },
+        {
+          id: 901,
+          kind: 'chat',
+          thread: 250,
+          title: 'New thread',
+          provider: 'codex',
+          provider_thread_id: 'provider-current',
+        },
+      ],
+    }
+
+    const panes = panesForWorkspace(workspace, [], [], new Set(), live_layout)
+
+    expect(panes).toHaveLength(2)
+    expect(panes[0].thread_id).toBeUndefined()
+    expect(panes[0].focused).toBe(false)
+    expect(panes[1]).toMatchObject({ thread_id: 'thread-current', focused: true })
+    expect(panes[0].pane_id).not.toBe(panes[1].pane_id)
+  })
+})
+
+describe('mergeThreadCatalogSettings', () => {
+  test('retains a locally opened thread until it appears in the daemon catalog', () => {
+    const existing = { local_thread_id: 'thread-1', title: 'Existing thread' }
+    const opening = {
+      local_thread_id: 'thread-opening',
+      title: 'New thread',
+      sort_index: 2,
+      committed: false,
+      model_ref: 'gpt-selected',
+    }
+
+    const merged = mergeThreadCatalogSettings(
+      'workspace-1',
+      [existing],
+      undefined,
+      [opening, existing],
+      new Set([opening.local_thread_id]),
+    )
+
+    expect(merged).toEqual([opening, existing])
   })
 })
 
