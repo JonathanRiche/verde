@@ -441,6 +441,14 @@ export function TerminalView(props: { workspaceId: string; paneId: number; sessi
     scroller.addEventListener('touchstart', onTouchStart, { passive: true })
     scroller.addEventListener('touchmove', onTouchMove, { passive: false })
     scroller.addEventListener('touchend', onTouchEnd)
+    // The desktop GUI re-asserts its grid on the shared PTY while its window
+    // is focused; clearing the sent-key makes the next pump re-send this
+    // client's size, so whichever client the user is actually in owns it.
+    const onWindowFocus = () => {
+      resize_sent = ''
+      void pump()
+    }
+    window.addEventListener('focus', onWindowFocus)
     const observer = new ResizeObserver(() => {
       void pump()
     })
@@ -457,6 +465,7 @@ export function TerminalView(props: { workspaceId: string; paneId: number; sessi
     onCleanup(() => {
       disposed = true
       window.clearInterval(poll)
+      window.removeEventListener('focus', onWindowFocus)
       observer.disconnect()
       surface.removeEventListener('keydown', onKeyDown)
       input.removeEventListener('keydown', onKeyDown)

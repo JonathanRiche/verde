@@ -4883,6 +4883,11 @@ pub const Daemon = struct {
             .offset = ring_start + @as(u64, @intCast(text_range.start)),
             .next_offset = session.output_total,
             .child_process_count = childProcessCount(session.child_pid),
+            // The PTY's current grid. A client whose local grid disagrees is
+            // rendering another client's repaint stream (wrapped/garbled TUI)
+            // and uses this to detect the drift.
+            .cols = session.cols,
+            .rows = session.rows,
         });
     }
 

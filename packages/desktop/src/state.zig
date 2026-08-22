@@ -3260,6 +3260,12 @@ pub const AppState = struct {
     // window focus events; used to gate chat-completion notifications so we
     // don't notify about a turn the user is actively watching.
     window_input_focus: bool,
+    /// Wall-clock ms of the last user input event (keys, clicks, wheel, or a
+    /// focus gain). Terminal size re-assertion uses this for tmux
+    /// `window-size latest` semantics: a focused-but-idle desktop must not
+    /// win the shared PTY size back from a web/mobile client the user is
+    /// actively using.
+    last_user_input_ms: i64 = 0,
     opencode_model_options: std.ArrayList(ModelOption),
     claude_model_options: std.ArrayList(ModelOption),
     cursor_model_options: std.ArrayList(ModelOption),
