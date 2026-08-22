@@ -63,35 +63,18 @@
   --font-display: 'Cal Sans', 'Noto Sans', sans-serif;
   --font-mono: 'JetBrains Mono', 'SF Mono', ui-monospace, monospace;
   --safe-top: env(safe-area-inset-top, 0px);
-  --safe-right: env(safe-area-inset-right, 0px);
   --safe-bottom: env(safe-area-inset-bottom, 0px);
-  --safe-left: env(safe-area-inset-left, 0px);
-  --app-safe-top: var(--safe-top);
-}
-
-/* Fullscreen has already removed the status bar, so do not reserve its old
-   inset. Standalone modes keep the inset to protect controls around cutouts. */
-@media (display-mode: fullscreen) {
-  :root { --app-safe-top: 0px; }
 }
 
 * { box-sizing: border-box; }
 
 html, body, #app {
   height: 100%;
-  min-height: 100%;
   width: 100%;
   max-width: 100%;
   overflow: hidden;
   -webkit-text-size-adjust: 100%;
   text-size-adjust: 100%;
-}
-
-@supports (height: 100dvh) {
-  html, body, #app {
-    height: 100dvh;
-    min-height: 100dvh;
-  }
 }
 
 body {
@@ -103,23 +86,6 @@ body {
   background: var(--chat-black);
   -webkit-font-smoothing: antialiased;
   overflow: hidden;
-  overscroll-behavior: none;
-}
-
-html { background: var(--chat-black); }
-
-/* The surface paints edge-to-edge while interactive chrome stays clear of
-   display cutouts in standalone fallbacks such as an iOS Home Screen app. */
-.mobile-app-bar {
-  height: calc(2.75rem + var(--app-safe-top));
-  padding-top: var(--app-safe-top);
-  padding-right: max(0.5rem, var(--safe-right));
-  padding-left: max(0.5rem, var(--safe-left));
-}
-.mobile-safe-panel {
-  padding-top: var(--app-safe-top);
-  padding-bottom: var(--safe-bottom);
-  padding-left: var(--safe-left);
 }
 
 /* Tailwind v4 preflight (base layer) already resets button/input/textarea
