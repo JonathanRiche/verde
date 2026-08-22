@@ -65,9 +65,7 @@ export function applyTheme(payload: ThemePayload): void {
   set('--assistant-card', mix(bg, text, 0.04))
   set('--selection', selection)
   root.style.setProperty('--accent-rgb', hexToRgb(accent).join(', '))
-  root.style.background = bg
   document.body.style.background = bg
-  document.querySelector<HTMLMetaElement>('meta[name="theme-color"]')?.setAttribute('content', bg)
   applyTerminalTheme(payload)
 }
 
