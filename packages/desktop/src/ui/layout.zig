@@ -621,6 +621,9 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .settings_theme_option => settings_modal.applyThemeOption(state, hit.index),
             .settings_title_provider_option => settings_modal.applyChatTitleProviderOption(state, hit.index),
             .settings_title_model_option => settings_modal.applyChatTitleModelOption(state, hit.index),
+            .settings_new_chat_provider_option => settings_modal.applyNewChatProviderOption(state, hit.index),
+            .settings_new_chat_model_option => settings_modal.applyNewChatModelOption(state, hit.index),
+            .settings_new_chat_reasoning_option => settings_modal.applyNewChatReasoningOption(state, hit.index),
             .modal_dismiss => dismissTopModal(state),
             .modal_block => {
                 state.palette_modal_text_focus = .none;
@@ -638,6 +641,13 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
                     state.settings_controller.title_provider_dropdown_open = false;
                     state.settings_controller.title_model_dropdown_open = false;
                     state.settings_controller.title_menu_hover_index = null;
+                    state.markDirty();
+                }
+                if (state.settings_controller.new_chat_provider_dropdown_open or state.settings_controller.new_chat_model_dropdown_open or state.settings_controller.new_chat_reasoning_dropdown_open) {
+                    state.settings_controller.new_chat_provider_dropdown_open = false;
+                    state.settings_controller.new_chat_model_dropdown_open = false;
+                    state.settings_controller.new_chat_reasoning_dropdown_open = false;
+                    state.settings_controller.new_chat_menu_hover_index = null;
                     state.markDirty();
                 }
             },

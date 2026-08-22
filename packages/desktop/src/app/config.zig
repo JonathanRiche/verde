@@ -25,6 +25,50 @@ pub const MAX_BROWSER_SCROLL_SPEED: f32 = 5.0;
 pub const BROWSER_SCROLL_SPEED_STEP: f32 = 0.25;
 pub const DEFAULT_CHAT_TITLE_MODEL = "gpt-5.6-luna";
 
+pub const ChatProvider = enum {
+    codex,
+    claude,
+    cursor,
+    opencode,
+
+    pub fn parse(value: []const u8) ?ChatProvider {
+        inline for (std.meta.fields(ChatProvider)) |field| {
+            if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+        }
+        return null;
+    }
+};
+
+pub const ChatReasoning = enum {
+    provider_default,
+    low,
+    medium,
+    high,
+    xhigh,
+    max,
+
+    pub fn parse(value: []const u8) ?ChatReasoning {
+        if (std.mem.eql(u8, value, "default")) return .provider_default;
+        inline for (std.meta.fields(ChatReasoning)) |field| {
+            if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+        }
+        return null;
+    }
+
+    pub fn configValue(self: ChatReasoning) []const u8 {
+        return if (self == .provider_default) "default" else @tagName(self);
+    }
+};
+
+pub const FavoriteModel = struct {
+    provider: ChatProvider,
+    model: []u8,
+
+    pub fn deinit(self: *FavoriteModel, allocator: std.mem.Allocator) void {
+        allocator.free(self.model);
+    }
+};
+
 pub const ChatTitleProvider = enum {
     codex,
     claude,
@@ -197,6 +241,10 @@ pub const AppConfig = struct {
     automatic_chat_titles_enabled: bool = true,
     chat_title_provider: ChatTitleProvider = .codex,
     chat_title_model: ?[]u8 = null,
+    new_chat_provider: ChatProvider = .codex,
+    new_chat_model: ?[]u8 = null,
+    new_chat_reasoning: ChatReasoning = .low,
+    favorite_models: []FavoriteModel = &.{},
     new_chat_pane_behavior: NewChatPaneBehavior = .new_pane,
     check_for_updates_automatically: bool = true,
     // User-scoped provider registration is opt-in because it updates each
@@ -211,6 +259,9 @@ pub const AppConfig = struct {
     pub fn deinit(self: *AppConfig, allocator: std.mem.Allocator) void {
         if (self.active_theme) |name| allocator.free(name);
         if (self.chat_title_model) |model| allocator.free(model);
+        if (self.new_chat_model) |model| allocator.free(model);
+        for (self.favorite_models) |*favorite| favorite.deinit(allocator);
+        allocator.free(self.favorite_models);
         for (self.installed_themes) |*installed| installed.deinit(allocator);
         allocator.free(self.installed_themes);
         self.default_open_action.deinit(allocator);
@@ -231,6 +282,40 @@ pub const AppConfig = struct {
         const owned_model = try allocator.dupe(u8, model);
         if (self.chat_title_model) |previous| allocator.free(previous);
         self.chat_title_model = owned_model;
+    }
+
+    pub fn setNewChatModel(self: *AppConfig, allocator: std.mem.Allocator, model: []const u8) !void {
+        const owned_model = try allocator.dupe(u8, model);
+        if (self.new_chat_model) |previous| allocator.free(previous);
+        self.new_chat_model = owned_model;
+    }
+
+    pub fn isFavoriteModel(self: AppConfig, provider: ChatProvider, model: []const u8) bool {
+        for (self.favorite_models) |favorite| {
+            if (favorite.provider == provider and std.mem.eql(u8, favorite.model, model)) return true;
+        }
+        return false;
+    }
+
+    pub fn toggleFavoriteModel(self: *AppConfig, allocator: std.mem.Allocator, provider: ChatProvider, model: []const u8) !bool {
+        for (self.favorite_models, 0..) |favorite, index| {
+            if (favorite.provider != provider or !std.mem.eql(u8, favorite.model, model)) continue;
+            const next = try allocator.alloc(FavoriteModel, self.favorite_models.len - 1);
+            @memcpy(next[0..index], self.favorite_models[0..index]);
+            @memcpy(next[index..], self.favorite_models[index + 1 ..]);
+            allocator.free(self.favorite_models[index].model);
+            allocator.free(self.favorite_models);
+            self.favorite_models = next;
+            return false;
+        }
+        const owned_model = try allocator.dupe(u8, model);
+        errdefer allocator.free(owned_model);
+        const next = try allocator.alloc(FavoriteModel, self.favorite_models.len + 1);
+        @memcpy(next[0..self.favorite_models.len], self.favorite_models);
+        next[self.favorite_models.len] = .{ .provider = provider, .model = owned_model };
+        allocator.free(self.favorite_models);
+        self.favorite_models = next;
+        return true;
     }
 
     pub fn activeThemeIndex(self: AppConfig) ?usize {
@@ -558,6 +643,21 @@ fn writeChatSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, c
     try chat_object.put(allocator, "automatic_titles", .{ .bool = config.automatic_chat_titles_enabled });
     try chat_object.put(allocator, "title_provider", .{ .string = @tagName(config.chat_title_provider) });
     try chat_object.put(allocator, "title_model", .{ .string = config.chatTitleModel() });
+    try chat_object.put(allocator, "default_provider", .{ .string = @tagName(config.new_chat_provider) });
+    if (config.new_chat_model) |model| {
+        try chat_object.put(allocator, "default_model", .{ .string = model });
+    } else {
+        _ = chat_object.swapRemove("default_model");
+    }
+    try chat_object.put(allocator, "default_reasoning", .{ .string = config.new_chat_reasoning.configValue() });
+    var favorites = std.json.Array.init(allocator);
+    for (config.favorite_models) |favorite| {
+        var favorite_object: std.json.ObjectMap = .empty;
+        try favorite_object.put(allocator, "provider", .{ .string = @tagName(favorite.provider) });
+        try favorite_object.put(allocator, "model", .{ .string = favorite.model });
+        try favorites.append(.{ .object = favorite_object });
+    }
+    try chat_object.put(allocator, "favorite_models", .{ .array = favorites });
     try chat_object.put(allocator, "new_pane_behavior", .{ .string = @tagName(config.new_chat_pane_behavior) });
 }
 
@@ -741,6 +841,40 @@ fn applyChatOverrides(allocator: std.mem.Allocator, config: *AppConfig, chat_val
             log.warn("chat.title_model must be a non-empty string when provided", .{});
         }
     }
+    if (chat_value.object.get("default_provider")) |provider_value| {
+        if (provider_value == .string) {
+            if (ChatProvider.parse(provider_value.string)) |provider| {
+                config.new_chat_provider = provider;
+            } else {
+                log.warn("chat.default_provider must be codex, claude, cursor, or opencode", .{});
+            }
+        } else {
+            log.warn("chat.default_provider must be a string when provided", .{});
+        }
+    }
+    if (chat_value.object.get("default_model")) |model_value| {
+        if (model_value == .string and model_value.string.len > 0) {
+            config.setNewChatModel(allocator, model_value.string) catch {
+                log.warn("could not allocate chat.default_model", .{});
+            };
+        } else {
+            log.warn("chat.default_model must be a non-empty string when provided", .{});
+        }
+    }
+    if (chat_value.object.get("default_reasoning")) |reasoning_value| {
+        if (reasoning_value == .string) {
+            if (ChatReasoning.parse(reasoning_value.string)) |reasoning| {
+                config.new_chat_reasoning = reasoning;
+            } else {
+                log.warn("chat.default_reasoning must be default, low, medium, high, xhigh, or max", .{});
+            }
+        } else {
+            log.warn("chat.default_reasoning must be a string when provided", .{});
+        }
+    }
+    if (chat_value.object.get("favorite_models")) |favorites_value| {
+        applyFavoriteModelOverrides(allocator, config, favorites_value);
+    }
     if (chat_value.object.get("new_pane_behavior")) |behavior_value| {
         if (behavior_value == .string) {
             if (std.mem.eql(u8, behavior_value.string, "new_pane")) {
@@ -754,6 +888,42 @@ fn applyChatOverrides(allocator: std.mem.Allocator, config: *AppConfig, chat_val
             log.warn("chat.new_pane_behavior must be a string when provided", .{});
         }
     }
+}
+
+fn applyFavoriteModelOverrides(allocator: std.mem.Allocator, config: *AppConfig, value: std.json.Value) void {
+    if (value != .array) {
+        log.warn("chat.favorite_models must be an array when provided", .{});
+        return;
+    }
+    var favorites: std.ArrayList(FavoriteModel) = .empty;
+    defer favorites.deinit(allocator);
+    for (value.array.items) |entry| {
+        if (entry != .object) continue;
+        const provider_value = entry.object.get("provider") orelse continue;
+        const model_value = entry.object.get("model") orelse continue;
+        if (provider_value != .string or model_value != .string or model_value.string.len == 0) continue;
+        const provider = ChatProvider.parse(provider_value.string) orelse continue;
+        var duplicate = false;
+        for (favorites.items) |favorite| {
+            if (favorite.provider == provider and std.mem.eql(u8, favorite.model, model_value.string)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        const model = allocator.dupe(u8, model_value.string) catch break;
+        favorites.append(allocator, .{ .provider = provider, .model = model }) catch {
+            allocator.free(model);
+            break;
+        };
+    }
+    const owned = favorites.toOwnedSlice(allocator) catch {
+        for (favorites.items) |*favorite| favorite.deinit(allocator);
+        return;
+    };
+    for (config.favorite_models) |*favorite| favorite.deinit(allocator);
+    allocator.free(config.favorite_models);
+    config.favorite_models = owned;
 }
 
 fn applyUpdatesOverrides(config: *AppConfig, updates_value: std.json.Value) void {
@@ -1684,6 +1854,34 @@ test "app config accepts chat title provider and model" {
 
     try std.testing.expectEqual(ChatTitleProvider.claude, config.chat_title_provider);
     try std.testing.expectEqualStrings("haiku", config.chatTitleModel());
+}
+
+test "app config accepts new chat defaults and favorite models" {
+    var root = try parseTestRoot(
+        "{\"chat\":{\"default_provider\":\"claude\",\"default_model\":\"sonnet\",\"default_reasoning\":\"high\",\"favorite_models\":[{\"provider\":\"codex\",\"model\":\"gpt-5.6-sol\"},{\"provider\":\"claude\",\"model\":\"sonnet\"}]}}",
+    );
+    defer root.deinit();
+
+    var config: AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+    applyAppOverrides(std.testing.allocator, &config, root.value);
+
+    try std.testing.expectEqual(ChatProvider.claude, config.new_chat_provider);
+    try std.testing.expectEqualStrings("sonnet", config.new_chat_model.?);
+    try std.testing.expectEqual(ChatReasoning.high, config.new_chat_reasoning);
+    try std.testing.expect(config.isFavoriteModel(.codex, "gpt-5.6-sol"));
+    try std.testing.expect(config.isFavoriteModel(.claude, "sonnet"));
+    try std.testing.expectEqual(@as(usize, 2), config.favorite_models.len);
+}
+
+test "favorite model toggle adds and removes one provider model" {
+    var config: AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+
+    try std.testing.expect(try config.toggleFavoriteModel(std.testing.allocator, .codex, "gpt-5.6-sol"));
+    try std.testing.expect(config.isFavoriteModel(.codex, "gpt-5.6-sol"));
+    try std.testing.expect(!(try config.toggleFavoriteModel(std.testing.allocator, .codex, "gpt-5.6-sol")));
+    try std.testing.expect(!config.isFavoriteModel(.codex, "gpt-5.6-sol"));
 }
 
 test "app config defaults new chats to new panes and accepts replacement preference" {

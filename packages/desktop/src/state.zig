@@ -1796,6 +1796,9 @@ pub const PaletteModalAction = enum {
     settings_theme_option,
     settings_title_provider_option,
     settings_title_model_option,
+    settings_new_chat_provider_option,
+    settings_new_chat_model_option,
+    settings_new_chat_reasoning_option,
     command_palette_input,
     command_palette_row,
     command_palette_action_row,
@@ -2583,6 +2586,32 @@ fn paletteModelPickerGroup(context: ?*anyopaque, index: usize) []const u8 {
     return chat_threads.providerLabel(entry.provider);
 }
 
+fn configChatProvider(provider: Provider) app_config.ChatProvider {
+    return switch (provider) {
+        .codex => .codex,
+        .claude => .claude,
+        .cursor => .cursor,
+        .opencode => .opencode,
+    };
+}
+
+fn providerFromConfig(provider: app_config.ChatProvider) Provider {
+    return switch (provider) {
+        .codex => .codex,
+        .claude => .claude,
+        .cursor => .cursor,
+        .opencode => .opencode,
+    };
+}
+
+fn paletteModelPickerFavorite(context: ?*anyopaque, index: usize) bool {
+    const state = appStateFromContext(context) orelse return false;
+    const entry = modelPickerEntryAt(state, index) orelse return false;
+    const option = modelPickerOptionAt(state, index) orelse return false;
+    const model = option.value orelse return false;
+    return state.app_config.isFavoriteModel(configChatProvider(entry.provider), model);
+}
+
 /// Contain-fits the provider logo into `slot`. Serves both picker icon
 /// contexts: the small description-line icon and the rail entries.
 fn drawModelPickerProviderLogo(
@@ -2694,13 +2723,17 @@ pub const PaletteModelPicker = palette.richPicker(.{
     .item_label = paletteModelPickerLabel,
     .item_description = paletteModelPickerDescription,
     .item_badge = paletteModelPickerBadge,
+    .item_action_icon = "\u{EA6A}",
+    .item_action_active_icon = "\u{EB59}",
+    .item_action_active = paletteModelPickerFavorite,
     .item_group = paletteModelPickerGroup,
-    // Provider rail on the left; codicon star-full tops it as "all models".
+    // Provider rail on the left; the star entry filters to favorite models.
     .rail_enabled = true,
     .rail_width = COMPOSER_MODEL_PICKER_RAIL_WIDTH,
     .rail_item_height = 46.0,
     .rail_icon_size = 24.0,
     .rail_all_icon = "\u{EB59}",
+    .rail_primary_filter = paletteModelPickerFavorite,
     .render_rail_icon = paletteModelPickerRailIcon,
     // codicon-check marks the active model inline after its name.
     .check_icon = "\u{EAB2}",
@@ -2724,6 +2757,26 @@ fn paletteModelPickerEvent(context: ?*anyopaque, event: palette.RichPickerEvent)
             }
             state.setCurrentThreadModelRef(option.value);
             state.syncPaletteComposerControls();
+        },
+        .action => |index| {
+            const entry = modelPickerEntryAt(state, index) orelse return;
+            const option = modelPickerOptionAt(state, index) orelse return;
+            const model = option.value orelse return;
+            const added = state.app_config.toggleFavoriteModel(state.allocator, configChatProvider(entry.provider), model) catch {
+                state.setSidebarNotice("Could not update model favorites.");
+                return;
+            };
+            app_config.saveAppConfig(state.allocator, &state.app_config) catch |err| {
+                log.warn("failed to persist model favorite: {s}", .{@errorName(err)});
+                state.setSidebarNotice("Favorite changed, but Verde settings could not be saved.");
+                state.composer_controller.model_picker.invalidateItems();
+                state.markDirty();
+                return;
+            };
+            state.app_config_file_mtime = app_config.configFileMtime(state.allocator) catch state.app_config_file_mtime;
+            state.composer_controller.model_picker.invalidateItems();
+            state.setSidebarNotice(if (added) "Model added to favorites." else "Model removed from favorites.");
+            state.markDirty();
         },
         .open_changed => |open| {
             if (!open) state.restoreComposerAfterShortcutPopover();
@@ -3670,6 +3723,10 @@ pub const AppState = struct {
         var project = try Project.init(self.allocator, id, label, path, unread_count);
         project.applyDefaultTerminalFontSize(self.app_config.terminal_font_size);
         try self.project_controller.projects.append(self.allocator, project);
+        const project_index = self.project_controller.projects.items.len - 1;
+        self.applyNewChatDefaults(project_index, 0) catch |err| {
+            log.warn("failed to apply new-chat defaults to imported workspace: {s}", .{@errorName(err)});
+        };
         self.markDirty();
         return .created;
     }
@@ -4696,13 +4753,17 @@ pub const AppState = struct {
         errdefer if (!restored_appended) restored.deinit(self.allocator);
         restored.archived = false;
         restored.unread_count = unread_count;
-        if (restored.threads.items.len == 0) {
+        const created_default_thread = restored.threads.items.len == 0;
+        if (created_default_thread) {
             _ = try restored.addThread(self.allocator);
         }
         try restored.normalize(self.allocator, self.app_config.terminal_font_size);
         try self.project_controller.projects.append(self.allocator, restored);
         restored_appended = true;
         self.project_controller.selected_index = self.project_controller.projects.items.len - 1;
+        if (created_default_thread) self.applyNewChatDefaults(self.project_controller.selected_index, 0) catch |err| {
+            log.warn("failed to apply new-chat defaults to reopened workspace: {s}", .{@errorName(err)});
+        };
         self.restorePersistedBrowserPaneAfterProjectSelection(self.project_controller.selected_index);
         self.syncRenameBuffer();
         self.markDirty();
@@ -4841,10 +4902,13 @@ pub const AppState = struct {
         project.invalidateSidebarThreadCache();
 
         if (project.threads.items.len == 0) {
-            _ = project.addThread(self.allocator) catch {
+            const new_thread_index = project.addThread(self.allocator) catch {
                 self.setSidebarNotice("Archived the thread, but failed to create a new draft.");
                 self.markDirty();
                 return;
+            };
+            self.applyNewChatDefaults(project_index, new_thread_index) catch |err| {
+                log.warn("failed to apply new-chat defaults after archive: {s}", .{@errorName(err)});
             };
         } else if (thread_index < project.selected_thread_index) {
             project.selected_thread_index -= 1;
@@ -4869,6 +4933,9 @@ pub const AppState = struct {
                 const thread_index = project.addThread(self.allocator) catch {
                     self.setSidebarNotice("Failed to create a new thread.");
                     return;
+                };
+                self.applyNewChatDefaults(index, thread_index) catch |err| {
+                    log.warn("failed to apply new-chat defaults: {s}", .{@errorName(err)});
                 };
                 self.focusProjectThreadInWorkspace(index, thread_index) catch |err| {
                     log.err("failed to open new thread in empty workspace: {s}", .{@errorName(err)});
@@ -4903,6 +4970,9 @@ pub const AppState = struct {
             self.setSidebarNotice("Failed to create a new thread.");
             return;
         };
+        self.applyNewChatDefaults(index, thread_index) catch |err| {
+            log.warn("failed to apply new-chat defaults: {s}", .{@errorName(err)});
+        };
         self.project_controller.selected_index = index;
         self.focusProjectThreadInWorkspace(index, thread_index) catch |err| {
             log.err("failed to focus new thread workspace pane: {s}", .{@errorName(err)});
@@ -4911,6 +4981,69 @@ pub const AppState = struct {
         self.syncRenameBuffer();
         self.setSidebarNotice("New thread ready.");
         self.markDirty();
+    }
+
+    /// Applies user-configured provider/model/reasoning defaults to a newly
+    /// created GUI chat without changing restored, imported, or CLI threads.
+    pub fn applyNewChatDefaults(self: *AppState, project_index: usize, thread_index: usize) !void {
+        if (project_index >= self.project_controller.projects.items.len) return;
+        const project = &self.project_controller.projects.items[project_index];
+        if (thread_index >= project.threads.items.len) return;
+
+        const provider = providerFromConfig(self.app_config.new_chat_provider);
+        const configured_model = self.app_config.new_chat_model orelse composerDefaultModelRef(self, provider);
+        const model = if (self.providerSupportsModel(provider, configured_model)) configured_model else composerDefaultModelRef(self, provider);
+        const owned_model = try self.allocator.dupeZ(u8, model);
+        errdefer self.allocator.free(owned_model);
+
+        var reasoning_effort: ?ReasoningEffort = null;
+        var variant_value: ?[]const u8 = null;
+        const configured_reasoning = self.app_config.new_chat_reasoning;
+        if (configured_reasoning != .provider_default) {
+            const raw = configured_reasoning.configValue();
+            switch (provider) {
+                .codex => if (parseReasoningEffort(raw)) |effort| {
+                    if (workspace_controller.codexSupportsReasoningEffort(model, effort)) reasoning_effort = effort;
+                },
+                .claude => if (self.claudeModelOptionForRef(owned_model)) |option| {
+                    const values = option.claude_effort_values orelse CLAUDE_STANDARD_EFFORT_VALUES[0..];
+                    for (values) |value| {
+                        if (std.mem.eql(u8, value, raw)) {
+                            reasoning_effort = parseReasoningEffort(value);
+                            break;
+                        }
+                    }
+                },
+                .cursor => if (self.cursorModelOptionForRef(owned_model)) |option| {
+                    if (option.cursor_reasoning_values) |values| for (values) |value| {
+                        if (std.mem.eql(u8, value, raw) or (configured_reasoning == .xhigh and std.mem.eql(u8, value, "extra-high"))) {
+                            variant_value = value;
+                            break;
+                        }
+                    };
+                },
+                .opencode => if (self.opencodeModelOptionForRef(owned_model)) |option| {
+                    if (option.reasoning_variant_keys) |values| for (values) |value| {
+                        if (std.mem.eql(u8, value, raw)) {
+                            variant_value = value;
+                            break;
+                        }
+                    };
+                },
+            }
+        }
+        const owned_variant = if (variant_value) |value| try self.allocator.dupeZ(u8, value) else null;
+
+        const thread = &project.threads.items[thread_index];
+        if (thread.model_ref) |previous| self.allocator.free(previous);
+        if (thread.provider_thread_id) |previous| self.allocator.free(previous);
+        if (thread.opencode_reasoning_variant) |previous| self.allocator.free(previous);
+        thread.provider = provider;
+        thread.provider_thread_id = null;
+        thread.model_ref = owned_model;
+        thread.reasoning_effort = reasoning_effort;
+        thread.opencode_reasoning_variant = owned_variant;
+        thread.fast_mode = .off;
     }
 
     pub fn selectThreadForProject(self: *AppState, project_index: usize, thread_index: usize) void {
@@ -5100,6 +5233,21 @@ pub const AppState = struct {
     pub const selectSettingsChatTitleProvider = settings_controller.selectSettingsChatTitleProvider;
     pub const selectSettingsChatTitleModel = settings_controller.selectSettingsChatTitleModel;
     pub const settingsChatTitleModelRef = settings_controller.settingsChatTitleModelRef;
+    pub const settingsNewChatProviderCount = settings_controller.settingsNewChatProviderCount;
+    pub const settingsNewChatProviderSelectedIndex = settings_controller.settingsNewChatProviderSelectedIndex;
+    pub const settingsNewChatProviderLabel = settings_controller.settingsNewChatProviderLabel;
+    pub const settingsNewChatModelCount = settings_controller.settingsNewChatModelCount;
+    pub const settingsNewChatModelLabel = settings_controller.settingsNewChatModelLabel;
+    pub const settingsNewChatModelSelectedIndex = settings_controller.settingsNewChatModelSelectedIndex;
+    pub const settingsNewChatModelSelectedLabel = settings_controller.settingsNewChatModelSelectedLabel;
+    pub const settingsNewChatModelRef = settings_controller.settingsNewChatModelRef;
+    pub const settingsNewChatReasoningCount = settings_controller.settingsNewChatReasoningCount;
+    pub const settingsNewChatReasoningLabel = settings_controller.settingsNewChatReasoningLabel;
+    pub const settingsNewChatReasoningSelectedIndex = settings_controller.settingsNewChatReasoningSelectedIndex;
+    pub const settingsNewChatReasoningSelectedLabel = settings_controller.settingsNewChatReasoningSelectedLabel;
+    pub const selectSettingsNewChatProvider = settings_controller.selectSettingsNewChatProvider;
+    pub const selectSettingsNewChatModel = settings_controller.selectSettingsNewChatModel;
+    pub const selectSettingsNewChatReasoning = settings_controller.selectSettingsNewChatReasoning;
     pub const startUpdateCheck = settings_controller.startUpdateCheck;
     pub const startAutomaticUpdateCheck = settings_controller.startAutomaticUpdateCheck;
     pub const pollUpdateCheck = settings_controller.pollUpdateCheck;
@@ -9295,6 +9443,9 @@ pub const AppState = struct {
                 .settings_theme_option,
                 .settings_title_provider_option,
                 .settings_title_model_option,
+                .settings_new_chat_provider_option,
+                .settings_new_chat_model_option,
+                .settings_new_chat_reasoning_option,
                 .settings_close,
                 .settings_cancel,
                 .settings_save,
@@ -10344,6 +10495,7 @@ pub const AppState = struct {
         self.claude_model_options.deinit(self.allocator);
         self.cursor_model_options.deinit(self.allocator);
         if (self.settings_controller.chat_title_model) |model| self.allocator.free(model);
+        if (self.settings_controller.new_chat_model) |model| self.allocator.free(model);
         self.app_config.deinit(self.allocator);
         self.project_controller.projects.deinit(self.allocator);
         self.project_controller.archived_projects.deinit(self.allocator);
@@ -12102,6 +12254,39 @@ test "new Codex threads default to GPT-5.6 Sol with low reasoning" {
     defer thread.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(DEFAULT_CODEX_MODEL, thread.model_ref.?);
     try std.testing.expectEqual(DEFAULT_CODEX_REASONING_EFFORT, thread.reasoning_effort.?);
+}
+
+test "GUI new-chat defaults apply configured provider model and reasoning" {
+    const allocator = std.testing.allocator;
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.app_config = .{
+        .new_chat_provider = .codex,
+        .new_chat_reasoning = .max,
+    };
+    try state.app_config.setNewChatModel(allocator, "gpt-5.6-terra");
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    state.opencode_model_options = .empty;
+    state.claude_model_options = .empty;
+    state.cursor_model_options = .empty;
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.app_config.deinit(allocator);
+    }
+
+    var project = try Project.init(allocator, "defaults", "Defaults", "/tmp/defaults", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    try state.applyNewChatDefaults(0, 0);
+
+    const thread = &state.project_controller.projects.items[0].threads.items[0];
+    try std.testing.expectEqual(Provider.codex, thread.provider);
+    try std.testing.expectEqualStrings("gpt-5.6-terra", thread.model_ref.?);
+    try std.testing.expectEqual(ReasoningEffort.max, thread.reasoning_effort.?);
 }
 
 test "background task action hits remain valid for pending transcript events" {

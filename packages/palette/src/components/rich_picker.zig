@@ -16,6 +16,7 @@ const text_layout = @import("../text_layout.zig");
 /// Empty slices mean "absent" — a row without description stays compact and a
 /// row without badge reserves no trailing pill.
 pub const ItemTextFn = *const fn (context: ?*anyopaque, index: usize) []const u8;
+pub const ItemBoolFn = *const fn (context: ?*anyopaque, index: usize) bool;
 
 pub const RowLeadingRenderFn = *const fn (
     context: ?*anyopaque,
@@ -89,6 +90,11 @@ pub const RichPickerConfig = struct {
     item_label: ?ItemTextFn = null,
     item_description: ?ItemTextFn = null,
     item_badge: ?ItemTextFn = null,
+    /// Optional trailing row action. Hosts commonly use this for pin/favorite
+    /// toggles; activating it emits `.action` without selecting or closing.
+    item_action_icon: []const u8 = "",
+    item_action_active_icon: []const u8 = "",
+    item_action_active: ?ItemBoolFn = null,
     /// Group header text per item; consecutive items sharing the same text
     /// render under one header row. Null/empty disables grouping.
     item_group: ?ItemTextFn = null,
@@ -102,6 +108,9 @@ pub const RichPickerConfig = struct {
     rail_icon_size: f32 = 24.0,
     /// Glyph for the "all groups" rail entry, drawn with the icon font.
     rail_all_icon: []const u8 = "",
+    /// Optional filter for the leading rail entry. When present, that entry
+    /// shows only matching items instead of all groups (for example favorites).
+    rail_primary_filter: ?ItemBoolFn = null,
     render_rail_icon: ?RailIconRenderFn = null,
     search_style: SearchStyle = .boxed,
     /// Optional glyph rendered at the left edge of the search field.
@@ -191,6 +200,7 @@ pub const Input = union(enum) {
 
 pub const RichPickerEvent = union(enum) {
     selected: usize,
+    action: usize,
     highlighted: usize,
     open_changed: bool,
 };
@@ -774,7 +784,12 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
         }
 
         fn itemPassesRailFilter(self: *const Component, index: usize) bool {
-            if (self.active_group_label.items.len == 0) return true;
+            if (self.active_group_label.items.len == 0) {
+                if (self.railActive()) {
+                    if (config.rail_primary_filter) |filter| return filter(self.callbacks.context, index);
+                }
+                return true;
+            }
             // A collapsed rail (single group) cannot show the filter, so it
             // must not silently hide rows either.
             if (!self.railActive()) return true;
@@ -1115,6 +1130,12 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
             if (self.rowAtPoint(point)) |row_index| {
                 const row = self.rows.items[row_index];
                 if (row.kind == .item) {
+                    if (self.itemActionRect(self.rowRect(row)).contains(point)) {
+                        self.emit(.{ .action = row.item });
+                        self.rows_dirty = true;
+                        try self.ensureRows(allocator);
+                        return true;
+                    }
                     self.selectItem(allocator, row.item);
                 }
                 return true;
@@ -1309,6 +1330,19 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
             // the label); the label strip clips before all of them.
             var trailing_right = row_rect.x + row_rect.w - self.scaled(config.row_padding_x);
             const icon_metrics = self.derivedMetrics(self.scaled(config.font_size));
+            if (config.item_action_icon.len > 0) {
+                const active = if (config.item_action_active) |callback| callback(context, row.item) else false;
+                const icon = if (active and config.item_action_active_icon.len > 0) config.item_action_active_icon else config.item_action_icon;
+                const action_rect = self.itemActionRect(row_rect);
+                const action_w = icon_metrics.measureSlice(icon);
+                try batch.roleText(allocator, .{
+                    .x = action_rect.x + @max((action_rect.w - action_w) * 0.5, 0.0),
+                    .y = action_rect.y + @max((action_rect.h - icon_metrics.line_height) * 0.5, 0.0),
+                    .w = action_w,
+                    .h = icon_metrics.line_height,
+                }, icon, if (active) self.style.accent_color else self.style.description_color, icon_metrics.font_size, config.icon_font_role, config.icon_font_id, clip);
+                trailing_right = action_rect.x - self.scaled(config.icon_gap);
+            }
             if (shortcut_chip_labels.len > 0 and row.ordinal < shortcut_chip_labels.len) {
                 trailing_right = try self.renderShortcutChip(allocator, batch, shortcut_chip_labels[row.ordinal], row_rect, trailing_right, clip);
             }
@@ -1408,6 +1442,17 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
             }
         }
 
+        fn itemActionRect(self: *const Component, row_rect: draw.Rect) draw.Rect {
+            if (config.item_action_icon.len == 0) return .{ .x = row_rect.x + row_rect.w, .y = row_rect.y, .w = 0.0, .h = 0.0 };
+            const size = self.scaled(26.0);
+            return .{
+                .x = row_rect.x + row_rect.w - self.scaled(config.row_padding_x) - size,
+                .y = row_rect.y + (row_rect.h - size) * 0.5,
+                .w = size,
+                .h = size,
+            };
+        }
+
         // Renders one "Ctrl+n" shortcut chip (outlined pill) at the row's
         // trailing edge and returns the new trailing-right x.
         fn renderShortcutChip(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, label: []const u8, row_rect: draw.Rect, trailing_right: f32, clip: draw.Rect) !f32 {
@@ -1480,6 +1525,7 @@ const TestContext = struct {
     selected: ?usize = null,
     open_events: usize = 0,
     close_events: usize = 0,
+    favorites: [6]bool = .{ false, false, false, false, false, false },
 
     const labels = [_][]const u8{ "GPT-5.6 Sol", "GPT-5.5", "Claude Opus 4.7", "Claude Sonnet 4.5", "Composer 2", "Auto" };
     const groups = [_][]const u8{ "Codex", "Codex", "Claude", "Claude", "Cursor", "Cursor" };
@@ -1501,10 +1547,16 @@ const TestContext = struct {
         return if (index == 0) "Default" else "";
     }
 
+    fn favorite(context: ?*anyopaque, index: usize) bool {
+        const self: *TestContext = @ptrCast(@alignCast(context.?));
+        return self.favorites[index];
+    }
+
     fn onEvent(context: ?*anyopaque, event: RichPickerEvent) void {
         const self: *TestContext = @ptrCast(@alignCast(context.?));
         switch (event) {
             .selected => |index| self.selected = index,
+            .action => {},
             .open_changed => |open| if (open) {
                 self.open_events += 1;
             } else {
@@ -1553,6 +1605,29 @@ const RailTestPicker = RichPicker(.{
     .check_inline = true,
     .leading_on_description = true,
     .shortcut_badge_limit = 9,
+    .placement = .below,
+});
+
+const FavoriteRailTestPicker = RichPicker(.{
+    .width = 300,
+    .row_height = 20,
+    .row_height_with_description = 34,
+    .max_body_height = 400,
+    .fixed_body_height = 180,
+    .search_enabled = true,
+    .search_min_items = 3,
+    .item_label = TestContext.label,
+    .item_description = TestContext.description,
+    .item_group = TestContext.group,
+    .item_action_icon = "+",
+    .item_action_active_icon = "*",
+    .item_action_active = TestContext.favorite,
+    .rail_enabled = true,
+    .rail_width = 48,
+    .rail_item_height = 40,
+    .rail_all_icon = "*",
+    .rail_primary_filter = TestContext.favorite,
+    .render_rail_icon = testRailIcon,
     .placement = .below,
 });
 
@@ -1674,6 +1749,24 @@ test "rich picker rail filters by group without headers" {
 
     _ = try picker.handleInput(std.testing.allocator, .{ .mouse_down = .{ .point = railItemCenter(&picker, 0) } });
     try std.testing.expectEqual(@as(usize, TestContext.labels.len), picker.rows.items.len);
+}
+
+test "rich picker primary rail entry filters to marked items" {
+    var context: TestContext = .{};
+    context.favorites[1] = true;
+    context.favorites[4] = true;
+    var picker = try openedPickerOf(FavoriteRailTestPicker, &context);
+    defer picker.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), picker.filtered.items.len);
+    try std.testing.expectEqual(@as(usize, 1), picker.filtered.items[0]);
+    try std.testing.expectEqual(@as(usize, 4), picker.filtered.items[1]);
+
+    const codex_rail = picker.railItemRect(1);
+    _ = try picker.handleInput(std.testing.allocator, .{ .mouse_down = .{ .point = .{ .x = codex_rail.x + codex_rail.w * 0.5, .y = codex_rail.y + codex_rail.h * 0.5 } } });
+    try std.testing.expectEqual(@as(usize, 2), picker.filtered.items.len);
+    try std.testing.expectEqual(@as(usize, 0), picker.filtered.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), picker.filtered.items[1]);
 }
 
 test "rich picker arrows move between model rows and provider rail" {
