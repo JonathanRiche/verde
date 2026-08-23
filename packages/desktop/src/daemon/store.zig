@@ -1703,19 +1703,20 @@ pub const Store = struct {
     }
 
     /// First-turn acceptance owns the prompt fallback. GUI draft rows are
-    /// uncommitted; daemon-created MCP rows are deliberately committed so a
-    /// compatibility snapshot cannot delete them, and use the pinned
-    /// `New Chat` placeholder until their first accepted prompt.
+    /// uncommitted; daemon-created and desktop-presented rows can already be
+    /// committed, so every reserved empty-thread label remains replaceable
+    /// until its first accepted prompt.
     fn updateTurnPresentationMetadata(
         self: *Self,
         workspace_id: []const u8,
         thread: store_protocol.Thread,
     ) !void {
         try self.conn.exec(
-            "update threads set title = case when committed = 0 or (title = ?1 and not exists " ++
-                "(select 1 from messages m where m.thread_id = threads.id)) then ?2 else title end, committed = 1 " ++
-                "where workspace_id = (select id from workspaces where workspace_id = ?3) and local_thread_id = ?4",
-            .{ "New Chat", thread.title, workspace_id, thread.local_thread_id },
+            "update threads set title = case when committed = 0 or " ++
+                "(title in (?1, ?2, ?3) and not exists " ++
+                "(select 1 from messages m where m.thread_id = threads.id)) then ?4 else title end, committed = 1 " ++
+                "where workspace_id = (select id from workspaces where workspace_id = ?5) and local_thread_id = ?6",
+            .{ "New Chat", "New chat", "New thread", thread.title, workspace_id, thread.local_thread_id },
         );
         if (self.conn.changes() > 0) return;
         const owner = try self.conn.row(
@@ -4203,7 +4204,7 @@ test "daemon turn titles commit the first prompt and preserve later manual renam
     _ = try store.upsertThread(.{
         .mutation = testHeader("title-thread", 1),
         .workspace_id = workspace.workspace_id,
-        .thread = testThread("thread-title", "New Chat"),
+        .thread = testThread("thread-title", "New thread"),
     });
 
     const acceptance: TurnAcceptanceRequest = .{

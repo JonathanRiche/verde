@@ -4,7 +4,7 @@ import { store } from '../lib/store'
 import { FileViewer } from './FileViewer'
 import { Icon } from './Icons'
 import { Palette, Settings, WorkspaceDialog } from './Overlays'
-import { Sidebar } from './Sidebar'
+import { PaneActionsButton, Sidebar } from './Sidebar'
 import { WorkspaceCanvas } from './WorkspaceCanvas'
 
 export function App() {
@@ -51,6 +51,12 @@ export function App() {
           <div class="min-w-0 flex-1 truncate text-[14px] font-medium">
             {focused() ? store.paneTitle(focused()!) : (store.workspace()?.label ?? 'Verde')}
           </div>
+          <Show
+            when={(focused()?.kind === 'chat' || focused()?.kind === 'terminal') ? focused() : undefined}
+            keyed
+          >
+            {(pane) => <PaneActionsButton pane={pane} mobile />}
+          </Show>
         </div>
 
         <WorkspaceCanvas />

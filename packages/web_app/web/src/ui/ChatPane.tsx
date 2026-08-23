@@ -8,6 +8,7 @@ import { type Attachment, type LivePane, type Message } from '../lib/types'
 import { effortLabel, effortOptionsIn, modelOptionsFor, modelSupportsFast, variantOptionsIn } from '../lib/models'
 import { handleFileCitationClick } from './FileViewer'
 import { Icon, ProviderGlyph, ZoomButton } from './Icons'
+import { PaneActionsButton } from './Sidebar'
 
 marked.setOptions({ gfm: true, breaks: true })
 
@@ -196,6 +197,7 @@ export function ChatPane(props: { pane: LivePane }) {
           <span class="text-[11px] tracking-wide text-[var(--accent)]">Working</span>
         </Show>
         <ZoomButton pane={props.pane} />
+        <PaneActionsButton pane={props.pane} />
       </header>
       {/* [overflow-anchor:none]: the browser's own scroll anchoring repositions
           the viewport a frame late when a tall card collapses (visible jitter)

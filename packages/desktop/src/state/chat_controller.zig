@@ -3577,9 +3577,24 @@ pub fn canRegenerateThreadTitle(self: anytype, project_index: usize, thread_inde
     const project = &self.project_controller.projects.items[project_index];
     if (thread_index >= project.threads.items.len) return false;
     const thread = &project.threads.items[thread_index];
-    return openingExchange(thread) != null and
+    return titleRegenerationSourceAvailable(thread) and
         !thread.isSendPendingForUi() and
         !thread.isTitleGenerationPendingForUi();
+}
+
+fn titleRegenerationSourceAvailable(thread: *const ChatThread) bool {
+    return openingExchange(thread) != null or thread.persisted_message_offset > 0;
+}
+
+fn hydrateOpeningExchangeForTitle(self: anytype, project_index: usize, thread_index: usize) !void {
+    while (true) {
+        if (project_index >= self.project_controller.projects.items.len) return error.ProjectNotFound;
+        const project = &self.project_controller.projects.items[project_index];
+        if (thread_index >= project.threads.items.len) return error.ThreadNotFound;
+        const thread = &project.threads.items[thread_index];
+        if (openingExchange(thread) != null or thread.persisted_message_offset == 0) return;
+        if (!try self.loadOlderThreadMessagesAt(project_index, thread_index)) return;
+    }
 }
 
 pub fn regenerateCurrentThreadTitle(self: anytype) void {
@@ -3595,6 +3610,15 @@ pub fn regenerateThreadTitleAtIndex(self: anytype, project_index: usize, thread_
         self.setSidebarNotice("A completed opening exchange is required to generate a title.");
         return;
     }
+    hydrateOpeningExchangeForTitle(self, project_index, thread_index) catch |err| {
+        log.warn("failed to load the opening exchange for chat title regeneration: {s}", .{@errorName(err)});
+        self.setSidebarNotice("Could not load the opening exchange for title generation.");
+        return;
+    };
+    if (!self.canRegenerateThreadTitle(project_index, thread_index)) {
+        self.setSidebarNotice("A completed opening exchange is required to generate a title.");
+        return;
+    }
     const thread = &self.project_controller.projects.items[project_index].threads.items[thread_index];
     self.startTitleGeneration(project_index, thread, true) catch |err| {
         log.warn("failed to start chat title regeneration: {s}", .{@errorName(err)});
@@ -3602,6 +3626,29 @@ pub fn regenerateThreadTitleAtIndex(self: anytype, project_index: usize, thread_
         return;
     };
     self.setSidebarNotice("Generating a new chat title...");
+}
+
+test "title regeneration remains available when its opening exchange is paged out" {
+    const allocator = std.testing.allocator;
+    var thread = try ChatThread.init(allocator, "New thread");
+    defer thread.deinit(allocator);
+
+    try std.testing.expect(!titleRegenerationSourceAvailable(&thread));
+    thread.persisted_message_offset = 2;
+    try std.testing.expect(titleRegenerationSourceAvailable(&thread));
+
+    thread.persisted_message_offset = 0;
+    try thread.messages.append(allocator, .{
+        .role = .user,
+        .author = try allocator.dupeZ(u8, "You"),
+        .body = try allocator.dupeZ(u8, "Opening prompt"),
+    });
+    try thread.messages.append(allocator, .{
+        .role = .assistant,
+        .author = try allocator.dupeZ(u8, "Codex"),
+        .body = try allocator.dupeZ(u8, "Opening reply"),
+    });
+    try std.testing.expect(titleRegenerationSourceAvailable(&thread));
 }
 
 pub fn pollSlashCommand(self: anytype) bool {
@@ -4397,6 +4444,19 @@ fn threadHasMessageId(thread: *const ChatThread, message_id: []const u8) bool {
     return false;
 }
 
+fn canApplyDaemonGeneratedTitle(current_title: []const u8, expected_title: []const u8) bool {
+    return expected_title.len > 0 and
+        (std.mem.eql(u8, current_title, expected_title) or
+            chat_threads.isPlaceholderThreadTitle(current_title));
+}
+
+test "daemon generated title replaces a stale opening placeholder" {
+    try std.testing.expect(canApplyDaemonGeneratedTitle("Opening prompt", "Opening prompt"));
+    try std.testing.expect(canApplyDaemonGeneratedTitle("New thread", "Opening prompt"));
+    try std.testing.expect(canApplyDaemonGeneratedTitle("New Chat", "Opening prompt"));
+    try std.testing.expect(!canApplyDaemonGeneratedTitle("Manual title", "Opening prompt"));
+}
+
 pub fn applyDaemonChatTurnTail(self: anytype, thread: *ChatThread, response: []const u8) !bool {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, response, .{});
     defer parsed.deinit();
@@ -4463,7 +4523,7 @@ pub fn applyDaemonChatTurnTail(self: anytype, thread: *ChatThread, response: []c
     if (std.mem.eql(u8, status_text, "completed")) {
         if (jsonValueString(result.object.get("generated_title") orelse .null)) |generated_title| {
             const expected_title = jsonValueString(result.object.get("generated_title_expected") orelse .null) orelse "";
-            if (expected_title.len > 0 and std.mem.eql(u8, thread.title, expected_title)) {
+            if (canApplyDaemonGeneratedTitle(thread.title, expected_title)) {
                 const owned_title = try self.allocator.dupeZ(u8, generated_title);
                 self.allocator.free(thread.title);
                 thread.title = owned_title;

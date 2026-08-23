@@ -76,6 +76,40 @@ type DraftMap = Record<string, string>
 type DraftAttachmentMap = Record<string, Attachment[]>
 type AttachmentUploadMap = Record<string, number>
 
+export type SidebarContextAction =
+  | 'workspace-new-chat'
+  | 'workspace-open-codex-tui'
+  | 'workspace-open-terminal'
+  | 'workspace-herdr-handoff'
+  | 'workspace-herdr-handoff-remote'
+  | 'workspace-herdr-focus-terminal'
+  | 'workspace-herdr-unlink'
+  | 'workspace-rename'
+  | 'workspace-import-codex'
+  | 'workspace-import-opencode'
+  | 'workspace-import-claude'
+  | 'workspace-close'
+  | 'thread-rename'
+  | 'thread-regenerate-title'
+  | 'thread-sync'
+  | 'thread-handoff'
+  | 'thread-open-tui'
+  | 'thread-open-chat'
+  | 'thread-archive'
+  | 'pane-zoom'
+  | 'pane-split-chat-right'
+  | 'pane-split-chat-down'
+  | 'pane-split-terminal-right'
+  | 'pane-split-terminal-down'
+  | 'pane-close'
+
+export interface SidebarContextActionRequest {
+  action: SidebarContextAction
+  workspace: Workspace
+  pane?: LivePane
+  value?: string
+}
+
 const MAX_CHAT_IMAGE_BYTES = 10 * 1024 * 1024
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -121,6 +155,26 @@ export async function requestTerminalOpen(
       label: 'Terminal',
     }),
     native: false,
+  }
+}
+
+export async function requestPaneClose(
+  call: (method: string, params: unknown) => Promise<RpcEnvelope>,
+  workspace_id: string,
+  pane: Pick<LivePane, 'kind' | 'native_pane_id' | 'session_id'>,
+): Promise<RpcEnvelope> {
+  if (pane.native_pane_id != null) {
+    return call('pane.close', { workspace: workspace_id, pane: pane.native_pane_id })
+  }
+  if (pane.kind === 'terminal' && pane.session_id) {
+    return call('session.kill', { id: pane.session_id })
+  }
+  return {
+    ok: false,
+    error: {
+      code: 'capability_unavailable',
+      message: 'This pane is not open in the desktop runtime.',
+    },
   }
 }
 
@@ -170,9 +224,14 @@ const THREAD_SETTING_KEYS = [
 ] as const satisfies ReadonlyArray<keyof Thread>
 const THREAD_SETTINGS_CACHE_KEY = 'verde:web:thread-settings:v1'
 const LAST_CHAT_PANE_CACHE_KEY = 'verde:web:last-chat-pane:v1'
+const COMPOSER_CACHE_KEY = 'verde:web:composer:v1'
 
 type CachedThreadSettings = Pick<Thread, (typeof THREAD_SETTING_KEYS)[number]>
 type ThreadSettingsCache = Record<string, Record<string, CachedThreadSettings>>
+interface ComposerCache {
+  drafts: DraftMap
+  attachments: DraftAttachmentMap
+}
 
 export interface LastChatPaneLocation {
   workspace_id: string
@@ -216,6 +275,52 @@ function writeLastChatPaneLocation(pane: LivePane): void {
     localStorage.setItem(LAST_CHAT_PANE_CACHE_KEY, JSON.stringify(location))
   } catch {
     // Storage can be unavailable in hardened/private browser contexts.
+  }
+}
+
+function readComposerCache(): ComposerCache {
+  const empty: ComposerCache = { drafts: {}, attachments: {} }
+  try {
+    const parsed = asRecord(JSON.parse(localStorage.getItem(COMPOSER_CACHE_KEY) ?? 'null'))
+    if (!parsed) return empty
+    const drafts: DraftMap = {}
+    const raw_drafts = asRecord(parsed.drafts)
+    for (const [key, value] of Object.entries(raw_drafts ?? {})) {
+      if (typeof value === 'string' && value.length > 0) drafts[key] = value
+    }
+    const attachments: DraftAttachmentMap = {}
+    const raw_attachments = asRecord(parsed.attachments)
+    for (const [key, value] of Object.entries(raw_attachments ?? {})) {
+      if (!Array.isArray(value)) continue
+      const rows = value.filter(
+        (item): item is Attachment =>
+          Boolean(item) &&
+          typeof item === 'object' &&
+          typeof (item as Attachment).path === 'string' &&
+          typeof (item as Attachment).mime === 'string',
+      )
+      if (rows.length > 0) attachments[key] = rows
+    }
+    return { drafts, attachments }
+  } catch {
+    return empty
+  }
+}
+
+function writeComposerCache(drafts: DraftMap, attachments: DraftAttachmentMap): void {
+  try {
+    const non_empty_drafts = Object.fromEntries(
+      Object.entries(drafts).filter(([, value]) => value.length > 0),
+    )
+    const non_empty_attachments = Object.fromEntries(
+      Object.entries(attachments).filter(([, value]) => value.length > 0),
+    )
+    localStorage.setItem(COMPOSER_CACHE_KEY, JSON.stringify({
+      drafts: non_empty_drafts,
+      attachments: non_empty_attachments,
+    }))
+  } catch {
+    // Storage can be unavailable or full in hardened/private contexts.
   }
 }
 
@@ -407,6 +512,30 @@ export function chatPaneHasLiveTurn(
   has_streaming_overlay: boolean,
 ): boolean {
   return Boolean(pane?.kind === 'chat' && (has_streaming_overlay || pane.send_pending))
+}
+
+/// Returns the last event sequence that a tail response actually delivered.
+/// `next_seq` is the daemon's next unused sequence and must never be used as
+/// an `after_seq` cursor because doing so skips the event assigned that value.
+export function lastDeliveredTailSeq(
+  current: number,
+  events: ReadonlyArray<{ seq?: number }>,
+  page_last_seq?: number,
+): number {
+  let last = current
+  for (const event of events) {
+    if (typeof event.seq === 'number' && Number.isSafeInteger(event.seq) && event.seq > last) {
+      last = event.seq
+    }
+  }
+  if (
+    typeof page_last_seq === 'number' &&
+    Number.isSafeInteger(page_last_seq) &&
+    page_last_seq > last
+  ) {
+    last = page_last_seq
+  }
+  return last
 }
 
 function sessionKey(session: SnapshotSession): string {
@@ -657,11 +786,21 @@ export function panesForWorkspace(
         // thread is absent from the bounded catalog must stay a placeholder;
         // binding it by a shared title can make two panes project one thread.
         const titled = pane.title ? threads.filter((item) => item.title === pane.title) : []
+        // A thread opened by this web client can be auto-titled in the store
+        // before the desktop pane consumes the terminal tail. Its placeholder
+        // no longer matches by title, so use the known local identity's index
+        // only for that narrow transition.
+        const placeholder_indexed = pane.title && isPlaceholderThreadTitle(pane.title)
+          ? threads.find(
+              (item) => item.sort_index === pane.thread && localThreadIds.has(item.local_thread_id),
+            )
+          : undefined
         const thread =
           (pane.provider_thread_id
             ? threads.find((item) => item.provider_thread_id === pane.provider_thread_id)
             : undefined) ??
           titled.find((item) => item.sort_index === pane.thread) ??
+          placeholder_indexed ??
           (has_live_layout ? undefined : titled[0]) ??
           (has_live_layout || pane.title
             ? undefined
@@ -685,12 +824,17 @@ export function panesForWorkspace(
           const fast_mode = Object.prototype.hasOwnProperty.call(thread, 'fast_mode')
             ? thread.fast_mode === 'on'
             : pane.fast_mode ?? false
+          const thread_title =
+            pane.title && !(isPlaceholderThreadTitle(pane.title) && !isPlaceholderThreadTitle(thread.title))
+              ? pane.title
+              : thread.title || pane.title || 'Chat'
           used_threads.add(thread.local_thread_id)
           rows.push({
             ...chatPane(workspace, thread, turns),
+            native_pane_id: pane.id,
             focused,
             thread_index: pane.thread,
-            thread_title: pane.title || thread.title || 'Chat',
+            thread_title,
             provider: thread.provider ?? pane.provider ?? workspace.provider,
             model,
             reasoning_effort,
@@ -714,6 +858,7 @@ export function panesForWorkspace(
           // the store catches up and the title resolves.
           rows.push({
             pane_id: stablePaneId('chat', `${workspace.workspace_id}:live-pane:${pane.id ?? 0}`),
+            native_pane_id: pane.id,
             workspace_id: workspace.workspace_id,
             kind: 'chat',
             thread_title: pane.title,
@@ -735,6 +880,7 @@ export function panesForWorkspace(
           used_sessions.add(sessionKey(session))
           rows.push({
             ...termPane(workspace, session),
+            native_pane_id: pane.id,
             focused,
             // Live rows carry the desktop's resolved terminal title (surface
             // title -> process label) and the TUI-agent provider; both beat
@@ -752,6 +898,7 @@ export function panesForWorkspace(
           // Pane is open on the desktop but its shell is not running.
           rows.push({
             pane_id: stablePaneId('term', `${workspace.workspace_id}:dock:${pane.dock}`),
+            native_pane_id: pane.id,
             workspace_id: workspace.workspace_id,
             kind: 'terminal',
             thread_title: pane.title || pane.purpose || 'Terminal',
@@ -767,6 +914,7 @@ export function panesForWorkspace(
       } else if (pane.kind === 'browser') {
         rows.push({
           pane_id: stablePaneId('browser', `${workspace.workspace_id}:browser:${pane.id ?? 0}`),
+          native_pane_id: pane.id,
           workspace_id: workspace.workspace_id,
           kind: 'browser',
           thread_title: 'Browser',
@@ -822,6 +970,7 @@ function projectPanes(
 
 function createAppStore() {
   const client = new LiveClient()
+  const composerCache = readComposerCache()
   const [source, setSource] = createSignal<Source>('mock')
   const [connected, setConnected] = createSignal(false)
   const [workspaces, setWorkspaces] = createSignal<Workspace[]>([])
@@ -831,8 +980,9 @@ function createAppStore() {
   const [focusedPaneId, setFocusedPaneId] = createSignal<number | null>(null)
   const [maximizedPaneId, setMaximizedPaneId] = createSignal<number | null>(null)
   const [transcripts, setTranscripts] = createSignal<TranscriptMap>({})
-  const [drafts, setDrafts] = createSignal<DraftMap>({})
-  const [draftAttachments, setDraftAttachments] = createSignal<DraftAttachmentMap>({})
+  const [drafts, setDrafts] = createSignal<DraftMap>(composerCache.drafts)
+  const [draftAttachments, setDraftAttachments] =
+    createSignal<DraftAttachmentMap>(composerCache.attachments)
   const [attachmentUploads, setAttachmentUploads] = createSignal<AttachmentUploadMap>({})
   const [paletteOpen, setPaletteOpen] = createSignal(false)
   const [settingsOpen, setSettingsOpen] = createSignal(false)
@@ -844,6 +994,16 @@ function createAppStore() {
   const [composerNonce, setComposerNonce] = createSignal(0)
   const [compact, setCompact] = createSignal(false)
   const [uiConfig, setUiConfig] = createSignal<UiConfig>(DEFAULT_UI_CONFIG)
+  let composerCacheTimer: number | null = null
+  const persistComposerState = () => {
+    if (composerCacheTimer !== null) window.clearTimeout(composerCacheTimer)
+    composerCacheTimer = null
+    writeComposerCache(drafts(), draftAttachments())
+  }
+  const scheduleComposerCacheWrite = () => {
+    if (composerCacheTimer !== null) window.clearTimeout(composerCacheTimer)
+    composerCacheTimer = window.setTimeout(persistComposerState, 300)
+  }
   const startupLastChatPane = readLastChatPaneLocation()
   const restoreLastChatOnStartup = startupLastChatPane != null
   const [initialViewReady, setInitialViewReady] = createSignal(!restoreLastChatOnStartup)
@@ -1010,7 +1170,9 @@ function createAppStore() {
     const listed = liveWorkspaces
       ? liveWorkspaces.map((item) => {
           const row = stored.find((entry) => entry.workspace_id === item.workspace_id)
-          return row ? { ...item, workspace_layout_json: row.workspace_layout_json } : item
+          // Keep the desktop listing's current label/path while retaining
+          // store-only metadata (notably Herdr linkage) used by web menus.
+          return row ? { ...row, ...item, workspace_layout_json: row.workspace_layout_json } : item
         })
       : workspacesFromVolatile(root, stored)
     const list = listed.filter((item) => item.workspace_id && !item.archived)
@@ -1319,7 +1481,7 @@ function createAppStore() {
   // appended on top until the turn commits.
   interface TurnTail {
     turn_id: string
-    next_seq: number
+    last_seq: number
     parts: Message[]
     tool_rows: Map<string, Message>
     stream: string
@@ -1550,7 +1712,7 @@ function createAppStore() {
   const sleep = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms))
   // Loops already driving a tail object; replaced tails simply orphan the old
   // loop, which exits at its next identity check.
-  const runningTails = new WeakSet<TurnTail>()
+  const runningTails = new Set<TurnTail>()
   // Turns observed terminal by a loop; discovery skips them while lastTurns
   // still lists them as working (projection lag).
   const finishedTurns = new Set<string>()
@@ -1566,12 +1728,14 @@ function createAppStore() {
         // own gateway connection task and may hang safely.
         response = await fetchRpc('chat.turn.tail', {
           turn_id: tail.turn_id,
-          after_seq: tail.next_seq,
+          after_seq: tail.last_seq,
           wait_ms: TAIL_WAIT_MS,
         })
       } catch {
-        // Gateway unreachable: drop the overlay; discovery retries next tick.
-        clearOverlay(key)
+        // A mobile page freeze commonly terminates the parked HTTP request.
+        // Keep the cursor and visible overlay so foreground recovery can
+        // restart from the next missing daemon event instead of flashing an
+        // empty turn.
         return
       }
       if (turnTails.get(key) !== tail) return
@@ -1584,7 +1748,7 @@ function createAppStore() {
       const result = unwrapResult<{
         status?: string
         started_at_ms?: number
-        next_seq?: number
+        page_last_seq?: number
         events?: Array<{ seq?: number; kind?: string; payload_json?: string }>
       }>(response)
       if (!result) {
@@ -1595,8 +1759,9 @@ function createAppStore() {
       if (typeof result.started_at_ms === 'number' && result.started_at_ms > 0) {
         tail.started_at_ms = result.started_at_ms
       }
-      const cursor_before = tail.next_seq
-      for (const event of result.events ?? []) {
+      const cursor_before = tail.last_seq
+      const events = result.events ?? []
+      for (const event of events) {
         if (!event.kind) continue
         let payload: Record<string, unknown> = {}
         try {
@@ -1606,7 +1771,7 @@ function createAppStore() {
         }
         applyTailEvent(tail, event.kind, payload)
       }
-      tail.next_seq = result.next_seq ?? tail.next_seq
+      tail.last_seq = lastDeliveredTailSeq(tail.last_seq, events, result.page_last_seq)
       if (turnIsTerminal(result.status)) {
         // Durable-first: a terminal status is published only after the turn's
         // messages commit, so the committed transcript fetched here already
@@ -1618,7 +1783,7 @@ function createAppStore() {
         return
       }
       setOverlays((prev) => ({ ...prev, [key]: overlayMessages(pane, tail) }))
-      if (tail.next_seq === cursor_before && Date.now() - started < TAIL_FAST_EMPTY_MS) {
+      if (tail.last_seq === cursor_before && Date.now() - started < TAIL_FAST_EMPTY_MS) {
         await sleep(TAIL_FALLBACK_DELAY_MS)
       }
     }
@@ -1645,7 +1810,7 @@ function createAppStore() {
     if (!tail || tail.turn_id !== turn.turn_id) {
       tail = {
         turn_id: turn.turn_id,
-        next_seq: 0,
+        last_seq: 0,
         parts: [],
         tool_rows: new Map(),
         stream: '',
@@ -1662,7 +1827,7 @@ function createAppStore() {
     }
     if (runningTails.has(tail)) return
     runningTails.add(tail)
-    void runTailLoop(pane, key, tail)
+    void runTailLoop(pane, key, tail).finally(() => runningTails.delete(tail!))
   }
 
   const refreshTranscripts = async () => {
@@ -1784,6 +1949,7 @@ function createAppStore() {
   const setDraftFor = (pane: LivePane, text: string) => {
     const key = paneKey(pane.workspace_id, pane.pane_id)
     setDrafts((prev) => ({ ...prev, [key]: text }))
+    scheduleComposerCacheWrite()
   }
 
   /// Prefills the pane's composer with an @-mention of a diff-card file plus
@@ -1851,6 +2017,7 @@ function createAppStore() {
       }
       if (uploaded.length > 0) {
         setDraftAttachments((prev) => ({ ...prev, [key]: [...(prev[key] ?? []), ...uploaded] }))
+        scheduleComposerCacheWrite()
       }
       if (failure) setNotice(failure)
     } finally {
@@ -1868,6 +2035,7 @@ function createAppStore() {
       ...prev,
       [key]: (prev[key] ?? []).filter((item) => item.path !== attachment.path),
     }))
+    scheduleComposerCacheWrite()
     void deleteChatImage(attachment).catch(() => {})
   }
 
@@ -1896,6 +2064,7 @@ function createAppStore() {
     const local_message_id = mintId('local-user-')
     setDraftFor(current, '')
     setDraftAttachments((prev) => ({ ...prev, [key]: [] }))
+    scheduleComposerCacheWrite()
     setTranscripts((prev) => ({
       ...prev,
       [key]: [
@@ -1919,6 +2088,7 @@ function createAppStore() {
       if (!draftFor(current)) setDraftFor(current, text)
       if (attachmentsFor(current).length === 0) {
         setDraftAttachments((prev) => ({ ...prev, [key]: images }))
+        scheduleComposerCacheWrite()
       }
     }
     try {
@@ -2324,8 +2494,8 @@ function createAppStore() {
     setComposerNonce((value) => value + 1)
   }
 
-  const newTerminal = async () => {
-    const ws = workspace()
+  const newTerminal = async (workspace_id?: string) => {
+    const ws = workspaces().find((item) => item.workspace_id === workspace_id) ?? workspace()
     if (!ws) return
     const session_id = mintId('web-sess-')
     const opened = await requestTerminalOpen(client.call.bind(client), ws, session_id)
@@ -2351,17 +2521,86 @@ function createAppStore() {
     setFocusedPaneId(stablePaneId('term', session_id))
   }
 
-  const closePane = async () => {
-    const pane = focusedPane()
-    const ws = workspace()
-    if (!pane || !ws) return
-    if (pane.kind === 'terminal' && pane.session_id) {
-      await client.call('session.kill', { id: pane.session_id })
-    }
-    await refreshProjection()
+  const callSucceeded = (response: RpcEnvelope, fallback: string): boolean => {
+    if (!(response.error || response.ok === false)) return true
+    setNotice(response.error?.message ?? fallback)
+    return false
   }
 
-  // Toggle zoom for a specific pane (header icon) or the focused pane (Alt+Z).
+  const upsertWorkspaceMetadata = async (current: Workspace, patch: Partial<Workspace>) => {
+    const metadata = { ...current, ...patch }
+    delete metadata.threads
+    delete metadata.messages
+    const client_id = await ensureClientId()
+    return client.call('workspace.upsert', {
+      mutation: {
+        request_key: `web:workspace.context:${current.workspace_id}:${mintId('')}`,
+        client_id,
+      },
+      workspace: metadata,
+    })
+  }
+
+  const upsertThreadMetadata = async (
+    current_workspace: Workspace,
+    pane: LivePane,
+    patch: Partial<Thread>,
+  ) => {
+    if (!pane.thread_id) return null
+    const got = await client.call('chat.thread.get', {
+      workspace_id: current_workspace.workspace_id,
+      local_thread_id: pane.thread_id,
+    })
+    if (got.error || got.ok === false) return got
+    const thread_root = unwrapResult<{ thread?: Thread } & Thread>(got)
+    const existing = thread_root?.thread ?? (thread_root as Thread | null)
+    if (!existing?.local_thread_id) return got
+    const thread = { ...existing, ...patch }
+    delete thread.messages
+    const client_id = await ensureClientId()
+    return client.call('chat.thread.upsert', {
+      mutation: {
+        request_key: `web:thread.context:${pane.thread_id}:${mintId('')}`,
+        client_id,
+      },
+      workspace_id: current_workspace.workspace_id,
+      thread,
+    })
+  }
+
+  /// Run a command which is implemented by the native desktop UI. The web
+  /// gateway automatically falls through to Live for methods the detached
+  /// daemon does not implement. Workspace and pane travel with palette.run so
+  /// Live applies the target before checking whether the command is enabled.
+  const runDesktopSidebarCommand = async (
+    current_workspace: Workspace,
+    command: string,
+    pane?: LivePane,
+  ): Promise<boolean> => {
+    const response = await client.call('palette.run', {
+      command,
+      workspace: current_workspace.workspace_id,
+      ...(pane?.native_pane_id != null ? { pane: pane.native_pane_id } : {}),
+    })
+    return callSucceeded(response, 'desktop command did not run')
+  }
+
+  const closePane = async (target?: LivePane) => {
+    const pane = target ?? focusedPane()
+    const ws = pane
+      ? workspaces().find((item) => item.workspace_id === pane.workspace_id)
+      : workspace()
+    if (!pane || !ws) return
+    const response = await requestPaneClose(client.call.bind(client), ws.workspace_id, pane)
+    if (!callSucceeded(response, 'could not close pane')) return
+    if (pane.kind === 'chat' && pane.thread_id) localThreadIds.delete(pane.thread_id)
+    if (maximizedPaneId() === pane.pane_id) setMaximizedPaneId(null)
+    // Sidebar actions may target a pane in the cross-workspace ACTIVE list.
+    await refreshProjection({ scope: 'full' })
+  }
+
+  // Toggle zoom for a specific pane (header/menu) or the focused pane
+  // (Alt+Z). Web zoom is local because this client renders its own strip.
   const maximizePane = async (target?: LivePane) => {
     const pane = target ?? focusedPane()
     if (!pane) return
@@ -2370,6 +2609,182 @@ function createAppStore() {
     const unzoom = maximizedPaneId() === pane.pane_id
     if (target) focusPane(target)
     setMaximizedPaneId(unzoom ? null : pane.pane_id)
+  }
+
+  const runSidebarContextAction = async (request: SidebarContextActionRequest) => {
+    const { action, workspace: current_workspace, pane, value } = request
+    setNotice(null)
+    try {
+      switch (action) {
+        case 'workspace-new-chat':
+          await newThread(current_workspace.workspace_id)
+          return
+        case 'workspace-open-codex-tui': {
+          const response = await client.call('agent.open', {
+            workspace: current_workspace.workspace_id,
+            provider: 'codex',
+          })
+          if (callSucceeded(response, 'could not open Codex TUI')) await refreshProjection({ scope: 'selected' })
+          return
+        }
+        case 'workspace-open-terminal':
+          await newTerminal(current_workspace.workspace_id)
+          return
+        case 'workspace-herdr-handoff': {
+          const response = await client.call('herdr.handoff', { workspace: current_workspace.workspace_id })
+          callSucceeded(response, 'Herdr handoff failed')
+          return
+        }
+        case 'workspace-herdr-handoff-remote': {
+          if (!value?.trim()) return
+          const response = await client.call('herdr.handoff', {
+            workspace: current_workspace.workspace_id,
+            remote: value.trim(),
+          })
+          callSucceeded(response, 'remote Herdr handoff failed')
+          return
+        }
+        case 'workspace-herdr-focus-terminal': {
+          const native_pane_id = current_workspace.herdr_link?.attach_pane_id
+          if (native_pane_id != null) {
+            const response = await client.call('pane.focus', {
+              workspace: current_workspace.workspace_id,
+              pane: native_pane_id,
+            })
+            callSucceeded(response, 'could not focus Herdr terminal')
+          } else {
+            await runDesktopSidebarCommand(current_workspace, 'workspace.herdr_focus_terminal')
+          }
+          return
+        }
+        case 'workspace-herdr-unlink': {
+          const response = await client.call('herdr.unlink', { workspace: current_workspace.workspace_id })
+          if (callSucceeded(response, 'could not unlink Herdr')) await refreshProjection()
+          return
+        }
+        case 'workspace-rename': {
+          const label = value?.trim()
+          if (!label) return
+          let response = await client.call('workspace.rename', {
+            workspace: current_workspace.workspace_id,
+            label,
+          })
+          if (methodUnavailable(response)) response = await upsertWorkspaceMetadata(current_workspace, { label })
+          if (callSucceeded(response, 'could not rename workspace')) {
+            setWorkspaces((prev) => prev.map((row) =>
+              row.workspace_id === current_workspace.workspace_id ? { ...row, label } : row,
+            ))
+            liveWorkspaces = null
+            await refreshProjection()
+          }
+          return
+        }
+        case 'workspace-import-codex':
+          await runDesktopSidebarCommand(current_workspace, 'thread.import_codex')
+          return
+        case 'workspace-import-opencode':
+          await runDesktopSidebarCommand(current_workspace, 'thread.import_opencode')
+          return
+        case 'workspace-import-claude':
+          await runDesktopSidebarCommand(current_workspace, 'thread.import_claude')
+          return
+        case 'workspace-close': {
+          let response = await client.call('workspace.close', { workspace: current_workspace.workspace_id })
+          if (methodUnavailable(response)) response = await upsertWorkspaceMetadata(current_workspace, { archived: true })
+          if (callSucceeded(response, 'could not close workspace')) {
+            pinnedWorkspaceId = null
+            liveWorkspaces = null
+            setWorkspaces((prev) => prev.filter((row) => row.workspace_id !== current_workspace.workspace_id))
+            await refreshProjection()
+          }
+          return
+        }
+        case 'thread-rename': {
+          const title = value?.trim()
+          if (!pane || !title) return
+          const response = await upsertThreadMetadata(current_workspace, pane, { title })
+          if (!response || !callSucceeded(response, 'could not rename chat')) return
+          setThreadsByWorkspace((prev) => ({
+            ...prev,
+            [current_workspace.workspace_id]: (prev[current_workspace.workspace_id] ?? []).map((thread) =>
+              thread.local_thread_id === pane.thread_id ? { ...thread, title } : thread,
+            ),
+          }))
+          publishPanes(workspaces())
+          await refreshProjection({ scope: 'selected' })
+          return
+        }
+        case 'thread-regenerate-title':
+          if (pane) await runDesktopSidebarCommand(current_workspace, 'thread.regenerate_title', pane)
+          return
+        case 'thread-sync':
+          if (pane) await runDesktopSidebarCommand(current_workspace, 'thread.sync_current', pane)
+          return
+        case 'thread-handoff':
+          if (pane) await runDesktopSidebarCommand(current_workspace, 'thread.handoff_current', pane)
+          return
+        case 'thread-open-tui':
+          if (pane) {
+            const command = pane.provider === 'codex'
+              ? 'thread.open_current_codex_tui'
+              : 'thread.open_current_tui'
+            await runDesktopSidebarCommand(current_workspace, command, pane)
+          }
+          return
+        case 'thread-open-chat':
+          setNotice('Open as chat is available from the linked TUI row in the desktop app.')
+          return
+        case 'thread-archive': {
+          if (!pane) return
+          if (pane.native_pane_id != null) {
+            const ran = await runDesktopSidebarCommand(current_workspace, 'thread.archive_current', pane)
+            if (ran) await refreshProjection()
+            return
+          }
+          const response = await upsertThreadMetadata(current_workspace, pane, { archived: true })
+          if (!response || !callSucceeded(response, 'could not archive thread')) return
+          setThreadsByWorkspace((prev) => ({
+            ...prev,
+            [current_workspace.workspace_id]: (prev[current_workspace.workspace_id] ?? []).filter(
+              (thread) => thread.local_thread_id !== pane.thread_id,
+            ),
+          }))
+          publishPanes(workspaces())
+          await refreshProjection({ scope: 'selected' })
+          return
+        }
+        case 'pane-zoom':
+          if (pane) await maximizePane(pane)
+          return
+        case 'pane-split-chat-right':
+        case 'pane-split-chat-down':
+        case 'pane-split-terminal-right':
+        case 'pane-split-terminal-down': {
+          if (pane?.native_pane_id == null) return
+          const kind = action === 'pane-split-chat-right' || action === 'pane-split-chat-down'
+            ? 'chat'
+            : 'terminal'
+          const axis = action === 'pane-split-chat-right' || action === 'pane-split-terminal-right'
+            ? 'vertical'
+            : 'horizontal'
+          const response = await client.call('pane.split', {
+            workspace: current_workspace.workspace_id,
+            pane: pane.native_pane_id,
+            kind,
+            axis,
+          })
+          if (callSucceeded(response, `could not split ${kind} pane`)) {
+            await refreshProjection({ scope: 'full' })
+          }
+          return
+        }
+        case 'pane-close':
+          if (pane) await closePane(pane)
+          return
+      }
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : 'sidebar action failed')
+    }
   }
 
   const selectPaneAt = (index: number, list: LivePane[] = openPanes()) => {
@@ -2473,7 +2888,7 @@ function createAppStore() {
         await newThread(workspace_id)
         break
       case 'new-terminal':
-        await newTerminal()
+        await newTerminal(workspace_id)
         break
       case 'toggle-sidebar':
         dispatchAction('toggle_sidebar')
@@ -2490,12 +2905,63 @@ function createAppStore() {
   }
 
   const start = () => {
-    client.onEvent(onEvent)
+    const removeClientListener = client.onEvent(onEvent)
     client.connect()
     const media = window.matchMedia('(max-width: 1023px)')
     const syncCompact = () => setCompact(media.matches)
     syncCompact()
     media.addEventListener('change', syncCompact)
+    let backgrounded = document.visibilityState === 'hidden'
+    let foregroundRecoveryRunning = false
+    const recoverForeground = () => {
+      if (document.visibilityState === 'hidden' || foregroundRecoveryRunning) return
+      foregroundRecoveryRunning = true
+      setConnected(false)
+      client.reconnect()
+      void refreshProjection({ scope: 'selected', enrich_chat_status: false })
+        .then(() => refreshTranscripts())
+        .catch(() => {})
+        .finally(() => {
+          setConnected(client.connected)
+          foregroundRecoveryRunning = false
+        })
+    }
+    const markBackgrounded = () => {
+      backgrounded = true
+      persistComposerState()
+    }
+    const resumeFromBackground = () => {
+      if (!backgrounded) return
+      backgrounded = false
+      recoverForeground()
+    }
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') markBackgrounded()
+      else resumeFromBackground()
+    }
+    const handleFreeze = () => {
+      markBackgrounded()
+      client.disconnect()
+      setConnected(false)
+    }
+    const handlePageHide = (event: PageTransitionEvent) => {
+      markBackgrounded()
+      // A page kept in the back/forward cache must release its live socket.
+      if (event.persisted) {
+        client.disconnect()
+        setConnected(false)
+      }
+    }
+    const handlePageShow = (event: PageTransitionEvent) => {
+      if (event.persisted) backgrounded = true
+      resumeFromBackground()
+    }
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    document.addEventListener('freeze', handleFreeze)
+    document.addEventListener('resume', resumeFromBackground)
+    window.addEventListener('pagehide', handlePageHide)
+    window.addEventListener('pageshow', handlePageShow)
+    window.addEventListener('online', recoverForeground)
     const tick = window.setInterval(() => setConnected(client.connected), 1000)
     const transcriptsTick = window.setInterval(() => {
       if (client.connected) void refreshTranscripts()
@@ -2518,10 +2984,18 @@ function createAppStore() {
         if (restoreLastChatOnStartup) void refreshProjection({ scope: 'selected' })
       })
     onCleanup(() => {
+      persistComposerState()
       window.clearInterval(tick)
       window.clearInterval(transcriptsTick)
       window.clearInterval(projectionTick)
       media.removeEventListener('change', syncCompact)
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+      document.removeEventListener('freeze', handleFreeze)
+      document.removeEventListener('resume', resumeFromBackground)
+      window.removeEventListener('pagehide', handlePageHide)
+      window.removeEventListener('pageshow', handlePageShow)
+      window.removeEventListener('online', recoverForeground)
+      removeClientListener()
       client.disconnect()
     })
   }
@@ -2578,6 +3052,7 @@ function createAppStore() {
     createWorkspace,
     providerModels,
     ensureProviderModels,
+    runSidebarContextAction,
     runCommand,
     handleKey,
     start,
