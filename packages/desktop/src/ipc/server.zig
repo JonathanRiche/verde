@@ -1612,6 +1612,27 @@ fn paletteCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value
     if (std.mem.eql(u8, command, "run")) {
         const command_id = stringParam(params, "command") orelse stringParam(params, "id") orelse
             return try errorResponseAlloc(allocator, id_value, "invalid_request", "palette.run requires command");
+        // Callers outside the desktop render loop can target a command
+        // atomically. Sending separate workspace.select / pane.focus requests
+        // through the web gateway can update the headless daemon instead of
+        // this Live state, leaving the palette command aimed at a stale pane.
+        const has_pane_target = params == .object and
+            (params.object.get("pane") != null or params.object.get("pane_id") != null);
+        if (has_pane_target) {
+            const target = resolvePaneTarget(state, params) orelse
+                return try errorResponseAlloc(allocator, id_value, "not_found", "palette target pane not found");
+            if (!state.selectProjectAtIndex(target.project_index))
+                return try errorResponseAlloc(allocator, id_value, "rejected", "palette target workspace could not be selected");
+            if (!state.focusWorkspacePane(target.project_index, target.pane_id))
+                return try errorResponseAlloc(allocator, id_value, "rejected", "palette target pane could not be focused");
+        } else if (params == .object and
+            (params.object.get("workspace_id") != null or params.object.get("workspace") != null or params.object.get("project") != null))
+        {
+            const project_index = resolveProjectIndex(state, params) orelse
+                return try errorResponseAlloc(allocator, id_value, "not_found", "palette target workspace not found");
+            if (!state.selectProjectAtIndex(project_index))
+                return try errorResponseAlloc(allocator, id_value, "rejected", "palette target workspace could not be selected");
+        }
         return switch (command_palette.runStaticCommandById(state, command_id)) {
             .ran => try okValueResponse(allocator, id_value, .{ .accepted = true, .command = command_id }),
             .not_found => try errorResponseAlloc(allocator, id_value, "not_found", "palette command not found"),

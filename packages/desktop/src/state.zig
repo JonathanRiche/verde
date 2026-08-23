@@ -6801,8 +6801,19 @@ pub const AppState = struct {
     /// requestOlderCurrentThreadMessages/pollTranscriptHydration instead so the
     /// DB read never blocks a frame; this remains the spawn-failure fallback.
     pub fn loadOlderCurrentThreadMessages(self: *AppState) !bool {
-        const project = self.currentProjectMutable();
-        const thread_index = project.currentThreadIndex();
+        const project_index = self.project_controller.selected_index;
+        if (project_index >= self.project_controller.projects.items.len) return error.ProjectNotFound;
+        const thread_index = self.project_controller.projects.items[project_index].currentThreadIndex();
+        return self.loadOlderThreadMessagesAt(project_index, thread_index);
+    }
+
+    /// Synchronously materialize one older durable transcript page for an
+    /// explicitly addressed thread. Non-render commands use this when their
+    /// required context may sit before the bounded in-memory transcript tail.
+    pub fn loadOlderThreadMessagesAt(self: *AppState, project_index: usize, thread_index: usize) !bool {
+        if (project_index >= self.project_controller.projects.items.len) return error.ProjectNotFound;
+        const project = &self.project_controller.projects.items[project_index];
+        if (thread_index >= project.threads.items.len) return error.ThreadNotFound;
         const thread = &project.threads.items[thread_index];
         const before_offset = thread.persisted_message_offset;
         if (before_offset == 0) return false;

@@ -3,8 +3,10 @@ import { describe, expect, test } from 'bun:test'
 import {
   chatPaneHasLiveTurn,
   findLastChatPane,
+  lastDeliveredTailSeq,
   mergeThreadCatalogSettings,
   panesForWorkspace,
+  requestPaneClose,
   requestTerminalOpen,
 } from './store.ts'
 
@@ -101,6 +103,23 @@ describe('chatPaneHasLiveTurn', () => {
   })
 })
 
+describe('lastDeliveredTailSeq', () => {
+  test('does not advance to the daemon next unused sequence', () => {
+    const response = {
+      events: [{ seq: 6 }],
+      page_last_seq: 6,
+      next_seq: 7,
+    }
+
+    expect(lastDeliveredTailSeq(5, response.events, response.page_last_seq)).toBe(6)
+  })
+
+  test('falls back to the greatest delivered event for older daemons', () => {
+    expect(lastDeliveredTailSeq(5, [{ seq: 6 }, { seq: 7 }])).toBe(7)
+    expect(lastDeliveredTailSeq(7, [])).toBe(7)
+  })
+})
+
 describe('panesForWorkspace', () => {
   test('keeps daemon thread settings ahead of a stale live pane', () => {
     const workspace = {
@@ -146,6 +165,38 @@ describe('panesForWorkspace', () => {
       reasoning_variant: 'max',
       fast_mode: true,
       send_pending: true,
+    })
+  })
+
+  test('projects an automatic title over a stale live placeholder', () => {
+    const workspace = {
+      workspace_id: 'workspace-1',
+      label: 'Workspace',
+      path: '/workspace',
+      threads: [
+        {
+          local_thread_id: 'thread-1',
+          title: 'Automatic Thread Title',
+          sort_index: 0,
+          provider: 'codex',
+        },
+      ],
+    }
+    const stale_live_layout = {
+      panes: [{ id: 7, kind: 'chat', thread: 0, title: 'New thread', provider: 'codex' }],
+    }
+
+    const [pane] = panesForWorkspace(
+      workspace,
+      [],
+      [],
+      new Set(['thread-1']),
+      stale_live_layout,
+    )
+
+    expect(pane).toMatchObject({
+      thread_id: 'thread-1',
+      thread_title: 'Automatic Thread Title',
     })
   })
 
@@ -263,5 +314,39 @@ describe('requestTerminalOpen', () => {
     expect(result.native).toBe(true)
     expect(result.response.error?.code).toBe('rejected')
     expect(calls).toHaveLength(1)
+  })
+})
+
+describe('requestPaneClose', () => {
+  test('closes a native pane by its desktop identity', async () => {
+    const calls = []
+    await requestPaneClose(async (method, params) => {
+      calls.push({ method, params })
+      return { id: 1, result: { panes: [] } }
+    }, 'workspace-1', { kind: 'chat', native_pane_id: 42 })
+
+    expect(calls).toEqual([
+      { method: 'pane.close', params: { workspace: 'workspace-1', pane: 42 } },
+    ])
+  })
+
+  test('falls back to killing a detached terminal session', async () => {
+    const calls = []
+    await requestPaneClose(async (method, params) => {
+      calls.push({ method, params })
+      return { id: 1, result: { stopped: true } }
+    }, 'workspace-1', { kind: 'terminal', session_id: 'session-1' })
+
+    expect(calls).toEqual([
+      { method: 'session.kill', params: { id: 'session-1' } },
+    ])
+  })
+
+  test('reports unavailable instead of archiving a detached chat', async () => {
+    const response = await requestPaneClose(async () => {
+      throw new Error('unexpected call')
+    }, 'workspace-1', { kind: 'chat' })
+
+    expect(response.error?.code).toBe('capability_unavailable')
   })
 })

@@ -43,6 +43,15 @@ export interface Thread {
   reasoning_variant?: string | null
   fast_mode?: string | null
   provider_thread_id?: string | null
+  tui_dock_id?: number | null
+}
+
+export interface HerdrWorkspaceLink {
+  remote_alias?: string | null
+  session_name?: string | null
+  workspace_id?: string | null
+  attach_dock_id?: number | null
+  attach_pane_id?: number | null
 }
 
 export interface Workspace {
@@ -61,6 +70,7 @@ export interface Workspace {
   messages?: Message[]
   pane_count?: number
   thread_count?: number
+  herdr_link?: HerdrWorkspaceLink | null
 }
 
 export interface LivePane {
@@ -87,6 +97,10 @@ export interface LivePane {
   attention?: boolean
   attention_reasons?: string[]
   dock_id?: number
+  /// Native Palette pane id when the desktop Live projection is available.
+  /// The web pane id remains stable across desktop restarts; commands which
+  /// target the running desktop use this native id instead.
+  native_pane_id?: number
   running?: boolean
   /// Desktop-surface work status for terminals: the agent inside the pane is
   /// actively working. Distinct from `running`, which only means the shell

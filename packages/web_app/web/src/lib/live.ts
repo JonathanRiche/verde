@@ -18,11 +18,27 @@ export class LiveClient {
     this.open()
   }
 
+  /// Replace a socket that may look open after a mobile page suspension but
+  /// no longer has a usable network connection.
+  reconnect(): void {
+    this.closed = false
+    this.clearReconnectTimer()
+    const socket = this.ws
+    this.ws = null
+    this.connected = false
+    this.resolvePendingAsClosed()
+    socket?.close()
+    this.open()
+  }
+
   disconnect(): void {
     this.closed = true
-    if (this.reconnectTimer !== null) window.clearTimeout(this.reconnectTimer)
-    this.ws?.close()
+    this.clearReconnectTimer()
+    const socket = this.ws
     this.ws = null
+    this.connected = false
+    this.resolvePendingAsClosed()
+    socket?.close()
   }
 
   onEvent(handler: EventHandler): () => void {
@@ -43,6 +59,9 @@ export class LiveClient {
   }
 
   private open(): void {
+    if (this.closed) return
+    if (this.ws?.readyState === WebSocket.OPEN || this.ws?.readyState === WebSocket.CONNECTING) return
+    this.clearReconnectTimer()
     const token = readToken()
     const proto = location.protocol === 'https:' ? 'wss' : 'ws'
     const query = token ? `?token=${encodeURIComponent(token)}` : ''
@@ -50,9 +69,11 @@ export class LiveClient {
     this.ws = socket
 
     socket.addEventListener('open', () => {
+      if (this.ws !== socket) return
       this.connected = true
     })
     socket.addEventListener('message', (event) => {
+      if (this.ws !== socket) return
       const parsed = parseEnvelope(String(event.data))
       if (!parsed) return
       if (parsed.method === 'core.hello') {
@@ -68,15 +89,33 @@ export class LiveClient {
       for (const listener of this.listeners) listener(parsed)
     })
     socket.addEventListener('close', () => {
+      if (this.ws !== socket) return
+      this.ws = null
       this.connected = false
-      for (const [id, waiter] of this.pending) {
-        this.pending.delete(id)
-        waiter.resolve({ id, error: { code: 'closed', message: 'socket closed' } })
-      }
-      if (!this.closed) {
-        this.reconnectTimer = window.setTimeout(() => this.open(), 1500)
-      }
+      this.resolvePendingAsClosed()
+      this.scheduleReconnect()
     })
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer === null) return
+    window.clearTimeout(this.reconnectTimer)
+    this.reconnectTimer = null
+  }
+
+  private resolvePendingAsClosed(): void {
+    for (const [id, waiter] of this.pending) {
+      this.pending.delete(id)
+      waiter.resolve({ id, error: { code: 'closed', message: 'socket closed' } })
+    }
+  }
+
+  private scheduleReconnect(): void {
+    if (this.closed || this.reconnectTimer !== null) return
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = null
+      this.open()
+    }, 1500)
   }
 }
 
