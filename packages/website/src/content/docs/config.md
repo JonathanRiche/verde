@@ -151,14 +151,19 @@ For another editor or workspace tool, use a custom action:
       "label": "Workbench",
       "action": "my-editor ."
     },
-    "links": "system_browser"
+    "links": "system_browser",
+    "chat_links": "verde_browser",
+    "terminal_links": "global"
   }
 }
 ```
 
 The custom command runs through the platform shell with the imported project
 as its working directory. `open.links` accepts `verde_browser` or
-`system_browser` and controls where links clicked in terminal output open.
+`system_browser` and sets the global destination for web links. `open.chat_links`
+and `open.terminal_links` optionally override it for GUI chat and terminal links;
+each accepts `global`, `verde_browser`, or `system_browser`. New installations
+default to `system_browser` when `open.links` is not configured.
 
 ## Chat titles
 

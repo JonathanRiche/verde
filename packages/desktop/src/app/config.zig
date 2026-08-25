@@ -149,6 +149,20 @@ pub const LinkOpenTarget = enum {
     system_browser,
 };
 
+pub const LinkOpenOverride = enum {
+    global,
+    verde_browser,
+    system_browser,
+
+    pub fn resolve(self: LinkOpenOverride, global: LinkOpenTarget) LinkOpenTarget {
+        return switch (self) {
+            .global => global,
+            .verde_browser => .verde_browser,
+            .system_browser => .system_browser,
+        };
+    }
+};
+
 pub const ToolCallGroupPreference = enum {
     collapsed,
     expanded,
@@ -246,7 +260,9 @@ pub const AppConfig = struct {
     active_theme: ?[]u8 = null,
     installed_themes: []InstalledTheme = &.{},
     default_open_action: DefaultOpenAction = .folder,
-    link_open_target: LinkOpenTarget = .verde_browser,
+    link_open_target: LinkOpenTarget = .system_browser,
+    chat_link_open_override: LinkOpenOverride = .global,
+    terminal_link_open_override: LinkOpenOverride = .global,
     browser_scroll_speed: f32 = DEFAULT_BROWSER_SCROLL_SPEED,
     file_links_in_neovim_pane: bool = false,
     terminal_launch_profiles: []TerminalLaunchProfileConfig = &.{},
@@ -614,6 +630,8 @@ fn writeOpenSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, c
         .system_browser => "system_browser",
     } };
     try open_object.put(allocator, "links", links_value);
+    try open_object.put(allocator, "chat_links", .{ .string = @tagName(config.chat_link_open_override) });
+    try open_object.put(allocator, "terminal_links", .{ .string = @tagName(config.terminal_link_open_override) });
     try open_object.put(allocator, "file_links_in_neovim_pane", .{ .bool = config.file_links_in_neovim_pane });
 }
 
@@ -1253,6 +1271,16 @@ fn applyOpenOverrides(allocator: std.mem.Allocator, config: *AppConfig, open_val
             config.link_open_target = target;
         }
     }
+    if (open_value.object.get("chat_links")) |links_value| {
+        if (parseLinkOpenOverride("open.chat_links", links_value)) |target| {
+            config.chat_link_open_override = target;
+        }
+    }
+    if (open_value.object.get("terminal_links")) |links_value| {
+        if (parseLinkOpenOverride("open.terminal_links", links_value)) |target| {
+            config.terminal_link_open_override = target;
+        }
+    }
     if (open_value.object.get("file_links_in_neovim_pane")) |pane_value| {
         if (pane_value == .bool) {
             config.file_links_in_neovim_pane = pane_value.bool;
@@ -1277,6 +1305,20 @@ fn parseLinkOpenTarget(value: std.json.Value) ?LinkOpenTarget {
         std.ascii.eqlIgnoreCase(trimmed, "default")) return .system_browser;
 
     log.warn("ignoring unsupported open.links value_len={d}", .{trimmed.len});
+    return null;
+}
+
+fn parseLinkOpenOverride(field_name: []const u8, value: std.json.Value) ?LinkOpenOverride {
+    if (value != .string) {
+        log.warn("{s} must be a string when provided", .{field_name});
+        return null;
+    }
+    const trimmed = std.mem.trim(u8, value.string, &std.ascii.whitespace);
+    if (std.ascii.eqlIgnoreCase(trimmed, "global") or std.ascii.eqlIgnoreCase(trimmed, "inherit")) return .global;
+    if (std.ascii.eqlIgnoreCase(trimmed, "verde_browser") or std.ascii.eqlIgnoreCase(trimmed, "verde") or std.ascii.eqlIgnoreCase(trimmed, "browser")) return .verde_browser;
+    if (std.ascii.eqlIgnoreCase(trimmed, "system_browser") or std.ascii.eqlIgnoreCase(trimmed, "system") or std.ascii.eqlIgnoreCase(trimmed, "default_browser") or std.ascii.eqlIgnoreCase(trimmed, "default")) return .system_browser;
+
+    log.warn("ignoring unsupported {s} value_len={d}", .{ field_name, trimmed.len });
     return null;
 }
 
@@ -1820,7 +1862,7 @@ test "app config accepts named open default" {
 }
 
 test "app config accepts link open target" {
-    var root = try parseTestRoot("{\"open\":{\"links\":\"system_browser\"}}");
+    var root = try parseTestRoot("{\"open\":{\"links\":\"system_browser\",\"chat_links\":\"verde_browser\",\"terminal_links\":\"global\"}}");
     defer root.deinit();
 
     var config: AppConfig = .{};
@@ -1828,6 +1870,21 @@ test "app config accepts link open target" {
     applyAppOverrides(std.testing.allocator, &config, root.value);
 
     try std.testing.expectEqual(LinkOpenTarget.system_browser, config.link_open_target);
+    try std.testing.expectEqual(LinkOpenOverride.verde_browser, config.chat_link_open_override);
+    try std.testing.expectEqual(LinkOpenOverride.global, config.terminal_link_open_override);
+}
+
+test "link overrides resolve against the global target" {
+    try std.testing.expectEqual(LinkOpenTarget.system_browser, LinkOpenOverride.global.resolve(.system_browser));
+    try std.testing.expectEqual(LinkOpenTarget.verde_browser, LinkOpenOverride.verde_browser.resolve(.system_browser));
+    try std.testing.expectEqual(LinkOpenTarget.system_browser, LinkOpenOverride.system_browser.resolve(.verde_browser));
+}
+
+test "web links default to the system browser" {
+    const config: AppConfig = .{};
+    try std.testing.expectEqual(LinkOpenTarget.system_browser, config.link_open_target);
+    try std.testing.expectEqual(LinkOpenTarget.system_browser, config.chat_link_open_override.resolve(config.link_open_target));
+    try std.testing.expectEqual(LinkOpenTarget.system_browser, config.terminal_link_open_override.resolve(config.link_open_target));
 }
 
 test "app config accepts browser scroll speed and legacy fast scrolling" {

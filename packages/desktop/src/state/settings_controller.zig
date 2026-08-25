@@ -78,7 +78,9 @@ pub const Draft = struct {
     theme_source: theme.ThemeSource = .omarchy,
     theme_choice: usize = 1,
     open_action: OpenAction = .folder,
-    link_open_target: app_config.LinkOpenTarget = .verde_browser,
+    link_open_target: app_config.LinkOpenTarget = .system_browser,
+    chat_link_open_override: app_config.LinkOpenOverride = .global,
+    terminal_link_open_override: app_config.LinkOpenOverride = .global,
     browser_scroll_speed: f32 = app_config.DEFAULT_BROWSER_SCROLL_SPEED,
     file_links_in_neovim_pane: bool = false,
     tool_call_group_preference: app_config.ToolCallGroupPreference = .collapsed,
@@ -307,6 +309,8 @@ pub fn syncSettingsDraftFromConfig(self: anytype) void {
         .theme_choice = self.app_config.themeChoiceIndex(),
         .open_action = settingsOpenActionFromConfig(self.app_config.default_open_action),
         .link_open_target = self.app_config.link_open_target,
+        .chat_link_open_override = self.app_config.chat_link_open_override,
+        .terminal_link_open_override = self.app_config.terminal_link_open_override,
         .browser_scroll_speed = self.app_config.browser_scroll_speed,
         .file_links_in_neovim_pane = self.app_config.file_links_in_neovim_pane,
         .tool_call_group_preference = self.app_config.tool_call_group_preference,
@@ -357,6 +361,8 @@ pub fn isSettingsDraftDirty(self: anytype) bool {
     if (isCompanionCharacterDraftDirty(&self.settings_controller, &self.app_config)) return true;
     if (draft.theme_choice != self.app_config.themeChoiceIndex()) return true;
     if (draft.link_open_target != self.app_config.link_open_target) return true;
+    if (draft.chat_link_open_override != self.app_config.chat_link_open_override) return true;
+    if (draft.terminal_link_open_override != self.app_config.terminal_link_open_override) return true;
     if (draft.browser_scroll_speed != self.app_config.browser_scroll_speed) return true;
     if (draft.file_links_in_neovim_pane != self.app_config.file_links_in_neovim_pane) return true;
     if (draft.tool_call_group_preference != self.app_config.tool_call_group_preference) return true;
@@ -514,6 +520,8 @@ pub fn saveSettingsModal(self: anytype) !void {
         self.app_config.workspace_scroll_threshold = workspace_scroll_threshold;
     }
     self.app_config.link_open_target = self.settings_controller.draft.link_open_target;
+    self.app_config.chat_link_open_override = self.settings_controller.draft.chat_link_open_override;
+    self.app_config.terminal_link_open_override = self.settings_controller.draft.terminal_link_open_override;
     self.app_config.browser_scroll_speed = theme.clampf(self.settings_controller.draft.browser_scroll_speed, app_config.MIN_BROWSER_SCROLL_SPEED, app_config.MAX_BROWSER_SCROLL_SPEED);
     self.app_config.file_links_in_neovim_pane = self.settings_controller.draft.file_links_in_neovim_pane;
     self.app_config.tool_call_group_preference = self.settings_controller.draft.tool_call_group_preference;

@@ -1364,7 +1364,7 @@ pub fn handleTranscriptPaletteMouseButton(state: *app_state.AppState, x: f32, y:
             if (webHref(link_hit.href)) |web_href| {
                 state.blurPaletteComposer();
                 state.clearTranscriptMarkdownSelection();
-                state.openConfiguredWebLink(web_href);
+                state.openConfiguredChatWebLink(web_href);
                 return true;
             }
         }
