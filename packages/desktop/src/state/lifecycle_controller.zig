@@ -488,6 +488,11 @@ pub fn pollFlushWorker(self: anytype) void {
     const now = platform_runtime.unixTimestampMs();
     if (success) {
         self.storage.clearPendingStateSpoolBestEffort();
+        acknowledgeDraftMutations(
+            self,
+            self.lifecycle.flush_snapshot_generation,
+            acknowledged_revision,
+        );
         self.lifecycle.clearDirtyForGeneration(self.lifecycle.flush_snapshot_generation);
         self.lifecycle.next_flush_attempt_ms = 0;
         clearCloseDurabilityNoticeAfterSuccess(self);
@@ -535,6 +540,12 @@ fn noteCompletedSpool(state: *State, captured_generation: u64) void {
     if (state.dirty_generation == captured_generation) state.dirty_spooled = true;
     state.clearPersistenceFailure();
     state.next_flush_attempt_ms = 0;
+}
+
+fn acknowledgeDraftMutations(self: anytype, generation: u64, revision: u64) void {
+    if (comptime @hasDecl(std.meta.Child(@TypeOf(self)), "acknowledgeDraftMutations")) {
+        self.acknowledgeDraftMutations(generation, revision);
+    }
 }
 
 /// Blocking flush for shutdown and latency-sensitive pre-turn durability.
@@ -641,6 +652,7 @@ fn flushDirtyBlockingResult(self: anytype) !void {
         else
             null;
         self.storage.clearPendingStateSpoolBestEffort();
+        acknowledgeDraftMutations(self, self.lifecycle.dirty_generation, acknowledged_revision);
         self.lifecycle.clearDirty();
         self.lifecycle.next_flush_attempt_ms = 0;
         clearCloseDurabilityNoticeAfterSuccess(self);

@@ -207,6 +207,13 @@ pub const ChatThread = struct {
     draft_image: ?ChatImageAttachment = null,
     draft_extra_images: std.ArrayList(ChatImageAttachment),
     draft_storage: [DRAFT_CAPACITY:0]u8,
+    /// UI-only persistence generation of the newest local composer mutation.
+    /// Kept until a covering snapshot is acknowledged so delayed projections
+    /// cannot resurrect an empty -> text -> empty draft transition.
+    draft_mutation_generation: u64 = 0,
+    /// Store revision that durably acknowledged `draft_mutation_generation`.
+    /// Zero means the mutation has not reached durable state yet.
+    draft_mutation_ack_revision: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, title: []const u8) !ChatThread {
         const send_state = try allocator.create(SendState);

@@ -1261,6 +1261,8 @@ fn transferProjectionThreadRuntime(current: *ChatThread, replacement: *ChatThrea
         std.mem.swap(@TypeOf(current.send_state), &current.send_state, &replacement.send_state);
         std.mem.swap(@TypeOf(current.pending_transcript_body), &current.pending_transcript_body, &replacement.pending_transcript_body);
     }
+    replacement.draft_mutation_generation = current.draft_mutation_generation;
+    replacement.draft_mutation_ack_revision = current.draft_mutation_ack_revision;
     // Title generation is GUI-owned and is never reconstructed from a daemon
     // projection, so its worker/result state always follows the stable thread.
     std.mem.swap(@TypeOf(current.title_generation_state), &current.title_generation_state, &replacement.title_generation_state);
@@ -1472,9 +1474,9 @@ fn preserveLiveWorkspacePresentationInPersisted(
     if (any_patched) persisted.projects = projects;
 }
 
-/// Find a thread's draft-attachment baseline inside the last applied
+/// Find a thread's composer baseline inside the last applied
 /// projection snapshot, or null when the baseline does not know the thread.
-fn baselineThreadForAttachments(
+fn baselineThreadForComposer(
     baseline: ?*const PersistedState,
     project_id: []const u8,
     thread_id: []const u8,
@@ -1493,21 +1495,19 @@ fn baselineThreadForAttachments(
     return null;
 }
 
-/// Carry live composer attachments into a refresh snapshot by identity.
+/// Carry unacknowledged live composer mutations into a refresh snapshot by identity.
 ///
-/// Draft attachments merge by recency, not flush ordering: an image attached
-/// moments before `dirty` cleared must survive a refresh whose snapshot was
-/// captured before the flush landed. The dirty-gated local-edit merge misses
-/// exactly that window, so this runs on every refresh and keeps the live
-/// values whenever they differ from the last applied baseline — a genuine
-/// local edit the snapshot cannot know about yet. When live matches the
-/// baseline the snapshot applies untouched, so an explicit remote clear (or
-/// change) from another client stays authoritative. Runs before the baseline
-/// clone (same rationale as the presentation patch above).
-fn overlayLiveDraftAttachmentsInPersisted(
+/// A value-only three-way merge cannot distinguish an untouched empty draft
+/// from empty -> text -> empty between snapshots. Keep every locally mutated
+/// composer authoritative until a snapshot covering its mutation generation
+/// is acknowledged. The attachment baseline comparison remains as a legacy
+/// safety net for direct attachment mutations that predate generation marking.
+/// Runs before the baseline clone (same rationale as the presentation patch above).
+fn overlayLiveComposerMutationsInPersisted(
     arena: std.mem.Allocator,
     controller: *project_controller.State,
     baseline: ?*const PersistedState,
+    projection_revision: u64,
     persisted: *PersistedState,
 ) !void {
     if (persisted.projects.len == 0) return;
@@ -1524,6 +1524,12 @@ fn overlayLiveDraftAttachmentsInPersisted(
         for (threads) |*thread| {
             const thread_id = thread.local_thread_id orelse continue;
             const live_thread = threadByIdForViewport(live_project, thread_id) orelse continue;
+            const draft_mutated = live_thread.draft_mutation_generation != 0;
+            const mutation_acknowledged = draft_mutated and
+                live_thread.draft_mutation_ack_revision != 0 and
+                projection_revision >= live_thread.draft_mutation_ack_revision;
+            const mutation_pending = draft_mutated and !mutation_acknowledged;
+            const draft_differs = !std.mem.eql(u8, thread.draft, live_thread.currentDraft());
             const live_primary: ?db_types.PersistedImageAttachment = if (live_thread.draft_image) |image| .{
                 .path = try arena.dupe(u8, image.path),
                 .mime = try arena.dupe(u8, image.mime),
@@ -1543,24 +1549,31 @@ fn overlayLiveDraftAttachmentsInPersisted(
                     };
                 }
             }
-            if (optionalImageEqual(thread.draft_image, live_primary) and
-                imageListEqual(thread.draft_extra_images, live_extras))
-            {
-                continue;
-            }
+            const images_differ = !optionalImageEqual(thread.draft_image, live_primary) or
+                !imageListEqual(thread.draft_extra_images, live_extras);
+            if (!draft_differs and !images_differ) continue;
+            // Once a refresh reaches the revision that acknowledged this
+            // mutation, its composer is authoritative (including a later
+            // change from another client).
+            if (mutation_acknowledged) continue;
             // Live equal to the baseline means no local edit since the last
             // applied refresh: the snapshot's differing value is a legitimate
             // remote change (or clear) and must win. A missing baseline is
             // conservative — never drop an attachment through a bootstrap.
-            if (baselineThreadForAttachments(baseline, project_id, thread_id)) |base_thread| {
-                if (optionalImageEqual(base_thread.draft_image, live_primary) and
-                    imageListEqual(base_thread.draft_extra_images, live_extras))
-                {
-                    continue;
+            if (!mutation_pending) {
+                if (baselineThreadForComposer(baseline, project_id, thread_id)) |base_thread| {
+                    if (optionalImageEqual(base_thread.draft_image, live_primary) and
+                        imageListEqual(base_thread.draft_extra_images, live_extras))
+                    {
+                        continue;
+                    }
                 }
             }
-            thread.draft_image = live_primary;
-            thread.draft_extra_images = live_extras;
+            if (mutation_pending) thread.draft = try arena.dupe(u8, live_thread.currentDraft());
+            if (mutation_pending or images_differ) {
+                thread.draft_image = live_primary;
+                thread.draft_extra_images = live_extras;
+            }
             thread_patched = true;
         }
         if (!thread_patched) continue;
@@ -1568,6 +1581,130 @@ fn overlayLiveDraftAttachmentsInPersisted(
         any_patched = true;
     }
     if (any_patched) persisted.projects = projects;
+}
+
+fn acknowledgeDraftMutationsInProjects(projects: []Project, generation: u64, revision: u64) void {
+    for (projects) |*project| {
+        for (project.threads.items) |*thread| {
+            if (thread.draft_mutation_generation != 0 and thread.draft_mutation_generation <= generation) {
+                thread.draft_mutation_ack_revision = revision;
+            }
+        }
+        for (project.archived_threads.items) |*thread| {
+            if (thread.draft_mutation_generation != 0 and thread.draft_mutation_generation <= generation) {
+                thread.draft_mutation_ack_revision = revision;
+            }
+        }
+    }
+}
+
+fn clearProjectedDraftMutationsInProjects(projects: []Project, projection_revision: u64) void {
+    for (projects) |*project| {
+        for (project.threads.items) |*thread| {
+            if (thread.draft_mutation_ack_revision != 0 and
+                thread.draft_mutation_ack_revision <= projection_revision)
+            {
+                thread.draft_mutation_generation = 0;
+                thread.draft_mutation_ack_revision = 0;
+            }
+        }
+        for (project.archived_threads.items) |*thread| {
+            if (thread.draft_mutation_ack_revision != 0 and
+                thread.draft_mutation_ack_revision <= projection_revision)
+            {
+                thread.draft_mutation_generation = 0;
+                thread.draft_mutation_ack_revision = 0;
+            }
+        }
+    }
+}
+
+test "existing-thread draft clear survives a stale projection until acknowledged" {
+    const allocator = std.testing.allocator;
+    var controller: project_controller.State = .{};
+    defer {
+        for (controller.projects.items) |*project| project.deinit(allocator);
+        controller.projects.deinit(allocator);
+    }
+
+    var project = try project_state.Project.init(allocator, "draft-aba", "Draft ABA", "/tmp/draft-aba", 0);
+    controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    const live_thread = &controller.projects.items[0].threads.items[0];
+    live_thread.clearDraft();
+    live_thread.draft_mutation_generation = 7;
+
+    const baseline_threads = [_]PersistedThread{.{
+        .title = "Existing thread",
+        .local_thread_id = live_thread.local_thread_id,
+        .draft = "",
+    }};
+    const stale_threads = [_]PersistedThread{.{
+        .title = "Existing thread",
+        .local_thread_id = live_thread.local_thread_id,
+        .draft = "queued follow-up",
+    }};
+    const baseline_projects = [_]PersistedProject{.{
+        .id = controller.projects.items[0].id,
+        .label = "Draft ABA",
+        .path = "/tmp/draft-aba",
+        .threads = &baseline_threads,
+    }};
+    const stale_projects = [_]PersistedProject{.{
+        .id = controller.projects.items[0].id,
+        .label = "Draft ABA",
+        .path = "/tmp/draft-aba",
+        .threads = &stale_threads,
+    }};
+    const baseline: PersistedState = .{ .projects = &baseline_projects };
+    var stale: PersistedState = .{ .projects = &stale_projects };
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    try overlayLiveComposerMutationsInPersisted(arena.allocator(), &controller, &baseline, 20, &stale);
+    try std.testing.expectEqualStrings("", stale.projects[0].threads.?[0].draft);
+
+    acknowledgeDraftMutationsInProjects(controller.projects.items, 6, 21);
+    try std.testing.expectEqual(@as(u64, 7), live_thread.draft_mutation_generation);
+    try std.testing.expectEqual(@as(u64, 0), live_thread.draft_mutation_ack_revision);
+    acknowledgeDraftMutationsInProjects(controller.projects.items, 7, 21);
+    try std.testing.expectEqual(@as(u64, 21), live_thread.draft_mutation_ack_revision);
+
+    // A refresh already fetched before the successful save is still stale.
+    const stale_after_ack_threads = [_]PersistedThread{.{
+        .title = "Existing thread",
+        .local_thread_id = live_thread.local_thread_id,
+        .draft = "queued follow-up",
+    }};
+    const stale_after_ack_projects = [_]PersistedProject{.{
+        .id = controller.projects.items[0].id,
+        .label = "Draft ABA",
+        .path = "/tmp/draft-aba",
+        .threads = &stale_after_ack_threads,
+    }};
+    var stale_after_ack: PersistedState = .{ .projects = &stale_after_ack_projects };
+    try overlayLiveComposerMutationsInPersisted(arena.allocator(), &controller, &baseline, 20, &stale_after_ack);
+    try std.testing.expectEqualStrings("", stale_after_ack.projects[0].threads.?[0].draft);
+
+    const remote_threads = [_]PersistedThread{.{
+        .title = "Existing thread",
+        .local_thread_id = live_thread.local_thread_id,
+        .draft = "remote draft",
+    }};
+    const remote_projects = [_]PersistedProject{.{
+        .id = controller.projects.items[0].id,
+        .label = "Draft ABA",
+        .path = "/tmp/draft-aba",
+        .threads = &remote_threads,
+    }};
+    var remote: PersistedState = .{ .projects = &remote_projects };
+    try overlayLiveComposerMutationsInPersisted(arena.allocator(), &controller, &baseline, 21, &remote);
+    try std.testing.expectEqualStrings("remote draft", remote.projects[0].threads.?[0].draft);
+    clearProjectedDraftMutationsInProjects(controller.projects.items, 21);
+    try std.testing.expectEqual(@as(u64, 0), live_thread.draft_mutation_generation);
+    try std.testing.expectEqual(@as(u64, 0), live_thread.draft_mutation_ack_revision);
 }
 
 test "daemon projection replacement preserves live runtime by identity" {
@@ -1616,6 +1753,8 @@ test "daemon projection replacement preserves live runtime by identity" {
     });
     current_thread.send_state.status = .pending;
     current_thread.send_state.daemon_owned = true;
+    current_thread.draft_mutation_generation = 9;
+    current_thread.draft_mutation_ack_revision = 14;
     try current_thread.send_state.partial_text.appendSlice(std.heap.page_allocator, "stable stream");
     const live_send_state = current_thread.send_state;
     const live_title_state = current_thread.title_generation_state;
@@ -1684,6 +1823,8 @@ test "daemon projection replacement preserves live runtime by identity" {
     try std.testing.expectEqual(live_send_state, next_thread.send_state);
     try std.testing.expectEqual(replacement_send_state, current.projects.items[0].threads.items[0].send_state);
     try std.testing.expectEqualStrings("stable stream", next_thread.send_state.partial_text.items);
+    try std.testing.expectEqual(@as(u64, 9), next_thread.draft_mutation_generation);
+    try std.testing.expectEqual(@as(u64, 14), next_thread.draft_mutation_ack_revision);
     try std.testing.expectEqual(live_title_state, next_thread.title_generation_state);
     try std.testing.expectEqual(@as(usize, 1), next_thread.transcript_layout_items.items.len);
     try std.testing.expectEqual(@as(f32, 960.0), next_thread.transcript_layout_width);
@@ -5915,7 +6056,7 @@ pub const AppState = struct {
         };
         runtime_log.diagnostic("clipboard image attached mime={s} bytes={d}", .{ image.mime, image.bytes.len });
         self.setSidebarNotice("Clipboard image attached.");
-        self.markDirty();
+        self.noteThreadDraftMutation(thread);
         return true;
     }
 
@@ -6049,7 +6190,7 @@ pub const AppState = struct {
             }
         }
         thread.clearDraftImageAt(self.allocator, index);
-        self.markDirty();
+        self.noteThreadDraftMutation(thread);
     }
 
     fn replaceThreadWithImportedSnapshot(
@@ -6100,6 +6241,8 @@ pub const AppState = struct {
                 null;
             hydrated.fast_mode = existing.fast_mode;
             hydrated.access_mode = existing.access_mode;
+            hydrated.draft_mutation_generation = existing.draft_mutation_generation;
+            hydrated.draft_mutation_ack_revision = existing.draft_mutation_ack_revision;
 
             if (hydrated.model_ref) |model_ref| {
                 self.allocator.free(model_ref);
@@ -10268,13 +10411,26 @@ pub const AppState = struct {
     }
 
     pub fn setDraft(self: *AppState, value: []const u8) void {
-        self.currentProjectMutable().setDraft(value);
-        self.markDirty();
+        const thread = self.currentThreadMutable();
+        thread.setDraft(value);
+        self.noteThreadDraftMutation(thread);
     }
 
     pub fn clearDraft(self: *AppState) void {
-        self.currentProjectMutable().clearDraft();
+        const thread = self.currentThreadMutable();
+        thread.clearDraft();
+        self.noteThreadDraftMutation(thread);
+    }
+
+    pub fn noteThreadDraftMutation(self: *AppState, thread: *ChatThread) void {
         self.markDirty();
+        thread.draft_mutation_generation = self.lifecycle.dirty_generation;
+        thread.draft_mutation_ack_revision = 0;
+    }
+
+    pub fn acknowledgeDraftMutations(self: *AppState, generation: u64, revision: u64) void {
+        acknowledgeDraftMutationsInProjects(self.project_controller.projects.items, generation, revision);
+        acknowledgeDraftMutationsInProjects(self.project_controller.archived_projects.items, generation, revision);
     }
 
     pub fn resetComposerInputWidget(self: *AppState) void {
@@ -10738,16 +10894,17 @@ pub const AppState = struct {
             &self.project_controller,
             &persisted,
         );
-        // Attachment recency merge reads the last applied baseline only when
+        // Composer recency merge reads the last applied baseline only when
         // it is revision-paired; a stale baseline conservatively keeps live.
         const attachment_baseline: ?*const PersistedState = if (self.lifecycle.projection_baseline) |*last_applied| blk: {
             if (self.lifecycle.projection_baseline_revision == observed_revision) break :blk &last_applied.value;
             break :blk null;
         } else null;
-        try overlayLiveDraftAttachmentsInPersisted(
+        try overlayLiveComposerMutationsInPersisted(
             conversion_arena.allocator(),
             &self.project_controller,
             attachment_baseline,
+            result.store_revision,
             &persisted,
         );
         var next_baseline = try self.clonePersistedBaseline(self.allocator, persisted);
@@ -10825,6 +10982,8 @@ pub const AppState = struct {
         self.terminal_controller.daemon_sessions = staged_sessions;
         staged_owned = false;
         sessions_owned = false;
+        clearProjectedDraftMutationsInProjects(self.project_controller.projects.items, result.store_revision);
+        clearProjectedDraftMutationsInProjects(self.project_controller.archived_projects.items, result.store_revision);
 
         var deinit_projects = old_projects;
         var deinit_surfaces = old_surfaces;

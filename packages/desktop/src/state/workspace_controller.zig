@@ -493,7 +493,7 @@ pub fn setWorkspaceChatPaneDraftForProject(self: anytype, project_index: usize, 
         self.terminal_controller.focused = false;
         self.syncPaletteComposerFromDraft();
     }
-    self.markDirty();
+    self.noteThreadDraftMutation(thread);
     return true;
 }
 

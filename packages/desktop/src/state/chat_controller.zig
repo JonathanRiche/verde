@@ -2228,15 +2228,23 @@ pub const AcceptanceDispatch = struct {
     }
 };
 
+fn markThreadDraftMutation(self: anytype, thread: *ChatThread) void {
+    self.markDirty();
+    if (comptime @hasField(std.meta.Child(@TypeOf(self)), "lifecycle")) {
+        thread.draft_mutation_generation = self.lifecycle.dirty_generation;
+        thread.draft_mutation_ack_revision = 0;
+    }
+}
+
 fn clearComposerForAcceptance(self: anytype, thread: *ChatThread, dispatch: *AcceptanceDispatch, selected: bool) void {
     dispatch.takeSubmittedComposer(thread);
-    self.markDirty();
+    markThreadDraftMutation(self, thread);
     if (selected) self.resetComposerInputWidget();
 }
 
 fn restoreComposerAfterRejectedAcceptance(self: anytype, thread: *ChatThread, dispatch: *AcceptanceDispatch, selected: bool) void {
     if (!dispatch.restoreSubmittedComposer(thread)) return;
-    self.markDirty();
+    markThreadDraftMutation(self, thread);
     if (selected) self.resetComposerInputWidget();
 }
 
