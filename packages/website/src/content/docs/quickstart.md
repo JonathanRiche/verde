@@ -123,7 +123,8 @@ workspace override to **Automatic**, **Always**, or **Disabled** directly from
 the command palette. **Use Global Default** clears that override. The palette
 also provides **Previous Pane** and **Next Pane** actions.
 
-- `Ctrl+H / J / K / L` — move focus across panes, vim-style (`Ctrl+Arrow` also works)
+- `Ctrl+Arrow` — move focus across panes
+- Optional: bind `workspace.focus_left/down/up/right` to `Ctrl+H/J/K/L` in `verde.json`
 - Horizontal touchpad/wheel, or `Ctrl`+vertical wheel in vertical mode — pan the scrolling pane strip
 - Drag a scrolling pane's trailing edge — set a persistent custom column width
 - `Ctrl+Shift+H / J / K / L` — swap the focused pane with its neighbor (rearrange the tiling)

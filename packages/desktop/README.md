@@ -77,7 +77,8 @@ The desktop shell includes embedded terminal panes powered by Ghostty's `libghos
 
 - Open the command palette with `Ctrl+Shift+P` to search threads, jump to panes, switch workspaces, or run an app command.
 - Create a terminal pane with `CommandOrControl+Shift+T`.
-- Move between workspace panes with `Alt+Arrow` or `Ctrl+H/J/K/L`; `Ctrl+Left/Right` also moves across columns.
+- Move between workspace panes with `Ctrl+Arrow`.
+- Vim-style `Ctrl+H/J/K/L` focus remains available through `keybinds.workspace.focus_*` overrides in `verde.json`.
 - With two or more tiled panes, use horizontal touchpad/wheel gestures for a horizontal strip, or `Ctrl`+vertical wheel for a vertical strip; each axis persists per workspace.
 - It starts in the selected project's directory.
 - `Ctrl+-` and `Ctrl+=` adjust only the terminal font scale while the terminal is focused.
@@ -119,6 +120,7 @@ Config supports UI and terminal font size, scrolling-pane activation and spacing
     "font_size": 20,
     "workspace_pane_gap": 12,
     "workspace_panes_per_view": 2,
+    "workspace_split_default_pane": "chat",
     "workspace_scroll_direction": "horizontal",
     "workspace_scroll_mode": "automatic",
     "workspace_scroll_threshold": 2
@@ -174,6 +176,8 @@ Config supports UI and terminal font size, scrolling-pane activation and spacing
 ```
 
 Keybind values can be a string, a string array, `null`, an empty string, or an empty array. `null` and empty values disable that binding.
+
+`keybinds.prefix` enables an optional tmux-style prefix mode (off by default). `"prefix": true` arms `Ctrl+B` with a default table that covers every built-in command; `"prefix": "Ctrl+A"` changes the chord; the object form (`enabled`, `key`, `defaults`, `bindings`) lets you bind any action name or a `{ "command": "..." }` shell script to `prefix + key`. While armed, a status bar shows the escape hatches and `?` opens the full cheat sheet. See the website keybinds docs for the full table.
 The nested `chat` bindings only run while a GUI chat pane is focused; they do not intercept input in terminal or browser panes. The model picker includes initial provider selection on a fresh thread.
 
 `open.default` accepts `folder`, `editor`, `cursor`, `vscode`, `zed`, or a custom shell action:

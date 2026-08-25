@@ -71,6 +71,62 @@ pub const NativeChatAction = enum {
     run_config,
 };
 
+/// What a prefix chord resolves to. Mirrors every dispatch surface the direct
+/// keybind tables reach so `prefix + key` can trigger any built-in command,
+/// plus user-authored shell scripts.
+pub const PrefixTarget = union(enum) {
+    app: NativeKeyboardAction,
+    terminal: NativeTerminalAction,
+    chat: NativeChatAction,
+    focus_prompt,
+    /// Opens the keybind cheat sheet and keeps the prefix armed.
+    show_keybinds,
+    /// Opens the workspace action menu (herdr `prefix w`).
+    navigate,
+    split_default_vertical,
+    split_default_horizontal,
+    split_alternate_vertical,
+    split_alternate_horizontal,
+    workspace_select: usize,
+    pane_select: usize,
+    active_select: usize,
+    /// Owned shell script, run through `sh -lc` in the current project.
+    command: []u8,
+
+    fn deinit(self: PrefixTarget, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .command => |script| allocator.free(script),
+            else => {},
+        }
+    }
+};
+
+pub const PrefixBinding = struct {
+    key: Keybind,
+    target: PrefixTarget,
+};
+
+pub const DEFAULT_PREFIX_ACCELERATOR = "Ctrl+B";
+
+/// tmux-style prefix mode. Pressing any `keys` chord arms the next keypress,
+/// which then resolves against `bindings` instead of the direct tables.
+/// Disabled by default so existing direct shortcuts keep working unchanged.
+pub const PrefixConfig = struct {
+    enabled: bool = false,
+    keys: []Keybind,
+    bindings: std.ArrayList(PrefixBinding),
+    /// Second table used while navigate mode is active.
+    navigate: std.ArrayList(PrefixBinding),
+
+    pub fn deinit(self: *PrefixConfig, allocator: std.mem.Allocator) void {
+        allocator.free(self.keys);
+        for (self.bindings.items) |binding| binding.target.deinit(allocator);
+        self.bindings.deinit(allocator);
+        for (self.navigate.items) |binding| binding.target.deinit(allocator);
+        self.navigate.deinit(allocator);
+    }
+};
+
 pub const Keybind = struct {
     alt: bool = false,
     ctrl: bool = false,
@@ -186,6 +242,7 @@ pub const NativeKeyboardConfig = struct {
     workspace_grow_up: []Keybind,
     workspace_grow_down: []Keybind,
     workspace_select: []Keybind,
+    prefix: PrefixConfig,
 
     pub fn load(allocator: std.mem.Allocator) !NativeKeyboardConfig {
         var config: NativeKeyboardConfig = .{
@@ -249,6 +306,7 @@ pub const NativeKeyboardConfig = struct {
             .workspace_grow_up = try cloneDefaultWorkspaceGrowUpKeybinds(allocator),
             .workspace_grow_down = try cloneDefaultWorkspaceGrowDownKeybinds(allocator),
             .workspace_select = try cloneDefaultWorkspaceSelectKeybinds(allocator),
+            .prefix = try cloneDefaultPrefixConfig(allocator),
         };
 
         var parsed = shared_config.readRootValue(allocator) catch |err| {
@@ -323,6 +381,7 @@ pub const NativeKeyboardConfig = struct {
         self.allocator.free(self.workspace_grow_up);
         self.allocator.free(self.workspace_grow_down);
         self.allocator.free(self.workspace_select);
+        self.prefix.deinit(self.allocator);
     }
 
     pub fn actionForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) ?NativeKeyboardAction {
@@ -447,6 +506,32 @@ pub const NativeKeyboardConfig = struct {
             return .workspace_grow_down;
         }
 
+        return null;
+    }
+
+    /// True when prefix mode is enabled and this key-down is the arming chord.
+    pub fn isPrefixKeyEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) bool {
+        return self.prefix.enabled and matchesAny(self.prefix.keys, event);
+    }
+
+    /// Resolves the keypress that follows an armed prefix chord.
+    pub fn prefixTargetForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) ?PrefixTarget {
+        return targetInTable(self.prefix.bindings.items, event);
+    }
+
+    /// Resolves a keypress while navigate mode is active. Repeats are allowed
+    /// so holding an arrow walks workspaces like herdr.
+    pub fn navigateTargetForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) ?PrefixTarget {
+        for (self.prefix.navigate.items) |binding| {
+            if (binding.key.matchesAllowRepeat(event)) return binding.target;
+        }
+        return null;
+    }
+
+    fn targetInTable(table: []const PrefixBinding, event: *const sdl.KeyboardEvent) ?PrefixTarget {
+        for (table) |binding| {
+            if (binding.key.matches(event)) return binding.target;
+        }
         return null;
     }
 
@@ -625,6 +710,9 @@ pub const NativeKeyboardConfig = struct {
         }
         if (keybinds_value.object.get("workspace")) |workspace_value| {
             self.applyWorkspaceOverrides(workspace_value);
+        }
+        if (keybinds_value.object.get("prefix")) |prefix_value| {
+            self.applyPrefixOverrides(prefix_value);
         }
         if (keybinds_value.object.get("chat_up")) |chat_up_value| {
             if (self.parseOverrideValue(chat_up_value, "chat_up")) |bindings| {
@@ -950,6 +1038,150 @@ pub const NativeKeyboardConfig = struct {
         }
     }
 
+    /// `keybinds.prefix` accepts `true`/`false` (toggle with defaults), a bare
+    /// accelerator string (enable with that chord), or an object with
+    /// `enabled`, `key`, `defaults`, and `bindings`.
+    fn applyPrefixOverrides(self: *NativeKeyboardConfig, value: std.json.Value) void {
+        switch (value) {
+            .bool => |enabled| {
+                self.prefix.enabled = enabled;
+                return;
+            },
+            .string => {
+                if (self.parseOverrideValue(value, "prefix")) |keys| {
+                    self.allocator.free(self.prefix.keys);
+                    self.prefix.keys = keys;
+                }
+                self.prefix.enabled = self.prefix.keys.len > 0;
+                return;
+            },
+            .object => {},
+            else => {
+                log.warn("keybinds.prefix must be a bool, accelerator string, or object when provided", .{});
+                return;
+            },
+        }
+
+        const object = value.object;
+        if (object.get("enabled")) |enabled_value| {
+            if (enabled_value == .bool) {
+                self.prefix.enabled = enabled_value.bool;
+            } else {
+                log.warn("keybinds.prefix.enabled must be a bool", .{});
+            }
+        }
+        if (object.get("key")) |key_value| {
+            if (self.parseOverrideValue(key_value, "prefix.key")) |keys| {
+                self.allocator.free(self.prefix.keys);
+                self.prefix.keys = keys;
+            }
+        }
+        if (object.get("defaults")) |defaults_value| {
+            if (defaults_value == .bool) {
+                if (!defaults_value.bool) {
+                    self.clearPrefixTable(&self.prefix.bindings);
+                    self.clearPrefixTable(&self.prefix.navigate);
+                }
+            } else {
+                log.warn("keybinds.prefix.defaults must be a bool", .{});
+            }
+        }
+        if (object.get("bindings")) |bindings_value| {
+            self.applyPrefixBindingOverrides(&self.prefix.bindings, bindings_value, "bindings");
+        }
+        if (object.get("navigate")) |navigate_value| {
+            self.applyPrefixBindingOverrides(&self.prefix.navigate, navigate_value, "navigate");
+        }
+        if (self.prefix.enabled and self.prefix.keys.len == 0) {
+            log.warn("keybinds.prefix.enabled is true but prefix.key is empty; prefix mode stays off", .{});
+            self.prefix.enabled = false;
+        }
+    }
+
+    fn clearPrefixTable(self: *NativeKeyboardConfig, table: *std.ArrayList(PrefixBinding)) void {
+        for (table.items) |binding| binding.target.deinit(self.allocator);
+        table.clearRetainingCapacity();
+    }
+
+    /// Entries are keyed by accelerator. A user entry replaces the default on
+    /// the same chord; `null`/empty removes it; unknown chords are added.
+    fn applyPrefixBindingOverrides(
+        self: *NativeKeyboardConfig,
+        table: *std.ArrayList(PrefixBinding),
+        bindings_value: std.json.Value,
+        comptime table_name: []const u8,
+    ) void {
+        if (bindings_value != .object) {
+            log.warn("keybinds.prefix.{s} must be an object when provided", .{table_name});
+            return;
+        }
+
+        var it = bindings_value.object.iterator();
+        while (it.next()) |entry| {
+            const raw_key = entry.key_ptr.*;
+            const key = parseAccelerator(raw_key) orelse {
+                log.warn("ignoring invalid prefix binding key value_len={d}", .{raw_key.len});
+                continue;
+            };
+            self.removePrefixBinding(table, key);
+            const target = self.parsePrefixTargetValue(entry.value_ptr.*, raw_key) orelse continue;
+            table.append(self.allocator, .{ .key = key, .target = target }) catch {
+                target.deinit(self.allocator);
+                log.warn("failed to store prefix binding", .{});
+            };
+        }
+    }
+
+    fn removePrefixBinding(self: *NativeKeyboardConfig, table: *std.ArrayList(PrefixBinding), key: Keybind) void {
+        var index: usize = 0;
+        while (index < table.items.len) {
+            if (table.items[index].key.eql(key)) {
+                table.items[index].target.deinit(self.allocator);
+                _ = table.swapRemove(index);
+                continue;
+            }
+            index += 1;
+        }
+    }
+
+    fn parsePrefixTargetValue(self: *const NativeKeyboardConfig, value: std.json.Value, key_label: []const u8) ?PrefixTarget {
+        switch (value) {
+            .null => return null,
+            .string => |name| {
+                const trimmed = std.mem.trim(u8, name, &std.ascii.whitespace);
+                if (trimmed.len == 0) return null;
+                return parsePrefixActionName(trimmed) orelse {
+                    log.warn("unknown prefix action for {s}: {s}", .{ key_label, trimmed });
+                    return null;
+                };
+            },
+            .object => |object| {
+                if (object.get("command")) |command_value| {
+                    if (command_value != .string) {
+                        log.warn("prefix binding {s}: command must be a string", .{key_label});
+                        return null;
+                    }
+                    const script = std.mem.trim(u8, command_value.string, &std.ascii.whitespace);
+                    if (script.len == 0) {
+                        log.warn("prefix binding {s}: command must not be empty", .{key_label});
+                        return null;
+                    }
+                    const owned = self.allocator.dupe(u8, script) catch return null;
+                    return .{ .command = owned };
+                }
+                if (object.get("action")) |action_value| {
+                    return self.parsePrefixTargetValue(action_value, key_label);
+                }
+                log.warn("prefix binding {s}: object needs an action or command", .{key_label});
+                return null;
+            },
+            else => {
+                log.warn("prefix binding {s} must be an action name, object, or null", .{key_label});
+                return null;
+            },
+        }
+    }
+
     fn parseOverrideValue(self: *const NativeKeyboardConfig, value: std.json.Value, comptime field_name: []const u8) ?[]Keybind {
         return switch (value) {
             .null => self.allocator.alloc(Keybind, 0) catch null,
@@ -1016,6 +1248,346 @@ pub const NativeKeyboardConfig = struct {
         return parsed.toOwnedSlice(self.allocator) catch null;
     }
 };
+
+const PrefixActionName = struct { name: []const u8, target: PrefixTarget };
+
+/// Action names accepted under `keybinds.prefix.bindings`. They mirror the
+/// direct-keybind config keys so one vocabulary covers both tables.
+const PREFIX_ACTION_NAMES = [_]PrefixActionName{
+    .{ .name = "refresh", .target = .{ .app = .refresh } },
+    .{ .name = "open", .target = .{ .app = .open_default } },
+    .{ .name = "open_default", .target = .{ .app = .open_default } },
+    .{ .name = "open_editor", .target = .{ .app = .open_editor } },
+    .{ .name = "new_thread", .target = .{ .app = .new_thread } },
+    .{ .name = "command_palette", .target = .{ .app = .command_palette } },
+    .{ .name = "companion", .target = .{ .app = .companion } },
+    .{ .name = "sidebar", .target = .{ .app = .toggle_sidebar } },
+    .{ .name = "sidebar_hidden", .target = .{ .app = .toggle_sidebar_hidden } },
+    .{ .name = "browser", .target = .{ .app = .toggle_browser } },
+    .{ .name = "chat_up", .target = .{ .app = .chat_up } },
+    .{ .name = "chat_down", .target = .{ .app = .chat_down } },
+    .{ .name = "chat_page_up", .target = .{ .app = .chat_page_up } },
+    .{ .name = "chat_page_down", .target = .{ .app = .chat_page_down } },
+    .{ .name = "chat.model_picker", .target = .{ .chat = .model_picker } },
+    .{ .name = "chat.run_config", .target = .{ .chat = .run_config } },
+    .{ .name = "terminal.toggle", .target = .{ .app = .toggle_terminal } },
+    .{ .name = "terminal.new_tab", .target = .{ .terminal = .new_tab } },
+    .{ .name = "terminal.close", .target = .{ .terminal = .close_active } },
+    .{ .name = "terminal.rename_tab", .target = .{ .terminal = .rename_tab } },
+    .{ .name = "terminal.tab_previous", .target = .{ .terminal = .tab_previous } },
+    .{ .name = "terminal.tab_next", .target = .{ .terminal = .tab_next } },
+    .{ .name = "terminal.split_up", .target = .{ .terminal = .split_up } },
+    .{ .name = "terminal.split_down", .target = .{ .terminal = .split_down } },
+    .{ .name = "terminal.split_left", .target = .{ .terminal = .split_left } },
+    .{ .name = "terminal.split_right", .target = .{ .terminal = .split_right } },
+    .{ .name = "terminal.focus_up", .target = .{ .terminal = .focus_up } },
+    .{ .name = "terminal.focus_down", .target = .{ .terminal = .focus_down } },
+    .{ .name = "terminal.focus_left", .target = .{ .terminal = .focus_left } },
+    .{ .name = "terminal.focus_right", .target = .{ .terminal = .focus_right } },
+    .{ .name = "workspace.split_default_vertical", .target = .split_default_vertical },
+    .{ .name = "workspace.split_default_horizontal", .target = .split_default_horizontal },
+    .{ .name = "workspace.split_alternate_vertical", .target = .split_alternate_vertical },
+    .{ .name = "workspace.split_alternate_horizontal", .target = .split_alternate_horizontal },
+    .{ .name = "workspace.split_chat_vertical", .target = .{ .app = .workspace_split_chat_vertical } },
+    .{ .name = "workspace.split_chat_horizontal", .target = .{ .app = .workspace_split_chat_horizontal } },
+    .{ .name = "workspace.split_terminal_vertical", .target = .{ .app = .workspace_split_terminal_vertical } },
+    .{ .name = "workspace.split_terminal_horizontal", .target = .{ .app = .workspace_split_terminal_horizontal } },
+    .{ .name = "workspace.toggle_maximize", .target = .{ .app = .workspace_toggle_maximize } },
+    .{ .name = "workspace.toggle_quick_pane", .target = .{ .app = .workspace_toggle_quick_pane } },
+    .{ .name = "workspace.close", .target = .{ .app = .workspace_close } },
+    .{ .name = "workspace.close_current", .target = .{ .app = .workspace_close_current } },
+    .{ .name = "workspace.focus_left", .target = .{ .app = .workspace_focus_left } },
+    .{ .name = "workspace.focus_right", .target = .{ .app = .workspace_focus_right } },
+    .{ .name = "workspace.focus_up", .target = .{ .app = .workspace_focus_up } },
+    .{ .name = "workspace.focus_down", .target = .{ .app = .workspace_focus_down } },
+    .{ .name = "workspace.focus_prompt", .target = .focus_prompt },
+    .{ .name = "prefix.keybinds", .target = .show_keybinds },
+    .{ .name = "prefix.navigate", .target = .navigate },
+    .{ .name = "workspace.previous", .target = .{ .app = .workspace_previous } },
+    .{ .name = "workspace.next", .target = .{ .app = .workspace_next } },
+    .{ .name = "workspace.active_previous", .target = .{ .app = .workspace_active_previous } },
+    .{ .name = "workspace.active_next", .target = .{ .app = .workspace_active_next } },
+    .{ .name = "workspace.pane_previous", .target = .{ .app = .workspace_pane_previous } },
+    .{ .name = "workspace.pane_next", .target = .{ .app = .workspace_pane_next } },
+    .{ .name = "workspace.move_left", .target = .{ .app = .workspace_move_left } },
+    .{ .name = "workspace.move_right", .target = .{ .app = .workspace_move_right } },
+    .{ .name = "workspace.move_up", .target = .{ .app = .workspace_move_up } },
+    .{ .name = "workspace.move_down", .target = .{ .app = .workspace_move_down } },
+    .{ .name = "workspace.grow_left", .target = .{ .app = .workspace_grow_left } },
+    .{ .name = "workspace.grow_right", .target = .{ .app = .workspace_grow_right } },
+    .{ .name = "workspace.grow_up", .target = .{ .app = .workspace_grow_up } },
+    .{ .name = "workspace.grow_down", .target = .{ .app = .workspace_grow_down } },
+};
+
+/// Resolves a prefix action name. Positional actions take a 1-based ordinal
+/// suffix: `workspace.select.3`, `workspace.pane_select.1`,
+/// `workspace.active_select.2`.
+pub fn parsePrefixActionName(raw: []const u8) ?PrefixTarget {
+    const name = std.mem.trim(u8, raw, &std.ascii.whitespace);
+    for (PREFIX_ACTION_NAMES) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry.name, name)) return entry.target;
+    }
+    if (parseOrdinalSuffix(name, "workspace.select.")) |index| return .{ .workspace_select = index };
+    if (parseOrdinalSuffix(name, "workspace.pane_select.")) |index| return .{ .pane_select = index };
+    if (parseOrdinalSuffix(name, "workspace.active_select.")) |index| return .{ .active_select = index };
+    return null;
+}
+
+/// Short human label for the which-key overlay. Scripts show their text so a
+/// user can recognise their own bindings without a label field.
+pub fn prefixTargetLabel(buf: []u8, target: PrefixTarget) []const u8 {
+    return switch (target) {
+        .app => |action| switch (action) {
+            .refresh => "Reload app",
+            .open_default => "Open project",
+            .open_editor => "Open in editor",
+            .new_thread => "New thread",
+            .command_palette => "Command palette",
+            .companion => "Companion",
+            .toggle_sidebar => "Sidebar",
+            .toggle_sidebar_hidden => "Hide sidebar",
+            .toggle_browser => "Browser",
+            .toggle_terminal => "Terminal",
+            .chat_up => "Scroll up",
+            .chat_down => "Scroll down",
+            .chat_page_up => "Page up",
+            .chat_page_down => "Page down",
+            .workspace_previous => "Prev workspace",
+            .workspace_next => "Next workspace",
+            .workspace_active_previous => "Prev active",
+            .workspace_active_next => "Next active",
+            .workspace_pane_previous => "Prev pane",
+            .workspace_pane_next => "Next pane",
+            .workspace_split_chat_vertical => "Chat split |",
+            .workspace_split_chat_horizontal => "Chat split -",
+            .workspace_split_terminal_vertical => "Term split |",
+            .workspace_split_terminal_horizontal => "Term split -",
+            .workspace_toggle_maximize => "Zoom pane",
+            .workspace_toggle_quick_pane => "Quick pane",
+            .workspace_close => "Close pane",
+            .workspace_close_current => "Close workspace",
+            .workspace_focus_left => "Focus left",
+            .workspace_focus_right => "Focus right",
+            .workspace_focus_up => "Focus up",
+            .workspace_focus_down => "Focus down",
+            .workspace_move_left => "Move left",
+            .workspace_move_right => "Move right",
+            .workspace_move_up => "Move up",
+            .workspace_move_down => "Move down",
+            .workspace_grow_left => "Grow left",
+            .workspace_grow_right => "Grow right",
+            .workspace_grow_up => "Grow up",
+            .workspace_grow_down => "Grow down",
+        },
+        .terminal => |action| switch (action) {
+            .new_tab => "Term: new tab",
+            .close_active => "Term: close",
+            .rename_tab => "Term: rename tab",
+            .tab_previous => "Term: prev tab",
+            .tab_next => "Term: next tab",
+            .split_up => "Term: split up",
+            .split_down => "Term: split down",
+            .split_left => "Term: split left",
+            .split_right => "Term: split right",
+            .focus_up => "Term: focus up",
+            .focus_down => "Term: focus down",
+            .focus_left => "Term: focus left",
+            .focus_right => "Term: focus right",
+        },
+        .split_default_vertical => "Default split |",
+        .split_default_horizontal => "Default split -",
+        .split_alternate_vertical => "Alternate split |",
+        .split_alternate_horizontal => "Alternate split -",
+        .chat => |action| switch (action) {
+            .model_picker => "Model picker",
+            .run_config => "Run settings",
+        },
+        .focus_prompt => "Focus prompt",
+        .show_keybinds => "Keybinds",
+        .navigate => "Workspace nav",
+        .workspace_select => |index| std.fmt.bufPrint(buf, "Workspace {d}", .{index + 1}) catch "Workspace",
+        .pane_select => |index| std.fmt.bufPrint(buf, "Pane {d}", .{index + 1}) catch "Pane",
+        .active_select => |index| std.fmt.bufPrint(buf, "Active row {d}", .{index + 1}) catch "Active row",
+        .command => |script| std.fmt.bufPrint(buf, "$ {s}", .{script}) catch "$ script",
+    };
+}
+
+fn parseOrdinalSuffix(name: []const u8, comptime head: []const u8) ?usize {
+    if (!std.ascii.startsWithIgnoreCase(name, head)) return null;
+    const ordinal = std.fmt.parseUnsigned(usize, name[head.len..], 10) catch return null;
+    if (ordinal == 0) return null;
+    return ordinal - 1;
+}
+
+const DefaultPrefixEntry = struct { accelerator: []const u8, target: []const u8 };
+
+/// Default prefix table. Every built-in command has a seat here so enabling
+/// prefix mode alone exposes the whole command surface. Letters follow tmux
+/// where a tmux habit exists (`x` close, `z` zoom, `,` rename, `[`/`]`
+/// traversal, digits select); Shift flips a command to its sibling and Ctrl
+/// to its resize/positional variant.
+const DEFAULT_PREFIX_TABLE = [_]DefaultPrefixEntry{
+    // Help / modes
+    .{ .accelerator = "Shift+Slash", .target = "prefix.keybinds" },
+    .{ .accelerator = "W", .target = "prefix.navigate" },
+    // App
+    .{ .accelerator = "P", .target = "command_palette" },
+    .{ .accelerator = "T", .target = "new_thread" },
+    .{ .accelerator = "R", .target = "refresh" },
+    .{ .accelerator = "O", .target = "open" },
+    .{ .accelerator = "E", .target = "open_editor" },
+    .{ .accelerator = "Space", .target = "companion" },
+    .{ .accelerator = "S", .target = "sidebar" },
+    .{ .accelerator = "Shift+S", .target = "sidebar_hidden" },
+    .{ .accelerator = "B", .target = "browser" },
+    .{ .accelerator = "Grave", .target = "terminal.toggle" },
+    .{ .accelerator = "Q", .target = "workspace.toggle_quick_pane" },
+    // Panes
+    .{ .accelerator = "X", .target = "workspace.close" },
+    .{ .accelerator = "Shift+X", .target = "workspace.close_current" },
+    .{ .accelerator = "Z", .target = "workspace.toggle_maximize" },
+    .{ .accelerator = "I", .target = "workspace.focus_prompt" },
+    .{ .accelerator = "C", .target = "workspace.split_chat_vertical" },
+    .{ .accelerator = "Shift+C", .target = "workspace.split_chat_horizontal" },
+    .{ .accelerator = "V", .target = "workspace.split_default_vertical" },
+    .{ .accelerator = "Minus", .target = "workspace.split_default_horizontal" },
+    .{ .accelerator = "Shift+V", .target = "workspace.split_alternate_vertical" },
+    .{ .accelerator = "Shift+Minus", .target = "workspace.split_alternate_horizontal" },
+    .{ .accelerator = "H", .target = "workspace.focus_left" },
+    .{ .accelerator = "J", .target = "workspace.focus_down" },
+    .{ .accelerator = "K", .target = "workspace.focus_up" },
+    .{ .accelerator = "L", .target = "workspace.focus_right" },
+    .{ .accelerator = "Left", .target = "workspace.focus_left" },
+    .{ .accelerator = "Down", .target = "workspace.focus_down" },
+    .{ .accelerator = "Up", .target = "workspace.focus_up" },
+    .{ .accelerator = "Right", .target = "workspace.focus_right" },
+    .{ .accelerator = "Shift+H", .target = "workspace.move_left" },
+    .{ .accelerator = "Shift+J", .target = "workspace.move_down" },
+    .{ .accelerator = "Shift+K", .target = "workspace.move_up" },
+    .{ .accelerator = "Shift+L", .target = "workspace.move_right" },
+    .{ .accelerator = "Ctrl+H", .target = "workspace.grow_left" },
+    .{ .accelerator = "Ctrl+J", .target = "workspace.grow_down" },
+    .{ .accelerator = "Ctrl+K", .target = "workspace.grow_up" },
+    .{ .accelerator = "Ctrl+L", .target = "workspace.grow_right" },
+    .{ .accelerator = "Ctrl+Left", .target = "workspace.grow_left" },
+    .{ .accelerator = "Ctrl+Down", .target = "workspace.grow_down" },
+    .{ .accelerator = "Ctrl+Up", .target = "workspace.grow_up" },
+    .{ .accelerator = "Ctrl+Right", .target = "workspace.grow_right" },
+    .{ .accelerator = "N", .target = "workspace.pane_next" },
+    .{ .accelerator = "Shift+N", .target = "workspace.pane_previous" },
+    .{ .accelerator = "LeftBracket", .target = "workspace.previous" },
+    .{ .accelerator = "RightBracket", .target = "workspace.next" },
+    .{ .accelerator = "Shift+LeftBracket", .target = "workspace.active_previous" },
+    .{ .accelerator = "Shift+RightBracket", .target = "workspace.active_next" },
+    .{ .accelerator = "1", .target = "workspace.pane_select.1" },
+    .{ .accelerator = "2", .target = "workspace.pane_select.2" },
+    .{ .accelerator = "3", .target = "workspace.pane_select.3" },
+    .{ .accelerator = "4", .target = "workspace.pane_select.4" },
+    .{ .accelerator = "5", .target = "workspace.pane_select.5" },
+    .{ .accelerator = "6", .target = "workspace.pane_select.6" },
+    .{ .accelerator = "7", .target = "workspace.pane_select.7" },
+    .{ .accelerator = "8", .target = "workspace.pane_select.8" },
+    .{ .accelerator = "9", .target = "workspace.pane_select.9" },
+    .{ .accelerator = "0", .target = "workspace.pane_select.10" },
+    .{ .accelerator = "Shift+1", .target = "workspace.select.1" },
+    .{ .accelerator = "Shift+2", .target = "workspace.select.2" },
+    .{ .accelerator = "Shift+3", .target = "workspace.select.3" },
+    .{ .accelerator = "Shift+4", .target = "workspace.select.4" },
+    .{ .accelerator = "Shift+5", .target = "workspace.select.5" },
+    .{ .accelerator = "Shift+6", .target = "workspace.select.6" },
+    .{ .accelerator = "Shift+7", .target = "workspace.select.7" },
+    .{ .accelerator = "Shift+8", .target = "workspace.select.8" },
+    .{ .accelerator = "Shift+9", .target = "workspace.select.9" },
+    .{ .accelerator = "Shift+0", .target = "workspace.select.10" },
+    .{ .accelerator = "Ctrl+1", .target = "workspace.active_select.1" },
+    .{ .accelerator = "Ctrl+2", .target = "workspace.active_select.2" },
+    .{ .accelerator = "Ctrl+3", .target = "workspace.active_select.3" },
+    .{ .accelerator = "Ctrl+4", .target = "workspace.active_select.4" },
+    .{ .accelerator = "Ctrl+5", .target = "workspace.active_select.5" },
+    .{ .accelerator = "Ctrl+6", .target = "workspace.active_select.6" },
+    .{ .accelerator = "Ctrl+7", .target = "workspace.active_select.7" },
+    .{ .accelerator = "Ctrl+8", .target = "workspace.active_select.8" },
+    .{ .accelerator = "Ctrl+9", .target = "workspace.active_select.9" },
+    .{ .accelerator = "Ctrl+0", .target = "workspace.active_select.10" },
+    // Chat
+    .{ .accelerator = "Shift+Up", .target = "chat_up" },
+    .{ .accelerator = "Shift+Down", .target = "chat_down" },
+    .{ .accelerator = "PageUp", .target = "chat_page_up" },
+    .{ .accelerator = "PageDown", .target = "chat_page_down" },
+    .{ .accelerator = "M", .target = "chat.model_picker" },
+    .{ .accelerator = "Shift+M", .target = "chat.run_config" },
+    // Terminal (only while a terminal pane is focused)
+    .{ .accelerator = "Ctrl+T", .target = "terminal.new_tab" },
+    .{ .accelerator = "Shift+W", .target = "terminal.close" },
+    .{ .accelerator = "Comma", .target = "terminal.rename_tab" },
+    .{ .accelerator = "Ctrl+PageUp", .target = "terminal.tab_previous" },
+    .{ .accelerator = "Ctrl+PageDown", .target = "terminal.tab_next" },
+    .{ .accelerator = "Alt+Up", .target = "terminal.split_up" },
+    .{ .accelerator = "Alt+Down", .target = "terminal.split_down" },
+    .{ .accelerator = "Alt+Left", .target = "terminal.split_left" },
+    .{ .accelerator = "Alt+Right", .target = "terminal.split_right" },
+    .{ .accelerator = "Alt+Shift+Up", .target = "terminal.focus_up" },
+    .{ .accelerator = "Alt+Shift+Down", .target = "terminal.focus_down" },
+    .{ .accelerator = "Alt+Shift+Left", .target = "terminal.focus_left" },
+    .{ .accelerator = "Alt+Shift+Right", .target = "terminal.focus_right" },
+};
+
+/// Navigate-mode table (herdr `prefix w`). Kept short: the status bar lists
+/// every entry as a hint, so this is the muscle-memory subset, not the full
+/// command surface (`?` still shows everything).
+const DEFAULT_NAVIGATE_TABLE = [_]DefaultPrefixEntry{
+    .{ .accelerator = "Up", .target = "workspace.previous" },
+    .{ .accelerator = "Down", .target = "workspace.next" },
+    .{ .accelerator = "Tab", .target = "workspace.pane_next" },
+    .{ .accelerator = "Shift+Tab", .target = "workspace.pane_previous" },
+    .{ .accelerator = "H", .target = "workspace.focus_left" },
+    .{ .accelerator = "J", .target = "workspace.focus_down" },
+    .{ .accelerator = "K", .target = "workspace.focus_up" },
+    .{ .accelerator = "L", .target = "workspace.focus_right" },
+    .{ .accelerator = "C", .target = "new_thread" },
+    .{ .accelerator = "V", .target = "workspace.split_default_vertical" },
+    .{ .accelerator = "Minus", .target = "workspace.split_default_horizontal" },
+    .{ .accelerator = "Shift+V", .target = "workspace.split_alternate_vertical" },
+    .{ .accelerator = "Shift+Minus", .target = "workspace.split_alternate_horizontal" },
+    .{ .accelerator = "X", .target = "workspace.close" },
+    .{ .accelerator = "Z", .target = "workspace.toggle_maximize" },
+    .{ .accelerator = "P", .target = "command_palette" },
+    .{ .accelerator = "Shift+Slash", .target = "prefix.keybinds" },
+    .{ .accelerator = "1", .target = "workspace.select.1" },
+    .{ .accelerator = "2", .target = "workspace.select.2" },
+    .{ .accelerator = "3", .target = "workspace.select.3" },
+    .{ .accelerator = "4", .target = "workspace.select.4" },
+    .{ .accelerator = "5", .target = "workspace.select.5" },
+    .{ .accelerator = "6", .target = "workspace.select.6" },
+    .{ .accelerator = "7", .target = "workspace.select.7" },
+    .{ .accelerator = "8", .target = "workspace.select.8" },
+    .{ .accelerator = "9", .target = "workspace.select.9" },
+    .{ .accelerator = "0", .target = "workspace.select.10" },
+};
+
+fn cloneDefaultPrefixTable(allocator: std.mem.Allocator, table: []const DefaultPrefixEntry) !std.ArrayList(PrefixBinding) {
+    var bindings: std.ArrayList(PrefixBinding) = .empty;
+    errdefer bindings.deinit(allocator);
+    for (table) |entry| {
+        try bindings.append(allocator, .{
+            .key = try parseDefaultAccelerator(entry.accelerator),
+            .target = parsePrefixActionName(entry.target) orelse return error.InvalidDefaultPrefixTarget,
+        });
+    }
+    return bindings;
+}
+
+fn cloneDefaultPrefixConfig(allocator: std.mem.Allocator) !PrefixConfig {
+    const keys = try allocator.alloc(Keybind, 1);
+    errdefer allocator.free(keys);
+    keys[0] = try parseDefaultAccelerator(DEFAULT_PREFIX_ACCELERATOR);
+
+    var bindings = try cloneDefaultPrefixTable(allocator, &DEFAULT_PREFIX_TABLE);
+    errdefer bindings.deinit(allocator);
+    const navigate = try cloneDefaultPrefixTable(allocator, &DEFAULT_NAVIGATE_TABLE);
+
+    return .{ .enabled = false, .keys = keys, .bindings = bindings, .navigate = navigate };
+}
 
 fn cloneDefaultKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
@@ -1208,28 +1780,24 @@ fn cloneDefaultTerminalFocusRightKeybinds(allocator: std.mem.Allocator) ![]Keybi
 
 fn cloneDefaultWorkspaceFocusLeftKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
-        try parseDefaultAccelerator("Ctrl+H"),
         try parseDefaultAccelerator("Ctrl+Left"),
     });
 }
 
 fn cloneDefaultWorkspaceFocusRightKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
-        try parseDefaultAccelerator("Ctrl+L"),
         try parseDefaultAccelerator("Ctrl+Right"),
     });
 }
 
 fn cloneDefaultWorkspaceFocusUpKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
-        try parseDefaultAccelerator("Ctrl+K"),
         try parseDefaultAccelerator("Ctrl+Up"),
     });
 }
 
 fn cloneDefaultWorkspaceFocusDownKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
-        try parseDefaultAccelerator("Ctrl+J"),
         try parseDefaultAccelerator("Ctrl+Down"),
     });
 }
@@ -1477,6 +2045,20 @@ fn keycodeLabel(key: sdl.Keycode) []const u8 {
         .right => "Right",
         .up => "Up",
         .down => "Down",
+        .grave => "`",
+        .leftbracket => "[",
+        .rightbracket => "]",
+        .backslash => "\\",
+        .semicolon => ";",
+        .apostrophe => "'",
+        .comma => ",",
+        .period => ".",
+        .slash => "/",
+        .minus => "-",
+        .equals => "=",
+        .space => "Space",
+        .pageup => "PageUp",
+        .pagedown => "PageDown",
         else => @tagName(key),
     };
 }
@@ -1624,6 +2206,15 @@ fn parseKeycode(token: []const u8) ?sdl.Keycode {
             '9' => .@"9",
             '-' => .minus,
             '=' => .equals,
+            '`' => .grave,
+            '[' => .leftbracket,
+            ']' => .rightbracket,
+            '\\' => .backslash,
+            ';' => .semicolon,
+            '\'' => .apostrophe,
+            ',' => .comma,
+            '.' => .period,
+            '/' => .slash,
             else => null,
         };
     }
@@ -1683,6 +2274,15 @@ fn parseKeycode(token: []const u8) ?sdl.Keycode {
     if (std.ascii.eqlIgnoreCase(token, "Down")) return .down;
     if (std.ascii.eqlIgnoreCase(token, "Left")) return .left;
     if (std.ascii.eqlIgnoreCase(token, "Right")) return .right;
+    if (std.ascii.eqlIgnoreCase(token, "Grave") or std.ascii.eqlIgnoreCase(token, "Backquote")) return .grave;
+    if (std.ascii.eqlIgnoreCase(token, "LeftBracket") or std.ascii.eqlIgnoreCase(token, "BracketLeft")) return .leftbracket;
+    if (std.ascii.eqlIgnoreCase(token, "RightBracket") or std.ascii.eqlIgnoreCase(token, "BracketRight")) return .rightbracket;
+    if (std.ascii.eqlIgnoreCase(token, "Backslash")) return .backslash;
+    if (std.ascii.eqlIgnoreCase(token, "Semicolon")) return .semicolon;
+    if (std.ascii.eqlIgnoreCase(token, "Apostrophe") or std.ascii.eqlIgnoreCase(token, "Quote")) return .apostrophe;
+    if (std.ascii.eqlIgnoreCase(token, "Comma")) return .comma;
+    if (std.ascii.eqlIgnoreCase(token, "Period")) return .period;
+    if (std.ascii.eqlIgnoreCase(token, "Slash")) return .slash;
 
     return null;
 }
@@ -2016,33 +2616,54 @@ test "default workspace close current uses ctrl shift w" {
     try std.testing.expectEqual(sdl.Keycode.w, config.workspace_close_current[0].key);
 }
 
-test "default workspace focus supports ctrl hjkl and arrows" {
+test "default workspace focus uses ctrl arrows without hjkl" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
 
-    try std.testing.expectEqual(@as(usize, 2), config.workspace_focus_left.len);
-    try std.testing.expect(config.workspace_focus_left[0].ctrl);
-    try std.testing.expectEqual(sdl.Keycode.h, config.workspace_focus_left[0].key);
-    try std.testing.expect(config.workspace_focus_left[1].ctrl);
-    try std.testing.expectEqual(sdl.Keycode.left, config.workspace_focus_left[1].key);
+    const defaults = [_]struct {
+        bindings: []const Keybind,
+        key: sdl.Keycode,
+    }{
+        .{ .bindings = config.workspace_focus_left, .key = .left },
+        .{ .bindings = config.workspace_focus_down, .key = .down },
+        .{ .bindings = config.workspace_focus_up, .key = .up },
+        .{ .bindings = config.workspace_focus_right, .key = .right },
+    };
+    for (defaults) |entry| {
+        try std.testing.expectEqual(@as(usize, 1), entry.bindings.len);
+        try std.testing.expect(entry.bindings[0].ctrl);
+        try std.testing.expectEqual(entry.key, entry.bindings[0].key);
+    }
+}
 
-    try std.testing.expectEqual(@as(usize, 2), config.workspace_focus_down.len);
-    try std.testing.expect(config.workspace_focus_down[0].ctrl);
-    try std.testing.expectEqual(sdl.Keycode.j, config.workspace_focus_down[0].key);
-    try std.testing.expect(config.workspace_focus_down[1].ctrl);
-    try std.testing.expectEqual(sdl.Keycode.down, config.workspace_focus_down[1].key);
+test "workspace focus ctrl hjkl chords remain configurable" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
 
-    try std.testing.expectEqual(@as(usize, 2), config.workspace_focus_up.len);
-    try std.testing.expect(config.workspace_focus_up[0].ctrl);
-    try std.testing.expectEqual(sdl.Keycode.k, config.workspace_focus_up[0].key);
-    try std.testing.expect(config.workspace_focus_up[1].ctrl);
-    try std.testing.expectEqual(sdl.Keycode.up, config.workspace_focus_up[1].key);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"keybinds": {"workspace": {
+        \\  "focus_left": "Ctrl+H", "focus_right": "Ctrl+L",
+        \\  "focus_up": "Ctrl+K", "focus_down": "Ctrl+J"
+        \\}}}
+    , .{});
+    defer parsed.deinit();
 
-    try std.testing.expectEqual(@as(usize, 2), config.workspace_focus_right.len);
-    try std.testing.expect(config.workspace_focus_right[0].ctrl);
-    try std.testing.expectEqual(sdl.Keycode.l, config.workspace_focus_right[0].key);
-    try std.testing.expect(config.workspace_focus_right[1].ctrl);
-    try std.testing.expectEqual(sdl.Keycode.right, config.workspace_focus_right[1].key);
+    config.applyOverrides(parsed.value);
+
+    const configured = [_]struct {
+        bindings: []const Keybind,
+        key: sdl.Keycode,
+    }{
+        .{ .bindings = config.workspace_focus_left, .key = .h },
+        .{ .bindings = config.workspace_focus_down, .key = .j },
+        .{ .bindings = config.workspace_focus_up, .key = .k },
+        .{ .bindings = config.workspace_focus_right, .key = .l },
+    };
+    for (configured) |entry| {
+        try std.testing.expectEqual(@as(usize, 1), entry.bindings.len);
+        try std.testing.expect(entry.bindings[0].ctrl);
+        try std.testing.expectEqual(entry.key, entry.bindings[0].key);
+    }
 }
 
 test "default workspace traversal uses alt up and down" {
@@ -2352,4 +2973,230 @@ test "legacy terminal keybind override still maps to terminal toggle" {
     try std.testing.expect(config.toggle_terminal[0].ctrl);
     try std.testing.expect(config.toggle_terminal[0].alt);
     try std.testing.expectEqual(sdl.Keycode.j, config.toggle_terminal[0].key);
+}
+
+test "prefix mode is off by default and arms on ctrl b" {
+    // Built-in defaults only: `load` merges the developer's real verde.json,
+    // which may legitimately enable prefix mode.
+    var prefix = try cloneDefaultPrefixConfig(std.testing.allocator);
+    defer prefix.deinit(std.testing.allocator);
+
+    try std.testing.expect(!prefix.enabled);
+    try std.testing.expectEqual(@as(usize, 1), prefix.keys.len);
+    try std.testing.expect(prefix.keys[0].ctrl);
+    try std.testing.expectEqual(sdl.Keycode.b, prefix.keys[0].key);
+    try std.testing.expectEqual(DEFAULT_PREFIX_TABLE.len, prefix.bindings.items.len);
+}
+
+test "default prefix table covers every app terminal and chat action" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    inline for (std.meta.fields(NativeKeyboardAction)) |field| {
+        const wanted: NativeKeyboardAction = @enumFromInt(field.value);
+        var found = switch (wanted) {
+            .workspace_split_chat_vertical,
+            .workspace_split_chat_horizontal,
+            .workspace_split_terminal_vertical,
+            .workspace_split_terminal_horizontal,
+            => true,
+            else => false,
+        };
+        for (config.prefix.bindings.items) |binding| {
+            if (binding.target == .app and binding.target.app == wanted) found = true;
+        }
+        try std.testing.expect(found);
+    }
+    inline for (std.meta.fields(NativeTerminalAction)) |field| {
+        const wanted: NativeTerminalAction = @enumFromInt(field.value);
+        var found = false;
+        for (config.prefix.bindings.items) |binding| {
+            if (binding.target == .terminal and binding.target.terminal == wanted) found = true;
+        }
+        try std.testing.expect(found);
+    }
+    inline for (std.meta.fields(NativeChatAction)) |field| {
+        const wanted: NativeChatAction = @enumFromInt(field.value);
+        var found = false;
+        for (config.prefix.bindings.items) |binding| {
+            if (binding.target == .chat and binding.target.chat == wanted) found = true;
+        }
+        try std.testing.expect(found);
+    }
+}
+
+test "default prefix table has no duplicate chords" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    const items = config.prefix.bindings.items;
+    for (items, 0..) |binding, index| {
+        for (items[index + 1 ..]) |other| {
+            try std.testing.expect(!binding.key.eql(other.key));
+        }
+    }
+}
+
+test "default prefix pane tile chords use default and shifted alternate actions" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    var default_vertical = false;
+    var default_horizontal = false;
+    var alternate_vertical = false;
+    var alternate_horizontal = false;
+    for (config.prefix.bindings.items) |binding| {
+        if (binding.key.eql(.{ .key = .v })) {
+            default_vertical = binding.target == .split_default_vertical;
+        }
+        if (binding.key.eql(.{ .key = .minus })) {
+            default_horizontal = binding.target == .split_default_horizontal;
+        }
+        if (binding.key.eql(.{ .shift = true, .key = .v })) {
+            alternate_vertical = binding.target == .split_alternate_vertical;
+        }
+        if (binding.key.eql(.{ .shift = true, .key = .minus })) {
+            alternate_horizontal = binding.target == .split_alternate_horizontal;
+        }
+    }
+    try std.testing.expect(default_vertical and default_horizontal and alternate_vertical and alternate_horizontal);
+
+    var navigate_default_vertical = false;
+    var navigate_default_horizontal = false;
+    var navigate_alternate_vertical = false;
+    var navigate_alternate_horizontal = false;
+    for (config.prefix.navigate.items) |binding| {
+        if (binding.key.eql(.{ .key = .v })) navigate_default_vertical = binding.target == .split_default_vertical;
+        if (binding.key.eql(.{ .key = .minus })) navigate_default_horizontal = binding.target == .split_default_horizontal;
+        if (binding.key.eql(.{ .shift = true, .key = .v })) navigate_alternate_vertical = binding.target == .split_alternate_vertical;
+        if (binding.key.eql(.{ .shift = true, .key = .minus })) navigate_alternate_horizontal = binding.target == .split_alternate_horizontal;
+    }
+    try std.testing.expect(navigate_default_vertical and navigate_default_horizontal and navigate_alternate_vertical and navigate_alternate_horizontal);
+}
+
+test "prefix shorthand bool and string overrides" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    var enabled = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"keybinds": {"prefix": true}}
+    , .{});
+    defer enabled.deinit();
+    config.applyOverrides(enabled.value);
+    try std.testing.expect(config.prefix.enabled);
+
+    var rekeyed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"keybinds": {"prefix": "Ctrl+A"}}
+    , .{});
+    defer rekeyed.deinit();
+    config.applyOverrides(rekeyed.value);
+    try std.testing.expect(config.prefix.enabled);
+    try std.testing.expectEqual(@as(usize, 1), config.prefix.keys.len);
+    try std.testing.expectEqual(sdl.Keycode.a, config.prefix.keys[0].key);
+}
+
+test "prefix object override changes key and merges bindings" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+    const default_count = config.prefix.bindings.items.len;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"keybinds": {"prefix": {
+        \\  "enabled": true,
+        \\  "key": ["Ctrl+Space", "Ctrl+B"],
+        \\  "bindings": {
+        \\    "x": "workspace.close_current",
+        \\    "z": null,
+        \\    "g": { "command": "lazygit" },
+        \\    "Shift+3": { "action": "workspace.select.3" },
+        \\    "bogus": "not.an.action"
+        \\  }
+        \\}}}
+    , .{});
+    defer parsed.deinit();
+    config.applyOverrides(parsed.value);
+
+    try std.testing.expect(config.prefix.enabled);
+    try std.testing.expectEqual(@as(usize, 2), config.prefix.keys.len);
+    try std.testing.expectEqual(sdl.Keycode.space, config.prefix.keys[0].key);
+    // x replaced, z removed, g added, Shift+3 replaced, bogus ignored.
+    try std.testing.expectEqual(default_count, config.prefix.bindings.items.len);
+
+    var saw_x = false;
+    var saw_g = false;
+    var saw_three = false;
+    for (config.prefix.bindings.items) |binding| {
+        if (binding.key.eql(.{ .key = .x })) {
+            saw_x = true;
+            try std.testing.expectEqual(NativeKeyboardAction.workspace_close_current, binding.target.app);
+        }
+        if (binding.key.eql(.{ .key = .z })) return error.TestUnexpectedResult;
+        if (binding.key.eql(.{ .key = .g })) {
+            saw_g = true;
+            try std.testing.expectEqualStrings("lazygit", binding.target.command);
+        }
+        if (binding.key.eql(.{ .shift = true, .key = .@"3" })) {
+            saw_three = true;
+            try std.testing.expectEqual(@as(usize, 2), binding.target.workspace_select);
+        }
+    }
+    try std.testing.expect(saw_x and saw_g and saw_three);
+}
+
+test "prefix defaults false drops the built-in table" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"keybinds": {"prefix": {"defaults": false, "bindings": {"c": "new_thread"}}}}
+    , .{});
+    defer parsed.deinit();
+    config.applyOverrides(parsed.value);
+
+    try std.testing.expectEqual(@as(usize, 1), config.prefix.bindings.items.len);
+    try std.testing.expectEqual(NativeKeyboardAction.new_thread, config.prefix.bindings.items[0].target.app);
+}
+
+test "prefix action names resolve positional ordinals" {
+    try std.testing.expectEqual(@as(usize, 0), parsePrefixActionName("workspace.pane_select.1").?.pane_select);
+    try std.testing.expectEqual(@as(usize, 9), parsePrefixActionName("Workspace.Active_Select.10").?.active_select);
+    try std.testing.expect(parsePrefixActionName("workspace.select.0") == null);
+    try std.testing.expect(parsePrefixActionName("workspace.select.x") == null);
+    try std.testing.expect(parsePrefixActionName("workspace.focus_prompt").? == .focus_prompt);
+}
+
+test "punctuation accelerators parse and format" {
+    try std.testing.expectEqual(sdl.Keycode.grave, parseAccelerator("`").?.key);
+    try std.testing.expectEqual(sdl.Keycode.backslash, parseAccelerator("Shift+Backslash").?.key);
+    try std.testing.expectEqual(sdl.Keycode.leftbracket, parseAccelerator("[").?.key);
+    try std.testing.expectEqual(sdl.Keycode.comma, parseAccelerator("Comma").?.key);
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("Shift+[", formatKeybind(&buf, .{ .shift = true, .key = .leftbracket }));
+}
+
+test "prefix target labels cover positional and script targets" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Pane 3", prefixTargetLabel(&buf, .{ .pane_select = 2 }));
+    try std.testing.expectEqualStrings("Command palette", prefixTargetLabel(&buf, .{ .app = .command_palette }));
+    var script = [_]u8{ 'l', 's' };
+    try std.testing.expectEqualStrings("$ ls", prefixTargetLabel(&buf, .{ .command = &script }));
+}
+
+test "navigate table overrides merge like the prefix table" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"keybinds": {"prefix": {"navigate": {"Up": null, "g": { "command": "lazygit" }}}}}
+    , .{});
+    defer parsed.deinit();
+    config.applyOverrides(parsed.value);
+
+    var saw_g = false;
+    for (config.prefix.navigate.items) |binding| {
+        if (binding.key.eql(.{ .key = .up })) return error.TestUnexpectedResult;
+        if (binding.key.eql(.{ .key = .g })) saw_g = true;
+    }
+    try std.testing.expect(saw_g);
+    try std.testing.expect(parsePrefixActionName("prefix.navigate").? == .navigate);
 }

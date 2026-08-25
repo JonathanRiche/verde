@@ -226,7 +226,7 @@ verde theme import https://verdeai.dev/themes/tokyo-night.json
 | `Ctrl+T` | New chat thread |
 | `Ctrl+Shift+T` | Split terminal pane |
 | `Ctrl+Shift+B` | Toggle browser pane |
-| `Ctrl+H/J/K/L` | Focus panes (vim-style); `Ctrl+Arrow` also moves across scrolling panes |
+| `Ctrl+Arrow` | Focus panes; `Ctrl+H/J/K/L` remain available as optional `verde.json` bindings |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous pane in sidebar order |
 | `Ctrl+Shift+H/J/K/L` | Swap / rearrange panes |
 | `Alt+Z` | Zoom focused pane |

@@ -26,6 +26,15 @@ pane header buttons for everything else.
 - `Ctrl+Shift+T` — split a terminal pane next to the focused workspace pane.
 - `Ctrl+T` — start a new chat thread (creates a new chat pane).
 
+With prefix mode enabled, `Ctrl+B`, then `v` creates a vertical GUI chat split
+inside the focused pane; `Ctrl+B`, then `-` creates a horizontal GUI chat split.
+`Shift+V` and `Shift+-` create the matching terminal splits. Choose **Terminal**
+under **Settings → Workspace → Prefix split pane** to invert those defaults so
+the unshifted keys create terminals and Shift creates GUI chats. The same keys
+work after `Ctrl+B W`. In a scrolling workspace the panes stay tiled together
+as one scrolling item, and the sidebar shows the same split as a clickable
+miniature instead of flattening it into unrelated pane rows.
+
 For chat-vs-chat splits and terminal-vertical splits, use the pane header
 buttons: `C|` and `C-` split a chat pane vertically or horizontally; `T|` and
 `T-` do the same for terminals. Right-click terminal content for selection
@@ -44,8 +53,9 @@ terminal.
 
 ## Moving focus
 
-- `Ctrl+H / J / K / L` — focus the pane to the left / down / up / right
-  (vim-style); `Ctrl+Arrow` provides the same four directions.
+- `Ctrl+Arrow` — focus the pane in that direction.
+- `Ctrl+H / J / K / L` are unbound by default; map the existing
+  `keybinds.workspace.focus_left/down/up/right` actions to opt into vim-style focus.
 - Horizontal touchpad/wheel gestures pan a horizontal strip independently of
   focus. In vertical mode, hold `Ctrl` while using the vertical wheel so normal
   terminal and transcript scrolling remains available.
