@@ -683,7 +683,9 @@ fn growScrollingPaneInDirection(
         layout.scroll_pane_extent_ratio_override,
         ui_scale,
     );
-    const current_css = scrollingPaneResolvedExtent(
+    const current_css = scrollingGroupResolvedExtent(
+        layout,
+        group_id,
         pane,
         default_extent,
         @max(viewport_extent, 1.0),
@@ -2060,8 +2062,33 @@ fn resolveScrollingGroupExtents(
                 break;
             }
         }
-        extent.* = scrollingPaneResolvedExtent(resolved_pane, default_extent, viewport_extent, gap, ui_scale);
+        extent.* = scrollingGroupResolvedExtent(
+            layout,
+            group_id,
+            resolved_pane,
+            default_extent,
+            viewport_extent,
+            gap,
+            ui_scale,
+        );
     }
+}
+
+fn scrollingGroupResolvedExtent(
+    layout: *const runtime.WorkspaceLayout,
+    group_id: runtime.WorkspacePaneId,
+    pane: *const workspace_layout.WorkspacePane,
+    default_extent: f32,
+    viewport_extent: f32,
+    gap: f32,
+    ui_scale: f32,
+) f32 {
+    const resolved = scrollingPaneResolvedExtent(pane, default_extent, viewport_extent, gap, ui_scale);
+    // A nested tile group must occupy at least one responsive scroll slot.
+    // Otherwise an extent inherited from the pane before it was split can
+    // leave the next group peeking into view after moving to a narrower screen.
+    if (layout.scrollGroupPaneCount(group_id) > 1) return @max(resolved, default_extent);
+    return resolved;
 }
 
 fn scrollingPaneResolvedExtent(
@@ -3363,6 +3390,14 @@ test "scrolling strip collects a tiled group as one item" {
     resolveScrollingGroupExtents(&layout, group_ids[0..count], representative_ids[0..count], 500.0, 1292.0, 12.0, 1.0, extents[0..count]);
     try std.testing.expectApproxEqAbs(@as(f32, 640.0), extents[0], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 500.0), extents[1], 0.0001);
+
+    // A ratio inherited before grouping cannot make a nested tile narrower
+    // than one responsive slot, while standalone panes keep custom widths.
+    try std.testing.expect(layout.setPaneScrollExtent(standalone_pane_id, 400.0, 0.4));
+    resolveScrollingGroupExtents(&layout, group_ids[0..count], representative_ids[0..count], 900.0, 900.0, 12.0, 1.0, extents[0..count]);
+    try std.testing.expectApproxEqAbs(@as(f32, 900.0), extents[0], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 352.8), extents[1], 0.0001);
+
     try std.testing.expectEqual(@as(?usize, 0), scrollGroupIndexForPane(&layout, tiled_pane_id));
     try std.testing.expectEqual(@as(?usize, 1), scrollGroupIndexForPane(&layout, standalone_pane_id));
 }
