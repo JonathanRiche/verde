@@ -1407,6 +1407,33 @@ pub const Store = struct {
     /// appending preserves transcript order, and the post-adoption flush
     /// carries every id and converges to exactly one copy per identity.
     fn restorePreservedChatRows(self: *Self) !void {
+        // A GUI snapshot can learn the accepted user-row ID before it learns
+        // the attachment payload. The snapshot copy wins for presentation
+        // fields and ordering, but an omitted image is not a deletion: sent
+        // transcript rows are immutable. Restore both the legacy primary and
+        // additive extras before the identity guard below skips this row.
+        try self.conn.execNoArgs(
+            \\update messages as m
+            \\set (image_path, image_mime, image_byte_size, extra_images_json) = (
+            \\    select coalesce(m.image_path, p.image_path),
+            \\           coalesce(m.image_mime, p.image_mime),
+            \\           coalesce(m.image_byte_size, p.image_byte_size),
+            \\           coalesce(m.extra_images_json, p.extra_images_json)
+            \\    from temp.preserved_chat_messages p
+            \\    join workspaces w on w.workspace_id = p.workspace_key
+            \\    join threads t on t.workspace_id = w.id and t.local_thread_id = p.thread_key
+            \\    where m.thread_id = t.id and m.message_id = p.message_id
+            \\)
+            \\where exists (
+            \\    select 1
+            \\    from temp.preserved_chat_messages p
+            \\    join workspaces w on w.workspace_id = p.workspace_key
+            \\    join threads t on t.workspace_id = w.id and t.local_thread_id = p.thread_key
+            \\    where m.thread_id = t.id and m.message_id = p.message_id
+            \\      and ((m.image_path is null and p.image_path is not null)
+            \\        or (m.extra_images_json is null and p.extra_images_json is not null))
+            \\);
+        );
         // M5-P4 Amendment 1 workspace belt: re-home ledger-referenced
         // workspaces first so the thread/message restores below can join
         // them. Restored rows append after the snapshot's workspaces
@@ -5202,8 +5229,36 @@ test "accepted multi-image user row and multi-image draft survive snapshot repla
         try std.testing.expect(std.mem.indexOf(u8, row.text(3), "/tmp/draft-b.png") != null);
     }
 
-    // Converged flush carrying the row with its full image list: identity
-    // upsert refreshes in place — exactly one copy, extras still present.
+    // An old GUI can carry the accepted identity before its projection has
+    // attachment metadata. Sparse means unknown, not removal, because sent
+    // transcript rows are immutable.
+    const sparse_messages = [_]store_protocol.Message{
+        .{
+            .message_id = "gui-msg:img:1",
+            .role = "user",
+            .author = "You",
+            .body = "look at these",
+        },
+    };
+    var sparse_thread = testThread("thread-img", "Image thread");
+    sparse_thread.messages = &sparse_messages;
+    var sparse_workspace = testWorkspace("workspace-img", "Image workspace");
+    sparse_workspace.threads = &.{sparse_thread};
+    const sparse_workspaces = [_]store_protocol.Workspace{sparse_workspace};
+    const sparse_revision = try store.storeRevision();
+    _ = try store.applyMutation(.{ .snapshot_replace = testSnapshotRequest("img-flush-sparse", sparse_revision, false, testSnapshot(&sparse_workspaces)) });
+    {
+        var row = (try store.conn.row(
+            "select image_path, extra_images_json from messages where message_id = 'gui-msg:img:1'",
+            .{},
+        )).?;
+        defer row.deinit();
+        try std.testing.expectEqualStrings("/tmp/shot-a.png", row.text(0));
+        try std.testing.expect(std.mem.indexOf(u8, row.text(1), "/tmp/shot-b.png") != null);
+    }
+
+    // A converged flush carrying the full image list still refreshes in place
+    // with exactly one copy and every extra present.
     const full_messages = [_]store_protocol.Message{
         .{
             .message_id = "gui-msg:img:1",

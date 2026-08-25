@@ -2,13 +2,74 @@ import { describe, expect, test } from 'bun:test'
 
 import {
   chatPaneHasLiveTurn,
+  clipboardImageFiles,
   findLastChatPane,
   lastDeliveredTailSeq,
+  mapTranscriptRows,
   mergeThreadCatalogSettings,
   panesForWorkspace,
   requestPaneClose,
   requestTerminalOpen,
 } from './store.ts'
+
+describe('clipboardImageFiles', () => {
+  test('returns every supported clipboard image and ignores text items', () => {
+    const png = new File(['png'], 'screenshot.png', { type: 'image/png' })
+    const webp = new File(['webp'], 'second.webp', { type: 'image/webp' })
+    const data = {
+      items: [
+        { kind: 'string', getAsFile: () => null },
+        { kind: 'file', getAsFile: () => png },
+        { kind: 'file', getAsFile: () => webp },
+      ],
+      files: [png, webp],
+    }
+
+    expect(clipboardImageFiles(data)).toEqual([png, webp])
+  })
+
+  test('falls back to the clipboard file list', () => {
+    const jpeg = new File(['jpeg'], 'clipboard.jpg', { type: 'image/jpeg' })
+    const text = new File(['text'], 'notes.txt', { type: 'text/plain' })
+
+    expect(clipboardImageFiles({ items: [], files: [jpeg, text] })).toEqual([jpeg])
+  })
+})
+
+describe('mapTranscriptRows', () => {
+  test('preserves every image when normalizing a snapshot thread', () => {
+    const images = [
+      { path: '/tmp/first.png', mime: 'image/png', byte_size: 101 },
+      { path: '/tmp/second.webp', mime: 'image/webp', byte_size: 202 },
+    ]
+
+    const [message] = mapTranscriptRows({
+      thread: {
+        messages: [{
+          message_id: 'message-1',
+          role: 'user',
+          author: 'You',
+          body: 'Compare these',
+          images,
+          created_at_ms: 1234,
+        }],
+      },
+    }, 'thread-1')
+
+    expect(message.images).toEqual(images.map((image) => ({ ...image, attachment_id: null })))
+  })
+
+  test('preserves a legacy single image attachment', () => {
+    const image = { path: '/tmp/legacy.jpg', mime: 'image/jpeg', byte_size: 303 }
+    const [message] = mapTranscriptRows({
+      thread: {
+        messages: [{ role: 'user', author: 'You', body: '', image }],
+      },
+    }, 'thread-legacy')
+
+    expect(message.images).toEqual([{ ...image, attachment_id: null }])
+  })
+})
 
 describe('findLastChatPane', () => {
   const chats = [

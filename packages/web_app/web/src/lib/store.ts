@@ -446,7 +446,7 @@ export function diffCommentLineSummary(patch: string): string | null {
   return `lines ${pieces.join(', ')}${more}`
 }
 
-function mapTranscriptRows(raw: unknown, fallbackId: string): Message[] {
+export function mapTranscriptRows(raw: unknown, fallbackId: string): Message[] {
   const root = unwrapResult<Record<string, unknown>>(raw) ?? asRecord(raw)
   const thread = (root?.thread && typeof root.thread === 'object' ? root.thread : root) as
     | { messages?: Message[] }
@@ -498,6 +498,19 @@ function imageMimeForFile(file: File): string | null {
   if (extension === 'gif') return 'image/gif'
   if (extension === 'bmp') return 'image/bmp'
   return null
+}
+
+/// Return supported image files from a clipboard paste. Prefer DataTransfer
+/// items because browsers can omit pasted screenshots from `files`, then use
+/// the file list as a compatibility fallback.
+export function clipboardImageFiles(data: Pick<DataTransfer, 'items' | 'files'> | null): File[] {
+  if (!data) return []
+  const from_items = Array.from(data.items)
+    .filter((item) => item.kind === 'file')
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => file !== null && imageMimeForFile(file) !== null)
+  if (from_items.length > 0) return from_items
+  return Array.from(data.files).filter((file) => imageMimeForFile(file) !== null)
 }
 
 function turnIsActive(status: string | undefined): boolean {
@@ -1202,15 +1215,11 @@ function createAppStore() {
           if (!thread.messages?.length) continue
           const pane_id = stablePaneId('chat', thread.local_thread_id)
           const key = paneKey(workspace.workspace_id, pane_id)
-          const mapped = thread.messages.map((row, index) => ({
-            message_id: row.message_id || `${thread.local_thread_id}-${index}`,
-            role: row.role,
-            author: row.author,
-            body: row.body,
-            tool_call_kind: row.tool_call_kind,
-            tool_call_status: row.tool_call_status,
-            created_at_ms: row.created_at_ms,
-          }))
+          // Use the same normalizer as an explicit thread fetch. Snapshot
+          // refreshes can land immediately after an optimistic send, and
+          // narrowing the row here used to replace its persisted images with
+          // an otherwise-identical image-less message.
+          const mapped = mapTranscriptRows({ thread }, thread.local_thread_id)
           const merged = mergeMessages(prev[key], mapped)
           if (merged !== prev[key]) {
             next[key] = merged
