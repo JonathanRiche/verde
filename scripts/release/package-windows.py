@@ -293,7 +293,12 @@ def verify_package_tree(root: Path, expected_version: str) -> dict[str, object]:
             raise RuntimeError(f"package contains a development artifact: {path}")
 
     installer = require_file(root / "install.ps1", "preview installer").read_text(encoding="utf-8")
-    for marker in (APP_USER_MODEL_ID, "9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3", "PropertyId = 5"):
+    for marker in (
+        APP_USER_MODEL_ID,
+        "9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3",
+        "PropertyId = 5",
+        '[Environment]::SetEnvironmentVariable("Path", $UpdatedUserPath, "User")',
+    ):
         if marker not in installer:
             raise RuntimeError(
                 f"install.ps1 does not assign {APP_USER_MODEL_ID} through property store"

@@ -1,6 +1,7 @@
 import { createFileRoute } from '@tanstack/solid-router'
+import { macosInstallCliScript } from '../lib/install-script'
 
-const installScript = String.raw`#!/bin/sh
+export const installScript = String.raw`#!/bin/sh
 set -eu
 
 REPO="JonathanRiche/verde"
@@ -208,6 +209,8 @@ make_temp_dir() {
   fi
 }
 
+${macosInstallCliScript}
+
 os="$(uname -s)"
 machine="$(uname -m)"
 
@@ -264,6 +267,7 @@ if [ "${'${'}VERDE_FORCE_INSTALL:-0}" != "1" ] &&
     fi
   else
     if macos_install_is_complete; then
+      macos_install_cli
       say "Verde $latest_version is already installed. Nothing to do."
       exit 0
     fi
@@ -309,6 +313,7 @@ else
   rm -rf "$MACOS_APP_DIR/Verde.app"
   cp -R "$app_path" "$MACOS_APP_DIR/Verde.app"
   say "Done. Installed Verde.app into $MACOS_APP_DIR"
+  macos_install_cli
 fi
 `
 

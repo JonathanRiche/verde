@@ -2,7 +2,8 @@ param(
   [string]$PackageRoot = $PSScriptRoot,
   [string]$Destination = (Join-Path $env:LOCALAPPDATA "Programs\Verde"),
   [string]$ShortcutPath = (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Verde.lnk"),
-  [switch]$NoCopy
+  [switch]$NoCopy,
+  [switch]$NoPath
 )
 
 Set-StrictMode -Version Latest
@@ -50,6 +51,11 @@ if ($ShouldCopy) {
 $InstalledExecutable = Join-Path $InstallRoot "app\Verde.exe"
 if (-not (Test-Path -LiteralPath $InstalledExecutable -PathType Leaf)) {
   throw "Installed GUI executable is missing: $InstalledExecutable"
+}
+$CliDirectory = Join-Path $InstallRoot "bin"
+$CliExecutable = Join-Path $CliDirectory "verde.exe"
+if (-not (Test-Path -LiteralPath $CliExecutable -PathType Leaf)) {
+  throw "Installed CLI executable is missing: $CliExecutable"
 }
 
 $ShortcutParent = Split-Path -Parent $ShortcutPath
@@ -170,12 +176,46 @@ if ($StoredIdentity -ne $AppUserModelId) {
   throw "Start Menu shortcut identity mismatch: expected $AppUserModelId, got $StoredIdentity"
 }
 
+$PathUpdated = $false
+if (-not $NoPath) {
+  $CliDirectoryKey = $CliDirectory.TrimEnd(
+    [System.IO.Path]::DirectorySeparatorChar,
+    [System.IO.Path]::AltDirectorySeparatorChar
+  )
+  $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+  $PathContainsCli = $false
+  foreach ($Entry in @($UserPath -split ";")) {
+    if ([string]::IsNullOrWhiteSpace($Entry)) {
+      continue
+    }
+    $EntryKey = [Environment]::ExpandEnvironmentVariables($Entry.Trim()).TrimEnd(
+      [System.IO.Path]::DirectorySeparatorChar,
+      [System.IO.Path]::AltDirectorySeparatorChar
+    )
+    if ([string]::Equals($EntryKey, $CliDirectoryKey, [StringComparison]::OrdinalIgnoreCase)) {
+      $PathContainsCli = $true
+      break
+    }
+  }
+  if (-not $PathContainsCli) {
+    $UpdatedUserPath = if ([string]::IsNullOrWhiteSpace($UserPath)) {
+      $CliDirectory
+    } else {
+      $UserPath.TrimEnd(";") + ";" + $CliDirectory
+    }
+    [Environment]::SetEnvironmentVariable("Path", $UpdatedUserPath, "User")
+    $PathUpdated = $true
+  }
+}
+
 $Evidence = [ordered]@{
   schema_version = 1
   install_root = $InstallRoot
   executable = $InstalledExecutable
   shortcut = $ShortcutPath
   app_user_model_id = $StoredIdentity
+  cli = $CliExecutable
+  cli_path_added = $PathUpdated
 }
 $EvidencePath = Join-Path $InstallRoot "share\verde\windows-installation.json"
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $EvidencePath) | Out-Null
