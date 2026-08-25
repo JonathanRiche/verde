@@ -375,8 +375,14 @@ pub fn focusPaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool 
     );
     if (maximized) {
         if (scrolling_navigation) {
-            const direction = scrollingPaneDirection(state.app_config.workspace_scroll_direction, dir) orelse return false;
-            const target = layout.adjacentTiledPaneIdInSidebarOrder(current_id, direction) orelse return false;
+            const direction = workspacePaneDirection(dir);
+            if (layout.neighborPaneId(current_id, direction)) |inner_target| {
+                if (layout.panesShareScrollGroup(current_id, inner_target)) {
+                    return focusPaneNavigationTarget(state, inner_target, true);
+                }
+            }
+            const strip_direction = scrollingPaneDirection(state.app_config.workspace_scroll_direction, dir) orelse return false;
+            const target = layout.adjacentScrollGroupPaneId(current_id, strip_direction) orelse return false;
             return focusPaneNavigationTarget(state, target, true);
         }
         if (state.currentProjectWorkspaceRoot()) |root| {
@@ -2992,6 +2998,10 @@ test "zoomed scrolling navigation follows sidebar order through terminal panes" 
 
     var project = try runtime.Project.init(allocator, "scroll-navigation", "Scroll Navigation", "/tmp/scroll-navigation", 0);
     const first_pane_id = project.workspace_layout.focused_pane_id.?;
+    const lower_thread = try project.addThread(allocator);
+    const lower_chat_pane_id = try project.workspace_layout.createChatPane(allocator, lower_thread);
+    try project.workspace_layout.splitPaneWithLeaf(allocator, first_pane_id, lower_chat_pane_id, .horizontal, true);
+    try std.testing.expect(project.workspace_layout.joinPaneToScrollGroup(first_pane_id, lower_chat_pane_id));
     const terminal_pane_id = try project.workspace_layout.createTerminalPane(allocator, 7);
     try project.workspace_layout.splitPaneWithLeaf(allocator, first_pane_id, terminal_pane_id, .vertical, true);
     const trailing_thread = try project.addThread(allocator);
@@ -3007,13 +3017,18 @@ test "zoomed scrolling navigation follows sidebar order through terminal panes" 
     state.app_config.workspace_scroll_mode = .always;
     state.app_config.workspace_scroll_direction = .horizontal;
 
-    // The split tree places the trailing chat geometrically before the
-    // terminal, while the scrolling strip and sidebar order are chat,
-    // terminal, chat. Zoomed navigation must follow the rendered strip.
+    // Zoomed navigation follows hidden split geometry inside a tiled group,
+    // then follows scrolling-group order along the strip axis.
     pane_rect_count = 1;
     pane_rects[0] = .{ .pane_id = first_pane_id, .rect = .{ .x = 0.0, .y = 0.0, .w = 1000.0, .h = 700.0 } };
-    try std.testing.expect(focusPaneInDirection(&state, .right));
     const layout = &state.project_controller.projects.items[0].workspace_layout;
+    try std.testing.expect(focusPaneInDirection(&state, .down));
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, lower_chat_pane_id), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, lower_chat_pane_id), layout.maximized_pane_id);
+    try std.testing.expect(focusPaneInDirection(&state, .up));
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, first_pane_id), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, first_pane_id), layout.maximized_pane_id);
+    try std.testing.expect(focusPaneInDirection(&state, .right));
     try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, terminal_pane_id), layout.focused_pane_id);
     try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, terminal_pane_id), layout.maximized_pane_id);
 }
