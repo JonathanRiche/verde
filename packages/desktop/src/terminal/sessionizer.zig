@@ -7018,7 +7018,8 @@ fn loadThreadGetResult(
         messages_list.deinit(allocator);
     }
     var rows = store.conn.rows(
-        \\select message_id, role, author, body, created_at_ms, updated_at_ms,
+        \\select message_id, role, author, body, image_path, image_mime,
+        \\       image_byte_size, extra_images_json, created_at_ms, updated_at_ms,
         \\       tool_call_id, tool_call_kind, tool_call_status
         \\from messages where thread_id = ?1 order by sort_index
     ,
@@ -7035,14 +7036,22 @@ fn loadThreadGetResult(
         errdefer allocator.free(author);
         const body = allocator.dupe(u8, row.text(3)) catch return error.OutOfMemory;
         errdefer allocator.free(body);
-        const tool_call_id = dupeOptionalText(allocator, row.nullableText(6)) catch return error.OutOfMemory;
+        const images = try decodeOwnedAttachmentList(
+            allocator,
+            row.nullableText(4),
+            row.nullableText(5),
+            row.nullableInt(6),
+            row.nullableText(7),
+        );
+        errdefer freeAttachmentArray(allocator, images);
+        const tool_call_id = dupeOptionalText(allocator, row.nullableText(10)) catch return error.OutOfMemory;
         errdefer if (tool_call_id) |value| allocator.free(value);
-        const tool_call_kind = if (row.nullableInt(7)) |code|
+        const tool_call_kind = if (row.nullableInt(11)) |code|
             (allocator.dupe(u8, toolCallKindNameFromCode(code)) catch return error.OutOfMemory)
         else
             null;
         errdefer if (tool_call_kind) |value| allocator.free(value);
-        const tool_call_status = if (row.nullableInt(8)) |code|
+        const tool_call_status = if (row.nullableInt(12)) |code|
             (allocator.dupe(u8, toolCallStatusNameFromCode(code)) catch return error.OutOfMemory)
         else
             null;
@@ -7052,8 +7061,10 @@ fn loadThreadGetResult(
             .role = role,
             .author = author,
             .body = body,
-            .created_at_ms = row.nullableInt(4),
-            .updated_at_ms = row.nullableInt(5),
+            .images = images,
+            .image = if (images.len > 0) images[0] else null,
+            .created_at_ms = row.nullableInt(8),
+            .updated_at_ms = row.nullableInt(9),
             .tool_call_id = tool_call_id,
             .tool_call_kind = tool_call_kind,
             .tool_call_status = tool_call_status,
@@ -7102,9 +7113,81 @@ fn freeOwnedMessage(allocator: std.mem.Allocator, message: store_protocol.Messag
     allocator.free(message.role);
     allocator.free(message.author);
     allocator.free(message.body);
+    if (message.images.len > 0) {
+        freeAttachmentArray(allocator, message.images);
+    } else if (message.image) |image| {
+        allocator.free(image.path);
+        allocator.free(image.mime);
+    }
     if (message.tool_call_id) |value| allocator.free(value);
     if (message.tool_call_kind) |value| allocator.free(value);
     if (message.tool_call_status) |value| allocator.free(value);
+}
+
+/// Decode one owned chat.thread.get attachment list. Unlike snapshot reads,
+/// this result outlives the SQLite row and must be individually freed.
+fn decodeOwnedAttachmentList(
+    allocator: std.mem.Allocator,
+    primary_path: ?[]const u8,
+    primary_mime: ?[]const u8,
+    primary_byte_size: ?i64,
+    encoded_extras: ?[]const u8,
+) daemon_store.StoreError![]const store_protocol.Attachment {
+    const path = primary_path orelse return &.{};
+    var attachments: std.ArrayList(store_protocol.Attachment) = .empty;
+    errdefer {
+        for (attachments.items) |attachment| {
+            allocator.free(attachment.path);
+            allocator.free(attachment.mime);
+        }
+        attachments.deinit(allocator);
+    }
+
+    const owned_path = allocator.dupe(u8, path) catch return error.OutOfMemory;
+    const owned_mime = allocator.dupe(u8, primary_mime orelse "") catch {
+        allocator.free(owned_path);
+        return error.OutOfMemory;
+    };
+    attachments.append(allocator, .{
+        .path = owned_path,
+        .mime = owned_mime,
+        .byte_size = if (primary_byte_size) |value| (std.math.cast(usize, value) orelse 0) else 0,
+    }) catch {
+        allocator.free(owned_path);
+        allocator.free(owned_mime);
+        return error.OutOfMemory;
+    };
+
+    if (encoded_extras) |encoded| {
+        var parsed = std.json.parseFromSlice(
+            []daemon_store.StoredExtraImage,
+            allocator,
+            encoded,
+            .{ .ignore_unknown_fields = true },
+        ) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            log.warn("malformed stored extra-images column dropped err={s}", .{@errorName(err)});
+            return attachments.toOwnedSlice(allocator) catch return error.OutOfMemory;
+        };
+        defer parsed.deinit();
+        for (parsed.value) |extra| {
+            const extra_path = allocator.dupe(u8, extra.path) catch return error.OutOfMemory;
+            const extra_mime = allocator.dupe(u8, extra.mime) catch {
+                allocator.free(extra_path);
+                return error.OutOfMemory;
+            };
+            attachments.append(allocator, .{
+                .path = extra_path,
+                .mime = extra_mime,
+                .byte_size = std.math.cast(usize, extra.byte_size) orelse 0,
+            }) catch {
+                allocator.free(extra_path);
+                allocator.free(extra_mime);
+                return error.OutOfMemory;
+            };
+        }
+    }
+    return attachments.toOwnedSlice(allocator) catch return error.OutOfMemory;
 }
 
 fn loadThreadListResult(
@@ -8938,7 +9021,7 @@ fn writePendingApproval(s: *std.json.Stringify, pending: ?PendingApproval) !void
     try s.endObject();
 }
 
-fn freeAttachmentArray(allocator: std.mem.Allocator, attachments: []store_protocol.Attachment) void {
+fn freeAttachmentArray(allocator: std.mem.Allocator, attachments: []const store_protocol.Attachment) void {
     for (attachments) |attachment| {
         allocator.free(attachment.path);
         allocator.free(attachment.mime);
@@ -13437,6 +13520,16 @@ test "durable reads decode canonical and historical daemon chat role codes" {
             },
         );
     }
+    try daemon.store_service.?.store.conn.exec(
+        "update messages set image_path = ?1, image_mime = ?2, image_byte_size = ?3, extra_images_json = ?4 where message_id = ?5",
+        .{
+            "/tmp/primary.png",
+            "image/png",
+            @as(i64, 101),
+            "[{\"path\":\"/tmp/extra.webp\",\"mime\":\"image/webp\",\"byte_size\":202}]",
+            "raw user",
+        },
+    );
     _ = try daemon.store_service.?.store.commitTurn(.{
         .turn_id = "turn-dto",
         .workspace_id = "ws-dto",
@@ -13473,6 +13566,16 @@ test "durable reads decode canonical and historical daemon chat role codes" {
     for (messages, expected_roles) |message, expected_role| {
         try std.testing.expectEqualStrings(expected_role, message.object.get("role").?.string);
     }
+    const primary_image = messages[0].object.get("image").?.object;
+    try std.testing.expectEqualStrings("/tmp/primary.png", primary_image.get("path").?.string);
+    try std.testing.expectEqualStrings("image/png", primary_image.get("mime").?.string);
+    try std.testing.expectEqual(@as(i64, 101), primary_image.get("byte_size").?.integer);
+    const message_images = messages[0].object.get("images").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), message_images.len);
+    try std.testing.expectEqualStrings("/tmp/primary.png", message_images[0].object.get("path").?.string);
+    try std.testing.expectEqualStrings("/tmp/extra.webp", message_images[1].object.get("path").?.string);
+    try std.testing.expectEqualStrings("image/webp", message_images[1].object.get("mime").?.string);
+    try std.testing.expectEqual(@as(i64, 202), message_images[1].object.get("byte_size").?.integer);
 
     var snapshot_arena_state: std.heap.ArenaAllocator = .init(allocator);
     defer snapshot_arena_state.deinit();

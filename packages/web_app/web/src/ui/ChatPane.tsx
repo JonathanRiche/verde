@@ -3,7 +3,7 @@ import { marked } from 'marked'
 
 import { decorateFileCitations } from '../lib/citations'
 import { chatImageUrl } from '../lib/live'
-import { store } from '../lib/store'
+import { clipboardImageFiles, store } from '../lib/store'
 import { type Attachment, type LivePane, type Message } from '../lib/types'
 import { effortLabel, effortOptionsIn, modelOptionsFor, modelSupportsFast, variantOptionsIn } from '../lib/models'
 import { handleFileCitationClick } from './FileViewer'
@@ -838,6 +838,15 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
           value={store.draftFor(props.pane)}
           onInput={(event) => store.setDraftFor(props.pane, event.currentTarget.value)}
           onKeyDown={onKeyDown}
+          onPaste={(event) => {
+            const files = clipboardImageFiles(event.clipboardData)
+            if (files.length === 0) return
+            // Image clipboard content is an attachment, matching the picker;
+            // suppress the browser's fallback filename/text insertion.
+            event.preventDefault()
+            if (uploading() || store.sending()) return
+            void store.attachFiles(props.pane, files)
+          }}
           onFocus={() => store.focusPane(props.pane)}
         />
         <div class="mt-1 flex min-w-0 flex-wrap items-center gap-1.5 lg:h-8 lg:flex-nowrap">
