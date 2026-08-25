@@ -1044,8 +1044,10 @@ fn focusWorkspacePaneWithCompletionPolicy(
 ) bool {
     if (project_index >= self.project_controller.projects.items.len) return false;
     var layout = &self.project_controller.projects.items[project_index].workspace_layout;
-    const pane = layout.paneById(pane_id) orelse return false;
+    if (layout.paneById(pane_id) == null) return false;
     const pane_focus_changed = layout.focused_pane_id != pane_id;
+    const scroll_group_focus_changed = layout.rememberScrollGroupFocusedPane(pane_id);
+    const pane = layout.paneById(pane_id).?;
     // Ordinary focus movement uses the strip's minimal-reveal behavior. A
     // direct navigation path may request leading-edge placement after this
     // method completes.
@@ -1055,7 +1057,7 @@ fn focusWorkspacePaneWithCompletionPolicy(
     // eating clicks through the popover routing.
     self.closePaletteModelPicker();
     self.closeRunConfigPopover();
-    var persisted_focus_changed = layout.focused_pane_id != pane_id;
+    var persisted_focus_changed = pane_focus_changed or scroll_group_focus_changed;
     layout.focused_pane_id = pane_id;
     switch (pane.ref) {
         .chat => |ref| {

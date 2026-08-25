@@ -3061,7 +3061,7 @@ test "directional navigation transfers zoom unless unzoom is configured" {
     try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, null), layout.maximized_pane_id);
 }
 
-test "zoomed scrolling navigation follows sidebar order through terminal panes" {
+test "scrolling navigation restores the last focused tile child with and without zoom" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3112,12 +3112,26 @@ test "zoomed scrolling navigation follows sidebar order through terminal panes" 
     try std.testing.expect(focusPaneInDirection(&state, .down));
     try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, lower_chat_pane_id), layout.focused_pane_id);
     try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, lower_chat_pane_id), layout.maximized_pane_id);
+    try std.testing.expect(focusPaneInDirection(&state, .right));
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, terminal_pane_id), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, terminal_pane_id), layout.maximized_pane_id);
+    try std.testing.expect(focusPaneInDirection(&state, .left));
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, lower_chat_pane_id), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, lower_chat_pane_id), layout.maximized_pane_id);
     try std.testing.expect(focusPaneInDirection(&state, .up));
     try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, first_pane_id), layout.focused_pane_id);
     try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, first_pane_id), layout.maximized_pane_id);
     try std.testing.expect(focusPaneInDirection(&state, .right));
     try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, terminal_pane_id), layout.focused_pane_id);
     try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, terminal_pane_id), layout.maximized_pane_id);
+
+    layout.maximized_pane_id = null;
+    try std.testing.expect(focusPaneNavigationTarget(&state, lower_chat_pane_id, false));
+    try std.testing.expect(focusPaneInDirection(&state, .right));
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, terminal_pane_id), layout.focused_pane_id);
+    try std.testing.expect(focusPaneInDirection(&state, .left));
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, lower_chat_pane_id), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, null), layout.maximized_pane_id);
 }
 
 test "scrolling focus reveal moves only enough to expose the column" {
