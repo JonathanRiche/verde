@@ -162,6 +162,17 @@ pub const NewChatPaneBehavior = enum {
     replace_pane,
 };
 
+pub const WorkspaceSplitDefaultPane = enum {
+    chat,
+    terminal,
+
+    pub fn parse(value: []const u8) ?WorkspaceSplitDefaultPane {
+        if (std.ascii.eqlIgnoreCase(value, "chat")) return .chat;
+        if (std.ascii.eqlIgnoreCase(value, "terminal")) return .terminal;
+        return null;
+    }
+};
+
 pub const WorkspaceScrollDirection = enum {
     horizontal,
     vertical,
@@ -220,6 +231,7 @@ pub const AppConfig = struct {
     terminal_font_size: f32 = DEFAULT_TERMINAL_FONT_SIZE,
     workspace_pane_gap: f32 = DEFAULT_WORKSPACE_PANE_GAP,
     workspace_panes_per_view: u8 = DEFAULT_WORKSPACE_PANES_PER_VIEW,
+    workspace_split_default_pane: WorkspaceSplitDefaultPane = .chat,
     workspace_scroll_direction: WorkspaceScrollDirection = .horizontal,
     workspace_scroll_mode: WorkspaceScrollMode = .automatic,
     workspace_scroll_threshold: u8 = DEFAULT_WORKSPACE_SCROLL_THRESHOLD,
@@ -504,6 +516,7 @@ fn writeUiSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, con
     try ui_object.put(allocator, "font_size", .{ .float = config.font_size });
     try ui_object.put(allocator, "workspace_pane_gap", .{ .float = config.workspace_pane_gap });
     try ui_object.put(allocator, "workspace_panes_per_view", .{ .integer = config.workspace_panes_per_view });
+    try ui_object.put(allocator, "workspace_split_default_pane", .{ .string = @tagName(config.workspace_split_default_pane) });
     try ui_object.put(allocator, "workspace_scroll_direction", .{ .string = @tagName(config.workspace_scroll_direction) });
     try ui_object.put(allocator, "workspace_scroll_mode", .{ .string = @tagName(config.workspace_scroll_mode) });
     try ui_object.put(allocator, "workspace_scroll_threshold", .{ .integer = config.workspace_scroll_threshold });
@@ -1152,6 +1165,15 @@ fn applyUiOverrides(config: *AppConfig, ui_value: std.json.Value) void {
             else => log.warn("ui.workspace_panes_per_view must be an integer when provided", .{}),
         }
     }
+    if (ui_value.object.get("workspace_split_default_pane")) |pane_value| {
+        if (pane_value != .string) {
+            log.warn("ui.workspace_split_default_pane must be a string when provided", .{});
+        } else if (WorkspaceSplitDefaultPane.parse(pane_value.string)) |pane_kind| {
+            config.workspace_split_default_pane = pane_kind;
+        } else {
+            log.warn("ui.workspace_split_default_pane must be chat or terminal", .{});
+        }
+    }
     if (ui_value.object.get("workspace_scroll_direction")) |direction_value| {
         if (direction_value != .string) {
             log.warn("ui.workspace_scroll_direction must be a string when provided", .{});
@@ -1561,6 +1583,18 @@ test "app config accepts ui.workspace_scroll_direction override" {
     applyAppOverrides(std.testing.allocator, &config, root.value);
 
     try std.testing.expectEqual(WorkspaceScrollDirection.vertical, config.workspace_scroll_direction);
+}
+
+test "app config defaults prefix splits to chat and accepts terminal override" {
+    var config: AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+    try std.testing.expectEqual(WorkspaceSplitDefaultPane.chat, config.workspace_split_default_pane);
+
+    var root = try parseTestRoot("{\"ui\":{\"workspace_split_default_pane\":\"terminal\"}}");
+    defer root.deinit();
+    applyAppOverrides(std.testing.allocator, &config, root.value);
+
+    try std.testing.expectEqual(WorkspaceSplitDefaultPane.terminal, config.workspace_split_default_pane);
 }
 
 test "app config ignores unsupported ui.workspace_scroll_direction" {

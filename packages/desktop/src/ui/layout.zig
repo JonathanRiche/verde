@@ -9,6 +9,7 @@ const colors = @import("colors.zig");
 const sidebar = @import("sidebar.zig");
 const workspace_panes = @import("workspace_panes.zig");
 const runtime = @import("runtime.zig");
+const keybinds = @import("../app/keybinds.zig");
 const debug_window = @import("debug.zig");
 const settings_modal = @import("settings_modal.zig");
 const command_palette = @import("command_palette.zig");
@@ -204,6 +205,12 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     const companion_z = state.palette_overlay_batch.setZIndex(COMPANION_Z);
     companion.render(state, width, height);
     state.palette_overlay_batch.restoreZIndex(companion_z);
+    // The which-key panel must sit above pane-local layers (composer, pane
+    // chrome) that queue at higher z than the workspace body.
+    const which_key_z = state.palette_overlay_batch.setZIndex(PALETTE_MODAL_Z);
+    renderPrefixStatusBar(state, root_layout.workspace);
+    renderPrefixWhichKey(state, root_layout.workspace);
+    state.palette_overlay_batch.restoreZIndex(which_key_z);
     const modal_z = state.palette_overlay_batch.setZIndex(PALETTE_MODAL_Z);
     defer state.palette_overlay_batch.restoreZIndex(modal_z);
     renderImageModal(state, width, height);
@@ -218,6 +225,181 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     settings_modal.render(state, width, height);
     command_palette.render(state, width, height);
     debug_window.render(state, width, height);
+}
+
+// Which-key overlay: while a tmux-style prefix chord is armed, a bottom-anchored
+// panel lists every second key and what it does (neovim which-key style), so
+// the user never has to remember the table. Hidden the moment the chord resolves.
+const WHICH_KEY_MAX_HEIGHT_RATIO: f32 = 0.55;
+
+// Prefix status bar: herdr-style one-line strip along the bottom the moment a
+// chord arms — a PREFIX pill plus `esc cancel`, `<chord> send prefix`, and
+// `? keybinds` hints. Instant and unobtrusive; the full table stays behind `?`.
+const PREFIX_BAR_HEIGHT_UI: f32 = 26.0;
+
+fn prefixBarHeight() f32 {
+    return theme.scaledUi(PREFIX_BAR_HEIGHT_UI);
+}
+
+fn renderPrefixStatusBar(state: *runtime.AppState, workspace: palette.Rect) void {
+    if (!state.prefix_armed and !state.prefix_navigate) return;
+    const config = state.command_controller.keyboard_config orelse return;
+    const navigate = state.prefix_navigate and !state.prefix_armed;
+    const bar_h = prefixBarHeight();
+    const bar: palette.Rect = .{ .x = workspace.x, .y = workspace.y + workspace.h - bar_h, .w = workspace.w, .h = bar_h };
+    queuePaletteRoundedRect(state, bar, paletteColor(theme.COLOR_PANEL_ALT), 0.0);
+    queuePaletteBorder(state, .{ .x = bar.x, .y = bar.y, .w = bar.w, .h = theme.scaledUi(1.0) }, paletteColor(theme.borderMuted()), 0.0, theme.scaledUi(1.0));
+
+    const font_size = theme.scaledUi(12.0);
+    const text_h = font_size * 1.25;
+    const text_y = bar.y + (bar_h - text_h) * 0.5;
+    const gap = theme.scaledUi(8.0);
+    const hint_gap = theme.scaledUi(18.0);
+    var x = bar.x + theme.scaledUi(12.0);
+
+    const chevron = "\u{00bb}";
+    queuePaletteText(state, .{ .x = x, .y = text_y, .w = runtime.paletteUiTextPrefixWidth(chevron, font_size, chevron.len), .h = text_h }, chevron, paletteColor(theme.current_colors.text_subtle), font_size, bar);
+    x += runtime.paletteUiTextPrefixWidth(chevron, font_size, chevron.len) + gap;
+
+    const pill_label: []const u8 = if (navigate) "NAVIGATE" else "PREFIX";
+    const pill_pad = theme.scaledUi(8.0);
+    const pill_w = runtime.paletteUiTextPrefixWidth(pill_label, font_size, pill_label.len) + pill_pad * 2.0;
+    const pill: palette.Rect = .{ .x = x, .y = bar.y + theme.scaledUi(4.0), .w = pill_w, .h = bar_h - theme.scaledUi(8.0) };
+    queuePaletteRoundedRect(state, pill, paletteColor(theme.accent()), theme.scaledUi(3.0));
+    queuePaletteText(state, .{ .x = pill.x + pill_pad, .y = text_y, .w = pill_w - pill_pad * 2.0, .h = text_h }, pill_label, paletteColor(theme.background()), font_size, bar);
+    x += pill_w + hint_gap;
+
+    var chord_buf: [32]u8 = undefined;
+    const chord = keybinds.formatFirstKeybind(&chord_buf, config.prefix.keys);
+    const help_key = prefixHelpKeyLabel(config, if (navigate) config.prefix.navigate.items else config.prefix.bindings.items);
+    const help_label: []const u8 = if (state.prefix_help_visible) "hide keybinds" else "keybinds";
+    if (navigate) {
+        x = queuePrefixHint(state, x, text_y, text_h, font_size, gap, hint_gap, bar, "esc", "back");
+        // Navigate hints come straight from the table so remaps show up;
+        // positional selects and the help key are folded into fixed hints.
+        var key_buf: [32]u8 = undefined;
+        var label_buf: [96]u8 = undefined;
+        for (config.prefix.navigate.items) |binding| {
+            switch (binding.target) {
+                .workspace_select, .pane_select, .active_select, .show_keybinds, .navigate => continue,
+                else => {},
+            }
+            if (x > bar.x + bar.w) break;
+            const key = keybinds.formatKeybind(&key_buf, binding.key);
+            const label = keybinds.prefixTargetLabel(&label_buf, binding.target);
+            x = queuePrefixHint(state, x, text_y, text_h, font_size, gap, hint_gap, bar, key, label);
+        }
+        x = queuePrefixHint(state, x, text_y, text_h, font_size, gap, hint_gap, bar, "1-0", "workspace");
+        _ = queuePrefixHint(state, x, text_y, text_h, font_size, gap, hint_gap, bar, help_key, help_label);
+    } else {
+        x = queuePrefixHint(state, x, text_y, text_h, font_size, gap, hint_gap, bar, "esc", "cancel");
+        x = queuePrefixHint(state, x, text_y, text_h, font_size, gap, hint_gap, bar, chord, "send prefix");
+        x = queuePrefixHint(state, x, text_y, text_h, font_size, gap, hint_gap, bar, prefixNavigateKeyLabel(config), "workspace nav");
+        _ = queuePrefixHint(state, x, text_y, text_h, font_size, gap, hint_gap, bar, help_key, help_label);
+    }
+}
+
+/// Queues one `key label` pair and returns the next x. Empty keys are skipped.
+fn queuePrefixHint(state: *runtime.AppState, x_in: f32, text_y: f32, text_h: f32, font_size: f32, gap: f32, hint_gap: f32, clip: palette.Rect, key: []const u8, label: []const u8) f32 {
+    if (key.len == 0) return x_in;
+    var x = x_in;
+    const key_w = runtime.paletteUiTextPrefixWidth(key, font_size, key.len);
+    queuePaletteText(state, .{ .x = x, .y = text_y, .w = key_w, .h = text_h }, key, paletteColor(theme.accent()), font_size, clip);
+    x += key_w + gap * 0.6;
+    const label_w = runtime.paletteUiTextPrefixWidth(label, font_size, label.len);
+    queuePaletteText(state, .{ .x = x, .y = text_y, .w = label_w, .h = text_h }, label, paletteColor(theme.current_colors.text_muted), font_size, clip);
+    return x + label_w + hint_gap;
+}
+
+fn prefixNavigateKeyLabel(config: *const keybinds.NativeKeyboardConfig) []const u8 {
+    for (config.prefix.bindings.items) |binding| {
+        if (binding.target != .navigate) continue;
+        return keybinds.formatKeybind(&prefix_navigate_key_buf, binding.key);
+    }
+    return "";
+}
+var prefix_navigate_key_buf: [32]u8 = undefined;
+
+/// Label for whichever chord is bound to the cheat sheet (default `?`), so a
+/// remapped help key is advertised correctly. Empty when unbound.
+fn prefixHelpKeyLabel(config: *const keybinds.NativeKeyboardConfig, table: []const keybinds.PrefixBinding) []const u8 {
+    _ = config;
+    for (table) |binding| {
+        if (binding.target != .show_keybinds) continue;
+        if (binding.key.shift and binding.key.key == .slash and !binding.key.ctrl and !binding.key.alt and !binding.key.meta and !binding.key.primary) return "?";
+        return keybinds.formatKeybind(&prefix_help_key_buf, binding.key);
+    }
+    return "";
+}
+var prefix_help_key_buf: [32]u8 = undefined;
+
+// Prefix cheat sheet: full which-key table above the status bar, only after `?`.
+fn renderPrefixWhichKey(state: *runtime.AppState, workspace: palette.Rect) void {
+    if (!state.prefix_help_visible or (!state.prefix_armed and !state.prefix_navigate)) return;
+    const config = state.command_controller.keyboard_config orelse return;
+    const navigate = state.prefix_navigate and !state.prefix_armed;
+    const bindings = if (navigate) config.prefix.navigate.items else config.prefix.bindings.items;
+
+    const font_size = theme.scaledUi(12.0);
+    const header_size = theme.scaledUi(12.5);
+    const line_h = font_size * 1.25 + theme.scaledUi(4.0);
+    const pad = theme.scaledUi(14.0);
+    const margin = theme.scaledUi(12.0);
+    const key_gap = theme.scaledUi(10.0);
+    const col_gap = theme.scaledUi(22.0);
+
+    // Column geometry comes from measured text so long script labels and
+    // multi-token chords never overlap their neighbours.
+    var key_buf: [32]u8 = undefined;
+    var label_buf: [96]u8 = undefined;
+    var key_w: f32 = 0.0;
+    var label_w: f32 = 0.0;
+    for (bindings) |binding| {
+        const key = keybinds.formatKeybind(&key_buf, binding.key);
+        const label = keybinds.prefixTargetLabel(&label_buf, binding.target);
+        key_w = @max(key_w, runtime.paletteUiTextPrefixWidth(key, font_size, key.len));
+        label_w = @max(label_w, runtime.paletteUiTextPrefixWidth(label, font_size, label.len));
+    }
+    label_w = @min(label_w, theme.scaledUi(180.0));
+    const col_w = key_w + key_gap + label_w;
+
+    const panel_w = @max(workspace.w - margin * 2.0, theme.scaledUi(320.0));
+    const inner_w = panel_w - pad * 2.0;
+    const columns: usize = @max(1, @as(usize, @intFromFloat(@floor((inner_w + col_gap) / (col_w + col_gap)))));
+    const max_rows: usize = @max(1, @as(usize, @intFromFloat(@floor(((workspace.h - prefixBarHeight()) * WHICH_KEY_MAX_HEIGHT_RATIO - pad * 2.0 - line_h * 1.5) / line_h))));
+    const wanted_rows = (bindings.len + columns - 1) / columns;
+    const rows = @min(wanted_rows, max_rows);
+    const shown = @min(bindings.len, rows * columns);
+    const hidden = bindings.len - shown;
+
+    const panel_h = pad * 2.0 + line_h * 1.5 + line_h * @as(f32, @floatFromInt(rows));
+    const rect: palette.Rect = .{ .x = workspace.x + margin, .y = workspace.y + workspace.h - prefixBarHeight() - margin - panel_h, .w = panel_w, .h = panel_h };
+    const radius = theme.scaledUi(8.0);
+    queuePaletteRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 245)), radius);
+    queuePaletteBorder(state, rect, paletteColor(theme.accent()), radius, theme.scaledUi(1.0));
+
+    var chord_buf: [32]u8 = undefined;
+    const chord = keybinds.formatFirstKeybind(&chord_buf, config.prefix.keys);
+    var header_buf: [96]u8 = undefined;
+    const header = std.fmt.bufPrint(&header_buf, "{s} keybinds{s}", .{
+        if (navigate) "Workspace nav" else chord,
+        if (hidden > 0) "  (table truncated)" else "",
+    }) catch chord;
+    queuePaletteText(state, .{ .x = rect.x + pad, .y = rect.y + pad, .w = inner_w, .h = header_size * 1.25 }, header, paletteColor(theme.current_colors.text_muted), header_size, rect);
+
+    const grid_y = rect.y + pad + line_h * 1.5;
+    for (bindings[0..shown], 0..) |binding, index| {
+        const col = index / rows;
+        const row = index % rows;
+        const x = rect.x + pad + @as(f32, @floatFromInt(col)) * (col_w + col_gap);
+        const y = grid_y + @as(f32, @floatFromInt(row)) * line_h;
+        const key = keybinds.formatKeybind(&key_buf, binding.key);
+        const label = keybinds.prefixTargetLabel(&label_buf, binding.target);
+        const this_key_w = runtime.paletteUiTextPrefixWidth(key, font_size, key.len);
+        // Right-align keys inside the key column so labels start on one edge.
+        queuePaletteText(state, .{ .x = x + key_w - this_key_w, .y = y, .w = this_key_w, .h = font_size * 1.25 }, key, paletteColor(theme.accent()), font_size, rect);
+        queuePaletteText(state, .{ .x = x + key_w + key_gap, .y = y, .w = label_w, .h = font_size * 1.25 }, label, paletteColor(theme.current_colors.text), font_size, rect);
+    }
 }
 
 pub fn isSidebarAnimating() bool {

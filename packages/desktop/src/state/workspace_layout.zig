@@ -49,6 +49,9 @@ pub fn deinitWorkspacePaneRef(ref: *WorkspacePaneRef, allocator: std.mem.Allocat
 pub const WorkspacePane = struct {
     id: WorkspacePaneId,
     ref: WorkspacePaneRef,
+    /// Panes with the same non-null id render as one nested tile in scrolling
+    /// mode. Null keeps the pane as its own scrolling item.
+    scroll_group_id: ?WorkspacePaneId = null,
     /// Optional scrolling-strip size. Null inherits the workspace default so
     /// dragging one pane does not force every other pane to the same width.
     scroll_extent_css: ?f32 = null,
@@ -402,6 +405,65 @@ pub const WorkspaceLayout = struct {
         pane.scroll_extent_css = clamped;
         pane.scroll_extent_ratio = if (extent_ratio > 0.0) extent_ratio else null;
         return true;
+    }
+
+    /// Stable scrolling-item identity for a pane. Standalone panes use their
+    /// own id without persisting redundant group metadata.
+    pub fn scrollGroupIdForPane(self: *const WorkspaceLayout, pane_id: WorkspacePaneId) ?WorkspacePaneId {
+        const pane = self.paneById(pane_id) orelse return null;
+        return pane.scroll_group_id orelse pane.id;
+    }
+
+    /// Keeps a newly split pane inside the target pane's scrolling tile.
+    pub fn joinPaneToScrollGroup(self: *WorkspaceLayout, target_pane_id: WorkspacePaneId, new_pane_id: WorkspacePaneId) bool {
+        const target_index = self.paneIndexById(target_pane_id) orelse return false;
+        const new_index = self.paneIndexById(new_pane_id) orelse return false;
+        const group_id = self.panes.items[target_index].scroll_group_id orelse target_pane_id;
+        self.panes.items[target_index].scroll_group_id = group_id;
+        self.panes.items[new_index].scroll_group_id = group_id;
+        return true;
+    }
+
+    pub fn panesShareScrollGroup(self: *const WorkspaceLayout, first_pane_id: WorkspacePaneId, second_pane_id: WorkspacePaneId) bool {
+        const first_group = self.scrollGroupIdForPane(first_pane_id) orelse return false;
+        const second_group = self.scrollGroupIdForPane(second_pane_id) orelse return false;
+        return first_group == second_group;
+    }
+
+    pub fn scrollGroupPaneCount(self: *const WorkspaceLayout, group_id: WorkspacePaneId) usize {
+        var count: usize = 0;
+        for (self.panes.items) |pane| {
+            if (!self.rootContainsPane(pane.id)) continue;
+            if ((pane.scroll_group_id orelse pane.id) == group_id) count += 1;
+        }
+        return count;
+    }
+
+    /// Adjacent scrolling item in persisted pane order, skipping the other
+    /// leaves inside the current tile group.
+    pub fn adjacentScrollGroupPaneId(self: *const WorkspaceLayout, pane_id: WorkspacePaneId, direction: WorkspacePaneDirection) ?WorkspacePaneId {
+        const current_group = self.scrollGroupIdForPane(pane_id) orelse return null;
+        const backwards = direction == .left or direction == .up;
+        var previous_pane_id: ?WorkspacePaneId = null;
+        var matched = false;
+        for (self.panes.items, 0..) |pane, pane_index| {
+            if (!self.rootContainsPane(pane.id)) continue;
+            const group_id = pane.scroll_group_id orelse pane.id;
+            var seen = false;
+            for (self.panes.items[0..pane_index]) |earlier| {
+                if (!self.rootContainsPane(earlier.id)) continue;
+                if ((earlier.scroll_group_id orelse earlier.id) == group_id) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) continue;
+            if (backwards and group_id == current_group) return previous_pane_id;
+            if (matched and group_id != current_group) return pane.id;
+            if (group_id == current_group) matched = true;
+            previous_pane_id = pane.id;
+        }
+        return null;
     }
 
     pub fn requestLeadingScrollReveal(self: *WorkspaceLayout, pane_id: WorkspacePaneId) void {
@@ -1002,6 +1064,10 @@ pub const WorkspaceLayout = struct {
                     try stringify.endArray();
                 },
             }
+            if (pane.scroll_group_id) |group_id| {
+                try stringify.objectField("scroll_group");
+                try stringify.write(group_id);
+            }
             if (pane.scroll_extent_css) |extent| {
                 try stringify.objectField("scroll_extent");
                 try stringify.write(extent);
@@ -1157,7 +1223,11 @@ pub const WorkspaceLayout = struct {
                 browser_ref_owned = false;
             }
             if (next_layout.panes.items.len > pane_count_before) {
-                applyPersistedPaneScrollExtent(&next_layout.panes.items[next_layout.panes.items.len - 1], pane_value);
+                const pane = &next_layout.panes.items[next_layout.panes.items.len - 1];
+                if (jsonInt(pane_value.object.get("scroll_group") orelse .null)) |group_id| {
+                    if (group_id > 0 and group_id <= @as(i64, std.math.maxInt(WorkspacePaneId))) pane.scroll_group_id = @intCast(group_id);
+                }
+                applyPersistedPaneScrollExtent(pane, pane_value);
             }
             if (pane_id >= next_layout.next_pane_id) next_layout.next_pane_id = pane_id + 1;
         }
@@ -1851,6 +1921,34 @@ test "workspace layout round-trips nonuniform split and explicit focus exactly" 
         },
         .leaf => return error.TestExpectedEqual,
     }
+}
+
+test "workspace layout persists scrolling tile groups and skips their inner leaves" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+
+    const tiled_pane_id = try layout.createTerminalPane(allocator, 10);
+    try layout.splitPaneWithLeaf(allocator, 1, tiled_pane_id, .vertical, true);
+    try std.testing.expect(layout.joinPaneToScrollGroup(1, tiled_pane_id));
+    const standalone_pane_id = try layout.createTerminalPane(allocator, 11);
+    try layout.splitPaneWithLeaf(allocator, tiled_pane_id, standalone_pane_id, .vertical, true);
+
+    try std.testing.expect(layout.panesShareScrollGroup(1, tiled_pane_id));
+    try std.testing.expect(!layout.panesShareScrollGroup(1, standalone_pane_id));
+    try std.testing.expectEqual(@as(usize, 2), layout.scrollGroupPaneCount(1));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, standalone_pane_id), layout.adjacentScrollGroupPaneId(tiled_pane_id, .right));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 1), layout.adjacentScrollGroupPaneId(standalone_pane_id, .left));
+
+    const persisted = try layout.persistedWorkspaceJson(allocator);
+    defer allocator.free(persisted);
+    var restored = try WorkspaceLayout.initDefaultChat(allocator);
+    defer restored.deinit(allocator);
+    try restored.applyPersistedWorkspaceJson(allocator, persisted);
+
+    try std.testing.expect(restored.panesShareScrollGroup(1, tiled_pane_id));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 1), restored.paneById(tiled_pane_id).?.scroll_group_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, null), restored.paneById(standalone_pane_id).?.scroll_group_id);
 }
 
 test "workspace layout persists scrolling policy overrides" {

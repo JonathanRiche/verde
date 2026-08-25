@@ -63,6 +63,7 @@ pub const Draft = struct {
     terminal_font_size: f32 = app_config.DEFAULT_TERMINAL_FONT_SIZE,
     workspace_pane_gap: f32 = app_config.DEFAULT_WORKSPACE_PANE_GAP,
     workspace_panes_per_view: u8 = app_config.DEFAULT_WORKSPACE_PANES_PER_VIEW,
+    workspace_split_default_pane: app_config.WorkspaceSplitDefaultPane = .chat,
     workspace_scroll_direction: app_config.WorkspaceScrollDirection = .horizontal,
     workspace_scroll_override_enabled: bool = false,
     workspace_scroll_mode: app_config.WorkspaceScrollMode = .automatic,
@@ -291,6 +292,7 @@ pub fn syncSettingsDraftFromConfig(self: anytype) void {
         .terminal_font_size = self.app_config.terminal_font_size,
         .workspace_pane_gap = self.app_config.workspace_pane_gap,
         .workspace_panes_per_view = self.app_config.workspace_panes_per_view,
+        .workspace_split_default_pane = self.app_config.workspace_split_default_pane,
         .workspace_scroll_direction = self.app_config.workspace_scroll_direction,
         .workspace_scroll_override_enabled = workspace_scroll_override_enabled,
         .workspace_scroll_mode = workspace_scroll_mode,
@@ -332,6 +334,7 @@ pub fn isSettingsDraftDirty(self: anytype) bool {
     if (draft.terminal_font_size != self.app_config.terminal_font_size) return true;
     if (draft.workspace_pane_gap != self.app_config.workspace_pane_gap) return true;
     if (draft.workspace_panes_per_view != self.app_config.workspace_panes_per_view) return true;
+    if (draft.workspace_split_default_pane != self.app_config.workspace_split_default_pane) return true;
     if (draft.workspace_scroll_direction != self.app_config.workspace_scroll_direction) return true;
     var workspace_scroll_override_enabled = false;
     var workspace_scroll_mode = self.app_config.workspace_scroll_mode;
@@ -493,6 +496,7 @@ pub fn saveSettingsModal(self: anytype) !void {
     const next_panes_per_view = std.math.clamp(self.settings_controller.draft.workspace_panes_per_view, app_config.MIN_WORKSPACE_PANES_PER_VIEW, app_config.MAX_WORKSPACE_PANES_PER_VIEW);
     const panes_per_view_changed = next_panes_per_view != self.app_config.workspace_panes_per_view;
     self.app_config.workspace_panes_per_view = next_panes_per_view;
+    self.app_config.workspace_split_default_pane = self.settings_controller.draft.workspace_split_default_pane;
     self.app_config.workspace_scroll_direction = self.settings_controller.draft.workspace_scroll_direction;
     self.app_config.unzoom_on_pane_navigation = self.settings_controller.draft.unzoom_on_pane_navigation;
     self.app_config.reduced_motion = self.settings_controller.draft.reduced_motion;

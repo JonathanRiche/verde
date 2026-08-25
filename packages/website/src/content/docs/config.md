@@ -29,6 +29,7 @@ file. It is read on startup and on app refresh.
     "font_size": 20,
     "workspace_pane_gap": 12,
     "workspace_panes_per_view": 2,
+    "workspace_split_default_pane": "chat",
     "workspace_scroll_direction": "horizontal",
     "workspace_scroll_mode": "automatic",
     "workspace_scroll_threshold": 2,
@@ -108,8 +109,9 @@ Most of these options also appear in Settings:
 - **Workspace** — choose `automatic`, `always`, or `disabled` scrolling layout,
   set the automatic activation threshold (1–64 panes), choose horizontal or
   vertical scrolling, control how many panes fit in one view and their gap,
-  set the default open action for project files and folders, and choose whether
-  new chats create panes or replace an existing chat pane. Mode and threshold
+  set the default open action for project files and folders, choose whether new
+  chats create panes or replace an existing chat pane, and choose whether the
+  unshifted prefix split keys create GUI chats or terminals. Mode and threshold
   can inherit these global values or be overridden for the currently selected
   workspace. Drag-resized column widths are also saved per workspace and take
   precedence over panes-per-view sizing until reset. Pane gaps are omitted

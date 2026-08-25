@@ -1193,7 +1193,7 @@ fn renderAttentionClusterSection(
     for (rows[0..row_count], 0..) |row, active_index| {
         const project = &state.project_controller.projects.items[row.project_index];
         const row_rect: palette.Rect = .{ .x = x, .y = y, .w = rail_w, .h = theme.scaledUi(SIDEBAR_THREAD_ROW_HEIGHT_CSS) };
-        if (rowVisible(row_rect, list_clip)) renderOpenPaneRow(state, row.project_index, project, row.pane, row_rect, clip, true, true, active_index);
+        if (rowVisible(row_rect, list_clip)) renderOpenPaneRow(state, row.project_index, project, row.pane, row_rect, clip, true, true, active_index, false);
         y += theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS);
     }
 
@@ -1750,17 +1750,122 @@ fn renderOpenPanesSection(
 
     const indent = theme.scaledUi(SIDEBAR_ROW_INDENT_CSS);
     for (layout.panes.items, 0..) |*pane, pane_index| {
+        const group_id = layout.scrollGroupIdForPane(pane.id) orelse continue;
+        const group_count = layout.scrollGroupPaneCount(group_id);
+        if (group_count > 1) {
+            var seen = false;
+            for (layout.panes.items[0..pane_index]) |earlier| {
+                if (layout.scrollGroupIdForPane(earlier.id) == group_id) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) continue;
+            const root = layout.root orelse continue;
+            const rows = sidebarScrollGroupRows(layout, root, group_id);
+            const row_h = theme.scaledUi(SIDEBAR_THREAD_ROW_HEIGHT_CSS);
+            const tile_gap = theme.scaledUi(4.0);
+            const group_h = row_h * @as(f32, @floatFromInt(@max(rows, 1))) +
+                tile_gap * @as(f32, @floatFromInt(if (rows > 0) rows - 1 else 0));
+            const group_rect: palette.Rect = .{
+                .x = x + indent,
+                .y = y,
+                .w = rail_w - indent,
+                .h = group_h,
+            };
+            if (rowVisible(group_rect, list_clip)) {
+                renderOpenPaneGroupNode(state, project_index, project, root, group_id, group_rect, clip);
+            }
+            y += group_h + tile_gap;
+            continue;
+        }
         const row_rect: palette.Rect = .{
             .x = x + indent,
             .y = y,
             .w = rail_w - indent,
             .h = theme.scaledUi(SIDEBAR_THREAD_ROW_HEIGHT_CSS),
         };
-        if (rowVisible(row_rect, list_clip)) renderOpenPaneRow(state, project_index, project, pane, row_rect, clip, false, false, pane_index);
+        if (rowVisible(row_rect, list_clip)) renderOpenPaneRow(state, project_index, project, pane, row_rect, clip, false, false, pane_index, false);
         y += theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS);
     }
     y += theme.scaledUi(4.0);
     return y;
+}
+
+fn sidebarScrollGroupRows(
+    layout: *const native_state.WorkspaceLayout,
+    node: *const native_state.WorkspaceNode,
+    group_id: native_state.WorkspacePaneId,
+) usize {
+    return switch (node.*) {
+        .leaf => |pane_id| if (layout.scrollGroupIdForPane(pane_id) == group_id) 1 else 0,
+        .split => |split| blk: {
+            const first = sidebarScrollGroupRows(layout, split.first, group_id);
+            const second = sidebarScrollGroupRows(layout, split.second, group_id);
+            if (first == 0) break :blk second;
+            if (second == 0) break :blk first;
+            break :blk if (split.axis == .horizontal) first + second else @max(first, second);
+        },
+    };
+}
+
+// Clickable miniature split tree beneath one workspace row.
+fn renderOpenPaneGroupNode(
+    state: *runtime.AppState,
+    project_index: usize,
+    project: *const native_state.Project,
+    node: *const native_state.WorkspaceNode,
+    group_id: native_state.WorkspacePaneId,
+    rect: palette.Rect,
+    clip: palette.Rect,
+) void {
+    const layout = &project.workspace_layout;
+    switch (node.*) {
+        .leaf => |pane_id| {
+            if (layout.scrollGroupIdForPane(pane_id) != group_id) return;
+            const pane = layout.paneById(pane_id) orelse return;
+            queuePaletteRoundedRect(state, snapRect(rect), paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 150)), theme.scaledUi(6.0));
+            renderOpenPaneRow(state, project_index, project, pane, rect, clip, false, false, layout.paneIndexById(pane_id), true);
+            queuePaletteBorder(state, snapRect(rect), paletteColor(theme.withAlpha(theme.COLOR_TEXT_SUBTLE, 105)), theme.scaledUi(6.0), theme.scaledUi(1.0));
+        },
+        .split => |split| {
+            const first_rows = sidebarScrollGroupRows(layout, split.first, group_id);
+            const second_rows = sidebarScrollGroupRows(layout, split.second, group_id);
+            if (first_rows == 0 and second_rows == 0) return;
+            if (second_rows == 0) return renderOpenPaneGroupNode(state, project_index, project, split.first, group_id, rect, clip);
+            if (first_rows == 0) return renderOpenPaneGroupNode(state, project_index, project, split.second, group_id, rect, clip);
+            renderOpenPaneGroupSplit(state, project_index, project, split, group_id, rect, clip);
+        },
+    }
+}
+
+// Geometry for one branch point in the sidebar tile miniature.
+fn renderOpenPaneGroupSplit(
+    state: *runtime.AppState,
+    project_index: usize,
+    project: *const native_state.Project,
+    split: anytype,
+    group_id: native_state.WorkspacePaneId,
+    rect: palette.Rect,
+    clip: palette.Rect,
+) void {
+    const gap = theme.scaledUi(4.0);
+    const ratio = std.math.clamp(split.ratio, 0.22, 0.78);
+    if (split.axis == .vertical) {
+        const available = @max(rect.w - gap, 0.0);
+        const first_w = available * ratio;
+        const first_rect: palette.Rect = .{ .x = rect.x, .y = rect.y, .w = first_w, .h = rect.h };
+        const second_rect: palette.Rect = .{ .x = rect.x + first_w + gap, .y = rect.y, .w = available - first_w, .h = rect.h };
+        renderOpenPaneGroupNode(state, project_index, project, split.first, group_id, first_rect, clip);
+        renderOpenPaneGroupNode(state, project_index, project, split.second, group_id, second_rect, clip);
+        return;
+    }
+    const available = @max(rect.h - gap, 0.0);
+    const first_h = available * ratio;
+    const first_rect: palette.Rect = .{ .x = rect.x, .y = rect.y, .w = rect.w, .h = first_h };
+    const second_rect: palette.Rect = .{ .x = rect.x, .y = rect.y + first_h + gap, .w = rect.w, .h = available - first_h };
+    renderOpenPaneGroupNode(state, project_index, project, split.first, group_id, first_rect, clip);
+    renderOpenPaneGroupNode(state, project_index, project, split.second, group_id, second_rect, clip);
 }
 
 /// Renders one live pane row: provider glyph, truncated title, and a trailing
@@ -1777,6 +1882,7 @@ fn renderOpenPaneRow(
     show_workspace_tag: bool,
     active_shortcut: bool,
     shortcut_index: ?usize,
+    compact_tile: bool,
 ) void {
     const layout = &project.workspace_layout;
     const quick = if (layout.quick_pane) |value|
@@ -1795,8 +1901,10 @@ fn renderOpenPaneRow(
     addPaletteHit(rect, if (show_workspace_tag) .open_pane else .open_pane_reorder, project_index, pane.id);
 
     const cy = rect.y + rect.h * 0.5;
-    var icon_x = rect.x + theme.scaledUi(SIDEBAR_THREAD_ICON_LEADING_PAD_CSS);
-    var title_left = theme.scaledUi(SIDEBAR_THREAD_ICON_LEADING_PAD_CSS + SIDEBAR_THREAD_PROVIDER_GLYPH_CSS + SIDEBAR_THREAD_ICON_TITLE_GAP_CSS);
+    const leading_pad = if (compact_tile) 6.0 else SIDEBAR_THREAD_ICON_LEADING_PAD_CSS;
+    const icon_title_gap = if (compact_tile) 5.0 else SIDEBAR_THREAD_ICON_TITLE_GAP_CSS;
+    var icon_x = rect.x + theme.scaledUi(leading_pad);
+    var title_left = theme.scaledUi(leading_pad + SIDEBAR_THREAD_PROVIDER_GLYPH_CSS + icon_title_gap);
     const muted = theme.COLOR_TEXT_MUTED;
 
     if (show_workspace_tag) {
@@ -1918,7 +2026,7 @@ fn renderOpenPaneRow(
     // Status label computed before truncation so the title only surrenders
     // width while a label is actually present.
     var status_buf: [24]u8 = undefined;
-    const status_label = paneStatusLabelText(&status_buf, status, running, status_started_at_ms);
+    const status_label = if (compact_tile) "" else paneStatusLabelText(&status_buf, status, running, status_started_at_ms);
     var shortcut_buf: [16]u8 = undefined;
     const shortcut_label = if (state.ctrl_shortcut_hints_visible and shortcut_index != null and active_shortcut and state.shift_shortcut_hints_visible)
         if (state.command_controller.keyboard_config) |config|
@@ -2620,6 +2728,22 @@ test "ACTIVE row cycling wraps and enters from either edge" {
     try std.testing.expectEqual(@as(usize, 0), adjacentAttentionClusterRowIndex(&rows, 1, 33, 1));
     try std.testing.expectEqual(@as(usize, 2), adjacentAttentionClusterRowIndex(&rows, 0, null, -1));
     try std.testing.expectEqual(@as(usize, 0), adjacentAttentionClusterRowIndex(&rows, 0, null, 1));
+}
+
+test "sidebar tile miniature follows nested split rows" {
+    const allocator = std.testing.allocator;
+    var layout = try native_state.WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+
+    const right_pane_id = try layout.createTerminalPane(allocator, 10);
+    try layout.splitPaneWithLeaf(allocator, 1, right_pane_id, .vertical, true);
+    try std.testing.expect(layout.joinPaneToScrollGroup(1, right_pane_id));
+    try std.testing.expectEqual(@as(usize, 1), sidebarScrollGroupRows(&layout, layout.root.?, 1));
+
+    const bottom_right_pane_id = try layout.createTerminalPane(allocator, 11);
+    try layout.splitPaneWithLeaf(allocator, right_pane_id, bottom_right_pane_id, .horizontal, true);
+    try std.testing.expect(layout.joinPaneToScrollGroup(right_pane_id, bottom_right_pane_id));
+    try std.testing.expectEqual(@as(usize, 2), sidebarScrollGroupRows(&layout, layout.root.?, 1));
 }
 
 test "ACTIVE collection sees every restored chat pane and deduplicates one thread owner" {

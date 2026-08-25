@@ -352,6 +352,15 @@ fn scrollingPaneDirection(scroll_direction: app_config.WorkspaceScrollDirection,
     };
 }
 
+fn workspacePaneDirection(focus_direction: FocusDirection) runtime.WorkspacePaneDirection {
+    return switch (focus_direction) {
+        .left => .left,
+        .right => .right,
+        .up => .up,
+        .down => .down,
+    };
+}
+
 pub fn focusPaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool {
     if (pane_rect_count == 0) return false;
     if (state.project_controller.projects.items.len == 0) return false;
@@ -383,8 +392,14 @@ pub fn focusPaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool 
     }
 
     if (scrolling_navigation) {
-        const direction = scrollingPaneDirection(state.app_config.workspace_scroll_direction, dir) orelse return false;
-        const target = layout.adjacentTiledPaneIdInSidebarOrder(current_id, direction) orelse return false;
+        const direction = workspacePaneDirection(dir);
+        if (layout.neighborPaneId(current_id, direction)) |inner_target| {
+            if (layout.panesShareScrollGroup(current_id, inner_target)) {
+                return focusPaneNavigationTarget(state, inner_target, false);
+            }
+        }
+        const strip_direction = scrollingPaneDirection(state.app_config.workspace_scroll_direction, dir) orelse return false;
+        const target = layout.adjacentScrollGroupPaneId(current_id, strip_direction) orelse return false;
         return focusPaneNavigationTarget(state, target, false);
     }
 
@@ -582,7 +597,13 @@ fn findNeighborId(current_id: runtime.WorkspacePaneId, cur: palette.Rect, dir: F
 pub fn growPaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool {
     if (state.project_controller.projects.items.len == 0) return false;
     const layout = &state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout;
-    if (scrollingLayoutActive(state, layout)) return growScrollingPaneInDirection(state, layout, dir);
+    if (scrollingLayoutActive(state, layout)) {
+        const current_id = layout.focused_pane_id orelse return false;
+        const neighbor = layout.neighborPaneId(current_id, workspacePaneDirection(dir));
+        if (neighbor == null or !layout.panesShareScrollGroup(current_id, neighbor.?)) {
+            return growScrollingPaneInDirection(state, layout, dir);
+        }
+    }
     if (pane_rect_count == 0) return false;
     const current_id = layout.focused_pane_id orelse return false;
 
@@ -630,9 +651,25 @@ fn growScrollingPaneInDirection(
     dir: FocusDirection,
 ) bool {
     const delta_css = scrollingGrowDeltaCss(state.app_config.workspace_scroll_direction, dir) orelse return false;
-    const pane_id = layout.focused_pane_id orelse return false;
-    const pane = layout.paneById(pane_id) orelse return false;
-    if (!layout.rootContainsPane(pane_id)) return false;
+    const focused_pane_id = layout.focused_pane_id orelse return false;
+    if (!layout.rootContainsPane(focused_pane_id)) return false;
+    const group_id = layout.scrollGroupIdForPane(focused_pane_id) orelse return false;
+    var extent_pane_id = focused_pane_id;
+    var pane = layout.paneById(focused_pane_id) orelse return false;
+    var chose_default = false;
+    for (layout.panes.items) |*candidate| {
+        if (layout.scrollGroupIdForPane(candidate.id) != group_id) continue;
+        if (!chose_default) {
+            extent_pane_id = candidate.id;
+            pane = candidate;
+            chose_default = true;
+        }
+        if (candidate.scroll_extent_css != null or candidate.scroll_extent_ratio != null) {
+            extent_pane_id = candidate.id;
+            pane = candidate;
+            break;
+        }
+    }
 
     const vertical = state.app_config.workspace_scroll_direction == .vertical;
     const viewport_extent = if (vertical) last_workspace_rect.h else last_workspace_rect.w;
@@ -660,7 +697,7 @@ fn growScrollingPaneInDirection(
         scrollingPaneExtentRatio(next_css * ui_scale, viewport_extent, gap)
     else
         0.0;
-    if (!layout.setPaneScrollExtent(pane_id, next_css, extent_ratio)) return false;
+    if (!layout.setPaneScrollExtent(extent_pane_id, next_css, extent_ratio)) return false;
     // Re-reveal on the next frame so a wider pane is not left clipped.
     layout.scroll_revealed_pane_id = null;
     state.markDirty();
@@ -1479,14 +1516,19 @@ fn renderScrollingStrip(
         layout.scroll_pane_extent_ratio_override,
         theme.uiScaleFactor(),
     );
+    var group_ids: [MAX_WORKSPACE_PANE_RECTS]runtime.WorkspacePaneId = undefined;
+    var representative_pane_ids: [MAX_WORKSPACE_PANE_RECTS]runtime.WorkspacePaneId = undefined;
+    const pane_count = collectScrollingGroups(layout, &group_ids, &representative_pane_ids);
     var extents: [MAX_WORKSPACE_PANE_RECTS]f32 = undefined;
-    const pane_count = collectScrollingPaneExtents(
+    resolveScrollingGroupExtents(
         layout,
+        group_ids[0..pane_count],
+        representative_pane_ids[0..pane_count],
         default_extent,
         viewport_extent,
         gap,
         theme.uiScaleFactor(),
-        &extents,
+        extents[0..pane_count],
     );
     const target_viewport_extent = if (vertical) workspace.h else target_workspace_width;
     const target_default_extent = responsiveScrollingPaneExtent(
@@ -1498,13 +1540,15 @@ fn renderScrollingStrip(
         theme.uiScaleFactor(),
     );
     var target_extents: [MAX_WORKSPACE_PANE_RECTS]f32 = undefined;
-    const target_pane_count = collectScrollingPaneExtents(
+    resolveScrollingGroupExtents(
         layout,
+        group_ids[0..pane_count],
+        representative_pane_ids[0..pane_count],
         target_default_extent,
         target_viewport_extent,
         gap,
         theme.uiScaleFactor(),
-        &target_extents,
+        target_extents[0..pane_count],
     );
     const max_offset = scrollingStripMaxOffset(viewport_extent, extents[0..pane_count], gap);
     const offset: *f32 = if (vertical) &layout.scroll_offset_y else &layout.scroll_offset_x;
@@ -1518,7 +1562,7 @@ fn renderScrollingStrip(
         if (layout.focused_pane_id) |focused_id| {
             if (layout.rootContainsPane(focused_id) and layout.scroll_revealed_pane_id != focused_id) {
                 layout.scroll_snap_deadline_ms = 0;
-                if (paneIndexInSidebarOrder(layout, focused_id)) |focused_index| {
+                if (scrollGroupIndexForPane(layout, focused_id)) |focused_index| {
                     const revealed_target = revealedScrollTargetForPane(
                         target.*,
                         viewport_extent,
@@ -1564,21 +1608,30 @@ fn renderScrollingStrip(
 
     const command_start = state.palette_overlay_batch.commands.items.len;
     const text_run_start = state.palette_overlay_batch.text_runs.items.len;
-    var pane_index: usize = 0;
     var origin: f32 = 0.0;
-    for (layout.panes.items) |pane| {
-        if (!layout.rootContainsPane(pane.id)) continue;
-        if (pane_index >= pane_count) break;
+    const root = layout.root orelse return;
+    for (group_ids[0..pane_count], 0..) |group_id, pane_index| {
         const pane_extent = extents[pane_index];
         const target_pane_width = if (vertical)
             target_workspace_width
-        else if (pane_index < target_pane_count)
-            target_extents[pane_index]
         else
-            pane_extent;
-        renderScrollingPane(state, pane.id, workspace, direction, origin, pane_extent, target_pane_width, gap, offset.*, pane_index);
+            target_extents[pane_index];
+        renderScrollingGroup(
+            state,
+            layout,
+            root,
+            group_id,
+            representative_pane_ids[pane_index],
+            workspace,
+            direction,
+            origin,
+            pane_extent,
+            target_pane_width,
+            gap,
+            offset.*,
+            pane_index,
+        );
         origin += pane_extent + gap;
-        pane_index += 1;
     }
     clipWorkspaceBatch(state, command_start, text_run_start, workspace);
     clipWorkspaceHitCaches(workspace);
@@ -1653,7 +1706,7 @@ fn renderScrollingEdgeNavigation(
     if (pane_drag.pending or pane_drag.active or resize_drag != null or quick_pane_drag != null or split_menu_open_for != null) return;
     if (state.currentProjectQuickPane()) |quick| if (quick.visible) return;
 
-    const focused_index = if (layout.focused_pane_id) |pane_id| paneIndexInSidebarOrder(layout, pane_id) else null;
+    const focused_index = if (layout.focused_pane_id) |pane_id| scrollGroupIndexForPane(layout, pane_id) else null;
     const available = scrollingEdgeAvailability(focused_index, pane_count);
     if (!available.previous and !available.next) return;
 
@@ -1714,16 +1767,24 @@ fn scrollingEdgeProximityContains(x: f32, y: f32) bool {
 }
 
 fn focusScrollingEdgePane(state: *runtime.AppState, edge: ScrollingEdgeDirection) void {
-    const direction: FocusDirection = switch (state.app_config.workspace_scroll_direction) {
+    if (state.project_controller.projects.items.len == 0) return;
+    const layout = &state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout;
+    const focused_pane_id = layout.focused_pane_id orelse return;
+    const direction: runtime.WorkspacePaneDirection = switch (state.app_config.workspace_scroll_direction) {
         .horizontal => if (edge == .previous) .left else .right,
         .vertical => if (edge == .previous) .up else .down,
     };
-    _ = focusPaneInDirection(state, direction);
+    const target = layout.adjacentScrollGroupPaneId(focused_pane_id, direction) orelse return;
+    _ = focusPaneNavigationTarget(state, target, false);
 }
 
-fn renderScrollingPane(
+// One scrolling workspace item, including any nested tiled panes.
+fn renderScrollingGroup(
     state: *runtime.AppState,
-    pane_id: runtime.WorkspacePaneId,
+    layout: *const runtime.WorkspaceLayout,
+    root: *const runtime.WorkspaceNode,
+    group_id: runtime.WorkspacePaneId,
+    representative_pane_id: runtime.WorkspacePaneId,
     workspace: palette.Rect,
     direction: app_config.WorkspaceScrollDirection,
     origin: f32,
@@ -1739,7 +1800,7 @@ fn renderScrollingPane(
         .vertical => .{ .x = workspace.x, .y = workspace.y + screen_origin, .w = workspace.w, .h = pane_extent },
     };
     if (intersectRects(rect, workspace) == null) return;
-    renderLeafWithin(state, pane_id, rect, workspace, target_pane_width);
+    renderScrollGroupNode(state, layout, root, group_id, rect, target_pane_width);
     const gutter: palette.Rect = switch (direction) {
         .horizontal => .{ .x = rect.x + rect.w, .y = workspace.y, .w = gap, .h = workspace.h },
         .vertical => .{ .x = workspace.x, .y = rect.y + rect.h, .w = workspace.w, .h = gap },
@@ -1757,8 +1818,117 @@ fn renderScrollingPane(
         .horizontal => .{ .x = rect.x + rect.w - grip_extent * 0.5, .y = workspace.y, .w = grip_extent, .h = workspace.h },
         .vertical => .{ .x = workspace.x, .y = rect.y + rect.h - grip_extent * 0.5, .w = workspace.w, .h = grip_extent },
     };
-    appendScrollingResizeHit(pane_id, axis, leading_grip, workspace, pane_index, offset, origin, pane_extent, true);
-    appendScrollingResizeHit(pane_id, axis, trailing_grip, workspace, pane_index, offset, origin, pane_extent, false);
+    appendScrollingResizeHit(representative_pane_id, axis, leading_grip, workspace, pane_index, offset, origin, pane_extent, true);
+    appendScrollingResizeHit(representative_pane_id, axis, trailing_grip, workspace, pane_index, offset, origin, pane_extent, false);
+}
+
+fn nodeContainsScrollGroup(
+    layout: *const runtime.WorkspaceLayout,
+    node: *const runtime.WorkspaceNode,
+    group_id: runtime.WorkspacePaneId,
+) bool {
+    return switch (node.*) {
+        .leaf => |pane_id| layout.scrollGroupIdForPane(pane_id) == group_id,
+        .split => |split| nodeContainsScrollGroup(layout, split.first, group_id) or
+            nodeContainsScrollGroup(layout, split.second, group_id),
+    };
+}
+
+// Nested tiled region inside one scrolling workspace item.
+fn renderScrollGroupNode(
+    state: *runtime.AppState,
+    layout: *const runtime.WorkspaceLayout,
+    node: *const runtime.WorkspaceNode,
+    group_id: runtime.WorkspacePaneId,
+    rect: palette.Rect,
+    target_width: f32,
+) void {
+    switch (node.*) {
+        .leaf => |pane_id| {
+            if (layout.scrollGroupIdForPane(pane_id) == group_id) {
+                renderLeafWithTranscriptLayoutWidth(state, pane_id, rect, target_width);
+            }
+        },
+        .split => |split| {
+            const first_visible = nodeContainsScrollGroup(layout, split.first, group_id);
+            const second_visible = nodeContainsScrollGroup(layout, split.second, group_id);
+            if (!first_visible and !second_visible) return;
+            if (!second_visible) return renderScrollGroupNode(state, layout, split.first, group_id, rect, target_width);
+            if (!first_visible) return renderScrollGroupNode(state, layout, split.second, group_id, rect, target_width);
+            renderScrollGroupSplit(state, layout, split, group_id, rect, target_width);
+        },
+    }
+}
+
+// Split geometry within one scrolling tile group.
+fn renderScrollGroupSplit(
+    state: *runtime.AppState,
+    layout: *const runtime.WorkspaceLayout,
+    split: anytype,
+    group_id: runtime.WorkspacePaneId,
+    rect: palette.Rect,
+    target_width: f32,
+) void {
+    const gap = theme.scaledUi(1.0);
+    if (split.axis == .vertical) {
+        const widths = verticalSplitWidths(rect.w, split.ratio, gap);
+        const target_widths = verticalSplitWidths(target_width, split.ratio, gap);
+        const first_rect: palette.Rect = .{ .x = rect.x, .y = rect.y, .w = widths.first, .h = rect.h };
+        const gutter_rect: palette.Rect = .{ .x = rect.x + widths.first, .y = rect.y, .w = gap, .h = rect.h };
+        const second_rect: palette.Rect = .{ .x = gutter_rect.x + gap, .y = rect.y, .w = widths.second, .h = rect.h };
+        renderScrollGroupNode(state, layout, split.first, group_id, first_rect, target_widths.first);
+        renderScrollGroupGutter(state, layout, split.first, split.second, group_id, .vertical, gutter_rect, rect);
+        renderScrollGroupNode(state, layout, split.second, group_id, second_rect, target_widths.second);
+        return;
+    }
+
+    const first_h = @max(theme.scaledUi(160.0), rect.h * split.ratio - gap * 0.5);
+    const second_h = @max(theme.scaledUi(120.0), rect.h - first_h - gap);
+    const clamped_first_h = @max(theme.scaledUi(120.0), rect.h - second_h - gap);
+    const first_rect: palette.Rect = .{ .x = rect.x, .y = rect.y, .w = rect.w, .h = clamped_first_h };
+    const gutter_rect: palette.Rect = .{ .x = rect.x, .y = rect.y + clamped_first_h, .w = rect.w, .h = gap };
+    const second_rect: palette.Rect = .{ .x = rect.x, .y = gutter_rect.y + gap, .w = rect.w, .h = @max(rect.h - clamped_first_h - gap, theme.scaledUi(120.0)) };
+    renderScrollGroupNode(state, layout, split.first, group_id, first_rect, target_width);
+    renderScrollGroupGutter(state, layout, split.first, split.second, group_id, .horizontal, gutter_rect, rect);
+    renderScrollGroupNode(state, layout, split.second, group_id, second_rect, target_width);
+}
+
+fn firstPaneIdInScrollGroup(
+    layout: *const runtime.WorkspaceLayout,
+    node: *const runtime.WorkspaceNode,
+    group_id: runtime.WorkspacePaneId,
+) ?runtime.WorkspacePaneId {
+    return switch (node.*) {
+        .leaf => |pane_id| if (layout.scrollGroupIdForPane(pane_id) == group_id) pane_id else null,
+        .split => |split| firstPaneIdInScrollGroup(layout, split.first, group_id) orelse
+            firstPaneIdInScrollGroup(layout, split.second, group_id),
+    };
+}
+
+// Resize gutter between two branches of a scrolling tile group.
+fn renderScrollGroupGutter(
+    state: *runtime.AppState,
+    layout: *const runtime.WorkspaceLayout,
+    first: *const runtime.WorkspaceNode,
+    second: *const runtime.WorkspaceNode,
+    group_id: runtime.WorkspacePaneId,
+    axis: runtime.WorkspaceSplitAxis,
+    rect: palette.Rect,
+    split_rect: palette.Rect,
+) void {
+    queueRect(state, rect, paletteColor(theme.COLOR_PANEL_MUTED));
+    const hit_rect: palette.Rect = if (axis == .vertical)
+        .{ .x = rect.x - theme.scaledUi(4.0), .y = rect.y, .w = rect.w + theme.scaledUi(8.0), .h = rect.h }
+    else
+        .{ .x = rect.x, .y = rect.y - theme.scaledUi(4.0), .w = rect.w, .h = rect.h + theme.scaledUi(8.0) };
+    appendHit(.{
+        .pane_id = firstPaneIdInScrollGroup(layout, first, group_id) orelse return,
+        .sibling_pane_id = firstPaneIdInScrollGroup(layout, second, group_id) orelse return,
+        .action = .resize_split,
+        .axis = axis,
+        .rect = hit_rect,
+        .split_rect = split_rect,
+    });
 }
 
 fn appendScrollingResizeHit(
@@ -1787,12 +1957,23 @@ fn appendScrollingResizeHit(
     });
 }
 
-fn paneIndexInSidebarOrder(layout: *const runtime.WorkspaceLayout, pane_id: runtime.WorkspacePaneId) ?usize {
-    var tiled_index: usize = 0;
-    for (layout.panes.items) |pane| {
+fn scrollGroupIndexForPane(layout: *const runtime.WorkspaceLayout, pane_id: runtime.WorkspacePaneId) ?usize {
+    const wanted_group = layout.scrollGroupIdForPane(pane_id) orelse return null;
+    var group_index: usize = 0;
+    for (layout.panes.items, 0..) |pane, pane_index| {
         if (!layout.rootContainsPane(pane.id)) continue;
-        if (pane.id == pane_id) return tiled_index;
-        tiled_index += 1;
+        const group_id = layout.scrollGroupIdForPane(pane.id) orelse continue;
+        var seen = false;
+        for (layout.panes.items[0..pane_index]) |earlier| {
+            if (!layout.rootContainsPane(earlier.id)) continue;
+            if (layout.scrollGroupIdForPane(earlier.id) == group_id) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) continue;
+        if (group_id == wanted_group) return group_index;
+        group_index += 1;
     }
     return null;
 }
@@ -1834,22 +2015,53 @@ fn scrollingMaxOffset(viewport_extent: f32, pane_extent: f32, gap: f32, pane_cou
     return @max(ordinary_max, final_pane_origin);
 }
 
-fn collectScrollingPaneExtents(
+fn collectScrollingGroups(
     layout: *const runtime.WorkspaceLayout,
+    group_ids: *[MAX_WORKSPACE_PANE_RECTS]runtime.WorkspacePaneId,
+    representative_pane_ids: *[MAX_WORKSPACE_PANE_RECTS]runtime.WorkspacePaneId,
+) usize {
+    var count: usize = 0;
+    for (layout.panes.items, 0..) |pane, pane_index| {
+        if (!layout.rootContainsPane(pane.id)) continue;
+        const group_id = layout.scrollGroupIdForPane(pane.id) orelse continue;
+        var seen = false;
+        for (layout.panes.items[0..pane_index]) |earlier| {
+            if (!layout.rootContainsPane(earlier.id)) continue;
+            if (layout.scrollGroupIdForPane(earlier.id) == group_id) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) continue;
+        if (count >= group_ids.len) break;
+        group_ids[count] = group_id;
+        representative_pane_ids[count] = pane.id;
+        count += 1;
+    }
+    return count;
+}
+
+fn resolveScrollingGroupExtents(
+    layout: *const runtime.WorkspaceLayout,
+    group_ids: []const runtime.WorkspacePaneId,
+    representative_pane_ids: []const runtime.WorkspacePaneId,
     default_extent: f32,
     viewport_extent: f32,
     gap: f32,
     ui_scale: f32,
-    extents: *[MAX_WORKSPACE_PANE_RECTS]f32,
-) usize {
-    var count: usize = 0;
-    for (layout.panes.items) |pane| {
-        if (!layout.rootContainsPane(pane.id)) continue;
-        if (count >= extents.len) break;
-        extents[count] = scrollingPaneResolvedExtent(&pane, default_extent, viewport_extent, gap, ui_scale);
-        count += 1;
+    extents: []f32,
+) void {
+    for (group_ids, representative_pane_ids, extents) |group_id, representative_pane_id, *extent| {
+        var resolved_pane = layout.paneById(representative_pane_id) orelse continue;
+        for (layout.panes.items) |*pane| {
+            if (layout.scrollGroupIdForPane(pane.id) != group_id) continue;
+            if (pane.scroll_extent_css != null or pane.scroll_extent_ratio != null) {
+                resolved_pane = pane;
+                break;
+            }
+        }
+        extent.* = scrollingPaneResolvedExtent(resolved_pane, default_extent, viewport_extent, gap, ui_scale);
     }
-    return count;
 }
 
 fn scrollingPaneResolvedExtent(
@@ -3125,6 +3337,34 @@ test "variable scrolling extents keep a uniform strip equivalent" {
     const mixed = [_]f32{ 700.0, 400.0, 500.0 };
     try std.testing.expectApproxEqAbs(@as(f32, 1112.0), scrollingPaneOrigin(&mixed, 12.0, 2), 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 1112.0), leadingScrollTargetForPane(&mixed, 12.0, 2, 2000.0), 0.0001);
+}
+
+test "scrolling strip collects a tiled group as one item" {
+    const allocator = std.testing.allocator;
+    var layout = try runtime.WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+
+    const tiled_pane_id = try layout.createTerminalPane(allocator, 10);
+    try layout.splitPaneWithLeaf(allocator, 1, tiled_pane_id, .vertical, true);
+    try std.testing.expect(layout.joinPaneToScrollGroup(1, tiled_pane_id));
+    const standalone_pane_id = try layout.createTerminalPane(allocator, 11);
+    try layout.splitPaneWithLeaf(allocator, tiled_pane_id, standalone_pane_id, .vertical, true);
+    try std.testing.expect(layout.setPaneScrollExtent(tiled_pane_id, 640.0, 0.5));
+
+    var group_ids: [MAX_WORKSPACE_PANE_RECTS]runtime.WorkspacePaneId = undefined;
+    var representative_ids: [MAX_WORKSPACE_PANE_RECTS]runtime.WorkspacePaneId = undefined;
+    const count = collectScrollingGroups(&layout, &group_ids, &representative_ids);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqual(@as(runtime.WorkspacePaneId, 1), group_ids[0]);
+    try std.testing.expectEqual(standalone_pane_id, group_ids[1]);
+    try std.testing.expectEqual(@as(runtime.WorkspacePaneId, 1), representative_ids[0]);
+
+    var extents: [MAX_WORKSPACE_PANE_RECTS]f32 = undefined;
+    resolveScrollingGroupExtents(&layout, group_ids[0..count], representative_ids[0..count], 500.0, 1292.0, 12.0, 1.0, extents[0..count]);
+    try std.testing.expectApproxEqAbs(@as(f32, 640.0), extents[0], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 500.0), extents[1], 0.0001);
+    try std.testing.expectEqual(@as(?usize, 0), scrollGroupIndexForPane(&layout, tiled_pane_id));
+    try std.testing.expectEqual(@as(?usize, 1), scrollGroupIndexForPane(&layout, standalone_pane_id));
 }
 
 test "scrolling grow keys follow the strip axis" {

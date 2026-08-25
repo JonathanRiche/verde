@@ -44,14 +44,17 @@ in your Verde config — see [Remapping](#remapping) below.
 Pane cycling wraps at either end. When a pane is zoomed, cycling switches the
 zoomed pane without restoring the split layout.
 
-### Focus (vim-style)
+### Focus
 
-| Combo    | Action                          |
-| -------- | ------------------------------- |
-| `Ctrl+H` or `Ctrl+Left` | Focus the pane or horizontal strip item to the left  |
-| `Ctrl+L` or `Ctrl+Right` | Focus the pane or horizontal strip item to the right |
-| `Ctrl+K` or `Ctrl+Up` | Focus the pane or vertical strip item above |
-| `Ctrl+J` or `Ctrl+Down` | Focus the pane or vertical strip item below |
+| Combo        | Action                                           |
+| ------------ | ------------------------------------------------ |
+| `Ctrl+Left`  | Focus the pane or horizontal strip item to the left  |
+| `Ctrl+Right` | Focus the pane or horizontal strip item to the right |
+| `Ctrl+Up`    | Focus the pane or vertical strip item above          |
+| `Ctrl+Down`  | Focus the pane or vertical strip item below          |
+`Ctrl+H/J/K/L` are intentionally unbound by default. Set the corresponding
+`keybinds.workspace.focus_left/down/up/right` values in `verde.json` to opt in.
+
 
 `Alt+arrow` combos are no longer focus aliases — `Alt+↑` / `Alt+↓` now cycle
 between workspaces (see the sidebar table above).
@@ -116,6 +119,133 @@ these actions yourself — see the table of binding keys below.
 
 Transcript scrolling is **direct** — no inertia or velocity decay. When input
 stops, the view stops. Do not expect a multi-frame glide.
+
+## Prefix mode (tmux-style)
+
+Prefix mode is **off by default**. When enabled, pressing the prefix chord
+(`Ctrl+B` by default) arms Verde for one keypress: the next key resolves
+against the prefix table below instead of reaching the focused pane. While
+armed, a one-line status bar appears along the bottom (`PREFIX  esc cancel
+Ctrl+B send prefix  w workspace nav  ? keybinds`); press `?` to open the full cheat sheet of
+every second key — including your own `command` scripts — without dropping the
+chord. `Esc` cancels,
+an unbound key is swallowed, and pressing the prefix twice sends the literal
+chord to the focused terminal (tmux `send-prefix`).
+
+Every built-in command has a default seat in the prefix table, so turning it
+on exposes the whole command surface without remapping anything:
+
+```json
+{ "keybinds": { "prefix": true } }
+```
+
+Change the prefix chord with a string (which also enables prefix mode), or use
+the object form for full control:
+
+```json
+{
+  "keybinds": {
+    "prefix": {
+      "enabled": true,
+      "key": ["Ctrl+A", "Ctrl+B"],
+      "defaults": true,
+      "bindings": {
+        "c": "new_thread",
+        "g": { "command": "lazygit" },
+        "Shift+3": { "action": "workspace.select.3" },
+        "z": null
+      }
+    }
+  }
+}
+```
+
+- `key` — one accelerator or an array. Any of them arms the prefix.
+- `defaults` — set to `false` to drop the built-in table and start empty.
+- `bindings` — keyed by the second key's accelerator (`"x"`, `"Shift+X"`,
+  `"Ctrl+Left"`, `"Comma"`). A string value is an action name; `null`
+  removes a default; `{ "command": "..." }` runs a shell script through
+  `sh -lc` with the current project as the working directory and the project
+  path as `$1` (the same contract as custom `open.default` actions).
+
+Direct shortcuts keep working alongside prefix mode. Modifier state is exact:
+`Ctrl+B` then `x` is different from `Ctrl+B` then `Ctrl+X`, so release `Ctrl`
+before the second key unless the binding uses it.
+
+### Workspace menu
+
+`prefix w` opens the herdr-style **NAVIGATE** workspace menu. The status bar
+switches to `» NAVIGATE  esc back  Up Prev workspace  Down Next workspace  Tab Next pane …`.
+Running any bound action closes the menu immediately; an unbound key leaves it
+open so you can choose again. Press `Esc` to close it without running anything.
+
+Defaults: `Up`/`Down` previous/next workspace, `Tab`/`Shift+Tab` next/previous
+pane, `h j k l` focus, `c` new thread, `v` / `-` split the configured default
+pane type, `Shift+V` / `Shift+-` split the other type, `x` close, `z` zoom,
+`p` command palette, `1`–`0` select workspace, `?` cheat sheet.
+
+The table is overridable exactly like `bindings`, under `"navigate"`:
+
+```json
+{ "keybinds": { "prefix": { "navigate": { "Up": null, "g": { "command": "lazygit" } } } } }
+```
+
+### Default prefix table
+
+| After `Ctrl+B`                   | Action                                            |
+| -------------------------------- | ------------------------------------------------- |
+| `?`                              | `prefix.keybinds` (cheat sheet, stays armed)      |
+| `w`                              | `prefix.navigate` (one-shot workspace menu)        |
+| `p`                              | `command_palette`                                 |
+| `t`                              | `new_thread`                                      |
+| `r`                              | `refresh`                                         |
+| `o` / `e`                        | `open` / `open_editor`                            |
+| `Space`                          | `companion`                                       |
+| `s` / `Shift+S`                  | `sidebar` / `sidebar_hidden`                      |
+| `b`                              | `browser`                                         |
+| `` ` ``                          | `terminal.toggle`                                 |
+| `q`                              | `workspace.toggle_quick_pane`                     |
+| `x` / `Shift+X`                  | `workspace.close` / `workspace.close_current`     |
+| `z`                              | `workspace.toggle_maximize`                       |
+| `i`                              | `workspace.focus_prompt`                          |
+| `c` / `Shift+C`                  | `workspace.split_chat_vertical` / `_horizontal`   |
+| `v` / `-`                        | Configured default pane, vertical / horizontal       |
+| `Shift+V` / `Shift+-`            | Other pane type, vertical / horizontal                |
+| `h` `j` `k` `l`, arrows          | `workspace.focus_*`                               |
+| `Shift+H/J/K/L`                  | `workspace.move_*`                                |
+| `Ctrl+H/J/K/L`, `Ctrl+arrows`    | `workspace.grow_*`                                |
+| `n` / `Shift+N`                  | `workspace.pane_next` / `pane_previous`           |
+| `[` / `]`                        | `workspace.previous` / `next`                     |
+| `Shift+[` / `Shift+]`            | `workspace.active_previous` / `active_next`       |
+| `1 … 9`, `0`                     | `workspace.pane_select.1 … 10`                    |
+| `Shift+1 … Shift+0`              | `workspace.select.1 … 10`                         |
+| `Ctrl+1 … Ctrl+0`                | `workspace.active_select.1 … 10`                  |
+| `Shift+Up` / `Shift+Down`        | `chat_up` / `chat_down`                           |
+| `PageUp` / `PageDown`            | `chat_page_up` / `chat_page_down`                 |
+| `m` / `Shift+M`                  | `chat.model_picker` / `chat.run_config`           |
+| `Ctrl+T` / `Shift+W`             | `terminal.new_tab` / `terminal.close`             |
+| `,`                              | `terminal.rename_tab`                             |
+| `Ctrl+PageUp` / `Ctrl+PageDown`  | `terminal.tab_previous` / `tab_next`              |
+| `Alt+arrows`                     | `terminal.split_*`                                |
+| `Alt+Shift+arrows`               | `terminal.focus_*`                                |
+
+The default pane type is GUI chat. Change **Settings → Workspace → Prefix split pane**
+or set `ui.workspace_split_default_pane` to `"terminal"` to invert the pair.
+
+Terminal and chat actions only apply while a pane of that kind is focused,
+exactly like their direct shortcuts.
+
+### Prefix action names
+
+Action names mirror the remapping keys below, joined with `.` for nested
+groups: `refresh`, `open`, `open_editor`, `new_thread`, `command_palette`,
+`companion`, `sidebar`, `sidebar_hidden`, `browser`, `chat_up`, `chat_down`,
+`chat_page_up`, `chat_page_down`, `chat.model_picker`, `chat.run_config`,
+`terminal.toggle`, `prefix.keybinds`, `prefix.navigate`, and `terminal.<key>`
+for every terminal binding. The dynamic split names are `workspace.split_default_*`
+and `workspace.split_alternate_*`, alongside every `workspace.<key>`. Positional actions take a
+1-based ordinal: `workspace.select.N`, `workspace.pane_select.N`,
+`workspace.active_select.N`.
 
 ## Remapping
 
@@ -202,6 +332,7 @@ or an array of shortcuts.
 | chat        | `chat_up`, `chat_down`, `chat_page_up`, `chat_page_down`                                                                                                                                                                          |
 | `workspace` | `split_chat_vertical`, `split_chat_horizontal`, `split_terminal_vertical`, `split_terminal_horizontal`, `toggle_maximize`, `close`, `close_current`, `focus_left`, `focus_right`, `focus_up`, `focus_down`, `focus_prompt`, `pane_previous`, `pane_next`, `active_select`, `pane_select`, `move_*`, `grow_*`, `select`, `previous`, `next` |
 | `terminal`  | `new_tab`, `close`, `rename_tab`, `tab_previous`, `tab_next`, `split_up`, `split_down`, `split_left`, `split_right`, `focus_up`, `focus_down`, `focus_left`, `focus_right`                                                       |
+| `prefix`    | `enabled`, `key`, `defaults`, `bindings`, `navigate` — see [Prefix mode](#prefix-mode-tmux-style)                                                                                                                                       |
 
 Keybinds are loaded on startup and on app refresh. See [Configuration &
 state](/docs/config) for the full `verde.json` schema and where state lives.

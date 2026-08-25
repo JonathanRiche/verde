@@ -45,6 +45,8 @@ pub const Control = enum(u8) {
     new_chat_reasoning_dropdown,
     new_chat_new_pane,
     new_chat_replace_pane,
+    workspace_split_default_chat,
+    workspace_split_default_terminal,
     open_folder,
     open_editor,
     open_cursor,
@@ -181,6 +183,9 @@ const SettingsLayout = struct {
     custom_open: ?palette.Rect = null,
     new_chat_new_pane: palette.Rect,
     new_chat_replace_pane: palette.Rect,
+    workspace_split_default_chat: palette.Rect,
+    workspace_split_default_terminal: palette.Rect,
+    workspace_split_default_hint_y: f32,
     file_links_neovim_pane: palette.Rect,
     file_links_hint_y: f32,
     workspace_unzoom_on_navigation: palette.Rect,
@@ -337,6 +342,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const experimental_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.row_h + m.inner_gap + m.label_h;
     const workspace_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + open_grid_h + custom_extra +
         m.row_gap + m.label_h + m.inner_gap + m.row_h +
+        m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h +
         m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h +
         m.row_gap + m.row_h + m.inner_gap + m.label_h +
         m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h +
@@ -539,7 +545,13 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const new_chat_cell_w = (content_w - m.card_pad * 2.0) * 0.5;
     const new_chat_new_pane: palette.Rect = .{ .x = open_x, .y = new_chat_y, .w = new_chat_cell_w, .h = m.row_h };
     const new_chat_replace_pane: palette.Rect = .{ .x = new_chat_new_pane.x + new_chat_cell_w, .y = new_chat_y, .w = new_chat_cell_w, .h = m.row_h };
-    const file_links_label_y = new_chat_y + m.row_h + m.row_gap;
+    const workspace_split_default_label_y = new_chat_y + m.row_h + m.row_gap;
+    const workspace_split_default_y = workspace_split_default_label_y + m.label_h + m.inner_gap;
+    const workspace_split_default_w = (content_w - m.card_pad * 2.0) * 0.5;
+    const workspace_split_default_chat: palette.Rect = .{ .x = open_x, .y = workspace_split_default_y, .w = workspace_split_default_w, .h = m.row_h };
+    const workspace_split_default_terminal: palette.Rect = .{ .x = workspace_split_default_chat.x + workspace_split_default_w, .y = workspace_split_default_y, .w = workspace_split_default_w, .h = m.row_h };
+    const workspace_split_default_hint_y = workspace_split_default_y + m.row_h + m.inner_gap;
+    const file_links_label_y = workspace_split_default_hint_y + m.label_h + m.row_gap;
     const file_links_y = file_links_label_y + m.label_h + m.inner_gap;
     const file_links_neovim_pane: palette.Rect = .{ .x = open_x, .y = file_links_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
     const file_links_hint_y = file_links_y + m.row_h + m.inner_gap;
@@ -679,6 +691,9 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .open_cells = open_cells,
         .custom_open = custom_open,
         .new_chat_new_pane = new_chat_new_pane,
+        .workspace_split_default_chat = workspace_split_default_chat,
+        .workspace_split_default_terminal = workspace_split_default_terminal,
+        .workspace_split_default_hint_y = workspace_split_default_hint_y,
         .new_chat_replace_pane = new_chat_replace_pane,
         .file_links_neovim_pane = file_links_neovim_pane,
         .file_links_hint_y = file_links_hint_y,
@@ -990,6 +1005,8 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     }
     queueControlHit(state, layout.new_chat_new_pane, layout.body_clip, .new_chat_new_pane, queue_hit);
     queueControlHit(state, layout.new_chat_replace_pane, layout.body_clip, .new_chat_replace_pane, queue_hit);
+    queueControlHit(state, layout.workspace_split_default_chat, layout.body_clip, .workspace_split_default_chat, queue_hit);
+    queueControlHit(state, layout.workspace_split_default_terminal, layout.body_clip, .workspace_split_default_terminal, queue_hit);
     queueControlHit(state, layout.file_links_neovim_pane, layout.body_clip, .file_links_neovim_pane, queue_hit);
     queueControlHit(state, layout.workspace_unzoom_on_navigation, layout.body_clip, .workspace_unzoom_on_navigation, queue_hit);
     queueControlHit(state, layout.workspace_scroll_use_global, layout.body_clip, .workspace_scroll_use_global, queue_hit);
@@ -1204,6 +1221,29 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         isControlHovered(state, .new_chat_replace_pane),
         layout.body_clip,
     );
+    queueText(state, .{
+        .x = layout.workspace_split_default_chat.x,
+        .y = layout.workspace_split_default_chat.y - m.inner_gap - m.label_h,
+        .w = layout.workspace_split_default_chat.w + layout.workspace_split_default_terminal.w,
+        .h = m.label_h,
+    }, "Prefix split pane", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
+    drawSegmentedPair(
+        state,
+        layout.workspace_split_default_chat,
+        layout.workspace_split_default_terminal,
+        "GUI chat",
+        "Terminal",
+        state.settings_controller.draft.workspace_split_default_pane == .chat,
+        isControlHovered(state, .workspace_split_default_chat),
+        isControlHovered(state, .workspace_split_default_terminal),
+        layout.body_clip,
+    );
+    queueText(state, .{
+        .x = layout.workspace_split_default_chat.x,
+        .y = layout.workspace_split_default_hint_y,
+        .w = layout.workspace_split_default_chat.w + layout.workspace_split_default_terminal.w,
+        .h = m.label_h,
+    }, "V and − create this pane type; hold Shift to create the other type", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
     queueText(state, .{
         .x = layout.file_links_neovim_pane.x,
         .y = layout.file_links_neovim_pane.y - m.inner_gap - m.label_h,
@@ -1626,6 +1666,8 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         .workspace_panes_per_view_inc => {
             if (state.settings_controller.draft.workspace_panes_per_view < app_config.MAX_WORKSPACE_PANES_PER_VIEW) state.settings_controller.draft.workspace_panes_per_view += 1;
         },
+        .workspace_split_default_chat => state.settings_controller.draft.workspace_split_default_pane = .chat,
+        .workspace_split_default_terminal => state.settings_controller.draft.workspace_split_default_pane = .terminal,
         .workspace_scroll_use_global => {
             state.settings_controller.draft.workspace_scroll_override_enabled = false;
             state.settings_controller.draft.workspace_scroll_mode = state.app_config.workspace_scroll_mode;

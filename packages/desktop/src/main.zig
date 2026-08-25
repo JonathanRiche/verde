@@ -1601,6 +1601,18 @@ const HotkeyPaneKind = enum { chat, terminal };
 // 2x2 grid placement (gridNewPanePlacement); once the grid is full (or the
 // workspace is maximized) it falls back to splitting the focused pane along the
 // requested axis.
+fn prefixSplitPaneKind(state: *const AppState, alternate: bool) HotkeyPaneKind {
+    const default_kind: HotkeyPaneKind = switch (state.app_config.workspace_split_default_pane) {
+        .chat => .chat,
+        .terminal => .terminal,
+    };
+    if (!alternate) return default_kind;
+    return switch (default_kind) {
+        .chat => .terminal,
+        .terminal => .chat,
+    };
+}
+
 fn openHotkeyWorkspacePane(state: *AppState, kind: HotkeyPaneKind, fallback_axis: native_state.WorkspaceSplitAxis) bool {
     if (state.project_controller.projects.items.len == 0) return false;
     const project_index = state.project_controller.selected_index;
@@ -1623,6 +1635,23 @@ fn openHotkeyWorkspacePane(state: *AppState, kind: HotkeyPaneKind, fallback_axis
         .chat => state.splitFocusedWorkspacePaneWithChatAxis(fallback_axis),
         .terminal => state.splitFocusedWorkspacePaneWithTerminalAxis(fallback_axis),
     };
+}
+
+// Prefix-created pane tile inside the focused scrolling item.
+fn openPrefixTiledWorkspacePane(state: *AppState, kind: HotkeyPaneKind, axis: native_state.WorkspaceSplitAxis) bool {
+    if (state.project_controller.projects.items.len == 0) return false;
+    const project_index = state.project_controller.selected_index;
+    const layout = &state.project_controller.projects.items[project_index].workspace_layout;
+    const target_pane_id = layout.focused_pane_id orelse return openHotkeyWorkspacePane(state, kind, axis);
+    const created = switch (kind) {
+        .chat => state.splitCurrentProjectWorkspacePaneWithChatPlacement(target_pane_id, axis, true),
+        .terminal => state.splitCurrentProjectWorkspacePaneWithTerminalPlacement(target_pane_id, axis, true),
+    };
+    if (!created) return false;
+    const new_pane_id = layout.focused_pane_id orelse return false;
+    if (!layout.joinPaneToScrollGroup(target_pane_id, new_pane_id)) return false;
+    state.markDirty();
+    return true;
 }
 
 // The new-thread policy and pane placement are shared with the sidebar pencil
@@ -1780,10 +1809,16 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             state.alt_shortcut_hints_visible = false;
             state.ctrl_shortcut_hints_visible = false;
             state.shift_shortcut_hints_visible = false;
+            disarmPrefix(state);
+            exitPrefixNavigate(state);
             ui_layout.resetCompanionInputCaptures(state);
             state.blurCompanionComposer();
         },
         .key_down => {
+            // Any new key-down supersedes a pending text_input swallow; the
+            // swallow only ever targets the event immediately following the
+            // chord-completing key.
+            state.prefix_swallow_text_input = false;
             if (event.key.scancode == .lalt or event.key.scancode == .ralt) {
                 state.alt_shortcut_hints_visible = true;
                 state.markDirty();
@@ -1826,6 +1861,16 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
+            // An armed prefix owns the next key outright, even above modals,
+            // so a chord never half-completes into a text field.
+            if (state.prefix_armed and handleArmedPrefixKeyDown(state, keyboard, &event.key)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (state.prefix_navigate and handleNavigateKeyDown(state, keyboard, &event.key)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             const raw_action = keyboard.actionForEvent(&event.key);
             const action = if (raw_action == .companion and !state.isCompanionEnabled()) null else raw_action;
             // True modals own keys before the persistent Companion, while the
@@ -1835,6 +1880,14 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             if (event.key.key == .escape and ui_layout.handleCompanionEscapeKey(state, true)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            // Arm only after true modals have declined the key so a modal
+            // text field keeps its own Ctrl chords.
+            if (keyboard.isPrefixKeyEvent(&event.key)) {
+                state.prefix_armed = true;
+                state.markDirty();
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -2074,6 +2127,10 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             }
         },
         .text_input => {
+            if (state.prefix_swallow_text_input) {
+                state.prefix_swallow_text_input = false;
+                return true;
+            }
             const text_input = std.mem.sliceTo(event.text.text, 0);
             if (suppressDuplicateMacosTextInput(text_input, event.text.timestamp)) return true;
             if (ui_layout.handlePaletteTextInput(state, text_input)) {
@@ -2718,6 +2775,10 @@ fn handleGuiChatShortcut(
     event: *const sdl.KeyboardEvent,
 ) bool {
     const action = keyboard.chatActionForEvent(event) orelse return false;
+    return handleGuiChatAction(state, action);
+}
+
+fn handleGuiChatAction(state: *AppState, action: keybinds.NativeChatAction) bool {
     if (state.terminal_controller.focused or state.isBrowserPaneFocused() or state.browser_controller.address_focused) return false;
     if (state.focusedWorkspacePaneKind() != .chat and state.focusedWorkspaceChatPaneId() == null) return false;
     switch (action) {
@@ -2725,6 +2786,120 @@ fn handleGuiChatShortcut(
         .run_config => state.toggleRunConfigPopoverFromShortcut(),
     }
     return true;
+}
+
+fn disarmPrefix(state: *AppState) void {
+    if (!state.prefix_armed and !state.prefix_help_visible) return;
+    state.prefix_armed = false;
+    state.prefix_help_visible = false;
+    state.markDirty();
+}
+
+fn exitPrefixNavigate(state: *AppState) void {
+    if (!state.prefix_navigate) return;
+    state.prefix_navigate = false;
+    state.prefix_help_visible = false;
+    state.markDirty();
+}
+
+/// Workspace action menu: a bound action closes it, while unbound keys and modifiers leave it open.
+fn handleNavigateKeyDown(
+    state: *AppState,
+    keyboard: *keybinds.NativeKeyboardConfig,
+    event: *const sdl.KeyboardEvent,
+) bool {
+    if (!event.down) return true;
+    if (isModifierOnlyKey(event.scancode)) return true;
+    if (event.key == .escape) {
+        exitPrefixNavigate(state);
+        return true;
+    }
+    if (keyboard.isPrefixKeyEvent(event)) {
+        exitPrefixNavigate(state);
+        state.prefix_armed = true;
+        state.markDirty();
+        return true;
+    }
+    const target = keyboard.navigateTargetForEvent(event) orelse return true;
+    state.prefix_swallow_text_input = true;
+    exitPrefixNavigate(state);
+    if (target != .navigate) dispatchPrefixTarget(state, keyboard, target);
+    return true;
+}
+
+fn isModifierOnlyKey(scancode: sdl.Scancode) bool {
+    return switch (scancode) {
+        .lshift, .rshift, .lctrl, .rctrl, .lalt, .ralt, .lgui, .rgui => true,
+        else => false,
+    };
+}
+
+/// Second half of a tmux-style chord. Always consumes the key; the
+/// send-prefix case (prefix pressed twice) is delivered straight to the
+/// focused terminal here rather than falling through, because the normal
+/// chain would just re-arm on the same chord.
+fn handleArmedPrefixKeyDown(
+    state: *AppState,
+    keyboard: *keybinds.NativeKeyboardConfig,
+    event: *const sdl.KeyboardEvent,
+) bool {
+    if (!event.down) return true;
+    // Holding Shift/Ctrl for the second key must not cancel the chord.
+    if (isModifierOnlyKey(event.scancode)) return true;
+    if (event.repeat) return true;
+    disarmPrefix(state);
+    if (keyboard.isPrefixKeyEvent(event)) {
+        if (state.terminal_controller.focused) {
+            const handled = state.handleTerminalKeyDown(keyboard, event);
+            state.noteTerminalKeyRouting(event, handled);
+        }
+        return true;
+    }
+    if (event.key == .escape) return true;
+    const target = keyboard.prefixTargetForEvent(event) orelse {
+        runtime_log.diagnostic("prefix chord unbound key=0x{x} mod=0x{x}", .{ @intFromEnum(event.key), keymodBits(event.mod) });
+        return true;
+    };
+    state.prefix_swallow_text_input = true;
+    dispatchPrefixTarget(state, keyboard, target);
+    return true;
+}
+
+fn dispatchPrefixTarget(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, target: keybinds.PrefixTarget) void {
+    switch (target) {
+        .app => |action| {
+            if (action == .companion and !state.isCompanionEnabled()) return;
+            switch (action) {
+                .workspace_split_chat_vertical => _ = openPrefixTiledWorkspacePane(state, .chat, .vertical),
+                .workspace_split_chat_horizontal => _ = openPrefixTiledWorkspacePane(state, .chat, .horizontal),
+                .workspace_split_terminal_vertical => _ = openPrefixTiledWorkspacePane(state, .terminal, .vertical),
+                .workspace_split_terminal_horizontal => _ = openPrefixTiledWorkspacePane(state, .terminal, .horizontal),
+                else => handleKeyboardAction(state, keyboard, action),
+            }
+        },
+        .terminal => |action| _ = state.handleTerminalAction(action),
+        .chat => |action| _ = handleGuiChatAction(state, action),
+        .focus_prompt => _ = state.focusPromptForFocusedChatWorkspacePane(),
+        .split_default_vertical => _ = openPrefixTiledWorkspacePane(state, prefixSplitPaneKind(state, false), .vertical),
+        .split_default_horizontal => _ = openPrefixTiledWorkspacePane(state, prefixSplitPaneKind(state, false), .horizontal),
+        .split_alternate_vertical => _ = openPrefixTiledWorkspacePane(state, prefixSplitPaneKind(state, true), .vertical),
+        .split_alternate_horizontal => _ = openPrefixTiledWorkspacePane(state, prefixSplitPaneKind(state, true), .horizontal),
+        .show_keybinds => {
+            // Cheat sheet keeps the chord live so the next key still fires.
+            state.prefix_armed = true;
+            state.prefix_help_visible = true;
+            state.markDirty();
+        },
+        .navigate => {
+            state.prefix_navigate = true;
+            state.prefix_help_visible = false;
+            state.markDirty();
+        },
+        .workspace_select => |index| _ = state.selectProjectAtIndex(index),
+        .pane_select => |index| _ = state.focusCurrentProjectWorkspacePaneAtSidebarIndex(index),
+        .active_select => |index| _ = sidebar_ui.focusAttentionClusterRowAtIndex(state, index),
+        .command => |script| state.runPrefixCommand(script),
+    }
 }
 
 fn handleComposerFocusShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
