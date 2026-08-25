@@ -1932,6 +1932,13 @@ pub const Dock = struct {
         event: *const sdl.KeyboardEvent,
     ) !bool {
         const action = keyboard.terminalActionForEvent(event) orelse return false;
+        try self.performWorkspaceAction(allocator, action);
+        return true;
+    }
+
+    /// Runs a resolved dock action. Direct shortcuts and prefix-mode chords
+    /// both land here so the two tables cannot drift apart.
+    pub fn performWorkspaceAction(self: *Dock, allocator: std.mem.Allocator, action: keybinds.NativeTerminalAction) !void {
         switch (action) {
             .new_tab => try self.createTab(allocator),
             .close_active => try self.closeActivePaneOrTab(allocator),
@@ -1947,7 +1954,6 @@ pub const Dock = struct {
             .focus_left => _ = try self.focusAdjacentPane(allocator, .left),
             .focus_right => _ = try self.focusAdjacentPane(allocator, .right),
         }
-        return true;
     }
 };
 

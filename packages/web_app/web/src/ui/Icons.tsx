@@ -9,6 +9,8 @@ import claudeUrl from '../../../../desktop/src/assets/claude-logo.png'
 import opencodeUrl from '../../../../desktop/src/assets/opencode-logo-dark.png'
 import cursorUrl from '../../../../desktop/src/assets/editor_logos/cursor.png'
 import grokUrl from '../../../../desktop/src/assets/grok-logo.png'
+import piUrl from '../../../../desktop/src/assets/pi-logo.png'
+import fxUrl from '../../../../desktop/src/assets/fx-logo.png'
 import ampUrl from '../../../../desktop/src/assets/amp-logo.png'
 
 export function VerdeLogo(props: { class?: string }) {
@@ -45,6 +47,10 @@ export function ProviderGlyph(props: { provider?: string; class?: string }) {
         return cursorUrl
       case 'grok':
         return grokUrl
+      case 'pi':
+        return piUrl
+      case 'fx':
+        return fxUrl
       case 'amp':
         return ampUrl
       default:

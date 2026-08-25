@@ -812,6 +812,10 @@ pub const SendState = struct {
     stop_requested: bool = false,
     stop_signal_sent: bool = false,
     worker: ?std.Thread = null,
+    /// Published only after the worker has finished all deferred cleanup.
+    /// Terminal provider status can become visible before that cleanup ends;
+    /// the SDL poll path must not join until this flag is set.
+    worker_done: std.atomic.Value(bool) = .init(false),
     /// Local bang commands reuse the chat's single in-flight lane, but never
     /// enter an AI provider or acquire a provider thread id.
     local_command: bool = false,
@@ -835,6 +839,8 @@ pub const TitleGenerationState = struct {
     discard_result: bool = false,
     automatic_suppressed: bool = false,
     worker: ?std.Thread = null,
+    /// Set after the title worker's provider teardown and request cleanup.
+    worker_done: std.atomic.Value(bool) = .init(false),
 };
 pub const OpeningExchange = struct {
     user: *const ChatMessage,

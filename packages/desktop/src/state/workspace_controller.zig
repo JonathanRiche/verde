@@ -25,6 +25,12 @@ const DEFAULT_OPENCODE_MODEL = provider_models.DEFAULT_OPENCODE_MODEL;
 const DEFAULT_CLAUDE_MODEL = provider_models.DEFAULT_CLAUDE_MODEL;
 const DEFAULT_CURSOR_MODEL = provider_models.DEFAULT_CURSOR_MODEL;
 const CODEX_MODEL_OPTIONS = provider_models.CODEX_MODEL_OPTIONS;
+const PI_MODEL_OPTIONS = provider_models.PI_MODEL_OPTIONS;
+const DEFAULT_PI_MODEL = provider_models.DEFAULT_PI_MODEL;
+const FX_MODEL_OPTIONS = provider_models.FX_MODEL_OPTIONS;
+const DEFAULT_FX_MODEL = provider_models.DEFAULT_FX_MODEL;
+const GROK_MODEL_OPTIONS = provider_models.GROK_MODEL_OPTIONS;
+const DEFAULT_GROK_MODEL = provider_models.DEFAULT_GROK_MODEL;
 const CLAUDE_STANDARD_EFFORT_VALUES = provider_models.CLAUDE_STANDARD_EFFORT_VALUES;
 const parseReasoningEffort = provider_models.parseReasoningEffort;
 const WorkspacePaneId = workspace_layout.WorkspacePaneId;
@@ -101,6 +107,9 @@ fn composerModelOptions(self: anytype, provider: Provider) []const ModelOption {
         CODEX_MODEL_OPTIONS[0..],
         self.claudeModelOptionsSnapshot(),
         self.cursorModelOptionsSnapshot(),
+        self.piModelOptionsSnapshot(),
+        self.fxModelOptionsSnapshot(),
+        self.grokModelOptionsSnapshot(),
     );
 }
 
@@ -110,6 +119,9 @@ fn composerDefaultModelRef(self: anytype, provider: Provider) [:0]const u8 {
         .opencode => self.cachedDefaultModelRefForProvider(.opencode),
         .claude => DEFAULT_CLAUDE_MODEL,
         .cursor => DEFAULT_CURSOR_MODEL,
+        .pi => DEFAULT_PI_MODEL,
+        .fx => DEFAULT_FX_MODEL,
+        .grok => DEFAULT_GROK_MODEL,
     };
 }
 
@@ -1453,7 +1465,11 @@ pub fn resolveChatCreationSettings(self: anytype, request: OpenChatRequest, mode
                 }
                 break :blk false;
             },
-            .opencode, .cursor => false,
+            // Pi accepts every Verde effort tag as a thinking level.
+            .pi => true,
+            .opencode, .cursor, .fx => false,
+            // grok reasoning efforts stop at xhigh.
+            .grok => effort != .max,
         };
         if (!supported) return error.UnsupportedReasoningEffort;
     }
@@ -1465,7 +1481,7 @@ pub fn resolveChatCreationSettings(self: anytype, request: OpenChatRequest, mode
         const values = switch (request.provider) {
             .opencode => option.reasoning_variant_keys,
             .cursor => option.cursor_reasoning_values,
-            .codex, .claude => null,
+            .codex, .claude, .pi, .fx, .grok => null,
         } orelse return error.UnsupportedReasoningVariant;
         var supported = false;
         for (values) |value| {
@@ -1481,7 +1497,7 @@ pub fn resolveChatCreationSettings(self: anytype, request: OpenChatRequest, mode
         const supported = switch (request.provider) {
             .codex => true,
             .cursor => if (self.modelOptionForProvider(.cursor, model_ref)) |option| option.cursor_fast_supported else false,
-            .opencode, .claude => false,
+            .opencode, .claude, .pi, .fx, .grok => false,
         };
         if (!supported) return error.UnsupportedFastMode;
     }
@@ -1964,6 +1980,9 @@ pub fn tuiResumeCommand(self: anytype, provider: Provider, thread_id: []const u8
         },
         .claude => std.fmt.allocPrint(self.allocator, "claude --resume {s}\n", .{thread_id}),
         .cursor => std.fmt.allocPrint(self.allocator, "agent --resume {s}\n", .{thread_id}),
+        .pi => std.fmt.allocPrint(self.allocator, "pi --session-id {s}\n", .{thread_id}),
+        .fx => std.fmt.allocPrint(self.allocator, "fx --resume {s}\n", .{thread_id}),
+        .grok => std.fmt.allocPrint(self.allocator, "grok --resume {s}\n", .{thread_id}),
     };
 }
 

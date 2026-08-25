@@ -17,6 +17,9 @@ fn defaultModelRef(self: anytype, provider: Provider) [:0]const u8 {
         .opencode => self.cachedDefaultModelRefForProvider(.opencode),
         .claude => provider_models.DEFAULT_CLAUDE_MODEL,
         .cursor => provider_models.DEFAULT_CURSOR_MODEL,
+        .pi => provider_models.DEFAULT_PI_MODEL,
+        .fx => provider_models.DEFAULT_FX_MODEL,
+        .grok => provider_models.DEFAULT_GROK_MODEL,
     };
 }
 
@@ -99,7 +102,7 @@ fn beginHandoff(self: anytype, project_index: usize, pane_id: WorkspacePaneId, t
     self.handoff_controller.target_surface = .gui_chat;
     self.handoff_controller.target_provider = switch (provider) {
         .codex => .claude,
-        .opencode, .claude, .cursor => .codex,
+        .opencode, .claude, .cursor, .pi, .fx, .grok => .codex,
     };
     self.handoff_controller.use_existing = false;
     self.handoff_controller.target_thread_index = firstCompatibleHandoffTargetThread(self);
@@ -300,6 +303,9 @@ fn prepareTuiHandoffTarget(self: anytype, preview: []const u8) !WorkspacePaneId 
         .opencode => .opencode,
         .claude => .claude,
         .cursor => .cursor,
+        // Pi and FX have no agent-TUI stack profile yet; the caller reports the error.
+        .pi, .fx => return error.UnsupportedOperation,
+        .grok => .grok,
     };
     if (!try self.openAgentTuiAtPlacement(
         self.handoff_controller.project_index,

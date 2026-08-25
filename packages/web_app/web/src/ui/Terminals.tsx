@@ -1,6 +1,5 @@
 import { onCleanup, onMount } from 'solid-js'
 
-import { matchKeyAction } from '../lib/keybinds'
 import { alignPtyStream, resizeSession, tailSession, writePane } from '../lib/pty'
 import { store } from '../lib/store'
 
@@ -258,7 +257,7 @@ export function TerminalView(props: { workspaceId: string; paneId: number; sessi
     }
 
     const onKeyDown = (event: KeyboardEvent) => {
-      if (matchKeyAction(event)) return
+      if (store.shouldHandleKey(event)) return
       // Let the IME/soft keyboard deliver text through the input event instead.
       if (
         composing ||

@@ -8,9 +8,9 @@ slug: chat
 
 ## Connect a provider
 
-Verde checks the four GUI-chat providers—Codex, Claude Code, OpenCode, and
-Cursor—when the app opens. If none is ready, the **Connect an AI provider**
-screen reports one of these states for each provider:
+Verde checks the GUI-chat providers—Codex, Claude Code, OpenCode, Cursor, Pi,
+FX, and Grok Build—when the app opens. If none is ready, the **Connect an AI
+provider** screen reports one of these states for each provider:
 
 - **Ready** — the CLI is installed and authenticated.
 - **CLI not found** — install the provider and make sure its executable is on
@@ -19,8 +19,8 @@ screen reports one of these states for each provider:
 - **Could not verify** — the readiness check failed or timed out.
 
 After installing or signing in, choose **Check again**. **Not now** dismisses
-the screen without changing provider configuration. Grok and Amp are not
-listed because they run as terminal TUIs rather than native chat providers.
+the screen without changing provider configuration. Amp is not listed because
+it runs as a terminal TUI rather than a native chat provider.
 See [Provider setup](/docs/providers) for the exact install and login commands.
 
 ## Choose a provider and model
@@ -34,10 +34,10 @@ switches the thread's provider. Once a thread has messages, its provider is
 locked so the transcript and provider session stay consistent; create another
 thread to use a different provider.
 
-Verde loads the available models from OpenCode, Claude Code, and Cursor at
-runtime. Codex models come from Verde's supported model list. A provider that
-is missing or signed out remains visible with a readiness hint instead of
-silently accepting a prompt it cannot send.
+Verde loads the available models from OpenCode, Claude Code, Cursor, Pi, FX,
+and Grok at runtime. Codex models come from Verde's supported model list. A
+provider that is missing or signed out remains visible with a readiness hint
+instead of silently accepting a prompt it cannot send.
 
 ## Configure a run
 
@@ -56,9 +56,9 @@ switch models because not every provider exposes equivalent controls.
 ## Send, steer, and stop
 
 Press `Enter` to send the composer. While an agent is working, type another
-message and press `Tab`: Codex tries to steer the active turn, while Claude
-Code, OpenCode, and Cursor queue the message as the next turn. The pending
-message stays pinned above the composer. Double-click that pin to pull it back
+message and press `Tab`: Codex, Claude Code, and Pi try to steer the active
+turn, while OpenCode, Cursor, FX, and Grok queue the message as the next turn.
+The pending message stays pinned above the composer. Double-click that pin to pull it back
 into an empty composer for editing, then press `Tab` to queue it again.
 
 **Stop** aborts the active run. Verde keeps the draft with its thread, so
@@ -85,10 +85,10 @@ attachments are persisted with the thread's draft, so they survive switching
 threads or restarting the app, and sent images remain viewable in the saved
 transcript.
 
-Codex, Claude Code, and OpenCode accept local image attachments. Cursor accepts
-them only when its ACP session advertises image support. Remote Herdr Codex GUI
-sends do not currently accept local image attachments; Verde reports the
-limitation instead of silently dropping them.
+Codex, Claude Code, OpenCode, Pi, and Grok accept local image attachments.
+Cursor and FX accept them when their ACP session advertises image support.
+Remote Herdr Codex GUI sends do not currently accept local image attachments;
+Verde reports the limitation instead of silently dropping them.
 
 To reference a workspace file, type `@` followed by part of its name or path.
 Verde searches the imported workspace, shows up to eight matching files, and
@@ -104,9 +104,9 @@ opens the command palette scoped to that workspace's saved chats, grouped into
 new pane. Press `Tab` on a result for thread actions.
 
 Right-click a workspace—or use `Ctrl+Shift+P`—to import an existing Codex,
-OpenCode, or Claude Code provider thread. The import dialog lists recent
-provider sessions and also accepts a provider thread ID. Cursor thread import
-is not supported yet.
+OpenCode, Claude Code, or Pi provider thread. The import dialog lists recent
+provider sessions and also accepts a provider thread ID. Cursor, FX, and Grok
+thread import is not supported yet.
 
 Imported and Verde-created provider threads can be refreshed with **Sync
 thread** when they have a provider thread ID and no request is running. The

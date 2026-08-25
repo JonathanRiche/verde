@@ -15,6 +15,9 @@ pub const DEFAULT_CODEX_REASONING_EFFORT: ReasoningEffort = .low;
 pub const DEFAULT_OPENCODE_MODEL: [:0]const u8 = "opencode/gpt-5.4";
 pub const DEFAULT_CLAUDE_MODEL: [:0]const u8 = "default";
 pub const DEFAULT_CURSOR_MODEL: [:0]const u8 = "composer-2.5";
+pub const DEFAULT_PI_MODEL: [:0]const u8 = "default";
+pub const DEFAULT_FX_MODEL: [:0]const u8 = "default";
+pub const DEFAULT_GROK_MODEL: [:0]const u8 = "default";
 
 pub const ModelOption = struct {
     label: [:0]const u8,
@@ -164,6 +167,61 @@ pub const CLAUDE_MODEL_OPTIONS = [_]ModelOption{
     .{ .label = "Fable", .value = "claude-fable-5[1m]", .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
     .{ .label = "Sonnet 5", .value = "sonnet", .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
     .{ .label = "Haiku 4.5", .value = "haiku", .reasoning_supported = false },
+};
+
+/// Static fallback shown until the async pi `get_available_models` response
+/// replaces it. "default" defers to the model configured inside pi itself.
+pub const PI_MODEL_OPTIONS = [_]ModelOption{
+    .{ .label = "Default (pi config)", .value = DEFAULT_PI_MODEL, .reasoning_supported = true },
+    .{ .label = "GPT-5.6 Sol", .value = "openai-codex/gpt-5.6-sol", .reasoning_supported = true },
+    .{ .label = "GPT-5.5", .value = "openai-codex/gpt-5.5", .reasoning_supported = true },
+    .{ .label = "GPT-5.4 Mini", .value = "openai-codex/gpt-5.4-mini", .reasoning_supported = true },
+    .{ .label = "Gemini 3.1 Pro", .value = "google/gemini-3.1-pro-preview", .reasoning_supported = true },
+    .{ .label = "Gemini 3.5 Flash", .value = "google/gemini-3.5-flash", .reasoning_supported = true },
+};
+
+/// Verde reasoning efforts are a strict subset of pi thinking levels, so every
+/// tier is offered; "Default" leaves pi's configured thinking level untouched.
+/// Static fallback shown until the async `fx acp` catalog discovery completes.
+/// "default" defers to the model persisted inside fx itself (`fx acp` without
+/// a --model override).
+pub const FX_MODEL_OPTIONS = [_]ModelOption{
+    .{ .label = "Default (fx config)", .value = DEFAULT_FX_MODEL, .reasoning_supported = false },
+    // fx's default provider is the Vercel AI Gateway, whose ids are
+    // "<vendor>/<model>"; bare Codex-subscription ids (gpt-5.6-sol, ...) get
+    // HTTP 403 from the gateway and surface only as "HTTP error".
+    .{ .label = "GPT-5.2", .value = "openai/gpt-5.2", .reasoning_supported = false },
+    .{ .label = "GPT-5.4 Mini", .value = "openai/gpt-5.4-mini", .reasoning_supported = false },
+    .{ .label = "GPT-5.1 Codex", .value = "openai/gpt-5.1-codex", .reasoning_supported = false },
+    .{ .label = "Claude Sonnet 5", .value = "anthropic/claude-sonnet-5", .reasoning_supported = false },
+};
+
+/// Static fallback shown until the async `grok agent stdio` initialize
+/// handshake reports the live catalog. "default" defers to the model persisted
+/// inside grok itself (no `--model` override).
+pub const GROK_MODEL_OPTIONS = [_]ModelOption{
+    .{ .label = "Default (grok config)", .value = DEFAULT_GROK_MODEL, .reasoning_supported = true },
+    .{ .label = "Grok 4.6", .value = "grok-4.6", .reasoning_supported = true },
+    .{ .label = "Grok 4.5", .value = "grok-4.5", .reasoning_supported = true },
+};
+
+pub const PI_REASONING_OPTIONS = [_]ReasoningOption{
+    .{ .label = "Default", .value = null },
+    .{ .label = "Low", .value = .low },
+    .{ .label = "Medium", .value = .medium },
+    .{ .label = "High", .value = .high },
+    .{ .label = "Xhigh", .value = .xhigh },
+    .{ .label = "Max", .value = .max },
+};
+
+/// grok advertises per-model reasoning efforts capped at `xhigh`; Verde's
+/// `max` tier is not offered. "Default" leaves grok's persisted effort untouched.
+pub const GROK_REASONING_OPTIONS = [_]ReasoningOption{
+    .{ .label = "Default", .value = null },
+    .{ .label = "Low", .value = .low },
+    .{ .label = "Medium", .value = .medium },
+    .{ .label = "High", .value = .high },
+    .{ .label = "Xhigh", .value = .xhigh },
 };
 
 pub const CODEX_REASONING_OPTIONS = [_]ReasoningOption{

@@ -76,6 +76,18 @@ export function dynamicModelOptions(provider: string, rows: DynamicModelRow[]): 
         ...(row.cursor_reasoning_values?.length ? { variants: row.cursor_reasoning_values } : {}),
         ...(row.cursor_fast_supported ? { fast_supported: true } : {}),
       })
+    } else if (provider === 'pi') {
+      // Pi model refs are "<provider_id>/<model_id>" strings passed to
+      // `pi --model`; thinking levels map 1:1 onto Verde effort tags.
+      options.push({
+        label,
+        value: row.model_id,
+        ...(row.reasoning_supported !== false ? { efforts: CLAUDE_FULL_EFFORTS } : {}),
+      })
+    } else if (provider === 'grok') {
+      // Grok Build reports its catalog over ACP; every model accepts a
+      // reasoning effort (low..xhigh), and `max` is not offered.
+      options.push({ label, value: row.model_id, efforts: GROK_EFFORTS })
     } else {
       options.push({ label, value: row.model_id })
     }
@@ -137,6 +149,39 @@ const OPENCODE_MODELS: ModelOption[] = [
   { label: 'Gemini 3.1 Pro', value: 'opencode/gemini-3.1-pro' },
 ]
 
+/// Pi's static fallback mirrors PI_MODEL_OPTIONS: "default" defers to the
+/// model configured in the user's pi settings.
+const PI_MODELS: ModelOption[] = [
+  { label: 'Default (pi config)', value: 'default', efforts: CLAUDE_FULL_EFFORTS },
+]
+
+/// Mirror of the desktop FX_MODEL_OPTIONS fallback; fx ACP exposes no
+/// effort control today, so no efforts are offered.
+const FX_MODELS: ModelOption[] = [
+  { label: 'Default (fx config)', value: 'default' },
+  { label: 'GPT-5.2', value: 'openai/gpt-5.2' },
+  { label: 'GPT-5.4 Mini', value: 'openai/gpt-5.4-mini' },
+  { label: 'GPT-5.1 Codex', value: 'openai/gpt-5.1-codex' },
+  { label: 'Claude Sonnet 5', value: 'anthropic/claude-sonnet-5' },
+]
+
+/// GROK_REASONING_OPTIONS: grok efforts stop at xhigh.
+const GROK_EFFORTS: EffortOption[] = [
+  DEFAULT_EFFORT,
+  { label: 'Low', value: 'low' },
+  { label: 'Medium', value: 'medium' },
+  { label: 'High', value: 'high' },
+  { label: 'Extra high', value: 'xhigh' },
+]
+
+/// Grok's static fallback mirrors GROK_MODEL_OPTIONS: "default" defers to the
+/// model persisted in the user's grok config.
+const GROK_MODELS: ModelOption[] = [
+  { label: 'Default (grok config)', value: 'default', efforts: GROK_EFFORTS },
+  { label: 'Grok 4.6', value: 'grok-4.6', efforts: GROK_EFFORTS },
+  { label: 'Grok 4.5', value: 'grok-4.5', efforts: GROK_EFFORTS },
+]
+
 const CURSOR_GROK_VARIANTS = ['low', 'medium', 'high']
 const CURSOR_GPT_FULL_VARIANTS = ['none', 'low', 'medium', 'high', 'xhigh', 'max']
 const CURSOR_GPT_55_VARIANTS = ['none', 'low', 'medium', 'high', 'extra-high']
@@ -173,6 +218,12 @@ export function modelOptionsFor(provider: string | null | undefined): ModelOptio
       return OPENCODE_MODELS
     case 'cursor':
       return CURSOR_MODELS
+    case 'pi':
+      return PI_MODELS
+    case 'fx':
+      return FX_MODELS
+    case 'grok':
+      return GROK_MODELS
     default:
       return []
   }

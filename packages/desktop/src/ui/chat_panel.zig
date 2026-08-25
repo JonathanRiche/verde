@@ -6838,6 +6838,9 @@ fn renderInactiveComposerProviderIcon(state: *app_state.AppState, pill: palette.
         .opencode => state.opencode_logo_texture,
         .claude => state.claude_logo_texture,
         .cursor => state.cursor_logo_texture,
+        .pi => state.pi_logo_texture,
+        .fx => state.fx_logo_texture,
+        .grok => state.grok_logo_texture,
     };
     if (provider_icon) |cached| {
         const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, icon_slot.x, icon_slot.y, icon_slot.w, icon_slot.h));
@@ -6848,6 +6851,9 @@ fn renderInactiveComposerProviderIcon(state: *app_state.AppState, pill: palette.
             .opencode => "O",
             .claude => "A",
             .cursor => "R",
+            .pi => "P",
+            .fx => "F",
+            .grok => "G",
         };
         queueText(state, icon_slot, fallback_label, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 175)), theme.scaledUi(13.0), pill);
     }
@@ -7402,6 +7408,9 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
         .opencode => state.opencode_logo_texture,
         .claude => state.claude_logo_texture,
         .cursor => state.cursor_logo_texture,
+        .pi => state.pi_logo_texture,
+        .fx => state.fx_logo_texture,
+        .grok => state.grok_logo_texture,
     };
     if (provider_icon) |cached| {
         const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, model_icon_slot.x, model_icon_slot.y, model_icon_slot.w, model_icon_slot.h));

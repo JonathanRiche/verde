@@ -8,9 +8,39 @@ import {
   mapTranscriptRows,
   mergeThreadCatalogSettings,
   panesForWorkspace,
+  parseFavoriteModels,
   requestPaneClose,
   requestTerminalOpen,
+  setFavoriteModelInList,
 } from './store.ts'
+
+describe('shared model favorites', () => {
+  test('parses, trims, and deduplicates the config snapshot', () => {
+    expect(parseFavoriteModels({
+      chat: {
+        favorite_models: [
+          { provider: 'codex', model: 'gpt-5.6-sol' },
+          { provider: ' codex ', model: ' gpt-5.6-sol ' },
+          { provider: 'claude', model: 'opus' },
+          { provider: '', model: 'ignored' },
+        ],
+      },
+    })).toEqual([
+      { provider: 'codex', model: 'gpt-5.6-sol' },
+      { provider: 'claude', model: 'opus' },
+    ])
+  })
+
+  test('applies an idempotent requested favorite state', () => {
+    const original = [{ provider: 'codex', model: 'gpt-5.6-sol' }]
+    expect(setFavoriteModelInList(original, 'codex', 'gpt-5.6-sol', true)).toBe(original)
+    expect(setFavoriteModelInList(original, 'codex', 'gpt-5.6-sol', false)).toEqual([])
+    expect(setFavoriteModelInList(original, 'claude', 'opus', true)).toEqual([
+      ...original,
+      { provider: 'claude', model: 'opus' },
+    ])
+  })
+})
 
 describe('clipboardImageFiles', () => {
   test('returns every supported clipboard image and ignores text items', () => {
@@ -57,6 +87,7 @@ describe('mapTranscriptRows', () => {
     }, 'thread-1')
 
     expect(message.images).toEqual(images.map((image) => ({ ...image, attachment_id: null })))
+    expect(message.created_at_ms).toBe(1234)
   })
 
   test('preserves a legacy single image attachment', () => {
@@ -297,6 +328,55 @@ describe('panesForWorkspace', () => {
     expect(panes[0].focused).toBe(false)
     expect(panes[1]).toMatchObject({ thread_id: 'thread-current', focused: true })
     expect(panes[0].pane_id).not.toBe(panes[1].pane_id)
+  })
+
+  test('projects duplicate live panes for one thread as a single chat', () => {
+    const thread = {
+      local_thread_id: 'thread-current',
+      provider_thread_id: 'provider-current',
+      title: 'Current thread',
+      sort_index: 250,
+      provider: 'codex',
+    }
+    const workspace = {
+      workspace_id: 'workspace-1',
+      label: 'Workspace',
+      path: '/workspace',
+      threads: [thread],
+    }
+    const live_layout = {
+      focused: 901,
+      panes: [
+        {
+          id: 897,
+          kind: 'chat',
+          thread: 250,
+          title: 'Current thread',
+          provider_thread_id: 'provider-current',
+          send_pending: true,
+        },
+        {
+          id: 901,
+          kind: 'chat',
+          thread: 250,
+          title: 'Current thread',
+          provider_thread_id: 'provider-current',
+          send_pending: false,
+          completion_pending: true,
+        },
+      ],
+    }
+
+    const panes = panesForWorkspace(workspace, [], [], new Set(), live_layout)
+
+    expect(panes).toHaveLength(1)
+    expect(panes[0]).toMatchObject({
+      thread_id: 'thread-current',
+      native_pane_id: 901,
+      focused: true,
+      send_pending: true,
+      completion_pending: true,
+    })
   })
 })
 

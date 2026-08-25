@@ -60,6 +60,9 @@ pub fn run(allocator: std.mem.Allocator, request: Request, sink: Sink) !Result {
         } },
         .claude => harness.ProviderConfig{ .claude = .{ .cwd = request_cwd } },
         .cursor => harness.ProviderConfig{ .cursor = .{ .cwd = request_cwd, .model = request.model_ref } },
+        .pi => harness.ProviderConfig{ .pi = .{ .cwd = request_cwd } },
+        .fx => harness.ProviderConfig{ .fx = .{ .cwd = request_cwd, .model = request.model_ref } },
+        .grok => harness.ProviderConfig{ .grok = .{ .cwd = request_cwd, .model = request.model_ref } },
     };
 
     log.info("send starting provider={s} cwd={s} model_len={d} thread_id_len={d} prompt_len={d}", .{
@@ -123,6 +126,9 @@ pub fn listModels(
         .codex => return error.UnsupportedOperation,
         .claude => harness.ProviderConfig{ .claude = .{ .cwd = project_path } },
         .cursor => harness.ProviderConfig{ .cursor = .{ .cwd = project_path } },
+        .pi => harness.ProviderConfig{ .pi = .{ .cwd = project_path } },
+        .fx => harness.ProviderConfig{ .fx = .{ .cwd = project_path } },
+        .grok => harness.ProviderConfig{ .grok = .{ .cwd = project_path } },
     };
     var client = try harness.connect(allocator, provider_config);
     defer client.deinit();

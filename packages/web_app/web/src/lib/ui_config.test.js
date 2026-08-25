@@ -12,6 +12,7 @@ describe('parseUiConfig', () => {
       ui: {
         workspace_pane_gap: 8,
         workspace_panes_per_view: 1,
+        workspace_split_default_pane: 'terminal',
         workspace_scroll_direction: 'vertical',
         workspace_scroll_mode: 'always',
         workspace_scroll_threshold: 4,
@@ -21,6 +22,7 @@ describe('parseUiConfig', () => {
     })
     expect(ui.workspace_panes_per_view).toBe(1)
     expect(ui.workspace_pane_gap).toBe(8)
+    expect(ui.workspace_split_default_pane).toBe('terminal')
     expect(ui.workspace_scroll_direction).toBe('vertical')
     expect(ui.workspace_scroll_mode).toBe('always')
     expect(ui.workspace_scroll_threshold).toBe(4)

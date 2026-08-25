@@ -4836,7 +4836,11 @@ fn mcpToolsCall(
                         .model = validated.model,
                         .reasoning_effort = validated.reasoning_effort,
                         .reasoning_variant = validated.reasoning_variant,
-                        .fast_mode = validated.fast_mode,
+                        // Validation echoes the resolved Fast state as a plain
+                        // bool; forwarding it unconditionally would turn an
+                        // omitted setting into an explicit one, which providers
+                        // without a Fast tier reject.
+                        .fast_mode = if (creation_settings.fast_mode != null) validated.fast_mode else null,
                         .target_pane_id = target_pane_id,
                         .axis = axis orelse "horizontal",
                         .focus = true,

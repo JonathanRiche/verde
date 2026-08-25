@@ -62,11 +62,11 @@ function About() {
           Built for multi-agent development.
         </h2>
         <p class="band-body">
-          Codex, Claude Code, OpenCode, and Cursor can run in Verde's native
-          chat interface or in their own terminal TUI. Grok Build and Amp run
-          as terminal TUIs. Beside them, you can tile shell terminals and a
-          native embedded browser, persist the layout, and control the running
-          app through its local CLI.
+          Codex, Claude Code, OpenCode, Cursor, Pi, FX, and Grok Build can run
+          in Verde's native chat interface. Codex, Claude Code, OpenCode,
+          Cursor, Pi, FX, Grok Build, and Amp also run as terminal TUIs. Beside them,
+          you can tile shell terminals and a native embedded browser, persist
+          the layout, and control the running app through its local CLI.
         </p>
         <p style={{ 'margin-top': '2rem' }}>
           <a href="/docs/quickstart" class="btn btn-primary">

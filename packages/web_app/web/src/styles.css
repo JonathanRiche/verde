@@ -222,6 +222,86 @@ textarea { resize: none; }
   padding-bottom: env(safe-area-inset-bottom, 0px);
   background: var(--chat-black);
 }
+
+.prefix-layer {
+  position: absolute;
+  inset: auto 0 0;
+  z-index: 40;
+  pointer-events: none;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.prefix-status-bar {
+  display: flex;
+  min-width: 0;
+  height: 30px;
+  align-items: center;
+  gap: 16px;
+  overflow: hidden;
+  padding: 0 12px;
+  border-top: 1px solid var(--border-muted);
+  background: color-mix(in srgb, var(--panel-alt) 96%, transparent);
+  box-shadow: 0 -10px 28px rgba(0, 0, 0, 0.25);
+  white-space: nowrap;
+}
+.prefix-status-bar strong {
+  padding: 2px 8px;
+  border-radius: 4px;
+  color: var(--chat-black);
+  background: var(--accent);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+}
+.prefix-chevron { color: var(--text-subtle); }
+.prefix-hint { display: inline-flex; align-items: center; gap: 6px; color: var(--text-muted); }
+.prefix-hint kbd,
+.prefix-key-row kbd {
+  color: var(--accent-hi);
+  font: inherit;
+}
+.prefix-which-key {
+  width: min(920px, calc(100% - 24px));
+  max-height: min(55vh, 520px);
+  margin: 0 auto 10px;
+  overflow: hidden;
+  border: 1px solid var(--border-muted);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--panel) 97%, transparent);
+  box-shadow: 0 18px 55px rgba(0, 0, 0, 0.48);
+  pointer-events: auto;
+}
+.prefix-which-key-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-muted);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-weight: 700;
+}
+.prefix-which-key-title span:last-child { color: var(--text-subtle); font-size: 11px; font-weight: 400; }
+.prefix-key-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  max-height: min(48vh, 450px);
+  gap: 2px 22px;
+  overflow-y: auto;
+  padding: 10px 14px 14px;
+}
+.prefix-key-row {
+  display: grid;
+  grid-template-columns: minmax(54px, auto) minmax(0, 1fr);
+  gap: 10px;
+  min-width: 0;
+  padding: 4px 0;
+}
+.prefix-key-row span { overflow: hidden; color: var(--text-muted); text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 640px) {
+  .prefix-status-bar { gap: 11px; overflow-x: auto; scrollbar-width: none; }
+  .prefix-which-key { width: calc(100% - 12px); }
+  .prefix-key-grid { grid-template-columns: 1fr; }
+}
 /* Desktop split: workspace_pane_gap from verde.json, matching ui.workspace_pane_gap. */
 .niri-strip.niri-inset {
   padding: var(--workspace-pane-gap, 12px);

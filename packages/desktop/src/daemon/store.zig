@@ -458,7 +458,10 @@ pub const Store = struct {
         const next_revision_sql: i64 = std.math.cast(i64, next_revision) orelse return error.StoreUnavailable;
         var applied = true;
         switch (mutation) {
-            .snapshot_replace => |request| self.applySnapshot(request.snapshot, next_revision_sql) catch |err| return mapStoreError(err),
+            .snapshot_replace => |request| if (request.bootstrap)
+                self.applySnapshotFullRewrite(request.snapshot, next_revision_sql) catch |err| return mapStoreError(err)
+            else
+                self.applySnapshot(request.snapshot, next_revision_sql) catch |err| return mapStoreError(err),
             .workspace_upsert => |request| self.applyWorkspace(request.workspace) catch |err| return mapStoreError(err),
             .thread_upsert => |request| self.applyThread(request) catch |err| return mapStoreError(err),
             .chat_draft_set => |request| self.applyChatDraftSet(request) catch |err| return mapStoreError(err),
@@ -1110,6 +1113,7 @@ pub const Store = struct {
             .chat_completion_clear => |request| self.fingerprintValue(.{
                 .workspace_id = request.workspace_id,
                 .local_thread_id = request.local_thread_id,
+                .completed_at_ms = request.completed_at_ms,
             }),
         };
     }
@@ -1128,7 +1132,414 @@ pub const Store = struct {
         };
     }
 
-    /// Identity-preserving snapshot application (M4-P4 authority fix).
+    /// Reconcile a normal GUI snapshot without rewriting paged-out transcript
+    /// history. Snapshot metadata is authoritative at its observed revision,
+    /// while loaded message tails replace only their declared sort-index
+    /// ranges. Daemon-owned rows absent from a tail are moved aside by row id
+    /// and appended after the replacement, so preserving them never copies
+    /// their potentially multi-megabyte bodies through SQLite's WAL.
+    fn applySnapshot(self: *Self, snapshot: store_protocol.Snapshot, store_revision: i64) !void {
+        if (snapshot.schema_version != 1) return error.InvalidParams;
+
+        try self.prepareSnapshotTargets(snapshot);
+        try self.conn.exec(
+            "insert into app_state (id, selected_workspace_index, sidebar_collapsed) values (1, ?1, ?2) " ++
+                "on conflict(id) do update set selected_workspace_index = excluded.selected_workspace_index, sidebar_collapsed = excluded.sidebar_collapsed",
+            .{ @as(i64, @intCast(snapshot.selected_workspace_index)), boolToInt(snapshot.sidebar_collapsed) },
+        );
+
+        // An omitted workspace is a deliberate deletion once the GUI has
+        // observed every committed turn which refers to it. A newer daemon
+        // turn keeps the existing rows in place until a later projection.
+        try self.conn.exec(
+            \\delete from chat_turns
+            \\where committed_store_revision is not null
+            \\  and committed_store_revision <= ?1
+            \\  and not exists (
+            \\      select 1 from temp.snapshot_workspace_targets target
+            \\      where target.workspace_id = chat_turns.workspace_id
+            \\  )
+        , .{@as(i64, @intCast(snapshot.store_revision))});
+        try self.conn.exec(
+            \\delete from workspaces
+            \\where not exists (
+            \\        select 1 from temp.snapshot_workspace_targets target
+            \\        where target.workspace_id = workspaces.workspace_id
+            \\    )
+            \\  and not exists (
+            \\        select 1 from chat_turns turn
+            \\        where turn.workspace_id = workspaces.workspace_id
+            \\          and turn.committed_store_revision is not null
+            \\          and turn.committed_store_revision > ?1
+            \\    )
+        , .{@as(i64, @intCast(snapshot.store_revision))});
+        try self.conn.execNoArgs(
+            \\delete from chat_completions
+            \\where not exists (
+            \\    select 1 from workspaces where workspaces.workspace_id = chat_completions.workspace_id
+            \\);
+        );
+
+        // Move existing order values out of the non-negative target range.
+        // Retained, omitted workspaces receive deterministic positions after
+        // every workspace carried by this snapshot.
+        try self.conn.exec(
+            \\insert into snapshot_workspace_positions (workspace_row_id, sort_index)
+            \\select w.id, ?1 + row_number() over (order by w.sort_index) - 1
+            \\from workspaces w
+            \\where not exists (
+            \\    select 1 from snapshot_workspace_targets target
+            \\    where target.workspace_id = w.workspace_id
+            \\)
+        , .{@as(i64, @intCast(snapshot.workspaces.len))});
+        try self.conn.execNoArgs("update workspaces set sort_index = -id");
+
+        for (snapshot.workspaces, 0..) |workspace, workspace_index| {
+            try self.upsertSnapshotWorkspace(workspace, workspace_index);
+            const workspace_row = (try self.conn.row(
+                "select id from workspaces where workspace_id = ?1",
+                .{workspace.workspace_id},
+            )) orelse return error.StoreCorrupt;
+            const workspace_row_id = workspace_row.int(0);
+            workspace_row.deinit();
+            try self.reconcileSnapshotThreads(snapshot, workspace, workspace_index == 0, workspace_row_id, store_revision);
+        }
+
+        try self.conn.execNoArgs(
+            \\update workspaces
+            \\set sort_index = (
+            \\    select position.sort_index from snapshot_workspace_positions position
+            \\    where position.workspace_row_id = workspaces.id
+            \\)
+            \\where exists (
+            \\    select 1 from snapshot_workspace_positions position
+            \\    where position.workspace_row_id = workspaces.id
+            \\);
+        );
+        for (snapshot.surface_states) |surface| try self.applySurfaceUpsert(surface);
+        for (snapshot.chat_completions) |completion| try self.applyChatCompletionUpsert(completion);
+    }
+
+    fn prepareSnapshotTargets(self: *Self, snapshot: store_protocol.Snapshot) !void {
+        try self.conn.execNoArgs(
+            \\create temp table if not exists snapshot_workspace_targets (
+            \\    workspace_id text primary key,
+            \\    sort_index integer not null
+            \\);
+            \\create temp table if not exists snapshot_thread_targets (
+            \\    workspace_id text not null,
+            \\    local_thread_id text not null,
+            \\    sort_index integer not null,
+            \\    primary key (workspace_id, local_thread_id)
+            \\);
+            \\create temp table if not exists snapshot_workspace_positions (
+            \\    workspace_row_id integer primary key,
+            \\    sort_index integer not null
+            \\);
+            \\create temp table if not exists snapshot_thread_positions (
+            \\    thread_row_id integer primary key,
+            \\    sort_index integer not null
+            \\);
+            \\create temp table if not exists snapshot_message_positions (
+            \\    message_row_id integer primary key,
+            \\    original_sort_index integer not null
+            \\);
+            \\create temp table if not exists snapshot_message_restore_positions (
+            \\    message_row_id integer primary key,
+            \\    sort_index integer not null
+            \\);
+            \\delete from snapshot_workspace_targets;
+            \\delete from snapshot_thread_targets;
+            \\delete from snapshot_workspace_positions;
+            \\delete from snapshot_thread_positions;
+            \\delete from snapshot_message_positions;
+            \\delete from snapshot_message_restore_positions;
+        );
+        for (snapshot.workspaces, 0..) |workspace, workspace_index| {
+            if (workspace.workspace_id.len == 0 or workspace.label.len == 0 or workspace.path.len == 0) {
+                return error.InvalidParams;
+            }
+            try self.conn.exec(
+                "insert into snapshot_workspace_targets (workspace_id, sort_index) values (?1, ?2)",
+                .{ workspace.workspace_id, @as(i64, @intCast(workspace_index)) },
+            );
+            for (workspace.threads, 0..) |thread, thread_index| {
+                if (thread.local_thread_id.len == 0) continue;
+                try self.conn.exec(
+                    "insert into snapshot_thread_targets (workspace_id, local_thread_id, sort_index) values (?1, ?2, ?3)",
+                    .{ workspace.workspace_id, thread.local_thread_id, @as(i64, @intCast(thread_index)) },
+                );
+            }
+        }
+    }
+
+    fn upsertSnapshotWorkspace(self: *Self, workspace: store_protocol.Workspace, workspace_index: usize) !void {
+        try self.conn.exec(
+            "insert into workspaces (workspace_id, sort_index, label, path, archived, unread_count, collapsed, thread_list_expanded, terminal_height, terminal_layout_json, terminal_docks_json, workspace_layout_json, selected_thread_index, companion_thread_local_id, herdr_remote_alias, herdr_session_name, herdr_workspace_id, herdr_local_dir, herdr_remote_cwd, herdr_last_pane_id, herdr_attach_dock_id, herdr_attach_pane_id, herdr_pane_links_json, herdr_updated_at_ms) " ++
+                "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24) " ++
+                "on conflict(workspace_id) do update set sort_index = excluded.sort_index, label = excluded.label, path = excluded.path, archived = excluded.archived, unread_count = excluded.unread_count, collapsed = excluded.collapsed, thread_list_expanded = excluded.thread_list_expanded, terminal_height = excluded.terminal_height, terminal_layout_json = excluded.terminal_layout_json, terminal_docks_json = excluded.terminal_docks_json, workspace_layout_json = excluded.workspace_layout_json, selected_thread_index = excluded.selected_thread_index, companion_thread_local_id = excluded.companion_thread_local_id, herdr_remote_alias = excluded.herdr_remote_alias, herdr_session_name = excluded.herdr_session_name, herdr_workspace_id = excluded.herdr_workspace_id, herdr_local_dir = excluded.herdr_local_dir, herdr_remote_cwd = excluded.herdr_remote_cwd, herdr_last_pane_id = excluded.herdr_last_pane_id, herdr_attach_dock_id = excluded.herdr_attach_dock_id, herdr_attach_pane_id = excluded.herdr_attach_pane_id, herdr_pane_links_json = excluded.herdr_pane_links_json, herdr_updated_at_ms = excluded.herdr_updated_at_ms",
+            workspaceValues(workspace, @as(i64, @intCast(workspace_index))),
+        );
+    }
+
+    fn reconcileSnapshotThreads(
+        self: *Self,
+        snapshot: store_protocol.Snapshot,
+        workspace: store_protocol.Workspace,
+        is_first_workspace: bool,
+        workspace_row_id: i64,
+        store_revision: i64,
+    ) !void {
+        // Null-id rows are legacy compatibility rows and have no durable
+        // identity. Stable omitted rows survive only when committed or owned
+        // by a daemon turn; abandoned GUI drafts are deletions.
+        try self.conn.exec("delete from threads where workspace_id = ?1 and local_thread_id is null", .{workspace_row_id});
+        try self.conn.exec(
+            \\delete from threads
+            \\where workspace_id = ?1
+            \\  and local_thread_id is not null
+            \\  and not exists (
+            \\      select 1 from snapshot_thread_targets target
+            \\      where target.workspace_id = ?2 and target.local_thread_id = threads.local_thread_id
+            \\  )
+            \\  and committed = 0
+            \\  and not exists (
+            \\      select 1 from chat_turns turn
+            \\      where turn.workspace_id = ?2 and turn.local_thread_id = threads.local_thread_id
+            \\  )
+        , .{ workspace_row_id, workspace.workspace_id });
+
+        const snapshot_thread_count: usize = if (workspace.threads.len == 0) 1 else workspace.threads.len;
+        try self.conn.exec(
+            \\insert into snapshot_thread_positions (thread_row_id, sort_index)
+            \\select t.id, ?3 + row_number() over (order by t.sort_index) - 1
+            \\from threads t
+            \\where t.workspace_id = ?1
+            \\  and not exists (
+            \\      select 1 from snapshot_thread_targets target
+            \\      where target.workspace_id = ?2 and target.local_thread_id = t.local_thread_id
+            \\  )
+        , .{ workspace_row_id, workspace.workspace_id, @as(i64, @intCast(snapshot_thread_count)) });
+        try self.conn.exec("update threads set sort_index = -id where workspace_id = ?1", .{workspace_row_id});
+
+        if (workspace.threads.len == 0) {
+            const legacy_messages = if (workspace.messages.len != 0)
+                workspace.messages
+            else if (is_first_workspace)
+                (snapshot.messages orelse &[_]store_protocol.Message{})
+            else
+                &[_]store_protocol.Message{};
+            const provider = if (is_first_workspace) snapshot.provider orelse workspace.provider else workspace.provider;
+            const harness = if (is_first_workspace) snapshot.harness orelse workspace.harness else workspace.harness;
+            const draft = if (is_first_workspace) snapshot.draft orelse workspace.draft else workspace.draft;
+            try self.insertThread(
+                workspace_row_id,
+                0,
+                "New thread",
+                workspace.archived,
+                legacy_messages.len != 0,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                provider,
+                harness,
+                null,
+                draft,
+                null,
+                &.{},
+                0,
+                legacy_messages,
+                store_revision,
+            );
+        } else {
+            for (workspace.threads, 0..) |thread, thread_index| {
+                try self.reconcileSnapshotThread(workspace_row_id, thread, thread_index, store_revision);
+            }
+        }
+
+        try self.conn.exec(
+            \\update threads
+            \\set sort_index = (
+            \\    select position.sort_index from snapshot_thread_positions position
+            \\    where position.thread_row_id = threads.id
+            \\)
+            \\where workspace_id = ?1 and exists (
+            \\    select 1 from snapshot_thread_positions position
+            \\    where position.thread_row_id = threads.id
+            \\)
+        , .{workspace_row_id});
+    }
+
+    fn reconcileSnapshotThread(
+        self: *Self,
+        workspace_row_id: i64,
+        thread: store_protocol.Thread,
+        thread_index: usize,
+        store_revision: i64,
+    ) !void {
+        var existing_thread_id: ?i64 = null;
+        if (thread.local_thread_id.len != 0) {
+            const existing = try self.conn.row(
+                "select id from threads where workspace_id = ?1 and local_thread_id = ?2",
+                .{ workspace_row_id, thread.local_thread_id },
+            );
+            if (existing) |row| {
+                existing_thread_id = row.int(0);
+                row.deinit();
+            }
+        }
+        if (existing_thread_id == null) {
+            try self.insertThread(
+                workspace_row_id,
+                @as(i64, @intCast(thread_index)),
+                thread.title,
+                thread.archived,
+                thread.committed,
+                if (thread.local_thread_id.len == 0) null else thread.local_thread_id,
+                thread.last_activity_at,
+                thread.provider_thread_id,
+                thread.model_ref,
+                thread.reasoning_effort,
+                thread.reasoning_variant,
+                thread.fast_mode,
+                thread.access_mode,
+                thread.provider,
+                thread.harness,
+                thread.tui_dock_id,
+                thread.draft,
+                thread.draft_image,
+                thread.draft_images,
+                thread.message_offset,
+                thread.messages,
+                store_revision,
+            );
+            return;
+        }
+
+        const thread_row_id = existing_thread_id.?;
+        const provider_code = try providerCode(thread.provider);
+        const harness_code = try harnessCode(thread.harness);
+        const reasoning_code = if (thread.reasoning_effort) |value| try reasoningEffortCode(value) else null;
+        const fast_code = if (thread.fast_mode) |value| try fastModeCode(value) else null;
+        const access_code = if (thread.access_mode) |value| try accessModeCode(value) else null;
+        const primary_draft_image = try firstAttachment(thread.draft_image, thread.draft_images);
+        const draft_images_json = try encodeExtraImagesJson(self.allocator, thread.draft_images);
+        defer if (draft_images_json) |value| self.allocator.free(value);
+        try self.conn.exec(
+            "update threads set sort_index = ?1, title = ?2, archived = ?3, committed = ?4, last_activity_at = ?5, provider_thread_id = ?6, model_ref = ?7, reasoning_effort = ?8, reasoning_variant = ?9, fast_mode = ?10, access_mode = ?11, provider = ?12, harness = ?13, tui_dock_id = ?14, draft = ?15, draft_image_path = ?16, draft_image_mime = ?17, draft_image_byte_size = ?18, draft_images_json = ?19 where id = ?20",
+            .{
+                @as(i64, @intCast(thread_index)),
+                thread.title,
+                boolToInt(thread.archived),
+                boolToInt(thread.committed),
+                thread.last_activity_at,
+                thread.provider_thread_id,
+                thread.model_ref,
+                reasoning_code,
+                thread.reasoning_variant,
+                fast_code,
+                access_code,
+                provider_code,
+                harness_code,
+                if (thread.tui_dock_id) |value| @as(i64, @intCast(value)) else null,
+                thread.draft,
+                if (primary_draft_image) |value| value.path else null,
+                if (primary_draft_image) |value| value.mime else null,
+                if (primary_draft_image) |value| @as(i64, @intCast(value.byte_size)) else null,
+                draft_images_json,
+                thread_row_id,
+            },
+        );
+        try self.replaceSnapshotMessageTail(thread_row_id, thread.message_offset, thread.messages, store_revision);
+    }
+
+    fn replaceSnapshotMessageTail(
+        self: *Self,
+        thread_row_id: i64,
+        message_offset: usize,
+        messages: []const store_protocol.Message,
+        store_revision: i64,
+    ) !void {
+        const offset: i64 = @intCast(message_offset);
+        try self.conn.execNoArgs(
+            \\delete from snapshot_message_positions;
+            \\delete from snapshot_message_restore_positions;
+        );
+        try self.conn.exec(
+            \\insert into snapshot_message_positions (message_row_id, original_sort_index)
+            \\select m.id, m.sort_index
+            \\from messages m
+            \\where m.thread_id = ?1 and m.sort_index >= ?2 and m.message_id is not null and (
+            \\    m.message_id like 'turn:%'
+            \\    or m.message_id in (
+            \\        select user_message_id from chat_turns
+            \\        where user_message_id is not null and committed_store_revision is not null
+            \\    )
+            \\)
+        , .{ thread_row_id, offset });
+        try self.conn.execNoArgs(
+            \\update messages
+            \\set sort_index = -id
+            \\where id in (select message_row_id from snapshot_message_positions);
+        );
+        try self.conn.exec(
+            "delete from messages where thread_id = ?1 and sort_index >= ?2",
+            .{ thread_row_id, offset },
+        );
+
+        for (messages, 0..) |message, message_index| {
+            const sort_index = offset + @as(i64, @intCast(message_index));
+            try self.insertMessage(thread_row_id, sort_index, message);
+            if (message.message_id.len != 0) try self.insertMessageKey(thread_row_id, sort_index, message, store_revision);
+        }
+
+        const next_sort_row = (try self.conn.row(
+            "select coalesce(max(sort_index) + 1, 0) from messages where thread_id = ?1 and sort_index >= 0",
+            .{thread_row_id},
+        )) orelse return error.StoreCorrupt;
+        const next_sort = next_sort_row.int(0);
+        next_sort_row.deinit();
+        try self.conn.exec(
+            \\insert into snapshot_message_restore_positions (message_row_id, sort_index)
+            \\select position.message_row_id,
+            \\       ?1 + row_number() over (order by position.original_sort_index) - 1
+            \\from snapshot_message_positions position
+            \\join messages m on m.id = position.message_row_id
+            \\where m.sort_index < 0
+        , .{next_sort});
+        try self.conn.execNoArgs(
+            \\update messages
+            \\set sort_index = (
+            \\    select position.sort_index from snapshot_message_restore_positions position
+            \\    where position.message_row_id = messages.id
+            \\)
+            \\where id in (select message_row_id from snapshot_message_restore_positions);
+        );
+        try self.conn.exec(
+            \\delete from client_message_keys
+            \\where thread_id = ?1 and not exists (
+            \\    select 1 from messages m
+            \\    where m.thread_id = client_message_keys.thread_id
+            \\      and m.message_id = client_message_keys.message_id
+            \\)
+        , .{thread_row_id});
+        try self.conn.exec(
+            \\update client_message_keys
+            \\set sort_index = (
+            \\    select m.sort_index from messages m
+            \\    where m.thread_id = client_message_keys.thread_id
+            \\      and m.message_id = client_message_keys.message_id
+            \\)
+            \\where thread_id = ?1
+        , .{thread_row_id});
+    }
+
+    /// Identity-preserving full rewrite used only for one-time legacy import.
     ///
     /// The GUI snapshot is not the transcript authority anymore: rows the
     /// daemon committed (`turn:{id}:msg:{n}` plus ledger-referenced client
@@ -1138,7 +1549,7 @@ pub const Store = struct {
     /// therefore stages those rows in temp tables first and re-homes any of
     /// them the snapshot did not carry, all inside applyMutation's single
     /// `begin immediate` transaction.
-    fn applySnapshot(self: *Self, snapshot: store_protocol.Snapshot, store_revision: i64) !void {
+    fn applySnapshotFullRewrite(self: *Self, snapshot: store_protocol.Snapshot, store_revision: i64) !void {
         if (snapshot.schema_version != 1) return error.InvalidParams;
 
         // Stage the protected sets before the wipe. Thread scope: any thread
@@ -1394,8 +1805,12 @@ pub const Store = struct {
     /// A thread absent from the snapshot whose workspace survives is restored
     /// (the GUI cannot have observed it — see applySnapshot). A message id the
     /// snapshot already carries wins on position/content (M4-P3 parity makes
-    /// content equal); identity is what must never fork, so a second row for
-    /// an existing (thread, message_id) is never inserted — pinned by the
+    /// content equal). Attachment fields are the exception: older GUI
+    /// projections can carry the accepted row identity while omitting its
+    /// daemon-owned images, so sparse attachment columns are enriched from
+    /// the preserved row before missing identities are restored. Identity is
+    /// what must never fork, so a second row for an existing
+    /// (thread, message_id) is never inserted — pinned by the
     /// `messages_thread_message_id_idx` unique index as a hard belt.
     ///
     /// Sort-index coherence: restored rows append after the snapshot's rows
@@ -2133,10 +2548,19 @@ pub const Store = struct {
 
     fn applyChatCompletionClear(self: *Self, request: store_protocol.NotificationChatCompletionClearRequest) !bool {
         if (request.workspace_id.len == 0 or request.local_thread_id.len == 0) return error.InvalidParams;
-        try self.conn.exec(
-            "delete from chat_completions where workspace_id = ?1 and local_thread_id = ?2",
-            .{ request.workspace_id, request.local_thread_id },
-        );
+        if (request.completed_at_ms) |completed_at_ms| {
+            try self.conn.exec(
+                "delete from chat_completions where workspace_id = ?1 and local_thread_id = ?2 and completed_at_ms <= ?3",
+                .{ request.workspace_id, request.local_thread_id, completed_at_ms },
+            );
+        } else {
+            // Compatibility for older clients that did not identify the
+            // completion they were acknowledging.
+            try self.conn.exec(
+                "delete from chat_completions where workspace_id = ?1 and local_thread_id = ?2",
+                .{ request.workspace_id, request.local_thread_id },
+            );
+        }
         return self.conn.changes() > 0;
     }
 
@@ -2319,7 +2743,7 @@ pub const Store = struct {
         // cannot collide.
         try self.conn.exec(
             "insert into messages (thread_id, sort_index, role, author, body, image_path, image_mime, image_byte_size, extra_images_json, tool_call_id, tool_call_kind, tool_call_status, message_id, created_at_ms, updated_at_ms) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) " ++
-                "on conflict(thread_id, message_id) where message_id is not null do update set sort_index = excluded.sort_index, role = excluded.role, author = excluded.author, body = excluded.body, image_path = excluded.image_path, image_mime = excluded.image_mime, image_byte_size = excluded.image_byte_size, extra_images_json = excluded.extra_images_json, tool_call_id = excluded.tool_call_id, tool_call_kind = excluded.tool_call_kind, tool_call_status = excluded.tool_call_status, created_at_ms = excluded.created_at_ms, updated_at_ms = excluded.updated_at_ms",
+                "on conflict(thread_id, message_id) where message_id is not null do update set sort_index = excluded.sort_index, role = excluded.role, author = excluded.author, body = excluded.body, image_path = coalesce(excluded.image_path, messages.image_path), image_mime = coalesce(excluded.image_mime, messages.image_mime), image_byte_size = coalesce(excluded.image_byte_size, messages.image_byte_size), extra_images_json = coalesce(excluded.extra_images_json, messages.extra_images_json), tool_call_id = excluded.tool_call_id, tool_call_kind = excluded.tool_call_kind, tool_call_status = excluded.tool_call_status, created_at_ms = excluded.created_at_ms, updated_at_ms = excluded.updated_at_ms",
             .{
                 thread_row_id,
                 sort_index,
@@ -2675,6 +3099,9 @@ fn providerCode(value: []const u8) !i64 {
     if (std.mem.eql(u8, value, "codex")) return 1;
     if (std.mem.eql(u8, value, "cursor")) return 2;
     if (std.mem.eql(u8, value, "claude")) return 3;
+    if (std.mem.eql(u8, value, "pi")) return 4;
+    if (std.mem.eql(u8, value, "fx")) return 5;
+    if (std.mem.eql(u8, value, "grok")) return 6;
     return error.InvalidParams;
 }
 
@@ -4993,6 +5420,23 @@ test "bounded snapshot preserves unloaded legacy transcript prefix" {
         testSnapshot(&.{initial_workspace}),
     ) });
 
+    try store.conn.exec(
+        "create temp table lazy_prefix_mutations (operation text not null)",
+        .{},
+    );
+    try store.conn.exec(
+        \\create temp trigger observe_lazy_prefix_delete before delete on main.messages
+        \\when old.sort_index < 2 begin
+        \\    insert into lazy_prefix_mutations (operation) values ('delete');
+        \\end
+    , .{});
+    try store.conn.exec(
+        \\create temp trigger observe_lazy_prefix_update before update on main.messages
+        \\when old.sort_index < 2 begin
+        \\    insert into lazy_prefix_mutations (operation) values ('update');
+        \\end
+    , .{});
+
     const tail = [_]store_protocol.Message{.{
         .role = "assistant",
         .author = "Assistant",
@@ -5021,6 +5465,12 @@ test "bounded snapshot preserves unloaded legacy transcript prefix" {
     }
     if (rows.err) |err| return err;
     try std.testing.expectEqual(expected.len, index);
+    var prefix_mutations = (try store.conn.row(
+        "select count(*) from lazy_prefix_mutations",
+        .{},
+    )).?;
+    defer prefix_mutations.deinit();
+    try std.testing.expectEqual(@as(i64, 0), prefix_mutations.int(0));
 }
 
 // M4-P4 fix Layer B (ii): a mid-window snapshot (commit → GUI observation gap)
@@ -5339,6 +5789,7 @@ test "chat completion ledger survives snapshot lacking it" {
         .mutation = testHeader("done-clear", 4),
         .workspace_id = workspace.workspace_id,
         .local_thread_id = thread.local_thread_id,
+        .completed_at_ms = 20,
     });
     try std.testing.expect(cleared.applied);
     var removed = (try store.conn.row(
@@ -5651,19 +6102,28 @@ test "granular mutations are durable, idempotent, and revision guarded" {
         .completion = .{ .workspace_id = workspace.workspace_id, .local_thread_id = thread.local_thread_id, .completed_at_ms = 7 },
     });
     try std.testing.expectEqual(@as(u64, 7), completion_result.store_revision);
-    const clear_completion = try store.clearChatCompletion(.{
-        .mutation = testHeader("completion-clear", 7),
+    const stale_clear_completion = try store.clearChatCompletion(.{
+        .mutation = testHeader("completion-clear-stale", 7),
         .workspace_id = workspace.workspace_id,
         .local_thread_id = thread.local_thread_id,
+        .completed_at_ms = 6,
+    });
+    try std.testing.expect(!stale_clear_completion.applied);
+    const clear_completion = try store.clearChatCompletion(.{
+        .mutation = testHeader("completion-clear", 8),
+        .workspace_id = workspace.workspace_id,
+        .local_thread_id = thread.local_thread_id,
+        .completed_at_ms = 7,
     });
     try std.testing.expect(clear_completion.applied);
     const clear_missing_completion = try store.clearChatCompletion(.{
-        .mutation = testHeader("completion-clear-missing", 8),
+        .mutation = testHeader("completion-clear-missing", 9),
         .workspace_id = workspace.workspace_id,
         .local_thread_id = thread.local_thread_id,
+        .completed_at_ms = 7,
     });
     try std.testing.expect(!clear_missing_completion.applied);
-    try std.testing.expectEqual(@as(u64, 9), clear_missing_completion.store_revision);
+    try std.testing.expectEqual(@as(u64, 10), clear_missing_completion.store_revision);
 }
 
 test "external chat draft mutation is atomic and rejects a stale GUI snapshot" {

@@ -20,7 +20,13 @@ const DEFAULT_CODEX_MODEL = provider_models.DEFAULT_CODEX_MODEL;
 const DEFAULT_OPENCODE_MODEL = provider_models.DEFAULT_OPENCODE_MODEL;
 const DEFAULT_CLAUDE_MODEL = provider_models.DEFAULT_CLAUDE_MODEL;
 const DEFAULT_CURSOR_MODEL = provider_models.DEFAULT_CURSOR_MODEL;
+const DEFAULT_PI_MODEL = provider_models.DEFAULT_PI_MODEL;
+const DEFAULT_FX_MODEL = provider_models.DEFAULT_FX_MODEL;
+const DEFAULT_GROK_MODEL = provider_models.DEFAULT_GROK_MODEL;
 const OPENCODE_MODEL_OPTIONS = provider_models.OPENCODE_MODEL_OPTIONS;
+const PI_MODEL_OPTIONS = provider_models.PI_MODEL_OPTIONS;
+const FX_MODEL_OPTIONS = provider_models.FX_MODEL_OPTIONS;
+const GROK_MODEL_OPTIONS = provider_models.GROK_MODEL_OPTIONS;
 const CLAUDE_MODEL_OPTIONS = provider_models.CLAUDE_MODEL_OPTIONS;
 const CURSOR_MODEL_OPTIONS = provider_models.CURSOR_MODEL_OPTIONS;
 const CLAUDE_STANDARD_EFFORT_VALUES = provider_models.CLAUDE_STANDARD_EFFORT_VALUES;
@@ -55,6 +61,33 @@ pub const CursorModelCacheState = struct {
 
 pub const ClaudeModelCacheStatus = OpencodeModelCacheStatus;
 
+pub const PiModelCacheStatus = OpencodeModelCacheStatus;
+
+pub const PiModelCacheState = struct {
+    mutex: Mutex = .{},
+    status: PiModelCacheStatus = .idle,
+    models: ?[]ai_harness.ModelInfo = null,
+    worker: ?std.Thread = null,
+};
+
+pub const FxModelCacheStatus = OpencodeModelCacheStatus;
+
+pub const FxModelCacheState = struct {
+    mutex: Mutex = .{},
+    status: FxModelCacheStatus = .idle,
+    models: ?[]ai_harness.ModelInfo = null,
+    worker: ?std.Thread = null,
+};
+
+pub const GrokModelCacheStatus = OpencodeModelCacheStatus;
+
+pub const GrokModelCacheState = struct {
+    mutex: Mutex = .{},
+    status: GrokModelCacheStatus = .idle,
+    models: ?[]ai_harness.ModelInfo = null,
+    worker: ?std.Thread = null,
+};
+
 pub const ClaudeModelCacheState = struct {
     mutex: Mutex = .{},
     status: ClaudeModelCacheStatus = .idle,
@@ -75,6 +108,9 @@ pub const ProviderReadinessSnapshot = struct {
     opencode: ProviderReadiness = .checking,
     claude: ProviderReadiness = .checking,
     cursor: ProviderReadiness = .checking,
+    pi: ProviderReadiness = .checking,
+    fx: ProviderReadiness = .checking,
+    grok: ProviderReadiness = .checking,
 
     pub fn forProvider(self: ProviderReadinessSnapshot, provider: Provider) ProviderReadiness {
         return switch (provider) {
@@ -82,11 +118,14 @@ pub const ProviderReadinessSnapshot = struct {
             .opencode => self.opencode,
             .claude => self.claude,
             .cursor => self.cursor,
+            .pi => self.pi,
+            .fx => self.fx,
+            .grok => self.grok,
         };
     }
 
     pub fn hasReadyProvider(self: ProviderReadinessSnapshot) bool {
-        return self.codex == .ready or self.opencode == .ready or self.claude == .ready or self.cursor == .ready;
+        return self.codex == .ready or self.opencode == .ready or self.claude == .ready or self.cursor == .ready or self.pi == .ready or self.fx == .ready or self.grok == .ready;
     }
 };
 
@@ -107,8 +146,88 @@ pub const State = struct {
     opencode_model_cache: OpencodeModelCacheState = .{},
     claude_model_cache: ClaudeModelCacheState = .{},
     cursor_model_cache: CursorModelCacheState = .{},
+    pi_model_cache: PiModelCacheState = .{},
+    fx_model_cache: FxModelCacheState = .{},
+    grok_model_cache: GrokModelCacheState = .{},
     readiness: ProviderReadinessState = .{},
 };
+
+/// One short-lived `pi --mode rpc` query (`get_available_models`) on a
+/// background thread; the result replaces the static picker list.
+pub fn piModelCacheWorker(state: *PiModelCacheState) void {
+    const models = blk: {
+        var client = ai_harness.connect(std.heap.page_allocator, .{ .pi = .{} }) catch |err| {
+            log.warn("failed to connect to pi for model discovery: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        defer client.deinit();
+        break :blk client.listModels(std.heap.page_allocator) catch |err| {
+            log.warn("failed to load pi models: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+    };
+
+    state.mutex.lock();
+    defer state.mutex.unlock();
+    if (models) |loaded| {
+        state.models = loaded;
+        state.status = .completed;
+    } else {
+        state.status = .failed;
+    }
+}
+
+/// One short-lived `fx acp` handshake on a background thread: it reads the
+/// model catalog from the newest existing session's configOptions so startup
+/// never blocks the UI and never spawns extra sessions when one already exists.
+pub fn fxModelCacheWorker(state: *FxModelCacheState) void {
+    const models = blk: {
+        var client = ai_harness.connect(std.heap.page_allocator, .{ .fx = .{} }) catch |err| {
+            log.warn("failed to connect to fx for model discovery: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        defer client.deinit();
+        break :blk client.listModels(std.heap.page_allocator) catch |err| {
+            log.warn("failed to load fx models: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+    };
+
+    state.mutex.lock();
+    defer state.mutex.unlock();
+    if (models) |loaded| {
+        state.models = loaded;
+        state.status = .completed;
+    } else {
+        state.status = .failed;
+    }
+}
+
+/// One short-lived `grok agent stdio` initialize handshake on a background
+/// thread: grok reports its model catalog in the initialize response, so
+/// discovery needs neither auth nor a session and never blocks the UI.
+pub fn grokModelCacheWorker(state: *GrokModelCacheState) void {
+    const models = blk: {
+        var client = ai_harness.connect(std.heap.page_allocator, .{ .grok = .{} }) catch |err| {
+            log.warn("failed to connect to grok for model discovery: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        defer client.deinit();
+        break :blk client.listModels(std.heap.page_allocator) catch |err| {
+            log.warn("failed to load grok models: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+    };
+
+    state.mutex.lock();
+    defer state.mutex.unlock();
+    if (models) |loaded| {
+        state.models = loaded;
+        state.status = .completed;
+    } else {
+        state.status = .failed;
+    }
+}
 
 pub fn providerReadinessWorker(state: *ProviderReadinessState) void {
     const snapshot: ProviderReadinessSnapshot = .{
@@ -116,6 +235,9 @@ pub fn providerReadinessWorker(state: *ProviderReadinessState) void {
         .opencode = detectProviderReadiness(.opencode),
         .claude = detectProviderReadiness(.claude),
         .cursor = detectProviderReadiness(.cursor),
+        .pi = detectProviderReadiness(.pi),
+        .fx = detectProviderReadiness(.fx),
+        .grok = detectProviderReadiness(.grok),
     };
 
     state.mutex.lock();
@@ -130,6 +252,9 @@ pub fn detectProviderReadiness(provider: Provider) ProviderReadiness {
         .opencode => process_env.commandExists("opencode"),
         .claude => process_env.commandExists("node") and process_env.commandExists("claude"),
         .cursor => process_env.commandExists("agent"),
+        .pi => process_env.commandExists("pi"),
+        .fx => process_env.commandExists("fx"),
+        .grok => process_env.commandExists("grok"),
     };
     if (!executable_ready) return .missing;
 
@@ -142,6 +267,9 @@ pub fn detectProviderReadiness(provider: Provider) ProviderReadiness {
         } },
         .claude => ai_harness.ProviderConfig{ .claude = .{} },
         .cursor => ai_harness.ProviderConfig{ .cursor = .{} },
+        .pi => ai_harness.ProviderConfig{ .pi = .{} },
+        .fx => ai_harness.ProviderConfig{ .fx = .{} },
+        .grok => ai_harness.ProviderConfig{ .grok = .{} },
     };
     var client = ai_harness.connect(std.heap.page_allocator, provider_config) catch |err| {
         log.warn("provider readiness connect failed provider={s}: {s}", .{ @tagName(provider), @errorName(err) });
@@ -265,6 +393,27 @@ pub fn claudeModelOptionsSnapshot(self: anytype) []const ModelOption {
         CLAUDE_MODEL_OPTIONS[0..];
 }
 
+pub fn piModelOptionsSnapshot(self: anytype) []const ModelOption {
+    return if (self.pi_model_options.items.len > 0)
+        self.pi_model_options.items
+    else
+        PI_MODEL_OPTIONS[0..];
+}
+
+pub fn fxModelOptionsSnapshot(self: anytype) []const ModelOption {
+    return if (self.fx_model_options.items.len > 0)
+        self.fx_model_options.items
+    else
+        FX_MODEL_OPTIONS[0..];
+}
+
+pub fn grokModelOptionsSnapshot(self: anytype) []const ModelOption {
+    return if (self.grok_model_options.items.len > 0)
+        self.grok_model_options.items
+    else
+        GROK_MODEL_OPTIONS[0..];
+}
+
 pub fn cursorModelOptionsSnapshot(self: anytype) []const ModelOption {
     return if (self.cursor_model_options.items.len > 0)
         self.cursor_model_options.items
@@ -277,6 +426,9 @@ pub fn cachedDefaultModelRefForProvider(self: anytype, provider: Provider) [:0]c
         .codex => DEFAULT_CODEX_MODEL,
         .claude => DEFAULT_CLAUDE_MODEL,
         .cursor => DEFAULT_CURSOR_MODEL,
+        .pi => DEFAULT_PI_MODEL,
+        .fx => DEFAULT_FX_MODEL,
+        .grok => DEFAULT_GROK_MODEL,
         .opencode => blk: {
             for (self.opencodeModelOptionsSnapshot()) |option| {
                 if (option.value) |value| break :blk value;
@@ -296,6 +448,18 @@ pub fn startCursorModelOptionsRefresh(self: anytype) void {
 
 pub fn startClaudeModelOptionsRefresh(self: anytype) void {
     self.refreshClaudeModelOptionsCacheAsync();
+}
+
+pub fn startPiModelOptionsRefresh(self: anytype) void {
+    self.refreshPiModelOptionsCacheAsync();
+}
+
+pub fn startFxModelOptionsRefresh(self: anytype) void {
+    self.refreshFxModelOptionsCacheAsync();
+}
+
+pub fn startGrokModelOptionsRefresh(self: anytype) void {
+    self.refreshGrokModelOptionsCacheAsync();
 }
 
 pub fn startProviderReadinessCheck(self: anytype) void {
@@ -458,6 +622,57 @@ pub fn refreshClaudeModelOptionsCacheAsync(self: anytype) void {
     }) catch {
         self.provider_controller.claude_model_cache.status = .idle;
         log.warn("failed to spawn Claude model cache worker", .{});
+        return;
+    };
+}
+
+pub fn refreshPiModelOptionsCacheAsync(self: anytype) void {
+    self.pollPiModelOptionsCache();
+
+    self.provider_controller.pi_model_cache.mutex.lock();
+    defer self.provider_controller.pi_model_cache.mutex.unlock();
+    if (self.provider_controller.pi_model_cache.status == .pending) return;
+
+    self.provider_controller.pi_model_cache.status = .pending;
+    self.provider_controller.pi_model_cache.worker = std.Thread.spawn(.{}, piModelCacheWorker, .{
+        &self.provider_controller.pi_model_cache,
+    }) catch {
+        self.provider_controller.pi_model_cache.status = .idle;
+        log.warn("failed to spawn pi model cache worker", .{});
+        return;
+    };
+}
+
+pub fn refreshFxModelOptionsCacheAsync(self: anytype) void {
+    self.pollFxModelOptionsCache();
+
+    self.provider_controller.fx_model_cache.mutex.lock();
+    defer self.provider_controller.fx_model_cache.mutex.unlock();
+    if (self.provider_controller.fx_model_cache.status == .pending) return;
+
+    self.provider_controller.fx_model_cache.status = .pending;
+    self.provider_controller.fx_model_cache.worker = std.Thread.spawn(.{}, fxModelCacheWorker, .{
+        &self.provider_controller.fx_model_cache,
+    }) catch {
+        self.provider_controller.fx_model_cache.status = .idle;
+        log.warn("failed to spawn fx model cache worker", .{});
+        return;
+    };
+}
+
+pub fn refreshGrokModelOptionsCacheAsync(self: anytype) void {
+    self.pollGrokModelOptionsCache();
+
+    self.provider_controller.grok_model_cache.mutex.lock();
+    defer self.provider_controller.grok_model_cache.mutex.unlock();
+    if (self.provider_controller.grok_model_cache.status == .pending) return;
+
+    self.provider_controller.grok_model_cache.status = .pending;
+    self.provider_controller.grok_model_cache.worker = std.Thread.spawn(.{}, grokModelCacheWorker, .{
+        &self.provider_controller.grok_model_cache,
+    }) catch {
+        self.provider_controller.grok_model_cache.status = .idle;
+        log.warn("failed to spawn grok model cache worker", .{});
         return;
     };
 }
@@ -626,6 +841,78 @@ pub fn populateClaudeModelOptions(self: anytype, models: []const ai_harness.Mode
     }
 }
 
+/// Rebuilds the pi picker from `get_available_models`. The "Default (pi
+/// config)" row stays first so users can keep deferring to pi's own config.
+pub fn populatePiModelOptions(self: anytype, models: []const ai_harness.ModelInfo) !void {
+    try appendDefaultModelOption(self, &self.pi_model_options, PI_MODEL_OPTIONS[0]);
+    for (models) |model| {
+        if (model.model_id.len == 0) continue;
+        const label_text = if (model.model_name.len > 0) model.model_name else model.model_id;
+        const label = try self.allocator.dupeZ(u8, label_text);
+        errdefer self.allocator.free(label);
+        const value = try self.allocator.dupeZ(u8, model.model_id);
+        errdefer self.allocator.free(value);
+        try self.pi_model_options.append(self.allocator, .{
+            .label = label,
+            .value = value,
+            .reasoning_supported = model.reasoning_supported,
+        });
+    }
+}
+
+/// Rebuilds the fx picker from the ACP `model` configOption. The "Default (fx
+/// config)" row stays first so users can keep deferring to fx's own config.
+pub fn populateFxModelOptions(self: anytype, models: []const ai_harness.ModelInfo) !void {
+    try appendDefaultModelOption(self, &self.fx_model_options, FX_MODEL_OPTIONS[0]);
+    for (models) |model| {
+        if (model.model_id.len == 0) continue;
+        const label_text = if (model.model_name.len > 0) model.model_name else model.model_id;
+        const label = try self.allocator.dupeZ(u8, label_text);
+        errdefer self.allocator.free(label);
+        const value = try self.allocator.dupeZ(u8, model.model_id);
+        errdefer self.allocator.free(value);
+        try self.fx_model_options.append(self.allocator, .{
+            .label = label,
+            .value = value,
+            .reasoning_supported = false,
+        });
+    }
+}
+
+/// Rebuilds the grok picker from the initialize `modelState` catalog. The
+/// "Default (grok config)" row stays first so users can keep deferring to
+/// grok's own persisted selection; every grok model supports reasoning effort.
+pub fn populateGrokModelOptions(self: anytype, models: []const ai_harness.ModelInfo) !void {
+    try appendDefaultModelOption(self, &self.grok_model_options, GROK_MODEL_OPTIONS[0]);
+    for (models) |model| {
+        if (model.model_id.len == 0) continue;
+        const label_text = if (model.model_name.len > 0) model.model_name else model.model_id;
+        const label = try self.allocator.dupeZ(u8, label_text);
+        errdefer self.allocator.free(label);
+        const value = try self.allocator.dupeZ(u8, model.model_id);
+        errdefer self.allocator.free(value);
+        try self.grok_model_options.append(self.allocator, .{
+            .label = label,
+            .value = value,
+            .reasoning_supported = true,
+        });
+    }
+}
+
+// Dynamic rows own their strings, so the static default row is copied rather
+// than referenced to keep the clear path uniform.
+fn appendDefaultModelOption(self: anytype, list: *std.ArrayList(ModelOption), template: ModelOption) !void {
+    const label = try self.allocator.dupeZ(u8, template.label);
+    errdefer self.allocator.free(label);
+    const value = if (template.value) |v| try self.allocator.dupeZ(u8, v) else null;
+    errdefer if (value) |v| self.allocator.free(v);
+    try list.append(self.allocator, .{
+        .label = label,
+        .value = value,
+        .reasoning_supported = template.reasoning_supported,
+    });
+}
+
 pub fn asciiCaseInsensitiveCompare(a: []const u8, b: []const u8) std.math.Order {
     var index: usize = 0;
     const min_len = @min(a.len, b.len);
@@ -687,6 +974,8 @@ pub fn refreshOpencodeReasoningMenu(self: anytype, thread: *const ChatThread) !v
 
     if (thread.provider == .cursor) return self.refreshCursorReasoningMenu(thread);
     if (thread.provider == .claude) return self.refreshClaudeReasoningMenu(thread);
+    if (thread.provider == .pi) return self.refreshPiReasoningMenu();
+    if (thread.provider == .grok) return self.refreshGrokReasoningMenu();
     if (thread.provider != .opencode) return;
     const opt = self.opencodeModelOptionForRef(thread.model_ref) orelse return;
     if (!opt.reasoning_supported) return;
@@ -716,6 +1005,29 @@ pub fn refreshCursorReasoningMenu(self: anytype, thread: *const ChatThread) !voi
         const label = try self.allocator.dupeZ(u8, label_text);
         const variant_copy = try self.allocator.dupeZ(u8, value);
         try self.opencode_reasoning_menu.append(self.allocator, .{ .label = label, .variant = variant_copy });
+    }
+}
+
+/// Pi accepts every Verde effort tag; the menu mirrors PI_REASONING_OPTIONS
+/// with effort tag names as row variants (the shared claude/pi selection
+/// handler parses them back into reasoning_effort).
+pub fn refreshPiReasoningMenu(self: anytype) !void {
+    for (provider_models.PI_REASONING_OPTIONS) |option| {
+        const label = try self.allocator.dupeZ(u8, option.label);
+        errdefer self.allocator.free(label);
+        const variant: ?[:0]u8 = if (option.value) |value| try self.allocator.dupeZ(u8, @tagName(value)) else null;
+        try self.opencode_reasoning_menu.append(self.allocator, .{ .label = label, .variant = variant });
+    }
+}
+
+/// grok efforts stop at xhigh; the menu mirrors GROK_REASONING_OPTIONS with
+/// effort tag names as row variants (parsed back by the shared handler).
+pub fn refreshGrokReasoningMenu(self: anytype) !void {
+    for (provider_models.GROK_REASONING_OPTIONS) |option| {
+        const label = try self.allocator.dupeZ(u8, option.label);
+        errdefer self.allocator.free(label);
+        const variant: ?[:0]u8 = if (option.value) |value| try self.allocator.dupeZ(u8, @tagName(value)) else null;
+        try self.opencode_reasoning_menu.append(self.allocator, .{ .label = label, .variant = variant });
     }
 }
 
@@ -898,6 +1210,42 @@ pub fn clearClaudeModelOptions(self: anytype) void {
     self.clearDynamicClaudeModelOptions();
 }
 
+pub fn clearDynamicPiModelOptions(self: anytype) void {
+    for (self.pi_model_options.items) |option| {
+        self.allocator.free(option.label);
+        if (option.value) |value| self.allocator.free(value);
+    }
+    self.pi_model_options.clearRetainingCapacity();
+}
+
+pub fn clearPiModelOptions(self: anytype) void {
+    self.clearDynamicPiModelOptions();
+}
+
+pub fn clearDynamicFxModelOptions(self: anytype) void {
+    for (self.fx_model_options.items) |option| {
+        self.allocator.free(option.label);
+        if (option.value) |value| self.allocator.free(value);
+    }
+    self.fx_model_options.clearRetainingCapacity();
+}
+
+pub fn clearFxModelOptions(self: anytype) void {
+    self.clearDynamicFxModelOptions();
+}
+
+pub fn clearDynamicGrokModelOptions(self: anytype) void {
+    for (self.grok_model_options.items) |option| {
+        self.allocator.free(option.label);
+        if (option.value) |value| self.allocator.free(value);
+    }
+    self.grok_model_options.clearRetainingCapacity();
+}
+
+pub fn clearGrokModelOptions(self: anytype) void {
+    self.clearDynamicGrokModelOptions();
+}
+
 pub fn clearCursorModelOptions(self: anytype) void {
     self.clearDynamicCursorModelOptions();
 }
@@ -1067,6 +1415,81 @@ pub fn pollCursorModelOptionsCache(self: anytype) void {
         },
         .failed => {
             log.warn("failed to refresh Cursor model cache", .{});
+        },
+        else => {},
+    }
+}
+
+pub fn pollPiModelOptionsCache(self: anytype) void {
+    const poll = takeModelCachePoll(&self.provider_controller.pi_model_cache);
+    if (poll.status != .idle) {
+        self.finishPiModelCacheThread();
+    }
+
+    switch (poll.status) {
+        .completed => {
+            const models = poll.models orelse return;
+            defer ai_harness.freeModelInfos(std.heap.page_allocator, models);
+            self.clearPiModelOptions();
+            if (models.len == 0) return;
+            self.populatePiModelOptions(models) catch |err| {
+                log.warn("failed to cache pi models: {s}", .{@errorName(err)});
+                self.clearDynamicPiModelOptions();
+                return;
+            };
+        },
+        .failed => {
+            log.warn("failed to refresh pi model cache", .{});
+        },
+        else => {},
+    }
+}
+
+pub fn pollFxModelOptionsCache(self: anytype) void {
+    const poll = takeModelCachePoll(&self.provider_controller.fx_model_cache);
+    if (poll.status != .idle) {
+        self.finishFxModelCacheThread();
+    }
+
+    switch (poll.status) {
+        .completed => {
+            const models = poll.models orelse return;
+            defer ai_harness.freeModelInfos(std.heap.page_allocator, models);
+            self.clearFxModelOptions();
+            if (models.len == 0) return;
+            self.populateFxModelOptions(models) catch |err| {
+                log.warn("failed to cache fx models: {s}", .{@errorName(err)});
+                self.clearDynamicFxModelOptions();
+                return;
+            };
+        },
+        .failed => {
+            log.warn("failed to refresh fx model cache", .{});
+        },
+        else => {},
+    }
+}
+
+pub fn pollGrokModelOptionsCache(self: anytype) void {
+    const poll = takeModelCachePoll(&self.provider_controller.grok_model_cache);
+    if (poll.status != .idle) {
+        self.finishGrokModelCacheThread();
+    }
+
+    switch (poll.status) {
+        .completed => {
+            const models = poll.models orelse return;
+            defer ai_harness.freeModelInfos(std.heap.page_allocator, models);
+            self.clearGrokModelOptions();
+            if (models.len == 0) return;
+            self.populateGrokModelOptions(models) catch |err| {
+                log.warn("failed to cache grok models: {s}", .{@errorName(err)});
+                self.clearDynamicGrokModelOptions();
+                return;
+            };
+        },
+        .failed => {
+            log.warn("failed to refresh grok model cache", .{});
         },
         else => {},
     }

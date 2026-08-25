@@ -684,6 +684,11 @@ pub fn runSendWorker(
                 .model = request.model_ref,
             },
         },
+        .pi => ai_harness.ProviderConfig{
+            .pi = .{
+                .cwd = request_cwd,
+            },
+        },
     };
 
     log.info(
@@ -1451,6 +1456,14 @@ fn formatSendWorkerError(
                 u8,
                 "Cursor CLI was not found. Install Cursor CLI, make sure `agent` is on PATH, then run `agent login`.",
             ),
+            .fx => allocator.dupe(
+                u8,
+                "The fx CLI was not found. Install it with `curl -fsSL https://fx.sh/setup.sh | bash`, then run `fx login`.",
+            ),
+            .grok => allocator.dupe(
+                u8,
+                "The grok CLI was not found. Install Grok Build (https://docs.x.ai/build/overview#install), then run `grok login`.",
+            ),
             else => std.fmt.allocPrint(
                 allocator,
                 "{s} CLI was not found. Install it and make sure it is available on PATH for packaged app launches.",
@@ -1480,6 +1493,38 @@ fn formatSendWorkerError(
         error.CursorAcpFailed => allocator.dupe(
             u8,
             "Cursor ACP request failed. Check that the Cursor CLI works with `agent status` and `agent acp`.",
+        ),
+        error.CursorAcpRefused => allocator.dupe(
+            u8,
+            "Cursor refused this turn; the reply text holds the agent's reason.",
+        ),
+        error.FxAttachmentsUnsupported => allocator.dupe(
+            u8,
+            "FX does not currently support local image attachments through this provider.",
+        ),
+        error.FxSignedOut => allocator.dupe(
+            u8,
+            "FX is not authenticated. Run `fx login` before sending.",
+        ),
+        error.FxAcpFailed => allocator.dupe(
+            u8,
+            "FX ACP request failed. Check that the fx CLI works with `fx acp` from a terminal.",
+        ),
+        error.FxAcpRefused => allocator.dupe(
+            u8,
+            "FX refused this turn; the reply text holds fx's reason. Usually the model id is not offered by the active fx provider (compare `fx models`, gateway ids look like openai/gpt-5.2) or the gateway returned an HTTP error.",
+        ),
+        error.GrokAttachmentsUnsupported => allocator.dupe(
+            u8,
+            "Grok does not currently support local image attachments through this provider.",
+        ),
+        error.GrokSignedOut => allocator.dupe(
+            u8,
+            "Grok is not authenticated. Run `grok login` before sending.",
+        ),
+        error.GrokAcpFailed => allocator.dupe(
+            u8,
+            "Grok ACP request failed. Check that the grok CLI works with `grok agent stdio` from a terminal.",
         ),
         error.UnsupportedRemoteProvider => allocator.dupe(
             u8,

@@ -44,8 +44,9 @@ configured in `verde.json`, the first custom launch profile also appears in
 the terminal context menu.
 
 Use `Ctrl+Alt+T` for a new shell tab. Launch Codex, Claude, OpenCode, Cursor,
-Grok, or Amp TUIs from the command palette; the built-in agent launchers are not
-entries in the terminal right-click menu.
+Pi, FX, Grok, or Amp TUIs from the command palette, or open a running GUI
+thread in TUI; the built-in agent launchers are not entries in the terminal
+right-click menu.
 
 Terminal-internal tabs live inside the focused terminal pane. Workspace split
 actions create new workspace panes in the tiling tree, not new tabs inside a
@@ -216,7 +217,8 @@ Control** for multi-step goals. It stays experimental and is off by default.
 workspaces, and app commands. `Ctrl+Enter` on a thread result opens it in a
 fresh pane. The palette also carries **Start New … TUI** entries for Codex, Claude,
 OpenCode, Cursor, Grok, and Amp, and **Open Current Thread in TUI** entries that
-promote a GUI chat thread into that provider's terminal TUI.
+promote a GUI chat thread — including Pi, FX, and Grok — into that provider's
+terminal TUI.
 
 The sidebar's **History · N** row opens the same palette scoped to one
 workspace's saved threads. Thread actions include open in a new pane, sync from
@@ -239,4 +241,4 @@ Provider-native commands surface in the same picker:
 
 - **Claude Code** — `/usage`, `/compact [instructions]`, plus skill commands such as `/code-review`, `/debug`, `/loop`, `/batch`, and `/skills`.
 - **Codex** — `/usage`, `/compact`, `/goal [status|clear|…]`, `/review [changes|base <branch>|commit <sha>|custom …]`, and `/shell confirm <command>` (requires typed confirmation).
-- **OpenCode / Cursor** — no native slash commands yet; `/stack`, `/process`, and `//` still work.
+- **OpenCode, Cursor, Pi, FX, Grok** — no native slash commands yet; `/stack`, `/process`, and `//` still work.

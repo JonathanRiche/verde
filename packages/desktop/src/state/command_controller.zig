@@ -124,6 +124,21 @@ fn runSlashCommandWorker(
                 .cwd = request_cwd,
             },
         },
+        .pi => ai_harness.ProviderConfig{
+            .pi = .{
+                .cwd = request_cwd,
+            },
+        },
+        .fx => ai_harness.ProviderConfig{
+            .fx = .{
+                .cwd = request_cwd,
+            },
+        },
+        .grok => ai_harness.ProviderConfig{
+            .grok = .{
+                .cwd = request_cwd,
+            },
+        },
     };
 
     var client = try ai_harness.connect(allocator, provider_config);
@@ -161,6 +176,18 @@ fn formatSlashCommandError(allocator: std.mem.Allocator, provider: Provider, err
         .cursor => switch (err) {
             error.UnsupportedOperation => "Cursor does not support this slash command yet.",
             else => "Cursor slash command failed.",
+        },
+        .pi => switch (err) {
+            error.UnsupportedOperation => "Pi does not support this slash command yet.",
+            else => "Pi slash command failed.",
+        },
+        .fx => switch (err) {
+            error.UnsupportedOperation => "FX does not support this slash command yet.",
+            else => "FX slash command failed.",
+        },
+        .grok => switch (err) {
+            error.UnsupportedOperation => "Grok does not support this slash command yet.",
+            else => "Grok slash command failed.",
         },
     };
     return allocator.dupe(u8, message);

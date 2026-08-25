@@ -769,6 +769,9 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .handoff_provider_opencode => state.setHandoffTargetProvider(.opencode),
             .handoff_provider_claude => state.setHandoffTargetProvider(.claude),
             .handoff_provider_cursor => state.setHandoffTargetProvider(.cursor),
+            .handoff_provider_pi => state.setHandoffTargetProvider(.pi),
+            .handoff_provider_fx => state.setHandoffTargetProvider(.fx),
+            .handoff_provider_grok => state.setHandoffTargetProvider(.grok),
             .handoff_context_summary => state.setHandoffContextMode(.summary),
             .handoff_context_recent => state.setHandoffContextMode(.recent),
             .handoff_context_full => state.setHandoffContextMode(.full),
@@ -1352,13 +1355,18 @@ fn registerHandoffModalHits(state: *runtime.AppState, width: f32, height: f32) v
     queueModalHit(state, .{ .x = modal.x + pad + surface_w + gap, .y = y, .w = surface_w, .h = row_h }, .handoff_surface_tui, 0);
 
     y += theme.scaledUi(58.0);
-    const provider_w = (content_w - gap * 3.0) * 0.25;
     const provider_actions = [_]runtime.PaletteModalAction{
         .handoff_provider_codex,
         .handoff_provider_opencode,
         .handoff_provider_claude,
         .handoff_provider_cursor,
+        .handoff_provider_pi,
+        .handoff_provider_fx,
+        .handoff_provider_grok,
     };
+    // Must mirror the render grid: one equal-width button per provider.
+    const provider_count: f32 = @floatFromInt(provider_actions.len);
+    const provider_w = (content_w - gap * (provider_count - 1.0)) / provider_count;
     for (provider_actions, 0..) |action, index| {
         queueModalHit(state, .{
             .x = modal.x + pad + @as(f32, @floatFromInt(index)) * (provider_w + gap),
@@ -1486,12 +1494,15 @@ fn renderProviderOnboardingModal(state: *runtime.AppState, width: f32, height: f
     y += theme.scaledUi(52.0);
 
     const snapshot = state.providerReadinessSnapshot();
-    const providers = [_]runtime.Provider{ .codex, .opencode, .claude, .cursor };
+    const providers = [_]runtime.Provider{ .codex, .opencode, .claude, .cursor, .pi, .fx, .grok };
     const button_h = theme.scaledUi(36.0);
     const button_y = modal.y + modal.h - pad - button_h;
     const rows_bottom = button_y - theme.scaledUi(18.0);
     const row_gap = theme.scaledUi(8.0);
-    const row_h = @max((rows_bottom - y - row_gap * 3.0) / 4.0, theme.scaledUi(58.0));
+    // Divide the available space across every provider row so new providers
+    // cannot silently overflow past the modal buttons.
+    const row_count: f32 = @floatFromInt(providers.len);
+    const row_h = @max((rows_bottom - y - row_gap * (row_count - 1.0)) / row_count, theme.scaledUi(58.0));
     for (providers) |provider| {
         const row: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = row_h };
         renderProviderReadinessRow(state, row, provider, snapshot.forProvider(provider), clip);
@@ -1504,7 +1515,7 @@ fn renderProviderOnboardingModal(state: *runtime.AppState, width: f32, height: f
     const check_w = theme.scaledUi(126.0);
     drawActionButton(state, .{ .x = modal.x + pad, .y = button_y, .w = close_w, .h = button_h }, "Not now", theme.COLOR_PANEL_ALT);
     drawActionButton(state, .{ .x = modal.x + modal.w - pad - check_w - gap - guide_w, .y = button_y, .w = guide_w, .h = button_h }, "Open setup guide", theme.COLOR_PANEL_MUTED);
-    const checking = snapshot.codex == .checking and snapshot.opencode == .checking and snapshot.claude == .checking and snapshot.cursor == .checking;
+    const checking = snapshot.codex == .checking and snapshot.opencode == .checking and snapshot.claude == .checking and snapshot.cursor == .checking and snapshot.pi == .checking and snapshot.fx == .checking and snapshot.grok == .checking;
     drawActionButton(state, .{ .x = modal.x + modal.w - pad - check_w, .y = button_y, .w = check_w, .h = button_h }, if (checking) "Checking..." else "Check again", theme.accent());
 }
 
@@ -1528,6 +1539,9 @@ fn renderProviderReadinessRow(state: *runtime.AppState, rect: palette.Rect, prov
         .opencode => "OpenCode",
         .claude => "Claude Code",
         .cursor => "Cursor",
+        .pi => "Pi",
+        .fx => "FX",
+        .grok => "Grok",
     };
     const status = switch (readiness) {
         .checking => "Checking...",
@@ -1552,6 +1566,9 @@ fn providerReadinessStep(provider: runtime.Provider, readiness: runtime.Provider
         .opencode => if (readiness == .missing) "Install OpenCode, then run: opencode" else "Open opencode, connect a model provider, then check again.",
         .claude => if (readiness == .missing) "Install Claude Code, then run: claude" else "Open claude, complete sign-in, then check again.",
         .cursor => if (readiness == .missing) "Install the Cursor CLI, then run: agent login" else "Run agent login, then return here and check again.",
+        .pi => if (readiness == .missing) "Install the pi CLI, then run: pi" else "Open pi, connect a model provider, then check again.",
+        .fx => if (readiness == .missing) "Install the fx CLI (curl -fsSL https://fx.sh/setup.sh | bash), then run: fx login" else "Run fx login, then return here and check again.",
+        .grok => if (readiness == .missing) "Install Grok Build (docs.x.ai/build), then run: grok login" else "Run grok login, then return here and check again.",
     };
 }
 
@@ -1829,8 +1846,10 @@ fn renderHandoffModal(state: *runtime.AppState, width: f32, height: f32) void {
 
     queuePaletteText(state, .{ .x = content_x, .y = y + theme.scaledUi(40.0), .w = content_w, .h = theme.scaledUi(18.0) }, "TARGET PROVIDER", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), modal);
     y += theme.scaledUi(58.0);
-    const providers = [_]runtime.Provider{ .codex, .opencode, .claude, .cursor };
-    const provider_w = (content_w - gap * 3.0) * 0.25;
+    const providers = [_]runtime.Provider{ .codex, .opencode, .claude, .cursor, .pi, .fx, .grok };
+    // One equal-width button per provider in the target grid.
+    const provider_count: f32 = @floatFromInt(providers.len);
+    const provider_w = (content_w - gap * (provider_count - 1.0)) / provider_count;
     for (providers, 0..) |provider, index| {
         const rect: palette.Rect = .{ .x = content_x + @as(f32, @floatFromInt(index)) * (provider_w + gap), .y = y, .w = provider_w, .h = row_h };
         drawActionButton(state, rect, handoffProviderLabel(provider), if (state.handoff_controller.target_provider == provider) theme.accent() else theme.COLOR_PANEL_ALT);
@@ -1894,6 +1913,9 @@ fn handoffProviderLabel(provider: runtime.Provider) []const u8 {
         .opencode => "OpenCode",
         .claude => "Claude",
         .cursor => "Cursor",
+        .pi => "Pi",
+        .fx => "FX",
+        .grok => "Grok",
     };
 }
 
@@ -1969,6 +1991,9 @@ fn threadImportHeading(provider: runtime.Provider) []const u8 {
         .opencode => "Import OpenCode thread",
         .claude => "Import Claude thread",
         .cursor => "Import Cursor thread",
+        .pi => "Import Pi thread",
+        .fx => "Import FX thread",
+        .grok => "Import Grok thread",
     };
 }
 
@@ -1978,6 +2003,9 @@ fn threadImportDescription(provider: runtime.Provider) []const u8 {
         .opencode => "Import loads the existing OpenCode transcript into this workspace and binds future turns to the same thread.",
         .claude => "Import loads the existing Claude transcript into this workspace and binds future turns to the same thread.",
         .cursor => "Import loads the existing Cursor transcript into this workspace and binds future turns to the same thread.",
+        .pi => "Import loads the existing Pi transcript into this workspace and binds future turns to the same thread.",
+        .fx => "Import loads the existing FX transcript into this workspace and binds future turns to the same thread.",
+        .grok => "Import loads the existing Grok transcript into this workspace and binds future turns to the same thread.",
     };
 }
 
@@ -1987,6 +2015,9 @@ fn threadImportHint(provider: runtime.Provider) [:0]const u8 {
         .opencode => "Paste an OpenCode thread ID",
         .claude => "Paste a Claude thread ID",
         .cursor => "Paste a Cursor thread ID",
+        .pi => "Paste a Pi session ID",
+        .fx => "Paste an FX session ID",
+        .grok => "Paste a Grok session ID",
     };
 }
 
@@ -1996,6 +2027,9 @@ fn emptyThreadImportListNotice(provider: runtime.Provider) []const u8 {
         .opencode => "No cached OpenCode threads to show.",
         .claude => "No cached Claude threads to show.",
         .cursor => "No cached Cursor threads to show.",
+        .pi => "No cached Pi threads to show.",
+        .fx => "No cached FX threads to show.",
+        .grok => "No cached Grok threads to show.",
     };
 }
 

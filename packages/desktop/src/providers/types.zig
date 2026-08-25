@@ -5,6 +5,9 @@ pub const Provider = enum(u8) {
     codex,
     claude,
     cursor,
+    pi,
+    fx,
+    grok,
 };
 
 pub const ProviderSlashCommandId = enum(u8) {

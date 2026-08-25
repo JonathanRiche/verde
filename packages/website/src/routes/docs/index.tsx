@@ -89,11 +89,12 @@ function DocsIndex() {
           <h1 class="heading">Everything you need to run Verde.</h1>
           <p class="band-body docs-hero-lead">
             Verde is a native desktop workspace for coding agents — Codex,
-            Claude Code, OpenCode, and Cursor as native chat or terminal panes,
-            with Grok Build and Amp available as terminal TUIs in the same
-            tiling window. These docs cover installation, provider setup, the
-            tiled workspace, keybinds, the scriptable CLI, configuration, and
-            troubleshooting.
+            Claude Code, OpenCode, Cursor, Pi, FX, and Grok Build as native
+            chat panes, with Codex, Claude Code, OpenCode, Cursor, Pi, FX, Grok
+            Build, and Amp also available as terminal TUIs in the same tiling
+            window.
+            These docs cover installation, provider setup, the tiled workspace,
+            keybinds, the scriptable CLI, configuration, and troubleshooting.
           </p>
         </section>
 
