@@ -1376,7 +1376,7 @@ fn finishPendingLinkClick(state: *app_state.AppState, x: f32, y: f32) bool {
     const coord = cellAtPoint(state, target, x, y) orelse return true;
     if (coord.x != click.coord.x or coord.y != click.coord.y) return true;
 
-    state.openConfiguredWebLink(click.value());
+    state.openConfiguredTerminalWebLink(click.value());
     state.markDirty();
     return true;
 }

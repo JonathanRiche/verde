@@ -6109,13 +6109,25 @@ pub const AppState = struct {
     }
 
     pub fn openConfiguredWebLink(self: *AppState, href: []const u8) void {
+        self.openWebLinkWithTarget(href, self.app_config.link_open_target);
+    }
+
+    pub fn openConfiguredChatWebLink(self: *AppState, href: []const u8) void {
+        self.openWebLinkWithTarget(href, self.app_config.chat_link_open_override.resolve(self.app_config.link_open_target));
+    }
+
+    pub fn openConfiguredTerminalWebLink(self: *AppState, href: []const u8) void {
+        self.openWebLinkWithTarget(href, self.app_config.terminal_link_open_override.resolve(self.app_config.link_open_target));
+    }
+
+    fn openWebLinkWithTarget(self: *AppState, href: []const u8, target: app_config.LinkOpenTarget) void {
         const trimmed = std.mem.trim(u8, href, &std.ascii.whitespace);
         if (trimmed.len == 0) {
             self.setSidebarNotice("No web link selected.");
             return;
         }
 
-        if (self.app_config.link_open_target == .system_browser) {
+        if (target == .system_browser) {
             utils.openUrlInDefaultBrowser(self.allocator, trimmed) catch |err| {
                 log.warn("failed to open web link in system browser: {s}", .{@errorName(err)});
                 self.setSidebarNotice("Failed to open web link in default browser.");
@@ -13513,7 +13525,7 @@ test "configured chat web links focus and reveal the Verde browser pane" {
     const layout = &state.project_controller.projects.items[0].workspace_layout;
     const chat_pane_id = layout.focused_pane_id orelse return error.TestExpectedEqual;
 
-    state.openConfiguredWebLink("https://example.com/docs");
+    state.openConfiguredChatWebLink("https://example.com/docs");
 
     const browser_pane_id = layout.visibleBrowserPaneId() orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(?WorkspacePaneId, browser_pane_id), layout.focused_pane_id);

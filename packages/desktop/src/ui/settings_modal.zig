@@ -55,6 +55,12 @@ pub const Control = enum(u8) {
     file_links_neovim_pane,
     links_verde_browser,
     links_system_browser,
+    chat_links_global,
+    chat_links_verde_browser,
+    chat_links_system_browser,
+    terminal_links_global,
+    terminal_links_verde_browser,
+    terminal_links_system_browser,
     browser_scroll_speed,
     companion_toggle,
     mcp_tools,
@@ -170,9 +176,15 @@ const SettingsLayout = struct {
     terminal_font_dec: palette.Rect,
     terminal_font_inc: palette.Rect,
     terminal_hint_y: f32,
+    browser_card: palette.Rect,
     links_verde_browser: palette.Rect,
     links_system_browser: palette.Rect,
-    browser_card: palette.Rect,
+    chat_links_global: palette.Rect,
+    chat_links_verde_browser: palette.Rect,
+    chat_links_system_browser: palette.Rect,
+    terminal_links_global: palette.Rect,
+    terminal_links_verde_browser: palette.Rect,
+    terminal_links_system_browser: palette.Rect,
     browser_scroll_speed: palette.Rect,
     browser_hint_y: f32,
     experimental_card: palette.Rect,
@@ -337,8 +349,9 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const chat_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h +
         m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h +
         m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
-    const terminal_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.row_h + m.inner_gap + m.label_h + m.row_gap + m.label_h + m.inner_gap + m.row_h;
-    const browser_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
+    const terminal_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.row_h + m.inner_gap + m.label_h;
+    const browser_h = m.card_pad * 2.0 + m.title_h + m.row_gap +
+        (m.label_h + m.inner_gap + m.row_h) * 4.0 + m.row_gap * 3.0 + m.inner_gap + m.label_h;
     const experimental_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.row_h + m.inner_gap + m.label_h;
     const workspace_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + open_grid_h + custom_extra +
         m.row_gap + m.label_h + m.inner_gap + m.row_h +
@@ -492,17 +505,29 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const terminal_font_y = terminal_card.y + m.card_pad + m.title_h + m.row_gap;
     const terminal_stepper = stepperRects(terminal_card, m.card_pad, terminal_font_y, m);
     const terminal_hint_y = terminal_font_y + m.row_h + m.inner_gap;
-    const link_label_y = terminal_hint_y + m.label_h + m.row_gap;
-    const link_row_y = link_label_y + m.label_h + m.inner_gap;
-    // Flush halves so the pair renders as one segmented control.
-    const link_cell_w = (content_w - m.card_pad * 2.0) * 0.5;
-    const links_verde_browser: palette.Rect = .{ .x = terminal_card.x + m.card_pad, .y = link_row_y, .w = link_cell_w, .h = m.row_h };
-    const links_system_browser: palette.Rect = .{ .x = links_verde_browser.x + link_cell_w, .y = link_row_y, .w = link_cell_w, .h = m.row_h };
 
     y += terminal_h + m.card_gap;
 
     const browser_card: palette.Rect = .{ .x = content_x, .y = y, .w = content_w, .h = browser_h };
-    const browser_scroll_speed_y = browser_card.y + m.card_pad + m.title_h + m.row_gap + m.label_h + m.inner_gap;
+    const link_label_y = browser_card.y + m.card_pad + m.title_h + m.row_gap;
+    const link_row_y = link_label_y + m.label_h + m.inner_gap;
+    const link_content_w = content_w - m.card_pad * 2.0;
+    const link_cell_w = link_content_w * 0.5;
+    const links_verde_browser: palette.Rect = .{ .x = browser_card.x + m.card_pad, .y = link_row_y, .w = link_cell_w, .h = m.row_h };
+    const links_system_browser: palette.Rect = .{ .x = links_verde_browser.x + link_cell_w, .y = link_row_y, .w = link_cell_w, .h = m.row_h };
+    const chat_links_label_y = link_row_y + m.row_h + m.row_gap;
+    const chat_links_y = chat_links_label_y + m.label_h + m.inner_gap;
+    const override_cell_w = link_content_w / 3.0;
+    const chat_links_global: palette.Rect = .{ .x = browser_card.x + m.card_pad, .y = chat_links_y, .w = override_cell_w, .h = m.row_h };
+    const chat_links_verde_browser: palette.Rect = .{ .x = chat_links_global.x + override_cell_w, .y = chat_links_y, .w = override_cell_w, .h = m.row_h };
+    const chat_links_system_browser: palette.Rect = .{ .x = chat_links_verde_browser.x + override_cell_w, .y = chat_links_y, .w = override_cell_w, .h = m.row_h };
+    const terminal_links_label_y = chat_links_y + m.row_h + m.row_gap;
+    const terminal_links_y = terminal_links_label_y + m.label_h + m.inner_gap;
+    const terminal_links_global: palette.Rect = .{ .x = browser_card.x + m.card_pad, .y = terminal_links_y, .w = override_cell_w, .h = m.row_h };
+    const terminal_links_verde_browser: palette.Rect = .{ .x = terminal_links_global.x + override_cell_w, .y = terminal_links_y, .w = override_cell_w, .h = m.row_h };
+    const terminal_links_system_browser: palette.Rect = .{ .x = terminal_links_verde_browser.x + override_cell_w, .y = terminal_links_y, .w = override_cell_w, .h = m.row_h };
+    const browser_scroll_label_y = terminal_links_y + m.row_h + m.row_gap;
+    const browser_scroll_speed_y = browser_scroll_label_y + m.label_h + m.inner_gap;
     const browser_scroll_speed: palette.Rect = .{ .x = browser_card.x + m.card_pad, .y = browser_scroll_speed_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
     const browser_hint_y = browser_scroll_speed_y + m.row_h + m.inner_gap;
 
@@ -679,9 +704,15 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .terminal_font_dec = terminal_stepper.dec,
         .terminal_font_inc = terminal_stepper.inc,
         .terminal_hint_y = terminal_hint_y,
+        .browser_card = browser_card,
         .links_verde_browser = links_verde_browser,
         .links_system_browser = links_system_browser,
-        .browser_card = browser_card,
+        .chat_links_global = chat_links_global,
+        .chat_links_verde_browser = chat_links_verde_browser,
+        .chat_links_system_browser = chat_links_system_browser,
+        .terminal_links_global = terminal_links_global,
+        .terminal_links_verde_browser = terminal_links_verde_browser,
+        .terminal_links_system_browser = terminal_links_system_browser,
         .browser_scroll_speed = browser_scroll_speed,
         .browser_hint_y = browser_hint_y,
         .experimental_card = experimental_card,
@@ -998,6 +1029,12 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     queueControlHit(state, layout.terminal_font_inc, layout.body_clip, .terminal_font_inc, queue_hit);
     queueControlHit(state, layout.links_verde_browser, layout.body_clip, .links_verde_browser, queue_hit);
     queueControlHit(state, layout.links_system_browser, layout.body_clip, .links_system_browser, queue_hit);
+    queueControlHit(state, layout.chat_links_global, layout.body_clip, .chat_links_global, queue_hit);
+    queueControlHit(state, layout.chat_links_verde_browser, layout.body_clip, .chat_links_verde_browser, queue_hit);
+    queueControlHit(state, layout.chat_links_system_browser, layout.body_clip, .chat_links_system_browser, queue_hit);
+    queueControlHit(state, layout.terminal_links_global, layout.body_clip, .terminal_links_global, queue_hit);
+    queueControlHit(state, layout.terminal_links_verde_browser, layout.body_clip, .terminal_links_verde_browser, queue_hit);
+    queueControlHit(state, layout.terminal_links_system_browser, layout.body_clip, .terminal_links_system_browser, queue_hit);
     queueControlHit(state, browserScrollSliderHitRect(layout.browser_scroll_speed), layout.body_clip, .browser_scroll_speed, queue_hit);
     queueControlHit(state, layout.companion_toggle, layout.body_clip, .companion_toggle, queue_hit);
     for (OPEN_CHOICES, 0..) |choice, index| {
@@ -1159,17 +1196,15 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         .w = layout.terminal_card.w - m.card_pad * 2.0,
         .h = m.label_h,
     }, profile_line, paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
-    queueText(state, .{
-        .x = layout.terminal_card.x + m.card_pad,
-        .y = layout.links_verde_browser.y - m.inner_gap - m.label_h,
-        .w = layout.terminal_card.w - m.card_pad * 2.0,
-        .h = m.label_h,
-    }, "Terminal link clicks", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
+    // Browser and web links
+    drawCardTitle(state, layout.browser_card, "Browser & links", layout.body_clip);
+    queueText(state, .{ .x = layout.links_verde_browser.x, .y = layout.links_verde_browser.y - m.inner_gap - m.label_h, .w = layout.links_verde_browser.w + layout.links_system_browser.w, .h = m.label_h }, "Global web link default", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
     drawSegmentedPair(state, layout.links_verde_browser, layout.links_system_browser, "Verde browser", "Default browser", state.settings_controller.draft.link_open_target == .verde_browser, isControlHovered(state, .links_verde_browser), isControlHovered(state, .links_system_browser), layout.body_clip);
-
-    // Browser
-    drawCardTitle(state, layout.browser_card, "Browser", layout.body_clip);
-    drawFieldLabel(state, layout.browser_card, m, "Scrolling", layout.body_clip);
+    queueText(state, .{ .x = layout.chat_links_global.x, .y = layout.chat_links_global.y - m.inner_gap - m.label_h, .w = layout.chat_links_global.w * 3.0, .h = m.label_h }, "GUI chat links", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
+    drawSegmentedTriple(state, layout.chat_links_global, layout.chat_links_verde_browser, layout.chat_links_system_browser, .{ "Use global", "Verde browser", "Default browser" }, @intFromEnum(state.settings_controller.draft.chat_link_open_override), .{ isControlHovered(state, .chat_links_global), isControlHovered(state, .chat_links_verde_browser), isControlHovered(state, .chat_links_system_browser) }, layout.body_clip);
+    queueText(state, .{ .x = layout.terminal_links_global.x, .y = layout.terminal_links_global.y - m.inner_gap - m.label_h, .w = layout.terminal_links_global.w * 3.0, .h = m.label_h }, "Terminal links", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
+    drawSegmentedTriple(state, layout.terminal_links_global, layout.terminal_links_verde_browser, layout.terminal_links_system_browser, .{ "Use global", "Verde browser", "Default browser" }, @intFromEnum(state.settings_controller.draft.terminal_link_open_override), .{ isControlHovered(state, .terminal_links_global), isControlHovered(state, .terminal_links_verde_browser), isControlHovered(state, .terminal_links_system_browser) }, layout.body_clip);
+    queueText(state, .{ .x = layout.browser_scroll_speed.x, .y = layout.browser_scroll_speed.y - m.inner_gap - m.label_h, .w = layout.browser_scroll_speed.w, .h = m.label_h }, "Scrolling", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
     drawBrowserScrollSpeedSlider(state, layout.browser_scroll_speed, state.settings_controller.draft.browser_scroll_speed, isControlHovered(state, .browser_scroll_speed), layout.body_clip);
     queueText(state, .{
         .x = layout.browser_card.x + m.card_pad,
@@ -1758,6 +1793,12 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         .workspace_unzoom_on_navigation => state.settings_controller.draft.unzoom_on_pane_navigation = !state.settings_controller.draft.unzoom_on_pane_navigation,
         .links_verde_browser => state.settings_controller.draft.link_open_target = .verde_browser,
         .links_system_browser => state.settings_controller.draft.link_open_target = .system_browser,
+        .chat_links_global => state.settings_controller.draft.chat_link_open_override = .global,
+        .chat_links_verde_browser => state.settings_controller.draft.chat_link_open_override = .verde_browser,
+        .chat_links_system_browser => state.settings_controller.draft.chat_link_open_override = .system_browser,
+        .terminal_links_global => state.settings_controller.draft.terminal_link_open_override = .global,
+        .terminal_links_verde_browser => state.settings_controller.draft.terminal_link_open_override = .verde_browser,
+        .terminal_links_system_browser => state.settings_controller.draft.terminal_link_open_override = .system_browser,
         .browser_scroll_speed => {},
         .companion_toggle => state.settings_controller.draft.companion_enabled = !state.settings_controller.draft.companion_enabled,
         // Acts immediately (filesystem side effect), independent of Save/Cancel.
