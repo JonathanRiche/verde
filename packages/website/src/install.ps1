@@ -110,7 +110,8 @@ try {
   }
 
   Write-Step "Installed Verde $Tag."
-  Write-Step "CLI: $(Join-Path $InstallRoot 'bin\verde.exe') (not added to PATH)"
+  Write-Step "CLI: $(Join-Path $InstallRoot 'bin\verde.exe')"
+  Write-Step "Open a new terminal, then run Verde with: verde"
   if ($env:VERDE_INSTALL_NO_LAUNCH -ne "1") {
     Write-Step "Launching Verde..."
     Start-Process -FilePath $InstalledExecutable

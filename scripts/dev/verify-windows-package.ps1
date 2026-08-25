@@ -371,8 +371,9 @@ if (-not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)) {
 $InstallerSource = Get-Content -LiteralPath $InstallerPath -Raw
 if (-not $InstallerSource.Contains($ExpectedAppUserModelId) -or
     -not $InstallerSource.Contains("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3") -or
-    -not $InstallerSource.Contains("PropertyId = 5")) {
-  throw "install.ps1 does not assign System.AppUserModel.ID=$ExpectedAppUserModelId through the Windows property store"
+    -not $InstallerSource.Contains("PropertyId = 5") -or
+    -not $InstallerSource.Contains('[Environment]::SetEnvironmentVariable("Path", $UpdatedUserPath, "User")')) {
+  throw "install.ps1 is missing the required shortcut identity or user PATH setup"
 }
 foreach ($Document in @("WINDOWS-TESTING.md", "WINDOWS-PREVIEW.md", "WINDOWS-IMPLEMENTATION.md")) {
   if (-not (Test-Path -LiteralPath (Join-Path $PackageRoot $Document) -PathType Leaf)) {
@@ -389,7 +390,7 @@ if ($IsWindows) {
   $ShortcutPath = Join-Path ([IO.Path]::GetTempPath()) "verde-$([Guid]::NewGuid().ToString('N')).lnk"
   $InstallationEvidencePath = Join-Path $PackageRoot "share\verde\windows-installation.json"
   try {
-    $InstallationResult = & $InstallerPath -PackageRoot $PackageRoot -NoCopy -ShortcutPath $ShortcutPath |
+    $InstallationResult = & $InstallerPath -PackageRoot $PackageRoot -NoCopy -NoPath -ShortcutPath $ShortcutPath |
       Out-String |
       ConvertFrom-Json
     $ExpectedShortcutTarget = (Resolve-Path -LiteralPath (Join-Path $PackageRoot "app\Verde.exe")).Path

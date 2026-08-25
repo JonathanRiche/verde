@@ -24,9 +24,13 @@ irm https://verdeai.dev/install.ps1 | iex
 
 The installers download the matching release artifact from GitHub and verify it
 before installation. Linux installs into `~/.local`, macOS installs into
-`/Applications`, and Windows installs the complete app and runtime package into
+`/Applications` and links its CLI at `~/.local/bin/verde`, and Windows installs
+the complete app and runtime package into
 `%LOCALAPPDATA%\Programs\Verde`, creates a Start Menu shortcut, and launches the
-app. The Windows install does not require administrator access. For other paths
+app. On macOS with zsh, the installer adds `~/.local/bin` to `~/.zprofile` when
+needed; open a new terminal before running `verde`. The Windows install does not
+require administrator access and adds its `bin` directory to the current user's
+`PATH`; open a new terminal before running `verde`. For other paths
 — Arch Linux via the AUR, an npm launcher, a custom prefix, or a source build —
 see the [install section on the homepage](/#install).
 
