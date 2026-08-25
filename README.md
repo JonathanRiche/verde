@@ -30,7 +30,7 @@
 
 Most AI coding tools pick a lane: a chat sidebar, a terminal CLI, or a hosted web app. Verde is the **workstation** for the agents you already run locally.
 
-- **One window for every agent.** Codex, Claude Code, OpenCode, and Cursor as native chat *or* TUI panes; Grok Build and Amp as terminal TUIs.
+- **One window for every agent.** Codex, Claude Code, OpenCode, Cursor, Pi, FX, and Grok Build as native chat *or* TUI panes; Amp as a terminal TUI.
 - **A real tiling workspace.** Split chat, terminal, and browser — or scroll them as a Niri-style strip when you open more panes. Layouts persist.
 - **Local-first.** Verde drives the provider CLIs already on your machine. No Verde-hosted inference, no prompt relay, no telemetry sink.
 - **Keyboard-first.** Command palette (`Ctrl+Shift+P`), pane focus, zoom, and workspace jumps — remappable in one config file.
@@ -54,7 +54,9 @@ Most AI coding tools pick a lane: a chat sidebar, a terminal CLI, or a hosted we
 | **Claude Code** | ✓ | ✓ | Claude Agent SDK against your installed Claude Code |
 | **OpenCode** | ✓ | ✓ | Local `opencode` CLI + `opencode serve` |
 | **Cursor** | ✓ | ✓ | Cursor CLI ACP (`agent acp`) |
-| **Grok Build** | – | ✓ | Local `grok` CLI in an embedded Ghostty pane |
+| **Pi** | ✓ | ✓ | Local `pi` CLI in RPC mode (`pi --mode rpc`) + embedded TUI |
+| **FX** | ✓ | ✓ | Local `fx` CLI ACP (`fx acp`) + embedded TUI |
+| **Grok Build** | ✓ | ✓ | Local `grok` CLI ACP (`grok agent stdio`) + embedded TUI |
 | **Amp** | – | ✓ | Local `amp` CLI in an embedded Ghostty pane |
 
 Verde does not host models or relay prompts. Install the provider CLIs you care about; Verde drives them on your machine.
@@ -102,7 +104,9 @@ Verde does **not** ship a model. Install and authenticate at least one provider 
 | **Claude Code** | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) + Node on `PATH` → log in |
 | **OpenCode** | [OpenCode](https://github.com/anomalyco/opencode) on `PATH` |
 | **Cursor** | [Cursor CLI](https://cursor.com/docs/cli/installation) → `agent login` (or `CURSOR_API_KEY`) |
-| **Grok Build** | [Grok Build](https://docs.x.ai/build/overview#install) → `grok` on `PATH` · terminal TUI (palette → **Start New Grok TUI**) |
+| **Pi** | [pi](https://pi.dev) on `PATH` · GUI chat + terminal TUI |
+| **FX** | [fx](https://fx.sh) → `fx login` · GUI chat + terminal TUI |
+| **Grok Build** | [Grok Build](https://docs.x.ai/build/overview#install) → `grok login` · GUI chat + terminal TUI |
 | **Amp** | [Amp](https://ampcode.com) on `PATH` · terminal TUI |
 
 Then:

@@ -199,6 +199,11 @@ export interface TurnRecord {
   started_at_ms?: number
 }
 
+export interface FavoriteModel {
+  provider: string
+  model: string
+}
+
 export interface Snapshot {
   schema_version?: number
   store_revision?: number
@@ -222,6 +227,9 @@ export interface SnapshotResult {
       workspace_scroll_threshold?: number
       unzoom_on_pane_navigation?: boolean
       reduced_motion?: boolean
+    }
+    chat?: {
+      favorite_models?: FavoriteModel[]
     }
   }
 }

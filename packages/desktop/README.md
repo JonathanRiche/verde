@@ -11,7 +11,9 @@ This package contains Verde's standalone Zig desktop app. It uses SDL3, SDL_GPU,
   - Claude Code: Claude Code installed and logged in locally; Verde talks to it through Anthropic's Claude Agent SDK
   - OpenCode: `opencode` on your `PATH`
   - Cursor: Cursor CLI `agent` on your `PATH` and `agent login`, or `CURSOR_API_KEY` for headless environments
-  - Grok Build: `grok` on your `PATH` for its terminal TUI
+  - Pi: `pi` on your `PATH` for GUI chat (`pi --mode rpc`) and its terminal TUI
+  - FX: `fx` on your `PATH` and `fx login` for GUI chat (`fx acp`) and its terminal TUI
+  - Grok Build: `grok` on your `PATH` and `grok login` for GUI chat (`grok agent stdio`) and its terminal TUI
   - Amp: `amp` on your `PATH` for its terminal TUI
 
 ## Development
@@ -93,6 +95,10 @@ The desktop app talks to local provider runtimes rather than a hosted Verde back
 - Claude Code uses Anthropic's Claude Agent SDK and requires Claude Code to be installed and logged in on your machine.
 - OpenCode uses the local `opencode` CLI and can start `opencode serve` automatically when needed.
 - Cursor uses the local Cursor CLI ACP server (`agent acp`) and requires `agent login` or `CURSOR_API_KEY`.
+- Pi uses the local `pi` CLI in RPC mode (`pi --mode rpc`), one process per turn; it can also launch as a terminal TUI.
+- FX uses the local `fx` CLI ACP server (`fx acp`) and requires `fx login`; it can also launch as a terminal TUI.
+- Grok Build uses the local `grok` CLI ACP server (`grok agent stdio`) and requires `grok login`; it can also launch as a terminal TUI.
+- Amp is TUI-only: Verde launches the `amp` CLI in an embedded terminal pane.
 
 Requests run against the project directory selected in Verde. If prompt sending fails, check that the selected provider is installed, available to Verde's launch environment, and authenticated.
 
@@ -201,10 +207,14 @@ Custom actions run through `sh -lc` with the selected project as the working dir
 - [`src/state.zig`](src/state.zig): app-state facade and cross-controller wiring
 - [`src/state/`](src/state): focused workspace, terminal, chat, provider, and persistence controllers
 - [`src/providers/harness.zig`](src/providers/harness.zig): provider-neutral interface
+- [`src/providers/acp.zig`](src/providers/acp.zig): shared ACP transport used by Cursor, FX, and Grok
 - [`src/providers/codex.zig`](src/providers/codex.zig): Codex integration
 - [`src/providers/opencode.zig`](src/providers/opencode.zig): OpenCode integration
 - [`src/providers/claude.zig`](src/providers/claude.zig): Claude Code integration
 - [`src/providers/cursor.zig`](src/providers/cursor.zig): Cursor integration
+- [`src/providers/pi.zig`](src/providers/pi.zig): Pi integration
+- [`src/providers/fx.zig`](src/providers/fx.zig): FX integration
+- [`src/providers/grok.zig`](src/providers/grok.zig): Grok Build integration
 - [`src/app/config.zig`](src/app/config.zig): user config loading
 - [`src/app/keybinds.zig`](src/app/keybinds.zig): keyboard shortcut parsing and overrides
 - [`src/cli/`](src/cli): CLI help, specification, completion, and live-control routing

@@ -1,8 +1,9 @@
 # verde-app
 
 npm launcher package for the [Verde](https://verdeai.dev) desktop app — a tiling
-workspace that runs Codex, Claude Code, OpenCode, and Cursor as native chat or
-terminal panes, with Grok Build and Amp available as terminal TUIs.
+workspace that runs Codex, Claude Code, OpenCode, Cursor, Pi, FX, and Grok
+Build as native chat or terminal TUI panes, with Amp available as a terminal
+TUI.
 
 Typical usage:
 

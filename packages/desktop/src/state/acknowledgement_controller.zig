@@ -5,15 +5,20 @@ const std = @import("std");
 const storage_mod = @import("storage.zig");
 const db_client = @import("../db/client.zig");
 const db_types = @import("../db/types.zig");
+const platform_runtime = @import("platform_runtime");
 const surface_controller = @import("surface_controller.zig");
 
 const Storage = storage_mod.Storage;
 const log = std.log.scoped(.native_shell);
+const CHAT_RETRY_MIN_MS: i64 = 1_000;
+const CHAT_RETRY_MAX_MS: i64 = 30_000;
 
 const ChatAcknowledgement = struct {
     workspace_id: []u8,
     local_thread_id: []u8,
     completed_at_ms: i64,
+    retry_attempts: u8 = 0,
+    retry_not_before_ms: i64 = 0,
 };
 
 const SurfaceAcknowledgement = struct {
@@ -134,7 +139,7 @@ pub fn queueChat(
     completed_at_ms: i64,
 ) bool {
     const state = &self.acknowledgement_controller;
-    if (containsChat(state, workspace_id, local_thread_id)) return true;
+    if (matchingChatAcknowledgement(state, workspace_id, local_thread_id, completed_at_ms)) return true;
     const outstanding_chat_count = countPendingChats(state);
     state.chat_suppressions.ensureTotalCapacity(
         self.allocator,
@@ -210,6 +215,11 @@ pub fn poll(self: anytype) void {
     state.worker_args = null;
     var acknowledgement = args.acknowledgement;
     if (!args.success) {
+        if (requeueFailedChat(self, &acknowledgement)) {
+            args.allocator.destroy(args);
+            startNext(self);
+            return;
+        }
         restoreFailed(self, acknowledgement);
         acknowledgement.deinit(args.allocator);
     } else switch (acknowledgement) {
@@ -277,11 +287,12 @@ pub fn deinit(self: anytype) void {
 fn startNext(self: anytype) void {
     const state = &self.acknowledgement_controller;
     if (state.worker != null or state.pending.items.len == 0) return;
+    const ready_index = nextReadyIndex(state, platform_runtime.unixTimestampMs()) orelse return;
     const args = self.allocator.create(WorkerArgs) catch return;
     args.* = .{
         .allocator = self.allocator,
         .storage = self.storage,
-        .acknowledgement = state.pending.orderedRemove(0),
+        .acknowledgement = state.pending.orderedRemove(ready_index),
     };
     const worker = std.Thread.spawn(.{}, workerMain, .{args}) catch |err| {
         log.warn("failed to start completion acknowledgement worker: {s}", .{@errorName(err)});
@@ -300,7 +311,7 @@ fn workerMain(args: *WorkerArgs) void {
     defer args.done.store(true, .release);
     args.success = switch (args.acknowledgement) {
         .chat => |ack| blk: {
-            _ = args.storage.clearChatCompletion(ack.workspace_id, ack.local_thread_id) catch |err| {
+            _ = args.storage.clearChatCompletion(ack.workspace_id, ack.local_thread_id, ack.completed_at_ms) catch |err| {
                 log.err("failed to persist chat completion acknowledgement via daemon: {s}", .{@errorName(err)});
                 break :blk false;
             };
@@ -316,6 +327,42 @@ fn workerMain(args: *WorkerArgs) void {
             break :blk true;
         },
     };
+}
+
+// Keep a user's acknowledgement hidden after a transient daemon failure and
+// retry it at a paced cadence. The timestamp-guarded store mutation makes an
+// old retry harmless if the same thread completes again in the meantime.
+fn requeueFailedChat(self: anytype, acknowledgement: *Acknowledgement) bool {
+    switch (acknowledgement.*) {
+        .surface => return false,
+        .chat => |*ack| {
+            scheduleChatRetry(ack, platform_runtime.unixTimestampMs());
+        },
+    }
+    self.acknowledgement_controller.pending.append(self.allocator, acknowledgement.*) catch return false;
+    return true;
+}
+
+fn scheduleChatRetry(ack: *ChatAcknowledgement, now_ms: i64) void {
+    ack.retry_attempts +|= 1;
+    ack.retry_not_before_ms = now_ms + chatRetryDelayMs(ack.retry_attempts);
+}
+
+fn chatRetryDelayMs(attempts: u8) i64 {
+    var delay_ms = CHAT_RETRY_MIN_MS;
+    var remaining = attempts;
+    while (remaining > 1 and delay_ms < CHAT_RETRY_MAX_MS) : (remaining -= 1) {
+        delay_ms = @min(delay_ms * 2, CHAT_RETRY_MAX_MS);
+    }
+    return delay_ms;
+}
+
+fn nextReadyIndex(state: *const State, now_ms: i64) ?usize {
+    for (state.pending.items, 0..) |acknowledgement, index| switch (acknowledgement) {
+        .chat => |ack| if (ack.retry_not_before_ms <= now_ms) return index,
+        .surface => return index,
+    };
+    return null;
 }
 
 fn restoreFailed(self: anytype, acknowledgement: Acknowledgement) void {
@@ -445,6 +492,55 @@ fn projectedChatCompletion(completions: anytype, workspace_id: []const u8, local
             std.mem.eql(u8, completion.local_thread_id, local_thread_id)) return completion;
     }
     return null;
+}
+
+test "chat acknowledgement retries stay hidden, paced, and completion-scoped" {
+    const ThreadStub = struct {
+        local_thread_id: []const u8,
+        completion_pending: bool,
+        completed_at_ms: i64,
+    };
+    const FakeState = struct {
+        acknowledgement_controller: State = .{},
+    };
+
+    var state: FakeState = .{};
+    defer {
+        for (state.acknowledgement_controller.pending.items) |*acknowledgement| acknowledgement.deinit(std.testing.allocator);
+        state.acknowledgement_controller.pending.deinit(std.testing.allocator);
+    }
+    try state.acknowledgement_controller.pending.append(std.testing.allocator, .{ .chat = .{
+        .workspace_id = try std.testing.allocator.dupe(u8, "workspace-a"),
+        .local_thread_id = try std.testing.allocator.dupe(u8, "thread-a"),
+        .completed_at_ms = 100,
+    } });
+
+    var acknowledged = [_]ThreadStub{.{
+        .local_thread_id = "thread-a",
+        .completion_pending = true,
+        .completed_at_ms = 100,
+    }};
+    clearSuppressedThreads(&state, "workspace-a", &acknowledged);
+    try std.testing.expect(!acknowledged[0].completion_pending);
+
+    var newer = [_]ThreadStub{.{
+        .local_thread_id = "thread-a",
+        .completion_pending = true,
+        .completed_at_ms = 101,
+    }};
+    clearSuppressedThreads(&state, "workspace-a", &newer);
+    try std.testing.expect(newer[0].completion_pending);
+
+    const pending = &state.acknowledgement_controller.pending.items[0].chat;
+    scheduleChatRetry(pending, 1_000);
+    try std.testing.expectEqual(@as(u8, 1), pending.retry_attempts);
+    try std.testing.expectEqual(@as(i64, 2_000), pending.retry_not_before_ms);
+    try std.testing.expect(nextReadyIndex(&state.acknowledgement_controller, 1_999) == null);
+    try std.testing.expectEqual(@as(?usize, 0), nextReadyIndex(&state.acknowledgement_controller, 2_000));
+
+    scheduleChatRetry(pending, 2_000);
+    try std.testing.expectEqual(@as(i64, 4_000), pending.retry_not_before_ms);
+    try std.testing.expectEqual(CHAT_RETRY_MAX_MS, chatRetryDelayMs(20));
 }
 
 test "surface acknowledgement queue coalesces exact identity but orders same-session replacement" {

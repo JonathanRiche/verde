@@ -763,12 +763,12 @@ pre code {
   letter-spacing: 0.16em;
 }
 
-/* Six providers → two rows of three on desktop; stack cleanly below. */
+/* Eight providers → two rows of four on desktop; stack cleanly below. */
 .provider-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 1rem;
-  max-width: 56rem;
+  max-width: 72rem;
   margin-inline: auto;
 }
 
@@ -2054,9 +2054,10 @@ thead .comp-rowhead { background: transparent; }
 
 @media (max-width: 1080px) {
   .feature-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .provider-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
-/* Tablet: two columns so the six cards land in three even rows. */
+/* Tablet: two columns so the eight cards land in four even rows. */
 @media (max-width: 900px) {
   .provider-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }

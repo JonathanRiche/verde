@@ -10,7 +10,10 @@ pub const ErrorCategory = enum {
     codex_shell_rpc,
     codex_rpc,
     cursor_acp,
+    fx_acp,
+    grok_acp,
     claude_bridge,
+    pi_rpc,
 };
 
 const ERROR_FORMAT = "provider_error category={s} code={?d} payload_len={d}";

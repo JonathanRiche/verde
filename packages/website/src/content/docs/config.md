@@ -114,8 +114,10 @@ Most of these options also appear in Settings:
   unshifted prefix split keys create GUI chats or terminals. Mode and threshold
   can inherit these global values or be overridden for the currently selected
   workspace. Drag-resized column widths are also saved per workspace and take
-  precedence over panes-per-view sizing until reset. Pane gaps are omitted
-  while zoomed. Pane navigation keeps the destination zoomed by default; set
+  precedence over panes-per-view sizing until reset. `ui.workspace_pane_gap`
+  also sets the outer margin and internal spacing for groups with two or more
+  tiled panes; standalone and zoomed panes remain edge-to-edge. Pane navigation
+  keeps the destination zoomed by default; set
   `ui.unzoom_on_pane_navigation` to `true` to restore on navigation instead.
 - **Agent integrations** — status-pip hooks for supported provider CLIs.
 - **Experimental features** — enable the Companion sidecar and Mission Control

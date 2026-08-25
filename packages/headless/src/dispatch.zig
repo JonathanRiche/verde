@@ -45,6 +45,7 @@ const MUTATING_METHODS = [_][]const u8{
     "surface.clear",
     "notification.chatCompletion.upsert",
     "notification.chatCompletion.clear",
+    "config.favoriteModel.set",
 };
 
 /// Return whether a method changes daemon-owned state.
@@ -334,6 +335,7 @@ test "reads are not mutators and store mutators drain" {
         "surface.clear",
         "notification.chatCompletion.upsert",
         "notification.chatCompletion.clear",
+        "config.favoriteModel.set",
     };
     for (store_mutators) |method| {
         try std.testing.expect(isMutatingMethod(method));

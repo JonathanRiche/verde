@@ -3124,7 +3124,7 @@ fn runStorageStaleGranularRetryScenario(allocator: std.mem.Allocator, io: std.Io
     if (!surface_advanced.response.isOk() or
         (try client.decodeWriteResult(&surface_advanced)).store_revision != 6) return error.StorageRetrySurfaceAdvanceFailed;
 
-    if (!try storage.clearChatCompletion("storage-retry-workspace", "storage-retry-thread"))
+    if (!try storage.clearChatCompletion("storage-retry-workspace", "storage-retry-thread", 300))
         return error.StorageRetryCompletionClearNotApplied;
     if (storage.currentStoreRevision() != 7) return error.StorageRetryCompletionClearDidNotRefresh;
 

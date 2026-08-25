@@ -1,7 +1,17 @@
 import { createMemo, createRoot, createSignal, onCleanup } from 'solid-js'
 
-import { matchKeyAction, type KeyAction } from './keybinds'
+import {
+  acceleratorMatches,
+  DEFAULT_WEB_KEYBINDS,
+  findPrefixBinding,
+  matchKeyAction,
+  parseWebKeybindConfig,
+  type KeyAction,
+  type PrefixTarget,
+  type WebKeybindConfig,
+} from './keybinds'
 import { dynamicModelOptions, type DynamicModelRow, type ModelOption } from './models'
+import { writePane } from './pty'
 import { isPlaceholderThreadTitle, makeThreadTitle } from './thread_title'
 import {
   LiveClient,
@@ -20,6 +30,7 @@ import {
   paneTitle,
   synthesizeSplit,
   type Attachment,
+  type FavoriteModel,
   type LayoutNode,
   type LivePane,
   type Message,
@@ -116,6 +127,41 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' ? (value as Record<string, unknown>) : null
 }
 
+export function favoriteModelKey(provider: string, model: string): string {
+  return `${provider}\u0000${model}`
+}
+
+export function setFavoriteModelInList(
+  favorites: FavoriteModel[],
+  provider: string,
+  model: string,
+  favorite: boolean,
+): FavoriteModel[] {
+  const key = favoriteModelKey(provider, model)
+  const exists = favorites.some((entry) => favoriteModelKey(entry.provider, entry.model) === key)
+  if (exists === favorite) return favorites
+  if (!favorite) return favorites.filter((entry) => favoriteModelKey(entry.provider, entry.model) !== key)
+  return [...favorites, { provider, model }]
+}
+
+export function parseFavoriteModels(config: unknown): FavoriteModel[] {
+  const chat = asRecord(asRecord(config)?.chat)
+  const rows = Array.isArray(chat?.favorite_models) ? chat.favorite_models : []
+  const favorites: FavoriteModel[] = []
+  const seen = new Set<string>()
+  for (const value of rows) {
+    const row = asRecord(value)
+    const provider = typeof row?.provider === 'string' ? row.provider.trim() : ''
+    const model = typeof row?.model === 'string' ? row.model.trim() : ''
+    if (!provider || !model) continue
+    const key = favoriteModelKey(provider, model)
+    if (seen.has(key)) continue
+    seen.add(key)
+    favorites.push({ provider, model })
+  }
+  return favorites
+}
+
 function sameJson(a: unknown, b: unknown): boolean {
   return JSON.stringify(a) === JSON.stringify(b)
 }
@@ -135,6 +181,26 @@ function isOpeningThread(thread: Thread | null, title: string): boolean {
 function methodUnavailable(response: { error?: { code: string } }): boolean {
   const code = response.error?.code
   return code === 'unknown_method' || code === 'method_not_found' || code === 'capability_unavailable'
+}
+
+/// User-initiated RPCs ride HTTP instead of the shared websocket. The gateway
+/// answers websocket RPCs serially in its read loop, so a click issued while
+/// the routine projection sweep is in flight would queue behind a dozen
+/// polling calls and feel seconds slow. Each HTTP request gets its own
+/// gateway connection task with the same daemon→Live→mock routing, so
+/// interactive latency is one round-trip regardless of polling load.
+async function interactiveCall(method: string, params: unknown = {}): Promise<RpcEnvelope> {
+  try {
+    return await fetchRpc(method, params)
+  } catch (err) {
+    return {
+      ok: false,
+      error: {
+        code: 'network',
+        message: err instanceof Error ? err.message : 'request failed',
+      },
+    }
+  }
 }
 
 export async function requestTerminalOpen(
@@ -462,8 +528,10 @@ export function mapTranscriptRows(raw: unknown, fallbackId: string): Message[] {
       author: String(record.author ?? ''),
       body: typeof body === 'string' ? body : JSON.stringify(body),
       ...(images.length > 0 ? { images } : {}),
+      tool_call_id: typeof record.tool_call_id === 'string' ? record.tool_call_id : null,
       tool_call_kind: typeof record.tool_call_kind === 'string' ? record.tool_call_kind : null,
       tool_call_status: typeof record.tool_call_status === 'string' ? record.tool_call_status : null,
+      created_at_ms: typeof record.created_at_ms === 'number' ? record.created_at_ms : null,
     }
   })
 }
@@ -842,7 +910,7 @@ export function panesForWorkspace(
               ? pane.title
               : thread.title || pane.title || 'Chat'
           used_threads.add(thread.local_thread_id)
-          rows.push({
+          const projected: LivePane = {
             ...chatPane(workspace, thread, turns),
             native_pane_id: pane.id,
             focused,
@@ -864,7 +932,29 @@ export function panesForWorkspace(
                   attention: pane.attention ?? false,
                 }
               : {}),
-          })
+          }
+          const duplicate_index = rows.findIndex(
+            (row) => row.kind === 'chat' && row.thread_id === thread.local_thread_id,
+          )
+          if (duplicate_index < 0) {
+            rows.push(projected)
+          } else {
+            // A stale desktop layout can contain multiple pane rows for one
+            // thread. They all receive the same stable web pane id and turn
+            // activity, so rendering each row duplicates the chat in both the
+            // workspace and ACTIVE lists. Keep one row, preferring the native
+            // pane the desktop currently focuses for subsequent pane actions.
+            const previous = rows[duplicate_index]!
+            const preferred = projected.focused && !previous.focused ? projected : previous
+            rows[duplicate_index] = {
+              ...preferred,
+              focused: Boolean(previous.focused || projected.focused),
+              send_pending: Boolean(previous.send_pending || projected.send_pending),
+              completion_pending: Boolean(previous.completion_pending || projected.completion_pending),
+              pending_approval: Boolean(previous.pending_approval || projected.pending_approval),
+              attention: Boolean(previous.attention || projected.attention),
+            }
+          }
         } else if (pane.title) {
           // Open on the desktop but its thread has not reached the store yet;
           // show it so the sidebar mirrors the desktop, transcript loads once
@@ -1007,6 +1097,14 @@ function createAppStore() {
   const [composerNonce, setComposerNonce] = createSignal(0)
   const [compact, setCompact] = createSignal(false)
   const [uiConfig, setUiConfig] = createSignal<UiConfig>(DEFAULT_UI_CONFIG)
+  const [keybindConfig, setKeybindConfig] = createSignal<WebKeybindConfig>(DEFAULT_WEB_KEYBINDS)
+  const [prefixMode, setPrefixMode] = createSignal<'armed' | 'navigate' | null>(null)
+  const [prefixHelpVisible, setPrefixHelpVisible] = createSignal(false)
+  const [favoriteModels, setFavoriteModels] = createSignal<FavoriteModel[]>([])
+  // Snapshot polling can race a user click. Keep the requested final state
+  // authoritative until its idempotent config RPC settles.
+  const pendingFavoriteModels = new Map<string, boolean>()
+  let favoriteModelUpdateQueue: Promise<void> = Promise.resolve()
   let composerCacheTimer: number | null = null
   const persistComposerState = () => {
     if (composerCacheTimer !== null) window.clearTimeout(composerCacheTimer)
@@ -1174,6 +1272,20 @@ function createAppStore() {
     if (root.config !== undefined) {
       const next = parseUiConfig(root.config)
       setUiConfig((prev) => (sameJson(prev, next) ? prev : next))
+      const next_keybinds = parseWebKeybindConfig(root.config)
+      setKeybindConfig((prev) => (sameJson(prev, next_keybinds) ? prev : next_keybinds))
+      if (!next_keybinds.prefix.enabled) {
+        setPrefixMode(null)
+        setPrefixHelpVisible(false)
+      }
+      let next_favorites = parseFavoriteModels(root.config)
+      for (const [key, favorite] of pendingFavoriteModels) {
+        const separator = key.indexOf('\u0000')
+        const provider = key.slice(0, separator)
+        const model = key.slice(separator + 1)
+        next_favorites = setFavoriteModelInList(next_favorites, provider, model, favorite)
+      }
+      setFavoriteModels((prev) => (sameJson(prev, next_favorites) ? prev : next_favorites))
     }
     const stored = snapshot.workspaces ?? root.workspaces ?? []
     // The desktop live listing decides which workspaces are open whenever the
@@ -1346,7 +1458,7 @@ function createAppStore() {
   const PROJECTION_FULL_SWEEP_EVERY = 5
 
   const refreshProjection = async (
-    opts: { scope?: 'selected' | 'full'; enrich_chat_status?: boolean } = {},
+    opts: { scope?: 'selected' | 'full'; workspace_id?: string; enrich_chat_status?: boolean } = {},
   ) => {
     if (projectionInFlight) {
       projectionQueued = true
@@ -1354,10 +1466,16 @@ function createAppStore() {
     }
     projectionInFlight = true
     try {
-      const scope = opts.scope ?? (projectionTick++ % PROJECTION_FULL_SWEEP_EVERY === 0 ? 'full' : 'selected')
-      const only = scope === 'selected'
-        ? workspaceId() ?? pendingLastChatPane?.workspace_id ?? null
-        : null
+      // An explicit workspace_id reconciles exactly that workspace (sidebar
+      // actions can target a pane outside the selected one) without paying
+      // for a full sweep.
+      const scope = opts.workspace_id
+        ? 'selected'
+        : opts.scope ?? (projectionTick++ % PROJECTION_FULL_SWEEP_EVERY === 0 ? 'full' : 'selected')
+      const only = opts.workspace_id ??
+        (scope === 'selected'
+          ? workspaceId() ?? pendingLastChatPane?.workspace_id ?? null
+          : null)
       await refreshLive(only, opts.enrich_chat_status ?? true)
       const response = await client.call('core.snapshot', { scopes: SNAPSHOT_SCOPES })
       if (response.error || response.ok === false) return
@@ -1469,7 +1587,10 @@ function createAppStore() {
     if (pendingTranscript.has(key)) return
     pendingTranscript.add(key)
     try {
-      const response = await client.call('chat.thread.get', {
+      // HTTP on purpose: a focused pane's first transcript is user-visible
+      // latency, and multi-megabyte thread bodies would otherwise queue
+      // behind the projection sweep on the serial websocket loop.
+      const response = await interactiveCall('chat.thread.get', {
         workspace_id: pane.workspace_id,
         local_thread_id: pane.thread_id,
       })
@@ -1696,6 +1817,12 @@ function createAppStore() {
         return 'Claude'
       case 'cursor':
         return 'Cursor'
+      case 'pi':
+        return 'Pi'
+      case 'fx':
+        return 'FX'
+      case 'grok':
+        return 'Grok'
       default:
         return provider ? provider.charAt(0).toUpperCase() + provider.slice(1) : 'Assistant'
     }
@@ -1904,7 +2031,7 @@ function createAppStore() {
         )
         .at(-1)?.turn_id
     if (!turn_id) return
-    const response = await client.call('chat.turn.cancel', { turn_id })
+    const response = await interactiveCall('chat.turn.cancel', { turn_id })
     if (response.error || response.ok === false) {
       setNotice(response.error?.message ?? 'could not stop the turn')
     }
@@ -1912,7 +2039,7 @@ function createAppStore() {
 
   const ensureClientId = async (): Promise<string> => {
     if (storeClientId) return storeClientId
-    const registered = await client.call('daemon.client.register', { persistent: false })
+    const registered = await interactiveCall('daemon.client.register', { persistent: false })
     const result = unwrapResult<{ client_id?: string }>(registered)
     storeClientId = result?.client_id ?? mintId('web-client-')
     return storeClientId
@@ -2106,7 +2233,7 @@ function createAppStore() {
       // a quick mobile tap cannot race the selected settings.
       const pending_settings = settingsUpdateQueues.get(key)
       if (pending_settings) await pending_settings
-      const got = await client.call('chat.thread.get', {
+      const got = await interactiveCall('chat.thread.get', {
         workspace_id: current.workspace_id,
         local_thread_id: current.thread_id,
       })
@@ -2123,7 +2250,7 @@ function createAppStore() {
         ? makeThreadTitle(fallback_prompt)
         : stored_title
       const turn_id = mintId('web-turn-')
-      const sent = await client.call('chat.turn.start', {
+      const sent = await interactiveCall('chat.turn.start', {
         turn_id,
         workspace_id: current.workspace_id,
         local_thread_id: current.thread_id,
@@ -2217,6 +2344,38 @@ function createAppStore() {
     })()
   }
 
+  const isFavoriteModel = (provider: string, model: string): boolean =>
+    favoriteModels().some(
+      (entry) => entry.provider === provider && entry.model === model,
+    )
+
+  const toggleFavoriteModel = (provider: string, model: string) => {
+    const favorite = !isFavoriteModel(provider, model)
+    const key = favoriteModelKey(provider, model)
+    pendingFavoriteModels.set(key, favorite)
+    setFavoriteModels((prev) => setFavoriteModelInList(prev, provider, model, favorite))
+    setNotice(null)
+    const update = favoriteModelUpdateQueue.then(async () => {
+      const response = await interactiveCall('config.favoriteModel.set', {
+        provider,
+        model,
+        favorite,
+      })
+      if (pendingFavoriteModels.get(key) === favorite) pendingFavoriteModels.delete(key)
+      if (response.error || response.ok === false) {
+        setNotice(response.error?.message ?? 'favorite change did not apply')
+      }
+      // Reconcile failures and desktop-side edits through the shared config
+      // snapshot after this key's newest requested state has settled.
+      void refreshProjection({ scope: 'selected', enrich_chat_status: false })
+    })
+    favoriteModelUpdateQueue = update.catch((err) => {
+      if (pendingFavoriteModels.get(key) === favorite) pendingFavoriteModels.delete(key)
+      setNotice(err instanceof Error ? err.message : 'favorite change failed')
+      void refreshProjection({ scope: 'selected', enrich_chat_status: false })
+    })
+  }
+
   /// Persist model/effort/variant changes onto the daemon thread record.
   /// The daemon's chat.thread.upsert is a full metadata overwrite, so this
   /// merges the patch over a fresh chat.thread.get before writing. The next
@@ -2238,7 +2397,7 @@ function createAppStore() {
     if (pane.kind !== 'chat' || !pane.thread_id) return
     setNotice(null)
     try {
-      const got = await client.call('chat.thread.get', {
+      const got = await interactiveCall('chat.thread.get', {
         workspace_id: pane.workspace_id,
         local_thread_id: pane.thread_id,
       })
@@ -2267,7 +2426,7 @@ function createAppStore() {
         access_mode: patch.access_mode !== undefined ? patch.access_mode : thread.access_mode ?? 'supervised',
       }
       const client_id = await ensureClientId()
-      const saved = await client.call('chat.thread.upsert', {
+      const saved = await interactiveCall('chat.thread.upsert', {
         mutation: {
           request_key: `web:chat.settings:${pane.thread_id}:${mintId('')}`,
           client_id,
@@ -2351,7 +2510,7 @@ function createAppStore() {
     }
     setNotice(null)
     try {
-      const created = await client.call('workspace.create', { path: trimmed_path })
+      const created = await interactiveCall('workspace.create', { path: trimmed_path })
       let workspace_id: string | undefined
       if (created.error || created.ok === false) {
         if (!methodUnavailable(created)) {
@@ -2360,7 +2519,7 @@ function createAppStore() {
         }
         workspace_id = linuxWorkspaceId(trimmed_path)
         const client_id = await ensureClientId()
-        const saved = await client.call('workspace.upsert', {
+        const saved = await interactiveCall('workspace.upsert', {
           mutation: {
             request_key: `web:workspace.add:${workspace_id}`,
             client_id,
@@ -2395,7 +2554,7 @@ function createAppStore() {
   const createHeadlessThread = async (current: Workspace, provider: string): Promise<number | null> => {
     const client_id = await ensureClientId()
     const local_thread_id = mintId('web-thread-')
-    const opened = await client.call('chat.thread.upsert', {
+    const opened = await interactiveCall('chat.thread.upsert', {
       mutation: {
         request_key: `web:chat.open:${local_thread_id}`,
         client_id,
@@ -2437,7 +2596,7 @@ function createAppStore() {
       current.provider ??
       'codex'
     setNotice(null)
-    const opened = await client.call('chat.open', {
+    const opened = await interactiveCall('chat.open', {
       workspace_id: current.workspace_id,
       provider,
       focus: true,
@@ -2493,7 +2652,11 @@ function createAppStore() {
     if (pane_id == null) return
     pinnedWorkspaceId = current.workspace_id
     setWorkspaceId(current.workspace_id)
-    await refreshProjection()
+    // Instant transition: the optimistic thread row above already projects a
+    // pane through localThreadIds, so publish and focus it now. The live
+    // pane/layout reconciliation lands in the background and rebinds the
+    // pane to the desktop layout entry once it appears.
+    publishPanes(workspaces())
     const focused_id = opened_thread_id ? stablePaneId('chat', opened_thread_id) : pane_id
     setFocusedPaneId(focused_id)
     const focused = (panesByWorkspace()[current.workspace_id] ?? []).find(
@@ -2501,13 +2664,14 @@ function createAppStore() {
     )
     if (focused) writeLastChatPaneLocation(focused)
     setComposerNonce((value) => value + 1)
+    void refreshProjection({ workspace_id: current.workspace_id })
   }
 
   const newTerminal = async (workspace_id?: string) => {
     const ws = workspaces().find((item) => item.workspace_id === workspace_id) ?? workspace()
     if (!ws) return
     const session_id = mintId('web-sess-')
-    const opened = await requestTerminalOpen(client.call.bind(client), ws, session_id)
+    const opened = await requestTerminalOpen(interactiveCall, ws, session_id)
     if (opened.response.error || opened.response.ok === false) {
       setNotice(opened.response.error?.message ?? 'could not create session')
       return
@@ -2523,11 +2687,27 @@ function createAppStore() {
         setFocusedPaneId(null)
         publishPanes(workspaces())
       }
-      await refreshProjection({ scope: 'selected' })
+      void refreshProjection({ workspace_id: ws.workspace_id })
       return
     }
-    await refreshProjection({ scope: 'selected' })
+    // Instant transition: project the created daemon session as a live pane
+    // now; the background snapshot refresh confirms (or corrects) it.
+    lastSessions = [
+      ...lastSessions,
+      {
+        session_id,
+        workspace_id: ws.workspace_id,
+        workspace_path: ws.path,
+        cwd: ws.path,
+        label: 'Terminal',
+        running: true,
+      },
+    ]
+    pinnedWorkspaceId = ws.workspace_id
+    setWorkspaceId(ws.workspace_id)
+    publishPanes(workspaces())
     setFocusedPaneId(stablePaneId('term', session_id))
+    void refreshProjection({ workspace_id: ws.workspace_id })
   }
 
   const callSucceeded = (response: RpcEnvelope, fallback: string): boolean => {
@@ -2541,7 +2721,7 @@ function createAppStore() {
     delete metadata.threads
     delete metadata.messages
     const client_id = await ensureClientId()
-    return client.call('workspace.upsert', {
+    return interactiveCall('workspace.upsert', {
       mutation: {
         request_key: `web:workspace.context:${current.workspace_id}:${mintId('')}`,
         client_id,
@@ -2556,7 +2736,7 @@ function createAppStore() {
     patch: Partial<Thread>,
   ) => {
     if (!pane.thread_id) return null
-    const got = await client.call('chat.thread.get', {
+    const got = await interactiveCall('chat.thread.get', {
       workspace_id: current_workspace.workspace_id,
       local_thread_id: pane.thread_id,
     })
@@ -2567,7 +2747,7 @@ function createAppStore() {
     const thread = { ...existing, ...patch }
     delete thread.messages
     const client_id = await ensureClientId()
-    return client.call('chat.thread.upsert', {
+    return interactiveCall('chat.thread.upsert', {
       mutation: {
         request_key: `web:thread.context:${pane.thread_id}:${mintId('')}`,
         client_id,
@@ -2586,7 +2766,7 @@ function createAppStore() {
     command: string,
     pane?: LivePane,
   ): Promise<boolean> => {
-    const response = await client.call('palette.run', {
+    const response = await interactiveCall('palette.run', {
       command,
       workspace: current_workspace.workspace_id,
       ...(pane?.native_pane_id != null ? { pane: pane.native_pane_id } : {}),
@@ -2600,12 +2780,33 @@ function createAppStore() {
       ? workspaces().find((item) => item.workspace_id === pane.workspace_id)
       : workspace()
     if (!pane || !ws) return
-    const response = await requestPaneClose(client.call.bind(client), ws.workspace_id, pane)
-    if (!callSucceeded(response, 'could not close pane')) return
+    // Optimistic close: drop the pane from every local projection source so
+    // the strip updates immediately. The scoped refresh after the close RPC
+    // reconciles — and restores the pane if the close was rejected.
     if (pane.kind === 'chat' && pane.thread_id) localThreadIds.delete(pane.thread_id)
+    const layout = liveLayouts[ws.workspace_id]
+    if (pane.native_pane_id != null && layout?.panes) {
+      liveLayouts = {
+        ...liveLayouts,
+        [ws.workspace_id]: {
+          ...layout,
+          panes: layout.panes.filter((row) => row.id !== pane.native_pane_id),
+        },
+      }
+    }
+    if (pane.kind === 'terminal' && pane.session_id) {
+      lastSessions = lastSessions.filter((row) => sessionKey(row) !== pane.session_id)
+    }
     if (maximizedPaneId() === pane.pane_id) setMaximizedPaneId(null)
-    // Sidebar actions may target a pane in the cross-workspace ACTIVE list.
-    await refreshProjection({ scope: 'full' })
+    publishPanes(workspaces())
+    // A web-local chat pane has nothing to close on the daemon or desktop;
+    // removing it from the projection above is the whole operation.
+    if (pane.kind === 'chat' && pane.native_pane_id == null && !pane.session_id) return
+    const response = await requestPaneClose(interactiveCall, ws.workspace_id, pane)
+    callSucceeded(response, 'could not close pane')
+    // Scoped: only this pane's workspace changed (the target can live in the
+    // cross-workspace ACTIVE list, so scope to it rather than the selection).
+    await refreshProjection({ workspace_id: ws.workspace_id })
   }
 
   // Toggle zoom for a specific pane (header/menu) or the focused pane
@@ -2620,6 +2821,24 @@ function createAppStore() {
     setMaximizedPaneId(unzoom ? null : pane.pane_id)
   }
 
+  const splitFocusedPane = async (kind: 'chat' | 'terminal', axis: 'vertical' | 'horizontal') => {
+    const pane = focusedPane()
+    const current_workspace = workspace()
+    if (!pane || !current_workspace || pane.native_pane_id == null) {
+      setNotice('Pane splitting requires the desktop runtime.')
+      return
+    }
+    const response = await interactiveCall('pane.split', {
+      workspace: current_workspace.workspace_id,
+      pane: pane.native_pane_id,
+      kind,
+      axis,
+    })
+    if (callSucceeded(response, `could not split ${kind} pane`)) {
+      await refreshProjection({ workspace_id: current_workspace.workspace_id })
+    }
+  }
+
   const runSidebarContextAction = async (request: SidebarContextActionRequest) => {
     const { action, workspace: current_workspace, pane, value } = request
     setNotice(null)
@@ -2629,24 +2848,26 @@ function createAppStore() {
           await newThread(current_workspace.workspace_id)
           return
         case 'workspace-open-codex-tui': {
-          const response = await client.call('agent.open', {
+          const response = await interactiveCall('agent.open', {
             workspace: current_workspace.workspace_id,
             provider: 'codex',
           })
-          if (callSucceeded(response, 'could not open Codex TUI')) await refreshProjection({ scope: 'selected' })
+          if (callSucceeded(response, 'could not open Codex TUI')) {
+            await refreshProjection({ workspace_id: current_workspace.workspace_id })
+          }
           return
         }
         case 'workspace-open-terminal':
           await newTerminal(current_workspace.workspace_id)
           return
         case 'workspace-herdr-handoff': {
-          const response = await client.call('herdr.handoff', { workspace: current_workspace.workspace_id })
+          const response = await interactiveCall('herdr.handoff', { workspace: current_workspace.workspace_id })
           callSucceeded(response, 'Herdr handoff failed')
           return
         }
         case 'workspace-herdr-handoff-remote': {
           if (!value?.trim()) return
-          const response = await client.call('herdr.handoff', {
+          const response = await interactiveCall('herdr.handoff', {
             workspace: current_workspace.workspace_id,
             remote: value.trim(),
           })
@@ -2656,7 +2877,7 @@ function createAppStore() {
         case 'workspace-herdr-focus-terminal': {
           const native_pane_id = current_workspace.herdr_link?.attach_pane_id
           if (native_pane_id != null) {
-            const response = await client.call('pane.focus', {
+            const response = await interactiveCall('pane.focus', {
               workspace: current_workspace.workspace_id,
               pane: native_pane_id,
             })
@@ -2667,14 +2888,14 @@ function createAppStore() {
           return
         }
         case 'workspace-herdr-unlink': {
-          const response = await client.call('herdr.unlink', { workspace: current_workspace.workspace_id })
+          const response = await interactiveCall('herdr.unlink', { workspace: current_workspace.workspace_id })
           if (callSucceeded(response, 'could not unlink Herdr')) await refreshProjection()
           return
         }
         case 'workspace-rename': {
           const label = value?.trim()
           if (!label) return
-          let response = await client.call('workspace.rename', {
+          let response = await interactiveCall('workspace.rename', {
             workspace: current_workspace.workspace_id,
             label,
           })
@@ -2698,7 +2919,7 @@ function createAppStore() {
           await runDesktopSidebarCommand(current_workspace, 'thread.import_claude')
           return
         case 'workspace-close': {
-          let response = await client.call('workspace.close', { workspace: current_workspace.workspace_id })
+          let response = await interactiveCall('workspace.close', { workspace: current_workspace.workspace_id })
           if (methodUnavailable(response)) response = await upsertWorkspaceMetadata(current_workspace, { archived: true })
           if (callSucceeded(response, 'could not close workspace')) {
             pinnedWorkspaceId = null
@@ -2776,14 +2997,15 @@ function createAppStore() {
           const axis = action === 'pane-split-chat-right' || action === 'pane-split-terminal-right'
             ? 'vertical'
             : 'horizontal'
-          const response = await client.call('pane.split', {
+          const response = await interactiveCall('pane.split', {
             workspace: current_workspace.workspace_id,
             pane: pane.native_pane_id,
             kind,
             axis,
           })
           if (callSucceeded(response, `could not split ${kind} pane`)) {
-            await refreshProjection({ scope: 'full' })
+            // Scoped: only this workspace's pane listing can have changed.
+            await refreshProjection({ workspace_id: current_workspace.workspace_id })
           }
           return
         }
@@ -2882,8 +3104,156 @@ function createAppStore() {
     }
   }
 
+  const dispatchPrefixTarget = (target: PrefixTarget) => {
+    if ('command' in target) {
+      setNotice('Custom prefix shell commands run from the desktop app only.')
+      return
+    }
+    const action = target.action
+    const ordinal = /^workspace\.(pane_select|active_select|select)\.(\d+)$/.exec(action)
+    if (ordinal) {
+      const index = Number(ordinal[2]) - 1
+      if (ordinal[1] === 'select') {
+        const next = workspaces()[index]
+        if (next) selectWorkspace(next.workspace_id)
+      } else selectPaneAt(index, ordinal[1] === 'active_select' ? activePanes() : openPanes())
+      return
+    }
+    const simple: Partial<Record<string, KeyAction>> = {
+      command_palette: 'command_palette', new_thread: 'new_thread', sidebar: 'toggle_sidebar',
+      sidebar_hidden: 'toggle_sidebar_hidden', 'workspace.close': 'close_pane',
+      'workspace.toggle_maximize': 'maximize', 'workspace.focus_prompt': 'focus_prompt',
+      'workspace.previous': 'workspace_previous', 'workspace.next': 'workspace_next',
+      'workspace.active_previous': 'pane_previous', 'workspace.active_next': 'pane_next',
+      'workspace.pane_previous': 'pane_previous', 'workspace.pane_next': 'pane_next',
+      'workspace.focus_left': 'focus_left', 'workspace.focus_right': 'focus_right',
+      'workspace.focus_up': 'focus_up', 'workspace.focus_down': 'focus_down',
+    }
+    if (simple[action]) {
+      dispatchAction(simple[action]!)
+      return
+    }
+    if (action === 'refresh') {
+      window.location.reload()
+      return
+    }
+    if (action === 'workspace.close_current') {
+      const current = workspace()
+      if (current) void runSidebarContextAction({ action: 'workspace-close', workspace: current })
+      return
+    }
+    const split = /^workspace\.split_(chat|terminal)_(vertical|horizontal)$/.exec(action)
+    if (split) {
+      void splitFocusedPane(split[1] as 'chat' | 'terminal', split[2] as 'vertical' | 'horizontal')
+      return
+    }
+    const dynamic_split = /^workspace\.split_(default|alternate)_(vertical|horizontal)$/.exec(action)
+    if (dynamic_split) {
+      const configured = uiConfig().workspace_split_default_pane
+      const kind = dynamic_split[1] === 'default' ? configured : configured === 'chat' ? 'terminal' : 'chat'
+      void splitFocusedPane(kind, dynamic_split[2] as 'vertical' | 'horizontal')
+      return
+    }
+    const move = /^workspace\.move_(left|right|up|down)$/.exec(action)
+    const pane = focusedPane()
+    const current = workspace()
+    if (move && pane?.native_pane_id != null && current) {
+      void interactiveCall('pane.move', {
+        workspace: current.workspace_id,
+        pane: pane.native_pane_id,
+        direction: move[1],
+      }).then(() => refreshProjection({ workspace_id: current.workspace_id }))
+      return
+    }
+    const paletteCommands: Record<string, string> = {
+      browser: 'pane.browser', 'terminal.toggle': 'pane.terminal',
+      'workspace.toggle_quick_pane': 'pane.quick_toggle', 'chat.model_picker': 'thread.choose_model',
+      'chat.run_config': 'thread.run_config', open: 'workspace.add', open_editor: 'workspace.open_editor',
+    }
+    const command = paletteCommands[action]
+    if (command && current) {
+      void runDesktopSidebarCommand(current, command, pane ?? undefined)
+      return
+    }
+    setNotice(`${action} is not available in the web client.`)
+  }
+
+  const sendPrefix = (event: KeyboardEvent) => {
+    const pane = focusedPane()
+    if (!pane || pane.kind !== 'terminal') return
+    if (pane.session_id && event.key.length === 1) {
+      const code = event.ctrlKey ? event.key.toLowerCase().charCodeAt(0) - 96 : 0
+      const bytes = code >= 1 && code <= 26 ? String.fromCharCode(code) : `${event.altKey ? '\x1b' : ''}${event.key}`
+      void writePane(client, pane.workspace_id, pane.pane_id, bytes, pane.session_id)
+    } else if (pane.native_pane_id != null) {
+      void client.call('terminal.key', {
+        workspace_id: pane.workspace_id,
+        pane: pane.native_pane_id,
+        key: event.key.toLowerCase(),
+        ctrl: event.ctrlKey,
+        alt: event.altKey,
+        shift: event.shiftKey,
+        super: event.metaKey,
+      })
+    }
+  }
+
+  const isPrefixKey = (event: KeyboardEvent) =>
+    keybindConfig().prefix.enabled && keybindConfig().prefix.keys.some((key) => acceleratorMatches(key, event))
+
+  const shouldHandleKey = (event: KeyboardEvent): boolean => {
+    if (prefixMode()) return true
+    return isPrefixKey(event) || matchKeyAction(event, keybindConfig()) != null
+  }
+
   const handleKey = (event: KeyboardEvent) => {
-    const action = matchKeyAction(event)
+    const mode = prefixMode()
+    if (mode) {
+      event.preventDefault()
+      event.stopPropagation()
+      if (['Control', 'Shift', 'Alt', 'Meta'].includes(event.key)) return
+      if (event.key === 'Escape') {
+        setPrefixMode(null)
+        setPrefixHelpVisible(false)
+        return
+      }
+      if (isPrefixKey(event)) {
+        if (mode === 'armed') sendPrefix(event)
+        setPrefixMode(mode === 'navigate' ? 'armed' : null)
+        setPrefixHelpVisible(false)
+        return
+      }
+      const table = mode === 'navigate' ? keybindConfig().prefix.navigate : keybindConfig().prefix.bindings
+      const binding = findPrefixBinding(table, event)
+      if (!binding) {
+        if (mode === 'armed') {
+          setPrefixMode(null)
+          setPrefixHelpVisible(false)
+        }
+        return
+      }
+      if ('action' in binding.target && binding.target.action === 'prefix.keybinds') {
+        setPrefixHelpVisible((visible) => !visible)
+        return
+      }
+      if ('action' in binding.target && binding.target.action === 'prefix.navigate') {
+        setPrefixMode('navigate')
+        setPrefixHelpVisible(false)
+        return
+      }
+      setPrefixMode(null)
+      setPrefixHelpVisible(false)
+      dispatchPrefixTarget(binding.target)
+      return
+    }
+    if (isPrefixKey(event)) {
+      event.preventDefault()
+      event.stopPropagation()
+      setPrefixMode('armed')
+      setPrefixHelpVisible(false)
+      return
+    }
+    const action = matchKeyAction(event, keybindConfig())
     if (!action) return
     event.preventDefault()
     event.stopPropagation()
@@ -3042,6 +3412,12 @@ function createAppStore() {
     composerNonce,
     compact,
     uiConfig,
+    keybindConfig,
+    prefixMode,
+    prefixHelpVisible,
+    favoriteModels,
+    isFavoriteModel,
+    toggleFavoriteModel,
     draftFor,
     setDraftFor,
     beginDiffComment,
@@ -3063,6 +3439,7 @@ function createAppStore() {
     ensureProviderModels,
     runSidebarContextAction,
     runCommand,
+    shouldHandleKey,
     handleKey,
     start,
     paneTitle,

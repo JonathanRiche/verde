@@ -501,6 +501,11 @@ fn mainInner(init: std.process.Init) !void {
     // Keep the persisted Cursor picker responsive at launch, then replace it
     // with the model set reported by the installed, authenticated Cursor CLI.
     state.startCursorModelOptionsRefresh();
+    // pi and fx expose their configured catalogs cheaply (one short-lived
+    // process each), so discover them once in the background at launch.
+    state.startPiModelOptionsRefresh();
+    state.startFxModelOptionsRefresh();
+    state.startGrokModelOptionsRefresh();
     state.startAutomaticUpdateCheck();
     var live_server: ?live_ipc.LiveServer = live_ipc.LiveServer.init(allocator, storage.pref_path) catch |err| blk: {
         log.warn("failed to initialize live-control server: {s}", .{@errorName(err)});
@@ -587,6 +592,9 @@ fn mainInner(init: std.process.Init) !void {
                 app_state.pollOpencodeModelOptionsCache();
                 app_state.pollClaudeModelOptionsCache();
                 app_state.pollCursorModelOptionsCache();
+                app_state.pollPiModelOptionsCache();
+                app_state.pollFxModelOptionsCache();
+                app_state.pollGrokModelOptionsCache();
                 app_state.pollProviderReadiness();
                 app_state.pollUpdateCheck();
             }
@@ -3537,9 +3545,14 @@ test {
     _ = @import("platform/workspace_identity.zig");
     _ = @import("state/browser_controller.zig");
     _ = @import("state/workspace_layout.zig");
+    _ = @import("providers/acp.zig");
     _ = @import("providers/claude.zig");
+    _ = @import("providers/cursor.zig");
     _ = @import("providers/diagnostics.zig");
+    _ = @import("providers/fx.zig");
+    _ = @import("providers/grok.zig");
     _ = @import("providers/opencode.zig");
+    _ = @import("providers/pi.zig");
     _ = @import("providers/mcp.zig");
     _ = @import("chat/slash_commands.zig");
     _ = @import("theme/coverage_test.zig");

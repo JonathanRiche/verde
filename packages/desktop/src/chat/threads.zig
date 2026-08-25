@@ -9,6 +9,9 @@ pub fn providerLabel(provider: anytype) [:0]const u8 {
         .codex => "Codex",
         .claude => "Claude",
         .cursor => "Cursor",
+        .pi => "Pi",
+        .fx => "FX",
+        .grok => "Grok",
     };
 }
 
@@ -36,12 +39,18 @@ pub fn modelOptions(
     codex_options: []const Option,
     claude_options: []const Option,
     cursor_options: []const Option,
+    pi_options: []const Option,
+    fx_options: []const Option,
+    grok_options: []const Option,
 ) []const Option {
     return switch (provider) {
         .opencode => opencode_options,
         .codex => codex_options,
         .claude => claude_options,
         .cursor => cursor_options,
+        .pi => pi_options,
+        .fx => fx_options,
+        .grok => grok_options,
     };
 }
 
@@ -53,15 +62,18 @@ pub fn selectedModelLabel(
     codex_options: []const Option,
     claude_options: []const Option,
     cursor_options: []const Option,
+    pi_options: []const Option,
+    fx_options: []const Option,
+    grok_options: []const Option,
 ) [:0]const u8 {
     if (thread.model_ref) |model_ref| {
-        for (modelOptions(Option, thread.provider, opencode_options, codex_options, claude_options, cursor_options)) |option| {
+        for (modelOptions(Option, thread.provider, opencode_options, codex_options, claude_options, cursor_options, pi_options, fx_options, grok_options)) |option| {
             if (option.value) |value| {
                 if (std.mem.eql(u8, model_ref, value)) return option.label;
             }
         }
     }
-    const options = modelOptions(Option, thread.provider, opencode_options, codex_options, claude_options, cursor_options);
+    const options = modelOptions(Option, thread.provider, opencode_options, codex_options, claude_options, cursor_options, pi_options, fx_options, grok_options);
     return if (options.len > 0) options[0].label else "Model";
 }
 

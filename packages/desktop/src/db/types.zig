@@ -48,7 +48,10 @@ fn storedUserAuthor(author: []const u8) bool {
 }
 
 fn storedAssistantAuthor(author: []const u8) bool {
-    inline for (.{ "Assistant", "Agent", "OpenCode", "Codex", "Claude", "Cursor", "Sprout", "Moss", "Vireo" }) |known| {
+    // Every provider label emitted by transcript_apply.providerLabel must be
+    // listed here, or the daemon decodes its assistant rows as system rows and
+    // GUI identity adoption never matches the streamed reply.
+    inline for (.{ "Assistant", "Agent", "OpenCode", "Codex", "Claude", "Cursor", "Pi", "FX", "Grok", "Sprout", "Moss", "Vireo" }) |known| {
         if (std.ascii.eqlIgnoreCase(author, known)) return true;
     }
     return false;
@@ -76,6 +79,9 @@ test "mixed stored chat role codecs retain semantic roles" {
         .{ .raw = 2, .author = "Codex", .expected = .assistant },
         .{ .raw = 2, .author = "Claude", .expected = .assistant },
         .{ .raw = 2, .author = "Cursor", .expected = .assistant },
+        .{ .raw = 2, .author = "Pi", .expected = .assistant },
+        .{ .raw = 2, .author = "FX", .expected = .assistant },
+        .{ .raw = 2, .author = "Grok", .expected = .assistant },
         .{ .raw = 2, .author = "Sprout", .expected = .assistant },
         // Older desktop projections used assistant=0, system=1, user=2.
         .{ .raw = 0, .author = "Codex", .expected = .assistant },
@@ -102,6 +108,9 @@ pub const Provider = enum(u8) {
     codex = 1,
     cursor = 2,
     claude = 3,
+    pi = 4,
+    fx = 5,
+    grok = 6,
 };
 
 /// Provider identity attached to terminal surface activity. This stays

@@ -27,6 +27,7 @@ pub const METHOD_DAEMON_STORE_STATUS: []const u8 = "daemon.storeStatus";
 pub const METHOD_CHAT_THREAD_GET: []const u8 = "chat.thread.get";
 pub const METHOD_CHAT_THREAD_LIST: []const u8 = "chat.thread.list";
 pub const METHOD_CHAT_TURN_RECORD: []const u8 = "chat.turn.record";
+pub const METHOD_CONFIG_FAVORITE_MODEL_SET: []const u8 = "config.favoriteModel.set";
 
 pub const STATE_SNAPSHOT_REPLACE_METHOD = METHOD_STATE_SNAPSHOT_REPLACE;
 pub const WORKSPACE_UPSERT_METHOD = METHOD_WORKSPACE_UPSERT;
@@ -42,6 +43,7 @@ pub const DAEMON_STORE_STATUS_METHOD = METHOD_DAEMON_STORE_STATUS;
 pub const CHAT_THREAD_GET_METHOD = METHOD_CHAT_THREAD_GET;
 pub const CHAT_THREAD_LIST_METHOD = METHOD_CHAT_THREAD_LIST;
 pub const CHAT_TURN_RECORD_METHOD = METHOD_CHAT_TURN_RECORD;
+pub const CONFIG_FAVORITE_MODEL_SET_METHOD = METHOD_CONFIG_FAVORITE_MODEL_SET;
 
 // Re-export the shared storage error names from the one protocol error owner.
 pub const ERR_CONFLICT = protocol.ERR_CONFLICT;
@@ -255,6 +257,9 @@ pub const NotificationChatCompletionClearRequest = struct {
     mutation: MutationHeader,
     workspace_id: []const u8,
     local_thread_id: []const u8,
+    /// When present, only clears this completion or an older one. This keeps
+    /// a delayed acknowledgement from consuming a later turn on the thread.
+    completed_at_ms: ?i64 = null,
 };
 
 // Frozen scope names for the M5 composite core.snapshot request.  An absent
@@ -302,6 +307,7 @@ pub const SessionSummary = struct {
 pub const ConfigUiSnapshot = struct {
     workspace_pane_gap: f32 = 12.0,
     workspace_panes_per_view: u8 = 2,
+    workspace_split_default_pane: []const u8 = "chat",
     workspace_scroll_direction: []const u8 = "horizontal",
     workspace_scroll_mode: []const u8 = "automatic",
     workspace_scroll_threshold: u8 = 2,
@@ -309,8 +315,34 @@ pub const ConfigUiSnapshot = struct {
     reduced_motion: bool = false,
 };
 
+pub const ConfigFavoriteModel = struct {
+    provider: []const u8,
+    model: []const u8,
+};
+
+pub const ConfigChatSnapshot = struct {
+    favorite_models: []const ConfigFavoriteModel = &.{},
+};
+
 pub const ConfigSnapshot = struct {
     ui: ConfigUiSnapshot = .{},
+    chat: ConfigChatSnapshot = .{},
+    /// Raw shared keybind config. Detached UIs parse the same accelerator and
+    /// prefix contracts as the desktop instead of maintaining local settings.
+    keybinds: std.json.Value = .null,
+};
+
+/// Idempotently update one model favorite in the shared user config.
+pub const ConfigFavoriteModelSetRequest = struct {
+    provider: []const u8,
+    model: []const u8,
+    favorite: bool,
+};
+
+pub const ConfigFavoriteModelSetResult = struct {
+    provider: []const u8,
+    model: []const u8,
+    favorite: bool,
 };
 
 pub const CoreSnapshotResult = struct {
@@ -818,6 +850,7 @@ test "store method names and error codes are pinned" {
     try std.testing.expectEqualStrings("chat.thread.get", METHOD_CHAT_THREAD_GET);
     try std.testing.expectEqualStrings("chat.thread.list", METHOD_CHAT_THREAD_LIST);
     try std.testing.expectEqualStrings("chat.turn.record", METHOD_CHAT_TURN_RECORD);
+    try std.testing.expectEqualStrings("config.favoriteModel.set", METHOD_CONFIG_FAVORITE_MODEL_SET);
     try std.testing.expectEqualStrings("store", SNAPSHOT_SCOPE_STORE);
     try std.testing.expectEqualStrings("registry", SNAPSHOT_SCOPE_REGISTRY);
     try std.testing.expectEqualStrings("sessions", SNAPSHOT_SCOPE_SESSIONS);

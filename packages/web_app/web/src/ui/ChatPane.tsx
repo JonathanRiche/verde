@@ -51,6 +51,37 @@ function renderMarkdown(body: string): string {
   return html
 }
 
+// Serialized deferred-reveal queue for off-screen panes. WebKit (the embedded
+// Verde browser) has no requestIdleCallback, and a shared timeout fallback
+// revealed every off-screen pane in the same task — the combined cold
+// markdown parse + DOM mount blocked the main thread for seconds right after
+// a workspace switch. Chaining reveals keeps each block to one pane and
+// yields a frame between panes so input/paint stay responsive. A pane that
+// gains focus reveals itself immediately regardless of its queue position.
+let deferredRevealChain: Promise<void> = Promise.resolve()
+function queueDeferredReveal(reveal: () => void): () => void {
+  let cancelled = false
+  const w = window as Window & {
+    requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number
+  }
+  deferredRevealChain = deferredRevealChain.then(
+    () =>
+      new Promise<void>((resolve) => {
+        const run = () => {
+          if (!cancelled) reveal()
+          // Let this pane's layout/paint finish before the next pane mounts.
+          requestAnimationFrame(() => window.setTimeout(resolve, 0))
+        }
+        if (cancelled) resolve()
+        else if (w.requestIdleCallback) w.requestIdleCallback(run, { timeout: 1000 })
+        else window.setTimeout(run, 120)
+      }),
+  )
+  return () => {
+    cancelled = true
+  }
+}
+
 export function ChatPane(props: { pane: LivePane }) {
   let scroller: HTMLDivElement | undefined
   let pinToBottom = true
@@ -61,24 +92,16 @@ export function ChatPane(props: { pane: LivePane }) {
   // Workspace switches mount every open pane in the niri strip at once;
   // building all transcripts' DOM synchronously blocked the switch for
   // ~700ms. Paint the focused pane's transcript immediately and fill the
-  // off-screen ones in during idle frames.
+  // off-screen ones in during idle frames — one pane per slot via the shared
+  // reveal queue, because revealing them all on one timer froze the strip
+  // for seconds on workspaces with several large threads.
   const [revealed, setRevealed] = createSignal(focused())
   createEffect(() => {
     if (focused()) setRevealed(true)
   })
   if (!revealed()) {
-    // WebKit (the embedded Verde browser) has no requestIdleCallback.
-    const w = window as Window & {
-      requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number
-      cancelIdleCallback?: (id: number) => void
-    }
-    if (w.requestIdleCallback && w.cancelIdleCallback) {
-      const idle_id = w.requestIdleCallback(() => setRevealed(true), { timeout: 2000 })
-      onCleanup(() => w.cancelIdleCallback?.(idle_id))
-    } else {
-      const timer_id = window.setTimeout(() => setRevealed(true), 250)
-      onCleanup(() => window.clearTimeout(timer_id))
-    }
+    const cancel = queueDeferredReveal(() => setRevealed(true))
+    onCleanup(cancel)
   }
 
   createEffect(() => {
@@ -163,21 +186,65 @@ export function ChatPane(props: { pane: LivePane }) {
   }, [])
 
   // Mount only the newest window of rows; "Show earlier" expands on demand.
-  const [rowLimit, setRowLimit] = createSignal(TRANSCRIPT_WINDOW_ROWS)
+  //
+  // Mounting is time-budgeted: materializing the whole 60-row window in one
+  // task (megabytes of markdown parse + layout across every open pane)
+  // blocked the main thread for multiple seconds on cold load, so the user's
+  // first tap — typically opening a menu, worst on mobile CPUs — sat behind
+  // it. Instead mount the newest few rows immediately and prepend the rest
+  // one row at a time in short slices with a yielded timer gap in between,
+  // anchoring scroll so the view never visibly shifts.
+  const INITIAL_MOUNT_ROWS = 8
+  const UNFOCUSED_WINDOW_ROWS = 16
+  const MOUNT_SLICE_BUDGET_MS = 30
+  const [windowTarget, setWindowTarget] = createSignal(TRANSCRIPT_WINDOW_ROWS)
+  const [rowLimit, setRowLimit] = createSignal(INITIAL_MOUNT_ROWS)
+  // Panes that were never focused stop at a short tail: cold loads reveal
+  // several large transcripts and the unread remainder can mount when the
+  // pane is first focused instead of competing with the user's first input.
+  const [everFocused, setEverFocused] = createSignal(focused())
+  createEffect(() => {
+    if (focused()) setEverFocused(true)
+  })
+  const paneTarget = () =>
+    everFocused() ? windowTarget() : Math.min(UNFOCUSED_WINDOW_ROWS, windowTarget())
   const hiddenCount = createMemo(() => Math.max(0, allItems().length - rowLimit()))
   const items = createMemo(() => {
     const all = allItems()
     return hiddenCount() > 0 ? all.slice(all.length - rowLimit()) : all
   })
-  const showEarlier = () => {
+  let mount_slice_timer = 0
+  const mountSlice = () => {
+    mount_slice_timer = 0
+    const el = scroller
     // Keep the viewport anchored on the rows the user was reading while
     // older rows mount above them.
-    const el = scroller
     const before = el ? el.scrollHeight - el.scrollTop : 0
-    setRowLimit((limit) => limit + TRANSCRIPT_WINDOW_STEP)
-    queueMicrotask(() => {
-      if (el) el.scrollTop = el.scrollHeight - before
-    })
+    const start = performance.now()
+    // Each increment synchronously prepends exactly one older row; stop the
+    // slice once the budget is spent so queued input can run in between.
+    while (
+      rowLimit() < paneTarget() &&
+      hiddenCount() > 0 &&
+      performance.now() - start < MOUNT_SLICE_BUDGET_MS
+    ) {
+      setRowLimit((limit) => limit + 1)
+    }
+    if (el) el.scrollTop = el.scrollHeight - before
+  }
+  createEffect(() => {
+    if (!revealed()) return
+    if (rowLimit() >= paneTarget() || hiddenCount() <= 0) return
+    if (mount_slice_timer !== 0) return
+    mount_slice_timer = window.setTimeout(mountSlice, 16)
+  })
+  onCleanup(() => window.clearTimeout(mount_slice_timer))
+  // Growing the target alone mounts nothing; the budgeted slices above
+  // prepend the extra rows, so a 200-row expansion no longer freezes input.
+  // Expanding is explicit read intent, so it also lifts the unfocused cap.
+  const showEarlier = () => {
+    setEverFocused(true)
+    setWindowTarget((target) => target + TRANSCRIPT_WINDOW_STEP)
   }
 
   // Turn acceptance time while streaming — drives live group elapsed labels.
@@ -927,9 +994,29 @@ const PROVIDER_OPTIONS = [
   { value: 'claude', label: 'Claude' },
   { value: 'cursor', label: 'Cursor' },
   { value: 'opencode', label: 'OpenCode' },
+  { value: 'pi', label: 'Pi' },
+  { value: 'fx', label: 'FX' },
+  { value: 'grok', label: 'Grok' },
 ] as const
 
+type PickerProvider = typeof PROVIDER_OPTIONS[number]['value'] | 'favorites'
+
+function FavoriteStar(props: { active: boolean }) {
+  return (
+    <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
+      <path
+        d="M12 3.7l2.55 5.17 5.7.83-4.13 4.02.98 5.68L12 16.72 6.9 19.4l.98-5.68L3.75 9.7l5.7-.83z"
+        fill={props.active ? 'currentColor' : 'none'}
+        stroke="currentColor"
+        stroke-width="1.6"
+        stroke-linejoin="round"
+      />
+    </svg>
+  )
+}
+
 function ComposerPickers(props: { pane: LivePane }) {
+  let modelTrigger: HTMLButtonElement | undefined
   const [open, setOpen] = createSignal<'model' | 'effort' | 'variant' | 'fast' | 'access' | null>(null)
   const [selectedProvider, setSelectedProvider] = createSignal(props.pane.provider ?? 'codex')
   const [selectedModel, setSelectedModel] = createSignal<string | null>(props.pane.model ?? null)
@@ -937,7 +1024,8 @@ function ComposerPickers(props: { pane: LivePane }) {
   const [selectedVariant, setSelectedVariant] = createSignal<string | null>(props.pane.reasoning_variant ?? null)
   const [selectedFast, setSelectedFast] = createSignal(props.pane.fast_mode === true)
   const [selectedAccess, setSelectedAccess] = createSignal(props.pane.access_mode ?? 'supervised')
-  const [pickerProvider, setPickerProvider] = createSignal(selectedProvider())
+  const [pickerProvider, setPickerProvider] = createSignal<PickerProvider>(selectedProvider() as PickerProvider)
+  const [modelMenuStyle, setModelMenuStyle] = createSignal('left:12px;bottom:64px;width:calc(100vw - 24px);max-height:55vh')
   // Picker feedback is local and synchronous; the pane projection catches up
   // after the durable daemon write. Reconcile external/desktop changes when a
   // fresh pane value arrives without making the click wait on that round trip.
@@ -950,7 +1038,10 @@ function ComposerPickers(props: { pane: LivePane }) {
   // Daemon catalog (provider.models.list) when the provider is reachable,
   // otherwise the static desktop-parity tables.
   createEffect(() => store.ensureProviderModels(selectedProvider()))
-  createEffect(() => store.ensureProviderModels(pickerProvider()))
+  createEffect(() => {
+    const provider = pickerProvider()
+    if (provider !== 'favorites') store.ensureProviderModels(provider)
+  })
   const modelsFor = (provider: string | null | undefined) =>
     store.providerModels(provider) ?? modelOptionsFor(provider)
   const models = () => modelsFor(selectedProvider())
@@ -963,17 +1054,72 @@ function ComposerPickers(props: { pane: LivePane }) {
     store.messagesFor(props.pane).length === 0 &&
     !props.pane.provider_thread_id &&
     !store.paneWorking(props.pane)
+  const pickerRows = () => {
+    const provider = allowsProviderChoice() ? pickerProvider() : selectedProvider()
+    if (provider !== 'favorites') {
+      return modelsFor(provider).map((option) => ({ provider, option }))
+    }
+    return store.favoriteModels().map((favorite) => ({
+      provider: favorite.provider,
+      option: modelsFor(favorite.provider).find((option) => option.value === favorite.model) ?? {
+        value: favorite.model,
+        label: shortModel(favorite.model),
+      },
+    }))
+  }
+  const pickerHeading = () => {
+    const provider = allowsProviderChoice() ? pickerProvider() : selectedProvider()
+    if (provider === 'favorites') return 'Favorites'
+    return PROVIDER_OPTIONS.find((option) => option.value === provider)?.label ?? provider
+  }
   const currentModelLabel = () => {
     const match = models().find((option) => option.value === selectedModel())
     return match?.label ?? models()[0]?.label ?? shortModel(selectedModel())
   }
+  // The trigger can sit anywhere in a wrapped composer toolbar. Measure it
+  // instead of assuming a left edge, then clamp the fixed popover inside the
+  // viewport so split panes and phone widths cannot push it off-screen.
+  const placeModelMenu = () => {
+    const rect = modelTrigger?.getBoundingClientRect()
+    if (!rect) return
+    const margin = 12
+    const gap = 6
+    const viewport_width = window.innerWidth
+    const viewport_height = window.innerHeight
+    const width = Math.min(400, Math.max(0, viewport_width - margin * 2))
+    const left = Math.min(
+      Math.max(margin, rect.left),
+      Math.max(margin, viewport_width - width - margin),
+    )
+    const max_height = Math.max(160, Math.min(viewport_height * 0.55, rect.top - margin - gap))
+    const bottom = Math.max(margin, viewport_height - rect.top + gap)
+    setModelMenuStyle(
+      `left:${left}px;bottom:${bottom}px;width:${width}px;max-height:${max_height}px`,
+    )
+  }
+  const repositionModelMenu = () => {
+    if (open() === 'model') placeModelMenu()
+  }
+  window.addEventListener('resize', repositionModelMenu)
+  window.addEventListener('scroll', repositionModelMenu, true)
+  window.visualViewport?.addEventListener('resize', repositionModelMenu)
+  onCleanup(() => {
+    window.removeEventListener('resize', repositionModelMenu)
+    window.removeEventListener('scroll', repositionModelMenu, true)
+    window.visualViewport?.removeEventListener('resize', repositionModelMenu)
+  })
+  createEffect(() => {
+    if (open() !== 'model') return
+    requestAnimationFrame(placeModelMenu)
+  })
   const toggleModelPicker = () => {
     if (open() === 'model') {
       setOpen(null)
       return
     }
-    setPickerProvider(selectedProvider())
+    setPickerProvider(selectedProvider() as PickerProvider)
     setOpen('model')
+    queueMicrotask(placeModelMenu)
   }
   const pickModel = (provider: string, value: string) => {
     setOpen(null)
@@ -1044,6 +1190,7 @@ function ComposerPickers(props: { pane: LivePane }) {
       </Show>
       <div class="relative min-w-0 shrink">
         <button
+          ref={(node) => { modelTrigger = node }}
           type="button"
           class="flex max-w-full items-center gap-1.5 rounded-full bg-[var(--panel-alt)] px-2.5 py-1 text-[12px] text-[var(--text-muted)]"
           disabled={models().length === 0}
@@ -1058,16 +1205,30 @@ function ComposerPickers(props: { pane: LivePane }) {
         </button>
         <Show when={open() === 'model'}>
           <div
-            class="absolute bottom-full left-0 z-30 mb-1.5 flex max-h-[55vh] min-w-[25rem] overflow-hidden rounded-[10px] border border-[var(--border-muted)] bg-[var(--panel)] shadow-lg max-sm:min-w-[calc(100vw-3rem)]"
+            class="fixed z-30 flex min-w-0 overflow-hidden rounded-[10px] border border-[var(--border-muted)] bg-[var(--panel)] shadow-lg max-[479px]:flex-col"
+            style={modelMenuStyle()}
             role="menu"
           >
             <Show when={allowsProviderChoice()}>
-              <div class="w-[9rem] shrink-0 border-r border-[var(--border-muted)] p-1">
+              <div class="w-[9rem] shrink-0 overflow-y-auto border-r border-[var(--border-muted)] p-1 max-[479px]:flex max-[479px]:w-full max-[479px]:overflow-x-auto max-[479px]:overflow-y-hidden max-[479px]:border-b max-[479px]:border-r-0">
+                <button
+                  type="button"
+                  class={`flex w-full items-center gap-2 rounded-[6px] px-2.5 py-2 text-left text-[13px] max-[479px]:w-auto max-[479px]:shrink-0 ${
+                    pickerProvider() === 'favorites'
+                      ? 'bg-[var(--accent-row)] text-[var(--text)]'
+                      : 'text-[var(--text-muted)] hover:bg-[var(--accent-hover)]'
+                  }`}
+                  onClick={() => setPickerProvider('favorites')}
+                  aria-label="Show favorite models"
+                >
+                  <FavoriteStar active />
+                  <span>Favorites</span>
+                </button>
                 <For each={PROVIDER_OPTIONS}>
                   {(provider) => (
                     <button
                       type="button"
-                      class={`flex w-full items-center gap-2 rounded-[6px] px-2.5 py-2 text-left text-[13px] ${
+                      class={`flex w-full items-center gap-2 rounded-[6px] px-2.5 py-2 text-left text-[13px] max-[479px]:w-auto max-[479px]:shrink-0 ${
                         pickerProvider() === provider.value
                           ? 'bg-[var(--accent-row)] text-[var(--text)]'
                           : 'text-[var(--text-muted)] hover:bg-[var(--accent-hover)]'
@@ -1081,24 +1242,52 @@ function ComposerPickers(props: { pane: LivePane }) {
                 </For>
               </div>
             </Show>
-            <div class="min-w-0 flex-1 overflow-y-auto py-1">
+            <div class="min-h-0 min-w-0 flex-1 overflow-y-auto py-1">
               <div class="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wide text-[var(--text-subtle)]">
-                {PROVIDER_OPTIONS.find((provider) => provider.value === pickerProvider())?.label ?? pickerProvider()}
+                {pickerHeading()}
               </div>
               <For
-                each={modelsFor(allowsProviderChoice() ? pickerProvider() : selectedProvider())}
-                fallback={<p class="px-3 py-4 text-xs text-[var(--text-subtle)]">No models available.</p>}
+                each={pickerRows()}
+                fallback={
+                  <p class="px-3 py-4 text-xs text-[var(--text-subtle)]">
+                    {pickerProvider() === 'favorites' ? 'Star a model to keep it here.' : 'No models available.'}
+                  </p>
+                }
               >
-                {(option) => {
-                  const provider = () => allowsProviderChoice() ? pickerProvider() : selectedProvider()
+                {(row) => {
+                  const selected = () =>
+                    row.provider === selectedProvider() && row.option.value === selectedModel()
+                  const favorite = () => store.isFavoriteModel(row.provider, row.option.value)
                   return (
-                    <button
-                      type="button"
-                      class={rowClass(provider() === selectedProvider() && option.value === selectedModel())}
-                      onClick={() => pickModel(provider(), option.value)}
+                    <div
+                      class={`group flex min-w-0 items-center ${
+                        selected() ? 'text-[var(--accent)]' : 'text-[var(--text-muted)]'
+                      }`}
                     >
-                      {option.label}
-                    </button>
+                      <button
+                        type="button"
+                        class="min-w-0 flex-1 px-3 py-2 text-left text-[13px] hover:text-[var(--text)]"
+                        onClick={() => pickModel(row.provider, row.option.value)}
+                      >
+                        <span class="block truncate">{row.option.label}</span>
+                        <Show when={pickerProvider() === 'favorites'}>
+                          <span class="mt-0.5 block text-[10px] uppercase tracking-wide text-[var(--text-subtle)]">
+                            {PROVIDER_OPTIONS.find((provider) => provider.value === row.provider)?.label ?? row.provider}
+                          </span>
+                        </Show>
+                      </button>
+                      <button
+                        type="button"
+                        class={`mr-1 grid h-8 w-8 shrink-0 place-items-center rounded-[6px] hover:bg-[var(--accent-hover)] hover:text-[var(--text)] ${
+                          favorite() ? 'text-[var(--accent)]' : 'text-[var(--text-subtle)]'
+                        }`}
+                        onClick={() => store.toggleFavoriteModel(row.provider, row.option.value)}
+                        aria-label={`${favorite() ? 'Remove' : 'Add'} ${row.option.label} ${favorite() ? 'from' : 'to'} favorites`}
+                        title={favorite() ? 'Remove from favorites' : 'Add to favorites'}
+                      >
+                        <FavoriteStar active={favorite()} />
+                      </button>
+                    </div>
                   )
                 }}
               </For>

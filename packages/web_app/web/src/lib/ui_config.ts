@@ -3,6 +3,7 @@
 export interface UiConfig {
   workspace_pane_gap: number
   workspace_panes_per_view: number
+  workspace_split_default_pane: 'chat' | 'terminal'
   workspace_scroll_direction: 'horizontal' | 'vertical'
   workspace_scroll_mode: 'automatic' | 'always' | 'disabled'
   workspace_scroll_threshold: number
@@ -13,6 +14,7 @@ export interface UiConfig {
 export const DEFAULT_UI_CONFIG: UiConfig = {
   workspace_pane_gap: 12,
   workspace_panes_per_view: 2,
+  workspace_split_default_pane: 'chat',
   workspace_scroll_direction: 'horizontal',
   workspace_scroll_mode: 'automatic',
   workspace_scroll_threshold: 2,
@@ -56,6 +58,7 @@ export function parseUiConfig(raw: unknown): UiConfig {
       MIN_PANES_PER_VIEW,
       MAX_PANES_PER_VIEW,
     ),
+    workspace_split_default_pane: ui.workspace_split_default_pane === 'terminal' ? 'terminal' : 'chat',
     workspace_scroll_direction: direction,
     workspace_scroll_mode: mode,
     workspace_scroll_threshold: clamp(

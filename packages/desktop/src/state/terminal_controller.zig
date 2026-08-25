@@ -867,6 +867,29 @@ pub fn handleTerminalKeyDown(
     return handled;
 }
 
+/// Dispatches an already-resolved terminal action (prefix mode) through the
+/// same workspace-vs-dock split `handleTerminalKeyDown` uses for raw events.
+pub fn handleTerminalAction(self: anytype, action: keybinds.NativeTerminalAction) bool {
+    if (!canRouteTerminalInput(self)) return false;
+    const dock_id = terminalInputDockId(self) orelse return false;
+    switch (action) {
+        .new_tab => return self.createCurrentProjectTerminalTab(dock_id, .{}),
+        .split_up => return self.splitFocusedWorkspacePaneWithTerminalPlacement(.horizontal, false),
+        .split_down => return self.splitFocusedWorkspacePaneWithTerminalPlacement(.horizontal, true),
+        .split_left => return self.splitFocusedWorkspacePaneWithTerminalPlacement(.vertical, false),
+        .split_right => return self.splitFocusedWorkspacePaneWithTerminalPlacement(.vertical, true),
+        else => {},
+    }
+    var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return false;
+    dock.performWorkspaceAction(self.allocator, action) catch |err| {
+        log.warn("terminal prefix action failed: {s}", .{@errorName(err)});
+        return false;
+    };
+    if (dock.consumeWorkspaceChange()) self.markDirty();
+    self.noteTerminalInputActivity();
+    return true;
+}
+
 pub fn handleTerminalTextInput(self: anytype, text: [*c]const u8) bool {
     if (!canRouteTerminalInput(self)) return false;
     const dock_id = terminalInputDockId(self) orelse return false;

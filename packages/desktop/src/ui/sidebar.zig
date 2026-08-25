@@ -784,6 +784,9 @@ fn openTuiLabel(provider: Provider) []const u8 {
         .opencode => "Open in TUI: OpenCode",
         .claude => "Open in TUI: Claude",
         .cursor => "Open in TUI: Cursor",
+        .pi => "Open in TUI: Pi",
+        .fx => "Open in TUI: FX",
+        .grok => "Open in TUI: Grok",
     };
 }
 
@@ -2537,6 +2540,8 @@ const TerminalAgentProvider = enum {
     cursor,
     grok,
     amp,
+    pi,
+    fx,
 };
 
 fn terminalAgentProviderFromChatProvider(provider: Provider) TerminalAgentProvider {
@@ -2545,6 +2550,9 @@ fn terminalAgentProviderFromChatProvider(provider: Provider) TerminalAgentProvid
         .opencode => .opencode,
         .claude => .claude,
         .cursor => .cursor,
+        .pi => .pi,
+        .fx => .fx,
+        .grok => .grok,
     };
 }
 
@@ -2579,8 +2587,10 @@ fn queuePaletteProviderGlyphInRect(state: *runtime.AppState, provider: TerminalA
         .opencode => state.opencode_logo_texture,
         .claude => state.claude_logo_texture,
         .cursor => state.cursor_logo_texture,
-        .grok => null,
+        .grok => state.grok_logo_texture,
         .amp => state.amp_logo_texture,
+        .pi => state.pi_logo_texture,
+        .fx => state.fx_logo_texture,
     };
     if (texture) |cached| {
         const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, box.x, box.y, box.w, box.h));
@@ -2595,6 +2605,8 @@ fn queuePaletteProviderGlyphInRect(state: *runtime.AppState, provider: TerminalA
         .cursor => "Cu",
         .grok => "G",
         .amp => "A",
+        .pi => "P",
+        .fx => "F",
     };
     const font_size = @min(theme.scaledUi(11.0), box.h);
     const color = if (provider == .amp) theme.COLOR_YELLOW else theme.COLOR_TEXT_SUBTLE;
@@ -2616,6 +2628,7 @@ fn providerFromComm(comm: []const u8) ?TerminalAgentProvider {
     if (std.mem.eql(u8, comm, "agent")) return .cursor;
     if (std.mem.eql(u8, comm, "grok")) return .grok;
     if (std.mem.eql(u8, comm, "amp")) return .amp;
+    if (std.mem.eql(u8, comm, "fx")) return .fx;
     return null;
 }
 

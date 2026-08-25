@@ -17,6 +17,9 @@ this order:
    which codex
    which opencode
    which agent
+   which pi
+   which fx
+   which grok
    ```
 
 2. **Is the provider authenticated?** Re-run the provider's login command and confirm credentials are still valid:
@@ -24,11 +27,14 @@ this order:
    ```bash
    codex login
    agent login
+   fx login
+   grok login
    ```
 
    Claude Code is authenticated through its own SDK; Verde has no Verde-side
    login for it. Make sure the Claude Code binary and `node` are both reachable
-   from the shell environment Verde was launched from.
+   from the shell environment Verde was launched from. Pi authenticates with
+   `pi login` or API keys in pi's own settings.
 
 3. **Is the project imported?** Verde runs the provider against the imported project directory. A provider CLI in a different working directory will not see the same files.
 
@@ -50,8 +56,7 @@ needed**, run the provider's login command outside Verde and retry. A timed-out
 or failed probe appears as **Could not verify** and should be checked against
 the runtime log.
 
-Grok and Amp never appear on this screen because they are terminal-only
-providers.
+Amp never appears on this screen because it is a terminal-only provider.
 
 ## Linux browser runtime missing
 

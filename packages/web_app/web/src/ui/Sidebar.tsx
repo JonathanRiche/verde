@@ -671,7 +671,13 @@ function contextMenuItems(target: SidebarMenuTarget): MenuItem[] {
       ? 'Claude'
       : pane.provider === 'cursor'
         ? 'Cursor'
-        : 'Codex'
+        : pane.provider === 'pi'
+          ? 'Pi'
+          : pane.provider === 'fx'
+            ? 'FX'
+            : pane.provider === 'grok'
+              ? 'Grok'
+              : 'Codex'
   return [
     { action: 'thread-rename', label: 'Rename chat', disabled: !pane.thread_id },
     { action: 'thread-regenerate-title', label: 'Regenerate title', disabled: busy || desktop_only_disabled },

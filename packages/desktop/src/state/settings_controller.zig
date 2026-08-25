@@ -24,7 +24,7 @@ const CHAT_TITLE_PROVIDER_OPTIONS = [_]app_config.ChatTitleProvider{
     .cursor,
     .opencode,
 };
-const NEW_CHAT_PROVIDER_OPTIONS = [_]app_config.ChatProvider{ .codex, .claude, .cursor, .opencode };
+const NEW_CHAT_PROVIDER_OPTIONS = [_]app_config.ChatProvider{ .codex, .claude, .cursor, .opencode, .pi, .fx, .grok };
 const NEW_CHAT_REASONING_OPTIONS = [_]app_config.ChatReasoning{ .provider_default, .low, .medium, .high, .xhigh, .max };
 
 fn monotonicMs() i64 {
@@ -46,6 +46,9 @@ fn dbProviderForChatProvider(provider: app_config.ChatProvider) Provider {
         .claude => .claude,
         .cursor => .cursor,
         .opencode => .opencode,
+        .pi => .pi,
+        .fx => .fx,
+        .grok => .grok,
     };
 }
 
@@ -767,13 +770,17 @@ fn settingsChatTitleModelOptions(self: anytype) []const ModelOption {
         provider_models.CODEX_MODEL_OPTIONS[0..],
         self.claudeModelOptionsSnapshot(),
         self.cursorModelOptionsSnapshot(),
+        self.piModelOptionsSnapshot(),
+        self.fxModelOptionsSnapshot(),
+        self.grokModelOptionsSnapshot(),
     );
 }
 
 fn defaultChatTitleModelRef(self: anytype, provider: app_config.ChatTitleProvider) []const u8 {
     if (provider == .codex) return app_config.DEFAULT_CHAT_TITLE_MODEL;
     return switch (dbProviderForChatTitleProvider(provider)) {
-        .codex => unreachable,
+        // ChatTitleProvider deliberately excludes pi, fx, and grok.
+        .codex, .pi, .fx, .grok => unreachable,
         .opencode => self.cachedDefaultModelRefForProvider(.opencode),
         .claude => provider_models.DEFAULT_CLAUDE_MODEL,
         .cursor => provider_models.DEFAULT_CURSOR_MODEL,
@@ -806,6 +813,9 @@ pub fn settingsNewChatProviderLabel(self: anytype, option_index: usize) []const 
         .claude => "Claude",
         .cursor => "Cursor",
         .opencode => "OpenCode",
+        .pi => "Pi",
+        .fx => "FX",
+        .grok => "Grok",
     };
 }
 
@@ -817,6 +827,9 @@ fn settingsNewChatModelOptions(self: anytype) []const ModelOption {
         provider_models.CODEX_MODEL_OPTIONS[0..],
         self.claudeModelOptionsSnapshot(),
         self.cursorModelOptionsSnapshot(),
+        self.piModelOptionsSnapshot(),
+        self.fxModelOptionsSnapshot(),
+        self.grokModelOptionsSnapshot(),
     );
 }
 
@@ -826,6 +839,9 @@ fn defaultNewChatModelRef(self: anytype, provider: app_config.ChatProvider) []co
         .opencode => self.cachedDefaultModelRefForProvider(.opencode),
         .claude => provider_models.DEFAULT_CLAUDE_MODEL,
         .cursor => provider_models.DEFAULT_CURSOR_MODEL,
+        .pi => provider_models.DEFAULT_PI_MODEL,
+        .fx => provider_models.DEFAULT_FX_MODEL,
+        .grok => provider_models.DEFAULT_GROK_MODEL,
     };
 }
 
@@ -899,6 +915,12 @@ fn settingsNewChatReasoningSupported(self: anytype, reasoning: app_config.ChatRe
             for (values) |value| if (reasoningValueMatches(value, reasoning)) break :blk true;
             break :blk false;
         },
+        // Pi accepts every Verde effort tag as a thinking level.
+        .pi => provider_models.parseReasoningEffort(reasoning.configValue()) != null,
+        // fx exposes no reasoning-effort control.
+        .fx => false,
+        // grok accepts Verde effort tags up to xhigh (no max tier).
+        .grok => reasoning.configValue().len > 0 and provider_models.parseReasoningEffort(reasoning.configValue()) != null and provider_models.parseReasoningEffort(reasoning.configValue()) != .max,
         .opencode => blk: {
             if (!option.reasoning_supported) break :blk false;
             const values = option.reasoning_variant_keys orelse break :blk false;
@@ -962,6 +984,9 @@ pub fn selectSettingsNewChatProvider(self: anytype, option_index: usize) void {
         self.settings_controller.draft.new_chat_reasoning = .provider_default;
         switch (provider) {
             .codex => {},
+            .pi => self.startPiModelOptionsRefresh(),
+            .fx => self.startFxModelOptionsRefresh(),
+            .grok => self.startGrokModelOptionsRefresh(),
             .claude => self.startClaudeModelOptionsRefresh(),
             .cursor => self.startCursorModelOptionsRefresh(),
             .opencode => self.startOpencodeModelOptionsRefresh(),

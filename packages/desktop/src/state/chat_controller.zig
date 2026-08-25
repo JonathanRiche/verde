@@ -82,6 +82,9 @@ const OPENCODE_LOGO_BYTES = @embedFile("../assets/opencode-logo-dark.png");
 const CODEX_LOGO_BYTES = @embedFile("../assets/OpenAI-white-monoblossom.png");
 const CLAUDE_LOGO_BYTES = @embedFile("../assets/claude-logo.png");
 const CURSOR_LOGO_BYTES = @embedFile("../assets/editor_logos/cursor.png");
+const PI_LOGO_BYTES = @embedFile("../assets/pi-logo.png");
+const FX_LOGO_BYTES = @embedFile("../assets/fx-logo.png");
+const GROK_LOGO_BYTES = @embedFile("../assets/grok-logo.png");
 
 pub const InitialSendSnapshot = struct {
     message_count: usize,
@@ -123,6 +126,9 @@ fn harnessProviderForDbProvider(provider: Provider) ai_harness.Provider {
         .codex => .codex,
         .claude => .claude,
         .cursor => .cursor,
+        .pi => .pi,
+        .fx => .fx,
+        .grok => .grok,
     };
 }
 
@@ -267,12 +273,13 @@ fn bangPipeReader(context: BangPipeReader) void {
 
 pub fn bangCommandWorker(request: *BangCommandRequest) void {
     const page_alloc = std.heap.page_allocator;
+    const state = request.send_state;
     defer {
         page_alloc.free(request.command);
         page_alloc.free(request.cwd);
         page_alloc.destroy(request);
+        state.worker_done.store(true, .release);
     }
-    const state = request.send_state;
 
     if (request.require_confirmation) {
         state.mutex.lock();
@@ -421,14 +428,27 @@ fn monotonicMs() i64 {
     return @intCast(@divTrunc(platform_runtime.monotonicTimestampNs(), std.time.ns_per_ms));
 }
 
+fn workerCleanupPending(terminal: bool, has_worker: bool, worker_done: bool) bool {
+    return terminal and has_worker and !worker_done;
+}
+
+test "render polling waits for worker cleanup before joining" {
+    try std.testing.expect(workerCleanupPending(true, true, false));
+    try std.testing.expect(!workerCleanupPending(true, true, true));
+    try std.testing.expect(!workerCleanupPending(true, false, false));
+    try std.testing.expect(!workerCleanupPending(false, true, false));
+}
+
 pub fn titleGenerationWorker(request: *TitleGenerationRequest) void {
     const page_alloc = std.heap.page_allocator;
+    const state = request.state;
     defer {
         page_alloc.free(request.project_path);
         page_alloc.free(request.prompt);
         page_alloc.free(request.model_ref);
         page_alloc.destroy(request);
         loop_wakeup.notify();
+        state.worker_done.store(true, .release);
     }
 
     const send_result = send_runner.run(page_alloc, .{
@@ -1566,6 +1586,7 @@ pub fn beginBangCommand(self: anytype, command: []const u8) !void {
         .cwd = try page_alloc.dupe(u8, self.currentProject().path),
         .require_confirmation = require_confirmation,
     };
+    state.worker_done.store(false, .release);
     state.worker = try std.Thread.spawn(.{}, bangCommandWorker, .{request});
     self.chat_controller.beginSend();
     self.clearDraft();
@@ -1797,9 +1818,11 @@ pub fn queueOrSteerDraftDuringSend(self: anytype) void {
     if (self.project_controller.projects.items.len == 0) return;
     const thread = self.currentThreadMutable();
     const kind: FollowupKind = switch (thread.provider) {
-        .codex, .claude => .steer,
+        .codex, .claude, .pi => .steer,
         .opencode => .queue,
         .cursor => .queue,
+        .fx => .queue,
+        .grok => .queue,
     };
     self.storeDraftDuringSend(kind);
 }
@@ -1817,8 +1840,8 @@ pub fn storeThreadFollowupPrompt(self: anytype, project_index: usize, thread_ind
     if (std.mem.trim(u8, prompt, &std.ascii.whitespace).len == 0) return false;
 
     const kind: FollowupKind = switch (thread.provider) {
-        .codex, .claude => .steer,
-        .opencode, .cursor => .queue,
+        .codex, .claude, .pi => .steer,
+        .opencode, .cursor, .fx, .grok => .queue,
     };
     const send_state = thread.send_state;
     send_state.mutex.lock();
@@ -1982,6 +2005,9 @@ pub fn pendingFollowupHint(self: anytype) ?[:0]const u8 {
         .opencode => "Tab to queue",
         .claude => "Enter to queue \u{00B7} Tab to steer",
         .cursor => "Tab to queue",
+        .pi => "Enter to queue \u{00B7} Tab to steer",
+        .fx => "Tab to queue",
+        .grok => "Tab to queue",
     };
 }
 
@@ -2016,6 +2042,11 @@ pub fn sendPromptViaHarness(self: anytype, prompt: []const u8) !ai_harness.SendP
             .cursor = .{
                 .cwd = project.path,
                 .model = if (thread.model_ref) |model_ref| model_ref else null,
+            },
+        },
+        .pi => ai_harness.ProviderConfig{
+            .pi = .{
+                .cwd = project.path,
             },
         },
     };
@@ -2078,6 +2109,21 @@ pub fn interruptThreadViaHarness(
                 .cwd = provider_cwd,
             },
         },
+        .pi => ai_harness.ProviderConfig{
+            .pi = .{
+                .cwd = provider_cwd,
+            },
+        },
+        .fx => ai_harness.ProviderConfig{
+            .fx = .{
+                .cwd = provider_cwd,
+            },
+        },
+        .grok => ai_harness.ProviderConfig{
+            .grok = .{
+                .cwd = provider_cwd,
+            },
+        },
     };
 
     var client = try ai_harness.connect(self.allocator, provider_config);
@@ -2110,7 +2156,7 @@ pub fn steerThreadViaHarness(
             } else null,
         } },
         .claude => ai_harness.ProviderConfig{ .claude = .{ .cwd = provider_cwd } },
-        .opencode, .cursor => return error.UnsupportedOperation,
+        .opencode, .cursor, .pi, .fx, .grok => return error.UnsupportedOperation,
     };
 
     var client = try ai_harness.connect(self.allocator, provider_config);
@@ -2758,7 +2804,7 @@ fn daemonChatTurnExistsRaw(allocator: std.mem.Allocator, pref_path: []const u8, 
 fn daemonReasoningVariant(provider: Provider, variant: ?[:0]const u8) ?[:0]const u8 {
     return switch (provider) {
         .opencode, .cursor => variant,
-        .codex, .claude => null,
+        .codex, .claude, .pi, .fx, .grok => null,
     };
 }
 
@@ -3434,6 +3480,14 @@ pub fn pollTitleGenerations(self: anytype) bool {
 pub fn pollThreadTitleGeneration(self: anytype, project: *Project, thread: *ChatThread) bool {
     const state = thread.title_generation_state;
     if (!state.mutex.tryLock()) return false;
+    if (workerCleanupPending(
+        state.status == .completed or state.status == .failed,
+        state.worker != null,
+        state.worker_done.load(.acquire),
+    )) {
+        state.mutex.unlock();
+        return false;
+    }
     var result: ?[:0]const u8 = null;
     var error_message: ?[]u8 = null;
     var manual = false;
@@ -3548,6 +3602,7 @@ pub fn startTitleGeneration(self: anytype, project_index: usize, thread: *ChatTh
     state.status = .pending;
     state.manual = manual;
     state.discard_result = false;
+    state.worker_done.store(false, .release);
     state.worker = std.Thread.spawn(.{}, titleGenerationWorker, .{request}) catch |err| {
         state.status = .idle;
         return err;
@@ -3765,6 +3820,9 @@ pub fn currentThreadPendingSlashCommandLabel(self: anytype) ?[]const u8 {
         },
         .opencode => "Running OpenCode command...",
         .cursor => "Running Cursor command...",
+        .pi => "Running Pi command...",
+        .fx => "Running FX command...",
+        .grok => "Running Grok command...",
     };
 }
 
@@ -4721,6 +4779,14 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
     var stream_changed = false;
 
     if (!send_state.mutex.tryLock()) return false;
+    if (workerCleanupPending(
+        send_state.status != .pending and send_state.status != .idle,
+        send_state.worker != null,
+        send_state.worker_done.load(.acquire),
+    )) {
+        send_state.mutex.unlock();
+        return daemon_changed;
+    }
     switch (send_state.status) {
         .pending => {
             if (send_state.ui_revision != send_state.polled_ui_revision) {
@@ -6070,7 +6136,9 @@ pub fn noteChatCompletion(self: anytype, project_index: usize, thread_index: usi
         // legacy GUI row) within one poll cycle. The daemon-owned path never
         // set the local pending flag, so arm it to pass clearChatCompletion's
         // pending gate (which keeps ordinary focus routes storage-free).
-        if (daemon_owned_completion) thread.completion_pending = true;
+        if (daemon_owned_completion) {
+            armFocusedDaemonCompletion(thread, unixTimestampMs());
+        }
         _ = self.clearChatCompletion(project_index, thread_index);
         return;
     }
@@ -6107,13 +6175,39 @@ pub fn noteChatCompletion(self: anytype, project_index: usize, thread_index: usi
     var body_buf: [256]u8 = undefined;
     const body = completionNoticeBody(is_companion, dir, &body_buf);
 
-    const icon: notifier.Icon = switch (thread.provider) {
+    const icon: ?notifier.Icon = switch (thread.provider) {
         .codex => .{ .key = "codex", .png_bytes = CODEX_LOGO_BYTES },
         .opencode => .{ .key = "opencode", .png_bytes = OPENCODE_LOGO_BYTES },
         .claude => .{ .key = "claude", .png_bytes = CLAUDE_LOGO_BYTES },
         .cursor => .{ .key = "cursor", .png_bytes = CURSOR_LOGO_BYTES },
+        .pi => .{ .key = "pi", .png_bytes = PI_LOGO_BYTES },
+        .fx => .{ .key = "fx", .png_bytes = FX_LOGO_BYTES },
+        .grok => .{ .key = "grok", .png_bytes = GROK_LOGO_BYTES },
     };
     notifier.notifyAgentDone(self.allocator, title, body, icon);
+}
+
+// A focused completion can be observed before the daemon snapshot carrying
+// its exact finish time. The observation time is an upper bound that lets the
+// acknowledgement suppress that snapshot without covering a later turn.
+fn armFocusedDaemonCompletion(thread: anytype, now_ms: i64) void {
+    thread.completion_pending = true;
+    if (thread.completed_at_ms == 0) thread.completed_at_ms = now_ms;
+}
+
+test "focused daemon completion receives a suppression timestamp" {
+    const ThreadStub = struct {
+        completion_pending: bool = false,
+        completed_at_ms: i64 = 0,
+    };
+    var fresh: ThreadStub = .{};
+    armFocusedDaemonCompletion(&fresh, 123);
+    try std.testing.expect(fresh.completion_pending);
+    try std.testing.expectEqual(@as(i64, 123), fresh.completed_at_ms);
+
+    var projected: ThreadStub = .{ .completed_at_ms = 100 };
+    armFocusedDaemonCompletion(&projected, 123);
+    try std.testing.expectEqual(@as(i64, 100), projected.completed_at_ms);
 }
 
 /// Completion toast copy. Companion completions direct the user to the Sprout
@@ -6368,8 +6462,8 @@ pub fn issuePendingProviderSteer(
         if (pending_thread_id) |resolved_thread_id| {
             const resolved_turn_id: ?[]const u8 = switch (provider) {
                 .codex => send_state.active_turn_id,
-                .claude => if (send_state.active_turn_id) |active| active else "",
-                .opencode, .cursor => null,
+                .claude, .pi => if (send_state.active_turn_id) |active| active else "",
+                .opencode, .cursor, .fx, .grok => null,
             };
             if (resolved_turn_id) |active_turn_id| {
                 thread_id = self.allocator.dupe(u8, resolved_thread_id) catch null;
@@ -6652,6 +6746,57 @@ pub fn finishClaudeModelCacheThread(self: anytype) void {
     self.provider_controller.claude_model_cache.models = null;
     self.provider_controller.claude_model_cache.status = .idle;
     self.provider_controller.claude_model_cache.mutex.unlock();
+
+    if (maybe_worker) |worker| {
+        worker.join();
+    }
+    if (maybe_models) |models| {
+        ai_harness.freeModelInfos(std.heap.page_allocator, models);
+    }
+}
+
+pub fn finishPiModelCacheThread(self: anytype) void {
+    self.provider_controller.pi_model_cache.mutex.lock();
+    const maybe_worker = self.provider_controller.pi_model_cache.worker;
+    self.provider_controller.pi_model_cache.worker = null;
+    const maybe_models = self.provider_controller.pi_model_cache.models;
+    self.provider_controller.pi_model_cache.models = null;
+    self.provider_controller.pi_model_cache.status = .idle;
+    self.provider_controller.pi_model_cache.mutex.unlock();
+
+    if (maybe_worker) |worker| {
+        worker.join();
+    }
+    if (maybe_models) |models| {
+        ai_harness.freeModelInfos(std.heap.page_allocator, models);
+    }
+}
+
+pub fn finishFxModelCacheThread(self: anytype) void {
+    self.provider_controller.fx_model_cache.mutex.lock();
+    const maybe_worker = self.provider_controller.fx_model_cache.worker;
+    self.provider_controller.fx_model_cache.worker = null;
+    const maybe_models = self.provider_controller.fx_model_cache.models;
+    self.provider_controller.fx_model_cache.models = null;
+    self.provider_controller.fx_model_cache.status = .idle;
+    self.provider_controller.fx_model_cache.mutex.unlock();
+
+    if (maybe_worker) |worker| {
+        worker.join();
+    }
+    if (maybe_models) |models| {
+        ai_harness.freeModelInfos(std.heap.page_allocator, models);
+    }
+}
+
+pub fn finishGrokModelCacheThread(self: anytype) void {
+    self.provider_controller.grok_model_cache.mutex.lock();
+    const maybe_worker = self.provider_controller.grok_model_cache.worker;
+    self.provider_controller.grok_model_cache.worker = null;
+    const maybe_models = self.provider_controller.grok_model_cache.models;
+    self.provider_controller.grok_model_cache.models = null;
+    self.provider_controller.grok_model_cache.status = .idle;
+    self.provider_controller.grok_model_cache.mutex.unlock();
 
     if (maybe_worker) |worker| {
         worker.join();

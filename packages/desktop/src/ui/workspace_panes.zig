@@ -870,7 +870,14 @@ pub fn renderAtWithTranscriptLayoutWidth(state: *runtime.AppState, rect: palette
         if (scrollingLayoutActive(state, layout)) {
             renderScrollingStrip(state, layout, rect, target_workspace_width);
         } else {
-            renderNode(state, root, rect, target_workspace_width);
+            const gap = theme.scaledUi(state.app_config.workspace_pane_gap);
+            const pane_count = layout.visiblePaneCount();
+            renderNode(
+                state,
+                root,
+                tiledContentRect(rect, gap, pane_count),
+                tiledContentExtent(target_workspace_width, gap, pane_count),
+            );
         }
     } else if (state.project_controller.projects.items.len > 0) {
         renderEmptyWorkspace(state, rect);
@@ -1808,7 +1815,15 @@ fn renderScrollingGroup(
         .vertical => .{ .x = workspace.x, .y = workspace.y + screen_origin, .w = workspace.w, .h = pane_extent },
     };
     if (intersectRects(rect, workspace) == null) return;
-    renderScrollGroupNode(state, layout, root, group_id, rect, target_pane_width);
+    const pane_count = layout.scrollGroupPaneCount(group_id);
+    renderScrollGroupNode(
+        state,
+        layout,
+        root,
+        group_id,
+        tiledContentRect(rect, gap, pane_count),
+        tiledContentExtent(target_pane_width, gap, pane_count),
+    );
     const gutter: palette.Rect = switch (direction) {
         .horizontal => .{ .x = rect.x + rect.w, .y = workspace.y, .w = gap, .h = workspace.h },
         .vertical => .{ .x = workspace.x, .y = rect.y + rect.h, .w = workspace.w, .h = gap },
@@ -1877,7 +1892,7 @@ fn renderScrollGroupSplit(
     rect: palette.Rect,
     target_width: f32,
 ) void {
-    const gap = theme.scaledUi(1.0);
+    const gap = theme.scaledUi(state.app_config.workspace_pane_gap);
     if (split.axis == .vertical) {
         const widths = verticalSplitWidths(rect.w, split.ratio, gap);
         const target_widths = verticalSplitWidths(target_width, split.ratio, gap);
@@ -1924,7 +1939,7 @@ fn renderScrollGroupGutter(
     rect: palette.Rect,
     split_rect: palette.Rect,
 ) void {
-    queueRect(state, rect, paletteColor(theme.COLOR_PANEL_MUTED));
+    queueRect(state, rect, paletteColor(theme.background()));
     const hit_rect: palette.Rect = if (axis == .vertical)
         .{ .x = rect.x - theme.scaledUi(4.0), .y = rect.y, .w = rect.w + theme.scaledUi(8.0), .h = rect.h }
     else
@@ -2320,6 +2335,38 @@ fn verticalSplitWidths(total_width: f32, ratio: f32, gap: f32) VerticalSplitWidt
     };
 }
 
+fn tiledContentExtent(extent: f32, gap: f32, pane_count: usize) f32 {
+    if (pane_count <= 1) return extent;
+    const inset = @min(gap, @max((extent - 1.0) * 0.5, 0.0));
+    return @max(1.0, extent - inset * 2.0);
+}
+
+fn tiledContentRect(rect: palette.Rect, gap: f32, pane_count: usize) palette.Rect {
+    if (pane_count <= 1) return rect;
+    const horizontal_inset = @min(gap, @max((rect.w - 1.0) * 0.5, 0.0));
+    const vertical_inset = @min(gap, @max((rect.h - 1.0) * 0.5, 0.0));
+    return .{
+        .x = rect.x + horizontal_inset,
+        .y = rect.y + vertical_inset,
+        .w = @max(1.0, rect.w - horizontal_inset * 2.0),
+        .h = @max(1.0, rect.h - vertical_inset * 2.0),
+    };
+}
+
+test "tiled content adds four-sided margins only for pane groups" {
+    const rect: palette.Rect = .{ .x = 10.0, .y = 20.0, .w = 1000.0, .h = 700.0 };
+
+    try std.testing.expectEqual(rect, tiledContentRect(rect, 12.0, 1));
+    try std.testing.expectEqual(@as(f32, 1000.0), tiledContentExtent(rect.w, 12.0, 1));
+
+    const tiled = tiledContentRect(rect, 12.0, 2);
+    try std.testing.expectEqual(@as(f32, 22.0), tiled.x);
+    try std.testing.expectEqual(@as(f32, 32.0), tiled.y);
+    try std.testing.expectEqual(@as(f32, 976.0), tiled.w);
+    try std.testing.expectEqual(@as(f32, 676.0), tiled.h);
+    try std.testing.expectEqual(@as(f32, 976.0), tiledContentExtent(rect.w, 12.0, 2));
+}
+
 test "target split widths finish without a corrective transcript reflow" {
     defer theme.applyTheme(1.0);
     theme.applyTheme(1.0);
@@ -2335,7 +2382,7 @@ fn renderNode(state: *runtime.AppState, node: *const runtime.WorkspaceNode, rect
     switch (node.*) {
         .leaf => |pane_id| renderLeafWithTranscriptLayoutWidth(state, pane_id, rect, target_width),
         .split => |split| {
-            const gap = theme.scaledUi(1.0);
+            const gap = theme.scaledUi(state.app_config.workspace_pane_gap);
             if (split.axis == .vertical) {
                 const widths = verticalSplitWidths(rect.w, split.ratio, gap);
                 const target_widths = verticalSplitWidths(target_width, split.ratio, gap);
@@ -2361,7 +2408,7 @@ fn renderNode(state: *runtime.AppState, node: *const runtime.WorkspaceNode, rect
 }
 
 fn renderSplitGutter(state: *runtime.AppState, first: *const runtime.WorkspaceNode, second: *const runtime.WorkspaceNode, axis: runtime.WorkspaceSplitAxis, rect: palette.Rect, split_rect: palette.Rect) void {
-    queueRect(state, rect, paletteColor(theme.COLOR_PANEL_MUTED));
+    queueRect(state, rect, paletteColor(theme.background()));
     const hit_rect = if (axis == .vertical)
         palette.Rect{ .x = rect.x - theme.scaledUi(4.0), .y = rect.y, .w = rect.w + theme.scaledUi(8.0), .h = rect.h }
     else

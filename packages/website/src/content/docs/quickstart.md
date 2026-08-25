@@ -47,7 +47,9 @@ terminal-only provider before launching the app:
 | Claude Code | Install [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and Node.js, ensure `node` is on `PATH`, then log in. |
 | OpenCode    | Install [OpenCode](https://github.com/anomalyco/opencode); ensure `opencode` is on `PATH`. |
 | Cursor      | Install the [Cursor CLI](https://cursor.com/docs/cli/installation), ensure `agent` is on `PATH`, run `agent login`. `CURSOR_API_KEY` is also supported for headless environments. |
-| Grok Build  | Install [Grok Build](https://docs.x.ai/build/overview#install); ensure `grok` is on `PATH`. Grok runs as a terminal TUI — launch **Start New Grok TUI** from the command palette. |
+| Pi          | Install [pi](https://pi.dev); ensure `pi` is on `PATH`. Pi drives Verde's native chat panes (`pi --mode rpc`) and can also launch as a terminal TUI. |
+| FX          | Install [fx](https://fx.sh) with its setup script, then run `fx login`. FX drives Verde's native chat panes (`fx acp`) and can also launch as a terminal TUI. |
+| Grok Build  | Install [Grok Build](https://docs.x.ai/build/overview#install); ensure `grok` is on `PATH`, then run `grok login`. Grok drives Verde's native chat panes and can also launch as a terminal TUI from the command palette. |
 | Amp         | Install [Amp](https://ampcode.com); ensure `amp` is on `PATH`. Amp runs as a terminal TUI rather than a chat pane — launch it from the command palette. |
 
 See [Provider setup](/docs/providers) for the full per-provider notes.

@@ -1862,6 +1862,9 @@ fn harnessProviderForDbProvider(provider: Provider) ai_harness.Provider {
         .codex => .codex,
         .claude => .claude,
         .cursor => .cursor,
+        .pi => .pi,
+        .fx => .fx,
+        .grok => .grok,
     };
 }
 
@@ -1915,6 +1918,9 @@ pub const PaletteModalAction = enum {
     handoff_provider_opencode,
     handoff_provider_claude,
     handoff_provider_cursor,
+    handoff_provider_pi,
+    handoff_provider_fx,
+    handoff_provider_grok,
     handoff_context_summary,
     handoff_context_recent,
     handoff_context_full,
@@ -2237,7 +2243,7 @@ const COMPOSER_MODEL_PICKER_WIDTH: f32 = 430.0;
 const COMPOSER_MODEL_PICKER_RAIL_WIDTH: f32 = 52.0;
 const COMPOSER_MODEL_PICKER_Z: i32 = 1400;
 pub const COMPOSER_RUN_CONFIG_Z: i32 = 1400;
-const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .claude, .cursor, .opencode };
+const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .claude, .cursor, .opencode, .pi, .fx, .grok };
 
 fn paletteEstimatedFontAdvance(_: ?*anyopaque, text: []const u8, byte_offset: usize, font_size: f32) palette.FontAdvance {
     if (byte_offset >= text.len) return .{ .byte_len = 0, .width = 0.0 };
@@ -2420,6 +2426,9 @@ fn composerModelOptions(state: *const AppState, provider: Provider) []const Mode
         CODEX_MODEL_OPTIONS[0..],
         state.claudeModelOptionsSnapshot(),
         state.cursorModelOptionsSnapshot(),
+        state.piModelOptionsSnapshot(),
+        state.fxModelOptionsSnapshot(),
+        state.grokModelOptionsSnapshot(),
     );
 }
 
@@ -2429,6 +2438,9 @@ fn composerDefaultModelRef(state: *const AppState, provider: Provider) [:0]const
         .opencode => state.cachedDefaultModelRefForProvider(.opencode),
         .claude => DEFAULT_CLAUDE_MODEL,
         .cursor => DEFAULT_CURSOR_MODEL,
+        .pi => DEFAULT_PI_MODEL,
+        .fx => DEFAULT_FX_MODEL,
+        .grok => DEFAULT_GROK_MODEL,
     };
 }
 
@@ -2479,7 +2491,8 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
                 state.markDirty();
                 return;
             }
-            if (thread.provider == .claude) {
+            // Claude, Pi, and Grok menus carry effort tag names as row variants.
+            if (thread.provider == .claude or thread.provider == .pi or thread.provider == .grok) {
                 const rows = state.opencode_reasoning_menu.items;
                 if (index >= rows.len) return;
                 const row = rows[index];
@@ -2490,6 +2503,13 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
                     thread.reasoning_effort != null;
                 if (!changed) return;
                 thread.reasoning_effort = next;
+                // Threads that picked a level before this branch covered their
+                // provider carry a stray variant string; drop it so the pill
+                // labels from reasoning_effort alone.
+                if (thread.opencode_reasoning_variant) |old| {
+                    state.allocator.free(old);
+                    thread.opencode_reasoning_variant = null;
+                }
                 state.markDirty();
                 return;
             }
@@ -2733,6 +2753,9 @@ fn configChatProvider(provider: Provider) app_config.ChatProvider {
         .claude => .claude,
         .cursor => .cursor,
         .opencode => .opencode,
+        .pi => .pi,
+        .fx => .fx,
+        .grok => .grok,
     };
 }
 
@@ -2742,6 +2765,9 @@ fn providerFromConfig(provider: app_config.ChatProvider) Provider {
         .claude => .claude,
         .cursor => .cursor,
         .opencode => .opencode,
+        .pi => .pi,
+        .fx => .fx,
+        .grok => .grok,
     };
 }
 
@@ -2763,8 +2789,14 @@ fn drawModelPickerProviderLogo(
     clip: palette.draw.Rect,
     slot: palette.draw.Rect,
 ) void {
-    const tex = state.providerLogoTexture(provider) orelse return;
-    if (!tex.valid or tex.texture_id == 0) return;
+    const tex = state.providerLogoTexture(provider) orelse {
+        drawModelPickerProviderLetter(state, allocator, batch, provider, clip, slot);
+        return;
+    };
+    if (!tex.valid or tex.texture_id == 0) {
+        drawModelPickerProviderLetter(state, allocator, batch, provider, clip, slot);
+        return;
+    }
     const inner = @min(slot.w, slot.h);
     const square: palette.Rect = .{
         .x = slot.x + (slot.w - inner) * 0.5,
@@ -2779,6 +2811,35 @@ fn drawModelPickerProviderLogo(
         .w = 1.0,
         .h = 1.0,
     }, .{ .r = 1.0, .g = 1.0, .b = 1.0, .a = 1.0 }, clip) catch {};
+}
+
+// Letter stand-in for providers without a bundled logo texture (Pi, FX), so
+// their model-picker rail and row slots are never empty.
+fn drawModelPickerProviderLetter(
+    state: *AppState,
+    allocator: std.mem.Allocator,
+    batch: *palette.draw.RenderBatch,
+    provider: Provider,
+    clip: palette.draw.Rect,
+    slot: palette.draw.Rect,
+) void {
+    _ = state;
+    const label = switch (provider) {
+        .codex => "C",
+        .opencode => "O",
+        .claude => "Cl",
+        .cursor => "Cu",
+        .pi => "P",
+        .fx => "F",
+        .grok => "G",
+    };
+    const font_size = @min(slot.h, theme.scaledUi(13.0));
+    batch.text(allocator, .{
+        .x = slot.x,
+        .y = slot.y + (slot.h - font_size * 1.25) * 0.5,
+        .w = slot.w,
+        .h = font_size * 1.25,
+    }, label, paletteColor(theme.COLOR_TEXT_SUBTLE), font_size, clip) catch {};
 }
 
 fn paletteModelPickerRenderRowLeading(
@@ -3068,10 +3129,18 @@ pub const DEFAULT_CODEX_REASONING_EFFORT = provider_models.DEFAULT_CODEX_REASONI
 pub const DEFAULT_OPENCODE_MODEL = provider_models.DEFAULT_OPENCODE_MODEL;
 pub const DEFAULT_CLAUDE_MODEL = provider_models.DEFAULT_CLAUDE_MODEL;
 pub const DEFAULT_CURSOR_MODEL = provider_models.DEFAULT_CURSOR_MODEL;
+pub const DEFAULT_PI_MODEL = provider_models.DEFAULT_PI_MODEL;
+pub const FX_MODEL_OPTIONS = provider_models.FX_MODEL_OPTIONS;
+pub const DEFAULT_FX_MODEL = provider_models.DEFAULT_FX_MODEL;
+pub const GROK_MODEL_OPTIONS = provider_models.GROK_MODEL_OPTIONS;
+pub const DEFAULT_GROK_MODEL = provider_models.DEFAULT_GROK_MODEL;
 pub const IMAGE_MODAL_ID: [:0]const u8 = "AttachmentPreviewModal";
 pub const THREAD_IMPORT_MODAL_ID: [:0]const u8 = "ThreadImportModal";
 pub const TRANSCRIPT_SELECTION_MODAL_ID: [:0]const u8 = "TranscriptSelectionModal";
 pub const VERDE_LOGO_BYTES = @embedFile("assets/verde_logo_mask.png");
+pub const PI_LOGO_BYTES = @embedFile("assets/pi-logo.png");
+pub const FX_LOGO_BYTES = @embedFile("assets/fx-logo.png");
+pub const GROK_LOGO_BYTES = @embedFile("assets/grok-logo.png");
 pub const OPENCODE_LOGO_BYTES = surface_controller.OPENCODE_LOGO_BYTES;
 pub const CODEX_LOGO_BYTES = surface_controller.CODEX_LOGO_BYTES;
 pub const CLAUDE_LOGO_BYTES = surface_controller.CLAUDE_LOGO_BYTES;
@@ -3125,6 +3194,8 @@ const claudeEffortValueLabel = provider_models.claudeEffortValueLabel;
 const reasoningEffortDisplayLabel = provider_models.reasoningEffortDisplayLabel;
 const codexReasoningOptions = provider_models.codexReasoningOptions;
 pub const ReasoningOption = provider_models.ReasoningOption;
+pub const PI_REASONING_OPTIONS = provider_models.PI_REASONING_OPTIONS;
+pub const GROK_REASONING_OPTIONS = provider_models.GROK_REASONING_OPTIONS;
 const FastModeOption = provider_models.FastModeOption;
 const AccessModeOption = provider_models.AccessModeOption;
 
@@ -3190,6 +3261,7 @@ pub const shouldPresentTranscriptImmediately = transcript_controller.shouldPrese
 
 pub const OPENCODE_MODEL_OPTIONS = provider_models.OPENCODE_MODEL_OPTIONS;
 pub const CODEX_MODEL_OPTIONS = provider_models.CODEX_MODEL_OPTIONS;
+pub const PI_MODEL_OPTIONS = provider_models.PI_MODEL_OPTIONS;
 pub const CURSOR_MODEL_OPTIONS = provider_models.CURSOR_MODEL_OPTIONS;
 const CLAUDE_STANDARD_EFFORT_VALUES = provider_models.CLAUDE_STANDARD_EFFORT_VALUES;
 const CLAUDE_FULL_EFFORT_VALUES = provider_models.CLAUDE_FULL_EFFORT_VALUES;
@@ -3408,6 +3480,18 @@ pub const AppState = struct {
     ctrl_shortcut_hints_visible: bool,
     /// Distinguishes Ctrl+Shift ACTIVE-row hints from plain Ctrl pane hints.
     shift_shortcut_hints_visible: bool,
+    /// tmux-style prefix chord was pressed; the next key-down resolves against
+    /// the prefix table instead of reaching panes.
+    prefix_armed: bool,
+    /// `?` was pressed while armed: show the full prefix cheat sheet above the
+    /// status bar until the chord resolves or is cancelled.
+    prefix_help_visible: bool,
+    /// Sticky navigate mode (prefix `w`): navigate-table keys keep firing
+    /// until Esc, with the status bar listing them.
+    prefix_navigate: bool,
+    /// The key that completed a prefix chord still emits an SDL text_input;
+    /// drop that one event so the letter does not leak into a terminal or composer.
+    prefix_swallow_text_input: bool,
     composer_controller: ComposerControllerState,
     companion_controller: companion_controller,
     companion_composer: CompanionComposerPrompt,
@@ -3462,6 +3546,9 @@ pub const AppState = struct {
     last_user_input_ms: i64 = 0,
     opencode_model_options: std.ArrayList(ModelOption),
     claude_model_options: std.ArrayList(ModelOption),
+    pi_model_options: std.ArrayList(ModelOption),
+    fx_model_options: std.ArrayList(ModelOption),
+    grok_model_options: std.ArrayList(ModelOption),
     cursor_model_options: std.ArrayList(ModelOption),
     opencode_reasoning_menu: std.ArrayList(OpencodeReasoningMenuRow),
     image_texture_cache: std.StringHashMap(CachedImageTexture),
@@ -3470,6 +3557,9 @@ pub const AppState = struct {
     codex_logo_texture: ?CachedImageTexture,
     claude_logo_texture: ?CachedImageTexture,
     amp_logo_texture: ?CachedImageTexture,
+    pi_logo_texture: ?CachedImageTexture,
+    fx_logo_texture: ?CachedImageTexture,
+    grok_logo_texture: ?CachedImageTexture,
     thread_edit_texture: ?CachedImageTexture,
     cursor_logo_texture: ?CachedImageTexture,
     emacs_logo_texture: ?CachedImageTexture,
@@ -3582,6 +3672,10 @@ pub const AppState = struct {
             .alt_shortcut_hints_visible = false,
             .ctrl_shortcut_hints_visible = false,
             .shift_shortcut_hints_visible = false,
+            .prefix_armed = false,
+            .prefix_help_visible = false,
+            .prefix_navigate = false,
+            .prefix_swallow_text_input = false,
             .composer_controller = ComposerControllerState.init(),
             .companion_controller = companion_controller.init(),
             .companion_composer = CompanionComposerPrompt.init(),
@@ -3617,6 +3711,9 @@ pub const AppState = struct {
             .window_input_focus = true,
             .opencode_model_options = .empty,
             .claude_model_options = .empty,
+            .pi_model_options = .empty,
+            .fx_model_options = .empty,
+            .grok_model_options = .empty,
             .cursor_model_options = .empty,
             .opencode_reasoning_menu = .empty,
             .image_texture_cache = std.StringHashMap(CachedImageTexture).init(allocator),
@@ -3625,6 +3722,9 @@ pub const AppState = struct {
             .codex_logo_texture = null,
             .claude_logo_texture = null,
             .amp_logo_texture = null,
+            .pi_logo_texture = null,
+            .fx_logo_texture = null,
+            .grok_logo_texture = null,
             .thread_edit_texture = null,
             .cursor_logo_texture = null,
             .emacs_logo_texture = null,
@@ -3747,6 +3847,9 @@ pub const AppState = struct {
             state.codex_logo_texture = state.loadEmbeddedTexture(CODEX_LOGO_BYTES);
             state.claude_logo_texture = state.loadEmbeddedTexture(CLAUDE_LOGO_BYTES);
             state.amp_logo_texture = state.loadEmbeddedTexture(AMP_LOGO_BYTES);
+            state.pi_logo_texture = state.loadEmbeddedTexture(PI_LOGO_BYTES);
+            state.fx_logo_texture = state.loadEmbeddedTexture(FX_LOGO_BYTES);
+            state.grok_logo_texture = state.loadEmbeddedTexture(GROK_LOGO_BYTES);
             state.thread_edit_texture = state.loadEmbeddedTexture(THREAD_EDIT_BYTES);
             state.cursor_logo_texture = state.loadEmbeddedTexture(CURSOR_LOGO_BYTES);
             state.emacs_logo_texture = state.loadEmbeddedTexture(EMACS_LOGO_BYTES);
@@ -3803,10 +3906,16 @@ pub const AppState = struct {
     pub const opencodeModelOptionsSnapshot = provider_controller.opencodeModelOptionsSnapshot;
     pub const claudeModelOptionsSnapshot = provider_controller.claudeModelOptionsSnapshot;
     pub const cursorModelOptionsSnapshot = provider_controller.cursorModelOptionsSnapshot;
+    pub const piModelOptionsSnapshot = provider_controller.piModelOptionsSnapshot;
+    pub const fxModelOptionsSnapshot = provider_controller.fxModelOptionsSnapshot;
+    pub const grokModelOptionsSnapshot = provider_controller.grokModelOptionsSnapshot;
     pub const cachedDefaultModelRefForProvider = provider_controller.cachedDefaultModelRefForProvider;
     pub const startOpencodeModelOptionsRefresh = provider_controller.startOpencodeModelOptionsRefresh;
     pub const startCursorModelOptionsRefresh = provider_controller.startCursorModelOptionsRefresh;
     pub const startClaudeModelOptionsRefresh = provider_controller.startClaudeModelOptionsRefresh;
+    pub const startPiModelOptionsRefresh = provider_controller.startPiModelOptionsRefresh;
+    pub const startFxModelOptionsRefresh = provider_controller.startFxModelOptionsRefresh;
+    pub const startGrokModelOptionsRefresh = provider_controller.startGrokModelOptionsRefresh;
     pub const startProviderReadinessCheck = provider_controller.startProviderReadinessCheck;
     pub const completeMcpOnboarding = provider_controller.completeMcpOnboarding;
     pub const pollProviderReadiness = provider_controller.pollProviderReadiness;
@@ -3817,6 +3926,9 @@ pub const AppState = struct {
     pub const refreshOpencodeModelOptionsCacheAsync = provider_controller.refreshOpencodeModelOptionsCacheAsync;
     pub const refreshCursorModelOptionsCacheAsync = provider_controller.refreshCursorModelOptionsCacheAsync;
     pub const refreshClaudeModelOptionsCacheAsync = provider_controller.refreshClaudeModelOptionsCacheAsync;
+    pub const refreshPiModelOptionsCacheAsync = provider_controller.refreshPiModelOptionsCacheAsync;
+    pub const refreshFxModelOptionsCacheAsync = provider_controller.refreshFxModelOptionsCacheAsync;
+    pub const refreshGrokModelOptionsCacheAsync = provider_controller.refreshGrokModelOptionsCacheAsync;
     pub const duplicateReasoningVariantKeys = provider_controller.duplicateReasoningVariantKeys;
     pub const populateOpencodeModelOptions = provider_controller.populateOpencodeModelOptions;
     pub const opencodeModelIdSuffixFromRef = provider_controller.opencodeModelIdSuffixFromRef;
@@ -3824,12 +3936,17 @@ pub const AppState = struct {
     pub const opencodeModelSortLessThan = provider_controller.opencodeModelSortLessThan;
     pub const populateCursorModelOptions = provider_controller.populateCursorModelOptions;
     pub const populateClaudeModelOptions = provider_controller.populateClaudeModelOptions;
+    pub const populatePiModelOptions = provider_controller.populatePiModelOptions;
+    pub const populateFxModelOptions = provider_controller.populateFxModelOptions;
+    pub const populateGrokModelOptions = provider_controller.populateGrokModelOptions;
     pub const asciiCaseInsensitiveCompare = provider_controller.asciiCaseInsensitiveCompare;
     pub const normalizeCurrentOpencodeThreadModel = provider_controller.normalizeCurrentOpencodeThreadModel;
     pub const opencodeModelOptionForRef = provider_controller.opencodeModelOptionForRef;
     pub const refreshOpencodeReasoningMenu = provider_controller.refreshOpencodeReasoningMenu;
     pub const refreshCursorReasoningMenu = provider_controller.refreshCursorReasoningMenu;
     pub const refreshClaudeReasoningMenu = provider_controller.refreshClaudeReasoningMenu;
+    pub const refreshPiReasoningMenu = provider_controller.refreshPiReasoningMenu;
+    pub const refreshGrokReasoningMenu = provider_controller.refreshGrokReasoningMenu;
     pub const cursorModelOptionForRef = provider_controller.cursorModelOptionForRef;
     pub const claudeModelOptionForRef = provider_controller.claudeModelOptionForRef;
     pub const cursorModelParamsJsonAlloc = provider_controller.cursorModelParamsJsonAlloc;
@@ -3841,6 +3958,12 @@ pub const AppState = struct {
     pub const clearDynamicClaudeModelOptions = provider_controller.clearDynamicClaudeModelOptions;
     pub const clearClaudeModelOptions = provider_controller.clearClaudeModelOptions;
     pub const clearCursorModelOptions = provider_controller.clearCursorModelOptions;
+    pub const clearDynamicPiModelOptions = provider_controller.clearDynamicPiModelOptions;
+    pub const clearPiModelOptions = provider_controller.clearPiModelOptions;
+    pub const clearDynamicFxModelOptions = provider_controller.clearDynamicFxModelOptions;
+    pub const clearFxModelOptions = provider_controller.clearFxModelOptions;
+    pub const clearDynamicGrokModelOptions = provider_controller.clearDynamicGrokModelOptions;
+    pub const clearGrokModelOptions = provider_controller.clearGrokModelOptions;
     pub const loadCursorModelOptionsDiskCache = provider_controller.loadCursorModelOptionsDiskCache;
     pub const saveCursorModelOptionsDiskCache = provider_controller.saveCursorModelOptionsDiskCache;
 
@@ -4495,7 +4618,12 @@ pub const AppState = struct {
                     .cwd = project.path,
                 },
             },
-            .cursor => return self.setThreadImportNotice(importThreadFailureMessage(provider, error.UnsupportedOperation)),
+            .pi => ai_harness.ProviderConfig{
+                .pi = .{
+                    .cwd = project.path,
+                },
+            },
+            .cursor, .fx, .grok => return self.setThreadImportNotice(importThreadFailureMessage(provider, error.UnsupportedOperation)),
         };
 
         var client = ai_harness.connect(self.allocator, provider_config) catch |err| {
@@ -4673,7 +4801,12 @@ pub const AppState = struct {
                     .cwd = project.path,
                 },
             },
-            .cursor => return self.setThreadImportNotice(importThreadFailureMessage(provider, error.UnsupportedOperation)),
+            .pi => ai_harness.ProviderConfig{
+                .pi = .{
+                    .cwd = project.path,
+                },
+            },
+            .cursor, .fx, .grok => return self.setThreadImportNotice(importThreadFailureMessage(provider, error.UnsupportedOperation)),
         };
 
         var client = ai_harness.connect(self.allocator, provider_config) catch |err| {
@@ -4769,7 +4902,12 @@ pub const AppState = struct {
                     .cwd = project.path,
                 },
             },
-            .cursor => {
+            .pi => ai_harness.ProviderConfig{
+                .pi = .{
+                    .cwd = project.path,
+                },
+            },
+            .cursor, .fx, .grok => {
                 self.setSidebarNotice(syncThreadFailureMessage(provider, error.UnsupportedOperation));
                 return;
             },
@@ -5171,6 +5309,16 @@ pub const AppState = struct {
                         }
                     };
                 },
+                // pi thinking levels match Verde's effort tags one-to-one.
+                .pi => if (parseReasoningEffort(raw)) |effort| {
+                    reasoning_effort = effort;
+                },
+                // fx exposes no reasoning-effort control.
+                .fx => {},
+                // grok efforts share Verde's tag names (max clamps to xhigh at send).
+                .grok => if (parseReasoningEffort(raw)) |effort| {
+                    reasoning_effort = effort;
+                },
             }
         }
         const owned_variant = if (variant_value) |value| try self.allocator.dupeZ(u8, value) else null;
@@ -5420,6 +5568,7 @@ pub const AppState = struct {
     pub const drainTerminalDockNotifications = terminal_controller.drainTerminalDockNotifications;
     pub const canRouteTerminalInput = terminal_controller.canRouteTerminalInput;
     pub const handleTerminalKeyDown = terminal_controller.handleTerminalKeyDown;
+    pub const handleTerminalAction = terminal_controller.handleTerminalAction;
     pub const handleTerminalTextInput = terminal_controller.handleTerminalTextInput;
     pub const requestTerminalFocus = terminal_controller.requestTerminalFocus;
     pub const requestTerminalDockFocus = terminal_controller.requestTerminalDockFocus;
@@ -6002,6 +6151,20 @@ pub const AppState = struct {
         self.focusWorkspaceOpenPane(project_index, result.pane_id);
     }
 
+    /// Runs a user script bound under `keybinds.prefix.bindings`, mirroring
+    /// the custom `open.default` action contract (`sh -lc`, project cwd, `$1`).
+    pub fn runPrefixCommand(self: *AppState, command: []const u8) void {
+        if (self.project_controller.projects.items.len == 0) {
+            self.setSidebarNotice("Open a workspace before running a prefix command.");
+            return;
+        }
+        utils.runCustomProjectCommand(self.allocator, self.currentProject().path, command) catch |err| {
+            log.warn("failed to run prefix command: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to run prefix command.");
+            return;
+        };
+    }
+
     fn runCustomOpenAction(self: *AppState, custom: app_config.CustomOpenAction) void {
         utils.runCustomProjectCommand(self.allocator, self.currentProject().path, custom.action) catch |err| {
             log.warn("failed to run custom open action: {s}", .{@errorName(err)});
@@ -6379,6 +6542,18 @@ pub const AppState = struct {
             cached.deinit();
             self.amp_logo_texture = null;
         }
+        if (self.pi_logo_texture) |cached| {
+            cached.deinit();
+            self.pi_logo_texture = null;
+        }
+        if (self.fx_logo_texture) |cached| {
+            cached.deinit();
+            self.fx_logo_texture = null;
+        }
+        if (self.grok_logo_texture) |cached| {
+            cached.deinit();
+            self.grok_logo_texture = null;
+        }
         if (self.thread_edit_texture) |cached| {
             cached.deinit();
             self.thread_edit_texture = null;
@@ -6613,6 +6788,9 @@ pub const AppState = struct {
             .opencode => self.opencode_logo_texture,
             .claude => self.claude_logo_texture,
             .cursor => self.cursor_logo_texture,
+            .pi => self.pi_logo_texture,
+            .fx => self.fx_logo_texture,
+            .grok => self.grok_logo_texture,
         };
     }
 
@@ -6665,6 +6843,11 @@ pub const AppState = struct {
                 .index = composerReasoningIndexForOptions(codexReasoningOptions(thread.model_ref), thread.reasoning_effort) orelse 0,
                 .count = codexReasoningOptions(thread.model_ref).len,
             },
+            // Pi accepts every Verde effort tag; rows mirror PI_REASONING_OPTIONS.
+            .pi => return .{
+                .index = composerReasoningIndexForOptions(PI_REASONING_OPTIONS[0..], thread.reasoning_effort) orelse 0,
+                .count = PI_REASONING_OPTIONS.len,
+            },
             .claude => {
                 const opt = self.claudeModelOptionForRef(thread.model_ref) orelse return null;
                 if (!opt.reasoning_supported) return null;
@@ -6705,6 +6888,13 @@ pub const AppState = struct {
                     }
                 }
                 return .{ .index = index, .count = values.len + 1 };
+            },
+            // fx exposes no reasoning levels.
+            .fx => return null,
+            // grok efforts stop at xhigh; rows mirror GROK_REASONING_OPTIONS.
+            .grok => return .{
+                .index = composerReasoningIndexForOptions(GROK_REASONING_OPTIONS[0..], thread.reasoning_effort) orelse 0,
+                .count = GROK_REASONING_OPTIONS.len,
             },
         }
     }
@@ -8352,17 +8542,22 @@ pub const AppState = struct {
                 return true;
             },
             .unknown => |unknown| {
-                if (thread.provider == .claude) {
+                // Claude and Grok resolve `/name` themselves (SDK commands,
+                // ACP available_commands incl. installed skills), so unknown
+                // names are forwarded rather than rejected.
+                if (thread.provider == .claude or thread.provider == .grok) {
+                    const provider_label = utils.providerLabel(thread.provider);
                     const command: ai_harness.ProviderSlashCommand = .{
                         .id = .custom,
                         .name = unknown.name,
-                        .summary = "Claude SDK slash command.",
+                        .summary = if (thread.provider == .grok) "Grok agent slash command." else "Claude SDK slash command.",
                         .usage = unknown.name,
                         .requires_thread = false,
                     };
                     self.beginProviderSlashCommand(command, unknown.args, raw_text) catch |err| {
-                        log.err("failed to start Claude slash command name_len={d}: {s}", .{ unknown.name.len, @errorName(err) });
-                        self.setSidebarNotice("Failed to start Claude slash command.");
+                        log.err("failed to start {s} slash command name_len={d}: {s}", .{ provider_label, unknown.name.len, @errorName(err) });
+                        var notice_buffer: [96]u8 = undefined;
+                        self.setSidebarNotice(std.fmt.bufPrint(&notice_buffer, "Failed to start {s} slash command.", .{provider_label}) catch "Failed to start slash command.");
                         return true;
                     };
                     return true;
@@ -9458,6 +9653,15 @@ pub const AppState = struct {
         if (self.cursor_model_options.items.len == 0) {
             self.refreshCursorModelOptionsCacheAsync();
         }
+        if (self.pi_model_options.items.len == 0) {
+            self.refreshPiModelOptionsCacheAsync();
+        }
+        if (self.fx_model_options.items.len == 0) {
+            self.refreshFxModelOptionsCacheAsync();
+        }
+        if (self.grok_model_options.items.len == 0) {
+            self.refreshGrokModelOptionsCacheAsync();
+        }
         self.closeRunConfigPopover();
         self.composer_controller.composer.active_menu = null;
         self.composer_controller.composer.hovered_menu_index = null;
@@ -9583,6 +9787,9 @@ pub const AppState = struct {
                 .handoff_provider_opencode,
                 .handoff_provider_claude,
                 .handoff_provider_cursor,
+                .handoff_provider_pi,
+                .handoff_provider_fx,
+                .handoff_provider_grok,
                 .handoff_context_summary,
                 .handoff_context_recent,
                 .handoff_context_full,
@@ -10372,7 +10579,8 @@ pub const AppState = struct {
         if (thread.provider == .codex) {
             return composerReasoningIndexForOptions(codexReasoningOptions(thread.model_ref), thread.reasoning_effort);
         }
-        if (thread.provider == .claude) {
+        // Claude, Pi, and Grok rows carry effort tag names as variants.
+        if (thread.provider == .claude or thread.provider == .pi or thread.provider == .grok) {
             const rows = self.opencode_reasoning_menu.items;
             for (rows, 0..) |row, i| {
                 if (thread.reasoning_effort == null and row.variant == null) return i;
@@ -10595,6 +10803,12 @@ pub const AppState = struct {
         runtime_log.diagnostic("AppState.deinit claude model cache finished", .{});
         self.finishCursorModelCacheThread();
         runtime_log.diagnostic("AppState.deinit cursor model cache finished", .{});
+        self.finishPiModelCacheThread();
+        runtime_log.diagnostic("AppState.deinit pi model cache finished", .{});
+        self.finishFxModelCacheThread();
+        runtime_log.diagnostic("AppState.deinit fx model cache finished", .{});
+        self.finishGrokModelCacheThread();
+        runtime_log.diagnostic("AppState.deinit grok model cache finished", .{});
         self.finishProviderReadinessThread();
         runtime_log.diagnostic("AppState.deinit provider readiness finished", .{});
         self.deinitBackgroundTaskPoller();
@@ -10657,10 +10871,16 @@ pub const AppState = struct {
         self.clearOpencodeModelOptions();
         self.clearClaudeModelOptions();
         self.clearCursorModelOptions();
+        self.clearPiModelOptions();
+        self.clearFxModelOptions();
+        self.clearGrokModelOptions();
         self.opencode_reasoning_menu.deinit(self.allocator);
         self.opencode_model_options.deinit(self.allocator);
         self.claude_model_options.deinit(self.allocator);
         self.cursor_model_options.deinit(self.allocator);
+        self.pi_model_options.deinit(self.allocator);
+        self.fx_model_options.deinit(self.allocator);
+        self.grok_model_options.deinit(self.allocator);
         if (self.settings_controller.chat_title_model) |model| self.allocator.free(model);
         if (self.settings_controller.new_chat_model) |model| self.allocator.free(model);
         self.app_config.deinit(self.allocator);
@@ -10768,6 +10988,9 @@ pub const AppState = struct {
     pub const pollOpencodeModelOptionsCache = provider_controller.pollOpencodeModelOptionsCache;
     pub const pollCursorModelOptionsCache = provider_controller.pollCursorModelOptionsCache;
     pub const pollClaudeModelOptionsCache = provider_controller.pollClaudeModelOptionsCache;
+    pub const pollPiModelOptionsCache = provider_controller.pollPiModelOptionsCache;
+    pub const pollFxModelOptionsCache = provider_controller.pollFxModelOptionsCache;
+    pub const pollGrokModelOptionsCache = provider_controller.pollGrokModelOptionsCache;
 
     /// Frame-loop entry point (main.zig calls this every frame): starts the
     /// M5-P4 change-cursor loop lazily (AppState.init returns by value, so
@@ -11212,6 +11435,9 @@ pub const AppState = struct {
     pub const finishOpencodeModelCacheThread = chat_controller.finishOpencodeModelCacheThread;
     pub const finishClaudeModelCacheThread = chat_controller.finishClaudeModelCacheThread;
     pub const finishCursorModelCacheThread = chat_controller.finishCursorModelCacheThread;
+    pub const finishPiModelCacheThread = chat_controller.finishPiModelCacheThread;
+    pub const finishFxModelCacheThread = chat_controller.finishFxModelCacheThread;
+    pub const finishGrokModelCacheThread = chat_controller.finishGrokModelCacheThread;
     pub const finishProviderReadinessThread = chat_controller.finishProviderReadinessThread;
     pub const finishAllSendThreads = chat_controller.finishAllSendThreads;
     pub const finishAllTitleGenerationThreads = chat_controller.finishAllTitleGenerationThreads;
@@ -12031,6 +12257,23 @@ fn importThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
             error.UnsupportedOperation => "Cursor CLI does not support thread imports in this version.",
             else => "Failed to load Cursor threads.",
         },
+        .pi => switch (err) {
+            error.FileNotFound => "The pi executable was not found on PATH.",
+            error.UnsupportedOperation => "This provider does not support thread imports.",
+            else => "Failed to load Pi threads.",
+        },
+        .fx => switch (err) {
+            error.FileNotFound => "The fx executable was not found on PATH.",
+            error.FxSignedOut => "FX is not authenticated. Run `fx login`.",
+            error.UnsupportedOperation => "FX does not support thread imports yet.",
+            else => "Failed to load FX threads.",
+        },
+        .grok => switch (err) {
+            error.FileNotFound => "The grok executable was not found on PATH.",
+            error.GrokSignedOut => "Grok is not authenticated. Run `grok login`.",
+            error.UnsupportedOperation => "Grok does not support thread imports yet.",
+            else => "Failed to load Grok threads.",
+        },
     };
 }
 
@@ -12067,6 +12310,26 @@ fn readThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
             error.MissingSessionId => "The selected Cursor thread could not be found.",
             error.UnsupportedOperation => "Cursor CLI does not support thread imports in this version.",
             else => "Failed to import the selected Cursor thread.",
+        },
+        .pi => switch (err) {
+            error.FileNotFound => "The pi executable was not found on PATH.",
+            error.MissingSessionId => "The selected Pi thread could not be found.",
+            error.UnsupportedOperation => "This provider does not support thread imports.",
+            else => "Failed to import the selected Pi thread.",
+        },
+        .fx => switch (err) {
+            error.FileNotFound => "The fx executable was not found on PATH.",
+            error.FxSignedOut => "FX is not authenticated. Run `fx login`.",
+            error.MissingSessionId => "The selected FX thread could not be found.",
+            error.UnsupportedOperation => "FX does not support thread imports yet.",
+            else => "Failed to import the selected FX thread.",
+        },
+        .grok => switch (err) {
+            error.FileNotFound => "The grok executable was not found on PATH.",
+            error.GrokSignedOut => "Grok is not authenticated. Run `grok login`.",
+            error.MissingSessionId => "The selected Grok thread could not be found.",
+            error.UnsupportedOperation => "Grok does not support thread imports yet.",
+            else => "Failed to import the selected Grok thread.",
         },
     };
 }
@@ -12152,6 +12415,23 @@ fn syncThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
             error.UnsupportedOperation => "Cursor CLI does not support thread sync in this version.",
             else => "Failed to sync the Cursor thread.",
         },
+        .pi => switch (err) {
+            error.FileNotFound => "The pi executable was not found on PATH.",
+            error.UnsupportedOperation => "This provider does not support thread sync.",
+            else => "Failed to sync the Pi thread.",
+        },
+        .fx => switch (err) {
+            error.FileNotFound => "The fx executable was not found on PATH.",
+            error.FxSignedOut => "FX is not authenticated. Run `fx login`.",
+            error.UnsupportedOperation => "FX does not support thread sync yet.",
+            else => "Failed to sync the FX thread.",
+        },
+        .grok => switch (err) {
+            error.FileNotFound => "The grok executable was not found on PATH.",
+            error.GrokSignedOut => "Grok is not authenticated. Run `grok login`.",
+            error.UnsupportedOperation => "Grok does not support thread sync yet.",
+            else => "Failed to sync the Grok thread.",
+        },
     };
 }
 
@@ -12161,6 +12441,9 @@ fn failedToStoreThreadListNotice(provider: Provider) []const u8 {
         .opencode => "Failed to store OpenCode thread list.",
         .claude => "Failed to store Claude thread list.",
         .cursor => "Failed to store Cursor thread list.",
+        .pi => "Failed to store Pi thread list.",
+        .fx => "Failed to store FX thread list.",
+        .grok => "Failed to store Grok thread list.",
     };
 }
 
@@ -12170,6 +12453,9 @@ fn noRecentThreadsNotice(provider: Provider) []const u8 {
         .opencode => "No recent OpenCode threads found.",
         .claude => "No recent Claude threads found.",
         .cursor => "No recent Cursor threads found.",
+        .pi => "No recent Pi threads found.",
+        .fx => "No recent FX threads found.",
+        .grok => "No recent Grok threads found.",
     };
 }
 
@@ -12179,6 +12465,9 @@ fn selectThreadNotice(provider: Provider) []const u8 {
         .opencode => "Select an OpenCode thread or paste a thread ID.",
         .claude => "Select a Claude thread or paste a thread ID.",
         .cursor => "Select a Cursor thread or paste a thread ID.",
+        .pi => "Select a Pi thread or paste a thread ID.",
+        .fx => "Select an FX thread or paste a thread ID.",
+        .grok => "Select a Grok thread or paste a thread ID.",
     };
 }
 
@@ -12188,6 +12477,9 @@ fn emptyThreadImportIdNotice(provider: Provider) []const u8 {
         .opencode => "Enter an OpenCode thread ID or select one from the list.",
         .claude => "Enter a Claude thread ID or select one from the list.",
         .cursor => "Enter a Cursor thread ID or select one from the list.",
+        .pi => "Enter a Pi thread ID or select one from the list.",
+        .fx => "Enter an FX thread ID or select one from the list.",
+        .grok => "Enter a Grok thread ID or select one from the list.",
     };
 }
 
@@ -12197,6 +12489,9 @@ fn duplicateThreadNotice(provider: Provider) []const u8 {
         .opencode => "OpenCode thread already exists in this workspace.",
         .claude => "Claude thread already exists in this workspace.",
         .cursor => "Cursor thread already exists in this workspace.",
+        .pi => "Pi thread already exists in this workspace.",
+        .fx => "FX thread already exists in this workspace.",
+        .grok => "Grok thread already exists in this workspace.",
     };
 }
 
@@ -12206,6 +12501,9 @@ fn failedCreateImportedThreadNotice(provider: Provider) []const u8 {
         .opencode => "Failed to create the imported thread.",
         .claude => "Failed to create the imported thread.",
         .cursor => "Failed to create the imported thread.",
+        .pi => "Failed to create the imported thread.",
+        .fx => "Failed to create the imported thread.",
+        .grok => "Failed to create the imported thread.",
     };
 }
 
@@ -12215,6 +12513,9 @@ fn failedAddImportedThreadNotice(provider: Provider) []const u8 {
         .opencode => "Failed to add the imported thread.",
         .claude => "Failed to add the imported thread.",
         .cursor => "Failed to add the imported thread.",
+        .pi => "Failed to add the imported thread.",
+        .fx => "Failed to add the imported thread.",
+        .grok => "Failed to add the imported thread.",
     };
 }
 
@@ -12224,6 +12525,9 @@ fn threadImportedNotice(provider: Provider) []const u8 {
         .opencode => "OpenCode thread imported.",
         .claude => "Claude thread imported.",
         .cursor => "Cursor thread imported.",
+        .pi => "Pi thread imported.",
+        .fx => "FX thread imported.",
+        .grok => "Grok thread imported.",
     };
 }
 
@@ -12233,6 +12537,9 @@ fn threadSyncedNotice(provider: Provider) []const u8 {
         .opencode => "Thread synced from OpenCode.",
         .claude => "Thread synced from Claude.",
         .cursor => "Thread synced from Cursor.",
+        .pi => "Thread synced from Pi.",
+        .fx => "Thread synced from FX.",
+        .grok => "Thread synced from Grok.",
     };
 }
 
@@ -12439,6 +12746,9 @@ test "GUI new-chat defaults apply configured provider model and reasoning" {
     state.project_controller.selected_index = 0;
     state.opencode_model_options = .empty;
     state.claude_model_options = .empty;
+    state.pi_model_options = .empty;
+    state.fx_model_options = .empty;
+    state.grok_model_options = .empty;
     state.cursor_model_options = .empty;
     defer {
         for (state.project_controller.projects.items) |*project| project.deinit(allocator);
@@ -12519,6 +12829,9 @@ test "provider-aware chat creation scopes mutation and rejects invalid models" {
     state.project_controller.selected_index = 0;
     state.opencode_model_options = .empty;
     state.claude_model_options = .empty;
+    state.pi_model_options = .empty;
+    state.fx_model_options = .empty;
+    state.grok_model_options = .empty;
     state.cursor_model_options = .empty;
     state.lifecycle.dirty = false;
     state.lifecycle.last_dirty_at_ms = 0;

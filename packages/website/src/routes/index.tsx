@@ -16,6 +16,8 @@ import openAiLogo from '../../../desktop/src/assets/OpenAI-white-monoblossom.png
 import claudeLogo from '../../../desktop/src/assets/claude-logo.png'
 import opencodeLogo from '../../../desktop/src/assets/opencode-logo-dark.png'
 import cursorLogo from '../../../desktop/src/assets/editor_logos/cursor.png'
+import piLogo from '../../../desktop/src/assets/pi-logo.png'
+import fxLogo from '../../../desktop/src/assets/fx-logo.png'
 import ampLogo from '../../../desktop/src/assets/amp-logo.png'
 import grokLogo from '../../../desktop/src/assets/grok-logo.png'
 import verdeLogoMask from '../../../desktop/src/assets/verde_logo_mask.png'
@@ -101,10 +103,22 @@ const providers = [
     blurb: 'Speaks to the Cursor CLI ACP server (agent acp) on your machine.',
   },
   {
+    name: 'Pi',
+    logo: piLogo,
+    modes: ['gui', 'tui'],
+    blurb: 'Drives the pi CLI in RPC mode (pi --mode rpc) for native chat, and also launches its terminal TUI.',
+  },
+  {
+    name: 'FX',
+    logo: fxLogo,
+    modes: ['gui', 'tui'],
+    blurb: 'Speaks ACP to the fx CLI (fx acp) for native chat, and also launches its terminal TUI.',
+  },
+  {
     name: 'Grok Build',
     logo: grokLogo,
-    modes: ['tui'],
-    blurb: 'Launches the grok CLI as a terminal TUI, with personal hooks for live status pips.',
+    modes: ['gui', 'tui'],
+    blurb: 'Speaks ACP to the grok CLI (grok agent stdio), and also launches its terminal TUI.',
   },
   {
     name: 'Amp',
@@ -222,7 +236,7 @@ const faqs = [
   {
     question: 'Which coding agents does Verde support?',
     answer:
-      'Verde supports Codex, Claude Code, OpenCode, and Cursor in native GUI chat panes or terminal TUI panes. Grok Build and Amp run in terminal TUI panes.',
+      'Verde supports Codex, Claude Code, OpenCode, Cursor, Pi, FX, and Grok Build in native GUI chat panes. Codex, Claude Code, OpenCode, Cursor, Pi, FX, Grok Build, and Amp also run as terminal TUIs.',
   },
   {
     question: 'Does Verde host models or relay prompts?',
@@ -353,11 +367,12 @@ function App() {
               <span class="display-accent">One tiling window.</span>
             </h1>
             <p class="lead">
-              Verde runs Codex, Claude Code, OpenCode, and Cursor as native
-              chat or terminal panes, with Grok Build and Amp terminal TUIs in
-              the same native desktop app. Tile or Niri-style scroll chat,
-              terminal, and browser panes with vim keybinds. No hosted relay —
-              Verde just talks to the CLIs already on your machine.
+              Verde runs Codex, Claude Code, OpenCode, Cursor, Pi, FX, and
+              Grok Build as native chat or terminal TUI panes, with Amp as a
+              terminal TUI in the same native desktop app.
+              Tile or Niri-style scroll chat, terminal, and browser panes with
+              vim keybinds. No hosted relay — Verde just talks to the CLIs
+              already on your machine.
             </p>
 
             <div class="hero-actions">
@@ -432,12 +447,12 @@ function App() {
             </For>
           </div>
           <p class="providers-note">
-            Codex, Claude Code, OpenCode, and Cursor can run inside an embedded
-            Ghostty terminal pane or drive Verde's native chat panes. Grok Build
-            and Amp run as terminal TUIs. Either way, Verde doesn't host a model
-            or run inference — it drives the provider CLIs already installed on
-            your machine, so your tokens, transcripts, and project files never
-            leave it.
+            Codex, Claude Code, OpenCode, Cursor, Pi, FX, and Grok Build can
+            run inside an embedded Ghostty terminal pane or drive Verde's native
+            chat panes. Amp is a terminal TUI.
+            Either way, Verde doesn't host a model or run inference — it drives
+            the provider CLIs already installed on your machine, so your tokens,
+            transcripts, and project files never leave it.
           </p>
         </div>
       </section>
@@ -879,7 +894,8 @@ function App() {
               Windows installs without administrator access and creates a Start
               Menu shortcut. Then install and authenticate at least one provider CLI —{' '}
               <code>codex login</code>, Claude Code, <code>opencode</code>,{' '}
-              <code>agent login</code> for Cursor, <code>grok</code>, or{' '}
+              <code>agent login</code> for Cursor, <code>pi</code>,{' '}
+              <code>fx login</code>, <code>grok login</code>, or{' '}
               <code>amp</code>.
             </p>
           </article>

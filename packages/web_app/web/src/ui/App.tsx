@@ -4,6 +4,7 @@ import { store } from '../lib/store'
 import { FileViewer } from './FileViewer'
 import { Icon } from './Icons'
 import { Palette, Settings, WorkspaceDialog } from './Overlays'
+import { PrefixBar } from './PrefixBar'
 import { PaneActionsButton, Sidebar } from './Sidebar'
 import { WorkspaceCanvas } from './WorkspaceCanvas'
 
@@ -38,7 +39,7 @@ export function App() {
         </div>
       </Show>
 
-      <div class="flex min-w-0 flex-1 flex-col overflow-hidden">
+      <div class="relative flex min-w-0 flex-1 flex-col overflow-hidden">
         <div class="flex h-11 shrink-0 items-center gap-2 border-b border-[var(--border-muted)] bg-[var(--panel)] px-2 lg:hidden">
           <button
             type="button"
@@ -60,6 +61,7 @@ export function App() {
         </div>
 
         <WorkspaceCanvas />
+        <PrefixBar />
       </div>
 
       <Palette />

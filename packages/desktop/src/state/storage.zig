@@ -594,22 +594,27 @@ pub const Storage = struct {
         self.noteStoreRevision(result.store_revision);
     }
 
-    pub fn clearChatCompletion(self: *const Storage, workspace_id: []const u8, local_thread_id: []const u8) !bool {
+    pub fn clearChatCompletion(self: *const Storage, workspace_id: []const u8, local_thread_id: []const u8, completed_at_ms: i64) !bool {
         try self.ensureGranularMutationAllowed();
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const pair: struct { []const u8, []const u8 } = .{ workspace_id, local_thread_id };
+        const completion: PersistedChatCompletion = .{
+            .workspace_id = workspace_id,
+            .local_thread_id = local_thread_id,
+            .completed_at_ms = completed_at_ms,
+        };
         const result = try self.withAcknowledgementClientRetry(a, "notification.chatCompletion.clear", struct {
-            fn call(storage: *const Storage, arena_inner: std.mem.Allocator, op: []const u8, client_id: []const u8, expected: u64, ids: struct { []const u8, []const u8 }) !headless.store.WriteResult {
+            fn call(storage: *const Storage, arena_inner: std.mem.Allocator, op: []const u8, client_id: []const u8, expected: u64, acknowledged: PersistedChatCompletion) !headless.store.WriteResult {
                 const req: headless.store.NotificationChatCompletionClearRequest = .{
                     .mutation = .{
                         .request_key = try storage.nextRequestKey(arena_inner, op),
                         .expected_store_revision = if (expected == 0) null else expected,
                         .client_id = client_id,
                     },
-                    .workspace_id = ids[0],
-                    .local_thread_id = ids[1],
+                    .workspace_id = acknowledged.workspace_id,
+                    .local_thread_id = acknowledged.local_thread_id,
+                    .completed_at_ms = acknowledged.completed_at_ms,
                 };
                 return storage.callStoreMutationAllowConflictWithTimeout(
                     headless.store.METHOD_NOTIFICATION_CHAT_COMPLETION_CLEAR,
@@ -618,7 +623,7 @@ pub const Storage = struct {
                     false,
                 );
             }
-        }.call, pair);
+        }.call, completion);
         self.noteStoreRevision(result.store_revision);
         return result.applied;
     }

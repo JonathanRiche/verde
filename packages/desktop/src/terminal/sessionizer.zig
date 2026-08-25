@@ -1936,6 +1936,9 @@ pub const Daemon = struct {
     sessions: std.ArrayList(*PtySession) = .empty,
     chat_turns: std.ArrayList(*ChatTurn) = .empty,
     mutex: ParkingMutex = .{},
+    /// Serializes verde.json snapshots and web-originated favorite updates.
+    /// It is independent of lockDaemon so filesystem I/O never delays chat.
+    config_mutex: ParkingMutex = .{},
     idle_since_ms: ?i64 = null,
     /// null = persistent (no idle exit). Tests set VERDE_SESSION_DAEMON_IDLE_EXIT_MS.
     idle_exit_ms: ?i64 = null,
@@ -2378,6 +2381,7 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, "chat.turn.cancel")) return try self.chatTurnCancelResponse(id_value, params);
         if (std.mem.eql(u8, method, "chat.turn.consume")) return try self.chatTurnConsumeResponse(id_value, params);
         if (std.mem.eql(u8, method, "provider.models.list")) return try self.providerModelsListResponse(id_value, params);
+        if (std.mem.eql(u8, method, store_protocol.METHOD_CONFIG_FAVORITE_MODEL_SET)) return try self.configFavoriteModelSetResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_WORKSPACE_RESOLVE)) return try self.workspaceResolveResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_PROCESS_LIST)) return try self.processListResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_PROCESS_INSPECT)) return try self.processInspectResponse(id_value, params);
@@ -3073,7 +3077,7 @@ pub const Daemon = struct {
             try writeRawFragment(&s, turns_json);
             if (include_config) {
                 try s.objectField("config");
-                try writeConfigSnapshot(&s, self.allocator);
+                try writeConfigSnapshot(&s, self);
             }
             try s.objectField("incomplete_scopes");
             try s.beginArray();
@@ -5152,7 +5156,8 @@ pub const Daemon = struct {
         return try okValueResponse(self.allocator, id_value, .{ .accepted = true });
     }
 
-    /// Inject a Claude follow-up into the exact SDK bridge owned by this daemon.
+    /// Inject a Claude/Pi follow-up into the exact provider process owned by
+    /// this daemon.
     /// The provider call runs outside lockDaemon; only stable request identity is
     /// copied while the turn is borrowed.
     fn chatTurnSteerResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
@@ -5176,7 +5181,8 @@ pub const Daemon = struct {
             return try errorResponseAlloc(self.allocator, id_value, "not_found", "turn not found");
         };
         lockTurn(turn);
-        if (turn.request.provider != .claude or turn.request.harness_kind != .local_cli) {
+        const steer_provider = turn.request.provider;
+        if ((steer_provider != .claude and steer_provider != .pi) or turn.request.harness_kind != .local_cli) {
             turn.mutex.unlock();
             self.mutex.unlock();
             return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "provider does not support daemon steering");
@@ -5207,8 +5213,12 @@ pub const Daemon = struct {
         defer self.allocator.free(owned_provider_thread_id);
         defer self.allocator.free(owned_project_path);
 
-        var client = harness.connect(self.allocator, .{ .claude = .{ .cwd = owned_project_path } }) catch {
-            return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "Claude bridge is unavailable");
+        const steer_config: harness.ProviderConfig = switch (steer_provider) {
+            .pi => .{ .pi = .{ .cwd = owned_project_path } },
+            else => .{ .claude = .{ .cwd = owned_project_path } },
+        };
+        var client = harness.connect(self.allocator, steer_config) catch {
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "provider bridge is unavailable");
         };
         defer client.deinit();
         const images = try self.allocator.alloc(harness.types.ImageAttachment, image_paths.len);
@@ -5220,7 +5230,7 @@ pub const Daemon = struct {
             .prompt = prompt,
             .images = images,
         }) catch {
-            return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "Claude could not accept steering for this turn");
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "provider could not accept steering for this turn");
         };
         return try okValueResponse(self.allocator, id_value, .{ .accepted = true });
     }
@@ -5341,6 +5351,44 @@ pub const Daemon = struct {
         return try okValueResponse(self.allocator, id_value, .{
             .provider = provider_name,
             .models = models,
+        });
+    }
+
+    /// Persist one web composer favorite into the same verde.json collection
+    /// used by the desktop model picker. The requested final state makes the
+    /// mutation safe to retry and lets rapid web taps serialize cleanly.
+    fn configFavoriteModelSetResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        var parsed = parseDaemonParams(store_protocol.ConfigFavoriteModelSetRequest, self.allocator, params) catch {
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "invalid favorite model settings");
+        };
+        defer parsed.deinit();
+        const request = parsed.value;
+        const provider = app_config.ChatProvider.parse(request.provider) orelse
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "unknown provider");
+        const model = std.mem.trim(u8, request.model, " \t\r\n");
+        if (model.len == 0 or model.len > 512) {
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "invalid model reference");
+        }
+
+        self.config_mutex.lock();
+        defer self.config_mutex.unlock();
+        var config = app_config.loadAppConfig(self.allocator) catch |err| {
+            return try errorResponseAlloc(self.allocator, id_value, "config_unavailable", @errorName(err));
+        };
+        defer config.deinit(self.allocator);
+        const current = config.isFavoriteModel(provider, model);
+        if (current != request.favorite) {
+            _ = config.toggleFavoriteModel(self.allocator, provider, model) catch |err| {
+                return try errorResponseAlloc(self.allocator, id_value, "config_unavailable", @errorName(err));
+            };
+            app_config.saveAppConfig(self.allocator, &config) catch |err| {
+                return try errorResponseAlloc(self.allocator, id_value, "config_unavailable", @errorName(err));
+            };
+        }
+        return try okValueResponse(self.allocator, id_value, store_protocol.ConfigFavoriteModelSetResult{
+            .provider = @tagName(provider),
+            .model = model,
+            .favorite = request.favorite,
         });
     }
 
@@ -7287,6 +7335,9 @@ fn providerNameFromCode(code: i64) []const u8 {
         1 => "codex",
         2 => "cursor",
         3 => "claude",
+        4 => "pi",
+        5 => "fx",
+        6 => "grok",
         else => "opencode",
     };
 }
@@ -7385,30 +7436,48 @@ fn writeRawFragment(s: *std.json.Stringify, fragment: []const u8) !void {
     s.endWriteRaw();
 }
 
-fn configSnapshotFromApp(config: *const app_config.AppConfig) store_protocol.ConfigSnapshot {
+fn configSnapshotFromApp(allocator: std.mem.Allocator, config: *const app_config.AppConfig) !store_protocol.ConfigSnapshot {
+    const favorites = try allocator.alloc(store_protocol.ConfigFavoriteModel, config.favorite_models.len);
+    for (config.favorite_models, favorites) |favorite, *snapshot| {
+        snapshot.* = .{
+            .provider = @tagName(favorite.provider),
+            .model = favorite.model,
+        };
+    }
     return .{
         .ui = .{
             .workspace_pane_gap = config.workspace_pane_gap,
             .workspace_panes_per_view = config.workspace_panes_per_view,
+            .workspace_split_default_pane = @tagName(config.workspace_split_default_pane),
             .workspace_scroll_direction = @tagName(config.workspace_scroll_direction),
             .workspace_scroll_mode = @tagName(config.workspace_scroll_mode),
             .workspace_scroll_threshold = config.workspace_scroll_threshold,
             .unzoom_on_pane_navigation = config.unzoom_on_pane_navigation,
             .reduced_motion = config.reduced_motion,
         },
+        .chat = .{ .favorite_models = favorites },
     };
 }
 
 /// Load verde.json off the daemon lock and project the client-visible UI
 /// slice. Missing or unreadable files fall back to AppConfig defaults so a
 /// detached UI still gets a coherent strip instead of omitting the field.
-fn writeConfigSnapshot(s: *std.json.Stringify, allocator: std.mem.Allocator) !void {
-    var config = app_config.loadAppConfig(allocator) catch {
+fn writeConfigSnapshot(s: *std.json.Stringify, daemon: *Daemon) !void {
+    daemon.config_mutex.lock();
+    defer daemon.config_mutex.unlock();
+    var config = app_config.loadAppConfig(daemon.allocator) catch {
         try s.write(store_protocol.ConfigSnapshot{});
         return;
     };
-    defer config.deinit(allocator);
-    try s.write(configSnapshotFromApp(&config));
+    defer config.deinit(daemon.allocator);
+    var snapshot = try configSnapshotFromApp(daemon.allocator, &config);
+    defer daemon.allocator.free(snapshot.chat.favorite_models);
+    var root = app_config.readRootValue(daemon.allocator) catch null;
+    defer if (root) |*parsed| parsed.deinit();
+    if (root) |parsed| {
+        if (parsed.value == .object) snapshot.keybinds = parsed.value.object.get("keybinds") orelse .null;
+    }
+    try s.write(snapshot);
 }
 
 /// Serialize the registry envelope object into an arena string. Caller holds
@@ -7545,8 +7614,8 @@ test "incomplete scope policy pins both chat-authority arms" {
     try std.testing.expect(CHAT_AUTHORITY_LANDED);
 }
 
-test "config snapshot projects workspace strip settings" {
-    const config: app_config.AppConfig = .{
+test "config snapshot projects workspace strip settings and model favorites" {
+    var config: app_config.AppConfig = .{
         .workspace_pane_gap = 8.0,
         .workspace_panes_per_view = 1,
         .workspace_scroll_direction = .vertical,
@@ -7555,7 +7624,10 @@ test "config snapshot projects workspace strip settings" {
         .unzoom_on_pane_navigation = true,
         .reduced_motion = true,
     };
-    const snapshot = configSnapshotFromApp(&config);
+    defer config.deinit(std.testing.allocator);
+    try std.testing.expect(try config.toggleFavoriteModel(std.testing.allocator, .claude, "claude-opus-4-1"));
+    const snapshot = try configSnapshotFromApp(std.testing.allocator, &config);
+    defer std.testing.allocator.free(snapshot.chat.favorite_models);
     try std.testing.expectEqual(@as(f32, 8.0), snapshot.ui.workspace_pane_gap);
     try std.testing.expectEqual(@as(u8, 1), snapshot.ui.workspace_panes_per_view);
     try std.testing.expectEqualStrings("vertical", snapshot.ui.workspace_scroll_direction);
@@ -7563,6 +7635,9 @@ test "config snapshot projects workspace strip settings" {
     try std.testing.expectEqual(@as(u8, 4), snapshot.ui.workspace_scroll_threshold);
     try std.testing.expect(snapshot.ui.unzoom_on_pane_navigation);
     try std.testing.expect(snapshot.ui.reduced_motion);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.chat.favorite_models.len);
+    try std.testing.expectEqualStrings("claude", snapshot.chat.favorite_models[0].provider);
+    try std.testing.expectEqualStrings("claude-opus-4-1", snapshot.chat.favorite_models[0].model);
 }
 
 test "registry bump topics map onto the frozen journal topic set" {
@@ -8006,7 +8081,9 @@ fn methodRunsUnlocked(method: []const u8) bool {
         std.mem.eql(u8, method, "chat.followup") or
         // Read-only provider discovery can block for seconds on provider
         // CLIs/servers; it touches no daemon state, so never hold lockDaemon.
-        std.mem.eql(u8, method, "provider.models.list");
+        std.mem.eql(u8, method, "provider.models.list") or
+        // Shared config writes have their own leaf lock and filesystem I/O.
+        std.mem.eql(u8, method, store_protocol.METHOD_CONFIG_FAVORITE_MODEL_SET);
 }
 
 fn classifyServerRequest(allocator: std.mem.Allocator, request: []const u8) !ServerRequestClass {
@@ -11841,6 +11918,7 @@ test "draining dispatcher rejects every state mutator" {
         "surface.clear",
         "notification.chatCompletion.upsert",
         "notification.chatCompletion.clear",
+        "config.favoriteModel.set",
     };
     for (methods, 0..) |method, index| {
         const request = try std.fmt.allocPrint(

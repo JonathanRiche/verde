@@ -1,6 +1,6 @@
 import { For, Show, createMemo, createResource, createSignal } from 'solid-js'
 
-import { unwrapResult } from '../lib/live'
+import { fetchRpc, unwrapResult } from '../lib/live'
 import { store } from '../lib/store'
 import { loadTheme } from '../lib/theme'
 
@@ -166,7 +166,9 @@ export function WorkspaceDialog() {
     setBrowserLoading(true)
     setBrowserError(null)
     try {
-      const response = await store.client.call('web.directory.list', { path: target })
+      // HTTP on purpose: the shared websocket answers RPCs serially, so this
+      // interactive browse must not queue behind a background projection sweep.
+      const response = await fetchRpc('web.directory.list', { path: target })
       if (response.error || response.ok === false) {
         setBrowserError(response.error?.message ?? 'could not list directory')
         return

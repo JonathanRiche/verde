@@ -3690,6 +3690,9 @@ fn streamAuthorLabel(provider: app_state.Provider) []const u8 {
         .opencode => "OpenCode",
         .claude => "Claude",
         .cursor => "Cursor",
+        .pi => "Pi",
+        .fx => "FX",
+        .grok => "Grok",
     };
 }
 
