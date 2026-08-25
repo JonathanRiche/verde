@@ -35,6 +35,7 @@ const BROWSER_TOOLBAR_RIGHT_RESERVE_CSS: f32 = PANE_CHROME_CONTROL_SIZE_CSS + PA
 const ZOOM_ICON_SIZE_CSS: f32 = 17.0;
 const TERMINAL_ZOOM_HOVER_WIDTH_CSS: f32 = 112.0;
 const TERMINAL_ZOOM_HOVER_HEIGHT_CSS: f32 = 48.0;
+const INACTIVE_BORDER_WIDTH_CSS: f32 = 1.0;
 const FOCUS_BORDER_WIDTH_CSS: f32 = 2.0;
 const ZOOM_BORDER_WIDTH_CSS: f32 = 3.0;
 const STATUS_BORDER_WIDTH_CSS: f32 = 3.0;
@@ -832,6 +833,17 @@ fn focusBorderAlpha(pane_id: runtime.WorkspacePaneId) f32 {
     if (focus_curr_id) |id| if (id == pane_id) return ease;
     if (focus_prev_id) |id| if (id == pane_id) return 1.0 - ease;
     return 0.0;
+}
+
+fn paneUsesRestingBorder(is_root_pane: bool, visible_pane_count: usize, maximized: bool) bool {
+    return is_root_pane and visible_pane_count > 1 and !maximized;
+}
+
+test "resting pane borders appear only throughout tiled layouts" {
+    try std.testing.expect(paneUsesRestingBorder(true, 2, false));
+    try std.testing.expect(!paneUsesRestingBorder(true, 1, false));
+    try std.testing.expect(!paneUsesRestingBorder(true, 2, true));
+    try std.testing.expect(!paneUsesRestingBorder(false, 2, false));
 }
 
 /// Renders workspace panes with transcript geometry matching the visible pane.
@@ -2508,6 +2520,10 @@ fn renderLeafWithin(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, 
         renderPaneOverlay(state, pane_id, header_rect);
     }
     renderZoomControl(state, pane_id, kind, rect, header_h, maximized);
+    const layout = &state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout;
+    if (paneUsesRestingBorder(layout.rootContainsPane(pane_id), layout.visiblePaneCount(), maximized)) {
+        queueBorder(state, rect, paletteColor(theme.borderMuted()), 0.0, theme.scaledUi(INACTIVE_BORDER_WIDTH_CSS));
+    }
     // Pane status frame. Live agent states intentionally override the ordinary
     // focus/unfocused and zoom colors so they remain legible in tiled and
     // maximized layouts without tinting the pane's content.
