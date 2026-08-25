@@ -2084,10 +2084,11 @@ fn scrollingGroupResolvedExtent(
     ui_scale: f32,
 ) f32 {
     const resolved = scrollingPaneResolvedExtent(pane, default_extent, viewport_extent, gap, ui_scale);
-    // A nested tile group must occupy at least one responsive scroll slot.
-    // Otherwise an extent inherited from the pane before it was split can
-    // leave the next group peeking into view after moving to a narrower screen.
-    if (layout.scrollGroupPaneCount(group_id) > 1) return @max(resolved, default_extent);
+    // A nested or collapsed tile group must occupy at least one responsive
+    // scroll slot. Otherwise an extent inherited before the split can shrink
+    // the survivor as soon as its sibling closes or the viewport narrows.
+    const is_tiled_group = pane.scroll_group_id != null or layout.scrollGroupPaneCount(group_id) > 1;
+    if (is_tiled_group) return @max(resolved, default_extent);
     return resolved;
 }
 
@@ -3400,6 +3401,16 @@ test "scrolling strip collects a tiled group as one item" {
 
     try std.testing.expectEqual(@as(?usize, 0), scrollGroupIndexForPane(&layout, tiled_pane_id));
     try std.testing.expectEqual(@as(?usize, 1), scrollGroupIndexForPane(&layout, standalone_pane_id));
+
+    // Closing one child leaves the survivor tagged with the tile-group id;
+    // it must continue filling the responsive slot instead of shrinking.
+    try std.testing.expect(layout.setPaneScrollExtent(1, 640.0, 0.5));
+    _ = layout.closePane(allocator, tiled_pane_id) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 1), layout.scrollGroupPaneCount(1));
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, 1), layout.paneById(1).?.scroll_group_id);
+    const collapsed_count = collectScrollingGroups(&layout, &group_ids, &representative_ids);
+    resolveScrollingGroupExtents(&layout, group_ids[0..collapsed_count], representative_ids[0..collapsed_count], 900.0, 900.0, 12.0, 1.0, extents[0..collapsed_count]);
+    try std.testing.expectApproxEqAbs(@as(f32, 900.0), extents[0], 0.0001);
 }
 
 test "scrolling grow keys follow the strip axis" {
