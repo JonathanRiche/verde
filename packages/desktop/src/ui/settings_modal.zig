@@ -1326,7 +1326,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         .y = layout.workspace_pane_gap_hint_y,
         .w = layout.workspace_card.w - m.card_pad * 2.0,
         .h = m.label_h,
-    }, "Scrolling gaps plus margins around and between tiles; zoom stays edge-to-edge", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
+    }, "Margins and gaps for multi-pane scrolling and tiles; zoom stays edge-to-edge", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
     drawStepperRow(state, layout.workspace_card, m, layout.workspace_panes_per_view_dec.y, "Panes per view", @floatFromInt(state.settings_controller.draft.workspace_panes_per_view), @floatFromInt(app_config.MIN_WORKSPACE_PANES_PER_VIEW), @floatFromInt(app_config.MAX_WORKSPACE_PANES_PER_VIEW), .workspace_panes_per_view_dec, .workspace_panes_per_view_inc, layout.workspace_panes_per_view_dec, layout.workspace_panes_per_view_inc, layout.body_clip);
     const custom_scrolling_width = state.project_controller.selected_index < state.project_controller.projects.items.len and
         state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout.hasCustomScrollPaneExtent();

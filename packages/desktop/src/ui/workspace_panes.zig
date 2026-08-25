@@ -661,6 +661,7 @@ fn growScrollingPaneInDirection(
     const focused_pane_id = layout.focused_pane_id orelse return false;
     if (!layout.rootContainsPane(focused_pane_id)) return false;
     const group_id = layout.scrollGroupIdForPane(focused_pane_id) orelse return false;
+    if (layout.scrollGroupPaneCount(group_id) > 1) return false;
     var extent_pane_id = focused_pane_id;
     var pane = layout.paneById(focused_pane_id) orelse return false;
     var chose_default = false;
@@ -679,8 +680,12 @@ fn growScrollingPaneInDirection(
     }
 
     const vertical = state.app_config.workspace_scroll_direction == .vertical;
-    const viewport_extent = if (vertical) last_workspace_rect.h else last_workspace_rect.w;
     const gap = theme.scaledUi(state.app_config.workspace_pane_gap);
+    var group_ids: [MAX_WORKSPACE_PANE_RECTS]runtime.WorkspacePaneId = undefined;
+    var representative_pane_ids: [MAX_WORKSPACE_PANE_RECTS]runtime.WorkspacePaneId = undefined;
+    const group_count = collectScrollingGroups(layout, &group_ids, &representative_pane_ids);
+    const raw_viewport_extent = if (vertical) last_workspace_rect.h else last_workspace_rect.w;
+    const viewport_extent = scrollingViewportExtent(raw_viewport_extent, gap, group_count, state.app_config.workspace_panes_per_view);
     const ui_scale = theme.uiScaleFactor();
     const default_extent = responsiveScrollingPaneExtent(
         @max(viewport_extent, 1.0),
@@ -1534,7 +1539,13 @@ fn renderScrollingStrip(
     }
 
     const gap = theme.scaledUi(state.app_config.workspace_pane_gap);
-    const viewport_extent = if (vertical) workspace.h else workspace.w;
+    var group_ids: [MAX_WORKSPACE_PANE_RECTS]runtime.WorkspacePaneId = undefined;
+    var representative_pane_ids: [MAX_WORKSPACE_PANE_RECTS]runtime.WorkspacePaneId = undefined;
+    const pane_count = collectScrollingGroups(layout, &group_ids, &representative_pane_ids);
+    const viewport = scrollingViewportRect(workspace, gap, pane_count, state.app_config.workspace_panes_per_view);
+    const target_viewport_width = scrollingViewportExtent(target_workspace_width, gap, pane_count, state.app_config.workspace_panes_per_view);
+    const viewport_has_margins = scrollingViewportUsesMargins(pane_count, state.app_config.workspace_panes_per_view);
+    const viewport_extent = if (vertical) viewport.h else viewport.w;
     const default_extent = responsiveScrollingPaneExtent(
         viewport_extent,
         gap,
@@ -1543,9 +1554,6 @@ fn renderScrollingStrip(
         layout.scroll_pane_extent_ratio_override,
         theme.uiScaleFactor(),
     );
-    var group_ids: [MAX_WORKSPACE_PANE_RECTS]runtime.WorkspacePaneId = undefined;
-    var representative_pane_ids: [MAX_WORKSPACE_PANE_RECTS]runtime.WorkspacePaneId = undefined;
-    const pane_count = collectScrollingGroups(layout, &group_ids, &representative_pane_ids);
     var extents: [MAX_WORKSPACE_PANE_RECTS]f32 = undefined;
     resolveScrollingGroupExtents(
         layout,
@@ -1557,7 +1565,7 @@ fn renderScrollingStrip(
         theme.uiScaleFactor(),
         extents[0..pane_count],
     );
-    const target_viewport_extent = if (vertical) workspace.h else target_workspace_width;
+    const target_viewport_extent = if (vertical) viewport.h else target_viewport_width;
     const target_default_extent = responsiveScrollingPaneExtent(
         target_viewport_extent,
         gap,
@@ -1640,7 +1648,7 @@ fn renderScrollingStrip(
     for (group_ids[0..pane_count], 0..) |group_id, pane_index| {
         const pane_extent = extents[pane_index];
         const target_pane_width = if (vertical)
-            target_workspace_width
+            target_viewport_width
         else
             target_extents[pane_index];
         renderScrollingGroup(
@@ -1649,7 +1657,7 @@ fn renderScrollingStrip(
             root,
             group_id,
             representative_pane_ids[pane_index],
-            workspace,
+            viewport,
             direction,
             origin,
             pane_extent,
@@ -1657,12 +1665,13 @@ fn renderScrollingStrip(
             gap,
             offset.*,
             pane_index,
+            viewport_has_margins,
         );
         origin += pane_extent + gap;
     }
-    clipWorkspaceBatch(state, command_start, text_run_start, workspace);
-    clipWorkspaceHitCaches(workspace);
-    renderScrollingEdgeNavigation(state, layout, workspace, direction, pane_count);
+    clipWorkspaceBatch(state, command_start, text_run_start, viewport);
+    clipWorkspaceHitCaches(viewport);
+    renderScrollingEdgeNavigation(state, layout, viewport, direction, pane_count);
 }
 
 const ScrollingEdgeAvailability = struct {
@@ -1820,6 +1829,7 @@ fn renderScrollingGroup(
     gap: f32,
     offset: f32,
     pane_index: usize,
+    viewport_has_margins: bool,
 ) void {
     const screen_origin = origin - offset;
     const rect: palette.Rect = switch (direction) {
@@ -1828,19 +1838,21 @@ fn renderScrollingGroup(
     };
     if (intersectRects(rect, workspace) == null) return;
     const pane_count = layout.scrollGroupPaneCount(group_id);
+    const content_pane_count = if (viewport_has_margins) @as(usize, 1) else pane_count;
     renderScrollGroupNode(
         state,
         layout,
         root,
         group_id,
-        tiledContentRect(rect, gap, pane_count),
-        tiledContentExtent(target_pane_width, gap, pane_count),
+        tiledContentRect(rect, gap, content_pane_count),
+        tiledContentExtent(target_pane_width, gap, content_pane_count),
     );
     const gutter: palette.Rect = switch (direction) {
         .horizontal => .{ .x = rect.x + rect.w, .y = workspace.y, .w = gap, .h = workspace.h },
         .vertical => .{ .x = workspace.x, .y = rect.y + rect.h, .w = workspace.w, .h = gap },
     };
     if (intersectRects(gutter, workspace) != null) queueRect(state, gutter, paletteColor(theme.background()));
+    if (pane_count > 1) return;
     const grip_extent = theme.scaledUi(10.0);
     const axis: runtime.WorkspaceSplitAxis = if (direction == .horizontal) .vertical else .horizontal;
     // Leading grip stays inside this pane so it resizes the pane the pointer
@@ -2018,6 +2030,20 @@ fn scrollingPaneExtent(viewport_extent: f32, gap: f32, panes_per_view: u8) f32 {
     return @max((viewport_extent - gap * (count - 1.0)) / count, 1.0);
 }
 
+fn scrollingViewportUsesMargins(group_count: usize, panes_per_view: u8) bool {
+    return group_count > 1 and panes_per_view > 1;
+}
+
+fn scrollingViewportExtent(extent: f32, gap: f32, group_count: usize, panes_per_view: u8) f32 {
+    if (!scrollingViewportUsesMargins(group_count, panes_per_view)) return extent;
+    return tiledContentExtent(extent, gap, 2);
+}
+
+fn scrollingViewportRect(rect: palette.Rect, gap: f32, group_count: usize, panes_per_view: u8) palette.Rect {
+    if (!scrollingViewportUsesMargins(group_count, panes_per_view)) return rect;
+    return tiledContentRect(rect, gap, 2);
+}
+
 fn responsiveScrollingPaneExtent(
     viewport_extent: f32,
     gap: f32,
@@ -2116,13 +2142,11 @@ fn scrollingGroupResolvedExtent(
     gap: f32,
     ui_scale: f32,
 ) f32 {
-    const resolved = scrollingPaneResolvedExtent(pane, default_extent, viewport_extent, gap, ui_scale);
-    // A nested or collapsed tile group must occupy at least one responsive
-    // scroll slot. Otherwise an extent inherited before the split can shrink
-    // the survivor as soon as its sibling closes or the viewport narrows.
-    const is_tiled_group = pane.scroll_group_id != null or layout.scrollGroupPaneCount(group_id) > 1;
-    if (is_tiled_group) return @max(resolved, default_extent);
-    return resolved;
+    // A live tile group owns the full scrolling viewport so its internal split
+    // tree has the same usable area as an ordinary tiled workspace. As soon as
+    // only one leaf remains, its normal scrolling extent applies again.
+    if (layout.scrollGroupPaneCount(group_id) > 1) return @max(viewport_extent, 1.0);
+    return scrollingPaneResolvedExtent(pane, default_extent, viewport_extent, gap, ui_scale);
 }
 
 fn scrollingPaneResolvedExtent(
@@ -3181,23 +3205,24 @@ test "sidebar horizontal render preserves visible activation and minimally revea
     renderAt(&state, narrow);
 
     const gap = theme.scaledUi(state.app_config.workspace_pane_gap);
+    const viewport_w = scrollingViewportExtent(narrow.w, gap, layout.visiblePaneCount(), state.app_config.workspace_panes_per_view);
     const pane_extent = responsiveScrollingPaneExtent(
-        narrow.w,
+        viewport_w,
         gap,
         state.app_config.workspace_panes_per_view,
         layout.scroll_pane_extent_override,
         layout.scroll_pane_extent_ratio_override,
         theme.uiScaleFactor(),
     );
-    const max_offset = scrollingMaxOffset(narrow.w, pane_extent, gap, layout.visiblePaneCount());
-    const expected_target = revealedScrollTarget(preserved_target_x, narrow.w, pane_extent, gap, 2, max_offset);
+    const max_offset = scrollingMaxOffset(viewport_w, pane_extent, gap, layout.visiblePaneCount());
+    const expected_target = revealedScrollTarget(preserved_target_x, viewport_w, pane_extent, gap, 2, max_offset);
     const leading_target = leadingScrollTarget(pane_extent, gap, 2, max_offset);
     try std.testing.expectApproxEqAbs(expected_target, layout.scroll_target_x, 0.0001);
     try std.testing.expect(expected_target > preserved_target_x);
     try std.testing.expect(layout.scroll_target_x < leading_target);
     const third_end = 3.0 * pane_extent + 2.0 * gap;
-    try std.testing.expect(third_end <= layout.scroll_target_x + narrow.w + 0.0001);
-    try std.testing.expect(layout.scroll_target_x <= third_end - narrow.w + 0.0001);
+    try std.testing.expect(third_end <= layout.scroll_target_x + viewport_w + 0.0001);
+    try std.testing.expect(layout.scroll_target_x <= third_end - viewport_w + 0.0001);
     try std.testing.expect(layout.scroll_offset_x >= 0.0 and layout.scroll_offset_x <= max_offset);
     try std.testing.expectEqual(preserved_target_y, layout.scroll_target_y);
 
@@ -3210,9 +3235,10 @@ test "sidebar horizontal render preserves visible activation and minimally revea
     state.focusWorkspaceOpenPaneFromSidebar(0, third_pane);
     try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, null), layout.scroll_revealed_pane_id);
     renderAt(&state, shorter);
-    const resized_extent = responsiveScrollingPaneExtent(shorter.w, gap, state.app_config.workspace_panes_per_view, layout.scroll_pane_extent_override, layout.scroll_pane_extent_ratio_override, theme.uiScaleFactor());
-    const resized_max = scrollingMaxOffset(shorter.w, resized_extent, gap, layout.visiblePaneCount());
-    const resized_expected = revealedScrollTarget(before_resize_target, shorter.w, resized_extent, gap, 2, resized_max);
+    const resized_viewport_w = scrollingViewportExtent(shorter.w, gap, layout.visiblePaneCount(), state.app_config.workspace_panes_per_view);
+    const resized_extent = responsiveScrollingPaneExtent(resized_viewport_w, gap, state.app_config.workspace_panes_per_view, layout.scroll_pane_extent_override, layout.scroll_pane_extent_ratio_override, theme.uiScaleFactor());
+    const resized_max = scrollingMaxOffset(resized_viewport_w, resized_extent, gap, layout.visiblePaneCount());
+    const resized_expected = revealedScrollTarget(before_resize_target, resized_viewport_w, resized_extent, gap, 2, resized_max);
     try std.testing.expectApproxEqAbs(resized_expected, layout.scroll_target_x, 0.0001);
     layout.scroll_offset_x = layout.scroll_target_x;
     const visible_offset = layout.scroll_offset_x;
@@ -3315,16 +3341,17 @@ test "sidebar vertical render minimally reveals after pre-render resize" {
     renderAt(&state, short);
 
     const gap = theme.scaledUi(state.app_config.workspace_pane_gap);
+    const viewport_h = scrollingViewportExtent(short.h, gap, layout.visiblePaneCount(), state.app_config.workspace_panes_per_view);
     const pane_extent = responsiveScrollingPaneExtent(
-        short.h,
+        viewport_h,
         gap,
         state.app_config.workspace_panes_per_view,
         layout.scroll_pane_extent_override,
         layout.scroll_pane_extent_ratio_override,
         theme.uiScaleFactor(),
     );
-    const max_offset = scrollingMaxOffset(short.h, pane_extent, gap, layout.visiblePaneCount());
-    const expected_target = revealedScrollTarget(19.5, short.h, pane_extent, gap, 2, max_offset);
+    const max_offset = scrollingMaxOffset(viewport_h, pane_extent, gap, layout.visiblePaneCount());
+    const expected_target = revealedScrollTarget(19.5, viewport_h, pane_extent, gap, 2, max_offset);
     const leading_target = leadingScrollTarget(pane_extent, gap, 2, max_offset);
     try std.testing.expectApproxEqAbs(expected_target, layout.scroll_target_y, 0.0001);
     try std.testing.expect(layout.scroll_target_y > 19.5);
@@ -3338,9 +3365,10 @@ test "sidebar vertical render minimally reveals after pre-render resize" {
     state.focusWorkspaceOpenPaneFromSidebar(0, third_pane);
     try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, null), layout.scroll_revealed_pane_id);
     renderAt(&state, shorter);
-    const resized_extent = responsiveScrollingPaneExtent(shorter.h, gap, state.app_config.workspace_panes_per_view, layout.scroll_pane_extent_override, layout.scroll_pane_extent_ratio_override, theme.uiScaleFactor());
-    const resized_max = scrollingMaxOffset(shorter.h, resized_extent, gap, layout.visiblePaneCount());
-    const resized_expected = revealedScrollTarget(before_resize_target, shorter.h, resized_extent, gap, 2, resized_max);
+    const resized_viewport_h = scrollingViewportExtent(shorter.h, gap, layout.visiblePaneCount(), state.app_config.workspace_panes_per_view);
+    const resized_extent = responsiveScrollingPaneExtent(resized_viewport_h, gap, state.app_config.workspace_panes_per_view, layout.scroll_pane_extent_override, layout.scroll_pane_extent_ratio_override, theme.uiScaleFactor());
+    const resized_max = scrollingMaxOffset(resized_viewport_h, resized_extent, gap, layout.visiblePaneCount());
+    const resized_expected = revealedScrollTarget(before_resize_target, resized_viewport_h, resized_extent, gap, 2, resized_max);
     try std.testing.expectApproxEqAbs(resized_expected, layout.scroll_target_y, 0.0001);
     layout.scroll_offset_y = layout.scroll_target_y;
     const same_geometry_offset = layout.scroll_offset_y;
@@ -3364,6 +3392,21 @@ test "scrolling pane extent fits the configured panes per view" {
             try std.testing.expectApproxEqAbs(viewport_extent, pane_extent * count_f + gap * (count_f - 1.0), 0.001);
         }
     }
+}
+
+test "scrolling viewport margins require multiple displayed groups" {
+    const rect: palette.Rect = .{ .x = 10.0, .y = 20.0, .w = 1000.0, .h = 700.0 };
+
+    try std.testing.expectEqual(rect, scrollingViewportRect(rect, 12.0, 1, 2));
+    try std.testing.expectEqual(rect, scrollingViewportRect(rect, 12.0, 2, 1));
+    try std.testing.expectEqual(@as(f32, 1000.0), scrollingViewportExtent(rect.w, 12.0, 1, 2));
+
+    const inset = scrollingViewportRect(rect, 12.0, 2, 2);
+    try std.testing.expectEqual(@as(f32, 22.0), inset.x);
+    try std.testing.expectEqual(@as(f32, 32.0), inset.y);
+    try std.testing.expectEqual(@as(f32, 976.0), inset.w);
+    try std.testing.expectEqual(@as(f32, 676.0), inset.h);
+    try std.testing.expectEqual(@as(f32, 976.0), scrollingViewportExtent(rect.w, 12.0, 2, 2));
 }
 
 test "custom scrolling pane extent follows viewport changes" {
@@ -3467,11 +3510,11 @@ test "scrolling strip collects a tiled group as one item" {
 
     var extents: [MAX_WORKSPACE_PANE_RECTS]f32 = undefined;
     resolveScrollingGroupExtents(&layout, group_ids[0..count], representative_ids[0..count], 500.0, 1292.0, 12.0, 1.0, extents[0..count]);
-    try std.testing.expectApproxEqAbs(@as(f32, 640.0), extents[0], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1292.0), extents[0], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 500.0), extents[1], 0.0001);
 
-    // A ratio inherited before grouping cannot make a nested tile narrower
-    // than one responsive slot, while standalone panes keep custom widths.
+    // A nested tile always fills the viewport, while standalone panes keep
+    // their ordinary custom widths.
     try std.testing.expect(layout.setPaneScrollExtent(standalone_pane_id, 400.0, 0.4));
     resolveScrollingGroupExtents(&layout, group_ids[0..count], representative_ids[0..count], 900.0, 900.0, 12.0, 1.0, extents[0..count]);
     try std.testing.expectApproxEqAbs(@as(f32, 900.0), extents[0], 0.0001);
@@ -3480,15 +3523,14 @@ test "scrolling strip collects a tiled group as one item" {
     try std.testing.expectEqual(@as(?usize, 0), scrollGroupIndexForPane(&layout, tiled_pane_id));
     try std.testing.expectEqual(@as(?usize, 1), scrollGroupIndexForPane(&layout, standalone_pane_id));
 
-    // Closing one child leaves the survivor tagged with the tile-group id;
-    // it must continue filling the responsive slot instead of shrinking.
+    // Closing one child returns the survivor to its ordinary scrolling width.
     try std.testing.expect(layout.setPaneScrollExtent(1, 640.0, 0.5));
     _ = layout.closePane(allocator, tiled_pane_id) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(usize, 1), layout.scrollGroupPaneCount(1));
     try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, 1), layout.paneById(1).?.scroll_group_id);
     const collapsed_count = collectScrollingGroups(&layout, &group_ids, &representative_ids);
     resolveScrollingGroupExtents(&layout, group_ids[0..collapsed_count], representative_ids[0..collapsed_count], 900.0, 900.0, 12.0, 1.0, extents[0..collapsed_count]);
-    try std.testing.expectApproxEqAbs(@as(f32, 900.0), extents[0], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 444.0), extents[0], 0.0001);
 }
 
 test "scrolling grow keys follow the strip axis" {
