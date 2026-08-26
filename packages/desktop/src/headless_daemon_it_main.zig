@@ -15,6 +15,7 @@ const platform_ipc = @import("platform/ipc.zig");
 const platform_paths = @import("platform_paths");
 const platform_runtime = @import("platform_runtime");
 const sessionizer = @import("terminal/sessionizer.zig");
+const mcp_http = @import("mcp/http_server.zig");
 const transcript_apply = @import("chat/transcript_apply.zig");
 const zqlite = @import("zqlite");
 // M4-P4 fix F2 arm: the GENUINE GUI snapshot conversion + persisted DTOs so
@@ -230,7 +231,8 @@ pub fn main(init: std.process.Init) !void {
     // M4-P5 MCP/CLI flip (Windows-safe): capability advertisement + no-GUI
     // create/send/stream/approve/stop/read lifecycle with a daemon restart.
     try runChatMcpCliFlipNoGuiScenario(allocator, io);
-    // M4-P5 fix (MAJOR-4): the REAL MCP tool layer over a piped `--mcp` child.
+    // M4-P5 fix (MAJOR-4): the REAL MCP tool layer over a piped `--mcp` child,
+    // including both the legacy handshake and modern stateless lifecycle.
     // Self-gates POSIX-only (bounded pipe reads use std.posix.poll).
     try runChatMcpToolLayerScenario(allocator, io);
     // M4-P5 fix amendment: failed-first identity adoption converges via retry
@@ -9048,6 +9050,86 @@ fn runChatMcpToolLayerScenario(allocator: std.mem.Allocator, io: std.Io) !void {
         var reader: McpChildReader = .{};
         defer reader.deinit(allocator);
         var next_id: u32 = 1;
+        var modern_tool_count: usize = 0;
+
+        // Modern discovery is the metadata-free probe and must still produce
+        // a fully discriminated 2026-07-28 result.
+        {
+            const request = try std.json.Stringify.valueAlloc(allocator, .{
+                .jsonrpc = "2.0",
+                .id = next_id,
+                .method = "server/discover",
+            }, .{});
+            defer allocator.free(request);
+            next_id += 1;
+            var response = try mcpChildCallParsed(allocator, io, &mcp, &reader, request, MCP_CHILD_READ_TIMEOUT_MS);
+            defer response.deinit();
+            const result = jsonObjectField(response.value, "result") orelse return error.McpModernDiscoverShape;
+            const result_type = jsonObjectField(result, "resultType") orelse return error.McpModernDiscoverShape;
+            if (result_type != .string or !std.mem.eql(u8, result_type.string, "complete")) return error.McpModernDiscoverShape;
+            const versions = jsonObjectField(result, "supportedVersions") orelse return error.McpModernDiscoverShape;
+            if (versions != .array or versions.array.items.len == 0) return error.McpModernDiscoverShape;
+            const version = versions.array.items[0];
+            if (version != .string or !std.mem.eql(u8, version.string, mcp_http.MODERN_PROTOCOL_VERSION)) {
+                return error.McpModernDiscoverVersion;
+            }
+        }
+
+        // Modern list and call requests carry their complete lifecycle in the
+        // reserved per-request metadata envelope.
+        {
+            const meta = .{
+                .@"io.modelcontextprotocol/protocolVersion" = mcp_http.MODERN_PROTOCOL_VERSION,
+                .@"io.modelcontextprotocol/clientInfo" = .{ .name = "verde-headless-it", .version = "1" },
+                .@"io.modelcontextprotocol/clientCapabilities" = .{},
+            };
+            const request = try std.json.Stringify.valueAlloc(allocator, .{
+                .jsonrpc = "2.0",
+                .id = next_id,
+                .method = "tools/list",
+                .params = .{ ._meta = meta },
+            }, .{});
+            defer allocator.free(request);
+            next_id += 1;
+            var response = try mcpChildCallParsed(allocator, io, &mcp, &reader, request, MCP_CHILD_READ_TIMEOUT_MS);
+            defer response.deinit();
+            const result = jsonObjectField(response.value, "result") orelse return error.McpModernToolsListShape;
+            const result_type = jsonObjectField(result, "resultType") orelse return error.McpModernToolsListShape;
+            if (result_type != .string or !std.mem.eql(u8, result_type.string, "complete")) return error.McpModernToolsListShape;
+            const tools = jsonObjectField(result, "tools") orelse return error.McpModernToolsListShape;
+            if (tools != .array) return error.McpModernToolsListShape;
+            modern_tool_count = tools.array.items.len;
+        }
+        {
+            const request = try std.json.Stringify.valueAlloc(allocator, .{
+                .jsonrpc = "2.0",
+                .id = next_id,
+                .method = "tools/call",
+                .params = .{
+                    .name = "list_workspaces",
+                    .arguments = .{},
+                    ._meta = .{
+                        .@"io.modelcontextprotocol/protocolVersion" = mcp_http.MODERN_PROTOCOL_VERSION,
+                        .@"io.modelcontextprotocol/clientInfo" = .{ .name = "verde-headless-it", .version = "1" },
+                        .@"io.modelcontextprotocol/clientCapabilities" = .{},
+                    },
+                },
+            }, .{});
+            defer allocator.free(request);
+            next_id += 1;
+            var response = try mcpChildCallParsed(allocator, io, &mcp, &reader, request, MCP_CHILD_READ_TIMEOUT_MS);
+            defer response.deinit();
+            const result = jsonObjectField(response.value, "result") orelse return error.McpModernToolsCallShape;
+            const result_type = jsonObjectField(result, "resultType") orelse return error.McpModernToolsCallShape;
+            if (result_type != .string or !std.mem.eql(u8, result_type.string, "complete")) return error.McpModernToolsCallShape;
+            const tool_text = try mcpToolTextFromResponseAlloc(allocator, response.value);
+            defer allocator.free(tool_text.text);
+            if (tool_text.is_error) return error.McpModernToolsCallError;
+            var envelope = try std.json.parseFromSlice(std.json.Value, allocator, tool_text.text, .{});
+            defer envelope.deinit();
+            const ok = jsonObjectField(envelope.value, "ok") orelse return error.McpModernToolsCallShape;
+            if (ok != .bool or !ok.bool) return error.McpModernToolsCallError;
+        }
 
         // initialize → the real serve loop identifies itself.
         {
@@ -9080,6 +9162,7 @@ fn runChatMcpToolLayerScenario(allocator: std.mem.Allocator, io: std.Io) !void {
             const result = jsonObjectField(response.value, "result") orelse return error.McpToolsListShape;
             const tools = jsonObjectField(result, "tools") orelse return error.McpToolsListShape;
             if (tools != .array) return error.McpToolsListShape;
+            if (tools.array.items.len != modern_tool_count) return error.McpToolEraSurfaceMismatch;
             const required = [_][]const u8{
                 "open_chat",           "present_chat",      "set_chat_draft",
                 "get_chat_draft",      "send_chat_message", "tail_chat_turn",

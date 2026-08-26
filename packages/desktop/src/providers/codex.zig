@@ -1263,6 +1263,24 @@ pub const Client = struct {
         const payload = try self.callRpcForResultAllocWait("thread/resume", params, wait);
         defer self.allocator.free(payload);
 
+        // Codex persists a thread's MCP policy snapshot. Refresh after resume
+        // so chats created before Verde's managed approval mode inherit it.
+        const reload_payload = self.callRpcForResultAllocWait(
+            "config/mcpServer/reload",
+            @as(?u8, null),
+            wait,
+        ) catch |err| switch (err) {
+            // Older app-server versions do not expose this RPC. Resuming the
+            // thread remains useful there, even though its MCP snapshot stays.
+            error.CodexRpcFailed => {
+                runtime_log.diagnostic("codex MCP config refresh after resume unavailable: {s}", .{@errorName(err)});
+                try self.rememberLoadedThread(thread_id);
+                return;
+            },
+            else => return err,
+        };
+        defer self.allocator.free(reload_payload);
+
         try self.rememberLoadedThread(thread_id);
     }
 
