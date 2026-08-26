@@ -86,6 +86,12 @@ pub const core_commands = [_][]const u8{
     "capabilities",
 };
 
+pub const mcp_commands = [_][]const u8{
+    "serve",
+    "stats",
+    "errors",
+};
+
 pub const live_commands = [_][]const u8{
     "status",
     "capabilities",

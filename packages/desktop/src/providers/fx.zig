@@ -7,6 +7,7 @@
 const std = @import("std");
 const acp = @import("acp.zig");
 const platform_process = @import("../platform/process.zig");
+const provider_mcp = @import("mcp.zig");
 const process_env = @import("../platform/env.zig");
 const provider_types = @import("types.zig");
 const runtime_log = @import("../runtime/log.zig");
@@ -230,14 +231,22 @@ pub const Client = struct {
 
         const cwd = try self.cwdAbsoluteAlloc(allocator);
         defer allocator.free(cwd);
+        var mcp_connection = if (provider_mcp.isInstalled(allocator, .fx))
+            try provider_mcp.loadHttpConnection(allocator)
+        else
+            null;
+        defer if (mcp_connection) |*connection| connection.deinit(allocator);
+        const mcp_http: ?acp.McpHttpServer = if (mcp_connection) |connection| .{
+            .url = connection.url,
+            .authorization = connection.authorization,
+            .client_name = "fx",
+        } else null;
 
         var state: acp.ReadThreadState = .{};
         errdefer state.deinit(allocator);
 
         try proc.writeLine(try acp.makeInitializeRequestAlloc(allocator, 1));
-        // Verde MCP injection stays off until fx joins the MCP hooks settings
-        // surface; fx ACP sessions see only client-supplied servers.
-        try proc.writeLine(try acp.makeSessionLoadRequestAlloc(allocator, 2, thread_id, cwd, null));
+        try proc.writeLine(try acp.makeSessionLoadRequestWithHttpMcpAlloc(allocator, 2, thread_id, cwd, mcp_http));
         try proc.closeStdin();
 
         var read_buffer: [16 * 1024]u8 = undefined;
@@ -280,17 +289,25 @@ pub const Client = struct {
 
         const cwd = try self.cwdAbsoluteAllocForRequest(allocator, request);
         defer allocator.free(cwd);
+        var mcp_connection = if (provider_mcp.isInstalled(allocator, .fx))
+            try provider_mcp.loadHttpConnection(allocator)
+        else
+            null;
+        defer if (mcp_connection) |*connection| connection.deinit(allocator);
+        const mcp_http: ?acp.McpHttpServer = if (mcp_connection) |connection| .{
+            .url = connection.url,
+            .authorization = connection.authorization,
+            .client_name = "fx",
+        } else null;
 
         var state: acp.SendPromptState = .{};
         errdefer state.deinit(allocator);
 
         try proc.writeLine(try acp.makeInitializeRequestAlloc(allocator, 1));
-        // Verde MCP injection stays off until fx joins the MCP hooks settings
-        // surface; fx ACP sessions see only client-supplied servers.
         if (request.thread_id) |thread_id| {
-            try proc.writeLine(try acp.makeSessionLoadRequestAlloc(allocator, 2, thread_id, cwd, null));
+            try proc.writeLine(try acp.makeSessionLoadRequestWithHttpMcpAlloc(allocator, 2, thread_id, cwd, mcp_http));
         } else {
-            try proc.writeLine(try acp.makeSessionNewRequestAlloc(allocator, 2, cwd, null));
+            try proc.writeLine(try acp.makeSessionNewRequestWithHttpMcpAlloc(allocator, 2, cwd, mcp_http));
         }
 
         var read_buffer: [16 * 1024]u8 = undefined;
