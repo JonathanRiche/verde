@@ -6,7 +6,6 @@
 const std = @import("std");
 const acp = @import("acp.zig");
 const platform_process = @import("../platform/process.zig");
-const platform_runtime = @import("platform_runtime");
 const provider_mcp = @import("mcp.zig");
 const process_env = @import("../platform/env.zig");
 const provider_types = @import("types.zig");
@@ -210,17 +209,22 @@ pub const Client = struct {
 
         const cwd = try self.cwdAbsoluteAlloc(allocator);
         defer allocator.free(cwd);
-        const mcp_executable = if (provider_mcp.isInstalled(allocator, .cursor))
-            try platform_runtime.executablePathAlloc(allocator)
+        var mcp_connection = if (provider_mcp.isInstalled(allocator, .cursor))
+            try provider_mcp.loadHttpConnection(allocator)
         else
             null;
-        defer if (mcp_executable) |executable| allocator.free(executable);
+        defer if (mcp_connection) |*connection| connection.deinit(allocator);
+        const mcp_http: ?acp.McpHttpServer = if (mcp_connection) |connection| .{
+            .url = connection.url,
+            .authorization = connection.authorization,
+            .client_name = "cursor",
+        } else null;
 
         var state: acp.ReadThreadState = .{};
         errdefer state.deinit(allocator);
 
         try proc.writeLine(try acp.makeInitializeRequestAlloc(allocator, 1));
-        try proc.writeLine(try acp.makeSessionLoadRequestAlloc(allocator, 2, thread_id, cwd, mcp_executable));
+        try proc.writeLine(try acp.makeSessionLoadRequestWithHttpMcpAlloc(allocator, 2, thread_id, cwd, mcp_http));
         try proc.closeStdin();
 
         var read_buffer: [16 * 1024]u8 = undefined;
@@ -260,20 +264,25 @@ pub const Client = struct {
 
         const cwd = try self.cwdAbsoluteAllocForRequest(allocator, request);
         defer allocator.free(cwd);
-        const mcp_executable = if (provider_mcp.isInstalled(allocator, .cursor))
-            try platform_runtime.executablePathAlloc(allocator)
+        var mcp_connection = if (provider_mcp.isInstalled(allocator, .cursor))
+            try provider_mcp.loadHttpConnection(allocator)
         else
             null;
-        defer if (mcp_executable) |executable| allocator.free(executable);
+        defer if (mcp_connection) |*connection| connection.deinit(allocator);
+        const mcp_http: ?acp.McpHttpServer = if (mcp_connection) |connection| .{
+            .url = connection.url,
+            .authorization = connection.authorization,
+            .client_name = "cursor",
+        } else null;
 
         var state: acp.SendPromptState = .{};
         errdefer state.deinit(allocator);
 
         try proc.writeLine(try acp.makeInitializeRequestAlloc(allocator, 1));
         if (request.thread_id) |thread_id| {
-            try proc.writeLine(try acp.makeSessionLoadRequestAlloc(allocator, 2, thread_id, cwd, mcp_executable));
+            try proc.writeLine(try acp.makeSessionLoadRequestWithHttpMcpAlloc(allocator, 2, thread_id, cwd, mcp_http));
         } else {
-            try proc.writeLine(try acp.makeSessionNewRequestAlloc(allocator, 2, cwd, mcp_executable));
+            try proc.writeLine(try acp.makeSessionNewRequestWithHttpMcpAlloc(allocator, 2, cwd, mcp_http));
         }
 
         var read_buffer: [16 * 1024]u8 = undefined;

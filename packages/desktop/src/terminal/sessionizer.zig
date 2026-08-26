@@ -13,6 +13,7 @@ const chat_threads = @import("../chat/threads.zig");
 const db_types = @import("../db/types.zig");
 const process_registry = @import("../daemon/process_registry.zig");
 const daemon_store = @import("../daemon/store.zig");
+const mcp_http = @import("../mcp/http_server.zig");
 const platform_ipc = @import("../platform/ipc.zig");
 const platform_live_endpoint = @import("../platform/live_endpoint.zig");
 const workspace_identity = @import("../platform/workspace_identity.zig");
@@ -57,7 +58,8 @@ pub const WINDOWS_PIPE_PREFIX = "\\\\.\\pipe\\verde-sessionizer-";
 // Version 21 makes first-prompt and generated titles part of daemon-owned
 // chat turns, including turns created through the MCP/headless API.
 // Version 22 adds bounded live-tail replay for large provider event streams.
-pub const PROTOCOL_VERSION: u32 = 22;
+// Version 23 makes the authenticated MCP HTTP transport daemon-owned.
+pub const PROTOCOL_VERSION: u32 = 23;
 pub const DEFAULT_COLS: u16 = 120;
 pub const DEFAULT_ROWS: u16 = 30;
 const MAX_OUTPUT_RING: usize = 1024 * 1024;
@@ -6322,20 +6324,38 @@ fn clientResponse(
 }
 
 pub fn runDaemon(allocator: std.mem.Allocator, pref_path: []const u8) !void {
+    return runDaemonOptions(allocator, pref_path, .{});
+}
+
+/// Runs the session daemon with the shared MCP dispatcher exposed over the
+/// authenticated loopback Streamable HTTP endpoint.
+pub fn runDaemonWithMcp(
+    allocator: std.mem.Allocator,
+    pref_path: []const u8,
+    mcp_handler: mcp_http.Handler,
+) !void {
+    return runDaemonOptions(allocator, pref_path, .{ .mcp_handler = mcp_handler });
+}
+
+const RunDaemonOptions = struct {
+    mcp_handler: ?mcp_http.Handler = null,
+};
+
+fn runDaemonOptions(allocator: std.mem.Allocator, pref_path: []const u8, options: RunDaemonOptions) !void {
     try process_env.applyAugmentedPathToCurrentProcess(allocator);
-    if (builtin.os.tag == .windows) return runWindowsDaemon(allocator, pref_path);
-    return runUnixDaemon(allocator, pref_path);
+    if (builtin.os.tag == .windows) return runWindowsDaemon(allocator, pref_path, options);
+    return runUnixDaemon(allocator, pref_path, options);
 }
 
-fn runUnixDaemon(allocator: std.mem.Allocator, pref_path: []const u8) !void {
-    return runSessionizerServer(allocator, pref_path);
+fn runUnixDaemon(allocator: std.mem.Allocator, pref_path: []const u8, options: RunDaemonOptions) !void {
+    return runSessionizerServer(allocator, pref_path, options);
 }
 
-fn runWindowsDaemon(allocator: std.mem.Allocator, pref_path: []const u8) !void {
-    return runSessionizerServer(allocator, pref_path);
+fn runWindowsDaemon(allocator: std.mem.Allocator, pref_path: []const u8, options: RunDaemonOptions) !void {
+    return runSessionizerServer(allocator, pref_path, options);
 }
 
-fn runSessionizerServer(allocator: std.mem.Allocator, pref_path: []const u8) !void {
+fn runSessionizerServer(allocator: std.mem.Allocator, pref_path: []const u8, options: RunDaemonOptions) !void {
     var setup_threaded = std.Io.Threaded.init_single_threaded;
     try std.Io.Dir.cwd().createDirPath(setup_threaded.io(), pref_path);
     const endpoint = try socketPath(allocator, pref_path);
@@ -6354,7 +6374,9 @@ fn runSessionizerServer(allocator: std.mem.Allocator, pref_path: []const u8) !vo
         .daemon = &daemon,
         .endpoint = endpoint,
         .pid_path = pid_path,
+        .pref_path = pref_path,
         .stop_requested = &stop_requested,
+        .mcp_handler = options.mcp_handler,
     };
     defer finishSessionizerServer(&server_context);
 
@@ -6383,7 +6405,10 @@ const SessionizerServerContext = struct {
     daemon: *Daemon,
     endpoint: []const u8,
     pid_path: []const u8,
+    pref_path: []const u8 = "",
     stop_requested: *std.atomic.Value(bool),
+    mcp_handler: ?mcp_http.Handler = null,
+    mcp_server: ?mcp_http.Server = null,
     drain_thread: ?std.Thread = null,
     pid_published: bool = false,
 };
@@ -6395,6 +6420,12 @@ fn sessionizerServerReady(raw_context: *anyopaque) !void {
     // Open the production (or hermetic-override) store only after bind succeeds
     // so a failed open fails readiness loudly (never a silent dual-writer).
     try maybeInitStoreService(context.daemon);
+    if (context.mcp_handler) |handler| {
+        context.mcp_server = mcp_http.start(context.daemon.allocator, context.pref_path, handler) catch |err| {
+            log.err("daemon MCP HTTP transport failed to start: {s}", .{@errorName(err)});
+            return err;
+        };
+    }
     context.drain_thread = try std.Thread.spawn(.{}, drainSessionsThread, .{DrainThreadContext{
         .daemon = context.daemon,
         .endpoint = context.endpoint,
@@ -6408,6 +6439,7 @@ fn sessionizerServerReady(raw_context: *anyopaque) !void {
 /// drain response) is what makes the subsequent worker join bounded.
 fn sessionizerServerDraining(raw_context: *anyopaque) void {
     const context: *SessionizerServerContext = @ptrCast(@alignCast(raw_context));
+    stopMcpHttpServer(context);
     context.daemon.beginChangesDrain();
 }
 
@@ -8494,11 +8526,17 @@ fn joinDrainThread(context: *SessionizerServerContext) void {
 /// (error-path fallback when serve fails before the accept loop).
 fn finishSessionizerServer(context: *SessionizerServerContext) void {
     context.stop_requested.store(true, .release);
+    stopMcpHttpServer(context);
     joinDrainThread(context);
     // Store finalization is primarily done in on_closing (before endpoint
     // release). This call is a no-op when that already ran.
     finalizeSessionizerStore(context);
     if (context.pid_published) deletePidFileIfOwned(context.pid_path);
+}
+
+fn stopMcpHttpServer(context: *SessionizerServerContext) void {
+    if (context.mcp_server) |*server| server.deinit();
+    context.mcp_server = null;
 }
 
 /// Commit the lease/outcome transfer and close the writer. Idempotent when
