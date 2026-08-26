@@ -4469,7 +4469,7 @@ fn mcpServerDiscover(allocator: std.mem.Allocator, out: output.Output, id_value:
     try s.objectField("ttlMs");
     try s.write(@as(u32, 60_000));
     try s.objectField("cacheScope");
-    try s.write("global");
+    try s.write("public");
     try s.endObject();
     try s.endObject();
     try out.stdout("{s}\n", .{writer.written()});
@@ -4624,7 +4624,7 @@ fn modernizeMcpResponseAlloc(allocator: std.mem.Allocator, response: []const u8)
     try result.put(arena, "resultType", .{ .string = "complete" });
     if (result.get("tools") != null) {
         try result.put(arena, "ttlMs", .{ .integer = 60_000 });
-        try result.put(arena, "cacheScope", .{ .string = "global" });
+        try result.put(arena, "cacheScope", .{ .string = "public" });
     }
 
     var server_info: std.json.ObjectMap = .empty;
@@ -8767,7 +8767,7 @@ test "modern MCP responses are complete, cacheable, and identify Verde" {
     const result = parsed.value.object.get("result").?.object;
     try std.testing.expectEqualStrings("complete", result.get("resultType").?.string);
     try std.testing.expectEqual(@as(i64, 60_000), result.get("ttlMs").?.integer);
-    try std.testing.expectEqualStrings("global", result.get("cacheScope").?.string);
+    try std.testing.expectEqualStrings("public", result.get("cacheScope").?.string);
     const meta = result.get("_meta").?.object;
     const server_info = meta.get("io.modelcontextprotocol/serverInfo").?.object;
     try std.testing.expectEqualStrings("verde", server_info.get("name").?.string);
