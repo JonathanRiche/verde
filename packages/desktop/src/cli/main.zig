@@ -31,6 +31,7 @@ const SOCKET_NAME = live_endpoint.SOCKET_NAME;
 const LIVE_RESPONSE_TIMEOUT_MS: u32 = 5000;
 const MCP_BROWSER_ACTION_TIMEOUT_MS: u32 = 30_000;
 const MCP_BROWSER_POLL_INTERVAL_MS: u32 = 20;
+const MCP_BROWSER_NAVIGATION_SETTLE_MS: i64 = 250;
 const MCP_TOOL_NAME_FIELD = "_verdeMcpTool";
 const mcp_log = std.log.scoped(.cli_mcp);
 const CORE_COMMANDS = [_][]const u8{ "status", "capabilities", "snapshot", "changes" };
@@ -4571,7 +4572,7 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
     });
     try writeMcpTypedTool(&s, "evaluate_browser_js", "Evaluate JavaScript in the embedded browser and return a structured result or serialized exception.", &.{
         .{ .name = "script", .type_name = "string", .description = "JavaScript function body; return the value to serialize.", .required = true },
-        .{ .name = "timeout_ms", .type_name = "integer", .description = "Timeout in milliseconds, including browser readiness; defaults to 30000 and is capped at 60000." },
+        .{ .name = "timeout_ms", .type_name = "integer", .description = "Execution timeout in milliseconds; browser readiness has a separate 30000 ms allowance. Defaults to 30000 and is capped at 60000." },
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, or path; defaults to the agent's workspace." },
     });
     try writeMcpTypedTool(&s, "browser_pointer_input", "Send a stateful low-level pointer event using pane-local coordinates.", &.{
@@ -4923,7 +4924,7 @@ fn mcpToolsCall(
             mcpArgU32(arguments, "text_limit") orelse 12_000,
         );
         defer allocator.free(script);
-        const response = mcpBrowserEvalAndWaitAlloc(allocator, io, workspace, script, MCP_BROWSER_ACTION_TIMEOUT_MS) catch |err|
+        const response = mcpBrowserEvalAndWaitAlloc(allocator, io, workspace, script, MCP_BROWSER_ACTION_TIMEOUT_MS, .synchronous) catch |err|
             return try mcpLiveCallError(allocator, out, id_value, tool_name, err);
         defer allocator.free(response);
         return try mcpToolLiveTextResult(allocator, out, id_value, response, tool_name);
@@ -4933,7 +4934,7 @@ fn mcpToolsCall(
             return try mcpError(allocator, out, id_value, -32602, "click_browser_element requires selector");
         const script = try mcpBrowserClickScriptAlloc(allocator, selector, mcpArgBool(arguments, "confirmed") orelse false);
         defer allocator.free(script);
-        const response = mcpBrowserEvalAndWaitAlloc(allocator, io, workspace, script, MCP_BROWSER_ACTION_TIMEOUT_MS) catch |err|
+        const response = mcpBrowserEvalAndWaitAlloc(allocator, io, workspace, script, MCP_BROWSER_ACTION_TIMEOUT_MS, .synchronous) catch |err|
             return try mcpLiveCallError(allocator, out, id_value, tool_name, err);
         defer allocator.free(response);
         return try mcpToolLiveTextResult(allocator, out, id_value, response, tool_name);
@@ -4951,7 +4952,7 @@ fn mcpToolsCall(
             mcpArgBool(arguments, "confirmed") orelse false,
         );
         defer allocator.free(script);
-        const response = mcpBrowserEvalAndWaitAlloc(allocator, io, workspace, script, MCP_BROWSER_ACTION_TIMEOUT_MS) catch |err|
+        const response = mcpBrowserEvalAndWaitAlloc(allocator, io, workspace, script, MCP_BROWSER_ACTION_TIMEOUT_MS, .synchronous) catch |err|
             return try mcpLiveCallError(allocator, out, id_value, tool_name, err);
         defer allocator.free(response);
         return try mcpToolLiveTextResult(allocator, out, id_value, response, tool_name);
@@ -4971,6 +4972,7 @@ fn mcpToolsCall(
             workspace,
             script,
             @min(mcpArgU32(arguments, "timeout_ms") orelse MCP_BROWSER_ACTION_TIMEOUT_MS, 60_000),
+            .promise_aware,
         ) catch |err| return try mcpLiveCallError(allocator, out, id_value, tool_name, err);
         defer allocator.free(response);
         return try mcpToolLiveTextResult(allocator, out, id_value, response, tool_name);
@@ -5362,14 +5364,34 @@ fn mcpToolsCall(
             break :blk sendLiveRequestAlloc(allocator, io, "browser.status", .{ .workspace = workspace }, 1);
         }
         if (std.mem.eql(u8, tool_name, "open_browser")) {
-            break :blk sendLiveRequestAlloc(allocator, io, "browser.open", .{
+            const target_url = mcpArgString(arguments, "url");
+            const browser_response = try sendLiveRequestAlloc(allocator, io, "browser.open", .{
                 .workspace = workspace,
-                .url = mcpArgString(arguments, "url"),
+                .url = target_url,
             }, 1);
+            errdefer allocator.free(browser_response);
+            if (target_url) |target| {
+                if (liveResponseOk(allocator, browser_response)) {
+                    const deadline_ms = sessionizer.monotonicNowMs() +| @as(i64, @intCast(MCP_BROWSER_ACTION_TIMEOUT_MS));
+                    try mcpBrowserWaitForNavigation(allocator, io, workspace, target, null, deadline_ms);
+                }
+            }
+            break :blk browser_response;
         }
         if (std.mem.eql(u8, tool_name, "navigate_browser")) {
             const url = mcpArgString(arguments, "url") orelse return try mcpError(allocator, out, id_value, -32602, "navigate_browser requires url");
-            break :blk sendLiveRequestAlloc(allocator, io, "browser.navigate", .{ .workspace = workspace, .url = url }, 1);
+            const browser_response = try sendLiveRequestAlloc(allocator, io, "browser.navigate", .{
+                .workspace = workspace,
+                .url = url,
+            }, 1);
+            errdefer allocator.free(browser_response);
+            const previous_url = try mcpBrowserResponseUrlAlloc(allocator, browser_response);
+            defer if (previous_url) |value| allocator.free(value);
+            if (liveResponseOk(allocator, browser_response)) {
+                const deadline_ms = sessionizer.monotonicNowMs() +| @as(i64, @intCast(MCP_BROWSER_ACTION_TIMEOUT_MS));
+                try mcpBrowserWaitForNavigation(allocator, io, workspace, url, previous_url, deadline_ms);
+            }
+            break :blk browser_response;
         }
         if (std.mem.eql(u8, tool_name, "restart_browser")) {
             break :blk sendLiveRequestAlloc(allocator, io, "browser.restart", .{ .workspace = workspace }, 1);
@@ -6712,6 +6734,7 @@ fn mcpEncodeTerminalKeyAlloc(
 }
 
 const McpBrowserReadiness = enum { ready, wait, passthrough };
+const McpBrowserEvalMode = enum { synchronous, promise_aware };
 
 fn mcpBrowserReadinessFromStatus(allocator: std.mem.Allocator, response: []const u8) McpBrowserReadiness {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch return .passthrough;
@@ -6722,11 +6745,192 @@ fn mcpBrowserReadinessFromStatus(allocator: std.mem.Allocator, response: []const
     if (result != .object) return .passthrough;
     const status = jsonString(result.object.get("status") orelse .null) orelse return .passthrough;
     const runtime_initialized = jsonBool(result.object.get("runtime_initialized") orelse .null) orelse return .passthrough;
-    if (std.mem.eql(u8, status, "Ready") and runtime_initialized) return .ready;
+    if (std.mem.eql(u8, status, "Ready") and runtime_initialized) {
+        const url = jsonString(result.object.get("url") orelse .null);
+        if (jsonString(result.object.get("address") orelse .null)) |address| {
+            const url_matches = if (url) |value| std.mem.eql(u8, value, address) else false;
+            if (address.len > 0 and !std.mem.eql(u8, address, "about:blank") and !url_matches) return .wait;
+        }
+        return .ready;
+    }
     if (std.mem.eql(u8, status, "Opening") or (std.mem.eql(u8, status, "Ready") and !runtime_initialized)) return .wait;
     // Hidden and failed runtimes should reach browser.eval so Live can return
     // its precise structured error instead of being flattened into a timeout.
     return .passthrough;
+}
+
+const McpBrowserNavigationReadiness = enum { target, stable_other, wait, passthrough };
+
+fn mcpBrowserUrlMatchesTarget(candidate: []const u8, target: []const u8) bool {
+    const trimmed = std.mem.trim(u8, target, &std.ascii.whitespace);
+    if (std.mem.eql(u8, candidate, trimmed)) return true;
+    if (std.mem.indexOf(u8, trimmed, "://") != null or
+        std.mem.startsWith(u8, trimmed, "about:") or
+        std.mem.startsWith(u8, trimmed, "data:") or
+        std.mem.startsWith(u8, trimmed, "file:") or
+        std.mem.startsWith(u8, trimmed, "blob:") or
+        std.mem.startsWith(u8, trimmed, "javascript:") or
+        std.mem.startsWith(u8, trimmed, "mailto:")) return false;
+    const prefix = "https://";
+    return candidate.len == prefix.len + trimmed.len and
+        std.mem.startsWith(u8, candidate, prefix) and
+        std.mem.eql(u8, candidate[prefix.len..], trimmed);
+}
+
+fn mcpBrowserResponseUrlAlloc(allocator: std.mem.Allocator, response: []const u8) !?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    if (!(jsonBool(parsed.value.object.get("ok") orelse .null) orelse false)) return null;
+    const result = parsed.value.object.get("result") orelse return null;
+    if (result != .object) return null;
+    const url = jsonString(result.object.get("url") orelse .null) orelse return null;
+    if (url.len == 0) return null;
+    return try allocator.dupe(u8, url);
+}
+
+fn mcpBrowserNavigationReadinessFromStatus(
+    allocator: std.mem.Allocator,
+    response: []const u8,
+    target_url: []const u8,
+    previous_url: ?[]const u8,
+) McpBrowserNavigationReadiness {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch return .passthrough;
+    defer parsed.deinit();
+    if (parsed.value != .object) return .passthrough;
+    if (!(jsonBool(parsed.value.object.get("ok") orelse .null) orelse false)) return .passthrough;
+    const result = parsed.value.object.get("result") orelse return .passthrough;
+    if (result != .object) return .passthrough;
+    const status = jsonString(result.object.get("status") orelse .null) orelse return .passthrough;
+    const runtime_initialized = jsonBool(result.object.get("runtime_initialized") orelse .null) orelse return .passthrough;
+    if (!std.mem.eql(u8, status, "Ready") or !runtime_initialized) {
+        if (std.mem.eql(u8, status, "Opening") or std.mem.eql(u8, status, "Ready")) return .wait;
+        return .passthrough;
+    }
+
+    const url = jsonString(result.object.get("url") orelse .null) orelse return .wait;
+    const address = jsonString(result.object.get("address") orelse .null);
+    if (address) |value| {
+        if (value.len > 0 and !std.mem.eql(u8, url, value)) return .wait;
+    }
+    if (mcpBrowserUrlMatchesTarget(url, target_url)) return .target;
+    if (address) |value| {
+        if (mcpBrowserUrlMatchesTarget(value, target_url)) return .target;
+    }
+    // The navigate acknowledgement reports the page that was current when
+    // the action was accepted. It cannot qualify as a redirect until the
+    // runtime has actually left that page.
+    if (previous_url) |previous| if (mcpBrowserUrlMatchesTarget(url, previous)) return .wait;
+    if (url.len == 0 or std.mem.eql(u8, url, "about:blank")) return .wait;
+    return .stable_other;
+}
+
+fn mcpBrowserNavigationReadinessFromAction(
+    allocator: std.mem.Allocator,
+    response: []const u8,
+    target_url: []const u8,
+    previous_url: ?[]const u8,
+) McpBrowserNavigationReadiness {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch return .passthrough;
+    defer parsed.deinit();
+    if (parsed.value != .object) return .passthrough;
+    if (!(jsonBool(parsed.value.object.get("ok") orelse .null) orelse false)) return .passthrough;
+    const ready_state = jsonString(parsed.value.object.get("result") orelse .null) orelse return .wait;
+    if (!std.mem.eql(u8, ready_state, "interactive") and !std.mem.eql(u8, ready_state, "complete")) return .wait;
+    const url = jsonString(parsed.value.object.get("url") orelse .null) orelse return .wait;
+    if (mcpBrowserUrlMatchesTarget(url, target_url)) return .target;
+    if (previous_url) |previous| if (mcpBrowserUrlMatchesTarget(url, previous)) return .wait;
+    if (url.len == 0 or std.mem.eql(u8, url, "about:blank")) return .wait;
+    return .stable_other;
+}
+
+fn mcpBrowserProbeNavigationReadiness(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    workspace: ?[]const u8,
+    target_url: []const u8,
+    previous_url: ?[]const u8,
+) !McpBrowserNavigationReadiness {
+    const nonce = try std.fmt.allocPrint(allocator, "{d}-{d}", .{
+        platform_runtime.processId(),
+        platform_runtime.monotonicTimestampNs(),
+    });
+    defer allocator.free(nonce);
+    const script = try mcpBrowserStartScriptAlloc(
+        allocator,
+        nonce,
+        "return String(document.readyState);",
+        .synchronous,
+    );
+    defer allocator.free(script);
+
+    const accepted = try sendLiveRequestAlloc(allocator, io, "browser.eval", .{
+        .workspace = workspace,
+        .script = script,
+    }, 1);
+    defer allocator.free(accepted);
+    if (!liveResponseOk(allocator, accepted)) return .passthrough;
+
+    const status = try sendLiveRequestAlloc(allocator, io, "browser.status", .{ .workspace = workspace }, 1);
+    defer allocator.free(status);
+    const action = try mcpBrowserActionResultAlloc(allocator, status, nonce);
+    const response = action orelse return .wait;
+    defer allocator.free(response);
+    return mcpBrowserNavigationReadinessFromAction(
+        allocator,
+        response,
+        target_url,
+        previous_url,
+    );
+}
+
+fn mcpBrowserWaitForNavigation(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    workspace: ?[]const u8,
+    target_url: []const u8,
+    previous_url: ?[]const u8,
+    deadline_ms: i64,
+) !void {
+    var stable_since_ms: ?i64 = null;
+    while (true) {
+        const status = try sendLiveRequestAlloc(allocator, io, "browser.status", .{ .workspace = workspace }, 1);
+        defer allocator.free(status);
+        switch (mcpBrowserNavigationReadinessFromStatus(allocator, status, target_url, previous_url)) {
+            .passthrough => return,
+            .wait => stable_since_ms = null,
+            .target, .stable_other => {
+                // WPE can briefly report the target document Ready before a
+                // pane rebind resets it to about:blank. Require a quiet
+                // window so the next MCP action reaches the retained page.
+                const now_ms = sessionizer.monotonicNowMs();
+                const started_ms = stable_since_ms orelse start: {
+                    stable_since_ms = now_ms;
+                    break :start now_ms;
+                };
+                if (now_ms - started_ms >= MCP_BROWSER_NAVIGATION_SETTLE_MS) {
+                    // The WPE navigation callback can update browser.status
+                    // before the JavaScript context leaves the previous DOM.
+                    // Probe inside the document so the next MCP action cannot
+                    // run against stale page content.
+                    switch (try mcpBrowserProbeNavigationReadiness(
+                        allocator,
+                        io,
+                        workspace,
+                        target_url,
+                        previous_url,
+                    )) {
+                        .target, .stable_other => return,
+                        .wait => stable_since_ms = null,
+                        .passthrough => return,
+                    }
+                }
+            },
+        }
+        const remaining_ms = confirmationRemainingMs(deadline_ms) orelse return error.BrowserActionTimeout;
+        const sleep_ms: u32 = @intCast(@min(remaining_ms, @as(i64, MCP_BROWSER_POLL_INTERVAL_MS)));
+        try std.Io.sleep(io, .fromMilliseconds(sleep_ms), .awake);
+    }
 }
 
 fn mcpBrowserWaitUntilReady(
@@ -6754,28 +6958,43 @@ fn mcpBrowserEvalAndWaitAlloc(
     workspace: ?[]const u8,
     script_body: []const u8,
     timeout_ms: u32,
+    mode: McpBrowserEvalMode,
 ) ![]u8 {
-    const deadline_ms = sessionizer.monotonicNowMs() +| @as(i64, @intCast(timeout_ms));
+    const readiness_deadline_ms = sessionizer.monotonicNowMs() +| @as(i64, @intCast(MCP_BROWSER_ACTION_TIMEOUT_MS));
     // Navigation marks the runtime Opening before its Live response returns.
     // Do not inject the nonce-bearing action into that disposable document:
     // cross-origin startup can replace the JS context and strand it pending.
-    try mcpBrowserWaitUntilReady(allocator, io, workspace, deadline_ms);
+    try mcpBrowserWaitUntilReady(allocator, io, workspace, readiness_deadline_ms);
+
+    // Cold WPE startup can consume the readiness window. Give the action its
+    // own budget once the stable document is available.
+    const action_deadline_ms = sessionizer.monotonicNowMs() +| @as(i64, @intCast(timeout_ms));
 
     const nonce = try std.fmt.allocPrint(allocator, "{d}-{d}", .{ platform_runtime.processId(), platform_runtime.monotonicTimestampNs() });
     defer allocator.free(nonce);
-    const start_script = try mcpBrowserStartScriptAlloc(allocator, nonce, script_body);
+    const start_script = try mcpBrowserStartScriptAlloc(allocator, nonce, script_body, mode);
     defer allocator.free(start_script);
-    const poll_script = try mcpBrowserPollScriptAlloc(allocator, nonce);
-    defer allocator.free(poll_script);
+    const poll_script = try mcpBrowserPollScriptForModeAlloc(allocator, nonce, mode);
+    defer if (poll_script) |script| allocator.free(script);
 
     const accepted = try sendLiveRequestAlloc(allocator, io, "browser.eval", .{ .workspace = workspace, .script = start_script }, 1);
     defer allocator.free(accepted);
     if (!liveResponseOk(allocator, accepted)) return try allocator.dupe(u8, accepted);
 
-    while (confirmationRemainingMs(deadline_ms)) |remaining_ms| {
-        const poll_accepted = try sendLiveRequestAlloc(allocator, io, "browser.eval", .{ .workspace = workspace, .script = poll_script }, 1);
-        defer allocator.free(poll_accepted);
-        if (!liveResponseOk(allocator, poll_accepted)) return try allocator.dupe(u8, poll_accepted);
+    // Synchronous actions can finish before the first poll. Capture that
+    // result before a click-triggered navigation replaces the page context.
+    const initial_status = try sendLiveRequestAlloc(allocator, io, "browser.status", .{ .workspace = workspace }, 1);
+    defer allocator.free(initial_status);
+    if (try mcpBrowserActionResultAlloc(allocator, initial_status, nonce)) |result| return result;
+
+    while (confirmationRemainingMs(action_deadline_ms)) |remaining_ms| {
+        // Synchronous evaluations return their payload directly. Submitting a
+        // poll script can race that result and overwrite it with pending.
+        if (poll_script) |script| {
+            const poll_accepted = try sendLiveRequestAlloc(allocator, io, "browser.eval", .{ .workspace = workspace, .script = script }, 1);
+            defer allocator.free(poll_accepted);
+            if (!liveResponseOk(allocator, poll_accepted)) return try allocator.dupe(u8, poll_accepted);
+        }
         const status = try sendLiveRequestAlloc(allocator, io, "browser.status", .{ .workspace = workspace }, 1);
         defer allocator.free(status);
         if (try mcpBrowserActionResultAlloc(allocator, status, nonce)) |result| return result;
@@ -6809,16 +7028,44 @@ fn mcpBrowserActionResultAlloc(allocator: std.mem.Allocator, status: []const u8,
     return try allocator.dupe(u8, raw_action);
 }
 
-fn mcpBrowserStartScriptAlloc(allocator: std.mem.Allocator, nonce: []const u8, script_body: []const u8) ![]u8 {
+fn mcpBrowserStartScriptAlloc(
+    allocator: std.mem.Allocator,
+    nonce: []const u8,
+    script_body: []const u8,
+    mode: McpBrowserEvalMode,
+) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
     try writer.writer.writeAll("(()=>{const __verdeNonce=");
     var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
     try s.write(nonce);
-    try writer.writer.writeAll(",__verdeKey='__verdeAgentEval_'+__verdeNonce;window[__verdeKey]={done:false};Promise.resolve().then(async()=>{");
-    try writer.writer.writeAll(script_body);
-    try writer.writer.writeAll("}).then(result=>{window[__verdeKey]={done:true,payload:{verdeAgentBrowserNonce:__verdeNonce,ok:true,url:String(location.href),result}}},error=>{window[__verdeKey]={done:true,payload:{verdeAgentBrowserNonce:__verdeNonce,ok:false,url:String(location.href),error:{name:String(error&&error.name||'Error'),message:String(error&&error.message||error),stack:String(error&&error.stack||'')}}}});return {verdeAgentBrowserNonce:__verdeNonce,pending:true};})()");
+    try writer.writer.writeAll(",__verdeKey='__verdeAgentEval_'+__verdeNonce;window[__verdeKey]={done:false};const __verdeResolve=result=>{const payload={verdeAgentBrowserNonce:__verdeNonce,ok:true,url:String(location.href),result};window[__verdeKey]={done:true,payload};return payload},__verdeReject=error=>{const payload={verdeAgentBrowserNonce:__verdeNonce,ok:false,url:String(location.href),error:{name:String(error&&error.name||'Error'),message:String(error&&error.message||error),stack:String(error&&error.stack||'')}};window[__verdeKey]={done:true,payload};return payload};");
+    switch (mode) {
+        .synchronous => {
+            // Hidden WPE surfaces pause page microtasks, so ordinary inspect,
+            // click, and type actions must complete in this evaluation turn.
+            try writer.writer.writeAll("try{return __verdeResolve((()=>{");
+            try writer.writer.writeAll(script_body);
+            try writer.writer.writeAll("})())}catch(error){return __verdeReject(error)}})()");
+        },
+        .promise_aware => {
+            try writer.writer.writeAll("Promise.resolve().then(async()=>{");
+            try writer.writer.writeAll(script_body);
+            try writer.writer.writeAll("}).then(__verdeResolve,__verdeReject);return {verdeAgentBrowserNonce:__verdeNonce,pending:true};})()");
+        },
+    }
     return try writer.toOwnedSlice();
+}
+
+fn mcpBrowserPollScriptForModeAlloc(
+    allocator: std.mem.Allocator,
+    nonce: []const u8,
+    mode: McpBrowserEvalMode,
+) !?[]u8 {
+    return switch (mode) {
+        .synchronous => null,
+        .promise_aware => try mcpBrowserPollScriptAlloc(allocator, nonce),
+    };
 }
 
 fn mcpBrowserPollScriptAlloc(allocator: std.mem.Allocator, nonce: []const u8) ![]u8 {
@@ -8358,7 +8605,7 @@ test "browser MCP action result is correlated by nonce" {
     try std.testing.expect((try mcpBrowserActionResultAlloc(allocator, pending, "test-nonce")) == null);
 }
 
-test "browser MCP actions wait only for an opening runtime" {
+test "browser MCP actions wait for runtime and pending navigation" {
     const allocator = std.testing.allocator;
     const opening =
         \\{"ok":true,"result":{"runtime_initialized":false,"status":"Opening"}}
@@ -8368,6 +8615,15 @@ test "browser MCP actions wait only for an opening runtime" {
     ;
     const ready =
         \\{"ok":true,"result":{"runtime_initialized":true,"status":"Ready"}}
+    ;
+    const pending_navigation =
+        \\{"ok":true,"result":{"runtime_initialized":true,"status":"Ready","url":"about:blank","address":"https://example.com"}}
+    ;
+    const loaded =
+        \\{"ok":true,"result":{"runtime_initialized":true,"status":"Ready","url":"https://example.com","address":"https://example.com"}}
+    ;
+    const blank =
+        \\{"ok":true,"result":{"runtime_initialized":true,"status":"Ready","url":"about:blank","address":"about:blank"}}
     ;
     const hidden =
         \\{"ok":true,"result":{"runtime_initialized":false,"status":"Hidden"}}
@@ -8379,22 +8635,108 @@ test "browser MCP actions wait only for an opening runtime" {
     try std.testing.expectEqual(McpBrowserReadiness.wait, mcpBrowserReadinessFromStatus(allocator, opening));
     try std.testing.expectEqual(McpBrowserReadiness.wait, mcpBrowserReadinessFromStatus(allocator, initializing_ready));
     try std.testing.expectEqual(McpBrowserReadiness.ready, mcpBrowserReadinessFromStatus(allocator, ready));
+    try std.testing.expectEqual(McpBrowserReadiness.wait, mcpBrowserReadinessFromStatus(allocator, pending_navigation));
+    try std.testing.expectEqual(McpBrowserReadiness.ready, mcpBrowserReadinessFromStatus(allocator, loaded));
+    try std.testing.expectEqual(McpBrowserReadiness.ready, mcpBrowserReadinessFromStatus(allocator, blank));
     try std.testing.expectEqual(McpBrowserReadiness.passthrough, mcpBrowserReadinessFromStatus(allocator, hidden));
     try std.testing.expectEqual(McpBrowserReadiness.passthrough, mcpBrowserReadinessFromStatus(allocator, failed));
     try std.testing.expectEqual(McpBrowserReadiness.passthrough, mcpBrowserReadinessFromStatus(allocator, "not json"));
 }
 
-test "browser MCP scripts await without returning a Promise to the backend" {
+test "browser MCP navigation confirmation rejects transient blank state" {
     const allocator = std.testing.allocator;
-    const start_script = try mcpBrowserStartScriptAlloc(allocator, "nonce", "return Promise.resolve({ready:true});");
-    defer allocator.free(start_script);
-    const poll_script = try mcpBrowserPollScriptAlloc(allocator, "nonce");
+    const opening =
+        \\{\"ok\":true,\"result\":{\"runtime_initialized\":false,\"status\":\"Opening\"}}
+    ;
+    const transient_blank =
+        \\{\"ok\":true,\"result\":{\"runtime_initialized\":true,\"status\":\"Ready\",\"url\":\"about:blank\",\"address\":\"about:blank\"}}
+    ;
+    const pending_target =
+        \\{\"ok\":true,\"result\":{\"runtime_initialized\":true,\"status\":\"Ready\",\"url\":\"about:blank\",\"address\":\"https://example.com\"}}
+    ;
+    const loaded =
+        \\{\"ok\":true,\"result\":{\"runtime_initialized\":true,\"status\":\"Ready\",\"url\":\"https://example.com\",\"address\":\"https://example.com\"}}
+    ;
+    const redirected =
+        \\{\"ok\":true,\"result\":{\"runtime_initialized\":true,\"status\":\"Ready\",\"url\":\"https://www.example.com/\",\"address\":\"https://www.example.com/\"}}
+    ;
+    const hidden =
+        \\{\"ok\":true,\"result\":{\"runtime_initialized\":false,\"status\":\"Hidden\"}}
+    ;
+    const stale_document =
+        \\{\"verdeAgentBrowserNonce\":\"nonce\",\"ok\":true,\"url\":\"https://old.example/\",\"result\":\"complete\"}
+    ;
+    const loaded_document =
+        \\{\"verdeAgentBrowserNonce\":\"nonce\",\"ok\":true,\"url\":\"https://example.com\",\"result\":\"complete\"}
+    ;
+    const redirected_document =
+        \\{\"verdeAgentBrowserNonce\":\"nonce\",\"ok\":true,\"url\":\"https://www.example.com/\",\"result\":\"interactive\"}
+    ;
+    const loading_document =
+        \\{\"verdeAgentBrowserNonce\":\"nonce\",\"ok\":true,\"url\":\"https://example.com\",\"result\":\"loading\"}
+    ;
+
+    try std.testing.expectEqual(McpBrowserNavigationReadiness.wait, mcpBrowserNavigationReadinessFromStatus(allocator, opening, "example.com", null));
+    try std.testing.expectEqual(McpBrowserNavigationReadiness.wait, mcpBrowserNavigationReadinessFromStatus(allocator, transient_blank, "example.com", null));
+    try std.testing.expectEqual(McpBrowserNavigationReadiness.wait, mcpBrowserNavigationReadinessFromStatus(allocator, pending_target, "example.com", null));
+    try std.testing.expectEqual(McpBrowserNavigationReadiness.target, mcpBrowserNavigationReadinessFromStatus(allocator, loaded, "example.com", null));
+    try std.testing.expectEqual(McpBrowserNavigationReadiness.stable_other, mcpBrowserNavigationReadinessFromStatus(allocator, redirected, "example.com", null));
+    try std.testing.expectEqual(McpBrowserNavigationReadiness.wait, mcpBrowserNavigationReadinessFromStatus(
+        allocator,
+        redirected,
+        "https://target.example/",
+        "https://www.example.com/",
+    ));
+    try std.testing.expectEqual(McpBrowserNavigationReadiness.target, mcpBrowserNavigationReadinessFromStatus(allocator, transient_blank, "about:blank", null));
+    try std.testing.expectEqual(McpBrowserNavigationReadiness.passthrough, mcpBrowserNavigationReadinessFromStatus(allocator, hidden, "example.com", null));
+
+    try std.testing.expectEqual(McpBrowserNavigationReadiness.wait, mcpBrowserNavigationReadinessFromAction(
+        allocator,
+        stale_document,
+        "https://example.com",
+        "https://old.example/",
+    ));
+    try std.testing.expectEqual(McpBrowserNavigationReadiness.target, mcpBrowserNavigationReadinessFromAction(
+        allocator,
+        loaded_document,
+        "example.com",
+        "https://old.example/",
+    ));
+    try std.testing.expectEqual(McpBrowserNavigationReadiness.stable_other, mcpBrowserNavigationReadinessFromAction(
+        allocator,
+        redirected_document,
+        "example.com",
+        "https://old.example/",
+    ));
+    try std.testing.expectEqual(McpBrowserNavigationReadiness.wait, mcpBrowserNavigationReadinessFromAction(
+        allocator,
+        loading_document,
+        "example.com",
+        null,
+    ));
+
+    const response_url = (try mcpBrowserResponseUrlAlloc(allocator, redirected)).?;
+    defer allocator.free(response_url);
+    try std.testing.expectEqualStrings("https://www.example.com/", response_url);
+}
+
+test "browser MCP scripts keep synchronous actions off the page microtask queue" {
+    const allocator = std.testing.allocator;
+    const synchronous = try mcpBrowserStartScriptAlloc(allocator, "nonce", "return {ready:true};", .synchronous);
+    defer allocator.free(synchronous);
+    const promise_aware = try mcpBrowserStartScriptAlloc(allocator, "nonce", "return Promise.resolve({ready:true});", .promise_aware);
+    defer allocator.free(promise_aware);
+    const synchronous_poll = try mcpBrowserPollScriptForModeAlloc(allocator, "nonce", .synchronous);
+    const poll_script = (try mcpBrowserPollScriptForModeAlloc(allocator, "nonce", .promise_aware)).?;
     defer allocator.free(poll_script);
 
-    try std.testing.expect(std.mem.indexOf(u8, start_script, "Promise.resolve().then(async()=>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, start_script, "return {verdeAgentBrowserNonce:__verdeNonce,pending:true}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, start_script, "name:String(error&&error.name") != null);
-    try std.testing.expect(std.mem.indexOf(u8, start_script, "stack:String(error&&error.stack") != null);
+    try std.testing.expect(synchronous_poll == null);
+    try std.testing.expect(std.mem.indexOf(u8, synchronous, "Promise.resolve().then(async()=>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, synchronous, "try{return __verdeResolve((()=>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, promise_aware, "Promise.resolve().then(async()=>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, promise_aware, "return {verdeAgentBrowserNonce:__verdeNonce,pending:true}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, promise_aware, "name:String(error&&error.name") != null);
+    try std.testing.expect(std.mem.indexOf(u8, promise_aware, "stack:String(error&&error.stack") != null);
     try std.testing.expect(std.mem.indexOf(u8, poll_script, "delete window[key]") != null);
 }
 
