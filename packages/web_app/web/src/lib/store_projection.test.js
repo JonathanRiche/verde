@@ -5,6 +5,7 @@ import {
   clipboardImageFiles,
   findLastChatPane,
   lastDeliveredTailSeq,
+  layoutFromLivePanes,
   mapTranscriptRows,
   mergeThreadCatalogSettings,
   panesForWorkspace,
@@ -13,6 +14,71 @@ import {
   requestTerminalOpen,
   setFavoriteModelInList,
 } from './store.ts'
+import { adjacentPaneInGroups, workspacePaneGroups } from './types.ts'
+
+describe('scrolling tile groups', () => {
+  const panes = [
+    { pane_id: 101, native_pane_id: 1, scroll_group_id: 1, workspace_id: 'w', kind: 'chat' },
+    { pane_id: 102, native_pane_id: 2, scroll_group_id: 1, workspace_id: 'w', kind: 'terminal' },
+    { pane_id: 103, native_pane_id: 3, workspace_id: 'w', kind: 'chat' },
+  ]
+  const root = {
+    split: {
+      axis: 'vertical',
+      ratio: 0.6,
+      first: {
+        split: {
+          axis: 'horizontal',
+          ratio: 0.4,
+          first: { leaf: 1 },
+          second: { leaf: 2 },
+        },
+      },
+      second: { leaf: 3 },
+    },
+  }
+
+  test('preserves live root and scrolling group ids', () => {
+    const layout = layoutFromLivePanes({ result: {
+      focused_pane_id: 2,
+      panes: [
+        { pane_id: 1, kind: 'chat', thread_index: 0, scroll_group: 1 },
+        { pane_id: 2, kind: 'terminal', dock_id: 7, scroll_group: 1 },
+      ],
+      root,
+    } })
+
+    expect(layout).toMatchObject({
+      focused: 2,
+      panes: [{ id: 1, scroll_group: 1 }, { id: 2, scroll_group: 1 }],
+      root,
+    })
+  })
+
+  test('renders a nested group as one strip item and keeps the standalone pane separate', () => {
+    const groups = workspacePaneGroups(panes, root)
+
+    expect(groups).toHaveLength(2)
+    expect(groups[0].panes.map((pane) => pane.pane_id)).toEqual([101, 102])
+    expect(groups[0].layout).toEqual({
+      split: {
+        axis: 'horizontal',
+        ratio: 0.4,
+        first: { leaf: 101 },
+        second: { leaf: 102 },
+      },
+    })
+    expect(groups[1].layout).toEqual({ leaf: 103 })
+  })
+
+  test('directional focus follows inner split geometry before the scrolling strip', () => {
+    const groups = workspacePaneGroups(panes, root)
+
+    expect(adjacentPaneInGroups(groups, 101, 'down')).toBe(102)
+    expect(adjacentPaneInGroups(groups, 102, 'up')).toBe(101)
+    expect(adjacentPaneInGroups(groups, 101, 'right')).toBe(103)
+  })
+})
 
 describe('shared model favorites', () => {
   test('parses, trims, and deduplicates the config snapshot', () => {

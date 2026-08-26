@@ -323,6 +323,42 @@ textarea { resize: none; }
 .niri-inset .niri-column {
   border-radius: 8px;
 }
+.pane-tile {
+  border: 1px solid var(--border-muted);
+  border-radius: 2px;
+}
+.pane-split-gutter {
+  position: relative;
+  z-index: 2;
+  flex: 0 0 var(--workspace-pane-gap, 12px);
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  background: var(--chat-black);
+  touch-action: none;
+}
+.pane-split-gutter::after {
+  content: '';
+  position: absolute;
+  opacity: 0;
+  background: var(--border-muted);
+  transition: opacity 120ms ease;
+}
+.pane-split-gutter:hover::after,
+.pane-split-gutter:focus-visible::after,
+.pane-split-gutter:active::after { opacity: 1; }
+.pane-split-gutter-vertical { cursor: col-resize; }
+.pane-split-gutter-vertical::after {
+  inset: 25% auto;
+  left: calc(50% - 1px);
+  width: 2px;
+}
+.pane-split-gutter-horizontal { cursor: row-resize; }
+.pane-split-gutter-horizontal::after {
+  inset: auto 25%;
+  top: calc(50% - 1px);
+  height: 2px;
+}
 @media (min-width: 1024px) {
   /* Fit `workspace_panes_per_view` columns in the strip content box, then
      scroll the rest. n=1 is desktop scrolling mode with one pane on screen. */

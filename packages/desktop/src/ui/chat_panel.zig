@@ -7105,7 +7105,14 @@ fn renderComposerSlashCommands(state: *app_state.AppState) void {
             .w = row.w - theme.scaledUi(120.0),
             .h = theme.scaledUi(16.0),
         }, data.usage, meta_color, theme.scaledUi(11.5), row);
-        const badge = if (data.disabled) "Unavailable" else data.provider_label;
+        // Session-scoped commands are only greyed out until the first turn
+        // creates a provider thread; say so instead of a blanket "Unavailable".
+        const badge = if (!data.disabled)
+            data.provider_label
+        else if (data.requires_thread)
+            "Needs thread"
+        else
+            "Unavailable";
         queueText(state, .{
             .x = row.x + row.w - theme.scaledUi(104.0),
             .y = row.y + theme.scaledUi(16.0),

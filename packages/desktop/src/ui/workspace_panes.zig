@@ -49,8 +49,10 @@ const QUICK_PANE_MIN_H_CSS: f32 = 220.0;
 const QUICK_PANE_MARGIN_CSS: f32 = 12.0;
 const QUICK_PANE_DRAG_H_CSS: f32 = 28.0;
 const QUICK_PANE_RESIZE_GRIP_CSS: f32 = 18.0;
-const SCROLLING_WHEEL_STEP_CSS: f32 = 72.0;
-const SCROLLING_SNAP_IDLE_MS: i64 = 120;
+// Smooth SDL deltas are small; this keeps a laptop swipe close to the
+// compositor-style distance shown by one workspace gesture.
+const SCROLLING_WHEEL_STEP_CSS: f32 = 120.0;
+const SCROLLING_SNAP_IDLE_MS: i64 = 80;
 const SCROLLING_ANIMATION_DURATION_MS: i64 = 150;
 const SCROLLING_ANIMATION_MAX_STEP_MS: i64 = 50;
 const SCROLLING_ANIMATION_EPSILON: f32 = 0.5;
@@ -285,6 +287,10 @@ pub fn handlePaletteWheel(state: *runtime.AppState, x: f32, y: f32, wheel_x: f32
         .horizontal => &layout.scroll_target_x,
         .vertical => &layout.scroll_target_y,
     };
+    const offset: *f32 = switch (state.app_config.workspace_scroll_direction) {
+        .horizontal => &layout.scroll_offset_x,
+        .vertical => &layout.scroll_offset_y,
+    };
     const next_target = freeScrollTarget(
         target.*,
         delta,
@@ -292,9 +298,9 @@ pub fn handlePaletteWheel(state: *runtime.AppState, x: f32, y: f32, wheel_x: f32
         scrolling_max_offset,
     );
     if (@abs(next_target - target.*) > 0.001) {
-        target.* = next_target;
         const timestamp = nowMs();
-        layout.scroll_animation_last_ms = timestamp;
+        applyDirectWheelTarget(offset, target, next_target);
+        layout.scroll_animation_last_ms = 0;
         layout.scroll_snap_deadline_ms = timestamp + SCROLLING_SNAP_IDLE_MS;
         state.markDirty();
     }
@@ -311,6 +317,11 @@ fn scrollingWheelDelta(direction: app_config.WorkspaceScrollDirection, wheel_x: 
 
 fn freeScrollTarget(current: f32, delta: f32, step: f32, max_offset: f32) f32 {
     return std.math.clamp(current + delta * step, 0.0, max_offset);
+}
+
+fn applyDirectWheelTarget(offset: *f32, target: *f32, next_target: f32) void {
+    offset.* = next_target;
+    target.* = next_target;
 }
 
 // Placement for a hotkey-opened pane while auto-building the 2x2 grid.
@@ -3714,12 +3725,20 @@ test "scrolling wheel routing preserves ordinary vertical pane scrolling" {
 test "manual scrolling settles partial positions to the nearest pane" {
     const extents = [_]f32{ 500.0, 360.0, 640.0 };
     const target = freeScrollTarget(0.0, 4.5, SCROLLING_WHEEL_STEP_CSS, 884.0);
-    try std.testing.expectApproxEqAbs(@as(f32, 324.0), target, 0.0001);
-    try std.testing.expect(scrollSnapTargetAfterIdle(120, 119, target, &extents, 12.0, 884.0) == null);
-    try std.testing.expectApproxEqAbs(@as(f32, 512.0), scrollSnapTargetAfterIdle(120, 120, target, &extents, 12.0, 884.0).?, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 540.0), target, 0.0001);
+    try std.testing.expect(scrollSnapTargetAfterIdle(SCROLLING_SNAP_IDLE_MS, SCROLLING_SNAP_IDLE_MS - 1, target, &extents, 12.0, 884.0) == null);
+    try std.testing.expectApproxEqAbs(@as(f32, 512.0), scrollSnapTargetAfterIdle(SCROLLING_SNAP_IDLE_MS, SCROLLING_SNAP_IDLE_MS, target, &extents, 12.0, 884.0).?, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), nearestPaneScrollTarget(200.0, &extents, 12.0, 884.0), 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 884.0), nearestPaneScrollTarget(800.0, &extents, 12.0, 884.0), 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 1200.0), freeScrollTarget(1190.0, 1.0, SCROLLING_WHEEL_STEP_CSS, 1200.0), 0.0001);
+}
+
+test "trackpad updates move the rendered strip directly with the gesture" {
+    var offset: f32 = 100.0;
+    var target: f32 = 240.0;
+    applyDirectWheelTarget(&offset, &target, 360.0);
+    try std.testing.expectEqual(@as(f32, 360.0), offset);
+    try std.testing.expectEqual(offset, target);
 }
 
 test "scrolling animation advances without overshooting" {

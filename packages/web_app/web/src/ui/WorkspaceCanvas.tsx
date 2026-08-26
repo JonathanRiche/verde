@@ -1,7 +1,7 @@
-import { For, Show, createEffect, createMemo, onCleanup, onMount } from 'solid-js'
+import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from 'solid-js'
 
 import { store } from '../lib/store'
-import type { LivePane } from '../lib/types'
+import type { LayoutNode, LivePane, WorkspacePaneGroup } from '../lib/types'
 import { effectivePanesPerView } from '../lib/ui_config'
 import { ChatPane } from './ChatPane'
 import { Icon, ZoomButton } from './Icons'
@@ -17,24 +17,25 @@ export function WorkspaceCanvas() {
 
   // Zoom renders only the maximized pane; the single column then naturally
   // fills the strip and other panes remount from daemon state on unzoom.
-  const panes = () => {
-    const all = store.openPanes()
+  const groups = (): WorkspacePaneGroup[] => {
     const zoomed_id = store.maximizedPaneId()
     if (zoomed_id != null) {
-      const zoomed = all.filter((pane) => pane.pane_id === zoomed_id)
-      if (zoomed.length > 0) return zoomed
+      const zoomed = store.openPanes().find((pane) => pane.pane_id === zoomed_id)
+      if (zoomed) return [{ key: `zoom:${zoomed_id}`, panes: [zoomed], layout: { leaf: zoomed_id } }]
     }
-    return all
+    return store.paneGroups()
   }
 
-  const pane_order = createMemo(() => panes().map((pane) => pane.pane_id).join(','))
+  const pane_order = createMemo(() => groups().flatMap((group) => group.panes.map((pane) => pane.pane_id)).join(','))
 
   createEffect(() => {
     pane_order()
     const id = store.focusedPaneId()
     const root = scroller
     if (!root || id == null) return
-    const column = root.querySelector(`[data-pane-id="${id}"]`)
+    const leaf = root.querySelector(`[data-pane-id="${id}"]`)
+    if (!(leaf instanceof HTMLElement)) return
+    const column = leaf.closest('.niri-column')
     if (!(column instanceof HTMLElement)) return
     const instant = store.takeInstantFocus(id) || last_focused_id === id
     last_focused_id = id
@@ -81,7 +82,7 @@ export function WorkspaceCanvas() {
 
   const inset = () => store.maximizedPaneId() == null && !store.compact()
   const panes_per_view = () =>
-    effectivePanesPerView(store.uiConfig(), panes().length, store.maximizedPaneId() != null)
+    effectivePanesPerView(store.uiConfig(), groups().length, store.maximizedPaneId() != null)
   const pane_gap = () => store.uiConfig().workspace_pane_gap
 
   return (
@@ -95,10 +96,18 @@ export function WorkspaceCanvas() {
         scroller = node
       }}
     >
-      <For each={panes()} fallback={<EmptyWorkspace />}>
-        {(pane) => (
-          <div class="niri-column" data-pane-id={String(pane.pane_id)}>
-            <PaneFrame pane={pane} />
+      <For each={groups()} fallback={<EmptyWorkspace />}>
+        {(group) => (
+          <div
+            class="niri-column"
+            data-scroll-group={group.key}
+            data-representative-pane-id={String(group.panes[0]?.pane_id ?? '')}
+          >
+            <PaneGroupNode
+              node={group.layout}
+              panes={group.panes}
+              bordered={groups().length > 1 || group.panes.length > 1}
+            />
           </div>
         )}
       </For>
@@ -109,15 +118,115 @@ export function WorkspaceCanvas() {
 function nearestPaneId(root: HTMLDivElement): number | null {
   const mid = root.scrollLeft + root.clientWidth / 2
   let best: { id: number; dist: number } | null = null
-  for (const node of root.querySelectorAll('[data-pane-id]')) {
+  for (const node of root.querySelectorAll('[data-scroll-group]')) {
     if (!(node instanceof HTMLElement)) continue
     const center = node.offsetLeft + node.offsetWidth / 2
     const dist = Math.abs(center - mid)
-    const id = Number(node.dataset.paneId)
+    const id = Number(node.dataset.representativePaneId)
     if (!Number.isFinite(id)) continue
     if (!best || dist < best.dist) best = { id, dist }
   }
   return best?.id ?? null
+}
+
+function firstLayoutLeaf(node: LayoutNode): number {
+  return 'leaf' in node ? node.leaf : firstLayoutLeaf(node.split.first)
+}
+
+function PaneGroupNode(props: { node: LayoutNode; panes: LivePane[]; bordered: boolean }) {
+  if ('leaf' in props.node) {
+    const leaf_id = props.node.leaf
+    const pane = props.panes.find((item) => item.pane_id === leaf_id)
+    return (
+      <Show when={pane} keyed>
+        {(item) => (
+          <div
+            class={`min-h-0 min-w-0 flex-1 overflow-hidden ${props.bordered ? 'pane-tile' : ''}`}
+            data-pane-id={String(item.pane_id)}
+          >
+            <PaneFrame pane={item} />
+          </div>
+        )}
+      </Show>
+    )
+  }
+  const split = props.node.split
+  const [ratio, setRatio] = createSignal(Math.min(0.78, Math.max(0.22, split.ratio)))
+  return (
+    <div class={`pane-split flex min-h-0 min-w-0 flex-1 ${split.axis === 'vertical' ? 'flex-row' : 'flex-col'}`}>
+      <div class="flex min-h-0 min-w-0 overflow-hidden" style={{ flex: `${ratio()} 1 0%` }}>
+        <PaneGroupNode node={split.first} panes={props.panes} bordered={props.bordered} />
+      </div>
+      <SplitGutter
+        axis={split.axis}
+        ratio={ratio()}
+        onRatio={setRatio}
+        onCommit={(next_ratio) => void store.resizePaneSplit(
+          firstLayoutLeaf(split.first),
+          firstLayoutLeaf(split.second),
+          split.axis,
+          next_ratio,
+        )}
+      />
+      <div class="flex min-h-0 min-w-0 overflow-hidden" style={{ flex: `${1 - ratio()} 1 0%` }}>
+        <PaneGroupNode node={split.second} panes={props.panes} bordered={props.bordered} />
+      </div>
+    </div>
+  )
+}
+
+function SplitGutter(props: {
+  axis: 'vertical' | 'horizontal'
+  ratio: number
+  onRatio: (ratio: number) => void
+  onCommit: (ratio: number) => void
+}) {
+  let gutter!: HTMLButtonElement
+  const onPointerDown = (event: PointerEvent) => {
+    if (event.button !== 0) return
+    event.preventDefault()
+    const container = gutter.parentElement
+    if (!container) return
+    gutter.setPointerCapture(event.pointerId)
+    const initial_ratio = props.ratio
+    let dragged_ratio = initial_ratio
+    const update = (pointer: PointerEvent) => {
+      const rect = container.getBoundingClientRect()
+      const gutter_extent = props.axis === 'vertical' ? gutter.offsetWidth : gutter.offsetHeight
+      const full_extent = props.axis === 'vertical' ? rect.width : rect.height
+      const pointer_offset = props.axis === 'vertical' ? pointer.clientX - rect.left : pointer.clientY - rect.top
+      const raw = (pointer_offset - gutter_extent / 2) / Math.max(full_extent - gutter_extent, 1)
+      dragged_ratio = Math.min(0.78, Math.max(0.22, raw))
+      props.onRatio(dragged_ratio)
+    }
+    const cleanup = (pointer: PointerEvent) => {
+      if (gutter.hasPointerCapture(pointer.pointerId)) gutter.releasePointerCapture(pointer.pointerId)
+      gutter.removeEventListener('pointermove', update)
+      gutter.removeEventListener('pointerup', finish)
+      gutter.removeEventListener('pointercancel', cancel)
+    }
+    const finish = (pointer: PointerEvent) => {
+      update(pointer)
+      cleanup(pointer)
+      props.onCommit(dragged_ratio)
+    }
+    const cancel = (pointer: PointerEvent) => {
+      cleanup(pointer)
+      props.onRatio(initial_ratio)
+    }
+    gutter.addEventListener('pointermove', update)
+    gutter.addEventListener('pointerup', finish)
+    gutter.addEventListener('pointercancel', cancel)
+  }
+  return (
+    <button
+      ref={gutter}
+      type="button"
+      class={`pane-split-gutter ${props.axis === 'vertical' ? 'pane-split-gutter-vertical' : 'pane-split-gutter-horizontal'}`}
+      aria-label={`Resize ${props.axis} pane split`}
+      onPointerDown={onPointerDown}
+    />
+  )
 }
 
 function PaneFrame(props: { pane: LivePane }) {

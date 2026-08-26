@@ -84,7 +84,7 @@ See [Configuration & state](/docs/config) for the schema.
 
 ## Start a chat thread
 
-1. With a project imported, press `Ctrl+T` (or `Cmd+T` on macOS) to create a new chat thread.
+1. With a project imported, click the workspace pencil to create a new chat thread. With prefix mode enabled, you can instead press `Ctrl+B`, then `t`.
 2. Open the searchable model picker. Before the first message you can choose both the provider and model; after that, the provider stays bound to the thread.
 3. Open the **Run** pill to choose available reasoning and speed options, plus **Supervised** or **Full access** command permissions.
 4. Type a prompt and press `Enter` to send. The transcript grows as the agent streams; consecutive tool calls collapse into a status summary you can expand.
@@ -115,7 +115,10 @@ screenshot support and delivery behavior.
 
 ## Split a terminal
 
-Press `Ctrl+Shift+T` to split a terminal pane next to the focused workspace pane.
+With prefix mode enabled, press `Ctrl+B`, then `Shift+T` to create a new
+standalone terminal pane in the scrolling workspace. To tile a terminal inside
+the focused pane instead, use the shifted `v` / `-` split chords or the pane
+header's terminal split buttons.
 Right-click inside a terminal for configured custom launch profiles and pane
 actions. Launch built-in provider TUIs from `Ctrl+Shift+P` or
 `verde live agent open --provider <name>`. Per-terminal zoom (`Ctrl+-` /

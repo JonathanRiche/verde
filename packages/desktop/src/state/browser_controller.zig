@@ -31,6 +31,7 @@ pub const BrowserContextMenuItem = struct {
     enabled: bool,
     separator: bool,
     submenu: bool,
+    selected: bool = false,
     parent_index: ?u32,
 };
 
@@ -38,6 +39,7 @@ pub const BrowserContextMenuPayload = struct {
     x: f32 = 0.0,
     y: f32 = 0.0,
     link_url: ?[]const u8 = null,
+    option_menu: bool = false,
     items: []const BrowserContextMenuPayloadItem = &.{},
 };
 
@@ -47,6 +49,7 @@ const BrowserContextMenuPayloadItem = struct {
     enabled: bool = false,
     separator: bool = false,
     submenu: bool = false,
+    selected: bool = false,
     items: []const BrowserContextMenuPayloadItem = &.{},
 };
 
@@ -207,6 +210,7 @@ pub const State = struct {
     address_drag_active: bool = false,
     inspector_menu_open: bool = false,
     context_menu_open: bool = false,
+    context_menu_is_option: bool = false,
     context_menu_anchor_x: f32 = 0.0,
     context_menu_anchor_y: f32 = 0.0,
     context_menu_items: std.ArrayList(BrowserContextMenuItem) = .empty,
@@ -1765,6 +1769,7 @@ pub fn clearBrowserContextMenuLocal(self: anytype) void {
     if (self.browser_controller.context_menu_link_url) |url| self.allocator.free(url);
     self.browser_controller.context_menu_link_url = null;
     self.browser_controller.context_menu_open = false;
+    self.browser_controller.context_menu_is_option = false;
     self.browser_controller.context_menu_anchor_x = 0.0;
     self.browser_controller.context_menu_anchor_y = 0.0;
     self.browser_controller.context_menu_selected_index = null;
@@ -1813,6 +1818,7 @@ pub fn appendBrowserContextMenuPayloadItems(
             .enabled = item.enabled,
             .separator = item.separator,
             .submenu = item.submenu,
+            .selected = item.selected,
             .parent_index = parent_index,
         }) catch |err| {
             self.allocator.free(label);
@@ -1847,6 +1853,15 @@ pub fn openBrowserContextMenuFromPayload(self: anytype, payload: []const u8) voi
     }
 
     self.appendBrowserContextMenuPayloadItems(parsed.value.items, null);
+    self.browser_controller.context_menu_is_option = parsed.value.option_menu;
+    if (parsed.value.option_menu) {
+        for (self.browser_controller.context_menu_items.items) |item| {
+            if (item.selected and item.enabled) {
+                self.browser_controller.context_menu_selected_index = item.index;
+                break;
+            }
+        }
+    }
     self.browser_controller.context_menu_open = self.browser_controller.context_menu_items.items.len > 0 or self.browser_controller.context_menu_link_url != null;
     self.browser_controller.address_focused = false;
     self.browser_controller.inspector_menu_open = false;

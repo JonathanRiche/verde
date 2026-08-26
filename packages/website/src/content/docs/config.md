@@ -92,7 +92,8 @@ Keybinds are loaded on startup and on app refresh. Use a string for one
 shortcut or a string array for multiple shortcuts. Use `null`, an empty string,
 or an empty array to disable a binding. The `workspace.pane_select` and
 `workspace.active_select` arrays are positional and follow the corresponding
-sidebar lists in displayed order. See [Keybinds](/docs/keybinds)
+sidebar lists in displayed order. `new_thread` is unbound by default; the
+example above opts back into its former direct shortcut. See [Keybinds](/docs/keybinds)
 for the full keybinds reference.
 
 Most of these options also appear in Settings:
@@ -185,10 +186,11 @@ The model picker’s star tab shows only `chat.favorite_models`. Use the star on
 any provider/model row to add or remove it; provider tabs continue to show the
 full model list for that provider.
 
-Ctrl+T and the workspace pencil button create and focus a new chat pane by
-default. Set `chat.new_pane_behavior` to `replace_pane`, or choose **Replace
-chat pane** under **Settings → Workspace → New chat action**, to reuse an
-existing visible chat pane instead.
+The workspace pencil button creates and focuses a new chat pane. With prefix
+mode enabled, `Ctrl+B`, then `t` performs the same action. Set
+`chat.new_pane_behavior` to `replace_pane`, or choose **Replace chat pane**
+under **Settings → Workspace → New chat action**, to reuse an existing visible
+chat pane instead.
 
 ## Updates
 

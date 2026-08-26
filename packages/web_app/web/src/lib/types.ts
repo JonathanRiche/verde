@@ -101,6 +101,9 @@ export interface LivePane {
   /// The web pane id remains stable across desktop restarts; commands which
   /// target the running desktop use this native id instead.
   native_pane_id?: number
+  /// Native scrolling-tile identity. Panes sharing this id render as one
+  /// scrolling item while retaining the desktop split tree inside it.
+  scroll_group_id?: number
   running?: boolean
   /// Desktop-surface work status for terminals: the agent inside the pane is
   /// actively working. Distinct from `running`, which only means the shell
@@ -150,6 +153,128 @@ export function layoutContains(node: LayoutNode, paneId: number): boolean {
 export function layoutLeafCount(node: LayoutNode): number {
   if ('leaf' in node) return 1
   return layoutLeafCount(node.split.first) + layoutLeafCount(node.split.second)
+}
+
+export interface WorkspacePaneGroup {
+  key: string
+  panes: LivePane[]
+  layout: LayoutNode
+}
+
+function filterGroupLayout(
+  node: LayoutNode,
+  native_ids: ReadonlySet<number>,
+  web_id_by_native: ReadonlyMap<number, number>,
+): LayoutNode | null {
+  if ('leaf' in node) {
+    if (!native_ids.has(node.leaf)) return null
+    const web_id = web_id_by_native.get(node.leaf)
+    return web_id == null ? null : { leaf: web_id }
+  }
+  const first = filterGroupLayout(node.split.first, native_ids, web_id_by_native)
+  const second = filterGroupLayout(node.split.second, native_ids, web_id_by_native)
+  if (!first) return second
+  if (!second) return first
+  return { split: { ...node.split, first, second } }
+}
+
+/// Projects the desktop's native split tree into stable web pane ids and
+/// collects each scrolling tile as one top-level strip item.
+export function workspacePaneGroups(panes: LivePane[], root: LayoutNode | null): WorkspacePaneGroup[] {
+  const groups = new Map<string, LivePane[]>()
+  for (const pane of panes) {
+    const key = pane.scroll_group_id != null
+      ? `native:${pane.scroll_group_id}`
+      : pane.native_pane_id != null
+        ? `native:${pane.native_pane_id}`
+        : `web:${pane.pane_id}`
+    const members = groups.get(key)
+    if (members) members.push(pane)
+    else groups.set(key, [pane])
+  }
+
+  const result: WorkspacePaneGroup[] = []
+  for (const [key, members] of groups) {
+    const web_id_by_native = new Map<number, number>()
+    const native_ids = new Set<number>()
+    for (const pane of members) {
+      if (pane.native_pane_id == null) continue
+      native_ids.add(pane.native_pane_id)
+      web_id_by_native.set(pane.native_pane_id, pane.pane_id)
+    }
+    const layout = root ? filterGroupLayout(root, native_ids, web_id_by_native) : null
+    if (layout) {
+      result.push({ key, panes: members, layout })
+      continue
+    }
+    for (const pane of members) {
+      result.push({ key: `${key}:${pane.pane_id}`, panes: [pane], layout: { leaf: pane.pane_id } })
+    }
+  }
+  return result
+}
+
+interface PaneRect {
+  pane_id: number
+  x: number
+  y: number
+  w: number
+  h: number
+}
+
+function collectPaneRects(node: LayoutNode, rect: Omit<PaneRect, 'pane_id'>, rows: PaneRect[]): void {
+  if ('leaf' in node) {
+    rows.push({ pane_id: node.leaf, ...rect })
+    return
+  }
+  const ratio = Math.min(0.78, Math.max(0.22, node.split.ratio))
+  if (node.split.axis === 'vertical') {
+    collectPaneRects(node.split.first, { ...rect, w: rect.w * ratio }, rows)
+    collectPaneRects(node.split.second, {
+      x: rect.x + rect.w * ratio,
+      y: rect.y,
+      w: rect.w * (1 - ratio),
+      h: rect.h,
+    }, rows)
+  } else {
+    collectPaneRects(node.split.first, { ...rect, h: rect.h * ratio }, rows)
+    collectPaneRects(node.split.second, {
+      x: rect.x,
+      y: rect.y + rect.h * ratio,
+      w: rect.w,
+      h: rect.h * (1 - ratio),
+    }, rows)
+  }
+}
+
+export function adjacentPaneInGroups(
+  groups: WorkspacePaneGroup[],
+  current_id: number,
+  direction: 'left' | 'right' | 'up' | 'down',
+): number | null {
+  const rects: PaneRect[] = []
+  groups.forEach((group, index) => {
+    collectPaneRects(group.layout, { x: index * 2, y: 0, w: 1, h: 1 }, rects)
+  })
+  const current = rects.find((rect) => rect.pane_id === current_id)
+  if (!current) return null
+  const cx = current.x + current.w / 2
+  const cy = current.y + current.h / 2
+  let best: { pane_id: number; score: number } | null = null
+  for (const candidate of rects) {
+    if (candidate.pane_id === current_id) continue
+    const dx = candidate.x + candidate.w / 2 - cx
+    const dy = candidate.y + candidate.h / 2 - cy
+    const primary = direction === 'left' ? -dx : direction === 'right' ? dx : direction === 'up' ? -dy : dy
+    if (primary <= 0) continue
+    const secondary = direction === 'left' || direction === 'right' ? Math.abs(dy) : Math.abs(dx)
+    // Prefer candidates aligned on the requested axis, then the nearest one
+    // along it. This keeps up/down inside a stacked tile before considering a
+    // pane in the next horizontal scrolling group.
+    const score = secondary * 1000 + primary
+    if (!best || score < best.score) best = { pane_id: candidate.pane_id, score }
+  }
+  return best?.pane_id ?? null
 }
 
 /// Desktop never paints every open pane. Collapse a large tree to the

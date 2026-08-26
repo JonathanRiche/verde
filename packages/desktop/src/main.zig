@@ -2888,6 +2888,7 @@ fn dispatchPrefixTarget(state: *AppState, keyboard: *keybinds.NativeKeyboardConf
         .terminal => |action| _ = state.handleTerminalAction(action),
         .chat => |action| _ = handleGuiChatAction(state, action),
         .focus_prompt => _ = state.focusPromptForFocusedChatWorkspacePane(),
+        .new_terminal => _ = state.openTerminalPaneForProjectIndex(state.project_controller.selected_index),
         .split_default_vertical => _ = openPrefixTiledWorkspacePane(state, prefixSplitPaneKind(state, false), .vertical),
         .split_default_horizontal => _ = openPrefixTiledWorkspacePane(state, prefixSplitPaneKind(state, false), .horizontal),
         .split_alternate_vertical => _ = openPrefixTiledWorkspacePane(state, prefixSplitPaneKind(state, true), .vertical),

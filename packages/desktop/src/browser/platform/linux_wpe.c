@@ -112,6 +112,7 @@ struct verde_browser_linux {
     WebKitWebView *web_view;
     WebKitUserContentManager *content_manager;
     WebKitContextMenu *context_menu;
+    WebKitOptionMenu *option_menu;
     struct verde_browser_linux_context_menu_item context_items[VERDE_BROWSER_LINUX_CONTEXT_MENU_ITEM_MAX];
     guint context_item_count;
     GQueue *events;
@@ -417,7 +418,9 @@ static void verde_browser_linux_clear_context_items(struct verde_browser_linux *
 
 static void verde_browser_linux_clear_context_menu(struct verde_browser_linux *browser, gboolean notify) {
     if (browser == NULL) return;
-    const gboolean had_menu = browser->context_menu != NULL || browser->context_item_count > 0;
+    const gboolean had_menu = browser->context_menu != NULL || browser->option_menu != NULL || browser->context_item_count > 0;
+    if (browser->option_menu != NULL) webkit_option_menu_close(browser->option_menu);
+    g_clear_object(&browser->option_menu);
     g_clear_object(&browser->context_menu);
     verde_browser_linux_clear_context_items(browser);
     if (!had_menu) return;
@@ -653,6 +656,37 @@ static char *verde_browser_linux_context_menu_to_json_with_inspector(
     }
     g_string_append(json, ",\"items\":[");
     verde_browser_linux_context_menu_items_to_json(browser, menu, json, remote_inspector_configured);
+    g_string_append(json, "]}");
+    return g_string_free(json, FALSE);
+}
+
+static char *verde_browser_linux_option_menu_to_json(
+    struct verde_browser_linux *browser,
+    WebKitOptionMenu *menu,
+    WebKitRectangle *rectangle
+) {
+    if (browser != NULL) verde_browser_linux_clear_context_items(browser);
+    const gint x = rectangle != NULL ? rectangle->x : 0;
+    const gint y = rectangle != NULL ? rectangle->y + rectangle->height : 0;
+    GString *json = g_string_new(NULL);
+    g_string_append_printf(json, "{\"x\":%d,\"y\":%d,\"option_menu\":true,\"items\":[", x, y);
+
+    const guint item_count = menu != NULL ? webkit_option_menu_get_n_items(menu) : 0;
+    gboolean first = TRUE;
+    for (guint index = 0; index < item_count && index < VERDE_BROWSER_LINUX_CONTEXT_MENU_ITEM_MAX; index += 1) {
+        WebKitOptionMenuItem *item = webkit_option_menu_get_item(menu, index);
+        if (item == NULL) continue;
+        const gboolean group_label = webkit_option_menu_item_is_group_label(item);
+        const gboolean enabled = webkit_option_menu_item_is_enabled(item) && !group_label;
+        if (!first) g_string_append_c(json, ',');
+        first = FALSE;
+        g_string_append_printf(json, "{\"index\":%u,\"enabled\":%s,\"selected\":%s,\"label\":",
+            index,
+            enabled ? "true" : "false",
+            webkit_option_menu_item_is_selected(item) ? "true" : "false");
+        verde_browser_linux_json_append_string(json, webkit_option_menu_item_get_label(item));
+        g_string_append_c(json, '}');
+    }
     g_string_append(json, "]}");
     return g_string_free(json, FALSE);
 }
@@ -1319,6 +1353,28 @@ static void verde_browser_linux_on_context_menu_dismissed(WebKitWebView *web_vie
     // explicit activate or dismiss command.
 }
 
+static gboolean verde_browser_linux_on_show_option_menu(
+    WebKitWebView *web_view,
+    WebKitOptionMenu *menu,
+    WebKitRectangle *rectangle,
+    gpointer user_data
+) {
+    struct verde_browser_linux *browser = user_data;
+    (void)web_view;
+    if (browser == NULL || menu == NULL) return FALSE;
+    if (webkit_option_menu_get_n_items(menu) == 0) {
+        webkit_option_menu_close(menu);
+        return TRUE;
+    }
+
+    verde_browser_linux_clear_context_menu(browser, FALSE);
+    browser->option_menu = g_object_ref(menu);
+    char *payload = verde_browser_linux_option_menu_to_json(browser, menu, rectangle);
+    verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_CONTEXT_MENU, payload);
+    g_free(payload);
+    return TRUE;
+}
+
 static void verde_browser_linux_on_eval_finished(GObject *object, GAsyncResult *result, gpointer user_data) {
     struct verde_browser_linux *browser = user_data;
     GError *error = NULL;
@@ -1552,6 +1608,7 @@ struct verde_browser_linux *verde_browser_linux_create(void) {
     g_signal_connect(browser->web_view, "web-process-terminated", G_CALLBACK(verde_browser_linux_on_web_process_terminated), browser);
     g_signal_connect(browser->web_view, "context-menu", G_CALLBACK(verde_browser_linux_on_context_menu), browser);
     g_signal_connect(browser->web_view, "context-menu-dismissed", G_CALLBACK(verde_browser_linux_on_context_menu_dismissed), browser);
+    g_signal_connect(browser->web_view, "show-option-menu", G_CALLBACK(verde_browser_linux_on_show_option_menu), browser);
     webkit_web_view_load_uri(browser->web_view, "about:blank");
     return browser;
 }
@@ -1955,6 +2012,15 @@ static gboolean verde_browser_linux_perform_context_menu_label_action(struct ver
 
 int verde_browser_linux_context_menu_activate(struct verde_browser_linux *browser, unsigned int index) {
     if (browser == NULL) return 0;
+    if (browser->option_menu != NULL) {
+        if (index >= webkit_option_menu_get_n_items(browser->option_menu)) return 0;
+        WebKitOptionMenuItem *item = webkit_option_menu_get_item(browser->option_menu, index);
+        if (item == NULL || !webkit_option_menu_item_is_enabled(item) || webkit_option_menu_item_is_group_label(item)) return 0;
+        webkit_option_menu_activate_item(browser->option_menu, index);
+        verde_browser_linux_mark_active(browser);
+        verde_browser_linux_clear_context_menu(browser, TRUE);
+        return 1;
+    }
     if (index >= browser->context_item_count) {
         if (verde_browser_linux_frame_log_enabled()) {
             fprintf(stderr, "verde-browser-linux WPE context-menu activate ignored index=%u count=%u\n", index, browser->context_item_count);
