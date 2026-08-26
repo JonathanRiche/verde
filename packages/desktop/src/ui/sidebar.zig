@@ -53,6 +53,16 @@ const HIDDEN_SIDEBAR_EDGE_REVEAL_CSS: f32 = 8.0;
 /// The scrolling workspace list stops short of this so its last row never
 /// slides under — or past — the pinned footer.
 const SIDEBAR_FOOTER_RESERVE_CSS: f32 = 56.0;
+/// Visible-row cap for the pinned ACTIVE cluster. Extra rows scroll inside
+/// the cluster so a busy machine cannot bury the workspace tree.
+const SIDEBAR_ACTIVE_MAX_ROWS: usize = 10;
+/// Caption band above ACTIVE rows, including the gap under the label.
+const SIDEBAR_ACTIVE_LABEL_H_CSS: f32 = 20.0;
+/// Hairline divider plus trailing gap that separates ACTIVE from the tree.
+const SIDEBAR_ACTIVE_TRAILING_H_CSS: f32 = 12.0;
+/// Keep at least this much of the workspace tree visible under a tall ACTIVE
+/// cluster so short windows still show the selected workspace.
+const SIDEBAR_WORKSPACE_MIN_H_CSS: f32 = 96.0;
 const THREAD_DRAG_THRESHOLD_CSS: f32 = 5.0;
 const THREAD_DRAG_FLOATING_Z: i32 = 160;
 /// Sidebar context menus are root overlays: keep them above pane menus and
@@ -92,6 +102,9 @@ var palette_hit_count: usize = 0;
 var palette_sidebar_rect: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
 var sidebar_scroll_y: f32 = 0.0;
 var sidebar_max_scroll_y: f32 = 0.0;
+var attention_scroll_y: f32 = 0.0;
+var attention_max_scroll_y: f32 = 0.0;
+var attention_clip: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
 
 const SidebarContextMenuAction = enum {
     workspace_new_chat,
@@ -166,6 +179,8 @@ var pane_drop_valid: bool = false;
 pub fn renderPalette(state: *runtime.AppState, rect: palette.Rect) void {
     palette_sidebar_rect = rect;
     palette_hit_count = 0;
+    attention_clip = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+    attention_max_scroll_y = 0.0;
 
     queuePaletteRect(state, rect, paletteColor(theme.COLOR_PANEL));
     queuePaletteRect(state, .{
@@ -351,7 +366,14 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
 
 pub fn handlePaletteWheel(x: f32, y: f32, wheel_y: f32) bool {
     if (wheel_y == 0.0 or !rectContainsPoint(palette_sidebar_rect, x, y)) return false;
-    sidebar_scroll_y = theme.clampf(sidebar_scroll_y - wheel_y * theme.scaledUi(64.0), 0.0, sidebar_max_scroll_y);
+    const step = wheel_y * theme.scaledUi(64.0);
+    // Overflowing ACTIVE rows own the wheel while the pointer is inside the
+    // pinned cluster so that motion cannot steal the workspace tree's scroll.
+    if (attention_max_scroll_y > 1.0 and rectContainsPoint(attention_clip, x, y)) {
+        attention_scroll_y = theme.clampf(attention_scroll_y - step, 0.0, attention_max_scroll_y);
+        return true;
+    }
+    sidebar_scroll_y = theme.clampf(sidebar_scroll_y - step, 0.0, sidebar_max_scroll_y);
     return true;
 }
 
@@ -925,11 +947,12 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
     }
 }
 
-/// Expanded workspace rail: one compact pinned header row, a cross-workspace
-/// "ACTIVE" attention cluster, then the workspace tree. Only the selected
-/// workspace expands its pane list; the others stay one header row tall and
-/// surface live work through the cluster, so rail height tracks activity
-/// rather than structure.
+/// Expanded workspace rail: one compact pinned header row, a pinned
+/// "ACTIVE" attention cluster, then an independently scrolling workspace
+/// tree. Only the selected workspace expands its pane list; the others stay
+/// one header row tall and surface live work through the cluster. The cluster
+/// stays visible while the tree scrolls, and overflows internally after
+/// ~10 rows so a busy machine cannot bury the tree.
 fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) void {
     const pad_x = theme.scaledUi(SIDEBAR_PAD_X_CSS);
     const rail_w = @max(rect.w - pad_x * 2.0, theme.scaledUi(140.0));
@@ -950,16 +973,32 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
     const search_top = header_top + header_h + theme.scaledUi(10.0);
     const list_top = search_top + search_h + theme.scaledUi(12.0);
     // Reserve a band at the bottom of the rail for sticky chrome. Clipping the
-    // list short here also caps `sidebar_max_scroll_y` (computed below from
-    // `list_clip.y + list_clip.h`), so the list scrolls to rest above the
+    // workspace tree short here also caps `sidebar_max_scroll_y` (computed
+    // below from `workspace_clip`), so the tree scrolls to rest above the
     // footer instead of running off the bottom edge.
     const footer_reserve = theme.scaledUi(SIDEBAR_FOOTER_RESERVE_CSS);
     const list_bottom = @max(rect.y + rect.h - footer_reserve, list_top);
-    const list_clip: palette.Rect = .{ .x = rect.x, .y = list_top, .w = rect.w, .h = @max(list_bottom - list_top, 0.0) };
-    const clip = list_clip;
-    var y = list_top - sidebar_scroll_y;
+    const available_list_h = @max(list_bottom - list_top, 0.0);
 
-    y = renderAttentionClusterSection(state, x, rail_w, list_clip, clip, y);
+    var cluster_rows: [palette_hits.len]AttentionClusterRow = undefined;
+    const cluster_row_count = collectAttentionClusterRows(state, &cluster_rows);
+    if (cluster_row_count > 0) sortAttentionClusterRows(cluster_rows[0..cluster_row_count]);
+    const cluster_layout = attentionClusterLayoutForRail(cluster_row_count, available_list_h);
+    attention_clip = .{
+        .x = rect.x,
+        .y = list_top,
+        .w = rect.w,
+        .h = cluster_layout.viewport_h,
+    };
+
+    const workspace_top = list_top + cluster_layout.viewport_h;
+    const workspace_clip: palette.Rect = .{
+        .x = rect.x,
+        .y = workspace_top,
+        .w = rect.w,
+        .h = @max(list_bottom - workspace_top, 0.0),
+    };
+    var y = workspace_top - sidebar_scroll_y;
 
     var project_index: usize = 0;
     while (project_index < state.project_controller.projects.items.len) : (project_index += 1) {
@@ -975,7 +1014,7 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
         // Full-width row: the hover zone covers the trailing action cluster so
         // moving onto the hover-revealed icons doesn't clear the row hover.
         const row_rect: palette.Rect = .{ .x = x, .y = y, .w = rail_w, .h = row_h };
-        const project_visible = rowVisible(row_rect, list_clip);
+        const project_visible = rowVisible(row_rect, workspace_clip);
         const project_hovered = state.sidebar_project_hover == project_index;
         var workspace_shortcut_buf: [16]u8 = undefined;
         const workspace_shortcut = if (state.alt_shortcut_hints_visible)
@@ -989,7 +1028,7 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
             if (project_hovered and !selected) {
                 queuePaletteRoundedRect(state, snapRect(row_rect), paletteColor(theme.withAlpha(theme.COLOR_GREEN, 48)), theme.scaledUi(6.0));
             }
-            addPaletteHit(row_rect, .workspace_row, project_index, 0);
+            addClippedPaletteHit(row_rect, workspace_clip, .workspace_row, project_index, 0);
         }
 
         const cy = y + row_h * 0.5;
@@ -1022,33 +1061,33 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
             if (badge_label) |label| {
                 renderHerdrRuntimeBadge(state, .{ .x = content_right - badge_w, .y = y + theme.scaledUi(6.0), .w = badge_w, .h = row_h - theme.scaledUi(12.0) }, label, selected or project_hovered, row_rect);
             }
-            if (workspace_shortcut.len > 0) renderSidebarShortcutKeyTip(state, row_rect, list_clip, workspace_shortcut);
+            if (workspace_shortcut.len > 0) renderSidebarShortcutKeyTip(state, row_rect, workspace_clip, workspace_shortcut);
         }
         if (project_visible and show_actions) {
             const action_x = row_rect.x + row_rect.w - action_cluster_w;
             const new_rect: palette.Rect = .{ .x = action_x, .y = y, .w = action_w, .h = row_h };
             const terminal_rect: palette.Rect = .{ .x = action_x + action_w + action_gap, .y = y, .w = action_w, .h = row_h };
             const history_rect: palette.Rect = .{ .x = action_x + (action_w + action_gap) * 2.0, .y = y, .w = action_w, .h = row_h };
-            renderPaletteSidebarActionIcon(state, new_rect, NF_COD_EDIT, state.sidebar_new_thread_hover == project_index, list_clip);
-            addPaletteHit(new_rect, .new_thread, project_index, 0);
-            renderPaletteSidebarActionIcon(state, terminal_rect, NF_COD_TERMINAL, terminal_action_hovered == project_index, list_clip);
-            addPaletteHit(terminal_rect, .new_terminal, project_index, 0);
-            renderPaletteSidebarActionIcon(state, history_rect, NF_COD_HISTORY, history_action_hovered == project_index, list_clip);
-            addPaletteHit(history_rect, .history, project_index, 0);
+            renderPaletteSidebarActionIcon(state, new_rect, NF_COD_EDIT, state.sidebar_new_thread_hover == project_index, workspace_clip);
+            addClippedPaletteHit(new_rect, workspace_clip, .new_thread, project_index, 0);
+            renderPaletteSidebarActionIcon(state, terminal_rect, NF_COD_TERMINAL, terminal_action_hovered == project_index, workspace_clip);
+            addClippedPaletteHit(terminal_rect, workspace_clip, .new_terminal, project_index, 0);
+            renderPaletteSidebarActionIcon(state, history_rect, NF_COD_HISTORY, history_action_hovered == project_index, workspace_clip);
+            addClippedPaletteHit(history_rect, workspace_clip, .history, project_index, 0);
         }
         y += row_h + theme.scaledUi(4.0);
 
         if (!effective_collapsed) {
-            y = renderOpenPanesSection(state, project_index, project, x, rail_w, list_clip, clip, y);
+            y = renderOpenPanesSection(state, project_index, project, x, rail_w, workspace_clip, workspace_clip, y);
         }
 
         // 3px accent bar spanning the active workspace group — mirrors the
         // collapsed rail's selected-chip bar so both rails share one selection
-        // cue. Clamped to the list band so it never bleeds into the pinned
-        // header/footer strips while scrolled.
+        // cue. Clamped to the workspace band so it never bleeds into the
+        // pinned ACTIVE/header/footer strips while scrolled.
         if (selected) {
-            const bar_top = @max(group_top + theme.scaledUi(4.0), list_clip.y);
-            const bar_bottom = @min(y - theme.scaledUi(4.0), list_clip.y + list_clip.h);
+            const bar_top = @max(group_top + theme.scaledUi(4.0), workspace_clip.y);
+            const bar_bottom = @min(y - theme.scaledUi(4.0), workspace_clip.y + workspace_clip.h);
             if (bar_bottom - bar_top > theme.scaledUi(4.0)) {
                 queuePaletteRoundedRect(state, .{
                     .x = rect.x + theme.scaledUi(2.0),
@@ -1061,17 +1100,11 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
         y += theme.scaledUi(8.0);
     }
 
-    // Scrollbar must clip to the list area so the thumb never extends behind
-    // the pinned header strip drawn below.
-    sidebar_max_scroll_y = @max(0.0, y + sidebar_scroll_y - (list_clip.y + list_clip.h) + theme.scaledUi(8.0));
+    // Scrollbar must clip to the workspace tree so the thumb never extends
+    // behind the pinned ACTIVE cluster or header strip drawn below.
+    sidebar_max_scroll_y = @max(0.0, y + sidebar_scroll_y - (workspace_clip.y + workspace_clip.h) + theme.scaledUi(8.0));
     sidebar_scroll_y = theme.clampf(sidebar_scroll_y, 0.0, sidebar_max_scroll_y);
-    if (sidebar_max_scroll_y > 1.0 and list_clip.h > theme.scaledUi(32.0)) {
-        const track: palette.Rect = .{ .x = rect.x + rect.w - theme.scaledUi(4.0), .y = list_clip.y + theme.scaledUi(4.0), .w = theme.scaledUi(3.0), .h = list_clip.h - theme.scaledUi(8.0) };
-        const thumb_h = @max(theme.scaledUi(34.0), track.h * (track.h / (track.h + sidebar_max_scroll_y)));
-        const thumb_y = track.y + (track.h - thumb_h) * (sidebar_scroll_y / sidebar_max_scroll_y);
-        queuePaletteRoundedRect(state, track, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 120)), theme.scaledUi(2.0));
-        queuePaletteRoundedRect(state, .{ .x = track.x, .y = thumb_y, .w = track.w, .h = thumb_h }, paletteColor(theme.withAlpha(theme.COLOR_TEXT_MUTED, 200)), theme.scaledUi(2.0));
-    }
+    renderSidebarOverflowScrollbar(state, workspace_clip, sidebar_scroll_y, sidebar_max_scroll_y);
 
     // Pinned footer band — painted after the list so any row scrolled into the
     // reserved band is covered by the panel-colored strip. A divider marks the
@@ -1102,6 +1135,18 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
             .h = btn,
         };
         renderPaletteSettingsButton(state, btn_rect, footer_rect);
+    }
+
+    // Pin ACTIVE after the workspace tree so any tree row that scrolled into
+    // the cluster band is covered — same overwrite trick as the header strip.
+    if (cluster_layout.viewport_h > 0.0) {
+        queuePaletteRect(state, .{
+            .x = attention_clip.x,
+            .y = attention_clip.y,
+            .w = attention_clip.w - theme.scaledUi(1.0),
+            .h = attention_clip.h,
+        }, paletteColor(theme.COLOR_PANEL));
+        renderAttentionClusterSection(state, x, rail_w, cluster_rows[0..cluster_row_count], attention_clip);
     }
 
     // Pinned header — painted last so any scrolled rows in the header band
@@ -1171,40 +1216,114 @@ const AttentionClusterRow = struct {
     completed_at_ms: ?i64,
 };
 
-/// Global "ACTIVE" cluster at the top of the expanded list: every
-/// working/waiting/done/error pane across all workspaces, including the
-/// selected workspace. Pending completions sort first in completion order.
+const AttentionClusterLayout = struct {
+    content_h: f32,
+    viewport_h: f32,
+};
+
+/// Sizes the pinned ACTIVE cluster: grow with row count until the ~10-row
+/// cap (or until the remaining rail would starve the workspace tree).
+fn attentionClusterLayout(
+    row_count: usize,
+    available_list_h: f32,
+    row_step: f32,
+    label_h: f32,
+    trailing_h: f32,
+    max_rows: usize,
+    workspace_min_h: f32,
+) AttentionClusterLayout {
+    if (row_count == 0 or available_list_h <= 0.0) return .{ .content_h = 0.0, .viewport_h = 0.0 };
+    const content_h = label_h + @as(f32, @floatFromInt(row_count)) * row_step + trailing_h;
+    const max_rows_h = label_h + @as(f32, @floatFromInt(max_rows)) * row_step + trailing_h;
+    const max_from_space = if (available_list_h > workspace_min_h)
+        available_list_h - workspace_min_h
+    else
+        available_list_h * 0.5;
+    return .{
+        .content_h = content_h,
+        .viewport_h = @min(content_h, @min(max_rows_h, max_from_space)),
+    };
+}
+
+fn attentionClusterLayoutForRail(row_count: usize, available_list_h: f32) AttentionClusterLayout {
+    return attentionClusterLayout(
+        row_count,
+        available_list_h,
+        theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS),
+        theme.scaledUi(SIDEBAR_ACTIVE_LABEL_H_CSS),
+        theme.scaledUi(SIDEBAR_ACTIVE_TRAILING_H_CSS),
+        SIDEBAR_ACTIVE_MAX_ROWS,
+        theme.scaledUi(SIDEBAR_WORKSPACE_MIN_H_CSS),
+    );
+}
+
+/// Pinned "ACTIVE" cluster: every working/waiting/done/error pane across all
+/// workspaces, including the selected workspace. Pending completions sort
+/// first in completion order. The caption and divider stay put; only the
+/// row list scrolls when the cluster overflows its cap.
 fn renderAttentionClusterSection(
     state: *runtime.AppState,
     x: f32,
     rail_w: f32,
-    list_clip: palette.Rect,
+    rows: []const AttentionClusterRow,
     clip: palette.Rect,
-    y_in: f32,
-) f32 {
-    var y = y_in;
-    var rows: [palette_hits.len]AttentionClusterRow = undefined;
-    const row_count = collectAttentionClusterRows(state, &rows);
-    if (row_count == 0) return y;
+) void {
+    if (rows.len == 0 or clip.h <= 0.0) return;
 
-    sortAttentionClusterRows(rows[0..row_count]);
+    const label_h = theme.scaledUi(SIDEBAR_ACTIVE_LABEL_H_CSS);
+    const trailing_h = theme.scaledUi(SIDEBAR_ACTIVE_TRAILING_H_CSS);
+    const row_h = theme.scaledUi(SIDEBAR_THREAD_ROW_HEIGHT_CSS);
+    const row_step = theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS);
+    const rows_clip: palette.Rect = .{
+        .x = clip.x,
+        .y = clip.y + label_h,
+        .w = clip.w,
+        .h = @max(clip.h - label_h - trailing_h, 0.0),
+    };
+    const content_h = @as(f32, @floatFromInt(rows.len)) * row_step;
+    attention_max_scroll_y = @max(0.0, content_h - rows_clip.h);
+    attention_scroll_y = theme.clampf(attention_scroll_y, 0.0, attention_max_scroll_y);
 
-    const label_rect: palette.Rect = .{ .x = x, .y = y, .w = rail_w, .h = theme.scaledUi(18.0) };
-    if (rowVisible(label_rect, list_clip)) queuePaletteText(state, label_rect, "ACTIVE", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), clip);
-    y += theme.scaledUi(20.0);
-
-    for (rows[0..row_count], 0..) |row, active_index| {
+    var y = rows_clip.y - attention_scroll_y;
+    for (rows, 0..) |row, active_index| {
         const project = &state.project_controller.projects.items[row.project_index];
-        const row_rect: palette.Rect = .{ .x = x, .y = y, .w = rail_w, .h = theme.scaledUi(SIDEBAR_THREAD_ROW_HEIGHT_CSS) };
-        if (rowVisible(row_rect, list_clip)) renderOpenPaneRow(state, row.project_index, project, row.pane, row_rect, clip, true, true, active_index, false);
-        y += theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS);
+        const row_rect: palette.Rect = .{ .x = x, .y = y, .w = rail_w, .h = row_h };
+        if (rowVisible(row_rect, rows_clip)) {
+            renderOpenPaneRow(state, row.project_index, project, row.pane, row_rect, rows_clip, true, true, active_index, false);
+        }
+        y += row_step;
     }
 
-    // Hairline divider separates the live board from the workspace tree.
-    const divider_rect: palette.Rect = .{ .x = x, .y = y + theme.scaledUi(2.0), .w = rail_w, .h = theme.scaledUi(1.0) };
-    if (rowVisible(divider_rect, list_clip)) queuePaletteRect(state, divider_rect, paletteColor(theme.borderMuted()));
-    y += theme.scaledUi(12.0);
-    return y;
+    // Caption and divider paint after the rows so a scrolled row cannot cover
+    // the section chrome — same overwrite trick as the rail header.
+    queuePaletteRect(state, .{
+        .x = clip.x,
+        .y = clip.y,
+        .w = clip.w - theme.scaledUi(1.0),
+        .h = label_h,
+    }, paletteColor(theme.COLOR_PANEL));
+    queuePaletteText(state, .{
+        .x = x,
+        .y = clip.y,
+        .w = rail_w,
+        .h = theme.scaledUi(18.0),
+    }, "ACTIVE", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), clip);
+
+    const divider_band: palette.Rect = .{
+        .x = clip.x,
+        .y = clip.y + clip.h - trailing_h,
+        .w = clip.w - theme.scaledUi(1.0),
+        .h = trailing_h,
+    };
+    queuePaletteRect(state, divider_band, paletteColor(theme.COLOR_PANEL));
+    queuePaletteRect(state, .{
+        .x = x,
+        .y = divider_band.y + theme.scaledUi(2.0),
+        .w = rail_w,
+        .h = theme.scaledUi(1.0),
+    }, paletteColor(theme.borderMuted()));
+
+    renderSidebarOverflowScrollbar(state, rows_clip, attention_scroll_y, attention_max_scroll_y);
 }
 
 fn collectAttentionClusterRows(state: *runtime.AppState, rows: []AttentionClusterRow) usize {
@@ -1901,7 +2020,7 @@ fn renderOpenPaneRow(
     } else if (hovered) {
         queuePaletteRoundedRect(state, snapRect(rect), paletteColor(theme.withAlpha(theme.COLOR_GREEN, 48)), theme.scaledUi(7.0));
     }
-    addPaletteHit(rect, if (show_workspace_tag) .open_pane else .open_pane_reorder, project_index, pane.id);
+    addClippedPaletteHit(rect, clip, if (show_workspace_tag) .open_pane else .open_pane_reorder, project_index, pane.id);
 
     const cy = rect.y + rect.h * 0.5;
     const leading_pad = if (compact_tile) 6.0 else SIDEBAR_THREAD_ICON_LEADING_PAD_CSS;
@@ -2234,6 +2353,15 @@ fn rowVisible(row: palette.Rect, viewport: palette.Rect) bool {
     return row.y + row.h >= viewport.y and row.y <= viewport.y + viewport.h;
 }
 
+fn intersectRects(a: palette.Rect, b: palette.Rect) ?palette.Rect {
+    const left = @max(a.x, b.x);
+    const top = @max(a.y, b.y);
+    const right = @min(a.x + a.w, b.x + b.w);
+    const bottom = @min(a.y + a.h, b.y + b.h);
+    if (right <= left or bottom <= top) return null;
+    return .{ .x = left, .y = top, .w = right - left, .h = bottom - top };
+}
+
 fn addPaletteHit(rect: palette.Rect, kind: SidebarHitKind, project_index: usize, thread_index: usize) void {
     if (palette_hit_count >= palette_hits.len) return;
     palette_hits[palette_hit_count] = .{
@@ -2243,6 +2371,29 @@ fn addPaletteHit(rect: palette.Rect, kind: SidebarHitKind, project_index: usize,
         .thread_index = thread_index,
     };
     palette_hit_count += 1;
+}
+
+fn addClippedPaletteHit(rect: palette.Rect, clip: palette.Rect, kind: SidebarHitKind, project_index: usize, thread_index: usize) void {
+    if (intersectRects(rect, clip)) |hit_rect| addPaletteHit(hit_rect, kind, project_index, thread_index);
+}
+
+fn renderSidebarOverflowScrollbar(
+    state: *runtime.AppState,
+    clip: palette.Rect,
+    scroll_y: f32,
+    max_scroll_y: f32,
+) void {
+    if (max_scroll_y <= 1.0 or clip.h <= theme.scaledUi(32.0)) return;
+    const track: palette.Rect = .{
+        .x = clip.x + clip.w - theme.scaledUi(4.0),
+        .y = clip.y + theme.scaledUi(4.0),
+        .w = theme.scaledUi(3.0),
+        .h = clip.h - theme.scaledUi(8.0),
+    };
+    const thumb_h = @max(theme.scaledUi(34.0), track.h * (track.h / (track.h + max_scroll_y)));
+    const thumb_y = track.y + (track.h - thumb_h) * (scroll_y / max_scroll_y);
+    queuePaletteRoundedRect(state, track, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 120)), theme.scaledUi(2.0));
+    queuePaletteRoundedRect(state, .{ .x = track.x, .y = thumb_y, .w = track.w, .h = thumb_h }, paletteColor(theme.withAlpha(theme.COLOR_TEXT_MUTED, 200)), theme.scaledUi(2.0));
 }
 
 fn rectContainsPoint(rect: palette.Rect, x: f32, y: f32) bool {
@@ -2790,4 +2941,63 @@ test "ACTIVE collection sees every restored chat pane and deduplicates one threa
     sortAttentionClusterRows(rows[0..row_count]);
     try std.testing.expectEqual(@as(usize, 0), rows[0].pane.ref.chat.thread_index);
     try std.testing.expectEqual(second_thread_index, rows[1].pane.ref.chat.thread_index);
+}
+
+test "ACTIVE cluster caps viewport at ten rows and leaves room for the workspace tree" {
+    const empty = attentionClusterLayout(0, 800, 42, 20, 12, 10, 96);
+    try std.testing.expectEqual(@as(f32, 0), empty.content_h);
+    try std.testing.expectEqual(@as(f32, 0), empty.viewport_h);
+
+    const short = attentionClusterLayout(3, 800, 42, 20, 12, 10, 96);
+    try std.testing.expectEqual(@as(f32, 158), short.content_h);
+    try std.testing.expectEqual(@as(f32, 158), short.viewport_h);
+
+    const overflowing = attentionClusterLayout(15, 800, 42, 20, 12, 10, 96);
+    try std.testing.expectEqual(@as(f32, 662), overflowing.content_h);
+    try std.testing.expectEqual(@as(f32, 452), overflowing.viewport_h);
+
+    const short_rail = attentionClusterLayout(15, 200, 42, 20, 12, 10, 96);
+    try std.testing.expectEqual(@as(f32, 104), short_rail.viewport_h);
+
+    const tiny_rail = attentionClusterLayout(15, 80, 42, 20, 12, 10, 96);
+    try std.testing.expectEqual(@as(f32, 40), tiny_rail.viewport_h);
+}
+
+test "ACTIVE wheel stays in the pinned cluster when it overflows" {
+    const previous_sidebar_rect = palette_sidebar_rect;
+    const previous_sidebar_scroll = sidebar_scroll_y;
+    const previous_sidebar_max = sidebar_max_scroll_y;
+    const previous_attention_clip = attention_clip;
+    const previous_attention_scroll = attention_scroll_y;
+    const previous_attention_max = attention_max_scroll_y;
+    defer {
+        palette_sidebar_rect = previous_sidebar_rect;
+        sidebar_scroll_y = previous_sidebar_scroll;
+        sidebar_max_scroll_y = previous_sidebar_max;
+        attention_clip = previous_attention_clip;
+        attention_scroll_y = previous_attention_scroll;
+        attention_max_scroll_y = previous_attention_max;
+    }
+
+    palette_sidebar_rect = .{ .x = 0, .y = 0, .w = 240, .h = 800 };
+    attention_clip = .{ .x = 0, .y = 100, .w = 240, .h = 200 };
+    attention_scroll_y = 0.0;
+    attention_max_scroll_y = 400.0;
+    sidebar_scroll_y = 0.0;
+    sidebar_max_scroll_y = 400.0;
+
+    try std.testing.expect(handlePaletteWheel(40, 150, -1.0));
+    try std.testing.expect(attention_scroll_y > 0.0);
+    try std.testing.expectEqual(@as(f32, 0), sidebar_scroll_y);
+
+    attention_scroll_y = 0.0;
+    try std.testing.expect(handlePaletteWheel(40, 400, -1.0));
+    try std.testing.expectEqual(@as(f32, 0), attention_scroll_y);
+    try std.testing.expect(sidebar_scroll_y > 0.0);
+
+    sidebar_scroll_y = 0.0;
+    attention_max_scroll_y = 0.0;
+    try std.testing.expect(handlePaletteWheel(40, 150, -1.0));
+    try std.testing.expectEqual(@as(f32, 0), attention_scroll_y);
+    try std.testing.expect(sidebar_scroll_y > 0.0);
 }
