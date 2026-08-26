@@ -549,6 +549,16 @@ fn changeCursorLoopMain(storage: *const Storage, loop: *ChangeCursorLoopState) v
     log.info("change-cursor loop exiting", .{});
 }
 
+fn refreshProviderMcpRegistrations(allocator: std.mem.Allocator, pref_path: []const u8) !provider_mcp.Summary {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const exe_path = try std.process.executablePathAlloc(threaded.io(), allocator);
+    defer allocator.free(exe_path);
+    // The daemon owns the HTTP listener and persists its final bound port.
+    // Wait for it before copying that endpoint into all provider configs.
+    try sessionizer.ensureDaemon(allocator, pref_path, exe_path);
+    return provider_mcp.install(allocator);
+}
+
 fn changeCursorSleep(loop: *ChangeCursorLoopState, total_ms: u64) void {
     var remaining = total_ms;
     while (remaining > 0) {
@@ -3894,7 +3904,7 @@ pub const AppState = struct {
             state.zed_logo_texture = state.loadEmbeddedTexture(ZED_LOGO_BYTES);
         }
         if (state.app_config.mcp_integration_enabled) {
-            state.settings_controller.mcp_summary = provider_mcp.install(state.allocator) catch |err| blk: {
+            state.settings_controller.mcp_summary = refreshProviderMcpRegistrations(state.allocator, state.storage.pref_path) catch |err| blk: {
                 log.warn("failed to refresh enabled provider MCP registrations: {s}", .{@errorName(err)});
                 break :blk provider_mcp.inspect(state.allocator);
             };

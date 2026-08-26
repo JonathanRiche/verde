@@ -380,12 +380,44 @@ pub fn makeSessionListRequestAlloc(allocator: std.mem.Allocator, id: i64, cwd_ow
     return writer.toOwnedSlice();
 }
 
+pub const McpHttpServer = struct {
+    url: []const u8,
+    authorization: []const u8,
+    client_name: []const u8,
+};
+
+const McpServer = union(enum) {
+    stdio: []const u8,
+    http: McpHttpServer,
+};
+
 pub fn makeSessionNewRequestAlloc(allocator: std.mem.Allocator, id: i64, cwd: []const u8, mcp_executable: ?[]const u8) ![]u8 {
-    return makeSessionSetupRequestAlloc(allocator, id, "session/new", null, cwd, mcp_executable);
+    const server: ?McpServer = if (mcp_executable) |executable| .{ .stdio = executable } else null;
+    return makeSessionSetupRequestAlloc(allocator, id, "session/new", null, cwd, server);
 }
 
 pub fn makeSessionLoadRequestAlloc(allocator: std.mem.Allocator, id: i64, session_id: []const u8, cwd: []const u8, mcp_executable: ?[]const u8) ![]u8 {
-    return makeSessionSetupRequestAlloc(allocator, id, "session/load", session_id, cwd, mcp_executable);
+    const server: ?McpServer = if (mcp_executable) |executable| .{ .stdio = executable } else null;
+    return makeSessionSetupRequestAlloc(allocator, id, "session/load", session_id, cwd, server);
+}
+
+pub fn makeSessionNewRequestWithHttpMcpAlloc(
+    allocator: std.mem.Allocator,
+    id: i64,
+    cwd: []const u8,
+    server: ?McpHttpServer,
+) ![]u8 {
+    return makeSessionSetupRequestAlloc(allocator, id, "session/new", null, cwd, if (server) |value| .{ .http = value } else null);
+}
+
+pub fn makeSessionLoadRequestWithHttpMcpAlloc(
+    allocator: std.mem.Allocator,
+    id: i64,
+    session_id: []const u8,
+    cwd: []const u8,
+    server: ?McpHttpServer,
+) ![]u8 {
+    return makeSessionSetupRequestAlloc(allocator, id, "session/load", session_id, cwd, if (server) |value| .{ .http = value } else null);
 }
 
 pub fn makePromptRequestAlloc(
@@ -1222,7 +1254,7 @@ fn makeSessionSetupRequestAlloc(
     method: []const u8,
     session_id: ?[]const u8,
     cwd: []const u8,
-    mcp_executable: ?[]const u8,
+    mcp_server: ?McpServer,
 ) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
@@ -1239,31 +1271,51 @@ fn makeSessionSetupRequestAlloc(
     try stringify.write(cwd);
     try stringify.objectField("mcpServers");
     try stringify.beginArray();
-    if (mcp_executable) |executable| {
+    if (mcp_server) |server| {
         try stringify.beginObject();
         try stringify.objectField("name");
         try stringify.write("verde");
-        try stringify.objectField("command");
-        try stringify.write(executable);
-        try stringify.objectField("args");
-        try stringify.beginArray();
-        try stringify.write("mcp");
-        try stringify.endArray();
-        try stringify.objectField("env");
-        try stringify.beginArray();
-        try stringify.beginObject();
-        try stringify.objectField("name");
-        try stringify.write("VERDE_MCP_MANAGED");
-        try stringify.objectField("value");
-        try stringify.write("1");
-        try stringify.endObject();
-        try stringify.endArray();
+        switch (server) {
+            .stdio => |executable| {
+                try stringify.objectField("command");
+                try stringify.write(executable);
+                try stringify.objectField("args");
+                try stringify.beginArray();
+                try stringify.write("mcp");
+                try stringify.endArray();
+                try stringify.objectField("env");
+                try stringify.beginArray();
+                try writeAcpNameValue(&stringify, "VERDE_MCP_MANAGED", "1");
+                try stringify.endArray();
+            },
+            .http => |http| {
+                try stringify.objectField("type");
+                try stringify.write("http");
+                try stringify.objectField("url");
+                try stringify.write(http.url);
+                try stringify.objectField("headers");
+                try stringify.beginArray();
+                try writeAcpNameValue(&stringify, "Authorization", http.authorization);
+                try writeAcpNameValue(&stringify, "X-Verde-MCP-Client", http.client_name);
+                try writeAcpNameValue(&stringify, "X-Verde-MCP-Managed", "1");
+                try stringify.endArray();
+            },
+        }
         try stringify.endObject();
     }
     try stringify.endArray();
     try stringify.endObject();
     try stringify.endObject();
     return writer.toOwnedSlice();
+}
+
+fn writeAcpNameValue(stringify: *std.json.Stringify, name: []const u8, value: []const u8) !void {
+    try stringify.beginObject();
+    try stringify.objectField("name");
+    try stringify.write(name);
+    try stringify.objectField("value");
+    try stringify.write(value);
+    try stringify.endObject();
 }
 
 fn writeImageContentBlock(allocator: std.mem.Allocator, stringify: *std.json.Stringify, image: provider_types.ImageAttachment) !void {
@@ -1386,6 +1438,26 @@ test "session setup passes Verde MCP through ACP" {
     const environment = getObjectField(servers[0], "env").?.array.items;
     try std.testing.expectEqualStrings("VERDE_MCP_MANAGED", getOptionalObjectString(environment[0], "name").?);
     try std.testing.expectEqualStrings("1", getOptionalObjectString(environment[0], "value").?);
+}
+
+test "session setup passes authenticated Verde HTTP MCP through ACP" {
+    const json = try makeSessionNewRequestWithHttpMcpAlloc(std.testing.allocator, 2, "/tmp/project", .{
+        .url = "http://127.0.0.1:47371/mcp",
+        .authorization = "Bearer test-token",
+        .client_name = "fx",
+    });
+    defer std.testing.allocator.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const params = getObjectField(parsed.value, "params").?;
+    const server = getObjectField(params, "mcpServers").?.array.items[0];
+    try std.testing.expectEqualStrings("http", getOptionalObjectString(server, "type").?);
+    try std.testing.expectEqualStrings("http://127.0.0.1:47371/mcp", getOptionalObjectString(server, "url").?);
+    const headers = getObjectField(server, "headers").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), headers.len);
+    try std.testing.expectEqualStrings("Authorization", getOptionalObjectString(headers[0], "name").?);
+    try std.testing.expectEqualStrings("Bearer test-token", getOptionalObjectString(headers[0], "value").?);
+    try std.testing.expectEqualStrings("fx", getOptionalObjectString(headers[1], "value").?);
 }
 
 test "makePromptRequestAlloc writes text and image content blocks" {
