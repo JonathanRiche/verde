@@ -388,10 +388,8 @@ pub fn focusPaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool 
     if (maximized) {
         if (scrolling_navigation) {
             const direction = workspacePaneDirection(dir);
-            if (layout.neighborPaneId(current_id, direction)) |inner_target| {
-                if (layout.panesShareScrollGroup(current_id, inner_target)) {
-                    return focusPaneNavigationTarget(state, inner_target, true);
-                }
+            if (layout.neighborPaneIdInScrollGroup(current_id, direction)) |inner_target| {
+                return focusPaneNavigationTarget(state, inner_target, true);
             }
             const strip_direction = scrollingPaneDirection(state.app_config.workspace_scroll_direction, dir) orelse return false;
             const target = layout.adjacentScrollGroupPaneId(current_id, strip_direction) orelse return false;
@@ -411,10 +409,8 @@ pub fn focusPaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool 
 
     if (scrolling_navigation) {
         const direction = workspacePaneDirection(dir);
-        if (layout.neighborPaneId(current_id, direction)) |inner_target| {
-            if (layout.panesShareScrollGroup(current_id, inner_target)) {
-                return focusPaneNavigationTarget(state, inner_target, false);
-            }
+        if (layout.neighborPaneIdInScrollGroup(current_id, direction)) |inner_target| {
+            return focusPaneNavigationTarget(state, inner_target, false);
         }
         const strip_direction = scrollingPaneDirection(state.app_config.workspace_scroll_direction, dir) orelse return false;
         const target = layout.adjacentScrollGroupPaneId(current_id, strip_direction) orelse return false;

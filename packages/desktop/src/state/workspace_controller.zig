@@ -306,6 +306,10 @@ pub fn toggleCurrentProjectQuickPane(self: anytype) bool {
 }
 
 pub fn createFloatingQuickTerminal(self: anytype) bool {
+    return createFloatingQuickTerminalWithProfile(self, .{});
+}
+
+pub fn createFloatingQuickTerminalWithProfile(self: anytype, profile: terminal.TerminalLaunchProfile) bool {
     if (self.project_controller.projects.items.len == 0) return false;
     const project_index = self.project_controller.selected_index;
     self.ensureCurrentProjectWorkspace();
@@ -316,7 +320,8 @@ pub fn createFloatingQuickTerminal(self: anytype) bool {
         self.setSidebarNotice("Failed to create quick terminal.");
         return false;
     };
-    self.restartTerminalDockForWorkspace(project_index, dock_id) catch |err| {
+    const cwd = self.project_controller.projects.items[project_index].path;
+    self.restartTerminalDockForWorkspaceProfile(project_index, dock_id, cwd, profile) catch |err| {
         log.err("failed to start quick terminal dock: {s}", .{@errorName(err)});
         self.setSidebarNotice("Failed to start quick terminal.");
         return false;

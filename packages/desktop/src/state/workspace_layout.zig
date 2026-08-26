@@ -926,6 +926,66 @@ pub const WorkspaceLayout = struct {
         return self.neighborPaneIdInNode(root_node, pane_id, direction);
     }
 
+    /// Finds a directional neighbor after pruning leaves outside the pane's
+    /// scrolling tile group, matching the nested geometry used by rendering.
+    pub fn neighborPaneIdInScrollGroup(self: *const WorkspaceLayout, pane_id: WorkspacePaneId, direction: WorkspacePaneDirection) ?WorkspacePaneId {
+        const root_node = self.root orelse return null;
+        const group_id = self.scrollGroupIdForPane(pane_id) orelse return null;
+        if (self.scrollGroupPaneCount(group_id) <= 1 or !nodeContainsPane(root_node, pane_id)) return null;
+        return self.neighborPaneIdInScrollGroupNode(root_node, pane_id, group_id, direction);
+    }
+
+    fn neighborPaneIdInScrollGroupNode(
+        self: *const WorkspaceLayout,
+        node: *const WorkspaceNode,
+        pane_id: WorkspacePaneId,
+        group_id: WorkspacePaneId,
+        direction: WorkspacePaneDirection,
+    ) ?WorkspacePaneId {
+        switch (node.*) {
+            .leaf => return null,
+            .split => |split| {
+                if (nodeContainsPane(split.first, pane_id)) {
+                    if (self.neighborPaneIdInScrollGroupNode(split.first, pane_id, group_id, direction)) |neighbor| return neighbor;
+                    if ((direction == .right and split.axis == .vertical) or
+                        (direction == .down and split.axis == .horizontal))
+                    {
+                        return self.edgeVisiblePaneIdInScrollGroup(split.second, group_id, false);
+                    }
+                    return null;
+                }
+                if (nodeContainsPane(split.second, pane_id)) {
+                    if (self.neighborPaneIdInScrollGroupNode(split.second, pane_id, group_id, direction)) |neighbor| return neighbor;
+                    if ((direction == .left and split.axis == .vertical) or
+                        (direction == .up and split.axis == .horizontal))
+                    {
+                        return self.edgeVisiblePaneIdInScrollGroup(split.first, group_id, true);
+                    }
+                }
+                return null;
+            },
+        }
+    }
+
+    fn edgeVisiblePaneIdInScrollGroup(
+        self: *const WorkspaceLayout,
+        node: *const WorkspaceNode,
+        group_id: WorkspacePaneId,
+        prefer_second: bool,
+    ) ?WorkspacePaneId {
+        switch (node.*) {
+            .leaf => |pane_id| return if (self.scrollGroupIdForPane(pane_id) == group_id) pane_id else null,
+            .split => |split| {
+                if (prefer_second) {
+                    return self.edgeVisiblePaneIdInScrollGroup(split.second, group_id, true) orelse
+                        self.edgeVisiblePaneIdInScrollGroup(split.first, group_id, true);
+                }
+                return self.edgeVisiblePaneIdInScrollGroup(split.first, group_id, false) orelse
+                    self.edgeVisiblePaneIdInScrollGroup(split.second, group_id, false);
+            },
+        }
+    }
+
     pub fn neighborPaneIdInNode(
         self: *const WorkspaceLayout,
         node: *const WorkspaceNode,
@@ -1991,6 +2051,33 @@ test "workspace layout persists scrolling tile groups and skips their inner leav
     try std.testing.expectEqual(@as(?WorkspacePaneId, 1), restored.paneById(tiled_pane_id).?.scroll_group_id);
     try std.testing.expect(restored.paneById(tiled_pane_id).?.last_focused_in_scroll_group);
     try std.testing.expectEqual(@as(?WorkspacePaneId, null), restored.paneById(standalone_pane_id).?.scroll_group_id);
+}
+
+test "restored scrolling tile navigation prunes interleaved standalone panes" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+
+    const standalone_pane_id = try layout.createTerminalPane(allocator, 10);
+    try layout.splitPaneWithLeaf(allocator, 1, standalone_pane_id, .vertical, true);
+    const tiled_pane_id = try layout.createTerminalPane(allocator, 11);
+    try layout.splitPaneWithLeaf(allocator, standalone_pane_id, tiled_pane_id, .vertical, true);
+    try std.testing.expect(layout.joinPaneToScrollGroup(1, tiled_pane_id));
+
+    // The unfiltered tree reaches the standalone middle leaf first. Rendering
+    // prunes that leaf from this tile group, so navigation must do the same.
+    try std.testing.expectEqual(@as(?WorkspacePaneId, standalone_pane_id), layout.neighborPaneId(1, .right));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, tiled_pane_id), layout.neighborPaneIdInScrollGroup(1, .right));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 1), layout.neighborPaneIdInScrollGroup(tiled_pane_id, .left));
+
+    const persisted = try layout.persistedWorkspaceJson(allocator);
+    defer allocator.free(persisted);
+    var restored = try WorkspaceLayout.initDefaultChat(allocator);
+    defer restored.deinit(allocator);
+    try restored.applyPersistedWorkspaceJson(allocator, persisted);
+
+    try std.testing.expectEqual(@as(?WorkspacePaneId, tiled_pane_id), restored.neighborPaneIdInScrollGroup(1, .right));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 1), restored.neighborPaneIdInScrollGroup(tiled_pane_id, .left));
 }
 
 test "workspace layout persists scrolling policy overrides" {

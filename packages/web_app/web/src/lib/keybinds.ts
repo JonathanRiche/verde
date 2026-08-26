@@ -21,7 +21,16 @@ export type KeyAction =
   | { kind: 'workspace_select'; index: number }
   | { kind: 'active_select'; index: number }
 
-export type PrefixTarget = { action: string } | { command: string }
+export type PrefixCommandPlacement =
+  | 'background'
+  | 'terminal'
+  | 'pane'
+  | 'split_horizontal'
+  | 'split_vertical'
+  | 'floating'
+  | 'tab'
+
+export type PrefixTarget = { action: string } | { command: string; in?: PrefixCommandPlacement }
 
 export interface Accelerator {
   key: string
@@ -61,7 +70,6 @@ const DIRECT_CHORDS: Chord[] = [
   { key: 'p', ctrl: true, shift: true, action: 'command_palette' },
   { key: 's', ctrl: true, action: 'toggle_sidebar' },
   { key: 's', ctrl: true, shift: true, action: 'toggle_sidebar_hidden' },
-  { key: 't', ctrl: true, action: 'new_thread' },
   { key: 't', ctrl: true, alt: true, action: 'new_terminal' },
   { key: 'w', ctrl: true, action: 'close_pane' },
   { key: 'x', alt: true, action: 'close_pane' },
@@ -90,14 +98,14 @@ for (let index = 0; index <= 9; index += 1) {
 
 const DEFAULT_PREFIX_ROWS: Array<[string, string]> = [
   ['Shift+Slash', 'prefix.keybinds'], ['W', 'prefix.navigate'],
-  ['P', 'command_palette'], ['T', 'new_thread'], ['R', 'refresh'], ['O', 'open'],
+  ['P', 'command_palette'], ['T', 'new_thread'], ['Shift+T', 'new_terminal'], ['R', 'refresh'], ['O', 'open'],
   ['E', 'open_editor'], ['Space', 'companion'], ['S', 'sidebar'], ['Shift+S', 'sidebar_hidden'],
   ['B', 'browser'], ['Grave', 'terminal.toggle'], ['Q', 'workspace.toggle_quick_pane'],
   ['X', 'workspace.close'], ['Shift+X', 'workspace.close_current'], ['Z', 'workspace.toggle_maximize'],
   ['I', 'workspace.focus_prompt'], ['C', 'workspace.split_chat_vertical'],
-  ['Shift+C', 'workspace.split_chat_horizontal'], ['V', 'workspace.split_default_vertical'],
-  ['Minus', 'workspace.split_default_horizontal'], ['Shift+V', 'workspace.split_alternate_vertical'],
-  ['Shift+Minus', 'workspace.split_alternate_horizontal'],
+  ['Shift+C', 'workspace.split_chat_horizontal'], ['V', 'workspace.split_chat_vertical'],
+  ['Minus', 'workspace.split_chat_horizontal'], ['Shift+V', 'workspace.split_terminal_vertical'],
+  ['Shift+Minus', 'workspace.split_terminal_horizontal'],
   ['H', 'workspace.focus_left'], ['J', 'workspace.focus_down'], ['K', 'workspace.focus_up'], ['L', 'workspace.focus_right'],
   ['Left', 'workspace.focus_left'], ['Down', 'workspace.focus_down'], ['Up', 'workspace.focus_up'], ['Right', 'workspace.focus_right'],
   ['Shift+H', 'workspace.move_left'], ['Shift+J', 'workspace.move_down'], ['Shift+K', 'workspace.move_up'], ['Shift+L', 'workspace.move_right'],
@@ -126,8 +134,8 @@ const DEFAULT_NAVIGATE_ROWS: Array<[string, string]> = [
   ['Up', 'workspace.previous'], ['Down', 'workspace.next'], ['Tab', 'workspace.pane_next'],
   ['Shift+Tab', 'workspace.pane_previous'], ['H', 'workspace.focus_left'], ['J', 'workspace.focus_down'],
   ['K', 'workspace.focus_up'], ['L', 'workspace.focus_right'], ['C', 'new_thread'],
-  ['V', 'workspace.split_default_vertical'], ['Minus', 'workspace.split_default_horizontal'],
-  ['Shift+V', 'workspace.split_alternate_vertical'], ['Shift+Minus', 'workspace.split_alternate_horizontal'],
+  ['V', 'workspace.split_chat_vertical'], ['Minus', 'workspace.split_chat_horizontal'],
+  ['Shift+V', 'workspace.split_terminal_vertical'], ['Shift+Minus', 'workspace.split_terminal_horizontal'],
   ['X', 'workspace.close'], ['Z', 'workspace.toggle_maximize'], ['P', 'command_palette'],
   ['Shift+Slash', 'prefix.keybinds'],
 ]
@@ -183,10 +191,44 @@ function parseAcceleratorList(raw: unknown): Accelerator[] | null {
   return values.flatMap((value) => typeof value === 'string' ? [parseAccelerator(value)].filter((item): item is Accelerator => item != null) : [])
 }
 
+function parseCommandPlacement(raw: unknown): PrefixCommandPlacement | null {
+  if (typeof raw !== 'string') return null
+  const aliases: Record<string, PrefixCommandPlacement> = {
+    background: 'background',
+    detached: 'background',
+    terminal: 'terminal',
+    current: 'terminal',
+    focused: 'terminal',
+    pane: 'pane',
+    new_pane: 'pane',
+    'new-pane': 'pane',
+    new: 'pane',
+    split: 'split_horizontal',
+    horizontal: 'split_horizontal',
+    split_horizontal: 'split_horizontal',
+    'split-horizontal': 'split_horizontal',
+    vertical: 'split_vertical',
+    split_vertical: 'split_vertical',
+    'split-vertical': 'split_vertical',
+    floating: 'floating',
+    float: 'floating',
+    quick: 'floating',
+    tab: 'tab',
+  }
+  return aliases[raw.trim().toLowerCase()] ?? null
+}
+
 function parseTarget(raw: unknown): PrefixTarget | null {
   if (typeof raw === 'string') return raw.trim() ? { action: raw.trim() } : null
   const record = asRecord(raw)
-  if (typeof record?.command === 'string' && record.command.trim()) return { command: record.command.trim() }
+  if (typeof record?.command === 'string' && record.command.trim()) {
+    const command = record.command.trim()
+    const placement_raw = record.in ?? record.open
+    if (placement_raw === undefined) return { command }
+    const placement = parseCommandPlacement(placement_raw)
+    if (!placement) return null
+    return placement === 'background' ? { command } : { command, in: placement }
+  }
   if (typeof record?.action === 'string' && record.action.trim()) return { action: record.action.trim() }
   return null
 }
@@ -306,7 +348,19 @@ export function matchKeyAction(event: KeyboardEvent, config: WebKeybindConfig = 
 }
 
 export function prefixTargetLabel(target: PrefixTarget): string {
-  if ('command' in target) return `$ ${target.command}`
+  if ('command' in target) {
+    const placement = target.in && target.in !== 'background'
+      ? ({
+          terminal: 'terminal',
+          pane: 'pane',
+          split_horizontal: 'split -',
+          split_vertical: 'split |',
+          floating: 'floating',
+          tab: 'tab',
+        } as const)[target.in]
+      : ''
+    return placement ? `$ ${target.command} · ${placement}` : `$ ${target.command}`
+  }
   const ordinal = /workspace\.(pane_select|active_select|select)\.(\d+)$/.exec(target.action)
   if (ordinal) return `${ordinal[1] === 'select' ? 'Workspace' : ordinal[1] === 'pane_select' ? 'Pane' : 'Active row'} ${ordinal[2]}`
   return ({

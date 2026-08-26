@@ -91,15 +91,32 @@ pub const PrefixTarget = union(enum) {
     workspace_select: usize,
     pane_select: usize,
     active_select: usize,
-    /// Owned shell script, run through `sh -lc` in the current project.
-    command: []u8,
+    /// Owned shell script. `in` chooses where it runs; omitted means background.
+    command: PrefixCommand,
 
     fn deinit(self: PrefixTarget, allocator: std.mem.Allocator) void {
         switch (self) {
-            .command => |script| allocator.free(script),
+            .command => |command| allocator.free(command.script),
             else => {},
         }
     }
+};
+
+/// Where a prefix `{ "command" }` script runs. Background is the historical
+/// detached `sh -lc` spawn; the rest open a Verde terminal surface.
+pub const PrefixCommandPlacement = enum {
+    background,
+    terminal,
+    pane,
+    split_horizontal,
+    split_vertical,
+    floating,
+    tab,
+};
+
+pub const PrefixCommand = struct {
+    script: []u8,
+    placement: PrefixCommandPlacement = .background,
 };
 
 pub const PrefixBinding = struct {
@@ -1158,17 +1175,7 @@ pub const NativeKeyboardConfig = struct {
             },
             .object => |object| {
                 if (object.get("command")) |command_value| {
-                    if (command_value != .string) {
-                        log.warn("prefix binding {s}: command must be a string", .{key_label});
-                        return null;
-                    }
-                    const script = std.mem.trim(u8, command_value.string, &std.ascii.whitespace);
-                    if (script.len == 0) {
-                        log.warn("prefix binding {s}: command must not be empty", .{key_label});
-                        return null;
-                    }
-                    const owned = self.allocator.dupe(u8, script) catch return null;
-                    return .{ .command = owned };
+                    return self.parsePrefixCommandObject(object, command_value, key_label);
                 }
                 if (object.get("action")) |action_value| {
                     return self.parsePrefixTargetValue(action_value, key_label);
@@ -1181,6 +1188,26 @@ pub const NativeKeyboardConfig = struct {
                 return null;
             },
         }
+    }
+
+    fn parsePrefixCommandObject(
+        self: *const NativeKeyboardConfig,
+        object: std.json.ObjectMap,
+        command_value: std.json.Value,
+        key_label: []const u8,
+    ) ?PrefixTarget {
+        if (command_value != .string) {
+            log.warn("prefix binding {s}: command must be a string", .{key_label});
+            return null;
+        }
+        const script = std.mem.trim(u8, command_value.string, &std.ascii.whitespace);
+        if (script.len == 0) {
+            log.warn("prefix binding {s}: command must not be empty", .{key_label});
+            return null;
+        }
+        const placement = parsePrefixCommandPlacementValue(object.get("in") orelse object.get("open"), key_label) orelse return null;
+        const owned = self.allocator.dupe(u8, script) catch return null;
+        return .{ .command = .{ .script = owned, .placement = placement } };
     }
 
     fn parseOverrideValue(self: *const NativeKeyboardConfig, value: std.json.Value, comptime field_name: []const u8) ?[]Keybind {
@@ -1411,8 +1438,70 @@ pub fn prefixTargetLabel(buf: []u8, target: PrefixTarget) []const u8 {
         .workspace_select => |index| std.fmt.bufPrint(buf, "Workspace {d}", .{index + 1}) catch "Workspace",
         .pane_select => |index| std.fmt.bufPrint(buf, "Pane {d}", .{index + 1}) catch "Pane",
         .active_select => |index| std.fmt.bufPrint(buf, "Active row {d}", .{index + 1}) catch "Active row",
-        .command => |script| std.fmt.bufPrint(buf, "$ {s}", .{script}) catch "$ script",
+        .command => |command| prefixCommandLabel(buf, command),
     };
+}
+
+fn prefixCommandLabel(buf: []u8, command: PrefixCommand) []const u8 {
+    const placement = prefixCommandPlacementLabel(command.placement);
+    if (placement.len == 0) {
+        return std.fmt.bufPrint(buf, "$ {s}", .{command.script}) catch "$ script";
+    }
+    return std.fmt.bufPrint(buf, "$ {s} · {s}", .{ command.script, placement }) catch "$ script";
+}
+
+pub fn prefixCommandPlacementLabel(placement: PrefixCommandPlacement) []const u8 {
+    return switch (placement) {
+        .background => "",
+        .terminal => "terminal",
+        .pane => "pane",
+        .split_horizontal => "split -",
+        .split_vertical => "split |",
+        .floating => "floating",
+        .tab => "tab",
+    };
+}
+
+fn parsePrefixCommandPlacementValue(value: ?std.json.Value, key_label: []const u8) ?PrefixCommandPlacement {
+    const placement_value = value orelse return .background;
+    if (placement_value != .string) {
+        log.warn("prefix binding {s}: in must be a string", .{key_label});
+        return null;
+    }
+    return parsePrefixCommandPlacement(placement_value.string) orelse {
+        log.warn("prefix binding {s}: unknown in value", .{key_label});
+        return null;
+    };
+}
+
+pub fn parsePrefixCommandPlacement(raw: []const u8) ?PrefixCommandPlacement {
+    const trimmed = std.mem.trim(u8, raw, &std.ascii.whitespace);
+    const entries = [_]struct { name: []const u8, placement: PrefixCommandPlacement }{
+        .{ .name = "background", .placement = .background },
+        .{ .name = "detached", .placement = .background },
+        .{ .name = "terminal", .placement = .terminal },
+        .{ .name = "current", .placement = .terminal },
+        .{ .name = "focused", .placement = .terminal },
+        .{ .name = "pane", .placement = .pane },
+        .{ .name = "new_pane", .placement = .pane },
+        .{ .name = "new-pane", .placement = .pane },
+        .{ .name = "new", .placement = .pane },
+        .{ .name = "split", .placement = .split_horizontal },
+        .{ .name = "horizontal", .placement = .split_horizontal },
+        .{ .name = "split_horizontal", .placement = .split_horizontal },
+        .{ .name = "split-horizontal", .placement = .split_horizontal },
+        .{ .name = "vertical", .placement = .split_vertical },
+        .{ .name = "split_vertical", .placement = .split_vertical },
+        .{ .name = "split-vertical", .placement = .split_vertical },
+        .{ .name = "floating", .placement = .floating },
+        .{ .name = "float", .placement = .floating },
+        .{ .name = "quick", .placement = .floating },
+        .{ .name = "tab", .placement = .tab },
+    };
+    for (entries) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry.name, trimmed)) return entry.placement;
+    }
+    return null;
 }
 
 fn parseOrdinalSuffix(name: []const u8, comptime head: []const u8) ?usize {
@@ -1453,10 +1542,10 @@ const DEFAULT_PREFIX_TABLE = [_]DefaultPrefixEntry{
     .{ .accelerator = "I", .target = "workspace.focus_prompt" },
     .{ .accelerator = "C", .target = "workspace.split_chat_vertical" },
     .{ .accelerator = "Shift+C", .target = "workspace.split_chat_horizontal" },
-    .{ .accelerator = "V", .target = "workspace.split_default_vertical" },
-    .{ .accelerator = "Minus", .target = "workspace.split_default_horizontal" },
-    .{ .accelerator = "Shift+V", .target = "workspace.split_alternate_vertical" },
-    .{ .accelerator = "Shift+Minus", .target = "workspace.split_alternate_horizontal" },
+    .{ .accelerator = "V", .target = "workspace.split_chat_vertical" },
+    .{ .accelerator = "Minus", .target = "workspace.split_chat_horizontal" },
+    .{ .accelerator = "Shift+V", .target = "workspace.split_terminal_vertical" },
+    .{ .accelerator = "Shift+Minus", .target = "workspace.split_terminal_horizontal" },
     .{ .accelerator = "H", .target = "workspace.focus_left" },
     .{ .accelerator = "J", .target = "workspace.focus_down" },
     .{ .accelerator = "K", .target = "workspace.focus_up" },
@@ -1549,10 +1638,10 @@ const DEFAULT_NAVIGATE_TABLE = [_]DefaultPrefixEntry{
     .{ .accelerator = "K", .target = "workspace.focus_up" },
     .{ .accelerator = "L", .target = "workspace.focus_right" },
     .{ .accelerator = "C", .target = "new_thread" },
-    .{ .accelerator = "V", .target = "workspace.split_default_vertical" },
-    .{ .accelerator = "Minus", .target = "workspace.split_default_horizontal" },
-    .{ .accelerator = "Shift+V", .target = "workspace.split_alternate_vertical" },
-    .{ .accelerator = "Shift+Minus", .target = "workspace.split_alternate_horizontal" },
+    .{ .accelerator = "V", .target = "workspace.split_chat_vertical" },
+    .{ .accelerator = "Minus", .target = "workspace.split_chat_horizontal" },
+    .{ .accelerator = "Shift+V", .target = "workspace.split_terminal_vertical" },
+    .{ .accelerator = "Shift+Minus", .target = "workspace.split_terminal_horizontal" },
     .{ .accelerator = "X", .target = "workspace.close" },
     .{ .accelerator = "Z", .target = "workspace.toggle_maximize" },
     .{ .accelerator = "P", .target = "command_palette" },
@@ -3046,41 +3135,41 @@ test "default prefix t chords create chat and terminal panes" {
     try std.testing.expect(chat and terminal);
 }
 
-test "default prefix pane tile chords use default and shifted alternate actions" {
+test "default prefix pane tile chords create chat and shifted terminal splits" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
 
-    var default_vertical = false;
-    var default_horizontal = false;
-    var alternate_vertical = false;
-    var alternate_horizontal = false;
+    var chat_vertical = false;
+    var chat_horizontal = false;
+    var terminal_vertical = false;
+    var terminal_horizontal = false;
     for (config.prefix.bindings.items) |binding| {
         if (binding.key.eql(.{ .key = .v })) {
-            default_vertical = binding.target == .split_default_vertical;
+            chat_vertical = binding.target == .app and binding.target.app == .workspace_split_chat_vertical;
         }
         if (binding.key.eql(.{ .key = .minus })) {
-            default_horizontal = binding.target == .split_default_horizontal;
+            chat_horizontal = binding.target == .app and binding.target.app == .workspace_split_chat_horizontal;
         }
         if (binding.key.eql(.{ .shift = true, .key = .v })) {
-            alternate_vertical = binding.target == .split_alternate_vertical;
+            terminal_vertical = binding.target == .app and binding.target.app == .workspace_split_terminal_vertical;
         }
         if (binding.key.eql(.{ .shift = true, .key = .minus })) {
-            alternate_horizontal = binding.target == .split_alternate_horizontal;
+            terminal_horizontal = binding.target == .app and binding.target.app == .workspace_split_terminal_horizontal;
         }
     }
-    try std.testing.expect(default_vertical and default_horizontal and alternate_vertical and alternate_horizontal);
+    try std.testing.expect(chat_vertical and chat_horizontal and terminal_vertical and terminal_horizontal);
 
-    var navigate_default_vertical = false;
-    var navigate_default_horizontal = false;
-    var navigate_alternate_vertical = false;
-    var navigate_alternate_horizontal = false;
+    var navigate_chat_vertical = false;
+    var navigate_chat_horizontal = false;
+    var navigate_terminal_vertical = false;
+    var navigate_terminal_horizontal = false;
     for (config.prefix.navigate.items) |binding| {
-        if (binding.key.eql(.{ .key = .v })) navigate_default_vertical = binding.target == .split_default_vertical;
-        if (binding.key.eql(.{ .key = .minus })) navigate_default_horizontal = binding.target == .split_default_horizontal;
-        if (binding.key.eql(.{ .shift = true, .key = .v })) navigate_alternate_vertical = binding.target == .split_alternate_vertical;
-        if (binding.key.eql(.{ .shift = true, .key = .minus })) navigate_alternate_horizontal = binding.target == .split_alternate_horizontal;
+        if (binding.key.eql(.{ .key = .v })) navigate_chat_vertical = binding.target == .app and binding.target.app == .workspace_split_chat_vertical;
+        if (binding.key.eql(.{ .key = .minus })) navigate_chat_horizontal = binding.target == .app and binding.target.app == .workspace_split_chat_horizontal;
+        if (binding.key.eql(.{ .shift = true, .key = .v })) navigate_terminal_vertical = binding.target == .app and binding.target.app == .workspace_split_terminal_vertical;
+        if (binding.key.eql(.{ .shift = true, .key = .minus })) navigate_terminal_horizontal = binding.target == .app and binding.target.app == .workspace_split_terminal_horizontal;
     }
-    try std.testing.expect(navigate_default_vertical and navigate_default_horizontal and navigate_alternate_vertical and navigate_alternate_horizontal);
+    try std.testing.expect(navigate_chat_vertical and navigate_chat_horizontal and navigate_terminal_vertical and navigate_terminal_horizontal);
 }
 
 test "prefix shorthand bool and string overrides" {
@@ -3142,7 +3231,8 @@ test "prefix object override changes key and merges bindings" {
         if (binding.key.eql(.{ .key = .z })) return error.TestUnexpectedResult;
         if (binding.key.eql(.{ .key = .g })) {
             saw_g = true;
-            try std.testing.expectEqualStrings("lazygit", binding.target.command);
+            try std.testing.expectEqualStrings("lazygit", binding.target.command.script);
+            try std.testing.expectEqual(PrefixCommandPlacement.background, binding.target.command.placement);
         }
         if (binding.key.eql(.{ .shift = true, .key = .@"3" })) {
             saw_three = true;
@@ -3189,7 +3279,51 @@ test "prefix target labels cover positional and script targets" {
     try std.testing.expectEqualStrings("Pane 3", prefixTargetLabel(&buf, .{ .pane_select = 2 }));
     try std.testing.expectEqualStrings("Command palette", prefixTargetLabel(&buf, .{ .app = .command_palette }));
     var script = [_]u8{ 'l', 's' };
-    try std.testing.expectEqualStrings("$ ls", prefixTargetLabel(&buf, .{ .command = &script }));
+    try std.testing.expectEqualStrings("$ ls", prefixTargetLabel(&buf, .{ .command = .{ .script = &script, .placement = .background } }));
+    var lazygit = "lazygit".*;
+    try std.testing.expectEqualStrings("$ lazygit · pane", prefixTargetLabel(&buf, .{
+        .command = .{ .script = &lazygit, .placement = .pane },
+    }));
+}
+
+test "prefix command in placement parses aliases and rejects unknowns" {
+    try std.testing.expectEqual(PrefixCommandPlacement.pane, parsePrefixCommandPlacement("new_pane").?);
+    try std.testing.expectEqual(PrefixCommandPlacement.split_horizontal, parsePrefixCommandPlacement("horizontal").?);
+    try std.testing.expectEqual(PrefixCommandPlacement.split_vertical, parsePrefixCommandPlacement("split-vertical").?);
+    try std.testing.expectEqual(PrefixCommandPlacement.floating, parsePrefixCommandPlacement("quick").?);
+    try std.testing.expectEqual(PrefixCommandPlacement.terminal, parsePrefixCommandPlacement("current").?);
+    try std.testing.expect(parsePrefixCommandPlacement("nope") == null);
+
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"keybinds": {"prefix": {"bindings": {
+        \\  "g": { "command": "lazygit", "in": "pane" },
+        \\  "f": { "command": "htop", "open": "floating" },
+        \\  "b": { "command": "true", "in": "not-a-place" }
+        \\}}}}
+    , .{});
+    defer parsed.deinit();
+    config.applyOverrides(parsed.value);
+
+    var saw_g = false;
+    var saw_f = false;
+    var saw_b = false;
+    for (config.prefix.bindings.items) |binding| {
+        if (binding.key.eql(.{ .key = .g })) {
+            saw_g = true;
+            try std.testing.expectEqualStrings("lazygit", binding.target.command.script);
+            try std.testing.expectEqual(PrefixCommandPlacement.pane, binding.target.command.placement);
+        }
+        if (binding.key.eql(.{ .key = .f })) {
+            saw_f = true;
+            try std.testing.expectEqualStrings("htop", binding.target.command.script);
+            try std.testing.expectEqual(PrefixCommandPlacement.floating, binding.target.command.placement);
+        }
+        if (binding.key.eql(.{ .key = .b })) saw_b = true;
+    }
+    try std.testing.expect(saw_g and saw_f);
+    try std.testing.expect(!saw_b);
 }
 
 test "navigate table overrides merge like the prefix table" {

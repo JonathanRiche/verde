@@ -2907,7 +2907,7 @@ fn dispatchPrefixTarget(state: *AppState, keyboard: *keybinds.NativeKeyboardConf
         .workspace_select => |index| _ = state.selectProjectAtIndex(index),
         .pane_select => |index| _ = state.focusCurrentProjectWorkspacePaneAtSidebarIndex(index),
         .active_select => |index| _ = sidebar_ui.focusAttentionClusterRowAtIndex(state, index),
-        .command => |script| state.runPrefixCommand(script),
+        .command => |command| state.runPrefixCommand(command),
     }
 }
 

@@ -3383,6 +3383,42 @@ pub const FloatingQuickPane = workspace_layout.FloatingQuickPane;
 pub const WorkspaceLayout = workspace_layout.WorkspaceLayout;
 const deinitWorkspacePaneRef = workspace_layout.deinitWorkspacePaneRef;
 
+const PrefixCommandArgv = struct {
+    items: [5][]const u8 = undefined,
+    len: usize = 0,
+
+    fn slice(self: *const PrefixCommandArgv) []const []const u8 {
+        return self.items[0..self.len];
+    }
+};
+
+fn prefixCommandLaunchProfile(
+    script: []const u8,
+    project_path: []const u8,
+    argv: *PrefixCommandArgv,
+) ?terminal.TerminalLaunchProfile {
+    const label = utils.executableNameForCommand(script);
+    const resolved_label = if (label.len == 0) "command" else label;
+    if (builtin.os.tag == .windows) {
+        const shell = if (process_env.commandExists("pwsh"))
+            "pwsh"
+        else if (process_env.commandExists("powershell"))
+            "powershell"
+        else
+            return null;
+        argv.items = .{ shell, "-NoLogo", "-NoProfile", "-Command", script };
+        argv.len = 5;
+    } else {
+        argv.items = .{ "sh", "-lc", script, "verde-prefix-command", project_path };
+        argv.len = 5;
+    }
+    return .{
+        .kind = .custom,
+        .label = resolved_label,
+        .command = argv.slice(),
+    };
+}
+
 pub const HerdrPanePresentation = herdr_types.HerdrPanePresentation;
 pub const HerdrPaneProvider = herdr_types.HerdrPaneProvider;
 const ProviderExecutionTarget = herdr_types.ProviderExecutionTarget;
@@ -6163,18 +6199,185 @@ pub const AppState = struct {
         self.focusWorkspaceOpenPane(project_index, result.pane_id);
     }
 
-    /// Runs a user script bound under `keybinds.prefix.bindings`, mirroring
-    /// the custom `open.default` action contract (`sh -lc`, project cwd, `$1`).
-    pub fn runPrefixCommand(self: *AppState, command: []const u8) void {
+    /// Runs a user script bound under `keybinds.prefix.bindings`. Background
+    /// placement keeps the custom `open.default` contract (`sh -lc`, project
+    /// cwd, `$1`). Every other `in` value opens a Verde terminal surface.
+    pub fn runPrefixCommand(self: *AppState, command: keybinds.PrefixCommand) void {
         if (self.project_controller.projects.items.len == 0) {
             self.setSidebarNotice("Open a workspace before running a prefix command.");
             return;
         }
-        utils.runCustomProjectCommand(self.allocator, self.currentProject().path, command) catch |err| {
+        switch (command.placement) {
+            .background => self.runPrefixCommandBackground(command.script),
+            .terminal => self.runPrefixCommandInFocusedTerminal(command.script),
+            .tab => self.runPrefixCommandInNewTab(command.script),
+            .pane, .split_horizontal, .split_vertical, .floating => self.runPrefixCommandInWorkspace(command.script, command.placement),
+        }
+    }
+
+    fn runPrefixCommandBackground(self: *AppState, script: []const u8) void {
+        utils.runCustomProjectCommand(self.allocator, self.currentProject().path, script) catch |err| {
             log.warn("failed to run prefix command: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to run prefix command.");
+        };
+    }
+
+    fn runPrefixCommandInFocusedTerminal(self: *AppState, script: []const u8) void {
+        const pane_id = self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout.focused_pane_id;
+        if (pane_id) |id| {
+            if (self.workspacePaneKindById(id) == .terminal) {
+                if (self.writePrefixCommandToPane(id, script)) {
+                    self.requestTerminalFocus();
+                    return;
+                }
+            }
+        }
+        self.runPrefixCommandInWorkspace(script, .pane);
+    }
+
+    fn runPrefixCommandInNewTab(self: *AppState, script: []const u8) void {
+        const dock_id = self.focusedWorkspaceTerminalDockId() orelse {
+            self.runPrefixCommandInWorkspace(script, .pane);
+            return;
+        };
+        var argv_buf: PrefixCommandArgv = undefined;
+        const profile = prefixCommandLaunchProfile(script, self.currentProject().path, &argv_buf) orelse {
             self.setSidebarNotice("Failed to run prefix command.");
             return;
         };
+        if (!self.createCurrentProjectTerminalTab(dock_id, profile)) {
+            self.runPrefixCommandInWorkspace(script, .pane);
+        }
+    }
+
+    fn runPrefixCommandInWorkspace(self: *AppState, script: []const u8, placement: keybinds.PrefixCommandPlacement) void {
+        const project_index = self.project_controller.selected_index;
+        self.ensureCurrentProjectWorkspace();
+        var argv_buf: PrefixCommandArgv = undefined;
+        const profile = prefixCommandLaunchProfile(script, self.currentProject().path, &argv_buf) orelse {
+            self.setSidebarNotice("Failed to run prefix command.");
+            return;
+        };
+        const opened = switch (placement) {
+            .floating => self.openPrefixCommandFloating(project_index, profile),
+            .split_vertical => self.openPrefixCommandSplit(project_index, profile, .vertical, true),
+            .split_horizontal => self.openPrefixCommandSplit(project_index, profile, .horizontal, true),
+            else => self.openPrefixCommandPane(project_index, profile),
+        };
+        if (!opened) {
+            self.setSidebarNotice("Failed to open a terminal for the prefix command.");
+        }
+    }
+
+    fn writePrefixCommandToPane(self: *AppState, pane_id: WorkspacePaneId, script: []const u8) bool {
+        const input = std.fmt.allocPrint(self.allocator, "{s}\r", .{script}) catch return false;
+        defer self.allocator.free(input);
+        const wrote = self.writeWorkspaceTerminalPane(pane_id, input) catch |err| {
+            log.warn("failed to write prefix command: {s}", .{@errorName(err)});
+            return false;
+        };
+        return wrote;
+    }
+
+    fn openPrefixCommandPane(self: *AppState, project_index: usize, profile: terminal.TerminalLaunchProfile) bool {
+        if (self.project_controller.projects.items[project_index].workspace_layout.visiblePaneCount() == 0) {
+            return self.seedPrefixCommandPane(project_index, profile);
+        }
+        const pane_id = self.project_controller.projects.items[project_index].workspace_layout.focused_pane_id orelse
+            self.project_controller.projects.items[project_index].workspace_layout.firstVisiblePaneId() orelse
+            return self.seedPrefixCommandPane(project_index, profile);
+        return self.splitPrefixCommandPane(project_index, pane_id, profile, .horizontal, true);
+    }
+
+    fn openPrefixCommandSplit(
+        self: *AppState,
+        project_index: usize,
+        profile: terminal.TerminalLaunchProfile,
+        axis: WorkspaceSplitAxis,
+        join_scroll: bool,
+    ) bool {
+        var layout = &self.project_controller.projects.items[project_index].workspace_layout;
+        const target_pane_id = layout.focused_pane_id orelse layout.firstVisiblePaneId() orelse {
+            return self.seedPrefixCommandPane(project_index, profile);
+        };
+        if (!self.splitPrefixCommandPane(project_index, target_pane_id, profile, axis, true)) return false;
+        if (!join_scroll) return true;
+        layout = &self.project_controller.projects.items[project_index].workspace_layout;
+        const new_pane_id = layout.focused_pane_id orelse return true;
+        _ = layout.joinPaneToScrollGroup(target_pane_id, new_pane_id);
+        self.markDirty();
+        return true;
+    }
+
+    fn openPrefixCommandFloating(self: *AppState, project_index: usize, profile: terminal.TerminalLaunchProfile) bool {
+        const layout = &self.project_controller.projects.items[project_index].workspace_layout;
+        if (layout.quick_pane != null) {
+            if (!self.returnCurrentProjectQuickPaneToTile()) return false;
+        }
+        return self.createFloatingQuickTerminalWithProfile(profile);
+    }
+
+    fn seedPrefixCommandPane(self: *AppState, project_index: usize, profile: terminal.TerminalLaunchProfile) bool {
+        const dock_id = self.createProjectTerminalDock(project_index) catch |err| {
+            log.err("failed to allocate prefix command dock: {s}", .{@errorName(err)});
+            return false;
+        };
+        self.restartTerminalDockForWorkspaceProfile(project_index, dock_id, self.project_controller.projects.items[project_index].path, profile) catch |err| {
+            log.err("failed to start prefix command dock: {s}", .{@errorName(err)});
+            return false;
+        };
+        var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return false;
+        const project = &self.project_controller.projects.items[project_index];
+        const pane_id = project.workspace_layout.createTerminalPane(self.allocator, dock_id) catch |err| {
+            log.err("failed to create prefix command pane: {s}", .{@errorName(err)});
+            return false;
+        };
+        project.workspace_layout.replaceRootWithLeaf(self.allocator, pane_id) catch |err| {
+            log.err("failed to seed prefix command pane: {s}", .{@errorName(err)});
+            return false;
+        };
+        project.workspace_layout.focusCreatedPane(pane_id);
+        dock.visible = false;
+        self.requestTerminalDockFocus(dock_id);
+        self.markDirty();
+        return true;
+    }
+
+    fn splitPrefixCommandPane(
+        self: *AppState,
+        project_index: usize,
+        pane_id: WorkspacePaneId,
+        profile: terminal.TerminalLaunchProfile,
+        axis: WorkspaceSplitAxis,
+        new_after: bool,
+    ) bool {
+        var project = &self.project_controller.projects.items[project_index];
+        var layout = &project.workspace_layout;
+        _ = layout.paneById(pane_id) orelse return false;
+        const dock_id = self.createProjectTerminalDock(project_index) catch |err| {
+            log.err("failed to allocate prefix command dock: {s}", .{@errorName(err)});
+            return false;
+        };
+        self.restartTerminalDockForWorkspaceProfile(project_index, dock_id, self.project_controller.projects.items[project_index].path, profile) catch |err| {
+            log.err("failed to start prefix command dock: {s}", .{@errorName(err)});
+            return false;
+        };
+        var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return false;
+        project = &self.project_controller.projects.items[project_index];
+        layout = &project.workspace_layout;
+        const new_pane_id = layout.createTerminalPane(self.allocator, dock_id) catch |err| {
+            log.err("failed to create prefix command pane: {s}", .{@errorName(err)});
+            return false;
+        };
+        layout.splitPaneWithLeaf(self.allocator, pane_id, new_pane_id, axis, new_after) catch |err| {
+            log.err("failed to split prefix command pane: {s}", .{@errorName(err)});
+            return false;
+        };
+        layout.focusCreatedPane(new_pane_id);
+        dock.visible = false;
+        if (self.project_controller.selected_index == project_index) self.requestTerminalDockFocus(dock_id);
+        self.markDirty();
+        return true;
     }
 
     fn runCustomOpenAction(self: *AppState, custom: app_config.CustomOpenAction) void {
@@ -7685,6 +7888,7 @@ pub const AppState = struct {
     pub const floatFocusedWorkspacePane = workspace_controller.floatFocusedWorkspacePane;
     pub const toggleCurrentProjectQuickPane = workspace_controller.toggleCurrentProjectQuickPane;
     pub const createFloatingQuickTerminal = workspace_controller.createFloatingQuickTerminal;
+    pub const createFloatingQuickTerminalWithProfile = workspace_controller.createFloatingQuickTerminalWithProfile;
     pub const restoreFocusBehindQuickPane = workspace_controller.restoreFocusBehindQuickPane;
     pub const minimizeCurrentProjectQuickPane = workspace_controller.minimizeCurrentProjectQuickPane;
     pub const toggleCurrentProjectQuickPaneMaximized = workspace_controller.toggleCurrentProjectQuickPaneMaximized;
