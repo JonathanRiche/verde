@@ -41,9 +41,11 @@ const POSIX_AGENT_ACTIVITY_STATE =
     \\  provider="$1"
     \\  activity="$2"
     \\  initial_status="$3"
-    \\  case "$VERDE_SESSION_ID" in ""|*[!A-Za-z0-9._-]*) return 1 ;; esac
+    \\  [ -n "$VERDE_SESSION_ID" ] || return 1
+    \\  session_key="$(printf '%s' "$VERDE_SESSION_ID" | cksum 2>/dev/null | awk '{print $1 "-" $2}')"
+    \\  [ -n "$session_key" ] || return 1
     \\  state_root="${TMPDIR:-/tmp}/verde-agent-status"
-    \\  state_dir="$state_root/$provider-$VERDE_SESSION_ID"
+    \\  state_dir="$state_root/$provider-$session_key"
     \\  lock_dir="$state_dir.lock"
     \\  mkdir -p "$state_root" 2>/dev/null || return 1
     \\  attempts=0
@@ -147,9 +149,12 @@ const POSIX_AGENT_ACTIVITY_STATE =
 const POWERSHELL_AGENT_ACTIVITY_STATE =
     \\function Update-AgentStatus {
     \\  param([string]$Provider, [string]$Activity, [string]$InitialStatus, [string]$PayloadText)
-    \\  if ($env:VERDE_SESSION_ID -notmatch '^[A-Za-z0-9._-]+$') { return '' }
+    \\  if ([string]::IsNullOrWhiteSpace($env:VERDE_SESSION_ID)) { return '' }
+    \\  $sessionBytes = [Text.Encoding]::UTF8.GetBytes($env:VERDE_SESSION_ID)
+    \\  $sessionSha = [Security.Cryptography.SHA256]::Create()
+    \\  try { $sessionFingerprint = [BitConverter]::ToString($sessionSha.ComputeHash($sessionBytes)).Replace('-', '') } finally { $sessionSha.Dispose() }
     \\  $stateRoot = Join-Path ([IO.Path]::GetTempPath()) 'verde-agent-status'
-    \\  $stateDir = Join-Path $stateRoot ($Provider + '-' + $env:VERDE_SESSION_ID)
+    \\  $stateDir = Join-Path $stateRoot ($Provider + '-' + $sessionFingerprint)
     \\  $lockDir = $stateDir + '.lock'
     \\  New-Item -ItemType Directory -Path $stateRoot -Force -ErrorAction SilentlyContinue | Out-Null
     \\  $locked = $false
@@ -2227,6 +2232,16 @@ test "PowerShell hooks use inherited transport-neutral endpoint and safe invocat
     try std.testing.expect(std.mem.indexOf(u8, grok_script, "VERDE_GROK_TITLE_SESSION_ID") != null);
     try std.testing.expect(std.mem.indexOf(u8, grok_script, "Start-Process") != null);
     try std.testing.expect(std.mem.indexOf(u8, grok_script, "'grok'") != null);
+}
+
+test "agent activity state accepts opaque Verde session ids" {
+    try std.testing.expect(std.mem.indexOf(u8, POSIX_AGENT_ACTIVITY_STATE, "cksum") != null);
+    try std.testing.expect(std.mem.indexOf(u8, POSIX_AGENT_ACTIVITY_STATE, "$provider-$session_key") != null);
+    try std.testing.expect(std.mem.indexOf(u8, POSIX_AGENT_ACTIVITY_STATE, "*[!A-Za-z0-9._-]*") == null);
+
+    try std.testing.expect(std.mem.indexOf(u8, POWERSHELL_AGENT_ACTIVITY_STATE, "SHA256") != null);
+    try std.testing.expect(std.mem.indexOf(u8, POWERSHELL_AGENT_ACTIVITY_STATE, "$Provider + '-' + $sessionFingerprint") != null);
+    try std.testing.expect(std.mem.indexOf(u8, POWERSHELL_AGENT_ACTIVITY_STATE, "^[A-Za-z0-9._-]+$") == null);
 }
 
 test "Grok hook file registers native lifecycle events" {
