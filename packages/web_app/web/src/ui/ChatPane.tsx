@@ -20,6 +20,12 @@ window.setInterval(() => setNowMs(Date.now()), 1000)
 // on every streamed event), mirroring the desktop's per-card state keys.
 const cardExpanded = new Map<string, boolean>()
 
+// Focus requests are events, not durable state. Remember the last one handled
+// across composer remounts so an old request can never refocus a replacement
+// textarea. Compact/mobile layouts intentionally never focus programmatically:
+// the user alone controls whether the on-screen keyboard is open.
+let handledComposerFocusNonce = 0
+
 // Desktop shows up to this many output lines before "Show more".
 const TOOL_OUTPUT_COLLAPSED_LINES = 18
 
@@ -837,11 +843,20 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
   let field: HTMLTextAreaElement | undefined
   let filePicker: HTMLInputElement | undefined
 
-  const attachments = () => store.attachmentsFor(props.pane)
-  const uploading = () => store.uploadingAttachmentsFor(props.pane)
+  // Pane projections are refreshed in the background, but a mounted
+  // composer's cache key never changes. Capturing it keeps those refreshes
+  // from redundantly assigning the controlled textarea value, which can
+  // disturb Android selection/IME state even when the string is unchanged.
+  const composer_pane = props.pane
+
+  const attachments = () => store.attachmentsFor(composer_pane)
+  const uploading = () => store.uploadingAttachmentsFor(composer_pane)
 
   createEffect(() => {
-    if (props.focused && store.composerNonce() > 0) field?.focus()
+    const nonce = store.composerNonce()
+    if (!props.focused || nonce <= handledComposerFocusNonce) return
+    handledComposerFocusNonce = nonce
+    if (!store.compact()) field?.focus()
   })
 
   const onKeyDown = (event: KeyboardEvent) => {
@@ -884,7 +899,7 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
                   <button
                     type="button"
                     class="absolute right-1 top-1 grid h-6 w-6 place-items-center rounded-full bg-black/75 text-white hover:bg-black"
-                    onClick={() => store.removeAttachment(props.pane, attachment)}
+                    onClick={() => store.removeAttachment(composer_pane, attachment)}
                     aria-label={`Remove ${attachmentLabel(attachment)}`}
                     title="Remove attachment"
                   >
@@ -902,8 +917,8 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
           ref={(node) => { field = node }}
           class="min-h-[52px] w-full bg-transparent text-[16px] leading-[21px] outline-none placeholder:text-[var(--text-subtle)] lg:min-h-[88px] lg:text-[18px] lg:leading-[22px]"
           placeholder="Ask anything…"
-          value={store.draftFor(props.pane)}
-          onInput={(event) => store.setDraftFor(props.pane, event.currentTarget.value)}
+          value={store.draftFor(composer_pane)}
+          onInput={(event) => store.setDraftFor(composer_pane, event.currentTarget.value)}
           onKeyDown={onKeyDown}
           onPaste={(event) => {
             const files = clipboardImageFiles(event.clipboardData)
@@ -912,7 +927,7 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
             // suppress the browser's fallback filename/text insertion.
             event.preventDefault()
             if (uploading() || store.sending()) return
-            void store.attachFiles(props.pane, files)
+            void store.attachFiles(composer_pane, files)
           }}
           onFocus={() => store.focusPane(props.pane)}
         />
@@ -926,7 +941,7 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
             onChange={(event) => {
               const files = Array.from(event.currentTarget.files ?? [])
               event.currentTarget.value = ''
-              void store.attachFiles(props.pane, files)
+              void store.attachFiles(composer_pane, files)
             }}
           />
           <button
@@ -971,7 +986,7 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
               disabled={
                 store.sending() ||
                 uploading() ||
-                (store.draftFor(props.pane).trim().length === 0 && attachments().length === 0)
+                (store.draftFor(composer_pane).trim().length === 0 && attachments().length === 0)
               }
               aria-label="Send"
             >

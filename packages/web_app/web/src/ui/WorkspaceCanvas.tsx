@@ -26,6 +26,19 @@ export function WorkspaceCanvas() {
     return store.paneGroups()
   }
 
+  // Solid's <For> keys objects by reference. Projection refreshes rebuild
+  // group objects even when their pane/layout identity is unchanged, so
+  // iterating those objects directly remounted the whole chat pane. On
+  // mobile that destroys the textarea (closing the keyboard), then the
+  // composer focus effect opens it again; transcript DOM replacement also
+  // clears an in-progress text selection. Keep columns keyed by durable pane
+  // and structural layout identity instead. Split ratios are intentionally
+  // excluded because the live bridge can report harmless float differences;
+  // PaneGroupNode reconciles ratio updates without replacing its children. A
+  // real topology change still gets a fresh subtree so it can safely choose
+  // its structural branch once.
+  const group_render_keys = createMemo(() => groups().map(groupRenderKey))
+
   const pane_order = createMemo(() => groups().flatMap((group) => group.panes.map((pane) => pane.pane_id)).join(','))
 
   createEffect(() => {
@@ -96,23 +109,40 @@ export function WorkspaceCanvas() {
         scroller = node
       }}
     >
-      <For each={groups()} fallback={<EmptyWorkspace />}>
-        {(group) => (
-          <div
-            class="niri-column"
-            data-scroll-group={group.key}
-            data-representative-pane-id={String(group.panes[0]?.pane_id ?? '')}
-          >
-            <PaneGroupNode
-              node={group.layout}
-              panes={group.panes}
-              bordered={groups().length > 1 || group.panes.length > 1}
-            />
-          </div>
-        )}
+      <For each={group_render_keys()} fallback={<EmptyWorkspace />}>
+        {(render_key) => {
+          const group = createMemo(() => groups().find((item) => groupRenderKey(item) === render_key))
+          return (
+            <Show when={group()}>
+              {(current) => (
+                <div
+                  class="niri-column"
+                  data-scroll-group={current().key}
+                  data-representative-pane-id={String(current().panes[0]?.pane_id ?? '')}
+                >
+                  <PaneGroupNode
+                    node={current().layout}
+                    panes={current().panes}
+                    bordered={groups().length > 1 || current().panes.length > 1}
+                  />
+                </div>
+              )}
+            </Show>
+          )
+        }}
       </For>
     </div>
   )
+}
+
+function layoutRenderKey(node: LayoutNode): string {
+  if ('leaf' in node) return `leaf:${node.leaf}`
+  const split = node.split
+  return `split:${split.axis}:${layoutRenderKey(split.first)}:${layoutRenderKey(split.second)}`
+}
+
+function groupRenderKey(group: WorkspacePaneGroup): string {
+  return `${group.key}\u0000${layoutRenderKey(group.layout)}`
 }
 
 function nearestPaneId(root: HTMLDivElement): number | null {
@@ -136,40 +166,46 @@ function firstLayoutLeaf(node: LayoutNode): number {
 function PaneGroupNode(props: { node: LayoutNode; panes: LivePane[]; bordered: boolean }) {
   if ('leaf' in props.node) {
     const leaf_id = props.node.leaf
-    const pane = props.panes.find((item) => item.pane_id === leaf_id)
+    const pane = createMemo(() => props.panes.find((item) => item.pane_id === leaf_id))
     return (
-      <Show when={pane} keyed>
+      <Show when={pane()}>
         {(item) => (
           <div
             class={`min-h-0 min-w-0 flex-1 overflow-hidden ${props.bordered ? 'pane-tile' : ''}`}
-            data-pane-id={String(item.pane_id)}
+            data-pane-id={String(item().pane_id)}
           >
-            <PaneFrame pane={item} />
+            <PaneFrame pane={item()} />
           </div>
         )}
       </Show>
     )
   }
-  const split = props.node.split
-  const [ratio, setRatio] = createSignal(Math.min(0.78, Math.max(0.22, split.ratio)))
+  const split = () => {
+    const node = props.node
+    if ('leaf' in node) throw new Error('pane layout topology changed without a remount')
+    return node.split
+  }
+  const clampRatio = (ratio: number) => Math.min(0.78, Math.max(0.22, ratio))
+  const [ratio, setRatio] = createSignal(clampRatio(split().ratio))
+  createEffect(() => setRatio(clampRatio(split().ratio)))
   return (
-    <div class={`pane-split flex min-h-0 min-w-0 flex-1 ${split.axis === 'vertical' ? 'flex-row' : 'flex-col'}`}>
+    <div class={`pane-split flex min-h-0 min-w-0 flex-1 ${split().axis === 'vertical' ? 'flex-row' : 'flex-col'}`}>
       <div class="flex min-h-0 min-w-0 overflow-hidden" style={{ flex: `${ratio()} 1 0%` }}>
-        <PaneGroupNode node={split.first} panes={props.panes} bordered={props.bordered} />
+        <PaneGroupNode node={split().first} panes={props.panes} bordered={props.bordered} />
       </div>
       <SplitGutter
-        axis={split.axis}
+        axis={split().axis}
         ratio={ratio()}
         onRatio={setRatio}
         onCommit={(next_ratio) => void store.resizePaneSplit(
-          firstLayoutLeaf(split.first),
-          firstLayoutLeaf(split.second),
-          split.axis,
+          firstLayoutLeaf(split().first),
+          firstLayoutLeaf(split().second),
+          split().axis,
           next_ratio,
         )}
       />
       <div class="flex min-h-0 min-w-0 overflow-hidden" style={{ flex: `${1 - ratio()} 1 0%` }}>
-        <PaneGroupNode node={split.second} panes={props.panes} bordered={props.bordered} />
+        <PaneGroupNode node={split().second} panes={props.panes} bordered={props.bordered} />
       </div>
     </div>
   )

@@ -3177,7 +3177,9 @@ function createAppStore() {
 
   const dispatchPrefixTarget = (target: PrefixTarget) => {
     if ('command' in target) {
-      setNotice('Custom prefix shell commands run from the desktop app only.')
+      setNotice(target.in
+        ? 'Custom prefix pane commands run from the desktop app only.'
+        : 'Custom prefix shell commands run from the desktop app only.')
       return
     }
     const action = target.action

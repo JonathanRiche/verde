@@ -86,8 +86,8 @@ between workspaces (see the sidebar table above).
 
 Workspace splits have no direct default keybinds. With prefix mode enabled,
 `Ctrl+B`, then `t` creates a new chat and `Ctrl+B`, then `Shift+T` creates a
-separate top-level terminal pane. The `v`, `-`, `Shift+V`, and `Shift+-` prefix
-chords create tiled splits using the configured default/alternate pane types.
+separate top-level terminal pane. The `v` and `-` prefix chords create tiled
+chat splits; `Shift+V` and `Shift+-` create tiled terminal splits.
 
 You can also use the pane header buttons: `C|` / `C-` for chat vertical /
 horizontal and `T|` / `T-` for terminal vertical / horizontal, or bind any
@@ -150,7 +150,7 @@ the object form for full control:
       "defaults": true,
       "bindings": {
         "c": "new_thread",
-        "g": { "command": "lazygit" },
+        "g": { "command": "lazygit", "in": "pane" },
         "Shift+3": { "action": "workspace.select.3" },
         "z": null
       }
@@ -163,9 +163,22 @@ the object form for full control:
 - `defaults` — set to `false` to drop the built-in table and start empty.
 - `bindings` — keyed by the second key's accelerator (`"x"`, `"Shift+X"`,
   `"Ctrl+Left"`, `"Comma"`). A string value is an action name; `null`
-  removes a default; `{ "command": "..." }` runs a shell script through
-  `sh -lc` with the current project as the working directory and the project
-  path as `$1` (the same contract as custom `open.default` actions).
+  removes a default; `{ "command": "..." }` runs a shell script. Add `in`
+  (or `open`) to choose where it runs:
+
+  | `in` | What happens |
+  | ---- | ------------ |
+  | omitted / `background` | Detached `sh -lc` in the project directory, with the project path as `$1` (same as custom `open.default` actions). TUIs like lazygit will not show a pane. |
+  | `terminal` | Types the command into the focused terminal. Falls back to `pane` if a terminal is not focused. |
+  | `pane` | Opens a new terminal pane whose process is the command. |
+  | `horizontal` / `split_horizontal` | Horizontal tiled split of the focused pane, then runs the command there. |
+  | `vertical` / `split_vertical` | Vertical tiled split, then runs the command there. |
+  | `floating` | Opens a floating quick terminal running the command. |
+  | `tab` | New tab in the focused terminal dock. Falls back to `pane` if a terminal is not focused. |
+
+  Aliases: `new_pane` / `new` → `pane`; `split` / `horizontal` → `split_horizontal`;
+  `float` / `quick` → `floating`; `current` / `focused` → `terminal`;
+  `detached` → `background`.
 
 Configured direct shortcuts work alongside prefix mode. Modifier state is exact:
 `Ctrl+B` then `x` is different from `Ctrl+B` then `Ctrl+X`, so release `Ctrl`
@@ -208,8 +221,8 @@ The table is overridable exactly like `bindings`, under `"navigate"`:
 | `z`                              | `workspace.toggle_maximize`                       |
 | `i`                              | `workspace.focus_prompt`                          |
 | `c` / `Shift+C`                  | `workspace.split_chat_vertical` / `_horizontal`   |
-| `v` / `-`                        | Configured default pane, vertical / horizontal       |
-| `Shift+V` / `Shift+-`            | Other pane type, vertical / horizontal                |
+| `v` / `-`                        | Chat split, vertical / horizontal                  |
+| `Shift+V` / `Shift+-`            | Terminal split, vertical / horizontal              |
 | `h` `j` `k` `l`, arrows          | `workspace.focus_*`                               |
 | `Shift+H/J/K/L`                  | `workspace.move_*`                                |
 | `Ctrl+H/J/K/L`, `Ctrl+arrows`    | `workspace.grow_*`                                |
@@ -227,9 +240,6 @@ The table is overridable exactly like `bindings`, under `"navigate"`:
 | `Ctrl+PageUp` / `Ctrl+PageDown`  | `terminal.tab_previous` / `tab_next`              |
 | `Alt+arrows`                     | `terminal.split_*`                                |
 | `Alt+Shift+arrows`               | `terminal.focus_*`                                |
-
-The default pane type is GUI chat. Change **Settings → Workspace → Prefix split pane**
-or set `ui.workspace_split_default_pane` to `"terminal"` to invert the pair.
 
 Terminal and chat actions only apply while a pane of that kind is focused,
 exactly like their direct shortcuts.

@@ -4621,6 +4621,12 @@ const UnixSession = struct {
         }
         if (identity.sessionizer_socket) |value| _ = setenv("VERDE_SESSIONIZER_SOCKET", value.ptr, 1);
         _ = setenv("VERDE_CLI", identity.cli_path.ptr, 1);
+        if (identity.sessionizer_socket) |socket_path| if (identity.session_id) |session_id| {
+            if (std.c.getenv("HERDR_SOCKET_PATH") == null and std.c.getenv("HERDR_PANE_ID") == null) {
+                _ = setenv("HERDR_SOCKET_PATH", socket_path.ptr, 0);
+                _ = setenv("HERDR_PANE_ID", session_id.ptr, 0);
+            }
+        };
         if (std.c.getenv("LANG") == null) {
             const lang = childLocaleEnvValue();
             _ = setenv("LANG", lang.ptr, 1);

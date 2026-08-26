@@ -27,10 +27,8 @@ or `Shift+-` when you want a tiled split inside the focused scrolling item.
 
 With prefix mode enabled, `Ctrl+B`, then `v` creates a vertical GUI chat split
 inside the focused pane; `Ctrl+B`, then `-` creates a horizontal GUI chat split.
-`Shift+V` and `Shift+-` create the matching terminal splits. Choose **Terminal**
-under **Settings → Workspace → Prefix split pane** to invert those defaults so
-the unshifted keys create terminals and Shift creates GUI chats. The same keys
-work after `Ctrl+B W`. In a scrolling workspace the panes stay tiled together
+`Shift+V` and `Shift+-` create the matching terminal splits. The same keys work
+after `Ctrl+B W`. In a scrolling workspace the panes stay tiled together
 as one scrolling item, and the sidebar shows the same split as a clickable
 miniature instead of flattening it into unrelated pane rows.
 

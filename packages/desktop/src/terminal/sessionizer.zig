@@ -104,6 +104,13 @@ pub const SESSION_DAEMON_JOURNAL_ENTRY_CAP_ENV_NAME = "VERDE_SESSION_DAEMON_JOUR
 const TEST_SLOW_IO_ENV_NAME = "VERDE_SESSIONIZER_TEST_SLOW_IO_MS";
 /// Test-only orphan retention override; registry-internal TTLs remain fixed.
 const TEST_RETENTION_ENV_NAME = "VERDE_SESSIONIZER_TEST_RETENTION_MS";
+const FX_LIFECYCLE_SOURCE = "custom:fx";
+const FX_LIFECYCLE_AGENT = "fx";
+const FX_REPORT_AGENT_METHOD = "pane.report_agent";
+const FX_REPORT_SESSION_METHOD = "pane.report_agent_session";
+const FX_PANE_RENAME_METHOD = "pane.rename";
+const FX_AGENT_RENAME_METHOD = "agent.rename";
+const FX_CLEAR_AUTHORITY_METHOD = "pane.clear_agent_authority";
 
 /// Futex-parking mutex with Io-free lock()/unlock() signatures. Zig 0.16 has
 /// no std.Thread.Mutex; the previous `while (!tryLock()) spinLoopHint()` spin
@@ -1414,6 +1421,7 @@ const PosixPtyBackend = if (builtin.os.tag == .windows) struct {} else struct {
         _ = setenv("VERDE_LIVE_SOCKET", identity.live_endpoint.ptr, 1);
         _ = setenv("VERDE_SESSIONIZER_SOCKET", identity.sessionizer_endpoint.ptr, 1);
         _ = setenv("VERDE_CLI", identity.cli_path.ptr, 1);
+        exposeFxLifecycleSocket(identity.sessionizer_endpoint, identity.session_id);
         if (std.c.getenv("LANG") == null) {
             const lang = childLocaleEnvValue();
             _ = setenv("LANG", lang.ptr, 1);
@@ -1467,6 +1475,10 @@ const PtySession = struct {
     /// Optional registered daemon client that owns this session for retention
     /// and client-scoped stop. The desktop omits this field.
     owner_client_id: ?[]u8 = null,
+    /// FX exposes authoritative TUI lifecycle over its local socket adapter.
+    fx_turn_active: bool = false,
+    fx_lifecycle_sequence: u64 = 0,
+    fx_provider_thread_id: ?[]u8 = null,
     created_at_ms: i64,
     last_attached_at_ms: ?i64 = null,
     attach_clients: std.ArrayList(AttachClient) = .empty,
@@ -1531,6 +1543,7 @@ const PtySession = struct {
         allocator.free(self.command_label);
         if (self.registry_workspace_id) |workspace_id| allocator.free(workspace_id);
         if (self.owner_client_id) |client_id| allocator.free(client_id);
+        if (self.fx_provider_thread_id) |thread_id| allocator.free(thread_id);
         for (self.attach_clients.items) |client| {
             allocator.free(client.attach_id);
             allocator.free(client.label);
@@ -2381,6 +2394,7 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, "chat.turn.cancel")) return try self.chatTurnCancelResponse(id_value, params);
         if (std.mem.eql(u8, method, "chat.turn.consume")) return try self.chatTurnConsumeResponse(id_value, params);
         if (std.mem.eql(u8, method, "provider.models.list")) return try self.providerModelsListResponse(id_value, params);
+        if (isFxLifecycleMethod(method)) return try self.fxLifecycleResponse(id_value, method, params);
         if (std.mem.eql(u8, method, store_protocol.METHOD_CONFIG_FAVORITE_MODEL_SET)) return try self.configFavoriteModelSetResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_WORKSPACE_RESOLVE)) return try self.workspaceResolveResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_PROCESS_LIST)) return try self.processListResponse(id_value, params);
@@ -2405,6 +2419,137 @@ pub const Daemon = struct {
 
     fn methodMutatesState(method: []const u8) bool {
         return headless.isMutatingMethod(method);
+    }
+
+    fn fxLifecycleResponse(self: *Daemon, id_value: std.json.Value, method: []const u8, params: std.json.Value) ![]u8 {
+        if (params != .object) {
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "FX lifecycle params must be an object");
+        }
+        if (std.mem.eql(u8, method, FX_PANE_RENAME_METHOD) or
+            std.mem.eql(u8, method, FX_AGENT_RENAME_METHOD))
+        {
+            // Verde owns pane titles. Accept FX's presentation calls without
+            // allowing them to rename the terminal pane.
+            return try okValueResponse(self.allocator, id_value, .{ .accepted = true });
+        }
+
+        const source = jsonString(params.object.get("source") orelse .null) orelse
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing FX lifecycle source");
+        if (!std.mem.eql(u8, source, FX_LIFECYCLE_SOURCE)) {
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "unsupported lifecycle reporter");
+        }
+        const session_id = jsonString(params.object.get("pane_id") orelse .null) orelse
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing FX lifecycle pane_id");
+
+        const releasing = std.mem.eql(u8, method, FX_CLEAR_AUTHORITY_METHOD);
+        if (!releasing) {
+            const agent = jsonString(params.object.get("agent") orelse .null) orelse
+                return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing FX lifecycle agent");
+            if (!std.mem.eql(u8, agent, FX_LIFECYCLE_AGENT)) {
+                return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "unsupported lifecycle reporter");
+            }
+        }
+
+        if (std.mem.eql(u8, method, FX_REPORT_SESSION_METHOD)) {
+            const provider_thread_id = jsonString(params.object.get("agent_session_id") orelse .null) orelse
+                return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing FX session id");
+            lockDaemon(self);
+            defer self.mutex.unlock();
+            const session = self.find(session_id) orelse
+                return try errorResponseAlloc(self.allocator, id_value, "resource_not_found", "session not found");
+            const owned = try self.allocator.dupe(u8, provider_thread_id);
+            if (session.fx_provider_thread_id) |old| self.allocator.free(old);
+            session.fx_provider_thread_id = owned;
+            return try okValueResponse(self.allocator, id_value, .{ .accepted = true });
+        }
+
+        const state = if (releasing)
+            null
+        else state: {
+            const raw_state = jsonString(params.object.get("state") orelse .null) orelse
+                return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing FX lifecycle state");
+            break :state std.meta.stringToEnum(FxLifecycleState, raw_state) orelse
+                return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "invalid FX lifecycle state");
+        };
+
+        var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var daemon_locked = true;
+        lockDaemon(self);
+        defer if (daemon_locked) self.mutex.unlock();
+
+        if (!self.accepting_mutations) {
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "daemon is preparing shutdown");
+        }
+        const session = self.find(session_id) orelse
+            return try errorResponseAlloc(self.allocator, id_value, "resource_not_found", "session not found");
+        const transition = if (state) |reported|
+            fxLifecycleTransition(&session.fx_turn_active, reported)
+        else
+            fxLifecycleRelease(&session.fx_turn_active);
+        session.fx_lifecycle_sequence +%= 1;
+        const sequence = session.fx_lifecycle_sequence;
+        const created_at_ms = session.created_at_ms;
+        const child_pid = session.child_pid;
+        const workspace_id = try arena.dupe(u8, session.project_id);
+        const workspace_path = try arena.dupe(u8, session.project_path);
+        const title = try arena.dupe(u8, session.label);
+        const provider_thread_id = if (session.fx_provider_thread_id) |value| try arena.dupe(u8, value) else null;
+        const dock_id = session.dock_id;
+        const pane_id = session.pane_id;
+        const service = self.store_service orelse
+            return try errorResponseAlloc(self.allocator, id_value, "capability_unavailable", "store capability is unavailable");
+        if (service.draining) {
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "daemon store is draining");
+        }
+        _ = service.in_flight.fetchAdd(1, .monotonic);
+        self.mutex.unlock();
+        daemon_locked = false;
+        defer _ = service.in_flight.fetchSub(1, .monotonic);
+
+        const request_key = try std.fmt.allocPrint(arena, "fx-lifecycle:{s}:{d}:{d}:{d}", .{
+            session_id,
+            created_at_ms,
+            child_pid,
+            sequence,
+        });
+        const changed_at_ms = nowMs();
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        const write_result = switch (transition) {
+            .clear => service.store.clearSurface(.{
+                .mutation = .{ .request_key = request_key, .client_id = "daemon" },
+                .session_id = session_id,
+                .workspace_id = workspace_id,
+            }),
+            .working, .waiting, .done => service.store.upsertSurface(.{
+                .mutation = .{ .request_key = request_key, .client_id = "daemon" },
+                .surface = .{
+                    .session_id = session_id,
+                    .workspace_id = workspace_id,
+                    .workspace_path = workspace_path,
+                    .dock_id = dock_id,
+                    .pane_id = pane_id,
+                    .provider = FX_LIFECYCLE_AGENT,
+                    .provider_thread_id = provider_thread_id,
+                    .title = title,
+                    .status = @tagName(transition),
+                    .status_changed_at_ms = changed_at_ms,
+                    .completed_at_ms = if (transition == .done) changed_at_ms else 0,
+                    .last_event_title = switch (transition) {
+                        .working => "FX working",
+                        .waiting => "FX needs attention",
+                        .done => "FX finished",
+                        .clear => unreachable,
+                    },
+                },
+            }),
+        } catch |err| return try storeErrorResponse(self.allocator, id_value, err);
+        return try okValueResponse(self.allocator, id_value, .{
+            .accepted = true,
+            .store_revision = write_result.store_revision,
+        });
     }
 
     /// Store request pipeline. Caller must NOT hold lockDaemon: this path takes
@@ -8082,8 +8227,19 @@ fn methodRunsUnlocked(method: []const u8) bool {
         // Read-only provider discovery can block for seconds on provider
         // CLIs/servers; it touches no daemon state, so never hold lockDaemon.
         std.mem.eql(u8, method, "provider.models.list") or
+        // FX lifecycle persistence uses the store spine and owns its short
+        // lockDaemon window, like the other unlocked mutation paths.
+        isFxLifecycleMethod(method) or
         // Shared config writes have their own leaf lock and filesystem I/O.
         std.mem.eql(u8, method, store_protocol.METHOD_CONFIG_FAVORITE_MODEL_SET);
+}
+
+fn isFxLifecycleMethod(method: []const u8) bool {
+    return std.mem.eql(u8, method, FX_REPORT_AGENT_METHOD) or
+        std.mem.eql(u8, method, FX_REPORT_SESSION_METHOD) or
+        std.mem.eql(u8, method, FX_PANE_RENAME_METHOD) or
+        std.mem.eql(u8, method, FX_AGENT_RENAME_METHOD) or
+        std.mem.eql(u8, method, FX_CLEAR_AUTHORITY_METHOD);
 }
 
 fn classifyServerRequest(allocator: std.mem.Allocator, request: []const u8) !ServerRequestClass {
@@ -8689,6 +8845,76 @@ fn chatTailHasNews(turn: *const ChatTurn, after_seq: u64) bool {
 
 fn sleepMs(milliseconds: i64) void {
     platform_runtime.sleepMillis(@intCast(@max(milliseconds, 0)));
+}
+
+const FxLifecycleState = enum {
+    idle,
+    working,
+    blocked,
+};
+
+const FxLifecycleTransition = enum {
+    clear,
+    working,
+    waiting,
+    done,
+};
+
+fn fxLifecycleTransition(turn_active: *bool, state: FxLifecycleState) FxLifecycleTransition {
+    return switch (state) {
+        .working => active: {
+            turn_active.* = true;
+            break :active .working;
+        },
+        .blocked => active: {
+            turn_active.* = true;
+            break :active .waiting;
+        },
+        .idle => if (turn_active.*) finished: {
+            turn_active.* = false;
+            break :finished .done;
+        } else .clear,
+    };
+}
+
+fn fxLifecycleRelease(turn_active: *bool) FxLifecycleTransition {
+    turn_active.* = false;
+    return .clear;
+}
+
+fn exposeFxLifecycleSocket(socket_path: [:0]const u8, session_id: [:0]const u8) void {
+    // Preserve a real Herdr binding when Verde itself was launched inside one.
+    if (std.c.getenv("HERDR_SOCKET_PATH") != null or std.c.getenv("HERDR_PANE_ID") != null) return;
+    _ = setenv("HERDR_SOCKET_PATH", socket_path.ptr, 0);
+    _ = setenv("HERDR_PANE_ID", session_id.ptr, 0);
+}
+
+test "FX lifecycle transitions clear startup state and finish active turns" {
+    var active = false;
+    try std.testing.expectEqual(FxLifecycleTransition.clear, fxLifecycleTransition(&active, .idle));
+    try std.testing.expect(!active);
+    try std.testing.expectEqual(FxLifecycleTransition.working, fxLifecycleTransition(&active, .working));
+    try std.testing.expect(active);
+    try std.testing.expectEqual(FxLifecycleTransition.waiting, fxLifecycleTransition(&active, .blocked));
+    try std.testing.expect(active);
+    try std.testing.expectEqual(FxLifecycleTransition.done, fxLifecycleTransition(&active, .idle));
+    try std.testing.expect(!active);
+    active = true;
+    try std.testing.expectEqual(FxLifecycleTransition.clear, fxLifecycleRelease(&active));
+    try std.testing.expect(!active);
+}
+
+test "FX lifecycle socket methods run outside the daemon lock" {
+    inline for (.{
+        FX_REPORT_AGENT_METHOD,
+        FX_REPORT_SESSION_METHOD,
+        FX_PANE_RENAME_METHOD,
+        FX_AGENT_RENAME_METHOD,
+        FX_CLEAR_AUTHORITY_METHOD,
+    }) |method| {
+        try std.testing.expect(isFxLifecycleMethod(method));
+        try std.testing.expect(methodRunsUnlocked(method));
+    }
 }
 
 fn isManagedSessionId(session_id: []const u8) bool {

@@ -9,6 +9,18 @@ describe('parseWebKeybindConfig', () => {
     expect(config.directFocusLetters).toEqual({})
   })
 
+  test('uses standalone t actions and fixed chat and terminal split chords', () => {
+    const config = parseWebKeybindConfig({ keybinds: { prefix: true } })
+    const target = (label) => config.prefix.bindings.find((row) => row.key.label === label)?.target
+
+    expect(target('T')).toEqual({ action: 'new_thread' })
+    expect(target('Shift+T')).toEqual({ action: 'new_terminal' })
+    expect(target('V')).toEqual({ action: 'workspace.split_chat_vertical' })
+    expect(target('Minus')).toEqual({ action: 'workspace.split_chat_horizontal' })
+    expect(target('Shift+V')).toEqual({ action: 'workspace.split_terminal_vertical' })
+    expect(target('Shift+Minus')).toEqual({ action: 'workspace.split_terminal_horizontal' })
+  })
+
   test('reads the shared verde.json prefix and opt-in focus bindings', () => {
     const config = parseWebKeybindConfig({
       keybinds: {
@@ -41,6 +53,26 @@ describe('parseWebKeybindConfig', () => {
     expect(config.prefix.keys[0].label).toBe('Ctrl+A')
     expect(config.prefix.bindings.some((row) => row.key.label === 'X')).toBe(false)
     expect(config.prefix.bindings.find((row) => row.key.label === 'g')?.target).toEqual({ action: 'workspace.next' })
+  })
+
+  test('parses prefix command placement', () => {
+    const config = parseWebKeybindConfig({
+      keybinds: {
+        prefix: {
+          enabled: true,
+          bindings: {
+            g: { command: 'lazygit', in: 'pane' },
+            f: { command: 'htop', open: 'floating' },
+            b: { command: 'true' },
+            x: { command: 'nope', in: 'not-a-place' },
+          },
+        },
+      },
+    })
+    expect(config.prefix.bindings.find((row) => row.key.label === 'g')?.target).toEqual({ command: 'lazygit', in: 'pane' })
+    expect(config.prefix.bindings.find((row) => row.key.label === 'f')?.target).toEqual({ command: 'htop', in: 'floating' })
+    expect(config.prefix.bindings.find((row) => row.key.label === 'b')?.target).toEqual({ command: 'true' })
+    expect(config.prefix.bindings.some((row) => row.key.label === 'x')).toBe(false)
   })
 })
 

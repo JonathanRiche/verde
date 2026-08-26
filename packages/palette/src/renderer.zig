@@ -2181,36 +2181,68 @@ fn appendCornerFan(allocator: std.mem.Allocator, mesh: *Mesh, cx: f32, cy: f32, 
 
 fn appendRoundedBorder(allocator: std.mem.Allocator, mesh: *Mesh, rect: draw.Rect, color: draw.Color, radius: f32, width: f32, clip: ?draw.Rect) !void {
     if (color.a <= 0.0 or rect.w <= 0.0 or rect.h <= 0.0 or width <= 0.0) return;
-    const r = if (clip) |clip_rect| clippedRect(rect, clip_rect) orelse return else rect;
+    if (clip) |clip_rect| {
+        if (clippedRect(rect, clip_rect) == null) return;
+    }
+    // Geometry always comes from the unclipped rect: callers clip a full circle
+    // border down to one quadrant to draw terminal rounded corners, and shrinking
+    // the rect first would turn that quarter-circle into a small rounded square.
+    const r = rect;
     const cr = clampedRadius(r, radius);
     const thickness = @max(width, 1.0);
     const inner = insetRect(r, thickness);
     if (cr <= 0.5 or inner.w <= 0.0 or inner.h <= 0.0) {
-        try appendBorderQuads(allocator, mesh, r, color, thickness, null);
+        try appendBorderQuads(allocator, mesh, r, color, thickness, clip);
         return;
     }
+    const inner_r = @max(cr - thickness, 0.0);
 
-    const inner_r = clampedRadius(inner, @max(cr - thickness, 0.0));
-    const y_start: i32 = @intFromFloat(@floor(r.y));
-    const y_end: i32 = @intFromFloat(@ceil(r.y + r.h));
+    // Straight bands between the corners; the corner squares own every pixel
+    // whose center lies past the arc tangent so nothing is covered twice.
+    const left_edge = @ceil(r.x + cr - 0.5);
+    const right_edge = @ceil(r.x + r.w - cr - 0.5);
+    const top_edge = @ceil(r.y + cr - 0.5);
+    const bottom_edge = @ceil(r.y + r.h - cr - 0.5);
+    try appendRect(allocator, mesh, .{ .x = left_edge, .y = r.y, .w = right_edge - left_edge, .h = thickness }, color, clip);
+    try appendRect(allocator, mesh, .{ .x = left_edge, .y = r.y + r.h - thickness, .w = right_edge - left_edge, .h = thickness }, color, clip);
+    try appendRect(allocator, mesh, .{ .x = r.x, .y = top_edge, .w = thickness, .h = bottom_edge - top_edge }, color, clip);
+    try appendRect(allocator, mesh, .{ .x = r.x + r.w - thickness, .y = top_edge, .w = thickness, .h = bottom_edge - top_edge }, color, clip);
+
+    const corners = [_]struct { cx: f32, cy: f32, x0: f32, x1: f32, y0: f32, y1: f32 }{
+        .{ .cx = r.x + cr, .cy = r.y + cr, .x0 = @floor(r.x), .x1 = left_edge, .y0 = @floor(r.y), .y1 = top_edge },
+        .{ .cx = r.x + r.w - cr, .cy = r.y + cr, .x0 = right_edge, .x1 = @ceil(r.x + r.w), .y0 = @floor(r.y), .y1 = top_edge },
+        .{ .cx = r.x + r.w - cr, .cy = r.y + r.h - cr, .x0 = right_edge, .x1 = @ceil(r.x + r.w), .y0 = bottom_edge, .y1 = @ceil(r.y + r.h) },
+        .{ .cx = r.x + cr, .cy = r.y + r.h - cr, .x0 = @floor(r.x), .x1 = left_edge, .y0 = bottom_edge, .y1 = @ceil(r.y + r.h) },
+    };
+    for (corners) |corner| {
+        try appendArcCoverage(allocator, mesh, corner.cx, corner.cy, cr, inner_r, .{ .x = corner.x0, .y = corner.y0, .w = corner.x1 - corner.x0, .h = corner.y1 - corner.y0 }, color, clip);
+    }
+}
+
+// Rasterizes the ring between inner_r and outer_r inside `bounds` one pixel at a
+// time with analytic edge coverage, so small terminal-cell arcs stay smooth
+// instead of stair-stepping like hard-edged scanline quads.
+fn appendArcCoverage(allocator: std.mem.Allocator, mesh: *Mesh, cx: f32, cy: f32, outer_r: f32, inner_r: f32, bounds: draw.Rect, color: draw.Color, clip: ?draw.Rect) !void {
+    const area = if (clip) |clip_rect| clippedRect(bounds, clip_rect) orelse return else bounds;
+    if (area.w <= 0.0 or area.h <= 0.0) return;
+    const x_start: i32 = @intFromFloat(@floor(area.x));
+    const x_end: i32 = @intFromFloat(@ceil(area.x + area.w));
+    const y_start: i32 = @intFromFloat(@floor(area.y));
+    const y_end: i32 = @intFromFloat(@ceil(area.y + area.h));
     var y = y_start;
     while (y < y_end) : (y += 1) {
-        const fy = @as(f32, @floatFromInt(y)) + 0.5;
-        const outer_inset = roundedInsetForY(r, cr, fy);
-        const outer_x0 = r.x + outer_inset;
-        const outer_x1 = r.x + r.w - outer_inset;
-        if (fy < inner.y or fy >= inner.y + inner.h) {
-            try appendQuad(mesh, allocator, .{ .x = outer_x0, .y = @floatFromInt(y), .w = @max(outer_x1 - outer_x0, 0.0), .h = 1.0 }, .{}, color);
-            continue;
-        }
-        const inner_inset = roundedInsetForY(inner, inner_r, fy);
-        const inner_x0 = inner.x + inner_inset;
-        const inner_x1 = inner.x + inner.w - inner_inset;
-        if (inner_x0 > outer_x0) {
-            try appendQuad(mesh, allocator, .{ .x = outer_x0, .y = @floatFromInt(y), .w = inner_x0 - outer_x0, .h = 1.0 }, .{}, color);
-        }
-        if (outer_x1 > inner_x1) {
-            try appendQuad(mesh, allocator, .{ .x = inner_x1, .y = @floatFromInt(y), .w = outer_x1 - inner_x1, .h = 1.0 }, .{}, color);
+        const py = @as(f32, @floatFromInt(y)) + 0.5;
+        var x = x_start;
+        while (x < x_end) : (x += 1) {
+            const px = @as(f32, @floatFromInt(x)) + 0.5;
+            const d = @sqrt((px - cx) * (px - cx) + (py - cy) * (py - cy));
+            const outer_cov = std.math.clamp(outer_r - d + 0.5, 0.0, 1.0);
+            const inner_cov = std.math.clamp(d - inner_r + 0.5, 0.0, 1.0);
+            const coverage = outer_cov * inner_cov;
+            if (coverage <= 0.002) continue;
+            var pixel = color;
+            pixel.a *= coverage;
+            try appendRect(allocator, mesh, .{ .x = @floatFromInt(x), .y = @floatFromInt(y), .w = 1.0, .h = 1.0 }, pixel, clip);
         }
     }
 }
