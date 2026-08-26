@@ -25,7 +25,8 @@ See [Provider setup](/docs/providers) for the exact install and login commands.
 
 ## Choose a provider and model
 
-Create a chat with `Ctrl+T`, then open the model pill in the composer. The
+Create a chat with the workspace pencil—or `Ctrl+B`, then `t` when prefix mode
+is enabled—then open the model pill in the composer. The
 picker has a provider rail, model search, default-model badges, and `Ctrl+1`
 through `Ctrl+9` shortcuts for the visible results.
 

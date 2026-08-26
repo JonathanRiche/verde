@@ -2114,6 +2114,10 @@ fn writePane(s: *std.json.Stringify, state: *app_state.AppState, project_index: 
     try s.beginObject();
     try s.objectField("pane_id");
     try s.write(pane.id);
+    if (pane.scroll_group_id) |group_id| {
+        try s.objectField("scroll_group");
+        try s.write(group_id);
+    }
     try s.objectField("focused");
     try s.write(project.workspace_layout.focused_pane_id != null and project.workspace_layout.focused_pane_id.? == pane.id);
     try s.objectField("maximized");

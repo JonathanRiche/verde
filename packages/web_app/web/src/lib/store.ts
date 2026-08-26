@@ -25,10 +25,13 @@ import {
 import { linuxWorkspaceId } from './wyhash'
 import { DEFAULT_UI_CONFIG, parseUiConfig, type UiConfig } from './ui_config'
 import {
+  adjacentPaneInGroups,
   paneIsActive,
   paneKey,
   paneTitle,
+  parseLayoutNode,
   synthesizeSplit,
+  workspacePaneGroups,
   type Attachment,
   type FavoriteModel,
   type LayoutNode,
@@ -665,6 +668,7 @@ function labelFromPath(path: string): string {
 /// (workspace_layout.zig persistedWorkspaceJson, v2).
 interface PersistedPaneRow {
   id?: number
+  scroll_group?: number
   kind?: string
   minimized?: boolean
   thread?: number
@@ -700,6 +704,7 @@ interface PersistedWorkspaceLayout {
   focused?: number | null
   maximized?: number | null
   panes?: PersistedPaneRow[]
+  root?: LayoutNode | null
 }
 
 export function parseWorkspaceLayout(json: string | null | undefined): PersistedWorkspaceLayout | null {
@@ -708,7 +713,10 @@ export function parseWorkspaceLayout(json: string | null | undefined): Persisted
     const parsed: unknown = JSON.parse(json)
     const record = asRecord(parsed)
     if (!record || !Array.isArray(record.panes)) return null
-    return record as PersistedWorkspaceLayout
+    return {
+      ...(record as PersistedWorkspaceLayout),
+      root: parseLayoutNode(record.root),
+    }
   } catch {
     return null
   }
@@ -720,8 +728,10 @@ export function parseWorkspaceLayout(json: string | null | undefined): Persisted
 export function layoutFromLivePanes(response: unknown): PersistedWorkspaceLayout | null {
   const result = unwrapResult<{
     focused_pane_id?: number | null
+    root?: unknown
     panes?: Array<{
       pane_id?: number
+      scroll_group?: number
       kind?: string
       thread_index?: number
       thread_title?: string
@@ -768,7 +778,16 @@ export function layoutFromLivePanes(response: unknown): PersistedWorkspaceLayout
       panes.push({ id: row.pane_id, kind: 'browser', tab_count: row.tab_count })
     }
   }
-  return { v: 2, focused: result.focused_pane_id ?? null, panes }
+  for (const pane of panes) {
+    const live_row = result.panes.find((row) => row.pane_id === pane.id)
+    pane.scroll_group = live_row?.scroll_group
+  }
+  return {
+    v: 2,
+    focused: result.focused_pane_id ?? null,
+    panes,
+    root: parseLayoutNode(result.root),
+  }
 }
 
 /// Desktop live `workspaces` listing: the set of workspaces actually open in
@@ -1048,6 +1067,17 @@ export function panesForWorkspace(
     if (used_sessions.has(sessionKey(session)) || !sessionIsLive(session)) continue
     rows.push(termPane(workspace, session))
   }
+  if (layout) {
+    const group_by_native = new Map(
+      (layout.panes ?? [])
+        .filter((pane): pane is PersistedPaneRow & { id: number } => typeof pane.id === 'number')
+        .map((pane) => [pane.id, pane.scroll_group] as const),
+    )
+    for (const pane of rows) {
+      if (pane.native_pane_id == null) continue
+      pane.scroll_group_id = group_by_native.get(pane.native_pane_id)
+    }
+  }
   return rows
 }
 
@@ -1140,6 +1170,12 @@ function createAppStore() {
     const id = workspace()?.workspace_id
     if (!id) return []
     return panesByWorkspace()[id] ?? []
+  })
+  const paneGroups = createMemo(() => {
+    const current = workspace()
+    if (!current) return []
+    const layout = liveLayouts[current.workspace_id] ?? parseWorkspaceLayout(current.workspace_layout_json)
+    return workspacePaneGroups(openPanes(), layout?.root ?? null)
   })
   const focusedPane = createMemo(() => {
     const id = focusedPaneId()
@@ -2839,6 +2875,29 @@ function createAppStore() {
     }
   }
 
+  const resizePaneSplit = async (
+    first_pane_id: number,
+    second_pane_id: number,
+    axis: 'vertical' | 'horizontal',
+    ratio: number,
+  ) => {
+    const first = openPanes().find((pane) => pane.pane_id === first_pane_id)
+    const second = openPanes().find((pane) => pane.pane_id === second_pane_id)
+    const current_workspace = workspace()
+    if (first?.native_pane_id == null || second?.native_pane_id == null || !current_workspace) return
+    const response = await interactiveCall('pane.resize', {
+      workspace: current_workspace.workspace_id,
+      pane: first.native_pane_id,
+      first: first.native_pane_id,
+      second: second.native_pane_id,
+      axis,
+      ratio: Math.min(0.78, Math.max(0.22, ratio)),
+    })
+    if (callSucceeded(response, 'could not resize pane split')) {
+      await refreshProjection({ workspace_id: current_workspace.workspace_id })
+    }
+  }
+
   const runSidebarContextAction = async (request: SidebarContextActionRequest) => {
     const { action, workspace: current_workspace, pane, value } = request
     setNotice(null)
@@ -3031,6 +3090,14 @@ function createAppStore() {
     focusPane(panes[next]!)
   }
 
+  const stepPaneDirection = (direction: 'left' | 'right' | 'up' | 'down') => {
+    const current = focusedPaneId()
+    if (current == null) return
+    const next_id = adjacentPaneInGroups(paneGroups(), current, direction)
+    const next = openPanes().find((pane) => pane.pane_id === next_id)
+    if (next) focusPane(next)
+  }
+
   const stepWorkspace = (delta: number) => {
     const list = workspaces()
     if (list.length === 0) return
@@ -3083,12 +3150,16 @@ function createAppStore() {
         stepPane(1)
         break
       case 'focus_left':
-      case 'focus_up':
-        stepPane(-1)
+        stepPaneDirection('left')
         break
       case 'focus_right':
+        stepPaneDirection('right')
+        break
+      case 'focus_up':
+        stepPaneDirection('up')
+        break
       case 'focus_down':
-        stepPane(1)
+        stepPaneDirection('down')
         break
       case 'maximize':
         void maximizePane()
@@ -3388,6 +3459,7 @@ function createAppStore() {
     workspace,
     workspaceId,
     openPanes,
+    paneGroups,
     visiblePanes,
     canvasLayout,
     activePanes,
@@ -3396,6 +3468,7 @@ function createAppStore() {
     focusedChat,
     maximizedPaneId,
     maximizePane,
+    resizePaneSplit,
     paletteOpen,
     setPaletteOpen,
     settingsOpen,

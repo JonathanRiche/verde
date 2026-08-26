@@ -20,11 +20,10 @@ launches.
 
 ## Splitting panes
 
-Splits come from two places: keyboard shortcuts for the common cases, and the
-pane header buttons for everything else.
-
-- `Ctrl+Shift+T` — split a terminal pane next to the focused workspace pane.
-- `Ctrl+T` — start a new chat thread (creates a new chat pane).
+Splits come from the prefix table and the pane header buttons. With prefix mode
+enabled, `Ctrl+B`, then `t` starts a new chat thread, while `Ctrl+B`, then
+`Shift+T` creates a separate top-level terminal pane. Use `v`, `-`, `Shift+V`,
+or `Shift+-` when you want a tiled split inside the focused scrolling item.
 
 With prefix mode enabled, `Ctrl+B`, then `v` creates a vertical GUI chat split
 inside the focused pane; `Ctrl+B`, then `-` creates a horizontal GUI chat split.
@@ -123,9 +122,12 @@ non-destructive — every pane keeps its content and provider.
 
 ## The sidebar
 
-The left rail shows projects, threads under each project, and the active pane
-in each workspace. Each pane row carries its provider glyph and a live title,
-so you always know what is working without switching to it.
+The left rail shows a pinned **ACTIVE** cluster of live, waiting, and recently
+finished work across workspaces, then the project tree beneath it. Each pane
+row carries its provider glyph and a live title, so you always know what is
+working without switching to it. ACTIVE stays put while you scroll the
+workspace list; if more than about ten rows need attention, that cluster
+scrolls on its own instead of burying the tree.
 
 - `Ctrl+S` — toggle the sidebar (visible ↔ icon rail).
 - `Ctrl+Shift+S` — toggle the sidebar's hidden mode (no rail at all).

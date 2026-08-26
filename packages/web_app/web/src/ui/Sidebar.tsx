@@ -2,7 +2,7 @@ import { For, Show, createEffect, createSignal, onCleanup, type JSX } from 'soli
 import { Portal } from 'solid-js/web'
 
 import { store, type SidebarContextAction } from '../lib/store'
-import { paneIsActive, type LivePane, type Workspace } from '../lib/types'
+import { paneIsActive, type LayoutNode, type LivePane, type Workspace } from '../lib/types'
 import { Icon, ProviderGlyph, StatusPip, VerdeLogo } from './Icons'
 
 type SidebarMenuTarget =
@@ -346,13 +346,27 @@ function WorkspaceGroup(props: {
       </div>
       <Show when={selected()}>
         <div class="mt-1 ml-4">
-          <For each={selected() ? store.openPanes() : []}>
-            {(pane) => (
-              <PaneRow
-                pane={pane}
-                onClick={() => store.focusPane(pane)}
-                onOpenContext={(x, y) => props.onOpenPaneContext(pane, x, y)}
-              />
+          <For each={selected() ? store.paneGroups() : []}>
+            {(group) => (
+              <Show
+                when={group.panes.length > 1}
+                fallback={<PaneRow
+                  pane={group.panes[0]!}
+                  onClick={() => store.focusPane(group.panes[0]!)}
+                  onOpenContext={(x, y) => props.onOpenPaneContext(group.panes[0]!, x, y)}
+                />}
+              >
+                <div
+                  class="mb-1 flex min-h-0 min-w-0 overflow-hidden"
+                  style={{ height: `${sidebarGroupRows(group.layout) * 38 + (sidebarGroupRows(group.layout) - 1) * 4}px` }}
+                >
+                  <SidebarGroupNode
+                    node={group.layout}
+                    panes={group.panes}
+                    onOpenPaneContext={props.onOpenPaneContext}
+                  />
+                </div>
+              </Show>
             )}
           </For>
         </div>
@@ -361,9 +375,54 @@ function WorkspaceGroup(props: {
   )
 }
 
+function sidebarGroupRows(node: LayoutNode): number {
+  if ('leaf' in node) return 1
+  const first = sidebarGroupRows(node.split.first)
+  const second = sidebarGroupRows(node.split.second)
+  return node.split.axis === 'horizontal' ? first + second : Math.max(first, second)
+}
+
+function SidebarGroupNode(props: {
+  node: LayoutNode
+  panes: LivePane[]
+  onOpenPaneContext: (pane: LivePane, x: number, y: number) => void
+}) {
+  if ('leaf' in props.node) {
+    const leaf_id = props.node.leaf
+    const pane = props.panes.find((item) => item.pane_id === leaf_id)
+    return (
+      <Show when={pane} keyed>
+        {(item) => (
+          <div class="min-h-0 min-w-0 flex-1 overflow-hidden rounded-[7px] border border-[var(--border-muted)] bg-[var(--panel-alt)]">
+            <PaneRow
+              pane={item}
+              tiled
+              onClick={() => store.focusPane(item)}
+              onOpenContext={(x, y) => props.onOpenPaneContext(item, x, y)}
+            />
+          </div>
+        )}
+      </Show>
+    )
+  }
+  const split = props.node.split
+  const ratio = Math.min(0.78, Math.max(0.22, split.ratio))
+  return (
+    <div class={`flex min-h-0 min-w-0 flex-1 gap-1 ${split.axis === 'vertical' ? 'flex-row' : 'flex-col'}`}>
+      <div class="flex min-h-0 min-w-0 overflow-hidden" style={{ flex: `${ratio} 1 0%` }}>
+        <SidebarGroupNode node={split.first} panes={props.panes} onOpenPaneContext={props.onOpenPaneContext} />
+      </div>
+      <div class="flex min-h-0 min-w-0 overflow-hidden" style={{ flex: `${1 - ratio} 1 0%` }}>
+        <SidebarGroupNode node={split.second} panes={props.panes} onOpenPaneContext={props.onOpenPaneContext} />
+      </div>
+    </div>
+  )
+}
+
 function PaneRow(props: {
   pane: LivePane
   activeCluster?: boolean
+  tiled?: boolean
   onClick: () => void
   onOpenContext?: (x: number, y: number) => void
 }) {
@@ -373,7 +432,7 @@ function PaneRow(props: {
   return (
     <button
       type="button"
-      class={`mb-[4px] flex h-[38px] w-full touch-pan-y select-none items-center gap-2.5 rounded-[7px] px-2.5 text-left ${focused() ? 'bg-[var(--accent-row)]' : 'hover:bg-[var(--accent-hover)]'}`}
+      class={`${props.tiled ? 'h-full min-h-[38px]' : 'mb-[4px] h-[38px]'} flex w-full touch-pan-y select-none items-center gap-2.5 rounded-[7px] px-2.5 text-left ${focused() ? 'bg-[var(--accent-row)]' : 'hover:bg-[var(--accent-hover)]'}`}
       style={{ '-webkit-touch-callout': 'none' }}
       onClick={(event) => {
         if (context.consumeClick(event)) return

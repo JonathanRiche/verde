@@ -79,6 +79,7 @@ pub const PrefixTarget = union(enum) {
     terminal: NativeTerminalAction,
     chat: NativeChatAction,
     focus_prompt,
+    new_terminal,
     /// Opens the keybind cheat sheet and keeps the prefix armed.
     show_keybinds,
     /// Opens the workspace action menu (herdr `prefix w`).
@@ -250,7 +251,7 @@ pub const NativeKeyboardConfig = struct {
             .refresh = try cloneDefaultKeybinds(allocator),
             .open_default = try cloneDefaultOpenKeybinds(allocator),
             .open_editor = try cloneDefaultOpenEditorKeybinds(allocator),
-            .new_thread = try cloneDefaultNewThreadKeybinds(allocator),
+            .new_thread = try cloneEmptyKeybinds(allocator),
             .command_palette = try cloneDefaultCommandPaletteKeybinds(allocator),
             .companion = try cloneDefaultCompanionKeybinds(allocator),
             .toggle_sidebar = try cloneDefaultSidebarKeybinds(allocator),
@@ -285,7 +286,7 @@ pub const NativeKeyboardConfig = struct {
             .workspace_split_chat_vertical = try cloneEmptyKeybinds(allocator),
             .workspace_split_chat_horizontal = try cloneEmptyKeybinds(allocator),
             .workspace_split_terminal_vertical = try cloneEmptyKeybinds(allocator),
-            .workspace_split_terminal_horizontal = try cloneDefaultWorkspaceSplitTerminalHorizontalKeybinds(allocator),
+            .workspace_split_terminal_horizontal = try cloneEmptyKeybinds(allocator),
             .workspace_toggle_maximize = try cloneDefaultWorkspaceToggleMaximizeKeybinds(allocator),
             .workspace_toggle_quick_pane = try cloneDefaultWorkspaceToggleQuickPaneKeybinds(allocator),
             .workspace_close = try cloneDefaultWorkspaceCloseKeybinds(allocator),
@@ -1259,6 +1260,7 @@ const PREFIX_ACTION_NAMES = [_]PrefixActionName{
     .{ .name = "open_default", .target = .{ .app = .open_default } },
     .{ .name = "open_editor", .target = .{ .app = .open_editor } },
     .{ .name = "new_thread", .target = .{ .app = .new_thread } },
+    .{ .name = "new_terminal", .target = .new_terminal },
     .{ .name = "command_palette", .target = .{ .app = .command_palette } },
     .{ .name = "companion", .target = .{ .app = .companion } },
     .{ .name = "sidebar", .target = .{ .app = .toggle_sidebar } },
@@ -1403,6 +1405,7 @@ pub fn prefixTargetLabel(buf: []u8, target: PrefixTarget) []const u8 {
             .run_config => "Run settings",
         },
         .focus_prompt => "Focus prompt",
+        .new_terminal => "New terminal",
         .show_keybinds => "Keybinds",
         .navigate => "Workspace nav",
         .workspace_select => |index| std.fmt.bufPrint(buf, "Workspace {d}", .{index + 1}) catch "Workspace",
@@ -1433,6 +1436,7 @@ const DEFAULT_PREFIX_TABLE = [_]DefaultPrefixEntry{
     // App
     .{ .accelerator = "P", .target = "command_palette" },
     .{ .accelerator = "T", .target = "new_thread" },
+    .{ .accelerator = "Shift+T", .target = "new_terminal" },
     .{ .accelerator = "R", .target = "refresh" },
     .{ .accelerator = "O", .target = "open" },
     .{ .accelerator = "E", .target = "open_editor" },
@@ -1613,12 +1617,6 @@ fn cloneDefaultOpenEditorKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     });
 }
 
-fn cloneDefaultNewThreadKeybinds(allocator: std.mem.Allocator) ![]Keybind {
-    return allocator.dupe(Keybind, &.{
-        try parseDefaultAccelerator("CommandOrControl+T"),
-    });
-}
-
 fn cloneDefaultWorkspaceCloseKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("CommandOrControl+W"),
@@ -1705,12 +1703,6 @@ fn cloneDefaultChatRunConfigKeybinds(allocator: std.mem.Allocator) ![]Keybind {
 fn cloneDefaultTerminalNewTabKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("CommandOrControl+Alt+T"),
-    });
-}
-
-fn cloneDefaultWorkspaceSplitTerminalHorizontalKeybinds(allocator: std.mem.Allocator) ![]Keybind {
-    return allocator.dupe(Keybind, &.{
-        try parseDefaultAccelerator("CommandOrControl+Shift+T"),
     });
 }
 
@@ -2485,6 +2477,23 @@ test "new thread keybind override accepts a single accelerator" {
     try std.testing.expectEqual(sdl.Keycode.t, config.new_thread[0].key);
 }
 
+test "terminal pane keybind override accepts the removed default accelerator" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"keybinds": {"workspace": {"split_terminal_horizontal": "CommandOrControl+Shift+T"}}}
+    , .{});
+    defer parsed.deinit();
+
+    config.applyOverrides(parsed.value);
+
+    try std.testing.expectEqual(@as(usize, 1), config.workspace_split_terminal_horizontal.len);
+    try std.testing.expect(config.workspace_split_terminal_horizontal[0].primary);
+    try std.testing.expect(config.workspace_split_terminal_horizontal[0].shift);
+    try std.testing.expectEqual(sdl.Keycode.t, config.workspace_split_terminal_horizontal[0].key);
+}
+
 test "sidebar keybind override accepts a single accelerator" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
@@ -2540,29 +2549,12 @@ test "default browser keybind uses ctrl shift b" {
     try std.testing.expectEqual(sdl.Keycode.b, config.toggle_browser[0].key);
 }
 
-test "default new thread keybind uses primary plus t" {
+test "direct new thread and terminal pane keybinds are disabled by default" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), config.new_thread.len);
-    try std.testing.expect(!config.new_thread[0].alt);
-    try std.testing.expect(!config.new_thread[0].ctrl);
-    try std.testing.expect(!config.new_thread[0].meta);
-    try std.testing.expect(config.new_thread[0].primary);
-    try std.testing.expectEqual(sdl.Keycode.t, config.new_thread[0].key);
-}
-
-test "default terminal pane keybind uses primary shift t" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    try std.testing.expectEqual(@as(usize, 1), config.workspace_split_terminal_horizontal.len);
-    try std.testing.expect(!config.workspace_split_terminal_horizontal[0].alt);
-    try std.testing.expect(!config.workspace_split_terminal_horizontal[0].ctrl);
-    try std.testing.expect(!config.workspace_split_terminal_horizontal[0].meta);
-    try std.testing.expect(config.workspace_split_terminal_horizontal[0].primary);
-    try std.testing.expect(config.workspace_split_terminal_horizontal[0].shift);
-    try std.testing.expectEqual(sdl.Keycode.t, config.workspace_split_terminal_horizontal[0].key);
+    try std.testing.expectEqual(@as(usize, 0), config.new_thread.len);
+    try std.testing.expectEqual(@as(usize, 0), config.workspace_split_terminal_horizontal.len);
 }
 
 test "default terminal tab keybind uses primary alt t" {
@@ -3037,6 +3029,23 @@ test "default prefix table has no duplicate chords" {
     }
 }
 
+test "default prefix t chords create chat and terminal panes" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    var chat = false;
+    var terminal = false;
+    for (config.prefix.bindings.items) |binding| {
+        if (binding.key.eql(.{ .key = .t })) {
+            chat = binding.target == .app and binding.target.app == .new_thread;
+        }
+        if (binding.key.eql(.{ .shift = true, .key = .t })) {
+            terminal = binding.target == .new_terminal;
+        }
+    }
+    try std.testing.expect(chat and terminal);
+}
+
 test "default prefix pane tile chords use default and shifted alternate actions" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
@@ -3158,6 +3167,7 @@ test "prefix defaults false drops the built-in table" {
 }
 
 test "prefix action names resolve positional ordinals" {
+    try std.testing.expect(parsePrefixActionName("new_terminal").? == .new_terminal);
     try std.testing.expectEqual(@as(usize, 0), parsePrefixActionName("workspace.pane_select.1").?.pane_select);
     try std.testing.expectEqual(@as(usize, 9), parsePrefixActionName("Workspace.Active_Select.10").?.active_select);
     try std.testing.expect(parsePrefixActionName("workspace.select.0") == null);

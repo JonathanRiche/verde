@@ -17,7 +17,6 @@ in your Verde config — see [Remapping](#remapping) below.
 | Combo                       | Action                                |
 | -------------------------- | ------------------------------------- |
 | `Ctrl+Shift+P` / `Cmd+Shift+P` | Command palette                    |
-| `Ctrl+T` / `Cmd+T`          | New chat thread                       |
 | `Ctrl+W` / `Cmd+W`, `Alt+X` | Close the focused pane                |
 | `Ctrl+Shift+W` / `Cmd+Shift+W` | Close the current workspace (reopen from the command palette) |
 | `Ctrl+Shift+Space`          | Toggle the experimental Companion (when enabled in Settings) |
@@ -85,14 +84,14 @@ between workspaces (see the sidebar table above).
 
 ### Workspace splits
 
-| Combo             | Action                                            |
-| ----------------- | ------------------------------------------------- |
-| `Ctrl+Shift+T` / `Cmd+Shift+T` | Split a terminal pane next to the focus |
+Workspace splits have no direct default keybinds. With prefix mode enabled,
+`Ctrl+B`, then `t` creates a new chat and `Ctrl+B`, then `Shift+T` creates a
+separate top-level terminal pane. The `v`, `-`, `Shift+V`, and `Shift+-` prefix
+chords create tiled splits using the configured default/alternate pane types.
 
-Vertical / horizontal chat splits and terminal-vertical splits have **no
-default keybind**. Use the pane header buttons: `C|` / `C-` for chat vertical /
-horizontal and `T|` / `T-` for terminal vertical / horizontal. You can bind
-these actions yourself — see the table of binding keys below.
+You can also use the pane header buttons: `C|` / `C-` for chat vertical /
+horizontal and `T|` / `T-` for terminal vertical / horizontal, or bind any
+split action directly under `keybinds.workspace`.
 
 ### Terminal (inside a focused terminal pane)
 
@@ -168,7 +167,7 @@ the object form for full control:
   `sh -lc` with the current project as the working directory and the project
   path as `$1` (the same contract as custom `open.default` actions).
 
-Direct shortcuts keep working alongside prefix mode. Modifier state is exact:
+Configured direct shortcuts work alongside prefix mode. Modifier state is exact:
 `Ctrl+B` then `x` is different from `Ctrl+B` then `Ctrl+X`, so release `Ctrl`
 before the second key unless the binding uses it.
 
@@ -197,7 +196,7 @@ The table is overridable exactly like `bindings`, under `"navigate"`:
 | `?`                              | `prefix.keybinds` (cheat sheet, stays armed)      |
 | `w`                              | `prefix.navigate` (one-shot workspace menu)        |
 | `p`                              | `command_palette`                                 |
-| `t`                              | `new_thread`                                      |
+| `t` / `Shift+T`                  | `new_thread` / `new_terminal`                       |
 | `r`                              | `refresh`                                         |
 | `o` / `e`                        | `open` / `open_editor`                            |
 | `Space`                          | `companion`                                       |
@@ -238,7 +237,7 @@ exactly like their direct shortcuts.
 ### Prefix action names
 
 Action names mirror the remapping keys below, joined with `.` for nested
-groups: `refresh`, `open`, `open_editor`, `new_thread`, `command_palette`,
+groups: `refresh`, `open`, `open_editor`, `new_thread`, `new_terminal`, `command_palette`,
 `companion`, `sidebar`, `sidebar_hidden`, `browser`, `chat_up`, `chat_down`,
 `chat_page_up`, `chat_page_down`, `chat.model_picker`, `chat.run_config`,
 `terminal.toggle`, `prefix.keybinds`, `prefix.navigate`, and `terminal.<key>`
@@ -254,6 +253,10 @@ Override any binding under `keybinds` in your `verde.json`. On Unix it is under
 `%APPDATA%\Verde`. Use a string for one shortcut, or a string array for multiple
 shortcuts on the same action:
 
+`Ctrl+T` and `Ctrl+Shift+T` are unbound by default. To opt back into those
+direct shortcuts, use `new_thread` and `workspace.split_terminal_horizontal`
+as shown below.
+
 ```json
 {
   "keybinds": {
@@ -261,6 +264,7 @@ shortcuts on the same action:
     "browser": "Ctrl+Shift+B",
     "companion": "Ctrl+Shift+Space",
     "workspace": {
+      "split_terminal_horizontal": "CommandOrControl+Shift+T",
       "close_current": "CommandOrControl+Shift+W",
       "focus_up": "Ctrl+K",
       "focus_down": "Ctrl+J",

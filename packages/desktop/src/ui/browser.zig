@@ -572,7 +572,7 @@ fn selectableBrowserContextMenuIndexes(state: *const app_state.AppState, parent_
     return selectableBrowserContextMenuIndexesFromItems(
         state.browser_controller.context_menu_items.items,
         parent_index,
-        state.currentProjectVisibleBrowserPaneId() != null,
+        !state.browser_controller.context_menu_is_option and state.currentProjectVisibleBrowserPaneId() != null,
         indexes,
     );
 }
@@ -1389,7 +1389,7 @@ fn browserContextMenuContentHeight(state: *const app_state.AppState, parent_inde
         if (item.parent_index != parent_index) continue;
         height += if (item.separator) separator_height else row_height;
     }
-    if (parent_index == null and state.currentProjectVisibleBrowserPaneId() != null) {
+    if (parent_index == null and !state.browser_controller.context_menu_is_option and state.currentProjectVisibleBrowserPaneId() != null) {
         height += separator_height + row_height;
     }
     return height;
@@ -1475,13 +1475,22 @@ fn renderBrowserContextMenuPanel(state: *app_state.AppState, parent_index: ?u32,
         if (selected or (rectHovered(row_rect) and item.enabled)) {
             queuePaletteRoundedRect(state, row_rect, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
         }
+        const leading_width = if (state.browser_controller.context_menu_is_option) theme.scaledUi(18.0) else 0.0;
         const trailing_width = if (item.submenu) theme.scaledUi(22.0) else 0.0;
         queuePaletteText(state, .{
-            .x = row_rect.x + theme.scaledUi(8.0),
+            .x = row_rect.x + theme.scaledUi(8.0) + leading_width,
             .y = row_rect.y + (row_rect.h - theme.scaledUi(13.0) * 1.25) * 0.5,
-            .w = row_rect.w - theme.scaledUi(16.0) - trailing_width,
+            .w = row_rect.w - theme.scaledUi(16.0) - leading_width - trailing_width,
             .h = theme.scaledUi(13.0) * 1.25,
         }, item.label, paletteColor(if (item.enabled) theme.COLOR_TEXT_MUTED else theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), row_rect);
+        if (state.browser_controller.context_menu_is_option and item.selected) {
+            queuePaletteText(state, .{
+                .x = row_rect.x + theme.scaledUi(7.0),
+                .y = row_rect.y + (row_rect.h - theme.scaledUi(13.0) * 1.25) * 0.5,
+                .w = theme.scaledUi(14.0),
+                .h = theme.scaledUi(13.0) * 1.25,
+            }, "*", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), row_rect);
+        }
         if (item.submenu) {
             queuePaletteText(state, .{
                 .x = row_rect.x + row_rect.w - theme.scaledUi(18.0),
@@ -1498,7 +1507,7 @@ fn renderBrowserContextMenuPanel(state: *app_state.AppState, parent_index: ?u32,
         row_y += row_height;
     }
 
-    if (parent_index == null and state.currentProjectVisibleBrowserPaneId() != null) {
+    if (parent_index == null and !state.browser_controller.context_menu_is_option and state.currentProjectVisibleBrowserPaneId() != null) {
         queuePaletteRect(state, snapRect(.{
             .x = panel_rect.x + pad,
             .y = row_y + separator_height * 0.5,
@@ -1992,6 +2001,9 @@ test "browser context-menu keyboard selection filters rows by level and wraps" {
     try std.testing.expectEqualSlices(u32, &.{ 1, CLOSE_PANE_MENU_INDEX }, indexes[0..root_count]);
     try std.testing.expectEqual(@as(u32, 1), nextBrowserContextMenuSelection(indexes[0..root_count], CLOSE_PANE_MENU_INDEX, 1));
     try std.testing.expectEqual(CLOSE_PANE_MENU_INDEX, nextBrowserContextMenuSelection(indexes[0..root_count], 1, -1));
+
+    const option_count = selectableBrowserContextMenuIndexesFromItems(&items, null, false, &indexes);
+    try std.testing.expectEqualSlices(u32, &.{1}, indexes[0..option_count]);
 
     const child_count = selectableBrowserContextMenuIndexesFromItems(&items, 1, false, &indexes);
     try std.testing.expectEqualSlices(u32, &.{4}, indexes[0..child_count]);
