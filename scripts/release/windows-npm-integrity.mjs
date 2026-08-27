@@ -10,9 +10,6 @@ export const WINDOWS_NPM_PAYLOAD_ENTRIES = Object.freeze([
   "LICENSE",
   "WINDOWS-RUNTIME.txt",
   "WINDOWS-SIGNING.json",
-  "WINDOWS-TESTING.md",
-  "WINDOWS-PREVIEW.md",
-  "WINDOWS-IMPLEMENTATION.md",
   "PACKAGE-MANIFEST.json",
   "SHA256SUMS.txt",
   "test-terminal.ps1",
@@ -20,7 +17,6 @@ export const WINDOWS_NPM_PAYLOAD_ENTRIES = Object.freeze([
 ]);
 
 const REQUIRED_MANIFEST_PATHS = Object.freeze([
-  "WINDOWS-IMPLEMENTATION.md",
   "test-terminal.ps1",
 ]);
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;

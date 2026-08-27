@@ -303,12 +303,6 @@ def verify_package_tree(root: Path, expected_version: str) -> dict[str, object]:
             raise RuntimeError(
                 f"install.ps1 does not assign {APP_USER_MODEL_ID} through property store"
             )
-    for document in (
-        "WINDOWS-TESTING.md",
-        "WINDOWS-PREVIEW.md",
-        "WINDOWS-IMPLEMENTATION.md",
-    ):
-        require_file(root / document, "Windows handoff document")
     require_file(root / "test-terminal.ps1", "Windows terminal smoke test")
     require_file(root / "share" / "verde" / "provider_bridge.mjs", "provider bridge")
     verify_build_version(root, expected_version)
@@ -383,11 +377,6 @@ def copy_package_payload(prefix: Path, dependency_root: Path, package_root: Path
     sources = {
         REPO_ROOT / "README.md": package_root / "README.md",
         REPO_ROOT / "LICENSE": package_root / "LICENSE",
-        REPO_ROOT / "notes" / "windows_test_handoff.md": package_root / "WINDOWS-TESTING.md",
-        REPO_ROOT / "notes" / "windows-preview-release.md": package_root / "WINDOWS-PREVIEW.md",
-        REPO_ROOT
-        / "notes"
-        / "windows_implementation_audit.md": package_root / "WINDOWS-IMPLEMENTATION.md",
         REPO_ROOT
         / "scripts"
         / "release"

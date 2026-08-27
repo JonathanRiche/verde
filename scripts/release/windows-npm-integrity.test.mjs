@@ -26,7 +26,6 @@ function sha256(value) {
 
 function createFixture(root) {
   const files = new Map([
-    ["WINDOWS-IMPLEMENTATION.md", Buffer.from("implementation audit\n")],
     ["test-terminal.ps1", Buffer.from("Write-Host 'terminal smoke'\n")],
     ["app/Verde.exe", Buffer.from("gui fixture\n")],
   ]);
@@ -63,8 +62,7 @@ function withFixture(callback) {
   }
 }
 
-test("Windows npm payload retains the implementation audit", () => {
-  assert.ok(WINDOWS_NPM_PAYLOAD_ENTRIES.includes("WINDOWS-IMPLEMENTATION.md"));
+test("Windows npm payload retains the terminal smoke test", () => {
   assert.ok(WINDOWS_NPM_PAYLOAD_ENTRIES.includes("test-terminal.ps1"));
   const packageJson = JSON.parse(
     readFileSync(
@@ -72,15 +70,14 @@ test("Windows npm payload retains the implementation audit", () => {
       "utf8",
     ),
   );
-  assert.ok(packageJson.files.includes("WINDOWS-IMPLEMENTATION.md"));
   assert.ok(packageJson.files.includes("test-terminal.ps1"));
 });
 
 test("valid copied payload passes manifest and checksum verification", () => {
   withFixture((root) => {
     assert.deepEqual(verifyWindowsNpmPayload(root), {
-      manifestFiles: 3,
-      checksummedFiles: 4,
+      manifestFiles: 2,
+      checksummedFiles: 3,
     });
   });
 });
@@ -110,7 +107,7 @@ test("unsafe manifest paths are rejected before file access", () => {
   withFixture((root) => {
     const manifestPath = path.join(root, "PACKAGE-MANIFEST.json");
     const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
-    manifest.files[0].path = "../WINDOWS-IMPLEMENTATION.md";
+    manifest.files[0].path = "../test-terminal.ps1";
     writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
     assert.throws(() => verifyWindowsNpmPayload(root), /unsafe payload path/);
   });

@@ -86,9 +86,6 @@ Copy-RequiredFile (Join-Path $PrefixDir "share\verde\provider_bridge.mjs") (Join
 Copy-RequiredFile (Join-Path $PrefixDir "share\verde\BUILD_VERSION") (Join-Path $PackageRoot "share\verde\BUILD_VERSION")
 Copy-RequiredFile (Join-Path $RepoRoot "README.md") (Join-Path $PackageRoot "README.md")
 Copy-RequiredFile (Join-Path $RepoRoot "LICENSE") (Join-Path $PackageRoot "LICENSE")
-Copy-RequiredFile (Join-Path $RepoRoot "notes\windows_test_handoff.md") (Join-Path $PackageRoot "WINDOWS-TESTING.md")
-Copy-RequiredFile (Join-Path $RepoRoot "notes\windows-preview-release.md") (Join-Path $PackageRoot "WINDOWS-PREVIEW.md")
-Copy-RequiredFile (Join-Path $RepoRoot "notes\windows_implementation_audit.md") (Join-Path $PackageRoot "WINDOWS-IMPLEMENTATION.md")
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\release\install-windows-preview.ps1") (Join-Path $PackageRoot "install.ps1")
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\dev\smoke-windows-terminal.ps1") (Join-Path $PackageRoot "test-terminal.ps1")
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\windows-dependencies.json") (Join-Path $PackageRoot "share\verde\windows-dependencies.json")
@@ -243,9 +240,6 @@ foreach ($RelativePath in @(
   "PACKAGE-MANIFEST.json",
   "SHA256SUMS.txt",
   "WINDOWS-SIGNING.json",
-  "WINDOWS-TESTING.md",
-  "WINDOWS-PREVIEW.md",
-  "WINDOWS-IMPLEMENTATION.md",
   "test-terminal.ps1",
   "install.ps1"
 )) {
