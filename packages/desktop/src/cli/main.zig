@@ -2092,6 +2092,8 @@ const integration_providers = [_]IntegrationProvider{
     .{ .name = "opencode", .hook_state = "global-plugin", .installable = true, .installed = false, .reason = "OpenCode lifecycle events are supported through a global ~/.config/opencode/plugin/verde-notify.ts plugin." },
     .{ .name = "cursor", .hook_state = "project-local", .installable = true, .installed = false, .reason = "Cursor Agent uses the same .cursor/hooks.json format in its terminal and desktop UI; Verde status updates require inherited Verde pane identity." },
     .{ .name = "grok", .hook_state = "global", .installable = true, .installed = false, .reason = "Grok Build personal hooks report lifecycle status from ~/.grok/hooks/verde-notify.json without requiring project trust." },
+    .{ .name = "pi", .hook_state = "global-extension", .installable = true, .installed = false, .reason = "Pi lifecycle and session-title events are supported through ~/.pi/agent/extensions/verde-notify.ts." },
+    .{ .name = "fx", .hook_state = "built-in", .installable = true, .installed = false, .reason = "FX reports lifecycle natively to Verde and supplies its session title through terminal OSC metadata." },
 };
 
 fn handleIntegrations(allocator: std.mem.Allocator, out: output.Output, argv: []const []const u8) !void {
@@ -2100,14 +2102,15 @@ fn handleIntegrations(allocator: std.mem.Allocator, out: output.Output, argv: []
             \\Usage:
             \\  verde integrations list [--json]
             \\  verde integrations doctor [--json]
-            \\  verde integrations install <claude|codex|amp|opencode|cursor|grok> [--global]
-            \\  verde integrations remove <claude|codex|amp|opencode|cursor|grok> [--global]
-            \\  verde integrations disable <claude|codex|amp|opencode|cursor|grok>
+            \\  verde integrations install <claude|codex|amp|opencode|cursor|grok|pi|fx> [--global]
+            \\  verde integrations remove <claude|codex|amp|opencode|cursor|grok|pi|fx> [--global]
+            \\  verde integrations disable <claude|codex|amp|opencode|cursor|grok|pi|fx>
             \\
             \\  --global installs Claude/Codex/Cursor/Grok hooks in their user config files,
-            \\  plus Amp/OpenCode plugins in their global plugin directories
+            \\  plus Amp/OpenCode/Pi plugins in their global plugin directories
             \\  (no-op outside Verde panes); otherwise supported hooks are project-local
             \\  where the provider supports that.
+            \\  FX lifecycle reporting is built into FX and Verde and needs no file install.
             \\
             \\Provider hooks are optional. Verde does not overwrite provider config
             \\or change provider login/auth behavior.
@@ -2254,6 +2257,25 @@ fn handleIntegrations(allocator: std.mem.Allocator, out: output.Output, argv: []
             try out.stdout("verde integrations {s} opencode --global: removed global OpenCode plugin from ~/.config/opencode/plugin/verde-notify.ts\n", .{command});
             return;
         }
+        if (global and std.mem.eql(u8, provider.name, "pi")) {
+            provider_hooks.removePiGlobalHooks(allocator) catch |err| {
+                try out.stderr("verde integrations {s} pi --global: {s}\n", .{ command, @errorName(err) });
+                std.process.exit(1);
+            };
+            if (json) {
+                try out.jsonValue(allocator, .{
+                    .provider = provider.name,
+                    .action = command,
+                    .installed = false,
+                    .changed = true,
+                    .status = "removed",
+                    .scope = "global",
+                });
+                return;
+            }
+            try out.stdout("verde integrations {s} pi --global: removed global Pi extension from ~/.pi/agent/extensions/verde-notify.ts\n", .{command});
+            return;
+        }
         try printIntegrationNoInstalledHook(allocator, out, json, command, provider);
         return;
     }
@@ -2284,6 +2306,10 @@ fn integrationProvidersWithInstalledState(allocator: std.mem.Allocator) [integra
             provider_hooks.cursorGlobalHooksInstalled(allocator)
         else if (std.mem.eql(u8, provider.name, "grok"))
             provider_hooks.grokGlobalHooksInstalled(allocator)
+        else if (std.mem.eql(u8, provider.name, "pi"))
+            provider_hooks.piGlobalHooksInstalled(allocator)
+        else if (std.mem.eql(u8, provider.name, "fx"))
+            process_env.commandExists("fx")
         else
             false;
     }
@@ -2323,7 +2349,7 @@ fn printIntegrationsDoctor(allocator: std.mem.Allocator, out: output.Output, jso
             .verde_env = std.mem.eql(u8, verde_env, "1"),
             .has_terminal_identity = has_identity,
             .providers = providers[0..],
-            .summary = "Claude/Codex/Cursor/Grok hooks and Amp/OpenCode global plugins are available.",
+            .summary = "Claude/Codex/Cursor/Grok hooks, Amp/OpenCode/Pi global plugins, and FX native lifecycle reporting are available.",
         });
         return;
     }
@@ -2331,7 +2357,7 @@ fn printIntegrationsDoctor(allocator: std.mem.Allocator, out: output.Output, jso
         \\Integration doctor:
         \\  VERDE=1: {s}
         \\  terminal identity: {s}
-        \\  hook installers: claude, codex, cursor project-local/global; grok global; amp/opencode global plugins
+        \\  hook installers: claude, codex, cursor project-local/global; grok global; amp/opencode/pi global plugins; fx built-in
         \\  generic paths: verde notify, OSC 777 notify, MCP surface tools
         \\
     , .{
@@ -2556,6 +2582,57 @@ fn installIntegration(allocator: std.mem.Allocator, out: output.Output, json: bo
             return;
         }
         try out.stdout("verde integrations install grok --global: installed global Grok hooks in ~/.grok/hooks/verde-notify.json\n", .{});
+        return;
+    }
+
+    if (std.mem.eql(u8, provider.name, "pi") and global) {
+        provider_hooks.ensurePiGlobalHooks(allocator) catch |err| {
+            if (json) {
+                try out.jsonValue(allocator, .{
+                    .provider = provider.name,
+                    .action = "install",
+                    .installed = false,
+                    .status = "error",
+                    .scope = "global",
+                    .reason = @errorName(err),
+                });
+                return;
+            }
+            try out.stderr("verde integrations install pi --global: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        if (json) {
+            try out.jsonValue(allocator, .{
+                .provider = provider.name,
+                .action = "install",
+                .installed = true,
+                .status = "installed",
+                .scope = "global",
+                .path = "~/.pi/agent/extensions/verde-notify.ts",
+            });
+            return;
+        }
+        try out.stdout("verde integrations install pi --global: installed global Pi extension in ~/.pi/agent/extensions/verde-notify.ts\n", .{});
+        return;
+    }
+
+    if (std.mem.eql(u8, provider.name, "fx")) {
+        const installed = process_env.commandExists("fx");
+        if (json) {
+            try out.jsonValue(allocator, .{
+                .provider = provider.name,
+                .action = "install",
+                .installed = installed,
+                .status = if (installed) "installed" else "provider_missing",
+                .scope = "built-in",
+            });
+            return;
+        }
+        if (!installed) {
+            try out.stderr("verde integrations install fx: FX is not installed\n", .{});
+            std.process.exit(1);
+        }
+        try out.stdout("verde integrations install fx: FX lifecycle and terminal-title reporting are built in; no hook file is required\n", .{});
         return;
     }
 
@@ -9291,7 +9368,7 @@ test "daemon-first chat validation requires canonical identity and setting types
 }
 
 test "stale GUI validation falls back only for unsupported methods" {
-    try std.testing.expectEqual(@as(u32, 23), sessionizer.PROTOCOL_VERSION);
+    try std.testing.expectEqual(@as(u32, 24), sessionizer.PROTOCOL_VERSION);
     const allocator = std.testing.allocator;
     const cases = [_]struct { payload: []const u8, expected: ChatOpenValidationRoute }{
         .{

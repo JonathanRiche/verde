@@ -67,6 +67,8 @@ pub const integration_providers = [_][]const u8{
     "opencode",
     "cursor",
     "grok",
+    "pi",
+    "fx",
 };
 
 pub const session_commands = [_][]const u8{

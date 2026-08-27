@@ -32,6 +32,9 @@ const CURSOR_WINDOWS_PROJECT_HOOK_REL_PATH = ".cursor/hooks/verde-cursor-notify-
 const CURSOR_HOOKS_JSON_REL_PATH = ".cursor/hooks.json";
 const CURSOR_HOOK_EVENTS = [_][]const u8{ "sessionStart", "beforeSubmitPrompt", "preToolUse", "subagentStart", "subagentStop", "stop" };
 
+const PI_GLOBAL_PLUGIN_REL = ".pi/agent/extensions/verde-notify.ts";
+const PI_GLOBAL_PLUGIN_NEEDLE = "verde-pi-notify-extension";
+
 // Command hooks run in separate processes and can overlap. This state machine
 // serializes updates by Verde pane, deduplicates hooks merged at both global
 // and project scope, and keeps the parent status authoritative while children
@@ -426,8 +429,8 @@ fn claudeSettingsIsManaged(content: []const u8) bool {
 }
 
 fn writeClaudeHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
-    // Drives Verde surface status (working/waiting/done) for the pips. It does
-    // not set a title, so the live OSC session summary remains the pane label.
+    // Drives Verde surface status and supplies a stable prompt-derived title;
+    // Claude's OSC title is often only the generic "Claude Code" label.
     const script = if (builtin.os.tag == .windows) claudePowerShellHookScript() else
         \\#!/bin/sh
         \\# verde-claude-notify-hook
@@ -442,9 +445,18 @@ fn writeClaudeHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const
         \\
     ++ POSIX_AGENT_ACTIVITY_STATE ++
         \\activity=""
+        \\title=""
         \\case "$event" in
         \\  SessionStart) activity="session-start" ;;
-        \\  UserPromptSubmit) activity="parent-working" ;;
+        \\  UserPromptSubmit)
+        \\    activity="parent-working"
+        \\    if command -v jq >/dev/null 2>&1; then
+        \\      title="$(jq -r '.prompt // empty' "$payload" 2>/dev/null)"
+        \\    else
+        \\      title="$(sed -n 's/.*"prompt"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$payload" | head -n 1)"
+        \\    fi
+        \\    title="$(printf '%s' "$title" | tr '\n\t' '  ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]][[:space:]]*/ /g' | cut -c1-72)"
+        \\    ;;
         \\  Notification)
         \\    # Claude fires Notification for both permission requests and the
         \\    # idle "waiting for your input" nudge. Only the former needs you.
@@ -474,7 +486,11 @@ fn writeClaudeHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const
         \\  fi
         \\fi
         \\
-        \\"$cli" notify --quiet --status "$status" --provider claude >/dev/null 2>&1 || true
+        \\if [ -n "$title" ]; then
+        \\  "$cli" notify --quiet --status "$status" --title "$title" --provider claude >/dev/null 2>&1 || true
+        \\else
+        \\  "$cli" notify --quiet --status "$status" --provider claude >/dev/null 2>&1 || true
+        \\fi
         \\rm -f "$payload"
         \\exit 0
         \\
@@ -713,9 +729,16 @@ fn claudePowerShellHookScript() []const u8 {
     ++ POWERSHELL_AGENT_ACTIVITY_STATE ++
         \\$eventName = if ($null -ne $payload -and $null -ne $payload.hook_event_name) { [string]$payload.hook_event_name } elseif ($args.Count -gt 0) { [string]$args[0] } else { '' }
         \\$activity = ''
+        \\$title = ''
         \\switch ($eventName) {
         \\  'SessionStart' { $activity = 'session-start' }
-        \\  'UserPromptSubmit' { $activity = 'parent-working' }
+        \\  'UserPromptSubmit' {
+        \\    $activity = 'parent-working'
+        \\    if ($null -ne $payload -and $null -ne $payload.prompt) {
+        \\      $title = [regex]::Replace([string]$payload.prompt, '\s+', ' ').Trim()
+        \\      if ($title.Length -gt 72) { $title = $title.Substring(0, 72) }
+        \\    }
+        \\  }
         \\  'Notification' {
         \\    $message = if ($null -ne $payload -and $null -ne $payload.message) { [string]$payload.message } else { '' }
         \\    if ($message -match 'waiting for your input|is idle') { exit 0 }
@@ -730,8 +753,10 @@ fn claudePowerShellHookScript() []const u8 {
         \\if ([string]::IsNullOrWhiteSpace($status)) { exit 0 }
         \\$cli = if ([string]::IsNullOrWhiteSpace($env:VERDE_CLI)) { 'verde.exe' } else { $env:VERDE_CLI }
         \\if ($cli.EndsWith(' (deleted)')) { $cli = $cli.Substring(0, $cli.Length - 10) }
+        \\$notifyArgs = @('notify', '--quiet', '--status', $status, '--provider', 'claude')
+        \\if (-not [string]::IsNullOrWhiteSpace($title)) { $notifyArgs += @('--title', $title) }
         \\# $env:VERDE_LIVE_ENDPOINT is inherited, so the CLI targets the exact named pipe advertised by Verde.
-        \\try { & $cli notify --quiet --status $status --provider claude *> $null } catch {}
+        \\try { & $cli @notifyArgs *> $null } catch {}
         \\exit 0
         \\
     ;
@@ -1426,6 +1451,7 @@ fn writeOpencodePlugin(allocator: std.mem.Allocator, io: std.Io, path: []const u
         \\type SessionNode = {
         \\  parentID?: string;
         \\  status: AgentStatus;
+        \\  title: string;
         \\};
         \\
         \\function inVerdePane(): boolean {
@@ -1442,7 +1468,10 @@ fn writeOpencodePlugin(allocator: std.mem.Allocator, io: std.Io, path: []const u
         \\  const permissionSessions = new Set<string>();
         \\  let activitySeen = false;
         \\  let lastStatus: VerdeStatus | null = null;
+        \\  let lastTitle = '';
         \\  let pending = Promise.resolve();
+        \\  const normalizeTitle = (value: unknown): string =>
+        \\    typeof value === 'string' ? value.replace(/\\s+/g, ' ').trim().slice(0, 72) : '';
         \\
         \\  const paneStatus = (): VerdeStatus | null => {
         \\    for (const node of sessions.values()) {
@@ -1455,32 +1484,45 @@ fn writeOpencodePlugin(allocator: std.mem.Allocator, io: std.Io, path: []const u
         \\    return activitySeen ? 'done' : null;
         \\  };
         \\
+        \\  const paneTitle = (): string => {
+        \\    for (const node of sessions.values()) {
+        \\      if (!node.parentID && node.title) return node.title;
+        \\    }
+        \\    return '';
+        \\  };
+        \\
         \\  const notifyStatus = (): void => {
         \\    if (!inVerdePane()) return;
         \\    const status = paneStatus();
-        \\    if (status === null || status === lastStatus) return;
+        \\    const title = paneTitle();
+        \\    if (status === null || (status === lastStatus && title === lastTitle)) return;
         \\    lastStatus = status;
+        \\    lastTitle = title;
         \\    pending = pending.then(async () => {
         \\      const cli = verdeCli();
         \\      try {
-        \\        await $`${cli} notify --quiet --status ${status} --provider opencode`;
+        \\        if (title) {
+        \\          await $`${cli} notify --quiet --status ${status} --title ${title} --provider opencode`;
+        \\        } else {
+        \\          await $`${cli} notify --quiet --status ${status} --provider opencode`;
+        \\        }
         \\      } catch {
         \\        // Status reporting is best-effort and must not interrupt OpenCode.
         \\      }
         \\    });
         \\  };
         \\
-        \\  const setSessionInfo = (info: { id: string; parentID?: string }): void => {
+        \\  const setSessionInfo = (info: { id: string; parentID?: string; title?: string }): void => {
         \\    const previous = sessions.get(info.id);
         \\    const status = previous?.status ?? (info.parentID ? 'busy' : 'idle');
-        \\    sessions.set(info.id, { parentID: info.parentID, status });
+        \\    sessions.set(info.id, { parentID: info.parentID, status, title: normalizeTitle(info.title) || previous?.title || '' });
         \\    if (info.parentID && status === 'busy') activitySeen = true;
         \\    notifyStatus();
         \\  };
         \\
         \\  const setSessionStatus = (sessionID: string, status: AgentStatus): void => {
         \\    const previous = sessions.get(sessionID);
-        \\    sessions.set(sessionID, { parentID: previous?.parentID, status });
+        \\    sessions.set(sessionID, { parentID: previous?.parentID, status, title: previous?.title ?? '' });
         \\    if (status === 'busy' || status === 'retry') {
         \\      activitySeen = true;
         \\      permissionSessions.delete(sessionID);
@@ -1594,6 +1636,11 @@ fn writeAmpPlugin(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !v
         \\  pending: Promise<void>;
         \\  revision: number;
         \\  subscription: Subscription | null;
+        \\  title: string;
+        \\  titleRevision: number;
+        \\  titleSubscription: Subscription | null;
+        \\  lastStatus: 'idle' | 'working' | 'done' | 'waiting' | 'error' | null;
+        \\  lastTitle: string;
         \\};
         \\
         \\const threadWatches = new Map<string, ThreadWatch>();
@@ -1609,11 +1656,19 @@ fn writeAmpPlugin(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !v
         \\  return raw.endsWith(' (deleted)') ? raw.slice(0, -10) : raw;
         \\}
         \\
-        \\async function notify(amp: PluginAPI, shell: PluginAPI['$'], status: 'idle' | 'working' | 'done' | 'waiting' | 'error'): Promise<void> {
+        \\function normalizeTitle(value: string | null): string {
+        \\  return (value || '').replace(/\\s+/g, ' ').trim().slice(0, 72);
+        \\}
+        \\
+        \\async function notify(amp: PluginAPI, shell: PluginAPI['$'], status: 'idle' | 'working' | 'done' | 'waiting' | 'error', title: string): Promise<void> {
         \\  if (!inVerdePane()) return;
         \\  const cli = verdeCli();
         \\  try {
-        \\    await shell`${cli} notify --quiet --status ${status}`;
+        \\    if (title) {
+        \\      await shell`${cli} notify --quiet --status ${status} --title ${title} --provider amp`;
+        \\    } else {
+        \\      await shell`${cli} notify --quiet --status ${status} --provider amp`;
+        \\    }
         \\  } catch (err) {
         \\    // Best-effort only: Amp should never fail because Verde is absent.
         \\    amp.logger.log(`Verde notify failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -1637,7 +1692,10 @@ fn writeAmpPlugin(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !v
         \\      if (status !== 'waiting') watch.active = false;
         \\      break;
         \\  }
-        \\  await notify(amp, amp.$, status);
+        \\  if (status === watch.lastStatus && watch.title === watch.lastTitle) return;
+        \\  watch.lastStatus = status;
+        \\  watch.lastTitle = watch.title;
+        \\  await notify(amp, amp.$, status, watch.title);
         \\}
         \\
         \\function queueThreadState(amp: PluginAPI, threadId: string, watch: ThreadWatch, state: ThreadState): void {
@@ -1653,6 +1711,14 @@ fn writeAmpPlugin(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !v
         \\      case 'idle':
         \\        break;
         \\    }
+        \\    await notifyThreadStatus(amp, watch);
+        \\  });
+        \\}
+        \\
+        \\function queueThreadTitle(amp: PluginAPI, threadId: string, watch: ThreadWatch, title: string | null): void {
+        \\  watch.pending = watch.pending.then(async () => {
+        \\    if (threadWatches.get(threadId) !== watch) return;
+        \\    watch.title = normalizeTitle(title);
         \\    await notifyThreadStatus(amp, watch);
         \\  });
         \\}
@@ -1732,6 +1798,7 @@ fn writeAmpPlugin(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !v
         \\    const threadId = event.thread.id;
         \\    const previous = threadWatches.get(threadId);
         \\    previous?.subscription?.unsubscribe();
+        \\    previous?.titleSubscription?.unsubscribe();
         \\    if (previous) {
         \\      for (const child of previous.children.values()) child.subscription?.unsubscribe();
         \\    }
@@ -1742,15 +1809,27 @@ fn writeAmpPlugin(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !v
         \\      pending: Promise.resolve(),
         \\      revision: 0,
         \\      subscription: null,
+        \\      title: '',
+        \\      titleRevision: 0,
+        \\      titleSubscription: null,
+        \\      lastStatus: null,
+        \\      lastTitle: '',
         \\    };
         \\    threadWatches.set(threadId, watch);
         \\    watch.subscription = ctx.thread.state.subscribe((state) => {
         \\      watch.revision += 1;
         \\      queueThreadState(amp, threadId, watch, state);
         \\    });
-        \\    const state = await ctx.thread.state.get();
+        \\    watch.titleSubscription = ctx.thread.title.subscribe((title) => {
+        \\      watch.titleRevision += 1;
+        \\      queueThreadTitle(amp, threadId, watch, title);
+        \\    });
+        \\    const [state, title] = await Promise.all([ctx.thread.state.get(), ctx.thread.title.get()]);
         \\    if (threadWatches.get(threadId) === watch && watch.revision === 0) {
         \\      queueThreadState(amp, threadId, watch, state);
+        \\    }
+        \\    if (threadWatches.get(threadId) === watch && watch.titleRevision === 0) {
+        \\      queueThreadTitle(amp, threadId, watch, title);
         \\    }
         \\  });
         \\
@@ -1767,9 +1846,114 @@ fn writeAmpPlugin(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !v
         \\  amp.onDispose(() => {
         \\    for (const watch of threadWatches.values()) {
         \\      watch.subscription?.unsubscribe();
+        \\      watch.titleSubscription?.unsubscribe();
         \\      for (const child of watch.children.values()) child.subscription?.unsubscribe();
         \\    }
         \\    threadWatches.clear();
+        \\  });
+        \\}
+        \\
+    ;
+    try writeFileAtomic(allocator, io, path, plugin, .default_file);
+}
+
+/// True when the managed Pi lifecycle extension is present globally.
+pub fn piGlobalHooksInstalled(allocator: std.mem.Allocator) bool {
+    const home = homeDirAlloc(allocator) catch return false;
+    defer allocator.free(home);
+    const extension_path = std.fs.path.join(allocator, &.{ home, PI_GLOBAL_PLUGIN_REL }) catch return false;
+    defer allocator.free(extension_path);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const content = std.Io.Dir.cwd().readFileAlloc(threaded.io(), extension_path, allocator, .limited(1024 * 1024)) catch return false;
+    defer allocator.free(content);
+    return std.mem.indexOf(u8, content, PI_GLOBAL_PLUGIN_NEEDLE) != null;
+}
+
+/// Installs Pi's managed global lifecycle extension. Pi loads extensions from
+/// ~/.pi/agent/extensions and exposes settled-state and session-name events.
+pub fn ensurePiGlobalHooks(allocator: std.mem.Allocator) !void {
+    const home = homeDirAlloc(allocator) catch return error.NoHomeDir;
+    defer allocator.free(home);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const extension_path = try std.fs.path.join(allocator, &.{ home, PI_GLOBAL_PLUGIN_REL });
+    defer allocator.free(extension_path);
+    try ensureParentDir(threaded.io(), extension_path);
+    try writePiPlugin(allocator, threaded.io(), extension_path);
+}
+
+/// Removes the managed Pi lifecycle extension. Idempotent.
+pub fn removePiGlobalHooks(allocator: std.mem.Allocator) !void {
+    const home = homeDirAlloc(allocator) catch return error.NoHomeDir;
+    defer allocator.free(home);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const extension_path = try std.fs.path.join(allocator, &.{ home, PI_GLOBAL_PLUGIN_REL });
+    defer allocator.free(extension_path);
+    std.Io.Dir.cwd().deleteFile(threaded.io(), extension_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+fn writePiPlugin(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+    const plugin =
+        \\// verde-pi-notify-extension
+        \\import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
+        \\
+        \\type VerdeStatus = 'idle' | 'working' | 'done';
+        \\
+        \\function inVerdePane(): boolean {
+        \\  return process.env.VERDE === '1' && Boolean(process.env.VERDE_SESSION_ID);
+        \\}
+        \\
+        \\function verdeCli(): string {
+        \\  const raw = process.env.VERDE_CLI || (process.platform === 'win32' ? 'verde.exe' : 'verde');
+        \\  return raw.endsWith(' (deleted)') ? raw.slice(0, -10) : raw;
+        \\}
+        \\
+        \\function normalizeTitle(value: string | undefined): string {
+        \\  return (value || '').replace(/\s+/g, ' ').trim().slice(0, 72);
+        \\}
+        \\
+        \\export default function (pi: ExtensionAPI) {
+        \\  let status: VerdeStatus = 'idle';
+        \\  let title = '';
+        \\  let lastStatus: VerdeStatus | null = null;
+        \\  let lastTitle = '';
+        \\
+        \\  const report = async (nextStatus: VerdeStatus, nextTitle?: string): Promise<void> => {
+        \\    status = nextStatus;
+        \\    if (nextTitle !== undefined) title = normalizeTitle(nextTitle);
+        \\    if (!inVerdePane() || (status === lastStatus && title === lastTitle)) return;
+        \\    lastStatus = status;
+        \\    lastTitle = title;
+        \\    const reportedStatus = status;
+        \\    const reportedTitle = title;
+        \\    const args = ['notify', '--quiet', '--status', reportedStatus, '--provider', 'pi'];
+        \\    if (reportedTitle) args.push('--title', reportedTitle);
+        \\    try {
+        \\      await pi.exec(verdeCli(), args, { timeout: 5000 });
+        \\    } catch {
+        \\      // Best-effort only: Pi must continue if Verde is unavailable.
+        \\    }
+        \\  };
+        \\
+        \\  pi.on('session_start', async () => {
+        \\    await report('idle', pi.getSessionName());
+        \\  });
+        \\  pi.on('session_info_changed', async (event) => {
+        \\    await report(status, event.name);
+        \\  });
+        \\  pi.on('before_agent_start', async (event) => {
+        \\    await report('working', pi.getSessionName() || event.prompt);
+        \\  });
+        \\  pi.on('agent_start', async () => {
+        \\    await report('working');
+        \\  });
+        \\  pi.on('agent_settled', async () => {
+        \\    await report('done');
         \\  });
         \\}
         \\
@@ -2209,18 +2393,21 @@ test "PowerShell hooks use inherited transport-neutral endpoint and safe invocat
     const codex_script = codexPowerShellHookScript();
     try std.testing.expect(std.mem.indexOf(u8, codex_script, "$env:VERDE_LIVE_ENDPOINT") != null);
     try std.testing.expect(std.mem.indexOf(u8, codex_script, "& $cli @notifyArgs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, codex_script, "@('--title', $title)") != null);
     try std.testing.expect(std.mem.indexOf(u8, codex_script, "/bin/sh") == null);
 
     const claude_script = claudePowerShellHookScript();
     try std.testing.expect(std.mem.indexOf(u8, claude_script, "$env:VERDE_LIVE_ENDPOINT") != null);
     try std.testing.expect(std.mem.indexOf(u8, claude_script, "ConvertFrom-Json") != null);
-    try std.testing.expect(std.mem.indexOf(u8, claude_script, "& $cli notify") != null);
+    try std.testing.expect(std.mem.indexOf(u8, claude_script, "@('--title', $title)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, claude_script, "& $cli @notifyArgs") != null);
 
     const cursor_script = cursorPowerShellHookScript();
     try std.testing.expect(std.mem.indexOf(u8, cursor_script, "$env:VERDE_LIVE_ENDPOINT") != null);
     try std.testing.expect(std.mem.indexOf(u8, cursor_script, "beforeSubmitPrompt") != null);
     try std.testing.expect(std.mem.indexOf(u8, cursor_script, "--provider") != null);
     try std.testing.expect(std.mem.indexOf(u8, cursor_script, "'cursor'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cursor_script, "@('--title', $title)") != null);
 
     const grok_script = grokPowerShellHookScript();
     try std.testing.expect(std.mem.indexOf(u8, grok_script, "$env:VERDE_LIVE_ENDPOINT") != null);
@@ -2232,6 +2419,69 @@ test "PowerShell hooks use inherited transport-neutral endpoint and safe invocat
     try std.testing.expect(std.mem.indexOf(u8, grok_script, "VERDE_GROK_TITLE_SESSION_ID") != null);
     try std.testing.expect(std.mem.indexOf(u8, grok_script, "Start-Process") != null);
     try std.testing.expect(std.mem.indexOf(u8, grok_script, "'grok'") != null);
+}
+
+test "Claude hook reports a prompt-derived title" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const script_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/claude-hook.sh", .{tmp.sub_path});
+    defer std.testing.allocator.free(script_path);
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+
+    try writeClaudeHookScript(std.testing.allocator, threaded.io(), script_path);
+    const script = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), script_path, std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(script);
+    try std.testing.expect(std.mem.indexOf(u8, script, ".prompt // empty") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "--title \"$title\" --provider claude") != null);
+    if (builtin.os.tag != .windows) {
+        const syntax = try std.process.run(std.testing.allocator, threaded.io(), .{
+            .argv = &.{ "sh", "-n", script_path },
+            .stdout_limit = .limited(1024),
+            .stderr_limit = .limited(8 * 1024),
+        });
+        defer std.testing.allocator.free(syntax.stdout);
+        defer std.testing.allocator.free(syntax.stderr);
+        switch (syntax.term) {
+            .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+            else => return error.UnexpectedHookSyntaxCheckTermination,
+        }
+    }
+}
+
+test "OpenCode plugin reports native session titles" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const plugin_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/verde-opencode-notify.ts", .{tmp.sub_path});
+    defer std.testing.allocator.free(plugin_path);
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+
+    try writeOpencodePlugin(std.testing.allocator, threaded.io(), plugin_path);
+    const plugin = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), plugin_path, std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(plugin);
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "title: normalizeTitle(info.title)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "--title ${title} --provider opencode") != null);
+}
+
+test "Pi extension reports lifecycle and native session titles" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const plugin_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/verde-pi-notify.ts", .{tmp.sub_path});
+    defer std.testing.allocator.free(plugin_path);
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+
+    try writePiPlugin(std.testing.allocator, threaded.io(), plugin_path);
+    const plugin = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), plugin_path, std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(plugin);
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "pi.on('before_agent_start'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "pi.on('agent_settled'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "pi.on('session_info_changed'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "pi.getSessionName() || event.prompt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "await report('working'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "'--provider', 'pi'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "args.push('--title', reportedTitle)") != null);
 }
 
 test "agent activity state accepts opaque Verde session ids" {
@@ -2313,6 +2563,9 @@ test "Amp plugin follows thread state across automatic retries" {
     defer std.testing.allocator.free(plugin);
 
     try std.testing.expect(std.mem.indexOf(u8, plugin, "ctx.thread.state.subscribe") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "ctx.thread.title.subscribe") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "ctx.thread.title.get()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "--title ${title} --provider amp") != null);
     try std.testing.expect(std.mem.indexOf(u8, plugin, "case 'running':") != null);
     try std.testing.expect(std.mem.indexOf(u8, plugin, "case 'awaiting-approval':") != null);
     try std.testing.expect(std.mem.indexOf(u8, plugin, "case 'error':") != null);

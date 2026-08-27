@@ -946,6 +946,17 @@ pub const Dock = struct {
         return tab.pinned_title;
     }
 
+    /// Clears an externally pinned title so the provider's live OSC title is
+    /// authoritative again.
+    pub fn clearActiveTabPinnedTitle(self: *Dock, allocator: std.mem.Allocator) bool {
+        const tab = self.activeTab() orelse return false;
+        const old = tab.pinned_title orelse return false;
+        allocator.free(old);
+        tab.pinned_title = null;
+        self.workspace_changed = true;
+        return true;
+    }
+
     /// Records the provider (tag name) of the agent running in the active tab so
     /// the sidebar can draw its logo after a restart, before the process revives.
     pub fn setActiveTabPinnedProvider(self: *Dock, allocator: std.mem.Allocator, provider: []const u8) bool {
@@ -4532,6 +4543,7 @@ const UnixSession = struct {
         live_socket: ?[:0]const u8 = null,
         sessionizer_socket: ?[:0]const u8 = null,
         cli_path: [:0]const u8,
+        mcp_token: ?[:0]const u8 = null,
 
         fn init(allocator: std.mem.Allocator, options: SessionCreateOptions) !LocalIdentityEnv {
             const project_id = try allocator.dupeZ(u8, options.project_id);
@@ -4553,6 +4565,11 @@ const UnixSession = struct {
                 break :blk try allocator.dupeZ(u8, p);
             };
             errdefer allocator.free(cli_path);
+            const mcp_token = if (options.pref_path) |pref_path|
+                try sessionizer.mcpTokenZAlloc(allocator, pref_path)
+            else
+                null;
+            errdefer if (mcp_token) |value| allocator.free(value);
             var session_id: ?[:0]u8 = null;
             if (options.session_id) |id| {
                 session_id = try allocator.dupeZ(u8, id);
@@ -4578,6 +4595,7 @@ const UnixSession = struct {
                 .live_socket = live_socket,
                 .sessionizer_socket = sessionizer_socket,
                 .cli_path = cli_path,
+                .mcp_token = mcp_token,
             };
         }
 
@@ -4590,6 +4608,7 @@ const UnixSession = struct {
             if (self.live_socket) |value| allocator.free(value);
             if (self.sessionizer_socket) |value| allocator.free(value);
             allocator.free(self.cli_path);
+            if (self.mcp_token) |value| allocator.free(value);
         }
     };
 
@@ -4621,6 +4640,7 @@ const UnixSession = struct {
         }
         if (identity.sessionizer_socket) |value| _ = setenv("VERDE_SESSIONIZER_SOCKET", value.ptr, 1);
         _ = setenv("VERDE_CLI", identity.cli_path.ptr, 1);
+        if (identity.mcp_token) |value| _ = setenv("VERDE_MCP_TOKEN", value.ptr, 1);
         if (identity.sessionizer_socket) |socket_path| if (identity.session_id) |session_id| {
             if (std.c.getenv("HERDR_SOCKET_PATH") == null and std.c.getenv("HERDR_PANE_ID") == null) {
                 _ = setenv("HERDR_SOCKET_PATH", socket_path.ptr, 0);

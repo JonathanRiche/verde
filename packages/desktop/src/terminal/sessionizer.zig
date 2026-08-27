@@ -14,6 +14,7 @@ const db_types = @import("../db/types.zig");
 const process_registry = @import("../daemon/process_registry.zig");
 const daemon_store = @import("../daemon/store.zig");
 const mcp_http = @import("../mcp/http_server.zig");
+const mcp_endpoint = @import("../mcp/endpoint.zig");
 const platform_ipc = @import("../platform/ipc.zig");
 const platform_live_endpoint = @import("../platform/live_endpoint.zig");
 const workspace_identity = @import("../platform/workspace_identity.zig");
@@ -59,7 +60,8 @@ pub const WINDOWS_PIPE_PREFIX = "\\\\.\\pipe\\verde-sessionizer-";
 // chat turns, including turns created through the MCP/headless API.
 // Version 22 adds bounded live-tail replay for large provider event streams.
 // Version 23 makes the authenticated MCP HTTP transport daemon-owned.
-pub const PROTOCOL_VERSION: u32 = 23;
+// Version 24 persists Pi and FX terminal lifecycle provider identities.
+pub const PROTOCOL_VERSION: u32 = 24;
 pub const DEFAULT_COLS: u16 = 120;
 pub const DEFAULT_ROWS: u16 = 30;
 const MAX_OUTPUT_RING: usize = 1024 * 1024;
@@ -1185,6 +1187,17 @@ pub const CreateOptions = struct {
     pref_path: []const u8 = "",
 };
 
+/// Loads the daemon's raw MCP bearer token for inheritance by Verde-owned
+/// terminal children. Provider config stores only the environment name.
+pub fn mcpTokenZAlloc(allocator: std.mem.Allocator, pref_path: []const u8) !?[:0]u8 {
+    if (pref_path.len == 0) return null;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    var endpoint = try mcp_endpoint.load(allocator, threaded.io(), pref_path) orelse return null;
+    defer endpoint.deinit(allocator);
+    return try allocator.dupeSentinel(u8, endpoint.token, 0);
+}
+
 const ChildIdentity = struct {
     session_id: [:0]u8,
     project_id: [:0]u8,
@@ -1194,6 +1207,7 @@ const ChildIdentity = struct {
     live_endpoint: [:0]u8,
     sessionizer_endpoint: [:0]u8,
     cli_path: [:0]u8,
+    mcp_token: ?[:0]u8,
 
     fn init(allocator: std.mem.Allocator, options: CreateOptions) !ChildIdentity {
         const session_id = try allocator.dupeZ(u8, options.session_id);
@@ -1218,6 +1232,8 @@ const ChildIdentity = struct {
 
         const cli_path = try sessionCliPathAlloc(allocator);
         errdefer allocator.free(cli_path);
+        const mcp_token = try mcpTokenZAlloc(allocator, options.pref_path);
+        errdefer if (mcp_token) |value| allocator.free(value);
 
         return .{
             .session_id = session_id,
@@ -1228,6 +1244,7 @@ const ChildIdentity = struct {
             .live_endpoint = live_endpoint,
             .sessionizer_endpoint = sessionizer_endpoint,
             .cli_path = cli_path,
+            .mcp_token = mcp_token,
         };
     }
 
@@ -1240,6 +1257,7 @@ const ChildIdentity = struct {
         allocator.free(self.live_endpoint);
         allocator.free(self.sessionizer_endpoint);
         allocator.free(self.cli_path);
+        if (self.mcp_token) |value| allocator.free(value);
     }
 };
 
@@ -1423,6 +1441,7 @@ const PosixPtyBackend = if (builtin.os.tag == .windows) struct {} else struct {
         _ = setenv("VERDE_LIVE_SOCKET", identity.live_endpoint.ptr, 1);
         _ = setenv("VERDE_SESSIONIZER_SOCKET", identity.sessionizer_endpoint.ptr, 1);
         _ = setenv("VERDE_CLI", identity.cli_path.ptr, 1);
+        if (identity.mcp_token) |value| _ = setenv("VERDE_MCP_TOKEN", value.ptr, 1);
         exposeFxLifecycleSocket(identity.sessionizer_endpoint, identity.session_id);
         if (std.c.getenv("LANG") == null) {
             const lang = childLocaleEnvValue();
@@ -2496,7 +2515,6 @@ pub const Daemon = struct {
         const child_pid = session.child_pid;
         const workspace_id = try arena.dupe(u8, session.project_id);
         const workspace_path = try arena.dupe(u8, session.project_path);
-        const title = try arena.dupe(u8, session.label);
         const provider_thread_id = if (session.fx_provider_thread_id) |value| try arena.dupe(u8, value) else null;
         const dock_id = session.dock_id;
         const pane_id = session.pane_id;
@@ -2535,7 +2553,9 @@ pub const Daemon = struct {
                     .pane_id = pane_id,
                     .provider = FX_LIFECYCLE_AGENT,
                     .provider_thread_id = provider_thread_id,
-                    .title = title,
+                    // FX owns a live OSC title derived from its session name
+                    // or workspace. Do not replace it with the generic label.
+                    .title = "",
                     .status = @tagName(transition),
                     .status_changed_at_ms = changed_at_ms,
                     .completed_at_ms = if (transition == .done) changed_at_ms else 0,

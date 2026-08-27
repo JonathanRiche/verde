@@ -122,6 +122,8 @@ pub const SurfaceProvider = enum(u8) {
     claude = 3,
     grok = 4,
     amp = 5,
+    pi = 6,
+    fx = 7,
 };
 
 pub const SurfaceStatus = enum(u8) {

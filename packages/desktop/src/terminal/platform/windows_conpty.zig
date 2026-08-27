@@ -729,6 +729,7 @@ fn addChildEnvironment(env_map: *std.process.Environ.Map, identity: anytype) !vo
     try env_map.put("VERDE_PANE_ID", identity.pane_id);
     try env_map.put("VERDE_SESSIONIZER_SOCKET", identity.sessionizer_endpoint);
     try env_map.put("VERDE_CLI", identity.cli_path);
+    if (identity.mcp_token) |value| try env_map.put("VERDE_MCP_TOKEN", value);
     if (identity.live_endpoint.len > 0) {
         try env_map.put("VERDE_SOCKET", identity.live_endpoint);
         try env_map.put("VERDE_LIVE_ENDPOINT", identity.live_endpoint);

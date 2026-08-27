@@ -2707,6 +2707,8 @@ fn terminalAgentProviderFromProvider(provider: ?SurfaceProvider) ?TerminalAgentP
         .cursor => .cursor,
         .grok => .grok,
         .amp => .amp,
+        .pi => .pi,
+        .fx => .fx,
     };
 }
 
