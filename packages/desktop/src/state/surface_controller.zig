@@ -241,7 +241,11 @@ fn projectedCompletionBecamePending(previous: *const State, current: *const Surf
     if (!current.completion_pending) return false;
     for (previous.surfaces.items) |surface| {
         if (!std.mem.eql(u8, surface.session_id, current.session_id)) continue;
-        return !surface.completion_pending;
+        // Native reporters can finish between GUI projection polls, leaving the
+        // pending bit true across turns. The timestamp identifies a new edge
+        // while an unchanged timestamp still suppresses replay notifications.
+        return !surface.completion_pending or
+            (current.completed_at_ms > 0 and current.completed_at_ms > surface.completed_at_ms);
     }
     return true;
 }
@@ -344,12 +348,17 @@ test "projected completion edge ignores an already presented completion" {
         .title = @constCast("FX task"),
         .status = .done,
         .completion_pending = true,
+        .completed_at_ms = 100,
     };
     try std.testing.expect(projectedCompletionBecamePending(&previous, &current));
 
     previous.surfaces.items[0].status = .done;
     previous.surfaces.items[0].completion_pending = true;
+    previous.surfaces.items[0].completed_at_ms = current.completed_at_ms;
     try std.testing.expect(!projectedCompletionBecamePending(&previous, &current));
+
+    current.completed_at_ms += 1;
+    try std.testing.expect(projectedCompletionBecamePending(&previous, &current));
 
     current.completion_pending = false;
     try std.testing.expect(!projectedCompletionBecamePending(&previous, &current));
