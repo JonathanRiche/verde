@@ -276,6 +276,39 @@ pub fn ensureCodexProjectHooks(allocator: std.mem.Allocator, project_path: []con
     try writeFileAtomic(allocator, io, hooks_json_path, hooks_json, .default_file);
 }
 
+/// Removes Verde's legacy project-scoped Codex entries while preserving any
+/// unrelated project hooks. Managed TUI launches use the global hook now;
+/// keeping both scopes makes Codex execute every lifecycle event twice.
+pub fn removeCodexProjectHooks(allocator: std.mem.Allocator, project_path: []const u8) !void {
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const hook_path = try std.fs.path.join(allocator, &.{ project_path, codexProjectHookRelPathForOs(builtin.os.tag) });
+    defer allocator.free(hook_path);
+    const hooks_json_path = try std.fs.path.join(allocator, &.{ project_path, CODEX_HOOKS_JSON_REL_PATH });
+    defer allocator.free(hooks_json_path);
+
+    const existing = std.Io.Dir.cwd().readFileAlloc(io, hooks_json_path, allocator, .limited(256 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.Io.Dir.cwd().deleteFile(io, hook_path) catch {};
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(existing);
+
+    const hook_command = try hookCommandAllocForOs(allocator, builtin.os.tag, hook_path);
+    defer allocator.free(hook_command);
+    const updated = try removeCodexHooksFromJson(allocator, existing, hook_command);
+    defer if (updated) |content| allocator.free(content);
+    if (updated) |content| try writeFileAtomic(allocator, io, hooks_json_path, content, .default_file);
+    std.Io.Dir.cwd().deleteFile(io, hook_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
 fn codexHooksJsonIsManaged(content: []const u8) bool {
     return std.mem.indexOf(u8, content, CODEX_HOOK_MARKER) != null or
         std.mem.indexOf(u8, content, CODEX_PROJECT_HOOK_NEEDLE) != null;
@@ -322,6 +355,13 @@ fn writeCodexHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const 
         \\esac
         \\status="$(update_agent_status codex "$activity" working)"
         \\[ -n "$status" ] || { rm -f "$payload"; exit 0; }
+        \\session_key="$(printf '%s' "$VERDE_SESSION_ID" | cksum 2>/dev/null | awk '{print $1 "-" $2}')"
+        \\title_path="${TMPDIR:-/tmp}/verde-agent-status/codex-$session_key/title"
+        \\if [ -n "$title" ]; then
+        \\  printf '%s' "$title" > "$title_path"
+        \\elif [ -f "$title_path" ]; then
+        \\  title="$(cat "$title_path" 2>/dev/null)"
+        \\fi
         \\
         \\cli="${VERDE_CLI:-verde}"
         \\if ! command -v "$cli" >/dev/null 2>&1; then
@@ -704,6 +744,15 @@ fn codexPowerShellHookScript() []const u8 {
         \\}
         \\$status = Update-AgentStatus -Provider 'codex' -Activity $activity -InitialStatus 'working' -PayloadText $payloadText
         \\if ([string]::IsNullOrWhiteSpace($status)) { exit 0 }
+        \\$sessionBytes = [Text.Encoding]::UTF8.GetBytes($env:VERDE_SESSION_ID)
+        \\$sessionSha = [Security.Cryptography.SHA256]::Create()
+        \\try { $sessionFingerprint = [BitConverter]::ToString($sessionSha.ComputeHash($sessionBytes)).Replace('-', '') } finally { $sessionSha.Dispose() }
+        \\$titlePath = Join-Path (Join-Path ([IO.Path]::GetTempPath()) 'verde-agent-status') ('codex-' + $sessionFingerprint + [IO.Path]::DirectorySeparatorChar + 'title')
+        \\if (-not [string]::IsNullOrWhiteSpace($title)) {
+        \\  Set-Content -LiteralPath $titlePath -Value $title -NoNewline -ErrorAction SilentlyContinue
+        \\} elseif (Test-Path -LiteralPath $titlePath) {
+        \\  $title = Get-Content -LiteralPath $titlePath -Raw -ErrorAction SilentlyContinue
+        \\}
         \\$cli = if ([string]::IsNullOrWhiteSpace($env:VERDE_CLI)) { 'verde.exe' } else { $env:VERDE_CLI }
         \\if ($cli.EndsWith(' (deleted)')) { $cli = $cli.Substring(0, $cli.Length - 10) }
         \\$notifyArgs = @('notify', '--quiet', '--status', $status, '--provider', 'codex')
@@ -2274,6 +2323,28 @@ test "ensureCodexProjectHooks accepts existing managed hooks json" {
 
     try ensureCodexProjectHooks(std.testing.allocator, project_path);
     try ensureCodexProjectHooks(std.testing.allocator, project_path);
+}
+
+test "removeCodexProjectHooks removes only Verde lifecycle entries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const project_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(project_path);
+
+    try ensureCodexProjectHooks(std.testing.allocator, project_path);
+    try removeCodexProjectHooks(std.testing.allocator, project_path);
+
+    const hook_path = try std.fs.path.join(std.testing.allocator, &.{ project_path, CODEX_HOOK_REL_PATH });
+    defer std.testing.allocator.free(hook_path);
+    const hooks_json_path = try std.fs.path.join(std.testing.allocator, &.{ project_path, CODEX_HOOKS_JSON_REL_PATH });
+    defer std.testing.allocator.free(hooks_json_path);
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(threaded.io(), hook_path, .{}));
+    const hooks_json = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), hooks_json_path, std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(hooks_json);
+    try std.testing.expect(std.mem.indexOf(u8, hooks_json, hook_path) == null);
 }
 
 test "managed project hooks gain subagent lifecycle events" {

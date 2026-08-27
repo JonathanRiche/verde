@@ -8269,7 +8269,10 @@ pub const AppState = struct {
     fn ensureManagedAgentProjectHooks(self: *AppState, project_path: []const u8, process: *const ManagedProcess) !void {
         if (!(process.kind == .agent and process.hooks)) return;
         switch (process.provider orelse return) {
-            .codex => try provider_hooks.ensureCodexProjectHooks(self.allocator, project_path),
+            .codex => {
+                try provider_hooks.ensureCodexGlobalHooks(self.allocator);
+                try provider_hooks.removeCodexProjectHooks(self.allocator, project_path);
+            },
             .claude => provider_hooks.ensureClaudeGlobalHooks(self.allocator) catch |err| {
                 log.warn("could not install Claude global status hooks: {s}", .{@errorName(err)});
             },
