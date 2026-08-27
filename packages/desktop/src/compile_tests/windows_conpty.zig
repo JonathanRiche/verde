@@ -38,6 +38,7 @@ test "Windows backend keeps an interactive ConPTY session alive" {
             .sessionizer_endpoint = "\\\\.\\pipe\\verde-test",
             .live_endpoint = "",
             .cli_path = "verde.exe",
+            .mcp_token = null,
         },
         80,
         24,
