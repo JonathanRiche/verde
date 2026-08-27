@@ -2972,7 +2972,8 @@ pub const Daemon = struct {
 
         // 3. Store work with NO daemon lock.
         lockStoreService(service);
-        defer service.mutex.unlock();
+        var store_locked = true;
+        defer if (store_locked) service.mutex.unlock();
 
         if (is_status) {
             const store_revision = service.store.storeRevision() catch |err| {
@@ -3054,7 +3055,60 @@ pub const Daemon = struct {
         const write_result = service.store.applyMutation(mutation) catch |err| {
             return try storeErrorResponse(self.allocator, id_value, err);
         };
+        // Hook CLIs persist first and normally follow with a Live request. A
+        // focused pane can acknowledge the projected completion in between,
+        // consuming the notification edge. Deliver CLI surface commits while
+        // their receipt is still current, before replying to the hook process.
+        service.mutex.unlock();
+        store_locked = false;
+        switch (mutation) {
+            .surface_upsert => |request| {
+                if (std.mem.startsWith(u8, request.mutation.request_key, "cli:notify:")) {
+                    self.deliverHookSurfaceToLive(request, write_result);
+                }
+            },
+            else => {},
+        }
         return try okValueResponse(self.allocator, id_value, write_result);
+    }
+
+    fn deliverHookSurfaceToLive(
+        self: *Daemon,
+        request: store_protocol.SurfaceUpsertRequest,
+        write_result: store_protocol.WriteResult,
+    ) void {
+        const endpoint = platform_live_endpoint.alloc(self.allocator, self.pref_path) catch return;
+        defer self.allocator.free(endpoint);
+
+        const surface = request.surface;
+        var request_writer: std.Io.Writer.Allocating = .init(self.allocator);
+        defer request_writer.deinit();
+        var json: std.json.Stringify = .{ .writer = &request_writer.writer, .options = .{} };
+        json.write(.{
+            .id = "hook-lifecycle",
+            .method = "notification.update",
+            .params = .{
+                .session_id = surface.session_id,
+                .workspace_id = surface.workspace_id,
+                .workspace_path = surface.workspace_path,
+                .dock_id = surface.dock_id,
+                .pane_id = surface.pane_id,
+                .provider = surface.provider,
+                .provider_thread_id = surface.provider_thread_id,
+                .title = if (surface.title.len > 0) surface.title else null,
+                .status = surface.status,
+                .event_title = surface.last_event_title,
+                .event_body = surface.last_event_body,
+                .store_request_key = request.mutation.request_key,
+                .store_revision = write_result.store_revision,
+                .store_status_changed_at_ms = surface.status_changed_at_ms,
+                .store_completed_at_ms = surface.completed_at_ms,
+            },
+        }) catch return;
+        const payload = request_writer.toOwnedSlice() catch return;
+        defer self.allocator.free(payload);
+        const response = platform_ipc.requestAlloc(self.allocator, endpoint, payload, .{ .timeout_ms = 500 }) catch return;
+        self.allocator.free(response);
     }
 
     /// core.changes: cursor poll with a real bounded long-poll (M5-P3).

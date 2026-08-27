@@ -15,6 +15,8 @@ pub const OPENCODE_LOGO_BYTES = @embedFile("../assets/opencode-logo-dark.png");
 pub const CODEX_LOGO_BYTES = @embedFile("../assets/OpenAI-white-monoblossom.png");
 pub const CLAUDE_LOGO_BYTES = @embedFile("../assets/claude-logo.png");
 pub const CURSOR_LOGO_BYTES = @embedFile("../assets/editor_logos/cursor.png");
+pub const GROK_LOGO_BYTES = @embedFile("../assets/grok-logo.png");
+pub const AMP_LOGO_BYTES = @embedFile("../assets/amp-logo.png");
 pub const PI_LOGO_BYTES = @embedFile("../assets/pi-logo.png");
 pub const FX_LOGO_BYTES = @embedFile("../assets/fx-logo.png");
 
@@ -325,17 +327,22 @@ fn fireCompletionNotification(self: anytype, surface: *const SurfaceState) void 
     else
         "Task completed";
 
-    const icon: ?notifier.Icon = if (provider) |p| switch (p) {
+    const icon = if (provider) |p| completionNotificationIcon(p) else null;
+
+    notifier.notifyAgentDone(self.allocator, title, body, icon);
+}
+
+fn completionNotificationIcon(provider: SurfaceProvider) ?notifier.Icon {
+    return switch (provider) {
         .codex => .{ .key = "codex", .png_bytes = CODEX_LOGO_BYTES },
         .opencode => .{ .key = "opencode", .png_bytes = OPENCODE_LOGO_BYTES },
         .claude => .{ .key = "claude", .png_bytes = CLAUDE_LOGO_BYTES },
         .cursor => .{ .key = "cursor", .png_bytes = CURSOR_LOGO_BYTES },
+        .grok => .{ .key = "grok", .png_bytes = GROK_LOGO_BYTES },
+        .amp => .{ .key = "amp", .png_bytes = AMP_LOGO_BYTES },
         .pi => .{ .key = "pi", .png_bytes = PI_LOGO_BYTES },
         .fx => .{ .key = "fx", .png_bytes = FX_LOGO_BYTES },
-        .grok, .amp => null,
-    } else null;
-
-    notifier.notifyAgentDone(self.allocator, title, body, icon);
+    };
 }
 
 test "projected completion edge ignores an already presented completion" {
@@ -505,6 +512,14 @@ test "nested provider cannot claim a terminal pinned to another agent" {
     try std.testing.expect(surfaceProviderClaimMatchesPin(.cursor, null));
     try std.testing.expect(surfaceProviderClaimMatchesPin(.cursor, "cursor"));
     try std.testing.expect(!surfaceProviderClaimMatchesPin(.cursor, "amp"));
+}
+
+test "Grok and Amp completion notifications use provider logos" {
+    inline for (.{ SurfaceProvider.grok, SurfaceProvider.amp }) |provider| {
+        const icon = completionNotificationIcon(provider).?;
+        try std.testing.expectEqualStrings(@tagName(provider), icon.key);
+        try std.testing.expect(icon.png_bytes.len > 0);
+    }
 }
 
 test "surface focus clear queues persistence and updates local state immediately" {
