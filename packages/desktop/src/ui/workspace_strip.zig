@@ -195,7 +195,8 @@ pub fn truncatedLabel(buffer: *[LABEL_BUFFER_LEN]u8, label: []const u8, max_w: f
 }
 
 /// Routes a strip click: workspace tabs select through the shared selection
-/// path; the "+" tab opens the existing Add Workspace flow.
+/// path; the "+" tab opens the existing Add Workspace modal and directory
+/// picker (never the blank-path quick-create fallback).
 pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: bool) bool {
     if (!isVisible(state) or !rectContains(strip_rect, x, y)) return false;
     if (!down) return true;
@@ -206,7 +207,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
 pub fn activateHit(state: *runtime.AppState, hit: StripHit) void {
     switch (hit.kind) {
         .workspace => _ = state.selectProjectAtIndex(hit.project_index),
-        .add_workspace => state.openWorkspaceCreator(false),
+        .add_workspace => state.openWorkspaceCreatorWithPicker(false),
     }
 }
 
@@ -304,6 +305,13 @@ fn testState(projects: *std.ArrayList(runtime.Project)) runtime.AppState {
     state.app_config.workspace_tabs = .automatic;
     state.project_controller.projects = projects.*;
     state.project_controller.selected_index = 0;
+    state.project_controller.show_creator = false;
+    state.lifecycle = .{};
+    state.project_directory_browse_requested = false;
+    state.project_directory_picker_create_parent = false;
+    state.project_directory_picker_start_home = false;
+    state.import_path_storage[0] = 0;
+    state.palette_modal_text_focus = .none;
     return state;
 }
 
@@ -462,4 +470,30 @@ test "workspace strip hits resolve workspace tabs and the add-workspace tab" {
     // A hidden strip owns no pointer input even with stale hits.
     state.sidebar_hidden = false;
     try std.testing.expect(!handlePaletteMouseButton(&state, second.x + 1.0, second.y + 1.0, true));
+}
+
+test "workspace strip plus tab dispatches the add-workspace picker, not quick-create" {
+    const allocator = std.testing.allocator;
+    var projects: std.ArrayList(runtime.Project) = .empty;
+    defer {
+        for (projects.items) |*project| project.deinit(allocator);
+        projects.deinit(allocator);
+    }
+    try projects.append(allocator, try runtime.Project.init(allocator, "ws-a", "alpha", "/tmp/alpha", 0));
+    var state = testState(&projects);
+    state.sidebar_collapsed = true;
+
+    activateHit(&state, .{ .rect = .{ .x = 0.0, .y = 0.0, .w = 1.0, .h = 1.0 }, .kind = .add_workspace, .project_index = 0 });
+
+    // Same modal initialization as the sidebar "+": creator open, empty path draft.
+    try std.testing.expect(state.project_controller.show_creator);
+    try std.testing.expectEqual(@as(usize, 0), state.importDirectoryDraft().len);
+    // The normal browse request is queued (create_parent off) and starts at home.
+    try std.testing.expect(state.project_directory_browse_requested);
+    try std.testing.expect(!state.project_directory_picker_create_parent);
+    try std.testing.expect(state.project_directory_picker_start_home);
+    // Nothing is imported or generated until the picker returns a folder; the
+    // strip never expands the sidebar.
+    try std.testing.expectEqual(@as(usize, 1), state.project_controller.projects.items.len);
+    try std.testing.expect(state.sidebar_collapsed);
 }

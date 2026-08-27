@@ -1471,6 +1471,7 @@ pub const Client = struct {
             try stringify.objectField("effort");
             try stringify.write(effort);
         }
+        try writeTurnPolicyOverrides(&stringify, request);
         try stringify.objectField("input");
         try stringify.beginArray();
         try stringify.beginObject();
@@ -3870,6 +3871,65 @@ fn sandboxModeString(value: provider_types.SandboxMode) []const u8 {
         .workspace_write => "workspace-write",
         .danger_full_access => "danger-full-access",
     };
+}
+
+fn writeTurnPolicyOverrides(
+    stringify: *std.json.Stringify,
+    request: provider_types.SendPromptRequest,
+) !void {
+    if (request.approval_policy) |approval_policy| {
+        try stringify.objectField("approvalPolicy");
+        try stringify.write(approvalPolicyString(approval_policy));
+    }
+    if (request.sandbox_mode) |sandbox_mode| {
+        // thread/start accepts the legacy string-valued `sandbox`, while
+        // turn/start requires a SandboxPolicy object. Sending it on every turn
+        // keeps resumed threads aligned with Verde's current access picker.
+        try stringify.objectField("sandboxPolicy");
+        try stringify.beginObject();
+        try stringify.objectField("type");
+        try stringify.write(switch (sandbox_mode) {
+            .workspace_write => "workspaceWrite",
+            .danger_full_access => "dangerFullAccess",
+        });
+        try stringify.endObject();
+    }
+}
+
+test "turn policy overrides preserve supervised and full access on resumed threads" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct {
+        approval_policy: provider_types.ApprovalPolicy,
+        sandbox_mode: provider_types.SandboxMode,
+        expected_approval: []const u8,
+        expected_sandbox_type: []const u8,
+    }{
+        .{ .approval_policy = .on_request, .sandbox_mode = .workspace_write, .expected_approval = "on-request", .expected_sandbox_type = "workspaceWrite" },
+        .{ .approval_policy = .never, .sandbox_mode = .danger_full_access, .expected_approval = "never", .expected_sandbox_type = "dangerFullAccess" },
+    };
+
+    for (cases) |case| {
+        var writer: std.Io.Writer.Allocating = .init(allocator);
+        defer writer.deinit();
+        var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+        try stringify.beginObject();
+        try writeTurnPolicyOverrides(&stringify, .{
+            .prompt = "hi",
+            .approval_policy = case.approval_policy,
+            .sandbox_mode = case.sandbox_mode,
+        });
+        try stringify.endObject();
+        const payload = try writer.toOwnedSlice();
+        defer allocator.free(payload);
+
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(case.expected_approval, parsed.value.object.get("approvalPolicy").?.string);
+        try std.testing.expectEqualStrings(
+            case.expected_sandbox_type,
+            parsed.value.object.get("sandboxPolicy").?.object.get("type").?.string,
+        );
+    }
 }
 
 fn approvalDecisionString(value: provider_types.ApprovalDecision) []const u8 {

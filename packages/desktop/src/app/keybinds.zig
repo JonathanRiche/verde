@@ -12,6 +12,7 @@ pub const NativeKeyboardAction = enum {
     open_default,
     open_editor,
     new_thread,
+    add_workspace,
     command_palette,
     companion,
     toggle_sidebar,
@@ -1287,6 +1288,7 @@ const PREFIX_ACTION_NAMES = [_]PrefixActionName{
     .{ .name = "open_default", .target = .{ .app = .open_default } },
     .{ .name = "open_editor", .target = .{ .app = .open_editor } },
     .{ .name = "new_thread", .target = .{ .app = .new_thread } },
+    .{ .name = "workspace.add", .target = .{ .app = .add_workspace } },
     .{ .name = "new_terminal", .target = .new_terminal },
     .{ .name = "command_palette", .target = .{ .app = .command_palette } },
     .{ .name = "companion", .target = .{ .app = .companion } },
@@ -1371,6 +1373,7 @@ pub fn prefixTargetLabel(buf: []u8, target: PrefixTarget) []const u8 {
             .open_default => "Open project",
             .open_editor => "Open in editor",
             .new_thread => "New thread",
+            .add_workspace => "Add workspace",
             .command_palette => "Command palette",
             .companion => "Companion",
             .toggle_sidebar => "Sidebar",
@@ -1540,12 +1543,12 @@ const DEFAULT_PREFIX_TABLE = [_]DefaultPrefixEntry{
     .{ .accelerator = "Shift+X", .target = "workspace.close_current" },
     .{ .accelerator = "Z", .target = "workspace.toggle_maximize" },
     .{ .accelerator = "I", .target = "workspace.focus_prompt" },
-    .{ .accelerator = "C", .target = "workspace.split_chat_vertical" },
+    .{ .accelerator = "C", .target = "workspace.add" },
     .{ .accelerator = "Shift+C", .target = "workspace.split_chat_horizontal" },
-    .{ .accelerator = "V", .target = "workspace.split_chat_vertical" },
-    .{ .accelerator = "Minus", .target = "workspace.split_chat_horizontal" },
-    .{ .accelerator = "Shift+V", .target = "workspace.split_terminal_vertical" },
-    .{ .accelerator = "Shift+Minus", .target = "workspace.split_terminal_horizontal" },
+    .{ .accelerator = "V", .target = "workspace.split_default_vertical" },
+    .{ .accelerator = "Minus", .target = "workspace.split_default_horizontal" },
+    .{ .accelerator = "Shift+V", .target = "workspace.split_alternate_vertical" },
+    .{ .accelerator = "Shift+Minus", .target = "workspace.split_alternate_horizontal" },
     .{ .accelerator = "H", .target = "workspace.focus_left" },
     .{ .accelerator = "J", .target = "workspace.focus_down" },
     .{ .accelerator = "K", .target = "workspace.focus_up" },
@@ -1638,10 +1641,10 @@ const DEFAULT_NAVIGATE_TABLE = [_]DefaultPrefixEntry{
     .{ .accelerator = "K", .target = "workspace.focus_up" },
     .{ .accelerator = "L", .target = "workspace.focus_right" },
     .{ .accelerator = "C", .target = "new_thread" },
-    .{ .accelerator = "V", .target = "workspace.split_chat_vertical" },
-    .{ .accelerator = "Minus", .target = "workspace.split_chat_horizontal" },
-    .{ .accelerator = "Shift+V", .target = "workspace.split_terminal_vertical" },
-    .{ .accelerator = "Shift+Minus", .target = "workspace.split_terminal_horizontal" },
+    .{ .accelerator = "V", .target = "workspace.split_default_vertical" },
+    .{ .accelerator = "Minus", .target = "workspace.split_default_horizontal" },
+    .{ .accelerator = "Shift+V", .target = "workspace.split_alternate_vertical" },
+    .{ .accelerator = "Shift+Minus", .target = "workspace.split_alternate_horizontal" },
     .{ .accelerator = "X", .target = "workspace.close" },
     .{ .accelerator = "Z", .target = "workspace.toggle_maximize" },
     .{ .accelerator = "P", .target = "command_palette" },
@@ -3135,41 +3138,58 @@ test "default prefix t chords create chat and terminal panes" {
     try std.testing.expect(chat and terminal);
 }
 
-test "default prefix pane tile chords create chat and shifted terminal splits" {
+test "default prefix c opens the workspace creator" {
+    var prefix = try cloneDefaultPrefixConfig(std.testing.allocator);
+    defer prefix.deinit(std.testing.allocator);
+
+    var add_workspace = false;
+    var chat_horizontal = false;
+    for (prefix.bindings.items) |binding| {
+        if (binding.key.eql(.{ .key = .c })) {
+            add_workspace = binding.target == .app and binding.target.app == .add_workspace;
+        }
+        if (binding.key.eql(.{ .shift = true, .key = .c })) {
+            chat_horizontal = binding.target == .app and binding.target.app == .workspace_split_chat_horizontal;
+        }
+    }
+    try std.testing.expect(add_workspace and chat_horizontal);
+}
+
+test "default prefix pane tile chords follow the configured default pane" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
 
-    var chat_vertical = false;
-    var chat_horizontal = false;
-    var terminal_vertical = false;
-    var terminal_horizontal = false;
+    var default_vertical = false;
+    var default_horizontal = false;
+    var alternate_vertical = false;
+    var alternate_horizontal = false;
     for (config.prefix.bindings.items) |binding| {
         if (binding.key.eql(.{ .key = .v })) {
-            chat_vertical = binding.target == .app and binding.target.app == .workspace_split_chat_vertical;
+            default_vertical = binding.target == .split_default_vertical;
         }
         if (binding.key.eql(.{ .key = .minus })) {
-            chat_horizontal = binding.target == .app and binding.target.app == .workspace_split_chat_horizontal;
+            default_horizontal = binding.target == .split_default_horizontal;
         }
         if (binding.key.eql(.{ .shift = true, .key = .v })) {
-            terminal_vertical = binding.target == .app and binding.target.app == .workspace_split_terminal_vertical;
+            alternate_vertical = binding.target == .split_alternate_vertical;
         }
         if (binding.key.eql(.{ .shift = true, .key = .minus })) {
-            terminal_horizontal = binding.target == .app and binding.target.app == .workspace_split_terminal_horizontal;
+            alternate_horizontal = binding.target == .split_alternate_horizontal;
         }
     }
-    try std.testing.expect(chat_vertical and chat_horizontal and terminal_vertical and terminal_horizontal);
+    try std.testing.expect(default_vertical and default_horizontal and alternate_vertical and alternate_horizontal);
 
-    var navigate_chat_vertical = false;
-    var navigate_chat_horizontal = false;
-    var navigate_terminal_vertical = false;
-    var navigate_terminal_horizontal = false;
+    var navigate_default_vertical = false;
+    var navigate_default_horizontal = false;
+    var navigate_alternate_vertical = false;
+    var navigate_alternate_horizontal = false;
     for (config.prefix.navigate.items) |binding| {
-        if (binding.key.eql(.{ .key = .v })) navigate_chat_vertical = binding.target == .app and binding.target.app == .workspace_split_chat_vertical;
-        if (binding.key.eql(.{ .key = .minus })) navigate_chat_horizontal = binding.target == .app and binding.target.app == .workspace_split_chat_horizontal;
-        if (binding.key.eql(.{ .shift = true, .key = .v })) navigate_terminal_vertical = binding.target == .app and binding.target.app == .workspace_split_terminal_vertical;
-        if (binding.key.eql(.{ .shift = true, .key = .minus })) navigate_terminal_horizontal = binding.target == .app and binding.target.app == .workspace_split_terminal_horizontal;
+        if (binding.key.eql(.{ .key = .v })) navigate_default_vertical = binding.target == .split_default_vertical;
+        if (binding.key.eql(.{ .key = .minus })) navigate_default_horizontal = binding.target == .split_default_horizontal;
+        if (binding.key.eql(.{ .shift = true, .key = .v })) navigate_alternate_vertical = binding.target == .split_alternate_vertical;
+        if (binding.key.eql(.{ .shift = true, .key = .minus })) navigate_alternate_horizontal = binding.target == .split_alternate_horizontal;
     }
-    try std.testing.expect(navigate_chat_vertical and navigate_chat_horizontal and navigate_terminal_vertical and navigate_terminal_horizontal);
+    try std.testing.expect(navigate_default_vertical and navigate_default_horizontal and navigate_alternate_vertical and navigate_alternate_horizontal);
 }
 
 test "prefix shorthand bool and string overrides" {

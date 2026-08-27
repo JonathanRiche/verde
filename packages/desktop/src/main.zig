@@ -641,10 +641,10 @@ fn mainInner(init: std.process.Init) !void {
         }.run, .{ &state, &terminal_needs_render });
         if (app_config_poll_cadence.shouldRun(monotonicMs(), APP_CONFIG_POLL_INTERVAL_MS)) {
             recordSpan(&frame_sample, .poll_config, struct {
-                fn run(app_state: *AppState) void {
-                    pollAppConfigFileChanges(app_state);
+                fn run(app_state: *AppState, kb: *keybinds.NativeKeyboardConfig) void {
+                    pollAppConfigFileChanges(app_state, kb);
                 }
-            }.run, .{&state});
+            }.run, .{ &state, &keyboard });
         }
         if (state.app_config_runtime_sync_pending) {
             state.app_config_runtime_sync_pending = false;
@@ -1990,11 +1990,11 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                     if (state.pasteClipboardTextIntoPaletteComposer()) return true;
                 }
             }
-            // The command palette must open from anywhere — including while
-            // the composer or a terminal owns focus — so it dispatches before
-            // the focus-dependent routing below.
+            // Palette and config refresh must win from anywhere — including
+            // while a TUI owns focus — so Ctrl+Shift+R is not typed into
+            // Claude/Codex as a redraw chord.
             if (action) |resolved_action| {
-                if (resolved_action == .command_palette) {
+                if (resolved_action == .command_palette or resolved_action == .refresh) {
                     handleKeyboardAction(state, keyboard, resolved_action);
                     syncWindowTextInput(window, state);
                     return true;
@@ -3053,6 +3053,7 @@ fn handleKeyboardAction(
         .open_default => state.openCurrentProjectEditor(.configured),
         .open_editor => state.openCurrentProjectEditor(.configured),
         .new_thread => _ = openHotkeyWorkspaceChatThread(state),
+        .add_workspace => state.openWorkspaceCreator(true),
         .command_palette => {
             const scope_project = if (state.project_controller.projects.items.len > 0 and
                 state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout.visiblePaneCount() == 0)
@@ -3542,7 +3543,7 @@ fn applyAppConfigRuntime(state: *AppState) void {
     runtime_log.diagnostic("apply app config runtime done", .{});
 }
 
-fn pollAppConfigFileChanges(state: *AppState) void {
+fn pollAppConfigFileChanges(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig) void {
     const next_mtime = app_config.configFileMtime(state.allocator) catch return;
     if (state.app_config_file_mtime < 0) {
         state.app_config_file_mtime = next_mtime;
@@ -3550,12 +3551,9 @@ fn pollAppConfigFileChanges(state: *AppState) void {
     }
     if (next_mtime == state.app_config_file_mtime) return;
 
-    state.app_config_file_mtime = next_mtime;
-    state.reloadAppConfigFromDisk() catch |err| {
-        log.warn("failed to reload app config: {s}", .{@errorName(err)});
-        return;
-    };
-    applyAppConfigRuntime(state);
+    // Prefix bindings live in the same file as ui/theme. Reloading only
+    // AppConfig left `keybinds.prefix.bindings` stale after an in-app edit.
+    reloadApplication(state, keyboard);
 }
 
 fn reloadApplication(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig) void {

@@ -14,6 +14,7 @@ import { Route as LlmsDottxtRouteImport } from './routes/llms[.]txt'
 import { Route as LlmsFullDottxtRouteImport } from './routes/llms-full[.]txt'
 import { Route as InstallDotshRouteImport } from './routes/install[.]sh'
 import { Route as InstallDotps1RouteImport } from './routes/install[.]ps1'
+import { Route as ConfigDotschemaDotjsonRouteImport } from './routes/config[.]schema[.]json'
 import { Route as AboutRouteImport } from './routes/about'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as DocsIndexRouteImport } from './routes/docs/index'
@@ -45,6 +46,11 @@ const InstallDotps1Route = InstallDotps1RouteImport.update({
   path: '/install.ps1',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ConfigDotschemaDotjsonRoute = ConfigDotschemaDotjsonRouteImport.update({
+  id: '/config.schema.json',
+  path: '/config.schema.json',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const AboutRoute = AboutRouteImport.update({
   id: '/about',
   path: '/about',
@@ -74,6 +80,7 @@ const DocsSlugRoute = DocsSlugRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/about': typeof AboutRoute
+  '/config.schema.json': typeof ConfigDotschemaDotjsonRoute
   '/install.ps1': typeof InstallDotps1Route
   '/install.sh': typeof InstallDotshRoute
   '/llms-full.txt': typeof LlmsFullDottxtRoute
@@ -86,6 +93,7 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/about': typeof AboutRoute
+  '/config.schema.json': typeof ConfigDotschemaDotjsonRoute
   '/install.ps1': typeof InstallDotps1Route
   '/install.sh': typeof InstallDotshRoute
   '/llms-full.txt': typeof LlmsFullDottxtRoute
@@ -99,6 +107,7 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/about': typeof AboutRoute
+  '/config.schema.json': typeof ConfigDotschemaDotjsonRoute
   '/install.ps1': typeof InstallDotps1Route
   '/install.sh': typeof InstallDotshRoute
   '/llms-full.txt': typeof LlmsFullDottxtRoute
@@ -113,6 +122,7 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/about'
+    | '/config.schema.json'
     | '/install.ps1'
     | '/install.sh'
     | '/llms-full.txt'
@@ -125,6 +135,7 @@ export interface FileRouteTypes {
   to:
     | '/'
     | '/about'
+    | '/config.schema.json'
     | '/install.ps1'
     | '/install.sh'
     | '/llms-full.txt'
@@ -137,6 +148,7 @@ export interface FileRouteTypes {
     | '__root__'
     | '/'
     | '/about'
+    | '/config.schema.json'
     | '/install.ps1'
     | '/install.sh'
     | '/llms-full.txt'
@@ -150,6 +162,7 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AboutRoute: typeof AboutRoute
+  ConfigDotschemaDotjsonRoute: typeof ConfigDotschemaDotjsonRoute
   InstallDotps1Route: typeof InstallDotps1Route
   InstallDotshRoute: typeof InstallDotshRoute
   LlmsFullDottxtRoute: typeof LlmsFullDottxtRoute
@@ -197,6 +210,13 @@ declare module '@tanstack/solid-router' {
       preLoaderRoute: typeof InstallDotps1RouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/config.schema.json': {
+      id: '/config.schema.json'
+      path: '/config.schema.json'
+      fullPath: '/config.schema.json'
+      preLoaderRoute: typeof ConfigDotschemaDotjsonRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/about': {
       id: '/about'
       path: '/about'
@@ -238,6 +258,7 @@ declare module '@tanstack/solid-router' {
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AboutRoute: AboutRoute,
+  ConfigDotschemaDotjsonRoute: ConfigDotschemaDotjsonRoute,
   InstallDotps1Route: InstallDotps1Route,
   InstallDotshRoute: InstallDotshRoute,
   LlmsFullDottxtRoute: LlmsFullDottxtRoute,
