@@ -2539,43 +2539,110 @@ pub const Daemon = struct {
             sequence,
         });
         const changed_at_ms = nowMs();
-        lockStoreService(service);
-        defer service.mutex.unlock();
-        const write_result = switch (transition) {
-            .clear => service.store.clearSurface(.{
-                .mutation = .{ .request_key = request_key, .client_id = "daemon" },
-                .session_id = session_id,
-                .workspace_id = workspace_id,
-            }),
-            .working, .waiting, .done => service.store.upsertSurface(.{
-                .mutation = .{ .request_key = request_key, .client_id = "daemon" },
-                .surface = .{
+        const write_result = write: {
+            lockStoreService(service);
+            defer service.mutex.unlock();
+            break :write switch (transition) {
+                .clear => service.store.clearSurface(.{
+                    .mutation = .{ .request_key = request_key, .client_id = "daemon" },
                     .session_id = session_id,
                     .workspace_id = workspace_id,
-                    .workspace_path = workspace_path,
-                    .dock_id = dock_id,
-                    .pane_id = pane_id,
-                    .provider = FX_LIFECYCLE_AGENT,
-                    .provider_thread_id = provider_thread_id,
-                    // FX owns a live OSC title derived from its session name
-                    // or workspace. Do not replace it with the generic label.
-                    .title = "",
-                    .status = @tagName(transition),
-                    .status_changed_at_ms = changed_at_ms,
-                    .completed_at_ms = if (transition == .done) changed_at_ms else 0,
-                    .last_event_title = switch (transition) {
-                        .working => "FX working",
-                        .waiting => "FX needs attention",
-                        .done => "FX finished",
-                        .clear => unreachable,
+                }),
+                .working, .waiting, .done => service.store.upsertSurface(.{
+                    .mutation = .{ .request_key = request_key, .client_id = "daemon" },
+                    .surface = .{
+                        .session_id = session_id,
+                        .workspace_id = workspace_id,
+                        .workspace_path = workspace_path,
+                        .dock_id = dock_id,
+                        .pane_id = pane_id,
+                        .provider = FX_LIFECYCLE_AGENT,
+                        .provider_thread_id = provider_thread_id,
+                        // FX owns a live OSC title derived from its session name
+                        // or workspace. Do not replace it with the generic label.
+                        .title = "",
+                        .status = @tagName(transition),
+                        .status_changed_at_ms = changed_at_ms,
+                        .completed_at_ms = if (transition == .done) changed_at_ms else 0,
+                        .last_event_title = switch (transition) {
+                            .working => "FX working",
+                            .waiting => "FX needs attention",
+                            .done => "FX finished",
+                            .clear => unreachable,
+                        },
                     },
-                },
-            }),
-        } catch |err| return try storeErrorResponse(self.allocator, id_value, err);
+                }),
+            } catch |err| return try storeErrorResponse(self.allocator, id_value, err);
+        };
+        // Hook-backed providers deliver this presentation update directly to
+        // the GUI after their durable write. Do the same for FX so a focused
+        // completion cannot be acknowledged before the notifier observes it.
+        if (transition != .clear) self.deliverFxLifecycleToLive(.{
+            .session_id = session_id,
+            .workspace_id = workspace_id,
+            .workspace_path = workspace_path,
+            .dock_id = dock_id,
+            .pane_id = pane_id,
+            .provider_thread_id = provider_thread_id,
+            .status = @tagName(transition),
+            .request_key = request_key,
+            .store_revision = write_result.store_revision,
+            .changed_at_ms = changed_at_ms,
+        });
         return try okValueResponse(self.allocator, id_value, .{
             .accepted = true,
             .store_revision = write_result.store_revision,
         });
+    }
+
+    const FxLiveLifecycle = struct {
+        session_id: []const u8,
+        workspace_id: []const u8,
+        workspace_path: []const u8,
+        dock_id: u32,
+        pane_id: u32,
+        provider_thread_id: ?[]const u8,
+        status: []const u8,
+        request_key: []const u8,
+        store_revision: u64,
+        changed_at_ms: i64,
+    };
+
+    fn deliverFxLifecycleToLive(self: *Daemon, lifecycle: FxLiveLifecycle) void {
+        const endpoint = platform_live_endpoint.alloc(self.allocator, self.pref_path) catch return;
+        defer self.allocator.free(endpoint);
+
+        var request_writer: std.Io.Writer.Allocating = .init(self.allocator);
+        defer request_writer.deinit();
+        var json: std.json.Stringify = .{ .writer = &request_writer.writer, .options = .{} };
+        json.write(.{
+            .id = "fx-lifecycle",
+            .method = "notification.update",
+            .params = .{
+                .session_id = lifecycle.session_id,
+                .workspace_id = lifecycle.workspace_id,
+                .workspace_path = lifecycle.workspace_path,
+                .dock_id = lifecycle.dock_id,
+                .pane_id = lifecycle.pane_id,
+                .provider = FX_LIFECYCLE_AGENT,
+                .provider_thread_id = lifecycle.provider_thread_id,
+                .status = lifecycle.status,
+                .event_title = if (std.mem.eql(u8, lifecycle.status, "working"))
+                    "FX working"
+                else if (std.mem.eql(u8, lifecycle.status, "waiting"))
+                    "FX needs attention"
+                else
+                    "FX finished",
+                .store_request_key = lifecycle.request_key,
+                .store_revision = lifecycle.store_revision,
+                .store_status_changed_at_ms = lifecycle.changed_at_ms,
+                .store_completed_at_ms = if (std.mem.eql(u8, lifecycle.status, "done")) lifecycle.changed_at_ms else 0,
+            },
+        }) catch return;
+        const request = request_writer.toOwnedSlice() catch return;
+        defer self.allocator.free(request);
+        const response = platform_ipc.requestAlloc(self.allocator, endpoint, request, .{ .timeout_ms = 500 }) catch return;
+        self.allocator.free(response);
     }
 
     /// Store request pipeline. Caller must NOT hold lockDaemon: this path takes

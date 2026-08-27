@@ -15,6 +15,8 @@ pub const OPENCODE_LOGO_BYTES = @embedFile("../assets/opencode-logo-dark.png");
 pub const CODEX_LOGO_BYTES = @embedFile("../assets/OpenAI-white-monoblossom.png");
 pub const CLAUDE_LOGO_BYTES = @embedFile("../assets/claude-logo.png");
 pub const CURSOR_LOGO_BYTES = @embedFile("../assets/editor_logos/cursor.png");
+pub const PI_LOGO_BYTES = @embedFile("../assets/pi-logo.png");
+pub const FX_LOGO_BYTES = @embedFile("../assets/fx-logo.png");
 
 fn unixTimestampMs() i64 {
     return platform_runtime.unixTimestampMs();
@@ -328,7 +330,9 @@ fn fireCompletionNotification(self: anytype, surface: *const SurfaceState) void 
         .opencode => .{ .key = "opencode", .png_bytes = OPENCODE_LOGO_BYTES },
         .claude => .{ .key = "claude", .png_bytes = CLAUDE_LOGO_BYTES },
         .cursor => .{ .key = "cursor", .png_bytes = CURSOR_LOGO_BYTES },
-        .grok, .amp, .pi, .fx => null,
+        .pi => .{ .key = "pi", .png_bytes = PI_LOGO_BYTES },
+        .fx => .{ .key = "fx", .png_bytes = FX_LOGO_BYTES },
+        .grok, .amp => null,
     } else null;
 
     notifier.notifyAgentDone(self.allocator, title, body, icon);
