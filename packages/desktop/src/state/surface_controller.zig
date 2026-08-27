@@ -143,6 +143,12 @@ pub fn updateSurface(self: anytype, update: SurfaceUpdate) !*SurfaceState {
         // logo after a restart, before the agent process revives.
         if (dock) |surface_dock| {
             _ = surface_dock.setActiveTabPinnedProvider(self.allocator, @tagName(value));
+            // FX already maintains a native session/workspace OSC title. Its
+            // lifecycle bridge must not pin the generic process label over it.
+            if (value == .fx and (update.title == null or update.title.?.len == 0)) {
+                try replaceOwnedSlice(self.allocator, &s.title, "");
+                _ = surface_dock.clearActiveTabPinnedTitle(self.allocator);
+            }
         }
     }
     if (update.provider_thread_id) |value| try replaceOwnedOptionalSlice(self.allocator, &s.provider_thread_id, value);
@@ -154,9 +160,8 @@ pub fn updateSurface(self: anytype, update: SurfaceUpdate) !*SurfaceState {
         if (value.len > 0) {
             if (terminalDockForSurface(self, s)) |dock| {
                 _ = dock.setActiveTabPinnedTitle(self.allocator, value);
-                // Codex and Cursor provide titles on their prompt-submit
-                // hooks, making this authoritative first-turn activity even
-                // when the prompt was submitted without a local Enter event.
+                // Provider hooks/plugins can supply authoritative first-turn
+                // titles even when submission did not use a local Enter event.
                 if (s.provider != null) {
                     _ = dock.noteActiveTabAgentHistory(unixTimestampMs());
                 }
@@ -218,6 +223,27 @@ pub fn updateSurface(self: anytype, update: SurfaceUpdate) !*SurfaceState {
     }
     self.markDirty();
     return s;
+}
+
+/// Fires notifications for completion edges first observed through the daemon
+/// projection. Native reporters such as FX write directly to the daemon store
+/// and therefore do not pass through `notification.update` in the live IPC
+/// server, where hook-backed providers normally trigger the notifier.
+pub fn notifyProjectedCompletionEdges(self: anytype, previous: *const State) void {
+    if (!self.app_config.notifications_enabled) return;
+    for (self.surface_controller.surfaces.items) |*surface| {
+        if (!projectedCompletionBecamePending(previous, surface)) continue;
+        fireCompletionNotification(self, surface);
+    }
+}
+
+fn projectedCompletionBecamePending(previous: *const State, current: *const SurfaceState) bool {
+    if (!current.completion_pending) return false;
+    for (previous.surfaces.items) |surface| {
+        if (!std.mem.eql(u8, surface.session_id, current.session_id)) continue;
+        return !surface.completion_pending;
+    }
+    return true;
 }
 
 pub fn persistedSurfaceState(surface: *const SurfaceState) PersistedSurfaceState {
@@ -298,10 +324,35 @@ fn fireCompletionNotification(self: anytype, surface: *const SurfaceState) void 
         .opencode => .{ .key = "opencode", .png_bytes = OPENCODE_LOGO_BYTES },
         .claude => .{ .key = "claude", .png_bytes = CLAUDE_LOGO_BYTES },
         .cursor => .{ .key = "cursor", .png_bytes = CURSOR_LOGO_BYTES },
-        .grok, .amp => null,
+        .grok, .amp, .pi, .fx => null,
     } else null;
 
     notifier.notifyAgentDone(self.allocator, title, body, icon);
+}
+
+test "projected completion edge ignores an already presented completion" {
+    var previous: State = .{};
+    defer previous.surfaces.deinit(std.testing.allocator);
+    try previous.surfaces.append(std.testing.allocator, .{
+        .session_id = @constCast("fx-session"),
+        .title = @constCast("FX task"),
+        .status = .working,
+    });
+
+    var current: SurfaceState = .{
+        .session_id = @constCast("fx-session"),
+        .title = @constCast("FX task"),
+        .status = .done,
+        .completion_pending = true,
+    };
+    try std.testing.expect(projectedCompletionBecamePending(&previous, &current));
+
+    previous.surfaces.items[0].status = .done;
+    previous.surfaces.items[0].completion_pending = true;
+    try std.testing.expect(!projectedCompletionBecamePending(&previous, &current));
+
+    current.completion_pending = false;
+    try std.testing.expect(!projectedCompletionBecamePending(&previous, &current));
 }
 
 fn surfaceProviderLabel(provider: SurfaceProvider) []const u8 {
@@ -312,6 +363,8 @@ fn surfaceProviderLabel(provider: SurfaceProvider) []const u8 {
         .claude => "Claude",
         .grok => "Grok",
         .amp => "Amp",
+        .pi => "Pi",
+        .fx => "FX",
     };
 }
 

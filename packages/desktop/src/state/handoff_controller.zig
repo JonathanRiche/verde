@@ -81,7 +81,10 @@ fn chatProviderForSurface(provider: db_types.SurfaceProvider) ?Provider {
         .codex => .codex,
         .cursor => .cursor,
         .claude => .claude,
-        .grok, .amp => null,
+        .pi => .pi,
+        .fx => .fx,
+        .grok => .grok,
+        .amp => null,
     };
 }
 

@@ -147,13 +147,15 @@ the complete provider list:
 - User-scoped Verde MCP registration/proxy support: Codex, Claude, Cursor,
   OpenCode, Amp, Pi, FX, and Grok. The source of truth is
   `providers/mcp.zig`; all eight registrations target the authenticated Verde
-  daemon HTTP endpoint. Pi uses a managed extension and FX uses its managed
-  enablement marker rather than the JSON/TOML shapes used by other providers.
-- Managed terminal TUI lifecycle status hooks/plugins: Codex, Claude, Cursor,
-  OpenCode, Amp, and Grok. The source of truth is `providers/hooks.zig` and the
-  CLI `integration_providers` table. Pi and FX do not currently have managed
-  terminal lifecycle hooks. Amp has terminal/MCP integration but is not a
-  native chat provider.
+  daemon HTTP endpoint. Pi uses a managed extension; FX uses its native
+  `~/.fx/mcp.json` profile rather than the JSON/TOML shapes used by the other
+  providers.
+- Managed terminal TUI lifecycle status integrations: Codex, Claude, Cursor,
+  OpenCode, Amp, Grok, Pi, and FX. The source of truth is `providers/hooks.zig`
+  and the CLI `integration_providers` table. Pi uses a global extension; FX
+  reports lifecycle natively through Verde's compatibility endpoint and keeps
+  its own OSC session title authoritative. Amp has terminal/MCP integration but
+  is not a native chat provider.
 
 Keep those sets intentionally distinct. When adding or changing a provider,
 audit every applicable surface instead of copying one provider list blindly:

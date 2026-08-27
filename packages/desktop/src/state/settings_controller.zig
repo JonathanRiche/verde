@@ -114,6 +114,7 @@ pub const HookKind = enum {
     grok,
     amp,
     opencode,
+    pi,
 };
 
 pub fn hookDisplayName(kind: HookKind) []const u8 {
@@ -124,6 +125,7 @@ pub fn hookDisplayName(kind: HookKind) []const u8 {
         .grok => "Grok",
         .amp => "Amp",
         .opencode => "OpenCode",
+        .pi => "Pi",
     };
 }
 
@@ -135,6 +137,7 @@ pub fn hookFailureNotice(kind: HookKind, installing: bool) []const u8 {
         .grok => if (installing) "Could not install Grok hooks." else "Could not remove Grok hooks.",
         .amp => if (installing) "Could not install Amp hooks." else "Could not remove Amp hooks.",
         .opencode => if (installing) "Could not install OpenCode hooks." else "Could not remove OpenCode hooks.",
+        .pi => if (installing) "Could not install Pi hooks." else "Could not remove Pi hooks.",
     };
 }
 
@@ -146,6 +149,7 @@ pub fn hookSuccessNotice(kind: HookKind, installed: bool) []const u8 {
         .grok => if (installed) "Enabled global Grok status hooks." else "Disabled global Grok status hooks.",
         .amp => if (installed) "Enabled global Amp status hooks." else "Disabled global Amp status hooks.",
         .opencode => if (installed) "Enabled global OpenCode status hooks." else "Disabled global OpenCode status hooks.",
+        .pi => if (installed) "Enabled global Pi status hooks." else "Disabled global Pi status hooks.",
     };
 }
 
@@ -166,6 +170,7 @@ pub const State = struct {
     hook_grok_installed: bool = false,
     hook_amp_installed: bool = false,
     hook_opencode_installed: bool = false,
+    hook_pi_installed: bool = false,
     mcp_summary: provider_mcp.Summary = .{},
     scroll_y: f32 = 0.0,
     hover_control: ?u8 = null,
@@ -230,6 +235,11 @@ pub fn toggleOpencodeGlobalHooks(self: anytype) void {
     self.toggleProviderGlobalHooks(.opencode, &self.settings_controller.hook_opencode_installed);
 }
 
+/// Installs or removes the global Pi lifecycle extension.
+pub fn togglePiGlobalHooks(self: anytype) void {
+    self.toggleProviderGlobalHooks(.pi, &self.settings_controller.hook_pi_installed);
+}
+
 pub fn toggleProviderGlobalHooks(self: anytype, provider: HookKind, installed: *bool) void {
     const changing_to_installed = !installed.*;
     const result = if (changing_to_installed)
@@ -240,6 +250,7 @@ pub fn toggleProviderGlobalHooks(self: anytype, provider: HookKind, installed: *
             .grok => provider_hooks.ensureGrokGlobalHooks(self.allocator),
             .amp => provider_hooks.ensureAmpGlobalHooks(self.allocator),
             .opencode => provider_hooks.ensureOpencodeGlobalHooks(self.allocator),
+            .pi => provider_hooks.ensurePiGlobalHooks(self.allocator),
         }
     else switch (provider) {
         .claude => provider_hooks.removeClaudeGlobalHooks(self.allocator),
@@ -248,6 +259,7 @@ pub fn toggleProviderGlobalHooks(self: anytype, provider: HookKind, installed: *
         .grok => provider_hooks.removeGrokGlobalHooks(self.allocator),
         .amp => provider_hooks.removeAmpGlobalHooks(self.allocator),
         .opencode => provider_hooks.removeOpencodeGlobalHooks(self.allocator),
+        .pi => provider_hooks.removePiGlobalHooks(self.allocator),
     };
     result catch |err| {
         log.warn("failed to {s} global {s} hooks: {s}", .{
@@ -395,6 +407,7 @@ pub fn openSettingsModal(self: anytype) void {
     self.settings_controller.hook_grok_installed = provider_hooks.grokGlobalHooksInstalled(self.allocator);
     self.settings_controller.hook_amp_installed = provider_hooks.ampGlobalHooksInstalled(self.allocator);
     self.settings_controller.hook_opencode_installed = provider_hooks.opencodeGlobalHooksInstalled(self.allocator);
+    self.settings_controller.hook_pi_installed = provider_hooks.piGlobalHooksInstalled(self.allocator);
     self.settings_controller.mcp_summary = provider_mcp.inspect(self.allocator);
     self.settings_controller.scroll_y = 0.0;
     self.settings_controller.hover_control = null;

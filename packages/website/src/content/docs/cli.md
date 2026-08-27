@@ -368,9 +368,9 @@ login/auth behavior.
 ```bash
 verde integrations list [--json]
 verde integrations doctor [--json]
-verde integrations install <claude|codex|amp|opencode|cursor|grok> [--global]
-verde integrations remove <claude|codex|amp|opencode|cursor|grok> [--global]
-verde integrations disable <claude|codex|amp|opencode|cursor|grok>
+verde integrations install <claude|codex|amp|opencode|cursor|grok|pi|fx> [--global]
+verde integrations remove <claude|codex|amp|opencode|cursor|grok|pi|fx> [--global]
+verde integrations disable <claude|codex|amp|opencode|cursor|grok|pi|fx>
 ```
 
 - **Claude / Codex** hooks are project-local (`.claude/settings.local.json` / `.codex/hooks.json`); `--global` installs them in `~/.claude/settings.json` / `~/.codex/hooks.json` instead.
@@ -381,8 +381,15 @@ verde integrations disable <claude|codex|amp|opencode|cursor|grok>
   `$GROK_HOME/hooks/verde-notify.json`, defaulting to
   `~/.grok/hooks/verde-notify.json`; install or remove it with `--global`.
 - **Amp** uses a global lifecycle plugin at `~/.config/amp/plugins/verde-notify.ts` (install with `--global`). The plugin is a no-op outside Verde panes.
-- **OpenCode** has no stable managed hook installer yet; `list` and `doctor`
-  report it as unsupported.
+- **OpenCode** uses a global lifecycle plugin at
+  `~/.config/opencode/plugin/verde-notify.ts`.
+- **Pi** uses a global extension at
+  `~/.pi/agent/extensions/verde-notify.ts`. It reports settled lifecycle state
+  and follows `/name` session-title changes, falling back to the submitted
+  prompt before a session is named.
+- **FX** reports lifecycle directly through Verde's built-in compatibility
+  endpoint. Its native session/workspace terminal title remains authoritative,
+  so no hook file is required.
 
 ## Remote workspaces (Herdr)
 

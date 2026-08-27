@@ -5531,6 +5531,7 @@ pub const AppState = struct {
     pub const surfaceBySessionId = surface_controller.surfaceBySessionId;
     pub const surfaceBySessionIdConst = surface_controller.surfaceBySessionIdConst;
     pub const updateSurface = surface_controller.updateSurface;
+    pub const notifyProjectedCompletionEdges = surface_controller.notifyProjectedCompletionEdges;
     pub const clearSurfaceAttentionBySession = surface_controller.clearSurfaceAttentionBySession;
     pub const clearSurfaceAttentionForDock = surface_controller.clearSurfaceAttentionForDock;
     pub const terminalDockSurfaceAttention = surface_controller.terminalDockSurfaceAttention;
@@ -5547,6 +5548,7 @@ pub const AppState = struct {
     pub const toggleGrokGlobalHooks = settings_controller.toggleGrokGlobalHooks;
     pub const toggleAmpGlobalHooks = settings_controller.toggleAmpGlobalHooks;
     pub const toggleOpencodeGlobalHooks = settings_controller.toggleOpencodeGlobalHooks;
+    pub const togglePiGlobalHooks = settings_controller.togglePiGlobalHooks;
     pub const toggleProviderGlobalHooks = settings_controller.toggleProviderGlobalHooks;
     pub const cancelSettingsModal = settings_controller.cancelSettingsModal;
     pub const saveSettingsModal = settings_controller.saveSettingsModal;
@@ -11331,6 +11333,7 @@ pub const AppState = struct {
     ) !void {
         const adoption_repair = self.hasUnresolvedAdoptionRows();
         const observed_revision = self.storage.currentProjectionObservedRevision();
+        const projection_was_initialized = self.lifecycle.projection_baseline != null;
         const baseline_repair = self.lifecycle.projection_baseline == null or
             self.lifecycle.projection_baseline_revision != observed_revision;
         if (!projectionRefreshApplyGate(
@@ -11445,6 +11448,13 @@ pub const AppState = struct {
         self.terminal_controller.daemon_sessions = staged_sessions;
         staged_owned = false;
         sessions_owned = false;
+        // Hook-backed providers also deliver `notification.update` directly
+        // to the GUI. FX reports natively to the daemon, so its completion can
+        // first become visible here. Compare the published replacement with
+        // the prior projection, but never replay durable completions at boot.
+        if (projection_was_initialized) {
+            self.notifyProjectedCompletionEdges(&old_surfaces);
+        }
         clearProjectedDraftMutationsInProjects(self.project_controller.projects.items, result.store_revision);
         clearProjectedDraftMutationsInProjects(self.project_controller.archived_projects.items, result.store_revision);
 

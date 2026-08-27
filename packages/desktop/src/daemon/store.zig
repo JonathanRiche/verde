@@ -3152,7 +3152,7 @@ fn toolCallStatusCode(value: []const u8) !i64 {
 }
 
 fn surfaceProviderCode(value: []const u8) !i64 {
-    const names = [_][]const u8{ "opencode", "codex", "cursor", "claude", "grok", "amp" };
+    const names = [_][]const u8{ "opencode", "codex", "cursor", "claude", "grok", "amp", "pi", "fx" };
     for (names, 0..) |name, index| if (std.mem.eql(u8, value, name)) return @intCast(index);
     return error.InvalidParams;
 }
