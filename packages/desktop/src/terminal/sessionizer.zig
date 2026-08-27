@@ -61,7 +61,9 @@ pub const WINDOWS_PIPE_PREFIX = "\\\\.\\pipe\\verde-sessionizer-";
 // Version 22 adds bounded live-tail replay for large provider event streams.
 // Version 23 makes the authenticated MCP HTTP transport daemon-owned.
 // Version 24 persists Pi and FX terminal lifecycle provider identities.
-pub const PROTOCOL_VERSION: u32 = 24;
+// Version 25 rebinds dedicated FX panes to Verde's lifecycle endpoint even
+// when the desktop itself inherited a real Herdr session.
+pub const PROTOCOL_VERSION: u32 = 25;
 pub const DEFAULT_COLS: u16 = 120;
 pub const DEFAULT_ROWS: u16 = 30;
 const MAX_OUTPUT_RING: usize = 1024 * 1024;
@@ -1442,7 +1444,7 @@ const PosixPtyBackend = if (builtin.os.tag == .windows) struct {} else struct {
         _ = setenv("VERDE_SESSIONIZER_SOCKET", identity.sessionizer_endpoint.ptr, 1);
         _ = setenv("VERDE_CLI", identity.cli_path.ptr, 1);
         if (identity.mcp_token) |value| _ = setenv("VERDE_MCP_TOKEN", value.ptr, 1);
-        exposeFxLifecycleSocket(identity.sessionizer_endpoint, identity.session_id);
+        exposeFxLifecycleSocket(command, identity.sessionizer_endpoint, identity.session_id);
         if (std.c.getenv("LANG") == null) {
             const lang = childLocaleEnvValue();
             _ = setenv("LANG", lang.ptr, 1);
@@ -8940,11 +8942,33 @@ fn fxLifecycleRelease(turn_active: *bool) FxLifecycleTransition {
     return .clear;
 }
 
-fn exposeFxLifecycleSocket(socket_path: [:0]const u8, session_id: [:0]const u8) void {
-    // Preserve a real Herdr binding when Verde itself was launched inside one.
-    if (std.c.getenv("HERDR_SOCKET_PATH") != null or std.c.getenv("HERDR_PANE_ID") != null) return;
-    _ = setenv("HERDR_SOCKET_PATH", socket_path.ptr, 0);
-    _ = setenv("HERDR_PANE_ID", session_id.ptr, 0);
+/// Returns whether a managed terminal command directly launches FX. Shells
+/// retain their real Herdr binding; only an FX child is rebound to Verde's
+/// compatibility endpoint for lifecycle reporting.
+pub fn commandLaunchesFx(command: []const [:0]u8) bool {
+    if (command.len == 0) return false;
+    const raw = command[0];
+    const executable = if (std.mem.findLastAny(u8, raw, "/\\")) |index| raw[index + 1 ..] else raw;
+    return std.ascii.eqlIgnoreCase(executable, "fx") or
+        std.ascii.eqlIgnoreCase(executable, "fx.exe");
+}
+
+fn exposeFxLifecycleSocket(command: []const [:0]u8, socket_path: [:0]const u8, session_id: [:0]const u8) void {
+    if (!commandLaunchesFx(command)) return;
+    // A dedicated FX pane must report to its owning Verde session even when
+    // Verde itself inherited a real Herdr binding from its parent terminal.
+    _ = setenv("HERDR_SOCKET_PATH", socket_path.ptr, 1);
+    _ = setenv("HERDR_PANE_ID", session_id.ptr, 1);
+}
+
+test "FX lifecycle binding applies only to direct FX commands" {
+    const fx_command = [_][:0]const u8{ "fx", "--resume", "session-1" };
+    const fx_exe_command = [_][:0]const u8{ "C:\\Tools\\fx.exe" };
+    const shell_command = [_][:0]const u8{ "bash", "-lc", "fx" };
+    try std.testing.expect(commandLaunchesFx(&fx_command));
+    try std.testing.expect(commandLaunchesFx(&fx_exe_command));
+    try std.testing.expect(!commandLaunchesFx(&shell_command));
+    try std.testing.expect(!commandLaunchesFx(&.{}));
 }
 
 test "FX lifecycle transitions clear startup state and finish active turns" {
