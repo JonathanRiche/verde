@@ -885,6 +885,7 @@ fn syncMouseCursor(state: *AppState, cache: *SystemCursorCache) void {
         (sidebar_ui.wantsPointerAt(state, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) or
             chat_panel_ui.workspaceHeaderWantsPointerAt(state, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) or
             chat_panel_ui.approvalActionWantsPointerAt(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) or
+            chat_panel_ui.backgroundTaskPinWantsPointerAt(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) or
             chat_panel_ui.transcriptActionWantsPointerAt(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) or
             chat_panel_ui.transcriptLinkWantsPointerAt(state, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y)))
     {
@@ -2341,6 +2342,18 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             // The approval card overlays the gap between transcript and
             // composer, so it must receive clicks before pane/browser routing.
             if (event.button.button == 1 and chat_panel_ui.handleApprovalPaletteMouseButton(state, event.button.x, event.button.y, event.button.down)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            // Running background-command cards occupy that same strip so Stop /
+            // Output remain reachable after the stream commits.
+            if (event.button.button == 1 and chat_panel_ui.handleBackgroundTaskPinMouseButton(
+                state,
+                event.button.x,
+                event.button.y,
+                event.button.down,
+                event.button.clicks,
+            )) {
                 syncWindowTextInput(window, state);
                 return true;
             }

@@ -3631,6 +3631,7 @@ pub const Storage = state_storage.Storage;
 /// M5-P4 Amendment 1: display-time filter for committed background
 /// bookkeeping rows (see chat_controller.shouldHideBackgroundTranscriptRow).
 pub const shouldHideBackgroundTranscriptRow = chat_controller.shouldHideBackgroundTranscriptRow;
+pub const backgroundTaskForEventBody = chat_controller.backgroundTaskForEventBody;
 
 pub const SendStatus = chat_types.SendStatus;
 pub const FollowupKind = chat_types.FollowupKind;
@@ -12716,6 +12717,17 @@ pub const AppState = struct {
     }
 
     pub fn recordBackgroundTaskActionForMessage(self: *AppState, rect: palette.Rect, message_index: usize, body: []const u8, action: BackgroundTaskAction) void {
+        self.recordBackgroundTaskActionForMessageWithTask(rect, message_index, body, action, null);
+    }
+
+    pub fn recordBackgroundTaskActionForMessageWithTask(
+        self: *AppState,
+        rect: palette.Rect,
+        message_index: usize,
+        body: []const u8,
+        action: BackgroundTaskAction,
+        live_task_index: ?usize,
+    ) void {
         if (rect.w < 2 or rect.h < 2) return;
         const project_index = self.project_controller.selected_index;
         if (project_index >= self.project_controller.projects.items.len) return;
@@ -12723,6 +12735,19 @@ pub const AppState = struct {
         const thread_index = project.selected_thread_index;
         if (thread_index >= project.threads.items.len) return;
         const thread = &project.threads.items[thread_index];
+
+        if (message_index == std.math.maxInt(usize)) {
+            self.recordBackgroundTaskActionHit(.{
+                .rect = rect,
+                .project_index = project_index,
+                .thread_index = thread_index,
+                .task_index = live_task_index,
+                .message_index = message_index,
+                .body_hash = std.hash.Wyhash.hash(0, body),
+                .action = action,
+            });
+            return;
+        }
 
         // Pending transcript rows are rendered while their send-state mutex is
         // held, so inspect that already-protected list directly. Requiring a
@@ -12736,7 +12761,7 @@ pub const AppState = struct {
             break :blk thread.send_state.pending_events.items[pending_index].body;
         };
         if (!std.mem.eql(u8, rendered_body, body)) return;
-        const task_index = if (chat_controller.backgroundTaskForEventBody(thread, body)) |task|
+        const derived_task_index = if (chat_controller.backgroundTaskForEventBody(thread, body)) |task|
             (@intFromPtr(task) - @intFromPtr(thread.background_tasks.items.ptr)) / @sizeOf(BackgroundTask)
         else
             null;
@@ -12744,7 +12769,7 @@ pub const AppState = struct {
             .rect = rect,
             .project_index = project_index,
             .thread_index = thread_index,
-            .task_index = task_index,
+            .task_index = live_task_index orelse derived_task_index,
             .message_index = message_index,
             .body_hash = std.hash.Wyhash.hash(0, body),
             .action = action,
@@ -12794,11 +12819,18 @@ pub const AppState = struct {
         const task_index = hit.task_index orelse return .{ .task = current_task };
         if (task_index >= thread.background_tasks.items.len) return null;
         const task = &thread.background_tasks.items[task_index];
-        if (current_task != task) return null;
+        // Pinned Ran-command rows keep an explicit task index because their
+        // bodies have no Verde/Codex identity metadata.
+        if (current_task != null and current_task != task) return null;
         return .{ .task = task };
     }
 
     fn resolveBackgroundTaskActionHit(thread: *ChatThread, hit: BackgroundTaskActionHit) ?ResolvedBackgroundTaskAction {
+        if (hit.message_index == std.math.maxInt(usize)) {
+            const task_index = hit.task_index orelse return null;
+            if (task_index >= thread.background_tasks.items.len) return null;
+            return .{ .task = &thread.background_tasks.items[task_index] };
+        }
         if (hit.message_index < thread.messages.items.len) {
             return resolveBackgroundTaskActionBody(thread, hit, thread.messages.items[hit.message_index].body);
         }
