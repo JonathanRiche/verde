@@ -13,8 +13,36 @@ User config is loaded from `$XDG_CONFIG_HOME/verde/verde.json` or
 `%APPDATA%\Verde\verde.json` on Windows. `VERDE_CONFIG` can point to a custom
 file. It is read on startup and on app refresh.
 
+Point JSON language servers at the hosted schema so editors autocomplete and
+validate keys:
+
 ```json
 {
+  "$schema": "https://verdeai.dev/config.schema.json"
+}
+```
+
+The schema is published at [`https://verdeai.dev/config.schema.json`](https://verdeai.dev/config.schema.json).
+Verde ignores `$schema` when loading config, and Settings saves leave the
+pointer in place. VS Code, Zed, Helix, and Neovim's JSON LSP pick it up from
+that field. You can also map the file globally:
+
+```json
+{
+  "json.schemas": [
+    {
+      "fileMatch": ["**/verde/verde.json"],
+      "url": "https://verdeai.dev/config.schema.json"
+    }
+  ]
+}
+```
+
+A complete example:
+
+```json
+{
+  "$schema": "https://verdeai.dev/config.schema.json",
   "theme": {
     "theme": "default",
     "colors": {
@@ -178,10 +206,10 @@ generation failure leaves Verde's prompt-derived fallback title unchanged.
 ## New chat defaults and favorite models
 
 New GUI chats start with `chat.default_provider`, `chat.default_model`, and
-`chat.default_reasoning`. Providers accept `codex`, `claude`, `cursor`, or
-`opencode`; reasoning accepts `default`, `low`, `medium`, `high`, `xhigh`, or
-`max` when the chosen model supports it. These values are also available under
-**Settings → Chat → New chat defaults**.
+`chat.default_reasoning`. Providers accept `codex`, `claude`, `cursor`,
+`opencode`, `pi`, `fx`, or `grok`; reasoning accepts `default`, `low`,
+`medium`, `high`, `xhigh`, or `max` when the chosen model supports it. These
+values are also available under **Settings → Chat → New chat defaults**.
 
 The model picker’s star tab shows only `chat.favorite_models`. Use the star on
 any provider/model row to add or remove it; provider tabs continue to show the

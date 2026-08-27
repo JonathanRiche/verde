@@ -186,6 +186,39 @@ function methodUnavailable(response: { error?: { code: string } }): boolean {
   return code === 'unknown_method' || code === 'method_not_found' || code === 'capability_unavailable'
 }
 
+/// GUI threads from `chat.open` are absent from the daemon store until the
+/// first turn commits. A not-found get is that opening case, not a failed send.
+export function isAbsentDaemonThread(response: { error?: { code?: string }; ok?: boolean }): boolean {
+  if (!(response.error || response.ok === false)) return false
+  const code = response.error?.code
+  return code === 'resource_not_found' || code === 'not_found'
+}
+
+export function threadFromDaemonGet(response: RpcEnvelope): Thread | null {
+  if (response.error || response.ok === false) return null
+  const thread_root = unwrapResult<{ thread?: Thread } & Thread>(response)
+  const thread = thread_root?.thread ?? (thread_root as Thread | null)
+  return thread?.local_thread_id ? thread : null
+}
+
+function openingThreadFromPane(pane: LivePane): Thread {
+  return {
+    local_thread_id: pane.thread_id ?? '',
+    title: pane.thread_title ?? 'New Chat',
+    committed: false,
+    last_activity_at: Date.now(),
+    provider: pane.provider ?? 'codex',
+    harness: 'local_cli',
+    model_ref: pane.model ?? null,
+    reasoning_effort: pane.reasoning_effort ?? null,
+    reasoning_variant: pane.reasoning_variant ?? null,
+    fast_mode: pane.fast_mode ? 'on' : 'off',
+    access_mode: pane.access_mode ?? 'supervised',
+    archived: false,
+    draft: '',
+  }
+}
+
 /// User-initiated RPCs ride HTTP instead of the shared websocket. The gateway
 /// answers websocket RPCs serially in its read loop, so a click issued while
 /// the routine projection sweep is in flight would queue behind a dozen
@@ -2222,7 +2255,11 @@ function createAppStore() {
   const sendDraft = async (pane = focusedChat()) => {
     const current = pane
     const ws = workspace()
-    if (!current || current.kind !== 'chat' || !current.thread_id || !ws) return
+    if (!current || current.kind !== 'chat' || !ws) return
+    if (!current.thread_id) {
+      setNotice('thread is not ready yet')
+      return
+    }
     if (uploadingAttachmentsFor(current) || sending()) return
     const text = draftFor(current).trim()
     const images = [...attachmentsFor(current)]
@@ -2273,13 +2310,14 @@ function createAppStore() {
         workspace_id: current.workspace_id,
         local_thread_id: current.thread_id,
       })
-      if (got.error || got.ok === false) {
+      const thread = threadFromDaemonGet(got)
+      // Opening GUI threads are not in the daemon yet. chat.turn.start creates
+      // that row, so a not-found get must not roll the optimistic submit back.
+      if (!thread && !isAbsentDaemonThread(got) && (got.error || got.ok === false)) {
         rollback()
         setNotice(got.error?.message ?? 'thread is not on the daemon')
         return
       }
-      const thread_root = unwrapResult<{ thread?: Thread } & Thread>(got)
-      const thread = thread_root?.thread ?? (thread_root as Thread | null)
       const stored_title = thread?.title ?? current.thread_title ?? 'New Chat'
       const fallback_prompt = text || (images.length > 0 ? 'Image' : '')
       const thread_title = isOpeningThread(thread, stored_title)
@@ -2437,14 +2475,16 @@ function createAppStore() {
         workspace_id: pane.workspace_id,
         local_thread_id: pane.thread_id,
       })
-      if (got.error || got.ok === false) {
+      const loaded = threadFromDaemonGet(got)
+      if (!loaded && !isAbsentDaemonThread(got) && (got.error || got.ok === false)) {
         setNotice(got.error?.message ?? 'thread is not on the daemon')
         void refreshProjection()
         return
       }
-      const thread_root = unwrapResult<{ thread?: Thread } & Thread>(got)
-      const thread = thread_root?.thread ?? (thread_root as Thread | null)
-      if (!thread?.local_thread_id) {
+      // Opening GUI threads have no daemon row to merge into. Seed one from
+      // the pane so the first model/effort click is not dropped.
+      const thread = loaded ?? openingThreadFromPane(pane)
+      if (!thread.local_thread_id) {
         setNotice('thread is not on the daemon')
         return
       }
@@ -3241,7 +3281,7 @@ function createAppStore() {
     const paletteCommands: Record<string, string> = {
       browser: 'pane.browser', 'terminal.toggle': 'pane.terminal',
       'workspace.toggle_quick_pane': 'pane.quick_toggle', 'chat.model_picker': 'thread.choose_model',
-      'chat.run_config': 'thread.run_config', open: 'workspace.add', open_editor: 'workspace.open_editor',
+      'chat.run_config': 'thread.run_config', open: 'workspace.add', 'workspace.add': 'workspace.add', open_editor: 'workspace.open_editor',
     }
     const command = paletteCommands[action]
     if (command && current) {

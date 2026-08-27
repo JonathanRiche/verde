@@ -87,7 +87,8 @@ between workspaces (see the sidebar table above).
 Workspace splits have no direct default keybinds. With prefix mode enabled,
 `Ctrl+B`, then `t` creates a new chat and `Ctrl+B`, then `Shift+T` creates a
 separate top-level terminal pane. The `v` and `-` prefix chords create tiled
-chat splits; `Shift+V` and `Shift+-` create tiled terminal splits.
+splits of the configured default pane type (chat or terminal);
+`Shift+V` and `Shift+-` create the other type.
 
 You can also use the pane header buttons: `C|` / `C-` for chat vertical /
 horizontal and `T|` / `T-` for terminal vertical / horizontal, or bind any
@@ -220,9 +221,10 @@ The table is overridable exactly like `bindings`, under `"navigate"`:
 | `x` / `Shift+X`                  | `workspace.close` / `workspace.close_current`     |
 | `z`                              | `workspace.toggle_maximize`                       |
 | `i`                              | `workspace.focus_prompt`                          |
-| `c` / `Shift+C`                  | `workspace.split_chat_vertical` / `_horizontal`   |
-| `v` / `-`                        | Chat split, vertical / horizontal                  |
-| `Shift+V` / `Shift+-`            | Terminal split, vertical / horizontal              |
+| `c`                              | `workspace.add` (new workspace)                    |
+| `Shift+C`                        | `workspace.split_chat_horizontal`                  |
+| `v` / `-`                        | Default pane split, vertical / horizontal          |
+| `Shift+V` / `Shift+-`            | Alternate pane split, vertical / horizontal        |
 | `h` `j` `k` `l`, arrows          | `workspace.focus_*`                               |
 | `Shift+H/J/K/L`                  | `workspace.move_*`                                |
 | `Ctrl+H/J/K/L`, `Ctrl+arrows`    | `workspace.grow_*`                                |
@@ -247,7 +249,7 @@ exactly like their direct shortcuts.
 ### Prefix action names
 
 Action names mirror the remapping keys below, joined with `.` for nested
-groups: `refresh`, `open`, `open_editor`, `new_thread`, `new_terminal`, `command_palette`,
+groups: `refresh`, `open`, `open_editor`, `new_thread`, `new_terminal`, `workspace.add`, `command_palette`,
 `companion`, `sidebar`, `sidebar_hidden`, `browser`, `chat_up`, `chat_down`,
 `chat_page_up`, `chat_page_down`, `chat.model_picker`, `chat.run_config`,
 `terminal.toggle`, `prefix.keybinds`, `prefix.navigate`, and `terminal.<key>`
@@ -260,7 +262,9 @@ and `workspace.split_alternate_*`, alongside every `workspace.<key>`. Positional
 
 Override any binding under `keybinds` in your `verde.json`. On Unix it is under
 `$XDG_CONFIG_HOME/verde` or `~/.config/verde`; on Windows it is under
-`%APPDATA%\Verde`. Use a string for one shortcut, or a string array for multiple
+`%APPDATA%\Verde`. Add `"$schema": "https://verdeai.dev/config.schema.json"` at
+the root of that file for editor autocomplete of every keybind and prefix
+action. Use a string for one shortcut, or a string array for multiple
 shortcuts on the same action:
 
 `Ctrl+T` and `Ctrl+Shift+T` are unbound by default. To opt back into those
@@ -348,5 +352,8 @@ or an array of shortcuts.
 | `terminal`  | `new_tab`, `close`, `rename_tab`, `tab_previous`, `tab_next`, `split_up`, `split_down`, `split_left`, `split_right`, `focus_up`, `focus_down`, `focus_left`, `focus_right`                                                       |
 | `prefix`    | `enabled`, `key`, `defaults`, `bindings`, `navigate` — see [Prefix mode](#prefix-mode-tmux-style)                                                                                                                                       |
 
-Keybinds are loaded on startup and on app refresh. See [Configuration &
-state](/docs/config) for the full `verde.json` schema and where state lives.
+Keybinds are loaded on startup, on app refresh (`F5`, `Ctrl+Shift+R`, or
+prefix then `r`), and whenever `verde.json` changes on disk. Refresh is
+app-owned even when a terminal TUI is focused. See [Configuration &
+state](/docs/config) for the hosted `verde.json` JSON Schema
+(`https://verdeai.dev/config.schema.json`) and where state lives.

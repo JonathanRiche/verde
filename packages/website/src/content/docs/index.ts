@@ -387,6 +387,7 @@ export function renderLlmsIndex(): string {
   lines.push(`## Optional`)
   lines.push(`- [Full docs as one markdown file](${SITE_ORIGIN}/llms-full.txt)`)
   lines.push(`- [Per-page raw markdown](${SITE_ORIGIN}/docs/<slug>.md) (e.g. ${SITE_ORIGIN}/docs/quickstart.md)`)
+  lines.push(`- [verde.json JSON Schema](${SITE_ORIGIN}/config.schema.json)`)
   lines.push(`- [Homepage](${SITE_ORIGIN}/)`)
   lines.push('')
   return lines.join('\n')

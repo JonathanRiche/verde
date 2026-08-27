@@ -4,6 +4,7 @@ import {
   chatPaneHasLiveTurn,
   clipboardImageFiles,
   findLastChatPane,
+  isAbsentDaemonThread,
   lastDeliveredTailSeq,
   layoutFromLivePanes,
   mapTranscriptRows,
@@ -13,6 +14,7 @@ import {
   requestPaneClose,
   requestTerminalOpen,
   setFavoriteModelInList,
+  threadFromDaemonGet,
 } from './store.ts'
 import { adjacentPaneInGroups, workspacePaneGroups } from './types.ts'
 
@@ -466,6 +468,33 @@ describe('mergeThreadCatalogSettings', () => {
     )
 
     expect(merged).toEqual([opening, existing])
+  })
+})
+
+describe('opening-thread daemon get', () => {
+  test('treats a missing daemon row as the opening-thread case', () => {
+    expect(isAbsentDaemonThread({
+      ok: false,
+      error: { code: 'resource_not_found', message: 'resource not found' },
+    })).toBe(true)
+    expect(isAbsentDaemonThread({
+      error: { code: 'not_found', message: 'thread is not on the daemon' },
+    })).toBe(true)
+    expect(isAbsentDaemonThread({
+      ok: false,
+      error: { code: 'store_unavailable', message: 'store is unavailable' },
+    })).toBe(false)
+    expect(isAbsentDaemonThread({ result: { thread: { local_thread_id: 't1' } } })).toBe(false)
+  })
+
+  test('does not invent a thread from a failed get', () => {
+    expect(threadFromDaemonGet({
+      ok: false,
+      error: { code: 'resource_not_found', message: 'resource not found' },
+    })).toBeNull()
+    expect(threadFromDaemonGet({
+      result: { thread: { local_thread_id: 'thread-1', title: 'New thread', committed: false } },
+    })).toMatchObject({ local_thread_id: 'thread-1', committed: false })
   })
 })
 

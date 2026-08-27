@@ -1945,6 +1945,7 @@ pub const PaletteModalAction = enum {
     modal_block,
     project_rename_input,
     thread_import_input,
+    project_import_name_input,
     project_import_input,
     settings_cancel,
     settings_close,
@@ -2026,6 +2027,7 @@ pub const PaletteModalTextFocus = enum {
     none,
     project_rename,
     thread_import,
+    project_import_name,
     project_import,
     command_palette,
 };
@@ -3500,6 +3502,24 @@ const ComposerControllerState = composer_controller.State(
 
 pub const HandoffTargetSurface = handoff_controller.TargetSurface;
 
+const MANAGED_WORKSPACES_DIR_NAME = "workspaces";
+
+fn projectImportPathAlloc(allocator: std.mem.Allocator, pref_path: []const u8, raw_path: []const u8, workspace_number: usize) ![]u8 {
+    const trimmed = std.mem.trim(u8, raw_path, &std.ascii.whitespace);
+    if (trimmed.len > 0) return allocator.dupe(u8, trimmed);
+    var directory_name_buf: [64]u8 = undefined;
+    const directory_name = try std.fmt.bufPrint(&directory_name_buf, "workspace-{d}", .{workspace_number});
+    return std.fs.path.join(allocator, &.{ pref_path, MANAGED_WORKSPACES_DIR_NAME, directory_name });
+}
+
+fn defaultProjectLabel(buf: []u8, workspace_number: usize) []const u8 {
+    return std.fmt.bufPrint(buf, "Workspace {d}", .{workspace_number}) catch "Workspace";
+}
+
+fn nextProjectDisplayNumber(open_workspace_count: usize) usize {
+    return open_workspace_count + 1;
+}
+
 pub const AppState = struct {
     pub const DRAFT_CAPACITY = chat_types.DRAFT_CAPACITY;
 
@@ -3509,6 +3529,7 @@ pub const AppState = struct {
     surface_controller: surface_controller.State,
     acknowledgement_controller: acknowledgement_controller.State = .{},
     import_path_storage: [DRAFT_CAPACITY:0]u8,
+    import_name_storage: [256:0]u8,
     rename_storage: [256:0]u8,
     sidebar_notice_storage: [256:0]u8,
     close_durability_notice: bool = false,
@@ -3565,6 +3586,7 @@ pub const AppState = struct {
     texture_upload_fn: ?TextureUploadFn,
     texture_release_fn: ?TextureReleaseFn,
     project_rename_cursor: usize,
+    project_import_name_cursor: usize,
     project_import_cursor: usize,
     thread_import_cursor: usize,
     /// Selection anchor for whichever modal text field currently owns focus.
@@ -3638,6 +3660,7 @@ pub const AppState = struct {
     app_config_runtime_sync_pending: bool,
     project_directory_browse_requested: bool,
     project_directory_picker_create_parent: bool,
+    project_directory_picker_start_home: bool,
     picker_state: PickerState,
     slash_command_state: SlashCommandState,
     provider_controller: provider_controller.State,
@@ -3707,6 +3730,7 @@ pub const AppState = struct {
             .project_controller = .{},
             .surface_controller = .{},
             .import_path_storage = std.mem.zeroes([DRAFT_CAPACITY:0]u8),
+            .import_name_storage = std.mem.zeroes([256:0]u8),
             .rename_storage = std.mem.zeroes([256:0]u8),
             .sidebar_notice_storage = std.mem.zeroes([256:0]u8),
             .import_thread_id_storage = std.mem.zeroes([256:0]u8),
@@ -3747,6 +3771,7 @@ pub const AppState = struct {
             .texture_upload_fn = options.texture_upload_fn,
             .texture_release_fn = options.texture_release_fn,
             .project_rename_cursor = 0,
+            .project_import_name_cursor = 0,
             .project_import_cursor = 0,
             .thread_import_cursor = 0,
             .modal_text_selection_anchor = null,
@@ -3799,6 +3824,7 @@ pub const AppState = struct {
             .app_config_runtime_sync_pending = false,
             .project_directory_browse_requested = false,
             .project_directory_picker_create_parent = false,
+            .project_directory_picker_start_home = false,
             .picker_state = .{},
             .slash_command_state = .{},
             .provider_controller = .{},
@@ -4042,6 +4068,10 @@ pub const AppState = struct {
     }
 
     pub fn createProjectFromPath(self: *AppState, raw_path: []const u8) !CreateProjectResult {
+        return self.createProjectFromPathWithLabel(raw_path, null);
+    }
+
+    fn createProjectFromPathWithLabel(self: *AppState, raw_path: []const u8, requested_label: ?[]const u8) !CreateProjectResult {
         const trimmed = std.mem.trim(u8, raw_path, &std.ascii.whitespace);
         if (trimmed.len == 0) return error.EmptyProjectPath;
 
@@ -4050,7 +4080,10 @@ pub const AppState = struct {
 
         if (self.findProjectIndexByPath(resolved) != null) return error.ProjectAlreadyExists;
 
-        const label = utils.projectLabelFromPath(resolved);
+        const label = if (requested_label) |value| blk: {
+            const trimmed_label = std.mem.trim(u8, value, &std.ascii.whitespace);
+            break :blk if (trimmed_label.len > 0) trimmed_label else utils.projectLabelFromPath(resolved);
+        } else utils.projectLabelFromPath(resolved);
         const add_result = try self.addProject(label, resolved, 0);
         const index = self.project_controller.projects.items.len - 1;
         self.project_controller.selected_index = index;
@@ -4159,11 +4192,25 @@ pub const AppState = struct {
     }
 
     pub fn importProjectFromInput(self: *AppState) !void {
-        _ = self.createProjectFromPath(self.importDirectoryDraft()) catch |err| switch (err) {
-            error.EmptyProjectPath => {
-                self.setSidebarNotice("Enter a workspace directory path first.");
-                return;
-            },
+        const raw_path = self.importDirectoryDraft();
+        const managed_workspace = std.mem.trim(u8, raw_path, &std.ascii.whitespace).len == 0;
+        const managed_directory_number = self.project_controller.next_project_number;
+        const display_number = nextProjectDisplayNumber(self.project_controller.projects.items.len);
+        const project_path = try projectImportPathAlloc(self.allocator, self.storage.pref_path, raw_path, managed_directory_number);
+        defer self.allocator.free(project_path);
+
+        var created_path: ?[]u8 = null;
+        defer if (created_path) |path| self.allocator.free(path);
+        const effective_path = if (managed_workspace) blk: {
+            created_path = try self.ensureDirectoryPath(project_path);
+            break :blk created_path.?;
+        } else project_path;
+
+        var default_label_buf: [64]u8 = undefined;
+        const entered_label = std.mem.trim(u8, self.importProjectNameDraft(), &std.ascii.whitespace);
+        const label = if (entered_label.len > 0) entered_label else defaultProjectLabel(&default_label_buf, display_number);
+
+        _ = self.createProjectFromPathWithLabel(effective_path, label) catch |err| switch (err) {
             error.FileNotFound => {
                 self.setSidebarNotice("Directory not found. Use New folder..., then type a folder name.");
                 self.markDirty();
@@ -4175,15 +4222,20 @@ pub const AppState = struct {
             },
             else => return err,
         };
+        self.project_controller.next_project_number += 1;
         self.clearImportPath();
+        self.clearImportProjectName();
+        self.project_import_name_cursor = 0;
         self.project_import_cursor = 0;
     }
 
     pub fn cancelProjectImport(self: *AppState) void {
         self.project_controller.show_creator = false;
+        self.clearImportProjectName();
         self.clearImportPath();
+        self.project_import_name_cursor = 0;
         self.project_import_cursor = 0;
-        if (self.palette_modal_text_focus == .project_import) {
+        if (self.palette_modal_text_focus == .project_import or self.palette_modal_text_focus == .project_import_name) {
             self.palette_modal_text_focus = .none;
         }
         self.setSidebarNotice("");
@@ -4249,6 +4301,18 @@ pub const AppState = struct {
         self.project_directory_picker_create_parent = false;
         self.project_directory_browse_requested = true;
         self.markDirty();
+    }
+
+    /// Add Workspace entry that goes straight to the directory picker: opens the
+    /// creator modal exactly like `openWorkspaceCreator` and queues the same
+    /// browse request the modal's Browse button uses. The picked folder then
+    /// imports through the normal modal path; nothing is created until the user
+    /// actually selects a directory, so cancelling leaves workspaces untouched.
+    /// With an empty draft the picker starts at the user's home directory.
+    pub fn openWorkspaceCreatorWithPicker(self: *AppState, expand_sidebar: bool) void {
+        self.openWorkspaceCreator(expand_sidebar);
+        self.project_directory_picker_start_home = true;
+        self.requestBrowseForProjectDirectory();
     }
 
     pub fn processDeferredProjectDirectoryBrowse(self: *AppState) void {
@@ -10048,6 +10112,7 @@ pub const AppState = struct {
                 .modal_block,
                 .project_rename_input,
                 .thread_import_input,
+                .project_import_name_input,
                 .project_import_input,
                 .command_palette_input,
                 => false,
@@ -10909,8 +10974,24 @@ pub const AppState = struct {
         return std.mem.sliceTo(self.import_path_storage[0..], 0);
     }
 
+    pub fn importProjectNameDraft(self: *const AppState) []const u8 {
+        return std.mem.sliceTo(self.import_name_storage[0..], 0);
+    }
+
+    pub fn importProjectNameBuffer(self: *AppState) [:0]u8 {
+        return self.import_name_storage[0 .. self.import_name_storage.len - 1 :0];
+    }
+
+    pub fn defaultProjectImportName(self: *const AppState, buf: []u8) []const u8 {
+        return defaultProjectLabel(buf, nextProjectDisplayNumber(self.project_controller.projects.items.len));
+    }
+
     pub fn importPathBuffer(self: *AppState) [:0]u8 {
         return self.import_path_storage[0 .. self.import_path_storage.len - 1 :0];
+    }
+
+    pub fn clearImportProjectName(self: *AppState) void {
+        self.import_name_storage[0] = 0;
     }
 
     pub fn clearImportPath(self: *AppState) void {
@@ -10919,14 +11000,16 @@ pub const AppState = struct {
 
     /// Opens the Add Workspace flow: every entry point (sidebar rail, command
     /// palette, workspace strip) shares this so the creator modal always starts
-    /// with a clean path field. Rail entry points expand the sidebar so the new
-    /// workspace lands in view; the strip keeps the sidebar as it was.
+    /// with clean optional name and path fields. Rail entry points expand the
+    /// sidebar so the new workspace lands in view; the strip keeps it as it was.
     pub fn openWorkspaceCreator(self: *AppState, expand_sidebar: bool) void {
         self.project_controller.show_creator = true;
         if (expand_sidebar) self.setSidebarCollapsed(false);
+        self.clearImportProjectName();
         self.clearImportPath();
+        self.project_import_name_cursor = 0;
         self.project_import_cursor = 0;
-        self.palette_modal_text_focus = .project_import;
+        self.palette_modal_text_focus = .project_import_name;
         self.setSidebarNotice("");
         self.markDirty();
     }
@@ -11789,6 +11872,7 @@ pub const AppState = struct {
         self.project_controller.selected_index = 0;
         self.project_controller.next_project_number = 1;
         self.project_controller.show_creator = false;
+        self.clearImportProjectName();
         self.clearImportPath();
         self.rename_storage[0] = 0;
         self.lifecycle.dirty = false;
@@ -11797,6 +11881,14 @@ pub const AppState = struct {
     fn defaultExplorerPath(self: *AppState) ![]u8 {
         if (self.importDirectoryDraft().len > 0) {
             return self.resolveProjectPath(std.mem.trim(u8, self.importDirectoryDraft(), &std.ascii.whitespace));
+        }
+
+        // Add Workspace entry points that jump directly to the picker start at
+        // home rather than inside the current workspace, so a new workspace is
+        // not accidentally nested under the selected one.
+        if (self.project_directory_picker_start_home) {
+            self.project_directory_picker_start_home = false;
+            return platform_paths.userHome(self.allocator) catch self.allocator.dupe(u8, ".");
         }
 
         if (self.project_controller.projects.items.len > 0) {
@@ -12261,6 +12353,28 @@ pub const AppState = struct {
         return false;
     }
 };
+
+test "blank workspace import path uses a numbered managed directory" {
+    const allocator = std.testing.allocator;
+    const default_path = try projectImportPathAlloc(allocator, "/tmp/verde-pref", " \t\n", 7);
+    defer allocator.free(default_path);
+    const expected_path = try std.fs.path.join(allocator, &.{ "/tmp/verde-pref", "workspaces", "workspace-7" });
+    defer allocator.free(expected_path);
+    try std.testing.expectEqualStrings(expected_path, default_path);
+
+    const next_path = try projectImportPathAlloc(allocator, "/tmp/verde-pref", "", 8);
+    defer allocator.free(next_path);
+    try std.testing.expect(!std.mem.eql(u8, default_path, next_path));
+
+    const explicit_path = try projectImportPathAlloc(allocator, "/tmp/verde-pref", "  /tmp/verde-workspace  ", 7);
+    defer allocator.free(explicit_path);
+    try std.testing.expectEqualStrings("/tmp/verde-workspace", explicit_path);
+
+    var label_buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Workspace 3", defaultProjectLabel(&label_buf, nextProjectDisplayNumber(2)));
+    try std.testing.expectEqual(@as(usize, 4), nextProjectDisplayNumber(3));
+    try std.testing.expectEqual(@as(usize, 3), nextProjectDisplayNumber(2));
+}
 
 test "lazy transcript hydration trims a durable page overlap by message identity" {
     const page = [_]PersistedMessage{

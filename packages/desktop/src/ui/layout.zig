@@ -610,6 +610,7 @@ fn focusedCursorReadOnly(state: *runtime.AppState) usize {
     return switch (state.palette_modal_text_focus) {
         .project_rename => state.project_rename_cursor,
         .thread_import => state.thread_import_cursor,
+        .project_import_name => state.project_import_name_cursor,
         .project_import => state.project_import_cursor,
         .command_palette => state.command_controller.cursor,
         .none => 0,
@@ -656,6 +657,7 @@ fn focusedValue(state: *runtime.AppState) []const u8 {
     return switch (state.palette_modal_text_focus) {
         .project_rename => state.renameInput(),
         .thread_import => state.threadImportThreadId(),
+        .project_import_name => state.importProjectNameDraft(),
         .project_import => state.importDirectoryDraft(),
         .command_palette => state.commandPaletteQuery(),
         .none => &[_]u8{},
@@ -844,6 +846,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             },
             .project_rename_input => focusModalInput(state, .project_rename, hit.rect, x, clicks),
             .thread_import_input => focusModalInput(state, .thread_import, hit.rect, x, clicks),
+            .project_import_name_input => focusModalInput(state, .project_import_name, hit.rect, x, clicks),
             .project_import_input => focusModalInput(state, .project_import, hit.rect, x, clicks),
             .command_palette_input => focusModalInput(state, .command_palette, hit.rect, x, clicks),
             .command_palette_row => command_palette.activateRow(state, hit.index, false),
@@ -912,6 +915,7 @@ pub fn handlePaletteTextInput(state: *runtime.AppState, text: []const u8) bool {
     return switch (state.palette_modal_text_focus) {
         .project_rename => insertIntoZBuffer(state.renameBuffer(), &state.project_rename_cursor, text),
         .thread_import => insertIntoZBuffer(state.threadImportThreadIdBuffer(), &state.thread_import_cursor, text),
+        .project_import_name => insertIntoZBuffer(state.importProjectNameBuffer(), &state.project_import_name_cursor, text),
         .project_import => insertIntoZBuffer(state.importPathBuffer(), &state.project_import_cursor, text),
         .command_palette => blk: {
             const inserted = insertIntoZBuffer(state.commandPaletteQueryBuffer(), &state.command_controller.cursor, text);
@@ -963,7 +967,7 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
                 state.importSelectedThread();
                 return true;
             }
-            if (state.palette_modal_text_focus == .project_import) {
+            if (state.palette_modal_text_focus == .project_import or state.palette_modal_text_focus == .project_import_name) {
                 state.importProjectFromInput() catch |err| {
                     runtime.log.warn("workspace import failed: {s}", .{@errorName(err)});
                     state.setSidebarNotice("Could not add that directory path.");
@@ -1134,6 +1138,7 @@ fn focusedCursor(state: *runtime.AppState) ?*usize {
     return switch (state.palette_modal_text_focus) {
         .project_rename => &state.project_rename_cursor,
         .thread_import => &state.thread_import_cursor,
+        .project_import_name => &state.project_import_name_cursor,
         .project_import => &state.project_import_cursor,
         .command_palette => &state.command_controller.cursor,
         .none => null,
@@ -1144,6 +1149,7 @@ fn focusedBuffer(state: *runtime.AppState) ?[:0]u8 {
     return switch (state.palette_modal_text_focus) {
         .project_rename => state.renameBuffer(),
         .thread_import => state.threadImportThreadIdBuffer(),
+        .project_import_name => state.importProjectNameBuffer(),
         .project_import => state.importPathBuffer(),
         .command_palette => state.commandPaletteQueryBuffer(),
         .none => null,
@@ -1154,6 +1160,7 @@ fn focusedTextLen(state: *runtime.AppState) usize {
     return switch (state.palette_modal_text_focus) {
         .project_rename => state.renameInput().len,
         .thread_import => state.threadImportThreadId().len,
+        .project_import_name => state.importProjectNameDraft().len,
         .project_import => state.importDirectoryDraft().len,
         .command_palette => state.commandPaletteQuery().len,
         .none => 0,
@@ -1257,13 +1264,16 @@ fn registerWorkspaceAddModalHits(state: *runtime.AppState, width: f32, height: f
     if (!state.project_controller.show_creator) return;
     const modal_w = theme.clampf(width * 0.34, theme.scaledUi(360.0), theme.scaledUi(500.0));
     const notice_h: f32 = if (state.projectImportNotice().len > 0) theme.scaledUi(24.0) else 0.0;
-    const modal_h = theme.scaledUi(252.0) + notice_h;
+    const modal_h = theme.scaledUi(320.0) + notice_h;
     const modal: palette.Rect = .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
     registerModalChromeHits(state, width, height, modal, false);
     const pad = theme.scaledUi(18.0);
     var y = modal.y + pad;
     y += theme.scaledUi(30.0);
-    y += theme.scaledUi(48.0);
+    y += theme.scaledUi(72.0);
+    const name_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(34.0) };
+    queueModalHit(state, name_rect, .project_import_name_input, 0);
+    y += theme.scaledUi(44.0);
     const button_gap = theme.scaledUi(10.0);
     const browse_w = (modal.w - pad * 2.0 - button_gap) * 0.5;
     const browse_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = browse_w, .h = theme.scaledUi(36.0) };
@@ -1271,7 +1281,7 @@ fn registerWorkspaceAddModalHits(state: *runtime.AppState, width: f32, height: f
     queueModalHit(state, browse_rect, .project_import_browse, 0);
     queueModalHit(state, create_rect, .project_import_create_dir, 0);
     y += theme.scaledUi(44.0);
-    const add_w = theme.scaledUi(76.0);
+    const add_w = theme.scaledUi(92.0);
     const row_gap = theme.scaledUi(10.0);
     const input_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0 - add_w - row_gap, .h = theme.scaledUi(34.0) };
     const add_rect: palette.Rect = .{ .x = input_rect.x + input_rect.w + row_gap, .y = y, .w = add_w, .h = theme.scaledUi(34.0) };
@@ -1695,20 +1705,32 @@ fn renderWorkspaceRenameModal(state: *runtime.AppState, width: f32, height: f32)
     drawActionButton(state, submit_rect, "Rename", theme.accent());
 }
 
+// Add-workspace modal for optional folder selection and creation.
 fn renderWorkspaceAddModal(state: *runtime.AppState, width: f32, height: f32) void {
     if (!state.project_controller.show_creator) return;
     const modal_w = theme.clampf(width * 0.34, theme.scaledUi(360.0), theme.scaledUi(500.0));
     const notice = state.projectImportNotice();
     const notice_h: f32 = if (notice.len > 0) theme.scaledUi(24.0) else 0.0;
-    const modal_h = theme.scaledUi(252.0) + notice_h;
+    const modal_h = theme.scaledUi(320.0) + notice_h;
     const modal: palette.Rect = .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
     drawModalChromeVisual(state, width, height, modal);
     const pad = theme.scaledUi(18.0);
     var y = modal.y + pad;
-    queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(24.0) }, "Add workspace", paletteColor(theme.COLOR_WHITE), theme.scaledUi(17.0), modal);
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(24.0) }, "New workspace", paletteColor(theme.COLOR_WHITE), theme.scaledUi(17.0), modal);
     y += theme.scaledUi(30.0);
-    queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(40.0) }, "Open an existing folder, or pick a parent and type a new folder name.", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), modal);
-    y += theme.scaledUi(48.0);
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(18.0) }, "Blank folder creates a numbered workspace.", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), modal);
+    y += theme.scaledUi(18.0);
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(18.0) }, "Verde manages its working directory.", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), modal);
+    y += theme.scaledUi(18.0);
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(18.0) }, "Blank name uses the shown default.", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), modal);
+    y += theme.scaledUi(24.0);
+    var default_name_buf: [64]u8 = undefined;
+    const default_name = state.defaultProjectImportName(&default_name_buf);
+    var name_placeholder_buf: [96]u8 = undefined;
+    const name_placeholder = std.fmt.bufPrint(&name_placeholder_buf, "{s} (default name)", .{default_name}) catch default_name;
+    const name_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(34.0) };
+    drawTextField(state, name_rect, state.importProjectNameDraft(), name_placeholder, state.palette_modal_text_focus == .project_import_name, state.project_import_name_cursor);
+    y += theme.scaledUi(44.0);
     const button_gap = theme.scaledUi(10.0);
     const browse_w = (modal.w - pad * 2.0 - button_gap) * 0.5;
     const browse_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = browse_w, .h = theme.scaledUi(36.0) };
@@ -1716,12 +1738,12 @@ fn renderWorkspaceAddModal(state: *runtime.AppState, width: f32, height: f32) vo
     drawActionButton(state, browse_rect, "Open existing folder", theme.COLOR_PANEL_ALT);
     drawActionButton(state, create_rect, "New folder...", theme.COLOR_GREEN);
     y += theme.scaledUi(44.0);
-    const add_w = theme.scaledUi(76.0);
+    const add_w = theme.scaledUi(92.0);
     const row_gap = theme.scaledUi(10.0);
     const input_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0 - add_w - row_gap, .h = theme.scaledUi(34.0) };
     const add_rect: palette.Rect = .{ .x = input_rect.x + input_rect.w + row_gap, .y = y, .w = add_w, .h = theme.scaledUi(34.0) };
-    drawTextField(state, input_rect, state.importDirectoryDraft(), "/path/to/workspace", state.palette_modal_text_focus == .project_import, state.project_import_cursor);
-    drawActionButton(state, add_rect, "Add", theme.accent());
+    drawTextField(state, input_rect, state.importDirectoryDraft(), "Folder path (optional)", state.palette_modal_text_focus == .project_import, state.project_import_cursor);
+    drawActionButton(state, add_rect, "Create", theme.accent());
     y += theme.scaledUi(46.0);
     const cancel_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = theme.scaledUi(120.0), .h = theme.scaledUi(34.0) };
     drawActionButton(state, cancel_rect, "Cancel", theme.COLOR_PANEL_ALT);

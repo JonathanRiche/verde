@@ -34,6 +34,10 @@ Before handing off website changes, run `bun test` and `bun run build`.
 - `src/content/docs/*.md` contains documentation pages.
 - `src/content/docs/index.ts` is the docs registry and the source of truth for
   navigation, raw Markdown routes, `/llms.txt`, and `/llms-full.txt`.
+- `src/lib/config-schema.ts` is the JSON Schema for `verde.json`, hosted at
+  `/config.schema.json`. Keep property lists aligned with
+  `packages/desktop/src/app/config.zig` and
+  `packages/desktop/src/app/keybinds.zig`.
 - `src/routes/__root.tsx` owns the HTML shell and site metadata.
 - `alchemy.run.ts` owns the Cloudflare deployment and local-development setup.
 

@@ -165,6 +165,9 @@ export function ChatPane(props: { pane: LivePane }) {
       run = []
     }
     for (const message of messages()) {
+      // Internal Codex resume metadata is persisted for the daemon, but it is
+      // not part of the user-facing web transcript.
+      if (message.author === '__verde_codex_background_snapshot') continue
       if (isCommandCardRow(message)) {
         run.push(message)
         continue

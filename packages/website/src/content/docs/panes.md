@@ -25,10 +25,10 @@ enabled, `Ctrl+B`, then `t` starts a new chat thread, while `Ctrl+B`, then
 `Shift+T` creates a separate top-level terminal pane. Use `v`, `-`, `Shift+V`,
 or `Shift+-` when you want a tiled split inside the focused scrolling item.
 
-With prefix mode enabled, `Ctrl+B`, then `v` creates a vertical GUI chat split
-inside the focused pane; `Ctrl+B`, then `-` creates a horizontal GUI chat split.
-`Shift+V` and `Shift+-` create the matching terminal splits. The same keys work
-after `Ctrl+B W`. In a scrolling workspace the panes stay tiled together
+With prefix mode enabled, `Ctrl+B`, then `v` creates a vertical split of the
+configured default pane type (chat or terminal) inside the focused pane;
+`Ctrl+B`, then `-` creates the matching horizontal split. `Shift+V` and
+`Shift+-` create the other type. The same keys work after `Ctrl+B W`. In a scrolling workspace the panes stay tiled together
 as one scrolling item, and the sidebar shows the same split as a clickable
 miniature instead of flattening it into unrelated pane rows.
 
