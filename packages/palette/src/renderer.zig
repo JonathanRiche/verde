@@ -162,6 +162,7 @@ pub const Renderer = struct {
     mono_symbols_font: ?*c.TTF_Font = null,
     symbols_font: ?*c.TTF_Font = null,
     symbols_alt_font: ?*c.TTF_Font = null,
+    math_font: ?*c.TTF_Font = null,
     emoji_font: ?*c.TTF_Font = null,
     vertex_buffer: ?*c.SDL_GPUBuffer = null,
     index_buffer: ?*c.SDL_GPUBuffer = null,
@@ -493,6 +494,7 @@ pub const Renderer = struct {
         mono_symbols: ?*sdl.Font = null,
         symbols: ?*sdl.Font = null,
         symbols_alt: ?*sdl.Font = null,
+        math: ?*sdl.Font = null,
         emoji: ?*sdl.Font = null,
     };
 
@@ -508,6 +510,7 @@ pub const Renderer = struct {
         self.mono_symbols_font = if (role_fonts.mono_symbols) |fallback| @ptrCast(fallback) else null;
         self.symbols_font = if (role_fonts.symbols) |fallback| @ptrCast(fallback) else null;
         self.symbols_alt_font = if (role_fonts.symbols_alt) |fallback| @ptrCast(fallback) else null;
+        self.math_font = if (role_fonts.math) |fallback| @ptrCast(fallback) else null;
         self.emoji_font = if (role_fonts.emoji) |fallback| @ptrCast(fallback) else null;
         self.text_engine = c.TTF_CreateGPUTextEngine(device) orelse return error.SdlTtfGpuTextEngineFailed;
         c.TTF_SetGPUTextEngineWinding(self.text_engine.?, c.TTF_GPU_TEXTENGINE_WINDING_COUNTER_CLOCKWISE);
@@ -1199,6 +1202,12 @@ pub const Renderer = struct {
             const sym_alt = self.fontForRoleAndSize(font_size, .symbols_alt) catch return font_role;
             if (c.TTF_FontHasGlyph(sym_alt, codepoint)) return .symbols_alt;
         }
+        // Noto Sans Math / the platform math face covers Mathematical
+        // Alphanumeric Symbols such as FX's stylized `𝒇` (U+1D487).
+        if (self.math_font != null) {
+            const math = self.fontForRoleAndSize(font_size, .math) catch return font_role;
+            if (c.TTF_FontHasGlyph(math, codepoint)) return .math;
+        }
         // Monochrome emoji face (Noto Emoji) — Symbols 2 deliberately excludes
         // emoji-styled Dingbats (✨ U+2728, ✅ U+2705, ❌ U+274C, ➕ U+2795,
         // ❤ U+2764, etc.), so emoji-as-status-markers (Vite's ✨, ⚠/⚡, ℹ,
@@ -1302,12 +1311,13 @@ pub const Renderer = struct {
             else => false,
         } else true;
         if (!wants_fallback) return;
-        const fallback_roles = [_]draw.FontRole{ .mono_symbols, .symbols, .symbols_alt, .emoji };
+        const fallback_roles = [_]draw.FontRole{ .mono_symbols, .symbols, .symbols_alt, .math, .emoji };
         for (fallback_roles) |fallback_role| {
             const loaded = switch (fallback_role) {
                 .mono_symbols => self.mono_symbols_font != null,
                 .symbols => self.symbols_font != null,
                 .symbols_alt => self.symbols_alt_font != null,
+                .math => self.math_font != null,
                 .emoji => self.emoji_font != null,
                 else => false,
             };
@@ -1329,6 +1339,7 @@ pub const Renderer = struct {
             .mono_symbols => if (self.mono_symbols_font) |font_value| return font_value,
             .symbols => if (self.symbols_font) |font_value| return font_value,
             .symbols_alt => if (self.symbols_alt_font) |font_value| return font_value,
+            .math => if (self.math_font) |font_value| return font_value,
             .emoji => if (self.emoji_font) |font_value| return font_value,
         };
         return self.font.?;
@@ -2452,7 +2463,8 @@ fn fontRoleCacheValue(font_role: ?draw.FontRole) u8 {
         .mono_symbols => 9,
         .symbols => 10,
         .symbols_alt => 11,
-        .emoji => 12,
+        .math => 12,
+        .emoji => 13,
     } else 0;
 }
 

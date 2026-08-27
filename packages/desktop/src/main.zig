@@ -424,6 +424,8 @@ fn mainInner(init: std.process.Init) !void {
         &PALETTE_GPU_SYMBOLS_ALT_FONT_PATHS,
     );
     defer allocator.free(palette_gpu_symbols_alt_font_path);
+    const palette_gpu_math_font_path = try systemMathFontPath(allocator);
+    defer if (palette_gpu_math_font_path) |path| allocator.free(path);
     // Monochrome emoji face (Noto Emoji) for the emoji-styled Dingbats that
     // Noto Sans Symbols 2 deliberately excludes — Vite's ✨, ✅/❌, ➕/➖,
     // ❤, ℹ, ⚡, ⚠ — plus 4-byte emoji (🔥/📦) that modern CLIs use as
@@ -450,6 +452,7 @@ fn mainInner(init: std.process.Init) !void {
         .mono_symbols_font_path = palette_gpu_mono_symbols_font_path,
         .symbols_font_path = palette_gpu_symbols_font_path,
         .symbols_alt_font_path = palette_gpu_symbols_alt_font_path,
+        .math_font_path = palette_gpu_math_font_path,
         .emoji_font_path = palette_gpu_emoji_font_path,
     });
     palette_renderer.configureTextMeasureRenderer();
@@ -1044,6 +1047,30 @@ fn ghosttyMonoFontPath(allocator: std.mem.Allocator) !?[:0]u8 {
     const family = try ghosttyFontFamily(allocator) orelse return null;
     defer allocator.free(family);
     return try fontPathForFamily(allocator, family);
+}
+
+fn systemMathFontPath(allocator: std.mem.Allocator) !?[:0]u8 {
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const candidates = [_][]const u8{
+        "/usr/share/fonts/noto/NotoSansMath-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansMath-Regular.ttf",
+        "/usr/share/fonts/Adwaita/AdwaitaMono-Regular.ttf",
+        "/System/Library/Fonts/Supplemental/STIXTwoMath.otf",
+        "/System/Library/Fonts/Supplemental/Cambria Math.ttf",
+        "C:\\Windows\\Fonts\\cambria.ttc",
+    };
+    for (candidates) |candidate| {
+        std.Io.Dir.cwd().access(io, candidate, .{}) catch continue;
+        return try allocator.dupeZ(u8, candidate);
+    }
+
+    const home = std.c.getenv("HOME") orelse return null;
+    const local_path = try std.fs.path.join(allocator, &.{ std.mem.span(home), ".local/share/fonts/NotoSansMath-Regular.ttf" });
+    defer allocator.free(local_path);
+    std.Io.Dir.cwd().access(io, local_path, .{}) catch return null;
+    return try allocator.dupeZ(u8, local_path);
 }
 
 fn ghosttyFontFamily(allocator: std.mem.Allocator) !?[]u8 {
