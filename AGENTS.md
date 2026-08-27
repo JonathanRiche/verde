@@ -137,6 +137,31 @@ Every new or changed text input must support complete editing behavior:
 
 Mirror `packages/desktop/src/ui/browser.zig` for the URL bar and `packages/desktop/src/ui/layout.zig` for modal fields.
 
+## Provider Surfaces, MCP Registration, And Hooks
+
+Verde has multiple provider surfaces. Do not treat the lifecycle-hook list as
+the complete provider list:
+
+- Native chat providers: Codex, Claude, Cursor, OpenCode, Pi, FX, and Grok.
+  The source of truth is `providers/types.zig` / `app/config.zig`.
+- User-scoped Verde MCP registration/proxy support: Codex, Claude, Cursor,
+  OpenCode, Amp, Pi, FX, and Grok. The source of truth is
+  `providers/mcp.zig`; all eight registrations target the authenticated Verde
+  daemon HTTP endpoint. Pi uses a managed extension and FX uses its managed
+  enablement marker rather than the JSON/TOML shapes used by other providers.
+- Managed terminal TUI lifecycle status hooks/plugins: Codex, Claude, Cursor,
+  OpenCode, Amp, and Grok. The source of truth is `providers/hooks.zig` and the
+  CLI `integration_providers` table. Pi and FX do not currently have managed
+  terminal lifecycle hooks. Amp has terminal/MCP integration but is not a
+  native chat provider.
+
+Keep those sets intentionally distinct. When adding or changing a provider,
+audit every applicable surface instead of copying one provider list blindly:
+native harness/config, MCP registration, terminal stack/default launcher,
+lifecycle hooks/plugins, CLI integration reporting, settings UI, and tests.
+Generated hooks must treat `VERDE_SESSION_ID` as opaque; derive a
+filesystem-safe state key rather than restricting its characters.
+
 ## Provider And Transcript Contracts
 
 When adding or changing a provider:

@@ -97,6 +97,26 @@ Treat every text field as a real editor. New or changed inputs must include:
 
 Use `packages/desktop/src/ui/browser.zig` and `packages/desktop/src/ui/layout.zig` as reference implementations.
 
+## Provider Surfaces And Integrations
+
+Verde's provider lists are intentionally different across features:
+
+- Native chat: Codex, Claude, Cursor, OpenCode, Pi, FX, and Grok
+  (`providers/types.zig`, `app/config.zig`).
+- User-scoped MCP registration/proxy: Codex, Claude, Cursor, OpenCode, Amp,
+  Pi, FX, and Grok (`providers/mcp.zig`). All eight connect to the authenticated
+  Verde daemon HTTP endpoint; Pi uses a managed extension and FX a managed
+  enablement marker.
+- Managed terminal lifecycle hooks/plugins: Codex, Claude, Cursor, OpenCode,
+  Amp, and Grok (`providers/hooks.zig` and the CLI integration table). Pi and
+  FX do not currently have managed terminal hooks; Amp is not a native chat
+  provider.
+
+Do not use the six hook integrations as the complete provider inventory. For
+provider changes, audit each applicable native-harness, MCP, terminal-stack,
+hook/plugin, CLI/settings, and test surface. Treat `VERDE_SESSION_ID` as opaque
+inside generated integrations and derive filesystem-safe state keys.
+
 ## Providers And Transcript
 
 - Integrate through the shared request/harness contract.
