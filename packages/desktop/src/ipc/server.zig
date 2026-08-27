@@ -772,6 +772,8 @@ fn notificationUpdateResponse(allocator: std.mem.Allocator, id_value: std.json.V
         return try errorResponseAlloc(allocator, id_value, "invalid_request", "invalid surface status") else null;
     const status_requests_attention = if (status) |value| value == .waiting or value == .@"error" else false;
     const requested_attention = boolParam(params, "attention") orelse if (status_requests_attention) true else null;
+    const event_title = stringParam(params, "event_title") orelse stringParam(params, "title") orelse stringParam(params, "label");
+    const event_body = stringParam(params, "event_body") orelse stringParam(params, "body");
     const proof = surfaceCommitProof(params);
     const status_changed_at_ms = intParam(params, "store_status_changed_at_ms");
     const completed_at_ms = intParam(params, "store_completed_at_ms");
@@ -801,8 +803,8 @@ fn notificationUpdateResponse(allocator: std.mem.Allocator, id_value: std.json.V
             .status = @tagName(status_value),
             .status_changed_at_ms = status_changed_at_ms.?,
             .completed_at_ms = completed_at_ms.?,
-            .last_event_title = stringParam(params, "title") orelse stringParam(params, "label"),
-            .last_event_body = stringParam(params, "body"),
+            .last_event_title = event_title,
+            .last_event_body = event_body,
         };
         switch (state.storage.classifySurfaceUpsertCommitProof(commit_proof, durable_surface) catch .invalid) {
             .current => {
@@ -832,8 +834,8 @@ fn notificationUpdateResponse(allocator: std.mem.Allocator, id_value: std.json.V
         .progress = floatParam(params, "progress"),
         .attention = requested_attention,
         .unread_increment = if (requested_attention orelse false) 1 else 0,
-        .last_event_title = stringParam(params, "title") orelse stringParam(params, "label"),
-        .last_event_body = stringParam(params, "body"),
+        .last_event_title = event_title,
+        .last_event_body = event_body,
         .status_changed_at_ms = if (durability == .presentation_only) status_changed_at_ms else null,
         .completed_at_ms = if (durability == .presentation_only) completed_at_ms else null,
         .durability = durability,
