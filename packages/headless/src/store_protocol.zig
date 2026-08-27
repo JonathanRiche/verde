@@ -155,6 +155,9 @@ pub const Thread = struct {
     provider: []const u8 = "opencode",
     harness: []const u8 = "local_cli",
     tui_dock_id: ?u32 = null,
+    /// Per-thread working-directory override. Null means the thread follows
+    /// its workspace path; "projectless" chats point at home or scratch.
+    cwd: ?[]const u8 = null,
     draft: []const u8 = "",
     draft_image: ?Attachment = null,
     draft_images: []const Attachment = &.{},
@@ -403,6 +406,7 @@ pub const ThreadListItem = struct {
     access_mode: ?[]const u8 = null,
     provider: []const u8 = "opencode",
     harness: []const u8 = "local_cli",
+    cwd: ?[]const u8 = null,
 };
 
 /// One durable thread and the revision from which it was read.
@@ -514,6 +518,7 @@ test "store DTOs round trip every wire shape" {
         .provider = "codex",
         .harness = "local_cli",
         .tui_dock_id = 3,
+        .cwd = "/work/sub",
         .draft = "draft",
         .draft_image = attachment,
         .draft_images = &.{attachment},

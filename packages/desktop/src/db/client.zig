@@ -554,13 +554,19 @@ pub const Client = struct {
         defer threads.deinit(allocator);
 
         const has_draft_images = self.hasColumn("threads", "draft_images_json");
+        // v6 adds the per-thread cwd override; older files read it as null.
+        const has_cwd = self.hasColumn("threads", "cwd");
+        const select_prefix = "select id, title, archived, committed, local_thread_id, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size, ";
+        const select_suffix = " from threads where workspace_id = ?1 order by sort_index";
         var thread_rows = try self.conn.rows(
-            if (has_draft_images)
-                "select id, title, archived, committed, local_thread_id, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size, draft_images_json " ++
-                    "from threads where workspace_id = ?1 order by sort_index"
+            if (has_draft_images and has_cwd)
+                select_prefix ++ "draft_images_json, cwd" ++ select_suffix
+            else if (has_draft_images)
+                select_prefix ++ "draft_images_json, null" ++ select_suffix
+            else if (has_cwd)
+                select_prefix ++ "null, cwd" ++ select_suffix
             else
-                "select id, title, archived, committed, local_thread_id, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size, null " ++
-                    "from threads where workspace_id = ?1 order by sort_index",
+                select_prefix ++ "null, null" ++ select_suffix,
             .{project_id},
         );
         defer thread_rows.deinit();
@@ -588,6 +594,7 @@ pub const Client = struct {
                 .provider = decodeEnumOr(db_types.Provider, thread_row.int(12), .opencode),
                 .harness = decodeEnumOr(db_types.Harness, thread_row.int(13), .local_cli),
                 .tui_dock_id = if (thread_row.nullableInt(14)) |value| @intCast(value) else null,
+                .cwd = try dupeOptionalText(allocator, thread_row.nullableText(20)),
                 .draft = try allocator.dupe(u8, thread_row.text(15)),
                 .draft_image = try loadOptionalImage(
                     allocator,
@@ -721,32 +728,44 @@ pub const Client = struct {
 
     fn saveThreadAtIndex(self: *const Self, project_id: i64, thread_index: usize, thread: PersistedThread) !void {
         const draft_image = thread.draft_image;
-        try self.conn.exec(
-            "insert into threads (workspace_id, sort_index, title, archived, committed, local_thread_id, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size) " ++
-                "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
-            .{
-                project_id,
-                @as(i64, @intCast(thread_index)),
-                thread.title,
-                boolToInt(thread.archived),
-                boolToInt(thread.committed),
-                thread.local_thread_id,
-                thread.last_activity_at,
-                thread.provider_thread_id,
-                thread.model_ref,
-                encodeOptionalEnum(thread.reasoning_effort),
-                thread.reasoning_variant,
-                encodeOptionalEnum(thread.fast_mode),
-                encodeOptionalEnum(thread.access_mode),
-                @as(i64, @intFromEnum(thread.provider)),
-                @as(i64, @intFromEnum(thread.harness)),
-                if (thread.tui_dock_id) |dock_id| @as(i64, @intCast(dock_id)) else null,
-                thread.draft,
-                if (draft_image) |image| image.path else null,
-                if (draft_image) |image| image.mime else null,
-                if (draft_image) |image| @as(i64, @intCast(image.byte_size)) else null,
-            },
-        );
+        const base_values = .{
+            project_id,
+            @as(i64, @intCast(thread_index)),
+            thread.title,
+            boolToInt(thread.archived),
+            boolToInt(thread.committed),
+            thread.local_thread_id,
+            thread.last_activity_at,
+            thread.provider_thread_id,
+            thread.model_ref,
+            encodeOptionalEnum(thread.reasoning_effort),
+            thread.reasoning_variant,
+            encodeOptionalEnum(thread.fast_mode),
+            encodeOptionalEnum(thread.access_mode),
+            @as(i64, @intFromEnum(thread.provider)),
+            @as(i64, @intFromEnum(thread.harness)),
+            if (thread.tui_dock_id) |dock_id| @as(i64, @intCast(dock_id)) else null,
+            thread.draft,
+            if (draft_image) |image| image.path else null,
+            if (draft_image) |image| image.mime else null,
+            if (draft_image) |image| @as(i64, @intCast(image.byte_size)) else null,
+        };
+        // The v1 writer only carries `cwd` once the daemon has migrated the
+        // file to v6; binding a 21st value against a 20-placeholder statement
+        // is a range error, so the two shapes stay separate statements.
+        if (self.hasColumn("threads", "cwd")) {
+            try self.conn.exec(
+                "insert into threads (workspace_id, sort_index, title, archived, committed, local_thread_id, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size, cwd) " ++
+                    "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                base_values ++ .{thread.cwd},
+            );
+        } else {
+            try self.conn.exec(
+                "insert into threads (workspace_id, sort_index, title, archived, committed, local_thread_id, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size) " ++
+                    "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                base_values,
+            );
+        }
         const thread_row_id = self.conn.lastInsertedRowId();
         try self.saveMessages(thread_row_id, thread.messages);
     }

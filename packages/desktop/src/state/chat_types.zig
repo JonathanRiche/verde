@@ -176,6 +176,9 @@ pub const ChatThread = struct {
     reasoning_effort: ?ReasoningEffort = null,
     /// OpenCode JSON `variant` when the configured model exposes variant keys.
     opencode_reasoning_variant: ?[:0]const u8 = null,
+    /// Working-directory override for provider sessions; null follows the
+    /// owning project path so ordinary threads need no extra state.
+    cwd: ?[:0]const u8 = null,
     fast_mode: FastMode = .off,
     access_mode: AccessMode = .full_access,
     provider: Provider = .opencode,
@@ -694,6 +697,7 @@ pub const ChatThread = struct {
         if (self.provider_thread_id) |thread_id| allocator.free(thread_id);
         if (self.model_ref) |model_ref| allocator.free(model_ref);
         if (self.opencode_reasoning_variant) |variant| allocator.free(variant);
+        if (self.cwd) |cwd| allocator.free(cwd);
         for (self.messages.items) |message| {
             allocator.free(message.author);
             allocator.free(message.body);

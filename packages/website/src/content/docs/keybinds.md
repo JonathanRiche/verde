@@ -237,6 +237,7 @@ The table is overridable exactly like `bindings`, under `"navigate"`:
 | `Shift+Up` / `Shift+Down`        | `chat_up` / `chat_down`                           |
 | `PageUp` / `PageDown`            | `chat_page_up` / `chat_page_down`                 |
 | `m` / `Shift+M`                  | `chat.model_picker` / `chat.run_config`           |
+| `d`                              | `chat.directory_picker`                           |
 | `Ctrl+T` / `Shift+W`             | `terminal.new_tab` / `terminal.close`             |
 | `,`                              | `terminal.rename_tab`                             |
 | `Ctrl+PageUp` / `Ctrl+PageDown`  | `terminal.tab_previous` / `tab_next`              |
@@ -251,7 +252,7 @@ exactly like their direct shortcuts.
 Action names mirror the remapping keys below, joined with `.` for nested
 groups: `refresh`, `open`, `open_editor`, `new_thread`, `new_terminal`, `workspace.add`, `command_palette`,
 `companion`, `sidebar`, `sidebar_hidden`, `browser`, `chat_up`, `chat_down`,
-`chat_page_up`, `chat_page_down`, `chat.model_picker`, `chat.run_config`,
+`chat_page_up`, `chat_page_down`, `chat.model_picker`, `chat.run_config`, `chat.directory_picker`,
 `terminal.toggle`, `prefix.keybinds`, `prefix.navigate`, and `terminal.<key>`
 for every terminal binding. The dynamic split names are `workspace.split_default_*`
 and `workspace.split_alternate_*`, alongside every `workspace.<key>`. Positional actions take a

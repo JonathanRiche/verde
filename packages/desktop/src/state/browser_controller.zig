@@ -1160,6 +1160,8 @@ pub fn isComposerMenuOpen(self: anytype) bool {
     return self.composer_controller.locked_model_picker_open or
         self.composer_controller.composer.active_menu != null or
         self.composer_controller.model_picker.isOpen() or
+        self.composer_controller.directory_picker.isOpen() or
+        self.composer_controller.runtime_picker.isOpen() or
         self.composer_controller.run_config_open;
 }
 
@@ -1214,6 +1216,8 @@ pub fn setComposerMenuOpen(self: anytype, open: bool) void {
         }
         self.composer_controller.locked_model_picker_open = false;
         self.closePaletteModelPicker();
+        self.closePaletteDirectoryPicker();
+        self.closePaletteRuntimePicker();
         self.browser_controller.inspector_menu_open = false;
         self.workspace_header_open_menu_open = false;
         self.workspace_header_open_menu_pane_id = null;
@@ -1224,6 +1228,8 @@ pub fn setComposerMenuOpen(self: anytype, open: bool) void {
         self.composer_controller.composer.hovered_menu_index = null;
         self.composer_controller.locked_model_picker_open = false;
         self.closePaletteModelPicker();
+        self.closePaletteDirectoryPicker();
+        self.closePaletteRuntimePicker();
         self.closeRunConfigPopover();
     }
     self.syncBrowserPaneBoundsToBackend();
@@ -1520,6 +1526,8 @@ pub fn browserBlockedByPaletteOverlay(self: anytype) bool {
         self.composer_controller.locked_model_picker_open or
         self.composer_controller.composer.active_menu != null or
         self.composer_controller.model_picker.isOpen() or
+        self.composer_controller.directory_picker.isOpen() or
+        self.composer_controller.runtime_picker.isOpen() or
         self.composer_controller.run_config_open;
 }
 

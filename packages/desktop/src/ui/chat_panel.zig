@@ -29,7 +29,12 @@ const TOP_BAR_HEIGHT: f32 = 57.0; // ~70% of legacy 82px cap
 const WORKSPACE_HEADER_ICON_CONTROL_CSS: f32 = 30.0;
 const WORKSPACE_HEADER_CHEVRON_CONTROL_CSS: f32 = 22.0;
 const WORKSPACE_HEADER_CONTROL_GAP_CSS: f32 = 6.0;
-const COMPOSER_HEIGHT: f32 = 220.0;
+/// Total composer footprint: the framed editor plus the directory strip
+/// under it (toolbar_height 32 + toolbar_gap 10 in the composer config).
+const COMPOSER_HEIGHT: f32 = 262.0;
+/// Floor keeps ~2 lines of prompt text visible above the inner toolbar even
+/// in short panes, after the 42px directory strip is taken out.
+const COMPOSER_MIN_HEIGHT: f32 = 176.0;
 /// Toolbar logos and drawn icons must sit above `PaletteComposerPrompt` geometry (`z_index` 120) so
 /// interleaved SDL_GPU rendering does not paint the composer panel over them.
 const COMPOSER_TOOLBAR_OVERLAY_Z: i32 = 130;
@@ -51,6 +56,14 @@ const COMPOSER_FILE_SEARCH_Z: i32 = 150;
 const COMPOSER_TOOLBAR_PILL_PAD_X: f32 = 13.0;
 /// Provider logo slot in the model pill.
 const COMPOSER_PROVIDER_LOGO_SLOT_CSS: f32 = 26.0;
+/// Folder glyph size inside the directory pill; a touch under the provider
+/// logo slot so the codicon's ink weight matches the neighbouring logos.
+const COMPOSER_DIRECTORY_GLYPH_CSS: f32 = 17.0;
+/// codicon-layers: the directory pill's glyph when the chat runs in an
+/// open workspace root.
+const NF_COD_LAYERS = "\u{EBD2}";
+/// codicon-device-desktop: the runtime pill's glyph for the local runtime.
+const NF_COD_DEVICE_DESKTOP = "\u{EA7A}";
 /// Shared max width for the chat content column. The composer card and the
 /// transcript bubble column both clamp to this (via `chatContentColumn`) so
 /// they always stay vertically aligned at the same width.
@@ -333,8 +346,10 @@ pub fn renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(
 
     // ~30% shorter than the original (0.14 / 54 / 82) clamp: scale each bound by 0.7.
     const header_height = theme.clampf(rect.h * 0.098, theme.scaledUi(38.0), theme.scaledUi(TOP_BAR_HEIGHT));
-    const composer_height = theme.clampf(rect.h * 0.29, theme.scaledUi(128.0), theme.scaledUi(COMPOSER_HEIGHT));
-    const bottom_margin = theme.clampf(rect.h * 0.018, theme.scaledUi(8.0), theme.scaledUi(14.0));
+    const composer_height = theme.clampf(rect.h * 0.32, theme.scaledUi(COMPOSER_MIN_HEIGHT), theme.scaledUi(COMPOSER_HEIGHT));
+    // Lifted off the panel edge so the toolbar pills (and the popovers that
+    // open above them) never sit flush against the bottom of the window.
+    const bottom_margin = theme.clampf(rect.h * 0.028, theme.scaledUi(14.0), theme.scaledUi(22.0));
     const terminal_visible = state.shouldRenderLegacyTerminalDockInChat() and !state.isBrowserVisible();
     const terminal_gap = if (terminal_visible) theme.scaledUi(12.0) else 0.0;
     const terminal_height = if (terminal_visible)
@@ -7424,6 +7439,37 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
         queueImage(state, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }, cached, model_rect);
     }
 
+    // The directory pill reserves the same leading cell as the model pill;
+    // the folder glyph is drawn through the icon font here rather than by
+    // Palette so it shares the sidebar's folder rendering.
+    if (state.composer_controller.composer.showDirectoryToggle()) {
+        const directory_rect = state.composer_controller.composer.directoryRect();
+        // Icon text anchors at the rect origin, so size the rect to the glyph
+        // and center that inside the pill's provider-logo-sized reserve.
+        const glyph_size = theme.scaledUi(COMPOSER_DIRECTORY_GLYPH_CSS);
+        const folder_slot = snapIconRectOrigin(palette.Rect{
+            .x = directory_rect.x + theme.scaledUi(COMPOSER_TOOLBAR_PILL_PAD_X) + (provider_slot - glyph_size) * 0.5,
+            .y = directory_rect.y + (directory_rect.h - glyph_size) * 0.5,
+            .w = glyph_size,
+            .h = glyph_size,
+        });
+        // Workspaces get their own glyph; a workspace may be tied to a
+        // directory, but the pill is about where the chat runs.
+        const directory_glyph = if (state.currentThreadCwdIsWorkspace()) NF_COD_LAYERS else file_icons.folder.glyph;
+        queueIconText(state, folder_slot, directory_glyph, icon_color, glyph_size, directory_rect);
+    }
+    if (state.composer_controller.composer.showRuntimeToggle()) {
+        const runtime_rect = state.composer_controller.composer.runtimeRect();
+        const glyph_size = theme.scaledUi(COMPOSER_DIRECTORY_GLYPH_CSS);
+        const runtime_slot = snapIconRectOrigin(palette.Rect{
+            .x = runtime_rect.x + theme.scaledUi(COMPOSER_TOOLBAR_PILL_PAD_X) + (provider_slot - glyph_size) * 0.5,
+            .y = runtime_rect.y + (runtime_rect.h - glyph_size) * 0.5,
+            .w = glyph_size,
+            .h = glyph_size,
+        });
+        queueIconText(state, runtime_slot, NF_COD_DEVICE_DESKTOP, icon_color, glyph_size, runtime_rect);
+    }
+
     // The run pill embeds the fast-mode and access state glyphs beside the
     // label segment each one describes; the composer reserves the cells via
     // `setReasoningIconSlots` and reports their rects so the glyphs track
@@ -7483,28 +7529,36 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
         }), icon_color);
     }
 
-    renderComposerShortcutHints(state, model_rect, state.composer_controller.composer.reasoningRect());
+    renderComposerShortcutHints(state, state.composer_controller.composer.directoryRect(), model_rect, state.composer_controller.composer.reasoningRect());
 }
 
 // Hover help and held-Alt key tips for the composer toolbar selectors.
-fn renderComposerShortcutHints(state: *app_state.AppState, model_rect: palette.Rect, run_rect: palette.Rect) void {
+fn renderComposerShortcutHints(state: *app_state.AppState, directory_rect: palette.Rect, model_rect: palette.Rect, run_rect: palette.Rect) void {
     const config = state.command_controller.keyboard_config orelse return;
+    const show_directory = state.composer_controller.composer.showDirectoryToggle();
     if (state.alt_shortcut_hints_visible) {
+        var directory_buf: [16]u8 = undefined;
         var model_buf: [16]u8 = undefined;
         var run_buf: [16]u8 = undefined;
+        if (show_directory) {
+            renderShortcutKeyTip(state, directory_rect, keybinds.formatAltKeyTip(&directory_buf, config.chat_directory_picker));
+        }
         renderShortcutKeyTip(state, model_rect, keybinds.formatAltKeyTip(&model_buf, config.chat_model_picker));
         if (state.composer_controller.composer.showReasoningToggle()) {
             renderShortcutKeyTip(state, run_rect, keybinds.formatAltKeyTip(&run_buf, config.chat_run_config));
         }
         return;
     }
-    if (state.composer_controller.model_picker.isOpen() or state.composer_controller.run_config_open) return;
+    if (state.composer_controller.model_picker.isOpen() or state.composer_controller.directory_picker.isOpen() or state.composer_controller.run_config_open) return;
     const point: palette.draw.Vec2 = .{
         .x = state.transcript_controller.palette_mouse_x,
         .y = state.transcript_controller.palette_mouse_y,
     };
     var shortcut_buf: [32]u8 = undefined;
-    if (model_rect.contains(point)) {
+    if (show_directory and directory_rect.contains(point)) {
+        // The pill only shows the basename; hovering reveals the full path.
+        renderComposerSelectorTooltip(state, directory_rect, state.currentThreadEffectiveCwd(), keybinds.formatFirstKeybind(&shortcut_buf, config.chat_directory_picker));
+    } else if (model_rect.contains(point)) {
         renderComposerSelectorTooltip(state, model_rect, "Choose model", keybinds.formatFirstKeybind(&shortcut_buf, config.chat_model_picker));
     } else if (state.composer_controller.composer.showReasoningToggle() and run_rect.contains(point)) {
         renderComposerSelectorTooltip(state, run_rect, "Run settings", keybinds.formatFirstKeybind(&shortcut_buf, config.chat_run_config));

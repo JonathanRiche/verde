@@ -66,6 +66,7 @@ const KeybindRef = enum {
     new_thread,
     chat_model_picker,
     chat_run_config,
+    chat_directory_picker,
     toggle_sidebar,
     toggle_browser,
     toggle_terminal,
@@ -86,6 +87,7 @@ const STATIC_COMMANDS = [_]Command{
     .{ .id = "thread.new", .title = "New Chat", .keywords = "thread conversation start", .section = .threads, .keybind = .new_thread, .run = runNewChat, .enabled = hasProjects },
     .{ .id = "thread.choose_model", .title = "Choose Chat Model", .keywords = "provider initial picker", .section = .threads, .keybind = .chat_model_picker, .run = runChooseChatModel, .enabled = hasFocusedGuiChat },
     .{ .id = "thread.run_config", .title = "Configure Reasoning and Run Settings", .keywords = "effort speed access permissions", .section = .threads, .keybind = .chat_run_config, .run = runChatRunConfig, .enabled = hasFocusedGuiChat },
+    .{ .id = "thread.choose_directory", .title = "Choose Chat Working Directory", .keywords = "cwd folder path scratch home project", .section = .threads, .keybind = .chat_directory_picker, .run = runChooseChatDirectory, .enabled = hasFocusedGuiChat },
     .{ .id = "thread.rename_current", .title = "Rename Current Chat", .keywords = "thread title label", .section = .threads, .run = runRenameCurrentChat, .enabled = currentThreadCommitted },
     .{ .id = "thread.regenerate_title", .title = "Regenerate Chat Title", .keywords = "thread rename luna automatic", .section = .threads, .run = runRegenerateChatTitle, .enabled = canRegenerateChatTitle },
     .{ .id = "thread.sync_current", .title = "Sync Current Thread", .keywords = "refresh provider", .section = .threads, .run = runSyncCurrentThread, .enabled = canSyncCurrentThread },
@@ -1251,6 +1253,10 @@ fn runChatRunConfig(state: *runtime.AppState) void {
     state.openRunConfigPopover();
 }
 
+fn runChooseChatDirectory(state: *runtime.AppState) void {
+    state.openPaletteDirectoryPicker();
+}
+
 fn runSyncCurrentThread(state: *runtime.AppState) void {
     const thread_index = focusedGuiThreadIndex(state) orelse return;
     state.syncThreadFromProvider(state.project_controller.selected_index, thread_index);
@@ -1283,19 +1289,19 @@ fn runImportClaude(state: *runtime.AppState) void {
 }
 
 fn runSplitChatRight(state: *runtime.AppState) void {
-    _ = state.splitFocusedWorkspacePaneWithChatAxis(.vertical);
+    _ = state.splitFocusedWorkspacePaneTiledWithChatPlacement(.vertical, true);
 }
 
 fn runSplitChatDown(state: *runtime.AppState) void {
-    _ = state.splitFocusedWorkspacePaneWithChatAxis(.horizontal);
+    _ = state.splitFocusedWorkspacePaneTiledWithChatPlacement(.horizontal, true);
 }
 
 fn runSplitTerminalRight(state: *runtime.AppState) void {
-    _ = state.splitFocusedWorkspacePaneWithTerminalAxis(.vertical);
+    _ = state.splitFocusedWorkspacePaneTiledWithTerminalPlacement(.vertical, true);
 }
 
 fn runSplitTerminalDown(state: *runtime.AppState) void {
-    _ = state.splitFocusedWorkspacePaneWithTerminalAxis(.horizontal);
+    _ = state.splitFocusedWorkspacePaneTiledWithTerminalPlacement(.horizontal, true);
 }
 
 fn runOpenTerminal(state: *runtime.AppState) void {
@@ -1864,6 +1870,7 @@ fn keybindHintFor(state: *runtime.AppState, ref: ?KeybindRef) []const u8 {
         .new_thread => config.new_thread,
         .chat_model_picker => config.chat_model_picker,
         .chat_run_config => config.chat_run_config,
+        .chat_directory_picker => config.chat_directory_picker,
         .toggle_sidebar => config.toggle_sidebar,
         .toggle_browser => config.toggle_browser,
         .toggle_terminal => config.toggle_terminal,

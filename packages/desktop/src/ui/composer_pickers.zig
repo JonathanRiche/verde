@@ -1,5 +1,6 @@
-//! Renders the composer-owned popovers: the rich model picker and the
-//! run-configuration panel (reasoning / speed / access steppers).
+//! Renders the composer-owned popovers: the rich model picker, the working
+//! directory picker, and the run-configuration panel (reasoning / speed /
+//! access steppers).
 
 const std = @import("std");
 
@@ -14,7 +15,28 @@ const AppState = native_state.AppState;
 
 pub fn render(state: *AppState) void {
     renderModelPicker(state);
+    renderDirectoryPicker(state);
+    renderRuntimePicker(state);
     renderRunConfigPopover(state);
+}
+
+// Renders the retained working-directory picker anchored to the composer
+// directory pill. Entries are rebuilt once on open; only the anchor tracks
+// the toolbar while the popover stays up.
+fn renderRuntimePicker(state: *AppState) void {
+    if (!state.composer_controller.runtime_picker.isOpen()) return;
+    state.setPaletteRuntimePickerBoundsFromToolbar();
+    state.composer_controller.runtime_picker.render(state.allocator, &state.palette_overlay_batch) catch |err| {
+        log.warn("failed to render runtime picker: {s}", .{@errorName(err)});
+    };
+}
+
+fn renderDirectoryPicker(state: *AppState) void {
+    if (!state.composer_controller.directory_picker.isOpen()) return;
+    state.setPaletteDirectoryPickerBoundsFromToolbar();
+    state.composer_controller.directory_picker.render(state.allocator, &state.palette_overlay_batch) catch |err| {
+        log.warn("failed to render composer directory picker: {s}", .{@errorName(err)});
+    };
 }
 
 // Renders the retained rich model picker anchored to the composer model pill.

@@ -1214,19 +1214,19 @@ fn renderContextMenu(state: *app_state.AppState, dock: anytype, dock_rect: palet
         enabled[count] = has_workspace_pane;
         count += 1;
         actions[count] = .split_up;
-        labels[count] = "New Pane Above";
+        labels[count] = "Split Above";
         enabled[count] = has_workspace_pane;
         count += 1;
         actions[count] = .split_down;
-        labels[count] = "New Pane Below";
+        labels[count] = "Split Below";
         enabled[count] = has_workspace_pane;
         count += 1;
         actions[count] = .split_left;
-        labels[count] = "New Pane Left";
+        labels[count] = "Split Left";
         enabled[count] = has_workspace_pane;
         count += 1;
         actions[count] = .split_right;
-        labels[count] = "New Pane Right";
+        labels[count] = "Split Right";
         enabled[count] = has_workspace_pane;
         count += 1;
         actions[count] = .close_pane;
@@ -1291,16 +1291,16 @@ fn performContextMenuAction(state: *app_state.AppState, dock: anytype, action: T
         .rename_tab => if (dock.activeTab()) |tab| dock.beginRenameTab(tab.id),
         .close_tab => dock.closeTab(state.allocator, hit_cache.menu_tab_index) catch |err| app_state.log.warn("failed to close terminal tab: {s}", .{@errorName(err)}),
         .split_up => if (workspacePaneIdForDock(state, hit_cache.menu_dock_id)) |pane_id| {
-            _ = state.splitCurrentProjectWorkspacePaneWithTerminalPlacement(pane_id, .horizontal, false);
+            _ = state.splitCurrentProjectWorkspacePaneTiledWithTerminalPlacement(pane_id, .horizontal, false);
         },
         .split_down => if (workspacePaneIdForDock(state, hit_cache.menu_dock_id)) |pane_id| {
-            _ = state.splitCurrentProjectWorkspacePaneWithTerminalPlacement(pane_id, .horizontal, true);
+            _ = state.splitCurrentProjectWorkspacePaneTiledWithTerminalPlacement(pane_id, .horizontal, true);
         },
         .split_left => if (workspacePaneIdForDock(state, hit_cache.menu_dock_id)) |pane_id| {
-            _ = state.splitCurrentProjectWorkspacePaneWithTerminalPlacement(pane_id, .vertical, false);
+            _ = state.splitCurrentProjectWorkspacePaneTiledWithTerminalPlacement(pane_id, .vertical, false);
         },
         .split_right => if (workspacePaneIdForDock(state, hit_cache.menu_dock_id)) |pane_id| {
-            _ = state.splitCurrentProjectWorkspacePaneWithTerminalPlacement(pane_id, .vertical, true);
+            _ = state.splitCurrentProjectWorkspacePaneTiledWithTerminalPlacement(pane_id, .vertical, true);
         },
         .zoom_pane => if (workspacePaneIdForDock(state, hit_cache.menu_dock_id)) |pane_id| {
             _ = state.toggleCurrentProjectWorkspacePaneMaximized(pane_id);

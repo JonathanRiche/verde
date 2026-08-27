@@ -10,6 +10,9 @@ pub fn State(
     comptime ComposerPrompt: type,
     comptime ModelPicker: type,
     comptime ModelPickerEntry: type,
+    comptime DirectoryPicker: type,
+    comptime DirectoryPickerEntry: type,
+    comptime RuntimePicker: type,
     comptime RunStepper: type,
     comptime RunStepperContext: type,
 ) type {
@@ -36,6 +39,8 @@ pub fn State(
         overlay_last_cursor_pos: usize = 0,
         overlay_last_draft_len: usize = 0,
         toolbar_overlay_valid: bool = false,
+        toolbar_directory_rect: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+        toolbar_runtime_rect: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
         toolbar_model_rect: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
         toolbar_reasoning_rect: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
         toolbar_fast_rect: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
@@ -43,6 +48,19 @@ pub fn State(
         composer: ComposerPrompt,
         model_picker: ModelPicker,
         model_picker_entries: std.ArrayList(ModelPickerEntry) = .empty,
+        directory_picker: DirectoryPicker,
+        directory_picker_entries: std.ArrayList(DirectoryPickerEntry) = .empty,
+        /// Local/Remote runtime chooser on the directory strip; Remote is a
+        /// reserved "coming soon" row until cloud/remote daemons ship.
+        runtime_picker: RuntimePicker,
+        /// Set while the shared folder dialog was opened from the directory
+        /// picker's Browse row, so `pollPicker` routes the result to the
+        /// current thread instead of the workspace importer.
+        browse_for_chat_directory: bool = false,
+        /// Lazily resolved absolute paths behind the Home / Scratch rows and
+        /// the matching pill labels.
+        home_path: ?[]const u8 = null,
+        scratch_path: ?[]const u8 = null,
         run_config_open: bool = false,
         popover_restore_focus: bool = false,
         run_config_focused_row: usize = 0,
@@ -59,6 +77,8 @@ pub fn State(
             return .{
                 .composer = ComposerPrompt.init(),
                 .model_picker = ModelPicker.init(0),
+                .directory_picker = DirectoryPicker.init(0),
+                .runtime_picker = RuntimePicker.init(0),
                 .run_steppers = .{ RunStepper.init(0), RunStepper.init(2), RunStepper.init(2) },
             };
         }

@@ -32,10 +32,11 @@ configured default pane type (chat or terminal) inside the focused pane;
 as one scrolling item, and the sidebar shows the same split as a clickable
 miniature instead of flattening it into unrelated pane rows.
 
-For chat-vs-chat splits and terminal-vertical splits, use the pane header
-buttons: `C|` and `C-` split a chat pane vertically or horizontally; `T|` and
-`T-` do the same for terminals. Right-click terminal content for selection
-copy, zoom, workspace splits around the focused pane, and **Close pane**.
+For chat-vs-chat splits and terminal splits, use the pane header grid menu or
+the right-click **Split Pane** submenu. Those actions tile inside the focused
+scrolling item instead of adding a new strip pane. Right-click terminal content
+for selection copy, zoom, the same workspace splits around the focused pane, and
+**Close pane**.
 Right-click a terminal tab to rename or close it. If `terminal.profiles` is
 configured in `verde.json`, the first custom launch profile also appears in
 the terminal context menu.

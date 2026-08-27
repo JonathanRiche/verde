@@ -19,6 +19,13 @@ pub const ComposerPromptConfig = struct {
     padding_y: f32 = 16.0,
     toolbar_height: f32 = 36.0,
     toolbar_gap: f32 = 8.0,
+    /// When set (and the directory pill is shown), the framed editor keeps
+    /// the model/run/send toolbar inside it while the directory pill renders
+    /// on its own strip underneath the frame, still within `bounds`.
+    directory_outside: bool = false,
+    /// Horizontal inset of the outside directory strip relative to the frame
+    /// edge, in CSS units; keeps the pill from kissing the frame corner.
+    directory_outside_inset_x: f32 = 4.0,
     control_gap: f32 = 8.0,
     separator_width: f32 = 1.0,
     corner_radius: f32 = 14.0,
@@ -54,6 +61,12 @@ pub const ComposerPromptConfig = struct {
     font_id: ?u32 = null,
     icon_font_id: ?u32 = null,
     placeholder: []const u8 = "Ask anything, or use / to show available commands",
+    /// Leading working-directory pill; hidden until the host opts in with
+    /// `setShowDirectoryToggle` so non-chat composers keep their layout.
+    /// Hosts that reserve a leading overlay cell draw the folder glyph
+    /// themselves and leave this empty.
+    directory_icon: []const u8 = "",
+    directory_label: []const u8 = "Project",
     model_icon: []const u8 = "O",
     model_label: []const u8 = "GPT-5.5",
     reasoning_label: []const u8 = "Low",
@@ -81,6 +94,14 @@ pub const ComposerPromptConfig = struct {
     pill_padding_x: f32 = 10.0,
     pill_icon_gap: f32 = 7.0,
     pill_chevron_gap: f32 = 8.0,
+    directory_min_width: f32 = 0.0,
+    directory_max_width: f32 = 160.0,
+    /// Trailing runtime pill on the outside directory strip (Local/Remote);
+    /// hidden until the host opts in with `setShowRuntimeToggle`.
+    runtime_icon: []const u8 = "",
+    runtime_label: []const u8 = "Local",
+    runtime_min_width: f32 = 0.0,
+    runtime_max_width: f32 = 160.0,
     model_min_width: f32 = 0.0,
     model_max_width: f32 = 180.0,
     reasoning_min_width: f32 = 0.0,
@@ -127,6 +148,8 @@ pub const ComposerPromptStyle = struct {
 };
 
 pub const ComposerPromptPart = enum {
+    directory,
+    runtime,
     model,
     reasoning,
     fast,
@@ -267,6 +290,8 @@ const EditSnapshot = struct {
 pub const ComposerPromptEvent = union(enum) {
     text_changed: []const u8,
     submitted: []const u8,
+    directory_clicked,
+    runtime_clicked,
     model_clicked,
     model_changed: usize,
     reasoning_clicked,
@@ -314,6 +339,8 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         scroll_y: f32 = 0.0,
         dragging_selection: bool = false,
         placeholder_buffer: std.ArrayList(u8) = .empty,
+        directory_label_buffer: std.ArrayList(u8) = .empty,
+        runtime_label_buffer: std.ArrayList(u8) = .empty,
         model_label_buffer: std.ArrayList(u8) = .empty,
         reasoning_label_buffer: std.ArrayList(u8) = .empty,
         fast_label_buffer: std.ArrayList(u8) = .empty,
@@ -327,6 +354,8 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         menu_scroll_y: f32 = 0.0,
         hovered_part: ?ComposerPromptPart = null,
         focused: bool = false,
+        show_directory_toggle: bool = false,
+        show_runtime_toggle: bool = false,
         show_fast_toggle: bool = true,
         show_reasoning_toggle: bool = true,
         show_access_toggle: bool = true,
@@ -434,6 +463,28 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             return result;
         }
 
+        pub fn setShowDirectoryToggle(self: *Component, show: bool) void {
+            self.show_directory_toggle = show;
+            if (!show) {
+                self.hovered_part = if (self.hovered_part == .directory) null else self.hovered_part;
+            }
+        }
+
+        pub fn showDirectoryToggle(self: *const Component) bool {
+            return self.show_directory_toggle;
+        }
+
+        pub fn setShowRuntimeToggle(self: *Component, show: bool) void {
+            self.show_runtime_toggle = show;
+            if (!show) {
+                self.hovered_part = if (self.hovered_part == .runtime) null else self.hovered_part;
+            }
+        }
+
+        pub fn showRuntimeToggle(self: *const Component) bool {
+            return self.show_runtime_toggle;
+        }
+
         pub fn setShowFastToggle(self: *Component, show: bool) void {
             self.show_fast_toggle = show;
             if (!show) {
@@ -515,6 +566,8 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             self.model_label_buffer.deinit(allocator);
             self.reasoning_label_buffer.deinit(allocator);
             self.fast_label_buffer.deinit(allocator);
+            self.directory_label_buffer.deinit(allocator);
+            self.runtime_label_buffer.deinit(allocator);
             self.access_label_buffer.deinit(allocator);
             self.clearEditHistory(allocator);
             self.undo_stack.deinit(allocator);
@@ -600,6 +653,14 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
 
         pub fn setPlaceholder(self: *Component, allocator: std.mem.Allocator, value: []const u8) !void {
             try setOwnedString(allocator, &self.placeholder_buffer, value);
+        }
+
+        pub fn setDirectoryLabel(self: *Component, allocator: std.mem.Allocator, value: []const u8) !void {
+            try setOwnedString(allocator, &self.directory_label_buffer, value);
+        }
+
+        pub fn setRuntimeLabel(self: *Component, allocator: std.mem.Allocator, value: []const u8) !void {
+            try setOwnedString(allocator, &self.runtime_label_buffer, value);
         }
 
         pub fn setModelLabel(self: *Component, allocator: std.mem.Allocator, value: []const u8) !void {
@@ -722,6 +783,8 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         pub fn hitTest(self: *const Component, point: draw.Vec2) ?ComposerPromptPart {
             const geometry = self.toolbarGeometry();
             if (geometry.send.contains(point)) return .send;
+            if (self.show_directory_toggle and geometry.directory.w > 0.0 and geometry.directory.contains(point)) return .directory;
+            if (geometry.runtime.w > 0.0 and geometry.runtime.contains(point)) return .runtime;
             if (geometry.model.contains(point)) return .model;
             if (self.show_reasoning_toggle and geometry.reasoning.w > 0.0 and geometry.reasoning.contains(point)) return .reasoning;
             if (self.show_fast_toggle and geometry.fast.w > 0.0 and geometry.fast.contains(point)) return .fast;
@@ -729,22 +792,54 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             return null;
         }
 
-        pub fn textRect(self: *const Component) draw.Rect {
+        fn directoryOutside(self: *const Component) bool {
+            return config.directory_outside and self.show_directory_toggle;
+        }
+
+        /// The bordered editor panel. Equals `bounds` unless the directory
+        /// pill sits outside, in which case the frame stops above its strip.
+        pub fn frameRect(self: *const Component) draw.Rect {
             const bounds_rect = self.bounds();
+            if (!self.directoryOutside()) return bounds_rect;
+            const reserve = self.scaled(config.toolbar_height) + self.scaled(config.toolbar_gap);
             return snapRect(.{
-                .x = bounds_rect.x + self.scaled(config.padding_x),
-                .y = bounds_rect.y + self.scaled(config.padding_y),
-                .w = @max(bounds_rect.w - self.scaled(config.padding_x) * 2.0, 0.0),
-                .h = @max(bounds_rect.h - self.scaled(config.padding_y) * 2.0 - self.scaled(config.toolbar_height) - self.scaled(config.toolbar_gap), 0.0),
+                .x = bounds_rect.x,
+                .y = bounds_rect.y,
+                .w = bounds_rect.w,
+                .h = @max(bounds_rect.h - reserve, 0.0),
+            });
+        }
+
+        /// Strip below the frame that hosts the outside directory pill; zero
+        /// height when the pill renders inside the toolbar.
+        pub fn directoryStripRect(self: *const Component) draw.Rect {
+            const bounds_rect = self.bounds();
+            if (!self.directoryOutside()) return snapRect(.{ .x = bounds_rect.x, .y = bounds_rect.y + bounds_rect.h, .w = bounds_rect.w, .h = 0.0 });
+            const inset = self.scaled(config.directory_outside_inset_x);
+            return snapRect(.{
+                .x = bounds_rect.x + inset,
+                .y = bounds_rect.y + bounds_rect.h - self.scaled(config.toolbar_height),
+                .w = @max(bounds_rect.w - inset * 2.0, 0.0),
+                .h = self.scaled(config.toolbar_height),
+            });
+        }
+
+        pub fn textRect(self: *const Component) draw.Rect {
+            const frame = self.frameRect();
+            return snapRect(.{
+                .x = frame.x + self.scaled(config.padding_x),
+                .y = frame.y + self.scaled(config.padding_y),
+                .w = @max(frame.w - self.scaled(config.padding_x) * 2.0, 0.0),
+                .h = @max(frame.h - self.scaled(config.padding_y) * 2.0 - self.scaled(config.toolbar_height) - self.scaled(config.toolbar_gap), 0.0),
             });
         }
 
         pub fn toolbarRect(self: *const Component) draw.Rect {
-            const bounds_rect = self.bounds();
+            const frame = self.frameRect();
             return snapRect(.{
-                .x = bounds_rect.x + self.scaled(config.padding_x),
-                .y = bounds_rect.y + bounds_rect.h - self.scaled(config.padding_y) - self.scaled(config.toolbar_height),
-                .w = @max(bounds_rect.w - self.scaled(config.padding_x) * 2.0, 0.0),
+                .x = frame.x + self.scaled(config.padding_x),
+                .y = frame.y + frame.h - self.scaled(config.padding_y) - self.scaled(config.toolbar_height),
+                .w = @max(frame.w - self.scaled(config.padding_x) * 2.0, 0.0),
                 .h = self.scaled(config.toolbar_height),
             });
         }
@@ -755,6 +850,16 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
 
         pub fn modelRect(self: *const Component) draw.Rect {
             return self.toolbarGeometry().model;
+        }
+
+        pub fn directoryRect(self: *const Component) draw.Rect {
+            return self.toolbarGeometry().directory;
+        }
+
+        /// Runtime pill rect; zero width unless it is shown on the outside
+        /// directory strip.
+        pub fn runtimeRect(self: *const Component) draw.Rect {
+            return self.toolbarGeometry().runtime;
         }
 
         pub fn reasoningRect(self: *const Component) draw.Rect {
@@ -775,7 +880,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
 
             const active_border_color = if (self.focused) (self.style.focus_border_color orelse self.style.border_color) else self.style.border_color;
             const active_border_width = self.scaled(if (self.focused) (self.style.focus_border_width orelse config.border_width) else config.border_width);
-            try batch.panel(allocator, self.bounds(), self.style.background_color, active_border_color, self.scaled(config.corner_radius), active_border_width);
+            try batch.panel(allocator, self.frameRect(), self.style.background_color, active_border_color, self.scaled(config.corner_radius), active_border_width);
             try self.renderPromptText(allocator, batch);
             try self.renderToolbar(allocator, batch);
             try self.renderMenu(allocator, batch);
@@ -805,6 +910,9 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             const geometry = self.toolbarGeometry();
             const left_before_fast: draw.Rect = if (self.show_reasoning_toggle) geometry.reasoning else geometry.model;
             // Draw separators under pills so divider lines cannot cover trailing chevrons in the gap.
+            if (self.show_directory_toggle and !self.directoryOutside()) {
+                try self.renderSeparator(allocator, batch, separatorX(geometry.directory, geometry.model), geometry.toolbar);
+            }
             if (self.show_reasoning_toggle) {
                 try self.renderSeparator(allocator, batch, separatorX(geometry.model, geometry.reasoning), geometry.toolbar);
             }
@@ -816,6 +924,12 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 try self.renderSeparator(allocator, batch, separatorX(left_before_access, geometry.access), geometry.toolbar);
             }
 
+            if (self.show_directory_toggle) {
+                try self.renderPill(allocator, batch, true, &.{}, geometry.directory, config.directory_icon, self.directoryLabel(), config.chevron_icon, self.hovered_part == .directory);
+            }
+            if (geometry.runtime.w > 0.0) {
+                try self.renderPill(allocator, batch, true, &.{}, geometry.runtime, config.runtime_icon, self.runtimeLabel(), config.chevron_icon, self.hovered_part == .runtime);
+            }
             try self.renderPill(allocator, batch, true, &.{}, geometry.model, config.model_icon, self.modelLabel(), config.chevron_icon, self.hovered_part == .model or self.active_menu == .model);
             if (self.show_reasoning_toggle) {
                 try self.renderPill(allocator, batch, false, self.reasoningIconSlots(), geometry.reasoning, "", self.reasoningLabel(), config.chevron_icon, self.hovered_part == .reasoning or self.active_menu == .reasoning);
@@ -1231,6 +1345,8 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 self.setFocused(false);
                 self.hovered_part = part;
                 switch (part) {
+                    .directory => self.emit(.directory_clicked),
+                    .runtime => self.emit(.runtime_clicked),
                     .model => {
                         if (!self.external_model_menu) self.toggleMenu(.model);
                         self.emit(.model_clicked);
@@ -1544,6 +1660,14 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             return if (self.placeholder_buffer.items.len > 0) self.placeholder_buffer.items else config.placeholder;
         }
 
+        fn directoryLabel(self: *const Component) []const u8 {
+            return if (self.directory_label_buffer.items.len > 0) self.directory_label_buffer.items else config.directory_label;
+        }
+
+        fn runtimeLabel(self: *const Component) []const u8 {
+            return if (self.runtime_label_buffer.items.len > 0) self.runtime_label_buffer.items else config.runtime_label;
+        }
+
         fn modelLabel(self: *const Component) []const u8 {
             return if (self.model_label_buffer.items.len > 0) self.model_label_buffer.items else config.model_label;
         }
@@ -1801,6 +1925,8 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
 
         fn toolbarGeometry(self: *const Component) struct {
             toolbar: draw.Rect,
+            directory: draw.Rect,
+            runtime: draw.Rect,
             model: draw.Rect,
             reasoning: draw.Rect,
             fast: draw.Rect,
@@ -1819,7 +1945,18 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             });
             // Extra air before the send control so the rightmost pill is not visually glued to the button.
             const max_x = send.x - self.scaled(config.control_gap) * 2.0;
-            const avail = @max(max_x - toolbar.x, 0.0);
+            const avail_total = @max(max_x - toolbar.x, 0.0);
+
+            // The directory pill sits ahead of the shared four-pill budget: it
+            // takes its natural width first and only gives ground once the
+            // other pills have already collapsed to their floors.
+            var directory_w: f32 = if (self.show_directory_toggle)
+                self.pillWidth(true, 0.0, config.directory_icon, self.directoryLabel(), config.chevron_icon, config.directory_min_width, config.directory_max_width)
+            else
+                0.0;
+            const directory_outside = self.directoryOutside();
+            const directory_span = if (self.show_directory_toggle and !directory_outside) directory_w + self.scaled(config.control_gap) else 0.0;
+            const avail = @max(avail_total - directory_span, 0.0);
 
             var model_w = self.pillWidth(true, 0.0, config.model_icon, self.modelLabel(), config.chevron_icon, config.model_min_width, config.model_max_width);
             var reasoning_w: f32 = if (self.show_reasoning_toggle)
@@ -1836,8 +1973,51 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 0.0;
 
             self.shrinkToolbarPillWidthsToFit(avail, &model_w, &reasoning_w, &fast_w, &access_w);
+            if (self.show_directory_toggle and !directory_outside) {
+                const rest = self.toolbarPillsTotalWidth(model_w, reasoning_w, fast_w, access_w);
+                const overflow = rest - avail;
+                if (overflow > 0.5) {
+                    directory_w = @max(directory_w - overflow, self.scaled(config.directory_min_width));
+                }
+            }
 
             var x = toolbar.x;
+            var directory: draw.Rect = undefined;
+            var runtime: draw.Rect = snapRect(.{ .x = toolbar.x + toolbar.w, .y = y, .w = 0.0, .h = control_h });
+            if (directory_outside) {
+                // Own strip under the frame: the directory pill leads at its
+                // natural width and the runtime pill trails at the far edge;
+                // the directory pill yields first if both cannot fit.
+                const strip = self.directoryStripRect();
+                const strip_control_h = @round(@min(strip.h, self.scaled(34.0)));
+                const strip_y = @round(strip.y + (strip.h - strip_control_h) * 0.5);
+                var runtime_w: f32 = if (self.show_runtime_toggle)
+                    @min(self.pillWidth(true, 0.0, config.runtime_icon, self.runtimeLabel(), config.chevron_icon, config.runtime_min_width, config.runtime_max_width), strip.w)
+                else
+                    0.0;
+                const runtime_span = if (self.show_runtime_toggle) runtime_w + self.scaled(config.control_gap) else 0.0;
+                const strip_directory_w = @min(directory_w, @max(strip.w - runtime_span, 0.0));
+                if (self.show_runtime_toggle) {
+                    runtime_w = @min(runtime_w, @max(strip.w - strip_directory_w - self.scaled(config.control_gap), 0.0));
+                    runtime = snapRect(.{
+                        .x = strip.x + strip.w - runtime_w,
+                        .y = strip_y,
+                        .w = runtime_w,
+                        .h = strip_control_h,
+                    });
+                }
+                directory = snapRect(.{
+                    .x = strip.x,
+                    .y = strip_y,
+                    .w = strip_directory_w,
+                    .h = strip_control_h,
+                });
+            } else if (self.show_directory_toggle) {
+                directory = snapRect(.{ .x = x, .y = y, .w = directory_w, .h = control_h });
+                x += directory_w + self.scaled(config.control_gap);
+            } else {
+                directory = snapRect(.{ .x = x, .y = y, .w = 0.0, .h = control_h });
+            }
             const model: draw.Rect = snapRect(.{ .x = x, .y = y, .w = model_w, .h = control_h });
             x += model_w + self.scaled(config.control_gap);
 
@@ -1861,6 +2041,8 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
 
             return .{
                 .toolbar = toolbar,
+                .directory = directory,
+                .runtime = runtime,
                 .model = model,
                 .reasoning = reasoning,
                 .fast = fast,
@@ -1942,7 +2124,62 @@ test "composer prompt hit tests toolbar controls" {
     try std.testing.expectEqual(@as(?ComposerPromptPart, .send), prompt.hitTest(.{ .x = prompt.sendButtonRect().x + 2, .y = prompt.sendButtonRect().y + 2 }));
 }
 
+test "composer prompt outside directory pill sits on a strip below the frame" {
+    const Outside = ComposerPrompt(.{ .directory_outside = true, .toolbar_height = 36.0, .toolbar_gap = 8.0, .padding_y = 16.0 });
+    var prompt = Outside.init();
+    defer prompt.deinit(std.testing.allocator);
+    prompt.setBounds(.{ .x = 0, .y = 0, .w = 600, .h = 200 });
+    // Hidden pill: the frame fills the bounds and the toolbar stays inside.
+    try std.testing.expectEqual(@as(f32, 200.0), prompt.frameRect().h);
+    try std.testing.expectEqual(@as(f32, 0.0), prompt.directoryStripRect().h);
+    prompt.setShowDirectoryToggle(true);
+    const frame = prompt.frameRect();
+    try std.testing.expectEqual(@as(f32, 156.0), frame.h);
+    const toolbar = prompt.toolbarRect();
+    try std.testing.expect(toolbar.y + toolbar.h <= frame.y + frame.h);
+    try std.testing.expectEqual(toolbar.x, prompt.modelRect().x);
+    const directory = prompt.directoryRect();
+    try std.testing.expect(directory.y >= frame.y + frame.h);
+    try std.testing.expect(directory.w > 0.0);
+    try std.testing.expectEqual(@as(?ComposerPromptPart, .directory), prompt.hitTest(.{ .x = directory.x + 2, .y = directory.y + 2 }));
+    // The runtime pill only exists on the strip and trails at the far edge.
+    try std.testing.expectEqual(@as(f32, 0.0), prompt.runtimeRect().w);
+    prompt.setShowRuntimeToggle(true);
+    const runtime = prompt.runtimeRect();
+    try std.testing.expect(runtime.w > 0.0);
+    try std.testing.expectEqual(directory.y, runtime.y);
+    try std.testing.expect(runtime.x > directory.x + directory.w);
+    try std.testing.expectEqual(prompt.directoryStripRect().x + prompt.directoryStripRect().w, runtime.x + runtime.w);
+    try std.testing.expectEqual(@as(?ComposerPromptPart, .runtime), prompt.hitTest(.{ .x = runtime.x + 2, .y = runtime.y + 2 }));
+}
+
+test "composer prompt directory pill is opt-in and leads the toolbar" {
+    const Prompt = ComposerPrompt(.{});
+    var prompt = Prompt.init();
+    defer prompt.deinit(std.testing.allocator);
+
+    // Hidden by default: nothing is reserved ahead of the model pill.
+    try std.testing.expectEqual(@as(f32, 0.0), prompt.directoryRect().w);
+    const model_without_directory = prompt.modelRect();
+
+    prompt.setShowDirectoryToggle(true);
+    try prompt.setDirectoryLabel(std.testing.allocator, "verde");
+    const directory = prompt.directoryRect();
+    try std.testing.expect(directory.w > 0.0);
+    try std.testing.expect(prompt.modelRect().x > model_without_directory.x);
+    try std.testing.expect(directory.x + directory.w <= prompt.modelRect().x);
+    try std.testing.expectEqual(@as(?ComposerPromptPart, .directory), prompt.hitTest(.{ .x = directory.x + 2, .y = directory.y + 2 }));
+    try std.testing.expectEqual(@as(?ComposerPromptPart, .model), prompt.hitTest(.{ .x = prompt.modelRect().x + 2, .y = prompt.modelRect().y + 2 }));
+
+    var probe = ComposerProbe{};
+    defer probe.clipboard.deinit(std.testing.allocator);
+    prompt.setCallbacks(.{ .context = @ptrCast(&probe), .on_event = probeComposerEvent });
+    try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .mouse_down = .{ .x = directory.x + 2, .y = directory.y + 2 } }));
+    try std.testing.expectEqual(@as(usize, 1), probe.directory_clicked);
+}
+
 const ComposerProbe = struct {
+    directory_clicked: usize = 0,
     text_changed: usize = 0,
     submitted: usize = 0,
     model_changed: usize = 0,
@@ -1957,6 +2194,8 @@ fn probeComposerEvent(context: ?*anyopaque, event: ComposerPromptEvent) void {
     switch (event) {
         .text_changed => probe.text_changed += 1,
         .submitted => probe.submitted += 1,
+        .directory_clicked => probe.directory_clicked += 1,
+        .runtime_clicked => {},
         .model_changed => probe.model_changed += 1,
         .fast_changed => probe.fast_changed += 1,
         .access_changed => probe.access_changed += 1,
