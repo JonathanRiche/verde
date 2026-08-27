@@ -1685,15 +1685,10 @@ fn openPrefixTiledWorkspacePane(state: *AppState, kind: HotkeyPaneKind, axis: na
     const project_index = state.project_controller.selected_index;
     const layout = &state.project_controller.projects.items[project_index].workspace_layout;
     const target_pane_id = layout.focused_pane_id orelse return openHotkeyWorkspacePane(state, kind, axis);
-    const created = switch (kind) {
-        .chat => state.splitCurrentProjectWorkspacePaneWithChatPlacement(target_pane_id, axis, true),
-        .terminal => state.splitCurrentProjectWorkspacePaneWithTerminalPlacement(target_pane_id, axis, true),
+    return switch (kind) {
+        .chat => state.splitCurrentProjectWorkspacePaneTiledWithChatPlacement(target_pane_id, axis, true),
+        .terminal => state.splitCurrentProjectWorkspacePaneTiledWithTerminalPlacement(target_pane_id, axis, true),
     };
-    if (!created) return false;
-    const new_pane_id = layout.focused_pane_id orelse return false;
-    if (!layout.joinPaneToScrollGroup(target_pane_id, new_pane_id)) return false;
-    state.markDirty();
-    return true;
 }
 
 // The new-thread policy and pane placement are shared with the sidebar pencil
@@ -1984,7 +1979,9 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 // search field handle their own paste further down the chain.
                 // Don't intercept here when one of them owns focus.
                 if (!state.browser_controller.address_focused and state.palette_modal_text_focus == .none and
-                    !state.composer_controller.model_picker.isOpen())
+                    !state.composer_controller.model_picker.isOpen() and
+                    !state.composer_controller.directory_picker.isOpen() and
+                    !state.composer_controller.runtime_picker.isOpen())
                 {
                     if (state.attachClipboardImageToCurrentDraft()) return true;
                     if (state.pasteClipboardTextIntoPaletteComposer()) return true;
@@ -2547,6 +2544,8 @@ fn syncWindowTextInput(window: *sdl.Window, state: *AppState) void {
         // The model picker's embedded search field consumes typed characters
         // while the popover is open.
         state.composer_controller.model_picker.isOpen() or
+        state.composer_controller.directory_picker.isOpen() or
+        state.composer_controller.runtime_picker.isOpen() or
         state.browser_controller.address_focused or
         state.palette_modal_text_focus != .none or
         (state.isBrowserPaneFocused() and !macosNativeBrowserShouldOwnKeyboard(state));
@@ -2833,6 +2832,7 @@ fn handleGuiChatAction(state: *AppState, action: keybinds.NativeChatAction) bool
     switch (action) {
         .model_picker => state.togglePaletteModelPickerFromShortcut(),
         .run_config => state.toggleRunConfigPopoverFromShortcut(),
+        .directory_picker => state.togglePaletteDirectoryPickerFromShortcut(),
     }
     return true;
 }

@@ -849,10 +849,10 @@ pub fn handleTerminalKeyDown(
     if (keyboard.terminalActionForEvent(event)) |action| {
         switch (action) {
             .new_tab => return self.createCurrentProjectTerminalTab(dock_id, .{}),
-            .split_up => return self.splitFocusedWorkspacePaneWithTerminalPlacement(.horizontal, false),
-            .split_down => return self.splitFocusedWorkspacePaneWithTerminalPlacement(.horizontal, true),
-            .split_left => return self.splitFocusedWorkspacePaneWithTerminalPlacement(.vertical, false),
-            .split_right => return self.splitFocusedWorkspacePaneWithTerminalPlacement(.vertical, true),
+            .split_up => return self.splitFocusedWorkspacePaneTiledWithTerminalPlacement(.horizontal, false),
+            .split_down => return self.splitFocusedWorkspacePaneTiledWithTerminalPlacement(.horizontal, true),
+            .split_left => return self.splitFocusedWorkspacePaneTiledWithTerminalPlacement(.vertical, false),
+            .split_right => return self.splitFocusedWorkspacePaneTiledWithTerminalPlacement(.vertical, true),
             else => {},
         }
     }
@@ -874,10 +874,10 @@ pub fn handleTerminalAction(self: anytype, action: keybinds.NativeTerminalAction
     const dock_id = terminalInputDockId(self) orelse return false;
     switch (action) {
         .new_tab => return self.createCurrentProjectTerminalTab(dock_id, .{}),
-        .split_up => return self.splitFocusedWorkspacePaneWithTerminalPlacement(.horizontal, false),
-        .split_down => return self.splitFocusedWorkspacePaneWithTerminalPlacement(.horizontal, true),
-        .split_left => return self.splitFocusedWorkspacePaneWithTerminalPlacement(.vertical, false),
-        .split_right => return self.splitFocusedWorkspacePaneWithTerminalPlacement(.vertical, true),
+        .split_up => return self.splitFocusedWorkspacePaneTiledWithTerminalPlacement(.horizontal, false),
+        .split_down => return self.splitFocusedWorkspacePaneTiledWithTerminalPlacement(.horizontal, true),
+        .split_left => return self.splitFocusedWorkspacePaneTiledWithTerminalPlacement(.vertical, false),
+        .split_right => return self.splitFocusedWorkspacePaneTiledWithTerminalPlacement(.vertical, true),
         else => {},
     }
     var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return false;

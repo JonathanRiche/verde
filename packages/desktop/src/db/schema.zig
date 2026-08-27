@@ -6,7 +6,7 @@ const zqlite = @import("zqlite");
 /// Latest schema version understood by this build.
 pub const CURRENT_VERSION: i64 = 1;
 /// Maximum schema version understood by read-only clients and the daemon store.
-pub const MAX_SUPPORTED_VERSION: i64 = 5;
+pub const MAX_SUPPORTED_VERSION: i64 = 6;
 /// SQLite busy timeout shared by writer and read-only connections.
 pub const BUSY_TIMEOUT_MS = 5000;
 
@@ -204,6 +204,12 @@ fn migrateToVersion(
                 try conn.execNoArgs("pragma user_version = 5");
                 version = 5;
             },
+            5 => {
+                try migrateV5ToV6(conn);
+                if (failure_point == .before_version_bump) return error.TestMigrationFailure;
+                try conn.execNoArgs("pragma user_version = 6");
+                version = 6;
+            },
             else => return error.DatabaseSchemaInvalid,
         }
     }
@@ -360,6 +366,12 @@ fn migrateV4ToV5(conn: zqlite.Conn) !void {
     try ensureColumn(conn, "messages", "extra_images_json", "alter table messages add column extra_images_json text");
 }
 
+fn migrateV5ToV6(conn: zqlite.Conn) !void {
+    // Per-thread working-directory override. Null keeps the thread on its
+    // workspace path, so every existing row and older client is unaffected.
+    try ensureColumn(conn, "threads", "cwd", "alter table threads add column cwd text");
+}
+
 fn migrateV0ToV1(conn: zqlite.Conn) !void {
     try conn.execNoArgs(INIT_SQL);
     try ensureColumn(conn, "app_state", "sidebar_collapsed", "alter table app_state add column sidebar_collapsed integer not null default 0");
@@ -501,6 +513,10 @@ test "schema migration chain advances v1 to v2 to v3 to v4 and preserves populat
     try std.testing.expectEqual(@as(i64, 5), try userVersion(conn));
     try std.testing.expect(try testHasColumn(conn, "threads", "draft_images_json"));
     try std.testing.expect(try testHasColumn(conn, "messages", "extra_images_json"));
+
+    try migrateToVersion(conn, 6, .none);
+    try std.testing.expectEqual(@as(i64, 6), try userVersion(conn));
+    try std.testing.expect(try testHasColumn(conn, "threads", "cwd"));
 }
 
 test "v1 to v2 migration failure before version bump rolls back cleanly" {

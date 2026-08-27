@@ -1061,6 +1061,8 @@ fn focusWorkspacePaneWithCompletionPolicy(
     // open on a pane that no longer renders them would silently keep
     // eating clicks through the popover routing.
     self.closePaletteModelPicker();
+    self.closePaletteDirectoryPicker();
+    self.closePaletteRuntimePicker();
     self.closeRunConfigPopover();
     var persisted_focus_changed = pane_focus_changed or scroll_group_focus_changed;
     layout.focused_pane_id = pane_id;
@@ -1371,6 +1373,23 @@ pub fn splitCurrentProjectWorkspacePaneWithChatAxis(self: anytype, pane_id: Work
 pub fn splitCurrentProjectWorkspacePaneWithChatPlacement(self: anytype, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis, new_after: bool) bool {
     if (self.project_controller.projects.items.len == 0) return false;
     return self.splitWorkspacePaneWithChatPlacement(self.project_controller.selected_index, pane_id, axis, new_after);
+}
+
+/// Split a chat pane and keep it inside the target scrolling tile.
+pub fn splitCurrentProjectWorkspacePaneTiledWithChatPlacement(
+    self: anytype,
+    pane_id: WorkspacePaneId,
+    axis: WorkspaceSplitAxis,
+    new_after: bool,
+) bool {
+    if (!self.splitCurrentProjectWorkspacePaneWithChatPlacement(pane_id, axis, new_after)) return false;
+    return joinCurrentProjectCreatedPaneToScrollGroup(self, pane_id);
+}
+
+pub fn splitFocusedWorkspacePaneTiledWithChatPlacement(self: anytype, axis: WorkspaceSplitAxis, new_after: bool) bool {
+    if (self.project_controller.projects.items.len == 0) return false;
+    const pane_id = self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout.focused_pane_id orelse return false;
+    return self.splitCurrentProjectWorkspacePaneTiledWithChatPlacement(pane_id, axis, new_after);
 }
 
 pub fn splitWorkspacePaneWithChatAxis(self: anytype, project_index: usize, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis) bool {
@@ -2051,6 +2070,33 @@ pub fn splitCurrentProjectWorkspacePaneWithTerminalAxis(self: anytype, pane_id: 
 pub fn splitCurrentProjectWorkspacePaneWithTerminalPlacement(self: anytype, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis, new_after: bool) bool {
     if (self.project_controller.projects.items.len == 0) return false;
     return self.splitWorkspacePaneWithTerminalPlacement(self.project_controller.selected_index, pane_id, axis, new_after);
+}
+
+/// Split a terminal pane and keep it inside the target scrolling tile.
+pub fn splitCurrentProjectWorkspacePaneTiledWithTerminalPlacement(
+    self: anytype,
+    pane_id: WorkspacePaneId,
+    axis: WorkspaceSplitAxis,
+    new_after: bool,
+) bool {
+    if (!self.splitCurrentProjectWorkspacePaneWithTerminalPlacement(pane_id, axis, new_after)) return false;
+    return joinCurrentProjectCreatedPaneToScrollGroup(self, pane_id);
+}
+
+pub fn splitFocusedWorkspacePaneTiledWithTerminalPlacement(self: anytype, axis: WorkspaceSplitAxis, new_after: bool) bool {
+    if (self.project_controller.projects.items.len == 0) return false;
+    const pane_id = self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout.focused_pane_id orelse return false;
+    return self.splitCurrentProjectWorkspacePaneTiledWithTerminalPlacement(pane_id, axis, new_after);
+}
+
+fn joinCurrentProjectCreatedPaneToScrollGroup(self: anytype, target_pane_id: WorkspacePaneId) bool {
+    if (self.project_controller.projects.items.len == 0) return false;
+    var layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
+    const new_pane_id = layout.focused_pane_id orelse return false;
+    if (new_pane_id == target_pane_id) return true;
+    if (!layout.joinPaneToScrollGroup(target_pane_id, new_pane_id)) return false;
+    self.markDirty();
+    return true;
 }
 
 pub fn splitWorkspacePaneWithTerminalAxis(self: anytype, project_index: usize, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis) bool {

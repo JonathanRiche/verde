@@ -214,6 +214,8 @@ pub const PersistedThread = struct {
     provider: Provider = .opencode,
     harness: Harness = .local_cli,
     tui_dock_id: ?u32 = null,
+    /// Per-thread working-directory override; null follows the workspace path.
+    cwd: ?[]const u8 = null,
     draft: []const u8 = "",
     draft_image: ?PersistedImageAttachment = null,
     /// Composer attachments past the primary `draft_image`. Additive

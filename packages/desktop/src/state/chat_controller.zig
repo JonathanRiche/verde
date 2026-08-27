@@ -1457,6 +1457,12 @@ test "acceptance keeps the optimistic clear, retains message id, and restores re
     try std.testing.expectEqual(@as(usize, 0), state.chat_controller.pending_send_count);
 }
 
+/// Directory a local provider session should run in: the thread's override
+/// when the user switched it, otherwise the owning workspace path.
+pub fn effectiveThreadCwd(project_path: []const u8, thread: *const ChatThread) []const u8 {
+    return if (thread.cwd) |cwd| std.mem.sliceTo(cwd, 0) else project_path;
+}
+
 pub fn providerExecutionTargetForProjectThread(
     self: anytype,
     project_index: usize,
@@ -1465,7 +1471,7 @@ pub fn providerExecutionTargetForProjectThread(
 ) ?ProviderExecutionTarget {
     if (project_index >= self.project_controller.projects.items.len) return null;
     const project = &self.project_controller.projects.items[project_index];
-    const link = project.herdr_link orelse return .{ .local = project.path };
+    const link = project.herdr_link orelse return .{ .local = effectiveThreadCwd(project.path, thread) };
 
     if (link.remote_alias.len == 0) {
         self.setSidebarNotice("Local Herdr GUI sends use the Herdr terminal/TUI pane for now.");
@@ -1538,7 +1544,8 @@ pub fn beginBangCommand(self: anytype, command: []const u8) !void {
     state.provider = null;
     state.local_command = true;
     state.local_command_text = try page_alloc.dupe(u8, command);
-    state.local_command_cwd = try page_alloc.dupe(u8, self.currentProject().path);
+    const command_cwd = effectiveThreadCwd(self.currentProject().path, self.currentThread());
+    state.local_command_cwd = try page_alloc.dupe(u8, command_cwd);
     state.local_command_shell = try page_alloc.dupe(u8, bang_commands.shellName());
     state.partial_text.clearRetainingCapacity();
     freePendingTimelineEventsLocked(page_alloc, &state.pending_events);
@@ -1546,7 +1553,7 @@ pub fn beginBangCommand(self: anytype, command: []const u8) !void {
         command,
         self.currentProject().label,
         bang_commands.shellName(),
-        self.currentProject().path,
+        command_cwd,
     });
     try state.pending_events.append(page_alloc, .{
         .role = .system,
@@ -1569,7 +1576,7 @@ pub fn beginBangCommand(self: anytype, command: []const u8) !void {
             command,
             self.currentProject().label,
             bang_commands.shellName(),
-            self.currentProject().path,
+            command_cwd,
             if (destructive) "destructive command; explicit approval required" else "Supervised workspace; approval required",
         });
         state.pending_approval = .{
@@ -1583,7 +1590,7 @@ pub fn beginBangCommand(self: anytype, command: []const u8) !void {
     request.* = .{
         .send_state = state,
         .command = try page_alloc.dupe(u8, command),
-        .cwd = try page_alloc.dupe(u8, self.currentProject().path),
+        .cwd = try page_alloc.dupe(u8, command_cwd),
         .require_confirmation = require_confirmation,
     };
     state.worker_done.store(false, .release);
@@ -2019,34 +2026,35 @@ pub fn sendPromptViaHarness(self: anytype, prompt: []const u8) !ai_harness.SendP
         return error.UnsupportedHarnessMode;
     }
 
+    const provider_cwd = effectiveThreadCwd(project.path, thread);
     const provider_config = switch (thread.provider) {
         .opencode => ai_harness.ProviderConfig{
             .opencode = .{
                 .allocator = self.allocator,
-                .working_directory = project.path,
+                .working_directory = provider_cwd,
                 .launch_if_missing = true,
             },
         },
         .codex => ai_harness.ProviderConfig{
             .codex = .{
-                .cwd = project.path,
+                .cwd = provider_cwd,
                 .launch_on_connect = false,
             },
         },
         .claude => ai_harness.ProviderConfig{
             .claude = .{
-                .cwd = project.path,
+                .cwd = provider_cwd,
             },
         },
         .cursor => ai_harness.ProviderConfig{
             .cursor = .{
-                .cwd = project.path,
+                .cwd = provider_cwd,
                 .model = if (thread.model_ref) |model_ref| model_ref else null,
             },
         },
         .pi => ai_harness.ProviderConfig{
             .pi = .{
-                .cwd = project.path,
+                .cwd = provider_cwd,
             },
         },
     };
@@ -2061,7 +2069,7 @@ pub fn sendPromptViaHarness(self: anytype, prompt: []const u8) !ai_harness.SendP
         .thread_id = if (thread.provider_thread_id) |thread_id| thread_id else null,
         .thread_title = thread.title,
         .prompt = prompt,
-        .cwd = project.path,
+        .cwd = provider_cwd,
         .model = if (thread.model_ref) |model_ref| model_ref else null,
         .opencode_variant = if (thread.provider == .opencode) thread.opencode_reasoning_variant else null,
         .cursor_model_params_json = cursor_model_params_json,
@@ -2219,6 +2227,9 @@ const AcceptanceTurnStartParams = struct {
     access_mode: []const u8,
     remote_ssh_host: ?[]const u8,
     remote_cwd: ?[]const u8,
+    /// Thread working-directory override; the daemon falls back to
+    /// `project_path` when null.
+    cwd: ?[]const u8 = null,
     message_id: []const u8,
 };
 
@@ -2407,6 +2418,7 @@ pub fn dispatchDaemonAcceptance(
         .access_mode = @tagName(thread.access_mode),
         .remote_ssh_host = if (execution_target.remoteHost()) |host| try arena.dupe(u8, host) else null,
         .remote_cwd = if (execution_target.remoteHost() != null) try arena.dupe(u8, execution_target.cwd()) else null,
+        .cwd = if (thread.cwd) |cwd| try arena.dupe(u8, cwd) else null,
         .message_id = message_id,
     };
 
@@ -2780,6 +2792,7 @@ pub fn startDaemonChatTurn(
         .access_mode = @tagName(thread.access_mode),
         .remote_ssh_host = if (execution_target.remoteHost()) |host| host else null,
         .remote_cwd = if (execution_target.remoteHost() != null) execution_cwd else null,
+        .cwd = if (thread.cwd) |cwd| @as(?[]const u8, cwd) else null,
         // Additive M4 param: stages this stable id at acceptance (daemon worker).
         .message_id = message_id,
     }, 1);

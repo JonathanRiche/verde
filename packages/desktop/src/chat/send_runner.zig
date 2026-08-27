@@ -12,6 +12,8 @@ pub const Request = struct {
     provider: harness.Provider,
     harness_kind: harness.HarnessKind,
     project_path: []const u8,
+    /// Per-thread working-directory override; null follows `project_path`.
+    cwd: ?[]const u8 = null,
     prompt: []const u8,
     image_paths: []const []const u8 = &.{},
     provider_thread_id: ?[]const u8 = null,
@@ -46,7 +48,7 @@ pub fn run(allocator: std.mem.Allocator, request: Request, sink: Sink) !Result {
     if (request.harness_kind != .local_cli) return error.UnsupportedHarnessMode;
     if (request.remote_ssh_host != null and request.provider != .codex) return error.UnsupportedRemoteProvider;
 
-    const request_cwd = request.remote_cwd orelse request.project_path;
+    const request_cwd = request.remote_cwd orelse request.cwd orelse request.project_path;
     const provider_config = switch (request.provider) {
         .opencode => harness.ProviderConfig{ .opencode = .{
             .allocator = allocator,

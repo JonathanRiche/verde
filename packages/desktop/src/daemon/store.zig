@@ -1354,6 +1354,7 @@ pub const Store = struct {
                 &.{},
                 0,
                 legacy_messages,
+                null,
                 store_revision,
             );
         } else {
@@ -1416,6 +1417,7 @@ pub const Store = struct {
                 thread.draft_images,
                 thread.message_offset,
                 thread.messages,
+                thread.cwd,
                 store_revision,
             );
             return;
@@ -1431,7 +1433,7 @@ pub const Store = struct {
         const draft_images_json = try encodeExtraImagesJson(self.allocator, thread.draft_images);
         defer if (draft_images_json) |value| self.allocator.free(value);
         try self.conn.exec(
-            "update threads set sort_index = ?1, title = ?2, archived = ?3, committed = ?4, last_activity_at = ?5, provider_thread_id = ?6, model_ref = ?7, reasoning_effort = ?8, reasoning_variant = ?9, fast_mode = ?10, access_mode = ?11, provider = ?12, harness = ?13, tui_dock_id = ?14, draft = ?15, draft_image_path = ?16, draft_image_mime = ?17, draft_image_byte_size = ?18, draft_images_json = ?19 where id = ?20",
+            "update threads set sort_index = ?1, title = ?2, archived = ?3, committed = ?4, last_activity_at = ?5, provider_thread_id = ?6, model_ref = ?7, reasoning_effort = ?8, reasoning_variant = ?9, fast_mode = ?10, access_mode = ?11, provider = ?12, harness = ?13, tui_dock_id = ?14, draft = ?15, draft_image_path = ?16, draft_image_mime = ?17, draft_image_byte_size = ?18, draft_images_json = ?19, cwd = ?20 where id = ?21",
             .{
                 @as(i64, @intCast(thread_index)),
                 thread.title,
@@ -1452,6 +1454,7 @@ pub const Store = struct {
                 if (primary_draft_image) |value| value.mime else null,
                 if (primary_draft_image) |value| @as(i64, @intCast(value.byte_size)) else null,
                 draft_images_json,
+                thread.cwd,
                 thread_row_id,
             },
         );
@@ -1586,7 +1589,8 @@ pub const Store = struct {
             \\    draft_image_path text,
             \\    draft_image_mime text,
             \\    draft_image_byte_size integer,
-            \\    draft_images_json text
+            \\    draft_images_json text,
+            \\    cwd text
             \\);
             \\create temp table if not exists preserved_workspaces (
             \\    workspace_id text not null,
@@ -1686,7 +1690,7 @@ pub const Store = struct {
             \\       t.last_activity_at, t.provider_thread_id, t.model_ref, t.reasoning_effort,
             \\       t.reasoning_variant, t.fast_mode, t.access_mode, t.provider, t.harness, t.tui_dock_id,
             \\       t.draft, t.draft_image_path, t.draft_image_mime, t.draft_image_byte_size,
-            \\       t.draft_images_json
+            \\       t.draft_images_json, t.cwd
             \\from threads t join workspaces w on w.id = t.workspace_id
             \\where t.local_thread_id is not null and (
             \\    t.committed != 0
@@ -1915,14 +1919,14 @@ pub const Store = struct {
             \\insert into threads (workspace_id, sort_index, title, archived, committed, local_thread_id,
             \\                     last_activity_at, provider_thread_id, model_ref, reasoning_effort,
             \\                     reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id,
-            \\                     draft, draft_image_path, draft_image_mime, draft_image_byte_size, draft_images_json)
+            \\                     draft, draft_image_path, draft_image_mime, draft_image_byte_size, draft_images_json, cwd)
             \\select w.id,
             \\       (select coalesce(max(t2.sort_index) + 1, 0) from threads t2 where t2.workspace_id = w.id)
             \\           + (row_number() over (partition by p.workspace_key order by p.sort_index) - 1),
             \\       p.title, p.archived, p.committed, p.local_thread_id, p.last_activity_at,
             \\       p.provider_thread_id, p.model_ref, p.reasoning_effort, p.reasoning_variant,
             \\       p.fast_mode, p.access_mode, p.provider, p.harness, p.tui_dock_id,
-            \\       p.draft, p.draft_image_path, p.draft_image_mime, p.draft_image_byte_size, p.draft_images_json
+            \\       p.draft, p.draft_image_path, p.draft_image_mime, p.draft_image_byte_size, p.draft_images_json, p.cwd
             \\from temp.preserved_chat_threads p
             \\join workspaces w on w.workspace_id = p.workspace_key
             \\where not exists (
@@ -2008,7 +2012,7 @@ pub const Store = struct {
             const draft_images_json = try encodeExtraImagesJson(self.allocator, thread.draft_images);
             defer if (draft_images_json) |value| self.allocator.free(value);
             try self.conn.exec(
-                "update threads set title = ?1, archived = ?2, committed = ?3, last_activity_at = ?4, provider_thread_id = ?5, model_ref = ?6, reasoning_effort = ?7, reasoning_variant = ?8, fast_mode = ?9, access_mode = ?10, provider = ?11, harness = ?12, tui_dock_id = ?13, draft = ?14, draft_image_path = ?15, draft_image_mime = ?16, draft_image_byte_size = ?17, draft_images_json = ?18 where id = ?19",
+                "update threads set title = ?1, archived = ?2, committed = ?3, last_activity_at = ?4, provider_thread_id = ?5, model_ref = ?6, reasoning_effort = ?7, reasoning_variant = ?8, fast_mode = ?9, access_mode = ?10, provider = ?11, harness = ?12, tui_dock_id = ?13, draft = ?14, draft_image_path = ?15, draft_image_mime = ?16, draft_image_byte_size = ?17, draft_images_json = ?18, cwd = ?19 where id = ?20",
                 .{
                     thread.title,
                     boolToInt(thread.archived),
@@ -2028,6 +2032,7 @@ pub const Store = struct {
                     if (primary_draft_image) |value| value.mime else null,
                     if (primary_draft_image) |value| @as(i64, @intCast(value.byte_size)) else null,
                     draft_images_json,
+                    thread.cwd,
                     row.int(0),
                 },
             );
@@ -2056,6 +2061,7 @@ pub const Store = struct {
             thread.draft_images,
             0,
             &.{},
+            thread.cwd,
             null,
         );
     }
@@ -2265,6 +2271,7 @@ pub const Store = struct {
         legacy_thread.reasoning_variant = null;
         legacy_thread.fast_mode = null;
         legacy_thread.access_mode = null;
+        legacy_thread.cwd = null;
         const thread_fingerprint = try self.fingerprintValue(.{
             .workspace_id = request.workspace.workspace_id,
             .thread = legacy_thread,
@@ -2624,6 +2631,7 @@ pub const Store = struct {
                 &.{},
                 0,
                 legacy_messages,
+                null,
                 store_revision,
             );
         } else {
@@ -2650,6 +2658,7 @@ pub const Store = struct {
                     thread.draft_images,
                     thread.message_offset,
                     thread.messages,
+                    thread.cwd,
                     store_revision,
                 );
             }
@@ -2679,6 +2688,7 @@ pub const Store = struct {
         draft_images: []const store_protocol.Attachment,
         message_offset: usize,
         messages: []const store_protocol.Message,
+        cwd: ?[]const u8,
         store_revision: ?i64,
     ) !void {
         const provider_code = try providerCode(provider);
@@ -2691,8 +2701,8 @@ pub const Store = struct {
         defer if (draft_images_json) |value| self.allocator.free(value);
 
         try self.conn.exec(
-            "insert into threads (workspace_id, sort_index, title, archived, committed, local_thread_id, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size, draft_images_json) " ++
-                "values (?1, coalesce(?2, (select coalesce(max(sort_index) + 1, 0) from threads where workspace_id = ?1)), ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+            "insert into threads (workspace_id, sort_index, title, archived, committed, local_thread_id, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size, draft_images_json, cwd) " ++
+                "values (?1, coalesce(?2, (select coalesce(max(sort_index) + 1, 0) from threads where workspace_id = ?1)), ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             .{
                 workspace_row_id,
                 sort_index,
@@ -2715,6 +2725,7 @@ pub const Store = struct {
                 if (primary_draft_image) |value| value.mime else null,
                 if (primary_draft_image) |value| @as(i64, @intCast(value.byte_size)) else null,
                 draft_images_json,
+                cwd,
             },
         );
         const thread_row_id = self.conn.lastInsertedRowId();

@@ -1897,6 +1897,7 @@ const ChatTurn = struct {
 
 fn freeRunnerRequest(allocator: std.mem.Allocator, request: send_runner.Request, image_paths: []const []const u8) void {
     allocator.free(request.project_path);
+    if (request.cwd) |value| allocator.free(value);
     allocator.free(request.prompt);
     for (image_paths) |path| allocator.free(path);
     allocator.free(image_paths);
@@ -7351,7 +7352,7 @@ fn loadThreadGetResult(
     const meta_or_null = store.conn.row(
         \\select t.local_thread_id, t.title, t.archived, t.committed, t.last_activity_at,
         \\       t.provider_thread_id, t.model_ref, t.reasoning_effort, t.reasoning_variant,
-        \\       t.fast_mode, t.access_mode, t.provider, t.harness, t.id, t.draft
+        \\       t.fast_mode, t.access_mode, t.provider, t.harness, t.id, t.draft, t.cwd
         \\from threads t
         \\join workspaces w on w.id = t.workspace_id
         \\where w.workspace_id = ?1 and t.local_thread_id = ?2
@@ -7378,6 +7379,8 @@ fn loadThreadGetResult(
     errdefer allocator.free(harness_name);
     const draft = allocator.dupe(u8, meta.text(14)) catch return error.OutOfMemory;
     errdefer allocator.free(draft);
+    const cwd = dupeOptionalText(allocator, meta.nullableText(15)) catch return error.OutOfMemory;
+    errdefer if (cwd) |value| allocator.free(value);
     const archived = meta.int(2) != 0;
     const committed = meta.int(3) != 0;
     const last_activity_at = meta.nullableInt(4);
@@ -7459,6 +7462,7 @@ fn loadThreadGetResult(
             .provider = provider,
             .harness = harness_name,
             .draft = draft,
+            .cwd = cwd,
             .messages = try messages_list.toOwnedSlice(allocator),
         },
         .store_revision = store_revision,
@@ -7474,6 +7478,7 @@ fn freeThreadGetResult(allocator: std.mem.Allocator, result: store_protocol.Thre
     allocator.free(result.thread.provider);
     allocator.free(result.thread.harness);
     allocator.free(result.thread.draft);
+    if (result.thread.cwd) |value| allocator.free(value);
     for (result.thread.messages) |message| freeOwnedMessage(allocator, message);
     allocator.free(result.thread.messages);
 }
@@ -7577,7 +7582,7 @@ fn loadThreadListResult(
     var rows = store.conn.rows(
         \\select t.local_thread_id, t.title, t.archived, t.committed, t.last_activity_at,
         \\       t.provider_thread_id, t.model_ref, t.reasoning_effort, t.reasoning_variant,
-        \\       t.fast_mode, t.access_mode, t.provider, t.harness, t.sort_index
+        \\       t.fast_mode, t.access_mode, t.provider, t.harness, t.sort_index, t.cwd
         \\from threads t
         \\join workspaces w on w.id = t.workspace_id
         \\where w.workspace_id = ?1
@@ -7602,6 +7607,8 @@ fn loadThreadListResult(
         errdefer allocator.free(provider);
         const harness_name = allocator.dupe(u8, harnessNameFromCode(row.int(12))) catch return error.OutOfMemory;
         errdefer allocator.free(harness_name);
+        const cwd = dupeOptionalText(allocator, row.nullableText(14)) catch return error.OutOfMemory;
+        errdefer if (cwd) |value| allocator.free(value);
         items.append(allocator, .{
             .local_thread_id = local_thread_id,
             .title = title,
@@ -7617,6 +7624,7 @@ fn loadThreadListResult(
             .access_mode = if (row.nullableInt(10)) |code| accessModeNameFromCode(code) else null,
             .provider = provider,
             .harness = harness_name,
+            .cwd = cwd,
         }) catch return error.OutOfMemory;
     }
     if (rows.err) |_| return error.StoreUnavailable;
@@ -7643,6 +7651,7 @@ fn freeThreadListItem(allocator: std.mem.Allocator, item: store_protocol.ThreadL
     if (item.reasoning_variant) |value| allocator.free(value);
     allocator.free(item.provider);
     allocator.free(item.harness);
+    if (item.cwd) |value| allocator.free(value);
 }
 
 fn dupeOptionalText(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
@@ -8228,7 +8237,7 @@ fn loadSnapshotContents(
                 \\select id, local_thread_id, title, archived, committed, last_activity_at,
                 \\       provider_thread_id, model_ref, reasoning_effort, reasoning_variant,
                 \\       fast_mode, access_mode, provider, harness, tui_dock_id, draft,
-                \\       draft_image_path, draft_image_mime, draft_image_byte_size, draft_images_json
+                \\       draft_image_path, draft_image_mime, draft_image_byte_size, draft_images_json, cwd
                 \\from threads where workspace_id = ?1 order by sort_index
             , .{workspace_row.row_id}) catch return error.StoreUnavailable;
             defer rows.deinit();
@@ -8259,6 +8268,7 @@ fn loadSnapshotContents(
                         .draft = arena.dupe(u8, row.nullableText(15) orelse "") catch return error.OutOfMemory,
                         .draft_image = draft_image,
                         .draft_images = draft_images,
+                        .cwd = dupeOptionalText(arena, row.nullableText(20)) catch return error.OutOfMemory,
                     },
                 }) catch return error.OutOfMemory;
             }
@@ -9623,6 +9633,7 @@ fn createChatTurnFromParams(allocator: std.mem.Allocator, params: std.json.Value
         .access_mode = parseAccessMode(jsonString(params.object.get("access_mode") orelse .null)),
         .remote_ssh_host = try optionalDupe(allocator, params, "remote_ssh_host"),
         .remote_cwd = try optionalDupe(allocator, params, "remote_cwd"),
+        .cwd = try optionalDupe(allocator, params, "cwd"),
     };
     const user_message_id = try optionalDupe(allocator, params, "message_id");
     errdefer if (user_message_id) |value| allocator.free(value);
@@ -9740,6 +9751,7 @@ fn maybeGenerateAutomaticChatTurnTitle(daemon: *Daemon, turn: *ChatTurn) void {
         .provider = provider,
         .harness_kind = .local_cli,
         .project_path = turn.request.project_path,
+        .cwd = turn.request.cwd,
         .prompt = title_prompt,
         .model_ref = config.chatTitleModel(),
         .fast_mode = if (provider == .codex) .on else .off,

@@ -70,6 +70,7 @@ pub const NativeTerminalAction = enum {
 pub const NativeChatAction = enum {
     model_picker,
     run_config,
+    directory_picker,
 };
 
 /// What a prefix chord resolves to. Mirrors every dispatch surface the direct
@@ -218,6 +219,7 @@ pub const NativeKeyboardConfig = struct {
     chat_page_down: []Keybind,
     chat_model_picker: []Keybind,
     chat_run_config: []Keybind,
+    chat_directory_picker: []Keybind,
     workspace_previous: []Keybind,
     workspace_next: []Keybind,
     workspace_active_previous: []Keybind,
@@ -282,6 +284,7 @@ pub const NativeKeyboardConfig = struct {
             .chat_page_down = try cloneDefaultChatPageDownKeybinds(allocator),
             .chat_model_picker = try cloneDefaultChatModelPickerKeybinds(allocator),
             .chat_run_config = try cloneDefaultChatRunConfigKeybinds(allocator),
+            .chat_directory_picker = try cloneDefaultChatDirectoryPickerKeybinds(allocator),
             .workspace_previous = try cloneDefaultWorkspacePreviousKeybinds(allocator),
             .workspace_next = try cloneDefaultWorkspaceNextKeybinds(allocator),
             .workspace_active_previous = try cloneDefaultWorkspaceActivePreviousKeybinds(allocator),
@@ -357,6 +360,7 @@ pub const NativeKeyboardConfig = struct {
         self.allocator.free(self.chat_page_down);
         self.allocator.free(self.chat_model_picker);
         self.allocator.free(self.chat_run_config);
+        self.allocator.free(self.chat_directory_picker);
         self.allocator.free(self.workspace_previous);
         self.allocator.free(self.workspace_next);
         self.allocator.free(self.workspace_active_previous);
@@ -561,6 +565,7 @@ pub const NativeKeyboardConfig = struct {
     pub fn chatActionForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) ?NativeChatAction {
         if (matchesAny(self.chat_model_picker, event)) return .model_picker;
         if (matchesAny(self.chat_run_config, event)) return .run_config;
+        if (matchesAny(self.chat_directory_picker, event)) return .directory_picker;
         return null;
     }
 
@@ -774,6 +779,12 @@ pub const NativeKeyboardConfig = struct {
             if (self.parseOverrideValue(value, "chat.run_config")) |bindings| {
                 self.allocator.free(self.chat_run_config);
                 self.chat_run_config = bindings;
+            }
+        }
+        if (chat_value.object.get("directory_picker")) |value| {
+            if (self.parseOverrideValue(value, "chat.directory_picker")) |bindings| {
+                self.allocator.free(self.chat_directory_picker);
+                self.chat_directory_picker = bindings;
             }
         }
     }
@@ -1301,6 +1312,7 @@ const PREFIX_ACTION_NAMES = [_]PrefixActionName{
     .{ .name = "chat_page_down", .target = .{ .app = .chat_page_down } },
     .{ .name = "chat.model_picker", .target = .{ .chat = .model_picker } },
     .{ .name = "chat.run_config", .target = .{ .chat = .run_config } },
+    .{ .name = "chat.directory_picker", .target = .{ .chat = .directory_picker } },
     .{ .name = "terminal.toggle", .target = .{ .app = .toggle_terminal } },
     .{ .name = "terminal.new_tab", .target = .{ .terminal = .new_tab } },
     .{ .name = "terminal.close", .target = .{ .terminal = .close_active } },
@@ -1433,6 +1445,7 @@ pub fn prefixTargetLabel(buf: []u8, target: PrefixTarget) []const u8 {
         .chat => |action| switch (action) {
             .model_picker => "Model picker",
             .run_config => "Run settings",
+            .directory_picker => "Directory picker",
         },
         .focus_prompt => "Focus prompt",
         .new_terminal => "New terminal",
@@ -1612,6 +1625,7 @@ const DEFAULT_PREFIX_TABLE = [_]DefaultPrefixEntry{
     .{ .accelerator = "PageDown", .target = "chat_page_down" },
     .{ .accelerator = "M", .target = "chat.model_picker" },
     .{ .accelerator = "Shift+M", .target = "chat.run_config" },
+    .{ .accelerator = "D", .target = "chat.directory_picker" },
     // Terminal (only while a terminal pane is focused)
     .{ .accelerator = "Ctrl+T", .target = "terminal.new_tab" },
     .{ .accelerator = "Shift+W", .target = "terminal.close" },
@@ -1783,6 +1797,12 @@ fn cloneDefaultChatPageDownKeybinds(allocator: std.mem.Allocator) ![]Keybind {
 fn cloneDefaultChatModelPickerKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("Alt+M"),
+    });
+}
+
+fn cloneDefaultChatDirectoryPickerKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Alt+D"),
     });
 }
 
@@ -2967,6 +2987,9 @@ test "default GUI chat composer keybinds use alt mnemonics" {
     try std.testing.expectEqual(@as(usize, 1), config.chat_run_config.len);
     try std.testing.expect(config.chat_run_config[0].alt);
     try std.testing.expectEqual(sdl.Keycode.r, config.chat_run_config[0].key);
+    try std.testing.expectEqual(@as(usize, 1), config.chat_directory_picker.len);
+    try std.testing.expect(config.chat_directory_picker[0].alt);
+    try std.testing.expectEqual(sdl.Keycode.d, config.chat_directory_picker[0].key);
 }
 
 test "GUI chat composer keybinds are configurable and disableable" {
@@ -2976,7 +2999,8 @@ test "GUI chat composer keybinds are configurable and disableable" {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
         \\{"keybinds": {"chat": {
         \\  "model_picker": "Ctrl+Shift+M",
-        \\  "run_config": null
+        \\  "run_config": null,
+        \\  "directory_picker": "Ctrl+Shift+D"
         \\}}}
     , .{});
     defer parsed.deinit();
@@ -2988,6 +3012,10 @@ test "GUI chat composer keybinds are configurable and disableable" {
     try std.testing.expect(config.chat_model_picker[0].shift);
     try std.testing.expectEqual(sdl.Keycode.m, config.chat_model_picker[0].key);
     try std.testing.expectEqual(@as(usize, 0), config.chat_run_config.len);
+    try std.testing.expectEqual(@as(usize, 1), config.chat_directory_picker.len);
+    try std.testing.expect(config.chat_directory_picker[0].ctrl);
+    try std.testing.expect(config.chat_directory_picker[0].shift);
+    try std.testing.expectEqual(sdl.Keycode.d, config.chat_directory_picker[0].key);
 }
 
 test "chat page down keybind override accepts a single accelerator" {

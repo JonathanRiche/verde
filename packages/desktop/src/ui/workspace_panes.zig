@@ -1151,35 +1151,35 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
                 split_menu_open_for = null;
             },
             .split_chat_left => {
-                _ = state.splitCurrentProjectWorkspacePaneWithChatPlacement(hit.pane_id, .vertical, false);
+                _ = state.splitCurrentProjectWorkspacePaneTiledWithChatPlacement(hit.pane_id, .vertical, false);
                 split_menu_open_for = null;
             },
             .split_chat_right => {
-                _ = state.splitCurrentProjectWorkspacePaneWithChatPlacement(hit.pane_id, .vertical, true);
+                _ = state.splitCurrentProjectWorkspacePaneTiledWithChatPlacement(hit.pane_id, .vertical, true);
                 split_menu_open_for = null;
             },
             .split_chat_up => {
-                _ = state.splitCurrentProjectWorkspacePaneWithChatPlacement(hit.pane_id, .horizontal, false);
+                _ = state.splitCurrentProjectWorkspacePaneTiledWithChatPlacement(hit.pane_id, .horizontal, false);
                 split_menu_open_for = null;
             },
             .split_chat_down => {
-                _ = state.splitCurrentProjectWorkspacePaneWithChatPlacement(hit.pane_id, .horizontal, true);
+                _ = state.splitCurrentProjectWorkspacePaneTiledWithChatPlacement(hit.pane_id, .horizontal, true);
                 split_menu_open_for = null;
             },
             .split_terminal_left => {
-                _ = state.splitCurrentProjectWorkspacePaneWithTerminalPlacement(hit.pane_id, .vertical, false);
+                _ = state.splitCurrentProjectWorkspacePaneTiledWithTerminalPlacement(hit.pane_id, .vertical, false);
                 split_menu_open_for = null;
             },
             .split_terminal_right => {
-                _ = state.splitCurrentProjectWorkspacePaneWithTerminalPlacement(hit.pane_id, .vertical, true);
+                _ = state.splitCurrentProjectWorkspacePaneTiledWithTerminalPlacement(hit.pane_id, .vertical, true);
                 split_menu_open_for = null;
             },
             .split_terminal_up => {
-                _ = state.splitCurrentProjectWorkspacePaneWithTerminalPlacement(hit.pane_id, .horizontal, false);
+                _ = state.splitCurrentProjectWorkspacePaneTiledWithTerminalPlacement(hit.pane_id, .horizontal, false);
                 split_menu_open_for = null;
             },
             .split_terminal_down => {
-                _ = state.splitCurrentProjectWorkspacePaneWithTerminalPlacement(hit.pane_id, .horizontal, true);
+                _ = state.splitCurrentProjectWorkspacePaneTiledWithTerminalPlacement(hit.pane_id, .horizontal, true);
                 split_menu_open_for = null;
             },
             .close => {
@@ -3507,6 +3507,53 @@ test "variable scrolling extents keep a uniform strip equivalent" {
     const mixed = [_]f32{ 700.0, 400.0, 500.0 };
     try std.testing.expectApproxEqAbs(@as(f32, 1112.0), scrollingPaneOrigin(&mixed, 12.0, 2), 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 1112.0), leadingScrollTargetForPane(&mixed, 12.0, 2, 2000.0), 0.0001);
+}
+
+test "menu split keeps the new pane inside the target scrolling tile" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try storage_mod.Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+    var state = try runtime.AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    defer {
+        state.lifecycle.clearDirty();
+        state.deinit();
+    }
+
+    for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+    state.project_controller.projects.clearRetainingCapacity();
+    state.lifecycle.clearDirty();
+
+    var project = try runtime.Project.init(allocator, "menu-split", "Menu split", "/tmp/menu-split", 0);
+    const first_pane_id = project.workspace_layout.focused_pane_id orelse return error.TestExpectedEqual;
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    state.project_controller.selected_index = 0;
+
+    try std.testing.expect(state.splitCurrentProjectWorkspacePaneTiledWithChatPlacement(first_pane_id, .vertical, true));
+    var layout = &state.project_controller.projects.items[0].workspace_layout;
+    const tiled_pane_id = layout.focused_pane_id orelse return error.TestExpectedEqual;
+    try std.testing.expect(tiled_pane_id != first_pane_id);
+    try std.testing.expect(layout.panesShareScrollGroup(first_pane_id, tiled_pane_id));
+    try std.testing.expectEqual(@as(usize, 2), layout.scrollGroupPaneCount(layout.scrollGroupIdForPane(first_pane_id).?));
+
+    var group_ids: [MAX_WORKSPACE_PANE_RECTS]runtime.WorkspacePaneId = undefined;
+    var representative_ids: [MAX_WORKSPACE_PANE_RECTS]runtime.WorkspacePaneId = undefined;
+    try std.testing.expectEqual(@as(usize, 1), collectScrollingGroups(layout, &group_ids, &representative_ids));
+
+    try std.testing.expect(state.splitCurrentProjectWorkspacePaneWithChatPlacement(first_pane_id, .vertical, true));
+    layout = &state.project_controller.projects.items[0].workspace_layout;
+    const standalone_pane_id = layout.focused_pane_id orelse return error.TestExpectedEqual;
+    try std.testing.expect(!layout.panesShareScrollGroup(first_pane_id, standalone_pane_id));
+    try std.testing.expectEqual(@as(usize, 2), collectScrollingGroups(layout, &group_ids, &representative_ids));
 }
 
 test "scrolling strip collects a tiled group as one item" {

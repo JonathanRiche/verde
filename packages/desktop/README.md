@@ -149,7 +149,8 @@ Config supports UI and terminal font size, scrolling-pane activation and spacing
     "browser": "Ctrl+Shift+B",
     "chat": {
       "model_picker": "Alt+M",
-      "run_config": "Alt+R"
+      "run_config": "Alt+R",
+      "directory_picker": "Alt+D"
     },
     "workspace": {
       "split_terminal_horizontal": "CommandOrControl+Shift+T",

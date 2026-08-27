@@ -639,6 +639,7 @@ fn snapshotThreadToPersisted(
         .provider = snapshotEnum(Provider, thread.provider, .opencode),
         .harness = snapshotEnum(Harness, thread.harness, .local_cli),
         .tui_dock_id = thread.tui_dock_id,
+        .cwd = thread.cwd,
         .draft = thread.draft,
         .draft_image = snapshotAttachment(thread.draft_image),
         .draft_extra_images = try snapshotAttachmentExtras(allocator, thread.draft_images),
@@ -808,6 +809,7 @@ fn overlayCurrentThreadEdits(
     if (current.provider != baseline.provider) remote.provider = current.provider;
     if (current.harness != baseline.harness) remote.harness = current.harness;
     if (current.tui_dock_id != baseline.tui_dock_id) remote.tui_dock_id = current.tui_dock_id;
+    if (!optionalSliceEqual(current.cwd, baseline.cwd)) remote.cwd = current.cwd;
     if (!std.mem.eql(u8, current.draft, baseline.draft)) remote.draft = current.draft;
     if (!optionalImageEqual(current.draft_image, baseline.draft_image)) remote.draft_image = current.draft_image;
     if (!imageListEqual(current.draft_extra_images, baseline.draft_extra_images)) {
@@ -2109,6 +2111,10 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .padding_x = 16.0,
     .padding_y = 14.0,
     .toolbar_height = 32.0,
+    // The working-directory pill renders on its own strip beneath the
+    // framed editor; model/run/send stay inside. `toolbar_gap` also spaces
+    // that strip from the frame.
+    .directory_outside = true,
     .toolbar_gap = 10.0,
     .control_gap = 6.0,
     .pill_padding_x = 13.0,
@@ -2120,6 +2126,12 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     // Kept tight: the chevron column already centers its ink with air on both
     // sides, so a wide gap here reads as dead space after the trailing glyph.
     .pill_chevron_gap = 8.0,
+    // The folder glyph is host-drawn in the pill's overlay reserve (see
+    // `renderComposerToolbarIcons`); the label is the directory basename so
+    // the pill stays compact next to long model names.
+    .directory_icon = "",
+    .directory_min_width = 96.0,
+    .directory_max_width = 200.0,
     .model_min_width = 112.0,
     // Long OpenCode labels include the provider, e.g. "GPT-5.4 (OpenAI)"; cap high enough for measured pill width.
     .model_max_width = 270.0,
@@ -2567,6 +2579,8 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
         },
         // Pill clicks that reach the composer directly (outside the overlay
         // hit-rect path) still open the host popovers.
+        .directory_clicked => state.openPaletteDirectoryPicker(),
+        .runtime_clicked => state.openPaletteRuntimePicker(),
         .model_clicked => state.openPaletteModelPicker(),
         .reasoning_clicked => state.toggleRunConfigPopover(),
     }
@@ -2757,6 +2771,55 @@ fn paletteModelPickerGroup(context: ?*anyopaque, index: usize) []const u8 {
     const state = appStateFromContext(context) orelse return "";
     const entry = modelPickerEntryAt(state, index) orelse return "";
     return chat_threads.providerLabel(entry.provider);
+}
+
+/// One row of the composer working-directory picker. Labels and paths are
+/// owned by the entry list and rebuilt each time the picker opens.
+pub const DirectoryPickerEntry = struct {
+    kind: Kind,
+    label: []const u8,
+    /// Absolute directory; null only for the Browse… row.
+    path: ?[]const u8,
+
+    pub const Kind = enum { project, workspace, recent, home, scratch, browse };
+};
+
+/// Recent rows are derived from other threads' overrides, so cap them before
+/// a busy workspace turns the picker into a scroll list.
+const MAX_RECENT_DIRECTORY_ENTRIES: usize = 12;
+
+fn directoryPickerEntryAt(state: *const AppState, index: usize) ?DirectoryPickerEntry {
+    if (index >= state.composer_controller.directory_picker_entries.items.len) return null;
+    return state.composer_controller.directory_picker_entries.items[index];
+}
+
+fn paletteDirectoryPickerLabel(context: ?*anyopaque, index: usize) []const u8 {
+    const state = appStateFromContext(context) orelse return "";
+    const entry = directoryPickerEntryAt(state, index) orelse return "";
+    return entry.label;
+}
+
+fn paletteDirectoryPickerDescription(context: ?*anyopaque, index: usize) []const u8 {
+    const state = appStateFromContext(context) orelse return "";
+    const entry = directoryPickerEntryAt(state, index) orelse return "";
+    return entry.path orelse "Pick any folder with the system dialog";
+}
+
+fn paletteDirectoryPickerBadge(context: ?*anyopaque, index: usize) []const u8 {
+    const state = appStateFromContext(context) orelse return "";
+    const entry = directoryPickerEntryAt(state, index) orelse return "";
+    return if (entry.kind == .project) "Default" else "";
+}
+
+fn paletteDirectoryPickerGroup(context: ?*anyopaque, index: usize) []const u8 {
+    const state = appStateFromContext(context) orelse return "";
+    const entry = directoryPickerEntryAt(state, index) orelse return "";
+    return switch (entry.kind) {
+        .project => "Project",
+        .workspace => "Open workspaces",
+        .recent => "Recent",
+        .home, .scratch, .browse => "Anywhere",
+    };
 }
 
 fn configChatProvider(provider: Provider) app_config.ChatProvider {
@@ -2959,6 +3022,124 @@ pub const PaletteModelPicker = palette.richPicker(.{
     .scrollbar_width = 5.0,
     .z_index = COMPOSER_MODEL_PICKER_Z,
 });
+
+const COMPOSER_DIRECTORY_PICKER_WIDTH: f32 = 420.0;
+
+pub const PaletteDirectoryPicker = palette.richPicker(.{
+    .width = COMPOSER_DIRECTORY_PICKER_WIDTH,
+    .row_height = 34.0,
+    .row_height_with_description = 50.0,
+    .header_row_height = 26.0,
+    .max_body_height = 380.0,
+    .padding_x = 10.0,
+    .padding_y = 10.0,
+    .row_padding_x = 10.0,
+    .corner_radius = 14.0,
+    .border_width = 1.0,
+    .font_size = 15.5,
+    .description_font_size = 12.0,
+    .header_font_size = 12.0,
+    .badge_font_size = 11.0,
+    .search_enabled = true,
+    .search_min_items = 8,
+    .search_height = 36.0,
+    .search_placeholder = "Search directories…",
+    .search_style = .underline,
+    .search_icon = "\u{EA6D}",
+    .search_gap = 10.0,
+    .item_label = paletteDirectoryPickerLabel,
+    // Every row shows its full path underneath so similar basenames
+    // (several `src` checkouts) stay distinguishable.
+    .item_description = paletteDirectoryPickerDescription,
+    .item_badge = paletteDirectoryPickerBadge,
+    .item_group = paletteDirectoryPickerGroup,
+    .check_icon = "\u{EAB2}",
+    .check_inline = true,
+    .placement = .above,
+    .scrollbar_width = 5.0,
+    .z_index = COMPOSER_MODEL_PICKER_Z,
+});
+
+fn paletteDirectoryPickerEvent(context: ?*anyopaque, event: palette.RichPickerEvent) void {
+    const state = appStateFromContext(context) orelse return;
+    switch (event) {
+        .selected => |index| {
+            const entry = directoryPickerEntryAt(state, index) orelse return;
+            state.applyDirectoryPickerEntry(entry);
+        },
+        .action => {},
+        .open_changed => |open| {
+            if (!open) state.restoreComposerAfterShortcutPopover();
+        },
+        .highlighted => {},
+    }
+}
+
+/// Rows of the runtime pill picker. Only `local` is selectable today; the
+/// remote row is reserved for the cloud/remote-daemon feature.
+const RUNTIME_PICKER_ROWS = [_]struct { label: []const u8, description: []const u8, badge: []const u8 }{
+    .{ .label = "Local", .description = "Runs on this machine", .badge = "" },
+    .{ .label = "Remote", .description = "Cloud and remote daemons", .badge = "Coming soon" },
+};
+const RUNTIME_PICKER_LOCAL_INDEX: usize = 0;
+const COMPOSER_RUNTIME_PICKER_WIDTH: f32 = 300.0;
+
+fn paletteRuntimePickerLabel(_: ?*anyopaque, index: usize) []const u8 {
+    return if (index < RUNTIME_PICKER_ROWS.len) RUNTIME_PICKER_ROWS[index].label else "";
+}
+
+fn paletteRuntimePickerDescription(_: ?*anyopaque, index: usize) []const u8 {
+    return if (index < RUNTIME_PICKER_ROWS.len) RUNTIME_PICKER_ROWS[index].description else "";
+}
+
+fn paletteRuntimePickerBadge(_: ?*anyopaque, index: usize) []const u8 {
+    return if (index < RUNTIME_PICKER_ROWS.len) RUNTIME_PICKER_ROWS[index].badge else "";
+}
+
+pub const PaletteRuntimePicker = palette.richPicker(.{
+    .width = COMPOSER_RUNTIME_PICKER_WIDTH,
+    .row_height = 34.0,
+    .row_height_with_description = 50.0,
+    .header_row_height = 26.0,
+    .max_body_height = 200.0,
+    .padding_x = 10.0,
+    .padding_y = 10.0,
+    .row_padding_x = 10.0,
+    .corner_radius = 14.0,
+    .border_width = 1.0,
+    .font_size = 15.5,
+    .description_font_size = 12.0,
+    .header_font_size = 12.0,
+    .badge_font_size = 11.0,
+    .search_enabled = false,
+    .item_label = paletteRuntimePickerLabel,
+    .item_description = paletteRuntimePickerDescription,
+    .item_badge = paletteRuntimePickerBadge,
+    .check_icon = "\u{EAB2}",
+    .check_inline = true,
+    .placement = .above,
+    .scrollbar_width = 5.0,
+    .z_index = COMPOSER_MODEL_PICKER_Z,
+});
+
+fn paletteRuntimePickerEvent(context: ?*anyopaque, event: palette.RichPickerEvent) void {
+    const state = appStateFromContext(context) orelse return;
+    switch (event) {
+        .selected => |index| {
+            // Remote stays a preview row: keep Local selected and say why.
+            if (index != RUNTIME_PICKER_LOCAL_INDEX) {
+                state.setSidebarNotice("Remote runtimes are coming soon; chats run locally for now.");
+            }
+            state.composer_controller.runtime_picker.setSelectedItem(RUNTIME_PICKER_LOCAL_INDEX);
+            state.noteInteraction();
+        },
+        .action => {},
+        .open_changed => |open| {
+            if (!open) state.restoreComposerAfterShortcutPopover();
+        },
+        .highlighted => {},
+    }
+}
 
 fn paletteModelPickerEvent(context: ?*anyopaque, event: palette.RichPickerEvent) void {
     const state = appStateFromContext(context) orelse return;
@@ -3496,6 +3677,9 @@ const ComposerControllerState = composer_controller.State(
     PaletteComposerPrompt,
     PaletteModelPicker,
     ModelPickerEntry,
+    PaletteDirectoryPicker,
+    DirectoryPickerEntry,
+    PaletteRuntimePicker,
     PaletteRunStepper,
     RunStepperContext,
 );
@@ -3504,12 +3688,54 @@ pub const HandoffTargetSurface = handoff_controller.TargetSurface;
 
 const MANAGED_WORKSPACES_DIR_NAME = "workspaces";
 
-fn projectImportPathAlloc(allocator: std.mem.Allocator, pref_path: []const u8, raw_path: []const u8, workspace_number: usize) ![]u8 {
+/// User-visible Verde data root. SDL's pref path ends in the app-name segment
+/// (`.../verde/Native/`); managed workspaces and scratch live one level up so
+/// users see `verde/workspaces/<name>` rather than that internal segment.
+fn verdeDataRootPath(pref_path: []const u8) []const u8 {
+    const trimmed = std.mem.trimEnd(u8, pref_path, "/\\");
+    if (std.mem.eql(u8, std.fs.path.basename(trimmed), APP_NAME)) {
+        return std.fs.path.dirname(trimmed) orelse trimmed;
+    }
+    return trimmed;
+}
+
+/// Filesystem-safe directory name for a managed workspace: lowercase, runs
+/// of anything but `[a-z0-9._-]` collapsed to a single dash. Empty when the
+/// label carries nothing usable.
+fn managedWorkspaceDirectoryName(buf: []u8, label: []const u8) []const u8 {
+    var len: usize = 0;
+    var pending_dash = false;
+    for (label) |c| {
+        const lower = std.ascii.toLower(c);
+        const keep = std.ascii.isAlphanumeric(lower) or lower == '_' or lower == '.' or lower == '-';
+        if (!keep) {
+            pending_dash = len > 0;
+            continue;
+        }
+        if (pending_dash and len < buf.len) {
+            buf[len] = '-';
+            len += 1;
+            pending_dash = false;
+        }
+        if (len >= buf.len) break;
+        buf[len] = lower;
+        len += 1;
+    }
+    // A leading dot would hide the workspace in file listings.
+    var name: []const u8 = buf[0..len];
+    name = std.mem.trimStart(u8, name, ".-");
+    name = std.mem.trimEnd(u8, name, ".-");
+    return name;
+}
+
+fn projectImportPathAlloc(allocator: std.mem.Allocator, pref_path: []const u8, raw_path: []const u8, label: []const u8, workspace_number: usize) ![]u8 {
     const trimmed = std.mem.trim(u8, raw_path, &std.ascii.whitespace);
     if (trimmed.len > 0) return allocator.dupe(u8, trimmed);
+    var slug_buf: [96]u8 = undefined;
+    const slug = managedWorkspaceDirectoryName(&slug_buf, label);
     var directory_name_buf: [64]u8 = undefined;
-    const directory_name = try std.fmt.bufPrint(&directory_name_buf, "workspace-{d}", .{workspace_number});
-    return std.fs.path.join(allocator, &.{ pref_path, MANAGED_WORKSPACES_DIR_NAME, directory_name });
+    const directory_name = if (slug.len > 0) slug else try std.fmt.bufPrint(&directory_name_buf, "workspace-{d}", .{workspace_number});
+    return std.fs.path.join(allocator, &.{ verdeDataRootPath(pref_path), MANAGED_WORKSPACES_DIR_NAME, directory_name });
 }
 
 fn defaultProjectLabel(buf: []u8, workspace_number: usize) []const u8 {
@@ -4130,6 +4356,31 @@ pub const AppState = struct {
         try self.importProjectFromInput();
     }
 
+    /// Returns `base_path`, or `base_path-2`, `-3`, ... until the candidate is
+    /// neither an existing directory nor another open workspace's root.
+    fn uniqueManagedWorkspacePath(self: *AppState, base_path: []const u8) ![]u8 {
+        var threaded: std.Io.Threaded = .init(self.allocator, .{});
+        defer threaded.deinit();
+        var suffix: usize = 1;
+        while (suffix < 100) : (suffix += 1) {
+            const candidate = if (suffix == 1)
+                try self.allocator.dupe(u8, base_path)
+            else
+                try std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ base_path, suffix });
+            errdefer self.allocator.free(candidate);
+            const taken_by_project = for (self.project_controller.projects.items) |*project| {
+                if (std.mem.eql(u8, project.path, candidate)) break true;
+            } else false;
+            const exists = blk: {
+                std.Io.Dir.cwd().access(threaded.io(), candidate, .{}) catch break :blk false;
+                break :blk true;
+            };
+            if (!taken_by_project and !exists) return candidate;
+            self.allocator.free(candidate);
+        }
+        return error.PathAlreadyExists;
+    }
+
     pub fn ensureDirectoryPath(self: *AppState, raw_path: []const u8) ![]u8 {
         const absolute = try self.absolutePathForCreate(raw_path);
         defer self.allocator.free(absolute);
@@ -4196,8 +4447,17 @@ pub const AppState = struct {
         const managed_workspace = std.mem.trim(u8, raw_path, &std.ascii.whitespace).len == 0;
         const managed_directory_number = self.project_controller.next_project_number;
         const display_number = nextProjectDisplayNumber(self.project_controller.projects.items.len);
-        const project_path = try projectImportPathAlloc(self.allocator, self.storage.pref_path, raw_path, managed_directory_number);
-        defer self.allocator.free(project_path);
+
+        var default_label_buf: [64]u8 = undefined;
+        const entered_label = std.mem.trim(u8, self.importProjectNameDraft(), &std.ascii.whitespace);
+        const label = if (entered_label.len > 0) entered_label else defaultProjectLabel(&default_label_buf, display_number);
+
+        const base_project_path = try projectImportPathAlloc(self.allocator, self.storage.pref_path, raw_path, label, managed_directory_number);
+        defer self.allocator.free(base_project_path);
+        // Managed directories are named after the label, so a repeated name
+        // must not silently share (or reuse) another workspace's directory.
+        const project_path = if (managed_workspace) try self.uniqueManagedWorkspacePath(base_project_path) else base_project_path;
+        defer if (project_path.ptr != base_project_path.ptr) self.allocator.free(project_path);
 
         var created_path: ?[]u8 = null;
         defer if (created_path) |path| self.allocator.free(path);
@@ -4205,10 +4465,6 @@ pub const AppState = struct {
             created_path = try self.ensureDirectoryPath(project_path);
             break :blk created_path.?;
         } else project_path;
-
-        var default_label_buf: [64]u8 = undefined;
-        const entered_label = std.mem.trim(u8, self.importProjectNameDraft(), &std.ascii.whitespace);
-        const label = if (entered_label.len > 0) entered_label else defaultProjectLabel(&default_label_buf, display_number);
 
         _ = self.createProjectFromPathWithLabel(effective_path, label) catch |err| switch (err) {
             error.FileNotFound => {
@@ -4259,13 +4515,18 @@ pub const AppState = struct {
         };
         runtime_log.diagnostic("browseForWorkspaceDirectory target_path={s}", .{target_path});
         log.info("browseForWorkspaceDirectory target_path={s}", .{target_path});
+        defer self.allocator.free(target_path);
+        self.startDirectoryPickerWorker(target_path);
+    }
+
+    /// Spawns the shared native folder dialog worker starting at
+    /// `target_path`; `pollPicker` consumes the result on the frame loop.
+    fn startDirectoryPickerWorker(self: *AppState, target_path: []const u8) void {
         const page_alloc = std.heap.page_allocator;
         const owned_target = page_alloc.dupe(u8, target_path) catch {
-            self.allocator.free(target_path);
             self.setSidebarNotice("Failed to start folder picker.");
             return;
         };
-        self.allocator.free(target_path);
 
         self.picker_state.mutex.lock();
         defer self.picker_state.mutex.unlock();
@@ -6695,6 +6956,8 @@ pub const AppState = struct {
                 null;
             hydrated.fast_mode = existing.fast_mode;
             hydrated.access_mode = existing.access_mode;
+            if (hydrated.cwd) |v| self.allocator.free(v);
+            hydrated.cwd = if (existing.cwd) |v| try self.allocator.dupeZ(u8, v) else null;
             hydrated.draft_mutation_generation = existing.draft_mutation_generation;
             hydrated.draft_mutation_ack_revision = existing.draft_mutation_ack_revision;
 
@@ -9102,6 +9365,8 @@ pub const AppState = struct {
     pub const splitFocusedWorkspacePaneWithChatAxis = workspace_controller.splitFocusedWorkspacePaneWithChatAxis;
     pub const splitCurrentProjectWorkspacePaneWithChatAxis = workspace_controller.splitCurrentProjectWorkspacePaneWithChatAxis;
     pub const splitCurrentProjectWorkspacePaneWithChatPlacement = workspace_controller.splitCurrentProjectWorkspacePaneWithChatPlacement;
+    pub const splitCurrentProjectWorkspacePaneTiledWithChatPlacement = workspace_controller.splitCurrentProjectWorkspacePaneTiledWithChatPlacement;
+    pub const splitFocusedWorkspacePaneTiledWithChatPlacement = workspace_controller.splitFocusedWorkspacePaneTiledWithChatPlacement;
     pub const splitWorkspacePaneWithChatAxis = workspace_controller.splitWorkspacePaneWithChatAxis;
     pub const openWorkspaceChat = workspace_controller.openWorkspaceChat;
     pub const presentWorkspaceChat = workspace_controller.presentWorkspaceChat;
@@ -9123,6 +9388,8 @@ pub const AppState = struct {
     pub const resumeRecreatedThreadTui = workspace_controller.resumeRecreatedThreadTui;
     pub const splitCurrentProjectWorkspacePaneWithTerminalAxis = workspace_controller.splitCurrentProjectWorkspacePaneWithTerminalAxis;
     pub const splitCurrentProjectWorkspacePaneWithTerminalPlacement = workspace_controller.splitCurrentProjectWorkspacePaneWithTerminalPlacement;
+    pub const splitCurrentProjectWorkspacePaneTiledWithTerminalPlacement = workspace_controller.splitCurrentProjectWorkspacePaneTiledWithTerminalPlacement;
+    pub const splitFocusedWorkspacePaneTiledWithTerminalPlacement = workspace_controller.splitFocusedWorkspacePaneTiledWithTerminalPlacement;
     pub const splitWorkspacePaneWithTerminalAxis = workspace_controller.splitWorkspacePaneWithTerminalAxis;
     pub const splitWorkspacePaneWithTerminalPlacement = workspace_controller.splitWorkspacePaneWithTerminalPlacement;
     pub const toggleFocusedWorkspacePaneMaximized = workspace_controller.toggleFocusedWorkspacePaneMaximized;
@@ -9709,6 +9976,8 @@ pub const AppState = struct {
     /// Hit targets for `routePaletteComposerToolbarOverlayClick` (cascade on new threads, synthetic
     /// toolbar clicks when the overlay batch sits above the composer's own hit testing).
     pub fn syncComposerToolbarOverlayHitRects(self: *AppState) void {
+        self.composer_controller.toolbar_directory_rect = self.composer_controller.composer.directoryRect();
+        self.composer_controller.toolbar_runtime_rect = self.composer_controller.composer.runtimeRect();
         self.composer_controller.toolbar_model_rect = self.composer_controller.composer.modelRect();
         self.composer_controller.toolbar_reasoning_rect = self.composer_controller.composer.reasoningRect();
         self.composer_controller.toolbar_fast_rect = self.composer_controller.composer.fastRect();
@@ -9745,6 +10014,19 @@ pub const AppState = struct {
         self.composer_controller.composer.setExternalReasoningMenu(true);
         self.composer_controller.composer.setShowFastToggle(false);
         self.composer_controller.composer.setShowAccessToggle(false);
+        // The directory pill only applies to local providers; remote (HERDR)
+        // threads run wherever the link's remote cwd points.
+        const show_directory = self.currentProject().herdr_link == null;
+        self.composer_controller.composer.setShowDirectoryToggle(show_directory);
+        // The runtime pill shares the directory strip, so it follows the same
+        // visibility; it always reads "Local" until remote runtimes ship.
+        self.composer_controller.composer.setShowRuntimeToggle(show_directory);
+        if (show_directory) {
+            const directory_label = self.directoryPillLabel(self.currentThreadEffectiveCwd());
+            self.composer_controller.composer.setDirectoryLabel(self.allocator, directory_label) catch |err| {
+                log.warn("failed to sync palette composer directory label: {s}", .{@errorName(err)});
+            };
+        }
         const hide_placeholder = thread.draftImageCount() > 0;
         const placeholder = if (thread.isSendAcceptancePending())
             "Confirming send..."
@@ -9958,6 +10240,8 @@ pub const AppState = struct {
             self.refreshGrokModelOptionsCacheAsync();
         }
         self.closeRunConfigPopover();
+        self.closePaletteDirectoryPicker();
+        self.closePaletteRuntimePicker();
         self.composer_controller.composer.active_menu = null;
         self.composer_controller.composer.hovered_menu_index = null;
         self.syncPaletteModelPicker();
@@ -9994,6 +10278,397 @@ pub const AppState = struct {
         if (self.composer_controller.model_picker.isOpen()) {
             self.composer_controller.popover_restore_focus = restore_focus;
         }
+    }
+
+    /// Directory the current thread's provider session runs in.
+    pub fn currentThreadEffectiveCwd(self: *const AppState) []const u8 {
+        return chat_controller.effectiveThreadCwd(self.currentProject().path, self.currentThread());
+    }
+
+    fn composerHomePath(self: *AppState) ?[]const u8 {
+        if (self.composer_controller.home_path == null) {
+            self.composer_controller.home_path = platform_paths.userHome(self.allocator) catch null;
+        }
+        return self.composer_controller.home_path;
+    }
+
+    /// Verde-managed scratch directory for projectless work; created on
+    /// first selection rather than at startup.
+    fn composerScratchPath(self: *AppState) ?[]const u8 {
+        if (self.composer_controller.scratch_path == null) {
+            self.composer_controller.scratch_path = std.fs.path.join(self.allocator, &.{ verdeDataRootPath(self.storage.pref_path), "scratch" }) catch null;
+        }
+        return self.composer_controller.scratch_path;
+    }
+
+    /// True when the current thread runs at an open workspace's root, so the
+    /// pill can show the workspace glyph rather than a plain folder.
+    pub fn currentThreadCwdIsWorkspace(self: *const AppState) bool {
+        return self.openWorkspaceLabelForPath(self.currentThreadEffectiveCwd()) != null;
+    }
+
+    /// Display label of the open, local workspace rooted at `path`, if any.
+    fn openWorkspaceLabelForPath(self: *const AppState, path: []const u8) ?[]const u8 {
+        for (self.project_controller.projects.items) |*project| {
+            if (project.herdr_link != null or project.path.len == 0) continue;
+            if (std.mem.eql(u8, project.path, path)) {
+                return if (project.label.len > 0) project.label else directoryDisplayName(project.path);
+            }
+        }
+        return null;
+    }
+
+    fn directoryPillLabel(self: *AppState, cwd: []const u8) []const u8 {
+        // Managed workspaces live under opaque `workspace-<id>` directories;
+        // show the workspace's name rather than that basename.
+        if (self.openWorkspaceLabelForPath(cwd)) |label| return label;
+        if (self.composerHomePath()) |home| {
+            if (std.mem.eql(u8, cwd, home)) return "Home";
+        }
+        if (self.composerScratchPath()) |scratch| {
+            if (std.mem.eql(u8, cwd, scratch)) return "Scratch";
+        }
+        return directoryDisplayName(cwd);
+    }
+
+    fn directoryDisplayName(path: []const u8) []const u8 {
+        const base = std.fs.path.basename(path);
+        return if (base.len == 0) path else base;
+    }
+
+    fn freeDirectoryPickerEntry(allocator: std.mem.Allocator, entry: DirectoryPickerEntry) void {
+        allocator.free(entry.label);
+        if (entry.path) |path| allocator.free(path);
+    }
+
+    fn deinitDirectoryPickerEntries(self: *AppState) void {
+        for (self.composer_controller.directory_picker_entries.items) |entry| freeDirectoryPickerEntry(self.allocator, entry);
+        self.composer_controller.directory_picker_entries.clearRetainingCapacity();
+    }
+
+    fn directoryPickerHasPath(self: *const AppState, path: []const u8) bool {
+        for (self.composer_controller.directory_picker_entries.items) |entry| {
+            const existing = entry.path orelse continue;
+            if (std.mem.eql(u8, existing, path)) return true;
+        }
+        return false;
+    }
+
+    /// Appends one picker row, skipping paths already listed so the project
+    /// root never repeats under Recent or Home.
+    fn appendDirectoryPickerEntry(self: *AppState, kind: DirectoryPickerEntry.Kind, label: []const u8, path: ?[]const u8) !bool {
+        if (path) |candidate| {
+            if (candidate.len == 0 or self.directoryPickerHasPath(candidate)) return false;
+        }
+        const owned_label = try self.allocator.dupe(u8, label);
+        errdefer self.allocator.free(owned_label);
+        const owned_path: ?[]const u8 = if (path) |candidate| try self.allocator.dupe(u8, candidate) else null;
+        errdefer if (owned_path) |candidate| self.allocator.free(candidate);
+        try self.composer_controller.directory_picker_entries.append(self.allocator, .{ .kind = kind, .label = owned_label, .path = owned_path });
+        return true;
+    }
+
+    fn rebuildDirectoryPickerEntries(self: *AppState) !void {
+        self.deinitDirectoryPickerEntries();
+        const project = self.currentProject();
+        _ = try self.appendDirectoryPickerEntry(.project, if (project.label.len > 0) project.label else directoryDisplayName(project.path), project.path);
+        for (self.project_controller.projects.items) |*other| {
+            if (other.herdr_link != null) continue;
+            _ = try self.appendDirectoryPickerEntry(.workspace, if (other.label.len > 0) other.label else directoryDisplayName(other.path), other.path);
+        }
+        // Recents come from directories threads already switched to, so there
+        // is no separate history store to keep in sync.
+        var recent_count: usize = 0;
+        outer: for (self.project_controller.projects.items) |*candidate| {
+            for (candidate.threads.items) |*thread| {
+                const cwd = thread.cwd orelse continue;
+                if (recent_count >= MAX_RECENT_DIRECTORY_ENTRIES) break :outer;
+                if (try self.appendDirectoryPickerEntry(.recent, directoryDisplayName(cwd), cwd)) recent_count += 1;
+            }
+        }
+        if (self.composerHomePath()) |home| _ = try self.appendDirectoryPickerEntry(.home, "Home", home);
+        if (self.composerScratchPath()) |scratch| _ = try self.appendDirectoryPickerEntry(.scratch, "Scratch", scratch);
+        _ = try self.appendDirectoryPickerEntry(.browse, "Browse…", null);
+        self.composer_controller.directory_picker.invalidateItems();
+    }
+
+    fn currentDirectoryPickerSelection(self: *const AppState) ?usize {
+        const cwd = self.currentThreadEffectiveCwd();
+        for (self.composer_controller.directory_picker_entries.items, 0..) |entry, index| {
+            const path = entry.path orelse continue;
+            if (std.mem.eql(u8, path, cwd)) return index;
+        }
+        return null;
+    }
+
+    pub fn syncPaletteDirectoryPicker(self: *AppState) void {
+        self.composer_controller.directory_picker.setCallbacks(.{
+            .context = self,
+            .on_event = paletteDirectoryPickerEvent,
+            .get_clipboard = paletteComposerGetClipboard,
+        });
+        self.composer_controller.directory_picker.setStyle(paletteModelPickerStyle());
+        self.composer_controller.directory_picker.setUiScale(theme.uiScaleFactor());
+        self.composer_controller.directory_picker.setFontMetrics(paletteEstimatedFontMetrics(theme.scaledUi(15.5)));
+        self.rebuildDirectoryPickerEntries() catch |err| {
+            log.warn("failed to rebuild directory picker entries: {s}", .{@errorName(err)});
+        };
+        self.composer_controller.directory_picker.setItemCount(self.composer_controller.directory_picker_entries.items.len);
+        self.composer_controller.directory_picker.setSelectedItem(self.currentDirectoryPickerSelection());
+        self.setPaletteDirectoryPickerBoundsFromToolbar();
+    }
+
+    fn directoryPickerInput(self: *AppState, input: palette.RichPickerInput) bool {
+        const handled = self.composer_controller.directory_picker.handleInput(self.allocator, input) catch |err| blk: {
+            log.warn("directory picker input failed: {s}", .{@errorName(err)});
+            break :blk false;
+        };
+        if (handled) self.noteInteraction();
+        return handled;
+    }
+
+    pub fn setPaletteDirectoryPickerBoundsFromToolbar(self: *AppState) void {
+        const anchor = self.composer_controller.toolbar_directory_rect;
+        if (anchor.w <= 0.0 or anchor.h <= 0.0) return;
+        const picker_width = COMPOSER_DIRECTORY_PICKER_WIDTH * theme.uiScaleFactor();
+        const min_x = if (self.composer_controller.input_bounds_valid) self.composer_controller.input_min[0] else anchor.x;
+        const max_x = if (self.composer_controller.input_bounds_valid) self.composer_controller.input_max[0] else anchor.x + picker_width;
+        const viewport_top: f32 = theme.scaledUi(8.0);
+        const viewport_bottom = if (self.composer_controller.input_bounds_valid)
+            self.composer_controller.input_max[1]
+        else
+            anchor.y + anchor.h;
+        self.composer_controller.directory_picker.setAnchorRect(anchor);
+        self.composer_controller.directory_picker.setViewportRect(.{
+            .x = min_x,
+            .y = viewport_top,
+            .w = @max(max_x - min_x, picker_width),
+            .h = @max(viewport_bottom - viewport_top, theme.scaledUi(120.0)),
+        });
+    }
+
+    pub fn openPaletteDirectoryPicker(self: *AppState) void {
+        if (self.project_controller.projects.items.len == 0) return;
+        // Remote threads have no directory pill; the shortcut stays inert there.
+        if (self.currentProject().herdr_link != null) return;
+        self.composer_controller.popover_restore_focus = false;
+        self.closePaletteModelPicker();
+        self.closePaletteRuntimePicker();
+        self.closeRunConfigPopover();
+        self.composer_controller.composer.active_menu = null;
+        self.composer_controller.composer.hovered_menu_index = null;
+        self.syncPaletteDirectoryPicker();
+        _ = self.composer_controller.directory_picker.handleInput(self.allocator, .open) catch |err| blk: {
+            log.warn("failed to open directory picker: {s}", .{@errorName(err)});
+            break :blk false;
+        };
+        self.composer_controller.composer.focused = false;
+        self.composer_controller.focused = false;
+        // The popover owns typing (search) and arrows while open.
+        self.terminal_controller.focused = false;
+        self.noteInteraction();
+    }
+
+    pub fn closePaletteDirectoryPicker(self: *AppState) void {
+        self.composer_controller.popover_restore_focus = false;
+        if (!self.composer_controller.directory_picker.isOpen()) return;
+        _ = self.composer_controller.directory_picker.handleInput(self.allocator, .close) catch |err| blk: {
+            log.warn("failed to close directory picker: {s}", .{@errorName(err)});
+            break :blk false;
+        };
+    }
+
+    pub fn syncPaletteRuntimePicker(self: *AppState) void {
+        self.composer_controller.runtime_picker.setCallbacks(.{
+            .context = self,
+            .on_event = paletteRuntimePickerEvent,
+            .get_clipboard = paletteComposerGetClipboard,
+        });
+        var runtime_style = paletteModelPickerStyle();
+        // Two rows only: the inline check already marks Local, so a selected
+        // fill on top of the hover fill reads as two highlighted rows.
+        runtime_style.selected_color = .{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 0.0 };
+        self.composer_controller.runtime_picker.setStyle(runtime_style);
+        self.composer_controller.runtime_picker.setUiScale(theme.uiScaleFactor());
+        self.composer_controller.runtime_picker.setFontMetrics(paletteEstimatedFontMetrics(theme.scaledUi(15.5)));
+        self.composer_controller.runtime_picker.setItemCount(RUNTIME_PICKER_ROWS.len);
+        self.composer_controller.runtime_picker.setSelectedItem(RUNTIME_PICKER_LOCAL_INDEX);
+        self.setPaletteRuntimePickerBoundsFromToolbar();
+    }
+
+    fn runtimePickerInput(self: *AppState, input: palette.RichPickerInput) bool {
+        const handled = self.composer_controller.runtime_picker.handleInput(self.allocator, input) catch |err| blk: {
+            log.warn("runtime picker input failed: {s}", .{@errorName(err)});
+            break :blk false;
+        };
+        if (handled) self.noteInteraction();
+        return handled;
+    }
+
+    pub fn setPaletteRuntimePickerBoundsFromToolbar(self: *AppState) void {
+        const anchor = self.composer_controller.toolbar_runtime_rect;
+        if (anchor.w <= 0.0 or anchor.h <= 0.0) return;
+        const picker_width = COMPOSER_RUNTIME_PICKER_WIDTH * theme.uiScaleFactor();
+        const min_x = if (self.composer_controller.input_bounds_valid) self.composer_controller.input_min[0] else anchor.x + anchor.w - picker_width;
+        const max_x = if (self.composer_controller.input_bounds_valid) self.composer_controller.input_max[0] else anchor.x + anchor.w;
+        const viewport_top: f32 = theme.scaledUi(8.0);
+        const viewport_bottom = if (self.composer_controller.input_bounds_valid)
+            self.composer_controller.input_max[1]
+        else
+            anchor.y + anchor.h;
+        self.composer_controller.runtime_picker.setAnchorRect(anchor);
+        self.composer_controller.runtime_picker.setViewportRect(.{
+            .x = min_x,
+            .y = viewport_top,
+            .w = @max(max_x - min_x, picker_width),
+            .h = @max(viewport_bottom - viewport_top, theme.scaledUi(120.0)),
+        });
+    }
+
+    pub fn openPaletteRuntimePicker(self: *AppState) void {
+        if (self.project_controller.projects.items.len == 0) return;
+        if (!self.composer_controller.composer.showRuntimeToggle()) return;
+        self.composer_controller.popover_restore_focus = false;
+        self.closePaletteModelPicker();
+        self.closePaletteDirectoryPicker();
+        self.closeRunConfigPopover();
+        self.composer_controller.composer.active_menu = null;
+        self.composer_controller.composer.hovered_menu_index = null;
+        self.syncPaletteRuntimePicker();
+        _ = self.composer_controller.runtime_picker.handleInput(self.allocator, .open) catch |err| blk: {
+            log.warn("failed to open runtime picker: {s}", .{@errorName(err)});
+            break :blk false;
+        };
+        self.composer_controller.composer.focused = false;
+        self.composer_controller.focused = false;
+        self.terminal_controller.focused = false;
+        self.noteInteraction();
+    }
+
+    pub fn closePaletteRuntimePicker(self: *AppState) void {
+        self.composer_controller.popover_restore_focus = false;
+        if (!self.composer_controller.runtime_picker.isOpen()) return;
+        _ = self.composer_controller.runtime_picker.handleInput(self.allocator, .close) catch |err| blk: {
+            log.warn("failed to close runtime picker: {s}", .{@errorName(err)});
+            break :blk false;
+        };
+    }
+
+    fn routePaletteRuntimePickerKey(self: *AppState, key: palette.Key) bool {
+        if (!self.composer_controller.runtime_picker.isOpen()) return false;
+        return self.runtimePickerInput(.{ .key = key });
+    }
+
+    fn routePaletteRuntimePickerMouseButton(self: *AppState, point: palette.draw.Vec2, down: bool, clicks: u8) bool {
+        if (!self.composer_controller.runtime_picker.isOpen()) return false;
+        if (down and self.composer_controller.toolbar_overlay_valid and
+            (self.composer_controller.toolbar_model_rect.contains(point) or
+                self.composer_controller.toolbar_reasoning_rect.contains(point) or
+                self.composer_controller.toolbar_directory_rect.contains(point)))
+        {
+            self.closePaletteRuntimePicker();
+            return false;
+        }
+        const input: palette.RichPickerInput = if (down)
+            .{ .mouse_down = .{ .point = point, .clicks = clicks } }
+        else
+            .{ .mouse_up = point };
+        return self.runtimePickerInput(input);
+    }
+
+    fn routePaletteRuntimePickerMouseMove(self: *AppState, point: palette.draw.Vec2, dragging: bool) bool {
+        if (!self.composer_controller.runtime_picker.isOpen()) return false;
+        return self.runtimePickerInput(if (dragging)
+            .{ .mouse_drag = point }
+        else
+            .{ .mouse_move = point });
+    }
+
+    fn routePaletteRuntimePickerWheel(self: *AppState, point: palette.draw.Vec2, y: f32) bool {
+        if (!self.composer_controller.runtime_picker.isOpen()) return false;
+        return self.runtimePickerInput(.{ .mouse_wheel = .{ .point = point, .y = y } });
+    }
+
+    pub fn togglePaletteDirectoryPickerFromShortcut(self: *AppState) void {
+        const restore_focus = self.composer_controller.popover_restore_focus or
+            self.composer_controller.composer.focused or self.composer_controller.focused;
+        if (self.composer_controller.directory_picker.isOpen()) {
+            self.closePaletteDirectoryPicker();
+            if (restore_focus) self.requestComposerFocus();
+            self.noteInteraction();
+            return;
+        }
+        self.openPaletteDirectoryPicker();
+        if (self.composer_controller.directory_picker.isOpen()) {
+            self.composer_controller.popover_restore_focus = restore_focus;
+        }
+    }
+
+    fn applyDirectoryPickerEntry(self: *AppState, entry: DirectoryPickerEntry) void {
+        switch (entry.kind) {
+            .browse => {
+                // The shared folder dialog runs on a worker; `pollPicker`
+                // hands the result back to `setCurrentThreadCwd`.
+                self.composer_controller.browse_for_chat_directory = true;
+                self.startDirectoryPickerWorker(self.currentThreadEffectiveCwd());
+            },
+            .scratch => {
+                const path = entry.path orelse return;
+                const ensured = self.ensureDirectoryPath(path) catch |err| {
+                    log.warn("failed to create scratch directory {s}: {s}", .{ path, @errorName(err) });
+                    self.setSidebarNotice("Could not create the scratch directory.");
+                    return;
+                };
+                defer self.allocator.free(ensured);
+                // Keep the pill label keyed on the resolved path in case the
+                // preferences directory sits behind a symlink.
+                if (self.composer_controller.scratch_path) |previous| self.allocator.free(previous);
+                self.composer_controller.scratch_path = self.allocator.dupe(u8, ensured) catch null;
+                self.setCurrentThreadCwd(ensured);
+            },
+            .project => self.setCurrentThreadCwd(null),
+            .workspace, .recent, .home => self.setCurrentThreadCwd(entry.path),
+        }
+    }
+
+    /// Sets the current thread's working-directory override; the project
+    /// root is the implicit default and stored as null.
+    pub fn setCurrentThreadCwd(self: *AppState, value: ?[]const u8) void {
+        const project_path = self.currentProject().path;
+        const next: ?[]const u8 = if (value) |path|
+            (if (std.mem.eql(u8, path, project_path)) null else path)
+        else
+            null;
+        const thread = self.currentThreadMutable();
+        const existing: ?[]const u8 = if (thread.cwd) |cwd| cwd else null;
+        if (optionalSliceEqual(existing, next)) return;
+        if (thread.isSendPendingForUi()) {
+            self.setSidebarNotice("Wait for the current turn to finish before changing the working directory.");
+            return;
+        }
+        const owned: ?[:0]const u8 = if (next) |path| (self.allocator.dupeZ(u8, path) catch {
+            self.setSidebarNotice("Could not change the working directory.");
+            return;
+        }) else null;
+        if (thread.cwd) |previous| self.allocator.free(previous);
+        thread.cwd = owned;
+        // Provider sessions are pinned to the directory they started in, so a
+        // switch on an established thread starts a fresh provider session while
+        // Verde keeps the transcript.
+        if (thread.provider_thread_id) |provider_thread_id| {
+            self.allocator.free(provider_thread_id);
+            thread.provider_thread_id = null;
+            const body = std.fmt.allocPrint(self.allocator, "Working directory changed → {s}\nThe provider session restarts in this directory; earlier context stays in the transcript.", .{next orelse project_path}) catch null;
+            if (body) |text| {
+                defer self.allocator.free(text);
+                self.appendMessageToThread(thread, .system, "Working directory changed", text, null, &.{}) catch |err| {
+                    log.warn("failed to record working directory change: {s}", .{@errorName(err)});
+                };
+            }
+        }
+        self.markDirty();
+        self.syncPaletteComposerControls();
+        self.noteInteraction();
     }
 
     /// Fresh, never-sent threads may still switch provider; committed threads
@@ -10122,6 +10797,8 @@ pub const AppState = struct {
         if (self.palette_modal_hits.items.len > 0) return false;
         if (self.project_controller.projects.items.len == 0) return false;
         if (self.composer_controller.model_picker.wantsPointerAt(point)) return true;
+        if (self.composer_controller.directory_picker.wantsPointerAt(point)) return true;
+        if (self.composer_controller.runtime_picker.wantsPointerAt(point)) return true;
         if (!self.settings_controller.modal_visible) {
             for (self.card_toggle_hits.items) |hit| {
                 if (hit.rect.contains(point)) return true;
@@ -10222,6 +10899,8 @@ pub const AppState = struct {
         if (self.project_controller.projects.items.len == 0) return;
         self.composer_controller.popover_restore_focus = false;
         self.closePaletteModelPicker();
+        self.closePaletteDirectoryPicker();
+        self.closePaletteRuntimePicker();
         self.composer_controller.composer.active_menu = null;
         self.composer_controller.composer.hovered_menu_index = null;
         self.syncRunConfigSteppers();
@@ -10275,6 +10954,12 @@ pub const AppState = struct {
 
     pub fn routePaletteComposerTextInput(self: *AppState, text: []const u8) bool {
         if (self.project_controller.projects.items.len == 0) return false;
+        if (self.composer_controller.directory_picker.isOpen()) {
+            return self.directoryPickerInput(.{ .text = text });
+        }
+        if (self.composer_controller.runtime_picker.isOpen()) {
+            return self.runtimePickerInput(.{ .text = text });
+        }
         if (self.composer_controller.model_picker.isOpen()) {
             const handled = self.composer_controller.model_picker.handleInput(self.allocator, .{ .text = text }) catch |err| blk: {
                 log.warn("model picker text input failed: {s}", .{@errorName(err)});
@@ -10307,6 +10992,12 @@ pub const AppState = struct {
             if (self.composer_controller.model_picker.isOpen()) {
                 return self.routePaletteModelPickerKey(.{ .code = .escape });
             }
+            if (self.composer_controller.directory_picker.isOpen()) {
+                return self.routePaletteDirectoryPickerKey(.{ .code = .escape });
+            }
+            if (self.composer_controller.runtime_picker.isOpen()) {
+                return self.routePaletteRuntimePickerKey(.{ .code = .escape });
+            }
             if (self.composer_controller.run_config_open) {
                 self.closeRunConfigPopoverFromKeyboard();
                 self.noteInteraction();
@@ -10330,6 +11021,12 @@ pub const AppState = struct {
             }
         }
         const palette_key = paletteComposerKeyFromSdl(event) orelse return false;
+        if (self.composer_controller.directory_picker.isOpen()) {
+            return self.routePaletteDirectoryPickerKey(palette_key);
+        }
+        if (self.composer_controller.runtime_picker.isOpen()) {
+            return self.routePaletteRuntimePickerKey(palette_key);
+        }
         if (self.composer_controller.model_picker.isOpen()) {
             // The picker owns typing while open: navigation keys move the
             // highlight, everything else edits the embedded search field.
@@ -10431,6 +11128,14 @@ pub const AppState = struct {
         // Model and run pills open host-owned popovers (rich picker /
         // run-config panel); the composer's built-in dropdowns stay disabled
         // via `setExternalModelMenu` / `setExternalReasoningMenu`.
+        if (self.composer_controller.composer.showDirectoryToggle() and self.composer_controller.toolbar_directory_rect.contains(point)) {
+            self.openPaletteDirectoryPicker();
+            return true;
+        }
+        if (self.composer_controller.composer.showRuntimeToggle() and self.composer_controller.toolbar_runtime_rect.contains(point)) {
+            self.openPaletteRuntimePicker();
+            return true;
+        }
         if (self.composer_controller.toolbar_model_rect.contains(point)) {
             self.openPaletteModelPicker();
             return true;
@@ -10480,6 +11185,8 @@ pub const AppState = struct {
         if (event.button != 1) return false;
         const point = paletteMousePoint(event.x, event.y, ui_scale);
         if (self.routePaletteModelPickerMouseButton(point, event.down, event.clicks)) return true;
+        if (self.routePaletteDirectoryPickerMouseButton(point, event.down, event.clicks)) return true;
+        if (self.routePaletteRuntimePickerMouseButton(point, event.down, event.clicks)) return true;
         return self.routeRunConfigMouseButton(point, event.down);
     }
 
@@ -10487,6 +11194,8 @@ pub const AppState = struct {
         if (self.project_controller.projects.items.len == 0) return false;
         const point = paletteMousePoint(event.x, event.y, ui_scale);
         if (self.routePaletteModelPickerMouseMove(point, event.state.left != 0)) return true;
+        if (self.routePaletteDirectoryPickerMouseMove(point, event.state.left != 0)) return true;
+        if (self.routePaletteRuntimePickerMouseMove(point, event.state.left != 0)) return true;
         return self.routeRunConfigMouseMove(point);
     }
 
@@ -10494,6 +11203,8 @@ pub const AppState = struct {
         if (self.project_controller.projects.items.len == 0) return false;
         const point = paletteMousePoint(event.mouse_x, event.mouse_y, ui_scale);
         if (self.routePaletteModelPickerWheel(point, event.y)) return true;
+        if (self.routePaletteDirectoryPickerWheel(point, event.y)) return true;
+        if (self.routePaletteRuntimePickerWheel(point, event.y)) return true;
         return self.routeRunConfigWheel(point);
     }
 
@@ -10564,11 +11275,52 @@ pub const AppState = struct {
         }
     }
 
+    fn routePaletteDirectoryPickerKey(self: *AppState, key: palette.Key) bool {
+        if (!self.composer_controller.directory_picker.isOpen()) return false;
+        return self.directoryPickerInput(.{ .key = key });
+    }
+
+    fn routePaletteDirectoryPickerMouseButton(self: *AppState, point: palette.draw.Vec2, down: bool, clicks: u8) bool {
+        if (!self.composer_controller.directory_picker.isOpen()) return false;
+        // Clicking another toolbar pill swaps popovers in one click: dismiss
+        // this picker and let the toolbar overlay handler open the next one.
+        if (down and self.composer_controller.toolbar_overlay_valid and
+            (self.composer_controller.toolbar_model_rect.contains(point) or
+                self.composer_controller.toolbar_reasoning_rect.contains(point) or
+                self.composer_controller.toolbar_runtime_rect.contains(point)))
+        {
+            self.closePaletteDirectoryPicker();
+            return false;
+        }
+        const input: palette.RichPickerInput = if (down)
+            .{ .mouse_down = .{ .point = point, .clicks = clicks } }
+        else
+            .{ .mouse_up = point };
+        return self.directoryPickerInput(input);
+    }
+
+    fn routePaletteDirectoryPickerMouseMove(self: *AppState, point: palette.draw.Vec2, dragging: bool) bool {
+        if (!self.composer_controller.directory_picker.isOpen()) return false;
+        return self.directoryPickerInput(if (dragging)
+            .{ .mouse_drag = point }
+        else
+            .{ .mouse_move = point });
+    }
+
+    fn routePaletteDirectoryPickerWheel(self: *AppState, point: palette.draw.Vec2, y: f32) bool {
+        if (!self.composer_controller.directory_picker.isOpen()) return false;
+        return self.directoryPickerInput(.{ .mouse_wheel = .{ .point = point, .y = y } });
+    }
+
     fn routePaletteModelPickerMouseButton(self: *AppState, point: palette.draw.Vec2, down: bool, clicks: u8) bool {
         if (!self.composer_controller.model_picker.isOpen()) return false;
-        // Clicking the run pill swaps popovers in one click: dismiss the
-        // picker and let the toolbar overlay handler open the run config.
-        if (down and self.composer_controller.toolbar_overlay_valid and self.composer_controller.toolbar_reasoning_rect.contains(point)) {
+        // Clicking another toolbar pill swaps popovers in one click: dismiss
+        // the picker and let the toolbar overlay handler open the next one.
+        if (down and self.composer_controller.toolbar_overlay_valid and
+            (self.composer_controller.toolbar_reasoning_rect.contains(point) or
+                self.composer_controller.toolbar_directory_rect.contains(point) or
+                self.composer_controller.toolbar_runtime_rect.contains(point)))
+        {
             self.closePaletteModelPicker();
             return false;
         }
@@ -11174,6 +11926,10 @@ pub const AppState = struct {
         self.lifecycle.deinit();
         self.file_search_controller.deinit(self.allocator);
         self.composer_controller.composer.deinit(self.allocator);
+        self.deinitDirectoryPickerEntries();
+        self.composer_controller.directory_picker_entries.deinit(self.allocator);
+        if (self.composer_controller.home_path) |path| self.allocator.free(path);
+        if (self.composer_controller.scratch_path) |path| self.allocator.free(path);
         self.companion_composer.deinit(self.allocator);
         self.palette_overlay_batch.deinit(self.allocator);
         self.palette_frame_text.deinit(self.allocator);
@@ -11273,12 +12029,21 @@ pub const AppState = struct {
         }
 
         const create_parent = self.project_directory_picker_create_parent;
-        if (next_status != .idle) self.project_directory_picker_create_parent = false;
+        const browse_for_chat_directory = self.composer_controller.browse_for_chat_directory;
+        if (next_status != .idle) {
+            self.project_directory_picker_create_parent = false;
+            self.composer_controller.browse_for_chat_directory = false;
+        }
 
         switch (next_status) {
             .selected => {
                 if (picked_path) |path| {
                     defer std.heap.page_allocator.free(path);
+                    if (browse_for_chat_directory) {
+                        self.setCurrentThreadCwd(path);
+                        self.setSidebarNotice("");
+                        return;
+                    }
                     if (self.project_controller.show_creator) {
                         if (create_parent) {
                             self.setImportPathWithTrailingSeparator(path) catch |err| {
@@ -12354,19 +13119,23 @@ pub const AppState = struct {
     }
 };
 
-test "blank workspace import path uses a numbered managed directory" {
+test "blank workspace import path uses a label-named managed directory beside the pref dir" {
     const allocator = std.testing.allocator;
-    const default_path = try projectImportPathAlloc(allocator, "/tmp/verde-pref", " \t\n", 7);
+    const default_path = try projectImportPathAlloc(allocator, "/tmp/verde/Native/", " \t\n", "Workspace 7", 7);
     defer allocator.free(default_path);
-    const expected_path = try std.fs.path.join(allocator, &.{ "/tmp/verde-pref", "workspaces", "workspace-7" });
+    const expected_path = try std.fs.path.join(allocator, &.{ "/tmp/verde", "workspaces", "workspace-7" });
     defer allocator.free(expected_path);
     try std.testing.expectEqualStrings(expected_path, default_path);
 
-    const next_path = try projectImportPathAlloc(allocator, "/tmp/verde-pref", "", 8);
-    defer allocator.free(next_path);
-    try std.testing.expect(!std.mem.eql(u8, default_path, next_path));
+    const named_path = try projectImportPathAlloc(allocator, "/tmp/verde/Native", "", "My App / v2", 8);
+    defer allocator.free(named_path);
+    try std.testing.expectEqualStrings("/tmp/verde/workspaces/my-app-v2", named_path);
 
-    const explicit_path = try projectImportPathAlloc(allocator, "/tmp/verde-pref", "  /tmp/verde-workspace  ", 7);
+    const next_path = try projectImportPathAlloc(allocator, "/tmp/verde-pref", "", "..", 8);
+    defer allocator.free(next_path);
+    try std.testing.expectEqualStrings("/tmp/verde-pref/workspaces/workspace-8", next_path);
+
+    const explicit_path = try projectImportPathAlloc(allocator, "/tmp/verde-pref", "  /tmp/verde-workspace  ", "x", 7);
     defer allocator.free(explicit_path);
     try std.testing.expectEqualStrings("/tmp/verde-workspace", explicit_path);
 

@@ -143,7 +143,7 @@ export const KEYBIND_TOP_KEYS = [
   'chat_page_down',
 ] as const
 
-export const KEYBIND_CHAT_KEYS = ['model_picker', 'run_config'] as const
+export const KEYBIND_CHAT_KEYS = ['model_picker', 'run_config', 'directory_picker'] as const
 
 export const KEYBIND_TERMINAL_KEYS = [
   'toggle',
@@ -217,6 +217,7 @@ export const PREFIX_ACTION_NAMES = [
   'chat_page_down',
   'chat.model_picker',
   'chat.run_config',
+  'chat.directory_picker',
   'terminal.toggle',
   'terminal.new_tab',
   'terminal.close',

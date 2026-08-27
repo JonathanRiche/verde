@@ -469,6 +469,7 @@ fn threadSnapshotWithBodies(
         .provider = thread.provider,
         .harness = thread.harness,
         .tui_dock_id = thread.tui_dock_id,
+        .cwd = try dupeOptionalSlice(allocator, thread.cwd),
         .draft = try allocator.dupe(u8, thread.currentDraft()),
         .draft_image = try imageSnapshot(allocator, thread.draft_image),
         .draft_extra_images = try imageListSnapshot(allocator, thread.draft_extra_images.items),
@@ -666,6 +667,7 @@ fn threadToProtocol(allocator: std.mem.Allocator, thread: PersistedThread, index
         .provider = try allocator.dupe(u8, @tagName(thread.provider)),
         .harness = try allocator.dupe(u8, @tagName(thread.harness)),
         .tui_dock_id = thread.tui_dock_id,
+        .cwd = if (thread.cwd) |v| try allocator.dupe(u8, v) else null,
         .draft = try allocator.dupe(u8, thread.draft),
         .draft_image = if (thread.draft_image) |img| try imageToProtocol(allocator, img) else null,
         .draft_images = try imageListToProtocol(allocator, thread.draft_image, thread.draft_extra_images),
@@ -832,6 +834,11 @@ pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
                 thread.provider = persisted_thread.provider;
                 thread.harness = persisted_thread.harness;
                 thread.tui_dock_id = persisted_thread.tui_dock_id;
+                if (thread.cwd) |v| self.allocator.free(v);
+                thread.cwd = if (persisted_thread.cwd) |cwd|
+                    try self.allocator.dupeZ(u8, cwd)
+                else
+                    null;
                 thread.persisted_message_offset = persisted_thread.message_offset;
                 thread.setDraft(persisted_thread.draft);
                 if (persisted_thread.draft_image) |image| {
@@ -1115,6 +1122,7 @@ fn cloneThreads(
             .provider = thread.provider,
             .harness = thread.harness,
             .tui_dock_id = thread.tui_dock_id,
+            .cwd = try cloneOptionalSlice(allocator, thread.cwd),
             .draft = try allocator.dupe(u8, thread.draft),
             .draft_image = try cloneImage(allocator, thread.draft_image),
             .draft_extra_images = try cloneImageList(allocator, thread.draft_extra_images),
