@@ -1802,6 +1802,7 @@ fn glyphNeedsRelaxedClip(cp: u21) bool {
         0xe5fa...0xe7ff,
         0xf000...0xf8ff,
         0xf0000...0xf20ff,
+        0x1D400...0x1D7FF, // Mathematical Alphanumeric Symbols (𝒇 etc.)
         => true,
         else => false,
     };

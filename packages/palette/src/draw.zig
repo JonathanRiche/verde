@@ -103,6 +103,9 @@ pub const FontRole = enum {
     // ➀➁..➓ at U+2776..2793), several Letterlike Symbols, parts of
     // Mathematical Operators, etc. Consulted between `symbols` and `emoji`.
     symbols_alt,
+    // System math face for Mathematical Alphanumeric Symbols such as FX's
+    // stylized `𝒇` (U+1D487). These live outside the bundled mono/symbol faces.
+    math,
     // Monochrome emoji face (Noto Emoji) for the *emoji-styled* Dingbats and
     // Misc Symbols that Noto Sans Symbols 2 deliberately excludes — Vite's
     // ✨ (U+2728), check/cross emoji (✅❌), ➕➖, ℹ, ⚡, etc., plus 4-byte
