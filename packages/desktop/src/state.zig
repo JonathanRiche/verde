@@ -10912,6 +10912,20 @@ pub const AppState = struct {
         self.import_path_storage[0] = 0;
     }
 
+    /// Opens the Add Workspace flow: every entry point (sidebar rail, command
+    /// palette, workspace strip) shares this so the creator modal always starts
+    /// with a clean path field. Rail entry points expand the sidebar so the new
+    /// workspace lands in view; the strip keeps the sidebar as it was.
+    pub fn openWorkspaceCreator(self: *AppState, expand_sidebar: bool) void {
+        self.project_controller.show_creator = true;
+        if (expand_sidebar) self.setSidebarCollapsed(false);
+        self.clearImportPath();
+        self.project_import_cursor = 0;
+        self.palette_modal_text_focus = .project_import;
+        self.setSidebarNotice("");
+        self.markDirty();
+    }
+
     fn setImportPath(self: *AppState, value: []const u8) void {
         @memset(&self.import_path_storage, 0);
         const len = @min(value.len, self.import_path_storage.len - 1);

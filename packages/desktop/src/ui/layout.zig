@@ -8,6 +8,7 @@ const text_measure = @import("text_measure.zig");
 const colors = @import("colors.zig");
 const sidebar = @import("sidebar.zig");
 const workspace_panes = @import("workspace_panes.zig");
+const workspace_strip = @import("workspace_strip.zig");
 const runtime = @import("runtime.zig");
 const keybinds = @import("../app/keybinds.zig");
 const debug_window = @import("debug.zig");
@@ -189,12 +190,17 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     state.sidebar_pulse_animating = false;
     const root_layout = computeRootLayout(state, width, height);
     queueRootBackground(state, width, height);
+    // The workspace strip (collapsed/hidden sidebar only) takes its height off
+    // the top of the workspace rect here, once, so every pane layout below and
+    // the prefix overlays share the same content rect.
+    const split = workspace_strip.splitWorkspaceRect(state, root_layout.workspace);
+    if (split.strip) |strip| workspace_strip.render(state, strip);
     if (state.isSidebarHidden()) {
-        workspace_panes.renderAtWithTranscriptLayoutWidth(state, root_layout.workspace, root_layout.target_workspace_width);
+        workspace_panes.renderAtWithTranscriptLayoutWidth(state, split.content, root_layout.target_workspace_width);
         sidebar.renderPalette(state, root_layout.sidebar);
     } else {
         sidebar.renderPalette(state, root_layout.sidebar);
-        workspace_panes.renderAtWithTranscriptLayoutWidth(state, root_layout.workspace, root_layout.target_workspace_width);
+        workspace_panes.renderAtWithTranscriptLayoutWidth(state, split.content, root_layout.target_workspace_width);
     }
     // Queue this root overlay only after scrolling panes have clipped their
     // local command range; the batch is z-sorted, so pre-queued high-z menu
@@ -208,8 +214,8 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     // The which-key panel must sit above pane-local layers (composer, pane
     // chrome) that queue at higher z than the workspace body.
     const which_key_z = state.palette_overlay_batch.setZIndex(PALETTE_MODAL_Z);
-    renderPrefixStatusBar(state, root_layout.workspace);
-    renderPrefixWhichKey(state, root_layout.workspace);
+    renderPrefixStatusBar(state, split.content);
+    renderPrefixWhichKey(state, split.content);
     state.palette_overlay_batch.restoreZIndex(which_key_z);
     const modal_z = state.palette_overlay_batch.setZIndex(PALETTE_MODAL_Z);
     defer state.palette_overlay_batch.restoreZIndex(modal_z);

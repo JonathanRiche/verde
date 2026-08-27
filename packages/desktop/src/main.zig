@@ -24,6 +24,7 @@ const stb_image = @import("media/stb_image.zig");
 const utils = @import("utils.zig");
 const ui_layout = @import("ui/layout.zig");
 const workspace_panes_ui = @import("ui/workspace_panes.zig");
+const workspace_strip_ui = @import("ui/workspace_strip.zig");
 const sidebar_ui = @import("ui/sidebar.zig");
 const chat_panel_ui = @import("ui/chat_panel.zig");
 const browser_ui = @import("ui/browser.zig");
@@ -836,6 +837,12 @@ fn syncMouseCursor(state: *AppState, cache: *SystemCursorCache) void {
     }
     if (!modalHitAtMouse(state)) {
         if (sidebar_ui.systemCursorAt(mouse_x, mouse_y)) |cursor| {
+            applySystemCursor(cache, cursor);
+            return;
+        }
+    }
+    if (!modalHitAtMouse(state)) {
+        if (workspace_strip_ui.systemCursorAt(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y)) |cursor| {
             applySystemCursor(cache, cursor);
             return;
         }
@@ -2216,6 +2223,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             chat_panel_ui.handleTranscriptPaletteMouseMotion(state);
+            workspace_strip_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
             const ctrl_down = isCtrlPressed() or isKeymodPressed(SDL_GetModState(), sdl.Keymod.ctrl);
             if (workspace_panes_ui.hasActivePaneDrag() and workspace_panes_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y, ctrl_down)) {
                 return true;
@@ -2297,6 +2305,12 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             if (event.button.button == 1 and debug_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            // The workspace strip sits above the pane region while the sidebar
+            // is collapsed/hidden; it owns its own rows before pane routing.
+            if (event.button.button == 1 and workspace_strip_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -3562,6 +3576,7 @@ test {
     _ = @import("ui/command_palette.zig");
     _ = @import("ui/companion.zig");
     _ = @import("ui/diff_view_cache.zig");
+    _ = @import("ui/workspace_strip.zig");
     _ = @import("compile_tests/windows_conpty.zig");
     _ = @import("daemon/change_journal.zig");
     _ = @import("daemon/process_registry.zig");

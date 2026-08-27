@@ -33,7 +33,8 @@ file. It is read on startup and on app refresh.
     "workspace_scroll_direction": "horizontal",
     "workspace_scroll_mode": "automatic",
     "workspace_scroll_threshold": 2,
-    "unzoom_on_pane_navigation": false
+    "unzoom_on_pane_navigation": false,
+    "workspace_tabs": "automatic"
   },
   "open": {
     "default": "folder",

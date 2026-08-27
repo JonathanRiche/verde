@@ -123,7 +123,7 @@ const STATIC_COMMANDS = [_]Command{
     .{ .id = "workspace.scrolling_always", .title = "Scrolling Layout: Always", .keywords = "niri panes mode pin enable", .section = .workspaces, .run = runScrollingAlways, .enabled = hasProjects },
     .{ .id = "workspace.scrolling_disabled", .title = "Scrolling Layout: Disabled", .keywords = "niri panes mode tiled off disable", .section = .workspaces, .run = runScrollingDisabled, .enabled = hasProjects },
     .{ .id = "workspace.scrolling_reset_column_width", .title = "Reset Scrolling Pane Widths", .keywords = "niri panes resize default per view", .section = .workspaces, .run = runResetScrollingColumnWidth, .enabled = hasCustomScrollingColumnWidth },
-    .{ .id = "workspace.add", .title = "Add Workspace", .keywords = "new project folder directory", .section = .workspaces, .run = runAddWorkspace },
+    .{ .id = "workspace.add", .title = "Add Workspace", .keywords = "new project folder directory create", .section = .workspaces, .run = runAddWorkspace },
     .{ .id = "workspace.rename", .title = "Rename Workspace", .keywords = "label", .section = .workspaces, .run = runRenameWorkspace, .enabled = hasProjects },
     .{ .id = "workspace.close", .title = "Close Workspace", .keywords = "archive remove project save state", .section = .workspaces, .keybind = .workspace_close_current, .run = runCloseWorkspace, .enabled = workspaceNotBusy },
     .{ .id = "workspace.reopen", .title = "Reopen Last Closed Workspace", .keywords = "restore archived project", .section = .workspaces, .run = runReopenWorkspace, .enabled = hasClosedWorkspaces },
@@ -1408,13 +1408,7 @@ fn runResetScrollingColumnWidth(state: *runtime.AppState) void {
 }
 
 fn runAddWorkspace(state: *runtime.AppState) void {
-    state.project_controller.show_creator = true;
-    state.setSidebarCollapsed(false);
-    state.clearImportPath();
-    state.project_import_cursor = 0;
-    state.palette_modal_text_focus = .project_import;
-    state.setSidebarNotice("");
-    state.markDirty();
+    state.openWorkspaceCreator(true);
 }
 
 fn runRenameWorkspace(state: *runtime.AppState) void {

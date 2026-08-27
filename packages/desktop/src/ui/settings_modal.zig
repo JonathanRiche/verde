@@ -31,6 +31,9 @@ pub const Control = enum(u8) {
     workspace_scroll_vertical,
     theme_dropdown,
     reduced_motion,
+    workspace_tabs_automatic,
+    workspace_tabs_always,
+    workspace_tabs_disabled,
     companion_character_dropdown,
     tool_groups_collapsed,
     tool_groups_expanded,
@@ -157,6 +160,10 @@ const SettingsLayout = struct {
     ui_font_inc: palette.Rect,
     reduced_motion: palette.Rect,
     reduced_motion_hint_y: f32,
+    workspace_tabs_label_y: f32,
+    workspace_tabs_automatic: palette.Rect,
+    workspace_tabs_always: palette.Rect,
+    workspace_tabs_disabled: palette.Rect,
     transcript_card: palette.Rect,
     tool_groups_collapsed: palette.Rect,
     tool_groups_expanded: palette.Rect,
@@ -338,11 +345,13 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const open_grid_h = @as(f32, @floatFromInt(open_rows)) * m.row_h + @as(f32, @floatFromInt(open_rows - 1)) * m.inner_gap;
     const custom_extra: f32 = if (state.settings_controller.draft.open_action == .custom) m.row_h + m.inner_gap else 0.0;
 
-    // Theme dropdown, Default companion dropdown, UI font stepper, then motion.
+    // Theme dropdown, Default companion dropdown, UI font stepper, motion,
+    // then the Workspace tabs label + three-way toggle.
     const appearance_h = m.card_pad * 2.0 + m.title_h + m.row_gap +
         m.label_h + m.inner_gap + m.row_h + m.row_gap +
         m.label_h + m.inner_gap + m.row_h + m.row_gap +
-        m.row_h + m.row_gap + m.row_h + m.inner_gap + m.label_h;
+        m.row_h + m.row_gap + m.row_h + m.inner_gap + m.label_h + m.row_gap +
+        m.label_h + m.inner_gap + m.row_h;
     const transcript_h = m.card_pad * 2.0 + m.title_h + m.row_gap +
         m.label_h + m.inner_gap + m.row_h + m.row_gap +
         m.label_h + m.inner_gap + m.row_h;
@@ -438,6 +447,12 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const reduced_motion_y = ui_font_y + m.row_h + m.row_gap;
     const reduced_motion: palette.Rect = .{ .x = theme_x, .y = reduced_motion_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
     const reduced_motion_hint_y = reduced_motion_y + m.row_h + m.inner_gap;
+    const workspace_tabs_label_y = reduced_motion_hint_y + m.label_h + m.row_gap;
+    const workspace_tabs_y = workspace_tabs_label_y + m.label_h + m.inner_gap;
+    const workspace_tabs_w = (content_w - m.card_pad * 2.0 - m.inner_gap * 2.0) / 3.0;
+    const workspace_tabs_automatic: palette.Rect = .{ .x = theme_x, .y = workspace_tabs_y, .w = workspace_tabs_w, .h = m.row_h };
+    const workspace_tabs_always: palette.Rect = .{ .x = workspace_tabs_automatic.x + workspace_tabs_w + m.inner_gap, .y = workspace_tabs_y, .w = workspace_tabs_w, .h = m.row_h };
+    const workspace_tabs_disabled: palette.Rect = .{ .x = workspace_tabs_always.x + workspace_tabs_w + m.inner_gap, .y = workspace_tabs_y, .w = workspace_tabs_w, .h = m.row_h };
 
     y += appearance_h + m.card_gap;
 
@@ -685,6 +700,10 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .ui_font_inc = ui_stepper.inc,
         .reduced_motion = reduced_motion,
         .reduced_motion_hint_y = reduced_motion_hint_y,
+        .workspace_tabs_label_y = workspace_tabs_label_y,
+        .workspace_tabs_automatic = workspace_tabs_automatic,
+        .workspace_tabs_always = workspace_tabs_always,
+        .workspace_tabs_disabled = workspace_tabs_disabled,
         .transcript_card = transcript_card,
         .tool_groups_collapsed = tool_groups_collapsed,
         .tool_groups_expanded = tool_groups_expanded,
@@ -1014,6 +1033,9 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     queueControlHit(state, layout.ui_font_dec, layout.body_clip, .ui_font_dec, queue_hit);
     queueControlHit(state, layout.ui_font_inc, layout.body_clip, .ui_font_inc, queue_hit);
     queueControlHit(state, layout.reduced_motion, layout.body_clip, .reduced_motion, queue_hit);
+    queueControlHit(state, layout.workspace_tabs_automatic, layout.body_clip, .workspace_tabs_automatic, queue_hit);
+    queueControlHit(state, layout.workspace_tabs_always, layout.body_clip, .workspace_tabs_always, queue_hit);
+    queueControlHit(state, layout.workspace_tabs_disabled, layout.body_clip, .workspace_tabs_disabled, queue_hit);
     queueControlHit(state, layout.tool_groups_collapsed, layout.body_clip, .tool_groups_collapsed, queue_hit);
     queueControlHit(state, layout.tool_groups_expanded, layout.body_clip, .tool_groups_expanded, queue_hit);
     queueControlHit(state, layout.tool_groups_remember_last, layout.body_clip, .tool_groups_remember_last, queue_hit);
@@ -1131,6 +1153,15 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         .w = layout.appearance_card.w - m.card_pad * 2.0,
         .h = m.label_h,
     }, "Shortens transitions and keeps status indicators static", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
+    queueText(state, .{
+        .x = layout.appearance_card.x + m.card_pad,
+        .y = layout.workspace_tabs_label_y,
+        .w = layout.appearance_card.w - m.card_pad * 2.0,
+        .h = m.label_h,
+    }, "Workspace tabs", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
+    drawToggleCell(state, layout.workspace_tabs_automatic, "Sidebar collapsed", state.settings_controller.draft.workspace_tabs == .automatic, isControlHovered(state, .workspace_tabs_automatic), layout.body_clip);
+    drawToggleCell(state, layout.workspace_tabs_always, "Always", state.settings_controller.draft.workspace_tabs == .always, isControlHovered(state, .workspace_tabs_always), layout.body_clip);
+    drawToggleCell(state, layout.workspace_tabs_disabled, "Off", state.settings_controller.draft.workspace_tabs == .disabled, isControlHovered(state, .workspace_tabs_disabled), layout.body_clip);
 
     // Transcript
     drawCardTitle(state, layout.transcript_card, "Transcript", layout.body_clip);
@@ -1721,6 +1752,9 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         .workspace_scroll_horizontal => state.settings_controller.draft.workspace_scroll_direction = .horizontal,
         .workspace_scroll_vertical => state.settings_controller.draft.workspace_scroll_direction = .vertical,
         .reduced_motion => state.settings_controller.draft.reduced_motion = !state.settings_controller.draft.reduced_motion,
+        .workspace_tabs_automatic => state.settings_controller.draft.workspace_tabs = .automatic,
+        .workspace_tabs_always => state.settings_controller.draft.workspace_tabs = .always,
+        .workspace_tabs_disabled => state.settings_controller.draft.workspace_tabs = .disabled,
         .theme_dropdown => {
             state.settings_controller.theme_dropdown_open = !state.settings_controller.theme_dropdown_open;
             if (state.settings_controller.theme_dropdown_open) {

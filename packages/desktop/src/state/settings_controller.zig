@@ -73,6 +73,7 @@ pub const Draft = struct {
     workspace_scroll_threshold: u8 = app_config.DEFAULT_WORKSPACE_SCROLL_THRESHOLD,
     unzoom_on_pane_navigation: bool = false,
     reduced_motion: bool = false,
+    workspace_tabs: app_config.WorkspaceTabsMode = .automatic,
     companion_enabled: bool = false,
     companion_character: app_config.CompanionCharacter = .sprout,
     theme_source: theme.ThemeSource = .omarchy,
@@ -304,6 +305,7 @@ pub fn syncSettingsDraftFromConfig(self: anytype) void {
         .workspace_scroll_threshold = workspace_scroll_threshold,
         .unzoom_on_pane_navigation = self.app_config.unzoom_on_pane_navigation,
         .reduced_motion = self.app_config.reduced_motion,
+        .workspace_tabs = self.app_config.workspace_tabs,
         .companion_enabled = self.app_config.companion_enabled,
         .theme_source = self.app_config.theme_config.source,
         .theme_choice = self.app_config.themeChoiceIndex(),
@@ -357,6 +359,7 @@ pub fn isSettingsDraftDirty(self: anytype) bool {
     if (draft.workspace_scroll_threshold != workspace_scroll_threshold) return true;
     if (draft.unzoom_on_pane_navigation != self.app_config.unzoom_on_pane_navigation) return true;
     if (draft.reduced_motion != self.app_config.reduced_motion) return true;
+    if (draft.workspace_tabs != self.app_config.workspace_tabs) return true;
     if (draft.companion_enabled != self.app_config.companion_enabled) return true;
     if (isCompanionCharacterDraftDirty(&self.settings_controller, &self.app_config)) return true;
     if (draft.theme_choice != self.app_config.themeChoiceIndex()) return true;
@@ -509,6 +512,7 @@ pub fn saveSettingsModal(self: anytype) !void {
     self.app_config.workspace_scroll_direction = self.settings_controller.draft.workspace_scroll_direction;
     self.app_config.unzoom_on_pane_navigation = self.settings_controller.draft.unzoom_on_pane_navigation;
     self.app_config.reduced_motion = self.settings_controller.draft.reduced_motion;
+    self.app_config.workspace_tabs = self.settings_controller.draft.workspace_tabs;
     self.app_config.companion_enabled = self.settings_controller.draft.companion_enabled;
     self.reconcileCompanionAvailability();
     applyCompanionCharacterDraft(&self.settings_controller, &self.app_config);

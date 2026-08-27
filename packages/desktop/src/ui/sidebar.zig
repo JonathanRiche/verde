@@ -320,15 +320,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
         switch (hit.kind) {
             .collapse => state.setSidebarCollapsed(true),
             .expand => state.setSidebarCollapsed(false),
-            .add_workspace => {
-                state.project_controller.show_creator = true;
-                state.setSidebarCollapsed(false);
-                state.clearImportPath();
-                state.project_import_cursor = 0;
-                state.palette_modal_text_focus = .project_import;
-                state.setSidebarNotice("");
-                state.markDirty();
-            },
+            .add_workspace => state.openWorkspaceCreator(true),
             .new_thread => {
                 if (state.project_controller.projects.items.len > 0) state.createThreadForProject(@min(hit.project_index, state.project_controller.projects.items.len - 1));
             },
