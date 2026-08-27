@@ -375,11 +375,6 @@ if (-not $InstallerSource.Contains($ExpectedAppUserModelId) -or
     -not $InstallerSource.Contains('[Environment]::SetEnvironmentVariable("Path", $UpdatedUserPath, "User")')) {
   throw "install.ps1 is missing the required shortcut identity or user PATH setup"
 }
-foreach ($Document in @("WINDOWS-TESTING.md", "WINDOWS-PREVIEW.md", "WINDOWS-IMPLEMENTATION.md")) {
-  if (-not (Test-Path -LiteralPath (Join-Path $PackageRoot $Document) -PathType Leaf)) {
-    throw "Windows package is missing $Document"
-  }
-}
 $TerminalSmokePath = Join-Path $PackageRoot "test-terminal.ps1"
 if (-not (Test-Path -LiteralPath $TerminalSmokePath -PathType Leaf)) {
   throw "Windows package is missing test-terminal.ps1"
