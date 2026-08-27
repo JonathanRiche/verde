@@ -201,6 +201,22 @@ pub const WorkspaceScrollDirection = enum {
     }
 };
 
+/// Where the top-of-pane workspace tab strip appears: `automatic` only when
+/// the sidebar is collapsed or hidden, `always` alongside the expanded sidebar
+/// too, `disabled` never.
+pub const WorkspaceTabsMode = enum {
+    automatic,
+    always,
+    disabled,
+
+    pub fn parse(value: []const u8) ?WorkspaceTabsMode {
+        if (std.ascii.eqlIgnoreCase(value, "automatic")) return .automatic;
+        if (std.ascii.eqlIgnoreCase(value, "always")) return .always;
+        if (std.ascii.eqlIgnoreCase(value, "disabled")) return .disabled;
+        return null;
+    }
+};
+
 pub const WorkspaceScrollMode = enum {
     automatic,
     always,
@@ -254,6 +270,7 @@ pub const AppConfig = struct {
     workspace_scroll_threshold: u8 = DEFAULT_WORKSPACE_SCROLL_THRESHOLD,
     unzoom_on_pane_navigation: bool = false,
     reduced_motion: bool = false,
+    workspace_tabs: WorkspaceTabsMode = .automatic,
     companion_enabled: bool = false,
     companion_character: CompanionCharacter = .sprout,
     theme_config: theme.ThemeConfig = .{},
@@ -541,6 +558,7 @@ fn writeUiSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, con
     try ui_object.put(allocator, "workspace_scroll_threshold", .{ .integer = config.workspace_scroll_threshold });
     try ui_object.put(allocator, "unzoom_on_pane_navigation", .{ .bool = config.unzoom_on_pane_navigation });
     try ui_object.put(allocator, "reduced_motion", .{ .bool = config.reduced_motion });
+    try ui_object.put(allocator, "workspace_tabs", .{ .string = @tagName(config.workspace_tabs) });
     try ui_object.put(allocator, "companion_enabled", .{ .bool = config.companion_enabled });
     try ui_object.put(allocator, "companion_character", .{ .string = @tagName(config.companion_character) });
 }
@@ -1233,6 +1251,15 @@ fn applyUiOverrides(config: *AppConfig, ui_value: std.json.Value) void {
             log.warn("ui.reduced_motion must be a boolean when provided", .{});
         }
     }
+    if (ui_value.object.get("workspace_tabs")) |tabs_value| {
+        if (tabs_value != .string) {
+            log.warn("ui.workspace_tabs must be a string when provided", .{});
+        } else if (WorkspaceTabsMode.parse(tabs_value.string)) |mode| {
+            config.workspace_tabs = mode;
+        } else {
+            log.warn("ignoring unsupported ui.workspace_tabs", .{});
+        }
+    }
     if (ui_value.object.get("companion_enabled")) |enabled_value| {
         if (enabled_value == .bool) {
             config.companion_enabled = enabled_value.bool;
@@ -1606,6 +1633,31 @@ test "app config reduced motion round trips explicit values" {
         applyAppOverrides(std.testing.allocator, &loaded, saved.value);
         try std.testing.expectEqual(enabled, loaded.reduced_motion);
     }
+}
+
+test "app config workspace tabs mode round trips and rejects unknown values" {
+    for ([_]WorkspaceTabsMode{ .automatic, .always, .disabled }) |mode| {
+        var root = try parseTestRoot("{}");
+        defer root.deinit();
+        const config: AppConfig = .{ .workspace_tabs = mode };
+        try writeUiSection(root.arena.allocator(), &root.value.object, &config);
+        const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, root.value, .{});
+        defer std.testing.allocator.free(encoded);
+
+        var saved = try parseTestRoot(encoded);
+        defer saved.deinit();
+        var loaded: AppConfig = .{};
+        defer loaded.deinit(std.testing.allocator);
+        applyAppOverrides(std.testing.allocator, &loaded, saved.value);
+        try std.testing.expectEqual(mode, loaded.workspace_tabs);
+    }
+
+    var bad = try parseTestRoot("{\"ui\":{\"workspace_tabs\":\"sometimes\"}}");
+    defer bad.deinit();
+    var loaded: AppConfig = .{};
+    defer loaded.deinit(std.testing.allocator);
+    applyAppOverrides(std.testing.allocator, &loaded, bad.value);
+    try std.testing.expectEqual(WorkspaceTabsMode.automatic, loaded.workspace_tabs);
 }
 
 test "app config ignores out-of-range ui.workspace_panes_per_view" {
