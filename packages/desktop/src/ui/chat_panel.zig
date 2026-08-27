@@ -48,6 +48,11 @@ const COMPOSER_FOLLOWUP_PIN_Z: i32 = 126;
 /// Height of the pinned follow-up card shown above the composer while a reply
 /// streams and a message is queued/steered. One label line plus two prompt lines.
 const FOLLOWUP_PIN_HEIGHT: f32 = 60.0;
+/// Running background-command cards sit above the composer (z 120) and draft
+/// attachments (125), sharing the follow-up pin layer so Stop/Output stay
+/// reachable after the stream commits and the transcript row is hidden.
+const COMPOSER_BACKGROUND_TASK_PIN_Z: i32 = 126;
+const MAX_PINNED_BACKGROUND_COMMANDS: usize = 8;
 const BANG_MODE_BANNER_HEIGHT: f32 = 54.0;
 const APPROVAL_CARD_HEIGHT: f32 = 164.0;
 /// File mention search must sit above composer chrome and toolbar menus.
@@ -109,6 +114,22 @@ const FollowupPinHit = struct {
 const MAX_FOLLOWUP_PIN_HITS = 16;
 var followup_pin_hit_count: usize = 0;
 var followup_pin_hits: [MAX_FOLLOWUP_PIN_HITS]FollowupPinHit = [_]FollowupPinHit{.{}} ** MAX_FOLLOWUP_PIN_HITS;
+
+const BackgroundTaskPinHit = struct {
+    pane_id: ?app_state.WorkspacePaneId = null,
+    rect: palette.Rect = .{},
+};
+
+const MAX_BACKGROUND_TASK_PIN_HITS = 16;
+var background_task_pin_hit_count: usize = 0;
+var background_task_pin_hits: [MAX_BACKGROUND_TASK_PIN_HITS]BackgroundTaskPinHit = [_]BackgroundTaskPinHit{.{}} ** MAX_BACKGROUND_TASK_PIN_HITS;
+
+const PinnedBackgroundCommand = struct {
+    message_index: usize,
+    task_index: ?usize = null,
+    author: []const u8,
+    body: []const u8,
+};
 
 const UsageActionHit = struct {
     rect: palette.Rect = .{},
@@ -237,6 +258,7 @@ pub fn renderWorkspace(state: *app_state.AppState, width: f32, height: f32) void
 pub fn resetTranscriptHitCache() void {
     transcript_hit_count = 0;
     followup_pin_hit_count = 0;
+    background_task_pin_hit_count = 0;
     usage_action_hit_count = 0;
     diff_file_open_hit_count = 0;
     diff_file_comment_hit_count = 0;
@@ -397,22 +419,14 @@ pub fn renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(
     else
         0.0;
 
-    const body = palette.Rect{
-        .x = rect.x,
-        .y = header.y + header.h,
-        .w = rect.w,
-        .h = @max(composer_y - (header.y + header.h) - attachment_reserve - bang_mode_reserve - followup_reserve - approval_reserve, theme.scaledUi(120.0)),
-    };
-
     const browser_visible = state.isBrowserVisible() and pane_id == null;
-    const split_chat_browser = browser_visible and body.w >= theme.scaledUi(900.0);
-    const stacked_chat_browser = browser_visible and !split_chat_browser and body.h >= theme.scaledUi(300.0);
-    const browser_width = if (split_chat_browser) state.browserPanelWidth(body.w) else 0.0;
+    const split_chat_browser = browser_visible and rect.w >= theme.scaledUi(900.0);
+    const browser_width = if (split_chat_browser) state.browserPanelWidth(rect.w) else 0.0;
     const target_split_chat_browser = browser_visible and transcript_layout_width >= theme.scaledUi(900.0);
     const target_browser_width = if (target_split_chat_browser) state.browserPanelWidth(transcript_layout_width) else 0.0;
     const target_chat_width = if (target_split_chat_browser) transcript_layout_width - target_browser_width else transcript_layout_width;
-    const composer_lane_w = if (split_chat_browser) body.w - browser_width else body.w;
-    const composer_lane_x = body.x;
+    const composer_lane_w = if (split_chat_browser) rect.w - browser_width else rect.w;
+    const composer_lane_x = rect.x;
 
     // Composer shares the transcript's content column so the prompt box and the
     // conversation bubbles are always the same width on the same center axis.
@@ -423,6 +437,42 @@ pub fn renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(
         .w = composer_column.w,
         .h = composer_height,
     };
+
+    var pinned_background_commands: [MAX_PINNED_BACKGROUND_COMMANDS]PinnedBackgroundCommand = undefined;
+    const pinned_background_count = collectPinnedBackgroundCommands(state.currentThread(), &pinned_background_commands);
+    var pinned_background_heights: [MAX_PINNED_BACKGROUND_COMMANDS]f32 = undefined;
+    var pinned_background_stack_h: f32 = 0.0;
+    {
+        var pin_i: usize = 0;
+        while (pin_i < pinned_background_count) : (pin_i += 1) {
+            const row = pinned_background_commands[pin_i];
+            const height = transcriptCommandEventHeight(
+                state,
+                row.message_index,
+                row.author,
+                row.body,
+                composer_column.w,
+                null,
+            );
+            pinned_background_heights[pin_i] = height;
+            pinned_background_stack_h += height;
+        }
+        if (pinned_background_count > 1) {
+            pinned_background_stack_h += theme.scaledUi(8.0) * @as(f32, @floatFromInt(pinned_background_count - 1));
+        }
+    }
+    const background_task_reserve = if (pinned_background_count > 0)
+        pinned_background_stack_h + theme.scaledUi(10.0)
+    else
+        0.0;
+
+    const body = palette.Rect{
+        .x = rect.x,
+        .y = header.y + header.h,
+        .w = rect.w,
+        .h = @max(composer_y - (header.y + header.h) - attachment_reserve - bang_mode_reserve - background_task_reserve - followup_reserve - approval_reserve, theme.scaledUi(120.0)),
+    };
+    const stacked_chat_browser = browser_visible and !split_chat_browser and body.h >= theme.scaledUi(300.0);
 
     if (split_chat_browser) {
         const chat_rect = palette.Rect{ .x = body.x, .y = body.y, .w = body.w - browser_width, .h = body.h };
@@ -474,13 +524,27 @@ pub fn renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(
         renderBangModeBanner(state, banner_rect);
     }
 
+    // Running background-command cards stay pinned above the prompt so Stop /
+    // Output remain reachable after the stream commits and the transcript row
+    // is hidden. Sit above bang/attachments and below follow-up/approval.
+    if (pinned_background_count > 0) {
+        renderPinnedBackgroundCommands(
+            state,
+            composer_rect,
+            bang_mode_reserve + attachment_reserve,
+            pinned_background_commands[0..pinned_background_count],
+            pinned_background_heights[0..pinned_background_count],
+            pane_id,
+        );
+    }
+
     // The pin sits above the composer and any draft-image attachments, in the
     // strip reserved by `followup_reserve`. Bottom edge clears the attachments.
     if (show_followup_pin) {
         if (followup_pin) |fp| {
             const pin_rect = palette.Rect{
                 .x = composer_rect.x,
-                .y = composer_rect.y - bang_mode_reserve - attachment_reserve - theme.scaledUi(FOLLOWUP_PIN_HEIGHT) - theme.scaledUi(8.0),
+                .y = composer_rect.y - bang_mode_reserve - attachment_reserve - background_task_reserve - theme.scaledUi(FOLLOWUP_PIN_HEIGHT) - theme.scaledUi(8.0),
                 .w = composer_rect.w,
                 .h = theme.scaledUi(FOLLOWUP_PIN_HEIGHT),
             };
@@ -493,7 +557,7 @@ pub fn renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(
     if (pending_approval) |approval| {
         const card_rect = palette.Rect{
             .x = composer_rect.x,
-            .y = composer_rect.y - bang_mode_reserve - attachment_reserve - followup_reserve - theme.scaledUi(APPROVAL_CARD_HEIGHT) - theme.scaledUi(8.0),
+            .y = composer_rect.y - bang_mode_reserve - attachment_reserve - background_task_reserve - followup_reserve - theme.scaledUi(APPROVAL_CARD_HEIGHT) - theme.scaledUi(8.0),
             .w = composer_rect.w,
             .h = theme.scaledUi(APPROVAL_CARD_HEIGHT),
         };
@@ -743,6 +807,41 @@ fn appendFollowupPinHit(pane_id: ?app_state.WorkspacePaneId, rect: palette.Rect)
     if (followup_pin_hit_count >= followup_pin_hits.len) return;
     followup_pin_hits[followup_pin_hit_count] = .{ .pane_id = pane_id, .rect = rect };
     followup_pin_hit_count += 1;
+}
+
+fn appendBackgroundTaskPinHit(pane_id: ?app_state.WorkspacePaneId, rect: palette.Rect) void {
+    if (background_task_pin_hit_count >= background_task_pin_hits.len) return;
+    background_task_pin_hits[background_task_pin_hit_count] = .{ .pane_id = pane_id, .rect = rect };
+    background_task_pin_hit_count += 1;
+}
+
+fn backgroundTaskPinHitAt(x: f32, y: f32) ?BackgroundTaskPinHit {
+    var index = background_task_pin_hit_count;
+    while (index > 0) {
+        index -= 1;
+        const hit = background_task_pin_hits[index];
+        if (rectContains(hit.rect, x, y)) return hit;
+    }
+    return null;
+}
+
+/// True when the mouse rests on a pinned running-background-command card.
+pub fn backgroundTaskPinWantsPointerAt(x: f32, y: f32) bool {
+    return backgroundTaskPinHitAt(x, y) != null;
+}
+
+/// Handles the sticky background-command card before pane/transcript routing
+/// because it overlays the strip between those two regions.
+pub fn handleBackgroundTaskPinMouseButton(state: *app_state.AppState, x: f32, y: f32, down: bool, clicks: u8) bool {
+    const hit = backgroundTaskPinHitAt(x, y) orelse return false;
+    if (!down) return true;
+    if (hit.pane_id) |pane_id| _ = state.focusCurrentProjectWorkspacePane(pane_id);
+    if (clicks <= 1) {
+        if (state.consumeCodeCopyButtonClick(x, y)) return true;
+        if (state.consumeBackgroundTaskActionClick(x, y)) return true;
+        if (state.consumeCardToggleClick(x, y)) return true;
+    }
+    return true;
 }
 
 fn followupPinHitAt(x: f32, y: f32) ?FollowupPinHit {
@@ -1121,7 +1220,7 @@ fn transcriptMarkdownBubbleHit(
     var pi: usize = 0;
     while (pi < send_state.pending_events.items.len) {
         const event = send_state.pending_events.items[pi];
-        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(thread, event.author, event.body)) {
+        if (event.role == .system and shouldSkipPendingTranscriptEvent(thread, event.author, event.body)) {
             pi += 1;
             continue;
         }
@@ -1190,7 +1289,7 @@ fn transcriptMarkdownBubbleLinkHit(
     var pi: usize = 0;
     while (pi < send_state.pending_events.items.len) {
         const event = send_state.pending_events.items[pi];
-        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(thread, event.author, event.body)) {
+        if (event.role == .system and shouldSkipPendingTranscriptEvent(thread, event.author, event.body)) {
             pi += 1;
             continue;
         }
@@ -1554,7 +1653,7 @@ fn transcriptMarkdownMessageSnapshot(state: *app_state.AppState, message_index: 
     const pi = message_index - n;
     if (pi < send_state.pending_events.items.len) {
         const ev = send_state.pending_events.items[pi];
-        if (ev.role == .system and shouldHideCursorLifecycleSystemEvent(thread, ev.author, ev.body)) return null;
+        if (ev.role == .system and shouldSkipPendingTranscriptEvent(thread, ev.author, ev.body)) return null;
         const kind = transcriptSelectableBodyKind(ev.role, ev.author, ev.body, false, false) orelse return null;
         const body_trim = std.mem.trim(u8, ev.body, "\n\r\t ");
         const body_rect = transcriptSelectableBodyRect(column, 0.0, 100000.0, ev.role, ev.author, ev.body) orelse return null;
@@ -3445,7 +3544,7 @@ fn transcriptPendingStreamHeight(state: *app_state.AppState, thread: *const app_
     var pi: usize = 0;
     while (pi < send_state.pending_events.items.len) {
         const event = &send_state.pending_events.items[pi];
-        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(thread, event.author, event.body)) {
+        if (event.role == .system and shouldSkipPendingTranscriptEvent(thread, event.author, event.body)) {
             pi += 1;
             continue;
         }
@@ -3480,7 +3579,7 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
     var pi: usize = 0;
     while (pi < pending_count) {
         const event = &send_state.pending_events.items[pi];
-        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(thread, event.author, event.body)) {
+        if (event.role == .system and shouldSkipPendingTranscriptEvent(thread, event.author, event.body)) {
             pi += 1;
             continue;
         }
@@ -3523,7 +3622,7 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
             const is_last = pi + 1 == pending_count;
             const is_backgrounded = chat_types.ChatThread.isBackgroundCommandEvent(event.author);
             if (y + item_h >= column.y and y <= column.y + column.h) {
-                renderCommandEventRow(state, column, y, item_h, event.author, event.body, clip, msg_idx, is_last or is_backgrounded, false, event.tool_call_status);
+                renderCommandEventRow(state, column, y, item_h, event.author, event.body, clip, msg_idx, is_last or is_backgrounded, false, event.tool_call_status, null);
             }
         } else if (event.role == .system and isDiffSummaryMessage(event.author, event.body)) {
             if (y + item_h >= column.y and y <= column.y + column.h) {
@@ -3803,6 +3902,171 @@ fn shouldHideCursorLifecycleSystemEvent(thread: anytype, author: []const u8, bod
         std.mem.eql(u8, body, "completed");
 }
 
+/// Pending "Background command" rows are pinned above the composer instead of
+/// occupying the live stream, so they do not flash then vanish at commit.
+fn shouldSkipPendingTranscriptEvent(thread: anytype, author: []const u8, body_raw: []const u8) bool {
+    if (shouldHideCursorLifecycleSystemEvent(thread, author, body_raw)) return true;
+    return chat_types.ChatThread.isBackgroundCommandEvent(author);
+}
+
+fn pinnedBackgroundCommandRowDuplicate(rows: []const PinnedBackgroundCommand, count: usize, body: []const u8) bool {
+    var index: usize = 0;
+    while (index < count) : (index += 1) {
+        if (std.mem.eql(u8, rows[index].body, body)) return true;
+    }
+    return false;
+}
+
+fn commandPreviewFromBody(body_raw: []const u8) []const u8 {
+    var text = chat_types.ChatThread.backgroundCommandFromEventBody(body_raw);
+    text = std.mem.trim(u8, text, "\n\r\t ");
+    const labels = [_][]const u8{ "Input:", "Command:", "Tool:" };
+    for (labels) |label| {
+        if (std.mem.startsWith(u8, text, label)) {
+            return std.mem.trim(u8, text[label.len..], "\n\r\t ");
+        }
+    }
+    return text;
+}
+
+fn commandTextMatchesTask(body: []const u8, task_command: []const u8) bool {
+    const preview = commandPreviewFromBody(body);
+    if (preview.len == 0 or task_command.len == 0) return false;
+    if (std.mem.eql(u8, preview, task_command)) return true;
+    if (task_command.len >= 8 and std.mem.indexOf(u8, preview, task_command) != null) return true;
+    if (preview.len >= 8 and std.mem.indexOf(u8, task_command, preview) != null) return true;
+    return false;
+}
+
+fn pinnedRowForRunningTask(
+    thread: *app_state.ChatThread,
+    task: *app_state.BackgroundTask,
+    task_index: usize,
+) PinnedBackgroundCommand {
+    var message_index = thread.messages.items.len;
+    var fallback: ?PinnedBackgroundCommand = null;
+    while (message_index > 0) {
+        message_index -= 1;
+        const message = thread.messages.items[message_index];
+        if (message.role != .system) continue;
+        if (chat_types.ChatThread.isBackgroundCommandEvent(message.author)) {
+            const event_task = app_state.backgroundTaskForEventBody(thread, message.body) orelse continue;
+            if (event_task != task) continue;
+            return .{
+                .message_index = message_index,
+                .task_index = task_index,
+                .author = message.author,
+                .body = message.body,
+            };
+        }
+        if (fallback != null) continue;
+        if (!isCommandSystemEvent(message.author)) continue;
+        if (!commandTextMatchesTask(message.body, task.command)) continue;
+        fallback = .{
+            .message_index = message_index,
+            .task_index = task_index,
+            .author = message.author,
+            .body = message.body,
+        };
+    }
+    return fallback orelse .{
+        .message_index = std.math.maxInt(usize),
+        .task_index = task_index,
+        .author = "Background command",
+        .body = task.command,
+    };
+}
+
+fn collectPinnedBackgroundCommands(
+    thread: *const app_state.ChatThread,
+    rows: *[MAX_PINNED_BACKGROUND_COMMANDS]PinnedBackgroundCommand,
+) usize {
+    var count: usize = 0;
+    const mutable_thread = @constCast(thread);
+
+    for (mutable_thread.background_tasks.items, 0..) |*task, task_index| {
+        if (task.status != .running) continue;
+        if (count >= rows.len) break;
+        const row = pinnedRowForRunningTask(mutable_thread, task, task_index);
+        if (pinnedBackgroundCommandRowDuplicate(rows, count, row.body)) continue;
+        rows[count] = row;
+        count += 1;
+    }
+
+    const send_state = thread.send_state;
+    send_state.mutex.lock();
+    defer send_state.mutex.unlock();
+    if (send_state.status != .pending) return count;
+    const base = thread.messages.items.len;
+    for (send_state.pending_events.items, 0..) |event, pending_index| {
+        if (count >= rows.len) break;
+        if (event.role != .system or !chat_types.ChatThread.isBackgroundCommandEvent(event.author)) continue;
+        if (pinnedBackgroundCommandRowDuplicate(rows, count, event.body)) continue;
+        rows[count] = .{
+            .message_index = base + pending_index,
+            .author = event.author,
+            .body = event.body,
+        };
+        count += 1;
+    }
+    return count;
+}
+
+// Sticky Stop/Output cards for live background commands, above the prompt.
+fn renderPinnedBackgroundCommands(
+    state: *app_state.AppState,
+    composer_rect: palette.Rect,
+    below_reserve: f32,
+    rows: []const PinnedBackgroundCommand,
+    heights: []const f32,
+    pane_id: ?app_state.WorkspacePaneId,
+) void {
+    const previous_z = state.palette_overlay_batch.setZIndex(COMPOSER_BACKGROUND_TASK_PIN_Z);
+    defer state.palette_overlay_batch.restoreZIndex(previous_z);
+
+    var stack_h: f32 = 0.0;
+    for (heights) |height| stack_h += height;
+    if (rows.len > 1) {
+        stack_h += theme.scaledUi(8.0) * @as(f32, @floatFromInt(rows.len - 1));
+    }
+    var y = composer_rect.y - below_reserve - stack_h - theme.scaledUi(8.0);
+    const clip = palette.Rect{
+        .x = composer_rect.x,
+        .y = y,
+        .w = composer_rect.w,
+        .h = stack_h,
+    };
+    const thread = state.currentThread();
+    for (rows, heights) |row, height| {
+        const card_rect = palette.Rect{
+            .x = composer_rect.x,
+            .y = y,
+            .w = composer_rect.w,
+            .h = height,
+        };
+        const pending = row.message_index != std.math.maxInt(usize) and
+            row.message_index >= thread.messages.items.len;
+        if (pending) thread.send_state.mutex.lock();
+        renderCommandEventRow(
+            state,
+            composer_rect,
+            y,
+            height,
+            row.author,
+            row.body,
+            clip,
+            row.message_index,
+            true,
+            false,
+            null,
+            row.task_index,
+        );
+        if (pending) thread.send_state.mutex.unlock();
+        appendBackgroundTaskPinHit(pane_id, card_rect);
+        y += height + theme.scaledUi(8.0);
+    }
+}
+
 test "M5-P4 background rows persist while the display filter hides known task events" {
     const allocator = std.testing.allocator;
     var thread = try app_state.ChatThread.init(allocator, "Background persistence");
@@ -3825,6 +4089,128 @@ test "M5-P4 background rows persist while the display filter hides known task ev
         thread.messages.items[0].body,
     ));
     try std.testing.expect(!shouldHideCursorLifecycleSystemEvent(&thread, "Notice", "mise run build"));
+}
+
+test "running background commands pin above the composer after the stream commits" {
+    const allocator = std.testing.allocator;
+    var thread = try app_state.ChatThread.init(allocator, "Pinned background command");
+    defer thread.deinit(allocator);
+    try thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "mise run dev"),
+        .status = .running,
+    });
+    try thread.messages.append(allocator, .{
+        .role = .system,
+        .author = try allocator.dupeZ(u8, "Background command"),
+        .body = try allocator.dupeZ(u8, "mise run dev"),
+    });
+
+    var rows: [MAX_PINNED_BACKGROUND_COMMANDS]PinnedBackgroundCommand = undefined;
+    const count = collectPinnedBackgroundCommands(&thread, &rows);
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqual(@as(usize, 0), rows[0].message_index);
+    try std.testing.expectEqualStrings("mise run dev", rows[0].body);
+    try std.testing.expect(shouldHideCursorLifecycleSystemEvent(
+        &thread,
+        thread.messages.items[0].author,
+        thread.messages.items[0].body,
+    ));
+}
+
+test "pending background commands pin instead of occupying the live stream" {
+    const allocator = std.testing.allocator;
+    const page = std.heap.page_allocator;
+    var thread = try app_state.ChatThread.init(allocator, "Pending background pin");
+    defer thread.deinit(allocator);
+    thread.send_state.status = .pending;
+    try thread.send_state.pending_events.append(page, .{
+        .role = .system,
+        .author = try page.dupe(u8, "Background command"),
+        .body = try page.dupe(u8, "npm run dev"),
+    });
+
+    var rows: [MAX_PINNED_BACKGROUND_COMMANDS]PinnedBackgroundCommand = undefined;
+    const count = collectPinnedBackgroundCommands(&thread, &rows);
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqual(@as(usize, 0), rows[0].message_index);
+    try std.testing.expectEqualStrings("npm run dev", rows[0].body);
+    try std.testing.expect(shouldSkipPendingTranscriptEvent(&thread, "Background command", "npm run dev"));
+    try std.testing.expect(!shouldSkipPendingTranscriptEvent(&thread, "Ran command", "npm test"));
+}
+
+test "completed background commands are not pinned" {
+    const allocator = std.testing.allocator;
+    var thread = try app_state.ChatThread.init(allocator, "Completed background pin");
+    defer thread.deinit(allocator);
+    try thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "mise run dev"),
+        .status = .completed,
+    });
+    try thread.messages.append(allocator, .{
+        .role = .system,
+        .author = try allocator.dupeZ(u8, "Background command"),
+        .body = try allocator.dupeZ(u8, "mise run dev"),
+    });
+
+    var rows: [MAX_PINNED_BACKGROUND_COMMANDS]PinnedBackgroundCommand = undefined;
+    try std.testing.expectEqual(@as(usize, 0), collectPinnedBackgroundCommands(&thread, &rows));
+}
+
+test "running background tasks pin from a cancelled Ran command row" {
+    const allocator = std.testing.allocator;
+    var thread = try app_state.ChatThread.init(allocator, "Yellow ran command pin");
+    defer thread.deinit(allocator);
+    try thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "bun run dev"),
+        .status = .running,
+    });
+    try thread.messages.append(allocator, .{
+        .role = .system,
+        .author = try allocator.dupeZ(u8, "Ran command"),
+        .body = try allocator.dupeZ(u8, "Input:\n/usr/bin/bash -lc 'bun run dev'"),
+        .tool_call_status = .cancelled,
+    });
+
+    var rows: [MAX_PINNED_BACKGROUND_COMMANDS]PinnedBackgroundCommand = undefined;
+    const count = collectPinnedBackgroundCommands(&thread, &rows);
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqual(@as(usize, 0), rows[0].message_index);
+    try std.testing.expectEqual(@as(?usize, 0), rows[0].task_index);
+    try std.testing.expectEqualStrings("Ran command", rows[0].author);
+    try std.testing.expect(commandTextMatchesTask(rows[0].body, "bun run dev"));
+}
+
+test "running background tasks pin even without a transcript row" {
+    const allocator = std.testing.allocator;
+    var thread = try app_state.ChatThread.init(allocator, "Synthetic background pin");
+    defer thread.deinit(allocator);
+    try thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "bun run dev"),
+        .status = .running,
+    });
+
+    var rows: [MAX_PINNED_BACKGROUND_COMMANDS]PinnedBackgroundCommand = undefined;
+    const count = collectPinnedBackgroundCommands(&thread, &rows);
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqual(std.math.maxInt(usize), rows[0].message_index);
+    try std.testing.expectEqual(@as(?usize, 0), rows[0].task_index);
+    try std.testing.expectEqualStrings("Background command", rows[0].author);
+    try std.testing.expectEqualStrings("bun run dev", rows[0].body);
+}
+
+test "background-task pin hits survive rendering another chat pane" {
+    resetTranscriptHitCache();
+    defer resetTranscriptHitCache();
+
+    appendBackgroundTaskPinHit(11, .{ .x = 10.0, .y = 20.0, .w = 100.0, .h = 40.0 });
+    appendBackgroundTaskPinHit(22, .{ .x = 200.0, .y = 20.0, .w = 100.0, .h = 40.0 });
+
+    const first = backgroundTaskPinHitAt(40.0, 40.0) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(?app_state.WorkspacePaneId, 11), first.pane_id);
+    const second = backgroundTaskPinHitAt(240.0, 40.0) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(?app_state.WorkspacePaneId, 22), second.pane_id);
+    try std.testing.expect(backgroundTaskPinWantsPointerAt(40.0, 40.0));
+    try std.testing.expect(!backgroundTaskPinWantsPointerAt(0.0, 0.0));
 }
 
 fn isUsageSummaryBody(body: []const u8, title: []const u8) bool {
@@ -4062,7 +4448,7 @@ fn renderTranscriptMessage(state: *app_state.AppState, thread: *const app_state.
         return;
     }
     if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body)) {
-        renderCommandEventRow(state, column, y, height, message.author, message.body, clip, message_index, thread.backgroundCommandIsRunning(message.body), false, message.tool_call_status);
+        renderCommandEventRow(state, column, y, height, message.author, message.body, clip, message_index, thread.backgroundCommandIsRunning(message.body), false, message.tool_call_status, null);
         return;
     }
     if (message.role == .system and isDiffSummaryMessage(message.author, message.body)) {
@@ -5723,6 +6109,7 @@ fn renderToolCallGroup(
                 fallback_running and index + 1 == end,
             true,
             toolCallEntryStatus(entry),
+            null,
         );
         child_y += child_h + theme.scaledUi(8.0);
     }
@@ -5740,6 +6127,7 @@ fn renderCommandEventRow(
     running: bool,
     grouped: bool,
     tool_call_status: ?ai_harness.ToolCallStatus,
+    live_task_index: ?usize,
 ) void {
     // Command transcript card, including controls for tracked background tasks.
     const bubble = palette.Rect{ .x = column.x, .y = y, .w = column.w, .h = height };
@@ -5807,16 +6195,17 @@ fn renderCommandEventRow(
 
     const text_x = status_cx + status_dia * 0.5 + theme.scaledUi(10.0);
     const backgrounded = chat_types.ChatThread.isBackgroundCommandEvent(original_author);
+    const live_background = backgrounded or live_task_index != null;
     const local_bang = (std.mem.eql(u8, original_author, "Ran command") or std.mem.eql(u8, original_author, "Command failed")) and std.mem.startsWith(u8, body, "$ ");
     const command_end = std.mem.indexOfScalar(u8, body, '\n') orelse body.len;
     const retry_command = if (local_bang) std.mem.trim(u8, body[2..command_end], " \t\r") else "";
     const action_w = theme.scaledUi(58.0);
     const action_gap = theme.scaledUi(6.0);
-    const show_output = backgrounded and bubble.w >= theme.scaledUi(330.0);
+    const show_output = live_background and bubble.w >= theme.scaledUi(330.0);
     const output_label = if (std.mem.indexOf(u8, body, "\nOutput log:") != null) "Output" else "Details";
-    const show_copy = !backgrounded or !is_running or bubble.w >= theme.scaledUi(210.0);
+    const show_copy = !live_background or !is_running or bubble.w >= theme.scaledUi(210.0);
     const action_right = bubble.x + bubble.w - pad_x - chev_box_w - copy_gap;
-    const stop_visible = backgrounded and is_running;
+    const stop_visible = live_background and is_running;
     const stop_rect = snapRect(palette.Rect{
         .x = action_right - action_w,
         .y = bubble.y + (header_h - copy_h) * 0.5,
@@ -5893,19 +6282,19 @@ fn renderCommandEventRow(
         }
     }
 
-    if (backgrounded) {
+    if (live_background) {
         if (show_output) {
             queueRoundedClipped(state, output_rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 86)), theme.scaledUi(5.0), clip);
             queueFixedTextLine(state, .{ .x = output_rect.x + theme.scaledUi(7.0), .y = output_rect.y + theme.scaledUi(6.0), .w = output_rect.w - theme.scaledUi(14.0), .h = theme.scaledUi(14.0) }, output_label, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(11.5), clip);
             if (intersectClipRect(intersectClipRect(output_rect, bubble), clip)) |clipped_output| {
-                state.recordBackgroundTaskActionForMessage(clipped_output, message_index, body_raw, .output);
+                state.recordBackgroundTaskActionForMessageWithTask(clipped_output, message_index, body_raw, .output, live_task_index);
             }
         }
         if (stop_visible) {
             queueRoundedClipped(state, stop_rect, paletteColor(theme.withAlpha(theme.COLOR_DIFF_REMOVE, 55)), theme.scaledUi(5.0), clip);
             queueFixedTextLine(state, .{ .x = stop_rect.x + theme.scaledUi(14.0), .y = stop_rect.y + theme.scaledUi(6.0), .w = stop_rect.w - theme.scaledUi(28.0), .h = theme.scaledUi(14.0) }, "Stop", paletteColor(theme.COLOR_DIFF_REMOVE), theme.scaledUi(11.5), clip);
             if (intersectClipRect(intersectClipRect(stop_rect, bubble), clip)) |clipped_stop| {
-                state.recordBackgroundTaskActionForMessage(clipped_stop, message_index, body_raw, .stop);
+                state.recordBackgroundTaskActionForMessageWithTask(clipped_stop, message_index, body_raw, .stop, live_task_index);
             }
         }
     }
