@@ -1931,7 +1931,12 @@ pub fn openThreadInTui(self: anytype, project_index: usize, thread_index: usize)
     layout = &project.workspace_layout;
     thread.tui_dock_id = dock_id;
     const pane = layout.paneByIdMutable(pane_id) orelse return;
-    self.restartTerminalDockForWorkspace(project_index, dock_id) catch |err| {
+    const fx_command = [_][]const u8{ "fx", "--resume", provider_thread_id };
+    const launch_profile: terminal.TerminalLaunchProfile = if (thread.provider == .fx)
+        .{ .kind = .custom, .label = "fx", .command = &fx_command }
+    else
+        .{};
+    self.restartTerminalDockForWorkspaceProfile(project_index, dock_id, project.path, launch_profile) catch |err| {
         log.err("failed to start TUI terminal dock: {s}", .{@errorName(err)});
         self.setSidebarNotice("Failed to start TUI terminal.");
         return;
@@ -1944,11 +1949,13 @@ pub fn openThreadInTui(self: anytype, project_index: usize, thread_index: usize)
     layout.maximized_pane_id = null;
     dock.visible = false;
     self.requestTerminalFocus();
-    _ = self.writeWorkspaceTerminalPane(pane_id, command) catch |err| {
-        log.warn("failed to write TUI resume command: {s}", .{@errorName(err)});
-        self.setSidebarNotice("Failed to write TUI resume command.");
-        return;
-    };
+    if (thread.provider != .fx) {
+        _ = self.writeWorkspaceTerminalPane(pane_id, command) catch |err| {
+            log.warn("failed to write TUI resume command: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to write TUI resume command.");
+            return;
+        };
+    }
     self.setSidebarNotice("Thread opened in TUI.");
     self.markDirty();
 }
@@ -2023,6 +2030,15 @@ pub fn resumeRecreatedThreadTui(self: anytype, project_index: usize, dock_id: u3
     const thread = threadForTuiDock(project, dock_id) orelse return false;
     const provider_thread_id = thread.provider_thread_id orelse return false;
     const pane_id = terminalPaneForDock(project, dock_id) orelse return false;
+    if (thread.provider == .fx) {
+        const fx_command = [_][]const u8{ "fx", "--resume", provider_thread_id };
+        try self.restartTerminalDockForWorkspaceProfile(project_index, dock_id, project.path, .{
+            .kind = .custom,
+            .label = "fx",
+            .command = &fx_command,
+        });
+        return true;
+    }
     const command = try self.tuiResumeCommand(thread.provider, provider_thread_id);
     defer self.allocator.free(command);
     return try self.writeWorkspaceTerminalPaneForProject(project_index, pane_id, command);
