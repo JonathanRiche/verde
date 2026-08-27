@@ -580,7 +580,7 @@ const Spawned = struct {
 fn spawnConpty(allocator: std.mem.Allocator, cwd: []const u8, command: []const [:0]u8, identity: anytype, cols: u16, rows: u16) !Spawned {
     var env_map = try process_env.buildAugmentedEnvMap(allocator);
     defer env_map.deinit();
-    try addChildEnvironment(&env_map, identity);
+    try addChildEnvironment(&env_map, identity, command);
 
     const is_batch_script = process_env.isWindowsCommandScript(command[0]);
     const application = if (is_batch_script)
@@ -712,7 +712,7 @@ fn conptyStartupInfo(attribute_list: ProcThreadAttributeList) StartupInfoEx {
     return startup_info;
 }
 
-fn addChildEnvironment(env_map: *std.process.Environ.Map, identity: anytype) !void {
+fn addChildEnvironment(env_map: *std.process.Environ.Map, identity: anytype, command: []const [:0]u8) !void {
     try env_map.put("TERM", "xterm-256color");
     try env_map.put("COLORTERM", "truecolor");
     try env_map.put("TERM_PROGRAM", "ghostty");
@@ -735,6 +735,18 @@ fn addChildEnvironment(env_map: *std.process.Environ.Map, identity: anytype) !vo
         try env_map.put("VERDE_LIVE_ENDPOINT", identity.live_endpoint);
         try env_map.put("VERDE_LIVE_SOCKET", identity.live_endpoint);
     }
+    if (commandLaunchesFx(command)) {
+        try env_map.put("HERDR_SOCKET_PATH", identity.sessionizer_endpoint);
+        try env_map.put("HERDR_PANE_ID", identity.session_id);
+    }
+}
+
+fn commandLaunchesFx(command: []const [:0]u8) bool {
+    if (command.len == 0) return false;
+    const raw = command[0];
+    const executable = if (std.mem.findLastAny(u8, raw, "/\\")) |index| raw[index + 1 ..] else raw;
+    return std.ascii.eqlIgnoreCase(executable, "fx") or
+        std.ascii.eqlIgnoreCase(executable, "fx.exe");
 }
 
 fn defaultShellCommand(allocator: std.mem.Allocator, env_map: *const std.process.Environ.Map) ![][:0]u8 {
