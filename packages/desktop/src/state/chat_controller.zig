@@ -1878,6 +1878,36 @@ fn copyDraftImagesToFollowup(
     }
 }
 
+fn restorePendingSteerToDraft(allocator: std.mem.Allocator, thread: *ChatThread) bool {
+    const send_state = thread.send_state;
+    send_state.mutex.lock();
+    const pending = send_state.pending_followup orelse {
+        send_state.mutex.unlock();
+        return false;
+    };
+    if (pending.kind != .steer) {
+        send_state.mutex.unlock();
+        return false;
+    }
+
+    // Provider steering runs synchronously on the render thread after Tab has
+    // cleared this draft, so restoring it cannot race with composer input.
+    std.debug.assert(thread.currentDraft().len == 0 and thread.draftImageCount() == 0);
+    var owned_pending = pending;
+    send_state.pending_followup = null;
+    send_state.pending_followup_signal_sent = false;
+    send_state.ui_revision +%= 1;
+    send_state.mutex.unlock();
+    defer owned_pending.deinit(allocator);
+
+    thread.setDraft(owned_pending.prompt);
+    if (owned_pending.images.items.len > 0) {
+        thread.draft_image = owned_pending.images.orderedRemove(0);
+        std.mem.swap(std.ArrayList(ChatImageAttachment), &thread.draft_extra_images, &owned_pending.images);
+    }
+    return true;
+}
+
 /// Queues the current composer draft as a new turn after the active reply.
 /// Codex and Claude use this for Enter while Tab remains the distinct steer action.
 pub fn queueDraftDuringSend(self: anytype) void {
@@ -6586,17 +6616,18 @@ pub fn issuePendingProviderSteer(
         steer_failure = error.UnsupportedExecutionTarget;
     }
     if (steer_failure) |err| {
-        send_state.mutex.lock();
-        defer send_state.mutex.unlock();
-        if (send_state.pending_followup) |*pending_followup| {
-            pending_followup.state = .fallback_next_turn;
+        const restored = restorePendingSteerToDraft(self.allocator, thread);
+        if (restored) {
+            self.markDirty();
+            if (project_index == self.project_controller.selected_index and thread_index == self.currentProject().selected_thread_index) {
+                self.resetComposerInputWidget();
+            }
         }
-        send_state.pending_followup_signal_sent = false;
         self.setSidebarNotice(if (provider == .claude)
-            "Claude could not steer this turn. It will send after the current reply finishes."
+            "Claude could not steer this turn. The message was restored to the composer."
         else switch (err) {
-            error.CodexActiveTurnNotSteerable => "Codex could not steer this turn. It will send after the current reply finishes.",
-            else => "Failed to send Codex steer. It will send after the current reply finishes.",
+            error.CodexActiveTurnNotSteerable => "Codex could not steer this turn. The message was restored to the composer.",
+            else => "Failed to send Codex steer. The message was restored to the composer.",
         });
         return;
     }
@@ -6680,6 +6711,31 @@ test "provider steer polling stops after fallback to next turn or approval wait"
     try std.testing.expect(!pendingProviderSteerCanSignal(&send_state));
     send_state.pending_followup.?.state = .sent_inline;
     try std.testing.expect(!pendingProviderSteerCanSignal(&send_state));
+}
+
+test "rejected provider steer restores text and ordered images instead of queueing" {
+    const allocator = std.testing.allocator;
+    var thread = try ChatThread.init(allocator, "Steer restore");
+    defer thread.deinit(allocator);
+    thread.send_state.pending_followup = .{
+        .kind = .steer,
+        .prompt = try allocator.dupe(u8, "keep steering separate"),
+    };
+    try thread.send_state.pending_followup.?.images.append(
+        allocator,
+        try ChatImageAttachment.init(allocator, "/tmp/first.png", "image/png", 10),
+    );
+    try thread.send_state.pending_followup.?.images.append(
+        allocator,
+        try ChatImageAttachment.init(allocator, "/tmp/second.jpg", "image/jpeg", 20),
+    );
+
+    try std.testing.expect(restorePendingSteerToDraft(allocator, &thread));
+    try std.testing.expect(thread.send_state.pending_followup == null);
+    try std.testing.expectEqualStrings("keep steering separate", thread.currentDraft());
+    try std.testing.expectEqual(@as(usize, 2), thread.draftImageCount());
+    try std.testing.expectEqualStrings("/tmp/first.png", thread.draft_image.?.path);
+    try std.testing.expectEqualStrings("/tmp/second.jpg", thread.draft_extra_images.items[0].path);
 }
 
 pub fn dispatchPendingFollowup(self: anytype, project_index: usize, thread_index: usize, thread: *ChatThread) void {

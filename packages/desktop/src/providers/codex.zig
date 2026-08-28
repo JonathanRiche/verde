@@ -1542,12 +1542,22 @@ pub const Client = struct {
 
     fn callTurnSteerForResultAlloc(self: *Client, request: provider_types.SteerThreadRequest) ![]u8 {
         var attempt: usize = 0;
+        var retried_turn_mismatch = false;
+        var retry_turn_id: ?[]u8 = null;
+        defer if (retry_turn_id) |turn_id| self.allocator.free(turn_id);
         while (true) : (attempt += 1) {
-            const id = try self.sendTurnSteerRequest(request);
-            const maybe_payload = self.awaitTurnSteerResultPayloadAlloc(id);
+            var current_request = request;
+            if (retry_turn_id) |turn_id| current_request.turn_id = turn_id;
+            const id = try self.sendTurnSteerRequest(current_request);
+            const maybe_payload = self.awaitTurnSteerResultPayloadAlloc(id, &retry_turn_id);
             if (maybe_payload) |payload| {
                 return payload;
             } else |err| switch (err) {
+                error.CodexExpectedTurnMismatch => {
+                    if (retried_turn_mismatch or retry_turn_id == null) return error.CodexRpcFailed;
+                    retried_turn_mismatch = true;
+                    continue;
+                },
                 error.ServerOverloaded => {
                     if (attempt + 1 >= MAX_RPC_RETRIES) return err;
                     sleepMs(@min(@as(u64, 100) * (@as(u64, 1) << @intCast(attempt)), 1500));
@@ -1799,7 +1809,7 @@ pub const Client = struct {
         }
     }
 
-    fn awaitTurnSteerResultPayloadAlloc(self: *Client, id: u64) ![]u8 {
+    fn awaitTurnSteerResultPayloadAlloc(self: *Client, id: u64, retry_turn_id: *?[]u8) ![]u8 {
         while (true) {
             const message = try self.readTextMessageAllocInterruptible(self.allocator, RPC_WAIT);
             defer self.allocator.free(message);
@@ -1814,12 +1824,19 @@ pub const Client = struct {
 
             if (response_id != id) continue;
 
-            if (getObjectField(root, "error")) |_| {
+            if (getObjectField(root, "error")) |rpc_error| {
                 if (std.mem.indexOf(u8, message, "activeTurnNotSteerable") != null or
                     std.mem.indexOf(u8, message, "active_turn_not_steerable") != null or
                     std.mem.indexOf(u8, message, "active turn not steerable") != null)
                 {
                     return error.CodexActiveTurnNotSteerable;
+                }
+                if (getOptionalObjectString(rpc_error, "message")) |error_message| {
+                    if (extractActualTurnIdFromSteerMismatch(error_message)) |actual_turn_id| {
+                        if (retry_turn_id.*) |old_turn_id| self.allocator.free(old_turn_id);
+                        retry_turn_id.* = try self.allocator.dupe(u8, actual_turn_id);
+                        return error.CodexExpectedTurnMismatch;
+                    }
                 }
                 if (std.mem.indexOf(u8, message, "code") != null) {
                     if (getObjectField(getObjectField(root, "error").?, "code")) |code_value| {
@@ -1955,6 +1972,16 @@ pub fn shutdownOwnedServer() void {
     remote_server_state.mutex.lock();
     defer remote_server_state.mutex.unlock();
     stopRemoteServerLocked();
+}
+
+fn extractActualTurnIdFromSteerMismatch(message: []const u8) ?[]const u8 {
+    const prefix = "expected active turn id `";
+    const separator = "` but found `";
+    if (!std.mem.startsWith(u8, message, prefix) or !std.mem.endsWith(u8, message, "`")) return null;
+    const remainder = message[prefix.len .. message.len - 1];
+    const separator_index = std.mem.indexOf(u8, remainder, separator) orelse return null;
+    const actual_turn_id = remainder[separator_index + separator.len ..];
+    return if (actual_turn_id.len == 0) null else actual_turn_id;
 }
 
 fn stopOwnedServerLocked() void {
@@ -4066,6 +4093,15 @@ test "turn steer payload preserves multiple local images" {
     try std.testing.expectEqualStrings("localImage", input.array.items[1].object.get("type").?.string);
     try std.testing.expectEqualStrings("/tmp/first.png", input.array.items[1].object.get("path").?.string);
     try std.testing.expectEqualStrings("/tmp/second.jpg", input.array.items[2].object.get("path").?.string);
+}
+
+test "turn steer mismatch extracts the server active turn id" {
+    try std.testing.expectEqualStrings(
+        "turn-current",
+        extractActualTurnIdFromSteerMismatch("expected active turn id `turn-stale` but found `turn-current`").?,
+    );
+    try std.testing.expect(extractActualTurnIdFromSteerMismatch("no active turn to steer") == null);
+    try std.testing.expect(extractActualTurnIdFromSteerMismatch("expected active turn id `old` but found ``") == null);
 }
 
 test "compute accept key matches websocket example" {
