@@ -3888,7 +3888,7 @@ const UnixSession = struct {
         }
         const result = response.object.get("result") orelse return error.InvalidSessionResponse;
         if (result != .object) return error.InvalidSessionResponse;
-        const text = jsonString(result.object.get("text") orelse .null) orelse "";
+        const raw_text = jsonString(result.object.get("text") orelse .null) orelse "";
         const suppress_replay_responses = initial_attach_replay;
         const shell_pid = jsonUsize(result.object.get("pid") orelse .null);
         const foreground_process_group = jsonUsize(result.object.get("foreground_process_group") orelse .null);
@@ -3896,6 +3896,9 @@ const UnixSession = struct {
             std.math.cast(u32, status)
         else
             null;
+        const response_offset = jsonUsize(result.object.get("offset") orelse .null) orelse self.remote_output_offset;
+        const replay_skipped_output = response_offset > self.remote_output_offset;
+        const text = if (replay_skipped_output) terminalReplayFromParserBoundary(raw_text) else raw_text;
         const next_offset = jsonUsize(result.object.get("next_offset") orelse .null) orelse self.remote_output_offset;
         if (jsonU16(result.object.get("cols") orelse .null)) |reported_cols| self.daemon_reported_cols = reported_cols;
         if (jsonU16(result.object.get("rows") orelse .null)) |reported_rows| self.daemon_reported_rows = reported_rows;
@@ -3905,7 +3908,7 @@ const UnixSession = struct {
             shell_pid != null and
             foreground_process_group != null and
             foreground_process_group.? == shell_pid.? and
-            looksLikeStaleFullScreenReplay(text);
+            looksLikeStaleFullScreenReplay(raw_text);
         self.remote_output_offset = next_offset;
         self.suppress_next_daemon_replay = false;
         self.running = jsonBool(result.object.get("running") orelse .null) orelse self.running;
@@ -5011,6 +5014,26 @@ fn jsonU16(value: std.json.Value) ?u16 {
         .number_string => |text| std.fmt.parseInt(u16, text, 10) catch null,
         else => null,
     };
+}
+
+// A capped daemon tail may skip old bytes and begin halfway through an ANSI
+// sequence. A fresh parser would print that orphaned suffix (for example
+// `20m`) as terminal text. Resume at the first complete escape sequence; for
+// the common SGR case, preserve any plain text immediately following its
+// recognizable parameter suffix.
+fn terminalReplayFromParserBoundary(bytes: []const u8) []const u8 {
+    if (bytes.len == 0 or bytes[0] == 0x1b) return bytes;
+
+    var index: usize = 0;
+    while (index < bytes.len and isCsiParameterByte(bytes[index])) : (index += 1) {}
+    if (index > 0 and index < bytes.len and bytes[index] == 'm') return bytes[index + 1 ..];
+
+    const escape = std.mem.indexOfScalar(u8, bytes, 0x1b) orelse return bytes;
+    return bytes[escape..];
+}
+
+fn isCsiParameterByte(byte: u8) bool {
+    return byte >= 0x30 and byte <= 0x3f;
 }
 
 fn looksLikeStaleFullScreenReplay(bytes: []const u8) bool {
@@ -6390,6 +6413,27 @@ test "unix session restores alternate screen and mouse modes before daemon repla
         .mouse_event = .any,
         .mouse_format = .sgr,
     }, session.persistedTerminalModes());
+}
+
+test "discontinuous terminal replay drops an orphaned escape suffix" {
+    const testing = std.testing;
+
+    try testing.expectEqualStrings(
+        "prompt",
+        terminalReplayFromParserBoundary("20mprompt"),
+    );
+    try testing.expectEqualStrings(
+        "\x1b[38;5;174mcolored",
+        terminalReplayFromParserBoundary("5;174mgarbage\x1b[38;5;174mcolored"),
+    );
+    try testing.expectEqualStrings(
+        "plain output",
+        terminalReplayFromParserBoundary("plain output"),
+    );
+    try testing.expectEqualStrings(
+        "\x1b[0mcomplete",
+        terminalReplayFromParserBoundary("\x1b[0mcomplete"),
+    );
 }
 
 test "terminal geometry sanitization never returns zero cells" {

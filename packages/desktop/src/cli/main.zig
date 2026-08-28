@@ -4331,8 +4331,8 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
     try writeMcpTypedTool(&s, "set_chat_draft", "Stage or append a composer draft without sending it. Address either a live pane_id or a durable local_thread_id.", &CHAT_DRAFT_SET_MCP_INPUTS);
     try writeMcpTypedTool(&s, "get_chat_draft", "Read a staged composer draft without sending it. Address either a live pane_id or a durable local_thread_id.", &CHAT_DRAFT_GET_MCP_INPUTS);
     try writeMcpTypedTool(&s, "send_chat_message", "Send a prompt on an existing chat thread daemon-direct (no GUI required) and return the accepted turn_id. The thread and its workspace row must already exist in the daemon store (open_chat creates the thread, the desktop dual-write creates the workspace). Poll tail_chat_turn for streaming events and completion.", &CHAT_SEND_MCP_INPUTS);
-    try writeMcpTypedTool(&s, "queue_chat_followup", "Queue or steer a prompt into a running chat pane through the session daemon. The durable pane mapping is resolved without the GUI; idle panes and unsupported provider harnesses return a structured invalid_state error.", &CHAT_FOLLOWUP_MCP_INPUTS);
-    try writeMcpTypedTool(&s, "tail_chat_turn", "Read a chat turn's streamed events and status daemon-direct. Terminal status (completed/failed/aborted) is published only after the durable transcript commit.", &CHAT_TAIL_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "queue_chat_followup", "Steer a running chat pane daemon-direct. Reuse steer_id after an ambiguous response; idle or unsupported panes return invalid_state.", &CHAT_FOLLOWUP_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "tail_chat_turn", "Read streamed events and status. Accepted steering is kind=steer with steer_id, message_id, title, body, and images; terminal status follows durable commit.", &CHAT_TAIL_MCP_INPUTS);
     try writeMcpTypedTool(&s, "approve_chat_turn", "Approve or deny a chat turn's pending tool approval daemon-direct. Returns not_found both for an unknown turn and for a turn with no pending approval matching call_id; re-check tail_chat_turn before retrying.", &CHAT_APPROVE_MCP_INPUTS);
     try writeMcpTypedTool(&s, "stop_chat_turn", "Stop a running chat turn daemon-direct. The interruption still commits durably. Stopping an already-terminal turn is an accepted no-op, not an error.", &CHAT_STOP_MCP_INPUTS);
     try writeMcpTypedTool(&s, "read_chat_thread", "Read a chat thread's durable transcript daemon-direct from the session daemon store.", &CHAT_READ_MCP_INPUTS);
@@ -4609,9 +4609,11 @@ const CHAT_SEND_MCP_INPUTS = [_]McpToolInput{
 };
 
 const CHAT_FOLLOWUP_MCP_INPUTS = [_]McpToolInput{
-    .{ .name = "workspace_id", .type_name = "string", .description = "Stable workspace id owning the pane.", .required = true },
-    .{ .name = "pane_id", .type_name = "integer", .description = "Durably persisted chat pane id. Resolving it never focuses or scrolls the GUI.", .required = true },
-    .{ .name = "prompt", .type_name = "string", .description = "Text to queue or steer into the running turn.", .required = true },
+    .{ .name = "workspace_id", .type_name = "string", .description = "Workspace id.", .required = true },
+    .{ .name = "pane_id", .type_name = "integer", .description = "Persisted chat pane id.", .required = true },
+    .{ .name = "prompt", .type_name = "string", .description = "Steering text.", .required = true },
+    .{ .name = "image_paths", .type_name = "array", .items_type_name = "string", .description = "Optional local images." },
+    .{ .name = "steer_id", .type_name = "string", .description = "Stable retry id; minted when omitted." },
 };
 
 const CHAT_TAIL_MCP_INPUTS = [_]McpToolInput{
@@ -4924,10 +4926,15 @@ fn mcpToolsCall(
             return try mcpError(allocator, out, id_value, -32602, "queue_chat_followup requires a non-negative pane_id");
         const prompt = mcpArgString(arguments, "prompt") orelse
             return try mcpError(allocator, out, id_value, -32602, "queue_chat_followup requires prompt");
+        var image_path_storage: [16][]const u8 = undefined;
+        const image_paths = mcpArgStringArray(arguments, "image_paths", &image_path_storage) catch
+            return try mcpError(allocator, out, id_value, -32602, "queue_chat_followup image_paths must be an array of at most 16 strings");
         const response = chatDaemonFollowupEnvelopeAlloc(allocator, io, .{
             .workspace_id = workspace_id,
             .pane_id = followup_pane_id,
             .prompt = prompt,
+            .image_paths = image_paths,
+            .steer_id = mcpArgString(arguments, "steer_id"),
         }) catch |err| return try mcpChatDaemonError(allocator, out, id_value, err);
         defer allocator.free(response);
         return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
@@ -5101,11 +5108,9 @@ fn mcpToolsCall(
             if (mcpArgIsNonNull(arguments, "axis") and axis == null) {
                 return try mcpError(allocator, out, id_value, -32602, "open_chat axis must be a string");
             }
-            // A running GUI validates first without mutation, then uses the
-            // same immediate chat.open path as the Live CLI. This is important
-            // while another pane is maximized: chat.open can create and return
-            // the pane immediately, whereas daemon-first projection is gated
-            // until the workspace layout is restored.
+            // A running GUI validates creation settings without mutation. The
+            // daemon then creates the exact canonical thread before the GUI is
+            // asked to present that durable identity.
             const validation_response = sendLiveRequestAlloc(allocator, io, "chat.open.validate", .{
                 .workspace_id = workspace_id,
                 .provider = provider,
@@ -5132,7 +5137,7 @@ fn mcpToolsCall(
                 if (validation_route == .validated) {
                     const validated = parseChatOpenValidation(validation_parsed.value, workspace_id, provider) orelse
                         return try mcpError(allocator, out, id_value, -32000, "invalid chat.open.validate response");
-                    const live_response = sendLiveRequestAlloc(allocator, io, "chat.open", .{
+                    const daemon_response = chatDaemonOpenThreadEnvelopeAlloc(allocator, io, .{
                         .workspace_id = validated.workspace_id,
                         .provider = validated.provider,
                         .model = validated.model,
@@ -5143,40 +5148,17 @@ fn mcpToolsCall(
                         // omitted setting into an explicit one, which providers
                         // without a Fast tier reject.
                         .fast_mode = if (creation_settings.fast_mode != null) validated.fast_mode else null,
-                        .target_pane_id = target_pane_id,
-                        .axis = axis orelse "horizontal",
-                        .focus = true,
-                    }, 1) catch |err| return try mcpLiveCallError(allocator, out, id_value, tool_name, err);
-                    defer allocator.free(live_response);
-                    var live_parsed = std.json.parseFromSlice(std.json.Value, allocator, live_response, .{}) catch |err|
-                        return try mcpError(allocator, out, id_value, -32000, @errorName(err));
-                    defer live_parsed.deinit();
-                    switch (classifyChatOpenLiveEnvelope(live_parsed.value)) {
-                        .not_ok => return try mcpToolLiveTextResult(allocator, out, id_value, live_response, tool_name),
-                        .missing_ids => return try mcpError(allocator, out, id_value, -32000, "chat.open succeeded without a stable thread id"),
-                        .ids => |ids| {
-                            const durable_workspace_id = ids.workspace_id orelse validated.workspace_id;
-                            const confirmation = chatOpenConfirmThreadDurable(
-                                allocator,
-                                io,
-                                durable_workspace_id,
-                                ids.local_thread_id,
-                                CHAT_OPEN_CONFIRM_ATTEMPTS,
-                                CHAT_OPEN_CONFIRM_DELAY_MS,
-                            ) catch |err| return try mcpError(allocator, out, id_value, -32000, @errorName(err));
-                            switch (confirmation) {
-                                .durable, .capability_skip => return try mcpToolLiveTextResult(allocator, out, id_value, live_response, tool_name),
-                                .timeout => return try mcpChatOpenNotDurable(
-                                    allocator,
-                                    out,
-                                    id_value,
-                                    durable_workspace_id,
-                                    ids.local_thread_id,
-                                    "confirmation deadline elapsed",
-                                ),
-                            }
-                        },
-                    }
+                    }) catch |err| return try mcpChatDaemonError(allocator, out, id_value, err);
+                    defer allocator.free(daemon_response);
+                    const presented = try presentDaemonChatOpenAlloc(
+                        allocator,
+                        io,
+                        daemon_response,
+                        target_pane_id,
+                        axis orelse "horizontal",
+                    );
+                    defer allocator.free(presented);
+                    return try mcpToolTextResult(allocator, out, id_value, presented, tool_name);
                 }
             }
             // No GUI: return through mcpToolTextResult directly so a daemon
@@ -5760,6 +5742,9 @@ const ChatDaemonFollowupArgs = struct {
     workspace_id: []const u8,
     pane_id: u32,
     prompt: []const u8,
+    image_paths: []const []const u8 = &.{},
+    /// Stable id for idempotent retry; minted when null.
+    steer_id: ?[]const u8 = null,
 };
 
 fn chatPaneThreadIndexFromLayout(allocator: std.mem.Allocator, layout_json: []const u8, pane_id: u32) !?usize {
@@ -5791,7 +5776,14 @@ fn chatDaemonFollowupSuccessEnvelopeAlloc(
     allocator: std.mem.Allocator,
     followup: ChatDaemonFollowupArgs,
     local_thread_id: []const u8,
+    daemon_result: std.json.Value,
 ) ![]u8 {
+    if (daemon_result != .object) return error.InvalidResponse;
+    const turn_id = jsonString(daemon_result.object.get("turn_id") orelse .null) orelse return error.InvalidResponse;
+    const steer_id = jsonString(daemon_result.object.get("steer_id") orelse .null) orelse return error.InvalidResponse;
+    const message_id = jsonString(daemon_result.object.get("message_id") orelse .null) orelse return error.InvalidResponse;
+    const event_seq = jsonUsize(daemon_result.object.get("event_seq") orelse .null) orelse return error.InvalidResponse;
+    const duplicate = jsonBool(daemon_result.object.get("duplicate") orelse .null) orelse false;
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
     var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
@@ -5803,6 +5795,11 @@ fn chatDaemonFollowupSuccessEnvelopeAlloc(
             .pane_id = followup.pane_id,
             .local_thread_id = local_thread_id,
             .disposition = "steered",
+            .turn_id = turn_id,
+            .steer_id = steer_id,
+            .message_id = message_id,
+            .event_seq = event_seq,
+            .duplicate = duplicate,
         },
     });
     return try writer.toOwnedSlice();
@@ -5868,16 +5865,20 @@ fn chatDaemonFollowupEnvelopeAlloc(allocator: std.mem.Allocator, io: std.Io, fol
     const resolved_thread_id = local_thread_id orelse
         return try chatDaemonErrorEnvelopeAlloc(allocator, "not_found", "chat pane thread not found");
 
+    const steer_id = followup.steer_id orelse try mintChatIdAlloc(arena, io, "cli-steer-");
+
     var followup_response = try client.call("chat.followup", .{
         .workspace_id = followup.workspace_id,
         .local_thread_id = resolved_thread_id,
         .prompt = followup.prompt,
+        .image_paths = followup.image_paths,
+        .steer_id = steer_id,
     });
     defer followup_response.deinit();
     if (!followup_response.response.isOk()) return try daemonResponseEnvelopeAlloc(allocator, &followup_response);
     const result = followup_response.response.result orelse return error.InvalidResponse;
     if (result != .object or !(jsonBool(result.object.get("accepted") orelse .null) orelse false)) return error.InvalidResponse;
-    return try chatDaemonFollowupSuccessEnvelopeAlloc(allocator, followup, resolved_thread_id);
+    return try chatDaemonFollowupSuccessEnvelopeAlloc(allocator, followup, resolved_thread_id, result);
 }
 
 const ChatDaemonSendArgs = struct {
@@ -6057,59 +6058,18 @@ fn chatDaemonOpenThreadEnvelopeAlloc(allocator: std.mem.Allocator, io: std.Io, o
         .fast_mode = open.fast_mode,
         // No GUI client is registered, so no pane presentation happened.
         .presented = false,
-        .presentation_status = "not_requested",
+        .presentation_status = "gui_unavailable",
+        .retryable = true,
+        .retry_tool = "present_chat",
     });
     try s.endObject();
     return try writer.toOwnedSlice();
 }
 
-// ---------------------------------------------------------------------------
-// M4-P5 fix (MAJOR-2): Live-arm durability confirmation for open_chat.
-//
-// The GUI's chat.open response is authored before its store dual-write is
-// necessarily durable, so after a Live success the CLI confirms the session
-// daemon can read the thread row back before reporting success. Budget:
-// 40 attempts x 50 ms = one absolute 2 s wall-clock budget. The confirm is
-// read-only (chat.thread.get); the
-// CLI never upserts GUI-created threads.
-// ---------------------------------------------------------------------------
-
-const CHAT_OPEN_CONFIRM_ATTEMPTS: u32 = 40;
-const CHAT_OPEN_CONFIRM_DELAY_MS: u64 = 50;
 const CHAT_OPEN_PRESENT_DELAY_MS: u64 = 50;
 const CHAT_OPEN_PRESENT_DEADLINE_MS: i64 = 2_000;
 const CORE_CHANGES_MAX_WAIT_MS: u32 = 25_000;
 const CORE_CHANGES_TRANSPORT_OVERHEAD_MS: u32 = 5_000;
-
-const ChatOpenLiveIds = struct {
-    local_thread_id: []const u8,
-    workspace_id: ?[]const u8,
-};
-
-const ChatOpenLiveEnvelope = union(enum) {
-    /// ok envelope carrying a stable id to confirm.
-    ids: ChatOpenLiveIds,
-    /// Error envelope: passed through unchanged (the GUI authored it).
-    not_ok,
-    /// ok envelope without any stable id: must never surface as success.
-    missing_ids,
-};
-
-/// Classify a Live chat.open envelope for the durability confirm. Returned
-/// slices point into `value`; the caller keeps the parsed JSON alive.
-fn classifyChatOpenLiveEnvelope(value: std.json.Value) ChatOpenLiveEnvelope {
-    if (value != .object) return .missing_ids;
-    if (!(jsonBool(value.object.get("ok") orelse .null) orelse false)) return .not_ok;
-    const result = value.object.get("result") orelse return .missing_ids;
-    if (result != .object) return .missing_ids;
-    const local_thread_id = jsonString(result.object.get("local_thread_id") orelse .null) orelse
-        jsonString(result.object.get("thread_id") orelse .null) orelse
-        return .missing_ids;
-    return .{ .ids = .{
-        .local_thread_id = local_thread_id,
-        .workspace_id = jsonString(result.object.get("workspace_id") orelse .null),
-    } };
-}
 
 fn liveEnvelopeErrorCode(value: std.json.Value) ?[]const u8 {
     if (value != .object) return null;
@@ -6358,6 +6318,12 @@ fn composeChatOpenResultAlloc(allocator: std.mem.Allocator, core: std.json.Objec
     try s.write(presented);
     try s.objectField("presentation_status");
     try s.write(status);
+    if (presented != true) {
+        try s.objectField("retryable");
+        try s.write(true);
+        try s.objectField("retry_tool");
+        try s.write("present_chat");
+    }
     if (workspace_index) |value| {
         try s.objectField("workspace_index");
         try s.write(value);
@@ -6387,164 +6353,75 @@ fn composeChatOpenResultAlloc(allocator: std.mem.Allocator, core: std.json.Objec
     return try writer.toOwnedSlice();
 }
 
-/// Public only so the hermetic daemon IT can execute the production confirm
-/// helper directly; callers outside that harness should use `open_chat`.
-pub const ChatOpenConfirmOutcome = enum {
-    durable,
-    /// Old daemon without the chat capability: the confirm cannot run, so
-    /// the Live envelope is returned exactly as before this fix (declared
-    /// residual — the id may still be non-durable on such daemons).
-    capability_skip,
-    timeout,
-};
-
-/// Bounded read-back confirm: poll `chat.thread.get` until the daemon serves
-/// the thread row durably. Cross-boundary ordering: each attempt builds a
-/// fresh arena + transport, performs one call, and fully tears both down
-/// before the next sleep — no lock, connection, or arena is held across a
-/// sleep.
-pub fn chatOpenConfirmThreadDurable(
+/// Present an already-durable daemon thread without changing creation success.
+/// Transport ambiguity is reported as an unknown presentation outcome so a
+/// caller can safely retry the idempotent `present_chat` operation.
+fn presentDaemonChatOpenAlloc(
     allocator: std.mem.Allocator,
     io: std.Io,
-    workspace_id: []const u8,
-    local_thread_id: []const u8,
-    attempts: u32,
-    delay_ms: u64,
-) !ChatOpenConfirmOutcome {
-    const budget_ms_u64 = std.math.mul(u64, attempts, delay_ms) catch std.math.maxInt(u64);
-    const budget_ms: i64 = @intCast(@min(budget_ms_u64, @as(u64, std.math.maxInt(i64))));
-    const started_at_ms = sessionizer.monotonicNowMs();
-    const deadline_ms = std.math.add(i64, started_at_ms, budget_ms) catch std.math.maxInt(i64);
-    // A Live chat.open just reached the running desktop/daemon pair. Do not
-    // autostart here: ensureDaemon has its own multi-second retry contract and
-    // would escape this helper's single confirmation deadline.
-    const pref_path = try prefPath(allocator);
-    defer allocator.free(pref_path);
-
-    // Capability gate once, in its own arena: an old daemon (chat=false)
-    // cannot serve chat.thread.get, so the confirm is skipped rather than
-    // misreported as a durability failure.
+    daemon_response: []const u8,
+    target_pane_id: ?u32,
+    axis: []const u8,
+) ![]u8 {
+    var daemon_parsed = try std.json.parseFromSlice(std.json.Value, allocator, daemon_response, .{});
+    defer daemon_parsed.deinit();
+    if (daemon_parsed.value != .object or
+        !(jsonBool(daemon_parsed.value.object.get("ok") orelse .null) orelse false))
     {
-        var gate_arena = std.heap.ArenaAllocator.init(allocator);
-        defer gate_arena.deinit();
-        const arena = gate_arena.allocator();
-        var transport: sessionizer.HeadlessTransport = .{
-            .allocator = arena,
-            .pref_path = pref_path,
-            .timeout_ms = confirmationRemainingTimeoutMs(deadline_ms) orelse return .timeout,
-        };
-        var client = sessionizer.headlessClient(arena, &transport);
-        chatDaemonRequireCapability(&client) catch |err| switch (err) {
-            error.ChatCapabilityUnavailable => return .capability_skip,
-            else => if (confirmationRemainingTimeoutMs(deadline_ms) == null) return .timeout else return err,
-        };
+        return try allocator.dupe(u8, daemon_response);
     }
+    const result = daemon_parsed.value.object.get("result") orelse return error.InvalidChatOpenResponse;
+    if (result != .object) return error.InvalidChatOpenResponse;
+    const workspace_id = jsonString(result.object.get("workspace_id") orelse .null) orelse return error.InvalidChatOpenResponse;
+    const local_thread_id = jsonString(result.object.get("local_thread_id") orelse .null) orelse return error.InvalidChatOpenResponse;
+    const store_revision = nonNegativeJsonInteger(result.object.get("store_revision") orelse .null) orelse return error.InvalidChatOpenResponse;
 
-    var attempt: u32 = 0;
-    while (attempt < attempts) : (attempt += 1) {
-        if (attempt != 0) {
-            const remaining_ms = confirmationRemainingMs(deadline_ms) orelse return .timeout;
-            const sleep_ms = @min(delay_ms, @as(u64, @intCast(remaining_ms)));
-            std.Io.sleep(io, .fromMilliseconds(@intCast(sleep_ms)), .awake) catch {};
-        }
-        var poll_arena = std.heap.ArenaAllocator.init(allocator);
-        defer poll_arena.deinit();
-        const arena = poll_arena.allocator();
-        var transport: sessionizer.HeadlessTransport = .{
-            .allocator = arena,
-            .pref_path = pref_path,
-            // Cross-boundary ordering: every stalled read receives only the
-            // remaining absolute budget, never a fresh 5s timeout.
-            .timeout_ms = confirmationRemainingTimeoutMs(deadline_ms) orelse return .timeout,
-        };
-        var client = sessionizer.headlessClient(arena, &transport);
-        var parsed = client.call(headless.store.METHOD_CHAT_THREAD_GET, .{
+    var ambiguous = false;
+    const deadline_ms = sessionizer.monotonicNowMs() +| CHAT_OPEN_PRESENT_DEADLINE_MS;
+    while (presentationRemainingMs(deadline_ms)) |remaining_ms| {
+        const response = sendLiveRequestAllocWithTimeout(allocator, "chat.present", .{
             .workspace_id = workspace_id,
             .local_thread_id = local_thread_id,
-        }) catch continue;
+            .store_revision = store_revision,
+            .target_pane_id = target_pane_id,
+            .axis = axis,
+            .focus = true,
+        }, 1, presentationTransportTimeoutMs(remaining_ms)) catch {
+            ambiguous = true;
+            sleepChatPresentationRetry(io, deadline_ms);
+            continue;
+        };
+        defer allocator.free(response);
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch {
+            ambiguous = true;
+            sleepChatPresentationRetry(io, deadline_ms);
+            continue;
+        };
         defer parsed.deinit();
-        if (parsed.response.isOk()) return .durable;
+        if (parseChatOpenPresentation(parsed.value, workspace_id, local_thread_id, store_revision)) |presentation| {
+            return try composeChatOpenPresentationAlloc(allocator, result.object, presentation);
+        }
+        const error_code = liveEnvelopeErrorCode(parsed.value) orelse {
+            ambiguous = true;
+            sleepChatPresentationRetry(io, deadline_ms);
+            continue;
+        };
+        if (std.mem.eql(u8, error_code, "projection_pending") or
+            std.mem.eql(u8, error_code, "projection_revision_pending"))
+        {
+            sleepChatPresentationRetry(io, deadline_ms);
+            continue;
+        }
+        const terminal_status = terminalChatOpenPresentation(ambiguous, error_code);
+        return try composeChatOpenStatusAlloc(allocator, result.object, terminal_status.presented, terminal_status.status);
     }
-    return .timeout;
+    const exhausted = exhaustedChatOpenPresentation(ambiguous);
+    return try composeChatOpenStatusAlloc(allocator, result.object, exhausted.presented, exhausted.status);
 }
 
 fn confirmationRemainingMs(deadline_ms: i64) ?i64 {
     const remaining_ms = deadline_ms -| sessionizer.monotonicNowMs();
     return if (remaining_ms > 0) remaining_ms else null;
-}
-
-fn confirmationRemainingTimeoutMs(deadline_ms: i64) ?u32 {
-    const remaining_ms = confirmationRemainingMs(deadline_ms) orelse return null;
-    return @intCast(@min(remaining_ms, @as(i64, std.math.maxInt(u32))));
-}
-
-/// Typed MCP tool error for a Live open_chat whose durable read-back failed:
-/// names the stable id so callers can retry read_chat_thread instead of
-/// treating the thread as lost. Never a success shape.
-fn mcpChatOpenNotDurableResponseAlloc(
-    allocator: std.mem.Allocator,
-    id_value: std.json.Value,
-    workspace_id: []const u8,
-    local_thread_id: []const u8,
-    detail: []const u8,
-) ![]u8 {
-    var text_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer text_writer.deinit();
-    var text_s: std.json.Stringify = .{ .writer = &text_writer.writer, .options = .{} };
-    try text_s.beginObject();
-    try text_s.objectField("ok");
-    try text_s.write(false);
-    try text_s.objectField("error");
-    try text_s.beginObject();
-    try text_s.objectField("code");
-    try text_s.write("thread_not_durable");
-    try text_s.objectField("message");
-    const message = try std.fmt.allocPrint(
-        allocator,
-        "chat.open was accepted by the GUI but thread {s} in workspace {s} could not be read back from the session daemon: {s}. The thread may still become durable; retry read_chat_thread with this local_thread_id before assuming loss.",
-        .{ local_thread_id, workspace_id, detail },
-    );
-    defer allocator.free(message);
-    try text_s.write(message);
-    try text_s.objectField("workspace_id");
-    try text_s.write(workspace_id);
-    try text_s.objectField("local_thread_id");
-    try text_s.write(local_thread_id);
-    try text_s.endObject();
-    try text_s.endObject();
-
-    var writer: std.Io.Writer.Allocating = .init(allocator);
-    errdefer writer.deinit();
-    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
-    try mcpBeginResult(&s, id_value);
-    try s.beginObject();
-    try s.objectField("content");
-    try s.beginArray();
-    try s.beginObject();
-    try s.objectField("type");
-    try s.write("text");
-    try s.objectField("text");
-    try s.write(text_writer.written());
-    try s.endObject();
-    try s.endArray();
-    try s.objectField("isError");
-    try s.write(true);
-    try s.endObject();
-    try s.endObject();
-    return try writer.toOwnedSlice();
-}
-
-fn mcpChatOpenNotDurable(
-    allocator: std.mem.Allocator,
-    out: output.Output,
-    id_value: std.json.Value,
-    workspace_id: []const u8,
-    local_thread_id: []const u8,
-    detail: []const u8,
-) !void {
-    const response = try mcpChatOpenNotDurableResponseAlloc(allocator, id_value, workspace_id, local_thread_id, detail);
-    defer allocator.free(response);
-    try out.stdout("{s}\n", .{response});
 }
 
 const McpTerminalKeyEncodeError = error{
@@ -8984,58 +8861,6 @@ test "M4-P5 MCP chat tool schemas require stable daemon addressing" {
     try std.testing.expect(!CHAT_TAIL_MCP_INPUTS[1].required);
 }
 
-test "M4-P5 fix open_chat Live envelope classifier extracts stable ids" {
-    const allocator = std.testing.allocator;
-    // ok + local_thread_id: confirmable, workspace carried along.
-    {
-        var parsed = try std.json.parseFromSlice(
-            std.json.Value,
-            allocator,
-            "{\"ok\":true,\"result\":{\"workspace_id\":\"ws-1\",\"thread_id\":\"chat-9\",\"local_thread_id\":\"chat-9\"}}",
-            .{},
-        );
-        defer parsed.deinit();
-        const classified = classifyChatOpenLiveEnvelope(parsed.value);
-        try std.testing.expectEqualStrings("chat-9", classified.ids.local_thread_id);
-        try std.testing.expectEqualStrings("ws-1", classified.ids.workspace_id.?);
-    }
-    // ok + legacy thread_id only: fallback id (pre-fix GUI response shape).
-    {
-        var parsed = try std.json.parseFromSlice(
-            std.json.Value,
-            allocator,
-            "{\"ok\":true,\"result\":{\"thread_id\":\"chat-legacy\"}}",
-            .{},
-        );
-        defer parsed.deinit();
-        const classified = classifyChatOpenLiveEnvelope(parsed.value);
-        try std.testing.expectEqualStrings("chat-legacy", classified.ids.local_thread_id);
-        try std.testing.expect(classified.ids.workspace_id == null);
-    }
-    // Error envelope: passed through unchanged, never confirmed.
-    {
-        var parsed = try std.json.parseFromSlice(
-            std.json.Value,
-            allocator,
-            "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"workspace not found\"}}",
-            .{},
-        );
-        defer parsed.deinit();
-        try std.testing.expect(classifyChatOpenLiveEnvelope(parsed.value) == .not_ok);
-    }
-    // ok without any stable id: must never surface as success.
-    {
-        var parsed = try std.json.parseFromSlice(
-            std.json.Value,
-            allocator,
-            "{\"ok\":true,\"result\":{\"pane_id\":4}}",
-            .{},
-        );
-        defer parsed.deinit();
-        try std.testing.expect(classifyChatOpenLiveEnvelope(parsed.value) == .missing_ids);
-    }
-}
-
 test "daemon-first chat presentation validates identity and preserves durable result" {
     const allocator = std.testing.allocator;
     var daemon = try std.json.parseFromSlice(
@@ -9222,41 +9047,26 @@ test "chat presentation ambiguity dominates typed terminal outcomes" {
     try std.testing.expectEqualStrings("projection_identity_missing", missing.status);
 }
 
-test "M4-P5 fix open_chat Live confirm budget is bounded at two seconds" {
-    try std.testing.expectEqual(
-        @as(u64, 2_000),
-        @as(u64, CHAT_OPEN_CONFIRM_ATTEMPTS) * CHAT_OPEN_CONFIRM_DELAY_MS,
-    );
-}
-
-test "M4-P5 fix open_chat not-durable result is a typed tool error naming the id" {
+test "deferred chat presentation preserves durable identity and names retry tool" {
     const allocator = std.testing.allocator;
-    const response = try mcpChatOpenNotDurableResponseAlloc(
+    var daemon = try std.json.parseFromSlice(
+        std.json.Value,
         allocator,
-        .{ .integer = 3 },
-        "ws-1",
-        "cli-thread-1-aabbccdd00112233",
-        "the durable thread row was not readable within the confirmation budget",
+        "{\"workspace_id\":\"ws-1\",\"local_thread_id\":\"thread-1\",\"thread_id\":\"thread-1\",\"store_revision\":17,\"created\":true,\"provider\":\"codex\",\"model\":\"gpt-5.6-sol\",\"reasoning_effort\":null,\"reasoning_variant\":null,\"fast_mode\":false}",
+        .{},
     );
-    defer allocator.free(response);
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer daemon.deinit();
+    const composed = try composeChatOpenStatusAlloc(allocator, daemon.value.object, false, "gui_unavailable");
+    defer allocator.free(composed);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, composed, .{});
     defer parsed.deinit();
     const result = parsed.value.object.get("result").?.object;
-    try std.testing.expect(jsonBool(result.get("isError") orelse .null).?);
-    const text = jsonString(result.get("content").?.array.items[0].object.get("text").?).?;
-    var text_parsed = try std.json.parseFromSlice(std.json.Value, allocator, text, .{});
-    defer text_parsed.deinit();
-    try std.testing.expect(!(jsonBool(text_parsed.value.object.get("ok").?).?));
-    const err_obj = text_parsed.value.object.get("error").?.object;
-    try std.testing.expectEqualStrings("thread_not_durable", jsonString(err_obj.get("code").?).?);
-    try std.testing.expectEqualStrings("ws-1", jsonString(err_obj.get("workspace_id").?).?);
-    try std.testing.expectEqualStrings(
-        "cli-thread-1-aabbccdd00112233",
-        jsonString(err_obj.get("local_thread_id").?).?,
-    );
-    const message = jsonString(err_obj.get("message").?).?;
-    try std.testing.expect(std.mem.indexOf(u8, message, "cli-thread-1-aabbccdd00112233") != null);
-    try std.testing.expect(std.mem.indexOf(u8, message, "read_chat_thread") != null);
+    try std.testing.expectEqualStrings("thread-1", result.get("local_thread_id").?.string);
+    try std.testing.expectEqual(@as(i64, 17), result.get("store_revision").?.integer);
+    try std.testing.expect(!result.get("presented").?.bool);
+    try std.testing.expectEqualStrings("gui_unavailable", result.get("presentation_status").?.string);
+    try std.testing.expect(result.get("retryable").?.bool);
+    try std.testing.expectEqualStrings("present_chat", result.get("retry_tool").?.string);
 }
 
 fn expectMintedChatId(id: []const u8, comptime prefix: []const u8) !void {
