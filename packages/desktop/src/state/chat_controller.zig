@@ -217,24 +217,10 @@ pub fn shouldHideBackgroundTranscriptRow(thread: *const ChatThread, author: []co
 }
 
 pub fn backgroundTaskForEventBody(thread: *ChatThread, body: []const u8) ?*BackgroundTask {
-    const task_id = ChatThread.backgroundTaskMetadataValue(body, "Verde task ID:");
-    const item_id = ChatThread.backgroundTaskMetadataValue(body, "Codex item ID:");
-    const process_id = ChatThread.backgroundTaskMetadataValue(body, "Process ID:");
     for (thread.background_tasks.items) |*task| {
-        if (task_id != null and task.task_id != null and std.mem.eql(u8, task_id.?, task.task_id.?)) return task;
-        if (item_id != null and task.item_id != null and std.mem.eql(u8, item_id.?, task.item_id.?) and
-            sameOptionalIdentity(task.provider_thread_id, ChatThread.backgroundTaskMetadataValue(body, "Provider thread ID:"))) return task;
-        if (item_id == null and task.item_id == null and process_id != null and task.process_id != null and
-            std.mem.eql(u8, process_id.?, task.process_id.?) and sameOptionalIdentity(task.provider_thread_id, ChatThread.backgroundTaskMetadataValue(body, "Provider thread ID:"))) return task;
-        if (task_id == null and item_id == null and process_id == null and
-            std.mem.eql(u8, ChatThread.backgroundCommandFromEventBody(body), task.command)) return task;
+        if (task.matchesEventBody(body)) return task;
     }
     return null;
-}
-
-fn sameOptionalIdentity(a: ?[:0]const u8, b: ?[]const u8) bool {
-    if (a == null or b == null) return false;
-    return std.mem.eql(u8, a.?, b.?);
 }
 
 pub const BangCommandRequest = struct {
@@ -2518,6 +2504,7 @@ pub fn steerThreadViaHarness(
 pub fn steerDaemonChatTurn(
     self: anytype,
     turn_id: []const u8,
+    steer_id: []const u8,
     prompt: []const u8,
     images: []const ChatImageAttachment,
 ) !void {
@@ -2526,6 +2513,7 @@ pub fn steerDaemonChatTurn(
     for (images) |image| try image_paths.append(self.allocator, image.path);
     const response = try sessionizer.requestAlloc(self.allocator, self.storage.pref_path, "chat.turn.steer", .{
         .turn_id = turn_id,
+        .steer_id = steer_id,
         .prompt = prompt,
         .image_paths = image_paths.items,
     }, 6);
@@ -4699,7 +4687,7 @@ pub fn deinitBackgroundTaskPoller(self: anytype) void {
 
 pub fn pollThreadBackgroundTasks(self: anytype, project_index: usize, thread_index: ?usize, thread: *ChatThread) bool {
     const now_ms = unixTimestampMs();
-    var changed = false;
+    var changed = syncThreadBackgroundTasksFromPendingEvents(self, thread);
 
     for (thread.background_tasks.items) |*task| {
         if (task.status != .running) continue;
@@ -4756,6 +4744,31 @@ pub fn backgroundTaskCompletionBodyAlloc(allocator: std.mem.Allocator, task: *co
     const owned = try writer.toOwnedSlice();
     defer allocator.free(owned);
     return try allocator.dupeZ(u8, owned);
+}
+
+fn syncThreadBackgroundTasksFromPendingEvents(self: anytype, thread: *ChatThread) bool {
+    const send_state = thread.send_state;
+    send_state.mutex.lock();
+    defer send_state.mutex.unlock();
+    if (send_state.status != .pending) return false;
+
+    var changed = false;
+    for (send_state.pending_events.items) |event| {
+        if (event.role != .system) continue;
+        const status = ChatThread.backgroundTaskStatusForEvent(event.author) orelse continue;
+        if (backgroundTaskForEventBody(thread, event.body)) |task| {
+            if (status == .running) continue;
+            if (task.status == status) continue;
+        } else if (status != .running) {
+            continue;
+        }
+        thread.noteBackgroundTaskEvent(self.allocator, event.author, event.body) catch |err| {
+            log.warn("failed to apply pending background task event: {s}", .{@errorName(err)});
+            continue;
+        };
+        changed = true;
+    }
+    return changed;
 }
 
 fn stopUnownedBackgroundTasksAtTurnEnd(self: anytype, thread: *ChatThread) void {
@@ -5444,12 +5457,14 @@ pub fn applyDaemonChatEventLocked(self: anytype, send_state: *SendState, kind: [
         const text = daemonPayloadStringAlloc(payload_json, "text") orelse return;
         defer std.heap.page_allocator.free(text);
         try send_state.partial_text.appendSlice(std.heap.page_allocator, text);
-    } else if (std.mem.eql(u8, kind, "message")) {
+    } else if (std.mem.eql(u8, kind, "message") or std.mem.eql(u8, kind, "steer")) {
         flushPendingAssistantTextLocked(send_state, std.heap.page_allocator);
-        const title = daemonPayloadStringAlloc(payload_json, "title") orelse try std.heap.page_allocator.dupe(u8, "System");
-        defer std.heap.page_allocator.free(title);
-        const body = daemonPayloadStringAlloc(payload_json, "body") orelse try std.heap.page_allocator.dupe(u8, "");
-        defer std.heap.page_allocator.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, payload_json, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidDaemonResponse;
+        const object = parsed.value.object;
+        const title = jsonValueString(object.get("title") orelse .null) orelse "System";
+        const body = jsonValueString(object.get("body") orelse .null) orelse "";
         const owned_author = try std.heap.page_allocator.dupe(u8, title);
         errdefer std.heap.page_allocator.free(owned_author);
         const owned_body = try std.heap.page_allocator.dupe(u8, body);
@@ -5458,14 +5473,29 @@ pub fn applyDaemonChatEventLocked(self: anytype, send_state: *SendState, kind: [
         // one (transcript_apply keys the committed row by the same value), so
         // the projection row lands id-carrying without waiting for terminal
         // adoption.
-        const payload_message_id = daemonPayloadStringAlloc(payload_json, "message_id");
+        const payload_message_id = if (jsonValueString(object.get("message_id") orelse .null)) |value|
+            try std.heap.page_allocator.dupe(u8, value)
+        else
+            null;
         errdefer if (payload_message_id) |value| std.heap.page_allocator.free(value);
-        try send_state.pending_events.append(std.heap.page_allocator, .{
+        var event: PendingTimelineEvent = .{
             .role = .system,
             .author = owned_author,
             .body = owned_body,
             .message_id = payload_message_id,
-        });
+        };
+        errdefer event.deinit(std.heap.page_allocator);
+        if (object.get("images")) |images| if (images == .array) {
+            try event.images.ensureTotalCapacity(std.heap.page_allocator, images.array.items.len);
+            for (images.array.items) |image| {
+                if (image != .object) return error.InvalidDaemonResponse;
+                const path = jsonValueString(image.object.get("path") orelse .null) orelse return error.InvalidDaemonResponse;
+                const mime = jsonValueString(image.object.get("mime") orelse .null) orelse "";
+                const byte_size = jsonValueU64(image.object.get("byte_size") orelse .null) orelse 0;
+                event.images.appendAssumeCapacity(try ChatImageAttachment.init(std.heap.page_allocator, path, mime, byte_size));
+            }
+        };
+        try send_state.pending_events.append(std.heap.page_allocator, event);
     } else if (std.mem.eql(u8, kind, "tool_call")) {
         var parsed = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, payload_json, .{});
         defer parsed.deinit();
@@ -7565,7 +7595,7 @@ pub fn issuePendingProviderSteer(
             if (resolved_turn_id) |active_turn_id| {
                 thread_id = self.allocator.dupe(u8, resolved_thread_id) catch null;
                 turn_id = self.allocator.dupe(u8, active_turn_id) catch null;
-                if (provider == .claude and send_state.daemon_owned) {
+                if ((provider == .codex or provider == .claude) and send_state.daemon_owned) {
                     if (send_state.daemon_turn_id) |daemon_id| {
                         daemon_turn_id = self.allocator.dupe(u8, daemon_id) catch null;
                     }
@@ -7576,7 +7606,7 @@ pub fn issuePendingProviderSteer(
                     &images,
                     send_state.pending_followup.?.images.items,
                 ) catch {};
-                const daemon_identity_ready = provider != .claude or !send_state.daemon_owned or daemon_turn_id != null;
+                const daemon_identity_ready = (provider != .codex and provider != .claude) or !send_state.daemon_owned or daemon_turn_id != null;
                 send_state.pending_followup_signal_sent = thread_id != null and turn_id != null and prompt != null and daemon_identity_ready and
                     images.items.len == send_state.pending_followup.?.images.items.len;
                 if (!send_state.pending_followup_signal_sent) {
@@ -7617,11 +7647,21 @@ pub fn issuePendingProviderSteer(
     defer self.allocator.free(owned_prompt);
     defer if (daemon_turn_id) |owned_daemon_turn_id| self.allocator.free(owned_daemon_turn_id);
 
+    // Daemon-owned Codex and Claude turns must steer through their owner. This
+    // keeps the GUI from opening a second provider client for the same turn.
+    const daemon_steer = (provider == .codex or provider == .claude) and daemon_turn_id != null;
+    const steer_id = if (daemon_steer)
+        std.fmt.allocPrint(self.allocator, "gui-steer:{s}:{d}", .{ daemon_turn_id.?, unixTimestampMs() }) catch null
+    else
+        null;
+    defer if (steer_id) |value| self.allocator.free(value);
     var steer_failure: ?anyerror = null;
-    if (provider == .claude and daemon_turn_id != null) {
-        self.steerDaemonChatTurn(daemon_turn_id.?, owned_prompt, images.items) catch |err| {
+    if (daemon_steer and steer_id != null) {
+        self.steerDaemonChatTurn(daemon_turn_id.?, steer_id.?, owned_prompt, images.items) catch |err| {
             steer_failure = err;
         };
+    } else if (daemon_steer) {
+        steer_failure = error.OutOfMemory;
     } else if (self.providerExecutionTargetForProjectThread(project_index, thread, images.items.len)) |execution_target| {
         self.steerThreadViaHarness(execution_target, provider, owned_thread_id, owned_turn_id, owned_prompt, images.items) catch |err| {
             steer_failure = err;
@@ -7650,30 +7690,35 @@ pub fn issuePendingProviderSteer(
         pending_followup.state = .sent_inline;
     }
     send_state.pending_followup_signal_sent = true;
-    flushPendingAssistantTextLocked(send_state, std.heap.page_allocator);
-    const owned_author = std.heap.page_allocator.dupe(u8, "Steering current turn") catch null;
-    const owned_body = std.heap.page_allocator.dupe(u8, owned_prompt) catch null;
-    if (owned_author) |author| {
-        if (owned_body) |body| {
-            var event: PendingTimelineEvent = .{
-                .role = .system,
-                .author = author,
-                .body = body,
-            };
-            copyFollowupImages(std.heap.page_allocator, &event.images, images.items) catch {
-                event.deinit(std.heap.page_allocator);
-                send_state.mutex.unlock();
-                self.setSidebarNotice(if (provider == .claude)
-                    "Claude steer sent, but Verde could not display its attachments."
-                else
-                    "Codex steer sent, but Verde could not display its attachments.");
-                return;
-            };
-            send_state.pending_events.append(std.heap.page_allocator, event) catch {
-                event.deinit(std.heap.page_allocator);
-            };
-        } else {
-            std.heap.page_allocator.free(author);
+    // Daemon-owned steering publishes the identified row through tail, which
+    // also makes it durable. Harness-owned steering retains the existing local
+    // projection path.
+    if (!daemon_steer) {
+        flushPendingAssistantTextLocked(send_state, std.heap.page_allocator);
+        const owned_author = std.heap.page_allocator.dupe(u8, "Steering current turn") catch null;
+        const owned_body = std.heap.page_allocator.dupe(u8, owned_prompt) catch null;
+        if (owned_author) |author| {
+            if (owned_body) |body| {
+                var event: PendingTimelineEvent = .{
+                    .role = .system,
+                    .author = author,
+                    .body = body,
+                };
+                copyFollowupImages(std.heap.page_allocator, &event.images, images.items) catch {
+                    event.deinit(std.heap.page_allocator);
+                    send_state.mutex.unlock();
+                    self.setSidebarNotice(if (provider == .claude)
+                        "Claude steer sent, but Verde could not display its attachments."
+                    else
+                        "Codex steer sent, but Verde could not display its attachments.");
+                    return;
+                };
+                send_state.pending_events.append(std.heap.page_allocator, event) catch {
+                    event.deinit(std.heap.page_allocator);
+                };
+            } else {
+                std.heap.page_allocator.free(author);
+            }
         }
     }
     send_state.mutex.unlock();
