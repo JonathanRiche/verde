@@ -163,6 +163,22 @@ pub const BackgroundTask = struct {
         if (self.pid_path) |value| allocator.free(value);
         if (self.log_path) |value| allocator.free(value);
     }
+
+    pub fn matchesEventBody(self: *const BackgroundTask, body_raw: []const u8) bool {
+        const task_id = ChatThread.backgroundTaskMetadataValue(body_raw, "Verde task ID:");
+        const item_id = ChatThread.backgroundTaskMetadataValue(body_raw, "Codex item ID:");
+        const process_id = ChatThread.backgroundTaskMetadataValue(body_raw, "Process ID:");
+        const provider_thread_id = ChatThread.backgroundTaskMetadataValue(body_raw, "Provider thread ID:");
+        if (task_id != null and self.task_id != null and std.mem.eql(u8, task_id.?, self.task_id.?)) return true;
+        if (item_id != null and self.item_id != null and provider_thread_id != null and self.provider_thread_id != null and
+            std.mem.eql(u8, item_id.?, self.item_id.?) and std.mem.eql(u8, provider_thread_id.?, self.provider_thread_id.?)) return true;
+        if (item_id == null and self.item_id == null and process_id != null and self.process_id != null and
+            provider_thread_id != null and self.provider_thread_id != null and std.mem.eql(u8, process_id.?, self.process_id.?) and
+            std.mem.eql(u8, provider_thread_id.?, self.provider_thread_id.?)) return true;
+        if (task_id == null and item_id == null and process_id == null and self.task_id == null and self.item_id == null and
+            self.process_id == null and std.mem.eql(u8, ChatThread.backgroundCommandFromEventBody(body_raw), self.command)) return true;
+        return false;
+    }
 };
 
 pub const ChatThread = struct {
@@ -471,6 +487,40 @@ pub const ChatThread = struct {
     pub fn isBackgroundCommandEvent(author: []const u8) bool {
         return std.mem.eql(u8, author, "Background command") or
             std.mem.eql(u8, author, "Backgrounded command");
+    }
+
+    pub fn isBackgroundTaskTerminalEvent(author: []const u8) bool {
+        const status = backgroundTaskStatusForEvent(author) orelse return false;
+        return status != .running;
+    }
+
+    pub fn backgroundCommandBodiesMatch(a_body: []const u8, b_body: []const u8) bool {
+        const a_task_id = backgroundTaskMetadataValue(a_body, "Verde task ID:");
+        const b_task_id = backgroundTaskMetadataValue(b_body, "Verde task ID:");
+        if (a_task_id != null and b_task_id != null) return std.mem.eql(u8, a_task_id.?, b_task_id.?);
+
+        const a_item_id = backgroundTaskMetadataValue(a_body, "Codex item ID:");
+        const b_item_id = backgroundTaskMetadataValue(b_body, "Codex item ID:");
+        const a_thread_id = backgroundTaskMetadataValue(a_body, "Provider thread ID:");
+        const b_thread_id = backgroundTaskMetadataValue(b_body, "Provider thread ID:");
+        if (a_item_id != null and b_item_id != null and a_thread_id != null and b_thread_id != null) {
+            return std.mem.eql(u8, a_item_id.?, b_item_id.?) and std.mem.eql(u8, a_thread_id.?, b_thread_id.?);
+        }
+
+        const a_process_id = backgroundTaskMetadataValue(a_body, "Process ID:");
+        const b_process_id = backgroundTaskMetadataValue(b_body, "Process ID:");
+        if (a_item_id == null and b_item_id == null and a_process_id != null and b_process_id != null and
+            a_thread_id != null and b_thread_id != null)
+        {
+            return std.mem.eql(u8, a_process_id.?, b_process_id.?) and std.mem.eql(u8, a_thread_id.?, b_thread_id.?);
+        }
+
+        if (a_task_id == null and b_task_id == null and a_item_id == null and b_item_id == null and
+            a_process_id == null and b_process_id == null)
+        {
+            return std.mem.eql(u8, backgroundCommandFromEventBody(a_body), backgroundCommandFromEventBody(b_body));
+        }
+        return false;
     }
 
     pub fn backgroundTaskStatusForEvent(author: []const u8) ?BackgroundTaskStatus {

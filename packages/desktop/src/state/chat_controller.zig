@@ -214,24 +214,10 @@ pub fn shouldHideBackgroundTranscriptRow(thread: *const ChatThread, author: []co
 }
 
 pub fn backgroundTaskForEventBody(thread: *ChatThread, body: []const u8) ?*BackgroundTask {
-    const task_id = ChatThread.backgroundTaskMetadataValue(body, "Verde task ID:");
-    const item_id = ChatThread.backgroundTaskMetadataValue(body, "Codex item ID:");
-    const process_id = ChatThread.backgroundTaskMetadataValue(body, "Process ID:");
     for (thread.background_tasks.items) |*task| {
-        if (task_id != null and task.task_id != null and std.mem.eql(u8, task_id.?, task.task_id.?)) return task;
-        if (item_id != null and task.item_id != null and std.mem.eql(u8, item_id.?, task.item_id.?) and
-            sameOptionalIdentity(task.provider_thread_id, ChatThread.backgroundTaskMetadataValue(body, "Provider thread ID:"))) return task;
-        if (item_id == null and task.item_id == null and process_id != null and task.process_id != null and
-            std.mem.eql(u8, process_id.?, task.process_id.?) and sameOptionalIdentity(task.provider_thread_id, ChatThread.backgroundTaskMetadataValue(body, "Provider thread ID:"))) return task;
-        if (task_id == null and item_id == null and process_id == null and
-            std.mem.eql(u8, ChatThread.backgroundCommandFromEventBody(body), task.command)) return task;
+        if (task.matchesEventBody(body)) return task;
     }
     return null;
-}
-
-fn sameOptionalIdentity(a: ?[:0]const u8, b: ?[]const u8) bool {
-    if (a == null or b == null) return false;
-    return std.mem.eql(u8, a.?, b.?);
 }
 
 pub const BangCommandRequest = struct {
@@ -4136,7 +4122,7 @@ pub fn deinitBackgroundTaskPoller(self: anytype) void {
 
 pub fn pollThreadBackgroundTasks(self: anytype, project_index: usize, thread_index: ?usize, thread: *ChatThread) bool {
     const now_ms = unixTimestampMs();
-    var changed = false;
+    var changed = syncThreadBackgroundTasksFromPendingEvents(self, thread);
 
     for (thread.background_tasks.items) |*task| {
         if (task.status != .running) continue;
@@ -4193,6 +4179,31 @@ pub fn backgroundTaskCompletionBodyAlloc(allocator: std.mem.Allocator, task: *co
     const owned = try writer.toOwnedSlice();
     defer allocator.free(owned);
     return try allocator.dupeZ(u8, owned);
+}
+
+fn syncThreadBackgroundTasksFromPendingEvents(self: anytype, thread: *ChatThread) bool {
+    const send_state = thread.send_state;
+    send_state.mutex.lock();
+    defer send_state.mutex.unlock();
+    if (send_state.status != .pending) return false;
+
+    var changed = false;
+    for (send_state.pending_events.items) |event| {
+        if (event.role != .system) continue;
+        const status = ChatThread.backgroundTaskStatusForEvent(event.author) orelse continue;
+        if (backgroundTaskForEventBody(thread, event.body)) |task| {
+            if (status == .running) continue;
+            if (task.status == status) continue;
+        } else if (status != .running) {
+            continue;
+        }
+        thread.noteBackgroundTaskEvent(self.allocator, event.author, event.body) catch |err| {
+            log.warn("failed to apply pending background task event: {s}", .{@errorName(err)});
+            continue;
+        };
+        changed = true;
+    }
+    return changed;
 }
 
 fn stopUnownedBackgroundTasksAtTurnEnd(self: anytype, thread: *ChatThread) void {

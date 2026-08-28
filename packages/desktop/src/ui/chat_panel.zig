@@ -3933,9 +3933,21 @@ fn commandTextMatchesTask(body: []const u8, task_command: []const u8) bool {
     const preview = commandPreviewFromBody(body);
     if (preview.len == 0 or task_command.len == 0) return false;
     if (std.mem.eql(u8, preview, task_command)) return true;
-    if (task_command.len >= 8 and std.mem.indexOf(u8, preview, task_command) != null) return true;
-    if (preview.len >= 8 and std.mem.indexOf(u8, task_command, preview) != null) return true;
+    // Allow Input-wrapped bodies ("Input:\n<command>") without treating a
+    // sibling command as a match just because they share a substring.
+    if (task_command.len >= 8) {
+        if (std.mem.indexOf(u8, preview, task_command)) |index| {
+            const after = index + task_command.len;
+            const before_ok = index == 0 or !commandTokenChar(preview[index - 1]);
+            const after_ok = after == preview.len or !commandTokenChar(preview[after]);
+            if (before_ok and after_ok) return true;
+        }
+    }
     return false;
+}
+
+fn commandTokenChar(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or byte == '.' or byte == ':' or byte == '/';
 }
 
 fn pinnedRowForRunningTask(
@@ -3977,15 +3989,42 @@ fn pinnedRowForRunningTask(
     };
 }
 
+fn pendingEventsTerminateBackgroundBody(events: []const chat_types.PendingTimelineEvent, start_index: usize, body: []const u8) bool {
+    var index = start_index + 1;
+    while (index < events.len) : (index += 1) {
+        const event = events[index];
+        if (event.role != .system or !chat_types.ChatThread.isBackgroundTaskTerminalEvent(event.author)) continue;
+        if (chat_types.ChatThread.backgroundCommandBodiesMatch(body, event.body)) return true;
+    }
+    return false;
+}
+
+fn pendingEventsTerminateBackgroundTask(events: []const chat_types.PendingTimelineEvent, task: *const app_state.BackgroundTask) bool {
+    for (events) |event| {
+        if (event.role != .system or !chat_types.ChatThread.isBackgroundTaskTerminalEvent(event.author)) continue;
+        if (task.matchesEventBody(event.body)) return true;
+    }
+    return false;
+}
+
 fn collectPinnedBackgroundCommands(
     thread: *const app_state.ChatThread,
     rows: *[MAX_PINNED_BACKGROUND_COMMANDS]PinnedBackgroundCommand,
 ) usize {
     var count: usize = 0;
     const mutable_thread = @constCast(thread);
+    const send_state = thread.send_state;
+    send_state.mutex.lock();
+    defer send_state.mutex.unlock();
+    const pending_active = send_state.status == .pending;
+    const pending_events: []const chat_types.PendingTimelineEvent = if (pending_active)
+        send_state.pending_events.items
+    else
+        &.{};
 
     for (mutable_thread.background_tasks.items, 0..) |*task, task_index| {
         if (task.status != .running) continue;
+        if (pendingEventsTerminateBackgroundTask(pending_events, task)) continue;
         if (count >= rows.len) break;
         const row = pinnedRowForRunningTask(mutable_thread, task, task_index);
         if (pinnedBackgroundCommandRowDuplicate(rows, count, row.body)) continue;
@@ -3993,17 +4032,24 @@ fn collectPinnedBackgroundCommands(
         count += 1;
     }
 
-    const send_state = thread.send_state;
-    send_state.mutex.lock();
-    defer send_state.mutex.unlock();
-    if (send_state.status != .pending) return count;
+    if (!pending_active) return count;
     const base = thread.messages.items.len;
-    for (send_state.pending_events.items, 0..) |event, pending_index| {
+    for (pending_events, 0..) |event, pending_index| {
         if (count >= rows.len) break;
         if (event.role != .system or !chat_types.ChatThread.isBackgroundCommandEvent(event.author)) continue;
         if (pinnedBackgroundCommandRowDuplicate(rows, count, event.body)) continue;
+        if (pendingEventsTerminateBackgroundBody(pending_events, pending_index, event.body)) continue;
+        const matched_task = app_state.backgroundTaskForEventBody(mutable_thread, event.body);
+        if (matched_task) |task| {
+            if (task.status != .running) continue;
+        }
+        const task_index = if (matched_task) |task|
+            (@intFromPtr(task) - @intFromPtr(mutable_thread.background_tasks.items.ptr)) / @sizeOf(app_state.BackgroundTask)
+        else
+            null;
         rows[count] = .{
             .message_index = base + pending_index,
+            .task_index = task_index,
             .author = event.author,
             .body = event.body,
         };
@@ -4117,6 +4163,55 @@ test "running background commands pin above the composer after the stream commit
     ));
 }
 
+test "finished background commands leave the pin stack" {
+    const allocator = std.testing.allocator;
+    const page = std.heap.page_allocator;
+    var thread = try app_state.ChatThread.init(allocator, "Finished background pin");
+    defer thread.deinit(allocator);
+
+    try thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "n=0; while [ $n -lt 6 ]; do sleep 10; n=$((n+1)); done"),
+        .status = .completed,
+    });
+    try thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "zig build test --release=safe"),
+        .status = .running,
+    });
+
+    var rows: [MAX_PINNED_BACKGROUND_COMMANDS]PinnedBackgroundCommand = undefined;
+    try std.testing.expectEqual(@as(usize, 1), collectPinnedBackgroundCommands(&thread, &rows));
+    try std.testing.expectEqualStrings("zig build test --release=safe", rows[0].body);
+
+    thread.send_state.status = .pending;
+    try thread.send_state.pending_events.append(page, .{
+        .role = .system,
+        .author = try page.dupe(u8, "Background command"),
+        .body = try page.dupe(u8, "n=0; while [ $n -lt 6 ]; do sleep 10; n=$((n+1)); done"),
+    });
+    try thread.send_state.pending_events.append(page, .{
+        .role = .system,
+        .author = try page.dupe(u8, "Background command"),
+        .body = try page.dupe(u8, "zig build test --release=safe"),
+    });
+    try thread.send_state.pending_events.append(page, .{
+        .role = .system,
+        .author = try page.dupe(u8, "Background task completed"),
+        .body = try page.dupe(u8, "n=0; while [ $n -lt 6 ]; do sleep 10; n=$((n+1)); done"),
+    });
+    try std.testing.expectEqual(@as(usize, 1), collectPinnedBackgroundCommands(&thread, &rows));
+    try std.testing.expectEqualStrings("zig build test --release=safe", rows[0].body);
+
+    try thread.send_state.pending_events.append(page, .{
+        .role = .system,
+        .author = try page.dupe(u8, "Background task stopped"),
+        .body = try page.dupe(u8, "zig build test --release=safe"),
+    });
+    try std.testing.expectEqual(@as(usize, 0), collectPinnedBackgroundCommands(&thread, &rows));
+
+    thread.background_tasks.items[1].status = .stopped;
+    try std.testing.expectEqual(@as(usize, 0), collectPinnedBackgroundCommands(&thread, &rows));
+}
+
 test "pending background commands pin instead of occupying the live stream" {
     const allocator = std.testing.allocator;
     const page = std.heap.page_allocator;
@@ -4178,6 +4273,38 @@ test "running background tasks pin from a cancelled Ran command row" {
     try std.testing.expectEqual(@as(?usize, 0), rows[0].task_index);
     try std.testing.expectEqualStrings("Ran command", rows[0].author);
     try std.testing.expect(commandTextMatchesTask(rows[0].body, "bun run dev"));
+    try std.testing.expect(!commandTextMatchesTask(
+        "until ! pgrep -f \"zig build test --release=safe\"",
+        "zig build test --release=safe -Dbrowser-backend=native_webview",
+    ));
+}
+
+test "grouped running background tasks pin with distinct task indexes" {
+    const allocator = std.testing.allocator;
+    var thread = try app_state.ChatThread.init(allocator, "Grouped background pins");
+    defer thread.deinit(allocator);
+    try thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "until ! pgrep -f zig"),
+        .status = .running,
+    });
+    try thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "zig build test --release=safe"),
+        .status = .running,
+    });
+    try thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "mise run build"),
+        .status = .running,
+    });
+
+    var rows: [MAX_PINNED_BACKGROUND_COMMANDS]PinnedBackgroundCommand = undefined;
+    const count = collectPinnedBackgroundCommands(&thread, &rows);
+    try std.testing.expectEqual(@as(usize, 3), count);
+    try std.testing.expectEqual(@as(?usize, 0), rows[0].task_index);
+    try std.testing.expectEqual(@as(?usize, 1), rows[1].task_index);
+    try std.testing.expectEqual(@as(?usize, 2), rows[2].task_index);
+    try std.testing.expectEqualStrings("until ! pgrep -f zig", rows[0].body);
+    try std.testing.expectEqualStrings("zig build test --release=safe", rows[1].body);
+    try std.testing.expectEqualStrings("mise run build", rows[2].body);
 }
 
 test "running background tasks pin even without a transcript row" {
