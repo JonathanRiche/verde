@@ -15,6 +15,7 @@ pub const MAX_WEBSOCKETS: usize = 16;
 pub const MAX_KEEPALIVE_REQUESTS: usize = 32;
 pub const MAX_HEADER_BYTES: usize = 4 * 1024;
 pub const MAX_LOGIN_BODY_BYTES: usize = 4 * 1024;
+pub const MAX_ACCESS_BODY_BYTES: usize = headless.access_protocol.MAX_PAIR_EXCHANGE_BODY_BYTES;
 pub const MAX_RPC_FRAME_BYTES: usize = daemon_mod.MAX_GATEWAY_RPC_BYTES;
 
 const MIN_CHANGES_RETRY_MS: u64 = 250;
@@ -196,7 +197,9 @@ fn handleConnection(
     // `receiveHead` cannot consume more than this backing buffer, so the
     // advertised 4 KiB header ceiling is also the parser's allocation ceiling.
     var recv_buffer: [MAX_HEADER_BYTES]u8 = undefined;
+    defer std.crypto.secureZero(u8, recv_buffer[0..]);
     var send_buffer: [16 * 1024]u8 = undefined;
+    defer std.crypto.secureZero(u8, send_buffer[0..]);
     var connection_reader = stream.reader(io, &recv_buffer);
     var connection_writer = stream.writer(io, &send_buffer);
     var server: std.http.Server = .init(&connection_reader.interface, &connection_writer.interface);
@@ -246,6 +249,7 @@ fn handleConnection(
                     daemon,
                     auth,
                     runtime,
+                    client_key,
                     &request,
                     opt_key,
                 ) catch |err| log.err("websocket session: {s}", .{@errorName(err)});
@@ -281,6 +285,7 @@ fn handleWebSocketUpgrade(
     daemon: *daemon_mod.Daemon,
     auth: *auth_mod.Service,
     runtime: *Runtime,
+    client_key: []const u8,
     request: *std.http.Server.Request,
     opt_key: ?[]const u8,
 ) !void {
@@ -288,11 +293,43 @@ fn handleWebSocketUpgrade(
         try respondJson(request, .not_found, "{\"ok\":false,\"error\":\"websocket_not_found\"}");
         return;
     }
-    const auth_context = try authenticate(auth, io, request) orelse {
-        try respondUnauthorized(request);
-        return;
+    var auth_context = if (try authenticate(auth, io, request)) |owner|
+        try webSocketAuthenticationFromOwner(owner)
+    else pair: {
+        const now_ms = auth_mod.nowMillis(io);
+        if (try auth.ticketPreflight(io, client_key, now_ms) == .rate_limited) {
+            try respondJson(request, .too_many_requests, "{\"ok\":false,\"error\":\"ticket_auth_rate_limited\"}");
+            return;
+        }
+        const ticket = parsePairWebSocketProtocols(request) orelse {
+            _ = try auth.recordTicketAttempt(io, client_key, false, now_ms);
+            try respondUnauthorized(request);
+            return;
+        };
+        defer std.crypto.secureZero(u8, @constCast(ticket));
+        var claims = (try auth.pair_credentials.consumeWebSocketTicket(
+            io,
+            ticket,
+            auth_mod.nowMillis(io),
+        )) orelse {
+            _ = try auth.recordTicketAttempt(io, client_key, false, now_ms);
+            try respondUnauthorized(request);
+            return;
+        };
+        _ = try auth.recordTicketAttempt(io, client_key, true, now_ms);
+        errdefer claims.clear();
+        const bootstrap_mask = headless.access_protocol.webSocketBootstrapScopeMask();
+        if (!headless.access_protocol.scopeMaskContains(claims.scope_mask, bootstrap_mask) or
+            !authorizePairClaims(allocator, daemon, auth, claims, bootstrap_mask))
+        {
+            claims.clear();
+            try respondJson(request, .forbidden, "{\"ok\":false,\"error\":\"insufficient_scope\"}");
+            return;
+        }
+        break :pair WsAuthentication{ .pair = claims };
     };
-    if (!requestOriginAllowed(request, auth_context == .session)) {
+    defer auth_context.clear();
+    if (!requestOriginAllowed(request, auth_context == .owner_session)) {
         try respondJson(request, .forbidden, "{\"ok\":false,\"error\":\"origin_forbidden\"}");
         return;
     }
@@ -306,12 +343,15 @@ fn handleWebSocketUpgrade(
         try respondJson(request, .bad_request, "{\"ok\":false,\"error\":\"missing_websocket_key\"}");
         return;
     };
-    const headers = BASE_SECURITY_HEADERS ++ [_]std.http.Header{
+    const owner_headers = BASE_SECURITY_HEADERS ++ [_]std.http.Header{
         .{ .name = "cache-control", .value = "no-store" },
+    };
+    const pair_headers = owner_headers ++ [_]std.http.Header{
+        .{ .name = "sec-websocket-protocol", .value = headless.access_protocol.WEBSOCKET_PROTOCOL_NAME },
     };
     var socket = try request.respondWebSocket(.{
         .key = key,
-        .extra_headers = &headers,
+        .extra_headers = if (auth_context == .pair) &pair_headers else &owner_headers,
     });
     try socket.flush();
 
@@ -327,21 +367,7 @@ fn handleWebSocketUpgrade(
     socket.input.seek = 0;
     socket.input.end = unread.len;
 
-    var session_id_buffer: [auth_mod.SESSION_ID_BYTES]u8 = undefined;
-    const session_id: ?[]const u8 = switch (auth_context) {
-        .bearer => null,
-        .session => |id| copied: {
-            if (id.len != session_id_buffer.len) return error.InvalidSession;
-            @memcpy(&session_id_buffer, id);
-            break :copied &session_id_buffer;
-        },
-    };
-    switch (auth_context) {
-        .bearer => {},
-        .session => |id| std.crypto.secureZero(u8, @constCast(id)),
-    }
-    defer if (session_id != null) std.crypto.secureZero(u8, &session_id_buffer);
-    try serveWebSocket(allocator, io, daemon, auth, session_id, &socket);
+    try serveWebSocket(allocator, io, daemon, auth, auth_context, &socket);
 }
 
 fn handleRequest(
@@ -372,6 +398,36 @@ fn handleRequest(
         return;
     }
 
+    if (std.mem.eql(u8, split.path, headless.access_protocol.HTTP_PAIR_EXCHANGE_PATH)) {
+        if (request.head.method != .POST) return respondMethodNotAllowed(request);
+        if (!requestOriginAllowed(request, false)) {
+            try respondJson(request, .forbidden, "{\"ok\":false,\"error\":\"origin_forbidden\"}");
+            return;
+        }
+        try handlePairExchange(allocator, io, daemon, auth, client_key, request);
+        return;
+    }
+
+    if (std.mem.eql(u8, split.path, headless.access_protocol.HTTP_ACCESS_TOKEN_PATH)) {
+        if (request.head.method != .POST) return respondMethodNotAllowed(request);
+        if (!requestOriginAllowed(request, false)) {
+            try respondJson(request, .forbidden, "{\"ok\":false,\"error\":\"origin_forbidden\"}");
+            return;
+        }
+        try handleAccessToken(allocator, io, daemon, auth, client_key, request);
+        return;
+    }
+
+    if (std.mem.eql(u8, split.path, headless.access_protocol.HTTP_WEBSOCKET_TICKET_PATH)) {
+        if (request.head.method != .POST) return respondMethodNotAllowed(request);
+        if (!requestOriginAllowed(request, false)) {
+            try respondJson(request, .forbidden, "{\"ok\":false,\"error\":\"origin_forbidden\"}");
+            return;
+        }
+        try handleWebSocketTicket(allocator, io, daemon, auth, client_key, request);
+        return;
+    }
+
     if (std.mem.eql(u8, split.path, "/login")) {
         if (request.head.method != .GET and request.head.method != .HEAD) return respondMethodNotAllowed(request);
         try respondAuthAsset(request, "text/html; charset=utf-8", LOGIN_HTML);
@@ -385,16 +441,16 @@ fn handleRequest(
     }
 
     if (isApiPath(split.path)) {
-        const auth_context = try authenticate(auth, io, request) orelse {
+        const auth_context = try authenticateApi(auth, io, request) orelse {
             try respondUnauthorized(request);
             return;
         };
         const state_changing = request.head.method != .GET and request.head.method != .HEAD;
-        if (!requestOriginAllowed(request, state_changing and auth_context == .session)) {
+        if (!requestOriginAllowed(request, state_changing and auth_context == .owner_session)) {
             try respondJson(request, .forbidden, "{\"ok\":false,\"error\":\"origin_forbidden\"}");
             return;
         }
-        try handleApi(allocator, io, config, daemon, env_map, split, request);
+        try handleApi(allocator, io, config, daemon, auth, env_map, auth_context, split, request);
         return;
     }
 
@@ -478,6 +534,7 @@ fn handleLogin(
             var issued = issued_value;
             defer issued.clear();
             var cookie_buffer: [256]u8 = undefined;
+            defer std.crypto.secureZero(u8, cookie_buffer[0..]);
             const cookie = try auth_mod.formatSessionCookie(&cookie_buffer, &issued);
             var body_buffer: [128]u8 = undefined;
             const response_body = try std.fmt.bufPrint(
@@ -498,16 +555,324 @@ fn handleLogin(
     }
 }
 
+fn handlePairExchange(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    daemon: *daemon_mod.Daemon,
+    auth: *auth_mod.Service,
+    client_key: []const u8,
+    request: *std.http.Server.Request,
+) !void {
+    const now_ms = auth_mod.nowMillis(io);
+    if (try auth.pairPreflight(io, client_key, now_ms) == .rate_limited) {
+        try respondJson(request, .too_many_requests, "{\"ok\":false,\"error\":\"pairing_rate_limited\"}");
+        return;
+    }
+    if (!contentTypeIsJson(requestContentType(request))) {
+        try respondJson(request, .unsupported_media_type, "{\"ok\":false,\"error\":\"expected_json\"}");
+        return;
+    }
+    const body = readBoundedSecretBody(allocator, request, MAX_ACCESS_BODY_BYTES) catch |err| switch (err) {
+        error.AccessBodyTooLarge => {
+            request.head.keep_alive = false;
+            try respondJson(request, .payload_too_large, "{\"ok\":false,\"error\":\"access_body_too_large\"}");
+            return;
+        },
+        else => return err,
+    };
+    defer {
+        std.crypto.secureZero(u8, body);
+        allocator.free(body);
+    }
+    var parsed = headless.access_protocol.parsePairingGrantExchangeRequest(allocator, body) catch {
+        _ = try auth.recordPairAttempt(io, client_key, false, now_ms);
+        try respondJson(request, .unauthorized, "{\"ok\":false,\"error\":\"invalid_pairing_grant\"}");
+        return;
+    };
+    defer {
+        std.crypto.secureZero(u8, @constCast(parsed.value.pairing_token.reveal()));
+        parsed.deinit();
+    }
+
+    const daemon_result = callPairingExchangeTargetedAfterBootstrap(
+        allocator,
+        daemon,
+        parsed.value,
+    ) catch {
+        try respondDaemonUnavailable(request);
+        return;
+    };
+    defer {
+        std.crypto.secureZero(u8, daemon_result.json);
+        allocator.free(daemon_result.json);
+    }
+    var envelope = headless.parseResponse(allocator, daemon_result.json) catch {
+        try respondDaemonUnavailable(request);
+        return;
+    };
+    defer envelope.deinit();
+    const result_value = envelope.response.result orelse {
+        const invalid = rpcErrorCode(envelope.response.err) orelse "";
+        if (std.mem.eql(u8, invalid, "authentication_rejected")) {
+            _ = try auth.recordPairAttempt(io, client_key, false, now_ms);
+            try respondJson(request, .unauthorized, "{\"ok\":false,\"error\":\"invalid_pairing_grant\"}");
+        } else {
+            try respondJson(request, .service_unavailable, "{\"ok\":false,\"error\":\"pairing_unavailable\"}");
+        }
+        return;
+    };
+    defer eraseJsonStringField(result_value, "device_credential");
+    var exchanged = std.json.parseFromValue(
+        headless.access_protocol.PairingGrantExchangeResult,
+        allocator,
+        result_value,
+        .{},
+    ) catch {
+        try respondDaemonUnavailable(request);
+        return;
+    };
+    defer {
+        std.crypto.secureZero(u8, @constCast(exchanged.value.device_credential.reveal()));
+        exchanged.deinit();
+    }
+    if (exchanged.value.access_protocol_version != headless.access_protocol.ACCESS_PROTOCOL_VERSION) {
+        try respondDaemonUnavailable(request);
+        return;
+    }
+    _ = try auth.recordPairAttempt(io, client_key, true, now_ms);
+    try respondPairExchangeResult(allocator, request, exchanged.value);
+}
+
+fn handleAccessToken(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    daemon: *daemon_mod.Daemon,
+    auth: *auth_mod.Service,
+    client_key: []const u8,
+    request: *std.http.Server.Request,
+) !void {
+    const now_ms = auth_mod.nowMillis(io);
+    if (try auth.devicePreflight(io, client_key, now_ms) == .rate_limited) {
+        try respondJson(request, .too_many_requests, "{\"ok\":false,\"error\":\"device_auth_rate_limited\"}");
+        return;
+    }
+    const header = switch (uniqueHeaderValue(request, "authorization")) {
+        .value => |value| value,
+        .invalid => {
+            eraseHeaderValues(request, "authorization");
+            _ = try auth.recordDeviceAttempt(io, client_key, false, now_ms);
+            try respondUnauthorized(request);
+            return;
+        },
+        .none => {
+            _ = try auth.recordDeviceAttempt(io, client_key, false, now_ms);
+            try respondUnauthorized(request);
+            return;
+        },
+    };
+    const device_auth = parseDeviceAuthorization(header) orelse {
+        std.crypto.secureZero(u8, @constCast(header));
+        _ = try auth.recordDeviceAttempt(io, client_key, false, now_ms);
+        try respondUnauthorized(request);
+        return;
+    };
+    defer std.crypto.secureZero(u8, @constCast(device_auth.credential));
+    if (!contentTypeIsJson(requestContentType(request))) {
+        try respondJson(request, .unsupported_media_type, "{\"ok\":false,\"error\":\"expected_json\"}");
+        return;
+    }
+    const body = readBoundedSecretBody(allocator, request, MAX_ACCESS_BODY_BYTES) catch |err| switch (err) {
+        error.AccessBodyTooLarge => {
+            request.head.keep_alive = false;
+            try respondJson(request, .payload_too_large, "{\"ok\":false,\"error\":\"access_body_too_large\"}");
+            return;
+        },
+        else => return err,
+    };
+    defer {
+        std.crypto.secureZero(u8, body);
+        allocator.free(body);
+    }
+    var parsed = headless.access_protocol.parseAccessTokenRequest(allocator, body) catch {
+        try respondJson(request, .bad_request, "{\"ok\":false,\"error\":\"invalid_access_request\"}");
+        return;
+    };
+    defer parsed.deinit();
+    const params: headless.access_protocol.DeviceAuthenticateRequest = .{
+        .access_protocol_version = headless.access_protocol.ACCESS_PROTOCOL_VERSION,
+        .device_id = device_auth.device_id,
+        .device_credential = .{ .bytes = device_auth.credential },
+        .requested_scopes = parsed.value.requested_scopes,
+    };
+    const daemon_result = callDeviceAuthenticateTargetedAfterBootstrap(
+        allocator,
+        daemon,
+        params,
+    ) catch {
+        try respondDaemonUnavailable(request);
+        return;
+    };
+    defer allocator.free(daemon_result.json);
+    var envelope = headless.parseResponse(allocator, daemon_result.json) catch {
+        try respondDaemonUnavailable(request);
+        return;
+    };
+    defer envelope.deinit();
+    const result_value = envelope.response.result orelse {
+        const code = rpcErrorCode(envelope.response.err) orelse "";
+        if (std.mem.eql(u8, code, "authentication_rejected")) {
+            _ = try auth.recordDeviceAttempt(io, client_key, false, now_ms);
+            try respondUnauthorized(request);
+        } else {
+            try respondDaemonUnavailable(request);
+        }
+        return;
+    };
+    var authorized = std.json.parseFromValue(
+        headless.access_protocol.DeviceAuthorizationResult,
+        allocator,
+        result_value,
+        .{},
+    ) catch {
+        try respondDaemonUnavailable(request);
+        return;
+    };
+    defer authorized.deinit();
+    if (authorized.value.access_protocol_version != headless.access_protocol.ACCESS_PROTOCOL_VERSION or
+        !std.mem.eql(u8, authorized.value.device_id, device_auth.device_id))
+    {
+        try respondDaemonUnavailable(request);
+        return;
+    }
+    const scope_mask = headless.access_protocol.scopeMask(authorized.value.scopes) catch {
+        try respondDaemonUnavailable(request);
+        return;
+    };
+    if (scope_mask != (headless.access_protocol.scopeMask(parsed.value.requested_scopes) catch unreachable)) {
+        try respondDaemonUnavailable(request);
+        return;
+    }
+    _ = try auth.recordDeviceAttempt(io, client_key, true, now_ms);
+    var issued = auth.pair_credentials.issueAccessToken(
+        io,
+        device_auth.device_id,
+        scope_mask,
+        now_ms,
+        auth_mod.unixNowMillis(io),
+    ) catch {
+        try respondJson(request, .service_unavailable, "{\"ok\":false,\"error\":\"access_token_capacity\"}");
+        return;
+    };
+    defer issued.clear();
+    try respondAccessTokenResult(allocator, request, &issued, authorized.value.scopes);
+}
+
+fn handleWebSocketTicket(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    daemon: *daemon_mod.Daemon,
+    auth: *auth_mod.Service,
+    client_key: []const u8,
+    request: *std.http.Server.Request,
+) !void {
+    const now_ms = auth_mod.nowMillis(io);
+    if (try auth.ticketPreflight(io, client_key, now_ms) == .rate_limited) {
+        try respondJson(request, .too_many_requests, "{\"ok\":false,\"error\":\"ticket_auth_rate_limited\"}");
+        return;
+    }
+    const authorization = switch (uniqueHeaderValue(request, "authorization")) {
+        .value => |value| value,
+        .invalid => {
+            eraseHeaderValues(request, "authorization");
+            _ = try auth.recordTicketAttempt(io, client_key, false, now_ms);
+            try respondUnauthorized(request);
+            return;
+        },
+        .none => {
+            _ = try auth.recordTicketAttempt(io, client_key, false, now_ms);
+            try respondUnauthorized(request);
+            return;
+        },
+    };
+    const bearer = parseBearer(authorization) orelse {
+        std.crypto.secureZero(u8, @constCast(authorization));
+        _ = try auth.recordTicketAttempt(io, client_key, false, now_ms);
+        try respondUnauthorized(request);
+        return;
+    };
+    defer std.crypto.secureZero(u8, @constCast(bearer));
+    var claims = (try auth.pair_credentials.validateAccessToken(
+        io,
+        bearer,
+        now_ms,
+    )) orelse {
+        _ = try auth.recordTicketAttempt(io, client_key, false, now_ms);
+        try respondUnauthorized(request);
+        return;
+    };
+    _ = try auth.recordTicketAttempt(io, client_key, true, now_ms);
+    defer claims.clear();
+    if (!contentTypeIsJson(requestContentType(request))) {
+        try respondJson(request, .unsupported_media_type, "{\"ok\":false,\"error\":\"expected_json\"}");
+        return;
+    }
+    const body = readBoundedSecretBody(allocator, request, MAX_ACCESS_BODY_BYTES) catch |err| switch (err) {
+        error.AccessBodyTooLarge => {
+            request.head.keep_alive = false;
+            try respondJson(request, .payload_too_large, "{\"ok\":false,\"error\":\"access_body_too_large\"}");
+            return;
+        },
+        else => return err,
+    };
+    defer {
+        std.crypto.secureZero(u8, body);
+        allocator.free(body);
+    }
+    var parsed = headless.access_protocol.parseWebSocketTicketRequest(allocator, body) catch {
+        try respondJson(request, .bad_request, "{\"ok\":false,\"error\":\"invalid_ticket_request\"}");
+        return;
+    };
+    defer parsed.deinit();
+    const bootstrap_mask = headless.access_protocol.webSocketBootstrapScopeMask();
+    if (!headless.access_protocol.scopeMaskContains(claims.scope_mask, bootstrap_mask) or
+        !authorizePairClaims(allocator, daemon, auth, claims, claims.scope_mask))
+    {
+        try respondJson(request, .forbidden, "{\"ok\":false,\"error\":\"insufficient_scope\"}");
+        return;
+    }
+    var issued = auth.pair_credentials.issueWebSocketTicket(
+        io,
+        claims,
+        auth_mod.nowMillis(io),
+        auth_mod.unixNowMillis(io),
+    ) catch {
+        try respondJson(request, .service_unavailable, "{\"ok\":false,\"error\":\"ticket_capacity\"}");
+        return;
+    };
+    defer issued.clear();
+    try respondWebSocketTicketResult(allocator, request, &issued);
+}
+
 fn handleApi(
     allocator: std.mem.Allocator,
     io: std.Io,
     config: config_mod,
     daemon: *daemon_mod.Daemon,
+    auth: *auth_mod.Service,
     env_map: *const std.process.Environ.Map,
+    auth_context: AuthContext,
     split: SplitTarget,
     request: *std.http.Server.Request,
 ) !void {
     if (disabledFileApi(split.path)) {
+        if (!try authorizeApiContext(
+            allocator,
+            daemon,
+            auth,
+            auth_context,
+            headless.access_protocol.scopeBit(.repository_read),
+            request,
+        )) return;
         try respondJson(
             request,
             .not_implemented,
@@ -518,6 +883,7 @@ fn handleApi(
 
     if (std.mem.eql(u8, split.path, "/api/theme")) {
         if (request.head.method != .GET) return respondMethodNotAllowed(request);
+        if (!try authorizeApiContext(allocator, daemon, auth, auth_context, headless.access_protocol.scopeBit(.runtime_read), request)) return;
         const resolved = try theme_mod.resolve(allocator, io, env_map);
         const body = try theme_mod.encodeJson(allocator, resolved);
         defer allocator.free(body);
@@ -529,12 +895,14 @@ fn handleApi(
         std.mem.eql(u8, split.path, "/api/status"))
     {
         if (request.head.method != .GET) return respondMethodNotAllowed(request);
+        if (!try authorizeApiContext(allocator, daemon, auth, auth_context, headless.access_protocol.scopeBit(.runtime_read), request)) return;
         try respondDaemonStatus(allocator, daemon, request);
         return;
     }
 
     if (std.mem.eql(u8, split.path, "/api/snapshot")) {
         if (request.head.method != .GET) return respondMethodNotAllowed(request);
+        if (!try authorizeApiContext(allocator, daemon, auth, auth_context, headless.access_protocol.webSocketBootstrapScopeMask(), request)) return;
         const result = callMethodTargetedAfterBootstrap(
             allocator,
             daemon,
@@ -550,6 +918,7 @@ fn handleApi(
     }
 
     if (std.mem.eql(u8, split.path, "/api/attachment") and request.head.method == .POST) {
+        if (!try authorizeApiContext(allocator, daemon, auth, auth_context, headless.access_protocol.scopeBit(.chat_write), request)) return;
         const mime = supportedImageMime(requestContentType(request)) orelse {
             try respondJson(request, .unsupported_media_type, "{\"ok\":false,\"error\":\"unsupported_image_type\"}");
             return;
@@ -588,6 +957,11 @@ fn handleApi(
     if (std.mem.eql(u8, split.path, "/api/attachment") and
         (request.head.method == .GET or request.head.method == .DELETE))
     {
+        const attachment_scope = if (request.head.method == .GET)
+            headless.access_protocol.scopeBit(.chat_read)
+        else
+            headless.access_protocol.scopeBit(.chat_write);
+        if (!try authorizeApiContext(allocator, daemon, auth, auth_context, attachment_scope, request)) return;
         const attachment_id = queryValue(split.query, "id") orelse {
             try respondJson(request, .bad_request, "{\"ok\":false,\"error\":\"missing_attachment_id\"}");
             return;
@@ -622,7 +996,7 @@ fn handleApi(
 
     if (std.mem.eql(u8, split.path, "/api/rpc")) {
         if (request.head.method != .POST) return respondMethodNotAllowed(request);
-        try handleRpc(allocator, daemon, request);
+        try handleRpc(allocator, daemon, auth, auth_context, request);
         return;
     }
 
@@ -632,6 +1006,8 @@ fn handleApi(
 fn handleRpc(
     allocator: std.mem.Allocator,
     daemon: *daemon_mod.Daemon,
+    auth: *auth_mod.Service,
+    auth_context: AuthContext,
     request: *std.http.Server.Request,
 ) !void {
     if (request.head.content_length) |length| {
@@ -660,11 +1036,25 @@ fn handleRpc(
             allocator,
             parsed.request.id,
             "unsupported",
-            "web.directory.list is disabled in remote gateways",
+            "method is disabled in remote gateways",
         );
         defer allocator.free(unsupported);
         try respondJson(request, .not_implemented, unsupported);
         return;
+    }
+    if (auth_context == .pair) {
+        const required_mask = headless.access_protocol.requiredScopeMaskForRpc(parsed.request.method) orelse {
+            const forbidden = try headless.encodeErrorResponse(
+                allocator,
+                parsed.request.id,
+                "forbidden",
+                "method is not available to paired sessions",
+            );
+            defer allocator.free(forbidden);
+            try respondJson(request, .forbidden, forbidden);
+            return;
+        };
+        if (!try authorizeApiContext(allocator, daemon, auth, auth_context, required_mask, request)) return;
     }
     if (rpcRequestMissingRequiredTarget(parsed.request)) {
         const rejected = try headless.encodeErrorResponse(
@@ -723,11 +1113,36 @@ fn callMethodTargetedAfterBootstrap(
     method: []const u8,
     params: anytype,
 ) !daemon_mod.CallResult {
+    const target = try runtimeTargetAfterBootstrap(allocator, daemon);
+    return daemon.callMethodTargeted(method, params, target.borrowed());
+}
+
+fn callPairingExchangeTargetedAfterBootstrap(
+    allocator: std.mem.Allocator,
+    daemon: *daemon_mod.Daemon,
+    request: headless.access_protocol.PairingGrantExchangeRequest,
+) !daemon_mod.CallResult {
+    const target = try runtimeTargetAfterBootstrap(allocator, daemon);
+    return daemon.callPairingExchangeTargeted(request, target.borrowed());
+}
+
+fn callDeviceAuthenticateTargetedAfterBootstrap(
+    allocator: std.mem.Allocator,
+    daemon: *daemon_mod.Daemon,
+    request: headless.access_protocol.DeviceAuthenticateRequest,
+) !daemon_mod.CallResult {
+    const target = try runtimeTargetAfterBootstrap(allocator, daemon);
+    return daemon.callDeviceAuthenticateTargeted(request, target.borrowed());
+}
+
+fn runtimeTargetAfterBootstrap(
+    allocator: std.mem.Allocator,
+    daemon: *daemon_mod.Daemon,
+) !SessionRuntimeTarget {
     const status = try daemon.callMethod("core.status", daemon_mod.Daemon.EmptyObject{});
     defer allocator.free(status.json);
     if (!rpcSucceeded(allocator, status.json)) return error.DaemonUnavailable;
-    const target = try SessionRuntimeTarget.fromStatusEnvelope(allocator, status.json);
-    return daemon.callMethodTargeted(method, params, target.borrowed());
+    return SessionRuntimeTarget.fromStatusEnvelope(allocator, status.json);
 }
 
 fn rpcRequestMissingRequiredTarget(request: headless.protocol.Request) bool {
@@ -790,7 +1205,7 @@ const WsSession = struct {
     io: std.Io,
     daemon: *daemon_mod.Daemon,
     auth: *auth_mod.Service,
-    session_id: ?[]const u8,
+    authentication: WsAuthentication,
     socket: *std.http.Server.WebSocket,
     runtime_target: ?SessionRuntimeTarget = null,
     write_mutex: std.Io.Mutex = .init,
@@ -804,12 +1219,41 @@ const WsSession = struct {
     }
 
     fn authenticationValid(self: *WsSession) bool {
-        const session_id = self.session_id orelse return true;
-        return self.auth.verifySession(
-            self.io,
-            session_id,
-            auth_mod.nowMillis(self.io),
-        ) catch false;
+        return switch (self.authentication) {
+            .owner_bearer => true,
+            .owner_session => |session_id| self.auth.verifySession(
+                self.io,
+                session_id[0..],
+                auth_mod.nowMillis(self.io),
+            ) catch false,
+            .pair => |claims| authorizePairClaims(
+                self.allocator,
+                self.daemon,
+                self.auth,
+                claims,
+                claims.scope_mask,
+            ),
+        };
+    }
+
+    fn rpcAllowed(self: *WsSession, method: []const u8) bool {
+        return switch (self.authentication) {
+            .owner_bearer, .owner_session => true,
+            .pair => |claims| allowed: {
+                const required_mask = headless.access_protocol.requiredScopeMaskForRpc(method) orelse
+                    break :allowed false;
+                if (!headless.access_protocol.scopeMaskContains(claims.scope_mask, required_mask)) {
+                    break :allowed false;
+                }
+                break :allowed authorizePairClaims(
+                    self.allocator,
+                    self.daemon,
+                    self.auth,
+                    claims,
+                    required_mask,
+                );
+            },
+        };
     }
 
     fn closeExpired(self: *WsSession) void {
@@ -825,7 +1269,7 @@ fn serveWebSocket(
     io: std.Io,
     daemon: *daemon_mod.Daemon,
     auth: *auth_mod.Service,
-    session_id: ?[]const u8,
+    authentication: WsAuthentication,
     socket: *std.http.Server.WebSocket,
 ) !void {
     var session: WsSession = .{
@@ -833,9 +1277,10 @@ fn serveWebSocket(
         .io = io,
         .daemon = daemon,
         .auth = auth,
-        .session_id = session_id,
+        .authentication = authentication,
         .socket = socket,
     };
+    defer session.authentication.clear();
 
     try sendHello(&session);
     var poll_task = try io.concurrent(pollChanges, .{&session});
@@ -872,7 +1317,18 @@ fn serveWebSocket(
                         allocator,
                         parsed.request.id,
                         "unsupported",
-                        "web.directory.list is disabled in remote gateways",
+                        "method is disabled in remote gateways",
+                    );
+                    defer allocator.free(encoded);
+                    session.send(encoded) catch {};
+                    continue;
+                }
+                if (!session.rpcAllowed(parsed.request.method)) {
+                    const encoded = try headless.encodeErrorResponse(
+                        allocator,
+                        parsed.request.id,
+                        "forbidden",
+                        "method is not authorized for this paired session",
                     );
                     defer allocator.free(encoded);
                     session.send(encoded) catch {};
@@ -906,6 +1362,10 @@ fn serveWebSocket(
 }
 
 fn sendHello(session: *WsSession) !void {
+    if (!session.authenticationValid()) {
+        session.closeExpired();
+        return error.AuthenticationExpired;
+    }
     const status = try session.daemon.callMethod("core.status", daemon_mod.Daemon.EmptyObject{});
     defer session.allocator.free(status.json);
     if (!rpcSucceeded(session.allocator, status.json)) return error.DaemonUnavailable;
@@ -917,6 +1377,10 @@ fn sendHello(session: *WsSession) !void {
         .{status.json},
     );
     defer session.allocator.free(hello);
+    if (!session.authenticationValid()) {
+        session.closeExpired();
+        return error.AuthenticationExpired;
+    }
     try session.send(hello);
     pushSnapshot(session) catch {};
 }
@@ -949,6 +1413,10 @@ fn pollChanges(session: *WsSession) void {
             session.closeExpired();
             return;
         }
+        if (!session.authenticationValid()) {
+            session.closeExpired();
+            return;
+        }
 
         const note = std.fmt.allocPrint(
             session.allocator,
@@ -976,11 +1444,19 @@ const SnapshotParams = struct {
 };
 
 fn pushSnapshot(session: *WsSession) !void {
+    if (!session.authenticationValid()) {
+        session.closeExpired();
+        return error.AuthenticationExpired;
+    }
     const target = if (session.runtime_target) |*value| value.borrowed() else return error.TargetRpcUnavailable;
     const snapshot = session.daemon.callMethodTargeted("core.snapshot", SnapshotParams{}, target) catch
         return error.DaemonUnavailable;
     defer session.allocator.free(snapshot.json);
     if (!rpcSucceeded(session.allocator, snapshot.json)) return error.DaemonUnavailable;
+    if (!session.authenticationValid()) {
+        session.closeExpired();
+        return error.AuthenticationExpired;
+    }
     try sendNotification(session, "core.snapshot", snapshot.json);
 }
 
@@ -1021,8 +1497,9 @@ fn sleepMs(io: std.Io, ms: u64) !void {
 }
 
 const AuthContext = union(enum) {
-    bearer,
-    session: []const u8,
+    owner_bearer,
+    owner_session: []const u8,
+    pair: auth_mod.PairClaims,
 };
 
 fn authenticate(
@@ -1032,29 +1509,186 @@ fn authenticate(
 ) !?AuthContext {
     const authorization = uniqueHeaderValue(request, "authorization");
     switch (authorization) {
-        .invalid => return null,
+        .invalid => {
+            eraseHeaderValues(request, "authorization");
+            return null;
+        },
         .value => |value| {
-            const bearer = parseBearer(value) orelse return null;
+            const bearer = parseBearer(value) orelse {
+                std.crypto.secureZero(u8, @constCast(value));
+                return null;
+            };
             const valid = auth.verifyBearer(bearer);
             std.crypto.secureZero(u8, @constCast(bearer));
-            return if (valid) .bearer else null;
+            return if (valid) .owner_bearer else null;
         },
         .none => {},
     }
 
     const session_id = requestSessionCookie(request) orelse return null;
     return if (try auth.verifySession(io, session_id, auth_mod.nowMillis(io)))
-        .{ .session = session_id }
+        .{ .owner_session = session_id }
     else
         null;
 }
 
+fn authenticateApi(
+    auth: *auth_mod.Service,
+    io: std.Io,
+    request: *const std.http.Server.Request,
+) !?AuthContext {
+    const authorization = uniqueHeaderValue(request, "authorization");
+    switch (authorization) {
+        .invalid => {
+            eraseHeaderValues(request, "authorization");
+            return null;
+        },
+        .value => |value| {
+            const bearer = parseBearer(value) orelse {
+                std.crypto.secureZero(u8, @constCast(value));
+                return null;
+            };
+            defer std.crypto.secureZero(u8, @constCast(bearer));
+            if (auth.verifyBearer(bearer)) return .owner_bearer;
+            if (try auth.pair_credentials.validateAccessToken(
+                io,
+                bearer,
+                auth_mod.nowMillis(io),
+            )) |claims| return .{ .pair = claims };
+            return null;
+        },
+        .none => {},
+    }
+
+    const session_id = requestSessionCookie(request) orelse return null;
+    return if (try auth.verifySession(io, session_id, auth_mod.nowMillis(io)))
+        .{ .owner_session = session_id }
+    else
+        null;
+}
+
+const WsAuthentication = union(enum) {
+    owner_bearer,
+    owner_session: [auth_mod.SESSION_ID_BYTES]u8,
+    pair: auth_mod.PairClaims,
+
+    fn clear(self: *WsAuthentication) void {
+        switch (self.*) {
+            .owner_bearer => {},
+            .owner_session => |*session_id| std.crypto.secureZero(u8, session_id[0..]),
+            .pair => |*claims| claims.clear(),
+        }
+        self.* = undefined;
+    }
+};
+
+fn webSocketAuthenticationFromOwner(owner: AuthContext) !WsAuthentication {
+    return switch (owner) {
+        .owner_bearer => .owner_bearer,
+        .owner_session => |session_id| copied: {
+            if (session_id.len != auth_mod.SESSION_ID_BYTES) return error.InvalidSession;
+            var copy: [auth_mod.SESSION_ID_BYTES]u8 = undefined;
+            @memcpy(copy[0..], session_id);
+            std.crypto.secureZero(u8, @constCast(session_id));
+            break :copied .{ .owner_session = copy };
+        },
+        .pair => unreachable,
+    };
+}
+
+fn authorizeApiContext(
+    allocator: std.mem.Allocator,
+    daemon: *daemon_mod.Daemon,
+    auth: *auth_mod.Service,
+    context: AuthContext,
+    required_mask: u16,
+    request: *std.http.Server.Request,
+) !bool {
+    switch (context) {
+        .owner_bearer, .owner_session => return true,
+        .pair => |claims| {
+            if (!headless.access_protocol.scopeMaskContains(claims.scope_mask, required_mask) or
+                !authorizePairClaims(allocator, daemon, auth, claims, required_mask))
+            {
+                try respondJson(request, .forbidden, "{\"ok\":false,\"error\":\"insufficient_scope\"}");
+                return false;
+            }
+            return true;
+        },
+    }
+}
+
+fn authorizePairClaims(
+    allocator: std.mem.Allocator,
+    daemon: *daemon_mod.Daemon,
+    auth: *auth_mod.Service,
+    claims: auth_mod.PairClaims,
+    required_mask: u16,
+) bool {
+    if (claims.deadline_ms <= auth_mod.nowMillis(daemon.io)) return false;
+    const scope_names = headless.access_protocol.scopeNamesAlloc(allocator, required_mask) catch return false;
+    defer allocator.free(scope_names);
+    const params: headless.access_protocol.DeviceAuthorizeRequest = .{
+        .access_protocol_version = headless.access_protocol.ACCESS_PROTOCOL_VERSION,
+        .device_id = claims.device_id[0..],
+        .required_scopes = scope_names,
+    };
+    const result = callMethodTargetedAfterBootstrap(
+        allocator,
+        daemon,
+        headless.access_protocol.METHOD_DAEMON_DEVICE_AUTHORIZE,
+        params,
+    ) catch return false;
+    defer allocator.free(result.json);
+    return switch (deviceAuthorizationStatus(
+        allocator,
+        result.json,
+        claims.device_id[0..],
+        required_mask,
+    )) {
+        .authorized => true,
+        .rejected => rejected: {
+            auth.pair_credentials.clearDeviceCredentials(
+                daemon.io,
+                claims.device_id[0..],
+            ) catch {};
+            break :rejected false;
+        },
+        .unavailable => false,
+    };
+}
+
+const DeviceAuthorizationStatus = enum { authorized, rejected, unavailable };
+
+fn deviceAuthorizationStatus(
+    allocator: std.mem.Allocator,
+    json: []const u8,
+    expected_device_id: []const u8,
+    expected_mask: u16,
+) DeviceAuthorizationStatus {
+    var parsed = headless.parseResponse(allocator, json) catch return .unavailable;
+    defer parsed.deinit();
+    const result = parsed.response.result orelse return if (std.mem.eql(
+        u8,
+        rpcErrorCode(parsed.response.err) orelse "",
+        "authentication_rejected",
+    )) .rejected else .unavailable;
+    var typed = std.json.parseFromValue(
+        headless.access_protocol.DeviceAuthorizationResult,
+        allocator,
+        result,
+        .{},
+    ) catch return .unavailable;
+    defer typed.deinit();
+    if (typed.value.access_protocol_version != headless.access_protocol.ACCESS_PROTOCOL_VERSION or
+        !std.mem.eql(u8, typed.value.device_id, expected_device_id)) return .unavailable;
+    const actual_mask = headless.access_protocol.scopeMask(typed.value.scopes) catch return .unavailable;
+    return if (actual_mask == expected_mask) .authorized else .unavailable;
+}
+
 fn requestEnvelopeAllowed(request: *const std.http.Server.Request) bool {
     const split = splitTarget(request.head.target);
-    if (queryValue(split.query, "token")) |token| {
-        std.crypto.secureZero(u8, @constCast(token));
-        return false;
-    }
+    if (eraseQueryCredentials(split.query)) return false;
     if (eraseLegacyTokenHeaders(request)) return false;
     return switch (uniqueHeaderValue(request, "host")) {
         .value => |host| validLoopbackAuthority(host),
@@ -1089,6 +1723,14 @@ fn uniqueHeaderValue(request: *const std.http.Server.Request, name: []const u8) 
         found = header.value;
     }
     return if (found) |value| .{ .value = value } else .none;
+}
+
+fn eraseHeaderValues(request: *const std.http.Server.Request, name: []const u8) void {
+    var headers = request.iterateHeaders();
+    while (headers.next()) |header| {
+        if (!std.ascii.eqlIgnoreCase(header.name, name)) continue;
+        std.crypto.secureZero(u8, @constCast(header.value));
+    }
 }
 
 fn eraseLegacyTokenHeaders(request: *const std.http.Server.Request) bool {
@@ -1180,7 +1822,15 @@ fn disabledFileApi(path: []const u8) bool {
 }
 
 fn blockedRpcMethod(method: []const u8) bool {
-    return std.mem.eql(u8, method, "web.directory.list");
+    return std.mem.eql(u8, method, "web.directory.list") or
+        std.mem.eql(u8, method, headless.access_protocol.METHOD_DAEMON_PAIRING_GRANT_CREATE) or
+        std.mem.eql(u8, method, headless.access_protocol.METHOD_DAEMON_PAIRING_GRANT_LIST) or
+        std.mem.eql(u8, method, headless.access_protocol.METHOD_DAEMON_PAIRING_GRANT_REVOKE) or
+        std.mem.eql(u8, method, headless.access_protocol.METHOD_DAEMON_DEVICE_LIST) or
+        std.mem.eql(u8, method, headless.access_protocol.METHOD_DAEMON_DEVICE_REVOKE) or
+        std.mem.eql(u8, method, headless.access_protocol.METHOD_DAEMON_PAIRING_EXCHANGE) or
+        std.mem.eql(u8, method, headless.access_protocol.METHOD_DAEMON_DEVICE_AUTHENTICATE) or
+        std.mem.eql(u8, method, headless.access_protocol.METHOD_DAEMON_DEVICE_AUTHORIZE);
 }
 
 const SplitTarget = struct { path: []const u8, query: []const u8 };
@@ -1457,6 +2107,206 @@ fn readFileLimited(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !
     return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(8 * 1024 * 1024));
 }
 
+const DeviceAuthorization = struct {
+    device_id: []const u8,
+    credential: []const u8,
+};
+
+fn parseDeviceAuthorization(value: []const u8) ?DeviceAuthorization {
+    const prefix = headless.access_protocol.DEVICE_AUTHORIZATION_SCHEME ++ " ";
+    if (!std.mem.startsWith(u8, value, prefix)) return null;
+    const payload = value[prefix.len..];
+    if (std.mem.indexOfAny(u8, payload, " \t\r\n") != null) return null;
+    const separator = std.mem.indexOfScalar(u8, payload, '.') orelse return null;
+    if (std.mem.findScalarPos(u8, payload, separator + 1, '.') != null) return null;
+    const device_id = payload[0..separator];
+    const credential = payload[separator + 1 ..];
+    headless.access_protocol.validateDeviceId(device_id) catch return null;
+    headless.access_protocol.validateSecret(credential) catch return null;
+    return .{ .device_id = device_id, .credential = credential };
+}
+
+fn parsePairWebSocketProtocols(request: *const std.http.Server.Request) ?[]const u8 {
+    const value = switch (uniqueHeaderValue(request, "sec-websocket-protocol")) {
+        .value => |header| header,
+        .invalid => {
+            eraseHeaderValues(request, "sec-websocket-protocol");
+            return null;
+        },
+        .none => return null,
+    };
+    const ticket = parsePairWebSocketProtocolValue(value);
+    if (ticket == null) eraseWebSocketProtocolSecrets(value);
+    return ticket;
+}
+
+fn parsePairWebSocketProtocolValue(value: []const u8) ?[]const u8 {
+    var saw_protocol = false;
+    var ticket: ?[]const u8 = null;
+    var count: usize = 0;
+    var parts = std.mem.splitScalar(u8, value, ',');
+    while (parts.next()) |raw| {
+        count += 1;
+        const part = std.mem.trim(u8, raw, " \t");
+        if (std.mem.eql(u8, part, headless.access_protocol.WEBSOCKET_PROTOCOL_NAME)) {
+            if (saw_protocol) return null;
+            saw_protocol = true;
+            continue;
+        }
+        if (std.mem.startsWith(u8, part, headless.access_protocol.WEBSOCKET_TICKET_PROTOCOL_PREFIX)) {
+            if (ticket != null) return null;
+            const candidate = part[headless.access_protocol.WEBSOCKET_TICKET_PROTOCOL_PREFIX.len..];
+            if (candidate.len != auth_mod.PAIR_TOKEN_BYTES) return null;
+            for (candidate) |byte| {
+                if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return null;
+            }
+            ticket = candidate;
+            continue;
+        }
+        return null;
+    }
+    return if (count == 2 and saw_protocol) ticket else null;
+}
+
+fn eraseWebSocketProtocolSecrets(value: []const u8) void {
+    var parts = std.mem.splitScalar(u8, value, ',');
+    while (parts.next()) |raw| {
+        const part = std.mem.trim(u8, raw, " \t");
+        if (!std.mem.startsWith(u8, part, headless.access_protocol.WEBSOCKET_TICKET_PROTOCOL_PREFIX)) continue;
+        std.crypto.secureZero(
+            u8,
+            @constCast(part[headless.access_protocol.WEBSOCKET_TICKET_PROTOCOL_PREFIX.len..]),
+        );
+    }
+}
+
+fn eraseQueryCredentials(query: []const u8) bool {
+    var found = false;
+    const names = [_][]const u8{ "token", "access_token", "pairing_token", "device_credential", "ticket" };
+    for (names) |name| {
+        if (queryValue(query, name)) |value| {
+            std.crypto.secureZero(u8, @constCast(value));
+            found = true;
+        }
+    }
+    return found;
+}
+
+fn readBoundedSecretBody(
+    allocator: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    limit: usize,
+) ![]u8 {
+    if (request.head.content_length) |length| if (length > limit) return error.AccessBodyTooLarge;
+    const reader = try request.readerExpectContinue(&.{});
+    return reader.allocRemaining(allocator, .limited(limit)) catch |err| switch (err) {
+        error.StreamTooLong => error.AccessBodyTooLarge,
+        else => err,
+    };
+}
+
+fn rpcErrorCode(value: ?headless.protocol.Error) ?[]const u8 {
+    return if (value) |rpc_error| rpc_error.code else null;
+}
+
+fn eraseJsonStringField(value: std.json.Value, field: []const u8) void {
+    if (value != .object) return;
+    const candidate = value.object.get(field) orelse return;
+    if (candidate == .string) std.crypto.secureZero(u8, @constCast(candidate.string));
+}
+
+fn respondPairExchangeResult(
+    allocator: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    result: headless.access_protocol.PairingGrantExchangeResult,
+) !void {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer {
+        std.crypto.secureZero(u8, writer.written());
+        writer.deinit();
+    }
+    var json: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try json.beginObject();
+    try json.objectField("access_protocol_version");
+    try json.write(result.access_protocol_version);
+    try json.objectField("runtime_id");
+    try json.write(result.runtime_id);
+    try json.objectField("instance_id");
+    try json.write(result.instance_id);
+    try json.objectField("device_id");
+    try json.write(result.device_id);
+    try json.objectField("device_credential");
+    try json.write(result.device_credential.reveal());
+    try json.objectField("scopes");
+    try json.write(result.scopes);
+    try json.endObject();
+    const body = try writer.toOwnedSlice();
+    defer {
+        std.crypto.secureZero(u8, body);
+        allocator.free(body);
+    }
+    try respondJson(request, .ok, body);
+}
+
+fn respondAccessTokenResult(
+    allocator: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    issued: *const auth_mod.IssuedPairCredential,
+    scopes: []const []const u8,
+) !void {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer {
+        std.crypto.secureZero(u8, writer.written());
+        writer.deinit();
+    }
+    var json: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try json.beginObject();
+    try json.objectField("access_protocol_version");
+    try json.write(headless.access_protocol.ACCESS_PROTOCOL_VERSION);
+    try json.objectField("access_token");
+    try json.write(issued.value[0..]);
+    try json.objectField("token_type");
+    try json.write(headless.access_protocol.ACCESS_TOKEN_TYPE);
+    try json.objectField("expires_at_ms");
+    try json.write(issued.expires_at_ms);
+    try json.objectField("scopes");
+    try json.write(scopes);
+    try json.endObject();
+    const body = try writer.toOwnedSlice();
+    defer {
+        std.crypto.secureZero(u8, body);
+        allocator.free(body);
+    }
+    try respondJson(request, .ok, body);
+}
+
+fn respondWebSocketTicketResult(
+    allocator: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    issued: *const auth_mod.IssuedPairCredential,
+) !void {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer {
+        std.crypto.secureZero(u8, writer.written());
+        writer.deinit();
+    }
+    var json: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try json.beginObject();
+    try json.objectField("access_protocol_version");
+    try json.write(headless.access_protocol.ACCESS_PROTOCOL_VERSION);
+    try json.objectField("ticket");
+    try json.write(issued.value[0..]);
+    try json.objectField("expires_at_ms");
+    try json.write(issued.expires_at_ms);
+    try json.endObject();
+    const body = try writer.toOwnedSlice();
+    defer {
+        std.crypto.secureZero(u8, body);
+        allocator.free(body);
+    }
+    try respondJson(request, .ok, body);
+}
+
 fn mimeType(path: []const u8) []const u8 {
     if (std.mem.endsWith(u8, path, ".html")) return "text/html; charset=utf-8";
     if (std.mem.endsWith(u8, path, ".js")) return "text/javascript; charset=utf-8";
@@ -1502,7 +2352,76 @@ test "query token and disabled file surfaces are rejected by policy" {
     try std.testing.expect(disabledFileApi("/api/file"));
     try std.testing.expect(disabledFileApi("/api/preview"));
     try std.testing.expect(blockedRpcMethod("web.directory.list"));
+    try std.testing.expect(blockedRpcMethod(headless.access_protocol.METHOD_DAEMON_PAIRING_GRANT_CREATE));
+    try std.testing.expect(blockedRpcMethod(headless.access_protocol.METHOD_DAEMON_PAIRING_GRANT_LIST));
+    try std.testing.expect(blockedRpcMethod(headless.access_protocol.METHOD_DAEMON_PAIRING_GRANT_REVOKE));
+    try std.testing.expect(blockedRpcMethod(headless.access_protocol.METHOD_DAEMON_DEVICE_LIST));
+    try std.testing.expect(blockedRpcMethod(headless.access_protocol.METHOD_DAEMON_DEVICE_REVOKE));
+    try std.testing.expect(blockedRpcMethod(headless.access_protocol.METHOD_DAEMON_PAIRING_EXCHANGE));
+    try std.testing.expect(blockedRpcMethod(headless.access_protocol.METHOD_DAEMON_DEVICE_AUTHENTICATE));
+    try std.testing.expect(blockedRpcMethod(headless.access_protocol.METHOD_DAEMON_DEVICE_AUTHORIZE));
     try std.testing.expect(!blockedRpcMethod("core.status"));
+}
+
+test "device authorization and WebSocket ticket headers are exact" {
+    const device_id = "0123456789abcdef0123456789abcdef";
+    const credential = "a" ** headless.access_protocol.SECRET_HEX_BYTES;
+    const value = headless.access_protocol.DEVICE_AUTHORIZATION_SCHEME ++ " " ++ device_id ++ "." ++ credential;
+    const parsed = parseDeviceAuthorization(value).?;
+    try std.testing.expectEqualStrings(device_id, parsed.device_id);
+    try std.testing.expectEqualStrings(credential, parsed.credential);
+    try std.testing.expect(parseDeviceAuthorization("verdedevice " ++ device_id ++ "." ++ credential) == null);
+    try std.testing.expect(parseDeviceAuthorization(headless.access_protocol.DEVICE_AUTHORIZATION_SCHEME ++ "  " ++ device_id ++ "." ++ credential) == null);
+
+    const ticket = "b" ** auth_mod.PAIR_TOKEN_BYTES;
+    const protocols = headless.access_protocol.WEBSOCKET_PROTOCOL_NAME ++ ", " ++
+        headless.access_protocol.WEBSOCKET_TICKET_PROTOCOL_PREFIX ++ ticket;
+    try std.testing.expectEqualStrings(ticket, parsePairWebSocketProtocolValue(protocols).?);
+    try std.testing.expect(parsePairWebSocketProtocolValue(protocols ++ ", extra") == null);
+    try std.testing.expect(parsePairWebSocketProtocolValue(
+        headless.access_protocol.WEBSOCKET_TICKET_PROTOCOL_PREFIX ++ ticket,
+    ) == null);
+    try std.testing.expect(parsePairWebSocketProtocolValue(
+        headless.access_protocol.WEBSOCKET_PROTOCOL_NAME ++ ", " ++
+            headless.access_protocol.WEBSOCKET_TICKET_PROTOCOL_PREFIX ++ ("B" ** auth_mod.PAIR_TOKEN_BYTES),
+    ) == null);
+}
+
+test "paired scope policy is shared by HTTP and WebSocket forwarding" {
+    try std.testing.expectEqual(
+        headless.access_protocol.scopeBit(.chat_write),
+        headless.access_protocol.requiredScopeMaskForRpc("chat.turn.start").?,
+    );
+    try std.testing.expect(headless.access_protocol.requiredScopeMaskForRpc("daemon.stop") == null);
+    try std.testing.expect(headless.access_protocol.requiredScopeMaskForRpc("web.directory.list") == null);
+}
+
+test "durable device rejection is distinguished from daemon failure" {
+    const rejected = try headless.encodeErrorResponse(
+        std.testing.allocator,
+        1,
+        "authentication_rejected",
+        "access credential was not accepted",
+    );
+    defer std.testing.allocator.free(rejected);
+    try std.testing.expectEqual(
+        DeviceAuthorizationStatus.rejected,
+        deviceAuthorizationStatus(
+            std.testing.allocator,
+            rejected,
+            "0123456789abcdef0123456789abcdef",
+            headless.access_protocol.scopeBit(.runtime_read),
+        ),
+    );
+    try std.testing.expectEqual(
+        DeviceAuthorizationStatus.unavailable,
+        deviceAuthorizationStatus(
+            std.testing.allocator,
+            "not-json",
+            "0123456789abcdef0123456789abcdef",
+            headless.access_protocol.scopeBit(.runtime_read),
+        ),
+    );
 }
 
 test "network RPC requires a target after bootstrap status" {

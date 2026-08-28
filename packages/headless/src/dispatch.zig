@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const protocol = @import("protocol.zig");
+const access_protocol = @import("access_protocol.zig");
 
 /// Methods that must be refused once the daemon has entered its drain phase.
 ///
@@ -51,6 +52,13 @@ const MUTATING_METHODS = [_][]const u8{
     "notification.chatCompletion.upsert",
     "notification.chatCompletion.clear",
     "config.favoriteModel.set",
+    // Owner-only access administration. Lists are included because they
+    // transactionally prune bounded terminal records before replying.
+    access_protocol.METHOD_DAEMON_PAIRING_GRANT_CREATE,
+    access_protocol.METHOD_DAEMON_PAIRING_GRANT_LIST,
+    access_protocol.METHOD_DAEMON_PAIRING_GRANT_REVOKE,
+    access_protocol.METHOD_DAEMON_DEVICE_LIST,
+    access_protocol.METHOD_DAEMON_DEVICE_REVOKE,
 };
 
 /// Return whether a method changes daemon-owned state.

@@ -9,6 +9,7 @@ const zqlite = @import("zqlite");
 const headless = @import("headless");
 
 const schema = @import("../db/schema.zig");
+const access_store = @import("access_store.zig");
 const transcript_apply = @import("../chat/transcript_apply.zig");
 const platform_runtime = @import("platform_runtime");
 
@@ -457,6 +458,7 @@ pub const Store = struct {
         } else {
             schema.initializeToVersion(conn, schema.MAX_SUPPORTED_VERSION) catch |err| return mapOpenError(err);
         }
+        access_store.initialize(conn) catch |err| return mapOpenError(err);
         const migrated_fingerprint_bytes = migrateLegacyFingerprints(allocator, conn) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return mapOpenError(err);
@@ -4612,6 +4614,30 @@ fn testHeader(request_key: []const u8, expected_store_revision: ?u64) store_prot
         .expected_store_revision = expected_store_revision,
         .client_id = "test-client",
     };
+}
+
+test "identity-bound store initializes durable access tables" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+    var store = try Store.initWithRuntimeIdentity(
+        std.testing.allocator,
+        db_path,
+        .none,
+        .{
+            .runtime_id = "0123456789abcdef0123456789abcdef",
+            .instance_id = "fedcba9876543210fedcba9876543210",
+        },
+    );
+    defer store.deinit();
+
+    var row = (try store.conn.row(
+        \\select count(*) from sqlite_schema
+        \\where type = 'table' and name in ('runtime_pairing_grants', 'runtime_devices')
+    , .{})).?;
+    defer row.deinit();
+    try std.testing.expectEqual(@as(i64, 2), row.int(0));
 }
 
 fn seedLegacyStagedAcceptance(store: *Store, request: TurnAcceptanceRequest) !void {

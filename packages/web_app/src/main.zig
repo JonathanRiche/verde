@@ -15,9 +15,20 @@ pub fn main(init: std.process.Init) void {
             return;
         },
         else => {
-            std.debug.print("verde-web fatal: {s}\n", .{@errorName(err)});
+            if (configurationErrorMessage(err)) |message| {
+                std.debug.print("verde-web: {s}\n", .{message});
+            } else {
+                std.debug.print("verde-web fatal: {s}\n", .{@errorName(err)});
+            }
             std.process.exit(1);
         },
+    };
+}
+
+fn configurationErrorMessage(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.NonLoopbackHost => "non-loopback bind rejected; use --host 127.0.0.1 and connect through an SSH local forward",
+        else => null,
     };
 }
 
@@ -52,4 +63,12 @@ test {
     _ = daemon_mod;
     _ = http_mod;
     _ = theme_mod;
+}
+
+test "non-loopback bind failure explains the supported access path" {
+    try std.testing.expectEqualStrings(
+        "non-loopback bind rejected; use --host 127.0.0.1 and connect through an SSH local forward",
+        configurationErrorMessage(error.NonLoopbackHost).?,
+    );
+    try std.testing.expect(configurationErrorMessage(error.TokenFileRequired) == null);
 }
