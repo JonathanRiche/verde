@@ -9,6 +9,7 @@ const platform_paths = @import("platform_paths");
 const platform_runtime = @import("platform_runtime");
 const sessionizer = @import("terminal/sessionizer.zig");
 const access_protocol = headless.access_protocol;
+const connect_protocol = headless.connect_protocol;
 
 const NOTIFY_REQUEST_TIMEOUT_MS: u32 = 5_000;
 const SIGNAL_WATCH_INTERVAL_MS: i64 = 25;
@@ -103,7 +104,18 @@ const Command = enum {
     pair_revoke,
     device_list,
     device_revoke,
+    connect_login,
+    connect_link,
+    connect_status,
+    connect_unlink,
+    connect_logout,
     notify,
+};
+
+const ConnectOptions = struct {
+    control_plane_url: ?[]const u8 = null,
+    credential_file: ?[]const u8 = null,
+    descriptor_file: ?[]const u8 = null,
 };
 
 const PairOptions = struct {
@@ -146,6 +158,7 @@ const Options = struct {
     json: bool = false,
     repository_bind: RepositoryBindOptions = .{},
     pair: PairOptions = .{},
+    connect: ConnectOptions = .{},
     notify: NotifyOptions = .{},
 };
 
@@ -158,11 +171,13 @@ const ParseError = error{
     MissingOptionValue,
     MissingPairCommand,
     MissingDeviceCommand,
+    MissingConnectCommand,
     MissingProvidersCommand,
     MissingWorkspaceCommand,
     UnknownCommand,
     UnknownPairCommand,
     UnknownDeviceCommand,
+    UnknownConnectCommand,
     UnknownProvidersCommand,
     UnknownWorkspaceCommand,
 };
@@ -295,6 +310,7 @@ fn execute(
         .workspace_bind => try handleWorkspaceBind(allocator, io, data_dir, options),
         .workspace_repository_bind => try handleWorkspaceRepositoryBind(allocator, io, data_dir, options),
         .pair_create, .pair_list, .pair_revoke, .device_list, .device_revoke => try handleAccessAdministration(allocator, io, data_dir, options),
+        .connect_login, .connect_link, .connect_status, .connect_unlink, .connect_logout => try handleConnectAdministration(allocator, io, data_dir, options),
         .help, .version, .notify => unreachable,
     }
 }
@@ -1082,6 +1098,107 @@ fn writeScopeLine(io: std.Io, scopes: []const []const u8) !void {
     try writeStdout(io, "\n", .{});
 }
 
+fn handleConnectAdministration(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    data_dir: []const u8,
+    options: Options,
+) !void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var transport: sessionizer.HeadlessTransport = .{ .allocator = arena, .pref_path = data_dir };
+    var probe_client = sessionizer.headlessClient(arena, &transport);
+    const handshake = try probe_client.handshakeRuntime(null);
+    var client = try headless.Client.initTargeted(
+        arena,
+        &transport,
+        sessionizer.HeadlessTransport.send,
+        .{
+            .runtime_id = handshake.status.runtime_id,
+            .instance_id = handshake.status.instance_id,
+        },
+    );
+
+    var parsed = switch (options.command) {
+        .connect_login => try client.call(
+            connect_protocol.METHOD_LOGIN,
+            connect_protocol.LoginRequest{
+                .connect_protocol_version = connect_protocol.CONNECT_PROTOCOL_VERSION,
+                .control_plane_url = options.connect.control_plane_url.?,
+                .credential_file = options.connect.credential_file.?,
+            },
+        ),
+        .connect_link => link: {
+            const descriptor = try readConnectDescriptor(arena, io, options.connect.descriptor_file.?);
+            if (!std.mem.eql(u8, descriptor.runtime_id, handshake.status.runtime_id) or
+                !std.mem.eql(u8, descriptor.instance_id, handshake.status.instance_id))
+            {
+                return error.RuntimeIdentityMismatch;
+            }
+            break :link try client.call(
+                connect_protocol.METHOD_LINK,
+                connect_protocol.LinkRequest{
+                    .connect_protocol_version = connect_protocol.CONNECT_PROTOCOL_VERSION,
+                    .provider = "external",
+                    .external_descriptor = descriptor,
+                },
+            );
+        },
+        .connect_status => try client.call(
+            connect_protocol.METHOD_STATUS,
+            connect_protocol.StatusRequest{ .connect_protocol_version = connect_protocol.CONNECT_PROTOCOL_VERSION },
+        ),
+        .connect_unlink => try client.call(
+            connect_protocol.METHOD_UNLINK,
+            connect_protocol.UnlinkRequest{ .connect_protocol_version = connect_protocol.CONNECT_PROTOCOL_VERSION },
+        ),
+        .connect_logout => try client.call(
+            connect_protocol.METHOD_LOGOUT,
+            connect_protocol.LogoutRequest{ .connect_protocol_version = connect_protocol.CONNECT_PROTOCOL_VERSION },
+        ),
+        else => unreachable,
+    };
+    defer parsed.deinit();
+    const status = try client.decodeConnectStatus(&parsed);
+    if (!std.mem.eql(u8, status.runtime_id, handshake.status.runtime_id) or
+        !std.mem.eql(u8, status.instance_id, handshake.status.instance_id))
+    {
+        return error.RuntimeIdentityMismatch;
+    }
+    if (options.json) {
+        return writeJson(io, allocator, .{ .ok = true, .data_dir = data_dir, .result = status });
+    }
+    try writeStdout(
+        io,
+        "Connect: {s} (desired={s}, authenticated={s}, connector={s})\n",
+        .{
+            @tagName(status.state),
+            @tagName(status.desired_state),
+            if (status.authenticated) "yes" else "no",
+            if (status.connector_running) "running" else "stopped",
+        },
+    );
+    if (status.endpoint_https_url) |url| try writeStdout(io, "Endpoint: {s}\n", .{url});
+    if (status.next_retry_at_ms) |retry_at| try writeStdout(io, "Retry at: {d}\n", .{retry_at});
+}
+
+fn readConnectDescriptor(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) !connect_protocol.RuntimeDescriptor {
+    const MAX_DESCRIPTOR_BYTES: usize = 64 * 1024;
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{ .follow_symlinks = false });
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.kind != .file or stat.size > MAX_DESCRIPTOR_BYTES) return error.InvalidArguments;
+    var buffer: [16 * 1024]u8 = undefined;
+    var reader = file.reader(io, &buffer);
+    const bytes = try reader.interface.allocRemaining(allocator, .limited(MAX_DESCRIPTOR_BYTES));
+    return std.json.parseFromSliceLeaky(connect_protocol.RuntimeDescriptor, allocator, bytes, .{});
+}
+
 fn queryStatus(allocator: std.mem.Allocator, data_dir: []const u8) !headless.StatusResult {
     var transport: sessionizer.HeadlessTransport = .{
         .allocator = allocator,
@@ -1195,6 +1312,22 @@ fn parseArgs(argv: []const []const u8) ParseError!Options {
             return error.UnknownDeviceCommand;
         }
         option_start = 3;
+    } else if (std.mem.eql(u8, first, "connect")) {
+        if (argv.len <= 2) return error.MissingConnectCommand;
+        if (std.mem.eql(u8, argv[2], "login")) {
+            command = .connect_login;
+        } else if (std.mem.eql(u8, argv[2], "link")) {
+            command = .connect_link;
+        } else if (std.mem.eql(u8, argv[2], "status")) {
+            command = .connect_status;
+        } else if (std.mem.eql(u8, argv[2], "unlink")) {
+            command = .connect_unlink;
+        } else if (std.mem.eql(u8, argv[2], "logout")) {
+            command = .connect_logout;
+        } else {
+            return error.UnknownConnectCommand;
+        }
+        option_start = 3;
     } else if (std.mem.eql(u8, first, "providers")) {
         if (argv.len <= 2) return error.MissingProvidersCommand;
         if (!std.mem.eql(u8, argv[2], "status")) return error.UnknownProvidersCommand;
@@ -1303,6 +1436,23 @@ fn parseArgs(argv: []const []const u8) ParseError!Options {
             index += 2;
             continue;
         }
+        if (command == .connect_login or command == .connect_link) {
+            const value = try notifyOptionValue(argv, index);
+            if (command == .connect_login and std.mem.eql(u8, arg, "--control-plane")) {
+                if (result.connect.control_plane_url != null) return error.InvalidArguments;
+                result.connect.control_plane_url = value;
+            } else if (command == .connect_login and std.mem.eql(u8, arg, "--credential-file")) {
+                if (result.connect.credential_file != null) return error.InvalidArguments;
+                result.connect.credential_file = value;
+            } else if (command == .connect_link and std.mem.eql(u8, arg, "--descriptor-file")) {
+                if (result.connect.descriptor_file != null) return error.InvalidArguments;
+                result.connect.descriptor_file = value;
+            } else {
+                return error.InvalidArguments;
+            }
+            index += 2;
+            continue;
+        }
         if (command == .notify) {
             if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
                 result.notify.help = true;
@@ -1382,6 +1532,13 @@ fn parseArgs(argv: []const []const u8) ParseError!Options {
     } else if (command == .device_revoke) {
         const device_id = result.pair.id orelse return error.InvalidArguments;
         access_protocol.validateDeviceId(device_id) catch return error.InvalidArguments;
+    } else if (command == .connect_login) {
+        const control_plane_url = result.connect.control_plane_url orelse return error.InvalidArguments;
+        const credential_file = result.connect.credential_file orelse return error.InvalidArguments;
+        connect_protocol.validateControlPlaneUrl(control_plane_url) catch return error.InvalidArguments;
+        connect_protocol.validateCredentialFile(credential_file) catch return error.InvalidArguments;
+    } else if (command == .connect_link) {
+        if (result.connect.descriptor_file == null) return error.InvalidArguments;
     }
     return result;
 }
@@ -1416,11 +1573,13 @@ fn writeParseError(io: std.Io, err: ParseError) !void {
         error.MissingOptionValue => "command option requires a non-empty value",
         error.MissingPairCommand => "pair requires create, list, or revoke",
         error.MissingDeviceCommand => "device requires list or revoke",
+        error.MissingConnectCommand => "connect requires login, link, status, unlink, or logout",
         error.MissingProvidersCommand => "providers requires the status command",
         error.MissingWorkspaceCommand => "workspace requires show, bind, or repository bind",
         error.UnknownCommand => "unknown command",
         error.UnknownPairCommand => "unknown pair command",
         error.UnknownDeviceCommand => "unknown device command",
+        error.UnknownConnectCommand => "unknown connect command",
         error.UnknownProvidersCommand => "unknown providers command",
         error.UnknownWorkspaceCommand => "unknown workspace command",
     };
@@ -1466,6 +1625,7 @@ fn commandErrorMessage(err: anyerror) []const u8 {
         error.RuntimeIdentityMismatch => "daemon runtime identity did not match",
         error.IncompatibleRuntimeProtocol, error.IncompatibleProtocolVersion => "daemon protocol is incompatible",
         error.IncompatibleAccessProtocol => "daemon access protocol is incompatible",
+        error.IncompatibleConnectProtocol => "daemon Connect protocol is incompatible",
         error.InvalidAccessResponse => "daemon returned an invalid access administration response",
         error.CapabilityUnavailable => "daemon does not support this command",
         error.RemoteError => "daemon rejected the request",
@@ -1482,6 +1642,7 @@ fn commandErrorExitCode(err: anyerror) u8 {
         error.IncompatibleRuntimeProtocol,
         error.IncompatibleProtocolVersion,
         error.IncompatibleAccessProtocol,
+        error.IncompatibleConnectProtocol,
         error.InvalidAccessResponse,
         error.StoreUnavailable,
         error.InheritedSocketOverride,
@@ -1514,6 +1675,9 @@ fn printHelp(io: std.Io, stderr: bool) !void {
         \\  verde-daemon pair revoke --id ID [--data-dir PATH] [--json]
         \\  verde-daemon device list [--data-dir PATH] [--json]
         \\  verde-daemon device revoke --id ID [--data-dir PATH] [--json]
+        \\  verde-daemon connect login --control-plane URL --credential-file PATH [--data-dir PATH] [--json]
+        \\  verde-daemon connect link --descriptor-file PATH [--data-dir PATH] [--json]
+        \\  verde-daemon connect status|unlink|logout [--data-dir PATH] [--json]
         \\  verde-daemon notify --status STATUS [options]
         \\  verde-daemon version [--json]
         \\  verde-daemon --help
@@ -1533,6 +1697,8 @@ fn printHelp(io: std.Io, stderr: bool) !void {
         \\documented single-user default scope set. Expiry accepts s, m, or h (max 1h).
         \\Repository bind options: --vcs-identity URL, --default-branch NAME,
         \\--default, --data-dir PATH, and --json. No checkout data is modified.
+        \\Connect login imports a token from an owner-only file; credentials are
+        \\never accepted directly in argv. Link consumes a public endpoint descriptor.
         \\
     ;
     if (stderr) return writeStderr(io, "{s}", .{help});
@@ -1646,6 +1812,26 @@ test "daemon CLI parses every public command" {
     try std.testing.expectEqual(Command.device_revoke, device_revoke.command);
     try std.testing.expectEqualStrings(device_id, device_revoke.pair.id.?);
     try std.testing.expectEqual(Command.device_list, (try parseArgs(&.{ "verde-daemon", "device", "list" })).command);
+
+    const connect_login = try parseArgs(&.{
+        "verde-daemon",
+        "connect",
+        "login",
+        "--control-plane",
+        "https://connect.example.test",
+        "--credential-file",
+        "/run/user/1000/verde-connect-token",
+        "--json",
+    });
+    try std.testing.expectEqual(Command.connect_login, connect_login.command);
+    try std.testing.expectEqualStrings("https://connect.example.test", connect_login.connect.control_plane_url.?);
+    try std.testing.expectEqualStrings("/run/user/1000/verde-connect-token", connect_login.connect.credential_file.?);
+    try std.testing.expectEqual(Command.connect_link, (try parseArgs(&.{
+        "verde-daemon", "connect", "link", "--descriptor-file", "/tmp/runtime-descriptor.json",
+    })).command);
+    try std.testing.expectEqual(Command.connect_status, (try parseArgs(&.{ "verde-daemon", "connect", "status" })).command);
+    try std.testing.expectEqual(Command.connect_unlink, (try parseArgs(&.{ "verde-daemon", "connect", "unlink" })).command);
+    try std.testing.expectEqual(Command.connect_logout, (try parseArgs(&.{ "verde-daemon", "connect", "logout" })).command);
 
     const workspace_show = try parseArgs(&.{
         "verde-daemon",

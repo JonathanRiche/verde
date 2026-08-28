@@ -10,6 +10,7 @@ const Self = @This();
 const std = @import("std");
 const headless = @import("headless");
 const connection = @import("connection.zig");
+const credential_store = @import("credential_store.zig");
 const manager_mod = @import("manager.zig");
 const pin_controller = @import("pin_controller.zig");
 const profile = @import("profile.zig");
@@ -29,6 +30,8 @@ allocator: std.mem.Allocator,
 io: std.Io,
 profile_path: []u8,
 runtime_manager: manager_mod.Manager,
+/// Durable home for paired device credentials; profiles hold only refs.
+credentials: credential_store.Store,
 
 /// Loads a path-explicit, non-secret profile document. The supplied `io` must
 /// remain valid until `deinit`. Dependency contexts must honor the manager's
@@ -51,18 +54,50 @@ pub fn init(
         loaded.items,
         dependencies,
     );
-    return .{
+    var self: Self = .{
         .allocator = allocator,
         .io = io,
         .profile_path = owned_path,
         .runtime_manager = runtime_manager,
+        .credentials = if (dependencies.durable_credentials)
+            credential_store.Store.init(allocator, io)
+        else
+            credential_store.Store.initMemoryOnly(allocator, io),
     };
+    self.hydrateStoredDeviceCredentials(loaded.items);
+    return self;
 }
 
 pub fn deinit(self: *Self) void {
     self.runtime_manager.deinit();
+    self.credentials.deinit();
     self.allocator.free(self.profile_path);
     self.* = undefined;
+}
+
+/// Reports where paired device credentials are kept so the UI can warn when
+/// they will not survive a restart.
+pub fn credentialBackend(self: *const Self) credential_store.Backend {
+    return self.credentials.backend;
+}
+
+// Loads each paired profile's device credential by reference. A missing or
+// unreadable credential simply leaves the profile "not loaded"; the UI then
+// offers re-pairing instead of guessing.
+fn hydrateStoredDeviceCredentials(self: *Self, profiles: []const profile.Profile) void {
+    for (profiles) |configured| {
+        const device = switch (configured.access) {
+            .paired_device => |device| device,
+            else => continue,
+        };
+        const ref = device.credential_ref orelse continue;
+        const credential = (self.credentials.getAlloc(self.allocator, ref) catch null) orelse continue;
+        defer {
+            std.crypto.secureZero(u8, credential);
+            self.allocator.free(credential);
+        }
+        self.runtime_manager.hydrateDeviceCredential(configured.id, credential) catch {};
+    }
 }
 
 /// Copies a bearer token into process memory for one configured profile.
@@ -172,6 +207,133 @@ pub fn createSshProfile(self: *Self, allocator: std.mem.Allocator, input: SshPro
     return allocator.dupe(u8, persisted.id);
 }
 
+/// Creates an SSH-forwarded profile that will authenticate with a paired
+/// device. No device exists until `beginPairing` → `commitPairing` succeeds.
+pub fn createPairedProfile(self: *Self, allocator: std.mem.Allocator, input: SshProfileInput) ![]u8 {
+    var created = try profile.Profile.createPairedSshTunnel(self.allocator, self.io, input.label, input.ssh);
+    defer created.deinit(self.allocator);
+    return self.persistNewProfile(allocator, created);
+}
+
+/// Creates a Connect profile bound to one self-hosted control plane. The
+/// runtime endpoint is selected later from the signed-in inventory.
+pub fn createConnectProfile(
+    self: *Self,
+    allocator: std.mem.Allocator,
+    label: []const u8,
+    control_plane_url: []const u8,
+) ![]u8 {
+    var created = try profile.Profile.createConnect(self.allocator, self.io, label, control_plane_url);
+    defer created.deinit(self.allocator);
+    return self.persistNewProfile(allocator, created);
+}
+
+fn persistNewProfile(self: *Self, allocator: std.mem.Allocator, created: profile.Profile) ![]u8 {
+    var lock = try profile_store.acquireExclusiveAtPath(self.allocator, self.io, self.profile_path);
+    defer lock.deinit();
+    var loaded = try profile_store.loadAtPath(self.allocator, self.io, self.profile_path);
+    defer loaded.deinit(self.allocator);
+    if (loaded.items.len >= profile.MAX_PROFILES) return error.TooManyProfiles;
+    const next = try self.allocator.alloc(profile.Profile, loaded.items.len + 1);
+    defer self.allocator.free(next);
+    @memcpy(next[0..loaded.items.len], loaded.items);
+    next[loaded.items.len] = created;
+    try profile_store.saveAtPath(self.allocator, self.io, self.profile_path, next);
+
+    var authoritative = try profile_store.loadAtPath(self.allocator, self.io, self.profile_path);
+    defer authoritative.deinit(self.allocator);
+    const persisted = findProfile(authoritative.items, created.id) orelse return error.RuntimeProfileNotPersisted;
+    try self.runtime_manager.addProfile(persisted.*);
+    return allocator.dupe(u8, persisted.id);
+}
+
+pub const PairingInput = manager_mod.PairingInput;
+pub const PairingResult = manager_mod.PairingResult;
+
+/// Starts exchanging a one-time grant over the profile's SSH tunnel. The
+/// secret is copied into the manager and never touches the profile store.
+pub fn beginPairing(self: *Self, profile_id: []const u8, input: PairingInput, now_ms: u64) !void {
+    return self.runtime_manager.beginPairing(profile_id, input, now_ms);
+}
+
+pub fn abandonPairing(self: *Self, profile_id: []const u8) !void {
+    return self.runtime_manager.abandonPairing(profile_id);
+}
+
+pub fn pairingResult(self: *const Self, profile_id: []const u8) ?PairingResult {
+    return self.runtime_manager.pairingResult(profile_id);
+}
+
+pub const PairingCommit = struct {
+    /// False when the credential is held in memory only (keyring unavailable
+    /// or write failed); the pairing must be repeated after a restart.
+    durable: bool,
+};
+
+/// Persists the confirmed device reference plus the exchanged identity pin
+/// under the store lock, stores the credential by reference, then lets the
+/// manager start a normal authenticated attempt against the pinned identity.
+pub fn commitPairing(self: *Self, profile_id: []const u8, now_ms: u64) !PairingCommit {
+    const result = self.runtime_manager.pairingResult(profile_id) orelse return error.PairingNotConfirmed;
+    const ref = try credential_store.deviceRefAlloc(self.allocator, profile_id);
+    defer self.allocator.free(ref);
+
+    var lock = try profile_store.acquireExclusiveAtPath(self.allocator, self.io, self.profile_path);
+    defer lock.deinit();
+    var loaded = try profile_store.loadAtPath(self.allocator, self.io, self.profile_path);
+    defer loaded.deinit(self.allocator);
+    const configured = findProfile(loaded.items, profile_id) orelse return error.UnknownRuntimeProfile;
+    try configured.setPairedDevice(self.allocator, result.device_id, ref);
+    try configured.setExpectedIdentity(self.allocator, result.runtime_id, result.instance_id);
+    try profile_store.saveAtPath(self.allocator, self.io, self.profile_path, loaded.items);
+
+    var durable = self.credentials.backend.durable();
+    {
+        var key_buffer: manager_mod.DeviceSecretKeyBuffer = undefined;
+        const credential = self.runtime_manager.secrets.get(manager_mod.deviceSecretKey(&key_buffer, profile_id)) orelse
+            return error.MissingRuntimeCredential;
+        self.credentials.put(ref, credential) catch |err| switch (err) {
+            error.CredentialStoreUnavailable => durable = false,
+            else => return err,
+        };
+    }
+
+    var authoritative = try profile_store.loadAtPath(self.allocator, self.io, self.profile_path);
+    defer authoritative.deinit(self.allocator);
+    const persisted = findProfile(authoritative.items, profile_id) orelse return error.RuntimeProfileNotPersisted;
+    try self.runtime_manager.completePairing(persisted.*, now_ms);
+    return .{ .durable = durable };
+}
+
+/// Unpairs: forgets the device reference on disk, deletes the credential from
+/// the store and memory, and invalidates the live generation. The runtime
+/// keeps its device record until revoked there. Returns whether a credential
+/// was actually held.
+pub fn forgetDevice(self: *Self, profile_id: []const u8) !bool {
+    var lock = try profile_store.acquireExclusiveAtPath(self.allocator, self.io, self.profile_path);
+    defer lock.deinit();
+    var loaded = try profile_store.loadAtPath(self.allocator, self.io, self.profile_path);
+    defer loaded.deinit(self.allocator);
+    const configured = findProfile(loaded.items, profile_id) orelse return error.UnknownRuntimeProfile;
+    const ref_copy: ?[]u8 = switch (configured.access) {
+        .paired_device => |device| if (device.credential_ref) |ref| try self.allocator.dupe(u8, ref) else null,
+        else => return error.ProfileAccessMismatch,
+    };
+    defer if (ref_copy) |ref| self.allocator.free(ref);
+    try configured.clearPairedDevice(self.allocator);
+    try profile_store.saveAtPath(self.allocator, self.io, self.profile_path, loaded.items);
+
+    var held = try self.runtime_manager.clearDeviceCredential(profile_id);
+    if (ref_copy) |ref| {
+        held = (self.credentials.remove(ref) catch false) or held;
+    }
+    var authoritative = try profile_store.loadAtPath(self.allocator, self.io, self.profile_path);
+    defer authoritative.deinit(self.allocator);
+    const persisted = findProfile(authoritative.items, profile_id) orelse return error.RuntimeProfileNotPersisted;
+    _ = try self.runtime_manager.replaceProfile(persisted.*);
+    return held;
+}
+
 /// Edits non-secret fields. An endpoint change clears the durable identity pin
 /// on disk and invalidates the live generation so trust is never carried over
 /// to a different peer; a label-only edit keeps the connection as is.
@@ -196,6 +358,54 @@ pub fn updateSshProfile(self: *Self, profile_id: []const u8, input: SshProfileIn
     return self.runtime_manager.replaceProfile(persisted.*);
 }
 
+/// Edits a Connect profile's label and control plane. Changing the plane
+/// drops the selected endpoint, link, and pin; label-only edits keep them.
+pub fn updateConnectProfile(self: *Self, profile_id: []const u8, label: []const u8, control_plane_url: []const u8) !ProfileReplacement {
+    var lock = try profile_store.acquireExclusiveAtPath(self.allocator, self.io, self.profile_path);
+    defer lock.deinit();
+    var loaded = try profile_store.loadAtPath(self.allocator, self.io, self.profile_path);
+    defer loaded.deinit(self.allocator);
+    const configured = findProfile(loaded.items, profile_id) orelse return error.UnknownRuntimeProfile;
+    if (configured.access != .connect) return error.ProfileAccessMismatch;
+    try configured.setLabel(self.allocator, label);
+    if (!configured.sameControlPlane(control_plane_url)) try configured.setControlPlaneUrl(self.allocator, control_plane_url);
+    try profile_store.saveAtPath(self.allocator, self.io, self.profile_path, loaded.items);
+
+    var authoritative = try profile_store.loadAtPath(self.allocator, self.io, self.profile_path);
+    defer authoritative.deinit(self.allocator);
+    const persisted = findProfile(authoritative.items, profile_id) orelse return error.RuntimeProfileNotPersisted;
+    return self.runtime_manager.replaceProfile(persisted.*);
+}
+
+/// Non-secret runtime descriptor chosen from the signed-in Connect inventory.
+pub const ConnectRuntimeSelection = struct {
+    link_id: []const u8,
+    runtime_id: []const u8,
+    instance_id: []const u8,
+    https_url: []const u8,
+    wss_url: []const u8,
+    spki_sha256: []const u8,
+};
+
+/// Persists the selected endpoint identity (URLs, SPKI pin, link id, and the
+/// advertised runtime/instance pair). The live entry is re-added without
+/// trust because no handshake has verified that pair yet.
+pub fn selectConnectRuntime(self: *Self, profile_id: []const u8, selection: ConnectRuntimeSelection) !void {
+    var lock = try profile_store.acquireExclusiveAtPath(self.allocator, self.io, self.profile_path);
+    defer lock.deinit();
+    var loaded = try profile_store.loadAtPath(self.allocator, self.io, self.profile_path);
+    defer loaded.deinit(self.allocator);
+    const configured = findProfile(loaded.items, profile_id) orelse return error.UnknownRuntimeProfile;
+    try configured.setConnectEndpoint(self.allocator, selection.https_url, selection.wss_url, selection.spki_sha256, selection.link_id);
+    try configured.setExpectedIdentity(self.allocator, selection.runtime_id, selection.instance_id);
+    try profile_store.saveAtPath(self.allocator, self.io, self.profile_path, loaded.items);
+
+    var authoritative = try profile_store.loadAtPath(self.allocator, self.io, self.profile_path);
+    defer authoritative.deinit(self.allocator);
+    const persisted = findProfile(authoritative.items, profile_id) orelse return error.RuntimeProfileNotPersisted;
+    _ = try self.runtime_manager.replaceProfile(persisted.*);
+}
+
 /// Removes the profile from disk and from the live manager, wiping any
 /// process-memory token. Returns whether a token was forgotten.
 pub fn removeProfile(self: *Self, profile_id: []const u8) !bool {
@@ -207,7 +417,14 @@ pub fn removeProfile(self: *Self, profile_id: []const u8) !bool {
     var kept: std.ArrayList(profile.Profile) = .empty;
     defer kept.deinit(self.allocator);
     for (loaded.items) |configured| {
-        if (!std.mem.eql(u8, configured.id, profile_id)) try kept.append(self.allocator, configured);
+        if (!std.mem.eql(u8, configured.id, profile_id)) {
+            try kept.append(self.allocator, configured);
+            continue;
+        }
+        // Removing a paired profile must not leave its credential behind.
+        if (configured.access == .paired_device) {
+            if (configured.access.paired_device.credential_ref) |ref| _ = self.credentials.remove(ref) catch false;
+        }
     }
     if (kept.items.len == loaded.items.len and self.runtime_manager.profileConst(profile_id) == null) {
         return error.UnknownRuntimeProfile;
@@ -235,6 +452,7 @@ pub fn reloadProfiles(self: *Self) !void {
             _ = try self.runtime_manager.replaceProfile(configured);
         }
     }
+    self.hydrateStoredDeviceCredentials(loaded.items);
 }
 
 /// Formats secret-free diagnostics for clipboard/bug reports. Includes the
@@ -251,6 +469,33 @@ pub fn redactedDiagnosticsAlloc(self: *const Self, allocator: std.mem.Allocator,
         .ssh_tunnel => |ssh| try w.print(
             "transport: ssh_tunnel host={s} user={s} ssh_port={d} gateway_port={d}\n",
             .{ ssh.host, ssh.user orelse "<default>", ssh.port, ssh.remote_gateway_port },
+        ),
+        .connect => |endpoint| try w.print(
+            "transport: connect https_url={s} wss_url={s} spki_sha256={s}\n",
+            .{
+                endpoint.https_url orelse "<unselected>",
+                endpoint.wss_url orelse "<unselected>",
+                endpoint.spki_sha256 orelse "<unselected>",
+            },
+        ),
+    }
+    // Access details are references and identifiers only; credentials and
+    // access tokens are reported as presence, never as values.
+    switch (configured.access) {
+        .admin_token => try w.writeAll("access: admin_token\n"),
+        .paired_device => |device| try w.print(
+            "access: paired_device device_id={s} credential_ref={s} device_credential={s} pairing={s}\ncredential_store: {s}\n",
+            .{
+                device.device_id orelse "<not paired>",
+                device.credential_ref orelse "<none>",
+                if (snap.device_credential_held) "held in memory (<redacted>)" else "not loaded",
+                @tagName(snap.pairing_state),
+                self.credentials.backend.description(),
+            },
+        ),
+        .connect => |link| try w.print(
+            "access: connect control_plane_url={s} link_id={s}\n",
+            .{ link.control_plane_url, link.link_id orelse "<none>" },
         ),
     }
     try w.print("phase: {s}\nfailure: {s}\ntunnel: {s}\n", .{
@@ -497,6 +742,7 @@ fn testDependencies(
         .port_selector = .{ .context = ports, .select = TestPorts.select },
         .tunnel_backend = tunnel.backend(),
         .rpc_backend = rpc.backend(),
+        .durable_credentials = false,
     };
 }
 

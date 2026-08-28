@@ -10,6 +10,7 @@ const headless = @import("headless");
 
 const schema = @import("../db/schema.zig");
 const access_store = @import("access_store.zig");
+const connect_store = @import("connect_store.zig");
 const transcript_apply = @import("../chat/transcript_apply.zig");
 const platform_runtime = @import("platform_runtime");
 
@@ -459,6 +460,10 @@ pub const Store = struct {
             schema.initializeToVersion(conn, schema.MAX_SUPPORTED_VERSION) catch |err| return mapOpenError(err);
         }
         access_store.initialize(conn) catch |err| return mapOpenError(err);
+        if (runtime_identity) |identity| {
+            connect_store.initialize(conn, identity.runtime_id, identity.instance_id) catch |err|
+                return mapOpenError(err);
+        }
         const migrated_fingerprint_bytes = migrateLegacyFingerprints(allocator, conn) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return mapOpenError(err);

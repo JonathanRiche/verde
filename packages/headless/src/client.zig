@@ -10,6 +10,7 @@ const store_protocol = @import("store_protocol.zig");
 const changes_protocol = @import("changes_protocol.zig");
 const providers_protocol = @import("providers_protocol.zig");
 const access_protocol = @import("access_protocol.zig");
+const connect_protocol = @import("connect_protocol.zig");
 
 /// Sends one request JSON document and returns an allocator-owned response JSON document.
 pub const TransportFn = *const fn (ctx: *anyopaque, request_json: []const u8) anyerror![]u8;
@@ -647,6 +648,76 @@ pub const Client = struct {
         return result;
     }
 
+    /// Decode the owner-only Connect projection without accepting future
+    /// fields or a response for another runtime generation.
+    pub fn decodeConnectStatus(
+        self: *Client,
+        parsed: *const protocol.ParsedResponse,
+    ) !connect_protocol.StatusResult {
+        const result = try self.decodeStrictResult(connect_protocol.StatusResult, parsed);
+        try validateConnectProtocolVersion(result.connect_protocol_version);
+        protocol.validateRequestTarget(.{
+            .runtime_id = result.runtime_id,
+            .instance_id = result.instance_id,
+        }) catch return error.InvalidConnectResponse;
+        if (self.request_target) |target| {
+            const expected = target.borrow();
+            if (!std.mem.eql(u8, result.runtime_id, expected.runtime_id) or
+                !std.mem.eql(u8, result.instance_id, expected.instance_id))
+            {
+                return error.RuntimeIdentityMismatch;
+            }
+        }
+        if (result.retry_attempt > 1024 or
+            (result.next_retry_at_ms != null and result.next_retry_at_ms.? < 0))
+        {
+            return error.InvalidConnectResponse;
+        }
+        return result;
+    }
+
+    pub fn decodeConnectBootstrapConsume(
+        self: *Client,
+        parsed: *const protocol.ParsedResponse,
+    ) !connect_protocol.BootstrapConsumeResult {
+        const result = try self.decodeStrictResult(connect_protocol.BootstrapConsumeResult, parsed);
+        try validateConnectProtocolVersion(result.connect_protocol_version);
+        try access_protocol.validateScopeNames(result.scopes);
+        if (!validConnectPrefixedId(result.grant_id, "grt_") or
+            !validConnectPrefixedId(result.device_id, "dev_") or
+            result.expires_at_ms < 0)
+        {
+            return error.InvalidConnectResponse;
+        }
+        return result;
+    }
+
+    /// Send a bootstrap grant over the owner-only daemon transport. The
+    /// request DTO deliberately redacts under generic serialization, so this
+    /// is the sole typed client path that places the grant in a wire buffer.
+    /// `callWithId` clears that buffer immediately after the transport call.
+    pub fn callConnectBootstrapConsume(
+        self: *Client,
+        request: connect_protocol.BootstrapConsumeRequest,
+    ) !protocol.ParsedResponse {
+        try validateConnectProtocolVersion(request.connect_protocol_version);
+        const grant_jwt = request.grant_jwt.reveal();
+        if (grant_jwt.len == 0 or grant_jwt.len > connect_protocol.MAX_COMPACT_TOKEN_BYTES) {
+            return error.InvalidConnectGrant;
+        }
+        const id = self.next_id;
+        self.next_id += 1;
+        return try self.callWithId(id, connect_protocol.METHOD_BOOTSTRAP_CONSUME, .{
+            .connect_protocol_version = request.connect_protocol_version,
+            .grant_jwt = grant_jwt,
+            .expected_issuer = request.expected_issuer,
+            .expected_audience = request.expected_audience,
+            .client_nonce = request.client_nonce,
+            .device_id = request.device_id,
+            .device_key_thumbprint = request.device_key_thumbprint,
+        });
+    }
+
     /// Issue an explicitly daemon-direct composite snapshot read. The gate is
     /// deliberately inside the typed call so an old daemon cannot silently
     /// re-enable a caller's legacy fallback after this API was chosen.
@@ -837,6 +908,18 @@ fn validateAccessProtocolVersion(version: u32) !void {
     }
 }
 
+fn validateConnectProtocolVersion(version: u32) !void {
+    if (version != connect_protocol.CONNECT_PROTOCOL_VERSION) {
+        return error.IncompatibleConnectProtocol;
+    }
+}
+
+fn validConnectPrefixedId(value: []const u8, prefix: []const u8) bool {
+    if (value.len != prefix.len + 32 or !std.mem.startsWith(u8, value, prefix)) return false;
+    for (value[prefix.len..]) |byte| if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
+    return true;
+}
+
 fn validateAccessResultHeader(
     version: u32,
     runtime_id: []const u8,
@@ -856,13 +939,19 @@ const MockTransport = struct {
     canned_response: []const u8,
 
     fn deinit(self: *MockTransport) void {
-        if (self.last_request) |bytes| self.allocator.free(bytes);
+        if (self.last_request) |bytes| {
+            std.crypto.secureZero(u8, bytes);
+            self.allocator.free(bytes);
+        }
     }
 
     fn send(ctx: *anyopaque, request_json: []const u8) anyerror![]u8 {
         const self: *MockTransport = @ptrCast(@alignCast(ctx));
         self.call_count += 1;
-        if (self.last_request) |bytes| self.allocator.free(bytes);
+        if (self.last_request) |bytes| {
+            std.crypto.secureZero(u8, bytes);
+            self.allocator.free(bytes);
+        }
         self.last_request = try self.allocator.dupe(u8, request_json);
         return try self.allocator.dupe(u8, self.canned_response);
     }
@@ -922,6 +1011,51 @@ test "client parses ok envelope via injected transport" {
     const status = try client.decodeStatus(&parsed_status);
     try std.testing.expectEqual(@as(u32, 18), status.protocol_version);
     try std.testing.expectEqual(@as(usize, 2), status.session_count);
+}
+
+test "Connect bootstrap uses only the explicit secret wire path" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const secret = "header.payload.signature";
+    const request: connect_protocol.BootstrapConsumeRequest = .{
+        .connect_protocol_version = connect_protocol.CONNECT_PROTOCOL_VERSION,
+        .grant_jwt = .{ .bytes = secret },
+        .expected_issuer = "https://connect.example.test",
+        .expected_audience = "https://runtime.example.test",
+        .client_nonce = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        .device_id = "dev_33333333333333333333333333333333",
+        .device_key_thumbprint = "kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k",
+    };
+    const response = try protocol.encodeOkResponse(allocator, 1, connect_protocol.BootstrapConsumeResult{
+        .connect_protocol_version = connect_protocol.CONNECT_PROTOCOL_VERSION,
+        .grant_id = "grt_66666666666666666666666666666666",
+        .device_id = request.device_id,
+        .scopes = &.{ "runtime:read", "chat:write" },
+        .expires_at_ms = 1_893_456_090_000,
+    });
+    defer allocator.free(response);
+    var mock: MockTransport = .{ .allocator = arena, .canned_response = response };
+    defer mock.deinit();
+    var client = Client.init(arena, &mock, MockTransport.send);
+
+    const generic = try client.encodeRequest(connect_protocol.METHOD_BOOTSTRAP_CONSUME, request);
+    defer {
+        std.crypto.secureZero(u8, generic.json);
+        arena.free(generic.json);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, generic.json, secret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, generic.json, connect_protocol.REDACTED_SECRET) != null);
+
+    client.next_id = 1;
+    var parsed = try client.callConnectBootstrapConsume(request);
+    defer parsed.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, mock.last_request.?, secret) != null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.last_request.?, connect_protocol.REDACTED_SECRET) == null);
+    const result = try client.decodeConnectBootstrapConsume(&parsed);
+    try std.testing.expectEqualStrings("grt_66666666666666666666666666666666", result.grant_id);
+    try std.testing.expectEqualStrings(request.device_id, result.device_id);
 }
 
 test "client parses error envelope via injected transport" {

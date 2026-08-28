@@ -19,7 +19,14 @@ Each device has at most one live access token and one unconsumed WebSocket
 ticket: issuing a replacement atomically invalidates the prior credential
 without consuming another device's bounded slot. A durable authorization
 rejection also clears that device's in-memory tokens and tickets.
-Direct non-loopback HTTPS and desktop credential import remain later slices.
+Direct non-loopback HTTPS remains a later slice. The native desktop pairs
+through the SSH-forwarded loopback transport today: Settings › Runtimes &
+connections › Add connection › **Pair this device** collects the grant id,
+masked one-time code, and device label, exchanges them over the forward, shows
+the returned runtime/instance identity for explicit confirmation, and then
+keeps only a credential reference in the profile (device credential in the OS
+Secret Service when available, otherwise process memory with a visible
+"pair again after relaunch" warning).
 
 ## Three separate concerns
 
@@ -124,21 +131,24 @@ lifecycle are not implemented yet.
 Pairing replaces repeated entry of the whole-runtime administrator token with
 a narrowly scoped, revocable device relationship.
 
-1. The operator currently runs `verde-daemon pair create` locally on the
-   runtime. The future `verde-server pair create` command is a convenience
-   wrapper over the same daemon-owned operation.
+1. The operator runs `verde-daemon pair create` locally on the runtime, or
+   `verde-server pair create` as a convenience wrapper over the same
+   daemon-owned operation.
 2. The runtime creates a cryptographically random, single-use grant with a
    short expiry and stores only its verifier.
 3. The command prints the grant once. URL/QR output is opt-in because terminals,
    screenshots, shell capture, and OS URL dispatch can retain the secret.
 4. A Pair client generates or selects its device identity and submits the grant
-   directly to the advertised runtime endpoint. The desktop import UI for this
-   step is not implemented yet.
+   directly to the advertised runtime endpoint. The desktop wizard's Pair step
+   does this over the SSH forward; there is no import string, the three grant
+   fields are typed or pasted (hex-filtered) and the code is wiped as soon as
+   the exchange starts.
 5. The runtime consumes the grant exactly once and creates a durable device
    record with explicit scopes.
-6. The client safeguards the returned device credential. The planned desktop
-   flow stores it in the OS credential store and keeps only a credential
-   reference in the runtime profile.
+6. The client safeguards the returned device credential. The desktop stores it
+   in the OS credential store (Linux Secret Service) and keeps only a
+   credential reference in the runtime profile; without a usable store it is
+   memory-only and the settings row says so.
 7. Later sessions use the device credential to obtain short-lived access and
    WebSocket credentials. The original pairing grant is never reused.
 
@@ -231,11 +241,12 @@ and reject unknown or duplicate scopes. Compatibility defaults are not used on
 authentication inputs.
 
 For the first account-free release, a high-entropy per-device secret stored as
-a verifier is acceptable over the approved encrypted SSH/TLS transport. Until
-desktop OS credential-store import lands, non-desktop Pair clients must protect
-the returned credential explicitly. The wire contract leaves room for
-proof-of-possession device keys so a later control-plane grant can be bound to
-the same device identity without changing the daemon protocol.
+a verifier is acceptable over the approved encrypted SSH/TLS transport. The
+desktop keeps the credential in the OS credential store by reference;
+non-desktop Pair clients must protect the returned credential explicitly. The
+wire contract leaves room for proof-of-possession device keys so a later
+control-plane grant can be bound to the same device identity without changing
+the daemon protocol.
 
 ## Direct endpoints
 
@@ -433,7 +444,16 @@ same connection driver and daemon client.
 4. **Network enforcement landed:** short-lived verifier-only access tokens,
    atomic one-use WebSocket tickets, prompt revocation/expiry checks, shared
    per-RPC scope enforcement, and `access.pair.v1` advertisement.
-5. Desktop pairing import and OS credential-store persistence.
+5. **Desktop pairing landed:** grant entry, identity confirmation, credential
+   reference in the profile, OS credential-store persistence with an explicit
+   memory-only fallback, forget/re-pair from Settings and the runtime picker.
+   **Desktop Connect onboarding partially landed:** control-plane URL entry
+   with discovery validation, OIDC PKCE loopback sign-in, runtime inventory
+   and selection, and endpoint/SPKI pinning into the profile. Connecting is
+   still blocked: the desktop has no direct HTTPS/WSS data plane with SPKI
+   pinning, and the runtime exposes no HTTP surface that consumes a Connect
+   bootstrap grant (it is consumed only via daemon IPC). The UI shows that
+   blocker instead of a fake connected state.
 6. Direct HTTPS/WSS profile support and certificate diagnostics.
 7. Shared resolver/driver supervision across SSH and HTTPS.
 8. Reconnectable PTYs, attachments, repositories, and provider login parity.
@@ -443,8 +463,12 @@ same connection driver and daemon client.
     with generic OIDC, runtime linking/discovery, signed and replay-safe grant
     issuance, revocation/audit, and an operator-managed external endpoint
     adapter.
-11. Runtime/desktop Connect CLI and outbound connector lifecycle, plus an
-    optional production managed-tunnel adapter behind the public interface.
+11. **Runtime Connect lifecycle landed:** owner-only daemon RPC/CLI login,
+    link, status, unlink, logout, durable identity-bound state, public-v1
+    proof/enrollment/JWE handling, bootstrap-grant validation, and the
+    provider-neutral external/test connector seam. Desktop direct data-plane
+    transport and an optional production managed-tunnel adapter remain future
+    work behind the public interface.
 12. Version-skew guidance and safe service installation/update lifecycle.
 
 The account-free Serve/Pair path is complete before Connect becomes a

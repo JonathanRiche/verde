@@ -30,6 +30,43 @@ pub fn callAlloc(allocator: std.mem.Allocator, call: Call) ![]u8 {
         std.crypto.secureZero(u8, authorization);
         allocator.free(authorization);
     }
+    var response = try postLoopbackAlloc(allocator, .{
+        .url = url,
+        .authorization = authorization,
+        .body = call.rpc_json,
+        .timeout_ms = call.timeout_ms,
+    });
+    errdefer response.deinit(allocator);
+    try validateStatus(response.status);
+    return response.body;
+}
+
+/// One bounded loopback POST whose status is returned instead of mapped, so
+/// the Pair auth endpoints can distinguish rejection from rate limiting.
+pub const LoopbackPost = struct {
+    url: []const u8,
+    /// Full header value (`Bearer …` or `VerdeDevice …`); zeroed by the caller.
+    authorization: ?[]const u8,
+    body: []const u8,
+    timeout_ms: i64 = DEFAULT_TIMEOUT_MS,
+};
+
+pub const LoopbackResponse = struct {
+    status: std.http.Status,
+    body: []u8,
+
+    pub fn deinit(self: *LoopbackResponse, allocator: std.mem.Allocator) void {
+        std.crypto.secureZero(u8, self.body);
+        allocator.free(self.body);
+        self.* = undefined;
+    }
+};
+
+pub fn postLoopbackAlloc(allocator: std.mem.Allocator, post: LoopbackPost) !LoopbackResponse {
+    if (!std.mem.startsWith(u8, post.url, "http://127.0.0.1:")) return error.InvalidPort;
+    if (post.body.len == 0) return error.EmptyRequest;
+    if (post.body.len > MAX_RPC_FRAME_BYTES) return error.RequestTooLarge;
+    if (post.timeout_ms <= 0 or post.timeout_ms > MAX_TIMEOUT_MS) return error.InvalidTimeout;
 
     const response_buffer = try allocator.alloc(u8, MAX_RPC_FRAME_BYTES);
     defer allocator.free(response_buffer);
@@ -49,14 +86,14 @@ pub fn callAlloc(allocator: std.mem.Allocator, call: Call) ![]u8 {
     // ambient HTTP(S)_PROXY configuration.
 
     const fetch_options: std.http.Client.FetchOptions = .{
-        .location = .{ .url = url },
+        .location = .{ .url = post.url },
         .method = .POST,
-        .payload = call.rpc_json,
+        .payload = post.body,
         .response_writer = &response_writer,
         .keep_alive = false,
         .redirect_behavior = .not_allowed,
         .headers = .{
-            .authorization = .{ .override = authorization },
+            .authorization = if (post.authorization) |value| .{ .override = value } else .omit,
             .content_type = .{ .override = "application/json" },
             .user_agent = .{ .override = "verde-desktop-runtime" },
         },
@@ -71,7 +108,7 @@ pub fn callAlloc(allocator: std.mem.Allocator, call: Call) ![]u8 {
     select.async(.fetch, std.http.Client.fetch, .{ &client, fetch_options });
     select.async(.timeout, std.Io.sleep, .{
         threaded.io(),
-        std.Io.Duration.fromMilliseconds(call.timeout_ms),
+        std.Io.Duration.fromMilliseconds(post.timeout_ms),
         .awake,
     });
     defer select.cancelDiscard();
@@ -90,8 +127,21 @@ pub fn callAlloc(allocator: std.mem.Allocator, call: Call) ![]u8 {
             return error.RequestTimedOut;
         },
     };
-    try validateStatus(result.status);
-    return try allocator.dupe(u8, response_writer.buffered());
+    const body = try allocator.dupe(u8, response_writer.buffered());
+    std.crypto.secureZero(u8, response_buffer);
+    return .{ .status = result.status, .body = body };
+}
+
+/// Maps a Pair auth endpoint status to a transport-level outcome. 401/403 is
+/// "this credential or grant is not accepted"; 429 is the runtime's own
+/// rate limit and must be surfaced to the user rather than retried blindly.
+pub fn validateAuthStatus(status: std.http.Status) !void {
+    return switch (status) {
+        .ok => {},
+        .unauthorized, .forbidden => error.AuthenticationRequired,
+        .too_many_requests => error.RateLimited,
+        else => validateStatus(status),
+    };
 }
 
 fn validateCall(call: Call) !void {

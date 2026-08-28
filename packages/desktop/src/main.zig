@@ -3657,6 +3657,9 @@ test {
     _ = @import("platform/workspace_identity.zig");
     _ = @import("runtime/gateway_transport.zig");
     _ = @import("runtime/connection.zig");
+    _ = @import("runtime/pair_client.zig");
+    _ = @import("runtime/credential_store.zig");
+    _ = @import("runtime/connect_client.zig");
     _ = @import("runtime/profile.zig");
     _ = @import("runtime/profile_store.zig");
     _ = @import("runtime/secret_store.zig");

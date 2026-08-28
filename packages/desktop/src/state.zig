@@ -2052,6 +2052,10 @@ pub const PaletteModalAction = enum {
     runtime_wizard_connect,
     runtime_wizard_done,
     runtime_wizard_input,
+    /// index = `WizardMethod` ordinal on the method chooser.
+    runtime_wizard_method,
+    /// index = Connect inventory row.
+    runtime_wizard_select,
     modal_dismiss,
     modal_block,
     project_rename_input,
@@ -2147,6 +2151,10 @@ pub const PaletteModalTextFocus = enum {
     runtime_wizard_user,
     runtime_wizard_ssh_port,
     runtime_wizard_gateway_port,
+    runtime_wizard_grant_id,
+    runtime_wizard_pairing_code,
+    runtime_wizard_device_label,
+    runtime_wizard_control_plane_url,
     command_palette,
 };
 
@@ -3200,6 +3208,12 @@ const RuntimeActivationAction = enum {
     enable,
     retry,
     request_credential,
+    /// Paired profile without a usable device credential: open the grant step
+    /// instead of the administrator-token modal.
+    request_pairing,
+    /// Connect profile: the desktop has no data plane yet, so activation opens
+    /// the editor, which states the exact blocker.
+    request_runtime_selection,
 };
 
 const RuntimeTrustContinuation = enum {
@@ -3229,6 +3243,14 @@ pub const RuntimePickerStatus = enum {
     unsupported,
     failed,
     unavailable,
+    /// Paired profile that has no device credential yet (or lost it).
+    pairing_required,
+    /// The runtime refused the one-time grant.
+    pairing_rejected,
+    /// The runtime is rate limiting Pair calls from this device.
+    rate_limited,
+    /// Connect profile awaiting the desktop data plane.
+    runtime_selection_required,
 };
 
 pub const RuntimePickerProfile = struct {
@@ -3250,21 +3272,31 @@ pub fn runtimePickerStatus(snapshot: RuntimeService.Snapshot) RuntimePickerStatu
         .ready => if (snapshot.execution_ready) .ready else .limited,
         .reconnecting => .reconnecting,
         .disabled, .failed => if (snapshot.failure) |failure| switch (failure) {
-            .missing_credential => .credential_required,
-            .unsupported_transport => .unsupported,
+            .missing_credential => if (snapshot.access == .paired_device) .pairing_required else .credential_required,
+            .unsupported_transport => if (snapshot.access == .connect) .runtime_selection_required else .unsupported,
             .authentication => .authentication_failed,
             .identity => .identity_mismatch,
             .network, .no_loopback_port, .tunnel_spawn, .tunnel_readiness, .tunnel_wait, .tunnel_exited => .connection_failed,
             .protocol, .resource => .failed,
-        } else if (snapshot.phase == .disabled) .offline else .failed,
+            .pairing_rejected => .pairing_rejected,
+            .rate_limited => .rate_limited,
+        } else if (snapshot.access == .connect)
+            .runtime_selection_required
+        else if (snapshot.access == .paired_device and !snapshot.credential_held and snapshot.pairing_state == .none)
+            .pairing_required
+        else if (snapshot.phase == .disabled) .offline else .failed,
     };
 }
 
 fn runtimeActivationAction(snapshot: RuntimeService.Snapshot) RuntimeActivationAction {
+    if (snapshot.access == .connect) return .request_runtime_selection;
     if (snapshot.failure) |failure| {
-        if (failure == .missing_credential or failure == .authentication) {
-            return .request_credential;
+        if (failure == .missing_credential or failure == .authentication or failure == .pairing_rejected) {
+            return if (snapshot.access == .paired_device) .request_pairing else .request_credential;
         }
+    }
+    if (snapshot.access == .paired_device and !snapshot.credential_held and snapshot.pairing_state == .none) {
+        return .request_pairing;
     }
     return switch (snapshot.phase) {
         .disabled => .enable,
@@ -3297,6 +3329,10 @@ pub fn runtimePickerStatusBadge(status: RuntimePickerStatus) []const u8 {
         .unsupported => "Unsupported",
         .failed => "Failed",
         .unavailable => "Unavailable",
+        .pairing_required => "Pair device",
+        .pairing_rejected => "Grant refused",
+        .rate_limited => "Rate limited",
+        .runtime_selection_required => "Choose runtime",
     };
 }
 
@@ -3310,6 +3346,10 @@ pub fn runtimePickerStatusDescription(status: RuntimePickerStatus) []const u8 {
         .unsupported => "This transport is not supported by the desktop",
         .failed => "The runtime connection failed",
         .unavailable => "This configured runtime is unavailable",
+        .pairing_required => "Redeem a one-time grant to pair this device",
+        .pairing_rejected => "The runtime refused the grant; mint a new one",
+        .rate_limited => "The runtime is rate limiting pairing; wait and retry",
+        .runtime_selection_required => "Sign in and choose a linked runtime (desktop data plane pending)",
         else => "Remote daemon over SSH",
     };
 }
@@ -4881,6 +4921,7 @@ pub const AppState = struct {
             changed = true;
         }
         changed = runtime_connections_controller.pollRuntimeConnectionsReadiness(self) or changed;
+        changed = runtime_connections_controller.pollRuntimeConnectionWizard(self) or changed;
         return self.maybePresentRuntimeTrustProposal() or changed;
     }
 
@@ -6450,6 +6491,9 @@ pub const AppState = struct {
     pub const openSettingsModal = settings_controller.openSettingsModal;
     pub const openRuntimeConnectionWizard = runtime_connections_controller.openRuntimeConnectionWizard;
     pub const openRuntimeConnectionEditor = runtime_connections_controller.openRuntimeConnectionEditor;
+    pub const openRuntimePairing = runtime_connections_controller.openRuntimePairing;
+    pub const chooseRuntimeWizardMethod = runtime_connections_controller.chooseRuntimeWizardMethod;
+    pub const selectRuntimeWizardConnectRuntime = runtime_connections_controller.selectRuntimeWizardConnectRuntime;
     pub const cancelRuntimeConnectionWizard = runtime_connections_controller.cancelRuntimeConnectionWizard;
     pub const runtimeConnectionWizardBack = runtime_connections_controller.runtimeConnectionWizardBack;
     pub const submitRuntimeConnectionWizard = runtime_connections_controller.submitRuntimeConnectionWizard;
@@ -11174,6 +11218,14 @@ pub const AppState = struct {
             return;
         };
         const action = runtimeActivationAction(snapshot);
+        if (action == .request_pairing) {
+            self.openRuntimePairing(profile_id);
+            return;
+        }
+        if (action == .request_runtime_selection) {
+            self.openRuntimeConnectionEditor(profile_id);
+            return;
+        }
         if (action == .request_credential) {
             // Stop retries and wipe any rejected credential before the user
             // starts editing its replacement. The modal owns the sole UI copy.
@@ -11196,7 +11248,7 @@ pub const AppState = struct {
                 break :blk null;
             },
             .none => null,
-            .request_credential => unreachable,
+            .request_credential, .request_pairing, .request_runtime_selection => unreachable,
         };
         if (start_error) |err| {
             if (err == error.MissingRuntimeCredential) {
@@ -11539,6 +11591,8 @@ pub const AppState = struct {
                 .runtime_wizard_submit,
                 .runtime_wizard_connect,
                 .runtime_wizard_done,
+                .runtime_wizard_method,
+                .runtime_wizard_select,
                 .settings_control,
                 .settings_runtime_action,
                 .settings_theme_option,

@@ -16,6 +16,12 @@ const db_types = @import("../db/types.zig");
 const process_registry = @import("../daemon/process_registry.zig");
 const repository_path = @import("../daemon/repository_path.zig");
 const access_store = @import("../daemon/access_store.zig");
+const connect_auth = @import("../daemon/connect_auth.zig");
+const connect_client = @import("../daemon/connect_client.zig");
+const connect_grants = @import("../daemon/connect_grants.zig");
+const connect_keys = @import("../daemon/connect_keys.zig");
+const connect_lifecycle = @import("../daemon/connect_lifecycle.zig");
+const connect_store = @import("../daemon/connect_store.zig");
 const daemon_store = @import("../daemon/store.zig");
 const daemon_runtime_identity = @import("../daemon/runtime_identity.zig");
 const mcp_http = @import("../mcp/http_server.zig");
@@ -37,6 +43,7 @@ const log = std.log.scoped(.sessionizer);
 const store_protocol = headless.store;
 const changes_protocol = headless.changes_protocol;
 const access_protocol = headless.access_protocol;
+const connect_protocol = headless.connect_protocol;
 const change_journal = @import("../daemon/change_journal.zig");
 
 pub const SOCKET_NAME = "verde-sessionizer.sock";
@@ -215,6 +222,25 @@ const AccessRequest = union(enum) {
             ),
             else => {},
         }
+    }
+};
+
+const ConnectRequest = union(enum) {
+    login: connect_protocol.LoginRequest,
+    link: connect_protocol.LinkRequest,
+    status: connect_protocol.StatusRequest,
+    unlink: connect_protocol.UnlinkRequest,
+    logout: connect_protocol.LogoutRequest,
+    bootstrap_consume: connect_protocol.BootstrapConsumeRequest,
+
+    fn protocolVersion(self: ConnectRequest) u32 {
+        return switch (self) {
+            inline else => |request| request.connect_protocol_version,
+        };
+    }
+
+    fn isMutating(self: ConnectRequest) bool {
+        return self != .status;
     }
 };
 
@@ -2704,6 +2730,7 @@ pub const Daemon = struct {
             return try errorResponseAlloc(self.allocator, id_value, "invalid_request", "missing method");
         const params = parsed.value.object.get("params") orelse .null;
         defer eraseAccessSecretParams(method, params);
+        defer eraseConnectSecretParams(method, params);
         if (try self.requestTargetRejection(id_value, parsed.value.object.get("target"))) |response| {
             return response;
         }
@@ -2755,6 +2782,7 @@ pub const Daemon = struct {
         // lockDaemon for SQLite work; route before the generic mutator drain gate.
         if (isStoreMethod(method)) return try self.handleStoreRequest(id_value, method, params);
         if (isAccessMethod(method)) return try self.handleAccessRequest(id_value, method, params);
+        if (isConnectMethod(method)) return try self.handleConnectRequest(id_value, method, params);
         // chat.turn.start owns its drain check under lockDaemon (unlocked serve
         // path); other mutators still gate here under the `.normal` outer lock.
         if (!std.mem.eql(u8, method, "chat.turn.start") and
@@ -2812,6 +2840,344 @@ pub const Daemon = struct {
         // Additive headless core methods; existing methods and error codes unchanged.
         if (std.mem.startsWith(u8, method, "core.")) return try self.coreResponse(id_value, method, params);
         return try errorResponseAlloc(self.allocator, id_value, "method_not_found", method);
+    }
+
+    /// Connect lifecycle stays behind the private session-daemon endpoint.
+    /// This owns its short bookkeeping/SQLite windows and never holds either
+    /// daemon lock while performing filesystem or control-plane I/O.
+    fn handleConnectRequest(
+        self: *Daemon,
+        id_value: std.json.Value,
+        method: []const u8,
+        params: std.json.Value,
+    ) ![]u8 {
+        var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const request = decodeConnectRequest(arena, method, params) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_PARAMS,
+                "invalid Connect request",
+            );
+        };
+        if (request.protocolVersion() != connect_protocol.CONNECT_PROTOCOL_VERSION) {
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_PROTOCOL_INCOMPATIBLE,
+                "Connect protocol version is incompatible",
+            );
+        }
+
+        var daemon_locked = true;
+        lockDaemon(self);
+        defer if (daemon_locked) self.mutex.unlock();
+        if (request.isMutating() and !self.accepting_mutations) {
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_STATE,
+                "daemon is preparing shutdown and is not accepting mutations",
+            );
+        }
+        const service = self.store_service orelse
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_CAPABILITY_UNAVAILABLE,
+                "store capability is unavailable",
+            );
+        if (service.draining) {
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_STATE,
+                "daemon store is draining",
+            );
+        }
+        if (request.isMutating()) _ = service.in_flight.fetchAdd(1, .monotonic);
+        self.mutex.unlock();
+        daemon_locked = false;
+        defer if (request.isMutating()) {
+            _ = service.in_flight.fetchSub(1, .monotonic);
+        };
+
+        var threaded = std.Io.Threaded.init_single_threaded;
+        const io = threaded.io();
+        return switch (request) {
+            .status => try self.connectStatusResponse(id_value, service, arena),
+            .login => |login_request| response: {
+                connect_protocol.validateControlPlaneUrl(login_request.control_plane_url) catch |err|
+                    return try connectErrorResponse(self.allocator, id_value, err);
+                connect_protocol.validateCredentialFile(login_request.credential_file) catch |err|
+                    return try connectErrorResponse(self.allocator, id_value, err);
+                var token = connect_auth.importCredential(
+                    arena,
+                    io,
+                    self.pref_path,
+                    login_request.credential_file,
+                ) catch |err| return try connectErrorResponse(self.allocator, id_value, err);
+                defer token.deinit(arena);
+                var request_id = connect_lifecycle.randomRequestId(io) catch |err|
+                    return try connectErrorResponse(self.allocator, id_value, err);
+                var http_transport: connect_client.HttpTransport = .{};
+                var login = connect_lifecycle.validateLogin(
+                    arena,
+                    http_transport.transport(),
+                    login_request.control_plane_url,
+                    token.bytes,
+                    &request_id,
+                ) catch |err| {
+                    connect_auth.remove(arena, io, self.pref_path) catch {};
+                    return try connectErrorResponse(self.allocator, id_value, err);
+                };
+                defer login.deinit(arena);
+                lockStoreService(service);
+                connect_store.recordLogin(
+                    service.store.conn,
+                    login_request.control_plane_url,
+                    login.issuer,
+                    login.signer_jwks_json,
+                    login.maximum_grant_lifetime_seconds,
+                    nowMs(),
+                ) catch |err| {
+                    service.mutex.unlock();
+                    connect_auth.remove(arena, io, self.pref_path) catch {};
+                    return try connectErrorResponse(self.allocator, id_value, err);
+                };
+                service.mutex.unlock();
+                break :response try self.connectStatusResponse(id_value, service, arena);
+            },
+            .link => |link_request| response: {
+                if (!std.mem.eql(u8, link_request.provider, "external") or
+                    link_request.external_descriptor == null)
+                {
+                    return try connectErrorResponse(self.allocator, id_value, error.UnsupportedEndpointProvider);
+                }
+                const descriptor = link_request.external_descriptor.?;
+                connect_protocol.validateRuntimeDescriptor(descriptor, self.runtime_id, self.instance_id) catch {
+                    return try connectErrorResponse(self.allocator, id_value, error.ConnectIdentityMismatch);
+                };
+                lockStoreService(service);
+                var state = connect_store.load(arena, service.store.conn) catch |err| {
+                    service.mutex.unlock();
+                    return try connectErrorResponse(self.allocator, id_value, err);
+                };
+                service.mutex.unlock();
+                defer state.deinit(arena);
+                if (state.link_id != null) {
+                    if (state.desired_state == .linked) {
+                        break :response try okValueResponse(self.allocator, id_value, state.status());
+                    }
+                    return try connectErrorResponse(self.allocator, id_value, error.ConnectAlreadyLinked);
+                }
+                const control_plane_url = state.control_plane_url orelse
+                    return try connectErrorResponse(self.allocator, id_value, error.ConnectLoginRequired);
+                const stable_request_id = if (state.desired_state == .linked and state.request_id != null)
+                    state.request_id.?
+                else request_id: {
+                    var generated = connect_lifecycle.randomRequestId(io) catch |err|
+                        return try connectErrorResponse(self.allocator, id_value, err);
+                    break :request_id try arena.dupe(u8, &generated);
+                };
+                lockStoreService(service);
+                connect_store.beginLink(service.store.conn, stable_request_id, link_request.provider, nowMs()) catch |err| {
+                    service.mutex.unlock();
+                    return try connectErrorResponse(self.allocator, id_value, err);
+                };
+                service.mutex.unlock();
+                var token = connect_auth.load(arena, io, self.pref_path) catch |err|
+                    return try self.recordConnectRetry(id_value, service, state.retry_attempt, err);
+                defer token.deinit(arena);
+                var keys = connect_keys.loadOrCreate(
+                    arena,
+                    io,
+                    self.pref_path,
+                    self.runtime_id,
+                    self.instance_id,
+                ) catch |err| return try self.recordConnectRetry(id_value, service, state.retry_attempt, err);
+                defer keys.clear();
+                var http_transport: connect_client.HttpTransport = .{};
+                var linked = connect_lifecycle.link(arena, http_transport.transport(), &keys, null, .{
+                    .control_plane_url = control_plane_url,
+                    .bearer_token = token.bytes,
+                    .runtime_id = self.runtime_id,
+                    .instance_id = self.instance_id,
+                    .request_id = stable_request_id,
+                    .provider = link_request.provider,
+                    .external_descriptor = descriptor,
+                    .now_seconds = @divFloor(nowMs(), std.time.ms_per_s),
+                }) catch |err| return try self.recordConnectRetry(id_value, service, state.retry_attempt, err);
+                defer linked.deinit(arena);
+                lockStoreService(service);
+                connect_store.recordLinked(service.store.conn, .{
+                    .link_id = linked.link_id,
+                    .enrollment_id = linked.enrollment_id,
+                    .endpoint_https_url = linked.endpoint_https_url,
+                    .endpoint_wss_url = linked.endpoint_wss_url,
+                    .connector_provider = linked.connector_provider,
+                }, linked.connector_running, nowMs()) catch |err| {
+                    service.mutex.unlock();
+                    return try connectErrorResponse(self.allocator, id_value, err);
+                };
+                service.mutex.unlock();
+                break :response try self.connectStatusResponse(id_value, service, arena);
+            },
+            .unlink => response: {
+                self.performConnectUnlink(service, arena, io) catch |err|
+                    return try connectErrorResponse(self.allocator, id_value, err);
+                break :response try self.connectStatusResponse(id_value, service, arena);
+            },
+            .logout => response: {
+                self.performConnectUnlink(service, arena, io) catch |err|
+                    return try connectErrorResponse(self.allocator, id_value, err);
+                connect_auth.remove(arena, io, self.pref_path) catch |err|
+                    return try connectErrorResponse(self.allocator, id_value, err);
+                lockStoreService(service);
+                connect_store.recordLogout(service.store.conn, nowMs()) catch |err| {
+                    service.mutex.unlock();
+                    return try connectErrorResponse(self.allocator, id_value, err);
+                };
+                service.mutex.unlock();
+                break :response try self.connectStatusResponse(id_value, service, arena);
+            },
+            .bootstrap_consume => |consume_request| response: {
+                defer std.crypto.secureZero(u8, @constCast(consume_request.grant_jwt.bytes));
+                lockStoreService(service);
+                var state = connect_store.load(arena, service.store.conn) catch |err| {
+                    service.mutex.unlock();
+                    return try connectErrorResponse(self.allocator, id_value, err);
+                };
+                service.mutex.unlock();
+                defer state.deinit(arena);
+                if (state.desired_state != .linked or state.lifecycle_state != .linked) {
+                    return try connectErrorResponse(self.allocator, id_value, error.ConnectLinkRequired);
+                }
+                const issuer = state.issuer orelse
+                    return try connectErrorResponse(self.allocator, id_value, error.ConnectLoginRequired);
+                const audience = state.endpoint_https_url orelse
+                    return try connectErrorResponse(self.allocator, id_value, error.ConnectLinkRequired);
+                const jwks_json = state.signer_jwks_json orelse
+                    return try connectErrorResponse(self.allocator, id_value, error.ConnectSignerUnavailable);
+                if (!std.mem.eql(u8, consume_request.expected_issuer, issuer) or
+                    !std.mem.eql(u8, consume_request.expected_audience, audience))
+                {
+                    return try connectErrorResponse(self.allocator, id_value, error.BootstrapIdentityMismatch);
+                }
+                var jwks = std.json.parseFromSlice(connect_client.Jwks, arena, jwks_json, .{
+                    .allocate = .alloc_always,
+                }) catch return try connectErrorResponse(self.allocator, id_value, error.ConnectSignerUnavailable);
+                defer jwks.deinit();
+                lockStoreService(service);
+                var consumed = connect_grants.consume(arena, service.store.conn, .{
+                    .compact_jwt = consume_request.grant_jwt.reveal(),
+                    .jwks = jwks.value.keys,
+                    .expected_issuer = issuer,
+                    .expected_audience = audience,
+                    .runtime_id = self.runtime_id,
+                    .instance_id = self.instance_id,
+                    .device_id = consume_request.device_id,
+                    .device_key_thumbprint = consume_request.device_key_thumbprint,
+                    .client_nonce = consume_request.client_nonce,
+                    .now_ms = nowMs(),
+                    .maximum_lifetime_seconds = state.maximum_grant_lifetime_seconds,
+                }) catch |err| {
+                    service.mutex.unlock();
+                    return try connectErrorResponse(self.allocator, id_value, err);
+                };
+                service.mutex.unlock();
+                defer consumed.deinit(arena);
+                const result: connect_protocol.BootstrapConsumeResult = .{
+                    .connect_protocol_version = connect_protocol.CONNECT_PROTOCOL_VERSION,
+                    .grant_id = consumed.grant_id,
+                    .device_id = consumed.device_id,
+                    .scopes = consumed.scopes,
+                    .expires_at_ms = consumed.expires_at_ms,
+                };
+                break :response try okValueResponse(self.allocator, id_value, result);
+            },
+        };
+    }
+
+    fn connectStatusResponse(
+        self: *Daemon,
+        id_value: std.json.Value,
+        service: *StoreService,
+        allocator: std.mem.Allocator,
+    ) ![]u8 {
+        lockStoreService(service);
+        var state = connect_store.load(allocator, service.store.conn) catch |err| {
+            service.mutex.unlock();
+            return try connectErrorResponse(self.allocator, id_value, err);
+        };
+        service.mutex.unlock();
+        defer state.deinit(allocator);
+        return try okValueResponse(self.allocator, id_value, state.status());
+    }
+
+    fn recordConnectRetry(
+        self: *Daemon,
+        id_value: std.json.Value,
+        service: *StoreService,
+        previous_attempt: u16,
+        err: anyerror,
+    ) ![]u8 {
+        const attempt = previous_attempt +| 1;
+        const delay_ms = connectRetryDelayMs(self.runtime_id, attempt);
+        lockStoreService(service);
+        connect_store.recordRetry(
+            service.store.conn,
+            @errorName(err),
+            attempt,
+            nowMs() + delay_ms,
+            nowMs(),
+        ) catch {};
+        service.mutex.unlock();
+        return try connectErrorResponse(self.allocator, id_value, err);
+    }
+
+    fn performConnectUnlink(
+        self: *Daemon,
+        service: *StoreService,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+    ) !void {
+        lockStoreService(service);
+        var state = connect_store.load(allocator, service.store.conn) catch |err| {
+            service.mutex.unlock();
+            return err;
+        };
+        service.mutex.unlock();
+        defer state.deinit(allocator);
+        lockStoreService(service);
+        connect_store.beginUnlink(service.store.conn, nowMs()) catch |err| {
+            service.mutex.unlock();
+            return err;
+        };
+        service.mutex.unlock();
+        if (state.link_id) |link_id| {
+            const control_plane_url = state.control_plane_url orelse return error.ConnectStateCorrupt;
+            var token = try connect_auth.load(allocator, io, self.pref_path);
+            defer token.deinit(allocator);
+            var request_id = try connect_lifecycle.randomRequestId(io);
+            var http_transport: connect_client.HttpTransport = .{};
+            try connect_lifecycle.unlink(
+                allocator,
+                http_transport.transport(),
+                control_plane_url,
+                token.bytes,
+                link_id,
+                self.runtime_id,
+                self.instance_id,
+                &request_id,
+            );
+        }
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        try connect_store.recordUnlinked(service.store.conn, nowMs());
     }
 
     /// Access storage stays behind the private session-daemon endpoint. Local
@@ -9940,6 +10306,62 @@ fn decodeAccessRequest(
     return error.UnknownAccessMethod;
 }
 
+fn decodeConnectRequest(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    params: std.json.Value,
+) !ConnectRequest {
+    if (std.mem.eql(u8, method, connect_protocol.METHOD_LOGIN)) {
+        return .{ .login = try std.json.parseFromValueLeaky(
+            connect_protocol.LoginRequest,
+            allocator,
+            params,
+            .{},
+        ) };
+    }
+    if (std.mem.eql(u8, method, connect_protocol.METHOD_LINK)) {
+        return .{ .link = try std.json.parseFromValueLeaky(
+            connect_protocol.LinkRequest,
+            allocator,
+            params,
+            .{},
+        ) };
+    }
+    if (std.mem.eql(u8, method, connect_protocol.METHOD_STATUS)) {
+        return .{ .status = try std.json.parseFromValueLeaky(
+            connect_protocol.StatusRequest,
+            allocator,
+            params,
+            .{},
+        ) };
+    }
+    if (std.mem.eql(u8, method, connect_protocol.METHOD_UNLINK)) {
+        return .{ .unlink = try std.json.parseFromValueLeaky(
+            connect_protocol.UnlinkRequest,
+            allocator,
+            params,
+            .{},
+        ) };
+    }
+    if (std.mem.eql(u8, method, connect_protocol.METHOD_LOGOUT)) {
+        return .{ .logout = try std.json.parseFromValueLeaky(
+            connect_protocol.LogoutRequest,
+            allocator,
+            params,
+            .{},
+        ) };
+    }
+    if (std.mem.eql(u8, method, connect_protocol.METHOD_BOOTSTRAP_CONSUME)) {
+        return .{ .bootstrap_consume = try std.json.parseFromValueLeaky(
+            connect_protocol.BootstrapConsumeRequest,
+            allocator,
+            params,
+            .{},
+        ) };
+    }
+    return error.UnknownConnectMethod;
+}
+
 fn eraseAccessSecretParams(method: []const u8, params: std.json.Value) void {
     if (params != .object) return;
     const field = if (std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_EXCHANGE))
@@ -9950,6 +10372,82 @@ fn eraseAccessSecretParams(method: []const u8, params: std.json.Value) void {
         return;
     const value = params.object.get(field) orelse return;
     if (value == .string) std.crypto.secureZero(u8, @constCast(value.string));
+}
+
+fn eraseConnectSecretParams(method: []const u8, params: std.json.Value) void {
+    if (!std.mem.eql(u8, method, connect_protocol.METHOD_BOOTSTRAP_CONSUME) or params != .object) return;
+    const value = params.object.get("grant_jwt") orelse return;
+    if (value == .string) std.crypto.secureZero(u8, @constCast(value.string));
+}
+
+fn connectRetryDelayMs(runtime_id: []const u8, attempt: u16) i64 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(runtime_id, &digest, .{});
+    const exponent: u4 = @intCast(@min(attempt, 8));
+    const base: u64 = @min(@as(u64, 300_000), @as(u64, 1_000) << exponent);
+    var prng = std.Random.DefaultPrng.init(std.mem.readInt(u64, digest[0..8], .big) ^ @as(u64, attempt));
+    const jitter = prng.random().uintLessThan(u64, @max(@as(u64, 1), base / 4));
+    return @intCast(@min(@as(u64, 300_000), base + jitter));
+}
+
+fn connectErrorResponse(
+    allocator: std.mem.Allocator,
+    id_value: std.json.Value,
+    err: anyerror,
+) ![]u8 {
+    const mapped: struct { code: []const u8, message: []const u8 } = switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.IncompatibleConnectProtocol => .{
+            .code = headless.protocol.ERR_PROTOCOL_INCOMPATIBLE,
+            .message = "Connect protocol version is incompatible",
+        },
+        error.InvalidControlPlaneUrl,
+        error.InsecureControlPlaneUrl,
+        error.InvalidCredentialFile,
+        error.InsecureCredentialPermissions,
+        error.InvalidConnectCredential,
+        error.UnsupportedEndpointProvider,
+        error.ExternalDescriptorRequired,
+        error.InvalidConnectRequestId,
+        => .{ .code = headless.protocol.ERR_INVALID_PARAMS, .message = "invalid Connect parameters" },
+        error.ConnectLoginRequired,
+        error.ConnectLinkRequired,
+        error.ConnectAlreadyLinked,
+        => .{ .code = headless.protocol.ERR_INVALID_STATE, .message = "Connect lifecycle state does not allow this operation" },
+        error.ConnectAuthenticationRejected => .{ .code = "authentication_rejected", .message = "Connect credential was not accepted" },
+        error.ConnectConflict,
+        error.ConnectBootstrapReplay,
+        => .{ .code = headless.protocol.ERR_CONFLICT, .message = "Connect request conflicts with durable state" },
+        error.ConnectIdentityMismatch,
+        error.ConnectKeyIdentityMismatch,
+        error.LinkIdentityMismatch,
+        error.EnrollmentIdentityMismatch,
+        error.BootstrapIdentityMismatch,
+        => .{ .code = headless.protocol.ERR_RUNTIME_IDENTITY_MISMATCH, .message = "Connect identity binding failed" },
+        error.BootstrapGrantExpired => .{ .code = "grant_expired", .message = "Connect bootstrap grant expired" },
+        error.UnknownBootstrapKey,
+        error.InvalidBootstrapSignature,
+        error.InvalidBootstrapGrant,
+        => .{ .code = "grant_rejected", .message = "Connect bootstrap grant was rejected" },
+        error.ConnectRateLimited => .{ .code = "rate_limited", .message = "Connect control plane rate limited the request" },
+        error.ConnectStateCorrupt,
+        error.ConnectStateMissing,
+        error.ConnectSignerUnavailable,
+        error.InvalidConnectKeyFile,
+        => .{ .code = headless.protocol.ERR_STORE_CORRUPT, .message = "Connect durable state is unavailable" },
+        error.ControlPlaneTimedOut,
+        error.ConnectUnavailable,
+        error.ControlPlaneResponseTooLarge,
+        error.ControlPlaneRedirectRejected,
+        error.InvalidConnectDiscovery,
+        error.InvalidSignerMetadata,
+        error.InvalidSignerJwks,
+        error.ConnectCapabilityMissing,
+        error.InvalidControlPlaneResponse,
+        => .{ .code = headless.protocol.ERR_CAPABILITY_UNAVAILABLE, .message = "Connect control plane is unavailable or incompatible" },
+        else => .{ .code = headless.protocol.ERR_CAPABILITY_UNAVAILABLE, .message = "Connect control plane is unavailable or incompatible" },
+    };
+    return try errorResponseAllocWithData(allocator, id_value, mapped.code, mapped.message, null);
 }
 
 fn accessAdminErrorResponse(
@@ -10099,6 +10597,9 @@ fn methodRunsUnlocked(method: []const u8) bool {
         // Local access administration is daemon-owned SQLite work and takes
         // only its own short lockDaemon bookkeeping window.
         isAccessMethod(method) or
+        // Connect owns bounded filesystem/network work and takes the SQLite
+        // mutex only for its short durable transitions.
+        isConnectMethod(method) or
         // FX lifecycle persistence uses the store spine and owns its short
         // lockDaemon window, like the other unlocked mutation paths.
         isFxLifecycleMethod(method) or
@@ -10115,6 +10616,10 @@ fn isAccessMethod(method: []const u8) bool {
         std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_EXCHANGE) or
         std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_DEVICE_AUTHENTICATE) or
         std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_DEVICE_AUTHORIZE);
+}
+
+fn isConnectMethod(method: []const u8) bool {
+    return connect_protocol.isMethod(method);
 }
 
 fn isFxLifecycleMethod(method: []const u8) bool {
@@ -17169,4 +17674,24 @@ test "chat turn tail falls back to durable terminal record after consume" {
     var unknown_parsed = try std.json.parseFromSlice(std.json.Value, allocator, unknown, .{});
     defer unknown_parsed.deinit();
     try std.testing.expectEqualStrings("not_found", unknown_parsed.value.object.get("error").?.object.get("code").?.string);
+}
+
+test "Connect bootstrap RPC secret copies are erased and retry is bounded" {
+    const encoded = try std.testing.allocator.dupe(u8,
+        \\{"grant_jwt":"secret-bootstrap-grant"}
+    );
+    defer std.testing.allocator.free(encoded);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+    const secret = parsed.value.object.get("grant_jwt").?.string;
+    eraseConnectSecretParams(connect_protocol.METHOD_BOOTSTRAP_CONSUME, parsed.value);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** "secret-bootstrap-grant".len), secret);
+
+    var attempt: u16 = 0;
+    while (attempt < 1_024) : (attempt += 1) {
+        const delay = connectRetryDelayMs("0123456789abcdef0123456789abcdef", attempt);
+        try std.testing.expect(delay >= 1_000 and delay <= 300_000);
+    }
 }

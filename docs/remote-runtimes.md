@@ -152,7 +152,7 @@ Supported kinds:
 
 Keep the descriptor extensible enough for an external provisioner to return an `https` profile later, but do not add SaaS account fields to it.
 
-The first usable SSH slice keeps the gateway bearer only in desktop process memory. Selecting a profile with no hydrated token opens a masked credential modal; cancelling disables that profile and clears the token. The user must explicitly approve the complete runtime and instance IDs on first contact. The accepted identity pair is persisted in the non-secret profile transaction, but the bearer is wiped at shutdown and must be entered again after relaunch. OS credential-store hydration is future convenience, not a prerequisite for manual open-source use.
+The first usable SSH slice keeps the gateway bearer only in desktop process memory. Selecting a profile with no hydrated token opens a masked credential modal; cancelling disables that profile and clears the token. The user must explicitly approve the complete runtime and instance IDs on first contact. The accepted identity pair is persisted in the non-secret profile transaction, but the bearer is wiped at shutdown and must be entered again after relaunch. Account-free Pair avoids that: the wizard exchanges a one-time grant over the same SSH forward, confirms the runtime identity, and stores the device credential in the OS credential store by reference (memory-only fallback is stated in the UI).
 
 ## Connection manager
 

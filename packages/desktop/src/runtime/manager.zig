@@ -9,20 +9,30 @@ const std = @import("std");
 const headless = @import("headless");
 const connection = @import("connection.zig");
 const gateway_transport = @import("gateway_transport.zig");
+const pair_client = @import("pair_client.zig");
 const profile = @import("profile.zig");
 const profile_store = @import("profile_store.zig");
 const secret_store = @import("secret_store.zig");
 const tunnel_supervisor = @import("ssh_tunnel_supervisor.zig");
+
+const access_protocol = headless.access_protocol;
 
 pub const MAX_PORT_SELECTION_ATTEMPTS: usize = 8;
 pub const HEARTBEAT_INTERVAL_MS: u64 = 15_000;
 pub const MAX_RPC_METHOD_BYTES: usize = 128;
 pub const REPOSITORY_MANIFEST_CAPABILITY: []const u8 = "repositories.manifest.v1";
 pub const REPOSITORY_CHAT_ROUTE_CAPABILITY: []const u8 = "chat.repository_route.v1";
+/// Paired-device access tokens are re-minted this long before they expire so
+/// a heartbeat never races an expiry.
+pub const ACCESS_TOKEN_REFRESH_MARGIN_MS: u64 = 60_000;
+pub const ACCESS_TOKEN_MIN_REFRESH_DELAY_MS: u64 = 5_000;
+/// Suffix for the process-memory slot holding a paired device credential.
+pub const DEVICE_SECRET_SUFFIX: []const u8 = ".device";
 
 pub const TransportKind = enum {
     local_socket,
     ssh_tunnel,
+    connect,
 };
 
 /// Secret-free, stable failure categories for the desktop runtime picker.
@@ -39,6 +49,69 @@ pub const Failure = enum {
     identity,
     protocol,
     resource,
+    /// The runtime refused the one-time pairing grant (expired, revoked, or
+    /// already used). The user must mint a new grant on the runtime.
+    pairing_rejected,
+    /// The runtime's Pair endpoints are rate limiting this device.
+    rate_limited,
+};
+
+/// Where a paired profile is in the one-time grant exchange.
+pub const PairingState = enum {
+    none,
+    /// The grant is being exchanged over the tunnel.
+    exchanging,
+    /// The runtime accepted the grant; the identity awaits user confirmation.
+    awaiting_confirmation,
+};
+
+/// Secret input for one exchange. The manager copies and zeroes it.
+pub const PairingInput = struct {
+    grant_id: []const u8,
+    pairing_token: []const u8,
+    device_label: []const u8,
+};
+
+/// Non-secret outcome of a grant exchange, shown for confirmation before the
+/// device is persisted. Borrowed until the next manager mutation.
+pub const PairingResult = struct {
+    device_id: []const u8,
+    runtime_id: []const u8,
+    instance_id: []const u8,
+};
+
+/// One Pair auth POST over the supervised loopback port. Injected in tests.
+pub const AccessBackend = struct {
+    context: ?*anyopaque = null,
+    call: *const fn (
+        ?*anyopaque,
+        std.mem.Allocator,
+        u16,
+        []const u8,
+        ?[]const u8,
+        []const u8,
+    ) pair_client.Error![]u8,
+    retain_context: ?*const fn (?*anyopaque) void = null,
+    release_context: ?*const fn (?*anyopaque) void = null,
+
+    pub fn system() AccessBackend {
+        return .{ .call = callSystemAccess };
+    }
+
+    fn validateLifetime(self: AccessBackend) !void {
+        if (self.context == null) return;
+        if (self.retain_context == null or self.release_context == null) {
+            return error.UnsafeRpcBackendLifetime;
+        }
+    }
+
+    fn retainContext(self: AccessBackend) void {
+        if (self.retain_context) |retain| retain(self.context);
+    }
+
+    fn releaseContext(self: AccessBackend) void {
+        if (self.release_context) |release| release(self.context);
+    }
 };
 
 pub const RuntimeSnapshot = struct {
@@ -78,6 +151,13 @@ pub const Snapshot = struct {
     /// runtime+instance target and the daemon checks it in the same dispatch;
     /// a separate heartbeat alone cannot authorize later mutation.
     execution_ready: bool,
+    access: profile.AccessKind = .admin_token,
+    pairing_state: PairingState = .none,
+    /// Whether a paired device credential is hydrated in memory. Never the value.
+    device_credential_held: bool = false,
+    /// Runtime-reported wall-clock expiry of the current paired access token.
+    access_token_expires_at_ms: ?i64 = null,
+    device_id: ?[]const u8 = null,
 };
 
 pub const RpcTicket = struct {
@@ -190,9 +270,40 @@ pub const Dependencies = struct {
     port_selector: PortSelector = PortSelector.system(),
     tunnel_backend: tunnel_supervisor.Backend = tunnel_supervisor.Backend.system(),
     rpc_backend: RpcBackend = RpcBackend.system(),
+    access_backend: AccessBackend = AccessBackend.system(),
+    /// False keeps paired device credentials in process memory only (tests
+    /// and callers that must never touch the OS keyring).
+    durable_credentials: bool = true,
 };
 
 pub const ProfileReplacement = enum { label_only, endpoint_changed };
+
+/// Owned copy of a grant awaiting exchange. Zeroed on release.
+const PendingGrant = struct {
+    grant_id: []u8,
+    pairing_token: []u8,
+    device_label: []u8,
+
+    fn deinit(self: *PendingGrant, allocator: std.mem.Allocator) void {
+        allocator.free(self.grant_id);
+        eraseAndFree(allocator, self.pairing_token);
+        allocator.free(self.device_label);
+        self.* = undefined;
+    }
+};
+
+const OwnedPairingResult = struct {
+    device_id: []u8,
+    runtime_id: []u8,
+    instance_id: []u8,
+
+    fn deinit(self: *OwnedPairingResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.device_id);
+        allocator.free(self.runtime_id);
+        allocator.free(self.instance_id);
+        self.* = undefined;
+    }
+};
 
 const Entry = struct {
     owned_profile: profile.Profile,
@@ -204,6 +315,11 @@ const Entry = struct {
     handshake: ?*HandshakeTask = null,
     rpc_task: ?*RpcTask = null,
     rpc_result: ?CompletedRpc = null,
+    access_task: ?*AccessTask = null,
+    pending_grant: ?PendingGrant = null,
+    pairing_result: ?OwnedPairingResult = null,
+    access_token_expires_at_ms: ?i64 = null,
+    access_token_refresh_at_ms: ?u64 = null,
     healthy_generation: ?u64 = null,
     last_heartbeat_ms: ?u64 = null,
     next_heartbeat_at_ms: ?u64 = null,
@@ -217,10 +333,17 @@ const Entry = struct {
             task.handoffToProcessReaper();
         }
         if (self.rpc_task) |task| task.handoffToProcessReaper();
+        if (self.access_task) |task| task.handoffToProcessReaper();
         if (self.rpc_result) |*completed| completed.result.deinit();
+        if (self.pending_grant) |*grant| grant.deinit(allocator);
+        if (self.pairing_result) |*result| result.deinit(allocator);
         self.connection_state.deinit();
         self.owned_profile.deinit(allocator);
         self.* = undefined;
+    }
+
+    fn isPaired(self: *const Entry) bool {
+        return self.owned_profile.access == .paired_device;
     }
 };
 
@@ -240,6 +363,7 @@ pub const Manager = struct {
     ) !Manager {
         if (profiles.len > profile.MAX_PROFILES) return error.TooManyProfiles;
         try dependencies.rpc_backend.validateLifetime();
+        try dependencies.access_backend.validateLifetime();
         var self: Manager = .{
             .allocator = allocator,
             .io = io,
@@ -324,9 +448,179 @@ pub const Manager = struct {
         if (entry.tunnel_owned) entry.supervisor.stop();
         self.collectTerminalTunnel(entry);
         const forgot_token = self.secrets.remove(profile_id);
+        var device_key_buffer: DeviceSecretKeyBuffer = undefined;
+        _ = self.secrets.remove(deviceSecretKey(&device_key_buffer, profile_id));
         var removed = self.entries.orderedRemove(index);
         removed.deinit(self.allocator);
         return forgot_token;
+    }
+
+    /// Hydrates the paired device credential (never the short-lived access
+    /// token) from the credential store. Replacing it invalidates the live
+    /// generation exactly like replacing an administrator token.
+    pub fn hydrateDeviceCredential(self: *Manager, profile_id: []const u8, credential: []const u8) !void {
+        const entry = self.findEntry(profile_id) orelse return error.UnknownRuntimeProfile;
+        if (!entry.isPaired()) return error.ProfileAccessMismatch;
+        try access_protocol.validateSecret(credential);
+        var key_buffer: DeviceSecretKeyBuffer = undefined;
+        const key = deviceSecretKey(&key_buffer, profile_id);
+        if (self.secrets.get(key)) |previous| {
+            if (!std.mem.eql(u8, previous, credential)) {
+                try entry.connection_state.disable();
+                clearHealth(entry);
+                entry.failure_override = null;
+                if (entry.tunnel_owned) entry.supervisor.stop();
+                self.collectTerminalTunnel(entry);
+                _ = self.secrets.remove(profile_id);
+            }
+        }
+        try self.secrets.put(key, credential);
+        if (entry.failure_override == .missing_credential) entry.failure_override = null;
+    }
+
+    /// Forgets the device credential and any minted access token, invalidating
+    /// the live generation first. Returns whether a credential was held.
+    pub fn clearDeviceCredential(self: *Manager, profile_id: []const u8) !bool {
+        const entry = self.findEntry(profile_id) orelse return error.UnknownRuntimeProfile;
+        try entry.connection_state.disable();
+        clearHealth(entry);
+        entry.failure_override = null;
+        entry.access_token_expires_at_ms = null;
+        entry.access_token_refresh_at_ms = null;
+        if (entry.tunnel_owned) entry.supervisor.stop();
+        self.collectTerminalTunnel(entry);
+        _ = self.secrets.remove(profile_id);
+        var key_buffer: DeviceSecretKeyBuffer = undefined;
+        return self.secrets.remove(deviceSecretKey(&key_buffer, profile_id));
+    }
+
+    /// Stores a one-time grant for the next attempt and starts it. The grant is
+    /// exchanged exactly once; the resulting identity waits for confirmation.
+    pub fn beginPairing(self: *Manager, profile_id: []const u8, input: PairingInput, now_ms: u64) !void {
+        const index = self.findEntryIndex(profile_id) orelse return error.UnknownRuntimeProfile;
+        const entry = &self.entries.items[index];
+        if (!entry.isPaired()) return error.ProfileAccessMismatch;
+        if (entry.owned_profile.transport != .ssh_tunnel) {
+            entry.failure_override = .unsupported_transport;
+            return error.UnsupportedRuntimeTransport;
+        }
+        try access_protocol.validateGrantId(input.grant_id);
+        try access_protocol.validateSecret(input.pairing_token);
+        try access_protocol.validateDeviceLabel(input.device_label);
+
+        const grant_id = try self.allocator.dupe(u8, input.grant_id);
+        errdefer self.allocator.free(grant_id);
+        const pairing_token = try self.allocator.dupe(u8, input.pairing_token);
+        errdefer eraseAndFree(self.allocator, pairing_token);
+        const device_label = try self.allocator.dupe(u8, input.device_label);
+        errdefer self.allocator.free(device_label);
+
+        // A re-pair replaces the old device entirely: old credential, token,
+        // trust, and any unconfirmed previous exchange.
+        try entry.connection_state.disable();
+        clearHealth(entry);
+        if (entry.tunnel_owned) entry.supervisor.stop();
+        self.collectTerminalTunnel(entry);
+        self.dropPairingState(entry);
+        entry.pending_grant = .{
+            .grant_id = grant_id,
+            .pairing_token = pairing_token,
+            .device_label = device_label,
+        };
+        const generation = try entry.connection_state.enable();
+        entry.failure_override = null;
+        if (!entry.tunnel_owned and entry.handshake == null and entry.access_task == null) {
+            try self.startAttempt(index, generation, now_ms);
+        }
+    }
+
+    /// Cancels an unconfirmed pairing: disables the connection, stops the
+    /// tunnel, and wipes the grant plus any device credential it produced.
+    /// The runtime may still list an orphaned device; the UI says so.
+    pub fn abandonPairing(self: *Manager, profile_id: []const u8) !void {
+        const entry = self.findEntry(profile_id) orelse return error.UnknownRuntimeProfile;
+        try entry.connection_state.disable();
+        clearHealth(entry);
+        entry.failure_override = null;
+        if (entry.tunnel_owned) entry.supervisor.stop();
+        self.collectTerminalTunnel(entry);
+        self.dropPairingState(entry);
+    }
+
+    /// Borrowed exchange result awaiting confirmation, if any.
+    pub fn pairingResult(self: *const Manager, profile_id: []const u8) ?PairingResult {
+        const entry = self.findEntryConst(profile_id) orelse return null;
+        const result = entry.pairing_result orelse return null;
+        return .{
+            .device_id = result.device_id,
+            .runtime_id = result.runtime_id,
+            .instance_id = result.instance_id,
+        };
+    }
+
+    /// Installs the persisted paired profile (device reference plus identity
+    /// pin) after the user confirmed the exchanged identity, keeping the
+    /// hydrated device credential, then starts a normal authenticated attempt.
+    pub fn completePairing(self: *Manager, configured_profile: profile.Profile, now_ms: u64) !void {
+        const index = self.findEntryIndex(configured_profile.id) orelse return error.UnknownRuntimeProfile;
+        if (configured_profile.access != .paired_device or !configured_profile.access.paired_device.isPaired()) {
+            return error.ProfileAccessMismatch;
+        }
+        {
+            const entry = &self.entries.items[index];
+            const result = entry.pairing_result orelse return error.PairingNotConfirmed;
+            const expected_runtime = configured_profile.expected_runtime_id orelse return error.PairingNotConfirmed;
+            const expected_instance = configured_profile.expected_instance_id orelse return error.PairingNotConfirmed;
+            if (!std.mem.eql(u8, result.runtime_id, expected_runtime) or
+                !std.mem.eql(u8, result.instance_id, expected_instance) or
+                !std.mem.eql(u8, result.device_id, configured_profile.access.paired_device.device_id.?))
+            {
+                return error.PairingIdentityMismatch;
+            }
+        }
+        try self.replaceEntryProfile(index, configured_profile);
+        try self.enable(configured_profile.id, now_ms);
+    }
+
+    fn dropPairingState(self: *Manager, entry: *Entry) void {
+        if (entry.pending_grant) |*grant| grant.deinit(self.allocator);
+        entry.pending_grant = null;
+        if (entry.pairing_result) |*result| result.deinit(self.allocator);
+        entry.pairing_result = null;
+        entry.access_token_expires_at_ms = null;
+        entry.access_token_refresh_at_ms = null;
+        _ = self.secrets.remove(entry.owned_profile.id);
+        var key_buffer: DeviceSecretKeyBuffer = undefined;
+        _ = self.secrets.remove(deviceSecretKey(&key_buffer, entry.owned_profile.id));
+    }
+
+    // Swaps the entry's profile and connection state without touching secrets
+    // so a confirmed pairing keeps its freshly exchanged credential.
+    fn replaceEntryProfile(self: *Manager, index: usize, configured_profile: profile.Profile) !void {
+        var owned_profile = try cloneProfile(self.allocator, configured_profile);
+        errdefer owned_profile.deinit(self.allocator);
+        var connection_state = try connection.Connection.init(
+            self.allocator,
+            owned_profile.id,
+            owned_profile.expected_runtime_id,
+            owned_profile.expected_instance_id,
+        );
+        errdefer connection_state.deinit();
+        const entry = &self.entries.items[index];
+        try entry.connection_state.disable();
+        clearHealth(entry);
+        if (entry.tunnel_owned) entry.supervisor.stop();
+        self.collectTerminalTunnel(entry);
+        if (entry.pending_grant) |*grant| grant.deinit(self.allocator);
+        if (entry.pairing_result) |*result| result.deinit(self.allocator);
+        var previous = self.entries.items[index];
+        previous.pending_grant = null;
+        previous.pairing_result = null;
+        self.entries.items[index] = .{
+            .owned_profile = owned_profile,
+            .connection_state = connection_state,
+        };
+        previous.deinit(self.allocator);
     }
 
     /// Replaces non-secret profile fields from an authoritative store reload.
@@ -339,8 +633,15 @@ pub const Manager = struct {
         const entry = &self.entries.items[index];
         if (profileEndpointsEqual(entry.owned_profile, configured_profile)) {
             const label = try self.allocator.dupe(u8, configured_profile.label);
+            errdefer self.allocator.free(label);
+            // Device references and Connect link ids are non-secret access
+            // metadata that may change without the peer changing.
+            var access = try cloneAccess(self.allocator, configured_profile.access);
             self.allocator.free(entry.owned_profile.label);
             entry.owned_profile.label = label;
+            entry.owned_profile.access.deinit(self.allocator);
+            entry.owned_profile.access = access;
+            access = .admin_token;
             return .label_only;
         }
         _ = try self.removeProfile(configured_profile.id);
@@ -377,7 +678,7 @@ pub const Manager = struct {
             entry.failure_override = .unsupported_transport;
             return error.UnsupportedRuntimeTransport;
         }
-        if (self.secrets.get(profile_id) == null) {
+        if (!self.entryHasStartCredential(entry)) {
             entry.failure_override = .missing_credential;
             return error.MissingRuntimeCredential;
         }
@@ -386,11 +687,25 @@ pub const Manager = struct {
         const generation = try entry.connection_state.enable();
         clearHealth(entry);
         entry.failure_override = null;
-        if (!entry.tunnel_owned and entry.handshake == null) {
+        if (!entry.tunnel_owned and entry.handshake == null and entry.access_task == null) {
             try self.startAttempt(index, generation, now_ms);
         } else if (entry.tunnel_owned) {
             entry.supervisor.stop();
         }
+    }
+
+    // Admin-token profiles need the bearer; paired profiles need the device
+    // credential or an unexchanged grant; Connect has no loopback path yet.
+    fn entryHasStartCredential(self: *const Manager, entry: *const Entry) bool {
+        return switch (entry.owned_profile.access) {
+            .admin_token => self.secrets.get(entry.owned_profile.id) != null,
+            .paired_device => blk: {
+                if (entry.pending_grant != null) break :blk true;
+                var key_buffer: DeviceSecretKeyBuffer = undefined;
+                break :blk self.secrets.get(deviceSecretKey(&key_buffer, entry.owned_profile.id)) != null;
+            },
+            .connect => false,
+        };
     }
 
     /// Invalidates all current work and requests exact SSH-tree termination.
@@ -409,7 +724,7 @@ pub const Manager = struct {
     pub fn retry(self: *Manager, profile_id: []const u8, now_ms: u64) !void {
         const index = self.findEntryIndex(profile_id) orelse return error.UnknownRuntimeProfile;
         const entry = &self.entries.items[index];
-        if (self.secrets.get(profile_id) == null) {
+        if (!self.entryHasStartCredential(entry)) {
             entry.failure_override = .missing_credential;
             return error.MissingRuntimeCredential;
         }
@@ -417,7 +732,7 @@ pub const Manager = struct {
         const generation = try entry.connection_state.retryFailed();
         clearHealth(entry);
         entry.failure_override = null;
-        if (!entry.tunnel_owned and entry.handshake == null) {
+        if (!entry.tunnel_owned and entry.handshake == null and entry.access_task == null) {
             try self.startAttempt(index, generation, now_ms);
         } else if (entry.tunnel_owned) {
             entry.supervisor.stop();
@@ -434,7 +749,7 @@ pub const Manager = struct {
     pub fn snapshot(self: *const Manager, profile_id: []const u8) ?Snapshot {
         const entry = self.findEntryConst(profile_id) orelse return null;
         var row = snapshotEntry(entry);
-        row.credential_held = self.secrets.get(profile_id) != null;
+        self.fillSecretPresence(entry, &row);
         return row;
     }
 
@@ -443,9 +758,15 @@ pub const Manager = struct {
         const snapshots = try allocator.alloc(Snapshot, self.entries.items.len);
         for (self.entries.items, 0..) |*entry, index| {
             snapshots[index] = snapshotEntry(entry);
-            snapshots[index].credential_held = self.secrets.get(entry.owned_profile.id) != null;
+            self.fillSecretPresence(entry, &snapshots[index]);
         }
         return snapshots;
+    }
+
+    fn fillSecretPresence(self: *const Manager, entry: *const Entry, row: *Snapshot) void {
+        row.credential_held = self.secrets.get(entry.owned_profile.id) != null;
+        var key_buffer: DeviceSecretKeyBuffer = undefined;
+        row.device_credential_held = self.secrets.get(deviceSecretKey(&key_buffer, entry.owned_profile.id)) != null;
     }
 
     /// Copies the verified identity plus its profile generation for a durable
@@ -589,8 +910,10 @@ pub const Manager = struct {
         // cannot be downgraded into a generic network reconnect.
         try self.observeTunnel(entry, now_ms);
         try self.collectHandshake(entry, now_ms);
+        try self.collectAccess(entry, now_ms);
         try self.collectRpc(entry, now_ms);
 
+        const workers_idle = entry.handshake == null and entry.access_task == null;
         switch (entry.connection_state.phase()) {
             .disabled, .failed => {
                 clearHealth(entry);
@@ -601,7 +924,7 @@ pub const Manager = struct {
                 clearHealth(entry);
                 if (entry.tunnel_owned) entry.supervisor.stop();
                 self.collectTerminalTunnel(entry);
-                if (!entry.tunnel_owned and entry.handshake == null) {
+                if (!entry.tunnel_owned and workers_idle) {
                     if (try entry.connection_state.reconnectIfDue(now_ms)) |generation| {
                         self.startAttempt(index, generation, now_ms) catch {};
                     }
@@ -609,14 +932,14 @@ pub const Manager = struct {
             },
             .connecting => {
                 clearHealth(entry);
-                if (!entry.tunnel_owned and entry.handshake == null) {
+                if (!entry.tunnel_owned and workers_idle) {
                     self.startAttempt(index, entry.connection_state.generation, now_ms) catch {};
-                } else if (entry.tunnel_owned and entry.handshake == null) {
+                } else if (entry.tunnel_owned and workers_idle) {
                     const tunnel = entry.supervisor.getSnapshot();
                     if (tunnel.lifecycle == .running and
                         entry.tunnel_generation == entry.connection_state.generation)
                     {
-                        try self.startHandshake(entry, now_ms);
+                        try self.advanceConnecting(entry, now_ms);
                     }
                 }
             },
@@ -625,7 +948,20 @@ pub const Manager = struct {
                 entry.failure_override = null;
                 if (!runtimeAdvertisesTargeting(entry)) {
                     try self.invalidateExecution(entry, .protocol, now_ms);
-                } else if (entry.rpc_task == null and heartbeatDue(entry, now_ms)) {
+                } else if (entry.isPaired() and entry.rpc_task == null and entry.access_task == null and
+                    accessTokenRefreshDue(entry, now_ms))
+                {
+                    // Re-mint before expiry; the fresh token replaces the old
+                    // one in place so the ready generation is preserved.
+                    self.startAccessTask(entry, .mint_access_token, now_ms) catch |err| {
+                        const failure: connection.FailureKind = switch (err) {
+                            error.MissingRuntimeCredential => .authentication,
+                            error.RelayNotReady, error.BearerLeaseAlreadyHeld => .network,
+                            else => .resource,
+                        };
+                        try self.invalidateExecution(entry, failure, now_ms);
+                    };
+                } else if (entry.rpc_task == null and entry.access_task == null and heartbeatDue(entry, now_ms)) {
                     self.startHeartbeat(entry) catch |err| {
                         const failure: connection.FailureKind = switch (err) {
                             error.MissingRuntimeCredential => .authentication,
@@ -646,7 +982,7 @@ pub const Manager = struct {
         now_ms: u64,
     ) !void {
         var entry = &self.entries.items[index];
-        if (self.secrets.get(entry.owned_profile.id) == null) {
+        if (!self.entryHasStartCredential(entry)) {
             _ = try entry.connection_state.failAttempt(
                 generation,
                 .authentication,
@@ -655,6 +991,13 @@ pub const Manager = struct {
             );
             entry.failure_override = .missing_credential;
             return error.MissingRuntimeCredential;
+        }
+        if (entry.isPaired()) {
+            // Access tokens are short lived and bound to the runtime session;
+            // every attempt mints a fresh one from the device credential.
+            _ = self.secrets.remove(entry.owned_profile.id);
+            entry.access_token_expires_at_ms = null;
+            entry.access_token_refresh_at_ms = null;
         }
 
         const local_port = self.selectUniquePort(index) catch |err| {
@@ -669,7 +1012,7 @@ pub const Manager = struct {
         };
         const ssh = switch (entry.owned_profile.transport) {
             .ssh_tunnel => |ssh| ssh,
-            .local_socket => return error.UnsupportedRuntimeTransport,
+            .local_socket, .connect => return error.UnsupportedRuntimeTransport,
         };
         entry.supervisor.startWithBackend(
             self.allocator,
@@ -739,6 +1082,247 @@ pub const Manager = struct {
             entry.supervisor.stop();
             return err;
         };
+    }
+
+    // With the tunnel up and no worker running, pick the next single relayed
+    // call: grant exchange, access-token mint, or the identity handshake.
+    fn advanceConnecting(self: *Manager, entry: *Entry, now_ms: u64) !void {
+        if (!entry.isPaired()) return self.startHandshake(entry, now_ms);
+        if (entry.pending_grant != null) return self.startAccessTask(entry, .pair_exchange, now_ms);
+        // An exchanged identity waits for the user; keep the tunnel warm.
+        if (entry.pairing_result != null) return;
+        if (self.secrets.get(entry.owned_profile.id) == null) {
+            return self.startAccessTask(entry, .mint_access_token, now_ms);
+        }
+        return self.startHandshake(entry, now_ms);
+    }
+
+    fn startAccessTask(self: *Manager, entry: *Entry, kind: AccessTaskKind, now_ms: u64) !void {
+        const generation = entry.tunnel_generation orelse return error.MissingTunnelGeneration;
+        if (entry.access_task != null) return error.RuntimeRpcBusy;
+        if (entry.supervisor.getSnapshot().lifecycle != .running) return error.RelayNotReady;
+        const local_port = entry.local_port orelse return error.MissingTunnelPort;
+
+        var body: []u8 = undefined;
+        var authorization: ?[]u8 = null;
+        var path: []const u8 = undefined;
+        switch (kind) {
+            .pair_exchange => {
+                const grant = entry.pending_grant orelse return error.PairingGrantMissing;
+                path = access_protocol.HTTP_PAIR_EXCHANGE_PATH;
+                body = try encodeExchangeBodyAlloc(self.allocator, grant);
+            },
+            .mint_access_token => {
+                var key_buffer: DeviceSecretKeyBuffer = undefined;
+                const credential = self.secrets.get(deviceSecretKey(&key_buffer, entry.owned_profile.id)) orelse {
+                    _ = try entry.connection_state.failAttempt(
+                        generation,
+                        .authentication,
+                        now_ms,
+                        reconnectJitter(entry, generation),
+                    );
+                    entry.failure_override = .missing_credential;
+                    entry.supervisor.stop();
+                    return error.MissingRuntimeCredential;
+                };
+                const device_id = switch (entry.owned_profile.access) {
+                    .paired_device => |device| device.device_id orelse return error.MissingRuntimeCredential,
+                    else => return error.ProfileAccessMismatch,
+                };
+                path = access_protocol.HTTP_ACCESS_TOKEN_PATH;
+                authorization = try pair_client.deviceAuthorizationAlloc(self.allocator, device_id, credential);
+                body = try encodeAccessTokenBodyAlloc(self.allocator);
+            },
+        }
+        defer eraseAndFree(self.allocator, body);
+        defer if (authorization) |value| eraseAndFree(self.allocator, value);
+
+        var bearer_lease = entry.supervisor.acquireBearerLease() catch {
+            if (entry.connection_state.phase() == .ready) return error.BearerLeaseAlreadyHeld;
+            _ = try entry.connection_state.failAttempt(
+                generation,
+                .network,
+                now_ms,
+                reconnectJitter(entry, generation),
+            );
+            entry.failure_override = .tunnel_readiness;
+            entry.supervisor.stop();
+            return;
+        };
+        defer bearer_lease.release();
+        entry.access_task = AccessTask.start(
+            generation,
+            kind,
+            local_port,
+            path,
+            authorization,
+            body,
+            self.dependencies.access_backend,
+            &bearer_lease,
+        ) catch |err| {
+            if (entry.connection_state.phase() != .ready) {
+                _ = try entry.connection_state.failAttempt(
+                    generation,
+                    .resource,
+                    now_ms,
+                    reconnectJitter(entry, generation),
+                );
+                entry.failure_override = .resource;
+                entry.supervisor.stop();
+            }
+            return err;
+        };
+    }
+
+    fn collectAccess(self: *Manager, entry: *Entry, now_ms: u64) !void {
+        const task = entry.access_task orelse return;
+        if (task.state.load(.acquire) != .finished) return;
+
+        const generation = task.generation;
+        const kind = task.kind;
+        const task_allocator = task.allocator;
+        var worker_result = task.takeResult();
+        task.releaseFields();
+        task_allocator.destroy(task);
+        entry.access_task = null;
+        defer worker_result.deinit(task_allocator);
+        if (!entry.tunnel_owned and entry.handshake == null) entry.local_port = null;
+
+        const current = entry.tunnel_owned and entry.tunnel_generation == generation and
+            entry.connection_state.generation == generation and
+            switch (entry.connection_state.phase()) {
+                .connecting, .ready => true,
+                else => false,
+            };
+        if (!current) return;
+
+        switch (worker_result) {
+            .failed => |failure| try self.failAccess(entry, generation, kind, failure, now_ms),
+            .response => |response| switch (kind) {
+                .pair_exchange => self.applyExchange(entry, generation, response, now_ms) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    error.PairingIdentityMismatch => try self.failAccess(entry, generation, kind, .identity, now_ms),
+                    else => try self.failAccess(entry, generation, kind, .protocol, now_ms),
+                },
+                .mint_access_token => self.applyAccessToken(entry, response, now_ms) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => try self.failAccess(entry, generation, kind, .protocol, now_ms),
+                },
+            },
+        }
+    }
+
+    fn failAccess(
+        self: *Manager,
+        entry: *Entry,
+        generation: u64,
+        kind: AccessTaskKind,
+        failure: AccessFailure,
+        now_ms: u64,
+    ) !void {
+        const connection_failure: connection.FailureKind = switch (failure) {
+            .authentication, .rate_limited => .authentication,
+            .network => .network,
+            .identity => .identity,
+            .protocol => .protocol,
+            .resource => .resource,
+        };
+        const override: Failure = switch (failure) {
+            .authentication => if (kind == .pair_exchange) .pairing_rejected else .authentication,
+            .rate_limited => .rate_limited,
+            .network => .network,
+            .identity => .identity,
+            .protocol => .protocol,
+            .resource => .resource,
+        };
+        // A rejected grant is one-shot: retrying it cannot succeed, so drop
+        // it and stop rather than scheduling reconnects against the runtime.
+        if (kind == .pair_exchange) {
+            if (entry.pending_grant) |*grant| grant.deinit(self.allocator);
+            entry.pending_grant = null;
+            _ = try entry.connection_state.failAttempt(
+                generation,
+                connection_failure,
+                now_ms,
+                reconnectJitter(entry, generation),
+            );
+            try entry.connection_state.disable();
+            entry.failure_override = override;
+            if (entry.tunnel_owned) entry.supervisor.stop();
+            return;
+        }
+        if (entry.connection_state.phase() == .ready) {
+            try self.invalidateExecution(entry, connection_failure, now_ms);
+        } else {
+            _ = try entry.connection_state.failAttempt(
+                generation,
+                connection_failure,
+                now_ms,
+                reconnectJitter(entry, generation),
+            );
+            if (entry.tunnel_owned) entry.supervisor.stop();
+        }
+        entry.failure_override = override;
+    }
+
+    // Validates the exchange response, stores the device credential in memory,
+    // and parks the identity for confirmation. A re-pair against a pinned
+    // profile must produce the same runtime.
+    fn applyExchange(self: *Manager, entry: *Entry, generation: u64, response: []const u8, now_ms: u64) !void {
+        _ = generation;
+        _ = now_ms;
+        var parsed = try std.json.parseFromSlice(ExchangeResponse, self.allocator, response, .{
+            .ignore_unknown_fields = true,
+        });
+        defer {
+            std.crypto.secureZero(u8, @constCast(parsed.value.device_credential));
+            parsed.deinit();
+        }
+        const value = parsed.value;
+        if (value.access_protocol_version != access_protocol.ACCESS_PROTOCOL_VERSION) return error.IncompatibleAccessProtocol;
+        try connection.validateRuntimeId(value.runtime_id);
+        try connection.validateRuntimeId(value.instance_id);
+        try access_protocol.validateDeviceId(value.device_id);
+        try access_protocol.validateSecret(value.device_credential);
+        if (entry.owned_profile.expected_runtime_id) |pinned| {
+            if (!std.mem.eql(u8, pinned, value.runtime_id)) return error.PairingIdentityMismatch;
+        }
+
+        const device_id = try self.allocator.dupe(u8, value.device_id);
+        errdefer self.allocator.free(device_id);
+        const runtime_id = try self.allocator.dupe(u8, value.runtime_id);
+        errdefer self.allocator.free(runtime_id);
+        const instance_id = try self.allocator.dupe(u8, value.instance_id);
+        errdefer self.allocator.free(instance_id);
+        var key_buffer: DeviceSecretKeyBuffer = undefined;
+        try self.secrets.put(deviceSecretKey(&key_buffer, entry.owned_profile.id), value.device_credential);
+
+        if (entry.pending_grant) |*grant| grant.deinit(self.allocator);
+        entry.pending_grant = null;
+        if (entry.pairing_result) |*previous| previous.deinit(self.allocator);
+        entry.pairing_result = .{
+            .device_id = device_id,
+            .runtime_id = runtime_id,
+            .instance_id = instance_id,
+        };
+    }
+
+    fn applyAccessToken(self: *Manager, entry: *Entry, response: []const u8, now_ms: u64) !void {
+        var parsed = try std.json.parseFromSlice(AccessTokenResponse, self.allocator, response, .{
+            .ignore_unknown_fields = true,
+        });
+        defer {
+            std.crypto.secureZero(u8, @constCast(parsed.value.access_token));
+            parsed.deinit();
+        }
+        const value = parsed.value;
+        if (value.access_protocol_version != access_protocol.ACCESS_PROTOCOL_VERSION) return error.IncompatibleAccessProtocol;
+        if (!std.mem.eql(u8, value.token_type, access_protocol.ACCESS_TOKEN_TYPE)) return error.UnexpectedTokenType;
+        try access_protocol.validateSecret(value.access_token);
+        try self.secrets.put(entry.owned_profile.id, value.access_token);
+        entry.access_token_expires_at_ms = value.expires_at_ms;
+        entry.access_token_refresh_at_ms = accessTokenRefreshAt(self.io, value.expires_at_ms, now_ms);
+        if (entry.failure_override == .missing_credential) entry.failure_override = null;
     }
 
     fn collectHandshake(_: *Manager, entry: *Entry, now_ms: u64) !void {
@@ -1117,6 +1701,237 @@ const TaskState = enum(u8) {
     abandoned,
 };
 
+const AccessTaskKind = enum {
+    pair_exchange,
+    mint_access_token,
+};
+
+const AccessFailure = enum {
+    authentication,
+    rate_limited,
+    network,
+    identity,
+    protocol,
+    resource,
+};
+
+const AccessWorkerResult = union(enum) {
+    response: []u8,
+    failed: AccessFailure,
+
+    fn deinit(self: *AccessWorkerResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .response => |response| eraseAndFree(allocator, response),
+            .failed => {},
+        }
+        self.* = undefined;
+    }
+};
+
+const ExchangeResponse = struct {
+    access_protocol_version: u32,
+    runtime_id: []const u8,
+    instance_id: []const u8,
+    device_id: []const u8,
+    device_credential: []const u8,
+};
+
+const AccessTokenResponse = struct {
+    access_protocol_version: u32,
+    access_token: []const u8,
+    token_type: []const u8,
+    expires_at_ms: i64,
+};
+
+pub const DeviceSecretKeyBuffer = [secret_store.MAX_PROFILE_ID_BYTES + DEVICE_SECRET_SUFFIX.len]u8;
+
+/// Process-memory slot for the paired device credential of one profile.
+pub fn deviceSecretKey(buffer: *DeviceSecretKeyBuffer, profile_id: []const u8) []const u8 {
+    const len = @min(profile_id.len, secret_store.MAX_PROFILE_ID_BYTES);
+    @memcpy(buffer[0..len], profile_id[0..len]);
+    @memcpy(buffer[len .. len + DEVICE_SECRET_SUFFIX.len], DEVICE_SECRET_SUFFIX);
+    return buffer[0 .. len + DEVICE_SECRET_SUFFIX.len];
+}
+
+fn encodeExchangeBodyAlloc(allocator: std.mem.Allocator, grant: PendingGrant) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    var stringify: std.json.Stringify = .{ .writer = &out.writer };
+    try stringify.beginObject();
+    try stringify.objectField("access_protocol_version");
+    try stringify.write(access_protocol.ACCESS_PROTOCOL_VERSION);
+    try stringify.objectField("grant_id");
+    try stringify.write(grant.grant_id);
+    try stringify.objectField("pairing_token");
+    try stringify.write(grant.pairing_token);
+    try stringify.objectField("device_label");
+    try stringify.write(grant.device_label);
+    try stringify.endObject();
+    return out.toOwnedSlice();
+}
+
+fn encodeAccessTokenBodyAlloc(allocator: std.mem.Allocator) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    var stringify: std.json.Stringify = .{ .writer = &out.writer };
+    try stringify.beginObject();
+    try stringify.objectField("access_protocol_version");
+    try stringify.write(access_protocol.ACCESS_PROTOCOL_VERSION);
+    try stringify.objectField("requested_scopes");
+    try stringify.write(&access_protocol.DEFAULT_SCOPE_NAMES);
+    try stringify.endObject();
+    return out.toOwnedSlice();
+}
+
+// The runtime reports wall-clock expiry; the manager runs on the caller's
+// monotonic `now_ms`. Convert once at mint time using the remaining TTL.
+fn accessTokenRefreshAt(io: std.Io, expires_at_ms: i64, now_ms: u64) u64 {
+    const wall_now_ms = std.Io.Clock.real.now(io).toMilliseconds();
+    const ttl_ms: u64 = if (expires_at_ms > wall_now_ms) @intCast(expires_at_ms - wall_now_ms) else 0;
+    const lead = ttl_ms -| ACCESS_TOKEN_REFRESH_MARGIN_MS;
+    return now_ms +| @max(lead, ACCESS_TOKEN_MIN_REFRESH_DELAY_MS);
+}
+
+fn accessTokenRefreshDue(entry: *const Entry, now_ms: u64) bool {
+    const refresh_at = entry.access_token_refresh_at_ms orelse return false;
+    return now_ms >= refresh_at;
+}
+
+const AccessTask = struct {
+    allocator: std.mem.Allocator,
+    generation: u64,
+    kind: AccessTaskKind,
+    local_port: u16,
+    path: []const u8,
+    authorization: ?[]u8,
+    body: []u8,
+    access_backend: AccessBackend,
+    bearer_lease: tunnel_supervisor.BearerLease,
+    worker: ?std.Thread = null,
+    state: std.atomic.Value(TaskState) = .init(.running),
+    result: ?AccessWorkerResult = null,
+
+    fn start(
+        generation: u64,
+        kind: AccessTaskKind,
+        local_port: u16,
+        path: []const u8,
+        authorization: ?[]const u8,
+        body: []const u8,
+        access_backend: AccessBackend,
+        bearer_lease: *tunnel_supervisor.BearerLease,
+    ) !*AccessTask {
+        try access_backend.validateLifetime();
+        const task_allocator = std.heap.page_allocator;
+        const task = try task_allocator.create(AccessTask);
+        errdefer task_allocator.destroy(task);
+        const authorization_copy = if (authorization) |value| try task_allocator.dupe(u8, value) else null;
+        errdefer if (authorization_copy) |value| eraseAndFree(task_allocator, value);
+        const body_copy = try task_allocator.dupe(u8, body);
+        errdefer eraseAndFree(task_allocator, body_copy);
+        access_backend.retainContext();
+        errdefer access_backend.releaseContext();
+        task.* = .{
+            .allocator = task_allocator,
+            .generation = generation,
+            .kind = kind,
+            .local_port = local_port,
+            .path = path,
+            .authorization = authorization_copy,
+            .body = body_copy,
+            .access_backend = access_backend,
+            .bearer_lease = bearer_lease.take(),
+        };
+        errdefer task.bearer_lease.release();
+        task.worker = try std.Thread.spawn(.{}, accessWorker, .{task});
+        return task;
+    }
+
+    fn releaseFields(self: *AccessTask) void {
+        if (self.result) |*result| result.deinit(self.allocator);
+        if (self.authorization) |value| eraseAndFree(self.allocator, value);
+        eraseAndFree(self.allocator, self.body);
+        self.access_backend.releaseContext();
+    }
+
+    fn takeResult(self: *AccessTask) AccessWorkerResult {
+        std.debug.assert(self.state.load(.acquire) == .finished);
+        if (self.worker) |worker| worker.join();
+        self.worker = null;
+        const result = self.result orelse unreachable;
+        self.result = null;
+        return result;
+    }
+
+    fn handoffToProcessReaper(self: *AccessTask) void {
+        const worker = self.worker orelse unreachable;
+        const previous = self.state.cmpxchgStrong(.running, .abandoned, .acq_rel, .acquire);
+        if (previous == null) {
+            worker.detach();
+            return;
+        }
+        std.debug.assert(previous.? == .finished);
+        worker.join();
+        const allocator = self.allocator;
+        self.releaseFields();
+        allocator.destroy(self);
+    }
+};
+
+fn accessWorker(task: *AccessTask) void {
+    task.result = if (task.access_backend.call(
+        task.access_backend.context,
+        task.allocator,
+        task.local_port,
+        task.path,
+        task.authorization,
+        task.body,
+    )) |response| blk: {
+        if (response.len > access_protocol.MAX_PAIR_EXCHANGE_BODY_BYTES) {
+            eraseAndFree(task.allocator, response);
+            break :blk .{ .failed = .protocol };
+        }
+        break :blk .{ .response = response };
+    } else |err| .{ .failed = mapAccessFailure(err) };
+    task.bearer_lease.release();
+    const previous = task.state.swap(.finished, .acq_rel);
+    switch (previous) {
+        .running => {},
+        .abandoned => {
+            const allocator = task.allocator;
+            task.releaseFields();
+            allocator.destroy(task);
+        },
+        .finished => unreachable,
+    }
+}
+
+fn mapAccessFailure(err: pair_client.Error) AccessFailure {
+    return switch (err) {
+        error.OutOfMemory => .resource,
+        error.AuthenticationRequired => .authentication,
+        error.RateLimited => .rate_limited,
+        error.NetworkUnavailable, error.RequestTimedOut, error.ConnectionClosed => .network,
+        error.ProtocolRejected => .protocol,
+    };
+}
+
+fn callSystemAccess(
+    _: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    local_port: u16,
+    path: []const u8,
+    authorization: ?[]const u8,
+    body: []const u8,
+) pair_client.Error![]u8 {
+    return pair_client.postAlloc(allocator, .{
+        .local_port = local_port,
+        .path = path,
+        .authorization = authorization,
+        .body = body,
+    });
+}
+
 const RpcTaskKind = union(enum) {
     heartbeat,
     user: RpcTicket,
@@ -1437,17 +2252,30 @@ fn heartbeatDue(entry: *const Entry, now_ms: u64) bool {
 }
 
 fn profileEndpointsEqual(current: profile.Profile, next: profile.Profile) bool {
+    if (current.access.kind() != next.access.kind()) return false;
     return switch (current.transport) {
         .local_socket => next.transport == .local_socket,
         .ssh_tunnel => |a| switch (next.transport) {
-            .local_socket => false,
+            .local_socket, .connect => false,
             .ssh_tunnel => |b| std.mem.eql(u8, a.host, b.host) and
                 a.port == b.port and
                 a.remote_gateway_port == b.remote_gateway_port and
                 ((a.user == null and b.user == null) or
                     (a.user != null and b.user != null and std.mem.eql(u8, a.user.?, b.user.?))),
         },
+        .connect => |a| switch (next.transport) {
+            .local_socket, .ssh_tunnel => false,
+            .connect => |b| optionalStringsEqual(a.https_url, b.https_url) and
+                optionalStringsEqual(a.wss_url, b.wss_url) and
+                optionalStringsEqual(a.spki_sha256, b.spki_sha256),
+        },
     };
+}
+
+fn optionalStringsEqual(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?, b.?);
 }
 
 fn clearHealth(entry: *Entry) void {
@@ -1497,6 +2325,20 @@ fn snapshotEntry(entry: *const Entry) Snapshot {
         .transport = switch (entry.owned_profile.transport) {
             .local_socket => .local_socket,
             .ssh_tunnel => .ssh_tunnel,
+            .connect => .connect,
+        },
+        .access = entry.owned_profile.access.kind(),
+        .pairing_state = if (entry.pairing_result != null)
+            .awaiting_confirmation
+        else if (entry.pending_grant != null or
+            (entry.access_task != null and entry.access_task.?.kind == .pair_exchange))
+            .exchanging
+        else
+            .none,
+        .access_token_expires_at_ms = entry.access_token_expires_at_ms,
+        .device_id = switch (entry.owned_profile.access) {
+            .paired_device => |device| device.device_id,
+            else => null,
         },
         .phase = entry.connection_state.phase(),
         .failure = entry.failure_override orelse if (entry.connection_state.lastFailure()) |failure|
@@ -1595,13 +2437,46 @@ fn cloneProfile(allocator: std.mem.Allocator, source: profile.Profile) !profile.
                 .remote_gateway_port = ssh.remote_gateway_port,
             } };
         },
+        .connect => |endpoint| blk: {
+            var cloned: profile.ConnectTransport = .{};
+            errdefer cloned.deinit(allocator);
+            if (endpoint.https_url) |value| cloned.https_url = try allocator.dupe(u8, value);
+            if (endpoint.wss_url) |value| cloned.wss_url = try allocator.dupe(u8, value);
+            if (endpoint.spki_sha256) |value| cloned.spki_sha256 = try allocator.dupe(u8, value);
+            break :blk .{ .connect = cloned };
+        },
     };
+    errdefer {
+        var owned_transport = transport;
+        owned_transport.deinit(allocator);
+    }
+    const access = try cloneAccess(allocator, source.access);
     return .{
         .id = id,
         .label = label,
         .expected_runtime_id = expected_runtime_id,
         .expected_instance_id = expected_instance_id,
         .transport = transport,
+        .access = access,
+    };
+}
+
+fn cloneAccess(allocator: std.mem.Allocator, source: profile.Access) !profile.Access {
+    return switch (source) {
+        .admin_token => .admin_token,
+        .paired_device => |device| blk: {
+            var cloned: profile.PairedDevice = .{};
+            errdefer cloned.deinit(allocator);
+            if (device.device_id) |value| cloned.device_id = try allocator.dupe(u8, value);
+            if (device.credential_ref) |value| cloned.credential_ref = try allocator.dupe(u8, value);
+            break :blk .{ .paired_device = cloned };
+        },
+        .connect => |link| blk: {
+            const url = try allocator.dupe(u8, link.control_plane_url);
+            errdefer allocator.free(url);
+            const link_id = if (link.link_id) |value| try allocator.dupe(u8, value) else null;
+            break :blk .{ .connect = .{ .control_plane_url = url, .link_id = link_id } };
+        },
     };
 }
 

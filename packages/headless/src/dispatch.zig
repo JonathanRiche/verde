@@ -6,6 +6,7 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const access_protocol = @import("access_protocol.zig");
+const connect_protocol = @import("connect_protocol.zig");
 
 /// Methods that must be refused once the daemon has entered its drain phase.
 ///
@@ -59,6 +60,11 @@ const MUTATING_METHODS = [_][]const u8{
     access_protocol.METHOD_DAEMON_PAIRING_GRANT_REVOKE,
     access_protocol.METHOD_DAEMON_DEVICE_LIST,
     access_protocol.METHOD_DAEMON_DEVICE_REVOKE,
+    connect_protocol.METHOD_LOGIN,
+    connect_protocol.METHOD_LINK,
+    connect_protocol.METHOD_UNLINK,
+    connect_protocol.METHOD_LOGOUT,
+    connect_protocol.METHOD_BOOTSTRAP_CONSUME,
 };
 
 /// Return whether a method changes daemon-owned state.

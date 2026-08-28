@@ -2,10 +2,19 @@
 
 const std = @import("std");
 
-pub const CURRENT_VERSION: u8 = 1;
+/// Version 2 adds the non-secret `access` method (administrator token, paired
+/// device reference, or Connect link) and the Connect-resolved transport.
+/// Version 1 documents still decode; version 2 is written on the next save.
+pub const CURRENT_VERSION: u8 = 2;
 pub const DEFAULT_SSH_PORT: u16 = 22;
 pub const DEFAULT_REMOTE_GATEWAY_PORT: u16 = 7420;
 pub const MAX_PROFILES: usize = 64;
+/// Credential references name an OS credential-store item; they are never
+/// the secret itself. Bounded so a hostile document cannot grow the store.
+pub const MAX_CREDENTIAL_REF_BYTES: usize = 160;
+pub const MAX_URL_BYTES: usize = 2048;
+/// Base64url SHA-256 without padding, as published in runtime descriptors.
+pub const SPKI_SHA256_BASE64URL_BYTES: usize = 43;
 
 const MAX_DOCUMENT_BYTES: usize = 256 * 1024;
 const MAX_LABEL_BYTES: usize = 80;
@@ -22,6 +31,7 @@ const VERSION_ONE_PROFILE_FIELDS = [_][]const u8{
     "expected_instance_id",
     "transport",
 };
+const VERSION_TWO_PROFILE_FIELDS = VERSION_ONE_PROFILE_FIELDS ++ [_][]const u8{"access"};
 const VERSION_ONE_LOCAL_TRANSPORT_FIELDS = [_][]const u8{"kind"};
 const VERSION_ONE_SSH_TRANSPORT_FIELDS = [_][]const u8{
     "kind",
@@ -30,6 +40,15 @@ const VERSION_ONE_SSH_TRANSPORT_FIELDS = [_][]const u8{
     "port",
     "remote_gateway_port",
 };
+const VERSION_TWO_CONNECT_TRANSPORT_FIELDS = [_][]const u8{
+    "kind",
+    "https_url",
+    "wss_url",
+    "spki_sha256",
+};
+const ACCESS_ADMIN_TOKEN_FIELDS = [_][]const u8{"method"};
+const ACCESS_PAIRED_DEVICE_FIELDS = [_][]const u8{ "method", "device_id", "credential_ref" };
+const ACCESS_CONNECT_FIELDS = [_][]const u8{ "method", "control_plane_url", "link_id" };
 
 pub const SshTunnelInput = struct {
     host: []const u8,
@@ -51,14 +70,90 @@ pub const SshTunnel = struct {
     }
 };
 
+/// Endpoint resolved from a Connect control-plane runtime descriptor. Every
+/// field is optional until the user selects a runtime from the inventory; the
+/// desktop has no direct HTTPS/WSS data-plane driver yet, so this records the
+/// verified target without claiming it can be used for execution.
+pub const ConnectTransport = struct {
+    https_url: ?[]u8 = null,
+    wss_url: ?[]u8 = null,
+    spki_sha256: ?[]u8 = null,
+
+    pub fn deinit(self: *ConnectTransport, allocator: std.mem.Allocator) void {
+        if (self.https_url) |value| allocator.free(value);
+        if (self.wss_url) |value| allocator.free(value);
+        if (self.spki_sha256) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
 pub const Transport = union(enum) {
     local_socket,
     ssh_tunnel: SshTunnel,
+    connect: ConnectTransport,
 
     pub fn deinit(self: *Transport, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .local_socket => {},
             .ssh_tunnel => |*ssh| ssh.deinit(allocator),
+            .connect => |*endpoint| endpoint.deinit(allocator),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const AccessKind = enum { admin_token, paired_device, connect };
+
+/// Account-free Pair result. Both fields are null until a grant exchange has
+/// been confirmed; `credential_ref` names the OS credential-store item that
+/// holds the device credential and is never the credential itself.
+pub const PairedDevice = struct {
+    device_id: ?[]u8 = null,
+    credential_ref: ?[]u8 = null,
+
+    pub fn isPaired(self: PairedDevice) bool {
+        return self.device_id != null and self.credential_ref != null;
+    }
+
+    pub fn deinit(self: *PairedDevice, allocator: std.mem.Allocator) void {
+        if (self.device_id) |value| allocator.free(value);
+        if (self.credential_ref) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
+/// Connect control-plane link. The OIDC session itself is never persisted.
+pub const ConnectLink = struct {
+    control_plane_url: []u8,
+    link_id: ?[]u8 = null,
+
+    pub fn deinit(self: *ConnectLink, allocator: std.mem.Allocator) void {
+        allocator.free(self.control_plane_url);
+        if (self.link_id) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
+/// How the desktop authenticates to the runtime. Only references and public
+/// identifiers live here; bearer, device, and OIDC material never do.
+pub const Access = union(enum) {
+    admin_token,
+    paired_device: PairedDevice,
+    connect: ConnectLink,
+
+    pub fn kind(self: Access) AccessKind {
+        return switch (self) {
+            .admin_token => .admin_token,
+            .paired_device => .paired_device,
+            .connect => .connect,
+        };
+    }
+
+    pub fn deinit(self: *Access, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .admin_token => {},
+            .paired_device => |*device| device.deinit(allocator),
+            .connect => |*link| link.deinit(allocator),
         }
         self.* = undefined;
     }
@@ -70,6 +165,7 @@ pub const Profile = struct {
     expected_runtime_id: ?[]u8,
     expected_instance_id: ?[]u8 = null,
     transport: Transport,
+    access: Access = .admin_token,
 
     /// Creates a local-socket profile with an identity that remains stable
     /// after the profile document is encoded and loaded again.
@@ -115,6 +211,143 @@ pub const Profile = struct {
             .expected_instance_id = null,
             .transport = .{ .ssh_tunnel = try ownedSshTunnel(allocator, input) },
         };
+    }
+
+    /// Creates an SSH-forwarded profile that authenticates with a paired
+    /// device instead of the administrator token. The device fields stay
+    /// null until a one-time grant exchange has been confirmed.
+    pub fn createPairedSshTunnel(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        label: []const u8,
+        input: SshTunnelInput,
+    ) !Profile {
+        var created = try createSshTunnel(allocator, io, label, null, input);
+        created.access = .{ .paired_device = .{} };
+        return created;
+    }
+
+    /// Creates a Connect profile bound to one self-hosted control plane. The
+    /// runtime endpoint is filled in later from the signed-in inventory.
+    pub fn createConnect(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        label: []const u8,
+        control_plane_url: []const u8,
+    ) !Profile {
+        const id = try generateIdAlloc(allocator, io);
+        errdefer allocator.free(id);
+        const owned_label = try sanitizedLabelAlloc(allocator, label);
+        errdefer allocator.free(owned_label);
+        const owned_url = try sanitizedHttpsUrlAlloc(allocator, control_plane_url);
+        return .{
+            .id = id,
+            .label = owned_label,
+            .expected_runtime_id = null,
+            .expected_instance_id = null,
+            .transport = .{ .connect = .{} },
+            .access = .{ .connect = .{ .control_plane_url = owned_url } },
+        };
+    }
+
+    /// Records a confirmed pairing. Fails without mutation unless the profile
+    /// uses paired-device access; the credential itself is never accepted.
+    pub fn setPairedDevice(
+        self: *Profile,
+        allocator: std.mem.Allocator,
+        device_id: []const u8,
+        credential_ref: []const u8,
+    ) !void {
+        const device = switch (self.access) {
+            .paired_device => |*value| value,
+            else => return error.ProfileAccessMismatch,
+        };
+        try validateDeviceId(device_id);
+        try validateCredentialRef(credential_ref);
+        const owned_device_id = try allocator.dupe(u8, device_id);
+        errdefer allocator.free(owned_device_id);
+        const owned_ref = try allocator.dupe(u8, credential_ref);
+        if (device.device_id) |previous| allocator.free(previous);
+        if (device.credential_ref) |previous| allocator.free(previous);
+        device.device_id = owned_device_id;
+        device.credential_ref = owned_ref;
+    }
+
+    /// Forgets the device reference so the profile reads as "not paired".
+    /// Callers delete the referenced credential-store item separately.
+    pub fn clearPairedDevice(self: *Profile, allocator: std.mem.Allocator) !void {
+        const device = switch (self.access) {
+            .paired_device => |*value| value,
+            else => return error.ProfileAccessMismatch,
+        };
+        if (device.device_id) |previous| allocator.free(previous);
+        if (device.credential_ref) |previous| allocator.free(previous);
+        device.* = .{};
+    }
+
+    /// Stores the runtime descriptor the user selected from Connect inventory.
+    pub fn setConnectEndpoint(
+        self: *Profile,
+        allocator: std.mem.Allocator,
+        https_url: []const u8,
+        wss_url: []const u8,
+        spki_sha256: []const u8,
+        link_id: []const u8,
+    ) !void {
+        const endpoint = switch (self.transport) {
+            .connect => |*value| value,
+            else => return error.ProfileAccessMismatch,
+        };
+        const link = switch (self.access) {
+            .connect => |*value| value,
+            else => return error.ProfileAccessMismatch,
+        };
+        try validateWssUrl(wss_url);
+        try validateSpkiSha256(spki_sha256);
+        try validateLinkId(link_id);
+        const owned_https = try sanitizedHttpsUrlAlloc(allocator, https_url);
+        errdefer allocator.free(owned_https);
+        const owned_wss = try allocator.dupe(u8, wss_url);
+        errdefer allocator.free(owned_wss);
+        const owned_spki = try allocator.dupe(u8, spki_sha256);
+        errdefer allocator.free(owned_spki);
+        const owned_link = try allocator.dupe(u8, link_id);
+        var next: ConnectTransport = .{ .https_url = owned_https, .wss_url = owned_wss, .spki_sha256 = owned_spki };
+        endpoint.deinit(allocator);
+        endpoint.* = next;
+        next = undefined;
+        if (link.link_id) |previous| allocator.free(previous);
+        link.link_id = owned_link;
+    }
+
+    /// True when the Connect profile already points at this control plane.
+    pub fn sameControlPlane(self: Profile, control_plane_url: []const u8) bool {
+        return switch (self.access) {
+            .connect => |link| std.mem.eql(u8, link.control_plane_url, std.mem.trimEnd(u8, std.mem.trim(u8, control_plane_url, &std.ascii.whitespace), "/")),
+            else => false,
+        };
+    }
+
+    /// Re-points a Connect profile at another control plane. The selected
+    /// runtime endpoint, link, and identity pin belong to the old plane and
+    /// are dropped so no trust carries over.
+    pub fn setControlPlaneUrl(self: *Profile, allocator: std.mem.Allocator, control_plane_url: []const u8) !void {
+        const endpoint = switch (self.transport) {
+            .connect => |*value| value,
+            else => return error.ProfileAccessMismatch,
+        };
+        const link = switch (self.access) {
+            .connect => |*value| value,
+            else => return error.ProfileAccessMismatch,
+        };
+        const owned_url = try sanitizedHttpsUrlAlloc(allocator, control_plane_url);
+        allocator.free(link.control_plane_url);
+        link.control_plane_url = owned_url;
+        if (link.link_id) |previous| allocator.free(previous);
+        link.link_id = null;
+        endpoint.deinit(allocator);
+        endpoint.* = .{};
+        try self.setExpectedIdentity(allocator, null, null);
     }
 
     /// Replaces the pinned daemon identity without disturbing the existing
@@ -168,7 +401,7 @@ pub const Profile = struct {
     /// are ignored because they do not change which peer is contacted.
     pub fn sameSshEndpoint(self: Profile, input: SshTunnelInput) bool {
         const ssh = switch (self.transport) {
-            .local_socket => return false,
+            .local_socket, .connect => return false,
             .ssh_tunnel => |value| value,
         };
         const input_user = if (input.user) |value| std.mem.trim(u8, value, &std.ascii.whitespace) else null;
@@ -186,6 +419,7 @@ pub const Profile = struct {
         if (self.expected_runtime_id) |runtime_id| allocator.free(runtime_id);
         if (self.expected_instance_id) |instance_id| allocator.free(instance_id);
         self.transport.deinit(allocator);
+        self.access.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -258,6 +492,49 @@ pub fn encodeAlloc(allocator: std.mem.Allocator, profiles: []const Profile) ![]u
                 try stringify.objectField("remote_gateway_port");
                 try stringify.write(ssh.remote_gateway_port);
             },
+            .connect => |endpoint| {
+                try stringify.objectField("kind");
+                try stringify.write("connect");
+                if (endpoint.https_url) |value| {
+                    try stringify.objectField("https_url");
+                    try stringify.write(value);
+                }
+                if (endpoint.wss_url) |value| {
+                    try stringify.objectField("wss_url");
+                    try stringify.write(value);
+                }
+                if (endpoint.spki_sha256) |value| {
+                    try stringify.objectField("spki_sha256");
+                    try stringify.write(value);
+                }
+            },
+        }
+        try stringify.endObject();
+        try stringify.objectField("access");
+        try stringify.beginObject();
+        try stringify.objectField("method");
+        switch (profile.access) {
+            .admin_token => try stringify.write("admin"),
+            .paired_device => |device| {
+                try stringify.write("paired_device");
+                if (device.device_id) |value| {
+                    try stringify.objectField("device_id");
+                    try stringify.write(value);
+                }
+                if (device.credential_ref) |value| {
+                    try stringify.objectField("credential_ref");
+                    try stringify.write(value);
+                }
+            },
+            .connect => |link| {
+                try stringify.write("connect");
+                try stringify.objectField("control_plane_url");
+                try stringify.write(link.control_plane_url);
+                if (link.link_id) |value| {
+                    try stringify.objectField("link_id");
+                    try stringify.write(value);
+                }
+            },
         }
         try stringify.endObject();
         try stringify.endObject();
@@ -287,7 +564,7 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, bytes: []const u8) !OwnedProfil
     if (document.version > CURRENT_VERSION) return error.UnsupportedProfileVersion;
     switch (document.version) {
         0 => {},
-        1 => try validateVersionOneSchema(parsed.value),
+        1, 2 => try validateVersionedSchema(parsed.value, document.version),
         else => return error.UnsupportedProfileVersion,
     }
     if (document.values.items.len > MAX_PROFILES) return error.TooManyProfiles;
@@ -350,7 +627,7 @@ fn parseVersion(value: std.json.Value) !u8 {
     return @intCast(value.integer);
 }
 
-fn validateVersionOneSchema(root: std.json.Value) !void {
+fn validateVersionedSchema(root: std.json.Value, version: u8) !void {
     if (root != .object) return error.InvalidProfileDocument;
     try validateAllowedFields(&root.object, &VERSION_ONE_DOCUMENT_FIELDS);
 
@@ -358,7 +635,10 @@ fn validateVersionOneSchema(root: std.json.Value) !void {
     if (profiles_value != .array) return error.InvalidProfileDocument;
     for (profiles_value.array.items) |profile_value| {
         if (profile_value != .object) return error.InvalidProfile;
-        try validateAllowedFields(&profile_value.object, &VERSION_ONE_PROFILE_FIELDS);
+        try validateAllowedFields(
+            &profile_value.object,
+            if (version >= 2) &VERSION_TWO_PROFILE_FIELDS else &VERSION_ONE_PROFILE_FIELDS,
+        );
 
         const transport_value = profile_value.object.get("transport") orelse return error.InvalidProfile;
         if (transport_value != .object) return error.InvalidProfile;
@@ -373,8 +653,27 @@ fn validateVersionOneSchema(root: std.json.Value) !void {
                 &transport_value.object,
                 &VERSION_ONE_SSH_TRANSPORT_FIELDS,
             );
+        } else if (version >= 2 and std.mem.eql(u8, kind, "connect")) {
+            try validateAllowedFields(
+                &transport_value.object,
+                &VERSION_TWO_CONNECT_TRANSPORT_FIELDS,
+            );
         } else {
             return error.UnsupportedProfileTransport;
+        }
+
+        if (profile_value.object.get("access")) |access_value| {
+            if (access_value != .object) return error.InvalidProfile;
+            const method = try requiredString(&access_value.object, "method");
+            if (std.mem.eql(u8, method, "admin")) {
+                try validateAllowedFields(&access_value.object, &ACCESS_ADMIN_TOKEN_FIELDS);
+            } else if (std.mem.eql(u8, method, "paired_device")) {
+                try validateAllowedFields(&access_value.object, &ACCESS_PAIRED_DEVICE_FIELDS);
+            } else if (std.mem.eql(u8, method, "connect")) {
+                try validateAllowedFields(&access_value.object, &ACCESS_CONNECT_FIELDS);
+            } else {
+                return error.UnsupportedProfileAccess;
+            }
         }
     }
 }
@@ -424,16 +723,44 @@ fn profileFromValue(
     errdefer if (owned_runtime_id) |runtime_id| allocator.free(runtime_id);
     const owned_instance_id = try ownedExpectedInstanceIdAlloc(allocator, expected_instance_id);
     errdefer if (owned_instance_id) |instance_id| allocator.free(instance_id);
+    var owned_access = try accessFromValue(allocator, object, version);
+    errdefer owned_access.deinit(allocator);
 
     if (std.mem.eql(u8, kind, "local_socket") or
         (version == 0 and std.mem.eql(u8, kind, "local")))
     {
+        if (owned_access != .admin_token) return error.InvalidProfile;
         return .{
             .id = owned_id,
             .label = owned_label,
             .expected_runtime_id = owned_runtime_id,
             .expected_instance_id = owned_instance_id,
             .transport = .local_socket,
+            .access = owned_access,
+        };
+    }
+    if (version >= 2 and std.mem.eql(u8, kind, "connect")) {
+        if (owned_access != .connect) return error.InvalidProfile;
+        var endpoint: ConnectTransport = .{};
+        errdefer endpoint.deinit(allocator);
+        if (try optionalString(&transport_object, "https_url")) |raw| {
+            endpoint.https_url = try sanitizedHttpsUrlAlloc(allocator, raw);
+        }
+        if (try optionalString(&transport_object, "wss_url")) |raw| {
+            try validateWssUrl(raw);
+            endpoint.wss_url = try allocator.dupe(u8, raw);
+        }
+        if (try optionalString(&transport_object, "spki_sha256")) |raw| {
+            try validateSpkiSha256(raw);
+            endpoint.spki_sha256 = try allocator.dupe(u8, raw);
+        }
+        return .{
+            .id = owned_id,
+            .label = owned_label,
+            .expected_runtime_id = owned_runtime_id,
+            .expected_instance_id = owned_instance_id,
+            .transport = .{ .connect = endpoint },
+            .access = owned_access,
         };
     }
     if (!std.mem.eql(u8, kind, "ssh_tunnel") and
@@ -441,6 +768,7 @@ fn profileFromValue(
     {
         return error.UnsupportedProfileTransport;
     }
+    if (owned_access == .connect) return error.InvalidProfile;
 
     const host = try firstRequiredString(&transport_object, &.{ "host", "hostname" });
     const user = try optionalString(&transport_object, "user");
@@ -461,7 +789,107 @@ fn profileFromValue(
             .port = port,
             .remote_gateway_port = remote_gateway_port,
         }) },
+        .access = owned_access,
     };
+}
+
+/// Decodes the optional non-secret `access` object. Missing means the
+/// administrator-token method that every earlier document implied.
+fn accessFromValue(allocator: std.mem.Allocator, object: *const std.json.ObjectMap, version: u8) !Access {
+    const access_value = object.get("access") orelse return .admin_token;
+    if (version < 2 or access_value != .object) return error.InvalidProfile;
+    const access_object = &access_value.object;
+    const method = try requiredString(access_object, "method");
+    if (std.mem.eql(u8, method, "admin")) return .admin_token;
+    if (std.mem.eql(u8, method, "paired_device")) {
+        const device_id = try optionalString(access_object, "device_id");
+        const credential_ref = try optionalString(access_object, "credential_ref");
+        // A half-recorded pairing is unusable and must not look paired.
+        if ((device_id == null) != (credential_ref == null)) return error.InvalidProfile;
+        var device: PairedDevice = .{};
+        errdefer device.deinit(allocator);
+        if (device_id) |value| {
+            try validateDeviceId(value);
+            device.device_id = try allocator.dupe(u8, value);
+        }
+        if (credential_ref) |value| {
+            try validateCredentialRef(value);
+            device.credential_ref = try allocator.dupe(u8, value);
+        }
+        return .{ .paired_device = device };
+    }
+    if (std.mem.eql(u8, method, "connect")) {
+        const control_plane_url = try requiredString(access_object, "control_plane_url");
+        const owned_url = try sanitizedHttpsUrlAlloc(allocator, control_plane_url);
+        errdefer allocator.free(owned_url);
+        var link: ConnectLink = .{ .control_plane_url = owned_url };
+        if (try optionalString(access_object, "link_id")) |value| {
+            try validateLinkId(value);
+            link.link_id = try allocator.dupe(u8, value);
+        }
+        return .{ .connect = link };
+    }
+    return error.UnsupportedProfileAccess;
+}
+
+/// Device IDs are the runtime-issued 32-character lowercase hex identifiers.
+pub fn validateDeviceId(value: []const u8) !void {
+    if (!validRuntimeId(value)) return error.InvalidDeviceId;
+}
+
+/// Credential references are opaque store keys: printable ASCII without
+/// whitespace so they are safe in argv-free store lookups and diagnostics.
+pub fn validateCredentialRef(value: []const u8) !void {
+    if (value.len == 0 or value.len > MAX_CREDENTIAL_REF_BYTES) return error.InvalidCredentialRef;
+    for (value) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and std.mem.indexOfScalar(u8, "._:/-", byte) == null) {
+            return error.InvalidCredentialRef;
+        }
+    }
+}
+
+/// Control-plane and runtime HTTPS URLs: scheme-pinned, bounded, and free of
+/// whitespace, control bytes, fragments, and embedded credentials.
+pub fn validateHttpsUrl(value: []const u8) !void {
+    try validateUrlWithScheme(value, "https://");
+}
+
+pub fn validateWssUrl(value: []const u8) !void {
+    try validateUrlWithScheme(value, "wss://");
+}
+
+fn validateUrlWithScheme(value: []const u8, scheme: []const u8) !void {
+    if (value.len <= scheme.len or value.len > MAX_URL_BYTES) return error.InvalidUrl;
+    if (!std.ascii.startsWithIgnoreCase(value, scheme)) return error.InvalidUrl;
+    const authority_end = std.mem.indexOfScalarPos(u8, value, scheme.len, '/') orelse value.len;
+    const authority = value[scheme.len..authority_end];
+    if (authority.len == 0 or std.mem.indexOfScalar(u8, authority, '@') != null) return error.InvalidUrl;
+    for (value) |byte| {
+        if (byte <= 0x20 or byte >= 0x7f or byte == '#' or byte == '"' or byte == '\'' or byte == '\\') {
+            return error.InvalidUrl;
+        }
+    }
+}
+
+pub fn validateSpkiSha256(value: []const u8) !void {
+    if (value.len != SPKI_SHA256_BASE64URL_BYTES) return error.InvalidSpkiSha256;
+    for (value) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_') return error.InvalidSpkiSha256;
+    }
+}
+
+pub fn validateLinkId(value: []const u8) !void {
+    if (!std.mem.startsWith(u8, value, "lnk_") or !validRuntimeId(value["lnk_".len..])) {
+        return error.InvalidLinkId;
+    }
+}
+
+pub fn sanitizedHttpsUrlAlloc(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    var trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
+    // A trailing slash would otherwise produce `//.well-known` on discovery.
+    while (trimmed.len > "https://".len and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
+    try validateHttpsUrl(trimmed);
+    return allocator.dupe(u8, trimmed);
 }
 
 /// Field-level validators shared with UI forms so inline feedback matches
@@ -585,8 +1013,30 @@ fn validateProfileSlice(profiles: []const Profile) !void {
             .local_socket => {
                 if (local_seen) return error.DuplicateLocalProfile;
                 local_seen = true;
+                if (profile.access != .admin_token) return error.InvalidProfile;
             },
-            .ssh_tunnel => |ssh| try validateCanonicalSsh(ssh),
+            .ssh_tunnel => |ssh| {
+                try validateCanonicalSsh(ssh);
+                if (profile.access == .connect) return error.InvalidProfile;
+            },
+            .connect => |endpoint| {
+                if (profile.access != .connect) return error.InvalidProfile;
+                if (endpoint.https_url) |value| try validateHttpsUrl(value);
+                if (endpoint.wss_url) |value| try validateWssUrl(value);
+                if (endpoint.spki_sha256) |value| try validateSpkiSha256(value);
+            },
+        }
+        switch (profile.access) {
+            .admin_token => {},
+            .paired_device => |device| {
+                if ((device.device_id == null) != (device.credential_ref == null)) return error.InvalidProfile;
+                if (device.device_id) |value| try validateDeviceId(value);
+                if (device.credential_ref) |value| try validateCredentialRef(value);
+            },
+            .connect => |link| {
+                try validateHttpsUrl(link.control_plane_url);
+                if (link.link_id) |value| try validateLinkId(value);
+            },
         }
     }
 }
@@ -846,7 +1296,7 @@ test "legacy documents and unknown fields decode without being persisted" {
     try std.testing.expect(std.mem.indexOf(u8, canonical, "future_profile_field") == null);
     try std.testing.expect(std.mem.indexOf(u8, canonical, "credential_ref") == null);
     try std.testing.expect(std.mem.indexOf(u8, canonical, "sentinel-legacy") == null);
-    try std.testing.expect(std.mem.indexOf(u8, canonical, "\"version\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, canonical, "\"version\": 2") != null);
 }
 
 test "unversioned objects and arrays retain version zero migration behavior" {
@@ -863,7 +1313,7 @@ test "unversioned objects and arrays retain version zero migration behavior" {
         defer std.testing.allocator.free(canonical);
         try std.testing.expect(std.mem.indexOf(u8, canonical, "future_") == null);
         try std.testing.expect(std.mem.indexOf(u8, canonical, "sentinel-") == null);
-        try std.testing.expect(std.mem.indexOf(u8, canonical, "\"version\": 1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, canonical, "\"version\": 2") != null);
     }
 }
 
@@ -952,8 +1402,65 @@ test "profile validation rejects malformed identities endpoints and duplicates" 
     }
     try std.testing.expectError(
         error.UnsupportedProfileVersion,
-        decodeAlloc(std.testing.allocator, "{\"version\":2,\"profiles\":[]}"),
+        decodeAlloc(std.testing.allocator, "{\"version\":3,\"profiles\":[]}"),
     );
+}
+
+test "version two persists paired-device and connect access without secrets" {
+    const allocator = std.testing.allocator;
+    var paired = try Profile.createPairedSshTunnel(allocator, std.testing.io, "Paired VM", .{ .host = "vm.example" });
+    defer paired.deinit(allocator);
+    try std.testing.expect(!paired.access.paired_device.isPaired());
+    try paired.setPairedDevice(
+        allocator,
+        "0123456789abcdef0123456789abcdef",
+        "verde-runtime/profile-0123456789abcdef0123456789abcdef/device",
+    );
+    try paired.setExpectedIdentity(allocator, "0123456789abcdef0123456789abcdef", "00112233445566778899aabbccddeeff");
+    var linked = try Profile.createConnect(allocator, std.testing.io, "Connect", " https://connect.example/ ");
+    defer linked.deinit(allocator);
+    try std.testing.expectEqualStrings("https://connect.example", linked.access.connect.control_plane_url);
+    try linked.setConnectEndpoint(
+        allocator,
+        "https://rt.example:8443",
+        "wss://rt.example:8443/ws",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "lnk_0123456789abcdef0123456789abcdef",
+    );
+
+    const encoded = try encodeAlloc(allocator, &.{ paired, linked });
+    defer allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"method\": \"paired_device\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"credential_ref\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"kind\": \"connect\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "device_credential") == null);
+
+    var decoded = try decodeAlloc(allocator, encoded);
+    defer decoded.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), decoded.items.len);
+    try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", decoded.items[0].access.paired_device.device_id.?);
+    try std.testing.expectEqualStrings("lnk_0123456789abcdef0123456789abcdef", decoded.items[1].access.connect.link_id.?);
+    try std.testing.expectEqualStrings("wss://rt.example:8443/ws", decoded.items[1].transport.connect.wss_url.?);
+
+    // Version 1 readers never accepted access objects or connect transports,
+    // and half-recorded pairings are rejected rather than treated as paired.
+    const rejected = [_][]const u8{
+        \\{"version":1,"profiles":[{"id":"profile-0123456789abcdef0123456789abcdef","label":"VM","transport":{"kind":"ssh_tunnel","host":"vm"},"access":{"method":"admin"}}]}
+        ,
+        \\{"version":1,"profiles":[{"id":"profile-0123456789abcdef0123456789abcdef","label":"C","transport":{"kind":"connect"}}]}
+        ,
+        \\{"version":2,"profiles":[{"id":"profile-0123456789abcdef0123456789abcdef","label":"VM","transport":{"kind":"ssh_tunnel","host":"vm"},"access":{"method":"paired_device","device_id":"0123456789abcdef0123456789abcdef"}}]}
+        ,
+        \\{"version":2,"profiles":[{"id":"profile-0123456789abcdef0123456789abcdef","label":"VM","transport":{"kind":"ssh_tunnel","host":"vm"},"access":{"method":"paired_device","device_credential":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}]}
+        ,
+        \\{"version":2,"profiles":[{"id":"profile-0123456789abcdef0123456789abcdef","label":"C","transport":{"kind":"connect"},"access":{"method":"connect","control_plane_url":"http://plain.example"}}]}
+        ,
+        \\{"version":2,"profiles":[{"id":"profile-0123456789abcdef0123456789abcdef","label":"L","transport":{"kind":"local_socket"},"access":{"method":"paired_device"}}]}
+        ,
+    };
+    for (rejected) |payload| {
+        try std.testing.expectError(error.InvalidProfileDocument, normalizeValidationError(payload));
+    }
 }
 
 fn normalizeValidationError(payload: []const u8) !void {

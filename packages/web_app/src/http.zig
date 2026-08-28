@@ -1823,6 +1823,7 @@ fn disabledFileApi(path: []const u8) bool {
 
 fn blockedRpcMethod(method: []const u8) bool {
     return std.mem.eql(u8, method, "web.directory.list") or
+        headless.connect_protocol.isMethod(method) or
         std.mem.eql(u8, method, headless.access_protocol.METHOD_DAEMON_PAIRING_GRANT_CREATE) or
         std.mem.eql(u8, method, headless.access_protocol.METHOD_DAEMON_PAIRING_GRANT_LIST) or
         std.mem.eql(u8, method, headless.access_protocol.METHOD_DAEMON_PAIRING_GRANT_REVOKE) or
@@ -2360,6 +2361,8 @@ test "query token and disabled file surfaces are rejected by policy" {
     try std.testing.expect(blockedRpcMethod(headless.access_protocol.METHOD_DAEMON_PAIRING_EXCHANGE));
     try std.testing.expect(blockedRpcMethod(headless.access_protocol.METHOD_DAEMON_DEVICE_AUTHENTICATE));
     try std.testing.expect(blockedRpcMethod(headless.access_protocol.METHOD_DAEMON_DEVICE_AUTHORIZE));
+    try std.testing.expect(blockedRpcMethod(headless.connect_protocol.METHOD_LOGIN));
+    try std.testing.expect(blockedRpcMethod(headless.connect_protocol.METHOD_BOOTSTRAP_CONSUME));
     try std.testing.expect(!blockedRpcMethod("core.status"));
 }
 

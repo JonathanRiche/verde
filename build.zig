@@ -62,6 +62,14 @@ pub fn build(b: *std.Build) void {
     const daemon_test_step = b.step("daemon-test", "Run GUI-free Verde daemon tests");
     daemon_test_step.dependOn(&daemon_test_cmd.step);
 
+    const server_cmd = addServerCommand(b, optimize, "server", target, version);
+    const server_step = b.step("server", "Build and install the account-free Verde server operator");
+    server_step.dependOn(&server_cmd.step);
+
+    const server_test_cmd = addServerCommand(b, optimize, "test", target, version);
+    const server_test_step = b.step("server-test", "Run verde-server operator tests");
+    server_test_step.dependOn(&server_test_cmd.step);
+
     const run_cmd = addDesktopCommand(b, optimize, .{
         .subcommand = "run",
         .forward_runtime_args = true,
@@ -348,6 +356,31 @@ fn addDaemonCommand(
 
     const cmd = b.addSystemCommand(argv.items);
     cmd.setCwd(b.path("packages/daemon"));
+    return cmd;
+}
+
+fn addServerCommand(
+    b: *std.Build,
+    optimize: std.builtin.OptimizeMode,
+    step_name: []const u8,
+    target: ?[]const u8,
+    version: ?[]const u8,
+) *std.Build.Step.Run {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(b.allocator);
+
+    argv.appendSlice(b.allocator, &.{ "zig", "build", step_name }) catch @panic("OOM");
+    if (optimize != .Debug) {
+        argv.append(b.allocator, b.fmt("-Doptimize={s}", .{@tagName(optimize)})) catch @panic("OOM");
+    }
+    if (target) |value| {
+        argv.append(b.allocator, b.fmt("-Dtarget={s}", .{value})) catch @panic("OOM");
+    }
+    appendStringOption(b, &argv, "version", version);
+    appendInstallArgs(b, &argv);
+
+    const cmd = b.addSystemCommand(argv.items);
+    cmd.setCwd(b.path("packages/server"));
     return cmd;
 }
 
