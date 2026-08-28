@@ -9022,7 +9022,6 @@ fn runChatMcpToolLayerScenario(allocator: std.mem.Allocator, io: std.Io) !void {
             var thread_parsed = try client.call(headless.store.METHOD_CHAT_THREAD_UPSERT, thread_request);
             defer thread_parsed.deinit();
             if (!thread_parsed.response.isOk()) return error.McpFixtureThreadUpsertFailed;
-
         }
 
         var mcp = try spawnMcpChild(allocator, io, self_exe, pref_path);
@@ -9686,7 +9685,6 @@ fn runChatMcpToolLayerScenario(allocator: std.mem.Allocator, io: std.Io) !void {
         kill_daemon_on_unwind = false;
         _ = try waitChildBounded(&daemon, io, 10_000);
     }
-
 }
 
 /// M4-P5 fix amendment (m4p4fix verify MAJOR-1): failed-first identity
