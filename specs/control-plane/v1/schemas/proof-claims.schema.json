@@ -1,0 +1,167 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://verde.dev/specs/control-plane/v1/schemas/proof-claims.schema.json",
+  "title": "Verde Connect proof JWT contracts",
+  "$defs": {
+    "registered": {
+      "type": "object",
+      "required": ["iss", "sub", "aud", "jti", "iat", "nbf", "exp"],
+      "properties": {
+        "iss": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "sub": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "aud": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "jti": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "iat": { "type": "integer", "minimum": 0 },
+        "nbf": { "type": "integer", "minimum": 0 },
+        "exp": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "runtimeLink": {
+      "allOf": [
+        { "$ref": "#/$defs/registered" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "iss",
+            "sub",
+            "aud",
+            "jti",
+            "iat",
+            "nbf",
+            "exp",
+            "contract_version",
+            "challenge_id",
+            "principal",
+            "runtime_id",
+            "instance_id",
+            "runtime_key_thumbprint",
+            "runtime_encryption_key_thumbprint",
+            "nonce"
+          ],
+          "properties": {
+            "iss": true,
+            "sub": true,
+            "aud": true,
+            "jti": true,
+            "iat": true,
+            "nbf": true,
+            "exp": true,
+            "contract_version": {
+              "$ref": "common.schema.json#/$defs/contractVersion"
+            },
+            "challenge_id": { "$ref": "common.schema.json#/$defs/challengeId" },
+            "principal": { "$ref": "common.schema.json#/$defs/principal" },
+            "runtime_id": { "$ref": "common.schema.json#/$defs/runtimeId" },
+            "instance_id": { "$ref": "common.schema.json#/$defs/instanceId" },
+            "runtime_key_thumbprint": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{43}$"
+            },
+            "runtime_encryption_key_thumbprint": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{43}$"
+            },
+            "nonce": { "$ref": "common.schema.json#/$defs/nonce" }
+          }
+        }
+      ]
+    },
+    "endpointEnrollment": {
+      "allOf": [
+        { "$ref": "#/$defs/registered" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "iss",
+            "sub",
+            "aud",
+            "jti",
+            "iat",
+            "nbf",
+            "exp",
+            "contract_version",
+            "link_id",
+            "request_id",
+            "request_digest",
+            "runtime_id",
+            "instance_id",
+            "runtime_key_thumbprint"
+          ],
+          "properties": {
+            "iss": true,
+            "sub": true,
+            "aud": true,
+            "jti": true,
+            "iat": true,
+            "nbf": true,
+            "exp": true,
+            "contract_version": {
+              "$ref": "common.schema.json#/$defs/contractVersion"
+            },
+            "link_id": { "$ref": "common.schema.json#/$defs/linkId" },
+            "request_id": { "$ref": "common.schema.json#/$defs/requestId" },
+            "request_digest": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{43}$"
+            },
+            "runtime_id": { "$ref": "common.schema.json#/$defs/runtimeId" },
+            "instance_id": { "$ref": "common.schema.json#/$defs/instanceId" },
+            "runtime_key_thumbprint": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{43}$"
+            }
+          }
+        }
+      ]
+    },
+    "deviceBootstrap": {
+      "allOf": [
+        { "$ref": "#/$defs/registered" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "iss",
+            "sub",
+            "aud",
+            "jti",
+            "iat",
+            "nbf",
+            "exp",
+            "contract_version",
+            "request_id",
+            "request_digest",
+            "device_id",
+            "device_key_thumbprint",
+            "principal"
+          ],
+          "properties": {
+            "iss": true,
+            "sub": true,
+            "aud": true,
+            "jti": true,
+            "iat": true,
+            "nbf": true,
+            "exp": true,
+            "contract_version": {
+              "$ref": "common.schema.json#/$defs/contractVersion"
+            },
+            "request_id": { "$ref": "common.schema.json#/$defs/requestId" },
+            "request_digest": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{43}$"
+            },
+            "device_id": { "$ref": "common.schema.json#/$defs/deviceId" },
+            "device_key_thumbprint": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{43}$"
+            },
+            "principal": { "$ref": "common.schema.json#/$defs/principal" }
+          }
+        }
+      ]
+    }
+  }
+}

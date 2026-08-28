@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://verde.dev/specs/control-plane/v1/schemas/discovery.schema.json",
+  "title": "Verde Connect v1 discovery",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "issuer",
+    "api_base_url",
+    "oidc",
+    "jwks_uri",
+    "signer_metadata_url",
+    "capabilities"
+  ],
+  "properties": {
+    "contract_version": {
+      "$ref": "common.schema.json#/$defs/contractVersion"
+    },
+    "issuer": {
+      "type": "string",
+      "format": "uri"
+    },
+    "api_base_url": {
+      "type": "string",
+      "format": "uri"
+    },
+    "oidc": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "issuer",
+        "authorization_endpoint",
+        "token_endpoint",
+        "code_challenge_methods_supported",
+        "public_client",
+        "headless_authorization"
+      ],
+      "properties": {
+        "issuer": {
+          "type": "string",
+          "format": "uri",
+          "maxLength": 2048
+        },
+        "authorization_endpoint": {
+          "type": "string",
+          "format": "uri",
+          "maxLength": 2048
+        },
+        "token_endpoint": {
+          "type": "string",
+          "format": "uri",
+          "maxLength": 2048
+        },
+        "device_authorization_endpoint": {
+          "type": "string",
+          "format": "uri",
+          "maxLength": 2048
+        },
+        "code_challenge_methods_supported": {
+          "const": ["S256"]
+        },
+        "public_client": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "client_id",
+            "scopes",
+            "redirect_uris",
+            "response_type",
+            "token_endpoint_auth_method"
+          ],
+          "properties": {
+            "client_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+            "scopes": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 16,
+              "uniqueItems": true,
+              "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+            },
+            "redirect_uris": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 16,
+              "uniqueItems": true,
+              "items": { "type": "string", "format": "uri", "maxLength": 2048 }
+            },
+            "response_type": { "const": "code" },
+            "token_endpoint_auth_method": { "const": "none" }
+          }
+        },
+        "headless_authorization": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["supported"],
+              "properties": { "supported": { "const": false } }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["supported", "grant_type"],
+              "properties": {
+                "supported": { "const": true },
+                "grant_type": {
+                  "const": "urn:ietf:params:oauth:grant-type:device_code"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "jwks_uri": {
+      "type": "string",
+      "format": "uri",
+      "maxLength": 2048
+    },
+    "signer_metadata_url": {
+      "type": "string",
+      "format": "uri"
+    },
+    "capabilities": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "runtime-link-proof-ed25519",
+          "inventory-v1",
+          "bootstrap-grant-eddsa",
+          "connector-credential-jwe-x25519",
+          "endpoint-external",
+          "endpoint-noop-test",
+          "audit-export-v1"
+        ]
+      }
+    }
+  }
+}

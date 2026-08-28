@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://verde.dev/specs/control-plane/v1/schemas/runtime-descriptor.schema.json",
+  "title": "Normalized Verde runtime descriptor",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "runtime_id",
+    "instance_id",
+    "https_url",
+    "wss_url",
+    "tls_identity",
+    "protocol",
+    "capabilities"
+  ],
+  "properties": {
+    "contract_version": {
+      "$ref": "common.schema.json#/$defs/contractVersion"
+    },
+    "runtime_id": {
+      "$ref": "common.schema.json#/$defs/runtimeId"
+    },
+    "instance_id": {
+      "$ref": "common.schema.json#/$defs/instanceId"
+    },
+    "https_url": {
+      "$ref": "common.schema.json#/$defs/httpsUrl"
+    },
+    "wss_url": {
+      "$ref": "common.schema.json#/$defs/wssUrl"
+    },
+    "tls_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "sha256"],
+      "properties": {
+        "kind": {
+          "const": "spki_sha256"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{43}$"
+        }
+      }
+    },
+    "protocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["major", "minor"],
+      "properties": {
+        "major": {
+          "const": 1
+        },
+        "minor": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        }
+      }
+    },
+    "capabilities": {
+      "type": "array",
+      "maxItems": 128,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_.:-]{1,63}$"
+      }
+    }
+  }
+}
