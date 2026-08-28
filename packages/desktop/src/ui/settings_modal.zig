@@ -9,6 +9,7 @@ const updater = @import("../app/updater.zig");
 const theme = @import("theme.zig");
 const runtime = @import("runtime.zig");
 const text_measure = @import("text_measure.zig");
+const runtime_connections = @import("../state/runtime_connections_controller.zig");
 
 pub const Control = enum(u8) {
     ui_font_dec,
@@ -229,6 +230,8 @@ const SettingsLayout = struct {
     workspace_scroll_horizontal: palette.Rect,
     workspace_scroll_vertical: palette.Rect,
     workspace_scroll_direction_hint_y: f32,
+    runtimes_card: palette.Rect,
+    runtimes: RuntimeCardPlan,
     integrations_card: palette.Rect,
     mcp_tools: palette.Rect,
     mcp_hint_y: f32,
@@ -375,6 +378,8 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         m.row_gap + m.row_h + m.inner_gap + m.label_h +
         m.row_gap + m.row_h + m.inner_gap + m.label_h +
         m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
+    const runtimes_w = modalWidth(width) - m.modal_pad * 2.0;
+    const runtimes_h = planRuntimeCard(state, 0.0, 0.0, runtimes_w, m).height;
     // MCP controls and status, followed by the provider status-hook controls.
     const integrations_h = m.card_pad * 2.0 + m.title_h + m.row_gap * 2.0 + m.label_h * 4.0 + m.row_h * 8.0 + m.inner_gap * 10.0;
     // Same shape as the integrations card: title, field label, one toggle row, hint.
@@ -387,7 +392,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     // (preview or expanded), and the show-more / release-page links row.
     const updates_h = m.card_pad * 2.0 + m.title_h + m.inner_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.row_h + m.inner_gap + updates_notes_h + m.inner_gap + m.label_h;
 
-    const body_h = appearance_h + m.card_gap + transcript_h + m.card_gap + chat_h + m.card_gap + terminal_h + m.card_gap + browser_h + m.card_gap + experimental_h + m.card_gap + workspace_h + m.card_gap + integrations_h + m.card_gap + updates_h + m.card_gap + notifications_h;
+    const body_h = appearance_h + m.card_gap + transcript_h + m.card_gap + chat_h + m.card_gap + terminal_h + m.card_gap + browser_h + m.card_gap + experimental_h + m.card_gap + workspace_h + m.card_gap + runtimes_h + m.card_gap + integrations_h + m.card_gap + updates_h + m.card_gap + notifications_h;
     const modal_h = m.header_h + m.modal_pad + body_h + m.modal_pad + m.footer_h;
     const modal = layoutModal(width, height, modal_h);
 
@@ -631,6 +636,10 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
 
     y += workspace_h + m.card_gap;
 
+    const runtimes_card: palette.Rect = .{ .x = content_x, .y = y, .w = content_w, .h = runtimes_h };
+    const runtimes = planRuntimeCard(state, content_x, y, content_w, m);
+    y += runtimes_h + m.card_gap;
+
     const integrations_card: palette.Rect = .{ .x = content_x, .y = y, .w = content_w, .h = integrations_h };
     const mcp_tools_y = integrations_card.y + m.card_pad + m.title_h + m.row_gap + m.label_h + m.inner_gap;
     const mcp_tools: palette.Rect = .{ .x = integrations_card.x + m.card_pad, .y = mcp_tools_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
@@ -772,6 +781,8 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .workspace_scroll_horizontal = workspace_scroll_horizontal,
         .workspace_scroll_vertical = workspace_scroll_vertical,
         .workspace_scroll_direction_hint_y = workspace_scroll_direction_hint_y,
+        .runtimes_card = runtimes_card,
+        .runtimes = runtimes,
         .integrations_card = integrations_card,
         .mcp_tools = mcp_tools,
         .mcp_hint_y = mcp_hint_y,
@@ -1106,6 +1117,7 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     }
     queueControlHit(state, layout.updates_release_page, layout.body_clip, .updates_release_page, queue_hit);
     queueControlHit(state, layout.notifications_toggle, layout.body_clip, .notifications_toggle, queue_hit);
+    registerRuntimeCardHits(state, layout, queue_hit);
     registerThemeOptionHits(state, layout, queue_hit);
     registerCompanionCharacterOptionHits(state, layout, queue_hit);
     registerTitleOptionHits(state, layout, queue_hit);
@@ -1136,6 +1148,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     drawCard(state, layout.browser_card, layout.body_clip);
     drawCard(state, layout.experimental_card, layout.body_clip);
     drawCard(state, layout.workspace_card, layout.body_clip);
+    drawCard(state, layout.runtimes_card, layout.body_clip);
     drawCard(state, layout.integrations_card, layout.body_clip);
     drawCard(state, layout.updates_card, layout.body_clip);
     drawCard(state, layout.notifications_card, layout.body_clip);
@@ -1422,6 +1435,8 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         .h = m.label_h,
     }, "Vertical keeps normal pane scrolling; hold Ctrl and use the wheel to pan panes", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
 
+    drawRuntimeCard(state, layout);
+
     // Agent integrations
     drawCardTitle(state, layout.integrations_card, "Agent integrations", layout.body_clip);
     drawFieldLabel(state, layout.integrations_card, m, "Verde agent tools (global)", layout.body_clip);
@@ -1617,8 +1632,9 @@ pub fn handleWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y:
 /// Updates settings-modal hover using hits from `refreshPaletteModalHits`.
 pub fn updateHover(state: *runtime.AppState, x: f32, y: f32) void {
     if (!state.settings_controller.modal_visible) {
-        if (state.settings_controller.hover_control != null or state.settings_controller.close_hovered or state.settings_controller.theme_hover_index != null or state.settings_controller.companion_character_hover_index != null or state.settings_controller.title_menu_hover_index != null or state.settings_controller.new_chat_menu_hover_index != null) {
+        if (state.settings_controller.hover_control != null or state.settings_controller.hover_runtime_action != null or state.settings_controller.close_hovered or state.settings_controller.theme_hover_index != null or state.settings_controller.companion_character_hover_index != null or state.settings_controller.title_menu_hover_index != null or state.settings_controller.new_chat_menu_hover_index != null) {
             state.settings_controller.hover_control = null;
+            state.settings_controller.hover_runtime_action = null;
             state.settings_controller.close_hovered = false;
             state.settings_controller.theme_hover_index = null;
             state.settings_controller.companion_character_hover_index = null;
@@ -1630,6 +1646,7 @@ pub fn updateHover(state: *runtime.AppState, x: f32, y: f32) void {
     }
 
     var new_hover: ?u8 = null;
+    var runtime_hover: ?usize = null;
     var theme_hover: ?usize = null;
     var companion_hover: ?usize = null;
     var title_hover: ?usize = null;
@@ -1659,14 +1676,19 @@ pub fn updateHover(state: *runtime.AppState, x: f32, y: f32) void {
             new_chat_hover = hit.index;
             break;
         }
+        if (hit.action == .settings_runtime_action and rectContains(hit.rect, x, y)) {
+            runtime_hover = hit.index;
+            break;
+        }
         if (hit.action != .settings_control) continue;
         if (!rectContains(hit.rect, x, y)) continue;
         new_hover = @intCast(hit.index);
         break;
     }
 
-    if (state.settings_controller.hover_control == new_hover and state.settings_controller.close_hovered == close_hovered and state.settings_controller.theme_hover_index == theme_hover and state.settings_controller.companion_character_hover_index == companion_hover and state.settings_controller.title_menu_hover_index == title_hover and state.settings_controller.new_chat_menu_hover_index == new_chat_hover) return;
+    if (state.settings_controller.hover_control == new_hover and state.settings_controller.hover_runtime_action == runtime_hover and state.settings_controller.close_hovered == close_hovered and state.settings_controller.theme_hover_index == theme_hover and state.settings_controller.companion_character_hover_index == companion_hover and state.settings_controller.title_menu_hover_index == title_hover and state.settings_controller.new_chat_menu_hover_index == new_chat_hover) return;
     state.settings_controller.hover_control = new_hover;
+    state.settings_controller.hover_runtime_action = runtime_hover;
     state.settings_controller.close_hovered = close_hovered;
     state.settings_controller.theme_hover_index = theme_hover;
     state.settings_controller.companion_character_hover_index = companion_hover;
@@ -2276,6 +2298,423 @@ fn drawFooterBar(state: *runtime.AppState, layout: SettingsLayout, dirty: bool) 
 }
 
 const FooterStyle = enum { primary, secondary };
+
+// ---------------------------------------------------------------------------
+// Runtimes & connections card
+// ---------------------------------------------------------------------------
+
+/// Local plus every configured profile.
+const MAX_RUNTIME_ROWS: usize = 65;
+const MAX_ROW_BUTTONS: usize = 7;
+/// Bounded detail block: repository rows + provider rows + status lines.
+const MAX_DETAIL_LINES: usize = 40;
+const DETAIL_LINE_BYTES: usize = 240;
+const RowAction = runtime_connections.RowAction;
+
+const RuntimeRowPlan = struct {
+    /// Clickable header (title, badge, description) that expands the row.
+    header: palette.Rect,
+    buttons: [MAX_ROW_BUTTONS]palette.Rect,
+    button_actions: [MAX_ROW_BUTTONS]RowAction,
+    button_labels: [MAX_ROW_BUTTONS][]const u8,
+    button_styles: [MAX_ROW_BUTTONS]ButtonStyle,
+    button_count: usize,
+    detail_y: f32,
+    detail_line_count: usize,
+    expanded: bool,
+    bottom: f32,
+};
+
+const RuntimeCardPlan = struct {
+    rows: [MAX_RUNTIME_ROWS]RuntimeRowPlan,
+    row_count: usize,
+    add_button: palette.Rect,
+    notice_y: f32,
+    hint_y: f32,
+    height: f32,
+};
+
+const DetailLine = struct {
+    text: []const u8,
+    tone: enum { normal, muted, warning, good },
+};
+
+const DetailBuffer = struct {
+    lines: [MAX_DETAIL_LINES]DetailLine = undefined,
+    scratch: [MAX_DETAIL_LINES][DETAIL_LINE_BYTES]u8 = undefined,
+    count: usize = 0,
+
+    fn push(self: *DetailBuffer, tone: @FieldType(DetailLine, "tone"), comptime fmt: []const u8, args: anytype) void {
+        if (self.count >= MAX_DETAIL_LINES) return;
+        const text = std.fmt.bufPrint(&self.scratch[self.count], fmt, args) catch blk: {
+            // Truncate rather than drop: the row must still show that a
+            // value exists even when it does not fit the line budget.
+            break :blk self.scratch[self.count][0..];
+        };
+        self.lines[self.count] = .{ .text = text, .tone = tone };
+        self.count += 1;
+    }
+};
+
+fn runtimeRowProfileId(state: *const runtime.AppState, row: usize) ?[]const u8 {
+    if (row == 0) return null;
+    const index = row - 1;
+    if (index >= state.runtime_picker_profiles.items.len) return null;
+    return state.runtime_picker_profiles.items[index].profile_id;
+}
+
+fn runtimeRowIsWorkspaceDefault(state: *const runtime.AppState, profile_id: ?[]const u8) bool {
+    const workspace_id = state.currentWorkspaceIdForRuntimeDefault() orelse return profile_id == null;
+    const default_id = state.workspaceRuntimeDefaultProfile(workspace_id);
+    if (profile_id) |value| return std.mem.eql(u8, default_id, value);
+    return std.mem.eql(u8, default_id, "local");
+}
+
+fn buttonWidth(label: []const u8) f32 {
+    // Measured label plus a fixed horizontal pad so short verbs keep a
+    // comfortable click target and long ones never clip.
+    return text_measure.textWidth(.ui, theme.scaledUi(13.0), label) + theme.scaledUi(28.0);
+}
+
+/// Lays out one row's buttons left-to-right, wrapping to a new line when the
+/// content width is exhausted. Returns the y after the last line.
+fn packRowButtons(plan: *RuntimeRowPlan, x: f32, y_start: f32, w: f32, m: Metrics) f32 {
+    var y = y_start;
+    var cursor_x = x;
+    var placed_any = false;
+    for (0..plan.button_count) |index| {
+        const bw = @min(buttonWidth(plan.button_labels[index]), w);
+        if (placed_any and cursor_x + bw > x + w) {
+            cursor_x = x;
+            y += m.row_h + m.inner_gap;
+        }
+        plan.buttons[index] = .{ .x = cursor_x, .y = y, .w = bw, .h = m.row_h };
+        cursor_x += bw + m.inner_gap;
+        placed_any = true;
+    }
+    return if (plan.button_count == 0) y_start else y + m.row_h;
+}
+
+fn pushButton(plan: *RuntimeRowPlan, action: RowAction, label: []const u8, style: ButtonStyle) void {
+    if (plan.button_count >= MAX_ROW_BUTTONS) return;
+    plan.button_actions[plan.button_count] = action;
+    plan.button_labels[plan.button_count] = label;
+    plan.button_styles[plan.button_count] = style;
+    plan.button_count += 1;
+}
+
+fn planRuntimeRowButtons(state: *const runtime.AppState, plan: *RuntimeRowPlan, profile_id: ?[]const u8) void {
+    plan.button_count = 0;
+    const is_default = runtimeRowIsWorkspaceDefault(state, profile_id);
+    const id = profile_id orelse {
+        pushButton(plan, .set_workspace_default, if (is_default) "Workspace default" else "Use as workspace default", if (is_default) .disabled else .secondary);
+        return;
+    };
+    const snapshot = state.runtimeProfileSnapshot(id);
+    const status = state.runtimeProfileStatus(id);
+    switch (status) {
+        .offline, .credential_required => pushButton(plan, .connect, "Connect", .primary),
+        .connection_failed, .authentication_failed, .identity_mismatch, .failed => pushButton(plan, .retry, "Retry", .primary),
+        .connecting, .handshaking, .trust_required, .ready, .limited, .reconnecting => pushButton(plan, .disable, "Disconnect", .secondary),
+        .unsupported, .unavailable => {},
+    }
+    if (snapshot != null and snapshot.?.credential_held) pushButton(plan, .forget_token, "Forget token", .secondary);
+    pushButton(plan, .edit, "Edit", .secondary);
+    if (state.runtime_connections.isRemoveConfirming(id)) {
+        pushButton(plan, .remove_confirm, "Confirm remove", .primary);
+        pushButton(plan, .remove_cancel, "Keep", .secondary);
+    } else {
+        pushButton(plan, .remove, "Remove", .secondary);
+    }
+    pushButton(plan, .copy_diagnostics, "Copy diagnostics", .secondary);
+    pushButton(plan, .set_workspace_default, if (is_default) "Workspace default" else "Use as default", if (is_default) .disabled else .secondary);
+}
+
+fn localProviderReadinessLabel(readiness: runtime.ProviderReadiness) []const u8 {
+    return switch (readiness) {
+        .checking => "checking",
+        .missing => "not installed",
+        .signed_out => "signed out",
+        .ready => "ready",
+        .unavailable => "unavailable",
+    };
+}
+
+/// Builds the expanded detail block. Local reads the workspace folder and the
+/// desktop's own provider probe; remote rows read only daemon-reported data.
+fn collectRuntimeDetailLines(state: *const runtime.AppState, profile_id: ?[]const u8, out: *DetailBuffer) void {
+    out.count = 0;
+    const rc = &state.runtime_connections;
+    if (profile_id == null) {
+        if (state.project_controller.selected_index < state.project_controller.projects.items.len) {
+            const project = state.project_controller.projects.items[state.project_controller.selected_index];
+            out.push(.normal, "Repository  {s}", .{project.path});
+        } else {
+            out.push(.muted, "Repository  no workspace selected", .{});
+        }
+        out.push(.muted, "Providers on this machine", .{});
+        const snapshot = state.provider_controller.readiness.snapshot;
+        inline for (.{ .codex, .claude, .cursor, .opencode, .pi, .fx, .grok }) |provider| {
+            const readiness = snapshot.forProvider(provider);
+            out.push(if (readiness == .ready) .good else if (readiness == .checking) .muted else .warning, "{s} · {s}", .{ runtime.providerLabel(provider), localProviderReadinessLabel(readiness) });
+        }
+        return;
+    }
+    const id = profile_id.?;
+    const tracking = rc.readiness_profile_id != null and std.mem.eql(u8, rc.readiness_profile_id.?, id);
+    const manifest_state = if (tracking) rc.manifest_state else .idle;
+    const providers_state = if (tracking) rc.providers_state else .idle;
+    switch (manifest_state) {
+        .idle, .loading => out.push(.muted, "Repository bindings · checking…", .{}),
+        .not_ready => out.push(.muted, "Repository bindings · connect and verify this runtime first", .{}),
+        .unsupported => out.push(.warning, "Repository bindings · this daemon does not advertise repository manifests", .{}),
+        .failed => out.push(.warning, "Repository bindings · could not be read from the daemon", .{}),
+        .loaded => {
+            if (rc.repositories.items.len == 0) {
+                out.push(.warning, "Repository bindings · none registered for this workspace on the daemon", .{});
+            } else {
+                out.push(.muted, "Repository bindings on this runtime", .{});
+            }
+            for (rc.repositories.items) |repo| {
+                if (repo.root_path) |root| {
+                    if (std.mem.eql(u8, repo.availability, "available")) {
+                        out.push(.good, "{s}{s} · {s}", .{ repo.label, if (repo.is_default) " (default)" else "", root });
+                    } else {
+                        out.push(.warning, "{s}{s} · {s} · {s}", .{ repo.label, if (repo.is_default) " (default)" else "", root, repo.availability });
+                    }
+                } else {
+                    out.push(.warning, "{s}{s} · not bound on this runtime — bind or clone it on the host (no remote clone from the desktop yet)", .{ repo.label, if (repo.is_default) " (default)" else "" });
+                }
+            }
+            if (rc.repositories_truncated > 0) out.push(.muted, "+{d} more repositories", .{rc.repositories_truncated});
+        },
+    }
+    switch (providers_state) {
+        .idle, .loading => out.push(.muted, "Providers · checking…", .{}),
+        .not_ready => out.push(.muted, "Providers · available after the runtime is verified", .{}),
+        .unsupported => out.push(.warning, "Providers · not reported by this daemon", .{}),
+        .failed => out.push(.warning, "Providers · inventory could not be read", .{}),
+        .loaded => {
+            out.push(.muted, "Providers on this runtime", .{});
+            var needs_remote_setup = false;
+            for (rc.providers.items) |row| {
+                const ready = std.mem.eql(u8, row.state, "ready");
+                out.push(if (ready) .good else .warning, "{s} · {s} · {s}{s}{s}{s}{s}", .{
+                    row.label,
+                    row.state,
+                    row.authentication,
+                    if (row.native_chat) " · chat" else "",
+                    if (row.terminal_tui) " · terminal" else "",
+                    if (row.mcp) " · mcp" else "",
+                    if (row.lifecycle) " · hooks" else "",
+                });
+                if (!ready) {
+                    if (row.remediation_command) |command| {
+                        out.push(.muted, "    {s}: {s}", .{ row.remediation_label orelse "Setup", command });
+                    } else if (row.remediation_label) |label| {
+                        out.push(.muted, "    {s}", .{label});
+                    }
+                    needs_remote_setup = true;
+                }
+            }
+            if (rc.providers_truncated > 0) out.push(.muted, "+{d} more providers", .{rc.providers_truncated});
+            if (needs_remote_setup) out.push(.muted, "Run setup commands on the runtime host; the desktop has no remote shell and cannot sign in for you.", .{});
+        },
+    }
+}
+
+fn runtimeDetailLineCount(state: *const runtime.AppState, profile_id: ?[]const u8) usize {
+    var buffer: DetailBuffer = .{};
+    collectRuntimeDetailLines(state, profile_id, &buffer);
+    return buffer.count;
+}
+
+fn planRuntimeCard(state: *const runtime.AppState, x: f32, y: f32, w: f32, m: Metrics) RuntimeCardPlan {
+    var plan: RuntimeCardPlan = undefined;
+    plan.row_count = 0;
+    const inner_x = x + m.card_pad;
+    const inner_w = w - m.card_pad * 2.0;
+    // Title, then a one-line explainer before the rows.
+    var cursor_y = y + m.card_pad + m.title_h + m.inner_gap + m.label_h + m.row_gap;
+    const total_rows = @min(1 + state.runtime_picker_profiles.items.len, MAX_RUNTIME_ROWS);
+    for (0..total_rows) |row| {
+        const profile_id = runtimeRowProfileId(state, row);
+        var row_plan: RuntimeRowPlan = undefined;
+        row_plan.expanded = state.runtime_connections.isExpanded(profile_id);
+        // Title line plus description line.
+        row_plan.header = .{ .x = inner_x, .y = cursor_y, .w = inner_w, .h = m.row_h + m.label_h };
+        var next_y = row_plan.header.y + row_plan.header.h + m.inner_gap;
+        planRuntimeRowButtons(state, &row_plan, profile_id);
+        next_y = packRowButtons(&row_plan, inner_x, next_y, inner_w, m);
+        row_plan.detail_y = next_y + m.inner_gap;
+        row_plan.detail_line_count = if (row_plan.expanded) runtimeDetailLineCount(state, profile_id) else 0;
+        if (row_plan.expanded) next_y = row_plan.detail_y + @as(f32, @floatFromInt(row_plan.detail_line_count)) * m.label_h;
+        row_plan.bottom = next_y;
+        plan.rows[plan.row_count] = row_plan;
+        plan.row_count += 1;
+        cursor_y = next_y + m.row_gap;
+    }
+    plan.add_button = .{ .x = inner_x, .y = cursor_y, .w = @min(buttonWidth("Add connection…"), inner_w), .h = m.row_h };
+    plan.notice_y = plan.add_button.y + m.row_h + m.inner_gap;
+    plan.hint_y = plan.notice_y + m.label_h + m.inner_gap;
+    plan.height = (plan.hint_y + m.label_h + m.card_pad) - y;
+    return plan;
+}
+
+fn registerRuntimeCardHits(state: *runtime.AppState, layout: SettingsLayout, queue_hit: *const fn (*runtime.AppState, palette.Rect, runtime.PaletteModalAction, usize) void) void {
+    const plan = &layout.runtimes;
+    for (0..plan.row_count) |row| {
+        const row_plan = &plan.rows[row];
+        if (intersectRect(row_plan.header, layout.body_clip)) |visible| {
+            queue_hit(state, visible, .settings_runtime_action, runtime_connections.encodeRowAction(row, .expand));
+        }
+        for (0..row_plan.button_count) |index| {
+            if (row_plan.button_styles[index] == .disabled) continue;
+            if (intersectRect(row_plan.buttons[index], layout.body_clip)) |visible| {
+                queue_hit(state, visible, .settings_runtime_action, runtime_connections.encodeRowAction(row, row_plan.button_actions[index]));
+            }
+        }
+    }
+    if (intersectRect(plan.add_button, layout.body_clip)) |visible| {
+        queue_hit(state, visible, .settings_runtime_action, runtime_connections.encodeRowAction(0, .add_connection));
+    }
+}
+
+fn isRuntimeActionHovered(state: *const runtime.AppState, index: usize) bool {
+    const hovered = state.settings_controller.hover_runtime_action orelse return false;
+    return hovered == index;
+}
+
+fn runtimeStatusColor(status: runtime.RuntimePickerStatus) [4]f32 {
+    return switch (status) {
+        .ready => theme.success(),
+        .connecting, .handshaking, .reconnecting, .limited, .trust_required, .credential_required, .offline => theme.COLOR_TEXT_MUTED,
+        .authentication_failed, .identity_mismatch, .connection_failed, .failed, .unsupported, .unavailable => theme.danger(),
+    };
+}
+
+// Runtimes & connections: Local plus saved runtimes with live state, per-row
+// actions, and readiness details for the expanded row.
+fn drawRuntimeCard(state: *runtime.AppState, layout: SettingsLayout) void {
+    const m = metrics();
+    const card = layout.runtimes_card;
+    const clip = layout.body_clip;
+    const plan = &layout.runtimes;
+    drawCardTitle(state, card, "Runtimes & connections", clip);
+    queueText(state, .{
+        .x = card.x + m.card_pad,
+        .y = card.y + m.card_pad + m.title_h + m.inner_gap,
+        .w = card.w - m.card_pad * 2.0,
+        .h = m.label_h,
+    }, "Where chats run. Select a row for repository and provider readiness · SSH is the current transport for self-hosted runtimes", paletteColor(textHint()), theme.scaledUi(12.0), clip);
+
+    for (0..plan.row_count) |row| {
+        const row_plan = &plan.rows[row];
+        const profile_id = runtimeRowProfileId(state, row);
+        const header = row_plan.header;
+        const header_hovered = isRuntimeActionHovered(state, runtime_connections.encodeRowAction(row, .expand));
+        if (row_plan.expanded) {
+            queueRoundedRectClipped(state, .{ .x = header.x, .y = header.y, .w = header.w, .h = row_plan.bottom - header.y }, paletteColor(controlSurface()), radiusSm(), clip);
+        } else if (header_hovered) {
+            queueRoundedRectClipped(state, header, paletteColor(controlHoverSurface()), radiusSm(), clip);
+        }
+
+        var title: []const u8 = "Local";
+        var description: []const u8 = "Runs on this machine";
+        var badge: []const u8 = "";
+        var badge_color = theme.COLOR_TEXT_MUTED;
+        var description_buf: [320]u8 = undefined;
+        if (profile_id) |id| {
+            const status = state.runtimeProfileStatus(id);
+            badge = runtime.runtimePickerStatusBadge(status);
+            badge_color = runtimeStatusColor(status);
+            if (state.runtimeProfileSnapshot(id)) |snapshot| {
+                title = snapshot.label;
+                if (state.runtime_service.?.runtime_manager.profileConst(id)) |configured| {
+                    switch (configured.transport) {
+                        .ssh_tunnel => |ssh| {
+                            description = std.fmt.bufPrint(&description_buf, "{s} · ssh {s}{s}{s}:{d} → gateway {d}", .{
+                                runtime.runtimePickerStatusDescription(status),
+                                ssh.user orelse "",
+                                if (ssh.user != null) "@" else "",
+                                ssh.host,
+                                ssh.port,
+                                ssh.remote_gateway_port,
+                            }) catch runtime.runtimePickerStatusDescription(status);
+                        },
+                        .local_socket => description = runtime.runtimePickerStatusDescription(status),
+                    }
+                } else {
+                    description = runtime.runtimePickerStatusDescription(status);
+                }
+            } else {
+                title = "Unavailable runtime";
+                description = runtime.runtimePickerStatusDescription(.unavailable);
+            }
+        }
+        const is_default = runtimeRowIsWorkspaceDefault(state, profile_id);
+        const pad_x = theme.scaledUi(10.0);
+        const badge_w = if (badge.len > 0) text_measure.textWidth(.ui, theme.scaledUi(11.5), badge) + theme.scaledUi(16.0) else 0.0;
+        queueText(state, .{
+            .x = header.x + pad_x,
+            .y = header.y + (m.row_h - theme.scaledUi(16.0)) * 0.5,
+            .w = header.w - pad_x * 2.0 - badge_w - m.inner_gap,
+            .h = theme.scaledUi(16.0),
+        }, title, paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), clip);
+        if (badge.len > 0) {
+            const badge_rect: palette.Rect = .{
+                .x = header.x + header.w - pad_x - badge_w,
+                .y = header.y + (m.row_h - theme.scaledUi(22.0)) * 0.5,
+                .w = badge_w,
+                .h = theme.scaledUi(22.0),
+            };
+            queueRoundedRectClipped(state, badge_rect, paletteColor(theme.withAlpha(badge_color, 40)), radiusSm(), clip);
+            queueCenteredText(state, badge_rect, badge, paletteColor(badge_color), theme.scaledUi(11.5), clip);
+        }
+        var desc_buf: [360]u8 = undefined;
+        const description_text = if (is_default)
+            std.fmt.bufPrint(&desc_buf, "{s} · workspace default", .{description}) catch description
+        else
+            description;
+        queueText(state, .{
+            .x = header.x + pad_x,
+            .y = header.y + m.row_h,
+            .w = header.w - pad_x * 2.0,
+            .h = m.label_h,
+        }, description_text, paletteColor(textHint()), theme.scaledUi(12.0), clip);
+
+        for (0..row_plan.button_count) |index| {
+            const action_index = runtime_connections.encodeRowAction(row, row_plan.button_actions[index]);
+            drawActionButton(state, row_plan.buttons[index], row_plan.button_labels[index], row_plan.button_styles[index], isRuntimeActionHovered(state, action_index), clip);
+        }
+
+        if (row_plan.expanded) {
+            var buffer: DetailBuffer = .{};
+            collectRuntimeDetailLines(state, profile_id, &buffer);
+            for (buffer.lines[0..buffer.count], 0..) |line, line_index| {
+                const color = switch (line.tone) {
+                    .normal => theme.COLOR_WHITE,
+                    .muted => textHint(),
+                    .warning => theme.warning(),
+                    .good => theme.success(),
+                };
+                queueText(state, .{
+                    .x = header.x + pad_x,
+                    .y = row_plan.detail_y + @as(f32, @floatFromInt(line_index)) * m.label_h,
+                    .w = header.w - pad_x * 2.0,
+                    .h = m.label_h,
+                }, line.text, paletteColor(color), theme.scaledUi(12.0), clip);
+            }
+        }
+    }
+
+    drawActionButton(state, plan.add_button, "Add connection…", .secondary, isRuntimeActionHovered(state, runtime_connections.encodeRowAction(0, .add_connection)), clip);
+    const notice = state.runtime_connections.cardNotice();
+    if (notice.len > 0) {
+        queueText(state, .{ .x = card.x + m.card_pad, .y = plan.notice_y, .w = card.w - m.card_pad * 2.0, .h = m.label_h }, notice, paletteColor(theme.COLOR_YELLOW), theme.scaledUi(12.0), clip);
+    }
+    queueText(state, .{ .x = card.x + m.card_pad, .y = plan.hint_y, .w = card.w - m.card_pad * 2.0, .h = m.label_h }, "Tokens stay in memory only · started chats keep their pinned runtime · defaults apply to new chats in the selected workspace", paletteColor(textHint()), theme.scaledUi(12.0), clip);
+}
 
 fn drawCard(state: *runtime.AppState, rect: palette.Rect, clip: palette.Rect) void {
     queueRoundedRectClipped(state, rect, paletteColor(cardSurface()), radiusMd(), clip);
@@ -3030,12 +3469,19 @@ fn testSettingsState(allocator: std.mem.Allocator) runtime.AppState {
     state.settings_controller.modal_visible = true;
     state.settings_controller.modal_anim_progress = 1.0;
     state.settings_controller.draft = .{};
+    // The runtimes card reads these directly; a bare test state has no
+    // service, so it renders only the Local row.
+    state.runtime_picker_profiles = .empty;
+    state.runtime_service = null;
+    state.workspace_runtime_defaults = null;
+    state.runtime_connections = .{};
     state.settings_controller.draft.theme_choice = state.app_config.themeChoiceIndex();
     state.settings_controller.draft.companion_character = state.app_config.companion_character;
     return state;
 }
 
 fn deinitTestSettingsState(state: *runtime.AppState, allocator: std.mem.Allocator) void {
+    state.runtime_picker_profiles.deinit(allocator);
     state.palette_overlay_batch.deinit(allocator);
     state.palette_frame_text_arena.deinit();
     state.palette_modal_hits.deinit(allocator);
@@ -3267,4 +3713,47 @@ test "Companion experimental setting renders one themed immutable toggle row" {
     try std.testing.expect(saw_companion);
     try std.testing.expect(saw_badge);
     try std.testing.expect(saw_copy);
+}
+
+test "runtimes card registers local row and add-connection hits through settings_runtime_action" {
+    const allocator = std.testing.allocator;
+    defer theme.applyTheme(1.0);
+    theme.applyTheme(1.0);
+
+    var state = testSettingsState(allocator);
+    defer deinitTestSettingsState(&state, allocator);
+
+    const width: f32 = 1200.0;
+    const height: f32 = 900.0;
+    // The card sits below the first viewport at laptop height; scroll it into
+    // the body clip the same way a user would before expecting hits.
+    const initial_layout = computeLayout(&state, width, height);
+    try std.testing.expect(initial_layout.runtimes_card.y > initial_layout.workspace_card.y);
+    state.settings_controller.scroll_y = theme.clampf(
+        initial_layout.runtimes_card.y - initial_layout.body_clip.y,
+        0.0,
+        initial_layout.max_scroll_y,
+    );
+    const layout = computeLayout(&state, width, height);
+    try std.testing.expect(layout.runtimes_card.h > 0.0);
+    try std.testing.expect(rectContains(layout.body_clip, layout.runtimes.add_button.x + 1.0, layout.runtimes.add_button.y + 1.0));
+    try std.testing.expectEqual(@as(usize, 1), layout.runtimes.row_count);
+
+    state.palette_modal_hits.clearRetainingCapacity();
+    registerHits(&state, width, height, captureSettingsHit);
+    var saw_local_expand = false;
+    var saw_add = false;
+    for (state.palette_modal_hits.items) |hit| {
+        if (hit.action != .settings_runtime_action) continue;
+        const decoded = runtime_connections.decodeRowAction(hit.index) orelse return error.TestUnexpectedResult;
+        if (decoded.row == 0 and decoded.action == .expand) saw_local_expand = true;
+        if (decoded.action == .add_connection) {
+            saw_add = true;
+            try std.testing.expect(rectContains(hit.rect, layout.runtimes.add_button.x + 1.0, layout.runtimes.add_button.y + 1.0));
+        }
+        // Local has no endpoint, token, or trust to edit, forget, or remove.
+        try std.testing.expect(decoded.action != .edit and decoded.action != .remove and decoded.action != .forget_token);
+    }
+    try std.testing.expect(saw_local_expand);
+    try std.testing.expect(saw_add);
 }

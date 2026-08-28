@@ -66,6 +66,8 @@ pub const Snapshot = struct {
     identity_pin_required: bool,
     rpc_in_flight: bool,
     last_heartbeat_ms: ?u64,
+    /// Whether a process-memory bearer is currently hydrated. Never the value.
+    credential_held: bool = false,
     /// True only when the live verified pair exactly matches the identity pair
     /// adopted from the profile document. Callers must not infer this merely
     /// from a connected phase when selecting an execution target.
@@ -190,6 +192,8 @@ pub const Dependencies = struct {
     rpc_backend: RpcBackend = RpcBackend.system(),
 };
 
+pub const ProfileReplacement = enum { label_only, endpoint_changed };
+
 const Entry = struct {
     owned_profile: profile.Profile,
     connection_state: connection.Connection,
@@ -307,6 +311,64 @@ pub const Manager = struct {
         return self.secrets.remove(profile_id);
     }
 
+    /// Removes a configured profile. The live generation is invalidated first
+    /// so a late handshake cannot publish, the tunnel is asked to stop, the
+    /// hydrated token is wiped, and any still-running worker is handed to the
+    /// process reaper. Returns whether a token was forgotten.
+    pub fn removeProfile(self: *Manager, profile_id: []const u8) !bool {
+        const index = self.findEntryIndex(profile_id) orelse return error.UnknownRuntimeProfile;
+        const entry = &self.entries.items[index];
+        try entry.connection_state.disable();
+        clearHealth(entry);
+        entry.failure_override = null;
+        if (entry.tunnel_owned) entry.supervisor.stop();
+        self.collectTerminalTunnel(entry);
+        const forgot_token = self.secrets.remove(profile_id);
+        var removed = self.entries.orderedRemove(index);
+        removed.deinit(self.allocator);
+        return forgot_token;
+    }
+
+    /// Replaces non-secret profile fields from an authoritative store reload.
+    /// A label-only change keeps the live generation and trust. Any endpoint
+    /// change is treated as a new peer: the generation is invalidated, health
+    /// is dropped, and the connection tracks the (already cleared) identity of
+    /// the replacement profile instead of silently retaining trust.
+    pub fn replaceProfile(self: *Manager, configured_profile: profile.Profile) !ProfileReplacement {
+        const index = self.findEntryIndex(configured_profile.id) orelse return error.UnknownRuntimeProfile;
+        const entry = &self.entries.items[index];
+        if (profileEndpointsEqual(entry.owned_profile, configured_profile)) {
+            const label = try self.allocator.dupe(u8, configured_profile.label);
+            self.allocator.free(entry.owned_profile.label);
+            entry.owned_profile.label = label;
+            return .label_only;
+        }
+        _ = try self.removeProfile(configured_profile.id);
+        var replacement = configured_profile;
+        replacement.expected_runtime_id = null;
+        replacement.expected_instance_id = null;
+        try self.addProfile(replacement);
+        // Keep the original ordering so picker/settings rows do not jump.
+        const appended = self.entries.items.len - 1;
+        if (appended != index) {
+            const moved = self.entries.orderedRemove(appended);
+            try self.entries.insert(self.allocator, index, moved);
+        }
+        return .endpoint_changed;
+    }
+
+    /// Borrowed profile IDs in display order; valid until the next mutation.
+    pub fn profileIdsAlloc(self: *const Manager, allocator: std.mem.Allocator) ![][]const u8 {
+        const ids = try allocator.alloc([]const u8, self.entries.items.len);
+        for (self.entries.items, 0..) |entry, index| ids[index] = entry.owned_profile.id;
+        return ids;
+    }
+
+    pub fn profileConst(self: *const Manager, profile_id: []const u8) ?*const profile.Profile {
+        const entry = self.findEntryConst(profile_id) orelse return null;
+        return &entry.owned_profile;
+    }
+
     /// Starts an SSH attempt without waiting for authentication or network IO.
     pub fn enable(self: *Manager, profile_id: []const u8, now_ms: u64) !void {
         const index = self.findEntryIndex(profile_id) orelse return error.UnknownRuntimeProfile;
@@ -371,13 +433,18 @@ pub const Manager = struct {
 
     pub fn snapshot(self: *const Manager, profile_id: []const u8) ?Snapshot {
         const entry = self.findEntryConst(profile_id) orelse return null;
-        return snapshotEntry(entry);
+        var row = snapshotEntry(entry);
+        row.credential_held = self.secrets.get(profile_id) != null;
+        return row;
     }
 
     /// Allocates only the bounded row array; all strings inside remain borrowed.
     pub fn snapshotsAlloc(self: *const Manager, allocator: std.mem.Allocator) ![]Snapshot {
         const snapshots = try allocator.alloc(Snapshot, self.entries.items.len);
-        for (self.entries.items, 0..) |*entry, index| snapshots[index] = snapshotEntry(entry);
+        for (self.entries.items, 0..) |*entry, index| {
+            snapshots[index] = snapshotEntry(entry);
+            snapshots[index].credential_held = self.secrets.get(entry.owned_profile.id) != null;
+        }
         return snapshots;
     }
 
@@ -1367,6 +1434,20 @@ fn verifiedRuntimeMatchesPin(entry: *const Entry) bool {
 fn heartbeatDue(entry: *const Entry, now_ms: u64) bool {
     if (entry.healthy_generation != entry.connection_state.generation) return true;
     return now_ms >= (entry.next_heartbeat_at_ms orelse 0);
+}
+
+fn profileEndpointsEqual(current: profile.Profile, next: profile.Profile) bool {
+    return switch (current.transport) {
+        .local_socket => next.transport == .local_socket,
+        .ssh_tunnel => |a| switch (next.transport) {
+            .local_socket => false,
+            .ssh_tunnel => |b| std.mem.eql(u8, a.host, b.host) and
+                a.port == b.port and
+                a.remote_gateway_port == b.remote_gateway_port and
+                ((a.user == null and b.user == null) or
+                    (a.user != null and b.user != null and std.mem.eql(u8, a.user.?, b.user.?))),
+        },
+    };
 }
 
 fn clearHealth(entry: *Entry) void {

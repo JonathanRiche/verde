@@ -174,6 +174,8 @@ pub const State = struct {
     mcp_summary: provider_mcp.Summary = .{},
     scroll_y: f32 = 0.0,
     hover_control: ?u8 = null,
+    /// Encoded `settings_runtime_action` index under the pointer.
+    hover_runtime_action: ?usize = null,
     browser_scroll_speed_drag_active: bool = false,
     browser_scroll_speed_drag_x: f32 = 0.0,
     browser_scroll_speed_drag_w: f32 = 0.0,
@@ -489,6 +491,7 @@ pub fn toggleGlobalMcpIntegration(self: anytype) void {
 
 pub fn cancelSettingsModal(self: anytype) void {
     if (self.settings_controller.modal_closing) return;
+    if (self.runtime_connections.wizard_open) self.cancelRuntimeConnectionWizard();
     beginSettingsModalClose(self);
     self.settings_controller.hover_control = null;
     self.settings_controller.close_hovered = false;
@@ -578,6 +581,7 @@ pub fn saveSettingsModal(self: anytype) !void {
     }
     self.applyTerminalFontSizesFromConfig();
     self.app_config_runtime_sync_pending = true;
+    if (self.runtime_connections.wizard_open) self.cancelRuntimeConnectionWizard();
     beginSettingsModalClose(self);
     self.settings_controller.hover_control = null;
     self.settings_controller.close_hovered = false;

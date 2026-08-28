@@ -2,7 +2,7 @@
 
 This guide covers the open-source, single-user Verde runtime on a manually administered Linux VM. It does not require a Verde account or the Verde SaaS control plane.
 
-The standalone `verde-daemon` and secured, loopback-only `verde-web` gateway are implemented. A browser can reach the gateway through an SSH local forward. A non-root container image and Compose example package the same two artifacts for a dedicated Linux VM. The native desktop can persist non-secret SSH profiles and workspace defaults, prompt for a process-memory gateway token, require explicit runtime/instance trust, show Local and configured runtimes in the prompt control, and run text-only native chat through an exactly pinned runtime. Remote attachments, PTYs/TUIs, guided provider login, and desktop repository-selection UX are not complete yet.
+The standalone `verde-daemon` and secured, loopback-only `verde-web` gateway are implemented. A browser can reach the gateway through an SSH local forward. A non-root container image and Compose example package the same two artifacts for a dedicated Linux VM. The native desktop can add, edit, and remove non-secret SSH connections from Settings › Runtimes & connections or the runtime picker, choose workspace defaults, prompt for a process-memory gateway token, require explicit runtime/instance trust, show Local and configured runtimes with live state, surface repository bindings and provider readiness reported by the verified runtime, and run text-only native chat through an exactly pinned runtime. Remote attachments, PTYs/TUIs, guided provider login, and desktop repository add/clone are not complete yet.
 
 ## Security and process model
 
@@ -396,7 +396,7 @@ This manual fixed-port `ssh -L` workflow trusts the client machine's local-user 
 
 ### Prepare and use a native desktop profile
 
-On the desktop machine, the offline CLI creates the non-secret connection profile. Profile mutations hold a cross-process lock across the complete load-modify-save transaction. If you used the systemd unit above, its remote gateway port is `6783`:
+On the desktop machine, either the Settings › **Runtimes & connections** card (or **Add connection…** in the runtime picker under the prompt) or the offline CLI creates the non-secret connection profile. Both paths hold the same cross-process lock across the complete load-modify-save transaction and reread the document before adopting it. If you used the systemd unit above, its remote gateway port is `6783`:
 
 ```bash
 verde runtime add-ssh \
@@ -410,7 +410,7 @@ verde runtime path
 
 `--host` accepts the same SSH config alias used by the manual `ssh` command. Add `--user` or `--ssh-port` only when they are not already expressed by SSH config. `--expected-runtime-id` accepts a previously verified 32-character lowercase hexadecimal runtime ID; normally the connection handshake will ask the user to trust and pin a first-seen identity instead of requiring manual entry.
 
-These commands never accept a token. In the desktop, create or focus a draft chat and open the runtime control below the prompt. Choose the configured profile. Verde opens a masked token modal because the bearer is absent, starts the owned SSH relay only after the token is hydrated, and then shows the complete runtime and instance IDs for explicit first-contact approval. Cancelling either step leaves the profile disabled. The bearer stays in process memory and is wiped on shutdown; enter it again after relaunch. The accepted identity pair is persisted in the non-secret profile file so a replaced runtime fails closed instead of being trusted silently.
+These commands never accept a token, and the desktop wizard has no token field. In the desktop, create or focus a draft chat and open the runtime control below the prompt, or press **Connect** on the row in Settings. Choose the configured profile. Verde opens a masked token modal because the bearer is absent, starts the owned SSH relay only after the token is hydrated, and then shows the complete runtime and instance IDs for explicit first-contact approval. Cancelling either step leaves the profile disabled. The bearer stays in process memory and is wiped on shutdown; enter it again after relaunch. The accepted identity pair is persisted in the non-secret profile file so a replaced runtime fails closed instead of being trusted silently.
 
 Once the profile reports Connected, send a text-only prompt normally. The thread is pinned to that exact runtime after accepted or ambiguously accepted work. Selecting Local or another profile on a draft affects only that thread; a started thread cannot be migrated and asks for a new chat instead. Attachment-bearing remote prompts are rejected visibly before transcript mutation until runtime-scoped upload support lands.
 
@@ -424,7 +424,7 @@ verde runtime default \
 verde runtime default --workspace <workspace-id> --json
 ```
 
-The desktop command palette also provides **Use Current Chat Runtime as Workspace Default** and **Use Local as Workspace Runtime Default**. Neither command rewrites an existing thread. `verde runtime default --workspace <workspace-id> --clear` removes the saved mapping, making Local the effective fallback. If a saved profile is later removed, new drafts fall back to Local while the CLI reports the stale preference.
+The desktop command palette also provides **Use Current Chat Runtime as Workspace Default** and **Use Local as Workspace Runtime Default**, and each row in Settings › Runtimes & connections has **Use as default**. None of these rewrites an existing thread. Editing a saved connection's host, user, or ports clears its persisted runtime/instance pin and disconnects it; the next connect asks for trust again. Removing a connection leaves already-pinned chats locked and marked unavailable. `verde runtime default --workspace <workspace-id> --clear` removes the saved mapping, making Local the effective fallback. If a saved profile is later removed, new drafts fall back to Local while the CLI reports the stale preference.
 
 Keep the forward bound to `127.0.0.1`, not `0.0.0.0`. Do not disable SSH host-key checking. Verde's desktop connection manager uses an observable, continuously owned listener plus an exact, bounded `ssh -W` process for each permitted call. Heartbeat and every post-trust RPC are targeted to the persisted runtime/instance pair and rejected before dispatch if that pair changes.
 
@@ -459,8 +459,8 @@ Gateway browser sessions are in memory and do not survive a gateway restart. To 
 - The gateway is loopback-and-SSH only. Direct HTTPS/WSS and public listeners are not implemented.
 - SSH-to-loopback mode supports a dedicated VM/container, not a network namespace shared with mutually untrusted local accounts or containers.
 - Authentication is one administrator token with ephemeral browser sessions; persistent token metadata, scopes, and selective revocation are not implemented.
-- Provider installation is detected, but provider authentication is reported as `unknown`; guided remote login and deadline-bounded auth probes are pending.
-- Receipt-backed multi-repository manifests, runtime-local bindings, safe repository-routed chat, and manual daemon CLI administration are implemented. Desktop add/clone/remove/default-repository and per-draft repository-picker UX are pending.
+- Provider installation is detected, but provider authentication is reported as `unknown`; Settings shows the runtime's provider states and remediation commands but cannot run them because there is no remote shell. Guided remote login and deadline-bounded auth probes are pending.
+- Receipt-backed multi-repository manifests, runtime-local bindings, safe repository-routed chat, and manual daemon CLI administration are implemented. Settings shows each repository's binding on the selected runtime read-only; desktop add/clone/remove/default-repository and per-draft repository-picker UX are pending.
 - Arbitrary remote filesystem browsing remains intentionally unavailable.
 - The repository now provides a locally built non-root image and Compose deployment. A signed/published registry image, automated multi-architecture release, and provider-specific derivative images are still pending.
 - One daemon is a single-user runtime. Do not share one token and provider home among mutually untrusted users.
