@@ -1,0 +1,9 @@
+{
+  "contract_version": "1",
+  "algorithm": "RFC8785-JCS+SHA-256-base64url",
+  "input": {
+    "z": [3, { "b": true, "a": "é" }],
+    "a": { "negative_zero": 0, "text": "line\nfeed" }
+  },
+  "digest": "uSbozcVnxd-4lvMt6bCgX6EvatYkGkp8Lsy_Ac9auPg"
+}
