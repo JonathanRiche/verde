@@ -12777,7 +12777,10 @@ pub const AppState = struct {
     }
 
     pub fn consumeBackgroundTaskActionClick(self: *AppState, x: f32, y: f32) bool {
-        for (self.background_task_action_hits.items) |hit| {
+        var hit_index = self.background_task_action_hits.items.len;
+        while (hit_index > 0) {
+            hit_index -= 1;
+            const hit = self.background_task_action_hits.items[hit_index];
             if (x < hit.rect.x or x > hit.rect.x + hit.rect.w or y < hit.rect.y or y > hit.rect.y + hit.rect.h) continue;
             if (hit.project_index >= self.project_controller.projects.items.len) return true;
             var project = &self.project_controller.projects.items[hit.project_index];
@@ -12798,8 +12801,25 @@ pub const AppState = struct {
             // Provider-owned background commands can reach the transcript
             // before their durable task metadata. Keep their visible controls
             // actionable instead of letting the overlapping card toggle win.
+            // Never abort the whole turn: that also stops sibling background
+            // commands in the same Claude/Codex chat.
             switch (hit.action) {
-                .stop => _ = self.abortThreadByLocalId(project.id, thread.local_thread_id),
+                .stop => {
+                    const body = copyBackgroundTaskEventBodyForHit(self.allocator, thread, hit) orelse {
+                        self.setSidebarNotice("Background task is no longer available.");
+                        return true;
+                    };
+                    defer self.allocator.free(body);
+                    thread.noteBackgroundTaskEvent(self.allocator, "Background command", body) catch {
+                        self.setSidebarNotice("Background task is no longer available.");
+                        return true;
+                    };
+                    if (chat_controller.backgroundTaskForEventBody(thread, body)) |task| {
+                        _ = self.stopBackgroundTask(hit.project_index, thread, task);
+                    } else {
+                        self.setSidebarNotice("Background task is no longer available.");
+                    }
+                },
                 .output => {
                     self.setCardExpanded(commandCardKey(hit.message_index), true);
                     self.setSidebarNotice("Background command details are shown in the expanded card.");
@@ -12815,14 +12835,27 @@ pub const AppState = struct {
 
     fn resolveBackgroundTaskActionBody(thread: *ChatThread, hit: BackgroundTaskActionHit, body: []const u8) ?ResolvedBackgroundTaskAction {
         if (std.hash.Wyhash.hash(0, body) != hit.body_hash) return null;
-        const current_task = chat_controller.backgroundTaskForEventBody(thread, body);
-        const task_index = hit.task_index orelse return .{ .task = current_task };
-        if (task_index >= thread.background_tasks.items.len) return null;
-        const task = &thread.background_tasks.items[task_index];
-        // Pinned Ran-command rows keep an explicit task index because their
-        // bodies have no Verde/Codex identity metadata.
-        if (current_task != null and current_task != task) return null;
-        return .{ .task = task };
+        if (hit.task_index) |task_index| {
+            if (task_index >= thread.background_tasks.items.len) return null;
+            return .{ .task = &thread.background_tasks.items[task_index] };
+        }
+        return .{ .task = chat_controller.backgroundTaskForEventBody(thread, body) };
+    }
+
+    fn copyBackgroundTaskEventBodyForHit(allocator: std.mem.Allocator, thread: *ChatThread, hit: BackgroundTaskActionHit) ?[]u8 {
+        if (hit.message_index == std.math.maxInt(usize)) return null;
+        if (hit.message_index < thread.messages.items.len) {
+            const body = thread.messages.items[hit.message_index].body;
+            if (std.hash.Wyhash.hash(0, body) != hit.body_hash) return null;
+            return allocator.dupe(u8, body) catch null;
+        }
+        thread.send_state.mutex.lock();
+        defer thread.send_state.mutex.unlock();
+        const pending_index = hit.message_index - thread.messages.items.len;
+        if (pending_index >= thread.send_state.pending_events.items.len) return null;
+        const body = thread.send_state.pending_events.items[pending_index].body;
+        if (std.hash.Wyhash.hash(0, body) != hit.body_hash) return null;
+        return allocator.dupe(u8, body) catch null;
     }
 
     fn resolveBackgroundTaskActionHit(thread: *ChatThread, hit: BackgroundTaskActionHit) ?ResolvedBackgroundTaskAction {
@@ -12878,24 +12911,38 @@ pub const AppState = struct {
             self.markDirty();
             return true;
         }
-        if (!task.pid_verified) {
-            self.setSidebarNotice("Cannot safely stop this restored PID; wait for a new live task event.");
-            return false;
+        if (task.pid != null or task.pid_path != null) {
+            if (!task.pid_verified) {
+                self.setSidebarNotice("Cannot safely stop this restored PID; wait for a new live task event.");
+                return false;
+            }
+            const pid = task.pid orelse if (task.pid_path) |path| readBackgroundTaskPid(self.allocator, path) else null;
+            const resolved_pid = pid orelse {
+                self.setSidebarNotice("Background task PID is not available yet.");
+                return false;
+            };
+            platform_process.terminateProcessIdTree(resolved_pid) catch |err| {
+                log.warn("failed to stop background process tree: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Failed to request background task termination.");
+                return false;
+            };
+            task.pid = resolved_pid;
+            task.stop_requested = true;
+            task.last_poll_ms = 0;
+            self.setSidebarNotice("Stopping background task...");
+            self.markDirty();
+            return true;
         }
-        const pid = task.pid orelse if (task.pid_path) |path| readBackgroundTaskPid(self.allocator, path) else null;
-        const resolved_pid = pid orelse {
-            self.setSidebarNotice("Background task PID is not available yet.");
-            return false;
-        };
-        platform_process.terminateProcessIdTree(resolved_pid) catch |err| {
-            log.warn("failed to stop background process tree: {s}", .{@errorName(err)});
-            self.setSidebarNotice("Failed to request background task termination.");
-            return false;
-        };
-        task.pid = resolved_pid;
+
+        // Query-scoped commands (Claude tracked bash) have no independent PID.
+        // Aborting the turn would also stop every sibling background command
+        // in this chat, so Verde ends only this tracked row.
         task.stop_requested = true;
-        task.last_poll_ms = 0;
-        self.setSidebarNotice("Stopping background task...");
+        task.status = .stopped;
+        const body = backgroundTaskCompletionBodyAlloc(self.allocator, task) catch return false;
+        defer self.allocator.free(body);
+        self.appendMessageToThread(thread, .system, "Background task stopped", body, null, &.{}) catch return false;
+        self.setSidebarNotice("Stopped this background command.");
         self.markDirty();
         return true;
     }
@@ -13987,6 +14034,47 @@ test "background task action hits remain valid for pending transcript events" {
     try std.testing.expect(AppState.resolveBackgroundTaskActionHit(&thread, pending_hit).?.task == null);
     pending_hit.message_index = 3;
     try std.testing.expect(AppState.resolveBackgroundTaskActionHit(&thread, pending_hit) == null);
+}
+
+test "background task stop hits keep sibling anonymous commands distinct" {
+    const allocator = std.testing.allocator;
+    var thread = try ChatThread.init(allocator, "Sibling background stop");
+    defer thread.deinit(allocator);
+
+    try thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "same command"),
+        .status = .running,
+    });
+    try thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "same command"),
+        .status = .running,
+    });
+    try thread.messages.append(allocator, .{
+        .role = .system,
+        .author = try allocator.dupeZ(u8, "Background command"),
+        .body = try allocator.dupeZ(u8, "same command"),
+    });
+    try thread.messages.append(allocator, .{
+        .role = .system,
+        .author = try allocator.dupeZ(u8, "Background command"),
+        .body = try allocator.dupeZ(u8, "same command"),
+    });
+
+    const first = &thread.background_tasks.items[0];
+    const second = &thread.background_tasks.items[1];
+    var hit: BackgroundTaskActionHit = .{
+        .rect = .{},
+        .project_index = 0,
+        .thread_index = 0,
+        .task_index = 0,
+        .message_index = 0,
+        .body_hash = std.hash.Wyhash.hash(0, "same command"),
+        .action = .stop,
+    };
+    try std.testing.expect(AppState.resolveBackgroundTaskActionHit(&thread, hit).?.task == first);
+    hit.task_index = 1;
+    hit.message_index = 1;
+    try std.testing.expect(AppState.resolveBackgroundTaskActionHit(&thread, hit).?.task == second);
 }
 
 test "provider-aware chat creation scopes mutation and rejects invalid models" {
