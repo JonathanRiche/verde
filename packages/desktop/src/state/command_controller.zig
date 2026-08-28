@@ -44,8 +44,6 @@ pub const SlashCommandWorkerRequest = struct {
     provider: Provider,
     harness: Harness,
     project_path: []u8,
-    remote_ssh_host: ?[]u8 = null,
-    remote_cwd: ?[]u8 = null,
     thread_id: ?[]u8,
     command: ai_harness.ProviderSlashCommandId,
     raw_text: []u8,
@@ -56,8 +54,6 @@ pub fn slashCommandWorker(state: *SlashCommandState, request: *SlashCommandWorke
     const page_alloc = std.heap.page_allocator;
     defer {
         page_alloc.free(request.project_path);
-        if (request.remote_ssh_host) |host| page_alloc.free(host);
-        if (request.remote_cwd) |cwd| page_alloc.free(cwd);
         if (request.thread_id) |thread_id| page_alloc.free(thread_id);
         page_alloc.free(request.raw_text);
         page_alloc.free(request.args);
@@ -93,8 +89,7 @@ fn runSlashCommandWorker(
     request: *const SlashCommandWorkerRequest,
 ) !ai_harness.RunSlashCommandResult {
     if (request.harness != .local_cli) return error.UnsupportedHarnessMode;
-    if (request.remote_ssh_host != null and request.provider != .codex) return error.UnsupportedRemoteProvider;
-    const request_cwd = request.remote_cwd orelse request.project_path;
+    const request_cwd = request.project_path;
 
     const provider_config = switch (request.provider) {
         .opencode => ai_harness.ProviderConfig{
@@ -108,10 +103,6 @@ fn runSlashCommandWorker(
             .codex = .{
                 .cwd = request_cwd,
                 .launch_on_connect = true,
-                .remote_ssh = if (request.remote_ssh_host) |host| .{
-                    .host = host,
-                    .cwd = request_cwd,
-                } else null,
             },
         },
         .claude => ai_harness.ProviderConfig{
@@ -161,7 +152,6 @@ fn formatSlashCommandError(allocator: std.mem.Allocator, provider: Provider, err
             error.NotConnected => "Could not connect to Codex app-server.",
             error.WebSocketUpgradeRejected => "Codex app-server rejected the connection.",
             error.FileNotFound => "The codex executable was not found on PATH.",
-            error.UnsupportedRemoteProvider => "Remote Herdr slash commands currently support Codex only.",
             error.UnsupportedOperation => "Codex does not support this slash command yet.",
             else => "Codex slash command failed.",
         },

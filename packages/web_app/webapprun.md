@@ -1,208 +1,223 @@
 # Run the Verde web app on another VM
 
-This is an agent-ready runbook for starting the web app on another VM. Run all commands from the repository root.
+This runbook covers the current open-source, single-user VM deployment. The GUI-free daemon and loopback web gateway do not require a Verde account. Remote browser access is through an SSH local forward.
 
-There are two supported ways to run it:
+The gateway rejects public/LAN binds. Public HTTPS, Cloudflare Tunnel, Tailscale Funnel/Serve, and direct reverse-proxy deployment are not supported in this release. The native desktop's remote connection manager and SSH profiles are also still pending.
 
-1. **Development mode:** run the Zig gateway and Vite as two processes. Use this while editing the frontend because Vite provides hot module reload.
-2. **Bundled mode:** run one command. It builds the frontend bundle and Zig gateway, then one `verde-web` process serves the UI, API, and WebSocket endpoint together. Use this when hot reload is unnecessary.
+For a long-running installation, use the systemd units, backup guidance, and provider credential notes in [Standalone Daemon Deployment](../../docs/daemon-deployment.md). This file focuses on a source-checkout smoke run.
 
-For the shortest deployment path, use bundled mode:
+## Processes and ports
 
-```bash
-mise install
-mise run build
-./zig-out/bin/verde core status --json
-mise run web-app-run -- --host 0.0.0.0 --port 6783
-```
+The deployment has independent processes:
 
-The first two runtime setup commands build and start the required headless daemon. The final command is the single web-app command: after its build completes, open `http://<VM-IP>:6783/`.
+1. `verde-daemon serve` owns runtime state, turns, provider processes, and PTYs. It listens only on the private `verde-sessionizer.sock` Unix socket.
+2. `verde-web` adapts that socket to authenticated HTTP/WebSocket on loopback.
+3. In development only, Vite serves HMR on port 6783 and proxies to `verde-web` on port 7420.
 
-## Important: a headless VM must start the session daemon
+| Mode | Browser port | Gateway port | Network bind |
+| --- | --- | --- | --- |
+| Bundled SPA | 6783 | 6783 | `127.0.0.1` |
+| Vite HMR | 6783 | 7420 | Both listeners use `127.0.0.1` |
 
-The web gateway is only a client of Verde's GUI-free session daemon; it does not replace or automatically start that daemon. On a VM where the Verde desktop GUI is not running, starting the daemon is a **required setup step** for real workspaces, chats, agent turns, and terminal sessions. Without it, the page may still load using review/mock data, which can make an incomplete deployment look healthy.
+Keep the VM firewall closed to both ports. The client-side SSH forward is the only supported remote network path.
 
-Build the main Verde CLI from the repository root:
+## Build the two artifacts
 
-```bash
-mise run build
-```
-
-Then use a public CLI request to ensure the detached headless daemon is running:
-
-```bash
-./zig-out/bin/verde core status --json
-```
-
-`verde core status` automatically starts the session daemon when needed and then queries it. Do not run the internal `__session-daemon` command directly. A successful response must contain an `ok` result, and the Unix socket should now exist:
-
-```bash
-test -S "${VERDE_SESSIONIZER_SOCKET:-$HOME/.local/share/verde/Native/verde-sessionizer.sock}"
-./zig-out/bin/verde core snapshot --json
-```
-
-Keep the daemon running before starting either web-app option below. It is detached from the GUI, so closing an SSH shell or not having a graphical display does not require stopping it. After a reboot, run `./zig-out/bin/verde core status --json` again before bringing up the web server, or arrange for that command to run through the VM's own process supervisor.
-
-The web gateway and daemon must use the same socket. If the VM uses a custom socket location, export it consistently before starting both:
-
-```bash
-export VERDE_SESSIONIZER_SOCKET=/absolute/path/to/verde-sessionizer.sock
-./zig-out/bin/verde core status --json
-mise run web-app-run -- --host 0.0.0.0 --port 6783
-```
-
-Do not expose `verde-sessionizer.sock` over the network. It is a local Unix socket; only the web UI port `6783` should be routed through the remote-access layer.
-
-## What the web-app modes run
-
-- `verde-web`, the Zig HTTP/WebSocket gateway, listens on `127.0.0.1:7420`.
-- Vite serves the browser UI with hot reload on `0.0.0.0:6783` and proxies `/api` and `/ws` to the gateway.
-- Port `6783` is the URL users open. Do not substitute Vite's default port `5173`.
-
-The gateway expects the Verde session daemon socket on the same VM. Its usual path is:
-
-```text
-~/.local/share/verde/Native/verde-sessionizer.sock
-```
-
-If the daemon is unavailable, the gateway can still serve a review snapshot, but live workspaces, chats, agent turns, and terminals will not be functional. Treat a health response whose source is not `daemon` as an incomplete headless deployment.
-
-## Prepare the VM
-
-Clone the repository and enter its root, then install the repo-pinned tools:
+Run these commands from the repository root:
 
 ```bash
 mise install
+zig build daemon --release=safe -Dbrowser-backend=native_webview
+mise run web-app
 ```
 
-Next, follow the required headless-daemon instructions above. Do this before starting the Zig web gateway or bundled web server.
-
-Before starting anything, confirm the required ports are free:
-
-```bash
-ss -ltnp | rg ':(6783|7420)\b' || true
-```
-
-Do not start duplicate servers if either port is already owned by the web app. When working through a Verde-hosted agent session, do not run `mise run dev`, `mise run dev-term`, or `pkill verde`; those commands can terminate the session hosting the agent.
-
-## Option A: frontend development server with HMR
-
-This option requires two running terminals. Vite serves the frontend on `6783`; the Zig gateway serves the API on loopback port `7420`.
-
-### 1. Start the Zig gateway
-
-In terminal A:
-
-```bash
-mise run web-app-run
-```
-
-The first run installs the Bun dependencies, builds the Zig gateway and SPA, and then listens on `127.0.0.1:7420`.
-
-Wait for this line before continuing:
+The standalone daemon staging tree contains:
 
 ```text
-verde-web listening on http://127.0.0.1:7420/
+zig-out/bin/verde-daemon
+zig-out/share/verde/provider_bridge.mjs
 ```
 
-### 2. Start the Vite development server
+The web build produces:
 
-In terminal B:
+```text
+packages/web_app/zig-out/bin/verde-web
+packages/web_app/dist/
+```
+
+Preserve the daemon binary's relative `../share/verde/provider_bridge.mjs` layout when copying it out of the repository.
+
+## Initialize and start the daemon
+
+Choose one explicit data directory. The shell variable below is only for the runbook; the daemon does not read `VERDE_DATA_DIR` itself. Repeat this export in each terminal that uses the variable.
+
+```bash
+export VERDE_DATA_DIR="$HOME/.local/share/verde/runtime"
+unset VERDE_SESSIONIZER_SOCKET
+
+./zig-out/bin/verde-daemon init \
+  --data-dir "$VERDE_DATA_DIR" \
+  --json
+```
+
+In terminal A, keep the daemon in the foreground:
+
+```bash
+./zig-out/bin/verde-daemon serve --data-dir "$VERDE_DATA_DIR"
+```
+
+From another shell, verify the real daemon and its durable store:
+
+```bash
+export VERDE_DATA_DIR="$HOME/.local/share/verde/runtime"
+unset VERDE_SESSIONIZER_SOCKET
+./zig-out/bin/verde-daemon status \
+  --data-dir "$VERDE_DATA_DIR" \
+  --json
+```
+
+The web gateway does not start a daemon and has no mock/review fallback. A browser may receive static assets while the daemon is unavailable, but runtime requests fail instead of returning invented state. `GET /healthz` checks only the gateway process, so use `verde-daemon status` when verifying runtime readiness.
+
+Do not run the hidden desktop `__session-daemon` entry point. Do not expose `verde-sessionizer.sock` over TCP or copy the SQLite database into a web process.
+
+## Create the mandatory token file
+
+Generate one administrator token as the same VM user that will run `verde-web`:
+
+```bash
+install -d -m 700 "$HOME/.config/verde"
+umask 077
+openssl rand -hex 32 > "$HOME/.config/verde/web-token"
+chmod 600 "$HOME/.config/verde/web-token"
+```
+
+The token file must be a regular, non-symlink file with no group/other permissions. The token must contain at least 32 printable non-space bytes; the command above writes 64 hexadecimal characters.
+
+Only pass the file path to `verde-web`. Raw `--token`, `VERDE_WEB_TOKEN`, query-string tokens, and `X-Verde-Token` are obsolete and rejected. Do not print the token in logs or place it in a shell command argument.
+
+## Option A: bundled SPA and gateway
+
+Bundled mode is the recommended VM path. It serves static assets, authenticated APIs, and the WebSocket from one loopback listener.
+
+In terminal B, from the repository root:
+
+```bash
+export VERDE_DATA_DIR="$HOME/.local/share/verde/runtime"
+mise run web-app-run -- \
+  --host 127.0.0.1 \
+  --port 6783 \
+  --token-file "$HOME/.config/verde/web-token" \
+  --pref-path "$VERDE_DATA_DIR"
+```
+
+The equivalent command after the build is:
+
+```bash
+./packages/web_app/zig-out/bin/verde-web \
+  --host 127.0.0.1 \
+  --port 6783 \
+  --token-file "$HOME/.config/verde/web-token" \
+  --pref-path "$VERDE_DATA_DIR" \
+  --static packages/web_app/dist
+```
+
+Verify the loopback listener and inventory-free liveness route on the VM:
+
+```bash
+ss -ltnp | rg '127\.0\.0\.1:6783'
+curl -fsS http://127.0.0.1:6783/healthz
+```
+
+Do not also start Vite in bundled mode; it would compete for port 6783.
+
+## Open the SSH local forward
+
+From the browser's machine, use the VM account's normal SSH configuration and host-key policy:
+
+```bash
+ssh -N -T \
+  -o ExitOnForwardFailure=yes \
+  -L 127.0.0.1:6783:127.0.0.1:6783 \
+  verde-runtime
+```
+
+Open `http://127.0.0.1:6783/login`. Enter the VM token; the browser posts it to `/auth/session`, receives an `HttpOnly; SameSite=Strict` session cookie, and continues to the SPA at `/`. The SPA then uses the same-origin cookie for APIs and the exact `/ws` WebSocket endpoint.
+
+Never append `?token=...` to the URL. Keep the local SSH listener on `127.0.0.1`, not `0.0.0.0`, and do not disable SSH host-key verification.
+
+The browser-facing endpoint is ordinary HTTP on its own loopback interface, so the current cookie is not marked `Secure`. SSH encrypts transit between machines. This model must not be repurposed as a public HTTP service.
+
+## Option B: frontend development with HMR
+
+Use HMR only while editing the frontend. The standalone daemon from terminal A must still be running.
+
+Start the authenticated gateway on its default loopback port in terminal B:
+
+```bash
+export VERDE_DATA_DIR="$HOME/.local/share/verde/runtime"
+mise run web-app-run -- \
+  --token-file "$HOME/.config/verde/web-token" \
+  --pref-path "$VERDE_DATA_DIR"
+```
+
+Start Vite in terminal C:
 
 ```bash
 mise run web-app-dev
 ```
 
-Wait for Vite to report that it is ready on port `6783`.
+Open `http://127.0.0.1:6783/login`. Vite proxies `/login`, `/auth`, `/api`, and `/ws` to the gateway at `127.0.0.1:7420`. Use the same SSH local-forward command from the bundled instructions if the browser is on another machine.
 
-Keep both terminal processes running. Stop only the processes you started, normally with `Ctrl-C` in their respective terminals.
+The repository's Vite configuration binds `127.0.0.1:6783`. Keep it as a development tool, not a deployment server, and use the same SSH local forward when the browser is on another machine.
 
-### 3. Verify development mode
-
-On the VM:
+To verify HMR without sending the administrator token from a command line:
 
 ```bash
-curl -fsS http://127.0.0.1:7420/api/health
-curl -fsS http://127.0.0.1:6783/ | head
+curl -fsS http://127.0.0.1:7420/healthz
+curl -fsS http://127.0.0.1:6783/login
 ss -ltnp | rg ':(6783|7420)\b'
 ```
 
-The health response should resemble:
+## Authentication behavior
 
-```json
-{"ok":true,"source":"daemon"}
-```
+`GET /healthz`, `GET /login`, `GET /login.js`, and trusted static assets are public. Unauthenticated app-shell navigation redirects to `/login`; runtime inventory is not public.
 
-The `"source":"daemon"` value is important. It confirms that the web gateway reached the real headless daemon instead of falling back to review data.
+`POST /auth/session` is the only token-to-browser-session exchange. Failed attempts are rate-limited. Browser sessions are bounded, expire in memory, and disappear when `verde-web` restarts. The configured administrator token may also be presented through `Authorization: Bearer` by a non-browser API client.
 
-Open the UI from another machine at:
+Every runtime API and exact `GET /ws` upgrade requires a valid browser session or bearer. The gateway rejects query-token and legacy custom-header authentication, permissive cross-origin requests, non-loopback Host values, and WebSocket targets other than exact `/ws`.
 
-```text
-http://<VM-IP>:6783/
-```
+To rotate the token, replace the owner-only token file and restart `verde-web`. The restart clears all issued browser sessions. Persistent token scopes, per-token metadata, and selective revocation are not implemented.
 
-Allow inbound TCP port `6783` in the VM firewall or cloud security group if necessary. Do not expose `7420`; it is intentionally loopback-only behind the Vite proxy.
+## Provider setup on the VM
 
-For regular remote use, it is preferable to put port `6783` behind a user-managed **Cloudflare Tunnel** or **Tailscale Funnel**. Both provide an HTTPS URL, which is safer than publicly exposing the VM's plain HTTP port and is required for full PWA installation behavior. The VM owner must authorize and manage the tunnel; an agent should not create, replace, or reset tunnel configuration without explicit permission.
+Install and authenticate provider CLIs as the same VM UID and `HOME` used by `verde-daemon`. A login performed under another account is not visible to the runtime. Systemd user services also do not source shell startup files, so provider installation directories must be present in the service's explicit `PATH`.
 
-Examples the VM owner may choose to run are:
+Inspect the eight integration rows with:
 
 ```bash
-# Public Cloudflare HTTPS URL
-cloudflared tunnel --url http://127.0.0.1:6783
-
-# Public Tailscale HTTPS URL
-sudo tailscale funnel --bg 6783
+./zig-out/bin/verde-daemon providers status \
+  --data-dir "$VERDE_DATA_DIR" \
+  --json
 ```
 
-For tailnet-only access rather than a public Funnel, the owner can use `sudo tailscale serve --bg 6783`. Point any existing reverse proxy or named Cloudflare Tunnel at `http://127.0.0.1:6783`.
-
-If direct inbound access is unavailable, create an SSH tunnel from the client machine:
-
-```bash
-ssh -N -L 6783:127.0.0.1:6783 <user>@<VM-host>
-```
-
-Then open `http://127.0.0.1:6783/` on the client.
-
-## Option B: bundled frontend with one command
-
-For a built UI without hot reload, do not run Vite. This single command installs dependencies if needed, builds the Zig gateway and frontend bundle, and then serves `/`, `/api`, and `/ws` from one `verde-web` process on port `6783`:
-
-```bash
-mise run web-app-run -- --host 0.0.0.0 --port 6783
-```
-
-Wait for:
-
-```text
-verde-web listening on http://0.0.0.0:6783/
-```
-
-Then verify it:
-
-```bash
-curl -fsS http://127.0.0.1:6783/api/health
-curl -fsS http://127.0.0.1:6783/ | head
-```
-
-The equivalent expanded commands are:
-
-```bash
-mise run web-app
-./packages/web_app/zig-out/bin/verde-web \
-  --host 0.0.0.0 \
-  --port 6783 \
-  --static packages/web_app/dist
-```
-
-In bundled mode, do not also start `mise run web-app-dev`; both would compete for port `6783`. If port `6783` is reachable beyond a trusted private network, set `VERDE_WEB_TOKEN` before starting the gateway and use the token-bearing URL it requires. Prefer a user-managed Cloudflare Tunnel or Tailscale Funnel for HTTPS remote access; an SSH tunnel is a good private fallback.
+The command currently reports bounded executable installation checks for Codex, Claude, Cursor, OpenCode, Amp, Pi, FX, and Grok. Authentication is always reported as `unknown`; it does not prove whether the provider login succeeded. Run each provider's own login flow manually as the runtime user.
 
 ## Troubleshooting
 
-- `6783` already in use: inspect the owning process with `ss -ltnp | rg ':6783\b'`; do not kill it unless it belongs to this task.
-- `7420` already in use: check `curl -fsS http://127.0.0.1:7420/api/health` before deciding whether another gateway is already usable.
-- UI loads but live state is missing: confirm the session daemon socket exists and inspect the gateway startup output for its selected source.
-- Health response does not say `"source":"daemon"`: run `./zig-out/bin/verde core status --json`, verify the socket, and restart the web gateway with the same `VERDE_SESSIONIZER_SOCKET` value.
-- Vite reports proxy failures: start or repair `verde-web` on `127.0.0.1:7420`.
-- Remote browser cannot connect: verify Vite is listening on `0.0.0.0:6783`, then check the VM firewall/security group or use the SSH tunnel above.
+- `TokenFileRequired`: add `--token-file` with an absolute or correctly resolved owner-only path.
+- `InsecureTokenFilePermissions`: run `chmod 600` on the token file and ensure its parent directory is private.
+- `NonLoopbackHost`: remove the public bind. The supported value is `127.0.0.1` with an SSH local forward.
+- `/healthz` succeeds but runtime calls fail: the gateway process is alive, but the daemon may be stopped or using another data directory. Run `verde-daemon status --data-dir "$VERDE_DATA_DIR" --json`.
+- Browser receives `401`: log in again at `http://127.0.0.1:6783/login`. Do not try a query token or legacy header.
+- Browser receives an origin/Host rejection: use the exact SSH-forwarded `http://127.0.0.1:6783/` origin and do not access the VM IP directly.
+- WebSocket reconnects repeatedly: confirm the session cookie was issued, the browser targets exact `/ws`, and the SSH forward is still alive.
+- Vite reports `/auth`, `/api`, or `/ws` proxy failures: confirm `verde-web` is listening on loopback port 7420 with the same daemon data directory.
+- Port 6783 or 7420 is occupied: inspect `ss -ltnp`; stop only the exact process you own.
+- `providers status` says `installed=false`: the provider executable is absent from the daemon service's `PATH`.
+- `providers status` says `authentication=unknown`: that is the current expected result; verify with the provider's own CLI.
+
+## Stop safely
+
+Stop only processes started by this runbook, normally with `Ctrl-C` in the gateway/Vite terminals. Stop the daemon last. Its `SIGINT`/`SIGTERM` handler enters the daemon's PID-checked prepare-shutdown path and waits for a safe exit.
+
+Do not use `pkill verde` or `kill -9` for normal cleanup. When working through a Verde-hosted agent session, do not run `mise run dev` or `mise run dev-term`; those commands can terminate the session that owns the work.

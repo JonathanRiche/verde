@@ -6,13 +6,17 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
+const zqlite = @import("zqlite");
 const harness = @import("../providers/harness.zig");
 const headless = @import("headless");
 const app_config = @import("../app/config.zig");
 const chat_threads = @import("../chat/threads.zig");
 const db_types = @import("../db/types.zig");
 const process_registry = @import("../daemon/process_registry.zig");
+const repository_path = @import("../daemon/repository_path.zig");
 const daemon_store = @import("../daemon/store.zig");
+const daemon_runtime_identity = @import("../daemon/runtime_identity.zig");
 const mcp_http = @import("../mcp/http_server.zig");
 const mcp_endpoint = @import("../mcp/endpoint.zig");
 const platform_ipc = @import("../platform/ipc.zig");
@@ -21,6 +25,7 @@ const workspace_identity = @import("../platform/workspace_identity.zig");
 const stack = @import("../workspace/stack.zig");
 const platform_runtime = @import("platform_runtime");
 const process_env = @import("../platform/env.zig");
+const provider_models = @import("../state/provider_models.zig");
 const send_runner = @import("../chat/send_runner.zig");
 const transcript_apply = @import("../chat/transcript_apply.zig");
 const windows_conpty = @import("platform/windows_conpty.zig");
@@ -35,6 +40,7 @@ const change_journal = @import("../daemon/change_journal.zig");
 pub const SOCKET_NAME = "verde-sessionizer.sock";
 pub const LIVE_SOCKET_NAME = "verde.sock";
 pub const PID_FILE_NAME = "verde-sessionizer.pid";
+pub const RUNTIME_IDENTITY_FILE_NAME = daemon_runtime_identity.FILE_NAME;
 pub const WINDOWS_PIPE_PREFIX = "\\\\.\\pipe\\verde-sessionizer-";
 // Bump whenever the daemon RPC/state surface changes incompatibly. GUI chat
 // turns are daemon-owned now; accepting an older daemon makes the UI
@@ -1006,12 +1012,22 @@ fn selfExePathAlloc(allocator: std.mem.Allocator) ![:0]u8 {
 fn sessionCliPathAlloc(allocator: std.mem.Allocator) ![:0]u8 {
     const executable = selfExePathAlloc(allocator) catch return allocator.dupeZ(u8, "verde");
     defer allocator.free(executable);
-    if (builtin.os.tag != .windows) return allocator.dupeZ(u8, executable);
+    if (builtin.os.tag != .windows) {
+        return allocator.dupeZ(u8, executablePathWithoutDeletedSuffix(builtin.os.tag, executable));
+    }
 
     const resolved = resolveWindowsCliPathAlloc(allocator, executable) catch
         return allocator.dupeZ(u8, executable);
     defer allocator.free(resolved);
     return allocator.dupeZ(u8, resolved);
+}
+
+fn executablePathWithoutDeletedSuffix(comptime os_tag: std.Target.Os.Tag, executable: []const u8) []const u8 {
+    const deleted_suffix = " (deleted)";
+    if (os_tag == .linux and std.mem.endsWith(u8, executable, deleted_suffix)) {
+        return executable[0 .. executable.len - deleted_suffix.len];
+    }
+    return executable;
 }
 
 const WindowsCliPathResolver = struct {
@@ -1784,6 +1800,10 @@ const ChatTurn = struct {
     turn_id: []u8,
     workspace_id: []u8,
     local_thread_id: []u8,
+    /// Runtime-local repository route resolved before provider launch. A null
+    /// repository keeps the legacy absolute-path request contract local-only.
+    repository_id: ?[]u8 = null,
+    repository_cwd: ?[]u8 = null,
     request: send_runner.Request,
     owned_image_paths: []const []const u8,
     /// Full attachment metadata for the turn request (path + any mime /
@@ -1841,6 +1861,8 @@ const ChatTurn = struct {
         allocator.free(self.turn_id);
         allocator.free(self.workspace_id);
         allocator.free(self.local_thread_id);
+        if (self.repository_id) |value| allocator.free(value);
+        if (self.repository_cwd) |value| allocator.free(value);
         freeRunnerRequest(allocator, self.request, self.owned_image_paths);
         for (self.owned_images) |attachment| {
             allocator.free(attachment.path);
@@ -1906,17 +1928,118 @@ fn freeRunnerRequest(allocator: std.mem.Allocator, request: send_runner.Request,
     if (request.model_ref) |value| allocator.free(value);
     if (request.opencode_reasoning_variant) |value| allocator.free(value);
     if (request.cursor_model_params_json) |value| allocator.free(value);
-    if (request.remote_ssh_host) |value| allocator.free(value);
-    if (request.remote_cwd) |value| allocator.free(value);
 }
 
-/// Generate the daemon namespace once at startup. Registry IDs and revisions
-/// are only comparable within this random instance namespace.
-fn randomInstanceNonce(allocator: std.mem.Allocator) []u8 {
+/// Generate an ephemeral process-local namespace. Durable runtime and store
+/// identities use fallible OS entropy during the post-bind readiness phase.
+fn randomEphemeralHexId(allocator: std.mem.Allocator) []u8 {
     var random_bytes: [16]u8 = undefined;
     std.Io.Threaded.global_single_threaded.io().random(&random_bytes);
     const hex = std.fmt.bytesToHex(random_bytes, .lower);
-    return allocator.dupe(u8, &hex) catch @panic("failed to allocate daemon instance nonce");
+    return allocator.dupe(u8, &hex) catch @panic("failed to allocate ephemeral daemon identity");
+}
+
+fn randomInstanceNonce(allocator: std.mem.Allocator) []u8 {
+    return randomEphemeralHexId(allocator);
+}
+
+const PROVIDER_SURFACES_ALL: headless.providers_protocol.ProviderSurfaces = .{
+    .native_chat = true,
+    .terminal_tui = true,
+    .mcp = true,
+    .lifecycle = true,
+};
+
+fn nativeProviderLabel(provider: provider_models.Provider) []const u8 {
+    return switch (provider) {
+        .codex => "Codex",
+        .claude => "Claude",
+        .cursor => "Cursor",
+        .opencode => "OpenCode",
+        .pi => "Pi",
+        .fx => "FX",
+        .grok => "Grok",
+    };
+}
+
+fn nativeProviderLoginCommand(provider: provider_models.Provider) []const []const u8 {
+    return switch (provider) {
+        .codex => &.{ "codex", "login" },
+        .claude => &.{"claude"},
+        .cursor => &.{ "agent", "login" },
+        .opencode => &.{ "opencode", "auth", "login" },
+        .pi => &.{"pi"},
+        .fx => &.{ "fx", "login" },
+        .grok => &.{ "grok", "login" },
+    };
+}
+
+fn nativeProviderInstalled(provider: provider_models.Provider) bool {
+    return switch (provider) {
+        .codex => process_env.commandExists("codex"),
+        .claude => process_env.commandExists("node") and process_env.commandExists("claude"),
+        .cursor => process_env.commandExists("agent"),
+        .opencode => process_env.commandExists("opencode"),
+        .pi => process_env.commandExists("pi"),
+        .fx => process_env.commandExists("fx"),
+        .grok => process_env.commandExists("grok"),
+    };
+}
+
+fn providerRemediation(
+    installed: bool,
+    login_command: []const []const u8,
+) headless.providers_protocol.Remediation {
+    return if (!installed)
+        .{
+            .kind = "install",
+            .label = "Install this provider CLI on the runtime",
+        }
+    else
+        .{
+            .kind = "login",
+            .label = "Authenticate in a terminal on this runtime",
+            .command = login_command,
+        };
+}
+
+fn nativeProviderStatus(provider: provider_models.Provider) headless.providers_protocol.ProviderStatus {
+    const installed = nativeProviderInstalled(provider);
+    return .{
+        .provider = @tagName(provider),
+        .label = nativeProviderLabel(provider),
+        .surfaces = PROVIDER_SURFACES_ALL,
+        .installed = installed,
+        .state = if (installed) "unknown" else "missing",
+        // Provider auth protocols are intentionally heterogeneous. Until each
+        // adapter has a cancellable deadline, the daemon must not occupy a
+        // transport worker with a potentially unbounded login handshake.
+        .authentication = "unknown",
+        .remediation = providerRemediation(installed, nativeProviderLoginCommand(provider)),
+    };
+}
+
+fn ampProviderStatus() headless.providers_protocol.ProviderStatus {
+    const installed = process_env.commandExists("amp");
+    return .{
+        .provider = "amp",
+        .label = "Amp",
+        .surfaces = .{ .terminal_tui = true, .mcp = true, .lifecycle = true },
+        .installed = installed,
+        .state = if (installed) "unknown" else "missing",
+        .authentication = "unknown",
+        .remediation = if (installed)
+            .{
+                .kind = "login",
+                .label = "Authenticate in a terminal on this runtime",
+                .command = &.{ "amp", "login" },
+            }
+        else
+            .{
+                .kind = "install",
+                .label = "Install the Amp CLI on the runtime",
+            },
+    };
 }
 
 const SlowProcessOperation = enum {
@@ -1971,6 +2094,10 @@ const SlowProcessPhaseResult = struct {
 pub const Daemon = struct {
     allocator: std.mem.Allocator,
     pref_path: []u8,
+    /// Stable across daemon restarts while the runtime data directory exists.
+    runtime_id: []u8,
+    /// Stable generation identity recreated with the runtime data directory.
+    instance_id: []u8,
     registry: process_registry.ProcessRegistry,
     sessions: std.ArrayList(*PtySession) = .empty,
     chat_turns: std.ArrayList(*ChatTurn) = .empty,
@@ -2041,6 +2168,11 @@ pub const Daemon = struct {
         return .{
             .allocator = allocator,
             .pref_path = owned_pref_path,
+            // These placeholders exist only for direct unit construction.
+            // Production readiness replaces them with the secure durable pair
+            // before any client can observe the daemon handshake.
+            .runtime_id = randomEphemeralHexId(allocator),
+            .instance_id = randomEphemeralHexId(allocator),
             .registry = process_registry.ProcessRegistry.init(allocator, instance_nonce) catch @panic("failed to initialize daemon process registry"),
             .idle_exit_ms = idleExitMsFromEnv(allocator),
             .registry_jobs = process_registry.RegistryJobQueue.init(process_registry.REGISTRY_JOB_QUEUE_MAX) catch @panic("failed to initialize registry job queue"),
@@ -2052,6 +2184,8 @@ pub const Daemon = struct {
 
     pub fn deinit(self: *Daemon) void {
         if (self.pref_path.len != 0) self.allocator.free(self.pref_path);
+        self.allocator.free(self.runtime_id);
+        self.allocator.free(self.instance_id);
         for (self.sessions.items) |session| session.deinit(self.allocator);
         self.sessions.deinit(self.allocator);
         for (self.chat_turns.items) |turn| turn.deinit(self.allocator);
@@ -2367,6 +2501,9 @@ pub const Daemon = struct {
         const id_value = parsed.value.object.get("id") orelse .null;
         const method = jsonString(parsed.value.object.get("method") orelse .null) orelse
             return try errorResponseAlloc(self.allocator, id_value, "invalid_request", "missing method");
+        if (try self.requestTargetRejection(id_value, parsed.value.object.get("target"))) |response| {
+            return response;
+        }
         const params = parsed.value.object.get("params") orelse .null;
 
         const response = self.handleMethodRequest(id_value, method, params) catch |err| switch (err) {
@@ -2379,6 +2516,36 @@ pub const Daemon = struct {
             return try errorResponseAlloc(self.allocator, id_value, "response_too_large", "response exceeds transport limit");
         }
         return response;
+    }
+
+    /// Validate an explicitly targeted request before any method-specific
+    /// params or state are touched. A missing target remains the legacy local
+    /// Unix-socket contract; remote transports enforce target presence.
+    fn requestTargetRejection(
+        self: *Daemon,
+        id_value: std.json.Value,
+        target_value: ?std.json.Value,
+    ) !?[]u8 {
+        const value = target_value orelse return null;
+        const target = headless.parseRequestTarget(value) catch {
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_RUNTIME_IDENTITY_MISSING,
+                "request target is missing or malformed",
+            );
+        };
+        if (!std.mem.eql(u8, target.runtime_id, self.runtime_id) or
+            !std.mem.eql(u8, target.instance_id, self.instance_id))
+        {
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_RUNTIME_IDENTITY_MISMATCH,
+                "request target does not match this daemon",
+            );
+        }
+        return null;
     }
 
     fn handleMethodRequest(self: *Daemon, id_value: std.json.Value, method: []const u8, params: std.json.Value) ![]u8 {
@@ -2420,6 +2587,7 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, "chat.turn.cancel")) return try self.chatTurnCancelResponse(id_value, params);
         if (std.mem.eql(u8, method, "chat.turn.consume")) return try self.chatTurnConsumeResponse(id_value, params);
         if (std.mem.eql(u8, method, "provider.models.list")) return try self.providerModelsListResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDERS_STATUS)) return try self.providerStatusResponse(id_value, params);
         if (isFxLifecycleMethod(method)) return try self.fxLifecycleResponse(id_value, method, params);
         if (std.mem.eql(u8, method, store_protocol.METHOD_CONFIG_FAVORITE_MODEL_SET)) return try self.configFavoriteModelSetResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_WORKSPACE_RESOLVE)) return try self.workspaceResolveResponse(id_value, params);
@@ -2437,7 +2605,7 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, headless.registry.METHOD_DAEMON_CLIENT_CLOSE)) return try self.clientCloseResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_DAEMON_STOP)) return try self.daemonStopResponse(id_value, params);
         if (std.mem.eql(u8, method, "status")) return try self.statusResponse(id_value);
-        if (std.mem.eql(u8, method, "daemon.prepareShutdown")) return try self.prepareShutdownResponse(id_value);
+        if (std.mem.eql(u8, method, "daemon.prepareShutdown")) return try self.prepareShutdownResponse(id_value, params);
         // Additive headless core methods; existing methods and error codes unchanged.
         if (std.mem.startsWith(u8, method, "core.")) return try self.coreResponse(id_value, method, params);
         return try errorResponseAlloc(self.allocator, id_value, "method_not_found", method);
@@ -2659,10 +2827,18 @@ pub const Daemon = struct {
         const arena = arena_state.allocator();
 
         const is_status = std.mem.eql(u8, method, store_protocol.METHOD_DAEMON_STORE_STATUS);
+        const is_workspace_list = std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_LIST);
+        const is_repository_manifest = std.mem.eql(
+            u8,
+            method,
+            store_protocol.METHOD_WORKSPACE_REPOSITORY_MANIFEST_GET,
+        );
         const is_thread_get = std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_GET);
         const is_thread_list = std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_LIST);
+        const is_message_list = std.mem.eql(u8, method, store_protocol.METHOD_CHAT_MESSAGE_LIST);
         const is_turn_record = std.mem.eql(u8, method, store_protocol.METHOD_CHAT_TURN_RECORD);
-        const is_chat_read = is_thread_get or is_thread_list or is_turn_record;
+        const is_chat_read = is_workspace_list or is_repository_manifest or is_thread_get or
+            is_thread_list or is_message_list or is_turn_record;
         const is_core_snapshot = std.mem.eql(u8, method, store_protocol.METHOD_CORE_SNAPSHOT);
         const is_core_changes = std.mem.eql(u8, method, changes_protocol.METHOD_CORE_CHANGES);
         // Reads never join the mutator drain gate or in_flight write counter.
@@ -2674,8 +2850,11 @@ pub const Daemon = struct {
         // OutOfMemory is re-raised (never remapped to invalid_params).
         var decode_failed = false;
         var decoded_mutation: ?daemon_store.Mutation = null;
+        var decoded_workspace_list: ?store_protocol.WorkspaceListRequest = null;
+        var decoded_repository_manifest: ?store_protocol.WorkspaceRepositoryManifestRequest = null;
         var decoded_thread_get: ?store_protocol.ThreadGetRequest = null;
         var decoded_thread_list: ?store_protocol.ThreadListRequest = null;
+        var decoded_message_list: ?store_protocol.MessageListRequest = null;
         var decoded_turn_record: ?store_protocol.TurnRecordRequest = null;
         var decoded_core_snapshot: ?store_protocol.CoreSnapshotRequest = null;
         var decoded_core_changes: ?changes_protocol.ChangesRequest = null;
@@ -2715,6 +2894,34 @@ pub const Daemon = struct {
                 };
                 if (req) |value| decoded_core_changes = value;
             }
+        } else if (is_workspace_list) {
+            if (params == .null) {
+                decoded_workspace_list = .{};
+            } else {
+                const req = std.json.parseFromValueLeaky(
+                    store_protocol.WorkspaceListRequest,
+                    arena,
+                    params,
+                    .{ .ignore_unknown_fields = true },
+                ) catch |err| blk: {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    decode_failed = true;
+                    break :blk null;
+                };
+                if (req) |value| decoded_workspace_list = value;
+            }
+        } else if (is_repository_manifest) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.WorkspaceRepositoryManifestRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_repository_manifest = value;
         } else if (is_thread_get) {
             const req = std.json.parseFromValueLeaky(
                 store_protocol.ThreadGetRequest,
@@ -2739,6 +2946,18 @@ pub const Daemon = struct {
                 break :blk null;
             };
             if (req) |value| decoded_thread_list = value;
+        } else if (is_message_list) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.MessageListRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_message_list = value;
         } else if (is_turn_record) {
             const req = std.json.parseFromValueLeaky(
                 store_protocol.TurnRecordRequest,
@@ -2775,6 +2994,93 @@ pub const Daemon = struct {
                 break :blk null;
             };
             if (req) |value| decoded_mutation = .{ .workspace_upsert = value };
+        } else if (std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_UPSERT)) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.WorkspaceRepositoryUpsertRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_mutation = .{ .workspace_repository_upsert = .{
+                .mutation = value.mutation,
+                .workspace_id = value.workspace_id,
+                .repository = .{
+                    .repository_id = value.repository.repository_id,
+                    .label = value.repository.label,
+                    .vcs_identity = value.repository.vcs_identity,
+                    .default_branch = value.repository.default_branch,
+                },
+            } };
+        } else if (std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_REMOVE)) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.WorkspaceRepositoryRemoveRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_mutation = .{ .workspace_repository_remove = .{
+                .mutation = value.mutation,
+                .workspace_id = value.workspace_id,
+                .repository_id = value.repository_id,
+            } };
+        } else if (std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_DEFAULT_SET)) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.WorkspaceDefaultRepositorySetRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_mutation = .{ .workspace_default_repository_set = .{
+                .mutation = value.mutation,
+                .workspace_id = value.workspace_id,
+                .repository_id = value.repository_id,
+            } };
+        } else if (std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_BINDING_UPSERT)) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.WorkspaceRepositoryBindingUpsertRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_mutation = .{ .workspace_repository_binding_upsert = .{
+                .mutation = value.mutation,
+                .workspace_id = value.workspace_id,
+                .repository_id = value.repository_id,
+                .binding = value.binding,
+            } };
+        } else if (std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_BINDING_REMOVE)) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.WorkspaceRepositoryBindingRemoveRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_mutation = .{ .workspace_repository_binding_remove = .{
+                .mutation = value.mutation,
+                .workspace_id = value.workspace_id,
+                .repository_id = value.repository_id,
+                .runtime_id = value.runtime_id,
+            } };
         } else if (std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_UPSERT)) {
             const req = std.json.parseFromValueLeaky(
                 store_protocol.ThreadUpsertRequest,
@@ -2897,10 +3203,16 @@ pub const Daemon = struct {
             decoded_core_snapshot == null
         else if (is_core_changes)
             decoded_core_changes == null
+        else if (is_workspace_list)
+            decoded_workspace_list == null
+        else if (is_repository_manifest)
+            decoded_repository_manifest == null
         else if (is_thread_get)
             decoded_thread_get == null
         else if (is_thread_list)
             decoded_thread_list == null
+        else if (is_message_list)
+            decoded_message_list == null
         else if (is_turn_record)
             decoded_turn_record == null
         else
@@ -3006,6 +3318,41 @@ pub const Daemon = struct {
             return try okValueResponse(self.allocator, id_value, result);
         }
 
+        if (is_workspace_list) {
+            const req = decoded_workspace_list orelse return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_PARAMS,
+                "invalid params",
+            );
+            const result = loadWorkspaceListResult(self.allocator, &service.store, self.runtime_id, req) catch |err| {
+                return try storeErrorResponse(self.allocator, id_value, err);
+            };
+            defer freeWorkspaceListResult(self.allocator, result);
+            return try okValueResponse(self.allocator, id_value, result);
+        }
+        if (is_repository_manifest) {
+            const req = decoded_repository_manifest orelse return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_PARAMS,
+                "invalid params",
+            );
+            var manifest = service.store.loadWorkspaceRepositoryManifest(req.workspace_id) catch |err| {
+                return try storeErrorResponse(self.allocator, id_value, err);
+            };
+            defer manifest.deinit(self.allocator);
+            const store_revision = service.store.storeRevision() catch |err| {
+                return try storeErrorResponse(self.allocator, id_value, err);
+            };
+            const result: store_protocol.WorkspaceRepositoryManifestResult = .{
+                .workspace_id = manifest.workspace_id,
+                .default_repository_id = manifest.default_repository_id,
+                .repositories = manifest.repositories,
+                .store_revision = store_revision,
+            };
+            return try okValueResponse(self.allocator, id_value, result);
+        }
         if (is_thread_get) {
             const req = decoded_thread_get orelse return try errorResponseAlloc(
                 self.allocator,
@@ -3030,6 +3377,19 @@ pub const Daemon = struct {
                 return try storeErrorResponse(self.allocator, id_value, err);
             };
             defer freeThreadListResult(self.allocator, result);
+            return try okValueResponse(self.allocator, id_value, result);
+        }
+        if (is_message_list) {
+            const req = decoded_message_list orelse return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_PARAMS,
+                "invalid params",
+            );
+            const result = loadMessageListResult(self.allocator, &service.store, req) catch |err| {
+                return try storeErrorResponse(self.allocator, id_value, err);
+            };
+            defer freeMessageListResult(self.allocator, result);
             return try okValueResponse(self.allocator, id_value, result);
         }
         if (is_turn_record) {
@@ -3404,7 +3764,35 @@ pub const Daemon = struct {
     /// Gate order: registry safe (leases transfer when the store is active) →
     /// store writes drained → transfer commit + store close in on_closing
     /// (before endpoint release; finishSessionizerServer is the idempotent fallback).
-    fn prepareShutdownResponse(self: *Daemon, id_value: std.json.Value) ![]u8 {
+    fn prepareShutdownResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        // Older typed clients encode an anonymous `.{}` parameter value as
+        // the empty JSON tuple `[]`. Preserve that no-argument wire shape;
+        // only the object form can carry the optional ownership assertion.
+        if (params == .array and params.array.items.len != 0) {
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object");
+        }
+        if (params != .object and params != .array) {
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object");
+        }
+        if (params == .object) {
+            if (params.object.get("expected_pid")) |expected_value| {
+                const expected_pid = jsonUsize(expected_value) orelse
+                    return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "expected_pid must be an integer");
+                const actual_pid = platform_runtime.processId();
+                if (expected_pid != actual_pid) {
+                    // Ownership assertions keep administrative clients from
+                    // draining a replacement endpoint after a reconnect/TOCTOU.
+                    return try okValueResponse(self.allocator, id_value, .{
+                        .accepted = false,
+                        .safe_to_exit = false,
+                        .owner_mismatch = true,
+                        .pid = actual_pid,
+                        .shutdown_requested = self.shutdown_requested,
+                        .accepting_mutations = self.accepting_mutations,
+                    });
+                }
+            }
+        }
         const now_ms = nowMs();
         // Reap expired registry state before evaluating the handoff gate; a
         // stale lease must not keep an otherwise empty daemon alive.
@@ -3464,25 +3852,39 @@ pub const Daemon = struct {
     }
 
     fn coreResponse(self: *Daemon, id_value: std.json.Value, method: []const u8, params: std.json.Value) ![]u8 {
+        const store_ready = self.store_service != null;
         const ctx: headless.Context = .{
+            .runtime_id = self.runtime_id,
+            .instance_id = self.instance_id,
+            .server_version = build_options.version,
             .pid = platform_runtime.processId(),
             .sessionizer_protocol_version = PROTOCOL_VERSION,
             .session_count = self.sessions.items.len,
             .chat_turn_count = self.chat_turns.items.len,
+            .store_ready = store_ready,
         };
         // Request id for the typed dispatcher is informational; wire id stays id_value.
         const typed = headless.dispatchMethod(0, method, params, ctx);
         // Authority signal: store=true only after the production writer owns the DB.
-        const store_ready = self.store_service != null;
         return switch (typed.body) {
             .status => |result| blk: {
                 var status = result;
                 status.capabilities.store = store_ready;
+                status.capabilities.repository_manifests = store_ready;
+                status.runtime_capabilities = if (store_ready)
+                    &headless.protocol.RUNTIME_CAPABILITY_NAMES
+                else
+                    &headless.protocol.RUNTIME_CAPABILITY_NAMES_BASE;
                 break :blk try okValueResponse(self.allocator, id_value, status);
             },
             .capabilities => |result| blk: {
                 var caps = result;
                 caps.capabilities.store = store_ready;
+                caps.capabilities.repository_manifests = store_ready;
+                caps.runtime_capabilities = if (store_ready)
+                    &headless.protocol.RUNTIME_CAPABILITY_NAMES
+                else
+                    &headless.protocol.RUNTIME_CAPABILITY_NAMES_BASE;
                 break :blk try okValueResponse(self.allocator, id_value, caps);
             },
             .err => |err| try errorResponseAllocWithData(self.allocator, id_value, err.code, err.message, err.data),
@@ -3815,6 +4217,9 @@ pub const Daemon = struct {
         if (parsed.value != .object) return error.InvalidParams;
         const id_value = parsed.value.object.get("id") orelse .null;
         const method = jsonString(parsed.value.object.get("method") orelse .null) orelse return error.InvalidParams;
+        if (try self.requestTargetRejection(id_value, parsed.value.object.get("target"))) |response| {
+            return response;
+        }
         const params = parsed.value.object.get("params") orelse .null;
 
         if (std.mem.eql(u8, method, headless.registry.METHOD_PROCESS_START)) {
@@ -5280,7 +5685,48 @@ pub const Daemon = struct {
             }
         }
 
-        const turn = try createChatTurnFromParams(self.allocator, params);
+        var execution_route = resolveChatExecutionRoute(self, params) catch |err| switch (err) {
+            error.InvalidParams => return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_PARAMS,
+                "invalid repository route params",
+            ),
+            error.RouteAttachmentsUnsupported => return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_CAPABILITY_UNAVAILABLE,
+                "remote repository routes do not support path-based attachments",
+            ),
+            error.CapabilityUnavailable => return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_CAPABILITY_UNAVAILABLE,
+                "repository checkout is unavailable on this runtime",
+            ),
+            error.ResourceNotFound => return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_RESOURCE_NOT_FOUND,
+                "repository binding not found on this runtime",
+            ),
+            error.StoreCorrupt => return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_STORE_CORRUPT,
+                "store is corrupt",
+            ),
+            error.StoreUnavailable => return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_STORE_UNAVAILABLE,
+                "store is unavailable",
+            ),
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        defer if (execution_route) |*route| route.deinit(self.allocator);
+        const route_ptr: ?*const ChatExecutionRoute = if (execution_route) |*route| route else null;
+        const turn = try createChatTurnFromParams(self.allocator, params, route_ptr);
         errdefer turn.deinit(self.allocator);
         // Wire the wake path before the turn is reachable by any worker.
         turn.daemon = self;
@@ -5645,6 +6091,34 @@ pub const Daemon = struct {
             .provider = provider_name,
             .models = models,
         });
+    }
+
+    /// Runtime-scoped provider inventory. This endpoint performs bounded
+    /// executable checks only; authentication remains unknown until provider
+    /// adapters expose cancellable, deadline-enforced probes. Login/setup runs
+    /// explicitly in a runtime PTY under the daemon user's HOME.
+    fn providerStatusResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        if (params != .null and params != .object) {
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object or null");
+        }
+        const ProviderStatus = headless.providers_protocol.ProviderStatus;
+        const statuses = [_]ProviderStatus{
+            nativeProviderStatus(.codex),
+            nativeProviderStatus(.claude),
+            nativeProviderStatus(.cursor),
+            nativeProviderStatus(.opencode),
+            ampProviderStatus(),
+            nativeProviderStatus(.pi),
+            nativeProviderStatus(.fx),
+            nativeProviderStatus(.grok),
+        };
+        const result: headless.providers_protocol.StatusResult = .{
+            .runtime_id = self.runtime_id,
+            .instance_id = self.instance_id,
+            .probed_at_ms = nowMs(),
+            .providers = &statuses,
+        };
+        return try okValueResponse(self.allocator, id_value, result);
     }
 
     /// Persist one web composer favorite into the same verde.json collection
@@ -6473,6 +6947,28 @@ pub fn runDaemon(allocator: std.mem.Allocator, pref_path: []const u8) !void {
     return runDaemonOptions(allocator, pref_path, .{});
 }
 
+pub const DaemonReadyCallback = struct {
+    context: *anyopaque,
+    notify: *const fn (context: *anyopaque) anyerror!void,
+};
+
+/// Run the daemon and invoke `callback` only after this process owns the
+/// endpoint and all durable services are ready. Lifetime helpers such as
+/// signal watchers must start here rather than before the bind race is won.
+pub fn runDaemonWithReadyCallback(
+    allocator: std.mem.Allocator,
+    pref_path: []const u8,
+    callback: DaemonReadyCallback,
+) !void {
+    return runDaemonOptions(allocator, pref_path, .{ .ready_callback = callback });
+}
+
+/// Initialize and migrate one daemon data directory through the ordinary
+/// endpoint-ownership and readiness path, then exit without staying resident.
+pub fn initializeDaemonData(allocator: std.mem.Allocator, pref_path: []const u8) !void {
+    return runDaemonOptions(allocator, pref_path, .{ .idle_exit_ms_override = 0 });
+}
+
 /// Runs the session daemon with the shared MCP dispatcher exposed over the
 /// authenticated loopback Streamable HTTP endpoint.
 pub fn runDaemonWithMcp(
@@ -6485,6 +6981,8 @@ pub fn runDaemonWithMcp(
 
 const RunDaemonOptions = struct {
     mcp_handler: ?mcp_http.Handler = null,
+    ready_callback: ?DaemonReadyCallback = null,
+    idle_exit_ms_override: ?i64 = null,
 };
 
 fn runDaemonOptions(allocator: std.mem.Allocator, pref_path: []const u8, options: RunDaemonOptions) !void {
@@ -6503,7 +7001,7 @@ fn runWindowsDaemon(allocator: std.mem.Allocator, pref_path: []const u8, options
 
 fn runSessionizerServer(allocator: std.mem.Allocator, pref_path: []const u8, options: RunDaemonOptions) !void {
     var setup_threaded = std.Io.Threaded.init_single_threaded;
-    try std.Io.Dir.cwd().createDirPath(setup_threaded.io(), pref_path);
+    try ensurePrivateDataDirectory(setup_threaded.io(), pref_path);
     const endpoint = try socketPath(allocator, pref_path);
     defer allocator.free(endpoint);
     const pid_path = try pidFilePath(allocator, pref_path);
@@ -6511,6 +7009,7 @@ fn runSessionizerServer(allocator: std.mem.Allocator, pref_path: []const u8, opt
 
     var daemon = Daemon.initWithPrefPath(allocator, pref_path);
     defer daemon.deinit();
+    if (options.idle_exit_ms_override) |idle_exit_ms| daemon.idle_exit_ms = idle_exit_ms;
     // M5-P2 journal hook: volatile revision bumps publish identity entries.
     // `&daemon` is stable for the daemon's whole lifetime (A3: production
     // default, not hermetic-gated; capability flags stay false regardless).
@@ -6523,6 +7022,7 @@ fn runSessionizerServer(allocator: std.mem.Allocator, pref_path: []const u8, opt
         .pref_path = pref_path,
         .stop_requested = &stop_requested,
         .mcp_handler = options.mcp_handler,
+        .ready_callback = options.ready_callback,
     };
     defer finishSessionizerServer(&server_context);
 
@@ -6547,6 +7047,18 @@ fn runSessionizerServer(allocator: std.mem.Allocator, pref_path: []const u8, opt
     });
 }
 
+fn ensurePrivateDataDirectory(io: std.Io, pref_path: []const u8) !void {
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+    if (builtin.os.tag == .windows) return;
+
+    var data_dir = try std.Io.Dir.cwd().openDir(io, pref_path, .{ .iterate = true });
+    defer data_dir.close(io);
+    // Runtime identity, SQLite state, provider metadata, socket, and lock file
+    // all live below this directory. Tighten an existing directory too so a
+    // permissive umask cannot leave daemon state readable by another user.
+    try data_dir.setPermissions(io, @enumFromInt(0o700));
+}
+
 const SessionizerServerContext = struct {
     daemon: *Daemon,
     endpoint: []const u8,
@@ -6554,6 +7066,7 @@ const SessionizerServerContext = struct {
     pref_path: []const u8 = "",
     stop_requested: *std.atomic.Value(bool),
     mcp_handler: ?mcp_http.Handler = null,
+    ready_callback: ?DaemonReadyCallback = null,
     mcp_server: ?mcp_http.Server = null,
     drain_thread: ?std.Thread = null,
     pid_published: bool = false,
@@ -6564,7 +7077,8 @@ fn sessionizerServerReady(raw_context: *anyopaque) !void {
     try writePidFile(context.pid_path);
     context.pid_published = true;
     // Open the production (or hermetic-override) store only after bind succeeds
-    // so a failed open fails readiness loudly (never a silent dual-writer).
+    // so identity creation and SQLite binding share endpoint ownership and a
+    // failed cross-check fails readiness loudly (never a silent dual-writer).
     try maybeInitStoreService(context.daemon);
     if (context.mcp_handler) |handler| {
         context.mcp_server = mcp_http.start(context.daemon.allocator, context.pref_path, handler) catch |err| {
@@ -6577,6 +7091,7 @@ fn sessionizerServerReady(raw_context: *anyopaque) !void {
         .endpoint = context.endpoint,
         .stop_requested = context.stop_requested,
     }});
+    if (context.ready_callback) |callback| try callback.notify(callback.context);
 }
 
 /// Invoked by platform_ipc.serve after the accept loop exits, BEFORE the
@@ -6605,6 +7120,11 @@ fn sessionizerServerClosing(raw_context: *anyopaque) void {
 fn isStoreMethod(method: []const u8) bool {
     return std.mem.eql(u8, method, store_protocol.METHOD_STATE_SNAPSHOT_REPLACE) or
         std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_UPSERT) or
+        std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_UPSERT) or
+        std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_REMOVE) or
+        std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_DEFAULT_SET) or
+        std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_BINDING_UPSERT) or
+        std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_BINDING_REMOVE) or
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_UPSERT) or
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_DRAFT_SET) or
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_MESSAGE_APPEND) or
@@ -6613,8 +7133,11 @@ fn isStoreMethod(method: []const u8) bool {
         std.mem.eql(u8, method, store_protocol.METHOD_NOTIFICATION_CHAT_COMPLETION_UPSERT) or
         std.mem.eql(u8, method, store_protocol.METHOD_NOTIFICATION_CHAT_COMPLETION_CLEAR) or
         std.mem.eql(u8, method, store_protocol.METHOD_DAEMON_STORE_STATUS) or
+        std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_LIST) or
+        std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_MANIFEST_GET) or
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_GET) or
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_LIST) or
+        std.mem.eql(u8, method, store_protocol.METHOD_CHAT_MESSAGE_LIST) or
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_TURN_RECORD) or
         // M5-P2: the composite snapshot and cursor route through the same
         // classify → store-queue seam (A1) so they never run under the outer
@@ -6697,6 +7220,11 @@ fn storeMutationCommittedHook(context: *anyopaque, mutation: *const daemon_store
             daemon.signalChangesWaiters();
         },
         .workspace_upsert => |request| daemon.appendJournalEntry(.workspace, request.workspace.workspace_id, request.workspace.workspace_id, revision),
+        .workspace_repository_upsert => |request| daemon.appendJournalEntry(.workspace, request.workspace_id, request.workspace_id, revision),
+        .workspace_repository_remove => |request| daemon.appendJournalEntry(.workspace, request.workspace_id, request.workspace_id, revision),
+        .workspace_default_repository_set => |request| daemon.appendJournalEntry(.workspace, request.workspace_id, request.workspace_id, revision),
+        .workspace_repository_binding_upsert => |request| daemon.appendJournalEntry(.workspace, request.workspace_id, request.workspace_id, revision),
+        .workspace_repository_binding_remove => |request| daemon.appendJournalEntry(.workspace, request.workspace_id, request.workspace_id, revision),
         .thread_upsert => |request| daemon.appendJournalEntry(.chat_thread, request.thread.local_thread_id, request.workspace_id, revision),
         .chat_draft_set => |request| daemon.appendJournalEntry(.chat_thread, request.local_thread_id, request.workspace_id, revision),
         .message_append => |request| daemon.appendJournalEntry(.chat_thread, request.thread_id, request.workspace_id, revision),
@@ -6761,6 +7289,11 @@ fn mutationHeader(mutation: daemon_store.Mutation) store_protocol.MutationHeader
     return switch (mutation) {
         .snapshot_replace => |request| request.mutation,
         .workspace_upsert => |request| request.mutation,
+        .workspace_repository_upsert => |request| request.mutation,
+        .workspace_repository_remove => |request| request.mutation,
+        .workspace_default_repository_set => |request| request.mutation,
+        .workspace_repository_binding_upsert => |request| request.mutation,
+        .workspace_repository_binding_remove => |request| request.mutation,
         .thread_upsert => |request| request.mutation,
         .chat_draft_set => |request| request.mutation,
         .message_append => |request| request.mutation,
@@ -6873,36 +7406,61 @@ fn storeFaultFromEnv(allocator: std.mem.Allocator) !daemon_store.StoreFault {
 /// VERDE_SESSION_DAEMON_STORE_DISABLE. Runs the shared migration chain and
 /// advertises store=true only after the writer is published.
 fn maybeInitStoreService(daemon: *Daemon) !void {
-    // NIT-2: a stray VERDE_SESSION_DAEMON_STORE_DISABLE in a user session is
-    // production-latent (GUI read-only, notify hard-fails). Loud warn so the
-    // knob is deliberate at runtime, not only in comments.
-    if (try storeDisabledFromEnv(daemon.allocator)) {
-        log.warn(
-            "store disabled by env — daemon is store-less; GUI read-only, notify will fail",
-            .{},
-        );
-        return;
-    }
-
     // NIT-1: never silently store-less. Empty pref_path is unreachable in
     // production (__session-daemon always passes a real path).
     if (daemon.pref_path.len == 0) {
         log.err("production store open requires non-empty pref_path", .{});
         return error.InvalidParams;
     }
+    // Resolve identity and SQLite from the same effective directory. This is
+    // essential for hermetic overrides: a test database must never bind to or
+    // rotate the production preference-directory identity.
     const effective_dir = try effectiveStoreDirectory(daemon.allocator, daemon.pref_path);
     defer daemon.allocator.free(effective_dir.path);
+    var threaded: std.Io.Threaded = .init(daemon.allocator, .{});
+    defer threaded.deinit();
+
+    // NIT-2: a stray VERDE_SESSION_DAEMON_STORE_DISABLE in a user session is
+    // production-latent (GUI read-only, notify hard-fails). Loud warn so the
+    // knob is deliberate at runtime, not only in comments. This explicit
+    // test-only mode has a secure file identity but no SQLite authority; the
+    // normal production path below always cross-checks both durable copies.
+    if (try storeDisabledFromEnv(daemon.allocator)) {
+        var identity = try daemon_runtime_identity.loadOrCreateFileOnly(
+            daemon.allocator,
+            threaded.io(),
+            effective_dir.path,
+        );
+        replaceDaemonRuntimeIdentity(daemon, identity);
+        identity = undefined;
+        log.warn(
+            "store disabled by env — identity is file-only; GUI read-only, notify will fail",
+            .{},
+        );
+        return;
+    }
+
     // B9: fault env is active only alongside the hermetic store-dir override.
     const fault = if (effective_dir.overridden) try storeFaultFromEnv(daemon.allocator) else daemon_store.StoreFault.none;
-    const db_path = try std.fs.path.join(daemon.allocator, &.{ effective_dir.path, "state.sqlite" });
+    const db_path = try std.fs.path.join(daemon.allocator, &.{ effective_dir.path, daemon_runtime_identity.DATABASE_FILE_NAME });
     defer daemon.allocator.free(db_path);
 
     const service = try daemon.allocator.create(StoreService);
     errdefer daemon.allocator.destroy(service);
+    var initialized = try daemon_runtime_identity.initStore(
+        daemon.allocator,
+        threaded.io(),
+        effective_dir.path,
+        db_path,
+        fault,
+    );
+    defer initialized.deinit(daemon.allocator);
     service.* = .{
-        .store = try daemon_store.Store.initWithFault(daemon.allocator, db_path, fault),
+        .store = initialized.takeStore(),
     };
     errdefer service.store.deinit();
+    const identity = initialized.takeIdentity();
+    replaceDaemonRuntimeIdentity(daemon, identity);
     // M5-P2 journal hook: every durable commit (mutations AND turn commits)
     // publishes identity entries post-commit. Installed before the service is
     // published so no committed write can slip past the journal.
@@ -6926,6 +7484,13 @@ fn maybeInitStoreService(daemon: *Daemon) !void {
     lockDaemon(daemon);
     daemon.store_service = service;
     daemon.mutex.unlock();
+}
+
+fn replaceDaemonRuntimeIdentity(daemon: *Daemon, identity: daemon_runtime_identity.OwnedIdentity) void {
+    daemon.allocator.free(daemon.runtime_id);
+    daemon.allocator.free(daemon.instance_id);
+    daemon.runtime_id = identity.runtime_id;
+    daemon.instance_id = identity.instance_id;
 }
 
 /// Mark dangling non-terminal ledger rows interrupted. Runs under the store
@@ -6966,6 +7531,9 @@ fn stageAcceptedChatTurn(daemon: *Daemon, turn: *ChatTurn) !AcceptanceOwnership 
     const workspace_id = try arena.dupe(u8, turn.workspace_id);
     const local_thread_id = try arena.dupe(u8, turn.local_thread_id);
     const project_path = try arena.dupe(u8, turn.request.project_path);
+    const repository_id = if (turn.repository_id) |value| try arena.dupe(u8, value) else null;
+    const repository_cwd = if (turn.repository_cwd) |value| try arena.dupe(u8, value) else null;
+    const runtime_id = if (repository_id != null) try arena.dupe(u8, daemon.runtime_id) else null;
     const provider = try arena.dupe(u8, @tagName(turn.request.provider));
     const harness_kind = @tagName(turn.request.harness_kind);
     const provider_thread_id = if (turn.request.provider_thread_id) |id| try arena.dupe(u8, id) else null;
@@ -7032,6 +7600,10 @@ fn stageAcceptedChatTurn(daemon: *Daemon, turn: *ChatTurn) !AcceptanceOwnership 
             .reasoning_variant = turn.request.opencode_reasoning_variant,
             .fast_mode = @tagName(turn.request.fast_mode),
             .access_mode = @tagName(turn.request.access_mode),
+            .profile_id = if (repository_id != null) "local" else null,
+            .runtime_id = runtime_id,
+            .repository_id = repository_id,
+            .repository_cwd = repository_cwd,
         },
         .started_at_ms = started_at_ms,
         .provider = provider,
@@ -7121,6 +7693,9 @@ fn commitChatTurnDurable(daemon: *Daemon, turn: *ChatTurn) !void {
     const local_thread_id = try arena.dupe(u8, turn.local_thread_id);
     const provider = try arena.dupe(u8, @tagName(turn.request.provider));
     const project_path = try arena.dupe(u8, turn.request.project_path);
+    const repository_id = if (turn.repository_id) |value| try arena.dupe(u8, value) else null;
+    const repository_cwd = if (turn.repository_cwd) |value| try arena.dupe(u8, value) else null;
+    const runtime_id = if (repository_id != null) try arena.dupe(u8, daemon.runtime_id) else null;
     const thread_title = try arena.dupe(u8, turn.request.thread_title);
     const harness_kind = @tagName(turn.request.harness_kind);
     const started_at_ms = turn.started_at_ms;
@@ -7245,6 +7820,10 @@ fn commitChatTurnDurable(daemon: *Daemon, turn: *ChatTurn) !void {
             .reasoning_variant = turn.request.opencode_reasoning_variant,
             .fast_mode = @tagName(turn.request.fast_mode),
             .access_mode = @tagName(turn.request.access_mode),
+            .profile_id = if (repository_id != null) "local" else null,
+            .runtime_id = runtime_id,
+            .repository_id = repository_id,
+            .repository_cwd = repository_cwd,
         },
         .expected_thread_title = if (generated_title != null) thread_title else null,
         .generated_title = generated_title,
@@ -7352,7 +7931,8 @@ fn loadThreadGetResult(
     const meta_or_null = store.conn.row(
         \\select t.local_thread_id, t.title, t.archived, t.committed, t.last_activity_at,
         \\       t.provider_thread_id, t.model_ref, t.reasoning_effort, t.reasoning_variant,
-        \\       t.fast_mode, t.access_mode, t.provider, t.harness, t.id, t.draft, t.cwd
+        \\       t.fast_mode, t.access_mode, t.provider, t.harness, t.id, t.draft, t.cwd,
+        \\       t.profile_id, t.runtime_id, t.repository_id, t.repository_cwd
         \\from threads t
         \\join workspaces w on w.id = t.workspace_id
         \\where w.workspace_id = ?1 and t.local_thread_id = ?2
@@ -7381,6 +7961,14 @@ fn loadThreadGetResult(
     errdefer allocator.free(draft);
     const cwd = dupeOptionalText(allocator, meta.nullableText(15)) catch return error.OutOfMemory;
     errdefer if (cwd) |value| allocator.free(value);
+    const profile_id = dupeOptionalText(allocator, meta.nullableText(16)) catch return error.OutOfMemory;
+    errdefer if (profile_id) |value| allocator.free(value);
+    const runtime_id = dupeOptionalText(allocator, meta.nullableText(17)) catch return error.OutOfMemory;
+    errdefer if (runtime_id) |value| allocator.free(value);
+    const repository_id = dupeOptionalText(allocator, meta.nullableText(18)) catch return error.OutOfMemory;
+    errdefer if (repository_id) |value| allocator.free(value);
+    const repository_cwd = dupeOptionalText(allocator, meta.nullableText(19)) catch return error.OutOfMemory;
+    errdefer if (repository_cwd) |value| allocator.free(value);
     const archived = meta.int(2) != 0;
     const committed = meta.int(3) != 0;
     const last_activity_at = meta.nullableInt(4);
@@ -7391,7 +7979,7 @@ fn loadThreadGetResult(
         messages_list.deinit(allocator);
     }
     var rows = store.conn.rows(
-        \\select message_id, role, author, body, image_path, image_mime,
+        \\select sort_index, message_id, role, author, body, image_path, image_mime,
         \\       image_byte_size, extra_images_json, created_at_ms, updated_at_ms,
         \\       tool_call_id, tool_call_kind, tool_call_status
         \\from messages where thread_id = ?1 order by sort_index
@@ -7400,48 +7988,9 @@ fn loadThreadGetResult(
     ) catch return error.StoreUnavailable;
     defer rows.deinit();
     while (rows.next()) |row| {
-        const message_id = allocator.dupe(u8, row.nullableText(0) orelse "") catch return error.OutOfMemory;
-        errdefer allocator.free(message_id);
-        const author_raw = row.text(2);
-        const role = allocator.dupe(u8, roleNameFromCode(row.int(1), author_raw)) catch return error.OutOfMemory;
-        errdefer allocator.free(role);
-        const author = allocator.dupe(u8, author_raw) catch return error.OutOfMemory;
-        errdefer allocator.free(author);
-        const body = allocator.dupe(u8, row.text(3)) catch return error.OutOfMemory;
-        errdefer allocator.free(body);
-        const images = try decodeOwnedAttachmentList(
-            allocator,
-            row.nullableText(4),
-            row.nullableText(5),
-            row.nullableInt(6),
-            row.nullableText(7),
-        );
-        errdefer freeAttachmentArray(allocator, images);
-        const tool_call_id = dupeOptionalText(allocator, row.nullableText(10)) catch return error.OutOfMemory;
-        errdefer if (tool_call_id) |value| allocator.free(value);
-        const tool_call_kind = if (row.nullableInt(11)) |code|
-            (allocator.dupe(u8, toolCallKindNameFromCode(code)) catch return error.OutOfMemory)
-        else
-            null;
-        errdefer if (tool_call_kind) |value| allocator.free(value);
-        const tool_call_status = if (row.nullableInt(12)) |code|
-            (allocator.dupe(u8, toolCallStatusNameFromCode(code)) catch return error.OutOfMemory)
-        else
-            null;
-        errdefer if (tool_call_status) |value| allocator.free(value);
-        messages_list.append(allocator, .{
-            .message_id = message_id,
-            .role = role,
-            .author = author,
-            .body = body,
-            .images = images,
-            .image = if (images.len > 0) images[0] else null,
-            .created_at_ms = row.nullableInt(8),
-            .updated_at_ms = row.nullableInt(9),
-            .tool_call_id = tool_call_id,
-            .tool_call_kind = tool_call_kind,
-            .tool_call_status = tool_call_status,
-        }) catch return error.OutOfMemory;
+        const message = try decodeOwnedMessage(allocator, row);
+        errdefer freeOwnedMessage(allocator, message);
+        messages_list.append(allocator, message) catch return error.OutOfMemory;
     }
     if (rows.err) |_| return error.StoreUnavailable;
 
@@ -7463,6 +8012,10 @@ fn loadThreadGetResult(
             .harness = harness_name,
             .draft = draft,
             .cwd = cwd,
+            .profile_id = profile_id,
+            .runtime_id = runtime_id,
+            .repository_id = repository_id,
+            .repository_cwd = repository_cwd,
             .messages = try messages_list.toOwnedSlice(allocator),
         },
         .store_revision = store_revision,
@@ -7479,6 +8032,10 @@ fn freeThreadGetResult(allocator: std.mem.Allocator, result: store_protocol.Thre
     allocator.free(result.thread.harness);
     allocator.free(result.thread.draft);
     if (result.thread.cwd) |value| allocator.free(value);
+    if (result.thread.profile_id) |value| allocator.free(value);
+    if (result.thread.runtime_id) |value| allocator.free(value);
+    if (result.thread.repository_id) |value| allocator.free(value);
+    if (result.thread.repository_cwd) |value| allocator.free(value);
     for (result.thread.messages) |message| freeOwnedMessage(allocator, message);
     allocator.free(result.thread.messages);
 }
@@ -7497,6 +8054,56 @@ fn freeOwnedMessage(allocator: std.mem.Allocator, message: store_protocol.Messag
     if (message.tool_call_id) |value| allocator.free(value);
     if (message.tool_call_kind) |value| allocator.free(value);
     if (message.tool_call_status) |value| allocator.free(value);
+}
+
+/// Decode one owned message from the shared transcript-column projection.
+fn decodeOwnedMessage(
+    allocator: std.mem.Allocator,
+    row: zqlite.Row,
+) daemon_store.StoreError!store_protocol.Message {
+    const message_id = allocator.dupe(u8, row.nullableText(1) orelse "") catch return error.OutOfMemory;
+    errdefer allocator.free(message_id);
+    const author_raw = row.text(3);
+    const role = allocator.dupe(u8, roleNameFromCode(row.int(2), author_raw)) catch return error.OutOfMemory;
+    errdefer allocator.free(role);
+    const author = allocator.dupe(u8, author_raw) catch return error.OutOfMemory;
+    errdefer allocator.free(author);
+    const body = allocator.dupe(u8, row.text(4)) catch return error.OutOfMemory;
+    errdefer allocator.free(body);
+    const images = try decodeOwnedAttachmentList(
+        allocator,
+        row.nullableText(5),
+        row.nullableText(6),
+        row.nullableInt(7),
+        row.nullableText(8),
+    );
+    errdefer freeAttachmentArray(allocator, images);
+    const tool_call_id = dupeOptionalText(allocator, row.nullableText(11)) catch return error.OutOfMemory;
+    errdefer if (tool_call_id) |value| allocator.free(value);
+    const tool_call_kind = if (row.nullableInt(12)) |code|
+        (allocator.dupe(u8, toolCallKindNameFromCode(code)) catch return error.OutOfMemory)
+    else
+        null;
+    errdefer if (tool_call_kind) |value| allocator.free(value);
+    const tool_call_status = if (row.nullableInt(13)) |code|
+        (allocator.dupe(u8, toolCallStatusNameFromCode(code)) catch return error.OutOfMemory)
+    else
+        null;
+    errdefer if (tool_call_status) |value| allocator.free(value);
+    return .{
+        .sort_index = std.math.cast(usize, row.int(0)) orelse return error.StoreCorrupt,
+        .message_id = message_id,
+        .role = role,
+        .author = author,
+        .body = body,
+        .images = images,
+        .image = if (images.len > 0) images[0] else null,
+        .created_at_ms = row.nullableInt(9),
+        .updated_at_ms = row.nullableInt(10),
+        .tool_call_id = tool_call_id,
+        .tool_call_kind = tool_call_kind,
+        .tool_call_status = tool_call_status,
+    };
 }
 
 /// Decode one owned chat.thread.get attachment list. Unlike snapshot reads,
@@ -7565,13 +8172,197 @@ fn decodeOwnedAttachmentList(
     return attachments.toOwnedSlice(allocator) catch return error.OutOfMemory;
 }
 
+fn boundedPageLimit(requested: u32) daemon_store.StoreError!u32 {
+    const limit = if (requested == 0) store_protocol.DEFAULT_PAGE_ITEMS else requested;
+    if (limit > store_protocol.MAX_PAGE_ITEMS) return error.InvalidParams;
+    return limit;
+}
+
+fn decodePageCursor(
+    cursor: ?[]const u8,
+    kind: headless.pagination.Kind,
+    store_revision: u64,
+    query_scope: []const u8,
+) daemon_store.StoreError!usize {
+    return headless.pagination.decode(cursor, kind, store_revision, query_scope) catch |err| switch (err) {
+        error.InvalidCursor => error.PageCursorInvalid,
+        error.StaleCursor => error.PageCursorStale,
+        error.QueryMismatch => error.PageCursorMismatch,
+    };
+}
+
+fn encodePageCursor(
+    allocator: std.mem.Allocator,
+    kind: headless.pagination.Kind,
+    store_revision: u64,
+    query_scope: []const u8,
+    offset: usize,
+) daemon_store.StoreError![]u8 {
+    return headless.pagination.encodeAlloc(
+        allocator,
+        kind,
+        store_revision,
+        query_scope,
+        offset,
+    ) catch return error.OutOfMemory;
+}
+
+fn workspacePageScope(include_archived: bool) []const u8 {
+    return if (include_archived) "all" else "active";
+}
+
+fn decodeMessageIndex(cursor: ?[]const u8, prefix: u8) daemon_store.StoreError!usize {
+    const value = cursor orelse return 0;
+    if (value.len < 3 or value[0] != prefix or value[1] != ':') return error.InvalidParams;
+    for (value[2..]) |char| {
+        if (char < '0' or char > '9') return error.InvalidParams;
+    }
+    return std.fmt.parseInt(usize, value[2..], 10) catch return error.InvalidParams;
+}
+
+fn encodeMessageIndex(
+    allocator: std.mem.Allocator,
+    prefix: u8,
+    index: usize,
+) daemon_store.StoreError![]u8 {
+    return std.fmt.allocPrint(allocator, "{c}:{d}", .{ prefix, index }) catch return error.OutOfMemory;
+}
+
+fn makePrimaryRepository(
+    allocator: std.mem.Allocator,
+    runtime_id: []const u8,
+    root_path: []const u8,
+) daemon_store.StoreError!store_protocol.Repository {
+    const repository_id = allocator.dupe(u8, store_protocol.PRIMARY_REPOSITORY_ID) catch return error.OutOfMemory;
+    errdefer allocator.free(repository_id);
+    const label = allocator.dupe(u8, "Primary") catch return error.OutOfMemory;
+    errdefer allocator.free(label);
+    const binding_runtime_id = allocator.dupe(u8, runtime_id) catch return error.OutOfMemory;
+    errdefer allocator.free(binding_runtime_id);
+    const binding_root_path = allocator.dupe(u8, root_path) catch return error.OutOfMemory;
+    errdefer allocator.free(binding_root_path);
+    const bindings = allocator.alloc(store_protocol.RepositoryBinding, 1) catch return error.OutOfMemory;
+    bindings[0] = .{
+        .runtime_id = binding_runtime_id,
+        .root_path = binding_root_path,
+    };
+    return .{
+        .repository_id = repository_id,
+        .label = label,
+        .bindings = bindings,
+    };
+}
+
+fn freeRepository(allocator: std.mem.Allocator, repository: store_protocol.Repository) void {
+    allocator.free(repository.repository_id);
+    allocator.free(repository.label);
+    if (repository.vcs_identity) |value| allocator.free(value);
+    if (repository.default_branch) |value| allocator.free(value);
+    for (repository.bindings) |binding| {
+        allocator.free(binding.runtime_id);
+        allocator.free(binding.root_path);
+    }
+    if (repository.bindings.len > 0) allocator.free(repository.bindings);
+}
+
+fn freeWorkspaceListItem(allocator: std.mem.Allocator, item: store_protocol.WorkspaceListItem) void {
+    allocator.free(item.workspace_id);
+    allocator.free(item.label);
+    allocator.free(item.path);
+    for (item.repositories) |repository| freeRepository(allocator, repository);
+    if (item.repositories.len > 0) allocator.free(item.repositories);
+}
+
+fn loadWorkspaceListResult(
+    allocator: std.mem.Allocator,
+    store: *daemon_store.Store,
+    runtime_id: []const u8,
+    request: store_protocol.WorkspaceListRequest,
+) daemon_store.StoreError!store_protocol.WorkspaceListResult {
+    const limit = try boundedPageLimit(request.limit);
+    const store_revision = store.storeRevision() catch return error.StoreUnavailable;
+    const query_scope = workspacePageScope(request.include_archived);
+    const offset = try decodePageCursor(request.cursor, .workspace, store_revision, query_scope);
+    const offset_i64 = std.math.cast(i64, offset) orelse return error.InvalidParams;
+    const fetch_limit: i64 = @intCast(limit + 1);
+
+    var items: std.ArrayListUnmanaged(store_protocol.WorkspaceListItem) = .empty;
+    errdefer {
+        for (items.items) |item| freeWorkspaceListItem(allocator, item);
+        items.deinit(allocator);
+    }
+    var rows = store.conn.rows(
+        \\select workspace_id, label, path, sort_index, archived
+        \\from workspaces
+        \\where (?1 != 0 or archived = 0)
+        \\order by sort_index asc, workspace_id asc
+        \\limit ?2 offset ?3
+    , .{ @as(i64, @intFromBool(request.include_archived)), fetch_limit, offset_i64 }) catch return error.StoreUnavailable;
+    defer rows.deinit();
+    while (rows.next()) |row| {
+        const workspace_id = allocator.dupe(u8, row.text(0)) catch return error.OutOfMemory;
+        errdefer allocator.free(workspace_id);
+        const label = allocator.dupe(u8, row.text(1)) catch return error.OutOfMemory;
+        errdefer allocator.free(label);
+        const path = allocator.dupe(u8, row.text(2)) catch return error.OutOfMemory;
+        errdefer allocator.free(path);
+        const repository = try makePrimaryRepository(allocator, runtime_id, row.text(2));
+        errdefer freeRepository(allocator, repository);
+        const repositories = allocator.alloc(store_protocol.Repository, 1) catch return error.OutOfMemory;
+        repositories[0] = repository;
+        errdefer allocator.free(repositories);
+        items.append(allocator, .{
+            .workspace_id = workspace_id,
+            .label = label,
+            .path = path,
+            .sort_index = std.math.cast(usize, row.int(3)) orelse return error.StoreCorrupt,
+            .archived = row.int(4) != 0,
+            .repositories = repositories,
+        }) catch return error.OutOfMemory;
+    }
+    if (rows.err) |_| return error.StoreUnavailable;
+
+    const has_more = items.items.len > @as(usize, limit);
+    if (has_more) {
+        const extra_index = items.items.len - 1;
+        freeWorkspaceListItem(allocator, items.items[extra_index]);
+        items.items.len = extra_index;
+    }
+    const next_cursor = if (has_more) blk: {
+        const next_offset = std.math.add(usize, offset, items.items.len) catch return error.InvalidParams;
+        break :blk try encodePageCursor(
+            allocator,
+            .workspace,
+            store_revision,
+            query_scope,
+            next_offset,
+        );
+    } else null;
+    errdefer if (next_cursor) |value| allocator.free(value);
+    return .{
+        .workspaces = items.toOwnedSlice(allocator) catch return error.OutOfMemory,
+        .next_cursor = next_cursor,
+        .store_revision = store_revision,
+    };
+}
+
+fn freeWorkspaceListResult(allocator: std.mem.Allocator, result: store_protocol.WorkspaceListResult) void {
+    for (result.workspaces) |item| freeWorkspaceListItem(allocator, item);
+    allocator.free(result.workspaces);
+    if (result.next_cursor) |value| allocator.free(value);
+}
+
 fn loadThreadListResult(
     allocator: std.mem.Allocator,
     store: *daemon_store.Store,
     request: store_protocol.ThreadListRequest,
 ) daemon_store.StoreError!store_protocol.ThreadListResult {
     if (request.workspace_id.len == 0) return error.InvalidParams;
-    const limit: u32 = if (request.limit == 0) 100 else request.limit;
+    const limit = try boundedPageLimit(request.limit);
+    const store_revision = store.storeRevision() catch return error.StoreUnavailable;
+    const offset = try decodePageCursor(request.cursor, .thread, store_revision, request.workspace_id);
+    const offset_i64 = std.math.cast(i64, offset) orelse return error.InvalidParams;
+    const fetch_limit: i64 = @intCast(limit + 1);
 
     var items: std.ArrayListUnmanaged(store_protocol.ThreadListItem) = .empty;
     errdefer {
@@ -7582,14 +8373,15 @@ fn loadThreadListResult(
     var rows = store.conn.rows(
         \\select t.local_thread_id, t.title, t.archived, t.committed, t.last_activity_at,
         \\       t.provider_thread_id, t.model_ref, t.reasoning_effort, t.reasoning_variant,
-        \\       t.fast_mode, t.access_mode, t.provider, t.harness, t.sort_index, t.cwd
+        \\       t.fast_mode, t.access_mode, t.provider, t.harness, t.sort_index, t.cwd,
+        \\       t.profile_id, t.runtime_id, t.repository_id, t.repository_cwd
         \\from threads t
         \\join workspaces w on w.id = t.workspace_id
         \\where w.workspace_id = ?1
-        \\order by coalesce(t.last_activity_at, 0) desc, t.local_thread_id asc
-        \\limit ?2
+        \\order by t.sort_index asc, t.local_thread_id asc
+        \\limit ?2 offset ?3
     ,
-        .{ request.workspace_id, @as(i64, @intCast(limit)) },
+        .{ request.workspace_id, fetch_limit, offset_i64 },
     ) catch return error.StoreUnavailable;
     defer rows.deinit();
     while (rows.next()) |row| {
@@ -7609,6 +8401,14 @@ fn loadThreadListResult(
         errdefer allocator.free(harness_name);
         const cwd = dupeOptionalText(allocator, row.nullableText(14)) catch return error.OutOfMemory;
         errdefer if (cwd) |value| allocator.free(value);
+        const profile_id = dupeOptionalText(allocator, row.nullableText(15)) catch return error.OutOfMemory;
+        errdefer if (profile_id) |value| allocator.free(value);
+        const runtime_id = dupeOptionalText(allocator, row.nullableText(16)) catch return error.OutOfMemory;
+        errdefer if (runtime_id) |value| allocator.free(value);
+        const repository_id = dupeOptionalText(allocator, row.nullableText(17)) catch return error.OutOfMemory;
+        errdefer if (repository_id) |value| allocator.free(value);
+        const repository_cwd = dupeOptionalText(allocator, row.nullableText(18)) catch return error.OutOfMemory;
+        errdefer if (repository_cwd) |value| allocator.free(value);
         items.append(allocator, .{
             .local_thread_id = local_thread_id,
             .title = title,
@@ -7625,14 +8425,34 @@ fn loadThreadListResult(
             .provider = provider,
             .harness = harness_name,
             .cwd = cwd,
+            .profile_id = profile_id,
+            .runtime_id = runtime_id,
+            .repository_id = repository_id,
+            .repository_cwd = repository_cwd,
         }) catch return error.OutOfMemory;
     }
     if (rows.err) |_| return error.StoreUnavailable;
 
-    const store_revision = store.storeRevision() catch return error.StoreUnavailable;
+    const has_more = items.items.len > @as(usize, limit);
+    if (has_more) {
+        const extra_index = items.items.len - 1;
+        freeThreadListItem(allocator, items.items[extra_index]);
+        items.items.len = extra_index;
+    }
+    const next_cursor = if (has_more) blk: {
+        const next_offset = std.math.add(usize, offset, items.items.len) catch return error.InvalidParams;
+        break :blk try encodePageCursor(
+            allocator,
+            .thread,
+            store_revision,
+            request.workspace_id,
+            next_offset,
+        );
+    } else null;
+    errdefer if (next_cursor) |value| allocator.free(value);
     return .{
         .threads = try items.toOwnedSlice(allocator),
-        .next_cursor = null,
+        .next_cursor = next_cursor,
         .store_revision = store_revision,
     };
 }
@@ -7652,6 +8472,100 @@ fn freeThreadListItem(allocator: std.mem.Allocator, item: store_protocol.ThreadL
     allocator.free(item.provider);
     allocator.free(item.harness);
     if (item.cwd) |value| allocator.free(value);
+    if (item.profile_id) |value| allocator.free(value);
+    if (item.runtime_id) |value| allocator.free(value);
+    if (item.repository_id) |value| allocator.free(value);
+    if (item.repository_cwd) |value| allocator.free(value);
+}
+
+fn loadMessageListResult(
+    allocator: std.mem.Allocator,
+    store: *daemon_store.Store,
+    request: store_protocol.MessageListRequest,
+) daemon_store.StoreError!store_protocol.MessageListResult {
+    if (request.workspace_id.len == 0 or request.local_thread_id.len == 0) return error.InvalidParams;
+    const is_backward = std.mem.eql(u8, request.direction, "backward");
+    const is_forward = std.mem.eql(u8, request.direction, "forward");
+    if (!is_backward and !is_forward) return error.InvalidParams;
+    const limit = try boundedPageLimit(request.limit);
+    const cursor_index = try decodeMessageIndex(request.cursor, if (is_backward) 'b' else 'f');
+    const boundary: i64 = if (request.cursor) |_|
+        (std.math.cast(i64, cursor_index) orelse return error.InvalidParams)
+    else if (is_backward)
+        std.math.maxInt(i64)
+    else
+        -1;
+    const fetch_limit: i64 = @intCast(limit + 1);
+
+    const thread_row = (store.conn.row(
+        \\select t.id
+        \\from threads t join workspaces w on w.id = t.workspace_id
+        \\where w.workspace_id = ?1 and t.local_thread_id = ?2
+    , .{ request.workspace_id, request.local_thread_id }) catch return error.StoreUnavailable) orelse
+        return error.ResourceNotFound;
+    const thread_row_id = thread_row.int(0);
+    thread_row.deinit();
+
+    var messages: std.ArrayListUnmanaged(store_protocol.Message) = .empty;
+    errdefer {
+        for (messages.items) |message| freeOwnedMessage(allocator, message);
+        messages.deinit(allocator);
+    }
+    var rows = (if (is_backward)
+        store.conn.rows(
+            \\select sort_index, message_id, role, author, body, image_path, image_mime,
+            \\       image_byte_size, extra_images_json, created_at_ms, updated_at_ms,
+            \\       tool_call_id, tool_call_kind, tool_call_status
+            \\from messages
+            \\where thread_id = ?1 and sort_index < ?2
+            \\order by sort_index desc
+            \\limit ?3
+        , .{ thread_row_id, boundary, fetch_limit })
+    else
+        store.conn.rows(
+            \\select sort_index, message_id, role, author, body, image_path, image_mime,
+            \\       image_byte_size, extra_images_json, created_at_ms, updated_at_ms,
+            \\       tool_call_id, tool_call_kind, tool_call_status
+            \\from messages
+            \\where thread_id = ?1 and sort_index > ?2
+            \\order by sort_index asc
+            \\limit ?3
+        , .{ thread_row_id, boundary, fetch_limit })) catch return error.StoreUnavailable;
+    defer rows.deinit();
+    while (rows.next()) |row| {
+        const message = try decodeOwnedMessage(allocator, row);
+        errdefer freeOwnedMessage(allocator, message);
+        messages.append(allocator, message) catch return error.OutOfMemory;
+    }
+    if (rows.err) |_| return error.StoreUnavailable;
+
+    const has_more = messages.items.len > @as(usize, limit);
+    if (has_more) {
+        const extra_index = messages.items.len - 1;
+        freeOwnedMessage(allocator, messages.items[extra_index]);
+        messages.items.len = extra_index;
+    }
+    if (is_backward) std.mem.reverse(store_protocol.Message, messages.items);
+    const next_cursor = if (has_more) blk: {
+        const next_index = if (is_backward)
+            messages.items[0].sort_index
+        else
+            messages.items[messages.items.len - 1].sort_index;
+        break :blk try encodeMessageIndex(allocator, if (is_backward) 'b' else 'f', next_index);
+    } else null;
+    errdefer if (next_cursor) |value| allocator.free(value);
+    const store_revision = store.storeRevision() catch return error.StoreUnavailable;
+    return .{
+        .messages = messages.toOwnedSlice(allocator) catch return error.OutOfMemory,
+        .next_cursor = next_cursor,
+        .store_revision = store_revision,
+    };
+}
+
+fn freeMessageListResult(allocator: std.mem.Allocator, result: store_protocol.MessageListResult) void {
+    for (result.messages) |message| freeOwnedMessage(allocator, message);
+    allocator.free(result.messages);
+    if (result.next_cursor) |value| allocator.free(value);
 }
 
 fn dupeOptionalText(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
@@ -8237,7 +9151,8 @@ fn loadSnapshotContents(
                 \\select id, local_thread_id, title, archived, committed, last_activity_at,
                 \\       provider_thread_id, model_ref, reasoning_effort, reasoning_variant,
                 \\       fast_mode, access_mode, provider, harness, tui_dock_id, draft,
-                \\       draft_image_path, draft_image_mime, draft_image_byte_size, draft_images_json, cwd
+                \\       draft_image_path, draft_image_mime, draft_image_byte_size, draft_images_json, cwd,
+                \\       profile_id, runtime_id, repository_id, repository_cwd
                 \\from threads where workspace_id = ?1 order by sort_index
             , .{workspace_row.row_id}) catch return error.StoreUnavailable;
             defer rows.deinit();
@@ -8269,6 +9184,10 @@ fn loadSnapshotContents(
                         .draft_image = draft_image,
                         .draft_images = draft_images,
                         .cwd = dupeOptionalText(arena, row.nullableText(20)) catch return error.OutOfMemory,
+                        .profile_id = dupeOptionalText(arena, row.nullableText(21)) catch return error.OutOfMemory,
+                        .runtime_id = dupeOptionalText(arena, row.nullableText(22)) catch return error.OutOfMemory,
+                        .repository_id = dupeOptionalText(arena, row.nullableText(23)) catch return error.OutOfMemory,
+                        .repository_cwd = dupeOptionalText(arena, row.nullableText(24)) catch return error.OutOfMemory,
                     },
                 }) catch return error.OutOfMemory;
             }
@@ -8281,7 +9200,7 @@ fn loadSnapshotContents(
             var rows = store.conn.rows(
                 \\select message_id, role, author, body, image_path, image_mime,
                 \\       image_byte_size, tool_call_id, tool_call_kind, tool_call_status,
-                \\       created_at_ms, updated_at_ms, extra_images_json
+                \\       created_at_ms, updated_at_ms, extra_images_json, sort_index
                 \\from messages where thread_id = ?1 order by sort_index
             , .{thread_row.row_id}) catch return error.StoreUnavailable;
             defer rows.deinit();
@@ -8293,6 +9212,7 @@ fn loadSnapshotContents(
                 } else null;
                 const images = try decodeAttachmentList(arena, image, row.nullableText(12));
                 messages.append(arena, .{
+                    .sort_index = std.math.cast(usize, row.int(13)) orelse return error.StoreCorrupt,
                     .message_id = arena.dupe(u8, row.nullableText(0) orelse "") catch return error.OutOfMemory,
                     .role = roleNameFromCode(row.int(1), row.text(2)),
                     .author = arena.dupe(u8, row.text(2)) catch return error.OutOfMemory,
@@ -8390,8 +9310,23 @@ fn storeErrorResponse(
         error.CapabilityUnavailable => .{ .code = headless.protocol.ERR_CAPABILITY_UNAVAILABLE, .message = "store capability is unavailable" },
         error.StoreBusy => .{ .code = headless.protocol.ERR_STORE_BUSY, .message = "store is busy" },
         error.SchemaTooNew => .{ .code = headless.protocol.ERR_SCHEMA_TOO_NEW, .message = "database schema is newer than this daemon" },
-        error.StoreCorrupt => .{ .code = headless.protocol.ERR_STORE_CORRUPT, .message = "store is corrupt" },
+        error.StoreCorrupt,
+        error.RuntimeIdentityMismatch,
+        error.InvalidRuntimeIdentity,
+        => .{ .code = headless.protocol.ERR_STORE_CORRUPT, .message = "store is corrupt" },
         error.StoreUnavailable => .{ .code = headless.protocol.ERR_STORE_UNAVAILABLE, .message = "store is unavailable" },
+        error.PageCursorInvalid => .{
+            .code = headless.protocol.ERR_INVALID_PARAMS,
+            .message = "invalid page cursor; restart pagination without a cursor",
+        },
+        error.PageCursorStale => .{
+            .code = headless.protocol.ERR_REVISION_EXPIRED,
+            .message = "page cursor is stale; restart pagination without a cursor",
+        },
+        error.PageCursorMismatch => .{
+            .code = headless.protocol.ERR_INVALID_PARAMS,
+            .message = "page cursor does not match this query; restart pagination without a cursor",
+        },
         error.Internal => .{ .code = headless.protocol.ERR_INTERNAL, .message = "internal store error" },
         error.OutOfMemory => return error.OutOfMemory,
     };
@@ -8411,9 +9346,10 @@ fn methodRunsUnlocked(method: []const u8) bool {
         std.mem.eql(u8, method, "chat.turn.tail") or
         std.mem.eql(u8, method, "chat.turn.steer") or
         std.mem.eql(u8, method, "chat.followup") or
-        // Read-only provider discovery can block for seconds on provider
-        // CLIs/servers; it touches no daemon state, so never hold lockDaemon.
+        // Read-only provider discovery performs bounded PATH lookups and
+        // touches no daemon state, so never hold lockDaemon around filesystem I/O.
         std.mem.eql(u8, method, "provider.models.list") or
+        std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDERS_STATUS) or
         // FX lifecycle persistence uses the store spine and owns its short
         // lockDaemon window, like the other unlocked mutation paths.
         isFxLifecycleMethod(method) or
@@ -9608,7 +10544,310 @@ test "turn images param and stored extra-image columns round-trip full lists" {
     try std.testing.expectEqual(@as(usize, 0), no_primary.len);
 }
 
-fn createChatTurnFromParams(allocator: std.mem.Allocator, params: std.json.Value) !*ChatTurn {
+const ChatExecutionRoute = struct {
+    project_path: []u8,
+    cwd: ?[]u8,
+    repository_id: []u8,
+    relative_cwd: ?[]u8,
+
+    fn deinit(self: *ChatExecutionRoute, allocator: std.mem.Allocator) void {
+        allocator.free(self.project_path);
+        if (self.cwd) |value| allocator.free(value);
+        allocator.free(self.repository_id);
+        if (self.relative_cwd) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
+const ChatExecutionRouteError = error{
+    InvalidParams,
+    RouteAttachmentsUnsupported,
+    CapabilityUnavailable,
+    ResourceNotFound,
+    StoreCorrupt,
+    StoreUnavailable,
+    OutOfMemory,
+};
+
+/// Resolve a client-controlled stable repository identity to this daemon's
+/// exact runtime-local checkout. Route-mode callers cannot supply absolute
+/// execution paths; legacy local callers retain their existing contract.
+fn resolveChatExecutionRoute(
+    daemon: *Daemon,
+    params: std.json.Value,
+) ChatExecutionRouteError!?ChatExecutionRoute {
+    if (params != .object) return error.InvalidParams;
+    const repository_value = params.object.get("repository_id") orelse {
+        if (params.object.get("relative_cwd") != null) return error.InvalidParams;
+        return null;
+    };
+    const repository_id = jsonString(repository_value) orelse return error.InvalidParams;
+    if (params.object.get("project_path") != null or params.object.get("cwd") != null) {
+        return error.InvalidParams;
+    }
+    if (try jsonArrayHasItems(params.object.get("image_paths")) or
+        try jsonArrayHasItems(params.object.get("images")) or
+        jsonValueIsPresent(params.object.get("image")))
+    {
+        return error.RouteAttachmentsUnsupported;
+    }
+
+    const workspace_id = jsonString(params.object.get("workspace_id") orelse .null) orelse
+        return error.InvalidParams;
+    const relative_cwd: ?[]const u8 = if (params.object.get("relative_cwd")) |value|
+        switch (value) {
+            .null => null,
+            .string => |text| text,
+            else => return error.InvalidParams,
+        }
+    else
+        null;
+    daemon_store.validateRepositoryRelativeCwd(relative_cwd) catch return error.InvalidParams;
+
+    lockDaemon(daemon);
+    const service = daemon.store_service;
+    if (service) |svc| _ = svc.lifetime_pins.fetchAdd(1, .monotonic);
+    daemon.mutex.unlock();
+    const svc = service orelse return error.CapabilityUnavailable;
+    defer _ = svc.lifetime_pins.fetchSub(1, .monotonic);
+
+    var binding = blk: {
+        lockStoreService(svc);
+        defer svc.mutex.unlock();
+        break :blk svc.store.loadWorkspaceRepositoryBinding(
+            workspace_id,
+            repository_id,
+            daemon.runtime_id,
+        ) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.InvalidParams => error.InvalidParams,
+            error.ResourceNotFound => error.ResourceNotFound,
+            error.CapabilityUnavailable => error.CapabilityUnavailable,
+            error.StoreCorrupt,
+            error.RuntimeIdentityMismatch,
+            error.InvalidRuntimeIdentity,
+            => error.StoreCorrupt,
+            else => error.StoreUnavailable,
+        };
+    };
+    defer binding.deinit(daemon.allocator);
+    if (!std.mem.eql(u8, binding.availability, "available")) {
+        return error.CapabilityUnavailable;
+    }
+
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const resolved = repository_path.resolveDirectoryAlloc(
+        daemon.allocator,
+        threaded.io(),
+        binding.root_path,
+        relative_cwd,
+    ) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidRepositoryCwd => error.InvalidParams,
+        error.InvalidRepositoryRoot => error.StoreCorrupt,
+        error.RepositoryPathUnavailable => error.CapabilityUnavailable,
+    };
+    errdefer daemon.allocator.free(resolved);
+
+    const owned_repository_id = daemon.allocator.dupe(u8, repository_id) catch return error.OutOfMemory;
+    errdefer daemon.allocator.free(owned_repository_id);
+    const owned_relative_cwd = if (relative_cwd) |value|
+        daemon.allocator.dupe(u8, value) catch return error.OutOfMemory
+    else
+        null;
+    errdefer if (owned_relative_cwd) |value| daemon.allocator.free(value);
+
+    if (relative_cwd == null) {
+        return .{
+            .project_path = resolved,
+            .cwd = null,
+            .repository_id = owned_repository_id,
+            .relative_cwd = null,
+        };
+    }
+    const project_path = daemon.allocator.dupe(u8, binding.root_path) catch return error.OutOfMemory;
+    return .{
+        .project_path = project_path,
+        .cwd = resolved,
+        .repository_id = owned_repository_id,
+        .relative_cwd = owned_relative_cwd,
+    };
+}
+
+fn jsonArrayHasItems(value: ?std.json.Value) error{InvalidParams}!bool {
+    const present = value orelse return false;
+    return switch (present) {
+        .null => false,
+        .array => |array| array.items.len != 0,
+        else => error.InvalidParams,
+    };
+}
+
+fn jsonValueIsPresent(value: ?std.json.Value) bool {
+    const present = value orelse return false;
+    return switch (present) {
+        .null => false,
+        else => true,
+    };
+}
+
+test "repository-routed chat resolves only the daemon binding and persists the stable route" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "repo/services/api");
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const temporary_root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const repository_root = try std.fs.path.join(allocator, &.{ root_buffer[0..temporary_root_len], "repo" });
+    defer allocator.free(repository_root);
+    const expected_cwd = try std.fs.path.join(allocator, &.{ repository_root, "services/api" });
+    defer allocator.free(expected_cwd);
+
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    const service = try allocator.create(StoreService);
+    const store = daemon_store.Store.initWithRuntimeIdentity(allocator, db_path, .none, .{
+        .runtime_id = daemon.runtime_id,
+        .instance_id = daemon.instance_id,
+    }) catch |err| {
+        allocator.destroy(service);
+        return err;
+    };
+    service.* = .{
+        .store = store,
+    };
+    daemon.store_service = service;
+    defer detachTestStoreService(&daemon);
+
+    {
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        _ = try service.store.upsertWorkspace(.{
+            .mutation = .{ .request_key = "route-workspace", .client_id = "route-test" },
+            .workspace = .{
+                .workspace_id = "route-workspace",
+                .label = "Route workspace",
+                .path = repository_root,
+            },
+        });
+    }
+
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"turn_id":"route-turn","workspace_id":"route-workspace","local_thread_id":"route-thread","repository_id":"primary","relative_cwd":"services/api","provider":"codex","harness":"local_cli","prompt":"hello","image_paths":[],"images":[],"thread_title":"Routed","access_mode":"supervised","message_id":"route-message"}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+    var route = (try resolveChatExecutionRoute(&daemon, parsed.value)).?;
+    defer route.deinit(allocator);
+    try std.testing.expectEqualStrings(repository_root, route.project_path);
+    try std.testing.expectEqualStrings(expected_cwd, route.cwd.?);
+    try std.testing.expectEqualStrings("primary", route.repository_id);
+    try std.testing.expectEqualStrings("services/api", route.relative_cwd.?);
+
+    const turn = try createChatTurnFromParams(allocator, parsed.value, &route);
+    defer turn.deinit(allocator);
+    try std.testing.expectEqualStrings(repository_root, turn.request.project_path);
+    try std.testing.expectEqualStrings(expected_cwd, turn.request.cwd.?);
+    try std.testing.expectEqual(AcceptanceOwnership.owned, try stageAcceptedChatTurn(&daemon, turn));
+
+    {
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        var thread_row = (try service.store.conn.row(
+            "select profile_id, runtime_id, repository_id, repository_cwd, cwd from threads where local_thread_id = ?1",
+            .{"route-thread"},
+        )).?;
+        defer thread_row.deinit();
+        try std.testing.expectEqualStrings("local", thread_row.text(0));
+        try std.testing.expectEqualStrings(daemon.runtime_id, thread_row.text(1));
+        try std.testing.expectEqualStrings("primary", thread_row.text(2));
+        try std.testing.expectEqualStrings("services/api", thread_row.text(3));
+        try std.testing.expect(thread_row.nullableText(4) == null);
+    }
+
+    const missing = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"workspace_id":"route-workspace","repository_id":"not-configured"}
+    ,
+        .{},
+    );
+    defer missing.deinit();
+    try std.testing.expectError(error.ResourceNotFound, resolveChatExecutionRoute(&daemon, missing.value));
+
+    {
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        _ = try service.store.upsertWorkspaceRepositoryBinding(.{
+            .mutation = .{ .request_key = "route-binding-missing", .client_id = "route-test" },
+            .workspace_id = "route-workspace",
+            .repository_id = "primary",
+            .binding = .{
+                .runtime_id = daemon.runtime_id,
+                .root_path = repository_root,
+                .availability = "missing",
+            },
+        });
+    }
+    try std.testing.expectError(error.CapabilityUnavailable, resolveChatExecutionRoute(&daemon, parsed.value));
+}
+
+test "repository-routed chat rejects client paths attachments storeless use and orphan cwd" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+
+    const smuggled = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"workspace_id":"route-workspace","repository_id":"primary","project_path":"/client/path"}
+    ,
+        .{},
+    );
+    defer smuggled.deinit();
+    try std.testing.expectError(error.InvalidParams, resolveChatExecutionRoute(&daemon, smuggled.value));
+
+    const attached = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"workspace_id":"route-workspace","repository_id":"primary","image_paths":["/client/secret.png"]}
+    ,
+        .{},
+    );
+    defer attached.deinit();
+    try std.testing.expectError(error.RouteAttachmentsUnsupported, resolveChatExecutionRoute(&daemon, attached.value));
+
+    const orphan_cwd = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"workspace_id":"route-workspace","relative_cwd":"services/api"}
+    ,
+        .{},
+    );
+    defer orphan_cwd.deinit();
+    try std.testing.expectError(error.InvalidParams, resolveChatExecutionRoute(&daemon, orphan_cwd.value));
+
+    const no_store = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"workspace_id":"route-workspace","repository_id":"primary"}
+    ,
+        .{},
+    );
+    defer no_store.deinit();
+    try std.testing.expectError(error.CapabilityUnavailable, resolveChatExecutionRoute(&daemon, no_store.value));
+}
+
+fn createChatTurnFromParams(
+    allocator: std.mem.Allocator,
+    params: std.json.Value,
+    execution_route: ?*const ChatExecutionRoute,
+) !*ChatTurn {
     const turn = try allocator.create(ChatTurn);
     errdefer allocator.destroy(turn);
     const image_paths = try jsonStringArray(allocator, params.object.get("image_paths") orelse .null);
@@ -9617,26 +10856,59 @@ fn createChatTurnFromParams(allocator: std.mem.Allocator, params: std.json.Value
     errdefer freeAttachmentArray(allocator, owned_images);
     const provider = parseEnum(harness.Provider, jsonString(params.object.get("provider") orelse .null) orelse return error.InvalidParams) orelse return error.InvalidParams;
     const harness_kind = parseEnum(harness.HarnessKind, jsonString(params.object.get("harness") orelse .null) orelse "local_cli") orelse return error.InvalidParams;
+    const project_path = if (execution_route) |route|
+        try allocator.dupe(u8, route.project_path)
+    else
+        try requiredDupe(allocator, params, "project_path");
+    errdefer allocator.free(project_path);
+    const prompt = try requiredDupe(allocator, params, "prompt");
+    errdefer allocator.free(prompt);
+    const provider_thread_id = try optionalDupe(allocator, params, "provider_thread_id");
+    errdefer if (provider_thread_id) |value| allocator.free(value);
+    const thread_title = try requiredDupe(allocator, params, "thread_title");
+    errdefer allocator.free(thread_title);
+    const model_ref = try optionalDupe(allocator, params, "model_ref");
+    errdefer if (model_ref) |value| allocator.free(value);
+    const opencode_reasoning_variant = try optionalDupe(allocator, params, "opencode_reasoning_variant");
+    errdefer if (opencode_reasoning_variant) |value| allocator.free(value);
+    const cursor_model_params_json = try optionalDupe(allocator, params, "cursor_model_params_json");
+    errdefer if (cursor_model_params_json) |value| allocator.free(value);
+    const cwd = if (execution_route) |route|
+        if (route.cwd) |value| try allocator.dupe(u8, value) else null
+    else
+        try optionalDupe(allocator, params, "cwd");
+    errdefer if (cwd) |value| allocator.free(value);
     const request: send_runner.Request = .{
         .provider = provider,
         .harness_kind = harness_kind,
-        .project_path = try requiredDupe(allocator, params, "project_path"),
-        .prompt = try requiredDupe(allocator, params, "prompt"),
+        .project_path = project_path,
+        .prompt = prompt,
         .image_paths = image_paths,
-        .provider_thread_id = try optionalDupe(allocator, params, "provider_thread_id"),
-        .thread_title = try requiredDupe(allocator, params, "thread_title"),
-        .model_ref = try optionalDupe(allocator, params, "model_ref"),
+        .provider_thread_id = provider_thread_id,
+        .thread_title = thread_title,
+        .model_ref = model_ref,
         .reasoning_effort = if (jsonString(params.object.get("reasoning_effort") orelse .null)) |value| parseEnum(harness.ReasoningEffort, value) else null,
-        .opencode_reasoning_variant = try optionalDupe(allocator, params, "opencode_reasoning_variant"),
-        .cursor_model_params_json = try optionalDupe(allocator, params, "cursor_model_params_json"),
+        .opencode_reasoning_variant = opencode_reasoning_variant,
+        .cursor_model_params_json = cursor_model_params_json,
         .fast_mode = if (jsonBool(params.object.get("fast_mode") orelse .null) orelse false) .on else .off,
         .access_mode = parseAccessMode(jsonString(params.object.get("access_mode") orelse .null)),
-        .remote_ssh_host = try optionalDupe(allocator, params, "remote_ssh_host"),
-        .remote_cwd = try optionalDupe(allocator, params, "remote_cwd"),
-        .cwd = try optionalDupe(allocator, params, "cwd"),
+        .cwd = cwd,
     };
     const user_message_id = try optionalDupe(allocator, params, "message_id");
     errdefer if (user_message_id) |value| allocator.free(value);
+    const repository_id = if (execution_route) |route| try allocator.dupe(u8, route.repository_id) else null;
+    errdefer if (repository_id) |value| allocator.free(value);
+    const repository_cwd = if (execution_route) |route|
+        if (route.relative_cwd) |value| try allocator.dupe(u8, value) else null
+    else
+        null;
+    errdefer if (repository_cwd) |value| allocator.free(value);
+    const owned_turn_id = try requiredDupe(allocator, params, "turn_id");
+    errdefer allocator.free(owned_turn_id);
+    const workspace_id = try requiredDupe(allocator, params, "workspace_id");
+    errdefer allocator.free(workspace_id);
+    const local_thread_id = try requiredDupe(allocator, params, "local_thread_id");
+    errdefer allocator.free(local_thread_id);
     // MINOR-7: wire test_stub is only honored when the hermetic stub env is
     // also set, so a production client cannot force canned durable rows.
     // Env alone still enables the offline worker for hermetic ITs.
@@ -9645,9 +10917,11 @@ fn createChatTurnFromParams(allocator: std.mem.Allocator, params: std.json.Value
     const use_stub = env_stub or (wire_stub and env_stub);
     turn.* = .{
         .allocator = allocator,
-        .turn_id = try requiredDupe(allocator, params, "turn_id"),
-        .workspace_id = try requiredDupe(allocator, params, "workspace_id"),
-        .local_thread_id = try requiredDupe(allocator, params, "local_thread_id"),
+        .turn_id = owned_turn_id,
+        .workspace_id = workspace_id,
+        .local_thread_id = local_thread_id,
+        .repository_id = repository_id,
+        .repository_cwd = repository_cwd,
         .request = request,
         .owned_image_paths = image_paths,
         .owned_images = owned_images,
@@ -12030,6 +13304,46 @@ test "daemon keep-alive is durability_pending and live work only (M4-P4)" {
     try std.testing.expect(chatTurnKeepsDaemonAlive(.completed, false, true, true));
 }
 
+test "prepareShutdown expected pid cannot drain a different endpoint owner" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    daemon.idle_exit_ms = null;
+
+    const response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"daemon.prepareShutdown","params":{"expected_pid":0}}
+    );
+    defer allocator.free(response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("result").?.object;
+    try std.testing.expect(!jsonBool(result.get("accepted") orelse .null).?);
+    try std.testing.expect(!jsonBool(result.get("safe_to_exit") orelse .null).?);
+    try std.testing.expect(jsonBool(result.get("owner_mismatch") orelse .null).?);
+    try std.testing.expectEqual(@as(i64, @intCast(platform_runtime.processId())), result.get("pid").?.integer);
+    try std.testing.expect(daemon.accepting_mutations);
+    try std.testing.expect(!daemon.shutdown_requested);
+}
+
+test "prepareShutdown accepts the legacy empty tuple parameter shape" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    daemon.idle_exit_ms = null;
+
+    const response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"daemon.prepareShutdown","params":[]}
+    );
+    defer allocator.free(response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("result").?.object;
+    try std.testing.expect(jsonBool(result.get("accepted") orelse .null).?);
+    try std.testing.expect(jsonBool(result.get("safe_to_exit") orelse .null).?);
+    try std.testing.expect(!daemon.accepting_mutations);
+    try std.testing.expect(daemon.shutdown_requested);
+}
+
 test "prepareShutdown refuses while a live PTY exists" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
 
@@ -12332,6 +13646,11 @@ test "draining dispatcher rejects every state mutator" {
         // Full store mutation surface participates in the drain gate (S3).
         "state.snapshot.replace",
         "workspace.upsert",
+        "workspace.repository.upsert",
+        "workspace.repository.remove",
+        "workspace.repository.default.set",
+        "workspace.repository.binding.upsert",
+        "workspace.repository.binding.remove",
         "chat.thread.upsert",
         "chat.draft.set",
         "chat.message.append",
@@ -12366,6 +13685,29 @@ test "draining dispatcher rejects every state mutator" {
         "invalid_state",
         jsonString(slow_parsed.value.object.get("error").?.object.get("code").?).?,
     );
+}
+
+test "repository manifest RPCs classify through the unlocked store queue" {
+    const methods = [_][]const u8{
+        "workspace.repository.manifest.get",
+        "workspace.repository.upsert",
+        "workspace.repository.remove",
+        "workspace.repository.default.set",
+        "workspace.repository.binding.upsert",
+        "workspace.repository.binding.remove",
+    };
+    for (methods) |method| {
+        const request = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"{s}\",\"params\":{{}}}}",
+            .{method},
+        );
+        defer std.testing.allocator.free(request);
+        try std.testing.expectEqual(
+            ServerRequestClass.store,
+            try classifyServerRequest(std.testing.allocator, request),
+        );
+    }
 }
 
 fn attachTestStoreService(daemon: *Daemon, db_path: []const u8) !void {
@@ -12404,12 +13746,160 @@ fn registerTestClientId(daemon: *Daemon, allocator: std.mem.Allocator) ![]const 
     return try allocator.dupe(u8, client_id);
 }
 
+fn testStoreWriteResult(
+    daemon: *Daemon,
+    allocator: std.mem.Allocator,
+    request: []const u8,
+) !store_protocol.WriteResult {
+    const response = try daemon.handleRequest(request);
+    defer allocator.free(response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("result") orelse return error.TestExpectedStoreWrite;
+    const store_revision = std.math.cast(u64, result.object.get("store_revision").?.integer) orelse
+        return error.TestExpectedStoreWrite;
+    return .{
+        .store_revision = store_revision,
+        .applied = result.object.get("applied").?.bool,
+        .duplicate = result.object.get("duplicate").?.bool,
+    };
+}
+
+fn expectRepositoryManifestAdvertisement(
+    response: []const u8,
+    allocator: std.mem.Allocator,
+    expected: bool,
+) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(
+        expected,
+        result.get("capabilities").?.object.get("repository_manifests").?.bool,
+    );
+    var found_runtime_capability = false;
+    var found_route_capability = false;
+    for (result.get("runtime_capabilities").?.array.items) |capability| {
+        const name = jsonString(capability) orelse continue;
+        if (std.mem.eql(u8, name, "repositories.manifest.v1")) {
+            found_runtime_capability = true;
+        } else if (std.mem.eql(u8, name, "chat.repository_route.v1")) {
+            found_route_capability = true;
+        }
+    }
+    try std.testing.expectEqual(expected, found_runtime_capability);
+    try std.testing.expectEqual(expected, found_route_capability);
+}
+
 fn expectErrorCodeMessage(response: []const u8, allocator: std.mem.Allocator, code: []const u8, message: []const u8) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
     defer parsed.deinit();
     const error_value = parsed.value.object.get("error").?.object;
     try std.testing.expectEqualStrings(code, jsonString(error_value.get("code").?).?);
     try std.testing.expectEqualStrings(message, jsonString(error_value.get("message").?).?);
+}
+
+fn mismatchedTestIdentity(identity: []const u8) [32]u8 {
+    std.debug.assert(identity.len == 32);
+    var mismatched: [32]u8 = undefined;
+    @memcpy(mismatched[0..], identity);
+    mismatched[0] = if (mismatched[0] == '0') '1' else '0';
+    return mismatched;
+}
+
+test "request target validation preserves local calls and accepts the exact daemon generation" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+
+    const local = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"core.status","params":{}}
+    );
+    defer allocator.free(local);
+    var local_parsed = try std.json.parseFromSlice(std.json.Value, allocator, local, .{});
+    defer local_parsed.deinit();
+    try std.testing.expect(local_parsed.value.object.get("result") != null);
+
+    const matching_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"core.status\",\"params\":{{}},\"target\":{{\"runtime_id\":\"{s}\",\"instance_id\":\"{s}\"}}}}",
+        .{ daemon.runtime_id, daemon.instance_id },
+    );
+    defer allocator.free(matching_request);
+    const matching = try daemon.handleRequest(matching_request);
+    defer allocator.free(matching);
+    var matching_parsed = try std.json.parseFromSlice(std.json.Value, allocator, matching, .{});
+    defer matching_parsed.deinit();
+    try std.testing.expect(matching_parsed.value.object.get("result") != null);
+
+    const malformed_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"core.status\",\"params\":{{}},\"target\":{{\"runtime_id\":\"{s}\"}}}}",
+        .{daemon.runtime_id},
+    );
+    defer allocator.free(malformed_request);
+    const malformed = try daemon.handleRequest(malformed_request);
+    defer allocator.free(malformed);
+    try expectErrorCodeMessage(
+        malformed,
+        allocator,
+        headless.protocol.ERR_RUNTIME_IDENTITY_MISSING,
+        "request target is missing or malformed",
+    );
+}
+
+test "wrong request targets cannot reach store mutation or slow process work" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+    const client_id = try registerTestClientId(&daemon, allocator);
+    defer allocator.free(client_id);
+
+    const wrong_runtime = mismatchedTestIdentity(daemon.runtime_id);
+    const before_revision = try daemon.store_service.?.store.storeRevision();
+    const store_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"workspace.upsert\",\"params\":{{\"mutation\":{{\"request_key\":\"target-ws\",\"client_id\":\"{s}\"}},\"workspace\":{{\"workspace_id\":\"target-ws\",\"label\":\"Target\",\"path\":\"/target\"}}}},\"target\":{{\"runtime_id\":\"{s}\",\"instance_id\":\"{s}\"}}}}",
+        .{ client_id, &wrong_runtime, daemon.instance_id },
+    );
+    defer allocator.free(store_request);
+    const store_response = try daemon.handleRequest(store_request);
+    defer allocator.free(store_response);
+    try expectErrorCodeMessage(
+        store_response,
+        allocator,
+        headless.protocol.ERR_RUNTIME_IDENTITY_MISMATCH,
+        "request target does not match this daemon",
+    );
+    try std.testing.expectEqual(before_revision, try daemon.store_service.?.store.storeRevision());
+    try std.testing.expect(std.mem.indexOf(u8, store_response, daemon.runtime_id) == null);
+    try std.testing.expect(std.mem.indexOf(u8, store_response, daemon.instance_id) == null);
+
+    const wrong_instance = mismatchedTestIdentity(daemon.instance_id);
+    try std.testing.expect(daemon.registry.workspace("target-slow") == null);
+    const slow_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"process.start\",\"params\":{{\"workspace\":{{\"workspace_id\":\"target-slow\"}},\"name\":\"worker\"}},\"target\":{{\"runtime_id\":\"{s}\",\"instance_id\":\"{s}\"}}}}",
+        .{ daemon.runtime_id, &wrong_instance },
+    );
+    defer allocator.free(slow_request);
+    const slow_response = try daemon.handleSlowRegistryRequest(allocator, slow_request);
+    defer allocator.free(slow_response);
+    try expectErrorCodeMessage(
+        slow_response,
+        allocator,
+        headless.protocol.ERR_RUNTIME_IDENTITY_MISMATCH,
+        "request target does not match this daemon",
+    );
+    try std.testing.expect(daemon.registry.workspace("target-slow") == null);
+    try std.testing.expectEqual(@as(usize, 0), daemon.registry_jobs.len());
 }
 
 const WorkerDurableSnapshot = struct {
@@ -12656,6 +14146,30 @@ test "store methods report capability_unavailable on a store-less daemon" {
     );
     defer allocator.free(status);
     try expectErrorCodeMessage(status, allocator, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "store capability is unavailable");
+
+    const manifest = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":3,"method":"workspace.repository.manifest.get","params":{"workspace_id":"w"}}
+    );
+    defer allocator.free(manifest);
+    try expectErrorCodeMessage(manifest, allocator, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "store capability is unavailable");
+}
+
+test "store-less core advertisements withhold repository manifest support" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+
+    inline for (.{ "core.status", "core.capabilities" }) |method| {
+        const request = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"{s}\",\"params\":{{}}}}",
+            .{method},
+        );
+        defer allocator.free(request);
+        const response = try daemon.handleRequest(request);
+        defer allocator.free(response);
+        try expectRepositoryManifestAdvertisement(response, allocator, false);
+    }
 }
 
 test "store dispatch commits mutations and replays duplicates" {
@@ -12705,6 +14219,169 @@ test "store dispatch commits mutations and replays duplicates" {
     try std.testing.expectEqual(@as(i64, 1), status_result.get("store_revision").?.integer);
     try std.testing.expectEqualStrings("open", jsonString(status_result.get("drain_state").?).?);
     try std.testing.expect(status_result.get("writer_ready").?.bool);
+}
+
+test "repository manifest RPCs preserve legacy projection and receipt semantics" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+    const client_id = try registerTestClientId(&daemon, allocator);
+    defer allocator.free(client_id);
+
+    inline for (.{ "core.status", "core.capabilities" }) |method| {
+        const request = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"{s}\",\"params\":{{}}}}",
+            .{method},
+        );
+        defer allocator.free(request);
+        const response = try daemon.handleRequest(request);
+        defer allocator.free(response);
+        try expectRepositoryManifestAdvertisement(response, allocator, true);
+    }
+
+    const workspace_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"workspace.upsert\",\"params\":{{\"mutation\":{{\"request_key\":\"manifest-workspace\",\"client_id\":\"{s}\"}},\"workspace\":{{\"workspace_id\":\"manifest-ws\",\"label\":\"Legacy Workspace\",\"path\":\"/legacy/root\"}}}}}}",
+        .{client_id},
+    );
+    defer allocator.free(workspace_request);
+    _ = try testStoreWriteResult(&daemon, allocator, workspace_request);
+
+    const legacy_response = try daemon.handleRequest(
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"workspace.repository.manifest.get\",\"params\":{\"workspace_id\":\"manifest-ws\"}}",
+    );
+    defer allocator.free(legacy_response);
+    var legacy = try std.json.parseFromSlice(std.json.Value, allocator, legacy_response, .{});
+    defer legacy.deinit();
+    const legacy_result = legacy.value.object.get("result").?.object;
+    try std.testing.expectEqualStrings(
+        store_protocol.PRIMARY_REPOSITORY_ID,
+        jsonString(legacy_result.get("default_repository_id").?).?,
+    );
+    const legacy_repositories = legacy_result.get("repositories").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), legacy_repositories.len);
+    try std.testing.expectEqualStrings(
+        store_protocol.PRIMARY_REPOSITORY_ID,
+        jsonString(legacy_repositories[0].object.get("repository_id").?).?,
+    );
+    const legacy_bindings = legacy_repositories[0].object.get("bindings").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), legacy_bindings.len);
+    try std.testing.expectEqualStrings(
+        "/legacy/root",
+        jsonString(legacy_bindings[0].object.get("root_path").?).?,
+    );
+
+    const upsert_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"workspace.repository.upsert\",\"params\":{{\"mutation\":{{\"request_key\":\"repo-upsert\",\"client_id\":\"{s}\"}},\"workspace_id\":\"manifest-ws\",\"repository\":{{\"repository_id\":\"repo-api\",\"label\":\"API\",\"vcs_identity\":\"git@example.com:org/api.git\",\"default_branch\":\"main\"}}}}}}",
+        .{client_id},
+    );
+    defer allocator.free(upsert_request);
+    const upserted = try testStoreWriteResult(&daemon, allocator, upsert_request);
+    const replayed = try testStoreWriteResult(&daemon, allocator, upsert_request);
+    try std.testing.expectEqual(upserted.store_revision, replayed.store_revision);
+    try std.testing.expectEqual(upserted.applied, replayed.applied);
+
+    const invalid_binding = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"workspace.repository.binding.upsert\",\"params\":{{\"mutation\":{{\"request_key\":\"binding-invalid\",\"client_id\":\"{s}\"}},\"workspace_id\":\"manifest-ws\",\"repository_id\":\"repo-api\",\"binding\":{{\"runtime_id\":\"not-canonical\",\"root_path\":\"/srv/api\",\"availability\":\"available\"}}}}}}",
+        .{client_id},
+    );
+    defer allocator.free(invalid_binding);
+    const invalid_response = try daemon.handleRequest(invalid_binding);
+    defer allocator.free(invalid_response);
+    try expectErrorCodeMessage(
+        invalid_response,
+        allocator,
+        headless.protocol.ERR_INVALID_PARAMS,
+        "invalid params",
+    );
+
+    const binding_upsert = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"workspace.repository.binding.upsert\",\"params\":{{\"mutation\":{{\"request_key\":\"binding-upsert\",\"client_id\":\"{s}\"}},\"workspace_id\":\"manifest-ws\",\"repository_id\":\"repo-api\",\"binding\":{{\"runtime_id\":\"0123456789abcdef0123456789abcdef\",\"root_path\":\"/srv/api\",\"availability\":\"available\"}}}}}}",
+        .{client_id},
+    );
+    defer allocator.free(binding_upsert);
+    _ = try testStoreWriteResult(&daemon, allocator, binding_upsert);
+
+    const default_api = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"workspace.repository.default.set\",\"params\":{{\"mutation\":{{\"request_key\":\"default-api\",\"client_id\":\"{s}\"}},\"workspace_id\":\"manifest-ws\",\"repository_id\":\"repo-api\"}}}}",
+        .{client_id},
+    );
+    defer allocator.free(default_api);
+    _ = try testStoreWriteResult(&daemon, allocator, default_api);
+
+    const manifest_response = try daemon.handleRequest(
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"workspace.repository.manifest.get\",\"params\":{\"workspace_id\":\"manifest-ws\"}}",
+    );
+    defer allocator.free(manifest_response);
+    var manifest = try std.json.parseFromSlice(std.json.Value, allocator, manifest_response, .{});
+    defer manifest.deinit();
+    const manifest_result = manifest.value.object.get("result").?.object;
+    try std.testing.expectEqualStrings(
+        "repo-api",
+        jsonString(manifest_result.get("default_repository_id").?).?,
+    );
+    try std.testing.expectEqual(@as(usize, 2), manifest_result.get("repositories").?.array.items.len);
+    var found_api = false;
+    for (manifest_result.get("repositories").?.array.items) |repository_value| {
+        const repository = repository_value.object;
+        if (!std.mem.eql(u8, jsonString(repository.get("repository_id").?).?, "repo-api")) continue;
+        found_api = true;
+        try std.testing.expectEqualStrings("API", jsonString(repository.get("label").?).?);
+        try std.testing.expectEqualStrings("main", jsonString(repository.get("default_branch").?).?);
+        const bindings = repository.get("bindings").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), bindings.len);
+        try std.testing.expectEqualStrings("/srv/api", jsonString(bindings[0].object.get("root_path").?).?);
+    }
+    try std.testing.expect(found_api);
+
+    const binding_remove = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"workspace.repository.binding.remove\",\"params\":{{\"mutation\":{{\"request_key\":\"binding-remove\",\"client_id\":\"{s}\"}},\"workspace_id\":\"manifest-ws\",\"repository_id\":\"repo-api\",\"runtime_id\":\"0123456789abcdef0123456789abcdef\"}}}}",
+        .{client_id},
+    );
+    defer allocator.free(binding_remove);
+    _ = try testStoreWriteResult(&daemon, allocator, binding_remove);
+
+    const default_primary = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"workspace.repository.default.set\",\"params\":{{\"mutation\":{{\"request_key\":\"default-primary\",\"client_id\":\"{s}\"}},\"workspace_id\":\"manifest-ws\",\"repository_id\":\"primary\"}}}}",
+        .{client_id},
+    );
+    defer allocator.free(default_primary);
+    _ = try testStoreWriteResult(&daemon, allocator, default_primary);
+
+    const repository_remove = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"workspace.repository.remove\",\"params\":{{\"mutation\":{{\"request_key\":\"repo-remove\",\"client_id\":\"{s}\"}},\"workspace_id\":\"manifest-ws\",\"repository_id\":\"repo-api\"}}}}",
+        .{client_id},
+    );
+    defer allocator.free(repository_remove);
+    _ = try testStoreWriteResult(&daemon, allocator, repository_remove);
+
+    const final_response = try daemon.handleRequest(
+        "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"workspace.repository.manifest.get\",\"params\":{\"workspace_id\":\"manifest-ws\"}}",
+    );
+    defer allocator.free(final_response);
+    var final_manifest = try std.json.parseFromSlice(std.json.Value, allocator, final_response, .{});
+    defer final_manifest.deinit();
+    const final_result = final_manifest.value.object.get("result").?.object;
+    try std.testing.expectEqualStrings(
+        store_protocol.PRIMARY_REPOSITORY_ID,
+        jsonString(final_result.get("default_repository_id").?).?,
+    );
+    try std.testing.expectEqual(@as(usize, 1), final_result.get("repositories").?.array.items.len);
 }
 
 test "store mutations from unknown clients are invalid_params" {
@@ -13757,6 +15434,21 @@ const TestCliPathResolver = struct {
     }
 };
 
+test "Linux session CLI path drops replaced executable suffix" {
+    try std.testing.expectEqualStrings(
+        "/opt/verde/bin/verde-daemon",
+        executablePathWithoutDeletedSuffix(.linux, "/opt/verde/bin/verde-daemon (deleted)"),
+    );
+    try std.testing.expectEqualStrings(
+        "/opt/verde/bin/verde-daemon",
+        executablePathWithoutDeletedSuffix(.linux, "/opt/verde/bin/verde-daemon"),
+    );
+    try std.testing.expectEqualStrings(
+        "/opt/verde/bin/verde-daemon (deleted)",
+        executablePathWithoutDeletedSuffix(.macos, "/opt/verde/bin/verde-daemon (deleted)"),
+    );
+}
+
 test "Windows CLI resolver selects packaged console executable" {
     const allocator = std.testing.allocator;
     var resolver: TestCliPathResolver = .{ .mappings = &.{.{
@@ -13973,6 +15665,10 @@ test "durable reads decode canonical and historical daemon chat role codes" {
         .mutation = .{ .request_key = "dto-ws", .client_id = "daemon" },
         .workspace = .{ .workspace_id = "ws-dto", .label = "DTO", .path = "/tmp/dto" },
     });
+    _ = try daemon.store_service.?.store.upsertWorkspace(.{
+        .mutation = .{ .request_key = "dto-ws-2", .client_id = "daemon" },
+        .workspace = .{ .workspace_id = "ws-dto-2", .label = "DTO 2", .path = "/tmp/dto-2" },
+    });
     _ = try daemon.store_service.?.store.upsertThread(.{
         .mutation = .{ .request_key = "dto-thread", .client_id = "daemon" },
         .workspace_id = "ws-dto",
@@ -13987,6 +15683,16 @@ test "durable reads decode canonical and historical daemon chat role codes" {
             .fast_mode = "on",
             .access_mode = "supervised",
             .draft = "staged DTO draft",
+        },
+    });
+    _ = try daemon.store_service.?.store.upsertThread(.{
+        .mutation = .{ .request_key = "dto-thread-2", .client_id = "daemon" },
+        .workspace_id = "ws-dto",
+        .thread = .{
+            .local_thread_id = "t-dto-2",
+            .title = "Second DTO thread",
+            .provider = "claude",
+            .harness = "local_cli",
         },
     });
     const thread_row = (try daemon.store_service.?.store.conn.row(
@@ -14116,6 +15822,164 @@ test "durable reads decode canonical and historical daemon chat role codes" {
     try std.testing.expectEqualStrings("none", listed_thread.get("reasoning_variant").?.string);
     try std.testing.expectEqualStrings("on", listed_thread.get("fast_mode").?.string);
     try std.testing.expectEqualStrings("supervised", listed_thread.get("access_mode").?.string);
+
+    const first_thread_page_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":4,"method":"chat.thread.list","params":{"workspace_id":"ws-dto","limit":1}}
+    );
+    defer allocator.free(first_thread_page_response);
+    var first_thread_page = try std.json.parseFromSlice(std.json.Value, allocator, first_thread_page_response, .{});
+    defer first_thread_page.deinit();
+    const first_thread_result = first_thread_page.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(usize, 1), first_thread_result.get("threads").?.array.items.len);
+    const first_thread_cursor = first_thread_result.get("next_cursor").?.string;
+    const first_thread_revision = std.math.cast(u64, first_thread_result.get("store_revision").?.integer) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(first_thread_cursor.len <= store_protocol.MAX_PAGE_CURSOR_BYTES);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try headless.pagination.decode(first_thread_cursor, .thread, first_thread_revision, "ws-dto"),
+    );
+
+    const second_thread_page_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"chat.thread.list\",\"params\":{{\"workspace_id\":\"ws-dto\",\"limit\":1,\"cursor\":\"{s}\"}}}}",
+        .{first_thread_cursor},
+    );
+    defer allocator.free(second_thread_page_request);
+    const second_thread_page_response = try daemon.handleRequest(second_thread_page_request);
+    defer allocator.free(second_thread_page_response);
+    var second_thread_page = try std.json.parseFromSlice(std.json.Value, allocator, second_thread_page_response, .{});
+    defer second_thread_page.deinit();
+    const second_thread_result = second_thread_page.value.object.get("result").?.object;
+    try std.testing.expectEqualStrings(
+        "t-dto-2",
+        second_thread_result.get("threads").?.array.items[0].object.get("local_thread_id").?.string,
+    );
+    try std.testing.expect(second_thread_result.get("next_cursor").? == .null);
+
+    const workspace_page_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":6,"method":"workspace.list","params":{"limit":1}}
+    );
+    defer allocator.free(workspace_page_response);
+    var workspace_page = try std.json.parseFromSlice(std.json.Value, allocator, workspace_page_response, .{});
+    defer workspace_page.deinit();
+    const workspace_result = workspace_page.value.object.get("result").?.object;
+    const workspace_item = workspace_result.get("workspaces").?.array.items[0].object;
+    try std.testing.expectEqualStrings("primary", workspace_item.get("default_repository_id").?.string);
+    const primary_repository = workspace_item.get("repositories").?.array.items[0].object;
+    try std.testing.expectEqualStrings("primary", primary_repository.get("repository_id").?.string);
+    const primary_binding = primary_repository.get("bindings").?.array.items[0].object;
+    try std.testing.expectEqualStrings(daemon.runtime_id, primary_binding.get("runtime_id").?.string);
+    try std.testing.expectEqualStrings("/tmp/dto", primary_binding.get("root_path").?.string);
+    const workspace_cursor = workspace_result.get("next_cursor").?.string;
+    const workspace_revision = std.math.cast(u64, workspace_result.get("store_revision").?.integer) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try headless.pagination.decode(workspace_cursor, .workspace, workspace_revision, "active"),
+    );
+
+    const mismatched_workspace_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":61,\"method\":\"workspace.list\",\"params\":{{\"limit\":1,\"include_archived\":true,\"cursor\":\"{s}\"}}}}",
+        .{workspace_cursor},
+    );
+    defer allocator.free(mismatched_workspace_request);
+    const mismatched_workspace_response = try daemon.handleRequest(mismatched_workspace_request);
+    defer allocator.free(mismatched_workspace_response);
+    try expectErrorCodeMessage(
+        mismatched_workspace_response,
+        allocator,
+        headless.protocol.ERR_INVALID_PARAMS,
+        "page cursor does not match this query; restart pagination without a cursor",
+    );
+
+    {
+        lockStoreService(daemon.store_service.?);
+        defer daemon.store_service.?.mutex.unlock();
+        _ = try daemon.store_service.?.store.upsertThread(.{
+            .mutation = .{ .request_key = "dto-thread-cursor-stale", .client_id = "daemon" },
+            .workspace_id = "ws-dto",
+            .thread = .{
+                .local_thread_id = "t-dto-cursor-stale",
+                .title = "Cursor invalidation",
+                .provider = "codex",
+                .harness = "local_cli",
+            },
+        });
+    }
+
+    const stale_thread_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":62,\"method\":\"chat.thread.list\",\"params\":{{\"workspace_id\":\"ws-dto\",\"limit\":1,\"cursor\":\"{s}\"}}}}",
+        .{first_thread_cursor},
+    );
+    defer allocator.free(stale_thread_request);
+    const stale_thread_response = try daemon.handleRequest(stale_thread_request);
+    defer allocator.free(stale_thread_response);
+    try expectErrorCodeMessage(
+        stale_thread_response,
+        allocator,
+        headless.protocol.ERR_REVISION_EXPIRED,
+        "page cursor is stale; restart pagination without a cursor",
+    );
+
+    const stale_workspace_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":63,\"method\":\"workspace.list\",\"params\":{{\"limit\":1,\"cursor\":\"{s}\"}}}}",
+        .{workspace_cursor},
+    );
+    defer allocator.free(stale_workspace_request);
+    const stale_workspace_response = try daemon.handleRequest(stale_workspace_request);
+    defer allocator.free(stale_workspace_response);
+    try expectErrorCodeMessage(
+        stale_workspace_response,
+        allocator,
+        headless.protocol.ERR_REVISION_EXPIRED,
+        "page cursor is stale; restart pagination without a cursor",
+    );
+
+    const legacy_cursor_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":64,"method":"workspace.list","params":{"limit":1,"cursor":"o:1"}}
+    );
+    defer allocator.free(legacy_cursor_response);
+    try expectErrorCodeMessage(
+        legacy_cursor_response,
+        allocator,
+        headless.protocol.ERR_INVALID_PARAMS,
+        "invalid page cursor; restart pagination without a cursor",
+    );
+
+    const backward_page_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":7,"method":"chat.message.list","params":{"workspace_id":"ws-dto","local_thread_id":"t-dto","limit":3}}
+    );
+    defer allocator.free(backward_page_response);
+    var backward_page = try std.json.parseFromSlice(std.json.Value, allocator, backward_page_response, .{});
+    defer backward_page.deinit();
+    const backward_result = backward_page.value.object.get("result").?.object;
+    const backward_messages = backward_result.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), backward_messages.len);
+    try std.testing.expectEqual(@as(i64, 6), backward_messages[0].object.get("sort_index").?.integer);
+    try std.testing.expectEqual(@as(i64, 8), backward_messages[2].object.get("sort_index").?.integer);
+    try std.testing.expectEqualStrings("b:6", backward_result.get("next_cursor").?.string);
+
+    const forward_page_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":8,"method":"chat.message.list","params":{"workspace_id":"ws-dto","local_thread_id":"t-dto","direction":"forward","limit":2}}
+    );
+    defer allocator.free(forward_page_response);
+    var forward_page = try std.json.parseFromSlice(std.json.Value, allocator, forward_page_response, .{});
+    defer forward_page.deinit();
+    const forward_result = forward_page.value.object.get("result").?.object;
+    const forward_messages = forward_result.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(i64, 0), forward_messages[0].object.get("sort_index").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), forward_messages[1].object.get("sort_index").?.integer);
+    try std.testing.expectEqualStrings("f:1", forward_result.get("next_cursor").?.string);
+
+    const oversized_page_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":9,"method":"chat.message.list","params":{"workspace_id":"ws-dto","local_thread_id":"t-dto","limit":201}}
+    );
+    defer allocator.free(oversized_page_response);
+    try expectErrorCodeMessage(oversized_page_response, allocator, headless.protocol.ERR_INVALID_PARAMS, "invalid params");
 }
 
 test "chat turn tail pages large replay before publishing terminal status" {

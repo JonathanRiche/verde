@@ -170,9 +170,9 @@ textarea { resize: none; }
   margin: 0.8em 0 0.35em;
 }
 
-/* Inline file chips replacing raw :codex-file-citation directives; clicks are
-   intercepted in ChatPane to open the FileViewer overlay. */
-.markdown a.file-citation {
+/* Inert file chips replace raw :codex-file-citation directives until the
+   daemon exposes repository-scoped remote file access. */
+.markdown .file-citation {
   display: inline-flex;
   align-items: center;
   gap: 0.4em;
@@ -182,22 +182,18 @@ textarea { resize: none; }
   border: 1px solid var(--border-muted);
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.05);
-  color: var(--accent-hi);
+  color: var(--text-muted);
   font-family: var(--font-mono);
   font-size: 0.82em;
   line-height: 1.5;
-  text-decoration: none;
   white-space: nowrap;
 }
-.markdown a.file-citation:hover {
-  background: var(--accent-hover);
-}
-.markdown a.file-citation svg {
+.markdown .file-citation svg {
   flex: none;
   width: 1em;
   height: 1em;
 }
-.markdown a.file-citation span {
+.markdown .file-citation span {
   overflow: hidden;
   text-overflow: ellipsis;
 }

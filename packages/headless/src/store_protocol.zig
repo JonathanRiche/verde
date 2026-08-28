@@ -26,6 +26,20 @@ pub const METHOD_CORE_SNAPSHOT: []const u8 = "core.snapshot";
 pub const METHOD_DAEMON_STORE_STATUS: []const u8 = "daemon.storeStatus";
 pub const METHOD_CHAT_THREAD_GET: []const u8 = "chat.thread.get";
 pub const METHOD_CHAT_THREAD_LIST: []const u8 = "chat.thread.list";
+pub const METHOD_WORKSPACE_LIST: []const u8 = "workspace.list";
+pub const METHOD_WORKSPACE_REPOSITORY_MANIFEST_GET: []const u8 =
+    "workspace.repository.manifest.get";
+pub const METHOD_WORKSPACE_REPOSITORY_UPSERT: []const u8 =
+    "workspace.repository.upsert";
+pub const METHOD_WORKSPACE_REPOSITORY_REMOVE: []const u8 =
+    "workspace.repository.remove";
+pub const METHOD_WORKSPACE_REPOSITORY_DEFAULT_SET: []const u8 =
+    "workspace.repository.default.set";
+pub const METHOD_WORKSPACE_REPOSITORY_BINDING_UPSERT: []const u8 =
+    "workspace.repository.binding.upsert";
+pub const METHOD_WORKSPACE_REPOSITORY_BINDING_REMOVE: []const u8 =
+    "workspace.repository.binding.remove";
+pub const METHOD_CHAT_MESSAGE_LIST: []const u8 = "chat.message.list";
 pub const METHOD_CHAT_TURN_RECORD: []const u8 = "chat.turn.record";
 pub const METHOD_CONFIG_FAVORITE_MODEL_SET: []const u8 = "config.favoriteModel.set";
 
@@ -42,6 +56,14 @@ pub const CORE_SNAPSHOT_METHOD = METHOD_CORE_SNAPSHOT;
 pub const DAEMON_STORE_STATUS_METHOD = METHOD_DAEMON_STORE_STATUS;
 pub const CHAT_THREAD_GET_METHOD = METHOD_CHAT_THREAD_GET;
 pub const CHAT_THREAD_LIST_METHOD = METHOD_CHAT_THREAD_LIST;
+pub const WORKSPACE_LIST_METHOD = METHOD_WORKSPACE_LIST;
+pub const WORKSPACE_REPOSITORY_MANIFEST_GET_METHOD = METHOD_WORKSPACE_REPOSITORY_MANIFEST_GET;
+pub const WORKSPACE_REPOSITORY_UPSERT_METHOD = METHOD_WORKSPACE_REPOSITORY_UPSERT;
+pub const WORKSPACE_REPOSITORY_REMOVE_METHOD = METHOD_WORKSPACE_REPOSITORY_REMOVE;
+pub const WORKSPACE_REPOSITORY_DEFAULT_SET_METHOD = METHOD_WORKSPACE_REPOSITORY_DEFAULT_SET;
+pub const WORKSPACE_REPOSITORY_BINDING_UPSERT_METHOD = METHOD_WORKSPACE_REPOSITORY_BINDING_UPSERT;
+pub const WORKSPACE_REPOSITORY_BINDING_REMOVE_METHOD = METHOD_WORKSPACE_REPOSITORY_BINDING_REMOVE;
+pub const CHAT_MESSAGE_LIST_METHOD = METHOD_CHAT_MESSAGE_LIST;
 pub const CHAT_TURN_RECORD_METHOD = METHOD_CHAT_TURN_RECORD;
 pub const CONFIG_FAVORITE_MODEL_SET_METHOD = METHOD_CONFIG_FAVORITE_MODEL_SET;
 
@@ -56,6 +78,12 @@ pub const ERR_STORE_BUSY = protocol.ERR_STORE_BUSY;
 pub const ERR_SCHEMA_TOO_NEW = protocol.ERR_SCHEMA_TOO_NEW;
 pub const ERR_STORE_CORRUPT = protocol.ERR_STORE_CORRUPT;
 pub const ERR_STORE_UNAVAILABLE = protocol.ERR_STORE_UNAVAILABLE;
+pub const ERR_REVISION_EXPIRED = protocol.ERR_REVISION_EXPIRED;
+
+pub const DEFAULT_PAGE_ITEMS: u32 = 100;
+pub const MAX_PAGE_ITEMS: u32 = 200;
+pub const MAX_PAGE_CURSOR_BYTES: usize = @import("pagination.zig").MAX_CURSOR_BYTES;
+pub const PRIMARY_REPOSITORY_ID: []const u8 = "primary";
 
 /// Common metadata carried by every store mutation.
 pub const MutationHeader = struct {
@@ -96,11 +124,83 @@ pub const HerdrWorkspaceLink = struct {
     updated_at_ms: i64 = 0,
 };
 
+/// One runtime-local checkout for a stable workspace repository identity.
+pub const RepositoryBinding = struct {
+    runtime_id: []const u8,
+    root_path: []const u8,
+    availability: []const u8 = "available",
+};
+
+/// Repository identity is workspace-scoped and never derived from a checkout path.
+pub const Repository = struct {
+    repository_id: []const u8,
+    label: []const u8,
+    vcs_identity: ?[]const u8 = null,
+    default_branch: ?[]const u8 = null,
+    bindings: []const RepositoryBinding = &.{},
+};
+
+/// Stable repository metadata without runtime-local checkout bindings.
+pub const RepositoryDefinition = struct {
+    repository_id: []const u8,
+    label: []const u8,
+    vcs_identity: ?[]const u8 = null,
+    default_branch: ?[]const u8 = null,
+};
+
+/// Bounded read of one workspace's complete repository manifest.
+pub const WorkspaceRepositoryManifestRequest = struct {
+    workspace_id: []const u8,
+};
+
+pub const WorkspaceRepositoryManifestResult = struct {
+    workspace_id: []const u8,
+    default_repository_id: []const u8,
+    repositories: []const Repository = &.{},
+    store_revision: u64,
+};
+
+pub const WorkspaceRepositoryUpsertRequest = struct {
+    mutation: MutationHeader,
+    workspace_id: []const u8,
+    repository: RepositoryDefinition,
+};
+
+pub const WorkspaceRepositoryRemoveRequest = struct {
+    mutation: MutationHeader,
+    workspace_id: []const u8,
+    repository_id: []const u8,
+};
+
+pub const WorkspaceDefaultRepositorySetRequest = struct {
+    mutation: MutationHeader,
+    workspace_id: []const u8,
+    repository_id: []const u8,
+};
+
+pub const WorkspaceRepositoryBindingUpsertRequest = struct {
+    mutation: MutationHeader,
+    workspace_id: []const u8,
+    repository_id: []const u8,
+    binding: RepositoryBinding,
+};
+
+pub const WorkspaceRepositoryBindingRemoveRequest = struct {
+    mutation: MutationHeader,
+    workspace_id: []const u8,
+    repository_id: []const u8,
+    runtime_id: []const u8,
+};
+
 /// Durable workspace metadata plus compatibility presentation fields.
 pub const Workspace = struct {
     workspace_id: []const u8,
     label: []const u8,
     path: []const u8,
+    /// Additive multi-repository manifest. Empty means a legacy one-path
+    /// workspace and projects as the stable `primary` repository.
+    repositories: []const Repository = &.{},
+    default_repository_id: ?[]const u8 = null,
     archived: bool = false,
     unread_count: u32 = 0,
     collapsed: ?bool = null,
@@ -123,6 +223,9 @@ pub const Workspace = struct {
 /// A durable transcript row.  Role/provider/tool values remain strings so new
 /// daemon variants can pass through older clients.
 pub const Message = struct {
+    /// Stable position inside the owning thread. Older snapshot clients may
+    /// omit it; paginated transcript responses always populate it.
+    sort_index: usize = 0,
     /// Legacy snapshot rows may omit this field; chat.message.append must
     /// reject an empty message ID with invalid_params.
     message_id: []const u8 = "",
@@ -158,6 +261,15 @@ pub const Thread = struct {
     /// Per-thread working-directory override. Null means the thread follows
     /// its workspace path; "projectless" chats point at home or scratch.
     cwd: ?[]const u8 = null,
+    /// Desktop connection-profile identity. Null decodes as the Local profile.
+    profile_id: ?[]const u8 = null,
+    /// Stable identity returned by the selected daemon handshake. It remains
+    /// null for legacy committed threads until they are verified again.
+    runtime_id: ?[]const u8 = null,
+    /// Stable repository binding for new clients. Null is the legacy primary repository.
+    repository_id: ?[]const u8 = null,
+    /// Runtime-independent directory beneath the selected repository root.
+    repository_cwd: ?[]const u8 = null,
     draft: []const u8 = "",
     draft_image: ?Attachment = null,
     draft_images: []const Attachment = &.{},
@@ -407,6 +519,10 @@ pub const ThreadListItem = struct {
     provider: []const u8 = "opencode",
     harness: []const u8 = "local_cli",
     cwd: ?[]const u8 = null,
+    profile_id: ?[]const u8 = null,
+    runtime_id: ?[]const u8 = null,
+    repository_id: ?[]const u8 = null,
+    repository_cwd: ?[]const u8 = null,
 };
 
 /// One durable thread and the revision from which it was read.
@@ -415,7 +531,8 @@ pub const ThreadGetResult = struct {
     store_revision: u64,
 };
 
-/// Bounded per-workspace thread metadata query.
+/// Bounded per-workspace thread metadata query. Returned cursors are opaque,
+/// revision-bound, and valid only for the same workspace query.
 pub const ThreadListRequest = struct {
     workspace_id: []const u8,
     limit: u32 = 100,
@@ -425,6 +542,47 @@ pub const ThreadListRequest = struct {
 /// Bounded per-workspace thread metadata result.
 pub const ThreadListResult = struct {
     threads: []const ThreadListItem = &.{},
+    next_cursor: ?[]const u8 = null,
+    store_revision: u64 = 0,
+};
+
+/// Bounded workspace row with an explicit repository manifest projection.
+pub const WorkspaceListItem = struct {
+    workspace_id: []const u8,
+    label: []const u8,
+    path: []const u8,
+    sort_index: usize = 0,
+    archived: bool = false,
+    repositories: []const Repository = &.{},
+    default_repository_id: []const u8 = PRIMARY_REPOSITORY_ID,
+};
+
+/// Returned cursors are opaque, revision-bound, and valid only with the same
+/// `include_archived` filter.
+pub const WorkspaceListRequest = struct {
+    limit: u32 = DEFAULT_PAGE_ITEMS,
+    cursor: ?[]const u8 = null,
+    include_archived: bool = false,
+};
+
+pub const WorkspaceListResult = struct {
+    workspaces: []const WorkspaceListItem = &.{},
+    next_cursor: ?[]const u8 = null,
+    store_revision: u64 = 0,
+};
+
+/// Bidirectional bounded transcript request. A returned cursor is opaque and
+/// already encodes its direction; clients must not construct one themselves.
+pub const MessageListRequest = struct {
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
+    direction: []const u8 = "backward",
+    limit: u32 = DEFAULT_PAGE_ITEMS,
+    cursor: ?[]const u8 = null,
+};
+
+pub const MessageListResult = struct {
+    messages: []const Message = &.{},
     next_cursor: ?[]const u8 = null,
     store_revision: u64 = 0,
 };
@@ -519,6 +677,10 @@ test "store DTOs round trip every wire shape" {
         .harness = "local_cli",
         .tui_dock_id = 3,
         .cwd = "/work/sub",
+        .profile_id = "remote-box",
+        .runtime_id = "0123456789abcdef0123456789abcdef",
+        .repository_id = "repo-api",
+        .repository_cwd = "services/api",
         .draft = "draft",
         .draft_image = attachment,
         .draft_images = &.{attachment},
@@ -605,6 +767,10 @@ test "store DTOs round trip every wire shape" {
         .model_ref = "model-1",
         .provider = "codex",
         .harness = "local_cli",
+        .profile_id = "remote-box",
+        .runtime_id = "0123456789abcdef0123456789abcdef",
+        .repository_id = "repo-api",
+        .repository_cwd = "services/api",
     };
     const turn_record: TurnRecord = .{
         .turn_id = "turn-1",
@@ -675,8 +841,25 @@ test "store DTOs round trip every wire shape" {
         ThreadGetRequest{ .workspace_id = "workspace-1", .local_thread_id = "thread-1" },
         ThreadListItem{ .local_thread_id = "thread-1", .title = "A thread", .sort_index = 3, .archived = true, .committed = false, .last_activity_at = 20, .provider_thread_id = "provider-1", .model_ref = "model-1", .provider = "codex", .harness = "local_cli" },
         ThreadGetResult{ .thread = thread, .store_revision = 8 },
-        ThreadListRequest{ .workspace_id = "workspace-1", .limit = 25, .cursor = "cursor-1" },
-        ThreadListResult{ .threads = &.{thread_list_item}, .next_cursor = "cursor-2", .store_revision = 8 },
+        ThreadListRequest{ .workspace_id = "workspace-1", .limit = 25, .cursor = "pg1:t:8:abc:25" },
+        ThreadListResult{ .threads = &.{thread_list_item}, .next_cursor = "pg1:t:8:abc:50", .store_revision = 8 },
+        WorkspaceListRequest{ .limit = 25, .cursor = "pg1:w:8:def:25", .include_archived = true },
+        WorkspaceListResult{
+            .workspaces = &.{.{
+                .workspace_id = "workspace-1",
+                .label = "Workspace",
+                .path = "/work",
+                .repositories = &.{.{
+                    .repository_id = PRIMARY_REPOSITORY_ID,
+                    .label = "Primary",
+                    .bindings = &.{.{ .runtime_id = "runtime-1", .root_path = "/work" }},
+                }},
+            }},
+            .next_cursor = "pg1:w:8:def:1",
+            .store_revision = 8,
+        },
+        MessageListRequest{ .workspace_id = "workspace-1", .local_thread_id = "thread-1", .direction = "backward", .limit = 25, .cursor = "b:10" },
+        MessageListResult{ .messages = &.{message}, .next_cursor = "b:2", .store_revision = 8 },
         turn_record,
         TurnRecordRequest{ .turn_id = "turn-1" },
     };
@@ -854,6 +1037,8 @@ test "store method names and error codes are pinned" {
     try std.testing.expectEqualStrings("daemon.storeStatus", METHOD_DAEMON_STORE_STATUS);
     try std.testing.expectEqualStrings("chat.thread.get", METHOD_CHAT_THREAD_GET);
     try std.testing.expectEqualStrings("chat.thread.list", METHOD_CHAT_THREAD_LIST);
+    try std.testing.expectEqualStrings("workspace.list", METHOD_WORKSPACE_LIST);
+    try std.testing.expectEqualStrings("chat.message.list", METHOD_CHAT_MESSAGE_LIST);
     try std.testing.expectEqualStrings("chat.turn.record", METHOD_CHAT_TURN_RECORD);
     try std.testing.expectEqualStrings("config.favoriteModel.set", METHOD_CONFIG_FAVORITE_MODEL_SET);
     try std.testing.expectEqualStrings("store", SNAPSHOT_SCOPE_STORE);

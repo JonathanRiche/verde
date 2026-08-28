@@ -54,6 +54,14 @@ pub fn build(b: *std.Build) void {
     });
     b.default_step.dependOn(&build_cmd.step);
 
+    const daemon_cmd = addDaemonCommand(b, optimize, "daemon", target, version);
+    const daemon_step = b.step("daemon", "Build and install the GUI-free Verde daemon");
+    daemon_step.dependOn(&daemon_cmd.step);
+
+    const daemon_test_cmd = addDaemonCommand(b, optimize, "daemon-test", target, version);
+    const daemon_test_step = b.step("daemon-test", "Run GUI-free Verde daemon tests");
+    daemon_test_step.dependOn(&daemon_test_cmd.step);
+
     const run_cmd = addDesktopCommand(b, optimize, .{
         .subcommand = "run",
         .forward_runtime_args = true,
@@ -160,6 +168,35 @@ pub fn build(b: *std.Build) void {
     headless_test_cmd.setCwd(b.path("packages/headless"));
     const headless_test_step = b.step("headless-test", "Run headless package unit tests from the repo root");
     headless_test_step.dependOn(&headless_test_cmd.step);
+
+    const runtime_test_cmd = addDesktopCommand(b, test_optimize, .{
+        .subcommand = "runtime-test",
+        .forward_runtime_args = false,
+        .target = target,
+        .version = version,
+        .ui_debug = ui_debug,
+        .palette_renderer = palette_renderer,
+        .browser_backend = browser_backend,
+        .terminal_backend = terminal_backend,
+        .local_ipc = local_ipc,
+        .windows_integrations = windows_integrations,
+        .build_fff = build_fff,
+        .fff_cargo_target = fff_cargo_target,
+        .fff_lib_dir = fff_lib_dir,
+        .fff_import_lib = fff_import_lib,
+        .fff_runtime_lib = fff_runtime_lib,
+        .sdl3_include_dir = sdl3_include_dir,
+        .sdl3_lib_dir = sdl3_lib_dir,
+        .sdl3_runtime_lib = sdl3_runtime_lib,
+        .sdl3_ttf_include_dir = sdl3_ttf_include_dir,
+        .sdl3_ttf_lib_dir = sdl3_ttf_lib_dir,
+        .sdl3_ttf_runtime_lib = sdl3_ttf_runtime_lib,
+        .webview2_include_dir = webview2_include_dir,
+        .webview2_loader_lib = webview2_loader_lib,
+        .webview2_loader_dll = webview2_loader_dll,
+    });
+    const runtime_test_step = b.step("runtime-test", "Run remote-runtime infrastructure tests from the repo root");
+    runtime_test_step.dependOn(&runtime_test_cmd.step);
 
     // Optional web client gateway. Not on the default desktop install path.
     const web_app_cmd = b.addSystemCommand(&.{ "zig", "build" });
@@ -286,6 +323,31 @@ fn addDesktopCommand(
         }
     }
 
+    return cmd;
+}
+
+fn addDaemonCommand(
+    b: *std.Build,
+    optimize: std.builtin.OptimizeMode,
+    step_name: []const u8,
+    target: ?[]const u8,
+    version: ?[]const u8,
+) *std.Build.Step.Run {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(b.allocator);
+
+    argv.appendSlice(b.allocator, &.{ "zig", "build", step_name }) catch @panic("OOM");
+    if (optimize != .Debug) {
+        argv.append(b.allocator, b.fmt("-Doptimize={s}", .{@tagName(optimize)})) catch @panic("OOM");
+    }
+    if (target) |value| {
+        argv.append(b.allocator, b.fmt("-Dtarget={s}", .{value})) catch @panic("OOM");
+    }
+    appendStringOption(b, &argv, "version", version);
+    appendInstallArgs(b, &argv);
+
+    const cmd = b.addSystemCommand(argv.items);
+    cmd.setCwd(b.path("packages/daemon"));
     return cmd;
 }
 

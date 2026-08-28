@@ -1,0 +1,1444 @@
+//! Standalone, noninteractive entry point for the GUI-free Verde daemon.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const build_options = @import("build_options");
+const headless = @import("headless");
+
+const platform_paths = @import("platform_paths");
+const platform_runtime = @import("platform_runtime");
+const sessionizer = @import("terminal/sessionizer.zig");
+
+const NOTIFY_REQUEST_TIMEOUT_MS: u32 = 5_000;
+const SIGNAL_WATCH_INTERVAL_MS: i64 = 25;
+const SIGNAL_DRAIN_RETRY_MS: i64 = 250;
+const SIGNAL_DRAIN_REQUEST_TIMEOUT_MS: u32 = 500;
+
+var termination_signal_requested = std.atomic.Value(bool).init(false);
+
+const TerminationWatcher = if (builtin.os.tag == .windows) struct {
+    fn init(_: std.mem.Allocator, _: []const u8) @This() {
+        return .{};
+    }
+
+    fn start(_: *@This()) !void {}
+    fn deinit(_: *@This()) void {}
+} else struct {
+    allocator: std.mem.Allocator,
+    data_dir: []const u8,
+    stop_requested: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+    previous_interrupt: std.posix.Sigaction = undefined,
+    previous_terminate: std.posix.Sigaction = undefined,
+    started: bool = false,
+
+    fn init(allocator: std.mem.Allocator, data_dir: []const u8) @This() {
+        return .{
+            .allocator = allocator,
+            .data_dir = data_dir,
+        };
+    }
+
+    fn start(self: *@This()) !void {
+        termination_signal_requested.store(false, .release);
+        self.stop_requested.store(false, .release);
+        const action: std.posix.Sigaction = .{
+            .handler = .{ .handler = handleTerminationSignal },
+            .mask = std.posix.sigemptyset(),
+            .flags = std.posix.SA.RESTART,
+        };
+        std.posix.sigaction(.INT, &action, &self.previous_interrupt);
+        errdefer std.posix.sigaction(.INT, &self.previous_interrupt, null);
+        std.posix.sigaction(.TERM, &action, &self.previous_terminate);
+        errdefer std.posix.sigaction(.TERM, &self.previous_terminate, null);
+        self.thread = try std.Thread.spawn(.{}, watch, .{self});
+        self.started = true;
+    }
+
+    fn deinit(self: *@This()) void {
+        if (!self.started) return;
+        self.stop_requested.store(true, .release);
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        std.posix.sigaction(.TERM, &self.previous_terminate, null);
+        std.posix.sigaction(.INT, &self.previous_interrupt, null);
+        self.started = false;
+    }
+
+    fn handleTerminationSignal(_: std.posix.SIG) callconv(.c) void {
+        // Async-signal-safe by construction: no allocation, I/O, or locks.
+        termination_signal_requested.store(true, .release);
+    }
+
+    fn watch(self: *@This()) void {
+        var threaded = std.Io.Threaded.init_single_threaded;
+        const io = threaded.io();
+        while (!self.stop_requested.load(.acquire)) {
+            if (!termination_signal_requested.load(.acquire)) {
+                std.Io.sleep(io, .fromMilliseconds(SIGNAL_WATCH_INTERVAL_MS), .awake) catch {};
+                continue;
+            }
+
+            const accepted = requestPrepareShutdown(self.allocator, self.data_dir) catch false;
+            if (accepted) return;
+            if (self.stop_requested.load(.acquire)) return;
+            std.Io.sleep(io, .fromMilliseconds(SIGNAL_DRAIN_RETRY_MS), .awake) catch {};
+        }
+    }
+};
+
+const Command = enum {
+    help,
+    version,
+    init,
+    serve,
+    status,
+    providers_status,
+    workspace_show,
+    workspace_bind,
+    workspace_repository_bind,
+    notify,
+};
+
+const RepositoryBindOptions = struct {
+    workspace_id: ?[]const u8 = null,
+    repository_id: ?[]const u8 = null,
+    label: ?[]const u8 = null,
+    root: ?[]const u8 = null,
+    vcs_identity: ?[]const u8 = null,
+    default_branch: ?[]const u8 = null,
+    set_default: bool = false,
+};
+
+const NotifyOptions = struct {
+    help: bool = false,
+    quiet: bool = false,
+    clear: bool = false,
+    session_id: ?[]const u8 = null,
+    workspace_id: ?[]const u8 = null,
+    dock_id: ?u32 = null,
+    pane_id: ?u32 = null,
+    provider: ?[]const u8 = null,
+    title: ?[]const u8 = null,
+    body: ?[]const u8 = null,
+    status: ?[]const u8 = null,
+    label: ?[]const u8 = null,
+};
+
+const Options = struct {
+    command: Command,
+    data_dir: ?[]const u8 = null,
+    json: bool = false,
+    repository_bind: RepositoryBindOptions = .{},
+    notify: NotifyOptions = .{},
+};
+
+const ParseError = error{
+    DuplicateDataDir,
+    DuplicateJson,
+    InvalidArguments,
+    JsonUnavailable,
+    MissingDataDir,
+    MissingOptionValue,
+    MissingProvidersCommand,
+    MissingWorkspaceCommand,
+    UnknownCommand,
+    UnknownProvidersCommand,
+    UnknownWorkspaceCommand,
+};
+
+const InitResult = struct {
+    ok: bool = true,
+    initialized: bool = true,
+    daemon_running: bool,
+    data_dir: []const u8,
+    runtime_id: ?[]const u8 = null,
+    instance_id: ?[]const u8 = null,
+    store_schema_version: ?u32 = null,
+};
+
+const StatusResult = struct {
+    ok: bool = true,
+    running: bool = true,
+    data_dir: []const u8,
+    runtime: headless.StatusResult,
+    store: ?headless.store_protocol.StoreStatusResult,
+};
+
+const ProvidersResult = struct {
+    ok: bool = true,
+    data_dir: []const u8,
+    result: headless.providers_protocol.StatusResult,
+};
+
+const RepositoryBindResult = struct {
+    ok: bool = true,
+    data_dir: []const u8,
+    runtime_id: []const u8,
+    workspace_id: []const u8,
+    repository_id: []const u8,
+    root_path: []const u8,
+    requested_default: bool,
+    store_revision: u64,
+};
+
+pub fn main(init: std.process.Init) void {
+    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+    defer {
+        if (builtin.mode == .Debug) _ = debug_allocator.deinit();
+    }
+    const allocator = if (builtin.mode == .Debug)
+        debug_allocator.allocator()
+    else
+        std.heap.smp_allocator;
+
+    const exit_code = run(allocator, init.io, init.minimal.args) catch |err| blk: {
+        writeStderr(init.io, "verde-daemon: {s}\n", .{@errorName(err)}) catch {};
+        break :blk @as(u8, 1);
+    };
+    if (exit_code != 0) std.process.exit(exit_code);
+}
+
+fn run(allocator: std.mem.Allocator, io: std.Io, process_args: std.process.Args) !u8 {
+    var iterator = try std.process.Args.Iterator.initAllocator(process_args, allocator);
+    defer iterator.deinit();
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    while (iterator.next()) |arg| try argv.append(allocator, arg);
+
+    const options = parseArgs(argv.items) catch |err| {
+        try writeParseError(io, err);
+        try printHelp(io, true);
+        return 2;
+    };
+
+    if (options.command == .help) {
+        try printHelp(io, false);
+        return 0;
+    }
+    if (options.command == .version) {
+        if (options.json) {
+            try writeJson(io, allocator, .{ .version = build_options.version });
+        } else {
+            try writeStdout(io, "verde-daemon {s}\n", .{build_options.version});
+        }
+        return 0;
+    }
+
+    if (options.command == .notify) {
+        prepareAndHandleNotify(allocator, io, options) catch |err| {
+            const target = options.data_dir orelse "inherited VERDE_SESSIONIZER_SOCKET";
+            try writeCommandError(io, allocator, options.json, target, err);
+            return commandErrorExitCode(err);
+        };
+        return 0;
+    }
+
+    const unresolved_data_dir = try resolveDataDir(allocator, options.data_dir);
+    defer allocator.free(unresolved_data_dir);
+
+    prepareAndExecute(allocator, io, options, unresolved_data_dir) catch |err| {
+        try writeCommandError(io, allocator, options.json, unresolved_data_dir, err);
+        return commandErrorExitCode(err);
+    };
+    return 0;
+}
+
+fn prepareAndExecute(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: Options,
+    unresolved_data_dir: []const u8,
+) !void {
+    try rejectInheritedSocketOverride(allocator);
+    if (options.command == .init or options.command == .serve) {
+        try std.Io.Dir.cwd().createDirPath(io, unresolved_data_dir);
+    }
+    const data_dir = try canonicalDataDir(allocator, io, unresolved_data_dir);
+    defer allocator.free(data_dir);
+    try execute(allocator, io, options, data_dir);
+}
+
+fn execute(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: Options,
+    data_dir: []const u8,
+) !void {
+    switch (options.command) {
+        .init => try handleInit(allocator, io, data_dir, options.json),
+        .serve => try handleServe(allocator, io, data_dir),
+        .status => try handleStatus(allocator, io, data_dir, options.json),
+        .providers_status => try handleProvidersStatus(allocator, io, data_dir, options.json),
+        .workspace_show => try handleWorkspaceShow(allocator, io, data_dir, options),
+        .workspace_bind => try handleWorkspaceBind(allocator, io, data_dir, options),
+        .workspace_repository_bind => try handleWorkspaceRepositoryBind(allocator, io, data_dir, options),
+        .help, .version, .notify => unreachable,
+    }
+}
+
+const NotifyTargetMode = enum {
+    data_dir,
+    inherited_endpoint,
+};
+
+fn selectNotifyTargetMode(has_data_dir: bool, has_endpoint: bool) !NotifyTargetMode {
+    if (has_data_dir and has_endpoint) return error.AmbiguousNotifyTarget;
+    if (has_data_dir) return .data_dir;
+    if (has_endpoint) return .inherited_endpoint;
+    return error.MissingNotifyTarget;
+}
+
+fn prepareAndHandleNotify(allocator: std.mem.Allocator, io: std.Io, options: Options) !void {
+    if (options.notify.help) {
+        try printNotifyHelp(io);
+        return;
+    }
+
+    const inherited_endpoint = try environmentValueAlloc(
+        allocator,
+        sessionizer.SESSIONIZER_SOCKET_ENV_NAME,
+    );
+    defer if (inherited_endpoint) |value| allocator.free(value);
+
+    switch (try selectNotifyTargetMode(options.data_dir != null, inherited_endpoint != null)) {
+        .data_dir => {
+            const unresolved = try resolveDataDir(allocator, options.data_dir);
+            defer allocator.free(unresolved);
+            const data_dir = try canonicalDataDir(allocator, io, unresolved);
+            defer allocator.free(data_dir);
+            try handleNotify(allocator, io, data_dir, options);
+        },
+        .inherited_endpoint => {
+            // HeadlessTransport honors the non-empty process endpoint checked
+            // above. The pref path is intentionally absent in endpoint-only mode.
+            try handleNotify(allocator, io, "", options);
+        },
+    }
+}
+
+fn handleNotify(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    pref_path: []const u8,
+    options: Options,
+) !void {
+    const notify = options.notify;
+    const session_id = notify.session_id orelse getenvSlice("VERDE_SESSION_ID") orelse
+        return error.MissingNotifySession;
+    if (session_id.len == 0) return error.MissingNotifySession;
+
+    const status = notify.status;
+    if (!notify.clear and status == null) return error.MissingNotifyStatus;
+    if (status) |value| if (!validNotifyStatus(value)) return error.InvalidNotifyStatus;
+
+    const provider = notify.provider orelse getenvSlice("VERDE_PROVIDER");
+    if (provider) |value| if (!validNotifyProvider(value)) return error.InvalidNotifyProvider;
+    const workspace_id = notify.workspace_id orelse getenvSlice("VERDE_WORKSPACE_ID") orelse "";
+    const workspace_path = getenvSlice("VERDE_WORKSPACE_PATH") orelse "";
+    const env_dock_id = try parseOptionalIdentityU32(getenvSlice("VERDE_DOCK_ID"));
+    const env_pane_id = try parseOptionalIdentityU32(getenvSlice("VERDE_PANE_ID"));
+    const dock_id = notify.dock_id orelse env_dock_id orelse 0;
+    const pane_id = notify.pane_id orelse env_pane_id;
+    const changed_at_ms = platform_runtime.unixTimestampMs();
+    const effective_status = status orelse "idle";
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    const arena = decode_arena.allocator();
+
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = arena,
+        .pref_path = pref_path,
+        .timeout_ms = NOTIFY_REQUEST_TIMEOUT_MS,
+    };
+    var client = sessionizer.headlessClient(arena, &transport);
+    var registered = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    defer registered.deinit();
+    const client_id = (try client.decodeClientRegister(&registered)).client_id;
+
+    const request_key = try std.fmt.allocPrint(
+        arena,
+        "cli:notify:{s}:{d}",
+        .{ session_id, changed_at_ms },
+    );
+    const mutation: headless.store.MutationHeader = .{
+        .request_key = request_key,
+        .client_id = client_id,
+    };
+    const clear = notify.clear or std.mem.eql(u8, effective_status, "idle");
+    var write_result: headless.store.WriteResult = undefined;
+    if (clear) {
+        var parsed = try client.call(headless.store.METHOD_SURFACE_CLEAR, headless.store.SurfaceClearRequest{
+            .mutation = mutation,
+            .session_id = session_id,
+        });
+        defer parsed.deinit();
+        write_result = try client.decodeWriteResult(&parsed);
+    } else {
+        var parsed = try client.call(headless.store.METHOD_SURFACE_UPSERT, headless.store.SurfaceUpsertRequest{
+            .mutation = mutation,
+            .surface = .{
+                .session_id = session_id,
+                .workspace_id = workspace_id,
+                .workspace_path = workspace_path,
+                .dock_id = dock_id,
+                .pane_id = pane_id,
+                .provider = provider,
+                .provider_thread_id = getenvSlice("VERDE_PROVIDER_THREAD_ID"),
+                .title = notify.label orelse notify.title orelse "",
+                .status = effective_status,
+                .status_changed_at_ms = changed_at_ms,
+                .completed_at_ms = if (std.mem.eql(u8, effective_status, "done")) changed_at_ms else 0,
+                .last_event_title = notify.title orelse notify.label,
+                .last_event_body = notify.body,
+            },
+        });
+        defer parsed.deinit();
+        write_result = try client.decodeWriteResult(&parsed);
+    }
+
+    if (options.json) {
+        try writeJson(io, allocator, .{
+            .ok = true,
+            .session_id = session_id,
+            .cleared = clear,
+            .status = effective_status,
+            .store_revision = write_result.store_revision,
+            .applied = write_result.applied,
+            .duplicate = write_result.duplicate,
+        });
+    } else if (!notify.quiet) {
+        try writeStdout(
+            io,
+            "Updated surface {s}: {s} (store revision {d})\n",
+            .{ session_id, if (clear) "idle" else effective_status, write_result.store_revision },
+        );
+    }
+}
+
+fn parseOptionalIdentityU32(value: ?[]const u8) !?u32 {
+    const raw = value orelse return null;
+    if (raw.len == 0) return null;
+    return std.fmt.parseInt(u32, raw, 10) catch error.InvalidNotifyIdentity;
+}
+
+fn validNotifyStatus(value: []const u8) bool {
+    return stringIn(value, &.{ "idle", "working", "waiting", "done", "error" });
+}
+
+fn validNotifyProvider(value: []const u8) bool {
+    return stringIn(value, &.{ "codex", "claude", "cursor", "opencode", "amp", "pi", "fx", "grok" });
+}
+
+fn stringIn(value: []const u8, candidates: []const []const u8) bool {
+    for (candidates) |candidate| {
+        if (std.mem.eql(u8, value, candidate)) return true;
+    }
+    return false;
+}
+
+fn handleServe(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) !void {
+    try writeStderr(io, "verde-daemon: serving data directory {s}\n", .{data_dir});
+    var watcher = TerminationWatcher.init(allocator, data_dir);
+    defer watcher.deinit();
+    try sessionizer.runDaemonWithReadyCallback(allocator, data_dir, .{
+        .context = &watcher,
+        .notify = startTerminationWatcher,
+    });
+}
+
+fn startTerminationWatcher(raw_context: *anyopaque) !void {
+    const watcher: *TerminationWatcher = @ptrCast(@alignCast(raw_context));
+    try watcher.start();
+}
+
+fn requestPrepareShutdown(allocator: std.mem.Allocator, data_dir: []const u8) !bool {
+    const response = try sessionizer.requestAllocWithTimeout(
+        allocator,
+        data_dir,
+        "daemon.prepareShutdown",
+        .{ .expected_pid = platform_runtime.processId() },
+        1,
+        SIGNAL_DRAIN_REQUEST_TIMEOUT_MS,
+    );
+    defer allocator.free(response);
+    return prepareShutdownAccepted(allocator, response);
+}
+
+fn prepareShutdownAccepted(allocator: std.mem.Allocator, response: []const u8) bool {
+    var parsed = headless.parseResponse(allocator, response) catch return false;
+    defer parsed.deinit();
+    if (!parsed.response.isOk()) return false;
+    const result = parsed.response.result orelse return false;
+    if (result != .object) return false;
+    const accepted = result.object.get("accepted") orelse return false;
+    const safe_to_exit = result.object.get("safe_to_exit") orelse return false;
+    return accepted == .bool and accepted.bool and
+        safe_to_exit == .bool and safe_to_exit.bool;
+}
+
+fn handleInit(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, json: bool) !void {
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    const arena = decode_arena.allocator();
+
+    var existing_status: ?headless.StatusResult = queryStatus(arena, data_dir) catch |err| switch (err) {
+        error.ConnectionRefused, error.FileNotFound => null,
+        else => return err,
+    };
+    var existing_store: ?headless.store_protocol.StoreStatusResult = null;
+    if (existing_status) |status| {
+        existing_store = try queryStoreStatus(arena, data_dir, status.capabilities);
+    } else {
+        sessionizer.initializeDaemonData(allocator, data_dir) catch |init_err| {
+            // A daemon may have won the endpoint race after our first probe.
+            // Accept it only after the same identity and store verification.
+            existing_status = queryStatus(arena, data_dir) catch return init_err;
+            existing_store = try queryStoreStatus(arena, data_dir, existing_status.?.capabilities);
+        };
+    }
+
+    const result: InitResult = .{
+        .daemon_running = existing_status != null,
+        .data_dir = data_dir,
+        .runtime_id = if (existing_status) |status| status.runtime_id else null,
+        .instance_id = if (existing_status) |status| status.instance_id else null,
+        .store_schema_version = if (existing_store) |store| store.schema_version else null,
+    };
+    if (json) {
+        try writeJson(io, allocator, result);
+        return;
+    }
+
+    try writeStdout(io, "Initialized Verde daemon data at {s}\n", .{data_dir});
+    if (result.daemon_running) {
+        try writeStdout(io, "Daemon: running\n", .{});
+        try writeStdout(io, "Runtime ID: {s}\n", .{result.runtime_id.?});
+        try writeStdout(io, "Store schema: {d}\n", .{result.store_schema_version.?});
+    } else {
+        try writeStdout(io, "Daemon: stopped (identity and store verified)\n", .{});
+    }
+}
+
+fn handleStatus(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, json: bool) !void {
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    const arena = decode_arena.allocator();
+
+    const status = try queryStatus(arena, data_dir);
+    const store = if (status.capabilities.store)
+        try queryStoreStatus(arena, data_dir, status.capabilities)
+    else
+        null;
+    const result: StatusResult = .{
+        .data_dir = data_dir,
+        .runtime = status,
+        .store = store,
+    };
+    if (json) {
+        try writeJson(io, allocator, result);
+        return;
+    }
+
+    try writeStdout(io, "Verde daemon is running\n", .{});
+    try writeStdout(io, "Data directory: {s}\n", .{data_dir});
+    try writeStdout(io, "Runtime ID: {s}\n", .{status.runtime_id});
+    try writeStdout(io, "Instance ID: {s}\n", .{status.instance_id});
+    try writeStdout(io, "Version: {s}\n", .{status.server_version});
+    try writeStdout(io, "PID: {d}\n", .{status.pid});
+    try writeStdout(io, "Sessions: {d}\n", .{status.session_count});
+    try writeStdout(io, "Chat turns: {d}\n", .{status.chat_turn_count});
+    if (store) |store_status| {
+        try writeStdout(
+            io,
+            "Store: {s} (schema {d}, revision {d})\n",
+            .{ store_status.drain_state, store_status.schema_version, store_status.store_revision },
+        );
+    } else {
+        try writeStdout(io, "Store: unavailable\n", .{});
+    }
+}
+
+fn handleProvidersStatus(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, json: bool) !void {
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    const arena = decode_arena.allocator();
+
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = arena,
+        .pref_path = data_dir,
+    };
+    var client = sessionizer.headlessClient(arena, &transport);
+    const handshake = try client.handshakeRuntime(null);
+    var parsed = try client.callProviderStatus(handshake.status.capabilities);
+    defer parsed.deinit();
+    const provider_status = try client.decodeProviderStatus(&parsed);
+    const result: ProvidersResult = .{
+        .data_dir = data_dir,
+        .result = provider_status,
+    };
+    if (json) {
+        try writeJson(io, allocator, result);
+        return;
+    }
+
+    try writeStdout(io, "Provider status for runtime {s}\n", .{provider_status.runtime_id});
+    for (provider_status.providers) |provider| {
+        try writeStdout(
+            io,
+            "{s}: {s} (installed={s}, auth={s})\n",
+            .{
+                provider.label,
+                provider.state,
+                if (provider.installed) "yes" else "no",
+                provider.authentication,
+            },
+        );
+        if (provider.remediation) |remediation| {
+            try writeStdout(io, "  Next: {s}\n", .{remediation.label});
+        }
+    }
+}
+
+/// Print the complete bounded repository manifest for one workspace. Absolute
+/// checkout paths appear only in this local administrative response.
+fn handleWorkspaceShow(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    data_dir: []const u8,
+    options: Options,
+) !void {
+    const workspace_id = options.repository_bind.workspace_id orelse return error.InvalidArguments;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var transport: sessionizer.HeadlessTransport = .{ .allocator = arena, .pref_path = data_dir };
+    var client = sessionizer.headlessClient(arena, &transport);
+    const handshake = try client.handshakeRuntime(null);
+    var parsed = try client.callWorkspaceRepositoryManifest(
+        handshake.status.capabilities,
+        .{ .workspace_id = workspace_id },
+    );
+    defer parsed.deinit();
+    const manifest = try client.decodeWorkspaceRepositoryManifest(&parsed);
+    if (options.json) return writeJson(io, allocator, manifest);
+
+    try writeStdout(
+        io,
+        "Workspace {s} repositories (default: {s}, store revision {d})\n",
+        .{ manifest.workspace_id, manifest.default_repository_id, manifest.store_revision },
+    );
+    for (manifest.repositories) |repository| {
+        const marker = if (std.mem.eql(u8, repository.repository_id, manifest.default_repository_id)) "*" else " ";
+        try writeStdout(io, "{s} {s}: {s}\n", .{ marker, repository.repository_id, repository.label });
+        if (repository.vcs_identity) |identity| try writeStdout(io, "    VCS: {s}\n", .{identity});
+        if (repository.default_branch) |branch| try writeStdout(io, "    Branch: {s}\n", .{branch});
+        if (repository.bindings.len == 0) {
+            try writeStdout(io, "    No runtime bindings\n", .{});
+            continue;
+        }
+        for (repository.bindings) |binding| {
+            try writeStdout(
+                io,
+                "    {s}: {s} ({s})\n",
+                .{ binding.runtime_id, binding.root_path, binding.availability },
+            );
+        }
+    }
+}
+
+/// Bind the workspace's stable `primary` repository to an existing checkout
+/// on this daemon. The mutation goes through the running sole-writer daemon;
+/// this command never opens SQLite or creates/deletes checkout contents.
+fn handleWorkspaceBind(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    data_dir: []const u8,
+    options: Options,
+) !void {
+    const binding = options.repository_bind;
+    const workspace_id = binding.workspace_id orelse return error.InvalidArguments;
+    const label = binding.label orelse return error.InvalidArguments;
+    const raw_root = binding.root orelse return error.InvalidArguments;
+    const root_path = try canonicalRepositoryRootAlloc(allocator, io, raw_root);
+    defer allocator.free(root_path);
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var transport: sessionizer.HeadlessTransport = .{ .allocator = arena, .pref_path = data_dir };
+    var client = sessionizer.headlessClient(arena, &transport);
+    const handshake = try client.handshakeRuntime(null);
+    try headless.requireCapability(handshake.status.capabilities, .repository_manifests);
+    const client_id = try registerAdministrativeClient(&client);
+    const request_key = try std.fmt.allocPrint(
+        arena,
+        "daemon-cli:workspace-bind:{s}:{d}",
+        .{ workspace_id, platform_runtime.unixTimestampMs() },
+    );
+    var parsed = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, headless.store.WorkspaceUpsertRequest{
+        .mutation = .{ .request_key = request_key, .client_id = client_id },
+        .workspace = .{
+            .workspace_id = workspace_id,
+            .label = label,
+            .path = root_path,
+        },
+    });
+    defer parsed.deinit();
+    const write_result = try client.decodeWriteResult(&parsed);
+    try writeRepositoryBindResult(io, allocator, options.json, .{
+        .data_dir = data_dir,
+        .runtime_id = handshake.status.runtime_id,
+        .workspace_id = workspace_id,
+        .repository_id = headless.store.PRIMARY_REPOSITORY_ID,
+        .root_path = root_path,
+        .requested_default = false,
+        .store_revision = write_result.store_revision,
+    });
+}
+
+/// Add or update one non-primary repository definition and bind its checkout
+/// to this exact runtime identity. Rerunning after a partial failure is safe:
+/// every mutation is an idempotent upsert and checkout data is never touched.
+fn handleWorkspaceRepositoryBind(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    data_dir: []const u8,
+    options: Options,
+) !void {
+    const binding = options.repository_bind;
+    const workspace_id = binding.workspace_id orelse return error.InvalidArguments;
+    const repository_id = binding.repository_id orelse return error.InvalidArguments;
+    const label = binding.label orelse return error.InvalidArguments;
+    const raw_root = binding.root orelse return error.InvalidArguments;
+    const root_path = try canonicalRepositoryRootAlloc(allocator, io, raw_root);
+    defer allocator.free(root_path);
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var transport: sessionizer.HeadlessTransport = .{ .allocator = arena, .pref_path = data_dir };
+    var client = sessionizer.headlessClient(arena, &transport);
+    const handshake = try client.handshakeRuntime(null);
+    try headless.requireCapability(handshake.status.capabilities, .repository_manifests);
+    const client_id = try registerAdministrativeClient(&client);
+    const operation_id = platform_runtime.unixTimestampMs();
+
+    var repository_response = try client.callWorkspaceRepositoryUpsert(
+        handshake.status.capabilities,
+        .{
+            .mutation = .{
+                .request_key = try std.fmt.allocPrint(arena, "daemon-cli:repository:{s}:{s}:{d}", .{ workspace_id, repository_id, operation_id }),
+                .client_id = client_id,
+            },
+            .workspace_id = workspace_id,
+            .repository = .{
+                .repository_id = repository_id,
+                .label = label,
+                .vcs_identity = binding.vcs_identity,
+                .default_branch = binding.default_branch,
+            },
+        },
+    );
+    defer repository_response.deinit();
+    _ = try client.decodeWriteResult(&repository_response);
+
+    var binding_response = try client.callWorkspaceRepositoryBindingUpsert(
+        handshake.status.capabilities,
+        .{
+            .mutation = .{
+                .request_key = try std.fmt.allocPrint(arena, "daemon-cli:repository-binding:{s}:{s}:{d}", .{ workspace_id, repository_id, operation_id }),
+                .client_id = client_id,
+            },
+            .workspace_id = workspace_id,
+            .repository_id = repository_id,
+            .binding = .{
+                .runtime_id = handshake.status.runtime_id,
+                .root_path = root_path,
+                .availability = "available",
+            },
+        },
+    );
+    defer binding_response.deinit();
+    var final_result = try client.decodeWriteResult(&binding_response);
+
+    if (binding.set_default) {
+        var default_response = try client.callWorkspaceRepositoryDefaultSet(
+            handshake.status.capabilities,
+            .{
+                .mutation = .{
+                    .request_key = try std.fmt.allocPrint(arena, "daemon-cli:repository-default:{s}:{s}:{d}", .{ workspace_id, repository_id, operation_id }),
+                    .client_id = client_id,
+                },
+                .workspace_id = workspace_id,
+                .repository_id = repository_id,
+            },
+        );
+        defer default_response.deinit();
+        final_result = try client.decodeWriteResult(&default_response);
+    }
+
+    try writeRepositoryBindResult(io, allocator, options.json, .{
+        .data_dir = data_dir,
+        .runtime_id = handshake.status.runtime_id,
+        .workspace_id = workspace_id,
+        .repository_id = repository_id,
+        .root_path = root_path,
+        .requested_default = binding.set_default,
+        .store_revision = final_result.store_revision,
+    });
+}
+
+fn registerAdministrativeClient(client: *headless.Client) ![]const u8 {
+    var registered = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    defer registered.deinit();
+    const borrowed = (try client.decodeClientRegister(&registered)).client_id;
+    return try client.allocator.dupe(u8, borrowed);
+}
+
+fn canonicalRepositoryRootAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    raw_path: []const u8,
+) ![]u8 {
+    const expanded = try platform_paths.expandUserPath(allocator, raw_path);
+    defer allocator.free(expanded);
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try std.Io.Dir.cwd().realPathFile(io, expanded, &path_buffer);
+    const absolute = path_buffer[0..path_len];
+    var directory = try std.Io.Dir.openDirAbsolute(io, absolute, .{
+        .access_sub_paths = true,
+        .follow_symlinks = false,
+    });
+    defer directory.close(io);
+    return allocator.dupe(u8, absolute);
+}
+
+fn writeRepositoryBindResult(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    json: bool,
+    result: RepositoryBindResult,
+) !void {
+    if (json) return writeJson(io, allocator, result);
+    try writeStdout(
+        io,
+        "Bound {s}/{s} to {s} on runtime {s} (store revision {d})\n",
+        .{ result.workspace_id, result.repository_id, result.root_path, result.runtime_id, result.store_revision },
+    );
+}
+
+fn queryStatus(allocator: std.mem.Allocator, data_dir: []const u8) !headless.StatusResult {
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = allocator,
+        .pref_path = data_dir,
+    };
+    var client = sessionizer.headlessClient(allocator, &transport);
+    const handshake = try client.handshakeRuntime(null);
+    return handshake.status;
+}
+
+fn queryStoreStatus(
+    allocator: std.mem.Allocator,
+    data_dir: []const u8,
+    capabilities: headless.Capabilities,
+) !headless.store_protocol.StoreStatusResult {
+    if (!capabilities.store) return error.StoreUnavailable;
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = allocator,
+        .pref_path = data_dir,
+    };
+    var client = sessionizer.headlessClient(allocator, &transport);
+    const empty_params: struct {} = .{};
+    var parsed = try client.call(headless.store_protocol.METHOD_DAEMON_STORE_STATUS, empty_params);
+    defer parsed.deinit();
+    return try client.decodeStoreStatus(&parsed);
+}
+
+fn resolveDataDir(allocator: std.mem.Allocator, raw_path: ?[]const u8) ![]u8 {
+    if (raw_path) |path| return try platform_paths.expandUserPath(allocator, path);
+    return try platform_paths.sdlPrefPathFallback(allocator, "verde", "Native");
+}
+
+fn canonicalDataDir(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    unresolved_data_dir: []const u8,
+) ![]u8 {
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try std.Io.Dir.cwd().realPathFile(io, unresolved_data_dir, &path_buffer);
+    return try allocator.dupe(u8, path_buffer[0..path_len]);
+}
+
+fn rejectInheritedSocketOverride(allocator: std.mem.Allocator) !void {
+    const inherited_endpoint = try environmentValueAlloc(
+        allocator,
+        sessionizer.SESSIONIZER_SOCKET_ENV_NAME,
+    );
+    defer if (inherited_endpoint) |value| allocator.free(value);
+    if (inherited_endpoint != null) return error.InheritedSocketOverride;
+}
+
+fn environmentValueAlloc(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
+    const environ: std.process.Environ = if (builtin.os.tag == .windows)
+        .{ .block = .global }
+    else
+        .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+    const raw = environ.getAlloc(allocator, name) catch |err| switch (err) {
+        error.EnvironmentVariableMissing => return null,
+        else => return err,
+    };
+    defer allocator.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return try allocator.dupe(u8, trimmed);
+}
+
+fn getenvSlice(name: [:0]const u8) ?[]const u8 {
+    const value = std.c.getenv(name) orelse return null;
+    return std.mem.span(value);
+}
+
+fn parseArgs(argv: []const []const u8) ParseError!Options {
+    if (argv.len <= 1) return .{ .command = .help };
+    const first = argv[1];
+    if (std.mem.eql(u8, first, "help") or std.mem.eql(u8, first, "--help") or std.mem.eql(u8, first, "-h")) {
+        if (argv.len != 2) return error.InvalidArguments;
+        return .{ .command = .help };
+    }
+
+    var command: Command = undefined;
+    var option_start: usize = 2;
+    if (std.mem.eql(u8, first, "version") or std.mem.eql(u8, first, "--version")) {
+        command = .version;
+    } else if (std.mem.eql(u8, first, "init")) {
+        command = .init;
+    } else if (std.mem.eql(u8, first, "serve")) {
+        command = .serve;
+    } else if (std.mem.eql(u8, first, "status")) {
+        command = .status;
+    } else if (std.mem.eql(u8, first, "notify")) {
+        command = .notify;
+    } else if (std.mem.eql(u8, first, "providers")) {
+        if (argv.len <= 2) return error.MissingProvidersCommand;
+        if (!std.mem.eql(u8, argv[2], "status")) return error.UnknownProvidersCommand;
+        command = .providers_status;
+        option_start = 3;
+    } else if (std.mem.eql(u8, first, "workspace")) {
+        if (argv.len <= 2) return error.MissingWorkspaceCommand;
+        if (std.mem.eql(u8, argv[2], "show")) {
+            command = .workspace_show;
+            option_start = 3;
+        } else if (std.mem.eql(u8, argv[2], "bind")) {
+            command = .workspace_bind;
+            option_start = 3;
+        } else if (std.mem.eql(u8, argv[2], "repository")) {
+            if (argv.len <= 3) return error.MissingWorkspaceCommand;
+            if (!std.mem.eql(u8, argv[3], "bind")) return error.UnknownWorkspaceCommand;
+            command = .workspace_repository_bind;
+            option_start = 4;
+        } else {
+            return error.UnknownWorkspaceCommand;
+        }
+    } else {
+        return error.UnknownCommand;
+    }
+
+    var result: Options = .{ .command = command };
+    var index = option_start;
+    while (index < argv.len) {
+        const arg = argv[index];
+        if (std.mem.eql(u8, arg, "--json")) {
+            if (result.json) return error.DuplicateJson;
+            result.json = true;
+            index += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--data-dir")) {
+            if (result.data_dir != null) return error.DuplicateDataDir;
+            if (index + 1 >= argv.len or argv[index + 1].len == 0) return error.MissingDataDir;
+            result.data_dir = argv[index + 1];
+            index += 2;
+            continue;
+        }
+        if (command == .workspace_show or command == .workspace_bind or command == .workspace_repository_bind) {
+            if (std.mem.eql(u8, arg, "--default")) {
+                if (command != .workspace_repository_bind or result.repository_bind.set_default) {
+                    return error.InvalidArguments;
+                }
+                result.repository_bind.set_default = true;
+                index += 1;
+                continue;
+            }
+            const value = try notifyOptionValue(argv, index);
+            if (std.mem.eql(u8, arg, "--workspace") or std.mem.eql(u8, arg, "--workspace-id")) {
+                if (result.repository_bind.workspace_id != null) return error.InvalidArguments;
+                result.repository_bind.workspace_id = value;
+            } else if (command != .workspace_show and std.mem.eql(u8, arg, "--label")) {
+                if (result.repository_bind.label != null) return error.InvalidArguments;
+                result.repository_bind.label = value;
+            } else if (command != .workspace_show and std.mem.eql(u8, arg, "--root")) {
+                if (result.repository_bind.root != null) return error.InvalidArguments;
+                result.repository_bind.root = value;
+            } else if (command == .workspace_repository_bind and
+                (std.mem.eql(u8, arg, "--repository") or std.mem.eql(u8, arg, "--repository-id")))
+            {
+                if (result.repository_bind.repository_id != null) return error.InvalidArguments;
+                result.repository_bind.repository_id = value;
+            } else if (command == .workspace_repository_bind and std.mem.eql(u8, arg, "--vcs-identity")) {
+                if (result.repository_bind.vcs_identity != null) return error.InvalidArguments;
+                result.repository_bind.vcs_identity = value;
+            } else if (command == .workspace_repository_bind and std.mem.eql(u8, arg, "--default-branch")) {
+                if (result.repository_bind.default_branch != null) return error.InvalidArguments;
+                result.repository_bind.default_branch = value;
+            } else {
+                return error.InvalidArguments;
+            }
+            index += 2;
+            continue;
+        }
+        if (command == .notify) {
+            if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+                result.notify.help = true;
+                index += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--quiet")) {
+                result.notify.quiet = true;
+                index += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--clear")) {
+                result.notify.clear = true;
+                index += 1;
+                continue;
+            }
+
+            const value = try notifyOptionValue(argv, index);
+            if (std.mem.eql(u8, arg, "--session") or std.mem.eql(u8, arg, "--session-id")) {
+                if (result.notify.session_id != null) return error.InvalidArguments;
+                result.notify.session_id = value;
+            } else if (std.mem.eql(u8, arg, "--workspace")) {
+                if (result.notify.workspace_id != null) return error.InvalidArguments;
+                result.notify.workspace_id = value;
+            } else if (std.mem.eql(u8, arg, "--dock")) {
+                if (result.notify.dock_id != null) return error.InvalidArguments;
+                result.notify.dock_id = std.fmt.parseInt(u32, value, 10) catch return error.InvalidArguments;
+            } else if (std.mem.eql(u8, arg, "--pane")) {
+                if (result.notify.pane_id != null) return error.InvalidArguments;
+                result.notify.pane_id = std.fmt.parseInt(u32, value, 10) catch return error.InvalidArguments;
+            } else if (std.mem.eql(u8, arg, "--provider")) {
+                if (result.notify.provider != null or !validNotifyProvider(value)) return error.InvalidArguments;
+                result.notify.provider = value;
+            } else if (std.mem.eql(u8, arg, "--title")) {
+                if (result.notify.title != null) return error.InvalidArguments;
+                result.notify.title = value;
+            } else if (std.mem.eql(u8, arg, "--body")) {
+                if (result.notify.body != null) return error.InvalidArguments;
+                result.notify.body = value;
+            } else if (std.mem.eql(u8, arg, "--status")) {
+                if (result.notify.status != null or !validNotifyStatus(value)) return error.InvalidArguments;
+                result.notify.status = value;
+            } else if (std.mem.eql(u8, arg, "--label")) {
+                if (result.notify.label != null) return error.InvalidArguments;
+                result.notify.label = value;
+            } else {
+                return error.InvalidArguments;
+            }
+            index += 2;
+            continue;
+        }
+        return error.InvalidArguments;
+    }
+    if (command == .serve and result.json) return error.JsonUnavailable;
+    if (command == .workspace_show) {
+        if (result.repository_bind.workspace_id == null) return error.InvalidArguments;
+    } else if (command == .workspace_bind) {
+        if (result.repository_bind.workspace_id == null or result.repository_bind.label == null or
+            result.repository_bind.root == null)
+        {
+            return error.InvalidArguments;
+        }
+    } else if (command == .workspace_repository_bind) {
+        if (result.repository_bind.workspace_id == null or result.repository_bind.repository_id == null or
+            result.repository_bind.label == null or result.repository_bind.root == null or
+            std.mem.eql(u8, result.repository_bind.repository_id.?, headless.store.PRIMARY_REPOSITORY_ID))
+        {
+            return error.InvalidArguments;
+        }
+    }
+    return result;
+}
+
+fn notifyOptionValue(argv: []const []const u8, index: usize) ParseError![]const u8 {
+    if (index + 1 >= argv.len or argv[index + 1].len == 0) return error.MissingOptionValue;
+    return argv[index + 1];
+}
+
+fn writeParseError(io: std.Io, err: ParseError) !void {
+    const message = switch (err) {
+        error.DuplicateDataDir => "--data-dir may be provided only once",
+        error.DuplicateJson => "--json may be provided only once",
+        error.InvalidArguments => "invalid command arguments",
+        error.JsonUnavailable => "serve does not support --json",
+        error.MissingDataDir => "--data-dir requires a non-empty path",
+        error.MissingOptionValue => "command option requires a non-empty value",
+        error.MissingProvidersCommand => "providers requires the status command",
+        error.MissingWorkspaceCommand => "workspace requires show, bind, or repository bind",
+        error.UnknownCommand => "unknown command",
+        error.UnknownProvidersCommand => "unknown providers command",
+        error.UnknownWorkspaceCommand => "unknown workspace command",
+    };
+    try writeStderr(io, "verde-daemon: {s}\n\n", .{message});
+}
+
+fn writeCommandError(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    json: bool,
+    data_dir: []const u8,
+    err: anyerror,
+) !void {
+    const message = commandErrorMessage(err);
+    if (json) {
+        try writeJson(io, allocator, .{
+            .ok = false,
+            .error_code = @errorName(err),
+            .error_message = message,
+            .data_dir = data_dir,
+        });
+        return;
+    }
+    try writeStderr(io, "verde-daemon: {s}: {s}\n", .{ message, data_dir });
+}
+
+fn commandErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.ConnectionRefused, error.FileNotFound => "daemon is not running for data directory",
+        error.ConnectionTimedOut => "daemon did not respond before the request deadline",
+        error.EndpointInUse => "another daemon owns the data directory endpoint",
+        error.InheritedSocketOverride => "unset VERDE_SESSIONIZER_SOCKET before using the standalone daemon CLI",
+        error.AmbiguousNotifyTarget => "notify accepts either --data-dir or inherited VERDE_SESSIONIZER_SOCKET, not both",
+        error.MissingNotifyTarget => "notify requires --data-dir outside a Verde-owned terminal",
+        error.MissingNotifySession => "notify requires --session or VERDE_SESSION_ID",
+        error.MissingNotifyStatus => "notify requires --status or --clear",
+        error.InvalidNotifyStatus => "notify status must be idle, working, waiting, done, or error",
+        error.InvalidNotifyProvider => "notify provider is not supported",
+        error.InvalidNotifyIdentity => "notify dock or pane identity is invalid",
+        error.InvalidArguments => "invalid command arguments",
+        error.StoreUnavailable => "daemon store is unavailable",
+        error.RuntimeIdentityMissing => "daemon did not return a runtime identity",
+        error.RuntimeIdentityMismatch => "daemon runtime identity did not match",
+        error.IncompatibleRuntimeProtocol, error.IncompatibleProtocolVersion => "daemon protocol is incompatible",
+        error.CapabilityUnavailable => "daemon does not support this command",
+        error.RemoteError => "daemon rejected the request",
+        else => @errorName(err),
+    };
+}
+
+fn commandErrorExitCode(err: anyerror) u8 {
+    return switch (err) {
+        error.CapabilityUnavailable,
+        error.RemoteError,
+        error.RuntimeIdentityMissing,
+        error.RuntimeIdentityMismatch,
+        error.IncompatibleRuntimeProtocol,
+        error.IncompatibleProtocolVersion,
+        error.StoreUnavailable,
+        error.InheritedSocketOverride,
+        => 4,
+        error.AmbiguousNotifyTarget,
+        error.MissingNotifyTarget,
+        error.MissingNotifySession,
+        error.MissingNotifyStatus,
+        error.InvalidNotifyStatus,
+        error.InvalidNotifyProvider,
+        error.InvalidNotifyIdentity,
+        error.InvalidArguments,
+        => 2,
+        else => 3,
+    };
+}
+
+fn printHelp(io: std.Io, stderr: bool) !void {
+    const help =
+        \\Usage:
+        \\  verde-daemon init [--data-dir PATH] [--json]
+        \\  verde-daemon serve [--data-dir PATH]
+        \\  verde-daemon status [--data-dir PATH] [--json]
+        \\  verde-daemon providers status [--data-dir PATH] [--json]
+        \\  verde-daemon workspace show --workspace ID [--data-dir PATH] [--json]
+        \\  verde-daemon workspace bind --workspace ID --label LABEL --root PATH [--data-dir PATH] [--json]
+        \\  verde-daemon workspace repository bind --workspace ID --repository ID --label LABEL --root PATH [options]
+        \\  verde-daemon notify --status STATUS [options]
+        \\  verde-daemon version [--json]
+        \\  verde-daemon --help
+        \\
+        \\Exit codes:
+        \\  0  Success
+        \\  2  Invalid command or options
+        \\  3  Startup or transport failure
+        \\  4  Runtime protocol, capability, or store failure
+        \\
+        \\VERDE_SESSIONIZER_SOCKET must be unset for administrative commands.
+        \\Notify accepts that inherited endpoint only inside a Verde-owned terminal;
+        \\otherwise notify requires an explicit --data-dir.
+        \\Workspace commands require a running daemon; binding requires an existing checkout.
+        \\Repository bind options: --vcs-identity URL, --default-branch NAME,
+        \\--default, --data-dir PATH, and --json. No checkout data is modified.
+        \\
+    ;
+    if (stderr) return writeStderr(io, "{s}", .{help});
+    return writeStdout(io, "{s}", .{help});
+}
+
+fn printNotifyHelp(io: std.Io) !void {
+    try writeStdout(io,
+        \\Usage:
+        \\  verde-daemon notify --status idle|working|waiting|done|error [options]
+        \\  verde-daemon notify --clear [options]
+        \\
+        \\Options:
+        \\  --quiet                 Suppress successful human-readable output
+        \\  --json                  Print a JSON mutation receipt
+        \\  --title TEXT            Record the provider event title
+        \\  --body TEXT             Record the provider event body
+        \\  --provider NAME         codex|claude|cursor|opencode|amp|pi|fx|grok
+        \\  --session ID            Override VERDE_SESSION_ID
+        \\  --workspace ID          Override VERDE_WORKSPACE_ID
+        \\  --dock ID               Override VERDE_DOCK_ID
+        \\  --pane ID               Override VERDE_PANE_ID
+        \\  --data-dir PATH         Target a daemon explicitly outside its terminal
+        \\
+        \\A Verde-owned terminal supplies VERDE_SESSIONIZER_SOCKET automatically.
+        \\Outside one, --data-dir is required; no desktop/default endpoint is inferred.
+        \\
+    , .{});
+}
+
+fn writeJson(io: std.Io, allocator: std.mem.Allocator, value: anytype) !void {
+    const encoded = try std.json.Stringify.valueAlloc(allocator, value, .{ .emit_null_optional_fields = false });
+    defer allocator.free(encoded);
+    try writeStdout(io, "{s}\n", .{encoded});
+}
+
+fn writeStdout(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
+    const stdout_file = std.Io.File.stdout();
+    var buffer: [16 * 1024]u8 = undefined;
+    var writer = stdout_file.writerStreaming(io, &buffer);
+    defer writer.interface.flush() catch {};
+    try writer.interface.print(fmt, args);
+}
+
+fn writeStderr(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
+    const stderr_file = std.Io.File.stderr();
+    var buffer: [4 * 1024]u8 = undefined;
+    var writer = stderr_file.writerStreaming(io, &buffer);
+    defer writer.interface.flush() catch {};
+    try writer.interface.print(fmt, args);
+}
+
+test "daemon CLI parses every public command" {
+    const init_options = try parseArgs(&.{ "verde-daemon", "init", "--data-dir", "/srv/verde", "--json" });
+    try std.testing.expectEqual(Command.init, init_options.command);
+    try std.testing.expectEqualStrings("/srv/verde", init_options.data_dir.?);
+    try std.testing.expect(init_options.json);
+
+    const serve_options = try parseArgs(&.{ "verde-daemon", "serve", "--data-dir", "/srv/verde" });
+    try std.testing.expectEqual(Command.serve, serve_options.command);
+    try std.testing.expect(!serve_options.json);
+
+    const status_options = try parseArgs(&.{ "verde-daemon", "status", "--json" });
+    try std.testing.expectEqual(Command.status, status_options.command);
+    try std.testing.expect(status_options.json);
+
+    const provider_options = try parseArgs(&.{ "verde-daemon", "providers", "status", "--json" });
+    try std.testing.expectEqual(Command.providers_status, provider_options.command);
+    try std.testing.expect(provider_options.json);
+
+    const workspace_show = try parseArgs(&.{
+        "verde-daemon",
+        "workspace",
+        "show",
+        "--workspace",
+        "workspace-1",
+        "--json",
+    });
+    try std.testing.expectEqual(Command.workspace_show, workspace_show.command);
+    try std.testing.expectEqualStrings("workspace-1", workspace_show.repository_bind.workspace_id.?);
+    try std.testing.expect(workspace_show.json);
+
+    const workspace_bind = try parseArgs(&.{
+        "verde-daemon",
+        "workspace",
+        "bind",
+        "--workspace",
+        "workspace-1",
+        "--label",
+        "Workspace one",
+        "--root",
+        "/workspace/one",
+        "--json",
+    });
+    try std.testing.expectEqual(Command.workspace_bind, workspace_bind.command);
+    try std.testing.expectEqualStrings("workspace-1", workspace_bind.repository_bind.workspace_id.?);
+    try std.testing.expectEqualStrings("Workspace one", workspace_bind.repository_bind.label.?);
+    try std.testing.expectEqualStrings("/workspace/one", workspace_bind.repository_bind.root.?);
+
+    const repository_bind = try parseArgs(&.{
+        "verde-daemon",
+        "workspace",
+        "repository",
+        "bind",
+        "--workspace-id",
+        "workspace-1",
+        "--repository-id",
+        "repo-api",
+        "--label",
+        "API",
+        "--root",
+        "/workspace/api",
+        "--vcs-identity",
+        "https://example.com/org/api.git",
+        "--default-branch",
+        "main",
+        "--default",
+    });
+    try std.testing.expectEqual(Command.workspace_repository_bind, repository_bind.command);
+    try std.testing.expectEqualStrings("repo-api", repository_bind.repository_bind.repository_id.?);
+    try std.testing.expect(repository_bind.repository_bind.set_default);
+
+    const notify_options = try parseArgs(&.{
+        "verde-daemon",
+        "notify",
+        "--quiet",
+        "--status",
+        "working",
+        "--title",
+        "Running tests",
+        "--provider",
+        "codex",
+    });
+    try std.testing.expectEqual(Command.notify, notify_options.command);
+    try std.testing.expect(notify_options.notify.quiet);
+    try std.testing.expectEqualStrings("working", notify_options.notify.status.?);
+    try std.testing.expectEqualStrings("Running tests", notify_options.notify.title.?);
+    try std.testing.expectEqualStrings("codex", notify_options.notify.provider.?);
+}
+
+test "daemon CLI rejects ambiguous or unsupported options" {
+    try std.testing.expectError(
+        error.DuplicateDataDir,
+        parseArgs(&.{ "verde-daemon", "status", "--data-dir", "a", "--data-dir", "b" }),
+    );
+    try std.testing.expectError(error.MissingDataDir, parseArgs(&.{ "verde-daemon", "init", "--data-dir" }));
+    try std.testing.expectError(error.MissingProvidersCommand, parseArgs(&.{ "verde-daemon", "providers" }));
+    try std.testing.expectError(error.MissingWorkspaceCommand, parseArgs(&.{ "verde-daemon", "workspace" }));
+    try std.testing.expectError(
+        error.InvalidArguments,
+        parseArgs(&.{ "verde-daemon", "workspace", "show", "--label", "No workspace" }),
+    );
+    try std.testing.expectError(
+        error.InvalidArguments,
+        parseArgs(&.{ "verde-daemon", "workspace", "bind", "--workspace", "workspace-1" }),
+    );
+    try std.testing.expectError(
+        error.InvalidArguments,
+        parseArgs(&.{
+            "verde-daemon",
+            "workspace",
+            "repository",
+            "bind",
+            "--workspace",
+            "workspace-1",
+            "--repository",
+            "primary",
+            "--label",
+            "Primary",
+            "--root",
+            "/workspace/one",
+        }),
+    );
+    try std.testing.expectError(error.JsonUnavailable, parseArgs(&.{ "verde-daemon", "serve", "--json" }));
+    try std.testing.expectError(error.InvalidArguments, parseArgs(&.{ "verde-daemon", "status", "--wat" }));
+    try std.testing.expectError(
+        error.MissingOptionValue,
+        parseArgs(&.{ "verde-daemon", "notify", "--status" }),
+    );
+    try std.testing.expectError(
+        error.InvalidArguments,
+        parseArgs(&.{ "verde-daemon", "notify", "--status", "busy" }),
+    );
+}
+
+test "daemon notify parses explicit identity and data directory" {
+    const options = try parseArgs(&.{
+        "verde-daemon",
+        "notify",
+        "--data-dir",
+        "/srv/verde",
+        "--session-id",
+        "opaque:session/id",
+        "--workspace",
+        "workspace-1",
+        "--dock",
+        "4",
+        "--pane",
+        "9",
+        "--status",
+        "done",
+        "--provider",
+        "fx",
+        "--json",
+    });
+    try std.testing.expectEqualStrings("/srv/verde", options.data_dir.?);
+    try std.testing.expectEqualStrings("opaque:session/id", options.notify.session_id.?);
+    try std.testing.expectEqualStrings("workspace-1", options.notify.workspace_id.?);
+    try std.testing.expectEqual(@as(?u32, 4), options.notify.dock_id);
+    try std.testing.expectEqual(@as(?u32, 9), options.notify.pane_id);
+    try std.testing.expectEqualStrings("done", options.notify.status.?);
+    try std.testing.expectEqualStrings("fx", options.notify.provider.?);
+    try std.testing.expect(options.json);
+}
+
+test "daemon notify target never falls back implicitly" {
+    try std.testing.expectEqual(NotifyTargetMode.data_dir, try selectNotifyTargetMode(true, false));
+    try std.testing.expectEqual(NotifyTargetMode.inherited_endpoint, try selectNotifyTargetMode(false, true));
+    try std.testing.expectError(error.MissingNotifyTarget, selectNotifyTargetMode(false, false));
+    try std.testing.expectError(error.AmbiguousNotifyTarget, selectNotifyTargetMode(true, true));
+}
+
+test "daemon notify recognizes all lifecycle providers and statuses" {
+    const providers = [_][]const u8{ "codex", "claude", "cursor", "opencode", "amp", "pi", "fx", "grok" };
+    for (providers) |provider| {
+        try std.testing.expect(validNotifyProvider(provider));
+    }
+    const statuses = [_][]const u8{ "idle", "working", "waiting", "done", "error" };
+    for (statuses) |status| {
+        try std.testing.expect(validNotifyStatus(status));
+    }
+    try std.testing.expect(!validNotifyProvider("unknown"));
+    try std.testing.expect(!validNotifyStatus("busy"));
+}
+
+test "signal watcher recognizes only an accepted prepare-shutdown result" {
+    const accepted =
+        \\{"jsonrpc":"2.0","id":1,"result":{"accepted":true,"safe_to_exit":true}}
+    ;
+    const refused =
+        \\{"jsonrpc":"2.0","id":1,"result":{"accepted":false,"safe_to_exit":false}}
+    ;
+    const inconsistent =
+        \\{"jsonrpc":"2.0","id":1,"result":{"accepted":true,"safe_to_exit":false}}
+    ;
+    const remote_error =
+        \\{"jsonrpc":"2.0","id":1,"error":{"code":"invalid_state","message":"busy"}}
+    ;
+    try std.testing.expect(prepareShutdownAccepted(std.testing.allocator, accepted));
+    try std.testing.expect(!prepareShutdownAccepted(std.testing.allocator, refused));
+    try std.testing.expect(!prepareShutdownAccepted(std.testing.allocator, inconsistent));
+    try std.testing.expect(!prepareShutdownAccepted(std.testing.allocator, remote_error));
+    try std.testing.expect(!prepareShutdownAccepted(std.testing.allocator, "not json"));
+}

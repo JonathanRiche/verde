@@ -1,0 +1,24 @@
+services:
+  verde-runtime:
+    image: verde-runtime:local
+    network_mode: host
+    environment:
+      VERDE_MODE: runtime
+      VERDE_GATEWAY_PORT: "${VERDE_GATEWAY_PORT:-6783}"
+    volumes:
+      - verde-home:/home/verde
+      - verde-workspaces:/workspace
+    read_only: true
+    tmpfs:
+      - /tmp:uid=10001,gid=10001,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 2048
+    stop_grace_period: 30m
+    restart: unless-stopped
+
+volumes:
+  verde-home:
+  verde-workspaces:

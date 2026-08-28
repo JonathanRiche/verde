@@ -11,6 +11,7 @@ const db_client = @import("../db/client.zig");
 const db_types = @import("../db/types.zig");
 const notifier = @import("../app/notifier.zig");
 const runtime_log = @import("../runtime/log.zig");
+const RuntimeService = @import("../runtime/service.zig");
 const sessionizer = @import("../terminal/sessionizer.zig");
 const send_runner = @import("../chat/send_runner.zig");
 const loop_wakeup = @import("loop_wakeup");
@@ -78,6 +79,8 @@ const DAEMON_CHAT_POLL_BACKOFF_MAX_MS: i64 = 1000;
 // for bounded replay pages so one synchronous tail cannot exceed the IPC cap
 // or monopolize the render thread.
 const DAEMON_CHAT_TAIL_PAGE_BYTES: usize = 1024 * 1024;
+const REMOTE_CHAT_TAIL_PAGE_BYTES: usize = 256 * 1024;
+const MAX_REMOTE_CONTROL_DISPATCHES: usize = 64;
 const OPENCODE_LOGO_BYTES = @embedFile("../assets/opencode-logo-dark.png");
 const CODEX_LOGO_BYTES = @embedFile("../assets/OpenAI-white-monoblossom.png");
 const CLAUDE_LOGO_BYTES = @embedFile("../assets/claude-logo.png");
@@ -488,6 +491,100 @@ fn finishTitleGenerationFailure(state: *TitleGenerationState, message: []const u
     state.status = .failed;
 }
 
+const OwnedRemoteTurnTarget = struct {
+    workspace_id: []u8,
+    local_thread_id: []u8,
+    profile_id: []u8,
+    runtime_id: []u8,
+    repository_id: []u8,
+    relative_cwd: ?[]u8,
+    turn_id: []u8,
+    started_at_ms: i64,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        workspace_id: []const u8,
+        thread: *const ChatThread,
+        turn_id: []const u8,
+        started_at_ms: i64,
+    ) !OwnedRemoteTurnTarget {
+        const route = thread.pinnedRuntimeRoute() orelse return error.RemoteRuntimeRouteNotPinned;
+        if (std.mem.eql(u8, route.profile_id, chat_types.LOCAL_RUNTIME_PROFILE_ID)) {
+            return error.RemoteRuntimeRouteNotPinned;
+        }
+        const runtime_id = route.runtime_id orelse return error.RemoteRuntimeRouteNotPinned;
+        const owned_workspace_id = try allocator.dupe(u8, workspace_id);
+        errdefer allocator.free(owned_workspace_id);
+        const owned_local_thread_id = try allocator.dupe(u8, thread.local_thread_id);
+        errdefer allocator.free(owned_local_thread_id);
+        const owned_profile_id = try allocator.dupe(u8, route.profile_id);
+        errdefer allocator.free(owned_profile_id);
+        const owned_runtime_id = try allocator.dupe(u8, runtime_id);
+        errdefer allocator.free(owned_runtime_id);
+        const owned_repository_id = try allocator.dupe(u8, route.repository_id);
+        errdefer allocator.free(owned_repository_id);
+        const owned_relative_cwd = if (route.relative_cwd) |cwd| try allocator.dupe(u8, cwd) else null;
+        errdefer if (owned_relative_cwd) |cwd| allocator.free(cwd);
+        const owned_turn_id = try allocator.dupe(u8, turn_id);
+        return .{
+            .workspace_id = owned_workspace_id,
+            .local_thread_id = owned_local_thread_id,
+            .profile_id = owned_profile_id,
+            .runtime_id = owned_runtime_id,
+            .repository_id = owned_repository_id,
+            .relative_cwd = owned_relative_cwd,
+            .turn_id = owned_turn_id,
+            .started_at_ms = started_at_ms,
+        };
+    }
+
+    fn deinit(self: *OwnedRemoteTurnTarget, allocator: std.mem.Allocator) void {
+        allocator.free(self.workspace_id);
+        allocator.free(self.local_thread_id);
+        allocator.free(self.profile_id);
+        allocator.free(self.runtime_id);
+        allocator.free(self.repository_id);
+        if (self.relative_cwd) |cwd| allocator.free(cwd);
+        allocator.free(self.turn_id);
+        self.* = undefined;
+    }
+};
+
+const RemoteTailDispatch = struct {
+    target: OwnedRemoteTurnTarget,
+    ticket: RuntimeService.RpcTicket,
+    after_seq: u64,
+    rpc_started_at_ms: i64,
+
+    fn deinit(self: *RemoteTailDispatch, allocator: std.mem.Allocator) void {
+        self.target.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const RemoteControlAction = union(enum) {
+    cancel,
+    approve: struct {
+        call_id: []u8,
+        decision: ai_harness.ApprovalDecision,
+    },
+};
+
+const RemoteControlDispatch = struct {
+    target: OwnedRemoteTurnTarget,
+    action: RemoteControlAction,
+    ticket: ?RuntimeService.RpcTicket = null,
+
+    fn deinit(self: *RemoteControlDispatch, allocator: std.mem.Allocator) void {
+        switch (self.action) {
+            .cancel => {},
+            .approve => |approval| allocator.free(approval.call_id),
+        }
+        self.target.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 pub const State = struct {
     pending_send_count: usize = 0,
     codex_background_poll: CodexBackgroundPollState = .{},
@@ -501,6 +598,10 @@ pub const State = struct {
     /// keeps the reusable connection and response buffer exclusive.
     daemon_tail_worker: ?std.Thread = null,
     daemon_tail_args: ?*DaemonTailWorkerArgs = null,
+    /// Manager-targeted remote RPCs have no controller-owned workers. Every
+    /// ticket remains here until the SDL owner drains and validates it.
+    remote_tail_dispatches: std.ArrayListUnmanaged(RemoteTailDispatch) = .empty,
+    remote_control_dispatches: std.ArrayListUnmanaged(RemoteControlDispatch) = .empty,
 
     /// Releases chat-controller-owned polling scratch space.
     pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
@@ -513,6 +614,10 @@ pub const State = struct {
             dispatch.destroy(allocator);
         }
         self.acceptance_dispatches.deinit(std.heap.page_allocator);
+        for (self.remote_tail_dispatches.items) |*dispatch| dispatch.deinit(allocator);
+        self.remote_tail_dispatches.deinit(allocator);
+        for (self.remote_control_dispatches.items) |*dispatch| dispatch.deinit(allocator);
+        self.remote_control_dispatches.deinit(allocator);
         self.daemon_tail_connection.deinit();
         if (self.daemon_tail_response_buffer) |buffer| allocator.free(buffer);
         self.daemon_tail_response_buffer = null;
@@ -560,7 +665,6 @@ const CodexBackgroundPollRequest = struct {
     provider_thread_id: []u8,
     process_id: []u8,
     cwd: []u8,
-    remote_host: ?[]u8,
 
     fn deinit(self: *CodexBackgroundPollRequest) void {
         const allocator = std.heap.page_allocator;
@@ -568,7 +672,6 @@ const CodexBackgroundPollRequest = struct {
         allocator.free(self.provider_thread_id);
         allocator.free(self.process_id);
         allocator.free(self.cwd);
-        if (self.remote_host) |value| allocator.free(value);
         allocator.destroy(self);
     }
 };
@@ -586,7 +689,6 @@ fn codexBackgroundPollWorker(state: *CodexBackgroundPollState, request: *const C
     const config: ai_harness.ProviderConfig = .{ .codex = .{
         .cwd = request.cwd,
         .launch_on_connect = false,
-        .remote_ssh = if (request.remote_host) |host| .{ .host = host, .cwd = request.cwd } else null,
     } };
     var running: ?bool = null;
     if (ai_harness.connect(allocator, config)) |client_value| {
@@ -1141,6 +1243,48 @@ test "prospective prompt preflight rejects before thread staging" {
     try std.testing.expectEqual(@as(usize, 0), prospective.messages.items.len);
 }
 
+test "remote attachments fail before composer or transcript mutation" {
+    const allocator = std.testing.allocator;
+    const FakeState = struct {
+        project_controller: struct {
+            projects: std.ArrayList(Project) = .empty,
+        } = .{},
+        notices: usize = 0,
+        daemon_checks: usize = 0,
+
+        pub fn setSidebarNotice(self: *@This(), _: []const u8) void {
+            self.notices += 1;
+        }
+        pub fn ensureSessionDaemon(self: *@This()) !void {
+            self.daemon_checks += 1;
+        }
+    };
+    var state: FakeState = .{};
+    var project = try Project.init(allocator, "remote-attachment", "Remote", "/desktop/private", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    defer {
+        for (state.project_controller.projects.items) |*owned| owned.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+    }
+    const thread = &state.project_controller.projects.items[0].threads.items[0];
+    thread.setDraft("keep this draft");
+    try std.testing.expectEqual(.updated, try thread.selectRuntimeRoute(allocator, .{
+        .profile_id = "remote-box",
+        .repository_id = "repo-api",
+    }));
+    var image = try ChatImageAttachment.init(allocator, "/desktop/private/secret.png", "image/png", 9);
+    defer image.deinit(allocator);
+
+    try std.testing.expect(!try preflightThreadPrompt(&state, 0, thread, "send remotely", &.{image}));
+    try std.testing.expectEqualStrings("keep this draft", thread.currentDraft());
+    try std.testing.expectEqual(@as(usize, 0), thread.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.daemon_checks);
+    try std.testing.expectEqual(@as(usize, 1), state.notices);
+}
+
 test "failed dispatch restores retryable draft; async acceptance arms one addressed turn" {
     // M4-P3 via 7.5: durability is the acceptance receipt, now awaited on a
     // worker. A dispatch failure restores the draft (nothing reached the
@@ -1195,7 +1339,7 @@ test "failed dispatch restores retryable draft; async acceptance arms one addres
             _: usize,
             thread: *ChatThread,
             prompt: []const u8,
-            _: ProviderExecutionTarget,
+            _: ChatExecutionRoute,
             _: *InitialSendSnapshot,
             selected: bool,
         ) !void {
@@ -1349,6 +1493,13 @@ test "acceptance keeps the optimistic clear, retains message id, and restores re
                 .project_id = "",
                 .local_thread_id = "",
                 .pref_path = "",
+                .profile_id = "",
+                .repository_id = "",
+                .relative_cwd = null,
+                .runtime_id = null,
+                .turn_id = "",
+                .prompt = "",
+                .message_id = "",
                 .params = undefined,
                 .snapshot = .{ .message_count = 0, .committed = false, .last_activity_at = 0, .title = null },
                 .outcome = outcome,
@@ -1356,14 +1507,19 @@ test "acceptance keeps the optimistic clear, retains message id, and restores re
             const arena = dispatch.arena.allocator();
             dispatch.project_id = try arena.dupe(u8, pid);
             dispatch.local_thread_id = try arena.dupe(u8, tid);
-            dispatch.params = .{
-                .turn_id = try arena.dupe(u8, "gui:test:turn"),
+            dispatch.profile_id = try arena.dupe(u8, chat_types.LOCAL_RUNTIME_PROFILE_ID);
+            dispatch.repository_id = try arena.dupe(u8, chat_types.PRIMARY_REPOSITORY_ID);
+            dispatch.turn_id = try arena.dupe(u8, "gui:test:turn");
+            dispatch.prompt = try arena.dupe(u8, prompt);
+            dispatch.message_id = try arena.dupe(u8, "gui-msg:test:turn");
+            dispatch.params = .{ .legacy_local = .{
+                .turn_id = dispatch.turn_id,
                 .workspace_id = dispatch.project_id,
                 .local_thread_id = dispatch.local_thread_id,
                 .provider = "claude",
                 .harness = "cli",
                 .project_path = "/tmp/accept-commit",
-                .prompt = try arena.dupe(u8, prompt),
+                .prompt = dispatch.prompt,
                 .image_paths = &.{},
                 .images = &.{},
                 .provider_thread_id = null,
@@ -1374,10 +1530,8 @@ test "acceptance keeps the optimistic clear, retains message id, and restores re
                 .cursor_model_params_json = null,
                 .fast_mode = false,
                 .access_mode = "default",
-                .remote_ssh_host = null,
-                .remote_cwd = null,
-                .message_id = try arena.dupe(u8, "gui-msg:test:turn"),
-            };
+                .message_id = dispatch.message_id,
+            } };
             return dispatch;
         }
     }.call;
@@ -1418,6 +1572,7 @@ test "acceptance keeps the optimistic clear, retains message id, and restores re
     try std.testing.expectEqual(@as(usize, 1), state.composer_resets);
     try std.testing.expect(!thread.isSendAcceptancePending());
     try std.testing.expect(thread.isSendPending());
+    try std.testing.expect(thread.pinnedRuntimeRoute() != null);
     try std.testing.expectEqual(@as(usize, 0), state.failure_rows);
 
     // Rejected: staged row popped, send disarmed, and the dispatch transfers
@@ -1463,6 +1618,154 @@ pub fn effectiveThreadCwd(project_path: []const u8, thread: *const ChatThread) [
     return if (thread.cwd) |cwd| std.mem.sliceTo(cwd, 0) else project_path;
 }
 
+/// The existing provider harness is local-only. Until the runtime connection
+/// manager supplies a verified target, only the exact legacy Local/primary
+/// route may reach it; every explicit runtime/repository route fails closed.
+pub fn mayUseLegacyLocalExecution(thread: *const ChatThread) bool {
+    const route = thread.selectedRuntimeRoute();
+    if (!std.mem.eql(u8, route.profile_id, chat_types.LOCAL_RUNTIME_PROFILE_ID) or
+        !std.mem.eql(u8, route.repository_id, chat_types.PRIMARY_REPOSITORY_ID) or
+        route.relative_cwd != null)
+    {
+        return false;
+    }
+    const pinned = thread.pinnedRuntimeRoute() orelse return true;
+    return pinned.runtime_id == null;
+}
+
+const RepositoryChatRoute = struct {
+    profile_id: []const u8,
+    repository_id: []const u8,
+    relative_cwd: ?[]const u8,
+    runtime_id: ?[]const u8,
+};
+
+const ChatExecutionRoute = union(enum) {
+    legacy_local,
+    repository_local: RepositoryChatRoute,
+    remote: RepositoryChatRoute,
+};
+
+fn optionalRouteTextEql(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
+}
+
+fn remoteSnapshotCanRoute(snapshot: RuntimeService.Snapshot, pinned_runtime_id: ?[]const u8) bool {
+    const runtime = snapshot.runtime orelse return false;
+    if (!snapshot.execution_ready or !snapshot.verified_runtime_matches_pin or
+        !snapshot.repository_manifest_capable or !snapshot.repository_chat_route_capable)
+    {
+        return false;
+    }
+    if (pinned_runtime_id) |pinned| {
+        return std.mem.eql(u8, pinned, runtime.runtime_id);
+    }
+    return true;
+}
+
+fn runtimeServiceFromState(self: anytype) ?*RuntimeService {
+    if (comptime !@hasField(std.meta.Child(@TypeOf(self)), "runtime_service")) return null;
+    return self.runtime_service;
+}
+
+/// Resolve a chat send without ever turning an unknown/remote selection into
+/// local execution. Repository routes deliberately carry only stable IDs;
+/// absolute paths remain exclusive to the legacy Local route.
+fn resolveChatExecutionRoute(
+    self: anytype,
+    project_index: usize,
+    thread: *const ChatThread,
+    image_count: usize,
+) ?ChatExecutionRoute {
+    if (project_index >= self.project_controller.projects.items.len) return null;
+    const project = &self.project_controller.projects.items[project_index];
+    if (project.herdr_link != null) {
+        self.setSidebarNotice("Local Herdr GUI sends use the Herdr terminal/TUI pane for now.");
+        return null;
+    }
+
+    const selected = thread.selectedRuntimeRoute();
+    const local = std.mem.eql(u8, selected.profile_id, chat_types.LOCAL_RUNTIME_PROFILE_ID);
+    const primary = std.mem.eql(u8, selected.repository_id, chat_types.PRIMARY_REPOSITORY_ID);
+    if (local and primary and selected.relative_cwd == null and mayUseLegacyLocalExecution(thread)) {
+        return .legacy_local;
+    }
+    if (image_count != 0) {
+        self.setSidebarNotice(if (local)
+            "Repository-routed chat does not support attachments yet. Remove them and try again."
+        else
+            "Remote runtime chat does not support attachments yet. Remove them and try again.");
+        return null;
+    }
+    if (local) return .{ .repository_local = .{
+        .profile_id = selected.profile_id,
+        .repository_id = selected.repository_id,
+        .relative_cwd = selected.relative_cwd,
+        .runtime_id = null,
+    } };
+
+    const service = runtimeServiceFromState(self) orelse {
+        self.setSidebarNotice("The selected remote runtime is unavailable.");
+        return null;
+    };
+    const snapshot = service.snapshot(selected.profile_id) orelse {
+        self.setSidebarNotice("The selected remote runtime is not configured.");
+        return null;
+    };
+    const pinned_runtime_id = if (thread.pinnedRuntimeRoute()) |pinned| pinned.runtime_id else null;
+    if (!remoteSnapshotCanRoute(snapshot, pinned_runtime_id)) {
+        self.setSidebarNotice("Connect and verify the selected runtime with repository chat support before sending.");
+        return null;
+    }
+    return .{ .remote = .{
+        .profile_id = selected.profile_id,
+        .repository_id = selected.repository_id,
+        .relative_cwd = selected.relative_cwd,
+        .runtime_id = snapshot.runtime.?.runtime_id,
+    } };
+}
+
+test "remote repository route requires readiness pin match and both capabilities" {
+    const runtime: RuntimeService.RuntimeSnapshot = .{
+        .runtime_id = "0123456789abcdef0123456789abcdef",
+        .instance_id = "00112233445566778899aabbccddeeff",
+        .server_version = "test",
+        .protocol_major = 1,
+        .protocol_minor = 0,
+        .negotiated_headless_protocol_version = 1,
+    };
+    var snapshot: RuntimeService.Snapshot = .{
+        .profile_id = "remote",
+        .label = "Remote",
+        .transport = .ssh_tunnel,
+        .phase = .ready,
+        .failure = null,
+        .retry_at_ms = null,
+        .local_port = 1234,
+        .tunnel_lifecycle = .running,
+        .tunnel_pid = 1,
+        .runtime = runtime,
+        .identity_pin_required = false,
+        .rpc_in_flight = false,
+        .last_heartbeat_ms = 1,
+        .verified_runtime_matches_pin = true,
+        .repository_manifest_capable = true,
+        .repository_chat_route_capable = true,
+        .execution_ready = true,
+    };
+    try std.testing.expect(remoteSnapshotCanRoute(snapshot, runtime.runtime_id));
+    try std.testing.expect(!remoteSnapshotCanRoute(snapshot, "fedcba9876543210fedcba9876543210"));
+    snapshot.repository_chat_route_capable = false;
+    try std.testing.expect(!remoteSnapshotCanRoute(snapshot, runtime.runtime_id));
+    snapshot.repository_chat_route_capable = true;
+    snapshot.repository_manifest_capable = false;
+    try std.testing.expect(!remoteSnapshotCanRoute(snapshot, runtime.runtime_id));
+    snapshot.repository_manifest_capable = true;
+    snapshot.execution_ready = false;
+    try std.testing.expect(!remoteSnapshotCanRoute(snapshot, runtime.runtime_id));
+}
+
 pub fn providerExecutionTargetForProjectThread(
     self: anytype,
     project_index: usize,
@@ -1471,30 +1774,49 @@ pub fn providerExecutionTargetForProjectThread(
 ) ?ProviderExecutionTarget {
     if (project_index >= self.project_controller.projects.items.len) return null;
     const project = &self.project_controller.projects.items[project_index];
-    const link = project.herdr_link orelse return .{ .local = effectiveThreadCwd(project.path, thread) };
-
-    if (link.remote_alias.len == 0) {
+    _ = image_count;
+    if (project.herdr_link != null) {
         self.setSidebarNotice("Local Herdr GUI sends use the Herdr terminal/TUI pane for now.");
         return null;
     }
-    if (thread.provider != .codex) {
-        var buffer: [160]u8 = undefined;
-        self.setSidebarNotice(std.fmt.bufPrint(
-            &buffer,
-            "Remote Herdr GUI sends support Codex only for now. Use the Herdr TUI pane for {s}.",
-            .{utils.providerLabel(thread.provider)},
-        ) catch "Remote Herdr GUI sends support Codex only for now.");
+    if (!mayUseLegacyLocalExecution(thread)) {
+        self.setSidebarNotice("Connect the thread's selected runtime before sending.");
         return null;
     }
-    if (image_count > 0) {
-        self.setSidebarNotice("Remote Herdr Codex GUI sends do not support local image attachments yet.");
-        return null;
-    }
-    const remote_cwd = link.remote_cwd orelse {
-        self.setSidebarNotice("Remote Herdr workspace is missing a remote cwd.");
-        return null;
-    };
-    return .{ .remote_ssh = .{ .host = link.remote_alias, .cwd = remote_cwd } };
+    return .{ .local = effectiveThreadCwd(project.path, thread) };
+}
+
+test "explicit or unknown runtime routes never fall through to local execution" {
+    const allocator = std.testing.allocator;
+    var thread = try ChatThread.init(allocator, "Route guard");
+    defer thread.deinit(allocator);
+    try std.testing.expect(mayUseLegacyLocalExecution(&thread));
+
+    try std.testing.expectEqual(.updated, try thread.selectRuntimeRoute(allocator, .{
+        .profile_id = "remote-box",
+        .repository_id = "primary",
+    }));
+    try std.testing.expect(!mayUseLegacyLocalExecution(&thread));
+
+    try std.testing.expectEqual(.updated, try thread.selectRuntimeRoute(allocator, .{
+        .profile_id = chat_types.LOCAL_RUNTIME_PROFILE_ID,
+        .repository_id = "secondary-repository",
+    }));
+    try std.testing.expect(!mayUseLegacyLocalExecution(&thread));
+
+    try std.testing.expectEqual(.updated, try thread.selectRuntimeRoute(allocator, .{
+        .profile_id = chat_types.LOCAL_RUNTIME_PROFILE_ID,
+        .repository_id = chat_types.PRIMARY_REPOSITORY_ID,
+        .relative_cwd = "services/api",
+    }));
+    try std.testing.expect(!mayUseLegacyLocalExecution(&thread));
+
+    try std.testing.expectEqual(.updated, try thread.selectRuntimeRoute(allocator, .{
+        .profile_id = chat_types.LOCAL_RUNTIME_PROFILE_ID,
+        .repository_id = chat_types.PRIMARY_REPOSITORY_ID,
+    }));
+    try thread.pinRuntimeRoute(allocator, "0123456789abcdef0123456789abcdef");
+    try std.testing.expect(!mayUseLegacyLocalExecution(&thread));
 }
 
 pub fn handleBangCommandSubmission(self: anytype) bool {
@@ -1525,6 +1847,11 @@ pub fn beginBangCommand(self: anytype, command: []const u8) !void {
         self.setSidebarNotice("This chat already has a running command or provider request.");
         return;
     }
+    const execution_target = self.providerExecutionTargetForProjectThread(
+        self.project_controller.selected_index,
+        thread,
+        0,
+    ) orelse return;
 
     if (!thread.committed) try thread.commitFromPrompt(self.allocator, command);
     const submitted = try std.fmt.allocPrint(self.allocator, "!{s}", .{command});
@@ -1544,7 +1871,7 @@ pub fn beginBangCommand(self: anytype, command: []const u8) !void {
     state.provider = null;
     state.local_command = true;
     state.local_command_text = try page_alloc.dupe(u8, command);
-    const command_cwd = effectiveThreadCwd(self.currentProject().path, self.currentThread());
+    const command_cwd = execution_target.cwd();
     state.local_command_cwd = try page_alloc.dupe(u8, command_cwd);
     state.local_command_shell = try page_alloc.dupe(u8, bang_commands.shellName());
     state.partial_text.clearRetainingCapacity();
@@ -1595,6 +1922,7 @@ pub fn beginBangCommand(self: anytype, command: []const u8) !void {
     };
     state.worker_done.store(false, .release);
     state.worker = try std.Thread.spawn(.{}, bangCommandWorker, .{request});
+    thread.lockRuntimeRoute();
     self.chat_controller.beginSend();
     self.clearDraft();
     self.resetComposerInputWidget();
@@ -1626,9 +1954,18 @@ pub fn preflightThreadPrompt(
         self.setSidebarNotice("This chat already has a provider request running.");
         return false;
     }
-    if (self.providerExecutionTargetForProjectThread(project_index, thread, images.len) == null) return false;
-    try self.ensureSessionDaemon();
-    return true;
+    if (comptime @hasField(std.meta.Child(@TypeOf(self)), "project_controller")) {
+        const execution_route = resolveChatExecutionRoute(self, project_index, thread, images.len) orelse return false;
+        switch (execution_route) {
+            .legacy_local, .repository_local => try self.ensureSessionDaemon(),
+            .remote => {},
+        }
+        return true;
+    } else {
+        if (self.providerExecutionTargetForProjectThread(project_index, thread, images.len) == null) return false;
+        try self.ensureSessionDaemon();
+        return true;
+    }
 }
 
 pub fn sendThreadPrompt(
@@ -1722,22 +2059,28 @@ pub fn sendThreadDraftWithUiPolicy(self: anytype, project_index: usize, thread_i
         self.setSidebarNotice("This chat already has a provider request running.");
         return false;
     }
-    const execution_target = self.providerExecutionTargetForProjectThread(
+    const execution_route = resolveChatExecutionRoute(
+        self,
         project_index,
         thread,
         draft_image_count,
     ) orelse return false;
 
-    // Prove the daemon is reachable before staging a persisted user turn.
-    // A failure here cannot be an ambiguously accepted send, so the draft,
-    // attachments, title, and existing transcript all remain retryable.
-    self.ensureSessionDaemon() catch |err| {
-        self.appendInitialSendFailure(thread, initialSendStartFailureMessage(err));
-        project.invalidateSidebarThreadCache();
-        if (selected_target) self.requestTranscriptScrollToBottom();
-        self.flushDirtyBlocking();
-        return err;
-    };
+    switch (execution_route) {
+        .legacy_local, .repository_local => {
+            // Prove the local daemon is reachable before staging a persisted
+            // user turn. Remote readiness was established by the manager and
+            // its targeted RPC starts later on this same owner thread.
+            self.ensureSessionDaemon() catch |err| {
+                self.appendInitialSendFailure(thread, initialSendStartFailureMessage(err));
+                project.invalidateSidebarThreadCache();
+                if (selected_target) self.requestTranscriptScrollToBottom();
+                self.flushDirtyBlocking();
+                return err;
+            };
+        },
+        .remote => {},
+    }
 
     const trimmed_title = std.mem.trim(u8, draft, &std.ascii.whitespace);
     var snapshot = try InitialSendSnapshot.init(self.allocator, thread);
@@ -1769,7 +2112,7 @@ pub fn sendThreadDraftWithUiPolicy(self: anytype, project_index: usize, thread_i
     // event thread; the receipt commits in pollSend with the same
     // rejected/ambiguous classification. Once the worker exists it clears the
     // composer immediately and owns the submitted attachments for rollback.
-    self.dispatchDaemonAcceptance(project_index, thread, draft, execution_target, &snapshot, selected_target) catch |err| {
+    self.dispatchDaemonAcceptance(project_index, thread, draft, execution_route, &snapshot, selected_target) catch |err| {
         // Dispatch failures happen before anything reaches the daemon, so
         // restoring the staged user row is safe and the draft stays intact.
         snapshot.restore(self, thread);
@@ -2087,7 +2430,6 @@ pub fn interruptThreadViaHarness(
     thread_id: []const u8,
     turn_id: ?[]const u8,
 ) !void {
-    if (execution_target.remoteHost() != null and provider != .codex) return error.UnsupportedRemoteProvider;
     const provider_cwd = execution_target.cwd();
     const provider_config = switch (provider) {
         .opencode => ai_harness.ProviderConfig{
@@ -2101,10 +2443,6 @@ pub fn interruptThreadViaHarness(
             .codex = .{
                 .cwd = provider_cwd,
                 .launch_on_connect = false,
-                .remote_ssh = if (execution_target.remoteHost()) |host| .{
-                    .host = host,
-                    .cwd = provider_cwd,
-                } else null,
             },
         },
         .claude => ai_harness.ProviderConfig{
@@ -2152,16 +2490,11 @@ pub fn steerThreadViaHarness(
     prompt: []const u8,
     images: []const ChatImageAttachment,
 ) !void {
-    if (execution_target.remoteHost() != null and provider != .codex) return error.UnsupportedRemoteProvider;
     const provider_cwd = execution_target.cwd();
     const provider_config = switch (provider) {
         .codex => ai_harness.ProviderConfig{ .codex = .{
             .cwd = provider_cwd,
             .launch_on_connect = false,
-            .remote_ssh = if (execution_target.remoteHost()) |host| .{
-                .host = host,
-                .cwd = provider_cwd,
-            } else null,
         } },
         .claude => ai_harness.ProviderConfig{ .claude = .{ .cwd = provider_cwd } },
         .opencode, .cursor, .pi, .fx, .grok => return error.UnsupportedOperation,
@@ -2204,10 +2537,10 @@ pub const AcceptanceOutcome = enum { accepted, rejected, ambiguous };
 
 const AcceptanceWireAttachment = struct { path: []const u8, mime: []const u8, byte_size: u64 };
 
-/// Wire params for chat.turn.start, arena-owned so the acceptance worker can
-/// serialize them after the submitting call has returned. Field names and
-/// order mirror startDaemonChatTurn's anonymous literal (same JSON shape).
-const AcceptanceTurnStartParams = struct {
+/// Legacy Local retains its existing absolute-path chat.turn.start contract.
+/// Repository routes use the separate stable-ID shape below, making it
+/// impossible for a remote request to accidentally serialize a desktop path.
+const AcceptanceLegacyTurnStartParams = struct {
     turn_id: []const u8,
     workspace_id: []const u8,
     local_thread_id: []const u8,
@@ -2225,12 +2558,52 @@ const AcceptanceTurnStartParams = struct {
     cursor_model_params_json: ?[]const u8,
     fast_mode: bool,
     access_mode: []const u8,
-    remote_ssh_host: ?[]const u8,
-    remote_cwd: ?[]const u8,
     /// Thread working-directory override; the daemon falls back to
     /// `project_path` when null.
     cwd: ?[]const u8 = null,
     message_id: []const u8,
+};
+
+const AcceptanceRepositoryTurnStartParams = struct {
+    turn_id: []const u8,
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
+    repository_id: []const u8,
+    relative_cwd: ?[]const u8 = null,
+    provider: []const u8,
+    harness: []const u8,
+    prompt: []const u8,
+    provider_thread_id: ?[]const u8,
+    thread_title: []const u8,
+    model_ref: ?[]const u8,
+    reasoning_effort: ?[]const u8,
+    opencode_reasoning_variant: ?[]const u8,
+    cursor_model_params_json: ?[]const u8,
+    fast_mode: bool,
+    access_mode: []const u8,
+    message_id: []const u8,
+};
+
+const AcceptanceTurnStartParams = union(enum) {
+    legacy_local: AcceptanceLegacyTurnStartParams,
+    repository: AcceptanceRepositoryTurnStartParams,
+};
+
+test "repository chat start params cannot carry an absolute desktop path" {
+    try std.testing.expect(@hasField(AcceptanceRepositoryTurnStartParams, "workspace_id"));
+    try std.testing.expect(@hasField(AcceptanceRepositoryTurnStartParams, "repository_id"));
+    try std.testing.expect(@hasField(AcceptanceRepositoryTurnStartParams, "relative_cwd"));
+    try std.testing.expect(!@hasField(AcceptanceRepositoryTurnStartParams, "project_path"));
+    try std.testing.expect(!@hasField(AcceptanceRepositoryTurnStartParams, "cwd"));
+    try std.testing.expect(!@hasField(AcceptanceRepositoryTurnStartParams, "image_paths"));
+    try std.testing.expect(!@hasField(AcceptanceRepositoryTurnStartParams, "images"));
+}
+
+const AcceptanceTransport = union(enum) {
+    local_worker,
+    remote_rpc: struct {
+        ticket: RuntimeService.RpcTicket,
+    },
 };
 
 /// One in-flight async chat.turn.start acceptance (7.5). The event thread
@@ -2243,7 +2616,15 @@ pub const AcceptanceDispatch = struct {
     project_id: []const u8,
     local_thread_id: []const u8,
     pref_path: []const u8,
+    profile_id: []const u8,
+    repository_id: []const u8,
+    relative_cwd: ?[]const u8,
+    runtime_id: ?[]const u8,
+    turn_id: []const u8,
+    prompt: []const u8,
+    message_id: []const u8,
     params: AcceptanceTurnStartParams,
+    transport: AcceptanceTransport = .local_worker,
     /// Owned pre-submit rollback state; allocated with the state allocator.
     snapshot: InitialSendSnapshot,
     /// Submitted attachments move here when the visible composer clears.
@@ -2251,6 +2632,7 @@ pub const AcceptanceDispatch = struct {
     /// without adding allocations or file I/O to the submit path.
     submitted_image: ?ChatImageAttachment = null,
     submitted_extra_images: std.ArrayList(ChatImageAttachment) = .empty,
+    rpc_started_at_ms: i64 = 0,
     rpc_elapsed_ms: i64 = 0,
     outcome: AcceptanceOutcome = .ambiguous,
     err: ?anyerror = null,
@@ -2268,7 +2650,7 @@ pub const AcceptanceDispatch = struct {
         // A background/MCP caller may have staged another draft while the
         // receipt was in flight. Never replace independently authored input.
         if (thread.currentDraft().len != 0 or thread.draftImageCount() != 0) return false;
-        thread.setDraft(self.params.prompt);
+        thread.setDraft(self.prompt);
         thread.draft_image = self.submitted_image;
         self.submitted_image = null;
         std.mem.swap(std.ArrayList(ChatImageAttachment), &thread.draft_extra_images, &self.submitted_extra_images);
@@ -2309,12 +2691,15 @@ fn acceptanceWorkerMain(dispatch: *AcceptanceDispatch) void {
     const alloc = std.heap.page_allocator;
     const started_ms = monotonicMs();
     const outcome: AcceptanceOutcome = blk: {
-        const response = sessionizer.requestAlloc(alloc, dispatch.pref_path, "chat.turn.start", dispatch.params, 1) catch |err| {
-            break :blk classifyAcceptanceFailure(alloc, dispatch, err);
+        const response = switch (dispatch.params) {
+            .legacy_local => |params| sessionizer.requestAlloc(alloc, dispatch.pref_path, "chat.turn.start", params, 1),
+            .repository => |params| sessionizer.requestAlloc(alloc, dispatch.pref_path, "chat.turn.start", params, 1),
+        } catch |err| {
+            break :blk classifyLocalAcceptanceFailure(alloc, dispatch, err);
         };
         defer alloc.free(response);
         ensureJsonRpcOk(alloc, response) catch |err| {
-            break :blk classifyAcceptanceFailure(alloc, dispatch, err);
+            break :blk classifyLocalAcceptanceFailure(alloc, dispatch, err);
         };
         break :blk .accepted;
     };
@@ -2327,10 +2712,53 @@ fn acceptanceWorkerMain(dispatch: *AcceptanceDispatch) void {
 /// can follow successful acceptance, so probe the exact idempotency key
 /// before exposing a retry that could run twice. A daemon JSON-RPC error is
 /// a confirmed rejection; anything else stays ambiguous.
-fn classifyAcceptanceFailure(alloc: std.mem.Allocator, dispatch: *AcceptanceDispatch, err: anyerror) AcceptanceOutcome {
-    if (daemonChatTurnExistsRaw(alloc, dispatch.pref_path, dispatch.params.turn_id)) return .accepted;
+fn classifyLocalAcceptanceFailure(alloc: std.mem.Allocator, dispatch: *AcceptanceDispatch, err: anyerror) AcceptanceOutcome {
+    if (daemonChatTurnExistsRaw(alloc, dispatch.pref_path, dispatch.turn_id)) return .accepted;
     dispatch.err = err;
     return if (err == error.DaemonRequestFailed) .rejected else .ambiguous;
+}
+
+fn classifyRemoteAcceptanceResult(dispatch: *AcceptanceDispatch, result: *RuntimeService.RpcCallResult) AcceptanceOutcome {
+    return switch (result.*) {
+        .response => |response| blk: {
+            ensureJsonRpcOk(std.heap.page_allocator, response.json) catch |err| {
+                dispatch.err = err;
+                break :blk if (err == error.DaemonRequestFailed) .rejected else .ambiguous;
+            };
+            break :blk .accepted;
+        },
+        .failed => {
+            dispatch.err = error.RemoteRuntimeUnavailable;
+            return .ambiguous;
+        },
+        .canceled => {
+            dispatch.err = error.RemoteRuntimeRpcCanceled;
+            return .ambiguous;
+        },
+    };
+}
+
+test "remote acceptance distinguishes accepted rejected and transport ambiguity" {
+    const allocator = std.testing.allocator;
+    var dispatch: AcceptanceDispatch = undefined;
+    dispatch.err = null;
+
+    var accepted: RuntimeService.RpcCallResult = .{ .response = .{
+        .allocator = allocator,
+        .json = try allocator.dupe(u8, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"accepted\":true}}"),
+    } };
+    defer accepted.deinit();
+    try std.testing.expectEqual(AcceptanceOutcome.accepted, classifyRemoteAcceptanceResult(&dispatch, &accepted));
+
+    var rejected: RuntimeService.RpcCallResult = .{ .response = .{
+        .allocator = allocator,
+        .json = try allocator.dupe(u8, "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":\"invalid_params\",\"message\":\"rejected\"}}"),
+    } };
+    defer rejected.deinit();
+    try std.testing.expectEqual(AcceptanceOutcome.rejected, classifyRemoteAcceptanceResult(&dispatch, &rejected));
+
+    var ambiguous: RuntimeService.RpcCallResult = .{ .failed = .network };
+    try std.testing.expectEqual(AcceptanceOutcome.ambiguous, classifyRemoteAcceptanceResult(&dispatch, &ambiguous));
 }
 
 /// Stages daemon acceptance for a just-appended user row without blocking the
@@ -2343,7 +2771,7 @@ pub fn dispatchDaemonAcceptance(
     project_index: usize,
     thread: *ChatThread,
     prompt: []const u8,
-    execution_target: ProviderExecutionTarget,
+    execution_route: ChatExecutionRoute,
     snapshot: *InitialSendSnapshot,
     selected_target: bool,
 ) !void {
@@ -2359,6 +2787,12 @@ pub fn dispatchDaemonAcceptance(
         self.finishProviderReadinessThread();
         ai_harness.releaseOwnedCodexServer();
     }
+    switch (execution_route) {
+        .legacy_local => {},
+        .repository_local, .remote => if (thread.draftImageCount() != 0) {
+            return error.RepositoryRouteAttachmentsUnsupported;
+        },
+    }
 
     const dispatch = try page_alloc.create(AcceptanceDispatch);
     errdefer page_alloc.destroy(dispatch);
@@ -2367,6 +2801,13 @@ pub fn dispatchDaemonAcceptance(
         .project_id = "",
         .local_thread_id = "",
         .pref_path = "",
+        .profile_id = "",
+        .repository_id = "",
+        .relative_cwd = null,
+        .runtime_id = null,
+        .turn_id = "",
+        .prompt = "",
+        .message_id = "",
         .params = undefined,
         .snapshot = .{ .message_count = 0, .committed = true, .last_activity_at = 0, .title = null },
     };
@@ -2379,48 +2820,93 @@ pub fn dispatchDaemonAcceptance(
     const message_id = try std.fmt.allocPrint(arena, "gui-msg:{s}:{s}:{d}", .{ project.id, thread.local_thread_id, now_ms });
     const cursor_model_params_json: ?[]const u8 = if (thread.provider == .cursor) try self.cursorModelParamsJsonAlloc(arena, thread) else null;
 
-    var image_paths: std.ArrayListUnmanaged([]const u8) = .empty;
-    var wire_images: std.ArrayListUnmanaged(AcceptanceWireAttachment) = .empty;
-    const draft_image_count = thread.draftImageCount();
-    try image_paths.ensureTotalCapacity(arena, draft_image_count);
-    try wire_images.ensureTotalCapacity(arena, draft_image_count);
-    if (thread.draft_image) |image| {
-        const path = try arena.dupe(u8, image.path);
-        image_paths.appendAssumeCapacity(path);
-        wire_images.appendAssumeCapacity(.{ .path = path, .mime = try arena.dupe(u8, image.mime), .byte_size = image.byte_size });
-    }
-    for (thread.draft_extra_images.items) |image| {
-        const path = try arena.dupe(u8, image.path);
-        image_paths.appendAssumeCapacity(path);
-        wire_images.appendAssumeCapacity(.{ .path = path, .mime = try arena.dupe(u8, image.mime), .byte_size = image.byte_size });
-    }
-
     dispatch.project_id = try arena.dupe(u8, project.id);
     dispatch.local_thread_id = try arena.dupe(u8, thread.local_thread_id);
-    dispatch.pref_path = try arena.dupe(u8, self.storage.pref_path);
-    dispatch.params = .{
-        .turn_id = turn_id,
-        .workspace_id = dispatch.project_id,
-        .local_thread_id = dispatch.local_thread_id,
-        .provider = @tagName(harnessProviderForDbProvider(thread.provider)),
-        .harness = @tagName(thread.harness),
-        .project_path = try arena.dupe(u8, project.path),
-        .prompt = try arena.dupe(u8, prompt),
-        .image_paths = image_paths.items,
-        .images = wire_images.items,
-        .provider_thread_id = if (thread.provider_thread_id) |thread_id| try arena.dupe(u8, thread_id) else null,
-        .thread_title = try arena.dupe(u8, thread.title),
-        .model_ref = if (thread.model_ref) |model_ref| try arena.dupe(u8, model_ref) else null,
-        .reasoning_effort = if (thread.reasoning_effort) |effort| @tagName(effort) else null,
-        .opencode_reasoning_variant = if (daemonReasoningVariant(thread.provider, thread.opencode_reasoning_variant)) |variant| try arena.dupe(u8, variant) else null,
-        .cursor_model_params_json = cursor_model_params_json,
-        .fast_mode = thread.fast_mode == .on,
-        .access_mode = @tagName(thread.access_mode),
-        .remote_ssh_host = if (execution_target.remoteHost()) |host| try arena.dupe(u8, host) else null,
-        .remote_cwd = if (execution_target.remoteHost() != null) try arena.dupe(u8, execution_target.cwd()) else null,
-        .cwd = if (thread.cwd) |cwd| try arena.dupe(u8, cwd) else null,
-        .message_id = message_id,
+    dispatch.turn_id = turn_id;
+    dispatch.prompt = try arena.dupe(u8, prompt);
+    dispatch.message_id = message_id;
+    const selected = thread.selectedRuntimeRoute();
+    dispatch.profile_id = try arena.dupe(u8, selected.profile_id);
+    dispatch.repository_id = try arena.dupe(u8, selected.repository_id);
+    dispatch.relative_cwd = if (selected.relative_cwd) |cwd| try arena.dupe(u8, cwd) else null;
+    dispatch.runtime_id = switch (execution_route) {
+        .remote => |route| try arena.dupe(u8, route.runtime_id.?),
+        .legacy_local, .repository_local => null,
     };
+
+    const provider_thread_id = if (thread.provider_thread_id) |thread_id| try arena.dupe(u8, thread_id) else null;
+    const thread_title = try arena.dupe(u8, thread.title);
+    const model_ref = if (thread.model_ref) |model_ref_value| try arena.dupe(u8, model_ref_value) else null;
+    const reasoning_effort: ?[]const u8 = if (thread.reasoning_effort) |effort| @tagName(effort) else null;
+    const reasoning_variant = if (daemonReasoningVariant(thread.provider, thread.opencode_reasoning_variant)) |variant| try arena.dupe(u8, variant) else null;
+
+    switch (execution_route) {
+        .legacy_local => {
+            dispatch.pref_path = try arena.dupe(u8, self.storage.pref_path);
+            var image_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+            var wire_images: std.ArrayListUnmanaged(AcceptanceWireAttachment) = .empty;
+            const draft_image_count = thread.draftImageCount();
+            try image_paths.ensureTotalCapacity(arena, draft_image_count);
+            try wire_images.ensureTotalCapacity(arena, draft_image_count);
+            if (thread.draft_image) |image| {
+                const path = try arena.dupe(u8, image.path);
+                image_paths.appendAssumeCapacity(path);
+                wire_images.appendAssumeCapacity(.{ .path = path, .mime = try arena.dupe(u8, image.mime), .byte_size = image.byte_size });
+            }
+            for (thread.draft_extra_images.items) |image| {
+                const path = try arena.dupe(u8, image.path);
+                image_paths.appendAssumeCapacity(path);
+                wire_images.appendAssumeCapacity(.{ .path = path, .mime = try arena.dupe(u8, image.mime), .byte_size = image.byte_size });
+            }
+            dispatch.params = .{ .legacy_local = .{
+                .turn_id = turn_id,
+                .workspace_id = dispatch.project_id,
+                .local_thread_id = dispatch.local_thread_id,
+                .provider = @tagName(harnessProviderForDbProvider(thread.provider)),
+                .harness = @tagName(thread.harness),
+                .project_path = try arena.dupe(u8, project.path),
+                .prompt = dispatch.prompt,
+                .image_paths = image_paths.items,
+                .images = wire_images.items,
+                .provider_thread_id = provider_thread_id,
+                .thread_title = thread_title,
+                .model_ref = model_ref,
+                .reasoning_effort = reasoning_effort,
+                .opencode_reasoning_variant = reasoning_variant,
+                .cursor_model_params_json = cursor_model_params_json,
+                .fast_mode = thread.fast_mode == .on,
+                .access_mode = @tagName(thread.access_mode),
+                .cwd = if (thread.cwd) |cwd| try arena.dupe(u8, cwd) else null,
+                .message_id = message_id,
+            } };
+        },
+        .repository_local, .remote => {
+            dispatch.params = .{ .repository = .{
+                .turn_id = turn_id,
+                .workspace_id = dispatch.project_id,
+                .local_thread_id = dispatch.local_thread_id,
+                .repository_id = dispatch.repository_id,
+                .relative_cwd = dispatch.relative_cwd,
+                .provider = @tagName(harnessProviderForDbProvider(thread.provider)),
+                .harness = @tagName(thread.harness),
+                .prompt = dispatch.prompt,
+                .provider_thread_id = provider_thread_id,
+                .thread_title = thread_title,
+                .model_ref = model_ref,
+                .reasoning_effort = reasoning_effort,
+                .opencode_reasoning_variant = reasoning_variant,
+                .cursor_model_params_json = cursor_model_params_json,
+                .fast_mode = thread.fast_mode == .on,
+                .access_mode = @tagName(thread.access_mode),
+                .message_id = message_id,
+            } };
+            switch (execution_route) {
+                .repository_local => dispatch.pref_path = try arena.dupe(u8, self.storage.pref_path),
+                .remote => {},
+                .legacy_local => unreachable,
+            }
+        },
+    }
 
     try self.chat_controller.acceptance_dispatches.ensureUnusedCapacity(page_alloc, 1);
     const send_state_turn_id = try page_alloc.dupe(u8, turn_id);
@@ -2433,7 +2919,24 @@ pub fn dispatchDaemonAcceptance(
     snapshot.title = null;
     self.chat_controller.acceptance_dispatches.appendAssumeCapacity(dispatch);
 
-    dispatch.worker = std.Thread.spawn(.{}, acceptanceWorkerMain, .{dispatch}) catch |err| {
+    const launch_error: ?anyerror = switch (execution_route) {
+        .legacy_local, .repository_local => blk: {
+            dispatch.worker = std.Thread.spawn(.{}, acceptanceWorkerMain, .{dispatch}) catch |err| break :blk err;
+            break :blk null;
+        },
+        .remote => |route| blk: {
+            const service = runtimeServiceFromState(self) orelse break :blk error.RuntimeServiceUnavailable;
+            const params = switch (dispatch.params) {
+                .repository => |value| value,
+                .legacy_local => unreachable,
+            };
+            dispatch.rpc_started_at_ms = monotonicMs();
+            const ticket = service.beginRpc(route.profile_id, "chat.turn.start", params) catch |err| break :blk err;
+            dispatch.transport = .{ .remote_rpc = .{ .ticket = ticket } };
+            break :blk null;
+        },
+    };
+    if (launch_error) |err| {
         // Nothing was sent: un-arm and hand rollback state back to the caller.
         _ = self.chat_controller.acceptance_dispatches.pop();
         disarmSendStateAfterFailedDispatch(self, thread);
@@ -2441,7 +2944,7 @@ pub fn dispatchDaemonAcceptance(
         dispatch.snapshot = .{ .message_count = 0, .committed = true, .last_activity_at = 0, .title = null };
         dispatch.destroy(self.allocator);
         return err;
-    };
+    }
     // Once the worker exists, submission is visibly complete. Clear the
     // composer immediately instead of holding its text/images hostage to a
     // potentially slow daemon receipt. The dispatch owns the attachments for
@@ -2471,13 +2974,38 @@ pub fn pollAcceptanceDispatches(self: anytype) bool {
     var index: usize = 0;
     while (index < self.chat_controller.acceptance_dispatches.items.len) {
         const dispatch = self.chat_controller.acceptance_dispatches.items[index];
-        if (!dispatch.done.load(.acquire)) {
-            index += 1;
-            continue;
-        }
-        if (dispatch.worker) |worker| {
-            worker.join();
-            dispatch.worker = null;
+        switch (dispatch.transport) {
+            .local_worker => {
+                if (!dispatch.done.load(.acquire)) {
+                    index += 1;
+                    continue;
+                }
+                if (dispatch.worker) |worker| {
+                    worker.join();
+                    dispatch.worker = null;
+                }
+            },
+            .remote_rpc => |remote| {
+                const service = runtimeServiceFromState(self) orelse {
+                    index += 1;
+                    continue;
+                };
+                var result = service.takeRpcResult(remote.ticket) catch |err| {
+                    dispatch.err = err;
+                    dispatch.outcome = .ambiguous;
+                    dispatch.rpc_elapsed_ms = monotonicMs() - dispatch.rpc_started_at_ms;
+                    _ = self.chat_controller.acceptance_dispatches.swapRemove(index);
+                    changed = commitAcceptanceDispatch(self, dispatch) or changed;
+                    dispatch.destroy(self.allocator);
+                    continue;
+                } orelse {
+                    index += 1;
+                    continue;
+                };
+                defer result.deinit();
+                dispatch.rpc_elapsed_ms = monotonicMs() - dispatch.rpc_started_at_ms;
+                dispatch.outcome = classifyRemoteAcceptanceResult(dispatch, &result);
+            },
         }
         _ = self.chat_controller.acceptance_dispatches.swapRemove(index);
         changed = commitAcceptanceDispatch(self, dispatch) or changed;
@@ -2498,13 +3026,46 @@ pub fn commitAcceptanceDispatch(self: anytype, dispatch: *AcceptanceDispatch) bo
     const send_state = thread.send_state;
 
     send_state.mutex.lock();
-    const turn_matches = if (send_state.daemon_turn_id) |turn_id| std.mem.eql(u8, turn_id, dispatch.params.turn_id) else false;
+    const turn_matches = if (send_state.daemon_turn_id) |turn_id| std.mem.eql(u8, turn_id, dispatch.turn_id) else false;
     const armed = send_state.acceptance_pending and send_state.status == .pending and send_state.daemon_owned and turn_matches;
     if (!armed) {
         // The send was reset/aborted during the window. Drop the outcome; an
         // accepted daemon turn stays discoverable through reattach flows.
         send_state.mutex.unlock();
         return false;
+    }
+    const selected_route = thread.selectedRuntimeRoute();
+    const route_matches = std.mem.eql(u8, selected_route.profile_id, dispatch.profile_id) and
+        std.mem.eql(u8, selected_route.repository_id, dispatch.repository_id) and
+        optionalRouteTextEql(selected_route.relative_cwd, dispatch.relative_cwd) and
+        (if (dispatch.runtime_id) |expected_runtime_id|
+            if (thread.pinnedRuntimeRoute()) |pinned|
+                pinned.runtime_id == null or std.mem.eql(u8, pinned.runtime_id.?, expected_runtime_id)
+            else
+                true
+        else
+            true);
+    if (!route_matches) {
+        send_state.acceptance_pending = false;
+        send_state.status = .idle;
+        send_state.daemon_owned = false;
+        if (send_state.daemon_turn_id) |turn_id| {
+            std.heap.page_allocator.free(turn_id);
+            send_state.daemon_turn_id = null;
+        }
+        send_state.mutex.unlock();
+        self.chat_controller.finishSend();
+        self.appendInitialSendFailure(thread, ambiguousInitialSendFailureMessage());
+        return true;
+    }
+    if (dispatch.runtime_id) |runtime_id| {
+        if (dispatch.outcome == .accepted or dispatch.outcome == .ambiguous) {
+            thread.pinRuntimeRoute(self.allocator, runtime_id) catch |err| {
+                log.err("failed to pin accepted remote chat route: {s}", .{@errorName(err)});
+                dispatch.err = err;
+                dispatch.outcome = .ambiguous;
+            };
+        }
     }
     send_state.acceptance_pending = false;
     if (dispatch.outcome != .accepted) {
@@ -2521,13 +3082,14 @@ pub fn commitAcceptanceDispatch(self: anytype, dispatch: *AcceptanceDispatch) bo
         resolved.thread_index == project.currentThreadIndex();
     switch (dispatch.outcome) {
         .accepted => {
+            if (dispatch.runtime_id == null) thread.lockRuntimeRoute();
             // M4-P4: retain the acceptance-staged client id on the user row
             // so the persistence flush carries the identity instead of
             // re-minting a positional `snap-msg-{i}` for it.
             if (thread.messages.items.len > 0) {
                 const user_row = &thread.messages.items[thread.messages.items.len - 1];
-                if (user_row.role == .user and user_row.message_id == null and std.mem.eql(u8, user_row.body, dispatch.params.prompt)) {
-                    user_row.message_id = self.allocator.dupe(u8, dispatch.params.message_id) catch null;
+                if (user_row.role == .user and user_row.message_id == null and std.mem.eql(u8, user_row.body, dispatch.prompt)) {
+                    user_row.message_id = self.allocator.dupe(u8, dispatch.message_id) catch null;
                 }
             }
             runtime_log.diagnostic("chat submit accepted daemon_start_ms={d} thread_messages={d}", .{
@@ -2545,6 +3107,10 @@ pub fn commitAcceptanceDispatch(self: anytype, dispatch: *AcceptanceDispatch) bo
             self.flushDirtyBlocking();
         },
         .ambiguous => {
+            // The daemon may already have accepted durable work. Locking is
+            // the fail-closed side of that uncertainty; retry cannot reroute
+            // a possibly running turn onto another machine/repository.
+            if (dispatch.runtime_id == null) thread.lockRuntimeRoute();
             self.chat_controller.finishSend();
             // Keep the in-memory user row (the daemon may have staged it) and
             // leave the optimistically cleared composer empty so a blind retry
@@ -2563,10 +3129,9 @@ pub fn beginSendForThread(
     project_index: usize,
     thread: *ChatThread,
     prompt: []const u8,
-    execution_target: ProviderExecutionTarget,
 ) !void {
     try self.ensureSessionDaemon();
-    return self.beginSendForThreadWithReadyDaemon(project_index, thread, prompt, execution_target);
+    return self.beginSendForThreadWithReadyDaemon(project_index, thread, prompt);
 }
 
 fn beginSendForThreadWithImages(
@@ -2575,10 +3140,9 @@ fn beginSendForThreadWithImages(
     thread: *ChatThread,
     prompt: []const u8,
     images: []const ChatImageAttachment,
-    execution_target: ProviderExecutionTarget,
 ) !void {
     try self.ensureSessionDaemon();
-    return beginSendForThreadWithReadyDaemonImages(self, project_index, thread, prompt, execution_target, images);
+    return beginSendForThreadWithReadyDaemonImages(self, project_index, thread, prompt, images);
 }
 
 pub fn beginSendForThreadWithReadyDaemon(
@@ -2586,9 +3150,8 @@ pub fn beginSendForThreadWithReadyDaemon(
     project_index: usize,
     thread: *ChatThread,
     prompt: []const u8,
-    execution_target: ProviderExecutionTarget,
 ) !void {
-    return beginSendForThreadWithReadyDaemonImages(self, project_index, thread, prompt, execution_target, null);
+    return beginSendForThreadWithReadyDaemonImages(self, project_index, thread, prompt, null);
 }
 
 fn beginSendForThreadWithReadyDaemonImages(
@@ -2596,11 +3159,9 @@ fn beginSendForThreadWithReadyDaemonImages(
     project_index: usize,
     thread: *ChatThread,
     prompt: []const u8,
-    execution_target: ProviderExecutionTarget,
     images: ?[]const ChatImageAttachment,
 ) !void {
     const page_alloc = std.heap.page_allocator;
-    const execution_cwd = execution_target.cwd();
     const now_ms = unixTimestampMs();
     const project_id = self.project_controller.projects.items[project_index].id;
     const turn_id = try std.fmt.allocPrint(page_alloc, "gui:{s}:{s}:{d}", .{ project_id, thread.local_thread_id, now_ms });
@@ -2631,8 +3192,6 @@ fn beginSendForThreadWithReadyDaemonImages(
         project_index,
         thread,
         prompt,
-        execution_target,
-        execution_cwd,
         cursor_model_params_json,
         turn_id,
         message_id,
@@ -2716,12 +3275,12 @@ fn armSendStateForDaemonTurn(self: anytype, thread: *ChatThread, turn_id: []u8, 
 }
 
 pub fn beginSendDraft(self: anytype, prompt: []const u8) !void {
-    const execution_target = self.providerExecutionTargetForProjectThread(
+    _ = self.providerExecutionTargetForProjectThread(
         self.project_controller.selected_index,
         self.currentThread(),
         self.currentThread().draftImageCount(),
     ) orelse return;
-    return self.beginSendForThread(self.project_controller.selected_index, self.currentThreadMutable(), prompt, execution_target);
+    return self.beginSendForThread(self.project_controller.selected_index, self.currentThreadMutable(), prompt);
 }
 
 pub fn ensureSessionDaemon(self: anytype) !void {
@@ -2741,8 +3300,6 @@ pub fn startDaemonChatTurn(
     project_index: usize,
     thread: *const ChatThread,
     prompt: []const u8,
-    execution_target: ProviderExecutionTarget,
-    execution_cwd: []const u8,
     cursor_model_params_json: ?[]const u8,
     turn_id: []const u8,
     message_id: []const u8,
@@ -2790,8 +3347,6 @@ pub fn startDaemonChatTurn(
         .cursor_model_params_json = cursor_model_params_json,
         .fast_mode = thread.fast_mode == .on,
         .access_mode = @tagName(thread.access_mode),
-        .remote_ssh_host = if (execution_target.remoteHost()) |host| host else null,
-        .remote_cwd = if (execution_target.remoteHost() != null) execution_cwd else null,
         .cwd = if (thread.cwd) |cwd| @as(?[]const u8, cwd) else null,
         // Additive M4 param: stages this stable id at acceptance (daemon worker).
         .message_id = message_id,
@@ -2852,6 +3407,13 @@ pub fn consumeDaemonChatTurn(self: anytype, turn_id: ?[]u8) void {
         return;
     };
     defer self.allocator.free(response);
+}
+
+fn consumeDaemonChatTurnForThread(self: anytype, thread: *const ChatThread, turn_id: ?[]u8) void {
+    if (!threadUsesRemoteRuntime(thread)) return self.consumeDaemonChatTurn(turn_id);
+    // Remote consume is only a retention hint and is not part of the first
+    // routed-chat slice. Never send the remote turn id to the local socket.
+    if (turn_id) |owned_turn_id| std.heap.page_allocator.free(owned_turn_id);
 }
 
 /// Reattach still-live daemon turns during launch. Terminal reconciliation
@@ -3454,9 +4016,18 @@ pub fn pollSend(self: anytype) bool {
         // polling so a rejected acceptance tears the armed send down before
         // its thread is tail-polled.
         changed = pollAcceptanceDispatches(self) or changed;
+        // Controls drain before tails and queued controls start before any new
+        // tail ticket, so a busy profile cannot starve stop/approval behind a
+        // continuous stream of polling requests.
+        if (comptime @hasField(std.meta.Child(@TypeOf(self)), "runtime_service")) {
+            changed = serviceRemoteControls(self) or changed;
+        }
         // Commit a finished chat.turn.tail response before the per-thread
         // dispatch pass below (also drains the slot when no send remains,
         // e.g. after an abort while the worker was in flight).
+        if (comptime @hasField(std.meta.Child(@TypeOf(self)), "runtime_service")) {
+            changed = serviceRemoteChatTails(self) or changed;
+        }
         changed = serviceDaemonChatTailWorker(self) or changed;
     }
     if (!self.chat_controller.hasPending()) return changed;
@@ -3967,7 +4538,6 @@ fn startCodexBackgroundPollForThread(
             .provider_thread_id = undefined,
             .process_id = undefined,
             .cwd = undefined,
-            .remote_host = null,
         };
         request.provider_thread_id = allocator.dupe(u8, task.provider_thread_id.?) catch {
             allocator.free(request.local_thread_id);
@@ -3987,11 +4557,6 @@ fn startCodexBackgroundPollForThread(
             allocator.destroy(request);
             return false;
         };
-        request.remote_host = if (target.remoteHost()) |host| allocator.dupe(u8, host) catch {
-            request.deinit();
-            return false;
-        } else null;
-
         const io = std.Io.Threaded.global_single_threaded.io();
         poll.mutex.lockUncancelable(io);
         poll.request = request;
@@ -4274,11 +4839,177 @@ fn daemonTailWorkerMain(connection: *sessionizer.ReusableRequestConnection, args
     args.done.store(true, .release);
 }
 
+fn threadUsesRemoteRuntime(thread: *const ChatThread) bool {
+    const pinned = thread.pinnedRuntimeRoute() orelse return false;
+    return !std.mem.eql(u8, pinned.profile_id, chat_types.LOCAL_RUNTIME_PROFILE_ID) and
+        pinned.runtime_id != null;
+}
+
+fn remoteTargetMatchesThread(target: *const OwnedRemoteTurnTarget, thread: *const ChatThread) bool {
+    const route = thread.pinnedRuntimeRoute() orelse return false;
+    if (route.runtime_id == null or
+        !std.mem.eql(u8, route.profile_id, target.profile_id) or
+        !std.mem.eql(u8, route.runtime_id.?, target.runtime_id) or
+        !std.mem.eql(u8, route.repository_id, target.repository_id) or
+        !optionalRouteTextEql(route.relative_cwd, target.relative_cwd))
+    {
+        return false;
+    }
+    const send_state = thread.send_state;
+    send_state.mutex.lock();
+    defer send_state.mutex.unlock();
+    return send_state.status == .pending and send_state.daemon_owned and
+        send_state.started_at_ms == target.started_at_ms and
+        send_state.daemon_turn_id != null and
+        std.mem.eql(u8, send_state.daemon_turn_id.?, target.turn_id);
+}
+
+fn remoteServiceCanAddressTarget(service: *const RuntimeService, target: *const OwnedRemoteTurnTarget) bool {
+    const snapshot = service.snapshot(target.profile_id) orelse return false;
+    return remoteSnapshotCanRoute(snapshot, target.runtime_id);
+}
+
+fn remoteTailAlreadyDispatched(chat: *const State, profile_id: []const u8, turn_id: []const u8) bool {
+    for (chat.remote_tail_dispatches.items) |dispatch| {
+        if (std.mem.eql(u8, dispatch.target.profile_id, profile_id) and
+            std.mem.eql(u8, dispatch.target.turn_id, turn_id)) return true;
+    }
+    return false;
+}
+
+fn remoteControlQueuedForProfile(chat: *const State, profile_id: []const u8) bool {
+    for (chat.remote_control_dispatches.items) |dispatch| {
+        if (std.mem.eql(u8, dispatch.target.profile_id, profile_id)) return true;
+    }
+    return false;
+}
+
+fn pollRemoteDaemonChatTurn(self: anytype, project_index: usize, thread: *ChatThread) bool {
+    const service = runtimeServiceFromState(self) orelse return false;
+    if (project_index >= self.project_controller.projects.items.len) return false;
+    const workspace_id = self.project_controller.projects.items[project_index].id;
+    const send_state = thread.send_state;
+    const now_ms = monotonicMs();
+
+    send_state.mutex.lock();
+    const active = send_state.status == .pending and send_state.daemon_owned and send_state.daemon_turn_id != null;
+    const poll_due = active and daemonChatPollDue(send_state.daemon_last_poll_ms, now_ms, send_state.daemon_poll_backoff_ms);
+    const turn_id = if (poll_due) self.allocator.dupe(u8, send_state.daemon_turn_id.?) catch null else null;
+    const after_seq = send_state.daemon_last_seq;
+    const started_at_ms = send_state.started_at_ms;
+    send_state.mutex.unlock();
+
+    const owned_turn_id = turn_id orelse return false;
+    defer self.allocator.free(owned_turn_id);
+    const pinned = thread.pinnedRuntimeRoute() orelse return false;
+    const runtime_id = pinned.runtime_id orelse return false;
+    if (remoteControlQueuedForProfile(&self.chat_controller, pinned.profile_id)) return false;
+    if (remoteTailAlreadyDispatched(&self.chat_controller, pinned.profile_id, owned_turn_id)) return false;
+
+    var target = OwnedRemoteTurnTarget.init(
+        self.allocator,
+        workspace_id,
+        thread,
+        owned_turn_id,
+        started_at_ms,
+    ) catch return false;
+    var target_owned = true;
+    defer if (target_owned) target.deinit(self.allocator);
+    if (!remoteServiceCanAddressTarget(service, &target) or !std.mem.eql(u8, runtime_id, target.runtime_id)) {
+        return false;
+    }
+    self.chat_controller.remote_tail_dispatches.ensureUnusedCapacity(self.allocator, 1) catch return false;
+
+    send_state.mutex.lock();
+    if (send_state.status == .pending and send_state.daemon_turn_id != null and
+        std.mem.eql(u8, send_state.daemon_turn_id.?, target.turn_id))
+    {
+        send_state.daemon_last_poll_ms = now_ms;
+    }
+    send_state.mutex.unlock();
+
+    const ticket = service.beginRpc(target.profile_id, "chat.turn.tail", .{
+        .turn_id = target.turn_id,
+        .after_seq = after_seq,
+        .max_bytes = REMOTE_CHAT_TAIL_PAGE_BYTES,
+    }) catch |err| {
+        if (err != error.RuntimeRpcBusy and err != error.RuntimeRpcResultPending) {
+            log.warn("failed to start remote chat tail: {s}", .{@errorName(err)});
+        }
+        return false;
+    };
+    self.chat_controller.remote_tail_dispatches.appendAssumeCapacity(.{
+        .target = target,
+        .ticket = ticket,
+        .after_seq = after_seq,
+        .rpc_started_at_ms = now_ms,
+    });
+    target_owned = false;
+    return false;
+}
+
+fn serviceRemoteChatTails(self: anytype) bool {
+    const service = runtimeServiceFromState(self) orelse return false;
+    var changed = false;
+    var index: usize = 0;
+    while (index < self.chat_controller.remote_tail_dispatches.items.len) {
+        const dispatch = &self.chat_controller.remote_tail_dispatches.items[index];
+        var result = service.takeRpcResult(dispatch.ticket) catch |err| {
+            log.warn("failed to drain remote chat tail ticket: {s}", .{@errorName(err)});
+            var removed = self.chat_controller.remote_tail_dispatches.swapRemove(index);
+            removed.deinit(self.allocator);
+            continue;
+        } orelse {
+            index += 1;
+            continue;
+        };
+
+        const resolved = self.projectThreadIndexByLocalId(dispatch.target.workspace_id, dispatch.target.local_thread_id);
+        const thread: ?*ChatThread = if (resolved) |location|
+            &self.project_controller.projects.items[location.project_index].threads.items[location.thread_index]
+        else
+            null;
+        const target_current = if (thread) |candidate| remoteTargetMatchesThread(&dispatch.target, candidate) else false;
+        if (target_current) {
+            const target_thread = thread.?;
+            const send_state = target_thread.send_state;
+            send_state.mutex.lock();
+            send_state.daemon_poll_backoff_ms = daemonChatPollBackoffMs(monotonicMs() - dispatch.rpc_started_at_ms);
+            send_state.mutex.unlock();
+            switch (result) {
+                .response => |response| {
+                    if (daemonTailResponseIsNotFound(response.json)) {
+                        changed = noteDaemonChatTailFailure(target_thread, "remote daemon chat turn was not found after reconnect") or changed;
+                    } else {
+                        const applied = self.applyDaemonChatTurnTail(target_thread, response.json) catch |err| blk: {
+                            log.warn("failed to apply remote chat turn tail: {s}", .{@errorName(err)});
+                            break :blk noteDaemonChatTailFailure(target_thread, "failed to apply remote daemon chat turn");
+                        };
+                        if (applied) {
+                            send_state.mutex.lock();
+                            send_state.daemon_tail_fail_count = 0;
+                            send_state.mutex.unlock();
+                        }
+                        changed = applied or changed;
+                    }
+                },
+                .failed => changed = noteDaemonChatTailFailure(target_thread, "remote daemon chat turn is unavailable") or changed,
+                .canceled => changed = noteDaemonChatTailFailure(target_thread, "remote daemon chat tail was canceled") or changed,
+            }
+        }
+        result.deinit();
+        var removed = self.chat_controller.remote_tail_dispatches.swapRemove(index);
+        removed.deinit(self.allocator);
+    }
+    return changed;
+}
+
 /// Dispatch half of the tail poll: when this thread's turn is due and the
 /// single worker slot is free, hand the RPC to a worker so the render thread
 /// never blocks in daemon IPC. The measured-cost backoff still applies at
 /// service time as the fallback pacing for a slow daemon.
-pub fn pollDaemonChatTurn(self: anytype, thread: *ChatThread) bool {
+pub fn pollDaemonChatTurn(self: anytype, project_index: usize, thread: *ChatThread) bool {
+    if (threadUsesRemoteRuntime(thread)) return pollRemoteDaemonChatTurn(self, project_index, thread);
     const chat = &self.chat_controller;
     // Single slot in flight: skip until the response is serviced in pollSend.
     if (chat.daemon_tail_args != null) return false;
@@ -4511,6 +5242,82 @@ test "daemon tail cursor advances only after an event applies" {
     ;
     try std.testing.expectError(error.TestEventRejected, applyDaemonChatTurnTail(&state, &thread, response));
     try std.testing.expectEqual(@as(u64, 0), thread.send_state.daemon_last_seq);
+}
+
+test "remote tail target guard rejects a changed turn or runtime route" {
+    const allocator = std.testing.allocator;
+    var thread = try ChatThread.init(allocator, "remote target");
+    defer thread.deinit(allocator);
+    try std.testing.expectEqual(.updated, try thread.selectRuntimeRoute(allocator, .{
+        .profile_id = "remote-box",
+        .repository_id = "repo-api",
+        .relative_cwd = "services/api",
+    }));
+    try thread.pinRuntimeRoute(allocator, "0123456789abcdef0123456789abcdef");
+    thread.send_state.status = .pending;
+    thread.send_state.daemon_owned = true;
+    thread.send_state.started_at_ms = 123;
+    thread.send_state.daemon_turn_id = try std.heap.page_allocator.dupe(u8, "remote-turn");
+
+    var target = try OwnedRemoteTurnTarget.init(allocator, "workspace", &thread, "remote-turn", 123);
+    defer target.deinit(allocator);
+    try std.testing.expect(remoteTargetMatchesThread(&target, &thread));
+    std.heap.page_allocator.free(thread.send_state.daemon_turn_id.?);
+    thread.send_state.daemon_turn_id = try std.heap.page_allocator.dupe(u8, "replacement-turn");
+    try std.testing.expect(!remoteTargetMatchesThread(&target, &thread));
+
+    var other = try ChatThread.init(allocator, "other runtime");
+    defer other.deinit(allocator);
+    try std.testing.expectEqual(.updated, try other.selectRuntimeRoute(allocator, .{
+        .profile_id = "other-box",
+        .repository_id = "repo-api",
+        .relative_cwd = "services/api",
+    }));
+    try other.pinRuntimeRoute(allocator, "fedcba9876543210fedcba9876543210");
+    other.send_state.status = .pending;
+    other.send_state.daemon_owned = true;
+    other.send_state.started_at_ms = 123;
+    other.send_state.daemon_turn_id = try std.heap.page_allocator.dupe(u8, "remote-turn");
+    try std.testing.expect(!remoteTargetMatchesThread(&target, &other));
+}
+
+test "remote routed tails reuse terminal and error state transitions" {
+    const allocator = std.testing.allocator;
+    const TailState = struct {
+        allocator: std.mem.Allocator,
+        fn markDirty(_: *@This()) void {}
+        fn applyDaemonChatEventLocked(_: *@This(), _: *SendState, _: []const u8, _: []const u8) !void {}
+    };
+    var state: TailState = .{ .allocator = allocator };
+
+    var completed = try ChatThread.init(allocator, "remote complete");
+    defer completed.deinit(allocator);
+    try std.testing.expectEqual(.updated, try completed.selectRuntimeRoute(allocator, .{
+        .profile_id = "remote-box",
+        .repository_id = "repo-api",
+    }));
+    try completed.pinRuntimeRoute(allocator, "0123456789abcdef0123456789abcdef");
+    completed.send_state.status = .pending;
+    completed.send_state.daemon_owned = true;
+    try std.testing.expect(try applyDaemonChatTurnTail(&state, &completed,
+        \\{"jsonrpc":"2.0","id":7,"result":{"status":"completed","events":[],"provider_thread_id":"provider-thread","result_reply_text":"done"}}
+    ));
+    try std.testing.expectEqual(SendStatus.completed, completed.send_state.status);
+
+    var failed = try ChatThread.init(allocator, "remote failed");
+    defer failed.deinit(allocator);
+    try std.testing.expectEqual(.updated, try failed.selectRuntimeRoute(allocator, .{
+        .profile_id = "remote-box",
+        .repository_id = "repo-api",
+    }));
+    try failed.pinRuntimeRoute(allocator, "0123456789abcdef0123456789abcdef");
+    failed.send_state.status = .pending;
+    failed.send_state.daemon_owned = true;
+    try std.testing.expect(try applyDaemonChatTurnTail(&state, &failed,
+        \\{"jsonrpc":"2.0","id":8,"result":{"status":"failed","events":[],"error_message":"remote provider failed"}}
+    ));
+    try std.testing.expectEqual(SendStatus.failed, failed.send_state.status);
+    try std.testing.expectEqualStrings("remote provider failed", failed.send_state.error_message.?);
 }
 
 /// True when the thread transcript already carries a row with this durable
@@ -4773,7 +5580,7 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
     const acceptance_pending = thread.send_state.acceptance_pending;
     thread.send_state.mutex.unlock();
     const rpc_gated = command_pending or acceptance_pending;
-    const daemon_changed = if (rpc_gated) false else self.pollDaemonChatTurn(thread);
+    const daemon_changed = if (rpc_gated) false else self.pollDaemonChatTurn(project_index, thread);
     if (!rpc_gated) {
         self.capturePendingProviderThreadId(thread);
         self.issuePendingProviderSteer(project_index, thread_index, thread);
@@ -4980,10 +5787,12 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
                 // one, the frame-loop debounce, title-generation completion,
                 // provider_thread_id capture, bang-command start, and the
                 // close-time blocking flush are all safe by construction.
-                if (completed_daemon_turn_id) |turn_id| adoptDaemonTranscriptIdentitiesWithRetry(self, project_index, thread, turn_id);
+                if (!threadUsesRemoteRuntime(thread)) {
+                    if (completed_daemon_turn_id) |turn_id| adoptDaemonTranscriptIdentitiesWithRetry(self, project_index, thread, turn_id);
+                }
                 self.flushDirtyNow();
                 // Consume is a retention hint only (daemon already committed).
-                self.consumeDaemonChatTurn(completed_daemon_turn_id);
+                consumeDaemonChatTurnForThread(self, thread, completed_daemon_turn_id);
             }
         },
         .failed => {
@@ -5001,9 +5810,11 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
             if (!completed_local_command) stopUnownedBackgroundTasksAtTurnEnd(self, thread);
             // M4-P4 fix: identity-preserving flush — adopt ids (failed turns
             // also commit durably), then flush without gating.
-            if (completed_daemon_turn_id) |turn_id| adoptDaemonTranscriptIdentitiesWithRetry(self, project_index, thread, turn_id);
+            if (!threadUsesRemoteRuntime(thread)) {
+                if (completed_daemon_turn_id) |turn_id| adoptDaemonTranscriptIdentitiesWithRetry(self, project_index, thread, turn_id);
+            }
             self.flushDirtyNow();
-            self.consumeDaemonChatTurn(completed_daemon_turn_id);
+            consumeDaemonChatTurnForThread(self, thread, completed_daemon_turn_id);
         },
         .aborted => {
             defer freePendingTimelineEvents(std.heap.page_allocator, &completed_events);
@@ -5033,9 +5844,11 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
             if (!completed_local_command) stopUnownedBackgroundTasksAtTurnEnd(self, thread);
             // M4-P4 fix: identity-preserving flush — adopt ids (aborted turns
             // also commit durably), then flush without gating.
-            if (completed_daemon_turn_id) |turn_id| adoptDaemonTranscriptIdentitiesWithRetry(self, project_index, thread, turn_id);
+            if (!threadUsesRemoteRuntime(thread)) {
+                if (completed_daemon_turn_id) |turn_id| adoptDaemonTranscriptIdentitiesWithRetry(self, project_index, thread, turn_id);
+            }
             self.flushDirtyNow();
-            self.consumeDaemonChatTurn(completed_daemon_turn_id);
+            consumeDaemonChatTurnForThread(self, thread, completed_daemon_turn_id);
         },
         else => {},
     }
@@ -6286,6 +7099,239 @@ pub fn capturePendingProviderThreadId(self: anytype, thread: *ChatThread) void {
     self.flushDirtyNow();
 }
 
+fn remoteCancelQueued(chat: *const State, profile_id: []const u8, turn_id: []const u8) bool {
+    for (chat.remote_control_dispatches.items) |dispatch| {
+        if (dispatch.action != .cancel) continue;
+        if (std.mem.eql(u8, dispatch.target.profile_id, profile_id) and
+            std.mem.eql(u8, dispatch.target.turn_id, turn_id)) return true;
+    }
+    return false;
+}
+
+fn remoteApprovalQueued(chat: *const State, profile_id: []const u8, turn_id: []const u8, call_id: []const u8) bool {
+    for (chat.remote_control_dispatches.items) |dispatch| switch (dispatch.action) {
+        .cancel => {},
+        .approve => |approval| if (std.mem.eql(u8, dispatch.target.profile_id, profile_id) and
+            std.mem.eql(u8, dispatch.target.turn_id, turn_id) and
+            std.mem.eql(u8, approval.call_id, call_id)) return true,
+    };
+    return false;
+}
+
+fn enqueueRemoteCancel(
+    self: anytype,
+    project_index: usize,
+    thread: *ChatThread,
+    turn_id: []const u8,
+    started_at_ms: i64,
+) !void {
+    if (self.chat_controller.remote_control_dispatches.items.len >= MAX_REMOTE_CONTROL_DISPATCHES) {
+        return error.TooManyRemoteControls;
+    }
+    if (project_index >= self.project_controller.projects.items.len) return error.WorkspaceNotFound;
+    const pinned = thread.pinnedRuntimeRoute() orelse return error.RemoteRuntimeRouteNotPinned;
+    if (remoteCancelQueued(&self.chat_controller, pinned.profile_id, turn_id)) return;
+    var target = try OwnedRemoteTurnTarget.init(
+        self.allocator,
+        self.project_controller.projects.items[project_index].id,
+        thread,
+        turn_id,
+        started_at_ms,
+    );
+    errdefer target.deinit(self.allocator);
+    try self.chat_controller.remote_control_dispatches.append(self.allocator, .{
+        .target = target,
+        .action = .cancel,
+    });
+}
+
+fn enqueueRemoteCancelForState(
+    self: anytype,
+    project_index: usize,
+    thread: *ChatThread,
+    turn_id: []const u8,
+    started_at_ms: i64,
+) !void {
+    if (comptime @hasField(std.meta.Child(@TypeOf(self)), "runtime_service") and
+        @hasField(std.meta.Child(@TypeOf(self)), "chat_controller") and
+        @hasField(std.meta.Child(@TypeOf(self)), "project_controller"))
+    {
+        return enqueueRemoteCancel(self, project_index, thread, turn_id, started_at_ms);
+    } else {
+        return error.RemoteRuntimeControlsUnavailable;
+    }
+}
+
+fn enqueueRemoteApproval(
+    self: anytype,
+    project_index: usize,
+    thread: *ChatThread,
+    turn_id: []const u8,
+    call_id: []const u8,
+    decision: ai_harness.ApprovalDecision,
+    started_at_ms: i64,
+) !void {
+    if (self.chat_controller.remote_control_dispatches.items.len >= MAX_REMOTE_CONTROL_DISPATCHES) {
+        return error.TooManyRemoteControls;
+    }
+    if (project_index >= self.project_controller.projects.items.len) return error.WorkspaceNotFound;
+    const pinned = thread.pinnedRuntimeRoute() orelse return error.RemoteRuntimeRouteNotPinned;
+    if (remoteApprovalQueued(&self.chat_controller, pinned.profile_id, turn_id, call_id)) return;
+    var target = try OwnedRemoteTurnTarget.init(
+        self.allocator,
+        self.project_controller.projects.items[project_index].id,
+        thread,
+        turn_id,
+        started_at_ms,
+    );
+    errdefer target.deinit(self.allocator);
+    const owned_call_id = try self.allocator.dupe(u8, call_id);
+    errdefer self.allocator.free(owned_call_id);
+    try self.chat_controller.remote_control_dispatches.append(self.allocator, .{
+        .target = target,
+        .action = .{ .approve = .{ .call_id = owned_call_id, .decision = decision } },
+    });
+}
+
+fn enqueueRemoteApprovalForState(
+    self: anytype,
+    project_index: usize,
+    thread: *ChatThread,
+    turn_id: []const u8,
+    call_id: []const u8,
+    decision: ai_harness.ApprovalDecision,
+    started_at_ms: i64,
+) !void {
+    if (comptime @hasField(std.meta.Child(@TypeOf(self)), "runtime_service") and
+        @hasField(std.meta.Child(@TypeOf(self)), "chat_controller") and
+        @hasField(std.meta.Child(@TypeOf(self)), "project_controller"))
+    {
+        return enqueueRemoteApproval(
+            self,
+            project_index,
+            thread,
+            turn_id,
+            call_id,
+            decision,
+            started_at_ms,
+        );
+    } else {
+        return error.RemoteRuntimeControlsUnavailable;
+    }
+}
+
+fn applyRemoteControlCompletion(self: anytype, dispatch: *const RemoteControlDispatch, accepted: bool) bool {
+    const resolved = self.projectThreadIndexByLocalId(dispatch.target.workspace_id, dispatch.target.local_thread_id) orelse return false;
+    const thread = &self.project_controller.projects.items[resolved.project_index].threads.items[resolved.thread_index];
+    if (!remoteTargetMatchesThread(&dispatch.target, thread)) return false;
+    const send_state = thread.send_state;
+    send_state.mutex.lock();
+    defer send_state.mutex.unlock();
+    switch (dispatch.action) {
+        .cancel => {
+            if (!daemonStopIdentityMatches(send_state, dispatch.target.started_at_ms, dispatch.target.turn_id)) return false;
+            if (!accepted) {
+                rollbackStopLocked(send_state, "Failed to stop the remote provider reply. Try again.");
+                return true;
+            }
+            clearControlFailureLocked(send_state);
+            send_state.stop_signal_sent = true;
+            return true;
+        },
+        .approve => |approval| {
+            const current = send_state.pending_approval orelse return false;
+            if (!std.mem.eql(u8, current.call_id, approval.call_id)) return false;
+            if (!accepted) {
+                setControlFailureLocked(send_state, "Failed to send the remote approval decision. Try again.");
+                return true;
+            }
+            clearControlFailureLocked(send_state);
+            return resolveApprovalLocked(send_state, approval.decision);
+        },
+    }
+}
+
+fn serviceRemoteControls(self: anytype) bool {
+    const service = runtimeServiceFromState(self) orelse return false;
+    var changed = false;
+    var index: usize = 0;
+    while (index < self.chat_controller.remote_control_dispatches.items.len) {
+        const dispatch = &self.chat_controller.remote_control_dispatches.items[index];
+        const ticket = dispatch.ticket orelse {
+            index += 1;
+            continue;
+        };
+        var result = service.takeRpcResult(ticket) catch |err| {
+            log.warn("failed to drain remote chat control ticket: {s}", .{@errorName(err)});
+            changed = applyRemoteControlCompletion(self, dispatch, false) or changed;
+            var removed = self.chat_controller.remote_control_dispatches.swapRemove(index);
+            removed.deinit(self.allocator);
+            continue;
+        } orelse {
+            index += 1;
+            continue;
+        };
+        const accepted = switch (result) {
+            .response => |response| blk: {
+                ensureJsonRpcOk(self.allocator, response.json) catch break :blk false;
+                break :blk true;
+            },
+            .failed, .canceled => false,
+        };
+        changed = applyRemoteControlCompletion(self, dispatch, accepted) or changed;
+        result.deinit();
+        var removed = self.chat_controller.remote_control_dispatches.swapRemove(index);
+        removed.deinit(self.allocator);
+    }
+
+    index = 0;
+    while (index < self.chat_controller.remote_control_dispatches.items.len) {
+        const dispatch = &self.chat_controller.remote_control_dispatches.items[index];
+        if (dispatch.ticket != null) {
+            index += 1;
+            continue;
+        }
+        const resolved = self.projectThreadIndexByLocalId(dispatch.target.workspace_id, dispatch.target.local_thread_id);
+        const target_current = if (resolved) |location|
+            remoteTargetMatchesThread(
+                &dispatch.target,
+                &self.project_controller.projects.items[location.project_index].threads.items[location.thread_index],
+            )
+        else
+            false;
+        if (!target_current or !remoteServiceCanAddressTarget(service, &dispatch.target)) {
+            changed = applyRemoteControlCompletion(self, dispatch, false) or changed;
+            var removed = self.chat_controller.remote_control_dispatches.swapRemove(index);
+            removed.deinit(self.allocator);
+            continue;
+        }
+
+        const ticket = switch (dispatch.action) {
+            .cancel => service.beginRpc(dispatch.target.profile_id, "chat.turn.cancel", .{
+                .turn_id = dispatch.target.turn_id,
+            }),
+            .approve => |approval| service.beginRpc(dispatch.target.profile_id, "chat.turn.approve", .{
+                .turn_id = dispatch.target.turn_id,
+                .call_id = approval.call_id,
+                .decision = @tagName(approval.decision),
+            }),
+        } catch |err| {
+            if (err == error.RuntimeRpcBusy or err == error.RuntimeRpcResultPending) {
+                index += 1;
+                continue;
+            }
+            log.warn("failed to start remote chat control: {s}", .{@errorName(err)});
+            changed = applyRemoteControlCompletion(self, dispatch, false) or changed;
+            var removed = self.chat_controller.remote_control_dispatches.swapRemove(index);
+            removed.deinit(self.allocator);
+            continue;
+        };
+        dispatch.ticket = ticket;
+        index += 1;
+    }
+    return changed;
+}
+
 pub fn issuePendingThreadStop(self: anytype, project_index: ?usize, project_path: []const u8, thread: *ChatThread) void {
     var provider: Provider = undefined;
     var thread_id: ?[]u8 = null;
@@ -6300,6 +7346,7 @@ pub fn issuePendingThreadStop(self: anytype, project_index: ?usize, project_path
     }
     if (send_state.daemon_owned) {
         addressed_started_at_ms = send_state.started_at_ms;
+        const remote_runtime = threadUsesRemoteRuntime(thread);
         const daemon_turn_id = if (send_state.daemon_turn_id) |id| self.allocator.dupe(u8, id) catch null else null;
         send_state.mutex.unlock();
         const owned_daemon_turn_id = daemon_turn_id orelse {
@@ -6309,6 +7356,29 @@ pub fn issuePendingThreadStop(self: anytype, project_index: ?usize, project_path
             return;
         };
         defer self.allocator.free(owned_daemon_turn_id);
+        if (remote_runtime) {
+            const resolved_project_index = project_index orelse {
+                send_state.mutex.lock();
+                rollbackStopLocked(send_state, "Could not address the remote provider turn during shutdown.");
+                send_state.mutex.unlock();
+                return;
+            };
+            enqueueRemoteCancelForState(
+                self,
+                resolved_project_index,
+                thread,
+                owned_daemon_turn_id,
+                addressed_started_at_ms,
+            ) catch |err| {
+                log.warn("failed to queue remote chat cancellation: {s}", .{@errorName(err)});
+                send_state.mutex.lock();
+                if (daemonStopIdentityMatches(send_state, addressed_started_at_ms, owned_daemon_turn_id)) {
+                    rollbackStopLocked(send_state, "Failed to queue the remote stop request. Try again.");
+                }
+                send_state.mutex.unlock();
+            };
+            return;
+        }
         self.cancelDaemonChatTurn(owned_daemon_turn_id) catch |err| {
             log.warn("failed to cancel daemon chat turn: {s}", .{@errorName(err)});
             send_state.mutex.lock();
@@ -6452,6 +7522,20 @@ pub fn issuePendingProviderSteer(
 ) void {
     const provider = thread.provider;
     if (provider != .codex and provider != .claude) return;
+    if (threadUsesRemoteRuntime(thread)) {
+        const remote_send_state = thread.send_state;
+        remote_send_state.mutex.lock();
+        if (pendingProviderSteerCanSignal(remote_send_state)) {
+            remote_send_state.pending_followup.?.state = .fallback_next_turn;
+            remote_send_state.pending_followup_signal_sent = false;
+            remote_send_state.ui_revision +%= 1;
+            remote_send_state.mutex.unlock();
+            self.setSidebarNotice("Remote steer is not available yet. This will send as the next turn.");
+            return;
+        }
+        remote_send_state.mutex.unlock();
+        return;
+    }
 
     var thread_id: ?[]u8 = null;
     var turn_id: ?[]u8 = null;
@@ -6655,20 +7739,18 @@ pub fn dispatchPendingFollowup(self: anytype, project_index: usize, thread_index
         return;
     }
 
-    const execution_target = self.providerExecutionTargetForProjectThread(project_index, thread, followup.images.items.len) orelse return;
-
-    const first_image: ?*const ChatImageAttachment = if (followup.images.items.len > 0) &followup.images.items[0] else null;
-    const extra_images: []const ChatImageAttachment = if (followup.images.items.len > 1) followup.images.items[1..] else &.{};
-    self.appendMessageToThread(thread, .user, "You", followup.prompt, first_image, extra_images) catch |err| {
-        log.err("failed to append pending follow-up: {s}", .{@errorName(err)});
-        self.setSidebarNotice("Failed to append the pending follow-up.");
-        return;
-    };
-    beginSendForThreadWithImages(self, project_index, thread, followup.prompt, followup.images.items, execution_target) catch |err| {
+    const workspace_id = self.project_controller.projects.items[project_index].id;
+    const sent = self.sendThreadPrompt(
+        workspace_id,
+        thread.local_thread_id,
+        followup.prompt,
+        followup.images.items,
+    ) catch |err| {
         log.err("failed to start pending follow-up: {s}", .{@errorName(err)});
         self.setSidebarNotice("Failed to send the pending follow-up.");
         return;
     };
+    if (!sent) return;
     if (project_index == self.project_controller.selected_index and thread_index == self.currentProject().selected_thread_index) {
         self.requestTranscriptScrollToBottom();
     }
@@ -7011,9 +8093,24 @@ pub fn resolveThreadApprovalByLocalId(self: anytype, workspace_id: []const u8, l
     return resolveThreadPendingApproval(self, thread, decision);
 }
 
+fn liveProjectIndexForThread(self: anytype, target: *const ChatThread) ?usize {
+    if (comptime @hasField(std.meta.Child(@TypeOf(self)), "project_controller")) {
+        for (self.project_controller.projects.items, 0..) |*project, project_index| {
+            for (project.threads.items) |*thread| {
+                if (thread == target) return project_index;
+            }
+        }
+        return null;
+    } else {
+        return null;
+    }
+}
+
 fn resolveThreadPendingApproval(self: anytype, thread: *ChatThread, decision: ai_harness.ApprovalDecision) bool {
     const send_state = thread.send_state;
     send_state.mutex.lock();
+    const remote_runtime = send_state.daemon_owned and threadUsesRemoteRuntime(thread);
+    const addressed_started_at_ms = send_state.started_at_ms;
     const daemon_turn_id = if (send_state.daemon_owned and send_state.daemon_turn_id != null)
         self.allocator.dupe(u8, send_state.daemon_turn_id.?) catch null
     else
@@ -7040,6 +8137,30 @@ fn resolveThreadPendingApproval(self: anytype, thread: *ChatThread, decision: ai
         defer self.allocator.free(turn_id);
         const approval_call_id = call_id orelse return false;
         defer self.allocator.free(approval_call_id);
+        if (remote_runtime) {
+            const project_index = liveProjectIndexForThread(self, thread) orelse {
+                send_state.mutex.lock();
+                setControlFailureLocked(send_state, "Could not address the remote approval. Try again.");
+                send_state.mutex.unlock();
+                return false;
+            };
+            enqueueRemoteApprovalForState(
+                self,
+                project_index,
+                thread,
+                turn_id,
+                approval_call_id,
+                decision,
+                addressed_started_at_ms,
+            ) catch |err| {
+                log.warn("failed to queue remote approval: {s}", .{@errorName(err)});
+                send_state.mutex.lock();
+                setControlFailureLocked(send_state, "Failed to queue the remote approval decision. Try again.");
+                send_state.mutex.unlock();
+                return false;
+            };
+            return true;
+        }
         self.approveDaemonChatTurn(turn_id, approval_call_id, decision) catch |err| {
             log.warn("failed to approve daemon chat turn: {s}", .{@errorName(err)});
             send_state.mutex.lock();

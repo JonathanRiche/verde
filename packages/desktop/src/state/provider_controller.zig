@@ -3,8 +3,8 @@
 const std = @import("std");
 const ai_harness = @import("../providers/harness.zig");
 const app_config = @import("../app/config.zig");
-const process_env = @import("../platform/env.zig");
 const provider_mcp = @import("../providers/mcp.zig");
+const provider_readiness = @import("../providers/readiness.zig");
 const utils = @import("../utils.zig");
 const chat_types = @import("chat_types.zig");
 const provider_models = @import("provider_models.zig");
@@ -95,13 +95,8 @@ pub const ClaudeModelCacheState = struct {
     worker: ?std.Thread = null,
 };
 
-pub const ProviderReadiness = enum {
-    checking,
-    missing,
-    signed_out,
-    ready,
-    unavailable,
-};
+pub const ProviderReadiness = provider_readiness.ProviderReadiness;
+pub const detectProviderReadiness = provider_readiness.detectProviderReadiness;
 
 pub const ProviderReadinessSnapshot = struct {
     codex: ProviderReadiness = .checking,
@@ -244,48 +239,6 @@ pub fn providerReadinessWorker(state: *ProviderReadinessState) void {
     defer state.mutex.unlock();
     state.snapshot = snapshot;
     state.status = .completed;
-}
-
-pub fn detectProviderReadiness(provider: Provider) ProviderReadiness {
-    const executable_ready = switch (provider) {
-        .codex => process_env.commandExists("codex"),
-        .opencode => process_env.commandExists("opencode"),
-        .claude => process_env.commandExists("node") and process_env.commandExists("claude"),
-        .cursor => process_env.commandExists("agent"),
-        .pi => process_env.commandExists("pi"),
-        .fx => process_env.commandExists("fx"),
-        .grok => process_env.commandExists("grok"),
-    };
-    if (!executable_ready) return .missing;
-
-    const provider_config = switch (provider) {
-        .codex => ai_harness.ProviderConfig{ .codex = .{} },
-        .opencode => ai_harness.ProviderConfig{ .opencode = .{
-            .allocator = std.heap.page_allocator,
-            .working_directory = null,
-            .launch_if_missing = true,
-        } },
-        .claude => ai_harness.ProviderConfig{ .claude = .{} },
-        .cursor => ai_harness.ProviderConfig{ .cursor = .{} },
-        .pi => ai_harness.ProviderConfig{ .pi = .{} },
-        .fx => ai_harness.ProviderConfig{ .fx = .{} },
-        .grok => ai_harness.ProviderConfig{ .grok = .{} },
-    };
-    var client = ai_harness.connect(std.heap.page_allocator, provider_config) catch |err| {
-        log.warn("provider readiness connect failed provider={s}: {s}", .{ @tagName(provider), @errorName(err) });
-        return if (err == error.FileNotFound) .missing else .unavailable;
-    };
-    defer client.deinit();
-
-    const auth_state = client.authState() catch |err| {
-        log.warn("provider readiness auth failed provider={s}: {s}", .{ @tagName(provider), @errorName(err) });
-        return if (err == error.FileNotFound) .missing else .unavailable;
-    };
-    return switch (auth_state) {
-        .signed_in => .ready,
-        .signed_out => .signed_out,
-        .unknown, .pending => .unavailable,
-    };
 }
 
 pub fn opencodeModelCacheWorker(state: *OpencodeModelCacheState) void {

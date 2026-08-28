@@ -2,11 +2,10 @@
 
 const std = @import("std");
 
+const auth_mod = @import("auth.zig");
 const config_mod = @import("config.zig");
 const daemon_mod = @import("daemon.zig");
-const directory_browser = @import("directory_browser.zig");
 const http_mod = @import("http.zig");
-const mock = @import("mock.zig");
 const theme_mod = @import("theme.zig");
 
 pub fn main(init: std.process.Init) void {
@@ -33,16 +32,24 @@ fn run(init: std.process.Init) !void {
     }
 
     const config = try config_mod.parse(init.gpa, init.environ_map, argv_list.items);
+    var auth = try auth_mod.Service.initFromTokenFile(
+        init.gpa,
+        init.io,
+        config.token_file,
+        .{},
+        .{},
+    );
+    defer auth.deinit();
+
     var daemon = daemon_mod.Daemon.init(init.gpa, init.io, config);
-    try http_mod.serve(init.gpa, init.io, config, &daemon, init.environ_map);
+    try http_mod.serve(init.gpa, init.io, config, &daemon, &auth, init.environ_map);
 }
 
 test {
     std.testing.refAllDecls(@This());
+    _ = auth_mod;
     _ = config_mod;
     _ = daemon_mod;
-    _ = directory_browser;
     _ = http_mod;
-    _ = mock;
     _ = theme_mod;
 }

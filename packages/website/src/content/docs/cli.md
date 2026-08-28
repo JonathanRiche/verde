@@ -27,7 +27,8 @@ verde integrations <command>  # Inspect and install optional provider hooks
 verde theme <command>         # Import, validate, export, or reset themes
 verde session <command>       # Manage persistent terminal sessions
 verde mcp                     # Run Verde's stdio MCP bridge
-verde herdr <command>         # Open or inspect Herdr-backed remote workspaces
+verde herdr <command>         # Open or inspect local Herdr-backed workspaces
+verde runtime <command>       # Manage non-secret runtime connection profiles
 verde live <command>          # Control or inspect the running app
 ```
 
@@ -59,6 +60,34 @@ install, Verde opens `yay` or `paru` in an interactive terminal pane so sudo
 password prompts and package progress remain visible. The card shows the
 installed version, release notes, **Check now**, **Install update**, and the
 **Check automatically** preference.
+
+## Runtime connection profiles
+
+Runtime commands manage the desktop's non-secret profile document without
+opening the app. They are currently offline administration commands. Mutations
+serialize across processes and replace the owner-only document atomically:
+
+```bash
+verde runtime path [--json]
+verde runtime list [--json]
+verde runtime add-ssh --label "Build VM" --host devbox \
+  [--user verde] [--ssh-port 22] [--gateway-port 7420] \
+  [--expected-runtime-id <32-lowercase-hex-id>] [--json]
+verde runtime remove --id <profile-id> [--json]
+```
+
+Local is built in and is not stored as a user profile. SSH host aliases,
+keys, agents, jump hosts, and host-key policy remain owned by normal SSH
+configuration. These commands deliberately have no token option: gateway
+bearers and provider credentials must never enter shell history, process
+arguments, or `runtime-profiles.json`.
+
+The profile CLI is available before the native Remote selector is enabled.
+The secure tunnel, handshake, targeted heartbeat/general-RPC manager, durable
+identity pinning, and immutable per-thread route foundations are implemented,
+but credential-store hydration and selector/chat-execution wiring are not yet
+end to end. Adding a profile therefore does not move or remotely run an
+existing thread.
 
 ## Theme packages
 
@@ -391,22 +420,16 @@ verde integrations disable <claude|codex|amp|opencode|cursor|grok|pi|fx>
   endpoint. Its native session/workspace terminal title remains authoritative,
   so no hook file is required.
 
-## Remote workspaces (Herdr)
+## Local Herdr handoff
 
-Herdr opens or attaches Verde workspaces on a remote host over SSH and syncs
-pane state, with handoff to move a local workspace to a remote (and unlink to
-bring it back) and reusable connection profiles. `handoff` and `unlink`
-require the app to be running.
+Herdr opens or attaches local Verde workspaces and syncs pane state for
+terminal/TUI handoff. `handoff` and `unlink` require the app to be running.
 
 ```bash
 verde herdr status [--json]
-verde herdr open --herdr-workspace <id> --session <name> [--profile <name>|--remote <ssh-alias>] [--remote-cwd <path>] [--local-dir <path>] [--json]
-verde herdr handoff [--workspace <id|index|path|current>] [--all] [--session <name>] [--profile <name>|--remote <ssh-alias>] [--remote-cwd <path>] [--dry-run] [--json]
+verde herdr open --herdr-workspace <id> [--session <name>] [--cwd <path>] [--local-dir <path>] [--json]
+verde herdr handoff [--workspace <id|index|path|current>] [--all] [--session <name>] [--dry-run] [--json]
 verde herdr unlink [--workspace <id|index|path|current>] [--all] [--json]
-verde herdr profiles list [--json]
-verde herdr profiles add --name <name> --ssh-target <alias> [--session <name>] [--remote-cwd <path>] [--local-dir <path>] [--json]
-verde herdr profiles remove <name> [--json]
-verde herdr profiles test <name> [--json]
 ```
 
 ## Terminal surface notifications
