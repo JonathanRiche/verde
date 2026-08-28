@@ -5,6 +5,7 @@
 //! methods stay byte-compatible with the daemon's beginOk / errorResponseAlloc.
 
 const std = @import("std");
+const access_protocol = @import("access_protocol.zig");
 const runtime_identity = @import("runtime_identity.zig");
 
 /// Current headless protocol version advertised by core.status / core.capabilities.
@@ -352,6 +353,7 @@ pub const RUNTIME_CAPABILITY_NAMES = RUNTIME_CAPABILITY_NAMES_BASE ++
     [_][]const u8{
         "repositories.manifest.v1",
         "chat.repository_route.v1",
+        access_protocol.PAIR_RUNTIME_CAPABILITY,
     };
 
 /// Runtime generation a remote JSON-RPC request intends to reach. Keeping
@@ -778,6 +780,21 @@ test "runtime capabilities advertise request target validation" {
         if (std.mem.eql(u8, capability, "rpc.target.v1")) found = true;
     }
     try std.testing.expect(found);
+}
+
+test "store-backed runtimes advertise complete Pair transport enforcement" {
+    var found_store_backed = false;
+    for (RUNTIME_CAPABILITY_NAMES) |capability| {
+        if (std.mem.eql(u8, capability, access_protocol.PAIR_RUNTIME_CAPABILITY)) {
+            found_store_backed = true;
+        }
+    }
+    var found_base = false;
+    for (RUNTIME_CAPABILITY_NAMES_BASE) |capability| {
+        if (std.mem.eql(u8, capability, access_protocol.PAIR_RUNTIME_CAPABILITY)) found_base = true;
+    }
+    try std.testing.expect(found_store_backed);
+    try std.testing.expect(!found_base);
 }
 
 test "parseResponse reads error envelopes" {

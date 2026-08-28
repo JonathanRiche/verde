@@ -8,6 +8,7 @@ const headless = @import("headless");
 const platform_paths = @import("platform_paths");
 const platform_runtime = @import("platform_runtime");
 const sessionizer = @import("terminal/sessionizer.zig");
+const access_protocol = headless.access_protocol;
 
 const NOTIFY_REQUEST_TIMEOUT_MS: u32 = 5_000;
 const SIGNAL_WATCH_INTERVAL_MS: i64 = 25;
@@ -97,7 +98,21 @@ const Command = enum {
     workspace_show,
     workspace_bind,
     workspace_repository_bind,
+    pair_create,
+    pair_list,
+    pair_revoke,
+    device_list,
+    device_revoke,
     notify,
+};
+
+const PairOptions = struct {
+    label: ?[]const u8 = null,
+    ttl_seconds: u32 = access_protocol.DEFAULT_PAIRING_TTL_SECONDS,
+    expires_set: bool = false,
+    id: ?[]const u8 = null,
+    scopes: [access_protocol.MAX_SCOPE_COUNT][]const u8 = @splat(""),
+    scope_count: usize = 0,
 };
 
 const RepositoryBindOptions = struct {
@@ -130,6 +145,7 @@ const Options = struct {
     data_dir: ?[]const u8 = null,
     json: bool = false,
     repository_bind: RepositoryBindOptions = .{},
+    pair: PairOptions = .{},
     notify: NotifyOptions = .{},
 };
 
@@ -140,9 +156,13 @@ const ParseError = error{
     JsonUnavailable,
     MissingDataDir,
     MissingOptionValue,
+    MissingPairCommand,
+    MissingDeviceCommand,
     MissingProvidersCommand,
     MissingWorkspaceCommand,
     UnknownCommand,
+    UnknownPairCommand,
+    UnknownDeviceCommand,
     UnknownProvidersCommand,
     UnknownWorkspaceCommand,
 };
@@ -274,6 +294,7 @@ fn execute(
         .workspace_show => try handleWorkspaceShow(allocator, io, data_dir, options),
         .workspace_bind => try handleWorkspaceBind(allocator, io, data_dir, options),
         .workspace_repository_bind => try handleWorkspaceRepositoryBind(allocator, io, data_dir, options),
+        .pair_create, .pair_list, .pair_revoke, .device_list, .device_revoke => try handleAccessAdministration(allocator, io, data_dir, options),
         .help, .version, .notify => unreachable,
     }
 }
@@ -830,6 +851,237 @@ fn writeRepositoryBindResult(
     );
 }
 
+/// Owner-only Pair/device administration through the running sole-writer
+/// daemon. These commands do not advertise remote Pair availability.
+fn handleAccessAdministration(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    data_dir: []const u8,
+    options: Options,
+) !void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var transport: sessionizer.HeadlessTransport = .{ .allocator = arena, .pref_path = data_dir };
+    var probe_client = sessionizer.headlessClient(arena, &transport);
+    const handshake = try probe_client.handshakeRuntime(null);
+    try headless.requireCapability(handshake.status.capabilities, .store);
+    // Every RPC opens a new transport connection. Pin all administration
+    // calls to the exact generation that answered the status probe so a
+    // replacement between calls fails identity validation before mutation.
+    var client = try headless.Client.initTargeted(
+        arena,
+        &transport,
+        sessionizer.HeadlessTransport.send,
+        .{
+            .runtime_id = handshake.status.runtime_id,
+            .instance_id = handshake.status.instance_id,
+        },
+    );
+
+    switch (options.command) {
+        .pair_create => {
+            const scopes: []const []const u8 = if (options.pair.scope_count == 0)
+                access_protocol.DEFAULT_SCOPE_NAMES[0..]
+            else
+                options.pair.scopes[0..options.pair.scope_count];
+            try access_protocol.validatePairingTtl(options.pair.ttl_seconds);
+            try access_protocol.validateScopeNames(scopes);
+            if (options.pair.label) |label| try access_protocol.validateDeviceLabel(label);
+            var parsed = try client.call(
+                access_protocol.METHOD_DAEMON_PAIRING_GRANT_CREATE,
+                access_protocol.PairingGrantCreateRequest{
+                    .access_protocol_version = access_protocol.ACCESS_PROTOCOL_VERSION,
+                    .label = options.pair.label,
+                    .ttl_seconds = options.pair.ttl_seconds,
+                    .scopes = scopes,
+                },
+            );
+            defer parsed.deinit();
+            var result = try client.decodePairingGrantCreate(&parsed);
+            defer {
+                std.crypto.secureZero(u8, @constCast(result.pairing_token.reveal()));
+                result.pairing_token = undefined;
+            }
+            try verifyAccessIdentity(handshake.status, result.runtime_id, result.instance_id);
+            try writePairingGrantCreateOutput(io, allocator, data_dir, options.json, result);
+        },
+        .pair_list => {
+            var parsed = try client.call(
+                access_protocol.METHOD_DAEMON_PAIRING_GRANT_LIST,
+                access_protocol.PairingGrantListRequest{
+                    .access_protocol_version = access_protocol.ACCESS_PROTOCOL_VERSION,
+                },
+            );
+            defer parsed.deinit();
+            const result = try client.decodePairingGrantList(&parsed);
+            try verifyAccessIdentity(handshake.status, result.runtime_id, result.instance_id);
+            if (options.json) {
+                return writeJson(io, allocator, .{
+                    .ok = true,
+                    .data_dir = data_dir,
+                    .result = result,
+                });
+            }
+            try writeStdout(io, "Pairing grants for runtime {s}: {d}\n", .{ result.runtime_id, result.grants.len });
+            const now_ms = platform_runtime.unixTimestampMs();
+            for (result.grants) |grant| {
+                const state: []const u8 = if (grant.revoked_at_ms != null)
+                    "revoked"
+                else if (grant.consumed_at_ms != null)
+                    "consumed"
+                else if (now_ms >= grant.expires_at_ms)
+                    "expired"
+                else
+                    "active";
+                try writeStdout(
+                    io,
+                    "{s}  {s}  expires={d}  label={s}\n",
+                    .{ grant.grant_id, state, grant.expires_at_ms, grant.label orelse "-" },
+                );
+                try writeScopeLine(io, grant.scopes);
+            }
+        },
+        .pair_revoke => {
+            const grant_id = options.pair.id orelse return error.InvalidArguments;
+            var parsed = try client.call(
+                access_protocol.METHOD_DAEMON_PAIRING_GRANT_REVOKE,
+                access_protocol.PairingGrantRevokeRequest{
+                    .access_protocol_version = access_protocol.ACCESS_PROTOCOL_VERSION,
+                    .grant_id = grant_id,
+                },
+            );
+            defer parsed.deinit();
+            const result = try client.decodePairingGrantRevoke(&parsed);
+            if (options.json) {
+                return writeJson(io, allocator, .{
+                    .ok = true,
+                    .data_dir = data_dir,
+                    .result = result,
+                });
+            }
+            try writeStdout(
+                io,
+                "Pairing grant {s}: {s}\n",
+                .{ result.grant_id, if (result.revoked) "revoked" else "already final or not found" },
+            );
+        },
+        .device_list => {
+            var parsed = try client.call(
+                access_protocol.METHOD_DAEMON_DEVICE_LIST,
+                access_protocol.DeviceListRequest{
+                    .access_protocol_version = access_protocol.ACCESS_PROTOCOL_VERSION,
+                },
+            );
+            defer parsed.deinit();
+            const result = try client.decodeDeviceList(&parsed);
+            try verifyAccessIdentity(handshake.status, result.runtime_id, result.instance_id);
+            if (options.json) {
+                return writeJson(io, allocator, .{
+                    .ok = true,
+                    .data_dir = data_dir,
+                    .result = result,
+                });
+            }
+            try writeStdout(io, "Paired devices for runtime {s}: {d}\n", .{ result.runtime_id, result.devices.len });
+            for (result.devices) |device| {
+                try writeStdout(
+                    io,
+                    "{s}  {s}  label={s}  created={d}\n",
+                    .{
+                        device.device_id,
+                        if (device.revoked_at_ms == null) "active" else "revoked",
+                        device.label,
+                        device.created_at_ms,
+                    },
+                );
+                try writeScopeLine(io, device.scopes);
+            }
+        },
+        .device_revoke => {
+            const device_id = options.pair.id orelse return error.InvalidArguments;
+            var parsed = try client.call(
+                access_protocol.METHOD_DAEMON_DEVICE_REVOKE,
+                access_protocol.DeviceRevokeRequest{
+                    .access_protocol_version = access_protocol.ACCESS_PROTOCOL_VERSION,
+                    .device_id = device_id,
+                },
+            );
+            defer parsed.deinit();
+            const result = try client.decodeDeviceRevoke(&parsed);
+            if (options.json) {
+                return writeJson(io, allocator, .{
+                    .ok = true,
+                    .data_dir = data_dir,
+                    .result = result,
+                });
+            }
+            try writeStdout(
+                io,
+                "Device {s}: {s}\n",
+                .{ result.device_id, if (result.revoked) "revoked" else "already revoked or not found" },
+            );
+        },
+        else => unreachable,
+    }
+}
+
+fn verifyAccessIdentity(
+    status: headless.StatusResult,
+    runtime_id: []const u8,
+    instance_id: []const u8,
+) !void {
+    if (!std.mem.eql(u8, status.runtime_id, runtime_id) or
+        !std.mem.eql(u8, status.instance_id, instance_id))
+    {
+        return error.RuntimeIdentityMismatch;
+    }
+}
+
+fn writePairingGrantCreateOutput(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    data_dir: []const u8,
+    json: bool,
+    result: access_protocol.PairingGrantCreateResult,
+) !void {
+    if (json) {
+        const encoded = try std.json.Stringify.valueAlloc(allocator, .{
+            .ok = true,
+            .data_dir = data_dir,
+            .result = .{
+                .access_protocol_version = result.access_protocol_version,
+                .runtime_id = result.runtime_id,
+                .instance_id = result.instance_id,
+                .grant_id = result.grant_id,
+                // This is the only CLI JSON boundary that deliberately
+                // reveals a one-time pairing token.
+                .pairing_token = result.pairing_token.reveal(),
+                .expires_at_ms = result.expires_at_ms,
+                .scopes = result.scopes,
+            },
+        }, .{ .emit_null_optional_fields = false });
+        defer {
+            std.crypto.secureZero(u8, encoded);
+            allocator.free(encoded);
+        }
+        return writeSensitiveStdout(io, "{s}\n", .{encoded});
+    }
+
+    try writeSensitiveStdout(
+        io,
+        "Pairing grant created for runtime {s}\nGrant ID: {s}\nExpires: {d}\nPairing token (shown once): {s}\n",
+        .{ result.runtime_id, result.grant_id, result.expires_at_ms, result.pairing_token.reveal() },
+    );
+    try writeScopeLine(io, result.scopes);
+}
+
+fn writeScopeLine(io: std.Io, scopes: []const []const u8) !void {
+    try writeStdout(io, "  Scopes:", .{});
+    for (scopes) |scope| try writeStdout(io, " {s}", .{scope});
+    try writeStdout(io, "\n", .{});
+}
+
 fn queryStatus(allocator: std.mem.Allocator, data_dir: []const u8) !headless.StatusResult {
     var transport: sessionizer.HeadlessTransport = .{
         .allocator = allocator,
@@ -921,6 +1173,28 @@ fn parseArgs(argv: []const []const u8) ParseError!Options {
         command = .status;
     } else if (std.mem.eql(u8, first, "notify")) {
         command = .notify;
+    } else if (std.mem.eql(u8, first, "pair")) {
+        if (argv.len <= 2) return error.MissingPairCommand;
+        if (std.mem.eql(u8, argv[2], "create")) {
+            command = .pair_create;
+        } else if (std.mem.eql(u8, argv[2], "list")) {
+            command = .pair_list;
+        } else if (std.mem.eql(u8, argv[2], "revoke")) {
+            command = .pair_revoke;
+        } else {
+            return error.UnknownPairCommand;
+        }
+        option_start = 3;
+    } else if (std.mem.eql(u8, first, "device")) {
+        if (argv.len <= 2) return error.MissingDeviceCommand;
+        if (std.mem.eql(u8, argv[2], "list")) {
+            command = .device_list;
+        } else if (std.mem.eql(u8, argv[2], "revoke")) {
+            command = .device_revoke;
+        } else {
+            return error.UnknownDeviceCommand;
+        }
+        option_start = 3;
     } else if (std.mem.eql(u8, first, "providers")) {
         if (argv.len <= 2) return error.MissingProvidersCommand;
         if (!std.mem.eql(u8, argv[2], "status")) return error.UnknownProvidersCommand;
@@ -999,6 +1273,36 @@ fn parseArgs(argv: []const []const u8) ParseError!Options {
             index += 2;
             continue;
         }
+        if (command == .pair_create or command == .pair_revoke or
+            command == .device_revoke)
+        {
+            const value = try notifyOptionValue(argv, index);
+            if (command == .pair_create and std.mem.eql(u8, arg, "--label")) {
+                if (result.pair.label != null) return error.InvalidArguments;
+                result.pair.label = value;
+            } else if (command == .pair_create and std.mem.eql(u8, arg, "--expires")) {
+                if (result.pair.expires_set) return error.InvalidArguments;
+                result.pair.ttl_seconds = try parsePairingExpiry(value);
+                result.pair.expires_set = true;
+            } else if (command == .pair_create and std.mem.eql(u8, arg, "--scope")) {
+                if (result.pair.scope_count >= result.pair.scopes.len) return error.InvalidArguments;
+                _ = access_protocol.parseScope(value) catch return error.InvalidArguments;
+                for (result.pair.scopes[0..result.pair.scope_count]) |existing| {
+                    if (std.mem.eql(u8, existing, value)) return error.InvalidArguments;
+                }
+                result.pair.scopes[result.pair.scope_count] = value;
+                result.pair.scope_count += 1;
+            } else if ((command == .pair_revoke or command == .device_revoke) and
+                std.mem.eql(u8, arg, "--id"))
+            {
+                if (result.pair.id != null) return error.InvalidArguments;
+                result.pair.id = value;
+            } else {
+                return error.InvalidArguments;
+            }
+            index += 2;
+            continue;
+        }
         if (command == .notify) {
             if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
                 result.notify.help = true;
@@ -1068,8 +1372,33 @@ fn parseArgs(argv: []const []const u8) ParseError!Options {
         {
             return error.InvalidArguments;
         }
+    } else if (command == .pair_create) {
+        if (result.pair.label) |label| {
+            access_protocol.validateDeviceLabel(label) catch return error.InvalidArguments;
+        }
+    } else if (command == .pair_revoke) {
+        const grant_id = result.pair.id orelse return error.InvalidArguments;
+        access_protocol.validateGrantId(grant_id) catch return error.InvalidArguments;
+    } else if (command == .device_revoke) {
+        const device_id = result.pair.id orelse return error.InvalidArguments;
+        access_protocol.validateDeviceId(device_id) catch return error.InvalidArguments;
     }
     return result;
+}
+
+fn parsePairingExpiry(value: []const u8) ParseError!u32 {
+    if (value.len < 2) return error.InvalidArguments;
+    const multiplier: u32 = switch (value[value.len - 1]) {
+        's' => 1,
+        'm' => 60,
+        'h' => 60 * 60,
+        else => return error.InvalidArguments,
+    };
+    const amount = std.fmt.parseInt(u32, value[0 .. value.len - 1], 10) catch
+        return error.InvalidArguments;
+    const seconds = std.math.mul(u32, amount, multiplier) catch return error.InvalidArguments;
+    access_protocol.validatePairingTtl(seconds) catch return error.InvalidArguments;
+    return seconds;
 }
 
 fn notifyOptionValue(argv: []const []const u8, index: usize) ParseError![]const u8 {
@@ -1085,9 +1414,13 @@ fn writeParseError(io: std.Io, err: ParseError) !void {
         error.JsonUnavailable => "serve does not support --json",
         error.MissingDataDir => "--data-dir requires a non-empty path",
         error.MissingOptionValue => "command option requires a non-empty value",
+        error.MissingPairCommand => "pair requires create, list, or revoke",
+        error.MissingDeviceCommand => "device requires list or revoke",
         error.MissingProvidersCommand => "providers requires the status command",
         error.MissingWorkspaceCommand => "workspace requires show, bind, or repository bind",
         error.UnknownCommand => "unknown command",
+        error.UnknownPairCommand => "unknown pair command",
+        error.UnknownDeviceCommand => "unknown device command",
         error.UnknownProvidersCommand => "unknown providers command",
         error.UnknownWorkspaceCommand => "unknown workspace command",
     };
@@ -1132,6 +1465,8 @@ fn commandErrorMessage(err: anyerror) []const u8 {
         error.RuntimeIdentityMissing => "daemon did not return a runtime identity",
         error.RuntimeIdentityMismatch => "daemon runtime identity did not match",
         error.IncompatibleRuntimeProtocol, error.IncompatibleProtocolVersion => "daemon protocol is incompatible",
+        error.IncompatibleAccessProtocol => "daemon access protocol is incompatible",
+        error.InvalidAccessResponse => "daemon returned an invalid access administration response",
         error.CapabilityUnavailable => "daemon does not support this command",
         error.RemoteError => "daemon rejected the request",
         else => @errorName(err),
@@ -1146,6 +1481,8 @@ fn commandErrorExitCode(err: anyerror) u8 {
         error.RuntimeIdentityMismatch,
         error.IncompatibleRuntimeProtocol,
         error.IncompatibleProtocolVersion,
+        error.IncompatibleAccessProtocol,
+        error.InvalidAccessResponse,
         error.StoreUnavailable,
         error.InheritedSocketOverride,
         => 4,
@@ -1172,6 +1509,11 @@ fn printHelp(io: std.Io, stderr: bool) !void {
         \\  verde-daemon workspace show --workspace ID [--data-dir PATH] [--json]
         \\  verde-daemon workspace bind --workspace ID --label LABEL --root PATH [--data-dir PATH] [--json]
         \\  verde-daemon workspace repository bind --workspace ID --repository ID --label LABEL --root PATH [options]
+        \\  verde-daemon pair create [--expires 10m] [--label TEXT] [--scope SCOPE]... [--data-dir PATH] [--json]
+        \\  verde-daemon pair list [--data-dir PATH] [--json]
+        \\  verde-daemon pair revoke --id ID [--data-dir PATH] [--json]
+        \\  verde-daemon device list [--data-dir PATH] [--json]
+        \\  verde-daemon device revoke --id ID [--data-dir PATH] [--json]
         \\  verde-daemon notify --status STATUS [options]
         \\  verde-daemon version [--json]
         \\  verde-daemon --help
@@ -1186,6 +1528,9 @@ fn printHelp(io: std.Io, stderr: bool) !void {
         \\Notify accepts that inherited endpoint only inside a Verde-owned terminal;
         \\otherwise notify requires an explicit --data-dir.
         \\Workspace commands require a running daemon; binding requires an existing checkout.
+        \\Pair/device commands require a running daemon. A created pairing token is
+        \\printed exactly once; store it as a secret. Omitting --scope grants the
+        \\documented single-user default scope set. Expiry accepts s, m, or h (max 1h).
         \\Repository bind options: --vcs-identity URL, --default-branch NAME,
         \\--default, --data-dir PATH, and --json. No checkout data is modified.
         \\
@@ -1232,6 +1577,18 @@ fn writeStdout(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
     try writer.interface.print(fmt, args);
 }
 
+/// Write an explicitly secret-bearing one-time result and clear the complete
+/// staging buffer after flush. Ordinary output must continue through
+/// `writeStdout` so secret output remains an auditable boundary.
+fn writeSensitiveStdout(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
+    const stdout_file = std.Io.File.stdout();
+    var buffer: [16 * 1024]u8 = undefined;
+    defer std.crypto.secureZero(u8, buffer[0..]);
+    var writer = stdout_file.writerStreaming(io, &buffer);
+    try writer.interface.print(fmt, args);
+    try writer.interface.flush();
+}
+
 fn writeStderr(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
     const stderr_file = std.Io.File.stderr();
     var buffer: [4 * 1024]u8 = undefined;
@@ -1257,6 +1614,38 @@ test "daemon CLI parses every public command" {
     const provider_options = try parseArgs(&.{ "verde-daemon", "providers", "status", "--json" });
     try std.testing.expectEqual(Command.providers_status, provider_options.command);
     try std.testing.expect(provider_options.json);
+
+    const pair_create = try parseArgs(&.{
+        "verde-daemon",
+        "pair",
+        "create",
+        "--expires",
+        "10m",
+        "--label",
+        "Laptop",
+        "--scope",
+        "runtime:read",
+        "--scope",
+        "chat:write",
+        "--json",
+    });
+    try std.testing.expectEqual(Command.pair_create, pair_create.command);
+    try std.testing.expectEqual(@as(u32, 600), pair_create.pair.ttl_seconds);
+    try std.testing.expectEqualStrings("Laptop", pair_create.pair.label.?);
+    try std.testing.expectEqual(@as(usize, 2), pair_create.pair.scope_count);
+    try std.testing.expect(pair_create.json);
+
+    const grant_id = "0123456789abcdef0123456789abcdef";
+    const pair_revoke = try parseArgs(&.{ "verde-daemon", "pair", "revoke", "--id", grant_id });
+    try std.testing.expectEqual(Command.pair_revoke, pair_revoke.command);
+    try std.testing.expectEqualStrings(grant_id, pair_revoke.pair.id.?);
+    try std.testing.expectEqual(Command.pair_list, (try parseArgs(&.{ "verde-daemon", "pair", "list" })).command);
+
+    const device_id = "fedcba9876543210fedcba9876543210";
+    const device_revoke = try parseArgs(&.{ "verde-daemon", "device", "revoke", "--id", device_id });
+    try std.testing.expectEqual(Command.device_revoke, device_revoke.command);
+    try std.testing.expectEqualStrings(device_id, device_revoke.pair.id.?);
+    try std.testing.expectEqual(Command.device_list, (try parseArgs(&.{ "verde-daemon", "device", "list" })).command);
 
     const workspace_show = try parseArgs(&.{
         "verde-daemon",
@@ -1336,6 +1725,8 @@ test "daemon CLI rejects ambiguous or unsupported options" {
     try std.testing.expectError(error.MissingDataDir, parseArgs(&.{ "verde-daemon", "init", "--data-dir" }));
     try std.testing.expectError(error.MissingProvidersCommand, parseArgs(&.{ "verde-daemon", "providers" }));
     try std.testing.expectError(error.MissingWorkspaceCommand, parseArgs(&.{ "verde-daemon", "workspace" }));
+    try std.testing.expectError(error.MissingPairCommand, parseArgs(&.{ "verde-daemon", "pair" }));
+    try std.testing.expectError(error.MissingDeviceCommand, parseArgs(&.{ "verde-daemon", "device" }));
     try std.testing.expectError(
         error.InvalidArguments,
         parseArgs(&.{ "verde-daemon", "workspace", "show", "--label", "No workspace" }),
@@ -1363,6 +1754,26 @@ test "daemon CLI rejects ambiguous or unsupported options" {
     );
     try std.testing.expectError(error.JsonUnavailable, parseArgs(&.{ "verde-daemon", "serve", "--json" }));
     try std.testing.expectError(error.InvalidArguments, parseArgs(&.{ "verde-daemon", "status", "--wat" }));
+    try std.testing.expectError(
+        error.InvalidArguments,
+        parseArgs(&.{ "verde-daemon", "pair", "create", "--expires", "61m" }),
+    );
+    try std.testing.expectError(
+        error.InvalidArguments,
+        parseArgs(&.{
+            "verde-daemon",
+            "pair",
+            "create",
+            "--scope",
+            "runtime:read",
+            "--scope",
+            "runtime:read",
+        }),
+    );
+    try std.testing.expectError(
+        error.InvalidArguments,
+        parseArgs(&.{ "verde-daemon", "pair", "revoke", "--id", "not-an-id" }),
+    );
     try std.testing.expectError(
         error.MissingOptionValue,
         parseArgs(&.{ "verde-daemon", "notify", "--status" }),

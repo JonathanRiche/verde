@@ -323,7 +323,10 @@ fn handleUnixClient(
         options.timeout_ms,
     ) catch return;
     const response = callbacks.handle_request(callbacks.context, request) catch return;
-    defer allocator.free(response);
+    defer {
+        std.crypto.secureZero(u8, response);
+        allocator.free(response);
+    }
     const response_to_write = if (response.len <= options.max_response_bytes)
         response
     else
@@ -405,8 +408,12 @@ fn readUnixLineAllocWithDeadline(
     deadline: u64,
 ) ![]u8 {
     var bytes: std.ArrayList(u8) = .empty;
-    errdefer bytes.deinit(allocator);
+    errdefer {
+        std.crypto.secureZero(u8, bytes.items);
+        bytes.deinit(allocator);
+    }
     var buffer: [4096]u8 = undefined;
+    defer std.crypto.secureZero(u8, buffer[0..]);
 
     while (bytes.items.len <= max_bytes) {
         const remaining_ms = remainingTimeoutMs(deadline) orelse return error.ConnectionTimedOut;
@@ -744,7 +751,10 @@ fn servePipeInstanceLoop(
 
         const request = readWindowsLineAlloc(allocator, pipe.*, options) catch continue;
         const response = callbacks.handle_request(callbacks.context, request) catch continue;
-        defer allocator.free(response);
+        defer {
+            std.crypto.secureZero(u8, response);
+            allocator.free(response);
+        }
         const response_to_write = if (response.len <= options.max_response_bytes)
             response
         else
@@ -997,8 +1007,12 @@ fn readWindowsLineAllocWithDeadline(
     deadline: u64,
 ) ![]u8 {
     var bytes: std.ArrayList(u8) = .empty;
-    errdefer bytes.deinit(allocator);
+    errdefer {
+        std.crypto.secureZero(u8, bytes.items);
+        bytes.deinit(allocator);
+    }
     var buffer: [4096]u8 = undefined;
+    defer std.crypto.secureZero(u8, buffer[0..]);
 
     while (bytes.items.len <= max_message_bytes) {
         const read_len = try readWindows(pipe, &buffer, deadline);

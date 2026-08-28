@@ -72,6 +72,7 @@ pub const TokenVerifier = struct {
         if (stat.size > TOKEN_MAX_BYTES) return error.TokenTooLong;
 
         var read_buffer: [1024]u8 = undefined;
+        defer std.crypto.secureZero(u8, read_buffer[0..]);
         var reader = file.reader(io, &read_buffer);
         const raw = reader.interface.allocRemaining(
             allocator,
@@ -319,6 +320,26 @@ pub const LoginRateLimiter = struct {
         std.crypto.secureZero(Bucket, self.buckets[0..]);
     }
 
+    /// Reject an already blocked client before an expensive credential check.
+    /// A full table also fails closed for an unseen client.
+    pub fn preflight(
+        self: *LoginRateLimiter,
+        io: std.Io,
+        client_key: []const u8,
+        now_ms: i64,
+    ) !RateLimitDecision {
+        var client_digest = digestSecret(client_key);
+        defer std.crypto.secureZero(u8, client_digest[0..]);
+
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+        self.pruneLocked(now_ms);
+        if (self.findBucket(client_digest)) |bucket| {
+            return if (bucket.blocked_until_ms > now_ms) .rate_limited else .allowed;
+        }
+        return if (self.availableBucket() == null) .rate_limited else .allowed;
+    }
+
     /// Records one token comparison result. A successful credential clears a
     /// non-blocked bucket; a credential cannot bypass an existing block.
     pub fn recordAttempt(
@@ -402,11 +423,244 @@ pub const LoginResult = union(enum) {
     rate_limited,
 };
 
+pub const PAIR_TOKEN_ENTROPY_BYTES: usize = 32;
+pub const PAIR_TOKEN_BYTES: usize = PAIR_TOKEN_ENTROPY_BYTES * 2;
+pub const MAX_ACCESS_TOKENS: usize = 256;
+pub const MAX_WEBSOCKET_TICKETS: usize = 256;
+pub const DEFAULT_ACCESS_TOKEN_TTL_MS: i64 = 15 * 60 * 1000;
+pub const DEFAULT_WEBSOCKET_TICKET_TTL_MS: i64 = 30 * 1000;
+
+pub const PairClaims = struct {
+    device_id: [32]u8,
+    scope_mask: u16,
+    deadline_ms: i64,
+
+    pub fn clear(self: *PairClaims) void {
+        std.crypto.secureZero(u8, self.device_id[0..]);
+        self.* = undefined;
+    }
+};
+
+pub const IssuedPairCredential = struct {
+    value: [PAIR_TOKEN_BYTES]u8,
+    /// Unix timestamp returned on the wire. Validation uses the separate
+    /// monotonic deadline retained only in the verifier entry.
+    expires_at_ms: i64,
+
+    pub fn clear(self: *IssuedPairCredential) void {
+        std.crypto.secureZero(u8, self.value[0..]);
+        self.* = undefined;
+    }
+};
+
+pub const PairCredentialOptions = struct {
+    max_access_tokens: usize = MAX_ACCESS_TOKENS,
+    max_websocket_tickets: usize = MAX_WEBSOCKET_TICKETS,
+    access_token_ttl_ms: i64 = DEFAULT_ACCESS_TOKEN_TTL_MS,
+    websocket_ticket_ttl_ms: i64 = DEFAULT_WEBSOCKET_TICKET_TTL_MS,
+};
+
+/// Bounded verifier-only storage for short-lived access tokens and one-use
+/// WebSocket tickets. Raw bearer values exist only in the returned structs.
+pub const PairCredentialManager = struct {
+    const AccessEntry = struct {
+        active: bool = false,
+        digest: Digest = @splat(0),
+        claims: PairClaims = .{
+            .device_id = @splat(0),
+            .scope_mask = 0,
+            .deadline_ms = 0,
+        },
+    };
+    const TicketEntry = AccessEntry;
+
+    mutex: std.Io.Mutex = .init,
+    access_entries: [MAX_ACCESS_TOKENS]AccessEntry = [_]AccessEntry{.{}} ** MAX_ACCESS_TOKENS,
+    ticket_entries: [MAX_WEBSOCKET_TICKETS]TicketEntry = [_]TicketEntry{.{}} ** MAX_WEBSOCKET_TICKETS,
+    options: PairCredentialOptions,
+
+    pub fn init(options: PairCredentialOptions) !PairCredentialManager {
+        if (options.max_access_tokens == 0 or options.max_access_tokens > MAX_ACCESS_TOKENS or
+            options.max_websocket_tickets == 0 or options.max_websocket_tickets > MAX_WEBSOCKET_TICKETS)
+        {
+            return error.InvalidPairCredentialLimit;
+        }
+        if (options.access_token_ttl_ms <= 0 or options.websocket_ticket_ttl_ms <= 0) {
+            return error.InvalidPairCredentialTtl;
+        }
+        return .{ .options = options };
+    }
+
+    pub fn deinit(self: *PairCredentialManager) void {
+        std.crypto.secureZero(AccessEntry, self.access_entries[0..]);
+        std.crypto.secureZero(TicketEntry, self.ticket_entries[0..]);
+    }
+
+    pub fn issueAccessToken(
+        self: *PairCredentialManager,
+        io: std.Io,
+        device_id: []const u8,
+        scope_mask: u16,
+        now_ms: i64,
+        unix_now_ms: i64,
+    ) !IssuedPairCredential {
+        if (device_id.len != 32 or scope_mask == 0 or now_ms < 0 or unix_now_ms < 0) {
+            return error.InvalidPairClaims;
+        }
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+        self.pruneLocked(now_ms);
+        const entries = self.access_entries[0..self.options.max_access_tokens];
+        const slot = entryForDevice(entries, device_id) orelse availableEntry(entries) orelse
+            return error.TooManyAccessTokens;
+        const deadline_ms = saturatingAdd(now_ms, self.options.access_token_ttl_ms);
+        const expires_at_ms = saturatingAdd(unix_now_ms, self.options.access_token_ttl_ms);
+        return self.issueLocked(io, slot, device_id, scope_mask, deadline_ms, expires_at_ms);
+    }
+
+    pub fn validateAccessToken(
+        self: *PairCredentialManager,
+        io: std.Io,
+        presented: []const u8,
+        now_ms: i64,
+    ) !?PairClaims {
+        if (presented.len != PAIR_TOKEN_BYTES or now_ms < 0) return null;
+        var candidate = digestSecret(presented);
+        defer std.crypto.secureZero(u8, candidate[0..]);
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+        self.pruneLocked(now_ms);
+        return findClaims(self.access_entries[0..self.options.max_access_tokens], candidate);
+    }
+
+    pub fn issueWebSocketTicket(
+        self: *PairCredentialManager,
+        io: std.Io,
+        claims: PairClaims,
+        now_ms: i64,
+        unix_now_ms: i64,
+    ) !IssuedPairCredential {
+        if (claims.scope_mask == 0 or claims.deadline_ms <= now_ms or now_ms < 0 or unix_now_ms < 0) {
+            return error.InvalidPairClaims;
+        }
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+        self.pruneLocked(now_ms);
+        const entries = self.ticket_entries[0..self.options.max_websocket_tickets];
+        const slot = entryForDevice(entries, claims.device_id[0..]) orelse availableEntry(entries) orelse
+            return error.TooManyWebSocketTickets;
+        const ticket_deadline = @min(
+            claims.deadline_ms,
+            saturatingAdd(now_ms, self.options.websocket_ticket_ttl_ms),
+        );
+        const expires_at_ms = saturatingAdd(unix_now_ms, ticket_deadline - now_ms);
+        return self.issueLocked(
+            io,
+            slot,
+            claims.device_id[0..],
+            claims.scope_mask,
+            ticket_deadline,
+            expires_at_ms,
+        );
+    }
+
+    /// Atomically validate and erase a WebSocket ticket. Concurrent callers
+    /// cannot both observe the same ticket as active.
+    pub fn consumeWebSocketTicket(
+        self: *PairCredentialManager,
+        io: std.Io,
+        presented: []const u8,
+        now_ms: i64,
+    ) !?PairClaims {
+        if (presented.len != PAIR_TOKEN_BYTES or now_ms < 0) return null;
+        var candidate = digestSecret(presented);
+        defer std.crypto.secureZero(u8, candidate[0..]);
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+        self.pruneLocked(now_ms);
+        for (self.ticket_entries[0..self.options.max_websocket_tickets]) |*entry| {
+            if (!entry.active or !std.crypto.timing_safe.eql(Digest, entry.digest, candidate)) continue;
+            const claims = entry.claims;
+            clearPairEntry(entry);
+            return claims;
+        }
+        return null;
+    }
+
+    /// Erase every short-lived credential for a device after durable
+    /// authorization reports that the device is no longer accepted.
+    pub fn clearDeviceCredentials(
+        self: *PairCredentialManager,
+        io: std.Io,
+        device_id: []const u8,
+    ) !void {
+        if (device_id.len != 32) return error.InvalidPairClaims;
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+        clearDeviceEntries(self.access_entries[0..self.options.max_access_tokens], device_id);
+        clearDeviceEntries(self.ticket_entries[0..self.options.max_websocket_tickets], device_id);
+    }
+
+    fn issueLocked(
+        self: *PairCredentialManager,
+        io: std.Io,
+        slot: *AccessEntry,
+        device_id: []const u8,
+        scope_mask: u16,
+        deadline_ms: i64,
+        expires_at_ms: i64,
+    ) !IssuedPairCredential {
+        var entropy: [PAIR_TOKEN_ENTROPY_BYTES]u8 = undefined;
+        defer std.crypto.secureZero(u8, entropy[0..]);
+        var attempt: u8 = 0;
+        while (attempt < 4) : (attempt += 1) {
+            try std.Io.randomSecure(io, entropy[0..]);
+            var issued: IssuedPairCredential = .{
+                .value = std.fmt.bytesToHex(entropy, .lower),
+                .expires_at_ms = expires_at_ms,
+            };
+            const candidate = digestSecret(issued.value[0..]);
+            if (findClaims(self.access_entries[0..self.options.max_access_tokens], candidate) != null or
+                findClaims(self.ticket_entries[0..self.options.max_websocket_tickets], candidate) != null)
+            {
+                issued.clear();
+                continue;
+            }
+            var copied_id: [32]u8 = undefined;
+            @memcpy(copied_id[0..], device_id);
+            slot.* = .{
+                .active = true,
+                .digest = candidate,
+                .claims = .{
+                    .device_id = copied_id,
+                    .scope_mask = scope_mask,
+                    .deadline_ms = deadline_ms,
+                },
+            };
+            return issued;
+        }
+        return error.RandomCollision;
+    }
+
+    fn pruneLocked(self: *PairCredentialManager, now_ms: i64) void {
+        for (self.access_entries[0..self.options.max_access_tokens]) |*entry| {
+            if (entry.active and entry.claims.deadline_ms <= now_ms) clearPairEntry(entry);
+        }
+        for (self.ticket_entries[0..self.options.max_websocket_tickets]) |*entry| {
+            if (entry.active and entry.claims.deadline_ms <= now_ms) clearPairEntry(entry);
+        }
+    }
+};
+
 /// Thread-safe authentication facade intended for the HTTP gateway owner.
 pub const Service = struct {
     token: TokenVerifier,
     sessions: SessionManager,
     rate_limiter: LoginRateLimiter,
+    pair_rate_limiter: LoginRateLimiter,
+    device_rate_limiter: LoginRateLimiter,
+    ticket_rate_limiter: LoginRateLimiter,
+    pair_credentials: PairCredentialManager,
 
     pub fn initFromTokenFile(
         allocator: std.mem.Allocator,
@@ -423,10 +677,18 @@ pub const Service = struct {
             .token = token,
             .sessions = sessions,
             .rate_limiter = try LoginRateLimiter.init(rate_limit_options),
+            .pair_rate_limiter = try LoginRateLimiter.init(rate_limit_options),
+            .device_rate_limiter = try LoginRateLimiter.init(rate_limit_options),
+            .ticket_rate_limiter = try LoginRateLimiter.init(rate_limit_options),
+            .pair_credentials = try PairCredentialManager.init(.{}),
         };
     }
 
     pub fn deinit(self: *Service) void {
+        self.pair_credentials.deinit();
+        self.ticket_rate_limiter.deinit();
+        self.device_rate_limiter.deinit();
+        self.pair_rate_limiter.deinit();
         self.rate_limiter.deinit();
         self.sessions.deinit();
         self.token.deinit();
@@ -462,6 +724,48 @@ pub const Service = struct {
     pub fn logout(self: *Service, io: std.Io, session_id: []const u8) !bool {
         return self.sessions.revoke(io, session_id);
     }
+
+    pub fn pairPreflight(self: *Service, io: std.Io, client_key: []const u8, now_ms: i64) !RateLimitDecision {
+        return self.pair_rate_limiter.preflight(io, client_key, now_ms);
+    }
+
+    pub fn recordPairAttempt(
+        self: *Service,
+        io: std.Io,
+        client_key: []const u8,
+        credential_valid: bool,
+        now_ms: i64,
+    ) !RateLimitDecision {
+        return self.pair_rate_limiter.recordAttempt(io, client_key, credential_valid, now_ms);
+    }
+
+    pub fn devicePreflight(self: *Service, io: std.Io, client_key: []const u8, now_ms: i64) !RateLimitDecision {
+        return self.device_rate_limiter.preflight(io, client_key, now_ms);
+    }
+
+    pub fn recordDeviceAttempt(
+        self: *Service,
+        io: std.Io,
+        client_key: []const u8,
+        credential_valid: bool,
+        now_ms: i64,
+    ) !RateLimitDecision {
+        return self.device_rate_limiter.recordAttempt(io, client_key, credential_valid, now_ms);
+    }
+
+    pub fn ticketPreflight(self: *Service, io: std.Io, client_key: []const u8, now_ms: i64) !RateLimitDecision {
+        return self.ticket_rate_limiter.preflight(io, client_key, now_ms);
+    }
+
+    pub fn recordTicketAttempt(
+        self: *Service,
+        io: std.Io,
+        client_key: []const u8,
+        credential_valid: bool,
+        now_ms: i64,
+    ) !RateLimitDecision {
+        return self.ticket_rate_limiter.recordAttempt(io, client_key, credential_valid, now_ms);
+    }
 };
 
 /// Formats cookie metadata for the SSH-loopback release. `Secure` is omitted
@@ -487,6 +791,10 @@ pub fn nowMillis(io: std.Io) i64 {
     return std.Io.Clock.awake.now(io).toMilliseconds();
 }
 
+pub fn unixNowMillis(io: std.Io) i64 {
+    return std.Io.Clock.real.now(io).toMilliseconds();
+}
+
 fn validateToken(token: []const u8) !void {
     if (token.len < TOKEN_MIN_BYTES) return error.WeakToken;
     if (token.len > TOKEN_MAX_BYTES) return error.TokenTooLong;
@@ -509,6 +817,48 @@ fn clearEntry(entry: *SessionManager.Entry) void {
 fn clearBucket(bucket: *LoginRateLimiter.Bucket) void {
     std.crypto.secureZero(u8, bucket.client_digest[0..]);
     bucket.* = .{};
+}
+
+fn availableEntry(entries: []PairCredentialManager.AccessEntry) ?*PairCredentialManager.AccessEntry {
+    for (entries) |*entry| if (!entry.active) return entry;
+    return null;
+}
+
+fn entryForDevice(
+    entries: []PairCredentialManager.AccessEntry,
+    device_id: []const u8,
+) ?*PairCredentialManager.AccessEntry {
+    for (entries) |*entry| {
+        if (entry.active and std.mem.eql(u8, entry.claims.device_id[0..], device_id)) return entry;
+    }
+    return null;
+}
+
+fn clearDeviceEntries(entries: []PairCredentialManager.AccessEntry, device_id: []const u8) void {
+    for (entries) |*entry| {
+        if (entry.active and std.mem.eql(u8, entry.claims.device_id[0..], device_id)) {
+            clearPairEntry(entry);
+        }
+    }
+}
+
+fn findClaims(
+    entries: []const PairCredentialManager.AccessEntry,
+    candidate: Digest,
+) ?PairClaims {
+    var result: ?PairClaims = null;
+    for (entries) |entry| {
+        if (entry.active and std.crypto.timing_safe.eql(Digest, entry.digest, candidate)) {
+            result = entry.claims;
+        }
+    }
+    return result;
+}
+
+fn clearPairEntry(entry: *PairCredentialManager.AccessEntry) void {
+    std.crypto.secureZero(u8, entry.digest[0..]);
+    entry.claims.clear();
+    entry.* = .{};
 }
 
 fn saturatingAdd(left: i64, right: i64) i64 {
@@ -683,4 +1033,268 @@ test "failed logins are rate limited for a bounded window" {
         RateLimitDecision.allowed,
         try limiter.recordAttempt(std.testing.io, "client-a", true, 1_501),
     );
+}
+
+test "pair rate limiter rejects blocked clients before credential work" {
+    var limiter = try LoginRateLimiter.init(.{
+        .max_clients = 1,
+        .max_failures = 1,
+        .window_ms = 100,
+        .block_ms = 500,
+    });
+    defer limiter.deinit();
+    try std.testing.expectEqual(
+        RateLimitDecision.allowed,
+        try limiter.preflight(std.testing.io, "client-a", 1_000),
+    );
+    _ = try limiter.recordAttempt(std.testing.io, "client-a", false, 1_000);
+    try std.testing.expectEqual(
+        RateLimitDecision.rate_limited,
+        try limiter.preflight(std.testing.io, "client-a", 1_001),
+    );
+    try std.testing.expectEqual(
+        RateLimitDecision.rate_limited,
+        try limiter.preflight(std.testing.io, "unseen-full-table", 1_001),
+    );
+    try std.testing.expectEqual(
+        RateLimitDecision.allowed,
+        try limiter.preflight(std.testing.io, "client-a", 1_500),
+    );
+}
+
+test "credential rate limiters are independent and success clears a bucket" {
+    const options: RateLimitOptions = .{
+        .max_clients = 1,
+        .max_failures = 1,
+        .window_ms = 100,
+        .block_ms = 500,
+    };
+    var device_limiter = try LoginRateLimiter.init(options);
+    defer device_limiter.deinit();
+    var ticket_limiter = try LoginRateLimiter.init(options);
+    defer ticket_limiter.deinit();
+
+    _ = try device_limiter.recordAttempt(std.testing.io, "client-a", false, 1_000);
+    try std.testing.expectEqual(
+        RateLimitDecision.rate_limited,
+        try device_limiter.preflight(std.testing.io, "client-a", 1_001),
+    );
+    try std.testing.expectEqual(
+        RateLimitDecision.allowed,
+        try ticket_limiter.preflight(std.testing.io, "client-a", 1_001),
+    );
+    _ = try ticket_limiter.recordAttempt(std.testing.io, "client-a", false, 1_001);
+    try std.testing.expectEqual(
+        RateLimitDecision.allowed,
+        try ticket_limiter.recordAttempt(std.testing.io, "client-a", true, 1_501),
+    );
+    try std.testing.expectEqual(
+        RateLimitDecision.allowed,
+        try ticket_limiter.preflight(std.testing.io, "client-a", 1_502),
+    );
+}
+
+test "pair access tokens expire and WebSocket tickets are one use" {
+    var manager = try PairCredentialManager.init(.{
+        .max_access_tokens = 2,
+        .max_websocket_tickets = 2,
+        .access_token_ttl_ms = 100,
+        .websocket_ticket_ttl_ms = 10,
+    });
+    defer manager.deinit();
+    const device_id = "0123456789abcdef0123456789abcdef";
+    var access_token = try manager.issueAccessToken(std.testing.io, device_id, 5, 1_000, 10_000);
+    defer access_token.clear();
+    try std.testing.expectEqual(@as(usize, PAIR_TOKEN_BYTES), access_token.value.len);
+    try std.testing.expectEqual(@as(i64, 10_100), access_token.expires_at_ms);
+    var claims = (try manager.validateAccessToken(
+        std.testing.io,
+        access_token.value[0..],
+        1_099,
+    )).?;
+    defer claims.clear();
+    try std.testing.expectEqualStrings(device_id, claims.device_id[0..]);
+    try std.testing.expectEqual(@as(u16, 5), claims.scope_mask);
+    try std.testing.expect((try manager.validateAccessToken(
+        std.testing.io,
+        access_token.value[0..],
+        1_100,
+    )) == null);
+
+    claims.deadline_ms = 1_200;
+    var ticket = try manager.issueWebSocketTicket(std.testing.io, claims, 1_100, 10_100);
+    defer ticket.clear();
+    try std.testing.expectEqual(@as(i64, 10_110), ticket.expires_at_ms);
+    var consumed = (try manager.consumeWebSocketTicket(
+        std.testing.io,
+        ticket.value[0..],
+        1_109,
+    )).?;
+    defer consumed.clear();
+    try std.testing.expect((try manager.consumeWebSocketTicket(
+        std.testing.io,
+        ticket.value[0..],
+        1_109,
+    )) == null);
+}
+
+test "Pair credentials replace per device without consuming another device capacity" {
+    var manager = try PairCredentialManager.init(.{
+        .max_access_tokens = 2,
+        .max_websocket_tickets = 2,
+        .access_token_ttl_ms = 1_000,
+        .websocket_ticket_ttl_ms = 100,
+    });
+    defer manager.deinit();
+    const device_a = "0123456789abcdef0123456789abcdef";
+    const device_b = "fedcba9876543210fedcba9876543210";
+
+    var access_a1 = try manager.issueAccessToken(std.testing.io, device_a, 1, 1_000, 10_000);
+    defer access_a1.clear();
+    var access_a2 = try manager.issueAccessToken(std.testing.io, device_a, 1, 1_001, 10_001);
+    defer access_a2.clear();
+    var access_a3 = try manager.issueAccessToken(std.testing.io, device_a, 1, 1_002, 10_002);
+    defer access_a3.clear();
+    try std.testing.expect((try manager.validateAccessToken(std.testing.io, access_a1.value[0..], 1_003)) == null);
+    try std.testing.expect((try manager.validateAccessToken(std.testing.io, access_a2.value[0..], 1_003)) == null);
+    var claims_a = (try manager.validateAccessToken(std.testing.io, access_a3.value[0..], 1_003)).?;
+    defer claims_a.clear();
+
+    var access_b = try manager.issueAccessToken(std.testing.io, device_b, 2, 1_003, 10_003);
+    defer access_b.clear();
+    var claims_b = (try manager.validateAccessToken(std.testing.io, access_b.value[0..], 1_004)).?;
+    defer claims_b.clear();
+
+    var ticket_a1 = try manager.issueWebSocketTicket(std.testing.io, claims_a, 1_004, 10_004);
+    defer ticket_a1.clear();
+    var ticket_a2 = try manager.issueWebSocketTicket(std.testing.io, claims_a, 1_005, 10_005);
+    defer ticket_a2.clear();
+    var ticket_a3 = try manager.issueWebSocketTicket(std.testing.io, claims_a, 1_006, 10_006);
+    defer ticket_a3.clear();
+    try std.testing.expect((try manager.consumeWebSocketTicket(std.testing.io, ticket_a1.value[0..], 1_007)) == null);
+    try std.testing.expect((try manager.consumeWebSocketTicket(std.testing.io, ticket_a2.value[0..], 1_007)) == null);
+
+    var ticket_b = try manager.issueWebSocketTicket(std.testing.io, claims_b, 1_007, 10_007);
+    defer ticket_b.clear();
+    try manager.clearDeviceCredentials(std.testing.io, device_a);
+    try std.testing.expect((try manager.validateAccessToken(std.testing.io, access_a3.value[0..], 1_008)) == null);
+    try std.testing.expect((try manager.consumeWebSocketTicket(std.testing.io, ticket_a3.value[0..], 1_008)) == null);
+
+    var surviving_b = (try manager.validateAccessToken(std.testing.io, access_b.value[0..], 1_008)).?;
+    defer surviving_b.clear();
+    try std.testing.expectEqualStrings(device_b, surviving_b.device_id[0..]);
+    var consumed_b = (try manager.consumeWebSocketTicket(std.testing.io, ticket_b.value[0..], 1_008)).?;
+    defer consumed_b.clear();
+    try std.testing.expectEqualStrings(device_b, consumed_b.device_id[0..]);
+}
+
+test "concurrent access-token issuance leaves one live credential per device" {
+    var manager = try PairCredentialManager.init(.{
+        .max_access_tokens = 1,
+        .max_websocket_tickets = 1,
+    });
+    defer manager.deinit();
+    const device_id = "0123456789abcdef0123456789abcdef";
+
+    const Race = struct {
+        manager: *PairCredentialManager,
+        device_id: []const u8,
+        ready: *std.atomic.Value(u8),
+        start: *std.atomic.Value(bool),
+        issued: ?IssuedPairCredential = null,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var threaded = std.Io.Threaded.init_single_threaded;
+            _ = self.ready.fetchAdd(1, .release);
+            while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+            self.issued = self.manager.issueAccessToken(
+                threaded.io(),
+                self.device_id,
+                1,
+                1_000,
+                10_000,
+            ) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+    var ready: std.atomic.Value(u8) = .init(0);
+    var start: std.atomic.Value(bool) = .init(false);
+    var first: Race = .{ .manager = &manager, .device_id = device_id, .ready = &ready, .start = &start };
+    var second: Race = .{ .manager = &manager, .device_id = device_id, .ready = &ready, .start = &start };
+    const first_thread = try std.Thread.spawn(.{}, Race.run, .{&first});
+    const second_thread = try std.Thread.spawn(.{}, Race.run, .{&second});
+    while (ready.load(.acquire) != 2) std.atomic.spinLoopHint();
+    start.store(true, .release);
+    first_thread.join();
+    second_thread.join();
+    if (first.failure) |err| return err;
+    if (second.failure) |err| return err;
+    defer if (first.issued) |*issued| issued.clear();
+    defer if (second.issued) |*issued| issued.clear();
+
+    var first_claims = try manager.validateAccessToken(std.testing.io, first.issued.?.value[0..], 1_001);
+    defer if (first_claims) |*claims| claims.clear();
+    var second_claims = try manager.validateAccessToken(std.testing.io, second.issued.?.value[0..], 1_001);
+    defer if (second_claims) |*claims| claims.clear();
+    try std.testing.expect((first_claims != null) != (second_claims != null));
+}
+
+test "concurrent WebSocket ticket replay has exactly one winner" {
+    var manager = try PairCredentialManager.init(.{
+        .max_access_tokens = 1,
+        .max_websocket_tickets = 1,
+    });
+    defer manager.deinit();
+    var claims: PairClaims = .{
+        .device_id = "0123456789abcdef0123456789abcdef".*,
+        .scope_mask = 1,
+        .deadline_ms = 10_000,
+    };
+    defer claims.clear();
+    var ticket = try manager.issueWebSocketTicket(std.testing.io, claims, 1_000, 10_000);
+    defer ticket.clear();
+
+    const Race = struct {
+        manager: *PairCredentialManager,
+        ticket: *const [PAIR_TOKEN_BYTES]u8,
+        ready: *std.atomic.Value(u8),
+        start: *std.atomic.Value(bool),
+        consumed: bool = false,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var threaded = std.Io.Threaded.init_single_threaded;
+            _ = self.ready.fetchAdd(1, .release);
+            while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+            const result = self.manager.consumeWebSocketTicket(
+                threaded.io(),
+                self.ticket[0..],
+                1_001,
+            ) catch |err| {
+                self.failure = err;
+                return;
+            };
+            if (result) |claims_value| {
+                var owned = claims_value;
+                owned.clear();
+                self.consumed = true;
+            }
+        }
+    };
+    var ready: std.atomic.Value(u8) = .init(0);
+    var start: std.atomic.Value(bool) = .init(false);
+    var first: Race = .{ .manager = &manager, .ticket = &ticket.value, .ready = &ready, .start = &start };
+    var second: Race = .{ .manager = &manager, .ticket = &ticket.value, .ready = &ready, .start = &start };
+    const first_thread = try std.Thread.spawn(.{}, Race.run, .{&first});
+    const second_thread = try std.Thread.spawn(.{}, Race.run, .{&second});
+    while (ready.load(.acquire) != 2) std.atomic.spinLoopHint();
+    start.store(true, .release);
+    first_thread.join();
+    second_thread.join();
+    if (first.failure) |err| return err;
+    if (second.failure) |err| return err;
+    try std.testing.expect(first.consumed != second.consumed);
 }

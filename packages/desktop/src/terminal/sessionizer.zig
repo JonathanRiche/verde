@@ -15,6 +15,7 @@ const chat_threads = @import("../chat/threads.zig");
 const db_types = @import("../db/types.zig");
 const process_registry = @import("../daemon/process_registry.zig");
 const repository_path = @import("../daemon/repository_path.zig");
+const access_store = @import("../daemon/access_store.zig");
 const daemon_store = @import("../daemon/store.zig");
 const daemon_runtime_identity = @import("../daemon/runtime_identity.zig");
 const mcp_http = @import("../mcp/http_server.zig");
@@ -35,6 +36,7 @@ extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 const log = std.log.scoped(.sessionizer);
 const store_protocol = headless.store;
 const changes_protocol = headless.changes_protocol;
+const access_protocol = headless.access_protocol;
 const change_journal = @import("../daemon/change_journal.zig");
 
 pub const SOCKET_NAME = "verde-sessionizer.sock";
@@ -183,6 +185,37 @@ const StoreService = struct {
     /// Read-side pointer borrows that must outlive service detachment/deinit.
     lifetime_pins: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     draining: bool = false, // set by prepare-shutdown in S3
+};
+
+const AccessRequest = union(enum) {
+    pairing_create: access_protocol.PairingGrantCreateRequest,
+    pairing_list: access_protocol.PairingGrantListRequest,
+    pairing_revoke: access_protocol.PairingGrantRevokeRequest,
+    device_list: access_protocol.DeviceListRequest,
+    device_revoke: access_protocol.DeviceRevokeRequest,
+    pairing_exchange: access_protocol.PairingGrantExchangeRequest,
+    device_authenticate: access_protocol.DeviceAuthenticateRequest,
+    device_authorize: access_protocol.DeviceAuthorizeRequest,
+
+    fn protocolVersion(self: AccessRequest) u32 {
+        return switch (self) {
+            inline else => |request| request.access_protocol_version,
+        };
+    }
+
+    fn clearSecrets(self: AccessRequest) void {
+        switch (self) {
+            .pairing_exchange => |request| std.crypto.secureZero(
+                u8,
+                @constCast(request.pairing_token.reveal()),
+            ),
+            .device_authenticate => |request| std.crypto.secureZero(
+                u8,
+                @constCast(request.device_credential.reveal()),
+            ),
+            else => {},
+        }
+    }
 };
 
 fn lockStoreService(service: *StoreService) void {
@@ -2653,16 +2686,27 @@ pub const Daemon = struct {
     }
 
     fn handleRequest(self: *Daemon, request_json: []const u8) ![]u8 {
-        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, request_json, .{});
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, request_json, .{}) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            // Duplicate fields are ambiguous before typed params decoding and
+            // must never collapse into a last-value-wins security request.
+            return try errorResponseAlloc(
+                self.allocator,
+                .null,
+                headless.protocol.ERR_INVALID_REQUEST,
+                "malformed or duplicate request fields",
+            );
+        };
         defer parsed.deinit();
         if (parsed.value != .object) return try errorResponseAlloc(self.allocator, .null, "invalid_request", "request must be an object");
         const id_value = parsed.value.object.get("id") orelse .null;
         const method = jsonString(parsed.value.object.get("method") orelse .null) orelse
             return try errorResponseAlloc(self.allocator, id_value, "invalid_request", "missing method");
+        const params = parsed.value.object.get("params") orelse .null;
+        defer eraseAccessSecretParams(method, params);
         if (try self.requestTargetRejection(id_value, parsed.value.object.get("target"))) |response| {
             return response;
         }
-        const params = parsed.value.object.get("params") orelse .null;
 
         const response = self.handleMethodRequest(id_value, method, params) catch |err| switch (err) {
             error.SessionNotFound => try errorResponseAlloc(self.allocator, id_value, "resource_not_found", "session not found"),
@@ -2710,6 +2754,7 @@ pub const Daemon = struct {
         // Store methods own their drain/capability precedence and unlock
         // lockDaemon for SQLite work; route before the generic mutator drain gate.
         if (isStoreMethod(method)) return try self.handleStoreRequest(id_value, method, params);
+        if (isAccessMethod(method)) return try self.handleAccessRequest(id_value, method, params);
         // chat.turn.start owns its drain check under lockDaemon (unlocked serve
         // path); other mutators still gate here under the `.normal` outer lock.
         if (!std.mem.eql(u8, method, "chat.turn.start") and
@@ -2767,6 +2812,228 @@ pub const Daemon = struct {
         // Additive headless core methods; existing methods and error codes unchanged.
         if (std.mem.startsWith(u8, method, "core.")) return try self.coreResponse(id_value, method, params);
         return try errorResponseAlloc(self.allocator, id_value, "method_not_found", method);
+    }
+
+    /// Access storage stays behind the private session-daemon endpoint. Local
+    /// administrators and the loopback gateway use distinct methods; none can
+    /// be forwarded by the gateway's generic RPC surfaces.
+    fn handleAccessRequest(
+        self: *Daemon,
+        id_value: std.json.Value,
+        method: []const u8,
+        params: std.json.Value,
+    ) ![]u8 {
+        var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const request = decodeAccessRequest(arena, method, params) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_PARAMS,
+                "invalid access administration params",
+            );
+        };
+        defer request.clearSecrets();
+        if (request.protocolVersion() != access_protocol.ACCESS_PROTOCOL_VERSION) {
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_PROTOCOL_INCOMPATIBLE,
+                "access protocol version is incompatible",
+            );
+        }
+
+        var daemon_locked = true;
+        lockDaemon(self);
+        defer if (daemon_locked) self.mutex.unlock();
+        if (!self.accepting_mutations) {
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_STATE,
+                "daemon is preparing shutdown and is not accepting mutations",
+            );
+        }
+        const service = self.store_service orelse
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_CAPABILITY_UNAVAILABLE,
+                "store capability is unavailable",
+            );
+        if (service.draining) {
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_STATE,
+                "daemon store is draining",
+            );
+        }
+        _ = service.in_flight.fetchAdd(1, .monotonic);
+        self.mutex.unlock();
+        daemon_locked = false;
+        defer _ = service.in_flight.fetchSub(1, .monotonic);
+
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        const now_ms = nowMs();
+        return switch (request) {
+            .pairing_create => |create_request| response: {
+                var threaded = std.Io.Threaded.init_single_threaded;
+                var issued = access_store.createPairingGrant(
+                    threaded.io(),
+                    service.store.conn,
+                    create_request,
+                    now_ms,
+                ) catch |err| return try accessAdminErrorResponse(self.allocator, id_value, err);
+                defer issued.clear();
+                const scope_names = access_protocol.scopeNamesAlloc(arena, issued.scope_mask) catch |err|
+                    return try accessAdminErrorResponse(self.allocator, id_value, err);
+                break :response try pairingGrantCreateResponse(
+                    self.allocator,
+                    id_value,
+                    self.runtime_id,
+                    self.instance_id,
+                    &issued,
+                    scope_names,
+                );
+            },
+            .pairing_list => response: {
+                var grants = access_store.listPairingGrants(
+                    self.allocator,
+                    service.store.conn,
+                    now_ms,
+                ) catch |err| return try accessAdminErrorResponse(self.allocator, id_value, err);
+                defer grants.deinit(self.allocator);
+                const records = try arena.alloc(access_protocol.PairingGrantRecord, grants.items.len);
+                for (grants.items, records) |grant, *record| {
+                    record.* = .{
+                        .grant_id = grant.grant_id,
+                        .label = grant.label,
+                        .scopes = access_protocol.scopeNamesAlloc(arena, grant.scope_mask) catch |err|
+                            return try accessAdminErrorResponse(self.allocator, id_value, err),
+                        .created_at_ms = grant.created_at_ms,
+                        .expires_at_ms = grant.expires_at_ms,
+                        .consumed_at_ms = grant.consumed_at_ms,
+                        .revoked_at_ms = grant.revoked_at_ms,
+                    };
+                }
+                const result: access_protocol.PairingGrantListResult = .{
+                    .access_protocol_version = access_protocol.ACCESS_PROTOCOL_VERSION,
+                    .runtime_id = self.runtime_id,
+                    .instance_id = self.instance_id,
+                    .grants = records,
+                };
+                break :response try okValueResponse(self.allocator, id_value, result);
+            },
+            .pairing_revoke => |revoke_request| response: {
+                const revoked = access_store.revokePairingGrant(
+                    service.store.conn,
+                    revoke_request.grant_id,
+                    now_ms,
+                ) catch |err| return try accessAdminErrorResponse(self.allocator, id_value, err);
+                const result: access_protocol.PairingGrantRevokeResult = .{
+                    .access_protocol_version = access_protocol.ACCESS_PROTOCOL_VERSION,
+                    .revoked = revoked,
+                    .grant_id = revoke_request.grant_id,
+                };
+                break :response try okValueResponse(self.allocator, id_value, result);
+            },
+            .device_list => response: {
+                var devices = access_store.listDevices(
+                    self.allocator,
+                    service.store.conn,
+                    now_ms,
+                ) catch |err| return try accessAdminErrorResponse(self.allocator, id_value, err);
+                defer devices.deinit(self.allocator);
+                const records = try arena.alloc(access_protocol.DeviceRecord, devices.items.len);
+                for (devices.items, records) |device, *record| {
+                    record.* = .{
+                        .device_id = device.device_id,
+                        .grant_id = device.grant_id,
+                        .label = device.label,
+                        .scopes = access_protocol.scopeNamesAlloc(arena, device.scope_mask) catch |err|
+                            return try accessAdminErrorResponse(self.allocator, id_value, err),
+                        .created_at_ms = device.created_at_ms,
+                        .last_used_at_ms = device.last_used_at_ms,
+                        .revoked_at_ms = device.revoked_at_ms,
+                    };
+                }
+                const result: access_protocol.DeviceListResult = .{
+                    .access_protocol_version = access_protocol.ACCESS_PROTOCOL_VERSION,
+                    .runtime_id = self.runtime_id,
+                    .instance_id = self.instance_id,
+                    .devices = records,
+                };
+                break :response try okValueResponse(self.allocator, id_value, result);
+            },
+            .device_revoke => |revoke_request| response: {
+                const revoked = access_store.revokeDevice(
+                    service.store.conn,
+                    revoke_request.device_id,
+                    now_ms,
+                ) catch |err| return try accessAdminErrorResponse(self.allocator, id_value, err);
+                const result: access_protocol.DeviceRevokeResult = .{
+                    .access_protocol_version = access_protocol.ACCESS_PROTOCOL_VERSION,
+                    .revoked = revoked,
+                    .device_id = revoke_request.device_id,
+                };
+                break :response try okValueResponse(self.allocator, id_value, result);
+            },
+            .pairing_exchange => |exchange_request| response: {
+                var threaded = std.Io.Threaded.init_single_threaded;
+                var issued = access_store.exchangePairingGrant(
+                    threaded.io(),
+                    service.store.conn,
+                    exchange_request,
+                    now_ms,
+                ) catch |err| return try accessAdminErrorResponse(self.allocator, id_value, err);
+                defer issued.clear();
+                const scope_names = access_protocol.scopeNamesAlloc(arena, issued.scope_mask) catch |err|
+                    return try accessAdminErrorResponse(self.allocator, id_value, err);
+                break :response try pairingGrantExchangeResponse(
+                    self.allocator,
+                    id_value,
+                    self.runtime_id,
+                    self.instance_id,
+                    &issued,
+                    scope_names,
+                );
+            },
+            .device_authenticate => |authenticate_request| response: {
+                const scope_mask = access_store.authenticateDevice(
+                    service.store.conn,
+                    authenticate_request.device_id,
+                    authenticate_request.device_credential.reveal(),
+                    authenticate_request.requested_scopes,
+                    now_ms,
+                ) catch |err| return try accessAdminErrorResponse(self.allocator, id_value, err);
+                const result: access_protocol.DeviceAuthorizationResult = .{
+                    .access_protocol_version = access_protocol.ACCESS_PROTOCOL_VERSION,
+                    .device_id = authenticate_request.device_id,
+                    .scopes = access_protocol.scopeNamesAlloc(arena, scope_mask) catch |err|
+                        return try accessAdminErrorResponse(self.allocator, id_value, err),
+                };
+                break :response try okValueResponse(self.allocator, id_value, result);
+            },
+            .device_authorize => |authorize_request| response: {
+                const scope_mask = access_store.authorizeDevice(
+                    service.store.conn,
+                    authorize_request.device_id,
+                    authorize_request.required_scopes,
+                ) catch |err| return try accessAdminErrorResponse(self.allocator, id_value, err);
+                const result: access_protocol.DeviceAuthorizationResult = .{
+                    .access_protocol_version = access_protocol.ACCESS_PROTOCOL_VERSION,
+                    .device_id = authorize_request.device_id,
+                    .scopes = access_protocol.scopeNamesAlloc(arena, scope_mask) catch |err|
+                        return try accessAdminErrorResponse(self.allocator, id_value, err),
+                };
+                break :response try okValueResponse(self.allocator, id_value, result);
+            },
+        };
     }
 
     fn methodMutatesState(method: []const u8) bool {
@@ -9601,6 +9868,217 @@ fn storeErrorResponse(
     return try errorResponseAllocWithData(allocator, id_value, mapped.code, mapped.message, null);
 }
 
+fn decodeAccessRequest(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    params: std.json.Value,
+) !AccessRequest {
+    if (std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_GRANT_CREATE)) {
+        return .{ .pairing_create = try std.json.parseFromValueLeaky(
+            access_protocol.PairingGrantCreateRequest,
+            allocator,
+            params,
+            .{},
+        ) };
+    }
+    if (std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_GRANT_LIST)) {
+        return .{ .pairing_list = try std.json.parseFromValueLeaky(
+            access_protocol.PairingGrantListRequest,
+            allocator,
+            params,
+            .{},
+        ) };
+    }
+    if (std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_GRANT_REVOKE)) {
+        return .{ .pairing_revoke = try std.json.parseFromValueLeaky(
+            access_protocol.PairingGrantRevokeRequest,
+            allocator,
+            params,
+            .{},
+        ) };
+    }
+    if (std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_DEVICE_LIST)) {
+        return .{ .device_list = try std.json.parseFromValueLeaky(
+            access_protocol.DeviceListRequest,
+            allocator,
+            params,
+            .{},
+        ) };
+    }
+    if (std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_DEVICE_REVOKE)) {
+        return .{ .device_revoke = try std.json.parseFromValueLeaky(
+            access_protocol.DeviceRevokeRequest,
+            allocator,
+            params,
+            .{},
+        ) };
+    }
+    if (std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_EXCHANGE)) {
+        return .{ .pairing_exchange = try std.json.parseFromValueLeaky(
+            access_protocol.PairingGrantExchangeRequest,
+            allocator,
+            params,
+            .{},
+        ) };
+    }
+    if (std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_DEVICE_AUTHENTICATE)) {
+        return .{ .device_authenticate = try std.json.parseFromValueLeaky(
+            access_protocol.DeviceAuthenticateRequest,
+            allocator,
+            params,
+            .{},
+        ) };
+    }
+    if (std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_DEVICE_AUTHORIZE)) {
+        return .{ .device_authorize = try std.json.parseFromValueLeaky(
+            access_protocol.DeviceAuthorizeRequest,
+            allocator,
+            params,
+            .{},
+        ) };
+    }
+    return error.UnknownAccessMethod;
+}
+
+fn eraseAccessSecretParams(method: []const u8, params: std.json.Value) void {
+    if (params != .object) return;
+    const field = if (std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_EXCHANGE))
+        "pairing_token"
+    else if (std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_DEVICE_AUTHENTICATE))
+        "device_credential"
+    else
+        return;
+    const value = params.object.get(field) orelse return;
+    if (value == .string) std.crypto.secureZero(u8, @constCast(value.string));
+}
+
+fn accessAdminErrorResponse(
+    allocator: std.mem.Allocator,
+    id_value: std.json.Value,
+    err: anyerror,
+) ![]u8 {
+    const mapped: struct { code: []const u8, message: []const u8 } = switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.IncompatibleAccessProtocol => .{
+            .code = headless.protocol.ERR_PROTOCOL_INCOMPATIBLE,
+            .message = "access protocol version is incompatible",
+        },
+        error.UnknownAccessScope,
+        error.AccessScopesRequired,
+        error.TooManyAccessScopes,
+        error.DuplicateAccessScope,
+        error.InvalidPairingTtl,
+        error.DeviceLabelRequired,
+        error.DeviceLabelTooLong,
+        error.InvalidDeviceLabel,
+        error.InvalidGrantId,
+        error.InvalidDeviceId,
+        error.InvalidAccessSecret,
+        => .{
+            .code = headless.protocol.ERR_INVALID_PARAMS,
+            .message = "invalid access administration params",
+        },
+        error.TooManyActivePairingGrants,
+        error.PairingGrantRetentionLimitReached,
+        error.TooManyActiveDevices,
+        error.DeviceRetentionLimitReached,
+        => .{
+            .code = headless.protocol.ERR_CONFLICT,
+            .message = "active access record limit reached; revoke an active grant or device",
+        },
+        error.AccessStoreCorrupt => .{
+            .code = headless.protocol.ERR_STORE_CORRUPT,
+            .message = "access store is corrupt",
+        },
+        error.PairingGrantRejected,
+        error.DeviceAuthenticationRejected,
+        error.DeviceAuthorizationRejected,
+        => .{
+            .code = "authentication_rejected",
+            .message = "access credential was not accepted",
+        },
+        else => .{
+            .code = headless.protocol.ERR_STORE_UNAVAILABLE,
+            .message = "access store is unavailable",
+        },
+    };
+    return try errorResponseAllocWithData(allocator, id_value, mapped.code, mapped.message, null);
+}
+
+/// The only generic-daemon response path allowed to reveal a pairing token.
+/// Callers must clear the returned wire buffer after it has been written.
+fn pairingGrantCreateResponse(
+    allocator: std.mem.Allocator,
+    id_value: std.json.Value,
+    runtime_id: []const u8,
+    instance_id: []const u8,
+    issued: *const access_store.IssuedPairingGrant,
+    scope_names: []const []const u8,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer {
+        std.crypto.secureZero(u8, writer.written());
+        writer.deinit();
+    }
+    var json: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try beginOk(&json, id_value);
+    try json.objectField("result");
+    try json.beginObject();
+    try json.objectField("access_protocol_version");
+    try json.write(access_protocol.ACCESS_PROTOCOL_VERSION);
+    try json.objectField("runtime_id");
+    try json.write(runtime_id);
+    try json.objectField("instance_id");
+    try json.write(instance_id);
+    try json.objectField("grant_id");
+    try json.write(issued.grant_id[0..]);
+    try json.objectField("pairing_token");
+    try json.write(issued.pairing_token[0..]);
+    try json.objectField("expires_at_ms");
+    try json.write(issued.expires_at_ms);
+    try json.objectField("scopes");
+    try json.write(scope_names);
+    try json.endObject();
+    try json.endObject();
+    return try writer.toOwnedSlice();
+}
+
+/// The only daemon response path allowed to reveal a new device credential.
+/// IPC and gateway owners clear the returned wire buffer after writing it.
+fn pairingGrantExchangeResponse(
+    allocator: std.mem.Allocator,
+    id_value: std.json.Value,
+    runtime_id: []const u8,
+    instance_id: []const u8,
+    issued: *const access_store.IssuedDevice,
+    scope_names: []const []const u8,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer {
+        std.crypto.secureZero(u8, writer.written());
+        writer.deinit();
+    }
+    var json: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try beginOk(&json, id_value);
+    try json.objectField("result");
+    try json.beginObject();
+    try json.objectField("access_protocol_version");
+    try json.write(access_protocol.ACCESS_PROTOCOL_VERSION);
+    try json.objectField("runtime_id");
+    try json.write(runtime_id);
+    try json.objectField("instance_id");
+    try json.write(instance_id);
+    try json.objectField("device_id");
+    try json.write(issued.device_id[0..]);
+    try json.objectField("device_credential");
+    try json.write(issued.device_credential[0..]);
+    try json.objectField("scopes");
+    try json.write(scope_names);
+    try json.endObject();
+    try json.endObject();
+    return try writer.toOwnedSlice();
+}
+
 /// Single serve-path classification (one JSON parse). Fold W5 slow-work and
 /// S2/S3 store routing so store/normal cannot disagree about lock ownership.
 /// `unlocked_method` is for handlers that manage their own short lockDaemon
@@ -9618,11 +10096,25 @@ fn methodRunsUnlocked(method: []const u8) bool {
         // touches no daemon state, so never hold lockDaemon around filesystem I/O.
         std.mem.eql(u8, method, "provider.models.list") or
         std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDERS_STATUS) or
+        // Local access administration is daemon-owned SQLite work and takes
+        // only its own short lockDaemon bookkeeping window.
+        isAccessMethod(method) or
         // FX lifecycle persistence uses the store spine and owns its short
         // lockDaemon window, like the other unlocked mutation paths.
         isFxLifecycleMethod(method) or
         // Shared config writes have their own leaf lock and filesystem I/O.
         std.mem.eql(u8, method, store_protocol.METHOD_CONFIG_FAVORITE_MODEL_SET);
+}
+
+fn isAccessMethod(method: []const u8) bool {
+    return std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_GRANT_CREATE) or
+        std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_GRANT_LIST) or
+        std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_GRANT_REVOKE) or
+        std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_DEVICE_LIST) or
+        std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_DEVICE_REVOKE) or
+        std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_EXCHANGE) or
+        std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_DEVICE_AUTHENTICATE) or
+        std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_DEVICE_AUTHORIZE);
 }
 
 fn isFxLifecycleMethod(method: []const u8) bool {
@@ -9764,7 +10256,10 @@ fn retentionExpiredForDaemon(start_ms: i64, now_ms: i64, retention_ms: i64) bool
 fn handleSessionizerServerRequest(raw_context: *anyopaque, request: []u8) anyerror![]u8 {
     const context: *SessionizerServerContext = @ptrCast(@alignCast(raw_context));
     const daemon = context.daemon;
-    defer daemon.allocator.free(request);
+    defer {
+        std.crypto.secureZero(u8, request);
+        daemon.allocator.free(request);
+    }
     const trimmed = std.mem.trim(u8, request, "\r");
 
     // One envelope parse outside lockDaemon classifies W5 slow-work vs store vs
@@ -14089,6 +14584,171 @@ test "repository manifest RPCs classify through the unlocked store queue" {
     }
 }
 
+test "access RPCs classify unlocked and bridge authentication fail closed" {
+    const allocator = std.testing.allocator;
+    const methods = [_][]const u8{
+        access_protocol.METHOD_DAEMON_PAIRING_GRANT_CREATE,
+        access_protocol.METHOD_DAEMON_PAIRING_GRANT_LIST,
+        access_protocol.METHOD_DAEMON_PAIRING_GRANT_REVOKE,
+        access_protocol.METHOD_DAEMON_DEVICE_LIST,
+        access_protocol.METHOD_DAEMON_DEVICE_REVOKE,
+        access_protocol.METHOD_DAEMON_PAIRING_EXCHANGE,
+        access_protocol.METHOD_DAEMON_DEVICE_AUTHENTICATE,
+        access_protocol.METHOD_DAEMON_DEVICE_AUTHORIZE,
+    };
+    for (methods) |method| {
+        const request = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"{s}\",\"params\":{{}}}}",
+            .{method},
+        );
+        defer allocator.free(request);
+        try std.testing.expect(isAccessMethod(method));
+        try std.testing.expect(methodRunsUnlocked(method));
+        try std.testing.expectEqual(
+            ServerRequestClass.unlocked_method,
+            try classifyServerRequest(allocator, request),
+        );
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+
+    const unknown_field_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"daemon.access.pairing.create","params":{"access_protocol_version":1,"ttl_seconds":60,"scopes":["runtime:read"],"future":true}}
+    );
+    defer allocator.free(unknown_field_response);
+    var unknown_field = try std.json.parseFromSlice(std.json.Value, allocator, unknown_field_response, .{});
+    defer unknown_field.deinit();
+    try std.testing.expectEqualStrings(
+        headless.protocol.ERR_INVALID_PARAMS,
+        unknown_field.value.object.get("error").?.object.get("code").?.string,
+    );
+
+    const duplicate_field_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"daemon.access.pairing.create","params":{"access_protocol_version":1,"ttl_seconds":60,"ttl_seconds":30,"scopes":["runtime:read"]}}
+    );
+    defer allocator.free(duplicate_field_response);
+    var duplicate_field = try std.json.parseFromSlice(std.json.Value, allocator, duplicate_field_response, .{});
+    defer duplicate_field.deinit();
+    try std.testing.expectEqualStrings(
+        headless.protocol.ERR_INVALID_REQUEST,
+        duplicate_field.value.object.get("error").?.object.get("code").?.string,
+    );
+
+    const wrong_version_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":2,"method":"daemon.access.pairing.list","params":{"access_protocol_version":2}}
+    );
+    defer allocator.free(wrong_version_response);
+    var wrong_version = try std.json.parseFromSlice(std.json.Value, allocator, wrong_version_response, .{});
+    defer wrong_version.deinit();
+    try std.testing.expectEqualStrings(
+        headless.protocol.ERR_PROTOCOL_INCOMPATIBLE,
+        wrong_version.value.object.get("error").?.object.get("code").?.string,
+    );
+
+    const create_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":3,"method":"daemon.access.pairing.create","params":{"access_protocol_version":1,"label":"Laptop","ttl_seconds":60,"scopes":["runtime:read","chat:write"]}}
+    );
+    defer {
+        std.crypto.secureZero(u8, create_response);
+        allocator.free(create_response);
+    }
+    var created = try std.json.parseFromSlice(std.json.Value, allocator, create_response, .{});
+    defer created.deinit();
+    const create_result = created.value.object.get("result").?.object;
+    const grant_id = create_result.get("grant_id").?.string;
+    const pairing_token = create_result.get("pairing_token").?.string;
+    defer std.crypto.secureZero(u8, @constCast(pairing_token));
+    try access_protocol.validateGrantId(grant_id);
+    try access_protocol.validateSecret(pairing_token);
+    try std.testing.expectEqualStrings(daemon.runtime_id, create_result.get("runtime_id").?.string);
+    try std.testing.expectEqualStrings(daemon.instance_id, create_result.get("instance_id").?.string);
+
+    const list_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":4,"method":"daemon.access.pairing.list","params":{"access_protocol_version":1}}
+    );
+    defer allocator.free(list_response);
+    var listed = try std.json.parseFromSlice(std.json.Value, allocator, list_response, .{});
+    defer listed.deinit();
+    const grants = listed.value.object.get("result").?.object.get("grants").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), grants.len);
+    try std.testing.expectEqualStrings(grant_id, grants[0].object.get("grant_id").?.string);
+
+    const exchange_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"{s}\",\"params\":{{\"access_protocol_version\":1,\"grant_id\":\"{s}\",\"pairing_token\":\"{s}\",\"device_label\":\"Laptop\"}}}}",
+        .{ access_protocol.METHOD_DAEMON_PAIRING_EXCHANGE, grant_id, pairing_token },
+    );
+    defer {
+        std.crypto.secureZero(u8, exchange_request);
+        allocator.free(exchange_request);
+    }
+    const exchange_response = try daemon.handleRequest(exchange_request);
+    defer {
+        std.crypto.secureZero(u8, exchange_response);
+        allocator.free(exchange_response);
+    }
+    var exchanged = try std.json.parseFromSlice(std.json.Value, allocator, exchange_response, .{});
+    defer exchanged.deinit();
+    const exchange_result = exchanged.value.object.get("result").?.object;
+    const device_id = exchange_result.get("device_id").?.string;
+    const device_credential = exchange_result.get("device_credential").?.string;
+    defer std.crypto.secureZero(u8, @constCast(device_credential));
+    try access_protocol.validateDeviceId(device_id);
+    try access_protocol.validateSecret(device_credential);
+
+    const replay_response = try daemon.handleRequest(exchange_request);
+    defer allocator.free(replay_response);
+    var replayed = try std.json.parseFromSlice(std.json.Value, allocator, replay_response, .{});
+    defer replayed.deinit();
+    try std.testing.expectEqualStrings(
+        "authentication_rejected",
+        replayed.value.object.get("error").?.object.get("code").?.string,
+    );
+
+    const authenticate_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"{s}\",\"params\":{{\"access_protocol_version\":1,\"device_id\":\"{s}\",\"device_credential\":\"{s}\",\"requested_scopes\":[\"runtime:read\"]}}}}",
+        .{ access_protocol.METHOD_DAEMON_DEVICE_AUTHENTICATE, device_id, device_credential },
+    );
+    defer {
+        std.crypto.secureZero(u8, authenticate_request);
+        allocator.free(authenticate_request);
+    }
+    const authenticate_response = try daemon.handleRequest(authenticate_request);
+    defer allocator.free(authenticate_response);
+    var authenticated = try std.json.parseFromSlice(std.json.Value, allocator, authenticate_response, .{});
+    defer authenticated.deinit();
+    const authenticated_result = authenticated.value.object.get("result").?.object;
+    try std.testing.expectEqualStrings(device_id, authenticated_result.get("device_id").?.string);
+    try std.testing.expectEqualStrings(
+        "runtime:read",
+        authenticated_result.get("scopes").?.array.items[0].string,
+    );
+
+    const authorize_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"{s}\",\"params\":{{\"access_protocol_version\":1,\"device_id\":\"{s}\",\"required_scopes\":[\"chat:write\"]}}}}",
+        .{ access_protocol.METHOD_DAEMON_DEVICE_AUTHORIZE, device_id },
+    );
+    defer allocator.free(authorize_request);
+    const authorize_response = try daemon.handleRequest(authorize_request);
+    defer allocator.free(authorize_response);
+    var authorized = try std.json.parseFromSlice(std.json.Value, allocator, authorize_response, .{});
+    defer authorized.deinit();
+    try std.testing.expectEqualStrings(
+        device_id,
+        authorized.value.object.get("result").?.object.get("device_id").?.string,
+    );
+}
+
 fn attachTestStoreService(daemon: *Daemon, db_path: []const u8) !void {
     try attachTestStoreServiceWithFault(daemon, db_path, .none);
 }
@@ -14225,6 +14885,42 @@ test "request target validation preserves local calls and accepts the exact daem
         headless.protocol.ERR_RUNTIME_IDENTITY_MISSING,
         "request target is missing or malformed",
     );
+}
+
+test "wrong request targets scrub access secrets before rejection" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    const wrong_runtime = mismatchedTestIdentity(daemon.runtime_id);
+    const secret = "f" ** access_protocol.SECRET_HEX_BYTES;
+    const cases = [_]struct { method: []const u8, field: []const u8 }{
+        .{ .method = access_protocol.METHOD_DAEMON_PAIRING_EXCHANGE, .field = "pairing_token" },
+        .{ .method = access_protocol.METHOD_DAEMON_DEVICE_AUTHENTICATE, .field = "device_credential" },
+    };
+
+    for (cases) |case| {
+        const request = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"{s}\",\"params\":{{\"{s}\":\"{s}\"}},\"target\":{{\"runtime_id\":\"{s}\",\"instance_id\":\"{s}\"}}}}",
+            .{ case.method, case.field, secret, &wrong_runtime, daemon.instance_id },
+        );
+        defer {
+            std.crypto.secureZero(u8, request);
+            allocator.free(request);
+        }
+        const secret_start = std.mem.indexOf(u8, request, secret) orelse return error.TestSecretMissing;
+        const response = try daemon.handleRequest(request);
+        defer allocator.free(response);
+        try expectErrorCodeMessage(
+            response,
+            allocator,
+            headless.protocol.ERR_RUNTIME_IDENTITY_MISMATCH,
+            "request target does not match this daemon",
+        );
+        for (request[secret_start .. secret_start + secret.len]) |byte| {
+            try std.testing.expectEqual(@as(u8, 0), byte);
+        }
+    }
 }
 
 test "wrong request targets cannot reach store mutation or slow process work" {

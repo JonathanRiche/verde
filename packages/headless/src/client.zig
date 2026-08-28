@@ -9,6 +9,7 @@ const registry = @import("registry_protocol.zig");
 const store_protocol = @import("store_protocol.zig");
 const changes_protocol = @import("changes_protocol.zig");
 const providers_protocol = @import("providers_protocol.zig");
+const access_protocol = @import("access_protocol.zig");
 
 /// Sends one request JSON document and returns an allocator-owned response JSON document.
 pub const TransportFn = *const fn (ctx: *anyopaque, request_json: []const u8) anyerror![]u8;
@@ -322,10 +323,16 @@ pub const Client = struct {
     /// Encode and send a request with the caller's existing request id.
     pub fn callWithId(self: *Client, id: u64, method: []const u8, params: anytype) !protocol.ParsedResponse {
         const request_json = try self.encodeRequestWithId(id, method, params);
-        defer self.allocator.free(request_json);
+        defer {
+            std.crypto.secureZero(u8, request_json);
+            self.allocator.free(request_json);
+        }
 
         const response_json = try self.send(request_json);
-        defer self.allocator.free(response_json);
+        defer {
+            std.crypto.secureZero(u8, response_json);
+            self.allocator.free(response_json);
+        }
 
         return try self.parseResponseWithId(id, response_json);
     }
@@ -343,7 +350,10 @@ pub const Client = struct {
 
         pub fn deinit(self: *CallResult, allocator: std.mem.Allocator) void {
             self.parsed.deinit();
-            if (self.response_json) |response_json| allocator.free(response_json);
+            if (self.response_json) |response_json| {
+                std.crypto.secureZero(u8, response_json);
+                allocator.free(response_json);
+            }
             self.* = undefined;
         }
     };
@@ -351,10 +361,16 @@ pub const Client = struct {
     /// Encode, send, and parse while retaining ownership of the original response JSON.
     pub fn callAllocWithId(self: *Client, id: u64, method: []const u8, params: anytype) !CallResult {
         const request_json = try self.encodeRequestWithId(id, method, params);
-        defer self.allocator.free(request_json);
+        defer {
+            std.crypto.secureZero(u8, request_json);
+            self.allocator.free(request_json);
+        }
 
         const response_json = try self.send(request_json);
-        errdefer self.allocator.free(response_json);
+        errdefer {
+            std.crypto.secureZero(u8, response_json);
+            self.allocator.free(response_json);
+        }
         var parsed = try self.parseResponseWithId(id, response_json);
         errdefer parsed.deinit();
         return .{
@@ -553,6 +569,84 @@ pub const Client = struct {
         return try self.decodeResult(store_protocol.CoreSnapshotResult, parsed);
     }
 
+    /// Decode the owner-only grant creation result with strict access-protocol
+    /// fields. Unlike the legacy tolerant decoders, unknown fields fail closed.
+    pub fn decodePairingGrantCreate(
+        self: *Client,
+        parsed: *const protocol.ParsedResponse,
+    ) !access_protocol.PairingGrantCreateResult {
+        const result = try self.decodeStrictResult(access_protocol.PairingGrantCreateResult, parsed);
+        try validateAccessResultHeader(result.access_protocol_version, result.runtime_id, result.instance_id);
+        try access_protocol.validateGrantId(result.grant_id);
+        try access_protocol.validateSecret(result.pairing_token.reveal());
+        try access_protocol.validateScopeNames(result.scopes);
+        if (result.expires_at_ms < 0) return error.InvalidAccessResponse;
+        return result;
+    }
+
+    /// Decode non-secret pairing grant metadata with strict v1 fields.
+    pub fn decodePairingGrantList(
+        self: *Client,
+        parsed: *const protocol.ParsedResponse,
+    ) !access_protocol.PairingGrantListResult {
+        const result = try self.decodeStrictResult(access_protocol.PairingGrantListResult, parsed);
+        try validateAccessResultHeader(result.access_protocol_version, result.runtime_id, result.instance_id);
+        for (result.grants) |grant| {
+            try access_protocol.validateGrantId(grant.grant_id);
+            if (grant.label) |label| try access_protocol.validateDeviceLabel(label);
+            try access_protocol.validateScopeNames(grant.scopes);
+            if (grant.created_at_ms < 0 or grant.expires_at_ms < grant.created_at_ms or
+                (grant.consumed_at_ms != null and grant.consumed_at_ms.? < 0) or
+                (grant.revoked_at_ms != null and grant.revoked_at_ms.? < 0))
+            {
+                return error.InvalidAccessResponse;
+            }
+        }
+        return result;
+    }
+
+    pub fn decodePairingGrantRevoke(
+        self: *Client,
+        parsed: *const protocol.ParsedResponse,
+    ) !access_protocol.PairingGrantRevokeResult {
+        const result = try self.decodeStrictResult(access_protocol.PairingGrantRevokeResult, parsed);
+        try validateAccessProtocolVersion(result.access_protocol_version);
+        try access_protocol.validateGrantId(result.grant_id);
+        return result;
+    }
+
+    /// Decode non-secret device metadata with strict v1 fields.
+    pub fn decodeDeviceList(
+        self: *Client,
+        parsed: *const protocol.ParsedResponse,
+    ) !access_protocol.DeviceListResult {
+        const result = try self.decodeStrictResult(access_protocol.DeviceListResult, parsed);
+        try validateAccessResultHeader(result.access_protocol_version, result.runtime_id, result.instance_id);
+        for (result.devices) |device| {
+            try access_protocol.validateDeviceId(device.device_id);
+            try access_protocol.validateGrantId(device.grant_id);
+            try access_protocol.validateDeviceLabel(device.label);
+            try access_protocol.validateScopeNames(device.scopes);
+            if (device.created_at_ms < 0 or
+                (device.last_used_at_ms != null and device.last_used_at_ms.? < 0) or
+                (device.revoked_at_ms != null and device.revoked_at_ms.? < 0))
+            {
+                return error.InvalidAccessResponse;
+            }
+        }
+        return result;
+    }
+
+    pub fn decodeDeviceRevoke(
+        self: *Client,
+        parsed: *const protocol.ParsedResponse,
+    ) !access_protocol.DeviceRevokeResult {
+        const result = try self.decodeStrictResult(access_protocol.DeviceRevokeResult, parsed);
+        try validateAccessProtocolVersion(result.access_protocol_version);
+        try access_protocol.validateDeviceId(result.device_id);
+        return result;
+    }
+
     /// Issue an explicitly daemon-direct composite snapshot read. The gate is
     /// deliberately inside the typed call so an old daemon cannot silently
     /// re-enable a caller's legacy fallback after this API was chosen.
@@ -723,12 +817,37 @@ pub const Client = struct {
         });
     }
 
+    /// Access credentials and grants use strict, versioned objects. Parsing
+    /// directly from the response DOM avoids another plaintext secret copy.
+    fn decodeStrictResult(self: *Client, comptime T: type, parsed: *const protocol.ParsedResponse) !T {
+        const result = try self.resultValue(parsed);
+        return try std.json.parseFromValueLeaky(T, self.allocator, result, .{});
+    }
+
     fn send(self: *Client, request_json: []const u8) ![]u8 {
         const transport = self.transport orelse return error.TransportUnavailable;
         const context = self.transport_ctx orelse return error.TransportUnavailable;
         return try transport(context, request_json);
     }
 };
+
+fn validateAccessProtocolVersion(version: u32) !void {
+    if (version != access_protocol.ACCESS_PROTOCOL_VERSION) {
+        return error.IncompatibleAccessProtocol;
+    }
+}
+
+fn validateAccessResultHeader(
+    version: u32,
+    runtime_id: []const u8,
+    instance_id: []const u8,
+) !void {
+    try validateAccessProtocolVersion(version);
+    protocol.validateRequestTarget(.{
+        .runtime_id = runtime_id,
+        .instance_id = instance_id,
+    }) catch return error.InvalidAccessResponse;
+}
 
 const MockTransport = struct {
     allocator: std.mem.Allocator,
@@ -880,6 +999,42 @@ test "targeted client rejects an invalid configured identity" {
             .instance_id = "00112233445566778899aabbccddeeff",
         }),
     );
+}
+
+test "access result decoders are strict and keep generic secret rendering redacted" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var client = Client.initEncoder(arena);
+    const response =
+        \\{"jsonrpc":"2.0","id":1,"result":{"access_protocol_version":1,"runtime_id":"0123456789abcdef0123456789abcdef","instance_id":"00112233445566778899aabbccddeeff","grant_id":"fedcba9876543210fedcba9876543210","pairing_token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expires_at_ms":1000,"scopes":["runtime:read"]}}
+    ;
+    var parsed = try protocol.parseResponse(arena, response);
+    defer parsed.deinit();
+    var result = try client.decodePairingGrantCreate(&parsed);
+    defer std.crypto.secureZero(u8, @constCast(result.pairing_token.reveal()));
+    try std.testing.expectEqualStrings("a" ** access_protocol.SECRET_HEX_BYTES, result.pairing_token.reveal());
+    const generic = try std.json.Stringify.valueAlloc(arena, result, .{});
+    try std.testing.expect(std.mem.indexOf(u8, generic, "a" ** access_protocol.SECRET_HEX_BYTES) == null);
+    try std.testing.expect(std.mem.indexOf(u8, generic, access_protocol.REDACTED_SECRET) != null);
+
+    const unknown_response =
+        \\{"jsonrpc":"2.0","id":2,"result":{"access_protocol_version":1,"runtime_id":"0123456789abcdef0123456789abcdef","instance_id":"00112233445566778899aabbccddeeff","grant_id":"fedcba9876543210fedcba9876543210","pairing_token":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","expires_at_ms":1000,"scopes":["runtime:read"],"future":true}}
+    ;
+    var unknown = try protocol.parseResponse(arena, unknown_response);
+    defer unknown.deinit();
+    const unknown_token = unknown.response.result.?.object.get("pairing_token").?.string;
+    defer std.crypto.secureZero(u8, @constCast(unknown_token));
+    try std.testing.expectError(error.UnknownField, client.decodePairingGrantCreate(&unknown));
+
+    const missing_version_response =
+        \\{"jsonrpc":"2.0","id":3,"result":{"runtime_id":"0123456789abcdef0123456789abcdef","instance_id":"00112233445566778899aabbccddeeff","grant_id":"fedcba9876543210fedcba9876543210","pairing_token":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","expires_at_ms":1000,"scopes":["runtime:read"]}}
+    ;
+    var missing_version = try protocol.parseResponse(arena, missing_version_response);
+    defer missing_version.deinit();
+    const missing_token = missing_version.response.result.?.object.get("pairing_token").?.string;
+    defer std.crypto.secureZero(u8, @constCast(missing_token));
+    try std.testing.expectError(error.MissingField, client.decodePairingGrantCreate(&missing_version));
 }
 
 test "identity response errors retain their failure classification" {
