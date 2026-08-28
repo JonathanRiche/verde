@@ -2,7 +2,21 @@
 
 Status: architecture, implementation status, and remaining plan for the open-source Verde repository.
 
-This document intentionally excludes the Verde SaaS control plane. The open-source desktop and daemon must support local use, a manually administered VM, and a container without an account or hosted service. An optional external control plane may eventually hand the desktop a normal runtime connection descriptor, but it does not get a separate protocol.
+This document focuses on the desktop/runtime boundary rather than the detailed
+Connect control-plane contract. The open-source desktop and daemon must support
+local use, a manually administered VM, and a container without an account or
+control plane. Optional Connect discovery may use the runnable self-hostable
+open-source reference service or a compatible private Verde Cloud deployment;
+either hands the desktop the same normalized runtime descriptor and does not
+get a separate execution protocol.
+
+The account-free Serve/Pair surface and the open contract for optional Connect
+are specified in [Verde Serve, Pair, and Connect](serve-pair-connect.md).
+The daemon now contains identity-bound grant/device storage and owner-only
+local administration. Store-backed runtimes advertise `access.pair.v1`; the
+loopback gateway provides rate-limited grant/device authentication,
+short-lived access tokens, one-use WebSocket tickets, current-revocation
+checks, and fail-closed per-RPC scope enforcement.
 
 The current standalone VM path and its limitations are documented in [Standalone Daemon Deployment](daemon-deployment.md). The daemon and SSH-forwarded browser gateway are usable now. The native desktop has durable non-secret profiles, offline profile/default-management CLI commands, a masked process-memory credential flow, explicit first-contact identity trust, a live Local/configured-runtime selector, a continuously owned loopback relay with shell-free per-call `ssh -W` channels, authenticated identity-targeted RPC, immutable thread routes, and remote text-chat dispatch. Remote attachments, remote PTYs/TUIs, direct HTTPS, guided provider login, and desktop multi-repository management remain separate follow-on work.
 
@@ -274,13 +288,25 @@ verde-daemon providers status [--data-dir <path>] [--json]
 verde-daemon workspace show --workspace <id> [--data-dir <path>] [--json]
 verde-daemon workspace bind --workspace <id> --label <label> --root <path> [options]
 verde-daemon workspace repository bind --workspace <id> --repository <id> --label <label> --root <path> [options]
+verde-daemon pair create [--expires 10m] [--label <text>] [--scope <scope>]... [--data-dir <path>] [--json]
+verde-daemon pair list [--data-dir <path>] [--json]
+verde-daemon pair revoke --id <id> [--data-dir <path>] [--json]
+verde-daemon device list [--data-dir <path>] [--json]
+verde-daemon device revoke --id <id> [--data-dir <path>] [--json]
 verde-daemon notify --status <state> [options]
 verde-daemon version [--json]
 ```
 
 The sibling `verde-web` process owns the network gateway; it is not a `verde-daemon gateway` subcommand. Daemon administration no longer requires launching the GUI. `init` establishes restrictive data-directory and identity permissions, and `serve` stays foreground-first so systemd, Docker, or Podman can supervise it.
 
-Convenience `service install/uninstall` commands and persistent daemon-managed token create/list/revoke/scoping are not implemented. Manual systemd and token-file setup is documented instead.
+Pair/device commands use the private session-daemon transport, target the exact
+runtime generation probed by the CLI, and are blocked from the web gateway.
+Pair creation returns its one-time grant secret only through explicit human or
+`--json` output. The sibling loopback gateway implements remote pairing
+exchange, short-lived access tokens, one-use WebSocket tickets, and per-RPC
+scope enforcement. Convenience `service install/uninstall` remains
+unimplemented. Manual systemd and owner-token-file setup is documented
+separately.
 
 ## Gateway hardening
 
@@ -294,15 +320,28 @@ The first SSH-safe gateway slice is implemented. `verde-web` now:
 - validates loopback Host and same-origin browser requests without permissive CORS;
 - talks only to the headless session daemon and does not fall back to Desktop Live or mock state;
 - enforces bounded requests, frames, responses, sessions, connections, and login failures;
+- rate-limits pairing-grant exchange, failed device authentication, and failed
+  access-token/ticket bootstrap in separate bounded client tables;
+- retains only verifier digests for 15-minute paired access tokens and
+  30-second atomic one-use WebSocket tickets, with at most one live token and
+  one unconsumed ticket per device so replacement cannot exhaust another
+  device's slots;
+- applies one centralized fail-closed scope map to paired HTTP and WebSocket
+  RPCs, scope-gates specialized API routes, and rechecks device revocation and
+  expiry during bounded WebSocket polling, clearing the rejected device's
+  in-memory credentials without affecting other devices;
+- uses narrow, immediately cleared private-IPC encoders for the two
+  secret-bearing daemon bridge requests while generic DTO serialization stays
+  redacted;
 - does not expose arbitrary file browsing or the legacy file/preview routes.
 
 This is deliberately not a public server or a direct HTTPS implementation. The browser reaches it through a manually owned SSH local forward; the native desktop reaches it through its continuously owned listener and per-call `ssh -W` relay. Before a future direct HTTPS mode is supported, it still needs:
 
-- apply scopes to every RPC, WebSocket, file, and PTY operation;
-- add persistent token/key metadata plus create/list/revoke/rotation commands;
+- add desktop pairing import plus OS credential-store persistence;
+- add proof-of-possession device keys as an optional successor to the current
+  high-entropy verifier-backed device credential;
 - require TLS directly or define and test a trusted reverse-proxy contract;
 - add certificate and forwarded-origin diagnostics;
-- close sessions promptly on token revocation where feasible;
 - define a safe non-loopback bind mode rather than weakening the loopback default.
 
 SSH mode keeps this gateway on loopback. The browser uses a conventional local forward, while the native desktop uses its owned relay. A future direct HTTPS mode will use the same runtime APIs through TLS.
@@ -364,8 +403,8 @@ Landed in the first foundation slice:
 - Legacy one-path workspaces project as a stable `primary` repository with a runtime-local binding. Durable, receipt-backed repository-manifest CRUD, default-repository choice, per-runtime bindings, typed client calls, and manual `verde-daemon workspace ...` administration are advertised. The desktop add/clone/remove/repository-picker UX is not implemented yet.
 - `providers.status` reports all eight integration providers with intentionally distinct native-chat, terminal, MCP, and lifecycle surfaces. It performs bounded installation checks; authentication is currently reported truthfully as `unknown` for every provider.
 - The transport-neutral client has typed capability gates and decoders for these new remote-safe surfaces.
-- A dependency-isolated `verde-daemon` artifact packages `bin/verde-daemon` plus `share/verde/provider_bridge.mjs` and implements idempotent init, foreground serve, runtime/store status, provider status, durable lifecycle notify, version/help, and PID-checked graceful signal shutdown.
-- The first `verde-web` hardening slice is loopback-only and token-file mandatory, issues bounded session cookies after login, removes Live/mock fallback, authenticates API/WebSocket access, and removes arbitrary file/preview access.
+- A dependency-isolated `verde-daemon` artifact packages `bin/verde-daemon` plus `share/verde/provider_bridge.mjs` and implements idempotent init, foreground serve, runtime/store status, provider status, owner-only Pair/device administration, durable lifecycle notify, version/help, and PID-checked graceful signal shutdown.
+- The loopback-only `verde-web` gateway keeps its mandatory owner token and bounded browser sessions, and now also exposes the account-free Pair exchange: independently rate-limited grant/device authentication, verifier-only 15-minute scoped access tokens, one-use 30-second WebSocket tickets, centralized fail-closed HTTP/WebSocket RPC scope enforcement, and ongoing expiry/revocation checks. It still removes Live/mock fallback and arbitrary file/preview access.
 - Desktop runtime foundations include runtime-qualified thread identities, a versioned non-secret Local/SSH profile schema with runtime/instance pinning, a process-memory-only bearer-token store, a 1 MiB bounded loopback RPC transport, and a continuously owned loopback listener that relays one permitted call through each shell-free OpenSSH `-W` process. The supervisor keeps normal user SSH configuration for aliases, ProxyJump, and IdentityFile while disabling control-master reuse, never releases a bearer-bearing call to an unowned listener, bounds I/O and teardown, and terminates the exact process tree it owns.
 - The per-profile connection manager validates canonical runtime and instance IDs, separates first-contact trust from transport readiness, and invalidates the connection generation when a token is cleared or replaced. A lock/reload/conflict/save/reread transaction adopts only an authoritative durable identity pair. Periodic targeted heartbeats and all general RPCs carry that pair; execution readiness requires a healthy current relay generation and `rpc.target.v1`.
 - The network gateway permits only bootstrap `core.status` without a target. Browser HTTP/WebSocket clients learn one page-lifetime identity pair and target every later request; the gateway targets its own snapshot/change calls, while the daemon rejects a missing, malformed, or mismatched target before either normal or slow dispatch.
@@ -376,7 +415,7 @@ Landed in the first foundation slice:
 - Workspace and thread page cursors are revision- and query-bound. A mutation or query mismatch produces an actionable restart-without-cursor error instead of silently duplicating or skipping rows.
 - Manual VM/systemd deployment and a locally built non-root Compose package now live in [Standalone Daemon Deployment](daemon-deployment.md).
 
-The open-source SSH path is now usable for desktop-configured, text-only native chat on a dedicated single-user VM/container. Still required for full parity: migrate the remaining desktop projections to bounded remote APIs; add optional OS credential-store hydration; add guided provider setup over a safe remote execution surface and deadline-bounded authentication probes; add repository add/clone/bind from the desktop; and complete attachment, audited file, reconnectable PTY, and remote TUI transport. Direct HTTPS, scoped token lifecycle, and signed multi-architecture image publishing are also pending.
+The open-source SSH path is now usable for desktop-configured, text-only native chat on a dedicated single-user VM/container. Still required for full parity: migrate the remaining desktop projections to bounded remote APIs; add desktop Pair credential import and optional OS credential-store hydration; add guided provider setup over a safe remote execution surface and deadline-bounded authentication probes; add repository add/clone/bind from the desktop; and complete attachment, audited file, reconnectable PTY, and remote TUI transport. Direct HTTPS and signed multi-architecture image publishing are also pending.
 
 ## Delivery plan
 
@@ -395,7 +434,8 @@ Exit: the local desktop can use daemon APIs for every state read needed by a rem
 
 - Keep server composition usable without the desktop binary.
 - Retain the public init/serve/status/provider/notify CLI surfaces.
-- Add the remaining service and persistent scoped-token administration helpers.
+- Add service lifecycle helpers. Local pairing-grant/device administration and
+  the loopback gateway's short-lived scoped credential exchange are landed.
 - Continue verifying the artifact stays free of GUI libraries.
 - Keep the desktop's local auto-management adapter separate.
 
@@ -404,7 +444,7 @@ Exit: a clean Linux VM can run the daemon without installing or launching the de
 ### 3. Authenticated loopback gateway and SSH profiles (manual SSH path landed)
 
 - Preserve the loopback-only, mandatory-token-file gateway and bounded browser sessions.
-- Add persistent token lifecycle and scopes.
+- Preserve the landed Pair credential lifecycle and centralized scope enforcement; add desktop Pair import plus optional OS credential-store hydration.
 - Preserve the landed desktop profile management (Settings › Runtimes & connections and the picker's "Add connection…") that uses the shared profile store lock and authoritative reload, retain the masked process-memory credential flow, and later add optional OS credential-store hydration. Preserve host-verification guidance, owned-relay supervision, health, reconnect, and redacted diagnostics.
 - Preserve the landed periodic authenticated heartbeat and generation-safe general RPC routing that validates the pinned runtime/instance pair inside every dispatched request before allowing remote execution.
 - Support multiple simultaneous runtime connections.
@@ -449,6 +489,27 @@ Exit: chat images, project selection, native chat, and terminal TUIs work after 
 
 Exit: a new user can deploy a runtime on an ordinary VM/container and connect without a Verde account.
 
+### 8. Optional Connect reference control plane (reference service landed)
+
+- Preserve the landed versioned, language-neutral OpenAPI/JSON Schema contract for OIDC
+  principals, runtime link challenge/proof, runtime inventory/descriptors,
+  scoped bootstrap request/response, unlink/revoke, signer/JWKS discovery,
+  audit events, and endpoint-provider adapters.
+- Preserve the landed self-hostable reference service with generic OIDC, signed and
+  replay-safe grant issuance, revocation/audit, and cryptographic conformance
+  vectors shared by every deployment.
+- Preserve the landed external operator-managed endpoint adapter, then add
+  runtime/desktop outbound connector lifecycle and optional managed adapters;
+  keep provider API credentials and tunnel-specific identifiers behind the
+  public adapter interface.
+- Allow private Verde Cloud to compose the same service with subscriptions,
+  provisioning, and managed operations without replacing the public contract
+  or reimplementing grant cryptography.
+
+Exit: an operator can self-host Connect identity, discovery, grants, and
+endpoint integration without a Verde account, while Serve/Pair remains usable
+without any control plane.
+
 ## Test matrix
 
 At minimum, test:
@@ -477,4 +538,6 @@ At minimum, test:
 - Reusing Herdr SSH profiles.
 - Exposing the Unix session socket over the network.
 - Multi-user authorization inside one daemon instance.
-- Requiring or implementing the Verde SaaS control plane in this repository.
+- Requiring any control plane for Serve/Pair or standalone VM/container use.
+- Treating private Verde Cloud subscriptions, provisioning, or operations as
+  part of this first runtime implementation.
