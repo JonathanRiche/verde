@@ -1775,6 +1775,47 @@ const ChatEvent = struct {
     }
 };
 
+const SteerAudit = struct {
+    const State = enum { in_flight, provider_accepted, published };
+
+    steer_id: []u8,
+    prompt: []u8,
+    image_paths: []const []u8,
+    state: State = .in_flight,
+    event_seq: ?u64 = null,
+
+    fn deinit(self: *SteerAudit, allocator: std.mem.Allocator) void {
+        allocator.free(self.steer_id);
+        allocator.free(self.prompt);
+        for (self.image_paths) |path| allocator.free(path);
+        allocator.free(self.image_paths);
+    }
+};
+
+const SteerInvocationCapture = struct {
+    provider: ?harness.Provider = null,
+    thread_id: [128]u8 = undefined,
+    thread_id_len: usize = 0,
+    turn_id: [128]u8 = undefined,
+    turn_id_len: usize = 0,
+
+    fn record(self: *SteerInvocationCapture, provider: harness.Provider, thread_id: []const u8, turn_id: []const u8) void {
+        self.provider = provider;
+        self.thread_id_len = @min(thread_id.len, self.thread_id.len);
+        @memcpy(self.thread_id[0..self.thread_id_len], thread_id[0..self.thread_id_len]);
+        self.turn_id_len = @min(turn_id.len, self.turn_id.len);
+        @memcpy(self.turn_id[0..self.turn_id_len], turn_id[0..self.turn_id_len]);
+    }
+
+    fn capturedThreadId(self: *const SteerInvocationCapture) []const u8 {
+        return self.thread_id[0..self.thread_id_len];
+    }
+
+    fn capturedTurnId(self: *const SteerInvocationCapture) []const u8 {
+        return self.turn_id[0..self.turn_id_len];
+    }
+};
+
 const ChatTurn = struct {
     allocator: std.mem.Allocator,
     /// Owning daemon, for waking parked `chat.turn.tail wait_ms` long-pollers
@@ -1795,6 +1836,9 @@ const ChatTurn = struct {
     mutex: ParkingMutex = .{},
     worker_thread: ?std.Thread = null,
     events: std.ArrayList(ChatEvent) = .empty,
+    /// Request identities retained for the life of the turn so an ambiguous
+    /// steering response can be retried without contacting the provider twice.
+    steers: std.ArrayList(SteerAudit) = .empty,
     next_seq: u64 = 1,
     status: ChatTurnStatus = .running,
     consumed: bool = false,
@@ -1816,6 +1860,8 @@ const ChatTurn = struct {
     acceptance_message_override: ?store_protocol.Message = null,
     /// Unit-test-only proof that a rejected acceptance never enters a provider.
     provider_invocation_count: ?*usize = null,
+    /// Unit-test-only capture of the exact provider steering identity.
+    steer_invocation_capture: ?*SteerInvocationCapture = null,
     /// Last durable-commit error name (diagnostic; dual-write-unread only).
     durability_error: ?[]u8 = null,
     provider_thread_id: ?[]u8 = null,
@@ -1849,6 +1895,8 @@ const ChatTurn = struct {
         if (self.owned_images.len > 0) allocator.free(self.owned_images);
         for (self.events.items) |*event| event.deinit(allocator);
         self.events.deinit(allocator);
+        for (self.steers.items) |*steer| steer.deinit(allocator);
+        self.steers.deinit(allocator);
         if (self.user_message_id) |value| allocator.free(value);
         if (self.durability_error) |value| allocator.free(value);
         if (self.provider_thread_id) |value| allocator.free(value);
@@ -1861,10 +1909,10 @@ const ChatTurn = struct {
         allocator.destroy(self);
     }
 
-    fn appendEvent(self: *ChatTurn, allocator: std.mem.Allocator, kind: []const u8, payload_json: []const u8) void {
-        const owned_kind = allocator.dupe(u8, kind) catch return;
+    fn appendEventFallible(self: *ChatTurn, allocator: std.mem.Allocator, kind: []const u8, payload_json: []const u8) !u64 {
+        const owned_kind = try allocator.dupe(u8, kind);
         errdefer allocator.free(owned_kind);
-        const owned_payload = allocator.dupe(u8, payload_json) catch return;
+        const owned_payload = try allocator.dupe(u8, payload_json);
         errdefer allocator.free(owned_payload);
         var event: ChatEvent = .{
             .seq = self.next_seq,
@@ -1872,13 +1920,19 @@ const ChatTurn = struct {
             .payload_json = owned_payload,
         };
         errdefer event.deinit(allocator);
-        self.events.append(allocator, event) catch return;
+        try self.events.append(allocator, event);
+        const seq = self.next_seq;
         self.next_seq += 1;
         // Missed-wake protocol twin of appendJournalEntry: the event is
         // visible (under this turn's mutex) before the signal bump, and a
         // tail waiter loads the signal word before reading turn state — so
         // it either sees this event or its futex expectation is stale.
         if (self.daemon) |owner| owner.signalTurnEventWaiters();
+        return seq;
+    }
+
+    fn appendEvent(self: *ChatTurn, allocator: std.mem.Allocator, kind: []const u8, payload_json: []const u8) void {
+        _ = self.appendEventFallible(allocator, kind, payload_json) catch return;
     }
 
     fn appendStringEvent(self: *ChatTurn, allocator: std.mem.Allocator, kind: []const u8, field: []const u8, value: []const u8) void {
@@ -1894,6 +1948,110 @@ const ChatTurn = struct {
         self.appendEvent(allocator, kind, payload);
     }
 };
+
+fn initSteerAudit(
+    allocator: std.mem.Allocator,
+    steer_id: []const u8,
+    prompt: []const u8,
+    image_paths: []const []const u8,
+) !SteerAudit {
+    var audit: SteerAudit = .{
+        .steer_id = try allocator.dupe(u8, steer_id),
+        .prompt = undefined,
+        .image_paths = undefined,
+    };
+    errdefer allocator.free(audit.steer_id);
+    audit.prompt = try allocator.dupe(u8, prompt);
+    errdefer allocator.free(audit.prompt);
+    const owned_paths = try allocator.alloc([]u8, image_paths.len);
+    var copied: usize = 0;
+    errdefer {
+        for (owned_paths[0..copied]) |path| allocator.free(path);
+        allocator.free(owned_paths);
+    }
+    for (image_paths, 0..) |path, index| {
+        owned_paths[index] = try allocator.dupe(u8, path);
+        copied += 1;
+    }
+    audit.image_paths = owned_paths;
+    return audit;
+}
+
+fn findSteerAuditIndex(turn: *const ChatTurn, steer_id: []const u8) ?usize {
+    for (turn.steers.items, 0..) |steer, index| {
+        if (std.mem.eql(u8, steer.steer_id, steer_id)) return index;
+    }
+    return null;
+}
+
+fn findSteerAudit(turn: *ChatTurn, steer_id: []const u8) ?*SteerAudit {
+    const index = findSteerAuditIndex(turn, steer_id) orelse return null;
+    return &turn.steers.items[index];
+}
+
+fn steerAuditMatches(audit: *const SteerAudit, prompt: []const u8, image_paths: []const []const u8) bool {
+    if (!std.mem.eql(u8, audit.prompt, prompt) or audit.image_paths.len != image_paths.len) return false;
+    for (audit.image_paths, image_paths) |left, right| {
+        if (!std.mem.eql(u8, left, right)) return false;
+    }
+    return true;
+}
+
+fn steerMessageIdAlloc(allocator: std.mem.Allocator, turn_id: []const u8, steer_id: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "turn:{s}:steer:{s}", .{ turn_id, steer_id });
+}
+
+/// `chat.turn.tail` steer event payload. This additive event shape is stable:
+/// `{steer_id,message_id,title,body,images:[{path,mime,byte_size}]}`.
+fn publishSteerAudit(allocator: std.mem.Allocator, turn: *ChatTurn, audit: *SteerAudit) !u64 {
+    std.debug.assert(audit.state == .provider_accepted);
+    const message_id = try steerMessageIdAlloc(allocator, turn.turn_id, audit.steer_id);
+    defer allocator.free(message_id);
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try s.beginObject();
+    try s.objectField("steer_id");
+    try s.write(audit.steer_id);
+    try s.objectField("message_id");
+    try s.write(message_id);
+    try s.objectField("title");
+    try s.write("Steering current turn");
+    try s.objectField("body");
+    try s.write(audit.prompt);
+    try s.objectField("images");
+    try s.beginArray();
+    for (audit.image_paths) |path| {
+        try s.write(.{ .path = path, .mime = "", .byte_size = @as(u64, 0) });
+    }
+    try s.endArray();
+    try s.endObject();
+    const payload = try writer.toOwnedSlice();
+    defer allocator.free(payload);
+    const seq = try turn.appendEventFallible(allocator, "steer", payload);
+    audit.state = .published;
+    audit.event_seq = seq;
+    return seq;
+}
+
+fn steerAcceptedResponse(
+    allocator: std.mem.Allocator,
+    id_value: std.json.Value,
+    turn_id: []const u8,
+    audit: *const SteerAudit,
+    duplicate: bool,
+) ![]u8 {
+    const message_id = try steerMessageIdAlloc(allocator, turn_id, audit.steer_id);
+    defer allocator.free(message_id);
+    return okValueResponse(allocator, id_value, .{
+        .accepted = true,
+        .turn_id = turn_id,
+        .steer_id = audit.steer_id,
+        .message_id = message_id,
+        .event_seq = audit.event_seq.?,
+        .duplicate = duplicate,
+    });
+}
 
 fn freeRunnerRequest(allocator: std.mem.Allocator, request: send_runner.Request, image_paths: []const []const u8) void {
     allocator.free(request.project_path);
@@ -5449,15 +5607,16 @@ pub const Daemon = struct {
         return try okValueResponse(self.allocator, id_value, .{ .accepted = true });
     }
 
-    /// Inject a Claude/Pi follow-up into the exact provider process owned by
-    /// this daemon.
-    /// The provider call runs outside lockDaemon; only stable request identity is
-    /// copied while the turn is borrowed.
+    /// Inject a Codex/Claude/Pi follow-up into the exact provider process owned by
+    /// this daemon. `steer_id` is the idempotency boundary: after provider
+    /// acknowledgement, retries return the original sequenced audit event and
+    /// never call the provider again.
     fn chatTurnSteerResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
         if (params != .object) return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object");
         const turn_id = jsonString(params.object.get("turn_id") orelse .null) orelse
             return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing turn_id");
         const prompt = jsonString(params.object.get("prompt") orelse .null) orelse "";
+        const requested_steer_id = jsonString(params.object.get("steer_id") orelse .null);
         const image_paths = try jsonStringArray(self.allocator, params.object.get("image_paths") orelse .null);
         defer freeStringArray(self.allocator, image_paths);
         if (std.mem.trim(u8, prompt, &std.ascii.whitespace).len == 0 and image_paths.len == 0) {
@@ -5474,8 +5633,58 @@ pub const Daemon = struct {
             return try errorResponseAlloc(self.allocator, id_value, "not_found", "turn not found");
         };
         lockTurn(turn);
+        const steer_id = requested_steer_id orelse std.fmt.allocPrint(
+            self.allocator,
+            "daemon-steer-{d}-{d}",
+            .{ nowMs(), turn.steers.items.len },
+        ) catch |err| {
+            turn.mutex.unlock();
+            self.mutex.unlock();
+            return err;
+        };
+        defer if (requested_steer_id == null) self.allocator.free(steer_id);
+        if (findSteerAudit(turn, steer_id)) |existing| {
+            if (!steerAuditMatches(existing, prompt, image_paths)) {
+                turn.mutex.unlock();
+                self.mutex.unlock();
+                return try errorResponseAlloc(self.allocator, id_value, "conflict", "steer_id was already used with different content");
+            }
+            switch (existing.state) {
+                .published => {
+                    const response = steerAcceptedResponse(self.allocator, id_value, turn.turn_id, existing, true) catch |err| {
+                        turn.mutex.unlock();
+                        self.mutex.unlock();
+                        return err;
+                    };
+                    turn.mutex.unlock();
+                    self.mutex.unlock();
+                    return response;
+                },
+                .provider_accepted => {
+                    const event_seq = publishSteerAudit(self.allocator, turn, existing) catch |err| {
+                        turn.mutex.unlock();
+                        self.mutex.unlock();
+                        return err;
+                    };
+                    const response = steerAcceptedResponse(self.allocator, id_value, turn.turn_id, existing, true) catch |err| {
+                        turn.mutex.unlock();
+                        self.mutex.unlock();
+                        return err;
+                    };
+                    std.debug.assert(existing.event_seq == event_seq);
+                    turn.mutex.unlock();
+                    self.mutex.unlock();
+                    return response;
+                },
+                .in_flight => {
+                    turn.mutex.unlock();
+                    self.mutex.unlock();
+                    return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "steer request is still in progress");
+                },
+            }
+        }
         const steer_provider = turn.request.provider;
-        if ((steer_provider != .claude and steer_provider != .pi) or turn.request.harness_kind != .local_cli) {
+        if ((steer_provider != .codex and steer_provider != .claude and steer_provider != .pi) or turn.request.harness_kind != .local_cli) {
             turn.mutex.unlock();
             self.mutex.unlock();
             return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "provider does not support daemon steering");
@@ -5485,7 +5694,9 @@ pub const Daemon = struct {
             self.mutex.unlock();
             return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "turn cannot accept steering now");
         }
-        const provider_thread_id = turn.provider_thread_id orelse turn.request.provider_thread_id orelse {
+        const provider_thread_id = turn.provider_thread_id orelse turn.request.provider_thread_id orelse if (turn.use_stub)
+            "stub-provider-thread"
+        else {
             turn.mutex.unlock();
             self.mutex.unlock();
             return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "provider thread is not ready");
@@ -5495,37 +5706,91 @@ pub const Daemon = struct {
             self.mutex.unlock();
             return err;
         };
-        const owned_project_path = self.allocator.dupe(u8, turn.request.project_path) catch |err| {
+        const provider_turn_id = if (steer_provider == .codex)
+            turn.active_turn_id orelse {
+                self.allocator.free(owned_provider_thread_id);
+                turn.mutex.unlock();
+                self.mutex.unlock();
+                return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "Codex active turn is not ready");
+            }
+        else
+            "";
+        const owned_provider_turn_id = self.allocator.dupe(u8, provider_turn_id) catch |err| {
             self.allocator.free(owned_provider_thread_id);
             turn.mutex.unlock();
             self.mutex.unlock();
             return err;
         };
+        const owned_project_path = self.allocator.dupe(u8, turn.request.project_path) catch |err| {
+            self.allocator.free(owned_provider_turn_id);
+            self.allocator.free(owned_provider_thread_id);
+            turn.mutex.unlock();
+            self.mutex.unlock();
+            return err;
+        };
+        var steer_audit = initSteerAudit(self.allocator, steer_id, prompt, image_paths) catch |err| {
+            self.allocator.free(owned_project_path);
+            self.allocator.free(owned_provider_turn_id);
+            self.allocator.free(owned_provider_thread_id);
+            turn.mutex.unlock();
+            self.mutex.unlock();
+            return err;
+        };
+        turn.steers.append(self.allocator, steer_audit) catch |err| {
+            steer_audit.deinit(self.allocator);
+            self.allocator.free(owned_project_path);
+            self.allocator.free(owned_provider_turn_id);
+            self.allocator.free(owned_provider_thread_id);
+            turn.mutex.unlock();
+            self.mutex.unlock();
+            return err;
+        };
+        const use_stub = turn.use_stub;
+        const provider_invocation_count = turn.provider_invocation_count;
+        const steer_invocation_capture = turn.steer_invocation_capture;
         turn.mutex.unlock();
         self.mutex.unlock();
         defer self.allocator.free(owned_provider_thread_id);
+        defer self.allocator.free(owned_provider_turn_id);
         defer self.allocator.free(owned_project_path);
 
         const steer_config: harness.ProviderConfig = switch (steer_provider) {
+            .codex => .{ .codex = .{ .cwd = owned_project_path, .launch_on_connect = false } },
             .pi => .{ .pi = .{ .cwd = owned_project_path } },
             else => .{ .claude = .{ .cwd = owned_project_path } },
         };
-        var client = harness.connect(self.allocator, steer_config) catch {
-            return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "provider bridge is unavailable");
+        const provider_accepted = if (use_stub) blk: {
+            if (provider_invocation_count) |count| count.* += 1;
+            if (steer_invocation_capture) |capture| capture.record(steer_provider, owned_provider_thread_id, owned_provider_turn_id);
+            break :blk std.mem.indexOf(u8, prompt, "reject steer") == null;
+        } else blk: {
+            var client = harness.connect(self.allocator, steer_config) catch break :blk false;
+            defer client.deinit();
+            const images = try self.allocator.alloc(harness.types.ImageAttachment, image_paths.len);
+            defer self.allocator.free(images);
+            for (image_paths, 0..) |path, index| images[index] = .{ .path = path };
+            client.steerThread(.{
+                .thread_id = owned_provider_thread_id,
+                .turn_id = owned_provider_turn_id,
+                .prompt = prompt,
+                .images = images,
+            }) catch break :blk false;
+            break :blk true;
         };
-        defer client.deinit();
-        const images = try self.allocator.alloc(harness.types.ImageAttachment, image_paths.len);
-        defer self.allocator.free(images);
-        for (image_paths, 0..) |path, index| images[index] = .{ .path = path };
-        client.steerThread(.{
-            .thread_id = owned_provider_thread_id,
-            .turn_id = "",
-            .prompt = prompt,
-            .images = images,
-        }) catch {
+
+        lockTurn(turn);
+        const audit_index = findSteerAuditIndex(turn, steer_id) orelse unreachable;
+        if (!provider_accepted) {
+            var rejected = turn.steers.orderedRemove(audit_index);
+            turn.mutex.unlock();
+            rejected.deinit(self.allocator);
             return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "provider could not accept steering for this turn");
-        };
-        return try okValueResponse(self.allocator, id_value, .{ .accepted = true });
+        }
+        defer turn.mutex.unlock();
+        const audit = &turn.steers.items[audit_index];
+        audit.state = .provider_accepted;
+        _ = try publishSteerAudit(self.allocator, turn, audit);
+        return try steerAcceptedResponse(self.allocator, id_value, turn.turn_id, audit, false);
     }
 
     /// Resolve the running daemon turn by stable thread identity, then reuse
@@ -5575,6 +5840,9 @@ pub const Daemon = struct {
         defer steer_params.deinit(self.allocator);
         try steer_params.put(self.allocator, "turn_id", .{ .string = turn_id });
         try steer_params.put(self.allocator, "prompt", .{ .string = prompt });
+        if (params.object.get("steer_id")) |steer_id| {
+            try steer_params.put(self.allocator, "steer_id", steer_id);
+        }
         if (params.object.get("image_paths")) |image_paths| {
             try steer_params.put(self.allocator, "image_paths", image_paths);
         }
@@ -9957,7 +10225,7 @@ fn runStubChatTurn(allocator: std.mem.Allocator, turn: *ChatTurn) void {
     const want_slow = std.mem.indexOf(u8, prompt, "slow") != null;
     if (want_slow) {
         // Keep the stall short enough for IT budgets but long enough to race a kill.
-        platform_runtime.sleepMillis(400);
+        platform_runtime.sleepMillis(if (std.mem.indexOf(u8, prompt, "steer target") != null) 1_500 else 400);
     }
     lockTurn(turn);
     defer turn.mutex.unlock();
@@ -10783,6 +11051,117 @@ test "chat.followup resolves running turns daemon-side and rejects idle or unsup
     const unsupported_error = unsupported.value.object.get("error").?.object;
     try std.testing.expectEqualStrings("invalid_state", unsupported_error.get("code").?.string);
     try std.testing.expectEqualStrings("provider does not support daemon steering", unsupported_error.get("message").?.string);
+}
+
+test "Codex daemon steering uses provider identities and deduplicates ambiguous retry" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+
+    const turn = try appendTestChatTurn(
+        &daemon,
+        allocator,
+        "steer-turn",
+        "steer-workspace",
+        "/tmp/steer",
+        "Steering",
+        "original slow prompt",
+        .running,
+        1,
+    );
+    turn.request.provider = .codex;
+    turn.use_stub = true;
+    var provider_calls: usize = 0;
+    turn.provider_invocation_count = &provider_calls;
+    turn.provider_thread_id = try allocator.dupe(u8, "provider-thread");
+    turn.active_turn_id = try allocator.dupe(u8, "active-turn-42");
+    var invocation: SteerInvocationCapture = .{};
+    turn.steer_invocation_capture = &invocation;
+
+    const accepted_request =
+        \\{"jsonrpc":"2.0","id":1,"method":"chat.followup","params":{"workspace_id":"steer-workspace","local_thread_id":"local-thread","steer_id":"steer-stable-1","prompt":"change direction","image_paths":["/tmp/a.png"]}}
+    ;
+    const accepted_response = try daemon.handleRequest(accepted_request);
+    defer allocator.free(accepted_response);
+    var accepted = try std.json.parseFromSlice(std.json.Value, allocator, accepted_response, .{});
+    defer accepted.deinit();
+    const accepted_result = accepted.value.object.get("result").?.object;
+    try std.testing.expect(accepted_result.get("accepted").?.bool);
+    try std.testing.expectEqualStrings("steer-stable-1", accepted_result.get("steer_id").?.string);
+    try std.testing.expectEqual(@as(i64, 1), accepted_result.get("event_seq").?.integer);
+    try std.testing.expect(!accepted_result.get("duplicate").?.bool);
+    try std.testing.expectEqual(@as(usize, 1), provider_calls);
+    try std.testing.expectEqual(harness.Provider.codex, invocation.provider.?);
+    try std.testing.expectEqualStrings("provider-thread", invocation.capturedThreadId());
+    try std.testing.expectEqualStrings("active-turn-42", invocation.capturedTurnId());
+    try std.testing.expectEqual(@as(usize, 1), turn.events.items.len);
+    try std.testing.expectEqualStrings("steer", turn.events.items[0].kind);
+    try std.testing.expect(std.mem.indexOf(u8, turn.events.items[0].payload_json, "Steering current turn") != null);
+    try std.testing.expect(std.mem.indexOf(u8, turn.events.items[0].payload_json, "/tmp/a.png") != null);
+
+    // Simulates a lost first response: the caller repeats the same stable id.
+    const retry_response = try daemon.handleRequest(accepted_request);
+    defer allocator.free(retry_response);
+    var retry = try std.json.parseFromSlice(std.json.Value, allocator, retry_response, .{});
+    defer retry.deinit();
+    try std.testing.expect(retry.value.object.get("result").?.object.get("duplicate").?.bool);
+    try std.testing.expectEqual(@as(usize, 1), provider_calls);
+    try std.testing.expectEqual(@as(usize, 1), turn.events.items.len);
+
+    const conflict_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":2,"method":"chat.followup","params":{"workspace_id":"steer-workspace","local_thread_id":"local-thread","steer_id":"steer-stable-1","prompt":"different content"}}
+    );
+    defer allocator.free(conflict_response);
+    var conflict = try std.json.parseFromSlice(std.json.Value, allocator, conflict_response, .{});
+    defer conflict.deinit();
+    try std.testing.expectEqualStrings("conflict", conflict.value.object.get("error").?.object.get("code").?.string);
+    try std.testing.expectEqual(@as(usize, 1), provider_calls);
+
+    const rejected_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":3,"method":"chat.followup","params":{"workspace_id":"steer-workspace","local_thread_id":"local-thread","steer_id":"steer-rejected","prompt":"reject steer"}}
+    );
+    defer allocator.free(rejected_response);
+    var rejected = try std.json.parseFromSlice(std.json.Value, allocator, rejected_response, .{});
+    defer rejected.deinit();
+    try std.testing.expectEqualStrings("invalid_state", rejected.value.object.get("error").?.object.get("code").?.string);
+    try std.testing.expectEqual(@as(usize, 2), provider_calls);
+    try std.testing.expectEqual(@as(usize, 1), turn.events.items.len);
+}
+
+test "Codex daemon steering rejects a missing active turn identity without audit" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+
+    const turn = try appendTestChatTurn(
+        &daemon,
+        allocator,
+        "steer-missing-active-turn",
+        "steer-workspace",
+        "/tmp/steer",
+        "Steering",
+        "original slow prompt",
+        .running,
+        1,
+    );
+    turn.request.provider = .codex;
+    turn.use_stub = true;
+    var provider_calls: usize = 0;
+    turn.provider_invocation_count = &provider_calls;
+    turn.provider_thread_id = try allocator.dupe(u8, "provider-thread");
+
+    const response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"chat.followup","params":{"workspace_id":"steer-workspace","local_thread_id":"local-thread","steer_id":"missing-active","prompt":"change direction"}}
+    );
+    defer allocator.free(response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const err = parsed.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings("invalid_state", err.get("code").?.string);
+    try std.testing.expectEqualStrings("Codex active turn is not ready", err.get("message").?.string);
+    try std.testing.expectEqual(@as(usize, 0), provider_calls);
+    try std.testing.expectEqual(@as(usize, 0), turn.steers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), turn.events.items.len);
 }
 
 test "chat turns project into process.list as turn records" {

@@ -83,7 +83,7 @@ pub fn apply(
             const object = try payload.object();
             const text = jsonString(object, "text") orelse continue;
             try partial_text.appendSlice(allocator, text);
-        } else if (std.mem.eql(u8, event.kind, "message")) {
+        } else if (std.mem.eql(u8, event.kind, "message") or std.mem.eql(u8, event.kind, "steer")) {
             try flushAssistant(allocator, &rows, &partial_text, outcome.provider);
             try appendMessageEvent(allocator, &rows, event.payload_json);
         } else if (std.mem.eql(u8, event.kind, "tool_call")) {
@@ -776,6 +776,22 @@ test "failed outcome appends GUI failure row and preserves images" {
     try std.testing.expectEqual(@as(usize, 2), messages[0].images.len);
     try std.testing.expectEqualStrings("a.png", messages[0].images[0].path);
     try std.testing.expectEqualStrings("No provider", messages[1].body);
+}
+
+test "accepted steer event becomes an identified durable system row" {
+    const allocator = std.testing.allocator;
+    const events = [_]ChatEvent{.{
+        .kind = "steer",
+        .payload_json = "{\"steer_id\":\"s1\",\"message_id\":\"turn:t1:steer:s1\",\"title\":\"Steering current turn\",\"body\":\"change direction\",\"images\":[{\"path\":\"a.png\",\"mime\":\"image/png\",\"byte_size\":4}]}",
+    }};
+    const messages = try apply(allocator, &events, .{ .status = .completed, .provider = "claude" });
+    defer freeMessages(allocator, messages);
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expectEqualStrings("system", messages[0].role);
+    try std.testing.expectEqualStrings("Steering current turn", messages[0].author);
+    try std.testing.expectEqualStrings("change direction", messages[0].body);
+    try std.testing.expectEqualStrings("turn:t1:steer:s1", messages[0].message_id);
+    try std.testing.expectEqualStrings("a.png", messages[0].images[0].path);
 }
 
 test "golden event stream matches the ordered GUI rows" {

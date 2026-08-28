@@ -8967,6 +8967,8 @@ fn runChatMcpToolLayerScenario(allocator: std.mem.Allocator, io: std.Io) !void {
 
     const self_exe = try std.process.executablePathAlloc(io, allocator);
     defer allocator.free(self_exe);
+    var reopen_thread_id: ?[]u8 = null;
+    defer if (reopen_thread_id) |value| allocator.free(value);
 
     // --- Arm 1: full pipeline against a chat-stub store daemon ---
     {
@@ -9004,44 +9006,23 @@ fn runChatMcpToolLayerScenario(allocator: std.mem.Allocator, io: std.Io) !void {
             defer parsed.deinit();
             if (!parsed.response.isOk()) return error.McpToolLayerWorkspaceUpsertFailed;
 
-            // Amendment 1 (mandatory first item): execute the production
-            // Live-arm durability confirm against this hermetic daemon. Seed
-            // one durable thread exactly as the GUI's async store write does,
-            // then prove both the success and bounded-timeout outcomes. The
-            // endpoint override installed above keeps ensureSessionDaemon and
-            // every helper poll on this tmpDir-only daemon.
+            // Seed one thread for the protocol-era read probe and the idle
+            // pane-resolution check below. This is fixture data, not an
+            // open_chat durability confirmation loop.
             const thread_request: headless.store.ThreadUpsertRequest = .{
-                .mutation = .{ .request_key = "m4p5-confirm-thread", .client_id = client_id },
+                .mutation = .{ .request_key = "mcp-fixture-thread", .client_id = client_id },
                 .workspace_id = "ws-mcp",
                 .thread = .{
                     .local_thread_id = "thread-confirm-durable",
-                    .title = "Confirm helper pin",
+                    .title = "MCP fixture thread",
                     .provider = "codex",
                     .harness = "local_cli",
                 },
             };
             var thread_parsed = try client.call(headless.store.METHOD_CHAT_THREAD_UPSERT, thread_request);
             defer thread_parsed.deinit();
-            if (!thread_parsed.response.isOk()) return error.McpConfirmThreadUpsertFailed;
+            if (!thread_parsed.response.isOk()) return error.McpFixtureThreadUpsertFailed;
 
-            const durable = try cli_main.chatOpenConfirmThreadDurable(
-                allocator,
-                io,
-                "ws-mcp",
-                "thread-confirm-durable",
-                2,
-                10,
-            );
-            if (durable != .durable) return error.McpConfirmDurableOutcome;
-            const missing = try cli_main.chatOpenConfirmThreadDurable(
-                allocator,
-                io,
-                "ws-mcp",
-                "thread-confirm-missing",
-                2,
-                10,
-            );
-            if (missing != .timeout) return error.McpConfirmMissingOutcome;
         }
 
         var mcp = try spawnMcpChild(allocator, io, self_exe, pref_path);
@@ -9081,7 +9062,7 @@ fn runChatMcpToolLayerScenario(allocator: std.mem.Allocator, io: std.Io) !void {
             const meta = .{
                 .@"io.modelcontextprotocol/protocolVersion" = mcp_http.MODERN_PROTOCOL_VERSION,
                 .@"io.modelcontextprotocol/clientInfo" = .{ .name = "verde-headless-it", .version = "1" },
-                .@"io.modelcontextprotocol/clientCapabilities" = .{},
+                .@"io.modelcontextprotocol/clientCapabilities" = std.json.Value{ .object = .empty },
             };
             const request = try std.json.Stringify.valueAlloc(allocator, .{
                 .jsonrpc = "2.0",
@@ -9106,12 +9087,12 @@ fn runChatMcpToolLayerScenario(allocator: std.mem.Allocator, io: std.Io) !void {
                 .id = next_id,
                 .method = "tools/call",
                 .params = .{
-                    .name = "list_workspaces",
-                    .arguments = .{},
+                    .name = "read_chat_thread",
+                    .arguments = .{ .workspace_id = "ws-mcp", .local_thread_id = "thread-confirm-durable" },
                     ._meta = .{
                         .@"io.modelcontextprotocol/protocolVersion" = mcp_http.MODERN_PROTOCOL_VERSION,
                         .@"io.modelcontextprotocol/clientInfo" = .{ .name = "verde-headless-it", .version = "1" },
-                        .@"io.modelcontextprotocol/clientCapabilities" = .{},
+                        .@"io.modelcontextprotocol/clientCapabilities" = std.json.Value{ .object = .empty },
                     },
                 },
             }, .{});
@@ -9213,7 +9194,7 @@ fn runChatMcpToolLayerScenario(allocator: std.mem.Allocator, io: std.Io) !void {
         {
             const request = try mcpToolCallRequestAlloc(allocator, next_id, "open_chat", .{
                 .workspace_id = "ws-mcp",
-                .provider = "codex",
+                .provider = "claude",
             });
             defer allocator.free(request);
             next_id += 1;
@@ -9239,7 +9220,49 @@ fn runChatMcpToolLayerScenario(allocator: std.mem.Allocator, io: std.Io) !void {
             if (created != .bool or !created.bool) return error.McpOpenChatCreated;
             const presented = jsonObjectField(result, "presented") orelse return error.McpOpenChatShape;
             if (presented != .bool or presented.bool) return error.McpOpenChatPresented;
+            const presentation_status = jsonObjectField(result, "presentation_status") orelse return error.McpOpenChatShape;
+            if (presentation_status != .string or !std.mem.eql(u8, presentation_status.string, "gui_unavailable")) return error.McpOpenChatPresentationStatus;
+            const retryable = jsonObjectField(result, "retryable") orelse return error.McpOpenChatShape;
+            if (retryable != .bool or !retryable.bool) return error.McpOpenChatRetryable;
+            const retry_tool = jsonObjectField(result, "retry_tool") orelse return error.McpOpenChatShape;
+            if (retry_tool != .string or !std.mem.eql(u8, retry_tool.string, "present_chat")) return error.McpOpenChatRetryTool;
             local_thread_id = try allocator.dupe(u8, id_value.string);
+            reopen_thread_id = try allocator.dupe(u8, id_value.string);
+        }
+
+        // Point the persisted pane at the newly opened Claude thread so the
+        // daemon-direct follow-up tool resolves it without GUI state.
+        {
+            var decode_arena = std.heap.ArenaAllocator.init(allocator);
+            defer decode_arena.deinit();
+            const arena = decode_arena.allocator();
+            var transport: sessionizer.HeadlessTransport = .{ .allocator = arena, .pref_path = pref_path };
+            var client = sessionizer.headlessClient(arena, &transport);
+            var reg = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+            defer reg.deinit();
+            if (!reg.response.isOk()) return error.McpSteerRegisterFailed;
+            const client_id = (try client.decodeClientRegister(&reg)).client_id;
+            var list = try client.call(headless.store.METHOD_CHAT_THREAD_LIST, .{ .workspace_id = "ws-mcp", .limit = @as(u32, 100) });
+            defer list.deinit();
+            if (!list.response.isOk()) return error.McpSteerThreadListFailed;
+            const threads = (try client.decodeThreadList(&list)).threads;
+            var sort_index: ?usize = null;
+            for (threads) |thread| if (std.mem.eql(u8, thread.local_thread_id, local_thread_id.?)) {
+                sort_index = thread.sort_index;
+                break;
+            };
+            const layout_json = try std.fmt.allocPrint(arena, "{{\"v\":2,\"panes\":[{{\"id\":7,\"kind\":\"chat\",\"thread\":{d}}}]}}", .{sort_index orelse return error.McpSteerThreadMissing});
+            var upsert = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, headless.store.WorkspaceUpsertRequest{
+                .mutation = .{ .request_key = "mcp-steer-pane", .client_id = client_id },
+                .workspace = .{
+                    .workspace_id = "ws-mcp",
+                    .label = "ws-mcp",
+                    .path = pref_path,
+                    .workspace_layout_json = layout_json,
+                },
+            });
+            defer upsert.deinit();
+            if (!upsert.response.isOk()) return error.McpSteerWorkspaceUpsertFailed;
         }
 
         // Draft tools stage and retrieve text without starting a real turn.
@@ -9297,7 +9320,7 @@ fn runChatMcpToolLayerScenario(allocator: std.mem.Allocator, io: std.Io) !void {
             const request = try mcpToolCallRequestAlloc(allocator, next_id, "send_chat_message", .{
                 .workspace_id = "ws-mcp",
                 .local_thread_id = local_thread_id.?,
-                .prompt = "hello mcp tool layer",
+                .prompt = "slow steer target hello mcp tool layer",
                 .project_path = pref_path,
             });
             defer allocator.free(request);
@@ -9320,6 +9343,80 @@ fn runChatMcpToolLayerScenario(allocator: std.mem.Allocator, io: std.Io) !void {
             const turn_value = jsonObjectField(result, "turn_id") orelse return error.McpSendNoTurnId;
             if (turn_value != .string) return error.McpSendShape;
             turn_id = try allocator.dupe(u8, turn_value.string);
+        }
+
+        // Rejection publishes nothing; acceptance publishes one documented
+        // steer event. Reissuing the same steer_id simulates an ambiguous/lost
+        // MCP response and must not contact the provider or append again.
+        {
+            const request = try mcpToolCallRequestAlloc(allocator, next_id, "queue_chat_followup", .{
+                .workspace_id = "ws-mcp",
+                .pane_id = 7,
+                .prompt = "reject steer",
+                .steer_id = "mcp-steer-rejected",
+            });
+            defer allocator.free(request);
+            next_id += 1;
+            var response = try mcpChildCallParsed(allocator, io, &mcp, &reader, request, MCP_CHILD_READ_TIMEOUT_MS);
+            defer response.deinit();
+            const tool_text = try mcpToolTextFromResponseAlloc(allocator, response.value);
+            defer allocator.free(tool_text.text);
+            var envelope = try std.json.parseFromSlice(std.json.Value, allocator, tool_text.text, .{});
+            defer envelope.deinit();
+            const ok = jsonObjectField(envelope.value, "ok") orelse return error.McpSteerRejectShape;
+            if (ok != .bool or ok.bool) return error.McpSteerRejectAccepted;
+        }
+        var accepted_event_seq: i64 = 0;
+        for (0..2) |attempt| {
+            const request = try mcpToolCallRequestAlloc(allocator, next_id, "queue_chat_followup", .{
+                .workspace_id = "ws-mcp",
+                .pane_id = 7,
+                .prompt = "change direction",
+                .image_paths = &.{"/tmp/steer.png"},
+                .steer_id = "mcp-steer-stable",
+            });
+            defer allocator.free(request);
+            next_id += 1;
+            var response = try mcpChildCallParsed(allocator, io, &mcp, &reader, request, MCP_CHILD_READ_TIMEOUT_MS);
+            defer response.deinit();
+            const tool_text = try mcpToolTextFromResponseAlloc(allocator, response.value);
+            defer allocator.free(tool_text.text);
+            if (tool_text.is_error) return error.McpSteerToolError;
+            var envelope = try std.json.parseFromSlice(std.json.Value, allocator, tool_text.text, .{});
+            defer envelope.deinit();
+            const result = jsonObjectField(envelope.value, "result") orelse return error.McpSteerShape;
+            const steer_id = jsonObjectField(result, "steer_id") orelse return error.McpSteerShape;
+            const event_seq = jsonObjectField(result, "event_seq") orelse return error.McpSteerShape;
+            const duplicate = jsonObjectField(result, "duplicate") orelse return error.McpSteerShape;
+            if (steer_id != .string or !std.mem.eql(u8, steer_id.string, "mcp-steer-stable")) return error.McpSteerIdentity;
+            if (event_seq != .integer) return error.McpSteerShape;
+            if (attempt == 0) accepted_event_seq = event_seq.integer else if (event_seq.integer != accepted_event_seq) return error.McpSteerRetrySequence;
+            if (duplicate != .bool or duplicate.bool != (attempt == 1)) return error.McpSteerRetryDisposition;
+        }
+        {
+            const request = try mcpToolCallRequestAlloc(allocator, next_id, "tail_chat_turn", .{ .turn_id = turn_id.? });
+            defer allocator.free(request);
+            next_id += 1;
+            var response = try mcpChildCallParsed(allocator, io, &mcp, &reader, request, MCP_CHILD_READ_TIMEOUT_MS);
+            defer response.deinit();
+            const tool_text = try mcpToolTextFromResponseAlloc(allocator, response.value);
+            defer allocator.free(tool_text.text);
+            var envelope = try std.json.parseFromSlice(std.json.Value, allocator, tool_text.text, .{});
+            defer envelope.deinit();
+            const result = jsonObjectField(envelope.value, "result") orelse return error.McpSteerTailShape;
+            const events = jsonObjectField(result, "events") orelse return error.McpSteerTailShape;
+            if (events != .array) return error.McpSteerTailShape;
+            var steer_count: usize = 0;
+            for (events.array.items) |event| {
+                const kind = jsonObjectField(event, "kind") orelse continue;
+                if (kind != .string or !std.mem.eql(u8, kind.string, "steer")) continue;
+                steer_count += 1;
+                const payload_json = jsonObjectField(event, "payload_json") orelse return error.McpSteerTailShape;
+                if (payload_json != .string or std.mem.indexOf(u8, payload_json.string, "Steering current turn") == null or
+                    std.mem.indexOf(u8, payload_json.string, "change direction") == null or
+                    std.mem.indexOf(u8, payload_json.string, "/tmp/steer.png") == null) return error.McpSteerTailPayload;
+            }
+            if (steer_count != 1) return error.McpSteerTailCount;
         }
 
         // tail_chat_turn → streamed assistant_delta, then terminal completed
@@ -9436,13 +9533,22 @@ fn runChatMcpToolLayerScenario(allocator: std.mem.Allocator, io: std.Io) !void {
             for (messages.array.items) |message| {
                 const body = jsonObjectField(message, "body") orelse return error.McpReadShape;
                 if (body != .string) return error.McpReadShape;
-                if (std.mem.eql(u8, body.string, "hello mcp tool layer")) saw_prompt = true;
+                if (std.mem.eql(u8, body.string, "slow steer target hello mcp tool layer")) saw_prompt = true;
                 if (std.mem.eql(u8, body.string, "stub-ok")) saw_reply = true;
                 const message_id = jsonObjectField(message, "message_id") orelse return error.McpReadShape;
                 if (message_id != .string) return error.McpReadShape;
                 if (!std.mem.startsWith(u8, message_id.string, "turn:")) return error.McpReadIdNamespace;
             }
             if (!saw_prompt or !saw_reply) return error.McpReadTranscript;
+            var steer_rows: usize = 0;
+            for (messages.array.items) |message| {
+                const author = jsonObjectField(message, "author") orelse continue;
+                const body = jsonObjectField(message, "body") orelse continue;
+                if (author == .string and body == .string and
+                    std.mem.eql(u8, author.string, "Steering current turn") and
+                    std.mem.eql(u8, body.string, "change direction")) steer_rows += 1;
+            }
+            if (steer_rows != 1) return error.McpReadSteerAudit;
         }
 
         // Lifecycle: close stdin → EOF ends the serve loop → child exits 0.
@@ -9464,6 +9570,62 @@ fn runChatMcpToolLayerScenario(allocator: std.mem.Allocator, io: std.Io) !void {
             defer prepare.deinit();
             if (!prepare.response.isOk()) return error.McpDaemonPrepareFailed;
         }
+        kill_daemon_on_unwind = false;
+        _ = try waitChildBounded(&daemon, io, 10_000);
+    }
+
+    // Reopen against the same store and verify the detached MCP read still
+    // projects exactly one accepted steer audit row.
+    {
+        var daemon = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+            .store_dir = store_dir,
+            .chat_stub = true,
+        });
+        var kill_daemon_on_unwind = true;
+        errdefer if (kill_daemon_on_unwind) daemon.kill(io);
+        var mcp = try spawnMcpChild(allocator, io, self_exe, pref_path);
+        var kill_mcp_on_unwind = true;
+        errdefer if (kill_mcp_on_unwind) mcp.kill(io);
+        var reader: McpChildReader = .{};
+        defer reader.deinit(allocator);
+        const request = try mcpToolCallRequestAlloc(allocator, 1, "read_chat_thread", .{
+            .workspace_id = "ws-mcp",
+            .local_thread_id = reopen_thread_id orelse return error.McpSteerReopenMissingThread,
+        });
+        defer allocator.free(request);
+        var response = try mcpChildCallParsed(allocator, io, &mcp, &reader, request, MCP_CHILD_READ_TIMEOUT_MS);
+        defer response.deinit();
+        const tool_text = try mcpToolTextFromResponseAlloc(allocator, response.value);
+        defer allocator.free(tool_text.text);
+        if (tool_text.is_error) return error.McpSteerReopenReadError;
+        var envelope = try std.json.parseFromSlice(std.json.Value, allocator, tool_text.text, .{});
+        defer envelope.deinit();
+        const result = jsonObjectField(envelope.value, "result") orelse return error.McpSteerReopenShape;
+        const thread = jsonObjectField(result, "thread") orelse return error.McpSteerReopenShape;
+        const messages = jsonObjectField(thread, "messages") orelse return error.McpSteerReopenShape;
+        if (messages != .array) return error.McpSteerReopenShape;
+        var steer_rows: usize = 0;
+        for (messages.array.items) |message| {
+            const author = jsonObjectField(message, "author") orelse continue;
+            const body = jsonObjectField(message, "body") orelse continue;
+            if (author == .string and body == .string and
+                std.mem.eql(u8, author.string, "Steering current turn") and
+                std.mem.eql(u8, body.string, "change direction")) steer_rows += 1;
+        }
+        if (steer_rows != 1) return error.McpSteerReopenAudit;
+
+        mcp.stdin.?.close(io);
+        mcp.stdin = null;
+        const term = try waitChildBounded(&mcp, io, 10_000);
+        kill_mcp_on_unwind = false;
+        if (term != .exited or term.exited != 0) return error.McpChildExitCode;
+        var decode_arena = std.heap.ArenaAllocator.init(allocator);
+        defer decode_arena.deinit();
+        var transport: sessionizer.HeadlessTransport = .{ .allocator = decode_arena.allocator(), .pref_path = pref_path };
+        var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+        var prepare = try client.call("daemon.prepareShutdown", .{});
+        defer prepare.deinit();
+        if (!prepare.response.isOk()) return error.McpDaemonPrepareFailed;
         kill_daemon_on_unwind = false;
         _ = try waitChildBounded(&daemon, io, 10_000);
     }
@@ -9525,131 +9687,6 @@ fn runChatMcpToolLayerScenario(allocator: std.mem.Allocator, io: std.Io) !void {
         _ = try waitChildBounded(&daemon, io, 10_000);
     }
 
-    // --- Arm 3 (m5p5fix MAJOR-1): a real chat.thread.get queues behind a
-    // deliberately stalled store mutation. The production helper must return
-    // on its one absolute budget rather than multiplying the transport's 5s
-    // default by its attempt count. ---
-    {
-        var daemon = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
-            .store_dir = store_dir,
-            .store_fault = "commit_stall",
-        });
-        var kill_daemon_on_unwind = true;
-        errdefer if (kill_daemon_on_unwind) daemon.kill(io);
-
-        var decode_arena = std.heap.ArenaAllocator.init(allocator);
-        defer decode_arena.deinit();
-        var transport: sessionizer.HeadlessTransport = .{
-            .allocator = decode_arena.allocator(),
-            .pref_path = pref_path,
-        };
-        var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
-        var reg = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
-        defer reg.deinit();
-        if (!reg.response.isOk()) return error.McpConfirmStallRegisterFailed;
-        const client_id = (try client.decodeClientRegister(&reg)).client_id;
-
-        const StallMutationContext = struct {
-            allocator: std.mem.Allocator,
-            pref_path: []const u8,
-            client_id: []const u8,
-            err: ?anyerror = null,
-        };
-        var stall_context: StallMutationContext = .{
-            .allocator = allocator,
-            .pref_path = pref_path,
-            .client_id = client_id,
-        };
-        const stall_thread = try std.Thread.spawn(.{}, struct {
-            fn run(context: *StallMutationContext) void {
-                var arena = std.heap.ArenaAllocator.init(context.allocator);
-                defer arena.deinit();
-                var stall_transport: sessionizer.HeadlessTransport = .{
-                    .allocator = arena.allocator(),
-                    .pref_path = context.pref_path,
-                };
-                var stall_client = sessionizer.headlessClient(arena.allocator(), &stall_transport);
-                var parsed = stall_client.call(headless.store.METHOD_WORKSPACE_UPSERT, .{
-                    .mutation = .{
-                        .request_key = "m5p5-confirm-stalled-read",
-                        .client_id = context.client_id,
-                    },
-                    .workspace = .{
-                        .workspace_id = "ws-confirm-stall",
-                        .label = "Confirm stalled read",
-                        .path = context.pref_path,
-                    },
-                }) catch |err| {
-                    context.err = err;
-                    return;
-                };
-                defer parsed.deinit();
-                if (!parsed.response.isOk()) context.err = error.McpConfirmStallMutationFailed;
-            }
-        }.run, .{&stall_context});
-        var stall_thread_joined = false;
-        defer if (!stall_thread_joined) stall_thread.join();
-
-        // Synchronization barrier: retry a real store-backed read until its
-        // short end-to-end transport deadline expires. That can happen here
-        // only after the mutation above has entered commit_stall while holding
-        // the store-service mutex. The lower elapsed bound below separately
-        // proves the production helper remained queued behind that stall.
-        const barrier_deadline_ms = sessionizer.monotonicNowMs() + 1_000;
-        var stall_observed = false;
-        while (sessionizer.monotonicNowMs() < barrier_deadline_ms) {
-            var barrier_arena = std.heap.ArenaAllocator.init(allocator);
-            defer barrier_arena.deinit();
-            const barrier_allocator = barrier_arena.allocator();
-            var barrier_transport: sessionizer.HeadlessTransport = .{
-                .allocator = barrier_allocator,
-                .pref_path = pref_path,
-                .timeout_ms = 75,
-            };
-            var barrier_client = sessionizer.headlessClient(barrier_allocator, &barrier_transport);
-            if (barrier_client.call(headless.store.METHOD_CHAT_THREAD_GET, .{
-                .workspace_id = "ws-mcp",
-                .local_thread_id = "thread-confirm-durable",
-            })) |response| {
-                var barrier_response = response;
-                barrier_response.deinit();
-            } else |err| {
-                if (std.mem.eql(u8, @errorName(err), "ConnectionTimedOut") or
-                    std.mem.eql(u8, @errorName(err), "Timeout"))
-                {
-                    stall_observed = true;
-                    break;
-                }
-                return err;
-            }
-            std.Io.sleep(io, .fromMilliseconds(5), .awake) catch {};
-        }
-        if (!stall_observed) return error.McpConfirmStallBarrierFailed;
-
-        const confirm_started_ms = sessionizer.monotonicNowMs();
-        const stalled = try cli_main.chatOpenConfirmThreadDurable(
-            allocator,
-            io,
-            "ws-mcp",
-            "thread-confirm-durable",
-            4,
-            50,
-        );
-        const confirm_elapsed_ms = sessionizer.monotonicNowMs() - confirm_started_ms;
-        if (stalled != .timeout) return error.McpConfirmStalledOutcome;
-        if (confirm_elapsed_ms < 150) return error.McpConfirmStalledTooFast;
-        if (confirm_elapsed_ms > 750) return error.McpConfirmStalledElapsed;
-
-        stall_thread.join();
-        stall_thread_joined = true;
-        if (stall_context.err) |err| return err;
-
-        var prepare = try client.call("daemon.prepareShutdown", .{});
-        defer prepare.deinit();
-        if (!prepare.response.isOk()) return error.McpConfirmStallPrepareFailed;
-        kill_daemon_on_unwind = false;
-        _ = try waitChildBounded(&daemon, io, 10_000);
-    }
 }
 
 /// M4-P5 fix amendment (m4p4fix verify MAJOR-1): failed-first identity
