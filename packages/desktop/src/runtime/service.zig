@@ -133,6 +133,154 @@ pub fn trustProposal(
     );
 }
 
+pub const ProfileReplacement = manager_mod.ProfileReplacement;
+
+/// Non-secret input for creating or editing a runtime reached over SSH.
+pub const SshProfileInput = struct {
+    label: []const u8,
+    ssh: profile.SshTunnelInput,
+};
+
+/// Creates one runtime profile under the cross-process store lock, rereads the
+/// authoritative document, and adopts the persisted copy. The returned id is
+/// owned by the caller. Bearer tokens never pass through this path.
+pub fn createSshProfile(self: *Self, allocator: std.mem.Allocator, input: SshProfileInput) ![]u8 {
+    var lock = try profile_store.acquireExclusiveAtPath(self.allocator, self.io, self.profile_path);
+    defer lock.deinit();
+    var loaded = try profile_store.loadAtPath(self.allocator, self.io, self.profile_path);
+    defer loaded.deinit(self.allocator);
+    if (loaded.items.len >= profile.MAX_PROFILES) return error.TooManyProfiles;
+
+    var created = try profile.Profile.createSshTunnel(
+        self.allocator,
+        self.io,
+        input.label,
+        null,
+        input.ssh,
+    );
+    defer created.deinit(self.allocator);
+    const next = try self.allocator.alloc(profile.Profile, loaded.items.len + 1);
+    defer self.allocator.free(next);
+    @memcpy(next[0..loaded.items.len], loaded.items);
+    next[loaded.items.len] = created;
+    try profile_store.saveAtPath(self.allocator, self.io, self.profile_path, next);
+
+    var authoritative = try profile_store.loadAtPath(self.allocator, self.io, self.profile_path);
+    defer authoritative.deinit(self.allocator);
+    const persisted = findProfile(authoritative.items, created.id) orelse return error.RuntimeProfileNotPersisted;
+    try self.runtime_manager.addProfile(persisted.*);
+    return allocator.dupe(u8, persisted.id);
+}
+
+/// Edits non-secret fields. An endpoint change clears the durable identity pin
+/// on disk and invalidates the live generation so trust is never carried over
+/// to a different peer; a label-only edit keeps the connection as is.
+pub fn updateSshProfile(self: *Self, profile_id: []const u8, input: SshProfileInput) !ProfileReplacement {
+    var lock = try profile_store.acquireExclusiveAtPath(self.allocator, self.io, self.profile_path);
+    defer lock.deinit();
+    var loaded = try profile_store.loadAtPath(self.allocator, self.io, self.profile_path);
+    defer loaded.deinit(self.allocator);
+    const configured = findProfile(loaded.items, profile_id) orelse return error.UnknownRuntimeProfile;
+
+    const endpoint_changed = !configured.sameSshEndpoint(input.ssh);
+    try configured.setLabel(self.allocator, input.label);
+    if (endpoint_changed) {
+        try configured.replaceSshTunnel(self.allocator, input.ssh);
+        try configured.setExpectedIdentity(self.allocator, null, null);
+    }
+    try profile_store.saveAtPath(self.allocator, self.io, self.profile_path, loaded.items);
+
+    var authoritative = try profile_store.loadAtPath(self.allocator, self.io, self.profile_path);
+    defer authoritative.deinit(self.allocator);
+    const persisted = findProfile(authoritative.items, profile_id) orelse return error.RuntimeProfileNotPersisted;
+    return self.runtime_manager.replaceProfile(persisted.*);
+}
+
+/// Removes the profile from disk and from the live manager, wiping any
+/// process-memory token. Returns whether a token was forgotten.
+pub fn removeProfile(self: *Self, profile_id: []const u8) !bool {
+    var lock = try profile_store.acquireExclusiveAtPath(self.allocator, self.io, self.profile_path);
+    defer lock.deinit();
+    var loaded = try profile_store.loadAtPath(self.allocator, self.io, self.profile_path);
+    defer loaded.deinit(self.allocator);
+
+    var kept: std.ArrayList(profile.Profile) = .empty;
+    defer kept.deinit(self.allocator);
+    for (loaded.items) |configured| {
+        if (!std.mem.eql(u8, configured.id, profile_id)) try kept.append(self.allocator, configured);
+    }
+    if (kept.items.len == loaded.items.len and self.runtime_manager.profileConst(profile_id) == null) {
+        return error.UnknownRuntimeProfile;
+    }
+    try profile_store.saveAtPath(self.allocator, self.io, self.profile_path, kept.items);
+    if (self.runtime_manager.profileConst(profile_id) == null) return false;
+    return self.runtime_manager.removeProfile(profile_id);
+}
+
+/// Resynchronizes the live manager with the on-disk document after another
+/// process (CLI) edited it. Disk is authoritative: vanished profiles are
+/// removed, new ones added, and changed endpoints re-verified.
+pub fn reloadProfiles(self: *Self) !void {
+    var loaded = try profile_store.loadAtPath(self.allocator, self.io, self.profile_path);
+    defer loaded.deinit(self.allocator);
+    const live_ids = try self.runtime_manager.profileIdsAlloc(self.allocator);
+    defer self.allocator.free(live_ids);
+    for (live_ids) |live_id| {
+        if (findProfile(loaded.items, live_id) == null) _ = try self.runtime_manager.removeProfile(live_id);
+    }
+    for (loaded.items) |configured| {
+        if (self.runtime_manager.profileConst(configured.id) == null) {
+            try self.runtime_manager.addProfile(configured);
+        } else {
+            _ = try self.runtime_manager.replaceProfile(configured);
+        }
+    }
+}
+
+/// Formats secret-free diagnostics for clipboard/bug reports. Includes the
+/// non-secret endpoint, state, and identity pins but never a bearer token.
+pub fn redactedDiagnosticsAlloc(self: *const Self, allocator: std.mem.Allocator, profile_id: []const u8) ![]u8 {
+    const snap = self.snapshot(profile_id) orelse return error.UnknownRuntimeProfile;
+    const configured = self.runtime_manager.profileConst(profile_id) orelse return error.UnknownRuntimeProfile;
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+    try w.print("verde runtime diagnostics (redacted)\nprofile_id: {s}\nlabel: {s}\n", .{ snap.profile_id, snap.label });
+    switch (configured.transport) {
+        .local_socket => try w.writeAll("transport: local_socket\n"),
+        .ssh_tunnel => |ssh| try w.print(
+            "transport: ssh_tunnel host={s} user={s} ssh_port={d} gateway_port={d}\n",
+            .{ ssh.host, ssh.user orelse "<default>", ssh.port, ssh.remote_gateway_port },
+        ),
+    }
+    try w.print("phase: {s}\nfailure: {s}\ntunnel: {s}\n", .{
+        @tagName(snap.phase),
+        if (snap.failure) |failure| @tagName(failure) else "none",
+        @tagName(snap.tunnel_lifecycle),
+    });
+    try w.print("credential: {s}\n", .{if (self.runtime_manager.secrets.get(profile_id) != null) "held in memory (<redacted>)" else "not provided"});
+    try w.print("pinned_runtime_id: {s}\npinned_instance_id: {s}\n", .{
+        configured.expected_runtime_id orelse "<unpinned>",
+        configured.expected_instance_id orelse "<unpinned>",
+    });
+    if (snap.runtime) |runtime| {
+        try w.print("verified_runtime_id: {s}\nverified_instance_id: {s}\nserver_version: {s}\nprotocol: {d}.{d}\n", .{
+            runtime.runtime_id, runtime.instance_id, runtime.server_version, runtime.protocol_major, runtime.protocol_minor,
+        });
+    }
+    try w.print("verified_matches_pin: {}\nexecution_ready: {}\nrepository_manifest_capable: {}\n", .{
+        snap.verified_runtime_matches_pin, snap.execution_ready, snap.repository_manifest_capable,
+    });
+    return out.toOwnedSlice();
+}
+
+fn findProfile(profiles: []profile.Profile, profile_id: []const u8) ?*profile.Profile {
+    for (profiles) |*configured| {
+        if (std.mem.eql(u8, configured.id, profile_id)) return configured;
+    }
+    return null;
+}
+
 /// Starts one manager-targeted RPC. This is the only execution entry point and
 /// succeeds only when `snapshot(profile_id).?.execution_ready` is true.
 pub fn beginRpc(
@@ -637,4 +785,135 @@ test "service exposes bounded snapshots for multiple independently owned profile
     try std.testing.expectEqualStrings("First VM", snapshots[0].label);
     try std.testing.expectEqualStrings(second.id, snapshots[1].profile_id);
     try std.testing.expectEqualStrings("Second VM", snapshots[1].label);
+}
+
+test "service profile crud persists under lock and rereads authoritatively" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPathAlloc(allocator, tmp.dir);
+    defer allocator.free(path);
+    try profile_store.saveAtPath(allocator, std.testing.io, path, &.{});
+
+    var ports: TestPorts = .{ .values = &.{43_140} };
+    var tunnel: TestTunnel = .{};
+    var rpc: TestRpc = .{};
+    var service = try Self.init(allocator, std.testing.io, path, testDependencies(&ports, &tunnel, &rpc));
+    defer service.deinit();
+
+    try std.testing.expectError(error.InvalidSshHost, service.createSshProfile(allocator, .{
+        .label = "Bad",
+        .ssh = .{ .host = "-evil" },
+    }));
+    const id = try service.createSshProfile(allocator, .{
+        .label = "  Build VM  ",
+        .ssh = .{ .host = "runtime.example", .user = "verde", .port = 2222 },
+    });
+    defer allocator.free(id);
+    try std.testing.expectEqualStrings("Build VM", service.snapshot(id).?.label);
+
+    var on_disk = try profile_store.loadAtPath(allocator, std.testing.io, path);
+    defer on_disk.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), on_disk.items.len);
+    try std.testing.expectEqual(@as(u16, 2222), on_disk.items[0].transport.ssh_tunnel.port);
+
+    // Label-only edit keeps the endpoint and does not touch identity.
+    try std.testing.expectEqual(ProfileReplacement.label_only, try service.updateSshProfile(id, .{
+        .label = "Build VM 2",
+        .ssh = .{ .host = "runtime.example", .user = "verde", .port = 2222 },
+    }));
+    try std.testing.expectEqualStrings("Build VM 2", service.snapshot(id).?.label);
+
+    const diagnostics = try service.redactedDiagnosticsAlloc(allocator, id);
+    defer allocator.free(diagnostics);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics, "runtime.example") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics, "not provided") != null);
+
+    try std.testing.expect(!(try service.removeProfile(id)));
+    try std.testing.expect(service.snapshot(id) == null);
+    var after_remove = try profile_store.loadAtPath(allocator, std.testing.io, path);
+    defer after_remove.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), after_remove.items.len);
+    try std.testing.expectError(error.UnknownRuntimeProfile, service.removeProfile(id));
+}
+
+test "endpoint edit drops trust, invalidates generation, and forgets nothing silently" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPathAlloc(allocator, tmp.dir);
+    defer allocator.free(path);
+
+    var configured = try profile.Profile.createSshTunnel(
+        allocator,
+        std.testing.io,
+        "Build VM",
+        null,
+        .{ .host = "runtime.example", .user = "verde" },
+    );
+    defer configured.deinit(allocator);
+    try profile_store.saveAtPath(allocator, std.testing.io, path, &.{configured});
+
+    var ports: TestPorts = .{ .values = &.{ 43_141, 43_142 } };
+    var tunnel: TestTunnel = .{};
+    tunnel.allow_ready.store(true, .release);
+    var rpc: TestRpc = .{};
+    var service = try Self.init(allocator, std.testing.io, path, testDependencies(&ports, &tunnel, &rpc));
+    defer {
+        service.disable(configured.id) catch {};
+        waitForCleanup(&service, configured.id) catch {};
+        service.deinit();
+    }
+    try service.hydrateToken(configured.id, TEST_TOKEN);
+    try service.enable(configured.id, 0);
+    try waitForPhase(&service, configured.id, .awaiting_trust);
+    var proposal = (try service.pinProposalAlloc(allocator, configured.id)).?;
+    defer proposal.deinit();
+    _ = try service.trustProposal(&proposal);
+    try waitForExecutionReady(&service, configured.id);
+
+    const diagnostics = try service.redactedDiagnosticsAlloc(allocator, configured.id);
+    defer allocator.free(diagnostics);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics, TEST_TOKEN) == null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics, "<redacted>") != null);
+
+    try std.testing.expectEqual(ProfileReplacement.endpoint_changed, try service.updateSshProfile(configured.id, .{
+        .label = "Build VM",
+        .ssh = .{ .host = "other.example", .user = "verde" },
+    }));
+    const replaced = service.snapshot(configured.id).?;
+    try std.testing.expect(!replaced.execution_ready);
+    try std.testing.expect(!replaced.verified_runtime_matches_pin);
+    try std.testing.expectEqual(connection.Phase.disabled, replaced.phase);
+    var on_disk = try profile_store.loadAtPath(allocator, std.testing.io, path);
+    defer on_disk.deinit(allocator);
+    try std.testing.expect(on_disk.items[0].expected_runtime_id == null);
+    try std.testing.expect(on_disk.items[0].expected_instance_id == null);
+    try std.testing.expectEqualStrings("other.example", on_disk.items[0].transport.ssh_tunnel.host);
+    // The in-memory token was wiped with the old peer; re-enable must ask again.
+    try std.testing.expectError(error.MissingRuntimeCredential, service.enable(configured.id, 1));
+}
+
+test "reloadProfiles adopts external store edits authoritatively" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPathAlloc(allocator, tmp.dir);
+    defer allocator.free(path);
+    var a = try profile.Profile.createSshTunnel(allocator, std.testing.io, "A", null, .{ .host = "a.example" });
+    defer a.deinit(allocator);
+    try profile_store.saveAtPath(allocator, std.testing.io, path, &.{a});
+
+    var ports: TestPorts = .{ .values = &.{43_143} };
+    var tunnel: TestTunnel = .{};
+    var rpc: TestRpc = .{};
+    var service = try Self.init(allocator, std.testing.io, path, testDependencies(&ports, &tunnel, &rpc));
+    defer service.deinit();
+
+    var b = try profile.Profile.createSshTunnel(allocator, std.testing.io, "B", null, .{ .host = "b.example" });
+    defer b.deinit(allocator);
+    try profile_store.saveAtPath(allocator, std.testing.io, path, &.{b});
+    try service.reloadProfiles();
+    try std.testing.expect(service.snapshot(a.id) == null);
+    try std.testing.expectEqualStrings("B", service.snapshot(b.id).?.label);
 }

@@ -148,6 +148,38 @@ pub const Profile = struct {
         self.expected_instance_id = next_instance;
     }
 
+    /// Replaces the display label; the stored value is left untouched on error.
+    pub fn setLabel(self: *Profile, allocator: std.mem.Allocator, label: []const u8) !void {
+        const owned_label = try sanitizedLabelAlloc(allocator, label);
+        allocator.free(self.label);
+        self.label = owned_label;
+    }
+
+    /// Replaces the SSH endpoint. Callers decide what an endpoint change means
+    /// for the durable identity pin; this only swaps validated transport data.
+    pub fn replaceSshTunnel(self: *Profile, allocator: std.mem.Allocator, input: SshTunnelInput) !void {
+        var next = try ownedSshTunnel(allocator, input);
+        errdefer next.deinit(allocator);
+        self.transport.deinit(allocator);
+        self.transport = .{ .ssh_tunnel = next };
+    }
+
+    /// True when both profiles reach the same SSH endpoint. Labels and pins
+    /// are ignored because they do not change which peer is contacted.
+    pub fn sameSshEndpoint(self: Profile, input: SshTunnelInput) bool {
+        const ssh = switch (self.transport) {
+            .local_socket => return false,
+            .ssh_tunnel => |value| value,
+        };
+        const input_user = if (input.user) |value| std.mem.trim(u8, value, &std.ascii.whitespace) else null;
+        const users_equal = if (ssh.user) |current|
+            input_user != null and std.mem.eql(u8, current, input_user.?)
+        else
+            input_user == null or input_user.?.len == 0;
+        return std.mem.eql(u8, ssh.host, std.mem.trim(u8, input.host, &std.ascii.whitespace)) and
+            users_equal and ssh.port == input.port and ssh.remote_gateway_port == input.remote_gateway_port;
+    }
+
     pub fn deinit(self: *Profile, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         allocator.free(self.label);
@@ -432,6 +464,31 @@ fn profileFromValue(
     };
 }
 
+/// Field-level validators shared with UI forms so inline feedback matches
+/// exactly what the store would reject. Inputs are trimmed like the setters.
+pub fn validateLabel(value: []const u8) !void {
+    const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
+    if (trimmed.len == 0 or trimmed.len > MAX_LABEL_BYTES or !std.unicode.utf8ValidateSlice(trimmed)) {
+        return error.InvalidProfileLabel;
+    }
+    for (trimmed) |byte| if (std.ascii.isControl(byte)) return error.InvalidProfileLabel;
+}
+
+pub fn validateSshHost(value: []const u8) !void {
+    return validateHost(std.mem.trim(u8, value, &std.ascii.whitespace));
+}
+
+/// An empty user is valid and means "use SSH config / current user".
+pub fn validateSshUser(value: []const u8) !void {
+    const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
+    if (trimmed.len == 0) return;
+    return validateUser(trimmed);
+}
+
+pub fn validatePort(port: u16) !void {
+    if (port == 0) return error.InvalidPort;
+}
+
 fn ownedSshTunnel(allocator: std.mem.Allocator, input: SshTunnelInput) !SshTunnel {
     if (input.port == 0 or input.remote_gateway_port == 0) return error.InvalidPort;
 
@@ -466,12 +523,8 @@ fn ownedExpectedInstanceIdAlloc(
 }
 
 fn sanitizedLabelAlloc(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
-    const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
-    if (trimmed.len == 0 or trimmed.len > MAX_LABEL_BYTES or !std.unicode.utf8ValidateSlice(trimmed)) {
-        return error.InvalidProfileLabel;
-    }
-    for (trimmed) |byte| if (std.ascii.isControl(byte)) return error.InvalidProfileLabel;
-    return allocator.dupe(u8, trimmed);
+    try validateLabel(value);
+    return allocator.dupe(u8, std.mem.trim(u8, value, &std.ascii.whitespace));
 }
 
 fn sanitizedHostAlloc(allocator: std.mem.Allocator, value: []const u8) ![]u8 {

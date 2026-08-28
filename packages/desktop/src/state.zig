@@ -65,6 +65,7 @@ const file_search_controller = @import("state/file_search_controller.zig");
 const herdr_controller = @import("state/herdr_controller.zig");
 const handoff_controller = @import("state/handoff_controller.zig");
 const settings_controller = @import("state/settings_controller.zig");
+const runtime_connections_controller = @import("state/runtime_connections_controller.zig");
 const surface_controller = @import("state/surface_controller.zig");
 const terminal_controller = @import("state/terminal_controller.zig");
 const transcript_controller = @import("state/transcript_controller.zig");
@@ -2045,6 +2046,12 @@ pub const PaletteModalAction = enum {
     runtime_credential_input,
     runtime_trust_cancel,
     runtime_trust_confirm,
+    runtime_wizard_cancel,
+    runtime_wizard_back,
+    runtime_wizard_submit,
+    runtime_wizard_connect,
+    runtime_wizard_done,
+    runtime_wizard_input,
     modal_dismiss,
     modal_block,
     project_rename_input,
@@ -2055,6 +2062,7 @@ pub const PaletteModalAction = enum {
     settings_close,
     settings_save,
     settings_control,
+    settings_runtime_action,
     settings_theme_option,
     settings_title_provider_option,
     settings_title_model_option,
@@ -2134,6 +2142,11 @@ pub const PaletteModalTextFocus = enum {
     project_import_name,
     project_import,
     runtime_credential,
+    runtime_wizard_label,
+    runtime_wizard_host,
+    runtime_wizard_user,
+    runtime_wizard_ssh_port,
+    runtime_wizard_gateway_port,
     command_palette,
 };
 
@@ -3201,7 +3214,7 @@ fn runtimeConnectionNowMs() u64 {
         if (now_ns < 0) @as(u64, 0) else std.math.maxInt(u64);
 }
 
-const RuntimePickerStatus = enum {
+pub const RuntimePickerStatus = enum {
     offline,
     credential_required,
     connecting,
@@ -3218,7 +3231,7 @@ const RuntimePickerStatus = enum {
     unavailable,
 };
 
-const RuntimePickerProfile = struct {
+pub const RuntimePickerProfile = struct {
     profile_id: []u8,
     status: RuntimePickerStatus,
 
@@ -3228,7 +3241,7 @@ const RuntimePickerProfile = struct {
     }
 };
 
-fn runtimePickerStatus(snapshot: RuntimeService.Snapshot) RuntimePickerStatus {
+pub fn runtimePickerStatus(snapshot: RuntimeService.Snapshot) RuntimePickerStatus {
     if (snapshot.identity_pin_required) return .trust_required;
     return switch (snapshot.phase) {
         .connecting => .connecting,
@@ -3268,7 +3281,7 @@ fn runtimeTrustContinuation(adoption: RuntimeService.PinAdoption) RuntimeTrustCo
     };
 }
 
-fn runtimePickerStatusBadge(status: RuntimePickerStatus) []const u8 {
+pub fn runtimePickerStatusBadge(status: RuntimePickerStatus) []const u8 {
     return switch (status) {
         .offline => "Offline",
         .credential_required => "Credential needed",
@@ -3287,7 +3300,7 @@ fn runtimePickerStatusBadge(status: RuntimePickerStatus) []const u8 {
     };
 }
 
-fn runtimePickerStatusDescription(status: RuntimePickerStatus) []const u8 {
+pub fn runtimePickerStatusDescription(status: RuntimePickerStatus) []const u8 {
     return switch (status) {
         .credential_required => "Add a bearer credential before connecting",
         .trust_required => "Confirm this daemon identity before use",
@@ -3327,9 +3340,14 @@ fn selectThreadRuntimeProfile(
     });
 }
 
+fn runtimePickerAddIndex(state: *const AppState) usize {
+    return 1 + state.runtime_picker_profiles.items.len;
+}
+
 fn paletteRuntimePickerLabel(context: ?*anyopaque, index: usize) []const u8 {
     if (index == RUNTIME_PICKER_LOCAL_INDEX) return "Local";
     const state = appStateFromContext(context) orelse return "";
+    if (index == runtimePickerAddIndex(state)) return "Add connection…";
     const snapshot = runtimePickerSnapshotAt(state, index) orelse return "Unavailable runtime";
     return snapshot.label;
 }
@@ -3337,6 +3355,7 @@ fn paletteRuntimePickerLabel(context: ?*anyopaque, index: usize) []const u8 {
 fn paletteRuntimePickerDescription(context: ?*anyopaque, index: usize) []const u8 {
     if (index == RUNTIME_PICKER_LOCAL_INDEX) return "Runs on this machine";
     const state = appStateFromContext(context) orelse return "";
+    if (index == runtimePickerAddIndex(state)) return "Connect a self-hosted Verde runtime over SSH";
     const snapshot = runtimePickerSnapshotAt(state, index) orelse return runtimePickerStatusDescription(.unavailable);
     return runtimePickerStatusDescription(runtimePickerStatus(snapshot));
 }
@@ -3344,6 +3363,7 @@ fn paletteRuntimePickerDescription(context: ?*anyopaque, index: usize) []const u
 fn paletteRuntimePickerBadge(context: ?*anyopaque, index: usize) []const u8 {
     if (index == RUNTIME_PICKER_LOCAL_INDEX) return "";
     const state = appStateFromContext(context) orelse return "";
+    if (index == runtimePickerAddIndex(state)) return "";
     const snapshot = runtimePickerSnapshotAt(state, index) orelse return runtimePickerStatusBadge(.unavailable);
     return runtimePickerStatusBadge(runtimePickerStatus(snapshot));
 }
@@ -4128,6 +4148,8 @@ pub const AppState = struct {
     /// router and keybind dispatch need.
     command_controller: command_controller.State,
     settings_controller: settings_controller.State,
+    /// Settings › Runtimes & connections card and SSH wizard state.
+    runtime_connections: runtime_connections_controller.State = .{},
     app_config_file_mtime: i128,
     app_config_runtime_sync_pending: bool,
     project_directory_browse_requested: bool,
@@ -4535,7 +4557,7 @@ pub const AppState = struct {
         self.workspace_runtime_defaults = loaded;
     }
 
-    fn persistWorkspaceRuntimeDefault(
+    pub fn persistWorkspaceRuntimeDefault(
         self: *AppState,
         workspace_id: []const u8,
         profile_id: []const u8,
@@ -4547,7 +4569,7 @@ pub const AppState = struct {
         try self.reloadWorkspaceRuntimeDefaults();
     }
 
-    fn workspaceRuntimeDefaultProfile(self: *const AppState, workspace_id: []const u8) []const u8 {
+    pub fn workspaceRuntimeDefaultProfile(self: *const AppState, workspace_id: []const u8) []const u8 {
         const defaults = self.workspace_runtime_defaults orelse return runtime_workspace_defaults.LOCAL_PROFILE_ID;
         for (defaults.items) |entry| {
             if (std.mem.eql(u8, entry.workspace_id, workspace_id)) return entry.profile_id;
@@ -4657,7 +4679,7 @@ pub const AppState = struct {
         self.modal_text_drag_active = false;
     }
 
-    fn openRuntimeCredentialModal(self: *AppState, profile_id: []const u8) !void {
+    pub fn openRuntimeCredentialModal(self: *AppState, profile_id: []const u8) !void {
         const owned_profile_id = try self.allocator.dupe(u8, profile_id);
         errdefer self.allocator.free(owned_profile_id);
         if (self.runtime_credential_profile_id != null) self.cancelRuntimeCredentialModal();
@@ -4673,7 +4695,7 @@ pub const AppState = struct {
         self.modal_text_drag_active = false;
     }
 
-    fn revokeRuntimeProfileCredential(self: *AppState, profile_id: []const u8) bool {
+    pub fn revokeRuntimeProfileCredential(self: *AppState, profile_id: []const u8) bool {
         const service = self.runtime_service orelse return false;
         var clean = true;
         service.disable(profile_id) catch |err| {
@@ -4801,6 +4823,7 @@ pub const AppState = struct {
             self.handoff_controller.modal_open or
             self.project_controller.show_creator or
             self.settings_controller.modal_visible or
+            self.runtime_connections.wizard_open or
             self.command_controller.open or
             self.prefix_armed or
             self.prefix_navigate or
@@ -4857,12 +4880,14 @@ pub const AppState = struct {
             configured.status = next_status;
             changed = true;
         }
+        changed = runtime_connections_controller.pollRuntimeConnectionsReadiness(self) or changed;
         return self.maybePresentRuntimeTrustProposal() or changed;
     }
 
     fn deinitRuntimeService(self: *AppState) void {
         self.closeRuntimeCredentialModalState();
         self.closeRuntimeTrustModalState();
+        self.runtime_connections.deinit(self.allocator);
         for (self.runtime_picker_profiles.items) |*profile| profile.deinit(self.allocator);
         self.runtime_picker_profiles.deinit(self.allocator);
         if (self.runtime_service) |service| {
@@ -6423,6 +6448,64 @@ pub const AppState = struct {
     pub const syncSettingsDraftFromConfig = settings_controller.syncSettingsDraftFromConfig;
     pub const isSettingsDraftDirty = settings_controller.isSettingsDraftDirty;
     pub const openSettingsModal = settings_controller.openSettingsModal;
+    pub const openRuntimeConnectionWizard = runtime_connections_controller.openRuntimeConnectionWizard;
+    pub const openRuntimeConnectionEditor = runtime_connections_controller.openRuntimeConnectionEditor;
+    pub const cancelRuntimeConnectionWizard = runtime_connections_controller.cancelRuntimeConnectionWizard;
+    pub const runtimeConnectionWizardBack = runtime_connections_controller.runtimeConnectionWizardBack;
+    pub const submitRuntimeConnectionWizard = runtime_connections_controller.submitRuntimeConnectionWizard;
+    pub const runtimeConnectionWizardConnect = runtime_connections_controller.runtimeConnectionWizardConnect;
+    pub const focusRuntimeWizardField = runtime_connections_controller.focusWizardField;
+    pub const cycleRuntimeWizardField = runtime_connections_controller.cycleWizardField;
+    pub const applyRuntimeRowAction = runtime_connections_controller.applyRuntimeRowAction;
+
+    pub fn runtimeNowMs(_: *const AppState) u64 {
+        return runtimeConnectionNowMs();
+    }
+
+    /// Secret-free status for one configured runtime row.
+    pub fn runtimeProfileStatus(self: *const AppState, profile_id: []const u8) RuntimePickerStatus {
+        const service = self.runtime_service orelse return .unavailable;
+        const snapshot = service.snapshot(profile_id) orelse return .unavailable;
+        return runtimePickerStatus(snapshot);
+    }
+
+    pub fn runtimeProfileSnapshot(self: *const AppState, profile_id: []const u8) ?RuntimeService.Snapshot {
+        const service = self.runtime_service orelse return null;
+        return service.snapshot(profile_id);
+    }
+
+    /// Workspace whose runtime default the settings card edits.
+    pub fn currentWorkspaceIdForRuntimeDefault(self: *const AppState) ?[]const u8 {
+        if (self.project_controller.selected_index >= self.project_controller.projects.items.len) return null;
+        return self.project_controller.projects.items[self.project_controller.selected_index].id;
+    }
+
+    pub fn setClipboardText(self: *AppState, text: []const u8) bool {
+        return paletteComposerSetClipboard(self, text);
+    }
+
+    /// Registers a profile the wizard just persisted so picker and settings
+    /// rows show it before the next poll.
+    pub fn appendRuntimePickerProfile(self: *AppState, profile_id: []const u8) !void {
+        for (self.runtime_picker_profiles.items) |configured| {
+            if (std.mem.eql(u8, configured.profile_id, profile_id)) return;
+        }
+        const owned = try self.allocator.dupe(u8, profile_id);
+        errdefer self.allocator.free(owned);
+        try self.runtime_picker_profiles.append(self.allocator, .{
+            .profile_id = owned,
+            .status = self.runtimeProfileStatus(profile_id),
+        });
+    }
+
+    pub fn removeRuntimePickerProfile(self: *AppState, profile_id: []const u8) void {
+        for (self.runtime_picker_profiles.items, 0..) |*configured, index| {
+            if (!std.mem.eql(u8, configured.profile_id, profile_id)) continue;
+            configured.deinit(self.allocator);
+            _ = self.runtime_picker_profiles.orderedRemove(index);
+            return;
+        }
+    }
     pub const toggleGlobalMcpIntegration = settings_controller.toggleGlobalMcpIntegration;
     pub const toggleClaudeGlobalHooks = settings_controller.toggleClaudeGlobalHooks;
     pub const toggleCodexGlobalHooks = settings_controller.toggleCodexGlobalHooks;
@@ -11056,7 +11139,8 @@ pub const AppState = struct {
         self.composer_controller.runtime_picker.setStyle(runtime_style);
         self.composer_controller.runtime_picker.setUiScale(theme.uiScaleFactor());
         self.composer_controller.runtime_picker.setFontMetrics(paletteEstimatedFontMetrics(theme.scaledUi(15.5)));
-        self.composer_controller.runtime_picker.setItemCount(1 + self.runtime_picker_profiles.items.len);
+        // Local, every configured runtime, then the trailing "Add connection…" row.
+        self.composer_controller.runtime_picker.setItemCount(2 + self.runtime_picker_profiles.items.len);
         self.composer_controller.runtime_picker.setSelectedItem(self.currentRuntimePickerIndex());
         self.setPaletteRuntimePickerBoundsFromToolbar();
     }
@@ -11080,7 +11164,7 @@ pub const AppState = struct {
         return snapshot.label;
     }
 
-    fn connectRuntimeProfileFromPicker(self: *AppState, profile_id: []const u8) void {
+    pub fn connectRuntimeProfileFromPicker(self: *AppState, profile_id: []const u8) void {
         const service = self.runtime_service orelse {
             self.setSidebarNotice("Runtime service is unavailable.");
             return;
@@ -11136,6 +11220,10 @@ pub const AppState = struct {
     }
 
     fn selectCurrentThreadRuntimePickerIndex(self: *AppState, index: usize) void {
+        if (index == runtimePickerAddIndex(self)) {
+            self.openRuntimeConnectionWizard();
+            return;
+        }
         const profile_id = if (index == RUNTIME_PICKER_LOCAL_INDEX)
             chat_types.LOCAL_RUNTIME_PROFILE_ID
         else if (runtimePickerProfileAt(self, index)) |configured|
@@ -11446,7 +11534,13 @@ pub const AppState = struct {
                 .runtime_credential_submit,
                 .runtime_trust_cancel,
                 .runtime_trust_confirm,
+                .runtime_wizard_cancel,
+                .runtime_wizard_back,
+                .runtime_wizard_submit,
+                .runtime_wizard_connect,
+                .runtime_wizard_done,
                 .settings_control,
+                .settings_runtime_action,
                 .settings_theme_option,
                 .settings_title_provider_option,
                 .settings_title_model_option,
@@ -11466,6 +11560,7 @@ pub const AppState = struct {
                 .project_import_name_input,
                 .project_import_input,
                 .runtime_credential_input,
+                .runtime_wizard_input,
                 .command_palette_input,
                 => false,
             };
@@ -18902,4 +18997,26 @@ test "browser context-menu payload retains an optional link disposition target" 
     );
     defer parsed.deinit();
     try std.testing.expectEqualStrings("https://example.com/docs", parsed.value.link_url.?);
+}
+
+test "runtime picker add-connection row follows the configured profiles" {
+    const allocator = std.testing.allocator;
+    var state: AppState = undefined;
+    state.runtime_service = null;
+    state.runtime_picker_profiles = .empty;
+    defer {
+        for (state.runtime_picker_profiles.items) |*item| item.deinit(allocator);
+        state.runtime_picker_profiles.deinit(allocator);
+    }
+    try std.testing.expectEqual(@as(usize, 1), runtimePickerAddIndex(&state));
+    try std.testing.expectEqualStrings("Add connection…", paletteRuntimePickerLabel(@ptrCast(&state), 1));
+    try state.runtime_picker_profiles.append(allocator, .{
+        .profile_id = try allocator.dupe(u8, "profile-remote"),
+        .status = .offline,
+    });
+    // The trailing row moves behind every configured profile and never
+    // shadows one; the profile row itself is resolved from the live service.
+    try std.testing.expectEqual(@as(usize, 2), runtimePickerAddIndex(&state));
+    try std.testing.expectEqualStrings("Unavailable runtime", paletteRuntimePickerLabel(@ptrCast(&state), 1));
+    try std.testing.expectEqualStrings("Add connection…", paletteRuntimePickerLabel(@ptrCast(&state), 2));
 }

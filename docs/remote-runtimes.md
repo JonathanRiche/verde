@@ -371,11 +371,12 @@ Landed in the first foundation slice:
 - The network gateway permits only bootstrap `core.status` without a target. Browser HTTP/WebSocket clients learn one page-lifetime identity pair and target every later request; the gateway targets its own snapshot/change calls, while the daemon rejects a missing, malformed, or mismatched target before either normal or slow dispatch.
 - Thread routes persist profile, verified runtime, repository, and relative working-directory identity in SQLite. A route is mutable while a thread is a draft and immutable after its first durable action; corrupt, partial, unknown-profile, or remote routes never fall back to Local execution.
 - The desktop run control lists Local and configured SSH profiles with live connection status. Missing bearers open a masked process-memory credential flow, first contact requires explicit approval of the complete runtime/instance pair, and workspace defaults are stored separately from each thread's override.
+- Settings › **Runtimes & connections** manages connections without the CLI: an "Add connection…" entry in the runtime picker and in Settings opens an SSH wizard (name, SSH host/config alias, optional user, SSH port, gateway port) with field-level validation and a connect step; rows show Local plus every saved runtime with live state (connected, connecting, verifying, token required, identity verification required, offline, identity mismatch, unreachable, auth failed, unsupported) and actions to connect, retry, disconnect, edit non-secret fields, forget the in-memory token, remove with confirmation, copy redacted diagnostics, and choose the workspace default. Edits go through the shared profile store lock and the authoritative reread; changing an endpoint clears the persisted identity pin and invalidates the live generation so trust is never carried to a different peer. The expanded row reads repository bindings (`workspace.repository.manifest.get`) and the runtime-scoped provider inventory (`providers.status`) from the verified runtime and renders daemon-reported paths, states, and remediation commands only; the desktop has no remote shell, so unbound repositories and signed-out providers show as honest blocked/action states rather than a fake clone or login.
 - Text-only native chat can dispatch through a ready, capability-matched, exactly pinned remote runtime. Acceptance, ambiguous acceptance, streaming tails, terminal errors, cancellation, and approval responses stay on that runtime; attachment-bearing prompts fail visibly before transcript mutation instead of dropping files or running locally.
 - Workspace and thread page cursors are revision- and query-bound. A mutation or query mismatch produces an actionable restart-without-cursor error instead of silently duplicating or skipping rows.
 - Manual VM/systemd deployment and a locally built non-root Compose package now live in [Standalone Daemon Deployment](daemon-deployment.md).
 
-The open-source SSH path is now usable for manually configured, text-only native chat on a dedicated single-user VM/container. Still required for full parity: migrate the remaining desktop projections to bounded remote APIs; add optional OS credential-store hydration; add guided provider setup and deadline-bounded authentication probes; build the desktop multi-repository management/picker flow; and complete attachment, audited file, reconnectable PTY, and remote TUI transport. Direct HTTPS, scoped token lifecycle, and signed multi-architecture image publishing are also pending.
+The open-source SSH path is now usable for desktop-configured, text-only native chat on a dedicated single-user VM/container. Still required for full parity: migrate the remaining desktop projections to bounded remote APIs; add optional OS credential-store hydration; add guided provider setup over a safe remote execution surface and deadline-bounded authentication probes; add repository add/clone/bind from the desktop; and complete attachment, audited file, reconnectable PTY, and remote TUI transport. Direct HTTPS, scoped token lifecycle, and signed multi-architecture image publishing are also pending.
 
 ## Delivery plan
 
@@ -404,7 +405,7 @@ Exit: a clean Linux VM can run the daemon without installing or launching the de
 
 - Preserve the loopback-only, mandatory-token-file gateway and bounded browser sessions.
 - Add persistent token lifecycle and scopes.
-- Persist desktop SSH profiles, retain the landed masked process-memory credential flow, and later add optional OS credential-store hydration. Preserve host-verification guidance, owned-relay supervision, health, reconnect, and diagnostics.
+- Preserve the landed desktop profile management (Settings › Runtimes & connections and the picker's "Add connection…") that uses the shared profile store lock and authoritative reload, retain the masked process-memory credential flow, and later add optional OS credential-store hydration. Preserve host-verification guidance, owned-relay supervision, health, reconnect, and redacted diagnostics.
 - Preserve the landed periodic authenticated heartbeat and generation-safe general RPC routing that validates the pinned runtime/instance pair inside every dispatched request before allowing remote execution.
 - Support multiple simultaneous runtime connections.
 
@@ -414,17 +415,17 @@ Exit: the desktop can use Local and at least two SSH runtimes concurrently.
 
 - Preserve the landed strict, owner-only workspace default profile store and CLI/command-palette controls.
 - Preserve the landed immutable runtime/repository/cwd binding on started threads and enforce it at every execution boundary.
-- Preserve the live Local/configured-profile status choices and per-draft override.
+- Preserve the live Local/configured-profile status choices, the Settings workspace-default selector, and per-draft override.
 - Keep started routes immutable; choosing another runtime requires a new thread instead of migrating work.
-- Extend the landed text-only remote dispatch with attachment, PTY, TUI, and repository-selection parity.
+- Preserve the landed read-only repository binding readiness in Settings; extend the landed text-only remote dispatch with attachment, PTY, TUI, and repository add/clone/selection parity.
 
 Exit: two threads in one workspace can intentionally run on different runtimes.
 
 ### 5. Provider parity and guided setup
 
 - Audit all applicable native-chat, MCP, terminal, hook, CLI, settings, and test surfaces.
-- Expose runtime-scoped provider status and remediation.
-- Launch provider-native login/setup in a remote PTY.
+- Preserve the landed runtime-scoped provider status and remediation display in Settings (read-only; commands are shown, never executed by the desktop).
+- Launch provider-native login/setup in a remote PTY once a safe remote execution surface exists.
 - Verify GUI and TUI share credentials through the same UID/HOME.
 
 Exit: each supported provider either works on the runtime or displays a specific setup/error state without leaking credentials.
