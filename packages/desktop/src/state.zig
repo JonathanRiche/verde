@@ -15,7 +15,6 @@ const chat_threads = @import("chat/threads.zig");
 const db_client = @import("db/client.zig");
 const db_types = @import("db/types.zig");
 const daemon_store = @import("daemon/store.zig");
-const herdr = @import("workspace/herdr.zig");
 const keybinds = @import("app/keybinds.zig");
 const loop_wakeup = @import("loop_wakeup");
 const platform_paths = @import("platform_paths");
@@ -26,6 +25,11 @@ const workspace_identity = @import("platform/workspace_identity.zig");
 const process_env = @import("platform/env.zig");
 const provider_hooks = @import("providers/hooks.zig");
 const provider_mcp = @import("providers/mcp.zig");
+const runtime_profile_store = @import("runtime/profile_store.zig");
+const runtime_secret_store = @import("runtime/secret_store.zig");
+const runtime_workspace_defaults = @import("runtime/workspace_runtime_defaults.zig");
+const RuntimeService = @import("runtime/service.zig");
+const thread_binding = @import("runtime/thread_binding.zig");
 const runtime_log = @import("runtime/log.zig");
 const send_runner = @import("chat/send_runner.zig");
 const slash_commands = @import("chat/slash_commands.zig");
@@ -640,6 +644,10 @@ fn snapshotThreadToPersisted(
         .harness = snapshotEnum(Harness, thread.harness, .local_cli),
         .tui_dock_id = thread.tui_dock_id,
         .cwd = thread.cwd,
+        .profile_id = thread.profile_id,
+        .runtime_id = thread.runtime_id,
+        .repository_id = thread.repository_id,
+        .repository_cwd = thread.repository_cwd,
         .draft = thread.draft,
         .draft_image = snapshotAttachment(thread.draft_image),
         .draft_extra_images = try snapshotAttachmentExtras(allocator, thread.draft_images),
@@ -796,10 +804,12 @@ fn overlayCurrentThreadEdits(
     remote: *PersistedThread,
     baseline: PersistedThread,
     current: PersistedThread,
-) void {
+) !void {
     if (!std.mem.eql(u8, current.title, baseline.title)) remote.title = current.title;
     if (current.archived != baseline.archived) remote.archived = current.archived;
-    if (current.committed != baseline.committed) remote.committed = current.committed;
+    const route_locked = baseline.committed or current.committed or remote.committed;
+    if (route_locked and !remote.committed) return error.CommittedThreadRouteConflict;
+    if (!route_locked and current.committed != baseline.committed) remote.committed = current.committed;
     if (current.last_activity_at != baseline.last_activity_at) remote.last_activity_at = current.last_activity_at;
     if (!optionalSliceEqual(current.model_ref, baseline.model_ref)) remote.model_ref = current.model_ref;
     if (current.reasoning_effort != baseline.reasoning_effort) remote.reasoning_effort = current.reasoning_effort;
@@ -810,11 +820,92 @@ fn overlayCurrentThreadEdits(
     if (current.harness != baseline.harness) remote.harness = current.harness;
     if (current.tui_dock_id != baseline.tui_dock_id) remote.tui_dock_id = current.tui_dock_id;
     if (!optionalSliceEqual(current.cwd, baseline.cwd)) remote.cwd = current.cwd;
+    if (route_locked) {
+        if (!committedMergeRoutesCompatible(remote.*, current)) {
+            return error.CommittedThreadRouteConflict;
+        }
+        // A remote null may be an additive-field omission. Preserve a stable
+        // runtime pin already known locally; null -> verified remote identity
+        // remains the sole forward transition.
+        if (current.runtime_id != null and remote.runtime_id == null) {
+            remote.runtime_id = current.runtime_id;
+        }
+    } else {
+        if (!optionalSliceEqual(current.profile_id, baseline.profile_id)) remote.profile_id = current.profile_id;
+        if (!optionalSliceEqual(current.runtime_id, baseline.runtime_id)) remote.runtime_id = current.runtime_id;
+        if (!optionalSliceEqual(current.repository_id, baseline.repository_id)) remote.repository_id = current.repository_id;
+        if (!optionalSliceEqual(current.repository_cwd, baseline.repository_cwd)) remote.repository_cwd = current.repository_cwd;
+    }
     if (!std.mem.eql(u8, current.draft, baseline.draft)) remote.draft = current.draft;
     if (!optionalImageEqual(current.draft_image, baseline.draft_image)) remote.draft_image = current.draft_image;
     if (!imageListEqual(current.draft_extra_images, baseline.draft_extra_images)) {
         remote.draft_extra_images = current.draft_extra_images;
     }
+}
+
+fn persistedThreadRouteAbsent(thread: PersistedThread) bool {
+    return thread.profile_id == null and thread.runtime_id == null and
+        thread.repository_id == null and thread.repository_cwd == null;
+}
+
+fn committedMergeRoutesCompatible(remote: PersistedThread, current: PersistedThread) bool {
+    const remote_absent = persistedThreadRouteAbsent(remote);
+    const current_absent = persistedThreadRouteAbsent(current);
+    if (!remote_absent and (remote.profile_id == null or remote.repository_id == null)) return false;
+    if (!current_absent and (current.profile_id == null or current.repository_id == null)) return false;
+
+    const remote_profile = remote.profile_id orelse chat_types.LOCAL_RUNTIME_PROFILE_ID;
+    const current_profile = current.profile_id orelse chat_types.LOCAL_RUNTIME_PROFILE_ID;
+    const remote_repository = remote.repository_id orelse chat_types.PRIMARY_REPOSITORY_ID;
+    const current_repository = current.repository_id orelse chat_types.PRIMARY_REPOSITORY_ID;
+    if (!std.mem.eql(u8, remote_profile, current_profile) or
+        !std.mem.eql(u8, remote_repository, current_repository) or
+        !optionalSliceEqual(remote.repository_cwd, current.repository_cwd))
+    {
+        return false;
+    }
+    if (current.runtime_id) |current_runtime_id| {
+        if (remote.runtime_id) |remote_runtime_id| {
+            return std.mem.eql(u8, remote_runtime_id, current_runtime_id);
+        }
+    }
+    return true;
+}
+
+test "committed thread merge never downgrades an immutable route to legacy local" {
+    const committed: PersistedThread = .{
+        .title = "Remote",
+        .committed = true,
+        .profile_id = "remote-box",
+        .runtime_id = "0123456789abcdef0123456789abcdef",
+        .repository_id = "repo-api",
+        .repository_cwd = "services/api",
+    };
+    var omitted: PersistedThread = .{
+        .title = "Remote",
+        .committed = true,
+    };
+    try std.testing.expectError(
+        error.CommittedThreadRouteConflict,
+        overlayCurrentThreadEdits(&omitted, committed, committed),
+    );
+
+    var verified_pin = committed;
+    verified_pin.runtime_id = "0123456789abcdef0123456789abcdef";
+    try overlayCurrentThreadEdits(&verified_pin, committed, committed);
+    try std.testing.expectEqualStrings(
+        "0123456789abcdef0123456789abcdef",
+        verified_pin.runtime_id.?,
+    );
+
+    var current_pinned = committed;
+    current_pinned.runtime_id = "0123456789abcdef0123456789abcdef";
+    var omitted_pin = committed;
+    try overlayCurrentThreadEdits(&omitted_pin, current_pinned, current_pinned);
+    try std.testing.expectEqualStrings(
+        "0123456789abcdef0123456789abcdef",
+        omitted_pin.runtime_id.?,
+    );
 }
 
 fn overlayCurrentThreadMessages(
@@ -877,6 +968,10 @@ fn mergeCurrentThreads(
                 merged.items[index].draft = current_thread.draft;
                 merged.items[index].draft_image = current_thread.draft_image;
                 merged.items[index].draft_extra_images = current_thread.draft_extra_images;
+                merged.items[index].profile_id = current_thread.profile_id;
+                merged.items[index].runtime_id = current_thread.runtime_id;
+                merged.items[index].repository_id = current_thread.repository_id;
+                merged.items[index].repository_cwd = current_thread.repository_cwd;
             } else {
                 try merged.append(allocator, current_thread);
             }
@@ -884,7 +979,7 @@ fn mergeCurrentThreads(
         }
         if (remote_index) |index| {
             const base_thread = baseline_threads[baseline_index.?];
-            overlayCurrentThreadEdits(&merged.items[index], base_thread, current_thread);
+            try overlayCurrentThreadEdits(&merged.items[index], base_thread, current_thread);
             try overlayCurrentThreadMessages(allocator, &merged.items[index], base_thread, current_thread);
         }
         // If remote omitted an identity present in the baseline, that is a
@@ -985,7 +1080,13 @@ fn preserveCurrentIdentitiesWithoutBaseline(
         try threads.appendSlice(allocator, remote_project.threads orelse &.{});
         for (current_project.threads orelse &.{}) |current_thread| {
             const thread_id = current_thread.local_thread_id orelse continue;
-            if (threadIndexById(threads.items, thread_id) == null) {
+            if (threadIndexById(threads.items, thread_id)) |thread_index| {
+                try overlayCurrentThreadEdits(
+                    &threads.items[thread_index],
+                    current_thread,
+                    current_thread,
+                );
+            } else {
                 try threads.append(allocator, current_thread);
             }
         }
@@ -1918,10 +2019,6 @@ pub const PaletteModalAction = enum {
     thread_import_cancel,
     thread_import_submit,
     thread_import_select,
-    herdr_profile_refresh,
-    herdr_profile_cancel,
-    herdr_profile_submit,
-    herdr_profile_select,
     handoff_cancel,
     handoff_prepare,
     handoff_surface_gui,
@@ -1943,6 +2040,11 @@ pub const PaletteModalAction = enum {
     project_import_submit,
     project_import_create_dir,
     project_import_cancel,
+    runtime_credential_cancel,
+    runtime_credential_submit,
+    runtime_credential_input,
+    runtime_trust_cancel,
+    runtime_trust_confirm,
     modal_dismiss,
     modal_block,
     project_rename_input,
@@ -2031,6 +2133,7 @@ pub const PaletteModalTextFocus = enum {
     thread_import,
     project_import_name,
     project_import,
+    runtime_credential,
     command_palette,
 };
 
@@ -3075,25 +3178,174 @@ fn paletteDirectoryPickerEvent(context: ?*anyopaque, event: palette.RichPickerEv
     }
 }
 
-/// Rows of the runtime pill picker. Only `local` is selectable today; the
-/// remote row is reserved for the cloud/remote-daemon feature.
-const RUNTIME_PICKER_ROWS = [_]struct { label: []const u8, description: []const u8, badge: []const u8 }{
-    .{ .label = "Local", .description = "Runs on this machine", .badge = "" },
-    .{ .label = "Remote", .description = "Cloud and remote daemons", .badge = "Coming soon" },
-};
 const RUNTIME_PICKER_LOCAL_INDEX: usize = 0;
 const COMPOSER_RUNTIME_PICKER_WIDTH: f32 = 300.0;
+const RUNTIME_CREDENTIAL_STORAGE_BYTES: usize = runtime_secret_store.MAX_TOKEN_BYTES + 1;
 
-fn paletteRuntimePickerLabel(_: ?*anyopaque, index: usize) []const u8 {
-    return if (index < RUNTIME_PICKER_ROWS.len) RUNTIME_PICKER_ROWS[index].label else "";
+const RuntimeActivationAction = enum {
+    none,
+    enable,
+    retry,
+    request_credential,
+};
+
+const RuntimeTrustContinuation = enum {
+    current,
+    reconnecting,
+    enable,
+};
+
+fn runtimeConnectionNowMs() u64 {
+    const now_ns = profiler.nowNs();
+    return std.math.cast(u64, @divTrunc(now_ns, std.time.ns_per_ms)) orelse
+        if (now_ns < 0) @as(u64, 0) else std.math.maxInt(u64);
 }
 
-fn paletteRuntimePickerDescription(_: ?*anyopaque, index: usize) []const u8 {
-    return if (index < RUNTIME_PICKER_ROWS.len) RUNTIME_PICKER_ROWS[index].description else "";
+const RuntimePickerStatus = enum {
+    offline,
+    credential_required,
+    connecting,
+    handshaking,
+    trust_required,
+    ready,
+    limited,
+    reconnecting,
+    authentication_failed,
+    identity_mismatch,
+    connection_failed,
+    unsupported,
+    failed,
+    unavailable,
+};
+
+const RuntimePickerProfile = struct {
+    profile_id: []u8,
+    status: RuntimePickerStatus,
+
+    fn deinit(self: *RuntimePickerProfile, allocator: std.mem.Allocator) void {
+        allocator.free(self.profile_id);
+        self.* = undefined;
+    }
+};
+
+fn runtimePickerStatus(snapshot: RuntimeService.Snapshot) RuntimePickerStatus {
+    if (snapshot.identity_pin_required) return .trust_required;
+    return switch (snapshot.phase) {
+        .connecting => .connecting,
+        .handshaking => .handshaking,
+        .awaiting_trust => .trust_required,
+        .ready => if (snapshot.execution_ready) .ready else .limited,
+        .reconnecting => .reconnecting,
+        .disabled, .failed => if (snapshot.failure) |failure| switch (failure) {
+            .missing_credential => .credential_required,
+            .unsupported_transport => .unsupported,
+            .authentication => .authentication_failed,
+            .identity => .identity_mismatch,
+            .network, .no_loopback_port, .tunnel_spawn, .tunnel_readiness, .tunnel_wait, .tunnel_exited => .connection_failed,
+            .protocol, .resource => .failed,
+        } else if (snapshot.phase == .disabled) .offline else .failed,
+    };
 }
 
-fn paletteRuntimePickerBadge(_: ?*anyopaque, index: usize) []const u8 {
-    return if (index < RUNTIME_PICKER_ROWS.len) RUNTIME_PICKER_ROWS[index].badge else "";
+fn runtimeActivationAction(snapshot: RuntimeService.Snapshot) RuntimeActivationAction {
+    if (snapshot.failure) |failure| {
+        if (failure == .missing_credential or failure == .authentication) {
+            return .request_credential;
+        }
+    }
+    return switch (snapshot.phase) {
+        .disabled => .enable,
+        .failed => .retry,
+        .connecting, .handshaking, .awaiting_trust, .ready, .reconnecting => .none,
+    };
+}
+
+fn runtimeTrustContinuation(adoption: RuntimeService.PinAdoption) RuntimeTrustContinuation {
+    return switch (adoption) {
+        .committed_current => .current,
+        .reconnect_required => .reconnecting,
+        .installed_disabled => .enable,
+    };
+}
+
+fn runtimePickerStatusBadge(status: RuntimePickerStatus) []const u8 {
+    return switch (status) {
+        .offline => "Offline",
+        .credential_required => "Credential needed",
+        .connecting => "Connecting",
+        .handshaking => "Verifying",
+        .trust_required => "Verify identity",
+        .ready => "Connected",
+        .limited => "Limited",
+        .reconnecting => "Reconnecting",
+        .authentication_failed => "Auth failed",
+        .identity_mismatch => "Identity mismatch",
+        .connection_failed => "Unreachable",
+        .unsupported => "Unsupported",
+        .failed => "Failed",
+        .unavailable => "Unavailable",
+    };
+}
+
+fn runtimePickerStatusDescription(status: RuntimePickerStatus) []const u8 {
+    return switch (status) {
+        .credential_required => "Add a bearer credential before connecting",
+        .trust_required => "Confirm this daemon identity before use",
+        .authentication_failed => "The remote daemon rejected authentication",
+        .identity_mismatch => "The daemon identity differs from the saved pin",
+        .connection_failed => "The SSH runtime could not be reached",
+        .unsupported => "This transport is not supported by the desktop",
+        .failed => "The runtime connection failed",
+        .unavailable => "This configured runtime is unavailable",
+        else => "Remote daemon over SSH",
+    };
+}
+
+fn runtimePickerProfileAt(state: *const AppState, index: usize) ?*const RuntimePickerProfile {
+    if (index == RUNTIME_PICKER_LOCAL_INDEX) return null;
+    const profile_index = index - 1;
+    if (profile_index >= state.runtime_picker_profiles.items.len) return null;
+    return &state.runtime_picker_profiles.items[profile_index];
+}
+
+fn runtimePickerSnapshotAt(state: *const AppState, index: usize) ?RuntimeService.Snapshot {
+    const configured = runtimePickerProfileAt(state, index) orelse return null;
+    const service = state.runtime_service orelse return null;
+    return service.snapshot(configured.profile_id);
+}
+
+fn selectThreadRuntimeProfile(
+    thread: *chat_types.ChatThread,
+    allocator: std.mem.Allocator,
+    profile_id: []const u8,
+) !thread_binding.SelectResult {
+    const current = thread.selectedRuntimeRoute();
+    return thread.selectRuntimeRoute(allocator, .{
+        .profile_id = profile_id,
+        .repository_id = current.repository_id,
+        .relative_cwd = current.relative_cwd,
+    });
+}
+
+fn paletteRuntimePickerLabel(context: ?*anyopaque, index: usize) []const u8 {
+    if (index == RUNTIME_PICKER_LOCAL_INDEX) return "Local";
+    const state = appStateFromContext(context) orelse return "";
+    const snapshot = runtimePickerSnapshotAt(state, index) orelse return "Unavailable runtime";
+    return snapshot.label;
+}
+
+fn paletteRuntimePickerDescription(context: ?*anyopaque, index: usize) []const u8 {
+    if (index == RUNTIME_PICKER_LOCAL_INDEX) return "Runs on this machine";
+    const state = appStateFromContext(context) orelse return "";
+    const snapshot = runtimePickerSnapshotAt(state, index) orelse return runtimePickerStatusDescription(.unavailable);
+    return runtimePickerStatusDescription(runtimePickerStatus(snapshot));
+}
+
+fn paletteRuntimePickerBadge(context: ?*anyopaque, index: usize) []const u8 {
+    if (index == RUNTIME_PICKER_LOCAL_INDEX) return "";
+    const state = appStateFromContext(context) orelse return "";
+    const snapshot = runtimePickerSnapshotAt(state, index) orelse return runtimePickerStatusBadge(.unavailable);
+    return runtimePickerStatusBadge(runtimePickerStatus(snapshot));
 }
 
 pub const PaletteRuntimePicker = palette.richPicker(.{
@@ -3126,11 +3378,7 @@ fn paletteRuntimePickerEvent(context: ?*anyopaque, event: palette.RichPickerEven
     const state = appStateFromContext(context) orelse return;
     switch (event) {
         .selected => |index| {
-            // Remote stays a preview row: keep Local selected and say why.
-            if (index != RUNTIME_PICKER_LOCAL_INDEX) {
-                state.setSidebarNotice("Remote runtimes are coming soon; chats run locally for now.");
-            }
-            state.composer_controller.runtime_picker.setSelectedItem(RUNTIME_PICKER_LOCAL_INDEX);
+            state.selectCurrentThreadRuntimePickerIndex(index);
             state.noteInteraction();
         },
         .action => {},
@@ -3511,8 +3759,6 @@ pub const ImportThreadSummary = struct {
     }
 };
 
-pub const HerdrProfileSummary = herdr_controller.ProfileSummary;
-
 pub const TextureBackend = state_ui_types.TextureBackend;
 pub const CachedImageTexture = state_ui_types.CachedImageTexture;
 
@@ -3762,7 +4008,6 @@ pub const AppState = struct {
     close_durability_notice: bool = false,
     import_thread_id_storage: [256:0]u8,
     import_notice_storage: [256:0]u8,
-    herdr_controller: herdr_controller.State,
     sidebar_collapsed: bool,
     sidebar_hidden: bool,
     sidebar_hover_revealed: bool,
@@ -3909,6 +4154,29 @@ pub const AppState = struct {
     transcript_controller: transcript_controller.State,
     lifecycle: lifecycle_controller.State,
     chat_controller: chat_controller.State,
+    /// Heap ownership keeps the manager and its supervisor fields at stable
+    /// addresses after AppState.init returns by value. The borrowed `std.Io`
+    /// is the process-owned backend supplied by `std.process.Init`.
+    runtime_service: ?*RuntimeService = null,
+    /// Profile IDs are copied because Service snapshots are borrowed only
+    /// until the next manager mutation. Labels and secret-free status are
+    /// looked up live on the single SDL owner thread.
+    runtime_picker_profiles: std.ArrayList(RuntimePickerProfile) = .empty,
+    /// Desktop-local, non-secret workspace defaults. A missing or stale
+    /// mapping behaves as Local and never rewrites an existing thread route.
+    workspace_runtime_defaults: ?runtime_workspace_defaults.OwnedWorkspaceRuntimeDefaults = null,
+    runtime_poll_failure_logged: bool = false,
+    /// The only UI-owned bearer copy. It exists solely while the masked
+    /// credential modal is open and is securely zeroed before every reset.
+    runtime_credential_profile_id: ?[]u8,
+    runtime_credential_token_storage: [RUNTIME_CREDENTIAL_STORAGE_BYTES:0]u8,
+    runtime_credential_token_cursor: usize,
+    runtime_credential_notice_storage: [256:0]u8,
+    /// Exact owned first-contact proposal shown to the user. Polling may fill
+    /// this field, but only the explicit confirm action passes it to Service.
+    runtime_pin_proposal: ?RuntimeService.RuntimePinProposal,
+    runtime_trust_notice_storage: [256:0]u8,
+    runtime_proposal_failure_logged: bool,
     /// Set by the sidebar render pass whenever it draws a pulsing status pip
     /// this frame; cleared at the top of renderRoot. The main loop reads the
     /// previous frame's value to keep a ~30fps animation tick going (the loop
@@ -3962,7 +4230,6 @@ pub const AppState = struct {
             .sidebar_notice_storage = std.mem.zeroes([256:0]u8),
             .import_thread_id_storage = std.mem.zeroes([256:0]u8),
             .import_notice_storage = std.mem.zeroes([256:0]u8),
-            .herdr_controller = .{},
             .sidebar_collapsed = false,
             .sidebar_hidden = false,
             .sidebar_hover_revealed = false,
@@ -4071,6 +4338,13 @@ pub const AppState = struct {
             .transcript_controller = .{},
             .lifecycle = .{},
             .chat_controller = .{},
+            .runtime_credential_profile_id = null,
+            .runtime_credential_token_storage = std.mem.zeroes([RUNTIME_CREDENTIAL_STORAGE_BYTES:0]u8),
+            .runtime_credential_token_cursor = 0,
+            .runtime_credential_notice_storage = std.mem.zeroes([256:0]u8),
+            .runtime_pin_proposal = null,
+            .runtime_trust_notice_storage = std.mem.zeroes([256:0]u8),
+            .runtime_proposal_failure_logged = false,
             .sidebar_pulse_animating = false,
             .external_open_close_suppress_until_ms = 0,
         };
@@ -4163,6 +4437,439 @@ pub const AppState = struct {
             };
         }
         return state;
+    }
+
+    /// Attaches the UI-independent runtime owner after this AppState reaches
+    /// its final address. Only non-secret profile metadata is loaded here;
+    /// credentials and identity approval remain explicit later operations.
+    /// `process_io` must remain valid until AppState.deinit; the native shell
+    /// supplies `std.process.Init.io`, whose lifetime covers the whole app.
+    pub fn attachRuntimeService(self: *AppState, process_io: std.Io) !void {
+        if (self.runtime_service != null) return error.RuntimeServiceAlreadyAttached;
+
+        const profile_path = try runtime_profile_store.pathAlloc(self.allocator);
+        defer self.allocator.free(profile_path);
+
+        const service = try self.allocator.create(RuntimeService);
+        errdefer self.allocator.destroy(service);
+        service.* = try RuntimeService.init(self.allocator, process_io, profile_path, .{});
+        errdefer service.deinit();
+
+        const snapshots = try service.snapshotsAlloc(self.allocator);
+        defer self.allocator.free(snapshots);
+        var configured: std.ArrayList(RuntimePickerProfile) = .empty;
+        errdefer {
+            for (configured.items) |*profile| profile.deinit(self.allocator);
+            configured.deinit(self.allocator);
+        }
+        for (snapshots) |snapshot| {
+            // Local is a built-in route. A profile document can contain one
+            // local-socket migration row, but it must not create a duplicate
+            // Local choice or imply that the unsupported manager transport is
+            // independently connectable.
+            if (snapshot.transport != .ssh_tunnel) continue;
+            try configured.ensureUnusedCapacity(self.allocator, 1);
+            configured.appendAssumeCapacity(.{
+                .profile_id = try self.allocator.dupe(u8, snapshot.profile_id),
+                .status = runtimePickerStatus(snapshot),
+            });
+        }
+
+        self.runtime_service = service;
+        self.runtime_picker_profiles = configured;
+    }
+
+    /// Loads desktop-owned workspace defaults after runtime profiles are
+    /// attached. Restored threads keep their persisted routes; only the
+    /// pristine seed created for a genuinely empty store is reconciled here.
+    pub fn loadWorkspaceRuntimeDefaults(self: *AppState) !void {
+        try self.reloadWorkspaceRuntimeDefaults();
+        if (self.daemon_projection_has_saved_state) return;
+
+        var changed = false;
+        for (self.project_controller.projects.items) |*project| {
+            for (project.threads.items) |*thread| {
+                const result = try self.applyWorkspaceRuntimeDefaultToThread(project.id, thread);
+                changed = changed or result == .updated;
+            }
+        }
+        if (changed) self.markDirty();
+    }
+
+    /// Makes the focused chat's selected runtime the default for future
+    /// drafts in this workspace. Existing drafts and started threads are not
+    /// rewritten, so each thread remains free to choose its own route.
+    pub fn useCurrentThreadRuntimeAsWorkspaceDefault(self: *AppState) void {
+        if (self.project_controller.selected_index >= self.project_controller.projects.items.len) return;
+        const project = &self.project_controller.projects.items[self.project_controller.selected_index];
+        if (project.selected_thread_index >= project.threads.items.len) return;
+        const profile_id = project.threads.items[project.selected_thread_index].selectedRuntimeRoute().profile_id;
+        self.persistWorkspaceRuntimeDefault(project.id, profile_id) catch |err| {
+            log.warn("failed to persist workspace runtime default: {s}", .{@errorName(err)});
+            self.setSidebarNotice(if (err == error.RuntimeProfileNotFound)
+                "That runtime is no longer configured. The workspace default was not changed."
+            else
+                "Could not save the workspace runtime default.");
+            return;
+        };
+        self.setSidebarNotice("Future chats in this workspace will use the selected runtime by default.");
+    }
+
+    /// Sets Local as the explicit default for future drafts without changing
+    /// any thread that already exists.
+    pub fn useLocalAsWorkspaceRuntimeDefault(self: *AppState) void {
+        if (self.project_controller.selected_index >= self.project_controller.projects.items.len) return;
+        const workspace_id = self.project_controller.projects.items[self.project_controller.selected_index].id;
+        self.persistWorkspaceRuntimeDefault(workspace_id, runtime_workspace_defaults.LOCAL_PROFILE_ID) catch |err| {
+            log.warn("failed to persist Local workspace runtime default: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Could not save the workspace runtime default.");
+            return;
+        };
+        self.setSidebarNotice("Future chats in this workspace will run locally by default.");
+    }
+
+    fn reloadWorkspaceRuntimeDefaults(self: *AppState) !void {
+        var loaded = try runtime_workspace_defaults.load(self.allocator);
+        errdefer loaded.deinit(self.allocator);
+        if (self.workspace_runtime_defaults) |*existing| existing.deinit(self.allocator);
+        self.workspace_runtime_defaults = loaded;
+    }
+
+    fn persistWorkspaceRuntimeDefault(
+        self: *AppState,
+        workspace_id: []const u8,
+        profile_id: []const u8,
+    ) !void {
+        if (!self.runtimeProfileAvailableForWorkspaceDefault(profile_id)) return error.RuntimeProfileNotFound;
+        _ = try runtime_workspace_defaults.upsert(self.allocator, workspace_id, profile_id);
+        // Reload the complete locked document so concurrent updates for other
+        // workspaces become visible without rewriting any existing thread.
+        try self.reloadWorkspaceRuntimeDefaults();
+    }
+
+    fn workspaceRuntimeDefaultProfile(self: *const AppState, workspace_id: []const u8) []const u8 {
+        const defaults = self.workspace_runtime_defaults orelse return runtime_workspace_defaults.LOCAL_PROFILE_ID;
+        for (defaults.items) |entry| {
+            if (std.mem.eql(u8, entry.workspace_id, workspace_id)) return entry.profile_id;
+        }
+        return runtime_workspace_defaults.LOCAL_PROFILE_ID;
+    }
+
+    fn runtimeProfileAvailableForWorkspaceDefault(self: *const AppState, profile_id: []const u8) bool {
+        if (std.mem.eql(u8, profile_id, runtime_workspace_defaults.LOCAL_PROFILE_ID)) return true;
+        for (self.runtime_picker_profiles.items) |configured| {
+            if (std.mem.eql(u8, configured.profile_id, profile_id)) return true;
+        }
+        return false;
+    }
+
+    fn applyWorkspaceRuntimeDefaultToThread(
+        self: *AppState,
+        workspace_id: []const u8,
+        thread: *ChatThread,
+    ) !thread_binding.SelectResult {
+        const configured = self.workspaceRuntimeDefaultProfile(workspace_id);
+        const profile_id = if (self.runtimeProfileAvailableForWorkspaceDefault(configured))
+            configured
+        else
+            runtime_workspace_defaults.LOCAL_PROFILE_ID;
+        return selectThreadRuntimeProfile(thread, self.allocator, profile_id);
+    }
+
+    pub fn runtimeCredentialModalOpen(self: *const AppState) bool {
+        return self.runtime_credential_profile_id != null;
+    }
+
+    pub fn runtimeCredentialToken(self: *const AppState) []const u8 {
+        return std.mem.sliceTo(self.runtime_credential_token_storage[0..], 0);
+    }
+
+    pub fn runtimeCredentialTokenBuffer(self: *AppState) [:0]u8 {
+        return self.runtime_credential_token_storage[0..self.runtime_credential_token_storage.len :0];
+    }
+
+    pub fn runtimeCredentialNotice(self: *const AppState) []const u8 {
+        return std.mem.sliceTo(self.runtime_credential_notice_storage[0..], 0);
+    }
+
+    pub fn runtimeCredentialProfileLabel(self: *const AppState) []const u8 {
+        const profile_id = self.runtime_credential_profile_id orelse return "Remote runtime";
+        const service = self.runtime_service orelse return "Remote runtime";
+        const snapshot = service.snapshot(profile_id) orelse return "Remote runtime";
+        return snapshot.label;
+    }
+
+    pub fn runtimeTrustProposal(self: *const AppState) ?*const RuntimeService.RuntimePinProposal {
+        return if (self.runtime_pin_proposal) |*proposal| proposal else null;
+    }
+
+    pub fn runtimeTrustNotice(self: *const AppState) []const u8 {
+        return std.mem.sliceTo(self.runtime_trust_notice_storage[0..], 0);
+    }
+
+    pub fn runtimeTrustProfileLabel(self: *const AppState) []const u8 {
+        const proposal = self.runtimeTrustProposal() orelse return "Remote runtime";
+        const service = self.runtime_service orelse return "Remote runtime";
+        const snapshot = service.snapshot(proposal.profile_id) orelse return "Remote runtime";
+        return snapshot.label;
+    }
+
+    fn setRuntimeCredentialNotice(self: *AppState, value: []const u8) void {
+        @memset(&self.runtime_credential_notice_storage, 0);
+        const len = @min(value.len, self.runtime_credential_notice_storage.len - 1);
+        @memcpy(self.runtime_credential_notice_storage[0..len], value[0..len]);
+    }
+
+    fn setRuntimeTrustNotice(self: *AppState, value: []const u8) void {
+        @memset(&self.runtime_trust_notice_storage, 0);
+        const len = @min(value.len, self.runtime_trust_notice_storage.len - 1);
+        @memcpy(self.runtime_trust_notice_storage[0..len], value[0..len]);
+    }
+
+    /// Erases the full UI credential allocation, including bytes after the
+    /// current sentinel that may contain text removed by an edit operation.
+    pub fn wipeRuntimeCredentialInput(self: *AppState) void {
+        std.crypto.secureZero(u8, self.runtime_credential_token_storage[0..]);
+        self.runtime_credential_token_cursor = 0;
+        if (self.palette_modal_text_focus == .runtime_credential) {
+            self.modal_text_selection_anchor = null;
+            self.modal_text_drag_active = false;
+        }
+    }
+
+    fn closeRuntimeCredentialModalState(self: *AppState) void {
+        self.wipeRuntimeCredentialInput();
+        if (self.runtime_credential_profile_id) |profile_id| self.allocator.free(profile_id);
+        self.runtime_credential_profile_id = null;
+        self.setRuntimeCredentialNotice("");
+        if (self.palette_modal_text_focus == .runtime_credential) {
+            self.palette_modal_text_focus = .none;
+        }
+        self.modal_text_selection_anchor = null;
+        self.modal_text_drag_active = false;
+    }
+
+    fn closeRuntimeTrustModalState(self: *AppState) void {
+        if (self.runtime_pin_proposal) |*proposal| proposal.deinit();
+        self.runtime_pin_proposal = null;
+        self.setRuntimeTrustNotice("");
+        self.modal_text_selection_anchor = null;
+        self.modal_text_drag_active = false;
+    }
+
+    fn openRuntimeCredentialModal(self: *AppState, profile_id: []const u8) !void {
+        const owned_profile_id = try self.allocator.dupe(u8, profile_id);
+        errdefer self.allocator.free(owned_profile_id);
+        if (self.runtime_credential_profile_id != null) self.cancelRuntimeCredentialModal();
+        self.closePaletteRuntimePicker();
+        self.closePaletteModelPicker();
+        self.closePaletteDirectoryPicker();
+        self.closeRunConfigPopover();
+        self.wipeRuntimeCredentialInput();
+        self.runtime_credential_profile_id = owned_profile_id;
+        self.setRuntimeCredentialNotice("");
+        self.palette_modal_text_focus = .runtime_credential;
+        self.modal_text_selection_anchor = null;
+        self.modal_text_drag_active = false;
+    }
+
+    fn revokeRuntimeProfileCredential(self: *AppState, profile_id: []const u8) bool {
+        const service = self.runtime_service orelse return false;
+        var clean = true;
+        service.disable(profile_id) catch |err| {
+            log.warn("failed to disable remote runtime: {s}", .{@errorName(err)});
+            clean = false;
+        };
+        _ = service.clearToken(profile_id) catch |err| {
+            log.warn("failed to clear remote runtime credential: {s}", .{@errorName(err)});
+            clean = false;
+        };
+        return clean;
+    }
+
+    pub fn cancelRuntimeCredentialModal(self: *AppState) void {
+        const clean = if (self.runtime_credential_profile_id) |profile_id|
+            self.revokeRuntimeProfileCredential(profile_id)
+        else
+            true;
+        self.closeRuntimeCredentialModalState();
+        self.setSidebarNotice(if (clean)
+            "Remote runtime connection canceled."
+        else
+            "Remote runtime canceled; cleanup will finish during shutdown.");
+    }
+
+    pub fn submitRuntimeCredential(self: *AppState) void {
+        const profile_id = self.runtime_credential_profile_id orelse return;
+        const service = self.runtime_service orelse {
+            self.setRuntimeCredentialNotice("Runtime service is unavailable.");
+            return;
+        };
+        const token = self.runtimeCredentialToken();
+        service.hydrateToken(profile_id, token) catch |err| {
+            self.setRuntimeCredentialNotice(switch (err) {
+                error.WeakToken => "Bearer token must be at least 32 characters.",
+                error.TokenTooLong => "Bearer token is too long.",
+                error.InvalidTokenEncoding => "Use printable characters without spaces.",
+                else => "Could not load that bearer token.",
+            });
+            log.warn("failed to hydrate remote runtime credential: {s}", .{@errorName(err)});
+            return;
+        };
+
+        // Service owns its independent process-memory copy now. Erase the UI
+        // copy before any later operation can allocate, render, or log.
+        self.wipeRuntimeCredentialInput();
+        const phase = if (service.snapshot(profile_id)) |snapshot| snapshot.phase else null;
+        var activation_error: ?anyerror = null;
+        if (phase) |current| switch (current) {
+            .disabled => service.enable(profile_id, runtimeConnectionNowMs()) catch |err| {
+                activation_error = err;
+            },
+            .failed => service.retry(profile_id, runtimeConnectionNowMs()) catch |err| {
+                activation_error = err;
+            },
+            .connecting, .handshaking, .awaiting_trust, .ready, .reconnecting => {},
+        };
+        self.closeRuntimeCredentialModalState();
+        if (activation_error) |err| {
+            log.warn("failed to start remote runtime after credential hydration: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Credential loaded, but the remote connection could not start.");
+        } else {
+            self.setSidebarNotice("Credential loaded in memory. Connecting to the remote runtime...");
+        }
+    }
+
+    pub fn cancelRuntimeTrust(self: *AppState) void {
+        const proposal = self.runtimeTrustProposal() orelse return;
+        const clean = self.revokeRuntimeProfileCredential(proposal.profile_id);
+        self.closeRuntimeTrustModalState();
+        self.setSidebarNotice(if (clean)
+            "Remote runtime identity was not trusted; the connection was disabled."
+        else
+            "Remote runtime trust canceled; cleanup will finish during shutdown.");
+    }
+
+    pub fn confirmRuntimeTrust(self: *AppState) void {
+        const proposal = if (self.runtime_pin_proposal) |*value| value else return;
+        const service = self.runtime_service orelse {
+            self.setRuntimeTrustNotice("Runtime service is unavailable.");
+            return;
+        };
+        const result = service.trustProposal(proposal) catch |err| {
+            log.warn("failed to persist remote runtime identity: {s}", .{@errorName(err)});
+            // A storage error after atomic replacement can be ambiguous until
+            // the next locked reread. Do not claim the durable profile was
+            // unchanged; execution remains blocked while this proposal stays
+            // unacknowledged in the manager.
+            self.setRuntimeTrustNotice("Could not finish identity approval. Connection remains blocked; retry or cancel.");
+            return;
+        };
+
+        var continuation_error: ?anyerror = null;
+        const continuation = runtimeTrustContinuation(result.adoption);
+        if (continuation == .enable) {
+            service.enable(proposal.profile_id, runtimeConnectionNowMs()) catch |err| {
+                continuation_error = err;
+            };
+        }
+        self.closeRuntimeTrustModalState();
+        if (continuation_error) |err| {
+            log.warn("failed to continue remote runtime after identity approval: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Identity saved, but the remote connection could not restart.");
+            return;
+        }
+        self.setSidebarNotice(switch (continuation) {
+            .current => if (result.recovered_after_save_error)
+                "Identity verified after a storage retry. Remote runtime connected."
+            else
+                "Remote runtime identity trusted for this configured profile.",
+            .reconnecting => "The saved identity requires a fresh connection; reconnecting to verify it now.",
+            .enable => "Remote runtime identity trusted. Reconnecting now.",
+        });
+    }
+
+    fn runtimeOnboardingPresentationBlocked(self: *const AppState) bool {
+        return self.runtime_credential_profile_id != null or
+            self.runtime_pin_proposal != null or
+            self.modal_image_path != null or
+            self.settings_controller.mcp_onboarding_visible or
+            self.settings_controller.provider_onboarding_visible or
+            self.rename_project_index != null or
+            self.transcriptSelectionBuffer() != null or
+            self.thread_import_provider != null or
+            self.handoff_controller.modal_open or
+            self.project_controller.show_creator or
+            self.settings_controller.modal_visible or
+            self.command_controller.open or
+            self.prefix_armed or
+            self.prefix_navigate or
+            self.composer_controller.model_picker.isOpen() or
+            self.composer_controller.directory_picker.isOpen() or
+            self.composer_controller.runtime_picker.isOpen() or
+            self.composer_controller.run_config_open;
+    }
+
+    fn maybePresentRuntimeTrustProposal(self: *AppState) bool {
+        if (self.runtimeOnboardingPresentationBlocked()) return false;
+        const service = self.runtime_service orelse return false;
+        for (self.runtime_picker_profiles.items) |configured| {
+            const proposal = service.pinProposalAlloc(self.allocator, configured.profile_id) catch |err| {
+                if (!self.runtime_proposal_failure_logged) {
+                    log.warn("failed to copy remote runtime identity proposal: {s}", .{@errorName(err)});
+                    self.runtime_proposal_failure_logged = true;
+                }
+                return false;
+            };
+            self.runtime_proposal_failure_logged = false;
+            if (proposal) |owned| {
+                self.runtime_pin_proposal = owned;
+                self.setRuntimeTrustNotice("");
+                self.palette_modal_text_focus = .none;
+                self.modal_text_selection_anchor = null;
+                self.modal_text_drag_active = false;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Advances bounded connection state on the SDL owner thread and reports
+    /// only status changes that can alter picker rendering.
+    pub fn pollRuntimeService(self: *AppState, now_ms: u64) bool {
+        const service = self.runtime_service orelse return false;
+        service.poll(now_ms) catch |err| {
+            if (!self.runtime_poll_failure_logged) {
+                log.warn("remote runtime service poll failed: {s}", .{@errorName(err)});
+                self.runtime_poll_failure_logged = true;
+            }
+            return false;
+        };
+        self.runtime_poll_failure_logged = false;
+
+        var changed = false;
+        for (self.runtime_picker_profiles.items) |*configured| {
+            const next_status = if (service.snapshot(configured.profile_id)) |snapshot|
+                runtimePickerStatus(snapshot)
+            else
+                RuntimePickerStatus.unavailable;
+            if (configured.status == next_status) continue;
+            configured.status = next_status;
+            changed = true;
+        }
+        return self.maybePresentRuntimeTrustProposal() or changed;
+    }
+
+    fn deinitRuntimeService(self: *AppState) void {
+        self.closeRuntimeCredentialModalState();
+        self.closeRuntimeTrustModalState();
+        for (self.runtime_picker_profiles.items) |*profile| profile.deinit(self.allocator);
+        self.runtime_picker_profiles.deinit(self.allocator);
+        if (self.runtime_service) |service| {
+            service.deinit();
+            self.allocator.destroy(service);
+            self.runtime_service = null;
+        }
     }
 
     fn loadEmbeddedTexture(self: *AppState, bytes: []const u8) ?CachedImageTexture {
@@ -4793,7 +5500,6 @@ pub const AppState = struct {
     pub fn beginThreadImport(self: *AppState, index: usize, provider: Provider) void {
         if (index >= self.project_controller.projects.items.len) return;
         if (self.project_controller.show_creator) self.cancelProjectImport();
-        if (self.herdr_controller.picker_project_index != null) self.cancelHerdrProfilePicker();
         self.project_controller.selected_index = index;
         self.rename_project_index = null;
         self.rename_thread_index = null;
@@ -4806,147 +5512,6 @@ pub const AppState = struct {
         self.setThreadImportNotice("");
         self.clearThreadImportThreads();
         self.refreshThreadImportList();
-    }
-
-    pub fn beginHerdrProfilePicker(self: *AppState, index: usize) void {
-        if (index >= self.project_controller.projects.items.len) return;
-        if (self.project_controller.show_creator) self.cancelProjectImport();
-        if (self.thread_import_provider != null) self.cancelThreadImport();
-        self.project_controller.selected_index = index;
-        self.rename_project_index = null;
-        self.rename_thread_index = null;
-        self.herdr_controller.picker_project_index = index;
-        self.herdr_controller.selected_index = null;
-        self.herdr_controller.hover_index = null;
-        self.palette_modal_text_focus = .none;
-        self.setHerdrProfileNotice("");
-        self.clearHerdrProfileSummaries();
-        self.refreshHerdrProfileList();
-    }
-
-    pub fn cancelHerdrProfilePicker(self: *AppState) void {
-        self.herdr_controller.picker_project_index = null;
-        self.herdr_controller.selected_index = null;
-        self.herdr_controller.hover_index = null;
-        self.palette_modal_text_focus = .none;
-        self.setHerdrProfileNotice("");
-        self.clearHerdrProfileSummaries();
-        self.markDirty();
-    }
-
-    pub fn refreshHerdrProfileList(self: *AppState) void {
-        if (self.herdr_controller.picker_project_index == null) return;
-        self.clearHerdrProfileSummaries();
-
-        var threaded: std.Io.Threaded = .init(self.allocator, .{});
-        defer threaded.deinit();
-        var loaded = herdr.loadProfiles(self.allocator, threaded.io(), self.storage.pref_path) catch |err| {
-            log.warn("failed to load Herdr profiles: {s}", .{@errorName(err)});
-            self.setHerdrProfileNotice("Could not load Herdr profiles.");
-            return;
-        };
-        defer loaded.deinit();
-
-        for (loaded.profiles) |profile| {
-            var summary = self.copyHerdrProfileSummary(profile) catch {
-                self.setHerdrProfileNotice("Could not store Herdr profile list.");
-                return;
-            };
-            errdefer summary.deinit(self.allocator);
-            self.herdr_controller.summaries.append(self.allocator, summary) catch {
-                self.setHerdrProfileNotice("Could not store Herdr profile list.");
-                return;
-            };
-        }
-
-        if (self.herdr_controller.summaries.items.len == 0) {
-            self.setHerdrProfileNotice("No Herdr profiles configured. Use `verde herdr profiles add` first.");
-        } else {
-            self.herdr_controller.selected_index = 0;
-            self.setHerdrProfileNotice("Choose a remote profile for this workspace.");
-        }
-        self.markDirty();
-    }
-
-    fn copyHerdrProfileSummary(self: *AppState, profile: herdr.Profile) !HerdrProfileSummary {
-        const name = try self.allocator.dupeZ(u8, profile.name);
-        errdefer self.allocator.free(name);
-        const ssh_target = try self.allocator.dupeZ(u8, profile.ssh_target);
-        errdefer self.allocator.free(ssh_target);
-        const session = try self.allocator.dupeZ(u8, profile.session);
-        errdefer self.allocator.free(session);
-        const remote_cwd = if (profile.remote_cwd) |value| try self.allocator.dupeZ(u8, value) else null;
-        errdefer if (remote_cwd) |value| self.allocator.free(value);
-        const local_dir = if (profile.local_dir) |value| try self.allocator.dupeZ(u8, value) else null;
-        errdefer if (local_dir) |value| self.allocator.free(value);
-        return .{
-            .name = name,
-            .ssh_target = ssh_target,
-            .session = session,
-            .remote_cwd = remote_cwd,
-            .local_dir = local_dir,
-        };
-    }
-
-    pub fn selectHerdrProfile(self: *AppState, index: usize) void {
-        if (index >= self.herdr_controller.summaries.items.len) return;
-        self.herdr_controller.selected_index = index;
-        self.markDirty();
-    }
-
-    pub fn handoffProjectToSelectedHerdrProfile(self: *AppState) void {
-        const project_index = self.herdr_controller.picker_project_index orelse return;
-        const profile_index = self.herdr_controller.selected_index orelse {
-            self.setHerdrProfileNotice("Select a Herdr profile first.");
-            return;
-        };
-        if (project_index >= self.project_controller.projects.items.len or profile_index >= self.herdr_controller.summaries.items.len) return;
-        const profile = self.herdr_controller.summaries.items[profile_index];
-        self.handoffProjectToRemoteHerdrProfile(project_index, profile);
-    }
-
-    fn handoffProjectToRemoteHerdrProfile(self: *AppState, project_index: usize, profile: HerdrProfileSummary) void {
-        if (project_index >= self.project_controller.projects.items.len) return;
-        const project = &self.project_controller.projects.items[project_index];
-        var default_remote_cwd: ?[]u8 = null;
-        defer if (default_remote_cwd) |cwd| self.allocator.free(cwd);
-        const remote_cwd = profile.remote_cwd orelse blk: {
-            default_remote_cwd = herdr.defaultRemoteCwd(self.allocator, project.label, project.id) catch {
-                self.setHerdrProfileNotice("Could not build a remote workspace path.");
-                return;
-            };
-            break :blk default_remote_cwd.?;
-        };
-        const request: herdr.HandoffRequest = .{
-            .session = profile.session,
-            .remote = profile.ssh_target,
-            .remote_cwd = remote_cwd,
-            .workspace = project.id,
-            .all = false,
-        };
-        var result = self.handoffHerdrWorkspaces(self.allocator, request) catch |err| {
-            self.setHerdrProfileNotice(herdrUiFailureMessage(err));
-            return;
-        };
-        defer result.deinit(self.allocator);
-        if (result.workspaces.len == 0) {
-            self.setHerdrProfileNotice("Herdr did not return a workspace.");
-            return;
-        }
-        const workspace_id = result.workspaces[0].herdr_workspace;
-        const open_request: herdr.OpenRequest = .{
-            .session = profile.session,
-            .herdr_workspace = workspace_id,
-            .remote = profile.ssh_target,
-            .remote_cwd = remote_cwd,
-            .local_dir = profile.local_dir orelse project.path,
-        };
-        _ = self.openOrCreateHerdrWorkspace(open_request) catch |err| {
-            self.setHerdrProfileNotice(herdrUiFailureMessage(err));
-            return;
-        };
-        self.cancelHerdrProfilePicker();
-        self.setSidebarNotice("Remote Herdr workspace opened.");
     }
 
     pub fn cancelThreadImport(self: *AppState) void {
@@ -5108,16 +5673,6 @@ pub const AppState = struct {
         @memset(&self.import_notice_storage, 0);
         const len = @min(value.len, self.import_notice_storage.len - 1);
         @memcpy(self.import_notice_storage[0..len], value[0..len]);
-    }
-
-    pub fn herdrProfileNotice(self: *const AppState) []const u8 {
-        return std.mem.sliceTo(self.herdr_controller.notice_storage[0..], 0);
-    }
-
-    pub fn setHerdrProfileNotice(self: *AppState, value: []const u8) void {
-        @memset(&self.herdr_controller.notice_storage, 0);
-        const len = @min(value.len, self.herdr_controller.notice_storage.len - 1);
-        @memcpy(self.herdr_controller.notice_storage[0..len], value[0..len]);
     }
 
     pub fn selectThreadImport(self: *AppState, index: usize) void {
@@ -5705,6 +6260,7 @@ pub const AppState = struct {
         thread.reasoning_effort = reasoning_effort;
         thread.opencode_reasoning_variant = owned_variant;
         thread.fast_mode = .off;
+        _ = try self.applyWorkspaceRuntimeDefaultToThread(project.id, thread);
     }
 
     pub fn selectThreadForProject(self: *AppState, project_index: usize, thread_index: usize) void {
@@ -6937,7 +7493,6 @@ pub const AppState = struct {
         var hydrated = try ChatThread.init(self.allocator, imported_thread.title);
         errdefer hydrated.deinit(self.allocator);
 
-        hydrated.committed = true;
         hydrated.last_activity_at = imported_thread.updated_at orelse 0;
 
         if (hydrated.provider_thread_id) |thread_id| {
@@ -6957,6 +7512,14 @@ pub const AppState = struct {
                 null;
             hydrated.fast_mode = existing.fast_mode;
             hydrated.access_mode = existing.access_mode;
+            const route = existing.selectedRuntimeRoute();
+            const route_result = try hydrated.selectRuntimeRoute(self.allocator, route);
+            std.debug.assert(route_result != .new_thread_required);
+            if (existing.pinnedRuntimeRoute()) |pinned| {
+                if (pinned.runtime_id) |runtime_id| {
+                    try hydrated.pinRuntimeRoute(self.allocator, runtime_id);
+                }
+            }
             if (hydrated.cwd) |v| self.allocator.free(v);
             hydrated.cwd = if (existing.cwd) |v| try self.allocator.dupeZ(u8, v) else null;
             hydrated.draft_mutation_generation = existing.draft_mutation_generation;
@@ -6981,6 +7544,8 @@ pub const AppState = struct {
             hydrated.provider = .codex;
             hydrated.harness = .local_cli;
         }
+        hydrated.lockRuntimeRoute();
+        hydrated.committed = true;
 
         for (imported_thread.messages) |message| {
             try hydrated.messages.append(self.allocator, try self.importedChatMessage(message));
@@ -9171,8 +9736,7 @@ pub const AppState = struct {
         }
         self.slash_command_state.mutex.unlock();
 
-        const execution_target = self.providerExecutionTargetForProjectThread(project_index, thread, 0) orelse return;
-        const execution_cwd = execution_target.cwd();
+        _ = self.providerExecutionTargetForProjectThread(project_index, thread, 0) orelse return;
 
         const command_display_name = try page_alloc.dupe(u8, command.name);
         errdefer page_alloc.free(command_display_name);
@@ -9183,8 +9747,6 @@ pub const AppState = struct {
             .provider = thread.provider,
             .harness = thread.harness,
             .project_path = try page_alloc.dupe(u8, project.path),
-            .remote_ssh_host = if (execution_target.remoteHost()) |host| try page_alloc.dupe(u8, host) else null,
-            .remote_cwd = if (execution_target.remoteHost() != null) try page_alloc.dupe(u8, execution_cwd) else null,
             .thread_id = if (thread.provider_thread_id) |thread_id| try page_alloc.dupe(u8, thread_id) else null,
             .command = command.id,
             .raw_text = try page_alloc.dupe(u8, raw_text),
@@ -9192,8 +9754,6 @@ pub const AppState = struct {
         };
         errdefer {
             page_alloc.free(request.project_path);
-            if (request.remote_ssh_host) |host| page_alloc.free(host);
-            if (request.remote_cwd) |cwd| page_alloc.free(cwd);
             if (request.thread_id) |thread_id| page_alloc.free(thread_id);
             page_alloc.free(request.raw_text);
             page_alloc.free(request.args);
@@ -10015,17 +10575,21 @@ pub const AppState = struct {
         self.composer_controller.composer.setExternalReasoningMenu(true);
         self.composer_controller.composer.setShowFastToggle(false);
         self.composer_controller.composer.setShowAccessToggle(false);
-        // The directory pill only applies to local providers; remote (HERDR)
-        // threads run wherever the link's remote cwd points.
+        // Herdr owns the working directory while a workspace is handed off,
+        // so the normal per-thread directory selector is hidden.
         const show_directory = self.currentProject().herdr_link == null;
         self.composer_controller.composer.setShowDirectoryToggle(show_directory);
-        // The runtime pill shares the directory strip, so it follows the same
-        // visibility; it always reads "Local" until remote runtimes ship.
+        // The runtime pill shares the directory strip, but its value is the
+        // current thread route. A workspace-level preference may seed future
+        // drafts; it never overrides an individual thread selection here.
         self.composer_controller.composer.setShowRuntimeToggle(show_directory);
         if (show_directory) {
             const directory_label = self.directoryPillLabel(self.currentThreadEffectiveCwd());
             self.composer_controller.composer.setDirectoryLabel(self.allocator, directory_label) catch |err| {
                 log.warn("failed to sync palette composer directory label: {s}", .{@errorName(err)});
+            };
+            self.composer_controller.composer.setRuntimeLabel(self.allocator, self.currentRuntimePickerLabel()) catch |err| {
+                log.warn("failed to sync palette composer runtime label: {s}", .{@errorName(err)});
             };
         }
         const hide_placeholder = thread.draftImageCount() > 0;
@@ -10486,15 +11050,126 @@ pub const AppState = struct {
             .get_clipboard = paletteComposerGetClipboard,
         });
         var runtime_style = paletteModelPickerStyle();
-        // Two rows only: the inline check already marks Local, so a selected
-        // fill on top of the hover fill reads as two highlighted rows.
+        // The inline check already marks the thread route, so a selected fill
+        // on top of the hover fill reads as two highlighted rows.
         runtime_style.selected_color = .{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 0.0 };
         self.composer_controller.runtime_picker.setStyle(runtime_style);
         self.composer_controller.runtime_picker.setUiScale(theme.uiScaleFactor());
         self.composer_controller.runtime_picker.setFontMetrics(paletteEstimatedFontMetrics(theme.scaledUi(15.5)));
-        self.composer_controller.runtime_picker.setItemCount(RUNTIME_PICKER_ROWS.len);
-        self.composer_controller.runtime_picker.setSelectedItem(RUNTIME_PICKER_LOCAL_INDEX);
+        self.composer_controller.runtime_picker.setItemCount(1 + self.runtime_picker_profiles.items.len);
+        self.composer_controller.runtime_picker.setSelectedItem(self.currentRuntimePickerIndex());
         self.setPaletteRuntimePickerBoundsFromToolbar();
+    }
+
+    fn currentRuntimePickerIndex(self: *const AppState) ?usize {
+        const profile_id = self.currentThread().selectedRuntimeRoute().profile_id;
+        if (std.mem.eql(u8, profile_id, chat_types.LOCAL_RUNTIME_PROFILE_ID)) {
+            return RUNTIME_PICKER_LOCAL_INDEX;
+        }
+        for (self.runtime_picker_profiles.items, 0..) |configured, index| {
+            if (std.mem.eql(u8, configured.profile_id, profile_id)) return index + 1;
+        }
+        return null;
+    }
+
+    fn currentRuntimePickerLabel(self: *const AppState) []const u8 {
+        const profile_id = self.currentThread().selectedRuntimeRoute().profile_id;
+        if (std.mem.eql(u8, profile_id, chat_types.LOCAL_RUNTIME_PROFILE_ID)) return "Local";
+        const service = self.runtime_service orelse return "Runtime unavailable";
+        const snapshot = service.snapshot(profile_id) orelse return "Runtime unavailable";
+        return snapshot.label;
+    }
+
+    fn connectRuntimeProfileFromPicker(self: *AppState, profile_id: []const u8) void {
+        const service = self.runtime_service orelse {
+            self.setSidebarNotice("Runtime service is unavailable.");
+            return;
+        };
+        const snapshot = service.snapshot(profile_id) orelse {
+            self.setSidebarNotice("That configured runtime is unavailable.");
+            return;
+        };
+        const action = runtimeActivationAction(snapshot);
+        if (action == .request_credential) {
+            // Stop retries and wipe any rejected credential before the user
+            // starts editing its replacement. The modal owns the sole UI copy.
+            _ = self.revokeRuntimeProfileCredential(profile_id);
+            self.openRuntimeCredentialModal(profile_id) catch |err| {
+                log.warn("failed to open remote runtime credential modal: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Could not open runtime credential entry.");
+            };
+            return;
+        }
+
+        const now_ms = runtimeConnectionNowMs();
+        const start_error: ?anyerror = switch (action) {
+            .enable => blk: {
+                service.enable(profile_id, now_ms) catch |err| break :blk err;
+                break :blk null;
+            },
+            .retry => blk: {
+                service.retry(profile_id, now_ms) catch |err| break :blk err;
+                break :blk null;
+            },
+            .none => null,
+            .request_credential => unreachable,
+        };
+        if (start_error) |err| {
+            if (err == error.MissingRuntimeCredential) {
+                _ = self.revokeRuntimeProfileCredential(profile_id);
+                self.openRuntimeCredentialModal(profile_id) catch |open_err| {
+                    log.warn("failed to open remote runtime credential modal: {s}", .{@errorName(open_err)});
+                    self.setSidebarNotice("Could not open runtime credential entry.");
+                };
+                return;
+            }
+            log.warn("failed to start configured remote runtime: {s}", .{@errorName(err)});
+            self.setSidebarNotice("The remote runtime connection could not start.");
+            return;
+        }
+        self.setSidebarNotice(switch (snapshot.phase) {
+            .ready => "Remote runtime is connected.",
+            .awaiting_trust => "Verify the remote runtime identity to continue.",
+            .connecting, .handshaking, .reconnecting => "Remote runtime connection is already in progress.",
+            .disabled, .failed => "Connecting to the remote runtime...",
+        });
+    }
+
+    fn selectCurrentThreadRuntimePickerIndex(self: *AppState, index: usize) void {
+        const profile_id = if (index == RUNTIME_PICKER_LOCAL_INDEX)
+            chat_types.LOCAL_RUNTIME_PROFILE_ID
+        else if (runtimePickerProfileAt(self, index)) |configured|
+            configured.profile_id
+        else
+            return;
+
+        const result = selectThreadRuntimeProfile(
+            self.currentThreadMutable(),
+            self.allocator,
+            profile_id,
+        ) catch |err| {
+            log.warn("failed to select thread runtime route: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Could not select that runtime.");
+            self.composer_controller.runtime_picker.setSelectedItem(self.currentRuntimePickerIndex());
+            return;
+        };
+        switch (result) {
+            .unchanged => if (index != RUNTIME_PICKER_LOCAL_INDEX) {
+                self.connectRuntimeProfileFromPicker(profile_id);
+            },
+            .updated => {
+                self.markDirty();
+                if (index == RUNTIME_PICKER_LOCAL_INDEX) {
+                    self.setSidebarNotice("This draft will run locally.");
+                } else {
+                    self.connectRuntimeProfileFromPicker(profile_id);
+                }
+            },
+            .new_thread_required => self.setSidebarNotice(
+                "This chat's runtime is locked. Start a new chat to choose another runtime.",
+            ),
+        }
+        self.composer_controller.runtime_picker.setSelectedItem(self.currentRuntimePickerIndex());
     }
 
     fn runtimePickerInput(self: *AppState, input: palette.RichPickerInput) bool {
@@ -10746,10 +11421,6 @@ pub const AppState = struct {
                 .thread_import_cancel,
                 .thread_import_submit,
                 .thread_import_select,
-                .herdr_profile_refresh,
-                .herdr_profile_cancel,
-                .herdr_profile_submit,
-                .herdr_profile_select,
                 .handoff_cancel,
                 .handoff_prepare,
                 .handoff_surface_gui,
@@ -10771,6 +11442,10 @@ pub const AppState = struct {
                 .project_import_submit,
                 .project_import_create_dir,
                 .project_import_cancel,
+                .runtime_credential_cancel,
+                .runtime_credential_submit,
+                .runtime_trust_cancel,
+                .runtime_trust_confirm,
                 .settings_control,
                 .settings_theme_option,
                 .settings_title_provider_option,
@@ -10790,6 +11465,7 @@ pub const AppState = struct {
                 .thread_import_input,
                 .project_import_name_input,
                 .project_import_input,
+                .runtime_credential_input,
                 .command_palette_input,
                 => false,
             };
@@ -11835,21 +12511,16 @@ pub const AppState = struct {
         self.thread_import_hover_index = null;
     }
 
-    fn clearHerdrProfileSummaries(self: *AppState) void {
-        for (self.herdr_controller.summaries.items) |profile| {
-            profile.deinit(self.allocator);
-        }
-        self.herdr_controller.summaries.clearRetainingCapacity();
-        self.herdr_controller.selected_index = null;
-        self.herdr_controller.hover_index = null;
-    }
-
     pub fn dupeZ(self: *AppState, value: []const u8) ![:0]const u8 {
         return try self.allocator.dupeZ(u8, value);
     }
 
     pub fn deinit(self: *AppState) void {
         runtime_log.diagnostic("AppState.deinit begin", .{});
+        // Shutdown durability and worker settlement may take time. Remove the
+        // UI-owned bearer immediately; RuntimeService keeps only its separate
+        // process-memory copy until remote work has been stopped below.
+        self.wipeRuntimeCredentialInput();
         shutdown_watchdog_deinit_complete.store(false, .release);
         shutdown_watchdog_state_durable.store(false, .release);
         // Final fallback for non-window quit paths. Ordinary interactive close
@@ -11902,6 +12573,10 @@ pub const AppState = struct {
         runtime_log.diagnostic("AppState.deinit send threads finished", .{});
         self.finishAllTitleGenerationThreads();
         runtime_log.diagnostic("AppState.deinit title generation threads finished", .{});
+        self.deinitRuntimeService();
+        runtime_log.diagnostic("AppState.deinit runtime service released", .{});
+        if (self.workspace_runtime_defaults) |*defaults| defaults.deinit(self.allocator);
+        self.workspace_runtime_defaults = null;
         self.change_cursor_loop.join();
         runtime_log.diagnostic("AppState.deinit change cursor loop joined", .{});
         _ = self.pollSend();
@@ -11951,8 +12626,6 @@ pub const AppState = struct {
         self.releaseAllImageTextures();
         self.thread_import_threads.deinit(self.allocator);
         if (self.handoff_controller.preview) |preview| self.allocator.free(preview);
-        self.clearHerdrProfileSummaries();
-        self.herdr_controller.summaries.deinit(self.allocator);
         self.clearOpencodeModelOptions();
         self.clearClaudeModelOptions();
         self.clearCursorModelOptions();
@@ -12857,7 +13530,6 @@ pub const AppState = struct {
             const config: ai_harness.ProviderConfig = .{ .codex = .{
                 .cwd = target.cwd(),
                 .launch_on_connect = false,
-                .remote_ssh = if (target.remoteHost()) |host| .{ .host = host, .cwd = target.cwd() } else null,
             } };
             var client = ai_harness.connect(self.allocator, config) catch |err| {
                 log.warn("failed to connect for background task stop: {s}", .{@errorName(err)});
@@ -13901,6 +14573,166 @@ test "new Codex threads default to GPT-5.6 Sol with low reasoning" {
     try std.testing.expectEqual(DEFAULT_CODEX_REASONING_EFFORT, thread.reasoning_effort.?);
 }
 
+test "runtime picker selection is per-thread and preserves repository routing" {
+    const allocator = std.testing.allocator;
+    var selected = try ChatThread.init(allocator, "Selected runtime");
+    defer selected.deinit(allocator);
+    var other = try ChatThread.init(allocator, "Independent runtime");
+    defer other.deinit(allocator);
+
+    try std.testing.expectEqual(.updated, try selected.selectRuntimeRoute(allocator, .{
+        .profile_id = chat_types.LOCAL_RUNTIME_PROFILE_ID,
+        .repository_id = "repo-api",
+        .relative_cwd = "services/api",
+    }));
+    try std.testing.expectEqual(
+        .updated,
+        try selectThreadRuntimeProfile(&selected, allocator, "profile-remote"),
+    );
+    const remote = selected.selectedRuntimeRoute();
+    try std.testing.expectEqualStrings("profile-remote", remote.profile_id);
+    try std.testing.expectEqualStrings("repo-api", remote.repository_id);
+    try std.testing.expectEqualStrings("services/api", remote.relative_cwd.?);
+
+    // Choosing a runtime for one draft is not a workspace-wide lock. Another
+    // thread keeps its own Local default and can choose independently.
+    try std.testing.expectEqualStrings(
+        chat_types.LOCAL_RUNTIME_PROFILE_ID,
+        other.selectedRuntimeRoute().profile_id,
+    );
+
+    try selected.pinRuntimeRoute(allocator, "0123456789abcdef0123456789abcdef");
+    selected.committed = true;
+    try std.testing.expectEqual(
+        .new_thread_required,
+        try selectThreadRuntimeProfile(&selected, allocator, chat_types.LOCAL_RUNTIME_PROFILE_ID),
+    );
+    try std.testing.expectEqualStrings("profile-remote", selected.selectedRuntimeRoute().profile_id);
+}
+
+test "runtime picker status maps lifecycle and trust states" {
+    var snapshot: RuntimeService.Snapshot = .{
+        .profile_id = "profile-remote",
+        .label = "Remote",
+        .transport = .ssh_tunnel,
+        .phase = .disabled,
+        .failure = null,
+        .retry_at_ms = null,
+        .local_port = null,
+        .tunnel_lifecycle = .stopped,
+        .tunnel_pid = null,
+        .runtime = null,
+        .identity_pin_required = false,
+        .rpc_in_flight = false,
+        .last_heartbeat_ms = null,
+        .execution_ready = false,
+    };
+    try std.testing.expectEqual(RuntimePickerStatus.offline, runtimePickerStatus(snapshot));
+    snapshot.failure = .missing_credential;
+    try std.testing.expectEqual(RuntimePickerStatus.credential_required, runtimePickerStatus(snapshot));
+    snapshot.failure = null;
+    snapshot.phase = .ready;
+    try std.testing.expectEqual(RuntimePickerStatus.limited, runtimePickerStatus(snapshot));
+    snapshot.execution_ready = true;
+    try std.testing.expectEqual(RuntimePickerStatus.ready, runtimePickerStatus(snapshot));
+    snapshot.identity_pin_required = true;
+    try std.testing.expectEqual(RuntimePickerStatus.trust_required, runtimePickerStatus(snapshot));
+}
+
+test "runtime onboarding transitions require credentials and explicit trust" {
+    var snapshot: RuntimeService.Snapshot = .{
+        .profile_id = "profile-remote",
+        .label = "Remote",
+        .transport = .ssh_tunnel,
+        .phase = .disabled,
+        .failure = null,
+        .retry_at_ms = null,
+        .local_port = null,
+        .tunnel_lifecycle = .stopped,
+        .tunnel_pid = null,
+        .runtime = null,
+        .identity_pin_required = false,
+        .rpc_in_flight = false,
+        .last_heartbeat_ms = null,
+        .execution_ready = false,
+    };
+    try std.testing.expectEqual(RuntimeActivationAction.enable, runtimeActivationAction(snapshot));
+    snapshot.failure = .missing_credential;
+    try std.testing.expectEqual(RuntimeActivationAction.request_credential, runtimeActivationAction(snapshot));
+    snapshot.failure = .authentication;
+    try std.testing.expectEqual(RuntimeActivationAction.request_credential, runtimeActivationAction(snapshot));
+    snapshot.failure = null;
+    snapshot.phase = .failed;
+    try std.testing.expectEqual(RuntimeActivationAction.retry, runtimeActivationAction(snapshot));
+    snapshot.phase = .awaiting_trust;
+    try std.testing.expectEqual(RuntimeActivationAction.none, runtimeActivationAction(snapshot));
+
+    try std.testing.expectEqual(
+        RuntimeTrustContinuation.current,
+        runtimeTrustContinuation(.committed_current),
+    );
+    try std.testing.expectEqual(
+        RuntimeTrustContinuation.reconnecting,
+        runtimeTrustContinuation(.reconnect_required),
+    );
+    try std.testing.expectEqual(
+        RuntimeTrustContinuation.enable,
+        runtimeTrustContinuation(.installed_disabled),
+    );
+
+    const source = @embedFile("state.zig");
+    const proposal_start = std.mem.indexOf(u8, source, "fn maybePresentRuntimeTrustProposal").?;
+    const proposal_end = std.mem.indexOfPos(
+        u8,
+        source,
+        proposal_start,
+        "/// Advances bounded connection state",
+    ).?;
+    const presentation_path = source[proposal_start..proposal_end];
+    try std.testing.expect(std.mem.indexOf(u8, presentation_path, "pinProposalAlloc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, presentation_path, "trustProposal") == null);
+
+    const submit_start = std.mem.indexOf(u8, source, "pub fn submitRuntimeCredential").?;
+    const submit_end = std.mem.indexOfPos(u8, source, submit_start, "pub fn cancelRuntimeTrust").?;
+    const submit_path = source[submit_start..submit_end];
+    const hydrate = std.mem.indexOf(u8, submit_path, "service.hydrateToken").?;
+    const wipe = std.mem.indexOf(u8, submit_path, "self.wipeRuntimeCredentialInput").?;
+    const enable = std.mem.indexOf(u8, submit_path, "service.enable").?;
+    const retry = std.mem.indexOf(u8, submit_path, "service.retry").?;
+    try std.testing.expect(hydrate < wipe);
+    try std.testing.expect(wipe < enable);
+    try std.testing.expect(wipe < retry);
+
+    const revoke_start = std.mem.indexOf(u8, source, "fn revokeRuntimeProfileCredential").?;
+    const revoke_end = std.mem.indexOfPos(u8, source, revoke_start, "pub fn cancelRuntimeCredentialModal").?;
+    const revoke_path = source[revoke_start..revoke_end];
+    try std.testing.expect(std.mem.indexOf(u8, revoke_path, "service.disable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, revoke_path, "service.clearToken") != null);
+
+    const confirm_start = std.mem.indexOf(u8, source, "pub fn confirmRuntimeTrust").?;
+    const confirm_end = std.mem.indexOfPos(u8, source, confirm_start, "fn runtimeOnboardingPresentationBlocked").?;
+    const confirm_path = source[confirm_start..confirm_end];
+    try std.testing.expect(std.mem.indexOf(u8, confirm_path, "service.trustProposal(proposal)") != null);
+}
+
+test "runtime credential UI storage is fully wiped" {
+    var state: AppState = undefined;
+    @memset(state.runtime_credential_token_storage[0..], 0xa5);
+    state.runtime_credential_token_cursor = 37;
+    state.palette_modal_text_focus = .runtime_credential;
+    state.modal_text_selection_anchor = 4;
+    state.modal_text_drag_active = true;
+
+    state.wipeRuntimeCredentialInput();
+
+    try std.testing.expectEqual(@as(usize, 0), state.runtime_credential_token_cursor);
+    try std.testing.expectEqual(@as(?usize, null), state.modal_text_selection_anchor);
+    try std.testing.expect(!state.modal_text_drag_active);
+    for (state.runtime_credential_token_storage) |byte| {
+        try std.testing.expectEqual(@as(u8, 0), byte);
+    }
+}
+
 test "GUI new-chat defaults apply configured provider model and reasoning" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
@@ -13918,9 +14750,12 @@ test "GUI new-chat defaults apply configured provider model and reasoning" {
     state.fx_model_options = .empty;
     state.grok_model_options = .empty;
     state.cursor_model_options = .empty;
+    state.runtime_picker_profiles = .empty;
+    state.workspace_runtime_defaults = null;
     defer {
         for (state.project_controller.projects.items) |*project| project.deinit(allocator);
         state.project_controller.projects.deinit(allocator);
+        state.runtime_picker_profiles.deinit(allocator);
         state.app_config.deinit(allocator);
     }
 
@@ -13935,6 +14770,92 @@ test "GUI new-chat defaults apply configured provider model and reasoning" {
     try std.testing.expectEqual(Provider.codex, thread.provider);
     try std.testing.expectEqualStrings("gpt-5.6-terra", thread.model_ref.?);
     try std.testing.expectEqual(ReasoningEffort.max, thread.reasoning_effort.?);
+}
+
+test "workspace runtime default affects future drafts while each thread can override" {
+    const allocator = std.testing.allocator;
+    const remote_profile_id = "profile-0123456789abcdef0123456789abcdef";
+    const workspace_id = "workspace-defaults";
+
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.app_config = .{};
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    state.opencode_model_options = .empty;
+    state.claude_model_options = .empty;
+    state.pi_model_options = .empty;
+    state.fx_model_options = .empty;
+    state.grok_model_options = .empty;
+    state.cursor_model_options = .empty;
+    state.runtime_picker_profiles = .empty;
+
+    const defaults = try allocator.alloc(runtime_workspace_defaults.WorkspaceRuntimeDefault, 1);
+    defaults[0] = .{
+        .workspace_id = try allocator.dupe(u8, workspace_id),
+        .profile_id = try allocator.dupe(u8, remote_profile_id),
+    };
+    state.workspace_runtime_defaults = .{ .items = defaults };
+    try state.runtime_picker_profiles.append(allocator, .{
+        .profile_id = try allocator.dupe(u8, remote_profile_id),
+        .status = .offline,
+    });
+    defer {
+        if (state.workspace_runtime_defaults) |*owned| owned.deinit(allocator);
+        for (state.runtime_picker_profiles.items) |*profile| profile.deinit(allocator);
+        state.runtime_picker_profiles.deinit(allocator);
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.app_config.deinit(allocator);
+    }
+
+    var project = try Project.init(allocator, workspace_id, "Defaults", "/tmp/defaults", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    try state.applyNewChatDefaults(0, 0);
+    var selected_project = &state.project_controller.projects.items[0];
+    try std.testing.expectEqualStrings(
+        remote_profile_id,
+        selected_project.threads.items[0].selectedRuntimeRoute().profile_id,
+    );
+
+    // A draft can opt out without changing the workspace mapping.
+    try std.testing.expectEqual(
+        .updated,
+        try selectThreadRuntimeProfile(
+            &selected_project.threads.items[0],
+            allocator,
+            chat_types.LOCAL_RUNTIME_PROFILE_ID,
+        ),
+    );
+    const second_index = try selected_project.addThread(allocator);
+    try state.applyNewChatDefaults(0, second_index);
+    selected_project = &state.project_controller.projects.items[0];
+    try std.testing.expectEqualStrings(
+        chat_types.LOCAL_RUNTIME_PROFILE_ID,
+        selected_project.threads.items[0].selectedRuntimeRoute().profile_id,
+    );
+    try std.testing.expectEqualStrings(
+        remote_profile_id,
+        selected_project.threads.items[second_index].selectedRuntimeRoute().profile_id,
+    );
+
+    // Removing a configured profile makes only later drafts fall back to
+    // Local; existing routes and the non-secret preference are untouched.
+    state.runtime_picker_profiles.items[0].deinit(allocator);
+    state.runtime_picker_profiles.clearRetainingCapacity();
+    const third_index = try selected_project.addThread(allocator);
+    try state.applyNewChatDefaults(0, third_index);
+    try std.testing.expectEqualStrings(
+        chat_types.LOCAL_RUNTIME_PROFILE_ID,
+        selected_project.threads.items[third_index].selectedRuntimeRoute().profile_id,
+    );
+    try std.testing.expectEqualStrings(
+        remote_profile_id,
+        state.workspaceRuntimeDefaultProfile(workspace_id),
+    );
 }
 
 test "background task action hits remain valid for pending transcript events" {

@@ -21,10 +21,10 @@ export default defineConfig({
   },
   assetsInclude: ['**/*.wasm'],
   server: {
-    host: '0.0.0.0',
+    host: '127.0.0.1',
     port: 6783,
     strictPort: true,
-    allowedHosts: true,
+    allowedHosts: ['127.0.0.1', 'localhost'],
     headers: {
       'Service-Worker-Allowed': '/',
     },
@@ -33,6 +33,8 @@ export default defineConfig({
     },
     proxy: {
       '/api': 'http://127.0.0.1:7420',
+      '/auth': 'http://127.0.0.1:7420',
+      '/login': 'http://127.0.0.1:7420',
       '/ws': { target: 'ws://127.0.0.1:7420', ws: true },
     },
   },

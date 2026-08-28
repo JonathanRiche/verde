@@ -23,45 +23,108 @@ pub const SpawnOptions = struct {
 pub const OwnedChild = struct {
     child: std.process.Child,
     job: if (builtin.os.tag == .windows) ?windows.HANDLE else void,
+    process_group_id: if (builtin.os.tag == .windows or builtin.os.tag == .wasi) void else ?std.posix.pid_t,
     owns_tree: bool,
 
     /// Sends a best-effort termination request to the whole owned process tree.
     /// The child handle remains valid so its owner can still call `wait`.
     pub fn terminateTree(self: *OwnedChild) void {
-        if (self.child.id == null) return;
-
         if (builtin.os.tag == .windows) {
             if (self.job) |job| {
                 if (win32.TerminateJobObject(job, 1) != .FALSE) return;
             }
-            _ = windows.ntdll.NtTerminateProcess(self.child.id, .UNSUCCESSFUL);
+            if (self.child.id) |id| _ = windows.ntdll.NtTerminateProcess(id, .UNSUCCESSFUL);
             return;
         }
 
         if (builtin.os.tag == .wasi) return;
-        const pid = self.child.id.?;
         if (self.owns_tree) {
-            std.posix.kill(-pid, .TERM) catch {
-                std.posix.kill(pid, .TERM) catch {};
-            };
-        } else {
-            std.posix.kill(pid, .TERM) catch {};
+            if (self.process_group_id) |group_id| {
+                std.posix.kill(-group_id, .TERM) catch {
+                    if (self.child.id) |id| std.posix.kill(id, .TERM) catch {};
+                };
+                return;
+            }
         }
+        if (self.child.id) |id| std.posix.kill(id, .TERM) catch {};
+    }
+
+    /// Force-terminates the exact owned process tree without waiting for it.
+    /// The owner must subsequently call `poll`, `wait`, or `kill` to reap the
+    /// direct child and release the platform tree handle.
+    pub fn forceTerminateTree(self: *OwnedChild) void {
+        if (builtin.os.tag == .windows) {
+            if (self.job) |job| {
+                if (win32.TerminateJobObject(job, 1) != .FALSE) return;
+            }
+            if (self.child.id) |id| _ = windows.ntdll.NtTerminateProcess(id, .UNSUCCESSFUL);
+            return;
+        }
+
+        if (builtin.os.tag == .wasi) return;
+        if (self.owns_tree) {
+            if (self.process_group_id) |group_id| {
+                std.posix.kill(-group_id, .KILL) catch {
+                    if (self.child.id) |id| std.posix.kill(id, .KILL) catch {};
+                };
+                return;
+            }
+        }
+        if (self.child.id) |id| std.posix.kill(id, .KILL) catch {};
     }
 
     /// Force-terminates and reaps the owned tree, releasing all process resources.
     pub fn kill(self: *OwnedChild, io: std.Io) void {
-        self.terminateTree();
-        self.child.kill(io);
+        // The direct child may exit before TERM-ignoring descendants. Kill the
+        // exact owned group/job first so reaping the leader cannot orphan them.
+        self.forceTerminateTree();
+        if (self.child.id != null) self.child.kill(io);
         self.closeTreeOwner();
     }
 
-    /// Waits for the direct child and then releases the tree owner.
-    /// Closing the Windows job also prevents descendants from being orphaned.
+    /// Waits for the direct child, then force-cleans any descendants that
+    /// outlived their leader before releasing the tree owner.
     pub fn wait(self: *OwnedChild, io: std.Io) std.process.Child.WaitError!std.process.Child.Term {
+        if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+            // Observe exit without reaping. The zombie pins both PID and PGID
+            // while descendants are killed, preventing either numeric id from
+            // being recycled into an unrelated process tree.
+            const pid = self.child.id orelse return error.Unexpected;
+            const exited = waitForExitedUnreaped(pid, false) catch return error.Unexpected;
+            std.debug.assert(exited);
+            self.forceTerminateTree();
+        }
         const term = try self.child.wait(io);
         self.closeTreeOwner();
         return term;
+    }
+
+    /// Reaps the direct child if it has exited, otherwise returns `null`.
+    /// Resource-usage collection is intentionally unsupported for polling;
+    /// callers that request it must use `wait` instead.
+    pub fn poll(self: *OwnedChild, io: std.Io) !?std.process.Child.Term {
+        if (self.child.id == null) return error.ChildAlreadyReaped;
+        if (self.child.request_resource_usage_statistics) return error.ResourceUsagePollingUnsupported;
+
+        if (builtin.os.tag == .windows) {
+            var zero_timeout: windows.LARGE_INTEGER = 0;
+            return switch (windows.ntdll.NtWaitForSingleObject(
+                self.child.id.?,
+                .FALSE,
+                &zero_timeout,
+            )) {
+                windows.NTSTATUS.WAIT_0 => try self.wait(io),
+                .TIMEOUT => null,
+                else => |status| windows.unexpectedStatus(status),
+            };
+        }
+        if (builtin.os.tag == .wasi) return error.UnsupportedPlatform;
+
+        if (!try waitForExitedUnreaped(self.child.id.?, true)) return null;
+        // As in wait(), the unreaped leader makes the subsequent group signal
+        // exact rather than a best-effort operation on a reusable number.
+        self.forceTerminateTree();
+        return @as(?std.process.Child.Term, try self.reapExitedPosix(io));
     }
 
     /// Returns a numeric process id suitable for diagnostics on every platform.
@@ -79,9 +142,138 @@ pub const OwnedChild = struct {
         if (builtin.os.tag == .windows) {
             if (self.job) |job| windows.CloseHandle(job);
             self.job = null;
+        } else if (builtin.os.tag != .wasi) {
+            self.process_group_id = null;
         }
     }
+
+    fn reapExitedPosix(self: *OwnedChild, io: std.Io) !std.process.Child.Term {
+        comptime std.debug.assert(builtin.os.tag != .windows and builtin.os.tag != .wasi);
+        const pid = self.child.id orelse return error.ChildAlreadyReaped;
+        var status: if (builtin.link_libc) c_int else u32 = undefined;
+        while (true) {
+            const result = if (builtin.link_libc)
+                std.c.waitpid(pid, &status, 0)
+            else
+                std.posix.system.waitpid(pid, &status, 0);
+            switch (std.posix.errno(result)) {
+                .SUCCESS => {
+                    if (result != pid) return error.UnexpectedWaitResult;
+                    const term = termFromStatus(@bitCast(status));
+                    self.cleanupReapedPosix(io);
+                    return term;
+                },
+                .INTR => continue,
+                .CHILD => return error.ChildAlreadyReaped,
+                else => |err| return std.posix.unexpectedErrno(err),
+            }
+        }
+    }
+
+    fn cleanupReapedPosix(self: *OwnedChild, io: std.Io) void {
+        comptime std.debug.assert(builtin.os.tag != .windows and builtin.os.tag != .wasi);
+        self.child.id = null;
+        if (self.child.stdin) |stdin| stdin.close(io);
+        if (self.child.stdout) |stdout| stdout.close(io);
+        if (self.child.stderr) |stderr| stderr.close(io);
+        self.child.stdin = null;
+        self.child.stdout = null;
+        self.child.stderr = null;
+        self.closeTreeOwner();
+    }
 };
+
+fn termFromStatus(status: u32) std.process.Child.Term {
+    return if (std.posix.W.IFEXITED(status))
+        .{ .exited = std.posix.W.EXITSTATUS(status) }
+    else if (std.posix.W.IFSIGNALED(status))
+        .{ .signal = std.posix.W.TERMSIG(status) }
+    else if (std.posix.W.IFSTOPPED(status))
+        .{ .stopped = std.posix.W.STOPSIG(status) }
+    else
+        .{ .unknown = status };
+}
+
+const WaitIdOptions = struct {
+    pid_kind: c_int,
+    exited: c_int,
+    nohang: c_int,
+    nowait: c_int,
+};
+
+const wait_id_options: WaitIdOptions = switch (builtin.os.tag) {
+    .linux => .{ .pid_kind = 1, .exited = 4, .nohang = 1, .nowait = 0x01000000 },
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => .{ .pid_kind = 1, .exited = 4, .nohang = 1, .nowait = 0x20 },
+    .freebsd => .{ .pid_kind = 0, .exited = 16, .nohang = 1, .nowait = 8 },
+    .openbsd => .{ .pid_kind = 2, .exited = 4, .nohang = 1, .nowait = 0x10 },
+    .netbsd => .{ .pid_kind = 1, .exited = 0x20, .nohang = 1, .nowait = 0x00010000 },
+    else => .{ .pid_kind = 0, .exited = 0, .nohang = 0, .nowait = 0 },
+};
+
+const WaitIdValue = if (builtin.os.tag == .freebsd) i64 else u32;
+
+const libc_process = if (builtin.os.tag != .windows and builtin.os.tag != .wasi and
+    builtin.os.tag != .linux) struct {
+    extern "c" fn waitid(
+        id_type: c_int,
+        id: WaitIdValue,
+        info: *std.c.siginfo_t,
+        options: c_int,
+    ) c_int;
+} else struct {};
+
+/// Detects child exit while deliberately leaving the leader as a zombie.
+/// Desktop targets use POSIX waitid(WNOWAIT); Windows already retains an exact
+/// process/job handle and therefore never enters this path.
+fn waitForExitedUnreaped(pid: std.posix.pid_t, nohang: bool) !bool {
+    comptime std.debug.assert(builtin.os.tag != .windows and builtin.os.tag != .wasi);
+    comptime if (wait_id_options.exited == 0) {
+        @compileError("owned POSIX process trees require waitid(WNOWAIT) support");
+    };
+
+    while (true) {
+        var info: std.c.siginfo_t = std.mem.zeroes(std.c.siginfo_t);
+        const options = wait_id_options.exited | wait_id_options.nowait |
+            (if (nohang) wait_id_options.nohang else 0);
+        const result = if (builtin.os.tag == .linux)
+            std.os.linux.waitid(.PID, pid, &info, @intCast(options), null)
+        else
+            libc_process.waitid(
+                wait_id_options.pid_kind,
+                @intCast(pid),
+                &info,
+                options,
+            );
+        switch (std.posix.errno(result)) {
+            .SUCCESS => return waitInfoProcessId(&info) != 0,
+            .INTR => if (nohang) return false else continue,
+            .CHILD => return error.ChildAlreadyReaped,
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
+}
+
+fn waitInfoProcessId(info: *const std.c.siginfo_t) std.posix.pid_t {
+    return switch (builtin.os.tag) {
+        .linux => info.fields.common.first.piduid.pid,
+        .driverkit,
+        .ios,
+        .maccatalyst,
+        .macos,
+        .tvos,
+        .visionos,
+        .watchos,
+        .freebsd,
+        .dragonfly,
+        .haiku,
+        .serenity,
+        => info.pid,
+        .openbsd => info.data.proc.pid,
+        .netbsd => info.info.reason.child.pid,
+        .illumos => info.reason.proc.pid,
+        else => 0,
+    };
+}
 
 /// Resolves argv[0] through the child environment, then spawns an owned tree.
 /// Zig's Windows spawn implementation securely quotes and wraps resolved
@@ -138,7 +330,16 @@ pub fn spawn(
         }
     }
 
-    return .{ .child = child, .job = job, .owns_tree = options.own_process_tree };
+    const process_group_id = if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {} else if (options.own_process_tree)
+        child.id
+    else
+        null;
+    return .{
+        .child = child,
+        .job = job,
+        .process_group_id = process_group_id,
+        .owns_tree = options.own_process_tree,
+    };
 }
 
 /// Classifies shims whose final Windows launch is delegated to Zig's secure
@@ -314,4 +515,136 @@ test "Windows command shim classification is case insensitive" {
 
 test "zero is never a live process id" {
     try std.testing.expect(!processIdIsAlive(0));
+}
+
+test "owned child kill does not orphan TERM-ignoring descendants" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buffer);
+    const pid_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ path_buffer[0..path_len], "descendant.pid" },
+    );
+    defer std.testing.allocator.free(pid_path);
+
+    const script =
+        \\trap '' TERM
+        \\(trap '' TERM; while :; do sleep 1; done) &
+        \\printf '%s\n' "$!" > "$1"
+        \\while :; do sleep 1; done
+    ;
+    var child = try spawn(std.testing.allocator, std.testing.io, .{
+        .argv = &.{ "sh", "-c", script, "sh", pid_path },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .own_process_tree = true,
+    });
+    defer if (child.child.id != null) child.kill(std.testing.io);
+
+    var descendant_pid: ?u32 = null;
+    for (0..2_000) |_| {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(
+            std.testing.io,
+            pid_path,
+            std.testing.allocator,
+            .limited(32),
+        ) catch |err| switch (err) {
+            error.FileNotFound => {
+                try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+                continue;
+            },
+            else => return err,
+        };
+        defer std.testing.allocator.free(bytes);
+        descendant_pid = try std.fmt.parseInt(u32, std.mem.trim(u8, bytes, &std.ascii.whitespace), 10);
+        break;
+    }
+    const pid = descendant_pid orelse return error.TestDescendantDidNotStart;
+    try std.testing.expect(processIdIsAlive(pid));
+
+    child.kill(std.testing.io);
+    for (0..2_000) |_| {
+        if (!processIdIsAlive(pid)) return;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    return error.TestDescendantSurvivedOwnedKill;
+}
+
+fn expectNaturalLeaderCleanup(use_poll: bool) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buffer);
+    const pid_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ path_buffer[0..path_len], if (use_poll) "poll.pid" else "wait.pid" },
+    );
+    defer std.testing.allocator.free(pid_path);
+
+    const script =
+        \\(trap '' TERM; while :; do sleep 1; done) &
+        \\printf '%s\n' "$!" > "$1"
+        \\exit 0
+    ;
+    var child = try spawn(std.testing.allocator, std.testing.io, .{
+        .argv = &.{ "sh", "-c", script, "sh", pid_path },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .own_process_tree = true,
+    });
+    defer if (child.child.id != null) child.kill(std.testing.io);
+
+    var descendant_pid: ?u32 = null;
+    for (0..2_000) |_| {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(
+            std.testing.io,
+            pid_path,
+            std.testing.allocator,
+            .limited(32),
+        ) catch |err| switch (err) {
+            error.FileNotFound => {
+                try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+                continue;
+            },
+            else => return err,
+        };
+        defer std.testing.allocator.free(bytes);
+        descendant_pid = try std.fmt.parseInt(
+            u32,
+            std.mem.trim(u8, bytes, &std.ascii.whitespace),
+            10,
+        );
+        break;
+    }
+    const pid = descendant_pid orelse return error.TestDescendantDidNotStart;
+    try std.testing.expect(processIdIsAlive(pid));
+
+    if (use_poll) {
+        for (0..2_000) |_| {
+            if (try child.poll(std.testing.io) != null) break;
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+        } else return error.TestLeaderDidNotExit;
+    } else {
+        _ = try child.wait(std.testing.io);
+    }
+    for (0..2_000) |_| {
+        if (!processIdIsAlive(pid)) return;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    return error.TestDescendantSurvivedLeaderReap;
+}
+
+test "poll cleans descendants after an owned group leader exits naturally" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    try expectNaturalLeaderCleanup(true);
+}
+
+test "wait cleans descendants after an owned group leader exits naturally" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    try expectNaturalLeaderCleanup(false);
 }

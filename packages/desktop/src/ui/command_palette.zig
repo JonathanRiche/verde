@@ -125,6 +125,8 @@ const STATIC_COMMANDS = [_]Command{
     .{ .id = "workspace.scrolling_always", .title = "Scrolling Layout: Always", .keywords = "niri panes mode pin enable", .section = .workspaces, .run = runScrollingAlways, .enabled = hasProjects },
     .{ .id = "workspace.scrolling_disabled", .title = "Scrolling Layout: Disabled", .keywords = "niri panes mode tiled off disable", .section = .workspaces, .run = runScrollingDisabled, .enabled = hasProjects },
     .{ .id = "workspace.scrolling_reset_column_width", .title = "Reset Scrolling Pane Widths", .keywords = "niri panes resize default per view", .section = .workspaces, .run = runResetScrollingColumnWidth, .enabled = hasCustomScrollingColumnWidth },
+    .{ .id = "workspace.runtime_default_current", .title = "Use Current Chat Runtime as Workspace Default", .keywords = "local remote new chat thread route", .section = .workspaces, .run = runUseCurrentRuntimeDefault, .enabled = hasFocusedGuiChat },
+    .{ .id = "workspace.runtime_default_local", .title = "Use Local as Workspace Runtime Default", .keywords = "remote new chat thread route reset", .section = .workspaces, .run = runUseLocalRuntimeDefault, .enabled = hasProjects },
     .{ .id = "workspace.add", .title = "Add Workspace", .keywords = "new project folder directory create", .section = .workspaces, .run = runAddWorkspace },
     .{ .id = "workspace.rename", .title = "Rename Workspace", .keywords = "label", .section = .workspaces, .run = runRenameWorkspace, .enabled = hasProjects },
     .{ .id = "workspace.close", .title = "Close Workspace", .keywords = "archive remove project save state", .section = .workspaces, .keybind = .workspace_close_current, .run = runCloseWorkspace, .enabled = workspaceNotBusy },
@@ -137,7 +139,6 @@ const STATIC_COMMANDS = [_]Command{
     .{ .id = "app.grok_setup", .title = "Set Up Grok Build", .keywords = "install xai agent provider tui", .section = .app, .run = runGrokSetup, .enabled = grokSetupNeeded },
     .{ .id = "workspace.amp_tui", .title = "Start New Amp TUI", .keywords = "agent terminal workspace fresh amp sourcegraph", .section = .workspaces, .run = runOpenAmpTui, .enabled = hasProjects },
     .{ .id = "workspace.herdr_handoff", .title = "Handoff Workspace to Herdr", .keywords = "runtime local terminal tui phone", .section = .workspaces, .run = runHerdrHandoffWorkspace, .enabled = hasProjects },
-    .{ .id = "workspace.herdr_handoff_remote", .title = "Handoff Workspace to Remote Herdr", .keywords = "remote profile ssh tailscale runtime terminal tui phone", .section = .workspaces, .run = runHerdrRemoteHandoffWorkspace, .enabled = hasProjects },
     .{ .id = "workspace.herdr_focus_terminal", .title = "Open/Focus Herdr Terminal", .keywords = "runtime terminal tui", .section = .workspaces, .run = runFocusHerdrTerminal, .enabled = currentWorkspaceHerdrLinked },
     .{ .id = "workspace.herdr_unlink", .title = "Run Workspace Locally", .keywords = "unlink herdr runtime local", .section = .workspaces, .run = runUnlinkHerdrWorkspace, .enabled = currentWorkspaceHerdrLinked },
     .{ .id = "app.history", .title = "History: This Workspace", .keywords = "saved chats threads search recent", .section = .app, .run = runHistoryThisWorkspace, .enabled = hasProjects, .keeps_open = true },
@@ -1413,6 +1414,14 @@ fn runResetScrollingColumnWidth(state: *runtime.AppState) void {
     state.markDirty();
 }
 
+fn runUseCurrentRuntimeDefault(state: *runtime.AppState) void {
+    state.useCurrentThreadRuntimeAsWorkspaceDefault();
+}
+
+fn runUseLocalRuntimeDefault(state: *runtime.AppState) void {
+    state.useLocalAsWorkspaceRuntimeDefault();
+}
+
 fn runAddWorkspace(state: *runtime.AppState) void {
     state.openWorkspaceCreator(true);
 }
@@ -1467,10 +1476,6 @@ fn runOpenAmpTui(state: *runtime.AppState) void {
 
 fn runHerdrHandoffWorkspace(state: *runtime.AppState) void {
     state.handoffProjectToLocalHerdrFromUi(state.project_controller.selected_index);
-}
-
-fn runHerdrRemoteHandoffWorkspace(state: *runtime.AppState) void {
-    state.beginHerdrProfilePicker(state.project_controller.selected_index);
 }
 
 fn runFocusHerdrTerminal(state: *runtime.AppState) void {
@@ -2034,6 +2039,22 @@ test "static commands expose scrolling layout controls" {
                 found = true;
                 break;
             }
+        }
+        try std.testing.expect(found);
+    }
+}
+
+test "static commands expose workspace runtime defaults without replacing thread selection" {
+    const expected_ids = [_][]const u8{
+        "workspace.runtime_default_current",
+        "workspace.runtime_default_local",
+    };
+    for (expected_ids) |expected_id| {
+        var found = false;
+        for (STATIC_COMMANDS) |command| {
+            if (!std.mem.eql(u8, command.id, expected_id)) continue;
+            found = true;
+            break;
         }
         try std.testing.expect(found);
     }

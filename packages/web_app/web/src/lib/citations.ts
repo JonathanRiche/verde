@@ -1,11 +1,8 @@
-import { workspaceFileUrl } from './live'
-
 // Codex emits inline file references as directives like
 //   :codex-file-citation{path="/abs/deliverable.pdf" purpose="output"}
 // which marked passes through as raw text — unreadable in the transcript.
-// Rewrite them into anchor chips before markdown parsing; the anchors resolve
-// through the gateway's /api/file endpoint and ChatPane intercepts clicks to
-// open the in-app file viewer.
+// Rewrite them into inert chips before markdown parsing. Remote workspace file
+// access is not exposed until the daemon has a repository-scoped file API.
 const CITATION_RE = /:codex-file-citation\{([^{}]*)\}/g
 const PATH_ATTR_RE = /path="([^"]+)"/
 
@@ -22,7 +19,7 @@ export function fileCitationName(path: string): string {
   return path.split('/').filter(Boolean).at(-1) ?? path
 }
 
-/// Replaces every codex file citation in a raw markdown body with an inline
+/// Replaces every Codex file citation in a raw markdown body with an inert
 /// HTML chip. Bodies without citations are returned unchanged so the hot
 /// streaming path stays a single includes() check.
 export function decorateFileCitations(body: string): string {
@@ -30,11 +27,9 @@ export function decorateFileCitations(body: string): string {
   return body.replace(CITATION_RE, (match, attrs: string) => {
     const path = PATH_ATTR_RE.exec(attrs)?.[1]
     if (!path) return match
-    const href = workspaceFileUrl(path)
     return (
-      `<a class="file-citation" data-verde-file="${escapeInline(path)}" ` +
-      `href="${escapeInline(href)}" target="_blank" rel="noopener" ` +
-      `title="${escapeInline(path)}">${CHIP_ICON}<span>${escapeInline(fileCitationName(path))}</span></a>`
+      `<span class="file-citation" title="${escapeInline(path)}">` +
+      `${CHIP_ICON}<span>${escapeInline(fileCitationName(path))}</span></span>`
     )
   })
 }

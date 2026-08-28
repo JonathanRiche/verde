@@ -11,6 +11,7 @@ pub const top_level_commands = [_][]const u8{
     "capabilities",
     "open",
     "herdr",
+    "runtime",
     "theme",
     "state",
     "notify",
@@ -41,15 +42,15 @@ pub const herdr_commands = [_][]const u8{
     "open",
     "handoff",
     "unlink",
-    "profiles",
     "status",
 };
 
-pub const herdr_profile_commands = [_][]const u8{
+pub const runtime_commands = [_][]const u8{
+    "path",
     "list",
-    "add",
+    "add-ssh",
     "remove",
-    "test",
+    "default",
 };
 
 pub const integration_commands = [_][]const u8{
@@ -347,13 +348,15 @@ pub const all_flags = [_][]const u8{
     "--status",
     "--progress",
     "--label",
-    "--session",
-    "--ssh-target",
     "--profile",
-    "--remote",
+    "--session",
     "--cwd",
-    "--remote-cwd",
     "--local-dir",
+    "--host",
+    "--user",
+    "--ssh-port",
+    "--gateway-port",
+    "--expected-runtime-id",
     "--all",
     "--dry-run",
     "--dock",
@@ -389,11 +392,20 @@ pub const all_flags = [_][]const u8{
 pub const json_flags = [_][]const u8{"--json"};
 pub const workspace_json_flags = [_][]const u8{ "--workspace", "--json" };
 pub const project_json_flags = workspace_json_flags;
-pub const herdr_open_flags = [_][]const u8{ "--session", "--herdr-workspace", "--profile", "--remote", "--cwd", "--remote-cwd", "--local-dir", "--pane", "--json" };
-pub const herdr_handoff_flags = [_][]const u8{ "--workspace", "--project", "--all", "--session", "--profile", "--remote", "--remote-cwd", "--dry-run", "--json" };
+pub const herdr_open_flags = [_][]const u8{ "--session", "--herdr-workspace", "--cwd", "--local-dir", "--pane", "--json" };
+pub const herdr_handoff_flags = [_][]const u8{ "--workspace", "--project", "--all", "--session", "--dry-run", "--json" };
 pub const herdr_unlink_flags = [_][]const u8{ "--workspace", "--project", "--all", "--json" };
-pub const herdr_profile_add_flags = [_][]const u8{ "--name", "--ssh-target", "--session", "--remote-cwd", "--local-dir", "--json" };
-pub const herdr_profile_name_flags = [_][]const u8{ "--name", "--json" };
+pub const runtime_add_ssh_flags = [_][]const u8{
+    "--label",
+    "--host",
+    "--user",
+    "--ssh-port",
+    "--gateway-port",
+    "--expected-runtime-id",
+    "--json",
+};
+pub const runtime_remove_flags = [_][]const u8{ "--id", "--json" };
+pub const runtime_default_flags = [_][]const u8{ "--workspace", "--profile", "--clear", "--json" };
 pub const session_id_json_flags = [_][]const u8{ "--id", "--json" };
 pub const session_new_flags = [_][]const u8{ "--workspace", "--name", "--json" };
 pub const session_attach_flags = [_][]const u8{ "--id", "--workspace", "--pane" };
@@ -513,6 +525,7 @@ pub const terminal_key_values = [_][]const u8{
     "8",
     "9",
 };
+pub const runtime_profile_values = [_][]const u8{"local"};
 
 pub fn shellSupported(name: []const u8) bool {
     for (shells) |shell| {

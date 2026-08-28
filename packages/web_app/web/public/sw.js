@@ -1,4 +1,4 @@
-const CACHE = 'verde-web-v3'
+const CACHE = 'verde-web-v4'
 
 const PRECACHE = [
   '/',
@@ -32,7 +32,13 @@ self.addEventListener('fetch', (event) => {
 
   const url = new URL(request.url)
   if (url.origin !== self.location.origin) return
-  if (url.pathname.startsWith('/api') || url.pathname.startsWith('/ws')) return
+  if (
+    url.pathname.startsWith('/api') ||
+    url.pathname.startsWith('/auth') ||
+    url.pathname.startsWith('/login') ||
+    url.pathname.startsWith('/ws') ||
+    url.pathname === '/healthz'
+  ) return
   if (url.pathname.startsWith('/@') || url.pathname.startsWith('/src/') || url.pathname.startsWith('/node_modules/')) return
   if (url.pathname.includes('vite') || url.search.includes('t=')) return
 

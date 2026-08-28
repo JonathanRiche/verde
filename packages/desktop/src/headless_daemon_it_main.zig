@@ -658,6 +658,80 @@ fn isConnectClassError(err: anyerror) bool {
     };
 }
 
+/// Extract the authenticated daemon PID from a status response received over
+/// this scenario's private endpoint. Detached CLI auto-start children cannot
+/// be waited through `std.process.Child`, so this is their stable test handle.
+fn daemonPidFromStatusResponse(allocator: std.mem.Allocator, response: []const u8) ?std.posix.pid_t {
+    if (comptime !posix_pty_supported) return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const result = parsed.value.object.get("result") orelse return null;
+    if (result != .object) return null;
+    const pid_value = result.object.get("pid") orelse return null;
+    if (pid_value != .integer or pid_value.integer <= 0) return null;
+    return std.math.cast(std.posix.pid_t, pid_value.integer);
+}
+
+fn prepareShutdownAccepted(allocator: std.mem.Allocator, response: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object or parsed.value.object.get("error") != null) return false;
+    const result = parsed.value.object.get("result") orelse return false;
+    if (result != .object) return false;
+    const accepted = result.object.get("accepted") orelse return false;
+    const safe_to_exit = result.object.get("safe_to_exit") orelse return false;
+    return accepted == .bool and accepted.bool and
+        safe_to_exit == .bool and safe_to_exit.bool;
+}
+
+fn detachedProcessAlive(pid: std.posix.pid_t) bool {
+    if (comptime !posix_pty_supported) return false;
+    std.posix.kill(pid, @enumFromInt(0)) catch |err| return err != error.ProcessNotFound;
+    return true;
+}
+
+fn waitDetachedProcessExit(io: std.Io, pid: std.posix.pid_t, timeout_ms: u64) bool {
+    const deadline = sessionizer.nowMs() + @as(i64, @intCast(timeout_ms));
+    while (sessionizer.nowMs() <= deadline) {
+        if (!detachedProcessAlive(pid)) return true;
+        std.Io.sleep(io, .fromMilliseconds(25), .awake) catch {};
+    }
+    return !detachedProcessAlive(pid);
+}
+
+/// Stop only the daemon authenticated through `pref_path`, then wait for its
+/// exact PID to disappear before the scenario removes the temporary database.
+fn shutdownAutoStartedDaemon(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    pref_path: []const u8,
+    pid: std.posix.pid_t,
+) !void {
+    if (comptime !posix_pty_supported) return;
+    if (!detachedProcessAlive(pid)) return;
+
+    const response = try sessionizer.requestAlloc(
+        allocator,
+        pref_path,
+        "daemon.prepareShutdown",
+        .{},
+        0,
+    );
+    defer allocator.free(response);
+    if (!prepareShutdownAccepted(allocator, response)) return error.AutoStartedDaemonShutdownRefused;
+    if (waitDetachedProcessExit(io, pid, 10_000)) return;
+
+    // A prepare-shutdown regression must not leave an integration daemon
+    // behind. The PID came from this private endpoint immediately above; TERM
+    // is bounded and never targets a process group or a user's live daemon.
+    std.posix.kill(pid, .TERM) catch |err| switch (err) {
+        error.ProcessNotFound => return,
+        else => return err,
+    };
+    if (!waitDetachedProcessExit(io, pid, 5_000)) return error.AutoStartedDaemonDidNotExit;
+}
+
 /// Wait for a child to exit with a deadline; kill on timeout so a regression
 /// fails instead of hanging the IT binary forever.
 fn waitChildBounded(child: *std.process.Child, io: std.Io, timeout_ms: u64) !std.process.Child.Term {
@@ -2543,36 +2617,45 @@ fn runCliBinaryNotifyWithBinary(
             else => return false,
         }
 
-        var ready = false;
+        var detached_pid: ?std.posix.pid_t = null;
+        defer if (detached_pid) |pid| {
+            shutdownAutoStartedDaemon(allocator, io, pref_path, pid) catch |err| {
+                std.debug.print(
+                    "headless-daemon-it: failed to clean auto-started daemon pid={d}: {s}\n",
+                    .{ pid, @errorName(err) },
+                );
+            };
+        };
         var attempts: usize = 0;
         while (attempts < 100) : (attempts += 1) {
             if (sessionizer.requestAlloc(allocator, pref_path, "status", .{}, 0)) |response| {
+                detached_pid = daemonPidFromStatusResponse(allocator, response);
                 allocator.free(response);
-                ready = true;
-                break;
+                if (detached_pid != null) break;
             } else |_| {
                 std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
             }
         }
-        if (!ready) return false;
+        const pid = detached_pid orelse return false;
 
-        if (sessionizer.requestAlloc(allocator, pref_path, "daemon.prepareShutdown", .{}, 0)) |resp| {
-            allocator.free(resp);
-        } else |_| {}
+        {
+            const db_path = try std.fs.path.join(allocator, &.{ pref_path, "state.sqlite" });
+            defer allocator.free(db_path);
+            const db_path_z = try allocator.dupeZ(u8, db_path);
+            defer allocator.free(db_path_z);
+            var conn = zqlite.open(db_path_z, zqlite.OpenFlags.ReadOnly | zqlite.OpenFlags.EXResCode) catch return false;
+            defer conn.close();
+            const row = (try conn.row(
+                "select status from surface_completions where session_id = ?1",
+                .{"m3p3-cli-notify-autostart"},
+            )) orelse return false;
+            defer row.deinit();
+            // done = 3 (surfaceStatusCode ordinal).
+            if (row.int(0) != 3) return false;
+        }
 
-        const db_path = try std.fs.path.join(allocator, &.{ pref_path, "state.sqlite" });
-        defer allocator.free(db_path);
-        const db_path_z = try allocator.dupeZ(u8, db_path);
-        defer allocator.free(db_path_z);
-        var conn = zqlite.open(db_path_z, zqlite.OpenFlags.ReadOnly | zqlite.OpenFlags.EXResCode) catch return false;
-        defer conn.close();
-        const row = (try conn.row(
-            "select status from surface_completions where session_id = ?1",
-            .{"m3p3-cli-notify-autostart"},
-        )) orelse return false;
-        defer row.deinit();
-        // done = 3 (surfaceStatusCode ordinal).
-        if (row.int(0) != 3) return false;
+        try shutdownAutoStartedDaemon(allocator, io, pref_path, pid);
+        detached_pid = null;
     }
     return true;
 }
@@ -7405,8 +7488,27 @@ fn runWireConcurrentTailDuringSlowStoreCommitScenario(allocator: std.mem.Allocat
     var killed = try client.call("session.kill", .{ .id = session_id });
     defer killed.deinit();
     if (!killed.response.isOk()) return error.M5WireSessionKillFailed;
-    var cleanup = try client.call("session.cleanup", .{});
-    defer cleanup.deinit();
+    // session.kill only signals the child; the daemon intentionally keeps the
+    // session live until a later poll observes its exit. Reap it before
+    // asserting that prepareShutdown has no live-session gate.
+    var session_reaped = false;
+    var reap_attempt: usize = 0;
+    while (reap_attempt < 100) : (reap_attempt += 1) {
+        var cleanup = try client.call("session.cleanup", .{});
+        defer cleanup.deinit();
+        if (!cleanup.response.isOk()) return error.M5WireSessionCleanupFailed;
+        if (cleanup.response.result) |result| {
+            if (result == .object) {
+                const removed = result.object.get("removed") orelse .null;
+                if (removed == .integer and removed.integer > 0) {
+                    session_reaped = true;
+                    break;
+                }
+            }
+        }
+        std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
+    }
+    if (!session_reaped) return error.M5WireSessionDidNotReap;
 
     var prepare = try client.call("daemon.prepareShutdown", .{});
     defer prepare.deinit();
@@ -9051,6 +9153,7 @@ fn runChatMcpToolLayerScenario(allocator: std.mem.Allocator, io: std.Io) !void {
         defer reader.deinit(allocator);
         var next_id: u32 = 1;
         var modern_tool_count: usize = 0;
+        const empty_object: struct {} = .{};
 
         // Modern discovery is the metadata-free probe and must still produce
         // a fully discriminated 2026-07-28 result.
@@ -9081,7 +9184,7 @@ fn runChatMcpToolLayerScenario(allocator: std.mem.Allocator, io: std.Io) !void {
             const meta = .{
                 .@"io.modelcontextprotocol/protocolVersion" = mcp_http.MODERN_PROTOCOL_VERSION,
                 .@"io.modelcontextprotocol/clientInfo" = .{ .name = "verde-headless-it", .version = "1" },
-                .@"io.modelcontextprotocol/clientCapabilities" = .{},
+                .@"io.modelcontextprotocol/clientCapabilities" = empty_object,
             };
             const request = try std.json.Stringify.valueAlloc(allocator, .{
                 .jsonrpc = "2.0",
@@ -9107,11 +9210,11 @@ fn runChatMcpToolLayerScenario(allocator: std.mem.Allocator, io: std.Io) !void {
                 .method = "tools/call",
                 .params = .{
                     .name = "list_workspaces",
-                    .arguments = .{},
+                    .arguments = empty_object,
                     ._meta = .{
                         .@"io.modelcontextprotocol/protocolVersion" = mcp_http.MODERN_PROTOCOL_VERSION,
                         .@"io.modelcontextprotocol/clientInfo" = .{ .name = "verde-headless-it", .version = "1" },
-                        .@"io.modelcontextprotocol/clientCapabilities" = .{},
+                        .@"io.modelcontextprotocol/clientCapabilities" = empty_object,
                     },
                 },
             }, .{});

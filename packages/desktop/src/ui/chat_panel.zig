@@ -67,7 +67,7 @@ const COMPOSER_DIRECTORY_GLYPH_CSS: f32 = 17.0;
 /// codicon-layers: the directory pill's glyph when the chat runs in an
 /// open workspace root.
 const NF_COD_LAYERS = "\u{EBD2}";
-/// codicon-device-desktop: the runtime pill's glyph for the local runtime.
+/// codicon-device-desktop: the composer runtime-route pill's glyph.
 const NF_COD_DEVICE_DESKTOP = "\u{EA7A}";
 /// Shared max width for the chat content column. The composer card and the
 /// transcript bubble column both clamp to this (via `chatContentColumn`) so

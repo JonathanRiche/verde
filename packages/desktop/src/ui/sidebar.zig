@@ -111,7 +111,6 @@ const SidebarContextMenuAction = enum {
     workspace_open_codex_tui,
     workspace_open_terminal,
     workspace_herdr_handoff,
-    workspace_herdr_handoff_remote,
     workspace_herdr_focus_terminal,
     workspace_herdr_unlink,
     workspace_rename,
@@ -744,7 +743,6 @@ fn handleSidebarContextMenuPrimary(state: *runtime.AppState, x: f32, y: f32) boo
                 .workspace_open_codex_tui => _ = state.openAgentTui(pi, .codex) catch false,
                 .workspace_open_terminal => _ = state.openTerminalPaneForProjectIndex(pi),
                 .workspace_herdr_handoff => state.handoffProjectToLocalHerdrFromUi(pi),
-                .workspace_herdr_handoff_remote => state.beginHerdrProfilePicker(pi),
                 .workspace_herdr_focus_terminal => _ = state.focusProjectHerdrAttachTerminal(pi),
                 .workspace_herdr_unlink => state.unlinkProjectHerdrFromUi(pi),
                 .workspace_rename => state.beginProjectRename(pi),
@@ -825,11 +823,9 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
             if (herdr_link) |link| {
                 appendSidebarContextMenuRow(.workspace_herdr_focus_terminal, pi < state.project_controller.projects.items.len, if (link.attach_dock_id != null) "Focus Herdr terminal" else "Open Herdr terminal");
                 appendSidebarContextMenuRow(.workspace_herdr_handoff, pi < state.project_controller.projects.items.len, "Refresh Herdr handoff");
-                appendSidebarContextMenuRow(.workspace_herdr_handoff_remote, pi < state.project_controller.projects.items.len, "Handoff to remote Herdr");
                 appendSidebarContextMenuRow(.workspace_herdr_unlink, pi < state.project_controller.projects.items.len, "Run locally (unlink Herdr)");
             } else {
                 appendSidebarContextMenuRow(.workspace_herdr_handoff, pi < state.project_controller.projects.items.len, "Handoff to Herdr");
-                appendSidebarContextMenuRow(.workspace_herdr_handoff_remote, pi < state.project_controller.projects.items.len, "Handoff to remote Herdr");
             }
             appendSidebarContextMenuRow(.workspace_rename, true, "Rename workspace");
             appendSidebarContextMenuRow(.workspace_import_codex, true, "Import Codex thread");
@@ -1452,8 +1448,8 @@ fn attentionClusterRowLessThan(left: AttentionClusterRow, right: AttentionCluste
 }
 
 fn herdrRuntimeBadgeLabel(project: *const native_state.Project) ?[]const u8 {
-    const link = project.herdr_link orelse return null;
-    return if (link.remote_alias.len > 0) "REMOTE" else "HERDR";
+    _ = project.herdr_link orelse return null;
+    return "HERDR";
 }
 
 // Renders the compact Herdr runtime badge inside a workspace row.

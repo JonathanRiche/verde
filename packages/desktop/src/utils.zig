@@ -530,7 +530,7 @@ fn runDirectoryPickerCommand(
 
 pub fn sendWorker(state: *chat_types.SendState, request: *SendWorkerRequest) void {
     const page_alloc = std.heap.page_allocator;
-    const request_cwd = request.remote_cwd orelse request.project_path;
+    const request_cwd = request.project_path;
     defer {
         page_alloc.free(request.project_path);
         page_alloc.free(request.prompt);
@@ -542,8 +542,6 @@ pub fn sendWorker(state: *chat_types.SendState, request: *SendWorkerRequest) voi
         if (request.model_ref) |model_ref| page_alloc.free(model_ref);
         if (request.opencode_reasoning_variant) |variant| page_alloc.free(variant);
         if (request.cursor_model_params_json) |params| page_alloc.free(params);
-        if (request.remote_ssh_host) |host| page_alloc.free(host);
-        if (request.remote_cwd) |cwd| page_alloc.free(cwd);
         page_alloc.destroy(request);
     }
 
@@ -639,8 +637,6 @@ pub const SendWorkerRequest = struct {
     cursor_model_params_json: ?[]u8,
     fast_mode: provider_models.FastMode,
     access_mode: provider_models.AccessMode,
-    remote_ssh_host: ?[]u8 = null,
-    remote_cwd: ?[]u8 = null,
 };
 pub fn runSendWorker(
     allocator: std.mem.Allocator,
@@ -650,10 +646,7 @@ pub fn runSendWorker(
         return error.UnsupportedHarnessMode;
     }
 
-    if (request.remote_ssh_host != null and request.provider != .codex) {
-        return error.UnsupportedRemoteProvider;
-    }
-    const request_cwd = request.remote_cwd orelse request.project_path;
+    const request_cwd = request.project_path;
 
     const provider_config = switch (request.provider) {
         .opencode => ai_harness.ProviderConfig{
@@ -667,10 +660,6 @@ pub fn runSendWorker(
             .codex = .{
                 .cwd = request_cwd,
                 .launch_on_connect = true,
-                .remote_ssh = if (request.remote_ssh_host) |host| .{
-                    .host = host,
-                    .cwd = request_cwd,
-                } else null,
             },
         },
         .claude => ai_harness.ProviderConfig{
@@ -1525,10 +1514,6 @@ fn formatSendWorkerError(
         error.GrokAcpFailed => allocator.dupe(
             u8,
             "Grok ACP request failed. Check that the grok CLI works with `grok agent stdio` from a terminal.",
-        ),
-        error.UnsupportedRemoteProvider => allocator.dupe(
-            u8,
-            "Remote Herdr GUI sends currently support Codex only. Use the Herdr terminal/TUI pane for this provider.",
         ),
         else => std.fmt.allocPrint(allocator, "{s} request failed. Check the provider status and retry.", .{providerLabel(provider)}),
     };

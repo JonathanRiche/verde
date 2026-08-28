@@ -8,6 +8,7 @@ const protocol = @import("protocol.zig");
 const registry = @import("registry_protocol.zig");
 const store_protocol = @import("store_protocol.zig");
 const changes_protocol = @import("changes_protocol.zig");
+const providers_protocol = @import("providers_protocol.zig");
 
 /// Sends one request JSON document and returns an allocator-owned response JSON document.
 pub const TransportFn = *const fn (ctx: *anyopaque, request_json: []const u8) anyerror![]u8;
@@ -24,6 +25,12 @@ pub const RequiredCapability = enum {
     store,
     snapshots,
     changes,
+    workspace_pagination,
+    thread_pagination,
+    message_pagination,
+    provider_status,
+    repository_projection,
+    repository_manifests,
     browser_execution,
     browser_presentation,
     browser_session_state,
@@ -52,6 +59,12 @@ pub const RequiredCapability = enum {
             .store => "store",
             .snapshots => "snapshots",
             .changes => "changes",
+            .workspace_pagination => "workspace_pagination",
+            .thread_pagination => "thread_pagination",
+            .message_pagination => "message_pagination",
+            .provider_status => "provider_status",
+            .repository_projection => "repository_projection",
+            .repository_manifests => "repository_manifests",
             .browser_execution => "browser_execution",
             .browser_presentation => "browser_presentation",
             .browser_session_state => "browser.session_state",
@@ -91,6 +104,12 @@ fn requireCapabilityChecked(capabilities: protocol.Capabilities, feature: Requir
         .store => capabilities.store,
         .snapshots => capabilities.snapshots,
         .changes => capabilities.changes,
+        .workspace_pagination => capabilities.workspace_pagination,
+        .thread_pagination => capabilities.thread_pagination,
+        .message_pagination => capabilities.message_pagination,
+        .provider_status => capabilities.provider_status,
+        .repository_projection => capabilities.repository_projection,
+        .repository_manifests => capabilities.repository_manifests,
         .browser_execution => capabilities.browser_execution,
         .browser_presentation => capabilities.browser_presentation,
         .browser_session_state => capabilities.isFeatureAvailable(.browser_session_state),
@@ -140,6 +159,12 @@ pub fn capabilityUnavailable(feature: RequiredCapability) protocol.Error {
             .store => "store capability is unavailable",
             .snapshots => "snapshots capability is unavailable",
             .changes => "changes capability is unavailable",
+            .workspace_pagination => "workspace_pagination capability is unavailable",
+            .thread_pagination => "thread_pagination capability is unavailable",
+            .message_pagination => "message_pagination capability is unavailable",
+            .provider_status => "provider_status capability is unavailable",
+            .repository_projection => "repository_projection capability is unavailable",
+            .repository_manifests => "repository_manifests capability is unavailable",
             .browser_execution => "browser_execution capability is unavailable",
             .browser_presentation => "browser_presentation capability is unavailable",
             .browser_session_state => "browser.session_state capability is unavailable",
@@ -189,10 +214,50 @@ pub fn advanceChangeCursor(
     };
 }
 
+pub const RuntimeHandshakeError = error{
+    RuntimeIdentityMissing,
+    RuntimeIdentityMismatch,
+    IncompatibleRuntimeProtocol,
+};
+
+/// Validate the network-runtime identity after the ordinary protocol-range
+/// negotiation. Callers persist `runtime_id`, never a mutable label/address.
+pub fn verifyRuntimeHandshake(
+    status: protocol.StatusResult,
+    expected_runtime_id: ?[]const u8,
+) RuntimeHandshakeError!void {
+    if (status.runtime_id.len == 0 or status.instance_id.len == 0) return error.RuntimeIdentityMissing;
+    if (status.protocol.major != protocol.RUNTIME_PROTOCOL_MAJOR) return error.IncompatibleRuntimeProtocol;
+    if (expected_runtime_id) |expected| {
+        if (expected.len == 0 or !std.mem.eql(u8, expected, status.runtime_id)) return error.RuntimeIdentityMismatch;
+    }
+}
+
+const ConfiguredRequestTarget = struct {
+    runtime_id: [32]u8,
+    instance_id: [32]u8,
+
+    fn init(target: protocol.RequestTarget) !ConfiguredRequestTarget {
+        try protocol.validateRequestTarget(target);
+        var configured: ConfiguredRequestTarget = undefined;
+        @memcpy(configured.runtime_id[0..], target.runtime_id);
+        @memcpy(configured.instance_id[0..], target.instance_id);
+        return configured;
+    }
+
+    fn borrow(self: *const ConfiguredRequestTarget) protocol.RequestTarget {
+        return .{
+            .runtime_id = &self.runtime_id,
+            .instance_id = &self.instance_id,
+        };
+    }
+};
+
 pub const Client = struct {
     allocator: std.mem.Allocator,
     transport_ctx: ?*anyopaque,
     transport: ?TransportFn,
+    request_target: ?ConfiguredRequestTarget = null,
     next_id: u64 = 1,
     negotiated_version: ?u32 = null,
 
@@ -215,6 +280,20 @@ pub const Client = struct {
         };
     }
 
+    /// Create a transport client permanently pinned to one runtime generation.
+    /// The identity pair is copied into the client so caller buffer changes
+    /// cannot retarget later requests.
+    pub fn initTargeted(
+        allocator: std.mem.Allocator,
+        transport_ctx: *anyopaque,
+        transport: TransportFn,
+        target: protocol.RequestTarget,
+    ) !Client {
+        var client = init(allocator, transport_ctx, transport);
+        client.request_target = try ConfiguredRequestTarget.init(target);
+        return client;
+    }
+
     /// Creates an encoder/parser-only client for adapters that own transport.
     pub fn initEncoder(allocator: std.mem.Allocator) Client {
         return .{
@@ -222,6 +301,14 @@ pub const Client = struct {
             .transport_ctx = null,
             .transport = null,
         };
+    }
+
+    /// Create an encoder-only client permanently pinned to one runtime
+    /// generation. No per-call API can replace or omit this target.
+    pub fn initTargetedEncoder(allocator: std.mem.Allocator, target: protocol.RequestTarget) !Client {
+        var client = initEncoder(allocator);
+        client.request_target = try ConfiguredRequestTarget.init(target);
+        return client;
     }
 
     /// Encode a typed request, hand it to the transport, and parse the envelope.
@@ -286,6 +373,9 @@ pub const Client = struct {
 
     /// Build a request envelope with an explicit id without advancing the generated id.
     pub fn encodeRequestWithId(self: *Client, id: u64, method: []const u8, params: anytype) ![]u8 {
+        if (self.request_target) |*target| {
+            return try protocol.encodeTargetedRequest(self.allocator, id, method, params, target.borrow());
+        }
         return try protocol.encodeRequest(self.allocator, id, method, params);
     }
 
@@ -318,6 +408,14 @@ pub const Client = struct {
             .status = status,
             .negotiated_version = self.negotiated_version.?,
         };
+    }
+
+    /// Perform the handshake required for a configured remote runtime and
+    /// reject a replaced/misdirected server before any state is projected.
+    pub fn handshakeRuntime(self: *Client, expected_runtime_id: ?[]const u8) !HandshakeResult {
+        const result = try self.handshake();
+        try verifyRuntimeHandshake(result.status, expected_runtime_id);
+        return result;
     }
 
     /// Return the version selected by the most recent successful status or
@@ -412,9 +510,32 @@ pub const Client = struct {
         return try self.decodeResult(store_protocol.ThreadGetResult, parsed);
     }
 
+    /// Decode a bounded workspace list with repository projections.
+    pub fn decodeWorkspaceList(self: *Client, parsed: *const protocol.ParsedResponse) !store_protocol.WorkspaceListResult {
+        return try self.decodeResult(store_protocol.WorkspaceListResult, parsed);
+    }
+
+    /// Decode one bounded, allocator-owned repository manifest projection.
+    pub fn decodeWorkspaceRepositoryManifest(
+        self: *Client,
+        parsed: *const protocol.ParsedResponse,
+    ) !store_protocol.WorkspaceRepositoryManifestResult {
+        return try self.decodeResult(store_protocol.WorkspaceRepositoryManifestResult, parsed);
+    }
+
     /// Decode a bounded durable thread metadata list.
     pub fn decodeThreadList(self: *Client, parsed: *const protocol.ParsedResponse) !store_protocol.ThreadListResult {
         return try self.decodeResult(store_protocol.ThreadListResult, parsed);
+    }
+
+    /// Decode a bounded bidirectional transcript page.
+    pub fn decodeMessageList(self: *Client, parsed: *const protocol.ParsedResponse) !store_protocol.MessageListResult {
+        return try self.decodeResult(store_protocol.MessageListResult, parsed);
+    }
+
+    /// Decode runtime-scoped installation/authentication status for providers.
+    pub fn decodeProviderStatus(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.StatusResult {
+        return try self.decodeResult(providers_protocol.StatusResult, parsed);
     }
 
     /// Decode one durable turn-ledger record.
@@ -456,6 +577,99 @@ pub const Client = struct {
         return try self.call(changes_protocol.METHOD_CORE_CHANGES, request);
     }
 
+    pub fn callWorkspaceList(
+        self: *Client,
+        capabilities: protocol.Capabilities,
+        request: store_protocol.WorkspaceListRequest,
+    ) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .workspace_pagination);
+        try requireCapabilityChecked(capabilities, .repository_projection);
+        return try self.call(store_protocol.METHOD_WORKSPACE_LIST, request);
+    }
+
+    pub fn callWorkspaceRepositoryManifest(
+        self: *Client,
+        capabilities: protocol.Capabilities,
+        request: store_protocol.WorkspaceRepositoryManifestRequest,
+    ) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .repository_manifests);
+        return try self.call(store_protocol.METHOD_WORKSPACE_REPOSITORY_MANIFEST_GET, request);
+    }
+
+    pub fn callWorkspaceRepositoryUpsert(
+        self: *Client,
+        capabilities: protocol.Capabilities,
+        request: store_protocol.WorkspaceRepositoryUpsertRequest,
+    ) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .repository_manifests);
+        return try self.call(store_protocol.METHOD_WORKSPACE_REPOSITORY_UPSERT, request);
+    }
+
+    pub fn callWorkspaceRepositoryRemove(
+        self: *Client,
+        capabilities: protocol.Capabilities,
+        request: store_protocol.WorkspaceRepositoryRemoveRequest,
+    ) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .repository_manifests);
+        return try self.call(store_protocol.METHOD_WORKSPACE_REPOSITORY_REMOVE, request);
+    }
+
+    pub fn callWorkspaceRepositoryDefaultSet(
+        self: *Client,
+        capabilities: protocol.Capabilities,
+        request: store_protocol.WorkspaceDefaultRepositorySetRequest,
+    ) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .repository_manifests);
+        return try self.call(store_protocol.METHOD_WORKSPACE_REPOSITORY_DEFAULT_SET, request);
+    }
+
+    pub fn callWorkspaceRepositoryBindingUpsert(
+        self: *Client,
+        capabilities: protocol.Capabilities,
+        request: store_protocol.WorkspaceRepositoryBindingUpsertRequest,
+    ) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .repository_manifests);
+        return try self.call(store_protocol.METHOD_WORKSPACE_REPOSITORY_BINDING_UPSERT, request);
+    }
+
+    pub fn callWorkspaceRepositoryBindingRemove(
+        self: *Client,
+        capabilities: protocol.Capabilities,
+        request: store_protocol.WorkspaceRepositoryBindingRemoveRequest,
+    ) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .repository_manifests);
+        return try self.call(store_protocol.METHOD_WORKSPACE_REPOSITORY_BINDING_REMOVE, request);
+    }
+
+    pub fn callThreadList(
+        self: *Client,
+        capabilities: protocol.Capabilities,
+        request: store_protocol.ThreadListRequest,
+    ) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .thread_pagination);
+        return try self.call(store_protocol.METHOD_CHAT_THREAD_LIST, request);
+    }
+
+    pub fn callMessageList(
+        self: *Client,
+        capabilities: protocol.Capabilities,
+        request: store_protocol.MessageListRequest,
+    ) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .message_pagination);
+        return try self.call(store_protocol.METHOD_CHAT_MESSAGE_LIST, request);
+    }
+
+    pub fn callProviderStatus(
+        self: *Client,
+        capabilities: protocol.Capabilities,
+    ) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .provider_status);
+        return try self.call(
+            providers_protocol.METHOD_PROVIDERS_STATUS,
+            providers_protocol.StatusRequest{},
+        );
+    }
+
     /// Require a capability on this client before a direct daemon request.
     pub fn requireCapability(_: *Client, capabilities: protocol.Capabilities, feature: RequiredCapability) CapabilityError!void {
         return requireCapabilityChecked(capabilities, feature);
@@ -485,7 +699,15 @@ pub const Client = struct {
     }
 
     fn resultValue(_: *Client, parsed: *const protocol.ParsedResponse) !std.json.Value {
-        if (!parsed.response.isOk()) return error.RemoteError;
+        if (parsed.response.err) |remote_error| {
+            if (std.mem.eql(u8, remote_error.code, protocol.ERR_RUNTIME_IDENTITY_MISSING)) {
+                return error.RuntimeIdentityMissing;
+            }
+            if (std.mem.eql(u8, remote_error.code, protocol.ERR_RUNTIME_IDENTITY_MISMATCH)) {
+                return error.RuntimeIdentityMismatch;
+            }
+            return error.RemoteError;
+        }
         return parsed.response.result orelse error.InvalidResponse;
     }
 
@@ -527,6 +749,12 @@ const MockTransport = struct {
     }
 };
 
+fn expectMockRequestMethod(mock: *const MockTransport, expected: []const u8) !void {
+    var parsed = try protocol.parseRequest(std.testing.allocator, mock.last_request.?);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(expected, parsed.request.method);
+}
+
 test "client parses ok envelope via injected transport" {
     const allocator = std.testing.allocator;
     const ok_body = try protocol.encodeOkResponse(allocator, 1, .{
@@ -554,7 +782,10 @@ test "client parses ok envelope via injected transport" {
     try std.testing.expectEqual(@as(u32, 1), capabilities.headless_protocol_version);
     try std.testing.expect(capabilities.capabilities.terminal_raw);
     try std.testing.expect(mock.last_request != null);
-    try std.testing.expect(std.mem.indexOf(u8, mock.last_request.?, "core.capabilities") != null);
+    try std.testing.expectEqualStrings(
+        "{\"id\":1,\"method\":\"core.capabilities\",\"params\":[]}",
+        mock.last_request.?,
+    );
 
     const status_body = try protocol.encodeOkResponse(allocator, 2, .{
         .headless_protocol_version = protocol.HEADLESS_PROTOCOL_VERSION,
@@ -596,6 +827,74 @@ test "client parses error envelope via injected transport" {
 
     try std.testing.expect(!parsed.response.isOk());
     try std.testing.expectEqualStrings(protocol.ERR_UNKNOWN_METHOD, parsed.response.err.?.code);
+}
+
+test "targeted client copies one target into generic and typed requests" {
+    const allocator = std.testing.allocator;
+    const ok_body = try protocol.encodeOkResponse(allocator, 2, .{});
+    defer allocator.free(ok_body);
+    var mock: MockTransport = .{
+        .allocator = allocator,
+        .canned_response = ok_body,
+    };
+    defer mock.deinit();
+
+    var runtime_id: [32]u8 = "0123456789abcdef0123456789abcdef".*;
+    var instance_id: [32]u8 = "00112233445566778899aabbccddeeff".*;
+    var client = try Client.initTargeted(allocator, &mock, MockTransport.send, .{
+        .runtime_id = &runtime_id,
+        .instance_id = &instance_id,
+    });
+    runtime_id[0] = 'f';
+    instance_id[0] = 'f';
+
+    const generic = try client.encodeRequest("core.capabilities", .{});
+    defer allocator.free(generic.json);
+    var parsed_generic = try protocol.parseRequest(allocator, generic.json);
+    defer parsed_generic.deinit();
+    try std.testing.expectEqualStrings(
+        "0123456789abcdef0123456789abcdef",
+        parsed_generic.request.target.?.runtime_id,
+    );
+    try std.testing.expectEqualStrings(
+        "00112233445566778899aabbccddeeff",
+        parsed_generic.request.target.?.instance_id,
+    );
+
+    var typed = try client.callCompositeSnapshot(protocol.Capabilities.phase1(), .{});
+    defer typed.deinit();
+    var parsed_typed = try protocol.parseRequest(allocator, mock.last_request.?);
+    defer parsed_typed.deinit();
+    try std.testing.expectEqualStrings("core.snapshot", parsed_typed.request.method);
+    try std.testing.expectEqualStrings(
+        "0123456789abcdef0123456789abcdef",
+        parsed_typed.request.target.?.runtime_id,
+    );
+}
+
+test "targeted client rejects an invalid configured identity" {
+    try std.testing.expectError(
+        error.RuntimeIdentityMissing,
+        Client.initTargetedEncoder(std.testing.allocator, .{
+            .runtime_id = "not-canonical",
+            .instance_id = "00112233445566778899aabbccddeeff",
+        }),
+    );
+}
+
+test "identity response errors retain their failure classification" {
+    var client = Client.initEncoder(std.testing.allocator);
+    const cases = [_]struct { code: []const u8, expected: anyerror }{
+        .{ .code = protocol.ERR_RUNTIME_IDENTITY_MISSING, .expected = error.RuntimeIdentityMissing },
+        .{ .code = protocol.ERR_RUNTIME_IDENTITY_MISMATCH, .expected = error.RuntimeIdentityMismatch },
+    };
+    for (cases) |case| {
+        const encoded = try protocol.encodeErrorResponse(std.testing.allocator, 1, case.code, "identity rejected");
+        defer std.testing.allocator.free(encoded);
+        var parsed = try protocol.parseResponse(std.testing.allocator, encoded);
+        defer parsed.deinit();
+        try std.testing.expectError(case.expected, client.decodeStatus(&parsed));
+    }
 }
 
 test "client rejects mismatched response ids in both call paths" {
@@ -657,6 +956,32 @@ test "client handshake returns and records negotiated version" {
     try std.testing.expectEqual(protocol.HEADLESS_PROTOCOL_VERSION, result.negotiated_version);
     try std.testing.expectEqual(result.negotiated_version, try client.negotiatedProtocolVersion());
     try std.testing.expectEqual(@as(u32, 4242), result.status.pid);
+}
+
+test "remote handshake verifies stable runtime identity and protocol major" {
+    const status: protocol.StatusResult = .{
+        .runtime_id = "runtime-a",
+        .instance_id = "instance-a",
+        .server_version = "1.0.0",
+        .headless_protocol_version = protocol.HEADLESS_PROTOCOL_VERSION,
+        .min_supported = protocol.MIN_SUPPORTED_PROTOCOL_VERSION,
+        .max_supported = protocol.MAX_SUPPORTED_PROTOCOL_VERSION,
+        .protocol_version = 26,
+        .pid = 1,
+        .session_count = 0,
+        .chat_turn_count = 0,
+        .capabilities = protocol.Capabilities.phase1(),
+    };
+    try verifyRuntimeHandshake(status, null);
+    try verifyRuntimeHandshake(status, "runtime-a");
+    try std.testing.expectError(error.RuntimeIdentityMismatch, verifyRuntimeHandshake(status, "runtime-b"));
+
+    var missing = status;
+    missing.runtime_id = "";
+    try std.testing.expectError(error.RuntimeIdentityMissing, verifyRuntimeHandshake(missing, null));
+    var incompatible = status;
+    incompatible.protocol.major += 1;
+    try std.testing.expectError(error.IncompatibleRuntimeProtocol, verifyRuntimeHandshake(incompatible, null));
 }
 
 test "client status decode rejects invalid and incompatible daemon ranges" {
@@ -971,6 +1296,183 @@ test "chat read decoders return RemoteError for error envelopes" {
     try std.testing.expectError(error.RemoteError, client.decodeTurnRecord(&parsed));
 }
 
+test "remote projection and provider decoders tolerate additive fields" {
+    var result_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer result_arena.deinit();
+    var client = Client.initEncoder(result_arena.allocator());
+
+    var workspaces = try protocol.parseResponse(
+        std.testing.allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"workspaces\":[{\"workspace_id\":\"w1\",\"label\":\"W\",\"path\":\"/w\",\"repositories\":[{\"repository_id\":\"primary\",\"label\":\"Primary\",\"bindings\":[{\"runtime_id\":\"r1\",\"root_path\":\"/w\"}]}],\"future\":true}],\"store_revision\":2}}",
+    );
+    defer workspaces.deinit();
+    const workspace_result = try client.decodeWorkspaceList(&workspaces);
+    try std.testing.expectEqualStrings("r1", workspace_result.workspaces[0].repositories[0].bindings[0].runtime_id);
+
+    var messages = try protocol.parseResponse(
+        std.testing.allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"messages\":[{\"sort_index\":4,\"message_id\":\"m4\",\"role\":\"assistant\",\"author\":\"Codex\",\"body\":\"done\",\"future\":1}],\"next_cursor\":\"b:4\",\"store_revision\":3}}",
+    );
+    defer messages.deinit();
+    const message_result = try client.decodeMessageList(&messages);
+    try std.testing.expectEqual(@as(usize, 4), message_result.messages[0].sort_index);
+    try std.testing.expectEqualStrings("b:4", message_result.next_cursor.?);
+
+    var providers = try protocol.parseResponse(
+        std.testing.allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"runtime_id\":\"r1\",\"instance_id\":\"i1\",\"probed_at_ms\":5,\"providers\":[{\"provider\":\"amp\",\"label\":\"Amp\",\"surfaces\":{\"terminal_tui\":true,\"mcp\":true,\"lifecycle\":true},\"installed\":true,\"state\":\"ready\",\"authentication\":\"unknown\",\"future\":true}]}}",
+    );
+    defer providers.deinit();
+    const provider_result = try client.decodeProviderStatus(&providers);
+    try std.testing.expect(!provider_result.providers[0].surfaces.native_chat);
+    try std.testing.expect(provider_result.providers[0].surfaces.mcp);
+}
+
+test "repository manifest decoder owns the complete bounded projection" {
+    var result_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer result_arena.deinit();
+    var client = Client.initEncoder(result_arena.allocator());
+    var repository_label: []const u8 = undefined;
+    var binding_root: []const u8 = undefined;
+
+    {
+        var parsed = try protocol.parseResponse(
+            std.testing.allocator,
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"workspace_id\":\"w1\",\"default_repository_id\":\"repo-api\",\"repositories\":[{\"repository_id\":\"repo-api\",\"label\":\"API\",\"bindings\":[{\"runtime_id\":\"0123456789abcdef0123456789abcdef\",\"root_path\":\"/srv/api\",\"availability\":\"available\",\"future\":true}],\"future\":1}],\"store_revision\":9,\"future\":{}}}",
+        );
+        defer parsed.deinit();
+        const result = try client.decodeWorkspaceRepositoryManifest(&parsed);
+        try std.testing.expectEqualStrings("w1", result.workspace_id);
+        try std.testing.expectEqualStrings("repo-api", result.default_repository_id);
+        try std.testing.expectEqual(@as(usize, 1), result.repositories.len);
+        try std.testing.expectEqual(@as(u64, 9), result.store_revision);
+        repository_label = result.repositories[0].label;
+        binding_root = result.repositories[0].bindings[0].root_path;
+    }
+
+    try std.testing.expectEqualStrings("API", repository_label);
+    try std.testing.expectEqualStrings("/srv/api", binding_root);
+}
+
+test "repository manifest typed calls share one fail-closed capability gate" {
+    const allocator = std.testing.allocator;
+    const ok_body = try protocol.encodeOkResponse(allocator, 1, .{
+        .store_revision = @as(u64, 1),
+        .applied = true,
+        .duplicate = false,
+    });
+    defer allocator.free(ok_body);
+    var mock: MockTransport = .{ .allocator = allocator, .canned_response = ok_body };
+    defer mock.deinit();
+    var client = Client.init(allocator, &mock, MockTransport.send);
+    const unavailable: protocol.Capabilities = .{};
+    const current = protocol.Capabilities.phase1();
+    const mutation: store_protocol.MutationHeader = .{
+        .request_key = "repo-test",
+        .client_id = "client-test",
+    };
+
+    try std.testing.expectError(
+        error.CapabilityUnavailable,
+        client.callWorkspaceRepositoryManifest(unavailable, .{ .workspace_id = "w1" }),
+    );
+    try std.testing.expectError(
+        error.CapabilityUnavailable,
+        client.callWorkspaceRepositoryUpsert(unavailable, .{
+            .mutation = mutation,
+            .workspace_id = "w1",
+            .repository = .{ .repository_id = "repo-api", .label = "API" },
+        }),
+    );
+    try std.testing.expectError(
+        error.CapabilityUnavailable,
+        client.callWorkspaceRepositoryRemove(unavailable, .{
+            .mutation = mutation,
+            .workspace_id = "w1",
+            .repository_id = "repo-api",
+        }),
+    );
+    try std.testing.expectError(
+        error.CapabilityUnavailable,
+        client.callWorkspaceRepositoryDefaultSet(unavailable, .{
+            .mutation = mutation,
+            .workspace_id = "w1",
+            .repository_id = "repo-api",
+        }),
+    );
+    try std.testing.expectError(
+        error.CapabilityUnavailable,
+        client.callWorkspaceRepositoryBindingUpsert(unavailable, .{
+            .mutation = mutation,
+            .workspace_id = "w1",
+            .repository_id = "repo-api",
+            .binding = .{
+                .runtime_id = "0123456789abcdef0123456789abcdef",
+                .root_path = "/srv/api",
+            },
+        }),
+    );
+    try std.testing.expectError(
+        error.CapabilityUnavailable,
+        client.callWorkspaceRepositoryBindingRemove(unavailable, .{
+            .mutation = mutation,
+            .workspace_id = "w1",
+            .repository_id = "repo-api",
+            .runtime_id = "0123456789abcdef0123456789abcdef",
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 0), mock.call_count);
+
+    var manifest = try client.callWorkspaceRepositoryManifest(current, .{ .workspace_id = "w1" });
+    defer manifest.deinit();
+    try expectMockRequestMethod(&mock, store_protocol.METHOD_WORKSPACE_REPOSITORY_MANIFEST_GET);
+    client.next_id = 1;
+    var upsert = try client.callWorkspaceRepositoryUpsert(current, .{
+        .mutation = mutation,
+        .workspace_id = "w1",
+        .repository = .{ .repository_id = "repo-api", .label = "API" },
+    });
+    defer upsert.deinit();
+    try expectMockRequestMethod(&mock, store_protocol.METHOD_WORKSPACE_REPOSITORY_UPSERT);
+    client.next_id = 1;
+    var remove = try client.callWorkspaceRepositoryRemove(current, .{
+        .mutation = mutation,
+        .workspace_id = "w1",
+        .repository_id = "repo-api",
+    });
+    defer remove.deinit();
+    try expectMockRequestMethod(&mock, store_protocol.METHOD_WORKSPACE_REPOSITORY_REMOVE);
+    client.next_id = 1;
+    var set_default = try client.callWorkspaceRepositoryDefaultSet(current, .{
+        .mutation = mutation,
+        .workspace_id = "w1",
+        .repository_id = "repo-api",
+    });
+    defer set_default.deinit();
+    try expectMockRequestMethod(&mock, store_protocol.METHOD_WORKSPACE_REPOSITORY_DEFAULT_SET);
+    client.next_id = 1;
+    var binding_upsert = try client.callWorkspaceRepositoryBindingUpsert(current, .{
+        .mutation = mutation,
+        .workspace_id = "w1",
+        .repository_id = "repo-api",
+        .binding = .{
+            .runtime_id = "0123456789abcdef0123456789abcdef",
+            .root_path = "/srv/api",
+        },
+    });
+    defer binding_upsert.deinit();
+    try expectMockRequestMethod(&mock, store_protocol.METHOD_WORKSPACE_REPOSITORY_BINDING_UPSERT);
+    client.next_id = 1;
+    var binding_remove = try client.callWorkspaceRepositoryBindingRemove(current, .{
+        .mutation = mutation,
+        .workspace_id = "w1",
+        .repository_id = "repo-api",
+        .runtime_id = "0123456789abcdef0123456789abcdef",
+    });
+    defer binding_remove.deinit();
+    try expectMockRequestMethod(&mock, store_protocol.METHOD_WORKSPACE_REPOSITORY_BINDING_REMOVE);
+}
+
 test "changes and composite snapshot decoders are tolerant and own result strings" {
     var result_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer result_arena.deinit();
@@ -1103,6 +1605,17 @@ test "store capability gate reports capability_unavailable" {
     try std.testing.expectEqualStrings("store", RequiredCapability.store.wireName());
     try std.testing.expectEqualStrings(protocol.ERR_CAPABILITY_UNAVAILABLE, unavailable.code);
     try std.testing.expectEqualStrings("store capability is unavailable", unavailable.message);
+}
+
+test "remote read and repository manifest capabilities are explicit" {
+    const capabilities = protocol.Capabilities.phase1();
+    try requireCapability(capabilities, .workspace_pagination);
+    try requireCapability(capabilities, .thread_pagination);
+    try requireCapability(capabilities, .message_pagination);
+    try requireCapability(capabilities, .provider_status);
+    try requireCapability(capabilities, .repository_projection);
+    try requireCapability(capabilities, .repository_manifests);
+    try std.testing.expectEqualStrings("provider_status", RequiredCapability.provider_status.wireName());
 }
 
 test "M4-P5 chat flip: current daemon passes, old-daemon shape rejects daemon-direct chat" {
