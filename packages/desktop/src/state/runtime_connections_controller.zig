@@ -264,7 +264,6 @@ pub fn openRuntimeConnectionWizard(self: anytype) void {
     self.closePaletteModelPicker();
     self.closePaletteDirectoryPicker();
     self.closeRunConfigPopover();
-    if (!self.settings_controller.modal_visible) self.openSettingsModal();
     focusWizardField(self, .label);
 }
 
@@ -298,7 +297,6 @@ pub fn openRuntimeConnectionEditor(self: anytype, profile_id: []const u8) void {
     rc.wizard_step = .form;
     rc.wizard_open = true;
     setNotice(&rc.wizard_notice_storage, "");
-    if (!self.settings_controller.modal_visible) self.openSettingsModal();
     focusWizardField(self, .label);
 }
 
