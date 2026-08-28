@@ -41,6 +41,11 @@ install -d "$rootfs/opt/verde/bin" "$rootfs/opt/verde/share/verde"
         --release=safe \
         -Dtarget="$zig_target" \
         --prefix "$rootfs/opt/verde"
+
+    zig build server \
+        --release=safe \
+        -Dtarget="$zig_target" \
+        --prefix "$rootfs/opt/verde"
 )
 
 (

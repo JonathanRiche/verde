@@ -1,10 +1,15 @@
 //! Desktop-owned state and actions for the Settings › Runtimes & connections
-//! surface and the SSH connection wizard. The controller talks only to the
-//! shared runtime Service (profile store, manager, RPC); it never spawns the
-//! Verde CLI and never holds bearer material — the masked credential modal in
-//! `state.zig` remains the sole UI-owned token copy.
+//! surface and the method-first connection wizard (SSH administrator token,
+//! account-free Pair, or a Connect control plane). The controller talks only
+//! to the shared runtime Service (profile store, manager, RPC); it never
+//! spawns the Verde CLI and never holds a runtime bearer — the masked
+//! credential modal in `state.zig` remains the sole UI-owned token copy. The
+//! one-time pairing code is the single exception: it is held masked in a
+//! zeroed buffer only until the exchange starts, then wiped.
 
 const std = @import("std");
+const access_protocol = @import("headless").access_protocol;
+const connect_client = @import("../runtime/connect_client.zig");
 const profile = @import("../runtime/profile.zig");
 const RuntimeService = @import("../runtime/service.zig");
 
@@ -16,14 +21,57 @@ pub const LABEL_CAPACITY: usize = 80;
 pub const HOST_CAPACITY: usize = 255;
 pub const USER_CAPACITY: usize = 64;
 pub const PORT_CAPACITY: usize = 5;
+pub const GRANT_ID_CAPACITY: usize = access_protocol.GRANT_ID_HEX_BYTES;
+pub const PAIRING_CODE_CAPACITY: usize = access_protocol.SECRET_HEX_BYTES;
+pub const DEVICE_LABEL_CAPACITY: usize = access_protocol.MAX_DEVICE_LABEL_BYTES;
+pub const URL_CAPACITY: usize = profile.MAX_URL_BYTES;
 const NOTICE_CAPACITY: usize = 256;
 /// Bounded so a hostile or huge manifest cannot grow the settings card
 /// without limit; extra rows are reported as a count.
 pub const MAX_READINESS_ROWS: usize = 12;
 
 pub const WizardMode = enum { add, edit };
-pub const WizardStep = enum { form, testing };
-pub const WizardField = enum { label, host, user, ssh_port, gateway_port };
+/// Which access method the wizard is configuring. Only Connect needs an
+/// account (on the control plane's identity provider).
+pub const WizardMethod = enum {
+    ssh,
+    pair,
+    connect,
+
+    pub fn title(self: WizardMethod) []const u8 {
+        return switch (self) {
+            .ssh => "SSH with administrator token",
+            .pair => "Pair this device (no account)",
+            .connect => "Connect through a control plane (account required)",
+        };
+    }
+
+    pub fn description(self: WizardMethod) []const u8 {
+        return switch (self) {
+            .ssh => "Forward the daemon over SSH and enter its gateway token each session.",
+            .pair => "Forward over SSH once, redeem a one-time grant, keep a revocable device credential.",
+            .connect => "Sign in to a self-hosted Verde Connect URL and pick a linked runtime. Verde Cloud later.",
+        };
+    }
+};
+pub const WizardStep = enum {
+    /// Method chooser shown first for new connections.
+    method,
+    /// SSH/Pair endpoint fields.
+    form,
+    /// Saved profile with live status and connect/retry.
+    testing,
+    /// Pair: grant id, one-time code, device label.
+    pair_grant,
+    /// Pair: runtime identity returned by the exchange awaits confirmation.
+    pair_confirm,
+    /// Connect: control-plane URL, discovery, sign-in, inventory selection.
+    connect_setup,
+};
+pub const WizardField = enum { label, host, user, ssh_port, gateway_port, grant_id, pairing_code, device_label, control_plane_url };
+pub const ConnectPhase = connect_client.Phase;
+/// Truthful reason a Connect profile cannot serve sessions from the desktop yet.
+pub const CONNECT_BLOCKER = connect_client.BLOCKER;
 
 /// Row actions encoded into one `settings_runtime_action` hit index as
 /// `(row << ACTION_BITS) | action`. Row 0 is Local; rows 1.. are profiles in
@@ -41,6 +89,12 @@ pub const RowAction = enum(u8) {
     copy_diagnostics,
     set_workspace_default,
     add_connection,
+    /// Paired profiles: drop the device reference and credential.
+    forget_device,
+    /// Paired profiles: start (or repeat) the one-time grant exchange.
+    pair_device,
+    /// Connect profiles: reopen sign-in and runtime selection.
+    choose_runtime,
 };
 pub const ACTION_BITS: u6 = 8;
 
@@ -102,7 +156,8 @@ pub const ProviderRow = struct {
 pub const State = struct {
     wizard_open: bool = false,
     wizard_mode: WizardMode = .add,
-    wizard_step: WizardStep = .form,
+    wizard_method: WizardMethod = .ssh,
+    wizard_step: WizardStep = .method,
     /// Profile being edited, or the profile just created by the wizard.
     wizard_profile_id: ?[]u8 = null,
     label_storage: [LABEL_CAPACITY + 1:0]u8 = std.mem.zeroes([LABEL_CAPACITY + 1:0]u8),
@@ -115,6 +170,29 @@ pub const State = struct {
     ssh_port_cursor: usize = 0,
     gateway_port_storage: [PORT_CAPACITY + 1:0]u8 = std.mem.zeroes([PORT_CAPACITY + 1:0]u8),
     gateway_port_cursor: usize = 0,
+    grant_id_storage: [GRANT_ID_CAPACITY + 1:0]u8 = std.mem.zeroes([GRANT_ID_CAPACITY + 1:0]u8),
+    grant_id_cursor: usize = 0,
+    /// One-time pairing code. Rendered masked, wiped with `secureZero` as
+    /// soon as the exchange starts or the wizard closes; never logged.
+    pairing_code_storage: [PAIRING_CODE_CAPACITY + 1:0]u8 = std.mem.zeroes([PAIRING_CODE_CAPACITY + 1:0]u8),
+    pairing_code_cursor: usize = 0,
+    device_label_storage: [DEVICE_LABEL_CAPACITY + 1:0]u8 = std.mem.zeroes([DEVICE_LABEL_CAPACITY + 1:0]u8),
+    device_label_cursor: usize = 0,
+    control_plane_url_storage: [URL_CAPACITY + 1:0]u8 = std.mem.zeroes([URL_CAPACITY + 1:0]u8),
+    control_plane_url_cursor: usize = 0,
+    /// True once `beginPairing` accepted the grant; the poll advances to
+    /// confirmation or reports the failure.
+    pairing_exchange_started: bool = false,
+    /// Live Connect session for the wizard's control-plane step.
+    connect_session: ?*connect_client.Session = null,
+    connect_phase: connect_client.Phase = .idle,
+    connect_failure: ?connect_client.Failure = null,
+    connect_login_open: bool = false,
+    connect_device_flow_advertised: bool = false,
+    connect_issuer: ?[]u8 = null,
+    connect_runtimes: std.ArrayList(ConnectRuntimeRow) = .empty,
+    connect_runtimes_truncated: usize = 0,
+    connect_selected: ?usize = null,
     wizard_notice_storage: [NOTICE_CAPACITY:0]u8 = std.mem.zeroes([NOTICE_CAPACITY:0]u8),
     /// Remove requires a second explicit click on the same row.
     remove_confirm_profile_id: ?[]u8 = null,
@@ -140,7 +218,15 @@ pub const State = struct {
         clearReadinessRows(self, allocator);
         self.repositories.deinit(allocator);
         self.providers.deinit(allocator);
+        destroyConnectSession(self, allocator);
+        self.connect_runtimes.deinit(allocator);
+        std.crypto.secureZero(u8, &self.pairing_code_storage);
         self.* = undefined;
+    }
+
+    pub fn connectRuntimeAt(self: *const State, index: usize) ?*const ConnectRuntimeRow {
+        if (index >= self.connect_runtimes.items.len) return null;
+        return &self.connect_runtimes.items[index];
     }
 
     pub fn wizardNotice(self: *const State) []const u8 {
@@ -158,6 +244,10 @@ pub const State = struct {
             .user => std.mem.sliceTo(self.user_storage[0..], 0),
             .ssh_port => std.mem.sliceTo(self.ssh_port_storage[0..], 0),
             .gateway_port => std.mem.sliceTo(self.gateway_port_storage[0..], 0),
+            .grant_id => std.mem.sliceTo(self.grant_id_storage[0..], 0),
+            .pairing_code => std.mem.sliceTo(self.pairing_code_storage[0..], 0),
+            .device_label => std.mem.sliceTo(self.device_label_storage[0..], 0),
+            .control_plane_url => std.mem.sliceTo(self.control_plane_url_storage[0..], 0),
         };
     }
 
@@ -168,6 +258,10 @@ pub const State = struct {
             .user => self.user_storage[0..self.user_storage.len :0],
             .ssh_port => self.ssh_port_storage[0..self.ssh_port_storage.len :0],
             .gateway_port => self.gateway_port_storage[0..self.gateway_port_storage.len :0],
+            .grant_id => self.grant_id_storage[0..self.grant_id_storage.len :0],
+            .pairing_code => self.pairing_code_storage[0..self.pairing_code_storage.len :0],
+            .device_label => self.device_label_storage[0..self.device_label_storage.len :0],
+            .control_plane_url => self.control_plane_url_storage[0..self.control_plane_url_storage.len :0],
         };
     }
 
@@ -178,6 +272,20 @@ pub const State = struct {
             .user => &self.user_cursor,
             .ssh_port => &self.ssh_port_cursor,
             .gateway_port => &self.gateway_port_cursor,
+            .grant_id => &self.grant_id_cursor,
+            .pairing_code => &self.pairing_code_cursor,
+            .device_label => &self.device_label_cursor,
+            .control_plane_url => &self.control_plane_url_cursor,
+        };
+    }
+
+    /// Fields visible on the current step, in Tab order.
+    pub fn visibleFields(self: *const State) []const WizardField {
+        return switch (self.wizard_step) {
+            .form => &.{ .label, .host, .user, .ssh_port, .gateway_port },
+            .pair_grant => &.{ .grant_id, .pairing_code, .device_label },
+            .connect_setup => &.{ .label, .control_plane_url },
+            .method, .testing, .pair_confirm => &.{},
         };
     }
 
@@ -216,6 +324,32 @@ pub fn validateWizardForm(state: *const State) ?ValidationError {
     return null;
 }
 
+/// Pair step validation against the shared access-protocol rules.
+pub fn validatePairGrantForm(state: *const State) ?ValidationError {
+    access_protocol.validateGrantId(state.fieldValue(.grant_id)) catch {
+        return .{ .field = .grant_id, .message = "Grant id is the 32-character hex id printed by `verde-daemon pair create`." };
+    };
+    access_protocol.validateSecret(state.fieldValue(.pairing_code)) catch {
+        return .{ .field = .pairing_code, .message = "Pairing code is the 64-character hex secret from the same grant." };
+    };
+    access_protocol.validateDeviceLabel(state.fieldValue(.device_label)) catch {
+        return .{ .field = .device_label, .message = "Device label is 1–128 printable characters shown in the runtime's device list." };
+    };
+    return null;
+}
+
+/// Connect step validation: name plus a bare https:// control-plane URL.
+pub fn validateConnectForm(state: *const State) ?ValidationError {
+    profile.validateLabel(state.fieldValue(.label)) catch {
+        return .{ .field = .label, .message = "Enter a name (1–80 printable characters)." };
+    };
+    const trimmed = std.mem.trim(u8, state.fieldValue(.control_plane_url), &std.ascii.whitespace);
+    profile.validateHttpsUrl(trimmed) catch {
+        return .{ .field = .control_plane_url, .message = "Enter the control plane as https://host[:port] with no credentials, query, or fragment." };
+    };
+    return null;
+}
+
 /// Empty means the documented default; anything else must be a valid port.
 pub fn parsePort(value: []const u8, default: u16) ?u16 {
     const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
@@ -251,20 +385,42 @@ pub fn wizardSshInput(state: *const State) profile.SshTunnelInput {
 // Wizard lifecycle (self is *AppState)
 // ---------------------------------------------------------------------------
 
-/// Opens the wizard for a new runtime. Any prior draft is discarded.
+/// Opens the wizard for a new runtime at the method chooser. Any prior draft
+/// is discarded.
 pub fn openRuntimeConnectionWizard(self: anytype) void {
     const rc = &self.runtime_connections;
     resetWizardFields(rc);
+    destroyConnectSession(rc, self.allocator);
     setWizardProfileId(self, null);
     rc.wizard_mode = .add;
-    rc.wizard_step = .form;
+    rc.wizard_method = .ssh;
+    rc.wizard_step = .method;
     rc.wizard_open = true;
     setNotice(&rc.wizard_notice_storage, "");
     self.closePaletteRuntimePicker();
     self.closePaletteModelPicker();
     self.closePaletteDirectoryPicker();
     self.closeRunConfigPopover();
-    focusWizardField(self, .label);
+    blurWizardField(self);
+}
+
+/// Method chooser selection: moves to that method's first input step.
+pub fn chooseRuntimeWizardMethod(self: anytype, method: WizardMethod) void {
+    const rc = &self.runtime_connections;
+    if (!rc.wizard_open or rc.wizard_step != .method) return;
+    rc.wizard_method = method;
+    setNotice(&rc.wizard_notice_storage, "");
+    switch (method) {
+        .ssh, .pair => {
+            rc.wizard_step = .form;
+            focusWizardField(self, .label);
+        },
+        .connect => {
+            rc.wizard_step = .connect_setup;
+            focusWizardField(self, .label);
+        },
+    }
+    self.markDirty();
 }
 
 /// Opens the wizard pre-filled with a saved profile's non-secret fields.
@@ -276,7 +432,14 @@ pub fn openRuntimeConnectionEditor(self: anytype, profile_id: []const u8) void {
     };
     const rc = &self.runtime_connections;
     resetWizardFields(rc);
+    destroyConnectSession(rc, self.allocator);
     fillZ(&rc.label_storage, configured.label);
+    rc.wizard_method = switch (configured.access) {
+        .admin_token => .ssh,
+        .paired_device => .pair,
+        .connect => .connect,
+    };
+    rc.wizard_step = .form;
     switch (configured.transport) {
         .ssh_tunnel => |ssh| {
             fillZ(&rc.host_storage, ssh.host);
@@ -285,25 +448,51 @@ pub fn openRuntimeConnectionEditor(self: anytype, profile_id: []const u8) void {
             fillZ(&rc.ssh_port_storage, std.fmt.bufPrint(&port_buf, "{d}", .{ssh.port}) catch "");
             fillZ(&rc.gateway_port_storage, std.fmt.bufPrint(&port_buf, "{d}", .{ssh.remote_gateway_port}) catch "");
         },
+        .connect => {
+            fillZ(&rc.control_plane_url_storage, configured.access.connect.control_plane_url);
+            rc.wizard_step = .connect_setup;
+        },
         .local_socket => {},
     }
-    rc.label_cursor = rc.fieldValue(.label).len;
-    rc.host_cursor = rc.fieldValue(.host).len;
-    rc.user_cursor = rc.fieldValue(.user).len;
-    rc.ssh_port_cursor = rc.fieldValue(.ssh_port).len;
-    rc.gateway_port_cursor = rc.fieldValue(.gateway_port).len;
+    inline for (.{ .label, .host, .user, .ssh_port, .gateway_port, .control_plane_url }) |field| {
+        rc.fieldCursor(field).* = rc.fieldValue(field).len;
+    }
     setWizardProfileId(self, profile_id);
     rc.wizard_mode = .edit;
-    rc.wizard_step = .form;
     rc.wizard_open = true;
     setNotice(&rc.wizard_notice_storage, "");
     focusWizardField(self, .label);
 }
 
+/// Opens the grant step for an existing paired profile (first pairing or a
+/// re-pair that replaces the device).
+pub fn openRuntimePairing(self: anytype, profile_id: []const u8) void {
+    const service = self.runtime_service orelse return;
+    const configured = service.runtime_manager.profileConst(profile_id) orelse {
+        self.setSidebarNotice("That runtime is no longer configured.");
+        return;
+    };
+    if (configured.access != .paired_device) return;
+    const rc = &self.runtime_connections;
+    resetWizardFields(rc);
+    destroyConnectSession(rc, self.allocator);
+    setWizardProfileId(self, profile_id);
+    rc.wizard_mode = .edit;
+    rc.wizard_method = .pair;
+    rc.wizard_open = true;
+    enterPairGrantStep(self, if (configured.access.paired_device.isPaired())
+        "Re-pairing replaces this device's credential. Revoke the old device on the runtime afterwards."
+    else
+        "");
+    self.closePaletteRuntimePicker();
+}
+
 pub fn cancelRuntimeConnectionWizard(self: anytype) void {
     const rc = &self.runtime_connections;
+    abandonWizardPairing(self);
+    destroyConnectSession(rc, self.allocator);
     rc.wizard_open = false;
-    rc.wizard_step = .form;
+    rc.wizard_step = .method;
     resetWizardFields(rc);
     setWizardProfileId(self, null);
     setNotice(&rc.wizard_notice_storage, "");
@@ -311,24 +500,60 @@ pub fn cancelRuntimeConnectionWizard(self: anytype) void {
     self.markDirty();
 }
 
-/// From the connect step, returns to the form to edit the saved profile.
+/// Back/Edit button: one step towards the beginning without losing the
+/// saved profile.
 pub fn runtimeConnectionWizardBack(self: anytype) void {
     const rc = &self.runtime_connections;
-    if (rc.wizard_step != .testing) return;
-    const profile_id = rc.wizard_profile_id orelse {
-        rc.wizard_step = .form;
-        return;
-    };
-    const owned = self.allocator.dupe(u8, profile_id) catch return;
-    defer self.allocator.free(owned);
-    openRuntimeConnectionEditor(self, owned);
+    switch (rc.wizard_step) {
+        .method => {},
+        .form, .connect_setup => {
+            if (rc.wizard_mode == .add and rc.wizard_profile_id == null) {
+                destroyConnectSession(rc, self.allocator);
+                rc.wizard_step = .method;
+                setNotice(&rc.wizard_notice_storage, "");
+                blurWizardField(self);
+            }
+        },
+        .testing => {
+            const profile_id = rc.wizard_profile_id orelse {
+                rc.wizard_step = .method;
+                return;
+            };
+            const owned = self.allocator.dupe(u8, profile_id) catch return;
+            defer self.allocator.free(owned);
+            openRuntimeConnectionEditor(self, owned);
+        },
+        .pair_grant => {
+            abandonWizardPairing(self);
+            rc.wizard_step = .testing;
+            blurWizardField(self);
+        },
+        .pair_confirm => {
+            // Declining the identity wipes the exchanged credential; the
+            // runtime still lists the device until revoked there.
+            abandonWizardPairing(self);
+            enterPairGrantStep(self, "Pairing canceled. The runtime may still list this device; revoke it there, then mint a new grant.");
+        },
+    }
+    self.markDirty();
 }
 
-/// Validates, persists through the shared service, and advances to the
-/// connect step. Never touches bearer material.
+/// Primary button: validates the current step, persists through the shared
+/// service, and advances. Never touches a runtime bearer.
 pub fn submitRuntimeConnectionWizard(self: anytype) void {
     const rc = &self.runtime_connections;
-    if (!rc.wizard_open or rc.wizard_step != .form) return;
+    if (!rc.wizard_open) return;
+    switch (rc.wizard_step) {
+        .form => submitEndpointForm(self),
+        .pair_grant => submitPairGrant(self),
+        .pair_confirm => confirmPairing(self),
+        .connect_setup => submitConnectSetup(self),
+        .method, .testing => {},
+    }
+}
+
+fn submitEndpointForm(self: anytype) void {
+    const rc = &self.runtime_connections;
     if (validateWizardForm(rc)) |failure| {
         setNotice(&rc.wizard_notice_storage, failure.message);
         focusWizardField(self, failure.field);
@@ -345,7 +570,10 @@ pub fn submitRuntimeConnectionWizard(self: anytype) void {
     };
     switch (rc.wizard_mode) {
         .add => {
-            const id = service.createSshProfile(self.allocator, input) catch |err| {
+            const id = (if (rc.wizard_method == .pair)
+                service.createPairedProfile(self.allocator, input)
+            else
+                service.createSshProfile(self.allocator, input)) catch |err| {
                 setNotice(&rc.wizard_notice_storage, saveFailureMessage(err));
                 log.warn("runtime profile create failed: {s}", .{@errorName(err)});
                 self.markDirty();
@@ -356,6 +584,12 @@ pub fn submitRuntimeConnectionWizard(self: anytype) void {
                 log.warn("runtime picker append failed: {s}", .{@errorName(err)});
             };
             setWizardProfileId(self, id);
+            self.syncPaletteRuntimePicker();
+            if (rc.wizard_method == .pair) {
+                enterPairGrantStep(self, "Saved. Enter the one-time grant from `verde-daemon pair create` on the runtime host.");
+                self.markDirty();
+                return;
+            }
             setNotice(&rc.wizard_notice_storage, "Saved. Connect to verify the daemon identity.");
         },
         .edit => {
@@ -379,10 +613,214 @@ pub fn submitRuntimeConnectionWizard(self: anytype) void {
     self.markDirty();
 }
 
-/// Connect/retry from the wizard's connect step.
+fn enterPairGrantStep(self: anytype, notice: []const u8) void {
+    const rc = &self.runtime_connections;
+    rc.wizard_step = .pair_grant;
+    rc.pairing_exchange_started = false;
+    setNotice(&rc.wizard_notice_storage, notice);
+    focusWizardField(self, .grant_id);
+}
+
+/// Hands the grant to the manager and wipes the local copy of the code.
+fn submitPairGrant(self: anytype) void {
+    const rc = &self.runtime_connections;
+    if (rc.pairing_exchange_started) return;
+    if (validatePairGrantForm(rc)) |failure| {
+        setNotice(&rc.wizard_notice_storage, failure.message);
+        focusWizardField(self, failure.field);
+        self.markDirty();
+        return;
+    }
+    const service = self.runtime_service orelse {
+        setNotice(&rc.wizard_notice_storage, "Runtime service is unavailable.");
+        return;
+    };
+    const profile_id = rc.wizard_profile_id orelse return;
+    service.beginPairing(profile_id, .{
+        .grant_id = rc.fieldValue(.grant_id),
+        .pairing_token = rc.fieldValue(.pairing_code),
+        .device_label = rc.fieldValue(.device_label),
+    }, self.runtimeNowMs()) catch |err| {
+        setNotice(&rc.wizard_notice_storage, pairingFailureMessage(err));
+        log.warn("pairing start failed: {s}", .{@errorName(err)});
+        self.markDirty();
+        return;
+    };
+    std.crypto.secureZero(u8, &rc.pairing_code_storage);
+    rc.pairing_code_cursor = 0;
+    rc.pairing_exchange_started = true;
+    invalidateReadiness(self, profile_id);
+    setNotice(&rc.wizard_notice_storage, "Exchanging the grant over SSH…");
+    blurWizardField(self);
+    self.markDirty();
+}
+
+/// Persists the device reference plus the exchanged identity pin and starts
+/// the first authenticated connection.
+fn confirmPairing(self: anytype) void {
+    const rc = &self.runtime_connections;
+    const service = self.runtime_service orelse return;
+    const profile_id = rc.wizard_profile_id orelse return;
+    const commit = service.commitPairing(profile_id, self.runtimeNowMs()) catch |err| {
+        setNotice(&rc.wizard_notice_storage, pairingFailureMessage(err));
+        log.warn("pairing commit failed: {s}", .{@errorName(err)});
+        self.markDirty();
+        return;
+    };
+    rc.pairing_exchange_started = false;
+    rc.wizard_step = .testing;
+    setNotice(&rc.wizard_notice_storage, if (commit.durable)
+        "Device paired. The credential is stored in the OS keyring by reference; the profile file holds no secret."
+    else
+        "Device paired for this session only: no OS keyring is available, so you must pair again after relaunch.");
+    invalidateReadiness(self, profile_id);
+    self.syncPaletteRuntimePicker();
+    self.markDirty();
+}
+
+fn abandonWizardPairing(self: anytype) void {
+    const rc = &self.runtime_connections;
+    if (!rc.pairing_exchange_started) return;
+    rc.pairing_exchange_started = false;
+    const service = self.runtime_service orelse return;
+    const profile_id = rc.wizard_profile_id orelse return;
+    service.abandonPairing(profile_id) catch |err| {
+        log.warn("pairing abandon failed: {s}", .{@errorName(err)});
+    };
+}
+
+/// Connect step primary action, driven by the session phase: save and
+/// discover, sign in, then adopt the selected runtime.
+fn submitConnectSetup(self: anytype) void {
+    const rc = &self.runtime_connections;
+    const service = self.runtime_service orelse {
+        setNotice(&rc.wizard_notice_storage, "Runtime service is unavailable.");
+        return;
+    };
+    if (rc.connect_session == null or rc.connect_phase == .failed or rc.connect_phase == .idle) {
+        if (validateConnectForm(rc)) |failure| {
+            setNotice(&rc.wizard_notice_storage, failure.message);
+            focusWizardField(self, failure.field);
+            self.markDirty();
+            return;
+        }
+        const url = std.mem.trim(u8, rc.fieldValue(.control_plane_url), &std.ascii.whitespace);
+        if (rc.wizard_profile_id) |profile_id| {
+            const replacement = service.updateConnectProfile(profile_id, rc.fieldValue(.label), url) catch |err| {
+                setNotice(&rc.wizard_notice_storage, saveFailureMessage(err));
+                self.markDirty();
+                return;
+            };
+            if (replacement == .endpoint_changed) invalidateReadiness(self, profile_id);
+        } else {
+            const id = service.createConnectProfile(self.allocator, rc.fieldValue(.label), url) catch |err| {
+                setNotice(&rc.wizard_notice_storage, saveFailureMessage(err));
+                log.warn("connect profile create failed: {s}", .{@errorName(err)});
+                self.markDirty();
+                return;
+            };
+            defer self.allocator.free(id);
+            self.appendRuntimePickerProfile(id) catch |err| {
+                log.warn("runtime picker append failed: {s}", .{@errorName(err)});
+            };
+            setWizardProfileId(self, id);
+            self.syncPaletteRuntimePicker();
+        }
+        destroyConnectSession(rc, self.allocator);
+        rc.connect_session = connect_client.Session.start(self.allocator, url) catch |err| {
+            setNotice(&rc.wizard_notice_storage, if (err == error.OutOfMemory) "Out of memory." else "Enter the control plane as https://host[:port].");
+            self.markDirty();
+            return;
+        };
+        rc.connect_phase = .discovering;
+        rc.connect_failure = null;
+        setNotice(&rc.wizard_notice_storage, "Saved. Checking the control plane's discovery document…");
+        blurWizardField(self);
+        self.markDirty();
+        return;
+    }
+    const session = rc.connect_session.?;
+    switch (rc.connect_phase) {
+        .discovered => {
+            if (session.signIn()) {
+                rc.connect_phase = .signing_in;
+                setNotice(&rc.wizard_notice_storage, "Opening the system browser for sign-in (PKCE, loopback redirect)…");
+            }
+        },
+        .signed_in => {
+            if (session.loadInventory()) rc.connect_phase = .loading_inventory;
+        },
+        .inventory_loaded => adoptSelectedConnectRuntime(self, service),
+        .discovering, .signing_in, .loading_inventory, .idle, .failed => {},
+    }
+    self.markDirty();
+}
+
+fn adoptSelectedConnectRuntime(self: anytype, service: *RuntimeService) void {
+    const rc = &self.runtime_connections;
+    const profile_id = rc.wizard_profile_id orelse return;
+    const index = rc.connect_selected orelse {
+        setNotice(&rc.wizard_notice_storage, "Select a linked runtime first.");
+        return;
+    };
+    const row = rc.connectRuntimeAt(index) orelse return;
+    service.selectConnectRuntime(profile_id, .{
+        .link_id = row.link_id,
+        .runtime_id = row.runtime_id,
+        .instance_id = row.instance_id,
+        .https_url = row.https_url,
+        .wss_url = row.wss_url,
+        .spki_sha256 = row.spki_sha256,
+    }) catch |err| {
+        setNotice(&rc.wizard_notice_storage, saveFailureMessage(err));
+        log.warn("connect runtime selection failed: {s}", .{@errorName(err)});
+        return;
+    };
+    destroyConnectSession(rc, self.allocator);
+    invalidateReadiness(self, profile_id);
+    rc.wizard_step = .testing;
+    setNotice(&rc.wizard_notice_storage, "Runtime endpoint and SPKI pin saved. The OIDC session was discarded.");
+    blurWizardField(self);
+    self.syncPaletteRuntimePicker();
+}
+
+/// Selects one inventory row on the Connect step.
+pub fn selectRuntimeWizardConnectRuntime(self: anytype, index: usize) void {
+    const rc = &self.runtime_connections;
+    if (rc.wizard_step != .connect_setup or rc.connectRuntimeAt(index) == null) return;
+    rc.connect_selected = index;
+    self.markDirty();
+}
+
+/// Middle button: connect/retry on the status step, decline on pairing
+/// confirmation, sign out on the Connect step.
 pub fn runtimeConnectionWizardConnect(self: anytype) void {
-    const profile_id = self.runtime_connections.wizard_profile_id orelse return;
-    self.connectRuntimeProfileFromPicker(profile_id);
+    const rc = &self.runtime_connections;
+    switch (rc.wizard_step) {
+        .testing => {
+            const profile_id = rc.wizard_profile_id orelse return;
+            if (self.runtime_service) |service| {
+                if (service.runtime_manager.profileConst(profile_id)) |configured| {
+                    if (configured.access == .paired_device and !configured.access.paired_device.isPaired()) {
+                        enterPairGrantStep(self, "");
+                        self.markDirty();
+                        return;
+                    }
+                }
+            }
+            self.connectRuntimeProfileFromPicker(profile_id);
+        },
+        .pair_confirm => runtimeConnectionWizardBack(self),
+        .connect_setup => {
+            if (rc.connect_session) |session| {
+                session.signOut();
+                clearConnectRuntimes(rc, self.allocator);
+                rc.connect_phase = .discovered;
+                setNotice(&rc.wizard_notice_storage, "Signed out. The OIDC token was wiped from memory.");
+            }
+        },
+        .method, .form, .pair_grant => {},
+    }
     self.markDirty();
 }
 
@@ -393,41 +831,198 @@ pub fn focusWizardField(self: anytype, field: WizardField) void {
         .user => .runtime_wizard_user,
         .ssh_port => .runtime_wizard_ssh_port,
         .gateway_port => .runtime_wizard_gateway_port,
+        .grant_id => .runtime_wizard_grant_id,
+        .pairing_code => .runtime_wizard_pairing_code,
+        .device_label => .runtime_wizard_device_label,
+        .control_plane_url => .runtime_wizard_control_plane_url,
     };
     self.modal_text_selection_anchor = null;
     self.modal_text_drag_active = false;
 }
 
-/// Tab / Shift+Tab order through the form.
-pub fn cycleWizardField(self: anytype, backwards: bool) void {
-    const current: ?WizardField = switch (self.palette_modal_text_focus) {
+pub fn focusedWizardField(focus: anytype) ?WizardField {
+    return switch (focus) {
         .runtime_wizard_label => .label,
         .runtime_wizard_host => .host,
         .runtime_wizard_user => .user,
         .runtime_wizard_ssh_port => .ssh_port,
         .runtime_wizard_gateway_port => .gateway_port,
+        .runtime_wizard_grant_id => .grant_id,
+        .runtime_wizard_pairing_code => .pairing_code,
+        .runtime_wizard_device_label => .device_label,
+        .runtime_wizard_control_plane_url => .control_plane_url,
         else => null,
     };
-    const fields = [_]WizardField{ .label, .host, .user, .ssh_port, .gateway_port };
-    const index: usize = if (current) |value| @intFromEnum(value) else if (backwards) 0 else fields.len - 1;
-    const next = if (backwards) (index + fields.len - 1) % fields.len else (index + 1) % fields.len;
+}
+
+/// Tab / Shift+Tab order through the current step's fields.
+pub fn cycleWizardField(self: anytype, backwards: bool) void {
+    const rc = &self.runtime_connections;
+    const fields = rc.visibleFields();
+    if (fields.len == 0) return;
+    const current = focusedWizardField(self.palette_modal_text_focus);
+    var index: ?usize = null;
+    if (current) |value| {
+        for (fields, 0..) |candidate, position| if (candidate == value) {
+            index = position;
+        };
+    }
+    const next = if (index) |position|
+        (if (backwards) (position + fields.len - 1) % fields.len else (position + 1) % fields.len)
+    else if (backwards) fields.len - 1 else 0;
     focusWizardField(self, fields[next]);
 }
 
 fn blurWizardField(self: anytype) void {
-    switch (self.palette_modal_text_focus) {
-        .runtime_wizard_label,
-        .runtime_wizard_host,
-        .runtime_wizard_user,
-        .runtime_wizard_ssh_port,
-        .runtime_wizard_gateway_port,
-        => {
-            self.palette_modal_text_focus = .none;
-            self.modal_text_selection_anchor = null;
-            self.modal_text_drag_active = false;
-        },
-        else => {},
+    if (focusedWizardField(self.palette_modal_text_focus) == null) return;
+    self.palette_modal_text_focus = .none;
+    self.modal_text_selection_anchor = null;
+    self.modal_text_drag_active = false;
+}
+
+// ---------------------------------------------------------------------------
+// Wizard polling: pairing exchange progress and the Connect session
+// ---------------------------------------------------------------------------
+
+/// Advances the open wizard from background progress. Returns true on change.
+pub fn pollRuntimeConnectionWizard(self: anytype) bool {
+    const rc = &self.runtime_connections;
+    if (!rc.wizard_open) return false;
+    return switch (rc.wizard_step) {
+        .pair_grant => pollPairingExchange(self),
+        .connect_setup => pollConnectSession(self),
+        else => false,
+    };
+}
+
+fn pollPairingExchange(self: anytype) bool {
+    const rc = &self.runtime_connections;
+    if (!rc.pairing_exchange_started) return false;
+    const service = self.runtime_service orelse return false;
+    const profile_id = rc.wizard_profile_id orelse return false;
+    const snapshot = service.snapshot(profile_id) orelse return false;
+    if (snapshot.pairing_state == .awaiting_confirmation) {
+        rc.wizard_step = .pair_confirm;
+        setNotice(&rc.wizard_notice_storage, "Compare both IDs with `verde-daemon identity` on the runtime host before confirming.");
+        blurWizardField(self);
+        return true;
     }
+    if (snapshot.phase == .disabled or snapshot.phase == .failed) {
+        rc.pairing_exchange_started = false;
+        setNotice(&rc.wizard_notice_storage, if (snapshot.failure) |failure| pairingSnapshotFailureMessage(failure) else "The exchange stopped before completing. Try again.");
+        focusWizardField(self, .grant_id);
+        return true;
+    }
+    return false;
+}
+
+fn pollConnectSession(self: anytype) bool {
+    const rc = &self.runtime_connections;
+    const session = rc.connect_session orelse return false;
+    const snapshot = session.poll();
+    var changed = snapshot.phase != rc.connect_phase or snapshot.failure != rc.connect_failure or snapshot.login_url_open != rc.connect_login_open;
+    rc.connect_phase = snapshot.phase;
+    rc.connect_failure = snapshot.failure;
+    rc.connect_login_open = snapshot.login_url_open;
+    rc.connect_device_flow_advertised = snapshot.device_flow_advertised;
+    if (!optionalStringsEqual(rc.connect_issuer, snapshot.issuer)) {
+        if (rc.connect_issuer) |value| self.allocator.free(value);
+        rc.connect_issuer = if (snapshot.issuer) |value| self.allocator.dupe(u8, value) catch null else null;
+        changed = true;
+    }
+    if (snapshot.runtimes.len != rc.connect_runtimes.items.len or snapshot.runtimes_truncated != rc.connect_runtimes_truncated) {
+        clearConnectRuntimes(rc, self.allocator);
+        for (snapshot.runtimes) |row| {
+            const copy = ConnectRuntimeRow.clone(self.allocator, row) catch break;
+            rc.connect_runtimes.append(self.allocator, copy) catch {
+                var owned = copy;
+                owned.deinit(self.allocator);
+                break;
+            };
+        }
+        rc.connect_runtimes_truncated = snapshot.runtimes_truncated;
+        if (rc.connect_runtimes.items.len == 1) rc.connect_selected = 0;
+        changed = true;
+    }
+    if (changed) {
+        if (snapshot.failure) |failure| {
+            setNotice(&rc.wizard_notice_storage, failure.message());
+        } else switch (snapshot.phase) {
+            .discovered => setNotice(&rc.wizard_notice_storage, "Discovery verified. Sign in with the control plane's identity provider to list your runtimes."),
+            .signed_in => {
+                // Inventory needs no further user input; fetch it right away.
+                if (session.loadInventory()) rc.connect_phase = .loading_inventory;
+                setNotice(&rc.wizard_notice_storage, "Signed in. Loading linked runtimes…");
+            },
+            .inventory_loaded => setNotice(&rc.wizard_notice_storage, if (rc.connect_runtimes.items.len == 0)
+                "No runtimes are linked to this account yet. Link one with `verde-daemon connect link` on the runtime host."
+            else
+                "Select the runtime to use with this profile."),
+            .signing_in => {},
+            .discovering, .loading_inventory, .idle, .failed => {},
+        }
+    }
+    return changed;
+}
+
+/// UI copy of one inventory row so rendering never borrows worker memory.
+pub const ConnectRuntimeRow = struct {
+    link_id: []u8,
+    runtime_id: []u8,
+    instance_id: []u8,
+    https_url: []u8,
+    wss_url: []u8,
+    spki_sha256: []u8,
+
+    fn clone(allocator: std.mem.Allocator, row: connect_client.RuntimeRow) !ConnectRuntimeRow {
+        var out: ConnectRuntimeRow = undefined;
+        out.link_id = try allocator.dupe(u8, row.link_id);
+        errdefer allocator.free(out.link_id);
+        out.runtime_id = try allocator.dupe(u8, row.runtime_id);
+        errdefer allocator.free(out.runtime_id);
+        out.instance_id = try allocator.dupe(u8, row.instance_id);
+        errdefer allocator.free(out.instance_id);
+        out.https_url = try allocator.dupe(u8, row.https_url);
+        errdefer allocator.free(out.https_url);
+        out.wss_url = try allocator.dupe(u8, row.wss_url);
+        errdefer allocator.free(out.wss_url);
+        out.spki_sha256 = try allocator.dupe(u8, row.spki_sha256);
+        return out;
+    }
+
+    fn deinit(self: *ConnectRuntimeRow, allocator: std.mem.Allocator) void {
+        allocator.free(self.link_id);
+        allocator.free(self.runtime_id);
+        allocator.free(self.instance_id);
+        allocator.free(self.https_url);
+        allocator.free(self.wss_url);
+        allocator.free(self.spki_sha256);
+        self.* = undefined;
+    }
+};
+
+fn clearConnectRuntimes(rc: *State, allocator: std.mem.Allocator) void {
+    for (rc.connect_runtimes.items) |*row| row.deinit(allocator);
+    rc.connect_runtimes.clearRetainingCapacity();
+    rc.connect_runtimes_truncated = 0;
+    rc.connect_selected = null;
+}
+
+fn destroyConnectSession(rc: *State, allocator: std.mem.Allocator) void {
+    if (rc.connect_session) |session| session.destroy();
+    rc.connect_session = null;
+    rc.connect_phase = .idle;
+    rc.connect_failure = null;
+    rc.connect_login_open = false;
+    rc.connect_device_flow_advertised = false;
+    if (rc.connect_issuer) |value| allocator.free(value);
+    rc.connect_issuer = null;
+    clearConnectRuntimes(rc, allocator);
+}
+
+fn optionalStringsEqual(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
 }
 
 // ---------------------------------------------------------------------------
@@ -479,6 +1074,21 @@ pub fn applyRuntimeRowAction(self: anytype, index: usize) void {
                 "Credential forgotten; connection cleanup will finish in the background.");
         },
         .edit => openRuntimeConnectionEditor(self, profile_id),
+        .forget_device => {
+            const held = service.forgetDevice(profile_id) catch |err| {
+                log.warn("forget device failed: {s}", .{@errorName(err)});
+                setNotice(&rc.card_notice_storage, "Could not forget the paired device.");
+                return;
+            };
+            invalidateReadiness(self, profile_id);
+            self.syncPaletteRuntimePicker();
+            setNotice(&rc.card_notice_storage, if (held)
+                "Device forgotten and its credential deleted here. Revoke the device on the runtime to finish."
+            else
+                "Device reference forgotten. Revoke the device on the runtime to finish.");
+        },
+        .pair_device => openRuntimePairing(self, profile_id),
+        .choose_runtime => openRuntimeConnectionEditor(self, profile_id),
         .remove => {
             if (rc.remove_confirm_profile_id) |pending| self.allocator.free(pending);
             rc.remove_confirm_profile_id = self.allocator.dupe(u8, profile_id) catch null;
@@ -841,10 +1451,39 @@ fn saveFailureMessage(err: anyerror) []const u8 {
         error.InvalidSshHost => "Enter an SSH alias, hostname, or IP without spaces or shell characters.",
         error.InvalidSshUser => "SSH user may contain letters, digits, '_', '-', and '.'.",
         error.InvalidPort => "Ports must be 1–65535.",
+        error.InvalidUrl, error.UrlTooLong => "Enter the control plane as https://host[:port] with no credentials, query, or fragment.",
         error.TooManyProfiles => "The runtime list is full (64).",
         error.UnknownRuntimeProfile => "That runtime no longer exists in the profile store.",
+        error.ProfileAccessMismatch => "That runtime uses a different access method.",
         error.WouldBlock, error.Locked => "Another Verde process is editing runtimes. Try again.",
         else => "Could not save the runtime profile.",
+    };
+}
+
+fn pairingFailureMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.InvalidGrantId, error.InvalidAccessSecret, error.DeviceLabelRequired, error.DeviceLabelTooLong, error.InvalidDeviceLabel => "Check the grant id, pairing code, and device label.",
+        error.UnsupportedRuntimeTransport => "Pairing needs an SSH-forwarded runtime.",
+        error.ProfileAccessMismatch => "That runtime uses a different access method.",
+        error.PairingNotConfirmed, error.PairingGrantMissing => "The exchange has not completed yet.",
+        error.PairingIdentityMismatch => "The runtime's identity differs from the saved pin. Forget the device or edit the connection before re-pairing.",
+        error.MissingRuntimeCredential => "The exchanged credential was lost. Pair again with a new grant.",
+        error.UnknownRuntimeProfile => "That runtime no longer exists in the profile store.",
+        error.WouldBlock, error.Locked => "Another Verde process is editing runtimes. Try again.",
+        else => "Pairing could not be started.",
+    };
+}
+
+fn pairingSnapshotFailureMessage(failure: @import("../runtime/manager.zig").Failure) []const u8 {
+    return switch (failure) {
+        .pairing_rejected => "The runtime refused this grant (expired, revoked, or already used). Mint a new one with `verde-daemon pair create`.",
+        .rate_limited => "The runtime is rate limiting pairing from this device. Wait a minute, then try again.",
+        .identity => "The exchanged runtime identity does not match the saved pin. Edit the connection or forget the device before re-pairing.",
+        .network, .no_loopback_port, .tunnel_spawn, .tunnel_readiness, .tunnel_wait, .tunnel_exited => "The SSH forward to the runtime failed. Check the host, user, and gateway port.",
+        .authentication => "The runtime rejected the exchanged device credential.",
+        .protocol => "The runtime answered with an invalid pairing response.",
+        .resource => "Out of memory while pairing.",
+        .missing_credential, .unsupported_transport => "Pairing needs an SSH-forwarded runtime with a grant.",
     };
 }
 
@@ -854,11 +1493,20 @@ fn resetWizardFields(rc: *State) void {
     @memset(&rc.user_storage, 0);
     @memset(&rc.ssh_port_storage, 0);
     @memset(&rc.gateway_port_storage, 0);
+    @memset(&rc.grant_id_storage, 0);
+    std.crypto.secureZero(u8, &rc.pairing_code_storage);
+    @memset(&rc.device_label_storage, 0);
+    @memset(&rc.control_plane_url_storage, 0);
     rc.label_cursor = 0;
     rc.host_cursor = 0;
     rc.user_cursor = 0;
     rc.ssh_port_cursor = 0;
     rc.gateway_port_cursor = 0;
+    rc.grant_id_cursor = 0;
+    rc.pairing_code_cursor = 0;
+    rc.device_label_cursor = 0;
+    rc.control_plane_url_cursor = 0;
+    rc.pairing_exchange_started = false;
 }
 
 fn setWizardProfileId(self: anytype, profile_id: ?[]const u8) void {
@@ -929,12 +1577,50 @@ test "port text filter drops every non-digit byte" {
 }
 
 test "wizard state never stores bearer material" {
-    // The wizard has fields for label/host/user/ports only; a token field
-    // would need its own zeroing and masking path and must stay in state.zig.
+    // Runtime bearers stay in state.zig's masked credential modal. The only
+    // secret the wizard holds is the one-time pairing code, which has its own
+    // zeroing path (checked below) and is masked when rendered.
     const fields = @typeInfo(State).@"struct".fields;
     inline for (fields) |field| {
         try std.testing.expect(std.mem.indexOf(u8, field.name, "token") == null);
         try std.testing.expect(std.mem.indexOf(u8, field.name, "bearer") == null);
         try std.testing.expect(std.mem.indexOf(u8, field.name, "secret") == null);
     }
+}
+
+test "pair grant validation follows the access protocol and reset wipes the code" {
+    var rc: State = .{};
+    try std.testing.expectEqual(WizardField.grant_id, validatePairGrantForm(&rc).?.field);
+    fillZ(&rc.grant_id_storage, "0123456789abcdef0123456789abcdef");
+    try std.testing.expectEqual(WizardField.pairing_code, validatePairGrantForm(&rc).?.field);
+    fillZ(&rc.pairing_code_storage, "ab" ** 32);
+    try std.testing.expectEqual(WizardField.device_label, validatePairGrantForm(&rc).?.field);
+    fillZ(&rc.device_label_storage, "Laptop");
+    try std.testing.expect(validatePairGrantForm(&rc) == null);
+    rc.pairing_exchange_started = true;
+    resetWizardFields(&rc);
+    try std.testing.expect(!rc.pairing_exchange_started);
+    for (rc.pairing_code_storage) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    try std.testing.expectEqual(@as(usize, 0), rc.fieldValue(.pairing_code).len);
+}
+
+test "connect form validation rejects non-https control planes" {
+    var rc: State = .{};
+    fillZ(&rc.label_storage, "Team plane");
+    fillZ(&rc.control_plane_url_storage, "http://connect.example");
+    try std.testing.expectEqual(WizardField.control_plane_url, validateConnectForm(&rc).?.field);
+    fillZ(&rc.control_plane_url_storage, "https://user@connect.example");
+    try std.testing.expectEqual(WizardField.control_plane_url, validateConnectForm(&rc).?.field);
+    fillZ(&rc.control_plane_url_storage, "  https://connect.example:8443/  ");
+    try std.testing.expect(validateConnectForm(&rc) == null);
+}
+
+test "visible fields follow the wizard step so Tab never reaches hidden inputs" {
+    var rc: State = .{};
+    rc.wizard_step = .method;
+    try std.testing.expectEqual(@as(usize, 0), rc.visibleFields().len);
+    rc.wizard_step = .pair_grant;
+    try std.testing.expectEqualSlices(WizardField, &.{ .grant_id, .pairing_code, .device_label }, rc.visibleFields());
+    rc.wizard_step = .connect_setup;
+    try std.testing.expectEqualSlices(WizardField, &.{ .label, .control_plane_url }, rc.visibleFields());
 }

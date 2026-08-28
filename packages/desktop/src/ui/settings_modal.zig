@@ -2414,11 +2414,20 @@ fn planRuntimeRowButtons(state: *const runtime.AppState, plan: *RuntimeRowPlan, 
     const status = state.runtimeProfileStatus(id);
     switch (status) {
         .offline, .credential_required => pushButton(plan, .connect, "Connect", .primary),
-        .connection_failed, .authentication_failed, .identity_mismatch, .failed => pushButton(plan, .retry, "Retry", .primary),
+        .connection_failed, .authentication_failed, .identity_mismatch, .failed, .rate_limited => pushButton(plan, .retry, "Retry", .primary),
         .connecting, .handshaking, .trust_required, .ready, .limited, .reconnecting => pushButton(plan, .disable, "Disconnect", .secondary),
+        .pairing_required, .pairing_rejected => pushButton(plan, .pair_device, "Pair device", .primary),
+        .runtime_selection_required => pushButton(plan, .choose_runtime, "Choose runtime", .primary),
         .unsupported, .unavailable => {},
     }
-    if (snapshot != null and snapshot.?.credential_held) pushButton(plan, .forget_token, "Forget token", .secondary);
+    if (snapshot) |live| switch (live.access) {
+        .admin_token => if (live.credential_held) pushButton(plan, .forget_token, "Forget token", .secondary),
+        .paired_device => if (live.device_id != null or live.credential_held) {
+            pushButton(plan, .forget_device, "Forget device", .secondary);
+            if (status != .pairing_required and status != .pairing_rejected) pushButton(plan, .pair_device, "Re-pair", .secondary);
+        },
+        .connect => {},
+    };
     pushButton(plan, .edit, "Edit", .secondary);
     if (state.runtime_connections.isRemoveConfirming(id)) {
         pushButton(plan, .remove_confirm, "Confirm remove", .primary);
@@ -2461,6 +2470,7 @@ fn collectRuntimeDetailLines(state: *const runtime.AppState, profile_id: ?[]cons
         return;
     }
     const id = profile_id.?;
+    pushRuntimeAccessDetailLines(state, id, out);
     const tracking = rc.readiness_profile_id != null and std.mem.eql(u8, rc.readiness_profile_id.?, id);
     const manifest_state = if (tracking) rc.manifest_state else .idle;
     const providers_state = if (tracking) rc.providers_state else .idle;
@@ -2519,6 +2529,55 @@ fn collectRuntimeDetailLines(state: *const runtime.AppState, profile_id: ?[]cons
             }
             if (rc.providers_truncated > 0) out.push(.muted, "+{d} more providers", .{rc.providers_truncated});
             if (needs_remote_setup) out.push(.muted, "Run setup commands on the runtime host; the desktop has no remote shell and cannot sign in for you.", .{});
+        },
+    }
+}
+
+/// Method-specific, secret-free access details: device reference and
+/// credential durability for Pair, endpoint identity and the data-plane
+/// blocker for Connect. Never prints a credential, token, or expiry secret.
+fn pushRuntimeAccessDetailLines(state: *const runtime.AppState, profile_id: []const u8, out: *DetailBuffer) void {
+    const service = state.runtime_service orelse return;
+    const snapshot = service.snapshot(profile_id) orelse return;
+    const configured = service.runtime_manager.profileConst(profile_id) orelse return;
+    switch (configured.access) {
+        .admin_token => out.push(.muted, "Access · administrator token, entered each session and kept in memory only", .{}),
+        .paired_device => |device| {
+            if (device.device_id) |device_id| {
+                out.push(.good, "Access · paired device {s}", .{device_id});
+            } else {
+                out.push(.warning, "Access · not paired yet — redeem a one-time grant from the runtime host", .{});
+            }
+            const backend = service.credentialBackend();
+            if (backend.durable()) {
+                out.push(.muted, "Device credential · stored by reference in the OS credential store ({s})", .{@tagName(backend)});
+            } else {
+                out.push(.warning, "Device credential · memory only on this platform; pair again after relaunch", .{});
+            }
+            switch (snapshot.pairing_state) {
+                .none => {},
+                .exchanging => out.push(.muted, "Pairing · exchanging the grant over SSH", .{}),
+                .awaiting_confirmation => out.push(.warning, "Pairing · runtime identity awaits your confirmation in the wizard", .{}),
+            }
+            if (snapshot.access_token_expires_at_ms) |expires| {
+                const now = state.runtimeNowMs();
+                const remaining_s: u64 = if (expires > 0 and @as(u64, @intCast(expires)) > now) (@as(u64, @intCast(expires)) - now) / 1000 else 0;
+                out.push(.muted, "Access token · renews via /auth/access-token, {d}s left", .{remaining_s});
+            }
+        },
+        .connect => |link| {
+            out.push(.muted, "Control plane · {s}", .{link.control_plane_url});
+            if (link.link_id) |link_id| out.push(.muted, "Link · {s}", .{link_id});
+            switch (configured.transport) {
+                .connect => |endpoint| {
+                    if (endpoint.https_url) |https| out.push(.muted, "Endpoint · {s}", .{https});
+                    if (endpoint.wss_url) |wss| out.push(.muted, "WebSocket · {s}", .{wss});
+                    if (endpoint.spki_sha256) |spki| out.push(.muted, "TLS SPKI sha256 · {s}", .{spki});
+                },
+                else => {},
+            }
+            if (configured.expected_runtime_id) |runtime_id| out.push(.muted, "Runtime · {s} / {s}", .{ runtime_id, configured.expected_instance_id orelse "?" });
+            out.push(.warning, "{s}", .{runtime_connections.CONNECT_BLOCKER});
         },
     }
 }
@@ -2588,8 +2647,8 @@ fn isRuntimeActionHovered(state: *const runtime.AppState, index: usize) bool {
 fn runtimeStatusColor(status: runtime.RuntimePickerStatus) [4]f32 {
     return switch (status) {
         .ready => theme.success(),
-        .connecting, .handshaking, .reconnecting, .limited, .trust_required, .credential_required, .offline => theme.COLOR_TEXT_MUTED,
-        .authentication_failed, .identity_mismatch, .connection_failed, .failed, .unsupported, .unavailable => theme.danger(),
+        .connecting, .handshaking, .reconnecting, .limited, .trust_required, .credential_required, .offline, .pairing_required, .rate_limited, .runtime_selection_required => theme.COLOR_TEXT_MUTED,
+        .authentication_failed, .identity_mismatch, .connection_failed, .failed, .unsupported, .unavailable, .pairing_rejected => theme.danger(),
     };
 }
 
@@ -2606,7 +2665,7 @@ fn drawRuntimeCard(state: *runtime.AppState, layout: SettingsLayout) void {
         .y = card.y + m.card_pad + m.title_h + m.inner_gap,
         .w = card.w - m.card_pad * 2.0,
         .h = m.label_h,
-    }, "Where chats run. Select a row for repository and provider readiness · SSH is the current transport for self-hosted runtimes", paletteColor(textHint()), theme.scaledUi(12.0), clip);
+    }, "Where chats run. Select a row for repository and provider readiness · SSH token, paired device, or Connect control plane", paletteColor(textHint()), theme.scaledUi(12.0), clip);
 
     for (0..plan.row_count) |row| {
         const row_plan = &plan.rows[row];
@@ -2643,6 +2702,12 @@ fn drawRuntimeCard(state: *runtime.AppState, layout: SettingsLayout) void {
                             }) catch runtime.runtimePickerStatusDescription(status);
                         },
                         .local_socket => description = runtime.runtimePickerStatusDescription(status),
+                        .connect => |endpoint| {
+                            description = std.fmt.bufPrint(&description_buf, "{s} · Connect {s}", .{
+                                runtime.runtimePickerStatusDescription(status),
+                                endpoint.https_url orelse "(no runtime selected)",
+                            }) catch runtime.runtimePickerStatusDescription(status);
+                        },
                     }
                 } else {
                     description = runtime.runtimePickerStatusDescription(status);

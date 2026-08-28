@@ -13,6 +13,7 @@ pub const store_protocol = @import("store_protocol.zig");
 pub const changes_protocol = @import("changes_protocol.zig");
 pub const providers_protocol = @import("providers_protocol.zig");
 pub const access_protocol = @import("access_protocol.zig");
+pub const connect_protocol = @import("connect_protocol.zig");
 pub const dispatch = @import("dispatch.zig");
 pub const client = @import("client.zig");
 // Deliberate second alias for store_protocol: `.store` predates it and is

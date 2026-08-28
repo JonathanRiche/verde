@@ -9,6 +9,9 @@ test {
     _ = @import("runtime/ssh_tunnel.zig");
     _ = @import("runtime/ssh_tunnel_supervisor.zig");
     _ = @import("runtime/connection.zig");
+    _ = @import("runtime/pair_client.zig");
+    _ = @import("runtime/credential_store.zig");
+    _ = @import("runtime/connect_client.zig");
     _ = @import("runtime/manager.zig");
     _ = @import("runtime/pin_controller.zig");
     _ = @import("runtime/service.zig");

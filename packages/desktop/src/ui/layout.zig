@@ -610,9 +610,19 @@ fn focusedCursorReadOnly(state: *runtime.AppState) usize {
         .runtime_wizard_user => state.runtime_connections.user_cursor,
         .runtime_wizard_ssh_port => state.runtime_connections.ssh_port_cursor,
         .runtime_wizard_gateway_port => state.runtime_connections.gateway_port_cursor,
+        .runtime_wizard_grant_id => state.runtime_connections.grant_id_cursor,
+        .runtime_wizard_pairing_code => state.runtime_connections.pairing_code_cursor,
+        .runtime_wizard_device_label => state.runtime_connections.device_label_cursor,
+        .runtime_wizard_control_plane_url => state.runtime_connections.control_plane_url_cursor,
         .command_palette => state.command_controller.cursor,
         .none => 0,
     };
+}
+
+/// Fields whose bytes are secrets: rendered masked, zeroed on delete, and
+/// never handed to the frame arena.
+fn isSecretModalFocus(focus: runtime.PaletteModalTextFocus) bool {
+    return focus == .runtime_credential or focus == .runtime_wizard_pairing_code;
 }
 
 fn clearModalSelection(state: *runtime.AppState) void {
@@ -660,7 +670,7 @@ fn focusedMetricOffsetForClickX(
     font_size: f32,
     rel: f32,
 ) usize {
-    if (state.palette_modal_text_focus != .runtime_credential) {
+    if (!isSecretModalFocus(state.palette_modal_text_focus)) {
         return modalOffsetForClickX(value, font_size, rel);
     }
     var masked: [4096]u8 = undefined;
@@ -693,6 +703,10 @@ fn focusedValue(state: *runtime.AppState) []const u8 {
         .runtime_wizard_user => state.runtime_connections.fieldValue(.user),
         .runtime_wizard_ssh_port => state.runtime_connections.fieldValue(.ssh_port),
         .runtime_wizard_gateway_port => state.runtime_connections.fieldValue(.gateway_port),
+        .runtime_wizard_grant_id => state.runtime_connections.fieldValue(.grant_id),
+        .runtime_wizard_pairing_code => state.runtime_connections.fieldValue(.pairing_code),
+        .runtime_wizard_device_label => state.runtime_connections.fieldValue(.device_label),
+        .runtime_wizard_control_plane_url => state.runtime_connections.fieldValue(.control_plane_url),
         .command_palette => state.commandPaletteQuery(),
         .none => &[_]u8{},
     };
@@ -709,7 +723,7 @@ fn deleteModalSelection(state: *runtime.AppState) bool {
     const current_len = std.mem.sliceTo(buf, 0).len;
     const removed = sel.end - sel.start;
     std.mem.copyForwards(u8, buf[sel.start .. current_len - removed], buf[sel.end..current_len]);
-    if (state.palette_modal_text_focus == .runtime_credential) {
+    if (isSecretModalFocus(state.palette_modal_text_focus)) {
         std.crypto.secureZero(u8, buf[current_len - removed .. current_len]);
     } else {
         buf[current_len - removed] = 0;
@@ -726,7 +740,7 @@ fn copyModalSelection(state: *runtime.AppState) void {
     if (slice.len == 0) return;
     const z = state.allocator.dupeZ(u8, slice) catch return;
     defer {
-        if (state.palette_modal_text_focus == .runtime_credential) {
+        if (isSecretModalFocus(state.palette_modal_text_focus)) {
             std.crypto.secureZero(u8, z);
         }
         state.allocator.free(z);
@@ -741,8 +755,16 @@ fn pasteIntoModal(state: *runtime.AppState) bool {
         return pasteIntoRuntimeCredential(state);
     }
     const text = state.readClipboardTextForPaste() orelse return false;
-    defer state.allocator.free(text);
+    const secret = isSecretModalFocus(state.palette_modal_text_focus);
+    defer {
+        if (secret) std.crypto.secureZero(u8, text);
+        state.allocator.free(text);
+    }
     if (text.len == 0) return false;
+    // Wizard fields apply their own per-field filters (hex, digits, URL).
+    if (runtime_connections.focusedWizardField(state.palette_modal_text_focus) != null) {
+        return handlePaletteTextInput(state, text);
+    }
     _ = deleteModalSelection(state);
     // Modal inputs are single-line; strip control chars from pasted text.
     var sanitized: [4096]u8 = undefined;
@@ -896,6 +918,8 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .runtime_wizard_submit => state.submitRuntimeConnectionWizard(),
             .runtime_wizard_connect => state.runtimeConnectionWizardConnect(),
             .runtime_wizard_done => state.cancelRuntimeConnectionWizard(),
+            .runtime_wizard_method => state.chooseRuntimeWizardMethod(@enumFromInt(@min(hit.index, @typeInfo(runtime_connections.WizardMethod).@"enum".fields.len - 1))),
+            .runtime_wizard_select => state.selectRuntimeWizardConnectRuntime(hit.index),
             .runtime_wizard_input => focusModalInput(state, runtimeWizardFocusForIndex(hit.index), hit.rect, x, clicks),
             .settings_runtime_action => state.applyRuntimeRowAction(hit.index),
             .settings_cancel => state.cancelSettingsModal(),
@@ -1025,10 +1049,10 @@ pub fn handlePaletteTextInput(state: *runtime.AppState, text: []const u8) bool {
         .project_import_name => insertIntoZBuffer(state.importProjectNameBuffer(), &state.project_import_name_cursor, text),
         .project_import => insertIntoZBuffer(state.importPathBuffer(), &state.project_import_cursor, text),
         .runtime_credential => unreachable,
-        .runtime_wizard_label, .runtime_wizard_host, .runtime_wizard_user => blk: {
+        .runtime_wizard_label, .runtime_wizard_host, .runtime_wizard_user, .runtime_wizard_device_label, .runtime_wizard_control_plane_url => blk: {
             // Single-line fields: strip control characters so a pasted
             // "host\n" cannot smuggle a line break into a profile.
-            var sanitized: [runtime_connections.HOST_CAPACITY]u8 = undefined;
+            var sanitized: [runtime_connections.URL_CAPACITY]u8 = undefined;
             var len: usize = 0;
             for (text) |byte| {
                 if (byte < 0x20 or byte == 0x7f) continue;
@@ -1039,9 +1063,28 @@ pub fn handlePaletteTextInput(state: *runtime.AppState, text: []const u8) bool {
             const field: runtime_connections.WizardField = switch (state.palette_modal_text_focus) {
                 .runtime_wizard_label => .label,
                 .runtime_wizard_host => .host,
+                .runtime_wizard_device_label => .device_label,
+                .runtime_wizard_control_plane_url => .control_plane_url,
                 else => .user,
             };
             break :blk insertIntoZBuffer(state.runtime_connections.fieldBuffer(field), state.runtime_connections.fieldCursor(field), sanitized[0..len]);
+        },
+        .runtime_wizard_grant_id, .runtime_wizard_pairing_code => blk: {
+            // Both values are canonical lowercase hex; fold case and drop
+            // everything else so a copied "Grant: AB12…" pastes cleanly. The
+            // scratch copy is zeroed because it may hold the pairing code.
+            var hex: [runtime_connections.PAIRING_CODE_CAPACITY]u8 = undefined;
+            defer std.crypto.secureZero(u8, &hex);
+            var len: usize = 0;
+            for (text) |byte| {
+                const lower = std.ascii.toLower(byte);
+                if (!std.ascii.isHex(lower)) continue;
+                if (len >= hex.len) break;
+                hex[len] = lower;
+                len += 1;
+            }
+            const field: runtime_connections.WizardField = if (state.palette_modal_text_focus == .runtime_wizard_grant_id) .grant_id else .pairing_code;
+            break :blk insertIntoZBuffer(state.runtime_connections.fieldBuffer(field), state.runtime_connections.fieldCursor(field), hex[0..len]);
         },
         .runtime_wizard_ssh_port, .runtime_wizard_gateway_port => blk: {
             var digits: [runtime_connections.PORT_CAPACITY]u8 = undefined;
@@ -1082,8 +1125,11 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
             },
             .@"return", .kp_enter => {
                 switch (state.runtime_connections.wizard_step) {
-                    .form => state.submitRuntimeConnectionWizard(),
+                    .form, .pair_grant, .connect_setup => state.submitRuntimeConnectionWizard(),
                     .testing => state.runtimeConnectionWizardConnect(),
+                    // Identity confirmation and method choice need a click:
+                    // a stray Enter must not adopt a runtime identity.
+                    .method, .pair_confirm => {},
                 }
                 return true;
             },
@@ -1291,7 +1337,7 @@ fn deleteModalText(state: *runtime.AppState, backwards: bool) bool {
         if (cursor.* == 0 or len == 0) return true;
         const at = cursor.* - 1;
         std.mem.copyForwards(u8, buf[at .. len - 1], buf[at + 1 .. len]);
-        if (state.palette_modal_text_focus == .runtime_credential) {
+        if (isSecretModalFocus(state.palette_modal_text_focus)) {
             std.crypto.secureZero(u8, buf[len - 1 .. len]);
         } else {
             buf[len - 1] = 0;
@@ -1300,7 +1346,7 @@ fn deleteModalText(state: *runtime.AppState, backwards: bool) bool {
     } else {
         if (cursor.* >= len) return true;
         std.mem.copyForwards(u8, buf[cursor.* .. len - 1], buf[cursor.* + 1 .. len]);
-        if (state.palette_modal_text_focus == .runtime_credential) {
+        if (isSecretModalFocus(state.palette_modal_text_focus)) {
             std.crypto.secureZero(u8, buf[len - 1 .. len]);
         } else {
             buf[len - 1] = 0;
@@ -1321,6 +1367,10 @@ fn focusedCursor(state: *runtime.AppState) ?*usize {
         .runtime_wizard_user => &state.runtime_connections.user_cursor,
         .runtime_wizard_ssh_port => &state.runtime_connections.ssh_port_cursor,
         .runtime_wizard_gateway_port => &state.runtime_connections.gateway_port_cursor,
+        .runtime_wizard_grant_id => &state.runtime_connections.grant_id_cursor,
+        .runtime_wizard_pairing_code => &state.runtime_connections.pairing_code_cursor,
+        .runtime_wizard_device_label => &state.runtime_connections.device_label_cursor,
+        .runtime_wizard_control_plane_url => &state.runtime_connections.control_plane_url_cursor,
         .command_palette => &state.command_controller.cursor,
         .none => null,
     };
@@ -1338,6 +1388,10 @@ fn focusedBuffer(state: *runtime.AppState) ?[:0]u8 {
         .runtime_wizard_user => state.runtime_connections.fieldBuffer(.user),
         .runtime_wizard_ssh_port => state.runtime_connections.fieldBuffer(.ssh_port),
         .runtime_wizard_gateway_port => state.runtime_connections.fieldBuffer(.gateway_port),
+        .runtime_wizard_grant_id => state.runtime_connections.fieldBuffer(.grant_id),
+        .runtime_wizard_pairing_code => state.runtime_connections.fieldBuffer(.pairing_code),
+        .runtime_wizard_device_label => state.runtime_connections.fieldBuffer(.device_label),
+        .runtime_wizard_control_plane_url => state.runtime_connections.fieldBuffer(.control_plane_url),
         .command_palette => state.commandPaletteQueryBuffer(),
         .none => null,
     };
@@ -1355,6 +1409,10 @@ fn focusedTextLen(state: *runtime.AppState) usize {
         .runtime_wizard_user => state.runtime_connections.fieldValue(.user).len,
         .runtime_wizard_ssh_port => state.runtime_connections.fieldValue(.ssh_port).len,
         .runtime_wizard_gateway_port => state.runtime_connections.fieldValue(.gateway_port).len,
+        .runtime_wizard_grant_id => state.runtime_connections.fieldValue(.grant_id).len,
+        .runtime_wizard_pairing_code => state.runtime_connections.fieldValue(.pairing_code).len,
+        .runtime_wizard_device_label => state.runtime_connections.fieldValue(.device_label).len,
+        .runtime_wizard_control_plane_url => state.runtime_connections.fieldValue(.control_plane_url).len,
         .command_palette => state.commandPaletteQuery().len,
         .none => 0,
     };
@@ -1374,6 +1432,10 @@ fn runtimeWizardFocusForIndex(index: usize) runtime.PaletteModalTextFocus {
         .user => .runtime_wizard_user,
         .ssh_port => .runtime_wizard_ssh_port,
         .gateway_port => .runtime_wizard_gateway_port,
+        .grant_id => .runtime_wizard_grant_id,
+        .pairing_code => .runtime_wizard_pairing_code,
+        .device_label => .runtime_wizard_device_label,
+        .control_plane_url => .runtime_wizard_control_plane_url,
     };
 }
 
@@ -1385,20 +1447,32 @@ fn runtimeWizardOwnsKeys(state: *const runtime.AppState) bool {
         !state.command_controller.open;
 }
 
+/// Method cards on the chooser step.
+const WIZARD_METHOD_COUNT: usize = @typeInfo(runtime_connections.WizardMethod).@"enum".fields.len;
+/// Inventory rows shown on the Connect step before the list is clipped;
+/// a count of hidden rows is rendered instead of a scroll surface.
+const WIZARD_INVENTORY_VISIBLE_ROWS: usize = 5;
+
 const WizardLayout = struct {
     modal: palette.Rect,
     pad: f32,
     content_w: f32,
-    fields: [5]palette.Rect,
+    /// Indexed by `WizardField` ordinal; only the current step's fields are
+    /// positioned meaningfully.
+    fields: [@typeInfo(WizardField).@"enum".fields.len]palette.Rect,
+    methods: [WIZARD_METHOD_COUNT]palette.Rect,
+    inventory: [WIZARD_INVENTORY_VISIBLE_ROWS]palette.Rect,
+    inventory_y: f32,
+    /// Identity boxes on the pairing confirmation step.
+    identity: [2]palette.Rect,
     notice_y: f32,
     buttons: [3]palette.Rect,
-    button_count: usize,
     status_y: f32,
 };
 
 fn runtimeWizardLayout(state: *const runtime.AppState, width: f32, height: f32) WizardLayout {
     const pad = theme.scaledUi(20.0);
-    const modal_w = @min(theme.clampf(width * 0.44, theme.scaledUi(460.0), theme.scaledUi(620.0)), @max(width - pad * 2.0, theme.scaledUi(320.0)));
+    const modal_w = @min(theme.clampf(width * 0.44, theme.scaledUi(460.0), theme.scaledUi(640.0)), @max(width - pad * 2.0, theme.scaledUi(320.0)));
     const label_h = theme.scaledUi(18.0);
     const input_h = theme.scaledUi(36.0);
     const gap = theme.scaledUi(8.0);
@@ -1406,11 +1480,23 @@ fn runtimeWizardLayout(state: *const runtime.AppState, width: f32, height: f32) 
     const button_h = theme.scaledUi(36.0);
     const heading_h = theme.scaledUi(24.0);
     const sub_h = theme.scaledUi(20.0);
-    const form = state.runtime_connections.wizard_step == .form;
-    // Form: heading, subtitle, three full-width fields, one two-column port
-    // row, notice line, buttons. Connect step: heading, status, notice, buttons.
-    const field_rows: f32 = if (form) 4.0 else 0.0;
-    const body_h = field_rows * (label_h + input_h) + @max(field_rows - 1.0, 0.0) * row_gap + (if (form) row_gap else theme.scaledUi(60.0));
+    // 56px cards give the title plus a one-line description room to breathe.
+    const method_card_h = theme.scaledUi(56.0);
+    const inventory_row_h = theme.scaledUi(44.0);
+    const identity_box_h = theme.scaledUi(38.0);
+    const rc = &state.runtime_connections;
+    const step = rc.wizard_step;
+    const field_row_h = label_h + input_h + row_gap;
+    const status_block_h = theme.scaledUi(60.0);
+    const inventory_rows = @min(rc.connect_runtimes.items.len, WIZARD_INVENTORY_VISIBLE_ROWS);
+    const body_h: f32 = switch (step) {
+        .method => @as(f32, @floatFromInt(WIZARD_METHOD_COUNT)) * (method_card_h + row_gap),
+        .form => 4.0 * field_row_h,
+        .pair_grant => 3.0 * field_row_h,
+        .pair_confirm => 2.0 * (label_h + identity_box_h + row_gap),
+        .connect_setup => 2.0 * field_row_h + status_block_h + @as(f32, @floatFromInt(inventory_rows)) * (inventory_row_h + gap) + (if (rc.connect_runtimes_truncated > 0) sub_h else 0.0),
+        .testing => status_block_h,
+    };
     const modal_h = @min(pad + heading_h + gap + sub_h + row_gap + body_h + sub_h + row_gap + button_h + pad, height - pad * 2.0);
     const modal: palette.Rect = .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
     const content_w = modal.w - pad * 2.0;
@@ -1420,36 +1506,103 @@ fn runtimeWizardLayout(state: *const runtime.AppState, width: f32, height: f32) 
     layout.content_w = content_w;
     var y = modal.y + pad + heading_h + gap + sub_h + row_gap;
     layout.status_y = y;
-    const full_fields = [_]usize{ 0, 1, 2 };
-    for (full_fields) |index| {
-        layout.fields[index] = .{ .x = modal.x + pad, .y = y + label_h, .w = content_w, .h = input_h };
-        y += label_h + input_h + row_gap;
+    const x = modal.x + pad;
+    for (&layout.fields) |*rect| rect.* = .{ .x = x, .y = y, .w = content_w, .h = input_h };
+    for (&layout.methods, 0..) |*rect, index| {
+        rect.* = .{ .x = x, .y = y + @as(f32, @floatFromInt(index)) * (method_card_h + row_gap), .w = content_w, .h = method_card_h };
     }
-    const half_w = (content_w - theme.scaledUi(10.0)) * 0.5;
-    layout.fields[3] = .{ .x = modal.x + pad, .y = y + label_h, .w = half_w, .h = input_h };
-    layout.fields[4] = .{ .x = modal.x + pad + half_w + theme.scaledUi(10.0), .y = y + label_h, .w = half_w, .h = input_h };
-    y += label_h + input_h + row_gap;
-    layout.notice_y = if (form) y else layout.status_y + theme.scaledUi(60.0);
+    switch (step) {
+        .form => {
+            const full_fields = [_]WizardField{ .label, .host, .user };
+            for (full_fields) |field| {
+                layout.fields[@intFromEnum(field)] = .{ .x = x, .y = y + label_h, .w = content_w, .h = input_h };
+                y += field_row_h;
+            }
+            const half_w = (content_w - theme.scaledUi(10.0)) * 0.5;
+            layout.fields[@intFromEnum(WizardField.ssh_port)] = .{ .x = x, .y = y + label_h, .w = half_w, .h = input_h };
+            layout.fields[@intFromEnum(WizardField.gateway_port)] = .{ .x = x + half_w + theme.scaledUi(10.0), .y = y + label_h, .w = half_w, .h = input_h };
+            y += field_row_h;
+        },
+        .pair_grant => {
+            const fields = [_]WizardField{ .grant_id, .pairing_code, .device_label };
+            for (fields) |field| {
+                layout.fields[@intFromEnum(field)] = .{ .x = x, .y = y + label_h, .w = content_w, .h = input_h };
+                y += field_row_h;
+            }
+        },
+        .pair_confirm => {
+            for (&layout.identity) |*rect| {
+                rect.* = .{ .x = x, .y = y + label_h, .w = content_w, .h = identity_box_h };
+                y += label_h + identity_box_h + row_gap;
+            }
+        },
+        .connect_setup => {
+            const fields = [_]WizardField{ .label, .control_plane_url };
+            for (fields) |field| {
+                layout.fields[@intFromEnum(field)] = .{ .x = x, .y = y + label_h, .w = content_w, .h = input_h };
+                y += field_row_h;
+            }
+            layout.status_y = y;
+            y += status_block_h;
+            layout.inventory_y = y;
+            for (&layout.inventory) |*rect| {
+                rect.* = .{ .x = x, .y = y, .w = content_w, .h = inventory_row_h };
+                y += inventory_row_h + gap;
+            }
+            if (rc.connect_runtimes_truncated > 0) y += sub_h;
+        },
+        .method => y += body_h,
+        .testing => y += status_block_h,
+    }
+    layout.notice_y = y;
     const button_y = modal.y + modal.h - pad - button_h;
-    layout.button_count = 3;
     const button_gap = theme.scaledUi(10.0);
     const button_w = (content_w - button_gap * 2.0) / 3.0;
     for (0..3) |index| {
-        layout.buttons[index] = .{ .x = modal.x + pad + @as(f32, @floatFromInt(index)) * (button_w + button_gap), .y = button_y, .w = button_w, .h = button_h };
+        layout.buttons[index] = .{ .x = x + @as(f32, @floatFromInt(index)) * (button_w + button_gap), .y = button_y, .w = button_w, .h = button_h };
     }
     return layout;
 }
 
 fn registerRuntimeWizardModalHits(state: *runtime.AppState, width: f32, height: f32) void {
-    if (!state.runtime_connections.wizard_open) return;
+    const rc = &state.runtime_connections;
+    if (!rc.wizard_open) return;
     const layout = runtimeWizardLayout(state, width, height);
     // Not dismissible from the scrim: a stray click must not lose the draft.
     registerModalChromeHits(state, width, height, layout.modal, false);
-    switch (state.runtime_connections.wizard_step) {
-        .form => {
-            for (layout.fields, 0..) |rect, index| queueModalHit(state, rect, .runtime_wizard_input, index);
+    for (rc.visibleFields()) |field| {
+        queueModalHit(state, layout.fields[@intFromEnum(field)], .runtime_wizard_input, @intFromEnum(field));
+    }
+    switch (rc.wizard_step) {
+        .method => {
+            for (layout.methods, 0..) |rect, index| queueModalHit(state, rect, .runtime_wizard_method, index);
             queueModalHit(state, layout.buttons[0], .runtime_wizard_cancel, 0);
+        },
+        .form => {
+            queueModalHit(state, layout.buttons[0], .runtime_wizard_cancel, 0);
+            if (rc.wizard_mode == .add and rc.wizard_profile_id == null) queueModalHit(state, layout.buttons[1], .runtime_wizard_back, 0);
             queueModalHit(state, layout.buttons[2], .runtime_wizard_submit, 0);
+        },
+        .pair_grant => {
+            queueModalHit(state, layout.buttons[0], .runtime_wizard_cancel, 0);
+            queueModalHit(state, layout.buttons[1], .runtime_wizard_back, 0);
+            if (!rc.pairing_exchange_started) queueModalHit(state, layout.buttons[2], .runtime_wizard_submit, 0);
+        },
+        .pair_confirm => {
+            queueModalHit(state, layout.buttons[0], .runtime_wizard_cancel, 0);
+            queueModalHit(state, layout.buttons[1], .runtime_wizard_connect, 0);
+            queueModalHit(state, layout.buttons[2], .runtime_wizard_submit, 0);
+        },
+        .connect_setup => {
+            const visible = @min(rc.connect_runtimes.items.len, WIZARD_INVENTORY_VISIBLE_ROWS);
+            for (layout.inventory[0..visible], 0..) |rect, index| queueModalHit(state, rect, .runtime_wizard_select, index);
+            queueModalHit(state, layout.buttons[0], .runtime_wizard_cancel, 0);
+            if (rc.wizard_mode == .add and rc.wizard_profile_id == null) {
+                queueModalHit(state, layout.buttons[1], .runtime_wizard_back, 0);
+            } else if (connectSignedIn(rc.connect_phase)) {
+                queueModalHit(state, layout.buttons[1], .runtime_wizard_connect, 0);
+            }
+            if (connectPrimaryEnabled(rc)) queueModalHit(state, layout.buttons[2], .runtime_wizard_submit, 0);
         },
         .testing => {
             queueModalHit(state, layout.buttons[0], .runtime_wizard_back, 0);
@@ -1459,11 +1612,50 @@ fn registerRuntimeWizardModalHits(state: *runtime.AppState, width: f32, height: 
     }
 }
 
+fn connectSignedIn(phase: runtime_connections.ConnectPhase) bool {
+    return phase == .signed_in or phase == .loading_inventory or phase == .inventory_loaded;
+}
+
+fn connectPrimaryEnabled(rc: *const runtime_connections.State) bool {
+    return switch (rc.connect_phase) {
+        .idle, .failed, .discovered => true,
+        .inventory_loaded => rc.connect_selected != null,
+        .signed_in => true,
+        .discovering, .signing_in, .loading_inventory => false,
+    };
+}
+
+fn connectPrimaryLabel(rc: *const runtime_connections.State) []const u8 {
+    return switch (rc.connect_phase) {
+        .idle => if (rc.wizard_profile_id == null) "Save & check" else "Check",
+        .failed => "Retry",
+        .discovering => "Checking…",
+        .discovered => "Sign in",
+        .signing_in => "Waiting for browser…",
+        .signed_in, .loading_inventory => "Loading…",
+        .inventory_loaded => "Use selected runtime",
+    };
+}
+
 fn drawWizardField(state: *runtime.AppState, layout: WizardLayout, field: WizardField, label: []const u8, hint: []const u8) void {
     const rect = layout.fields[@intFromEnum(field)];
     queuePaletteText(state, .{ .x = rect.x, .y = rect.y - theme.scaledUi(18.0), .w = rect.w, .h = theme.scaledUi(16.0) }, label, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), layout.modal);
     const focus = runtimeWizardFocusForIndex(@intFromEnum(field));
-    drawTextField(state, rect, state.runtime_connections.fieldValue(field), hint, state.palette_modal_text_focus == focus, state.runtime_connections.fieldCursor(field).*);
+    const value = state.runtime_connections.fieldValue(field);
+    if (field == .pairing_code) {
+        // Same-length mask: the code never enters a Palette batch or arena.
+        var masked: [4096]u8 = undefined;
+        drawTextField(state, rect, maskedRuntimeCredential(&masked, value.len), hint, state.palette_modal_text_focus == focus, state.runtime_connections.fieldCursor(field).*);
+        return;
+    }
+    drawTextField(state, rect, value, hint, state.palette_modal_text_focus == focus, state.runtime_connections.fieldCursor(field).*);
+}
+
+/// Labelled read-only identity box (runtime id / instance id / SPKI).
+fn drawWizardIdentityBox(state: *runtime.AppState, modal: palette.Rect, rect: palette.Rect, label: []const u8, value: []const u8) void {
+    queuePaletteText(state, .{ .x = rect.x, .y = rect.y - theme.scaledUi(18.0), .w = rect.w, .h = theme.scaledUi(16.0) }, label, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), modal);
+    queuePaletteRoundedRect(state, rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(6.0));
+    queuePaletteText(state, .{ .x = rect.x + theme.scaledUi(10.0), .y = rect.y + theme.scaledUi(9.0), .w = rect.w - theme.scaledUi(20.0), .h = theme.scaledUi(20.0) }, value, paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), modal);
 }
 
 // Renders the add/edit runtime connection wizard: SSH form, then a connect
@@ -1475,18 +1667,45 @@ fn renderRuntimeWizardModal(state: *runtime.AppState, width: f32, height: f32) v
     const modal = layout.modal;
     drawModalChromeVisual(state, width, height, modal);
     const pad = layout.pad;
-    const heading = switch (rc.wizard_mode) {
-        .add => "Add runtime connection",
-        .edit => "Edit runtime connection",
+    const heading = switch (rc.wizard_step) {
+        .method => "Add connection",
+        .pair_grant => "Pair this device",
+        .pair_confirm => "Confirm the runtime identity",
+        else => switch (rc.wizard_mode) {
+            .add => "Add runtime connection",
+            .edit => "Edit runtime connection",
+        },
     };
     queuePaletteText(state, .{ .x = modal.x + pad, .y = modal.y + pad, .w = layout.content_w, .h = theme.scaledUi(24.0) }, heading, paletteColor(theme.COLOR_WHITE), theme.scaledUi(18.0), modal);
     const subtitle = switch (rc.wizard_step) {
-        .form => "Reach a self-hosted Verde daemon over SSH. Host keys are verified by OpenSSH; no secrets are stored here.",
-        .testing => "Connect to verify the daemon identity. You will be asked for the gateway token and to confirm the runtime on first contact.",
+        .method => "Choose how this desktop reaches the runtime. Only Connect needs an account.",
+        .form => if (rc.wizard_method == .pair)
+            "Pairing forwards the daemon over SSH for the exchange; afterwards only a revocable device credential is used."
+        else
+            "Reach a self-hosted Verde daemon over SSH. Host keys are verified by OpenSSH; no secrets are stored here.",
+        .pair_grant => "Run `verde-daemon pair create --label <name>` on the runtime host and copy its grant id and one-time code.",
+        .pair_confirm => "The runtime answered the exchange. Verify both IDs against `verde-daemon identity` before trusting it.",
+        .connect_setup => "Enter your self-hosted Verde Connect URL. Sign-in uses the system browser with PKCE; tokens stay in memory.",
+        .testing => switch (rc.wizard_method) {
+            .ssh => "Connect to verify the daemon identity. You will be asked for the gateway token and to confirm the runtime on first contact.",
+            .pair => "Connect uses the paired device credential; no token prompt is needed.",
+            .connect => "The runtime endpoint is saved. Live sessions wait on the desktop data plane (see below).",
+        },
     };
     queuePaletteText(state, .{ .x = modal.x + pad, .y = modal.y + pad + theme.scaledUi(32.0), .w = layout.content_w, .h = theme.scaledUi(20.0) }, subtitle, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.5), modal);
 
     switch (rc.wizard_step) {
+        .method => {
+            for (layout.methods, 0..) |rect, index| {
+                const method: runtime_connections.WizardMethod = @enumFromInt(index);
+                const hovered = pointInRect(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y, rect);
+                queuePaletteRoundedRect(state, rect, paletteColor(if (hovered) theme.lighten(theme.COLOR_PANEL_ALT, 0.055) else theme.COLOR_PANEL_ALT), theme.scaledUi(7.0));
+                queuePaletteBorder(state, rect, paletteColor(if (hovered) theme.accent() else theme.COLOR_PANEL_MUTED), theme.scaledUi(7.0), theme.scaledUi(1.0));
+                queuePaletteText(state, .{ .x = rect.x + theme.scaledUi(12.0), .y = rect.y + theme.scaledUi(8.0), .w = rect.w - theme.scaledUi(24.0), .h = theme.scaledUi(20.0) }, method.title(), paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), rect);
+                queuePaletteText(state, .{ .x = rect.x + theme.scaledUi(12.0), .y = rect.y + theme.scaledUi(30.0), .w = rect.w - theme.scaledUi(24.0), .h = theme.scaledUi(18.0) }, method.description(), paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), rect);
+            }
+            drawActionButton(state, layout.buttons[0], "Cancel", theme.COLOR_PANEL_ALT);
+        },
         .form => {
             drawWizardField(state, layout, .label, "NAME", "Build VM");
             drawWizardField(state, layout, .host, "SSH HOST OR CONFIG ALIAS", "runtime.example or my-vm");
@@ -1494,7 +1713,74 @@ fn renderRuntimeWizardModal(state: *runtime.AppState, width: f32, height: f32) v
             drawWizardField(state, layout, .ssh_port, "SSH PORT", "22");
             drawWizardField(state, layout, .gateway_port, "GATEWAY PORT ON HOST", "7420");
             drawActionButton(state, layout.buttons[0], "Cancel", theme.COLOR_PANEL_ALT);
+            if (rc.wizard_mode == .add and rc.wizard_profile_id == null) drawActionButton(state, layout.buttons[1], "Back", theme.COLOR_PANEL_ALT);
             drawActionButton(state, layout.buttons[2], if (rc.wizard_mode == .add) "Save & continue" else "Save", theme.accent());
+        },
+        .pair_grant => {
+            drawWizardField(state, layout, .grant_id, "GRANT ID", "32 hex characters");
+            drawWizardField(state, layout, .pairing_code, "ONE-TIME PAIRING CODE", "64 hex characters, masked");
+            drawWizardField(state, layout, .device_label, "DEVICE LABEL", "e.g. work laptop");
+            drawActionButton(state, layout.buttons[0], "Cancel", theme.COLOR_PANEL_ALT);
+            drawActionButton(state, layout.buttons[1], "Back", theme.COLOR_PANEL_ALT);
+            drawActionButton(state, layout.buttons[2], if (rc.pairing_exchange_started) "Exchanging…" else "Exchange grant", theme.accent());
+        },
+        .pair_confirm => {
+            var runtime_id: []const u8 = "";
+            var instance_id: []const u8 = "";
+            if (state.runtime_service) |service| if (rc.wizard_profile_id) |profile_id| if (service.pairingResult(profile_id)) |result| {
+                runtime_id = result.runtime_id;
+                instance_id = result.instance_id;
+            };
+            drawWizardIdentityBox(state, modal, layout.identity[0], "RUNTIME ID", runtime_id);
+            drawWizardIdentityBox(state, modal, layout.identity[1], "INSTANCE ID", instance_id);
+            drawActionButton(state, layout.buttons[0], "Cancel", theme.COLOR_PANEL_ALT);
+            drawActionButton(state, layout.buttons[1], "Not this runtime", theme.COLOR_PANEL_ALT);
+            drawActionButton(state, layout.buttons[2], "Trust and pair", theme.accent());
+        },
+        .connect_setup => {
+            drawWizardField(state, layout, .label, "NAME", "Team control plane");
+            drawWizardField(state, layout, .control_plane_url, "CONTROL PLANE URL", "https://connect.example");
+            const status: []const u8 = if (rc.connect_failure) |failure| failure.message() else switch (rc.connect_phase) {
+                .idle => "Not checked yet.",
+                .discovering => "Fetching /.well-known/verde-connect-configuration…",
+                .discovered => "Discovery verified. Signed out.",
+                .signing_in => if (rc.connect_login_open) "Browser opened. Finish sign-in there; this window waits for the loopback redirect." else "Starting sign-in…",
+                .signed_in, .loading_inventory => "Signed in. Loading linked runtimes…",
+                .inventory_loaded => "Signed in.",
+                .failed => "Failed.",
+            };
+            const status_color = if (rc.connect_failure != null) theme.danger() else if (connectSignedIn(rc.connect_phase)) theme.success() else theme.COLOR_TEXT_MUTED;
+            queuePaletteText(state, .{ .x = modal.x + pad, .y = layout.status_y, .w = layout.content_w, .h = theme.scaledUi(20.0) }, status, paletteColor(status_color), theme.scaledUi(13.0), modal);
+            var issuer_buf: [runtime_connections.URL_CAPACITY + 32]u8 = undefined;
+            const issuer_line: []const u8 = if (rc.connect_issuer) |issuer|
+                std.fmt.bufPrint(&issuer_buf, "Issuer {s}{s}", .{ issuer, if (rc.connect_device_flow_advertised) " · device flow advertised" else "" }) catch issuer
+            else
+                "";
+            queuePaletteText(state, .{ .x = modal.x + pad, .y = layout.status_y + theme.scaledUi(24.0), .w = layout.content_w, .h = theme.scaledUi(18.0) }, issuer_line, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), modal);
+            const visible = @min(rc.connect_runtimes.items.len, WIZARD_INVENTORY_VISIBLE_ROWS);
+            for (rc.connect_runtimes.items[0..visible], 0..) |row, index| {
+                const rect = layout.inventory[index];
+                const selected = rc.connect_selected == index;
+                queuePaletteRoundedRect(state, rect, paletteColor(if (selected) theme.lighten(theme.COLOR_PANEL_ALT, 0.08) else theme.COLOR_PANEL_ALT), theme.scaledUi(7.0));
+                queuePaletteBorder(state, rect, paletteColor(if (selected) theme.accent() else theme.COLOR_PANEL_MUTED), theme.scaledUi(7.0), theme.scaledUi(if (selected) 1.5 else 1.0));
+                queuePaletteText(state, .{ .x = rect.x + theme.scaledUi(12.0), .y = rect.y + theme.scaledUi(6.0), .w = rect.w - theme.scaledUi(24.0), .h = theme.scaledUi(18.0) }, row.https_url, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), rect);
+                var id_buf: [256]u8 = undefined;
+                const id_line = std.fmt.bufPrint(&id_buf, "runtime {s} · instance {s} · spki {s}", .{ row.runtime_id, row.instance_id, row.spki_sha256 }) catch row.runtime_id;
+                queuePaletteText(state, .{ .x = rect.x + theme.scaledUi(12.0), .y = rect.y + theme.scaledUi(24.0), .w = rect.w - theme.scaledUi(24.0), .h = theme.scaledUi(16.0) }, id_line, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), rect);
+            }
+            const hidden = rc.connect_runtimes.items.len - visible + rc.connect_runtimes_truncated;
+            if (hidden > 0) {
+                var more_buf: [64]u8 = undefined;
+                const more = std.fmt.bufPrint(&more_buf, "{d} more linked runtime(s) not shown", .{hidden}) catch "";
+                queuePaletteText(state, .{ .x = modal.x + pad, .y = layout.inventory_y + @as(f32, @floatFromInt(visible)) * (theme.scaledUi(44.0) + theme.scaledUi(8.0)), .w = layout.content_w, .h = theme.scaledUi(18.0) }, more, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), modal);
+            }
+            drawActionButton(state, layout.buttons[0], "Cancel", theme.COLOR_PANEL_ALT);
+            if (rc.wizard_mode == .add and rc.wizard_profile_id == null) {
+                drawActionButton(state, layout.buttons[1], "Back", theme.COLOR_PANEL_ALT);
+            } else if (connectSignedIn(rc.connect_phase)) {
+                drawActionButton(state, layout.buttons[1], "Sign out", theme.COLOR_PANEL_ALT);
+            }
+            drawActionButton(state, layout.buttons[2], connectPrimaryLabel(rc), if (connectPrimaryEnabled(rc)) theme.accent() else theme.COLOR_PANEL_MUTED);
         },
         .testing => {
             var badge: []const u8 = "Saved";
@@ -1507,16 +1793,23 @@ fn renderRuntimeWizardModal(state: *runtime.AppState, width: f32, height: f32) v
                 description = runtime.runtimePickerStatusDescription(status);
                 badge_color = switch (status) {
                     .ready => theme.success(),
-                    .authentication_failed, .identity_mismatch, .connection_failed, .failed, .unsupported, .unavailable => theme.danger(),
+                    .authentication_failed, .identity_mismatch, .connection_failed, .failed, .unsupported, .unavailable, .pairing_rejected => theme.danger(),
                     else => theme.COLOR_TEXT_MUTED,
                 };
                 connect_label = switch (status) {
                     .connecting, .handshaking, .reconnecting => "Connecting…",
                     .trust_required => "Verify…",
                     .ready, .limited => "Reconnect",
-                    .connection_failed, .authentication_failed, .identity_mismatch, .failed => "Retry",
+                    .connection_failed, .authentication_failed, .identity_mismatch, .failed, .rate_limited => "Retry",
+                    .pairing_required, .pairing_rejected => "Pair device",
+                    .runtime_selection_required => "Choose runtime",
                     else => "Connect",
                 };
+                if (rc.wizard_method == .connect) {
+                    // Do not fake a data plane: the exact blocker is shown in
+                    // place of a status that could never become "Connected".
+                    description = runtime_connections.CONNECT_BLOCKER;
+                }
             }
             queuePaletteText(state, .{ .x = modal.x + pad, .y = layout.status_y, .w = layout.content_w, .h = theme.scaledUi(22.0) }, badge, paletteColor(badge_color), theme.scaledUi(15.0), modal);
             queuePaletteText(state, .{ .x = modal.x + pad, .y = layout.status_y + theme.scaledUi(26.0), .w = layout.content_w, .h = theme.scaledUi(20.0) }, description, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.5), modal);

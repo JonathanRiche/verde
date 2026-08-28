@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 readonly daemon_bin=/opt/verde/bin/verde-daemon
 readonly gateway_bin=/opt/verde/bin/verde-web
+readonly server_bin=/opt/verde/bin/verde-server
 readonly static_dir=/opt/verde/share/verde/web
 readonly data_dir="${VERDE_DATA_DIR:-/home/verde/.local/share/verde/runtime}"
 readonly token_file="${VERDE_WEB_TOKEN_FILE:-/home/verde/.config/verde/web-token}"
@@ -52,31 +53,14 @@ run_runtime() {
     [[ "$gateway_port" =~ ^[0-9]+$ ]] || fail 'VERDE_GATEWAY_PORT must be an integer'
     (( gateway_port >= 1 && gateway_port <= 65535 )) || fail 'VERDE_GATEWAY_PORT is outside 1..65535'
     [[ -x "$gateway_bin" ]] || fail 'verde-web is missing from the image'
+    [[ -x "$server_bin" ]] || fail 'verde-server is missing from the image'
     [[ -d "$static_dir" ]] || fail 'the built web client is missing from the image'
 
     ensure_gateway_token
-    "$daemon_bin" serve --data-dir "$data_dir" &
-    local daemon_pid=$!
-    "$gateway_bin" \
-        --host 127.0.0.1 \
-        --port "$gateway_port" \
+    exec "$server_bin" serve \
+        --data-dir "$data_dir" \
         --token-file "$token_file" \
-        --pref-path "$data_dir" \
-        --static "$static_dir" &
-    local gateway_pid=$!
-
-    shutdown_children() {
-        trap - EXIT INT TERM
-        kill -TERM "$gateway_pid" "$daemon_pid" 2>/dev/null || true
-        wait "$gateway_pid" 2>/dev/null || true
-        wait "$daemon_pid" 2>/dev/null || true
-    }
-    trap shutdown_children EXIT INT TERM
-
-    local status=0
-    wait -n "$daemon_pid" "$gateway_pid" || status=$?
-    shutdown_children
-    exit "$status"
+        --gateway-port "$gateway_port"
 }
 
 initialize_daemon

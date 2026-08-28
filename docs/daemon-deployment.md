@@ -2,7 +2,7 @@
 
 This guide covers the open-source, single-user Verde runtime on a manually administered Linux VM. It does not require a Verde account or the Verde SaaS control plane.
 
-The standalone `verde-daemon` and secured, loopback-only `verde-web` gateway are implemented. A browser can reach the gateway through an SSH local forward. A non-root container image and Compose example package the same two artifacts for a dedicated Linux VM. The native desktop can add, edit, and remove non-secret SSH connections from Settings › Runtimes & connections or the runtime picker, choose workspace defaults, prompt for a process-memory gateway token, require explicit runtime/instance trust, show Local and configured runtimes with live state, surface repository bindings and provider readiness reported by the verified runtime, and run text-only native chat through an exactly pinned runtime. Remote attachments, PTYs/TUIs, guided provider login, and desktop repository add/clone are not complete yet.
+The standalone `verde-daemon` and secured, loopback-only `verde-web` gateway are implemented. A browser can reach the gateway through an SSH local forward. A non-root container image and Compose example package the same two artifacts for a dedicated Linux VM. The native desktop can add, edit, and remove non-secret connections from Settings › Runtimes & connections or the runtime picker (SSH with an administrator token, account-free Pair, or a Connect control plane), choose workspace defaults, prompt for a process-memory gateway token or pair a device credential, require explicit runtime/instance trust, show Local and configured runtimes with live state, surface repository bindings and provider readiness reported by the verified runtime, and run text-only native chat through an exactly pinned runtime. Remote attachments, PTYs/TUIs, guided provider login, and desktop repository add/clone are not complete yet.
 
 ## Security and process model
 
@@ -455,7 +455,8 @@ Gateway browser sessions are in memory and do not survive a gateway restart. To 
 ## Current limitations
 
 - The native desktop remote path currently supports text-only native chat. Remote prompt attachments, repository file transfer/preview, reconnectable PTYs, provider TUIs, and terminal lifecycle parity are pending.
-- Gateway bearers are process-memory-only and must be entered again after desktop relaunch. OS credential-store hydration is pending; tokens are intentionally absent from profile/default JSON and CLI flags.
+- Administrator gateway bearers are process-memory-only and must be entered again after desktop relaunch. Paired device credentials persist by reference in the OS credential store (Linux Secret Service) or, without one, stay memory-only with a visible warning. Tokens are intentionally absent from profile/default JSON, diagnostics, and CLI flags.
+- Connect profiles stop at runtime selection: the desktop pins the chosen endpoint and SPKI but cannot open a session until a direct HTTPS/WSS data plane and a runtime-side HTTP bootstrap-grant surface exist.
 - The gateway is loopback-and-SSH only. Direct HTTPS/WSS and public listeners are not implemented.
 - SSH-to-loopback mode supports a dedicated VM/container, not a network namespace shared with mutually untrusted local accounts or containers.
 - Authentication is one administrator token with ephemeral browser sessions; persistent token metadata, scopes, and selective revocation are not implemented.
