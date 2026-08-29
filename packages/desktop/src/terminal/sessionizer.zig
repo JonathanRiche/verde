@@ -3072,7 +3072,7 @@ pub const Daemon = struct {
                 }) catch return try connectErrorResponse(self.allocator, id_value, error.ConnectSignerUnavailable);
                 defer jwks.deinit();
                 lockStoreService(service);
-                var consumed = connect_grants.consume(arena, service.store.conn, .{
+                var issued = connect_grants.consume(arena, io, service.store.conn, .{
                     .compact_jwt = consume_request.grant_jwt.reveal(),
                     .jwks = jwks.value.keys,
                     .expected_issuer = issuer,
@@ -3084,20 +3084,22 @@ pub const Daemon = struct {
                     .client_nonce = consume_request.client_nonce,
                     .now_ms = nowMs(),
                     .maximum_lifetime_seconds = state.maximum_grant_lifetime_seconds,
-                }) catch |err| {
+                }, consume_request.device_label) catch |err| {
                     service.mutex.unlock();
                     return try connectErrorResponse(self.allocator, id_value, err);
                 };
                 service.mutex.unlock();
-                defer consumed.deinit(arena);
-                const result: connect_protocol.BootstrapConsumeResult = .{
-                    .connect_protocol_version = connect_protocol.CONNECT_PROTOCOL_VERSION,
-                    .grant_id = consumed.grant_id,
-                    .device_id = consumed.device_id,
-                    .scopes = consumed.scopes,
-                    .expires_at_ms = consumed.expires_at_ms,
-                };
-                break :response try okValueResponse(self.allocator, id_value, result);
+                defer issued.clear();
+                const scope_names = access_protocol.scopeNamesAlloc(arena, issued.scope_mask) catch |err|
+                    return try accessAdminErrorResponse(self.allocator, id_value, err);
+                break :response try connectBootstrapResponse(
+                    self.allocator,
+                    id_value,
+                    self.runtime_id,
+                    self.instance_id,
+                    &issued,
+                    scope_names,
+                );
             },
         };
     }
@@ -3320,6 +3322,8 @@ pub const Daemon = struct {
                     record.* = .{
                         .device_id = device.device_id,
                         .grant_id = device.grant_id,
+                        .source = device.source,
+                        .source_id = device.source_id,
                         .label = device.label,
                         .scopes = access_protocol.scopeNamesAlloc(arena, device.scope_mask) catch |err|
                             return try accessAdminErrorResponse(self.allocator, id_value, err),
@@ -10415,20 +10419,19 @@ fn connectErrorResponse(
         error.ConnectAlreadyLinked,
         => .{ .code = headless.protocol.ERR_INVALID_STATE, .message = "Connect lifecycle state does not allow this operation" },
         error.ConnectAuthenticationRejected => .{ .code = "authentication_rejected", .message = "Connect credential was not accepted" },
-        error.ConnectConflict,
-        error.ConnectBootstrapReplay,
-        => .{ .code = headless.protocol.ERR_CONFLICT, .message = "Connect request conflicts with durable state" },
+        error.ConnectConflict => .{ .code = headless.protocol.ERR_CONFLICT, .message = "Connect request conflicts with durable state" },
         error.ConnectIdentityMismatch,
         error.ConnectKeyIdentityMismatch,
         error.LinkIdentityMismatch,
         error.EnrollmentIdentityMismatch,
-        error.BootstrapIdentityMismatch,
         => .{ .code = headless.protocol.ERR_RUNTIME_IDENTITY_MISMATCH, .message = "Connect identity binding failed" },
-        error.BootstrapGrantExpired => .{ .code = "grant_expired", .message = "Connect bootstrap grant expired" },
+        error.ConnectBootstrapReplay,
+        error.BootstrapIdentityMismatch,
+        error.BootstrapGrantExpired,
         error.UnknownBootstrapKey,
         error.InvalidBootstrapSignature,
         error.InvalidBootstrapGrant,
-        => .{ .code = "grant_rejected", .message = "Connect bootstrap grant was rejected" },
+        => .{ .code = "authentication_rejected", .message = "Connect bootstrap grant was not accepted" },
         error.ConnectRateLimited => .{ .code = "rate_limited", .message = "Connect control plane rate limited the request" },
         error.ConnectStateCorrupt,
         error.ConnectStateMissing,
@@ -10562,6 +10565,42 @@ fn pairingGrantExchangeResponse(
     try json.beginObject();
     try json.objectField("access_protocol_version");
     try json.write(access_protocol.ACCESS_PROTOCOL_VERSION);
+    try json.objectField("runtime_id");
+    try json.write(runtime_id);
+    try json.objectField("instance_id");
+    try json.write(instance_id);
+    try json.objectField("device_id");
+    try json.write(issued.device_id[0..]);
+    try json.objectField("device_credential");
+    try json.write(issued.device_credential[0..]);
+    try json.objectField("scopes");
+    try json.write(scope_names);
+    try json.endObject();
+    try json.endObject();
+    return try writer.toOwnedSlice();
+}
+
+/// The only daemon response path allowed to reveal a Connect-issued local
+/// device credential. The gateway clears the returned IPC buffer.
+fn connectBootstrapResponse(
+    allocator: std.mem.Allocator,
+    id_value: std.json.Value,
+    runtime_id: []const u8,
+    instance_id: []const u8,
+    issued: *const access_store.IssuedDevice,
+    scope_names: []const []const u8,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer {
+        std.crypto.secureZero(u8, writer.written());
+        writer.deinit();
+    }
+    var json: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try beginOk(&json, id_value);
+    try json.objectField("result");
+    try json.beginObject();
+    try json.objectField("connect_protocol_version");
+    try json.write(connect_protocol.CONNECT_PROTOCOL_VERSION);
     try json.objectField("runtime_id");
     try json.write(runtime_id);
     try json.objectField("instance_id");

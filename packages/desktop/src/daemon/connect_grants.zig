@@ -6,6 +6,7 @@ const headless = @import("headless");
 
 const crypto = @import("connect_crypto.zig");
 const store = @import("connect_store.zig");
+const access_store = @import("access_store.zig");
 
 pub const ConsumeInput = struct {
     compact_jwt: []const u8,
@@ -21,30 +22,17 @@ pub const ConsumeInput = struct {
     maximum_lifetime_seconds: i64 = 300,
 };
 
-pub const Result = struct {
-    grant_id: []u8,
-    device_id: []u8,
-    scopes: [][]const u8,
-    expires_at_ms: i64,
-
-    pub fn deinit(self: *Result, allocator: std.mem.Allocator) void {
-        allocator.free(self.grant_id);
-        allocator.free(self.device_id);
-        for (self.scopes) |scope| allocator.free(scope);
-        allocator.free(self.scopes);
-        self.* = undefined;
-    }
-};
-
-/// Validate every signed/bound claim before atomically recording both grant
-/// ID and client nonce. Only after the insert commits may a caller mint local
-/// Pair/access material for the device.
+/// Validate every signed/bound claim, consume its replay keys, and issue a
+/// runtime-local device verifier in one transaction.
 pub fn consume(
     allocator: std.mem.Allocator,
+    io: std.Io,
     conn: zqlite.Conn,
     input: ConsumeInput,
-) !Result {
+    device_label: []const u8,
+) !access_store.IssuedDevice {
     if (input.now_ms < 0) return error.InvalidBootstrapTime;
+    try headless.access_protocol.validateDeviceLabel(device_label);
     var verified = try crypto.verifyBootstrapGrant(allocator, input.compact_jwt, input.jwks, .{
         .issuer = input.expected_issuer,
         .audience = input.expected_audience,
@@ -59,7 +47,11 @@ pub fn consume(
     defer verified.deinit();
     const claims = verified.claims();
     const expires_at_ms = std.math.mul(i64, claims.exp, 1000) catch return error.InvalidBootstrapTime;
-    try store.consumeBootstrap(
+    const scope_mask = try headless.access_protocol.scopeMask(claims.scopes);
+    try conn.execNoArgs("begin immediate");
+    var transaction_open = true;
+    defer if (transaction_open) conn.rollback();
+    try store.consumeBootstrapLocked(
         conn,
         claims.jti,
         claims.client_nonce,
@@ -72,22 +64,19 @@ pub fn consume(
         input.now_ms,
         expires_at_ms,
     );
-    const scopes = try allocator.alloc([]const u8, claims.scopes.len);
-    errdefer allocator.free(scopes);
-    var initialized: usize = 0;
-    errdefer for (scopes[0..initialized]) |scope| allocator.free(scope);
-    for (claims.scopes, scopes) |scope, *owned| {
-        owned.* = try allocator.dupe(u8, scope);
-        initialized += 1;
-    }
-    const grant_id = try allocator.dupe(u8, claims.jti);
-    errdefer allocator.free(grant_id);
-    return .{
-        .grant_id = grant_id,
-        .device_id = try allocator.dupe(u8, claims.device_id),
-        .scopes = scopes,
-        .expires_at_ms = expires_at_ms,
-    };
+    var issued = try access_store.issueConnectDeviceLocked(io, conn, .{
+        .connect_grant_id = claims.jti,
+        .connect_device_id = claims.device_id,
+        .device_key_thumbprint = claims.device_key_thumbprint,
+        .issuer = input.expected_issuer,
+        .device_label = device_label,
+        .scope_mask = scope_mask,
+        .now_ms = input.now_ms,
+    });
+    errdefer issued.clear();
+    try conn.commit();
+    transaction_open = false;
+    return issued;
 }
 
 fn openTestStore(tmp: *std.testing.TmpDir) !zqlite.Conn {
@@ -117,6 +106,7 @@ test "public bootstrap vector validates once and fails closed on identity or rep
     defer tmp.cleanup();
     const conn = try openTestStore(&tmp);
     defer conn.close();
+    try access_store.initialize(conn);
     try store.initialize(conn, runtime_id, instance_id);
     try store.recordLogin(conn, "https://connect.example.test", "https://connect.example.test", "{\"keys\":[]}", 300, 1);
     try store.beginLink(conn, "req_11111111111111111111111111111111", "external", 2);
@@ -139,14 +129,84 @@ test "public bootstrap vector validates once and fails closed on identity or rep
         .client_nonce = nonce,
         .now_ms = 1_893_456_000_000,
     };
-    var result = try consume(std.testing.allocator, conn, base);
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("grt_66666666666666666666666666666666", result.grant_id);
-    try std.testing.expectEqual(@as(usize, 2), result.scopes.len);
-    try std.testing.expectError(error.ConnectBootstrapReplay, consume(std.testing.allocator, conn, base));
+    var mismatch = base;
+    mismatch.expected_issuer = "https://other.example.test";
+    try std.testing.expectError(
+        error.BootstrapIdentityMismatch,
+        consume(std.testing.allocator, std.testing.io, conn, mismatch, "Wrong issuer"),
+    );
+    mismatch = base;
+    mismatch.expected_audience = "https://other-runtime.example.test";
+    try std.testing.expectError(
+        error.BootstrapIdentityMismatch,
+        consume(std.testing.allocator, std.testing.io, conn, mismatch, "Wrong audience"),
+    );
+    mismatch = base;
+    mismatch.device_key_thumbprint = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    try std.testing.expectError(
+        error.BootstrapIdentityMismatch,
+        consume(std.testing.allocator, std.testing.io, conn, mismatch, "Wrong key"),
+    );
+    var expired = base;
+    expired.now_ms = 1_893_456_090_000;
+    try std.testing.expectError(
+        error.BootstrapGrantExpired,
+        consume(std.testing.allocator, std.testing.io, conn, expired, "Expired"),
+    );
+    try conn.execNoArgs(
+        \\create trigger reject_connect_device_for_test
+        \\before insert on runtime_connect_devices
+        \\begin select raise(abort, 'injected device insert failure'); end
+    );
+    try std.testing.expectError(
+        error.ConstraintTrigger,
+        consume(std.testing.allocator, std.testing.io, conn, base, "Connect laptop"),
+    );
+    try conn.execNoArgs("drop trigger reject_connect_device_for_test");
+    // The failed post-validation insert rolled back grant consumption, so the
+    // exact signed grant remains usable once durable issuance can succeed.
+    var result = try consume(std.testing.allocator, std.testing.io, conn, base, "Connect laptop");
+    defer result.clear();
+    try std.testing.expectEqual(
+        try headless.access_protocol.scopeMask(&.{ "runtime:read", "chat:write" }),
+        result.scope_mask,
+    );
+    try std.testing.expectEqual(
+        headless.access_protocol.scopeBit(.runtime_read),
+        try access_store.authenticateDevice(
+            conn,
+            result.device_id[0..],
+            result.device_credential[0..],
+            &.{"runtime:read"},
+            base.now_ms + 1,
+        ),
+    );
+    try std.testing.expectError(
+        error.ConnectBootstrapReplay,
+        consume(std.testing.allocator, std.testing.io, conn, base, "Replay"),
+    );
     var wrong = base;
     wrong.instance_id = "00000000000000000000000000000000";
-    try std.testing.expectError(error.BootstrapIdentityMismatch, consume(std.testing.allocator, conn, wrong));
+    try std.testing.expectError(
+        error.BootstrapIdentityMismatch,
+        consume(std.testing.allocator, std.testing.io, conn, wrong, "Wrong identity"),
+    );
+    var devices = try access_store.listDevices(std.testing.allocator, conn, base.now_ms + 2);
+    defer devices.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), devices.items.len);
+    try std.testing.expectEqual(headless.access_protocol.DeviceSource.connect, devices.items[0].source);
+    try std.testing.expectEqualStrings("grt_66666666666666666666666666666666", devices.items[0].source_id.?);
+    try std.testing.expect(try access_store.revokeDevice(conn, result.device_id[0..], base.now_ms + 3));
+    try std.testing.expectError(
+        error.DeviceAuthenticationRejected,
+        access_store.authenticateDevice(
+            conn,
+            result.device_id[0..],
+            result.device_credential[0..],
+            &.{"runtime:read"},
+            base.now_ms + 4,
+        ),
+    );
 }
 
 test "signer rotation accepts retained keys but rejects unknown kid" {

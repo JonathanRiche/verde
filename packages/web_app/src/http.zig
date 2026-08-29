@@ -1,4 +1,4 @@
-//! Loopback-only HTTP and WebSocket gateway for the Solid client.
+//! Loopback HTTP and WebSocket gateway for SSH or one trusted HTTPS proxy.
 
 const std = @import("std");
 const headless = @import("headless");
@@ -16,6 +16,7 @@ pub const MAX_KEEPALIVE_REQUESTS: usize = 32;
 pub const MAX_HEADER_BYTES: usize = 4 * 1024;
 pub const MAX_LOGIN_BODY_BYTES: usize = 4 * 1024;
 pub const MAX_ACCESS_BODY_BYTES: usize = headless.access_protocol.MAX_PAIR_EXCHANGE_BODY_BYTES;
+pub const MAX_CONNECT_BOOTSTRAP_BODY_BYTES: usize = headless.connect_protocol.MAX_BOOTSTRAP_BODY_BYTES;
 pub const MAX_RPC_FRAME_BYTES: usize = daemon_mod.MAX_GATEWAY_RPC_BYTES;
 
 const MIN_CHANGES_RETRY_MS: u64 = 250;
@@ -146,7 +147,11 @@ pub fn serve(
     std.debug.print("verde-web listening on http://{f}/\n", .{listener.socket.address});
     std.debug.print("  daemon socket   {s}\n", .{config.sessionizer_endpoint});
     std.debug.print("  static          {s}\n", .{config.static_dir});
-    std.debug.print("  access          SSH tunnel to this loopback listener\n", .{});
+    if (config.trusted_proxy_origin.len > 0) {
+        std.debug.print("  access          trusted HTTPS proxy at {s}\n", .{config.trusted_proxy_origin});
+    } else {
+        std.debug.print("  access          SSH tunnel to this loopback listener\n", .{});
+    }
 
     var runtime: Runtime = .{};
     var group: std.Io.Group = .init;
@@ -206,8 +211,8 @@ fn handleConnection(
 
     var client_address = stream.socket.address;
     client_address.setPort(0);
-    var client_key_buffer: [128]u8 = undefined;
-    const client_key = std.fmt.bufPrint(&client_key_buffer, "{f}", .{client_address}) catch "loopback";
+    var peer_key_buffer: [128]u8 = undefined;
+    const peer_key = std.fmt.bufPrint(&peer_key_buffer, "{f}", .{client_address}) catch "loopback";
 
     var request_count: usize = 0;
     while (request_count < MAX_KEEPALIVE_REQUESTS) {
@@ -230,11 +235,12 @@ fn handleConnection(
             ) catch {};
             return;
         }
-        if (!requestEnvelopeAllowed(&request)) {
+        const request_envelope = classifyRequestEnvelope(config, &request) orelse {
             respondJson(&request, .bad_request, "{\"ok\":false,\"error\":\"invalid_request_origin\"}") catch {};
             if (!request.head.keep_alive) return;
             continue;
-        }
+        };
+        const client_key = requestClientKey(request_envelope, &request, peer_key);
         if (request.head.method == .OPTIONS) {
             respondJson(&request, .method_not_allowed, "{\"ok\":false,\"error\":\"options_not_supported\"}") catch {};
             if (!request.head.keep_alive) return;
@@ -249,6 +255,8 @@ fn handleConnection(
                     daemon,
                     auth,
                     runtime,
+                    config,
+                    request_envelope,
                     client_key,
                     &request,
                     opt_key,
@@ -264,6 +272,7 @@ fn handleConnection(
                     allocator,
                     io,
                     config,
+                    request_envelope,
                     daemon,
                     auth,
                     env_map,
@@ -285,6 +294,8 @@ fn handleWebSocketUpgrade(
     daemon: *daemon_mod.Daemon,
     auth: *auth_mod.Service,
     runtime: *Runtime,
+    config: config_mod,
+    request_envelope: RequestEnvelope,
     client_key: []const u8,
     request: *std.http.Server.Request,
     opt_key: ?[]const u8,
@@ -329,7 +340,7 @@ fn handleWebSocketUpgrade(
         break :pair WsAuthentication{ .pair = claims };
     };
     defer auth_context.clear();
-    if (!requestOriginAllowed(request, auth_context == .owner_session)) {
+    if (!requestOriginAllowed(config, request_envelope, request, auth_context == .owner_session)) {
         try respondJson(request, .forbidden, "{\"ok\":false,\"error\":\"origin_forbidden\"}");
         return;
     }
@@ -374,6 +385,7 @@ fn handleRequest(
     allocator: std.mem.Allocator,
     io: std.Io,
     config: config_mod,
+    request_envelope: RequestEnvelope,
     daemon: *daemon_mod.Daemon,
     auth: *auth_mod.Service,
     env_map: *const std.process.Environ.Map,
@@ -390,17 +402,41 @@ fn handleRequest(
 
     if (std.mem.eql(u8, split.path, "/auth/session")) {
         if (request.head.method != .POST) return respondMethodNotAllowed(request);
-        if (!requestOriginAllowed(request, true)) {
+        if (!requestOriginAllowed(config, request_envelope, request, true)) {
             try respondJson(request, .forbidden, "{\"ok\":false,\"error\":\"origin_forbidden\"}");
             return;
         }
-        try handleLogin(allocator, io, auth, client_key, request);
+        try handleLogin(allocator, io, auth, client_key, secureCookieForEnvelope(request_envelope), request);
+        return;
+    }
+
+    if (std.mem.eql(u8, split.path, headless.access_protocol.HTTP_RUNTIME_METADATA_PATH)) {
+        if (request.head.method != .GET) return respondMethodNotAllowed(request);
+        if (config.trustedProxyAuthority() == null) {
+            try respondJson(request, .not_found, "{\"ok\":false,\"error\":\"not_found\"}");
+            return;
+        }
+        try handleRuntimeMetadata(allocator, daemon, config, request);
+        return;
+    }
+
+    if (std.mem.eql(u8, split.path, headless.connect_protocol.HTTP_BOOTSTRAP_PATH)) {
+        if (request.head.method != .POST) return respondMethodNotAllowed(request);
+        if (config.trustedProxyAuthority() == null) {
+            try respondJson(request, .not_found, "{\"ok\":false,\"error\":\"not_found\"}");
+            return;
+        }
+        if (!requestOriginAllowed(config, request_envelope, request, false)) {
+            try respondJson(request, .forbidden, "{\"ok\":false,\"error\":\"origin_forbidden\"}");
+            return;
+        }
+        try handleConnectBootstrap(allocator, io, daemon, auth, client_key, request);
         return;
     }
 
     if (std.mem.eql(u8, split.path, headless.access_protocol.HTTP_PAIR_EXCHANGE_PATH)) {
         if (request.head.method != .POST) return respondMethodNotAllowed(request);
-        if (!requestOriginAllowed(request, false)) {
+        if (!requestOriginAllowed(config, request_envelope, request, false)) {
             try respondJson(request, .forbidden, "{\"ok\":false,\"error\":\"origin_forbidden\"}");
             return;
         }
@@ -410,7 +446,7 @@ fn handleRequest(
 
     if (std.mem.eql(u8, split.path, headless.access_protocol.HTTP_ACCESS_TOKEN_PATH)) {
         if (request.head.method != .POST) return respondMethodNotAllowed(request);
-        if (!requestOriginAllowed(request, false)) {
+        if (!requestOriginAllowed(config, request_envelope, request, false)) {
             try respondJson(request, .forbidden, "{\"ok\":false,\"error\":\"origin_forbidden\"}");
             return;
         }
@@ -420,7 +456,7 @@ fn handleRequest(
 
     if (std.mem.eql(u8, split.path, headless.access_protocol.HTTP_WEBSOCKET_TICKET_PATH)) {
         if (request.head.method != .POST) return respondMethodNotAllowed(request);
-        if (!requestOriginAllowed(request, false)) {
+        if (!requestOriginAllowed(config, request_envelope, request, false)) {
             try respondJson(request, .forbidden, "{\"ok\":false,\"error\":\"origin_forbidden\"}");
             return;
         }
@@ -446,7 +482,7 @@ fn handleRequest(
             return;
         };
         const state_changing = request.head.method != .GET and request.head.method != .HEAD;
-        if (!requestOriginAllowed(request, state_changing and auth_context == .owner_session)) {
+        if (!requestOriginAllowed(config, request_envelope, request, state_changing and auth_context == .owner_session)) {
             try respondJson(request, .forbidden, "{\"ok\":false,\"error\":\"origin_forbidden\"}");
             return;
         }
@@ -480,6 +516,7 @@ fn handleLogin(
     io: std.Io,
     auth: *auth_mod.Service,
     client_key: []const u8,
+    secure_cookie: bool,
     request: *std.http.Server.Request,
 ) !void {
     if (!contentTypeIsJson(requestContentType(request))) {
@@ -535,7 +572,7 @@ fn handleLogin(
             defer issued.clear();
             var cookie_buffer: [256]u8 = undefined;
             defer std.crypto.secureZero(u8, cookie_buffer[0..]);
-            const cookie = try auth_mod.formatSessionCookie(&cookie_buffer, &issued);
+            const cookie = try auth_mod.formatSessionCookie(&cookie_buffer, &issued, secure_cookie);
             var body_buffer: [128]u8 = undefined;
             const response_body = try std.fmt.bufPrint(
                 &body_buffer,
@@ -553,6 +590,169 @@ fn handleLogin(
             });
         },
     }
+}
+
+fn handleRuntimeMetadata(
+    allocator: std.mem.Allocator,
+    daemon: *daemon_mod.Daemon,
+    config: config_mod,
+    request: *std.http.Server.Request,
+) !void {
+    const status = daemon.callMethod("core.status", daemon_mod.Daemon.EmptyObject{}) catch {
+        try respondDaemonUnavailable(request);
+        return;
+    };
+    defer allocator.free(status.json);
+    var parsed = headless.parseResponse(allocator, status.json) catch {
+        try respondDaemonUnavailable(request);
+        return;
+    };
+    defer parsed.deinit();
+    const result = parsed.response.result orelse {
+        try respondDaemonUnavailable(request);
+        return;
+    };
+    const target = SessionRuntimeTarget.fromStatusResult(result) catch {
+        try respondDaemonUnavailable(request);
+        return;
+    };
+    if (!statusAdvertisesCapability(result, headless.access_protocol.PAIR_RUNTIME_CAPABILITY)) {
+        try respondDaemonUnavailable(request);
+        return;
+    }
+
+    var wss_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer wss_writer.deinit();
+    try wss_writer.writer.writeAll("wss://");
+    try wss_writer.writer.writeAll(config.trustedProxyAuthority().?);
+    try wss_writer.writer.writeAll("/ws");
+    const wss_url = wss_writer.written();
+    const metadata: headless.access_protocol.RuntimeEndpointMetadata = .{
+        .access_protocol_version = headless.access_protocol.ACCESS_PROTOCOL_VERSION,
+        .runtime_id = &target.runtime_id,
+        .instance_id = &target.instance_id,
+        .https_url = config.trusted_proxy_origin,
+        .wss_url = wss_url,
+        .capabilities = &.{headless.access_protocol.PAIR_RUNTIME_CAPABILITY},
+    };
+    const body = try std.json.Stringify.valueAlloc(allocator, metadata, .{});
+    defer allocator.free(body);
+    try respondJson(request, .ok, body);
+}
+
+fn handleConnectBootstrap(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    daemon: *daemon_mod.Daemon,
+    auth: *auth_mod.Service,
+    client_key: []const u8,
+    request: *std.http.Server.Request,
+) !void {
+    const now_ms = auth_mod.nowMillis(io);
+    if (try auth.connectPreflight(io, client_key, now_ms) == .rate_limited) {
+        try respondJson(request, .too_many_requests, "{\"ok\":false,\"error\":\"connect_bootstrap_rate_limited\"}");
+        return;
+    }
+    if (!contentTypeIsJson(requestContentType(request))) {
+        try respondJson(request, .unsupported_media_type, "{\"ok\":false,\"error\":\"expected_json\"}");
+        return;
+    }
+    const body = readBoundedSecretBody(allocator, request, MAX_CONNECT_BOOTSTRAP_BODY_BYTES) catch |err| switch (err) {
+        error.AccessBodyTooLarge => {
+            request.head.keep_alive = false;
+            try respondJson(request, .payload_too_large, "{\"ok\":false,\"error\":\"connect_bootstrap_body_too_large\"}");
+            return;
+        },
+        else => return err,
+    };
+    defer {
+        std.crypto.secureZero(u8, body);
+        allocator.free(body);
+    }
+    var parsed = headless.connect_protocol.parseHttpBootstrapRequest(allocator, body) catch {
+        _ = try auth.recordConnectAttempt(io, client_key, false, now_ms);
+        try respondJson(request, .unauthorized, "{\"ok\":false,\"error\":\"invalid_connect_grant\"}");
+        return;
+    };
+    defer {
+        std.crypto.secureZero(u8, @constCast(parsed.value.grant_jwt.reveal()));
+        parsed.deinit();
+    }
+    const bridge_request: headless.connect_protocol.BootstrapConsumeRequest = .{
+        .connect_protocol_version = parsed.value.connect_protocol_version,
+        .grant_jwt = parsed.value.grant_jwt,
+        .expected_issuer = parsed.value.expected_issuer,
+        .expected_audience = parsed.value.expected_audience,
+        .client_nonce = parsed.value.client_nonce,
+        .device_id = parsed.value.connect_device_id,
+        .device_key_thumbprint = parsed.value.device_key_thumbprint,
+        .device_label = parsed.value.device_label,
+    };
+    const daemon_result = callConnectBootstrapTargetedAfterBootstrap(
+        allocator,
+        daemon,
+        bridge_request,
+    ) catch {
+        try respondDaemonUnavailable(request);
+        return;
+    };
+    defer {
+        std.crypto.secureZero(u8, daemon_result.json);
+        allocator.free(daemon_result.json);
+    }
+    var envelope = headless.parseResponse(allocator, daemon_result.json) catch {
+        try respondDaemonUnavailable(request);
+        return;
+    };
+    defer envelope.deinit();
+    const result_value = envelope.response.result orelse {
+        if (std.mem.eql(u8, rpcErrorCode(envelope.response.err) orelse "", "authentication_rejected")) {
+            _ = try auth.recordConnectAttempt(io, client_key, false, now_ms);
+            try respondJson(request, .unauthorized, "{\"ok\":false,\"error\":\"invalid_connect_grant\"}");
+        } else {
+            try respondDaemonUnavailable(request);
+        }
+        return;
+    };
+    defer eraseJsonStringField(result_value, "device_credential");
+    var issued = std.json.parseFromValue(
+        headless.connect_protocol.BootstrapConsumeResult,
+        allocator,
+        result_value,
+        .{},
+    ) catch {
+        try respondDaemonUnavailable(request);
+        return;
+    };
+    defer {
+        std.crypto.secureZero(u8, @constCast(issued.value.device_credential.reveal()));
+        issued.deinit();
+    }
+    if (issued.value.connect_protocol_version != headless.connect_protocol.CONNECT_PROTOCOL_VERSION) {
+        try respondDaemonUnavailable(request);
+        return;
+    }
+    headless.protocol.validateRequestTarget(.{
+        .runtime_id = issued.value.runtime_id,
+        .instance_id = issued.value.instance_id,
+    }) catch {
+        try respondDaemonUnavailable(request);
+        return;
+    };
+    headless.access_protocol.validateDeviceId(issued.value.device_id) catch {
+        try respondDaemonUnavailable(request);
+        return;
+    };
+    headless.access_protocol.validateSecret(issued.value.device_credential.reveal()) catch {
+        try respondDaemonUnavailable(request);
+        return;
+    };
+    headless.access_protocol.validateScopeNames(issued.value.scopes) catch {
+        try respondDaemonUnavailable(request);
+        return;
+    };
+    _ = try auth.recordConnectAttempt(io, client_key, true, now_ms);
+    try respondConnectBootstrapResult(allocator, request, issued.value);
 }
 
 fn handlePairExchange(
@@ -712,7 +912,10 @@ fn handleAccessToken(
         try respondDaemonUnavailable(request);
         return;
     };
-    defer allocator.free(daemon_result.json);
+    defer {
+        std.crypto.secureZero(u8, daemon_result.json);
+        allocator.free(daemon_result.json);
+    }
     var envelope = headless.parseResponse(allocator, daemon_result.json) catch {
         try respondDaemonUnavailable(request);
         return;
@@ -1135,6 +1338,15 @@ fn callDeviceAuthenticateTargetedAfterBootstrap(
     return daemon.callDeviceAuthenticateTargeted(request, target.borrowed());
 }
 
+fn callConnectBootstrapTargetedAfterBootstrap(
+    allocator: std.mem.Allocator,
+    daemon: *daemon_mod.Daemon,
+    request: headless.connect_protocol.BootstrapConsumeRequest,
+) !daemon_mod.CallResult {
+    const target = try runtimeTargetAfterBootstrap(allocator, daemon);
+    return daemon.callConnectBootstrapTargeted(request, target.borrowed());
+}
+
 fn runtimeTargetAfterBootstrap(
     allocator: std.mem.Allocator,
     daemon: *daemon_mod.Daemon,
@@ -1157,6 +1369,10 @@ const SessionRuntimeTarget = struct {
         var parsed = try headless.parseResponse(allocator, status_json);
         defer parsed.deinit();
         const result = parsed.response.result orelse return error.InvalidRuntimeStatus;
+        return fromStatusResult(result);
+    }
+
+    fn fromStatusResult(result: std.json.Value) !SessionRuntimeTarget {
         if (result != .object) return error.InvalidRuntimeStatus;
         const runtime_id = jsonString(result.object.get("runtime_id") orelse .null) orelse
             return error.InvalidRuntimeStatus;
@@ -1167,7 +1383,7 @@ const SessionRuntimeTarget = struct {
             .instance_id = instance_id,
         };
         try headless.protocol.validateRequestTarget(candidate);
-        if (!statusAdvertisesTargetRpc(result)) return error.TargetRpcUnavailable;
+        if (!statusAdvertisesCapability(result, "rpc.target.v1")) return error.TargetRpcUnavailable;
 
         var target: SessionRuntimeTarget = undefined;
         @memcpy(target.runtime_id[0..], runtime_id);
@@ -1183,12 +1399,12 @@ const SessionRuntimeTarget = struct {
     }
 };
 
-fn statusAdvertisesTargetRpc(result: std.json.Value) bool {
+fn statusAdvertisesCapability(result: std.json.Value, expected: []const u8) bool {
     const capabilities = result.object.get("runtime_capabilities") orelse return false;
     if (capabilities != .array) return false;
     for (capabilities.array.items) |capability| {
         const name = jsonString(capability) orelse continue;
-        if (std.mem.eql(u8, name, "rpc.target.v1")) return true;
+        if (std.mem.eql(u8, name, expected)) return true;
     }
     return false;
 }
@@ -1639,7 +1855,10 @@ fn authorizePairClaims(
         headless.access_protocol.METHOD_DAEMON_DEVICE_AUTHORIZE,
         params,
     ) catch return false;
-    defer allocator.free(result.json);
+    defer {
+        std.crypto.secureZero(u8, result.json);
+        allocator.free(result.json);
+    }
     return switch (deviceAuthorizationStatus(
         allocator,
         result.json,
@@ -1686,26 +1905,148 @@ fn deviceAuthorizationStatus(
     return if (actual_mask == expected_mask) .authorized else .unavailable;
 }
 
-fn requestEnvelopeAllowed(request: *const std.http.Server.Request) bool {
+const RequestEnvelope = enum {
+    loopback,
+    trusted_proxy,
+};
+
+fn classifyRequestEnvelope(config: config_mod, request: *const std.http.Server.Request) ?RequestEnvelope {
     const split = splitTarget(request.head.target);
-    if (eraseQueryCredentials(split.query)) return false;
-    if (eraseLegacyTokenHeaders(request)) return false;
-    return switch (uniqueHeaderValue(request, "host")) {
-        .value => |host| validLoopbackAuthority(host),
-        else => false,
+    if (eraseQueryCredentials(split.query)) return null;
+    if (eraseLegacyTokenHeaders(request)) return null;
+    if (!headerIsNone(uniqueHeaderValue(request, "forwarded"))) return null;
+    const host = switch (uniqueHeaderValue(request, "host")) {
+        .value => |value| value,
+        else => return null,
+    };
+    return classifyEnvelopeValues(
+        config.trustedProxyAuthority(),
+        host,
+        uniqueHeaderValue(request, "x-forwarded-proto"),
+        uniqueHeaderValue(request, "x-forwarded-host"),
+        uniqueHeaderValue(request, "x-forwarded-for"),
+    );
+}
+
+fn classifyEnvelopeValues(
+    trusted_proxy_authority: ?[]const u8,
+    host: []const u8,
+    forwarded_proto: HeaderValue,
+    forwarded_host: HeaderValue,
+    forwarded_for: HeaderValue,
+) ?RequestEnvelope {
+    if (headerIsNone(forwarded_proto) and
+        headerIsNone(forwarded_host) and
+        headerIsNone(forwarded_for))
+    {
+        return if (validLoopbackAuthority(host)) .loopback else null;
+    }
+
+    const authority = trusted_proxy_authority orelse return null;
+    return if (trustedProxyEnvelopeAllowed(
+        authority,
+        host,
+        forwarded_proto,
+        forwarded_host,
+        forwarded_for,
+    )) .trusted_proxy else null;
+}
+
+fn requestClientKey(
+    envelope: RequestEnvelope,
+    request: *const std.http.Server.Request,
+    peer_key: []const u8,
+) []const u8 {
+    return clientKeyForEnvelope(envelope, uniqueHeaderValue(request, "x-forwarded-for"), peer_key);
+}
+
+fn clientKeyForEnvelope(
+    envelope: RequestEnvelope,
+    forwarded_for: HeaderValue,
+    peer_key: []const u8,
+) []const u8 {
+    return switch (envelope) {
+        .loopback => peer_key,
+        .trusted_proxy => switch (forwarded_for) {
+            .value => |value| value,
+            else => unreachable,
+        },
     };
 }
 
-fn requestOriginAllowed(request: *const std.http.Server.Request, required: bool) bool {
+fn secureCookieForEnvelope(envelope: RequestEnvelope) bool {
+    return envelope == .trusted_proxy;
+}
+
+fn requestOriginAllowed(
+    config: config_mod,
+    envelope: RequestEnvelope,
+    request: *const std.http.Server.Request,
+    required: bool,
+) bool {
     const host = switch (uniqueHeaderValue(request, "host")) {
         .value => |value| value,
         else => return false,
     };
-    return switch (uniqueHeaderValue(request, "origin")) {
+    return originAllowedForEnvelope(
+        config,
+        envelope,
+        host,
+        uniqueHeaderValue(request, "origin"),
+        required,
+    );
+}
+
+fn originAllowedForEnvelope(
+    config: config_mod,
+    envelope: RequestEnvelope,
+    host: []const u8,
+    origin_header: HeaderValue,
+    required: bool,
+) bool {
+    return switch (origin_header) {
         .invalid => false,
         .none => !required,
-        .value => |origin| sameLoopbackOrigin(host, origin),
+        .value => |origin| switch (envelope) {
+            .loopback => sameLoopbackOrigin(host, origin),
+            .trusted_proxy => std.ascii.eqlIgnoreCase(origin, config.trusted_proxy_origin),
+        },
     };
+}
+
+fn trustedProxyEnvelopeAllowed(
+    authority: []const u8,
+    host: []const u8,
+    forwarded_proto: HeaderValue,
+    forwarded_host: HeaderValue,
+    forwarded_for: HeaderValue,
+) bool {
+    if (!validLoopbackAuthority(host) and !std.ascii.eqlIgnoreCase(host, authority)) return false;
+    const proto = switch (forwarded_proto) {
+        .value => |value| value,
+        else => return false,
+    };
+    const public_host = switch (forwarded_host) {
+        .value => |value| value,
+        else => return false,
+    };
+    const client = switch (forwarded_for) {
+        .value => |value| value,
+        else => return false,
+    };
+    return std.mem.eql(u8, proto, "https") and
+        std.ascii.eqlIgnoreCase(public_host, authority) and
+        validForwardedClient(client);
+}
+
+fn validForwardedClient(value: []const u8) bool {
+    if (value.len == 0 or !std.mem.eql(u8, value, std.mem.trim(u8, value, " \t")) or
+        std.mem.indexOfScalar(u8, value, ',') != null)
+    {
+        return false;
+    }
+    _ = std.Io.net.IpAddress.parse(value, 0) catch return false;
+    return true;
 }
 
 const HeaderValue = union(enum) {
@@ -1713,6 +2054,13 @@ const HeaderValue = union(enum) {
     invalid,
     value: []const u8,
 };
+
+fn headerIsNone(value: HeaderValue) bool {
+    return switch (value) {
+        .none => true,
+        else => false,
+    };
+}
 
 fn uniqueHeaderValue(request: *const std.http.Server.Request, name: []const u8) HeaderValue {
     var found: ?[]const u8 = null;
@@ -2216,6 +2564,39 @@ fn eraseJsonStringField(value: std.json.Value, field: []const u8) void {
     if (candidate == .string) std.crypto.secureZero(u8, @constCast(candidate.string));
 }
 
+fn respondConnectBootstrapResult(
+    allocator: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    result: headless.connect_protocol.HttpBootstrapResult,
+) !void {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer {
+        std.crypto.secureZero(u8, writer.written());
+        writer.deinit();
+    }
+    var json: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try json.beginObject();
+    try json.objectField("connect_protocol_version");
+    try json.write(result.connect_protocol_version);
+    try json.objectField("runtime_id");
+    try json.write(result.runtime_id);
+    try json.objectField("instance_id");
+    try json.write(result.instance_id);
+    try json.objectField("device_id");
+    try json.write(result.device_id);
+    try json.objectField("device_credential");
+    try json.write(result.device_credential.reveal());
+    try json.objectField("scopes");
+    try json.write(result.scopes);
+    try json.endObject();
+    const body = try writer.toOwnedSlice();
+    defer {
+        std.crypto.secureZero(u8, body);
+        allocator.free(body);
+    }
+    try respondJson(request, .ok, body);
+}
+
 fn respondPairExchangeResult(
     allocator: std.mem.Allocator,
     request: *std.http.Server.Request,
@@ -2363,6 +2744,14 @@ test "query token and disabled file surfaces are rejected by policy" {
     try std.testing.expect(blockedRpcMethod(headless.access_protocol.METHOD_DAEMON_DEVICE_AUTHORIZE));
     try std.testing.expect(blockedRpcMethod(headless.connect_protocol.METHOD_LOGIN));
     try std.testing.expect(blockedRpcMethod(headless.connect_protocol.METHOD_BOOTSTRAP_CONSUME));
+    try std.testing.expectEqualStrings(
+        "/auth/connect/bootstrap",
+        headless.connect_protocol.HTTP_BOOTSTRAP_PATH,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 24 * 1024),
+        MAX_CONNECT_BOOTSTRAP_BODY_BYTES,
+    );
     try std.testing.expect(!blockedRpcMethod("core.status"));
 }
 
@@ -2492,6 +2881,116 @@ test "loopback Host and exact HTTP Origin validation" {
     try std.testing.expect(sameLoopbackOrigin("LOCALHOST:6783", "http://localhost:6783"));
     try std.testing.expect(!sameLoopbackOrigin("127.0.0.1:7420", "http://127.0.0.1:6783"));
     try std.testing.expect(!sameLoopbackOrigin("127.0.0.1:7420", "https://127.0.0.1:7420"));
+}
+
+test "trusted proxy mode preserves loopback and classifies exact proxy envelopes" {
+    const authority = "runtime.example.test";
+    try std.testing.expectEqual(RequestEnvelope.loopback, classifyEnvelopeValues(
+        authority,
+        "127.0.0.1:7420",
+        .none,
+        .none,
+        .none,
+    ).?);
+    try std.testing.expectEqual(RequestEnvelope.trusted_proxy, classifyEnvelopeValues(
+        authority,
+        "127.0.0.1:7420",
+        .{ .value = "https" },
+        .{ .value = authority },
+        .{ .value = "100.64.0.7" },
+    ).?);
+    try std.testing.expectEqual(RequestEnvelope.trusted_proxy, classifyEnvelopeValues(
+        authority,
+        "runtime.example.test",
+        .{ .value = "https" },
+        .{ .value = "RUNTIME.EXAMPLE.TEST" },
+        .{ .value = "2001:db8::7" },
+    ).?);
+    try std.testing.expect(classifyEnvelopeValues(
+        authority,
+        "127.0.0.1:7420",
+        .{ .value = "http" },
+        .{ .value = authority },
+        .{ .value = "100.64.0.7" },
+    ) == null);
+    try std.testing.expect(classifyEnvelopeValues(
+        authority,
+        "127.0.0.1:7420",
+        .{ .value = "https" },
+        .{ .value = "attacker.example.test" },
+        .{ .value = "100.64.0.7" },
+    ) == null);
+    try std.testing.expect(classifyEnvelopeValues(
+        authority,
+        "127.0.0.1:7420",
+        .{ .value = "https" },
+        .none,
+        .{ .value = "100.64.0.7" },
+    ) == null);
+    try std.testing.expect(classifyEnvelopeValues(
+        authority,
+        "127.0.0.1:7420",
+        .invalid,
+        .{ .value = authority },
+        .{ .value = "100.64.0.7" },
+    ) == null);
+    try std.testing.expect(classifyEnvelopeValues(
+        null,
+        "127.0.0.1:7420",
+        .{ .value = "https" },
+        .{ .value = authority },
+        .{ .value = "100.64.0.7" },
+    ) == null);
+    try std.testing.expect(classifyEnvelopeValues(
+        authority,
+        authority,
+        .none,
+        .none,
+        .none,
+    ) == null);
+    try std.testing.expect(!validForwardedClient("100.64.0.7, 127.0.0.1"));
+    try std.testing.expect(!validForwardedClient("not-an-ip"));
+
+    const proxy_config: config_mod = .{ .trusted_proxy_origin = "https://runtime.example.test" };
+    try std.testing.expect(proxy_config.trustedProxyAuthority() != null);
+    try std.testing.expect(originAllowedForEnvelope(
+        proxy_config,
+        .loopback,
+        "127.0.0.1:7420",
+        .{ .value = "http://127.0.0.1:7420" },
+        true,
+    ));
+    try std.testing.expect(!originAllowedForEnvelope(
+        proxy_config,
+        .loopback,
+        "127.0.0.1:7420",
+        .{ .value = "https://runtime.example.test" },
+        true,
+    ));
+    try std.testing.expect(originAllowedForEnvelope(
+        proxy_config,
+        .trusted_proxy,
+        "127.0.0.1:7420",
+        .{ .value = "https://runtime.example.test" },
+        true,
+    ));
+    try std.testing.expect(!originAllowedForEnvelope(
+        proxy_config,
+        .trusted_proxy,
+        "127.0.0.1:7420",
+        .{ .value = "http://127.0.0.1:7420" },
+        true,
+    ));
+    try std.testing.expectEqualStrings(
+        "127.0.0.1",
+        clientKeyForEnvelope(.loopback, .none, "127.0.0.1"),
+    );
+    try std.testing.expectEqualStrings(
+        "100.64.0.7",
+        clientKeyForEnvelope(.trusted_proxy, .{ .value = "100.64.0.7" }, "127.0.0.1"),
+    );
+    try std.testing.expect(!secureCookieForEnvelope(.loopback));
+    try std.testing.expect(secureCookieForEnvelope(.trusted_proxy));
 }
 
 test "session cookie parsing is exact and rejects duplicates" {

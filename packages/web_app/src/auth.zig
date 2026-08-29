@@ -658,6 +658,7 @@ pub const Service = struct {
     sessions: SessionManager,
     rate_limiter: LoginRateLimiter,
     pair_rate_limiter: LoginRateLimiter,
+    connect_rate_limiter: LoginRateLimiter,
     device_rate_limiter: LoginRateLimiter,
     ticket_rate_limiter: LoginRateLimiter,
     pair_credentials: PairCredentialManager,
@@ -678,6 +679,7 @@ pub const Service = struct {
             .sessions = sessions,
             .rate_limiter = try LoginRateLimiter.init(rate_limit_options),
             .pair_rate_limiter = try LoginRateLimiter.init(rate_limit_options),
+            .connect_rate_limiter = try LoginRateLimiter.init(rate_limit_options),
             .device_rate_limiter = try LoginRateLimiter.init(rate_limit_options),
             .ticket_rate_limiter = try LoginRateLimiter.init(rate_limit_options),
             .pair_credentials = try PairCredentialManager.init(.{}),
@@ -688,6 +690,7 @@ pub const Service = struct {
         self.pair_credentials.deinit();
         self.ticket_rate_limiter.deinit();
         self.device_rate_limiter.deinit();
+        self.connect_rate_limiter.deinit();
         self.pair_rate_limiter.deinit();
         self.rate_limiter.deinit();
         self.sessions.deinit();
@@ -739,6 +742,20 @@ pub const Service = struct {
         return self.pair_rate_limiter.recordAttempt(io, client_key, credential_valid, now_ms);
     }
 
+    pub fn connectPreflight(self: *Service, io: std.Io, client_key: []const u8, now_ms: i64) !RateLimitDecision {
+        return self.connect_rate_limiter.preflight(io, client_key, now_ms);
+    }
+
+    pub fn recordConnectAttempt(
+        self: *Service,
+        io: std.Io,
+        client_key: []const u8,
+        credential_valid: bool,
+        now_ms: i64,
+    ) !RateLimitDecision {
+        return self.connect_rate_limiter.recordAttempt(io, client_key, credential_valid, now_ms);
+    }
+
     pub fn devicePreflight(self: *Service, io: std.Io, client_key: []const u8, now_ms: i64) !RateLimitDecision {
         return self.device_rate_limiter.preflight(io, client_key, now_ms);
     }
@@ -768,14 +785,13 @@ pub const Service = struct {
     }
 };
 
-/// Formats cookie metadata for the SSH-loopback release. `Secure` is omitted
-/// because an SSH local-forward is normally opened as `http://127.0.0.1` in
-/// the browser; HttpOnly and SameSite=Strict remain mandatory.
-pub fn formatSessionCookie(buffer: []u8, issued: *const IssuedSession) ![]const u8 {
+/// Formats cookie metadata for either an HTTP SSH forward or the configured
+/// HTTPS proxy. HttpOnly and SameSite=Strict remain mandatory in both modes.
+pub fn formatSessionCookie(buffer: []u8, issued: *const IssuedSession, secure: bool) ![]const u8 {
     return std.fmt.bufPrint(
         buffer,
-        SESSION_COOKIE_NAME ++ "={s}; " ++ SESSION_COOKIE_ATTRIBUTES ++ "; Max-Age={d}",
-        .{ issued.id[0..], issued.max_age_seconds },
+        SESSION_COOKIE_NAME ++ "={s}; " ++ SESSION_COOKIE_ATTRIBUTES ++ "; Max-Age={d}{s}",
+        .{ issued.id[0..], issued.max_age_seconds, if (secure) "; Secure" else "" },
     );
 }
 
@@ -1000,12 +1016,24 @@ test "browser sessions can be revoked and emit strict cookie metadata" {
     defer issued.clear();
 
     var buffer: [256]u8 = undefined;
-    const cookie = try formatSessionCookie(&buffer, &issued);
+    const cookie = try formatSessionCookie(&buffer, &issued, false);
     try std.testing.expect(std.mem.startsWith(u8, cookie, SESSION_COOKIE_NAME ++ "="));
     try std.testing.expect(std.mem.indexOf(u8, cookie, "HttpOnly") != null);
     try std.testing.expect(std.mem.indexOf(u8, cookie, "SameSite=Strict") != null);
     try std.testing.expect(try sessions.revoke(std.testing.io, issued.id[0..]));
     try std.testing.expect(!try sessions.validate(std.testing.io, issued.id[0..], 2_001));
+}
+
+test "HTTPS proxy sessions add the Secure cookie attribute" {
+    var issued: IssuedSession = .{
+        .id = [_]u8{'a'} ** SESSION_ID_BYTES,
+        .expires_at_ms = 2_000,
+        .max_age_seconds = 60,
+    };
+    defer issued.clear();
+    var buffer: [256]u8 = undefined;
+    const cookie = try formatSessionCookie(&buffer, &issued, true);
+    try std.testing.expect(std.mem.endsWith(u8, cookie, "; Secure"));
 }
 
 test "failed logins are rate limited for a bounded window" {

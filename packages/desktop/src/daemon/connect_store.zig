@@ -280,7 +280,40 @@ pub fn consumeBootstrap(
     expires_at_ms: i64,
 ) !void {
     try conn.execNoArgs("begin immediate");
-    errdefer conn.rollback();
+    var transaction_open = true;
+    defer if (transaction_open) conn.rollback();
+    try consumeBootstrapLocked(
+        conn,
+        grant_id,
+        client_nonce,
+        runtime_id,
+        instance_id,
+        link_id,
+        issuer,
+        audience,
+        device_id,
+        consumed_at_ms,
+        expires_at_ms,
+    );
+    try conn.commit();
+    transaction_open = false;
+}
+
+/// Validate linked state and record one grant/nonce inside the caller's open
+/// transaction. Used when device verifier issuance must share the commit.
+pub fn consumeBootstrapLocked(
+    conn: zqlite.Conn,
+    grant_id: []const u8,
+    client_nonce: []const u8,
+    runtime_id: []const u8,
+    instance_id: []const u8,
+    link_id: []const u8,
+    issuer: []const u8,
+    audience: []const u8,
+    device_id: []const u8,
+    consumed_at_ms: i64,
+    expires_at_ms: i64,
+) !void {
     var identity = (try conn.row(
         \\select runtime_id, instance_id, desired_state, lifecycle_state,
         \\       link_id, issuer, endpoint_https_url
@@ -306,7 +339,6 @@ pub fn consumeBootstrap(
         "delete from runtime_connect_bootstrap_consumptions where expires_at_ms < ?1 and grant_id != ?2",
         .{ consumed_at_ms - 300_000, grant_id },
     );
-    try conn.commit();
 }
 
 fn parseDesired(value: []const u8) !connect.DesiredState {

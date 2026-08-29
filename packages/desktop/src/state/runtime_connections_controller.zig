@@ -25,6 +25,7 @@ pub const GRANT_ID_CAPACITY: usize = access_protocol.GRANT_ID_HEX_BYTES;
 pub const PAIRING_CODE_CAPACITY: usize = access_protocol.SECRET_HEX_BYTES;
 pub const DEVICE_LABEL_CAPACITY: usize = access_protocol.MAX_DEVICE_LABEL_BYTES;
 pub const URL_CAPACITY: usize = profile.MAX_URL_BYTES;
+pub const PAIR_LINK_PREFIX: []const u8 = "verde://pair?";
 const NOTICE_CAPACITY: usize = 256;
 /// Bounded so a hostile or huge manifest cannot grow the settings card
 /// without limit; extra rows are reported as a count.
@@ -41,7 +42,7 @@ pub const WizardMethod = enum {
     pub fn title(self: WizardMethod) []const u8 {
         return switch (self) {
             .ssh => "SSH with administrator token",
-            .pair => "Pair this device (no account)",
+            .pair => "Direct / Tailnet (Pair code)",
             .connect => "Connect through a control plane (account required)",
         };
     }
@@ -49,7 +50,7 @@ pub const WizardMethod = enum {
     pub fn description(self: WizardMethod) []const u8 {
         return switch (self) {
             .ssh => "Forward the daemon over SSH and enter its gateway token each session.",
-            .pair => "Forward over SSH once, redeem a one-time grant, keep a revocable device credential.",
+            .pair => "Connect to an HTTPS runtime or Tailscale Serve URL and keep a revocable device credential.",
             .connect => "Sign in to a self-hosted Verde Connect URL and pick a linked runtime. Verde Cloud later.",
         };
     }
@@ -57,7 +58,7 @@ pub const WizardMethod = enum {
 pub const WizardStep = enum {
     /// Method chooser shown first for new connections.
     method,
-    /// SSH/Pair endpoint fields.
+    /// SSH and Direct / Tailnet Pair endpoint fields.
     form,
     /// Saved profile with live status and connect/retry.
     testing,
@@ -69,9 +70,8 @@ pub const WizardStep = enum {
     connect_setup,
 };
 pub const WizardField = enum { label, host, user, ssh_port, gateway_port, grant_id, pairing_code, device_label, control_plane_url };
+/// Connect sign-in and bootstrap progress mirrored into the connection wizard.
 pub const ConnectPhase = connect_client.Phase;
-/// Truthful reason a Connect profile cannot serve sessions from the desktop yet.
-pub const CONNECT_BLOCKER = connect_client.BLOCKER;
 
 /// Row actions encoded into one `settings_runtime_action` hit index as
 /// `(row << ACTION_BITS) | action`. Row 0 is Local; rows 1.. are profiles in
@@ -282,7 +282,10 @@ pub const State = struct {
     /// Fields visible on the current step, in Tab order.
     pub fn visibleFields(self: *const State) []const WizardField {
         return switch (self.wizard_step) {
-            .form => &.{ .label, .host, .user, .ssh_port, .gateway_port },
+            .form => if (self.wizard_method == .pair)
+                &.{ .label, .control_plane_url }
+            else
+                &.{ .label, .host, .user, .ssh_port, .gateway_port },
             .pair_grant => &.{ .grant_id, .pairing_code, .device_label },
             .connect_setup => &.{ .label, .control_plane_url },
             .method, .testing, .pair_confirm => &.{},
@@ -309,6 +312,19 @@ pub fn validateWizardForm(state: *const State) ?ValidationError {
     profile.validateLabel(state.fieldValue(.label)) catch {
         return .{ .field = .label, .message = "Enter a name (1–80 printable characters)." };
     };
+    if (state.wizard_method == .pair) {
+        if (state.wizard_mode == .add) {
+            const link = state.fieldValue(.control_plane_url);
+            if (!std.mem.startsWith(u8, link, PAIR_LINK_PREFIX)) {
+                return .{ .field = .control_plane_url, .message = "Paste the complete verde://pair link from the runtime." };
+            }
+            return null;
+        }
+        profile.validateRuntimeHttpsOrigin(std.mem.trim(u8, state.fieldValue(.control_plane_url), &std.ascii.whitespace)) catch {
+            return .{ .field = .control_plane_url, .message = "Enter the runtime as https://host[:port] (a Tailscale Serve URL works)." };
+        };
+        return null;
+    }
     profile.validateSshHost(state.fieldValue(.host)) catch {
         return .{ .field = .host, .message = "Enter an SSH alias, hostname, or IP without spaces or shell characters." };
     };
@@ -336,6 +352,87 @@ pub fn validatePairGrantForm(state: *const State) ?ValidationError {
         return .{ .field = .device_label, .message = "Device label is 1–128 printable characters shown in the runtime's device list." };
     };
     return null;
+}
+
+/// Imports the frozen one-paste Pair URL. The fragment code is copied only to
+/// the masked code buffer, then the source link staging buffer is wiped.
+pub fn importPairLink(state: *State) !void {
+    const link = state.fieldValue(.control_plane_url);
+    if (!std.mem.startsWith(u8, link, PAIR_LINK_PREFIX)) return error.InvalidPairLink;
+    const hash = std.mem.indexOfScalar(u8, link, '#') orelse return error.InvalidPairLink;
+    if (std.mem.indexOfScalarPos(u8, link, hash + 1, '#') != null) return error.InvalidPairLink;
+    const query = link[PAIR_LINK_PREFIX.len..hash];
+    const fragment = link[hash + 1 ..];
+    if (!std.mem.startsWith(u8, fragment, "code=") or std.mem.indexOfScalar(u8, fragment, '&') != null) {
+        return error.InvalidPairLink;
+    }
+    const code = fragment["code=".len..];
+    try access_protocol.validateSecret(code);
+
+    var raw_host: ?[]const u8 = null;
+    var grant_id: ?[]const u8 = null;
+    var fields = std.mem.splitScalar(u8, query, '&');
+    while (fields.next()) |field| {
+        const eq = std.mem.indexOfScalar(u8, field, '=') orelse return error.InvalidPairLink;
+        const name = field[0..eq];
+        const value = field[eq + 1 ..];
+        if (std.mem.eql(u8, name, "host")) {
+            if (raw_host != null) return error.InvalidPairLink;
+            raw_host = value;
+        } else if (std.mem.eql(u8, name, "grant_id")) {
+            if (grant_id != null) return error.InvalidPairLink;
+            grant_id = value;
+        } else return error.InvalidPairLink;
+    }
+    const encoded_host = raw_host orelse return error.InvalidPairLink;
+    const grant = grant_id orelse return error.InvalidPairLink;
+    try access_protocol.validateGrantId(grant);
+    if (std.mem.indexOfScalar(u8, encoded_host, '%') == null or
+        std.mem.indexOfAny(u8, encoded_host, ":/") != null)
+    {
+        return error.InvalidPairLink;
+    }
+    try validatePercentEncoding(encoded_host);
+    var host_buffer: [URL_CAPACITY]u8 = undefined;
+    if (encoded_host.len > host_buffer.len) return error.InvalidPairLink;
+    @memcpy(host_buffer[0..encoded_host.len], encoded_host);
+    const host = std.Uri.percentDecodeInPlace(host_buffer[0..encoded_host.len]);
+    try profile.validateRuntimeHttpsOrigin(host);
+    const uri = std.Uri.parse(host) catch return error.InvalidPairLink;
+    if (uri.user != null or uri.password != null or uri.query != null or uri.fragment != null) return error.InvalidPairLink;
+    const path = switch (uri.path) {
+        .raw => |value| value,
+        .percent_encoded => |value| value,
+    };
+    if (path.len != 0 and !std.mem.eql(u8, path, "/")) return error.InvalidPairLink;
+
+    var grant_copy: [GRANT_ID_CAPACITY]u8 = undefined;
+    @memcpy(grant_copy[0..grant.len], grant);
+    var code_copy: [PAIRING_CODE_CAPACITY]u8 = undefined;
+    defer std.crypto.secureZero(u8, &code_copy);
+    @memcpy(code_copy[0..code.len], code);
+
+    // All validation happens before mutation. Once accepted, erase the link
+    // (including fragment), then retain only split values in their proper UI
+    // buffers; the code buffer is rendered/edited as a secret.
+    std.crypto.secureZero(u8, &state.control_plane_url_storage);
+    fillZ(&state.control_plane_url_storage, std.mem.trimEnd(u8, host, "/"));
+    fillZ(&state.grant_id_storage, grant_copy[0..grant.len]);
+    fillZ(&state.pairing_code_storage, code_copy[0..code.len]);
+    state.control_plane_url_cursor = state.fieldValue(.control_plane_url).len;
+    state.grant_id_cursor = grant.len;
+    state.pairing_code_cursor = code.len;
+}
+
+fn validatePercentEncoding(value: []const u8) !void {
+    var index: usize = 0;
+    while (index < value.len) : (index += 1) {
+        if (value[index] != '%') continue;
+        if (index + 2 >= value.len or !std.ascii.isHex(value[index + 1]) or !std.ascii.isHex(value[index + 2])) {
+            return error.InvalidPairLink;
+        }
+        index += 2;
+    }
 }
 
 /// Connect step validation: name plus a bare https:// control-plane URL.
@@ -447,6 +544,9 @@ pub fn openRuntimeConnectionEditor(self: anytype, profile_id: []const u8) void {
             var port_buf: [PORT_CAPACITY]u8 = undefined;
             fillZ(&rc.ssh_port_storage, std.fmt.bufPrint(&port_buf, "{d}", .{ssh.port}) catch "");
             fillZ(&rc.gateway_port_storage, std.fmt.bufPrint(&port_buf, "{d}", .{ssh.remote_gateway_port}) catch "");
+        },
+        .direct_https => |endpoint| {
+            fillZ(&rc.control_plane_url_storage, endpoint.https_url orelse "");
         },
         .connect => {
             fillZ(&rc.control_plane_url_storage, configured.access.connect.control_plane_url);
@@ -564,6 +664,7 @@ fn submitEndpointForm(self: anytype) void {
         setNotice(&rc.wizard_notice_storage, "Runtime service is unavailable.");
         return;
     };
+    if (rc.wizard_method == .pair) return submitDirectPairForm(self, service);
     const input: RuntimeService.SshProfileInput = .{
         .label = rc.fieldValue(.label),
         .ssh = wizardSshInput(rc),
@@ -610,6 +711,47 @@ fn submitEndpointForm(self: anytype) void {
     rc.wizard_step = .testing;
     blurWizardField(self);
     self.syncPaletteRuntimePicker();
+    self.markDirty();
+}
+
+fn submitDirectPairForm(self: anytype, service: *RuntimeService) void {
+    const rc = &self.runtime_connections;
+    if (rc.wizard_mode == .add) importPairLink(rc) catch {
+        setNotice(&rc.wizard_notice_storage, "Paste the complete verde://pair link. Manual host, grant ID, and code entry is available after import.");
+        focusWizardField(self, .control_plane_url);
+        self.markDirty();
+        return;
+    };
+    const url = std.mem.trim(u8, rc.fieldValue(.control_plane_url), &std.ascii.whitespace);
+    switch (rc.wizard_mode) {
+        .add => {
+            const id = service.createDirectPairedProfile(self.allocator, rc.fieldValue(.label), url) catch |err| {
+                setNotice(&rc.wizard_notice_storage, saveFailureMessage(err));
+                self.markDirty();
+                return;
+            };
+            defer self.allocator.free(id);
+            self.appendRuntimePickerProfile(id) catch {};
+            setWizardProfileId(self, id);
+            self.syncPaletteRuntimePicker();
+            enterPairGrantStep(self, "HTTPS endpoint saved. Enter the grant ID and masked one-time code from `verde-server pair create`.");
+        },
+        .edit => {
+            const profile_id = rc.wizard_profile_id orelse return;
+            const replacement = service.updateDirectPairedProfile(profile_id, rc.fieldValue(.label), url) catch |err| {
+                setNotice(&rc.wizard_notice_storage, saveFailureMessage(err));
+                self.markDirty();
+                return;
+            };
+            if (replacement == .endpoint_changed) invalidateReadiness(self, profile_id);
+            rc.wizard_step = .testing;
+            setNotice(&rc.wizard_notice_storage, if (replacement == .endpoint_changed)
+                "Endpoint changed. The old credential and identity trust were cleared; pair again."
+            else
+                "Saved.");
+        },
+    }
+    blurWizardField(self);
     self.markDirty();
 }
 
@@ -751,7 +893,7 @@ fn submitConnectSetup(self: anytype) void {
             if (session.loadInventory()) rc.connect_phase = .loading_inventory;
         },
         .inventory_loaded => adoptSelectedConnectRuntime(self, service),
-        .discovering, .signing_in, .loading_inventory, .idle, .failed => {},
+        .discovering, .signing_in, .loading_inventory, .bootstrapping, .bootstrap_ready, .idle, .failed => {},
     }
     self.markDirty();
 }
@@ -776,10 +918,13 @@ fn adoptSelectedConnectRuntime(self: anytype, service: *RuntimeService) void {
         log.warn("connect runtime selection failed: {s}", .{@errorName(err)});
         return;
     };
-    destroyConnectSession(rc, self.allocator);
-    invalidateReadiness(self, profile_id);
-    rc.wizard_step = .testing;
-    setNotice(&rc.wizard_notice_storage, "Runtime endpoint and SPKI pin saved. The OIDC session was discarded.");
+    const session = rc.connect_session orelse return;
+    if (!session.bootstrap(index, rc.fieldValue(.label))) {
+        setNotice(&rc.wizard_notice_storage, "Could not start the signed runtime bootstrap. Sign in again and retry.");
+        return;
+    }
+    rc.connect_phase = .bootstrapping;
+    setNotice(&rc.wizard_notice_storage, "Endpoint saved. Requesting a signed grant and creating the runtime-local device…");
     blurWizardField(self);
     self.syncPaletteRuntimePicker();
 }
@@ -925,6 +1070,36 @@ fn pollConnectSession(self: anytype) bool {
     rc.connect_failure = snapshot.failure;
     rc.connect_login_open = snapshot.login_url_open;
     rc.connect_device_flow_advertised = snapshot.device_flow_advertised;
+    if (snapshot.phase == .bootstrap_ready) {
+        if (session.takeBootstrapResult()) |owned_result| {
+            var result = owned_result;
+            defer result.deinit();
+            const service = self.runtime_service orelse return changed;
+            const profile_id = rc.wizard_profile_id orelse return changed;
+            const committed = service.commitConnectBootstrap(profile_id, .{
+                .runtime_id = result.runtime_id,
+                .instance_id = result.instance_id,
+                .device_id = result.device_id,
+                .device_credential = result.device_credential,
+            }, self.runtimeNowMs()) catch |err| {
+                destroyConnectSession(rc, self.allocator);
+                rc.connect_phase = .failed;
+                rc.connect_failure = null;
+                setNotice(&rc.wizard_notice_storage, saveFailureMessage(err));
+                return true;
+            };
+            destroyConnectSession(rc, self.allocator);
+            invalidateReadiness(self, profile_id);
+            rc.wizard_step = .testing;
+            setNotice(&rc.wizard_notice_storage, if (committed.durable)
+                "Connected. OIDC, signed grant, and device-key staging were wiped; the runtime-local credential is in the secret store."
+            else
+                "Connected, but this platform could keep the runtime-local credential only in memory.");
+            blurWizardField(self);
+            self.syncPaletteRuntimePicker();
+            return true;
+        }
+    }
     if (!optionalStringsEqual(rc.connect_issuer, snapshot.issuer)) {
         if (rc.connect_issuer) |value| self.allocator.free(value);
         rc.connect_issuer = if (snapshot.issuer) |value| self.allocator.dupe(u8, value) catch null else null;
@@ -958,6 +1133,8 @@ fn pollConnectSession(self: anytype) bool {
                 "No runtimes are linked to this account yet. Link one with `verde-daemon connect link` on the runtime host."
             else
                 "Select the runtime to use with this profile."),
+            .bootstrapping => setNotice(&rc.wizard_notice_storage, "Requesting and consuming the signed Connect bootstrap…"),
+            .bootstrap_ready => {},
             .signing_in => {},
             .discovering, .loading_inventory, .idle, .failed => {},
         }
@@ -1463,7 +1640,7 @@ fn saveFailureMessage(err: anyerror) []const u8 {
 fn pairingFailureMessage(err: anyerror) []const u8 {
     return switch (err) {
         error.InvalidGrantId, error.InvalidAccessSecret, error.DeviceLabelRequired, error.DeviceLabelTooLong, error.InvalidDeviceLabel => "Check the grant id, pairing code, and device label.",
-        error.UnsupportedRuntimeTransport => "Pairing needs an SSH-forwarded runtime.",
+        error.UnsupportedRuntimeTransport => "Pairing is available for SSH-forwarded and Direct / Tailnet runtimes.",
         error.ProfileAccessMismatch => "That runtime uses a different access method.",
         error.PairingNotConfirmed, error.PairingGrantMissing => "The exchange has not completed yet.",
         error.PairingIdentityMismatch => "The runtime's identity differs from the saved pin. Forget the device or edit the connection before re-pairing.",
@@ -1483,7 +1660,8 @@ fn pairingSnapshotFailureMessage(failure: @import("../runtime/manager.zig").Fail
         .authentication => "The runtime rejected the exchanged device credential.",
         .protocol => "The runtime answered with an invalid pairing response.",
         .resource => "Out of memory while pairing.",
-        .missing_credential, .unsupported_transport => "Pairing needs an SSH-forwarded runtime with a grant.",
+        .missing_credential => "Pairing needs a valid grant or saved device credential.",
+        .unsupported_transport => "Pairing needs an SSH relay or Direct / Tailnet HTTPS runtime.",
     };
 }
 
@@ -1496,7 +1674,9 @@ fn resetWizardFields(rc: *State) void {
     @memset(&rc.grant_id_storage, 0);
     std.crypto.secureZero(u8, &rc.pairing_code_storage);
     @memset(&rc.device_label_storage, 0);
-    @memset(&rc.control_plane_url_storage, 0);
+    // In Direct add mode this buffer may still contain the self-contained
+    // Pair link fragment, so clear it as secret staging on every exit/reset.
+    std.crypto.secureZero(u8, &rc.control_plane_url_storage);
     rc.label_cursor = 0;
     rc.host_cursor = 0;
     rc.user_cursor = 0;
@@ -1611,8 +1791,40 @@ test "connect form validation rejects non-https control planes" {
     try std.testing.expectEqual(WizardField.control_plane_url, validateConnectForm(&rc).?.field);
     fillZ(&rc.control_plane_url_storage, "https://user@connect.example");
     try std.testing.expectEqual(WizardField.control_plane_url, validateConnectForm(&rc).?.field);
+    fillZ(&rc.control_plane_url_storage, "https://connect.example?tenant=one");
+    try std.testing.expectEqual(WizardField.control_plane_url, validateConnectForm(&rc).?.field);
     fillZ(&rc.control_plane_url_storage, "  https://connect.example:8443/  ");
     try std.testing.expect(validateConnectForm(&rc) == null);
+}
+
+test "Pair link import is exact and wipes fragment staging" {
+    var rc: State = .{};
+    defer rc.deinit(std.testing.allocator);
+    const grant = "0123456789abcdef0123456789abcdef";
+    const code = "ab" ** 32;
+    fillZ(&rc.control_plane_url_storage, "verde://pair?host=https%3A%2F%2Fruntime.example&grant_id=" ++ grant ++ "#code=" ++ code);
+    try importPairLink(&rc);
+    try std.testing.expectEqualStrings("https://runtime.example", rc.fieldValue(.control_plane_url));
+    try std.testing.expectEqualStrings(grant, rc.fieldValue(.grant_id));
+    try std.testing.expectEqualStrings(code, rc.fieldValue(.pairing_code));
+}
+
+test "Pair link rejects query secrets duplicates and non-origin hosts" {
+    var rc: State = .{};
+    defer rc.deinit(std.testing.allocator);
+    const grant = "0123456789abcdef0123456789abcdef";
+    const code = "ab" ** 32;
+    const invalid = [_][]const u8{
+        "verde://pair?host=https%3A%2F%2Fruntime.example&grant_id=" ++ grant ++ "&code=" ++ code ++ "#code=" ++ code,
+        "verde://pair?host=https%3A%2F%2Fruntime.example&host=https%3A%2F%2Fother.example&grant_id=" ++ grant ++ "#code=" ++ code,
+        "verde://pair?host=https%3A%2F%2Fuser%40runtime.example&grant_id=" ++ grant ++ "#code=" ++ code,
+        "verde://pair?host=https%3A%2F%2Fruntime.example%2Fpath&grant_id=" ++ grant ++ "#code=" ++ code,
+        "https://runtime.example/?grant_id=" ++ grant ++ "#code=" ++ code,
+    };
+    for (invalid) |value| {
+        fillZ(&rc.control_plane_url_storage, value);
+        try std.testing.expectError(error.InvalidPairLink, importPairLink(&rc));
+    }
 }
 
 test "visible fields follow the wizard step so Tab never reaches hidden inputs" {

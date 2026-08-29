@@ -3211,8 +3211,8 @@ const RuntimeActivationAction = enum {
     /// Paired profile without a usable device credential: open the grant step
     /// instead of the administrator-token modal.
     request_pairing,
-    /// Connect profile: the desktop has no data plane yet, so activation opens
-    /// the editor, which states the exact blocker.
+    /// Connect profile without a runtime-local device: reopen selection and
+    /// bootstrap. Once present, normal enable/retry owns reconnects.
     request_runtime_selection,
 };
 
@@ -3249,7 +3249,7 @@ pub const RuntimePickerStatus = enum {
     pairing_rejected,
     /// The runtime is rate limiting Pair calls from this device.
     rate_limited,
-    /// Connect profile awaiting the desktop data plane.
+    /// Connect profile awaiting selection or runtime-local bootstrap.
     runtime_selection_required,
 };
 
@@ -3272,7 +3272,7 @@ pub fn runtimePickerStatus(snapshot: RuntimeService.Snapshot) RuntimePickerStatu
         .ready => if (snapshot.execution_ready) .ready else .limited,
         .reconnecting => .reconnecting,
         .disabled, .failed => if (snapshot.failure) |failure| switch (failure) {
-            .missing_credential => if (snapshot.access == .paired_device) .pairing_required else .credential_required,
+            .missing_credential => if (snapshot.access == .paired_device) .pairing_required else if (snapshot.access == .connect) .runtime_selection_required else .credential_required,
             .unsupported_transport => if (snapshot.access == .connect) .runtime_selection_required else .unsupported,
             .authentication => .authentication_failed,
             .identity => .identity_mismatch,
@@ -3280,7 +3280,7 @@ pub fn runtimePickerStatus(snapshot: RuntimeService.Snapshot) RuntimePickerStatu
             .protocol, .resource => .failed,
             .pairing_rejected => .pairing_rejected,
             .rate_limited => .rate_limited,
-        } else if (snapshot.access == .connect)
+        } else if (snapshot.access == .connect and (snapshot.device_id == null or !snapshot.device_credential_held))
             .runtime_selection_required
         else if (snapshot.access == .paired_device and !snapshot.credential_held and snapshot.pairing_state == .none)
             .pairing_required
@@ -3289,7 +3289,7 @@ pub fn runtimePickerStatus(snapshot: RuntimeService.Snapshot) RuntimePickerStatu
 }
 
 fn runtimeActivationAction(snapshot: RuntimeService.Snapshot) RuntimeActivationAction {
-    if (snapshot.access == .connect) return .request_runtime_selection;
+    if (snapshot.access == .connect and (snapshot.device_id == null or !snapshot.device_credential_held)) return .request_runtime_selection;
     if (snapshot.failure) |failure| {
         if (failure == .missing_credential or failure == .authentication or failure == .pairing_rejected) {
             return if (snapshot.access == .paired_device) .request_pairing else .request_credential;
@@ -3342,15 +3342,15 @@ pub fn runtimePickerStatusDescription(status: RuntimePickerStatus) []const u8 {
         .trust_required => "Confirm this daemon identity before use",
         .authentication_failed => "The remote daemon rejected authentication",
         .identity_mismatch => "The daemon identity differs from the saved pin",
-        .connection_failed => "The SSH runtime could not be reached",
+        .connection_failed => "The remote runtime could not be reached",
         .unsupported => "This transport is not supported by the desktop",
         .failed => "The runtime connection failed",
         .unavailable => "This configured runtime is unavailable",
         .pairing_required => "Redeem a one-time grant to pair this device",
         .pairing_rejected => "The runtime refused the grant; mint a new one",
         .rate_limited => "The runtime is rate limiting pairing; wait and retry",
-        .runtime_selection_required => "Sign in and choose a linked runtime (desktop data plane pending)",
-        else => "Remote daemon over SSH",
+        .runtime_selection_required => "Sign in, choose a linked runtime, and create its local device credential",
+        else => "Remote Verde runtime",
     };
 }
 

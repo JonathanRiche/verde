@@ -86,11 +86,11 @@ pub fn credentialBackend(self: *const Self) credential_store.Backend {
 // offers re-pairing instead of guessing.
 fn hydrateStoredDeviceCredentials(self: *Self, profiles: []const profile.Profile) void {
     for (profiles) |configured| {
-        const device = switch (configured.access) {
-            .paired_device => |device| device,
+        const ref = switch (configured.access) {
+            .paired_device => |device| device.credential_ref,
+            .connect => |link| link.credential_ref,
             else => continue,
-        };
-        const ref = device.credential_ref orelse continue;
+        } orelse continue;
         const credential = (self.credentials.getAlloc(self.allocator, ref) catch null) orelse continue;
         defer {
             std.crypto.secureZero(u8, credential);
@@ -98,6 +98,55 @@ fn hydrateStoredDeviceCredentials(self: *Self, profiles: []const profile.Profile
         }
         self.runtime_manager.hydrateDeviceCredential(configured.id, credential) catch {};
     }
+}
+
+pub const ConnectBootstrapResult = struct {
+    runtime_id: []const u8,
+    instance_id: []const u8,
+    device_id: []const u8,
+    device_credential: []const u8,
+};
+
+/// Adopts a runtime-local device returned once by the public Connect bootstrap
+/// endpoint. The external Connect device id is deliberately not accepted.
+pub fn commitConnectBootstrap(
+    self: *Self,
+    profile_id: []const u8,
+    result: ConnectBootstrapResult,
+    now_ms: u64,
+) !PairingCommit {
+    try connection.validateRuntimeId(result.runtime_id);
+    try connection.validateRuntimeId(result.instance_id);
+    try profile.validateDeviceId(result.device_id);
+    try headless.access_protocol.validateSecret(result.device_credential);
+    const ref = try credential_store.deviceRefAlloc(self.allocator, profile_id);
+    defer self.allocator.free(ref);
+
+    var lock = try profile_store.acquireExclusiveAtPath(self.allocator, self.io, self.profile_path);
+    defer lock.deinit();
+    var loaded = try profile_store.loadAtPath(self.allocator, self.io, self.profile_path);
+    defer loaded.deinit(self.allocator);
+    const configured = findProfile(loaded.items, profile_id) orelse return error.UnknownRuntimeProfile;
+    if (configured.access != .connect) return error.ProfileAccessMismatch;
+    const expected_runtime = configured.expected_runtime_id orelse return error.RuntimeIdentityNotPinned;
+    const expected_instance = configured.expected_instance_id orelse return error.RuntimeIdentityNotPinned;
+    if (!std.mem.eql(u8, expected_runtime, result.runtime_id) or
+        !std.mem.eql(u8, expected_instance, result.instance_id)) return error.PairingIdentityMismatch;
+    try configured.setConnectRuntimeDevice(self.allocator, result.device_id, ref);
+    try profile_store.saveAtPath(self.allocator, self.io, self.profile_path, loaded.items);
+
+    var durable = self.credentials.backend.durable();
+    self.credentials.put(ref, result.device_credential) catch |err| switch (err) {
+        error.CredentialStoreUnavailable => durable = false,
+        else => return err,
+    };
+    var authoritative = try profile_store.loadAtPath(self.allocator, self.io, self.profile_path);
+    defer authoritative.deinit(self.allocator);
+    const persisted = findProfile(authoritative.items, profile_id) orelse return error.RuntimeProfileNotPersisted;
+    _ = try self.runtime_manager.replaceProfile(persisted.*);
+    try self.runtime_manager.hydrateDeviceCredential(profile_id, result.device_credential);
+    try self.runtime_manager.enable(profile_id, now_ms);
+    return .{ .durable = durable };
 }
 
 /// Copies a bearer token into process memory for one configured profile.
@@ -213,6 +262,57 @@ pub fn createPairedProfile(self: *Self, allocator: std.mem.Allocator, input: Ssh
     var created = try profile.Profile.createPairedSshTunnel(self.allocator, self.io, input.label, input.ssh);
     defer created.deinit(self.allocator);
     return self.persistNewProfile(allocator, created);
+}
+
+/// Creates a directly reachable HTTPS Pair profile. The URL is non-secret;
+/// the one-time code and resulting device credential never enter the profile.
+pub fn createDirectPairedProfile(
+    self: *Self,
+    allocator: std.mem.Allocator,
+    label: []const u8,
+    https_url: []const u8,
+) ![]u8 {
+    var created = try profile.Profile.createPairedDirect(self.allocator, self.io, label, https_url, null);
+    defer created.deinit(self.allocator);
+    return self.persistNewProfile(allocator, created);
+}
+
+pub fn updateDirectPairedProfile(
+    self: *Self,
+    profile_id: []const u8,
+    label: []const u8,
+    https_url: []const u8,
+) !ProfileReplacement {
+    var lock = try profile_store.acquireExclusiveAtPath(self.allocator, self.io, self.profile_path);
+    defer lock.deinit();
+    var loaded = try profile_store.loadAtPath(self.allocator, self.io, self.profile_path);
+    defer loaded.deinit(self.allocator);
+    const configured = findProfile(loaded.items, profile_id) orelse return error.UnknownRuntimeProfile;
+    if (configured.transport != .direct_https or configured.access != .paired_device) return error.ProfileAccessMismatch;
+    const canonical = try profile.sanitizedRuntimeHttpsOriginAlloc(self.allocator, https_url);
+    defer self.allocator.free(canonical);
+    const changed = !std.mem.eql(u8, configured.transport.direct_https.https_url.?, canonical);
+    const previous_ref = if (changed and configured.access.paired_device.credential_ref != null)
+        try self.allocator.dupe(u8, configured.access.paired_device.credential_ref.?)
+    else
+        null;
+    defer if (previous_ref) |value| self.allocator.free(value);
+    try configured.setLabel(self.allocator, label);
+    if (changed) {
+        var endpoint: profile.DirectTransport = .{ .https_url = try self.allocator.dupe(u8, canonical) };
+        configured.transport.direct_https.deinit(self.allocator);
+        configured.transport.direct_https = endpoint;
+        endpoint = undefined;
+        try configured.setExpectedIdentity(self.allocator, null, null);
+        try configured.clearPairedDevice(self.allocator);
+    }
+    try profile_store.saveAtPath(self.allocator, self.io, self.profile_path, loaded.items);
+    var authoritative = try profile_store.loadAtPath(self.allocator, self.io, self.profile_path);
+    defer authoritative.deinit(self.allocator);
+    const persisted = findProfile(authoritative.items, profile_id) orelse return error.RuntimeProfileNotPersisted;
+    const replacement = try self.runtime_manager.replaceProfile(persisted.*);
+    if (previous_ref) |value| _ = self.credentials.remove(value) catch false;
+    return replacement;
 }
 
 /// Creates a Connect profile bound to one self-hosted control plane. The
@@ -367,14 +467,22 @@ pub fn updateConnectProfile(self: *Self, profile_id: []const u8, label: []const 
     defer loaded.deinit(self.allocator);
     const configured = findProfile(loaded.items, profile_id) orelse return error.UnknownRuntimeProfile;
     if (configured.access != .connect) return error.ProfileAccessMismatch;
+    const plane_changed = !configured.sameControlPlane(control_plane_url);
+    const previous_ref = if (plane_changed and configured.access.connect.credential_ref != null)
+        try self.allocator.dupe(u8, configured.access.connect.credential_ref.?)
+    else
+        null;
+    defer if (previous_ref) |value| self.allocator.free(value);
     try configured.setLabel(self.allocator, label);
-    if (!configured.sameControlPlane(control_plane_url)) try configured.setControlPlaneUrl(self.allocator, control_plane_url);
+    if (plane_changed) try configured.setControlPlaneUrl(self.allocator, control_plane_url);
     try profile_store.saveAtPath(self.allocator, self.io, self.profile_path, loaded.items);
 
     var authoritative = try profile_store.loadAtPath(self.allocator, self.io, self.profile_path);
     defer authoritative.deinit(self.allocator);
     const persisted = findProfile(authoritative.items, profile_id) orelse return error.RuntimeProfileNotPersisted;
-    return self.runtime_manager.replaceProfile(persisted.*);
+    const replacement = try self.runtime_manager.replaceProfile(persisted.*);
+    if (previous_ref) |value| _ = self.credentials.remove(value) catch false;
+    return replacement;
 }
 
 /// Non-secret runtime descriptor chosen from the signed-in Connect inventory.
@@ -387,15 +495,20 @@ pub const ConnectRuntimeSelection = struct {
     spki_sha256: []const u8,
 };
 
-/// Persists the selected endpoint identity (URLs, SPKI pin, link id, and the
-/// advertised runtime/instance pair). The live entry is re-added without
-/// trust because no handshake has verified that pair yet.
+/// Persists the selected endpoint metadata, link id, and advertised
+/// runtime/instance identity. Bootstrap must return that exact identity before
+/// the runtime-local credential is adopted.
 pub fn selectConnectRuntime(self: *Self, profile_id: []const u8, selection: ConnectRuntimeSelection) !void {
     var lock = try profile_store.acquireExclusiveAtPath(self.allocator, self.io, self.profile_path);
     defer lock.deinit();
     var loaded = try profile_store.loadAtPath(self.allocator, self.io, self.profile_path);
     defer loaded.deinit(self.allocator);
     const configured = findProfile(loaded.items, profile_id) orelse return error.UnknownRuntimeProfile;
+    const previous_ref = if (configured.access == .connect and configured.access.connect.credential_ref != null)
+        try self.allocator.dupe(u8, configured.access.connect.credential_ref.?)
+    else
+        null;
+    defer if (previous_ref) |value| self.allocator.free(value);
     try configured.setConnectEndpoint(self.allocator, selection.https_url, selection.wss_url, selection.spki_sha256, selection.link_id);
     try configured.setExpectedIdentity(self.allocator, selection.runtime_id, selection.instance_id);
     try profile_store.saveAtPath(self.allocator, self.io, self.profile_path, loaded.items);
@@ -404,6 +517,7 @@ pub fn selectConnectRuntime(self: *Self, profile_id: []const u8, selection: Conn
     defer authoritative.deinit(self.allocator);
     const persisted = findProfile(authoritative.items, profile_id) orelse return error.RuntimeProfileNotPersisted;
     _ = try self.runtime_manager.replaceProfile(persisted.*);
+    if (previous_ref) |value| _ = self.credentials.remove(value) catch false;
 }
 
 /// Removes the profile from disk and from the live manager, wiping any
@@ -424,6 +538,8 @@ pub fn removeProfile(self: *Self, profile_id: []const u8) !bool {
         // Removing a paired profile must not leave its credential behind.
         if (configured.access == .paired_device) {
             if (configured.access.paired_device.credential_ref) |ref| _ = self.credentials.remove(ref) catch false;
+        } else if (configured.access == .connect) {
+            if (configured.access.connect.credential_ref) |ref| _ = self.credentials.remove(ref) catch false;
         }
     }
     if (kept.items.len == loaded.items.len and self.runtime_manager.profileConst(profile_id) == null) {
@@ -470,6 +586,10 @@ pub fn redactedDiagnosticsAlloc(self: *const Self, allocator: std.mem.Allocator,
             "transport: ssh_tunnel host={s} user={s} ssh_port={d} gateway_port={d}\n",
             .{ ssh.host, ssh.user orelse "<default>", ssh.port, ssh.remote_gateway_port },
         ),
+        .direct_https => |endpoint| try w.print(
+            "transport: direct_https https_url={s} wss_url={s} spki_sha256={s}\n",
+            .{ endpoint.https_url orelse "<missing>", endpoint.wss_url orelse "<derived>", endpoint.spki_sha256 orelse "<pkix-only>" },
+        ),
         .connect => |endpoint| try w.print(
             "transport: connect https_url={s} wss_url={s} spki_sha256={s}\n",
             .{
@@ -494,8 +614,15 @@ pub fn redactedDiagnosticsAlloc(self: *const Self, allocator: std.mem.Allocator,
             },
         ),
         .connect => |link| try w.print(
-            "access: connect control_plane_url={s} link_id={s}\n",
-            .{ link.control_plane_url, link.link_id orelse "<none>" },
+            "access: connect control_plane_url={s} link_id={s} runtime_device_id={s} credential_ref={s} device_credential={s}\ncredential_store: {s}\n",
+            .{
+                link.control_plane_url,
+                link.link_id orelse "<none>",
+                link.device_id orelse "<not bootstrapped>",
+                link.credential_ref orelse "<none>",
+                if (snap.device_credential_held) "held in memory (<redacted>)" else "not loaded",
+                self.credentials.backend.description(),
+            },
         ),
     }
     try w.print("phase: {s}\nfailure: {s}\ntunnel: {s}\n", .{
@@ -630,7 +757,7 @@ const TestRpc = struct {
     fn call(
         raw_context: ?*anyopaque,
         allocator: std.mem.Allocator,
-        local_port: u16,
+        target: manager_mod.TransportTarget,
         bearer_token: []const u8,
         rpc_json: []const u8,
     ) connection.TransportError![]u8 {
@@ -644,11 +771,14 @@ const TestRpc = struct {
         };
         defer parsed.deinit();
 
-        const runtime_id = if (local_port == 43_127) TEST_RUNTIME_A else TEST_RUNTIME_B;
-        if (parsed.request.target) |target| {
+        const runtime_id = switch (target) {
+            .loopback => |port| if (port == 43_127) TEST_RUNTIME_A else TEST_RUNTIME_B,
+            .direct_https => TEST_RUNTIME_A,
+        };
+        if (parsed.request.target) |request_target| {
             _ = self.targeted_calls.fetchAdd(1, .acq_rel);
-            if (!std.mem.eql(u8, target.runtime_id, runtime_id) or
-                !std.mem.eql(u8, target.instance_id, TEST_INSTANCE_A))
+            if (!std.mem.eql(u8, request_target.runtime_id, runtime_id) or
+                !std.mem.eql(u8, request_target.instance_id, TEST_INSTANCE_A))
             {
                 self.valid_targets.store(false, .release);
             }

@@ -14,9 +14,15 @@ pub const Paths = struct {
     token_file: []const u8,
     static_dir: []const u8,
     gateway_port: u16,
+    trusted_proxy_origin: ?[]const u8 = null,
 };
 
-pub fn serve(io: std.Io, paths: Paths) !u8 {
+pub const ReadyHook = struct {
+    context: *anyopaque,
+    callback: *const fn (*anyopaque) anyerror!void,
+};
+
+pub fn serve(io: std.Io, paths: Paths, ready_hook: ?ReadyHook) !u8 {
     if (builtin.os.tag == .windows) return error.UnsupportedPlatform;
     try validatePaths(io, paths);
     shutdown_requested.store(false, .release);
@@ -29,17 +35,38 @@ pub fn serve(io: std.Io, paths: Paths) !u8 {
     var port_buffer: [6]u8 = undefined;
     var socket_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const port = try std.fmt.bufPrint(&port_buffer, "{d}", .{paths.gateway_port});
-    var gateway = std.process.spawn(io, .{ .argv = &.{
-        paths.gateway,                                       "--host",         "127.0.0.1",      "--port",       port,
-        "--token-file",                                      paths.token_file, "--pref-path",    paths.data_dir, "--sessionizer",
+    var gateway_args: std.ArrayList([]const u8) = .empty;
+    defer gateway_args.deinit(std.heap.page_allocator);
+    try gateway_args.appendSlice(std.heap.page_allocator, &.{
+        paths.gateway,                                      "--host",         "127.0.0.1",      "--port",       port,
+        "--token-file",                                     paths.token_file, "--pref-path",    paths.data_dir, "--sessionizer",
         try sessionizerPath(paths.data_dir, &socket_buffer), "--static",       paths.static_dir,
-    } }) catch |err| {
+    });
+    if (paths.trusted_proxy_origin) |origin| {
+        try gateway_args.appendSlice(std.heap.page_allocator, &.{ "--trusted-proxy-origin", origin });
+    }
+    var gateway = std.process.spawn(io, .{ .argv = gateway_args.items }) catch |err| {
         terminateChild(&daemon);
         _ = try daemon.wait(io);
         return err;
     };
     const started_gateway_pid = gateway.id.?;
     gateway_pid.store(@intCast(started_gateway_pid), .release);
+
+    waitForGateway(io, paths.gateway_port) catch |err| {
+        terminatePid(started_gateway_pid);
+        terminatePid(started_daemon_pid);
+        _ = try gateway.wait(io);
+        _ = try daemon.wait(io);
+        return err;
+    };
+    if (ready_hook) |hook| hook.callback(hook.context) catch |err| {
+        terminatePid(started_gateway_pid);
+        terminatePid(started_daemon_pid);
+        _ = try gateway.wait(io);
+        _ = try daemon.wait(io);
+        return err;
+    };
 
     var daemon_monitor: Monitor = .{ .child = &daemon, .io = io };
     var gateway_monitor: Monitor = .{ .child = &gateway, .io = io };
@@ -71,6 +98,21 @@ pub fn serve(io: std.Io, paths: Paths) !u8 {
     gateway_thread.join();
     if (shutdown_requested.load(.acquire)) return 0;
     return if (daemon_finished_first) termCode(daemon_monitor.term) else termCode(gateway_monitor.term);
+}
+
+fn waitForGateway(io: std.Io, port: u16) !void {
+    var attempts: usize = 0;
+    while (attempts < 100) : (attempts += 1) {
+        var address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1");
+        address.setPort(port);
+        const stream = address.connect(io, .{ .mode = .stream, .timeout = .none }) catch {
+            try std.Io.sleep(io, .fromMilliseconds(100), .awake);
+            continue;
+        };
+        stream.close(io);
+        return;
+    }
+    return error.GatewayStartupTimedOut;
 }
 
 pub fn validatePaths(io: std.Io, paths: Paths) !void {

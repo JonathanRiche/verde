@@ -28,6 +28,7 @@ pub fn main(init: std.process.Init) void {
 fn configurationErrorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.NonLoopbackHost => "non-loopback bind rejected; use --host 127.0.0.1 and connect through an SSH local forward",
+        error.InvalidTrustedProxyOrigin => "trusted proxy origin must be one exact pathless https:// origin",
         else => null,
     };
 }
@@ -71,4 +72,5 @@ test "non-loopback bind failure explains the supported access path" {
         configurationErrorMessage(error.NonLoopbackHost).?,
     );
     try std.testing.expect(configurationErrorMessage(error.TokenFileRequired) == null);
+    try std.testing.expect(configurationErrorMessage(error.InvalidTrustedProxyOrigin) != null);
 }

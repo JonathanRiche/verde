@@ -15,6 +15,10 @@ pub const Command = enum {
     pair_revoke,
     device_list,
     device_revoke,
+    connect,
+    connect_status,
+    connect_unlink,
+    connect_logout,
     service_install,
     service_status,
     service_update,
@@ -26,8 +30,14 @@ pub const Options = struct {
     data_dir: ?[]const u8 = null,
     token_file: ?[]const u8 = null,
     gateway_port: u16 = DEFAULT_GATEWAY_PORT,
+    tailscale: bool = false,
     json: bool = false,
     no_start: bool = false,
+    headless: bool = false,
+    install_service: bool = false,
+    control_plane_url: ?[]const u8 = null,
+    credential_file: ?[]const u8 = null,
+    descriptor_file: ?[]const u8 = null,
     delegate_args: []const []const u8 = &.{},
 };
 
@@ -45,6 +55,26 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) !Options {
             return error.InvalidArguments;
         } else if (std.mem.eql(u8, arg, "--json")) {
             options.json = true;
+        } else if (std.mem.eql(u8, arg, "--tailscale") and
+            (command == .serve or command == .service_install))
+        {
+            options.tailscale = true;
+        } else if (std.mem.eql(u8, arg, "--headless") and isConnectAuth(command)) {
+            options.headless = true;
+        } else if (std.mem.eql(u8, arg, "--install-service") and command == .connect) {
+            options.install_service = true;
+        } else if (std.mem.eql(u8, arg, "--control-plane") and isConnectAuth(command)) {
+            index += 1;
+            if (index >= argv.len or options.control_plane_url != null) return error.InvalidArguments;
+            options.control_plane_url = argv[index];
+        } else if (std.mem.eql(u8, arg, "--credential-file") and isConnectAuth(command)) {
+            index += 1;
+            if (index >= argv.len or options.credential_file != null) return error.InvalidArguments;
+            options.credential_file = argv[index];
+        } else if (std.mem.eql(u8, arg, "--descriptor-file") and command == .connect) {
+            index += 1;
+            if (index >= argv.len or options.descriptor_file != null) return error.InvalidArguments;
+            options.descriptor_file = argv[index];
         } else if (std.mem.eql(u8, arg, "--no-start") and command == .service_install) {
             options.no_start = true;
         } else if (std.mem.eql(u8, arg, "--data-dir")) {
@@ -87,6 +117,12 @@ fn parseCommand(argv: []const []const u8) !struct { Command, usize } {
     if (std.mem.eql(u8, first, "device")) return parseNested(argv, 2, .{
         .{ "list", .device_list }, .{ "revoke", .device_revoke },
     });
+    if (std.mem.eql(u8, first, "connect")) {
+        if (argv.len > 2 and std.mem.eql(u8, argv[2], "status")) return .{ .connect_status, 3 };
+        if (argv.len > 2 and std.mem.eql(u8, argv[2], "unlink")) return .{ .connect_unlink, 3 };
+        if (argv.len > 2 and std.mem.eql(u8, argv[2], "logout")) return .{ .connect_logout, 3 };
+        return .{ .connect, 2 };
+    }
     if (std.mem.eql(u8, first, "service")) return parseNested(argv, 2, .{
         .{ "install", .service_install }, .{ "status", .service_status },
         .{ "update", .service_update },   .{ "uninstall", .service_uninstall },
@@ -107,6 +143,10 @@ fn isDelegate(command: Command) bool {
         .pair_create, .pair_list, .pair_revoke, .device_list, .device_revoke => true,
         else => false,
     };
+}
+
+fn isConnectAuth(command: Command) bool {
+    return command == .connect or command == .connect_unlink or command == .connect_logout;
 }
 
 fn isRawSecretArgument(arg: []const u8) bool {
@@ -135,10 +175,31 @@ test "service and gateway options validate bounds" {
     defer deinit(&defaults, std.testing.allocator);
     try std.testing.expectEqual(DEFAULT_GATEWAY_PORT, defaults.gateway_port);
 
+    var tailscale = try parse(std.testing.allocator, &.{ "verde-server", "serve", "--tailscale" });
+    defer deinit(&tailscale, std.testing.allocator);
+    try std.testing.expect(tailscale.tailscale);
+
     var parsed = try parse(std.testing.allocator, &.{ "verde-server", "service", "install", "--gateway-port", "18473", "--no-start" });
     defer deinit(&parsed, std.testing.allocator);
     try std.testing.expectEqual(Command.service_install, parsed.command);
     try std.testing.expectEqual(@as(u16, 18473), parsed.gateway_port);
     try std.testing.expect(parsed.no_start);
     try std.testing.expectError(error.InvalidArguments, parse(std.testing.allocator, &.{ "verde-server", "serve", "--gateway-port", "0" }));
+}
+
+test "Connect onboarding and lifecycle commands are explicit" {
+    var bare = try parse(std.testing.allocator, &.{ "verde-server", "connect" });
+    defer deinit(&bare, std.testing.allocator);
+    try std.testing.expectEqual(Command.connect, bare.command);
+    var onboarding = try parse(std.testing.allocator, &.{
+        "verde-server", "connect", "--control-plane", "https://connect.example.test",
+        "--descriptor-file", "/tmp/runtime.json", "--headless", "--install-service",
+    });
+    defer deinit(&onboarding, std.testing.allocator);
+    try std.testing.expectEqual(Command.connect, onboarding.command);
+    try std.testing.expect(onboarding.headless);
+    try std.testing.expect(onboarding.install_service);
+    var status = try parse(std.testing.allocator, &.{ "verde-server", "connect", "status", "--json" });
+    defer deinit(&status, std.testing.allocator);
+    try std.testing.expectEqual(Command.connect_status, status.command);
 }

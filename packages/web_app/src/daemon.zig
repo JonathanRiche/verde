@@ -7,6 +7,7 @@ const config_mod = @import("config.zig");
 
 const protocol = headless.protocol;
 const access_protocol = headless.access_protocol;
+const connect_protocol = headless.connect_protocol;
 
 const INITIAL_RESPONSE_CAPACITY: usize = 64 * 1024;
 pub const MAX_GATEWAY_RPC_BYTES: usize = 1024 * 1024;
@@ -101,6 +102,16 @@ pub const Daemon = struct {
         return self.callSecretMethodTargetedWith(.{ .device_authenticate = request }, target, tryUnix);
     }
 
+    /// Send the signed Connect bootstrap grant only through the explicit
+    /// secret-bearing private daemon encoder.
+    pub fn callConnectBootstrapTargeted(
+        self: *Daemon,
+        request: connect_protocol.BootstrapConsumeRequest,
+        target: protocol.RequestTarget,
+    ) !CallResult {
+        return self.callSecretMethodTargetedWith(.{ .connect_bootstrap = request }, target, tryUnix);
+    }
+
     fn callSecretMethodTargetedWith(
         self: *Daemon,
         request: SecretBridgeRequest,
@@ -120,9 +131,10 @@ pub const Daemon = struct {
 const SecretBridgeRequest = union(enum) {
     pairing_exchange: access_protocol.PairingGrantExchangeRequest,
     device_authenticate: access_protocol.DeviceAuthenticateRequest,
+    connect_bootstrap: connect_protocol.BootstrapConsumeRequest,
 };
 
-/// Encode only the two private-daemon requests that intentionally reveal a
+/// Encode only the three private-daemon requests that intentionally reveal a
 /// secret. `access_protocol.Secret` remains redacted everywhere generic.
 fn encodeSecretTargetedRequest(
     allocator: std.mem.Allocator,
@@ -144,6 +156,7 @@ fn encodeSecretTargetedRequest(
     try json.write(switch (request) {
         .pairing_exchange => access_protocol.METHOD_DAEMON_PAIRING_EXCHANGE,
         .device_authenticate => access_protocol.METHOD_DAEMON_DEVICE_AUTHENTICATE,
+        .connect_bootstrap => connect_protocol.METHOD_BOOTSTRAP_CONSUME,
     });
     try json.objectField("params");
     try json.beginObject();
@@ -167,6 +180,24 @@ fn encodeSecretTargetedRequest(
             try json.write(params.device_credential.reveal());
             try json.objectField("requested_scopes");
             try json.write(params.requested_scopes);
+        },
+        .connect_bootstrap => |params| {
+            try json.objectField("connect_protocol_version");
+            try json.write(params.connect_protocol_version);
+            try json.objectField("grant_jwt");
+            try json.write(params.grant_jwt.reveal());
+            try json.objectField("expected_issuer");
+            try json.write(params.expected_issuer);
+            try json.objectField("expected_audience");
+            try json.write(params.expected_audience);
+            try json.objectField("client_nonce");
+            try json.write(params.client_nonce);
+            try json.objectField("device_id");
+            try json.write(params.device_id);
+            try json.objectField("device_key_thumbprint");
+            try json.write(params.device_key_thumbprint);
+            try json.objectField("device_label");
+            try json.write(params.device_label);
         },
     }
     try json.endObject();
@@ -274,6 +305,11 @@ const TestTransport = struct {
                 "b" ** access_protocol.SECRET_HEX_BYTES,
                 params.object.get("device_credential").?.string,
             );
+        } else if (std.mem.eql(u8, parsed.request.method, connect_protocol.METHOD_BOOTSTRAP_CONSUME)) {
+            try std.testing.expectEqualStrings(
+                "header.payload.signature",
+                params.object.get("grant_jwt").?.string,
+            );
         } else return error.UnexpectedMethod;
         return allocator.dupe(u8, "{\"id\":1,\"result\":{}}");
     }
@@ -324,7 +360,7 @@ test "daemon response remains authoritative" {
     );
 }
 
-test "Pair bridge deliberately reveals only transient daemon request secrets" {
+test "access bridges deliberately reveal only transient daemon request secrets" {
     const target: protocol.RequestTarget = .{
         .runtime_id = "0123456789abcdef0123456789abcdef",
         .instance_id = "00112233445566778899aabbccddeeff",
@@ -366,6 +402,33 @@ test "Pair bridge deliberately reveals only transient daemon request secrets" {
         TestTransport.secretBridge,
     );
     defer std.testing.allocator.free(authenticate_result.json);
+
+    const connect_secret = "header.payload.signature";
+    const connect_request: connect_protocol.BootstrapConsumeRequest = .{
+        .connect_protocol_version = connect_protocol.CONNECT_PROTOCOL_VERSION,
+        .grant_jwt = .{ .bytes = connect_secret },
+        .expected_issuer = "https://connect.example.test",
+        .expected_audience = "https://runtime.example.test",
+        .client_nonce = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        .device_id = "dev_33333333333333333333333333333333",
+        .device_key_thumbprint = "kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k",
+        .device_label = "Connect laptop",
+    };
+    const generic_connect = try protocol.encodeTargetedRequest(
+        std.testing.allocator,
+        10,
+        connect_protocol.METHOD_BOOTSTRAP_CONSUME,
+        connect_request,
+        target,
+    );
+    defer std.testing.allocator.free(generic_connect);
+    try std.testing.expect(std.mem.indexOf(u8, generic_connect, connect_secret) == null);
+    const connect_result = try daemon.callSecretMethodTargetedWith(
+        .{ .connect_bootstrap = connect_request },
+        target,
+        TestTransport.secretBridge,
+    );
+    defer std.testing.allocator.free(connect_result.json);
 }
 
 test "gateway request and response bounds are enforced" {

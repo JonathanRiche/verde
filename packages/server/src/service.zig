@@ -5,6 +5,10 @@ const builtin = @import("builtin");
 
 pub const UNIT_DAEMON = "verde-daemon.service";
 pub const UNIT_WEB = "verde-web.service";
+pub const LAUNCHD_DAEMON = "dev.verde.runtime.daemon";
+pub const LAUNCHD_WEB = "dev.verde.runtime.web";
+pub const PLIST_DAEMON = LAUNCHD_DAEMON ++ ".plist";
+pub const PLIST_WEB = LAUNCHD_WEB ++ ".plist";
 pub const STATE_FILE = "service-state.json";
 
 pub const ArtifactPaths = struct {
@@ -21,6 +25,7 @@ pub const RuntimePaths = struct {
     unit_dir: []const u8,
     state_dir: []const u8,
     gateway_port: u16,
+    trusted_proxy_origin: ?[]const u8 = null,
 };
 
 pub const ReleaseState = struct {
@@ -53,6 +58,11 @@ pub fn validateRuntimePaths(paths: RuntimePaths) !void {
     try validateSafeAbsolutePath(paths.unit_dir);
     try validateSafeAbsolutePath(paths.state_dir);
     if (paths.gateway_port == 0) return error.InvalidPort;
+    if (paths.trusted_proxy_origin) |origin| {
+        if (!std.mem.startsWith(u8, origin, "https://") or std.mem.indexOfAny(u8, origin, "\r\n\t ") != null) {
+            return error.InvalidTrustedProxyOrigin;
+        }
+    }
 }
 
 pub fn daemonUnitAlloc(allocator: std.mem.Allocator, artifacts: ArtifactPaths, paths: RuntimePaths) ![]u8 {
@@ -83,6 +93,11 @@ pub fn daemonUnitAlloc(allocator: std.mem.Allocator, artifacts: ArtifactPaths, p
 }
 
 pub fn webUnitAlloc(allocator: std.mem.Allocator, artifacts: ArtifactPaths, paths: RuntimePaths) ![]u8 {
+    const proxy_arg = if (paths.trusted_proxy_origin) |origin|
+        try std.fmt.allocPrint(allocator, " --trusted-proxy-origin {s}", .{origin})
+    else
+        try allocator.dupe(u8, "");
+    defer allocator.free(proxy_arg);
     return std.fmt.allocPrint(allocator,
         \\[Unit]
         \\Description=Verde authenticated loopback web gateway
@@ -93,7 +108,7 @@ pub fn webUnitAlloc(allocator: std.mem.Allocator, artifacts: ArtifactPaths, path
         \\Type=simple
         \\UMask=0077
         \\UnsetEnvironment=VERDE_SESSIONIZER_SOCKET VERDE_WEB_TOKEN
-        \\ExecStart={s} --host 127.0.0.1 --port {d} --token-file {s} --pref-path {s} --sessionizer {s}/verde-sessionizer.sock --static {s}
+        \\ExecStart={s} --host 127.0.0.1 --port {d} --token-file {s} --pref-path {s} --sessionizer {s}/verde-sessionizer.sock --static {s}{s}
         \\Restart=on-failure
         \\RestartSec=2s
         \\NoNewPrivileges=true
@@ -105,11 +120,71 @@ pub fn webUnitAlloc(allocator: std.mem.Allocator, artifacts: ArtifactPaths, path
         \\[Install]
         \\WantedBy=default.target
         \\
-    , .{ artifacts.web, paths.gateway_port, paths.token_file, paths.data_dir, paths.data_dir, artifacts.static_dir, artifacts.static_dir, paths.data_dir });
+    , .{ artifacts.web, paths.gateway_port, paths.token_file, paths.data_dir, paths.data_dir, artifacts.static_dir, proxy_arg, artifacts.static_dir, paths.data_dir });
+}
+
+pub fn daemonPlistAlloc(allocator: std.mem.Allocator, artifacts: ArtifactPaths, paths: RuntimePaths) ![]u8 {
+    return launchdPlistAlloc(allocator, LAUNCHD_DAEMON, &.{
+        artifacts.daemon, "serve", "--data-dir", paths.data_dir,
+    });
+}
+
+pub fn webPlistAlloc(allocator: std.mem.Allocator, artifacts: ArtifactPaths, paths: RuntimePaths) ![]u8 {
+    var arguments: std.ArrayList([]const u8) = .empty;
+    defer arguments.deinit(allocator);
+    var port_buffer: [6]u8 = undefined;
+    const port = try std.fmt.bufPrint(&port_buffer, "{d}", .{paths.gateway_port});
+    const socket = try std.fmt.allocPrint(allocator, "{s}/verde-sessionizer.sock", .{paths.data_dir});
+    defer allocator.free(socket);
+    try arguments.appendSlice(allocator, &.{
+        artifacts.web, "--host", "127.0.0.1", "--port", port,
+        "--token-file", paths.token_file, "--pref-path", paths.data_dir,
+        "--sessionizer", socket, "--static", artifacts.static_dir,
+    });
+    if (paths.trusted_proxy_origin) |origin| try arguments.appendSlice(allocator, &.{ "--trusted-proxy-origin", origin });
+    return launchdPlistAlloc(allocator, LAUNCHD_WEB, arguments.items);
+}
+
+fn launchdPlistAlloc(allocator: std.mem.Allocator, label: []const u8, arguments: []const []const u8) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try output.writer.writeAll(
+        \\<?xml version="1.0" encoding="UTF-8"?>
+        \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        \\<plist version="1.0"><dict>
+        \\<key>Label</key><string>
+    );
+    try writeXml(&output.writer, label);
+    try output.writer.writeAll("</string>\n<key>ProgramArguments</key><array>\n");
+    for (arguments) |argument| {
+        try output.writer.writeAll("<string>");
+        try writeXml(&output.writer, argument);
+        try output.writer.writeAll("</string>\n");
+    }
+    try output.writer.writeAll(
+        \\</array>
+        \\<key>RunAtLoad</key><true/>
+        \\<key>KeepAlive</key><true/>
+        \\<key>ProcessType</key><string>Background</string>
+        \\<key>Umask</key><integer>63</integer>
+        \\</dict></plist>
+    );
+    return output.toOwnedSlice();
+}
+
+fn writeXml(writer: *std.Io.Writer, value: []const u8) !void {
+    for (value) |byte| switch (byte) {
+        '&' => try writer.writeAll("&amp;"),
+        '<' => try writer.writeAll("&lt;"),
+        '>' => try writer.writeAll("&gt;"),
+        '"' => try writer.writeAll("&quot;"),
+        '\'' => try writer.writeAll("&apos;"),
+        else => try writer.writeByte(byte),
+    };
 }
 
 pub fn install(io: std.Io, allocator: std.mem.Allocator, artifacts: ArtifactPaths, paths: RuntimePaths, version: []const u8) !void {
-    if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.UnsupportedPlatform;
     try validateArtifactPaths(io, artifacts);
     try validateRuntimePaths(paths);
     try ensureOwnerOnlyDir(io, paths.unit_dir);
@@ -118,12 +193,25 @@ pub fn install(io: std.Io, allocator: std.mem.Allocator, artifacts: ArtifactPath
     if (std.fs.path.dirname(paths.token_file)) |parent| try ensureOwnerOnlyDir(io, parent);
     try ensureOwnerOnlyToken(io, paths.token_file);
 
-    try writeUnits(io, allocator, artifacts, paths);
+    if (builtin.os.tag == .linux) {
+        try writeUnits(io, allocator, artifacts, paths);
+    } else {
+        try writePlists(io, allocator, artifacts, paths);
+    }
 
     const root = std.fs.path.dirname(std.fs.path.dirname(artifacts.server) orelse return error.InvalidArtifactLayout) orelse
         return error.InvalidArtifactLayout;
     const state: ReleaseState = .{ .active_version = version, .active_root = root };
     try writeState(io, allocator, paths.state_dir, state);
+}
+
+pub fn writePlists(io: std.Io, allocator: std.mem.Allocator, artifacts: ArtifactPaths, paths: RuntimePaths) !void {
+    const daemon = try daemonPlistAlloc(allocator, artifacts, paths);
+    defer allocator.free(daemon);
+    const web = try webPlistAlloc(allocator, artifacts, paths);
+    defer allocator.free(web);
+    try writeAtomic(io, paths.unit_dir, PLIST_DAEMON, daemon, 0o600);
+    try writeAtomic(io, paths.unit_dir, PLIST_WEB, web, 0o600);
 }
 
 pub fn writeUnits(io: std.Io, allocator: std.mem.Allocator, artifacts: ArtifactPaths, paths: RuntimePaths) !void {
@@ -149,6 +237,8 @@ pub fn readState(io: std.Io, allocator: std.mem.Allocator, state_dir: []const u8
 pub fn uninstall(io: std.Io, paths: RuntimePaths) !void {
     try deleteIfExists(io, paths.unit_dir, UNIT_WEB);
     try deleteIfExists(io, paths.unit_dir, UNIT_DAEMON);
+    try deleteIfExists(io, paths.unit_dir, PLIST_WEB);
+    try deleteIfExists(io, paths.unit_dir, PLIST_DAEMON);
     // Runtime data, provider credentials, token, and release state are retained.
 }
 
@@ -312,6 +402,7 @@ test "units use exact foreground boundaries and no raw secret" {
         .unit_dir = "/home/verde/.config/systemd/user",
         .state_dir = "/home/verde/.local/state/verde-server",
         .gateway_port = 7420,
+        .trusted_proxy_origin = "https://runtime.tail.ts.net",
     };
     const daemon = try daemonUnitAlloc(std.testing.allocator, artifacts, paths);
     defer std.testing.allocator.free(daemon);
@@ -321,7 +412,16 @@ test "units use exact foreground boundaries and no raw secret" {
     try std.testing.expect(std.mem.indexOf(u8, daemon, "KillMode=mixed") != null);
     try std.testing.expect(std.mem.indexOf(u8, web, "--token-file /home/verde/.config/verde/web-token") != null);
     try std.testing.expect(std.mem.indexOf(u8, web, "--port 7420") != null);
+    try std.testing.expect(std.mem.indexOf(u8, web, "--trusted-proxy-origin https://runtime.tail.ts.net") != null);
     try std.testing.expect(std.mem.indexOf(u8, web, "VERDE_WEB_TOKEN=") == null);
+
+    const daemon_plist = try daemonPlistAlloc(std.testing.allocator, artifacts, paths);
+    defer std.testing.allocator.free(daemon_plist);
+    const web_plist = try webPlistAlloc(std.testing.allocator, artifacts, paths);
+    defer std.testing.allocator.free(web_plist);
+    try std.testing.expect(std.mem.indexOf(u8, daemon_plist, "dev.verde.runtime.daemon") != null);
+    try std.testing.expect(std.mem.indexOf(u8, web_plist, "--trusted-proxy-origin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, web_plist, "https://runtime.tail.ts.net") != null);
 }
 
 test "activation and rollback retain exact version roots" {

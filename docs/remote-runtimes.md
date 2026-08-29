@@ -18,7 +18,10 @@ loopback gateway provides rate-limited grant/device authentication,
 short-lived access tokens, one-use WebSocket tickets, current-revocation
 checks, and fail-closed per-RPC scope enforcement.
 
-The current standalone VM path and its limitations are documented in [Standalone Daemon Deployment](daemon-deployment.md). The daemon and SSH-forwarded browser gateway are usable now. The native desktop has durable non-secret profiles, offline profile/default-management CLI commands, a masked process-memory credential flow, explicit first-contact identity trust, a live Local/configured-runtime selector, a continuously owned loopback relay with shell-free per-call `ssh -W` channels, authenticated identity-targeted RPC, immutable thread routes, and remote text-chat dispatch. Remote attachments, remote PTYs/TUIs, direct HTTPS, guided provider login, and desktop multi-repository management remain separate follow-on work.
+The current standalone VM path and its limitations are documented in [Standalone Daemon Deployment](daemon-deployment.md). Direct private HTTPS through Tailscale Serve and the SSH-forwarded recovery path are usable now. The native desktop has durable non-secret profiles, one-paste `verde://pair` import for direct HTTPS, offline profile/default-management CLI commands, explicit first-contact identity trust, a live Local/configured-runtime selector, a continuously owned loopback relay with shell-free per-call `ssh -W` channels, authenticated identity-targeted RPC, immutable thread routes, and remote text-chat dispatch.
+
+Remote attachments, remote PTYs/TUIs, guided provider login, and desktop
+multi-repository management remain separate follow-on work.
 
 ## Outcome
 
@@ -89,7 +92,11 @@ An SSH profile is a transport profile, not Herdr state. The Verde-owned listener
 
 ### Add a direct HTTPS runtime
 
-The desktop collects an HTTPS URL and token/key reference, verifies TLS and the runtime handshake, and stores only the non-secret profile fields in config. This path is appropriate behind Caddy, nginx, Traefik, a VPN, or an administrator's equivalent TLS setup.
+The normal Tailnet flow is two actions: run `verde-server serve --tailscale`
+on the runtime, then open or paste its printed `verde://pair` link in the
+desktop and confirm the complete runtime/instance identity. Tailscale
+terminates verified HTTPS while `verde-web` remains bound to loopback. Manual
+HTTPS endpoints are an advanced operator-managed alternative.
 
 ### Choose per thread
 
@@ -148,9 +155,10 @@ Supported kinds:
 - `local_socket`: built-in local profile; not user-secret-bearing.
 - `ssh_tunnel`: Verde-owned loopback listener with one bounded `ssh -W`
   channel per permitted RPC to the remote loopback gateway.
-- `https`: planned direct HTTPS/WSS endpoint; not accepted by the version-1 profile decoder yet.
+- `https`: implemented direct HTTPS/WSS profile, normally created by importing
+  the self-contained Tailscale Pair link.
 
-Keep the descriptor extensible enough for an external provisioner to return an `https` profile later, but do not add SaaS account fields to it.
+The same normalized descriptor is used by the implemented Direct/Tailnet Pair flow and by optional external Connect provisioners; do not add SaaS account fields to the local profile schema.
 
 The first usable SSH slice keeps the gateway bearer only in desktop process memory. Selecting a profile with no hydrated token opens a masked credential modal; cancelling disables that profile and clears the token. The user must explicitly approve the complete runtime and instance IDs on first contact. The accepted identity pair is persisted in the non-secret profile transaction, but the bearer is wiped at shutdown and must be entered again after relaunch. Account-free Pair avoids that: the wizard exchanges a one-time grant over the same SSH forward, confirms the runtime identity, and stores the device credential in the OS credential store by reference (memory-only fallback is stated in the UI).
 
@@ -304,9 +312,9 @@ runtime generation probed by the CLI, and are blocked from the web gateway.
 Pair creation returns its one-time grant secret only through explicit human or
 `--json` output. The sibling loopback gateway implements remote pairing
 exchange, short-lived access tokens, one-use WebSocket tickets, and per-RPC
-scope enforcement. Convenience `service install/uninstall` remains
-unimplemented. Manual systemd and owner-token-file setup is documented
-separately.
+scope enforcement. `verde-server` now supplies Tailscale Serve orchestration,
+Linux systemd-user and macOS launchd install/status/update/uninstall paths,
+and conservative ownership-aware cleanup.
 
 ## Gateway hardening
 
@@ -335,16 +343,19 @@ The first SSH-safe gateway slice is implemented. `verde-web` now:
   redacted;
 - does not expose arbitrary file browsing or the legacy file/preview routes.
 
-This is deliberately not a public server or a direct HTTPS implementation. The browser reaches it through a manually owned SSH local forward; the native desktop reaches it through its continuously owned listener and per-call `ssh -W` relay. Before a future direct HTTPS mode is supported, it still needs:
+The gateway is deliberately not a public listener: it remains on loopback.
+Direct private HTTPS is implemented by placing Tailscale Serve in front as the
+one trusted TLS-terminating proxy. The frozen proxy contract requires one exact
+configured origin plus unique normalized forwarded proto, host, and client IP.
+Remaining follow-ons include:
 
-- add desktop pairing import plus OS credential-store persistence;
 - add proof-of-possession device keys as an optional successor to the current
   high-entropy verifier-backed device credential;
-- require TLS directly or define and test a trusted reverse-proxy contract;
-- add certificate and forwarded-origin diagnostics;
-- define a safe non-loopback bind mode rather than weakening the loopback default.
+- expand certificate and forwarded-origin diagnostics for proxy types beyond
+  the supported Tailscale path.
 
-SSH mode keeps this gateway on loopback. The browser uses a conventional local forward, while the native desktop uses its owned relay. A future direct HTTPS mode will use the same runtime APIs through TLS.
+Both modes keep the gateway on loopback. SSH uses its owned relay; direct mode
+uses Tailscale-terminated HTTPS and the same authenticated runtime APIs.
 
 The loopback TCP endpoint is a single-tenant deployment boundary, not merely a firewall setting. If `verde-web` is down, another untrusted account or container in the same remote network namespace could bind its unprivileged port and receive the next HTTP Authorization bearer before a runtime-identity response exists. The supported SSH deployment therefore uses a dedicated VM/container with no untrusted local users. Shared-host support must first add end-to-end TLS with a pinned server identity, or an SSH-authenticated stdio proxy to an owner-only Unix socket; a post-authentication runtime handshake cannot repair a bearer already disclosed to an impostor listener.
 
@@ -363,7 +374,8 @@ The implemented VM path is documented in [Standalone Daemon Deployment](daemon-d
 7. create an owner-only gateway token file and start `verde-web` on loopback;
 8. bind the workspace's existing primary and optional additional repository
    checkouts through the running daemon;
-9. use an SSH local forward and the browser client when desired;
+9. use an SSH local forward and the browser client when recovery/manual access
+   is desired;
 10. add a desktop SSH profile, choose it on a draft, enter the gateway bearer,
     approve the runtime identity, and send a text-only prompt.
 
@@ -404,7 +416,7 @@ Landed in the first foundation slice:
 - `providers.status` reports all eight integration providers with intentionally distinct native-chat, terminal, MCP, and lifecycle surfaces. It performs bounded installation checks; authentication is currently reported truthfully as `unknown` for every provider.
 - The transport-neutral client has typed capability gates and decoders for these new remote-safe surfaces.
 - A dependency-isolated `verde-daemon` artifact packages `bin/verde-daemon` plus `share/verde/provider_bridge.mjs` and implements idempotent init, foreground serve, runtime/store status, provider status, owner-only Pair/device administration, durable lifecycle notify, version/help, and PID-checked graceful signal shutdown.
-- The loopback-only `verde-web` gateway keeps its mandatory owner token and bounded browser sessions, and now also exposes the account-free Pair exchange: independently rate-limited grant/device authentication, verifier-only 15-minute scoped access tokens, one-use 30-second WebSocket tickets, centralized fail-closed HTTP/WebSocket RPC scope enforcement, and ongoing expiry/revocation checks. It still removes Live/mock fallback and arbitrary file/preview access.
+- The loopback-only `verde-web` gateway keeps its mandatory owner token and bounded browser sessions, exposes Pair exchange, and accepts one exact trusted-proxy origin for direct Tailscale HTTPS without permitting a public bind.
 - Desktop runtime foundations include runtime-qualified thread identities, a versioned non-secret Local/SSH profile schema with runtime/instance pinning, a process-memory-only bearer-token store, a 1 MiB bounded loopback RPC transport, and a continuously owned loopback listener that relays one permitted call through each shell-free OpenSSH `-W` process. The supervisor keeps normal user SSH configuration for aliases, ProxyJump, and IdentityFile while disabling control-master reuse, never releases a bearer-bearing call to an unowned listener, bounds I/O and teardown, and terminates the exact process tree it owns.
 - The per-profile connection manager validates canonical runtime and instance IDs, separates first-contact trust from transport readiness, and invalidates the connection generation when a token is cleared or replaced. A lock/reload/conflict/save/reread transaction adopts only an authoritative durable identity pair. Periodic targeted heartbeats and all general RPCs carry that pair; execution readiness requires a healthy current relay generation and `rpc.target.v1`.
 - The network gateway permits only bootstrap `core.status` without a target. Browser HTTP/WebSocket clients learn one page-lifetime identity pair and target every later request; the gateway targets its own snapshot/change calls, while the daemon rejects a missing, malformed, or mismatched target before either normal or slow dispatch.
@@ -415,7 +427,11 @@ Landed in the first foundation slice:
 - Workspace and thread page cursors are revision- and query-bound. A mutation or query mismatch produces an actionable restart-without-cursor error instead of silently duplicating or skipping rows.
 - Manual VM/systemd deployment and a locally built non-root Compose package now live in [Standalone Daemon Deployment](daemon-deployment.md).
 
-The open-source SSH path is now usable for desktop-configured, text-only native chat on a dedicated single-user VM/container. Still required for full parity: migrate the remaining desktop projections to bounded remote APIs; add desktop Pair credential import and optional OS credential-store hydration; add guided provider setup over a safe remote execution surface and deadline-bounded authentication probes; add repository add/clone/bind from the desktop; and complete attachment, audited file, reconnectable PTY, and remote TUI transport. Direct HTTPS and signed multi-architecture image publishing are also pending.
+The open-source SSH and Tailscale direct paths are usable for
+desktop-configured remote runtimes. Still required for full parity are guided
+provider setup, remaining repository/file/attachment/PTY surfaces, and signed
+multi-architecture image publishing. Connect requires an existing external
+HTTPS endpoint; no managed relay/tunnel is bundled.
 
 ## Delivery plan
 
@@ -480,9 +496,10 @@ Exit: each supported provider either works on the runtime or displays a specific
 
 Exit: chat images, project selection, native chat, and terminal TUIs work after a disconnect/reconnect.
 
-### 7. Direct HTTPS and deployment documentation (manual VM and local container guides landed)
+### 7. Direct HTTPS and deployment documentation (Tailscale direct path landed)
 
-- Add direct TLS profile support and certificate diagnostics.
+- Preserve direct Tailscale TLS profile support and expand certificate
+  diagnostics for advanced reverse proxies.
 - Preserve the landed non-root container/Compose path and add signed multi-architecture publishing, reverse-proxy, and container recovery instructions as those modes land.
 - Add hermetic remote integration coverage and a manual compatibility matrix.
 - Document threat model and security defaults.
@@ -498,17 +515,16 @@ Exit: a new user can deploy a runtime on an ordinary VM/container and connect wi
 - Preserve the landed self-hostable reference service with generic OIDC, signed and
   replay-safe grant issuance, revocation/audit, and cryptographic conformance
   vectors shared by every deployment.
-- Preserve the landed external operator-managed endpoint adapter, then add
-  runtime/desktop outbound connector lifecycle and optional managed adapters;
-  keep provider API credentials and tunnel-specific identifiers behind the
-  public adapter interface.
+- Preserve the landed external operator-managed endpoint adapter and keep
+  provider API credentials and tunnel-specific identifiers behind the public
+  adapter interface. No managed relay, tunnel, or runtime connector is bundled.
 - Allow private Verde Cloud to compose the same service with subscriptions,
   provisioning, and managed operations without replacing the public contract
   or reimplementing grant cryptography.
 
 Exit: an operator can self-host Connect identity, discovery, grants, and
-endpoint integration without a Verde account, while Serve/Pair remains usable
-without any control plane.
+publication of an already reachable HTTPS endpoint without a Verde account,
+while Serve/Pair remains usable without any control plane.
 
 ## Test matrix
 

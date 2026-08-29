@@ -601,6 +601,10 @@ fn writeProfiles(
                 ssh.remote_gateway_port,
             },
         ),
+        .direct_https => |endpoint| try out.stdout(
+            "{s}\t{s}\tdirect_https\t{s}\n",
+            .{ item.id, item.label, endpoint.https_url orelse "<missing endpoint>" },
+        ),
         .connect => |endpoint| try out.stdout(
             "{s}\t{s}\tconnect\t{s}\n",
             .{ item.id, item.label, endpoint.https_url orelse "<no runtime selected>" },

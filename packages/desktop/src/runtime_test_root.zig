@@ -17,6 +17,9 @@ test {
     _ = @import("runtime/service.zig");
     _ = @import("runtime/thread_binding.zig");
     _ = @import("daemon/runtime_identity.zig");
+    _ = @import("daemon/access_store.zig");
+    _ = @import("daemon/connect_store.zig");
+    _ = @import("daemon/connect_grants.zig");
     _ = @import("daemon/repository_path.zig");
     _ = @import("db/client.zig");
     _ = @import("cli/runtime_profiles.zig");

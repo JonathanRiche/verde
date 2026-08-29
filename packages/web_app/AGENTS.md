@@ -8,7 +8,8 @@ Do not start `mise run dev`, relaunch Verde, or use `pkill verde` from a Verde p
 
 ## Security contract
 
-The current gateway release is for loopback plus an SSH local forward only:
+The gateway listener remains loopback-only. It supports plain loopback/SSH
+requests and one explicitly configured trusted HTTPS proxy origin:
 
 - `verde-web` accepts only `127.0.0.1`, `localhost`, or `::1`; a public/LAN bind is a configuration error.
 - A token file is mandatory. It must be an owner-only, regular, non-symlink file containing at least 32 printable bytes.
@@ -17,7 +18,10 @@ The current gateway release is for loopback plus an SSH local forward only:
 - `GET /healthz` reveals liveness only. `GET /login`, `GET /login.js`, and trusted static assets are also public; unauthenticated app navigation redirects to `/login`. APIs and the exact `GET /ws` upgrade require authentication.
 - Keep the session daemon's Unix socket private to the host. The gateway is the only network adapter.
 - Do not restore Desktop Live/mock fallback, permissive CORS, arbitrary file browsing, `/api/file`, or `/api/preview`.
-- Do not expose this release through Cloudflare Tunnel, Tailscale Funnel/Serve, a public reverse proxy, or a public firewall/NAT port. Public HTTPS/WSS is a future deployment mode with its own security requirements.
+- Trusted-proxy mode must preserve plain loopback/SSH requests and accept only
+  the complete exact Tailscale-style forwarded HTTPS envelope. Partial, mixed,
+  duplicate, or standard `Forwarded` headers fail closed. Do not use Tailscale
+  Funnel, an arbitrary public reverse proxy, or a public firewall/NAT port.
 
 Static assets must come from the trusted built SPA directory. Do not turn static serving into a general filesystem server, and do not add repository HTML/SVG preview as an authenticated shortcut.
 
@@ -108,7 +112,9 @@ Or, from `packages/web_app`:
 
 In this mode `/`, `/api`, and `/ws` all come from `verde-web`; do not also run Vite on 6783.
 
-For a manually administered VM, leave the gateway on loopback and use a local-only SSH forward with normal host-key verification:
+For a manually administered VM, leave the gateway on loopback and use either
+the ownership-checked `verde-server serve --tailscale` flow or a local-only SSH
+forward with normal host-key verification:
 
 ```bash
 ssh -N -T \
@@ -117,7 +123,10 @@ ssh -N -T \
   verde-runtime
 ```
 
-Then open `http://127.0.0.1:6783/login`; the login page continues to the SPA after the session cookie is issued. The SSH tunnel encrypts network transit; the gateway itself does not implement public HTTPS in this release.
+Then open `http://127.0.0.1:6783/login`; the login page continues to the SPA
+after the session cookie is issued. The SSH tunnel encrypts network transit.
+In Tailnet mode, Tailscale Serve terminates private HTTPS and forwards to the
+same loopback gateway; the gateway does not bind publicly or implement TLS.
 
 ## Terminal engine (`ghostty-vt.wasm`)
 
