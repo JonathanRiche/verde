@@ -2,6 +2,8 @@
 
 const std = @import("std");
 
+const DEFAULT_GATEWAY_PORT: u16 = 7420;
+
 pub const Command = enum {
     init,
     serve,
@@ -23,7 +25,7 @@ pub const Options = struct {
     command: Command,
     data_dir: ?[]const u8 = null,
     token_file: ?[]const u8 = null,
-    gateway_port: u16 = 6783,
+    gateway_port: u16 = DEFAULT_GATEWAY_PORT,
     json: bool = false,
     no_start: bool = false,
     delegate_args: []const []const u8 = &.{},
@@ -129,6 +131,10 @@ test "parses operator and delegated commands without accepting raw tokens" {
 }
 
 test "service and gateway options validate bounds" {
+    var defaults = try parse(std.testing.allocator, &.{ "verde-server", "serve" });
+    defer deinit(&defaults, std.testing.allocator);
+    try std.testing.expectEqual(DEFAULT_GATEWAY_PORT, defaults.gateway_port);
+
     var parsed = try parse(std.testing.allocator, &.{ "verde-server", "service", "install", "--gateway-port", "18473", "--no-start" });
     defer deinit(&parsed, std.testing.allocator);
     try std.testing.expectEqual(Command.service_install, parsed.command);

@@ -323,6 +323,7 @@ fn printHelp(io: std.Io) !void {
         \\
         \\All paths passed to services are absolute. Pair/device operations delegate
         \\to the owner-only daemon transport. Raw tokens are never accepted in argv.
+        \\The production gateway port defaults to 7420.
         \\
     , .{});
 }

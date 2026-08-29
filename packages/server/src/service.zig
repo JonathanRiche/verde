@@ -311,7 +311,7 @@ test "units use exact foreground boundaries and no raw secret" {
         .token_file = "/home/verde/.config/verde/web-token",
         .unit_dir = "/home/verde/.config/systemd/user",
         .state_dir = "/home/verde/.local/state/verde-server",
-        .gateway_port = 6783,
+        .gateway_port = 7420,
     };
     const daemon = try daemonUnitAlloc(std.testing.allocator, artifacts, paths);
     defer std.testing.allocator.free(daemon);
@@ -320,6 +320,7 @@ test "units use exact foreground boundaries and no raw secret" {
     try std.testing.expect(std.mem.indexOf(u8, daemon, "Type=simple") != null);
     try std.testing.expect(std.mem.indexOf(u8, daemon, "KillMode=mixed") != null);
     try std.testing.expect(std.mem.indexOf(u8, web, "--token-file /home/verde/.config/verde/web-token") != null);
+    try std.testing.expect(std.mem.indexOf(u8, web, "--port 7420") != null);
     try std.testing.expect(std.mem.indexOf(u8, web, "VERDE_WEB_TOKEN=") == null);
 }
 

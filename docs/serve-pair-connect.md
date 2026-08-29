@@ -60,13 +60,12 @@ kind of workspace, thread, provider, or daemon.
 
 ## User-facing server CLI
 
-The current deployment exposes `verde-daemon` and `verde-web` separately.
-`verde-server` remains plan-only in this release. A future dependency-light
-command should be a thin administrator
-and supervisor over those existing artifacts; it must not merge their trust
-boundaries or invent another server implementation.
+The dependency-light `verde-server` command is implemented as a thin
+administrator and supervisor over the existing `verde-daemon` and `verde-web`
+artifacts. It preserves their trust boundaries rather than introducing another
+server implementation.
 
-Planned account-free commands:
+Implemented account-free commands:
 
 ```text
 verde-server init
@@ -106,25 +105,28 @@ operate only through its private local transport and are blocked by
 documented single-user default scope set. `pair create` prints the grant secret
 exactly once; `--json` is also an explicit secret-bearing output mode.
 
-Planned optional Connect commands:
+The owner-only daemon Connect lifecycle is implemented through:
 
 ```text
-verde-server connect
-verde-server connect login [--control-plane URL]
-verde-server connect link
-verde-server connect status [--json]
-verde-server connect unlink
-verde-server connect logout
+verde-daemon connect login --control-plane URL --credential-file PATH
+verde-daemon connect link --descriptor-file PATH
+verde-daemon connect status [--json]
+verde-daemon connect unlink [--json]
+verde-daemon connect logout [--json]
 ```
 
-Bare `connect` is onboarding: select a compatible control plane, authorize,
-link, and optionally install the background service. `login` stores
-authorization for that control plane without exposing the runtime. `unlink`
-disables exposure while retaining authorization. `logout` also removes that
-authorization. These commands remain planned. The open-source reference
-service, v1 contract, self-host guide, and external endpoint adapter are
-runnable now; Verde's runtime/desktop Connect CLI and outbound connector
-lifecycle are not implemented yet.
+`login` stores authorization for the selected control plane without exposing
+the runtime. `link` enables the desired linked state; `unlink` disables
+exposure while retaining authorization; `logout` also removes that
+authorization. The desktop implements control-plane discovery, OIDC PKCE
+sign-in, runtime inventory, selection, and endpoint pinning UI. The open-source
+reference service, v1 contract, self-host guide, runtime connector lifecycle,
+and external endpoint adapter are runnable now.
+
+The `verde-server connect ...` convenience commands and the desktop's direct
+Connect HTTPS/WSS bootstrap and data-plane transport remain incomplete. No
+production managed-cloud or managed-tunnel implementation is claimed or
+bundled.
 
 ## Direct pairing flow
 

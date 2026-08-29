@@ -4,7 +4,7 @@ services:
     network_mode: host
     environment:
       VERDE_MODE: runtime
-      VERDE_GATEWAY_PORT: "${VERDE_GATEWAY_PORT:-6783}"
+      VERDE_GATEWAY_PORT: "${VERDE_GATEWAY_PORT:-7420}"
     volumes:
       - verde-home:/home/verde
       - verde-workspaces:/workspace
