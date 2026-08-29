@@ -1,26 +1,40 @@
-//! OpenCode provider harness backed by the local HTTP server.
+//! OpenCode provider harness backed by the user's shared OpenCode 2 background service.
+//!
+//! OpenCode 2 runs one background service per user account. Verde never owns
+//! that process: it discovers the registration the service writes to
+//! `$XDG_STATE_HOME/opencode/service.json`, health-checks it with the
+//! registered password, and only asks the CLI (`opencode2 service start`) to
+//! bring one up when none is reachable. Every request is scoped to the
+//! workspace through the `location[directory]` query parameter.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const platform_process = @import("../platform/process.zig");
 const platform_runtime = @import("platform_runtime");
 const process_env = @import("../platform/env.zig");
 const provider_types = @import("types.zig");
-const runtime_log = @import("../runtime/log.zig");
 
 const log = std.log.scoped(.native_opencode);
 
 const MAX_HTTP_BODY_BYTES = 8 * 1024 * 1024;
+const MAX_SERVICE_FILE_BYTES = 64 * 1024;
+const MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024;
+/// `opencode2 service start` returns once the service is registered; a few
+/// extra probes cover slow filesystems and the first health response.
 const MAX_HEALTH_WAIT_ATTEMPTS = 30;
-/// Health-probe receive deadline: long enough for a healthy local server under
-/// load, short enough that a wedged server cannot hang startup or shutdown.
+/// Health-probe receive deadline: long enough for a healthy local service under
+/// load, short enough that a wedged service cannot hang startup or shutdown.
 const HEALTH_PROBE_RECV_TIMEOUT_MS = 2_000;
-const DEFAULT_BASE_URL = "http://127.0.0.1:4096";
+const DEFAULT_SERVICE_USERNAME = "opencode";
+const THREAD_LIST_LIMIT = 200;
 const MESSAGE_POLL_LIMIT = 12;
-const IMPORT_MESSAGE_LIMIT = 100_000;
+const IMPORT_PAGE_LIMIT = 200;
+const MAX_IMPORT_PAGES = 500;
 const POLL_INTERVAL_MS: u64 = 150;
 const MAX_POLL_ATTEMPTS = 24_000;
 const EMPTY_IDLE_GRACE_POLLS: usize = 16;
+/// Working-tree diffs run `git diff` inside the service; sample them every
+/// ~1.5s instead of on every poll tick.
+const DIFF_POLL_STRIDE: usize = 10;
 
 fn sleepMs(ms: u64) void {
     platform_runtime.sleepMillis(ms);
@@ -50,86 +64,57 @@ const Condition = struct {
 
 pub const Config = struct {
     allocator: std.mem.Allocator,
-    executable: []const u8 = "opencode",
-    base_url: []const u8 = DEFAULT_BASE_URL,
+    executable: []const u8 = "opencode2",
+    /// Explicit server override. When null, Verde discovers the user's shared
+    /// background service through its registration file.
+    base_url: ?[]const u8 = null,
     working_directory: ?[]const u8 = null,
     username: ?[]const u8 = null,
     password: ?[]const u8 = null,
     launch_if_missing: bool = false,
 };
 
-const SharedServerState = struct {
-    mutex: Mutex = .{},
-    child: ?platform_process.OwnedChild = null,
-    owns_child: bool = false,
-    active_clients: usize = 0,
-};
-
-var shared_server_state: SharedServerState = .{};
+/// Serializes `service start` so concurrent clients do not race to launch.
+var service_launch_mutex: Mutex = .{};
 
 pub fn providerSlashCommands() []const provider_types.ProviderSlashCommand {
     return &.{};
 }
 
-/// When `VERDE_DUMP_OPENCODE_PROVIDERS` is set to a non-empty value other than `0`, writes the raw
-/// JSON body from `GET /config/providers` to disk for inspection (reasoning/thinking fields, variants, etc.).
-/// Override path with `VERDE_DUMP_OPENCODE_PROVIDERS_PATH` (absolute recommended on Unix: `/tmp/...`).
-fn maybeDumpOpencodeProvidersConfig(body: []const u8) void {
-    const flag_z = std.c.getenv("VERDE_DUMP_OPENCODE_PROVIDERS") orelse return;
-    const flag = std.mem.sliceTo(flag_z, 0);
-    if (flag.len == 0 or std.mem.eql(u8, flag, "0")) return;
+/// Resolved connection details for one service; owned by the client.
+const Endpoint = struct {
+    base_url: []const u8,
+    password: ?[]const u8,
 
-    const default_path: []const u8 = switch (builtin.os.tag) {
-        .windows => "verde-opencode-config-providers.json",
-        else => "/tmp/verde-opencode-config-providers.json",
-    };
-    const path = if (std.c.getenv("VERDE_DUMP_OPENCODE_PROVIDERS_PATH")) |p|
-        std.mem.sliceTo(p, 0)
-    else
-        default_path;
+    fn init(allocator: std.mem.Allocator, base_url: []const u8, password: ?[]const u8) !Endpoint {
+        const owned_url = try allocator.dupe(u8, std.mem.trimEnd(u8, base_url, "/"));
+        errdefer allocator.free(owned_url);
+        const owned_password = if (password) |value| try allocator.dupe(u8, value) else null;
+        return .{ .base_url = owned_url, .password = owned_password };
+    }
 
-    var threaded = std.Io.Threaded.init_single_threaded;
-    var file = std.Io.Dir.createFileAbsolute(threaded.io(), path, .{ .truncate = true }) catch |err| {
-        log.warn("VERDE_DUMP_OPENCODE_PROVIDERS: create {s}: {s}", .{ path, @errorName(err) });
-        return;
-    };
-    defer file.close(threaded.io());
-    file.writeStreamingAll(threaded.io(), body) catch |err| {
-        log.warn("VERDE_DUMP_OPENCODE_PROVIDERS: write {s}: {s}", .{ path, @errorName(err) });
-        return;
-    };
-    log.info("VERDE_DUMP_OPENCODE_PROVIDERS: wrote {d} bytes to {s}", .{ body.len, path });
-}
+    fn deinit(self: *Endpoint, allocator: std.mem.Allocator) void {
+        allocator.free(self.base_url);
+        if (self.password) |value| allocator.free(value);
+    }
+};
 
 pub const Client = struct {
     allocator: std.mem.Allocator,
     config: Config,
-    server_lease_held: bool = false,
+    endpoint: Endpoint,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
-        var client: Client = .{
+        const endpoint = try resolveEndpoint(allocator, config);
+        return .{
             .allocator = allocator,
             .config = config,
+            .endpoint = endpoint,
         };
-        retainSharedServer();
-        client.server_lease_held = true;
-        errdefer client.releaseSharedServer();
-        try client.ensureServer();
-        return client;
     }
 
     pub fn deinit(self: *Client) void {
-        self.releaseSharedServer();
-    }
-
-    fn releaseSharedServer(self: *Client) void {
-        if (!self.server_lease_held) return;
-        self.server_lease_held = false;
-        shared_server_state.mutex.lock();
-        defer shared_server_state.mutex.unlock();
-        std.debug.assert(shared_server_state.active_clients > 0);
-        shared_server_state.active_clients -= 1;
-        if (shared_server_state.active_clients == 0) stopOwnedServerLocked();
+        self.endpoint.deinit(self.allocator);
     }
 
     pub fn slashCommands(self: *Client) []const provider_types.ProviderSlashCommand {
@@ -149,7 +134,9 @@ pub const Client = struct {
     }
 
     pub fn authState(self: *Client) !provider_types.AuthState {
-        const response = try self.requestJson(.GET, "/provider", null);
+        const path = try self.apiPathAlloc("/provider", .{}, null);
+        defer self.allocator.free(path);
+        const response = try self.requestJson(.GET, path, null);
         defer self.allocator.free(response.body);
 
         if (response.status != .ok) return error.OpencodeRequestFailed;
@@ -157,15 +144,19 @@ pub const Client = struct {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, response.body, .{});
         defer parsed.deinit();
 
-        const connected = getObjectField(parsed.value, "connected") orelse return .unknown;
-        return switch (connected) {
+        const providers = getObjectField(parsed.value, "data") orelse return .unknown;
+        return switch (providers) {
             .array => |items| if (items.items.len > 0) .signed_in else .signed_out,
             else => .unknown,
         };
     }
 
     pub fn listThreads(self: *Client, allocator: std.mem.Allocator) ![]provider_types.ChatThreadSummary {
-        const response = try self.requestJson(.GET, "/session", null);
+        const query = try std.fmt.allocPrint(self.allocator, "limit={d}&order=desc", .{THREAD_LIST_LIMIT});
+        defer self.allocator.free(query);
+        const path = try self.apiPathAlloc("/session", .{}, query);
+        defer self.allocator.free(path);
+        const response = try self.requestJson(.GET, path, null);
         defer self.allocator.free(response.body);
 
         if (response.status != .ok) return error.OpencodeRequestFailed;
@@ -173,19 +164,15 @@ pub const Client = struct {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, response.body, .{});
         defer parsed.deinit();
 
-        if (parsed.value != .array) {
-            return allocator.alloc(provider_types.ChatThreadSummary, 0);
-        }
+        const sessions = getObjectField(parsed.value, "data") orelse return allocator.alloc(provider_types.ChatThreadSummary, 0);
+        if (sessions != .array) return allocator.alloc(provider_types.ChatThreadSummary, 0);
 
         var threads: std.ArrayList(provider_types.ChatThreadSummary) = .empty;
         defer threads.deinit(allocator);
-        var saw_directory = false;
 
-        for (parsed.value.array.items) |session_value| {
+        for (sessions.array.items) |session_value| {
             if (session_value != .object) continue;
-            const directory = getOptionalObjectString(session_value, "directory");
-            if (directory != null) saw_directory = true;
-            if (!sessionMatchesWorkingDirectory(self.config.working_directory, directory)) continue;
+            if (!sessionMatchesWorkingDirectory(self.config.working_directory, sessionDirectory(session_value))) continue;
 
             const id = getOptionalObjectString(session_value, "id") orelse continue;
             const title = getOptionalObjectString(session_value, "title") orelse id;
@@ -195,25 +182,32 @@ pub const Client = struct {
             });
         }
 
-        if (threads.items.len == 0 and self.config.working_directory != null and saw_directory) {
-            return allocator.alloc(provider_types.ChatThreadSummary, 0);
-        }
-
         return threads.toOwnedSlice(allocator);
     }
 
     pub fn listModels(self: *Client, allocator: std.mem.Allocator) ![]provider_types.ModelInfo {
-        const response = try self.requestJson(.GET, "/config/providers", null);
+        const provider_path = try self.apiPathAlloc("/provider", .{}, null);
+        defer self.allocator.free(provider_path);
+        const provider_response = try self.requestJson(.GET, provider_path, null);
+        defer self.allocator.free(provider_response.body);
+
+        var parsed_providers: ?std.json.Parsed(std.json.Value) = null;
+        defer if (parsed_providers) |*parsed| parsed.deinit();
+        if (provider_response.status == .ok) {
+            parsed_providers = try std.json.parseFromSlice(std.json.Value, self.allocator, provider_response.body, .{});
+        }
+
+        const model_path = try self.apiPathAlloc("/model", .{}, null);
+        defer self.allocator.free(model_path);
+        const response = try self.requestJson(.GET, model_path, null);
         defer self.allocator.free(response.body);
 
         if (response.status != .ok) return error.OpencodeRequestFailed;
 
-        maybeDumpOpencodeProvidersConfig(response.body);
-
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, response.body, .{});
         defer parsed.deinit();
 
-        return parseConfiguredModelsAlloc(allocator, parsed.value);
+        return parseModelsAlloc(allocator, parsed.value, if (parsed_providers) |p| p.value else null);
     }
 
     pub fn readThread(
@@ -221,32 +215,27 @@ pub const Client = struct {
         allocator: std.mem.Allocator,
         thread_id: []const u8,
     ) !provider_types.ReadThreadResult {
-        const session_response = try self.requestJson(.GET, "/session", null);
+        const session_path = try self.apiPathAlloc("/session/{s}", .{thread_id}, null);
+        defer self.allocator.free(session_path);
+        const session_response = try self.requestJson(.GET, session_path, null);
         defer self.allocator.free(session_response.body);
         if (session_response.status != .ok) return error.OpencodeRequestFailed;
 
-        var parsed_sessions = try std.json.parseFromSlice(std.json.Value, self.allocator, session_response.body, .{});
-        defer parsed_sessions.deinit();
+        var parsed_session = try std.json.parseFromSlice(std.json.Value, self.allocator, session_response.body, .{});
+        defer parsed_session.deinit();
 
-        const session_value = findSessionById(parsed_sessions.value, thread_id) orelse return error.MissingSessionId;
+        const session_value = getObjectField(parsed_session.value, "data") orelse return error.MissingSessionId;
         const session_id = getOptionalObjectString(session_value, "id") orelse return error.MissingSessionId;
         const session_title = getOptionalObjectString(session_value, "title") orelse session_id;
 
-        const messages_path = try std.fmt.allocPrint(
-            self.allocator,
-            "/session/{s}/message?limit={d}",
-            .{ session_id, IMPORT_MESSAGE_LIMIT },
-        );
-        defer self.allocator.free(messages_path);
-
-        const messages_response = try self.requestJson(.GET, messages_path, null);
-        defer self.allocator.free(messages_response.body);
-        if (messages_response.status != .ok) return error.OpencodeRequestFailed;
-
-        var parsed_messages = try std.json.parseFromSlice(std.json.Value, self.allocator, messages_response.body, .{});
-        defer parsed_messages.deinit();
-
-        const imported_messages = try parseImportedApiMessagesAlloc(allocator, parsed_messages.value);
+        const imported_messages = try self.fetchAllMessagesAlloc(allocator, session_id);
+        errdefer {
+            for (imported_messages) |message| {
+                allocator.free(message.author);
+                allocator.free(message.body);
+            }
+            allocator.free(imported_messages);
+        }
 
         return .{
             .thread_id = try allocator.dupe(u8, session_id),
@@ -264,34 +253,40 @@ pub const Client = struct {
         const session_id = if (request.thread_id) |existing|
             try allocator.dupe(u8, existing)
         else
-            try self.createSession(allocator, request.thread_title);
+            try self.createSession(allocator, request);
         errdefer allocator.free(session_id);
 
         if (request.on_thread_id) |on_thread_id| {
             on_thread_id(request.stream_context, session_id);
         }
 
-        if (request.thread_title) |thread_title| {
-            try self.ensureSessionTitle(session_id, thread_title);
+        if (request.thread_id != null) {
+            if (request.thread_title) |thread_title| {
+                try self.ensureSessionTitle(session_id, thread_title);
+            }
+            // The model lives on the session in v2, so re-apply the request's
+            // selection before each turn on an existing thread.
+            self.applySessionModel(session_id, request) catch |err| {
+                log.warn("failed to apply OpenCode session model: {s}", .{@errorName(err)});
+            };
         }
 
-        var baseline = try self.fetchLatestAssistantSnapshot(allocator, session_id, null);
-        defer baseline.deinit(allocator);
-        const baseline_diff_payload = try self.fetchSessionDiffPayloadAlloc(session_id);
+        const baseline_diff_payload = try self.fetchWorkingDiffPayloadAlloc();
         defer self.allocator.free(baseline_diff_payload);
 
-        const event_stream = startEventStream(self, allocator, session_id, baseline.message_id, request) catch |err| blk: {
+        const event_stream = startEventStream(self, allocator, session_id, request) catch |err| blk: {
             log.warn("failed to start OpenCode event stream: {s}", .{@errorName(err)});
             break :blk null;
         };
         defer if (event_stream) |handle| signalEventStreamStop(handle);
 
-        try self.startPromptAsync(session_id, request);
+        const user_message_id = try self.submitPrompt(session_id, request);
+        defer if (user_message_id) |id| self.allocator.free(id);
 
         const reply_text = try self.waitForPromptResult(
             allocator,
             session_id,
-            baseline.message_id,
+            user_message_id,
             baseline_diff_payload,
             request,
             if (event_stream) |handle| handle.context else null,
@@ -305,7 +300,7 @@ pub const Client = struct {
     }
 
     pub fn interruptThread(self: *Client, request: provider_types.InterruptThreadRequest) !void {
-        const path = try std.fmt.allocPrint(self.allocator, "/session/{s}/abort", .{request.thread_id});
+        const path = try self.apiPathAlloc("/session/{s}/interrupt", .{request.thread_id}, null);
         defer self.allocator.free(path);
 
         const response = try self.requestJson(.POST, path, "{}");
@@ -322,200 +317,21 @@ pub const Client = struct {
         return error.UnsupportedOperation;
     }
 
-    fn ensureServer(self: *Client) !void {
-        if (self.checkHealth()) {
-            return;
-        }
-
-        if (!self.config.launch_if_missing) {
-            return error.OpencodeServerUnavailable;
-        }
-
-        shared_server_state.mutex.lock();
-        defer shared_server_state.mutex.unlock();
-
-        if (self.checkHealth()) {
-            return;
-        }
-
-        if (shared_server_state.owns_child) {
-            if (self.waitForHealth(MAX_HEALTH_WAIT_ATTEMPTS)) {
-                return;
-            }
-            stopOwnedServerLocked();
-            if (self.checkHealth()) {
-                return;
-            }
-        }
-
-        try self.spawnServer();
-        if (self.waitForHealth(MAX_HEALTH_WAIT_ATTEMPTS)) {
-            return;
-        }
-
-        stopOwnedServerLocked();
-        return error.OpencodeServerUnavailable;
-    }
-
-    // Health probes must complete in bounded time. A wedged server that
-    // accepts TCP but never answers (observed live 2026-07-15) previously
-    // blocked forever inside std.http.Client.fetch — which has no read
-    // timeout — hanging ensureServer, the provider-readiness worker, and app
-    // shutdown, which joins that worker. So the probe speaks minimal HTTP/1.1
-    // over a stream raced against a std.Io timeout instead of using requestJson.
-    fn checkHealth(self: *Client) bool {
-        return self.probeHealthBounded() catch |err| {
-            log.debug("opencode health probe failed: {s}", .{@errorName(err)});
-            return false;
-        };
-    }
-
-    fn probeHealthBounded(self: *Client) !bool {
-        const uri = try std.Uri.parse(self.config.base_url);
-        var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-        const host = try uri.getHost(&host_buffer);
-        const port: u16 = uri.port orelse 4096;
-
-        // The server is only ever launched on a literal loopback address, so
-        // a non-literal hostname (which would need DNS) is a config we never
-        // spawn against; report unhealthy rather than fall back to an
-        // unbounded fetch.
-        const address = try std.Io.net.IpAddress.parse(host.bytes, port);
-
-        var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
-        defer threaded.deinit();
-        const io = threaded.io();
-
-        // Threaded Io has no connect-timeout support yet (it panics on a
-        // non-none timeout option). Loopback connects resolve immediately
-        // (accept or ECONNREFUSED), so the receive timeout below is the
-        // guard that matters for a live-but-stuck server.
-        var stream = try address.connect(io, .{ .mode = .stream });
-        defer stream.close(io);
-
-        const auth_header = try self.makeAuthorizationHeader();
-        defer if (auth_header) |header| self.allocator.free(header.value);
-        const request = if (auth_header) |header|
-            try std.fmt.allocPrint(
-                self.allocator,
-                "GET /global/health HTTP/1.1\r\nHost: {s}:{d}\r\n{s}: {s}\r\nConnection: close\r\n\r\n",
-                .{ host.bytes, port, header.name, header.value },
-            )
-        else
-            try std.fmt.allocPrint(
-                self.allocator,
-                "GET /global/health HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\n\r\n",
-                .{ host.bytes, port },
-            );
-        defer self.allocator.free(request);
-
-        try streamWriteAllWithIo(io, stream, request);
-
-        // Only the status line matters; 128 bytes is ample for
-        // "HTTP/1.1 200 OK\r\n" plus slack for unusual reason phrases.
-        const Event = union(enum) {
-            read: std.Io.net.Stream.Reader.Error!usize,
-            timeout: std.Io.Cancelable!void,
-        };
-        var response_buffer: [128]u8 = undefined;
-        var result_buffer: [2]Event = undefined;
-        var select = std.Io.Select(Event).init(io, &result_buffer);
-        defer select.cancelDiscard();
-
-        var filled: usize = 0;
-        try select.concurrent(.read, streamReadSomeWithIo, .{ io, stream, response_buffer[filled..] });
-        try select.concurrent(.timeout, std.Io.sleep, .{
-            io,
-            std.Io.Duration.fromMilliseconds(HEALTH_PROBE_RECV_TIMEOUT_MS),
-            std.Io.Clock.awake,
-        });
-        while (filled < response_buffer.len) {
-            switch (try select.await()) {
-                .read => |result| {
-                    const read_len = try result;
-                    if (read_len == 0) break;
-                    filled += read_len;
-                    if (std.mem.indexOf(u8, response_buffer[0..filled], "\r\n") != null) break;
-                    try select.concurrent(.read, streamReadSomeWithIo, .{ io, stream, response_buffer[filled..] });
-                },
-                .timeout => |result| {
-                    try result;
-                    return false;
-                },
-            }
-        }
-        return statusLineIsOk(response_buffer[0..filled]);
-    }
-
-    fn waitForHealth(self: *Client, attempts: usize) bool {
-        var attempt: usize = 0;
-        while (attempt < attempts) : (attempt += 1) {
-            if (self.checkHealth()) {
-                return true;
-            }
-            sleepMs(100);
-        }
-        return false;
-    }
-
-    fn spawnServer(self: *Client) !void {
-        if (shared_server_state.child != null) return;
-
-        const uri = try std.Uri.parse(self.config.base_url);
-        if (!std.ascii.eqlIgnoreCase(uri.scheme, "http")) {
-            return error.UnsupportedOpencodeScheme;
-        }
-
-        const host = try uri.getHostAlloc(self.allocator);
-
-        const port = uri.port orelse 4096;
-        const port_text = try std.fmt.allocPrint(self.allocator, "{d}", .{port});
-        defer self.allocator.free(port_text);
-
-        var env_map = try process_env.buildAugmentedEnvMap(self.allocator);
-        defer env_map.deinit();
-
-        const executable = try process_env.resolveExecutableInEnvMapAlloc(self.allocator, &env_map, self.config.executable);
-        defer self.allocator.free(executable);
-
-        var argv = [_][]const u8{
-            executable,
-            "serve",
-            "--hostname",
-            host.bytes,
-            "--port",
-            port_text,
-        };
-
-        var threaded_spawn = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer threaded_spawn.deinit();
-        const child = try platform_process.spawn(self.allocator, threaded_spawn.io(), .{
-            .argv = argv[0..],
-            .stdin = .ignore,
-            .stdout = .inherit,
-            .stderr = .inherit,
-            .cwd = if (self.config.working_directory) |path| .{ .path = path } else .inherit,
-            .environ_map = &env_map,
-        });
-
-        shared_server_state.child = child;
-        shared_server_state.owns_child = true;
-    }
-
-    fn createSession(self: *Client, allocator: std.mem.Allocator, title: ?[]const u8) ![]u8 {
-        const body = try stringifyAlloc(self.allocator, .{
-            .title = title orelse "Verde",
-        });
+    fn createSession(self: *Client, allocator: std.mem.Allocator, request: provider_types.SendPromptRequest) ![]u8 {
+        const body = try buildSessionCreateBody(self.allocator, request.thread_title, self.config.working_directory, request);
         defer self.allocator.free(body);
 
-        const response = try self.requestJson(.POST, "/session", body);
+        const path = try self.apiPathAlloc("/session", .{}, null);
+        defer self.allocator.free(path);
+        const response = try self.requestJson(.POST, path, body);
         defer self.allocator.free(response.body);
-        if (response.status != .ok) return error.OpencodeRequestFailed;
+        if (response.status != .ok and response.status != .created) return error.OpencodeRequestFailed;
 
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, response.body, .{});
         defer parsed.deinit();
 
-        const id = getOptionalObjectString(parsed.value, "id") orelse return error.MissingSessionId;
+        const session = getObjectField(parsed.value, "data") orelse return error.MissingSessionId;
+        const id = getOptionalObjectString(session, "id") orelse return error.MissingSessionId;
         return allocator.dupe(u8, id);
     }
 
@@ -523,31 +339,10 @@ pub const Client = struct {
         const trimmed = std.mem.trim(u8, title, &std.ascii.whitespace);
         if (trimmed.len == 0) return;
 
-        const path = try std.fmt.allocPrint(self.allocator, "/session/{s}", .{session_id});
+        const path = try self.apiPathAlloc("/session/{s}/rename", .{session_id}, null);
         defer self.allocator.free(path);
 
-        const body = try stringifyAlloc(self.allocator, .{
-            .title = trimmed,
-        });
-        defer self.allocator.free(body);
-
-        const response = try self.requestJson(.PATCH, path, body);
-        defer self.allocator.free(response.body);
-
-        if (response.status != .ok and response.status != .no_content) {
-            return error.OpencodeRequestFailed;
-        }
-    }
-
-    fn startPromptAsync(
-        self: *Client,
-        session_id: []const u8,
-        request: provider_types.SendPromptRequest,
-    ) !void {
-        const path = try std.fmt.allocPrint(self.allocator, "/session/{s}/prompt_async", .{session_id});
-        defer self.allocator.free(path);
-
-        const body = try buildPromptBody(self.allocator, request);
+        const body = try stringifyAlloc(self.allocator, .{ .title = trimmed });
         defer self.allocator.free(body);
 
         const response = try self.requestJson(.POST, path, body);
@@ -558,11 +353,58 @@ pub const Client = struct {
         }
     }
 
+    fn applySessionModel(self: *Client, session_id: []const u8, request: provider_types.SendPromptRequest) !void {
+        if (request.model == null) return;
+
+        const path = try self.apiPathAlloc("/session/{s}/model", .{session_id}, null);
+        defer self.allocator.free(path);
+
+        var writer: std.Io.Writer.Allocating = .init(self.allocator);
+        defer writer.deinit();
+        var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+        try stringify.beginObject();
+        try stringify.objectField("model");
+        try writeModelRef(&stringify, request);
+        try stringify.endObject();
+
+        const response = try self.requestJson(.POST, path, writer.written());
+        defer self.allocator.free(response.body);
+
+        if (response.status != .ok and response.status != .no_content) {
+            return error.OpencodeRequestFailed;
+        }
+    }
+
+    /// Enqueues the prompt and returns the id of the user message it created,
+    /// which anchors the assistant reply lookup for this turn.
+    fn submitPrompt(self: *Client, session_id: []const u8, request: provider_types.SendPromptRequest) !?[]u8 {
+        const path = try self.apiPathAlloc("/session/{s}/prompt", .{session_id}, null);
+        defer self.allocator.free(path);
+
+        const body = try buildPromptBody(self.allocator, request);
+        defer self.allocator.free(body);
+
+        const response = try self.requestJson(.POST, path, body);
+        defer self.allocator.free(response.body);
+
+        if (response.status == .conflict) return error.OpencodeSessionBusy;
+        if (response.status != .ok and response.status != .created and response.status != .no_content) {
+            return error.OpencodeRequestFailed;
+        }
+        if (response.body.len == 0) return null;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, response.body, .{}) catch return null;
+        defer parsed.deinit();
+        const data = getObjectField(parsed.value, "data") orelse return null;
+        const id = getOptionalObjectString(data, "id") orelse return null;
+        return try self.allocator.dupe(u8, id);
+    }
+
     fn waitForPromptResult(
         self: *Client,
         allocator: std.mem.Allocator,
         session_id: []const u8,
-        baseline_assistant_id: ?[]const u8,
+        user_message_id: ?[]const u8,
         baseline_diff_payload: []const u8,
         request: provider_types.SendPromptRequest,
         event_stream_context: ?*EventStreamContext,
@@ -582,77 +424,35 @@ pub const Client = struct {
         var last_task_summary: ?[]u8 = null;
         defer if (last_task_summary) |summary| self.allocator.free(summary);
 
-        var last_retry_message: ?[]u8 = null;
-        defer if (last_retry_message) |message| self.allocator.free(message);
-
         var attempt: usize = 0;
         while (attempt < MAX_POLL_ATTEMPTS) : (attempt += 1) {
             const has_pending_permissions = try self.handlePendingPermissions(session_id, request, &handled_permission_ids);
-            var latest_snapshot = try self.fetchLatestAssistantSnapshot(self.allocator, session_id, baseline_assistant_id);
+            var latest_snapshot = try self.fetchAssistantSnapshot(self.allocator, session_id, user_message_id);
             defer latest_snapshot.deinit(self.allocator);
-            const stream_idle = if (event_stream_context) |context|
-                eventStreamReachedIdle(context)
-            else
-                false;
+
+            const stream_terminal = if (event_stream_context) |context| eventStreamReachedTerminal(context) else false;
             if (event_stream_context) |context| {
                 try self.syncStreamedTextFromEventStream(context, &streamed_text);
+            } else {
+                try self.emitTaskProgressFromSnapshot(&latest_snapshot, request, &last_task_summary);
+                try self.emitAssistantProgressFromSnapshot(&latest_snapshot, request, &streamed_text);
             }
-            try self.emitTaskProgressFromSnapshot(&latest_snapshot, request, &last_task_summary);
-            if (event_stream_context == null) {
-                try self.emitAssistantProgressFromSnapshot(&latest_snapshot, baseline_assistant_id, request, &streamed_text);
-            }
-            try self.emitDiffProgress(session_id, request, baseline_diff_payload, &last_diff_payload);
-
-            const status = try self.fetchSessionStatus(session_id);
-            switch (status) {
-                .retry => |retry| {
-                    if (request.on_stream_event) |on_stream_event| {
-                        if (lastRetryMessageChanged(&last_retry_message, self.allocator, retry.message)) {
-                            const title = if (retry.attempt > 0)
-                                try std.fmt.allocPrint(self.allocator, "OpenCode retry {d}", .{retry.attempt})
-                            else
-                                try self.allocator.dupe(u8, "OpenCode retry");
-                            defer self.allocator.free(title);
-                            on_stream_event(request.stream_context, .{ .message = .{
-                                .title = title,
-                                .body = retry.message,
-                            } });
-                        }
-                    }
-                },
-                else => {
-                    if (last_retry_message) |message| {
-                        self.allocator.free(message);
-                        last_retry_message = null;
-                    }
-                },
+            if (attempt % DIFF_POLL_STRIDE == 0) {
+                try self.emitDiffProgress(request, baseline_diff_payload, &last_diff_payload);
             }
 
             const has_output_activity =
                 std.mem.trim(u8, streamed_text, &std.ascii.whitespace).len > 0 or
-                latest_snapshot.hasRenderablePostBaselineContent(baseline_assistant_id);
+                latest_snapshot.hasRenderableContent();
 
-            const idle_exit_with_body = blk: {
-                if (status != .idle or !has_output_activity) break :blk false;
-                const f = latest_snapshot.finish orelse break :blk false;
-                break :blk !std.mem.eql(u8, f, "tool-calls");
-            };
-
-            if (!has_pending_permissions and
-                (stream_idle or
-                    latest_snapshot.isTerminalForPrompt(baseline_assistant_id) or
-                    idle_exit_with_body))
-            {
+            if (!has_pending_permissions and (stream_terminal or latest_snapshot.isTerminalForPrompt())) {
                 break;
             }
 
-            if (!has_pending_permissions and
-                event_stream_context == null and
-                status == .idle and
-                !has_output_activity and
-                attempt + 1 >= EMPTY_IDLE_GRACE_POLLS)
-            {
-                return error.OpencodeEmptyReply;
+            if (!has_pending_permissions and event_stream_context == null) {
+                const active = try self.sessionIsActive(session_id);
+                if (!active and has_output_activity) break;
+                if (!active and attempt + 1 >= EMPTY_IDLE_GRACE_POLLS) return error.OpencodeEmptyReply;
             }
 
             sleepMs(POLL_INTERVAL_MS);
@@ -660,20 +460,17 @@ pub const Client = struct {
             return error.OpencodeRequestTimedOut;
         }
 
-        var final_snapshot = try self.fetchLatestAssistantSnapshot(allocator, session_id, baseline_assistant_id);
+        try self.emitDiffProgress(request, baseline_diff_payload, &last_diff_payload);
+
+        var final_snapshot = try self.fetchAssistantSnapshot(allocator, session_id, user_message_id);
         defer final_snapshot.deinit(allocator);
 
-        if (final_snapshot.message_id) |message_id| {
-            if (baseline_assistant_id == null or !std.mem.eql(u8, message_id, baseline_assistant_id.?)) {
-                if (std.mem.trim(u8, final_snapshot.text, &std.ascii.whitespace).len > 0) {
-                    return allocator.dupe(u8, final_snapshot.text);
-                }
-                if (final_snapshot.error_message) |error_message| {
-                    return allocator.dupe(u8, error_message);
-                }
-            }
+        if (std.mem.trim(u8, final_snapshot.text, &std.ascii.whitespace).len > 0) {
+            return allocator.dupe(u8, final_snapshot.text);
         }
-
+        if (final_snapshot.error_message) |error_message| {
+            return allocator.dupe(u8, error_message);
+        }
         if (std.mem.trim(u8, streamed_text, &std.ascii.whitespace).len > 0) {
             return allocator.dupe(u8, streamed_text);
         }
@@ -696,18 +493,6 @@ pub const Client = struct {
         streamed_text.* = try self.allocator.dupe(u8, context.streamed_text.items);
     }
 
-    fn emitAssistantProgress(
-        self: *Client,
-        session_id: []const u8,
-        baseline_assistant_id: ?[]const u8,
-        request: provider_types.SendPromptRequest,
-        streamed_text: *[]u8,
-    ) !void {
-        var snapshot = try self.fetchLatestAssistantSnapshot(self.allocator, session_id, baseline_assistant_id);
-        defer snapshot.deinit(self.allocator);
-        try self.emitAssistantProgressFromSnapshot(&snapshot, baseline_assistant_id, request, streamed_text);
-    }
-
     fn emitTaskProgressFromSnapshot(
         self: *Client,
         snapshot: *const AssistantSnapshot,
@@ -723,9 +508,13 @@ pub const Client = struct {
             last_task_summary.* = null;
         }
 
-        on_stream_event(request.stream_context, .{ .message = .{
-            .title = "OpenCode task",
-            .body = summary,
+        const parsed_task = parseOpenCodeTaskSummary(summary);
+        on_stream_event(request.stream_context, .{ .tool_call = .{
+            .call_id = "opencode-task",
+            .title = parsed_task.title,
+            .kind = .subagent,
+            .status = parsed_task.status,
+            .input = summary,
         } });
         last_task_summary.* = try self.allocator.dupe(u8, summary);
     }
@@ -733,16 +522,11 @@ pub const Client = struct {
     fn emitAssistantProgressFromSnapshot(
         self: *Client,
         snapshot: *const AssistantSnapshot,
-        baseline_assistant_id: ?[]const u8,
         request: provider_types.SendPromptRequest,
         streamed_text: *[]u8,
     ) !void {
         const on_stream_delta = request.on_stream_delta orelse return;
-
-        const message_id = snapshot.message_id orelse return;
-        if (baseline_assistant_id) |baseline_id| {
-            if (std.mem.eql(u8, message_id, baseline_id)) return;
-        }
+        if (snapshot.message_id == null) return;
 
         if (!std.mem.startsWith(u8, snapshot.text, streamed_text.*)) return;
         const delta = snapshot.text[streamed_text.*.len..];
@@ -756,14 +540,13 @@ pub const Client = struct {
 
     fn emitDiffProgress(
         self: *Client,
-        session_id: []const u8,
         request: provider_types.SendPromptRequest,
         baseline_diff_payload: []const u8,
         last_diff_payload: *[]u8,
     ) !void {
         const on_stream_event = request.on_stream_event orelse return;
 
-        const current_payload = try self.fetchSessionDiffPayloadAlloc(session_id);
+        const current_payload = try self.fetchWorkingDiffPayloadAlloc();
         defer self.allocator.free(current_payload);
         if (std.mem.eql(u8, current_payload, last_diff_payload.*)) return;
 
@@ -781,30 +564,28 @@ pub const Client = struct {
         defer changed_files.deinit(std.heap.page_allocator);
         try appendChangedSessionDiffFiles(&changed_files, files.items, baseline_files.items);
 
-        if (changed_files.items.len == 0) {
-            self.allocator.free(last_diff_payload.*);
-            last_diff_payload.* = try self.allocator.dupe(u8, current_payload);
-            return;
+        if (changed_files.items.len > 0) {
+            on_stream_event(request.stream_context, .{ .diff = .{
+                .files = changed_files.items,
+            } });
         }
-
-        on_stream_event(request.stream_context, .{ .diff = .{
-            .files = changed_files.items,
-        } });
 
         self.allocator.free(last_diff_payload.*);
         last_diff_payload.* = try self.allocator.dupe(u8, current_payload);
     }
 
-    fn fetchSessionDiffPayloadAlloc(self: *Client, session_id: []const u8) ![]u8 {
-        const path = try std.fmt.allocPrint(self.allocator, "/session/{s}/diff", .{session_id});
+    /// v2 has no per-session diff; the working-tree diff scoped to the
+    /// workspace is the closest signal for edits made during a turn.
+    fn fetchWorkingDiffPayloadAlloc(self: *Client) ![]u8 {
+        if (self.config.working_directory == null) return self.allocator.dupe(u8, "");
+
+        const path = try self.apiPathAlloc("/vcs/diff", .{}, "mode=working");
         defer self.allocator.free(path);
 
-        const response = try self.requestJson(.GET, path, null);
+        const response = self.requestJson(.GET, path, null) catch return self.allocator.dupe(u8, "");
         defer self.allocator.free(response.body);
 
-        if (response.status != .ok) {
-            return self.allocator.dupe(u8, "");
-        }
+        if (response.status != .ok) return self.allocator.dupe(u8, "");
         return self.allocator.dupe(u8, response.body);
     }
 
@@ -814,7 +595,9 @@ pub const Client = struct {
         request: provider_types.SendPromptRequest,
         handled_permission_ids: *std.ArrayList([]u8),
     ) !bool {
-        const response = try self.requestJson(.GET, "/permission", null);
+        const path = try self.apiPathAlloc("/session/{s}/permission", .{session_id}, null);
+        defer self.allocator.free(path);
+        const response = try self.requestJson(.GET, path, null);
         defer self.allocator.free(response.body);
 
         if (response.status != .ok) return false;
@@ -822,13 +605,15 @@ pub const Client = struct {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, response.body, .{});
         defer parsed.deinit();
 
-        if (parsed.value != .array) return false;
+        const pending = getObjectField(parsed.value, "data") orelse return false;
+        if (pending != .array) return false;
 
         var found_pending_for_session = false;
-        for (parsed.value.array.items) |item| {
+        for (pending.array.items) |item| {
             if (item != .object) continue;
-            const pending_session_id = getOptionalObjectString(item, "sessionID") orelse continue;
-            if (!std.mem.eql(u8, pending_session_id, session_id)) continue;
+            if (getOptionalObjectString(item, "sessionID")) |pending_session_id| {
+                if (!std.mem.eql(u8, pending_session_id, session_id)) continue;
+            }
 
             found_pending_for_session = true;
 
@@ -857,8 +642,8 @@ pub const Client = struct {
         context: ?*anyopaque,
         on_approval_request: *const fn (?*anyopaque, provider_types.ApprovalRequest) provider_types.ApprovalDecision,
     ) !provider_types.ApprovalDecision {
-        const permission_name = getOptionalObjectString(value, "permission") orelse "permission";
-        const title = try std.fmt.allocPrint(self.allocator, "OpenCode wants {s} permission", .{permission_name});
+        const action = getOptionalObjectString(value, "action") orelse "permission";
+        const title = try std.fmt.allocPrint(self.allocator, "OpenCode wants {s} permission", .{action});
         defer self.allocator.free(title);
 
         const body = try buildPermissionBody(self.allocator, value);
@@ -882,42 +667,29 @@ pub const Client = struct {
             .deny => "reject",
         };
 
-        const body = try stringifyAlloc(self.allocator, .{
-            .reply = reply,
-        });
+        const body = try stringifyAlloc(self.allocator, .{ .reply = reply });
         defer self.allocator.free(body);
 
-        const path = try std.fmt.allocPrint(self.allocator, "/permission/{s}/reply", .{request_id});
+        const path = try self.apiPathAlloc("/session/{s}/permission/{s}/reply", .{ session_id, request_id }, null);
         defer self.allocator.free(path);
 
         const response = try self.requestJson(.POST, path, body);
         defer self.allocator.free(response.body);
 
-        if (response.status == .ok or response.status == .no_content) return;
-
-        const legacy_body = try stringifyAlloc(self.allocator, .{
-            .response = reply,
-        });
-        defer self.allocator.free(legacy_body);
-
-        const legacy_path = try std.fmt.allocPrint(self.allocator, "/session/{s}/permissions/{s}", .{ session_id, request_id });
-        defer self.allocator.free(legacy_path);
-
-        const legacy_response = try self.requestJson(.POST, legacy_path, legacy_body);
-        defer self.allocator.free(legacy_response.body);
-
-        if (legacy_response.status != .ok and legacy_response.status != .no_content) {
+        if (response.status != .ok and response.status != .no_content) {
             return error.OpencodeRequestFailed;
         }
     }
 
-    fn fetchLatestAssistantSnapshot(
+    fn fetchAssistantSnapshot(
         self: *Client,
         allocator: std.mem.Allocator,
         session_id: []const u8,
-        baseline_assistant_id: ?[]const u8,
+        user_message_id: ?[]const u8,
     ) !AssistantSnapshot {
-        const path = try std.fmt.allocPrint(self.allocator, "/session/{s}/message?limit={d}", .{ session_id, MESSAGE_POLL_LIMIT });
+        const query = try std.fmt.allocPrint(self.allocator, "order=desc&limit={d}", .{MESSAGE_POLL_LIMIT});
+        defer self.allocator.free(query);
+        const path = try self.apiPathAlloc("/session/{s}/message", .{session_id}, query);
         defer self.allocator.free(path);
 
         const response = try self.requestJson(.GET, path, null);
@@ -928,30 +700,25 @@ pub const Client = struct {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, response.body, .{});
         defer parsed.deinit();
 
-        const latest_opt: ?std.json.Value = if (baseline_assistant_id != null)
-            findPrimaryAssistantAfterLastUser(parsed.value) orelse findLatestAssistantMessage(parsed.value)
-        else
-            findLatestAssistantMessage(parsed.value);
-        const latest = latest_opt orelse return .{
+        const messages = getObjectField(parsed.value, "data") orelse .null;
+        const latest = findPrimaryAssistantAfterUser(messages, user_message_id) orelse return .{
             .text = try allocator.dupe(u8, ""),
         };
-
-        const info = getObjectField(latest, "info") orelse return .{
-            .text = try allocator.dupe(u8, ""),
-        };
-        const message_id = getOptionalObjectString(info, "id");
+        const message_id = getOptionalObjectString(latest, "id");
 
         return .{
             .message_id = if (message_id) |id| try allocator.dupe(u8, id) else null,
             .text = try extractAssistantTextAlloc(allocator, latest),
             .error_message = try extractAssistantErrorMessageAlloc(allocator, latest),
             .finish = try extractAssistantFinishAlloc(allocator, latest),
-            .task_summary = try extractLatestAssistantTaskSummaryAlloc(allocator, parsed.value, baseline_assistant_id),
+            .task_summary = try extractLatestAssistantTaskSummaryAlloc(allocator, messages, user_message_id),
         };
     }
 
-    fn fetchSessionStatus(self: *Client, session_id: []const u8) !SessionStatus {
-        const response = try self.requestJson(.GET, "/session/status", null);
+    fn sessionIsActive(self: *Client, session_id: []const u8) !bool {
+        const path = try self.apiPathAlloc("/session/active", .{}, null);
+        defer self.allocator.free(path);
+        const response = try self.requestJson(.GET, path, null);
         defer self.allocator.free(response.body);
 
         if (response.status != .ok) return error.OpencodeRequestFailed;
@@ -959,21 +726,87 @@ pub const Client = struct {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, response.body, .{});
         defer parsed.deinit();
 
-        if (parsed.value != .object) return .idle;
-        const status_value = parsed.value.object.get(session_id) orelse return .idle;
-        if (status_value != .object) return .idle;
+        const active = getObjectField(parsed.value, "data") orelse return false;
+        if (active != .object) return false;
+        return active.object.get(session_id) != null;
+    }
 
-        const type_name = getOptionalObjectString(status_value, "type") orelse return .busy;
-        if (std.mem.eql(u8, type_name, "idle")) return .idle;
-        if (std.mem.eql(u8, type_name, "busy")) return .busy;
-        if (std.mem.eql(u8, type_name, "retry")) {
-            return .{ .retry = .{
-                .attempt = jsonInteger(getObjectField(status_value, "attempt")) orelse 0,
-                .message = getOptionalObjectString(status_value, "message") orelse "OpenCode is retrying the request.",
-            } };
+    fn fetchAllMessagesAlloc(self: *Client, allocator: std.mem.Allocator, session_id: []const u8) ![]provider_types.ChatMessage {
+        var messages: std.ArrayList(provider_types.ChatMessage) = .empty;
+        errdefer {
+            for (messages.items) |message| {
+                allocator.free(message.author);
+                allocator.free(message.body);
+            }
+            messages.deinit(allocator);
         }
 
-        return .busy;
+        var cursor: ?[]u8 = null;
+        defer if (cursor) |value| self.allocator.free(value);
+
+        var page: usize = 0;
+        while (page < MAX_IMPORT_PAGES) : (page += 1) {
+            var query: std.ArrayList(u8) = .empty;
+            defer query.deinit(self.allocator);
+            try query.appendSlice(self.allocator, "order=asc&limit=");
+            try appendDecimal(&query, self.allocator, IMPORT_PAGE_LIMIT);
+            if (cursor) |value| {
+                try query.appendSlice(self.allocator, "&cursor=");
+                try appendPercentEncoded(&query, self.allocator, value);
+            }
+
+            const path = try self.apiPathAlloc("/session/{s}/message", .{session_id}, query.items);
+            defer self.allocator.free(path);
+            const response = try self.requestJson(.GET, path, null);
+            defer self.allocator.free(response.body);
+            if (response.status != .ok) return error.OpencodeRequestFailed;
+
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, response.body, .{});
+            defer parsed.deinit();
+
+            try appendImportedApiMessages(allocator, &messages, getObjectField(parsed.value, "data") orelse .null);
+
+            const next = blk: {
+                const cursor_value = getObjectField(parsed.value, "cursor") orelse break :blk null;
+                break :blk getOptionalObjectString(cursor_value, "next");
+            };
+            if (cursor) |value| self.allocator.free(value);
+            cursor = null;
+            const next_cursor = next orelse break;
+            if (next_cursor.len == 0) break;
+            cursor = try self.allocator.dupe(u8, next_cursor);
+        }
+
+        return messages.toOwnedSlice(allocator);
+    }
+
+    /// Builds `/api{path}` with the workspace `location[directory]` scope and
+    /// any extra query string. v2 ignores a bare `directory` parameter, so the
+    /// bracketed form is the only way to scope requests.
+    fn apiPathAlloc(self: *Client, comptime path_fmt: []const u8, args: anytype, extra_query: ?[]const u8) ![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+
+        try out.appendSlice(self.allocator, "/api");
+        const path = try std.fmt.allocPrint(self.allocator, path_fmt, args);
+        defer self.allocator.free(path);
+        try out.appendSlice(self.allocator, path);
+
+        var separator: u8 = '?';
+        if (self.config.working_directory) |directory| {
+            try out.append(self.allocator, separator);
+            try out.appendSlice(self.allocator, "location%5Bdirectory%5D=");
+            try appendPercentEncoded(&out, self.allocator, directory);
+            separator = '&';
+        }
+        if (extra_query) |query| {
+            if (query.len > 0) {
+                try out.append(self.allocator, separator);
+                try out.appendSlice(self.allocator, query);
+            }
+        }
+
+        return out.toOwnedSlice(self.allocator);
     }
 
     fn requestJson(
@@ -982,23 +815,19 @@ pub const Client = struct {
         path: []const u8,
         payload: ?[]const u8,
     ) !HttpResponse {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ self.config.base_url, path });
+        const url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ self.endpoint.base_url, path });
         defer self.allocator.free(url);
 
         var body_writer: std.Io.Writer.Allocating = .init(self.allocator);
         errdefer body_writer.deinit();
 
-        const auth_header = try self.makeAuthorizationHeader();
+        const auth_header = try makeAuthorizationHeaderAlloc(self.allocator, self.config.username, self.endpoint.password);
         defer if (auth_header) |header| self.allocator.free(header.value);
 
-        var headers_storage: [3]std.http.Header = undefined;
+        var headers_storage: [2]std.http.Header = undefined;
         var header_count: usize = 0;
         if (payload != null) {
             headers_storage[header_count] = .{ .name = "content-type", .value = "application/json" };
-            header_count += 1;
-        }
-        if (self.config.working_directory) |dir| {
-            headers_storage[header_count] = .{ .name = "x-opencode-directory", .value = dir };
             header_count += 1;
         }
         if (auth_header) |header| {
@@ -1023,49 +852,229 @@ pub const Client = struct {
             .body = try body_writer.toOwnedSlice(),
         };
     }
+};
 
-    fn makeAuthorizationHeader(self: *Client) !?std.http.Header {
-        return makeAuthorizationHeaderAlloc(self.allocator, self.config);
+// Service discovery -----------------------------------------------------------
+
+const ServiceRegistration = struct {
+    url: []u8,
+    password: ?[]u8,
+
+    fn deinit(self: *ServiceRegistration, allocator: std.mem.Allocator) void {
+        allocator.free(self.url);
+        if (self.password) |value| allocator.free(value);
     }
 };
 
-fn retainSharedServer() void {
-    shared_server_state.mutex.lock();
-    defer shared_server_state.mutex.unlock();
-    shared_server_state.active_clients += 1;
-}
-
-pub fn shutdownOwnedServer() void {
-    shared_server_state.mutex.lock();
-    defer shared_server_state.mutex.unlock();
-    stopOwnedServerLocked();
-}
-
-fn stopOwnedServerLocked() void {
-    if (shared_server_state.child) |*child| {
-        if (shared_server_state.owns_child) {
-            const pid = child.processId() orelse 0;
-            runtime_log.diagnostic("opencode.stopOwnedServer signalling pid={d}", .{pid});
-            var threaded = std.Io.Threaded.init_single_threaded;
-            child.kill(threaded.io());
+fn resolveEndpoint(allocator: std.mem.Allocator, config: Config) !Endpoint {
+    if (config.base_url) |base_url| {
+        var endpoint = try Endpoint.init(allocator, base_url, config.password);
+        errdefer endpoint.deinit(allocator);
+        if (!checkHealth(allocator, endpoint.base_url, config.username, endpoint.password)) {
+            return error.OpencodeServerUnavailable;
         }
-        shared_server_state.child = null;
-        shared_server_state.owns_child = false;
+        return endpoint;
+    }
+
+    if (try discoverHealthyService(allocator, config)) |endpoint| return endpoint;
+    if (!config.launch_if_missing) return error.OpencodeServerUnavailable;
+
+    service_launch_mutex.lock();
+    defer service_launch_mutex.unlock();
+
+    if (try discoverHealthyService(allocator, config)) |endpoint| return endpoint;
+
+    try startBackgroundService(allocator, config);
+
+    var attempt: usize = 0;
+    while (attempt < MAX_HEALTH_WAIT_ATTEMPTS) : (attempt += 1) {
+        if (try discoverHealthyService(allocator, config)) |endpoint| return endpoint;
+        sleepMs(200);
+    }
+    return error.OpencodeServerUnavailable;
+}
+
+fn discoverHealthyService(allocator: std.mem.Allocator, config: Config) !?Endpoint {
+    var registration = (readServiceRegistrationAlloc(allocator) catch |err| {
+        log.debug("opencode service registration unreadable: {s}", .{@errorName(err)});
+        return null;
+    }) orelse return null;
+    defer registration.deinit(allocator);
+
+    var endpoint = try Endpoint.init(allocator, registration.url, registration.password);
+    errdefer endpoint.deinit(allocator);
+    if (!checkHealth(allocator, endpoint.base_url, config.username, endpoint.password)) {
+        endpoint.deinit(allocator);
+        return null;
+    }
+    return endpoint;
+}
+
+/// `service start` daemonizes the shared service itself and exits once the
+/// registration file is written, so waiting for the CLI is bounded.
+fn startBackgroundService(allocator: std.mem.Allocator, config: Config) !void {
+    var env_map = try process_env.buildAugmentedEnvMap(allocator);
+    defer env_map.deinit();
+
+    const executable = try process_env.resolveExecutableInEnvMapAlloc(allocator, &env_map, config.executable);
+    defer allocator.free(executable);
+
+    const argv = [_][]const u8{ executable, "service", "start" };
+
+    var threaded_spawn = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded_spawn.deinit();
+    var child = try platform_process.spawn(allocator, threaded_spawn.io(), .{
+        .argv = argv[0..],
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .inherit,
+        .environ_map = &env_map,
+        // The service must outlive Verde; keep it out of any Verde-owned tree.
+        .own_process_tree = false,
+    });
+    const term = try child.wait(threaded_spawn.io());
+    switch (term) {
+        .exited => |code| if (code != 0) {
+            log.warn("opencode2 service start exited with code {d}", .{code});
+        },
+        else => log.warn("opencode2 service start ended abnormally", .{}),
     }
 }
+
+fn serviceRegistrationPathAlloc(allocator: std.mem.Allocator) ![]u8 {
+    if (std.c.getenv("XDG_STATE_HOME")) |raw| {
+        const state_home = std.mem.sliceTo(raw, 0);
+        if (state_home.len > 0) {
+            return std.fs.path.join(allocator, &.{ state_home, "opencode", "service.json" });
+        }
+    }
+    const home_raw = std.c.getenv("HOME") orelse return error.EnvironmentVariableNotFound;
+    const home = std.mem.sliceTo(home_raw, 0);
+    if (home.len == 0) return error.EnvironmentVariableNotFound;
+    return std.fs.path.join(allocator, &.{ home, ".local", "state", "opencode", "service.json" });
+}
+
+fn readServiceRegistrationAlloc(allocator: std.mem.Allocator) !?ServiceRegistration {
+    const path = try serviceRegistrationPathAlloc(allocator);
+    defer allocator.free(path);
+
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const contents = std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, allocator, .limited(MAX_SERVICE_FILE_BYTES)) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(contents);
+
+    return try parseServiceRegistrationAlloc(allocator, contents);
+}
+
+fn parseServiceRegistrationAlloc(allocator: std.mem.Allocator, contents: []const u8) !?ServiceRegistration {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, contents, .{});
+    defer parsed.deinit();
+
+    const url = getOptionalObjectString(parsed.value, "url") orelse return null;
+    if (std.mem.trim(u8, url, &std.ascii.whitespace).len == 0) return null;
+    const owned_url = try allocator.dupe(u8, url);
+    errdefer allocator.free(owned_url);
+    const password = getOptionalObjectString(parsed.value, "password");
+    return .{
+        .url = owned_url,
+        .password = if (password) |value| try allocator.dupe(u8, value) else null,
+    };
+}
+
+// Health probes must complete in bounded time. A wedged server that accepts
+// TCP but never answers (observed live 2026-07-15) previously blocked forever
+// inside std.http.Client.fetch — which has no read timeout — hanging the
+// provider-readiness worker and app shutdown, which joins that worker. So the
+// probe speaks minimal HTTP/1.1 over a stream raced against a std.Io timeout.
+fn checkHealth(allocator: std.mem.Allocator, base_url: []const u8, username: ?[]const u8, password: ?[]const u8) bool {
+    return probeHealthBounded(allocator, base_url, username, password) catch |err| {
+        log.debug("opencode health probe failed: {s}", .{@errorName(err)});
+        return false;
+    };
+}
+
+fn probeHealthBounded(allocator: std.mem.Allocator, base_url: []const u8, username: ?[]const u8, password: ?[]const u8) !bool {
+    const uri = try std.Uri.parse(base_url);
+    var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+    const host = try uri.getHost(&host_buffer);
+    const port: u16 = uri.port orelse 80;
+
+    // The service registers a literal loopback address; a hostname needing
+    // DNS is never expected, so report unhealthy rather than fall back to an
+    // unbounded fetch.
+    const address = try std.Io.net.IpAddress.parse(host.bytes, port);
+
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Threaded Io has no connect-timeout support yet. Loopback connects
+    // resolve immediately (accept or ECONNREFUSED), so the receive timeout
+    // below is the guard that matters for a live-but-stuck service.
+    var stream = try address.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    const auth_header = try makeAuthorizationHeaderAlloc(allocator, username, password);
+    defer if (auth_header) |header| allocator.free(header.value);
+    const request = if (auth_header) |header|
+        try std.fmt.allocPrint(
+            allocator,
+            "GET /api/health HTTP/1.1\r\nHost: {s}:{d}\r\n{s}: {s}\r\nConnection: close\r\n\r\n",
+            .{ host.bytes, port, header.name, header.value },
+        )
+    else
+        try std.fmt.allocPrint(
+            allocator,
+            "GET /api/health HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\n\r\n",
+            .{ host.bytes, port },
+        );
+    defer allocator.free(request);
+
+    try streamWriteAllWithIo(io, stream, request);
+
+    // Only the status line matters; 128 bytes is ample for
+    // "HTTP/1.1 200 OK\r\n" plus slack for unusual reason phrases.
+    const Event = union(enum) {
+        read: std.Io.net.Stream.Reader.Error!usize,
+        timeout: std.Io.Cancelable!void,
+    };
+    var response_buffer: [128]u8 = undefined;
+    var result_buffer: [2]Event = undefined;
+    var select = std.Io.Select(Event).init(io, &result_buffer);
+    defer select.cancelDiscard();
+
+    var filled: usize = 0;
+    try select.concurrent(.read, streamReadSomeWithIo, .{ io, stream, response_buffer[filled..] });
+    try select.concurrent(.timeout, std.Io.sleep, .{
+        io,
+        std.Io.Duration.fromMilliseconds(HEALTH_PROBE_RECV_TIMEOUT_MS),
+        std.Io.Clock.awake,
+    });
+    while (filled < response_buffer.len) {
+        switch (try select.await()) {
+            .read => |result| {
+                const read_len = try result;
+                if (read_len == 0) break;
+                filled += read_len;
+                if (std.mem.indexOf(u8, response_buffer[0..filled], "\r\n") != null) break;
+                try select.concurrent(.read, streamReadSomeWithIo, .{ io, stream, response_buffer[filled..] });
+            },
+            .timeout => |result| {
+                try result;
+                return false;
+            },
+        }
+    }
+    return statusLineIsOk(response_buffer[0..filled]);
+}
+
+// Shared types and helpers ----------------------------------------------------
 
 const HttpResponse = struct {
     status: std.http.Status,
     body: []u8,
-};
-
-const SessionStatus = union(enum) {
-    idle,
-    busy,
-    retry: struct {
-        attempt: i64,
-        message: []const u8,
-    },
 };
 
 const AssistantSnapshot = struct {
@@ -1083,22 +1092,14 @@ const AssistantSnapshot = struct {
         if (self.task_summary) |summary| allocator.free(summary);
     }
 
-    fn isTerminalForPrompt(self: *const AssistantSnapshot, baseline_assistant_id: ?[]const u8) bool {
-        const message_id = self.message_id orelse return false;
-        if (baseline_assistant_id) |baseline_id| {
-            if (std.mem.eql(u8, message_id, baseline_id)) return false;
-        }
-
+    fn isTerminalForPrompt(self: *const AssistantSnapshot) bool {
+        if (self.message_id == null) return false;
         const finish = self.finish orelse return false;
         return !std.mem.eql(u8, finish, "tool-calls") and !std.mem.eql(u8, finish, "unknown");
     }
 
-    fn hasRenderablePostBaselineContent(self: *const AssistantSnapshot, baseline_assistant_id: ?[]const u8) bool {
-        const message_id = self.message_id orelse return false;
-        if (baseline_assistant_id) |baseline_id| {
-            if (std.mem.eql(u8, message_id, baseline_id)) return false;
-        }
-
+    fn hasRenderableContent(self: *const AssistantSnapshot) bool {
+        if (self.message_id == null) return false;
         if (std.mem.trim(u8, self.text, &std.ascii.whitespace).len > 0) return true;
         return self.error_message != null;
     }
@@ -1117,25 +1118,31 @@ const EventStreamOpenState = enum {
 
 const EventStreamContext = struct {
     allocator: std.mem.Allocator,
-    config: Config,
+    base_url: []const u8,
+    username: ?[]const u8,
+    password: ?[]const u8,
+    working_directory: ?[]const u8,
     session_id: []u8,
-    baseline_assistant_id: ?[]u8,
     request: provider_types.SendPromptRequest,
     child: ?platform_process.OwnedChild = null,
     streamed_text: std.ArrayListUnmanaged(u8) = .empty,
-    visible_text_part_ids: std.ArrayListUnmanaged([]u8) = .empty,
+    /// callID → tool name, so success/failure events can be titled and classified.
+    tool_names: std.StringHashMapUnmanaged([]u8) = .empty,
     mutex: Mutex = .{},
     condition: Condition = .{},
     open_state: EventStreamOpenState = .starting,
     stop_requested: bool = false,
-    session_idle: bool = false,
+    session_terminal: bool = false,
 
     fn deinit(self: *EventStreamContext) void {
         self.allocator.free(self.session_id);
-        if (self.baseline_assistant_id) |message_id| self.allocator.free(message_id);
         self.streamed_text.deinit(self.allocator);
-        for (self.visible_text_part_ids.items) |part_id| self.allocator.free(part_id);
-        self.visible_text_part_ids.deinit(self.allocator);
+        var it = self.tool_names.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.tool_names.deinit(self.allocator);
     }
 };
 
@@ -1155,6 +1162,24 @@ fn encodeBase64Alloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     const out = try allocator.alloc(u8, size);
     _ = std.base64.standard.Encoder.encode(out, bytes);
     return out;
+}
+
+fn appendDecimal(list: *std.ArrayList(u8), allocator: std.mem.Allocator, value: usize) !void {
+    var buffer: [20]u8 = undefined;
+    const text = try std.fmt.bufPrint(&buffer, "{d}", .{value});
+    try list.appendSlice(allocator, text);
+}
+
+/// RFC 3986 unreserved characters pass through; everything else is `%XX`.
+fn appendPercentEncoded(list: *std.ArrayList(u8), allocator: std.mem.Allocator, raw: []const u8) !void {
+    const HEX = "0123456789ABCDEF";
+    for (raw) |byte| {
+        if (std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or byte == '.' or byte == '~') {
+            try list.append(allocator, byte);
+        } else {
+            try list.appendSlice(allocator, &.{ '%', HEX[byte >> 4], HEX[byte & 0x0F] });
+        }
+    }
 }
 
 fn streamReadSomeWithIo(io: std.Io, stream: std.Io.net.Stream, buffer: []u8) std.Io.net.Stream.Reader.Error!usize {
@@ -1202,10 +1227,10 @@ fn statusLineIsOk(line: []const u8) bool {
     return std.mem.eql(u8, line[space + 1 .. space + 4], "200");
 }
 
-fn makeAuthorizationHeaderAlloc(allocator: std.mem.Allocator, config: Config) !?std.http.Header {
-    const password = config.password orelse return null;
-    const username = config.username orelse "opencode";
-    const combined = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ username, password });
+fn makeAuthorizationHeaderAlloc(allocator: std.mem.Allocator, username: ?[]const u8, password: ?[]const u8) !?std.http.Header {
+    const actual_password = password orelse return null;
+    const actual_username = username orelse DEFAULT_SERVICE_USERNAME;
+    const combined = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ actual_username, actual_password });
     defer allocator.free(combined);
     const encoded = try encodeBase64Alloc(allocator, combined);
     defer allocator.free(encoded);
@@ -1226,30 +1251,58 @@ fn getOptionalObjectString(value: std.json.Value, field: []const u8) ?[]const u8
     };
 }
 
-fn parseImportedApiMessagesAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]provider_types.ChatMessage {
-    if (value != .array) return allocator.alloc(provider_types.ChatMessage, 0);
+fn jsonBool(value: ?std.json.Value) ?bool {
+    const actual = value orelse return null;
+    return switch (actual) {
+        .bool => |flag| flag,
+        else => null,
+    };
+}
 
-    var messages: std.ArrayList(provider_types.ChatMessage) = .empty;
-    errdefer {
-        for (messages.items) |message| {
-            allocator.free(message.author);
-            allocator.free(message.body);
-        }
-        messages.deinit(allocator);
-    }
+fn jsonInteger(value: ?std.json.Value) ?i64 {
+    const actual = value orelse return null;
+    return switch (actual) {
+        .integer => |number| number,
+        .number_string => |text| std.fmt.parseInt(i64, text, 10) catch null,
+        else => null,
+    };
+}
+
+fn normalizeUnixTimestamp(value: ?i64) ?i64 {
+    const timestamp = value orelse return null;
+    if (timestamp >= 1_000_000_000_000) return @divFloor(timestamp, 1000);
+    return timestamp;
+}
+
+fn messageType(value: std.json.Value) ?[]const u8 {
+    return getOptionalObjectString(value, "type");
+}
+
+fn messageIs(value: std.json.Value, kind: []const u8) bool {
+    const type_name = messageType(value) orelse return false;
+    return std.mem.eql(u8, type_name, kind);
+}
+
+// Thread import ---------------------------------------------------------------
+
+fn appendImportedApiMessages(
+    allocator: std.mem.Allocator,
+    messages: *std.ArrayList(provider_types.ChatMessage),
+    value: std.json.Value,
+) !void {
+    if (value != .array) return;
 
     for (value.array.items) |item| {
         if (item != .object) continue;
-        const info = getObjectField(item, "info") orelse continue;
-        const role = parseImportedApiMessageRole(info) orelse continue;
-        const parts = getObjectField(item, "parts") orelse continue;
-        if (parts != .array) continue;
+        const role = parseImportedApiMessageRole(item) orelse continue;
 
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(allocator);
 
-        for (parts.array.items) |part| {
-            try appendImportedPartText(allocator, &body, part);
+        switch (role) {
+            .user => try appendImportedUserText(allocator, &body, item),
+            .assistant => try appendImportedAssistantText(allocator, &body, item),
+            .system => {},
         }
 
         const trimmed = std.mem.trim(u8, body.items, &std.ascii.whitespace);
@@ -1261,15 +1314,12 @@ fn parseImportedApiMessagesAlloc(allocator: std.mem.Allocator, value: std.json.V
             .body = try allocator.dupe(u8, trimmed),
         });
     }
-
-    return messages.toOwnedSlice(allocator);
 }
 
-fn parseImportedApiMessageRole(info: std.json.Value) ?provider_types.MessageRole {
-    const role = getOptionalObjectString(info, "role") orelse return null;
-    if (std.mem.eql(u8, role, "user")) return .user;
-    if (std.mem.eql(u8, role, "assistant")) return .assistant;
-    if (std.mem.eql(u8, role, "system")) return .system;
+fn parseImportedApiMessageRole(item: std.json.Value) ?provider_types.MessageRole {
+    const type_name = messageType(item) orelse return null;
+    if (std.mem.eql(u8, type_name, "user")) return .user;
+    if (std.mem.eql(u8, type_name, "assistant")) return .assistant;
     return null;
 }
 
@@ -1281,31 +1331,28 @@ fn importedAuthorForRole(role: provider_types.MessageRole) []const u8 {
     };
 }
 
-fn appendImportedPartText(
-    allocator: std.mem.Allocator,
-    body: *std.ArrayList(u8),
-    part: std.json.Value,
-) !void {
-    if (part != .object) return;
-    const part_type = getOptionalObjectString(part, "type") orelse return;
+fn appendImportedUserText(allocator: std.mem.Allocator, body: *std.ArrayList(u8), item: std.json.Value) !void {
+    const text = getOptionalObjectString(item, "text") orelse blk: {
+        const payload = getObjectField(item, "payload") orelse break :blk null;
+        break :blk getOptionalObjectString(payload, "text");
+    };
+    if (text) |value| try appendImportedBodySegment(allocator, body, value);
 
-    if (std.mem.eql(u8, part_type, "text")) {
-        if (jsonBool(getObjectField(part, "synthetic")) == true) return;
-        const text = getOptionalObjectString(part, "text") orelse return;
-        try appendImportedBodySegment(allocator, body, text);
-        return;
+    const files = getObjectField(item, "files") orelse return;
+    if (files != .array) return;
+    for (files.array.items) |file| {
+        const name = getOptionalObjectString(file, "name") orelse blk: {
+            const source = getObjectField(file, "source") orelse break :blk null;
+            break :blk getOptionalObjectString(source, "uri");
+        } orelse continue;
+        try appendImportedBodySegment(allocator, body, name);
     }
+}
 
-    if (std.mem.eql(u8, part_type, "file")) {
-        const source = getObjectField(part, "source");
-        const path = if (source) |source_value|
-            getOptionalObjectString(source_value, "path")
-        else
-            null;
-        const fallback = getOptionalObjectString(part, "filename") orelse getOptionalObjectString(part, "url");
-        const target = path orelse fallback orelse return;
-        try appendImportedBodySegment(allocator, body, target);
-    }
+fn appendImportedAssistantText(allocator: std.mem.Allocator, body: *std.ArrayList(u8), item: std.json.Value) !void {
+    const text = try extractAssistantTextAlloc(allocator, item);
+    defer allocator.free(text);
+    try appendImportedBodySegment(allocator, body, text);
 }
 
 fn appendImportedBodySegment(
@@ -1319,35 +1366,7 @@ fn appendImportedBodySegment(
     try body.appendSlice(allocator, trimmed);
 }
 
-fn jsonBool(value: ?std.json.Value) ?bool {
-    const actual = value orelse return null;
-    return switch (actual) {
-        .bool => |flag| flag,
-        else => null,
-    };
-}
-
-fn normalizeUnixTimestamp(value: ?i64) ?i64 {
-    const timestamp = value orelse return null;
-    if (timestamp >= 1_000_000_000_000) return @divFloor(timestamp, 1000);
-    return timestamp;
-}
-
-fn findSessionById(value: std.json.Value, thread_id: []const u8) ?std.json.Value {
-    if (value != .array) return null;
-    for (value.array.items) |item| {
-        if (item != .object) continue;
-        const id = getOptionalObjectString(item, "id") orelse continue;
-        if (std.mem.eql(u8, id, thread_id)) return item;
-    }
-    return null;
-}
-
 fn extractSessionUpdatedAt(value: std.json.Value) ?i64 {
-    if (jsonInteger(getObjectField(value, "time_updated"))) |time_updated| {
-        return normalizeUnixTimestamp(time_updated);
-    }
-
     const time_value = getObjectField(value, "time") orelse return null;
     if (time_value == .object) {
         if (jsonInteger(getObjectField(time_value, "updated"))) |updated| {
@@ -1357,8 +1376,12 @@ fn extractSessionUpdatedAt(value: std.json.Value) ?i64 {
             return normalizeUnixTimestamp(created);
         }
     }
-
     return null;
+}
+
+fn sessionDirectory(session_value: std.json.Value) ?[]const u8 {
+    const location = getObjectField(session_value, "location") orelse return null;
+    return getOptionalObjectString(location, "directory");
 }
 
 fn sessionMatchesWorkingDirectory(working_directory: ?[]const u8, session_directory: ?[]const u8) bool {
@@ -1372,57 +1395,81 @@ fn sessionMatchesWorkingDirectory(working_directory: ?[]const u8, session_direct
     return candidate[root.len] == separator;
 }
 
-fn parseConfiguredModelsAlloc(allocator: std.mem.Allocator, root: std.json.Value) ![]provider_types.ModelInfo {
+// Models ----------------------------------------------------------------------
+
+/// Parses `GET /api/model` (`{data: [Model.Info]}`); `providers_root` is the
+/// optional `GET /api/provider` body used for display names.
+fn parseModelsAlloc(allocator: std.mem.Allocator, root: std.json.Value, providers_root: ?std.json.Value) ![]provider_types.ModelInfo {
     var models: std.ArrayList(provider_types.ModelInfo) = .empty;
     errdefer {
         for (models.items) |model| model.deinit(allocator);
         models.deinit(allocator);
     }
 
-    switch (providerCollectionValue(root) orelse root) {
-        .array => |providers| {
-            for (providers.items) |provider_value| {
-                try appendProviderModels(allocator, provider_value, null, &models);
-            }
-        },
-        .object => |providers| {
-            var iterator = providers.iterator();
-            while (iterator.next()) |entry| {
-                try appendProviderModels(allocator, entry.value_ptr.*, entry.key_ptr.*, &models);
-            }
-        },
-        else => {},
+    const list = getObjectField(root, "data") orelse root;
+    if (list != .array) return models.toOwnedSlice(allocator);
+
+    for (list.array.items) |model_value| {
+        if (model_value != .object) continue;
+        if (jsonBool(getObjectField(model_value, "enabled")) == false) continue;
+
+        const provider_id = getOptionalObjectString(model_value, "providerID") orelse continue;
+        const model_id = getOptionalObjectString(model_value, "modelID") orelse
+            getOptionalObjectString(model_value, "id") orelse continue;
+        const model_name = getOptionalObjectString(model_value, "name") orelse model_id;
+        const provider_name = providerNameFor(providers_root, provider_id) orelse provider_id;
+
+        const variant_keys = try collectVariantKeysSortedAlloc(allocator, model_value);
+        errdefer if (variant_keys) |keys| {
+            for (keys) |k| allocator.free(k);
+            allocator.free(keys);
+        };
+
+        try models.append(allocator, .{
+            .provider_id = try allocator.dupe(u8, provider_id),
+            .provider_name = try allocator.dupe(u8, provider_name),
+            .model_id = try allocator.dupe(u8, model_id),
+            .model_name = try allocator.dupe(u8, model_name),
+            // v2 exposes reasoning control only through named variants.
+            .reasoning_supported = variant_keys != null,
+            .reasoning_variant_keys = variant_keys,
+        });
     }
 
     return models.toOwnedSlice(allocator);
 }
 
-fn providerCollectionValue(root: std.json.Value) ?std.json.Value {
-    if (root != .object) return null;
-    return getObjectField(root, "providers");
-}
-
-fn readReasoningSupported(model_value: std.json.Value) bool {
-    if (model_value != .object) return true;
-    const cap = getObjectField(model_value, "capabilities") orelse return true;
-    if (cap != .object) return true;
-    const r = getObjectField(cap, "reasoning") orelse return true;
-    return switch (r) {
-        .bool => |b| b,
-        else => true,
-    };
+fn providerNameFor(providers_root: ?std.json.Value, provider_id: []const u8) ?[]const u8 {
+    const root = providers_root orelse return null;
+    const list = getObjectField(root, "data") orelse root;
+    if (list != .array) return null;
+    for (list.array.items) |provider| {
+        const id = getOptionalObjectString(provider, "id") orelse continue;
+        if (!std.mem.eql(u8, id, provider_id)) continue;
+        return getOptionalObjectString(provider, "name");
+    }
+    return null;
 }
 
 fn collectVariantKeysSortedAlloc(allocator: std.mem.Allocator, model_value: std.json.Value) !?[][:0]const u8 {
-    if (model_value != .object) return null;
     const variants = getObjectField(model_value, "variants") orelse return null;
-    if (variants != .object) return null;
 
     var names: std.ArrayListUnmanaged([]const u8) = .empty;
     defer names.deinit(allocator);
-    var it = variants.object.iterator();
-    while (it.next()) |entry| {
-        try names.append(allocator, entry.key_ptr.*);
+    switch (variants) {
+        .array => |items| for (items.items) |variant| {
+            const id = switch (variant) {
+                .string => |text| text,
+                .object => getOptionalObjectString(variant, "id") orelse continue,
+                else => continue,
+            };
+            try names.append(allocator, id);
+        },
+        .object => |object| {
+            var it = object.iterator();
+            while (it.next()) |entry| try names.append(allocator, entry.key_ptr.*);
+        },
+        else => return null,
     }
     if (names.items.len == 0) return null;
 
@@ -1443,85 +1490,19 @@ fn collectVariantKeysSortedAlloc(allocator: std.mem.Allocator, model_value: std.
     return out;
 }
 
-fn appendProviderModels(
-    allocator: std.mem.Allocator,
-    provider_value: std.json.Value,
-    fallback_provider_id: ?[]const u8,
-    models: *std.ArrayList(provider_types.ModelInfo),
-) !void {
-    if (provider_value != .object) return;
-
-    const provider_id = getOptionalObjectString(provider_value, "id") orelse fallback_provider_id orelse return;
-    const provider_name = getOptionalObjectString(provider_value, "name") orelse
-        getOptionalObjectString(provider_value, "displayName") orelse
-        provider_id;
-    const provider_models = getObjectField(provider_value, "models") orelse return;
-
-    switch (provider_models) {
-        .object => {
-            var iterator = provider_models.object.iterator();
-            while (iterator.next()) |entry| {
-                try appendModelInfo(allocator, entry.value_ptr.*, provider_id, provider_name, entry.key_ptr.*, models);
-            }
-        },
-        .array => {
-            for (provider_models.array.items) |model_value| {
-                try appendModelInfo(allocator, model_value, provider_id, provider_name, null, models);
-            }
-        },
-        else => {},
-    }
-}
-
-fn appendModelInfo(
-    allocator: std.mem.Allocator,
-    model_value: std.json.Value,
-    provider_id: []const u8,
-    provider_name: []const u8,
-    fallback_model_id: ?[]const u8,
-    models: *std.ArrayList(provider_types.ModelInfo),
-) !void {
-    const model_id, const model_name = switch (model_value) {
-        .string => |text| .{ text, text },
-        .object => .{
-            getOptionalObjectString(model_value, "id") orelse fallback_model_id orelse return,
-            getOptionalObjectString(model_value, "name") orelse
-                getOptionalObjectString(model_value, "displayName") orelse
-                getOptionalObjectString(model_value, "id") orelse
-                fallback_model_id orelse return,
-        },
-        else => return,
-    };
-
-    const reasoning_supported = readReasoningSupported(model_value);
-    const variant_keys = try collectVariantKeysSortedAlloc(allocator, model_value);
-    errdefer if (variant_keys) |keys| {
-        for (keys) |k| allocator.free(k);
-        allocator.free(keys);
-    };
-
-    try models.append(allocator, .{
-        .provider_id = try allocator.dupe(u8, provider_id),
-        .provider_name = try allocator.dupe(u8, provider_name),
-        .model_id = try allocator.dupe(u8, model_id),
-        .model_name = try allocator.dupe(u8, model_name),
-        .reasoning_supported = reasoning_supported,
-        .reasoning_variant_keys = variant_keys,
-    });
-}
+// Assistant messages ----------------------------------------------------------
 
 fn extractAssistantTextAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
-    const parts = getObjectField(value, "parts") orelse return allocator.dupe(u8, "");
-    if (parts != .array) return allocator.dupe(u8, "");
+    const content = getObjectField(value, "content") orelse return allocator.dupe(u8, "");
+    if (content != .array) return allocator.dupe(u8, "");
 
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(allocator);
 
-    for (parts.array.items) |part| {
+    for (content.array.items) |part| {
         if (part != .object) continue;
         const type_name = getOptionalObjectString(part, "type") orelse continue;
         if (!std.mem.eql(u8, type_name, "text")) continue;
-        if (jsonBool(getObjectField(part, "ignored")) == true or jsonBool(getObjectField(part, "synthetic")) == true) continue;
         const chunk = getOptionalObjectString(part, "text") orelse "";
         try text.appendSlice(allocator, chunk);
     }
@@ -1530,37 +1511,48 @@ fn extractAssistantTextAlloc(allocator: std.mem.Allocator, value: std.json.Value
 }
 
 fn extractAssistantErrorMessageAlloc(allocator: std.mem.Allocator, value: std.json.Value) !?[]u8 {
-    const info = getObjectField(value, "info") orelse return null;
-    const error_value = getObjectField(info, "error") orelse return null;
-    const message = getOptionalObjectString(error_value, "message") orelse return null;
+    const error_value = getObjectField(value, "error") orelse return null;
+    const message = switch (error_value) {
+        .string => |text| text,
+        .object => getOptionalObjectString(error_value, "message") orelse return null,
+        else => return null,
+    };
     return try allocator.dupe(u8, message);
 }
 
 fn extractAssistantFinishAlloc(allocator: std.mem.Allocator, value: std.json.Value) !?[]u8 {
-    const info = getObjectField(value, "info") orelse return null;
-    const finish = getOptionalObjectString(info, "finish") orelse return null;
+    const finish = getOptionalObjectString(value, "finish") orelse return null;
     return try allocator.dupe(u8, finish);
 }
 
+fn parseOpenCodeTaskSummary(summary: []const u8) struct { title: []const u8, status: provider_types.ToolCallStatus } {
+    if (std.mem.startsWith(u8, summary, "Running subtask: ")) {
+        return .{ .title = summary["Running subtask: ".len..], .status = .in_progress };
+    }
+    if (std.mem.startsWith(u8, summary, "Completed subtask: ")) {
+        return .{ .title = summary["Completed subtask: ".len..], .status = .completed };
+    }
+    if (std.mem.startsWith(u8, summary, "Failed subtask: ")) {
+        return .{ .title = summary["Failed subtask: ".len..], .status = .failed };
+    }
+    if (std.mem.indexOf(u8, summary, " subtask: ")) |index| {
+        return .{ .title = summary[index + " subtask: ".len ..], .status = .unknown };
+    }
+    return .{ .title = summary, .status = .unknown };
+}
+
+/// Scans the newest-first message window for the latest assistant step after
+/// the anchoring user message and summarizes its subagent tool state.
 fn extractLatestAssistantTaskSummaryAlloc(
     allocator: std.mem.Allocator,
-    value: std.json.Value,
-    baseline_assistant_id: ?[]const u8,
+    messages_desc: std.json.Value,
+    user_message_id: ?[]const u8,
 ) !?[]u8 {
-    if (value != .array) return null;
+    if (messages_desc != .array) return null;
+    const boundary = findUserBoundary(messages_desc.array.items, user_message_id);
 
-    var index = value.array.items.len;
-    while (index > 0) {
-        index -= 1;
-        const item = value.array.items[index];
-        if (item != .object) continue;
-        const info = getObjectField(item, "info") orelse continue;
-        const role = getOptionalObjectString(info, "role") orelse continue;
-        if (!std.mem.eql(u8, role, "assistant")) continue;
-
-        const message_id = getOptionalObjectString(info, "id");
-        if (baseline_assistant_id != null and message_id != null and std.mem.eql(u8, baseline_assistant_id.?, message_id.?)) continue;
-
+    for (messages_desc.array.items[0..boundary]) |item| {
+        if (!messageIs(item, "assistant")) continue;
         if (try extractAssistantTaskSummaryAlloc(allocator, item)) |summary| {
             return summary;
         }
@@ -1570,33 +1562,30 @@ fn extractLatestAssistantTaskSummaryAlloc(
 }
 
 fn extractAssistantTaskSummaryAlloc(allocator: std.mem.Allocator, value: std.json.Value) !?[]u8 {
-    const parts = getObjectField(value, "parts") orelse return null;
-    if (parts != .array) return null;
+    const content = getObjectField(value, "content") orelse return null;
+    if (content != .array) return null;
 
-    var index = parts.array.items.len;
+    var index = content.array.items.len;
     while (index > 0) {
         index -= 1;
-        const part = parts.array.items[index];
+        const part = content.array.items[index];
         if (part != .object) continue;
         const part_type = getOptionalObjectString(part, "type") orelse continue;
         if (!std.mem.eql(u8, part_type, "tool")) continue;
-        const tool_name = getOptionalObjectString(part, "tool") orelse continue;
-        if (!std.mem.eql(u8, tool_name, "task")) continue;
+        const tool_name = getOptionalObjectString(part, "name") orelse continue;
+        if (!provider_types.isSubagentToolName(tool_name)) continue;
 
         const state = getObjectField(part, "state") orelse continue;
         const status = getOptionalObjectString(state, "status") orelse continue;
-        const title = getOptionalObjectString(state, "title") orelse blk: {
-            const input = getObjectField(state, "input") orelse break :blk null;
-            break :blk getOptionalObjectString(input, "description");
-        } orelse "OpenCode task";
+        const title = openCodeTaskTitle(getObjectField(state, "input") orelse .null, "OpenCode task");
 
-        if (std.mem.eql(u8, status, "running")) {
+        if (std.mem.eql(u8, status, "running") or std.mem.eql(u8, status, "streaming")) {
             return try std.fmt.allocPrint(allocator, "Running subtask: {s}", .{title});
         }
         if (std.mem.eql(u8, status, "completed")) {
             return try std.fmt.allocPrint(allocator, "Completed subtask: {s}", .{title});
         }
-        if (std.mem.eql(u8, status, "failed")) {
+        if (std.mem.eql(u8, status, "error")) {
             return try std.fmt.allocPrint(allocator, "Failed subtask: {s}", .{title});
         }
 
@@ -1606,26 +1595,88 @@ fn extractAssistantTaskSummaryAlloc(allocator: std.mem.Allocator, value: std.jso
     return null;
 }
 
-fn startEventStream(self: *Client, allocator: std.mem.Allocator, session_id: []const u8, baseline_assistant_id: ?[]const u8, request: provider_types.SendPromptRequest) !?EventStreamHandle {
+/// Index of the anchoring user message in a newest-first window: the message
+/// with `user_message_id`, else the newest user message. When the anchor has
+/// already scrolled out of the window, every message in it belongs to the turn.
+fn findUserBoundary(items_desc: []const std.json.Value, user_message_id: ?[]const u8) usize {
+    for (items_desc, 0..) |item, index| {
+        if (!messageIs(item, "user")) continue;
+        if (user_message_id) |wanted| {
+            const id = getOptionalObjectString(item, "id") orelse continue;
+            if (std.mem.eql(u8, id, wanted)) return index;
+        } else {
+            return index;
+        }
+    }
+    return items_desc.len;
+}
+
+/// OpenCode creates one assistant message per model step. Prefer the latest
+/// visible or terminal step for the current turn while retaining the first
+/// step as an in-flight fallback. `messages_desc` is newest-first.
+fn findPrimaryAssistantAfterUser(messages_desc: std.json.Value, user_message_id: ?[]const u8) ?std.json.Value {
+    if (messages_desc != .array) return null;
+    const items = messages_desc.array.items;
+    const boundary = findUserBoundary(items, user_message_id);
+
+    var first_assistant: ?std.json.Value = null;
+    var reply_assistant: ?std.json.Value = null;
+    var index = boundary;
+    while (index > 0) {
+        index -= 1;
+        const item = items[index];
+        if (!messageIs(item, "assistant")) continue;
+
+        if (first_assistant == null) first_assistant = item;
+        if (assistantMessageHasVisibleText(item) or assistantMessageIsTerminal(item) or assistantMessageHasError(item)) {
+            reply_assistant = item;
+        }
+    }
+
+    return reply_assistant orelse first_assistant;
+}
+
+fn assistantMessageHasVisibleText(value: std.json.Value) bool {
+    const content = getObjectField(value, "content") orelse return false;
+    if (content != .array) return false;
+    for (content.array.items) |part| {
+        if (part != .object) continue;
+        const part_type = getOptionalObjectString(part, "type") orelse continue;
+        if (!std.mem.eql(u8, part_type, "text")) continue;
+        const text = getOptionalObjectString(part, "text") orelse continue;
+        if (std.mem.trim(u8, text, &std.ascii.whitespace).len > 0) return true;
+    }
+    return false;
+}
+
+fn assistantMessageIsTerminal(value: std.json.Value) bool {
+    const finish = getOptionalObjectString(value, "finish") orelse return false;
+    return !std.mem.eql(u8, finish, "tool-calls") and !std.mem.eql(u8, finish, "unknown");
+}
+
+fn assistantMessageHasError(value: std.json.Value) bool {
+    const error_value = getObjectField(value, "error") orelse return false;
+    return error_value != .null;
+}
+
+// Event stream ----------------------------------------------------------------
+
+fn startEventStream(self: *Client, allocator: std.mem.Allocator, session_id: []const u8, request: provider_types.SendPromptRequest) !?EventStreamHandle {
     if (request.on_stream_delta == null and request.on_stream_event == null) return null;
 
     const owned_session_id = try allocator.dupe(u8, session_id);
     errdefer allocator.free(owned_session_id);
-
-    const owned_baseline_assistant_id = if (baseline_assistant_id) |message_id|
-        try allocator.dupe(u8, message_id)
-    else
-        null;
-    errdefer if (owned_baseline_assistant_id) |message_id| allocator.free(message_id);
 
     const context = try allocator.create(EventStreamContext);
     errdefer allocator.destroy(context);
 
     context.* = .{
         .allocator = allocator,
-        .config = self.config,
+        .base_url = self.endpoint.base_url,
+        .username = self.config.username,
+        .password = self.endpoint.password,
+        .working_directory = self.config.working_directory,
         .session_id = owned_session_id,
-        .baseline_assistant_id = owned_baseline_assistant_id,
         .request = request,
     };
     errdefer context.deinit();
@@ -1657,6 +1708,18 @@ fn runEventStream(context: *EventStreamContext) void {
     };
 }
 
+fn eventStreamUrlAlloc(context: *EventStreamContext) ![]u8 {
+    var url: std.ArrayList(u8) = .empty;
+    errdefer url.deinit(context.allocator);
+    try url.appendSlice(context.allocator, context.base_url);
+    try url.appendSlice(context.allocator, "/api/event");
+    if (context.working_directory) |directory| {
+        try url.appendSlice(context.allocator, "?location%5Bdirectory%5D=");
+        try appendPercentEncoded(&url, context.allocator, directory);
+    }
+    return url.toOwnedSlice(context.allocator);
+}
+
 fn streamSessionEvents(context: *EventStreamContext) !void {
     var env_map = try process_env.buildAugmentedEnvMap(context.allocator);
     defer env_map.deinit();
@@ -1667,7 +1730,7 @@ fn streamSessionEvents(context: *EventStreamContext) !void {
     var opened = false;
     errdefer if (!opened) signalEventStreamOpenState(context, .failed);
 
-    const url = try std.fmt.allocPrint(context.allocator, "{s}/event", .{context.config.base_url});
+    const url = try eventStreamUrlAlloc(context);
     defer context.allocator.free(url);
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(context.allocator);
@@ -1683,17 +1746,10 @@ fn streamSessionEvents(context: *EventStreamContext) !void {
 
     var owned_auth_header: ?[]u8 = null;
     defer if (owned_auth_header) |header| context.allocator.free(header);
-    if (try makeAuthorizationHeaderAlloc(context.allocator, context.config)) |header| {
+    if (try makeAuthorizationHeaderAlloc(context.allocator, context.username, context.password)) |header| {
         defer context.allocator.free(header.value);
         owned_auth_header = try std.fmt.allocPrint(context.allocator, "{s}: {s}", .{ header.name, header.value });
         try argv.appendSlice(context.allocator, &.{ "-H", owned_auth_header.? });
-    }
-
-    var owned_directory_header: ?[]u8 = null;
-    defer if (owned_directory_header) |header| context.allocator.free(header);
-    if (context.config.working_directory) |dir| {
-        owned_directory_header = try std.fmt.allocPrint(context.allocator, "x-opencode-directory: {s}", .{dir});
-        try argv.appendSlice(context.allocator, &.{ "-H", owned_directory_header.? });
     }
 
     try argv.append(context.allocator, url);
@@ -1747,8 +1803,8 @@ fn streamSessionEvents(context: *EventStreamContext) !void {
         const line = std.mem.trimEnd(u8, raw_line, "\r");
 
         if (line.len == 0) {
-            if (event_data.items.len > 0 and try processEventStreamMessage(context, event_name.items, event_data.items)) {
-                return;
+            if (event_data.items.len > 0) {
+                try processEventStreamMessage(context, event_name.items, event_data.items);
             }
             if (isEventStreamStopRequested(context)) return;
             event_name.clearRetainingCapacity();
@@ -1773,7 +1829,7 @@ fn streamSessionEvents(context: *EventStreamContext) !void {
     }
 
     if (event_data.items.len > 0) {
-        _ = try processEventStreamMessage(context, event_name.items, event_data.items);
+        try processEventStreamMessage(context, event_name.items, event_data.items);
     }
 }
 
@@ -1818,51 +1874,64 @@ fn cleanupEventStreamChild(context: *EventStreamContext) void {
     log.info("OpenCode event stream exited session_len={d}", .{context.session_id.len});
 }
 
-fn processEventStreamMessage(context: *EventStreamContext, raw_event_name: []const u8, raw_event_data: []const u8) !bool {
-    if (raw_event_data.len == 0) return false;
+fn processEventStreamMessage(context: *EventStreamContext, raw_event_name: []const u8, raw_event_data: []const u8) !void {
+    if (raw_event_data.len == 0) return;
 
     var parsed = try std.json.parseFromSlice(std.json.Value, context.allocator, raw_event_data, .{});
     defer parsed.deinit();
 
-    const envelope = parseEventEnvelope(parsed.value, raw_event_name) orelse return false;
+    const envelope = parseEventEnvelope(parsed.value, raw_event_name) orelse return;
+    const event_type = envelope.event_type;
+    const properties = envelope.properties;
+    if (!eventTargetsSession(properties, context.session_id)) return;
 
-    if (std.mem.eql(u8, envelope.event_type, "session.idle") and eventTargetsSession(envelope.properties, context.session_id)) {
-        signalEventStreamIdle(context);
-        return false;
+    if (eventTypeIs(event_type, "session.text.delta")) {
+        try handleTextDelta(context, properties);
+    } else if (eventTypeIs(event_type, "session.tool.called")) {
+        try handleToolCalled(context, properties);
+    } else if (eventTypeIs(event_type, "session.tool.success")) {
+        try handleToolFinished(context, properties, .completed);
+    } else if (eventTypeIs(event_type, "session.tool.failed")) {
+        try handleToolFinished(context, properties, .failed);
+    } else if (eventTypeIs(event_type, "session.retried")) {
+        try emitRetryMessage(context, properties);
+    } else if (eventTypeIs(event_type, "session.status")) {
+        const status = getObjectField(properties, "status") orelse return;
+        if (std.mem.eql(u8, getOptionalObjectString(status, "type") orelse "", "retry")) {
+            try emitRetryMessage(context, status);
+        }
+    } else if (eventTypeIs(event_type, "session.execution.failed")) {
+        emitExecutionFailure(context, properties);
+        signalEventStreamTerminal(context);
+    } else if (eventTypeIs(event_type, "session.execution.succeeded") or
+        eventTypeIs(event_type, "session.execution.interrupted") or
+        eventTypeIs(event_type, "session.idle"))
+    {
+        signalEventStreamTerminal(context);
     }
+}
 
-    if (std.mem.eql(u8, envelope.event_type, "session.status")) {
-        return false;
+/// Live services emit `session.text.delta`; the published schema also names
+/// the same events `session.next.text.delta`. Accept both spellings.
+fn eventTypeIs(event_type: []const u8, comptime canonical: []const u8) bool {
+    if (std.mem.eql(u8, event_type, canonical)) return true;
+    if (comptime std.mem.startsWith(u8, canonical, "session.")) {
+        const with_next = "session.next." ++ canonical["session.".len..];
+        return std.mem.eql(u8, event_type, with_next);
     }
-
-    if (std.mem.eql(u8, envelope.event_type, "message.part.updated")) {
-        try handleMessagePartUpdated(context, envelope.properties);
-        return false;
-    }
-
-    if (std.mem.eql(u8, envelope.event_type, "message.part.delta")) {
-        try handleMessagePartDelta(context, envelope.properties);
-        return false;
-    }
-
-    if (std.mem.eql(u8, envelope.event_type, "session.diff")) {
-        try handleSessionDiff(context, envelope.properties);
-        return false;
-    }
-
     return false;
 }
 
-fn signalEventStreamIdle(context: *EventStreamContext) void {
+fn signalEventStreamTerminal(context: *EventStreamContext) void {
     context.mutex.lock();
-    context.session_idle = true;
+    context.session_terminal = true;
     context.mutex.unlock();
 }
 
-fn eventStreamReachedIdle(context: *EventStreamContext) bool {
+fn eventStreamReachedTerminal(context: *EventStreamContext) bool {
     context.mutex.lock();
     defer context.mutex.unlock();
-    return context.session_idle;
+    return context.session_terminal;
 }
 
 const EventEnvelope = struct {
@@ -1870,23 +1939,13 @@ const EventEnvelope = struct {
     properties: std.json.Value,
 };
 
+/// v2 frames are `{"id","type","data":{...}}`; older shapes used `properties`.
 fn parseEventEnvelope(root: std.json.Value, event_name: []const u8) ?EventEnvelope {
     if (root == .object) {
-        if (getObjectField(root, "payload")) |payload| {
-            if (payload == .object) {
-                if (getOptionalObjectString(payload, "type")) |payload_type| {
-                    return .{
-                        .event_type = payload_type,
-                        .properties = getObjectField(payload, "properties") orelse payload,
-                    };
-                }
-            }
-        }
-
         if (getOptionalObjectString(root, "type")) |root_type| {
             return .{
                 .event_type = root_type,
-                .properties = getObjectField(root, "properties") orelse root,
+                .properties = getObjectField(root, "data") orelse getObjectField(root, "properties") orelse root,
             };
         }
     }
@@ -1903,31 +1962,89 @@ fn eventTargetsSession(value: std.json.Value, session_id: []const u8) bool {
     return std.mem.eql(u8, event_session_id, session_id);
 }
 
-fn handleMessagePartUpdated(context: *EventStreamContext, properties: std.json.Value) !void {
-    const part = getObjectField(properties, "part") orelse return;
-    const part_type = getOptionalObjectString(part, "type") orelse return;
-    if (std.mem.eql(u8, part_type, "tool")) {
-        if (!eventTargetsSession(part, context.session_id) and !eventTargetsSession(properties, context.session_id)) return;
-        if (context.baseline_assistant_id) |baseline_id| {
-            if (getOptionalObjectString(part, "messageID")) |message_id| {
-                if (std.mem.eql(u8, message_id, baseline_id)) return;
-            }
-        }
-        _ = try emitOpenCodeToolPart(context.allocator, part, context.request);
-        return;
+fn handleTextDelta(context: *EventStreamContext, properties: std.json.Value) !void {
+    const delta = getOptionalObjectString(properties, "delta") orelse return;
+    if (delta.len == 0) return;
+
+    {
+        context.mutex.lock();
+        defer context.mutex.unlock();
+        try context.streamed_text.appendSlice(context.allocator, delta);
     }
 
-    const part_id = visibleTextPartId(properties, context.session_id) orelse return;
+    const on_stream_delta = context.request.on_stream_delta orelse return;
+    on_stream_delta(context.request.stream_context, delta);
+}
+
+fn handleToolCalled(context: *EventStreamContext, properties: std.json.Value) !void {
+    const call_id = getOptionalObjectString(properties, "callID") orelse return;
+    const tool_name = getOptionalObjectString(properties, "tool") orelse return;
+
+    {
+        context.mutex.lock();
+        defer context.mutex.unlock();
+        if (context.tool_names.get(call_id) == null) {
+            const owned_call_id = try context.allocator.dupe(u8, call_id);
+            errdefer context.allocator.free(owned_call_id);
+            const owned_name = try context.allocator.dupe(u8, tool_name);
+            errdefer context.allocator.free(owned_name);
+            try context.tool_names.put(context.allocator, owned_call_id, owned_name);
+        }
+    }
+
+    _ = try emitToolCalled(context.allocator, context.request, properties);
+}
+
+fn handleToolFinished(context: *EventStreamContext, properties: std.json.Value, status: provider_types.ToolCallStatus) !void {
+    const call_id = getOptionalObjectString(properties, "callID") orelse return;
 
     context.mutex.lock();
-    defer context.mutex.unlock();
-    if (containsString(context.visible_text_part_ids.items, part_id)) return;
-    const owned_part_id = try context.allocator.dupe(u8, part_id);
-    errdefer context.allocator.free(owned_part_id);
-    try context.visible_text_part_ids.append(context.allocator, owned_part_id);
+    const tool_name: []const u8 = context.tool_names.get(call_id) orelse "tool";
+    context.mutex.unlock();
+
+    _ = try emitToolResult(context.allocator, context.request, tool_name, properties, status);
+}
+
+fn emitRetryMessage(context: *EventStreamContext, properties: std.json.Value) !void {
+    const on_stream_event = context.request.on_stream_event orelse return;
+    const attempt = jsonInteger(getObjectField(properties, "attempt")) orelse 0;
+    const message = blk: {
+        const error_value = getObjectField(properties, "error") orelse break :blk null;
+        break :blk switch (error_value) {
+            .string => |text| text,
+            .object => getOptionalObjectString(error_value, "message"),
+            else => null,
+        };
+    } orelse getOptionalObjectString(properties, "message") orelse "OpenCode is retrying the request.";
+
+    const title = if (attempt > 0)
+        try std.fmt.allocPrint(context.allocator, "OpenCode retry {d}", .{attempt})
+    else
+        try context.allocator.dupe(u8, "OpenCode retry");
+    defer context.allocator.free(title);
+
+    on_stream_event(context.request.stream_context, .{ .message = .{
+        .title = title,
+        .body = message,
+    } });
+}
+
+fn emitExecutionFailure(context: *EventStreamContext, properties: std.json.Value) void {
+    const on_stream_event = context.request.on_stream_event orelse return;
+    const error_value = getObjectField(properties, "error") orelse return;
+    const message = switch (error_value) {
+        .string => |text| text,
+        .object => getOptionalObjectString(error_value, "message") orelse return,
+        else => return,
+    };
+    on_stream_event(context.request.stream_context, .{ .message = .{
+        .title = "OpenCode error",
+        .body = message,
+    } });
 }
 
 fn openCodeToolKind(tool_name: []const u8) provider_types.ToolCallKind {
+    if (provider_types.isSubagentToolName(tool_name)) return .subagent;
     if (std.mem.eql(u8, tool_name, "bash") or std.mem.eql(u8, tool_name, "shell")) return .execute;
     if (std.mem.eql(u8, tool_name, "read")) return .read;
     if (std.mem.eql(u8, tool_name, "edit") or std.mem.eql(u8, tool_name, "write") or std.mem.eql(u8, tool_name, "patch")) return .edit;
@@ -1940,251 +2057,146 @@ fn openCodeToolKind(tool_name: []const u8) provider_types.ToolCallKind {
     return .mcp;
 }
 
-fn openCodeToolStatus(status: []const u8) provider_types.ToolCallStatus {
-    if (std.mem.eql(u8, status, "pending")) return .pending;
-    if (std.mem.eql(u8, status, "running")) return .in_progress;
-    if (std.mem.eql(u8, status, "completed")) return .completed;
-    if (std.mem.eql(u8, status, "error")) return .failed;
-    return .unknown;
+fn openCodeTaskTitle(input: std.json.Value, fallback: []const u8) []const u8 {
+    if (getOptionalObjectString(input, "description")) |description| {
+        if (std.mem.trim(u8, description, &std.ascii.whitespace).len > 0) return description;
+    }
+    if (getOptionalObjectString(input, "prompt")) |prompt| {
+        if (std.mem.trim(u8, prompt, &std.ascii.whitespace).len > 0) return prompt;
+    }
+    return fallback;
 }
 
-fn emitOpenCodeToolPart(
+/// Emits a `session.tool.called` event (`{callID, tool, input}`) as an in-progress tool row.
+fn emitToolCalled(
     allocator: std.mem.Allocator,
-    part: std.json.Value,
     request: provider_types.SendPromptRequest,
+    properties: std.json.Value,
 ) !bool {
     const on_stream_event = request.on_stream_event orelse return false;
-    const tool_name = getOptionalObjectString(part, "tool") orelse return false;
-    const call_id = getOptionalObjectString(part, "callID") orelse getOptionalObjectString(part, "id") orelse return false;
-    const state = getObjectField(part, "state") orelse return false;
-    const status_text = getOptionalObjectString(state, "status") orelse return false;
-    const input = if (getObjectField(state, "input")) |value|
-        try stringifyAlloc(allocator, value)
-    else
-        null;
+    const tool_name = getOptionalObjectString(properties, "tool") orelse return false;
+    const call_id = getOptionalObjectString(properties, "callID") orelse return false;
+    const input_value = getObjectField(properties, "input") orelse .null;
+    const input = if (input_value != .null) try stringifyAlloc(allocator, input_value) else null;
     defer if (input) |value| allocator.free(value);
+
+    const kind = openCodeToolKind(tool_name);
+    const title = if (kind == .subagent) openCodeTaskTitle(input_value, tool_name) else tool_name;
 
     on_stream_event(request.stream_context, .{ .tool_call = .{
         .call_id = call_id,
-        .title = tool_name,
-        .kind = openCodeToolKind(tool_name),
-        .status = openCodeToolStatus(status_text),
+        .title = title,
+        .kind = kind,
+        .status = .in_progress,
         .input = input,
-        .output = getOptionalObjectString(state, "output"),
-        .error_text = getOptionalObjectString(state, "error"),
     } });
     return true;
 }
 
-fn visibleTextPartId(properties: std.json.Value, session_id: []const u8) ?[]const u8 {
-    const part = getObjectField(properties, "part") orelse return null;
-    if (!eventTargetsSession(part, session_id) and !eventTargetsSession(properties, session_id)) return null;
-    const part_type = getOptionalObjectString(part, "type") orelse return null;
-    if (!std.mem.eql(u8, part_type, "text")) return null;
-    if (jsonBool(getObjectField(part, "ignored")) == true or jsonBool(getObjectField(part, "synthetic")) == true) return null;
-    return getOptionalObjectString(part, "id");
-}
+/// Emits a `session.tool.success` / `session.tool.failed` event as the final tool row.
+fn emitToolResult(
+    allocator: std.mem.Allocator,
+    request: provider_types.SendPromptRequest,
+    tool_name: []const u8,
+    properties: std.json.Value,
+    status: provider_types.ToolCallStatus,
+) !bool {
+    const on_stream_event = request.on_stream_event orelse return false;
+    const call_id = getOptionalObjectString(properties, "callID") orelse return false;
 
-fn handleMessagePartDelta(context: *EventStreamContext, properties: std.json.Value) !void {
-    if (!eventTargetsSession(properties, context.session_id)) return;
+    const output = try extractToolOutputAlloc(allocator, properties);
+    defer if (output) |value| allocator.free(value);
 
-    const message_id = getOptionalObjectString(properties, "messageID") orelse return;
-    if (context.baseline_assistant_id) |baseline_id| {
-        if (std.mem.eql(u8, message_id, baseline_id)) return;
-    }
-
-    const field = getOptionalObjectString(properties, "field") orelse return;
-    if (!std.mem.eql(u8, field, "text")) return;
-
-    const part_id = getOptionalObjectString(properties, "partID") orelse return;
-    context.mutex.lock();
-    const is_visible_text = containsString(context.visible_text_part_ids.items, part_id);
-    context.mutex.unlock();
-    if (!is_visible_text) return;
-
-    const delta = getOptionalObjectString(properties, "delta") orelse return;
-    if (delta.len == 0) return;
-
-    const on_stream_delta = context.request.on_stream_delta orelse {
-        context.mutex.lock();
-        defer context.mutex.unlock();
-        try context.streamed_text.appendSlice(context.allocator, delta);
-        return;
+    const error_text = blk: {
+        const error_value = getObjectField(properties, "error") orelse break :blk null;
+        break :blk switch (error_value) {
+            .string => |text| text,
+            .object => getOptionalObjectString(error_value, "message"),
+            else => null,
+        };
     };
 
-    {
-        context.mutex.lock();
-        defer context.mutex.unlock();
-        try context.streamed_text.appendSlice(context.allocator, delta);
-    }
+    const kind = openCodeToolKind(tool_name);
+    // Result events often omit `input`. Leave subagent titles empty so the
+    // in-progress description from `session.tool.called` is not overwritten
+    // with the generic tool name (`task`).
+    const input_value = getObjectField(properties, "input") orelse .null;
+    const title = if (kind == .subagent) openCodeTaskTitle(input_value, "") else tool_name;
 
-    const owned = try context.allocator.dupe(u8, delta);
-    errdefer context.allocator.free(owned);
-    on_stream_delta(context.request.stream_context, owned);
-    context.allocator.free(owned);
-}
-
-fn handleSessionDiff(context: *EventStreamContext, properties: std.json.Value) !void {
-    const on_stream_event = context.request.on_stream_event orelse return;
-    if (!eventTargetsSession(properties, context.session_id)) return;
-
-    const diff_value = getObjectField(properties, "diff") orelse return;
-    var files: std.ArrayList(provider_types.StreamDiffFile) = .empty;
-    defer files.deinit(std.heap.page_allocator);
-
-    try appendSessionDiffFiles(diff_value, &files);
-    if (files.items.len == 0) return;
-
-    on_stream_event(context.request.stream_context, .{ .diff = .{
-        .files = files.items,
+    on_stream_event(request.stream_context, .{ .tool_call = .{
+        .call_id = call_id,
+        .title = title,
+        .kind = kind,
+        .status = status,
+        .output = output,
+        .error_text = error_text,
     } });
+    return true;
 }
 
-/// OpenCode creates one assistant message per model step. Prefer the latest visible or
-/// terminal step for the current user while retaining the first step as an in-flight fallback.
-fn findPrimaryAssistantAfterLastUser(root: std.json.Value) ?std.json.Value {
-    if (root != .array) return null;
+fn extractToolOutputAlloc(allocator: std.mem.Allocator, properties: std.json.Value) !?[]u8 {
+    const content = getObjectField(properties, "content") orelse return null;
+    if (content == .string) return try allocator.dupe(u8, content.string);
+    if (content != .array) return null;
 
-    var last_user_index: ?usize = null;
-    var last_user_id: ?[]const u8 = null;
-    for (root.array.items, 0..) |item, index| {
-        if (item != .object) continue;
-        const info = getObjectField(item, "info") orelse continue;
-        const role = getOptionalObjectString(info, "role") orelse continue;
-        if (std.mem.eql(u8, role, "user")) {
-            last_user_index = index;
-            last_user_id = getOptionalObjectString(info, "id");
-        }
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    for (content.array.items) |part| {
+        const chunk = switch (part) {
+            .string => |value| value,
+            .object => getOptionalObjectString(part, "text") orelse getOptionalObjectString(part, "uri") orelse continue,
+            else => continue,
+        };
+        if (text.items.len > 0) try text.append(allocator, '\n');
+        try text.appendSlice(allocator, chunk);
     }
-
-    const after_user = last_user_index orelse return null;
-    var first_assistant: ?std.json.Value = null;
-    var reply_assistant: ?std.json.Value = null;
-    var i = after_user + 1;
-    while (i < root.array.items.len) : (i += 1) {
-        const item = root.array.items[i];
-        if (item != .object) continue;
-        const info = getObjectField(item, "info") orelse continue;
-        const role = getOptionalObjectString(info, "role") orelse continue;
-        if (!std.mem.eql(u8, role, "assistant")) continue;
-        if (jsonBool(getObjectField(info, "summary")) == true) continue;
-        if (last_user_id) |user_id| {
-            if (getOptionalObjectString(info, "parentID")) |parent_id| {
-                if (!std.mem.eql(u8, parent_id, user_id)) continue;
-            }
-        }
-
-        if (first_assistant == null) first_assistant = item;
-        if (assistantMessageHasVisibleText(item) or assistantMessageIsTerminal(info) or assistantMessageHasError(info)) {
-            reply_assistant = item;
-        }
-    }
-
-    return reply_assistant orelse first_assistant;
+    if (text.items.len == 0) return null;
+    return try text.toOwnedSlice(allocator);
 }
 
-fn assistantMessageHasVisibleText(value: std.json.Value) bool {
-    const parts = getObjectField(value, "parts") orelse return false;
-    if (parts != .array) return false;
-    for (parts.array.items) |part| {
-        if (part != .object) continue;
-        const part_type = getOptionalObjectString(part, "type") orelse continue;
-        if (!std.mem.eql(u8, part_type, "text")) continue;
-        if (jsonBool(getObjectField(part, "ignored")) == true or jsonBool(getObjectField(part, "synthetic")) == true) continue;
-        const text = getOptionalObjectString(part, "text") orelse continue;
-        if (std.mem.trim(u8, text, &std.ascii.whitespace).len > 0) return true;
-    }
-    return false;
-}
+// Permissions -----------------------------------------------------------------
 
-fn assistantMessageIsTerminal(info: std.json.Value) bool {
-    const finish = getOptionalObjectString(info, "finish") orelse return false;
-    return !std.mem.eql(u8, finish, "tool-calls") and !std.mem.eql(u8, finish, "unknown");
-}
-
-fn assistantMessageHasError(info: std.json.Value) bool {
-    const error_value = getObjectField(info, "error") orelse return false;
-    return error_value != .null;
-}
-
-fn findLatestAssistantMessage(value: std.json.Value) ?std.json.Value {
-    if (value != .array) return null;
-
-    var latest: ?std.json.Value = null;
-    var latest_created: i64 = -1;
-
-    for (value.array.items, 0..) |item, index| {
-        if (item != .object) continue;
-        const info = getObjectField(item, "info") orelse continue;
-        const role = getOptionalObjectString(info, "role") orelse continue;
-        if (!std.mem.eql(u8, role, "assistant")) continue;
-
-        const created = extractMessageCreatedAt(info) orelse @as(i64, @intCast(index));
-        if (latest == null or created >= latest_created) {
-            latest = item;
-            latest_created = created;
-        }
-    }
-
-    return latest;
-}
-
-fn extractMessageCreatedAt(info: std.json.Value) ?i64 {
-    const time = getObjectField(info, "time") orelse return null;
-    return jsonInteger(getObjectField(time, "created"));
-}
-
-fn jsonInteger(value: ?std.json.Value) ?i64 {
-    const actual = value orelse return null;
-    return switch (actual) {
-        .integer => |number| number,
-        .number_string => |text| std.fmt.parseInt(i64, text, 10) catch null,
-        else => null,
-    };
-}
-
+/// Summarizes a `Permission.Request` (`action`, `resources`, `message`, `source`).
 fn buildPermissionBody(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(allocator);
 
-    const permission_name = getOptionalObjectString(value, "permission") orelse "permission";
-    const permission_label = try std.fmt.allocPrint(allocator, "Permission: {s}", .{permission_name});
-    defer allocator.free(permission_label);
-    try text.appendSlice(allocator, permission_label);
+    const action = getOptionalObjectString(value, "action") orelse "permission";
+    const action_label = try std.fmt.allocPrint(allocator, "Action: {s}", .{action});
+    defer allocator.free(action_label);
+    try text.appendSlice(allocator, action_label);
 
-    const patterns_value = getObjectField(value, "patterns");
-    if (patterns_value) |patterns| {
-        if (patterns == .array and patterns.array.items.len > 0) {
-            try text.appendSlice(allocator, "\nPatterns:");
-            for (patterns.array.items) |pattern| {
-                if (pattern != .string) continue;
-                const label = try std.fmt.allocPrint(allocator, "\n- {s}", .{pattern.string});
+    if (getOptionalObjectString(value, "message")) |message| {
+        if (std.mem.trim(u8, message, &std.ascii.whitespace).len > 0) {
+            try text.appendSlice(allocator, "\n");
+            try text.appendSlice(allocator, message);
+        }
+    }
+
+    if (getObjectField(value, "resources")) |resources| {
+        if (resources == .array and resources.array.items.len > 0) {
+            try text.appendSlice(allocator, "\nResources:");
+            for (resources.array.items) |resource| {
+                if (resource != .string) continue;
+                const label = try std.fmt.allocPrint(allocator, "\n- {s}", .{resource.string});
                 defer allocator.free(label);
                 try text.appendSlice(allocator, label);
             }
         }
     }
 
-    if (getObjectField(value, "tool")) |tool| {
-        const call_id = getOptionalObjectString(tool, "callID");
-        const message_id = getOptionalObjectString(tool, "messageID");
-        if (call_id != null or message_id != null) {
-            try text.appendSlice(allocator, "\nTool:");
-            if (call_id) |id| {
-                const label = try std.fmt.allocPrint(allocator, "\n- call: {s}", .{id});
-                defer allocator.free(label);
-                try text.appendSlice(allocator, label);
-            }
-            if (message_id) |id| {
-                const label = try std.fmt.allocPrint(allocator, "\n- message: {s}", .{id});
-                defer allocator.free(label);
-                try text.appendSlice(allocator, label);
-            }
+    if (getObjectField(value, "source")) |source| {
+        if (getOptionalObjectString(source, "callID")) |call_id| {
+            const label = try std.fmt.allocPrint(allocator, "\nTool call: {s}", .{call_id});
+            defer allocator.free(label);
+            try text.appendSlice(allocator, label);
         }
     }
 
     return text.toOwnedSlice(allocator);
 }
+
+// Diffs -----------------------------------------------------------------------
 
 fn appendSessionDiffFiles(value: std.json.Value, files: *std.ArrayList(provider_types.StreamDiffFile)) !void {
     switch (value) {
@@ -2194,7 +2206,7 @@ fn appendSessionDiffFiles(value: std.json.Value, files: *std.ArrayList(provider_
             }
         },
         .object => {
-            if (getObjectField(value, "files")) |nested| {
+            if (getObjectField(value, "data") orelse getObjectField(value, "files")) |nested| {
                 try appendSessionDiffFiles(nested, files);
                 return;
             }
@@ -2252,11 +2264,9 @@ fn appendSessionDiffFile(item: std.json.Value, files: *std.ArrayList(provider_ty
     if (item != .object) return;
 
     const path = getOptionalObjectString(item, "file") orelse
-        getOptionalObjectString(item, "path") orelse
-        findFirstStringByField(item, "path") orelse
-        findFirstStringByField(item, "file") orelse return;
-    const patch_text = findFirstStringByField(item, "patch") orelse
-        findFirstStringByField(item, "diff");
+        getOptionalObjectString(item, "path") orelse return;
+    const patch_text = getOptionalObjectString(item, "patch") orelse
+        getOptionalObjectString(item, "diff");
     const patch = if (patch_text) |text|
         if (text.len > 0) text else null
     else
@@ -2264,62 +2274,10 @@ fn appendSessionDiffFile(item: std.json.Value, files: *std.ArrayList(provider_ty
 
     try files.append(std.heap.page_allocator, .{
         .path = path,
-        .additions = jsonInteger(getObjectField(item, "additions")) orelse
-            findFirstIntegerByField(item, "additions") orelse
-            countPatchLines(patch, '+'),
-        .deletions = jsonInteger(getObjectField(item, "deletions")) orelse
-            findFirstIntegerByField(item, "deletions") orelse
-            countPatchLines(patch, '-'),
+        .additions = jsonInteger(getObjectField(item, "additions")) orelse countPatchLines(patch, '+'),
+        .deletions = jsonInteger(getObjectField(item, "deletions")) orelse countPatchLines(patch, '-'),
         .patch = patch,
     });
-}
-
-fn findFirstStringByField(value: std.json.Value, field: []const u8) ?[]const u8 {
-    switch (value) {
-        .object => |obj| {
-            if (obj.get(field)) |candidate| {
-                if (candidate == .string) return candidate.string;
-            }
-            var it = obj.iterator();
-            while (it.next()) |entry| {
-                if (findFirstStringByField(entry.value_ptr.*, field)) |text| return text;
-            }
-            return null;
-        },
-        .array => |arr| {
-            for (arr.items) |item| {
-                if (findFirstStringByField(item, field)) |text| return text;
-            }
-            return null;
-        },
-        else => return null,
-    }
-}
-
-fn findFirstIntegerByField(value: std.json.Value, field: []const u8) ?i64 {
-    switch (value) {
-        .object => |obj| {
-            if (obj.get(field)) |candidate| {
-                return switch (candidate) {
-                    .integer => |number| number,
-                    .number_string => |text| std.fmt.parseInt(i64, text, 10) catch null,
-                    else => null,
-                };
-            }
-            var it = obj.iterator();
-            while (it.next()) |entry| {
-                if (findFirstIntegerByField(entry.value_ptr.*, field)) |number| return number;
-            }
-            return null;
-        },
-        .array => |arr| {
-            for (arr.items) |item| {
-                if (findFirstIntegerByField(item, field)) |number| return number;
-            }
-            return null;
-        },
-        else => return null,
-    }
 }
 
 fn countPatchLines(patch: ?[]const u8, prefix: u8) i64 {
@@ -2342,94 +2300,109 @@ fn containsString(items: []const []u8, needle: []const u8) bool {
     return false;
 }
 
-fn lastRetryMessageChanged(target: *?[]u8, allocator: std.mem.Allocator, next: []const u8) bool {
-    if (target.*) |current| {
-        if (std.mem.eql(u8, current, next)) return false;
-        allocator.free(current);
-    }
+// Request bodies --------------------------------------------------------------
 
-    target.* = allocator.dupe(u8, next) catch return false;
-    return true;
-}
-
-fn buildMessageBodyWithModel(
+fn buildSessionCreateBody(
     allocator: std.mem.Allocator,
-    prompt: []const u8,
-    model_ref: []const u8,
-) ![]u8 {
-    const provider_id, const model_id = parseModelRef(model_ref);
-    return stringifyAlloc(allocator, .{
-        .model = .{
-            .providerID = provider_id,
-            .modelID = model_id,
-        },
-        .parts = &.{.{ .type = "text", .text = prompt }},
-    });
-}
-
-fn buildPromptBody(
-    allocator: std.mem.Allocator,
+    title: ?[]const u8,
+    directory: ?[]const u8,
     request: provider_types.SendPromptRequest,
 ) ![]u8 {
-    const mapped_effort_variant = reasoningVariantName(request.reasoning_effort);
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
-    var stringify: std.json.Stringify = .{
-        .writer = &writer.writer,
-        .options = .{},
-    };
+    var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
 
     try stringify.beginObject();
-    if (request.model) |model_ref| {
-        const provider_id, const model_id = parseModelRef(model_ref);
-        try stringify.objectField("model");
+    try stringify.objectField("title");
+    try stringify.write(title orelse "Verde");
+    if (directory) |path| {
+        try stringify.objectField("location");
         try stringify.beginObject();
-        try stringify.objectField("providerID");
-        try stringify.write(provider_id);
-        try stringify.objectField("modelID");
-        try stringify.write(model_id);
+        try stringify.objectField("directory");
+        try stringify.write(path);
         try stringify.endObject();
     }
-    if (request.opencode_variant) |explicit| {
-        try stringify.objectField("variant");
-        try stringify.write(explicit);
-    } else if (mapped_effort_variant) |variant_name| {
-        try stringify.objectField("variant");
-        try stringify.write(variant_name);
+    if (request.model != null) {
+        try stringify.objectField("model");
+        try writeModelRef(&stringify, request);
     }
-    try stringify.objectField("parts");
-    try stringify.beginArray();
-    try writeTextPart(&stringify, request.prompt);
-    if (request.image) |image| try writeImagePart(&stringify, image.path);
-    for (request.images) |image| try writeImagePart(&stringify, image.path);
-    try stringify.endArray();
     try stringify.endObject();
     return writer.toOwnedSlice();
 }
 
-fn writeTextPart(stringify: *std.json.Stringify, text: []const u8) !void {
+/// Writes a v2 `Model.Ref` (`{providerID, id, variant?}`); the explicit
+/// OpenCode variant wins over the generic reasoning-effort mapping.
+fn writeModelRef(stringify: *std.json.Stringify, request: provider_types.SendPromptRequest) !void {
+    const provider_id, const model_id = parseModelRef(request.model orelse "");
     try stringify.beginObject();
-    try stringify.objectField("type");
-    try stringify.write("text");
-    try stringify.objectField("text");
-    try stringify.write(text);
+    try stringify.objectField("providerID");
+    try stringify.write(provider_id);
+    try stringify.objectField("id");
+    try stringify.write(model_id);
+    if (request.opencode_variant) |explicit| {
+        try stringify.objectField("variant");
+        try stringify.write(explicit);
+    } else if (reasoningVariantName(request.reasoning_effort)) |variant_name| {
+        try stringify.objectField("variant");
+        try stringify.write(variant_name);
+    }
     try stringify.endObject();
 }
 
-fn writeImagePart(stringify: *std.json.Stringify, path: []const u8) !void {
+/// Builds the `/prompt` body: `{text, files?}` with inline base64 attachments.
+fn buildPromptBody(
+    allocator: std.mem.Allocator,
+    request: provider_types.SendPromptRequest,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+
     try stringify.beginObject();
-    try stringify.objectField("type");
-    try stringify.write("file");
-    try stringify.objectField("filename");
+    try stringify.objectField("text");
+    try stringify.write(request.prompt);
+    if (request.image != null or request.images.len > 0) {
+        try stringify.objectField("files");
+        try stringify.beginArray();
+        if (request.image) |image| try writeInlineFile(allocator, &stringify, image.path);
+        for (request.images) |image| try writeInlineFile(allocator, &stringify, image.path);
+        try stringify.endArray();
+    }
+    try stringify.endObject();
+    return writer.toOwnedSlice();
+}
+
+fn writeInlineFile(allocator: std.mem.Allocator, stringify: *std.json.Stringify, path: []const u8) !void {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, allocator, .limited(MAX_ATTACHMENT_BYTES));
+    defer allocator.free(bytes);
+    const encoded = try encodeBase64Alloc(allocator, bytes);
+    defer allocator.free(encoded);
+
+    try stringify.beginObject();
+    try stringify.objectField("data");
+    try stringify.write(encoded);
+    try stringify.objectField("mime");
+    try stringify.write(mimeTypeForPath(path));
+    try stringify.objectField("name");
     try stringify.write(std.fs.path.basename(path));
     try stringify.objectField("source");
     try stringify.beginObject();
     try stringify.objectField("type");
-    try stringify.write("path");
-    try stringify.objectField("path");
-    try stringify.write(path);
+    try stringify.write("inline");
     try stringify.endObject();
     try stringify.endObject();
+}
+
+fn mimeTypeForPath(path: []const u8) []const u8 {
+    const extension = std.fs.path.extension(path);
+    if (std.ascii.eqlIgnoreCase(extension, ".png")) return "image/png";
+    if (std.ascii.eqlIgnoreCase(extension, ".jpg") or std.ascii.eqlIgnoreCase(extension, ".jpeg")) return "image/jpeg";
+    if (std.ascii.eqlIgnoreCase(extension, ".gif")) return "image/gif";
+    if (std.ascii.eqlIgnoreCase(extension, ".webp")) return "image/webp";
+    if (std.ascii.eqlIgnoreCase(extension, ".pdf")) return "application/pdf";
+    if (std.ascii.eqlIgnoreCase(extension, ".txt") or std.ascii.eqlIgnoreCase(extension, ".md")) return "text/plain";
+    return "application/octet-stream";
 }
 
 fn reasoningVariantName(value: ?provider_types.ReasoningEffort) ?[]const u8 {
@@ -2454,12 +2427,15 @@ fn parseModelRef(model_ref: []const u8) struct { []const u8, []const u8 } {
     return .{ "opencode", model_ref };
 }
 
+// Tests -----------------------------------------------------------------------
+
 const OpenCodeTestToolCapture = struct {
     call_id: ?[]const u8 = null,
     title: ?[]const u8 = null,
     kind: ?provider_types.ToolCallKind = null,
     status: ?provider_types.ToolCallStatus = null,
-    output: ?[]const u8 = null,
+    output_buffer: [256]u8 = undefined,
+    output_len: usize = 0,
     input_buffer: [256]u8 = undefined,
     input_len: usize = 0,
     count: usize = 0,
@@ -2472,10 +2448,13 @@ const OpenCodeTestToolCapture = struct {
                 self.title = tool_call.title;
                 self.kind = tool_call.kind;
                 self.status = tool_call.status;
-                self.output = tool_call.output;
                 if (tool_call.input) |input| {
                     self.input_len = @min(input.len, self.input_buffer.len);
                     @memcpy(self.input_buffer[0..self.input_len], input[0..self.input_len]);
+                }
+                if (tool_call.output) |output| {
+                    self.output_len = @min(output.len, self.output_buffer.len);
+                    @memcpy(self.output_buffer[0..self.output_len], output[0..self.output_len]);
                 }
                 self.count += 1;
             },
@@ -2484,49 +2463,119 @@ const OpenCodeTestToolCapture = struct {
     }
 };
 
-test "OpenCode tool parts preserve MCP input and output" {
+test "OpenCode tool called events preserve MCP input" {
     const payload =
-        \\{"id":"part-1","sessionID":"session-1","messageID":"assistant-1","type":"tool","callID":"call-1","tool":"verde:list_processes","state":{"status":"completed","input":{"workspace":"current"},"output":"{\"ok\":true}"}}
+        \\{"sessionID":"ses_1","assistantMessageID":"msg_1","callID":"call-1","tool":"verde:list_processes","input":{"workspace":"current"}}
     ;
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
     defer parsed.deinit();
     var capture: OpenCodeTestToolCapture = .{};
 
-    try std.testing.expect(try emitOpenCodeToolPart(std.testing.allocator, parsed.value, .{
+    try std.testing.expect(try emitToolCalled(std.testing.allocator, .{
         .prompt = "",
         .stream_context = &capture,
         .on_stream_event = OpenCodeTestToolCapture.handle,
-    }));
+    }, parsed.value));
     try std.testing.expectEqual(@as(usize, 1), capture.count);
     try std.testing.expectEqualStrings("call-1", capture.call_id.?);
     try std.testing.expectEqualStrings("verde:list_processes", capture.title.?);
-    try std.testing.expectEqual(provider_types.ToolCallStatus.completed, capture.status.?);
+    try std.testing.expectEqual(provider_types.ToolCallKind.mcp, capture.kind.?);
+    try std.testing.expectEqual(provider_types.ToolCallStatus.in_progress, capture.status.?);
     try std.testing.expectEqualStrings("{\"workspace\":\"current\"}", capture.input_buffer[0..capture.input_len]);
-    try std.testing.expectEqualStrings("{\"ok\":true}", capture.output.?);
 }
 
-test "OpenCode tool parts classify shell commands" {
+test "OpenCode tool called events classify task tools as subagents" {
     const payload =
-        \\{"id":"part-1","sessionID":"session-1","messageID":"assistant-1","type":"tool","callID":"bash-1","tool":"bash","state":{"status":"completed","input":{"command":"git status --short"},"output":"clean"}}
+        \\{"sessionID":"ses_1","callID":"task-1","tool":"task","input":{"description":"Explore website package"}}
     ;
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
     defer parsed.deinit();
     var capture: OpenCodeTestToolCapture = .{};
 
-    try std.testing.expect(try emitOpenCodeToolPart(std.testing.allocator, parsed.value, .{
+    try std.testing.expect(try emitToolCalled(std.testing.allocator, .{
         .prompt = "",
         .stream_context = &capture,
         .on_stream_event = OpenCodeTestToolCapture.handle,
-    }));
-    try std.testing.expectEqual(@as(usize, 1), capture.count);
-    try std.testing.expectEqual(provider_types.ToolCallKind.execute, capture.kind.?);
-    try std.testing.expectEqualStrings("bash", capture.title.?);
+    }, parsed.value));
+    try std.testing.expectEqual(provider_types.ToolCallKind.subagent, capture.kind.?);
+    try std.testing.expectEqualStrings("Explore website package", capture.title.?);
 }
 
-test "extractAssistantTextAlloc joins text parts" {
+test "OpenCode tool success events preserve subagent titles from input" {
+    const payload =
+        \\{"sessionID":"ses_1","callID":"task-1","input":{"description":"Explore website package"},"content":[{"type":"text","text":"done"}]}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    var capture: OpenCodeTestToolCapture = .{};
+
+    try std.testing.expect(try emitToolResult(std.testing.allocator, .{
+        .prompt = "",
+        .stream_context = &capture,
+        .on_stream_event = OpenCodeTestToolCapture.handle,
+    }, "task", parsed.value, .completed));
+    try std.testing.expectEqual(provider_types.ToolCallKind.subagent, capture.kind.?);
+    try std.testing.expectEqualStrings("Explore website package", capture.title.?);
+}
+
+test "OpenCode tool success events leave subagent titles empty without input" {
+    const payload =
+        \\{"sessionID":"ses_1","callID":"task-1","content":[{"type":"text","text":"done"}]}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    var capture: OpenCodeTestToolCapture = .{};
+
+    try std.testing.expect(try emitToolResult(std.testing.allocator, .{
+        .prompt = "",
+        .stream_context = &capture,
+        .on_stream_event = OpenCodeTestToolCapture.handle,
+    }, "task", parsed.value, .completed));
+    try std.testing.expectEqual(provider_types.ToolCallKind.subagent, capture.kind.?);
+    try std.testing.expectEqualStrings("", capture.title.?);
+}
+
+test "OpenCode tool success events join text content into output" {
+    const payload =
+        \\{"sessionID":"ses_1","callID":"bash-1","content":[{"type":"text","text":"clean"},{"type":"file","uri":"file:///tmp/x"}]}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    var capture: OpenCodeTestToolCapture = .{};
+
+    try std.testing.expect(try emitToolResult(std.testing.allocator, .{
+        .prompt = "",
+        .stream_context = &capture,
+        .on_stream_event = OpenCodeTestToolCapture.handle,
+    }, "bash", parsed.value, .completed));
+    try std.testing.expectEqual(provider_types.ToolCallKind.execute, capture.kind.?);
+    try std.testing.expectEqual(provider_types.ToolCallStatus.completed, capture.status.?);
+    try std.testing.expectEqualStrings("clean\nfile:///tmp/x", capture.output_buffer[0..capture.output_len]);
+}
+
+test "eventTypeIs accepts live and schema event spellings" {
+    try std.testing.expect(eventTypeIs("session.text.delta", "session.text.delta"));
+    try std.testing.expect(eventTypeIs("session.next.text.delta", "session.text.delta"));
+    try std.testing.expect(!eventTypeIs("session.text.started", "session.text.delta"));
+    try std.testing.expect(eventTypeIs("permission.asked", "permission.asked"));
+}
+
+test "parseEventEnvelope reads v2 data frames" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"id":"evt_1","type":"session.text.delta","data":{"sessionID":"ses_1","delta":"hi"}}
+    , .{});
+    defer parsed.deinit();
+
+    const envelope = parseEventEnvelope(parsed.value, "") orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("session.text.delta", envelope.event_type);
+    try std.testing.expect(eventTargetsSession(envelope.properties, "ses_1"));
+    try std.testing.expectEqualStrings("hi", getOptionalObjectString(envelope.properties, "delta").?);
+}
+
+test "extractAssistantTextAlloc joins text content parts" {
     const allocator = std.testing.allocator;
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
-        \\{"parts":[{"type":"text","text":"hello "},{"type":"reasoning","text":"hidden"},{"type":"text","text":"discarded","ignored":true},{"type":"text","text":"world"},{"type":"tool","text":"ignored"}]}
+        \\{"type":"assistant","content":[{"type":"text","text":"hello "},{"type":"reasoning","text":"hidden"},{"type":"text","text":"world"},{"type":"tool","name":"bash"}]}
     , .{});
     defer parsed.deinit();
 
@@ -2563,106 +2612,62 @@ test "oversized SSE lines can be discarded before reading the next event" {
     try std.testing.expectEqualStrings("ok", (try readEventStreamLine(&reader, &line_writer, 4)).?);
 }
 
-test "visibleTextPartId rejects reasoning and ignored text parts" {
+test "extractLatestAssistantTaskSummaryAlloc summarizes the newest subagent tool" {
     const allocator = std.testing.allocator;
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
         \\[
-        \\  {"part":{"id":"reasoning","sessionID":"root","type":"reasoning"}},
-        \\  {"part":{"id":"ignored","sessionID":"root","type":"text","ignored":true}},
-        \\  {"part":{"id":"visible","sessionID":"root","type":"text"}},
-        \\  {"part":{"id":"other-session","sessionID":"child","type":"text"}}
+        \\  {"id":"a2","type":"assistant","content":[{"type":"tool","name":"task","state":{"status":"running","input":{"description":"New task"}}}]},
+        \\  {"id":"a1","type":"assistant","content":[{"type":"tool","name":"task","state":{"status":"completed","input":{"description":"Old task"}}}]},
+        \\  {"id":"u1","type":"user","text":"go"},
+        \\  {"id":"a0","type":"assistant","content":[{"type":"tool","name":"task","state":{"status":"completed","input":{"description":"Stale task"}}}]}
         \\]
     , .{});
     defer parsed.deinit();
 
-    try std.testing.expectEqual(null, visibleTextPartId(parsed.value.array.items[0], "root"));
-    try std.testing.expectEqual(null, visibleTextPartId(parsed.value.array.items[1], "root"));
-    try std.testing.expectEqualStrings("visible", visibleTextPartId(parsed.value.array.items[2], "root").?);
-    try std.testing.expectEqual(null, visibleTextPartId(parsed.value.array.items[3], "root"));
-}
-
-test "extractAssistantTaskSummaryAlloc summarizes task tool state" {
-    const allocator = std.testing.allocator;
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
-        \\{"parts":[{"type":"tool","tool":"task","state":{"status":"running","title":"Explore website package"}}]}
-    , .{});
-    defer parsed.deinit();
-
-    const summary = (try extractAssistantTaskSummaryAlloc(allocator, parsed.value)).?;
-    defer allocator.free(summary);
-    try std.testing.expectEqualStrings("Running subtask: Explore website package", summary);
-}
-
-test "extractLatestAssistantTaskSummaryAlloc skips baseline assistant message" {
-    const allocator = std.testing.allocator;
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
-        \\[
-        \\  {"info":{"role":"assistant","id":"baseline"},"parts":[{"type":"tool","tool":"task","state":{"status":"completed","title":"Old task"}}]},
-        \\  {"info":{"role":"assistant","id":"next"},"parts":[{"type":"tool","tool":"task","state":{"status":"running","title":"New task"}}]}
-        \\]
-    , .{});
-    defer parsed.deinit();
-
-    const summary = (try extractLatestAssistantTaskSummaryAlloc(allocator, parsed.value, "baseline")).?;
+    const summary = (try extractLatestAssistantTaskSummaryAlloc(allocator, parsed.value, "u1")).?;
     defer allocator.free(summary);
     try std.testing.expectEqualStrings("Running subtask: New task", summary);
 }
 
-test "findPrimaryAssistantAfterLastUser picks root assistant for latest user turn" {
+test "findPrimaryAssistantAfterUser picks final step after tool calls" {
     const allocator = std.testing.allocator;
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
         \\[
-        \\  {"info":{"role":"user","id":"u1","time":{"created":1}},"parts":[{"type":"text","text":"hi"}]},
-        \\  {"info":{"role":"assistant","id":"root","parentID":"u1","time":{"created":2}},"parts":[{"type":"text","text":"main"}]},
-        \\  {"info":{"role":"assistant","id":"sub","parentID":"u1","time":{"created":99}},"parts":[]}
+        \\  {"id":"final","type":"assistant","finish":"stop","content":[{"type":"text","text":"complete report"}]},
+        \\  {"id":"tool-2","type":"assistant","finish":"tool-calls","content":[{"type":"tool","name":"bash"}]},
+        \\  {"id":"tool-1","type":"assistant","finish":"tool-calls","content":[{"type":"reasoning","text":"first"}]},
+        \\  {"id":"u1","type":"user","text":"test it"},
+        \\  {"id":"old","type":"assistant","finish":"stop","content":[{"type":"text","text":"previous turn"}]}
         \\]
     , .{});
     defer parsed.deinit();
 
-    const item = findPrimaryAssistantAfterLastUser(parsed.value) orelse return error.TestUnexpectedNull;
-    const info_obj = getObjectField(item, "info") orelse return error.TestUnexpectedNull;
-    const id = getOptionalObjectString(info_obj, "id") orelse return error.TestUnexpectedNull;
-    try std.testing.expectEqualStrings("root", id);
+    const item = findPrimaryAssistantAfterUser(parsed.value, "u1") orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("final", getOptionalObjectString(item, "id") orelse return error.TestUnexpectedNull);
 }
 
-test "findPrimaryAssistantAfterLastUser picks final step after tool calls" {
+test "findPrimaryAssistantAfterUser falls back to the first in-flight step" {
     const allocator = std.testing.allocator;
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
         \\[
-        \\  {"info":{"role":"user","id":"u1"},"parts":[{"type":"text","text":"test it"}]},
-        \\  {"info":{"role":"assistant","id":"tool-1","parentID":"u1","finish":"tool-calls"},"parts":[{"type":"reasoning","text":"first"}]},
-        \\  {"info":{"role":"assistant","id":"tool-2","parentID":"u1","finish":"tool-calls"},"parts":[{"type":"tool"}]},
-        \\  {"info":{"role":"assistant","id":"final","parentID":"u1","finish":"stop"},"parts":[{"type":"text","text":"complete report"}]},
-        \\  {"info":{"role":"assistant","id":"summary","parentID":"u1","finish":"stop","summary":true},"parts":[{"type":"text","text":"summary"}]}
+        \\  {"id":"step-2","type":"assistant","finish":"tool-calls","content":[]},
+        \\  {"id":"step-1","type":"assistant","finish":"tool-calls","content":[]},
+        \\  {"id":"u1","type":"user","text":"test it"}
         \\]
     , .{});
     defer parsed.deinit();
 
-    const item = findPrimaryAssistantAfterLastUser(parsed.value) orelse return error.TestUnexpectedNull;
-    const info = getObjectField(item, "info") orelse return error.TestUnexpectedNull;
-    try std.testing.expectEqualStrings("final", getOptionalObjectString(info, "id") orelse return error.TestUnexpectedNull);
+    const item = findPrimaryAssistantAfterUser(parsed.value, null) orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("step-1", getOptionalObjectString(item, "id") orelse return error.TestUnexpectedNull);
+    // An anchor that scrolled out of the window means the whole window is the turn.
+    const unanchored = findPrimaryAssistantAfterUser(parsed.value, "u0-missing-window") orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("step-1", getOptionalObjectString(unanchored, "id") orelse return error.TestUnexpectedNull);
 }
 
-test "findPrimaryAssistantAfterLastUser supports messages without parent IDs" {
+test "appendSessionDiffFiles reads the vcs diff data wrapper" {
     const allocator = std.testing.allocator;
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
-        \\[
-        \\  {"info":{"role":"user","id":"u1"},"parts":[{"type":"text","text":"test it"}]},
-        \\  {"info":{"role":"assistant","id":"tool","finish":"tool-calls"},"parts":[{"type":"tool"}]},
-        \\  {"info":{"role":"assistant","id":"final","finish":"stop"},"parts":[{"type":"text","text":"complete report"}]}
-        \\]
-    , .{});
-    defer parsed.deinit();
-
-    const item = findPrimaryAssistantAfterLastUser(parsed.value) orelse return error.TestUnexpectedNull;
-    const info = getObjectField(item, "info") orelse return error.TestUnexpectedNull;
-    try std.testing.expectEqualStrings("final", getOptionalObjectString(info, "id") orelse return error.TestUnexpectedNull);
-}
-
-test "appendSessionDiffFiles keeps nested patch bodies and derives counts" {
-    const allocator = std.testing.allocator;
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
-        \\{"files":[{"file":{"path":"packages/desktop/src/ui/chat_panel.zig"},"diff":"@@ -1 +1 @@\n-old\n+new\n"}]}
+        \\{"data":[{"file":"packages/desktop/src/ui/chat_panel.zig","patch":"@@ -1 +1 @@\n-old\n+new\n","status":"modified"}]}
     , .{});
     defer parsed.deinit();
 
@@ -2677,68 +2682,97 @@ test "appendSessionDiffFiles keeps nested patch bodies and derives counts" {
     try std.testing.expectEqualStrings("@@ -1 +1 @@\n-old\n+new\n", files.items[0].patch.?);
 }
 
-test "parseConfiguredModelsAlloc reads configured providers and models" {
+test "parseModelsAlloc reads v2 models with provider names and variants" {
     const allocator = std.testing.allocator;
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
-        \\{
-        \\  "providers": [
-        \\    {
-        \\      "id": "openai",
-        \\      "name": "OpenAI",
-        \\      "models": {
-        \\        "gpt-5.4": { "id": "gpt-5.4", "name": "GPT-5.4", "capabilities": { "reasoning": true }, "variants": { "high": {}, "low": {} } }
-        \\      }
-        \\    },
-        \\    {
-        \\      "id": "zen",
-        \\      "name": "Zen",
-        \\      "models": {
-        \\        "gpt-5.4": { "id": "gpt-5.4", "name": "GPT-5.4" },
-        \\        "sonnet": { "id": "sonnet", "name": "Claude Sonnet", "capabilities": { "reasoning": false } }
-        \\      }
-        \\    }
-        \\  ]
-        \\}
+    var parsed_models = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"data":[
+        \\  {"id":"openai/gpt-5.4","modelID":"gpt-5.4","providerID":"openai","name":"GPT-5.4","enabled":true,"variants":[{"id":"low"},{"id":"high"}]},
+        \\  {"id":"anthropic/sonnet","modelID":"sonnet","providerID":"anthropic","name":"Claude Sonnet","enabled":true,"variants":[]},
+        \\  {"id":"zen/hidden","modelID":"hidden","providerID":"zen","name":"Hidden","enabled":false}
+        \\]}
     , .{});
-    defer parsed.deinit();
+    defer parsed_models.deinit();
+    var parsed_providers = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"data":[{"id":"openai","name":"OpenAI"}]}
+    , .{});
+    defer parsed_providers.deinit();
 
-    const models = try parseConfiguredModelsAlloc(allocator, parsed.value);
+    const models = try parseModelsAlloc(allocator, parsed_models.value, parsed_providers.value);
     defer provider_types.freeModelInfos(allocator, models);
 
-    try std.testing.expectEqual(@as(usize, 3), models.len);
+    try std.testing.expectEqual(@as(usize, 2), models.len);
     try std.testing.expectEqualStrings("openai", models[0].provider_id);
     try std.testing.expectEqualStrings("OpenAI", models[0].provider_name);
     try std.testing.expectEqualStrings("gpt-5.4", models[0].model_id);
     try std.testing.expectEqualStrings("GPT-5.4", models[0].model_name);
     try std.testing.expect(models[0].reasoning_supported);
-    try std.testing.expect(models[0].reasoning_variant_keys != null);
     try std.testing.expectEqual(@as(usize, 2), models[0].reasoning_variant_keys.?.len);
     try std.testing.expectEqualStrings("high", models[0].reasoning_variant_keys.?[0]);
     try std.testing.expectEqualStrings("low", models[0].reasoning_variant_keys.?[1]);
-    try std.testing.expectEqualStrings("zen", models[1].provider_id);
-    try std.testing.expectEqualStrings("Zen", models[1].provider_name);
+    try std.testing.expectEqualStrings("anthropic", models[1].provider_name);
+    try std.testing.expect(!models[1].reasoning_supported);
     try std.testing.expect(models[1].reasoning_variant_keys == null);
-    try std.testing.expectEqualStrings("zen", models[2].provider_id);
-    try std.testing.expectEqualStrings("sonnet", models[2].model_id);
-    try std.testing.expect(!models[2].reasoning_supported);
-    try std.testing.expect(models[2].reasoning_variant_keys == null);
 }
 
-test "buildPromptBody prefers explicit opencode variant over reasoning effort" {
+test "buildSessionCreateBody prefers explicit opencode variant over reasoning effort" {
     const allocator = std.testing.allocator;
-    const body = try buildPromptBody(allocator, .{
+    const body = try buildSessionCreateBody(allocator, "Verde chat", "/tmp/work", .{
         .prompt = "hi",
         .model = "openai/gpt-5.4",
         .opencode_variant = "minimal",
         .reasoning_effort = .high,
     });
     defer allocator.free(body);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"variant\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "minimal") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "high") == null);
+    try std.testing.expectEqualStrings(
+        \\{"title":"Verde chat","location":{"directory":"/tmp/work"},"model":{"providerID":"openai","id":"gpt-5.4","variant":"minimal"}}
+    , body);
 }
 
-test "checkHealth times out against a server that accepts but never responds" {
+test "buildPromptBody sends text-only prompts without files" {
+    const allocator = std.testing.allocator;
+    const body = try buildPromptBody(allocator, .{ .prompt = "hi there" });
+    defer allocator.free(body);
+    try std.testing.expectEqualStrings("{\"text\":\"hi there\"}", body);
+}
+
+test "apiPathAlloc scopes requests with an encoded location directory" {
+    var client: Client = .{
+        .allocator = std.testing.allocator,
+        .config = .{ .allocator = std.testing.allocator, .working_directory = "/tmp/my work" },
+        .endpoint = .{ .base_url = "http://127.0.0.1:1", .password = null },
+    };
+    const path = try client.apiPathAlloc("/session/{s}/message", .{"ses_1"}, "order=desc&limit=12");
+    defer std.testing.allocator.free(path);
+    try std.testing.expectEqualStrings(
+        "/api/session/ses_1/message?location%5Bdirectory%5D=%2Ftmp%2Fmy%20work&order=desc&limit=12",
+        path,
+    );
+}
+
+test "parseServiceRegistrationAlloc reads the service url and password" {
+    const allocator = std.testing.allocator;
+    var registration = (try parseServiceRegistrationAlloc(allocator,
+        \\{"id":"svc","version":"0.0.0-beta-18414","url":"http://127.0.0.1:49374","pid":1105379,"password":"secret"}
+    )) orelse return error.TestUnexpectedNull;
+    defer registration.deinit(allocator);
+    try std.testing.expectEqualStrings("http://127.0.0.1:49374", registration.url);
+    try std.testing.expectEqualStrings("secret", registration.password.?);
+    try std.testing.expectEqual(null, try parseServiceRegistrationAlloc(allocator, "{\"pid\":1}"));
+}
+
+test "buildPermissionBody summarizes v2 permission requests" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":"per_1","sessionID":"ses_1","action":"bash","resources":["git status"],"source":{"type":"tool","messageID":"msg_1","callID":"call_1"}}
+    , .{});
+    defer parsed.deinit();
+
+    const body = try buildPermissionBody(allocator, parsed.value);
+    defer allocator.free(body);
+    try std.testing.expectEqualStrings("Action: bash\nResources:\n- git status\nTool call: call_1", body);
+}
+
+test "health probe times out against a server that accepts but never responds" {
     // Wedge listener: bound and listening but never accepting or answering.
     // The kernel completes the TCP handshake via the backlog, so the probe
     // connects fine and then gets no bytes — the exact failure observed live
@@ -2754,12 +2788,8 @@ test "checkHealth times out against a server that accepts but never responds" {
     const base_url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}", .{port});
     defer std.testing.allocator.free(base_url);
 
-    var client: Client = .{
-        .allocator = std.testing.allocator,
-        .config = .{ .allocator = std.testing.allocator, .base_url = base_url },
-    };
     const started_ms = platform_runtime.unixTimestampMs();
-    try std.testing.expect(!client.checkHealth());
+    try std.testing.expect(!checkHealth(std.testing.allocator, base_url, null, "secret"));
     const elapsed_ms = platform_runtime.unixTimestampMs() - started_ms;
     // Must fail via the receive timeout (~2s), not block unboundedly; the
     // upper bound is loose to tolerate slow CI machines.

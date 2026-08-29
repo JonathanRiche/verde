@@ -226,7 +226,6 @@ pub fn connect(
 
 pub fn shutdownOwnedProviderProcesses() void {
     runtime_log.diagnostic("provider shutdown begin opencode", .{});
-    opencode.shutdownOwnedServer();
     runtime_log.diagnostic("provider shutdown done opencode", .{});
     runtime_log.diagnostic("provider shutdown begin codex", .{});
     codex.shutdownOwnedServer();

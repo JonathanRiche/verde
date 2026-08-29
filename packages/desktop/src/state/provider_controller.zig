@@ -249,7 +249,7 @@ pub fn providerReadinessWorker(state: *ProviderReadinessState) void {
 pub fn detectProviderReadiness(provider: Provider) ProviderReadiness {
     const executable_ready = switch (provider) {
         .codex => process_env.commandExists("codex"),
-        .opencode => process_env.commandExists("opencode"),
+        .opencode => process_env.commandExists("opencode2"),
         .claude => process_env.commandExists("node") and process_env.commandExists("claude"),
         .cursor => process_env.commandExists("agent"),
         .pi => process_env.commandExists("pi"),
