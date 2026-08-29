@@ -3151,7 +3151,7 @@ fn roleCode(value: []const u8) !i64 {
 }
 
 fn toolCallKindCode(value: []const u8) !i64 {
-    const names = [_][]const u8{ "read", "edit", "delete", "move", "search", "execute", "think", "fetch", "mcp", "other" };
+    const names = [_][]const u8{ "read", "edit", "delete", "move", "search", "execute", "think", "fetch", "mcp", "other", "subagent" };
     for (names, 0..) |name, index| if (std.mem.eql(u8, value, name)) return @intCast(index);
     return error.InvalidParams;
 }

@@ -214,6 +214,19 @@ function mcpNameFromClaudeToolUse(item) {
   return `${parts[1]}.${parts.slice(2).join("__")}`;
 }
 
+function subagentFromClaudeToolUse(item) {
+  if (item?.type !== "tool_use") return null;
+  const name = String(item.name ?? "");
+  if (!["task", "agent", "subagent"].includes(name.toLowerCase())) return null;
+  const input = item.input && typeof item.input === "object" ? item.input : {};
+  const title =
+    (typeof input.description === "string" && input.description.trim()) ||
+    (typeof input.prompt === "string" && input.prompt.trim()) ||
+    (typeof input.subagent_type === "string" && input.subagent_type.trim()) ||
+    name;
+  return { title, input: jsonText(item.input) };
+}
+
 function jsonText(value) {
   if (value === undefined || value === null) return null;
   if (typeof value === "string") return value;
@@ -468,7 +481,7 @@ function scheduleBackgroundTask(query, toolUseId, command, backgroundState, alre
   backgroundState.pendingBackgrounds.push(task);
 }
 
-function emitClaudeToolEvents(message, commandByToolUseId, mcpByToolUseId, query, backgroundState) {
+function emitClaudeToolEvents(message, commandByToolUseId, mcpByToolUseId, subagentByToolUseId, query, backgroundState) {
   const content = message?.message?.content ?? message?.content;
   if (!Array.isArray(content)) return;
   for (const item of content) {
@@ -502,6 +515,20 @@ function emitClaudeToolEvents(message, commandByToolUseId, mcpByToolUseId, query
       continue;
     }
 
+    const subagent = subagentFromClaudeToolUse(item);
+    if (subagent && typeof item.id === "string") {
+      subagentByToolUseId.set(item.id, subagent.title);
+      write({
+        type: "tool_call_event",
+        call_id: item.id,
+        title: subagent.title,
+        kind: "subagent",
+        status: "in_progress",
+        input: subagent.input,
+      });
+      continue;
+    }
+
     if (item?.type === "tool_result" && typeof item.tool_use_id === "string") {
       const completedMcpName = mcpByToolUseId.get(item.tool_use_id);
       if (completedMcpName) {
@@ -517,6 +544,22 @@ function emitClaudeToolEvents(message, commandByToolUseId, mcpByToolUseId, query
           error_text: failed ? result : undefined,
         });
         mcpByToolUseId.delete(item.tool_use_id);
+        continue;
+      }
+      const completedSubagentTitle = subagentByToolUseId.get(item.tool_use_id);
+      if (completedSubagentTitle) {
+        const result = claudeToolResultText(item);
+        const failed = item.is_error === true;
+        write({
+          type: "tool_call_event",
+          call_id: item.tool_use_id,
+          title: completedSubagentTitle,
+          kind: "subagent",
+          status: failed ? "failed" : "completed",
+          output: failed ? undefined : result,
+          error_text: failed ? result : undefined,
+        });
+        subagentByToolUseId.delete(item.tool_use_id);
         continue;
       }
     }
@@ -1036,6 +1079,7 @@ async function handleClaudeSendPrompt(sdk, request) {
   const stderrChunks = [];
   const commandByToolUseId = new Map();
   const mcpByToolUseId = new Map();
+  const subagentByToolUseId = new Map();
   const options = buildClaudeOptions(request);
   options.stderr = (data) => {
     if (typeof data === "string" && data.length > 0) stderrChunks.push(data);
@@ -1081,7 +1125,7 @@ async function handleClaudeSendPrompt(sdk, request) {
       // query open so it can inspect the result and finish the turn itself.
       emitClaudeTaskNotification(message, commandByToolUseId, backgroundState);
       emitClaudeSdkMessage(message);
-      emitClaudeToolEvents(message, commandByToolUseId, mcpByToolUseId, query, backgroundState);
+      emitClaudeToolEvents(message, commandByToolUseId, mcpByToolUseId, subagentByToolUseId, query, backgroundState);
       const delta = textFromContent(message?.message?.content ?? message?.content);
       if (message?.type === "assistant" && delta) {
         reply += delta;

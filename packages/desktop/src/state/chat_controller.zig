@@ -4811,6 +4811,7 @@ pub fn parseToolCallKind(value: []const u8) ai_harness.ToolCallKind {
     if (std.mem.eql(u8, value, "think")) return .think;
     if (std.mem.eql(u8, value, "fetch")) return .fetch;
     if (std.mem.eql(u8, value, "mcp")) return .mcp;
+    if (std.mem.eql(u8, value, "subagent")) return .subagent;
     return .other;
 }
 

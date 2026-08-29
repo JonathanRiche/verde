@@ -414,6 +414,10 @@ export function paneTitle(pane: LivePane): string {
   return 'Browser'
 }
 
+export function isSubagentThreadId(local_thread_id: string | undefined | null): boolean {
+  return typeof local_thread_id === 'string' && local_thread_id.startsWith('subagent:')
+}
+
 export function paneKey(workspaceId: string, paneId: number): string {
   return `${workspaceId}:${paneId}`
 }

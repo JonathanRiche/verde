@@ -2908,6 +2908,17 @@ fn appendImportedMessagesForItem(
         const query = getOptionalObjectString(item, "query") orelse return;
         if (std.mem.trim(u8, query, &std.ascii.whitespace).len == 0) return;
         try appendImportedMessage(allocator, messages, .system, "Web search", query);
+        return;
+    }
+
+    if (std.mem.eql(u8, item_type, "collabAgentToolCall") or std.mem.eql(u8, item_type, "subAgentActivity")) {
+        const body = getOptionalObjectString(item, "prompt") orelse
+            getOptionalObjectString(item, "agentPath") orelse
+            getOptionalObjectString(item, "agent_path") orelse
+            getOptionalObjectString(item, "tool") orelse
+            "Codex subagent";
+        if (std.mem.trim(u8, body, &std.ascii.whitespace).len == 0) return;
+        try appendImportedMessage(allocator, messages, .system, "Subagent", body);
     }
 }
 
@@ -3131,6 +3142,12 @@ fn emitItemEvent(
     if (std.mem.eql(u8, item_type, "mcpToolCall"))
         return emitMcpToolCallItem(allocator, item, started, context, on_stream_event);
 
+    if (std.mem.eql(u8, item_type, "collabAgentToolCall"))
+        return emitCollabAgentToolCallItem(item, started, context, on_stream_event);
+
+    if (std.mem.eql(u8, item_type, "subAgentActivity"))
+        return emitSubAgentActivityItem(item, context, on_stream_event);
+
     if (std.mem.eql(u8, item_type, "reasoning")) {
         const call_id = getOptionalObjectString(item, "id") orelse return false;
         // Reasoning surfaces only as a transient "Thinking" liveness row: no
@@ -3328,6 +3345,92 @@ fn formatMcpToolCallOutputAlloc(allocator: std.mem.Allocator, item: std.json.Val
         if (structured != .null) return try stringifyAlloc(allocator, structured);
     }
     return try stringifyAlloc(allocator, result);
+}
+
+fn firstReceiverThreadId(item: std.json.Value) ?[]const u8 {
+    const field = getObjectField(item, "receiverThreadIds") orelse getObjectField(item, "receiver_thread_ids") orelse return null;
+    if (field != .array or field.array.items.len == 0) return null;
+    return stringValue(field.array.items[0]);
+}
+
+fn collabAgentCallId(item: std.json.Value) []const u8 {
+    return firstReceiverThreadId(item) orelse
+        getOptionalObjectString(item, "id") orelse
+        "";
+}
+
+fn collabAgentStatus(item: std.json.Value, started: bool) provider_types.ToolCallStatus {
+    if (started) return .in_progress;
+    const status = getOptionalObjectString(item, "status") orelse return .completed;
+    if (std.mem.eql(u8, status, "inProgress") or std.mem.eql(u8, status, "in_progress")) return .in_progress;
+    if (std.mem.eql(u8, status, "failed")) return .failed;
+    if (std.mem.eql(u8, status, "interrupted")) return .cancelled;
+    return .completed;
+}
+
+fn emitCollabAgentToolCallItem(
+    item: std.json.Value,
+    started: bool,
+    context: ?*anyopaque,
+    on_stream_event: *const fn (?*anyopaque, provider_types.StreamEvent) void,
+) bool {
+    const tool = getOptionalObjectString(item, "tool") orelse "";
+    // Spawn/resume are child-agent lifecycle. Wait/send/list are parent
+    // orchestration around an already-visible child and would duplicate rows.
+    const is_child_lifecycle = std.mem.eql(u8, tool, "spawnAgent") or
+        std.mem.eql(u8, tool, "resumeAgent") or
+        tool.len == 0;
+    if (!is_child_lifecycle) return true;
+
+    const call_id = collabAgentCallId(item);
+    if (call_id.len == 0) return false;
+    const prompt = getOptionalObjectString(item, "prompt");
+    const model = getOptionalObjectString(item, "model");
+    const input = if (prompt) |text|
+        text
+    else if (model) |text|
+        text
+    else
+        tool;
+    const error_text = if (getObjectField(item, "error")) |error_value|
+        getOptionalObjectString(error_value, "message")
+    else
+        null;
+    on_stream_event(context, .{ .tool_call = .{
+        .call_id = call_id,
+        .title = if (prompt) |text| text else "Codex subagent",
+        .kind = .subagent,
+        .status = collabAgentStatus(item, started),
+        .input = if (input.len > 0) input else null,
+        .error_text = error_text,
+    } });
+    return true;
+}
+
+fn emitSubAgentActivityItem(
+    item: std.json.Value,
+    context: ?*anyopaque,
+    on_stream_event: *const fn (?*anyopaque, provider_types.StreamEvent) void,
+) bool {
+    const call_id = getOptionalObjectString(item, "agentThreadId") orelse
+        getOptionalObjectString(item, "id") orelse
+        return false;
+    const kind = getOptionalObjectString(item, "kind") orelse "";
+    const status: provider_types.ToolCallStatus = if (std.mem.eql(u8, kind, "completed"))
+        .completed
+    else if (std.mem.eql(u8, kind, "interrupted"))
+        .cancelled
+    else
+        .in_progress;
+    const path = getOptionalObjectString(item, "agentPath") orelse "Codex subagent";
+    on_stream_event(context, .{ .tool_call = .{
+        .call_id = call_id,
+        .title = path,
+        .kind = .subagent,
+        .status = status,
+        .input = path,
+    } });
+    return true;
 }
 
 fn handleCommandApprovalRequest(self: *Client, root: std.json.Value, request_id: std.json.Value, request: provider_types.SendPromptRequest) !void {
@@ -4702,6 +4805,59 @@ test "MCP calls emit lifecycle tool call updates" {
     try std.testing.expectEqualStrings("mcp-2", capture.tool_call_id.?);
     try std.testing.expectEqual(provider_types.ToolCallStatus.failed, capture.tool_status.?);
     try std.testing.expectEqualStrings("blender.execute_blender_code", capture.tool_input.?);
+}
+
+test "collab agent spawn emits subagent lifecycle updates" {
+    const allocator = std.testing.allocator;
+    const started_json =
+        \\{
+        \\  "method": "item/started",
+        \\  "params": {
+        \\    "item": {
+        \\      "id": "collab-1",
+        \\      "type": "collabAgentToolCall",
+        \\      "tool": "spawnAgent",
+        \\      "status": "inProgress",
+        \\      "senderThreadId": "parent-1",
+        \\      "receiverThreadIds": ["child-1"],
+        \\      "prompt": "Explore the web app",
+        \\      "model": "gpt-5"
+        \\    }
+        \\  }
+        \\}
+    ;
+    var started = try std.json.parseFromSlice(std.json.Value, allocator, started_json, .{});
+    defer started.deinit();
+
+    var capture: TestStreamEventCapture = .{};
+    try std.testing.expect(try emitItemEvent(allocator, started.value, &capture, TestStreamEventCapture.handle));
+    try std.testing.expectEqual(@as(usize, 1), capture.tool_call_count);
+    try std.testing.expectEqualStrings("child-1", capture.tool_call_id.?);
+    try std.testing.expectEqual(provider_types.ToolCallKind.subagent, capture.tool_kind.?);
+    try std.testing.expectEqual(provider_types.ToolCallStatus.in_progress, capture.tool_status.?);
+    try std.testing.expectEqualStrings("Explore the web app", capture.tool_input.?);
+
+    const activity_json =
+        \\{
+        \\  "method": "item/completed",
+        \\  "params": {
+        \\    "item": {
+        \\      "id": "activity-1",
+        \\      "type": "subAgentActivity",
+        \\      "kind": "completed",
+        \\      "agentThreadId": "child-1",
+        \\      "agentPath": "Explore the web app"
+        \\    }
+        \\  }
+        \\}
+    ;
+    var activity = try std.json.parseFromSlice(std.json.Value, allocator, activity_json, .{});
+    defer activity.deinit();
+
+    try std.testing.expect(try emitItemEvent(allocator, activity.value, &capture, TestStreamEventCapture.handle));
+    try std.testing.expectEqual(@as(usize, 2), capture.tool_call_count);
+    try std.testing.expectEqualStrings("child-1", capture.tool_call_id.?);
+    try std.testing.expectEqual(provider_types.ToolCallStatus.completed, capture.tool_status.?);
 }
 
 test "hydrated Codex turn items backfill MCP output" {

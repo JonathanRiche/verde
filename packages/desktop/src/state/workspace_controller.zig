@@ -1472,6 +1472,242 @@ pub fn presentWorkspaceChat(self: anytype, project_index: usize, request: Presen
     return result;
 }
 
+pub const OpenSubagentRequest = struct {
+    parent_local_thread_id: []const u8,
+    tool_call_id: ?[]const u8 = null,
+    message_id: ?[]const u8 = null,
+    message_index: ?usize = null,
+    target_pane_id: ?WorkspacePaneId = null,
+    axis: WorkspaceSplitAxis = .vertical,
+    focus: bool = true,
+};
+
+const SubagentSource = struct {
+    identity: []u8,
+    title: []u8,
+    prompt: []u8,
+    result: []u8,
+
+    fn deinit(self: SubagentSource, allocator: std.mem.Allocator) void {
+        allocator.free(self.identity);
+        allocator.free(self.title);
+        allocator.free(self.prompt);
+        allocator.free(self.result);
+    }
+};
+
+pub fn openSubagentFromParentMessage(
+    self: anytype,
+    project_index: usize,
+    parent_thread_index: usize,
+    message_index: usize,
+) void {
+    if (project_index >= self.project_controller.projects.items.len) return;
+    const project = &self.project_controller.projects.items[project_index];
+    if (parent_thread_index >= project.threads.items.len) return;
+    _ = openSubagent(self, project_index, .{
+        .parent_local_thread_id = project.threads.items[parent_thread_index].local_thread_id,
+        .message_index = message_index,
+        .axis = .vertical,
+        .focus = true,
+    }) catch |err| {
+        log.warn("failed to open subagent chat pane: {s}", .{@errorName(err)});
+        self.setSidebarNotice("Could not open that subagent.");
+        self.markDirty();
+        return;
+    };
+}
+
+pub fn openSubagent(self: anytype, project_index: usize, request: OpenSubagentRequest) !OpenChatResult {
+    if (project_index >= self.project_controller.projects.items.len) return error.ProjectNotFound;
+    var project = &self.project_controller.projects.items[project_index];
+    const parent_index = for (project.threads.items, 0..) |thread, index| {
+        if (std.mem.eql(u8, thread.local_thread_id, request.parent_local_thread_id)) break index;
+    } else return error.ParentThreadNotFound;
+
+    const source = try captureSubagentSource(self.allocator, &project.threads.items[parent_index], request);
+    defer source.deinit(self.allocator);
+
+    const child_index = try project.ensureSubagentThread(
+        self.allocator,
+        &project.threads.items[parent_index],
+        source.identity,
+        source.title,
+    );
+    project = &self.project_controller.projects.items[project_index];
+    try project.threads.items[child_index].replaceSubagentViewMessages(
+        self.allocator,
+        source.title,
+        source.prompt,
+        source.result,
+    );
+
+    return try presentSubagentThread(self, project_index, child_index, request.target_pane_id, request.axis, request.focus);
+}
+
+fn presentSubagentThread(
+    self: anytype,
+    project_index: usize,
+    thread_index: usize,
+    target_pane_id: ?WorkspacePaneId,
+    axis: WorkspaceSplitAxis,
+    focus: bool,
+) !OpenChatResult {
+    var project = &self.project_controller.projects.items[project_index];
+    for (project.workspace_layout.panes.items) |pane| switch (pane.ref) {
+        .chat => |chat_ref| if (chat_ref.thread_index == thread_index) {
+            if (focus) {
+                project.workspace_layout.focusCreatedPane(pane.id);
+                project.selected_thread_index = thread_index;
+                project.last_content_pane_id = pane.id;
+                self.project_controller.selected_index = project_index;
+                self.blurPaletteComposer();
+                self.syncRenameBuffer();
+                self.requestTranscriptScrollToBottom();
+                self.markDirty();
+            }
+            return .{ .pane_id = pane.id, .thread_index = thread_index, .focused = focus, .presentation_existing = true };
+        },
+        else => {},
+    };
+
+    const result = try createWorkspaceChatPaneForThread(
+        project,
+        self.allocator,
+        thread_index,
+        target_pane_id,
+        axis,
+        focus,
+    );
+    if (focus) {
+        self.project_controller.selected_index = project_index;
+        self.blurPaletteComposer();
+        self.syncRenameBuffer();
+        self.requestTranscriptScrollToBottom();
+    }
+    self.setSidebarNotice("Subagent pane ready.");
+    self.markDirty();
+    return result;
+}
+
+fn captureSubagentSource(
+    allocator: std.mem.Allocator,
+    parent: *const ChatThread,
+    request: OpenSubagentRequest,
+) !SubagentSource {
+    if (request.tool_call_id) |call_id| {
+        for (parent.messages.items, 0..) |message, index| {
+            if (message.tool_call_id) |existing| {
+                if (std.mem.eql(u8, existing, call_id)) {
+                    return try subagentSourceFromMessage(allocator, message, index);
+                }
+            }
+        }
+        {
+            parent.send_state.mutex.lock();
+            defer parent.send_state.mutex.unlock();
+            for (parent.send_state.pending_events.items, 0..) |event, pending_index| {
+                if (event.tool_call_id) |existing| {
+                    if (std.mem.eql(u8, existing, call_id)) {
+                        return try subagentSourceFromPending(allocator, event, parent.messages.items.len + pending_index);
+                    }
+                }
+            }
+        }
+    }
+    if (request.message_id) |message_id| {
+        for (parent.messages.items, 0..) |message, index| {
+            if (message.message_id) |existing| {
+                if (std.mem.eql(u8, existing, message_id)) {
+                    return try subagentSourceFromMessage(allocator, message, index);
+                }
+            }
+        }
+        {
+            parent.send_state.mutex.lock();
+            defer parent.send_state.mutex.unlock();
+            for (parent.send_state.pending_events.items, 0..) |event, pending_index| {
+                if (event.message_id) |existing| {
+                    if (std.mem.eql(u8, existing, message_id)) {
+                        return try subagentSourceFromPending(allocator, event, parent.messages.items.len + pending_index);
+                    }
+                }
+            }
+        }
+    }
+    const message_index = request.message_index orelse return error.SourceNotFound;
+    if (message_index < parent.messages.items.len) {
+        return try subagentSourceFromMessage(allocator, parent.messages.items[message_index], message_index);
+    }
+    {
+        parent.send_state.mutex.lock();
+        defer parent.send_state.mutex.unlock();
+        const pending_index = message_index - parent.messages.items.len;
+        if (pending_index >= parent.send_state.pending_events.items.len) return error.SourceNotFound;
+        return try subagentSourceFromPending(allocator, parent.send_state.pending_events.items[pending_index], message_index);
+    }
+}
+
+fn subagentSourceFromMessage(allocator: std.mem.Allocator, message: chat_types.ChatMessage, message_index: usize) !SubagentSource {
+    if (!chat_types.isSubagentAuthorOrKind(message.author, message.tool_call_kind)) return error.NotASubagent;
+    var identity_buf: [32]u8 = undefined;
+    const identity = if (message.tool_call_id) |call_id|
+        call_id
+    else
+        std.fmt.bufPrint(&identity_buf, "m{d}", .{message_index}) catch "m";
+    return try buildSubagentSource(allocator, identity, message.body, message.tool_call_status);
+}
+
+fn subagentSourceFromPending(allocator: std.mem.Allocator, event: chat_types.PendingTimelineEvent, message_index: usize) !SubagentSource {
+    if (!chat_types.isSubagentAuthorOrKind(event.author, event.tool_call_kind)) return error.NotASubagent;
+    var identity_buf: [32]u8 = undefined;
+    const identity = if (event.tool_call_id) |call_id|
+        call_id
+    else
+        std.fmt.bufPrint(&identity_buf, "m{d}", .{message_index}) catch "m";
+    return try buildSubagentSource(allocator, identity, event.body, event.tool_call_status);
+}
+
+fn buildSubagentSource(
+    allocator: std.mem.Allocator,
+    identity: []const u8,
+    body: []const u8,
+    status: ?ai_harness.ToolCallStatus,
+) !SubagentSource {
+    const tool_title = chat_types.toolBodyField(body, "Tool") orelse "";
+    const input = chat_types.toolBodyField(body, "Input") orelse "";
+    const output = chat_types.toolBodyField(body, "Output");
+    const error_text = chat_types.toolBodyField(body, "Error");
+    const title_src = if (tool_title.len > 0) tool_title else firstNonEmptyLine(if (input.len > 0) input else body);
+    const prompt_src = if (input.len > 0) input else if (tool_title.len > 0) tool_title else std.mem.trim(u8, body, " \n\r\t");
+    const result_src = error_text orelse output orelse subagentStatusFallback(status);
+
+    return .{
+        .identity = try allocator.dupe(u8, identity),
+        .title = try allocator.dupe(u8, if (title_src.len > 0) title_src else "Subagent"),
+        .prompt = try allocator.dupe(u8, if (prompt_src.len > 0) prompt_src else "No task prompt was stored."),
+        .result = try allocator.dupe(u8, result_src),
+    };
+}
+
+fn firstNonEmptyLine(text: []const u8) []const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \r\t");
+        if (line.len > 0) return line;
+    }
+    return std.mem.trim(u8, text, " \n\r\t");
+}
+
+fn subagentStatusFallback(status: ?ai_harness.ToolCallStatus) []const u8 {
+    return switch (status orelse .unknown) {
+        .pending, .in_progress => "This subagent is still running.",
+        .cancelled => "This subagent was cancelled.",
+        .failed => "This subagent failed.",
+        .completed, .unknown => "This subagent finished without a stored transcript.",
+    };
+}
+
 pub fn resolveChatCreationSettings(self: anytype, request: OpenChatRequest, model_ref: []const u8) !EffectiveChatSettings {
     if (request.reasoning_effort != null and request.reasoning_variant != null) {
         return error.ConflictingReasoningSettings;

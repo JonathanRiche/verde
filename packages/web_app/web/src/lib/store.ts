@@ -29,6 +29,7 @@ import {
   paneIsActive,
   paneKey,
   paneTitle,
+  isSubagentThreadId,
   parseLayoutNode,
   synthesizeSplit,
   workspacePaneGroups,
@@ -1081,12 +1082,13 @@ export function panesForWorkspace(
     // Threads this client opened that the desktop layout does not know about.
     for (const thread of threads) {
       if (thread.archived || used_threads.has(thread.local_thread_id)) continue
+      if (isSubagentThreadId(thread.local_thread_id)) continue
       if (!localThreadIds.has(thread.local_thread_id)) continue
       rows.push(chatPane(workspace, thread, turns))
     }
   } else {
     const recent = [...threads]
-      .filter((thread) => !thread.archived)
+      .filter((thread) => !thread.archived && !isSubagentThreadId(thread.local_thread_id))
       .sort((left, right) => (right.last_activity_at ?? 0) - (left.last_activity_at ?? 0))
       .slice(0, MAX_OPEN_THREADS)
     for (const thread of recent) {
@@ -1842,9 +1844,16 @@ function createAppStore() {
       // Canonical command authoring drives the web's compact command rows and
       // failure styling, same contract as committed transcript rows.
       const author =
-        title ?? (tool_kind === 'execute' ? (status === 'failed' ? 'Command failed' : 'Ran command') : tool_kind)
+        tool_kind === 'subagent'
+          ? 'Subagent'
+          : title ?? (tool_kind === 'execute' ? (status === 'failed' ? 'Command failed' : 'Ran command') : tool_kind)
       const body =
-        [input && `Input:\n${input}`, output && `Output:\n${output}`, error_text]
+        [
+          title && tool_kind === 'subagent' ? `Tool:\n${title}` : null,
+          input && `Input:\n${input}`,
+          output && `Output:\n${output}`,
+          error_text,
+        ]
           .filter(Boolean)
           .join('\n\n') || author
       const row: Message = {
@@ -2256,6 +2265,7 @@ function createAppStore() {
     const current = pane
     const ws = workspace()
     if (!current || current.kind !== 'chat' || !ws) return
+    if (isSubagentThreadId(current.thread_id)) return
     if (!current.thread_id) {
       setNotice('thread is not ready yet')
       return
@@ -2895,6 +2905,28 @@ function createAppStore() {
     const unzoom = maximizedPaneId() === pane.pane_id
     if (target) focusPane(target)
     setMaximizedPaneId(unzoom ? null : pane.pane_id)
+  }
+
+  const openSubagent = async (pane: LivePane, message: Message) => {
+    const current_workspace = workspace()
+    if (!current_workspace) return
+    if (pane.native_pane_id == null) {
+      setNotice('Opening a subagent pane requires the desktop runtime.')
+      return
+    }
+    setNotice(null)
+    const response = await interactiveCall('chat.open_subagent', {
+      workspace_id: current_workspace.workspace_id,
+      parent_local_thread_id: pane.thread_id,
+      tool_call_id: message.tool_call_id ?? undefined,
+      message_id: message.message_id,
+      axis: 'vertical',
+      focus: true,
+      target_pane_id: pane.native_pane_id,
+    })
+    if (callSucceeded(response, 'could not open subagent')) {
+      await refreshProjection({ workspace_id: current_workspace.workspace_id })
+    }
   }
 
   const splitFocusedPane = async (kind: 'chat' | 'terminal', axis: 'vertical' | 'horizontal') => {
@@ -3558,6 +3590,7 @@ function createAppStore() {
     handleKey,
     start,
     paneTitle,
+    openSubagent,
   }
 }
 

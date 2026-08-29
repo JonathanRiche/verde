@@ -1032,12 +1032,20 @@ fn toolKind(update: std.json.Value) ?provider_types.ToolCallKind {
         if (std.mem.eql(u8, kind, "execute")) return .execute;
         if (std.mem.eql(u8, kind, "think")) return .think;
         if (std.mem.eql(u8, kind, "fetch")) return .fetch;
+        if (std.mem.eql(u8, kind, "task") or std.mem.eql(u8, kind, "subagent") or std.mem.eql(u8, kind, "agent")) return .subagent;
         // ACP `other` is deliberately non-specific. Let provider titles such
         // as `MCP: ...` refine it, and otherwise preserve an earlier kind.
         if (!std.mem.eql(u8, kind, "other")) return .other;
     }
 
     const title = toolTitle(update) orelse "";
+    const tool_name = getTrimmedObjectString(update, "toolName") orelse nested_name: {
+        const tool_call = getObjectField(update, "toolCall") orelse break :nested_name "";
+        break :nested_name getTrimmedObjectString(tool_call, "toolName") orelse
+            getTrimmedObjectString(tool_call, "name") orelse
+            "";
+    };
+    if (provider_types.isSubagentToolName(title) or provider_types.isSubagentToolName(tool_name)) return .subagent;
     if (std.ascii.startsWithIgnoreCase(title, "mcp") or std.ascii.startsWithIgnoreCase(title, "verde:")) return .mcp;
     if (getTrimmedObjectString(update, "command") != null or title.len > 0 and title[0] == '`') return .execute;
     if (std.ascii.startsWithIgnoreCase(title, "read")) return .read;
@@ -1640,6 +1648,18 @@ test "toolEvent shows tool call starts with structured input" {
     try std.testing.expectEqualStrings("Read", event.title);
     try std.testing.expectEqual(provider_types.ToolCallKind.read, event.tool_kind.?);
     try std.testing.expectEqualStrings("{\"path\":\"/tmp/a.txt\"}", event.input.?);
+}
+
+test "toolEvent classifies ACP task tools as subagents" {
+    const payload =
+        \\{"sessionUpdate":"tool_call","toolCallId":"task-1","toolName":"task","title":"Explore website","status":"in_progress"}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    const event = (try toolEventAlloc(std.testing.allocator, parsed.value)).?;
+    defer event.deinit(std.testing.allocator);
+    try std.testing.expectEqual(provider_types.ToolCallKind.subagent, event.tool_kind.?);
+    try std.testing.expectEqualStrings("Explore website", event.title);
 }
 
 test "toolEvent ignores empty ACP input containers" {

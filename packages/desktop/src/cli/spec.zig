@@ -155,6 +155,7 @@ pub const live_capabilities = [_][]const u8{
     "pane.maximize",
     "pane.close",
     "chat.open",
+    "chat.open_subagent",
     "chat.status",
     "chat.transcript",
     "chat.draft.get",
