@@ -12,6 +12,7 @@ pub const ACCESS_PROTOCOL_VERSION: u32 = 1;
 pub const HTTP_PAIR_EXCHANGE_PATH: []const u8 = "/auth/pair/exchange";
 pub const HTTP_ACCESS_TOKEN_PATH: []const u8 = "/auth/access-token";
 pub const HTTP_WEBSOCKET_TICKET_PATH: []const u8 = "/auth/websocket-ticket";
+pub const HTTP_RUNTIME_METADATA_PATH: []const u8 = "/.well-known/verde-runtime";
 pub const HTTP_AUTHORIZATION_HEADER: []const u8 = "Authorization";
 pub const HTTP_WEBSOCKET_PROTOCOL_HEADER: []const u8 = "Sec-WebSocket-Protocol";
 pub const DEVICE_AUTHORIZATION_SCHEME: []const u8 = "VerdeDevice";
@@ -394,15 +395,30 @@ pub const PairingGrantExchangeResult = struct {
     scopes: []const []const u8,
 };
 
+/// Non-secret identity and endpoint advertisement exposed by an explicitly
+/// configured HTTPS reverse-proxy profile.
+pub const RuntimeEndpointMetadata = struct {
+    access_protocol_version: u32,
+    runtime_id: []const u8,
+    instance_id: []const u8,
+    https_url: []const u8,
+    wss_url: []const u8,
+    capabilities: []const []const u8,
+};
+
 pub const DeviceRecord = struct {
     device_id: []const u8,
-    grant_id: []const u8,
+    grant_id: ?[]const u8 = null,
+    source: DeviceSource = .pair,
+    source_id: ?[]const u8 = null,
     label: []const u8,
     scopes: []const []const u8,
     created_at_ms: i64,
     last_used_at_ms: ?i64 = null,
     revoked_at_ms: ?i64 = null,
 };
+
+pub const DeviceSource = enum { pair, connect };
 
 pub const DeviceListResult = struct {
     access_protocol_version: u32,
@@ -623,6 +639,23 @@ test "access token and ticket requests are strict and versioned" {
             std.testing.allocator,
             "{\"access_protocol_version\":2}",
         ),
+    );
+}
+
+test "runtime endpoint metadata has the frozen direct-runtime shape" {
+    const metadata: RuntimeEndpointMetadata = .{
+        .access_protocol_version = ACCESS_PROTOCOL_VERSION,
+        .runtime_id = "0123456789abcdef0123456789abcdef",
+        .instance_id = "00112233445566778899aabbccddeeff",
+        .https_url = "https://runtime.example.test",
+        .wss_url = "wss://runtime.example.test/ws",
+        .capabilities = &.{PAIR_RUNTIME_CAPABILITY},
+    };
+    const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, metadata, .{});
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expectEqualStrings(
+        "{\"access_protocol_version\":1,\"runtime_id\":\"0123456789abcdef0123456789abcdef\",\"instance_id\":\"00112233445566778899aabbccddeeff\",\"https_url\":\"https://runtime.example.test\",\"wss_url\":\"wss://runtime.example.test/ws\",\"capabilities\":[\"access.pair.v1\"]}",
+        encoded,
     );
 }
 

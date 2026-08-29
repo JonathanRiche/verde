@@ -4,6 +4,7 @@
 //! daemon transport must use a deliberate encoder and clear its wire buffer.
 
 const std = @import("std");
+const access_protocol = @import("access_protocol.zig");
 
 pub const CONNECT_PROTOCOL_VERSION: u32 = 1;
 pub const CONTRACT_VERSION: []const u8 = "1";
@@ -11,6 +12,8 @@ pub const REDACTED_SECRET: []const u8 = "[REDACTED]";
 pub const MAX_CONTROL_PLANE_URL_BYTES: usize = 2048;
 pub const MAX_CREDENTIAL_FILE_BYTES: usize = 4096;
 pub const MAX_COMPACT_TOKEN_BYTES: usize = 16 * 1024;
+pub const MAX_BOOTSTRAP_BODY_BYTES: usize = 24 * 1024;
+pub const HTTP_BOOTSTRAP_PATH: []const u8 = "/auth/connect/bootstrap";
 
 pub const METHOD_LOGIN: []const u8 = "daemon.connect.login";
 pub const METHOD_LINK: []const u8 = "daemon.connect.link";
@@ -37,6 +40,15 @@ pub const Secret = struct {
             .allocated_string => |value| .{ .bytes = value },
             else => error.UnexpectedToken,
         };
+    }
+
+    pub fn jsonParseFromValue(
+        _: std.mem.Allocator,
+        source: std.json.Value,
+        _: std.json.ParseOptions,
+    ) !Secret {
+        if (source != .string) return error.UnexpectedToken;
+        return .{ .bytes = source.string };
     }
 
     pub fn jsonStringify(_: Secret, writer: anytype) !void {
@@ -116,15 +128,59 @@ pub const BootstrapConsumeRequest = struct {
     client_nonce: []const u8,
     device_id: []const u8,
     device_key_thumbprint: []const u8,
+    device_label: []const u8,
 };
 
 pub const BootstrapConsumeResult = struct {
     connect_protocol_version: u32,
-    grant_id: []const u8,
+    runtime_id: []const u8,
+    instance_id: []const u8,
     device_id: []const u8,
+    device_credential: Secret,
     scopes: []const []const u8,
-    expires_at_ms: i64,
 };
+
+/// Public HTTPS request. The Connect identity is deliberately named
+/// separately from the runtime-local device ID returned on success.
+pub const HttpBootstrapRequest = struct {
+    connect_protocol_version: u32,
+    grant_jwt: Secret,
+    expected_issuer: []const u8,
+    expected_audience: []const u8,
+    client_nonce: []const u8,
+    connect_device_id: []const u8,
+    device_key_thumbprint: []const u8,
+    device_label: []const u8,
+};
+
+pub const HttpBootstrapResult = BootstrapConsumeResult;
+
+pub fn parseHttpBootstrapRequest(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+) !std.json.Parsed(HttpBootstrapRequest) {
+    if (body.len > MAX_BOOTSTRAP_BODY_BYTES) return error.ConnectBootstrapBodyTooLarge;
+    var parsed = try std.json.parseFromSlice(HttpBootstrapRequest, allocator, body, .{});
+    errdefer parsed.deinit();
+    if (parsed.value.connect_protocol_version != CONNECT_PROTOCOL_VERSION) {
+        return error.IncompatibleConnectProtocol;
+    }
+    if (parsed.value.grant_jwt.reveal().len == 0 or
+        parsed.value.grant_jwt.reveal().len > MAX_COMPACT_TOKEN_BYTES)
+    {
+        return error.InvalidBootstrapGrant;
+    }
+    try validateControlPlaneUrl(parsed.value.expected_issuer);
+    if (!validEndpointUrl(parsed.value.expected_audience, "https") or
+        !validPrefixedHex32(parsed.value.connect_device_id, "dev_") or
+        !validBase64Url43(parsed.value.client_nonce) or
+        !validBase64Url43(parsed.value.device_key_thumbprint))
+    {
+        return error.InvalidBootstrapGrant;
+    }
+    try access_protocol.validateDeviceLabel(parsed.value.device_label);
+    return parsed;
+}
 
 pub fn isMethod(method: []const u8) bool {
     return std.mem.eql(u8, method, METHOD_LOGIN) or
@@ -201,6 +257,14 @@ fn validBase64Url43(value: []const u8) bool {
     return true;
 }
 
+fn validPrefixedHex32(value: []const u8, prefix: []const u8) bool {
+    if (value.len != prefix.len + 32 or !std.mem.startsWith(u8, value, prefix)) return false;
+    for (value[prefix.len..]) |byte| {
+        if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
+    }
+    return true;
+}
+
 test "connect methods keep login/link and unlink/logout distinct" {
     try std.testing.expect(isMutatingMethod(METHOD_LOGIN));
     try std.testing.expect(isMutatingMethod(METHOD_LINK));
@@ -244,4 +308,26 @@ test "runtime descriptors enforce public v1 identity and endpoint constraints" {
         error.InvalidRuntimeDescriptor,
         validateRuntimeDescriptor(invalid, descriptor.runtime_id, descriptor.instance_id),
     );
+}
+
+test "public Connect bootstrap DTO is strict redacting and identity-explicit" {
+    const wire =
+        "{\"connect_protocol_version\":1,\"grant_jwt\":\"header.payload.signature\"," ++
+        "\"expected_issuer\":\"https://connect.example.test\"," ++
+        "\"expected_audience\":\"https://runtime.example.test\"," ++
+        "\"client_nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"," ++
+        "\"connect_device_id\":\"dev_33333333333333333333333333333333\"," ++
+        "\"device_key_thumbprint\":\"kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k\"," ++
+        "\"device_label\":\"Connect laptop\"}";
+    var parsed = try parseHttpBootstrapRequest(std.testing.allocator, wire);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("dev_33333333333333333333333333333333", parsed.value.connect_device_id);
+    const generic = try std.json.Stringify.valueAlloc(std.testing.allocator, parsed.value, .{});
+    defer std.testing.allocator.free(generic);
+    try std.testing.expect(std.mem.indexOf(u8, generic, "header.payload.signature") == null);
+    try std.testing.expect(std.mem.indexOf(u8, generic, REDACTED_SECRET) != null);
+    try std.testing.expectError(error.UnknownField, parseHttpBootstrapRequest(
+        std.testing.allocator,
+        wire[0 .. wire.len - 1] ++ ",\"future\":true}",
+    ));
 }

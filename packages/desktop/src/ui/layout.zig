@@ -621,8 +621,11 @@ fn focusedCursorReadOnly(state: *runtime.AppState) usize {
 
 /// Fields whose bytes are secrets: rendered masked, zeroed on delete, and
 /// never handed to the frame arena.
-fn isSecretModalFocus(focus: runtime.PaletteModalTextFocus) bool {
-    return focus == .runtime_credential or focus == .runtime_wizard_pairing_code;
+fn isSecretModalFocus(state: *const runtime.AppState, focus: runtime.PaletteModalTextFocus) bool {
+    return focus == .runtime_credential or focus == .runtime_wizard_pairing_code or
+        (focus == .runtime_wizard_control_plane_url and
+            state.runtime_connections.wizard_method == .pair and
+            state.runtime_connections.wizard_mode == .add);
 }
 
 fn clearModalSelection(state: *runtime.AppState) void {
@@ -670,7 +673,7 @@ fn focusedMetricOffsetForClickX(
     font_size: f32,
     rel: f32,
 ) usize {
-    if (!isSecretModalFocus(state.palette_modal_text_focus)) {
+    if (!isSecretModalFocus(state, state.palette_modal_text_focus)) {
         return modalOffsetForClickX(value, font_size, rel);
     }
     var masked: [4096]u8 = undefined;
@@ -723,7 +726,7 @@ fn deleteModalSelection(state: *runtime.AppState) bool {
     const current_len = std.mem.sliceTo(buf, 0).len;
     const removed = sel.end - sel.start;
     std.mem.copyForwards(u8, buf[sel.start .. current_len - removed], buf[sel.end..current_len]);
-    if (isSecretModalFocus(state.palette_modal_text_focus)) {
+    if (isSecretModalFocus(state, state.palette_modal_text_focus)) {
         std.crypto.secureZero(u8, buf[current_len - removed .. current_len]);
     } else {
         buf[current_len - removed] = 0;
@@ -740,7 +743,7 @@ fn copyModalSelection(state: *runtime.AppState) void {
     if (slice.len == 0) return;
     const z = state.allocator.dupeZ(u8, slice) catch return;
     defer {
-        if (isSecretModalFocus(state.palette_modal_text_focus)) {
+        if (isSecretModalFocus(state, state.palette_modal_text_focus)) {
             std.crypto.secureZero(u8, z);
         }
         state.allocator.free(z);
@@ -755,7 +758,7 @@ fn pasteIntoModal(state: *runtime.AppState) bool {
         return pasteIntoRuntimeCredential(state);
     }
     const text = state.readClipboardTextForPaste() orelse return false;
-    const secret = isSecretModalFocus(state.palette_modal_text_focus);
+    const secret = isSecretModalFocus(state, state.palette_modal_text_focus);
     defer {
         if (secret) std.crypto.secureZero(u8, text);
         state.allocator.free(text);
@@ -1337,7 +1340,7 @@ fn deleteModalText(state: *runtime.AppState, backwards: bool) bool {
         if (cursor.* == 0 or len == 0) return true;
         const at = cursor.* - 1;
         std.mem.copyForwards(u8, buf[at .. len - 1], buf[at + 1 .. len]);
-        if (isSecretModalFocus(state.palette_modal_text_focus)) {
+        if (isSecretModalFocus(state, state.palette_modal_text_focus)) {
             std.crypto.secureZero(u8, buf[len - 1 .. len]);
         } else {
             buf[len - 1] = 0;
@@ -1346,7 +1349,7 @@ fn deleteModalText(state: *runtime.AppState, backwards: bool) bool {
     } else {
         if (cursor.* >= len) return true;
         std.mem.copyForwards(u8, buf[cursor.* .. len - 1], buf[cursor.* + 1 .. len]);
-        if (isSecretModalFocus(state.palette_modal_text_focus)) {
+        if (isSecretModalFocus(state, state.palette_modal_text_focus)) {
             std.crypto.secureZero(u8, buf[len - 1 .. len]);
         } else {
             buf[len - 1] = 0;
@@ -1491,7 +1494,7 @@ fn runtimeWizardLayout(state: *const runtime.AppState, width: f32, height: f32) 
     const inventory_rows = @min(rc.connect_runtimes.items.len, WIZARD_INVENTORY_VISIBLE_ROWS);
     const body_h: f32 = switch (step) {
         .method => @as(f32, @floatFromInt(WIZARD_METHOD_COUNT)) * (method_card_h + row_gap),
-        .form => 4.0 * field_row_h,
+        .form => if (rc.wizard_method == .pair) 2.0 * field_row_h else 4.0 * field_row_h,
         .pair_grant => 3.0 * field_row_h,
         .pair_confirm => 2.0 * (label_h + identity_box_h + row_gap),
         .connect_setup => 2.0 * field_row_h + status_block_h + @as(f32, @floatFromInt(inventory_rows)) * (inventory_row_h + gap) + (if (rc.connect_runtimes_truncated > 0) sub_h else 0.0),
@@ -1513,15 +1516,21 @@ fn runtimeWizardLayout(state: *const runtime.AppState, width: f32, height: f32) 
     }
     switch (step) {
         .form => {
-            const full_fields = [_]WizardField{ .label, .host, .user };
-            for (full_fields) |field| {
-                layout.fields[@intFromEnum(field)] = .{ .x = x, .y = y + label_h, .w = content_w, .h = input_h };
+            if (rc.wizard_method == .pair) {
+                for ([_]WizardField{ .label, .control_plane_url }) |field| {
+                    layout.fields[@intFromEnum(field)] = .{ .x = x, .y = y + label_h, .w = content_w, .h = input_h };
+                    y += field_row_h;
+                }
+            } else {
+                for ([_]WizardField{ .label, .host, .user }) |field| {
+                    layout.fields[@intFromEnum(field)] = .{ .x = x, .y = y + label_h, .w = content_w, .h = input_h };
+                    y += field_row_h;
+                }
+                const half_w = (content_w - theme.scaledUi(10.0)) * 0.5;
+                layout.fields[@intFromEnum(WizardField.ssh_port)] = .{ .x = x, .y = y + label_h, .w = half_w, .h = input_h };
+                layout.fields[@intFromEnum(WizardField.gateway_port)] = .{ .x = x + half_w + theme.scaledUi(10.0), .y = y + label_h, .w = half_w, .h = input_h };
                 y += field_row_h;
             }
-            const half_w = (content_w - theme.scaledUi(10.0)) * 0.5;
-            layout.fields[@intFromEnum(WizardField.ssh_port)] = .{ .x = x, .y = y + label_h, .w = half_w, .h = input_h };
-            layout.fields[@intFromEnum(WizardField.gateway_port)] = .{ .x = x + half_w + theme.scaledUi(10.0), .y = y + label_h, .w = half_w, .h = input_h };
-            y += field_row_h;
         },
         .pair_grant => {
             const fields = [_]WizardField{ .grant_id, .pairing_code, .device_label };
@@ -1621,7 +1630,7 @@ fn connectPrimaryEnabled(rc: *const runtime_connections.State) bool {
         .idle, .failed, .discovered => true,
         .inventory_loaded => rc.connect_selected != null,
         .signed_in => true,
-        .discovering, .signing_in, .loading_inventory => false,
+        .discovering, .signing_in, .loading_inventory, .bootstrapping, .bootstrap_ready => false,
     };
 }
 
@@ -1634,6 +1643,8 @@ fn connectPrimaryLabel(rc: *const runtime_connections.State) []const u8 {
         .signing_in => "Waiting for browser…",
         .signed_in, .loading_inventory => "Loading…",
         .inventory_loaded => "Use selected runtime",
+        .bootstrapping => "Creating device…",
+        .bootstrap_ready => "Finishing…",
     };
 }
 
@@ -1642,8 +1653,9 @@ fn drawWizardField(state: *runtime.AppState, layout: WizardLayout, field: Wizard
     queuePaletteText(state, .{ .x = rect.x, .y = rect.y - theme.scaledUi(18.0), .w = rect.w, .h = theme.scaledUi(16.0) }, label, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), layout.modal);
     const focus = runtimeWizardFocusForIndex(@intFromEnum(field));
     const value = state.runtime_connections.fieldValue(field);
-    if (field == .pairing_code) {
-        // Same-length mask: the code never enters a Palette batch or arena.
+    if (isSecretModalFocus(state, focus)) {
+        // Same-length mask: pairing codes and an unimported one-paste Pair
+        // link never enter a Palette batch or frame arena.
         var masked: [4096]u8 = undefined;
         drawTextField(state, rect, maskedRuntimeCredential(&masked, value.len), hint, state.palette_modal_text_focus == focus, state.runtime_connections.fieldCursor(field).*);
         return;
@@ -1680,16 +1692,16 @@ fn renderRuntimeWizardModal(state: *runtime.AppState, width: f32, height: f32) v
     const subtitle = switch (rc.wizard_step) {
         .method => "Choose how this desktop reaches the runtime. Only Connect needs an account.",
         .form => if (rc.wizard_method == .pair)
-            "Pairing forwards the daemon over SSH for the exchange; afterwards only a revocable device credential is used."
+            "Paste the complete Pair link once. HTTPS and runtime identity are verified before trust is saved."
         else
             "Reach a self-hosted Verde daemon over SSH. Host keys are verified by OpenSSH; no secrets are stored here.",
-        .pair_grant => "Run `verde-daemon pair create --label <name>` on the runtime host and copy its grant id and one-time code.",
+        .pair_grant => "Advanced manual fallback: review or enter the grant ID and masked one-time code, then exchange.",
         .pair_confirm => "The runtime answered the exchange. Verify both IDs against `verde-daemon identity` before trusting it.",
         .connect_setup => "Enter your self-hosted Verde Connect URL. Sign-in uses the system browser with PKCE; tokens stay in memory.",
         .testing => switch (rc.wizard_method) {
             .ssh => "Connect to verify the daemon identity. You will be asked for the gateway token and to confirm the runtime on first contact.",
             .pair => "Connect uses the paired device credential; no token prompt is needed.",
-            .connect => "The runtime endpoint is saved. Live sessions wait on the desktop data plane (see below).",
+            .connect => "Connect uses the runtime-local device credential; OIDC is needed only to select or re-bootstrap.",
         },
     };
     queuePaletteText(state, .{ .x = modal.x + pad, .y = modal.y + pad + theme.scaledUi(32.0), .w = layout.content_w, .h = theme.scaledUi(20.0) }, subtitle, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.5), modal);
@@ -1708,10 +1720,14 @@ fn renderRuntimeWizardModal(state: *runtime.AppState, width: f32, height: f32) v
         },
         .form => {
             drawWizardField(state, layout, .label, "NAME", "Build VM");
-            drawWizardField(state, layout, .host, "SSH HOST OR CONFIG ALIAS", "runtime.example or my-vm");
-            drawWizardField(state, layout, .user, "SSH USER (OPTIONAL)", "leave empty to use ~/.ssh/config");
-            drawWizardField(state, layout, .ssh_port, "SSH PORT", "22");
-            drawWizardField(state, layout, .gateway_port, "GATEWAY PORT ON HOST", "7420");
+            if (rc.wizard_method == .pair) {
+                drawWizardField(state, layout, .control_plane_url, if (rc.wizard_mode == .add) "PAIR LINK (MASKED)" else "DIRECT HTTPS / TAILSCALE SERVE URL", if (rc.wizard_mode == .add) "verde://pair?host=…&grant_id=…#code=…" else "https://runtime.example");
+            } else {
+                drawWizardField(state, layout, .host, "SSH HOST OR CONFIG ALIAS", "runtime.example or my-vm");
+                drawWizardField(state, layout, .user, "SSH USER (OPTIONAL)", "leave empty to use ~/.ssh/config");
+                drawWizardField(state, layout, .ssh_port, "SSH PORT", "22");
+                drawWizardField(state, layout, .gateway_port, "GATEWAY PORT ON HOST", "7420");
+            }
             drawActionButton(state, layout.buttons[0], "Cancel", theme.COLOR_PANEL_ALT);
             if (rc.wizard_mode == .add and rc.wizard_profile_id == null) drawActionButton(state, layout.buttons[1], "Back", theme.COLOR_PANEL_ALT);
             drawActionButton(state, layout.buttons[2], if (rc.wizard_mode == .add) "Save & continue" else "Save", theme.accent());
@@ -1747,6 +1763,8 @@ fn renderRuntimeWizardModal(state: *runtime.AppState, width: f32, height: f32) v
                 .signing_in => if (rc.connect_login_open) "Browser opened. Finish sign-in there; this window waits for the loopback redirect." else "Starting sign-in…",
                 .signed_in, .loading_inventory => "Signed in. Loading linked runtimes…",
                 .inventory_loaded => "Signed in.",
+                .bootstrapping => "Creating the runtime-local device credential…",
+                .bootstrap_ready => "Runtime bootstrap complete.",
                 .failed => "Failed.",
             };
             const status_color = if (rc.connect_failure != null) theme.danger() else if (connectSignedIn(rc.connect_phase)) theme.success() else theme.COLOR_TEXT_MUTED;
@@ -1805,11 +1823,6 @@ fn renderRuntimeWizardModal(state: *runtime.AppState, width: f32, height: f32) v
                     .runtime_selection_required => "Choose runtime",
                     else => "Connect",
                 };
-                if (rc.wizard_method == .connect) {
-                    // Do not fake a data plane: the exact blocker is shown in
-                    // place of a status that could never become "Connected".
-                    description = runtime_connections.CONNECT_BLOCKER;
-                }
             }
             queuePaletteText(state, .{ .x = modal.x + pad, .y = layout.status_y, .w = layout.content_w, .h = theme.scaledUi(22.0) }, badge, paletteColor(badge_color), theme.scaledUi(15.0), modal);
             queuePaletteText(state, .{ .x = modal.x + pad, .y = layout.status_y + theme.scaledUi(26.0), .w = layout.content_w, .h = theme.scaledUi(20.0) }, description, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.5), modal);
@@ -2862,6 +2875,29 @@ test "runtime credential renderer receives only a same-length mask" {
     try std.testing.expectEqual(@as(usize, "not-a-renderable-secret".len), masked.len);
     for (masked) |byte| try std.testing.expectEqual(@as(u8, '*'), byte);
     try std.testing.expect(!std.mem.eql(u8, masked, "not-a-renderable-secret"));
+}
+
+test "Pair wizard form positions only its two visible fields on separate rows" {
+    var state: runtime.AppState = undefined;
+    state.runtime_connections = .{};
+    state.runtime_connections.wizard_step = .form;
+    state.runtime_connections.wizard_method = .pair;
+
+    const pair_layout = runtimeWizardLayout(&state, 1200.0, 900.0);
+    const label = pair_layout.fields[@intFromEnum(WizardField.label)];
+    const pair_link = pair_layout.fields[@intFromEnum(WizardField.control_plane_url)];
+    try std.testing.expect(pair_link.y >= label.y + label.h);
+    try std.testing.expectEqual(label.x, pair_link.x);
+    try std.testing.expectEqual(label.w, pair_link.w);
+    try std.testing.expectEqualSlices(
+        WizardField,
+        &.{ .label, .control_plane_url },
+        state.runtime_connections.visibleFields(),
+    );
+
+    state.runtime_connections.wizard_method = .ssh;
+    const ssh_layout = runtimeWizardLayout(&state, 1200.0, 900.0);
+    try std.testing.expect(pair_layout.modal.h < ssh_layout.modal.h);
 }
 
 test "runtime trust requires the explicit confirmation button" {

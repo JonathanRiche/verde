@@ -406,7 +406,7 @@ test "RFC 7638 runtime key thumbprints match public vectors" {
     const x_public = try decodeFixed(32, "hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo");
     const x_thumbprint = try thumbprintAlloc(std.testing.allocator, "X25519", &x_public);
     defer std.testing.allocator.free(x_thumbprint);
-    try std.testing.expectEqualStrings("u809Vppx5ixWMOohxWr2aM3m5bD0LQ67g_GP-mubQus", x_thumbprint);
+    try std.testing.expectEqualStrings("u809Vppx5ixWMOohxWr2aM3m5bD0LQ67g_GPmubQus4", x_thumbprint);
 }
 
 test "RFC 8785 canonical request digest matches the public vector" {

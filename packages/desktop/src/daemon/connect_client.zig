@@ -47,7 +47,10 @@ pub const HttpTransport = struct {
     fn send(_: *anyopaque, allocator: std.mem.Allocator, request: Request) !Response {
         try validateRequest(request);
         const response_buffer = try allocator.alloc(u8, MAX_RESPONSE_BYTES);
-        defer allocator.free(response_buffer);
+        defer {
+            std.crypto.secureZero(u8, response_buffer);
+            allocator.free(response_buffer);
+        }
         var response_writer: std.Io.Writer = .fixed(response_buffer);
 
         var authorization: ?[]u8 = null;

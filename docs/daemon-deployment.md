@@ -1,8 +1,11 @@
 # Standalone Daemon Deployment
 
-This guide covers the open-source, single-user Verde runtime on a manually administered Linux VM. It does not require a Verde account or the Verde SaaS control plane.
+This is the advanced/manual VM and container guide. For the normal two-step
+Tailscale or Connect flow, start with [Verde Serve, Pair, and
+Connect](serve-pair-connect.md). A manually administered runtime does not
+require a Verde account or hosted control plane.
 
-The standalone `verde-daemon` and secured, loopback-only `verde-web` gateway are implemented. A browser can reach the gateway through an SSH local forward. A non-root container image and Compose example package the same two artifacts for a dedicated Linux VM. The native desktop can add, edit, and remove non-secret connections from Settings › Runtimes & connections or the runtime picker (SSH with an administrator token, account-free Pair, or a Connect control plane), choose workspace defaults, prompt for a process-memory gateway token or pair a device credential, require explicit runtime/instance trust, show Local and configured runtimes with live state, surface repository bindings and provider readiness reported by the verified runtime, and run text-only native chat through an exactly pinned runtime. Remote attachments, PTYs/TUIs, guided provider login, and desktop repository add/clone are not complete yet.
+The standalone `verde-daemon` and secured, loopback-only `verde-web` gateway are implemented. Tailscale Serve can terminate direct private HTTPS in front of that loopback listener; an SSH local forward remains an advanced/recovery path. A non-root container image and Compose example package the same artifacts for a dedicated Linux VM. The native desktop can add, edit, and remove non-secret connections from Settings › Runtimes & connections or the runtime picker (direct HTTPS Pair, SSH with an administrator token, or a Connect control plane), choose workspace defaults, require explicit runtime/instance trust, show Local and configured runtimes with live state, surface repository bindings and provider readiness reported by the verified runtime, and run text-only native chat through an exactly pinned runtime. Remote attachments, PTYs/TUIs, guided provider login, and desktop repository add/clone are not complete yet.
 
 ## Security and process model
 
@@ -14,7 +17,9 @@ The current remote deployment has these boundaries:
 
 - `verde-sessionizer.sock` stays on the VM and must never be exposed over the network.
 - `verde-web` accepts only a loopback listener and requires an owner-only token file at startup.
-- Remote access uses an SSH local forward. The current gateway does not provide public HTTPS or accept a non-loopback bind.
+- Normal Tailnet access uses Tailscale Serve for HTTPS; advanced/recovery access
+  may use an SSH local forward. The gateway itself never accepts a
+  non-loopback bind.
 - One token grants administrative access to this single-user runtime. Persistent token scopes and multi-user authorization are not implemented.
 - The gateway does not expose arbitrary filesystem browsing, file-preview, or file-download routes.
 
@@ -41,7 +46,8 @@ If the browser gateway is installed from the same staging prefix, a complete man
 /opt/verde/
 ├── bin/
 │   ├── verde-daemon
-│   └── verde-web
+│   ├── verde-web
+│   └── verde-server
 └── share/
     └── verde/
         ├── provider_bridge.mjs
@@ -377,7 +383,10 @@ curl -fsS http://127.0.0.1:7420/healthz
 
 `GET /healthz` is intentionally limited to liveness. `GET /login`, `GET /login.js`, and trusted built SPA assets are also public; unauthenticated app-shell navigation redirects to `/login`. Runtime inventory, RPC, and the exact `/ws` upgrade require either the authenticated browser session cookie or an authorization bearer. Browser login exchanges the administrator token for a bounded, in-memory, `HttpOnly; SameSite=Strict` session cookie. Raw tokens in query strings and `X-Verde-Token` headers are not accepted. The gateway has no production Live/mock fallback: it talks only to the configured headless session daemon.
 
-The current SSH-loopback release uses HTTP at the browser's loopback endpoint, so the session cookie is not marked `Secure`. The SSH tunnel encrypts network transit. This is not a substitute for a future HTTPS/WSS deployment mode.
+The advanced SSH-loopback browser path uses HTTP at the browser's loopback
+endpoint, so its session cookie is not marked `Secure`; SSH encrypts network
+transit. The normal native Pair path instead uses Tailscale-terminated HTTPS
+and scoped device credentials.
 
 ## Connect through SSH
 
@@ -428,7 +437,11 @@ The desktop command palette also provides **Use Current Chat Runtime as Workspac
 
 Keep the forward bound to `127.0.0.1`, not `0.0.0.0`. Do not disable SSH host-key checking. Verde's desktop connection manager uses an observable, continuously owned listener plus an exact, bounded `ssh -W` process for each permitted call. Heartbeat and every post-trust RPC are targeted to the persisted runtime/instance pair and rejected before dispatch if that pair changes.
 
-The gateway rejects public/LAN binds, so Cloudflare Tunnel, Tailscale Funnel/Serve, a public reverse proxy, and direct Internet exposure are outside the current supported mode. Direct HTTPS needs a separate security and certificate path rather than weakening this loopback default.
+The gateway rejects public/LAN binds. The supported direct private path keeps
+that invariant: Tailscale Serve terminates HTTPS and proxies to the loopback
+port under one exact trusted-origin contract. Other reverse proxies and public
+Internet exposure remain advanced, operator-managed deployments and must meet
+the same forwarding and certificate requirements.
 
 ## Shutdown, backup, and upgrade
 
@@ -456,8 +469,11 @@ Gateway browser sessions are in memory and do not survive a gateway restart. To 
 
 - The native desktop remote path currently supports text-only native chat. Remote prompt attachments, repository file transfer/preview, reconnectable PTYs, provider TUIs, and terminal lifecycle parity are pending.
 - Administrator gateway bearers are process-memory-only and must be entered again after desktop relaunch. Paired device credentials persist by reference in the OS credential store (Linux Secret Service) or, without one, stay memory-only with a visible warning. Tokens are intentionally absent from profile/default JSON, diagnostics, and CLI flags.
-- Connect profiles stop at runtime selection: the desktop pins the chosen endpoint and SPKI but cannot open a session until a direct HTTPS/WSS data plane and a runtime-side HTTP bootstrap-grant surface exist.
-- The gateway is loopback-and-SSH only. Direct HTTPS/WSS and public listeners are not implemented.
+- Connect discovery and bootstrap require an existing externally reachable
+  HTTPS endpoint, normally the saved Tailscale origin or an advanced descriptor.
+  No managed relay, tunnel, or NAT traversal component is bundled.
+- The gateway remains loopback-only. Direct HTTPS/WSS is provided by Tailscale
+  Serve as the trusted TLS-terminating proxy, not by a public gateway bind.
 - SSH-to-loopback mode supports a dedicated VM/container, not a network namespace shared with mutually untrusted local accounts or containers.
 - Authentication is one administrator token with ephemeral browser sessions; persistent token metadata, scopes, and selective revocation are not implemented.
 - Provider installation is detected, but provider authentication is reported as `unknown`; Settings shows the runtime's provider states and remediation commands but cannot run them because there is no remote shell. Guided remote login and deadline-bounded auth probes are pending.

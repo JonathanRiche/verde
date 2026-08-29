@@ -90,14 +90,31 @@ compile_palette_metallib "$REPO_ROOT/packages/palette/src/shaders/ui.image.frag.
 BUILD_ARGS=(zig build --release=safe -p "$PREFIX_DIR" -Dbrowser-backend=native_webview -Dversion="$VERSION")
 "${BUILD_ARGS[@]}"
 
+cd "$REPO_ROOT"
+zig build daemon server --release=safe -Dversion="$VERSION" --prefix "$PREFIX_DIR"
+(
+  cd "$REPO_ROOT/packages/web_app"
+  zig build --release=safe --prefix "$PREFIX_DIR"
+  bun install --frozen-lockfile
+  bun run build
+)
+rm -rf "$PREFIX_DIR/share/verde/web"
+cp -a "$REPO_ROOT/packages/web_app/dist" "$PREFIX_DIR/share/verde/web"
+
 mkdir -p \
   "$APP_DIR/Contents/MacOS" \
-  "$APP_DIR/Contents/Resources"
+  "$APP_DIR/Contents/Resources" \
+  "$APP_DIR/Contents/share/verde"
 
 install -m 755 "$PREFIX_DIR/bin/verde" "$APP_DIR/Contents/MacOS/verde"
+install -m 755 "$PREFIX_DIR/bin/verde-server" "$APP_DIR/Contents/MacOS/verde-server"
+install -m 755 "$PREFIX_DIR/bin/verde-daemon" "$APP_DIR/Contents/MacOS/verde-daemon"
+install -m 755 "$PREFIX_DIR/bin/verde-web" "$APP_DIR/Contents/MacOS/verde-web"
 install -m 755 "$PREFIX_DIR/bin/libfff_c.dylib" "$APP_DIR/Contents/MacOS/libfff_c.dylib"
 ditto "$PREFIX_DIR/bin/SDL3.framework" "$APP_DIR/Contents/MacOS/SDL3.framework"
 install -m 644 "$PREFIX_DIR/share/verde/provider_bridge.mjs" "$APP_DIR/Contents/Resources/provider_bridge.mjs"
+install -m 644 "$PREFIX_DIR/share/verde/provider_bridge.mjs" "$APP_DIR/Contents/share/verde/provider_bridge.mjs"
+cp -a "$PREFIX_DIR/share/verde/web" "$APP_DIR/Contents/share/verde/web"
 set_macos_build_version "$APP_DIR/Contents/MacOS/verde"
 
 cat > "$APP_DIR/Contents/Info.plist" <<EOF

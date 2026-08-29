@@ -2533,9 +2533,8 @@ fn collectRuntimeDetailLines(state: *const runtime.AppState, profile_id: ?[]cons
     }
 }
 
-/// Method-specific, secret-free access details: device reference and
-/// credential durability for Pair, endpoint identity and the data-plane
-/// blocker for Connect. Never prints a credential, token, or expiry secret.
+/// Method-specific, secret-free access details for Pair and Connect. Never
+/// prints a credential, token, or expiry secret.
 fn pushRuntimeAccessDetailLines(state: *const runtime.AppState, profile_id: []const u8, out: *DetailBuffer) void {
     const service = state.runtime_service orelse return;
     const snapshot = service.snapshot(profile_id) orelse return;
@@ -2556,7 +2555,7 @@ fn pushRuntimeAccessDetailLines(state: *const runtime.AppState, profile_id: []co
             }
             switch (snapshot.pairing_state) {
                 .none => {},
-                .exchanging => out.push(.muted, "Pairing · exchanging the grant over SSH", .{}),
+                .exchanging => out.push(.muted, "Pairing · exchanging the one-time grant with the runtime", .{}),
                 .awaiting_confirmation => out.push(.warning, "Pairing · runtime identity awaits your confirmation in the wizard", .{}),
             }
             if (snapshot.access_token_expires_at_ms) |expires| {
@@ -2577,7 +2576,10 @@ fn pushRuntimeAccessDetailLines(state: *const runtime.AppState, profile_id: []co
                 else => {},
             }
             if (configured.expected_runtime_id) |runtime_id| out.push(.muted, "Runtime · {s} / {s}", .{ runtime_id, configured.expected_instance_id orelse "?" });
-            out.push(.warning, "{s}", .{runtime_connections.CONNECT_BLOCKER});
+            if (link.device_id) |device_id| out.push(.muted, "Runtime-local device · {s}", .{device_id});
+            if (link.credential_ref != null and !snapshot.device_credential_held) {
+                out.push(.warning, "Runtime-local credential is not loaded; sign in to Connect and bootstrap again", .{});
+            }
         },
     }
 }
@@ -2665,7 +2667,7 @@ fn drawRuntimeCard(state: *runtime.AppState, layout: SettingsLayout) void {
         .y = card.y + m.card_pad + m.title_h + m.inner_gap,
         .w = card.w - m.card_pad * 2.0,
         .h = m.label_h,
-    }, "Where chats run. Select a row for repository and provider readiness · SSH token, paired device, or Connect control plane", paletteColor(textHint()), theme.scaledUi(12.0), clip);
+    }, "Where chats run. Select a row for repository and provider readiness · Local, SSH, Direct / Tailnet, or Connect", paletteColor(textHint()), theme.scaledUi(12.0), clip);
 
     for (0..plan.row_count) |row| {
         const row_plan = &plan.rows[row];
@@ -2702,6 +2704,12 @@ fn drawRuntimeCard(state: *runtime.AppState, layout: SettingsLayout) void {
                             }) catch runtime.runtimePickerStatusDescription(status);
                         },
                         .local_socket => description = runtime.runtimePickerStatusDescription(status),
+                        .direct_https => |endpoint| {
+                            description = std.fmt.bufPrint(&description_buf, "{s} · Direct / Tailnet {s}", .{
+                                runtime.runtimePickerStatusDescription(status),
+                                endpoint.https_url orelse "(missing endpoint)",
+                            }) catch runtime.runtimePickerStatusDescription(status);
+                        },
                         .connect => |endpoint| {
                             description = std.fmt.bufPrint(&description_buf, "{s} · Connect {s}", .{
                                 runtime.runtimePickerStatusDescription(status),

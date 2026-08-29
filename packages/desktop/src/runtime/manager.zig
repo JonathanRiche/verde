@@ -32,7 +32,42 @@ pub const DEVICE_SECRET_SUFFIX: []const u8 = ".device";
 pub const TransportKind = enum {
     local_socket,
     ssh_tunnel,
+    direct_https,
     connect,
+};
+
+/// Prepared request target. Direct and Connect calls intentionally share the
+/// same authenticated operations; only endpoint resolution differs.
+pub const TransportTarget = union(enum) {
+    loopback: u16,
+    direct_https: []const u8,
+};
+
+const OwnedTransportTarget = union(enum) {
+    loopback: u16,
+    direct_https: []u8,
+
+    fn clone(allocator: std.mem.Allocator, target: TransportTarget) !OwnedTransportTarget {
+        return switch (target) {
+            .loopback => |port| .{ .loopback = port },
+            .direct_https => |url| .{ .direct_https = try allocator.dupe(u8, url) },
+        };
+    }
+
+    fn borrow(self: OwnedTransportTarget) TransportTarget {
+        return switch (self) {
+            .loopback => |port| .{ .loopback = port },
+            .direct_https => |url| .{ .direct_https = url },
+        };
+    }
+
+    fn deinit(self: *OwnedTransportTarget, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .loopback => {},
+            .direct_https => |url| allocator.free(url),
+        }
+        self.* = undefined;
+    }
 };
 
 /// Secret-free, stable failure categories for the desktop runtime picker.
@@ -86,7 +121,7 @@ pub const AccessBackend = struct {
     call: *const fn (
         ?*anyopaque,
         std.mem.Allocator,
-        u16,
+        TransportTarget,
         []const u8,
         ?[]const u8,
         []const u8,
@@ -237,7 +272,7 @@ pub const RpcBackend = struct {
     call: *const fn (
         ?*anyopaque,
         std.mem.Allocator,
-        u16,
+        TransportTarget,
         []const u8,
         []const u8,
     ) connection.TransportError![]u8,
@@ -342,8 +377,12 @@ const Entry = struct {
         self.* = undefined;
     }
 
-    fn isPaired(self: *const Entry) bool {
-        return self.owned_profile.access == .paired_device;
+    fn usesDeviceCredential(self: *const Entry) bool {
+        return switch (self.owned_profile.access) {
+            .paired_device => true,
+            .connect => |link| link.hasRuntimeDevice(),
+            .admin_token => false,
+        };
     }
 };
 
@@ -460,7 +499,7 @@ pub const Manager = struct {
     /// generation exactly like replacing an administrator token.
     pub fn hydrateDeviceCredential(self: *Manager, profile_id: []const u8, credential: []const u8) !void {
         const entry = self.findEntry(profile_id) orelse return error.UnknownRuntimeProfile;
-        if (!entry.isPaired()) return error.ProfileAccessMismatch;
+        if (!entry.usesDeviceCredential()) return error.ProfileAccessMismatch;
         try access_protocol.validateSecret(credential);
         var key_buffer: DeviceSecretKeyBuffer = undefined;
         const key = deviceSecretKey(&key_buffer, profile_id);
@@ -499,8 +538,8 @@ pub const Manager = struct {
     pub fn beginPairing(self: *Manager, profile_id: []const u8, input: PairingInput, now_ms: u64) !void {
         const index = self.findEntryIndex(profile_id) orelse return error.UnknownRuntimeProfile;
         const entry = &self.entries.items[index];
-        if (!entry.isPaired()) return error.ProfileAccessMismatch;
-        if (entry.owned_profile.transport != .ssh_tunnel) {
+        if (entry.owned_profile.access != .paired_device) return error.ProfileAccessMismatch;
+        if (entry.owned_profile.transport != .ssh_tunnel and entry.owned_profile.transport != .direct_https) {
             entry.failure_override = .unsupported_transport;
             return error.UnsupportedRuntimeTransport;
         }
@@ -670,11 +709,13 @@ pub const Manager = struct {
         return &entry.owned_profile;
     }
 
-    /// Starts an SSH attempt without waiting for authentication or network IO.
+    /// Starts a remote attempt without waiting for authentication or network IO.
     pub fn enable(self: *Manager, profile_id: []const u8, now_ms: u64) !void {
         const index = self.findEntryIndex(profile_id) orelse return error.UnknownRuntimeProfile;
         const entry = &self.entries.items[index];
-        if (entry.owned_profile.transport != .ssh_tunnel) {
+        if (entry.owned_profile.transport != .ssh_tunnel and
+            entry.owned_profile.transport != .direct_https and entry.owned_profile.transport != .connect)
+        {
             entry.failure_override = .unsupported_transport;
             return error.UnsupportedRuntimeTransport;
         }
@@ -694,8 +735,8 @@ pub const Manager = struct {
         }
     }
 
-    // Admin-token profiles need the bearer; paired profiles need the device
-    // credential or an unexchanged grant; Connect has no loopback path yet.
+    // Admin-token profiles need the bearer. Pair and bootstrapped Connect
+    // profiles use the same runtime-local device credential and token flow.
     fn entryHasStartCredential(self: *const Manager, entry: *const Entry) bool {
         return switch (entry.owned_profile.access) {
             .admin_token => self.secrets.get(entry.owned_profile.id) != null,
@@ -704,7 +745,11 @@ pub const Manager = struct {
                 var key_buffer: DeviceSecretKeyBuffer = undefined;
                 break :blk self.secrets.get(deviceSecretKey(&key_buffer, entry.owned_profile.id)) != null;
             },
-            .connect => false,
+            .connect => |link| blk: {
+                if (!link.hasRuntimeDevice()) break :blk false;
+                var key_buffer: DeviceSecretKeyBuffer = undefined;
+                break :blk self.secrets.get(deviceSecretKey(&key_buffer, entry.owned_profile.id)) != null;
+            },
         };
     }
 
@@ -811,9 +856,8 @@ pub const Manager = struct {
         const profile_instance_id = try self.allocator.dupe(u8, persisted.instance_id);
         errdefer self.allocator.free(profile_instance_id);
         const tunnel = entry.supervisor.getSnapshot();
-        const allow_commit_current = entry.tunnel_owned and
-            entry.tunnel_generation == proposal.generation and
-            tunnel.lifecycle == .running;
+        const allow_commit_current = entry.tunnel_generation == proposal.generation and
+            ((!entry.tunnel_owned and isDirectEntry(entry)) or tunnel.lifecycle == .running);
         const adoption = try entry.connection_state.adoptPersistedIdentity(
             proposal.generation,
             proposal.runtime_id,
@@ -932,7 +976,9 @@ pub const Manager = struct {
             },
             .connecting => {
                 clearHealth(entry);
-                if (!entry.tunnel_owned and workers_idle) {
+                if (isDirectEntry(entry) and entry.tunnel_generation == entry.connection_state.generation and workers_idle) {
+                    try self.advanceConnecting(entry, now_ms);
+                } else if (!entry.tunnel_owned and workers_idle) {
                     self.startAttempt(index, entry.connection_state.generation, now_ms) catch {};
                 } else if (entry.tunnel_owned and workers_idle) {
                     const tunnel = entry.supervisor.getSnapshot();
@@ -948,7 +994,7 @@ pub const Manager = struct {
                 entry.failure_override = null;
                 if (!runtimeAdvertisesTargeting(entry)) {
                     try self.invalidateExecution(entry, .protocol, now_ms);
-                } else if (entry.isPaired() and entry.rpc_task == null and entry.access_task == null and
+                } else if (entry.usesDeviceCredential() and entry.rpc_task == null and entry.access_task == null and
                     accessTokenRefreshDue(entry, now_ms))
                 {
                     // Re-mint before expiry; the fresh token replaces the old
@@ -992,7 +1038,7 @@ pub const Manager = struct {
             entry.failure_override = .missing_credential;
             return error.MissingRuntimeCredential;
         }
-        if (entry.isPaired()) {
+        if (entry.usesDeviceCredential()) {
             // Access tokens are short lived and bound to the runtime session;
             // every attempt mints a fresh one from the device credential.
             _ = self.secrets.remove(entry.owned_profile.id);
@@ -1000,6 +1046,17 @@ pub const Manager = struct {
             entry.access_token_refresh_at_ms = null;
         }
 
+        if (entry.owned_profile.transport == .direct_https or entry.owned_profile.transport == .connect) {
+            const endpoint = directEndpoint(entry) orelse {
+                _ = try entry.connection_state.failAttempt(generation, .protocol, now_ms, reconnectJitter(entry, generation));
+                entry.failure_override = .unsupported_transport;
+                return error.UnsupportedRuntimeTransport;
+            };
+            _ = endpoint;
+            entry.tunnel_generation = generation;
+            entry.failure_override = null;
+            return;
+        }
         const local_port = self.selectUniquePort(index) catch |err| {
             _ = try entry.connection_state.failAttempt(
                 generation,
@@ -1012,7 +1069,7 @@ pub const Manager = struct {
         };
         const ssh = switch (entry.owned_profile.transport) {
             .ssh_tunnel => |ssh| ssh,
-            .local_socket, .connect => return error.UnsupportedRuntimeTransport,
+            .local_socket, .direct_https, .connect => return error.UnsupportedRuntimeTransport,
         };
         entry.supervisor.startWithBackend(
             self.allocator,
@@ -1046,31 +1103,29 @@ pub const Manager = struct {
                 reconnectJitter(entry, generation),
             );
             entry.failure_override = .missing_credential;
-            entry.supervisor.stop();
+            if (entry.tunnel_owned) entry.supervisor.stop();
             return;
         };
-        var bearer_lease = entry.supervisor.acquireBearerLease() catch {
-            _ = try entry.connection_state.failAttempt(
-                generation,
-                .network,
-                now_ms,
-                reconnectJitter(entry, generation),
-            );
-            entry.failure_override = .tunnel_readiness;
-            entry.supervisor.stop();
-            return;
-        };
-        defer bearer_lease.release();
+        var bearer_lease: ?tunnel_supervisor.BearerLease = if (entry.tunnel_owned)
+            entry.supervisor.acquireBearerLease() catch {
+                _ = try entry.connection_state.failAttempt(generation, .network, now_ms, reconnectJitter(entry, generation));
+                entry.failure_override = .tunnel_readiness;
+                entry.supervisor.stop();
+                return;
+            }
+        else
+            null;
+        defer if (bearer_lease) |*lease| lease.release();
         if (try entry.connection_state.beginHandshake(generation) == .stale) return;
 
         entry.handshake = HandshakeTask.start(
             self.allocator,
             generation,
-            entry.local_port orelse return error.MissingTunnelPort,
+            try transportTarget(entry),
             token,
             entry.connection_state.expectedRuntimeId(),
             self.dependencies.rpc_backend,
-            &bearer_lease,
+            if (bearer_lease) |*lease| lease else null,
         ) catch |err| {
             _ = try entry.connection_state.failAttempt(
                 generation,
@@ -1079,7 +1134,7 @@ pub const Manager = struct {
                 reconnectJitter(entry, generation),
             );
             entry.failure_override = .resource;
-            entry.supervisor.stop();
+            if (entry.tunnel_owned) entry.supervisor.stop();
             return err;
         };
     }
@@ -1087,7 +1142,7 @@ pub const Manager = struct {
     // With the tunnel up and no worker running, pick the next single relayed
     // call: grant exchange, access-token mint, or the identity handshake.
     fn advanceConnecting(self: *Manager, entry: *Entry, now_ms: u64) !void {
-        if (!entry.isPaired()) return self.startHandshake(entry, now_ms);
+        if (!entry.usesDeviceCredential()) return self.startHandshake(entry, now_ms);
         if (entry.pending_grant != null) return self.startAccessTask(entry, .pair_exchange, now_ms);
         // An exchanged identity waits for the user; keep the tunnel warm.
         if (entry.pairing_result != null) return;
@@ -1100,8 +1155,8 @@ pub const Manager = struct {
     fn startAccessTask(self: *Manager, entry: *Entry, kind: AccessTaskKind, now_ms: u64) !void {
         const generation = entry.tunnel_generation orelse return error.MissingTunnelGeneration;
         if (entry.access_task != null) return error.RuntimeRpcBusy;
-        if (entry.supervisor.getSnapshot().lifecycle != .running) return error.RelayNotReady;
-        const local_port = entry.local_port orelse return error.MissingTunnelPort;
+        if (entry.tunnel_owned and entry.supervisor.getSnapshot().lifecycle != .running) return error.RelayNotReady;
+        const target = try transportTarget(entry);
 
         var body: []u8 = undefined;
         var authorization: ?[]u8 = null;
@@ -1127,6 +1182,7 @@ pub const Manager = struct {
                 };
                 const device_id = switch (entry.owned_profile.access) {
                     .paired_device => |device| device.device_id orelse return error.MissingRuntimeCredential,
+                    .connect => |link| link.device_id orelse return error.MissingRuntimeCredential,
                     else => return error.ProfileAccessMismatch,
                 };
                 path = access_protocol.HTTP_ACCESS_TOKEN_PATH;
@@ -1137,7 +1193,7 @@ pub const Manager = struct {
         defer eraseAndFree(self.allocator, body);
         defer if (authorization) |value| eraseAndFree(self.allocator, value);
 
-        var bearer_lease = entry.supervisor.acquireBearerLease() catch {
+        var bearer_lease: ?tunnel_supervisor.BearerLease = if (entry.tunnel_owned) entry.supervisor.acquireBearerLease() catch {
             if (entry.connection_state.phase() == .ready) return error.BearerLeaseAlreadyHeld;
             _ = try entry.connection_state.failAttempt(
                 generation,
@@ -1148,17 +1204,17 @@ pub const Manager = struct {
             entry.failure_override = .tunnel_readiness;
             entry.supervisor.stop();
             return;
-        };
-        defer bearer_lease.release();
+        } else null;
+        defer if (bearer_lease) |*lease| lease.release();
         entry.access_task = AccessTask.start(
             generation,
             kind,
-            local_port,
+            target,
             path,
             authorization,
             body,
             self.dependencies.access_backend,
-            &bearer_lease,
+            if (bearer_lease) |*lease| lease else null,
         ) catch |err| {
             if (entry.connection_state.phase() != .ready) {
                 _ = try entry.connection_state.failAttempt(
@@ -1188,7 +1244,8 @@ pub const Manager = struct {
         defer worker_result.deinit(task_allocator);
         if (!entry.tunnel_owned and entry.handshake == null) entry.local_port = null;
 
-        const current = entry.tunnel_owned and entry.tunnel_generation == generation and
+        const current = entry.tunnel_generation == generation and
+            (!entry.tunnel_owned or entry.supervisor.getSnapshot().lifecycle == .running) and
             entry.connection_state.generation == generation and
             switch (entry.connection_state.phase()) {
                 .connecting, .ready => true,
@@ -1466,23 +1523,24 @@ pub const Manager = struct {
         if (entry.rpc_task != null) return error.RuntimeRpcBusy;
         if (entry.connection_state.phase() != .ready) return error.RuntimeNotExecutionReady;
         const generation = entry.connection_state.generation;
-        if (!entry.tunnel_owned or entry.tunnel_generation != generation) {
-            return error.RelayNotReady;
-        }
-        if (entry.supervisor.getSnapshot().lifecycle != .running) return error.RelayNotReady;
+        if (entry.tunnel_generation != generation) return error.RelayNotReady;
+        if (entry.tunnel_owned and entry.supervisor.getSnapshot().lifecycle != .running) return error.RelayNotReady;
         const token = self.secrets.get(entry.owned_profile.id) orelse
             return error.MissingRuntimeCredential;
-        var bearer_lease = try entry.supervisor.acquireBearerLease();
-        defer bearer_lease.release();
+        var bearer_lease: ?tunnel_supervisor.BearerLease = if (entry.tunnel_owned)
+            try entry.supervisor.acquireBearerLease()
+        else
+            null;
+        defer if (bearer_lease) |*lease| lease.release();
         entry.rpc_task = try RpcTask.start(
             generation,
             request_id,
             kind,
-            entry.local_port orelse return error.MissingTunnelPort,
+            try transportTarget(entry),
             token,
             request_json,
             self.dependencies.rpc_backend,
-            &bearer_lease,
+            if (bearer_lease) |*lease| lease else null,
         );
     }
 
@@ -1609,11 +1667,11 @@ const HandshakeResult = union(enum) {
 const HandshakeTask = struct {
     allocator: std.mem.Allocator,
     generation: u64,
-    local_port: u16,
+    target: OwnedTransportTarget,
     token: []u8,
     expected_runtime_id: ?[]u8,
     rpc_backend: RpcBackend,
-    bearer_lease: tunnel_supervisor.BearerLease,
+    bearer_lease: ?tunnel_supervisor.BearerLease,
     worker: ?std.Thread = null,
     state: std.atomic.Value(TaskState) = .init(.running),
     result: ?HandshakeResult = null,
@@ -1621,11 +1679,11 @@ const HandshakeTask = struct {
     fn start(
         allocator: std.mem.Allocator,
         generation: u64,
-        local_port: u16,
+        target: TransportTarget,
         token: []const u8,
         expected_runtime_id: ?[]const u8,
         rpc_backend: RpcBackend,
-        bearer_lease: *tunnel_supervisor.BearerLease,
+        bearer_lease: ?*tunnel_supervisor.BearerLease,
     ) !*HandshakeTask {
         _ = allocator;
         try rpc_backend.validateLifetime();
@@ -1634,6 +1692,8 @@ const HandshakeTask = struct {
         const task_allocator = std.heap.page_allocator;
         const task = try task_allocator.create(HandshakeTask);
         errdefer task_allocator.destroy(task);
+        var target_copy = try OwnedTransportTarget.clone(task_allocator, target);
+        errdefer target_copy.deinit(task_allocator);
         const token_copy = try task_allocator.dupe(u8, token);
         errdefer eraseAndFree(task_allocator, token_copy);
         const expected_copy = if (expected_runtime_id) |runtime_id|
@@ -1646,19 +1706,20 @@ const HandshakeTask = struct {
         task.* = .{
             .allocator = task_allocator,
             .generation = generation,
-            .local_port = local_port,
+            .target = target_copy,
             .token = token_copy,
             .expected_runtime_id = expected_copy,
             .rpc_backend = rpc_backend,
-            .bearer_lease = bearer_lease.take(),
+            .bearer_lease = if (bearer_lease) |lease| lease.take() else null,
         };
-        errdefer task.bearer_lease.release();
+        errdefer if (task.bearer_lease) |*lease| lease.release();
         task.worker = try std.Thread.spawn(.{}, handshakeWorker, .{task});
         return task;
     }
 
     fn releaseFields(self: *HandshakeTask) void {
         if (self.result) |*result| result.deinit();
+        self.target.deinit(self.allocator);
         eraseAndFree(self.allocator, self.token);
         if (self.expected_runtime_id) |runtime_id| self.allocator.free(runtime_id);
         self.rpc_backend.releaseContext();
@@ -1801,12 +1862,12 @@ const AccessTask = struct {
     allocator: std.mem.Allocator,
     generation: u64,
     kind: AccessTaskKind,
-    local_port: u16,
+    target: OwnedTransportTarget,
     path: []const u8,
     authorization: ?[]u8,
     body: []u8,
     access_backend: AccessBackend,
-    bearer_lease: tunnel_supervisor.BearerLease,
+    bearer_lease: ?tunnel_supervisor.BearerLease,
     worker: ?std.Thread = null,
     state: std.atomic.Value(TaskState) = .init(.running),
     result: ?AccessWorkerResult = null,
@@ -1814,17 +1875,19 @@ const AccessTask = struct {
     fn start(
         generation: u64,
         kind: AccessTaskKind,
-        local_port: u16,
+        target: TransportTarget,
         path: []const u8,
         authorization: ?[]const u8,
         body: []const u8,
         access_backend: AccessBackend,
-        bearer_lease: *tunnel_supervisor.BearerLease,
+        bearer_lease: ?*tunnel_supervisor.BearerLease,
     ) !*AccessTask {
         try access_backend.validateLifetime();
         const task_allocator = std.heap.page_allocator;
         const task = try task_allocator.create(AccessTask);
         errdefer task_allocator.destroy(task);
+        var target_copy = try OwnedTransportTarget.clone(task_allocator, target);
+        errdefer target_copy.deinit(task_allocator);
         const authorization_copy = if (authorization) |value| try task_allocator.dupe(u8, value) else null;
         errdefer if (authorization_copy) |value| eraseAndFree(task_allocator, value);
         const body_copy = try task_allocator.dupe(u8, body);
@@ -1835,20 +1898,21 @@ const AccessTask = struct {
             .allocator = task_allocator,
             .generation = generation,
             .kind = kind,
-            .local_port = local_port,
+            .target = target_copy,
             .path = path,
             .authorization = authorization_copy,
             .body = body_copy,
             .access_backend = access_backend,
-            .bearer_lease = bearer_lease.take(),
+            .bearer_lease = if (bearer_lease) |lease| lease.take() else null,
         };
-        errdefer task.bearer_lease.release();
+        errdefer if (task.bearer_lease) |*lease| lease.release();
         task.worker = try std.Thread.spawn(.{}, accessWorker, .{task});
         return task;
     }
 
     fn releaseFields(self: *AccessTask) void {
         if (self.result) |*result| result.deinit(self.allocator);
+        self.target.deinit(self.allocator);
         if (self.authorization) |value| eraseAndFree(self.allocator, value);
         eraseAndFree(self.allocator, self.body);
         self.access_backend.releaseContext();
@@ -1882,7 +1946,7 @@ fn accessWorker(task: *AccessTask) void {
     task.result = if (task.access_backend.call(
         task.access_backend.context,
         task.allocator,
-        task.local_port,
+        task.target.borrow(),
         task.path,
         task.authorization,
         task.body,
@@ -1893,7 +1957,7 @@ fn accessWorker(task: *AccessTask) void {
         }
         break :blk .{ .response = response };
     } else |err| .{ .failed = mapAccessFailure(err) };
-    task.bearer_lease.release();
+    if (task.bearer_lease) |*lease| lease.release();
     const previous = task.state.swap(.finished, .acq_rel);
     switch (previous) {
         .running => {},
@@ -1919,17 +1983,25 @@ fn mapAccessFailure(err: pair_client.Error) AccessFailure {
 fn callSystemAccess(
     _: ?*anyopaque,
     allocator: std.mem.Allocator,
-    local_port: u16,
+    target: TransportTarget,
     path: []const u8,
     authorization: ?[]const u8,
     body: []const u8,
 ) pair_client.Error![]u8 {
-    return pair_client.postAlloc(allocator, .{
-        .local_port = local_port,
-        .path = path,
-        .authorization = authorization,
-        .body = body,
-    });
+    return switch (target) {
+        .loopback => |port| pair_client.postAlloc(allocator, .{
+            .local_port = port,
+            .path = path,
+            .authorization = authorization,
+            .body = body,
+        }),
+        .direct_https => |url| pair_client.postDirectAlloc(allocator, .{
+            .https_url = url,
+            .path = path,
+            .authorization = authorization,
+            .body = body,
+        }),
+    };
 }
 
 const RpcTaskKind = union(enum) {
@@ -1960,11 +2032,11 @@ const RpcTask = struct {
     generation: u64,
     request_id: u64,
     kind: RpcTaskKind,
-    local_port: u16,
+    target: OwnedTransportTarget,
     token: []u8,
     request_json: []u8,
     rpc_backend: RpcBackend,
-    bearer_lease: tunnel_supervisor.BearerLease,
+    bearer_lease: ?tunnel_supervisor.BearerLease,
     worker: ?std.Thread = null,
     state: std.atomic.Value(TaskState) = .init(.running),
     result: ?RpcWorkerResult = null,
@@ -1973,16 +2045,18 @@ const RpcTask = struct {
         generation: u64,
         request_id: u64,
         kind: RpcTaskKind,
-        local_port: u16,
+        target: TransportTarget,
         token: []const u8,
         request_json: []const u8,
         rpc_backend: RpcBackend,
-        bearer_lease: *tunnel_supervisor.BearerLease,
+        bearer_lease: ?*tunnel_supervisor.BearerLease,
     ) !*RpcTask {
         try rpc_backend.validateLifetime();
         const task_allocator = std.heap.page_allocator;
         const task = try task_allocator.create(RpcTask);
         errdefer task_allocator.destroy(task);
+        var target_copy = try OwnedTransportTarget.clone(task_allocator, target);
+        errdefer target_copy.deinit(task_allocator);
         const token_copy = try task_allocator.dupe(u8, token);
         errdefer eraseAndFree(task_allocator, token_copy);
         const request_copy = try task_allocator.dupe(u8, request_json);
@@ -1994,19 +2068,20 @@ const RpcTask = struct {
             .generation = generation,
             .request_id = request_id,
             .kind = kind,
-            .local_port = local_port,
+            .target = target_copy,
             .token = token_copy,
             .request_json = request_copy,
             .rpc_backend = rpc_backend,
-            .bearer_lease = bearer_lease.take(),
+            .bearer_lease = if (bearer_lease) |lease| lease.take() else null,
         };
-        errdefer task.bearer_lease.release();
+        errdefer if (task.bearer_lease) |*lease| lease.release();
         task.worker = try std.Thread.spawn(.{}, rpcWorker, .{task});
         return task;
     }
 
     fn releaseFields(self: *RpcTask) void {
         if (self.result) |*result| result.deinit(self.allocator);
+        self.target.deinit(self.allocator);
         eraseAndFree(self.allocator, self.token);
         eraseAndFree(self.allocator, self.request_json);
         self.rpc_backend.releaseContext();
@@ -2045,7 +2120,7 @@ fn rpcWorker(task: *RpcTask) void {
     task.result = if (task.rpc_backend.call(
         task.rpc_backend.context,
         task.allocator,
-        task.local_port,
+        task.target.borrow(),
         task.token,
         task.request_json,
     )) |response| blk: {
@@ -2055,7 +2130,7 @@ fn rpcWorker(task: *RpcTask) void {
         }
         break :blk .{ .response = response };
     } else |err| .{ .failed = mapTransportFailure(err) };
-    task.bearer_lease.release();
+    if (task.bearer_lease) |*lease| lease.release();
     const previous = task.state.swap(.finished, .acq_rel);
     switch (previous) {
         .running => {},
@@ -2070,7 +2145,7 @@ fn rpcWorker(task: *RpcTask) void {
 
 const RpcBridge = struct {
     backend: RpcBackend,
-    local_port: u16,
+    target: TransportTarget,
     token: []const u8,
 
     fn send(
@@ -2082,7 +2157,7 @@ const RpcBridge = struct {
         return self.backend.call(
             self.backend.context,
             allocator,
-            self.local_port,
+            self.target,
             self.token,
             request_json,
         );
@@ -2092,7 +2167,7 @@ const RpcBridge = struct {
 fn handshakeWorker(task: *HandshakeTask) void {
     var bridge: RpcBridge = .{
         .backend = task.rpc_backend,
-        .local_port = task.local_port,
+        .target = task.target.borrow(),
         .token = task.token,
     };
     task.result = if (connection.performHandshakeAlloc(
@@ -2106,7 +2181,7 @@ fn handshakeWorker(task: *HandshakeTask) void {
         .resource;
     // Release the continuously bound port only after the bearer-bearing RPC
     // can no longer initiate or retry a loopback connection.
-    task.bearer_lease.release();
+    if (task.bearer_lease) |*lease| lease.release();
     const previous = task.state.swap(.finished, .acq_rel);
     switch (previous) {
         .running => {},
@@ -2131,15 +2206,23 @@ fn selectSystemLoopbackPort(_: ?*anyopaque, io: std.Io) anyerror!u16 {
 fn callSystemGateway(
     _: ?*anyopaque,
     allocator: std.mem.Allocator,
-    local_port: u16,
+    target: TransportTarget,
     bearer_token: []const u8,
     rpc_json: []const u8,
 ) connection.TransportError![]u8 {
-    return gateway_transport.callAlloc(allocator, .{
-        .local_port = local_port,
-        .bearer_token = bearer_token,
-        .rpc_json = rpc_json,
-    }) catch |err| switch (err) {
+    const response = switch (target) {
+        .loopback => |port| gateway_transport.callAlloc(allocator, .{
+            .local_port = port,
+            .bearer_token = bearer_token,
+            .rpc_json = rpc_json,
+        }),
+        .direct_https => |url| gateway_transport.callDirectAlloc(allocator, .{
+            .https_url = url,
+            .bearer_token = bearer_token,
+            .rpc_json = rpc_json,
+        }),
+    };
+    return response catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.AuthenticationRequired => error.AuthenticationRequired,
         error.RequestTimedOut => error.RequestTimedOut,
@@ -2256,15 +2339,21 @@ fn profileEndpointsEqual(current: profile.Profile, next: profile.Profile) bool {
     return switch (current.transport) {
         .local_socket => next.transport == .local_socket,
         .ssh_tunnel => |a| switch (next.transport) {
-            .local_socket, .connect => false,
+            .local_socket, .direct_https, .connect => false,
             .ssh_tunnel => |b| std.mem.eql(u8, a.host, b.host) and
                 a.port == b.port and
                 a.remote_gateway_port == b.remote_gateway_port and
                 ((a.user == null and b.user == null) or
                     (a.user != null and b.user != null and std.mem.eql(u8, a.user.?, b.user.?))),
         },
+        .direct_https => |a| switch (next.transport) {
+            .direct_https => |b| optionalStringsEqual(a.https_url, b.https_url) and
+                optionalStringsEqual(a.wss_url, b.wss_url) and
+                optionalStringsEqual(a.spki_sha256, b.spki_sha256),
+            .local_socket, .ssh_tunnel, .connect => false,
+        },
         .connect => |a| switch (next.transport) {
-            .local_socket, .ssh_tunnel => false,
+            .local_socket, .ssh_tunnel, .direct_https => false,
             .connect => |b| optionalStringsEqual(a.https_url, b.https_url) and
                 optionalStringsEqual(a.wss_url, b.wss_url) and
                 optionalStringsEqual(a.spki_sha256, b.spki_sha256),
@@ -2287,12 +2376,28 @@ fn clearHealth(entry: *Entry) void {
 fn rpcGenerationIsCurrent(entry: *const Entry, generation: u64) bool {
     if (entry.connection_state.phase() != .ready or
         entry.connection_state.generation != generation or
-        !entry.tunnel_owned or
         entry.tunnel_generation != generation)
     {
         return false;
     }
-    return entry.supervisor.getSnapshot().lifecycle == .running;
+    return !entry.tunnel_owned or entry.supervisor.getSnapshot().lifecycle == .running;
+}
+
+fn isDirectEntry(entry: *const Entry) bool {
+    return entry.owned_profile.transport == .direct_https or entry.owned_profile.transport == .connect;
+}
+
+fn directEndpoint(entry: *const Entry) ?[]const u8 {
+    return switch (entry.owned_profile.transport) {
+        .direct_https => |endpoint| endpoint.https_url,
+        .connect => |endpoint| endpoint.https_url,
+        .local_socket, .ssh_tunnel => null,
+    };
+}
+
+fn transportTarget(entry: *const Entry) !TransportTarget {
+    if (entry.tunnel_owned) return .{ .loopback = entry.local_port orelse return error.MissingTunnelPort };
+    return .{ .direct_https = directEndpoint(entry) orelse return error.MissingDirectEndpoint };
 }
 
 fn entryExecutionReady(entry: *const Entry) bool {
@@ -2325,6 +2430,7 @@ fn snapshotEntry(entry: *const Entry) Snapshot {
         .transport = switch (entry.owned_profile.transport) {
             .local_socket => .local_socket,
             .ssh_tunnel => .ssh_tunnel,
+            .direct_https => .direct_https,
             .connect => .connect,
         },
         .access = entry.owned_profile.access.kind(),
@@ -2338,6 +2444,7 @@ fn snapshotEntry(entry: *const Entry) Snapshot {
         .access_token_expires_at_ms = entry.access_token_expires_at_ms,
         .device_id = switch (entry.owned_profile.access) {
             .paired_device => |device| device.device_id,
+            .connect => |link| link.device_id,
             else => null,
         },
         .phase = entry.connection_state.phase(),
@@ -2437,6 +2544,14 @@ fn cloneProfile(allocator: std.mem.Allocator, source: profile.Profile) !profile.
                 .remote_gateway_port = ssh.remote_gateway_port,
             } };
         },
+        .direct_https => |endpoint| blk: {
+            var cloned: profile.DirectTransport = .{};
+            errdefer cloned.deinit(allocator);
+            if (endpoint.https_url) |value| cloned.https_url = try allocator.dupe(u8, value);
+            if (endpoint.wss_url) |value| cloned.wss_url = try allocator.dupe(u8, value);
+            if (endpoint.spki_sha256) |value| cloned.spki_sha256 = try allocator.dupe(u8, value);
+            break :blk .{ .direct_https = cloned };
+        },
         .connect => |endpoint| blk: {
             var cloned: profile.ConnectTransport = .{};
             errdefer cloned.deinit(allocator);
@@ -2475,7 +2590,16 @@ fn cloneAccess(allocator: std.mem.Allocator, source: profile.Access) !profile.Ac
             const url = try allocator.dupe(u8, link.control_plane_url);
             errdefer allocator.free(url);
             const link_id = if (link.link_id) |value| try allocator.dupe(u8, value) else null;
-            break :blk .{ .connect = .{ .control_plane_url = url, .link_id = link_id } };
+            errdefer if (link_id) |value| allocator.free(value);
+            const device_id = if (link.device_id) |value| try allocator.dupe(u8, value) else null;
+            errdefer if (device_id) |value| allocator.free(value);
+            const credential_ref = if (link.credential_ref) |value| try allocator.dupe(u8, value) else null;
+            break :blk .{ .connect = .{
+                .control_plane_url = url,
+                .link_id = link_id,
+                .device_id = device_id,
+                .credential_ref = credential_ref,
+            } };
         },
     };
 }
@@ -2581,7 +2705,7 @@ const TestRpc = struct {
     fn call(
         raw_context: ?*anyopaque,
         allocator: std.mem.Allocator,
-        local_port: u16,
+        target: TransportTarget,
         bearer_token: []const u8,
         rpc_json: []const u8,
     ) connection.TransportError![]u8 {
@@ -2600,10 +2724,13 @@ const TestRpc = struct {
         }
         while (!self.allow_return.load(.acquire)) std.atomic.spinLoopHint();
 
-        const runtime_id = if (local_port == 43_127) self.runtime_a else self.runtime_b;
-        if (parsed.request.target) |target| {
-            if (!std.mem.eql(u8, target.runtime_id, runtime_id) or
-                !std.mem.eql(u8, target.instance_id, TEST_INSTANCE))
+        const runtime_id = switch (target) {
+            .loopback => |port| if (port == 43_127) self.runtime_a else self.runtime_b,
+            .direct_https => self.runtime_a,
+        };
+        if (parsed.request.target) |request_target| {
+            if (!std.mem.eql(u8, request_target.runtime_id, runtime_id) or
+                !std.mem.eql(u8, request_target.instance_id, TEST_INSTANCE))
             {
                 self.valid_request.store(false, .release);
             }
@@ -2660,7 +2787,7 @@ const TargetRpc = struct {
     fn call(
         raw_context: ?*anyopaque,
         allocator: std.mem.Allocator,
-        _: u16,
+        _: TransportTarget,
         bearer_token: []const u8,
         rpc_json: []const u8,
     ) connection.TransportError![]u8 {

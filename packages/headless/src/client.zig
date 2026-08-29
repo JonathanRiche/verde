@@ -625,7 +625,7 @@ pub const Client = struct {
         try validateAccessResultHeader(result.access_protocol_version, result.runtime_id, result.instance_id);
         for (result.devices) |device| {
             try access_protocol.validateDeviceId(device.device_id);
-            try access_protocol.validateGrantId(device.grant_id);
+            if (device.grant_id) |grant_id| try access_protocol.validateGrantId(grant_id);
             try access_protocol.validateDeviceLabel(device.label);
             try access_protocol.validateScopeNames(device.scopes);
             if (device.created_at_ms < 0 or
@@ -683,12 +683,12 @@ pub const Client = struct {
         const result = try self.decodeStrictResult(connect_protocol.BootstrapConsumeResult, parsed);
         try validateConnectProtocolVersion(result.connect_protocol_version);
         try access_protocol.validateScopeNames(result.scopes);
-        if (!validConnectPrefixedId(result.grant_id, "grt_") or
-            !validConnectPrefixedId(result.device_id, "dev_") or
-            result.expires_at_ms < 0)
-        {
-            return error.InvalidConnectResponse;
-        }
+        protocol.validateRequestTarget(.{
+            .runtime_id = result.runtime_id,
+            .instance_id = result.instance_id,
+        }) catch return error.InvalidConnectResponse;
+        access_protocol.validateDeviceId(result.device_id) catch return error.InvalidConnectResponse;
+        access_protocol.validateSecret(result.device_credential.reveal()) catch return error.InvalidConnectResponse;
         return result;
     }
 
@@ -715,6 +715,7 @@ pub const Client = struct {
             .client_nonce = request.client_nonce,
             .device_id = request.device_id,
             .device_key_thumbprint = request.device_key_thumbprint,
+            .device_label = request.device_label,
         });
     }
 
@@ -1027,14 +1028,17 @@ test "Connect bootstrap uses only the explicit secret wire path" {
         .client_nonce = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         .device_id = "dev_33333333333333333333333333333333",
         .device_key_thumbprint = "kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k",
+        .device_label = "Connect laptop",
     };
-    const response = try protocol.encodeOkResponse(allocator, 1, connect_protocol.BootstrapConsumeResult{
-        .connect_protocol_version = connect_protocol.CONNECT_PROTOCOL_VERSION,
-        .grant_id = "grt_66666666666666666666666666666666",
-        .device_id = request.device_id,
-        .scopes = &.{ "runtime:read", "chat:write" },
-        .expires_at_ms = 1_893_456_090_000,
-    });
+    const response = try allocator.dupe(
+        u8,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"ok\":true,\"result\":{\"connect_protocol_version\":1," ++
+            "\"runtime_id\":\"0123456789abcdef0123456789abcdef\"," ++
+            "\"instance_id\":\"abcdef0123456789abcdef0123456789\"," ++
+            "\"device_id\":\"00112233445566778899aabbccddeeff\"," ++
+            "\"device_credential\":\"" ++ ("a" ** access_protocol.SECRET_HEX_BYTES) ++ "\"," ++
+            "\"scopes\":[\"runtime:read\",\"chat:write\"]}}",
+    );
     defer allocator.free(response);
     var mock: MockTransport = .{ .allocator = arena, .canned_response = response };
     defer mock.deinit();
@@ -1054,8 +1058,7 @@ test "Connect bootstrap uses only the explicit secret wire path" {
     try std.testing.expect(std.mem.indexOf(u8, mock.last_request.?, secret) != null);
     try std.testing.expect(std.mem.indexOf(u8, mock.last_request.?, connect_protocol.REDACTED_SECRET) == null);
     const result = try client.decodeConnectBootstrapConsume(&parsed);
-    try std.testing.expectEqualStrings("grt_66666666666666666666666666666666", result.grant_id);
-    try std.testing.expectEqualStrings(request.device_id, result.device_id);
+    try std.testing.expectEqualStrings("00112233445566778899aabbccddeeff", result.device_id);
 }
 
 test "client parses error envelope via injected transport" {
@@ -1169,6 +1172,27 @@ test "access result decoders are strict and keep generic secret rendering redact
     const missing_token = missing_version.response.result.?.object.get("pairing_token").?.string;
     defer std.crypto.secureZero(u8, @constCast(missing_token));
     try std.testing.expectError(error.MissingField, client.decodePairingGrantCreate(&missing_version));
+}
+
+test "device list accepts Connect devices without Pair grants and validates present grants" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var client = Client.initEncoder(arena);
+    const connect_response =
+        \\{"jsonrpc":"2.0","id":1,"result":{"access_protocol_version":1,"runtime_id":"0123456789abcdef0123456789abcdef","instance_id":"00112233445566778899aabbccddeeff","devices":[{"device_id":"fedcba9876543210fedcba9876543210","grant_id":null,"source":"connect","source_id":"grt_66666666666666666666666666666666","label":"Connect laptop","scopes":["runtime:read"],"created_at_ms":1000}]}}
+    ;
+    var connect = try protocol.parseResponse(arena, connect_response);
+    defer connect.deinit();
+    const devices = try client.decodeDeviceList(&connect);
+    try std.testing.expect(devices.devices[0].grant_id == null);
+
+    const invalid_pair_response =
+        \\{"jsonrpc":"2.0","id":2,"result":{"access_protocol_version":1,"runtime_id":"0123456789abcdef0123456789abcdef","instance_id":"00112233445566778899aabbccddeeff","devices":[{"device_id":"fedcba9876543210fedcba9876543210","grant_id":"not-a-grant","source":"pair","source_id":null,"label":"Paired laptop","scopes":["runtime:read"],"created_at_ms":1000}]}}
+    ;
+    var invalid_pair = try protocol.parseResponse(arena, invalid_pair_response);
+    defer invalid_pair.deinit();
+    try std.testing.expectError(error.InvalidGrantId, client.decodeDeviceList(&invalid_pair));
 }
 
 test "identity response errors retain their failure classification" {

@@ -1,4 +1,4 @@
-//! Bounded bearer-authenticated RPC transport for an SSH-forwarded Verde gateway.
+//! Bounded bearer-authenticated RPC transport for Verde gateways.
 
 const std = @import("std");
 
@@ -17,6 +17,22 @@ pub const Call = struct {
     timeout_ms: i64 = DEFAULT_TIMEOUT_MS,
 };
 
+/// HTTPS endpoint call used by Direct/Tailnet and Connect-resolved profiles.
+/// Zig's HTTP client performs normal CA-chain and hostname verification. It
+/// currently exposes no peer certificate/SPKI callback; descriptor SPKI is
+/// therefore checked for canonical form by the profile layer but is not used
+/// to weaken or replace PKIX verification.
+pub const DirectCall = struct {
+    https_url: []const u8,
+    bearer_token: []const u8,
+    rpc_json: []const u8,
+    timeout_ms: i64 = DEFAULT_TIMEOUT_MS,
+};
+
+pub const TLS_TRUST_BOUNDARY: []const u8 =
+    "Direct HTTPS requires a system-trusted certificate for the exact URL hostname; " ++
+    "runtime and instance identity are pinned separately after authenticated handshake.";
+
 /// POST one JSON-RPC frame to the authenticated gateway and return the
 /// caller-owned response. Tokens are borrowed for the call and never logged
 /// or retained by the transport.
@@ -31,6 +47,28 @@ pub fn callAlloc(allocator: std.mem.Allocator, call: Call) ![]u8 {
         allocator.free(authorization);
     }
     var response = try postLoopbackAlloc(allocator, .{
+        .url = url,
+        .authorization = authorization,
+        .body = call.rpc_json,
+        .timeout_ms = call.timeout_ms,
+    });
+    errdefer response.deinit(allocator);
+    try validateStatus(response.status);
+    return response.body;
+}
+
+/// POST one RPC directly over verified HTTPS. Redirects are rejected so a
+/// bearer can never be forwarded to a different origin.
+pub fn callDirectAlloc(allocator: std.mem.Allocator, call: DirectCall) ![]u8 {
+    try validateDirectCall(call);
+    const url = try endpointUrlAlloc(allocator, call.https_url, "/api/rpc");
+    defer allocator.free(url);
+    const authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{call.bearer_token});
+    defer {
+        std.crypto.secureZero(u8, authorization);
+        allocator.free(authorization);
+    }
+    var response = try postHttpsAlloc(allocator, .{
         .url = url,
         .authorization = authorization,
         .body = call.rpc_json,
@@ -62,14 +100,52 @@ pub const LoopbackResponse = struct {
     }
 };
 
+pub const HttpsPost = struct {
+    url: []const u8,
+    authorization: ?[]const u8,
+    body: []const u8,
+    timeout_ms: i64 = DEFAULT_TIMEOUT_MS,
+};
+
+/// Bounded HTTPS POST with strict PKIX/hostname verification and no redirects.
+pub fn postHttpsAlloc(allocator: std.mem.Allocator, post: HttpsPost) !LoopbackResponse {
+    if (!std.mem.startsWith(u8, post.url, "https://")) return error.InvalidDirectUrl;
+    const uri = std.Uri.parse(post.url) catch return error.InvalidDirectUrl;
+    if (uri.host == null or uri.user != null or uri.password != null or uri.fragment != null) {
+        return error.InvalidDirectUrl;
+    }
+    return fetchNetworkAlloc(allocator, .POST, post.url, post.authorization, post.body, post.timeout_ms);
+}
+
+pub fn getHttpsAlloc(allocator: std.mem.Allocator, url: []const u8, timeout_ms: i64) !LoopbackResponse {
+    if (!std.mem.startsWith(u8, url, "https://")) return error.InvalidDirectUrl;
+    const uri = std.Uri.parse(url) catch return error.InvalidDirectUrl;
+    if (uri.host == null or uri.user != null or uri.password != null or uri.fragment != null) return error.InvalidDirectUrl;
+    return fetchNetworkAlloc(allocator, .GET, url, null, null, timeout_ms);
+}
+
 pub fn postLoopbackAlloc(allocator: std.mem.Allocator, post: LoopbackPost) !LoopbackResponse {
     if (!std.mem.startsWith(u8, post.url, "http://127.0.0.1:")) return error.InvalidPort;
-    if (post.body.len == 0) return error.EmptyRequest;
-    if (post.body.len > MAX_RPC_FRAME_BYTES) return error.RequestTooLarge;
-    if (post.timeout_ms <= 0 or post.timeout_ms > MAX_TIMEOUT_MS) return error.InvalidTimeout;
+    return fetchNetworkAlloc(allocator, .POST, post.url, post.authorization, post.body, post.timeout_ms);
+}
+
+fn fetchNetworkAlloc(
+    allocator: std.mem.Allocator,
+    method: std.http.Method,
+    url: []const u8,
+    authorization: ?[]const u8,
+    body: ?[]const u8,
+    timeout_ms: i64,
+) !LoopbackResponse {
+    if (method == .POST and (body == null or body.?.len == 0)) return error.EmptyRequest;
+    if (body) |value| if (value.len > MAX_RPC_FRAME_BYTES) return error.RequestTooLarge;
+    if (timeout_ms <= 0 or timeout_ms > MAX_TIMEOUT_MS) return error.InvalidTimeout;
 
     const response_buffer = try allocator.alloc(u8, MAX_RPC_FRAME_BYTES);
-    defer allocator.free(response_buffer);
+    defer {
+        std.crypto.secureZero(u8, response_buffer);
+        allocator.free(response_buffer);
+    }
     var response_writer: std.Io.Writer = .fixed(response_buffer);
 
     var threaded: std.Io.Threaded = .init(allocator, .{});
@@ -86,14 +162,14 @@ pub fn postLoopbackAlloc(allocator: std.mem.Allocator, post: LoopbackPost) !Loop
     // ambient HTTP(S)_PROXY configuration.
 
     const fetch_options: std.http.Client.FetchOptions = .{
-        .location = .{ .url = post.url },
-        .method = .POST,
-        .payload = post.body,
+        .location = .{ .url = url },
+        .method = method,
+        .payload = body,
         .response_writer = &response_writer,
         .keep_alive = false,
         .redirect_behavior = .not_allowed,
         .headers = .{
-            .authorization = if (post.authorization) |value| .{ .override = value } else .omit,
+            .authorization = if (authorization) |value| .{ .override = value } else .omit,
             .content_type = .{ .override = "application/json" },
             .user_agent = .{ .override = "verde-desktop-runtime" },
         },
@@ -108,7 +184,7 @@ pub fn postLoopbackAlloc(allocator: std.mem.Allocator, post: LoopbackPost) !Loop
     select.async(.fetch, std.http.Client.fetch, .{ &client, fetch_options });
     select.async(.timeout, std.Io.sleep, .{
         threaded.io(),
-        std.Io.Duration.fromMilliseconds(post.timeout_ms),
+        std.Io.Duration.fromMilliseconds(timeout_ms),
         .awake,
     });
     defer select.cancelDiscard();
@@ -127,9 +203,35 @@ pub fn postLoopbackAlloc(allocator: std.mem.Allocator, post: LoopbackPost) !Loop
             return error.RequestTimedOut;
         },
     };
-    const body = try allocator.dupe(u8, response_writer.buffered());
-    std.crypto.secureZero(u8, response_buffer);
-    return .{ .status = result.status, .body = body };
+    const response_body = try allocator.dupe(u8, response_writer.buffered());
+    return .{ .status = result.status, .body = response_body };
+}
+
+fn validateDirectCall(call: DirectCall) !void {
+    try validateCall(.{
+        .local_port = 1,
+        .bearer_token = call.bearer_token,
+        .rpc_json = call.rpc_json,
+        .timeout_ms = call.timeout_ms,
+    });
+    if (!std.mem.startsWith(u8, call.https_url, "https://")) return error.InvalidDirectUrl;
+}
+
+pub fn endpointUrlAlloc(allocator: std.mem.Allocator, origin: []const u8, path: []const u8) ![]u8 {
+    if (!std.mem.startsWith(u8, origin, "https://") or path.len == 0 or path[0] != '/') {
+        return error.InvalidDirectUrl;
+    }
+    const trimmed = std.mem.trimEnd(u8, origin, "/");
+    const uri = std.Uri.parse(trimmed) catch return error.InvalidDirectUrl;
+    if (uri.host == null or uri.user != null or uri.password != null or uri.query != null or uri.fragment != null) {
+        return error.InvalidDirectUrl;
+    }
+    const origin_path = switch (uri.path) {
+        .raw => |value| value,
+        .percent_encoded => |value| value,
+    };
+    if (origin_path.len != 0) return error.InvalidDirectUrl;
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ trimmed, path });
 }
 
 /// Maps a Pair auth endpoint status to a transport-level outcome. 401/403 is
@@ -215,4 +317,14 @@ test "gateway status mapping keeps auth and redirect failures distinct" {
     try std.testing.expectError(error.DaemonUnavailable, validateStatus(.service_unavailable));
     try std.testing.expectError(error.RedirectRejected, validateStatus(.temporary_redirect));
     try std.testing.expectError(error.GatewayRejected, validateStatus(.not_found));
+}
+
+test "direct endpoint keeps credentials on one verified origin" {
+    const url = try endpointUrlAlloc(std.testing.allocator, "https://runtime.tailnet.ts.net/", "/api/rpc");
+    defer std.testing.allocator.free(url);
+    try std.testing.expectEqualStrings("https://runtime.tailnet.ts.net/api/rpc", url);
+    try std.testing.expectError(error.InvalidDirectUrl, endpointUrlAlloc(std.testing.allocator, "http://runtime.test", "/api/rpc"));
+    try std.testing.expectError(error.InvalidDirectUrl, endpointUrlAlloc(std.testing.allocator, "https://user@runtime.test", "/api/rpc"));
+    try std.testing.expectError(error.InvalidDirectUrl, endpointUrlAlloc(std.testing.allocator, "https://runtime.test/base", "/api/rpc"));
+    try std.testing.expectError(error.InvalidDirectUrl, endpointUrlAlloc(std.testing.allocator, "https://runtime.test?tenant=one", "/api/rpc"));
 }

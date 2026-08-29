@@ -51,10 +51,25 @@ pub fn initialize(conn: zqlite.Conn) !void {
         \\    last_used_at_ms integer,
         \\    revoked_at_ms integer
         \\);
+        \\create table if not exists runtime_connect_devices (
+        \\    device_id text primary key check(length(device_id) = 32),
+        \\    connect_grant_id text not null unique,
+        \\    connect_device_id text not null,
+        \\    device_key_thumbprint text not null,
+        \\    issuer text not null,
+        \\    credential_verifier blob not null check(length(credential_verifier) = 32),
+        \\    label text not null,
+        \\    scopes integer not null check(scopes > 0 and scopes <= 255),
+        \\    created_at_ms integer not null,
+        \\    last_used_at_ms integer,
+        \\    revoked_at_ms integer
+        \\);
         \\create index if not exists runtime_pairing_grants_created
         \\    on runtime_pairing_grants(created_at_ms desc);
         \\create index if not exists runtime_devices_created
         \\    on runtime_devices(created_at_ms desc);
+        \\create index if not exists runtime_connect_devices_created
+        \\    on runtime_connect_devices(created_at_ms desc);
     );
 }
 
@@ -144,7 +159,9 @@ pub const OwnedPairingGrantList = struct {
 
 pub const OwnedDevice = struct {
     device_id: []u8,
-    grant_id: []u8,
+    grant_id: ?[]u8,
+    source: access.DeviceSource,
+    source_id: ?[]u8,
     label: []u8,
     scope_mask: u16,
     created_at_ms: i64,
@@ -153,7 +170,8 @@ pub const OwnedDevice = struct {
 
     pub fn deinit(self: *OwnedDevice, allocator: std.mem.Allocator) void {
         allocator.free(self.device_id);
-        allocator.free(self.grant_id);
+        if (self.grant_id) |value| allocator.free(value);
+        if (self.source_id) |value| allocator.free(value);
         allocator.free(self.label);
         self.* = undefined;
     }
@@ -293,15 +311,10 @@ pub fn exchangePairingGrant(
         MAX_RETAINED_PAIRING_GRANTS,
         MAX_RETAINED_DEVICES - 1,
     );
-    if (try countRows(conn, "runtime_devices") >= MAX_RETAINED_DEVICES) {
+    if (try countAllDevices(conn) >= MAX_RETAINED_DEVICES) {
         return error.DeviceRetentionLimitReached;
     }
-    var active_devices_row = (try conn.row(
-        "select count(*) from runtime_devices where revoked_at_ms is null",
-        .{},
-    )).?;
-    const active_devices = active_devices_row.int(0);
-    active_devices_row.deinit();
+    const active_devices = try countActiveDevices(conn);
     if (active_devices >= MAX_ACTIVE_DEVICES) return error.TooManyActiveDevices;
 
     var issued: IssuedDevice = .{
@@ -310,6 +323,7 @@ pub fn exchangePairingGrant(
         .scope_mask = 0,
     };
     errdefer issued.clear();
+    if (try deviceIdExists(conn, issued.device_id[0..])) return error.RandomCollision;
 
     var device_verifier = secretVerifier(
         DEVICE_VERIFIER_DOMAIN,
@@ -340,6 +354,68 @@ pub fn exchangePairingGrant(
     return issued;
 }
 
+pub const ConnectDeviceInput = struct {
+    connect_grant_id: []const u8,
+    connect_device_id: []const u8,
+    device_key_thumbprint: []const u8,
+    issuer: []const u8,
+    device_label: []const u8,
+    scope_mask: u16,
+    now_ms: i64,
+};
+
+/// Issue and insert one Connect-sourced local verifier inside the caller's
+/// open transaction. The caller owns commit/rollback with grant consumption.
+pub fn issueConnectDeviceLocked(
+    io: std.Io,
+    conn: zqlite.Conn,
+    input: ConnectDeviceInput,
+) !IssuedDevice {
+    try validateNow(input.now_ms);
+    try access.validateDeviceLabel(input.device_label);
+    try access.validateScopeMask(input.scope_mask);
+    _ = try pruneLockedToLimits(
+        conn,
+        input.now_ms,
+        DEFAULT_RETENTION_MS,
+        MAX_RETAINED_PAIRING_GRANTS,
+        MAX_RETAINED_DEVICES - 1,
+    );
+    if (try countAllDevices(conn) >= MAX_RETAINED_DEVICES) return error.DeviceRetentionLimitReached;
+    if (try countActiveDevices(conn) >= MAX_ACTIVE_DEVICES) return error.TooManyActiveDevices;
+
+    var issued: IssuedDevice = .{
+        .device_id = try secureHex(access.DEVICE_ID_BYTES, io),
+        .device_credential = try secureHex(access.SECRET_BYTES, io),
+        .scope_mask = input.scope_mask,
+    };
+    errdefer issued.clear();
+    if (try deviceIdExists(conn, issued.device_id[0..])) return error.RandomCollision;
+    var verifier = secretVerifier(
+        DEVICE_VERIFIER_DOMAIN,
+        issued.device_id[0..],
+        issued.device_credential[0..],
+    );
+    defer std.crypto.secureZero(u8, verifier[0..]);
+    try conn.exec(
+        \\insert into runtime_connect_devices
+        \\    (device_id, connect_grant_id, connect_device_id, device_key_thumbprint,
+        \\     issuer, credential_verifier, label, scopes, created_at_ms)
+        \\values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+    , .{
+        issued.device_id[0..],
+        input.connect_grant_id,
+        input.connect_device_id,
+        input.device_key_thumbprint,
+        input.issuer,
+        zqlite.blob(verifier[0..]),
+        input.device_label,
+        @as(i64, input.scope_mask),
+        input.now_ms,
+    });
+    return issued;
+}
+
 /// Verify a device credential in constant time, enforce scope subset, record
 /// successful use, and return only the requested/granted mask. Keeping the
 /// device's broader authorization private prevents a token adapter from
@@ -361,14 +437,20 @@ pub fn authenticateDevice(
     var transaction_open = true;
     defer if (transaction_open) conn.rollback();
     var row = (try conn.row(
-        \\select credential_verifier, scopes, revoked_at_ms
-        \\from runtime_devices where device_id = ?1
+        \\select credential_verifier, scopes, revoked_at_ms, source from (
+        \\    select credential_verifier, scopes, revoked_at_ms, 'pair' as source
+        \\    from runtime_devices where device_id = ?1
+        \\    union all
+        \\    select credential_verifier, scopes, revoked_at_ms, 'connect' as source
+        \\    from runtime_connect_devices where device_id = ?1
+        \\)
     , .{device_id})) orelse return error.DeviceAuthenticationRejected;
     defer row.deinit();
 
     const stored_verifier = row.blob(0);
     const authorized_mask = try checkedScopeMask(row.int(1));
     const revoked_at_ms = row.nullableInt(2);
+    const source = row.text(3);
     var candidate = secretVerifier(DEVICE_VERIFIER_DOMAIN, device_id, device_credential);
     defer std.crypto.secureZero(u8, candidate[0..]);
     if (stored_verifier.len != candidate.len or
@@ -379,10 +461,17 @@ pub fn authenticateDevice(
         return error.DeviceAuthenticationRejected;
     }
 
-    try conn.exec(
-        "update runtime_devices set last_used_at_ms = ?2 where device_id = ?1 and revoked_at_ms is null",
-        .{ device_id, now_ms },
-    );
+    if (std.mem.eql(u8, source, "pair")) {
+        try conn.exec(
+            "update runtime_devices set last_used_at_ms = ?2 where device_id = ?1 and revoked_at_ms is null",
+            .{ device_id, now_ms },
+        );
+    } else if (std.mem.eql(u8, source, "connect")) {
+        try conn.exec(
+            "update runtime_connect_devices set last_used_at_ms = ?2 where device_id = ?1 and revoked_at_ms is null",
+            .{ device_id, now_ms },
+        );
+    } else return error.AccessStoreCorrupt;
     if (conn.changes() != 1) return error.DeviceAuthenticationRejected;
     try conn.commit();
     transaction_open = false;
@@ -401,7 +490,12 @@ pub fn authorizeDevice(
     const required_mask = access.scopeMask(required_scopes) catch
         return error.DeviceAuthorizationRejected;
     var row = (try conn.row(
-        "select scopes, revoked_at_ms from runtime_devices where device_id = ?1",
+        \\select scopes, revoked_at_ms from (
+        \\    select scopes, revoked_at_ms from runtime_devices where device_id = ?1
+        \\    union all
+        \\    select scopes, revoked_at_ms from runtime_connect_devices where device_id = ?1
+        \\)
+    ,
         .{device_id},
     )) orelse return error.DeviceAuthorizationRejected;
     defer row.deinit();
@@ -429,11 +523,22 @@ pub fn revokePairingGrant(conn: zqlite.Conn, grant_id: []const u8, now_ms: i64) 
 pub fn revokeDevice(conn: zqlite.Conn, device_id: []const u8, now_ms: i64) !bool {
     try access.validateDeviceId(device_id);
     try validateNow(now_ms);
+    try conn.execNoArgs("begin immediate");
+    var transaction_open = true;
+    defer if (transaction_open) conn.rollback();
     try conn.exec(
         "update runtime_devices set revoked_at_ms = ?2 where device_id = ?1 and revoked_at_ms is null",
         .{ device_id, now_ms },
     );
-    return conn.changes() == 1;
+    var changed = conn.changes();
+    try conn.exec(
+        "update runtime_connect_devices set revoked_at_ms = ?2 where device_id = ?1 and revoked_at_ms is null",
+        .{ device_id, now_ms },
+    );
+    changed += conn.changes();
+    try conn.commit();
+    transaction_open = false;
+    return changed > 0;
 }
 
 /// List only non-secret grant metadata for local administration.
@@ -511,6 +616,8 @@ pub fn listDevices(
         try items.append(allocator, .{
             .device_id = owned_device_id,
             .grant_id = owned_grant_id,
+            .source = .pair,
+            .source_id = null,
             .label = owned_label,
             .scope_mask = try checkedScopeMask(row.int(3)),
             .created_at_ms = row.int(4),
@@ -519,6 +626,37 @@ pub fn listDevices(
         });
     }
     if (rows.err) |err| return err;
+    var connect_rows = try conn.rows(
+        \\select device_id, connect_grant_id, label, scopes, created_at_ms,
+        \\       last_used_at_ms, revoked_at_ms
+        \\from runtime_connect_devices order by created_at_ms desc, device_id
+    , .{});
+    defer connect_rows.deinit();
+    while (connect_rows.next()) |row| {
+        const device_id = row.text(0);
+        const source_id = row.text(1);
+        const label = row.text(2);
+        try access.validateDeviceId(device_id);
+        try access.validateDeviceLabel(label);
+        const owned_device_id = try allocator.dupe(u8, device_id);
+        errdefer allocator.free(owned_device_id);
+        const owned_source_id = try allocator.dupe(u8, source_id);
+        errdefer allocator.free(owned_source_id);
+        const owned_label = try allocator.dupe(u8, label);
+        errdefer allocator.free(owned_label);
+        try items.append(allocator, .{
+            .device_id = owned_device_id,
+            .grant_id = null,
+            .source = .connect,
+            .source_id = owned_source_id,
+            .label = owned_label,
+            .scope_mask = try checkedScopeMask(row.int(3)),
+            .created_at_ms = row.int(4),
+            .last_used_at_ms = row.nullableInt(5),
+            .revoked_at_ms = row.nullableInt(6),
+        });
+    }
+    if (connect_rows.err) |err| return err;
     return .{ .items = try items.toOwnedSlice(allocator) };
 }
 
@@ -556,11 +694,28 @@ fn pruneLockedToLimits(
         \\where revoked_at_ms is not null and revoked_at_ms <= ?1
     , .{cutoff_ms});
     var devices_removed = conn.changes();
-    const device_excess = @max(@as(i64, 0), try countRows(conn, "runtime_devices") - device_limit);
+    try conn.exec(
+        \\delete from runtime_connect_devices
+        \\where revoked_at_ms is not null and revoked_at_ms <= ?1
+    , .{cutoff_ms});
+    devices_removed += conn.changes();
+    var device_excess = @max(@as(i64, 0), try countAllDevices(conn) - device_limit);
     if (device_excess > 0) {
         try conn.exec(
             \\delete from runtime_devices where device_id in (
             \\    select device_id from runtime_devices
+            \\    where revoked_at_ms is not null
+            \\    order by revoked_at_ms, created_at_ms, device_id
+            \\    limit ?1
+            \\)
+        , .{device_excess});
+        devices_removed += conn.changes();
+        device_excess = @max(@as(i64, 0), try countAllDevices(conn) - device_limit);
+    }
+    if (device_excess > 0) {
+        try conn.exec(
+            \\delete from runtime_connect_devices where device_id in (
+            \\    select device_id from runtime_connect_devices
             \\    where revoked_at_ms is not null
             \\    order by revoked_at_ms, created_at_ms, device_id
             \\    limit ?1
@@ -609,6 +764,31 @@ fn countRows(conn: zqlite.Conn, comptime table_name: []const u8) !i64 {
     const count = row.int(0);
     if (count < 0) return error.AccessStoreCorrupt;
     return count;
+}
+
+fn countAllDevices(conn: zqlite.Conn) !i64 {
+    return try countRows(conn, "runtime_devices") + try countRows(conn, "runtime_connect_devices");
+}
+
+fn countActiveDevices(conn: zqlite.Conn) !i64 {
+    var row = (try conn.row(
+        \\select
+        \\    (select count(*) from runtime_devices where revoked_at_ms is null) +
+        \\    (select count(*) from runtime_connect_devices where revoked_at_ms is null)
+    , .{})).?;
+    defer row.deinit();
+    const count = row.int(0);
+    if (count < 0) return error.AccessStoreCorrupt;
+    return count;
+}
+
+fn deviceIdExists(conn: zqlite.Conn, device_id: []const u8) !bool {
+    var row = (try conn.row(
+        \\select exists(select 1 from runtime_devices where device_id = ?1) or
+        \\       exists(select 1 from runtime_connect_devices where device_id = ?1)
+    , .{device_id})).?;
+    defer row.deinit();
+    return row.int(0) != 0;
 }
 
 fn checkedScopeMask(value: i64) !u16 {

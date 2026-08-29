@@ -17,7 +17,7 @@ Zig is the repository-pinned 0.16 toolchain from the root [`mise.toml`](../../mi
 
 ## Current security model
 
-The first remote release is loopback plus SSH only:
+The gateway supports two explicit request envelopes while its listener remains loopback-only:
 
 - `verde-web` rejects non-loopback binds.
 - An owner-only token file is required at startup.
@@ -26,10 +26,11 @@ The first remote release is loopback plus SSH only:
 - `GET /healthz` is the only unauthenticated health route and exposes liveness, not runtime inventory. `GET /login`, `GET /login.js`, and trusted static assets are public; unauthenticated app navigation redirects to `/login`.
 - The gateway talks only to `verde-sessionizer.sock`. It has no Desktop Live or mock fallback.
 - Arbitrary filesystem browsing and the legacy `/api/file` and `/api/preview` routes are not available.
+- Plain loopback requests support local use and SSH forwarding. Optional trusted-proxy mode accepts only the complete, exact forwarded HTTPS envelope for one configured origin, as used by Tailscale Serve; partial, mixed, duplicate, or standard `Forwarded` headers fail closed.
 
 Do not pass secrets through `--token`, `VERDE_WEB_TOKEN`, `?token=...`, or `X-Verde-Token`. Those legacy forms are rejected. Pass only a token-file path through `--token-file` or `VERDE_WEB_TOKEN_FILE`.
 
-Do not expose the gateway with a public bind, public firewall/NAT port, Cloudflare Tunnel, Tailscale Funnel/Serve, or a public reverse proxy. See [Standalone Daemon Deployment](../../docs/daemon-deployment.md) for the supported SSH-forwarded VM setup.
+Do not expose the gateway with a public bind, public firewall/NAT port, Tailscale Funnel, or an arbitrary public reverse proxy. Private Tailnet HTTPS through the ownership-checked `verde-server serve --tailscale` flow and SSH forwarding are supported; see [Standalone Daemon Deployment](../../docs/daemon-deployment.md) and [Verde Serve, Pair, and Connect](../../docs/serve-pair-connect.md).
 
 ## Build and checks
 

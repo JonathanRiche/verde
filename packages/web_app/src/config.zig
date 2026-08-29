@@ -9,6 +9,7 @@ pub const DEFAULT_PORT: u16 = 7420;
 pub const SESSIONIZER_SOCKET_NAME = "verde-sessionizer.sock";
 pub const SESSIONIZER_SOCKET_ENV = "VERDE_SESSIONIZER_SOCKET";
 pub const TOKEN_FILE_ENV = "VERDE_WEB_TOKEN_FILE";
+pub const TRUSTED_PROXY_ORIGIN_ENV = "VERDE_WEB_TRUSTED_PROXY_ORIGIN";
 
 host: []const u8 = DEFAULT_HOST,
 port: u16 = DEFAULT_PORT,
@@ -16,12 +17,15 @@ token_file: []const u8 = "",
 pref_path: []const u8 = "",
 sessionizer_endpoint: []const u8 = "",
 static_dir: []const u8 = "",
+/// Exact public HTTPS origin supplied by the only trusted loopback proxy.
+/// Empty keeps the original SSH/loopback request-envelope policy.
+trusted_proxy_origin: []const u8 = "",
 
-/// Parses the SSH-tunnel-only gateway configuration.
+/// Parses the loopback gateway and optional trusted HTTPS proxy profile.
 ///
 /// Authentication is deliberately file-based so secrets never appear in
-/// process arguments, URLs, or the inherited environment. The listener is
-/// limited to loopback; remote browsers connect through an SSH tunnel.
+/// process arguments, URLs, or the inherited environment. The listener stays
+/// on loopback for both SSH forwards and an explicitly named local proxy.
 pub fn parse(allocator: std.mem.Allocator, env: *const std.process.Environ.Map, args: []const []const u8) !Self {
     try rejectLegacyEnvironment(env);
 
@@ -31,6 +35,7 @@ pub fn parse(allocator: std.mem.Allocator, env: *const std.process.Environ.Map, 
     if (env.get(TOKEN_FILE_ENV)) |value| config.token_file = value;
     if (env.get("VERDE_PREF_PATH")) |value| config.pref_path = value;
     if (env.get("VERDE_WEB_STATIC")) |value| config.static_dir = value;
+    if (env.get(TRUSTED_PROXY_ORIGIN_ENV)) |value| config.trusted_proxy_origin = value;
     if (env.get(SESSIONIZER_SOCKET_ENV)) |value| config.sessionizer_endpoint = value;
 
     var index: usize = 1;
@@ -54,6 +59,8 @@ pub fn parse(allocator: std.mem.Allocator, env: *const std.process.Environ.Map, 
             config.sessionizer_endpoint = value;
         } else if (try takeValue(args, &index, arg, "--static")) |value| {
             config.static_dir = value;
+        } else if (try takeValue(args, &index, arg, "--trusted-proxy-origin")) |value| {
+            config.trusted_proxy_origin = value;
         } else {
             // Do not echo an unknown argument: it may contain a secret from a
             // caller using an obsolete `--token=<secret>` spelling.
@@ -63,9 +70,11 @@ pub fn parse(allocator: std.mem.Allocator, env: *const std.process.Environ.Map, 
 
     config.host = std.mem.trim(u8, config.host, &std.ascii.whitespace);
     config.token_file = std.mem.trim(u8, config.token_file, &std.ascii.whitespace);
+    config.trusted_proxy_origin = std.mem.trim(u8, config.trusted_proxy_origin, &std.ascii.whitespace);
     if (!isLoopback(config.host)) return error.NonLoopbackHost;
     if (std.ascii.eqlIgnoreCase(config.host, "localhost")) config.host = DEFAULT_HOST;
     if (config.token_file.len == 0) return error.TokenFileRequired;
+    if (config.trusted_proxy_origin.len > 0) try validateTrustedProxyOrigin(config.trusted_proxy_origin);
 
     if (config.pref_path.len == 0) {
         config.pref_path = try defaultPrefPath(allocator, env);
@@ -92,14 +101,36 @@ pub fn printUsage() void {
         \\  --pref-path <dir>     Verde data dir (default ~/.local/share/verde/Native)
         \\  --sessionizer <path>  Session-daemon unix socket
         \\  --static <dir>        Built Solid SPA directory
+        \\  --trusted-proxy-origin <https-origin>
+        \\                        Trust exact forwarded HTTPS host/origin from a loopback proxy
         \\
         \\Environment: VERDE_WEB_HOST, VERDE_WEB_PORT, VERDE_WEB_TOKEN_FILE,
-        \\VERDE_PREF_PATH, VERDE_WEB_STATIC, VERDE_SESSIONIZER_SOCKET
+        \\VERDE_PREF_PATH, VERDE_WEB_STATIC, VERDE_SESSIONIZER_SOCKET,
+        \\VERDE_WEB_TRUSTED_PROXY_ORIGIN
         \\
-        \\The first release accepts loopback listeners only. Connect a remote
-        \\browser with an SSH local-forward; direct network binds are rejected.
+        \\The listener always remains loopback-only. Use an SSH local-forward,
+        \\or explicitly name the HTTPS origin of one trusted loopback proxy.
         \\
     , .{});
+}
+
+/// Return the exact public authority configured for trusted proxy headers.
+pub fn trustedProxyAuthority(self: Self) ?[]const u8 {
+    if (self.trusted_proxy_origin.len == 0) return null;
+    return self.trusted_proxy_origin["https://".len..];
+}
+
+fn validateTrustedProxyOrigin(value: []const u8) !void {
+    if (!std.mem.startsWith(u8, value, "https://") or value.len <= "https://".len) {
+        return error.InvalidTrustedProxyOrigin;
+    }
+    for (value) |byte| if (byte < 0x21 or byte > 0x7e) return error.InvalidTrustedProxyOrigin;
+    const uri = std.Uri.parse(value) catch return error.InvalidTrustedProxyOrigin;
+    if (!std.mem.eql(u8, uri.scheme, "https") or uri.host == null or uri.host.?.isEmpty() or
+        uri.user != null or uri.password != null or !uri.path.isEmpty() or uri.query != null or uri.fragment != null)
+    {
+        return error.InvalidTrustedProxyOrigin;
+    }
 }
 
 pub fn isLoopback(host: []const u8) bool {
@@ -259,4 +290,29 @@ test "localhost bind normalizes to a numeric loopback address" {
     defer std.testing.allocator.free(parsed.sessionizer_endpoint);
     defer std.testing.allocator.free(parsed.static_dir);
     try std.testing.expectEqualStrings(DEFAULT_HOST, parsed.host);
+}
+
+test "trusted proxy mode requires one exact pathless HTTPS origin" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("HOME", "/tmp/verde-config-test");
+
+    const parsed = try parse(std.testing.allocator, &env, &.{
+        "verde-web",
+        "--token-file",
+        "/tmp/verde-token",
+        "--trusted-proxy-origin",
+        "https://runtime.example.test:8443",
+    });
+    defer std.testing.allocator.free(parsed.pref_path);
+    defer std.testing.allocator.free(parsed.sessionizer_endpoint);
+    defer std.testing.allocator.free(parsed.static_dir);
+    try std.testing.expectEqualStrings("runtime.example.test:8443", parsed.trustedProxyAuthority().?);
+
+    try std.testing.expectError(error.InvalidTrustedProxyOrigin, parse(std.testing.allocator, &env, &.{
+        "verde-web", "--token-file", "/tmp/verde-token", "--trusted-proxy-origin", "http://runtime.example.test",
+    }));
+    try std.testing.expectError(error.InvalidTrustedProxyOrigin, parse(std.testing.allocator, &env, &.{
+        "verde-web", "--token-file", "/tmp/verde-token", "--trusted-proxy-origin", "https://runtime.example.test/path",
+    }));
 }

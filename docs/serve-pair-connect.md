@@ -1,5 +1,47 @@
 # Verde Serve, Pair, and Connect
 
+## Quick start
+
+For a private tailnet runtime, install the complete Verde package, sign in to
+Tailscale on the server, then run:
+
+```sh
+verde-server serve --tailscale
+```
+
+This keeps `verde-web` on `127.0.0.1`, configures Tailscale Serve as the HTTPS
+terminator, installs the Linux systemd-user or macOS launchd service, and
+prints one self-contained import URL:
+
+```text
+verde://pair?host=https%3A%2F%2Fruntime.example.ts.net&grant_id=<32-hex>#code=<64-hex>
+```
+
+Open or paste that URL in Verde. The one-time code is in the fragment, never
+the query or an HTTP request. Tailscale's background Serve mapping and Verde's
+user service survive reboot. Verde refuses to replace an existing unrelated
+Serve mapping.
+
+For hosted or self-hosted Connect, configure the deployment's control-plane
+URL once (or export `VERDE_CONNECT_CONTROL_PLANE`) and run:
+
+```sh
+verde-server connect
+```
+
+The command opens or prints the OIDC device-authorization page, links the live
+runtime using its HTTPS metadata and certificate SPKI, saves only non-secret
+intent/public metadata, removes the provider bearer after linking, and offers
+background service installation. This open-source slice needs an existing
+externally reachable HTTPS endpoint: normally the saved Tailscale origin, or
+an advanced `--descriptor-file` supplied by the endpoint operator. It does not
+bundle a managed relay or tunnel. On a headless host use `--headless`; the OIDC
+provider must advertise RFC 8628 device authorization.
+
+External requirements are limited to a logged-in Tailscale client for the
+tailnet flow, or a configured Connect control plane, OIDC provider, and HTTPS
+domain/endpoint provider for Connect.
+
 Status: product and protocol contract with the first complete account-free
 Serve/Pair network-authentication slice implemented. The open-source boundary includes account-free
 Serve/Pair and a runnable self-hostable Connect reference control plane. A
@@ -19,14 +61,15 @@ Each device has at most one live access token and one unconsumed WebSocket
 ticket: issuing a replacement atomically invalidates the prior credential
 without consuming another device's bounded slot. A durable authorization
 rejection also clears that device's in-memory tokens and tickets.
-Direct non-loopback HTTPS remains a later slice. The native desktop pairs
-through the SSH-forwarded loopback transport today: Settings › Runtimes &
-connections › Add connection › **Pair this device** collects the grant id,
-masked one-time code, and device label, exchanges them over the forward, shows
-the returned runtime/instance identity for explicit confirmation, and then
-keeps only a credential reference in the profile (device credential in the OS
-Secret Service when available, otherwise process memory with a visible
-"pair again after relaunch" warning).
+Direct private HTTPS is implemented for Tailscale Serve. The server prints one
+`verde://pair` import URL containing the HTTPS origin and grant ID in the query
+and the one-time code only in the fragment. Opening or pasting it in the native
+desktop stages the direct profile, exchanges the grant over verified HTTPS,
+shows the returned runtime/instance identity for explicit confirmation, and
+then keeps only a credential reference in the profile (device credential in
+the OS Secret Service when available, otherwise process memory with a visible
+"pair again after relaunch" warning). SSH-forwarded Pair remains an advanced
+and recovery path.
 
 ## Three separate concerns
 
@@ -37,13 +80,13 @@ are not treated as one transport:
   daemon, network gateway, repositories, providers, chat turns, attachments,
   and PTYs.
 - **Pair** authorizes a device to use a directly reachable runtime and requires
-  no Verde account. The implemented path is an SSH-forwarded loopback endpoint;
-  approved administrator-provided or private-network HTTPS endpoints are the
-  next transport adapters.
+  no Verde account. The normal implemented path is Tailscale Serve terminating
+  HTTPS in front of the loopback-only gateway; SSH forwarding remains available.
 - **Connect** optionally links a runtime to a compatible control plane, either
-  self-hosted or operated by Verde Cloud. It gives a runtime behind NAT a
-  discoverable HTTPS/WSS endpoint through an outbound connector. It does not
-  create a second execution protocol.
+  self-hosted or operated by Verde Cloud. It makes an already reachable
+  HTTPS/WSS runtime discoverable to the same signed-in account and bootstraps
+  access to it. It does not create a second execution protocol or provide NAT
+  traversal.
 
 The desktop connection manager normalizes every access method into one
 authenticated runtime endpoint:
@@ -69,7 +112,7 @@ Implemented account-free commands:
 
 ```text
 verde-server init
-verde-server serve
+verde-server serve [--tailscale]
 verde-server status [--json]
 verde-server pair create [--expires 10m] [--label TEXT] [--json]
 verde-server pair list [--json]
@@ -77,6 +120,8 @@ verde-server pair revoke --id ID
 verde-server device list [--json]
 verde-server device revoke --id ID
 verde-server service install|status|update|uninstall
+verde-server connect [--headless] [--install-service]
+verde-server connect status|unlink|logout
 ```
 
 `verde-server serve` foreground-supervises `verde-daemon` and `verde-web` for
@@ -120,13 +165,15 @@ the runtime. `link` enables the desired linked state; `unlink` disables
 exposure while retaining authorization; `logout` also removes that
 authorization. The desktop implements control-plane discovery, OIDC PKCE
 sign-in, runtime inventory, selection, and endpoint pinning UI. The open-source
-reference service, v1 contract, self-host guide, runtime connector lifecycle,
-and external endpoint adapter are runnable now.
+reference service, v1 contract, self-host guide, runtime link lifecycle, and
+external endpoint adapter are runnable now.
 
-The `verde-server connect ...` convenience commands and the desktop's direct
-Connect HTTPS/WSS bootstrap and data-plane transport remain incomplete. No
-production managed-cloud or managed-tunnel implementation is claimed or
-bundled.
+`verde-server connect`, `connect status`, `connect unlink`, and `connect
+logout` wrap this lifecycle. `--control-plane`, `--descriptor-file`, and
+`--credential-file` remain advanced/testing overrides; the normal command has
+no required flags. No private managed-cloud implementation is bundled.
+
+## Advanced and manual deployment
 
 ## Direct pairing flow
 
@@ -140,11 +187,11 @@ a narrowly scoped, revocable device relationship.
    short expiry and stores only its verifier.
 3. The command prints the grant once. URL/QR output is opt-in because terminals,
    screenshots, shell capture, and OS URL dispatch can retain the secret.
-4. A Pair client generates or selects its device identity and submits the grant
-   directly to the advertised runtime endpoint. The desktop wizard's Pair step
-   does this over the SSH forward; there is no import string, the three grant
-   fields are typed or pasted (hex-filtered) and the code is wiped as soon as
-   the exchange starts.
+4. The normal Tailscale command prints a self-contained `verde://pair` URL.
+   Opening or pasting it in the desktop imports the HTTPS endpoint, grant ID,
+   and fragment-only code in one action. The code staging buffer is wiped as
+   soon as exchange starts. Manual grant fields and SSH forwarding remain an
+   advanced fallback.
 5. The runtime consumes the grant exactly once and creates a durable device
    record with explicit scopes.
 6. The client safeguards the returned device credential. The desktop stores it
@@ -201,7 +248,8 @@ The implemented loopback connection bootstrap is:
     -> 15-minute scoped runtime access token
     -> POST /auth/websocket-ticket
     -> single-use 30-second WebSocket ticket
-    -> WS through the approved SSH loopback tunnel with
+    -> WSS through direct verified HTTPS, or WS through the advanced SSH
+       loopback tunnel, with
        `Sec-WebSocket-Protocol: verde.v1,
        verde.ticket.<one-time-ticket>`
 ```
@@ -252,19 +300,15 @@ the daemon protocol.
 
 ## Direct endpoints
 
-The current Pair network path supports one safe arrangement:
+The current Pair network paths support Tailscale Serve terminating HTTPS in
+front of the loopback gateway and the existing SSH-to-loopback recovery path.
+The direct desktop transport performs normal CA/hostname verification and
+pins the returned Verde runtime/instance identity before execution.
 
-- the existing SSH-to-loopback gateway.
-
-The handlers and transport-neutral DTOs can be reused by a future HTTPS/WSS
-adapter with a certificate or SPKI identity that the desktop validates and
-pins alongside the Verde runtime identity.
-
-Plain public HTTP/WS is never a supported Internet deployment. The first HTTPS
-profile may rely on an administrator-managed reverse proxy or private-network
-TLS endpoint, but Verde must define and test the forwarded-origin, client-IP,
-body-bound, upgrade, timeout, and certificate-diagnostic contract before
-accepting a non-loopback listener.
+Plain public HTTP/WS is never supported. `verde-web` still refuses non-loopback
+binds. Trusted proxy mode accepts one exact configured HTTPS origin and
+requires unique normalized forwarded proto, host, and client-IP headers; the
+Tailscale CLI supplies that origin while Tailscale owns TLS.
 
 ## Open control-plane contract
 
@@ -335,11 +379,10 @@ The normalized version-1 service sequence is:
    consumption before minting runtime-local access. A grant is not a reusable
    runtime access token.
 5. **Unlink and revoke.** Unlinking is idempotent, disables new bootstrap
-   issuance, and tears down endpoint publication without deleting runtime data.
-   Grants, link credentials, device associations, connector enrollment, and
-   signer keys have explicit immutable IDs and revocation paths. Issuance and
-   exchange check current revocation state; short expiries bound an offline
-   runtime's exposure.
+   issuance, and removes endpoint publication without deleting runtime data.
+   Grants, link credentials, device associations, and signer keys have explicit
+   immutable IDs and revocation paths. Issuance and exchange check current
+   revocation state; short expiries bound an offline runtime's exposure.
 
 Control-plane signer discovery is separate from upstream OIDC discovery. It
 publishes the exact grant issuer, supported contract version and algorithms,
@@ -354,61 +397,55 @@ challenge issue/consume/failure, link/unlink, endpoint provision/rotation,
 bootstrap issue/consume/reject, revocation, and signer rotation. Events include
 stable actor, runtime, device, link, grant, request, and correlation IDs plus
 outcome and timestamp. They never include bearer values, signed grant bodies,
-provider credentials, connector enrollment secrets, prompt content, terminal
+provider credentials, endpoint-provider secrets, prompt content, terminal
 bytes, or file data. The reference service must expose an operator-owned audit
 sink/export path without making a Verde-operated telemetry service mandatory.
 
-## Endpoint-provider adapter
+## External endpoint adapter
 
-The reference control plane owns a provider-neutral adapter for provisioning,
-observing, rotating, and removing the HTTPS/WSS endpoint. The adapter returns a
-normalized endpoint descriptor and connector enrollment result; only the
-adapter sees provider-specific tunnel IDs and API shapes. Operators may supply
-an externally managed endpoint adapter, a self-hosted tunnel adapter, or a
-managed provider adapter without changing the desktop, runtime, or public
-control-plane contract.
+The reference control plane has a provider-neutral adapter for validating and
+publishing an HTTPS/WSS endpoint that the operator already manages. The
+adapter returns a normalized descriptor; provider-specific state stays behind
+the adapter and outside the desktop/runtime protocol. The bundled production
+adapter only validates an endpoint that already exists; it does not establish
+network reachability for the runtime.
 
-Provider API credentials remain control-plane-only secrets. A connector
-enrollment secret is a separate, high-value, rotatable credential returned
-only as compact `ECDH-ES` + `A256GCM` JWE encrypted to the exact runtime's
-linked X25519 key. Plaintext connector material is never stored or returned to
-the ordinary OIDC caller and must never appear in process arguments, logs,
-descriptors, or desktop responses. A remotely managed Cloudflare tunnel token
-is one example of such a secret; `cloudflared` may be supported behind an
-adapter, but Cloudflare identifiers, credentials, and lifecycle semantics are
-never part of the Verde contract.
+An operator can extend this boundary for infrastructure it controls, but any
+provider credentials remain control-plane-only secrets and must never appear
+in process arguments, logs, public descriptors, or desktop responses. That is
+an external deployment integration, not functionality bundled with
+`verde-server connect`.
 
-## Planned Connect flow
+## Connect flow
 
-The optional Connect path adds discovery and NAT traversal while preserving the
-runtime as the execution and credential authority:
+The optional Connect path adds account discovery and bootstrap while
+preserving the runtime as the execution and credential authority:
 
 1. The desktop and runtime select a compatible control-plane URL, validate its
    discovery metadata, and authenticate through the deployment's generic OIDC
    configuration.
 2. `connect link` creates durable local intent, obtains a one-time link
    challenge, and submits the runtime's signed proof.
-3. The control plane records the principal/runtime link. Its endpoint adapter
-   returns a stable normalized endpoint plus a short-lived connector enrollment
-   result.
-4. The server launches a pinned, verified outbound connector and supplies its
-   enrollment secret without argv or log exposure. No inbound port or SSH
-   session is required.
-5. A signed-in desktop discovers its runtime inventory and selects a normalized
+3. The control plane records the principal/runtime link and publishes the
+   normalized, externally reachable HTTPS/WSS descriptor supplied by the
+   runtime/operator.
+4. A signed-in desktop discovers its runtime inventory and selects a normalized
    descriptor without learning tunnel-provider state.
-6. The desktop sends a scoped bootstrap request. The control plane authorizes
+5. The desktop sends a scoped bootstrap request. The control plane authorizes
    it and returns a signed, short-lived, replay-protected grant.
-7. The runtime validates and atomically consumes that grant, intersects its
+6. The runtime validates and atomically consumes that grant, intersects its
    scopes with runtime-local policy, and mints one-time runtime bootstrap
    material for the requesting device.
-8. The desktop exchanges that material directly with the runtime, obtains
+7. The desktop exchanges that material directly with the runtime, obtains
    runtime access plus a WebSocket ticket, and opens the ordinary Verde WSS
    session.
 
 The control-plane API brokers identity, endpoint discovery, grants, revocation,
 audit, and runtime lifecycle metadata. Normal prompts, terminal bytes, files,
-and repository operations travel to the runtime through the provisioned
+and repository operations travel directly to the runtime through its existing
 endpoint; they are not executed or retained by the control-plane application.
+The endpoint must already be reachable by the desktop; Connect does not
+establish network reachability for it.
 
 ## Connection supervision
 
@@ -446,17 +483,12 @@ same connection driver and daemon client.
 4. **Network enforcement landed:** short-lived verifier-only access tokens,
    atomic one-use WebSocket tickets, prompt revocation/expiry checks, shared
    per-RPC scope enforcement, and `access.pair.v1` advertisement.
-5. **Desktop pairing landed:** grant entry, identity confirmation, credential
-   reference in the profile, OS credential-store persistence with an explicit
-   memory-only fallback, forget/re-pair from Settings and the runtime picker.
-   **Desktop Connect onboarding partially landed:** control-plane URL entry
-   with discovery validation, OIDC PKCE loopback sign-in, runtime inventory
-   and selection, and endpoint/SPKI pinning into the profile. Connecting is
-   still blocked: the desktop has no direct HTTPS/WSS data plane with SPKI
-   pinning, and the runtime exposes no HTTP surface that consumes a Connect
-   bootstrap grant (it is consumed only via daemon IPC). The UI shows that
-   blocker instead of a fake connected state.
-6. Direct HTTPS/WSS profile support and certificate diagnostics.
+5. **Desktop direct pairing landed:** one-link import, direct HTTPS/WSS,
+   identity confirmation, credential references, OS credential-store
+   persistence with an explicit memory-only fallback, and forget/re-pair.
+   Connect discovery and bootstrap reuse the same direct transport.
+6. Direct HTTPS/WSS profile support and certificate diagnostics landed for
+   private CA/hostname-verified endpoints including Tailscale Serve.
 7. Shared resolver/driver supervision across SSH and HTTPS.
 8. Reconnectable PTYs, attachments, repositories, and provider login parity.
 9. **Reference contract landed:** versioned OpenAPI/JSON Schema contract and
@@ -468,9 +500,8 @@ same connection driver and daemon client.
 11. **Runtime Connect lifecycle landed:** owner-only daemon RPC/CLI login,
     link, status, unlink, logout, durable identity-bound state, public-v1
     proof/enrollment/JWE handling, bootstrap-grant validation, and the
-    provider-neutral external/test connector seam. Desktop direct data-plane
-    transport and an optional production managed-tunnel adapter remain future
-    work behind the public interface.
+    provider-neutral external endpoint seam. Operators supply the reachable
+    HTTPS endpoint; no production tunnel runtime is bundled.
 12. Version-skew guidance and safe service installation/update lifecycle.
 
 The account-free Serve/Pair path is complete before Connect becomes a
