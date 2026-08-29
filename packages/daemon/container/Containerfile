@@ -23,7 +23,7 @@ ENV HOME=/home/verde \
     PATH=/opt/verde/bin:/home/verde/.local/bin:/usr/local/bin:/usr/bin:/bin \
     VERDE_DATA_DIR=/home/verde/.local/share/verde/runtime \
     VERDE_WEB_TOKEN_FILE=/home/verde/.config/verde/web-token \
-    VERDE_GATEWAY_PORT=6783 \
+    VERDE_GATEWAY_PORT=7420 \
     VERDE_MODE=runtime
 
 RUN install -d -o verde -g verde -m 0700 \

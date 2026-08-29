@@ -294,7 +294,7 @@ docker compose \
 
 The Compose service uses the host network intentionally while `verde-web`
 still binds only `127.0.0.1`. Consequently the VM's SSH server can reach
-`127.0.0.1:6783` for `ssh -W`, but Docker publishes no LAN-facing port. This
+`127.0.0.1:7420` for `ssh -W`, but Docker publishes no LAN-facing port. This
 mode has the same dedicated-VM/network-namespace trust requirement as the
 systemd setup. Do not use it on a host with mutually untrusted local users or
 containers. Confirm that the container engine's host-network mode behaves as
@@ -355,7 +355,7 @@ After=verde-daemon.service
 Type=simple
 UMask=0077
 UnsetEnvironment=VERDE_SESSIONIZER_SOCKET
-ExecStart=/opt/verde/bin/verde-web --host 127.0.0.1 --port 6783 --token-file %h/.config/verde/web-token --pref-path %h/.local/share/verde/runtime --static /opt/verde/share/verde/web
+ExecStart=/opt/verde/bin/verde-web --host 127.0.0.1 --port 7420 --token-file %h/.config/verde/web-token --pref-path %h/.local/share/verde/runtime --static /opt/verde/share/verde/web
 Restart=on-failure
 RestartSec=2s
 NoNewPrivileges=true
@@ -371,8 +371,8 @@ systemctl --user daemon-reload
 systemctl --user enable --now verde-web.service
 systemctl --user status verde-web.service
 journalctl --user -u verde-web.service -f
-ss -ltnp | rg '127\.0\.0\.1:6783'
-curl -fsS http://127.0.0.1:6783/healthz
+ss -ltnp | rg '127\.0\.0\.1:7420'
+curl -fsS http://127.0.0.1:7420/healthz
 ```
 
 `GET /healthz` is intentionally limited to liveness. `GET /login`, `GET /login.js`, and trusted built SPA assets are also public; unauthenticated app-shell navigation redirects to `/login`. Runtime inventory, RPC, and the exact `/ws` upgrade require either the authenticated browser session cookie or an authorization bearer. Browser login exchanges the administrator token for a bounded, in-memory, `HttpOnly; SameSite=Strict` session cookie. Raw tokens in query strings and `X-Verde-Token` headers are not accepted. The gateway has no production Live/mock fallback: it talks only to the configured headless session daemon.
@@ -381,28 +381,28 @@ The current SSH-loopback release uses HTTP at the browser's loopback endpoint, s
 
 ## Connect through SSH
 
-Leave the VM firewall closed to ports 6783 and 7420. From the client machine, create a loopback-only local forward using the user's normal SSH host-key policy:
+Leave the VM firewall closed to port 7420. From the client machine, create a loopback-only local forward using the user's normal SSH host-key policy:
 
 ```bash
 ssh -N -T \
   -o ExitOnForwardFailure=yes \
-  -L 127.0.0.1:6783:127.0.0.1:6783 \
+  -L 127.0.0.1:7420:127.0.0.1:7420 \
   verde-runtime
 ```
 
-Open `http://127.0.0.1:6783/login` and enter the token from the VM's token file. After the cookie is issued, the login page sends the browser to the SPA at `http://127.0.0.1:6783/`. Do not append `?token=...`.
+Open `http://127.0.0.1:7420/login` and enter the token from the VM's token file. After the cookie is issued, the login page sends the browser to the SPA at `http://127.0.0.1:7420/`. Do not append `?token=...`.
 
-This manual fixed-port `ssh -L` workflow trusts the client machine's local-user boundary. If SSH exits, another local process could bind port 6783 and impersonate that browser origin. Confirm the SSH process is still running before entering the token, and close the Verde browser tab immediately when the forward exits. The native desktop's managed transport uses a continuously Verde-owned listener relayed through `ssh -W`; this manual browser command does not gain that ownership guarantee.
+This manual fixed-port `ssh -L` workflow trusts the client machine's local-user boundary. If SSH exits, another local process could bind port 7420 and impersonate that browser origin. Confirm the SSH process is still running before entering the token, and close the Verde browser tab immediately when the forward exits. The native desktop's managed transport uses a continuously Verde-owned listener relayed through `ssh -W`; this manual browser command does not gain that ownership guarantee.
 
 ### Prepare and use a native desktop profile
 
-On the desktop machine, either the Settings › **Runtimes & connections** card (or **Add connection…** in the runtime picker under the prompt) or the offline CLI creates the non-secret connection profile. Both paths hold the same cross-process lock across the complete load-modify-save transaction and reread the document before adopting it. If you used the systemd unit above, its remote gateway port is `6783`:
+On the desktop machine, either the Settings › **Runtimes & connections** card (or **Add connection…** in the runtime picker under the prompt) or the offline CLI creates the non-secret connection profile. Both paths hold the same cross-process lock across the complete load-modify-save transaction and reread the document before adopting it. If you used the systemd unit above, its remote gateway port is `7420`:
 
 ```bash
 verde runtime add-ssh \
   --label "Build VM" \
   --host verde-runtime \
-  --gateway-port 6783
+  --gateway-port 7420
 
 verde runtime list --json
 verde runtime path

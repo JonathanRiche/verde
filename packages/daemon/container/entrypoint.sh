@@ -7,7 +7,7 @@ readonly server_bin=/opt/verde/bin/verde-server
 readonly static_dir=/opt/verde/share/verde/web
 readonly data_dir="${VERDE_DATA_DIR:-/home/verde/.local/share/verde/runtime}"
 readonly token_file="${VERDE_WEB_TOKEN_FILE:-/home/verde/.config/verde/web-token}"
-readonly gateway_port="${VERDE_GATEWAY_PORT:-6783}"
+readonly gateway_port="${VERDE_GATEWAY_PORT:-7420}"
 readonly mode="${VERDE_MODE:-runtime}"
 
 # Administrative startup must target the explicit container data directory,
