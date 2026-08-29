@@ -4,7 +4,7 @@ import { marked } from 'marked'
 import { decorateFileCitations } from '../lib/citations'
 import { chatImageUrl } from '../lib/live'
 import { clipboardImageFiles, store } from '../lib/store'
-import { type Attachment, type LivePane, type Message } from '../lib/types'
+import { type Attachment, type LivePane, type Message, isSubagentThreadId } from '../lib/types'
 import { effortLabel, effortOptionsIn, modelOptionsFor, modelSupportsFast, variantOptionsIn } from '../lib/models'
 import { handleFileCitationClick } from './FileViewer'
 import { Icon, ProviderGlyph, ZoomButton } from './Icons'
@@ -153,22 +153,34 @@ export function ChatPane(props: { pane: LivePane }) {
   // underlying message refs are unchanged must be reused verbatim — otherwise
   // every streamed delta remounts (and re-markdown-parses) the whole
   // transcript, which livelocks large threads.
-  type RenderItem = { kind: 'row'; message: Message } | { kind: 'group'; items: Message[] }
+  type RenderItem =
+    | { kind: 'row'; message: Message }
+    | { kind: 'group'; items: Message[]; groupKind: 'tool' | 'subagent' }
   const itemKey = (item: RenderItem) =>
-    item.kind === 'row' ? `r:${item.message.message_id}` : `g:${item.items[0]?.message_id ?? ''}`
+    item.kind === 'row' ? `r:${item.message.message_id}` : `g:${item.groupKind}:${item.items[0]?.message_id ?? ''}`
   const allItems = createMemo<RenderItem[]>((prev) => {
     const out: RenderItem[] = []
     let run: Message[] = []
+    let runKind: 'tool' | 'subagent' | null = null
     const flush = () => {
-      if (run.length >= 2) out.push({ kind: 'group', items: run })
-      else for (const message of run) out.push({ kind: 'row', message })
+      if (runKind === 'subagent' && run.length >= 1) {
+        out.push({ kind: 'group', items: run, groupKind: 'subagent' })
+      } else if (run.length >= 2) {
+        out.push({ kind: 'group', items: run, groupKind: 'tool' })
+      } else {
+        for (const message of run) out.push({ kind: 'row', message })
+      }
       run = []
+      runKind = null
     }
     for (const message of messages()) {
       // Internal Codex resume metadata is persisted for the daemon, but it is
       // not part of the user-facing web transcript.
       if (message.author === '__verde_codex_background_snapshot') continue
       if (isCommandCardRow(message)) {
+        const nextKind: 'tool' | 'subagent' = isSubagentCardRow(message) ? 'subagent' : 'tool'
+        if (runKind != null && runKind !== nextKind) flush()
+        runKind = nextKind
         run.push(message)
         continue
       }
@@ -260,13 +272,21 @@ export function ChatPane(props: { pane: LivePane }) {
   const workingSince = createMemo(
     () => messages().find((m) => m.message_id.endsWith('-stream'))?.created_at_ms ?? null,
   )
+  const subagent = () => isSubagentThreadId(props.pane.thread_id)
 
   return (
-    <section class="flex min-h-0 flex-1 flex-col bg-[var(--chat-black)]">
+    <section class={`flex min-h-0 flex-1 flex-col ${subagent() ? 'bg-[color-mix(in_srgb,var(--accent)_8%,var(--chat-black))]' : 'bg-[var(--chat-black)]'}`}>
       <header
-        class="hidden h-10 shrink-0 items-center gap-2 border-b border-[var(--border-muted)] px-3 lg:flex"
+        class={`hidden h-10 shrink-0 items-center gap-2 border-b px-3 lg:flex ${
+          subagent() ? 'border-[color-mix(in_srgb,var(--accent)_55%,var(--border-muted))]' : 'border-[var(--border-muted)]'
+        }`}
         onMouseDown={() => store.focusPane(props.pane)}
       >
+        <Show when={subagent()}>
+          <span class="shrink-0 rounded-full bg-[color-mix(in_srgb,var(--accent)_18%,transparent)] px-2 py-0.5 text-[11px] font-medium tracking-wide text-[var(--accent)]">
+            Subagent
+          </span>
+        </Show>
         <ProviderGlyph provider={props.pane.provider} />
         <div class="min-w-0 flex-1 truncate text-[14px] font-medium">{store.paneTitle(props.pane)}</div>
         <Show when={props.pane.send_pending}>
@@ -300,7 +320,7 @@ export function ChatPane(props: { pane: LivePane }) {
           <For each={items()}>
             {(item) =>
               item.kind === 'group'
-                ? <ToolCallGroup items={item.items} workingSince={workingSince()} />
+                ? <ToolCallGroup items={item.items} workingSince={workingSince()} groupKind={item.groupKind} pane={props.pane} />
                 : <TranscriptRow message={item.message} pane={props.pane} />}
           </For>
           <Show when={messages().length === 0}>
@@ -309,7 +329,9 @@ export function ChatPane(props: { pane: LivePane }) {
           </Show>
         </div>
       </div>
-      <Composer pane={props.pane} focused={focused()} />
+      <Show when={!subagent()} fallback={<SubagentComposerBanner />}>
+        <Composer pane={props.pane} focused={focused()} />
+      </Show>
     </section>
   )
 }
@@ -319,6 +341,19 @@ function EmptyTranscript() {
     <div class="px-2 py-16 text-[var(--text-subtle)]">
       <div class="wordmark text-[28px] text-[var(--text)]">Ask anything</div>
       <p class="mt-2 max-w-md text-[15px]">or use / to show available commands</p>
+    </div>
+  )
+}
+
+function SubagentComposerBanner() {
+  return (
+    <div class="min-w-0 bg-[var(--chat-black)] px-3 pb-[max(12px,var(--safe-bottom))] lg:px-5 lg:pb-[max(16px,var(--safe-bottom))]">
+      <div class="mx-auto w-full max-w-[900px] rounded-[14px] border border-[color-mix(in_srgb,var(--accent)_40%,var(--panel-muted))] bg-[color-mix(in_srgb,var(--accent)_8%,var(--panel))] px-4 py-3">
+        <div class="text-[14px] font-medium text-[var(--accent)]">Read-only subagent</div>
+        <p class="mt-1 text-[13px] text-[var(--text-muted)]">
+          This pane shows a child agent from the parent chat. Continue the work there.
+        </p>
+      </div>
     </div>
   )
 }
@@ -340,12 +375,17 @@ function isShellLikeBody(body: string): boolean {
 
 function isCommandCardRow(message: Message): boolean {
   if (message.role !== 'system') return false
+  if (message.tool_call_kind === 'subagent' || message.author === 'Subagent') return true
   if (message.tool_call_kind && message.tool_call_kind !== 'think') return true
   return (
     message.author === 'Ran command' ||
     message.author === 'Command failed' ||
     isShellLikeBody(message.body)
   )
+}
+
+function isSubagentCardRow(message: Message): boolean {
+  return message.tool_call_kind === 'subagent' || message.author === 'Subagent'
 }
 
 function commandFailed(message: Message): boolean {
@@ -414,9 +454,10 @@ function CopyPill(props: { payload: string }) {
   )
 }
 
-function CommandCard(props: { message: Message; child?: boolean }) {
+function CommandCard(props: { message: Message; child?: boolean; pane?: LivePane }) {
   const failed = () => commandFailed(props.message)
   const running = () => commandRunning(props.message)
+  const subagent = () => isSubagentCardRow(props.message)
   const [expanded, toggleExpanded] = usePersistedFlag(
     () => `cmd:${props.message.message_id}`,
     failed,
@@ -432,10 +473,16 @@ function CommandCard(props: { message: Message; child?: boolean }) {
   const visibleBody = () =>
     (showAll() ? bodyLines() : bodyLines().slice(0, TOOL_OUTPUT_COLLAPSED_LINES)).join('\n')
   const textColor = () => (failed() ? 'text-[var(--danger)]' : 'text-[var(--text-muted)]')
+  const openSubagent = (event: MouseEvent) => {
+    event.stopPropagation()
+    const pane = props.pane
+    if (!pane) return
+    void store.openSubagent(pane, props.message)
+  }
 
   return (
     <div
-      class={`min-w-0 border ${props.child ? 'rounded-[8px] bg-[#0b0f10] border-[rgba(60,71,76,0.73)]' : 'rounded-[10px] bg-[var(--panel-alt)] border-[var(--border-muted)]'} ${failed() ? '!border-[var(--danger)]' : ''}`}
+      class={`min-w-0 border ${props.child ? 'rounded-[8px] bg-[#0b0f10] border-[rgba(60,71,76,0.73)]' : 'rounded-[10px] bg-[var(--panel-alt)] border-[var(--border-muted)]'} ${failed() ? '!border-[var(--danger)]' : ''} ${subagent() ? '!border-[color-mix(in_srgb,var(--accent)_45%,var(--border-muted))]' : ''}`}
     >
       <button
         type="button"
@@ -454,6 +501,15 @@ function CommandCard(props: { message: Message; child?: boolean }) {
         </Show>
         <Show when={preview().length === 0}>
           <span class="min-w-0 flex-1" />
+        </Show>
+        <Show when={subagent() && props.pane}>
+          <button
+            type="button"
+            class="shrink-0 rounded-[5px] bg-[color-mix(in_srgb,var(--accent)_16%,transparent)] px-2.5 py-1 text-[11px] text-[var(--accent)] hover:bg-[color-mix(in_srgb,var(--accent)_28%,transparent)] hover:text-white"
+            onClick={openSubagent}
+          >
+            Open
+          </button>
         </Show>
         <CopyPill payload={props.message.body} />
         <Chevron open={expanded()} />
@@ -477,7 +533,7 @@ function CommandCard(props: { message: Message; child?: boolean }) {
 }
 
 // Grouped card: "N tool calls  ·  X completed  ·  Y failed  ·  Z running  ·  m:ss"
-function ToolCallGroup(props: { items: Message[]; workingSince: number | null }) {
+function ToolCallGroup(props: { items: Message[]; workingSince: number | null; groupKind: 'tool' | 'subagent'; pane: LivePane }) {
   const counts = createMemo(() => {
     let failed = 0
     let running = 0
@@ -488,12 +544,19 @@ function ToolCallGroup(props: { items: Message[]; workingSince: number | null })
     return { count: props.items.length, failed, running, completed: props.items.length - failed - running }
   })
   const [expanded, toggleExpanded] = usePersistedFlag(
-    () => `group:${props.items[0]?.message_id ?? ''}`,
+    () => `group:${props.groupKind}:${props.items[0]?.message_id ?? ''}`,
     () => counts().failed > 0,
   )
   const summary = () => {
     const { count, failed, running, completed } = counts()
-    const noun = count === 1 ? 'tool call' : 'tool calls'
+    const noun =
+      props.groupKind === 'subagent'
+        ? count === 1
+          ? 'subagent'
+          : 'subagents'
+        : count === 1
+          ? 'tool call'
+          : 'tool calls'
     const parts = [`${count} ${noun}`, `${completed} completed`]
     if (failed > 0) parts.push(`${failed} failed`)
     if (running > 0) parts.push(`${running} running`)
@@ -531,7 +594,7 @@ function ToolCallGroup(props: { items: Message[]; workingSince: number | null })
       </button>
       <Show when={expanded()}>
         <div class="flex flex-col gap-2 px-2.5 pb-2.5">
-          <For each={props.items}>{(message) => <CommandCard message={message} child />}</For>
+          <For each={props.items}>{(message) => <CommandCard message={message} child pane={props.pane} />}</For>
         </div>
       </Show>
     </div>
@@ -740,7 +803,7 @@ function TranscriptRow(props: { message: Message; pane: LivePane }) {
     return <DiffCard message={props.message} pane={props.pane} />
   }
   if (isCommandCardRow(props.message)) {
-    return <CommandCard message={props.message} />
+    return <CommandCard message={props.message} pane={props.pane} />
   }
 
   const mine = props.message.role === 'user'

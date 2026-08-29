@@ -483,6 +483,43 @@ pub const Project = struct {
         return std.mem.eql(u8, local_id, thread.local_thread_id);
     }
 
+    pub fn isSubagentThread(_: *const Project, thread: *const ChatThread) bool {
+        return thread.isSubagentView();
+    }
+
+    /// Resolves or creates the GUI-local child-agent pane for a parent tool call.
+    /// Does not change the selected thread or workspace layout.
+    pub fn ensureSubagentThread(
+        self: *Project,
+        allocator: std.mem.Allocator,
+        parent: *const ChatThread,
+        identity: []const u8,
+        title: []const u8,
+    ) !usize {
+        var local_id: ?[:0]u8 = try chat_types.mintSubagentLocalThreadId(allocator, parent.local_thread_id, identity);
+        errdefer if (local_id) |id| allocator.free(id);
+        const minted = local_id.?;
+        for (self.threads.items, 0..) |*thread, index| {
+            if (std.mem.eql(u8, thread.local_thread_id, minted)) {
+                allocator.free(minted);
+                local_id = null;
+                if (title.len > 0) try thread.setTitleText(allocator, title);
+                return index;
+            }
+        }
+
+        var thread = try ChatThread.init(allocator, if (title.len > 0) title else "Subagent");
+        errdefer thread.deinit(allocator);
+        try copyChatSessionSettings(allocator, &thread, parent);
+        allocator.free(thread.local_thread_id);
+        thread.local_thread_id = minted;
+        local_id = null;
+        thread.committed = true;
+        try self.threads.append(allocator, thread);
+        self.invalidateSidebarThreadCache();
+        return self.threads.items.len - 1;
+    }
+
     /// Removes the eager-created Companion rows produced by the phase-two
     /// prototype, but only when no durable or live owner can observe them.
     pub fn cleanupPristineLegacyCompanion(self: *Project, allocator: std.mem.Allocator) bool {
@@ -778,7 +815,7 @@ pub const Project = struct {
     pub fn committedThreadCount(self: *const Project) usize {
         var count: usize = 0;
         for (self.threads.items) |thread| {
-            if (thread.committed and !self.isCompanionThread(&thread)) count += 1;
+            if (thread.committed and !self.isCompanionThread(&thread) and !self.isSubagentThread(&thread)) count += 1;
         }
         return count;
     }
@@ -822,7 +859,7 @@ pub const Project = struct {
         self.sidebar_committed_thread_count = 0;
 
         for (self.threads.items, 0..) |thread, index| {
-            if (!thread.committed or self.isCompanionThread(&thread)) continue;
+            if (!thread.committed or self.isCompanionThread(&thread) or self.isSubagentThread(&thread)) continue;
             self.sidebar_committed_thread_count += 1;
             self.sidebar_thread_indices.append(allocator, index) catch {
                 self.sidebar_thread_cache_dirty = true;
@@ -867,6 +904,26 @@ fn terminalProcessOutcomeStatus(finish: TerminalProcessFinish) TerminalProcessOu
     if (finish.exit_code) |exit_code| return if (exit_code == 0) .completed else .failed;
     if (finish.signal != null) return .crashed;
     return .unknown;
+}
+
+fn copyChatSessionSettings(allocator: std.mem.Allocator, dest: *ChatThread, src: *const ChatThread) !void {
+    dest.provider = src.provider;
+    dest.harness = src.harness;
+    dest.fast_mode = src.fast_mode;
+    dest.access_mode = src.access_mode;
+    dest.reasoning_effort = src.reasoning_effort;
+    if (dest.model_ref) |existing| allocator.free(existing);
+    dest.model_ref = null;
+    dest.model_ref = if (src.model_ref) |model| try allocator.dupeZ(u8, model) else null;
+    if (dest.opencode_reasoning_variant) |existing| allocator.free(existing);
+    dest.opencode_reasoning_variant = null;
+    dest.opencode_reasoning_variant = if (src.opencode_reasoning_variant) |variant|
+        try allocator.dupeZ(u8, variant)
+    else
+        null;
+    if (dest.cwd) |existing| allocator.free(existing);
+    dest.cwd = null;
+    dest.cwd = if (src.cwd) |cwd| try allocator.dupeZ(u8, cwd) else null;
 }
 
 fn appendOwnedString(allocator: std.mem.Allocator, list: *std.ArrayList([]u8), value: []const u8) !void {
@@ -1151,6 +1208,30 @@ test "committed Companion is absent from sidebar cache" {
     const indices = project.sortedCommittedThreadIndices(allocator);
     try std.testing.expectEqual(@as(usize, 1), indices.len);
     try std.testing.expect(!project.isCompanionThread(&project.threads.items[indices[0]]));
+}
+
+test "subagent threads reuse identity and stay out of the sidebar" {
+    const allocator = std.testing.allocator;
+    var project = try Project.init(allocator, "subagent-sidebar", "Subagent", "/tmp/subagent-sidebar", 0);
+    defer project.deinit(allocator);
+    project.threads.items[0].committed = true;
+    project.threads.items[0].provider = .opencode;
+    const selected_before = project.selected_thread_index;
+
+    const first = try project.ensureSubagentThread(allocator, &project.threads.items[0], "call-1", "Explore site");
+    const first_id = try allocator.dupe(u8, project.threads.items[first].local_thread_id);
+    defer allocator.free(first_id);
+    const repeated = try project.ensureSubagentThread(allocator, &project.threads.items[0], "call-1", "Explore site");
+    try std.testing.expectEqual(first, repeated);
+    try std.testing.expect(project.threads.items[first].isSubagentView());
+    try std.testing.expectEqual(selected_before, project.selected_thread_index);
+    try std.testing.expectEqual(.opencode, project.threads.items[first].provider);
+
+    project.invalidateSidebarThreadCache();
+    try std.testing.expectEqual(@as(usize, 1), project.committedThreadCount());
+    const indices = project.sortedCommittedThreadIndices(allocator);
+    try std.testing.expectEqual(@as(usize, 1), indices.len);
+    try std.testing.expect(!project.isSubagentThread(&project.threads.items[indices[0]]));
 }
 
 test "legacy pristine Companion cleanup repairs non-last indexes" {

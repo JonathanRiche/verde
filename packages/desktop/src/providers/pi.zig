@@ -864,6 +864,7 @@ fn emitToolCall(request: provider_types.SendPromptRequest, update: provider_type
 }
 
 fn toolCallKindForName(tool_name: []const u8) provider_types.ToolCallKind {
+    if (provider_types.isSubagentToolName(tool_name)) return .subagent;
     if (std.mem.eql(u8, tool_name, "read")) return .read;
     if (std.mem.eql(u8, tool_name, "edit")) return .edit;
     if (std.mem.eql(u8, tool_name, "write")) return .edit;
@@ -1702,6 +1703,8 @@ test "pi tool kinds map builtin tool names" {
     try std.testing.expectEqual(provider_types.ToolCallKind.edit, toolCallKindForName("edit"));
     try std.testing.expectEqual(provider_types.ToolCallKind.edit, toolCallKindForName("write"));
     try std.testing.expectEqual(provider_types.ToolCallKind.execute, toolCallKindForName("bash"));
+    try std.testing.expectEqual(provider_types.ToolCallKind.subagent, toolCallKindForName("TaskExecute"));
+    try std.testing.expectEqual(provider_types.ToolCallKind.subagent, toolCallKindForName("Agent"));
     try std.testing.expectEqual(provider_types.ToolCallKind.other, toolCallKindForName("custom_tool"));
 }
 
