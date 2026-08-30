@@ -3263,6 +3263,10 @@ pub const RuntimePickerProfile = struct {
     }
 };
 
+fn runtimeProfileVisibleInPicker(snapshot: RuntimeService.Snapshot) bool {
+    return snapshot.transport != .local_socket;
+}
+
 pub fn runtimePickerStatus(snapshot: RuntimeService.Snapshot) RuntimePickerStatus {
     if (snapshot.identity_pin_required) return .trust_required;
     return switch (snapshot.phase) {
@@ -3282,7 +3286,7 @@ pub fn runtimePickerStatus(snapshot: RuntimeService.Snapshot) RuntimePickerStatu
             .rate_limited => .rate_limited,
         } else if (snapshot.access == .connect and (snapshot.device_id == null or !snapshot.device_credential_held))
             .runtime_selection_required
-        else if (snapshot.access == .paired_device and !snapshot.credential_held and snapshot.pairing_state == .none)
+        else if (snapshot.access == .paired_device and !snapshot.device_credential_held and snapshot.pairing_state == .none)
             .pairing_required
         else if (snapshot.phase == .disabled) .offline else .failed,
     };
@@ -3295,7 +3299,7 @@ fn runtimeActivationAction(snapshot: RuntimeService.Snapshot) RuntimeActivationA
             return if (snapshot.access == .paired_device) .request_pairing else .request_credential;
         }
     }
-    if (snapshot.access == .paired_device and !snapshot.credential_held and snapshot.pairing_state == .none) {
+    if (snapshot.access == .paired_device and !snapshot.device_credential_held and snapshot.pairing_state == .none) {
         return .request_pairing;
     }
     return switch (snapshot.phase) {
@@ -4527,9 +4531,9 @@ pub const AppState = struct {
         for (snapshots) |snapshot| {
             // Local is a built-in route. A profile document can contain one
             // local-socket migration row, but it must not create a duplicate
-            // Local choice or imply that the unsupported manager transport is
-            // independently connectable.
-            if (snapshot.transport != .ssh_tunnel) continue;
+            // Local choice. SSH, Direct, and Connect profiles are all valid
+            // remote choices and must survive a desktop relaunch.
+            if (!runtimeProfileVisibleInPicker(snapshot)) continue;
             try configured.ensureUnusedCapacity(self.allocator, 1);
             configured.appendAssumeCapacity(.{
                 .profile_id = try self.allocator.dupe(u8, snapshot.profile_id),
@@ -14835,6 +14839,32 @@ test "runtime picker status maps lifecycle and trust states" {
     try std.testing.expectEqual(RuntimePickerStatus.trust_required, runtimePickerStatus(snapshot));
 }
 
+test "runtime picker retains every configured remote transport after relaunch" {
+    var snapshot: RuntimeService.Snapshot = .{
+        .profile_id = "profile-remote",
+        .label = "Remote",
+        .transport = .ssh_tunnel,
+        .phase = .disabled,
+        .failure = null,
+        .retry_at_ms = null,
+        .local_port = null,
+        .tunnel_lifecycle = .stopped,
+        .tunnel_pid = null,
+        .runtime = null,
+        .identity_pin_required = false,
+        .rpc_in_flight = false,
+        .last_heartbeat_ms = null,
+        .execution_ready = false,
+    };
+    try std.testing.expect(runtimeProfileVisibleInPicker(snapshot));
+    snapshot.transport = .direct_https;
+    try std.testing.expect(runtimeProfileVisibleInPicker(snapshot));
+    snapshot.transport = .connect;
+    try std.testing.expect(runtimeProfileVisibleInPicker(snapshot));
+    snapshot.transport = .local_socket;
+    try std.testing.expect(!runtimeProfileVisibleInPicker(snapshot));
+}
+
 test "runtime onboarding transitions require credentials and explicit trust" {
     var snapshot: RuntimeService.Snapshot = .{
         .profile_id = "profile-remote",
@@ -15052,6 +15082,34 @@ test "workspace runtime default affects future drafts while each thread can over
         remote_profile_id,
         state.workspaceRuntimeDefaultProfile(workspace_id),
     );
+}
+
+test "paired runtime restart uses the durable device credential before minting an access token" {
+    var snapshot: RuntimeService.Snapshot = .{
+        .profile_id = "profile-paired",
+        .label = "Paired",
+        .transport = .direct_https,
+        .phase = .disabled,
+        .failure = null,
+        .retry_at_ms = null,
+        .local_port = null,
+        .tunnel_lifecycle = .stopped,
+        .tunnel_pid = null,
+        .runtime = null,
+        .identity_pin_required = false,
+        .rpc_in_flight = false,
+        .last_heartbeat_ms = null,
+        .credential_held = false,
+        .device_credential_held = true,
+        .execution_ready = false,
+        .access = .paired_device,
+    };
+    try std.testing.expectEqual(RuntimePickerStatus.offline, runtimePickerStatus(snapshot));
+    try std.testing.expectEqual(RuntimeActivationAction.enable, runtimeActivationAction(snapshot));
+
+    snapshot.device_credential_held = false;
+    try std.testing.expectEqual(RuntimePickerStatus.pairing_required, runtimePickerStatus(snapshot));
+    try std.testing.expectEqual(RuntimeActivationAction.request_pairing, runtimeActivationAction(snapshot));
 }
 
 test "background task action hits remain valid for pending transcript events" {

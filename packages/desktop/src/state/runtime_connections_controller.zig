@@ -727,6 +727,7 @@ fn submitDirectPairForm(self: anytype, service: *RuntimeService) void {
         .add => {
             const id = service.createDirectPairedProfile(self.allocator, rc.fieldValue(.label), url) catch |err| {
                 setNotice(&rc.wizard_notice_storage, saveFailureMessage(err));
+                log.warn("direct paired runtime profile create failed: {s}", .{@errorName(err)});
                 self.markDirty();
                 return;
             };
@@ -740,6 +741,7 @@ fn submitDirectPairForm(self: anytype, service: *RuntimeService) void {
             const profile_id = rc.wizard_profile_id orelse return;
             const replacement = service.updateDirectPairedProfile(profile_id, rc.fieldValue(.label), url) catch |err| {
                 setNotice(&rc.wizard_notice_storage, saveFailureMessage(err));
+                log.warn("direct paired runtime profile update failed: {s}", .{@errorName(err)});
                 self.markDirty();
                 return;
             };
@@ -1633,6 +1635,8 @@ fn saveFailureMessage(err: anyerror) []const u8 {
         error.UnknownRuntimeProfile => "That runtime no longer exists in the profile store.",
         error.ProfileAccessMismatch => "That runtime uses a different access method.",
         error.WouldBlock, error.Locked => "Another Verde process is editing runtimes. Try again.",
+        error.NotDir, error.AccessDenied, error.ReadOnlyFileSystem => "Could not write runtime profiles in Verde's config directory. Check that ~/.config/verde points to a writable directory.",
+        error.NoSpaceLeft, error.DiskQuota => "Could not save the runtime profile. Free some disk space and try again.",
         else => "Could not save the runtime profile.",
     };
 }

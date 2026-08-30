@@ -2,6 +2,7 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.option([]const u8, "target", "Target triple forwarded to packages/desktop");
+    const cpu = b.option([]const u8, "cpu", "CPU model forwarded to standalone daemon and server builds");
     const version = b.option([]const u8, "version", "Version embedded in the desktop binaries") orelse
         b.graph.environ_map.get("VERDE_VERSION");
     const optimize = b.standardOptimizeOption(.{});
@@ -54,19 +55,19 @@ pub fn build(b: *std.Build) void {
     });
     b.default_step.dependOn(&build_cmd.step);
 
-    const daemon_cmd = addDaemonCommand(b, optimize, "daemon", target, version);
+    const daemon_cmd = addDaemonCommand(b, optimize, "daemon", target, cpu, version);
     const daemon_step = b.step("daemon", "Build and install the GUI-free Verde daemon");
     daemon_step.dependOn(&daemon_cmd.step);
 
-    const daemon_test_cmd = addDaemonCommand(b, optimize, "daemon-test", target, version);
+    const daemon_test_cmd = addDaemonCommand(b, optimize, "daemon-test", target, cpu, version);
     const daemon_test_step = b.step("daemon-test", "Run GUI-free Verde daemon tests");
     daemon_test_step.dependOn(&daemon_test_cmd.step);
 
-    const server_cmd = addServerCommand(b, optimize, "server", target, version);
+    const server_cmd = addServerCommand(b, optimize, "server", target, cpu, version);
     const server_step = b.step("server", "Build and install the account-free Verde server operator");
     server_step.dependOn(&server_cmd.step);
 
-    const server_test_cmd = addServerCommand(b, optimize, "test", target, version);
+    const server_test_cmd = addServerCommand(b, optimize, "test", target, cpu, version);
     const server_test_step = b.step("server-test", "Run verde-server operator tests");
     server_test_step.dependOn(&server_test_cmd.step);
 
@@ -339,6 +340,7 @@ fn addDaemonCommand(
     optimize: std.builtin.OptimizeMode,
     step_name: []const u8,
     target: ?[]const u8,
+    cpu: ?[]const u8,
     version: ?[]const u8,
 ) *std.Build.Step.Run {
     var argv: std.ArrayList([]const u8) = .empty;
@@ -351,6 +353,7 @@ fn addDaemonCommand(
     if (target) |value| {
         argv.append(b.allocator, b.fmt("-Dtarget={s}", .{value})) catch @panic("OOM");
     }
+    appendStringOption(b, &argv, "cpu", cpu);
     appendStringOption(b, &argv, "version", version);
     appendInstallArgs(b, &argv);
 
@@ -364,6 +367,7 @@ fn addServerCommand(
     optimize: std.builtin.OptimizeMode,
     step_name: []const u8,
     target: ?[]const u8,
+    cpu: ?[]const u8,
     version: ?[]const u8,
 ) *std.Build.Step.Run {
     var argv: std.ArrayList([]const u8) = .empty;
@@ -376,6 +380,7 @@ fn addServerCommand(
     if (target) |value| {
         argv.append(b.allocator, b.fmt("-Dtarget={s}", .{value})) catch @panic("OOM");
     }
+    appendStringOption(b, &argv, "cpu", cpu);
     appendStringOption(b, &argv, "version", version);
     appendInstallArgs(b, &argv);
 
