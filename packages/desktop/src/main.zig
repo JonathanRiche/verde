@@ -747,6 +747,7 @@ fn mainInner(init: std.process.Init) !void {
         state.code_copy_buttons.clearRetainingCapacity();
         state.card_toggle_hits.clearRetainingCapacity();
         state.background_task_action_hits.clearRetainingCapacity();
+        chat_panel_ui.resetRuntimeBannerHits();
 
         state.noteWorkspaceSwitchRenderStarted();
         recordSpan(&frame_sample, .render_root, struct {

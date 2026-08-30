@@ -6,7 +6,7 @@ const zqlite = @import("zqlite");
 /// Latest schema version understood by this build.
 pub const CURRENT_VERSION: i64 = 1;
 /// Maximum schema version understood by read-only clients and the daemon store.
-pub const MAX_SUPPORTED_VERSION: i64 = 9;
+pub const MAX_SUPPORTED_VERSION: i64 = 10;
 /// SQLite busy timeout shared by writer and read-only connections.
 pub const BUSY_TIMEOUT_MS = 5000;
 
@@ -283,6 +283,12 @@ fn migrateToVersionInternal(
                 if (failure_point == .before_version_bump) return error.TestMigrationFailure;
                 try conn.execNoArgs("pragma user_version = 9");
                 version = 9;
+            },
+            9 => {
+                try migrateV9ToV10(conn);
+                if (failure_point == .before_version_bump) return error.TestMigrationFailure;
+                try conn.execNoArgs("pragma user_version = 10");
+                version = 10;
             },
             else => return error.DatabaseSchemaInvalid,
         }
@@ -668,6 +674,17 @@ fn migrateV8ToV9(conn: zqlite.Conn) !void {
     try seedLegacyPrimaryRepositories(conn);
 }
 
+fn migrateV9ToV10(conn: zqlite.Conn) !void {
+    // Additive and nullable: existing turns retain an explicitly unknown
+    // provider failure without reconstructing a code from display text.
+    try ensureColumn(
+        conn,
+        "chat_turns",
+        "failure_reason",
+        "alter table chat_turns add column failure_reason text check (failure_reason is null or failure_reason in ('provider_unavailable', 'provider_not_authenticated'))",
+    );
+}
+
 fn seedLegacyPrimaryRepositories(conn: zqlite.Conn) !void {
     try conn.execNoArgs(
         \\insert or ignore into workspace_repositories (workspace_id, repository_id, sort_index, label)
@@ -907,6 +924,20 @@ test "schema migration chain advances v1 to v2 to v3 to v4 and preserves populat
     defer primary.deinit();
     try std.testing.expectEqualStrings("primary", primary.text(0));
     try std.testing.expectEqualStrings("Primary", primary.text(1));
+
+    try conn.execNoArgs(
+        "insert into chat_turns (turn_id, workspace_id, local_thread_id, status, started_at_ms, provider, error_message) values ('legacy-failed-turn', 'chain-workspace', 'v3-thread', 'failed', 400, 'codex', 'opaque legacy failure')",
+    );
+    try migrateToVersion(conn, 10, .none);
+    try std.testing.expectEqual(@as(i64, 10), try userVersion(conn));
+    try std.testing.expect(try testHasColumn(conn, "chat_turns", "failure_reason"));
+    var legacy_turn = (try conn.row(
+        "select error_message, failure_reason from chat_turns where turn_id = 'legacy-failed-turn'",
+        .{},
+    )).?;
+    defer legacy_turn.deinit();
+    try std.testing.expectEqualStrings("opaque legacy failure", legacy_turn.text(0));
+    try std.testing.expect(legacy_turn.nullableText(1) == null);
 }
 
 test "v9 migration preserves legacy path as primary runtime binding" {

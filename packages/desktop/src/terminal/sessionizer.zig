@@ -1824,6 +1824,8 @@ const PtySession = struct {
 };
 
 const ChatTurnStatus = enum { running, waiting_approval, completed, failed, aborted };
+const ProviderFailureReason = store_protocol.ProviderFailureReason;
+const INTERRUPTED_TURN_MESSAGE = "The daemon restarted before the provider reply completed.";
 const ApprovalDecision = enum { approve, deny };
 const AcceptanceOwnership = enum { owned, conflict_not_owned };
 
@@ -1949,6 +1951,7 @@ const ChatTurn = struct {
     generated_title: ?[:0]const u8 = null,
     generated_title_applied: bool = false,
     error_message: ?[]u8 = null,
+    failure_reason: ?ProviderFailureReason = null,
     pending_approval: ?PendingApproval = null,
     approval_call_id: ?[]u8 = null,
     approval_decision: ?ApprovalDecision = null,
@@ -2195,11 +2198,23 @@ fn nativeProviderInstalled(provider: provider_models.Provider) bool {
     return switch (provider) {
         .codex => process_env.commandExists("codex"),
         .claude => process_env.commandExists("node") and process_env.commandExists("claude"),
-        .cursor => process_env.commandExists("agent"),
+        .cursor => process_env.commandExists("agent") or process_env.commandExists("cursor-agent"),
         .opencode => process_env.commandExists("opencode"),
         .pi => process_env.commandExists("pi"),
         .fx => process_env.commandExists("fx"),
         .grok => process_env.commandExists("grok"),
+    };
+}
+
+fn nativeProviderFromHarness(provider: harness.Provider) provider_models.Provider {
+    return switch (provider) {
+        .codex => .codex,
+        .claude => .claude,
+        .cursor => .cursor,
+        .opencode => .opencode,
+        .pi => .pi,
+        .fx => .fx,
+        .grok => .grok,
     };
 }
 
@@ -6464,18 +6479,18 @@ pub const Daemon = struct {
         if (service) |svc| _ = svc.in_flight.fetchAdd(1, .monotonic);
         self.mutex.unlock();
 
-        // MAJOR-R1: reject replay of terminal committed turn_ids. Without this,
-        // a fresh worker re-runs and commitTurn hits receipt Conflict ×3 →
-        // durability_pending wedges permanently. Interrupted rows still allow
-        // replay (sweep → re-commit upsert). Never SQLite under lockDaemon.
+        // MAJOR-R1: reject replay of consumed durable turn_ids. Completed
+        // commits and startup-interrupted acceptances both require a new turn
+        // id; neither may invoke provider work again. Never SQLite under
+        // lockDaemon.
         if (service) |svc| {
             defer _ = svc.in_flight.fetchSub(1, .monotonic);
-            if (try ledgerHasTerminalCommittedTurn(svc, turn_id)) {
+            if (try ledgerHasConsumedTurnId(svc, turn_id)) {
                 return try errorResponseAlloc(
                     self.allocator,
                     id_value,
                     headless.protocol.ERR_INVALID_STATE,
-                    "turn already committed",
+                    "turn id is already consumed; retry with a new turn id",
                 );
             }
         }
@@ -6520,6 +6535,24 @@ pub const Daemon = struct {
             error.OutOfMemory => return error.OutOfMemory,
         };
         defer if (execution_route) |*route| route.deinit(self.allocator);
+        // Remote clients request this bounded installation proof so missing
+        // CLIs reject before durable acceptance. Local callers omit it and
+        // retain the existing launch behavior. Authentication is deliberately
+        // not probed here: provider auth handshakes are heterogeneous and can
+        // block, prompt, or mutate provider state.
+        const require_provider_ready = jsonBool(params.object.get("require_provider_ready") orelse .null) orelse false;
+        if (require_provider_ready) {
+            const provider = parseEnum(harness.Provider, jsonString(params.object.get("provider") orelse .null) orelse "") orelse
+                return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid provider");
+            if (!nativeProviderInstalled(nativeProviderFromHarness(provider))) {
+                return try errorResponseAlloc(
+                    self.allocator,
+                    id_value,
+                    headless.protocol.ERR_PROVIDER_UNAVAILABLE,
+                    "provider is unavailable on this runtime",
+                );
+            }
+        }
         const route_ptr: ?*const ChatExecutionRoute = if (execution_route) |*route| route else null;
         const turn = try createChatTurnFromParams(self.allocator, params, route_ptr);
         errdefer turn.deinit(self.allocator);
@@ -6989,7 +7022,7 @@ pub const Daemon = struct {
             return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing project_path");
 
         const models = send_runner.listModels(self.allocator, provider, project_path) catch |err| {
-            return try errorResponseAlloc(self.allocator, id_value, "provider_unavailable", @errorName(err));
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_PROVIDER_UNAVAILABLE, @errorName(err));
         };
         defer harness.freeModelInfos(self.allocator, models);
         return try okValueResponse(self.allocator, id_value, .{
@@ -8406,12 +8439,23 @@ fn sweepInterruptedChatTurns(store: *daemon_store.Store) !void {
     store.conn.exec(
         \\update chat_turns
         \\set status = 'interrupted',
-        \\    finished_at_ms = coalesce(finished_at_ms, ?1)
+        \\    finished_at_ms = coalesce(finished_at_ms, ?1),
+        \\    error_message = coalesce(error_message, ?2)
         \\where status in ('accepted', 'running', 'waiting_approval')
     ,
-        .{finished_at},
+        .{ finished_at, INTERRUPTED_TURN_MESSAGE },
     ) catch |err| {
         log.err("interrupted-turn sweep failed err={s}", .{@errorName(err)});
+        return mapStageStoreError(err);
+    };
+    // The replay guard outlives chat_turn retention. Publish every swept ID as
+    // consumed before the store service becomes reachable; retries must mint a
+    // new turn ID rather than re-invoking a provider after ambiguous death.
+    store.conn.execNoArgs(
+        \\insert or ignore into terminal_turn_replay_guard (turn_id, status)
+        \\select turn_id, status from chat_turns where status = 'interrupted';
+    ) catch |err| {
+        log.err("interrupted-turn replay guard failed err={s}", .{@errorName(err)});
         return mapStageStoreError(err);
     };
 }
@@ -8564,11 +8608,11 @@ fn chatCommitFaultOnceShouldFail(allocator: std.mem.Allocator) bool {
     return !chat_commit_fault_once_consumed.swap(true, .monotonic);
 }
 
-/// MAJOR-R1 ledger identity guard: true when the durable ledger already has a
-/// terminal committed row for `turn_id` (completed/failed/aborted). Interrupted
-/// / running / accepted rows return false so same-id replay after a crash sweep
-/// remains legal. SQLite under the store service mutex only — never lockDaemon.
-fn ledgerHasTerminalCommittedTurn(service: *StoreService, turn_id: []const u8) !bool {
+/// MAJOR-R1 ledger identity guard: true when a durable turn ID has been
+/// terminally consumed, including a startup-interrupted acceptance whose
+/// provider completion is ambiguous. SQLite under the store service mutex
+/// only — never lockDaemon.
+fn ledgerHasConsumedTurnId(service: *StoreService, turn_id: []const u8) !bool {
     lockStoreService(service);
     defer service.mutex.unlock();
     const row_or_null = service.store.conn.row(
@@ -8580,7 +8624,8 @@ fn ledgerHasTerminalCommittedTurn(service: *StoreService, turn_id: []const u8) !
     const status = row.text(0);
     return std.mem.eql(u8, status, "completed") or
         std.mem.eql(u8, status, "failed") or
-        std.mem.eql(u8, status, "aborted");
+        std.mem.eql(u8, status, "aborted") or
+        std.mem.eql(u8, status, "interrupted");
 }
 
 /// Apply transcript_apply and commitTurn outside lockDaemon. Caller must not
@@ -8611,6 +8656,7 @@ fn commitChatTurnDurable(daemon: *Daemon, turn: *ChatTurn) !void {
     const prompt = try arena.dupe(u8, turn.request.prompt);
     const provider_thread_id = if (turn.provider_thread_id) |id| try arena.dupe(u8, id) else null;
     const error_message = if (turn.error_message) |msg| try arena.dupe(u8, msg) else null;
+    const failure_reason = turn.failure_reason;
     const reply_text = if (turn.result_reply_text) |text| try arena.dupe(u8, text) else "";
     const generated_title = if (turn.generated_title) |title| try arena.dupe(u8, title) else null;
     var events = try arena.alloc(transcript_apply.ChatEvent, turn.events.items.len);
@@ -8733,6 +8779,7 @@ fn commitChatTurnDurable(daemon: *Daemon, turn: *ChatTurn) !void {
         .expected_thread_title = if (generated_title != null) thread_title else null,
         .generated_title = generated_title,
         .error_message = error_message,
+        .failure_reason = failure_reason,
         .user_message_id = user_message_id,
         .messages = messages,
         .followup_pending = followup_pending,
@@ -8770,7 +8817,7 @@ fn loadTurnRecord(
     const row_or_null = store.conn.row(
         \\select turn_id, workspace_id, local_thread_id, status, started_at_ms,
         \\       finished_at_ms, provider, provider_thread_id, error_message,
-        \\       user_message_id, committed_store_revision
+        \\       failure_reason, user_message_id, committed_store_revision
         \\from chat_turns where turn_id = ?1
     ,
         .{request.turn_id},
@@ -8792,11 +8839,15 @@ fn loadTurnRecord(
     errdefer if (provider_thread_id) |value| allocator.free(value);
     const error_message = dupeOptionalText(allocator, row.nullableText(8)) catch return error.OutOfMemory;
     errdefer if (error_message) |value| allocator.free(value);
-    const user_message_id = dupeOptionalText(allocator, row.nullableText(9)) catch return error.OutOfMemory;
+    const failure_reason = if (row.nullableText(9)) |value|
+        std.meta.stringToEnum(store_protocol.ProviderFailureReason, value) orelse return error.StoreCorrupt
+    else
+        null;
+    const user_message_id = dupeOptionalText(allocator, row.nullableText(10)) catch return error.OutOfMemory;
     errdefer if (user_message_id) |value| allocator.free(value);
     // MINOR-6: range-check before cast (storeStatus pattern); corrupt/negative
     // committed_store_revision maps to store_corrupt, not a Debug panic.
-    const committed: ?u64 = if (row.nullableInt(10)) |value|
+    const committed: ?u64 = if (row.nullableInt(11)) |value|
         std.math.cast(u64, value) orelse return error.StoreCorrupt
     else
         null;
@@ -8811,6 +8862,7 @@ fn loadTurnRecord(
         .provider = provider,
         .provider_thread_id = provider_thread_id,
         .error_message = error_message,
+        .failure_reason = failure_reason,
         .user_message_id = user_message_id,
         .committed_store_revision = committed,
     };
@@ -9734,6 +9786,8 @@ fn serializeTurnsFragment(arena: std.mem.Allocator, daemon: *Daemon, workspace_f
         if (turn.provider_thread_id) |value| try s.write(value) else try s.write(null);
         try s.objectField("error_message");
         if (turn.error_message) |value| try s.write(value) else try s.write(null);
+        try s.objectField("failure_reason");
+        if (turn.failure_reason) |value| try s.write(@tagName(value)) else try s.write(null);
         try s.objectField("user_message_id");
         if (turn.user_message_id) |value| try s.write(value) else try s.write(null);
         try s.objectField("committed_store_revision");
@@ -11573,6 +11627,10 @@ fn writeChatTurnTail(
     if (!has_more_events) {
         if (turn.error_message) |value| try s.write(value) else try s.write(null);
     } else try s.write(null);
+    try s.objectField("failure_reason");
+    if (!has_more_events) {
+        if (turn.failure_reason) |value| try s.write(@tagName(value)) else try s.write(null);
+    } else try s.write(null);
     try s.objectField("pending_approval");
     try writePendingApproval(s, turn.pending_approval);
     // M4 durable-commit publication: present only after the store receipt.
@@ -11589,6 +11647,10 @@ fn writeChatTurnTail(
 }
 
 fn durableTurnRecordIsTerminal(record: store_protocol.TurnRecord) bool {
+    // Startup interruption is itself the durable terminal publication. The
+    // accepted/running row predates a worker commit, so it intentionally has
+    // no committed_store_revision; requiring one makes the swept row vanish.
+    if (std.mem.eql(u8, record.status, "interrupted")) return true;
     if (record.committed_store_revision == null) return false;
     return std.mem.eql(u8, record.status, "completed") or
         std.mem.eql(u8, record.status, "failed") or
@@ -11638,10 +11700,12 @@ fn durableChatTurnTailResponse(
     try s.write(null);
     try s.objectField("error_message");
     if (record.error_message) |value| try s.write(value) else try s.write(null);
+    try s.objectField("failure_reason");
+    if (record.failure_reason) |value| try s.write(@tagName(value)) else try s.write(null);
     try s.objectField("pending_approval");
     try s.write(null);
     try s.objectField("committed_store_revision");
-    try s.write(record.committed_store_revision.?);
+    if (record.committed_store_revision) |value| try s.write(value) else try s.write(null);
     try s.objectField("events_compacted_before_seq");
     try s.write(null);
     try s.objectField("durability_pending");
@@ -12263,6 +12327,35 @@ fn automaticTitleExpectedTitle(requested_title: []const u8, fallback_title: []co
     return null;
 }
 
+fn providerFailureReasonForError(
+    provider: harness.Provider,
+    err: anyerror,
+) ?ProviderFailureReason {
+    return switch (err) {
+        error.CursorSignedOut => if (provider == .cursor) .provider_not_authenticated else null,
+        error.FxSignedOut => if (provider == .fx) .provider_not_authenticated else null,
+        error.GrokSignedOut => if (provider == .grok) .provider_not_authenticated else null,
+        error.AcpSignedOut => switch (provider) {
+            .cursor, .fx, .grok => .provider_not_authenticated,
+            else => null,
+        },
+        error.ProviderBridgeNotFound => if (provider == .claude) .provider_unavailable else null,
+        error.OpencodeServerUnavailable => if (provider == .opencode) .provider_unavailable else null,
+        // FileNotFound is intentionally unknown here: it can identify the
+        // executable, working directory, an attachment, or provider state.
+        // The remote acceptance preflight performs the unambiguous executable
+        // check before durable work is accepted.
+        else => null,
+    };
+}
+
+fn providerFailureMessage(reason: ProviderFailureReason) []const u8 {
+    return switch (reason) {
+        .provider_unavailable => "The provider is unavailable on this runtime.",
+        .provider_not_authenticated => "The provider is not authenticated on this runtime.",
+    };
+}
+
 /// Generate an opening-exchange title under the same durable identity guard
 /// for GUI and headless turns. A manual rename changes the stored title away
 /// from the accepted fallback/placeholder, so the terminal commit cannot
@@ -12378,6 +12471,28 @@ test "automatic title eligibility accepts every empty-thread presentation label"
     try std.testing.expect(automaticTitleExpectedTitle("My Manual Title", "Opening prompt") == null);
 }
 
+test "provider launch failures retain only provable typed reasons" {
+    try std.testing.expect(providerFailureReasonForError(.codex, error.FileNotFound) == null);
+    try std.testing.expect(providerFailureReasonForError(.pi, error.FileNotFound) == null);
+    try std.testing.expectEqual(
+        ProviderFailureReason.provider_unavailable,
+        providerFailureReasonForError(.claude, error.ProviderBridgeNotFound).?,
+    );
+    try std.testing.expectEqual(
+        ProviderFailureReason.provider_not_authenticated,
+        providerFailureReasonForError(.cursor, error.CursorSignedOut).?,
+    );
+    try std.testing.expectEqual(
+        ProviderFailureReason.provider_not_authenticated,
+        providerFailureReasonForError(.fx, error.FxSignedOut).?,
+    );
+    try std.testing.expectEqual(
+        ProviderFailureReason.provider_not_authenticated,
+        providerFailureReasonForError(.grok, error.GrokSignedOut).?,
+    );
+    try std.testing.expect(providerFailureReasonForError(.codex, error.InvalidDaemonResponse) == null);
+}
+
 fn chatTurnThread(daemon: *Daemon, turn: *ChatTurn) void {
     const allocator = daemon.allocator;
     // Acceptance staging before provider work so a mid-turn kill still leaves
@@ -12451,8 +12566,11 @@ fn chatTurnThread(daemon: *Daemon, turn: *ChatTurn) void {
                 allocator.free(value.reply_text);
             } else |err| {
                 turn.status = if (turn.cancel_requested) .aborted else .failed;
+                const reason = providerFailureReasonForError(turn.request.provider, err);
+                turn.failure_reason = reason;
                 if (turn.error_message == null) {
-                    turn.error_message = allocator.dupe(u8, @errorName(err)) catch null;
+                    const message = if (reason) |typed| providerFailureMessage(typed) else @errorName(err);
+                    turn.error_message = allocator.dupe(u8, message) catch null;
                 }
                 const message = turn.error_message orelse @errorName(err);
                 turn.appendStringEvent(allocator, if (turn.status == .aborted) "aborted" else "failed", "message", message);
@@ -15539,7 +15657,7 @@ const WorkerDurableSnapshot = struct {
                 "coalesce((select group_concat(v, char(30)) from (select quote(w.workspace_id)||char(31)||quote(w.label)||char(31)||quote(w.path)||char(31)||quote(t.local_thread_id)||char(31)||quote(t.title)||char(31)||quote(t.provider_thread_id)||char(31)||t.provider||char(31)||t.harness v from workspaces w left join threads t on t.workspace_id=w.id order by w.workspace_id,t.local_thread_id)), ''), " ++
                 "coalesce((select group_concat(v, char(30)) from (select quote(message_id)||char(31)||quote(role)||char(31)||quote(author)||char(31)||quote(body)||char(31)||quote(image_path)||char(31)||quote(image_mime)||char(31)||quote(image_byte_size)||char(31)||quote(created_at_ms)||char(31)||quote(updated_at_ms) v from messages order by thread_id,sort_index)), ''), " ++
                 "coalesce((select group_concat(v, char(30)) from (select quote(message_id)||char(31)||quote(message_fingerprint)||char(31)||quote(sort_index)||char(31)||quote(created_at_ms)||char(31)||quote(updated_at_ms)||char(31)||quote(store_revision) v from client_message_keys order by thread_id,message_id)), ''), " ++
-                "coalesce((select group_concat(v, char(30)) from (select quote(turn_id)||char(31)||quote(workspace_id)||char(31)||quote(local_thread_id)||char(31)||quote(status)||char(31)||quote(started_at_ms)||char(31)||quote(finished_at_ms)||char(31)||quote(provider)||char(31)||quote(provider_thread_id)||char(31)||quote(error_message)||char(31)||quote(user_message_id)||char(31)||quote(committed_store_revision) v from chat_turns order by turn_id)), ''), " ++
+                "coalesce((select group_concat(v, char(30)) from (select quote(turn_id)||char(31)||quote(workspace_id)||char(31)||quote(local_thread_id)||char(31)||quote(status)||char(31)||quote(started_at_ms)||char(31)||quote(finished_at_ms)||char(31)||quote(provider)||char(31)||quote(provider_thread_id)||char(31)||quote(error_message)||char(31)||quote(failure_reason)||char(31)||quote(user_message_id)||char(31)||quote(committed_store_revision) v from chat_turns order by turn_id)), ''), " ++
                 "coalesce((select group_concat(v, char(30)) from (select quote(request_key)||char(31)||quote(operation)||char(31)||quote(fingerprint)||char(31)||quote(store_revision)||char(31)||quote(response_status)||char(31)||quote(response_payload) v from store_receipts order by request_key)), ''), " ++
                 "coalesce((select group_concat(v, char(30)) from (select quote(turn_id)||char(31)||quote(status) v from terminal_turn_replay_guard order by turn_id)), ''), " ++
                 "(select count(*) from chat_completions)",
@@ -17173,6 +17291,44 @@ test "durable turn commit is exactly once and interrupt sweep marks running rows
         try std.testing.expectEqualStrings("interrupted", row.text(0));
     }
 
+    const interrupted_tail = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":71,"method":"chat.turn.tail","params":{"turn_id":"turn-running","after_seq":0}}
+    );
+    defer allocator.free(interrupted_tail);
+    var parsed_interrupted_tail = try std.json.parseFromSlice(std.json.Value, allocator, interrupted_tail, .{});
+    defer parsed_interrupted_tail.deinit();
+    const interrupted_result = parsed_interrupted_tail.value.object.get("result").?.object;
+    try std.testing.expectEqualStrings("interrupted", interrupted_result.get("status").?.string);
+    try std.testing.expectEqualStrings(INTERRUPTED_TURN_MESSAGE, interrupted_result.get("error_message").?.string);
+    try std.testing.expect(interrupted_result.get("committed_store_revision").? == .null);
+
+    {
+        lockStoreService(daemon.store_service.?);
+        defer daemon.store_service.?.mutex.unlock();
+        var guard = (try daemon.store_service.?.store.conn.row(
+            "select status from terminal_turn_replay_guard where turn_id = 'turn-running'",
+            .{},
+        )).?;
+        defer guard.deinit();
+        try std.testing.expectEqualStrings("interrupted", guard.text(0));
+    }
+
+    // Reopen the store with no volatile turn state. Reusing the swept ID is a
+    // terminal idempotency error before request validation or worker launch.
+    detachTestStoreService(&daemon);
+    try attachTestStoreService(&daemon, db_path);
+    const replay_start = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":73,"method":"chat.turn.start","params":{"turn_id":"turn-running","workspace_id":"ws-sweep","local_thread_id":"t-sweep","project_path":"/tmp/sweep","prompt":"must not run","thread_title":"Sweep","provider":"codex","harness":"local_cli","message_id":"retry-user","test_stub":true}}
+    );
+    defer allocator.free(replay_start);
+    try expectErrorCodeMessage(
+        replay_start,
+        allocator,
+        headless.protocol.ERR_INVALID_STATE,
+        "turn id is already consumed; retry with a new turn id",
+    );
+    try std.testing.expectEqual(@as(usize, 0), daemon.chat_turns.items.len);
+
     // MAJOR-1/2 pin: pre-stage a 'running' row for the turn that will commit
     // (upsert supersedes it inside commitTurn; no external delete).
     {
@@ -17201,15 +17357,15 @@ test "durable turn commit is exactly once and interrupt sweep marks running rows
         .owned_image_paths = image_paths,
         .started_at_ms = 10,
         .finished_at_ms = 20,
-        .status = .completed,
+        .status = .failed,
         .worker_done = true,
         .durability_pending = true,
-        .result_reply_text = try allocator.dupe(u8, "reply"),
+        .error_message = try allocator.dupe(u8, "Provider login expired."),
+        .failure_reason = .provider_not_authenticated,
         .generated_title = try allocator.dupeZ(u8, "Generated Commit Title"),
         .user_message_id = try allocator.dupe(u8, "user-1"),
     };
-    turn.appendStringEvent(allocator, "assistant_delta", "text", "reply");
-    turn.appendEvent(allocator, "completed", "{}");
+    turn.appendStringEvent(allocator, "failed", "message", "Provider login expired.");
     // Owned by daemon.chat_turns (freed in daemon.deinit).
     try daemon.chat_turns.append(allocator, turn);
 
@@ -17235,28 +17391,49 @@ test "durable turn commit is exactly once and interrupt sweep marks running rows
     try std.testing.expectEqual(first_revision, turn.committed_store_revision.?);
     try std.testing.expect(!turn.durability_pending);
 
-    lockStoreService(daemon.store_service.?);
-    defer daemon.store_service.?.mutex.unlock();
-    var count = (try daemon.store_service.?.store.conn.row(
-        "select count(*) from chat_turns where turn_id = 'turn-commit-once'",
-        .{},
-    )).?;
-    defer count.deinit();
-    try std.testing.expectEqual(@as(i64, 1), count.int(0));
+    {
+        lockStoreService(daemon.store_service.?);
+        defer daemon.store_service.?.mutex.unlock();
+        var count = (try daemon.store_service.?.store.conn.row(
+            "select count(*) from chat_turns where turn_id = 'turn-commit-once'",
+            .{},
+        )).?;
+        defer count.deinit();
+        try std.testing.expectEqual(@as(i64, 1), count.int(0));
 
-    var ledger_status = (try daemon.store_service.?.store.conn.row(
-        "select status from chat_turns where turn_id = 'turn-commit-once'",
-        .{},
-    )).?;
-    defer ledger_status.deinit();
-    try std.testing.expectEqualStrings("completed", ledger_status.text(0));
+        var ledger_status = (try daemon.store_service.?.store.conn.row(
+            "select status, failure_reason from chat_turns where turn_id = 'turn-commit-once'",
+            .{},
+        )).?;
+        defer ledger_status.deinit();
+        try std.testing.expectEqualStrings("failed", ledger_status.text(0));
+        try std.testing.expectEqualStrings("provider_not_authenticated", ledger_status.text(1));
 
-    var receipt = (try daemon.store_service.?.store.conn.row(
-        "select count(*) from store_receipts where request_key = 'turn:turn-commit-once:commit'",
-        .{},
-    )).?;
-    defer receipt.deinit();
-    try std.testing.expectEqual(@as(i64, 1), receipt.int(0));
+        var receipt = (try daemon.store_service.?.store.conn.row(
+            "select count(*) from store_receipts where request_key = 'turn:turn-commit-once:commit'",
+            .{},
+        )).?;
+        defer receipt.deinit();
+        try std.testing.expectEqual(@as(i64, 1), receipt.int(0));
+    }
+
+    // Drop all volatile turn state and reopen the store, matching a daemon
+    // restart. The durable tail must publish the stored stable code.
+    daemon.chat_turns.orderedRemove(0).deinit(allocator);
+    detachTestStoreService(&daemon);
+    try attachTestStoreService(&daemon, db_path);
+    const durable_tail = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":72,"method":"chat.turn.tail","params":{"turn_id":"turn-commit-once","after_seq":0}}
+    );
+    defer allocator.free(durable_tail);
+    var parsed_durable_tail = try std.json.parseFromSlice(std.json.Value, allocator, durable_tail, .{});
+    defer parsed_durable_tail.deinit();
+    const durable_result = parsed_durable_tail.value.object.get("result").?.object;
+    try std.testing.expectEqualStrings("failed", durable_result.get("status").?.string);
+    try std.testing.expectEqualStrings(
+        "provider_not_authenticated",
+        durable_result.get("failure_reason").?.string,
+    );
 }
 
 test "legacy interrupted acceptance conflict never terminalizes unowned work" {

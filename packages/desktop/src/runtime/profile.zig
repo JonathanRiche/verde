@@ -2,9 +2,9 @@
 
 const std = @import("std");
 
-/// Version 3 adds a directly reachable HTTPS/WSS transport. Older documents
-/// remain readable and are rewritten only on the next normal profile save.
-pub const CURRENT_VERSION: u8 = 3;
+/// Version 4 persists the user's desired connection state. Older documents
+/// remain readable and default to disabled until the user enables them again.
+pub const CURRENT_VERSION: u8 = 4;
 pub const DEFAULT_SSH_PORT: u16 = 22;
 pub const DEFAULT_REMOTE_GATEWAY_PORT: u16 = 7420;
 pub const MAX_PROFILES: usize = 64;
@@ -31,6 +31,7 @@ const VERSION_ONE_PROFILE_FIELDS = [_][]const u8{
     "transport",
 };
 const VERSION_TWO_PROFILE_FIELDS = VERSION_ONE_PROFILE_FIELDS ++ [_][]const u8{"access"};
+const VERSION_FOUR_PROFILE_FIELDS = VERSION_TWO_PROFILE_FIELDS ++ [_][]const u8{"desired_enabled"};
 const VERSION_ONE_LOCAL_TRANSPORT_FIELDS = [_][]const u8{"kind"};
 const VERSION_ONE_SSH_TRANSPORT_FIELDS = [_][]const u8{
     "kind",
@@ -181,6 +182,8 @@ pub const Profile = struct {
     expected_instance_id: ?[]u8 = null,
     transport: Transport,
     access: Access = .admin_token,
+    /// Non-secret intent only. Runtime health and retry state are never persisted.
+    desired_enabled: bool = false,
 
     /// Creates a local-socket profile with an identity that remains stable
     /// after the profile document is encoded and loaded again.
@@ -538,6 +541,8 @@ pub fn encodeAlloc(allocator: std.mem.Allocator, profiles: []const Profile) ![]u
         try stringify.write(profile.id);
         try stringify.objectField("label");
         try stringify.write(profile.label);
+        try stringify.objectField("desired_enabled");
+        try stringify.write(profile.desired_enabled);
         if (profile.expected_runtime_id) |runtime_id| {
             try stringify.objectField("expected_runtime_id");
             try stringify.write(runtime_id);
@@ -647,7 +652,7 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, bytes: []const u8) !OwnedProfil
     if (document.version > CURRENT_VERSION) return error.UnsupportedProfileVersion;
     switch (document.version) {
         0 => {},
-        1, 2, 3 => try validateVersionedSchema(parsed.value, document.version),
+        1, 2, 3, 4 => try validateVersionedSchema(parsed.value, document.version),
         else => return error.UnsupportedProfileVersion,
     }
     if (document.values.items.len > MAX_PROFILES) return error.TooManyProfiles;
@@ -724,7 +729,12 @@ fn validateVersionedSchema(root: std.json.Value, version: u8) !void {
         if (profile_value != .object) return error.InvalidProfile;
         try validateAllowedFields(
             &profile_value.object,
-            if (version >= 2) &VERSION_TWO_PROFILE_FIELDS else &VERSION_ONE_PROFILE_FIELDS,
+            if (version >= 4)
+                &VERSION_FOUR_PROFILE_FIELDS
+            else if (version >= 2)
+                &VERSION_TWO_PROFILE_FIELDS
+            else
+                &VERSION_ONE_PROFILE_FIELDS,
         );
 
         const transport_value = profile_value.object.get("transport") orelse return error.InvalidProfile;
@@ -791,6 +801,10 @@ fn profileFromValue(
     const label = try requiredString(object, "label");
     const expected_runtime_id = try optionalString(object, "expected_runtime_id");
     const expected_instance_id = try optionalString(object, "expected_instance_id");
+    const desired_enabled = if (version >= 4)
+        try optionalBool(object, "desired_enabled", false)
+    else
+        false;
     if (expected_runtime_id == null and expected_instance_id != null) {
         return error.InvalidExpectedIdentityPair;
     }
@@ -826,6 +840,7 @@ fn profileFromValue(
             .expected_instance_id = owned_instance_id,
             .transport = .local_socket,
             .access = owned_access,
+            .desired_enabled = desired_enabled,
         };
     }
     if (version >= 2 and (std.mem.eql(u8, kind, "connect") or
@@ -853,6 +868,7 @@ fn profileFromValue(
             .expected_instance_id = owned_instance_id,
             .transport = if (is_connect) .{ .connect = endpoint } else .{ .direct_https = endpoint },
             .access = owned_access,
+            .desired_enabled = desired_enabled,
         };
     }
     if (!std.mem.eql(u8, kind, "ssh_tunnel") and
@@ -882,6 +898,7 @@ fn profileFromValue(
             .remote_gateway_port = remote_gateway_port,
         }) },
         .access = owned_access,
+        .desired_enabled = desired_enabled,
     };
 }
 
@@ -1279,6 +1296,12 @@ fn optionalString(object: *const std.json.ObjectMap, key: []const u8) !?[]const 
     return value.string;
 }
 
+fn optionalBool(object: *const std.json.ObjectMap, key: []const u8, default: bool) !bool {
+    const value = object.get(key) orelse return default;
+    if (value != .bool) return error.InvalidProfile;
+    return value.bool;
+}
+
 fn firstPort(object: *const std.json.ObjectMap, keys: []const []const u8, default: u16) !u16 {
     for (keys) |key| {
         if (object.get(key)) |value| {
@@ -1471,7 +1494,7 @@ test "legacy documents and unknown fields decode without being persisted" {
     try std.testing.expect(std.mem.indexOf(u8, canonical, "future_profile_field") == null);
     try std.testing.expect(std.mem.indexOf(u8, canonical, "credential_ref") == null);
     try std.testing.expect(std.mem.indexOf(u8, canonical, "sentinel-legacy") == null);
-    try std.testing.expect(std.mem.indexOf(u8, canonical, "\"version\": 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, canonical, "\"version\": 4") != null);
 }
 
 test "unversioned objects and arrays retain version zero migration behavior" {
@@ -1488,7 +1511,7 @@ test "unversioned objects and arrays retain version zero migration behavior" {
         defer std.testing.allocator.free(canonical);
         try std.testing.expect(std.mem.indexOf(u8, canonical, "future_") == null);
         try std.testing.expect(std.mem.indexOf(u8, canonical, "sentinel-") == null);
-        try std.testing.expect(std.mem.indexOf(u8, canonical, "\"version\": 3") != null);
+        try std.testing.expect(std.mem.indexOf(u8, canonical, "\"version\": 4") != null);
     }
 }
 
@@ -1581,7 +1604,7 @@ test "profile validation rejects malformed identities endpoints and duplicates" 
     }
     try std.testing.expectError(
         error.UnsupportedProfileVersion,
-        decodeAlloc(std.testing.allocator, "{\"version\":4,\"profiles\":[]}"),
+        decodeAlloc(std.testing.allocator, "{\"version\":5,\"profiles\":[]}"),
     );
 }
 
@@ -1596,6 +1619,7 @@ test "current version persists paired-device and connect access without secrets"
         "verde-runtime/profile-0123456789abcdef0123456789abcdef/device",
     );
     try paired.setExpectedIdentity(allocator, "0123456789abcdef0123456789abcdef", "00112233445566778899aabbccddeeff");
+    paired.desired_enabled = true;
     var linked = try Profile.createConnect(allocator, std.testing.io, "Connect", " https://connect.example/ ");
     defer linked.deinit(allocator);
     try std.testing.expectEqualStrings("https://connect.example", linked.access.connect.control_plane_url);
@@ -1654,7 +1678,7 @@ test "current version persists paired-device and connect access without secrets"
     }
 }
 
-test "version three direct HTTPS profile round trips without secret material" {
+test "version four direct HTTPS profile round trips desired state without secret material" {
     const allocator = std.testing.allocator;
     var direct = try Profile.createPairedDirect(
         allocator,
@@ -1664,6 +1688,7 @@ test "version three direct HTTPS profile round trips without secret material" {
         "wss://runtime.example/ws",
     );
     defer direct.deinit(allocator);
+    direct.desired_enabled = true;
     const encoded = try encodeAlloc(allocator, &.{direct});
     defer allocator.free(encoded);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"kind\": \"direct_https\"") != null);
@@ -1672,6 +1697,7 @@ test "version three direct HTTPS profile round trips without secret material" {
     defer decoded.deinit(allocator);
     try std.testing.expectEqualStrings("https://runtime.example", decoded.items[0].transport.direct_https.https_url.?);
     try std.testing.expect(decoded.items[0].access == .paired_device);
+    try std.testing.expect(decoded.items[0].desired_enabled);
 }
 
 test "runtime endpoints are exact origins with a same-authority websocket" {

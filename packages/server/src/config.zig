@@ -3,6 +3,7 @@
 const std = @import("std");
 
 const DEFAULT_GATEWAY_PORT: u16 = 7420;
+const DEFAULT_TAILSCALE_HTTPS_PORT: u16 = 443;
 
 pub const Command = enum {
     init,
@@ -15,6 +16,7 @@ pub const Command = enum {
     pair_revoke,
     device_list,
     device_revoke,
+    tailscale_doctor,
     connect,
     connect_status,
     connect_unlink,
@@ -30,6 +32,7 @@ pub const Options = struct {
     data_dir: ?[]const u8 = null,
     token_file: ?[]const u8 = null,
     gateway_port: u16 = DEFAULT_GATEWAY_PORT,
+    tailscale_https_port: u16 = DEFAULT_TAILSCALE_HTTPS_PORT,
     tailscale: bool = false,
     json: bool = false,
     no_start: bool = false,
@@ -90,11 +93,23 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) !Options {
             if (index >= argv.len) return error.InvalidArguments;
             options.gateway_port = std.fmt.parseInt(u16, argv[index], 10) catch return error.InvalidArguments;
             if (options.gateway_port == 0) return error.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--tailscale-https-port") and
+            (command == .serve or command == .service_install or command == .tailscale_doctor))
+        {
+            index += 1;
+            if (index >= argv.len) return error.InvalidArguments;
+            options.tailscale_https_port = std.fmt.parseInt(u16, argv[index], 10) catch return error.InvalidArguments;
+            if (options.tailscale_https_port == 0) return error.InvalidArguments;
         } else if (isDelegate(command)) {
             try delegated.append(allocator, arg);
         } else {
             return error.InvalidArguments;
         }
+    }
+    if (options.tailscale_https_port != DEFAULT_TAILSCALE_HTTPS_PORT and
+        (command == .serve or command == .service_install) and !options.tailscale)
+    {
+        return error.InvalidArguments;
     }
     options.delegate_args = try delegated.toOwnedSlice(allocator);
     return options;
@@ -116,6 +131,9 @@ fn parseCommand(argv: []const []const u8) !struct { Command, usize } {
     });
     if (std.mem.eql(u8, first, "device")) return parseNested(argv, 2, .{
         .{ "list", .device_list }, .{ "revoke", .device_revoke },
+    });
+    if (std.mem.eql(u8, first, "tailscale")) return parseNested(argv, 2, .{
+        .{ "doctor", .tailscale_doctor }, .{ "status", .tailscale_doctor },
     });
     if (std.mem.eql(u8, first, "connect")) {
         if (argv.len > 2 and std.mem.eql(u8, argv[2], "status")) return .{ .connect_status, 3 };
@@ -178,6 +196,13 @@ test "service and gateway options validate bounds" {
     var tailscale = try parse(std.testing.allocator, &.{ "verde-server", "serve", "--tailscale" });
     defer deinit(&tailscale, std.testing.allocator);
     try std.testing.expect(tailscale.tailscale);
+    try std.testing.expectEqual(DEFAULT_TAILSCALE_HTTPS_PORT, tailscale.tailscale_https_port);
+
+    var dedicated = try parse(std.testing.allocator, &.{
+        "verde-server", "serve", "--tailscale", "--tailscale-https-port", "8443",
+    });
+    defer deinit(&dedicated, std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 8443), dedicated.tailscale_https_port);
 
     var parsed = try parse(std.testing.allocator, &.{ "verde-server", "service", "install", "--gateway-port", "18473", "--no-start" });
     defer deinit(&parsed, std.testing.allocator);
@@ -185,6 +210,24 @@ test "service and gateway options validate bounds" {
     try std.testing.expectEqual(@as(u16, 18473), parsed.gateway_port);
     try std.testing.expect(parsed.no_start);
     try std.testing.expectError(error.InvalidArguments, parse(std.testing.allocator, &.{ "verde-server", "serve", "--gateway-port", "0" }));
+    try std.testing.expectError(error.InvalidArguments, parse(std.testing.allocator, &.{ "verde-server", "serve", "--tailscale-https-port", "0" }));
+    try std.testing.expectError(error.InvalidArguments, parse(std.testing.allocator, &.{
+        "verde-server", "serve", "--tailscale-https-port", "8443",
+    }));
+}
+
+test "Tailscale doctor and status aliases are read-only commands" {
+    var doctor = try parse(std.testing.allocator, &.{
+        "verde-server", "tailscale", "doctor", "--tailscale-https-port", "8443", "--json",
+    });
+    defer deinit(&doctor, std.testing.allocator);
+    try std.testing.expectEqual(Command.tailscale_doctor, doctor.command);
+    try std.testing.expectEqual(@as(u16, 8443), doctor.tailscale_https_port);
+    try std.testing.expect(doctor.json);
+
+    var status = try parse(std.testing.allocator, &.{ "verde-server", "tailscale", "status" });
+    defer deinit(&status, std.testing.allocator);
+    try std.testing.expectEqual(Command.tailscale_doctor, status.command);
 }
 
 test "Connect onboarding and lifecycle commands are explicit" {
@@ -192,8 +235,8 @@ test "Connect onboarding and lifecycle commands are explicit" {
     defer deinit(&bare, std.testing.allocator);
     try std.testing.expectEqual(Command.connect, bare.command);
     var onboarding = try parse(std.testing.allocator, &.{
-        "verde-server", "connect", "--control-plane", "https://connect.example.test",
-        "--descriptor-file", "/tmp/runtime.json", "--headless", "--install-service",
+        "verde-server",      "connect",           "--control-plane", "https://connect.example.test",
+        "--descriptor-file", "/tmp/runtime.json", "--headless",      "--install-service",
     });
     defer deinit(&onboarding, std.testing.allocator);
     try std.testing.expectEqual(Command.connect, onboarding.command);

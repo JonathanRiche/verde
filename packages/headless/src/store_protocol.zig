@@ -83,6 +83,12 @@ pub const ERR_REVISION_EXPIRED = protocol.ERR_REVISION_EXPIRED;
 pub const DEFAULT_PAGE_ITEMS: u32 = 100;
 pub const MAX_PAGE_ITEMS: u32 = 200;
 pub const MAX_PAGE_CURSOR_BYTES: usize = @import("pagination.zig").MAX_CURSOR_BYTES;
+
+/// Stable provider failure codes persisted with terminal turn outcomes.
+pub const ProviderFailureReason = enum {
+    provider_unavailable,
+    provider_not_authenticated,
+};
 pub const PRIMARY_REPOSITORY_ID: []const u8 = "primary";
 
 /// Common metadata carried by every store mutation.
@@ -598,6 +604,7 @@ pub const TurnRecord = struct {
     provider: []const u8,
     provider_thread_id: ?[]const u8 = null,
     error_message: ?[]const u8 = null,
+    failure_reason: ?ProviderFailureReason = null,
     user_message_id: ?[]const u8 = null,
     committed_store_revision: ?u64 = null,
 };
@@ -782,6 +789,7 @@ test "store DTOs round trip every wire shape" {
         .provider = "codex",
         .provider_thread_id = "provider-1",
         .error_message = null,
+        .failure_reason = .provider_not_authenticated,
         .user_message_id = "message-1",
         .committed_store_revision = 9,
     };

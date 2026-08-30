@@ -2305,7 +2305,11 @@ const FooterStyle = enum { primary, secondary };
 
 /// Local plus every configured profile.
 const MAX_RUNTIME_ROWS: usize = 65;
-const MAX_ROW_BUTTONS: usize = 7;
+/// Upper bound of `planRuntimeRowButtons` for one profile row: primary
+/// recovery, Disconnect, Show server setup, Forget token/device, Edit,
+/// Confirm remove + Keep, Copy diagnostics, workspace default. `pushButton`
+/// asserts rather than silently dropping a planned action.
+const MAX_ROW_BUTTONS: usize = 9;
 /// Bounded detail block: repository rows + provider rows + status lines.
 const MAX_DETAIL_LINES: usize = 40;
 const DETAIL_LINE_BYTES: usize = 240;
@@ -2396,7 +2400,7 @@ fn packRowButtons(plan: *RuntimeRowPlan, x: f32, y_start: f32, w: f32, m: Metric
 }
 
 fn pushButton(plan: *RuntimeRowPlan, action: RowAction, label: []const u8, style: ButtonStyle) void {
-    if (plan.button_count >= MAX_ROW_BUTTONS) return;
+    std.debug.assert(plan.button_count < MAX_ROW_BUTTONS);
     plan.button_actions[plan.button_count] = action;
     plan.button_labels[plan.button_count] = label;
     plan.button_styles[plan.button_count] = style;
@@ -2412,19 +2416,38 @@ fn planRuntimeRowButtons(state: *const runtime.AppState, plan: *RuntimeRowPlan, 
     };
     const snapshot = state.runtimeProfileSnapshot(id);
     const status = state.runtimeProfileStatus(id);
-    switch (status) {
-        .offline, .credential_required => pushButton(plan, .connect, "Connect", .primary),
-        .connection_failed, .authentication_failed, .identity_mismatch, .failed, .rate_limited => pushButton(plan, .retry, "Retry", .primary),
-        .connecting, .handshaking, .trust_required, .ready, .limited, .reconnecting => pushButton(plan, .disable, "Disconnect", .secondary),
-        .pairing_required, .pairing_rejected => pushButton(plan, .pair_device, "Pair device", .primary),
-        .runtime_selection_required => pushButton(plan, .choose_runtime, "Choose runtime", .primary),
-        .unsupported, .unavailable => {},
+    // Primary action follows the shared recovery mapping so the picker,
+    // wizard, and composer banner agree. Re-pair is never offered unless the
+    // status is a credential/revocation state.
+    const recovery = runtime.runtimeStatusRecovery(status);
+    const primary_label = runtime.runtimeRecoveryLabel(recovery, status);
+    switch (recovery) {
+        .retry => pushButton(plan, if (status == .offline or status == .paired_offline) .connect else .retry, primary_label, .primary),
+        .reconnect => pushButton(plan, .reconnect, primary_label, .primary),
+        .credential => pushButton(plan, .connect, primary_label, .primary),
+        .repair => pushButton(plan, .pair_device, primary_label, .primary),
+        .review_trust => pushButton(plan, .review_trust, primary_label, .primary),
+        .edit_endpoint => pushButton(plan, .edit, primary_label, .primary),
+        .choose_runtime => pushButton(plan, .choose_runtime, primary_label, .primary),
+        .server_setup => pushButton(plan, .show_server_setup, primary_label, .primary),
+        .none => switch (status) {
+            .connecting, .handshaking, .trust_required, .ready, .reconnecting => pushButton(plan, .disable, "Disconnect", .secondary),
+            else => {},
+        },
+    }
+    // Readiness failures happen on an authenticated open session. Keep an
+    // explicit Disconnect alongside the corrective action and fresh-session
+    // retry so users are never trapped in a connected-but-blocked state.
+    if (snapshot) |live| {
+        if (live.phase == .ready and recovery != .none) pushButton(plan, .disable, "Disconnect", .secondary);
+    }
+    if (recovery != .server_setup and runtime.runtimeStatusOffersServerSetup(status)) {
+        pushButton(plan, .show_server_setup, "Show server setup", .secondary);
     }
     if (snapshot) |live| switch (live.access) {
         .admin_token => if (live.credential_held) pushButton(plan, .forget_token, "Forget token", .secondary),
         .paired_device => if (live.device_id != null or live.credential_held) {
             pushButton(plan, .forget_device, "Forget device", .secondary);
-            if (status != .pairing_required and status != .pairing_rejected) pushButton(plan, .pair_device, "Re-pair", .secondary);
         },
         .connect => {},
     };
@@ -2647,11 +2670,7 @@ fn isRuntimeActionHovered(state: *const runtime.AppState, index: usize) bool {
 }
 
 fn runtimeStatusColor(status: runtime.RuntimePickerStatus) [4]f32 {
-    return switch (status) {
-        .ready => theme.success(),
-        .connecting, .handshaking, .reconnecting, .limited, .trust_required, .credential_required, .offline, .pairing_required, .rate_limited, .runtime_selection_required => theme.COLOR_TEXT_MUTED,
-        .authentication_failed, .identity_mismatch, .connection_failed, .failed, .unsupported, .unavailable, .pairing_rejected => theme.danger(),
-    };
+    return runtime.runtimeStatusTone(status).color();
 }
 
 // Runtimes & connections: Local plus saved runtimes with live state, per-row

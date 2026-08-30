@@ -175,6 +175,7 @@ pub const TurnCommitRequest = struct {
     expected_thread_title: ?[]const u8 = null,
     generated_title: ?[]const u8 = null,
     error_message: ?[]const u8 = null,
+    failure_reason: ?store_protocol.ProviderFailureReason = null,
     user_message_id: ?[]const u8 = null,
     /// Rows are already ordered by transcript_apply; the store appends them
     /// in this order. Empty synthesized-row IDs are assigned at this boundary
@@ -488,7 +489,7 @@ pub const Store = struct {
         conn.execNoArgs(
             \\insert or ignore into terminal_turn_replay_guard (turn_id, status)
             \\select turn_id, status from chat_turns
-            \\where status in ('completed', 'failed', 'aborted');
+            \\where status in ('completed', 'failed', 'aborted', 'interrupted');
         ) catch |err| return mapOpenError(err);
 
         return .{
@@ -1046,24 +1047,47 @@ pub const Store = struct {
         };
         // Match the S1 mutation convention: client_id identifies the caller
         // but is not part of the logical turn state or its replay fingerprint.
-        const fingerprint = self.fingerprintValue(.{
-            .turn_id = request.turn_id,
-            .workspace_id = request.workspace_id,
-            .local_thread_id = request.local_thread_id,
-            .status = request.status,
-            .started_at_ms = request.started_at_ms,
-            .finished_at_ms = request.finished_at_ms,
-            .provider = request.provider,
-            .harness = request.harness,
-            .provider_thread_id = request.provider_thread_id,
-            .expected_thread_title = request.expected_thread_title,
-            .generated_title = request.generated_title,
-            .error_message = request.error_message,
-            .user_message_id = request.user_message_id,
-            .messages = request.messages,
-            .followup_pending = request.followup_pending,
-            .completion = request.completion,
-        }) catch |err| return err;
+        // Preserve the pre-v10 fingerprint byte-for-byte for null reasons so
+        // retries of old receipts remain duplicates instead of conflicts.
+        const fingerprint = if (request.failure_reason) |failure_reason|
+            self.fingerprintValue(.{
+                .turn_id = request.turn_id,
+                .workspace_id = request.workspace_id,
+                .local_thread_id = request.local_thread_id,
+                .status = request.status,
+                .started_at_ms = request.started_at_ms,
+                .finished_at_ms = request.finished_at_ms,
+                .provider = request.provider,
+                .harness = request.harness,
+                .provider_thread_id = request.provider_thread_id,
+                .expected_thread_title = request.expected_thread_title,
+                .generated_title = request.generated_title,
+                .error_message = request.error_message,
+                .failure_reason = failure_reason,
+                .user_message_id = request.user_message_id,
+                .messages = request.messages,
+                .followup_pending = request.followup_pending,
+                .completion = request.completion,
+            }) catch |err| return err
+        else
+            self.fingerprintValue(.{
+                .turn_id = request.turn_id,
+                .workspace_id = request.workspace_id,
+                .local_thread_id = request.local_thread_id,
+                .status = request.status,
+                .started_at_ms = request.started_at_ms,
+                .finished_at_ms = request.finished_at_ms,
+                .provider = request.provider,
+                .harness = request.harness,
+                .provider_thread_id = request.provider_thread_id,
+                .expected_thread_title = request.expected_thread_title,
+                .generated_title = request.generated_title,
+                .error_message = request.error_message,
+                .user_message_id = request.user_message_id,
+                .messages = request.messages,
+                .followup_pending = request.followup_pending,
+                .completion = request.completion,
+            }) catch |err| return err;
         defer self.allocator.free(fingerprint);
 
         self.conn.execNoArgs("begin immediate") catch |err| return mapStoreError(err);
@@ -2394,10 +2418,11 @@ pub const Store = struct {
             \\    where m3.thread_id = t.id and m3.message_id = p.message_id
             \\);
         );
-        // Keys of restored rows keep their original fingerprint/revision so a
-        // later same-turn replay commit still resolves duplicate-by-identity
-        // (the F1 user-row exception tolerates the fingerprint drift). Rows
-        // the snapshot carried already re-wrote their key on insert.
+        // Keys of restored rows keep their original fingerprint/revision so
+        // internal commit recovery still resolves duplicate-by-identity (the
+        // F1 user-row exception tolerates fingerprint drift). Public retries
+        // of interrupted turns use a new turn ID. Rows the snapshot carried
+        // already re-wrote their key on insert.
         try self.conn.execNoArgs(
             \\insert into client_message_keys (thread_id, message_id, message_fingerprint, sort_index,
             \\                                 created_at_ms, updated_at_ms, store_revision)
@@ -3215,12 +3240,11 @@ pub const Store = struct {
                     if (existing) |status| {
                         if (status.conflict) {
                             // Amendment-2 F1: the turn's user row is idempotent
-                            // by IDENTITY, not fingerprint. A stable-turn_id
-                            // replay after an interrupted sweep re-sends the
-                            // acceptance user row with drifted prompt/timestamps;
-                            // the originally staged row stays authoritative
-                            // (first-writer-wins). All other rows keep strict
-                            // fingerprint conflicts.
+                            // by IDENTITY, not fingerprint. Internal recovery
+                            // may carry drifted prompt/timestamps; the original
+                            // staged row stays authoritative (first-writer-
+                            // wins). Public interrupted-turn retries use a new
+                            // turn ID. All other rows keep strict conflicts.
                             const is_user_row = if (request.user_message_id) |uid|
                                 std.mem.eql(u8, stored_message.message_id, uid)
                             else
@@ -3243,7 +3267,7 @@ pub const Store = struct {
         // transaction (no external pre-delete). Receipt replay still short-circuits
         // before this call, so a duplicate commit never mutates the ledger.
         try self.conn.exec(
-            "insert into chat_turns (turn_id, workspace_id, local_thread_id, status, started_at_ms, finished_at_ms, provider, provider_thread_id, error_message, user_message_id, committed_store_revision) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) on conflict(turn_id) do update set workspace_id = excluded.workspace_id, local_thread_id = excluded.local_thread_id, status = excluded.status, started_at_ms = excluded.started_at_ms, finished_at_ms = excluded.finished_at_ms, provider = excluded.provider, provider_thread_id = excluded.provider_thread_id, error_message = excluded.error_message, user_message_id = excluded.user_message_id, committed_store_revision = excluded.committed_store_revision",
+            "insert into chat_turns (turn_id, workspace_id, local_thread_id, status, started_at_ms, finished_at_ms, provider, provider_thread_id, error_message, failure_reason, user_message_id, committed_store_revision) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) on conflict(turn_id) do update set workspace_id = excluded.workspace_id, local_thread_id = excluded.local_thread_id, status = excluded.status, started_at_ms = excluded.started_at_ms, finished_at_ms = excluded.finished_at_ms, provider = excluded.provider, provider_thread_id = excluded.provider_thread_id, error_message = excluded.error_message, failure_reason = excluded.failure_reason, user_message_id = excluded.user_message_id, committed_store_revision = excluded.committed_store_revision",
             .{
                 request.turn_id,
                 request.workspace_id,
@@ -3254,6 +3278,7 @@ pub const Store = struct {
                 request.provider,
                 request.provider_thread_id,
                 request.error_message,
+                if (request.failure_reason) |reason| @tagName(reason) else null,
                 request.user_message_id,
                 store_revision,
             },
@@ -4741,7 +4766,7 @@ const LegacyStateSnapshot = struct {
                 "coalesce((select group_concat(v, char(30)) from (select quote(w.workspace_id)||char(31)||quote(t.local_thread_id)||char(31)||quote(t.title)||char(31)||quote(t.provider_thread_id)||char(31)||t.provider||char(31)||t.harness v from threads t join workspaces w on w.id=t.workspace_id order by w.workspace_id,t.local_thread_id)), ''), " ++
                 "coalesce((select group_concat(v, char(30)) from (select quote(message_id)||char(31)||quote(role)||char(31)||quote(author)||char(31)||quote(body)||char(31)||quote(image_path)||char(31)||quote(image_mime)||char(31)||quote(image_byte_size)||char(31)||quote(created_at_ms)||char(31)||quote(updated_at_ms) v from messages order by thread_id,sort_index)), ''), " ++
                 "coalesce((select group_concat(v, char(30)) from (select quote(message_id)||char(31)||quote(message_fingerprint)||char(31)||quote(sort_index)||char(31)||quote(created_at_ms)||char(31)||quote(updated_at_ms)||char(31)||quote(store_revision) v from client_message_keys order by thread_id,message_id)), ''), " ++
-                "coalesce((select group_concat(v, char(30)) from (select quote(turn_id)||char(31)||quote(workspace_id)||char(31)||quote(local_thread_id)||char(31)||quote(status)||char(31)||quote(started_at_ms)||char(31)||quote(finished_at_ms)||char(31)||quote(provider)||char(31)||quote(provider_thread_id)||char(31)||quote(error_message)||char(31)||quote(user_message_id)||char(31)||quote(committed_store_revision) v from chat_turns order by turn_id)), ''), " ++
+                "coalesce((select group_concat(v, char(30)) from (select quote(turn_id)||char(31)||quote(workspace_id)||char(31)||quote(local_thread_id)||char(31)||quote(status)||char(31)||quote(started_at_ms)||char(31)||quote(finished_at_ms)||char(31)||quote(provider)||char(31)||quote(provider_thread_id)||char(31)||quote(error_message)||char(31)||quote(failure_reason)||char(31)||quote(user_message_id)||char(31)||quote(committed_store_revision) v from chat_turns order by turn_id)), ''), " ++
                 "coalesce((select group_concat(v, char(30)) from (select quote(request_key)||char(31)||quote(operation)||char(31)||quote(fingerprint)||char(31)||quote(store_revision)||char(31)||quote(response_status)||char(31)||quote(response_payload) v from store_receipts order by request_key)), ''), " ++
                 "coalesce((select group_concat(v, char(30)) from (select quote(turn_id)||char(31)||quote(status) v from terminal_turn_replay_guard order by turn_id)), '')",
             .{},
@@ -6900,8 +6925,8 @@ test "transcript_apply rows commit with deterministic IDs and replay exactly onc
 
 // M4-P4 fix Layer B (i): a GUI-shaped id-carrying snapshot after a daemon
 // commit preserves every identity, the message keys, and the ledger's
-// user_message_id reference — and an interrupted same-turn replay commit
-// after the snapshot does not duplicate the user row.
+// user_message_id reference — and lower-level commit recovery does not
+// duplicate the user row. Public interrupted-turn retries use a new turn ID.
 test "snapshot replace preserves daemon-committed identities keys and ledger reference" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

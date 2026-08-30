@@ -3207,6 +3207,7 @@ const RuntimeActivationAction = enum {
     none,
     enable,
     retry,
+    reconnect,
     request_credential,
     /// Paired profile without a usable device credential: open the grant step
     /// instead of the administrator-token modal.
@@ -3251,7 +3252,155 @@ pub const RuntimePickerStatus = enum {
     rate_limited,
     /// Connect profile awaiting selection or runtime-local bootstrap.
     runtime_selection_required,
+    /// Paired device credential is on file but no session is open. Distinct
+    /// from `ready` ("Connected") so a paired-but-unreachable runtime never
+    /// reads as usable.
+    paired_offline,
+    /// The endpoint answered but it is another service (typed `wrong_service`).
+    not_verde_runtime,
+    /// A Verde-looking endpoint returned a malformed or incompatible reply.
+    invalid_protocol,
+    /// Reachable but the runtime reports itself unavailable.
+    server_unavailable,
+    /// The runtime rejected the paired device credential: revoked or the
+    /// device record is gone. Only this (and grant states) leads to Re-pair.
+    device_revoked,
+    /// Session is open but this workspace has no remote binding.
+    workspace_binding_missing,
+    /// Session is open but the selected provider is not installed there.
+    provider_unavailable,
+    /// Session is open but the selected provider is not signed in there.
+    provider_not_authenticated,
+    /// The local secure credential store could not be opened.
+    credential_store_unavailable,
 };
+
+/// What the primary recovery affordance should do for a status. Shared by the
+/// settings row, the picker, and the composer banner so copy and actions
+/// cannot drift apart.
+pub const RuntimeRecovery = enum {
+    none,
+    /// Start or retry the connection on the same endpoint.
+    retry,
+    /// Session is open but readiness is stale/blocked: drop it and open a
+    /// fresh one so the binding/provider probe runs again.
+    reconnect,
+    /// Enter the administrator token again.
+    credential,
+    /// Redeem a new one-time grant (credential/revocation states only).
+    repair,
+    /// Present a pending first-contact identity, never silently adopt it.
+    review_trust,
+    /// Fix the host/port/URL.
+    edit_endpoint,
+    /// Connect profile: choose a runtime in the editor.
+    choose_runtime,
+    /// Fix on the server side: open the server setup guide.
+    server_setup,
+};
+
+pub fn runtimeStatusRecovery(status: RuntimePickerStatus) RuntimeRecovery {
+    return switch (status) {
+        .offline, .paired_offline, .connection_failed, .server_unavailable, .invalid_protocol, .failed, .rate_limited, .limited, .credential_store_unavailable => .retry,
+        .credential_required, .authentication_failed => .credential,
+        .pairing_required, .pairing_rejected, .device_revoked => .repair,
+        .trust_required => .review_trust,
+        .identity_mismatch, .not_verde_runtime, .unsupported => .edit_endpoint,
+        .runtime_selection_required => .choose_runtime,
+        // The server-side fix stays reachable via the "Show server setup"
+        // secondary (`runtimeStatusOffersServerSetup`); the primary must
+        // re-probe once that fix has been applied.
+        .workspace_binding_missing, .provider_unavailable, .provider_not_authenticated => .reconnect,
+        .connecting, .handshaking, .reconnecting, .ready, .unavailable => .none,
+    };
+}
+
+/// Whether "Show server setup" is a useful secondary action for a status.
+pub fn runtimeStatusOffersServerSetup(status: RuntimePickerStatus) bool {
+    return switch (status) {
+        .not_verde_runtime, .invalid_protocol, .server_unavailable, .connection_failed, .workspace_binding_missing, .provider_unavailable, .provider_not_authenticated => true,
+        else => false,
+    };
+}
+
+/// Button label for the primary recovery action.
+pub fn runtimeRecoveryLabel(recovery: RuntimeRecovery, status: RuntimePickerStatus) []const u8 {
+    return switch (recovery) {
+        .none => switch (status) {
+            .connecting, .handshaking => "Connecting…",
+            .reconnecting => "Reconnecting…",
+            else => "",
+        },
+        .retry => switch (status) {
+            .offline, .paired_offline => "Connect",
+            .limited => "Reconnect",
+            else => "Retry",
+        },
+        .reconnect => "Reconnect",
+        .credential => "Enter token",
+        .repair => "Re-pair device",
+        .review_trust => "Review identity",
+        .edit_endpoint => "Edit endpoint",
+        .choose_runtime => "Choose runtime",
+        .server_setup => "Show server setup",
+    };
+}
+
+/// Colour tone for a status badge, shared by the picker, wizard, settings
+/// row, and composer banner. Paired-but-offline is informative, not an error.
+pub const RuntimeStatusTone = enum {
+    success,
+    muted,
+    warning,
+    danger,
+
+    pub fn color(self: RuntimeStatusTone) [4]f32 {
+        return switch (self) {
+            .success => theme.success(),
+            .muted => theme.COLOR_TEXT_MUTED,
+            .warning => theme.warning(),
+            .danger => theme.danger(),
+        };
+    }
+};
+
+pub fn runtimeStatusTone(status: RuntimePickerStatus) RuntimeStatusTone {
+    return switch (status) {
+        .ready => .success,
+        .connecting, .handshaking, .reconnecting, .limited, .trust_required, .credential_required, .offline, .paired_offline, .pairing_required, .rate_limited, .runtime_selection_required => .muted,
+        .workspace_binding_missing, .provider_unavailable, .provider_not_authenticated, .server_unavailable => .warning,
+        .authentication_failed, .identity_mismatch, .connection_failed, .failed, .unsupported, .unavailable, .pairing_rejected, .not_verde_runtime, .invalid_protocol, .device_revoked, .credential_store_unavailable => .danger,
+    };
+}
+
+/// A selected remote runtime that cannot accept a send right now, resolved
+/// from typed snapshot fields only. The thread's selection is left untouched;
+/// the banner never offers Local as a fallback.
+pub const RuntimeComposerBlocker = struct {
+    profile_id: []const u8,
+    label: []const u8,
+    status: RuntimePickerStatus,
+    recovery: RuntimeRecovery,
+    offers_server_setup: bool,
+    automatic_retry_scheduled: bool,
+    retry_attempt: u8,
+};
+
+fn runtimeSnapshotBlocksSend(
+    snapshot: RuntimeService.Snapshot,
+    status: RuntimePickerStatus,
+    pinned_runtime_id: ?[]const u8,
+) bool {
+    if (status != .ready) return true;
+    // Mirrors the pre-dispatch route check in chat_controller so the banner
+    // and the rejection agree.
+    const runtime = snapshot.runtime orelse return true;
+    if (pinned_runtime_id) |pinned| {
+        if (!std.mem.eql(u8, pinned, runtime.runtime_id)) return true;
+    }
+    return !snapshot.verified_runtime_matches_pin or
+        !snapshot.repository_manifest_capable or !snapshot.repository_chat_route_capable;
+}
 
 pub const RuntimePickerProfile = struct {
     profile_id: []u8,
@@ -3267,36 +3416,118 @@ fn runtimeProfileVisibleInPicker(snapshot: RuntimeService.Snapshot) bool {
     return snapshot.transport != .local_socket;
 }
 
+const RuntimeFailure = @typeInfo(@FieldType(RuntimeService.Snapshot, "failure")).optional.child;
+
 pub fn runtimePickerStatus(snapshot: RuntimeService.Snapshot) RuntimePickerStatus {
     if (snapshot.identity_pin_required) return .trust_required;
     return switch (snapshot.phase) {
         .connecting => .connecting,
         .handshaking => .handshaking,
         .awaiting_trust => .trust_required,
-        .ready => if (snapshot.execution_ready) .ready else .limited,
+        // A session can be open while a typed readiness failure blocks
+        // execution (binding/provider); surface that instead of "limited".
+        .ready => readinessStatus(snapshot.failure_reason) orelse if (snapshot.execution_ready) .ready else .limited,
         .reconnecting => .reconnecting,
-        .disabled, .failed => if (snapshot.failure) |failure| switch (failure) {
-            .missing_credential => if (snapshot.access == .paired_device) .pairing_required else if (snapshot.access == .connect) .runtime_selection_required else .credential_required,
-            .unsupported_transport => if (snapshot.access == .connect) .runtime_selection_required else .unsupported,
-            .authentication => .authentication_failed,
-            .identity => .identity_mismatch,
-            .network, .no_loopback_port, .tunnel_spawn, .tunnel_readiness, .tunnel_wait, .tunnel_exited => .connection_failed,
-            .protocol, .resource => .failed,
-            .pairing_rejected => .pairing_rejected,
-            .rate_limited => .rate_limited,
-        } else if (snapshot.access == .connect and (snapshot.device_id == null or !snapshot.device_credential_held))
+        .disabled, .failed => if (snapshot.failure_reason) |reason|
+            failureReasonStatus(snapshot, reason)
+        else if (snapshot.failure) |failure|
+            legacyFailureStatus(snapshot, failure)
+        else if (snapshot.access == .connect and (snapshot.device_id == null or !snapshot.device_credential_held))
             .runtime_selection_required
         else if (snapshot.access == .paired_device and !snapshot.device_credential_held and snapshot.pairing_state == .none)
             .pairing_required
-        else if (snapshot.phase == .disabled) .offline else .failed,
+        else if (snapshot.phase == .disabled)
+            (if (snapshot.access == .paired_device) .paired_offline else .offline)
+        else
+            .failed,
+    };
+}
+
+/// Typed readiness failures reported while the session itself is fine.
+fn readinessStatus(reason: ?RuntimeService.FailureReason) ?RuntimePickerStatus {
+    return switch (reason orelse return null) {
+        .workspace_binding_missing => .workspace_binding_missing,
+        .provider_unavailable => .provider_unavailable,
+        .provider_not_authenticated => .provider_not_authenticated,
+        else => null,
+    };
+}
+
+/// Maps the manager's typed `failure_reason` to a picker status. The coarse
+/// `failure` is consulted only where the reason is deliberately ambiguous
+/// (`authentication_required` covers missing, refused, and revoked
+/// credentials; `unknown` defers to the legacy classification).
+fn failureReasonStatus(snapshot: RuntimeService.Snapshot, reason: RuntimeService.FailureReason) RuntimePickerStatus {
+    return switch (reason) {
+        .transport_offline => .connection_failed,
+        .wrong_service => .not_verde_runtime,
+        .invalid_protocol_response => .invalid_protocol,
+        .server_unavailable => .server_unavailable,
+        .identity_changed => .identity_mismatch,
+        .workspace_binding_missing => .workspace_binding_missing,
+        .provider_unavailable => .provider_unavailable,
+        .provider_not_authenticated => .provider_not_authenticated,
+        .authentication_required => if (snapshot.failure) |failure| switch (failure) {
+            .missing_credential => credentialMissingStatus(snapshot),
+            .pairing_rejected => if (snapshot.access == .connect) .runtime_selection_required else .pairing_rejected,
+            else => authenticationRejectedStatus(snapshot),
+        } else authenticationRejectedStatus(snapshot),
+        .device_credential_revoked => authenticationRejectedStatus(snapshot),
+        // A malformed stored credential needs re-entry / re-pair, same as a
+        // missing one.
+        .credential_invalid => credentialMissingStatus(snapshot),
+        .credential_store_unavailable => .credential_store_unavailable,
+        .unknown => if (snapshot.failure) |failure| legacyFailureStatus(snapshot, failure) else .failed,
+    };
+}
+
+fn credentialMissingStatus(snapshot: RuntimeService.Snapshot) RuntimePickerStatus {
+    return switch (snapshot.access) {
+        .paired_device => .pairing_required,
+        .connect => .runtime_selection_required,
+        .admin_token => .credential_required,
+    };
+}
+
+fn authenticationRejectedStatus(snapshot: RuntimeService.Snapshot) RuntimePickerStatus {
+    return switch (snapshot.access) {
+        .paired_device => .device_revoked,
+        .connect => .runtime_selection_required,
+        .admin_token => .authentication_failed,
+    };
+}
+
+fn runtimeCredentialRecoveryAction(snapshot: RuntimeService.Snapshot) RuntimeActivationAction {
+    return switch (snapshot.access) {
+        .paired_device => .request_pairing,
+        .connect => .request_runtime_selection,
+        .admin_token => .request_credential,
+    };
+}
+
+fn legacyFailureStatus(snapshot: RuntimeService.Snapshot, failure: RuntimeFailure) RuntimePickerStatus {
+    return switch (failure) {
+        .missing_credential => credentialMissingStatus(snapshot),
+        .unsupported_transport => if (snapshot.access == .connect) .runtime_selection_required else .unsupported,
+        .authentication => authenticationRejectedStatus(snapshot),
+        .identity => .identity_mismatch,
+        .network, .no_loopback_port, .tunnel_spawn, .tunnel_readiness, .tunnel_wait, .tunnel_exited => .connection_failed,
+        .protocol => .invalid_protocol,
+        .resource => .failed,
+        .pairing_rejected => .pairing_rejected,
+        .rate_limited => .rate_limited,
     };
 }
 
 fn runtimeActivationAction(snapshot: RuntimeService.Snapshot) RuntimeActivationAction {
     if (snapshot.access == .connect and (snapshot.device_id == null or !snapshot.device_credential_held)) return .request_runtime_selection;
+    if (snapshot.failure_reason) |reason| switch (reason) {
+        .authentication_required, .credential_invalid, .device_credential_revoked => return runtimeCredentialRecoveryAction(snapshot),
+        else => {},
+    };
     if (snapshot.failure) |failure| {
         if (failure == .missing_credential or failure == .authentication or failure == .pairing_rejected) {
-            return if (snapshot.access == .paired_device) .request_pairing else .request_credential;
+            return runtimeCredentialRecoveryAction(snapshot);
         }
     }
     if (snapshot.access == .paired_device and !snapshot.device_credential_held and snapshot.pairing_state == .none) {
@@ -3305,7 +3536,10 @@ fn runtimeActivationAction(snapshot: RuntimeService.Snapshot) RuntimeActivationA
     return switch (snapshot.phase) {
         .disabled => .enable,
         .failed => .retry,
-        .connecting, .handshaking, .awaiting_trust, .ready, .reconnecting => .none,
+        .ready => if (!snapshot.execution_ready or
+            !snapshot.repository_manifest_capable or
+            !snapshot.repository_chat_route_capable) .reconnect else .none,
+        .connecting, .handshaking, .awaiting_trust, .reconnecting => .none,
     };
 }
 
@@ -3337,6 +3571,15 @@ pub fn runtimePickerStatusBadge(status: RuntimePickerStatus) []const u8 {
         .pairing_rejected => "Grant refused",
         .rate_limited => "Rate limited",
         .runtime_selection_required => "Choose runtime",
+        .paired_offline => "Paired · offline",
+        .not_verde_runtime => "Not a Verde runtime",
+        .invalid_protocol => "Invalid protocol",
+        .server_unavailable => "Server unavailable",
+        .device_revoked => "Device revoked",
+        .workspace_binding_missing => "No workspace binding",
+        .provider_unavailable => "Provider unavailable",
+        .provider_not_authenticated => "Provider not signed in",
+        .credential_store_unavailable => "Credential store unavailable",
     };
 }
 
@@ -3354,7 +3597,20 @@ pub fn runtimePickerStatusDescription(status: RuntimePickerStatus) []const u8 {
         .pairing_rejected => "The runtime refused the grant; mint a new one",
         .rate_limited => "The runtime is rate limiting pairing; wait and retry",
         .runtime_selection_required => "Sign in, choose a linked runtime, and create its local device credential",
-        else => "Remote Verde runtime",
+        .paired_offline => "Paired, not connected — the device credential is on file",
+        .ready => "Connected and verified",
+        .limited => "Connected, but not ready to run chats yet",
+        .connecting, .handshaking => "Connecting to the runtime",
+        .reconnecting => "Connection lost; reconnecting",
+        .offline => "Not connected",
+        .not_verde_runtime => "The endpoint answered, but it is not a Verde runtime — check what is listening there",
+        .invalid_protocol => "The runtime replied with an invalid or incompatible protocol response",
+        .server_unavailable => "The runtime is reachable but reports it is unavailable",
+        .device_revoked => "The runtime no longer accepts this device; it was revoked or replaced",
+        .workspace_binding_missing => "Connected, but this workspace has no binding on the runtime",
+        .provider_unavailable => "Connected, but the selected provider is not available on the runtime",
+        .provider_not_authenticated => "Connected, but the selected provider is not signed in on the runtime",
+        .credential_store_unavailable => "The local secure credential store could not be opened",
     };
 }
 
@@ -4814,6 +5070,30 @@ pub const AppState = struct {
             "Remote runtime identity was not trusted; the connection was disabled."
         else
             "Remote runtime trust canceled; cleanup will finish during shutdown.");
+    }
+
+    fn presentRuntimeTrustProposal(self: *AppState, profile_id: []const u8) bool {
+        if (self.runtime_pin_proposal != null) return true;
+        const service = self.runtime_service orelse return false;
+        const proposal = service.pinProposalAlloc(self.allocator, profile_id) catch |err| {
+            log.warn("failed to copy remote runtime identity proposal: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Could not load the runtime identity for review.");
+            return false;
+        } orelse return false;
+        self.runtime_pin_proposal = proposal;
+        self.setRuntimeTrustNotice("");
+        self.palette_modal_text_focus = .none;
+        self.modal_text_selection_anchor = null;
+        self.modal_text_drag_active = false;
+        return true;
+    }
+
+    /// Opens the existing first-contact proposal. Established-pin mismatches
+    /// deliberately take the endpoint-edit/remove-and-pair path instead; an
+    /// ordinary retry must never turn a changed peer into a trusted one.
+    pub fn reviewRuntimeIdentity(self: *AppState, profile_id: []const u8) void {
+        if (self.presentRuntimeTrustProposal(profile_id)) return;
+        self.setSidebarNotice("Identity details are not ready for review. Retry the connection, or edit the endpoint if its saved identity changed.");
     }
 
     pub fn confirmRuntimeTrust(self: *AppState) void {
@@ -11212,6 +11492,125 @@ pub const AppState = struct {
         return snapshot.label;
     }
 
+    /// Blocker for the current thread's selected remote runtime, or null when
+    /// the selection is Local or the runtime can run.
+    pub fn runtimeComposerBlocker(self: *const AppState) ?RuntimeComposerBlocker {
+        const thread = self.currentThread();
+        const selected = thread.selectedRuntimeRoute();
+        if (std.mem.eql(u8, selected.profile_id, chat_types.LOCAL_RUNTIME_PROFILE_ID)) return null;
+        const service = self.runtime_service orelse return .{
+            .profile_id = selected.profile_id,
+            .label = selected.profile_id,
+            .status = .unavailable,
+            .recovery = .none,
+            .offers_server_setup = false,
+            .automatic_retry_scheduled = false,
+            .retry_attempt = 0,
+        };
+        const snapshot = service.snapshot(selected.profile_id) orelse return .{
+            .profile_id = selected.profile_id,
+            .label = selected.profile_id,
+            .status = .unavailable,
+            .recovery = .none,
+            .offers_server_setup = false,
+            .automatic_retry_scheduled = false,
+            .retry_attempt = 0,
+        };
+        const pinned_runtime_id = if (thread.pinnedRuntimeRoute()) |pinned| pinned.runtime_id else null;
+        const thread_identity_mismatch = if (pinned_runtime_id) |pinned|
+            if (snapshot.runtime) |runtime| !std.mem.eql(u8, pinned, runtime.runtime_id) else false
+        else
+            false;
+        const status: RuntimePickerStatus = if (thread_identity_mismatch) .identity_mismatch else runtimePickerStatus(snapshot);
+        if (!runtimeSnapshotBlocksSend(snapshot, status, pinned_runtime_id)) return null;
+        return .{
+            .profile_id = snapshot.profile_id,
+            .label = snapshot.label,
+            .status = status,
+            // A thread pin is immutable after its first send. Restoring the
+            // original runtime (or starting a new thread) is a server/setup
+            // decision, not permission to silently re-pin this thread.
+            .recovery = if (thread_identity_mismatch) .server_setup else runtimeStatusRecovery(status),
+            .offers_server_setup = if (thread_identity_mismatch) true else runtimeStatusOffersServerSetup(status),
+            .automatic_retry_scheduled = snapshot.automatic_retry_scheduled,
+            .retry_attempt = snapshot.retry_attempt,
+        };
+    }
+
+    /// Runs the banner's primary recovery on the same runtime. The thread's
+    /// selection is never changed here.
+    pub fn recoverRuntimeFromBanner(self: *AppState, profile_id: []const u8, recovery: RuntimeRecovery) void {
+        switch (recovery) {
+            .retry, .credential, .repair => self.connectRuntimeProfileFromPicker(profile_id),
+            .reconnect => self.reconnectRuntimeProfile(profile_id),
+            .review_trust => self.reviewRuntimeIdentity(profile_id),
+            .edit_endpoint, .choose_runtime => self.openRuntimeConnectionEditor(profile_id),
+            .server_setup => self.openRuntimeServerSetupGuide(),
+            .none => {},
+        }
+    }
+
+    /// Applies the shared recovery mapping to a saved profile. The connection
+    /// wizard uses this so a button labelled Edit/Review/Server setup never
+    /// falls through to an unrelated reconnect.
+    pub fn recoverRuntimeProfile(self: *AppState, profile_id: []const u8) void {
+        const service = self.runtime_service orelse {
+            self.setSidebarNotice("Runtime service is unavailable.");
+            return;
+        };
+        const snapshot = service.snapshot(profile_id) orelse {
+            self.setSidebarNotice("That configured runtime is unavailable.");
+            return;
+        };
+        const status = runtimePickerStatus(snapshot);
+        self.recoverRuntimeFromBanner(profile_id, runtimeStatusRecovery(status));
+    }
+
+    /// Drops the open session and starts a fresh attempt on the same
+    /// endpoint so binding/provider readiness is probed again. Distinct from
+    /// `connectRuntimeProfileFromPicker`, which is a no-op on an open session.
+    pub fn reconnectRuntimeProfile(self: *AppState, profile_id: []const u8) void {
+        const service = self.runtime_service orelse {
+            self.setSidebarNotice("Runtime service is unavailable.");
+            return;
+        };
+        service.reconnect(profile_id, runtimeConnectionNowMs()) catch |err| {
+            log.warn("failed to reconnect remote runtime: {s}", .{@errorName(err)});
+            self.setSidebarNotice("The remote runtime could not be reconnected.");
+            return;
+        };
+        runtime_connections_controller.invalidateReadiness(self, profile_id);
+        self.setSidebarNotice("Reconnecting to the remote runtime and re-checking readiness...");
+    }
+
+    /// Copies the secret-free diagnostics bundle; the notice reports only
+    /// success/failure, never the contents.
+    pub fn copyRuntimeDiagnosticsToClipboard(self: *AppState, profile_id: []const u8) void {
+        const service = self.runtime_service orelse {
+            self.setSidebarNotice("Runtime service is unavailable.");
+            return;
+        };
+        const text = service.redactedDiagnosticsAlloc(self.allocator, profile_id) catch |err| {
+            log.warn("runtime diagnostics failed: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Could not build runtime diagnostics.");
+            return;
+        };
+        defer self.allocator.free(text);
+        self.setSidebarNotice(if (self.setClipboardText(text))
+            "Redacted runtime diagnostics copied (no credential material)."
+        else
+            "Could not access the clipboard.");
+    }
+
+    pub fn openRuntimeServerSetupGuide(self: *AppState) void {
+        utils.openUrlInDefaultBrowser(self.allocator, "https://github.com/JonathanRiche/verde/blob/master/docs/serve-pair-connect.md") catch |err| {
+            log.warn("failed to open server setup guide: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Could not open the guide. On GitHub, open Verde's docs/serve-pair-connect.md.");
+            return;
+        };
+        self.setSidebarNotice("Opened the remote runtime setup guide.");
+    }
+
     pub fn connectRuntimeProfileFromPicker(self: *AppState, profile_id: []const u8) void {
         const service = self.runtime_service orelse {
             self.setSidebarNotice("Runtime service is unavailable.");
@@ -11221,6 +11620,21 @@ pub const AppState = struct {
             self.setSidebarNotice("That configured runtime is unavailable.");
             return;
         };
+        if (snapshot.failure_reason == .credential_store_unavailable) {
+            service.reloadProfiles() catch |err| {
+                log.warn("failed to reload remote runtime credentials: {s}", .{@errorName(err)});
+                self.setSidebarNotice("The OS credential store is still unavailable. Unlock it, then retry.");
+                return;
+            };
+            self.syncPaletteRuntimePicker();
+            const reloaded = service.snapshot(profile_id);
+            if (reloaded != null and reloaded.?.failure_reason != .credential_store_unavailable) {
+                self.connectRuntimeProfileFromPicker(profile_id);
+                return;
+            }
+            self.setSidebarNotice("The OS credential store is still unavailable. Unlock it, then retry.");
+            return;
+        }
         const action = runtimeActivationAction(snapshot);
         if (action == .request_pairing) {
             self.openRuntimePairing(profile_id);
@@ -11251,23 +11665,36 @@ pub const AppState = struct {
                 service.retry(profile_id, now_ms) catch |err| break :blk err;
                 break :blk null;
             },
+            .reconnect => blk: {
+                service.reconnect(profile_id, now_ms) catch |err| break :blk err;
+                break :blk null;
+            },
             .none => null,
             .request_credential, .request_pairing, .request_runtime_selection => unreachable,
         };
         if (start_error) |err| {
             if (err == error.MissingRuntimeCredential) {
-                _ = self.revokeRuntimeProfileCredential(profile_id);
-                self.openRuntimeCredentialModal(profile_id) catch |open_err| {
-                    log.warn("failed to open remote runtime credential modal: {s}", .{@errorName(open_err)});
-                    self.setSidebarNotice("Could not open runtime credential entry.");
-                };
+                switch (runtimeCredentialRecoveryAction(snapshot)) {
+                    .request_pairing => self.openRuntimePairing(profile_id),
+                    .request_runtime_selection => self.openRuntimeConnectionEditor(profile_id),
+                    .request_credential => {
+                        _ = self.revokeRuntimeProfileCredential(profile_id);
+                        self.openRuntimeCredentialModal(profile_id) catch |open_err| {
+                            log.warn("failed to open remote runtime credential modal: {s}", .{@errorName(open_err)});
+                            self.setSidebarNotice("Could not open runtime credential entry.");
+                        };
+                    },
+                    else => unreachable,
+                }
                 return;
             }
             log.warn("failed to start configured remote runtime: {s}", .{@errorName(err)});
             self.setSidebarNotice("The remote runtime connection could not start.");
             return;
         }
-        self.setSidebarNotice(switch (snapshot.phase) {
+        self.setSidebarNotice(if (action == .reconnect)
+            "Reconnecting to refresh this runtime's workspace and provider readiness..."
+        else switch (snapshot.phase) {
             .ready => "Remote runtime is connected.",
             .awaiting_trust => "Verify the remote runtime identity to continue.",
             .connecting, .handshaking, .reconnecting => "Remote runtime connection is already in progress.",
@@ -14839,6 +15266,139 @@ test "runtime picker status maps lifecycle and trust states" {
     try std.testing.expectEqual(RuntimePickerStatus.trust_required, runtimePickerStatus(snapshot));
 }
 
+test "runtime picker status separates paired-offline, non-Verde endpoints, and revoked devices" {
+    var snapshot: RuntimeService.Snapshot = .{
+        .profile_id = "profile-paired",
+        .label = "Paired",
+        .transport = .ssh_tunnel,
+        .phase = .disabled,
+        .failure = null,
+        .retry_at_ms = null,
+        .local_port = null,
+        .tunnel_lifecycle = .stopped,
+        .tunnel_pid = null,
+        .runtime = null,
+        .identity_pin_required = false,
+        .rpc_in_flight = false,
+        .last_heartbeat_ms = null,
+        .execution_ready = false,
+        .access = .paired_device,
+        .device_credential_held = true,
+        .device_id = "0123456789abcdef0123456789abcdef",
+    };
+    try std.testing.expectEqual(RuntimePickerStatus.paired_offline, runtimePickerStatus(snapshot));
+    snapshot.device_credential_held = false;
+    try std.testing.expectEqual(RuntimePickerStatus.pairing_required, runtimePickerStatus(snapshot));
+    snapshot.device_credential_held = true;
+    snapshot.phase = .failed;
+    snapshot.failure = .protocol;
+    snapshot.failure_reason = .wrong_service;
+    try std.testing.expectEqual(RuntimePickerStatus.not_verde_runtime, runtimePickerStatus(snapshot));
+    snapshot.failure_reason = .invalid_protocol_response;
+    try std.testing.expectEqual(RuntimePickerStatus.invalid_protocol, runtimePickerStatus(snapshot));
+    snapshot.failure_reason = .server_unavailable;
+    try std.testing.expectEqual(RuntimePickerStatus.server_unavailable, runtimePickerStatus(snapshot));
+    snapshot.failure = .authentication;
+    snapshot.failure_reason = .authentication_required;
+    try std.testing.expectEqual(RuntimePickerStatus.device_revoked, runtimePickerStatus(snapshot));
+    try std.testing.expectEqual(RuntimeActivationAction.request_pairing, runtimeActivationAction(snapshot));
+    snapshot.failure = null;
+    snapshot.failure_reason = .device_credential_revoked;
+    try std.testing.expectEqual(RuntimePickerStatus.device_revoked, runtimePickerStatus(snapshot));
+    try std.testing.expectEqual(RuntimeActivationAction.request_pairing, runtimeActivationAction(snapshot));
+    snapshot.failure_reason = .credential_invalid;
+    try std.testing.expectEqual(RuntimePickerStatus.pairing_required, runtimePickerStatus(snapshot));
+    snapshot.failure_reason = .credential_store_unavailable;
+    try std.testing.expectEqual(RuntimePickerStatus.credential_store_unavailable, runtimePickerStatus(snapshot));
+    try std.testing.expectEqual(RuntimeActivationAction.retry, runtimeActivationAction(snapshot));
+    snapshot.failure = .identity;
+    snapshot.failure_reason = .identity_changed;
+    try std.testing.expectEqual(RuntimePickerStatus.identity_mismatch, runtimePickerStatus(snapshot));
+    try std.testing.expectEqual(RuntimeActivationAction.retry, runtimeActivationAction(snapshot));
+    snapshot.access = .admin_token;
+    snapshot.failure = .authentication;
+    snapshot.failure_reason = .authentication_required;
+    try std.testing.expectEqual(RuntimePickerStatus.authentication_failed, runtimePickerStatus(snapshot));
+    try std.testing.expectEqual(RuntimeActivationAction.request_credential, runtimeActivationAction(snapshot));
+    snapshot.access = .connect;
+    snapshot.device_id = "0123456789abcdef0123456789abcdef";
+    snapshot.device_credential_held = true;
+    try std.testing.expectEqual(RuntimePickerStatus.runtime_selection_required, runtimePickerStatus(snapshot));
+    try std.testing.expectEqual(RuntimeActivationAction.request_runtime_selection, runtimeActivationAction(snapshot));
+    // `unknown` defers to the coarse failure; the legacy path stays honest.
+    snapshot.failure = .resource;
+    snapshot.failure_reason = .unknown;
+    try std.testing.expectEqual(RuntimePickerStatus.failed, runtimePickerStatus(snapshot));
+    // Readiness failures are reported on an open session.
+    snapshot.phase = .ready;
+    snapshot.failure = null;
+    snapshot.execution_ready = true;
+    snapshot.failure_reason = .workspace_binding_missing;
+    try std.testing.expectEqual(RuntimePickerStatus.workspace_binding_missing, runtimePickerStatus(snapshot));
+    snapshot.failure_reason = .provider_not_authenticated;
+    try std.testing.expectEqual(RuntimePickerStatus.provider_not_authenticated, runtimePickerStatus(snapshot));
+    snapshot.failure_reason = null;
+    try std.testing.expectEqual(RuntimePickerStatus.ready, runtimePickerStatus(snapshot));
+}
+
+test "runtime recovery routes only credential states to re-pair" {
+    inline for (@typeInfo(RuntimePickerStatus).@"enum".fields) |field| {
+        const status: RuntimePickerStatus = @enumFromInt(field.value);
+        const recovery = runtimeStatusRecovery(status);
+        const repair_state = status == .pairing_required or status == .pairing_rejected or status == .device_revoked;
+        try std.testing.expectEqual(repair_state, recovery == .repair);
+        // Every non-transient state has a labelled affordance.
+        if (recovery != .none) try std.testing.expect(runtimeRecoveryLabel(recovery, status).len > 0);
+    }
+    try std.testing.expectEqual(RuntimeRecovery.edit_endpoint, runtimeStatusRecovery(.not_verde_runtime));
+    try std.testing.expectEqual(RuntimeRecovery.edit_endpoint, runtimeStatusRecovery(.identity_mismatch));
+    try std.testing.expectEqual(RuntimeRecovery.review_trust, runtimeStatusRecovery(.trust_required));
+    try std.testing.expectEqual(RuntimeRecovery.retry, runtimeStatusRecovery(.paired_offline));
+    try std.testing.expectEqualStrings("Connect", runtimeRecoveryLabel(.retry, .paired_offline));
+    try std.testing.expectEqualStrings("Retry", runtimeRecoveryLabel(.retry, .connection_failed));
+    // Readiness failures re-probe as the primary and keep the server-side
+    // guide reachable as a secondary, so neither affordance is lost.
+    inline for (.{ RuntimePickerStatus.workspace_binding_missing, .provider_unavailable, .provider_not_authenticated }) |status| {
+        try std.testing.expectEqual(RuntimeRecovery.reconnect, runtimeStatusRecovery(status));
+        try std.testing.expectEqualStrings("Reconnect", runtimeRecoveryLabel(.reconnect, status));
+        try std.testing.expect(runtimeStatusOffersServerSetup(status));
+    }
+    try std.testing.expect(runtimeStatusOffersServerSetup(.not_verde_runtime));
+    try std.testing.expect(!runtimeStatusOffersServerSetup(.device_revoked));
+}
+
+test "composer runtime blocker includes the thread runtime identity pin" {
+    const runtime: RuntimeService.RuntimeSnapshot = .{
+        .runtime_id = "0123456789abcdef0123456789abcdef",
+        .instance_id = "00112233445566778899aabbccddeeff",
+        .server_version = "test",
+        .protocol_major = 1,
+        .protocol_minor = 0,
+        .negotiated_headless_protocol_version = 1,
+    };
+    const snapshot: RuntimeService.Snapshot = .{
+        .profile_id = "remote",
+        .label = "Remote",
+        .transport = .direct_https,
+        .phase = .ready,
+        .failure = null,
+        .retry_at_ms = null,
+        .local_port = null,
+        .tunnel_lifecycle = .stopped,
+        .tunnel_pid = null,
+        .runtime = runtime,
+        .identity_pin_required = false,
+        .rpc_in_flight = false,
+        .last_heartbeat_ms = null,
+        .execution_ready = true,
+        .verified_runtime_matches_pin = true,
+        .repository_manifest_capable = true,
+        .repository_chat_route_capable = true,
+    };
+    try std.testing.expect(!runtimeSnapshotBlocksSend(snapshot, .ready, runtime.runtime_id));
+    try std.testing.expect(runtimeSnapshotBlocksSend(snapshot, .ready, "ffffffffffffffffffffffffffffffff"));
+}
+
 test "runtime picker retains every configured remote transport after relaunch" {
     var snapshot: RuntimeService.Snapshot = .{
         .profile_id = "profile-remote",
@@ -14887,10 +15447,22 @@ test "runtime onboarding transitions require credentials and explicit trust" {
     try std.testing.expectEqual(RuntimeActivationAction.request_credential, runtimeActivationAction(snapshot));
     snapshot.failure = .authentication;
     try std.testing.expectEqual(RuntimeActivationAction.request_credential, runtimeActivationAction(snapshot));
+    snapshot.access = .connect;
+    snapshot.device_id = "0123456789abcdef0123456789abcdef";
+    snapshot.device_credential_held = true;
+    try std.testing.expectEqual(RuntimeActivationAction.request_runtime_selection, runtimeActivationAction(snapshot));
+    snapshot.access = .admin_token;
     snapshot.failure = null;
     snapshot.phase = .failed;
     try std.testing.expectEqual(RuntimeActivationAction.retry, runtimeActivationAction(snapshot));
     snapshot.phase = .awaiting_trust;
+    try std.testing.expectEqual(RuntimeActivationAction.none, runtimeActivationAction(snapshot));
+    snapshot.phase = .ready;
+    snapshot.execution_ready = false;
+    try std.testing.expectEqual(RuntimeActivationAction.reconnect, runtimeActivationAction(snapshot));
+    snapshot.execution_ready = true;
+    snapshot.repository_manifest_capable = true;
+    snapshot.repository_chat_route_capable = true;
     try std.testing.expectEqual(RuntimeActivationAction.none, runtimeActivationAction(snapshot));
 
     try std.testing.expectEqual(
@@ -15104,7 +15676,7 @@ test "paired runtime restart uses the durable device credential before minting a
         .execution_ready = false,
         .access = .paired_device,
     };
-    try std.testing.expectEqual(RuntimePickerStatus.offline, runtimePickerStatus(snapshot));
+    try std.testing.expectEqual(RuntimePickerStatus.paired_offline, runtimePickerStatus(snapshot));
     try std.testing.expectEqual(RuntimeActivationAction.enable, runtimeActivationAction(snapshot));
 
     snapshot.device_credential_held = false;

@@ -55,13 +55,14 @@ fn run(init: std.process.Init) !void {
     defer resolved.deinit();
     switch (options.command) {
         .init => try runInit(init.io, init.gpa, resolved),
-        .serve => try runServe(init.io, init.gpa, resolved, options.tailscale),
+        .serve => try runServe(init.io, init.gpa, resolved, options),
         .status => try runStatus(init.io, init.gpa, resolved, options.json),
         .pair_create, .pair_list, .pair_revoke, .device_list, .device_revoke => try runDelegate(init.io, init.gpa, resolved, options),
+        .tailscale_doctor => try runTailscaleDoctor(init.io, init.gpa, resolved, options),
         .connect => try runConnect(init.io, init.gpa, init.environ_map, resolved, options),
         .connect_status => try runConnectLifecycle(init.io, init.gpa, resolved, options),
         .connect_unlink, .connect_logout => try runConnectRemoval(init.io, init.gpa, init.environ_map, resolved, options),
-        .service_install => try serviceInstall(init.io, init.gpa, resolved, options.no_start, options.tailscale),
+        .service_install => try serviceInstall(init.io, init.gpa, resolved, options),
         .service_status => try serviceStatus(init.io, init.gpa, resolved, options.json),
         .service_update => try serviceUpdate(init.io, init.gpa, resolved),
         .service_uninstall => try serviceUninstall(init.io, init.gpa, resolved),
@@ -140,8 +141,8 @@ fn runInit(io: std.Io, allocator: std.mem.Allocator, resolved: Resolved) !void {
     try writeStdout(io, "Gateway token: {s} (owner-only; value not displayed)\n", .{resolved.runtime.token_file});
 }
 
-fn runServe(io: std.Io, allocator: std.mem.Allocator, resolved: Resolved, use_tailscale: bool) !void {
-    if (use_tailscale) return runTailscaleServe(io, allocator, resolved);
+fn runServe(io: std.Io, allocator: std.mem.Allocator, resolved: Resolved, options: config.Options) !void {
+    if (options.tailscale) return runTailscaleServe(io, allocator, resolved, options);
     try runInit(io, allocator, resolved);
     try writeStdout(io,
         \\Verde server foreground supervision
@@ -166,15 +167,43 @@ fn runServe(io: std.Io, allocator: std.mem.Allocator, resolved: Resolved, use_ta
 
 // Installs the supervised runtime because a background Tailscale mapping must
 // never outlive an unsupervised loopback backend after reboot.
-fn runTailscaleServe(io: std.Io, allocator: std.mem.Allocator, resolved: Resolved) !void {
+fn runTailscaleServe(io: std.Io, allocator: std.mem.Allocator, resolved: Resolved, options: config.Options) !void {
+    var lifecycle_lock = try tailscale.LifecycleLock.acquire(io, resolved.runtime.state_dir);
+    defer lifecycle_lock.deinit(io);
     var system_runner: tailscale.SystemRunner = .{ .io = io };
-    var prepared = try tailscale.prepare(allocator, system_runner.runner(), resolved.runtime.gateway_port);
+    var prepared = try tailscale.prepare(
+        allocator,
+        system_runner.runner(),
+        resolved.runtime.gateway_port,
+        options.tailscale_https_port,
+    );
     defer prepared.deinit();
-    try tailscale.apply(allocator, system_runner.runner(), prepared);
+    if (prepared.state == .collision) {
+        try emitTailscaleDiagnostic(io, allocator, prepared, options.json);
+        return error.TailscaleServeConflict;
+    }
     var service_ready = false;
-    errdefer if (!prepared.already_configured and !service_ready) {
-        _ = tailscale.rollbackExact(allocator, system_runner.runner(), prepared.origin, prepared.target) catch {};
-        tailscale.removeIntent(io, resolved.runtime.state_dir);
+    var mutation_cleanup_armed = false;
+    errdefer if (mutation_cleanup_armed and !service_ready) {
+        protectFailedTailscaleMutation(
+            io,
+            allocator,
+            system_runner.runner(),
+            resolved.runtime.state_dir,
+            prepared,
+        );
+    };
+    if (prepared.state == .available) {
+        _ = try tailscale.writePendingIntent(io, allocator, resolved.runtime.state_dir, prepared);
+        mutation_cleanup_armed = true;
+    }
+    tailscale.apply(allocator, system_runner.runner(), &prepared) catch |err| switch (err) {
+        error.TailscaleServeChanged => {
+            mutation_cleanup_armed = false;
+            std.log.warn("preserved Tailscale intent after CAS conflict", .{});
+            return err;
+        },
+        else => return err,
     };
     try tailscale.writeIntent(io, allocator, resolved.runtime.state_dir, prepared);
 
@@ -186,11 +215,63 @@ fn runTailscaleServe(io: std.Io, allocator: std.mem.Allocator, resolved: Resolve
     try waitForGateway(io, managed.runtime.gateway_port);
     try waitForPublicRuntime(io, allocator, prepared.origin);
     service_ready = true;
-    try writeStdout(io,
+    try writeStdout(
+        io,
         "Verde is installed as a background service and Tailscale terminates HTTPS at {s}.\n",
         .{prepared.origin},
     );
     try printPairGrant(io, allocator, managed, prepared.origin);
+}
+
+fn runTailscaleDoctor(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    resolved: Resolved,
+    options: config.Options,
+) !void {
+    var system_runner: tailscale.SystemRunner = .{ .io = io };
+    var prepared = try tailscale.prepare(
+        allocator,
+        system_runner.runner(),
+        resolved.runtime.gateway_port,
+        options.tailscale_https_port,
+    );
+    defer prepared.deinit();
+    try emitTailscaleDiagnostic(io, allocator, prepared, options.json);
+    if (prepared.state == .collision) return error.TailscaleServeConflict;
+}
+
+fn emitTailscaleDiagnostic(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    prepared: tailscale.Prepared,
+    json: bool,
+) !void {
+    const diagnostic = tailscale.diagnostic(prepared);
+    if (json) {
+        const encoded = try std.json.Stringify.valueAlloc(allocator, diagnostic, .{});
+        defer allocator.free(encoded);
+        return writeStdout(io, "{s}\n", .{encoded});
+    }
+    try writeStdout(
+        io,
+        "Tailscale Serve listener: {s}\nState: {s}\nRequested backend: {s}\n",
+        .{ diagnostic.endpoint, @tagName(diagnostic.state), diagnostic.requested_target },
+    );
+    if (diagnostic.current_target) |current| {
+        try writeStdout(io, "Current root backend: {s}\n", .{current});
+    }
+    if (prepared.state != .collision) return;
+    try writeStdout(io,
+        \\Verde did not change this listener because another service or route occupies it.
+        \\Safe recovery choices:
+        \\  1. Keep the existing listener and retry Verde on another port:
+        \\     verde-server serve --tailscale --tailscale-https-port {d}
+        \\  2. Keep the existing listener and use the documented SSH recovery path.
+        \\  3. If you have independently verified ownership, remove that exact
+        \\     listener manually, then rerun Verde. Never use `tailscale serve reset`.
+        \\
+    , .{diagnostic.suggested_https_port.?});
 }
 
 fn printPairGrant(io: std.Io, allocator: std.mem.Allocator, resolved: Resolved, origin: []const u8) !void {
@@ -448,13 +529,13 @@ fn runConnect(
     };
     const descriptor = options.descriptor_file orelse generated_descriptor.?;
     if (try runInherited(io, allocator, &.{
-        resolved.artifacts.daemon, "connect", "login", "--control-plane", control_plane,
-        "--credential-file", credential_file, "--data-dir", resolved.runtime.data_dir,
+        resolved.artifacts.daemon, "connect",       "login",      "--control-plane",         control_plane,
+        "--credential-file",       credential_file, "--data-dir", resolved.runtime.data_dir,
     }) != 0) return error.ConnectLoginFailed;
     errdefer removeDaemonConnectToken(io, allocator, resolved.runtime.data_dir);
     if (try runInherited(io, allocator, &.{
-        resolved.artifacts.daemon, "connect", "link", "--descriptor-file", descriptor,
-        "--data-dir", resolved.runtime.data_dir,
+        resolved.artifacts.daemon, "connect",                 "link", "--descriptor-file", descriptor,
+        "--data-dir",              resolved.runtime.data_dir,
     }) != 0) return error.ConnectLinkFailed;
     removeDaemonConnectToken(io, allocator, resolved.runtime.data_dir);
     try writeConnectIntent(io, allocator, resolved.runtime.state_dir, control_plane);
@@ -504,8 +585,8 @@ fn runConnectRemoval(
     var authorization = try authorizeConnect(io, allocator, resolved.runtime.state_dir, control_plane, options);
     defer authorization.deinit(io);
     if (try runInherited(io, allocator, &.{
-        resolved.artifacts.daemon, "connect", "login", "--control-plane", control_plane,
-        "--credential-file", authorization.path, "--data-dir", resolved.runtime.data_dir,
+        resolved.artifacts.daemon, "connect",          "login",      "--control-plane",         control_plane,
+        "--credential-file",       authorization.path, "--data-dir", resolved.runtime.data_dir,
     }) != 0) return error.ConnectLoginFailed;
     defer removeDaemonConnectToken(io, allocator, resolved.runtime.data_dir);
     try runConnectLifecycle(io, allocator, resolved, options);
@@ -647,7 +728,11 @@ fn generateRuntimeDescriptor(io: std.Io, allocator: std.mem.Allocator, resolved:
     }
     var system_runner: tailscale.SystemRunner = .{ .io = io };
     const spki = try tailscale.spkiSha256(
-        io, allocator, system_runner.runner(), resolved.runtime.state_dir, origin,
+        io,
+        allocator,
+        system_runner.runner(),
+        resolved.runtime.state_dir,
+        origin,
     );
     const encoded = try std.json.Stringify.valueAlloc(allocator, .{
         .contract_version = "1",
@@ -712,26 +797,55 @@ fn waitForDaemon(io: std.Io, allocator: std.mem.Allocator, resolved: Resolved) !
     return error.DaemonStartupTimedOut;
 }
 
-fn serviceInstall(io: std.Io, allocator: std.mem.Allocator, resolved: Resolved, no_start: bool, use_tailscale: bool) !void {
+fn serviceInstall(io: std.Io, allocator: std.mem.Allocator, resolved: Resolved, options: config.Options) !void {
     var managed = resolved;
     var prepared: ?tailscale.Prepared = null;
     defer if (prepared) |*value| value.deinit();
+    var lifecycle_lock: ?tailscale.LifecycleLock = null;
+    defer if (lifecycle_lock) |*value| value.deinit(io);
     var installed = false;
-    errdefer if (prepared) |value| if (!value.already_configured and !installed) {
+    var mutation_cleanup_armed = false;
+    errdefer if (prepared) |value| if (mutation_cleanup_armed and !installed) {
         var cleanup_runner: tailscale.SystemRunner = .{ .io = io };
-        _ = tailscale.rollbackExact(allocator, cleanup_runner.runner(), value.origin, value.target) catch {};
-        tailscale.removeIntent(io, resolved.runtime.state_dir);
+        protectFailedTailscaleMutation(
+            io,
+            allocator,
+            cleanup_runner.runner(),
+            resolved.runtime.state_dir,
+            value,
+        );
     };
-    if (use_tailscale) {
+    if (options.tailscale) {
+        lifecycle_lock = try tailscale.LifecycleLock.acquire(io, resolved.runtime.state_dir);
         var system_runner: tailscale.SystemRunner = .{ .io = io };
-        prepared = try tailscale.prepare(allocator, system_runner.runner(), resolved.runtime.gateway_port);
-        try tailscale.apply(allocator, system_runner.runner(), prepared.?);
+        prepared = try tailscale.prepare(
+            allocator,
+            system_runner.runner(),
+            resolved.runtime.gateway_port,
+            options.tailscale_https_port,
+        );
+        if (prepared.?.state == .collision) {
+            try emitTailscaleDiagnostic(io, allocator, prepared.?, options.json);
+            return error.TailscaleServeConflict;
+        }
+        if (prepared.?.state == .available) {
+            _ = try tailscale.writePendingIntent(io, allocator, resolved.runtime.state_dir, prepared.?);
+            mutation_cleanup_armed = true;
+        }
+        tailscale.apply(allocator, system_runner.runner(), &prepared.?) catch |err| switch (err) {
+            error.TailscaleServeChanged => {
+                mutation_cleanup_armed = false;
+                std.log.warn("preserved Tailscale intent after CAS conflict", .{});
+                return err;
+            },
+            else => return err,
+        };
         try tailscale.writeIntent(io, allocator, resolved.runtime.state_dir, prepared.?);
         managed.runtime.trusted_proxy_origin = prepared.?.origin;
     }
     try runInit(io, allocator, managed);
     try service.install(io, allocator, managed.artifacts, managed.runtime, VERSION);
-    try activateServices(io, allocator, managed.runtime.unit_dir, no_start);
+    try activateServices(io, allocator, managed.runtime.unit_dir, options.no_start);
     installed = true;
     try writeStdout(io, "Installed Verde user services in {s}\nArtifacts: {s}\n", .{ resolved.runtime.unit_dir, std.fs.path.dirname(std.fs.path.dirname(resolved.artifacts.server).?).? });
     if (builtin.os.tag == .linux) try printLingerGuidance(io, allocator);
@@ -807,6 +921,8 @@ fn serviceUpdate(io: std.Io, allocator: std.mem.Allocator, resolved: Resolved) !
 }
 
 fn serviceUninstall(io: std.Io, allocator: std.mem.Allocator, resolved: Resolved) !void {
+    var lifecycle_lock = try tailscale.LifecycleLock.acquire(io, resolved.runtime.state_dir);
+    defer lifecycle_lock.deinit(io);
     if (builtin.os.tag == .linux) {
         _ = runInherited(io, allocator, &.{ "systemctl", "--user", "disable", "--now", service.UNIT_WEB, service.UNIT_DAEMON }) catch {};
     } else if (builtin.os.tag == .macos) {
@@ -822,16 +938,66 @@ fn serviceUninstall(io: std.Io, allocator: std.mem.Allocator, resolved: Resolved
     try service.uninstall(io, resolved.runtime);
     if (builtin.os.tag == .linux) try runSystemctl(io, allocator, &.{"daemon-reload"});
     var system_runner: tailscale.SystemRunner = .{ .io = io };
-    const cleanup = tailscale.cleanupSaved(io, allocator, system_runner.runner(), resolved.runtime.state_dir) catch {
-        try writeStderr(io, "warning: preserved Tailscale Serve mapping because saved ownership could not be verified\n", .{});
-        return writeStdout(io, "Removed Verde user services. Runtime data, token, credentials, and release metadata were retained.\n", .{});
+    const cleanup = tailscale.cleanupSaved(io, allocator, system_runner.runner(), resolved.runtime.state_dir) catch |err| {
+        try writeStderr(
+            io,
+            "error: preserved Tailscale ownership intent because cleanup failed: {s}\n",
+            .{@errorName(err)},
+        );
+        return err;
     };
-    if (cleanup == .preserved_changed) {
-        try writeStderr(io, "warning: preserved Tailscale Serve mapping because it no longer exactly matches Verde's saved mapping\n", .{});
-    } else if (cleanup == .removed) {
-        tailscale.removeIntent(io, resolved.runtime.state_dir);
+    switch (cleanup) {
+        .removed, .missing => try tailscale.removeIntent(io, resolved.runtime.state_dir),
+        .preserved_changed => {
+            try writeStderr(io, "error: preserved Tailscale ownership intent because the listener no longer exactly matches Verde's saved mapping\n", .{});
+            return error.TailscaleServeCleanupPreserved;
+        },
+        .not_owned => try writeStderr(
+            io,
+            "warning: retained non-owning Tailscale intent; no listener was removed\n",
+            .{},
+        ),
     }
     try writeStdout(io, "Removed Verde user services. Runtime data, token, credentials, and release metadata were retained.\n", .{});
+}
+
+fn protectFailedTailscaleMutation(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    runner: tailscale.Runner,
+    state_dir: []const u8,
+    prepared: tailscale.Prepared,
+) void {
+    const cleanup = tailscale.rollbackExact(
+        allocator,
+        runner,
+        prepared.origin,
+        prepared.target,
+        prepared.https_port,
+        prepared.owned_etag,
+    ) catch |err| {
+        std.log.err(
+            "preserved Tailscale ownership intent because rollback failed: {s}",
+            .{@errorName(err)},
+        );
+        return;
+    };
+    switch (cleanup) {
+        .removed, .missing => {
+            tailscale.removeIntent(io, state_dir) catch |err| {
+                std.log.err("preserved Tailscale intent because local cleanup failed: {s}", .{@errorName(err)});
+                return;
+            };
+        },
+        .preserved_changed => std.log.err(
+            "preserved Tailscale ownership intent because rollback found changed configuration",
+            .{},
+        ),
+        .not_owned => std.log.err(
+            "preserved non-owning Tailscale intent during failed setup",
+            .{},
+        ),
+    }
 }
 
 fn runSystemctl(io: std.Io, allocator: std.mem.Allocator, tail: []const []const u8) !void {
@@ -917,13 +1083,14 @@ fn printHelp(io: std.Io) !void {
         \\
         \\Usage:
         \\  verde-server init [--data-dir PATH] [--token-file PATH]
-        \\  verde-server serve [--tailscale] [--data-dir PATH] [--token-file PATH] [--gateway-port PORT]
+        \\  verde-server serve [--tailscale] [--tailscale-https-port PORT] [--data-dir PATH] [--token-file PATH] [--gateway-port PORT]
         \\  verde-server status [--json]
+        \\  verde-server tailscale doctor|status [--tailscale-https-port PORT] [--json]
         \\  verde-server pair create|list|revoke [daemon pair options]
         \\  verde-server device list|revoke [daemon device options]
         \\  verde-server connect [--headless] [--install-service]
         \\  verde-server connect status|unlink|logout [--json]
-        \\  verde-server service install [--tailscale] [--no-start]
+        \\  verde-server service install [--tailscale] [--tailscale-https-port PORT] [--no-start]
         \\  verde-server service status [--json]
         \\  verde-server service update
         \\  verde-server service uninstall
@@ -932,8 +1099,10 @@ fn printHelp(io: std.Io) !void {
         \\All paths passed to services are absolute. Pair/device operations delegate
         \\to the owner-only daemon transport. Raw tokens are never accepted in argv.
         \\The production gateway port defaults to 7420. `serve --tailscale`
-        \\keeps verde-web on loopback, installs the user service, configures only
-        \\one otherwise-empty Tailscale Serve HTTPS mapping, and prints Pair data.
+        \\keeps verde-web on loopback, installs the user service, and configures
+        \\only the requested unoccupied Tailscale HTTPS listener. It never replaces
+        \\another route. Use `tailscale doctor --json` before setup or select a
+        \\dedicated listener with `--tailscale-https-port`; Pair uses that exact URL.
         \\`connect` discovers its saved or environment-configured control plane,
         \\uses OIDC device authorization, and removes the provider bearer after
         \\linking. --control-plane, --descriptor-file, and --credential-file are
@@ -956,7 +1125,13 @@ fn errorMessage(err: anyerror) []const u8 {
         error.Unhealthy => "one or more runtime components are unhealthy",
         error.TailscaleCliMissing, error.TailscaleCliUnavailable => "the `tailscale` CLI is required and must be executable",
         error.TailscaleNotRunning, error.TailscaleNotLoggedIn => "Tailscale must be running and logged in on this device",
-        error.TailscaleServeConflict => "Tailscale Serve already has another mapping; Verde refused to replace it",
+        error.TailscaleServeConflict => "the requested Tailscale Serve listener is occupied; Verde made no change (see the diagnostic above)",
+        error.TailscaleServeChanged => "Tailscale Serve changed concurrently; Verde's compare-and-set made no change",
+        error.TailscaleServeCasUnavailable => "Tailscale's local compare-and-set API is unavailable; Verde refused to mutate Serve configuration",
+        error.TailscaleLifecycleLockFailed => "the Tailscale lifecycle lock could not be acquired; Verde refused to change services, Serve configuration, or ownership intent",
+        error.TailscaleServePostwriteUnverified => "Tailscale accepted the Serve update, but its resulting version could not be verified; Verde preserved recovery intent and will not claim or automatically remove it",
+        error.TailscaleServeCleanupPreserved => "Tailscale cleanup was not exact; the listener and recoverable ownership intent were preserved",
+        error.TailscaleIntentConflict => "a different Tailscale ownership intent already exists; Verde preserved it and refused to mutate Serve configuration",
         error.ConnectControlPlaneRequired => "no Connect control plane is configured; set VERDE_CONNECT_CONTROL_PLANE or pass --control-plane URL",
         error.ConnectDescriptorUnavailable => "no runtime descriptor could be derived; configure Tailscale Serve first or use advanced --descriptor-file PATH",
         error.ConnectDeviceFlowUnavailable => "the configured OIDC provider does not advertise RFC 8628 device authorization",
@@ -969,7 +1144,7 @@ fn errorMessage(err: anyerror) []const u8 {
 fn exitCode(err: anyerror) u8 {
     return switch (err) {
         error.InvalidArguments, error.UnknownCommand => 2,
-        error.Unhealthy, error.ChildFailed, error.DaemonCommandFailed, error.SystemctlFailed => 3,
+        error.Unhealthy, error.ChildFailed, error.DaemonCommandFailed, error.SystemctlFailed, error.TailscaleServeConflict => 3,
         else => 4,
     };
 }
@@ -1026,6 +1201,23 @@ test "Pair URL keeps the one-time code in the fragment" {
     );
     const query_end = std.mem.indexOfScalar(u8, url, '#').?;
     try std.testing.expect(std.mem.indexOf(u8, url[0..query_end], "ab" ** 8) == null);
+}
+
+test "Pair URL preserves a dedicated Tailscale HTTPS port" {
+    const url = try pairUrlAlloc(
+        std.testing.allocator,
+        "https://runtime.tail.ts.net:8443",
+        "0123456789abcdef0123456789abcdef",
+        "cd" ** 32,
+    );
+    defer std.testing.allocator.free(url);
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        url,
+        "verde://pair?host=https%3A%2F%2Fruntime.tail.ts.net%3A8443&grant_id=",
+    ));
+    const fragment = std.mem.indexOfScalar(u8, url, '#').?;
+    try std.testing.expect(std.mem.indexOf(u8, url[0..fragment], "cd" ** 8) == null);
 }
 
 test "Linux activation reloads enables and restarts exact units" {

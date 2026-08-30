@@ -150,8 +150,13 @@ fn ensureJsonRpcOk(allocator: std.mem.Allocator, response: []const u8) !void {
     _ = try jsonRpcResult(parsed.value);
 }
 
-pub fn initialSendStartFailureMessage(_: anyerror) []const u8 {
-    return "Verde could not start this message. Your draft and attachments are still in the composer; try Send again.";
+pub fn initialSendStartFailureMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.RemoteWorkspaceBindingMissing => "The selected repository is not bound on this runtime. Bind it, then send again; your draft and attachments were restored.",
+        error.RemoteProviderUnavailable => "The selected provider is unavailable on this runtime. Install or configure it, then send again; your draft and attachments were restored.",
+        error.RemoteProviderNotAuthenticated => "The selected provider is not authenticated on this runtime. Sign in there, then send again; your draft and attachments were restored.",
+        else => "Verde could not start this message. Your draft and attachments are still in the composer; try Send again.",
+    };
 }
 
 fn ambiguousInitialSendFailureMessage() []const u8 {
@@ -1596,6 +1601,38 @@ test "acceptance keeps the optimistic clear, retains message id, and restores re
     try std.testing.expectEqual(@as(usize, 3), state.dirty_marks);
     try std.testing.expectEqual(@as(usize, 3), state.composer_resets);
     try std.testing.expectEqual(@as(usize, 0), state.chat_controller.pending_send_count);
+
+    // Ambiguous remote acceptance keeps the exact turn armed. Reconnect tail
+    // reconciliation can probe it, while pending accounting blocks replay.
+    var remote_project = try Project.init(allocator, "ambiguous-remote", "Ambiguous remote", "/tmp/ambiguous-remote", 0);
+    state.project_controller.projects.append(allocator, remote_project) catch |err| {
+        remote_project.deinit(allocator);
+        return err;
+    };
+    const remote_thread = &state.project_controller.projects.items[1].threads.items[0];
+    try std.testing.expectEqual(.updated, try remote_thread.selectRuntimeRoute(allocator, .{
+        .profile_id = "remote-box",
+        .repository_id = "repo-api",
+    }));
+    try remote_thread.messages.append(allocator, .{
+        .role = .user,
+        .author = try allocator.dupeZ(u8, "You"),
+        .body = try allocator.dupeZ(u8, "maybe accepted"),
+        .extra_images = try allocator.alloc(ChatImageAttachment, 0),
+    });
+    const ambiguous = try makeDispatch(remote_project.id, remote_thread.local_thread_id, "maybe accepted", .ambiguous);
+    const ambiguous_arena = ambiguous.arena.allocator();
+    ambiguous.profile_id = try ambiguous_arena.dupe(u8, "remote-box");
+    ambiguous.repository_id = try ambiguous_arena.dupe(u8, "repo-api");
+    ambiguous.runtime_id = try ambiguous_arena.dupe(u8, "0123456789abcdef0123456789abcdef");
+    try armThread(&state.chat_controller, remote_thread);
+    try std.testing.expect(commitAcceptanceDispatch(&state, ambiguous));
+    ambiguous.destroy(allocator);
+    try std.testing.expect(remote_thread.isSendPending());
+    try std.testing.expect(!remote_thread.isSendAcceptancePending());
+    try std.testing.expectEqualStrings("gui:test:turn", remote_thread.send_state.daemon_turn_id.?);
+    try std.testing.expectEqual(@as(usize, 1), state.chat_controller.pending_send_count);
+    try std.testing.expectEqual(@as(usize, 1), state.failure_rows);
 }
 
 /// Directory a local provider session should run in: the thread's override
@@ -1701,7 +1738,9 @@ fn resolveChatExecutionRoute(
     };
     const pinned_runtime_id = if (thread.pinnedRuntimeRoute()) |pinned| pinned.runtime_id else null;
     if (!remoteSnapshotCanRoute(snapshot, pinned_runtime_id)) {
-        self.setSidebarNotice("Connect and verify the selected runtime with repository chat support before sending.");
+        // The draft is untouched: nothing was dispatched. The composer banner
+        // explains the typed state and offers Retry on this same runtime.
+        self.setSidebarNotice("The selected remote runtime cannot run this message yet; your draft was kept. Use the banner above the composer to recover.");
         return null;
     }
     return .{ .remote = .{
@@ -2570,6 +2609,9 @@ const AcceptanceRepositoryTurnStartParams = struct {
     fast_mode: bool,
     access_mode: []const u8,
     message_id: []const u8,
+    /// Remote callers request a bounded installed-provider proof before the
+    /// daemon accepts durable work. Repository-local sends leave this false.
+    require_provider_ready: bool = false,
 };
 
 const AcceptanceTurnStartParams = union(enum) {
@@ -2581,6 +2623,7 @@ test "repository chat start params cannot carry an absolute desktop path" {
     try std.testing.expect(@hasField(AcceptanceRepositoryTurnStartParams, "workspace_id"));
     try std.testing.expect(@hasField(AcceptanceRepositoryTurnStartParams, "repository_id"));
     try std.testing.expect(@hasField(AcceptanceRepositoryTurnStartParams, "relative_cwd"));
+    try std.testing.expect(@hasField(AcceptanceRepositoryTurnStartParams, "require_provider_ready"));
     try std.testing.expect(!@hasField(AcceptanceRepositoryTurnStartParams, "project_path"));
     try std.testing.expect(!@hasField(AcceptanceRepositoryTurnStartParams, "cwd"));
     try std.testing.expect(!@hasField(AcceptanceRepositoryTurnStartParams, "image_paths"));
@@ -2710,7 +2753,7 @@ fn classifyRemoteAcceptanceResult(dispatch: *AcceptanceDispatch, result: *Runtim
     return switch (result.*) {
         .response => |response| blk: {
             ensureJsonRpcOk(std.heap.page_allocator, response.json) catch |err| {
-                dispatch.err = err;
+                dispatch.err = if (response.failure_reason) |reason| remoteAcceptanceFailure(reason) else err;
                 break :blk if (err == error.DaemonRequestFailed) .rejected else .ambiguous;
             };
             break :blk .accepted;
@@ -2723,6 +2766,15 @@ fn classifyRemoteAcceptanceResult(dispatch: *AcceptanceDispatch, result: *Runtim
             dispatch.err = error.RemoteRuntimeRpcCanceled;
             return .ambiguous;
         },
+    };
+}
+
+fn remoteAcceptanceFailure(reason: RuntimeService.FailureReason) anyerror {
+    return switch (reason) {
+        .workspace_binding_missing => error.RemoteWorkspaceBindingMissing,
+        .provider_unavailable => error.RemoteProviderUnavailable,
+        .provider_not_authenticated => error.RemoteProviderNotAuthenticated,
+        else => error.DaemonRequestFailed,
     };
 }
 
@@ -2741,12 +2793,22 @@ test "remote acceptance distinguishes accepted rejected and transport ambiguity"
     var rejected: RuntimeService.RpcCallResult = .{ .response = .{
         .allocator = allocator,
         .json = try allocator.dupe(u8, "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":\"invalid_params\",\"message\":\"rejected\"}}"),
+        .failure_reason = .workspace_binding_missing,
     } };
     defer rejected.deinit();
     try std.testing.expectEqual(AcceptanceOutcome.rejected, classifyRemoteAcceptanceResult(&dispatch, &rejected));
+    try std.testing.expectEqual(error.RemoteWorkspaceBindingMissing, dispatch.err.?);
 
     var ambiguous: RuntimeService.RpcCallResult = .{ .failed = .network };
     try std.testing.expectEqual(AcceptanceOutcome.ambiguous, classifyRemoteAcceptanceResult(&dispatch, &ambiguous));
+}
+
+test "remote acceptance maps exact structured readiness reasons" {
+    try std.testing.expectEqual(error.RemoteWorkspaceBindingMissing, remoteAcceptanceFailure(.workspace_binding_missing));
+    try std.testing.expectEqual(error.RemoteProviderUnavailable, remoteAcceptanceFailure(.provider_unavailable));
+    try std.testing.expectEqual(error.RemoteProviderNotAuthenticated, remoteAcceptanceFailure(.provider_not_authenticated));
+    try std.testing.expectEqual(error.DaemonRequestFailed, remoteAcceptanceFailure(.unknown));
+    try std.testing.expect(std.mem.indexOf(u8, initialSendStartFailureMessage(error.RemoteProviderNotAuthenticated), "Sign in") != null);
 }
 
 /// Stages daemon acceptance for a just-appended user row without blocking the
@@ -2887,6 +2949,10 @@ pub fn dispatchDaemonAcceptance(
                 .fast_mode = thread.fast_mode == .on,
                 .access_mode = @tagName(thread.access_mode),
                 .message_id = message_id,
+                .require_provider_ready = switch (execution_route) {
+                    .remote => true,
+                    .legacy_local, .repository_local => false,
+                },
             } };
             switch (execution_route) {
                 .repository_local => dispatch.pref_path = try arena.dupe(u8, self.storage.pref_path),
@@ -3005,8 +3071,9 @@ pub fn pollAcceptanceDispatches(self: anytype) bool {
 /// Applies one acceptance outcome with the synchronous path's M4-P3 safety:
 /// accepted retains the staged message id and the optimistic composer clear;
 /// confirmed rejection restores the pre-submit state and submitted composer;
-/// ambiguous keeps the staged row and leaves the composer clear so a blind
-/// retry cannot duplicate a possibly accepted turn.
+/// ambiguous keeps the stable turn armed and leaves the composer clear. Tail
+/// reconciliation probes that exact id after reconnect; no submit path can
+/// replay while the unresolved send remains pending.
 pub fn commitAcceptanceDispatch(self: anytype, dispatch: *AcceptanceDispatch) bool {
     const resolved = self.projectThreadIndexByLocalId(dispatch.project_id, dispatch.local_thread_id) orelse return false;
     const project = &self.project_controller.projects.items[resolved.project_index];
@@ -3056,7 +3123,8 @@ pub fn commitAcceptanceDispatch(self: anytype, dispatch: *AcceptanceDispatch) bo
         }
     }
     send_state.acceptance_pending = false;
-    if (dispatch.outcome != .accepted) {
+    const preserve_remote_ambiguity = dispatch.outcome == .ambiguous and dispatch.runtime_id != null;
+    if (dispatch.outcome == .rejected or (dispatch.outcome == .ambiguous and !preserve_remote_ambiguity)) {
         send_state.status = .idle;
         send_state.daemon_owned = false;
         if (send_state.daemon_turn_id) |turn_id| {
@@ -3095,18 +3163,22 @@ pub fn commitAcceptanceDispatch(self: anytype, dispatch: *AcceptanceDispatch) bo
             self.flushDirtyBlocking();
         },
         .ambiguous => {
+            if (!preserve_remote_ambiguity) {
+                // Preserve the established Local behavior: end accounting,
+                // keep the staged row, and require an explicit user retry.
+                if (dispatch.runtime_id == null) thread.lockRuntimeRoute();
+                self.chat_controller.finishSend();
+                self.appendInitialSendFailure(thread, ambiguousInitialSendFailureMessage());
+                project.invalidateSidebarThreadCache();
+                if (selected) self.requestTranscriptScrollToBottom();
+                self.flushDirtyBlocking();
+                return true;
+            }
             // The daemon may already have accepted durable work. Locking is
-            // the fail-closed side of that uncertainty; retry cannot reroute
-            // a possibly running turn onto another machine/repository.
-            if (dispatch.runtime_id == null) thread.lockRuntimeRoute();
-            self.chat_controller.finishSend();
-            // Keep the in-memory user row (the daemon may have staged it) and
-            // leave the optimistically cleared composer empty so a blind retry
-            // cannot duplicate the provider turn.
-            self.appendInitialSendFailure(thread, ambiguousInitialSendFailureMessage());
-            project.invalidateSidebarThreadCache();
-            if (selected) self.requestTranscriptScrollToBottom();
-            self.flushDirtyBlocking();
+            // the fail-closed side of that uncertainty. Keep the original
+            // daemon_turn_id pending so reconnect tails probe the idempotency
+            // key; no submit path can replay while this state is armed.
+            self.setSidebarNotice("Reconnecting to confirm the submitted message; Verde will not resend it.");
         },
     }
     return true;
@@ -5331,6 +5403,29 @@ test "remote routed tails reuse terminal and error state transitions" {
     ));
     try std.testing.expectEqual(SendStatus.failed, failed.send_state.status);
     try std.testing.expectEqualStrings("remote provider failed", failed.send_state.error_message.?);
+
+    var interrupted = try ChatThread.init(allocator, "remote interrupted");
+    defer interrupted.deinit(allocator);
+    interrupted.send_state.status = .pending;
+    interrupted.send_state.daemon_owned = true;
+    try std.testing.expect(try applyDaemonChatTurnTail(&state, &interrupted,
+        \\{"jsonrpc":"2.0","id":9,"result":{"status":"interrupted","events":[],"error_message":"The daemon restarted before the provider reply completed."}}
+    ));
+    try std.testing.expectEqual(SendStatus.failed, interrupted.send_state.status);
+    try std.testing.expectEqualStrings(
+        "The daemon restarted before the provider reply completed.",
+        interrupted.send_state.error_message.?,
+    );
+
+    var signed_out = try ChatThread.init(allocator, "remote signed out");
+    defer signed_out.deinit(allocator);
+    signed_out.send_state.status = .pending;
+    signed_out.send_state.daemon_owned = true;
+    try std.testing.expect(try applyDaemonChatTurnTail(&state, &signed_out,
+        \\{"jsonrpc":"2.0","id":10,"result":{"status":"failed","events":[],"error_message":"opaque","failure_reason":"provider_not_authenticated"}}
+    ));
+    try std.testing.expectEqual(SendStatus.failed, signed_out.send_state.status);
+    try std.testing.expect(std.mem.indexOf(u8, signed_out.send_state.error_message.?, "Sign in") != null);
 }
 
 /// True when the thread transcript already carries a row with this durable
@@ -5347,6 +5442,17 @@ fn canApplyDaemonGeneratedTitle(current_title: []const u8, expected_title: []con
     return expected_title.len > 0 and
         (std.mem.eql(u8, current_title, expected_title) or
             chat_threads.isPlaceholderThreadTitle(current_title));
+}
+
+fn daemonProviderFailureMessage(reason: ?[]const u8, fallback: []const u8) []const u8 {
+    const value = reason orelse return fallback;
+    if (std.mem.eql(u8, value, "provider_unavailable")) {
+        return "The selected provider is unavailable on this runtime. Install or configure it, then try again.";
+    }
+    if (std.mem.eql(u8, value, "provider_not_authenticated")) {
+        return "The selected provider is not authenticated on this runtime. Sign in there, then try again.";
+    }
+    return fallback;
 }
 
 test "daemon generated title replaces a stale opening placeholder" {
@@ -5439,12 +5545,20 @@ pub fn applyDaemonChatTurnTail(self: anytype, thread: *ChatThread, response: []c
         send_state.status = .completed;
         changed = true;
     } else if (std.mem.eql(u8, status_text, "failed")) {
-        const message = jsonValueString(result.object.get("error_message") orelse .null) orelse "Provider request failed.";
+        const fallback = jsonValueString(result.object.get("error_message") orelse .null) orelse "Provider request failed.";
+        const reason = jsonValueString(result.object.get("failure_reason") orelse .null);
+        const message = daemonProviderFailureMessage(reason, fallback);
         send_state.error_message = try std.heap.page_allocator.dupe(u8, message);
         send_state.status = .failed;
         changed = true;
     } else if (std.mem.eql(u8, status_text, "aborted")) {
         send_state.status = .aborted;
+        changed = true;
+    } else if (std.mem.eql(u8, status_text, "interrupted")) {
+        const message = jsonValueString(result.object.get("error_message") orelse .null) orelse
+            "The daemon restarted before the provider reply completed.";
+        send_state.error_message = try std.heap.page_allocator.dupe(u8, message);
+        send_state.status = .failed;
         changed = true;
     }
     if (changed) send_state.ui_revision +%= 1;

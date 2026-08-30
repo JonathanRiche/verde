@@ -100,6 +100,9 @@ pub const ERR_REVISION_EXPIRED: []const u8 = "revision_expired";
 pub const ERR_RUNTIME_IDENTITY_MISSING: []const u8 = "runtime_identity_missing";
 pub const ERR_RUNTIME_IDENTITY_MISMATCH: []const u8 = "runtime_identity_mismatch";
 pub const ERR_PROTOCOL_INCOMPATIBLE: []const u8 = "protocol_incompatible";
+/// The requested native chat provider is not installed or otherwise has an
+/// exact provider-specific unavailable failure. Never infer this from text.
+pub const ERR_PROVIDER_UNAVAILABLE: []const u8 = "provider_unavailable";
 
 /// Typed protocol error carried inside a response envelope.
 pub const Error = struct {

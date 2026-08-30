@@ -91,6 +91,33 @@ pub const Failure = enum {
     rate_limited,
 };
 
+/// Stable, secret-free reason codes shared by snapshots and RPC results.
+/// These codes are independent of display copy and must not be inferred from
+/// an English error message.
+pub const FailureReason = enum {
+    transport_offline,
+    wrong_service,
+    invalid_protocol_response,
+    server_unavailable,
+    authentication_required,
+    device_credential_revoked,
+    identity_changed,
+    workspace_binding_missing,
+    provider_unavailable,
+    provider_not_authenticated,
+    credential_store_unavailable,
+    credential_invalid,
+    unknown,
+};
+
+pub const CredentialHydration = enum {
+    not_applicable,
+    loaded,
+    missing,
+    backend_unavailable,
+    invalid,
+};
+
 /// Where a paired profile is in the one-time grant exchange.
 pub const PairingState = enum {
     none,
@@ -167,6 +194,14 @@ pub const Snapshot = struct {
     phase: connection.Phase,
     failure: ?Failure,
     retry_at_ms: ?u64,
+    failure_reason: ?FailureReason = null,
+    automatic_retry_scheduled: bool = false,
+    retry_attempt: u8 = 0,
+    retry_delay_ms: ?u64 = null,
+    manual_retry_available: bool = false,
+    last_successful_connection_ms: ?u64 = null,
+    credential_hydration: CredentialHydration = .not_applicable,
+    desired_enabled: bool = false,
     local_port: ?u16,
     tunnel_lifecycle: tunnel_supervisor.Lifecycle,
     tunnel_pid: ?u32,
@@ -202,6 +237,9 @@ pub const RpcTicket = struct {
 pub const RpcResponse = struct {
     allocator: std.mem.Allocator,
     json: []u8,
+    /// Method-level failure classification, if the valid JSON-RPC response
+    /// carries one. It never causes prompt replay or connection fallback.
+    failure_reason: ?FailureReason = null,
 
     pub fn deinit(self: *RpcResponse) void {
         self.allocator.free(self.json);
@@ -358,6 +396,8 @@ const Entry = struct {
     healthy_generation: ?u64 = null,
     last_heartbeat_ms: ?u64 = null,
     next_heartbeat_at_ms: ?u64 = null,
+    last_successful_connection_ms: ?u64 = null,
+    credential_hydration: CredentialHydration = .not_applicable,
     failure_override: ?Failure = null,
 
     fn deinit(self: *Entry, allocator: std.mem.Allocator) void {
@@ -440,6 +480,10 @@ pub const Manager = struct {
         try self.entries.append(self.allocator, .{
             .owned_profile = owned_profile,
             .connection_state = connection_state,
+            .credential_hydration = if (configured_profile.access.kind() == .admin_token)
+                .not_applicable
+            else
+                .missing,
         });
     }
 
@@ -514,7 +558,23 @@ pub const Manager = struct {
             }
         }
         try self.secrets.put(key, credential);
+        entry.credential_hydration = .loaded;
         if (entry.failure_override == .missing_credential) entry.failure_override = null;
+    }
+
+    /// Records a credential-store load outcome without accepting secret data.
+    pub fn noteCredentialHydration(
+        self: *Manager,
+        profile_id: []const u8,
+        hydration: CredentialHydration,
+    ) !void {
+        const entry = self.findEntry(profile_id) orelse return error.UnknownRuntimeProfile;
+        if (!entry.usesDeviceCredential() or hydration == .not_applicable) {
+            return error.ProfileAccessMismatch;
+        }
+        if (hydration == .loaded) return error.CredentialHydrationRequiresSecret;
+        entry.credential_hydration = hydration;
+        entry.failure_override = .missing_credential;
     }
 
     /// Forgets the device credential and any minted access token, invalidating
@@ -530,6 +590,7 @@ pub const Manager = struct {
         self.collectTerminalTunnel(entry);
         _ = self.secrets.remove(profile_id);
         var key_buffer: DeviceSecretKeyBuffer = undefined;
+        entry.credential_hydration = .missing;
         return self.secrets.remove(deviceSecretKey(&key_buffer, profile_id));
     }
 
@@ -617,7 +678,7 @@ pub const Manager = struct {
                 return error.PairingIdentityMismatch;
             }
         }
-        try self.replaceEntryProfile(index, configured_profile);
+        try self.replaceEntryProfile(index, configured_profile, true);
         try self.enable(configured_profile.id, now_ms);
     }
 
@@ -633,9 +694,15 @@ pub const Manager = struct {
         _ = self.secrets.remove(deviceSecretKey(&key_buffer, entry.owned_profile.id));
     }
 
-    // Swaps the entry's profile and connection state without touching secrets
-    // so a confirmed pairing keeps its freshly exchanged credential.
-    fn replaceEntryProfile(self: *Manager, index: usize, configured_profile: profile.Profile) !void {
+    // Swaps the entry's profile and connection state. Pair confirmation keeps
+    // its freshly exchanged credential; explicit peer replacement clears all
+    // credentials before the new descriptor becomes live.
+    fn replaceEntryProfile(
+        self: *Manager,
+        index: usize,
+        configured_profile: profile.Profile,
+        preserve_credentials: bool,
+    ) !void {
         var owned_profile = try cloneProfile(self.allocator, configured_profile);
         errdefer owned_profile.deinit(self.allocator);
         var connection_state = try connection.Connection.init(
@@ -655,11 +722,36 @@ pub const Manager = struct {
         var previous = self.entries.items[index];
         previous.pending_grant = null;
         previous.pairing_result = null;
+        if (!preserve_credentials) {
+            _ = self.secrets.remove(configured_profile.id);
+            var clear_key_buffer: DeviceSecretKeyBuffer = undefined;
+            _ = self.secrets.remove(deviceSecretKey(&clear_key_buffer, configured_profile.id));
+        }
+        var device_key_buffer: DeviceSecretKeyBuffer = undefined;
+        const device_credential_loaded = configured_profile.access.kind() != .admin_token and
+            self.secrets.get(deviceSecretKey(&device_key_buffer, configured_profile.id)) != null;
         self.entries.items[index] = .{
             .owned_profile = owned_profile,
             .connection_state = connection_state,
+            .credential_hydration = if (configured_profile.access.kind() == .admin_token)
+                .not_applicable
+            else if (device_credential_loaded)
+                .loaded
+            else
+                .missing,
         };
         previous.deinit(self.allocator);
+    }
+
+    /// Installs a newly selected Connect descriptor even when its transport
+    /// URLs equal the previous selection. Link and runtime identity changes are
+    /// new peers: live work and both credential forms must never cross them.
+    pub fn replaceConnectPeer(self: *Manager, configured_profile: profile.Profile) !void {
+        if (configured_profile.transport != .connect or configured_profile.access != .connect) {
+            return error.ProfileAccessMismatch;
+        }
+        const index = self.findEntryIndex(configured_profile.id) orelse return error.UnknownRuntimeProfile;
+        try self.replaceEntryProfile(index, configured_profile, false);
     }
 
     /// Replaces non-secret profile fields from an authoritative store reload.
@@ -680,6 +772,7 @@ pub const Manager = struct {
             entry.owned_profile.label = label;
             entry.owned_profile.access.deinit(self.allocator);
             entry.owned_profile.access = access;
+            entry.owned_profile.desired_enabled = configured_profile.desired_enabled;
             access = .admin_token;
             return .label_only;
         }
@@ -812,6 +905,8 @@ pub const Manager = struct {
         row.credential_held = self.secrets.get(entry.owned_profile.id) != null;
         var key_buffer: DeviceSecretKeyBuffer = undefined;
         row.device_credential_held = self.secrets.get(deviceSecretKey(&key_buffer, entry.owned_profile.id)) != null;
+        row.manual_retry_available = (row.phase == .failed or row.phase == .reconnecting) and
+            self.entryHasStartCredential(entry);
     }
 
     /// Copies the verified identity plus its profile generation for a durable
@@ -925,7 +1020,13 @@ pub const Manager = struct {
         }
 
         const ticket: RpcTicket = .{ .id = request_id };
-        try self.startRpcTask(entry, .{ .user = ticket }, request_id, request_json);
+        try self.startRpcTask(
+            entry,
+            .{ .user = ticket },
+            request_id,
+            request_json,
+            rpcFailureContext(method),
+        );
         return ticket;
     }
 
@@ -1407,6 +1508,11 @@ pub const Manager = struct {
                         mapConnectionFailure(failure)
                     else
                         null;
+                    if (entry.connection_state.phase() == .ready or
+                        entry.connection_state.phase() == .awaiting_trust)
+                    {
+                        entry.last_successful_connection_ms = now_ms;
+                    }
                 }
             },
             .resource => {
@@ -1428,6 +1534,7 @@ pub const Manager = struct {
         const generation = task.generation;
         const request_id = task.request_id;
         const kind = task.kind;
+        const failure_context = task.failure_context;
         const task_allocator = task.allocator;
         var worker_result: ?RpcWorkerResult = task.takeResult();
         task.releaseFields();
@@ -1477,11 +1584,18 @@ pub const Manager = struct {
                     entry.last_heartbeat_ms = now_ms;
                     entry.next_heartbeat_at_ms = now_ms +| HEARTBEAT_INTERVAL_MS;
                     if (kind == .user) {
+                        const failure_reason = classifyRpcResponseFailure(
+                            self.allocator,
+                            failure_context,
+                            request_id,
+                            response,
+                        );
                         entry.rpc_result = .{
                             .ticket = kind.user,
                             .result = .{ .response = .{
                                 .allocator = task_allocator,
                                 .json = response,
+                                .failure_reason = failure_reason,
                             } },
                         };
                         worker_result = null;
@@ -1510,7 +1624,7 @@ pub const Manager = struct {
         if (request_json.len > headless.protocol.RUNTIME_MAX_MESSAGE_BYTES) {
             return error.RuntimeRpcRequestTooLarge;
         }
-        try self.startRpcTask(entry, .heartbeat, request_id, request_json);
+        try self.startRpcTask(entry, .heartbeat, request_id, request_json, .general);
     }
 
     fn startRpcTask(
@@ -1519,6 +1633,7 @@ pub const Manager = struct {
         kind: RpcTaskKind,
         request_id: u64,
         request_json: []const u8,
+        failure_context: RpcFailureContext,
     ) !void {
         if (entry.rpc_task != null) return error.RuntimeRpcBusy;
         if (entry.connection_state.phase() != .ready) return error.RuntimeNotExecutionReady;
@@ -1536,6 +1651,7 @@ pub const Manager = struct {
             generation,
             request_id,
             kind,
+            failure_context,
             try transportTarget(entry),
             token,
             request_json,
@@ -1975,8 +2091,12 @@ fn mapAccessFailure(err: pair_client.Error) AccessFailure {
         error.OutOfMemory => .resource,
         error.AuthenticationRequired => .authentication,
         error.RateLimited => .rate_limited,
-        error.NetworkUnavailable, error.RequestTimedOut, error.ConnectionClosed => .network,
-        error.ProtocolRejected => .protocol,
+        error.NetworkUnavailable,
+        error.RequestTimedOut,
+        error.ConnectionClosed,
+        error.ServerUnavailable,
+        => .network,
+        error.WrongService, error.ProtocolRejected => .protocol,
     };
 }
 
@@ -2009,6 +2129,13 @@ const RpcTaskKind = union(enum) {
     user: RpcTicket,
 };
 
+const RpcFailureContext = enum {
+    general,
+    repository_manifest_get,
+    providers_status,
+    chat_turn_start,
+};
+
 const RpcWorkerResult = union(enum) {
     response: []u8,
     failed: connection.FailureKind,
@@ -2032,6 +2159,7 @@ const RpcTask = struct {
     generation: u64,
     request_id: u64,
     kind: RpcTaskKind,
+    failure_context: RpcFailureContext,
     target: OwnedTransportTarget,
     token: []u8,
     request_json: []u8,
@@ -2045,6 +2173,7 @@ const RpcTask = struct {
         generation: u64,
         request_id: u64,
         kind: RpcTaskKind,
+        failure_context: RpcFailureContext,
         target: TransportTarget,
         token: []const u8,
         request_json: []const u8,
@@ -2068,6 +2197,7 @@ const RpcTask = struct {
             .generation = generation,
             .request_id = request_id,
             .kind = kind,
+            .failure_context = failure_context,
             .target = target_copy,
             .token = token_copy,
             .request_json = request_copy,
@@ -2226,7 +2356,8 @@ fn callSystemGateway(
         error.OutOfMemory => error.OutOfMemory,
         error.AuthenticationRequired => error.AuthenticationRequired,
         error.RequestTimedOut => error.RequestTimedOut,
-        error.RedirectRejected,
+        error.DaemonUnavailable => error.ServerUnavailable,
+        error.WrongService, error.RedirectRejected => error.WrongService,
         error.GatewayRejected,
         error.RequestTooLarge,
         error.ResponseTooLarge,
@@ -2278,6 +2409,74 @@ fn inspectRpcResponse(
     return null;
 }
 
+fn rpcFailureContext(method: []const u8) RpcFailureContext {
+    if (std.mem.eql(u8, method, headless.store_protocol.METHOD_WORKSPACE_REPOSITORY_MANIFEST_GET)) {
+        return .repository_manifest_get;
+    }
+    if (std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDERS_STATUS)) {
+        return .providers_status;
+    }
+    if (std.mem.eql(u8, method, "chat.turn.start")) return .chat_turn_start;
+    return .general;
+}
+
+/// Classifies one valid method-level JSON-RPC error by stable method and code.
+/// Display text is intentionally excluded from this contract.
+pub fn classifyRpcFailure(method: []const u8, code: []const u8) FailureReason {
+    return classifyRpcError(rpcFailureContext(method), code);
+}
+
+fn classifyRpcError(context: RpcFailureContext, code: []const u8) FailureReason {
+    if (context == .repository_manifest_get and
+        std.mem.eql(u8, code, headless.protocol.ERR_RESOURCE_NOT_FOUND))
+    {
+        return .workspace_binding_missing;
+    }
+    if (context == .providers_status and
+        std.mem.eql(u8, code, headless.protocol.ERR_CAPABILITY_UNAVAILABLE))
+    {
+        return .provider_unavailable;
+    }
+    if (context == .chat_turn_start and
+        std.mem.eql(u8, code, headless.protocol.ERR_PROVIDER_UNAVAILABLE))
+    {
+        return .provider_unavailable;
+    }
+    return .unknown;
+}
+
+/// Classifies structured provider state independently from unrelated chat RPC
+/// errors and without parsing display text.
+pub fn classifyProviderStatus(status: headless.providers_protocol.ProviderStatus) ?FailureReason {
+    if (!status.installed or
+        std.mem.eql(u8, status.state, "missing") or
+        std.mem.eql(u8, status.state, "unavailable"))
+    {
+        return .provider_unavailable;
+    }
+    if (std.mem.eql(u8, status.authentication, "unauthenticated") or
+        std.mem.eql(u8, status.authentication, "required"))
+    {
+        return .provider_not_authenticated;
+    }
+    return null;
+}
+
+fn classifyRpcResponseFailure(
+    allocator: std.mem.Allocator,
+    context: RpcFailureContext,
+    request_id: u64,
+    response_json: []const u8,
+) ?FailureReason {
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    var client = headless.Client.initEncoder(arena.allocator());
+    var parsed = client.parseResponseWithId(request_id, response_json) catch return null;
+    defer parsed.deinit();
+    const remote_error = parsed.response.err orelse return null;
+    return classifyRpcError(context, remote_error.code);
+}
+
 fn classifyRpcInspectionError(err: anyerror) connection.FailureKind {
     return switch (err) {
         error.OutOfMemory => .resource,
@@ -2294,6 +2493,8 @@ fn mapTransportFailure(err: connection.TransportError) connection.FailureKind {
         error.RequestTimedOut,
         error.ConnectionClosed,
         => .network,
+        error.ServerUnavailable => .server_unavailable,
+        error.WrongService => .wrong_service,
         error.ProtocolRejected => .protocol,
     };
 }
@@ -2424,6 +2625,15 @@ fn snapshotEntry(entry: *const Entry) Snapshot {
         tunnel_supervisor.Snapshot{ .lifecycle = .stopped };
     const pending_metadata = entry.connection_state.pendingTrustMetadata();
     const metadata = entry.connection_state.metadata() orelse pending_metadata;
+    const retry = switch (entry.connection_state.state) {
+        .reconnecting => |retry_state| retry_state,
+        else => null,
+    };
+    const connection_failure = entry.connection_state.lastFailure();
+    const displayed_failure = entry.failure_override orelse if (connection_failure) |failure|
+        mapConnectionFailure(failure)
+    else
+        null;
     return .{
         .profile_id = entry.owned_profile.id,
         .label = entry.owned_profile.label,
@@ -2448,14 +2658,29 @@ fn snapshotEntry(entry: *const Entry) Snapshot {
             else => null,
         },
         .phase = entry.connection_state.phase(),
-        .failure = entry.failure_override orelse if (entry.connection_state.lastFailure()) |failure|
-            mapConnectionFailure(failure)
+        .failure = displayed_failure,
+        .failure_reason = if (entry.credential_hydration == .backend_unavailable)
+            .credential_store_unavailable
+        else if (entry.credential_hydration == .invalid)
+            .credential_invalid
+        else if (entry.failure_override == .missing_credential)
+            .authentication_required
+        else if (connection_failure) |failure|
+            if (failure == .authentication and entry.usesDeviceCredential())
+                .device_credential_revoked
+            else
+                mapConnectionFailureReason(failure)
+        else if (displayed_failure) |failure|
+            mapManagerFailureReason(failure)
         else
             null,
-        .retry_at_ms = switch (entry.connection_state.state) {
-            .reconnecting => |retry_state| retry_state.retry_at_ms,
-            else => null,
-        },
+        .automatic_retry_scheduled = retry != null,
+        .retry_attempt = if (retry) |value| value.attempt else 0,
+        .retry_delay_ms = if (retry) |value| value.delay_ms else null,
+        .retry_at_ms = if (retry) |value| value.retry_at_ms else null,
+        .last_successful_connection_ms = entry.last_successful_connection_ms,
+        .credential_hydration = entry.credential_hydration,
+        .desired_enabled = entry.owned_profile.desired_enabled,
         .local_port = entry.local_port,
         .tunnel_lifecycle = tunnel.lifecycle,
         .tunnel_pid = tunnel.pid,
@@ -2481,9 +2706,38 @@ fn mapConnectionFailure(failure: connection.FailureKind) Failure {
     return switch (failure) {
         .authentication => .authentication,
         .network => .network,
+        .server_unavailable => .network,
         .identity => .identity,
         .protocol => .protocol,
+        .wrong_service => .protocol,
         .resource => .resource,
+    };
+}
+
+fn mapConnectionFailureReason(failure: connection.FailureKind) FailureReason {
+    return switch (failure) {
+        .authentication => .authentication_required,
+        .network => .transport_offline,
+        .server_unavailable => .server_unavailable,
+        .identity => .identity_changed,
+        .protocol => .invalid_protocol_response,
+        .wrong_service => .wrong_service,
+        .resource => .unknown,
+    };
+}
+
+fn mapManagerFailureReason(failure: Failure) FailureReason {
+    return switch (failure) {
+        .missing_credential, .authentication, .pairing_rejected => .authentication_required,
+        .network, .tunnel_readiness, .tunnel_wait, .tunnel_exited => .transport_offline,
+        .identity => .identity_changed,
+        .protocol => .invalid_protocol_response,
+        .unsupported_transport,
+        .no_loopback_port,
+        .tunnel_spawn,
+        .resource,
+        .rate_limited,
+        => .unknown,
     };
 }
 
@@ -2573,6 +2827,7 @@ fn cloneProfile(allocator: std.mem.Allocator, source: profile.Profile) !profile.
         .expected_instance_id = expected_instance_id,
         .transport = transport,
         .access = access,
+        .desired_enabled = source.desired_enabled,
     };
 }
 
@@ -2611,6 +2866,9 @@ fn eraseAndFree(allocator: std.mem.Allocator, bytes: []u8) void {
 
 const TEST_TOKEN_A = "0123456789abcdef0123456789abcdef";
 const TEST_TOKEN_B = "fedcba9876543210fedcba9876543210";
+const TEST_DEVICE_CREDENTIAL =
+    "0123456789abcdef0123456789abcdef" ++
+    "fedcba9876543210fedcba9876543210";
 const TEST_RUNTIME_A = "0123456789abcdef0123456789abcdef";
 const TEST_RUNTIME_B = "fedcba9876543210fedcba9876543210";
 const TEST_INSTANCE = "00112233445566778899aabbccddeeff";
@@ -2980,6 +3238,7 @@ test "manager gates auth on readiness and first contact on durable trust" {
     try std.testing.expectEqual(@as(usize, 1), rpc.calls.load(.acquire));
     try std.testing.expect(rpc.valid_request.load(.acquire));
     try std.testing.expect(pending.runtime != null);
+    try std.testing.expect(pending.last_successful_connection_ms != null);
     try std.testing.expectEqualStrings(TEST_RUNTIME_A, pending.runtime.?.runtime_id);
     try std.testing.expect(pending.identity_pin_required);
     try std.testing.expect(!pending.execution_ready);
@@ -3079,6 +3338,7 @@ test "targeted RPC preserves method errors and rejects replacement before mutati
     defer method_result.deinit();
     switch (method_result) {
         .response => |response| {
+            try std.testing.expectEqual(FailureReason.unknown, response.failure_reason.?);
             var client = headless.Client.initEncoder(std.testing.allocator);
             var parsed = try client.parseResponseWithId(method_ticket.id, response.json);
             defer parsed.deinit();
@@ -3112,6 +3372,141 @@ test "targeted RPC preserves method errors and rejects replacement before mutati
     try waitForManagerCleanup(&manager, configured.id);
 }
 
+test "typed RPC failure reasons use method and code rather than messages" {
+    try std.testing.expectEqual(
+        connection.FailureKind.server_unavailable,
+        mapTransportFailure(error.ServerUnavailable),
+    );
+    try std.testing.expectEqual(
+        connection.FailureKind.wrong_service,
+        mapTransportFailure(error.WrongService),
+    );
+    try std.testing.expectEqual(
+        FailureReason.workspace_binding_missing,
+        classifyRpcFailure("workspace.repository.manifest.get", headless.protocol.ERR_RESOURCE_NOT_FOUND),
+    );
+    try std.testing.expectEqual(
+        FailureReason.unknown,
+        classifyRpcFailure("chat.turn.start", headless.protocol.ERR_RESOURCE_NOT_FOUND),
+    );
+    try std.testing.expectEqual(
+        FailureReason.provider_unavailable,
+        classifyRpcFailure("chat.turn.start", headless.protocol.ERR_PROVIDER_UNAVAILABLE),
+    );
+    try std.testing.expectEqual(
+        FailureReason.unknown,
+        classifyRpcFailure("chat.turn.start", headless.protocol.ERR_CAPABILITY_UNAVAILABLE),
+    );
+    try std.testing.expectEqual(
+        FailureReason.unknown,
+        classifyRpcFailure("chat.turn.start", headless.protocol.ERR_INVALID_STATE),
+    );
+    try std.testing.expectEqual(
+        FailureReason.unknown,
+        classifyRpcFailure("chat.turn.tail", headless.protocol.ERR_RESOURCE_NOT_FOUND),
+    );
+    try std.testing.expectEqual(
+        FailureReason.unknown,
+        classifyRpcFailure("chat.message.append", headless.protocol.ERR_INVALID_PARAMS),
+    );
+    try std.testing.expectEqual(
+        FailureReason.unknown,
+        classifyRpcFailure("workspace.repository.binding.upsert", headless.protocol.ERR_RESOURCE_NOT_FOUND),
+    );
+    try std.testing.expectEqual(
+        FailureReason.provider_unavailable,
+        classifyRpcFailure("providers.status", headless.protocol.ERR_CAPABILITY_UNAVAILABLE),
+    );
+    try std.testing.expectEqual(
+        FailureReason.unknown,
+        classifyRpcFailure("core.snapshot", headless.protocol.ERR_INTERNAL),
+    );
+
+    const unavailable: headless.providers_protocol.ProviderStatus = .{
+        .provider = "codex",
+        .label = "Codex",
+        .surfaces = .{ .native_chat = true },
+        .installed = false,
+        .state = "missing",
+        .authentication = "unknown",
+    };
+    try std.testing.expectEqual(FailureReason.provider_unavailable, classifyProviderStatus(unavailable).?);
+    const signed_out: headless.providers_protocol.ProviderStatus = .{
+        .provider = "codex",
+        .label = "Codex",
+        .surfaces = .{ .native_chat = true },
+        .installed = true,
+        .state = "ready",
+        .authentication = "unauthenticated",
+    };
+    try std.testing.expectEqual(FailureReason.provider_not_authenticated, classifyProviderStatus(signed_out).?);
+    const ready: headless.providers_protocol.ProviderStatus = .{
+        .provider = "codex",
+        .label = "Codex",
+        .surfaces = .{ .native_chat = true },
+        .installed = true,
+        .state = "ready",
+        .authentication = "authenticated",
+    };
+    try std.testing.expect(classifyProviderStatus(ready) == null);
+}
+
+test "transient and wrong-service failures preserve paired device credentials" {
+    var configured = try profile.Profile.createPairedDirect(
+        std.testing.allocator,
+        std.testing.io,
+        "Paired Direct",
+        "https://runtime.example",
+        null,
+    );
+    defer configured.deinit(std.testing.allocator);
+    try configured.setPairedDevice(
+        std.testing.allocator,
+        "0123456789abcdef0123456789abcdef",
+        "verde-runtime/test/device",
+    );
+    try configured.setExpectedIdentity(std.testing.allocator, TEST_RUNTIME_A, TEST_INSTANCE);
+
+    var manager = try Manager.init(std.testing.allocator, std.testing.io, &.{configured}, .{
+        .durable_credentials = false,
+    });
+    defer manager.deinit();
+    try manager.noteCredentialHydration(configured.id, .backend_unavailable);
+    const backend_failure = manager.snapshot(configured.id).?;
+    try std.testing.expectEqual(CredentialHydration.backend_unavailable, backend_failure.credential_hydration);
+    try std.testing.expectEqual(FailureReason.credential_store_unavailable, backend_failure.failure_reason.?);
+    try manager.noteCredentialHydration(configured.id, .invalid);
+    const invalid = manager.snapshot(configured.id).?;
+    try std.testing.expectEqual(CredentialHydration.invalid, invalid.credential_hydration);
+    try std.testing.expectEqual(FailureReason.credential_invalid, invalid.failure_reason.?);
+    try manager.hydrateDeviceCredential(configured.id, TEST_DEVICE_CREDENTIAL);
+    const entry = manager.findEntry(configured.id).?;
+    const first_generation = try entry.connection_state.enable();
+    _ = try entry.connection_state.failAttempt(first_generation, .network, 1_000, 0);
+
+    const offline = manager.snapshot(configured.id).?;
+    try std.testing.expectEqual(connection.Phase.reconnecting, offline.phase);
+    try std.testing.expectEqual(FailureReason.transport_offline, offline.failure_reason.?);
+    try std.testing.expect(offline.device_credential_held);
+    try std.testing.expect(offline.automatic_retry_scheduled);
+    try std.testing.expect(offline.manual_retry_available);
+
+    const retry_generation = try entry.connection_state.retryFailed();
+    _ = try entry.connection_state.failAttempt(retry_generation, .wrong_service, 1_100, 0);
+    const wrong_service = manager.snapshot(configured.id).?;
+    try std.testing.expectEqual(connection.Phase.failed, wrong_service.phase);
+    try std.testing.expectEqual(FailureReason.wrong_service, wrong_service.failure_reason.?);
+    try std.testing.expect(wrong_service.device_credential_held);
+    try std.testing.expect(wrong_service.failure.? != .missing_credential);
+
+    const auth_generation = try entry.connection_state.retryFailed();
+    _ = try entry.connection_state.failAttempt(auth_generation, .authentication, 1_200, 0);
+    const revoked = manager.snapshot(configured.id).?;
+    try std.testing.expectEqual(FailureReason.device_credential_revoked, revoked.failure_reason.?);
+    try std.testing.expect(!revoked.automatic_retry_scheduled);
+    try std.testing.expect(revoked.device_credential_held);
+}
+
 test "targeted heartbeat network failure retries and restores health" {
     var configured = try createPinnedTestProfile("Heartbeat VM");
     defer configured.deinit(std.testing.allocator);
@@ -3129,7 +3524,9 @@ test "targeted heartbeat network failure retries and restores health" {
     try manager.enable(configured.id, 0);
     try waitForExecutionReady(&manager, configured.id, 5_000);
 
-    const first_heartbeat_ms = manager.snapshot(configured.id).?.last_heartbeat_ms.?;
+    const connected = manager.snapshot(configured.id).?;
+    const first_heartbeat_ms = connected.last_heartbeat_ms.?;
+    const last_successful_connection_ms = connected.last_successful_connection_ms.?;
     const due_ms = first_heartbeat_ms + HEARTBEAT_INTERVAL_MS;
     rpc.setMode(.network_failure);
     try manager.poll(due_ms);
@@ -3141,7 +3538,12 @@ test "targeted heartbeat network failure retries and restores health" {
 
     const disconnected = manager.snapshot(configured.id).?;
     try std.testing.expectEqual(Failure.network, disconnected.failure.?);
+    try std.testing.expectEqual(FailureReason.transport_offline, disconnected.failure_reason.?);
     try std.testing.expect(disconnected.retry_at_ms != null);
+    try std.testing.expect(disconnected.automatic_retry_scheduled);
+    try std.testing.expect(disconnected.retry_attempt > 0);
+    try std.testing.expect(disconnected.retry_delay_ms != null);
+    try std.testing.expectEqual(last_successful_connection_ms, disconnected.last_successful_connection_ms.?);
     try std.testing.expect(!disconnected.execution_ready);
     try std.testing.expectEqual(@as(usize, 2), rpc.targeted_heartbeats.load(.acquire));
 
