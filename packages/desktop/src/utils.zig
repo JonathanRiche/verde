@@ -1812,6 +1812,7 @@ fn toolCallDefaultTitle(tool_call: ai_harness.ToolCallUpdate) []const u8 {
         .fetch => "Fetch",
         .mcp => "MCP tool",
         .other => "Cursor tool",
+        .subagent => "Subagent",
     };
 }
 
@@ -1821,10 +1822,12 @@ fn isGenericMcpToolTitle(title: []const u8) bool {
 }
 
 fn toolCallDisplayAuthor(tool_call: ai_harness.ToolCallUpdate) []const u8 {
-    // MCP method names belong in the card body. Keeping the stable author
-    // makes every provider use the structured command-card renderer instead
-    // of treating provider-specific method names as ordinary system bubbles.
+    // MCP method names and subagent task titles belong in the card body.
+    // Keeping the stable author makes every provider use the structured
+    // command-card renderer instead of treating provider-specific names as
+    // ordinary system bubbles.
     if ((tool_call.kind orelse .other) == .mcp) return "MCP tool";
+    if ((tool_call.kind orelse .other) == .subagent) return "Subagent";
     return toolCallDefaultTitle(tool_call);
 }
 

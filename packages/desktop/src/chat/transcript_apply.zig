@@ -245,7 +245,7 @@ fn hasToolContent(input: ?[]const u8, output: ?[]const u8, error_text: ?[]const 
 
 fn canonicalKind(value: ?[]const u8) ?[]const u8 {
     const text = value orelse return null;
-    const known = [_][]const u8{ "read", "edit", "delete", "move", "search", "execute", "think", "fetch", "mcp" };
+    const known = [_][]const u8{ "read", "edit", "delete", "move", "search", "execute", "think", "fetch", "mcp", "subagent" };
     for (known) |item| if (std.mem.eql(u8, text, item)) return item;
     return "other";
 }
@@ -469,11 +469,14 @@ fn toolDefaultTitle(kind: []const u8, status: []const u8) []const u8 {
     if (std.mem.eql(u8, kind, "think")) return if (std.mem.eql(u8, status, "pending") or std.mem.eql(u8, status, "in_progress")) "Thinking" else "Think";
     if (std.mem.eql(u8, kind, "fetch")) return "Fetch";
     if (std.mem.eql(u8, kind, "mcp")) return "MCP tool";
+    if (std.mem.eql(u8, kind, "subagent")) return "Subagent";
     return "Cursor tool";
 }
 
 fn toolDisplayAuthor(kind: []const u8, status: []const u8) []const u8 {
-    return if (std.mem.eql(u8, kind, "mcp")) "MCP tool" else toolDefaultTitle(kind, status);
+    if (std.mem.eql(u8, kind, "mcp")) return "MCP tool";
+    if (std.mem.eql(u8, kind, "subagent")) return "Subagent";
+    return toolDefaultTitle(kind, status);
 }
 
 fn toolBodyAlloc(

@@ -35,6 +35,9 @@ const COMPOSER_HEIGHT: f32 = 262.0;
 /// Floor keeps ~2 lines of prompt text visible above the inner toolbar even
 /// in short panes, after the 42px directory strip is taken out.
 const COMPOSER_MIN_HEIGHT: f32 = 176.0;
+/// Compact read-only strip used instead of the prompt box on subagent panes.
+const SUBAGENT_COMPOSER_HEIGHT: f32 = 88.0;
+const SUBAGENT_COMPOSER_MIN_HEIGHT: f32 = 64.0;
 /// Toolbar logos and drawn icons must sit above `PaletteComposerPrompt` geometry (`z_index` 120) so
 /// interleaved SDL_GPU rendering does not paint the composer panel over them.
 const COMPOSER_TOOLBAR_OVERLAY_Z: i32 = 130;
@@ -490,7 +493,6 @@ pub fn renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(
         quick.visible and pane_id != null and pane_id.? != quick.pane_id
     else
         false;
-    const live_composer = !blocked_by_quick and paneOwnsActiveChatState(state, pane_id);
     const restore_thread_index = if (pane_id != null and state.project_controller.projects.items.len > 0)
         state.project_controller.projects.items[state.project_controller.selected_index].selected_thread_index
     else
@@ -507,6 +509,8 @@ pub fn renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(
             }
         }
     }
+    const subagent_view = state.project_controller.projects.items.len > 0 and state.currentThread().isSubagentView();
+    const live_composer = !blocked_by_quick and !subagent_view and paneOwnsActiveChatState(state, pane_id);
 
     if (live_composer) {
         state.invalidateComposerToolbarOverlayHitRects();
@@ -523,7 +527,10 @@ pub fn renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(
 
     // ~30% shorter than the original (0.14 / 54 / 82) clamp: scale each bound by 0.7.
     const header_height = theme.clampf(rect.h * 0.098, theme.scaledUi(38.0), theme.scaledUi(TOP_BAR_HEIGHT));
-    const composer_height = theme.clampf(rect.h * 0.32, theme.scaledUi(COMPOSER_MIN_HEIGHT), theme.scaledUi(COMPOSER_HEIGHT));
+    const composer_height = if (subagent_view)
+        theme.clampf(rect.h * 0.12, theme.scaledUi(SUBAGENT_COMPOSER_MIN_HEIGHT), theme.scaledUi(SUBAGENT_COMPOSER_HEIGHT))
+    else
+        theme.clampf(rect.h * 0.32, theme.scaledUi(COMPOSER_MIN_HEIGHT), theme.scaledUi(COMPOSER_HEIGHT));
     // Lifted off the panel edge so the toolbar pills (and the popovers that
     // open above them) never sit flush against the bottom of the window.
     const bottom_margin = theme.clampf(rect.h * 0.028, theme.scaledUi(14.0), theme.scaledUi(22.0));
@@ -669,7 +676,9 @@ pub fn renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(
     renderHeader(state, header, header_right_reserve, pane_id);
 
     if (!blocked_by_quick) {
-        if (live_composer) {
+        if (subagent_view) {
+            renderSubagentComposerBanner(state, composer_rect);
+        } else if (live_composer) {
             renderComposer(state, composer_rect);
         } else {
             renderInactiveComposer(state, composer_rect);
@@ -1386,7 +1395,7 @@ fn transcriptMarkdownBubbleHit(
     const content_offset_y = mouse_y - column.y + scroll_y;
     const estimated_height = estimatedPartialTranscriptHeight(thread);
     if (transcriptLayoutItemAtContentY(thread.transcript_layout_items.items, estimated_height, content_offset_y)) |item| {
-        if (item.group_end - item.message_index < 2 and item.message_index < thread.messages.items.len) {
+        if (!commandGroupRendersGrouped(thread.messages.items, item.message_index, item.group_end) and item.message_index < thread.messages.items.len) {
             const message = thread.messages.items[item.message_index];
             const content_y = column.y - scroll_y + estimated_height + item.top;
             if (!(message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body))) {
@@ -1411,8 +1420,8 @@ fn transcriptMarkdownBubbleHit(
             pi += 1;
             continue;
         }
-        const group_end = if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body)) toolCallGroupEnd(send_state.pending_events.items, pi) else pi + 1;
-        if (group_end - pi >= 2) {
+        const group_end = if (shouldGroupCommandRow(event)) toolCallGroupEnd(send_state.pending_events.items, pi) else pi + 1;
+        if (commandGroupRendersGrouped(send_state.pending_events.items, pi, group_end)) {
             content_y += toolCallGroupHeight(state, send_state.pending_events.items, pi, group_end, base_idx, column.w) + theme.scaledUi(12.0);
             pi = group_end;
             continue;
@@ -1456,7 +1465,7 @@ fn transcriptMarkdownBubbleLinkHit(
     const content_offset_y = mouse_y - column.y + scroll_y;
     const estimated_height = estimatedPartialTranscriptHeight(thread);
     if (transcriptLayoutItemAtContentY(thread.transcript_layout_items.items, estimated_height, content_offset_y)) |item| {
-        if (item.group_end - item.message_index < 2 and item.message_index < thread.messages.items.len) {
+        if (!commandGroupRendersGrouped(thread.messages.items, item.message_index, item.group_end) and item.message_index < thread.messages.items.len) {
             const message = thread.messages.items[item.message_index];
             const content_y = column.y - scroll_y + estimated_height + item.top;
             if (!(message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body))) {
@@ -1480,8 +1489,8 @@ fn transcriptMarkdownBubbleLinkHit(
             pi += 1;
             continue;
         }
-        const group_end = if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body)) toolCallGroupEnd(send_state.pending_events.items, pi) else pi + 1;
-        if (group_end - pi >= 2) {
+        const group_end = if (shouldGroupCommandRow(event)) toolCallGroupEnd(send_state.pending_events.items, pi) else pi + 1;
+        if (commandGroupRendersGrouped(send_state.pending_events.items, pi, group_end)) {
             content_y += toolCallGroupHeight(state, send_state.pending_events.items, pi, group_end, thread.messages.items.len, column.w) + theme.scaledUi(12.0);
             pi = group_end;
             continue;
@@ -2034,11 +2043,24 @@ fn workspaceHeaderControlHit(x: f32, y: f32) ?*WorkspaceHeaderHitCache {
 fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f32, pane_id: ?app_state.WorkspacePaneId) void {
     const header_hit = appendWorkspaceHeaderHit(pane_id, rect);
 
-    queueRect(state, rect, paletteColor(theme.background()));
-    queueRect(state, .{ .x = rect.x, .y = rect.y + rect.h - 1.0, .w = rect.w, .h = 1.0 }, paletteColor(theme.borderMuted()));
+    const thread = state.currentThread();
+    const subagent = thread.isSubagentView();
+    const header_fill = if (subagent)
+        theme.mix(theme.background(), theme.accent(), 0.08)
+    else
+        theme.background();
+    queueRect(state, rect, paletteColor(header_fill));
+    if (subagent) {
+        queueRect(state, .{
+            .x = rect.x,
+            .y = rect.y,
+            .w = theme.scaledUi(3.0),
+            .h = rect.h,
+        }, paletteColor(theme.accent()));
+    }
+    queueRect(state, .{ .x = rect.x, .y = rect.y + rect.h - 1.0, .w = rect.w, .h = 1.0 }, paletteColor(if (subagent) theme.accent() else theme.borderMuted()));
 
     const padding_x = theme.scaledUi(28.0);
-    const thread = state.currentThread();
     const title_src: []const u8 = if (thread.committed)
         if (thread.title.len > 0) thread.title else "New chat"
     else
@@ -2060,14 +2082,24 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
 
     const actions_right = rect.x + rect.w - right_reserve - button_gap;
     const actions_x = actions_right - actions_w;
-    const title_max_w = @max(actions_x - rect.x - padding_x - title_gap, theme.scaledUi(96.0));
+    const badge_w: f32 = if (subagent) theme.scaledUi(78.0) else 0.0;
+    const badge_gap: f32 = if (subagent) theme.scaledUi(10.0) else 0.0;
+    const title_x = rect.x + padding_x + badge_w + badge_gap;
+    const title_max_w = @max(actions_x - title_x - title_gap, theme.scaledUi(96.0));
 
     var title_buf: [256]u8 = undefined;
     const title_display = truncateWorkspaceTitle(&title_buf, title_src, title_max_w, title_font);
     const title_line_h = theme.scaledUi(32.0);
     const title_y = rect.y + @max((rect.h - title_line_h) * 0.5, theme.scaledUi(4.0));
+    if (subagent) {
+        const badge_h = theme.scaledUi(22.0);
+        const badge_y = rect.y + @max((rect.h - badge_h) * 0.5, theme.scaledUi(6.0));
+        const badge_rect = palette.Rect{ .x = rect.x + padding_x, .y = badge_y, .w = badge_w, .h = badge_h };
+        queueRounded(state, badge_rect, paletteColor(theme.withAlpha(theme.accent(), 46)), theme.scaledUi(11.0));
+        queueText(state, badge_rect, "Subagent", paletteColor(theme.accent()), label_font, rect);
+    }
     queueText(state, .{
-        .x = rect.x + padding_x,
+        .x = title_x,
         .y = title_y,
         .w = title_max_w,
         .h = title_line_h,
@@ -3102,7 +3134,7 @@ fn tryPatchToggledCardLayout(
     const messages = thread.messages.items;
     // Mirror the build loop's measurement exactly so patched and rebuilt
     // geometry can never disagree.
-    const new_height = if (item.group_end - item.message_index >= 2)
+    const new_height = if (commandGroupRendersGrouped(messages, item.message_index, item.group_end))
         toolCallGroupHeight(state, messages, item.message_index, item.group_end, 0, width)
     else
         transcriptCommittedMessageHeight(state, item.message_index, messages[item.message_index], width);
@@ -3206,16 +3238,18 @@ fn ensureTranscriptLayout(
         }
 
         var message_index = previous_index;
-        if (previous.role == .system and shouldRenderPaletteCommandRow(previous.author, previous.body)) {
+        if (shouldGroupCommandRow(previous)) {
+            const subagent = isSubagentTimelineEntry(previous);
             while (message_index > 0) {
                 const candidate = thread.messages.items[message_index - 1];
-                if (candidate.role != .system or !shouldRenderPaletteCommandRow(candidate.author, candidate.body)) break;
+                if (!shouldGroupCommandRow(candidate)) break;
+                if (isSubagentTimelineEntry(candidate) != subagent) break;
                 message_index -= 1;
             }
         }
         const message = thread.messages.items[message_index];
         const group_end = before;
-        const height = if (group_end - message_index >= 2)
+        const height = if (commandGroupRendersGrouped(thread.messages.items, message_index, group_end))
             toolCallGroupHeight(state, thread.messages.items, message_index, group_end, 0, width)
         else
             transcriptCommittedMessageHeight(state, message_index, message, width);
@@ -3431,7 +3465,7 @@ fn renderCommittedTranscript(
         if (item.top > visible_bottom) break;
         const content_y = column.y - scroll_y + estimated_height + item.top;
         const message = thread.messages.items[item.message_index];
-        if (item.group_end - item.message_index >= 2) {
+        if (commandGroupRendersGrouped(thread.messages.items, item.message_index, item.group_end)) {
             const last = thread.messages.items[item.group_end - 1];
             const batch_start = transcriptBatchStart(state);
             renderToolCallGroup(state, thread.messages.items, item.message_index, item.group_end, 0, column, content_y, item.height, clip, thread.backgroundCommandIsRunning(last.body), null);
@@ -3735,11 +3769,11 @@ fn transcriptPendingStreamHeight(state: *app_state.AppState, thread: *const app_
             pi += 1;
             continue;
         }
-        const group_end = if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body))
+        const group_end = if (shouldGroupCommandRow(event.*))
             toolCallGroupEnd(send_state.pending_events.items, pi)
         else
             pi + 1;
-        if (group_end - pi >= 2) {
+        if (commandGroupRendersGrouped(send_state.pending_events.items, pi, group_end)) {
             total += pendingToolCallGroupHeight(state, send_state.pending_events.items, pi, group_end, base, column_width, send_state.started_at_ms, variant_hash) + theme.scaledUi(12.0);
             pi = group_end;
             continue;
@@ -3770,11 +3804,11 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
             pi += 1;
             continue;
         }
-        const group_end = if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body))
+        const group_end = if (shouldGroupCommandRow(event.*))
             toolCallGroupEnd(send_state.pending_events.items, pi)
         else
             pi + 1;
-        if (group_end - pi >= 2) {
+        if (commandGroupRendersGrouped(send_state.pending_events.items, pi, group_end)) {
             const item_h = pendingToolCallGroupHeight(state, send_state.pending_events.items, pi, group_end, base_message_index, column.w, send_state.started_at_ms, variant_hash);
             const entrance_opacity = pendingTranscriptCardOpacity(event, now_ms, state.app_config.reduced_motion);
             if (y + item_h >= column.y and y <= column.y + column.h) {
@@ -3925,13 +3959,36 @@ fn toolCopyIdentity(message_index: usize, body: []const u8) u64 {
     return hasher.final();
 }
 
+fn isSubagentTimelineEntry(entry: anytype) bool {
+    if (@hasField(@TypeOf(entry), "tool_call_kind")) {
+        if (entry.tool_call_kind) |kind| {
+            if (kind == .subagent) return true;
+        }
+    }
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, entry.author, " \n\r\t"), "Subagent");
+}
+
+fn shouldGroupCommandRow(entry: anytype) bool {
+    if (entry.role != .system) return false;
+    if (isSubagentTimelineEntry(entry)) return true;
+    return shouldRenderPaletteCommandRow(entry.author, entry.body);
+}
+
 fn toolCallGroupEnd(entries: anytype, start: usize) usize {
-    var end = start;
+    if (start >= entries.len or !shouldGroupCommandRow(entries[start])) return start + 1;
+    const subagent = isSubagentTimelineEntry(entries[start]);
+    var end = start + 1;
     while (end < entries.len) : (end += 1) {
-        const entry = entries[end];
-        if (entry.role != .system or !shouldRenderPaletteCommandRow(entry.author, entry.body)) break;
+        if (!shouldGroupCommandRow(entries[end])) break;
+        if (isSubagentTimelineEntry(entries[end]) != subagent) break;
     }
     return end;
+}
+
+fn commandGroupRendersGrouped(entries: anytype, start: usize, end: usize) bool {
+    if (end <= start) return false;
+    if (end - start >= 2) return true;
+    return isSubagentTimelineEntry(entries[start]);
 }
 
 fn toolCallGroupFailed(entries: anytype, start: usize, end: usize) bool {
@@ -4002,6 +4059,29 @@ test "tool call groups use structured lifecycle status" {
     try std.testing.expectEqual(@as(usize, 1), toolCallGroupFailureCount(entries[0..], 0, entries.len));
 }
 
+test "subagent rows group separately from ordinary tool calls" {
+    const Event = struct {
+        role: app_state.ChatRole = .system,
+        author: []const u8,
+        body: []const u8,
+        tool_call_kind: ?ai_harness.ToolCallKind = null,
+        tool_call_status: ?ai_harness.ToolCallStatus = null,
+    };
+    const entries = [_]Event{
+        .{ .author = "Read", .body = "Input", .tool_call_kind = .read },
+        .{ .author = "Subagent", .body = "Explore website", .tool_call_kind = .subagent, .tool_call_status = .in_progress },
+        .{ .author = "Subagent", .body = "Review changes", .tool_call_kind = .subagent, .tool_call_status = .completed },
+        .{ .author = "Edit", .body = "Input", .tool_call_kind = .edit },
+    };
+
+    try std.testing.expectEqual(@as(usize, 1), toolCallGroupEnd(entries[0..], 0));
+    try std.testing.expectEqual(@as(usize, 3), toolCallGroupEnd(entries[0..], 1));
+    try std.testing.expectEqual(@as(usize, 4), toolCallGroupEnd(entries[0..], 3));
+    try std.testing.expect(commandGroupRendersGrouped(entries[0..], 1, 3));
+    try std.testing.expect(commandGroupRendersGrouped(entries[0..], 1, 2));
+    try std.testing.expect(!commandGroupRendersGrouped(entries[0..], 0, 1));
+}
+
 /// True when the body looks like an executed shell one-liner (e.g. Codex/OpenCode style `/usr/bin/bash -lc '…'`).
 fn isCommandLikeShellBody(body_raw: []const u8) bool {
     const t = std.mem.trim(u8, body_raw, "\n\r\t ");
@@ -4058,6 +4138,7 @@ fn isCursorToolSystemEvent(author_raw: []const u8, body_raw: []const u8) bool {
         "Thinking",
         "MCP tool",
         "Cursor tool",
+        "Subagent",
     };
     for (known_tools) |tool| {
         if (std.ascii.eqlIgnoreCase(author, tool)) return true;
@@ -6340,7 +6421,10 @@ fn renderToolCallGroup(
     }
 
     var summary_buf: [128]u8 = undefined;
-    const noun = if (count == 1) "tool call" else "tool calls";
+    const subagent = isSubagentTimelineEntry(entries[start]);
+    const noun = if (subagent)
+        (if (count == 1) "subagent" else "subagents")
+    else if (count == 1) "tool call" else "tool calls";
     const summary = if (running) blk: {
         if (started_at_ms == null) {
             if (failed_count > 0) {
@@ -6452,7 +6536,10 @@ fn renderCommandEventRow(
         running;
     const failed = commandEventFailed(original_author) or (tool_call_status orelse .unknown) == .failed;
     const stopped = std.mem.eql(u8, original_author, "Background task stopped") or (tool_call_status orelse .unknown) == .cancelled;
-    const fill_color = if (grouped) theme.darken(theme.background(), 0.035) else theme.COLOR_PANEL_ALT;
+    const subagent_row = chat_types.isSubagentAuthorOrKind(original_author, null);
+    const fill_color = if (subagent_row)
+        theme.mix(theme.background(), theme.accent(), 0.07)
+    else if (grouped) theme.darken(theme.background(), 0.035) else theme.COLOR_PANEL_ALT;
     const resting_border = if (grouped) theme.withAlpha(theme.borderMuted(), 185) else theme.borderMuted();
     queueRoundedShellClipped(
         state,
@@ -6546,7 +6633,15 @@ fn renderCommandEventRow(
         .w = action_w,
         .h = copy_h,
     });
-    const leftmost_action_x = if (show_output) output_rect.x else if (local_bang) retry_rect.x else if (show_copy) copy_rect.x else stop_rect.x;
+    const show_open = subagent_row;
+    const open_right = if (show_output) output_rect.x - action_gap else if (local_bang) retry_rect.x - action_gap else if (show_copy) copy_rect.x - action_gap else if (stop_visible) stop_rect.x - action_gap else action_right;
+    const open_rect = snapRect(palette.Rect{
+        .x = open_right - action_w,
+        .y = stop_rect.y,
+        .w = action_w,
+        .h = copy_h,
+    });
+    const leftmost_action_x = if (show_open) open_rect.x else if (show_output) output_rect.x else if (local_bang) retry_rect.x else if (show_copy) copy_rect.x else stop_rect.x;
     const text_right = leftmost_action_x - copy_gap;
     const text_w = @max(text_right - text_x, theme.scaledUi(40.0));
     const header_text_clip = intersectClipRect(clip, .{
@@ -6579,6 +6674,21 @@ fn renderCommandEventRow(
             .h = copy_label_h,
         }, "Copy", paletteColor(copy_text_color), theme.scaledUi(11.5), clip);
         state.recordTranscriptCopyHit(copy_rect, copy_payload, toolCopyIdentity(message_index, copy_payload));
+    }
+
+    if (show_open) {
+        const open_hovered = rectContains(open_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
+        const open_bg = if (open_hovered)
+            theme.withAlpha(theme.accent(), 64)
+        else
+            theme.withAlpha(theme.accent(), 36);
+        queueRoundedClipped(state, open_rect, paletteColor(open_bg), theme.scaledUi(5.0), clip);
+        queueFixedTextLine(state, .{
+            .x = open_rect.x + theme.scaledUi(10.0),
+            .y = open_rect.y + (open_rect.h - copy_label_h) * 0.5,
+            .w = open_rect.w - theme.scaledUi(20.0),
+            .h = copy_label_h,
+        }, "Open", paletteColor(if (open_hovered) theme.COLOR_WHITE else theme.accent()), theme.scaledUi(11.5), clip);
     }
 
     if (local_bang and retry_command.len > 0) {
@@ -6664,13 +6774,35 @@ fn renderCommandEventRow(
         }), display_body.text, paletteColor(theme.COLOR_TEXT_SUBTLE), font_size, header_text_clip);
     }
 
-    state.recordCardToggleHit(.{
-        .rect = .{ .x = bubble.x, .y = bubble.y, .w = bubble.w, .h = header_h },
-        .key = key,
-        .kind = .command_card,
-        .default_expanded = default_expanded,
-        .message_index = message_index,
-    });
+    if (subagent_row) {
+        const chev_hit = palette.Rect{
+            .x = bubble.x + bubble.w - pad_x - chev_box_w,
+            .y = bubble.y,
+            .w = chev_box_w + pad_x,
+            .h = header_h,
+        };
+        state.recordCardToggleHit(.{
+            .rect = chev_hit,
+            .key = key,
+            .kind = .command_card,
+            .default_expanded = default_expanded,
+            .message_index = message_index,
+        });
+        state.recordCardToggleHit(.{
+            .rect = .{ .x = bubble.x, .y = bubble.y, .w = @max(chev_hit.x - bubble.x, 1.0), .h = header_h },
+            .key = key,
+            .kind = .subagent_open,
+            .message_index = message_index,
+        });
+    } else {
+        state.recordCardToggleHit(.{
+            .rect = .{ .x = bubble.x, .y = bubble.y, .w = bubble.w, .h = header_h },
+            .key = key,
+            .kind = .command_card,
+            .default_expanded = default_expanded,
+            .message_index = message_index,
+        });
+    }
 
     if (expanded) {
         if (grouped) {
@@ -7353,6 +7485,31 @@ fn renderWrappedBody(state: *app_state.AppState, rect: palette.Rect, body: []con
         }
         line_start = i + 1;
     }
+}
+
+fn renderSubagentComposerBanner(state: *app_state.AppState, rect: palette.Rect) void {
+    const radius = theme.scaledUi(13.0);
+    queuePanel(
+        state,
+        rect,
+        paletteColor(theme.mix(theme.background(), theme.accent(), 0.06)),
+        paletteColor(theme.withAlpha(theme.accent(), 90)),
+        radius,
+        @max(theme.scaledUi(1.0), 1.0),
+    );
+    const pad = theme.scaledUi(18.0);
+    queueText(state, .{
+        .x = rect.x + pad,
+        .y = rect.y + theme.scaledUi(16.0),
+        .w = @max(rect.w - pad * 2.0, theme.scaledUi(1.0)),
+        .h = theme.scaledUi(20.0),
+    }, "Read-only subagent", paletteColor(theme.accent()), theme.scaledUi(14.0), rect);
+    queueText(state, .{
+        .x = rect.x + pad,
+        .y = rect.y + theme.scaledUi(38.0),
+        .w = @max(rect.w - pad * 2.0, theme.scaledUi(1.0)),
+        .h = @max(rect.h - theme.scaledUi(48.0), theme.scaledUi(20.0)),
+    }, "This pane shows a child agent from the parent chat. Continue the work there.", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), rect);
 }
 
 fn renderComposer(state: *app_state.AppState, rect: palette.Rect) void {

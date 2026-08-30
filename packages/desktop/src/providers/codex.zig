@@ -1392,12 +1392,22 @@ pub const Client = struct {
 
     fn callTurnSteerForResultAlloc(self: *Client, request: provider_types.SteerThreadRequest) ![]u8 {
         var attempt: usize = 0;
+        var retried_turn_mismatch = false;
+        var retry_turn_id: ?[]u8 = null;
+        defer if (retry_turn_id) |turn_id| self.allocator.free(turn_id);
         while (true) : (attempt += 1) {
-            const id = try self.sendTurnSteerRequest(request);
-            const maybe_payload = self.awaitTurnSteerResultPayloadAlloc(id);
+            var current_request = request;
+            if (retry_turn_id) |turn_id| current_request.turn_id = turn_id;
+            const id = try self.sendTurnSteerRequest(current_request);
+            const maybe_payload = self.awaitTurnSteerResultPayloadAlloc(id, &retry_turn_id);
             if (maybe_payload) |payload| {
                 return payload;
             } else |err| switch (err) {
+                error.CodexExpectedTurnMismatch => {
+                    if (retried_turn_mismatch or retry_turn_id == null) return error.CodexRpcFailed;
+                    retried_turn_mismatch = true;
+                    continue;
+                },
                 error.ServerOverloaded => {
                     if (attempt + 1 >= MAX_RPC_RETRIES) return err;
                     sleepMs(@min(@as(u64, 100) * (@as(u64, 1) << @intCast(attempt)), 1500));
@@ -1649,7 +1659,7 @@ pub const Client = struct {
         }
     }
 
-    fn awaitTurnSteerResultPayloadAlloc(self: *Client, id: u64) ![]u8 {
+    fn awaitTurnSteerResultPayloadAlloc(self: *Client, id: u64, retry_turn_id: *?[]u8) ![]u8 {
         while (true) {
             const message = try self.readTextMessageAllocInterruptible(self.allocator, RPC_WAIT);
             defer self.allocator.free(message);
@@ -1664,12 +1674,19 @@ pub const Client = struct {
 
             if (response_id != id) continue;
 
-            if (getObjectField(root, "error")) |_| {
+            if (getObjectField(root, "error")) |rpc_error| {
                 if (std.mem.indexOf(u8, message, "activeTurnNotSteerable") != null or
                     std.mem.indexOf(u8, message, "active_turn_not_steerable") != null or
                     std.mem.indexOf(u8, message, "active turn not steerable") != null)
                 {
                     return error.CodexActiveTurnNotSteerable;
+                }
+                if (getOptionalObjectString(rpc_error, "message")) |error_message| {
+                    if (extractActualTurnIdFromSteerMismatch(error_message)) |actual_turn_id| {
+                        if (retry_turn_id.*) |old_turn_id| self.allocator.free(old_turn_id);
+                        retry_turn_id.* = try self.allocator.dupe(u8, actual_turn_id);
+                        return error.CodexExpectedTurnMismatch;
+                    }
                 }
                 if (std.mem.indexOf(u8, message, "code") != null) {
                     if (getObjectField(getObjectField(root, "error").?, "code")) |code_value| {
@@ -1801,6 +1818,16 @@ pub fn shutdownOwnedServer() void {
     shared_server_state.mutex.lock();
     defer shared_server_state.mutex.unlock();
     stopOwnedServerLocked();
+}
+
+fn extractActualTurnIdFromSteerMismatch(message: []const u8) ?[]const u8 {
+    const prefix = "expected active turn id `";
+    const separator = "` but found `";
+    if (!std.mem.startsWith(u8, message, prefix) or !std.mem.endsWith(u8, message, "`")) return null;
+    const remainder = message[prefix.len .. message.len - 1];
+    const separator_index = std.mem.indexOf(u8, remainder, separator) orelse return null;
+    const actual_turn_id = remainder[separator_index + separator.len ..];
+    return if (actual_turn_id.len == 0) null else actual_turn_id;
 }
 
 fn stopOwnedServerLocked() void {
@@ -2668,6 +2695,17 @@ fn appendImportedMessagesForItem(
         const query = getOptionalObjectString(item, "query") orelse return;
         if (std.mem.trim(u8, query, &std.ascii.whitespace).len == 0) return;
         try appendImportedMessage(allocator, messages, .system, "Web search", query);
+        return;
+    }
+
+    if (std.mem.eql(u8, item_type, "collabAgentToolCall") or std.mem.eql(u8, item_type, "subAgentActivity")) {
+        const body = getOptionalObjectString(item, "prompt") orelse
+            getOptionalObjectString(item, "agentPath") orelse
+            getOptionalObjectString(item, "agent_path") orelse
+            getOptionalObjectString(item, "tool") orelse
+            "Codex subagent";
+        if (std.mem.trim(u8, body, &std.ascii.whitespace).len == 0) return;
+        try appendImportedMessage(allocator, messages, .system, "Subagent", body);
     }
 }
 
@@ -2891,6 +2929,12 @@ fn emitItemEvent(
     if (std.mem.eql(u8, item_type, "mcpToolCall"))
         return emitMcpToolCallItem(allocator, item, started, context, on_stream_event);
 
+    if (std.mem.eql(u8, item_type, "collabAgentToolCall"))
+        return emitCollabAgentToolCallItem(item, started, context, on_stream_event);
+
+    if (std.mem.eql(u8, item_type, "subAgentActivity"))
+        return emitSubAgentActivityItem(item, context, on_stream_event);
+
     if (std.mem.eql(u8, item_type, "reasoning")) {
         const call_id = getOptionalObjectString(item, "id") orelse return false;
         // Reasoning surfaces only as a transient "Thinking" liveness row: no
@@ -3088,6 +3132,92 @@ fn formatMcpToolCallOutputAlloc(allocator: std.mem.Allocator, item: std.json.Val
         if (structured != .null) return try stringifyAlloc(allocator, structured);
     }
     return try stringifyAlloc(allocator, result);
+}
+
+fn firstReceiverThreadId(item: std.json.Value) ?[]const u8 {
+    const field = getObjectField(item, "receiverThreadIds") orelse getObjectField(item, "receiver_thread_ids") orelse return null;
+    if (field != .array or field.array.items.len == 0) return null;
+    return stringValue(field.array.items[0]);
+}
+
+fn collabAgentCallId(item: std.json.Value) []const u8 {
+    return firstReceiverThreadId(item) orelse
+        getOptionalObjectString(item, "id") orelse
+        "";
+}
+
+fn collabAgentStatus(item: std.json.Value, started: bool) provider_types.ToolCallStatus {
+    if (started) return .in_progress;
+    const status = getOptionalObjectString(item, "status") orelse return .completed;
+    if (std.mem.eql(u8, status, "inProgress") or std.mem.eql(u8, status, "in_progress")) return .in_progress;
+    if (std.mem.eql(u8, status, "failed")) return .failed;
+    if (std.mem.eql(u8, status, "interrupted")) return .cancelled;
+    return .completed;
+}
+
+fn emitCollabAgentToolCallItem(
+    item: std.json.Value,
+    started: bool,
+    context: ?*anyopaque,
+    on_stream_event: *const fn (?*anyopaque, provider_types.StreamEvent) void,
+) bool {
+    const tool = getOptionalObjectString(item, "tool") orelse "";
+    // Spawn/resume are child-agent lifecycle. Wait/send/list are parent
+    // orchestration around an already-visible child and would duplicate rows.
+    const is_child_lifecycle = std.mem.eql(u8, tool, "spawnAgent") or
+        std.mem.eql(u8, tool, "resumeAgent") or
+        tool.len == 0;
+    if (!is_child_lifecycle) return true;
+
+    const call_id = collabAgentCallId(item);
+    if (call_id.len == 0) return false;
+    const prompt = getOptionalObjectString(item, "prompt");
+    const model = getOptionalObjectString(item, "model");
+    const input = if (prompt) |text|
+        text
+    else if (model) |text|
+        text
+    else
+        tool;
+    const error_text = if (getObjectField(item, "error")) |error_value|
+        getOptionalObjectString(error_value, "message")
+    else
+        null;
+    on_stream_event(context, .{ .tool_call = .{
+        .call_id = call_id,
+        .title = if (prompt) |text| text else "Codex subagent",
+        .kind = .subagent,
+        .status = collabAgentStatus(item, started),
+        .input = if (input.len > 0) input else null,
+        .error_text = error_text,
+    } });
+    return true;
+}
+
+fn emitSubAgentActivityItem(
+    item: std.json.Value,
+    context: ?*anyopaque,
+    on_stream_event: *const fn (?*anyopaque, provider_types.StreamEvent) void,
+) bool {
+    const call_id = getOptionalObjectString(item, "agentThreadId") orelse
+        getOptionalObjectString(item, "id") orelse
+        return false;
+    const kind = getOptionalObjectString(item, "kind") orelse "";
+    const status: provider_types.ToolCallStatus = if (std.mem.eql(u8, kind, "completed"))
+        .completed
+    else if (std.mem.eql(u8, kind, "interrupted"))
+        .cancelled
+    else
+        .in_progress;
+    const path = getOptionalObjectString(item, "agentPath") orelse "Codex subagent";
+    on_stream_event(context, .{ .tool_call = .{
+        .call_id = call_id,
+        .title = path,
+        .kind = .subagent,
+        .status = status,
+        .input = path,
+    } });
+    return true;
 }
 
 fn handleCommandApprovalRequest(self: *Client, root: std.json.Value, request_id: std.json.Value, request: provider_types.SendPromptRequest) !void {
@@ -3843,6 +3973,15 @@ test "turn steer payload preserves multiple local images" {
     try std.testing.expectEqualStrings("/tmp/second.jpg", input.array.items[2].object.get("path").?.string);
 }
 
+test "turn steer mismatch extracts the server active turn id" {
+    try std.testing.expectEqualStrings(
+        "turn-current",
+        extractActualTurnIdFromSteerMismatch("expected active turn id `turn-stale` but found `turn-current`").?,
+    );
+    try std.testing.expect(extractActualTurnIdFromSteerMismatch("no active turn to steer") == null);
+    try std.testing.expect(extractActualTurnIdFromSteerMismatch("expected active turn id `old` but found ``") == null);
+}
+
 test "compute accept key matches websocket example" {
     const allocator = std.testing.allocator;
     const accept = try computeAcceptKeyAlloc(allocator, "dGhlIHNhbXBsZSBub25jZQ==");
@@ -4441,6 +4580,59 @@ test "MCP calls emit lifecycle tool call updates" {
     try std.testing.expectEqualStrings("mcp-2", capture.tool_call_id.?);
     try std.testing.expectEqual(provider_types.ToolCallStatus.failed, capture.tool_status.?);
     try std.testing.expectEqualStrings("blender.execute_blender_code", capture.tool_input.?);
+}
+
+test "collab agent spawn emits subagent lifecycle updates" {
+    const allocator = std.testing.allocator;
+    const started_json =
+        \\{
+        \\  "method": "item/started",
+        \\  "params": {
+        \\    "item": {
+        \\      "id": "collab-1",
+        \\      "type": "collabAgentToolCall",
+        \\      "tool": "spawnAgent",
+        \\      "status": "inProgress",
+        \\      "senderThreadId": "parent-1",
+        \\      "receiverThreadIds": ["child-1"],
+        \\      "prompt": "Explore the web app",
+        \\      "model": "gpt-5"
+        \\    }
+        \\  }
+        \\}
+    ;
+    var started = try std.json.parseFromSlice(std.json.Value, allocator, started_json, .{});
+    defer started.deinit();
+
+    var capture: TestStreamEventCapture = .{};
+    try std.testing.expect(try emitItemEvent(allocator, started.value, &capture, TestStreamEventCapture.handle));
+    try std.testing.expectEqual(@as(usize, 1), capture.tool_call_count);
+    try std.testing.expectEqualStrings("child-1", capture.tool_call_id.?);
+    try std.testing.expectEqual(provider_types.ToolCallKind.subagent, capture.tool_kind.?);
+    try std.testing.expectEqual(provider_types.ToolCallStatus.in_progress, capture.tool_status.?);
+    try std.testing.expectEqualStrings("Explore the web app", capture.tool_input.?);
+
+    const activity_json =
+        \\{
+        \\  "method": "item/completed",
+        \\  "params": {
+        \\    "item": {
+        \\      "id": "activity-1",
+        \\      "type": "subAgentActivity",
+        \\      "kind": "completed",
+        \\      "agentThreadId": "child-1",
+        \\      "agentPath": "Explore the web app"
+        \\    }
+        \\  }
+        \\}
+    ;
+    var activity = try std.json.parseFromSlice(std.json.Value, allocator, activity_json, .{});
+    defer activity.deinit();
+
+    try std.testing.expect(try emitItemEvent(allocator, activity.value, &capture, TestStreamEventCapture.handle));
+    try std.testing.expectEqual(@as(usize, 2), capture.tool_call_count);
+    try std.testing.expectEqualStrings("child-1", capture.tool_call_id.?);
+    try std.testing.expectEqual(provider_types.ToolCallStatus.completed, capture.tool_status.?);
 }
 
 test "hydrated Codex turn items backfill MCP output" {
