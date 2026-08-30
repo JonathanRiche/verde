@@ -264,14 +264,16 @@ fn gatewayUrlAlloc(allocator: std.mem.Allocator, local_port: u16) ![]u8 {
 }
 
 fn validateStatus(status: std.http.Status) !void {
-    return switch (status) {
-        .ok => {},
-        .unauthorized, .forbidden => error.AuthenticationRequired,
-        .payload_too_large => error.RequestTooLarge,
-        .service_unavailable, .bad_gateway, .gateway_timeout => error.DaemonUnavailable,
-        .moved_permanently, .found, .see_other, .temporary_redirect, .permanent_redirect => error.RedirectRejected,
-        else => error.GatewayRejected,
-    };
+    switch (status) {
+        .ok => return,
+        .unauthorized, .forbidden => return error.AuthenticationRequired,
+        .payload_too_large => return error.RequestTooLarge,
+        .not_found, .method_not_allowed, .unsupported_media_type => return error.WrongService,
+        .moved_permanently, .found, .see_other, .temporary_redirect, .permanent_redirect => return error.RedirectRejected,
+        else => {},
+    }
+    if (status.class() == .server_error) return error.DaemonUnavailable;
+    return error.GatewayRejected;
 }
 
 test "gateway URL is fixed to numeric loopback and one RPC path" {
@@ -315,8 +317,11 @@ test "gateway status mapping keeps auth and redirect failures distinct" {
     try validateStatus(.ok);
     try std.testing.expectError(error.AuthenticationRequired, validateStatus(.unauthorized));
     try std.testing.expectError(error.DaemonUnavailable, validateStatus(.service_unavailable));
+    try std.testing.expectError(error.DaemonUnavailable, validateStatus(.internal_server_error));
+    try std.testing.expectError(error.WrongService, validateStatus(.not_found));
+    try std.testing.expectError(error.WrongService, validateStatus(.method_not_allowed));
     try std.testing.expectError(error.RedirectRejected, validateStatus(.temporary_redirect));
-    try std.testing.expectError(error.GatewayRejected, validateStatus(.not_found));
+    try std.testing.expectError(error.GatewayRejected, validateStatus(.bad_request));
 }
 
 test "direct endpoint keeps credentials on one verified origin" {

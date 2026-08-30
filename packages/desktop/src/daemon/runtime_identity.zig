@@ -577,7 +577,10 @@ test "future schema fails before requiring or reading sidecar" {
     {
         const conn = try zqlite.open(db_path_z, zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
         defer conn.close();
-        try conn.execNoArgs("pragma user_version = 10");
+        try conn.execNoArgs(std.fmt.comptimePrint(
+            "pragma user_version = {d}",
+            .{schema.MAX_SUPPORTED_VERSION + 1},
+        ));
     }
     try std.testing.expectError(
         error.SchemaTooNew,

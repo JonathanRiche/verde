@@ -20,8 +20,12 @@ const tunnel_supervisor = @import("ssh_tunnel_supervisor.zig");
 pub const Dependencies = manager_mod.Dependencies;
 pub const RuntimeSnapshot = manager_mod.RuntimeSnapshot;
 pub const Snapshot = manager_mod.Snapshot;
+pub const FailureReason = manager_mod.FailureReason;
+pub const CredentialHydration = manager_mod.CredentialHydration;
 pub const RpcTicket = manager_mod.RpcTicket;
 pub const RpcCallResult = manager_mod.RpcCallResult;
+pub const classifyRpcFailure = manager_mod.classifyRpcFailure;
+pub const classifyProviderStatus = manager_mod.classifyProviderStatus;
 pub const RuntimePinProposal = manager_mod.RuntimePinProposal;
 pub const PinAdoption = manager_mod.PinAdoption;
 pub const TrustResult = pin_controller.CommitResult;
@@ -32,6 +36,7 @@ profile_path: []u8,
 runtime_manager: manager_mod.Manager,
 /// Durable home for paired device credentials; profiles hold only refs.
 credentials: credential_store.Store,
+durable_credentials_requested: bool,
 
 /// Loads a path-explicit, non-secret profile document. The supplied `io` must
 /// remain valid until `deinit`. Dependency contexts must honor the manager's
@@ -63,8 +68,10 @@ pub fn init(
             credential_store.Store.init(allocator, io)
         else
             credential_store.Store.initMemoryOnly(allocator, io),
+        .durable_credentials_requested = dependencies.durable_credentials,
     };
     self.hydrateStoredDeviceCredentials(loaded.items);
+    self.resumeDesiredConnections(loaded.items, @intCast(std.Io.Clock.awake.now(io).toMilliseconds()));
     return self;
 }
 
@@ -81,22 +88,54 @@ pub fn credentialBackend(self: *const Self) credential_store.Backend {
     return self.credentials.backend;
 }
 
-// Loads each paired profile's device credential by reference. A missing or
-// unreadable credential simply leaves the profile "not loaded"; the UI then
-// offers re-pairing instead of guessing.
+// Loads each paired profile's device credential by reference and records the
+// exact non-secret outcome for snapshots. Backend and validation failures are
+// never collapsed into an ordinary missing credential.
 fn hydrateStoredDeviceCredentials(self: *Self, profiles: []const profile.Profile) void {
     for (profiles) |configured| {
         const ref = switch (configured.access) {
             .paired_device => |device| device.credential_ref,
             .connect => |link| link.credential_ref,
             else => continue,
-        } orelse continue;
-        const credential = (self.credentials.getAlloc(self.allocator, ref) catch null) orelse continue;
+        } orelse {
+            self.runtime_manager.noteCredentialHydration(configured.id, .missing) catch {};
+            continue;
+        };
+        const credential = self.credentials.getAlloc(self.allocator, ref) catch |err| {
+            const hydration: manager_mod.CredentialHydration = switch (err) {
+                error.InvalidStoredCredential, error.InvalidCredentialRef => .invalid,
+                else => .backend_unavailable,
+            };
+            self.runtime_manager.noteCredentialHydration(configured.id, hydration) catch {};
+            continue;
+        } orelse {
+            const hydration: CredentialHydration =
+                if (self.durable_credentials_requested and self.credentials.backend == .memory_only)
+                    .backend_unavailable
+                else
+                    .missing;
+            self.runtime_manager.noteCredentialHydration(configured.id, hydration) catch {};
+            continue;
+        };
         defer {
             std.crypto.secureZero(u8, credential);
             self.allocator.free(credential);
         }
-        self.runtime_manager.hydrateDeviceCredential(configured.id, credential) catch {};
+        self.runtime_manager.hydrateDeviceCredential(configured.id, credential) catch {
+            self.runtime_manager.noteCredentialHydration(configured.id, .invalid) catch {};
+        };
+    }
+}
+
+// Desired state is resumed only after a valid paired credential is hydrated.
+// Each enable starts one connection attempt; terminal trust/auth/configuration
+// failures remain stopped in the manager until explicit user action.
+fn resumeDesiredConnections(self: *Self, profiles: []const profile.Profile, now_ms: u64) void {
+    for (profiles) |configured| {
+        if (!configured.desired_enabled or configured.access.kind() == .admin_token) continue;
+        const current = self.runtime_manager.snapshot(configured.id) orelse continue;
+        if (current.credential_hydration != .loaded) continue;
+        self.runtime_manager.enable(configured.id, now_ms) catch {};
     }
 }
 
@@ -133,12 +172,16 @@ pub fn commitConnectBootstrap(
     if (!std.mem.eql(u8, expected_runtime, result.runtime_id) or
         !std.mem.eql(u8, expected_instance, result.instance_id)) return error.PairingIdentityMismatch;
     try configured.setConnectRuntimeDevice(self.allocator, result.device_id, ref);
-    try profile_store.saveAtPath(self.allocator, self.io, self.profile_path, loaded.items);
+    configured.desired_enabled = true;
 
     var durable = self.credentials.backend.durable();
     self.credentials.put(ref, result.device_credential) catch |err| switch (err) {
         error.CredentialStoreUnavailable => durable = false,
         else => return err,
+    };
+    profile_store.saveAtPath(self.allocator, self.io, self.profile_path, loaded.items) catch |save_err| {
+        _ = self.credentials.remove(ref) catch return error.CredentialCleanupIncomplete;
+        return save_err;
     };
     var authoritative = try profile_store.loadAtPath(self.allocator, self.io, self.profile_path);
     defer authoritative.deinit(self.allocator);
@@ -160,15 +203,39 @@ pub fn clearToken(self: *Self, profile_id: []const u8) !bool {
 }
 
 pub fn enable(self: *Self, profile_id: []const u8, now_ms: u64) !void {
+    try self.setDesiredEnabled(profile_id, true);
     return self.runtime_manager.enable(profile_id, now_ms);
 }
 
 pub fn disable(self: *Self, profile_id: []const u8) !void {
+    try self.setDesiredEnabled(profile_id, false);
     return self.runtime_manager.disable(profile_id);
 }
 
 pub fn retry(self: *Self, profile_id: []const u8, now_ms: u64) !void {
     return self.runtime_manager.retry(profile_id, now_ms);
+}
+
+/// Invalidates an open session and immediately starts a fresh attempt while
+/// preserving the user's desired-enabled setting. This is the manual recovery
+/// path for a connected session whose repository/provider readiness is stale.
+pub fn reconnect(self: *Self, profile_id: []const u8, now_ms: u64) !void {
+    try self.setDesiredEnabled(profile_id, true);
+    try self.runtime_manager.disable(profile_id);
+    return self.runtime_manager.enable(profile_id, now_ms);
+}
+
+fn setDesiredEnabled(self: *Self, profile_id: []const u8, desired_enabled: bool) !void {
+    var lock = try profile_store.acquireExclusiveAtPath(self.allocator, self.io, self.profile_path);
+    defer lock.deinit();
+    var loaded = try profile_store.loadAtPath(self.allocator, self.io, self.profile_path);
+    defer loaded.deinit(self.allocator);
+    const configured = findProfile(loaded.items, profile_id) orelse return error.UnknownRuntimeProfile;
+    if (configured.access.kind() == .admin_token) return;
+    if (configured.desired_enabled == desired_enabled) return;
+    configured.desired_enabled = desired_enabled;
+    try profile_store.saveAtPath(self.allocator, self.io, self.profile_path, loaded.items);
+    _ = try self.runtime_manager.replaceProfile(configured.*);
 }
 
 /// Advances bounded owner-thread state. This never persists or acknowledges a
@@ -305,13 +372,14 @@ pub fn updateDirectPairedProfile(
         endpoint = undefined;
         try configured.setExpectedIdentity(self.allocator, null, null);
         try configured.clearPairedDevice(self.allocator);
+        configured.desired_enabled = false;
     }
+    if (previous_ref) |value| _ = try self.credentials.remove(value);
     try profile_store.saveAtPath(self.allocator, self.io, self.profile_path, loaded.items);
     var authoritative = try profile_store.loadAtPath(self.allocator, self.io, self.profile_path);
     defer authoritative.deinit(self.allocator);
     const persisted = findProfile(authoritative.items, profile_id) orelse return error.RuntimeProfileNotPersisted;
     const replacement = try self.runtime_manager.replaceProfile(persisted.*);
-    if (previous_ref) |value| _ = self.credentials.remove(value) catch false;
     return replacement;
 }
 
@@ -370,8 +438,8 @@ pub const PairingCommit = struct {
     durable: bool,
 };
 
-/// Persists the confirmed device reference plus the exchanged identity pin
-/// under the store lock, stores the credential by reference, then lets the
+/// Stores the credential by reference before persisting the confirmed device
+/// reference and exchanged identity pin, then lets the
 /// manager start a normal authenticated attempt against the pinned identity.
 pub fn commitPairing(self: *Self, profile_id: []const u8, now_ms: u64) !PairingCommit {
     const result = self.runtime_manager.pairingResult(profile_id) orelse return error.PairingNotConfirmed;
@@ -385,7 +453,7 @@ pub fn commitPairing(self: *Self, profile_id: []const u8, now_ms: u64) !PairingC
     const configured = findProfile(loaded.items, profile_id) orelse return error.UnknownRuntimeProfile;
     try configured.setPairedDevice(self.allocator, result.device_id, ref);
     try configured.setExpectedIdentity(self.allocator, result.runtime_id, result.instance_id);
-    try profile_store.saveAtPath(self.allocator, self.io, self.profile_path, loaded.items);
+    configured.desired_enabled = true;
 
     var durable = self.credentials.backend.durable();
     {
@@ -397,6 +465,10 @@ pub fn commitPairing(self: *Self, profile_id: []const u8, now_ms: u64) !PairingC
             else => return err,
         };
     }
+    profile_store.saveAtPath(self.allocator, self.io, self.profile_path, loaded.items) catch |save_err| {
+        _ = self.credentials.remove(ref) catch return error.CredentialCleanupIncomplete;
+        return save_err;
+    };
 
     var authoritative = try profile_store.loadAtPath(self.allocator, self.io, self.profile_path);
     defer authoritative.deinit(self.allocator);
@@ -420,13 +492,15 @@ pub fn forgetDevice(self: *Self, profile_id: []const u8) !bool {
         else => return error.ProfileAccessMismatch,
     };
     defer if (ref_copy) |ref| self.allocator.free(ref);
+    var held = false;
+    if (ref_copy) |ref| {
+        held = try self.credentials.remove(ref);
+    }
     try configured.clearPairedDevice(self.allocator);
+    configured.desired_enabled = false;
     try profile_store.saveAtPath(self.allocator, self.io, self.profile_path, loaded.items);
 
-    var held = try self.runtime_manager.clearDeviceCredential(profile_id);
-    if (ref_copy) |ref| {
-        held = (self.credentials.remove(ref) catch false) or held;
-    }
+    held = (try self.runtime_manager.clearDeviceCredential(profile_id)) or held;
     var authoritative = try profile_store.loadAtPath(self.allocator, self.io, self.profile_path);
     defer authoritative.deinit(self.allocator);
     const persisted = findProfile(authoritative.items, profile_id) orelse return error.RuntimeProfileNotPersisted;
@@ -434,9 +508,10 @@ pub fn forgetDevice(self: *Self, profile_id: []const u8) !bool {
     return held;
 }
 
-/// Edits non-secret fields. An endpoint change clears the durable identity pin
-/// on disk and invalidates the live generation so trust is never carried over
-/// to a different peer; a label-only edit keeps the connection as is.
+/// Edits non-secret fields. An endpoint change treats the destination as a new
+/// peer: paired-device metadata and credentials, the identity pin, desired
+/// state, and the live generation are all cleared. Administrator tokens are
+/// process-only and are wiped when the manager replaces the endpoint.
 pub fn updateSshProfile(self: *Self, profile_id: []const u8, input: SshProfileInput) !ProfileReplacement {
     var lock = try profile_store.acquireExclusiveAtPath(self.allocator, self.io, self.profile_path);
     defer lock.deinit();
@@ -445,11 +520,22 @@ pub fn updateSshProfile(self: *Self, profile_id: []const u8, input: SshProfileIn
     const configured = findProfile(loaded.items, profile_id) orelse return error.UnknownRuntimeProfile;
 
     const endpoint_changed = !configured.sameSshEndpoint(input.ssh);
+    const previous_ref = if (endpoint_changed and configured.access == .paired_device and
+        configured.access.paired_device.credential_ref != null)
+        try self.allocator.dupe(u8, configured.access.paired_device.credential_ref.?)
+    else
+        null;
+    defer if (previous_ref) |value| self.allocator.free(value);
     try configured.setLabel(self.allocator, input.label);
     if (endpoint_changed) {
         try configured.replaceSshTunnel(self.allocator, input.ssh);
         try configured.setExpectedIdentity(self.allocator, null, null);
+        if (configured.access == .paired_device) try configured.clearPairedDevice(self.allocator);
+        configured.desired_enabled = false;
     }
+    // Keep the durable reference intact when keyring cleanup cannot complete;
+    // the user can retry instead of being told a possibly-live secret is gone.
+    if (previous_ref) |value| _ = try self.credentials.remove(value);
     try profile_store.saveAtPath(self.allocator, self.io, self.profile_path, loaded.items);
 
     var authoritative = try profile_store.loadAtPath(self.allocator, self.io, self.profile_path);
@@ -474,15 +560,17 @@ pub fn updateConnectProfile(self: *Self, profile_id: []const u8, label: []const 
         null;
     defer if (previous_ref) |value| self.allocator.free(value);
     try configured.setLabel(self.allocator, label);
-    if (plane_changed) try configured.setControlPlaneUrl(self.allocator, control_plane_url);
+    if (plane_changed) {
+        try configured.setControlPlaneUrl(self.allocator, control_plane_url);
+        configured.desired_enabled = false;
+    }
+    if (previous_ref) |value| _ = try self.credentials.remove(value);
     try profile_store.saveAtPath(self.allocator, self.io, self.profile_path, loaded.items);
 
     var authoritative = try profile_store.loadAtPath(self.allocator, self.io, self.profile_path);
     defer authoritative.deinit(self.allocator);
     const persisted = findProfile(authoritative.items, profile_id) orelse return error.RuntimeProfileNotPersisted;
-    const replacement = try self.runtime_manager.replaceProfile(persisted.*);
-    if (previous_ref) |value| _ = self.credentials.remove(value) catch false;
-    return replacement;
+    return self.runtime_manager.replaceProfile(persisted.*);
 }
 
 /// Non-secret runtime descriptor chosen from the signed-in Connect inventory.
@@ -511,13 +599,18 @@ pub fn selectConnectRuntime(self: *Self, profile_id: []const u8, selection: Conn
     defer if (previous_ref) |value| self.allocator.free(value);
     try configured.setConnectEndpoint(self.allocator, selection.https_url, selection.wss_url, selection.spki_sha256, selection.link_id);
     try configured.setExpectedIdentity(self.allocator, selection.runtime_id, selection.instance_id);
+    configured.desired_enabled = false;
+    if (previous_ref) |value| _ = try self.credentials.remove(value);
+    // Fail closed before durable adoption. Building the replacement entry can
+    // still allocate after the save; the old generation and both live secret
+    // forms must already be unusable if that allocation fails.
+    _ = try self.runtime_manager.clearDeviceCredential(profile_id);
     try profile_store.saveAtPath(self.allocator, self.io, self.profile_path, loaded.items);
 
     var authoritative = try profile_store.loadAtPath(self.allocator, self.io, self.profile_path);
     defer authoritative.deinit(self.allocator);
     const persisted = findProfile(authoritative.items, profile_id) orelse return error.RuntimeProfileNotPersisted;
-    _ = try self.runtime_manager.replaceProfile(persisted.*);
-    if (previous_ref) |value| _ = self.credentials.remove(value) catch false;
+    try self.runtime_manager.replaceConnectPeer(persisted.*);
 }
 
 /// Removes the profile from disk and from the live manager, wiping any
@@ -535,11 +628,12 @@ pub fn removeProfile(self: *Self, profile_id: []const u8) !bool {
             try kept.append(self.allocator, configured);
             continue;
         }
-        // Removing a paired profile must not leave its credential behind.
+        // Delete first: on failure the profile retains the only durable cleanup
+        // reference and the caller receives an actionable error.
         if (configured.access == .paired_device) {
-            if (configured.access.paired_device.credential_ref) |ref| _ = self.credentials.remove(ref) catch false;
+            if (configured.access.paired_device.credential_ref) |ref| _ = try self.credentials.remove(ref);
         } else if (configured.access == .connect) {
-            if (configured.access.connect.credential_ref) |ref| _ = self.credentials.remove(ref) catch false;
+            if (configured.access.connect.credential_ref) |ref| _ = try self.credentials.remove(ref);
         }
     }
     if (kept.items.len == loaded.items.len and self.runtime_manager.profileConst(profile_id) == null) {
@@ -569,6 +663,7 @@ pub fn reloadProfiles(self: *Self) !void {
         }
     }
     self.hydrateStoredDeviceCredentials(loaded.items);
+    self.resumeDesiredConnections(loaded.items, @intCast(std.Io.Clock.awake.now(self.io).toMilliseconds()));
 }
 
 /// Formats secret-free diagnostics for clipboard/bug reports. Includes the
@@ -630,6 +725,23 @@ pub fn redactedDiagnosticsAlloc(self: *const Self, allocator: std.mem.Allocator,
         if (snap.failure) |failure| @tagName(failure) else "none",
         @tagName(snap.tunnel_lifecycle),
     });
+    try w.print("failure_reason: {s}\nautomatic_retry_scheduled: {}\nretry_attempt: {d}\ndesired_enabled: {}\ncredential_hydration: {s}\n", .{
+        if (snap.failure_reason) |reason| @tagName(reason) else "none",
+        snap.automatic_retry_scheduled,
+        snap.retry_attempt,
+        snap.desired_enabled,
+        @tagName(snap.credential_hydration),
+    });
+    if (snap.retry_at_ms) |retry_at_ms| {
+        try w.print("retry_at_ms: {d}\n", .{retry_at_ms});
+    } else {
+        try w.writeAll("retry_at_ms: none\n");
+    }
+    if (snap.last_successful_connection_ms) |connected_at_ms| {
+        try w.print("last_successful_connection_ms: {d}\n", .{connected_at_ms});
+    } else {
+        try w.writeAll("last_successful_connection_ms: none\n");
+    }
     try w.print("credential: {s}\n", .{if (self.runtime_manager.secrets.get(profile_id) != null) "held in memory (<redacted>)" else "not provided"});
     try w.print("pinned_runtime_id: {s}\npinned_instance_id: {s}\n", .{
         configured.expected_runtime_id orelse "<unpinned>",
@@ -675,6 +787,9 @@ pub fn takeRpcResult(
 }
 
 const TEST_TOKEN = "0123456789abcdef0123456789abcdef";
+const TEST_DEVICE_CREDENTIAL =
+    "0123456789abcdef0123456789abcdef" ++
+    "fedcba9876543210fedcba9876543210";
 const TEST_RUNTIME_A = "0123456789abcdef0123456789abcdef";
 const TEST_RUNTIME_B = "fedcba9876543210fedcba9876543210";
 const TEST_INSTANCE_A = "00112233445566778899aabbccddeeff";
@@ -959,10 +1074,11 @@ test "service reports first contact without trusting until explicit approval" {
     const pending = service.snapshot(configured.id).?;
     try std.testing.expect(pending.identity_pin_required);
     try std.testing.expect(!pending.execution_ready);
-    try std.testing.expectError(
-        error.RuntimeNotExecutionReady,
-        service.beginRpc(configured.id, "core.snapshot", .{}),
-    );
+    if (service.beginRpc(configured.id, "core.snapshot", .{})) |_| {
+        return error.OldConnectCredentialAuthorizedRpc;
+    } else |err| {
+        try std.testing.expectEqual(error.RuntimeNotExecutionReady, err);
+    }
     for (0..10) |iteration| try service.poll(5_000 + iteration);
     var before_approval = try profile_store.loadAtPath(allocator, std.testing.io, path);
     defer before_approval.deinit(allocator);
@@ -1127,6 +1243,76 @@ test "service owns secret lifecycle independently from persisted profiles" {
     try std.testing.expect(persisted.items[0].expected_runtime_id == null);
 }
 
+test "desired paired runtime resumes only after restart credential hydration" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPathAlloc(allocator, tmp.dir);
+    defer allocator.free(path);
+
+    var configured = try profile.Profile.createPairedSshTunnel(
+        allocator,
+        std.testing.io,
+        "Remembered VM",
+        .{ .host = "runtime.example", .user = "verde" },
+    );
+    defer configured.deinit(allocator);
+    const credential_ref = try credential_store.deviceRefAlloc(allocator, configured.id);
+    defer allocator.free(credential_ref);
+    try configured.setPairedDevice(allocator, "0123456789abcdef0123456789abcdef", credential_ref);
+    try configured.setExpectedIdentity(allocator, TEST_RUNTIME_A, TEST_INSTANCE_A);
+    try profile_store.saveAtPath(allocator, std.testing.io, path, &.{configured});
+
+    var first_ports: TestPorts = .{ .values = &.{43_127} };
+    var first_tunnel: TestTunnel = .{};
+    var first_rpc: TestRpc = .{};
+    var first = try Self.init(
+        allocator,
+        std.testing.io,
+        path,
+        testDependencies(&first_ports, &first_tunnel, &first_rpc),
+    );
+    try first.credentials.put(credential_ref, TEST_DEVICE_CREDENTIAL);
+    first.hydrateStoredDeviceCredentials(&.{configured});
+    try first.enable(configured.id, 1_000);
+    try std.testing.expect(first.snapshot(configured.id).?.desired_enabled);
+    try first.runtime_manager.disable(configured.id);
+    try waitForCleanup(&first, configured.id);
+    first.deinit();
+
+    var persisted = try profile_store.loadAtPath(allocator, std.testing.io, path);
+    defer persisted.deinit(allocator);
+    try std.testing.expect(persisted.items[0].desired_enabled);
+
+    var second_ports: TestPorts = .{ .values = &.{43_128} };
+    var second_tunnel: TestTunnel = .{};
+    var second_rpc: TestRpc = .{};
+    var second = try Self.init(
+        allocator,
+        std.testing.io,
+        path,
+        testDependencies(&second_ports, &second_tunnel, &second_rpc),
+    );
+    defer {
+        second.runtime_manager.disable(configured.id) catch {};
+        waitForCleanup(&second, configured.id) catch {};
+        second.deinit();
+    }
+    const before_hydration = second.snapshot(configured.id).?;
+    try std.testing.expectEqual(connection.Phase.disabled, before_hydration.phase);
+    try std.testing.expectEqual(CredentialHydration.missing, before_hydration.credential_hydration);
+    try std.testing.expectEqual(FailureReason.authentication_required, before_hydration.failure_reason.?);
+    try std.testing.expect(before_hydration.desired_enabled);
+
+    try second.credentials.put(credential_ref, TEST_DEVICE_CREDENTIAL);
+    second.hydrateStoredDeviceCredentials(persisted.items);
+    second.resumeDesiredConnections(persisted.items, 2_000);
+    const resumed = second.snapshot(configured.id).?;
+    try std.testing.expectEqual(connection.Phase.connecting, resumed.phase);
+    try std.testing.expectEqual(CredentialHydration.loaded, resumed.credential_hydration);
+    try std.testing.expect(resumed.desired_enabled);
+}
+
 test "service exposes bounded snapshots for multiple independently owned profiles" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1268,6 +1454,156 @@ test "endpoint edit drops trust, invalidates generation, and forgets nothing sil
     try std.testing.expectEqualStrings("other.example", on_disk.items[0].transport.ssh_tunnel.host);
     // The in-memory token was wiped with the old peer; re-enable must ask again.
     try std.testing.expectError(error.MissingRuntimeCredential, service.enable(configured.id, 1));
+}
+
+test "paired SSH endpoint edit reloads without the old device credential" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPathAlloc(allocator, tmp.dir);
+    defer allocator.free(path);
+
+    var configured = try profile.Profile.createPairedSshTunnel(
+        allocator,
+        std.testing.io,
+        "Paired VM",
+        .{ .host = "old.example", .user = "verde" },
+    );
+    defer configured.deinit(allocator);
+    const credential_ref = try credential_store.deviceRefAlloc(allocator, configured.id);
+    defer allocator.free(credential_ref);
+    try configured.setPairedDevice(allocator, "0123456789abcdef0123456789abcdef", credential_ref);
+    try configured.setExpectedIdentity(allocator, TEST_RUNTIME_A, TEST_INSTANCE_A);
+    configured.desired_enabled = true;
+    try profile_store.saveAtPath(allocator, std.testing.io, path, &.{configured});
+
+    var ports: TestPorts = .{ .values = &.{43_144} };
+    var tunnel: TestTunnel = .{};
+    var rpc: TestRpc = .{};
+    var service = try Self.init(allocator, std.testing.io, path, testDependencies(&ports, &tunnel, &rpc));
+    defer service.deinit();
+    try service.credentials.put(credential_ref, TEST_DEVICE_CREDENTIAL);
+    service.hydrateStoredDeviceCredentials(&.{configured});
+    try std.testing.expect(service.snapshot(configured.id).?.device_credential_held);
+
+    try std.testing.expectEqual(ProfileReplacement.endpoint_changed, try service.updateSshProfile(configured.id, .{
+        .label = "Paired VM",
+        .ssh = .{ .host = "new.example", .user = "verde" },
+    }));
+    try std.testing.expect((try service.credentials.getAlloc(allocator, credential_ref)) == null);
+
+    var persisted = try profile_store.loadAtPath(allocator, std.testing.io, path);
+    defer persisted.deinit(allocator);
+    const edited = persisted.items[0];
+    try std.testing.expectEqualStrings("new.example", edited.transport.ssh_tunnel.host);
+    try std.testing.expect(edited.access.paired_device.device_id == null);
+    try std.testing.expect(edited.access.paired_device.credential_ref == null);
+    try std.testing.expect(edited.expected_runtime_id == null);
+    try std.testing.expect(edited.expected_instance_id == null);
+    try std.testing.expect(!edited.desired_enabled);
+
+    try service.reloadProfiles();
+    const reloaded = service.snapshot(configured.id).?;
+    try std.testing.expect(!reloaded.device_credential_held);
+    try std.testing.expectEqual(CredentialHydration.missing, reloaded.credential_hydration);
+    // Missing start credentials are rejected before a tunnel or access-token
+    // mint task can be created for the replacement endpoint.
+    try std.testing.expectError(error.MissingRuntimeCredential, service.enable(configured.id, 2_000));
+    try std.testing.expectEqual(connection.Phase.disabled, service.snapshot(configured.id).?.phase);
+}
+
+test "Connect reselection at the same endpoint invalidates the old peer and credentials" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPathAlloc(allocator, tmp.dir);
+    defer allocator.free(path);
+
+    const https_url = "https://runtime.example";
+    const wss_url = "wss://runtime.example/ws";
+    const spki_sha256 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    var configured = try profile.Profile.createConnect(
+        allocator,
+        std.testing.io,
+        "Connect VM",
+        "https://control.example",
+    );
+    defer configured.deinit(allocator);
+    try configured.setConnectEndpoint(
+        allocator,
+        https_url,
+        wss_url,
+        spki_sha256,
+        "lnk_0123456789abcdef0123456789abcdef",
+    );
+    try configured.setExpectedIdentity(allocator, TEST_RUNTIME_A, TEST_INSTANCE_A);
+    const credential_ref = try credential_store.deviceRefAlloc(allocator, configured.id);
+    defer allocator.free(credential_ref);
+    try configured.setConnectRuntimeDevice(
+        allocator,
+        "0123456789abcdef0123456789abcdef",
+        credential_ref,
+    );
+    configured.desired_enabled = true;
+    try profile_store.saveAtPath(allocator, std.testing.io, path, &.{configured});
+
+    var ports: TestPorts = .{ .values = &.{43_145} };
+    var tunnel: TestTunnel = .{};
+    var rpc: TestRpc = .{};
+    var service = try Self.init(allocator, std.testing.io, path, testDependencies(&ports, &tunnel, &rpc));
+    defer service.deinit();
+    try service.credentials.put(credential_ref, TEST_DEVICE_CREDENTIAL);
+    service.hydrateStoredDeviceCredentials(&.{configured});
+    try service.hydrateToken(configured.id, TEST_TOKEN);
+    if (!service.snapshot(configured.id).?.credential_held) return error.OldConnectBearerNotLoaded;
+    try service.enable(configured.id, 1_000);
+    const old_peer = service.snapshot(configured.id).?;
+    if (old_peer.phase == .disabled) return error.OldConnectGenerationNotStarted;
+    if (!old_peer.device_credential_held) return error.OldConnectDeviceCredentialNotLoaded;
+    try std.testing.expectEqualStrings(TEST_RUNTIME_A, service.runtime_manager.expectedRuntimeId(configured.id).?);
+    try std.testing.expectEqualStrings(TEST_INSTANCE_A, service.runtime_manager.expectedInstanceId(configured.id).?);
+
+    try service.selectConnectRuntime(configured.id, .{
+        .link_id = "lnk_fedcba9876543210fedcba9876543210",
+        .runtime_id = TEST_RUNTIME_B,
+        .instance_id = TEST_INSTANCE_B,
+        .https_url = https_url,
+        .wss_url = wss_url,
+        .spki_sha256 = spki_sha256,
+    });
+    if ((try service.credentials.getAlloc(allocator, credential_ref)) != null) {
+        return error.OldConnectCredentialStillStored;
+    }
+    const selected = service.snapshot(configured.id).?;
+    try std.testing.expectEqual(connection.Phase.disabled, selected.phase);
+    if (selected.runtime != null) return error.OldConnectIdentityStillLive;
+    if (selected.execution_ready) return error.OldConnectGenerationStillReady;
+    if (selected.device_credential_held) return error.OldConnectDeviceCredentialStillLive;
+    if (selected.credential_held) return error.OldConnectBearerStillLive;
+    try std.testing.expectEqual(CredentialHydration.missing, selected.credential_hydration);
+    try std.testing.expectEqualStrings(TEST_RUNTIME_B, service.runtime_manager.expectedRuntimeId(configured.id).?);
+    try std.testing.expectEqualStrings(TEST_INSTANCE_B, service.runtime_manager.expectedInstanceId(configured.id).?);
+    if (service.beginRpc(configured.id, "core.snapshot", .{})) |_| {
+        return error.OldConnectCredentialAuthorizedRpc;
+    } else |err| {
+        try std.testing.expectEqual(error.RuntimeNotExecutionReady, err);
+    }
+
+    try service.reloadProfiles();
+    const reloaded = service.snapshot(configured.id).?;
+    try std.testing.expectEqual(connection.Phase.disabled, reloaded.phase);
+    if (reloaded.runtime != null) return error.OldConnectIdentityRestoredOnReload;
+    if (reloaded.device_credential_held) return error.OldConnectDeviceCredentialRestoredOnReload;
+    if (reloaded.credential_held) return error.OldConnectBearerRestoredOnReload;
+    try std.testing.expectEqualStrings(TEST_RUNTIME_B, service.runtime_manager.expectedRuntimeId(configured.id).?);
+    try std.testing.expectEqualStrings(TEST_INSTANCE_B, service.runtime_manager.expectedInstanceId(configured.id).?);
+    // No device credential survives to mint a bearer for the new link, even
+    // though its transport URLs are byte-for-byte identical to the old peer.
+    if (service.enable(configured.id, 2_000)) {
+        return error.OldConnectCredentialMintedAfterReload;
+    } else |err| {
+        try std.testing.expectEqual(error.MissingRuntimeCredential, err);
+    }
 }
 
 test "reloadProfiles adopts external store edits authoritatively" {

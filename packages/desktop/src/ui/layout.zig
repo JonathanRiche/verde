@@ -1129,7 +1129,13 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
             .@"return", .kp_enter => {
                 switch (state.runtime_connections.wizard_step) {
                     .form, .pair_grant, .connect_setup => state.submitRuntimeConnectionWizard(),
-                    .testing => state.runtimeConnectionWizardConnect(),
+                    // Enter obeys the same gate as the drawn middle button:
+                    // with no recovery action it activates the visible Done
+                    // control and never a hidden connect/pair path.
+                    .testing => if (wizardTestingActionable(state))
+                        state.runtimeConnectionWizardConnect()
+                    else
+                        state.cancelRuntimeConnectionWizard(),
                     // Identity confirmation and method choice need a click:
                     // a stray Enter must not adopt a runtime identity.
                     .method, .pair_confirm => {},
@@ -1615,10 +1621,42 @@ fn registerRuntimeWizardModalHits(state: *runtime.AppState, width: f32, height: 
         },
         .testing => {
             queueModalHit(state, layout.buttons[0], .runtime_wizard_back, 0);
-            queueModalHit(state, layout.buttons[1], .runtime_wizard_connect, 0);
+            // Same gate as the render path: no hit for a button that is not drawn.
+            if (wizardTestingActionable(state)) queueModalHit(state, layout.buttons[1], .runtime_wizard_connect, 0);
             queueModalHit(state, layout.buttons[2], .runtime_wizard_done, 0);
         },
     }
+}
+
+/// Label of the testing-step middle button, or empty when the shared
+/// recovery mapping has no action for the status. Trust review keeps its
+/// wizard wording; everything else uses the mapping's own label so the
+/// button never promises an action `recoverRuntimeProfile` will not run.
+/// Single actionability gate for the testing step's middle control, shared by
+/// render, pointer hit registration, and keyboard Enter.
+fn wizardTestingActionable(state: *const runtime.AppState) bool {
+    const profile_id = state.runtime_connections.wizard_profile_id orelse return false;
+    return wizardTestingActionLabel(state.runtimeProfileStatus(profile_id)).len > 0;
+}
+
+fn wizardTestingActionLabel(status: runtime.RuntimePickerStatus) []const u8 {
+    const recovery = runtime.runtimeStatusRecovery(status);
+    return switch (recovery) {
+        .none => "",
+        .review_trust => "Verify…",
+        else => runtime.runtimeRecoveryLabel(recovery, status),
+    };
+}
+
+test "wizard testing step hides the middle button when recovery has no action" {
+    try std.testing.expectEqualStrings("", wizardTestingActionLabel(.ready));
+    try std.testing.expectEqualStrings("", wizardTestingActionLabel(.connecting));
+    try std.testing.expectEqualStrings("", wizardTestingActionLabel(.reconnecting));
+    try std.testing.expectEqualStrings("", wizardTestingActionLabel(.unavailable));
+    try std.testing.expectEqualStrings("Verify…", wizardTestingActionLabel(.trust_required));
+    try std.testing.expectEqualStrings("Edit endpoint", wizardTestingActionLabel(.identity_mismatch));
+    try std.testing.expectEqualStrings("Reconnect", wizardTestingActionLabel(.provider_not_authenticated));
+    try std.testing.expectEqualStrings("Connect", wizardTestingActionLabel(.paired_offline));
 }
 
 fn connectSignedIn(phase: runtime_connections.ConnectPhase) bool {
@@ -1804,30 +1842,22 @@ fn renderRuntimeWizardModal(state: *runtime.AppState, width: f32, height: f32) v
             var badge: []const u8 = "Saved";
             var description: []const u8 = "";
             var badge_color = theme.COLOR_TEXT_MUTED;
-            var connect_label: []const u8 = "Connect";
+            // The middle button mirrors `recoverRuntimeProfile`: label and
+            // action come from one mapping, and no button is drawn when the
+            // mapping has nothing to do (connected/connecting) so a no-op
+            // accent control never appears.
+            var connect_label: []const u8 = "";
             if (rc.wizard_profile_id) |profile_id| {
                 const status = state.runtimeProfileStatus(profile_id);
                 badge = runtime.runtimePickerStatusBadge(status);
                 description = runtime.runtimePickerStatusDescription(status);
-                badge_color = switch (status) {
-                    .ready => theme.success(),
-                    .authentication_failed, .identity_mismatch, .connection_failed, .failed, .unsupported, .unavailable, .pairing_rejected => theme.danger(),
-                    else => theme.COLOR_TEXT_MUTED,
-                };
-                connect_label = switch (status) {
-                    .connecting, .handshaking, .reconnecting => "Connecting…",
-                    .trust_required => "Verify…",
-                    .ready, .limited => "Reconnect",
-                    .connection_failed, .authentication_failed, .identity_mismatch, .failed, .rate_limited => "Retry",
-                    .pairing_required, .pairing_rejected => "Pair device",
-                    .runtime_selection_required => "Choose runtime",
-                    else => "Connect",
-                };
+                badge_color = runtime.runtimeStatusTone(status).color();
+                connect_label = wizardTestingActionLabel(status);
             }
             queuePaletteText(state, .{ .x = modal.x + pad, .y = layout.status_y, .w = layout.content_w, .h = theme.scaledUi(22.0) }, badge, paletteColor(badge_color), theme.scaledUi(15.0), modal);
             queuePaletteText(state, .{ .x = modal.x + pad, .y = layout.status_y + theme.scaledUi(26.0), .w = layout.content_w, .h = theme.scaledUi(20.0) }, description, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.5), modal);
             drawActionButton(state, layout.buttons[0], "Edit", theme.COLOR_PANEL_ALT);
-            drawActionButton(state, layout.buttons[1], connect_label, theme.accent());
+            if (connect_label.len > 0) drawActionButton(state, layout.buttons[1], connect_label, theme.accent());
             drawActionButton(state, layout.buttons[2], "Done", theme.COLOR_PANEL_ALT);
         },
     }

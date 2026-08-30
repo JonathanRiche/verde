@@ -22,6 +22,37 @@ the query or an HTTP request. Tailscale's background Serve mapping and Verde's
 user service survive reboot. Verde refuses to replace an existing unrelated
 Serve mapping.
 
+If that node already serves another application on HTTPS 443, Verde stops
+before changing Tailscale. Inspect the requested listener without mutating it:
+
+```sh
+verde-server tailscale doctor --json
+```
+
+Keep the existing application and give Verde a dedicated listener when the
+tailnet permits that port:
+
+```sh
+verde-server serve --tailscale --tailscale-https-port 8443
+```
+
+The printed Pair link then contains the actual origin, for example
+`host=https%3A%2F%2Fruntime.example.ts.net%3A8443`. The desktop must retain
+that port for HTTPS and WSS. Running the command again is idempotent only when
+the selected listener still contains the one exact root proxy to Verde. An
+extra path, a different backend, or Funnel use is a collision.
+
+Collision JSON is a stable setup diagnostic. It has `schema_version: 1`,
+`ok: false`, `code: "tailscale_serve_collision"`, the explicit occupied
+`endpoint` (including `:443`), `requested_target`, the discoverable
+`current_target` (or `null`), `handler_count`, `https_port`,
+`safe_to_configure: false`, `suggested_https_port`, and
+`recovery_choices`. Setup exits nonzero and performs no Serve mutation.
+Operators may choose another port, retain the listener and use SSH recovery,
+or manually remove only that exact listener after independently verifying its
+ownership. Never use `tailscale serve reset` as Verde recovery; it would
+remove unrelated configuration.
+
 For hosted or self-hosted Connect, configure the deployment's control-plane
 URL once (or export `VERDE_CONNECT_CONTROL_PLANE`) and run:
 
@@ -41,6 +72,17 @@ provider must advertise RFC 8628 device authorization.
 External requirements are limited to a logged-in Tailscale client for the
 tailnet flow, or a configured Connect control plane, OIDC provider, and HTTPS
 domain/endpoint provider for Connect.
+
+Tailscale Serve mutation is supported on Linux through the LocalAPI Unix
+socket and on macOS through either that socket or Tailscale's authenticated
+localhost safe-socket endpoint. The macOS credential is used only to build the
+single LocalAPI request and its buffers are cleared immediately afterward; it
+is never logged or saved. Windows Serve mutation fails closed before invoking
+`tailscale debug local-creds`, because the Windows form starts a persistent
+proxy instead of returning connection credentials. Serve setup and uninstall
+also serialize on an OS-released lock in Verde's state directory, covering the
+local ownership intent, Tailscale mutation, service lifecycle, and rollback as
+one administrator transaction.
 
 Status: product and protocol contract with the first complete account-free
 Serve/Pair network-authentication slice implemented. The open-source boundary includes account-free
@@ -112,8 +154,9 @@ Implemented account-free commands:
 
 ```text
 verde-server init
-verde-server serve [--tailscale]
+verde-server serve [--tailscale] [--tailscale-https-port PORT]
 verde-server status [--json]
+verde-server tailscale doctor|status [--tailscale-https-port PORT] [--json]
 verde-server pair create [--expires 10m] [--label TEXT] [--json]
 verde-server pair list [--json]
 verde-server pair revoke --id ID

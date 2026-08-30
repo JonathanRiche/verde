@@ -27,17 +27,23 @@ pub const Phase = enum {
     reconnecting,
 };
 
-/// Stable failure classes for UI and retry policy. Only network failures are
-/// automatically eligible for a bounded reconnect attempt.
+/// Stable failure classes for retry policy and machine-readable diagnostics.
 pub const FailureKind = enum {
     authentication,
     network,
+    server_unavailable,
     identity,
     protocol,
+    wrong_service,
     resource,
+
+    pub fn retryable(self: FailureKind) bool {
+        return self == .network or self == .server_unavailable;
+    }
 };
 
 pub const Retry = struct {
+    failure: FailureKind,
     attempt: u8,
     delay_ms: u64,
     retry_at_ms: u64,
@@ -73,6 +79,8 @@ pub const TransportError = error{
     NetworkUnavailable,
     RequestTimedOut,
     ConnectionClosed,
+    ServerUnavailable,
+    WrongService,
     ProtocolRejected,
 };
 
@@ -283,6 +291,8 @@ fn classifyHandshakeError(err: anyerror) FailureKind {
         error.RequestTimedOut,
         error.ConnectionClosed,
         => .network,
+        error.ServerUnavailable => .server_unavailable,
+        error.WrongService => .wrong_service,
         error.RuntimeIdentityMissing,
         error.RuntimeIdentityMismatch,
         => .identity,
@@ -326,7 +336,7 @@ pub const Connection = struct {
     expected_instance_id: ?[]u8,
     state: State = .disabled,
     generation: u64 = 0,
-    consecutive_network_failures: u8 = 0,
+    consecutive_transient_failures: u8 = 0,
     verified_metadata: ?OwnedRuntimeMetadata = null,
 
     pub fn init(
@@ -448,7 +458,7 @@ pub const Connection = struct {
             return .committed_current;
         }
         self.clearVerifiedMetadata();
-        self.consecutive_network_failures = 0;
+        self.consecutive_transient_failures = 0;
         if (!reconnect) return .installed_disabled;
         self.generation = next_generation;
         self.state = .connecting;
@@ -458,7 +468,7 @@ pub const Connection = struct {
     pub fn lastFailure(self: *const Connection) ?FailureKind {
         return switch (self.state) {
             .failed => |failure| failure,
-            .reconnecting => .network,
+            .reconnecting => |retry| retry.failure,
             else => null,
         };
     }
@@ -468,7 +478,7 @@ pub const Connection = struct {
         if (self.phase() != .disabled) return error.InvalidConnectionTransition;
         const next_generation = try self.nextGeneration();
         self.clearVerifiedMetadata();
-        self.consecutive_network_failures = 0;
+        self.consecutive_transient_failures = 0;
         self.generation = next_generation;
         self.state = .connecting;
         return next_generation;
@@ -479,7 +489,7 @@ pub const Connection = struct {
     pub fn disable(self: *Connection) !void {
         const next_generation = try self.nextGeneration();
         self.clearVerifiedMetadata();
-        self.consecutive_network_failures = 0;
+        self.consecutive_transient_failures = 0;
         self.generation = next_generation;
         self.state = .disabled;
     }
@@ -529,7 +539,7 @@ pub const Connection = struct {
                 self.clearVerifiedMetadata();
                 self.verified_metadata = verified;
                 outcome_owned = false;
-                self.consecutive_network_failures = 0;
+                self.consecutive_transient_failures = 0;
                 self.state = if (self.expected_runtime_id == null or self.expected_instance_id == null)
                     .awaiting_trust
                 else
@@ -577,13 +587,16 @@ pub const Connection = struct {
         return result;
     }
 
-    /// Start a user-requested retry after a terminal auth/identity/protocol
-    /// failure. No daemon process action is implied.
+    /// Start an immediate user-requested retry from either a terminal failure
+    /// or a scheduled reconnect. No daemon process action or RPC replay is implied.
     pub fn retryFailed(self: *Connection) !u64 {
-        if (self.phase() != .failed) return error.InvalidConnectionTransition;
+        switch (self.phase()) {
+            .failed, .reconnecting => {},
+            else => return error.InvalidConnectionTransition,
+        }
         const next_generation = try self.nextGeneration();
         self.clearVerifiedMetadata();
-        self.consecutive_network_failures = 0;
+        self.consecutive_transient_failures = 0;
         self.generation = next_generation;
         self.state = .connecting;
         return next_generation;
@@ -611,11 +624,11 @@ pub const Connection = struct {
             .ready, .awaiting_trust => {},
             else => return error.InvalidConnectionTransition,
         }
-        const retry = try self.nextRetry(now_ms, jitter_ms);
+        const retry = try self.nextRetry(.network, now_ms, jitter_ms);
         const next_generation = try self.nextGeneration();
         self.clearVerifiedMetadata();
         self.generation = next_generation;
-        self.consecutive_network_failures = retry.attempt;
+        self.consecutive_transient_failures = retry.attempt;
         self.state = .{ .reconnecting = retry };
     }
 
@@ -640,24 +653,26 @@ pub const Connection = struct {
         jitter_ms: u32,
     ) !ApplyResult {
         self.clearVerifiedMetadata();
-        if (failure == .network) {
-            const retry = try self.nextRetry(now_ms, jitter_ms);
-            self.consecutive_network_failures = retry.attempt;
+        if (failure.retryable()) {
+            const retry = try self.nextRetry(failure, now_ms, jitter_ms);
+            self.consecutive_transient_failures = retry.attempt;
             self.state = .{ .reconnecting = retry };
         } else {
-            self.consecutive_network_failures = 0;
+            self.consecutive_transient_failures = 0;
             self.state = .{ .failed = failure };
         }
         return .applied;
     }
 
-    fn nextRetry(self: *const Connection, now_ms: u64, jitter_ms: u32) !Retry {
-        const attempt = if (self.consecutive_network_failures == std.math.maxInt(u8))
-            self.consecutive_network_failures
+    fn nextRetry(self: *const Connection, failure: FailureKind, now_ms: u64, jitter_ms: u32) !Retry {
+        std.debug.assert(failure.retryable());
+        const attempt = if (self.consecutive_transient_failures == std.math.maxInt(u8))
+            self.consecutive_transient_failures
         else
-            self.consecutive_network_failures + 1;
+            self.consecutive_transient_failures + 1;
         const delay_ms = try reconnectDelayMs(attempt, jitter_ms);
         return .{
+            .failure = failure,
             .attempt = attempt,
             .delay_ms = delay_ms,
             .retry_at_ms = now_ms +| delay_ms,
@@ -704,6 +719,8 @@ const ErrorTransport = struct {
         return switch (self.failure) {
             .authentication => error.AuthenticationRequired,
             .network => error.NetworkUnavailable,
+            .server_unavailable => error.ServerUnavailable,
+            .wrong_service => error.WrongService,
             .identity, .protocol, .resource => unreachable,
         };
     }
@@ -753,6 +770,7 @@ fn validStatus() headless.StatusResult {
 fn expectRetry(connection: *const Connection, attempt: u8, retry_at_ms: u64) !void {
     switch (connection.state) {
         .reconnecting => |retry| {
+            try std.testing.expectEqual(FailureKind.network, retry.failure);
             try std.testing.expectEqual(attempt, retry.attempt);
             try std.testing.expectEqual(retry_at_ms, retry.retry_at_ms);
         },
@@ -870,6 +888,26 @@ test "handshake classifies transport identity and protocol failures" {
     );
     defer network.deinit();
     try std.testing.expectEqual(FailureKind.network, network.failed);
+
+    var unavailable_transport: ErrorTransport = .{ .failure = .server_unavailable };
+    var unavailable = try performHandshakeAlloc(
+        std.testing.allocator,
+        TEST_RUNTIME_ID,
+        &unavailable_transport,
+        ErrorTransport.send,
+    );
+    defer unavailable.deinit();
+    try std.testing.expectEqual(FailureKind.server_unavailable, unavailable.failed);
+
+    var wrong_service_transport: ErrorTransport = .{ .failure = .wrong_service };
+    var wrong_service = try performHandshakeAlloc(
+        std.testing.allocator,
+        TEST_RUNTIME_ID,
+        &wrong_service_transport,
+        ErrorTransport.send,
+    );
+    defer wrong_service.deinit();
+    try std.testing.expectEqual(FailureKind.wrong_service, wrong_service.failed);
 
     var mismatch_transport: StatusTransport = .{ .status = validStatus() };
     var mismatch = try performHandshakeAlloc(
@@ -1230,6 +1268,35 @@ test "reconnect delay is deterministic jittered and capped" {
     try std.testing.expectEqual(@as(u64, 2_250), try reconnectDelayMs(3, 250));
     try std.testing.expectEqual(RECONNECT_MAX_DELAY_MS, try reconnectDelayMs(64, 0));
     try std.testing.expectEqual(RECONNECT_MAX_DELAY_MS, try reconnectDelayMs(255, RECONNECT_MAX_JITTER_MS));
+}
+
+test "only transient failures retry and manual retry bypasses the deadline" {
+    var runtime_connection = try Connection.init(
+        std.testing.allocator,
+        "profile-retry",
+        TEST_RUNTIME_ID,
+        TEST_INSTANCE_ID,
+    );
+    defer runtime_connection.deinit();
+
+    const first_generation = try runtime_connection.enable();
+    _ = try runtime_connection.failAttempt(first_generation, .server_unavailable, 1_000, 25);
+    switch (runtime_connection.state) {
+        .reconnecting => |retry| {
+            try std.testing.expectEqual(FailureKind.server_unavailable, retry.failure);
+            try std.testing.expectEqual(@as(u8, 1), retry.attempt);
+            try std.testing.expectEqual(@as(u64, 525), retry.delay_ms);
+            try std.testing.expectEqual(@as(u64, 1_525), retry.retry_at_ms);
+        },
+        else => return error.TestExpectedReconnectState,
+    }
+    const manual_generation = try runtime_connection.retryFailed();
+    try std.testing.expect(manual_generation > first_generation);
+    try std.testing.expectEqual(Phase.connecting, runtime_connection.phase());
+
+    _ = try runtime_connection.failAttempt(manual_generation, .wrong_service, 1_100, 0);
+    try std.testing.expectEqual(Phase.failed, runtime_connection.phase());
+    try std.testing.expectEqual(FailureKind.wrong_service, runtime_connection.lastFailure().?);
 }
 
 fn checkConnectionAllocationFailures(allocator: std.mem.Allocator) !void {

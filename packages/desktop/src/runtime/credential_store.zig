@@ -99,7 +99,7 @@ pub const Store = struct {
             return error.CredentialStoreUnavailable;
         } orelse return null;
         defer eraseAndFree(self.allocator, looked_up);
-        secret_store.validateToken(looked_up) catch return null;
+        secret_store.validateToken(looked_up) catch return error.InvalidStoredCredential;
         // Cache in memory so repeated token mints never re-prompt the keyring.
         try self.memory.put(memoryKey(&key_buffer, ref), looked_up);
         return try allocator.dupe(u8, looked_up);

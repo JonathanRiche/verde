@@ -95,6 +95,13 @@ pub const RowAction = enum(u8) {
     pair_device,
     /// Connect profiles: reopen sign-in and runtime selection.
     choose_runtime,
+    /// Open the server setup guide for endpoint/binding/provider fixes.
+    show_server_setup,
+    /// Present the pending first-contact identity proposal for explicit
+    /// review; never a reconnect, so trust is never re-pinned silently.
+    review_trust,
+    /// Open session with stale/blocked readiness: drop it and re-probe.
+    reconnect,
 };
 pub const ACTION_BITS: u6 = 8;
 
@@ -111,6 +118,43 @@ pub fn decodeRowAction(index: usize) ?DecodedRowAction {
 }
 
 pub const ReadinessState = enum { idle, loading, loaded, failed, unsupported, not_ready };
+
+const ReadinessRequest = enum { manifest, providers };
+const RuntimeFailure = @typeInfo(@FieldType(RuntimeService.Snapshot, "failure")).optional.child;
+
+const ReadinessTicket = struct {
+    ticket: RuntimeService.RpcTicket,
+    request: ReadinessRequest,
+    profile_id: []u8,
+    runtime_id: []u8,
+    instance_id: []u8,
+    generation: u64,
+
+    fn deinit(self: *ReadinessTicket, allocator: std.mem.Allocator) void {
+        allocator.free(self.profile_id);
+        allocator.free(self.runtime_id);
+        allocator.free(self.instance_id);
+        self.* = undefined;
+    }
+};
+
+const ReadinessRetry = struct {
+    attempt: u8 = 0,
+    retry_at_ms: u64 = 0,
+
+    fn reset(self: *ReadinessRetry) void {
+        self.* = .{};
+    }
+
+    fn schedule(self: *ReadinessRetry, now_ms: u64) void {
+        self.attempt +|= 1;
+        self.retry_at_ms = now_ms +| readinessRetryDelayMs(self.attempt);
+    }
+
+    fn due(self: ReadinessRetry, now_ms: u64) bool {
+        return self.attempt == 0 or now_ms >= self.retry_at_ms;
+    }
+};
 
 pub const RepositoryRow = struct {
     repository_id: []u8,
@@ -200,10 +244,18 @@ pub const State = struct {
     /// Local's details.
     expanded_profile_id: ?[]u8 = null,
     readiness_profile_id: ?[]u8 = null,
-    manifest_ticket: ?RuntimeService.RpcTicket = null,
-    providers_ticket: ?RuntimeService.RpcTicket = null,
+    readiness_runtime_id: ?[]u8 = null,
+    readiness_instance_id: ?[]u8 = null,
+    readiness_generation: u64 = 0,
+    readiness_ticket: ?ReadinessTicket = null,
+    manifest_retry: ReadinessRetry = .{},
+    providers_retry: ReadinessRetry = .{},
     manifest_state: ReadinessState = .idle,
     providers_state: ReadinessState = .idle,
+    /// Stable method-level failures for non-rendering consumers. Transport
+    /// failures stay represented by `failed` plus the bounded retry state.
+    manifest_failure_reason: ?RuntimeService.FailureReason = null,
+    providers_failure_reason: ?RuntimeService.FailureReason = null,
     repositories: std.ArrayList(RepositoryRow) = .empty,
     repositories_truncated: usize = 0,
     providers: std.ArrayList(ProviderRow) = .empty,
@@ -215,6 +267,9 @@ pub const State = struct {
         if (self.remove_confirm_profile_id) |value| allocator.free(value);
         if (self.expanded_profile_id) |value| allocator.free(value);
         if (self.readiness_profile_id) |value| allocator.free(value);
+        if (self.readiness_runtime_id) |value| allocator.free(value);
+        if (self.readiness_instance_id) |value| allocator.free(value);
+        if (self.readiness_ticket) |*ticket| ticket.deinit(allocator);
         clearReadinessRows(self, allocator);
         self.repositories.deinit(allocator);
         self.providers.deinit(allocator);
@@ -955,7 +1010,10 @@ pub fn runtimeConnectionWizardConnect(self: anytype) void {
                     }
                 }
             }
-            self.connectRuntimeProfileFromPicker(profile_id);
+            // The button label comes from the shared recovery mapping, so
+            // run that same mapping: Verify/Edit/Show server setup must not
+            // silently become a reconnect.
+            self.recoverRuntimeProfile(profile_id);
         },
         .pair_confirm => runtimeConnectionWizardBack(self),
         .connect_setup => {
@@ -1237,6 +1295,8 @@ pub fn applyRuntimeRowAction(self: anytype, index: usize) void {
     switch (decoded.action) {
         .expand => setExpandedProfile(self, profile_id),
         .connect, .retry => self.connectRuntimeProfileFromPicker(profile_id),
+        .review_trust => self.reviewRuntimeIdentity(profile_id),
+        .reconnect => self.reconnectRuntimeProfile(profile_id),
         .disable => {
             service.disable(profile_id) catch |err| {
                 log.warn("runtime disable failed: {s}", .{@errorName(err)});
@@ -1256,7 +1316,10 @@ pub fn applyRuntimeRowAction(self: anytype, index: usize) void {
         .forget_device => {
             const held = service.forgetDevice(profile_id) catch |err| {
                 log.warn("forget device failed: {s}", .{@errorName(err)});
-                setNotice(&rc.card_notice_storage, "Could not forget the paired device.");
+                setNotice(&rc.card_notice_storage, if (err == error.CredentialStoreUnavailable)
+                    "Could not delete the keyring credential. The paired-device reference was kept; unlock the keyring and retry."
+                else
+                    "Could not forget the paired device.");
                 return;
             };
             invalidateReadiness(self, profile_id);
@@ -1278,7 +1341,10 @@ pub fn applyRuntimeRowAction(self: anytype, index: usize) void {
             clearRemoveConfirm(self);
             _ = service.removeProfile(profile_id) catch |err| {
                 log.warn("runtime remove failed: {s}", .{@errorName(err)});
-                setNotice(&rc.card_notice_storage, "Could not remove that runtime.");
+                setNotice(&rc.card_notice_storage, if (err == error.CredentialStoreUnavailable)
+                    "Could not delete the keyring credential, so the runtime was kept. Unlock the keyring and retry."
+                else
+                    "Could not remove that runtime.");
                 return;
             };
             if (rc.isExpanded(profile_id)) setExpandedProfile(self, null);
@@ -1287,6 +1353,7 @@ pub fn applyRuntimeRowAction(self: anytype, index: usize) void {
             self.syncPaletteRuntimePicker();
             setNotice(&rc.card_notice_storage, "Runtime removed. Chats already pinned to it stay locked and show as unavailable.");
         },
+        .show_server_setup => self.openRuntimeServerSetupGuide(),
         .copy_diagnostics => {
             const text = service.redactedDiagnosticsAlloc(self.allocator, profile_id) catch |err| {
                 log.warn("runtime diagnostics failed: {s}", .{@errorName(err)});
@@ -1333,129 +1400,150 @@ fn setExpandedProfile(self: anytype, profile_id: ?[]const u8) void {
 /// Advances readiness for the expanded runtime. Starts RPCs when the runtime
 /// is execution-ready and drains finished tickets. Returns true on change.
 pub fn pollRuntimeConnectionsReadiness(self: anytype) bool {
-    if (!self.settings_controller.modal_visible) return false;
     const rc = &self.runtime_connections;
-    const profile_id = rc.expanded_profile_id orelse return false;
     const service = self.runtime_service orelse return false;
+    const now_ms = self.runtimeNowMs();
     var changed = false;
 
+    if (!self.settings_controller.modal_visible or rc.expanded_profile_id == null) {
+        if (rc.readiness_profile_id != null) {
+            resetReadiness(self);
+            changed = true;
+        }
+        return drainReadinessTicket(self, service, null) or changed;
+    }
+
+    const profile_id = rc.expanded_profile_id.?;
     if (rc.readiness_profile_id == null or !std.mem.eql(u8, rc.readiness_profile_id.?, profile_id)) {
         resetReadiness(self);
         rc.readiness_profile_id = self.allocator.dupe(u8, profile_id) catch return false;
         changed = true;
     }
 
-    const snapshot = service.snapshot(profile_id) orelse return changed;
+    const snapshot = service.snapshot(profile_id) orelse
+        return drainReadinessTicket(self, service, null) or changed;
     if (!snapshot.execution_ready) {
-        if (rc.manifest_state != .not_ready or rc.providers_state != .not_ready) {
-            // A lost generation invalidates prior answers; tickets for the
-            // old generation resolve as canceled and are dropped below.
-            clearReadinessRows(rc, self.allocator);
-            rc.manifest_state = .not_ready;
-            rc.providers_state = .not_ready;
-            changed = true;
-        }
-        drainCanceled(self, service);
-        return changed;
+        changed = markReadinessNotReady(self) or changed;
+        return drainReadinessTicket(self, service, null) or changed;
     }
 
-    if (rc.manifest_state == .idle or rc.manifest_state == .not_ready) {
+    const runtime = snapshot.runtime orelse {
+        changed = markReadinessNotReady(self) or changed;
+        return drainReadinessTicket(self, service, null) or changed;
+    };
+    changed = adoptReadinessIdentity(self, runtime.runtime_id, runtime.instance_id) or changed;
+    if (rc.readiness_runtime_id == null or rc.readiness_instance_id == null) return changed;
+
+    // A ticket always drains before another starts. Its bound profile,
+    // identity pair, and controller generation decide whether it may mutate
+    // the selected profile; stale results are consumed and discarded.
+    changed = drainReadinessTicket(self, service, snapshot) or changed;
+    if (rc.readiness_ticket != null) return changed;
+    if (rc.readiness_runtime_id == null or rc.readiness_instance_id == null) return changed;
+
+    if (readinessNextRequest(rc, now_ms) == .manifest) {
         if (!snapshot.repository_manifest_capable) {
             rc.manifest_state = .unsupported;
+            rc.manifest_failure_reason = null;
+            rc.manifest_retry.reset();
         } else if (self.currentWorkspaceIdForRuntimeDefault()) |workspace_id| {
-            rc.manifest_ticket = service.beginRpc(profile_id, "workspace.repository.manifest.get", .{ .workspace_id = workspace_id }) catch null;
-            rc.manifest_state = if (rc.manifest_ticket != null) .loading else .failed;
+            startReadinessRequest(self, service, .manifest, profile_id, runtime.runtime_id, runtime.instance_id, .{
+                .workspace_id = workspace_id,
+            }) catch |err| {
+                log.warn("repository manifest rpc start failed: {s}", .{@errorName(err)});
+                rc.manifest_state = .failed;
+                rc.manifest_failure_reason = null;
+                rc.manifest_retry.schedule(now_ms);
+                return true;
+            };
+            rc.manifest_state = .loading;
+            rc.manifest_failure_reason = null;
+            return true;
         } else {
             rc.manifest_state = .failed;
+            rc.manifest_failure_reason = .workspace_binding_missing;
+            rc.manifest_retry.reset();
         }
-        changed = true;
-    }
-    if (rc.providers_state == .idle or rc.providers_state == .not_ready) {
-        rc.providers_ticket = service.beginRpc(profile_id, "providers.status", .{}) catch null;
-        rc.providers_state = if (rc.providers_ticket != null) .loading else .failed;
         changed = true;
     }
 
-    if (rc.manifest_ticket) |ticket| {
-        if (takeResult(service, ticket)) |maybe| {
-            if (maybe) |result| {
-                var owned = result;
-                defer owned.deinit();
-                rc.manifest_ticket = null;
-                rc.manifest_state = switch (owned) {
-                    .response => |response| blk: {
-                        const runtime_id = if (snapshot.runtime) |runtime| runtime.runtime_id else "";
-                        parseManifest(self, response.json, runtime_id) catch |err| {
-                            log.warn("repository manifest parse failed: {s}", .{@errorName(err)});
-                            break :blk .failed;
-                        };
-                        break :blk .loaded;
-                    },
-                    .failed, .canceled => .failed,
-                };
-                changed = true;
-            }
-        } else {
-            rc.manifest_ticket = null;
-            rc.manifest_state = .failed;
-            changed = true;
-        }
-    }
-    if (rc.providers_ticket) |ticket| {
-        if (takeResult(service, ticket)) |maybe| {
-            if (maybe) |result| {
-                var owned = result;
-                defer owned.deinit();
-                rc.providers_ticket = null;
-                rc.providers_state = switch (owned) {
-                    .response => |response| blk: {
-                        parseProviders(self, response.json) catch |err| {
-                            log.warn("provider status parse failed: {s}", .{@errorName(err)});
-                            break :blk .failed;
-                        };
-                        break :blk .loaded;
-                    },
-                    .failed, .canceled => .failed,
-                };
-                changed = true;
-            }
-        } else {
-            rc.providers_ticket = null;
+    if (readinessNextRequest(rc, now_ms) == .providers) {
+        startReadinessRequest(self, service, .providers, profile_id, runtime.runtime_id, runtime.instance_id, .{}) catch |err| {
+            log.warn("provider status rpc start failed: {s}", .{@errorName(err)});
             rc.providers_state = .failed;
-            changed = true;
-        }
+            rc.providers_failure_reason = null;
+            rc.providers_retry.schedule(now_ms);
+            return true;
+        };
+        rc.providers_state = .loading;
+        rc.providers_failure_reason = null;
+        return true;
     }
     return changed;
 }
 
-/// Returns null when the take itself failed, `?null` while still in flight.
-fn takeResult(service: *RuntimeService, ticket: RuntimeService.RpcTicket) ??RuntimeService.RpcCallResult {
-    return service.takeRpcResult(ticket) catch |err| {
-        log.warn("runtime readiness rpc take failed: {s}", .{@errorName(err)});
-        return null;
+fn startReadinessRequest(
+    self: anytype,
+    service: *RuntimeService,
+    request: ReadinessRequest,
+    profile_id: []const u8,
+    runtime_id: []const u8,
+    instance_id: []const u8,
+    params: anytype,
+) !void {
+    const owned_profile_id = try self.allocator.dupe(u8, profile_id);
+    errdefer self.allocator.free(owned_profile_id);
+    const owned_runtime_id = try self.allocator.dupe(u8, runtime_id);
+    errdefer self.allocator.free(owned_runtime_id);
+    const owned_instance_id = try self.allocator.dupe(u8, instance_id);
+    errdefer self.allocator.free(owned_instance_id);
+    const method = switch (request) {
+        .manifest => "workspace.repository.manifest.get",
+        .providers => "providers.status",
+    };
+    const ticket = try service.beginRpc(profile_id, method, params);
+    self.runtime_connections.readiness_ticket = .{
+        .ticket = ticket,
+        .request = request,
+        .profile_id = owned_profile_id,
+        .runtime_id = owned_runtime_id,
+        .instance_id = owned_instance_id,
+        .generation = self.runtime_connections.readiness_generation,
     };
 }
 
-fn drainCanceled(self: anytype, service: *RuntimeService) void {
+fn drainReadinessTicket(
+    self: anytype,
+    service: *RuntimeService,
+    snapshot: ?RuntimeService.Snapshot,
+) bool {
     const rc = &self.runtime_connections;
-    if (rc.manifest_ticket) |ticket| {
-        if (takeResult(service, ticket)) |maybe| {
-            if (maybe) |result| {
-                var owned = result;
-                owned.deinit();
-                rc.manifest_ticket = null;
-            }
-        } else rc.manifest_ticket = null;
+    const current = rc.readiness_ticket orelse return false;
+    const maybe_result = service.takeRpcResult(current.ticket) catch |err| {
+        log.warn("runtime readiness rpc take failed: {s}", .{@errorName(err)});
+        var dropped = rc.readiness_ticket.?;
+        rc.readiness_ticket = null;
+        const applies = readinessTicketMatches(dropped, rc, snapshot);
+        const request = dropped.request;
+        dropped.deinit(self.allocator);
+        if (applies) scheduleReadinessRetry(rc, request, self.runtimeNowMs());
+        return true;
+    };
+    if (maybe_result == null) return false;
+
+    var result = maybe_result.?;
+    defer result.deinit();
+    var completed = rc.readiness_ticket.?;
+    rc.readiness_ticket = null;
+    defer completed.deinit(self.allocator);
+    if (!readinessTicketMatches(completed, rc, snapshot)) return true;
+
+    switch (result) {
+        .response => |response| applyReadinessResponse(self, completed.request, response, completed.runtime_id),
+        .failed => |failure| applyReadinessChannelFailure(rc, completed.request, failure, self.runtimeNowMs()),
+        .canceled => restartReadinessGeneration(self),
     }
-    if (rc.providers_ticket) |ticket| {
-        if (takeResult(service, ticket)) |maybe| {
-            if (maybe) |result| {
-                var owned = result;
-                owned.deinit();
-                rc.providers_ticket = null;
-            }
-        } else rc.providers_ticket = null;
-    }
+    return true;
 }
 
 /// Drops cached readiness for a profile whose generation or endpoint changed.
@@ -1463,20 +1551,258 @@ pub fn invalidateReadiness(self: anytype, profile_id: []const u8) void {
     const rc = &self.runtime_connections;
     const current = rc.readiness_profile_id orelse return;
     if (!std.mem.eql(u8, current, profile_id)) return;
-    clearReadinessRows(rc, self.allocator);
-    rc.manifest_state = .idle;
-    rc.providers_state = .idle;
+    restartReadinessGeneration(self);
 }
 
 fn resetReadiness(self: anytype) void {
     const rc = &self.runtime_connections;
+    rc.readiness_generation +%= 1;
     if (rc.readiness_profile_id) |value| self.allocator.free(value);
     rc.readiness_profile_id = null;
+    clearReadinessIdentity(rc, self.allocator);
     clearReadinessRows(rc, self.allocator);
-    rc.manifest_state = .idle;
-    rc.providers_state = .idle;
-    // In-flight tickets stay owned by the manager until taken; they are
-    // drained on the next poll for whichever profile is expanded.
+    resetReadinessProgress(rc, .idle);
+}
+
+fn restartReadinessGeneration(self: anytype) void {
+    const rc = &self.runtime_connections;
+    rc.readiness_generation +%= 1;
+    clearReadinessIdentity(rc, self.allocator);
+    clearReadinessRows(rc, self.allocator);
+    resetReadinessProgress(rc, .idle);
+}
+
+fn markReadinessNotReady(self: anytype) bool {
+    const rc = &self.runtime_connections;
+    if (rc.manifest_state == .not_ready and rc.providers_state == .not_ready and
+        rc.readiness_runtime_id == null and rc.readiness_instance_id == null)
+    {
+        return false;
+    }
+    rc.readiness_generation +%= 1;
+    clearReadinessIdentity(rc, self.allocator);
+    clearReadinessRows(rc, self.allocator);
+    resetReadinessProgress(rc, .not_ready);
+    return true;
+}
+
+fn adoptReadinessIdentity(self: anytype, runtime_id: []const u8, instance_id: []const u8) bool {
+    const rc = &self.runtime_connections;
+    if (rc.readiness_runtime_id) |current_runtime| {
+        if (rc.readiness_instance_id) |current_instance| {
+            if (std.mem.eql(u8, current_runtime, runtime_id) and
+                std.mem.eql(u8, current_instance, instance_id)) return false;
+        }
+        restartReadinessGeneration(self);
+    }
+    const owned_runtime = self.allocator.dupe(u8, runtime_id) catch return false;
+    const owned_instance = self.allocator.dupe(u8, instance_id) catch {
+        self.allocator.free(owned_runtime);
+        return false;
+    };
+    rc.readiness_runtime_id = owned_runtime;
+    rc.readiness_instance_id = owned_instance;
+    if (rc.manifest_state == .not_ready and rc.providers_state == .not_ready) {
+        resetReadinessProgress(rc, .idle);
+    }
+    return true;
+}
+
+fn clearReadinessIdentity(rc: *State, allocator: std.mem.Allocator) void {
+    if (rc.readiness_runtime_id) |value| allocator.free(value);
+    if (rc.readiness_instance_id) |value| allocator.free(value);
+    rc.readiness_runtime_id = null;
+    rc.readiness_instance_id = null;
+}
+
+fn resetReadinessProgress(rc: *State, state: ReadinessState) void {
+    rc.manifest_state = state;
+    rc.providers_state = state;
+    rc.manifest_failure_reason = null;
+    rc.providers_failure_reason = null;
+    rc.manifest_retry.reset();
+    rc.providers_retry.reset();
+}
+
+fn applyReadinessResponse(
+    self: anytype,
+    request: ReadinessRequest,
+    response: anytype,
+    runtime_id: []const u8,
+) void {
+    const rc = &self.runtime_connections;
+    if (response.failure_reason) |reason| {
+        if (readinessFailureReasonTransient(reason)) {
+            scheduleReadinessRetry(rc, request, self.runtimeNowMs());
+            switch (request) {
+                .manifest => rc.manifest_failure_reason = reason,
+                .providers => rc.providers_failure_reason = reason,
+            }
+            return;
+        }
+        switch (request) {
+            .manifest => {
+                rc.manifest_state = .failed;
+                rc.manifest_failure_reason = reason;
+                rc.manifest_retry.reset();
+            },
+            .providers => {
+                rc.providers_state = .failed;
+                rc.providers_failure_reason = reason;
+                rc.providers_retry.reset();
+            },
+        }
+        return;
+    }
+    switch (request) {
+        .manifest => {
+            parseManifest(self, response.json, runtime_id) catch |err| {
+                log.warn("repository manifest parse failed: {s}", .{@errorName(err)});
+                rc.manifest_state = .failed;
+                rc.manifest_failure_reason = null;
+                rc.manifest_retry.reset();
+                return;
+            };
+            rc.manifest_state = .loaded;
+            rc.manifest_failure_reason = null;
+            rc.manifest_retry.reset();
+        },
+        .providers => {
+            parseProviders(self, response.json) catch |err| {
+                log.warn("provider status parse failed: {s}", .{@errorName(err)});
+                rc.providers_state = .failed;
+                rc.providers_failure_reason = null;
+                rc.providers_retry.reset();
+                return;
+            };
+            rc.providers_state = .loaded;
+            rc.providers_failure_reason = null;
+            rc.providers_retry.reset();
+        },
+    }
+}
+
+fn readinessFailureReasonTransient(reason: RuntimeService.FailureReason) bool {
+    return reason == .transport_offline or reason == .server_unavailable;
+}
+
+fn scheduleReadinessRetry(rc: *State, request: ReadinessRequest, now_ms: u64) void {
+    switch (request) {
+        .manifest => {
+            rc.manifest_state = .failed;
+            rc.manifest_failure_reason = null;
+            rc.manifest_retry.schedule(now_ms);
+        },
+        .providers => {
+            rc.providers_state = .failed;
+            rc.providers_failure_reason = null;
+            rc.providers_retry.schedule(now_ms);
+        },
+    }
+}
+
+fn applyReadinessChannelFailure(
+    rc: *State,
+    request: ReadinessRequest,
+    failure: RuntimeFailure,
+    now_ms: u64,
+) void {
+    const transient = switch (failure) {
+        .network, .tunnel_readiness, .tunnel_wait, .tunnel_exited => true,
+        .missing_credential,
+        .unsupported_transport,
+        .no_loopback_port,
+        .tunnel_spawn,
+        .authentication,
+        .identity,
+        .protocol,
+        .resource,
+        .pairing_rejected,
+        .rate_limited,
+        => false,
+    };
+    if (transient) return scheduleReadinessRetry(rc, request, now_ms);
+    switch (request) {
+        .manifest => {
+            rc.manifest_state = .failed;
+            rc.manifest_failure_reason = null;
+            rc.manifest_retry.reset();
+        },
+        .providers => {
+            rc.providers_state = .failed;
+            rc.providers_failure_reason = null;
+            rc.providers_retry.reset();
+        },
+    }
+}
+
+fn readinessTicketMatches(
+    ticket: ReadinessTicket,
+    rc: *const State,
+    snapshot: ?RuntimeService.Snapshot,
+) bool {
+    const profile_id = rc.readiness_profile_id orelse return false;
+    const runtime_id = rc.readiness_runtime_id orelse return false;
+    const instance_id = rc.readiness_instance_id orelse return false;
+    const live = snapshot orelse return false;
+    const live_runtime = live.runtime orelse return false;
+    return readinessIdentityMatches(
+        ticket.generation,
+        ticket.profile_id,
+        ticket.runtime_id,
+        ticket.instance_id,
+        rc.readiness_generation,
+        profile_id,
+        runtime_id,
+        instance_id,
+        live_runtime.runtime_id,
+        live_runtime.instance_id,
+    );
+}
+
+fn readinessIdentityMatches(
+    ticket_generation: u64,
+    ticket_profile_id: []const u8,
+    ticket_runtime_id: []const u8,
+    ticket_instance_id: []const u8,
+    current_generation: u64,
+    current_profile_id: []const u8,
+    current_runtime_id: []const u8,
+    current_instance_id: []const u8,
+    live_runtime_id: []const u8,
+    live_instance_id: []const u8,
+) bool {
+    return ticket_generation == current_generation and
+        std.mem.eql(u8, ticket_profile_id, current_profile_id) and
+        std.mem.eql(u8, ticket_runtime_id, current_runtime_id) and
+        std.mem.eql(u8, ticket_instance_id, current_instance_id) and
+        std.mem.eql(u8, ticket_runtime_id, live_runtime_id) and
+        std.mem.eql(u8, ticket_instance_id, live_instance_id);
+}
+
+fn manifestFinished(state: ReadinessState) bool {
+    return state == .loaded or state == .failed or state == .unsupported;
+}
+
+/// Pure sequencing seam: the provider inventory cannot start until the
+/// manifest lane is terminal, and either lane waits for its bounded retry.
+fn readinessNextRequest(rc: *const State, now_ms: u64) ?ReadinessRequest {
+    if (rc.manifest_state == .idle or rc.manifest_state == .not_ready) return .manifest;
+    if (rc.manifest_state == .failed and rc.manifest_retry.attempt != 0) {
+        return if (rc.manifest_retry.due(now_ms)) .manifest else null;
+    }
+    if (!manifestFinished(rc.manifest_state)) return null;
+    if (readinessMayStart(rc.providers_state, rc.providers_retry, now_ms)) return .providers;
+    return null;
+}
+
+fn readinessMayStart(state: ReadinessState, retry: ReadinessRetry, now_ms: u64) bool {
+    return state == .idle or state == .not_ready or (state == .failed and retry.attempt != 0 and retry.due(now_ms));
+}
+
+fn readinessRetryDelayMs(attempt: u8) u64 {
+    const exponent: u6 = @intCast(@min(attempt -| 1, 4));
+    return @min(@as(u64, 250) << exponent, 4_000);
 }
 
 fn clearReadinessRows(rc: *State, allocator: std.mem.Allocator) void {
@@ -1634,6 +1960,8 @@ fn saveFailureMessage(err: anyerror) []const u8 {
         error.TooManyProfiles => "The runtime list is full (64).",
         error.UnknownRuntimeProfile => "That runtime no longer exists in the profile store.",
         error.ProfileAccessMismatch => "That runtime uses a different access method.",
+        error.CredentialStoreUnavailable => "Could not delete the old keyring credential. The existing runtime settings were kept; unlock the keyring and retry.",
+        error.CredentialCleanupIncomplete => "The profile could not be saved, and keyring rollback was incomplete. Retry pairing to replace the staged credential, then remove or forget the runtime if needed.",
         error.WouldBlock, error.Locked => "Another Verde process is editing runtimes. Try again.",
         error.NotDir, error.AccessDenied, error.ReadOnlyFileSystem => "Could not write runtime profiles in Verde's config directory. Check that ~/.config/verde points to a writable directory.",
         error.NoSpaceLeft, error.DiskQuota => "Could not save the runtime profile. Free some disk space and try again.",
@@ -1649,6 +1977,7 @@ fn pairingFailureMessage(err: anyerror) []const u8 {
         error.PairingNotConfirmed, error.PairingGrantMissing => "The exchange has not completed yet.",
         error.PairingIdentityMismatch => "The runtime's identity differs from the saved pin. Forget the device or edit the connection before re-pairing.",
         error.MissingRuntimeCredential => "The exchanged credential was lost. Pair again with a new grant.",
+        error.CredentialCleanupIncomplete => "The profile could not be saved, and keyring rollback was incomplete. Retry pairing to replace the staged credential.",
         error.UnknownRuntimeProfile => "That runtime no longer exists in the profile store.",
         error.WouldBlock, error.Locked => "Another Verde process is editing runtimes. Try again.",
         else => "Pairing could not be started.",
@@ -1717,6 +2046,168 @@ pub fn setCardNotice(self: anytype, value: []const u8) void {
 // ---------------------------------------------------------------------------
 // Tests: pure state/validation seams with no AppState dependency
 // ---------------------------------------------------------------------------
+
+test "readiness state machine serializes manifest before providers" {
+    var rc: State = .{};
+    try std.testing.expectEqual(ReadinessRequest.manifest, readinessNextRequest(&rc, 0).?);
+
+    rc.manifest_state = .loading;
+    try std.testing.expect(readinessNextRequest(&rc, 0) == null);
+
+    rc.manifest_state = .loaded;
+    try std.testing.expectEqual(ReadinessRequest.providers, readinessNextRequest(&rc, 0).?);
+    rc.providers_state = .loading;
+    try std.testing.expect(readinessNextRequest(&rc, 0) == null);
+
+    // A typed terminal manifest error still permits the independent provider
+    // inventory, while a transport failure waits for its retry deadline.
+    rc.manifest_state = .failed;
+    rc.manifest_failure_reason = .workspace_binding_missing;
+    rc.providers_state = .idle;
+    try std.testing.expectEqual(ReadinessRequest.providers, readinessNextRequest(&rc, 0).?);
+    rc.manifest_failure_reason = null;
+    rc.manifest_retry.schedule(1_000);
+    try std.testing.expect(readinessNextRequest(&rc, 1_249) == null);
+    try std.testing.expectEqual(ReadinessRequest.manifest, readinessNextRequest(&rc, 1_250).?);
+}
+
+test "readiness retry is capped and never becomes permanently failed" {
+    var retry: ReadinessRetry = .{};
+    var now_ms: u64 = 0;
+    for (0..40) |_| {
+        retry.schedule(now_ms);
+        const delay = retry.retry_at_ms - now_ms;
+        try std.testing.expect(delay >= 250);
+        try std.testing.expect(delay <= 4_000);
+        try std.testing.expect(!retry.due(retry.retry_at_ms - 1));
+        try std.testing.expect(retry.due(retry.retry_at_ms));
+        now_ms = retry.retry_at_ms;
+    }
+    try std.testing.expectEqual(@as(u64, 4_000), readinessRetryDelayMs(retry.attempt));
+
+    var rc: State = .{};
+    applyReadinessChannelFailure(&rc, .manifest, .network, 10_000);
+    try std.testing.expectEqual(ReadinessState.failed, rc.manifest_state);
+    try std.testing.expectEqual(@as(u8, 1), rc.manifest_retry.attempt);
+    applyReadinessChannelFailure(&rc, .manifest, .protocol, 10_001);
+    try std.testing.expectEqual(@as(u8, 0), rc.manifest_retry.attempt);
+    try std.testing.expect(readinessFailureReasonTransient(.server_unavailable));
+    try std.testing.expect(readinessFailureReasonTransient(.transport_offline));
+    try std.testing.expect(!readinessFailureReasonTransient(.workspace_binding_missing));
+    try std.testing.expect(!readinessFailureReasonTransient(.provider_not_authenticated));
+}
+
+test "readiness preserves typed binding and provider failures for UI" {
+    const TestState = struct {
+        allocator: std.mem.Allocator = std.testing.allocator,
+        runtime_connections: State = .{},
+
+        fn runtimeNowMs(_: *const @This()) u64 {
+            return 50_000;
+        }
+    };
+    var state: TestState = .{};
+    applyReadinessResponse(&state, .manifest, .{
+        .failure_reason = @as(?RuntimeService.FailureReason, .workspace_binding_missing),
+        .json = "",
+    }, "runtime");
+    try std.testing.expectEqual(
+        RuntimeService.FailureReason.workspace_binding_missing,
+        state.runtime_connections.manifest_failure_reason.?,
+    );
+    applyReadinessResponse(&state, .providers, .{
+        .failure_reason = @as(?RuntimeService.FailureReason, .provider_unavailable),
+        .json = "",
+    }, "runtime");
+    try std.testing.expectEqual(
+        RuntimeService.FailureReason.provider_unavailable,
+        state.runtime_connections.providers_failure_reason.?,
+    );
+    applyReadinessResponse(&state, .providers, .{
+        .failure_reason = @as(?RuntimeService.FailureReason, .provider_not_authenticated),
+        .json = "",
+    }, "runtime");
+    try std.testing.expectEqual(
+        RuntimeService.FailureReason.provider_not_authenticated,
+        state.runtime_connections.providers_failure_reason.?,
+    );
+    applyReadinessResponse(&state, .providers, .{
+        .failure_reason = @as(?RuntimeService.FailureReason, .server_unavailable),
+        .json = "",
+    }, "runtime");
+    try std.testing.expectEqual(@as(u8, 1), state.runtime_connections.providers_retry.attempt);
+    try std.testing.expectEqual(
+        RuntimeService.FailureReason.server_unavailable,
+        state.runtime_connections.providers_failure_reason.?,
+    );
+}
+
+test "readiness ticket identity rejects profile generation and trust changes" {
+    const runtime_a = "0123456789abcdef0123456789abcdef";
+    const runtime_b = "fedcba9876543210fedcba9876543210";
+    const instance_a = "00112233445566778899aabbccddeeff";
+    const instance_b = "ffeeddccbbaa99887766554433221100";
+    try std.testing.expect(readinessIdentityMatches(
+        7,
+        "profile-a",
+        runtime_a,
+        instance_a,
+        7,
+        "profile-a",
+        runtime_a,
+        instance_a,
+        runtime_a,
+        instance_a,
+    ));
+    try std.testing.expect(!readinessIdentityMatches(
+        7,
+        "profile-a",
+        runtime_a,
+        instance_a,
+        8,
+        "profile-a",
+        runtime_a,
+        instance_a,
+        runtime_a,
+        instance_a,
+    ));
+    try std.testing.expect(!readinessIdentityMatches(
+        7,
+        "profile-a",
+        runtime_a,
+        instance_a,
+        7,
+        "profile-b",
+        runtime_a,
+        instance_a,
+        runtime_a,
+        instance_a,
+    ));
+    try std.testing.expect(!readinessIdentityMatches(
+        7,
+        "profile-a",
+        runtime_a,
+        instance_a,
+        7,
+        "profile-a",
+        runtime_a,
+        instance_a,
+        runtime_b,
+        instance_a,
+    ));
+    try std.testing.expect(!readinessIdentityMatches(
+        7,
+        "profile-a",
+        runtime_a,
+        instance_a,
+        7,
+        "profile-a",
+        runtime_a,
+        instance_a,
+        runtime_a,
+        instance_b,
+    ));
+}
 
 test "row action encoding round-trips every action for the last profile row" {
     inline for (@typeInfo(RowAction).@"enum".fields) |field| {

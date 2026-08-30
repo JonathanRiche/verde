@@ -423,6 +423,38 @@ These commands never accept a token, and the desktop wizard has no token field. 
 
 Once the profile reports Connected, send a text-only prompt normally. The thread is pinned to that exact runtime after accepted or ambiguously accepted work. Selecting Local or another profile on a draft affects only that thread; a started thread cannot be migrated and asks for a new chat instead. Attachment-bearing remote prompts are rejected visibly before transcript mutation until runtime-scoped upload support lands.
 
+### Recover a desktop connection
+
+The runtime control below the prompt and **Settings › Runtimes &
+connections** show the same typed status and recovery actions:
+
+- **Offline**, **Unreachable**, and other transient transport failures retry with
+  bounded backoff. **Connect**, **Retry**, or **Reconnect** starts an immediate
+  attempt without changing the thread's selected runtime.
+- **Workspace binding missing**, **Provider unavailable**, and **Provider not
+  authenticated** mean the network session opened but the runtime is not ready
+  to execute that thread. Fix the VM-side repository/provider setup, then press
+  **Reconnect** to drop the stale session and re-read readiness. **Show server
+  setup** keeps the relevant operator instructions available beside that action.
+- **Token required**, **Authentication failed**, **Pairing required**, and
+  **Device revoked** require new authorization. Enter the administrator token
+  for an advanced SSH profile or use **Re-pair device** for a direct/Tailnet
+  profile; repeated reconnects cannot repair a missing or revoked credential.
+- **Verify identity** is first-contact trust. **Identity mismatch** is a hard
+  stop: inspect or edit the endpoint and explicitly trust the replacement.
+  Reconnect never silently re-pins a changed runtime.
+- **Copy diagnostics** copies redacted connection state and identifiers, not
+  administrator tokens, Pair codes, or device credentials.
+
+A started thread remains pinned while its runtime is unavailable. Verde never
+runs that work on Local as a fallback; restore the original runtime or create a
+new thread and choose another runtime. For a Tailscale profile, the desktop
+connects directly to the saved HTTPS origin, so reconnecting does not require an
+SSH session. The remote `verde-daemon`, `verde-web`, Tailscale client, and Serve
+mapping must still be running; use `verde-server service status --json` and
+`verde-server tailscale doctor --json` on the runtime when UI retries keep
+returning the same server-side failure.
+
 To make the profile the default only for future chats in one workspace, copy the profile ID from `verde runtime list --json` and the workspace ID from `verde live workspaces --json`, then run:
 
 ```bash
