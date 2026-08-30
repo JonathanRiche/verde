@@ -108,10 +108,7 @@ pub fn saveAtPath(
     defer allocator.free(encoded);
 
     const parent_path = std.fs.path.dirname(path) orelse ".";
-    if (!std.mem.eql(u8, parent_path, ".")) {
-        try std.Io.Dir.cwd().createDirPath(io, parent_path);
-    }
-    var dir = try std.Io.Dir.cwd().openDir(io, parent_path, .{
+    var dir = try openOrCreateParentDir(io, parent_path, .{
         // Directory fsync requires a real readable descriptor on POSIX.
         .iterate = builtin.os.tag != .windows,
     });
@@ -151,10 +148,7 @@ fn openExclusiveAtPath(
 ) !?ExclusiveLock {
     try validateStorePath(path);
     const parent_path = std.fs.path.dirname(path) orelse ".";
-    if (!std.mem.eql(u8, parent_path, ".")) {
-        try std.Io.Dir.cwd().createDirPath(io, parent_path);
-    }
-    var dir = try std.Io.Dir.cwd().openDir(io, parent_path, .{});
+    var dir = try openOrCreateParentDir(io, parent_path, .{});
     defer dir.close(io);
 
     const lock_name = try std.fmt.allocPrint(
@@ -182,6 +176,22 @@ fn openExclusiveAtPath(
         try file.setPermissions(io, PRIVATE_FILE_PERMISSIONS);
     }
     return .{ .io = io, .file = file };
+}
+
+fn openOrCreateParentDir(
+    io: std.Io,
+    parent_path: []const u8,
+    options: std.Io.Dir.OpenOptions,
+) !std.Io.Dir {
+    // Config directories commonly point into dotfiles via a symlink, which
+    // openDir follows but createDirPath rejects as a final path component.
+    return std.Io.Dir.cwd().openDir(io, parent_path, options) catch |err| switch (err) {
+        error.FileNotFound => {
+            try std.Io.Dir.cwd().createDirPath(io, parent_path);
+            return std.Io.Dir.cwd().openDir(io, parent_path, options);
+        },
+        else => return err,
+    };
 }
 
 fn stageAndReplace(
@@ -251,6 +261,32 @@ test "profile store path is beside the existing config" {
     const relative = try pathBesideConfigAlloc(allocator, "verde.json");
     defer allocator.free(relative);
     try std.testing.expectEqualStrings(FILE_NAME, relative);
+}
+
+test "profile store saves through a symlinked config directory" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "config-real", .default_dir);
+    try tmp.dir.symLink(std.testing.io, "config-real", "config-link", .{});
+
+    var absolute_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const absolute_len = try tmp.dir.realPath(std.testing.io, &absolute_buffer);
+    const path = try std.fs.path.join(allocator, &.{
+        absolute_buffer[0..absolute_len],
+        "config-link",
+        FILE_NAME,
+    });
+    defer allocator.free(path);
+
+    var lock = try acquireExclusiveAtPath(allocator, std.testing.io, path);
+    defer lock.deinit();
+    try saveAtPath(allocator, std.testing.io, path, &.{});
+    var loaded = try loadAtPath(allocator, std.testing.io, path);
+    defer loaded.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), loaded.items.len);
 }
 
 test "profile store round trips local and SSH profiles privately" {

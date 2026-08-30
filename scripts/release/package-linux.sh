@@ -141,7 +141,7 @@ cd "$DESKTOP_ROOT"
 "${BUILD_ARGS[@]}"
 
 cd "$REPO_ROOT"
-zig build daemon server --release=safe -Dversion="$VERSION" --prefix "$PREFIX_DIR"
+zig build daemon server --release=safe -Dcpu=baseline -Dversion="$VERSION" --prefix "$PREFIX_DIR"
 (
   cd "$REPO_ROOT/packages/web_app"
   zig build --release=safe -Dcpu=baseline --prefix "$PREFIX_DIR"
