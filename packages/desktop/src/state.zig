@@ -2101,6 +2101,7 @@ pub const CardToggleKind = enum(u8) {
     tool_call_group,
     tool_output,
     diff_file,
+    subagent_open,
 };
 
 /// Per-frame hit-test entry for a collapsible card header (command bubble,
@@ -6014,6 +6015,12 @@ pub const AppState = struct {
         self.requestTranscriptScrollToBottom();
         self.markDirty();
     }
+
+    pub fn openSubagentFromParentMessage(self: *AppState, project_index: usize, thread_index: usize, message_index: usize) void {
+        workspace_controller.openSubagentFromParentMessage(self, project_index, thread_index, message_index);
+    }
+
+    pub const openSubagent = workspace_controller.openSubagent;
 
     pub fn threadImportNotice(self: *const AppState) []const u8 {
         return std.mem.sliceTo(self.import_notice_storage[0..], 0);
@@ -14374,6 +14381,10 @@ pub const AppState = struct {
         for (self.card_toggle_hits.items) |hit| {
             if (x < hit.rect.x or x > hit.rect.x + hit.rect.w) continue;
             if (y < hit.rect.y or y > hit.rect.y + hit.rect.h) continue;
+            if (hit.kind == .subagent_open) {
+                self.openSubagentFromParentMessage(hit.project_index, hit.thread_index, hit.message_index);
+                return true;
+            }
             const expanded = !self.isCardExpandedDefault(hit.key, hit.default_expanded);
             self.setCardExpanded(hit.key, expanded);
             // Remember-last flips the default for every group card, so only a

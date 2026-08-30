@@ -1,5 +1,7 @@
 //! Shared provider-neutral types for native AI harnesses.
 
+const std = @import("std");
+
 pub const Provider = enum(u8) {
     opencode,
     codex,
@@ -193,7 +195,21 @@ pub const ToolCallKind = enum(u8) {
     fetch,
     mcp,
     other,
+    /// Appended after `other` so existing SQLite integer codes stay stable.
+    subagent,
 };
+
+/// Provider tool names that represent child-agent delegation, not a local tool.
+pub fn isSubagentToolName(name: []const u8) bool {
+    const trimmed = std.mem.trim(u8, name, &std.ascii.whitespace);
+    if (trimmed.len == 0) return false;
+    return std.ascii.eqlIgnoreCase(trimmed, "task") or
+        std.ascii.eqlIgnoreCase(trimmed, "agent") or
+        std.ascii.eqlIgnoreCase(trimmed, "subagent") or
+        std.ascii.eqlIgnoreCase(trimmed, "taskexecute") or
+        std.ascii.eqlIgnoreCase(trimmed, "spawnagent") or
+        std.ascii.eqlIgnoreCase(trimmed, "spawn_agent");
+}
 
 pub const ToolCallStatus = enum(u8) {
     pending,
@@ -295,3 +311,13 @@ pub const SteerThreadRequest = struct {
     prompt: []const u8,
     images: []const ImageAttachment = &.{},
 };
+
+test "subagent tool names match delegation tools only" {
+    try std.testing.expect(isSubagentToolName("task"));
+    try std.testing.expect(isSubagentToolName("Agent"));
+    try std.testing.expect(isSubagentToolName("TaskExecute"));
+    try std.testing.expect(isSubagentToolName("spawnAgent"));
+    try std.testing.expect(!isSubagentToolName("TaskCreate"));
+    try std.testing.expect(!isSubagentToolName("bash"));
+    try std.testing.expect(!isSubagentToolName(""));
+}

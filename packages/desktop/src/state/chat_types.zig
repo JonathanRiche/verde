@@ -103,6 +103,16 @@ pub const ChatMessage = struct {
     /// UI-only entrance timestamp for a card appended by a live stream. It is
     /// intentionally absent from persistence and defaults to fully presented.
     transcript_card_started_ms: i64 = 0,
+
+    pub fn deinit(self: ChatMessage, allocator: std.mem.Allocator) void {
+        allocator.free(self.author);
+        allocator.free(self.body);
+        if (self.tool_call_id) |call_id| allocator.free(call_id);
+        if (self.message_id) |message_id| allocator.free(message_id);
+        if (self.image) |image| image.deinit(allocator);
+        for (self.extra_images) |image| image.deinit(allocator);
+        allocator.free(self.extra_images);
+    }
 };
 
 pub const ChatImageAttachment = struct {
@@ -130,6 +140,60 @@ pub const ChatImageAttachment = struct {
         allocator.free(self.mime);
     }
 };
+
+/// Prefix for GUI-local child-agent panes. Encodes the parent local id so
+/// sidebar/composer code can recognize a subagent view without a schema bump.
+pub const SUBAGENT_LOCAL_ID_PREFIX = "subagent:";
+
+pub fn isSubagentLocalThreadId(local_thread_id: []const u8) bool {
+    return std.mem.startsWith(u8, local_thread_id, SUBAGENT_LOCAL_ID_PREFIX);
+}
+
+pub fn subagentParentLocalId(local_thread_id: []const u8) ?[]const u8 {
+    if (!isSubagentLocalThreadId(local_thread_id)) return null;
+    const rest = local_thread_id[SUBAGENT_LOCAL_ID_PREFIX.len..];
+    const sep = std.mem.lastIndexOfScalar(u8, rest, ':') orelse return null;
+    if (sep == 0) return null;
+    return rest[0..sep];
+}
+
+pub fn mintSubagentLocalThreadId(
+    allocator: std.mem.Allocator,
+    parent_local_id: []const u8,
+    identity: []const u8,
+) ![:0]u8 {
+    var hasher = std.hash.Wyhash.init(0x5A6E7A6E7);
+    hasher.update(parent_local_id);
+    hasher.update("\x00");
+    hasher.update(identity);
+    return ChatThread.allocPrintZCompat(allocator, "subagent:{s}:{x}", .{ parent_local_id, hasher.final() });
+}
+
+pub fn isSubagentAuthorOrKind(author: []const u8, kind: ?ai_harness.ToolCallKind) bool {
+    if (kind) |value| {
+        if (value == .subagent) return true;
+    }
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, author, " \n\r\t"), "Subagent");
+}
+
+/// Returns the `Label:\n...` section from a structured tool-call body.
+pub fn toolBodyField(body: []const u8, label: []const u8) ?[]const u8 {
+    var needle_buf: [48]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "{s}:\n", .{label}) catch return null;
+    const start: usize = if (std.mem.startsWith(u8, body, needle))
+        needle.len
+    else blk: {
+        var wrapped_buf: [50]u8 = undefined;
+        const wrapped = std.fmt.bufPrint(&wrapped_buf, "\n\n{s}:\n", .{label}) catch return null;
+        const idx = std.mem.indexOf(u8, body, wrapped) orelse return null;
+        break :blk idx + wrapped.len;
+    };
+    if (start >= body.len) return null;
+    const rest = body[start..];
+    const end = std.mem.indexOf(u8, rest, "\n\n") orelse rest.len;
+    const value = std.mem.trim(u8, rest[0..end], " \n\r\t");
+    return if (value.len == 0) null else value;
+}
 
 pub const BackgroundTaskStatus = enum {
     running,
@@ -400,6 +464,74 @@ pub const ChatThread = struct {
 
     pub fn touch(self: *ChatThread) void {
         self.last_activity_at = unixTimestampSeconds();
+    }
+
+    pub fn isSubagentView(self: *const ChatThread) bool {
+        return isSubagentLocalThreadId(self.local_thread_id);
+    }
+
+    pub fn clearMessages(self: *ChatThread, allocator: std.mem.Allocator) void {
+        for (self.messages.items) |message| message.deinit(allocator);
+        self.messages.clearRetainingCapacity();
+        if (self.pending_transcript_body) |entry| entry.deinit(allocator);
+        self.pending_transcript_body = null;
+        self.clearTranscriptMarkdownEntries(allocator);
+        self.clearTranscriptHeightEntries();
+        self.transcript_layout_valid = false;
+        self.transcript_layout_items.clearRetainingCapacity();
+        self.transcript_layout_first_message_index = 0;
+        self.transcript_layout_message_count = 0;
+        self.transcript_layout_committed_height = 0.0;
+        self.transcript_layout_requested_height = 0.0;
+        self.transcript_layout_visible_ready = false;
+    }
+
+    pub fn setTitleText(self: *ChatThread, allocator: std.mem.Allocator, title: []const u8) !void {
+        if (std.mem.eql(u8, self.title, title)) return;
+        const owned = try allocator.dupeZ(u8, title);
+        allocator.free(self.title);
+        self.title = owned;
+    }
+
+    /// Rebuilds the child-agent pane as a small chat: task prompt, then result.
+    pub fn replaceSubagentViewMessages(
+        self: *ChatThread,
+        allocator: std.mem.Allocator,
+        task_title: []const u8,
+        prompt: []const u8,
+        result_text: []const u8,
+    ) !void {
+        const intro = "Read-only view of a child agent. This is not an independent Verde chat.";
+        if (self.messages.items.len == 3) {
+            const same_intro = std.mem.eql(u8, self.messages.items[0].body, intro);
+            const same_prompt = std.mem.eql(u8, self.messages.items[1].body, prompt);
+            const same_result = std.mem.eql(u8, self.messages.items[2].body, result_text);
+            if (same_intro and same_prompt and same_result) {
+                try self.setTitleText(allocator, task_title);
+                return;
+            }
+        }
+
+        self.clearMessages(allocator);
+        try self.messages.append(allocator, .{
+            .role = .system,
+            .author = try allocator.dupeZ(u8, "System"),
+            .body = try allocator.dupeZ(u8, intro),
+        });
+        errdefer self.clearMessages(allocator);
+        try self.messages.append(allocator, .{
+            .role = .user,
+            .author = try allocator.dupeZ(u8, "You"),
+            .body = try allocator.dupeZ(u8, prompt),
+        });
+        try self.messages.append(allocator, .{
+            .role = .assistant,
+            .author = try allocator.dupeZ(u8, "Child agent"),
+            .body = try allocator.dupeZ(u8, result_text),
+        });
+        self.committed = true;
+        try self.setTitleText(allocator, task_title);
+        self.touch();
     }
 
     pub fn isSendPending(self: *const ChatThread) bool {
@@ -795,13 +927,7 @@ pub const ChatThread = struct {
         if (self.cwd) |cwd| allocator.free(cwd);
         self.runtime_route.deinit(allocator);
         for (self.messages.items) |message| {
-            allocator.free(message.author);
-            allocator.free(message.body);
-            if (message.tool_call_id) |call_id| allocator.free(call_id);
-            if (message.message_id) |message_id| allocator.free(message_id);
-            if (message.image) |*image| image.deinit(allocator);
-            for (message.extra_images) |*image| image.deinit(allocator);
-            allocator.free(message.extra_images);
+            message.deinit(allocator);
         }
         self.messages.deinit(allocator);
         for (self.background_tasks.items) |task| task.deinit(allocator);
@@ -1173,4 +1299,30 @@ test "terminal events resolve repeated anonymous background commands in order" {
 test "background command events accept current and legacy labels" {
     try std.testing.expectEqual(BackgroundTaskStatus.running, ChatThread.backgroundTaskStatusForEvent("Background command").?);
     try std.testing.expectEqual(BackgroundTaskStatus.running, ChatThread.backgroundTaskStatusForEvent("Backgrounded command").?);
+}
+
+test "subagent local thread ids encode the parent and stay stable" {
+    const allocator = std.testing.allocator;
+    const first = try mintSubagentLocalThreadId(allocator, "chat-1-abc", "call-9");
+    defer allocator.free(first);
+    const second = try mintSubagentLocalThreadId(allocator, "chat-1-abc", "call-9");
+    defer allocator.free(second);
+    const other = try mintSubagentLocalThreadId(allocator, "chat-1-abc", "call-8");
+    defer allocator.free(other);
+
+    try std.testing.expectEqualStrings(first, second);
+    try std.testing.expect(isSubagentLocalThreadId(first));
+    try std.testing.expectEqualStrings("chat-1-abc", subagentParentLocalId(first).?);
+    try std.testing.expect(!std.mem.eql(u8, first, other));
+    try std.testing.expect(isSubagentAuthorOrKind("Subagent", null));
+    try std.testing.expect(isSubagentAuthorOrKind("Read", .subagent));
+    try std.testing.expect(!isSubagentAuthorOrKind("Read", .read));
+}
+
+test "structured tool bodies expose title input and output sections" {
+    const body = "Tool:\nExplore website\n\nInput:\n{\"prompt\":\"look around\"}\n\nOutput:\nfound 3 pages";
+    try std.testing.expectEqualStrings("Explore website", toolBodyField(body, "Tool").?);
+    try std.testing.expectEqualStrings("{\"prompt\":\"look around\"}", toolBodyField(body, "Input").?);
+    try std.testing.expectEqualStrings("found 3 pages", toolBodyField(body, "Output").?);
+    try std.testing.expect(toolBodyField(body, "Error") == null);
 }

@@ -92,6 +92,16 @@ Windows installs per-user (no admin), adds a Start Menu shortcut, and needs the 
 
 Full install variants and platform notes: [verdeai.dev/#install](https://verdeai.dev/#install) · [Troubleshooting](https://verdeai.dev/docs/troubleshooting)
 
+### macOS legacy database repair
+
+If Verde bounces once in the Dock and does not open with a `DatabaseSchemaTooOld` startup error, quit Verde and run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JonathanRiche/verde/master/scripts/repair-legacy-database.sh | sh
+```
+
+The repair only updates legacy schema-version-0 databases. It creates a timestamped backup beside `state.sqlite` before using Verde's supported session-daemon migration path; already-migrated databases are left unchanged.
+
 ---
 
 ## First five minutes

@@ -391,34 +391,34 @@ fn capabilitiesResponse(allocator: std.mem.Allocator, id_value: std.json.Value) 
     return try okValueResponse(allocator, id_value, .{
         .protocol_version = PROTOCOL_VERSION,
         .commands = &.{
-            "status",                              "capabilities",                        "workspaces",                           "panes",
-            "active",                              "inspect",                             "threads",                              "terminals",
-            "herdr.open",                          "herdr.handoff",                       "herdr.unlink",                         "herdr.status",
-            "surfaces",                            "surface.list",                        "surface.inspect",                      "surface.focus",
-            "surface.clearAttention",              "notification.create",                 "notification.update",                  "notification.clear",
-            "processes",                           "workspace.select",                    "workspace.create",                     "workspace.rename",
-            "workspace.close",                     "workspace.reopen",                    "workspace.archive",                    "pane.focus",
-            "pane.split",                          "pane.resize",                         "pane.move",                            "pane.maximize",
-            "pane.close",                          "chat.open",                           "chat.open.validate",                   "chat.present",
-            "chat.status",                         "chat.transcript",                     "chat.draft.get",                       "chat.draft.set",
-            "chat.draft.append",                   "chat.send",                           "chat.followup",                        "chat.stop",
-            "chat.approve",                        "browser.open",                        "browser.navigate",                     "browser.status",
-            "browser.close",                       "browser.toggle",                      "browser.back",                         "browser.forward",
-            "browser.reload",                      "browser.focus",                       "browser.blur",                         "browser.restart",
-            "browser.reset",                       "browser.pointerDown",                 "browser.pointerMove",                  "browser.pointerUp",
-            "browser.toolbarHit",                  "browser.selectAllFocused",            "browser.copyFocused",                  "browser.pasteTextFocused",
-            "browser.eval",                        "browser.postJson",                    "browser.screenshot",                   "browser.inspector.enable",
-            "browser.inspector.disable",           "browser.inspector.toggle",            "browser.inspector.mode",               "browser.inspector.menuOpen",
-            "browser.inspector.menuClose",         "browser.overlay.workspaceMenuOpen",   "browser.overlay.workspaceMenuClose",   "browser.overlay.sidebarMenuOpen",
-            "browser.overlay.sidebarMenuClose",    "browser.overlay.composerMenuOpen",    "browser.overlay.composerMenuClose",    "browser.overlay.workspaceModalOpen",
-            "browser.overlay.workspaceModalClose", "browser.overlay.threadModalOpen",     "browser.overlay.threadModalClose",     "browser.overlay.imageModalOpen",
-            "browser.overlay.imageModalClose",     "browser.overlay.transcriptModalOpen", "browser.overlay.transcriptModalClose", "palette.list",
-            "palette.run",                         "terminal.open",                       "terminal.write",                       "terminal.key",
-            "terminal.tail",                       "terminal.screen",                     "process.list",                         "process.inspect",
-            "process.start",                       "process.stop",                        "process.restart",                      "process.logs",
-            "agent.open",                          "stack.status",                        "stack.start",                          "stack.stop",
-            "stack.restart",                       "workspace.processes",                 "workspace.checkCommand",               "workspace.acquireLease",
-            "workspace.releaseLease",
+            "status",                             "capabilities",                        "workspaces",                          "panes",
+            "active",                             "inspect",                             "threads",                             "terminals",
+            "herdr.open",                         "herdr.handoff",                       "herdr.unlink",                        "herdr.status",
+            "surfaces",                           "surface.list",                        "surface.inspect",                     "surface.focus",
+            "surface.clearAttention",             "notification.create",                 "notification.update",                 "notification.clear",
+            "processes",                          "workspace.select",                    "workspace.create",                    "workspace.rename",
+            "workspace.close",                    "workspace.reopen",                    "workspace.archive",                   "pane.focus",
+            "pane.split",                         "pane.resize",                         "pane.move",                           "pane.maximize",
+            "pane.close",                         "chat.open",                           "chat.open.validate",                  "chat.present",
+            "chat.open_subagent",                 "chat.status",                         "chat.transcript",                     "chat.draft.get",
+            "chat.draft.set",                     "chat.draft.append",                   "chat.send",                           "chat.followup",
+            "chat.stop",                          "chat.approve",                        "browser.open",                        "browser.navigate",
+            "browser.status",                     "browser.close",                       "browser.toggle",                      "browser.back",
+            "browser.forward",                    "browser.reload",                      "browser.focus",                       "browser.blur",
+            "browser.restart",                    "browser.reset",                       "browser.pointerDown",                 "browser.pointerMove",
+            "browser.pointerUp",                  "browser.toolbarHit",                  "browser.selectAllFocused",            "browser.copyFocused",
+            "browser.pasteTextFocused",           "browser.eval",                        "browser.postJson",                    "browser.screenshot",
+            "browser.inspector.enable",           "browser.inspector.disable",           "browser.inspector.toggle",            "browser.inspector.mode",
+            "browser.inspector.menuOpen",         "browser.inspector.menuClose",         "browser.overlay.workspaceMenuOpen",   "browser.overlay.workspaceMenuClose",
+            "browser.overlay.sidebarMenuOpen",    "browser.overlay.sidebarMenuClose",    "browser.overlay.composerMenuOpen",    "browser.overlay.composerMenuClose",
+            "browser.overlay.workspaceModalOpen", "browser.overlay.workspaceModalClose", "browser.overlay.threadModalOpen",     "browser.overlay.threadModalClose",
+            "browser.overlay.imageModalOpen",     "browser.overlay.imageModalClose",     "browser.overlay.transcriptModalOpen", "browser.overlay.transcriptModalClose",
+            "palette.list",                       "palette.run",                         "terminal.open",                       "terminal.write",
+            "terminal.key",                       "terminal.tail",                       "terminal.screen",                     "process.list",
+            "process.inspect",                    "process.start",                       "process.stop",                        "process.restart",
+            "process.logs",                       "agent.open",                          "stack.status",                        "stack.start",
+            "stack.stop",                         "stack.restart",                       "workspace.processes",                 "workspace.checkCommand",
+            "workspace.acquireLease",             "workspace.releaseLease",
         },
         .events = &.{},
         .encodings = &.{"json"},
@@ -1034,6 +1034,7 @@ fn chatCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, s
     if (std.mem.eql(u8, command, "open")) return try chatOpenResponse(allocator, id_value, state, params, false);
     if (std.mem.eql(u8, command, "open.validate")) return try chatOpenResponse(allocator, id_value, state, params, true);
     if (std.mem.eql(u8, command, "present")) return try chatPresentResponse(allocator, id_value, state, params);
+    if (std.mem.eql(u8, command, "open_subagent")) return try chatOpenSubagentResponse(allocator, id_value, state, params);
 
     const target = resolvePaneTarget(state, params) orelse
         return try errorResponseAlloc(allocator, id_value, "not_found", "chat pane not found");
@@ -1271,6 +1272,61 @@ fn chatPresentResponse(allocator: std.mem.Allocator, id_value: std.json.Value, s
     };
     const project = &state.project_controller.projects.items[project_index];
     return try chatPresentResultResponse(allocator, id_value, project.id, project_index, result, local_thread_id, observed_revision);
+}
+
+fn chatOpenSubagentResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
+    const project_index = resolveProjectIndex(state, params) orelse
+        return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
+    const parent_local_thread_id = stringParam(params, "parent_local_thread_id") orelse
+        return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.open_subagent requires parent_local_thread_id");
+    if (paramIsNonNull(params, "axis") and stringParam(params, "axis") == null)
+        return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.open_subagent axis must be a string");
+    const axis = parseAxis(stringParam(params, "axis") orelse "vertical") orelse
+        return try errorResponseAlloc(allocator, id_value, "invalid_request", "invalid chat.open_subagent split axis");
+    if (paramIsNonNull(params, "focus") and boolParam(params, "focus") == null)
+        return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.open_subagent focus must be a boolean");
+    const focus = boolParam(params, "focus") orelse true;
+    if (paramIsNonNull(params, "target_pane_id") and intParam(params, "target_pane_id") == null)
+        return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.open_subagent target_pane_id must be a non-negative integer");
+    const raw_target = intParam(params, "target_pane_id");
+    const target_pane_id: ?app_state.WorkspacePaneId = if (raw_target) |value| blk: {
+        if (value < 0 or value > std.math.maxInt(app_state.WorkspacePaneId))
+            return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.open_subagent target_pane_id is out of range");
+        break :blk @intCast(value);
+    } else null;
+    const raw_message_index = intParam(params, "message_index");
+    const message_index: ?usize = if (raw_message_index) |value| blk: {
+        if (value < 0) return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.open_subagent message_index must be a non-negative integer");
+        break :blk @intCast(value);
+    } else null;
+    const result = state.openSubagent(project_index, .{
+        .parent_local_thread_id = parent_local_thread_id,
+        .tool_call_id = stringParam(params, "tool_call_id"),
+        .message_id = stringParam(params, "message_id"),
+        .message_index = message_index,
+        .target_pane_id = target_pane_id,
+        .axis = axis,
+        .focus = focus,
+    }) catch |err| switch (err) {
+        error.ProjectNotFound => return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found"),
+        error.ParentThreadNotFound => return try errorResponseAlloc(allocator, id_value, "not_found", "parent thread not found"),
+        error.SourceNotFound => return try errorResponseAlloc(allocator, id_value, "not_found", "subagent tool call not found"),
+        error.NotASubagent => return try errorResponseAlloc(allocator, id_value, "invalid_request", "message is not a subagent tool call"),
+        error.TargetPaneNotFound => return try errorResponseAlloc(allocator, id_value, "not_found", "target pane not found"),
+        else => return try errorResponseAlloc(allocator, id_value, "internal_error", @errorName(err)),
+    };
+    const project = &state.project_controller.projects.items[project_index];
+    const local_thread_id = project.threads.items[result.thread_index].local_thread_id;
+    return try okValueResponse(allocator, id_value, .{
+        .workspace_id = project.id,
+        .workspace_index = project_index,
+        .pane_id = result.pane_id,
+        .thread_id = local_thread_id,
+        .local_thread_id = local_thread_id,
+        .thread_index = result.thread_index,
+        .focused = result.focused,
+        .presentation = if (result.presentation_existing) "existing" else "created",
+    });
 }
 
 fn chatPresentResultResponse(allocator: std.mem.Allocator, id_value: std.json.Value, workspace_id: []const u8, workspace_index: usize, result: app_state.OpenChatResult, thread_id: []const u8, projected_store_revision: u64) ![]u8 {

@@ -875,6 +875,7 @@ fn getOptionalObjectInt(value: std.json.Value, field: []const u8) ?i64 {
 
 fn bridgeToolCallKind(value: []const u8) provider_types.ToolCallKind {
     if (std.mem.eql(u8, value, "mcp")) return .mcp;
+    if (std.mem.eql(u8, value, "subagent")) return .subagent;
     return .other;
 }
 
@@ -1197,6 +1198,26 @@ test "Claude bridge MCP events preserve input and output" {
     try std.testing.expectEqual(provider_types.ToolCallStatus.completed, capture.status.?);
     try std.testing.expectEqualStrings("{\"workspace\":\"current\"}", capture.input.?);
     try std.testing.expectEqualStrings("{\"ok\":true}", capture.output.?);
+}
+
+test "Claude bridge subagent events preserve title and status" {
+    const payload =
+        \\{"type":"tool_call_event","call_id":"agent-1","title":"Explore the web app","kind":"subagent","status":"in_progress","input":"{\"description\":\"Explore the web app\"}"}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    var capture: ClaudeTestToolCapture = .{};
+
+    try std.testing.expect(emitBridgeToolCallEvent(parsed.value, .{
+        .prompt = "",
+        .stream_context = &capture,
+        .on_stream_event = ClaudeTestToolCapture.handle,
+    }));
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqualStrings("agent-1", capture.call_id.?);
+    try std.testing.expectEqualStrings("Explore the web app", capture.title.?);
+    try std.testing.expectEqual(provider_types.ToolCallKind.subagent, capture.kind.?);
+    try std.testing.expectEqual(provider_types.ToolCallStatus.in_progress, capture.status.?);
 }
 
 test "Windows provider bridge probes CLI and package-root GUI layouts" {

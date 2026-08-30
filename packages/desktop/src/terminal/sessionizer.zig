@@ -9557,7 +9557,7 @@ fn roleNameFromCode(code: i64, author: []const u8) []const u8 {
 }
 
 fn toolCallKindNameFromCode(code: i64) []const u8 {
-    const names = [_][]const u8{ "read", "edit", "delete", "move", "search", "execute", "think", "fetch", "mcp", "other" };
+    const names = [_][]const u8{ "read", "edit", "delete", "move", "search", "execute", "think", "fetch", "mcp", "other", "subagent" };
     if (code < 0 or code >= names.len) return "other";
     return names[@intCast(code)];
 }
