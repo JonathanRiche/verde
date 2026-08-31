@@ -385,7 +385,29 @@ function isCommandCardRow(message: Message): boolean {
 }
 
 function isSubagentCardRow(message: Message): boolean {
-  return message.tool_call_kind === 'subagent' || message.author === 'Subagent'
+  if (message.tool_call_kind === 'subagent' || message.author === 'Subagent') return true
+  const tool = toolBodyField(message.body, 'Tool')
+  if (tool && /^(task|agent|subagent|taskexecute|spawnagent|spawn_agent)$/i.test(tool.trim())) return true
+  const input = toolBodyField(message.body, 'Input') ?? ''
+  if (input.includes('"subagent_type"')) return true
+  const output = toolBodyField(message.body, 'Output') ?? ''
+  return output.includes('<task id="')
+}
+
+function toolBodyField(body: string, label: string): string | null {
+  const prefix = `${label}:\n`
+  const start = body.startsWith(prefix)
+    ? prefix.length
+    : (() => {
+        const wrapped = `\n\n${prefix}`
+        const idx = body.indexOf(wrapped)
+        return idx >= 0 ? idx + wrapped.length : -1
+      })()
+  if (start < 0) return null
+  const rest = body.slice(start)
+  const end = rest.indexOf('\n\n')
+  const value = (end >= 0 ? rest.slice(0, end) : rest).trim()
+  return value.length > 0 ? value : null
 }
 
 function commandFailed(message: Message): boolean {

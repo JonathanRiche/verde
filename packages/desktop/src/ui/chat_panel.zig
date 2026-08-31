@@ -3656,7 +3656,7 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
             const is_last = pi + 1 == pending_count;
             const is_backgrounded = chat_types.ChatThread.isBackgroundCommandEvent(event.author);
             if (y + item_h >= column.y and y <= column.y + column.h) {
-                renderCommandEventRow(state, column, y, item_h, event.author, event.body, clip, msg_idx, is_last or is_backgrounded, false, event.tool_call_status, null);
+                renderCommandEventRow(state, column, y, item_h, event.author, event.body, clip, msg_idx, is_last or is_backgrounded, false, event.tool_call_status, event.tool_call_kind, null);
             }
         } else if (event.role == .system and isDiffSummaryMessage(event.author, event.body)) {
             if (y + item_h >= column.y and y <= column.y + column.h) {
@@ -3773,12 +3773,8 @@ fn toolCopyIdentity(message_index: usize, body: []const u8) u64 {
 }
 
 fn isSubagentTimelineEntry(entry: anytype) bool {
-    if (@hasField(@TypeOf(entry), "tool_call_kind")) {
-        if (entry.tool_call_kind) |kind| {
-            if (kind == .subagent) return true;
-        }
-    }
-    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, entry.author, " \n\r\t"), "Subagent");
+    const kind = if (@hasField(@TypeOf(entry), "tool_call_kind")) entry.tool_call_kind else null;
+    return chat_types.looksLikeSubagentCard(entry.author, kind, entry.body);
 }
 
 fn shouldGroupCommandRow(entry: anytype) bool {
@@ -3908,6 +3904,7 @@ fn isCommandLikeShellBody(body_raw: []const u8) bool {
 }
 
 fn shouldRenderPaletteCommandRow(author: []const u8, body_raw: []const u8) bool {
+    if (chat_types.looksLikeSubagentCard(author, null, body_raw)) return true;
     if (isCommandSystemEvent(author)) return true;
     if (isCursorToolSystemEvent(author, body_raw)) return true;
     return isCommandLikeShellBody(body_raw);
@@ -4186,6 +4183,7 @@ fn renderPinnedBackgroundCommands(
             true,
             false,
             null,
+            null,
             row.task_index,
         );
         if (pending) thread.send_state.mutex.unlock();
@@ -4450,6 +4448,7 @@ fn isSlashCommandResultMessage(author: []const u8, body_raw: []const u8) bool {
 
 /// Label shown after `>_` in the compact command row (Codex-native titles preserved; Cursor/shell-like bodies default to "Ran command").
 fn paletteCommandRowDisplayAuthor(original_author: []const u8, body_raw: []const u8) []const u8 {
+    if (chat_types.looksLikeSubagentCard(original_author, null, body_raw)) return "Subagent";
     if (isCommandSystemEvent(original_author)) return original_author;
     if (isCursorToolSystemEvent(original_author, body_raw)) return original_author;
     if (isCommandLikeShellBody(body_raw)) return "Ran command";
@@ -4656,7 +4655,7 @@ fn renderTranscriptMessage(state: *app_state.AppState, thread: *const app_state.
         return;
     }
     if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body)) {
-        renderCommandEventRow(state, column, y, height, message.author, message.body, clip, message_index, thread.backgroundCommandIsRunning(message.body), false, message.tool_call_status, null);
+        renderCommandEventRow(state, column, y, height, message.author, message.body, clip, message_index, thread.backgroundCommandIsRunning(message.body), false, message.tool_call_status, message.tool_call_kind, null);
         return;
     }
     if (message.role == .system and isDiffSummaryMessage(message.author, message.body)) {
@@ -6320,6 +6319,7 @@ fn renderToolCallGroup(
                 fallback_running and index + 1 == end,
             true,
             toolCallEntryStatus(entry),
+            if (@hasField(@TypeOf(entry), "tool_call_kind")) entry.tool_call_kind else null,
             null,
         );
         child_y += child_h + theme.scaledUi(8.0);
@@ -6338,6 +6338,7 @@ fn renderCommandEventRow(
     running: bool,
     grouped: bool,
     tool_call_status: ?ai_harness.ToolCallStatus,
+    tool_call_kind: ?ai_harness.ToolCallKind,
     live_task_index: ?usize,
 ) void {
     // Command transcript card, including controls for tracked background tasks.
@@ -6349,7 +6350,7 @@ fn renderCommandEventRow(
         running;
     const failed = commandEventFailed(original_author) or (tool_call_status orelse .unknown) == .failed;
     const stopped = std.mem.eql(u8, original_author, "Background task stopped") or (tool_call_status orelse .unknown) == .cancelled;
-    const subagent_row = chat_types.isSubagentAuthorOrKind(original_author, null);
+    const subagent_row = chat_types.looksLikeSubagentCard(original_author, tool_call_kind, body_raw);
     const fill_color = if (subagent_row)
         theme.mix(theme.background(), theme.accent(), 0.07)
     else if (grouped) theme.darken(theme.background(), 0.035) else theme.COLOR_PANEL_ALT;

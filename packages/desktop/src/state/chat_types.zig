@@ -172,6 +172,96 @@ pub fn isSubagentAuthorOrKind(author: []const u8, kind: ?ai_harness.ToolCallKind
     return std.ascii.eqlIgnoreCase(std.mem.trim(u8, author, " \n\r\t"), "Subagent");
 }
 
+/// True for live `tool_call_kind=subagent` rows and for already-persisted
+/// Claude/OpenCode cards that stored the child as a generic tool.
+pub fn looksLikeSubagentCard(author: []const u8, kind: ?ai_harness.ToolCallKind, body: []const u8) bool {
+    if (isSubagentAuthorOrKind(author, kind)) return true;
+    if (ai_harness.types.isSubagentToolName(toolBodyField(body, "Tool") orelse "")) return true;
+    const input = toolBodyField(body, "Input") orelse "";
+    if (std.mem.indexOf(u8, input, "\"subagent_type\"") != null) return true;
+    const output = toolBodyField(body, "Output") orelse "";
+    return std.mem.indexOf(u8, output, "<task id=\"") != null;
+}
+
+/// Child-agent prompt/title/result parsed from a structured tool-call body.
+pub fn parseSubagentConversation(body: []const u8) struct { title: []const u8, prompt: []const u8, result: []const u8, session_id: ?[]const u8 } {
+    const tool_title = toolBodyField(body, "Tool") orelse "";
+    const input = toolBodyField(body, "Input") orelse "";
+    const output = toolBodyField(body, "Output");
+    const error_text = toolBodyField(body, "Error");
+    const description = jsonObjectString(input, "description") orelse "";
+    const prompt = jsonObjectString(input, "prompt") orelse
+        (if (input.len > 0) input else if (tool_title.len > 0) tool_title else "");
+    const title = if (description.len > 0)
+        description
+    else if (tool_title.len > 0 and !ai_harness.types.isSubagentToolName(tool_title))
+        tool_title
+    else
+        firstNonEmptyLine(if (prompt.len > 0) prompt else body);
+    const raw_result = error_text orelse output orelse "";
+    return .{
+        .title = if (title.len > 0) title else "Subagent",
+        .prompt = if (prompt.len > 0) prompt else "No task prompt was stored.",
+        .result = unwrapChildAgentResult(raw_result),
+        .session_id = openCodeChildSessionId(output orelse input),
+    };
+}
+
+fn firstNonEmptyLine(text: []const u8) []const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \r\t");
+        if (line.len > 0) return line;
+    }
+    return std.mem.trim(u8, text, " \n\r\t");
+}
+
+fn unwrapChildAgentResult(text: []const u8) []const u8 {
+    const start_tag = "<task_result>";
+    const end_tag = "</task_result>";
+    const start = std.mem.indexOf(u8, text, start_tag) orelse return std.mem.trim(u8, text, " \n\r\t");
+    const from = start + start_tag.len;
+    const end = std.mem.indexOf(u8, text[from..], end_tag) orelse return std.mem.trim(u8, text[from..], " \n\r\t");
+    return std.mem.trim(u8, text[from .. from + end], " \n\r\t");
+}
+
+fn openCodeChildSessionId(text: []const u8) ?[]const u8 {
+    const prefixes = [_][]const u8{ "<task id=\"", "\"sessionID\":\"", "\"sessionId\":\"" };
+    for (prefixes) |prefix| {
+        const start = std.mem.indexOf(u8, text, prefix) orelse continue;
+        const from = start + prefix.len;
+        const rest = text[from..];
+        const end = std.mem.indexOfAny(u8, rest, "\"<") orelse continue;
+        const id = rest[0..end];
+        if (std.mem.startsWith(u8, id, "ses_")) return id;
+    }
+    return null;
+}
+
+fn jsonObjectString(json_text: []const u8, key: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, json_text, " \n\r\t");
+    if (trimmed.len < 2 or trimmed[0] != '{') return null;
+    var needle_buf: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "\"{s}\":", .{key}) catch return null;
+    const key_at = std.mem.indexOf(u8, trimmed, needle) orelse return null;
+    var index = key_at + needle.len;
+    while (index < trimmed.len and std.ascii.isWhitespace(trimmed[index])) index += 1;
+    if (index >= trimmed.len or trimmed[index] != '"') return null;
+    index += 1;
+    const value_start = index;
+    while (index < trimmed.len) : (index += 1) {
+        if (trimmed[index] == '\\') {
+            index += 1;
+            continue;
+        }
+        if (trimmed[index] == '"') {
+            const value = trimmed[value_start..index];
+            return if (value.len > 0) value else null;
+        }
+    }
+    return null;
+}
+
 /// Returns the `Label:\n...` section from a structured tool-call body.
 pub fn toolBodyField(body: []const u8, label: []const u8) ?[]const u8 {
     var needle_buf: [48]u8 = undefined;
@@ -1279,4 +1369,45 @@ test "structured tool bodies expose title input and output sections" {
     try std.testing.expectEqualStrings("{\"prompt\":\"look around\"}", toolBodyField(body, "Input").?);
     try std.testing.expectEqualStrings("found 3 pages", toolBodyField(body, "Output").?);
     try std.testing.expect(toolBodyField(body, "Error") == null);
+}
+
+test "looksLikeSubagentCard recovers persisted Claude and OpenCode rows" {
+    try std.testing.expect(looksLikeSubagentCard("Cursor tool", .other,
+        \\Tool:
+        \\read_readme
+        \\
+        \\Input:
+        \\{"description":"read_readme","subagent_type":"Explore","prompt":"Read README.md"}
+        \\
+        \\Output:
+        \\Verde
+    ));
+    try std.testing.expect(looksLikeSubagentCard("MCP tool", .mcp,
+        \\Tool:
+        \\task
+        \\
+        \\Input:
+        \\{"description":"list_provider_files","prompt":"List files"}
+        \\
+        \\Output:
+        \\<task id="ses_abc123" state="completed"><task_result>acp.zig</task_result></task>
+    ));
+    try std.testing.expect(!looksLikeSubagentCard("Ran command", .execute, "Input:\nls\n\nOutput:\nok"));
+
+    const parsed = parseSubagentConversation(
+        \\Tool:
+        \\task
+        \\
+        \\Input:
+        \\{"description":"read_readme","prompt":"Read README.md. Reply in one sentence."}
+        \\
+        \\Output:
+        \\<task id="ses_fab7bd" state="completed"><task_result>
+        \\The repo is Verde.
+        \\</task_result></task>
+    );
+    try std.testing.expectEqualStrings("read_readme", parsed.title);
+    try std.testing.expectEqualStrings("Read README.md. Reply in one sentence.", parsed.prompt);
+    try std.testing.expectEqualStrings("The repo is Verde.", parsed.result);
+    try std.testing.expectEqualStrings("ses_fab7bd", parsed.session_id.?);
 }

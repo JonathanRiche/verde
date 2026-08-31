@@ -217,8 +217,10 @@ function mcpNameFromClaudeToolUse(item) {
 function subagentFromClaudeToolUse(item) {
   if (item?.type !== "tool_use") return null;
   const name = String(item.name ?? "");
-  if (!["task", "agent", "subagent"].includes(name.toLowerCase())) return null;
   const input = item.input && typeof item.input === "object" ? item.input : {};
+  const named = ["task", "agent", "subagent", "taskexecute"].includes(name.toLowerCase());
+  const typed = typeof input.subagent_type === "string" && input.subagent_type.trim().length > 0;
+  if (!named && !typed) return null;
   const title =
     (typeof input.description === "string" && input.description.trim()) ||
     (typeof input.prompt === "string" && input.prompt.trim()) ||

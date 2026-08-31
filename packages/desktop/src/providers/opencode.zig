@@ -499,7 +499,7 @@ pub const Client = struct {
         request: provider_types.SendPromptRequest,
         last_task_summary: *?[]u8,
     ) !void {
-        const on_stream_event = request.on_stream_event orelse return;
+        _ = request;
         const summary = snapshot.task_summary orelse return;
 
         if (last_task_summary.*) |existing| {
@@ -508,14 +508,9 @@ pub const Client = struct {
             last_task_summary.* = null;
         }
 
-        const parsed_task = parseOpenCodeTaskSummary(summary);
-        on_stream_event(request.stream_context, .{ .tool_call = .{
-            .call_id = "opencode-task",
-            .title = parsed_task.title,
-            .kind = .subagent,
-            .status = parsed_task.status,
-            .input = summary,
-        } });
+        // SSE `session.tool.*` already upserts one card per Task call. Keep
+        // the summary for idle detection only — a shared poll-derived
+        // `opencode-task` id would collapse every child into one row.
         last_task_summary.* = try self.allocator.dupe(u8, summary);
     }
 

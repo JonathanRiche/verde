@@ -1649,20 +1649,26 @@ fn captureSubagentSource(
 }
 
 fn subagentSourceFromMessage(allocator: std.mem.Allocator, message: chat_types.ChatMessage, message_index: usize) !SubagentSource {
-    if (!chat_types.isSubagentAuthorOrKind(message.author, message.tool_call_kind)) return error.NotASubagent;
+    if (!chat_types.looksLikeSubagentCard(message.author, message.tool_call_kind, message.body)) return error.NotASubagent;
     var identity_buf: [32]u8 = undefined;
+    const parsed = chat_types.parseSubagentConversation(message.body);
     const identity = if (message.tool_call_id) |call_id|
         call_id
+    else if (parsed.session_id) |session_id|
+        session_id
     else
         std.fmt.bufPrint(&identity_buf, "m{d}", .{message_index}) catch "m";
     return try buildSubagentSource(allocator, identity, message.body, message.tool_call_status);
 }
 
 fn subagentSourceFromPending(allocator: std.mem.Allocator, event: chat_types.PendingTimelineEvent, message_index: usize) !SubagentSource {
-    if (!chat_types.isSubagentAuthorOrKind(event.author, event.tool_call_kind)) return error.NotASubagent;
+    if (!chat_types.looksLikeSubagentCard(event.author, event.tool_call_kind, event.body)) return error.NotASubagent;
     var identity_buf: [32]u8 = undefined;
+    const parsed = chat_types.parseSubagentConversation(event.body);
     const identity = if (event.tool_call_id) |call_id|
         call_id
+    else if (parsed.session_id) |session_id|
+        session_id
     else
         std.fmt.bufPrint(&identity_buf, "m{d}", .{message_index}) catch "m";
     return try buildSubagentSource(allocator, identity, event.body, event.tool_call_status);
@@ -1674,29 +1680,15 @@ fn buildSubagentSource(
     body: []const u8,
     status: ?ai_harness.ToolCallStatus,
 ) !SubagentSource {
-    const tool_title = chat_types.toolBodyField(body, "Tool") orelse "";
-    const input = chat_types.toolBodyField(body, "Input") orelse "";
-    const output = chat_types.toolBodyField(body, "Output");
-    const error_text = chat_types.toolBodyField(body, "Error");
-    const title_src = if (tool_title.len > 0) tool_title else firstNonEmptyLine(if (input.len > 0) input else body);
-    const prompt_src = if (input.len > 0) input else if (tool_title.len > 0) tool_title else std.mem.trim(u8, body, " \n\r\t");
-    const result_src = error_text orelse output orelse subagentStatusFallback(status);
+    const parsed = chat_types.parseSubagentConversation(body);
+    const result_src = if (parsed.result.len > 0) parsed.result else subagentStatusFallback(status);
 
     return .{
         .identity = try allocator.dupe(u8, identity),
-        .title = try allocator.dupe(u8, if (title_src.len > 0) title_src else "Subagent"),
-        .prompt = try allocator.dupe(u8, if (prompt_src.len > 0) prompt_src else "No task prompt was stored."),
+        .title = try allocator.dupe(u8, parsed.title),
+        .prompt = try allocator.dupe(u8, parsed.prompt),
         .result = try allocator.dupe(u8, result_src),
     };
-}
-
-fn firstNonEmptyLine(text: []const u8) []const u8 {
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |line_raw| {
-        const line = std.mem.trim(u8, line_raw, " \r\t");
-        if (line.len > 0) return line;
-    }
-    return std.mem.trim(u8, text, " \n\r\t");
 }
 
 fn subagentStatusFallback(status: ?ai_harness.ToolCallStatus) []const u8 {
