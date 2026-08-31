@@ -3061,6 +3061,13 @@ fn emitNotificationEvent(self: *Client, root: std.json.Value, request: provider_
         if (try emitItemEvent(self.allocator, root, request.stream_context, on_stream_event)) {
             return;
         }
+        const params = getObjectField(root, "params") orelse getObjectField(root, "item");
+        const item = if (params) |value| getObjectField(value, "item") orelse value else null;
+        if (item) |value| {
+            if (getOptionalObjectString(value, "type")) |item_type| {
+                runtime_log.diagnostic("codex.unhandled_item method={s} type={s}", .{ method, item_type });
+            }
+        }
     }
 
     if (std.mem.eql(u8, method, "turn/diff/updated")) {
