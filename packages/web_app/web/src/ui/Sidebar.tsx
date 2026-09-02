@@ -18,7 +18,7 @@ interface MenuItem {
 }
 
 interface PromptState {
-  action: 'workspace-rename' | 'thread-rename' | 'workspace-herdr-handoff-remote'
+  action: 'workspace-rename' | 'thread-rename'
   workspace: Workspace
   pane?: LivePane
   title: string
@@ -59,17 +59,6 @@ export function Sidebar() {
         title: 'Rename chat',
         label: 'Chat title',
         initial: store.paneTitle(target.pane),
-      })
-      return
-    }
-    if (item.action === 'workspace-herdr-handoff-remote') {
-      setPrompt({
-        action: item.action,
-        workspace: target.workspace,
-        title: 'Remote Herdr handoff',
-        label: 'Remote profile',
-        initial: target.workspace.herdr_link?.remote_alias ?? '',
-        placeholder: 'profile name',
       })
       return
     }
@@ -688,12 +677,10 @@ function contextMenuItems(target: SidebarMenuTarget): MenuItem[] {
       ? [
           { action: 'workspace-herdr-focus-terminal', label: target.workspace.herdr_link?.attach_dock_id != null ? 'Focus Herdr terminal' : 'Open Herdr terminal' },
           { action: 'workspace-herdr-handoff', label: 'Refresh Herdr handoff' },
-          { action: 'workspace-herdr-handoff-remote', label: 'Handoff to remote Herdr' },
           { action: 'workspace-herdr-unlink', label: 'Run locally (unlink Herdr)' },
         ]
       : [
           { action: 'workspace-herdr-handoff', label: 'Handoff to Herdr' },
-          { action: 'workspace-herdr-handoff-remote', label: 'Handoff to remote Herdr' },
         ]
     return [
       { action: 'workspace-new-chat', label: 'Start a new chat' },

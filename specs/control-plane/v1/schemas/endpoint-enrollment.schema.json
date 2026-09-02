@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://verde.dev/specs/control-plane/v1/schemas/endpoint-enrollment.schema.json",
+  "title": "Endpoint-provider enrollment messages",
+  "$defs": {
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "request_id",
+        "provider",
+        "runtime_proof_jwt",
+        "expires_at"
+      ],
+      "properties": {
+        "contract_version": {
+          "$ref": "common.schema.json#/$defs/contractVersion"
+        },
+        "request_id": {
+          "$ref": "common.schema.json#/$defs/requestId"
+        },
+        "provider": {
+          "enum": ["external", "noop_test"]
+        },
+        "runtime_proof_jwt": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$",
+          "maxLength": 16384
+        },
+        "expires_at": {
+          "$ref": "common.schema.json#/$defs/timestamp"
+        },
+        "external_descriptor": {
+          "$ref": "runtime-descriptor.schema.json"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "provider": {
+                "const": "external"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "external_descriptor": true
+            },
+            "required": ["external_descriptor"]
+          },
+          "else": {
+            "not": {
+              "required": ["external_descriptor"]
+            }
+          }
+        }
+      ]
+    },
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "enrollment_id",
+        "provider",
+        "descriptor",
+        "created_at"
+      ],
+      "properties": {
+        "contract_version": {
+          "$ref": "common.schema.json#/$defs/contractVersion"
+        },
+        "enrollment_id": {
+          "$ref": "common.schema.json#/$defs/enrollmentId"
+        },
+        "provider": {
+          "enum": ["external", "noop_test"]
+        },
+        "descriptor": {
+          "$ref": "runtime-descriptor.schema.json"
+        },
+        "connector_enrollment": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "encrypted_credential",
+            "expires_at",
+            "key_thumbprint",
+            "alg",
+            "enc"
+          ],
+          "properties": {
+            "encrypted_credential": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]*\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$",
+              "maxLength": 8192
+            },
+            "expires_at": {
+              "$ref": "common.schema.json#/$defs/timestamp"
+            },
+            "key_thumbprint": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{43}$"
+            },
+            "alg": {
+              "const": "ECDH-ES"
+            },
+            "enc": {
+              "const": "A256GCM"
+            }
+          }
+        },
+        "created_at": {
+          "$ref": "common.schema.json#/$defs/timestamp"
+        }
+      }
+    }
+  }
+}

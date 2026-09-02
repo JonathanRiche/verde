@@ -13,6 +13,7 @@ const runtime = @import("runtime.zig");
 const keybinds = @import("../app/keybinds.zig");
 const debug_window = @import("debug.zig");
 const settings_modal = @import("settings_modal.zig");
+const runtime_connections = @import("../state/runtime_connections_controller.zig");
 const command_palette = @import("command_palette.zig");
 const companion = @import("companion.zig");
 const companion_controller = @import("../state/companion_controller.zig");
@@ -39,8 +40,9 @@ pub fn updateSettingsModalHover(state: *runtime.AppState, x: f32, y: f32) void {
     settings_modal.updateHover(state, x, y);
 }
 
-/// Routes wheel input to the settings modal body when it is open.
+/// Routes wheel input to the workspace-settings or settings modal body.
 pub fn handleSettingsModalWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y: f32, wheel_y: f32) bool {
+    if (handleWorkspaceSettingsWheel(state, width, height, x, y, wheel_y)) return true;
     return settings_modal.handleWheel(state, width, height, x, y, wheel_y);
 }
 
@@ -69,9 +71,12 @@ pub fn refreshPaletteModalHits(state: *runtime.AppState, width: f32, height: f32
     registerWorkspaceAddModalHits(state, width, height);
     registerWorkspaceRenameModalHits(state, width, height);
     registerThreadImportModalHits(state, width, height);
-    registerHerdrProfilePickerHits(state, width, height);
     settings_modal.registerHits(state, width, height, queueModalHit);
+    registerWorkspaceSettingsModalHits(state, width, height);
+    registerRuntimeWizardModalHits(state, width, height);
     command_palette.registerHits(state, width, height, queueModalHit);
+    registerRuntimeCredentialModalHits(state, width, height);
+    registerRuntimeTrustModalHits(state, width, height);
 }
 
 /// Updates command-palette row hover using hits from `refreshPaletteModalHits`.
@@ -149,35 +154,6 @@ pub fn updateThreadImportModalHover(state: *runtime.AppState, x: f32, y: f32) vo
     state.markDirty();
 }
 
-/// Updates Herdr profile-picker row hover using hits from `refreshPaletteModalHits`.
-pub fn updateHerdrProfilePickerHover(state: *runtime.AppState, x: f32, y: f32) void {
-    if (state.herdr_controller.picker_project_index == null) {
-        if (state.herdr_controller.hover_index != null) {
-            state.herdr_controller.hover_index = null;
-            state.markDirty();
-        }
-        return;
-    }
-
-    var new_hover: ?usize = null;
-    var i = state.palette_modal_hits.items.len;
-    while (i > 0) {
-        i -= 1;
-        const hit = state.palette_modal_hits.items[i];
-        if (hit.action != .herdr_profile_select) continue;
-        if (!rectContainsModalPoint(hit.rect, x, y)) continue;
-        new_hover = hit.index;
-        break;
-    }
-    if (new_hover) |hi| {
-        if (hi >= state.herdr_controller.summaries.items.len) new_hover = null;
-    }
-
-    if (state.herdr_controller.hover_index == new_hover) return;
-    state.herdr_controller.hover_index = new_hover;
-    state.markDirty();
-}
-
 fn rectContainsModalPoint(rect: palette.Rect, x: f32, y: f32) bool {
     return x >= rect.x and y >= rect.y and x <= rect.x + rect.w and y <= rect.y + rect.h;
 }
@@ -225,11 +201,14 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     renderWorkspaceAddModal(state, width, height);
     renderWorkspaceRenameModal(state, width, height);
     renderThreadImportModal(state, width, height);
-    renderHerdrProfilePickerModal(state, width, height);
     renderProviderOnboardingModal(state, width, height);
     renderMcpOnboardingModal(state, width, height);
     settings_modal.render(state, width, height);
+    renderWorkspaceSettingsModal(state, width, height);
+    renderRuntimeWizardModal(state, width, height);
     command_palette.render(state, width, height);
+    renderRuntimeCredentialModal(state, width, height);
+    renderRuntimeTrustModal(state, width, height);
     debug_window.render(state, width, height);
 }
 
@@ -531,6 +510,232 @@ fn drawActionButton(state: *runtime.AppState, rect: palette.Rect, label: []const
     }, label, paletteColor(theme.foregroundOn(fill)), font_size, rect);
 }
 
+// ---------------------------------------------------------------------------
+// Workspace Settings modal: bound to one workspace by id; first section is
+// "Default runtime for new chats" plus a route to global connection
+// management. Selection changes elsewhere never retarget the modal.
+// ---------------------------------------------------------------------------
+
+const WORKSPACE_SETTINGS_ROW_H_UI: f32 = 46.0;
+
+const WorkspaceSettingsLayout = struct {
+    modal: palette.Rect,
+    title_y: f32,
+    section_y: f32,
+    /// Clip rect of the scrollable option list.
+    list: palette.Rect,
+    row_h: f32,
+    explain_y: f32,
+    notice_y: f32,
+    manage_button: palette.Rect,
+    close_button: palette.Rect,
+    max_scroll_y: f32,
+};
+
+// Fixed vertical bands around a height-clamped option list so the modal fits
+// short laptop heights; only the list scrolls.
+fn workspaceSettingsLayout(state: *const runtime.AppState, width: f32, height: f32) WorkspaceSettingsLayout {
+    const pad = theme.scaledUi(20.0);
+    const gap = theme.scaledUi(10.0);
+    const title_h = theme.scaledUi(24.0);
+    const section_h = theme.scaledUi(20.0);
+    const explain_h = theme.scaledUi(17.0) * 3.0;
+    const notice_h = theme.scaledUi(18.0);
+    const button_h = theme.scaledUi(34.0);
+    const row_h = theme.scaledUi(WORKSPACE_SETTINGS_ROW_H_UI);
+    const modal_w = @min(theme.scaledUi(560.0), @max(width - theme.scaledUi(64.0), theme.scaledUi(320.0)));
+    const rows_h = row_h * @as(f32, @floatFromInt(state.workspaceSettingsOptionCount()));
+    const fixed_h = pad + title_h + gap + section_h + gap + gap + explain_h + gap + notice_h + gap + button_h + pad;
+    const max_modal_h = @max(height - theme.scaledUi(96.0), theme.scaledUi(300.0));
+    const list_h = theme.clampf(rows_h, row_h, @max(max_modal_h - fixed_h, row_h));
+    const modal_h = fixed_h + list_h;
+    const modal: palette.Rect = .{
+        .x = (width - modal_w) * 0.5,
+        .y = @max((height - modal_h) * 0.5, theme.scaledUi(24.0)),
+        .w = modal_w,
+        .h = modal_h,
+    };
+    const title_y = modal.y + pad;
+    const section_y = title_y + title_h + gap;
+    const list: palette.Rect = .{
+        .x = modal.x + pad,
+        .y = section_y + section_h + gap,
+        .w = modal.w - pad * 2.0,
+        .h = list_h,
+    };
+    const explain_y = list.y + list.h + gap;
+    const notice_y = explain_y + explain_h + gap;
+    const button_y = notice_y + notice_h + gap;
+    const close_w = theme.scaledUi(96.0);
+    const manage_w = theme.scaledUi(176.0);
+    const close_button: palette.Rect = .{ .x = modal.x + modal.w - pad - close_w, .y = button_y, .w = close_w, .h = button_h };
+    const manage_button: palette.Rect = .{ .x = close_button.x - theme.scaledUi(8.0) - manage_w, .y = button_y, .w = manage_w, .h = button_h };
+    return .{
+        .modal = modal,
+        .title_y = title_y,
+        .section_y = section_y,
+        .list = list,
+        .row_h = row_h,
+        .explain_y = explain_y,
+        .notice_y = notice_y,
+        .manage_button = manage_button,
+        .close_button = close_button,
+        .max_scroll_y = @max(rows_h - list_h, 0.0),
+    };
+}
+
+fn workspaceSettingsOptionRowRect(layout: WorkspaceSettingsLayout, index: usize, scroll_y: f32) palette.Rect {
+    return .{
+        .x = layout.list.x,
+        .y = layout.list.y + @as(f32, @floatFromInt(index)) * layout.row_h - scroll_y,
+        .w = layout.list.w,
+        .h = layout.row_h - theme.scaledUi(4.0),
+    };
+}
+
+fn rectIntersection(a: palette.Rect, b: palette.Rect) palette.Rect {
+    const x0 = @max(a.x, b.x);
+    const y0 = @max(a.y, b.y);
+    const x1 = @min(a.x + a.w, b.x + b.w);
+    const y1 = @min(a.y + a.h, b.y + b.h);
+    return .{ .x = x0, .y = y0, .w = @max(x1 - x0, 0.0), .h = @max(y1 - y0, 0.0) };
+}
+
+fn registerWorkspaceSettingsModalHits(state: *runtime.AppState, width: f32, height: f32) void {
+    if (!state.workspaceSettingsOpen()) return;
+    if (state.workspaceSettingsProject() == null) return;
+    const layout = workspaceSettingsLayout(state, width, height);
+    registerModalChromeHits(state, width, height, layout.modal, true);
+    const scroll_y = theme.clampf(state.workspace_settings_scroll_y, 0.0, layout.max_scroll_y);
+    const count = state.workspaceSettingsOptionCount();
+    var index: usize = 0;
+    while (index < count) : (index += 1) {
+        // Hits are clipped to the visible list band so scrolled-out rows
+        // cannot be clicked through the explainer text or buttons.
+        const clipped = rectIntersection(workspaceSettingsOptionRowRect(layout, index, scroll_y), layout.list);
+        if (clipped.h <= 0.0) continue;
+        queueModalHit(state, clipped, .workspace_settings_option, index);
+    }
+    queueModalHit(state, layout.manage_button, .workspace_settings_manage, 0);
+    queueModalHit(state, layout.close_button, .workspace_settings_close, 0);
+}
+
+/// Scrolls the workspace-settings option list while the pointer is over it.
+fn handleWorkspaceSettingsWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y: f32, wheel_y: f32) bool {
+    if (!state.workspaceSettingsOpen()) return false;
+    const layout = workspaceSettingsLayout(state, width, height);
+    if (!pointInRect(x, y, layout.modal)) return true; // swallow: modal owns the wheel
+    if (!pointInRect(x, y, layout.list)) return true;
+    state.workspace_settings_scroll_y = theme.clampf(
+        state.workspace_settings_scroll_y - wheel_y * theme.scaledUi(48.0),
+        0.0,
+        layout.max_scroll_y,
+    );
+    state.markDirty();
+    return true;
+}
+
+// Workspace Settings modal body: workspace-identifying title, single-choice
+// default-runtime list with the current default marked, scope explainer, and
+// Manage connections / Close actions.
+fn renderWorkspaceSettingsModal(state: *runtime.AppState, width: f32, height: f32) void {
+    if (!state.workspaceSettingsOpen()) return;
+    const project = state.workspaceSettingsProject() orelse {
+        // The bound workspace was closed/archived while the modal was open.
+        state.closeWorkspaceSettings();
+        return;
+    };
+    const layout = workspaceSettingsLayout(state, width, height);
+    drawModalChromeVisual(state, width, height, layout.modal);
+    const pad = theme.scaledUi(20.0);
+    const content_w = layout.modal.w - pad * 2.0;
+
+    var title_buffer: [192]u8 = undefined;
+    const title = std.fmt.bufPrint(&title_buffer, "Workspace settings — {s}", .{project.label}) catch "Workspace settings";
+    queuePaletteText(state, .{ .x = layout.modal.x + pad, .y = layout.title_y, .w = content_w, .h = theme.scaledUi(24.0) }, title, paletteColor(theme.COLOR_WHITE), theme.scaledUi(17.0), layout.modal);
+    queuePaletteText(state, .{ .x = layout.modal.x + pad, .y = layout.section_y, .w = content_w, .h = theme.scaledUi(20.0) }, "Default runtime for new chats", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.5), layout.modal);
+
+    state.workspace_settings_scroll_y = theme.clampf(state.workspace_settings_scroll_y, 0.0, layout.max_scroll_y);
+    const mouse_x = state.transcript_controller.palette_mouse_x;
+    const mouse_y = state.transcript_controller.palette_mouse_y;
+    const count = state.workspaceSettingsOptionCount();
+    var index: usize = 0;
+    while (index < count) : (index += 1) {
+        const option = state.workspaceSettingsOptionAt(index) orelse continue;
+        const row = workspaceSettingsOptionRowRect(layout, index, state.workspace_settings_scroll_y);
+        if (row.y + row.h < layout.list.y or row.y > layout.list.y + layout.list.h) continue;
+        const hovered = pointInRect(mouse_x, mouse_y, row) and pointInRect(mouse_x, mouse_y, layout.list);
+        if (option.is_current) {
+            queuePaletteRoundedRect(state, rectIntersection(row, layout.list), paletteColor(theme.withAlpha(theme.COLOR_GREEN, 30)), theme.scaledUi(8.0));
+        } else if (hovered) {
+            queuePaletteRoundedRect(state, rectIntersection(row, layout.list), paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 220)), theme.scaledUi(8.0));
+        }
+        // Radio affordance: outer ring always, inner dot only on the current
+        // default so single-choice semantics read at a glance.
+        const radio_size = theme.scaledUi(14.0);
+        const radio: palette.Rect = .{
+            .x = row.x + theme.scaledUi(12.0),
+            .y = row.y + (row.h - radio_size) * 0.5,
+            .w = radio_size,
+            .h = radio_size,
+        };
+        // The ring/dot cannot be partially clipped like the rects above (the
+        // border primitive has no clip rect), so draw them only when the
+        // radio sits fully inside the list band; a half row shows text and
+        // background alone rather than a ring bleeding into the explainer.
+        const radio_fully_visible = radio.y >= layout.list.y and
+            radio.y + radio.h <= layout.list.y + layout.list.h;
+        if (radio_fully_visible) {
+            queuePaletteBorder(state, radio, paletteColor(if (option.is_current) theme.COLOR_GREEN else theme.COLOR_TEXT_SUBTLE), radio_size * 0.5, theme.scaledUi(1.5));
+            if (option.is_current) {
+                const dot_inset = theme.scaledUi(4.0);
+                queuePaletteRoundedRect(state, .{
+                    .x = radio.x + dot_inset,
+                    .y = radio.y + dot_inset,
+                    .w = radio.w - dot_inset * 2.0,
+                    .h = radio.h - dot_inset * 2.0,
+                }, paletteColor(theme.COLOR_GREEN), (radio.w - dot_inset * 2.0) * 0.5);
+            }
+        }
+        const badge = if (option.status) |status| runtime.runtimePickerStatusBadge(status) else "Always available";
+        const badge_color = if (option.status) |status| runtime.runtimeStatusTone(status).color() else theme.COLOR_TEXT_MUTED;
+        const badge_w = theme.scaledUi(170.0);
+        const label_x = radio.x + radio_size + theme.scaledUi(10.0);
+        queuePaletteText(state, .{
+            .x = label_x,
+            .y = row.y + (row.h - theme.scaledUi(20.0)) * 0.5,
+            .w = @max(row.x + row.w - badge_w - theme.scaledUi(20.0) - label_x, theme.scaledUi(48.0)),
+            .h = theme.scaledUi(20.0),
+        }, option.label, paletteColor(if (option.is_current or hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(14.5), layout.list);
+        queuePaletteText(state, .{
+            .x = row.x + row.w - badge_w - theme.scaledUi(12.0),
+            .y = row.y + (row.h - theme.scaledUi(17.0)) * 0.5,
+            .w = badge_w,
+            .h = theme.scaledUi(17.0),
+        }, badge, paletteColor(badge_color), theme.scaledUi(12.0), layout.list);
+    }
+
+    const explain_lines: [3][]const u8 = .{
+        "Applies to new chats in this workspace only.",
+        "Chats that already started keep the runtime they were using.",
+        "Each chat can still pick its own runtime from the composer.",
+    };
+    for (explain_lines, 0..) |line, line_index| {
+        queuePaletteText(state, .{
+            .x = layout.modal.x + pad,
+            .y = layout.explain_y + @as(f32, @floatFromInt(line_index)) * theme.scaledUi(17.0),
+            .w = content_w,
+            .h = theme.scaledUi(17.0),
+        }, line, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), layout.modal);
+    }
+    const notice = state.workspaceSettingsNotice();
+    if (notice.len > 0) {
+        queuePaletteText(state, .{ .x = layout.modal.x + pad, .y = layout.notice_y, .w = content_w, .h = theme.scaledUi(18.0) }, notice, paletteColor(theme.COLOR_GREEN), theme.scaledUi(12.5), layout.modal);
+    }
+    drawActionButton(state, layout.manage_button, "Manage connections", theme.COLOR_PANEL_ALT);
+    drawActionButton(state, layout.close_button, "Close", theme.accent());
+}
+
 fn drawModalChromeVisual(state: *runtime.AppState, width: f32, height: f32, modal: palette.Rect) void {
     const scrim: palette.Rect = .{ .x = 0.0, .y = 0.0, .w = width, .h = height };
     queuePaletteRoundedRect(state, scrim, paletteColor(theme.scrim(0.68)), 0.0);
@@ -595,6 +800,22 @@ fn drawTextField(state: *runtime.AppState, rect: palette.Rect, value: []const u8
     }
 }
 
+// Renders the bearer field using only a same-length non-secret mask.
+fn drawRuntimeCredentialField(state: *runtime.AppState, rect: palette.Rect) void {
+    // The bearer itself never enters a Palette batch, frame arena,
+    // diagnostic, or other UI-owned allocation.
+    var masked: [4096]u8 = undefined;
+    const value = maskedRuntimeCredential(&masked, state.runtimeCredentialToken().len);
+    drawTextField(
+        state,
+        rect,
+        value,
+        "Bearer token",
+        state.palette_modal_text_focus == .runtime_credential,
+        state.runtime_credential_token_cursor,
+    );
+}
+
 const ModalSelectionRange = struct { start: usize, end: usize };
 
 fn modalSelectionRange(state: *runtime.AppState, value: []const u8) ?ModalSelectionRange {
@@ -612,13 +833,43 @@ fn focusedCursorReadOnly(state: *runtime.AppState) usize {
         .thread_import => state.thread_import_cursor,
         .project_import_name => state.project_import_name_cursor,
         .project_import => state.project_import_cursor,
+        .runtime_credential => state.runtime_credential_token_cursor,
+        .runtime_wizard_label => state.runtime_connections.label_cursor,
+        .runtime_wizard_host => state.runtime_connections.host_cursor,
+        .runtime_wizard_user => state.runtime_connections.user_cursor,
+        .runtime_wizard_ssh_port => state.runtime_connections.ssh_port_cursor,
+        .runtime_wizard_gateway_port => state.runtime_connections.gateway_port_cursor,
+        .runtime_wizard_grant_id => state.runtime_connections.grant_id_cursor,
+        .runtime_wizard_pairing_code => state.runtime_connections.pairing_code_cursor,
+        .runtime_wizard_device_label => state.runtime_connections.device_label_cursor,
+        .runtime_wizard_control_plane_url => state.runtime_connections.control_plane_url_cursor,
         .command_palette => state.command_controller.cursor,
         .none => 0,
     };
 }
 
+/// Fields whose bytes are secrets: rendered masked, zeroed on delete, and
+/// never handed to the frame arena.
+fn isSecretModalFocus(state: *const runtime.AppState, focus: runtime.PaletteModalTextFocus) bool {
+    return focus == .runtime_credential or focus == .runtime_wizard_pairing_code or
+        (focus == .runtime_wizard_control_plane_url and
+            state.runtime_connections.wizard_method == .pair and
+            state.runtime_connections.wizard_mode == .add);
+}
+
 fn clearModalSelection(state: *runtime.AppState) void {
     state.modal_text_selection_anchor = null;
+}
+
+fn blurModalTextInput(state: *runtime.AppState) void {
+    state.palette_modal_text_focus = .none;
+    state.modal_text_selection_anchor = null;
+    state.modal_text_drag_active = false;
+}
+
+/// Clears modal caret-selection gestures when the native window loses focus.
+pub fn blurPaletteModalTextInput(state: *runtime.AppState) void {
+    blurModalTextInput(state);
 }
 
 fn modalOffsetForClickX(value: []const u8, font_size: f32, rel: f32) usize {
@@ -637,6 +888,25 @@ fn modalOffsetForClickX(value: []const u8, font_size: f32, rel: f32) usize {
         i = next;
     }
     return value.len;
+}
+
+fn maskedRuntimeCredential(buffer: *[4096]u8, len: usize) []const u8 {
+    const masked_len = @min(len, buffer.len);
+    @memset(buffer[0..masked_len], '*');
+    return buffer[0..masked_len];
+}
+
+fn focusedMetricOffsetForClickX(
+    state: *runtime.AppState,
+    value: []const u8,
+    font_size: f32,
+    rel: f32,
+) usize {
+    if (!isSecretModalFocus(state, state.palette_modal_text_focus)) {
+        return modalOffsetForClickX(value, font_size, rel);
+    }
+    var masked: [4096]u8 = undefined;
+    return modalOffsetForClickX(maskedRuntimeCredential(&masked, value.len), font_size, rel);
 }
 
 fn isModalWordChar(b: u8) bool {
@@ -659,6 +929,16 @@ fn focusedValue(state: *runtime.AppState) []const u8 {
         .thread_import => state.threadImportThreadId(),
         .project_import_name => state.importProjectNameDraft(),
         .project_import => state.importDirectoryDraft(),
+        .runtime_credential => state.runtimeCredentialToken(),
+        .runtime_wizard_label => state.runtime_connections.fieldValue(.label),
+        .runtime_wizard_host => state.runtime_connections.fieldValue(.host),
+        .runtime_wizard_user => state.runtime_connections.fieldValue(.user),
+        .runtime_wizard_ssh_port => state.runtime_connections.fieldValue(.ssh_port),
+        .runtime_wizard_gateway_port => state.runtime_connections.fieldValue(.gateway_port),
+        .runtime_wizard_grant_id => state.runtime_connections.fieldValue(.grant_id),
+        .runtime_wizard_pairing_code => state.runtime_connections.fieldValue(.pairing_code),
+        .runtime_wizard_device_label => state.runtime_connections.fieldValue(.device_label),
+        .runtime_wizard_control_plane_url => state.runtime_connections.fieldValue(.control_plane_url),
         .command_palette => state.commandPaletteQuery(),
         .none => &[_]u8{},
     };
@@ -675,7 +955,11 @@ fn deleteModalSelection(state: *runtime.AppState) bool {
     const current_len = std.mem.sliceTo(buf, 0).len;
     const removed = sel.end - sel.start;
     std.mem.copyForwards(u8, buf[sel.start .. current_len - removed], buf[sel.end..current_len]);
-    buf[current_len - removed] = 0;
+    if (isSecretModalFocus(state, state.palette_modal_text_focus)) {
+        std.crypto.secureZero(u8, buf[current_len - removed .. current_len]);
+    } else {
+        buf[current_len - removed] = 0;
+    }
     cursor.* = sel.start;
     clearModalSelection(state);
     return true;
@@ -687,16 +971,32 @@ fn copyModalSelection(state: *runtime.AppState) void {
     const slice = value[sel.start..sel.end];
     if (slice.len == 0) return;
     const z = state.allocator.dupeZ(u8, slice) catch return;
-    defer state.allocator.free(z);
+    defer {
+        if (isSecretModalFocus(state, state.palette_modal_text_focus)) {
+            std.crypto.secureZero(u8, z);
+        }
+        state.allocator.free(z);
+    }
     sdl.setClipboardText(z) catch |err| {
         runtime.log.warn("failed to copy modal selection: {s}", .{@errorName(err)});
     };
 }
 
 fn pasteIntoModal(state: *runtime.AppState) bool {
+    if (state.palette_modal_text_focus == .runtime_credential) {
+        return pasteIntoRuntimeCredential(state);
+    }
     const text = state.readClipboardTextForPaste() orelse return false;
-    defer state.allocator.free(text);
+    const secret = isSecretModalFocus(state, state.palette_modal_text_focus);
+    defer {
+        if (secret) std.crypto.secureZero(u8, text);
+        state.allocator.free(text);
+    }
     if (text.len == 0) return false;
+    // Wizard fields apply their own per-field filters (hex, digits, URL).
+    if (runtime_connections.focusedWizardField(state.palette_modal_text_focus) != null) {
+        return handlePaletteTextInput(state, text);
+    }
     _ = deleteModalSelection(state);
     // Modal inputs are single-line; strip control chars from pasted text.
     var sanitized: [4096]u8 = undefined;
@@ -712,6 +1012,50 @@ fn pasteIntoModal(state: *runtime.AppState) bool {
     const cursor = focusedCursor(state) orelse return false;
     _ = insertIntoZBuffer(buf, cursor, sanitized[0..n]);
     return true;
+}
+
+fn readRuntimeCredentialClipboard(state: *runtime.AppState) ?[]u8 {
+    const clipboard_text = sdl.getClipboardText() catch |err| {
+        runtime.log.warn("failed to read runtime credential clipboard text: {s}", .{@errorName(err)});
+        return null;
+    };
+    const text = std.mem.span(clipboard_text);
+    defer {
+        std.crypto.secureZero(u8, @constCast(text));
+        sdl.free(@ptrCast(clipboard_text));
+    }
+    const max_raw_bytes = state.runtimeCredentialTokenBuffer().len - 1;
+    return state.allocator.dupe(u8, text[0..@min(text.len, max_raw_bytes)]) catch null;
+}
+
+fn insertRuntimeCredentialText(state: *runtime.AppState, text: []const u8) bool {
+    var sanitized: [4096]u8 = undefined;
+    defer std.crypto.secureZero(u8, &sanitized);
+    var len: usize = 0;
+    for (text) |byte| {
+        // Runtime bearer tokens are printable ASCII without spaces. Filtering
+        // here keeps byte-wise caret and selection boundaries well-defined.
+        if (byte < 0x21 or byte > 0x7e) continue;
+        if (len >= sanitized.len) break;
+        sanitized[len] = byte;
+        len += 1;
+    }
+    if (len == 0) return true;
+    _ = deleteModalSelection(state);
+    return insertIntoZBuffer(
+        state.runtimeCredentialTokenBuffer(),
+        &state.runtime_credential_token_cursor,
+        sanitized[0..len],
+    );
+}
+
+fn pasteIntoRuntimeCredential(state: *runtime.AppState) bool {
+    const text = readRuntimeCredentialClipboard(state) orelse return false;
+    defer {
+        std.crypto.secureZero(u8, text);
+        state.allocator.free(text);
+    }
+    return insertRuntimeCredentialText(state, text);
 }
 
 fn moveModalCursorWithShift(state: *runtime.AppState, target: usize, shift: bool) bool {
@@ -765,10 +1109,6 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .thread_import_cancel => state.cancelThreadImport(),
             .thread_import_submit => state.importSelectedThread(),
             .thread_import_select => state.selectThreadImport(hit.index),
-            .herdr_profile_refresh => state.refreshHerdrProfileList(),
-            .herdr_profile_cancel => state.cancelHerdrProfilePicker(),
-            .herdr_profile_submit => state.handoffProjectToSelectedHerdrProfile(),
-            .herdr_profile_select => state.selectHerdrProfile(hit.index),
             .handoff_cancel => state.cancelHandoff(),
             .handoff_prepare => state.prepareHandoffTarget(),
             .handoff_surface_gui => state.setHandoffTargetSurface(.gui_chat),
@@ -800,6 +1140,20 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
                 };
             },
             .project_import_cancel => state.cancelProjectImport(),
+            .runtime_credential_cancel => state.cancelRuntimeCredentialModal(),
+            .runtime_credential_submit => state.submitRuntimeCredential(),
+            .runtime_credential_input => focusModalInput(state, .runtime_credential, hit.rect, x, clicks),
+            .runtime_trust_cancel => state.cancelRuntimeTrust(),
+            .runtime_trust_confirm => state.confirmRuntimeTrust(),
+            .runtime_wizard_cancel => state.cancelRuntimeConnectionWizard(),
+            .runtime_wizard_back => state.runtimeConnectionWizardBack(),
+            .runtime_wizard_submit => state.submitRuntimeConnectionWizard(),
+            .runtime_wizard_connect => state.runtimeConnectionWizardConnect(),
+            .runtime_wizard_done => state.cancelRuntimeConnectionWizard(),
+            .runtime_wizard_method => state.chooseRuntimeWizardMethod(@enumFromInt(@min(hit.index, @typeInfo(runtime_connections.WizardMethod).@"enum".fields.len - 1))),
+            .runtime_wizard_select => state.selectRuntimeWizardConnectRuntime(hit.index),
+            .runtime_wizard_input => focusModalInput(state, runtimeWizardFocusForIndex(hit.index), hit.rect, x, clicks),
+            .settings_runtime_action => state.applyRuntimeRowAction(hit.index),
             .settings_cancel => state.cancelSettingsModal(),
             .settings_close => state.cancelSettingsModal(),
             .settings_save => {
@@ -810,6 +1164,9 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
                     state.setSidebarNotice("Could not save settings to verde.json.");
                 }
             },
+            .workspace_settings_close => state.closeWorkspaceSettings(),
+            .workspace_settings_option => state.applyWorkspaceSettingsOption(hit.index),
+            .workspace_settings_manage => state.openManageConnectionsFromWorkspaceSettings(),
             .settings_control => settings_modal.applyControlAt(state, hit.index, hit.rect, x),
             .settings_theme_option => settings_modal.applyThemeOption(state, hit.index),
             .settings_title_provider_option => settings_modal.applyChatTitleProviderOption(state, hit.index),
@@ -819,7 +1176,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .settings_new_chat_reasoning_option => settings_modal.applyNewChatReasoningOption(state, hit.index),
             .modal_dismiss => dismissTopModal(state),
             .modal_block => {
-                state.palette_modal_text_focus = .none;
+                blurModalTextInput(state);
                 if (state.settings_controller.theme_dropdown_open) {
                     state.settings_controller.theme_dropdown_open = false;
                     state.settings_controller.theme_hover_index = null;
@@ -869,7 +1226,7 @@ fn focusModalInput(state: *runtime.AppState, focus: runtime.PaletteModalTextFocu
     const font_size = theme.scaledUi(14.0);
     const text_x = rect.x + theme.scaledUi(10.0);
     const rel = @max(x - text_x, 0.0);
-    const offset = modalOffsetForClickX(value, font_size, rel);
+    const offset = focusedMetricOffsetForClickX(state, value, font_size, rel);
     const cursor = focusedCursor(state) orelse return;
     if (clicks >= 3) {
         state.modal_text_selection_anchor = 0;
@@ -897,7 +1254,7 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) bool {
         if (rect.w > 0.0) {
             const text_x = rect.x + theme.scaledUi(10.0);
             const rel = @max(x - text_x, 0.0);
-            const offset = modalOffsetForClickX(value, state.modal_text_input_font_size, rel);
+            const offset = focusedMetricOffsetForClickX(state, value, state.modal_text_input_font_size, rel);
             if (focusedCursor(state)) |cursor| cursor.* = offset;
         }
     }
@@ -910,13 +1267,70 @@ pub fn hasPaletteModal(state: *const runtime.AppState) bool {
 }
 
 pub fn handlePaletteTextInput(state: *runtime.AppState, text: []const u8) bool {
-    if (state.palette_modal_text_focus == .none) return false;
+    if (state.palette_modal_text_focus == .none) {
+        // The trust modal intentionally has no editable field, and clicking
+        // credential-modal chrome blurs its field. Both still own text input:
+        // an SDL text_input paired with an already-consumed key-down must not
+        // fall through into the obscured composer, browser, or terminal.
+        // Workspace Settings has no editable field but likewise owns text
+        // input while open.
+        return state.runtimeCredentialModalOpen() or
+            state.runtimeTrustProposal() != null or
+            state.workspaceSettingsOpen();
+    }
+    if (state.palette_modal_text_focus == .runtime_credential) {
+        return insertRuntimeCredentialText(state, text);
+    }
     _ = deleteModalSelection(state);
     return switch (state.palette_modal_text_focus) {
         .project_rename => insertIntoZBuffer(state.renameBuffer(), &state.project_rename_cursor, text),
         .thread_import => insertIntoZBuffer(state.threadImportThreadIdBuffer(), &state.thread_import_cursor, text),
         .project_import_name => insertIntoZBuffer(state.importProjectNameBuffer(), &state.project_import_name_cursor, text),
         .project_import => insertIntoZBuffer(state.importPathBuffer(), &state.project_import_cursor, text),
+        .runtime_credential => unreachable,
+        .runtime_wizard_label, .runtime_wizard_host, .runtime_wizard_user, .runtime_wizard_device_label, .runtime_wizard_control_plane_url => blk: {
+            // Single-line fields: strip control characters so a pasted
+            // "host\n" cannot smuggle a line break into a profile.
+            var sanitized: [runtime_connections.URL_CAPACITY]u8 = undefined;
+            var len: usize = 0;
+            for (text) |byte| {
+                if (byte < 0x20 or byte == 0x7f) continue;
+                if (len >= sanitized.len) break;
+                sanitized[len] = byte;
+                len += 1;
+            }
+            const field: runtime_connections.WizardField = switch (state.palette_modal_text_focus) {
+                .runtime_wizard_label => .label,
+                .runtime_wizard_host => .host,
+                .runtime_wizard_device_label => .device_label,
+                .runtime_wizard_control_plane_url => .control_plane_url,
+                else => .user,
+            };
+            break :blk insertIntoZBuffer(state.runtime_connections.fieldBuffer(field), state.runtime_connections.fieldCursor(field), sanitized[0..len]);
+        },
+        .runtime_wizard_grant_id, .runtime_wizard_pairing_code => blk: {
+            // Both values are canonical lowercase hex; fold case and drop
+            // everything else so a copied "Grant: AB12…" pastes cleanly. The
+            // scratch copy is zeroed because it may hold the pairing code.
+            var hex: [runtime_connections.PAIRING_CODE_CAPACITY]u8 = undefined;
+            defer std.crypto.secureZero(u8, &hex);
+            var len: usize = 0;
+            for (text) |byte| {
+                const lower = std.ascii.toLower(byte);
+                if (!std.ascii.isHex(lower)) continue;
+                if (len >= hex.len) break;
+                hex[len] = lower;
+                len += 1;
+            }
+            const field: runtime_connections.WizardField = if (state.palette_modal_text_focus == .runtime_wizard_grant_id) .grant_id else .pairing_code;
+            break :blk insertIntoZBuffer(state.runtime_connections.fieldBuffer(field), state.runtime_connections.fieldCursor(field), hex[0..len]);
+        },
+        .runtime_wizard_ssh_port, .runtime_wizard_gateway_port => blk: {
+            var digits: [runtime_connections.PORT_CAPACITY]u8 = undefined;
+            const filtered = runtime_connections.filterPortText(text, &digits);
+            const field: runtime_connections.WizardField = if (state.palette_modal_text_focus == .runtime_wizard_ssh_port) .ssh_port else .gateway_port;
+            break :blk insertIntoZBuffer(state.runtime_connections.fieldBuffer(field), state.runtime_connections.fieldCursor(field), filtered);
+        },
         .command_palette => blk: {
             const inserted = insertIntoZBuffer(state.commandPaletteQueryBuffer(), &state.command_controller.cursor, text);
             state.markDirty();
@@ -927,22 +1341,65 @@ pub fn handlePaletteTextInput(state: *runtime.AppState, text: []const u8) bool {
 }
 
 pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent) bool {
-    const has_modal_open = state.modal_image_path != null or
+    const has_modal_open = state.runtimeCredentialModalOpen() or
+        state.runtimeTrustProposal() != null or
+        state.modal_image_path != null or
         state.settings_controller.mcp_onboarding_visible or
         state.settings_controller.provider_onboarding_visible or
         state.rename_project_index != null or
         state.transcriptSelectionBuffer() != null or
         state.thread_import_provider != null or
-        state.herdr_controller.picker_project_index != null or
         state.handoff_controller.modal_open or
         state.project_controller.show_creator or
         state.settings_controller.modal_visible or
+        state.workspaceSettingsOpen() or
+        state.runtime_connections.wizard_open or
         state.command_controller.open;
     if (!has_modal_open) return false;
+    if (runtimeWizardOwnsKeys(state)) {
+        switch (event.key) {
+            .tab => {
+                state.cycleRuntimeWizardField((keymodBits(event.mod) & sdl.Keymod.shift) != 0);
+                state.markDirty();
+                return true;
+            },
+            .@"return", .kp_enter => {
+                switch (state.runtime_connections.wizard_step) {
+                    .form, .pair_grant, .connect_setup => state.submitRuntimeConnectionWizard(),
+                    // Enter obeys the same gate as the drawn middle button:
+                    // with no recovery action it activates the visible Done
+                    // control and never a hidden connect/pair path.
+                    .testing => if (wizardTestingActionable(state))
+                        state.runtimeConnectionWizardConnect()
+                    else
+                        state.cancelRuntimeConnectionWizard(),
+                    // Identity confirmation and method choice need a click:
+                    // a stray Enter must not adopt a runtime identity.
+                    .method, .pair_confirm => {},
+                }
+                return true;
+            },
+            else => {},
+        }
+    }
     // Palette-owned navigation/activation keys; editing keys fall through to
     // the shared modal text path below.
     if (state.command_controller.open and command_palette.handleKeyDown(state, event)) return true;
     if (state.settings_controller.modal_visible and settings_modal.handleKeyDown(state, event.key)) return true;
+    // Workspace Settings keyboard ownership: it has no editable field, so
+    // with no higher-priority modal above it Escape closes through the shared
+    // dismiss path and every other key is consumed — Enter, Backspace, and
+    // shortcuts must not fall through to the obscured composer, browser, or
+    // terminal, and rows stay mouse-activated only.
+    if (state.workspaceSettingsOpen() and
+        !state.runtimeCredentialModalOpen() and
+        state.runtimeTrustProposal() == null and
+        !state.runtime_connections.wizard_open and
+        !state.command_controller.open)
+    {
+        if (event.key == .escape) dismissTopModal(state);
+        return true;
+    }
     const primary = (keymodBits(event.mod) & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0;
     const shift = (keymodBits(event.mod) & sdl.Keymod.shift) != 0;
     switch (event.key) {
@@ -951,6 +1408,16 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
             return true;
         },
         .@"return", .kp_enter => {
+            if (state.runtimeCredentialModalOpen()) {
+                state.submitRuntimeCredential();
+                return true;
+            }
+            if (state.runtimeTrustProposal() != null) {
+                // Trust appears asynchronously after a handshake. Do not let
+                // an Enter intended for the obscured composer approve a new
+                // identity; confirmation requires the explicit modal button.
+                return true;
+            }
             if (state.settings_controller.provider_onboarding_visible) {
                 state.recheckProviderReadiness();
                 return true;
@@ -972,10 +1439,6 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
                     runtime.log.warn("workspace import failed: {s}", .{@errorName(err)});
                     state.setSidebarNotice("Could not add that directory path.");
                 };
-                return true;
-            }
-            if (state.herdr_controller.picker_project_index != null) {
-                state.handoffProjectToSelectedHerdrProfile();
                 return true;
             }
             if (state.handoff_controller.modal_open) {
@@ -1056,6 +1519,18 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
 }
 
 fn dismissTopModal(state: *runtime.AppState) void {
+    if (state.runtimeCredentialModalOpen()) {
+        state.cancelRuntimeCredentialModal();
+        return;
+    }
+    if (state.runtimeTrustProposal() != null) {
+        state.cancelRuntimeTrust();
+        return;
+    }
+    if (state.runtime_connections.wizard_open) {
+        state.cancelRuntimeConnectionWizard();
+        return;
+    }
     if (state.command_controller.open) {
         state.closeCommandPalette();
         return;
@@ -1074,14 +1549,14 @@ fn dismissTopModal(state: *runtime.AppState) void {
         state.cancelProjectRename();
     } else if (state.thread_import_provider != null) {
         state.cancelThreadImport();
-    } else if (state.herdr_controller.picker_project_index != null) {
-        state.cancelHerdrProfilePicker();
     } else if (state.handoff_controller.modal_open) {
         state.cancelHandoff();
+    } else if (state.workspaceSettingsOpen()) {
+        state.closeWorkspaceSettings();
     } else if (state.settings_controller.modal_visible) {
         state.cancelSettingsModal();
     }
-    state.palette_modal_text_focus = .none;
+    blurModalTextInput(state);
 }
 
 fn keymodBits(modifier_state: sdl.Keymod) u16 {
@@ -1124,12 +1599,20 @@ fn deleteModalText(state: *runtime.AppState, backwards: bool) bool {
         if (cursor.* == 0 or len == 0) return true;
         const at = cursor.* - 1;
         std.mem.copyForwards(u8, buf[at .. len - 1], buf[at + 1 .. len]);
-        buf[len - 1] = 0;
+        if (isSecretModalFocus(state, state.palette_modal_text_focus)) {
+            std.crypto.secureZero(u8, buf[len - 1 .. len]);
+        } else {
+            buf[len - 1] = 0;
+        }
         cursor.* = at;
     } else {
         if (cursor.* >= len) return true;
         std.mem.copyForwards(u8, buf[cursor.* .. len - 1], buf[cursor.* + 1 .. len]);
-        buf[len - 1] = 0;
+        if (isSecretModalFocus(state, state.palette_modal_text_focus)) {
+            std.crypto.secureZero(u8, buf[len - 1 .. len]);
+        } else {
+            buf[len - 1] = 0;
+        }
     }
     return true;
 }
@@ -1140,6 +1623,16 @@ fn focusedCursor(state: *runtime.AppState) ?*usize {
         .thread_import => &state.thread_import_cursor,
         .project_import_name => &state.project_import_name_cursor,
         .project_import => &state.project_import_cursor,
+        .runtime_credential => &state.runtime_credential_token_cursor,
+        .runtime_wizard_label => &state.runtime_connections.label_cursor,
+        .runtime_wizard_host => &state.runtime_connections.host_cursor,
+        .runtime_wizard_user => &state.runtime_connections.user_cursor,
+        .runtime_wizard_ssh_port => &state.runtime_connections.ssh_port_cursor,
+        .runtime_wizard_gateway_port => &state.runtime_connections.gateway_port_cursor,
+        .runtime_wizard_grant_id => &state.runtime_connections.grant_id_cursor,
+        .runtime_wizard_pairing_code => &state.runtime_connections.pairing_code_cursor,
+        .runtime_wizard_device_label => &state.runtime_connections.device_label_cursor,
+        .runtime_wizard_control_plane_url => &state.runtime_connections.control_plane_url_cursor,
         .command_palette => &state.command_controller.cursor,
         .none => null,
     };
@@ -1151,6 +1644,16 @@ fn focusedBuffer(state: *runtime.AppState) ?[:0]u8 {
         .thread_import => state.threadImportThreadIdBuffer(),
         .project_import_name => state.importProjectNameBuffer(),
         .project_import => state.importPathBuffer(),
+        .runtime_credential => state.runtimeCredentialTokenBuffer(),
+        .runtime_wizard_label => state.runtime_connections.fieldBuffer(.label),
+        .runtime_wizard_host => state.runtime_connections.fieldBuffer(.host),
+        .runtime_wizard_user => state.runtime_connections.fieldBuffer(.user),
+        .runtime_wizard_ssh_port => state.runtime_connections.fieldBuffer(.ssh_port),
+        .runtime_wizard_gateway_port => state.runtime_connections.fieldBuffer(.gateway_port),
+        .runtime_wizard_grant_id => state.runtime_connections.fieldBuffer(.grant_id),
+        .runtime_wizard_pairing_code => state.runtime_connections.fieldBuffer(.pairing_code),
+        .runtime_wizard_device_label => state.runtime_connections.fieldBuffer(.device_label),
+        .runtime_wizard_control_plane_url => state.runtime_connections.fieldBuffer(.control_plane_url),
         .command_palette => state.commandPaletteQueryBuffer(),
         .none => null,
     };
@@ -1162,9 +1665,571 @@ fn focusedTextLen(state: *runtime.AppState) usize {
         .thread_import => state.threadImportThreadId().len,
         .project_import_name => state.importProjectNameDraft().len,
         .project_import => state.importDirectoryDraft().len,
+        .runtime_credential => state.runtimeCredentialToken().len,
+        .runtime_wizard_label => state.runtime_connections.fieldValue(.label).len,
+        .runtime_wizard_host => state.runtime_connections.fieldValue(.host).len,
+        .runtime_wizard_user => state.runtime_connections.fieldValue(.user).len,
+        .runtime_wizard_ssh_port => state.runtime_connections.fieldValue(.ssh_port).len,
+        .runtime_wizard_gateway_port => state.runtime_connections.fieldValue(.gateway_port).len,
+        .runtime_wizard_grant_id => state.runtime_connections.fieldValue(.grant_id).len,
+        .runtime_wizard_pairing_code => state.runtime_connections.fieldValue(.pairing_code).len,
+        .runtime_wizard_device_label => state.runtime_connections.fieldValue(.device_label).len,
+        .runtime_wizard_control_plane_url => state.runtime_connections.fieldValue(.control_plane_url).len,
         .command_palette => state.commandPaletteQuery().len,
         .none => 0,
     };
+}
+
+// ---------------------------------------------------------------------------
+// Runtime connection wizard (SSH) — layered above the settings modal
+// ---------------------------------------------------------------------------
+
+const WizardField = runtime_connections.WizardField;
+
+fn runtimeWizardFocusForIndex(index: usize) runtime.PaletteModalTextFocus {
+    const field: WizardField = @enumFromInt(@min(index, @typeInfo(WizardField).@"enum".fields.len - 1));
+    return switch (field) {
+        .label => .runtime_wizard_label,
+        .host => .runtime_wizard_host,
+        .user => .runtime_wizard_user,
+        .ssh_port => .runtime_wizard_ssh_port,
+        .gateway_port => .runtime_wizard_gateway_port,
+        .grant_id => .runtime_wizard_grant_id,
+        .pairing_code => .runtime_wizard_pairing_code,
+        .device_label => .runtime_wizard_device_label,
+        .control_plane_url => .runtime_wizard_control_plane_url,
+    };
+}
+
+/// Credential and trust modals stack above the wizard and keep their keys.
+fn runtimeWizardOwnsKeys(state: *const runtime.AppState) bool {
+    return state.runtime_connections.wizard_open and
+        !state.runtimeCredentialModalOpen() and
+        state.runtimeTrustProposal() == null and
+        !state.command_controller.open;
+}
+
+/// Method cards on the chooser step.
+const WIZARD_METHOD_COUNT: usize = @typeInfo(runtime_connections.WizardMethod).@"enum".fields.len;
+/// Inventory rows shown on the Connect step before the list is clipped;
+/// a count of hidden rows is rendered instead of a scroll surface.
+const WIZARD_INVENTORY_VISIBLE_ROWS: usize = 5;
+
+const WizardLayout = struct {
+    modal: palette.Rect,
+    pad: f32,
+    content_w: f32,
+    /// Indexed by `WizardField` ordinal; only the current step's fields are
+    /// positioned meaningfully.
+    fields: [@typeInfo(WizardField).@"enum".fields.len]palette.Rect,
+    methods: [WIZARD_METHOD_COUNT]palette.Rect,
+    inventory: [WIZARD_INVENTORY_VISIBLE_ROWS]palette.Rect,
+    inventory_y: f32,
+    /// Identity boxes on the pairing confirmation step.
+    identity: [2]palette.Rect,
+    notice_y: f32,
+    buttons: [3]palette.Rect,
+    status_y: f32,
+};
+
+fn runtimeWizardLayout(state: *const runtime.AppState, width: f32, height: f32) WizardLayout {
+    const pad = theme.scaledUi(20.0);
+    const modal_w = @min(theme.clampf(width * 0.44, theme.scaledUi(460.0), theme.scaledUi(640.0)), @max(width - pad * 2.0, theme.scaledUi(320.0)));
+    const label_h = theme.scaledUi(18.0);
+    const input_h = theme.scaledUi(36.0);
+    const gap = theme.scaledUi(8.0);
+    const row_gap = theme.scaledUi(12.0);
+    const button_h = theme.scaledUi(36.0);
+    const heading_h = theme.scaledUi(24.0);
+    const sub_h = theme.scaledUi(20.0);
+    // 56px cards give the title plus a one-line description room to breathe.
+    const method_card_h = theme.scaledUi(56.0);
+    const inventory_row_h = theme.scaledUi(44.0);
+    const identity_box_h = theme.scaledUi(38.0);
+    const rc = &state.runtime_connections;
+    const step = rc.wizard_step;
+    const field_row_h = label_h + input_h + row_gap;
+    const status_block_h = theme.scaledUi(60.0);
+    const inventory_rows = @min(rc.connect_runtimes.items.len, WIZARD_INVENTORY_VISIBLE_ROWS);
+    const body_h: f32 = switch (step) {
+        .method => @as(f32, @floatFromInt(WIZARD_METHOD_COUNT)) * (method_card_h + row_gap),
+        .form => if (rc.wizard_method == .pair) 2.0 * field_row_h else 4.0 * field_row_h,
+        .pair_grant => 3.0 * field_row_h,
+        .pair_confirm => 2.0 * (label_h + identity_box_h + row_gap),
+        .connect_setup => 2.0 * field_row_h + status_block_h + @as(f32, @floatFromInt(inventory_rows)) * (inventory_row_h + gap) + (if (rc.connect_runtimes_truncated > 0) sub_h else 0.0),
+        .testing => status_block_h,
+    };
+    const modal_h = @min(pad + heading_h + gap + sub_h + row_gap + body_h + sub_h + row_gap + button_h + pad, height - pad * 2.0);
+    const modal: palette.Rect = .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
+    const content_w = modal.w - pad * 2.0;
+    var layout: WizardLayout = undefined;
+    layout.modal = modal;
+    layout.pad = pad;
+    layout.content_w = content_w;
+    var y = modal.y + pad + heading_h + gap + sub_h + row_gap;
+    layout.status_y = y;
+    const x = modal.x + pad;
+    for (&layout.fields) |*rect| rect.* = .{ .x = x, .y = y, .w = content_w, .h = input_h };
+    for (&layout.methods, 0..) |*rect, index| {
+        rect.* = .{ .x = x, .y = y + @as(f32, @floatFromInt(index)) * (method_card_h + row_gap), .w = content_w, .h = method_card_h };
+    }
+    switch (step) {
+        .form => {
+            if (rc.wizard_method == .pair) {
+                for ([_]WizardField{ .label, .control_plane_url }) |field| {
+                    layout.fields[@intFromEnum(field)] = .{ .x = x, .y = y + label_h, .w = content_w, .h = input_h };
+                    y += field_row_h;
+                }
+            } else {
+                for ([_]WizardField{ .label, .host, .user }) |field| {
+                    layout.fields[@intFromEnum(field)] = .{ .x = x, .y = y + label_h, .w = content_w, .h = input_h };
+                    y += field_row_h;
+                }
+                const half_w = (content_w - theme.scaledUi(10.0)) * 0.5;
+                layout.fields[@intFromEnum(WizardField.ssh_port)] = .{ .x = x, .y = y + label_h, .w = half_w, .h = input_h };
+                layout.fields[@intFromEnum(WizardField.gateway_port)] = .{ .x = x + half_w + theme.scaledUi(10.0), .y = y + label_h, .w = half_w, .h = input_h };
+                y += field_row_h;
+            }
+        },
+        .pair_grant => {
+            const fields = [_]WizardField{ .grant_id, .pairing_code, .device_label };
+            for (fields) |field| {
+                layout.fields[@intFromEnum(field)] = .{ .x = x, .y = y + label_h, .w = content_w, .h = input_h };
+                y += field_row_h;
+            }
+        },
+        .pair_confirm => {
+            for (&layout.identity) |*rect| {
+                rect.* = .{ .x = x, .y = y + label_h, .w = content_w, .h = identity_box_h };
+                y += label_h + identity_box_h + row_gap;
+            }
+        },
+        .connect_setup => {
+            const fields = [_]WizardField{ .label, .control_plane_url };
+            for (fields) |field| {
+                layout.fields[@intFromEnum(field)] = .{ .x = x, .y = y + label_h, .w = content_w, .h = input_h };
+                y += field_row_h;
+            }
+            layout.status_y = y;
+            y += status_block_h;
+            layout.inventory_y = y;
+            for (&layout.inventory) |*rect| {
+                rect.* = .{ .x = x, .y = y, .w = content_w, .h = inventory_row_h };
+                y += inventory_row_h + gap;
+            }
+            if (rc.connect_runtimes_truncated > 0) y += sub_h;
+        },
+        .method => y += body_h,
+        .testing => y += status_block_h,
+    }
+    layout.notice_y = y;
+    const button_y = modal.y + modal.h - pad - button_h;
+    const button_gap = theme.scaledUi(10.0);
+    const button_w = (content_w - button_gap * 2.0) / 3.0;
+    for (0..3) |index| {
+        layout.buttons[index] = .{ .x = x + @as(f32, @floatFromInt(index)) * (button_w + button_gap), .y = button_y, .w = button_w, .h = button_h };
+    }
+    return layout;
+}
+
+fn registerRuntimeWizardModalHits(state: *runtime.AppState, width: f32, height: f32) void {
+    const rc = &state.runtime_connections;
+    if (!rc.wizard_open) return;
+    const layout = runtimeWizardLayout(state, width, height);
+    // Not dismissible from the scrim: a stray click must not lose the draft.
+    registerModalChromeHits(state, width, height, layout.modal, false);
+    for (rc.visibleFields()) |field| {
+        queueModalHit(state, layout.fields[@intFromEnum(field)], .runtime_wizard_input, @intFromEnum(field));
+    }
+    switch (rc.wizard_step) {
+        .method => {
+            for (layout.methods, 0..) |rect, index| queueModalHit(state, rect, .runtime_wizard_method, index);
+            queueModalHit(state, layout.buttons[0], .runtime_wizard_cancel, 0);
+        },
+        .form => {
+            queueModalHit(state, layout.buttons[0], .runtime_wizard_cancel, 0);
+            if (rc.wizard_mode == .add and rc.wizard_profile_id == null) queueModalHit(state, layout.buttons[1], .runtime_wizard_back, 0);
+            queueModalHit(state, layout.buttons[2], .runtime_wizard_submit, 0);
+        },
+        .pair_grant => {
+            queueModalHit(state, layout.buttons[0], .runtime_wizard_cancel, 0);
+            queueModalHit(state, layout.buttons[1], .runtime_wizard_back, 0);
+            if (!rc.pairing_exchange_started) queueModalHit(state, layout.buttons[2], .runtime_wizard_submit, 0);
+        },
+        .pair_confirm => {
+            queueModalHit(state, layout.buttons[0], .runtime_wizard_cancel, 0);
+            queueModalHit(state, layout.buttons[1], .runtime_wizard_connect, 0);
+            queueModalHit(state, layout.buttons[2], .runtime_wizard_submit, 0);
+        },
+        .connect_setup => {
+            const visible = @min(rc.connect_runtimes.items.len, WIZARD_INVENTORY_VISIBLE_ROWS);
+            for (layout.inventory[0..visible], 0..) |rect, index| queueModalHit(state, rect, .runtime_wizard_select, index);
+            queueModalHit(state, layout.buttons[0], .runtime_wizard_cancel, 0);
+            if (rc.wizard_mode == .add and rc.wizard_profile_id == null) {
+                queueModalHit(state, layout.buttons[1], .runtime_wizard_back, 0);
+            } else if (connectSignedIn(rc.connect_phase)) {
+                queueModalHit(state, layout.buttons[1], .runtime_wizard_connect, 0);
+            }
+            if (connectPrimaryEnabled(rc)) queueModalHit(state, layout.buttons[2], .runtime_wizard_submit, 0);
+        },
+        .testing => {
+            queueModalHit(state, layout.buttons[0], .runtime_wizard_back, 0);
+            // Same gate as the render path: no hit for a button that is not drawn.
+            if (wizardTestingActionable(state)) queueModalHit(state, layout.buttons[1], .runtime_wizard_connect, 0);
+            queueModalHit(state, layout.buttons[2], .runtime_wizard_done, 0);
+        },
+    }
+}
+
+/// Label of the testing-step middle button, or empty when the shared
+/// recovery mapping has no action for the status. Trust review keeps its
+/// wizard wording; everything else uses the mapping's own label so the
+/// button never promises an action `recoverRuntimeProfile` will not run.
+/// Single actionability gate for the testing step's middle control, shared by
+/// render, pointer hit registration, and keyboard Enter.
+fn wizardTestingActionable(state: *const runtime.AppState) bool {
+    const profile_id = state.runtime_connections.wizard_profile_id orelse return false;
+    return wizardTestingActionLabel(state.runtimeProfileStatus(profile_id)).len > 0;
+}
+
+fn wizardTestingActionLabel(status: runtime.RuntimePickerStatus) []const u8 {
+    const recovery = runtime.runtimeStatusRecovery(status);
+    return switch (recovery) {
+        .none => "",
+        .review_trust => "Verify…",
+        else => runtime.runtimeRecoveryLabel(recovery, status),
+    };
+}
+
+test "wizard testing step hides the middle button when recovery has no action" {
+    try std.testing.expectEqualStrings("", wizardTestingActionLabel(.ready));
+    try std.testing.expectEqualStrings("", wizardTestingActionLabel(.connecting));
+    // A scheduled reconnect exposes the manual accelerator.
+    try std.testing.expectEqualStrings("Retry now", wizardTestingActionLabel(.reconnecting));
+    try std.testing.expectEqualStrings("", wizardTestingActionLabel(.unavailable));
+    try std.testing.expectEqualStrings("Verify…", wizardTestingActionLabel(.trust_required));
+    try std.testing.expectEqualStrings("Edit endpoint", wizardTestingActionLabel(.identity_mismatch));
+    try std.testing.expectEqualStrings("Reconnect", wizardTestingActionLabel(.provider_not_authenticated));
+    try std.testing.expectEqualStrings("Connect", wizardTestingActionLabel(.paired_offline));
+}
+
+fn connectSignedIn(phase: runtime_connections.ConnectPhase) bool {
+    return phase == .signed_in or phase == .loading_inventory or phase == .inventory_loaded;
+}
+
+fn connectPrimaryEnabled(rc: *const runtime_connections.State) bool {
+    return switch (rc.connect_phase) {
+        .idle, .failed, .discovered => true,
+        .inventory_loaded => rc.connect_selected != null,
+        .signed_in => true,
+        .discovering, .signing_in, .loading_inventory, .bootstrapping, .bootstrap_ready => false,
+    };
+}
+
+fn connectPrimaryLabel(rc: *const runtime_connections.State) []const u8 {
+    return switch (rc.connect_phase) {
+        .idle => if (rc.wizard_profile_id == null) "Save & check" else "Check",
+        .failed => "Retry",
+        .discovering => "Checking…",
+        .discovered => "Sign in",
+        .signing_in => "Waiting for browser…",
+        .signed_in, .loading_inventory => "Loading…",
+        .inventory_loaded => "Use selected runtime",
+        .bootstrapping => "Creating device…",
+        .bootstrap_ready => "Finishing…",
+    };
+}
+
+fn drawWizardField(state: *runtime.AppState, layout: WizardLayout, field: WizardField, label: []const u8, hint: []const u8) void {
+    const rect = layout.fields[@intFromEnum(field)];
+    queuePaletteText(state, .{ .x = rect.x, .y = rect.y - theme.scaledUi(18.0), .w = rect.w, .h = theme.scaledUi(16.0) }, label, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), layout.modal);
+    const focus = runtimeWizardFocusForIndex(@intFromEnum(field));
+    const value = state.runtime_connections.fieldValue(field);
+    if (isSecretModalFocus(state, focus)) {
+        // Same-length mask: pairing codes and an unimported one-paste Pair
+        // link never enter a Palette batch or frame arena.
+        var masked: [4096]u8 = undefined;
+        drawTextField(state, rect, maskedRuntimeCredential(&masked, value.len), hint, state.palette_modal_text_focus == focus, state.runtime_connections.fieldCursor(field).*);
+        return;
+    }
+    drawTextField(state, rect, value, hint, state.palette_modal_text_focus == focus, state.runtime_connections.fieldCursor(field).*);
+}
+
+/// Labelled read-only identity box (runtime id / instance id / SPKI).
+fn drawWizardIdentityBox(state: *runtime.AppState, modal: palette.Rect, rect: palette.Rect, label: []const u8, value: []const u8) void {
+    queuePaletteText(state, .{ .x = rect.x, .y = rect.y - theme.scaledUi(18.0), .w = rect.w, .h = theme.scaledUi(16.0) }, label, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), modal);
+    queuePaletteRoundedRect(state, rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(6.0));
+    queuePaletteText(state, .{ .x = rect.x + theme.scaledUi(10.0), .y = rect.y + theme.scaledUi(9.0), .w = rect.w - theme.scaledUi(20.0), .h = theme.scaledUi(20.0) }, value, paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), modal);
+}
+
+// Renders the add/edit runtime connection wizard: SSH form, then a connect
+// step that shows the live verification state of the saved profile.
+fn renderRuntimeWizardModal(state: *runtime.AppState, width: f32, height: f32) void {
+    const rc = &state.runtime_connections;
+    if (!rc.wizard_open) return;
+    const layout = runtimeWizardLayout(state, width, height);
+    const modal = layout.modal;
+    drawModalChromeVisual(state, width, height, modal);
+    const pad = layout.pad;
+    const heading = switch (rc.wizard_step) {
+        .method => "Add connection",
+        .pair_grant => "Pair this device",
+        .pair_confirm => "Confirm the runtime identity",
+        else => switch (rc.wizard_mode) {
+            .add => "Add runtime connection",
+            .edit => "Edit runtime connection",
+        },
+    };
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = modal.y + pad, .w = layout.content_w, .h = theme.scaledUi(24.0) }, heading, paletteColor(theme.COLOR_WHITE), theme.scaledUi(18.0), modal);
+    const subtitle = switch (rc.wizard_step) {
+        .method => "Choose how this desktop reaches the runtime. Only Connect needs an account.",
+        .form => if (rc.wizard_method == .pair)
+            "Paste the complete Pair link once. HTTPS and runtime identity are verified before trust is saved."
+        else
+            "Reach a self-hosted Verde daemon over SSH. Host keys are verified by OpenSSH; no secrets are stored here.",
+        .pair_grant => "Advanced manual fallback: review or enter the grant ID and masked one-time code, then exchange.",
+        .pair_confirm => "The runtime answered the exchange. Verify both IDs against `verde-daemon identity` before trusting it.",
+        .connect_setup => "Enter your self-hosted Verde Connect URL. Sign-in uses the system browser with PKCE; tokens stay in memory.",
+        .testing => switch (rc.wizard_method) {
+            .ssh => "Connect to verify the daemon identity. You will be asked for the gateway token and to confirm the runtime on first contact.",
+            .pair => "Connect uses the paired device credential; no token prompt is needed.",
+            .connect => "Connect uses the runtime-local device credential; OIDC is needed only to select or re-bootstrap.",
+        },
+    };
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = modal.y + pad + theme.scaledUi(32.0), .w = layout.content_w, .h = theme.scaledUi(20.0) }, subtitle, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.5), modal);
+
+    switch (rc.wizard_step) {
+        .method => {
+            for (layout.methods, 0..) |rect, index| {
+                const method: runtime_connections.WizardMethod = @enumFromInt(index);
+                const hovered = pointInRect(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y, rect);
+                queuePaletteRoundedRect(state, rect, paletteColor(if (hovered) theme.lighten(theme.COLOR_PANEL_ALT, 0.055) else theme.COLOR_PANEL_ALT), theme.scaledUi(7.0));
+                queuePaletteBorder(state, rect, paletteColor(if (hovered) theme.accent() else theme.COLOR_PANEL_MUTED), theme.scaledUi(7.0), theme.scaledUi(1.0));
+                queuePaletteText(state, .{ .x = rect.x + theme.scaledUi(12.0), .y = rect.y + theme.scaledUi(8.0), .w = rect.w - theme.scaledUi(24.0), .h = theme.scaledUi(20.0) }, method.title(), paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), rect);
+                queuePaletteText(state, .{ .x = rect.x + theme.scaledUi(12.0), .y = rect.y + theme.scaledUi(30.0), .w = rect.w - theme.scaledUi(24.0), .h = theme.scaledUi(18.0) }, method.description(), paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), rect);
+            }
+            drawActionButton(state, layout.buttons[0], "Cancel", theme.COLOR_PANEL_ALT);
+        },
+        .form => {
+            drawWizardField(state, layout, .label, "NAME", "Build VM");
+            if (rc.wizard_method == .pair) {
+                drawWizardField(state, layout, .control_plane_url, if (rc.wizard_mode == .add) "PAIR LINK (MASKED)" else "DIRECT HTTPS / TAILSCALE SERVE URL", if (rc.wizard_mode == .add) "verde://pair?host=…&grant_id=…#code=…" else "https://runtime.example");
+            } else {
+                drawWizardField(state, layout, .host, "SSH HOST OR CONFIG ALIAS", "runtime.example or my-vm");
+                drawWizardField(state, layout, .user, "SSH USER (OPTIONAL)", "leave empty to use ~/.ssh/config");
+                drawWizardField(state, layout, .ssh_port, "SSH PORT", "22");
+                drawWizardField(state, layout, .gateway_port, "GATEWAY PORT ON HOST", "7420");
+            }
+            drawActionButton(state, layout.buttons[0], "Cancel", theme.COLOR_PANEL_ALT);
+            if (rc.wizard_mode == .add and rc.wizard_profile_id == null) drawActionButton(state, layout.buttons[1], "Back", theme.COLOR_PANEL_ALT);
+            drawActionButton(state, layout.buttons[2], if (rc.wizard_mode == .add) "Save & continue" else "Save", theme.accent());
+        },
+        .pair_grant => {
+            drawWizardField(state, layout, .grant_id, "GRANT ID", "32 hex characters");
+            drawWizardField(state, layout, .pairing_code, "ONE-TIME PAIRING CODE", "64 hex characters, masked");
+            drawWizardField(state, layout, .device_label, "DEVICE LABEL", "e.g. work laptop");
+            drawActionButton(state, layout.buttons[0], "Cancel", theme.COLOR_PANEL_ALT);
+            drawActionButton(state, layout.buttons[1], "Back", theme.COLOR_PANEL_ALT);
+            drawActionButton(state, layout.buttons[2], if (rc.pairing_exchange_started) "Exchanging…" else "Exchange grant", theme.accent());
+        },
+        .pair_confirm => {
+            var runtime_id: []const u8 = "";
+            var instance_id: []const u8 = "";
+            if (state.runtime_service) |service| if (rc.wizard_profile_id) |profile_id| if (service.pairingResult(profile_id)) |result| {
+                runtime_id = result.runtime_id;
+                instance_id = result.instance_id;
+            };
+            drawWizardIdentityBox(state, modal, layout.identity[0], "RUNTIME ID", runtime_id);
+            drawWizardIdentityBox(state, modal, layout.identity[1], "INSTANCE ID", instance_id);
+            drawActionButton(state, layout.buttons[0], "Cancel", theme.COLOR_PANEL_ALT);
+            drawActionButton(state, layout.buttons[1], "Not this runtime", theme.COLOR_PANEL_ALT);
+            drawActionButton(state, layout.buttons[2], "Trust and pair", theme.accent());
+        },
+        .connect_setup => {
+            drawWizardField(state, layout, .label, "NAME", "Team control plane");
+            drawWizardField(state, layout, .control_plane_url, "CONTROL PLANE URL", "https://connect.example");
+            const status: []const u8 = if (rc.connect_failure) |failure| failure.message() else switch (rc.connect_phase) {
+                .idle => "Not checked yet.",
+                .discovering => "Fetching /.well-known/verde-connect-configuration…",
+                .discovered => "Discovery verified. Signed out.",
+                .signing_in => if (rc.connect_login_open) "Browser opened. Finish sign-in there; this window waits for the loopback redirect." else "Starting sign-in…",
+                .signed_in, .loading_inventory => "Signed in. Loading linked runtimes…",
+                .inventory_loaded => "Signed in.",
+                .bootstrapping => "Creating the runtime-local device credential…",
+                .bootstrap_ready => "Runtime bootstrap complete.",
+                .failed => "Failed.",
+            };
+            const status_color = if (rc.connect_failure != null) theme.danger() else if (connectSignedIn(rc.connect_phase)) theme.success() else theme.COLOR_TEXT_MUTED;
+            queuePaletteText(state, .{ .x = modal.x + pad, .y = layout.status_y, .w = layout.content_w, .h = theme.scaledUi(20.0) }, status, paletteColor(status_color), theme.scaledUi(13.0), modal);
+            var issuer_buf: [runtime_connections.URL_CAPACITY + 32]u8 = undefined;
+            const issuer_line: []const u8 = if (rc.connect_issuer) |issuer|
+                std.fmt.bufPrint(&issuer_buf, "Issuer {s}{s}", .{ issuer, if (rc.connect_device_flow_advertised) " · device flow advertised" else "" }) catch issuer
+            else
+                "";
+            queuePaletteText(state, .{ .x = modal.x + pad, .y = layout.status_y + theme.scaledUi(24.0), .w = layout.content_w, .h = theme.scaledUi(18.0) }, issuer_line, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), modal);
+            const visible = @min(rc.connect_runtimes.items.len, WIZARD_INVENTORY_VISIBLE_ROWS);
+            for (rc.connect_runtimes.items[0..visible], 0..) |row, index| {
+                const rect = layout.inventory[index];
+                const selected = rc.connect_selected == index;
+                queuePaletteRoundedRect(state, rect, paletteColor(if (selected) theme.lighten(theme.COLOR_PANEL_ALT, 0.08) else theme.COLOR_PANEL_ALT), theme.scaledUi(7.0));
+                queuePaletteBorder(state, rect, paletteColor(if (selected) theme.accent() else theme.COLOR_PANEL_MUTED), theme.scaledUi(7.0), theme.scaledUi(if (selected) 1.5 else 1.0));
+                queuePaletteText(state, .{ .x = rect.x + theme.scaledUi(12.0), .y = rect.y + theme.scaledUi(6.0), .w = rect.w - theme.scaledUi(24.0), .h = theme.scaledUi(18.0) }, row.https_url, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), rect);
+                var id_buf: [256]u8 = undefined;
+                const id_line = std.fmt.bufPrint(&id_buf, "runtime {s} · instance {s} · spki {s}", .{ row.runtime_id, row.instance_id, row.spki_sha256 }) catch row.runtime_id;
+                queuePaletteText(state, .{ .x = rect.x + theme.scaledUi(12.0), .y = rect.y + theme.scaledUi(24.0), .w = rect.w - theme.scaledUi(24.0), .h = theme.scaledUi(16.0) }, id_line, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), rect);
+            }
+            const hidden = rc.connect_runtimes.items.len - visible + rc.connect_runtimes_truncated;
+            if (hidden > 0) {
+                var more_buf: [64]u8 = undefined;
+                const more = std.fmt.bufPrint(&more_buf, "{d} more linked runtime(s) not shown", .{hidden}) catch "";
+                queuePaletteText(state, .{ .x = modal.x + pad, .y = layout.inventory_y + @as(f32, @floatFromInt(visible)) * (theme.scaledUi(44.0) + theme.scaledUi(8.0)), .w = layout.content_w, .h = theme.scaledUi(18.0) }, more, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), modal);
+            }
+            drawActionButton(state, layout.buttons[0], "Cancel", theme.COLOR_PANEL_ALT);
+            if (rc.wizard_mode == .add and rc.wizard_profile_id == null) {
+                drawActionButton(state, layout.buttons[1], "Back", theme.COLOR_PANEL_ALT);
+            } else if (connectSignedIn(rc.connect_phase)) {
+                drawActionButton(state, layout.buttons[1], "Sign out", theme.COLOR_PANEL_ALT);
+            }
+            drawActionButton(state, layout.buttons[2], connectPrimaryLabel(rc), if (connectPrimaryEnabled(rc)) theme.accent() else theme.COLOR_PANEL_MUTED);
+        },
+        .testing => {
+            var badge: []const u8 = "Saved";
+            var description: []const u8 = "";
+            var badge_color = theme.COLOR_TEXT_MUTED;
+            // The middle button mirrors `recoverRuntimeProfile`: label and
+            // action come from one mapping, and no button is drawn when the
+            // mapping has nothing to do (connected/connecting) so a no-op
+            // accent control never appears.
+            var connect_label: []const u8 = "";
+            if (rc.wizard_profile_id) |profile_id| {
+                const status = state.runtimeProfileStatus(profile_id);
+                badge = runtime.runtimePickerStatusBadge(status);
+                description = runtime.runtimePickerStatusDescription(status);
+                badge_color = runtime.runtimeStatusTone(status).color();
+                connect_label = wizardTestingActionLabel(status);
+            }
+            queuePaletteText(state, .{ .x = modal.x + pad, .y = layout.status_y, .w = layout.content_w, .h = theme.scaledUi(22.0) }, badge, paletteColor(badge_color), theme.scaledUi(15.0), modal);
+            queuePaletteText(state, .{ .x = modal.x + pad, .y = layout.status_y + theme.scaledUi(26.0), .w = layout.content_w, .h = theme.scaledUi(20.0) }, description, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.5), modal);
+            drawActionButton(state, layout.buttons[0], "Edit", theme.COLOR_PANEL_ALT);
+            if (connect_label.len > 0) drawActionButton(state, layout.buttons[1], connect_label, theme.accent());
+            drawActionButton(state, layout.buttons[2], "Done", theme.COLOR_PANEL_ALT);
+        },
+    }
+    const notice = rc.wizardNotice();
+    if (notice.len > 0) {
+        queuePaletteText(state, .{ .x = modal.x + pad, .y = layout.notice_y, .w = layout.content_w, .h = theme.scaledUi(20.0) }, notice, paletteColor(theme.COLOR_YELLOW), theme.scaledUi(12.5), modal);
+    }
+}
+
+fn runtimeCredentialModalRect(width: f32, height: f32) palette.Rect {
+    const modal_w = theme.clampf(width * 0.40, theme.scaledUi(420.0), theme.scaledUi(560.0));
+    const modal_h = theme.scaledUi(284.0);
+    return .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
+}
+
+fn runtimeTrustModalRect(width: f32, height: f32) palette.Rect {
+    const modal_w = theme.clampf(width * 0.48, theme.scaledUi(520.0), theme.scaledUi(680.0));
+    const modal_h = theme.scaledUi(366.0);
+    return .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
+}
+
+fn registerRuntimeCredentialModalHits(state: *runtime.AppState, width: f32, height: f32) void {
+    if (!state.runtimeCredentialModalOpen()) return;
+    const modal = runtimeCredentialModalRect(width, height);
+    registerModalChromeHits(state, width, height, modal, false);
+    const pad = theme.scaledUi(20.0);
+    const input_rect: palette.Rect = .{
+        .x = modal.x + pad,
+        .y = modal.y + theme.scaledUi(132.0),
+        .w = modal.w - pad * 2.0,
+        .h = theme.scaledUi(36.0),
+    };
+    const gap = theme.scaledUi(10.0);
+    const button_h = theme.scaledUi(36.0);
+    const button_w = (input_rect.w - gap) * 0.5;
+    const button_y = modal.y + modal.h - pad - button_h;
+    queueModalHit(state, input_rect, .runtime_credential_input, 0);
+    queueModalHit(state, .{ .x = input_rect.x, .y = button_y, .w = button_w, .h = button_h }, .runtime_credential_cancel, 0);
+    queueModalHit(state, .{ .x = input_rect.x + button_w + gap, .y = button_y, .w = button_w, .h = button_h }, .runtime_credential_submit, 0);
+}
+
+fn registerRuntimeTrustModalHits(state: *runtime.AppState, width: f32, height: f32) void {
+    if (state.runtimeTrustProposal() == null) return;
+    const modal = runtimeTrustModalRect(width, height);
+    registerModalChromeHits(state, width, height, modal, false);
+    const pad = theme.scaledUi(20.0);
+    const gap = theme.scaledUi(10.0);
+    const button_h = theme.scaledUi(36.0);
+    const content_w = modal.w - pad * 2.0;
+    const button_w = (content_w - gap) * 0.5;
+    const button_y = modal.y + modal.h - pad - button_h;
+    queueModalHit(state, .{ .x = modal.x + pad, .y = button_y, .w = button_w, .h = button_h }, .runtime_trust_cancel, 0);
+    queueModalHit(state, .{ .x = modal.x + pad + button_w + gap, .y = button_y, .w = button_w, .h = button_h }, .runtime_trust_confirm, 0);
+}
+
+// Renders the masked, process-memory-only runtime bearer entry modal.
+fn renderRuntimeCredentialModal(state: *runtime.AppState, width: f32, height: f32) void {
+    if (!state.runtimeCredentialModalOpen()) return;
+    const modal = runtimeCredentialModalRect(width, height);
+    drawModalChromeVisual(state, width, height, modal);
+    const pad = theme.scaledUi(20.0);
+    const content_w = modal.w - pad * 2.0;
+    var heading_buf: [192]u8 = undefined;
+    const heading = std.fmt.bufPrint(
+        &heading_buf,
+        "Connect to {s}",
+        .{state.runtimeCredentialProfileLabel()},
+    ) catch "Connect to remote runtime";
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = modal.y + pad, .w = content_w, .h = theme.scaledUi(24.0) }, heading, paletteColor(theme.COLOR_WHITE), theme.scaledUi(18.0), modal);
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = modal.y + theme.scaledUi(54.0), .w = content_w, .h = theme.scaledUi(20.0) }, "Enter the gateway bearer token for this daemon.", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), modal);
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = modal.y + theme.scaledUi(76.0), .w = content_w, .h = theme.scaledUi(20.0) }, "Memory-only: never saved, logged, or put in SSH argv/environment.", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.5), modal);
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = modal.y + theme.scaledUi(104.0), .w = content_w, .h = theme.scaledUi(18.0) }, "BEARER TOKEN", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), modal);
+    const input_rect: palette.Rect = .{ .x = modal.x + pad, .y = modal.y + theme.scaledUi(132.0), .w = content_w, .h = theme.scaledUi(36.0) };
+    drawRuntimeCredentialField(state, input_rect);
+    const notice = state.runtimeCredentialNotice();
+    if (notice.len > 0) {
+        queuePaletteText(state, .{ .x = modal.x + pad, .y = input_rect.y + theme.scaledUi(44.0), .w = content_w, .h = theme.scaledUi(20.0) }, notice, paletteColor(theme.COLOR_YELLOW), theme.scaledUi(12.5), modal);
+    }
+    const gap = theme.scaledUi(10.0);
+    const button_h = theme.scaledUi(36.0);
+    const button_w = (content_w - gap) * 0.5;
+    const button_y = modal.y + modal.h - pad - button_h;
+    drawActionButton(state, .{ .x = modal.x + pad, .y = button_y, .w = button_w, .h = button_h }, "Cancel", theme.COLOR_PANEL_ALT);
+    drawActionButton(state, .{ .x = modal.x + pad + button_w + gap, .y = button_y, .w = button_w, .h = button_h }, "Connect", theme.accent());
+}
+
+// Renders the explicit first-contact daemon identity confirmation modal.
+fn renderRuntimeTrustModal(state: *runtime.AppState, width: f32, height: f32) void {
+    const proposal = state.runtimeTrustProposal() orelse return;
+    const modal = runtimeTrustModalRect(width, height);
+    drawModalChromeVisual(state, width, height, modal);
+    const pad = theme.scaledUi(20.0);
+    const content_w = modal.w - pad * 2.0;
+    var heading_buf: [192]u8 = undefined;
+    const heading = std.fmt.bufPrint(
+        &heading_buf,
+        "Trust {s}?",
+        .{state.runtimeTrustProfileLabel()},
+    ) catch "Trust remote runtime?";
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = modal.y + pad, .w = content_w, .h = theme.scaledUi(24.0) }, heading, paletteColor(theme.COLOR_WHITE), theme.scaledUi(18.0), modal);
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = modal.y + theme.scaledUi(54.0), .w = content_w, .h = theme.scaledUi(20.0) }, "First contact is blocked until you verify both complete IDs.", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), modal);
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = modal.y + theme.scaledUi(76.0), .w = content_w, .h = theme.scaledUi(20.0) }, "Compare them with the daemon output on the remote machine.", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.5), modal);
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = modal.y + theme.scaledUi(112.0), .w = content_w, .h = theme.scaledUi(18.0) }, "RUNTIME ID", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), modal);
+    queuePaletteRoundedRect(state, .{ .x = modal.x + pad, .y = modal.y + theme.scaledUi(134.0), .w = content_w, .h = theme.scaledUi(38.0) }, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(6.0));
+    queuePaletteText(state, .{ .x = modal.x + pad + theme.scaledUi(10.0), .y = modal.y + theme.scaledUi(143.0), .w = content_w - theme.scaledUi(20.0), .h = theme.scaledUi(20.0) }, proposal.runtime_id, paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), modal);
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = modal.y + theme.scaledUi(188.0), .w = content_w, .h = theme.scaledUi(18.0) }, "INSTANCE ID", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), modal);
+    queuePaletteRoundedRect(state, .{ .x = modal.x + pad, .y = modal.y + theme.scaledUi(210.0), .w = content_w, .h = theme.scaledUi(38.0) }, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(6.0));
+    queuePaletteText(state, .{ .x = modal.x + pad + theme.scaledUi(10.0), .y = modal.y + theme.scaledUi(219.0), .w = content_w - theme.scaledUi(20.0), .h = theme.scaledUi(20.0) }, proposal.instance_id, paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), modal);
+    const notice = state.runtimeTrustNotice();
+    if (notice.len > 0) {
+        queuePaletteText(state, .{ .x = modal.x + pad, .y = modal.y + theme.scaledUi(258.0), .w = content_w, .h = theme.scaledUi(20.0) }, notice, paletteColor(theme.COLOR_YELLOW), theme.scaledUi(12.5), modal);
+    }
+    const gap = theme.scaledUi(10.0);
+    const button_h = theme.scaledUi(36.0);
+    const button_w = (content_w - gap) * 0.5;
+    const button_y = modal.y + modal.h - pad - button_h;
+    drawActionButton(state, .{ .x = modal.x + pad, .y = button_y, .w = button_w, .h = button_h }, "Cancel and disconnect", theme.COLOR_PANEL_ALT);
+    drawActionButton(state, .{ .x = modal.x + pad + button_w + gap, .y = button_y, .w = button_w, .h = button_h }, "Trust this daemon", theme.accent());
 }
 
 fn registerImageModalHits(state: *runtime.AppState, width: f32, height: f32) void {
@@ -1420,39 +2485,6 @@ fn registerHandoffModalHits(state: *runtime.AppState, width: f32, height: f32) v
     const button_w = (content_w - gap) * 0.5;
     queueModalHit(state, .{ .x = modal.x + pad, .y = button_y, .w = button_w, .h = row_h }, .handoff_cancel, 0);
     queueModalHit(state, .{ .x = modal.x + pad + button_w + gap, .y = button_y, .w = button_w, .h = row_h }, .handoff_prepare, 0);
-}
-
-fn registerHerdrProfilePickerHits(state: *runtime.AppState, width: f32, height: f32) void {
-    if (state.herdr_controller.picker_project_index == null) return;
-    const modal_w = theme.clampf(width * 0.42, theme.scaledUi(460.0), theme.scaledUi(640.0));
-    const modal_h = theme.clampf(height * 0.58, theme.scaledUi(360.0), theme.scaledUi(540.0));
-    const modal: palette.Rect = .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
-    registerModalChromeHits(state, width, height, modal, true);
-    const pad = theme.scaledUi(18.0);
-    var y = modal.y + pad;
-    y += theme.scaledUi(28.0);
-    y += theme.scaledUi(42.0);
-    const refresh_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = @max(theme.scaledUi(112.0), (modal.w - pad * 2.0) * 0.28), .h = theme.scaledUi(32.0) };
-    queueModalHit(state, refresh_rect, .herdr_profile_refresh, 0);
-    y += theme.scaledUi(42.0);
-    const button_h = theme.scaledUi(34.0);
-    const notice_h = if (state.herdrProfileNotice().len > 0) theme.scaledUi(24.0) else 0.0;
-    const list_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = modal.y + modal.h - pad - button_h - notice_h - theme.scaledUi(16.0) - y };
-    if (state.herdr_controller.summaries.items.len != 0) {
-        const row_h = theme.scaledUi(50.0);
-        for (state.herdr_controller.summaries.items, 0..) |_, index| {
-            const row: palette.Rect = .{ .x = list_rect.x + theme.scaledUi(6.0), .y = list_rect.y + theme.scaledUi(6.0) + @as(f32, @floatFromInt(index)) * row_h, .w = list_rect.w - theme.scaledUi(12.0), .h = row_h - theme.scaledUi(2.0) };
-            if (row.y + row.h > list_rect.y + list_rect.h) break;
-            queueModalHit(state, row, .herdr_profile_select, index);
-        }
-    }
-    const button_y = modal.y + modal.h - pad - button_h;
-    const gap = theme.scaledUi(10.0);
-    const button_w = (modal.w - pad * 2.0 - gap) * 0.5;
-    const cancel_rect: palette.Rect = .{ .x = modal.x + pad, .y = button_y, .w = button_w, .h = button_h };
-    const submit_rect: palette.Rect = .{ .x = cancel_rect.x + button_w + gap, .y = button_y, .w = button_w, .h = button_h };
-    queueModalHit(state, cancel_rect, .herdr_profile_cancel, 0);
-    queueModalHit(state, submit_rect, .herdr_profile_submit, 0);
 }
 
 // Renders the one-time opt-in for provider-native Verde MCP registration.
@@ -1947,72 +2979,6 @@ fn handoffProviderLabel(provider: runtime.Provider) []const u8 {
     };
 }
 
-/// Shows the modal used to choose a saved Herdr remote profile for workspace handoff.
-fn renderHerdrProfilePickerModal(state: *runtime.AppState, width: f32, height: f32) void {
-    const project_index = state.herdr_controller.picker_project_index orelse return;
-    if (project_index >= state.project_controller.projects.items.len) {
-        state.cancelHerdrProfilePicker();
-        return;
-    }
-    const modal_w = theme.clampf(width * 0.42, theme.scaledUi(460.0), theme.scaledUi(640.0));
-    const modal_h = theme.clampf(height * 0.58, theme.scaledUi(360.0), theme.scaledUi(540.0));
-    const modal: palette.Rect = .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
-    drawModalChromeVisual(state, width, height, modal);
-    const pad = theme.scaledUi(18.0);
-    var y = modal.y + pad;
-    const project = &state.project_controller.projects.items[project_index];
-    queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(24.0) }, "Handoff to remote Herdr", paletteColor(theme.COLOR_WHITE), theme.scaledUi(17.0), modal);
-    y += theme.scaledUi(28.0);
-    queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(38.0) }, project.path, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), modal);
-    y += theme.scaledUi(42.0);
-    const refresh_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = @max(theme.scaledUi(112.0), (modal.w - pad * 2.0) * 0.28), .h = theme.scaledUi(32.0) };
-    drawActionButton(state, refresh_rect, "Refresh profiles", theme.COLOR_PANEL_MUTED);
-    y += theme.scaledUi(42.0);
-
-    const button_h = theme.scaledUi(34.0);
-    const notice = state.herdrProfileNotice();
-    const notice_h = if (notice.len > 0) theme.scaledUi(24.0) else 0.0;
-    const list_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = modal.y + modal.h - pad - button_h - notice_h - theme.scaledUi(16.0) - y };
-    queuePaletteRoundedRect(state, list_rect, paletteColor(theme.darken(theme.COLOR_PANEL_ALT, 0.03)), theme.scaledUi(8.0));
-    queuePaletteBorder(state, list_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0), theme.scaledUi(1.0));
-    if (state.herdr_controller.summaries.items.len == 0) {
-        queuePaletteText(state, .{ .x = list_rect.x + theme.scaledUi(12.0), .y = list_rect.y + theme.scaledUi(12.0), .w = list_rect.w - theme.scaledUi(24.0), .h = theme.scaledUi(20.0) }, "No profiles found. Add one with `verde herdr profiles add`.", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), list_rect);
-    } else {
-        const row_h = theme.scaledUi(50.0);
-        for (state.herdr_controller.summaries.items, 0..) |profile, index| {
-            const row: palette.Rect = .{ .x = list_rect.x + theme.scaledUi(6.0), .y = list_rect.y + theme.scaledUi(6.0) + @as(f32, @floatFromInt(index)) * row_h, .w = list_rect.w - theme.scaledUi(12.0), .h = row_h - theme.scaledUi(2.0) };
-            if (row.y + row.h > list_rect.y + list_rect.h) break;
-            const selected = state.herdr_controller.selected_index != null and state.herdr_controller.selected_index.? == index;
-            const row_hovered = state.herdr_controller.hover_index != null and state.herdr_controller.hover_index.? == index;
-            if (selected) {
-                const sel_bg = if (row_hovered)
-                    paletteColor(theme.lighten(theme.COLOR_PANEL_MUTED, 0.10))
-                else
-                    paletteColor(theme.COLOR_PANEL_MUTED);
-                queuePaletteRoundedRect(state, row, sel_bg, theme.scaledUi(6.0));
-            } else if (row_hovered) {
-                queuePaletteRoundedRect(state, row, paletteColor(theme.lighten(theme.COLOR_PANEL_MUTED, 0.06)), theme.scaledUi(6.0));
-                queuePaletteBorder(state, row, paletteColor(theme.lighten(theme.borderMuted(), 0.02)), theme.scaledUi(6.0), theme.scaledUi(1.0));
-            }
-            const cwd_label = profile.remote_cwd orelse "default Verde remote workspace dir";
-            queuePaletteText(state, .{ .x = row.x + theme.scaledUi(8.0), .y = row.y + theme.scaledUi(5.0), .w = row.w - theme.scaledUi(16.0), .h = theme.scaledUi(18.0) }, profile.name, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), list_rect);
-            queuePaletteText(state, .{ .x = row.x + theme.scaledUi(8.0), .y = row.y + theme.scaledUi(24.0), .w = row.w - theme.scaledUi(16.0), .h = theme.scaledUi(16.0) }, profile.ssh_target, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), list_rect);
-            queuePaletteText(state, .{ .x = row.x + row.w * 0.56, .y = row.y + theme.scaledUi(24.0), .w = row.w * 0.42, .h = theme.scaledUi(16.0) }, cwd_label, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), list_rect);
-        }
-    }
-
-    const button_y = modal.y + modal.h - pad - button_h;
-    if (notice.len > 0) {
-        queuePaletteText(state, .{ .x = modal.x + pad, .y = button_y - theme.scaledUi(26.0), .w = modal.w - pad * 2.0, .h = theme.scaledUi(20.0) }, notice, paletteColor(theme.COLOR_YELLOW), theme.scaledUi(13.0), modal);
-    }
-    const gap = theme.scaledUi(10.0);
-    const button_w = (modal.w - pad * 2.0 - gap) * 0.5;
-    const cancel_rect: palette.Rect = .{ .x = modal.x + pad, .y = button_y, .w = button_w, .h = button_h };
-    const submit_rect: palette.Rect = .{ .x = cancel_rect.x + button_w + gap, .y = button_y, .w = button_w, .h = button_h };
-    drawActionButton(state, cancel_rect, "Cancel", theme.COLOR_PANEL_MUTED);
-    drawActionButton(state, submit_rect, "Handoff", theme.COLOR_GREEN);
-}
-
 fn threadImportHeading(provider: runtime.Provider) []const u8 {
     return switch (provider) {
         .codex => "Import Codex thread",
@@ -2095,4 +3061,312 @@ fn truncateThreadImportLabel(state: *runtime.AppState, value: []const u8, max_wi
 test "thread import labels use only the first non-empty line" {
     try std.testing.expectEqualStrings("First title", threadImportSingleLineLabel(" \nFirst title  \r\nSecond line"));
     try std.testing.expectEqualStrings("One line", threadImportSingleLineLabel("\tOne line\t"));
+}
+
+test "runtime credential input filters edits and wipes removed bytes" {
+    var state: runtime.AppState = undefined;
+    // Zero the sentinel too: `[0..]` on a sentinel-terminated array stops
+    // before the terminator, and the buffer accessor checks it.
+    state.runtime_credential_token_storage = std.mem.zeroes(@TypeOf(state.runtime_credential_token_storage));
+    state.runtime_credential_token_cursor = 0;
+    state.palette_modal_text_focus = .runtime_credential;
+    state.modal_text_selection_anchor = null;
+    state.modal_text_drag_active = false;
+    state.runtime_credential_profile_id = null;
+    state.runtime_pin_proposal = null;
+
+    try std.testing.expect(handlePaletteTextInput(&state, "abc \nDEF\t$"));
+    try std.testing.expectEqualStrings("abcDEF$", state.runtimeCredentialToken());
+
+    // Insertion replaces the active selection first and applies the same
+    // printable, no-space contract used by the secret store.
+    state.modal_text_selection_anchor = 3;
+    state.runtime_credential_token_cursor = 6;
+    try std.testing.expect(handlePaletteTextInput(&state, "pq\n r"));
+    try std.testing.expectEqualStrings("abcpqr$", state.runtimeCredentialToken());
+    try std.testing.expectEqual(@as(?usize, null), state.modal_text_selection_anchor);
+
+    state.runtime_credential_token_cursor = state.runtimeCredentialToken().len;
+    const before_backspace = state.runtimeCredentialToken().len;
+    try std.testing.expect(deleteModalText(&state, true));
+    try std.testing.expectEqualStrings("abcpqr", state.runtimeCredentialToken());
+    try std.testing.expectEqual(@as(u8, 0), state.runtime_credential_token_storage[before_backspace - 1]);
+    state.runtime_credential_token_cursor = 3;
+    const before_delete = state.runtimeCredentialToken().len;
+    try std.testing.expect(deleteModalText(&state, false));
+    try std.testing.expectEqualStrings("abcqr", state.runtimeCredentialToken());
+    try std.testing.expectEqual(@as(u8, 0), state.runtime_credential_token_storage[before_delete - 1]);
+
+    const previous_len = state.runtimeCredentialToken().len;
+    state.modal_text_selection_anchor = 0;
+    state.runtime_credential_token_cursor = previous_len;
+    try std.testing.expect(deleteModalSelection(&state));
+    try std.testing.expectEqualStrings("", state.runtimeCredentialToken());
+    for (state.runtime_credential_token_storage[0..previous_len]) |byte| {
+        try std.testing.expectEqual(@as(u8, 0), byte);
+    }
+}
+
+test "runtime credential input honors selection navigation pointer and blur contract" {
+    var state: runtime.AppState = undefined;
+    // Zero the sentinel too: `[0..]` on a sentinel-terminated array stops
+    // before the terminator, and the buffer accessor checks it.
+    state.runtime_credential_token_storage = std.mem.zeroes(@TypeOf(state.runtime_credential_token_storage));
+    @memcpy(state.runtime_credential_token_storage[0..7], "abc/def");
+    state.runtime_credential_token_cursor = 3;
+    state.palette_modal_text_focus = .runtime_credential;
+    state.modal_text_selection_anchor = null;
+    state.modal_text_drag_active = false;
+    state.runtime_credential_profile_id = null;
+    state.runtime_pin_proposal = null;
+
+    try std.testing.expect(moveModalCursorWithShift(&state, 0, true));
+    try std.testing.expectEqual(@as(?usize, 3), state.modal_text_selection_anchor);
+    try std.testing.expectEqual(@as(usize, 0), state.runtime_credential_token_cursor);
+    try std.testing.expect(moveModalCursorWithShift(&state, 7, false));
+    try std.testing.expectEqual(@as(?usize, null), state.modal_text_selection_anchor);
+
+    const word = modalWordBoundsAt(state.runtimeCredentialToken(), 5);
+    try std.testing.expectEqual(@as(usize, 4), word.start);
+    try std.testing.expectEqual(@as(usize, 7), word.end);
+
+    const input_rect: palette.Rect = .{ .x = 20.0, .y = 20.0, .w = 300.0, .h = 36.0 };
+    focusModalInput(&state, .runtime_credential, input_rect, input_rect.x, 3);
+    try std.testing.expectEqual(@as(?usize, 0), state.modal_text_selection_anchor);
+    try std.testing.expectEqual(@as(usize, 7), state.runtime_credential_token_cursor);
+    try std.testing.expect(!state.modal_text_drag_active);
+
+    focusModalInput(&state, .runtime_credential, input_rect, input_rect.x + input_rect.w, 1);
+    try std.testing.expectEqual(@as(?usize, 7), state.modal_text_selection_anchor);
+    try std.testing.expectEqual(@as(usize, 7), state.runtime_credential_token_cursor);
+    try std.testing.expect(state.modal_text_drag_active);
+
+    blurPaletteModalTextInput(&state);
+    try std.testing.expectEqual(runtime.PaletteModalTextFocus.none, state.palette_modal_text_focus);
+    try std.testing.expectEqual(@as(?usize, null), state.modal_text_selection_anchor);
+    try std.testing.expect(!state.modal_text_drag_active);
+
+    // Blurred runtime modals still consume SDL text_input so a paired event
+    // cannot reach an obscured composer or terminal.
+    state.runtime_credential_profile_id = @constCast("profile-remote");
+    try std.testing.expect(handlePaletteTextInput(&state, "must-not-leak"));
+    try std.testing.expectEqualStrings("abc/def", state.runtimeCredentialToken());
+}
+
+test "runtime credential renderer receives only a same-length mask" {
+    var mask_storage: [4096]u8 = undefined;
+    const masked = maskedRuntimeCredential(&mask_storage, "not-a-renderable-secret".len);
+    try std.testing.expectEqual(@as(usize, "not-a-renderable-secret".len), masked.len);
+    for (masked) |byte| try std.testing.expectEqual(@as(u8, '*'), byte);
+    try std.testing.expect(!std.mem.eql(u8, masked, "not-a-renderable-secret"));
+}
+
+test "Pair wizard form positions only its two visible fields on separate rows" {
+    var state: runtime.AppState = undefined;
+    state.runtime_connections = .{};
+    state.runtime_connections.wizard_step = .form;
+    state.runtime_connections.wizard_method = .pair;
+
+    const pair_layout = runtimeWizardLayout(&state, 1200.0, 900.0);
+    const label = pair_layout.fields[@intFromEnum(WizardField.label)];
+    const pair_link = pair_layout.fields[@intFromEnum(WizardField.control_plane_url)];
+    try std.testing.expect(pair_link.y >= label.y + label.h);
+    try std.testing.expectEqual(label.x, pair_link.x);
+    try std.testing.expectEqual(label.w, pair_link.w);
+    try std.testing.expectEqualSlices(
+        WizardField,
+        &.{ .label, .control_plane_url },
+        state.runtime_connections.visibleFields(),
+    );
+
+    state.runtime_connections.wizard_method = .ssh;
+    const ssh_layout = runtimeWizardLayout(&state, 1200.0, 900.0);
+    try std.testing.expect(pair_layout.modal.h < ssh_layout.modal.h);
+}
+
+test "workspace settings modal dismisses on escape and routes its actions" {
+    const source = @embedFile("layout.zig");
+    const dismiss_start = std.mem.indexOf(u8, source, "fn dismissTopModal").?;
+    const dismiss_end = std.mem.indexOfPos(u8, source, dismiss_start, "fn keymodBits").?;
+    const dismiss_path = source[dismiss_start..dismiss_end];
+    try std.testing.expect(std.mem.indexOf(u8, dismiss_path, "state.workspaceSettingsOpen()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dismiss_path, "state.closeWorkspaceSettings()") != null);
+
+    const pointer_start = std.mem.indexOf(u8, source, "pub fn handlePaletteMouseButton").?;
+    const pointer_end = std.mem.indexOfPos(u8, source, pointer_start, "fn focusModalInput").?;
+    const pointer_path = source[pointer_start..pointer_end];
+    try std.testing.expect(std.mem.indexOf(u8, pointer_path, ".workspace_settings_option => state.applyWorkspaceSettingsOption(hit.index)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pointer_path, ".workspace_settings_manage => state.openManageConnectionsFromWorkspaceSettings()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pointer_path, ".workspace_settings_close => state.closeWorkspaceSettings()") != null);
+}
+
+test "workspace settings modal owns keyboard and text input while open" {
+    const allocator = std.testing.allocator;
+    var state: runtime.AppState = undefined;
+    state.allocator = allocator;
+    state.lifecycle = .{};
+    state.palette_modal_text_focus = .none;
+    state.modal_text_selection_anchor = null;
+    state.modal_text_drag_active = false;
+    state.runtime_credential_profile_id = null;
+    state.runtime_pin_proposal = null;
+    state.modal_image_path = null;
+    state.settings_controller.mcp_onboarding_visible = false;
+    state.settings_controller.provider_onboarding_visible = false;
+    state.settings_controller.modal_visible = false;
+    state.rename_project_index = null;
+    state.transcript_controller.selection_text = null;
+    state.thread_import_provider = null;
+    state.handoff_controller.modal_open = false;
+    state.project_controller.show_creator = false;
+    state.runtime_connections = .{};
+    state.command_controller.open = false;
+    state.workspace_settings_project_id = null;
+    state.workspace_settings_notice_storage = @splat(0);
+    defer state.closeWorkspaceSettings();
+
+    // With no focused field, an SDL text_input must be swallowed while the
+    // modal is open so printable characters cannot reach the obscured
+    // composer, browser, or terminal.
+    try std.testing.expect(!handlePaletteTextInput(&state, "x"));
+    state.workspace_settings_project_id = try allocator.dupe(u8, "workspace-a");
+    try std.testing.expect(handlePaletteTextInput(&state, "x"));
+
+    // Every key-down is consumed while the modal owns the keyboard; Escape
+    // additionally closes it through the shared dismiss path.
+    var event: sdl.KeyboardEvent = undefined;
+    @memset(std.mem.asBytes(&event), 0);
+    event.type = .key_down;
+    event.down = true;
+    const consumed_keys: [4]sdl.Keycode = .{ .@"return", .c, .backspace, .q };
+    for (consumed_keys) |key| {
+        event.key = key;
+        try std.testing.expect(handlePaletteKeyDown(&state, &event));
+        try std.testing.expect(state.workspaceSettingsOpen());
+    }
+    // Ctrl+C (copy chord) is likewise consumed, not forwarded.
+    event.key = .c;
+    @as(*u16, @ptrCast(&event.mod)).* = sdl.Keymod.ctrl;
+    try std.testing.expect(handlePaletteKeyDown(&state, &event));
+    try std.testing.expect(state.workspaceSettingsOpen());
+    @as(*u16, @ptrCast(&event.mod)).* = sdl.Keymod.none;
+    event.key = .escape;
+    try std.testing.expect(handlePaletteKeyDown(&state, &event));
+    try std.testing.expect(!state.workspaceSettingsOpen());
+    // Once closed, the same keys fall back to normal (unconsumed) routing.
+    event.key = .q;
+    try std.testing.expect(!handlePaletteKeyDown(&state, &event));
+    try std.testing.expect(!handlePaletteTextInput(&state, "x"));
+}
+
+test "workspace settings layout clamps the option list at short heights" {
+    defer theme.applyTheme(1.0);
+    theme.applyTheme(1.0);
+    const allocator = std.testing.allocator;
+
+    var state: runtime.AppState = undefined;
+    state.runtime_picker_profiles = .empty;
+    defer {
+        for (state.runtime_picker_profiles.items) |*profile| {
+            allocator.free(profile.profile_id);
+        }
+        state.runtime_picker_profiles.deinit(allocator);
+    }
+    var index: usize = 0;
+    while (index < 12) : (index += 1) {
+        try state.runtime_picker_profiles.append(allocator, .{
+            .profile_id = try allocator.dupe(u8, "profile-0123456789abcdef0123456789abcdef"),
+            .status = .offline,
+        });
+    }
+
+    const tall = workspaceSettingsLayout(&state, 1200.0, 1000.0);
+    const short = workspaceSettingsLayout(&state, 1200.0, 520.0);
+    // The whole modal stays on screen at short heights; only the list shrinks
+    // and becomes scrollable.
+    try std.testing.expect(short.modal.y >= 0.0);
+    try std.testing.expect(short.modal.y + short.modal.h <= 520.0 + theme.scaledUi(1.0));
+    try std.testing.expect(short.list.h < tall.list.h);
+    try std.testing.expect(short.max_scroll_y > 0.0);
+    // Buttons stay inside the modal below the notice band.
+    try std.testing.expect(short.close_button.y + short.close_button.h <= short.modal.y + short.modal.h);
+    try std.testing.expect(short.manage_button.x + short.manage_button.w < short.close_button.x);
+    // A row scrolled past the clip registers no hit area.
+    const scrolled = workspaceSettingsOptionRowRect(short, 11, short.max_scroll_y);
+    try std.testing.expect(scrolled.y + scrolled.h <= short.list.y + short.list.h + short.row_h);
+    const hidden = rectIntersection(workspaceSettingsOptionRowRect(short, 0, short.max_scroll_y), short.list);
+    try std.testing.expect(hidden.h <= 0.0 or short.max_scroll_y < short.row_h);
+
+    // A half-scrolled top row centers its radio above the list band, so the
+    // renderer must gate the unclippable ring/dot on full containment.
+    const partial = workspaceSettingsOptionRowRect(short, 0, short.row_h * 0.5);
+    const radio_size = theme.scaledUi(14.0);
+    const partial_radio_y = partial.y + (partial.h - radio_size) * 0.5;
+    try std.testing.expect(partial_radio_y < short.list.y);
+    const source = @embedFile("layout.zig");
+    const render_start = std.mem.indexOf(u8, source, "fn renderWorkspaceSettingsModal").?;
+    const render_end = std.mem.indexOfPos(u8, source, render_start, "fn drawModalChromeVisual").?;
+    const render_path = source[render_start..render_end];
+    const guard = std.mem.indexOf(u8, render_path, "const radio_fully_visible = radio.y >= layout.list.y and").?;
+    const ring = std.mem.indexOf(u8, render_path, "queuePaletteBorder(state, radio").?;
+    try std.testing.expect(guard < ring);
+}
+
+test "runtime trust requires the explicit confirmation button" {
+    const source = @embedFile("layout.zig");
+    const keys_start = std.mem.indexOf(u8, source, "pub fn handlePaletteKeyDown").?;
+    const keys_end = std.mem.indexOfPos(u8, source, keys_start, "fn dismissTopModal").?;
+    const key_path = source[keys_start..keys_end];
+    try std.testing.expect(std.mem.indexOf(u8, key_path, "state.runtimeTrustProposal() != null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, key_path, "confirmRuntimeTrust") == null);
+
+    const pointer_start = std.mem.indexOf(u8, source, "pub fn handlePaletteMouseButton").?;
+    const pointer_end = std.mem.indexOfPos(u8, source, pointer_start, "fn focusModalInput").?;
+    const pointer_path = source[pointer_start..pointer_end];
+    try std.testing.expect(std.mem.indexOf(u8, pointer_path, ".runtime_trust_confirm => state.confirmRuntimeTrust()") != null);
+}
+
+test "runtime wizard fields honor the modal text-input contract and port filtering" {
+    var state: runtime.AppState = undefined;
+    state.runtime_connections = .{};
+    state.runtime_connections.wizard_open = true;
+    state.palette_modal_text_focus = .runtime_wizard_host;
+    state.modal_text_selection_anchor = null;
+    state.modal_text_drag_active = false;
+    state.runtime_credential_profile_id = null;
+    state.runtime_pin_proposal = null;
+
+    try std.testing.expect(handlePaletteTextInput(&state, "dev.\nexample"));
+    try std.testing.expectEqualStrings("dev.example", state.runtime_connections.fieldValue(.host));
+
+    // Insertion replaces the active selection first; Shift navigation and
+    // pointer focus follow the same anchor/cursor contract as other modals.
+    state.modal_text_selection_anchor = 3;
+    state.runtime_connections.host_cursor = 4;
+    try std.testing.expect(handlePaletteTextInput(&state, "-"));
+    try std.testing.expectEqualStrings("dev-example", state.runtime_connections.fieldValue(.host));
+    try std.testing.expectEqual(@as(?usize, null), state.modal_text_selection_anchor);
+    try std.testing.expect(moveModalCursorWithShift(&state, 0, true));
+    try std.testing.expectEqual(@as(?usize, 4), state.modal_text_selection_anchor);
+    try std.testing.expectEqual(@as(usize, 0), state.runtime_connections.host_cursor);
+    try std.testing.expect(deleteModalSelection(&state));
+    try std.testing.expectEqualStrings("example", state.runtime_connections.fieldValue(.host));
+
+    const input_rect: palette.Rect = .{ .x = 20.0, .y = 20.0, .w = 300.0, .h = 36.0 };
+    focusModalInput(&state, .runtime_wizard_host, input_rect, input_rect.x, 3);
+    try std.testing.expectEqual(@as(?usize, 0), state.modal_text_selection_anchor);
+    try std.testing.expectEqual(@as(usize, 7), state.runtime_connections.host_cursor);
+    blurPaletteModalTextInput(&state);
+    try std.testing.expectEqual(runtime.PaletteModalTextFocus.none, state.palette_modal_text_focus);
+    try std.testing.expectEqual(@as(?usize, null), state.modal_text_selection_anchor);
+    try std.testing.expect(!state.modal_text_drag_active);
+
+    // Port fields accept digits only, so a pasted "host:port" cannot smuggle
+    // text into a numeric field.
+    state.palette_modal_text_focus = .runtime_wizard_gateway_port;
+    try std.testing.expect(handlePaletteTextInput(&state, "6a7-8 3"));
+    try std.testing.expectEqualStrings("6783", state.runtime_connections.fieldValue(.gateway_port));
+    state.runtime_connections.gateway_port_cursor = 4;
+    try std.testing.expect(deleteModalText(&state, true));
+    try std.testing.expectEqualStrings("678", state.runtime_connections.fieldValue(.gateway_port));
 }

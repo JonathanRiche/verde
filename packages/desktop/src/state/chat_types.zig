@@ -9,6 +9,7 @@ const platform_paths = @import("platform_paths");
 const platform_process = @import("../platform/process.zig");
 const platform_runtime = @import("platform_runtime");
 const runtime_log = @import("../runtime/log.zig");
+const thread_binding = @import("../runtime/thread_binding.zig");
 const provider_models = @import("provider_models.zig");
 const state_sync = @import("sync.zig");
 
@@ -23,8 +24,11 @@ const DEFAULT_CODEX_MODEL = provider_models.DEFAULT_CODEX_MODEL;
 const DEFAULT_CODEX_REASONING_EFFORT = provider_models.DEFAULT_CODEX_REASONING_EFFORT;
 const Mutex = state_sync.Mutex;
 const Condition = state_sync.Condition;
+const ThreadBinding = thread_binding.ThreadBinding;
 
 pub const DRAFT_CAPACITY = 64 * 1024;
+pub const LOCAL_RUNTIME_PROFILE_ID: []const u8 = "local";
+pub const PRIMARY_REPOSITORY_ID: []const u8 = "primary";
 
 pub const TranscriptBodyKind = enum {
     markdown,
@@ -263,6 +267,10 @@ pub const ChatThread = struct {
     access_mode: AccessMode = .full_access,
     provider: Provider = .opencode,
     harness: Harness = .local_cli,
+    /// Runtime/repository routing is independently selectable while this is a
+    /// draft. `committed` is the durable-action boundary; route APIs lock the
+    /// binding before evaluating changes once that bit is set.
+    runtime_route: ThreadBinding,
     tui_dock_id: ?u32 = null,
     completion_pending: bool = false,
     completed_at_ms: i64 = 0,
@@ -307,6 +315,11 @@ pub const ChatThread = struct {
         title_generation_state.* = .{};
         const local_thread_id = try allocPrintZCompat(allocator, "chat-{d}-{x}", .{ unixTimestampMs(), @intFromPtr(send_state) });
         errdefer allocator.free(local_thread_id);
+        var runtime_route = try ThreadBinding.initDraft(allocator, .{
+            .profile_id = LOCAL_RUNTIME_PROFILE_ID,
+            .repository_id = PRIMARY_REPOSITORY_ID,
+        });
+        errdefer runtime_route.deinit(allocator);
 
         return .{
             .title = try allocator.dupeZ(u8, title),
@@ -319,6 +332,7 @@ pub const ChatThread = struct {
             .access_mode = .full_access,
             .provider = .codex,
             .harness = .local_cli,
+            .runtime_route = runtime_route,
             .tui_dock_id = null,
             .completion_pending = false,
             .completed_at_ms = 0,
@@ -396,6 +410,37 @@ pub const ChatThread = struct {
         if (extra_index >= self.draft_extra_images.items.len) return;
         var image = self.draft_extra_images.orderedRemove(extra_index);
         image.deinit(allocator);
+    }
+
+    /// Apply a route choice. Existing durable threads never mutate in place;
+    /// callers receive `new_thread_required` for a different selection.
+    pub fn selectRuntimeRoute(
+        self: *ChatThread,
+        allocator: std.mem.Allocator,
+        selection: thread_binding.Selection,
+    ) !thread_binding.SelectResult {
+        if (self.committed) self.runtime_route.lock();
+        return self.runtime_route.select(allocator, selection);
+    }
+
+    /// Record the verified stable runtime at the first durable-action
+    /// boundary. Repeating the same identity is safe; identity drift fails.
+    pub fn pinRuntimeRoute(self: *ChatThread, allocator: std.mem.Allocator, runtime_id: []const u8) !void {
+        try self.runtime_route.pin(allocator, runtime_id);
+    }
+
+    pub fn selectedRuntimeRoute(self: *const ChatThread) thread_binding.Selection {
+        return self.runtime_route.selectedRoute();
+    }
+
+    pub fn pinnedRuntimeRoute(self: *const ChatThread) ?thread_binding.Pinned {
+        return self.runtime_route.pinnedRoute();
+    }
+
+    /// Lock the current route at a durable-action boundary without inventing
+    /// a runtime identity for migrated or legacy Local work.
+    pub fn lockRuntimeRoute(self: *ChatThread) void {
+        self.runtime_route.lock();
     }
 
     pub fn draftImageCount(self: *const ChatThread) usize {
@@ -880,6 +925,7 @@ pub const ChatThread = struct {
         if (self.model_ref) |model_ref| allocator.free(model_ref);
         if (self.opencode_reasoning_variant) |variant| allocator.free(variant);
         if (self.cwd) |cwd| allocator.free(cwd);
+        self.runtime_route.deinit(allocator);
         for (self.messages.items) |message| {
             message.deinit(allocator);
         }

@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://verde.dev/specs/control-plane/v1/schemas/bootstrap-grant-claims.schema.json",
+  "title": "Verde Connect bootstrap grant JWT claims",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "iss",
+    "sub",
+    "aud",
+    "jti",
+    "iat",
+    "nbf",
+    "exp",
+    "contract_version",
+    "principal",
+    "link_id",
+    "runtime_id",
+    "instance_id",
+    "device_id",
+    "device_key_thumbprint",
+    "client_nonce",
+    "request_id",
+    "scopes"
+  ],
+  "properties": {
+    "iss": { "type": "string", "minLength": 1, "maxLength": 2048 },
+    "sub": { "type": "string", "minLength": 1, "maxLength": 2304 },
+    "aud": { "type": "string", "format": "uri", "maxLength": 2048 },
+    "jti": { "$ref": "common.schema.json#/$defs/grantId" },
+    "iat": { "type": "integer", "minimum": 0 },
+    "nbf": { "type": "integer", "minimum": 0 },
+    "exp": { "type": "integer", "minimum": 0 },
+    "contract_version": { "$ref": "common.schema.json#/$defs/contractVersion" },
+    "principal": { "$ref": "common.schema.json#/$defs/principal" },
+    "link_id": { "$ref": "common.schema.json#/$defs/linkId" },
+    "runtime_id": { "$ref": "common.schema.json#/$defs/runtimeId" },
+    "instance_id": { "$ref": "common.schema.json#/$defs/instanceId" },
+    "device_id": { "$ref": "common.schema.json#/$defs/deviceId" },
+    "device_key_thumbprint": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{43}$"
+    },
+    "client_nonce": { "$ref": "common.schema.json#/$defs/nonce" },
+    "request_id": { "$ref": "common.schema.json#/$defs/requestId" },
+    "scopes": { "$ref": "common.schema.json#/$defs/scopes" }
+  }
+}

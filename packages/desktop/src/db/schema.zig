@@ -6,9 +6,15 @@ const zqlite = @import("zqlite");
 /// Latest schema version understood by this build.
 pub const CURRENT_VERSION: i64 = 1;
 /// Maximum schema version understood by read-only clients and the daemon store.
-pub const MAX_SUPPORTED_VERSION: i64 = 6;
+pub const MAX_SUPPORTED_VERSION: i64 = 10;
 /// SQLite busy timeout shared by writer and read-only connections.
 pub const BUSY_TIMEOUT_MS = 5000;
+
+/// Stable daemon identity persisted alongside the authoritative store state.
+pub const RuntimeIdentity = struct {
+    runtime_id: []const u8,
+    instance_id: []const u8,
+};
 
 /// Stored shape of one attachment past the primary inside the additive v5
 /// `threads.draft_images_json` / `messages.extra_images_json` columns. Only
@@ -144,6 +150,38 @@ pub fn initializeToVersion(conn: zqlite.Conn, target_version: i64) !void {
     );
 }
 
+/// Initialize the authoritative daemon store and bind it to one identity.
+///
+/// For a new database or a pre-v8 database, the current schema and identity
+/// pair commit in the same migration transaction. A v8+ database must already carry
+/// the exact pair; missing, partial, or mismatched metadata is never reseeded.
+pub fn initializeStoreWithRuntimeIdentity(conn: zqlite.Conn, identity: RuntimeIdentity) !void {
+    if (!validRuntimeIdentityPart(identity.runtime_id) or
+        !validRuntimeIdentityPart(identity.instance_id))
+    {
+        return error.InvalidRuntimeIdentity;
+    }
+
+    try conn.busyTimeout(BUSY_TIMEOUT_MS);
+    const initial_version = try userVersion(conn);
+    if (initial_version > MAX_SUPPORTED_VERSION) return error.DatabaseSchemaTooNew;
+
+    if (initial_version < MAX_SUPPORTED_VERSION) {
+        try migrateToVersionWithRuntimeIdentity(conn, MAX_SUPPORTED_VERSION, identity);
+    } else {
+        try conn.execNoArgs("begin immediate");
+        errdefer conn.rollback();
+        try validateOrSeedRuntimeIdentity(conn, identity, false);
+        try seedLegacyPrimaryRepositories(conn);
+        try conn.commit();
+    }
+
+    try conn.execNoArgs(
+        \\pragma foreign_keys = on;
+        \\pragma journal_mode = wal;
+    );
+}
+
 /// Validate that a read-only connection can consume the schema without
 /// attempting initialization or migration.
 pub fn validateReadOnly(conn: zqlite.Conn) !void {
@@ -167,10 +205,28 @@ fn migrateToVersion(
     target_version: i64,
     comptime failure_point: MigrationFailurePoint,
 ) !void {
+    try migrateToVersionInternal(conn, target_version, failure_point, null);
+}
+
+fn migrateToVersionWithRuntimeIdentity(
+    conn: zqlite.Conn,
+    target_version: i64,
+    identity: RuntimeIdentity,
+) !void {
+    try migrateToVersionInternal(conn, target_version, .none, identity);
+}
+
+fn migrateToVersionInternal(
+    conn: zqlite.Conn,
+    target_version: i64,
+    comptime failure_point: MigrationFailurePoint,
+    runtime_identity: ?RuntimeIdentity,
+) !void {
     try conn.execNoArgs("begin immediate");
     errdefer conn.rollback();
 
-    var version = try userVersion(conn);
+    const initial_version = try userVersion(conn);
+    var version = initial_version;
     if (version > target_version) return error.DatabaseSchemaTooNew;
     while (version < target_version) {
         switch (version) {
@@ -210,8 +266,37 @@ fn migrateToVersion(
                 try conn.execNoArgs("pragma user_version = 6");
                 version = 6;
             },
+            6 => {
+                try migrateV6ToV7(conn);
+                if (failure_point == .before_version_bump) return error.TestMigrationFailure;
+                try conn.execNoArgs("pragma user_version = 7");
+                version = 7;
+            },
+            7 => {
+                try migrateV7ToV8(conn);
+                if (failure_point == .before_version_bump) return error.TestMigrationFailure;
+                try conn.execNoArgs("pragma user_version = 8");
+                version = 8;
+            },
+            8 => {
+                try migrateV8ToV9(conn);
+                if (failure_point == .before_version_bump) return error.TestMigrationFailure;
+                try conn.execNoArgs("pragma user_version = 9");
+                version = 9;
+            },
+            9 => {
+                try migrateV9ToV10(conn);
+                if (failure_point == .before_version_bump) return error.TestMigrationFailure;
+                try conn.execNoArgs("pragma user_version = 10");
+                version = 10;
+            },
             else => return error.DatabaseSchemaInvalid,
         }
+    }
+
+    if (runtime_identity) |identity| {
+        try validateOrSeedRuntimeIdentity(conn, identity, initial_version < 8);
+        try seedLegacyPrimaryRepositories(conn);
     }
 
     try conn.commit();
@@ -372,6 +457,296 @@ fn migrateV5ToV6(conn: zqlite.Conn) !void {
     try ensureColumn(conn, "threads", "cwd", "alter table threads add column cwd text");
 }
 
+fn migrateV6ToV7(conn: zqlite.Conn) !void {
+    // Per-thread execution routing. Nulls intentionally encode legacy Local +
+    // primary-repository state so every existing row remains valid and a
+    // stable runtime identity can be learned on a later handshake.
+    try ensureColumn(conn, "threads", "profile_id", "alter table threads add column profile_id text");
+    try ensureColumn(conn, "threads", "runtime_id", "alter table threads add column runtime_id text");
+    try ensureColumn(conn, "threads", "repository_id", "alter table threads add column repository_id text");
+    try ensureColumn(conn, "threads", "repository_cwd", "alter table threads add column repository_cwd text");
+    try conn.execNoArgs(
+        \\create trigger if not exists threads_committed_route_immutable
+        \\before update of committed, profile_id, runtime_id, repository_id, repository_cwd on threads
+        \\when old.committed != 0 and (
+        \\    new.committed = 0
+        \\    or coalesce(new.profile_id, 'local') != coalesce(old.profile_id, 'local')
+        \\    or coalesce(new.repository_id, 'primary') != coalesce(old.repository_id, 'primary')
+        \\    or coalesce(new.repository_cwd, '') != coalesce(old.repository_cwd, '')
+        \\    or (old.profile_id is not null and old.profile_id != 'local' and
+        \\        old.runtime_id is null)
+        \\    or (old.runtime_id is not null and
+        \\        (new.runtime_id is null or new.runtime_id != old.runtime_id))
+        \\)
+        \\begin
+        \\    select raise(abort, 'committed thread route is immutable');
+        \\end;
+    );
+}
+
+fn migrateV7ToV8(conn: zqlite.Conn) !void {
+    // The JSON sidecar keeps the data-directory runtime identity discoverable,
+    // while SQLite is authoritative for the store incarnation. Null/null is
+    // retained only so generic test/projection stores can migrate; production
+    // initialization seeds the pair in this same transaction.
+    try ensureColumn(conn, "store_state", "runtime_id", "alter table store_state add column runtime_id text");
+    try ensureColumn(conn, "store_state", "instance_id", "alter table store_state add column instance_id text");
+    try conn.execNoArgs(
+        \\drop trigger if exists threads_committed_route_immutable;
+        \\create trigger threads_committed_route_immutable
+        \\before update of committed, profile_id, runtime_id, repository_id, repository_cwd on threads
+        \\when old.committed != 0 and (
+        \\    new.committed = 0
+        \\    or coalesce(new.profile_id, 'local') != coalesce(old.profile_id, 'local')
+        \\    or coalesce(new.repository_id, 'primary') != coalesce(old.repository_id, 'primary')
+        \\    or coalesce(new.repository_cwd, '') != coalesce(old.repository_cwd, '')
+        \\    or (old.profile_id is not null and old.profile_id != 'local' and
+        \\        old.runtime_id is null)
+        \\    or (old.runtime_id is not null and
+        \\        (new.runtime_id is null or new.runtime_id != old.runtime_id))
+        \\)
+        \\begin
+        \\    select raise(abort, 'committed thread route is immutable');
+        \\end;
+        \\create trigger if not exists store_runtime_identity_pair_valid
+        \\before update of runtime_id, instance_id on store_state
+        \\when (new.runtime_id is null) != (new.instance_id is null)
+        \\  or (new.runtime_id is not null and (
+        \\      length(new.runtime_id) != 32
+        \\      or new.runtime_id glob '*[^0-9a-f]*'
+        \\      or length(new.instance_id) != 32
+        \\      or new.instance_id glob '*[^0-9a-f]*'
+        \\  ))
+        \\begin
+        \\    select raise(abort, 'invalid store runtime identity');
+        \\end;
+        \\create trigger if not exists store_runtime_identity_immutable
+        \\before update of runtime_id, instance_id on store_state
+        \\when (old.runtime_id is not null or old.instance_id is not null) and (
+        \\    new.runtime_id is null
+        \\    or new.instance_id is null
+        \\    or new.runtime_id != old.runtime_id
+        \\    or new.instance_id != old.instance_id
+        \\)
+        \\begin
+        \\    select raise(abort, 'store runtime identity is immutable');
+        \\end;
+    );
+}
+
+fn migrateV8ToV9(conn: zqlite.Conn) !void {
+    // Repository identity is workspace-scoped and checkout paths are
+    // runtime-scoped. The legacy workspace path remains the local runtime's
+    // stable `primary` binding instead of becoming an inferred repository ID.
+    try ensureColumn(
+        conn,
+        "workspaces",
+        "default_repository_id",
+        "alter table workspaces add column default_repository_id text not null default 'primary'",
+    );
+    try conn.execNoArgs(
+        \\create table if not exists workspace_repositories (
+        \\    id integer primary key,
+        \\    workspace_id integer not null references workspaces(id) on delete cascade,
+        \\    repository_id text not null check (
+        \\        length(repository_id) between 1 and 128 and
+        \\        repository_id not glob '*[^A-Za-z0-9._-]*'
+        \\    ),
+        \\    sort_index integer not null check (sort_index >= 0),
+        \\    label text not null check (length(label) between 1 and 256),
+        \\    vcs_identity text check (vcs_identity is null or length(vcs_identity) between 1 and 2048),
+        \\    default_branch text check (default_branch is null or length(default_branch) between 1 and 255),
+        \\    unique(workspace_id, repository_id)
+        \\);
+        \\create table if not exists workspace_repository_bindings (
+        \\    repository_row_id integer not null references workspace_repositories(id) on delete cascade,
+        \\    runtime_id text not null check (
+        \\        length(runtime_id) = 32 and runtime_id not glob '*[^0-9a-f]*'
+        \\    ),
+        \\    root_path text not null check (length(root_path) between 1 and 4096),
+        \\    availability text not null check (availability in ('available', 'missing', 'unknown')),
+        \\    primary key (repository_row_id, runtime_id)
+        \\);
+        \\create index if not exists workspace_repository_bindings_runtime_idx
+        \\    on workspace_repository_bindings(runtime_id, repository_row_id);
+        \\create trigger if not exists workspaces_primary_binding_path_insert_valid
+        \\before insert on workspaces
+        \\when exists (select 1 from store_state where id = 1 and runtime_id is not null)
+        \\ and not (
+        \\    (length(new.path) > 1 and substr(new.path, 1, 1) = '/')
+        \\    or (length(new.path) > 3 and substr(new.path, 1, 1) glob '[A-Za-z]'
+        \\        and substr(new.path, 2, 1) = ':'
+        \\        and substr(new.path, 3, 1) in ('/', '\'))
+        \\    or (substr(new.path, 1, 2) = '\\'
+        \\        and instr(substr(new.path, 3), '\') > 1
+        \\        and instr(substr(new.path, 3 + instr(substr(new.path, 3), '\')), '\') > 1
+        \\        and length(substr(new.path, 3 + instr(substr(new.path, 3), '\'))) >
+        \\            instr(substr(new.path, 3 + instr(substr(new.path, 3), '\')), '\'))
+        \\ )
+        \\begin
+        \\    select raise(abort, 'workspace primary repository path must be absolute');
+        \\end;
+        \\create trigger if not exists workspaces_primary_repository_insert
+        \\after insert on workspaces
+        \\begin
+        \\    insert into workspace_repositories (workspace_id, repository_id, sort_index, label)
+        \\    values (new.id, 'primary', 0, 'Primary');
+        \\    insert into workspace_repository_bindings (repository_row_id, runtime_id, root_path, availability)
+        \\    select repository.id, state.runtime_id, new.path, 'available'
+        \\    from workspace_repositories repository join store_state state on state.id = 1
+        \\    where repository.workspace_id = new.id
+        \\      and repository.repository_id = 'primary'
+        \\      and state.runtime_id is not null
+        \\      and (
+        \\          (length(new.path) > 1 and substr(new.path, 1, 1) = '/')
+        \\          or (length(new.path) > 3 and substr(new.path, 1, 1) glob '[A-Za-z]'
+        \\              and substr(new.path, 2, 1) = ':'
+        \\              and substr(new.path, 3, 1) in ('/', '\'))
+        \\          or (substr(new.path, 1, 2) = '\\'
+        \\              and instr(substr(new.path, 3), '\') > 1
+        \\              and instr(substr(new.path, 3 + instr(substr(new.path, 3), '\')), '\') > 1
+        \\              and length(substr(new.path, 3 + instr(substr(new.path, 3), '\'))) >
+        \\                  instr(substr(new.path, 3 + instr(substr(new.path, 3), '\')), '\'))
+        \\      );
+        \\    select case when not exists (
+        \\        select 1 from workspace_repositories repository
+        \\        where repository.workspace_id = new.id
+        \\          and repository.repository_id = new.default_repository_id
+        \\    ) then raise(abort, 'workspace default repository is missing') end;
+        \\end;
+        \\create trigger if not exists workspaces_default_repository_valid
+        \\before update of default_repository_id on workspaces
+        \\when not exists (
+        \\    select 1 from workspace_repositories repository
+        \\    where repository.workspace_id = old.id
+        \\      and repository.repository_id = new.default_repository_id
+        \\)
+        \\begin
+        \\    select raise(abort, 'workspace default repository is missing');
+        \\end;
+        \\create trigger if not exists workspace_default_repository_delete_guard
+        \\before delete on workspace_repositories
+        \\when exists (select 1 from workspaces where id = old.workspace_id)
+        \\ and old.repository_id = (
+        \\    select default_repository_id from workspaces where id = old.workspace_id
+        \\ )
+        \\begin
+        \\    select raise(abort, 'workspace default repository cannot be removed');
+        \\end;
+        \\create trigger if not exists workspace_primary_repository_delete_guard
+        \\before delete on workspace_repositories
+        \\when exists (select 1 from workspaces where id = old.workspace_id)
+        \\ and old.repository_id = 'primary'
+        \\begin
+        \\    select raise(abort, 'workspace primary repository cannot be removed');
+        \\end;
+        \\create trigger if not exists workspaces_primary_binding_path_update_valid
+        \\before update of path on workspaces
+        \\when new.path != old.path
+        \\ and exists (select 1 from store_state where id = 1 and runtime_id is not null)
+        \\ and not (
+        \\    (length(new.path) > 1 and substr(new.path, 1, 1) = '/')
+        \\    or (length(new.path) > 3 and substr(new.path, 1, 1) glob '[A-Za-z]'
+        \\        and substr(new.path, 2, 1) = ':'
+        \\        and substr(new.path, 3, 1) in ('/', '\'))
+        \\    or (substr(new.path, 1, 2) = '\\'
+        \\        and instr(substr(new.path, 3), '\') > 1
+        \\        and instr(substr(new.path, 3 + instr(substr(new.path, 3), '\')), '\') > 1
+        \\        and length(substr(new.path, 3 + instr(substr(new.path, 3), '\'))) >
+        \\            instr(substr(new.path, 3 + instr(substr(new.path, 3), '\')), '\'))
+        \\ )
+        \\begin
+        \\    select raise(abort, 'workspace primary repository path must be absolute');
+        \\end;
+        \\create trigger if not exists workspaces_primary_binding_path_sync
+        \\after update of path on workspaces
+        \\when new.path != old.path
+        \\begin
+        \\    update workspace_repository_bindings
+        \\    set root_path = new.path
+        \\    where repository_row_id = (
+        \\        select repository.id from workspace_repositories repository
+        \\        where repository.workspace_id = new.id and repository.repository_id = 'primary'
+        \\    )
+        \\      and runtime_id = (select runtime_id from store_state where id = 1);
+        \\end;
+    );
+    try seedLegacyPrimaryRepositories(conn);
+}
+
+fn migrateV9ToV10(conn: zqlite.Conn) !void {
+    // Additive and nullable: existing turns retain an explicitly unknown
+    // provider failure without reconstructing a code from display text.
+    try ensureColumn(
+        conn,
+        "chat_turns",
+        "failure_reason",
+        "alter table chat_turns add column failure_reason text check (failure_reason is null or failure_reason in ('provider_unavailable', 'provider_not_authenticated'))",
+    );
+}
+
+fn seedLegacyPrimaryRepositories(conn: zqlite.Conn) !void {
+    try conn.execNoArgs(
+        \\insert or ignore into workspace_repositories (workspace_id, repository_id, sort_index, label)
+        \\select id, 'primary', 0, 'Primary' from workspaces;
+        \\insert or ignore into workspace_repository_bindings (repository_row_id, runtime_id, root_path, availability)
+        \\select repository.id, state.runtime_id, workspace.path, 'available'
+        \\from workspace_repositories repository
+        \\join workspaces workspace on workspace.id = repository.workspace_id
+        \\join store_state state on state.id = 1
+        \\where repository.repository_id = 'primary' and state.runtime_id is not null
+        \\  and (
+        \\      (length(workspace.path) > 1 and substr(workspace.path, 1, 1) = '/')
+        \\      or (length(workspace.path) > 3 and substr(workspace.path, 1, 1) glob '[A-Za-z]'
+        \\          and substr(workspace.path, 2, 1) = ':'
+        \\          and substr(workspace.path, 3, 1) in ('/', '\'))
+        \\      or (substr(workspace.path, 1, 2) = '\\'
+        \\          and instr(substr(workspace.path, 3), '\') > 1
+        \\          and instr(substr(workspace.path, 3 + instr(substr(workspace.path, 3), '\')), '\') > 1
+        \\          and length(substr(workspace.path, 3 + instr(substr(workspace.path, 3), '\'))) >
+        \\              instr(substr(workspace.path, 3 + instr(substr(workspace.path, 3), '\')), '\'))
+        \\  );
+    );
+}
+
+fn validateOrSeedRuntimeIdentity(conn: zqlite.Conn, identity: RuntimeIdentity, allow_seed: bool) !void {
+    var row = (try conn.row(
+        "select runtime_id, instance_id from store_state where id = 1",
+        .{},
+    )) orelse return error.StoreMetadataMissing;
+    defer row.deinit();
+
+    const stored_runtime_id = row.nullableText(0);
+    const stored_instance_id = row.nullableText(1);
+    if (stored_runtime_id == null and stored_instance_id == null) {
+        if (!allow_seed) return error.StoreMetadataMissing;
+        try conn.exec(
+            "update store_state set runtime_id = ?1, instance_id = ?2 where id = 1",
+            .{ identity.runtime_id, identity.instance_id },
+        );
+        return;
+    }
+    if (stored_runtime_id == null or stored_instance_id == null) return error.StoreMetadataCorrupt;
+    if (!validRuntimeIdentityPart(stored_runtime_id.?) or
+        !validRuntimeIdentityPart(stored_instance_id.?))
+    {
+        return error.StoreMetadataCorrupt;
+    }
+    if (!std.mem.eql(u8, stored_runtime_id.?, identity.runtime_id) or
+        !std.mem.eql(u8, stored_instance_id.?, identity.instance_id))
+    {
+        return error.RuntimeIdentityMismatch;
+    }
+}
+
+fn validRuntimeIdentityPart(value: []const u8) bool {
+    if (value.len != 32) return false;
+    for (value) |byte| {
+        if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
+    }
+    return true;
+}
+
 fn migrateV0ToV1(conn: zqlite.Conn) !void {
     try conn.execNoArgs(INIT_SQL);
     try ensureColumn(conn, "app_state", "sidebar_collapsed", "alter table app_state add column sidebar_collapsed integer not null default 0");
@@ -517,6 +892,141 @@ test "schema migration chain advances v1 to v2 to v3 to v4 and preserves populat
     try migrateToVersion(conn, 6, .none);
     try std.testing.expectEqual(@as(i64, 6), try userVersion(conn));
     try std.testing.expect(try testHasColumn(conn, "threads", "cwd"));
+
+    try migrateToVersion(conn, 7, .none);
+    try std.testing.expectEqual(@as(i64, 7), try userVersion(conn));
+    try std.testing.expect(try testHasColumn(conn, "threads", "profile_id"));
+    try std.testing.expect(try testHasColumn(conn, "threads", "runtime_id"));
+    try std.testing.expect(try testHasColumn(conn, "threads", "repository_id"));
+    try std.testing.expect(try testHasColumn(conn, "threads", "repository_cwd"));
+
+    try migrateToVersion(conn, 8, .none);
+    try std.testing.expectEqual(@as(i64, 8), try userVersion(conn));
+    try std.testing.expect(try testHasColumn(conn, "store_state", "runtime_id"));
+    try std.testing.expect(try testHasColumn(conn, "store_state", "instance_id"));
+    var identity = (try conn.row(
+        "select runtime_id, instance_id from store_state where id = 1",
+        .{},
+    )).?;
+    defer identity.deinit();
+    try std.testing.expect(identity.nullableText(0) == null);
+    try std.testing.expect(identity.nullableText(1) == null);
+
+    try migrateToVersion(conn, 9, .none);
+    try std.testing.expectEqual(@as(i64, 9), try userVersion(conn));
+    try std.testing.expect(try testHasColumn(conn, "workspaces", "default_repository_id"));
+    try std.testing.expect(try testHasColumn(conn, "workspace_repositories", "repository_id"));
+    try std.testing.expect(try testHasColumn(conn, "workspace_repository_bindings", "runtime_id"));
+    var primary = (try conn.row(
+        "select repository_id, label from workspace_repositories where workspace_id = (select id from workspaces where workspace_id = 'chain-workspace')",
+        .{},
+    )).?;
+    defer primary.deinit();
+    try std.testing.expectEqualStrings("primary", primary.text(0));
+    try std.testing.expectEqualStrings("Primary", primary.text(1));
+
+    try conn.execNoArgs(
+        "insert into chat_turns (turn_id, workspace_id, local_thread_id, status, started_at_ms, provider, error_message) values ('legacy-failed-turn', 'chain-workspace', 'v3-thread', 'failed', 400, 'codex', 'opaque legacy failure')",
+    );
+    try migrateToVersion(conn, 10, .none);
+    try std.testing.expectEqual(@as(i64, 10), try userVersion(conn));
+    try std.testing.expect(try testHasColumn(conn, "chat_turns", "failure_reason"));
+    var legacy_turn = (try conn.row(
+        "select error_message, failure_reason from chat_turns where turn_id = 'legacy-failed-turn'",
+        .{},
+    )).?;
+    defer legacy_turn.deinit();
+    try std.testing.expectEqualStrings("opaque legacy failure", legacy_turn.text(0));
+    try std.testing.expect(legacy_turn.nullableText(1) == null);
+}
+
+test "v9 migration preserves legacy path as primary runtime binding" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const path = try std.fs.path.joinZ(std.testing.allocator, &.{ path_buf[0..path_len], "state.sqlite" });
+    defer std.testing.allocator.free(path);
+
+    const runtime_id = "0123456789abcdef0123456789abcdef";
+    const conn = try zqlite.open(path, zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
+    defer conn.close();
+    try migrateToVersion(conn, 8, .none);
+    try conn.exec(
+        "update store_state set runtime_id = ?1, instance_id = ?2 where id = 1",
+        .{ runtime_id, "fedcba9876543210fedcba9876543210" },
+    );
+    try conn.execNoArgs(
+        \\insert into app_state (id, selected_workspace_index, sidebar_collapsed) values (1, 0, 0);
+        \\insert into workspaces (workspace_id, sort_index, label, path) values ('legacy', 0, 'Legacy', '/legacy');
+    );
+
+    try migrateToVersion(conn, 9, .none);
+    {
+        var migrated = (try conn.row(
+            \\select workspace.default_repository_id, repository.repository_id, binding.runtime_id, binding.root_path
+            \\from workspaces workspace
+            \\join workspace_repositories repository on repository.workspace_id = workspace.id
+            \\join workspace_repository_bindings binding on binding.repository_row_id = repository.id
+            \\where workspace.workspace_id = 'legacy'
+        , .{})).?;
+        defer migrated.deinit();
+        try std.testing.expectEqualStrings("primary", migrated.text(0));
+        try std.testing.expectEqualStrings("primary", migrated.text(1));
+        try std.testing.expectEqualStrings(runtime_id, migrated.text(2));
+        try std.testing.expectEqualStrings("/legacy", migrated.text(3));
+    }
+
+    try std.testing.expectError(
+        error.ConstraintTrigger,
+        conn.execNoArgs("insert into workspaces (workspace_id, sort_index, label, path) values ('root-posix', 1, 'Root', '/')"),
+    );
+    try std.testing.expectError(
+        error.ConstraintTrigger,
+        conn.execNoArgs("insert into workspaces (workspace_id, sort_index, label, path) values ('root-drive', 1, 'Root', 'C:\\')"),
+    );
+    try std.testing.expectError(
+        error.ConstraintTrigger,
+        conn.execNoArgs("insert into workspaces (workspace_id, sort_index, label, path) values ('root-unc', 1, 'Root', '\\\\server\\share')"),
+    );
+
+    try conn.execNoArgs(
+        "insert into workspaces (workspace_id, sort_index, label, path) values ('new', 1, 'New', '/new')",
+    );
+    {
+        var inserted = (try conn.row(
+            \\select binding.root_path
+            \\from workspace_repository_bindings binding
+            \\join workspace_repositories repository on repository.id = binding.repository_row_id
+            \\join workspaces workspace on workspace.id = repository.workspace_id
+            \\where workspace.workspace_id = 'new' and repository.repository_id = 'primary'
+        , .{})).?;
+        defer inserted.deinit();
+        try std.testing.expectEqualStrings("/new", inserted.text(0));
+    }
+
+    try conn.execNoArgs("update workspaces set path = '/new-location' where workspace_id = 'new'");
+    {
+        var moved = (try conn.row(
+            \\select binding.root_path
+            \\from workspace_repository_bindings binding
+            \\join workspace_repositories repository on repository.id = binding.repository_row_id
+            \\join workspaces workspace on workspace.id = repository.workspace_id
+            \\where workspace.workspace_id = 'new' and repository.repository_id = 'primary'
+        , .{})).?;
+        defer moved.deinit();
+        try std.testing.expectEqualStrings("/new-location", moved.text(0));
+    }
+
+    try conn.execNoArgs("pragma foreign_keys = on");
+    try conn.execNoArgs("delete from workspaces where workspace_id = 'new'");
+    var orphan_count = (try conn.row(
+        "select count(*) from workspace_repositories where workspace_id not in (select id from workspaces)",
+        .{},
+    )).?;
+    defer orphan_count.deinit();
+    try std.testing.expectEqual(@as(i64, 0), orphan_count.int(0));
 }
 
 test "v1 to v2 migration failure before version bump rolls back cleanly" {

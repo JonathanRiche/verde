@@ -88,8 +88,6 @@ transcript.
 
 Codex, Claude Code, OpenCode, Pi, and Grok accept local image attachments.
 Cursor and FX accept them when their ACP session advertises image support.
-Remote Herdr Codex GUI sends do not currently accept local image attachments;
-Verde reports the limitation instead of silently dropping them.
 
 To reference a workspace file, type `@` followed by part of its name or path.
 Verde searches the imported workspace, shows up to eight matching files, and

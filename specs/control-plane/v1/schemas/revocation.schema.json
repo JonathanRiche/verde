@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://verde.dev/specs/control-plane/v1/schemas/revocation.schema.json",
+  "title": "Revocation messages",
+  "$defs": {
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "request_id",
+        "entity_type",
+        "entity_id"
+      ],
+      "properties": {
+        "contract_version": {
+          "$ref": "common.schema.json#/$defs/contractVersion"
+        },
+        "request_id": {
+          "$ref": "common.schema.json#/$defs/requestId"
+        },
+        "entity_type": {
+          "enum": ["runtime_link", "device", "endpoint_enrollment"]
+        },
+        "entity_id": {
+          "type": "string",
+          "pattern": "^[a-z]{3}_[0-9a-f]{32}$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[\\x20-\\x7e]+$"
+        }
+      }
+    },
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "revocation_id",
+        "entity_type",
+        "entity_id",
+        "revoked_at"
+      ],
+      "properties": {
+        "contract_version": {
+          "$ref": "common.schema.json#/$defs/contractVersion"
+        },
+        "revocation_id": {
+          "$ref": "common.schema.json#/$defs/revocationId"
+        },
+        "entity_type": {
+          "enum": ["runtime_link", "device", "endpoint_enrollment"]
+        },
+        "entity_id": {
+          "type": "string"
+        },
+        "revoked_at": {
+          "$ref": "common.schema.json#/$defs/timestamp"
+        }
+      }
+    }
+  }
+}

@@ -8,6 +8,7 @@ const schema = @import("schema.zig");
 const db_types = @import("types.zig");
 const migration_fixture = @import("migration_fixture.zig");
 const provider_types = @import("../providers/types.zig");
+const thread_binding = @import("../runtime/thread_binding.zig");
 
 const LoadedState = db_types.LoadedState;
 const PersistedChatCompletion = db_types.PersistedChatCompletion;
@@ -18,6 +19,38 @@ const PersistedProject = db_types.PersistedProject;
 const PersistedState = db_types.PersistedState;
 const PersistedSurfaceState = db_types.PersistedSurfaceState;
 const PersistedThread = db_types.PersistedThread;
+
+const LEGACY_LOCAL_PROFILE_ID = "local";
+const LEGACY_PRIMARY_REPOSITORY_ID = "primary";
+
+const PersistedThreadRoute = struct {
+    profile_id: ?[]const u8,
+    runtime_id: ?[]const u8,
+    repository_id: ?[]const u8,
+    repository_cwd: ?[]const u8,
+
+    fn fromThread(thread: PersistedThread) PersistedThreadRoute {
+        return .{
+            .profile_id = thread.profile_id,
+            .runtime_id = thread.runtime_id,
+            .repository_id = thread.repository_id,
+            .repository_cwd = thread.repository_cwd,
+        };
+    }
+
+    fn isAbsent(self: PersistedThreadRoute) bool {
+        return self.profile_id == null and self.runtime_id == null and
+            self.repository_id == null and self.repository_cwd == null;
+    }
+
+    fn isLegacyLocalEquivalent(self: PersistedThreadRoute) bool {
+        if (self.isAbsent()) return true;
+        return optionalTextEqual(self.profile_id, LEGACY_LOCAL_PROFILE_ID) and
+            self.runtime_id == null and
+            optionalTextEqual(self.repository_id, LEGACY_PRIMARY_REPOSITORY_ID) and
+            self.repository_cwd == null;
+    }
+};
 
 /// Compare every field in the canonical durable surface representation.
 pub fn surfaceStatesEqual(a: PersistedSurfaceState, b: PersistedSurfaceState) bool {
@@ -397,6 +430,11 @@ pub const Client = struct {
         try self.conn.transaction();
         errdefer self.conn.rollback();
 
+        // Full-state compatibility saves replace every thread row. Compare
+        // stable thread identities before those deletes so a committed remote
+        // route cannot be rewritten as legacy Local by an omitted field.
+        try self.guardPersistedThreadRoutes(state);
+
         try self.conn.execNoArgs(
             \\delete from messages;
             \\delete from threads;
@@ -456,15 +494,19 @@ pub const Client = struct {
     pub fn saveThread(self: *const Self, workspace_id: []const u8, thread_index: usize, thread: PersistedThread) !void {
         in_process_write_mutex.lock();
         defer in_process_write_mutex.unlock();
-        var workspace_row = (try self.conn.row(
-            "select id from workspaces where workspace_id = ?1",
-            .{workspace_id},
-        )) orelse return error.WorkspaceNotFound;
-        defer workspace_row.deinit();
-        const workspace_row_id = workspace_row.int(0);
-
         try self.conn.transaction();
         errdefer self.conn.rollback();
+        const workspace_row_id = blk: {
+            var workspace_row = (try self.conn.row(
+                "select id from workspaces where workspace_id = ?1",
+                .{workspace_id},
+            )) orelse return error.WorkspaceNotFound;
+            defer workspace_row.deinit();
+            break :blk workspace_row.int(0);
+        };
+        // This writer deletes and reinserts its target row, so the schema's
+        // UPDATE trigger alone cannot protect the immutable route.
+        try self.guardPersistedThreadRoute(workspace_row_id, thread_index, thread);
         try self.conn.exec(
             "delete from threads where workspace_id = ?1 and sort_index = ?2",
             .{ workspace_row_id, @as(i64, @intCast(thread_index)) },
@@ -544,6 +586,155 @@ pub const Client = struct {
         return true;
     }
 
+    fn hasThreadRouteColumns(self: *const Self) bool {
+        return self.hasColumn("threads", "profile_id") and
+            self.hasColumn("threads", "runtime_id") and
+            self.hasColumn("threads", "repository_id") and
+            self.hasColumn("threads", "repository_cwd");
+    }
+
+    fn guardPersistedThreadRoutes(self: *const Self, state: PersistedState) !void {
+        const has_route_columns = self.hasThreadRouteColumns();
+        for (state.projects, 0..) |project, project_index| {
+            const workspace_row_id = if (has_route_columns)
+                try self.fullSaveWorkspaceRowId(state, project, project_index)
+            else
+                null;
+
+            if (project.threads) |threads| {
+                for (threads, 0..) |thread, thread_index| {
+                    try self.validatePersistedThreadRouteForSchema(thread, has_route_columns);
+                    if (workspace_row_id) |row_id| {
+                        try self.guardFullSaveCommittedThreadRoute(row_id, project, thread_index, thread);
+                    }
+                }
+            } else {
+                const thread = synthesizedProjectThread(state, project, project_index);
+                try self.validatePersistedThreadRouteForSchema(thread, has_route_columns);
+                if (workspace_row_id) |row_id| {
+                    try self.guardFullSaveCommittedThreadRoute(row_id, project, 0, thread);
+                }
+            }
+        }
+    }
+
+    fn guardPersistedThreadRoute(
+        self: *const Self,
+        workspace_row_id: i64,
+        thread_index: usize,
+        thread: PersistedThread,
+    ) !void {
+        const has_route_columns = self.hasThreadRouteColumns();
+        try self.validatePersistedThreadRouteForSchema(thread, has_route_columns);
+        if (!has_route_columns) return;
+        try self.guardFocusedSaveCommittedThreadRoute(workspace_row_id, thread_index, thread);
+    }
+
+    fn validatePersistedThreadRouteForSchema(
+        _: *const Self,
+        thread: PersistedThread,
+        has_route_columns: bool,
+    ) !void {
+        const route = PersistedThreadRoute.fromThread(thread);
+        try validatePersistedThreadRoute(route);
+        if (thread.committed and route.profile_id != null and
+            !std.mem.eql(u8, route.profile_id.?, LEGACY_LOCAL_PROFILE_ID) and
+            route.runtime_id == null)
+        {
+            return error.InvalidPersistedThreadRoute;
+        }
+        if (thread.committed and !route.isAbsent()) {
+            const local_thread_id = thread.local_thread_id orelse
+                return error.InvalidPersistedThreadRoute;
+            if (local_thread_id.len == 0) return error.InvalidPersistedThreadRoute;
+        }
+        if (!has_route_columns and !route.isLegacyLocalEquivalent()) {
+            return error.ThreadRouteSchemaUnavailable;
+        }
+    }
+
+    fn fullSaveWorkspaceRowId(
+        self: *const Self,
+        state: PersistedState,
+        project: PersistedProject,
+        project_index: usize,
+    ) !?i64 {
+        const workspace_key = project.id orelse project.path;
+        if (try self.conn.row(
+            "select id from workspaces where workspace_id = ?1",
+            .{workspace_key},
+        )) |row| {
+            defer row.deinit();
+            return row.int(0);
+        }
+
+        // An unmatched row at this position is a replacement candidate, not
+        // automatically a new workspace. If its stable identity exists
+        // elsewhere in the incoming snapshot it is merely being reordered.
+        const row = (try self.conn.row(
+            "select w.id, w.workspace_id, exists(" ++
+                "select 1 from threads t where t.workspace_id = w.id and t.committed != 0" ++
+                ") from workspaces w where w.sort_index = ?1",
+            .{@as(i64, @intCast(project_index))},
+        )) orelse return null;
+        defer row.deinit();
+        if (stateContainsWorkspaceId(state, row.text(1))) return null;
+        if (row.int(2) != 0) return error.CommittedWorkspaceIdentityImmutable;
+        return row.int(0);
+    }
+
+    fn guardFullSaveCommittedThreadRoute(
+        self: *const Self,
+        workspace_row_id: i64,
+        project: PersistedProject,
+        thread_index: usize,
+        thread: PersistedThread,
+    ) !void {
+        var maybe_row = if (thread.local_thread_id) |local_thread_id|
+            try self.conn.row(
+                "select committed, profile_id, runtime_id, repository_id, repository_cwd " ++
+                    "from threads where workspace_id = ?1 and local_thread_id = ?2",
+                .{ workspace_row_id, local_thread_id },
+            )
+        else
+            null;
+        if (maybe_row == null) {
+            maybe_row = try self.conn.row(
+                "select committed, profile_id, runtime_id, repository_id, repository_cwd, local_thread_id " ++
+                    "from threads where workspace_id = ?1 and sort_index = ?2",
+                .{ workspace_row_id, @as(i64, @intCast(thread_index)) },
+            );
+            if (maybe_row) |row| {
+                if (row.nullableText(5)) |old_local_thread_id| {
+                    if (projectContainsThreadId(project, old_local_thread_id)) {
+                        row.deinit();
+                        return;
+                    }
+                }
+                try guardCommittedThreadIdentity(row, thread);
+            }
+        }
+        const row = maybe_row orelse return;
+        defer row.deinit();
+        try guardCommittedRouteRow(row, thread);
+    }
+
+    fn guardFocusedSaveCommittedThreadRoute(
+        self: *const Self,
+        workspace_row_id: i64,
+        thread_index: usize,
+        thread: PersistedThread,
+    ) !void {
+        const row = (try self.conn.row(
+            "select committed, profile_id, runtime_id, repository_id, repository_cwd, local_thread_id " ++
+                "from threads where workspace_id = ?1 and sort_index = ?2",
+            .{ workspace_row_id, @as(i64, @intCast(thread_index)) },
+        )) orelse return;
+        defer row.deinit();
+        try guardCommittedThreadIdentity(row, thread);
+        try guardCommittedRouteRow(row, thread);
+    }
+
     fn loadThreads(
         self: *const Self,
         allocator: std.mem.Allocator,
@@ -556,17 +747,28 @@ pub const Client = struct {
         const has_draft_images = self.hasColumn("threads", "draft_images_json");
         // v6 adds the per-thread cwd override; older files read it as null.
         const has_cwd = self.hasColumn("threads", "cwd");
+        // v7 adds the immutable execution-route fields as one migration.
+        const has_runtime_route = self.hasThreadRouteColumns();
         const select_prefix = "select id, title, archived, committed, local_thread_id, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size, ";
         const select_suffix = " from threads where workspace_id = ?1 order by sort_index";
         var thread_rows = try self.conn.rows(
-            if (has_draft_images and has_cwd)
-                select_prefix ++ "draft_images_json, cwd" ++ select_suffix
+            if (has_runtime_route)
+                if (has_draft_images and has_cwd)
+                    select_prefix ++ "draft_images_json, cwd, profile_id, runtime_id, repository_id, repository_cwd" ++ select_suffix
+                else if (has_draft_images)
+                    select_prefix ++ "draft_images_json, null, profile_id, runtime_id, repository_id, repository_cwd" ++ select_suffix
+                else if (has_cwd)
+                    select_prefix ++ "null, cwd, profile_id, runtime_id, repository_id, repository_cwd" ++ select_suffix
+                else
+                    select_prefix ++ "null, null, profile_id, runtime_id, repository_id, repository_cwd" ++ select_suffix
+            else if (has_draft_images and has_cwd)
+                select_prefix ++ "draft_images_json, cwd, null, null, null, null" ++ select_suffix
             else if (has_draft_images)
-                select_prefix ++ "draft_images_json, null" ++ select_suffix
+                select_prefix ++ "draft_images_json, null, null, null, null, null" ++ select_suffix
             else if (has_cwd)
-                select_prefix ++ "null, cwd" ++ select_suffix
+                select_prefix ++ "null, cwd, null, null, null, null" ++ select_suffix
             else
-                select_prefix ++ "null, null" ++ select_suffix,
+                select_prefix ++ "null, null, null, null, null, null" ++ select_suffix,
             .{project_id},
         );
         defer thread_rows.deinit();
@@ -595,6 +797,10 @@ pub const Client = struct {
                 .harness = decodeEnumOr(db_types.Harness, thread_row.int(13), .local_cli),
                 .tui_dock_id = if (thread_row.nullableInt(14)) |value| @intCast(value) else null,
                 .cwd = try dupeOptionalText(allocator, thread_row.nullableText(20)),
+                .profile_id = try dupeOptionalText(allocator, thread_row.nullableText(21)),
+                .runtime_id = try dupeOptionalText(allocator, thread_row.nullableText(22)),
+                .repository_id = try dupeOptionalText(allocator, thread_row.nullableText(23)),
+                .repository_cwd = try dupeOptionalText(allocator, thread_row.nullableText(24)),
                 .draft = try allocator.dupe(u8, thread_row.text(15)),
                 .draft_image = try loadOptionalImage(
                     allocator,
@@ -699,24 +905,7 @@ pub const Client = struct {
             return self.saveThreads(project_id, threads);
         }
 
-        var synthesized: PersistedThread = .{
-            .title = "New thread",
-            .archived = project.archived,
-            .committed = project.messages.len > 0,
-            .last_activity_at = if (project.messages.len > 0) 0 else null,
-            .provider = project.provider,
-            .harness = project.harness,
-            .draft = project.draft,
-            .messages = project.messages,
-        };
-
-        if (project_index == 0 and project.messages.len == 0 and state.messages != null) {
-            synthesized.provider = state.provider orelse synthesized.provider;
-            synthesized.harness = state.harness orelse synthesized.harness;
-            synthesized.draft = state.draft orelse synthesized.draft;
-            synthesized.messages = state.messages.?;
-        }
-
+        const synthesized = synthesizedProjectThread(state, project, project_index);
         return self.saveThreads(project_id, &.{synthesized});
     }
 
@@ -753,7 +942,13 @@ pub const Client = struct {
         // The v1 writer only carries `cwd` once the daemon has migrated the
         // file to v6; binding a 21st value against a 20-placeholder statement
         // is a range error, so the two shapes stay separate statements.
-        if (self.hasColumn("threads", "cwd")) {
+        if (self.hasThreadRouteColumns()) {
+            try self.conn.exec(
+                "insert into threads (workspace_id, sort_index, title, archived, committed, local_thread_id, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size, cwd, profile_id, runtime_id, repository_id, repository_cwd) " ++
+                    "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+                base_values ++ .{ thread.cwd, thread.profile_id, thread.runtime_id, thread.repository_id, thread.repository_cwd },
+            );
+        } else if (self.hasColumn("threads", "cwd")) {
             try self.conn.exec(
                 "insert into threads (workspace_id, sort_index, title, archived, committed, local_thread_id, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size, cwd) " ++
                     "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
@@ -793,6 +988,130 @@ pub const Client = struct {
         }
     }
 };
+
+fn synthesizedProjectThread(
+    state: PersistedState,
+    project: PersistedProject,
+    project_index: usize,
+) PersistedThread {
+    var thread: PersistedThread = .{
+        .title = "New thread",
+        .archived = project.archived,
+        .committed = project.messages.len > 0,
+        .last_activity_at = if (project.messages.len > 0) 0 else null,
+        .provider = project.provider,
+        .harness = project.harness,
+        .draft = project.draft,
+        .messages = project.messages,
+    };
+    if (project_index == 0 and project.messages.len == 0 and state.messages != null) {
+        thread.provider = state.provider orelse thread.provider;
+        thread.harness = state.harness orelse thread.harness;
+        thread.draft = state.draft orelse thread.draft;
+        thread.messages = state.messages.?;
+    }
+    return thread;
+}
+
+fn validatePersistedThreadRoute(route: PersistedThreadRoute) !void {
+    if (route.isAbsent()) return;
+    const profile_id = route.profile_id orelse return error.InvalidPersistedThreadRoute;
+    const repository_id = route.repository_id orelse return error.InvalidPersistedThreadRoute;
+    thread_binding.validateSelection(.{
+        .profile_id = profile_id,
+        .repository_id = repository_id,
+        .relative_cwd = route.repository_cwd,
+    }) catch return error.InvalidPersistedThreadRoute;
+    if (route.runtime_id) |runtime_id| {
+        thread_binding.validateRuntimeId(runtime_id) catch return error.InvalidPersistedThreadRoute;
+    }
+}
+
+fn stateContainsWorkspaceId(state: PersistedState, workspace_id: []const u8) bool {
+    for (state.projects) |project| {
+        if (std.mem.eql(u8, project.id orelse project.path, workspace_id)) return true;
+    }
+    return false;
+}
+
+fn projectContainsThreadId(project: PersistedProject, local_thread_id: []const u8) bool {
+    const threads = project.threads orelse return false;
+    for (threads) |thread| {
+        const candidate = thread.local_thread_id orelse continue;
+        if (std.mem.eql(u8, candidate, local_thread_id)) return true;
+    }
+    return false;
+}
+
+fn guardCommittedThreadIdentity(row: zqlite.Row, thread: PersistedThread) !void {
+    if (row.int(0) == 0) return;
+    const old_local_thread_id = row.nullableText(5);
+    if (old_local_thread_id == null or old_local_thread_id.?.len == 0) {
+        const old_route: PersistedThreadRoute = .{
+            .profile_id = row.nullableText(1),
+            .runtime_id = row.nullableText(2),
+            .repository_id = row.nullableText(3),
+            .repository_cwd = row.nullableText(4),
+        };
+        // Only an exact pre-v7 Local row may learn its first stable thread
+        // identity. An explicit/partial route without one is opaque: assigning
+        // an identity during delete/reinsert would silently legitimize it.
+        if (!old_route.isAbsent()) return error.CommittedThreadIdentityImmutable;
+        return;
+    }
+    const incoming_local_thread_id = thread.local_thread_id orelse
+        return error.CommittedThreadIdentityImmutable;
+    if (incoming_local_thread_id.len == 0 or
+        !std.mem.eql(u8, old_local_thread_id.?, incoming_local_thread_id))
+    {
+        return error.CommittedThreadIdentityImmutable;
+    }
+}
+
+fn guardCommittedRouteRow(row: zqlite.Row, thread: PersistedThread) !void {
+    if (row.int(0) == 0) return;
+    if (!thread.committed) return error.CommittedThreadCannotBecomeDraft;
+    const old_route: PersistedThreadRoute = .{
+        .profile_id = row.nullableText(1),
+        .runtime_id = row.nullableText(2),
+        .repository_id = row.nullableText(3),
+        .repository_cwd = row.nullableText(4),
+    };
+    if (!committedRouteRewriteAllowed(old_route, PersistedThreadRoute.fromThread(thread))) {
+        return error.CommittedThreadRouteImmutable;
+    }
+}
+
+fn committedRouteRewriteAllowed(old: PersistedThreadRoute, incoming: PersistedThreadRoute) bool {
+    // Only the wholly absent pre-v7 shape has Local + primary semantics. A
+    // partial/corrupt old row remains opaque and cannot be normalized into an
+    // executable route by a compatibility save.
+    if (!old.isAbsent() and (old.profile_id == null or old.repository_id == null)) return false;
+    if (!incoming.isAbsent() and (incoming.profile_id == null or incoming.repository_id == null)) return false;
+    if (old.profile_id) |profile_id| {
+        if (!std.mem.eql(u8, profile_id, LEGACY_LOCAL_PROFILE_ID) and old.runtime_id == null) return false;
+    }
+
+    const old_profile = old.profile_id orelse LEGACY_LOCAL_PROFILE_ID;
+    const incoming_profile = incoming.profile_id orelse LEGACY_LOCAL_PROFILE_ID;
+    const old_repository = old.repository_id orelse LEGACY_PRIMARY_REPOSITORY_ID;
+    const incoming_repository = incoming.repository_id orelse LEGACY_PRIMARY_REPOSITORY_ID;
+    if (!std.mem.eql(u8, old_profile, incoming_profile) or
+        !std.mem.eql(u8, old_repository, incoming_repository) or
+        !optionalTextEqual(old.repository_cwd, incoming.repository_cwd))
+    {
+        return false;
+    }
+
+    // A migrated committed row may not know its runtime identity yet. The
+    // first verified identity is the sole allowed change; once known it may
+    // neither change nor be cleared.
+    if (old.runtime_id) |old_runtime_id| {
+        const incoming_runtime_id = incoming.runtime_id orelse return false;
+        return std.mem.eql(u8, old_runtime_id, incoming_runtime_id);
+    }
+    return true;
+}
 
 /// Decode the additive `*_images_json` column (attachments past the primary)
 /// into persisted attachments. Malformed JSON degrades to "no extras" rather
@@ -1754,6 +2073,415 @@ test "single-thread save preserves unrelated transcript history" {
     try testing.expectEqualStrings("Target updated", threads[1].title);
     try testing.expectEqual(@as(usize, 2), threads[1].messages.len);
     try testing.expectEqualStrings("new prompt", threads[1].messages[1].body);
+}
+
+test "full save pins but never replaces a committed thread route" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
+    defer testing.allocator.free(pref_path);
+
+    var client = try Client.init(testing.allocator, pref_path);
+    defer client.deinit();
+    try schema.initializeToVersion(client.conn, 7);
+
+    const initial: PersistedThread = .{
+        .title = "Remote route",
+        .committed = false,
+        .local_thread_id = "full-route-thread",
+        .profile_id = "remote-box",
+        .repository_id = "repo-api",
+        .repository_cwd = "services/api",
+    };
+    try client.save(.{ .projects = &.{.{
+        .id = "route-workspace",
+        .label = "Route workspace",
+        .path = "/tmp/route-workspace",
+        .threads = &.{initial},
+    }} });
+
+    var pinned = initial;
+    pinned.title = "Pinned route";
+    pinned.committed = true;
+    pinned.runtime_id = "0123456789abcdef0123456789abcdef";
+    try client.save(.{ .projects = &.{.{
+        .id = "route-workspace",
+        .label = "Route workspace",
+        .path = "/tmp/route-workspace",
+        .threads = &.{pinned},
+    }} });
+
+    var profile_drift = pinned;
+    profile_drift.profile_id = LEGACY_LOCAL_PROFILE_ID;
+    try testing.expectError(error.CommittedThreadRouteImmutable, client.save(.{ .projects = &.{.{
+        .id = "route-workspace",
+        .label = "Route workspace",
+        .path = "/tmp/route-workspace",
+        .threads = &.{profile_drift},
+    }} }));
+
+    var runtime_drift = pinned;
+    runtime_drift.runtime_id = "fedcba9876543210fedcba9876543210";
+    try testing.expectError(error.CommittedThreadRouteImmutable, client.save(.{ .projects = &.{.{
+        .id = "route-workspace",
+        .label = "Route workspace",
+        .path = "/tmp/route-workspace",
+        .threads = &.{runtime_drift},
+    }} }));
+
+    var identity_drift = pinned;
+    identity_drift.local_thread_id = "full-route-thread-replaced";
+    try testing.expectError(error.CommittedThreadIdentityImmutable, client.save(.{ .projects = &.{.{
+        .id = "route-workspace",
+        .label = "Route workspace",
+        .path = "/tmp/route-workspace",
+        .threads = &.{identity_drift},
+    }} }));
+    try testing.expectError(error.CommittedWorkspaceIdentityImmutable, client.save(.{ .projects = &.{.{
+        .id = "route-workspace-replaced",
+        .label = "Route workspace",
+        .path = "/tmp/route-workspace",
+        .threads = &.{pinned},
+    }} }));
+    var unlocked = pinned;
+    unlocked.committed = false;
+    try testing.expectError(error.CommittedThreadCannotBecomeDraft, client.save(.{ .projects = &.{.{
+        .id = "route-workspace",
+        .label = "Route workspace",
+        .path = "/tmp/route-workspace",
+        .threads = &.{unlocked},
+    }} }));
+
+    {
+        const row = (try client.conn.row(
+            "select title, profile_id, runtime_id, repository_id, repository_cwd " ++
+                "from threads where local_thread_id = 'full-route-thread'",
+            .{},
+        )).?;
+        defer row.deinit();
+        try testing.expectEqualStrings("Pinned route", row.text(0));
+        try testing.expectEqualStrings("remote-box", row.text(1));
+        try testing.expectEqualStrings("0123456789abcdef0123456789abcdef", row.text(2));
+        try testing.expectEqualStrings("repo-api", row.text(3));
+        try testing.expectEqualStrings("services/api", row.text(4));
+    }
+
+    var loaded = (try client.load(testing.allocator)).?;
+    defer loaded.deinit();
+    const loaded_thread = loaded.value.projects[0].threads.?[0];
+    try testing.expectEqualStrings("remote-box", loaded_thread.profile_id.?);
+    try testing.expectEqualStrings("0123456789abcdef0123456789abcdef", loaded_thread.runtime_id.?);
+    try testing.expectEqualStrings("repo-api", loaded_thread.repository_id.?);
+    try testing.expectEqualStrings("services/api", loaded_thread.repository_cwd.?);
+}
+
+test "single-thread save pins but never replaces a committed thread route" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
+    defer testing.allocator.free(pref_path);
+
+    var client = try Client.init(testing.allocator, pref_path);
+    defer client.deinit();
+    try schema.initializeToVersion(client.conn, 7);
+
+    const initial: PersistedThread = .{
+        .title = "Remote route",
+        .committed = false,
+        .local_thread_id = "focused-route-thread",
+        .profile_id = "remote-box",
+        .repository_id = "repo-api",
+        .repository_cwd = "services/api",
+    };
+    try client.save(.{ .projects = &.{.{
+        .id = "route-workspace",
+        .label = "Route workspace",
+        .path = "/tmp/route-workspace",
+        .threads = &.{initial},
+    }} });
+
+    var pinned = initial;
+    pinned.title = "Pinned route";
+    pinned.committed = true;
+    pinned.runtime_id = "0123456789abcdef0123456789abcdef";
+    try client.saveThread("route-workspace", 0, pinned);
+
+    var repository_drift = pinned;
+    repository_drift.repository_id = "repo-web";
+    try testing.expectError(
+        error.CommittedThreadRouteImmutable,
+        client.saveThread("route-workspace", 0, repository_drift),
+    );
+
+    var cwd_drift = pinned;
+    cwd_drift.repository_cwd = "services/worker";
+    try testing.expectError(
+        error.CommittedThreadRouteImmutable,
+        client.saveThread("route-workspace", 0, cwd_drift),
+    );
+
+    var identity_drift = pinned;
+    identity_drift.local_thread_id = "focused-route-thread-replaced";
+    try testing.expectError(
+        error.CommittedThreadIdentityImmutable,
+        client.saveThread("route-workspace", 0, identity_drift),
+    );
+    var unlocked = pinned;
+    unlocked.committed = false;
+    try testing.expectError(
+        error.CommittedThreadCannotBecomeDraft,
+        client.saveThread("route-workspace", 0, unlocked),
+    );
+
+    const row = (try client.conn.row(
+        "select title, runtime_id, repository_id, repository_cwd " ++
+            "from threads where local_thread_id = 'focused-route-thread'",
+        .{},
+    )).?;
+    defer row.deinit();
+    try testing.expectEqualStrings("Pinned route", row.text(0));
+    try testing.expectEqualStrings("0123456789abcdef0123456789abcdef", row.text(1));
+    try testing.expectEqualStrings("repo-api", row.text(2));
+    try testing.expectEqualStrings("services/api", row.text(3));
+}
+
+test "compatibility saves never normalize a corrupt committed route to local" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
+    defer testing.allocator.free(pref_path);
+
+    var client = try Client.init(testing.allocator, pref_path);
+    defer client.deinit();
+    try schema.initializeToVersion(client.conn, 7);
+    const seed: PersistedThread = .{
+        .title = "Opaque route",
+        .committed = false,
+        .local_thread_id = "opaque-route-thread",
+    };
+    try client.save(.{ .projects = &.{.{
+        .id = "route-workspace",
+        .label = "Route workspace",
+        .path = "/tmp/route-workspace",
+        .threads = &.{seed},
+    }} });
+
+    // Simulate a damaged external writer without asking the production API to
+    // manufacture invalid route state. The seed is still a draft, so the
+    // immutability trigger permits the corruption fixture to be manufactured;
+    // commit it before exercising either compatibility replacement path.
+    try client.conn.execNoArgs(
+        \\update threads set profile_id = 'remote-box', runtime_id = 'bad-runtime',
+        \\    repository_id = null, repository_cwd = null
+        \\where local_thread_id = 'opaque-route-thread';
+        \\update threads set committed = 1 where local_thread_id = 'opaque-route-thread';
+    );
+
+    var legacy = seed;
+    legacy.committed = true;
+
+    try testing.expectError(error.CommittedThreadRouteImmutable, client.save(.{ .projects = &.{.{
+        .id = "route-workspace",
+        .label = "Route workspace",
+        .path = "/tmp/route-workspace",
+        .threads = &.{legacy},
+    }} }));
+    try testing.expectError(
+        error.CommittedThreadRouteImmutable,
+        client.saveThread("route-workspace", 0, legacy),
+    );
+
+    const row = (try client.conn.row(
+        "select profile_id, runtime_id, repository_id from threads " ++
+            "where local_thread_id = 'opaque-route-thread'",
+        .{},
+    )).?;
+    defer row.deinit();
+    try testing.expectEqualStrings("remote-box", row.text(0));
+    try testing.expectEqualStrings("bad-runtime", row.text(1));
+    try testing.expect(row.nullableText(2) == null);
+}
+
+test "compatibility saves quarantine an unaddressable committed remote route" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
+    defer testing.allocator.free(pref_path);
+
+    var client = try Client.init(testing.allocator, pref_path);
+    defer client.deinit();
+    try schema.initializeToVersion(client.conn, 7);
+    const seed: PersistedThread = .{
+        .title = "Opaque route",
+        .committed = false,
+    };
+    try client.save(.{ .projects = &.{.{
+        .id = "route-workspace",
+        .label = "Route workspace",
+        .path = "/tmp/route-workspace",
+        .threads = &.{seed},
+    }} });
+
+    try client.conn.execNoArgs(
+        \\update threads set profile_id = 'remote-box',
+        \\    runtime_id = '0123456789abcdef0123456789abcdef',
+        \\    repository_id = 'repo-api', repository_cwd = 'services/api', committed = 1;
+    );
+    const adoption: PersistedThread = .{
+        .title = "Opaque route",
+        .committed = true,
+        .local_thread_id = "newly-assigned-id",
+        .profile_id = "remote-box",
+        .runtime_id = "0123456789abcdef0123456789abcdef",
+        .repository_id = "repo-api",
+        .repository_cwd = "services/api",
+    };
+    try testing.expectError(error.CommittedThreadIdentityImmutable, client.save(.{ .projects = &.{.{
+        .id = "route-workspace",
+        .label = "Route workspace",
+        .path = "/tmp/route-workspace",
+        .threads = &.{adoption},
+    }} }));
+    try testing.expectError(
+        error.CommittedThreadIdentityImmutable,
+        client.saveThread("route-workspace", 0, adoption),
+    );
+
+    const row = (try client.conn.row(
+        "select local_thread_id, profile_id, runtime_id, repository_id, repository_cwd from threads",
+        .{},
+    )).?;
+    defer row.deinit();
+    try testing.expect(row.nullableText(0) == null);
+    try testing.expectEqualStrings("remote-box", row.text(1));
+    try testing.expectEqualStrings("0123456789abcdef0123456789abcdef", row.text(2));
+    try testing.expectEqualStrings("repo-api", row.text(3));
+    try testing.expectEqualStrings("services/api", row.text(4));
+}
+
+test "compatibility saves reject creation of an unaddressable committed remote route" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
+    defer testing.allocator.free(pref_path);
+
+    var client = try Client.init(testing.allocator, pref_path);
+    defer client.deinit();
+    try schema.initializeToVersion(client.conn, 7);
+    const unaddressable: PersistedThread = .{
+        .title = "Unaddressable route",
+        .committed = true,
+        .profile_id = "remote-box",
+        .runtime_id = "0123456789abcdef0123456789abcdef",
+        .repository_id = "repo-api",
+        .repository_cwd = "services/api",
+    };
+    try testing.expectError(error.InvalidPersistedThreadRoute, client.save(.{ .projects = &.{.{
+        .id = "route-workspace",
+        .label = "Route workspace",
+        .path = "/tmp/route-workspace",
+        .threads = &.{unaddressable},
+    }} }));
+
+    const draft: PersistedThread = .{
+        .title = "Addressed draft",
+        .committed = false,
+        .local_thread_id = "addressed-draft",
+    };
+    try client.save(.{ .projects = &.{.{
+        .id = "route-workspace",
+        .label = "Route workspace",
+        .path = "/tmp/route-workspace",
+        .threads = &.{draft},
+    }} });
+    try testing.expectError(
+        error.InvalidPersistedThreadRoute,
+        client.saveThread("route-workspace", 1, unaddressable),
+    );
+
+    const row = (try client.conn.row("select count(*) from threads", .{})).?;
+    defer row.deinit();
+    try testing.expectEqual(@as(i64, 1), row.int(0));
+}
+
+test "compatibility saves require runtime pin for committed non-local routes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
+    defer testing.allocator.free(pref_path);
+
+    var client = try Client.init(testing.allocator, pref_path);
+    defer client.deinit();
+    try schema.initializeToVersion(client.conn, 7);
+    const unpinned_remote: PersistedThread = .{
+        .title = "Unpinned remote",
+        .committed = true,
+        .local_thread_id = "unpinned-remote",
+        .profile_id = "remote-box",
+        .repository_id = "repo-api",
+    };
+    try testing.expectError(error.InvalidPersistedThreadRoute, client.save(.{ .projects = &.{.{
+        .id = "route-workspace",
+        .label = "Route workspace",
+        .path = "/tmp/route-workspace",
+        .threads = &.{unpinned_remote},
+    }} }));
+
+    const explicit_local: PersistedThread = .{
+        .title = "Explicit local",
+        .committed = true,
+        .local_thread_id = "explicit-local",
+        .profile_id = LEGACY_LOCAL_PROFILE_ID,
+        .repository_id = LEGACY_PRIMARY_REPOSITORY_ID,
+    };
+    const remote_draft: PersistedThread = .{
+        .title = "Remote draft",
+        .committed = false,
+        .local_thread_id = "remote-draft",
+        .profile_id = "remote-box",
+        .repository_id = "repo-api",
+    };
+    try client.save(.{ .projects = &.{.{
+        .id = "route-workspace",
+        .label = "Route workspace",
+        .path = "/tmp/route-workspace",
+        .threads = &.{ explicit_local, remote_draft },
+    }} });
+
+    var focused_unpinned = remote_draft;
+    focused_unpinned.committed = true;
+    try testing.expectError(
+        error.InvalidPersistedThreadRoute,
+        client.saveThread("route-workspace", 1, focused_unpinned),
+    );
+    {
+        const row = (try client.conn.row(
+            "select committed, runtime_id from threads where local_thread_id = 'remote-draft'",
+            .{},
+        )).?;
+        defer row.deinit();
+        try testing.expectEqual(@as(i64, 0), row.int(0));
+        try testing.expect(row.nullableText(1) == null);
+    }
+
+    // A pre-fix writer could have committed this now-invalid shape. Neither
+    // compatibility transaction may legitimize it by attaching whichever
+    // runtime the profile happens to reach today.
+    try client.conn.execNoArgs(
+        "update threads set committed = 1 where local_thread_id = 'remote-draft'",
+    );
+    var attempted_pin = focused_unpinned;
+    attempted_pin.runtime_id = "0123456789abcdef0123456789abcdef";
+    try testing.expectError(error.CommittedThreadRouteImmutable, client.save(.{ .projects = &.{.{
+        .id = "route-workspace",
+        .label = "Route workspace",
+        .path = "/tmp/route-workspace",
+        .threads = &.{ explicit_local, attempted_pin },
+    }} }));
+    try testing.expectError(
+        error.CommittedThreadRouteImmutable,
+        client.saveThread("route-workspace", 1, attempted_pin),
+    );
 }
 
 test "save clears orphaned threads left behind by manual db edits" {

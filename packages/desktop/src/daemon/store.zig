@@ -9,6 +9,8 @@ const zqlite = @import("zqlite");
 const headless = @import("headless");
 
 const schema = @import("../db/schema.zig");
+const access_store = @import("access_store.zig");
+const connect_store = @import("connect_store.zig");
 const transcript_apply = @import("../chat/transcript_apply.zig");
 const platform_runtime = @import("platform_runtime");
 
@@ -39,12 +41,102 @@ pub const StoreError = error{
     SchemaTooNew,
     StoreCorrupt,
     StoreUnavailable,
+    RuntimeIdentityMismatch,
+    InvalidRuntimeIdentity,
+    PageCursorInvalid,
+    PageCursorStale,
+    PageCursorMismatch,
     OutOfMemory,
 };
+
+/// Identity pair bound to the authoritative daemon SQLite store.
+pub const RuntimeIdentity = schema.RuntimeIdentity;
+
+/// Maximum repositories accepted in one workspace manifest.
+pub const MAX_WORKSPACE_REPOSITORIES: usize = 64;
+/// Maximum runtime bindings accepted for one repository.
+pub const MAX_REPOSITORY_BINDINGS: usize = 64;
+/// Maximum encoded repository identifier length.
+pub const MAX_REPOSITORY_ID_BYTES: usize = 128;
+/// Maximum encoded repository display-label length.
+pub const MAX_REPOSITORY_LABEL_BYTES: usize = 256;
+/// Maximum absolute checkout-root length.
+pub const MAX_REPOSITORY_PATH_BYTES: usize = 4 * 1024;
+/// Maximum credential-free VCS identity length.
+pub const MAX_VCS_IDENTITY_BYTES: usize = 2 * 1024;
+/// Maximum default-branch name length.
+pub const MAX_DEFAULT_BRANCH_BYTES: usize = 255;
+
+/// Metadata whose identity is stable across runtime-local checkouts.
+/// `vcs_identity` is an optional credential-free fetch identity, never a URL
+/// carrying userinfo, query tokens, fragments, or percent-encoded secrets.
+pub const RepositoryDefinition = store_protocol.RepositoryDefinition;
+
+/// Receipt-backed stable repository metadata mutation.
+pub const WorkspaceRepositoryUpsertRequest = store_protocol.WorkspaceRepositoryUpsertRequest;
+
+/// Receipt-backed repository reference removal mutation.
+pub const WorkspaceRepositoryRemoveRequest = store_protocol.WorkspaceRepositoryRemoveRequest;
+
+/// Receipt-backed workspace default selection mutation.
+pub const WorkspaceDefaultRepositorySetRequest = store_protocol.WorkspaceDefaultRepositorySetRequest;
+
+/// Receipt-backed runtime-local checkout binding mutation.
+pub const WorkspaceRepositoryBindingUpsertRequest = store_protocol.WorkspaceRepositoryBindingUpsertRequest;
+
+/// Receipt-backed checkout-reference removal mutation.
+pub const WorkspaceRepositoryBindingRemoveRequest = store_protocol.WorkspaceRepositoryBindingRemoveRequest;
+
+/// Allocator-owned manifest returned by `loadWorkspaceRepositoryManifest`.
+pub const OwnedWorkspaceRepositoryManifest = struct {
+    workspace_id: []u8,
+    default_repository_id: []u8,
+    repositories: []store_protocol.Repository,
+
+    pub fn deinit(self: *OwnedWorkspaceRepositoryManifest, allocator: std.mem.Allocator) void {
+        allocator.free(self.workspace_id);
+        allocator.free(self.default_repository_id);
+        for (self.repositories) |repository| freeOwnedRepository(allocator, repository);
+        allocator.free(self.repositories);
+        self.* = undefined;
+    }
+};
+
+/// Allocator-owned exact runtime binding returned by the targeted loader.
+pub const OwnedWorkspaceRepositoryBinding = struct {
+    workspace_id: []u8,
+    repository_id: []u8,
+    runtime_id: []u8,
+    root_path: []u8,
+    availability: []u8,
+
+    pub fn deinit(self: *OwnedWorkspaceRepositoryBinding, allocator: std.mem.Allocator) void {
+        allocator.free(self.workspace_id);
+        allocator.free(self.repository_id);
+        allocator.free(self.runtime_id);
+        allocator.free(self.root_path);
+        allocator.free(self.availability);
+        self.* = undefined;
+    }
+};
+
+/// Validate a runtime-independent cwd carried by a client. Null selects the
+/// repository root; absolute, parent, dot, empty-segment, and Windows-shaped
+/// paths are rejected before filesystem resolution.
+pub fn validateRepositoryRelativeCwd(relative_cwd: ?[]const u8) StoreError!void {
+    if (relative_cwd) |value| {
+        if (!validRepositoryCwd(value)) return error.InvalidParams;
+    }
+}
 
 pub const Mutation = union(enum) {
     snapshot_replace: store_protocol.SnapshotReplaceRequest,
     workspace_upsert: store_protocol.WorkspaceUpsertRequest,
+    workspace_repository_upsert: WorkspaceRepositoryUpsertRequest,
+    workspace_repository_remove: WorkspaceRepositoryRemoveRequest,
+    workspace_default_repository_set: WorkspaceDefaultRepositorySetRequest,
+    workspace_repository_binding_upsert: WorkspaceRepositoryBindingUpsertRequest,
+    workspace_repository_binding_remove: WorkspaceRepositoryBindingRemoveRequest,
     thread_upsert: store_protocol.ThreadUpsertRequest,
     chat_draft_set: store_protocol.ChatDraftSetRequest,
     message_append: store_protocol.MessageAppendRequest,
@@ -83,6 +175,7 @@ pub const TurnCommitRequest = struct {
     expected_thread_title: ?[]const u8 = null,
     generated_title: ?[]const u8 = null,
     error_message: ?[]const u8 = null,
+    failure_reason: ?store_protocol.ProviderFailureReason = null,
     user_message_id: ?[]const u8 = null,
     /// Rows are already ordered by transcript_apply; the store appends them
     /// in this order. Empty synthesized-row IDs are assigned at this boundary
@@ -287,6 +380,11 @@ pub const ImportedLeasesAndOutcomes = struct {
 
 const SNAPSHOT_REPLACE_OPERATION = store_protocol.METHOD_STATE_SNAPSHOT_REPLACE;
 const WORKSPACE_UPSERT_OPERATION = store_protocol.METHOD_WORKSPACE_UPSERT;
+const WORKSPACE_REPOSITORY_UPSERT_OPERATION: []const u8 = "workspace.repository.upsert";
+const WORKSPACE_REPOSITORY_REMOVE_OPERATION: []const u8 = "workspace.repository.remove";
+const WORKSPACE_DEFAULT_REPOSITORY_SET_OPERATION: []const u8 = "workspace.repository.default.set";
+const WORKSPACE_REPOSITORY_BINDING_UPSERT_OPERATION: []const u8 = "workspace.repository.binding.upsert";
+const WORKSPACE_REPOSITORY_BINDING_REMOVE_OPERATION: []const u8 = "workspace.repository.binding.remove";
 const THREAD_UPSERT_OPERATION = store_protocol.METHOD_CHAT_THREAD_UPSERT;
 const CHAT_DRAFT_SET_OPERATION = store_protocol.METHOD_CHAT_DRAFT_SET;
 const MESSAGE_APPEND_OPERATION = store_protocol.METHOD_CHAT_MESSAGE_APPEND;
@@ -322,12 +420,33 @@ pub const Store = struct {
 
     /// Open the exact database path as the sole store writer.
     pub fn init(allocator: std.mem.Allocator, db_path: []const u8) StoreError!Self {
-        return initWithFault(allocator, db_path, .none);
+        return initInternal(allocator, db_path, .none, null);
     }
 
     /// Open the store with an optional test-only fault hook (B9). Production
     /// always uses `.none`; hermetic ITs may arm stalls/crashes via env.
     pub fn initWithFault(allocator: std.mem.Allocator, db_path: []const u8, fault: StoreFault) StoreError!Self {
+        return initInternal(allocator, db_path, fault, null);
+    }
+
+    /// Open the production store and atomically bind or verify its identity.
+    /// Existing v8 stores must already carry this exact pair; only a database
+    /// that was pre-v8 before this open may receive the one-time seed.
+    pub fn initWithRuntimeIdentity(
+        allocator: std.mem.Allocator,
+        db_path: []const u8,
+        fault: StoreFault,
+        identity: RuntimeIdentity,
+    ) StoreError!Self {
+        return initInternal(allocator, db_path, fault, identity);
+    }
+
+    fn initInternal(
+        allocator: std.mem.Allocator,
+        db_path: []const u8,
+        fault: StoreFault,
+        runtime_identity: ?RuntimeIdentity,
+    ) StoreError!Self {
         const path = try allocator.dupeZ(u8, db_path);
         errdefer allocator.free(path);
 
@@ -336,7 +455,16 @@ pub const Store = struct {
         errdefer conn.close();
 
         conn.busyTimeout(schema.BUSY_TIMEOUT_MS) catch |err| return mapOpenError(err);
-        schema.initializeToVersion(conn, schema.MAX_SUPPORTED_VERSION) catch |err| return mapOpenError(err);
+        if (runtime_identity) |identity| {
+            schema.initializeStoreWithRuntimeIdentity(conn, identity) catch |err| return mapOpenError(err);
+        } else {
+            schema.initializeToVersion(conn, schema.MAX_SUPPORTED_VERSION) catch |err| return mapOpenError(err);
+        }
+        access_store.initialize(conn) catch |err| return mapOpenError(err);
+        if (runtime_identity) |identity| {
+            connect_store.initialize(conn, identity.runtime_id, identity.instance_id) catch |err|
+                return mapOpenError(err);
+        }
         const migrated_fingerprint_bytes = migrateLegacyFingerprints(allocator, conn) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return mapOpenError(err);
@@ -361,7 +489,7 @@ pub const Store = struct {
         conn.execNoArgs(
             \\insert or ignore into terminal_turn_replay_guard (turn_id, status)
             \\select turn_id, status from chat_turns
-            \\where status in ('completed', 'failed', 'aborted');
+            \\where status in ('completed', 'failed', 'aborted', 'interrupted');
         ) catch |err| return mapOpenError(err);
 
         return .{
@@ -421,6 +549,11 @@ pub const Store = struct {
         }
 
         const current_revision = self.readStoreRevision() catch |err| return mapStoreError(err);
+        switch (mutation) {
+            .snapshot_replace => |request| self.guardSnapshotTransaction(request, current_revision) catch |err|
+                return mapStoreError(err),
+            else => {},
+        }
 
         // Message identity is independent of the transport request key. A
         // retry with a fresh key must not append the same client message.
@@ -463,6 +596,11 @@ pub const Store = struct {
             else
                 self.applySnapshot(request.snapshot, next_revision_sql) catch |err| return mapStoreError(err),
             .workspace_upsert => |request| self.applyWorkspace(request.workspace) catch |err| return mapStoreError(err),
+            .workspace_repository_upsert => |request| self.applyWorkspaceRepositoryUpsert(request) catch |err| return mapStoreError(err),
+            .workspace_repository_remove => |request| self.applyWorkspaceRepositoryRemove(request) catch |err| return mapStoreError(err),
+            .workspace_default_repository_set => |request| self.applyWorkspaceDefaultRepositorySet(request) catch |err| return mapStoreError(err),
+            .workspace_repository_binding_upsert => |request| self.applyWorkspaceRepositoryBindingUpsert(request) catch |err| return mapStoreError(err),
+            .workspace_repository_binding_remove => |request| self.applyWorkspaceRepositoryBindingRemove(request) catch |err| return mapStoreError(err),
             .thread_upsert => |request| self.applyThread(request) catch |err| return mapStoreError(err),
             .chat_draft_set => |request| self.applyChatDraftSet(request) catch |err| return mapStoreError(err),
             .message_append => |request| self.applyMessageAppend(request, next_revision_sql) catch |err| return mapStoreError(err),
@@ -504,12 +642,276 @@ pub const Store = struct {
         return self.applyMutation(.{ .workspace_upsert = request });
     }
 
+    /// Create or update stable repository metadata without replacing bindings.
+    pub fn upsertWorkspaceRepository(
+        self: *Self,
+        request: WorkspaceRepositoryUpsertRequest,
+    ) StoreError!store_protocol.WriteResult {
+        return self.applyMutation(.{ .workspace_repository_upsert = request });
+    }
+
+    /// Remove one repository reference and its bindings. No filesystem path is touched.
+    pub fn removeWorkspaceRepository(
+        self: *Self,
+        request: WorkspaceRepositoryRemoveRequest,
+    ) StoreError!store_protocol.WriteResult {
+        return self.applyMutation(.{ .workspace_repository_remove = request });
+    }
+
+    /// Select an existing repository as the workspace default.
+    pub fn setWorkspaceDefaultRepository(
+        self: *Self,
+        request: WorkspaceDefaultRepositorySetRequest,
+    ) StoreError!store_protocol.WriteResult {
+        return self.applyMutation(.{ .workspace_default_repository_set = request });
+    }
+
+    /// Create or update an absolute checkout root for one canonical runtime ID.
+    pub fn upsertWorkspaceRepositoryBinding(
+        self: *Self,
+        request: WorkspaceRepositoryBindingUpsertRequest,
+    ) StoreError!store_protocol.WriteResult {
+        return self.applyMutation(.{ .workspace_repository_binding_upsert = request });
+    }
+
+    /// Remove only the runtime-local checkout reference. Checkout data is never deleted.
+    pub fn removeWorkspaceRepositoryBinding(
+        self: *Self,
+        request: WorkspaceRepositoryBindingRemoveRequest,
+    ) StoreError!store_protocol.WriteResult {
+        return self.applyMutation(.{ .workspace_repository_binding_remove = request });
+    }
+
+    /// Load one bounded, allocator-owned manifest from a consistent SQLite snapshot.
+    pub fn loadWorkspaceRepositoryManifest(
+        self: *Self,
+        workspace_id: []const u8,
+    ) StoreError!OwnedWorkspaceRepositoryManifest {
+        if (!validWorkspaceId(workspace_id)) return error.InvalidParams;
+
+        self.conn.execNoArgs("begin") catch |err| return mapStoreError(err);
+        var transaction_open = true;
+        defer if (transaction_open) self.conn.rollback();
+
+        const header = blk: {
+            const workspace_row = (self.conn.row(
+                "select id, workspace_id, default_repository_id from workspaces where workspace_id = ?1",
+                .{workspace_id},
+            ) catch |err| return mapStoreError(err)) orelse return error.ResourceNotFound;
+            defer workspace_row.deinit();
+            const owned_workspace_id = self.allocator.dupe(u8, workspace_row.text(1)) catch return error.OutOfMemory;
+            errdefer self.allocator.free(owned_workspace_id);
+            const default_repository_id = self.allocator.dupe(u8, workspace_row.text(2)) catch return error.OutOfMemory;
+            break :blk .{
+                .workspace_row_id = workspace_row.int(0),
+                .workspace_id = owned_workspace_id,
+                .default_repository_id = default_repository_id,
+            };
+        };
+        const owned_workspace_id = header.workspace_id;
+        errdefer self.allocator.free(owned_workspace_id);
+        const default_repository_id = header.default_repository_id;
+        errdefer self.allocator.free(default_repository_id);
+        var repositories: std.ArrayListUnmanaged(store_protocol.Repository) = .empty;
+        errdefer {
+            for (repositories.items) |repository| freeOwnedRepository(self.allocator, repository);
+            repositories.deinit(self.allocator);
+        }
+        var found_primary = false;
+        var found_default = false;
+        {
+            var rows = self.conn.rows(
+                "select id, repository_id, label, vcs_identity, default_branch " ++
+                    "from workspace_repositories where workspace_id = ?1 order by sort_index, repository_id",
+                .{header.workspace_row_id},
+            ) catch |err| return mapStoreError(err);
+            defer rows.deinit();
+            while (rows.next()) |row| {
+                if (repositories.items.len >= MAX_WORKSPACE_REPOSITORIES) return error.StoreCorrupt;
+                const definition: RepositoryDefinition = .{
+                    .repository_id = row.text(1),
+                    .label = row.text(2),
+                    .vcs_identity = row.nullableText(3),
+                    .default_branch = row.nullableText(4),
+                };
+                if (!repositoryDefinitionValid(definition)) return error.StoreCorrupt;
+                const repository = self.copyStoredRepository(row.int(0), definition) catch |err| return mapStoreError(err);
+                errdefer freeOwnedRepository(self.allocator, repository);
+                found_primary = found_primary or std.mem.eql(u8, definition.repository_id, store_protocol.PRIMARY_REPOSITORY_ID);
+                found_default = found_default or std.mem.eql(u8, definition.repository_id, default_repository_id);
+                repositories.append(self.allocator, repository) catch return error.OutOfMemory;
+            }
+            if (rows.err) |err| return mapStoreError(err);
+        }
+        if (!found_primary or !found_default) return error.StoreCorrupt;
+
+        const owned_repositories = repositories.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
+        errdefer {
+            for (owned_repositories) |repository| freeOwnedRepository(self.allocator, repository);
+            self.allocator.free(owned_repositories);
+        }
+        self.conn.commit() catch |err| return mapStoreError(err);
+        transaction_open = false;
+        return .{
+            .workspace_id = owned_workspace_id,
+            .default_repository_id = default_repository_id,
+            .repositories = owned_repositories,
+        };
+    }
+
+    /// Load one exact runtime binding. Callers must match `runtime_id` to the
+    /// authenticated daemon identity and resolve any relative cwd beneath the
+    /// returned root with filesystem-aware symlink containment checks.
+    pub fn loadWorkspaceRepositoryBinding(
+        self: *Self,
+        workspace_id: []const u8,
+        repository_id: []const u8,
+        runtime_id: []const u8,
+    ) StoreError!OwnedWorkspaceRepositoryBinding {
+        if (!validWorkspaceId(workspace_id) or !validRouteId(repository_id) or !validRuntimeId(runtime_id)) {
+            return error.InvalidParams;
+        }
+        const row = (self.conn.row(
+            \\select workspace.workspace_id, repository.repository_id,
+            \\       binding.runtime_id, binding.root_path, binding.availability
+            \\from workspaces workspace
+            \\join workspace_repositories repository on repository.workspace_id = workspace.id
+            \\join workspace_repository_bindings binding on binding.repository_row_id = repository.id
+            \\where workspace.workspace_id = ?1 and repository.repository_id = ?2 and binding.runtime_id = ?3
+        , .{ workspace_id, repository_id, runtime_id }) catch |err| return mapStoreError(err)) orelse
+            return error.ResourceNotFound;
+        defer row.deinit();
+        const binding: store_protocol.RepositoryBinding = .{
+            .runtime_id = row.text(2),
+            .root_path = row.text(3),
+            .availability = row.text(4),
+        };
+        if (!repositoryBindingValid(binding)) return error.StoreCorrupt;
+
+        const owned_workspace_id = self.allocator.dupe(u8, row.text(0)) catch return error.OutOfMemory;
+        errdefer self.allocator.free(owned_workspace_id);
+        const owned_repository_id = self.allocator.dupe(u8, row.text(1)) catch return error.OutOfMemory;
+        errdefer self.allocator.free(owned_repository_id);
+        const owned_runtime_id = self.allocator.dupe(u8, binding.runtime_id) catch return error.OutOfMemory;
+        errdefer self.allocator.free(owned_runtime_id);
+        const root_path = self.allocator.dupe(u8, binding.root_path) catch return error.OutOfMemory;
+        errdefer self.allocator.free(root_path);
+        const availability = self.allocator.dupe(u8, binding.availability) catch return error.OutOfMemory;
+        return .{
+            .workspace_id = owned_workspace_id,
+            .repository_id = owned_repository_id,
+            .runtime_id = owned_runtime_id,
+            .root_path = root_path,
+            .availability = availability,
+        };
+    }
+
+    fn copyStoredRepository(
+        self: *Self,
+        repository_row_id: i64,
+        definition: RepositoryDefinition,
+    ) !store_protocol.Repository {
+        const repository_id = try self.allocator.dupe(u8, definition.repository_id);
+        errdefer self.allocator.free(repository_id);
+        const label = try self.allocator.dupe(u8, definition.label);
+        errdefer self.allocator.free(label);
+        const vcs_identity = try dupeNullableText(self.allocator, definition.vcs_identity);
+        errdefer if (vcs_identity) |value| self.allocator.free(value);
+        const default_branch = try dupeNullableText(self.allocator, definition.default_branch);
+        errdefer if (default_branch) |value| self.allocator.free(value);
+
+        var bindings: std.ArrayListUnmanaged(store_protocol.RepositoryBinding) = .empty;
+        errdefer {
+            for (bindings.items) |binding| freeOwnedRepositoryBinding(self.allocator, binding);
+            bindings.deinit(self.allocator);
+        }
+        var rows = try self.conn.rows(
+            "select runtime_id, root_path, availability from workspace_repository_bindings " ++
+                "where repository_row_id = ?1 order by runtime_id",
+            .{repository_row_id},
+        );
+        defer rows.deinit();
+        while (rows.next()) |row| {
+            if (bindings.items.len >= MAX_REPOSITORY_BINDINGS) return error.StoreCorrupt;
+            const binding: store_protocol.RepositoryBinding = .{
+                .runtime_id = row.text(0),
+                .root_path = row.text(1),
+                .availability = row.text(2),
+            };
+            if (!repositoryBindingValid(binding)) return error.StoreCorrupt;
+            const owned_binding = try copyRepositoryBinding(self.allocator, binding);
+            errdefer freeOwnedRepositoryBinding(self.allocator, owned_binding);
+            try bindings.append(self.allocator, owned_binding);
+        }
+        if (rows.err) |err| return err;
+        return .{
+            .repository_id = repository_id,
+            .label = label,
+            .vcs_identity = vcs_identity,
+            .default_branch = default_branch,
+            .bindings = try bindings.toOwnedSlice(self.allocator),
+        };
+    }
+
     pub fn upsertThread(self: *Self, request: store_protocol.ThreadUpsertRequest) StoreError!store_protocol.WriteResult {
         return self.applyMutation(.{ .thread_upsert = request });
     }
 
     pub fn setChatDraft(self: *Self, request: store_protocol.ChatDraftSetRequest) StoreError!store_protocol.WriteResult {
         return self.applyMutation(.{ .chat_draft_set = request });
+    }
+
+    fn guardSnapshotTransaction(
+        self: *Self,
+        request: store_protocol.SnapshotReplaceRequest,
+        current_revision: u64,
+    ) !void {
+        if (request.bootstrap) {
+            // Bootstrap is a one-time import capability, not an unguarded
+            // replacement mode. A replay with the same request key returned
+            // above; every fresh bootstrap must find a pristine store.
+            if (current_revision != 0 or try self.hasBootstrapOwnedState()) {
+                return error.Conflict;
+            }
+        }
+
+        // Legacy all-null committed rows may predate stable thread identity.
+        // Any explicit route is different: deleting an unaddressable row in
+        // reconcile would silently erase its immutable remote destination.
+        const unaddressable = try self.conn.row(
+            \\select 1 from threads
+            \\where committed != 0
+            \\  and (local_thread_id is null or local_thread_id = '')
+            \\  and not (
+            \\      profile_id is null and runtime_id is null and
+            \\      repository_id is null and repository_cwd is null
+            \\  )
+            \\limit 1
+        , .{});
+        if (unaddressable) |row| {
+            row.deinit();
+            return error.InvalidParams;
+        }
+    }
+
+    fn hasBootstrapOwnedState(self: *Self) !bool {
+        const row = (try self.conn.row(
+            \\select
+            \\    exists(select 1 from app_state)
+            \\ or exists(select 1 from workspaces)
+            \\ or exists(select 1 from threads)
+            \\ or exists(select 1 from messages)
+            \\ or exists(select 1 from surface_completions)
+            \\ or exists(select 1 from chat_completions)
+            \\ or exists(select 1 from store_receipts)
+            \\ or exists(select 1 from client_message_keys)
+            \\ or exists(select 1 from workspace_leases)
+            \\ or exists(select 1 from terminal_process_outcomes)
+            \\ or exists(select 1 from chat_turns)
+            \\ or exists(select 1 from terminal_turn_replay_guard)
+        , .{})) orelse return error.StoreCorrupt;
+        defer row.deinit();
+        return row.int(0) != 0;
     }
 
     /// Accept a chat turn under one receipt-backed SQLite transaction. The
@@ -645,24 +1047,47 @@ pub const Store = struct {
         };
         // Match the S1 mutation convention: client_id identifies the caller
         // but is not part of the logical turn state or its replay fingerprint.
-        const fingerprint = self.fingerprintValue(.{
-            .turn_id = request.turn_id,
-            .workspace_id = request.workspace_id,
-            .local_thread_id = request.local_thread_id,
-            .status = request.status,
-            .started_at_ms = request.started_at_ms,
-            .finished_at_ms = request.finished_at_ms,
-            .provider = request.provider,
-            .harness = request.harness,
-            .provider_thread_id = request.provider_thread_id,
-            .expected_thread_title = request.expected_thread_title,
-            .generated_title = request.generated_title,
-            .error_message = request.error_message,
-            .user_message_id = request.user_message_id,
-            .messages = request.messages,
-            .followup_pending = request.followup_pending,
-            .completion = request.completion,
-        }) catch |err| return err;
+        // Preserve the pre-v10 fingerprint byte-for-byte for null reasons so
+        // retries of old receipts remain duplicates instead of conflicts.
+        const fingerprint = if (request.failure_reason) |failure_reason|
+            self.fingerprintValue(.{
+                .turn_id = request.turn_id,
+                .workspace_id = request.workspace_id,
+                .local_thread_id = request.local_thread_id,
+                .status = request.status,
+                .started_at_ms = request.started_at_ms,
+                .finished_at_ms = request.finished_at_ms,
+                .provider = request.provider,
+                .harness = request.harness,
+                .provider_thread_id = request.provider_thread_id,
+                .expected_thread_title = request.expected_thread_title,
+                .generated_title = request.generated_title,
+                .error_message = request.error_message,
+                .failure_reason = failure_reason,
+                .user_message_id = request.user_message_id,
+                .messages = request.messages,
+                .followup_pending = request.followup_pending,
+                .completion = request.completion,
+            }) catch |err| return err
+        else
+            self.fingerprintValue(.{
+                .turn_id = request.turn_id,
+                .workspace_id = request.workspace_id,
+                .local_thread_id = request.local_thread_id,
+                .status = request.status,
+                .started_at_ms = request.started_at_ms,
+                .finished_at_ms = request.finished_at_ms,
+                .provider = request.provider,
+                .harness = request.harness,
+                .provider_thread_id = request.provider_thread_id,
+                .expected_thread_title = request.expected_thread_title,
+                .generated_title = request.generated_title,
+                .error_message = request.error_message,
+                .user_message_id = request.user_message_id,
+                .messages = request.messages,
+                .followup_pending = request.followup_pending,
+                .completion = request.completion,
+            }) catch |err| return err;
         defer self.allocator.free(fingerprint);
 
         self.conn.execNoArgs("begin immediate") catch |err| return mapStoreError(err);
@@ -1089,6 +1514,28 @@ pub const Store = struct {
                 .bootstrap = request.bootstrap,
             }),
             .workspace_upsert => |request| self.fingerprintValue(request.workspace),
+            .workspace_repository_upsert => |request| self.fingerprintValue(.{
+                .workspace_id = request.workspace_id,
+                .repository = request.repository,
+            }),
+            .workspace_repository_remove => |request| self.fingerprintValue(.{
+                .workspace_id = request.workspace_id,
+                .repository_id = request.repository_id,
+            }),
+            .workspace_default_repository_set => |request| self.fingerprintValue(.{
+                .workspace_id = request.workspace_id,
+                .repository_id = request.repository_id,
+            }),
+            .workspace_repository_binding_upsert => |request| self.fingerprintValue(.{
+                .workspace_id = request.workspace_id,
+                .repository_id = request.repository_id,
+                .binding = request.binding,
+            }),
+            .workspace_repository_binding_remove => |request| self.fingerprintValue(.{
+                .workspace_id = request.workspace_id,
+                .repository_id = request.repository_id,
+                .runtime_id = request.runtime_id,
+            }),
             .thread_upsert => |request| self.fingerprintValue(.{
                 .workspace_id = request.workspace_id,
                 .thread = request.thread,
@@ -1203,6 +1650,7 @@ pub const Store = struct {
             const workspace_row_id = workspace_row.int(0);
             workspace_row.deinit();
             try self.reconcileSnapshotThreads(snapshot, workspace, workspace_index == 0, workspace_row_id, store_revision);
+            try self.reconcileWorkspaceRepositories(workspace_row_id, workspace);
         }
 
         try self.conn.execNoArgs(
@@ -1355,6 +1803,10 @@ pub const Store = struct {
                 0,
                 legacy_messages,
                 null,
+                null,
+                null,
+                null,
+                null,
                 store_revision,
             );
         } else {
@@ -1418,6 +1870,10 @@ pub const Store = struct {
                 thread.message_offset,
                 thread.messages,
                 thread.cwd,
+                thread.profile_id,
+                thread.runtime_id,
+                thread.repository_id,
+                thread.repository_cwd,
                 store_revision,
             );
             return;
@@ -1433,7 +1889,7 @@ pub const Store = struct {
         const draft_images_json = try encodeExtraImagesJson(self.allocator, thread.draft_images);
         defer if (draft_images_json) |value| self.allocator.free(value);
         try self.conn.exec(
-            "update threads set sort_index = ?1, title = ?2, archived = ?3, committed = ?4, last_activity_at = ?5, provider_thread_id = ?6, model_ref = ?7, reasoning_effort = ?8, reasoning_variant = ?9, fast_mode = ?10, access_mode = ?11, provider = ?12, harness = ?13, tui_dock_id = ?14, draft = ?15, draft_image_path = ?16, draft_image_mime = ?17, draft_image_byte_size = ?18, draft_images_json = ?19, cwd = ?20 where id = ?21",
+            "update threads set sort_index = ?1, title = ?2, archived = ?3, committed = ?4, last_activity_at = ?5, provider_thread_id = ?6, model_ref = ?7, reasoning_effort = ?8, reasoning_variant = ?9, fast_mode = ?10, access_mode = ?11, provider = ?12, harness = ?13, tui_dock_id = ?14, draft = ?15, draft_image_path = ?16, draft_image_mime = ?17, draft_image_byte_size = ?18, draft_images_json = ?19, cwd = ?20, profile_id = ?21, runtime_id = ?22, repository_id = ?23, repository_cwd = ?24 where id = ?25",
             .{
                 @as(i64, @intCast(thread_index)),
                 thread.title,
@@ -1455,6 +1911,10 @@ pub const Store = struct {
                 if (primary_draft_image) |value| @as(i64, @intCast(value.byte_size)) else null,
                 draft_images_json,
                 thread.cwd,
+                thread.profile_id,
+                thread.runtime_id,
+                thread.repository_id,
+                thread.repository_cwd,
                 thread_row_id,
             },
         );
@@ -1590,7 +2050,11 @@ pub const Store = struct {
             \\    draft_image_mime text,
             \\    draft_image_byte_size integer,
             \\    draft_images_json text,
-            \\    cwd text
+            \\    cwd text,
+            \\    profile_id text,
+            \\    runtime_id text,
+            \\    repository_id text,
+            \\    repository_cwd text
             \\);
             \\create temp table if not exists preserved_workspaces (
             \\    workspace_id text not null,
@@ -1690,7 +2154,7 @@ pub const Store = struct {
             \\       t.last_activity_at, t.provider_thread_id, t.model_ref, t.reasoning_effort,
             \\       t.reasoning_variant, t.fast_mode, t.access_mode, t.provider, t.harness, t.tui_dock_id,
             \\       t.draft, t.draft_image_path, t.draft_image_mime, t.draft_image_byte_size,
-            \\       t.draft_images_json, t.cwd
+            \\       t.draft_images_json, t.cwd, t.profile_id, t.runtime_id, t.repository_id, t.repository_cwd
             \\from threads t join workspaces w on w.id = t.workspace_id
             \\where t.local_thread_id is not null and (
             \\    t.committed != 0
@@ -1919,14 +2383,16 @@ pub const Store = struct {
             \\insert into threads (workspace_id, sort_index, title, archived, committed, local_thread_id,
             \\                     last_activity_at, provider_thread_id, model_ref, reasoning_effort,
             \\                     reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id,
-            \\                     draft, draft_image_path, draft_image_mime, draft_image_byte_size, draft_images_json, cwd)
+            \\                     draft, draft_image_path, draft_image_mime, draft_image_byte_size, draft_images_json, cwd,
+            \\                     profile_id, runtime_id, repository_id, repository_cwd)
             \\select w.id,
             \\       (select coalesce(max(t2.sort_index) + 1, 0) from threads t2 where t2.workspace_id = w.id)
             \\           + (row_number() over (partition by p.workspace_key order by p.sort_index) - 1),
             \\       p.title, p.archived, p.committed, p.local_thread_id, p.last_activity_at,
             \\       p.provider_thread_id, p.model_ref, p.reasoning_effort, p.reasoning_variant,
             \\       p.fast_mode, p.access_mode, p.provider, p.harness, p.tui_dock_id,
-            \\       p.draft, p.draft_image_path, p.draft_image_mime, p.draft_image_byte_size, p.draft_images_json, p.cwd
+            \\       p.draft, p.draft_image_path, p.draft_image_mime, p.draft_image_byte_size, p.draft_images_json, p.cwd,
+            \\       p.profile_id, p.runtime_id, p.repository_id, p.repository_cwd
             \\from temp.preserved_chat_threads p
             \\join workspaces w on w.workspace_id = p.workspace_key
             \\where not exists (
@@ -1952,10 +2418,11 @@ pub const Store = struct {
             \\    where m3.thread_id = t.id and m3.message_id = p.message_id
             \\);
         );
-        // Keys of restored rows keep their original fingerprint/revision so a
-        // later same-turn replay commit still resolves duplicate-by-identity
-        // (the F1 user-row exception tolerates the fingerprint drift). Rows
-        // the snapshot carried already re-wrote their key on insert.
+        // Keys of restored rows keep their original fingerprint/revision so
+        // internal commit recovery still resolves duplicate-by-identity (the
+        // F1 user-row exception tolerates fingerprint drift). Public retries
+        // of interrupted turns use a new turn ID. Rows the snapshot carried
+        // already re-wrote their key on insert.
         try self.conn.execNoArgs(
             \\insert into client_message_keys (thread_id, message_id, message_fingerprint, sort_index,
             \\                                 created_at_ms, updated_at_ms, store_revision)
@@ -1986,6 +2453,285 @@ pub const Store = struct {
                 "on conflict(workspace_id) do update set label = excluded.label, path = excluded.path, archived = excluded.archived, unread_count = excluded.unread_count, collapsed = excluded.collapsed, thread_list_expanded = excluded.thread_list_expanded, terminal_height = excluded.terminal_height, terminal_layout_json = excluded.terminal_layout_json, terminal_docks_json = excluded.terminal_docks_json, workspace_layout_json = excluded.workspace_layout_json, selected_thread_index = excluded.selected_thread_index, companion_thread_local_id = excluded.companion_thread_local_id, herdr_remote_alias = excluded.herdr_remote_alias, herdr_session_name = excluded.herdr_session_name, herdr_workspace_id = excluded.herdr_workspace_id, herdr_local_dir = excluded.herdr_local_dir, herdr_remote_cwd = excluded.herdr_remote_cwd, herdr_last_pane_id = excluded.herdr_last_pane_id, herdr_attach_dock_id = excluded.herdr_attach_dock_id, herdr_attach_pane_id = excluded.herdr_attach_pane_id, herdr_pane_links_json = excluded.herdr_pane_links_json, herdr_updated_at_ms = excluded.herdr_updated_at_ms",
             workspaceValues(workspace, null),
         );
+        const workspace_row_id = try self.requireWorkspaceRowId(workspace.workspace_id);
+        try self.reconcileWorkspaceRepositories(workspace_row_id, workspace);
+    }
+
+    fn applyWorkspaceRepositoryUpsert(self: *Self, request: WorkspaceRepositoryUpsertRequest) !void {
+        const workspace_row_id = try self.requireWorkspaceRowId(request.workspace_id);
+        const existing = try self.conn.row(
+            "select id from workspace_repositories where workspace_id = ?1 and repository_id = ?2",
+            .{ workspace_row_id, request.repository.repository_id },
+        );
+        if (existing) |row| {
+            row.deinit();
+        } else {
+            const count_row = (try self.conn.row(
+                "select count(*) from workspace_repositories where workspace_id = ?1",
+                .{workspace_row_id},
+            )) orelse return error.StoreCorrupt;
+            const repository_count = count_row.int(0);
+            count_row.deinit();
+            if (repository_count >= @as(i64, MAX_WORKSPACE_REPOSITORIES)) return error.CapabilityUnavailable;
+        }
+        try self.conn.exec(
+            "insert into workspace_repositories (workspace_id, repository_id, sort_index, label, vcs_identity, default_branch) " ++
+                "values (?1, ?2, coalesce((select max(sort_index) + 1 from workspace_repositories where workspace_id = ?1), 0), ?3, ?4, ?5) " ++
+                "on conflict(workspace_id, repository_id) do update set label = excluded.label, " ++
+                "vcs_identity = excluded.vcs_identity, default_branch = excluded.default_branch",
+            .{
+                workspace_row_id,
+                request.repository.repository_id,
+                request.repository.label,
+                request.repository.vcs_identity,
+                request.repository.default_branch,
+            },
+        );
+    }
+
+    fn applyWorkspaceRepositoryRemove(self: *Self, request: WorkspaceRepositoryRemoveRequest) !void {
+        const workspace_row_id = try self.requireWorkspaceRowId(request.workspace_id);
+        const repository_row = (try self.conn.row(
+            "select id, repository_id = (select default_repository_id from workspaces where id = ?1) " ++
+                "from workspace_repositories where workspace_id = ?1 and repository_id = ?2",
+            .{ workspace_row_id, request.repository_id },
+        )) orelse return error.ResourceNotFound;
+        const repository_row_id = repository_row.int(0);
+        const is_default = repository_row.int(1) != 0;
+        repository_row.deinit();
+        if (is_default) return error.Conflict;
+
+        const referenced = (try self.conn.row(
+            "select 1 from threads where workspace_id = ?1 and coalesce(repository_id, 'primary') = ?2 limit 1",
+            .{ workspace_row_id, request.repository_id },
+        ));
+        if (referenced) |row| {
+            row.deinit();
+            return error.Conflict;
+        }
+        try self.conn.exec("delete from workspace_repositories where id = ?1", .{repository_row_id});
+        if (self.conn.changes() == 0) return error.ResourceNotFound;
+    }
+
+    fn applyWorkspaceDefaultRepositorySet(self: *Self, request: WorkspaceDefaultRepositorySetRequest) !void {
+        const workspace_row_id = try self.requireWorkspaceRowId(request.workspace_id);
+        const repository = try self.conn.row(
+            "select 1 from workspace_repositories where workspace_id = ?1 and repository_id = ?2",
+            .{ workspace_row_id, request.repository_id },
+        );
+        if (repository) |row| {
+            row.deinit();
+        } else {
+            return error.ResourceNotFound;
+        }
+        try self.conn.exec(
+            "update workspaces set default_repository_id = ?1 where id = ?2",
+            .{ request.repository_id, workspace_row_id },
+        );
+    }
+
+    fn applyWorkspaceRepositoryBindingUpsert(
+        self: *Self,
+        request: WorkspaceRepositoryBindingUpsertRequest,
+    ) !void {
+        const workspace_row_id = try self.requireWorkspaceRowId(request.workspace_id);
+        const repository_row_id = try self.requireRepositoryRowId(workspace_row_id, request.repository_id);
+        const existing = try self.conn.row(
+            "select 1 from workspace_repository_bindings where repository_row_id = ?1 and runtime_id = ?2",
+            .{ repository_row_id, request.binding.runtime_id },
+        );
+        if (existing) |row| {
+            row.deinit();
+        } else {
+            const count_row = (try self.conn.row(
+                "select count(*) from workspace_repository_bindings where repository_row_id = ?1",
+                .{repository_row_id},
+            )) orelse return error.StoreCorrupt;
+            const binding_count = count_row.int(0);
+            count_row.deinit();
+            if (binding_count >= @as(i64, MAX_REPOSITORY_BINDINGS)) return error.CapabilityUnavailable;
+        }
+        try self.upsertRepositoryBindingRow(repository_row_id, request.binding);
+        if (std.mem.eql(u8, request.repository_id, store_protocol.PRIMARY_REPOSITORY_ID) and
+            try self.isStoreRuntime(request.binding.runtime_id))
+        {
+            // The legacy workspace path remains the current runtime's primary
+            // checkout projection. Updating it never performs filesystem I/O.
+            try self.conn.exec(
+                "update workspaces set path = ?1 where id = ?2",
+                .{ request.binding.root_path, workspace_row_id },
+            );
+        }
+    }
+
+    fn applyWorkspaceRepositoryBindingRemove(
+        self: *Self,
+        request: WorkspaceRepositoryBindingRemoveRequest,
+    ) !void {
+        const workspace_row_id = try self.requireWorkspaceRowId(request.workspace_id);
+        const repository_row_id = try self.requireRepositoryRowId(workspace_row_id, request.repository_id);
+        try self.conn.exec(
+            "delete from workspace_repository_bindings where repository_row_id = ?1 and runtime_id = ?2",
+            .{ repository_row_id, request.runtime_id },
+        );
+        if (self.conn.changes() == 0) return error.ResourceNotFound;
+    }
+
+    fn reconcileWorkspaceRepositories(
+        self: *Self,
+        workspace_row_id: i64,
+        workspace: store_protocol.Workspace,
+    ) !void {
+        // An empty list is the decode-compatible legacy shape. Preserve any
+        // richer manifest already learned instead of letting an old client
+        // erase it, while the v9 insert trigger guarantees stable `primary`.
+        if (workspace.repositories.len == 0) {
+            try self.ensureWorkspaceThreadRepositoriesExist(workspace_row_id);
+            return;
+        }
+
+        try self.conn.execNoArgs(
+            \\create temp table if not exists repository_manifest_targets (
+            \\    repository_id text primary key
+            \\);
+            \\delete from repository_manifest_targets;
+        );
+        for (workspace.repositories) |repository| {
+            try self.conn.exec(
+                "insert into repository_manifest_targets (repository_id) values (?1)",
+                .{repository.repository_id},
+            );
+        }
+
+        const referenced_omission = try self.conn.row(
+            \\select 1
+            \\from workspace_repositories repository
+            \\join threads thread on thread.workspace_id = repository.workspace_id
+            \\where repository.workspace_id = ?1
+            \\  and not exists (
+            \\      select 1 from repository_manifest_targets target
+            \\      where target.repository_id = repository.repository_id
+            \\  )
+            \\  and coalesce(thread.repository_id, 'primary') = repository.repository_id
+            \\limit 1
+        , .{workspace_row_id});
+        if (referenced_omission) |row| {
+            row.deinit();
+            return error.Conflict;
+        }
+
+        for (workspace.repositories, 0..) |repository, repository_index| {
+            try self.conn.exec(
+                "insert into workspace_repositories (workspace_id, repository_id, sort_index, label, vcs_identity, default_branch) " ++
+                    "values (?1, ?2, ?3, ?4, ?5, ?6) " ++
+                    "on conflict(workspace_id, repository_id) do update set sort_index = excluded.sort_index, " ++
+                    "label = excluded.label, vcs_identity = excluded.vcs_identity, default_branch = excluded.default_branch",
+                .{
+                    workspace_row_id,
+                    repository.repository_id,
+                    @as(i64, @intCast(repository_index)),
+                    repository.label,
+                    repository.vcs_identity,
+                    repository.default_branch,
+                },
+            );
+            const repository_row_id = try self.requireRepositoryRowId(workspace_row_id, repository.repository_id);
+            try self.conn.exec(
+                "delete from workspace_repository_bindings where repository_row_id = ?1",
+                .{repository_row_id},
+            );
+            for (repository.bindings) |binding| try self.upsertRepositoryBindingRow(repository_row_id, binding);
+        }
+
+        const default_repository_id = workspace.default_repository_id orelse store_protocol.PRIMARY_REPOSITORY_ID;
+        try self.conn.exec(
+            "update workspaces set default_repository_id = ?1 where id = ?2",
+            .{ default_repository_id, workspace_row_id },
+        );
+        try self.conn.exec(
+            \\delete from workspace_repositories
+            \\where workspace_id = ?1
+            \\  and not exists (
+            \\      select 1 from repository_manifest_targets target
+            \\      where target.repository_id = workspace_repositories.repository_id
+            \\  )
+        , .{workspace_row_id});
+
+        try self.conn.exec(
+            \\update workspaces
+            \\set path = (
+            \\    select binding.root_path
+            \\    from workspace_repository_bindings binding
+            \\    join workspace_repositories repository on repository.id = binding.repository_row_id
+            \\    join store_state state on state.id = 1 and state.runtime_id = binding.runtime_id
+            \\    where repository.workspace_id = ?1 and repository.repository_id = 'primary'
+            \\)
+            \\where id = ?1 and exists (
+            \\    select 1
+            \\    from workspace_repository_bindings binding
+            \\    join workspace_repositories repository on repository.id = binding.repository_row_id
+            \\    join store_state state on state.id = 1 and state.runtime_id = binding.runtime_id
+            \\    where repository.workspace_id = ?1 and repository.repository_id = 'primary'
+            \\)
+        , .{workspace_row_id});
+        try self.ensureWorkspaceThreadRepositoriesExist(workspace_row_id);
+    }
+
+    fn ensureWorkspaceThreadRepositoriesExist(self: *Self, workspace_row_id: i64) !void {
+        const missing = try self.conn.row(
+            \\select 1 from threads thread
+            \\where thread.workspace_id = ?1 and not exists (
+            \\    select 1 from workspace_repositories repository
+            \\    where repository.workspace_id = thread.workspace_id
+            \\      and repository.repository_id = coalesce(thread.repository_id, 'primary')
+            \\)
+            \\limit 1
+        , .{workspace_row_id});
+        if (missing) |row| {
+            row.deinit();
+            return error.InvalidParams;
+        }
+    }
+
+    fn upsertRepositoryBindingRow(
+        self: *Self,
+        repository_row_id: i64,
+        binding: store_protocol.RepositoryBinding,
+    ) !void {
+        try self.conn.exec(
+            "insert into workspace_repository_bindings (repository_row_id, runtime_id, root_path, availability) " ++
+                "values (?1, ?2, ?3, ?4) on conflict(repository_row_id, runtime_id) do update set " ++
+                "root_path = excluded.root_path, availability = excluded.availability",
+            .{ repository_row_id, binding.runtime_id, binding.root_path, binding.availability },
+        );
+    }
+
+    fn requireWorkspaceRowId(self: *Self, workspace_id: []const u8) !i64 {
+        const row = (try self.conn.row(
+            "select id from workspaces where workspace_id = ?1",
+            .{workspace_id},
+        )) orelse return error.ResourceNotFound;
+        defer row.deinit();
+        return row.int(0);
+    }
+
+    fn requireRepositoryRowId(self: *Self, workspace_row_id: i64, repository_id: []const u8) !i64 {
+        const row = (try self.conn.row(
+            "select id from workspace_repositories where workspace_id = ?1 and repository_id = ?2",
+            .{ workspace_row_id, repository_id },
+        )) orelse return error.ResourceNotFound;
+        defer row.deinit();
+        return row.int(0);
+    }
+
+    fn isStoreRuntime(self: *Self, runtime_id: []const u8) !bool {
+        const row = (try self.conn.row(
+            "select runtime_id from store_state where id = 1",
+            .{},
+        )) orelse return error.StoreCorrupt;
+        defer row.deinit();
+        const stored_runtime_id = row.nullableText(0) orelse return false;
+        return std.mem.eql(u8, stored_runtime_id, runtime_id);
     }
 
     fn applyThread(self: *Self, request: store_protocol.ThreadUpsertRequest) !void {
@@ -1996,6 +2742,10 @@ pub const Store = struct {
         )) orelse return error.ResourceNotFound;
         defer workspace_row_id.deinit();
         const workspace_id = workspace_row_id.int(0);
+        _ = try self.requireRepositoryRowId(
+            workspace_id,
+            thread.repository_id orelse store_protocol.PRIMARY_REPOSITORY_ID,
+        );
         const primary_draft_image = try firstAttachment(thread.draft_image, thread.draft_images);
         const provider_code = try providerCode(thread.provider);
         const harness_code = try harnessCode(thread.harness);
@@ -2012,7 +2762,7 @@ pub const Store = struct {
             const draft_images_json = try encodeExtraImagesJson(self.allocator, thread.draft_images);
             defer if (draft_images_json) |value| self.allocator.free(value);
             try self.conn.exec(
-                "update threads set title = ?1, archived = ?2, committed = ?3, last_activity_at = ?4, provider_thread_id = ?5, model_ref = ?6, reasoning_effort = ?7, reasoning_variant = ?8, fast_mode = ?9, access_mode = ?10, provider = ?11, harness = ?12, tui_dock_id = ?13, draft = ?14, draft_image_path = ?15, draft_image_mime = ?16, draft_image_byte_size = ?17, draft_images_json = ?18, cwd = ?19 where id = ?20",
+                "update threads set title = ?1, archived = ?2, committed = ?3, last_activity_at = ?4, provider_thread_id = ?5, model_ref = ?6, reasoning_effort = ?7, reasoning_variant = ?8, fast_mode = ?9, access_mode = ?10, provider = ?11, harness = ?12, tui_dock_id = ?13, draft = ?14, draft_image_path = ?15, draft_image_mime = ?16, draft_image_byte_size = ?17, draft_images_json = ?18, cwd = ?19, profile_id = ?20, runtime_id = ?21, repository_id = ?22, repository_cwd = ?23 where id = ?24",
                 .{
                     thread.title,
                     boolToInt(thread.archived),
@@ -2033,6 +2783,10 @@ pub const Store = struct {
                     if (primary_draft_image) |value| @as(i64, @intCast(value.byte_size)) else null,
                     draft_images_json,
                     thread.cwd,
+                    thread.profile_id,
+                    thread.runtime_id,
+                    thread.repository_id,
+                    thread.repository_cwd,
                     row.int(0),
                 },
             );
@@ -2062,6 +2816,10 @@ pub const Store = struct {
             0,
             &.{},
             thread.cwd,
+            thread.profile_id,
+            thread.runtime_id,
+            thread.repository_id,
+            thread.repository_cwd,
             null,
         );
     }
@@ -2082,7 +2840,12 @@ pub const Store = struct {
                 "on conflict(workspace_id) do nothing",
             .{ workspace.workspace_id, workspace.label, workspace.path },
         );
-        return self.conn.changes() > 0;
+        const inserted = self.conn.changes() > 0;
+        if (inserted) {
+            const workspace_row_id = try self.requireWorkspaceRowId(workspace.workspace_id);
+            try self.reconcileWorkspaceRepositories(workspace_row_id, workspace);
+        }
+        return inserted;
     }
 
     fn insertChatTurnThreadIfMissing(
@@ -2090,14 +2853,19 @@ pub const Store = struct {
         workspace_id: []const u8,
         thread: store_protocol.Thread,
     ) !bool {
+        const workspace_row_id = try self.requireWorkspaceRowId(workspace_id);
+        _ = try self.requireRepositoryRowId(
+            workspace_row_id,
+            thread.repository_id orelse store_protocol.PRIMARY_REPOSITORY_ID,
+        );
         const provider_code = try providerCode(thread.provider);
         const harness_code = try harnessCode(thread.harness);
         const reasoning_code = if (thread.reasoning_effort) |value| try reasoningEffortCode(value) else null;
         const fast_code = if (thread.fast_mode) |value| try fastModeCode(value) else null;
         const access_code = if (thread.access_mode) |value| try accessModeCode(value) else null;
         try self.conn.exec(
-            "insert into threads (workspace_id, sort_index, title, local_thread_id, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness) " ++
-                "select w.id, coalesce((select max(t.sort_index) + 1 from threads t where t.workspace_id = w.id), 0), ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11 " ++
+            "insert into threads (workspace_id, sort_index, title, local_thread_id, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, profile_id, runtime_id, repository_id, repository_cwd) " ++
+                "select w.id, coalesce((select max(t.sort_index) + 1 from threads t where t.workspace_id = w.id), 0), ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15 " ++
                 "from workspaces w where w.workspace_id = ?1 " ++
                 "on conflict(workspace_id, local_thread_id) where local_thread_id is not null do nothing",
             .{
@@ -2112,6 +2880,10 @@ pub const Store = struct {
                 access_code,
                 provider_code,
                 harness_code,
+                thread.profile_id,
+                thread.runtime_id,
+                thread.repository_id,
+                thread.repository_cwd,
             },
         );
         if (self.conn.changes() > 0) return true;
@@ -2135,14 +2907,20 @@ pub const Store = struct {
         const fast_code = if (thread.fast_mode) |value| try fastModeCode(value) else null;
         const access_code = if (thread.access_mode) |value| try accessModeCode(value) else null;
         try self.conn.exec(
-            "update threads set model_ref = ?1, reasoning_effort = ?2, reasoning_variant = ?3, fast_mode = ?4, access_mode = ?5 " ++
-                "where workspace_id = (select id from workspaces where workspace_id = ?6) and local_thread_id = ?7",
+            "update threads set model_ref = ?1, reasoning_effort = ?2, reasoning_variant = ?3, fast_mode = ?4, access_mode = ?5, " ++
+                "profile_id = coalesce(?6, profile_id), runtime_id = coalesce(?7, runtime_id), " ++
+                "repository_id = coalesce(?8, repository_id), repository_cwd = coalesce(?9, repository_cwd) " ++
+                "where workspace_id = (select id from workspaces where workspace_id = ?10) and local_thread_id = ?11",
             .{
                 thread.model_ref,
                 reasoning_code,
                 thread.reasoning_variant,
                 fast_code,
                 access_code,
+                thread.profile_id,
+                thread.runtime_id,
+                thread.repository_id,
+                thread.repository_cwd,
                 workspace_id,
                 thread.local_thread_id,
             },
@@ -2272,6 +3050,10 @@ pub const Store = struct {
         legacy_thread.fast_mode = null;
         legacy_thread.access_mode = null;
         legacy_thread.cwd = null;
+        legacy_thread.profile_id = null;
+        legacy_thread.runtime_id = null;
+        legacy_thread.repository_id = null;
+        legacy_thread.repository_cwd = null;
         const thread_fingerprint = try self.fingerprintValue(.{
             .workspace_id = request.workspace.workspace_id,
             .thread = legacy_thread,
@@ -2458,12 +3240,11 @@ pub const Store = struct {
                     if (existing) |status| {
                         if (status.conflict) {
                             // Amendment-2 F1: the turn's user row is idempotent
-                            // by IDENTITY, not fingerprint. A stable-turn_id
-                            // replay after an interrupted sweep re-sends the
-                            // acceptance user row with drifted prompt/timestamps;
-                            // the originally staged row stays authoritative
-                            // (first-writer-wins). All other rows keep strict
-                            // fingerprint conflicts.
+                            // by IDENTITY, not fingerprint. Internal recovery
+                            // may carry drifted prompt/timestamps; the original
+                            // staged row stays authoritative (first-writer-
+                            // wins). Public interrupted-turn retries use a new
+                            // turn ID. All other rows keep strict conflicts.
                             const is_user_row = if (request.user_message_id) |uid|
                                 std.mem.eql(u8, stored_message.message_id, uid)
                             else
@@ -2486,7 +3267,7 @@ pub const Store = struct {
         // transaction (no external pre-delete). Receipt replay still short-circuits
         // before this call, so a duplicate commit never mutates the ledger.
         try self.conn.exec(
-            "insert into chat_turns (turn_id, workspace_id, local_thread_id, status, started_at_ms, finished_at_ms, provider, provider_thread_id, error_message, user_message_id, committed_store_revision) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) on conflict(turn_id) do update set workspace_id = excluded.workspace_id, local_thread_id = excluded.local_thread_id, status = excluded.status, started_at_ms = excluded.started_at_ms, finished_at_ms = excluded.finished_at_ms, provider = excluded.provider, provider_thread_id = excluded.provider_thread_id, error_message = excluded.error_message, user_message_id = excluded.user_message_id, committed_store_revision = excluded.committed_store_revision",
+            "insert into chat_turns (turn_id, workspace_id, local_thread_id, status, started_at_ms, finished_at_ms, provider, provider_thread_id, error_message, failure_reason, user_message_id, committed_store_revision) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) on conflict(turn_id) do update set workspace_id = excluded.workspace_id, local_thread_id = excluded.local_thread_id, status = excluded.status, started_at_ms = excluded.started_at_ms, finished_at_ms = excluded.finished_at_ms, provider = excluded.provider, provider_thread_id = excluded.provider_thread_id, error_message = excluded.error_message, failure_reason = excluded.failure_reason, user_message_id = excluded.user_message_id, committed_store_revision = excluded.committed_store_revision",
             .{
                 request.turn_id,
                 request.workspace_id,
@@ -2497,6 +3278,7 @@ pub const Store = struct {
                 request.provider,
                 request.provider_thread_id,
                 request.error_message,
+                if (request.failure_reason) |reason| @tagName(reason) else null,
                 request.user_message_id,
                 store_revision,
             },
@@ -2632,6 +3414,10 @@ pub const Store = struct {
                 0,
                 legacy_messages,
                 null,
+                null,
+                null,
+                null,
+                null,
                 store_revision,
             );
         } else {
@@ -2659,10 +3445,15 @@ pub const Store = struct {
                     thread.message_offset,
                     thread.messages,
                     thread.cwd,
+                    thread.profile_id,
+                    thread.runtime_id,
+                    thread.repository_id,
+                    thread.repository_cwd,
                     store_revision,
                 );
             }
         }
+        try self.reconcileWorkspaceRepositories(workspace_row_id, workspace);
     }
 
     fn insertThread(
@@ -2689,6 +3480,10 @@ pub const Store = struct {
         message_offset: usize,
         messages: []const store_protocol.Message,
         cwd: ?[]const u8,
+        profile_id: ?[]const u8,
+        runtime_id: ?[]const u8,
+        repository_id: ?[]const u8,
+        repository_cwd: ?[]const u8,
         store_revision: ?i64,
     ) !void {
         const provider_code = try providerCode(provider);
@@ -2701,8 +3496,8 @@ pub const Store = struct {
         defer if (draft_images_json) |value| self.allocator.free(value);
 
         try self.conn.exec(
-            "insert into threads (workspace_id, sort_index, title, archived, committed, local_thread_id, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size, draft_images_json, cwd) " ++
-                "values (?1, coalesce(?2, (select coalesce(max(sort_index) + 1, 0) from threads where workspace_id = ?1)), ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+            "insert into threads (workspace_id, sort_index, title, archived, committed, local_thread_id, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size, draft_images_json, cwd, profile_id, runtime_id, repository_id, repository_cwd) " ++
+                "values (?1, coalesce(?2, (select coalesce(max(sort_index) + 1, 0) from threads where workspace_id = ?1)), ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
             .{
                 workspace_row_id,
                 sort_index,
@@ -2726,6 +3521,10 @@ pub const Store = struct {
                 if (primary_draft_image) |value| @as(i64, @intCast(value.byte_size)) else null,
                 draft_images_json,
                 cwd,
+                profile_id,
+                runtime_id,
+                repository_id,
+                repository_cwd,
             },
         );
         const thread_row_id = self.conn.lastInsertedRowId();
@@ -2828,6 +3627,11 @@ fn mutationHeader(mutation: Mutation) store_protocol.MutationHeader {
     return switch (mutation) {
         .snapshot_replace => |request| request.mutation,
         .workspace_upsert => |request| request.mutation,
+        .workspace_repository_upsert => |request| request.mutation,
+        .workspace_repository_remove => |request| request.mutation,
+        .workspace_default_repository_set => |request| request.mutation,
+        .workspace_repository_binding_upsert => |request| request.mutation,
+        .workspace_repository_binding_remove => |request| request.mutation,
         .thread_upsert => |request| request.mutation,
         .chat_draft_set => |request| request.mutation,
         .message_append => |request| request.mutation,
@@ -2842,6 +3646,11 @@ fn mutationOperation(mutation: Mutation) []const u8 {
     return switch (mutation) {
         .snapshot_replace => SNAPSHOT_REPLACE_OPERATION,
         .workspace_upsert => WORKSPACE_UPSERT_OPERATION,
+        .workspace_repository_upsert => WORKSPACE_REPOSITORY_UPSERT_OPERATION,
+        .workspace_repository_remove => WORKSPACE_REPOSITORY_REMOVE_OPERATION,
+        .workspace_default_repository_set => WORKSPACE_DEFAULT_REPOSITORY_SET_OPERATION,
+        .workspace_repository_binding_upsert => WORKSPACE_REPOSITORY_BINDING_UPSERT_OPERATION,
+        .workspace_repository_binding_remove => WORKSPACE_REPOSITORY_BINDING_REMOVE_OPERATION,
         .thread_upsert => THREAD_UPSERT_OPERATION,
         .chat_draft_set => CHAT_DRAFT_SET_OPERATION,
         .message_append => MESSAGE_APPEND_OPERATION,
@@ -2864,14 +3673,51 @@ fn validateMutation(mutation: Mutation) StoreError!void {
                 // workspace resurrection before the transaction mutates rows.
                 return error.Conflict;
             }
+            for (request.snapshot.workspaces) |workspace| {
+                try validateWorkspaceRepositoryManifest(workspace);
+                for (workspace.threads) |thread| try validateThreadRoute(thread);
+            }
         },
         .workspace_upsert => |request| {
             if (request.workspace.workspace_id.len == 0 or request.workspace.label.len == 0 or request.workspace.path.len == 0) return error.InvalidParams;
             if (request.workspace.threads.len != 0 or request.workspace.messages.len != 0) return error.InvalidParams;
+            try validateWorkspaceRepositoryManifest(request.workspace);
+        },
+        .workspace_repository_upsert => |request| {
+            if (!validWorkspaceId(request.workspace_id) or !repositoryDefinitionValid(request.repository)) {
+                return error.InvalidParams;
+            }
+        },
+        .workspace_repository_remove => |request| {
+            if (!validWorkspaceId(request.workspace_id) or !validRouteId(request.repository_id) or
+                std.mem.eql(u8, request.repository_id, store_protocol.PRIMARY_REPOSITORY_ID))
+            {
+                return error.InvalidParams;
+            }
+        },
+        .workspace_default_repository_set => |request| {
+            if (!validWorkspaceId(request.workspace_id) or !validRouteId(request.repository_id)) {
+                return error.InvalidParams;
+            }
+        },
+        .workspace_repository_binding_upsert => |request| {
+            if (!validWorkspaceId(request.workspace_id) or !validRouteId(request.repository_id) or
+                !repositoryBindingValid(request.binding))
+            {
+                return error.InvalidParams;
+            }
+        },
+        .workspace_repository_binding_remove => |request| {
+            if (!validWorkspaceId(request.workspace_id) or !validRouteId(request.repository_id) or
+                !validRuntimeId(request.runtime_id))
+            {
+                return error.InvalidParams;
+            }
         },
         .thread_upsert => |request| {
             if (request.workspace_id.len == 0 or request.thread.local_thread_id.len == 0) return error.InvalidParams;
             if (request.thread.messages.len != 0) return error.InvalidParams;
+            try validateThreadRoute(request.thread);
             _ = try firstAttachment(request.thread.draft_image, request.thread.draft_images);
         },
         .chat_draft_set => |request| {
@@ -2909,11 +3755,13 @@ fn validateTurnCommit(request: TurnCommitRequest) StoreError!void {
     if (request.workspace) |workspace| {
         if (!std.mem.eql(u8, workspace.workspace_id, request.workspace_id) or workspace.label.len == 0 or workspace.path.len == 0 or
             workspace.threads.len != 0 or workspace.messages.len != 0) return error.InvalidParams;
+        try validateWorkspaceRepositoryManifest(workspace);
     }
     if (request.thread) |thread| {
         if (!std.mem.eql(u8, thread.local_thread_id, request.local_thread_id) or thread.messages.len != 0 or
             !std.mem.eql(u8, thread.provider, request.provider) or !std.mem.eql(u8, thread.harness, request.harness) or
             !optionalBytesEqual(thread.provider_thread_id, request.provider_thread_id)) return error.InvalidParams;
+        try validateThreadRoute(thread);
     }
     if (request.completion) |completion| {
         if (!std.mem.eql(u8, completion.workspace_id, request.workspace_id) or
@@ -2933,12 +3781,392 @@ fn validateTurnAcceptance(request: TurnAcceptanceRequest) StoreError!void {
         return error.InvalidParams;
     }
     if (request.workspace.threads.len != 0 or request.workspace.messages.len != 0 or request.thread.messages.len != 0) return error.InvalidParams;
+    try validateWorkspaceRepositoryManifest(request.workspace);
     if (!std.mem.eql(u8, request.thread.provider, request.provider) or
         !std.mem.eql(u8, request.thread.harness, request.harness) or
         !optionalBytesEqual(request.thread.provider_thread_id, request.provider_thread_id)) return error.InvalidParams;
+    try validateThreadRoute(request.thread);
     _ = providerCode(request.provider) catch return error.InvalidParams;
     _ = harnessCode(request.harness) catch return error.InvalidParams;
     _ = try firstAttachment(request.user_message.image, request.user_message.images);
+}
+
+fn validateThreadRoute(thread: store_protocol.Thread) StoreError!void {
+    const route_absent = thread.profile_id == null and thread.runtime_id == null and
+        thread.repository_id == null and thread.repository_cwd == null;
+    if (route_absent) return;
+    if (thread.committed and thread.local_thread_id.len == 0) return error.InvalidParams;
+    const profile_id = thread.profile_id orelse return error.InvalidParams;
+    const repository_id = thread.repository_id orelse return error.InvalidParams;
+    if (!validRouteId(profile_id) or !validRouteId(repository_id)) return error.InvalidParams;
+    if (thread.committed and !std.mem.eql(u8, profile_id, "local") and thread.runtime_id == null) {
+        return error.InvalidParams;
+    }
+    if (thread.runtime_id) |runtime_id| {
+        if (runtime_id.len != 32) return error.InvalidParams;
+        for (runtime_id) |byte| {
+            if (!std.ascii.isHex(byte) or std.ascii.isUpper(byte)) return error.InvalidParams;
+        }
+    }
+    if (thread.repository_cwd) |relative_cwd| {
+        if (!validRepositoryCwd(relative_cwd)) return error.InvalidParams;
+    }
+}
+
+fn validRouteId(value: []const u8) bool {
+    if (value.len == 0 or value.len > MAX_REPOSITORY_ID_BYTES) return false;
+    for (value) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_' and byte != '.') return false;
+    }
+    return true;
+}
+
+fn validRepositoryCwd(value: []const u8) bool {
+    if (value.len == 0 or value.len > 4 * 1024 or value[0] == '/' or
+        !std.unicode.utf8ValidateSlice(value))
+    {
+        return false;
+    }
+    for (value) |byte| {
+        if (byte == '\\' or byte == ':' or std.ascii.isControl(byte)) return false;
+    }
+    var segments = std.mem.splitScalar(u8, value, '/');
+    while (segments.next()) |segment| {
+        if (segment.len == 0 or std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..")) return false;
+    }
+    return true;
+}
+
+fn validateWorkspaceRepositoryManifest(workspace: store_protocol.Workspace) StoreError!void {
+    if (!validWorkspaceId(workspace.workspace_id)) return error.InvalidParams;
+    if (workspace.repositories.len > MAX_WORKSPACE_REPOSITORIES) return error.CapabilityUnavailable;
+    if (workspace.repositories.len == 0) {
+        if (workspace.default_repository_id) |repository_id| {
+            if (!std.mem.eql(u8, repository_id, store_protocol.PRIMARY_REPOSITORY_ID)) return error.InvalidParams;
+        }
+        return;
+    }
+
+    const default_repository_id = workspace.default_repository_id orelse store_protocol.PRIMARY_REPOSITORY_ID;
+    if (!validRouteId(default_repository_id)) return error.InvalidParams;
+    var found_primary = false;
+    var found_default = false;
+    for (workspace.repositories, 0..) |repository, repository_index| {
+        const definition: RepositoryDefinition = .{
+            .repository_id = repository.repository_id,
+            .label = repository.label,
+            .vcs_identity = repository.vcs_identity,
+            .default_branch = repository.default_branch,
+        };
+        if (!repositoryDefinitionValid(definition)) return error.InvalidParams;
+        if (repository.bindings.len > MAX_REPOSITORY_BINDINGS) return error.CapabilityUnavailable;
+        for (workspace.repositories[0..repository_index]) |prior| {
+            if (std.mem.eql(u8, prior.repository_id, repository.repository_id)) return error.InvalidParams;
+        }
+        for (repository.bindings, 0..) |binding, binding_index| {
+            if (!repositoryBindingValid(binding)) return error.InvalidParams;
+            for (repository.bindings[0..binding_index]) |prior| {
+                if (std.mem.eql(u8, prior.runtime_id, binding.runtime_id)) return error.InvalidParams;
+            }
+        }
+        found_primary = found_primary or std.mem.eql(u8, repository.repository_id, store_protocol.PRIMARY_REPOSITORY_ID);
+        found_default = found_default or std.mem.eql(u8, repository.repository_id, default_repository_id);
+    }
+    if (!found_primary or !found_default) return error.InvalidParams;
+
+    for (workspace.threads) |thread| {
+        const repository_id = thread.repository_id orelse store_protocol.PRIMARY_REPOSITORY_ID;
+        var found = false;
+        for (workspace.repositories) |repository| {
+            if (std.mem.eql(u8, repository.repository_id, repository_id)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return error.InvalidParams;
+    }
+}
+
+fn repositoryDefinitionValid(definition: RepositoryDefinition) bool {
+    if (!validRouteId(definition.repository_id) or
+        !validBoundedDisplayText(definition.label, MAX_REPOSITORY_LABEL_BYTES))
+    {
+        return false;
+    }
+    if (definition.vcs_identity) |value| {
+        if (!validVcsIdentity(value)) return false;
+    }
+    if (definition.default_branch) |value| {
+        if (!validDefaultBranch(value)) return false;
+    }
+    return true;
+}
+
+fn repositoryBindingValid(binding: store_protocol.RepositoryBinding) bool {
+    return validRuntimeId(binding.runtime_id) and
+        validAbsoluteRepositoryPath(binding.root_path) and
+        (std.mem.eql(u8, binding.availability, "available") or
+            std.mem.eql(u8, binding.availability, "missing") or
+            std.mem.eql(u8, binding.availability, "unknown"));
+}
+
+fn validWorkspaceId(value: []const u8) bool {
+    if (value.len == 0 or value.len > 512 or !std.unicode.utf8ValidateSlice(value)) return false;
+    for (value) |byte| if (std.ascii.isControl(byte)) return false;
+    return true;
+}
+
+fn validRuntimeId(value: []const u8) bool {
+    if (value.len != 32) return false;
+    for (value) |byte| {
+        if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
+    }
+    return true;
+}
+
+fn validBoundedDisplayText(value: []const u8, max_bytes: usize) bool {
+    if (value.len == 0 or value.len > max_bytes or !std.unicode.utf8ValidateSlice(value)) return false;
+    if (std.ascii.isWhitespace(value[0]) or std.ascii.isWhitespace(value[value.len - 1])) return false;
+    for (value) |byte| if (std.ascii.isControl(byte)) return false;
+    return true;
+}
+
+fn validAbsoluteRepositoryPath(value: []const u8) bool {
+    if (value.len == 0 or value.len > MAX_REPOSITORY_PATH_BYTES or
+        !std.unicode.utf8ValidateSlice(value))
+    {
+        return false;
+    }
+    for (value) |byte| if (std.ascii.isControl(byte)) return false;
+
+    if (value[0] == '/') {
+        if (std.mem.findScalar(u8, value, '\\') != null) return false;
+        if (value.len == 1) return false;
+        return validPathSegments(value[1..], "/", 1);
+    }
+    if (value.len >= 3 and std.ascii.isAlphabetic(value[0]) and value[1] == ':' and
+        (value[2] == '/' or value[2] == '\\'))
+    {
+        if (value.len == 3) return false;
+        const separator: u8 = value[2];
+        const other_separator: u8 = if (separator == '/') '\\' else '/';
+        if (std.mem.findScalar(u8, value[3..], other_separator) != null or
+            std.mem.findScalar(u8, value[2..], ':') != null)
+        {
+            return false;
+        }
+        const delimiters = if (separator == '/') "/" else "\\";
+        return validPathSegments(value[3..], delimiters, 1);
+    }
+    if (std.mem.startsWith(u8, value, "\\\\") and
+        !std.mem.startsWith(u8, value, "\\\\?\\") and
+        !std.mem.startsWith(u8, value, "\\\\.\\"))
+    {
+        if (std.mem.findScalar(u8, value[2..], '/') != null) return false;
+        return validPathSegments(value[2..], "\\", 3);
+    }
+    return false;
+}
+
+fn validPathSegments(value: []const u8, delimiters: []const u8, minimum_segments: usize) bool {
+    var count: usize = 0;
+    var segments = std.mem.splitAny(u8, value, delimiters);
+    while (segments.next()) |segment| {
+        if (segment.len == 0 or std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..")) return false;
+        count += 1;
+    }
+    return count >= minimum_segments;
+}
+
+fn validVcsIdentity(value: []const u8) bool {
+    if (value.len == 0 or value.len > MAX_VCS_IDENTITY_BYTES or
+        !std.unicode.utf8ValidateSlice(value) or
+        std.mem.findScalar(u8, value, '?') != null or
+        std.mem.findScalar(u8, value, '#') != null or
+        std.mem.findScalar(u8, value, '\\') != null or
+        std.mem.findScalar(u8, value, '%') != null)
+    {
+        return false;
+    }
+    for (value) |byte| if (std.ascii.isWhitespace(byte) or std.ascii.isControl(byte)) return false;
+
+    if (std.mem.find(u8, value, "://")) |scheme_end| {
+        const scheme = value[0..scheme_end];
+        const is_ssh = std.mem.eql(u8, scheme, "ssh");
+        if (!is_ssh and !std.mem.eql(u8, scheme, "https") and
+            !std.mem.eql(u8, scheme, "git"))
+        {
+            return false;
+        }
+        const authority_start = scheme_end + 3;
+        if (authority_start >= value.len) return false;
+        const path_offset = std.mem.findScalar(u8, value[authority_start..], '/') orelse return false;
+        const authority_end = authority_start + path_offset;
+        const authority = value[authority_start..authority_end];
+        return validVcsAuthority(authority, is_ssh) and validVcsPath(value[authority_end + 1 ..]);
+    }
+
+    const at_index = std.mem.findScalar(u8, value, '@') orelse return false;
+    if (!validVcsUser(value[0..at_index]) or
+        std.mem.findScalar(u8, value[at_index + 1 ..], '@') != null)
+    {
+        return false;
+    }
+    const host_and_path = value[at_index + 1 ..];
+    const colon_index = std.mem.findScalar(u8, host_and_path, ':') orelse return false;
+    return validVcsHost(host_and_path[0..colon_index]) and validVcsPath(host_and_path[colon_index + 1 ..]);
+}
+
+fn validVcsAuthority(authority: []const u8, allow_user: bool) bool {
+    if (authority.len == 0 or std.mem.findScalar(u8, authority, '%') != null) return false;
+    var host_port = authority;
+    if (std.mem.findScalar(u8, authority, '@')) |at_index| {
+        if (!allow_user or !validVcsUser(authority[0..at_index]) or
+            std.mem.findScalar(u8, authority[at_index + 1 ..], '@') != null)
+        {
+            return false;
+        }
+        host_port = authority[at_index + 1 ..];
+    }
+    return validVcsHostPort(host_port);
+}
+
+fn validVcsUser(value: []const u8) bool {
+    if (value.len == 0 or value.len > 64 or vcsSegmentLooksCredentialBearing(value)) return false;
+    for (value) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '.' and byte != '_' and byte != '-') return false;
+    }
+    return true;
+}
+
+fn validVcsHostPort(value: []const u8) bool {
+    if (value.len == 0) return false;
+    if (value[0] == '[') {
+        const close_index = std.mem.findScalar(u8, value, ']') orelse return false;
+        if (close_index <= 1 or !validBracketedVcsHost(value[1..close_index])) return false;
+        if (close_index + 1 == value.len) return true;
+        return value[close_index + 1] == ':' and validNumericPort(value[close_index + 2 ..]);
+    }
+    if (std.mem.findScalar(u8, value, ':')) |colon_index| {
+        if (std.mem.findScalar(u8, value[colon_index + 1 ..], ':') != null) return false;
+        return validVcsHost(value[0..colon_index]) and validNumericPort(value[colon_index + 1 ..]);
+    }
+    return validVcsHost(value);
+}
+
+fn validVcsHost(value: []const u8) bool {
+    if (value.len == 0 or value.len > 253 or !std.ascii.isAlphanumeric(value[0]) or
+        !std.ascii.isAlphanumeric(value[value.len - 1]))
+    {
+        return false;
+    }
+    for (value) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '.' and byte != '-') return false;
+    }
+    return true;
+}
+
+fn validBracketedVcsHost(value: []const u8) bool {
+    for (value) |byte| {
+        if (!std.ascii.isHex(byte) and byte != ':' and byte != '.') return false;
+    }
+    return true;
+}
+
+fn validNumericPort(value: []const u8) bool {
+    if (value.len == 0 or value.len > 5) return false;
+    var port: u32 = 0;
+    for (value) |byte| {
+        if (!std.ascii.isDigit(byte)) return false;
+        port = port * 10 + (byte - '0');
+    }
+    return port > 0 and port <= 65535;
+}
+
+fn validVcsPath(value: []const u8) bool {
+    if (value.len == 0 or value[0] == '/' or value[value.len - 1] == '/' or
+        std.mem.find(u8, value, "//") != null)
+    {
+        return false;
+    }
+    var segments = std.mem.splitScalar(u8, value, '/');
+    while (segments.next()) |segment| {
+        if (segment.len == 0 or std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..") or
+            vcsSegmentLooksCredentialBearing(segment))
+        {
+            return false;
+        }
+        for (segment) |byte| {
+            if (!std.ascii.isAlphanumeric(byte) and byte != '.' and byte != '_' and
+                byte != '-' and byte != '+' and byte != '~')
+            {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+fn vcsSegmentLooksCredentialBearing(segment: []const u8) bool {
+    const exact = [_][]const u8{ "oauth2", "token", "x-access-token" };
+    for (exact) |candidate| if (std.ascii.eqlIgnoreCase(segment, candidate)) return true;
+    const prefixes = [_][]const u8{ "ghp_", "github_pat_", "glpat-" };
+    for (prefixes) |prefix| {
+        if (segment.len >= prefix.len and std.ascii.eqlIgnoreCase(segment[0..prefix.len], prefix)) return true;
+    }
+    return false;
+}
+
+fn validDefaultBranch(value: []const u8) bool {
+    if (value.len == 0 or value.len > MAX_DEFAULT_BRANCH_BYTES or
+        !std.unicode.utf8ValidateSlice(value) or value[0] == '/' or value[value.len - 1] == '/' or
+        value[0] == '.' or value[value.len - 1] == '.' or
+        std.mem.eql(u8, value, "@") or std.mem.endsWith(u8, value, ".lock") or
+        std.mem.find(u8, value, "..") != null or std.mem.find(u8, value, "//") != null or
+        std.mem.find(u8, value, "@{") != null)
+    {
+        return false;
+    }
+    for (value) |byte| {
+        if (std.ascii.isControl(byte) or std.ascii.isWhitespace(byte) or
+            byte == '~' or byte == '^' or byte == ':' or byte == '?' or
+            byte == '*' or byte == '[' or byte == '\\')
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn copyRepositoryBinding(
+    allocator: std.mem.Allocator,
+    binding: store_protocol.RepositoryBinding,
+) !store_protocol.RepositoryBinding {
+    const runtime_id = try allocator.dupe(u8, binding.runtime_id);
+    errdefer allocator.free(runtime_id);
+    const root_path = try allocator.dupe(u8, binding.root_path);
+    errdefer allocator.free(root_path);
+    const availability = try allocator.dupe(u8, binding.availability);
+    return .{
+        .runtime_id = runtime_id,
+        .root_path = root_path,
+        .availability = availability,
+    };
+}
+
+fn freeOwnedRepositoryBinding(allocator: std.mem.Allocator, binding: store_protocol.RepositoryBinding) void {
+    allocator.free(binding.runtime_id);
+    allocator.free(binding.root_path);
+    allocator.free(binding.availability);
+}
+
+fn freeOwnedRepository(allocator: std.mem.Allocator, repository: store_protocol.Repository) void {
+    allocator.free(repository.repository_id);
+    allocator.free(repository.label);
+    if (repository.vcs_identity) |value| allocator.free(value);
+    if (repository.default_branch) |value| allocator.free(value);
+    for (repository.bindings) |binding| freeOwnedRepositoryBinding(allocator, binding);
+    allocator.free(repository.bindings);
 }
 
 fn checkExpectedRevision(mutation: Mutation, current_revision: u64) StoreError!void {
@@ -3303,7 +4531,9 @@ fn isDigestFingerprint(value: []const u8) bool {
 fn mapOpenError(err: anyerror) StoreError {
     if (err == error.DatabaseSchemaTooNew) return error.SchemaTooNew;
     if (err == error.DatabaseSchemaInvalid or err == error.MissingSchemaVersion) return error.StoreCorrupt;
-    if (err == error.StoreMetadataMissing) return error.StoreCorrupt;
+    if (err == error.StoreMetadataMissing or err == error.StoreMetadataCorrupt) return error.StoreCorrupt;
+    if (err == error.RuntimeIdentityMismatch) return error.RuntimeIdentityMismatch;
+    if (err == error.InvalidRuntimeIdentity) return error.InvalidRuntimeIdentity;
     return mapSqliteError(err);
 }
 
@@ -3315,6 +4545,11 @@ fn mapStoreError(err: anyerror) StoreError {
     if (err == error.Internal) return error.Internal;
     if (err == error.OutOfMemory) return error.OutOfMemory;
     if (err == error.StoreCorrupt or err == error.StoreMetadataMissing) return error.StoreCorrupt;
+    if (err == error.RuntimeIdentityMismatch) return error.RuntimeIdentityMismatch;
+    if (err == error.InvalidRuntimeIdentity) return error.InvalidRuntimeIdentity;
+    if (err == error.PageCursorInvalid) return error.PageCursorInvalid;
+    if (err == error.PageCursorStale) return error.PageCursorStale;
+    if (err == error.PageCursorMismatch) return error.PageCursorMismatch;
     return mapSqliteError(err);
 }
 
@@ -3409,6 +4644,30 @@ fn testHeader(request_key: []const u8, expected_store_revision: ?u64) store_prot
         .expected_store_revision = expected_store_revision,
         .client_id = "test-client",
     };
+}
+
+test "identity-bound store initializes durable access tables" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+    var store = try Store.initWithRuntimeIdentity(
+        std.testing.allocator,
+        db_path,
+        .none,
+        .{
+            .runtime_id = "0123456789abcdef0123456789abcdef",
+            .instance_id = "fedcba9876543210fedcba9876543210",
+        },
+    );
+    defer store.deinit();
+
+    var row = (try store.conn.row(
+        \\select count(*) from sqlite_schema
+        \\where type = 'table' and name in ('runtime_pairing_grants', 'runtime_devices')
+    , .{})).?;
+    defer row.deinit();
+    try std.testing.expectEqual(@as(i64, 2), row.int(0));
 }
 
 fn seedLegacyStagedAcceptance(store: *Store, request: TurnAcceptanceRequest) !void {
@@ -3507,7 +4766,7 @@ const LegacyStateSnapshot = struct {
                 "coalesce((select group_concat(v, char(30)) from (select quote(w.workspace_id)||char(31)||quote(t.local_thread_id)||char(31)||quote(t.title)||char(31)||quote(t.provider_thread_id)||char(31)||t.provider||char(31)||t.harness v from threads t join workspaces w on w.id=t.workspace_id order by w.workspace_id,t.local_thread_id)), ''), " ++
                 "coalesce((select group_concat(v, char(30)) from (select quote(message_id)||char(31)||quote(role)||char(31)||quote(author)||char(31)||quote(body)||char(31)||quote(image_path)||char(31)||quote(image_mime)||char(31)||quote(image_byte_size)||char(31)||quote(created_at_ms)||char(31)||quote(updated_at_ms) v from messages order by thread_id,sort_index)), ''), " ++
                 "coalesce((select group_concat(v, char(30)) from (select quote(message_id)||char(31)||quote(message_fingerprint)||char(31)||quote(sort_index)||char(31)||quote(created_at_ms)||char(31)||quote(updated_at_ms)||char(31)||quote(store_revision) v from client_message_keys order by thread_id,message_id)), ''), " ++
-                "coalesce((select group_concat(v, char(30)) from (select quote(turn_id)||char(31)||quote(workspace_id)||char(31)||quote(local_thread_id)||char(31)||quote(status)||char(31)||quote(started_at_ms)||char(31)||quote(finished_at_ms)||char(31)||quote(provider)||char(31)||quote(provider_thread_id)||char(31)||quote(error_message)||char(31)||quote(user_message_id)||char(31)||quote(committed_store_revision) v from chat_turns order by turn_id)), ''), " ++
+                "coalesce((select group_concat(v, char(30)) from (select quote(turn_id)||char(31)||quote(workspace_id)||char(31)||quote(local_thread_id)||char(31)||quote(status)||char(31)||quote(started_at_ms)||char(31)||quote(finished_at_ms)||char(31)||quote(provider)||char(31)||quote(provider_thread_id)||char(31)||quote(error_message)||char(31)||quote(failure_reason)||char(31)||quote(user_message_id)||char(31)||quote(committed_store_revision) v from chat_turns order by turn_id)), ''), " ++
                 "coalesce((select group_concat(v, char(30)) from (select quote(request_key)||char(31)||quote(operation)||char(31)||quote(fingerprint)||char(31)||quote(store_revision)||char(31)||quote(response_status)||char(31)||quote(response_payload) v from store_receipts order by request_key)), ''), " ++
                 "coalesce((select group_concat(v, char(30)) from (select quote(turn_id)||char(31)||quote(status) v from terminal_turn_replay_guard order by turn_id)), '')",
             .{},
@@ -3643,6 +4902,606 @@ fn testWorkspaceRequest(
         },
         .workspace = workspace,
     };
+}
+
+test "repository manifest CRUD is receipt-backed and never deletes checkout data" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const root_path = root_buf[0..root_len];
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repository-sentinel", .data = "keep" });
+
+    const runtime_id = "0123456789abcdef0123456789abcdef";
+    var store = try Store.initWithRuntimeIdentity(std.testing.allocator, db_path, .none, .{
+        .runtime_id = runtime_id,
+        .instance_id = "fedcba9876543210fedcba9876543210",
+    });
+    defer store.deinit();
+
+    var workspace = testWorkspace("manifest-workspace", "Manifest workspace");
+    workspace.path = root_path;
+    _ = try store.upsertWorkspace(testWorkspaceRequest("manifest-workspace", null, workspace));
+
+    var legacy_manifest = try store.loadWorkspaceRepositoryManifest("manifest-workspace");
+    defer legacy_manifest.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("primary", legacy_manifest.default_repository_id);
+    try std.testing.expectEqual(@as(usize, 1), legacy_manifest.repositories.len);
+    try std.testing.expectEqualStrings(runtime_id, legacy_manifest.repositories[0].bindings[0].runtime_id);
+    try std.testing.expectEqualStrings(root_path, legacy_manifest.repositories[0].bindings[0].root_path);
+
+    _ = try store.upsertWorkspaceRepository(.{
+        .mutation = testHeader("repo-api-upsert", 1),
+        .workspace_id = "manifest-workspace",
+        .repository = .{
+            .repository_id = "repo-api",
+            .label = "API",
+            .vcs_identity = "https://example.com/org/api.git",
+            .default_branch = "main",
+        },
+    });
+    _ = try store.upsertWorkspaceRepositoryBinding(.{
+        .mutation = testHeader("repo-api-binding", 2),
+        .workspace_id = "manifest-workspace",
+        .repository_id = "repo-api",
+        .binding = .{ .runtime_id = runtime_id, .root_path = root_path },
+    });
+    _ = try store.setWorkspaceDefaultRepository(.{
+        .mutation = testHeader("repo-api-default", 3),
+        .workspace_id = "manifest-workspace",
+        .repository_id = "repo-api",
+    });
+
+    var manifest = try store.loadWorkspaceRepositoryManifest("manifest-workspace");
+    defer manifest.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("repo-api", manifest.default_repository_id);
+    try std.testing.expectEqual(@as(usize, 2), manifest.repositories.len);
+    try std.testing.expectEqualStrings("repo-api", manifest.repositories[1].repository_id);
+    try std.testing.expectEqualStrings("https://example.com/org/api.git", manifest.repositories[1].vcs_identity.?);
+    try std.testing.expectEqualStrings("main", manifest.repositories[1].default_branch.?);
+    try std.testing.expectEqualStrings(root_path, manifest.repositories[1].bindings[0].root_path);
+
+    var binding = try store.loadWorkspaceRepositoryBinding("manifest-workspace", "repo-api", runtime_id);
+    defer binding.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(root_path, binding.root_path);
+    try std.testing.expectEqualStrings("available", binding.availability);
+
+    const remove_binding: WorkspaceRepositoryBindingRemoveRequest = .{
+        .mutation = testHeader("repo-api-binding-remove", 4),
+        .workspace_id = "manifest-workspace",
+        .repository_id = "repo-api",
+        .runtime_id = runtime_id,
+    };
+    const removed = try store.removeWorkspaceRepositoryBinding(remove_binding);
+    try std.testing.expectEqual(@as(u64, 5), removed.store_revision);
+    const replayed = try store.removeWorkspaceRepositoryBinding(remove_binding);
+    try std.testing.expectEqual(@as(u64, 5), replayed.store_revision);
+    try std.testing.expectEqual(@as(u64, 5), try store.storeRevision());
+    try std.testing.expectError(
+        error.ResourceNotFound,
+        store.loadWorkspaceRepositoryBinding("manifest-workspace", "repo-api", runtime_id),
+    );
+
+    _ = try store.setWorkspaceDefaultRepository(.{
+        .mutation = testHeader("primary-default", 5),
+        .workspace_id = "manifest-workspace",
+        .repository_id = "primary",
+    });
+    _ = try store.removeWorkspaceRepository(.{
+        .mutation = testHeader("repo-api-remove", 6),
+        .workspace_id = "manifest-workspace",
+        .repository_id = "repo-api",
+    });
+    _ = try tmp.dir.statFile(std.testing.io, "repository-sentinel", .{});
+    var final_manifest = try store.loadWorkspaceRepositoryManifest("manifest-workspace");
+    defer final_manifest.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), final_manifest.repositories.len);
+    try std.testing.expectEqualStrings("primary", final_manifest.repositories[0].repository_id);
+}
+
+test "repository persistence rejects credential-shaped identities and broad roots" {
+    try std.testing.expect(validVcsIdentity("https://example.com/org/api.git"));
+    try std.testing.expect(validVcsIdentity("ssh://git@example.com:22/org/api.git"));
+    try std.testing.expect(validVcsIdentity("git@example.com:org/api.git"));
+    const rejected_identities = [_][]const u8{
+        "https://token@example.com/org/api.git",
+        "https://user%3Apass%40example.com/org/api.git",
+        "https://example.com:secret/org/api.git",
+        "https://example.com/org/api.git?access_token=secret",
+        "https://example.com/ghp_secret/repo.git",
+        "ssh://ghp_secret@example.com/org/api.git",
+        "ghp_secret@example.com:org/api.git",
+        "oauth2:secret@gitlab.com:org/api.git",
+        "example.com/org/api.git",
+    };
+    for (rejected_identities) |identity| try std.testing.expect(!validVcsIdentity(identity));
+
+    try std.testing.expect(validAbsoluteRepositoryPath("/srv/verde/api"));
+    try std.testing.expect(validAbsoluteRepositoryPath("C:\\src\\api"));
+    try std.testing.expect(validAbsoluteRepositoryPath("C:/src/api"));
+    try std.testing.expect(validAbsoluteRepositoryPath("\\\\server\\share\\api"));
+    const rejected_roots = [_][]const u8{
+        "/",
+        "C:\\",
+        "C:/",
+        "\\\\server\\share",
+        "relative/repo",
+        "/srv/../secret",
+        "/srv/repo/",
+    };
+    for (rejected_roots) |root_path| try std.testing.expect(!validAbsoluteRepositoryPath(root_path));
+
+    try validateRepositoryRelativeCwd(null);
+    try validateRepositoryRelativeCwd("services/api");
+    try std.testing.expectError(error.InvalidParams, validateRepositoryRelativeCwd("/absolute"));
+    try std.testing.expectError(error.InvalidParams, validateRepositoryRelativeCwd("../escape"));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+    _ = try store.upsertWorkspace(testWorkspaceRequest(
+        "credential-workspace",
+        null,
+        testWorkspace("credential-workspace", "Credential workspace"),
+    ));
+    for (rejected_identities) |identity| {
+        try std.testing.expectError(error.InvalidParams, store.upsertWorkspaceRepository(.{
+            .mutation = testHeader("rejected-credential", 1),
+            .workspace_id = "credential-workspace",
+            .repository = .{ .repository_id = "secret-repo", .label = "Secret", .vcs_identity = identity },
+        }));
+    }
+    try std.testing.expectEqual(@as(u64, 1), try store.storeRevision());
+    var persisted = (try store.conn.row(
+        "select count(*) from workspace_repositories where repository_id = 'secret-repo'",
+        .{},
+    )).?;
+    defer persisted.deinit();
+    try std.testing.expectEqual(@as(i64, 0), persisted.int(0));
+    var receipt = (try store.conn.row(
+        "select count(*) from store_receipts where request_key = 'rejected-credential'",
+        .{},
+    )).?;
+    defer receipt.deinit();
+    try std.testing.expectEqual(@as(i64, 0), receipt.int(0));
+}
+
+test "repository removal preserves referenced thread routes and loader is bounded" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+
+    const repositories = [_]store_protocol.Repository{
+        .{ .repository_id = "primary", .label = "Primary" },
+        .{ .repository_id = "repo-api", .label = "API" },
+    };
+    var workspace = testWorkspace("referenced-repository-workspace", "Referenced repositories");
+    workspace.repositories = &repositories;
+    _ = try store.upsertWorkspace(testWorkspaceRequest("referenced-repositories", null, workspace));
+    _ = try store.upsertThread(.{
+        .mutation = testHeader("referenced-repository-thread", 1),
+        .workspace_id = workspace.workspace_id,
+        .thread = .{
+            .local_thread_id = "repo-api-thread",
+            .title = "API thread",
+            .profile_id = "local",
+            .repository_id = "repo-api",
+        },
+    });
+    try std.testing.expectError(error.Conflict, store.removeWorkspaceRepository(.{
+        .mutation = testHeader("referenced-repository-remove", 2),
+        .workspace_id = workspace.workspace_id,
+        .repository_id = "repo-api",
+    }));
+    try std.testing.expectEqual(@as(u64, 2), try store.storeRevision());
+
+    const workspace_row_id = try store.requireWorkspaceRowId(workspace.workspace_id);
+    const repository_row_id = try store.requireRepositoryRowId(workspace_row_id, "repo-api");
+    const hex_digits = "0123456789abcdef";
+    var runtime_id: [32]u8 = [_]u8{'0'} ** 32;
+    for (0..MAX_REPOSITORY_BINDINGS) |index| {
+        runtime_id[30] = hex_digits[(index / 16) % 16];
+        runtime_id[31] = hex_digits[index % 16];
+        try store.conn.exec(
+            "insert into workspace_repository_bindings (repository_row_id, runtime_id, root_path, availability) " ++
+                "values (?1, ?2, '/srv/verde/repository', 'available')",
+            .{ repository_row_id, runtime_id[0..] },
+        );
+    }
+    try std.testing.expectError(error.CapabilityUnavailable, store.upsertWorkspaceRepositoryBinding(.{
+        .mutation = testHeader("bounded-binding-upsert", 2),
+        .workspace_id = workspace.workspace_id,
+        .repository_id = "repo-api",
+        .binding = .{
+            .runtime_id = "ffffffffffffffffffffffffffffffff",
+            .root_path = "/srv/verde/repository",
+        },
+    }));
+    runtime_id[30] = '4';
+    runtime_id[31] = '0';
+    try store.conn.exec(
+        "insert into workspace_repository_bindings (repository_row_id, runtime_id, root_path, availability) " ++
+            "values (?1, ?2, '/srv/verde/repository', 'available')",
+        .{ repository_row_id, runtime_id[0..] },
+    );
+    try std.testing.expectError(
+        error.StoreCorrupt,
+        store.loadWorkspaceRepositoryManifest(workspace.workspace_id),
+    );
+    try store.conn.exec(
+        "delete from workspace_repository_bindings where repository_row_id = ?1",
+        .{repository_row_id},
+    );
+
+    var id_buf: [32]u8 = undefined;
+    for (0..MAX_WORKSPACE_REPOSITORIES - 2) |index| {
+        const repository_id = try std.fmt.bufPrint(&id_buf, "overflow-{d}", .{index});
+        try store.conn.exec(
+            "insert into workspace_repositories (workspace_id, repository_id, sort_index, label) values (?1, ?2, ?3, 'Overflow')",
+            .{ workspace_row_id, repository_id, @as(i64, @intCast(index + 2)) },
+        );
+    }
+    try std.testing.expectError(error.CapabilityUnavailable, store.upsertWorkspaceRepository(.{
+        .mutation = testHeader("bounded-repository-upsert", 2),
+        .workspace_id = workspace.workspace_id,
+        .repository = .{ .repository_id = "one-too-many", .label = "Overflow" },
+    }));
+    try store.conn.exec(
+        "insert into workspace_repositories (workspace_id, repository_id, sort_index, label) values (?1, 'one-too-many', ?2, 'Overflow')",
+        .{ workspace_row_id, @as(i64, MAX_WORKSPACE_REPOSITORIES) },
+    );
+    try std.testing.expectError(
+        error.StoreCorrupt,
+        store.loadWorkspaceRepositoryManifest(workspace.workspace_id),
+    );
+    try std.testing.expectEqual(@as(u64, 2), try store.storeRevision());
+}
+
+test "thread runtime route persists once and committed route rejects drift" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+
+    const route_repositories = [_]store_protocol.Repository{
+        .{ .repository_id = "primary", .label = "Primary" },
+        .{ .repository_id = "repo-api", .label = "API" },
+    };
+    var route_workspace = testWorkspace("route-workspace", "Route workspace");
+    route_workspace.repositories = &route_repositories;
+    _ = try store.upsertWorkspace(testWorkspaceRequest(
+        "route-workspace",
+        null,
+        route_workspace,
+    ));
+    const draft: store_protocol.Thread = .{
+        .local_thread_id = "route-thread",
+        .title = "Route thread",
+        .committed = false,
+        .profile_id = "remote-box",
+        .repository_id = "repo-api",
+        .repository_cwd = "services/api",
+    };
+    _ = try store.upsertThread(.{
+        .mutation = testHeader("route-draft", 1),
+        .workspace_id = "route-workspace",
+        .thread = draft,
+    });
+
+    var committed = draft;
+    committed.committed = true;
+    committed.runtime_id = "0123456789abcdef0123456789abcdef";
+    _ = try store.upsertThread(.{
+        .mutation = testHeader("route-pin", 2),
+        .workspace_id = "route-workspace",
+        .thread = committed,
+    });
+
+    {
+        const row = (try store.conn.row(
+            "select profile_id, runtime_id, repository_id, repository_cwd from threads where local_thread_id = 'route-thread'",
+            .{},
+        )).?;
+        defer row.deinit();
+        try std.testing.expectEqualStrings("remote-box", row.text(0));
+        try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", row.text(1));
+        try std.testing.expectEqualStrings("repo-api", row.text(2));
+        try std.testing.expectEqualStrings("services/api", row.text(3));
+    }
+
+    var drifted = committed;
+    drifted.profile_id = "local";
+    try std.testing.expectError(error.InvalidParams, store.upsertThread(.{
+        .mutation = testHeader("route-drift", 3),
+        .workspace_id = "route-workspace",
+        .thread = drifted,
+    }));
+    try std.testing.expectEqual(@as(u64, 3), try store.storeRevision());
+
+    var unlocked = committed;
+    unlocked.committed = false;
+    try std.testing.expectError(error.InvalidParams, store.upsertThread(.{
+        .mutation = testHeader("route-unlock", 3),
+        .workspace_id = "route-workspace",
+        .thread = unlocked,
+    }));
+    try std.testing.expectEqual(@as(u64, 3), try store.storeRevision());
+
+    const partial: store_protocol.Thread = .{
+        .local_thread_id = "partial-route",
+        .title = "Partial route",
+        .profile_id = "remote-box",
+    };
+    try std.testing.expectError(error.InvalidParams, store.upsertThread(.{
+        .mutation = testHeader("route-partial", 3),
+        .workspace_id = "route-workspace",
+        .thread = partial,
+    }));
+    try std.testing.expectEqual(@as(u64, 3), try store.storeRevision());
+}
+
+test "thread runtime route bootstrap cannot replace a nonempty committed store" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+
+    const route_repositories = [_]store_protocol.Repository{
+        .{ .repository_id = "primary", .label = "Primary" },
+        .{ .repository_id = "repo-api", .label = "API" },
+    };
+    var route_workspace = testWorkspace("bootstrap-route-workspace", "Route workspace");
+    route_workspace.repositories = &route_repositories;
+    _ = try store.upsertWorkspace(testWorkspaceRequest(
+        "bootstrap-route-workspace",
+        null,
+        route_workspace,
+    ));
+    const committed: store_protocol.Thread = .{
+        .local_thread_id = "bootstrap-route-thread",
+        .title = "Remote route",
+        .committed = true,
+        .profile_id = "remote-box",
+        .runtime_id = "0123456789abcdef0123456789abcdef",
+        .repository_id = "repo-api",
+        .repository_cwd = "services/api",
+    };
+    _ = try store.upsertThread(.{
+        .mutation = testHeader("bootstrap-route-thread", 1),
+        .workspace_id = "bootstrap-route-workspace",
+        .thread = committed,
+    });
+
+    const same_threads = [_]store_protocol.Thread{committed};
+    const same_workspaces = [_]store_protocol.Workspace{.{
+        .workspace_id = "bootstrap-route-workspace",
+        .label = "Route workspace",
+        .path = "bootstrap-route-workspace",
+        .threads = &same_threads,
+    }};
+    try std.testing.expectError(error.Conflict, store.replaceSnapshot(testSnapshotRequest(
+        "late-bootstrap-same-route",
+        null,
+        true,
+        testSnapshot(&same_workspaces),
+    )));
+
+    var drifted = committed;
+    drifted.profile_id = "other-remote-box";
+    const drifted_threads = [_]store_protocol.Thread{drifted};
+    const drifted_workspaces = [_]store_protocol.Workspace{.{
+        .workspace_id = "bootstrap-route-workspace",
+        .label = "Route workspace",
+        .path = "bootstrap-route-workspace",
+        .threads = &drifted_threads,
+    }};
+    try std.testing.expectError(error.Conflict, store.replaceSnapshot(testSnapshotRequest(
+        "late-bootstrap-drifted-route",
+        null,
+        true,
+        testSnapshot(&drifted_workspaces),
+    )));
+
+    try std.testing.expectEqual(@as(u64, 2), try store.storeRevision());
+    const row = (try store.conn.row(
+        "select committed, profile_id, runtime_id, repository_id, repository_cwd " ++
+            "from threads where local_thread_id = 'bootstrap-route-thread'",
+        .{},
+    )).?;
+    defer row.deinit();
+    try std.testing.expectEqual(@as(i64, 1), row.int(0));
+    try std.testing.expectEqualStrings("remote-box", row.text(1));
+    try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", row.text(2));
+    try std.testing.expectEqualStrings("repo-api", row.text(3));
+    try std.testing.expectEqualStrings("services/api", row.text(4));
+}
+
+test "thread runtime route requires stable identity once committed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+
+    const routed: store_protocol.Thread = .{
+        .local_thread_id = "unpinned-remote-route",
+        .title = "Unpinned remote route",
+        .committed = true,
+        .profile_id = "remote-box",
+        .repository_id = "repo-api",
+    };
+    const routed_threads = [_]store_protocol.Thread{routed};
+    const routed_workspaces = [_]store_protocol.Workspace{.{
+        .workspace_id = "unpinned-workspace",
+        .label = "Unpinned workspace",
+        .path = "unpinned-workspace",
+        .threads = &routed_threads,
+    }};
+    try std.testing.expectError(error.InvalidParams, store.replaceSnapshot(testSnapshotRequest(
+        "unpinned-bootstrap",
+        null,
+        true,
+        testSnapshot(&routed_workspaces),
+    )));
+    try std.testing.expectEqual(@as(u64, 0), try store.storeRevision());
+
+    // The exact all-null route is the sole compatibility exception for a
+    // committed pre-routing thread without a stable public identity.
+    const legacy: store_protocol.Thread = .{
+        .local_thread_id = "",
+        .title = "Legacy local route",
+        .committed = true,
+    };
+    const explicit_local: store_protocol.Thread = .{
+        .local_thread_id = "explicit-local-route",
+        .title = "Explicit local route",
+        .committed = true,
+        .profile_id = "local",
+        .repository_id = "primary",
+    };
+    const legacy_threads = [_]store_protocol.Thread{ legacy, explicit_local };
+    const legacy_workspaces = [_]store_protocol.Workspace{.{
+        .workspace_id = "legacy-workspace",
+        .label = "Legacy workspace",
+        .path = "legacy-workspace",
+        .threads = &legacy_threads,
+    }};
+    _ = try store.replaceSnapshot(testSnapshotRequest(
+        "legacy-bootstrap",
+        null,
+        true,
+        testSnapshot(&legacy_workspaces),
+    ));
+    const row = (try store.conn.row(
+        "select local_thread_id, profile_id, runtime_id, repository_id, repository_cwd from threads where sort_index = 0",
+        .{},
+    )).?;
+    defer row.deinit();
+    try std.testing.expectEqualStrings("", row.text(0));
+    try std.testing.expect(row.nullableText(1) == null);
+    try std.testing.expect(row.nullableText(2) == null);
+    try std.testing.expect(row.nullableText(3) == null);
+    try std.testing.expect(row.nullableText(4) == null);
+    const explicit_row = (try store.conn.row(
+        "select profile_id, runtime_id, repository_id from threads where local_thread_id = 'explicit-local-route'",
+        .{},
+    )).?;
+    defer explicit_row.deinit();
+    try std.testing.expectEqualStrings("local", explicit_row.text(0));
+    try std.testing.expect(explicit_row.nullableText(1) == null);
+    try std.testing.expectEqualStrings("primary", explicit_row.text(2));
+}
+
+test "committed non-local route without runtime pin stays quarantined" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+
+    const route_repositories = [_]store_protocol.Repository{
+        .{ .repository_id = "primary", .label = "Primary" },
+        .{ .repository_id = "repo-api", .label = "API" },
+    };
+    var route_workspace = testWorkspace("quarantined-pin-workspace", "Quarantined pin workspace");
+    route_workspace.repositories = &route_repositories;
+    _ = try store.upsertWorkspace(testWorkspaceRequest(
+        "quarantined-pin-workspace",
+        null,
+        route_workspace,
+    ));
+    const draft: store_protocol.Thread = .{
+        .local_thread_id = "quarantined-pin-thread",
+        .title = "Quarantined remote route",
+        .committed = false,
+        .profile_id = "remote-box",
+        .repository_id = "repo-api",
+    };
+    _ = try store.upsertThread(.{
+        .mutation = testHeader("quarantined-pin-draft", 1),
+        .workspace_id = "quarantined-pin-workspace",
+        .thread = draft,
+    });
+    // Manufacture the pre-fix committed shape without the production API.
+    try store.conn.execNoArgs(
+        "update threads set committed = 1 where local_thread_id = 'quarantined-pin-thread'",
+    );
+
+    var attempted_pin = draft;
+    attempted_pin.committed = true;
+    attempted_pin.runtime_id = "0123456789abcdef0123456789abcdef";
+    try std.testing.expectError(error.InvalidParams, store.upsertThread(.{
+        .mutation = testHeader("quarantined-pin-attempt", 2),
+        .workspace_id = "quarantined-pin-workspace",
+        .thread = attempted_pin,
+    }));
+    try std.testing.expectEqual(@as(u64, 2), try store.storeRevision());
+    const row = (try store.conn.row(
+        "select committed, runtime_id from threads where local_thread_id = 'quarantined-pin-thread'",
+        .{},
+    )).?;
+    defer row.deinit();
+    try std.testing.expectEqual(@as(i64, 1), row.int(0));
+    try std.testing.expect(row.nullableText(1) == null);
+}
+
+test "thread runtime route quarantine prevents null identity reconcile deletion" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+
+    _ = try store.upsertWorkspace(testWorkspaceRequest(
+        "quarantine-workspace",
+        null,
+        testWorkspace("quarantine-workspace", "Quarantine workspace"),
+    ));
+    try store.conn.exec(
+        \\insert into threads (
+        \\    workspace_id, sort_index, title, committed, local_thread_id,
+        \\    provider, harness, profile_id, runtime_id, repository_id, repository_cwd
+        \\)
+        \\select id, 0, 'Opaque remote route', 1, null, ?2, ?3,
+        \\       'remote-box', '0123456789abcdef0123456789abcdef', 'repo-api', 'services/api'
+        \\from workspaces where workspace_id = ?1
+    , .{ "quarantine-workspace", try providerCode("codex"), try harnessCode("local_cli") });
+
+    const workspaces = [_]store_protocol.Workspace{
+        testWorkspace("quarantine-workspace", "Quarantine workspace"),
+    };
+    try std.testing.expectError(error.InvalidParams, store.replaceSnapshot(testSnapshotRequest(
+        "quarantine-reconcile",
+        1,
+        false,
+        testSnapshot(&workspaces),
+    )));
+    try std.testing.expectEqual(@as(u64, 1), try store.storeRevision());
+    const row = (try store.conn.row(
+        "select profile_id, runtime_id, repository_id, repository_cwd from threads " ++
+            "where local_thread_id is null",
+        .{},
+    )).?;
+    defer row.deinit();
+    try std.testing.expectEqualStrings("remote-box", row.text(0));
+    try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", row.text(1));
+    try std.testing.expectEqualStrings("repo-api", row.text(2));
+    try std.testing.expectEqualStrings("services/api", row.text(3));
 }
 
 fn workspaceCount(store: *const Store) !i64 {
@@ -5066,8 +6925,8 @@ test "transcript_apply rows commit with deterministic IDs and replay exactly onc
 
 // M4-P4 fix Layer B (i): a GUI-shaped id-carrying snapshot after a daemon
 // commit preserves every identity, the message keys, and the ledger's
-// user_message_id reference — and an interrupted same-turn replay commit
-// after the snapshot does not duplicate the user row.
+// user_message_id reference — and lower-level commit recovery does not
+// duplicate the user row. Public interrupted-turn retries use a new turn ID.
 test "snapshot replace preserves daemon-committed identities keys and ledger reference" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

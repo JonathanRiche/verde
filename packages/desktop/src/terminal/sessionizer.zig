@@ -6,13 +6,24 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
+const zqlite = @import("zqlite");
 const harness = @import("../providers/harness.zig");
 const headless = @import("headless");
 const app_config = @import("../app/config.zig");
 const chat_threads = @import("../chat/threads.zig");
 const db_types = @import("../db/types.zig");
 const process_registry = @import("../daemon/process_registry.zig");
+const repository_path = @import("../daemon/repository_path.zig");
+const access_store = @import("../daemon/access_store.zig");
+const connect_auth = @import("../daemon/connect_auth.zig");
+const connect_client = @import("../daemon/connect_client.zig");
+const connect_grants = @import("../daemon/connect_grants.zig");
+const connect_keys = @import("../daemon/connect_keys.zig");
+const connect_lifecycle = @import("../daemon/connect_lifecycle.zig");
+const connect_store = @import("../daemon/connect_store.zig");
 const daemon_store = @import("../daemon/store.zig");
+const daemon_runtime_identity = @import("../daemon/runtime_identity.zig");
 const mcp_http = @import("../mcp/http_server.zig");
 const mcp_endpoint = @import("../mcp/endpoint.zig");
 const platform_ipc = @import("../platform/ipc.zig");
@@ -21,6 +32,7 @@ const workspace_identity = @import("../platform/workspace_identity.zig");
 const stack = @import("../workspace/stack.zig");
 const platform_runtime = @import("platform_runtime");
 const process_env = @import("../platform/env.zig");
+const provider_models = @import("../state/provider_models.zig");
 const send_runner = @import("../chat/send_runner.zig");
 const transcript_apply = @import("../chat/transcript_apply.zig");
 const windows_conpty = @import("platform/windows_conpty.zig");
@@ -30,11 +42,14 @@ extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 const log = std.log.scoped(.sessionizer);
 const store_protocol = headless.store;
 const changes_protocol = headless.changes_protocol;
+const access_protocol = headless.access_protocol;
+const connect_protocol = headless.connect_protocol;
 const change_journal = @import("../daemon/change_journal.zig");
 
 pub const SOCKET_NAME = "verde-sessionizer.sock";
 pub const LIVE_SOCKET_NAME = "verde.sock";
 pub const PID_FILE_NAME = "verde-sessionizer.pid";
+pub const RUNTIME_IDENTITY_FILE_NAME = daemon_runtime_identity.FILE_NAME;
 pub const WINDOWS_PIPE_PREFIX = "\\\\.\\pipe\\verde-sessionizer-";
 // Bump whenever the daemon RPC/state surface changes incompatibly. GUI chat
 // turns are daemon-owned now; accepting an older daemon makes the UI
@@ -177,6 +192,56 @@ const StoreService = struct {
     /// Read-side pointer borrows that must outlive service detachment/deinit.
     lifetime_pins: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     draining: bool = false, // set by prepare-shutdown in S3
+};
+
+const AccessRequest = union(enum) {
+    pairing_create: access_protocol.PairingGrantCreateRequest,
+    pairing_list: access_protocol.PairingGrantListRequest,
+    pairing_revoke: access_protocol.PairingGrantRevokeRequest,
+    device_list: access_protocol.DeviceListRequest,
+    device_revoke: access_protocol.DeviceRevokeRequest,
+    pairing_exchange: access_protocol.PairingGrantExchangeRequest,
+    device_authenticate: access_protocol.DeviceAuthenticateRequest,
+    device_authorize: access_protocol.DeviceAuthorizeRequest,
+
+    fn protocolVersion(self: AccessRequest) u32 {
+        return switch (self) {
+            inline else => |request| request.access_protocol_version,
+        };
+    }
+
+    fn clearSecrets(self: AccessRequest) void {
+        switch (self) {
+            .pairing_exchange => |request| std.crypto.secureZero(
+                u8,
+                @constCast(request.pairing_token.reveal()),
+            ),
+            .device_authenticate => |request| std.crypto.secureZero(
+                u8,
+                @constCast(request.device_credential.reveal()),
+            ),
+            else => {},
+        }
+    }
+};
+
+const ConnectRequest = union(enum) {
+    login: connect_protocol.LoginRequest,
+    link: connect_protocol.LinkRequest,
+    status: connect_protocol.StatusRequest,
+    unlink: connect_protocol.UnlinkRequest,
+    logout: connect_protocol.LogoutRequest,
+    bootstrap_consume: connect_protocol.BootstrapConsumeRequest,
+
+    fn protocolVersion(self: ConnectRequest) u32 {
+        return switch (self) {
+            inline else => |request| request.connect_protocol_version,
+        };
+    }
+
+    fn isMutating(self: ConnectRequest) bool {
+        return self != .status;
+    }
 };
 
 fn lockStoreService(service: *StoreService) void {
@@ -1006,12 +1071,22 @@ fn selfExePathAlloc(allocator: std.mem.Allocator) ![:0]u8 {
 fn sessionCliPathAlloc(allocator: std.mem.Allocator) ![:0]u8 {
     const executable = selfExePathAlloc(allocator) catch return allocator.dupeZ(u8, "verde");
     defer allocator.free(executable);
-    if (builtin.os.tag != .windows) return allocator.dupeZ(u8, executable);
+    if (builtin.os.tag != .windows) {
+        return allocator.dupeZ(u8, executablePathWithoutDeletedSuffix(builtin.os.tag, executable));
+    }
 
     const resolved = resolveWindowsCliPathAlloc(allocator, executable) catch
         return allocator.dupeZ(u8, executable);
     defer allocator.free(resolved);
     return allocator.dupeZ(u8, resolved);
+}
+
+fn executablePathWithoutDeletedSuffix(comptime os_tag: std.Target.Os.Tag, executable: []const u8) []const u8 {
+    const deleted_suffix = " (deleted)";
+    if (os_tag == .linux and std.mem.endsWith(u8, executable, deleted_suffix)) {
+        return executable[0 .. executable.len - deleted_suffix.len];
+    }
+    return executable;
 }
 
 const WindowsCliPathResolver = struct {
@@ -1749,6 +1824,8 @@ const PtySession = struct {
 };
 
 const ChatTurnStatus = enum { running, waiting_approval, completed, failed, aborted };
+const ProviderFailureReason = store_protocol.ProviderFailureReason;
+const INTERRUPTED_TURN_MESSAGE = "The daemon restarted before the provider reply completed.";
 const ApprovalDecision = enum { approve, deny };
 const AcceptanceOwnership = enum { owned, conflict_not_owned };
 
@@ -1825,6 +1902,10 @@ const ChatTurn = struct {
     turn_id: []u8,
     workspace_id: []u8,
     local_thread_id: []u8,
+    /// Runtime-local repository route resolved before provider launch. A null
+    /// repository keeps the legacy absolute-path request contract local-only.
+    repository_id: ?[]u8 = null,
+    repository_cwd: ?[]u8 = null,
     request: send_runner.Request,
     owned_image_paths: []const []const u8,
     /// Full attachment metadata for the turn request (path + any mime /
@@ -1870,6 +1951,7 @@ const ChatTurn = struct {
     generated_title: ?[:0]const u8 = null,
     generated_title_applied: bool = false,
     error_message: ?[]u8 = null,
+    failure_reason: ?ProviderFailureReason = null,
     pending_approval: ?PendingApproval = null,
     approval_call_id: ?[]u8 = null,
     approval_decision: ?ApprovalDecision = null,
@@ -1887,6 +1969,8 @@ const ChatTurn = struct {
         allocator.free(self.turn_id);
         allocator.free(self.workspace_id);
         allocator.free(self.local_thread_id);
+        if (self.repository_id) |value| allocator.free(value);
+        if (self.repository_cwd) |value| allocator.free(value);
         freeRunnerRequest(allocator, self.request, self.owned_image_paths);
         for (self.owned_images) |attachment| {
             allocator.free(attachment.path);
@@ -2064,17 +2148,130 @@ fn freeRunnerRequest(allocator: std.mem.Allocator, request: send_runner.Request,
     if (request.model_ref) |value| allocator.free(value);
     if (request.opencode_reasoning_variant) |value| allocator.free(value);
     if (request.cursor_model_params_json) |value| allocator.free(value);
-    if (request.remote_ssh_host) |value| allocator.free(value);
-    if (request.remote_cwd) |value| allocator.free(value);
 }
 
-/// Generate the daemon namespace once at startup. Registry IDs and revisions
-/// are only comparable within this random instance namespace.
-fn randomInstanceNonce(allocator: std.mem.Allocator) []u8 {
+/// Generate an ephemeral process-local namespace. Durable runtime and store
+/// identities use fallible OS entropy during the post-bind readiness phase.
+fn randomEphemeralHexId(allocator: std.mem.Allocator) []u8 {
     var random_bytes: [16]u8 = undefined;
     std.Io.Threaded.global_single_threaded.io().random(&random_bytes);
     const hex = std.fmt.bytesToHex(random_bytes, .lower);
-    return allocator.dupe(u8, &hex) catch @panic("failed to allocate daemon instance nonce");
+    return allocator.dupe(u8, &hex) catch @panic("failed to allocate ephemeral daemon identity");
+}
+
+fn randomInstanceNonce(allocator: std.mem.Allocator) []u8 {
+    return randomEphemeralHexId(allocator);
+}
+
+const PROVIDER_SURFACES_ALL: headless.providers_protocol.ProviderSurfaces = .{
+    .native_chat = true,
+    .terminal_tui = true,
+    .mcp = true,
+    .lifecycle = true,
+};
+
+fn nativeProviderLabel(provider: provider_models.Provider) []const u8 {
+    return switch (provider) {
+        .codex => "Codex",
+        .claude => "Claude",
+        .cursor => "Cursor",
+        .opencode => "OpenCode",
+        .pi => "Pi",
+        .fx => "FX",
+        .grok => "Grok",
+    };
+}
+
+fn nativeProviderLoginCommand(provider: provider_models.Provider) []const []const u8 {
+    return switch (provider) {
+        .codex => &.{ "codex", "login" },
+        .claude => &.{"claude"},
+        .cursor => &.{ "agent", "login" },
+        .opencode => &.{ "opencode", "auth", "login" },
+        .pi => &.{"pi"},
+        .fx => &.{ "fx", "login" },
+        .grok => &.{ "grok", "login" },
+    };
+}
+
+fn nativeProviderInstalled(provider: provider_models.Provider) bool {
+    return switch (provider) {
+        .codex => process_env.commandExists("codex"),
+        .claude => process_env.commandExists("node") and process_env.commandExists("claude"),
+        .cursor => process_env.commandExists("agent") or process_env.commandExists("cursor-agent"),
+        .opencode => process_env.commandExists("opencode"),
+        .pi => process_env.commandExists("pi"),
+        .fx => process_env.commandExists("fx"),
+        .grok => process_env.commandExists("grok"),
+    };
+}
+
+fn nativeProviderFromHarness(provider: harness.Provider) provider_models.Provider {
+    return switch (provider) {
+        .codex => .codex,
+        .claude => .claude,
+        .cursor => .cursor,
+        .opencode => .opencode,
+        .pi => .pi,
+        .fx => .fx,
+        .grok => .grok,
+    };
+}
+
+fn providerRemediation(
+    installed: bool,
+    login_command: []const []const u8,
+) headless.providers_protocol.Remediation {
+    return if (!installed)
+        .{
+            .kind = "install",
+            .label = "Install this provider CLI on the runtime",
+        }
+    else
+        .{
+            .kind = "login",
+            .label = "Authenticate in a terminal on this runtime",
+            .command = login_command,
+        };
+}
+
+fn nativeProviderStatus(provider: provider_models.Provider) headless.providers_protocol.ProviderStatus {
+    const installed = nativeProviderInstalled(provider);
+    return .{
+        .provider = @tagName(provider),
+        .label = nativeProviderLabel(provider),
+        .surfaces = PROVIDER_SURFACES_ALL,
+        .installed = installed,
+        .state = if (installed) "unknown" else "missing",
+        // Provider auth protocols are intentionally heterogeneous. Until each
+        // adapter has a cancellable deadline, the daemon must not occupy a
+        // transport worker with a potentially unbounded login handshake.
+        .authentication = "unknown",
+        .remediation = providerRemediation(installed, nativeProviderLoginCommand(provider)),
+    };
+}
+
+fn ampProviderStatus() headless.providers_protocol.ProviderStatus {
+    const installed = process_env.commandExists("amp");
+    return .{
+        .provider = "amp",
+        .label = "Amp",
+        .surfaces = .{ .terminal_tui = true, .mcp = true, .lifecycle = true },
+        .installed = installed,
+        .state = if (installed) "unknown" else "missing",
+        .authentication = "unknown",
+        .remediation = if (installed)
+            .{
+                .kind = "login",
+                .label = "Authenticate in a terminal on this runtime",
+                .command = &.{ "amp", "login" },
+            }
+        else
+            .{
+                .kind = "install",
+                .label = "Install the Amp CLI on the runtime",
+            },
+    };
 }
 
 const SlowProcessOperation = enum {
@@ -2126,12 +2323,101 @@ const SlowProcessPhaseResult = struct {
     }
 };
 
+/// Chat attachment staging (chat.attachments.v1). Remote desktops stream
+/// image bytes here through chunked authenticated RPCs, then a
+/// repository-routed chat.turn.start claims the staged files by opaque ID —
+/// desktop-local filesystem paths never cross the runtime boundary.
+const CHAT_ATTACHMENT_DIR_NAME = "chat-attachments";
+/// Bound total staged records so a misbehaving client cannot exhaust disk
+/// between TTL sweeps (records include consumed files awaiting expiry).
+const MAX_STAGED_CHAT_ATTACHMENTS_TOTAL: usize = 64;
+/// Bound concurrently uploading/unclaimed records more tightly. Shared with
+/// the desktop composer gate and the claim path: one turn can reference at
+/// most this many staged attachments, so a client can never stage a set that
+/// deterministically fails at claim time.
+const MAX_STAGED_CHAT_ATTACHMENTS_PENDING: usize = headless.attachment_protocol.MAX_ATTACHMENTS_PER_TURN;
+/// Aggregate declared-byte budget for pending (unclaimed) staged uploads.
+/// Bounds disk amplification beyond the per-record and count caps.
+const MAX_STAGED_CHAT_ATTACHMENT_PENDING_BYTES: usize = 256 * 1024 * 1024;
+/// Aggregate declared-byte budget across every staged record, including
+/// consumed files awaiting their retention TTL.
+const MAX_STAGED_CHAT_ATTACHMENT_TOTAL_BYTES: usize = 512 * 1024 * 1024;
+/// Uploads that never commit or are never claimed are swept after this window.
+const STAGED_ATTACHMENT_PENDING_TTL_MS: i64 = 15 * std.time.ms_per_min;
+/// Claimed files linger long enough for the provider worker to read them.
+const STAGED_ATTACHMENT_CONSUMED_TTL_MS: i64 = 60 * std.time.ms_per_min;
+/// Every supported image format is identifiable from its first 16 bytes; the
+/// first append chunk must carry at least this much so magic-byte validation
+/// runs before any payload reaches disk.
+const STAGED_ATTACHMENT_MIN_BYTES: usize = 16;
+/// Cadence of the drain-loop staged-attachment sweep. Coarse on purpose: the
+/// TTLs are 15/60 minutes, so a minute of slack is invisible while keeping
+/// the 20ms drain tick free of per-tick sweep work.
+const CHAT_ATTACHMENT_SWEEP_INTERVAL_MS: i64 = 60 * std.time.ms_per_s;
+
+const StagedChatAttachment = struct {
+    /// Opaque daemon-generated 32-hex identity; the only client handle.
+    id: []u8,
+    /// Canonical MIME from the shared allowlist (static slice; never freed).
+    mime: []const u8,
+    declared_bytes: usize,
+    received_bytes: usize = 0,
+    state: enum { staging, committed, consumed } = .staging,
+    /// One in-flight append/commit at a time. Guarded by lockDaemon; file
+    /// I/O runs outside the lock while the flag is held.
+    busy: bool = false,
+    updated_at_ms: i64,
+    /// Daemon-constructed absolute path in the private staging directory.
+    /// Never derived from client input beyond the validated hex id.
+    path: []u8,
+    /// Sequential write handle, open for the staging phase only.
+    file: ?std.Io.File = null,
+
+    fn destroy(self: *StagedChatAttachment, allocator: std.mem.Allocator) void {
+        var threaded = std.Io.Threaded.init_single_threaded;
+        const io = threaded.io();
+        if (self.file) |file| file.close(io);
+        std.Io.Dir.deleteFileAbsolute(io, self.path) catch {};
+        allocator.free(self.id);
+        allocator.free(self.path);
+        allocator.destroy(self);
+    }
+};
+
+const ClaimedAttachmentsError = error{ InvalidParams, ResourceNotFound, InvalidState, OutOfMemory };
+
+/// Runtime-local attachment references a repository-routed turn resolved from
+/// staged IDs. Both slices are daemon-owned copies of daemon-constructed paths.
+const ClaimedAttachments = struct {
+    image_paths: []const []const u8 = &.{},
+    images: []store_protocol.Attachment = &.{},
+    /// Consumed staged-record ids, retained so a turn-start failure after the
+    /// claim can restore the records for a client retry.
+    ids: []const []const u8 = &.{},
+
+    fn deinit(self: *ClaimedAttachments, allocator: std.mem.Allocator) void {
+        freeStringArray(allocator, self.image_paths);
+        freeAttachmentArray(allocator, self.images);
+        freeStringArray(allocator, self.ids);
+    }
+};
+
 pub const Daemon = struct {
     allocator: std.mem.Allocator,
     pref_path: []u8,
+    /// Stable across daemon restarts while the runtime data directory exists.
+    runtime_id: []u8,
+    /// Stable generation identity recreated with the runtime data directory.
+    instance_id: []u8,
     registry: process_registry.ProcessRegistry,
     sessions: std.ArrayList(*PtySession) = .empty,
     chat_turns: std.ArrayList(*ChatTurn) = .empty,
+    /// Staged chat attachments awaiting a claiming turn. Guarded by lockDaemon;
+    /// per-record `busy` flags keep file I/O outside the lock.
+    chat_attachments: std.ArrayList(*StagedChatAttachment) = .empty,
+    /// Next drain-loop sweep of expired staged attachments (monotonic-ish
+    /// wall ms, see CHAT_ATTACHMENT_SWEEP_INTERVAL_MS). Guarded by lockDaemon.
+    chat_attachment_sweep_due_ms: i64 = 0,
     mutex: ParkingMutex = .{},
     /// Serializes verde.json snapshots and web-originated favorite updates.
     /// It is independent of lockDaemon so filesystem I/O never delays chat.
@@ -2199,6 +2485,11 @@ pub const Daemon = struct {
         return .{
             .allocator = allocator,
             .pref_path = owned_pref_path,
+            // These placeholders exist only for direct unit construction.
+            // Production readiness replaces them with the secure durable pair
+            // before any client can observe the daemon handshake.
+            .runtime_id = randomEphemeralHexId(allocator),
+            .instance_id = randomEphemeralHexId(allocator),
             .registry = process_registry.ProcessRegistry.init(allocator, instance_nonce) catch @panic("failed to initialize daemon process registry"),
             .idle_exit_ms = idleExitMsFromEnv(allocator),
             .registry_jobs = process_registry.RegistryJobQueue.init(process_registry.REGISTRY_JOB_QUEUE_MAX) catch @panic("failed to initialize registry job queue"),
@@ -2210,10 +2501,14 @@ pub const Daemon = struct {
 
     pub fn deinit(self: *Daemon) void {
         if (self.pref_path.len != 0) self.allocator.free(self.pref_path);
+        self.allocator.free(self.runtime_id);
+        self.allocator.free(self.instance_id);
         for (self.sessions.items) |session| session.deinit(self.allocator);
         self.sessions.deinit(self.allocator);
         for (self.chat_turns.items) |turn| turn.deinit(self.allocator);
         self.chat_turns.deinit(self.allocator);
+        for (self.chat_attachments.items) |record| record.destroy(self.allocator);
+        self.chat_attachments.deinit(self.allocator);
         self.registry_jobs.deinit(self.allocator);
         self.registry.deinit(self.allocator);
         self.journal.deinit(self.allocator);
@@ -2519,13 +2814,28 @@ pub const Daemon = struct {
     }
 
     fn handleRequest(self: *Daemon, request_json: []const u8) ![]u8 {
-        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, request_json, .{});
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, request_json, .{}) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            // Duplicate fields are ambiguous before typed params decoding and
+            // must never collapse into a last-value-wins security request.
+            return try errorResponseAlloc(
+                self.allocator,
+                .null,
+                headless.protocol.ERR_INVALID_REQUEST,
+                "malformed or duplicate request fields",
+            );
+        };
         defer parsed.deinit();
         if (parsed.value != .object) return try errorResponseAlloc(self.allocator, .null, "invalid_request", "request must be an object");
         const id_value = parsed.value.object.get("id") orelse .null;
         const method = jsonString(parsed.value.object.get("method") orelse .null) orelse
             return try errorResponseAlloc(self.allocator, id_value, "invalid_request", "missing method");
         const params = parsed.value.object.get("params") orelse .null;
+        defer eraseAccessSecretParams(method, params);
+        defer eraseConnectSecretParams(method, params);
+        if (try self.requestTargetRejection(id_value, parsed.value.object.get("target"))) |response| {
+            return response;
+        }
 
         const response = self.handleMethodRequest(id_value, method, params) catch |err| switch (err) {
             error.SessionNotFound => try errorResponseAlloc(self.allocator, id_value, "resource_not_found", "session not found"),
@@ -2539,15 +2849,53 @@ pub const Daemon = struct {
         return response;
     }
 
+    /// Validate an explicitly targeted request before any method-specific
+    /// params or state are touched. A missing target remains the legacy local
+    /// Unix-socket contract; remote transports enforce target presence.
+    fn requestTargetRejection(
+        self: *Daemon,
+        id_value: std.json.Value,
+        target_value: ?std.json.Value,
+    ) !?[]u8 {
+        const value = target_value orelse return null;
+        const target = headless.parseRequestTarget(value) catch {
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_RUNTIME_IDENTITY_MISSING,
+                "request target is missing or malformed",
+            );
+        };
+        if (!std.mem.eql(u8, target.runtime_id, self.runtime_id) or
+            !std.mem.eql(u8, target.instance_id, self.instance_id))
+        {
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_RUNTIME_IDENTITY_MISMATCH,
+                "request target does not match this daemon",
+            );
+        }
+        return null;
+    }
+
     fn handleMethodRequest(self: *Daemon, id_value: std.json.Value, method: []const u8, params: std.json.Value) ![]u8 {
         // Store methods own their drain/capability precedence and unlock
         // lockDaemon for SQLite work; route before the generic mutator drain gate.
         if (isStoreMethod(method)) return try self.handleStoreRequest(id_value, method, params);
+        if (isAccessMethod(method)) return try self.handleAccessRequest(id_value, method, params);
+        if (isConnectMethod(method)) return try self.handleConnectRequest(id_value, method, params);
         // chat.turn.start owns its drain check under lockDaemon (unlocked serve
         // path); other mutators still gate here under the `.normal` outer lock.
+        // The chat.attachment.* trio also serves unlocked, so this generic
+        // unlocked read is not safe for them either — each handler confirms
+        // accepting_mutations and pins in_flight under lockDaemon itself.
         if (!std.mem.eql(u8, method, "chat.turn.start") and
             !std.mem.eql(u8, method, "chat.turn.steer") and
             !std.mem.eql(u8, method, "chat.followup") and
+            !std.mem.eql(u8, method, headless.attachment_protocol.METHOD_CHAT_ATTACHMENT_CREATE) and
+            !std.mem.eql(u8, method, headless.attachment_protocol.METHOD_CHAT_ATTACHMENT_APPEND) and
+            !std.mem.eql(u8, method, headless.attachment_protocol.METHOD_CHAT_ATTACHMENT_COMMIT) and
             !self.accepting_mutations and methodMutatesState(method))
         {
             return try errorResponseAlloc(
@@ -2577,7 +2925,11 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, "chat.followup")) return try self.chatFollowupResponse(id_value, params);
         if (std.mem.eql(u8, method, "chat.turn.cancel")) return try self.chatTurnCancelResponse(id_value, params);
         if (std.mem.eql(u8, method, "chat.turn.consume")) return try self.chatTurnConsumeResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.attachment_protocol.METHOD_CHAT_ATTACHMENT_CREATE)) return try self.chatAttachmentCreateResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.attachment_protocol.METHOD_CHAT_ATTACHMENT_APPEND)) return try self.chatAttachmentAppendResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.attachment_protocol.METHOD_CHAT_ATTACHMENT_COMMIT)) return try self.chatAttachmentCommitResponse(id_value, params);
         if (std.mem.eql(u8, method, "provider.models.list")) return try self.providerModelsListResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDERS_STATUS)) return try self.providerStatusResponse(id_value, params);
         if (isFxLifecycleMethod(method)) return try self.fxLifecycleResponse(id_value, method, params);
         if (std.mem.eql(u8, method, store_protocol.METHOD_CONFIG_FAVORITE_MODEL_SET)) return try self.configFavoriteModelSetResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_WORKSPACE_RESOLVE)) return try self.workspaceResolveResponse(id_value, params);
@@ -2595,10 +2947,574 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, headless.registry.METHOD_DAEMON_CLIENT_CLOSE)) return try self.clientCloseResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_DAEMON_STOP)) return try self.daemonStopResponse(id_value, params);
         if (std.mem.eql(u8, method, "status")) return try self.statusResponse(id_value);
-        if (std.mem.eql(u8, method, "daemon.prepareShutdown")) return try self.prepareShutdownResponse(id_value);
+        if (std.mem.eql(u8, method, "daemon.prepareShutdown")) return try self.prepareShutdownResponse(id_value, params);
         // Additive headless core methods; existing methods and error codes unchanged.
         if (std.mem.startsWith(u8, method, "core.")) return try self.coreResponse(id_value, method, params);
         return try errorResponseAlloc(self.allocator, id_value, "method_not_found", method);
+    }
+
+    /// Connect lifecycle stays behind the private session-daemon endpoint.
+    /// This owns its short bookkeeping/SQLite windows and never holds either
+    /// daemon lock while performing filesystem or control-plane I/O.
+    fn handleConnectRequest(
+        self: *Daemon,
+        id_value: std.json.Value,
+        method: []const u8,
+        params: std.json.Value,
+    ) ![]u8 {
+        var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const request = decodeConnectRequest(arena, method, params) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_PARAMS,
+                "invalid Connect request",
+            );
+        };
+        if (request.protocolVersion() != connect_protocol.CONNECT_PROTOCOL_VERSION) {
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_PROTOCOL_INCOMPATIBLE,
+                "Connect protocol version is incompatible",
+            );
+        }
+
+        var daemon_locked = true;
+        lockDaemon(self);
+        defer if (daemon_locked) self.mutex.unlock();
+        if (request.isMutating() and !self.accepting_mutations) {
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_STATE,
+                "daemon is preparing shutdown and is not accepting mutations",
+            );
+        }
+        const service = self.store_service orelse
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_CAPABILITY_UNAVAILABLE,
+                "store capability is unavailable",
+            );
+        if (service.draining) {
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_STATE,
+                "daemon store is draining",
+            );
+        }
+        if (request.isMutating()) _ = service.in_flight.fetchAdd(1, .monotonic);
+        self.mutex.unlock();
+        daemon_locked = false;
+        defer if (request.isMutating()) {
+            _ = service.in_flight.fetchSub(1, .monotonic);
+        };
+
+        var threaded = std.Io.Threaded.init_single_threaded;
+        const io = threaded.io();
+        return switch (request) {
+            .status => try self.connectStatusResponse(id_value, service, arena),
+            .login => |login_request| response: {
+                connect_protocol.validateControlPlaneUrl(login_request.control_plane_url) catch |err|
+                    return try connectErrorResponse(self.allocator, id_value, err);
+                connect_protocol.validateCredentialFile(login_request.credential_file) catch |err|
+                    return try connectErrorResponse(self.allocator, id_value, err);
+                var token = connect_auth.importCredential(
+                    arena,
+                    io,
+                    self.pref_path,
+                    login_request.credential_file,
+                ) catch |err| return try connectErrorResponse(self.allocator, id_value, err);
+                defer token.deinit(arena);
+                var request_id = connect_lifecycle.randomRequestId(io) catch |err|
+                    return try connectErrorResponse(self.allocator, id_value, err);
+                var http_transport: connect_client.HttpTransport = .{};
+                var login = connect_lifecycle.validateLogin(
+                    arena,
+                    http_transport.transport(),
+                    login_request.control_plane_url,
+                    token.bytes,
+                    &request_id,
+                ) catch |err| {
+                    connect_auth.remove(arena, io, self.pref_path) catch {};
+                    return try connectErrorResponse(self.allocator, id_value, err);
+                };
+                defer login.deinit(arena);
+                lockStoreService(service);
+                connect_store.recordLogin(
+                    service.store.conn,
+                    login_request.control_plane_url,
+                    login.issuer,
+                    login.signer_jwks_json,
+                    login.maximum_grant_lifetime_seconds,
+                    nowMs(),
+                ) catch |err| {
+                    service.mutex.unlock();
+                    connect_auth.remove(arena, io, self.pref_path) catch {};
+                    return try connectErrorResponse(self.allocator, id_value, err);
+                };
+                service.mutex.unlock();
+                break :response try self.connectStatusResponse(id_value, service, arena);
+            },
+            .link => |link_request| response: {
+                if (!std.mem.eql(u8, link_request.provider, "external") or
+                    link_request.external_descriptor == null)
+                {
+                    return try connectErrorResponse(self.allocator, id_value, error.UnsupportedEndpointProvider);
+                }
+                const descriptor = link_request.external_descriptor.?;
+                connect_protocol.validateRuntimeDescriptor(descriptor, self.runtime_id, self.instance_id) catch {
+                    return try connectErrorResponse(self.allocator, id_value, error.ConnectIdentityMismatch);
+                };
+                lockStoreService(service);
+                var state = connect_store.load(arena, service.store.conn) catch |err| {
+                    service.mutex.unlock();
+                    return try connectErrorResponse(self.allocator, id_value, err);
+                };
+                service.mutex.unlock();
+                defer state.deinit(arena);
+                if (state.link_id != null) {
+                    if (state.desired_state == .linked) {
+                        break :response try okValueResponse(self.allocator, id_value, state.status());
+                    }
+                    return try connectErrorResponse(self.allocator, id_value, error.ConnectAlreadyLinked);
+                }
+                const control_plane_url = state.control_plane_url orelse
+                    return try connectErrorResponse(self.allocator, id_value, error.ConnectLoginRequired);
+                const stable_request_id = if (state.desired_state == .linked and state.request_id != null)
+                    state.request_id.?
+                else request_id: {
+                    var generated = connect_lifecycle.randomRequestId(io) catch |err|
+                        return try connectErrorResponse(self.allocator, id_value, err);
+                    break :request_id try arena.dupe(u8, &generated);
+                };
+                lockStoreService(service);
+                connect_store.beginLink(service.store.conn, stable_request_id, link_request.provider, nowMs()) catch |err| {
+                    service.mutex.unlock();
+                    return try connectErrorResponse(self.allocator, id_value, err);
+                };
+                service.mutex.unlock();
+                var token = connect_auth.load(arena, io, self.pref_path) catch |err|
+                    return try self.recordConnectRetry(id_value, service, state.retry_attempt, err);
+                defer token.deinit(arena);
+                var keys = connect_keys.loadOrCreate(
+                    arena,
+                    io,
+                    self.pref_path,
+                    self.runtime_id,
+                    self.instance_id,
+                ) catch |err| return try self.recordConnectRetry(id_value, service, state.retry_attempt, err);
+                defer keys.clear();
+                var http_transport: connect_client.HttpTransport = .{};
+                var linked = connect_lifecycle.link(arena, http_transport.transport(), &keys, null, .{
+                    .control_plane_url = control_plane_url,
+                    .bearer_token = token.bytes,
+                    .runtime_id = self.runtime_id,
+                    .instance_id = self.instance_id,
+                    .request_id = stable_request_id,
+                    .provider = link_request.provider,
+                    .external_descriptor = descriptor,
+                    .now_seconds = @divFloor(nowMs(), std.time.ms_per_s),
+                }) catch |err| return try self.recordConnectRetry(id_value, service, state.retry_attempt, err);
+                defer linked.deinit(arena);
+                lockStoreService(service);
+                connect_store.recordLinked(service.store.conn, .{
+                    .link_id = linked.link_id,
+                    .enrollment_id = linked.enrollment_id,
+                    .endpoint_https_url = linked.endpoint_https_url,
+                    .endpoint_wss_url = linked.endpoint_wss_url,
+                    .connector_provider = linked.connector_provider,
+                }, linked.connector_running, nowMs()) catch |err| {
+                    service.mutex.unlock();
+                    return try connectErrorResponse(self.allocator, id_value, err);
+                };
+                service.mutex.unlock();
+                break :response try self.connectStatusResponse(id_value, service, arena);
+            },
+            .unlink => response: {
+                self.performConnectUnlink(service, arena, io) catch |err|
+                    return try connectErrorResponse(self.allocator, id_value, err);
+                break :response try self.connectStatusResponse(id_value, service, arena);
+            },
+            .logout => response: {
+                self.performConnectUnlink(service, arena, io) catch |err|
+                    return try connectErrorResponse(self.allocator, id_value, err);
+                connect_auth.remove(arena, io, self.pref_path) catch |err|
+                    return try connectErrorResponse(self.allocator, id_value, err);
+                lockStoreService(service);
+                connect_store.recordLogout(service.store.conn, nowMs()) catch |err| {
+                    service.mutex.unlock();
+                    return try connectErrorResponse(self.allocator, id_value, err);
+                };
+                service.mutex.unlock();
+                break :response try self.connectStatusResponse(id_value, service, arena);
+            },
+            .bootstrap_consume => |consume_request| response: {
+                defer std.crypto.secureZero(u8, @constCast(consume_request.grant_jwt.bytes));
+                lockStoreService(service);
+                var state = connect_store.load(arena, service.store.conn) catch |err| {
+                    service.mutex.unlock();
+                    return try connectErrorResponse(self.allocator, id_value, err);
+                };
+                service.mutex.unlock();
+                defer state.deinit(arena);
+                if (state.desired_state != .linked or state.lifecycle_state != .linked) {
+                    return try connectErrorResponse(self.allocator, id_value, error.ConnectLinkRequired);
+                }
+                const issuer = state.issuer orelse
+                    return try connectErrorResponse(self.allocator, id_value, error.ConnectLoginRequired);
+                const audience = state.endpoint_https_url orelse
+                    return try connectErrorResponse(self.allocator, id_value, error.ConnectLinkRequired);
+                const jwks_json = state.signer_jwks_json orelse
+                    return try connectErrorResponse(self.allocator, id_value, error.ConnectSignerUnavailable);
+                if (!std.mem.eql(u8, consume_request.expected_issuer, issuer) or
+                    !std.mem.eql(u8, consume_request.expected_audience, audience))
+                {
+                    return try connectErrorResponse(self.allocator, id_value, error.BootstrapIdentityMismatch);
+                }
+                var jwks = std.json.parseFromSlice(connect_client.Jwks, arena, jwks_json, .{
+                    .allocate = .alloc_always,
+                }) catch return try connectErrorResponse(self.allocator, id_value, error.ConnectSignerUnavailable);
+                defer jwks.deinit();
+                lockStoreService(service);
+                var issued = connect_grants.consume(arena, io, service.store.conn, .{
+                    .compact_jwt = consume_request.grant_jwt.reveal(),
+                    .jwks = jwks.value.keys,
+                    .expected_issuer = issuer,
+                    .expected_audience = audience,
+                    .runtime_id = self.runtime_id,
+                    .instance_id = self.instance_id,
+                    .device_id = consume_request.device_id,
+                    .device_key_thumbprint = consume_request.device_key_thumbprint,
+                    .client_nonce = consume_request.client_nonce,
+                    .now_ms = nowMs(),
+                    .maximum_lifetime_seconds = state.maximum_grant_lifetime_seconds,
+                }, consume_request.device_label) catch |err| {
+                    service.mutex.unlock();
+                    return try connectErrorResponse(self.allocator, id_value, err);
+                };
+                service.mutex.unlock();
+                defer issued.clear();
+                const scope_names = access_protocol.scopeNamesAlloc(arena, issued.scope_mask) catch |err|
+                    return try accessAdminErrorResponse(self.allocator, id_value, err);
+                break :response try connectBootstrapResponse(
+                    self.allocator,
+                    id_value,
+                    self.runtime_id,
+                    self.instance_id,
+                    &issued,
+                    scope_names,
+                );
+            },
+        };
+    }
+
+    fn connectStatusResponse(
+        self: *Daemon,
+        id_value: std.json.Value,
+        service: *StoreService,
+        allocator: std.mem.Allocator,
+    ) ![]u8 {
+        lockStoreService(service);
+        var state = connect_store.load(allocator, service.store.conn) catch |err| {
+            service.mutex.unlock();
+            return try connectErrorResponse(self.allocator, id_value, err);
+        };
+        service.mutex.unlock();
+        defer state.deinit(allocator);
+        return try okValueResponse(self.allocator, id_value, state.status());
+    }
+
+    fn recordConnectRetry(
+        self: *Daemon,
+        id_value: std.json.Value,
+        service: *StoreService,
+        previous_attempt: u16,
+        err: anyerror,
+    ) ![]u8 {
+        const attempt = previous_attempt +| 1;
+        const delay_ms = connectRetryDelayMs(self.runtime_id, attempt);
+        lockStoreService(service);
+        connect_store.recordRetry(
+            service.store.conn,
+            @errorName(err),
+            attempt,
+            nowMs() + delay_ms,
+            nowMs(),
+        ) catch {};
+        service.mutex.unlock();
+        return try connectErrorResponse(self.allocator, id_value, err);
+    }
+
+    fn performConnectUnlink(
+        self: *Daemon,
+        service: *StoreService,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+    ) !void {
+        lockStoreService(service);
+        var state = connect_store.load(allocator, service.store.conn) catch |err| {
+            service.mutex.unlock();
+            return err;
+        };
+        service.mutex.unlock();
+        defer state.deinit(allocator);
+        lockStoreService(service);
+        connect_store.beginUnlink(service.store.conn, nowMs()) catch |err| {
+            service.mutex.unlock();
+            return err;
+        };
+        service.mutex.unlock();
+        if (state.link_id) |link_id| {
+            const control_plane_url = state.control_plane_url orelse return error.ConnectStateCorrupt;
+            var token = try connect_auth.load(allocator, io, self.pref_path);
+            defer token.deinit(allocator);
+            var request_id = try connect_lifecycle.randomRequestId(io);
+            var http_transport: connect_client.HttpTransport = .{};
+            try connect_lifecycle.unlink(
+                allocator,
+                http_transport.transport(),
+                control_plane_url,
+                token.bytes,
+                link_id,
+                self.runtime_id,
+                self.instance_id,
+                &request_id,
+            );
+        }
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        try connect_store.recordUnlinked(service.store.conn, nowMs());
+    }
+
+    /// Access storage stays behind the private session-daemon endpoint. Local
+    /// administrators and the loopback gateway use distinct methods; none can
+    /// be forwarded by the gateway's generic RPC surfaces.
+    fn handleAccessRequest(
+        self: *Daemon,
+        id_value: std.json.Value,
+        method: []const u8,
+        params: std.json.Value,
+    ) ![]u8 {
+        var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const request = decodeAccessRequest(arena, method, params) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_PARAMS,
+                "invalid access administration params",
+            );
+        };
+        defer request.clearSecrets();
+        if (request.protocolVersion() != access_protocol.ACCESS_PROTOCOL_VERSION) {
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_PROTOCOL_INCOMPATIBLE,
+                "access protocol version is incompatible",
+            );
+        }
+
+        var daemon_locked = true;
+        lockDaemon(self);
+        defer if (daemon_locked) self.mutex.unlock();
+        if (!self.accepting_mutations) {
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_STATE,
+                "daemon is preparing shutdown and is not accepting mutations",
+            );
+        }
+        const service = self.store_service orelse
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_CAPABILITY_UNAVAILABLE,
+                "store capability is unavailable",
+            );
+        if (service.draining) {
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_STATE,
+                "daemon store is draining",
+            );
+        }
+        _ = service.in_flight.fetchAdd(1, .monotonic);
+        self.mutex.unlock();
+        daemon_locked = false;
+        defer _ = service.in_flight.fetchSub(1, .monotonic);
+
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        const now_ms = nowMs();
+        return switch (request) {
+            .pairing_create => |create_request| response: {
+                var threaded = std.Io.Threaded.init_single_threaded;
+                var issued = access_store.createPairingGrant(
+                    threaded.io(),
+                    service.store.conn,
+                    create_request,
+                    now_ms,
+                ) catch |err| return try accessAdminErrorResponse(self.allocator, id_value, err);
+                defer issued.clear();
+                const scope_names = access_protocol.scopeNamesAlloc(arena, issued.scope_mask) catch |err|
+                    return try accessAdminErrorResponse(self.allocator, id_value, err);
+                break :response try pairingGrantCreateResponse(
+                    self.allocator,
+                    id_value,
+                    self.runtime_id,
+                    self.instance_id,
+                    &issued,
+                    scope_names,
+                );
+            },
+            .pairing_list => response: {
+                var grants = access_store.listPairingGrants(
+                    self.allocator,
+                    service.store.conn,
+                    now_ms,
+                ) catch |err| return try accessAdminErrorResponse(self.allocator, id_value, err);
+                defer grants.deinit(self.allocator);
+                const records = try arena.alloc(access_protocol.PairingGrantRecord, grants.items.len);
+                for (grants.items, records) |grant, *record| {
+                    record.* = .{
+                        .grant_id = grant.grant_id,
+                        .label = grant.label,
+                        .scopes = access_protocol.scopeNamesAlloc(arena, grant.scope_mask) catch |err|
+                            return try accessAdminErrorResponse(self.allocator, id_value, err),
+                        .created_at_ms = grant.created_at_ms,
+                        .expires_at_ms = grant.expires_at_ms,
+                        .consumed_at_ms = grant.consumed_at_ms,
+                        .revoked_at_ms = grant.revoked_at_ms,
+                    };
+                }
+                const result: access_protocol.PairingGrantListResult = .{
+                    .access_protocol_version = access_protocol.ACCESS_PROTOCOL_VERSION,
+                    .runtime_id = self.runtime_id,
+                    .instance_id = self.instance_id,
+                    .grants = records,
+                };
+                break :response try okValueResponse(self.allocator, id_value, result);
+            },
+            .pairing_revoke => |revoke_request| response: {
+                const revoked = access_store.revokePairingGrant(
+                    service.store.conn,
+                    revoke_request.grant_id,
+                    now_ms,
+                ) catch |err| return try accessAdminErrorResponse(self.allocator, id_value, err);
+                const result: access_protocol.PairingGrantRevokeResult = .{
+                    .access_protocol_version = access_protocol.ACCESS_PROTOCOL_VERSION,
+                    .revoked = revoked,
+                    .grant_id = revoke_request.grant_id,
+                };
+                break :response try okValueResponse(self.allocator, id_value, result);
+            },
+            .device_list => response: {
+                var devices = access_store.listDevices(
+                    self.allocator,
+                    service.store.conn,
+                    now_ms,
+                ) catch |err| return try accessAdminErrorResponse(self.allocator, id_value, err);
+                defer devices.deinit(self.allocator);
+                const records = try arena.alloc(access_protocol.DeviceRecord, devices.items.len);
+                for (devices.items, records) |device, *record| {
+                    record.* = .{
+                        .device_id = device.device_id,
+                        .grant_id = device.grant_id,
+                        .source = device.source,
+                        .source_id = device.source_id,
+                        .label = device.label,
+                        .scopes = access_protocol.scopeNamesAlloc(arena, device.scope_mask) catch |err|
+                            return try accessAdminErrorResponse(self.allocator, id_value, err),
+                        .created_at_ms = device.created_at_ms,
+                        .last_used_at_ms = device.last_used_at_ms,
+                        .revoked_at_ms = device.revoked_at_ms,
+                    };
+                }
+                const result: access_protocol.DeviceListResult = .{
+                    .access_protocol_version = access_protocol.ACCESS_PROTOCOL_VERSION,
+                    .runtime_id = self.runtime_id,
+                    .instance_id = self.instance_id,
+                    .devices = records,
+                };
+                break :response try okValueResponse(self.allocator, id_value, result);
+            },
+            .device_revoke => |revoke_request| response: {
+                const revoked = access_store.revokeDevice(
+                    service.store.conn,
+                    revoke_request.device_id,
+                    now_ms,
+                ) catch |err| return try accessAdminErrorResponse(self.allocator, id_value, err);
+                const result: access_protocol.DeviceRevokeResult = .{
+                    .access_protocol_version = access_protocol.ACCESS_PROTOCOL_VERSION,
+                    .revoked = revoked,
+                    .device_id = revoke_request.device_id,
+                };
+                break :response try okValueResponse(self.allocator, id_value, result);
+            },
+            .pairing_exchange => |exchange_request| response: {
+                var threaded = std.Io.Threaded.init_single_threaded;
+                var issued = access_store.exchangePairingGrant(
+                    threaded.io(),
+                    service.store.conn,
+                    exchange_request,
+                    now_ms,
+                ) catch |err| return try accessAdminErrorResponse(self.allocator, id_value, err);
+                defer issued.clear();
+                const scope_names = access_protocol.scopeNamesAlloc(arena, issued.scope_mask) catch |err|
+                    return try accessAdminErrorResponse(self.allocator, id_value, err);
+                break :response try pairingGrantExchangeResponse(
+                    self.allocator,
+                    id_value,
+                    self.runtime_id,
+                    self.instance_id,
+                    &issued,
+                    scope_names,
+                );
+            },
+            .device_authenticate => |authenticate_request| response: {
+                const scope_mask = access_store.authenticateDevice(
+                    service.store.conn,
+                    authenticate_request.device_id,
+                    authenticate_request.device_credential.reveal(),
+                    authenticate_request.requested_scopes,
+                    now_ms,
+                ) catch |err| return try accessAdminErrorResponse(self.allocator, id_value, err);
+                const result: access_protocol.DeviceAuthorizationResult = .{
+                    .access_protocol_version = access_protocol.ACCESS_PROTOCOL_VERSION,
+                    .device_id = authenticate_request.device_id,
+                    .scopes = access_protocol.scopeNamesAlloc(arena, scope_mask) catch |err|
+                        return try accessAdminErrorResponse(self.allocator, id_value, err),
+                };
+                break :response try okValueResponse(self.allocator, id_value, result);
+            },
+            .device_authorize => |authorize_request| response: {
+                const scope_mask = access_store.authorizeDevice(
+                    service.store.conn,
+                    authorize_request.device_id,
+                    authorize_request.required_scopes,
+                ) catch |err| return try accessAdminErrorResponse(self.allocator, id_value, err);
+                const result: access_protocol.DeviceAuthorizationResult = .{
+                    .access_protocol_version = access_protocol.ACCESS_PROTOCOL_VERSION,
+                    .device_id = authorize_request.device_id,
+                    .scopes = access_protocol.scopeNamesAlloc(arena, scope_mask) catch |err|
+                        return try accessAdminErrorResponse(self.allocator, id_value, err),
+                };
+                break :response try okValueResponse(self.allocator, id_value, result);
+            },
+        };
     }
 
     fn methodMutatesState(method: []const u8) bool {
@@ -2817,10 +3733,18 @@ pub const Daemon = struct {
         const arena = arena_state.allocator();
 
         const is_status = std.mem.eql(u8, method, store_protocol.METHOD_DAEMON_STORE_STATUS);
+        const is_workspace_list = std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_LIST);
+        const is_repository_manifest = std.mem.eql(
+            u8,
+            method,
+            store_protocol.METHOD_WORKSPACE_REPOSITORY_MANIFEST_GET,
+        );
         const is_thread_get = std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_GET);
         const is_thread_list = std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_LIST);
+        const is_message_list = std.mem.eql(u8, method, store_protocol.METHOD_CHAT_MESSAGE_LIST);
         const is_turn_record = std.mem.eql(u8, method, store_protocol.METHOD_CHAT_TURN_RECORD);
-        const is_chat_read = is_thread_get or is_thread_list or is_turn_record;
+        const is_chat_read = is_workspace_list or is_repository_manifest or is_thread_get or
+            is_thread_list or is_message_list or is_turn_record;
         const is_core_snapshot = std.mem.eql(u8, method, store_protocol.METHOD_CORE_SNAPSHOT);
         const is_core_changes = std.mem.eql(u8, method, changes_protocol.METHOD_CORE_CHANGES);
         // Reads never join the mutator drain gate or in_flight write counter.
@@ -2832,8 +3756,11 @@ pub const Daemon = struct {
         // OutOfMemory is re-raised (never remapped to invalid_params).
         var decode_failed = false;
         var decoded_mutation: ?daemon_store.Mutation = null;
+        var decoded_workspace_list: ?store_protocol.WorkspaceListRequest = null;
+        var decoded_repository_manifest: ?store_protocol.WorkspaceRepositoryManifestRequest = null;
         var decoded_thread_get: ?store_protocol.ThreadGetRequest = null;
         var decoded_thread_list: ?store_protocol.ThreadListRequest = null;
+        var decoded_message_list: ?store_protocol.MessageListRequest = null;
         var decoded_turn_record: ?store_protocol.TurnRecordRequest = null;
         var decoded_core_snapshot: ?store_protocol.CoreSnapshotRequest = null;
         var decoded_core_changes: ?changes_protocol.ChangesRequest = null;
@@ -2873,6 +3800,34 @@ pub const Daemon = struct {
                 };
                 if (req) |value| decoded_core_changes = value;
             }
+        } else if (is_workspace_list) {
+            if (params == .null) {
+                decoded_workspace_list = .{};
+            } else {
+                const req = std.json.parseFromValueLeaky(
+                    store_protocol.WorkspaceListRequest,
+                    arena,
+                    params,
+                    .{ .ignore_unknown_fields = true },
+                ) catch |err| blk: {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    decode_failed = true;
+                    break :blk null;
+                };
+                if (req) |value| decoded_workspace_list = value;
+            }
+        } else if (is_repository_manifest) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.WorkspaceRepositoryManifestRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_repository_manifest = value;
         } else if (is_thread_get) {
             const req = std.json.parseFromValueLeaky(
                 store_protocol.ThreadGetRequest,
@@ -2897,6 +3852,18 @@ pub const Daemon = struct {
                 break :blk null;
             };
             if (req) |value| decoded_thread_list = value;
+        } else if (is_message_list) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.MessageListRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_message_list = value;
         } else if (is_turn_record) {
             const req = std.json.parseFromValueLeaky(
                 store_protocol.TurnRecordRequest,
@@ -2933,6 +3900,93 @@ pub const Daemon = struct {
                 break :blk null;
             };
             if (req) |value| decoded_mutation = .{ .workspace_upsert = value };
+        } else if (std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_UPSERT)) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.WorkspaceRepositoryUpsertRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_mutation = .{ .workspace_repository_upsert = .{
+                .mutation = value.mutation,
+                .workspace_id = value.workspace_id,
+                .repository = .{
+                    .repository_id = value.repository.repository_id,
+                    .label = value.repository.label,
+                    .vcs_identity = value.repository.vcs_identity,
+                    .default_branch = value.repository.default_branch,
+                },
+            } };
+        } else if (std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_REMOVE)) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.WorkspaceRepositoryRemoveRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_mutation = .{ .workspace_repository_remove = .{
+                .mutation = value.mutation,
+                .workspace_id = value.workspace_id,
+                .repository_id = value.repository_id,
+            } };
+        } else if (std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_DEFAULT_SET)) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.WorkspaceDefaultRepositorySetRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_mutation = .{ .workspace_default_repository_set = .{
+                .mutation = value.mutation,
+                .workspace_id = value.workspace_id,
+                .repository_id = value.repository_id,
+            } };
+        } else if (std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_BINDING_UPSERT)) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.WorkspaceRepositoryBindingUpsertRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_mutation = .{ .workspace_repository_binding_upsert = .{
+                .mutation = value.mutation,
+                .workspace_id = value.workspace_id,
+                .repository_id = value.repository_id,
+                .binding = value.binding,
+            } };
+        } else if (std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_BINDING_REMOVE)) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.WorkspaceRepositoryBindingRemoveRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_mutation = .{ .workspace_repository_binding_remove = .{
+                .mutation = value.mutation,
+                .workspace_id = value.workspace_id,
+                .repository_id = value.repository_id,
+                .runtime_id = value.runtime_id,
+            } };
         } else if (std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_UPSERT)) {
             const req = std.json.parseFromValueLeaky(
                 store_protocol.ThreadUpsertRequest,
@@ -3055,10 +4109,16 @@ pub const Daemon = struct {
             decoded_core_snapshot == null
         else if (is_core_changes)
             decoded_core_changes == null
+        else if (is_workspace_list)
+            decoded_workspace_list == null
+        else if (is_repository_manifest)
+            decoded_repository_manifest == null
         else if (is_thread_get)
             decoded_thread_get == null
         else if (is_thread_list)
             decoded_thread_list == null
+        else if (is_message_list)
+            decoded_message_list == null
         else if (is_turn_record)
             decoded_turn_record == null
         else
@@ -3164,6 +4224,41 @@ pub const Daemon = struct {
             return try okValueResponse(self.allocator, id_value, result);
         }
 
+        if (is_workspace_list) {
+            const req = decoded_workspace_list orelse return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_PARAMS,
+                "invalid params",
+            );
+            const result = loadWorkspaceListResult(self.allocator, &service.store, self.runtime_id, req) catch |err| {
+                return try storeErrorResponse(self.allocator, id_value, err);
+            };
+            defer freeWorkspaceListResult(self.allocator, result);
+            return try okValueResponse(self.allocator, id_value, result);
+        }
+        if (is_repository_manifest) {
+            const req = decoded_repository_manifest orelse return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_PARAMS,
+                "invalid params",
+            );
+            var manifest = service.store.loadWorkspaceRepositoryManifest(req.workspace_id) catch |err| {
+                return try storeErrorResponse(self.allocator, id_value, err);
+            };
+            defer manifest.deinit(self.allocator);
+            const store_revision = service.store.storeRevision() catch |err| {
+                return try storeErrorResponse(self.allocator, id_value, err);
+            };
+            const result: store_protocol.WorkspaceRepositoryManifestResult = .{
+                .workspace_id = manifest.workspace_id,
+                .default_repository_id = manifest.default_repository_id,
+                .repositories = manifest.repositories,
+                .store_revision = store_revision,
+            };
+            return try okValueResponse(self.allocator, id_value, result);
+        }
         if (is_thread_get) {
             const req = decoded_thread_get orelse return try errorResponseAlloc(
                 self.allocator,
@@ -3188,6 +4283,19 @@ pub const Daemon = struct {
                 return try storeErrorResponse(self.allocator, id_value, err);
             };
             defer freeThreadListResult(self.allocator, result);
+            return try okValueResponse(self.allocator, id_value, result);
+        }
+        if (is_message_list) {
+            const req = decoded_message_list orelse return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_PARAMS,
+                "invalid params",
+            );
+            const result = loadMessageListResult(self.allocator, &service.store, req) catch |err| {
+                return try storeErrorResponse(self.allocator, id_value, err);
+            };
+            defer freeMessageListResult(self.allocator, result);
             return try okValueResponse(self.allocator, id_value, result);
         }
         if (is_turn_record) {
@@ -3562,7 +4670,35 @@ pub const Daemon = struct {
     /// Gate order: registry safe (leases transfer when the store is active) →
     /// store writes drained → transfer commit + store close in on_closing
     /// (before endpoint release; finishSessionizerServer is the idempotent fallback).
-    fn prepareShutdownResponse(self: *Daemon, id_value: std.json.Value) ![]u8 {
+    fn prepareShutdownResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        // Older typed clients encode an anonymous `.{}` parameter value as
+        // the empty JSON tuple `[]`. Preserve that no-argument wire shape;
+        // only the object form can carry the optional ownership assertion.
+        if (params == .array and params.array.items.len != 0) {
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object");
+        }
+        if (params != .object and params != .array) {
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object");
+        }
+        if (params == .object) {
+            if (params.object.get("expected_pid")) |expected_value| {
+                const expected_pid = jsonUsize(expected_value) orelse
+                    return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "expected_pid must be an integer");
+                const actual_pid = platform_runtime.processId();
+                if (expected_pid != actual_pid) {
+                    // Ownership assertions keep administrative clients from
+                    // draining a replacement endpoint after a reconnect/TOCTOU.
+                    return try okValueResponse(self.allocator, id_value, .{
+                        .accepted = false,
+                        .safe_to_exit = false,
+                        .owner_mismatch = true,
+                        .pid = actual_pid,
+                        .shutdown_requested = self.shutdown_requested,
+                        .accepting_mutations = self.accepting_mutations,
+                    });
+                }
+            }
+        }
         const now_ms = nowMs();
         // Reap expired registry state before evaluating the handoff gate; a
         // stale lease must not keep an otherwise empty daemon alive.
@@ -3622,25 +4758,39 @@ pub const Daemon = struct {
     }
 
     fn coreResponse(self: *Daemon, id_value: std.json.Value, method: []const u8, params: std.json.Value) ![]u8 {
+        const store_ready = self.store_service != null;
         const ctx: headless.Context = .{
+            .runtime_id = self.runtime_id,
+            .instance_id = self.instance_id,
+            .server_version = build_options.version,
             .pid = platform_runtime.processId(),
             .sessionizer_protocol_version = PROTOCOL_VERSION,
             .session_count = self.sessions.items.len,
             .chat_turn_count = self.chat_turns.items.len,
+            .store_ready = store_ready,
         };
         // Request id for the typed dispatcher is informational; wire id stays id_value.
         const typed = headless.dispatchMethod(0, method, params, ctx);
         // Authority signal: store=true only after the production writer owns the DB.
-        const store_ready = self.store_service != null;
         return switch (typed.body) {
             .status => |result| blk: {
                 var status = result;
                 status.capabilities.store = store_ready;
+                status.capabilities.repository_manifests = store_ready;
+                status.runtime_capabilities = if (store_ready)
+                    &headless.protocol.RUNTIME_CAPABILITY_NAMES
+                else
+                    &headless.protocol.RUNTIME_CAPABILITY_NAMES_BASE;
                 break :blk try okValueResponse(self.allocator, id_value, status);
             },
             .capabilities => |result| blk: {
                 var caps = result;
                 caps.capabilities.store = store_ready;
+                caps.capabilities.repository_manifests = store_ready;
+                caps.runtime_capabilities = if (store_ready)
+                    &headless.protocol.RUNTIME_CAPABILITY_NAMES
+                else
+                    &headless.protocol.RUNTIME_CAPABILITY_NAMES_BASE;
                 break :blk try okValueResponse(self.allocator, id_value, caps);
             },
             .err => |err| try errorResponseAllocWithData(self.allocator, id_value, err.code, err.message, err.data),
@@ -3973,6 +5123,9 @@ pub const Daemon = struct {
         if (parsed.value != .object) return error.InvalidParams;
         const id_value = parsed.value.object.get("id") orelse .null;
         const method = jsonString(parsed.value.object.get("method") orelse .null) orelse return error.InvalidParams;
+        if (try self.requestTargetRejection(id_value, parsed.value.object.get("target"))) |response| {
+            return response;
+        }
         const params = parsed.value.object.get("params") orelse .null;
 
         if (std.mem.eql(u8, method, headless.registry.METHOD_PROCESS_START)) {
@@ -5422,23 +6575,115 @@ pub const Daemon = struct {
         if (service) |svc| _ = svc.in_flight.fetchAdd(1, .monotonic);
         self.mutex.unlock();
 
-        // MAJOR-R1: reject replay of terminal committed turn_ids. Without this,
-        // a fresh worker re-runs and commitTurn hits receipt Conflict ×3 →
-        // durability_pending wedges permanently. Interrupted rows still allow
-        // replay (sweep → re-commit upsert). Never SQLite under lockDaemon.
+        // MAJOR-R1: reject replay of consumed durable turn_ids. Completed
+        // commits and startup-interrupted acceptances both require a new turn
+        // id; neither may invoke provider work again. Never SQLite under
+        // lockDaemon.
         if (service) |svc| {
             defer _ = svc.in_flight.fetchSub(1, .monotonic);
-            if (try ledgerHasTerminalCommittedTurn(svc, turn_id)) {
+            if (try ledgerHasConsumedTurnId(svc, turn_id)) {
                 return try errorResponseAlloc(
                     self.allocator,
                     id_value,
                     headless.protocol.ERR_INVALID_STATE,
-                    "turn already committed",
+                    "turn id is already consumed; retry with a new turn id",
                 );
             }
         }
 
-        const turn = try createChatTurnFromParams(self.allocator, params);
+        var execution_route = resolveChatExecutionRoute(self, params) catch |err| switch (err) {
+            error.InvalidParams => return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_PARAMS,
+                "invalid repository route params",
+            ),
+            error.RouteAttachmentsUnsupported => return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_CAPABILITY_UNAVAILABLE,
+                "remote repository routes do not support path-based attachments",
+            ),
+            error.CapabilityUnavailable => return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_CAPABILITY_UNAVAILABLE,
+                "repository checkout is unavailable on this runtime",
+            ),
+            error.ResourceNotFound => return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_RESOURCE_NOT_FOUND,
+                "repository binding not found on this runtime",
+            ),
+            error.StoreCorrupt => return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_STORE_CORRUPT,
+                "store is corrupt",
+            ),
+            error.StoreUnavailable => return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_STORE_UNAVAILABLE,
+                "store is unavailable",
+            ),
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        defer if (execution_route) |*route| route.deinit(self.allocator);
+        // Remote clients request this bounded installation proof so missing
+        // CLIs reject before durable acceptance. Local callers omit it and
+        // retain the existing launch behavior. Authentication is deliberately
+        // not probed here: provider auth handshakes are heterogeneous and can
+        // block, prompt, or mutate provider state.
+        const require_provider_ready = jsonBool(params.object.get("require_provider_ready") orelse .null) orelse false;
+        if (require_provider_ready) {
+            const provider = parseEnum(harness.Provider, jsonString(params.object.get("provider") orelse .null) orelse "") orelse
+                return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid provider");
+            if (!nativeProviderInstalled(nativeProviderFromHarness(provider))) {
+                return try errorResponseAlloc(
+                    self.allocator,
+                    id_value,
+                    headless.protocol.ERR_PROVIDER_UNAVAILABLE,
+                    "provider is unavailable on this runtime",
+                );
+            }
+        }
+        const route_ptr: ?*const ChatExecutionRoute = if (execution_route) |*route| route else null;
+        // Staged attachments are claimed after every rejectable precondition
+        // above so a refused turn never consumes uploads the client would
+        // have to redo.
+        var claimed_attachments = self.claimStagedChatAttachments(params, route_ptr != null) catch |err| switch (err) {
+            error.InvalidParams => return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_PARAMS,
+                "invalid attachments param",
+            ),
+            error.ResourceNotFound => return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_RESOURCE_NOT_FOUND,
+                "unknown or expired attachment id",
+            ),
+            error.InvalidState => return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_STATE,
+                "attachment is not committed",
+            ),
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        // If anything past this point stops the new turn from launching
+        // (duplicate turn, shutdown drain, OOM, worker spawn failure), the
+        // claim is rolled back so the client can retry without re-uploading.
+        var turn_launched = false;
+        defer if (claimed_attachments) |*claim| {
+            if (!turn_launched) self.restoreClaimedChatAttachments(claim);
+            claim.deinit(self.allocator);
+        };
+        const claimed_ptr: ?*const ClaimedAttachments = if (claimed_attachments) |*claim| claim else null;
+        const turn = try createChatTurnFromParams(self.allocator, params, route_ptr, claimed_ptr);
         errdefer turn.deinit(self.allocator);
         // Wire the wake path before the turn is reachable by any worker.
         turn.daemon = self;
@@ -5477,6 +6722,7 @@ pub const Daemon = struct {
             return err;
         };
         turn.worker_thread = thread;
+        turn_launched = true;
         self.mutex.unlock();
         return try okValueResponse(self.allocator, id_value, .{ .turn_id = turn.turn_id, .created = true });
     }
@@ -5890,6 +7136,459 @@ pub const Daemon = struct {
         return try errorResponseAlloc(self.allocator, id_value, "not_found", "turn not found");
     }
 
+    /// Drain-safe entry for the unlocked chat.attachment.* handlers: confirm
+    /// accepting_mutations and pin the store in-flight counter under one
+    /// lockDaemon window. The generic mutator gate's unlocked read is not
+    /// safe for these methods, and the pin makes prepareShutdown's
+    /// store_writes_in_flight refusal observe staging file work in progress.
+    /// Callers must unpin the returned service when done.
+    fn beginStagedAttachmentRequest(self: *Daemon) error{DaemonDraining}!?*StoreService {
+        lockDaemon(self);
+        defer self.mutex.unlock();
+        if (!self.accepting_mutations) return error.DaemonDraining;
+        const service = self.store_service;
+        if (service) |svc| _ = svc.in_flight.fetchAdd(1, .monotonic);
+        return service;
+    }
+
+    fn stagedAttachmentDrainingResponse(self: *Daemon, id_value: std.json.Value) ![]u8 {
+        return try errorResponseAlloc(
+            self.allocator,
+            id_value,
+            "invalid_state",
+            "daemon is preparing shutdown and is not accepting mutations",
+        );
+    }
+
+    /// chat.attachments.v1: begin a chunked, authenticated attachment upload.
+    /// Runs unlocked (see methodRunsUnlocked); file I/O never holds lockDaemon.
+    /// The path is server-constructed from a random hex id inside the private
+    /// staging directory, and the exclusive create defeats substitution.
+    fn chatAttachmentCreateResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        if (params != .object) return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object");
+        const mime_raw = jsonString(params.object.get("mime") orelse .null) orelse
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing mime");
+        const mime = headless.attachment_protocol.supportedImageMime(mime_raw) orelse
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "unsupported attachment mime type");
+        const declared: usize = blk: {
+            const value = params.object.get("byte_size") orelse .null;
+            if (value != .integer) break :blk 0;
+            break :blk std.math.cast(usize, value.integer) orelse 0;
+        };
+        const limits: headless.RuntimeLimits = .{};
+        // The portable cap is the smallest per-image size every audited
+        // provider harness ingests; accepting more would defer a
+        // deterministic provider failure past acceptance.
+        const max_declared = @min(limits.max_attachment_bytes, headless.attachment_protocol.MAX_PORTABLE_ATTACHMENT_BYTES);
+        if (declared < STAGED_ATTACHMENT_MIN_BYTES or declared > max_declared)
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "attachment byte_size out of range");
+
+        const pinned_service = self.beginStagedAttachmentRequest() catch
+            return try self.stagedAttachmentDrainingResponse(id_value);
+        defer if (pinned_service) |svc| {
+            _ = svc.in_flight.fetchSub(1, .monotonic);
+        };
+        if (pinned_service == null or self.pref_path.len == 0)
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "attachment staging is unavailable on this runtime");
+
+        self.sweepExpiredChatAttachments();
+
+        const dir_path = try std.fs.path.join(self.allocator, &.{ self.pref_path, CHAT_ATTACHMENT_DIR_NAME });
+        defer self.allocator.free(dir_path);
+        var threaded = std.Io.Threaded.init_single_threaded;
+        const io = threaded.io();
+        ensureChatAttachmentStagingDirectory(io, dir_path) catch
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_STATE, "attachment staging directory is unavailable");
+
+        const id = randomEphemeralHexId(self.allocator);
+        // Suffix from the validated MIME (never client input): provider CLIs
+        // and bridges may infer image type from the extension, so a correct
+        // canonical suffix keeps every shared harness working while the
+        // random server-generated id preserves traversal/isolation guarantees.
+        const extension = headless.attachment_protocol.imageExtension(mime);
+        const file_path = std.fmt.allocPrint(self.allocator, "{s}{c}{s}.{s}", .{ dir_path, std.fs.path.sep, id, extension }) catch |err| {
+            self.allocator.free(id);
+            return err;
+        };
+        var file = std.Io.Dir.createFileAbsolute(io, file_path, .{ .exclusive = true }) catch {
+            self.allocator.free(id);
+            self.allocator.free(file_path);
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_STATE, "attachment staging is unavailable");
+        };
+        const record = self.allocator.create(StagedChatAttachment) catch |err| {
+            file.close(io);
+            std.Io.Dir.deleteFileAbsolute(io, file_path) catch {};
+            self.allocator.free(id);
+            self.allocator.free(file_path);
+            return err;
+        };
+        record.* = .{
+            .id = id,
+            .mime = mime,
+            .declared_bytes = declared,
+            .updated_at_ms = nowMs(),
+            .path = file_path,
+            .file = file,
+        };
+        // The record is shared once appended; respond from this stack copy so
+        // a concurrent sweep can never race the response encoding.
+        var id_copy: [headless.attachment_protocol.ATTACHMENT_ID_LENGTH]u8 = undefined;
+        @memcpy(id_copy[0..], id);
+
+        lockDaemon(self);
+        var pending: usize = 0;
+        var pending_bytes: usize = 0;
+        var total_bytes: usize = 0;
+        for (self.chat_attachments.items) |existing| {
+            // Saturating adds: declared sizes are client-influenced, so the
+            // budget comparison must stay correct even at usize extremes.
+            total_bytes +|= existing.declared_bytes;
+            if (existing.state != .consumed) {
+                pending += 1;
+                pending_bytes +|= existing.declared_bytes;
+            }
+        }
+        const over_cap = self.chat_attachments.items.len >= MAX_STAGED_CHAT_ATTACHMENTS_TOTAL or
+            pending >= MAX_STAGED_CHAT_ATTACHMENTS_PENDING or
+            pending_bytes +| declared > MAX_STAGED_CHAT_ATTACHMENT_PENDING_BYTES or
+            total_bytes +| declared > MAX_STAGED_CHAT_ATTACHMENT_TOTAL_BYTES;
+        if (!over_cap) {
+            self.chat_attachments.append(self.allocator, record) catch |err| {
+                self.mutex.unlock();
+                record.destroy(self.allocator);
+                return err;
+            };
+        }
+        self.mutex.unlock();
+        if (over_cap) {
+            record.destroy(self.allocator);
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_STATE, "too many staged attachments; retry shortly");
+        }
+        return try okValueResponse(self.allocator, id_value, .{
+            .attachment_id = id_copy[0..],
+            .max_chunk_bytes = headless.attachment_protocol.maxAppendChunkBytes(limits.max_request_bytes),
+        });
+    }
+
+    /// chat.attachments.v1: append one exact-offset base64 chunk. The first
+    /// chunk must carry the declared MIME's magic bytes so a lying declaration
+    /// never reaches disk. Never logs or echoes attachment bytes.
+    fn chatAttachmentAppendResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        if (params != .object) return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object");
+        const attachment_id = jsonString(params.object.get("attachment_id") orelse .null) orelse
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing attachment_id");
+        if (!headless.attachment_protocol.isValidAttachmentId(attachment_id))
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "invalid attachment_id");
+        const offset: usize = blk: {
+            const value = params.object.get("offset") orelse .null;
+            if (value != .integer) return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing offset");
+            break :blk std.math.cast(usize, value.integer) orelse
+                return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "invalid offset");
+        };
+        const data_b64 = jsonString(params.object.get("data") orelse .null) orelse
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing data");
+        const decoder = std.base64.standard.Decoder;
+        const decoded_len = decoder.calcSizeForSlice(data_b64) catch
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "invalid base64 data");
+        if (decoded_len == 0)
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "empty data");
+        const decoded = try self.allocator.alloc(u8, decoded_len);
+        defer self.allocator.free(decoded);
+        decoder.decode(decoded, data_b64) catch
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "invalid base64 data");
+
+        const pinned_service = self.beginStagedAttachmentRequest() catch
+            return try self.stagedAttachmentDrainingResponse(id_value);
+        defer if (pinned_service) |svc| {
+            _ = svc.in_flight.fetchSub(1, .monotonic);
+        };
+
+        // Reserve the record under lockDaemon; the write runs outside the
+        // lock behind the busy flag (which also shields it from the sweep).
+        lockDaemon(self);
+        const record = self.findStagedChatAttachment(attachment_id) orelse {
+            self.mutex.unlock();
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_RESOURCE_NOT_FOUND, "unknown attachment id");
+        };
+        if (record.state != .staging or record.busy) {
+            self.mutex.unlock();
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_STATE, "attachment is not accepting data");
+        }
+        if (offset != record.received_bytes) {
+            self.mutex.unlock();
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "attachment chunk offset mismatch");
+        }
+        if (record.received_bytes + decoded.len > record.declared_bytes) {
+            self.mutex.unlock();
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "attachment data exceeds declared byte_size");
+        }
+        if (record.received_bytes == 0 and
+            (decoded.len < STAGED_ATTACHMENT_MIN_BYTES or
+                !headless.attachment_protocol.imageBytesMatchMime(record.mime, decoded)))
+        {
+            self.mutex.unlock();
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "attachment bytes do not match declared mime");
+        }
+        record.busy = true;
+        const file = record.file.?;
+        self.mutex.unlock();
+
+        var threaded = std.Io.Threaded.init_single_threaded;
+        const write_failed = blk: {
+            file.writeStreamingAll(threaded.io(), decoded) catch break :blk true;
+            break :blk false;
+        };
+
+        lockDaemon(self);
+        record.busy = false;
+        record.updated_at_ms = nowMs();
+        if (write_failed) {
+            self.removeStagedChatAttachmentLocked(record);
+            self.mutex.unlock();
+            record.destroy(self.allocator);
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_STATE, "attachment staging failed; create a new attachment");
+        }
+        record.received_bytes += decoded.len;
+        const received = record.received_bytes;
+        self.mutex.unlock();
+        return try okValueResponse(self.allocator, id_value, .{ .received_bytes = received });
+    }
+
+    /// chat.attachments.v1: seal a fully uploaded attachment so a
+    /// repository-routed chat.turn.start can claim it by id.
+    fn chatAttachmentCommitResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        if (params != .object) return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object");
+        const attachment_id = jsonString(params.object.get("attachment_id") orelse .null) orelse
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing attachment_id");
+        if (!headless.attachment_protocol.isValidAttachmentId(attachment_id))
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "invalid attachment_id");
+
+        const pinned_service = self.beginStagedAttachmentRequest() catch
+            return try self.stagedAttachmentDrainingResponse(id_value);
+        defer if (pinned_service) |svc| {
+            _ = svc.in_flight.fetchSub(1, .monotonic);
+        };
+
+        lockDaemon(self);
+        const record = self.findStagedChatAttachment(attachment_id) orelse {
+            self.mutex.unlock();
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_RESOURCE_NOT_FOUND, "unknown attachment id");
+        };
+        if (record.state != .staging or record.busy) {
+            self.mutex.unlock();
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_STATE, "attachment is not committable");
+        }
+        if (record.received_bytes != record.declared_bytes) {
+            self.mutex.unlock();
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_STATE, "attachment upload is incomplete");
+        }
+        record.busy = true;
+        const file = record.file;
+        record.file = null;
+        self.mutex.unlock();
+
+        if (file) |open_file| {
+            var threaded = std.Io.Threaded.init_single_threaded;
+            open_file.close(threaded.io());
+        }
+
+        lockDaemon(self);
+        record.busy = false;
+        record.state = .committed;
+        record.updated_at_ms = nowMs();
+        const byte_size = record.declared_bytes;
+        const mime = record.mime;
+        self.mutex.unlock();
+        return try okValueResponse(self.allocator, id_value, .{
+            .attachment_id = attachment_id,
+            .byte_size = byte_size,
+            .mime = mime,
+        });
+    }
+
+    fn findStagedChatAttachment(self: *Daemon, attachment_id: []const u8) ?*StagedChatAttachment {
+        for (self.chat_attachments.items) |record| {
+            if (std.mem.eql(u8, record.id, attachment_id)) return record;
+        }
+        return null;
+    }
+
+    fn removeStagedChatAttachmentLocked(self: *Daemon, record: *StagedChatAttachment) void {
+        for (self.chat_attachments.items, 0..) |candidate, index| {
+            if (candidate == record) {
+                _ = self.chat_attachments.swapRemove(index);
+                return;
+            }
+        }
+    }
+
+    /// Bounded periodic sweep so expired staged uploads are reclaimed even
+    /// when no future chat.attachment.create ever arrives. Called from the
+    /// drain loop every tick; the due timestamp holds the real cadence to
+    /// CHAT_ATTACHMENT_SWEEP_INTERVAL_MS. Returns true when a sweep ran.
+    fn maybeSweepStagedChatAttachments(self: *Daemon, now_ms: i64) bool {
+        lockDaemon(self);
+        if (now_ms < self.chat_attachment_sweep_due_ms) {
+            self.mutex.unlock();
+            return false;
+        }
+        self.chat_attachment_sweep_due_ms = now_ms + CHAT_ATTACHMENT_SWEEP_INTERVAL_MS;
+        self.mutex.unlock();
+        self.sweepExpiredChatAttachments();
+        return true;
+    }
+
+    /// TTL sweep for uploads that never commit / are never claimed, and for
+    /// consumed files after the provider worker window. Busy records are
+    /// skipped; file deletion runs outside lockDaemon.
+    fn sweepExpiredChatAttachments(self: *Daemon) void {
+        const now = nowMs();
+        var expired: std.ArrayList(*StagedChatAttachment) = .empty;
+        defer expired.deinit(self.allocator);
+        lockDaemon(self);
+        expired.ensureTotalCapacity(self.allocator, self.chat_attachments.items.len) catch {
+            self.mutex.unlock();
+            return;
+        };
+        var index: usize = 0;
+        while (index < self.chat_attachments.items.len) {
+            const record = self.chat_attachments.items[index];
+            const ttl: i64 = if (record.state == .consumed)
+                STAGED_ATTACHMENT_CONSUMED_TTL_MS
+            else
+                STAGED_ATTACHMENT_PENDING_TTL_MS;
+            if (!record.busy and now - record.updated_at_ms > ttl) {
+                _ = self.chat_attachments.swapRemove(index);
+                expired.appendAssumeCapacity(record);
+                continue;
+            }
+            index += 1;
+        }
+        self.mutex.unlock();
+        for (expired.items) |record| record.destroy(self.allocator);
+    }
+
+    /// Resolve committed staged attachment IDs into daemon-local files for a
+    /// repository-routed turn. Validation and consumption share one lock
+    /// window: either every id resolves or nothing is consumed.
+    fn claimStagedChatAttachments(
+        self: *Daemon,
+        params: std.json.Value,
+        repository_routed: bool,
+    ) ClaimedAttachmentsError!?ClaimedAttachments {
+        const value = params.object.get("attachments") orelse return null;
+        const array = switch (value) {
+            .null => return null,
+            .array => |entries| entries,
+            else => return error.InvalidParams,
+        };
+        if (array.items.len == 0) return null;
+        // Staged attachments exist for repository/remote routes only; local
+        // turns keep the legacy absolute-path contract.
+        if (!repository_routed) return error.InvalidParams;
+        if (array.items.len > MAX_STAGED_CHAT_ATTACHMENTS_PENDING) return error.InvalidParams;
+
+        var paths: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (paths.items) |path| self.allocator.free(path);
+            paths.deinit(self.allocator);
+        }
+        var images: std.ArrayList(store_protocol.Attachment) = .empty;
+        errdefer {
+            for (images.items) |attachment| {
+                self.allocator.free(attachment.path);
+                self.allocator.free(attachment.mime);
+            }
+            images.deinit(self.allocator);
+        }
+        var ids: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (ids.items) |id| self.allocator.free(id);
+            ids.deinit(self.allocator);
+        }
+
+        // Pure memory work only under this lock (no file/SQLite I/O), and no
+        // record state changes until every fallible step has succeeded — an
+        // OOM or validation failure at any point leaves all records claimable.
+        lockDaemon(self);
+        defer self.mutex.unlock();
+        for (array.items, 0..) |item, index| {
+            const id = jsonString(item) orelse return error.InvalidParams;
+            if (!headless.attachment_protocol.isValidAttachmentId(id)) return error.InvalidParams;
+            // A duplicate id would alias one staged file into two turn slots
+            // and double-consume the record; reject the whole claim.
+            for (array.items[0..index]) |prior| {
+                if (std.mem.eql(u8, jsonString(prior).?, id)) return error.InvalidParams;
+            }
+            const record = self.findStagedChatAttachment(id) orelse return error.ResourceNotFound;
+            if (record.busy or record.state != .committed) return error.InvalidState;
+        }
+        for (array.items) |item| {
+            const record = self.findStagedChatAttachment(jsonString(item).?).?;
+            const owned_path = try self.allocator.dupe(u8, record.path);
+            {
+                errdefer self.allocator.free(owned_path);
+                try paths.append(self.allocator, owned_path);
+            }
+            const owned_id = try self.allocator.dupe(u8, record.id);
+            {
+                errdefer self.allocator.free(owned_id);
+                try ids.append(self.allocator, owned_id);
+            }
+            // Durable projection: the message row persists a stable opaque
+            // reference, never the daemon's absolute staging path (which is
+            // private, ephemeral, and wiped at restart). v1 retains metadata
+            // only — historical bytes are not downloadable after the TTL.
+            // The real path travels solely through image_paths → provider.
+            const image_path = try std.fmt.allocPrint(
+                self.allocator,
+                "{s}{s}",
+                .{ headless.attachment_protocol.ATTACHMENT_REFERENCE_PREFIX, record.id },
+            );
+            const image_mime = self.allocator.dupe(u8, record.mime) catch |err| {
+                self.allocator.free(image_path);
+                return err;
+            };
+            images.append(self.allocator, .{
+                .path = image_path,
+                .mime = image_mime,
+                .byte_size = record.declared_bytes,
+            }) catch |err| {
+                self.allocator.free(image_path);
+                self.allocator.free(image_mime);
+                return err;
+            };
+        }
+        const owned_paths = try paths.toOwnedSlice(self.allocator);
+        errdefer freeStringArray(self.allocator, owned_paths);
+        const owned_images = try images.toOwnedSlice(self.allocator);
+        errdefer freeAttachmentArray(self.allocator, owned_images);
+        const owned_ids = try ids.toOwnedSlice(self.allocator);
+        // Infallible from here: consumption is atomic with the validation
+        // above because the daemon lock was never released.
+        for (array.items) |item| {
+            const record = self.findStagedChatAttachment(jsonString(item).?).?;
+            record.state = .consumed;
+            record.updated_at_ms = nowMs();
+        }
+        return .{ .image_paths = owned_paths, .images = owned_images, .ids = owned_ids };
+    }
+
+    /// Undo a successful claim after a later turn-start failure (duplicate
+    /// turn, shutdown drain, OOM, worker spawn failure): restore records to
+    /// `.committed` so the client can retry without re-uploading. Records
+    /// already swept are simply gone; the retry then reports resource_not_found.
+    fn restoreClaimedChatAttachments(self: *Daemon, claim: *const ClaimedAttachments) void {
+        lockDaemon(self);
+        defer self.mutex.unlock();
+        for (claim.ids) |id| {
+            const record = self.findStagedChatAttachment(id) orelse continue;
+            if (record.state != .consumed) continue;
+            record.state = .committed;
+            record.updated_at_ms = nowMs();
+        }
+    }
+
     /// Read-only dynamic model catalog so detached clients (web/CLI) can
     /// mirror the desktop composer pickers. Runs unlocked (see
     /// methodRunsUnlocked): provider discovery may block on the OpenCode
@@ -5906,13 +7605,41 @@ pub const Daemon = struct {
             return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing project_path");
 
         const models = send_runner.listModels(self.allocator, provider, project_path) catch |err| {
-            return try errorResponseAlloc(self.allocator, id_value, "provider_unavailable", @errorName(err));
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_PROVIDER_UNAVAILABLE, @errorName(err));
         };
         defer harness.freeModelInfos(self.allocator, models);
         return try okValueResponse(self.allocator, id_value, .{
             .provider = provider_name,
             .models = models,
         });
+    }
+
+    /// Runtime-scoped provider inventory. This endpoint performs bounded
+    /// executable checks only; authentication remains unknown until provider
+    /// adapters expose cancellable, deadline-enforced probes. Login/setup runs
+    /// explicitly in a runtime PTY under the daemon user's HOME.
+    fn providerStatusResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        if (params != .null and params != .object) {
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object or null");
+        }
+        const ProviderStatus = headless.providers_protocol.ProviderStatus;
+        const statuses = [_]ProviderStatus{
+            nativeProviderStatus(.codex),
+            nativeProviderStatus(.claude),
+            nativeProviderStatus(.cursor),
+            nativeProviderStatus(.opencode),
+            ampProviderStatus(),
+            nativeProviderStatus(.pi),
+            nativeProviderStatus(.fx),
+            nativeProviderStatus(.grok),
+        };
+        const result: headless.providers_protocol.StatusResult = .{
+            .runtime_id = self.runtime_id,
+            .instance_id = self.instance_id,
+            .probed_at_ms = nowMs(),
+            .providers = &statuses,
+        };
+        return try okValueResponse(self.allocator, id_value, result);
     }
 
     /// Persist one web composer favorite into the same verde.json collection
@@ -6741,6 +8468,28 @@ pub fn runDaemon(allocator: std.mem.Allocator, pref_path: []const u8) !void {
     return runDaemonOptions(allocator, pref_path, .{});
 }
 
+pub const DaemonReadyCallback = struct {
+    context: *anyopaque,
+    notify: *const fn (context: *anyopaque) anyerror!void,
+};
+
+/// Run the daemon and invoke `callback` only after this process owns the
+/// endpoint and all durable services are ready. Lifetime helpers such as
+/// signal watchers must start here rather than before the bind race is won.
+pub fn runDaemonWithReadyCallback(
+    allocator: std.mem.Allocator,
+    pref_path: []const u8,
+    callback: DaemonReadyCallback,
+) !void {
+    return runDaemonOptions(allocator, pref_path, .{ .ready_callback = callback });
+}
+
+/// Initialize and migrate one daemon data directory through the ordinary
+/// endpoint-ownership and readiness path, then exit without staying resident.
+pub fn initializeDaemonData(allocator: std.mem.Allocator, pref_path: []const u8) !void {
+    return runDaemonOptions(allocator, pref_path, .{ .idle_exit_ms_override = 0 });
+}
+
 /// Runs the session daemon with the shared MCP dispatcher exposed over the
 /// authenticated loopback Streamable HTTP endpoint.
 pub fn runDaemonWithMcp(
@@ -6753,6 +8502,8 @@ pub fn runDaemonWithMcp(
 
 const RunDaemonOptions = struct {
     mcp_handler: ?mcp_http.Handler = null,
+    ready_callback: ?DaemonReadyCallback = null,
+    idle_exit_ms_override: ?i64 = null,
 };
 
 fn runDaemonOptions(allocator: std.mem.Allocator, pref_path: []const u8, options: RunDaemonOptions) !void {
@@ -6771,7 +8522,7 @@ fn runWindowsDaemon(allocator: std.mem.Allocator, pref_path: []const u8, options
 
 fn runSessionizerServer(allocator: std.mem.Allocator, pref_path: []const u8, options: RunDaemonOptions) !void {
     var setup_threaded = std.Io.Threaded.init_single_threaded;
-    try std.Io.Dir.cwd().createDirPath(setup_threaded.io(), pref_path);
+    try ensurePrivateDataDirectory(setup_threaded.io(), pref_path);
     const endpoint = try socketPath(allocator, pref_path);
     defer allocator.free(endpoint);
     const pid_path = try pidFilePath(allocator, pref_path);
@@ -6779,6 +8530,7 @@ fn runSessionizerServer(allocator: std.mem.Allocator, pref_path: []const u8, opt
 
     var daemon = Daemon.initWithPrefPath(allocator, pref_path);
     defer daemon.deinit();
+    if (options.idle_exit_ms_override) |idle_exit_ms| daemon.idle_exit_ms = idle_exit_ms;
     // M5-P2 journal hook: volatile revision bumps publish identity entries.
     // `&daemon` is stable for the daemon's whole lifetime (A3: production
     // default, not hermetic-gated; capability flags stay false regardless).
@@ -6791,6 +8543,7 @@ fn runSessionizerServer(allocator: std.mem.Allocator, pref_path: []const u8, opt
         .pref_path = pref_path,
         .stop_requested = &stop_requested,
         .mcp_handler = options.mcp_handler,
+        .ready_callback = options.ready_callback,
     };
     defer finishSessionizerServer(&server_context);
 
@@ -6815,6 +8568,65 @@ fn runSessionizerServer(allocator: std.mem.Allocator, pref_path: []const u8, opt
     });
 }
 
+/// Remove staging leftovers from a previous daemon generation. Runs at ready
+/// time, before any client can stage new attachments. The no-follow stat
+/// gates the recursive delete: a planted symlink is unlinked as a link only,
+/// so cleanup can never recurse through it into a foreign directory.
+fn wipeStagedChatAttachmentDirectory(daemon: *Daemon) void {
+    if (daemon.pref_path.len == 0) return;
+    const dir_path = std.fs.path.join(daemon.allocator, &.{ daemon.pref_path, CHAT_ATTACHMENT_DIR_NAME }) catch return;
+    defer daemon.allocator.free(dir_path);
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    const stat = std.Io.Dir.cwd().statFile(io, dir_path, .{ .follow_symlinks = false }) catch return;
+    switch (stat.kind) {
+        .directory => std.Io.Dir.cwd().deleteTree(io, dir_path) catch {},
+        else => std.Io.Dir.deleteFileAbsolute(io, dir_path) catch {},
+    }
+}
+
+/// Prepare the private chat-attachment staging directory without ever
+/// following a planted symlink. Ordering is the defense: a no-follow stat
+/// runs BEFORE any open/chmod/create so a symlink target is never touched,
+/// creation happens only when the path is genuinely absent, and a no-follow
+/// recheck closes the create race before the directory is opened no-follow
+/// for permission tightening.
+fn ensureChatAttachmentStagingDirectory(io: std.Io, dir_path: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    _ = cwd.statFile(io, dir_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        // mkdir never follows a symlink in the final component.
+        error.FileNotFound => cwd.createDirPath(io, dir_path) catch |create_err| switch (create_err) {
+            error.PathAlreadyExists => {},
+            else => return create_err,
+        },
+        else => return err,
+    };
+    const stat = try cwd.statFile(io, dir_path, .{ .follow_symlinks = false });
+    if (stat.kind != .directory) return error.NotDir;
+    if (builtin.os.tag == .windows) return;
+    // Staged image bytes must stay private to the daemon user, mirroring
+    // ensurePrivateDataDirectory but with a no-follow open. `iterate` is
+    // required even though nothing is listed: without it std opens the
+    // directory as an O_PATH handle and fchmod on that fd fails with EBADF
+    // on every Linux kernel, which made every chat.attachment.create report
+    // the staging directory as unavailable.
+    var dir = try cwd.openDir(io, dir_path, .{ .iterate = true, .follow_symlinks = false });
+    defer dir.close(io);
+    try dir.setPermissions(io, @enumFromInt(0o700));
+}
+
+fn ensurePrivateDataDirectory(io: std.Io, pref_path: []const u8) !void {
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+    if (builtin.os.tag == .windows) return;
+
+    var data_dir = try std.Io.Dir.cwd().openDir(io, pref_path, .{ .iterate = true });
+    defer data_dir.close(io);
+    // Runtime identity, SQLite state, provider metadata, socket, and lock file
+    // all live below this directory. Tighten an existing directory too so a
+    // permissive umask cannot leave daemon state readable by another user.
+    try data_dir.setPermissions(io, @enumFromInt(0o700));
+}
+
 const SessionizerServerContext = struct {
     daemon: *Daemon,
     endpoint: []const u8,
@@ -6822,6 +8634,7 @@ const SessionizerServerContext = struct {
     pref_path: []const u8 = "",
     stop_requested: *std.atomic.Value(bool),
     mcp_handler: ?mcp_http.Handler = null,
+    ready_callback: ?DaemonReadyCallback = null,
     mcp_server: ?mcp_http.Server = null,
     drain_thread: ?std.Thread = null,
     pid_published: bool = false,
@@ -6832,8 +8645,12 @@ fn sessionizerServerReady(raw_context: *anyopaque) !void {
     try writePidFile(context.pid_path);
     context.pid_published = true;
     // Open the production (or hermetic-override) store only after bind succeeds
-    // so a failed open fails readiness loudly (never a silent dual-writer).
+    // so identity creation and SQLite binding share endpoint ownership and a
+    // failed cross-check fails readiness loudly (never a silent dual-writer).
     try maybeInitStoreService(context.daemon);
+    // Staged chat attachments never survive a daemon generation: their IDs
+    // live only in this process, so leftovers are unclaimable garbage.
+    wipeStagedChatAttachmentDirectory(context.daemon);
     if (context.mcp_handler) |handler| {
         context.mcp_server = mcp_http.start(context.daemon.allocator, context.pref_path, handler) catch |err| {
             log.err("daemon MCP HTTP transport failed to start: {s}", .{@errorName(err)});
@@ -6845,6 +8662,7 @@ fn sessionizerServerReady(raw_context: *anyopaque) !void {
         .endpoint = context.endpoint,
         .stop_requested = context.stop_requested,
     }});
+    if (context.ready_callback) |callback| try callback.notify(callback.context);
 }
 
 /// Invoked by platform_ipc.serve after the accept loop exits, BEFORE the
@@ -6873,6 +8691,11 @@ fn sessionizerServerClosing(raw_context: *anyopaque) void {
 fn isStoreMethod(method: []const u8) bool {
     return std.mem.eql(u8, method, store_protocol.METHOD_STATE_SNAPSHOT_REPLACE) or
         std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_UPSERT) or
+        std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_UPSERT) or
+        std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_REMOVE) or
+        std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_DEFAULT_SET) or
+        std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_BINDING_UPSERT) or
+        std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_BINDING_REMOVE) or
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_UPSERT) or
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_DRAFT_SET) or
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_MESSAGE_APPEND) or
@@ -6881,8 +8704,11 @@ fn isStoreMethod(method: []const u8) bool {
         std.mem.eql(u8, method, store_protocol.METHOD_NOTIFICATION_CHAT_COMPLETION_UPSERT) or
         std.mem.eql(u8, method, store_protocol.METHOD_NOTIFICATION_CHAT_COMPLETION_CLEAR) or
         std.mem.eql(u8, method, store_protocol.METHOD_DAEMON_STORE_STATUS) or
+        std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_LIST) or
+        std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_MANIFEST_GET) or
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_GET) or
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_LIST) or
+        std.mem.eql(u8, method, store_protocol.METHOD_CHAT_MESSAGE_LIST) or
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_TURN_RECORD) or
         // M5-P2: the composite snapshot and cursor route through the same
         // classify → store-queue seam (A1) so they never run under the outer
@@ -6965,6 +8791,11 @@ fn storeMutationCommittedHook(context: *anyopaque, mutation: *const daemon_store
             daemon.signalChangesWaiters();
         },
         .workspace_upsert => |request| daemon.appendJournalEntry(.workspace, request.workspace.workspace_id, request.workspace.workspace_id, revision),
+        .workspace_repository_upsert => |request| daemon.appendJournalEntry(.workspace, request.workspace_id, request.workspace_id, revision),
+        .workspace_repository_remove => |request| daemon.appendJournalEntry(.workspace, request.workspace_id, request.workspace_id, revision),
+        .workspace_default_repository_set => |request| daemon.appendJournalEntry(.workspace, request.workspace_id, request.workspace_id, revision),
+        .workspace_repository_binding_upsert => |request| daemon.appendJournalEntry(.workspace, request.workspace_id, request.workspace_id, revision),
+        .workspace_repository_binding_remove => |request| daemon.appendJournalEntry(.workspace, request.workspace_id, request.workspace_id, revision),
         .thread_upsert => |request| daemon.appendJournalEntry(.chat_thread, request.thread.local_thread_id, request.workspace_id, revision),
         .chat_draft_set => |request| daemon.appendJournalEntry(.chat_thread, request.local_thread_id, request.workspace_id, revision),
         .message_append => |request| daemon.appendJournalEntry(.chat_thread, request.thread_id, request.workspace_id, revision),
@@ -7029,6 +8860,11 @@ fn mutationHeader(mutation: daemon_store.Mutation) store_protocol.MutationHeader
     return switch (mutation) {
         .snapshot_replace => |request| request.mutation,
         .workspace_upsert => |request| request.mutation,
+        .workspace_repository_upsert => |request| request.mutation,
+        .workspace_repository_remove => |request| request.mutation,
+        .workspace_default_repository_set => |request| request.mutation,
+        .workspace_repository_binding_upsert => |request| request.mutation,
+        .workspace_repository_binding_remove => |request| request.mutation,
         .thread_upsert => |request| request.mutation,
         .chat_draft_set => |request| request.mutation,
         .message_append => |request| request.mutation,
@@ -7141,36 +8977,61 @@ fn storeFaultFromEnv(allocator: std.mem.Allocator) !daemon_store.StoreFault {
 /// VERDE_SESSION_DAEMON_STORE_DISABLE. Runs the shared migration chain and
 /// advertises store=true only after the writer is published.
 fn maybeInitStoreService(daemon: *Daemon) !void {
-    // NIT-2: a stray VERDE_SESSION_DAEMON_STORE_DISABLE in a user session is
-    // production-latent (GUI read-only, notify hard-fails). Loud warn so the
-    // knob is deliberate at runtime, not only in comments.
-    if (try storeDisabledFromEnv(daemon.allocator)) {
-        log.warn(
-            "store disabled by env — daemon is store-less; GUI read-only, notify will fail",
-            .{},
-        );
-        return;
-    }
-
     // NIT-1: never silently store-less. Empty pref_path is unreachable in
     // production (__session-daemon always passes a real path).
     if (daemon.pref_path.len == 0) {
         log.err("production store open requires non-empty pref_path", .{});
         return error.InvalidParams;
     }
+    // Resolve identity and SQLite from the same effective directory. This is
+    // essential for hermetic overrides: a test database must never bind to or
+    // rotate the production preference-directory identity.
     const effective_dir = try effectiveStoreDirectory(daemon.allocator, daemon.pref_path);
     defer daemon.allocator.free(effective_dir.path);
+    var threaded: std.Io.Threaded = .init(daemon.allocator, .{});
+    defer threaded.deinit();
+
+    // NIT-2: a stray VERDE_SESSION_DAEMON_STORE_DISABLE in a user session is
+    // production-latent (GUI read-only, notify hard-fails). Loud warn so the
+    // knob is deliberate at runtime, not only in comments. This explicit
+    // test-only mode has a secure file identity but no SQLite authority; the
+    // normal production path below always cross-checks both durable copies.
+    if (try storeDisabledFromEnv(daemon.allocator)) {
+        var identity = try daemon_runtime_identity.loadOrCreateFileOnly(
+            daemon.allocator,
+            threaded.io(),
+            effective_dir.path,
+        );
+        replaceDaemonRuntimeIdentity(daemon, identity);
+        identity = undefined;
+        log.warn(
+            "store disabled by env — identity is file-only; GUI read-only, notify will fail",
+            .{},
+        );
+        return;
+    }
+
     // B9: fault env is active only alongside the hermetic store-dir override.
     const fault = if (effective_dir.overridden) try storeFaultFromEnv(daemon.allocator) else daemon_store.StoreFault.none;
-    const db_path = try std.fs.path.join(daemon.allocator, &.{ effective_dir.path, "state.sqlite" });
+    const db_path = try std.fs.path.join(daemon.allocator, &.{ effective_dir.path, daemon_runtime_identity.DATABASE_FILE_NAME });
     defer daemon.allocator.free(db_path);
 
     const service = try daemon.allocator.create(StoreService);
     errdefer daemon.allocator.destroy(service);
+    var initialized = try daemon_runtime_identity.initStore(
+        daemon.allocator,
+        threaded.io(),
+        effective_dir.path,
+        db_path,
+        fault,
+    );
+    defer initialized.deinit(daemon.allocator);
     service.* = .{
-        .store = try daemon_store.Store.initWithFault(daemon.allocator, db_path, fault),
+        .store = initialized.takeStore(),
     };
     errdefer service.store.deinit();
+    const identity = initialized.takeIdentity();
+    replaceDaemonRuntimeIdentity(daemon, identity);
     // M5-P2 journal hook: every durable commit (mutations AND turn commits)
     // publishes identity entries post-commit. Installed before the service is
     // published so no committed write can slip past the journal.
@@ -7196,6 +9057,13 @@ fn maybeInitStoreService(daemon: *Daemon) !void {
     daemon.mutex.unlock();
 }
 
+fn replaceDaemonRuntimeIdentity(daemon: *Daemon, identity: daemon_runtime_identity.OwnedIdentity) void {
+    daemon.allocator.free(daemon.runtime_id);
+    daemon.allocator.free(daemon.instance_id);
+    daemon.runtime_id = identity.runtime_id;
+    daemon.instance_id = identity.instance_id;
+}
+
 /// Mark dangling non-terminal ledger rows interrupted. Runs under the store
 /// open path before the service is published; no lockDaemon. Propagates so a
 /// failed sweep fails readiness loudly (NIT-4).
@@ -7204,12 +9072,23 @@ fn sweepInterruptedChatTurns(store: *daemon_store.Store) !void {
     store.conn.exec(
         \\update chat_turns
         \\set status = 'interrupted',
-        \\    finished_at_ms = coalesce(finished_at_ms, ?1)
+        \\    finished_at_ms = coalesce(finished_at_ms, ?1),
+        \\    error_message = coalesce(error_message, ?2)
         \\where status in ('accepted', 'running', 'waiting_approval')
     ,
-        .{finished_at},
+        .{ finished_at, INTERRUPTED_TURN_MESSAGE },
     ) catch |err| {
         log.err("interrupted-turn sweep failed err={s}", .{@errorName(err)});
+        return mapStageStoreError(err);
+    };
+    // The replay guard outlives chat_turn retention. Publish every swept ID as
+    // consumed before the store service becomes reachable; retries must mint a
+    // new turn ID rather than re-invoking a provider after ambiguous death.
+    store.conn.execNoArgs(
+        \\insert or ignore into terminal_turn_replay_guard (turn_id, status)
+        \\select turn_id, status from chat_turns where status = 'interrupted';
+    ) catch |err| {
+        log.err("interrupted-turn replay guard failed err={s}", .{@errorName(err)});
         return mapStageStoreError(err);
     };
 }
@@ -7234,6 +9113,9 @@ fn stageAcceptedChatTurn(daemon: *Daemon, turn: *ChatTurn) !AcceptanceOwnership 
     const workspace_id = try arena.dupe(u8, turn.workspace_id);
     const local_thread_id = try arena.dupe(u8, turn.local_thread_id);
     const project_path = try arena.dupe(u8, turn.request.project_path);
+    const repository_id = if (turn.repository_id) |value| try arena.dupe(u8, value) else null;
+    const repository_cwd = if (turn.repository_cwd) |value| try arena.dupe(u8, value) else null;
+    const runtime_id = if (repository_id != null) try arena.dupe(u8, daemon.runtime_id) else null;
     const provider = try arena.dupe(u8, @tagName(turn.request.provider));
     const harness_kind = @tagName(turn.request.harness_kind);
     const provider_thread_id = if (turn.request.provider_thread_id) |id| try arena.dupe(u8, id) else null;
@@ -7300,6 +9182,10 @@ fn stageAcceptedChatTurn(daemon: *Daemon, turn: *ChatTurn) !AcceptanceOwnership 
             .reasoning_variant = turn.request.opencode_reasoning_variant,
             .fast_mode = @tagName(turn.request.fast_mode),
             .access_mode = @tagName(turn.request.access_mode),
+            .profile_id = if (repository_id != null) "local" else null,
+            .runtime_id = runtime_id,
+            .repository_id = repository_id,
+            .repository_cwd = repository_cwd,
         },
         .started_at_ms = started_at_ms,
         .provider = provider,
@@ -7355,11 +9241,11 @@ fn chatCommitFaultOnceShouldFail(allocator: std.mem.Allocator) bool {
     return !chat_commit_fault_once_consumed.swap(true, .monotonic);
 }
 
-/// MAJOR-R1 ledger identity guard: true when the durable ledger already has a
-/// terminal committed row for `turn_id` (completed/failed/aborted). Interrupted
-/// / running / accepted rows return false so same-id replay after a crash sweep
-/// remains legal. SQLite under the store service mutex only — never lockDaemon.
-fn ledgerHasTerminalCommittedTurn(service: *StoreService, turn_id: []const u8) !bool {
+/// MAJOR-R1 ledger identity guard: true when a durable turn ID has been
+/// terminally consumed, including a startup-interrupted acceptance whose
+/// provider completion is ambiguous. SQLite under the store service mutex
+/// only — never lockDaemon.
+fn ledgerHasConsumedTurnId(service: *StoreService, turn_id: []const u8) !bool {
     lockStoreService(service);
     defer service.mutex.unlock();
     const row_or_null = service.store.conn.row(
@@ -7371,7 +9257,8 @@ fn ledgerHasTerminalCommittedTurn(service: *StoreService, turn_id: []const u8) !
     const status = row.text(0);
     return std.mem.eql(u8, status, "completed") or
         std.mem.eql(u8, status, "failed") or
-        std.mem.eql(u8, status, "aborted");
+        std.mem.eql(u8, status, "aborted") or
+        std.mem.eql(u8, status, "interrupted");
 }
 
 /// Apply transcript_apply and commitTurn outside lockDaemon. Caller must not
@@ -7389,6 +9276,9 @@ fn commitChatTurnDurable(daemon: *Daemon, turn: *ChatTurn) !void {
     const local_thread_id = try arena.dupe(u8, turn.local_thread_id);
     const provider = try arena.dupe(u8, @tagName(turn.request.provider));
     const project_path = try arena.dupe(u8, turn.request.project_path);
+    const repository_id = if (turn.repository_id) |value| try arena.dupe(u8, value) else null;
+    const repository_cwd = if (turn.repository_cwd) |value| try arena.dupe(u8, value) else null;
+    const runtime_id = if (repository_id != null) try arena.dupe(u8, daemon.runtime_id) else null;
     const thread_title = try arena.dupe(u8, turn.request.thread_title);
     const harness_kind = @tagName(turn.request.harness_kind);
     const started_at_ms = turn.started_at_ms;
@@ -7399,6 +9289,7 @@ fn commitChatTurnDurable(daemon: *Daemon, turn: *ChatTurn) !void {
     const prompt = try arena.dupe(u8, turn.request.prompt);
     const provider_thread_id = if (turn.provider_thread_id) |id| try arena.dupe(u8, id) else null;
     const error_message = if (turn.error_message) |msg| try arena.dupe(u8, msg) else null;
+    const failure_reason = turn.failure_reason;
     const reply_text = if (turn.result_reply_text) |text| try arena.dupe(u8, text) else "";
     const generated_title = if (turn.generated_title) |title| try arena.dupe(u8, title) else null;
     var events = try arena.alloc(transcript_apply.ChatEvent, turn.events.items.len);
@@ -7513,10 +9404,15 @@ fn commitChatTurnDurable(daemon: *Daemon, turn: *ChatTurn) !void {
             .reasoning_variant = turn.request.opencode_reasoning_variant,
             .fast_mode = @tagName(turn.request.fast_mode),
             .access_mode = @tagName(turn.request.access_mode),
+            .profile_id = if (repository_id != null) "local" else null,
+            .runtime_id = runtime_id,
+            .repository_id = repository_id,
+            .repository_cwd = repository_cwd,
         },
         .expected_thread_title = if (generated_title != null) thread_title else null,
         .generated_title = generated_title,
         .error_message = error_message,
+        .failure_reason = failure_reason,
         .user_message_id = user_message_id,
         .messages = messages,
         .followup_pending = followup_pending,
@@ -7554,7 +9450,7 @@ fn loadTurnRecord(
     const row_or_null = store.conn.row(
         \\select turn_id, workspace_id, local_thread_id, status, started_at_ms,
         \\       finished_at_ms, provider, provider_thread_id, error_message,
-        \\       user_message_id, committed_store_revision
+        \\       failure_reason, user_message_id, committed_store_revision
         \\from chat_turns where turn_id = ?1
     ,
         .{request.turn_id},
@@ -7576,11 +9472,15 @@ fn loadTurnRecord(
     errdefer if (provider_thread_id) |value| allocator.free(value);
     const error_message = dupeOptionalText(allocator, row.nullableText(8)) catch return error.OutOfMemory;
     errdefer if (error_message) |value| allocator.free(value);
-    const user_message_id = dupeOptionalText(allocator, row.nullableText(9)) catch return error.OutOfMemory;
+    const failure_reason = if (row.nullableText(9)) |value|
+        std.meta.stringToEnum(store_protocol.ProviderFailureReason, value) orelse return error.StoreCorrupt
+    else
+        null;
+    const user_message_id = dupeOptionalText(allocator, row.nullableText(10)) catch return error.OutOfMemory;
     errdefer if (user_message_id) |value| allocator.free(value);
     // MINOR-6: range-check before cast (storeStatus pattern); corrupt/negative
     // committed_store_revision maps to store_corrupt, not a Debug panic.
-    const committed: ?u64 = if (row.nullableInt(10)) |value|
+    const committed: ?u64 = if (row.nullableInt(11)) |value|
         std.math.cast(u64, value) orelse return error.StoreCorrupt
     else
         null;
@@ -7595,6 +9495,7 @@ fn loadTurnRecord(
         .provider = provider,
         .provider_thread_id = provider_thread_id,
         .error_message = error_message,
+        .failure_reason = failure_reason,
         .user_message_id = user_message_id,
         .committed_store_revision = committed,
     };
@@ -7620,7 +9521,8 @@ fn loadThreadGetResult(
     const meta_or_null = store.conn.row(
         \\select t.local_thread_id, t.title, t.archived, t.committed, t.last_activity_at,
         \\       t.provider_thread_id, t.model_ref, t.reasoning_effort, t.reasoning_variant,
-        \\       t.fast_mode, t.access_mode, t.provider, t.harness, t.id, t.draft, t.cwd
+        \\       t.fast_mode, t.access_mode, t.provider, t.harness, t.id, t.draft, t.cwd,
+        \\       t.profile_id, t.runtime_id, t.repository_id, t.repository_cwd
         \\from threads t
         \\join workspaces w on w.id = t.workspace_id
         \\where w.workspace_id = ?1 and t.local_thread_id = ?2
@@ -7649,6 +9551,14 @@ fn loadThreadGetResult(
     errdefer allocator.free(draft);
     const cwd = dupeOptionalText(allocator, meta.nullableText(15)) catch return error.OutOfMemory;
     errdefer if (cwd) |value| allocator.free(value);
+    const profile_id = dupeOptionalText(allocator, meta.nullableText(16)) catch return error.OutOfMemory;
+    errdefer if (profile_id) |value| allocator.free(value);
+    const runtime_id = dupeOptionalText(allocator, meta.nullableText(17)) catch return error.OutOfMemory;
+    errdefer if (runtime_id) |value| allocator.free(value);
+    const repository_id = dupeOptionalText(allocator, meta.nullableText(18)) catch return error.OutOfMemory;
+    errdefer if (repository_id) |value| allocator.free(value);
+    const repository_cwd = dupeOptionalText(allocator, meta.nullableText(19)) catch return error.OutOfMemory;
+    errdefer if (repository_cwd) |value| allocator.free(value);
     const archived = meta.int(2) != 0;
     const committed = meta.int(3) != 0;
     const last_activity_at = meta.nullableInt(4);
@@ -7659,7 +9569,7 @@ fn loadThreadGetResult(
         messages_list.deinit(allocator);
     }
     var rows = store.conn.rows(
-        \\select message_id, role, author, body, image_path, image_mime,
+        \\select sort_index, message_id, role, author, body, image_path, image_mime,
         \\       image_byte_size, extra_images_json, created_at_ms, updated_at_ms,
         \\       tool_call_id, tool_call_kind, tool_call_status
         \\from messages where thread_id = ?1 order by sort_index
@@ -7668,48 +9578,9 @@ fn loadThreadGetResult(
     ) catch return error.StoreUnavailable;
     defer rows.deinit();
     while (rows.next()) |row| {
-        const message_id = allocator.dupe(u8, row.nullableText(0) orelse "") catch return error.OutOfMemory;
-        errdefer allocator.free(message_id);
-        const author_raw = row.text(2);
-        const role = allocator.dupe(u8, roleNameFromCode(row.int(1), author_raw)) catch return error.OutOfMemory;
-        errdefer allocator.free(role);
-        const author = allocator.dupe(u8, author_raw) catch return error.OutOfMemory;
-        errdefer allocator.free(author);
-        const body = allocator.dupe(u8, row.text(3)) catch return error.OutOfMemory;
-        errdefer allocator.free(body);
-        const images = try decodeOwnedAttachmentList(
-            allocator,
-            row.nullableText(4),
-            row.nullableText(5),
-            row.nullableInt(6),
-            row.nullableText(7),
-        );
-        errdefer freeAttachmentArray(allocator, images);
-        const tool_call_id = dupeOptionalText(allocator, row.nullableText(10)) catch return error.OutOfMemory;
-        errdefer if (tool_call_id) |value| allocator.free(value);
-        const tool_call_kind = if (row.nullableInt(11)) |code|
-            (allocator.dupe(u8, toolCallKindNameFromCode(code)) catch return error.OutOfMemory)
-        else
-            null;
-        errdefer if (tool_call_kind) |value| allocator.free(value);
-        const tool_call_status = if (row.nullableInt(12)) |code|
-            (allocator.dupe(u8, toolCallStatusNameFromCode(code)) catch return error.OutOfMemory)
-        else
-            null;
-        errdefer if (tool_call_status) |value| allocator.free(value);
-        messages_list.append(allocator, .{
-            .message_id = message_id,
-            .role = role,
-            .author = author,
-            .body = body,
-            .images = images,
-            .image = if (images.len > 0) images[0] else null,
-            .created_at_ms = row.nullableInt(8),
-            .updated_at_ms = row.nullableInt(9),
-            .tool_call_id = tool_call_id,
-            .tool_call_kind = tool_call_kind,
-            .tool_call_status = tool_call_status,
-        }) catch return error.OutOfMemory;
+        const message = try decodeOwnedMessage(allocator, row);
+        errdefer freeOwnedMessage(allocator, message);
+        messages_list.append(allocator, message) catch return error.OutOfMemory;
     }
     if (rows.err) |_| return error.StoreUnavailable;
 
@@ -7731,6 +9602,10 @@ fn loadThreadGetResult(
             .harness = harness_name,
             .draft = draft,
             .cwd = cwd,
+            .profile_id = profile_id,
+            .runtime_id = runtime_id,
+            .repository_id = repository_id,
+            .repository_cwd = repository_cwd,
             .messages = try messages_list.toOwnedSlice(allocator),
         },
         .store_revision = store_revision,
@@ -7747,6 +9622,10 @@ fn freeThreadGetResult(allocator: std.mem.Allocator, result: store_protocol.Thre
     allocator.free(result.thread.harness);
     allocator.free(result.thread.draft);
     if (result.thread.cwd) |value| allocator.free(value);
+    if (result.thread.profile_id) |value| allocator.free(value);
+    if (result.thread.runtime_id) |value| allocator.free(value);
+    if (result.thread.repository_id) |value| allocator.free(value);
+    if (result.thread.repository_cwd) |value| allocator.free(value);
     for (result.thread.messages) |message| freeOwnedMessage(allocator, message);
     allocator.free(result.thread.messages);
 }
@@ -7765,6 +9644,56 @@ fn freeOwnedMessage(allocator: std.mem.Allocator, message: store_protocol.Messag
     if (message.tool_call_id) |value| allocator.free(value);
     if (message.tool_call_kind) |value| allocator.free(value);
     if (message.tool_call_status) |value| allocator.free(value);
+}
+
+/// Decode one owned message from the shared transcript-column projection.
+fn decodeOwnedMessage(
+    allocator: std.mem.Allocator,
+    row: zqlite.Row,
+) daemon_store.StoreError!store_protocol.Message {
+    const message_id = allocator.dupe(u8, row.nullableText(1) orelse "") catch return error.OutOfMemory;
+    errdefer allocator.free(message_id);
+    const author_raw = row.text(3);
+    const role = allocator.dupe(u8, roleNameFromCode(row.int(2), author_raw)) catch return error.OutOfMemory;
+    errdefer allocator.free(role);
+    const author = allocator.dupe(u8, author_raw) catch return error.OutOfMemory;
+    errdefer allocator.free(author);
+    const body = allocator.dupe(u8, row.text(4)) catch return error.OutOfMemory;
+    errdefer allocator.free(body);
+    const images = try decodeOwnedAttachmentList(
+        allocator,
+        row.nullableText(5),
+        row.nullableText(6),
+        row.nullableInt(7),
+        row.nullableText(8),
+    );
+    errdefer freeAttachmentArray(allocator, images);
+    const tool_call_id = dupeOptionalText(allocator, row.nullableText(11)) catch return error.OutOfMemory;
+    errdefer if (tool_call_id) |value| allocator.free(value);
+    const tool_call_kind = if (row.nullableInt(12)) |code|
+        (allocator.dupe(u8, toolCallKindNameFromCode(code)) catch return error.OutOfMemory)
+    else
+        null;
+    errdefer if (tool_call_kind) |value| allocator.free(value);
+    const tool_call_status = if (row.nullableInt(13)) |code|
+        (allocator.dupe(u8, toolCallStatusNameFromCode(code)) catch return error.OutOfMemory)
+    else
+        null;
+    errdefer if (tool_call_status) |value| allocator.free(value);
+    return .{
+        .sort_index = std.math.cast(usize, row.int(0)) orelse return error.StoreCorrupt,
+        .message_id = message_id,
+        .role = role,
+        .author = author,
+        .body = body,
+        .images = images,
+        .image = if (images.len > 0) images[0] else null,
+        .created_at_ms = row.nullableInt(9),
+        .updated_at_ms = row.nullableInt(10),
+        .tool_call_id = tool_call_id,
+        .tool_call_kind = tool_call_kind,
+        .tool_call_status = tool_call_status,
+    };
 }
 
 /// Decode one owned chat.thread.get attachment list. Unlike snapshot reads,
@@ -7833,13 +9762,197 @@ fn decodeOwnedAttachmentList(
     return attachments.toOwnedSlice(allocator) catch return error.OutOfMemory;
 }
 
+fn boundedPageLimit(requested: u32) daemon_store.StoreError!u32 {
+    const limit = if (requested == 0) store_protocol.DEFAULT_PAGE_ITEMS else requested;
+    if (limit > store_protocol.MAX_PAGE_ITEMS) return error.InvalidParams;
+    return limit;
+}
+
+fn decodePageCursor(
+    cursor: ?[]const u8,
+    kind: headless.pagination.Kind,
+    store_revision: u64,
+    query_scope: []const u8,
+) daemon_store.StoreError!usize {
+    return headless.pagination.decode(cursor, kind, store_revision, query_scope) catch |err| switch (err) {
+        error.InvalidCursor => error.PageCursorInvalid,
+        error.StaleCursor => error.PageCursorStale,
+        error.QueryMismatch => error.PageCursorMismatch,
+    };
+}
+
+fn encodePageCursor(
+    allocator: std.mem.Allocator,
+    kind: headless.pagination.Kind,
+    store_revision: u64,
+    query_scope: []const u8,
+    offset: usize,
+) daemon_store.StoreError![]u8 {
+    return headless.pagination.encodeAlloc(
+        allocator,
+        kind,
+        store_revision,
+        query_scope,
+        offset,
+    ) catch return error.OutOfMemory;
+}
+
+fn workspacePageScope(include_archived: bool) []const u8 {
+    return if (include_archived) "all" else "active";
+}
+
+fn decodeMessageIndex(cursor: ?[]const u8, prefix: u8) daemon_store.StoreError!usize {
+    const value = cursor orelse return 0;
+    if (value.len < 3 or value[0] != prefix or value[1] != ':') return error.InvalidParams;
+    for (value[2..]) |char| {
+        if (char < '0' or char > '9') return error.InvalidParams;
+    }
+    return std.fmt.parseInt(usize, value[2..], 10) catch return error.InvalidParams;
+}
+
+fn encodeMessageIndex(
+    allocator: std.mem.Allocator,
+    prefix: u8,
+    index: usize,
+) daemon_store.StoreError![]u8 {
+    return std.fmt.allocPrint(allocator, "{c}:{d}", .{ prefix, index }) catch return error.OutOfMemory;
+}
+
+fn makePrimaryRepository(
+    allocator: std.mem.Allocator,
+    runtime_id: []const u8,
+    root_path: []const u8,
+) daemon_store.StoreError!store_protocol.Repository {
+    const repository_id = allocator.dupe(u8, store_protocol.PRIMARY_REPOSITORY_ID) catch return error.OutOfMemory;
+    errdefer allocator.free(repository_id);
+    const label = allocator.dupe(u8, "Primary") catch return error.OutOfMemory;
+    errdefer allocator.free(label);
+    const binding_runtime_id = allocator.dupe(u8, runtime_id) catch return error.OutOfMemory;
+    errdefer allocator.free(binding_runtime_id);
+    const binding_root_path = allocator.dupe(u8, root_path) catch return error.OutOfMemory;
+    errdefer allocator.free(binding_root_path);
+    const bindings = allocator.alloc(store_protocol.RepositoryBinding, 1) catch return error.OutOfMemory;
+    bindings[0] = .{
+        .runtime_id = binding_runtime_id,
+        .root_path = binding_root_path,
+    };
+    return .{
+        .repository_id = repository_id,
+        .label = label,
+        .bindings = bindings,
+    };
+}
+
+fn freeRepository(allocator: std.mem.Allocator, repository: store_protocol.Repository) void {
+    allocator.free(repository.repository_id);
+    allocator.free(repository.label);
+    if (repository.vcs_identity) |value| allocator.free(value);
+    if (repository.default_branch) |value| allocator.free(value);
+    for (repository.bindings) |binding| {
+        allocator.free(binding.runtime_id);
+        allocator.free(binding.root_path);
+    }
+    if (repository.bindings.len > 0) allocator.free(repository.bindings);
+}
+
+fn freeWorkspaceListItem(allocator: std.mem.Allocator, item: store_protocol.WorkspaceListItem) void {
+    allocator.free(item.workspace_id);
+    allocator.free(item.label);
+    allocator.free(item.path);
+    for (item.repositories) |repository| freeRepository(allocator, repository);
+    if (item.repositories.len > 0) allocator.free(item.repositories);
+}
+
+fn loadWorkspaceListResult(
+    allocator: std.mem.Allocator,
+    store: *daemon_store.Store,
+    runtime_id: []const u8,
+    request: store_protocol.WorkspaceListRequest,
+) daemon_store.StoreError!store_protocol.WorkspaceListResult {
+    const limit = try boundedPageLimit(request.limit);
+    const store_revision = store.storeRevision() catch return error.StoreUnavailable;
+    const query_scope = workspacePageScope(request.include_archived);
+    const offset = try decodePageCursor(request.cursor, .workspace, store_revision, query_scope);
+    const offset_i64 = std.math.cast(i64, offset) orelse return error.InvalidParams;
+    const fetch_limit: i64 = @intCast(limit + 1);
+
+    var items: std.ArrayListUnmanaged(store_protocol.WorkspaceListItem) = .empty;
+    errdefer {
+        for (items.items) |item| freeWorkspaceListItem(allocator, item);
+        items.deinit(allocator);
+    }
+    var rows = store.conn.rows(
+        \\select workspace_id, label, path, sort_index, archived
+        \\from workspaces
+        \\where (?1 != 0 or archived = 0)
+        \\order by sort_index asc, workspace_id asc
+        \\limit ?2 offset ?3
+    , .{ @as(i64, @intFromBool(request.include_archived)), fetch_limit, offset_i64 }) catch return error.StoreUnavailable;
+    defer rows.deinit();
+    while (rows.next()) |row| {
+        const workspace_id = allocator.dupe(u8, row.text(0)) catch return error.OutOfMemory;
+        errdefer allocator.free(workspace_id);
+        const label = allocator.dupe(u8, row.text(1)) catch return error.OutOfMemory;
+        errdefer allocator.free(label);
+        const path = allocator.dupe(u8, row.text(2)) catch return error.OutOfMemory;
+        errdefer allocator.free(path);
+        const repository = try makePrimaryRepository(allocator, runtime_id, row.text(2));
+        errdefer freeRepository(allocator, repository);
+        const repositories = allocator.alloc(store_protocol.Repository, 1) catch return error.OutOfMemory;
+        repositories[0] = repository;
+        errdefer allocator.free(repositories);
+        items.append(allocator, .{
+            .workspace_id = workspace_id,
+            .label = label,
+            .path = path,
+            .sort_index = std.math.cast(usize, row.int(3)) orelse return error.StoreCorrupt,
+            .archived = row.int(4) != 0,
+            .repositories = repositories,
+        }) catch return error.OutOfMemory;
+    }
+    if (rows.err) |_| return error.StoreUnavailable;
+
+    const has_more = items.items.len > @as(usize, limit);
+    if (has_more) {
+        const extra_index = items.items.len - 1;
+        freeWorkspaceListItem(allocator, items.items[extra_index]);
+        items.items.len = extra_index;
+    }
+    const next_cursor = if (has_more) blk: {
+        const next_offset = std.math.add(usize, offset, items.items.len) catch return error.InvalidParams;
+        break :blk try encodePageCursor(
+            allocator,
+            .workspace,
+            store_revision,
+            query_scope,
+            next_offset,
+        );
+    } else null;
+    errdefer if (next_cursor) |value| allocator.free(value);
+    return .{
+        .workspaces = items.toOwnedSlice(allocator) catch return error.OutOfMemory,
+        .next_cursor = next_cursor,
+        .store_revision = store_revision,
+    };
+}
+
+fn freeWorkspaceListResult(allocator: std.mem.Allocator, result: store_protocol.WorkspaceListResult) void {
+    for (result.workspaces) |item| freeWorkspaceListItem(allocator, item);
+    allocator.free(result.workspaces);
+    if (result.next_cursor) |value| allocator.free(value);
+}
+
 fn loadThreadListResult(
     allocator: std.mem.Allocator,
     store: *daemon_store.Store,
     request: store_protocol.ThreadListRequest,
 ) daemon_store.StoreError!store_protocol.ThreadListResult {
     if (request.workspace_id.len == 0) return error.InvalidParams;
-    const limit: u32 = if (request.limit == 0) 100 else request.limit;
+    const limit = try boundedPageLimit(request.limit);
+    const store_revision = store.storeRevision() catch return error.StoreUnavailable;
+    const offset = try decodePageCursor(request.cursor, .thread, store_revision, request.workspace_id);
+    const offset_i64 = std.math.cast(i64, offset) orelse return error.InvalidParams;
+    const fetch_limit: i64 = @intCast(limit + 1);
 
     var items: std.ArrayListUnmanaged(store_protocol.ThreadListItem) = .empty;
     errdefer {
@@ -7850,14 +9963,15 @@ fn loadThreadListResult(
     var rows = store.conn.rows(
         \\select t.local_thread_id, t.title, t.archived, t.committed, t.last_activity_at,
         \\       t.provider_thread_id, t.model_ref, t.reasoning_effort, t.reasoning_variant,
-        \\       t.fast_mode, t.access_mode, t.provider, t.harness, t.sort_index, t.cwd
+        \\       t.fast_mode, t.access_mode, t.provider, t.harness, t.sort_index, t.cwd,
+        \\       t.profile_id, t.runtime_id, t.repository_id, t.repository_cwd
         \\from threads t
         \\join workspaces w on w.id = t.workspace_id
         \\where w.workspace_id = ?1
-        \\order by coalesce(t.last_activity_at, 0) desc, t.local_thread_id asc
-        \\limit ?2
+        \\order by t.sort_index asc, t.local_thread_id asc
+        \\limit ?2 offset ?3
     ,
-        .{ request.workspace_id, @as(i64, @intCast(limit)) },
+        .{ request.workspace_id, fetch_limit, offset_i64 },
     ) catch return error.StoreUnavailable;
     defer rows.deinit();
     while (rows.next()) |row| {
@@ -7877,6 +9991,14 @@ fn loadThreadListResult(
         errdefer allocator.free(harness_name);
         const cwd = dupeOptionalText(allocator, row.nullableText(14)) catch return error.OutOfMemory;
         errdefer if (cwd) |value| allocator.free(value);
+        const profile_id = dupeOptionalText(allocator, row.nullableText(15)) catch return error.OutOfMemory;
+        errdefer if (profile_id) |value| allocator.free(value);
+        const runtime_id = dupeOptionalText(allocator, row.nullableText(16)) catch return error.OutOfMemory;
+        errdefer if (runtime_id) |value| allocator.free(value);
+        const repository_id = dupeOptionalText(allocator, row.nullableText(17)) catch return error.OutOfMemory;
+        errdefer if (repository_id) |value| allocator.free(value);
+        const repository_cwd = dupeOptionalText(allocator, row.nullableText(18)) catch return error.OutOfMemory;
+        errdefer if (repository_cwd) |value| allocator.free(value);
         items.append(allocator, .{
             .local_thread_id = local_thread_id,
             .title = title,
@@ -7893,14 +10015,34 @@ fn loadThreadListResult(
             .provider = provider,
             .harness = harness_name,
             .cwd = cwd,
+            .profile_id = profile_id,
+            .runtime_id = runtime_id,
+            .repository_id = repository_id,
+            .repository_cwd = repository_cwd,
         }) catch return error.OutOfMemory;
     }
     if (rows.err) |_| return error.StoreUnavailable;
 
-    const store_revision = store.storeRevision() catch return error.StoreUnavailable;
+    const has_more = items.items.len > @as(usize, limit);
+    if (has_more) {
+        const extra_index = items.items.len - 1;
+        freeThreadListItem(allocator, items.items[extra_index]);
+        items.items.len = extra_index;
+    }
+    const next_cursor = if (has_more) blk: {
+        const next_offset = std.math.add(usize, offset, items.items.len) catch return error.InvalidParams;
+        break :blk try encodePageCursor(
+            allocator,
+            .thread,
+            store_revision,
+            request.workspace_id,
+            next_offset,
+        );
+    } else null;
+    errdefer if (next_cursor) |value| allocator.free(value);
     return .{
         .threads = try items.toOwnedSlice(allocator),
-        .next_cursor = null,
+        .next_cursor = next_cursor,
         .store_revision = store_revision,
     };
 }
@@ -7920,6 +10062,100 @@ fn freeThreadListItem(allocator: std.mem.Allocator, item: store_protocol.ThreadL
     allocator.free(item.provider);
     allocator.free(item.harness);
     if (item.cwd) |value| allocator.free(value);
+    if (item.profile_id) |value| allocator.free(value);
+    if (item.runtime_id) |value| allocator.free(value);
+    if (item.repository_id) |value| allocator.free(value);
+    if (item.repository_cwd) |value| allocator.free(value);
+}
+
+fn loadMessageListResult(
+    allocator: std.mem.Allocator,
+    store: *daemon_store.Store,
+    request: store_protocol.MessageListRequest,
+) daemon_store.StoreError!store_protocol.MessageListResult {
+    if (request.workspace_id.len == 0 or request.local_thread_id.len == 0) return error.InvalidParams;
+    const is_backward = std.mem.eql(u8, request.direction, "backward");
+    const is_forward = std.mem.eql(u8, request.direction, "forward");
+    if (!is_backward and !is_forward) return error.InvalidParams;
+    const limit = try boundedPageLimit(request.limit);
+    const cursor_index = try decodeMessageIndex(request.cursor, if (is_backward) 'b' else 'f');
+    const boundary: i64 = if (request.cursor) |_|
+        (std.math.cast(i64, cursor_index) orelse return error.InvalidParams)
+    else if (is_backward)
+        std.math.maxInt(i64)
+    else
+        -1;
+    const fetch_limit: i64 = @intCast(limit + 1);
+
+    const thread_row = (store.conn.row(
+        \\select t.id
+        \\from threads t join workspaces w on w.id = t.workspace_id
+        \\where w.workspace_id = ?1 and t.local_thread_id = ?2
+    , .{ request.workspace_id, request.local_thread_id }) catch return error.StoreUnavailable) orelse
+        return error.ResourceNotFound;
+    const thread_row_id = thread_row.int(0);
+    thread_row.deinit();
+
+    var messages: std.ArrayListUnmanaged(store_protocol.Message) = .empty;
+    errdefer {
+        for (messages.items) |message| freeOwnedMessage(allocator, message);
+        messages.deinit(allocator);
+    }
+    var rows = (if (is_backward)
+        store.conn.rows(
+            \\select sort_index, message_id, role, author, body, image_path, image_mime,
+            \\       image_byte_size, extra_images_json, created_at_ms, updated_at_ms,
+            \\       tool_call_id, tool_call_kind, tool_call_status
+            \\from messages
+            \\where thread_id = ?1 and sort_index < ?2
+            \\order by sort_index desc
+            \\limit ?3
+        , .{ thread_row_id, boundary, fetch_limit })
+    else
+        store.conn.rows(
+            \\select sort_index, message_id, role, author, body, image_path, image_mime,
+            \\       image_byte_size, extra_images_json, created_at_ms, updated_at_ms,
+            \\       tool_call_id, tool_call_kind, tool_call_status
+            \\from messages
+            \\where thread_id = ?1 and sort_index > ?2
+            \\order by sort_index asc
+            \\limit ?3
+        , .{ thread_row_id, boundary, fetch_limit })) catch return error.StoreUnavailable;
+    defer rows.deinit();
+    while (rows.next()) |row| {
+        const message = try decodeOwnedMessage(allocator, row);
+        errdefer freeOwnedMessage(allocator, message);
+        messages.append(allocator, message) catch return error.OutOfMemory;
+    }
+    if (rows.err) |_| return error.StoreUnavailable;
+
+    const has_more = messages.items.len > @as(usize, limit);
+    if (has_more) {
+        const extra_index = messages.items.len - 1;
+        freeOwnedMessage(allocator, messages.items[extra_index]);
+        messages.items.len = extra_index;
+    }
+    if (is_backward) std.mem.reverse(store_protocol.Message, messages.items);
+    const next_cursor = if (has_more) blk: {
+        const next_index = if (is_backward)
+            messages.items[0].sort_index
+        else
+            messages.items[messages.items.len - 1].sort_index;
+        break :blk try encodeMessageIndex(allocator, if (is_backward) 'b' else 'f', next_index);
+    } else null;
+    errdefer if (next_cursor) |value| allocator.free(value);
+    const store_revision = store.storeRevision() catch return error.StoreUnavailable;
+    return .{
+        .messages = messages.toOwnedSlice(allocator) catch return error.OutOfMemory,
+        .next_cursor = next_cursor,
+        .store_revision = store_revision,
+    };
+}
+
+fn freeMessageListResult(allocator: std.mem.Allocator, result: store_protocol.MessageListResult) void {
+    for (result.messages) |message| freeOwnedMessage(allocator, message);
+    allocator.free(result.messages);
+    if (result.next_cursor) |value| allocator.free(value);
 }
 
 fn dupeOptionalText(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
@@ -8183,6 +10419,8 @@ fn serializeTurnsFragment(arena: std.mem.Allocator, daemon: *Daemon, workspace_f
         if (turn.provider_thread_id) |value| try s.write(value) else try s.write(null);
         try s.objectField("error_message");
         if (turn.error_message) |value| try s.write(value) else try s.write(null);
+        try s.objectField("failure_reason");
+        if (turn.failure_reason) |value| try s.write(@tagName(value)) else try s.write(null);
         try s.objectField("user_message_id");
         if (turn.user_message_id) |value| try s.write(value) else try s.write(null);
         try s.objectField("committed_store_revision");
@@ -8505,7 +10743,8 @@ fn loadSnapshotContents(
                 \\select id, local_thread_id, title, archived, committed, last_activity_at,
                 \\       provider_thread_id, model_ref, reasoning_effort, reasoning_variant,
                 \\       fast_mode, access_mode, provider, harness, tui_dock_id, draft,
-                \\       draft_image_path, draft_image_mime, draft_image_byte_size, draft_images_json, cwd
+                \\       draft_image_path, draft_image_mime, draft_image_byte_size, draft_images_json, cwd,
+                \\       profile_id, runtime_id, repository_id, repository_cwd
                 \\from threads where workspace_id = ?1 order by sort_index
             , .{workspace_row.row_id}) catch return error.StoreUnavailable;
             defer rows.deinit();
@@ -8537,6 +10776,10 @@ fn loadSnapshotContents(
                         .draft_image = draft_image,
                         .draft_images = draft_images,
                         .cwd = dupeOptionalText(arena, row.nullableText(20)) catch return error.OutOfMemory,
+                        .profile_id = dupeOptionalText(arena, row.nullableText(21)) catch return error.OutOfMemory,
+                        .runtime_id = dupeOptionalText(arena, row.nullableText(22)) catch return error.OutOfMemory,
+                        .repository_id = dupeOptionalText(arena, row.nullableText(23)) catch return error.OutOfMemory,
+                        .repository_cwd = dupeOptionalText(arena, row.nullableText(24)) catch return error.OutOfMemory,
                     },
                 }) catch return error.OutOfMemory;
             }
@@ -8549,7 +10792,7 @@ fn loadSnapshotContents(
             var rows = store.conn.rows(
                 \\select message_id, role, author, body, image_path, image_mime,
                 \\       image_byte_size, tool_call_id, tool_call_kind, tool_call_status,
-                \\       created_at_ms, updated_at_ms, extra_images_json
+                \\       created_at_ms, updated_at_ms, extra_images_json, sort_index
                 \\from messages where thread_id = ?1 order by sort_index
             , .{thread_row.row_id}) catch return error.StoreUnavailable;
             defer rows.deinit();
@@ -8561,6 +10804,7 @@ fn loadSnapshotContents(
                 } else null;
                 const images = try decodeAttachmentList(arena, image, row.nullableText(12));
                 messages.append(arena, .{
+                    .sort_index = std.math.cast(usize, row.int(13)) orelse return error.StoreCorrupt,
                     .message_id = arena.dupe(u8, row.nullableText(0) orelse "") catch return error.OutOfMemory,
                     .role = roleNameFromCode(row.int(1), row.text(2)),
                     .author = arena.dupe(u8, row.text(2)) catch return error.OutOfMemory,
@@ -8658,12 +10902,405 @@ fn storeErrorResponse(
         error.CapabilityUnavailable => .{ .code = headless.protocol.ERR_CAPABILITY_UNAVAILABLE, .message = "store capability is unavailable" },
         error.StoreBusy => .{ .code = headless.protocol.ERR_STORE_BUSY, .message = "store is busy" },
         error.SchemaTooNew => .{ .code = headless.protocol.ERR_SCHEMA_TOO_NEW, .message = "database schema is newer than this daemon" },
-        error.StoreCorrupt => .{ .code = headless.protocol.ERR_STORE_CORRUPT, .message = "store is corrupt" },
+        error.StoreCorrupt,
+        error.RuntimeIdentityMismatch,
+        error.InvalidRuntimeIdentity,
+        => .{ .code = headless.protocol.ERR_STORE_CORRUPT, .message = "store is corrupt" },
         error.StoreUnavailable => .{ .code = headless.protocol.ERR_STORE_UNAVAILABLE, .message = "store is unavailable" },
+        error.PageCursorInvalid => .{
+            .code = headless.protocol.ERR_INVALID_PARAMS,
+            .message = "invalid page cursor; restart pagination without a cursor",
+        },
+        error.PageCursorStale => .{
+            .code = headless.protocol.ERR_REVISION_EXPIRED,
+            .message = "page cursor is stale; restart pagination without a cursor",
+        },
+        error.PageCursorMismatch => .{
+            .code = headless.protocol.ERR_INVALID_PARAMS,
+            .message = "page cursor does not match this query; restart pagination without a cursor",
+        },
         error.Internal => .{ .code = headless.protocol.ERR_INTERNAL, .message = "internal store error" },
         error.OutOfMemory => return error.OutOfMemory,
     };
     return try errorResponseAllocWithData(allocator, id_value, mapped.code, mapped.message, null);
+}
+
+fn decodeAccessRequest(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    params: std.json.Value,
+) !AccessRequest {
+    if (std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_GRANT_CREATE)) {
+        return .{ .pairing_create = try std.json.parseFromValueLeaky(
+            access_protocol.PairingGrantCreateRequest,
+            allocator,
+            params,
+            .{},
+        ) };
+    }
+    if (std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_GRANT_LIST)) {
+        return .{ .pairing_list = try std.json.parseFromValueLeaky(
+            access_protocol.PairingGrantListRequest,
+            allocator,
+            params,
+            .{},
+        ) };
+    }
+    if (std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_GRANT_REVOKE)) {
+        return .{ .pairing_revoke = try std.json.parseFromValueLeaky(
+            access_protocol.PairingGrantRevokeRequest,
+            allocator,
+            params,
+            .{},
+        ) };
+    }
+    if (std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_DEVICE_LIST)) {
+        return .{ .device_list = try std.json.parseFromValueLeaky(
+            access_protocol.DeviceListRequest,
+            allocator,
+            params,
+            .{},
+        ) };
+    }
+    if (std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_DEVICE_REVOKE)) {
+        return .{ .device_revoke = try std.json.parseFromValueLeaky(
+            access_protocol.DeviceRevokeRequest,
+            allocator,
+            params,
+            .{},
+        ) };
+    }
+    if (std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_EXCHANGE)) {
+        return .{ .pairing_exchange = try std.json.parseFromValueLeaky(
+            access_protocol.PairingGrantExchangeRequest,
+            allocator,
+            params,
+            .{},
+        ) };
+    }
+    if (std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_DEVICE_AUTHENTICATE)) {
+        return .{ .device_authenticate = try std.json.parseFromValueLeaky(
+            access_protocol.DeviceAuthenticateRequest,
+            allocator,
+            params,
+            .{},
+        ) };
+    }
+    if (std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_DEVICE_AUTHORIZE)) {
+        return .{ .device_authorize = try std.json.parseFromValueLeaky(
+            access_protocol.DeviceAuthorizeRequest,
+            allocator,
+            params,
+            .{},
+        ) };
+    }
+    return error.UnknownAccessMethod;
+}
+
+fn decodeConnectRequest(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    params: std.json.Value,
+) !ConnectRequest {
+    if (std.mem.eql(u8, method, connect_protocol.METHOD_LOGIN)) {
+        return .{ .login = try std.json.parseFromValueLeaky(
+            connect_protocol.LoginRequest,
+            allocator,
+            params,
+            .{},
+        ) };
+    }
+    if (std.mem.eql(u8, method, connect_protocol.METHOD_LINK)) {
+        return .{ .link = try std.json.parseFromValueLeaky(
+            connect_protocol.LinkRequest,
+            allocator,
+            params,
+            .{},
+        ) };
+    }
+    if (std.mem.eql(u8, method, connect_protocol.METHOD_STATUS)) {
+        return .{ .status = try std.json.parseFromValueLeaky(
+            connect_protocol.StatusRequest,
+            allocator,
+            params,
+            .{},
+        ) };
+    }
+    if (std.mem.eql(u8, method, connect_protocol.METHOD_UNLINK)) {
+        return .{ .unlink = try std.json.parseFromValueLeaky(
+            connect_protocol.UnlinkRequest,
+            allocator,
+            params,
+            .{},
+        ) };
+    }
+    if (std.mem.eql(u8, method, connect_protocol.METHOD_LOGOUT)) {
+        return .{ .logout = try std.json.parseFromValueLeaky(
+            connect_protocol.LogoutRequest,
+            allocator,
+            params,
+            .{},
+        ) };
+    }
+    if (std.mem.eql(u8, method, connect_protocol.METHOD_BOOTSTRAP_CONSUME)) {
+        return .{ .bootstrap_consume = try std.json.parseFromValueLeaky(
+            connect_protocol.BootstrapConsumeRequest,
+            allocator,
+            params,
+            .{},
+        ) };
+    }
+    return error.UnknownConnectMethod;
+}
+
+fn eraseAccessSecretParams(method: []const u8, params: std.json.Value) void {
+    if (params != .object) return;
+    const field = if (std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_EXCHANGE))
+        "pairing_token"
+    else if (std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_DEVICE_AUTHENTICATE))
+        "device_credential"
+    else
+        return;
+    const value = params.object.get(field) orelse return;
+    if (value == .string) std.crypto.secureZero(u8, @constCast(value.string));
+}
+
+fn eraseConnectSecretParams(method: []const u8, params: std.json.Value) void {
+    if (!std.mem.eql(u8, method, connect_protocol.METHOD_BOOTSTRAP_CONSUME) or params != .object) return;
+    const value = params.object.get("grant_jwt") orelse return;
+    if (value == .string) std.crypto.secureZero(u8, @constCast(value.string));
+}
+
+fn connectRetryDelayMs(runtime_id: []const u8, attempt: u16) i64 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(runtime_id, &digest, .{});
+    const exponent: u4 = @intCast(@min(attempt, 8));
+    const base: u64 = @min(@as(u64, 300_000), @as(u64, 1_000) << exponent);
+    var prng = std.Random.DefaultPrng.init(std.mem.readInt(u64, digest[0..8], .big) ^ @as(u64, attempt));
+    const jitter = prng.random().uintLessThan(u64, @max(@as(u64, 1), base / 4));
+    return @intCast(@min(@as(u64, 300_000), base + jitter));
+}
+
+fn connectErrorResponse(
+    allocator: std.mem.Allocator,
+    id_value: std.json.Value,
+    err: anyerror,
+) ![]u8 {
+    const mapped: struct { code: []const u8, message: []const u8 } = switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.IncompatibleConnectProtocol => .{
+            .code = headless.protocol.ERR_PROTOCOL_INCOMPATIBLE,
+            .message = "Connect protocol version is incompatible",
+        },
+        error.InvalidControlPlaneUrl,
+        error.InsecureControlPlaneUrl,
+        error.InvalidCredentialFile,
+        error.InsecureCredentialPermissions,
+        error.InvalidConnectCredential,
+        error.UnsupportedEndpointProvider,
+        error.ExternalDescriptorRequired,
+        error.InvalidConnectRequestId,
+        => .{ .code = headless.protocol.ERR_INVALID_PARAMS, .message = "invalid Connect parameters" },
+        error.ConnectLoginRequired,
+        error.ConnectLinkRequired,
+        error.ConnectAlreadyLinked,
+        => .{ .code = headless.protocol.ERR_INVALID_STATE, .message = "Connect lifecycle state does not allow this operation" },
+        error.ConnectAuthenticationRejected => .{ .code = "authentication_rejected", .message = "Connect credential was not accepted" },
+        error.ConnectConflict => .{ .code = headless.protocol.ERR_CONFLICT, .message = "Connect request conflicts with durable state" },
+        error.ConnectIdentityMismatch,
+        error.ConnectKeyIdentityMismatch,
+        error.LinkIdentityMismatch,
+        error.EnrollmentIdentityMismatch,
+        => .{ .code = headless.protocol.ERR_RUNTIME_IDENTITY_MISMATCH, .message = "Connect identity binding failed" },
+        error.ConnectBootstrapReplay,
+        error.BootstrapIdentityMismatch,
+        error.BootstrapGrantExpired,
+        error.UnknownBootstrapKey,
+        error.InvalidBootstrapSignature,
+        error.InvalidBootstrapGrant,
+        => .{ .code = "authentication_rejected", .message = "Connect bootstrap grant was not accepted" },
+        error.ConnectRateLimited => .{ .code = "rate_limited", .message = "Connect control plane rate limited the request" },
+        error.ConnectStateCorrupt,
+        error.ConnectStateMissing,
+        error.ConnectSignerUnavailable,
+        error.InvalidConnectKeyFile,
+        => .{ .code = headless.protocol.ERR_STORE_CORRUPT, .message = "Connect durable state is unavailable" },
+        error.ControlPlaneTimedOut,
+        error.ConnectUnavailable,
+        error.ControlPlaneResponseTooLarge,
+        error.ControlPlaneRedirectRejected,
+        error.InvalidConnectDiscovery,
+        error.InvalidSignerMetadata,
+        error.InvalidSignerJwks,
+        error.ConnectCapabilityMissing,
+        error.InvalidControlPlaneResponse,
+        => .{ .code = headless.protocol.ERR_CAPABILITY_UNAVAILABLE, .message = "Connect control plane is unavailable or incompatible" },
+        else => .{ .code = headless.protocol.ERR_CAPABILITY_UNAVAILABLE, .message = "Connect control plane is unavailable or incompatible" },
+    };
+    return try errorResponseAllocWithData(allocator, id_value, mapped.code, mapped.message, null);
+}
+
+fn accessAdminErrorResponse(
+    allocator: std.mem.Allocator,
+    id_value: std.json.Value,
+    err: anyerror,
+) ![]u8 {
+    const mapped: struct { code: []const u8, message: []const u8 } = switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.IncompatibleAccessProtocol => .{
+            .code = headless.protocol.ERR_PROTOCOL_INCOMPATIBLE,
+            .message = "access protocol version is incompatible",
+        },
+        error.UnknownAccessScope,
+        error.AccessScopesRequired,
+        error.TooManyAccessScopes,
+        error.DuplicateAccessScope,
+        error.InvalidPairingTtl,
+        error.DeviceLabelRequired,
+        error.DeviceLabelTooLong,
+        error.InvalidDeviceLabel,
+        error.InvalidGrantId,
+        error.InvalidDeviceId,
+        error.InvalidAccessSecret,
+        => .{
+            .code = headless.protocol.ERR_INVALID_PARAMS,
+            .message = "invalid access administration params",
+        },
+        error.TooManyActivePairingGrants,
+        error.PairingGrantRetentionLimitReached,
+        error.TooManyActiveDevices,
+        error.DeviceRetentionLimitReached,
+        => .{
+            .code = headless.protocol.ERR_CONFLICT,
+            .message = "active access record limit reached; revoke an active grant or device",
+        },
+        error.AccessStoreCorrupt => .{
+            .code = headless.protocol.ERR_STORE_CORRUPT,
+            .message = "access store is corrupt",
+        },
+        error.PairingGrantRejected,
+        error.DeviceAuthenticationRejected,
+        error.DeviceAuthorizationRejected,
+        => .{
+            .code = "authentication_rejected",
+            .message = "access credential was not accepted",
+        },
+        else => .{
+            .code = headless.protocol.ERR_STORE_UNAVAILABLE,
+            .message = "access store is unavailable",
+        },
+    };
+    return try errorResponseAllocWithData(allocator, id_value, mapped.code, mapped.message, null);
+}
+
+/// The only generic-daemon response path allowed to reveal a pairing token.
+/// Callers must clear the returned wire buffer after it has been written.
+fn pairingGrantCreateResponse(
+    allocator: std.mem.Allocator,
+    id_value: std.json.Value,
+    runtime_id: []const u8,
+    instance_id: []const u8,
+    issued: *const access_store.IssuedPairingGrant,
+    scope_names: []const []const u8,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer {
+        std.crypto.secureZero(u8, writer.written());
+        writer.deinit();
+    }
+    var json: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try beginOk(&json, id_value);
+    try json.objectField("result");
+    try json.beginObject();
+    try json.objectField("access_protocol_version");
+    try json.write(access_protocol.ACCESS_PROTOCOL_VERSION);
+    try json.objectField("runtime_id");
+    try json.write(runtime_id);
+    try json.objectField("instance_id");
+    try json.write(instance_id);
+    try json.objectField("grant_id");
+    try json.write(issued.grant_id[0..]);
+    try json.objectField("pairing_token");
+    try json.write(issued.pairing_token[0..]);
+    try json.objectField("expires_at_ms");
+    try json.write(issued.expires_at_ms);
+    try json.objectField("scopes");
+    try json.write(scope_names);
+    try json.endObject();
+    try json.endObject();
+    return try writer.toOwnedSlice();
+}
+
+/// The only daemon response path allowed to reveal a new device credential.
+/// IPC and gateway owners clear the returned wire buffer after writing it.
+fn pairingGrantExchangeResponse(
+    allocator: std.mem.Allocator,
+    id_value: std.json.Value,
+    runtime_id: []const u8,
+    instance_id: []const u8,
+    issued: *const access_store.IssuedDevice,
+    scope_names: []const []const u8,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer {
+        std.crypto.secureZero(u8, writer.written());
+        writer.deinit();
+    }
+    var json: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try beginOk(&json, id_value);
+    try json.objectField("result");
+    try json.beginObject();
+    try json.objectField("access_protocol_version");
+    try json.write(access_protocol.ACCESS_PROTOCOL_VERSION);
+    try json.objectField("runtime_id");
+    try json.write(runtime_id);
+    try json.objectField("instance_id");
+    try json.write(instance_id);
+    try json.objectField("device_id");
+    try json.write(issued.device_id[0..]);
+    try json.objectField("device_credential");
+    try json.write(issued.device_credential[0..]);
+    try json.objectField("scopes");
+    try json.write(scope_names);
+    try json.endObject();
+    try json.endObject();
+    return try writer.toOwnedSlice();
+}
+
+/// The only daemon response path allowed to reveal a Connect-issued local
+/// device credential. The gateway clears the returned IPC buffer.
+fn connectBootstrapResponse(
+    allocator: std.mem.Allocator,
+    id_value: std.json.Value,
+    runtime_id: []const u8,
+    instance_id: []const u8,
+    issued: *const access_store.IssuedDevice,
+    scope_names: []const []const u8,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer {
+        std.crypto.secureZero(u8, writer.written());
+        writer.deinit();
+    }
+    var json: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try beginOk(&json, id_value);
+    try json.objectField("result");
+    try json.beginObject();
+    try json.objectField("connect_protocol_version");
+    try json.write(connect_protocol.CONNECT_PROTOCOL_VERSION);
+    try json.objectField("runtime_id");
+    try json.write(runtime_id);
+    try json.objectField("instance_id");
+    try json.write(instance_id);
+    try json.objectField("device_id");
+    try json.write(issued.device_id[0..]);
+    try json.objectField("device_credential");
+    try json.write(issued.device_credential[0..]);
+    try json.objectField("scopes");
+    try json.write(scope_names);
+    try json.endObject();
+    try json.endObject();
+    return try writer.toOwnedSlice();
 }
 
 /// Single serve-path classification (one JSON parse). Fold W5 slow-work and
@@ -8679,14 +11316,41 @@ fn methodRunsUnlocked(method: []const u8) bool {
         std.mem.eql(u8, method, "chat.turn.tail") or
         std.mem.eql(u8, method, "chat.turn.steer") or
         std.mem.eql(u8, method, "chat.followup") or
-        // Read-only provider discovery can block for seconds on provider
-        // CLIs/servers; it touches no daemon state, so never hold lockDaemon.
+        // Attachment staging performs file I/O and owns its own short
+        // lockDaemon windows via per-record busy flags.
+        std.mem.eql(u8, method, headless.attachment_protocol.METHOD_CHAT_ATTACHMENT_CREATE) or
+        std.mem.eql(u8, method, headless.attachment_protocol.METHOD_CHAT_ATTACHMENT_APPEND) or
+        std.mem.eql(u8, method, headless.attachment_protocol.METHOD_CHAT_ATTACHMENT_COMMIT) or
+        // Read-only provider discovery performs bounded PATH lookups and
+        // touches no daemon state, so never hold lockDaemon around filesystem I/O.
         std.mem.eql(u8, method, "provider.models.list") or
+        std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDERS_STATUS) or
+        // Local access administration is daemon-owned SQLite work and takes
+        // only its own short lockDaemon bookkeeping window.
+        isAccessMethod(method) or
+        // Connect owns bounded filesystem/network work and takes the SQLite
+        // mutex only for its short durable transitions.
+        isConnectMethod(method) or
         // FX lifecycle persistence uses the store spine and owns its short
         // lockDaemon window, like the other unlocked mutation paths.
         isFxLifecycleMethod(method) or
         // Shared config writes have their own leaf lock and filesystem I/O.
         std.mem.eql(u8, method, store_protocol.METHOD_CONFIG_FAVORITE_MODEL_SET);
+}
+
+fn isAccessMethod(method: []const u8) bool {
+    return std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_GRANT_CREATE) or
+        std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_GRANT_LIST) or
+        std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_GRANT_REVOKE) or
+        std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_DEVICE_LIST) or
+        std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_DEVICE_REVOKE) or
+        std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_EXCHANGE) or
+        std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_DEVICE_AUTHENTICATE) or
+        std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_DEVICE_AUTHORIZE);
+}
+
+fn isConnectMethod(method: []const u8) bool {
+    return connect_protocol.isMethod(method);
 }
 
 fn isFxLifecycleMethod(method: []const u8) bool {
@@ -8828,7 +11492,10 @@ fn retentionExpiredForDaemon(start_ms: i64, now_ms: i64, retention_ms: i64) bool
 fn handleSessionizerServerRequest(raw_context: *anyopaque, request: []u8) anyerror![]u8 {
     const context: *SessionizerServerContext = @ptrCast(@alignCast(raw_context));
     const daemon = context.daemon;
-    defer daemon.allocator.free(request);
+    defer {
+        std.crypto.secureZero(u8, request);
+        daemon.allocator.free(request);
+    }
     const trimmed = std.mem.trim(u8, request, "\r");
 
     // One envelope parse outside lockDaemon classifies W5 slow-work vs store vs
@@ -8920,6 +11587,10 @@ fn drainSessionsThread(context: DrainThreadContext) void {
         daemon.reapOrphanedSessions(now_ms);
         const should_exit = daemon.shouldExitForIdle();
         daemon.mutex.unlock();
+        // Staged-attachment TTL sweep: file deletion must never run under
+        // lockDaemon, so it lives outside the locked bookkeeping above and
+        // rate-limits itself with a due timestamp instead of every 20ms tick.
+        _ = daemon.maybeSweepStagedChatAttachments(now_ms);
         if (should_exit) {
             context.stop_requested.store(true, .release);
             platform_ipc.wake(daemon.allocator, context.endpoint, .{
@@ -9598,6 +12269,10 @@ fn writeChatTurnTail(
     if (!has_more_events) {
         if (turn.error_message) |value| try s.write(value) else try s.write(null);
     } else try s.write(null);
+    try s.objectField("failure_reason");
+    if (!has_more_events) {
+        if (turn.failure_reason) |value| try s.write(@tagName(value)) else try s.write(null);
+    } else try s.write(null);
     try s.objectField("pending_approval");
     try writePendingApproval(s, turn.pending_approval);
     // M4 durable-commit publication: present only after the store receipt.
@@ -9614,6 +12289,10 @@ fn writeChatTurnTail(
 }
 
 fn durableTurnRecordIsTerminal(record: store_protocol.TurnRecord) bool {
+    // Startup interruption is itself the durable terminal publication. The
+    // accepted/running row predates a worker commit, so it intentionally has
+    // no committed_store_revision; requiring one makes the swept row vanish.
+    if (std.mem.eql(u8, record.status, "interrupted")) return true;
     if (record.committed_store_revision == null) return false;
     return std.mem.eql(u8, record.status, "completed") or
         std.mem.eql(u8, record.status, "failed") or
@@ -9663,10 +12342,12 @@ fn durableChatTurnTailResponse(
     try s.write(null);
     try s.objectField("error_message");
     if (record.error_message) |value| try s.write(value) else try s.write(null);
+    try s.objectField("failure_reason");
+    if (record.failure_reason) |value| try s.write(@tagName(value)) else try s.write(null);
     try s.objectField("pending_approval");
     try s.write(null);
     try s.objectField("committed_store_revision");
-    try s.write(record.committed_store_revision.?);
+    if (record.committed_store_revision) |value| try s.write(value) else try s.write(null);
     try s.objectField("events_compacted_before_seq");
     try s.write(null);
     try s.objectField("durability_pending");
@@ -9876,35 +12557,944 @@ test "turn images param and stored extra-image columns round-trip full lists" {
     try std.testing.expectEqual(@as(usize, 0), no_primary.len);
 }
 
-fn createChatTurnFromParams(allocator: std.mem.Allocator, params: std.json.Value) !*ChatTurn {
+const ChatExecutionRoute = struct {
+    project_path: []u8,
+    cwd: ?[]u8,
+    repository_id: []u8,
+    relative_cwd: ?[]u8,
+
+    fn deinit(self: *ChatExecutionRoute, allocator: std.mem.Allocator) void {
+        allocator.free(self.project_path);
+        if (self.cwd) |value| allocator.free(value);
+        allocator.free(self.repository_id);
+        if (self.relative_cwd) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
+const ChatExecutionRouteError = error{
+    InvalidParams,
+    RouteAttachmentsUnsupported,
+    CapabilityUnavailable,
+    ResourceNotFound,
+    StoreCorrupt,
+    StoreUnavailable,
+    OutOfMemory,
+};
+
+/// Resolve a client-controlled stable repository identity to this daemon's
+/// exact runtime-local checkout. Route-mode callers cannot supply absolute
+/// execution paths; legacy local callers retain their existing contract.
+fn resolveChatExecutionRoute(
+    daemon: *Daemon,
+    params: std.json.Value,
+) ChatExecutionRouteError!?ChatExecutionRoute {
+    if (params != .object) return error.InvalidParams;
+    const repository_value = params.object.get("repository_id") orelse {
+        if (params.object.get("relative_cwd") != null) return error.InvalidParams;
+        return null;
+    };
+    const repository_id = jsonString(repository_value) orelse return error.InvalidParams;
+    if (params.object.get("project_path") != null or params.object.get("cwd") != null) {
+        return error.InvalidParams;
+    }
+    if (try jsonArrayHasItems(params.object.get("image_paths")) or
+        try jsonArrayHasItems(params.object.get("images")) or
+        jsonValueIsPresent(params.object.get("image")))
+    {
+        return error.RouteAttachmentsUnsupported;
+    }
+
+    const workspace_id = jsonString(params.object.get("workspace_id") orelse .null) orelse
+        return error.InvalidParams;
+    const relative_cwd: ?[]const u8 = if (params.object.get("relative_cwd")) |value|
+        switch (value) {
+            .null => null,
+            .string => |text| text,
+            else => return error.InvalidParams,
+        }
+    else
+        null;
+    daemon_store.validateRepositoryRelativeCwd(relative_cwd) catch return error.InvalidParams;
+
+    lockDaemon(daemon);
+    const service = daemon.store_service;
+    if (service) |svc| _ = svc.lifetime_pins.fetchAdd(1, .monotonic);
+    daemon.mutex.unlock();
+    const svc = service orelse return error.CapabilityUnavailable;
+    defer _ = svc.lifetime_pins.fetchSub(1, .monotonic);
+
+    var binding = blk: {
+        lockStoreService(svc);
+        defer svc.mutex.unlock();
+        break :blk svc.store.loadWorkspaceRepositoryBinding(
+            workspace_id,
+            repository_id,
+            daemon.runtime_id,
+        ) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.InvalidParams => error.InvalidParams,
+            error.ResourceNotFound => error.ResourceNotFound,
+            error.CapabilityUnavailable => error.CapabilityUnavailable,
+            error.StoreCorrupt,
+            error.RuntimeIdentityMismatch,
+            error.InvalidRuntimeIdentity,
+            => error.StoreCorrupt,
+            else => error.StoreUnavailable,
+        };
+    };
+    defer binding.deinit(daemon.allocator);
+    if (!std.mem.eql(u8, binding.availability, "available")) {
+        return error.CapabilityUnavailable;
+    }
+
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const resolved = repository_path.resolveDirectoryAlloc(
+        daemon.allocator,
+        threaded.io(),
+        binding.root_path,
+        relative_cwd,
+    ) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidRepositoryCwd => error.InvalidParams,
+        error.InvalidRepositoryRoot => error.StoreCorrupt,
+        error.RepositoryPathUnavailable => error.CapabilityUnavailable,
+    };
+    errdefer daemon.allocator.free(resolved);
+
+    const owned_repository_id = daemon.allocator.dupe(u8, repository_id) catch return error.OutOfMemory;
+    errdefer daemon.allocator.free(owned_repository_id);
+    const owned_relative_cwd = if (relative_cwd) |value|
+        daemon.allocator.dupe(u8, value) catch return error.OutOfMemory
+    else
+        null;
+    errdefer if (owned_relative_cwd) |value| daemon.allocator.free(value);
+
+    if (relative_cwd == null) {
+        return .{
+            .project_path = resolved,
+            .cwd = null,
+            .repository_id = owned_repository_id,
+            .relative_cwd = null,
+        };
+    }
+    const project_path = daemon.allocator.dupe(u8, binding.root_path) catch return error.OutOfMemory;
+    return .{
+        .project_path = project_path,
+        .cwd = resolved,
+        .repository_id = owned_repository_id,
+        .relative_cwd = owned_relative_cwd,
+    };
+}
+
+fn jsonArrayHasItems(value: ?std.json.Value) error{InvalidParams}!bool {
+    const present = value orelse return false;
+    return switch (present) {
+        .null => false,
+        .array => |array| array.items.len != 0,
+        else => error.InvalidParams,
+    };
+}
+
+fn jsonValueIsPresent(value: ?std.json.Value) bool {
+    const present = value orelse return false;
+    return switch (present) {
+        .null => false,
+        else => true,
+    };
+}
+
+test "repository-routed chat resolves only the daemon binding and persists the stable route" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "repo/services/api");
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const temporary_root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const repository_root = try std.fs.path.join(allocator, &.{ root_buffer[0..temporary_root_len], "repo" });
+    defer allocator.free(repository_root);
+    const expected_cwd = try std.fs.path.join(allocator, &.{ repository_root, "services/api" });
+    defer allocator.free(expected_cwd);
+
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    const service = try allocator.create(StoreService);
+    const store = daemon_store.Store.initWithRuntimeIdentity(allocator, db_path, .none, .{
+        .runtime_id = daemon.runtime_id,
+        .instance_id = daemon.instance_id,
+    }) catch |err| {
+        allocator.destroy(service);
+        return err;
+    };
+    service.* = .{
+        .store = store,
+    };
+    daemon.store_service = service;
+    defer detachTestStoreService(&daemon);
+
+    {
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        _ = try service.store.upsertWorkspace(.{
+            .mutation = .{ .request_key = "route-workspace", .client_id = "route-test" },
+            .workspace = .{
+                .workspace_id = "route-workspace",
+                .label = "Route workspace",
+                .path = repository_root,
+            },
+        });
+    }
+
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"turn_id":"route-turn","workspace_id":"route-workspace","local_thread_id":"route-thread","repository_id":"primary","relative_cwd":"services/api","provider":"codex","harness":"local_cli","prompt":"hello","image_paths":[],"images":[],"thread_title":"Routed","access_mode":"supervised","message_id":"route-message"}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+    var route = (try resolveChatExecutionRoute(&daemon, parsed.value)).?;
+    defer route.deinit(allocator);
+    try std.testing.expectEqualStrings(repository_root, route.project_path);
+    try std.testing.expectEqualStrings(expected_cwd, route.cwd.?);
+    try std.testing.expectEqualStrings("primary", route.repository_id);
+    try std.testing.expectEqualStrings("services/api", route.relative_cwd.?);
+
+    const turn = try createChatTurnFromParams(allocator, parsed.value, &route, null);
+    defer turn.deinit(allocator);
+    try std.testing.expectEqualStrings(repository_root, turn.request.project_path);
+    try std.testing.expectEqualStrings(expected_cwd, turn.request.cwd.?);
+    try std.testing.expectEqual(AcceptanceOwnership.owned, try stageAcceptedChatTurn(&daemon, turn));
+
+    {
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        var thread_row = (try service.store.conn.row(
+            "select profile_id, runtime_id, repository_id, repository_cwd, cwd from threads where local_thread_id = ?1",
+            .{"route-thread"},
+        )).?;
+        defer thread_row.deinit();
+        try std.testing.expectEqualStrings("local", thread_row.text(0));
+        try std.testing.expectEqualStrings(daemon.runtime_id, thread_row.text(1));
+        try std.testing.expectEqualStrings("primary", thread_row.text(2));
+        try std.testing.expectEqualStrings("services/api", thread_row.text(3));
+        try std.testing.expect(thread_row.nullableText(4) == null);
+    }
+
+    const missing = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"workspace_id":"route-workspace","repository_id":"not-configured"}
+    ,
+        .{},
+    );
+    defer missing.deinit();
+    try std.testing.expectError(error.ResourceNotFound, resolveChatExecutionRoute(&daemon, missing.value));
+
+    {
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        _ = try service.store.upsertWorkspaceRepositoryBinding(.{
+            .mutation = .{ .request_key = "route-binding-missing", .client_id = "route-test" },
+            .workspace_id = "route-workspace",
+            .repository_id = "primary",
+            .binding = .{
+                .runtime_id = daemon.runtime_id,
+                .root_path = repository_root,
+                .availability = "missing",
+            },
+        });
+    }
+    try std.testing.expectError(error.CapabilityUnavailable, resolveChatExecutionRoute(&daemon, parsed.value));
+}
+
+test "repository-routed chat rejects client paths attachments storeless use and orphan cwd" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+
+    const smuggled = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"workspace_id":"route-workspace","repository_id":"primary","project_path":"/client/path"}
+    ,
+        .{},
+    );
+    defer smuggled.deinit();
+    try std.testing.expectError(error.InvalidParams, resolveChatExecutionRoute(&daemon, smuggled.value));
+
+    const attached = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"workspace_id":"route-workspace","repository_id":"primary","image_paths":["/client/secret.png"]}
+    ,
+        .{},
+    );
+    defer attached.deinit();
+    try std.testing.expectError(error.RouteAttachmentsUnsupported, resolveChatExecutionRoute(&daemon, attached.value));
+
+    const orphan_cwd = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"workspace_id":"route-workspace","relative_cwd":"services/api"}
+    ,
+        .{},
+    );
+    defer orphan_cwd.deinit();
+    try std.testing.expectError(error.InvalidParams, resolveChatExecutionRoute(&daemon, orphan_cwd.value));
+
+    const no_store = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"workspace_id":"route-workspace","repository_id":"primary"}
+    ,
+        .{},
+    );
+    defer no_store.deinit();
+    try std.testing.expectError(error.CapabilityUnavailable, resolveChatExecutionRoute(&daemon, no_store.value));
+}
+
+const TestAttachmentMethod = enum { create, append, commit };
+
+fn testAttachmentRpc(
+    daemon: *Daemon,
+    method: TestAttachmentMethod,
+    params_json: []const u8,
+) !std.json.Parsed(std.json.Value) {
+    const allocator = std.testing.allocator;
+    var params = try std.json.parseFromSlice(std.json.Value, allocator, params_json, .{});
+    defer params.deinit();
+    const response = switch (method) {
+        .create => try daemon.chatAttachmentCreateResponse(.null, params.value),
+        .append => try daemon.chatAttachmentAppendResponse(.null, params.value),
+        .commit => try daemon.chatAttachmentCommitResponse(.null, params.value),
+    };
+    defer allocator.free(response);
+    return try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+}
+
+fn testRpcResultField(root: std.json.Value, field: []const u8) ?std.json.Value {
+    const result = root.object.get("result") orelse return null;
+    if (result != .object) return null;
+    return result.object.get(field);
+}
+
+fn testRpcErrorCode(root: std.json.Value) ?[]const u8 {
+    const err = root.object.get("error") orelse return null;
+    if (err != .object) return null;
+    return jsonString(err.object.get("code") orelse .null);
+}
+
+fn testAppendChunkJsonAlloc(
+    allocator: std.mem.Allocator,
+    attachment_id: []const u8,
+    offset: usize,
+    chunk: []const u8,
+) ![]u8 {
+    const encoder = std.base64.standard.Encoder;
+    const b64 = try allocator.alloc(u8, encoder.calcSize(chunk.len));
+    defer allocator.free(b64);
+    _ = encoder.encode(b64, chunk);
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"attachment_id\":\"{s}\",\"offset\":{d},\"data\":\"{s}\"}}",
+        .{ attachment_id, offset, b64 },
+    );
+}
+
+/// Drive create -> chunked append -> commit for `bytes` and return the owned
+/// staged attachment id.
+fn testUploadCommittedAttachmentAlloc(
+    daemon: *Daemon,
+    mime: []const u8,
+    bytes: []const u8,
+) ![]u8 {
+    const allocator = std.testing.allocator;
+    const create_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mime\":\"{s}\",\"byte_size\":{d}}}",
+        .{ mime, bytes.len },
+    );
+    defer allocator.free(create_json);
+    var create = try testAttachmentRpc(daemon, .create, create_json);
+    defer create.deinit();
+    const id_value = testRpcResultField(create.value, "attachment_id") orelse return error.TestExpectedResult;
+    const attachment_id = try allocator.dupe(u8, id_value.string);
+    errdefer allocator.free(attachment_id);
+    try std.testing.expect(headless.attachment_protocol.isValidAttachmentId(attachment_id));
+    const chunk_value = testRpcResultField(create.value, "max_chunk_bytes") orelse return error.TestExpectedResult;
+    const max_chunk = std.math.cast(usize, chunk_value.integer) orelse return error.TestExpectedResult;
+    try std.testing.expect(max_chunk >= headless.attachment_protocol.MIN_APPEND_CHUNK_BYTES);
+
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const end = @min(offset + max_chunk, bytes.len);
+        const append_json = try testAppendChunkJsonAlloc(allocator, attachment_id, offset, bytes[offset..end]);
+        defer allocator.free(append_json);
+        var append = try testAttachmentRpc(daemon, .append, append_json);
+        defer append.deinit();
+        const received = testRpcResultField(append.value, "received_bytes") orelse return error.TestExpectedResult;
+        try std.testing.expectEqual(@as(i64, @intCast(end)), received.integer);
+        offset = end;
+    }
+
+    const commit_json = try std.fmt.allocPrint(allocator, "{{\"attachment_id\":\"{s}\"}}", .{attachment_id});
+    defer allocator.free(commit_json);
+    var commit = try testAttachmentRpc(daemon, .commit, commit_json);
+    defer commit.deinit();
+    const committed_size = testRpcResultField(commit.value, "byte_size") orelse return error.TestExpectedResult;
+    try std.testing.expectEqual(@as(i64, @intCast(bytes.len)), committed_size.integer);
+    return attachment_id;
+}
+
+test "staged chat attachments upload commit claim and sweep end to end" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+
+    var daemon = Daemon.initWithPrefPath(allocator, root_buffer[0..root_len]);
+    defer daemon.deinit();
+    const service = try allocator.create(StoreService);
+    const store = daemon_store.Store.initWithRuntimeIdentity(allocator, db_path, .none, .{
+        .runtime_id = daemon.runtime_id,
+        .instance_id = daemon.instance_id,
+    }) catch |err| {
+        allocator.destroy(service);
+        return err;
+    };
+    service.* = .{ .store = store };
+    daemon.store_service = service;
+    defer detachTestStoreService(&daemon);
+
+    // Small PNG: real magic bytes plus filler to reach the staging minimum.
+    const png_magic = "\x89PNG\r\n\x1a\n";
+    var small: [16]u8 = undefined;
+    @memcpy(small[0..png_magic.len], png_magic);
+    @memset(small[png_magic.len..], 0xAB);
+    const small_id = try testUploadCommittedAttachmentAlloc(&daemon, "image/png", small[0..]);
+    defer allocator.free(small_id);
+
+    // 2 MiB PNG exercises the multi-chunk path end to end.
+    const big_len: usize = 2 * 1024 * 1024;
+    const big = try allocator.alloc(u8, big_len);
+    defer allocator.free(big);
+    @memset(big, 0x5C);
+    @memcpy(big[0..png_magic.len], png_magic);
+    const big_id = try testUploadCommittedAttachmentAlloc(&daemon, "image/png", big);
+    defer allocator.free(big_id);
+
+    // Claim both ids for a repository-routed turn: paths must be daemon-owned
+    // staging files, never client paths, and the claim must consume records.
+    const claim_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"attachments\":[\"{s}\",\"{s}\"]}}",
+        .{ small_id, big_id },
+    );
+    defer allocator.free(claim_json);
+    var claim_params = try std.json.parseFromSlice(std.json.Value, allocator, claim_json, .{});
+    defer claim_params.deinit();
+    var claim = (try daemon.claimStagedChatAttachments(claim_params.value, true)).?;
+    defer claim.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), claim.image_paths.len);
+    try std.testing.expectEqual(@as(usize, 2), claim.images.len);
+    for (claim.image_paths) |path| {
+        try std.testing.expect(std.mem.indexOf(u8, path, CHAT_ATTACHMENT_DIR_NAME) != null);
+        try std.testing.expect(std.mem.startsWith(u8, path, daemon.pref_path));
+        // Provider harnesses may infer image type from the suffix: the
+        // server-owned path carries the canonical extension of the MIME.
+        try std.testing.expect(std.mem.endsWith(u8, path, ".png"));
+    }
+    try std.testing.expectEqualStrings("image/png", claim.images[0].mime);
+    try std.testing.expectEqual(@as(usize, small.len), claim.images[0].byte_size);
+    try std.testing.expectEqual(@as(usize, big_len), claim.images[1].byte_size);
+
+    // Durable projection: message rows persist only the opaque
+    // `verde-attachment:<id>` reference — never the daemon staging path (and
+    // desktop paths never reached the daemon at all). v1 keeps metadata, not
+    // downloadable bytes, once the staging TTL lapses.
+    for (claim.images) |attachment| {
+        try std.testing.expect(std.mem.startsWith(u8, attachment.path, headless.attachment_protocol.ATTACHMENT_REFERENCE_PREFIX));
+        try std.testing.expect(std.mem.indexOf(u8, attachment.path, daemon.pref_path) == null);
+    }
+    // Durable-store coverage: stage the accepted turn through the real store
+    // path and inspect the persisted message row, not just the in-memory
+    // claim projection.
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+    const repo_root = try std.fs.path.join(allocator, &.{ root_buffer[0..root_len], "repo" });
+    defer allocator.free(repo_root);
+    {
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        _ = try service.store.upsertWorkspace(.{
+            .mutation = .{ .request_key = "attach-workspace", .client_id = "attach-test" },
+            .workspace = .{
+                .workspace_id = "attach-workspace",
+                .label = "Attach workspace",
+                .path = repo_root,
+            },
+        });
+    }
+    const turn_params = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"turn_id":"attach-turn","workspace_id":"attach-workspace","local_thread_id":"attach-thread","repository_id":"primary","provider":"codex","harness":"local_cli","prompt":"look","thread_title":"Attached","access_mode":"supervised","message_id":"attach-message"}
+    , .{});
+    defer turn_params.deinit();
+    var route = (try resolveChatExecutionRoute(&daemon, turn_params.value)).?;
+    defer route.deinit(allocator);
+    const turn = try createChatTurnFromParams(allocator, turn_params.value, &route, &claim);
+    defer turn.deinit(allocator);
+    // The provider request keeps the real staging paths; only the durable
+    // projection carries the opaque reference.
+    try std.testing.expectEqual(@as(usize, 2), turn.request.image_paths.len);
+    try std.testing.expectEqual(AcceptanceOwnership.owned, try stageAcceptedChatTurn(&daemon, turn));
+    {
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        var message_row = (try service.store.conn.row(
+            "select image_path, extra_images_json from messages where message_id = ?1",
+            .{"attach-message"},
+        )).?;
+        defer message_row.deinit();
+        const primary_path = message_row.text(0);
+        try std.testing.expect(std.mem.startsWith(u8, primary_path, headless.attachment_protocol.ATTACHMENT_REFERENCE_PREFIX));
+        const extra_json = message_row.text(1);
+        try std.testing.expect(std.mem.indexOf(u8, extra_json, headless.attachment_protocol.ATTACHMENT_REFERENCE_PREFIX) != null);
+        // Neither the daemon staging path nor a desktop path is durable.
+        try std.testing.expect(std.mem.indexOf(u8, primary_path, daemon.pref_path) == null);
+        try std.testing.expect(std.mem.indexOf(u8, extra_json, daemon.pref_path) == null);
+        try std.testing.expect(std.mem.indexOf(u8, extra_json, CHAT_ATTACHMENT_DIR_NAME) == null);
+    }
+
+    // The staged file carries exactly the uploaded bytes.
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    const staged_bytes = try std.Io.Dir.cwd().readFileAlloc(io, claim.image_paths[0], allocator, .limited(64));
+    defer allocator.free(staged_bytes);
+    try std.testing.expectEqualSlices(u8, small[0..], staged_bytes);
+
+    // Consumed records cannot be claimed again by a second turn.
+    try std.testing.expectError(
+        error.InvalidState,
+        daemon.claimStagedChatAttachments(claim_params.value, true),
+    );
+
+    // A turn-start failure after the claim restores the records so the
+    // client retries without re-uploading; the restored records claim again.
+    daemon.restoreClaimedChatAttachments(&claim);
+    var reclaim = (try daemon.claimStagedChatAttachments(claim_params.value, true)).?;
+    defer reclaim.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), reclaim.image_paths.len);
+
+    // The periodic drain-loop sweep destroys consumed records once their
+    // retention window lapses — and rate-limits itself via the due timestamp.
+    lockDaemon(&daemon);
+    for (daemon.chat_attachments.items) |record| {
+        record.updated_at_ms -= STAGED_ATTACHMENT_CONSUMED_TTL_MS + 1;
+    }
+    daemon.chat_attachment_sweep_due_ms = 0;
+    daemon.mutex.unlock();
+    try std.testing.expect(daemon.maybeSweepStagedChatAttachments(nowMs()));
+    // Immediately after a sweep the next one is not yet due.
+    try std.testing.expect(!daemon.maybeSweepStagedChatAttachments(nowMs()));
+    lockDaemon(&daemon);
+    const remaining = daemon.chat_attachments.items.len;
+    daemon.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 0), remaining);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().readFileAlloc(io, claim.image_paths[0], allocator, .limited(64)),
+    );
+}
+
+test "staged chat attachments reject invalid input at every stage" {
+    const allocator = std.testing.allocator;
+
+    // Store-less runtimes advertise no staging capability and refuse creates.
+    {
+        var storeless = Daemon.init(allocator);
+        defer storeless.deinit();
+        var response = try testAttachmentRpc(&storeless, .create,
+            \\{"mime":"image/png","byte_size":4096}
+        );
+        defer response.deinit();
+        try std.testing.expectEqualStrings(
+            headless.protocol.ERR_CAPABILITY_UNAVAILABLE,
+            testRpcErrorCode(response.value).?,
+        );
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+    var daemon = Daemon.initWithPrefPath(allocator, root_buffer[0..root_len]);
+    defer daemon.deinit();
+    const service = try allocator.create(StoreService);
+    const store = daemon_store.Store.initWithRuntimeIdentity(allocator, db_path, .none, .{
+        .runtime_id = daemon.runtime_id,
+        .instance_id = daemon.instance_id,
+    }) catch |err| {
+        allocator.destroy(service);
+        return err;
+    };
+    service.* = .{ .store = store };
+    daemon.store_service = service;
+    defer detachTestStoreService(&daemon);
+
+    const cases: []const struct { method: TestAttachmentMethod, params: []const u8, code: []const u8 } = &.{
+        // Unsupported MIME and out-of-range declarations never allocate state.
+        .{ .method = .create, .params = "{\"mime\":\"text/plain\",\"byte_size\":4096}", .code = headless.protocol.ERR_INVALID_PARAMS },
+        .{ .method = .create, .params = "{\"mime\":\"image/png\",\"byte_size\":8}", .code = headless.protocol.ERR_INVALID_PARAMS },
+        .{ .method = .create, .params = "{\"mime\":\"image/png\",\"byte_size\":53687091200}", .code = headless.protocol.ERR_INVALID_PARAMS },
+        // Just past the portable per-image cap (16 MiB): accepted staging
+        // must never defer a deterministic provider-harness failure.
+        .{ .method = .create, .params = "{\"mime\":\"image/png\",\"byte_size\":16777217}", .code = headless.protocol.ERR_INVALID_PARAMS },
+        // Traversal-shaped and unknown ids are rejected before any file work.
+        .{ .method = .append, .params = "{\"attachment_id\":\"../../../../etc/passwd0000000000\",\"offset\":0,\"data\":\"aGk=\"}", .code = headless.protocol.ERR_INVALID_PARAMS },
+        .{ .method = .append, .params = "{\"attachment_id\":\"00000000000000000000000000000000\",\"offset\":0,\"data\":\"aGk=\"}", .code = headless.protocol.ERR_RESOURCE_NOT_FOUND },
+        .{ .method = .commit, .params = "{\"attachment_id\":\"00000000000000000000000000000000\"}", .code = headless.protocol.ERR_RESOURCE_NOT_FOUND },
+    };
+    for (cases) |case| {
+        var response = try testAttachmentRpc(&daemon, case.method, case.params);
+        defer response.deinit();
+        try std.testing.expectEqualStrings(case.code, testRpcErrorCode(response.value).?);
+    }
+
+    // Stage one attachment and probe the byte-level guards against it.
+    var create = try testAttachmentRpc(&daemon, .create,
+        \\{"mime":"image/png","byte_size":16}
+    );
+    defer create.deinit();
+    const staged_id = testRpcResultField(create.value, "attachment_id").?.string;
+
+    const png_magic = "\x89PNG\r\n\x1a\n";
+    var payload: [16]u8 = undefined;
+    @memcpy(payload[0..png_magic.len], png_magic);
+    @memset(payload[png_magic.len..], 0x11);
+    var not_png: [16]u8 = @splat(0xFF);
+
+    // First chunk with mismatched magic bytes: the lying MIME never lands.
+    {
+        const chunk_json = try testAppendChunkJsonAlloc(allocator, staged_id, 0, not_png[0..]);
+        defer allocator.free(chunk_json);
+        var response = try testAttachmentRpc(&daemon, .append, chunk_json);
+        defer response.deinit();
+        try std.testing.expectEqualStrings(headless.protocol.ERR_INVALID_PARAMS, testRpcErrorCode(response.value).?);
+    }
+    // Out-of-order offsets are rejected exactly.
+    {
+        const chunk_json = try testAppendChunkJsonAlloc(allocator, staged_id, 4, payload[0..]);
+        defer allocator.free(chunk_json);
+        var response = try testAttachmentRpc(&daemon, .append, chunk_json);
+        defer response.deinit();
+        try std.testing.expectEqualStrings(headless.protocol.ERR_INVALID_PARAMS, testRpcErrorCode(response.value).?);
+    }
+    // Committing before all declared bytes arrive fails.
+    {
+        const commit_json = try std.fmt.allocPrint(allocator, "{{\"attachment_id\":\"{s}\"}}", .{staged_id});
+        defer allocator.free(commit_json);
+        var response = try testAttachmentRpc(&daemon, .commit, commit_json);
+        defer response.deinit();
+        try std.testing.expectEqualStrings(headless.protocol.ERR_INVALID_STATE, testRpcErrorCode(response.value).?);
+    }
+    // Complete the upload, then verify overflow beyond byte_size is refused.
+    {
+        const chunk_json = try testAppendChunkJsonAlloc(allocator, staged_id, 0, payload[0..]);
+        defer allocator.free(chunk_json);
+        var response = try testAttachmentRpc(&daemon, .append, chunk_json);
+        defer response.deinit();
+        try std.testing.expect(testRpcResultField(response.value, "received_bytes") != null);
+    }
+    {
+        const chunk_json = try testAppendChunkJsonAlloc(allocator, staged_id, 16, payload[0..1]);
+        defer allocator.free(chunk_json);
+        var response = try testAttachmentRpc(&daemon, .append, chunk_json);
+        defer response.deinit();
+        try std.testing.expectEqualStrings(headless.protocol.ERR_INVALID_PARAMS, testRpcErrorCode(response.value).?);
+    }
+
+    // Claims: uncommitted records, non-repository routes, and malformed
+    // entries all fail without consuming anything.
+    const uncommitted_json = try std.fmt.allocPrint(allocator, "{{\"attachments\":[\"{s}\"]}}", .{staged_id});
+    defer allocator.free(uncommitted_json);
+    var uncommitted_params = try std.json.parseFromSlice(std.json.Value, allocator, uncommitted_json, .{});
+    defer uncommitted_params.deinit();
+    try std.testing.expectError(
+        error.InvalidState,
+        daemon.claimStagedChatAttachments(uncommitted_params.value, true),
+    );
+    {
+        const commit_json = try std.fmt.allocPrint(allocator, "{{\"attachment_id\":\"{s}\"}}", .{staged_id});
+        defer allocator.free(commit_json);
+        var response = try testAttachmentRpc(&daemon, .commit, commit_json);
+        defer response.deinit();
+        try std.testing.expect(testRpcResultField(response.value, "attachment_id") != null);
+    }
+    try std.testing.expectError(
+        error.InvalidParams,
+        daemon.claimStagedChatAttachments(uncommitted_params.value, false),
+    );
+    var malformed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"attachments":[42]}
+    , .{});
+    defer malformed.deinit();
+    try std.testing.expectError(
+        error.InvalidParams,
+        daemon.claimStagedChatAttachments(malformed.value, true),
+    );
+    // Duplicate ids would double-consume one staged record: whole claim fails
+    // atomically and the record stays committed.
+    const duplicate_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"attachments\":[\"{s}\",\"{s}\"]}}",
+        .{ staged_id, staged_id },
+    );
+    defer allocator.free(duplicate_json);
+    var duplicate_params = try std.json.parseFromSlice(std.json.Value, allocator, duplicate_json, .{});
+    defer duplicate_params.deinit();
+    try std.testing.expectError(
+        error.InvalidParams,
+        daemon.claimStagedChatAttachments(duplicate_params.value, true),
+    );
+    // The committed record survived every failed claim and remains claimable.
+    var claim = (try daemon.claimStagedChatAttachments(uncommitted_params.value, true)).?;
+    defer claim.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), claim.image_paths.len);
+
+    // Aggregate declared-byte budgets bound disk amplification beyond the
+    // count caps; maxInt also exercises the saturating-add comparison.
+    lockDaemon(&daemon);
+    const budget_record = daemon.chat_attachments.items[0];
+    const real_declared = budget_record.declared_bytes;
+    budget_record.declared_bytes = std.math.maxInt(usize);
+    daemon.mutex.unlock();
+    {
+        var response = try testAttachmentRpc(&daemon, .create, "{\"mime\":\"image/png\",\"byte_size\":4096}");
+        defer response.deinit();
+        try std.testing.expectEqualStrings(headless.protocol.ERR_INVALID_STATE, testRpcErrorCode(response.value).?);
+    }
+    lockDaemon(&daemon);
+    budget_record.declared_bytes = real_declared;
+    daemon.mutex.unlock();
+    {
+        var response = try testAttachmentRpc(&daemon, .create, "{\"mime\":\"image/png\",\"byte_size\":4096}");
+        defer response.deinit();
+        try std.testing.expect(testRpcResultField(response.value, "attachment_id") != null);
+    }
+
+    // Drain gate: once prepareShutdown flips accepting_mutations, all three
+    // unlocked staging handlers refuse before any file work (they own the
+    // lockDaemon check because the generic gate's unlocked read is unsafe).
+    lockDaemon(&daemon);
+    daemon.accepting_mutations = false;
+    daemon.mutex.unlock();
+    const drained_cases: []const struct { method: TestAttachmentMethod, params: []const u8 } = &.{
+        .{ .method = .create, .params = "{\"mime\":\"image/png\",\"byte_size\":4096}" },
+        .{ .method = .append, .params = "{\"attachment_id\":\"00000000000000000000000000000000\",\"offset\":0,\"data\":\"aGk=\"}" },
+        .{ .method = .commit, .params = "{\"attachment_id\":\"00000000000000000000000000000000\"}" },
+    };
+    for (drained_cases) |case| {
+        var response = try testAttachmentRpc(&daemon, case.method, case.params);
+        defer response.deinit();
+        try std.testing.expectEqualStrings(headless.protocol.ERR_INVALID_STATE, testRpcErrorCode(response.value).?);
+        const err = response.value.object.get("error").?;
+        try std.testing.expect(std.mem.indexOf(u8, jsonString(err.object.get("message") orelse .null).?, "not accepting mutations") != null);
+    }
+    lockDaemon(&daemon);
+    daemon.accepting_mutations = true;
+    daemon.mutex.unlock();
+}
+
+test "attachment staging directory is created private and reusable" {
+    // Regression: the directory was opened as an O_PATH handle, so the
+    // permission tightening failed with EBADF and every create reported the
+    // staging directory as unavailable — on a fresh directory and on every
+    // later call against the existing one.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+
+    try tmp.dir.createDirPath(io, "pref");
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    const dir_path = try std.fs.path.join(allocator, &.{ root_buffer[0..root_len], "pref", CHAT_ATTACHMENT_DIR_NAME });
+    defer allocator.free(dir_path);
+
+    // Fresh directory, then the idempotent path against the existing one.
+    try ensureChatAttachmentStagingDirectory(io, dir_path);
+    try ensureChatAttachmentStagingDirectory(io, dir_path);
+
+    const stat = try std.Io.Dir.cwd().statFile(io, dir_path, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(std.Io.File.Kind.directory, stat.kind);
+    if (builtin.os.tag != .windows) {
+        try std.testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast(@intFromEnum(stat.permissions) & 0o777)));
+    }
+}
+
+test "attachment staging never follows a planted symlink at create or cleanup" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+
+    // Victim directory with a sentinel file: a symlink attack would redirect
+    // staging writes (or the startup wipe) into it.
+    try tmp.dir.createDirPath(io, "victim");
+    try tmp.dir.writeFile(io, .{ .sub_path = "victim/keep.txt", .data = "sentinel" });
+    try tmp.dir.createDirPath(io, "pref");
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const victim_path = try std.fs.path.join(allocator, &.{ root, "victim" });
+    defer allocator.free(victim_path);
+    const pref_path = try std.fs.path.join(allocator, &.{ root, "pref" });
+    defer allocator.free(pref_path);
+    const link_path = try std.fs.path.join(allocator, &.{ pref_path, CHAT_ATTACHMENT_DIR_NAME });
+    defer allocator.free(link_path);
+    try std.Io.Dir.cwd().symLink(io, victim_path, link_path, .{ .is_directory = true });
+
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+    var daemon = Daemon.initWithPrefPath(allocator, pref_path);
+    defer daemon.deinit();
+    const service = try allocator.create(StoreService);
+    const store = daemon_store.Store.initWithRuntimeIdentity(allocator, db_path, .none, .{
+        .runtime_id = daemon.runtime_id,
+        .instance_id = daemon.instance_id,
+    }) catch |err| {
+        allocator.destroy(service);
+        return err;
+    };
+    service.* = .{ .store = store };
+    daemon.store_service = service;
+    defer detachTestStoreService(&daemon);
+
+    // Create refuses before any open/chmod/write through the link.
+    {
+        var response = try testAttachmentRpc(&daemon, .create,
+            \\{"mime":"image/png","byte_size":4096}
+        );
+        defer response.deinit();
+        try std.testing.expectEqualStrings(headless.protocol.ERR_INVALID_STATE, testRpcErrorCode(response.value).?);
+    }
+    // The victim's contents are untouched and nothing was staged into it.
+    const sentinel = try tmp.dir.readFileAlloc(io, "victim/keep.txt", allocator, .limited(64));
+    defer allocator.free(sentinel);
+    try std.testing.expectEqualStrings("sentinel", sentinel);
+    var victim_dir = try tmp.dir.openDir(io, "victim", .{ .iterate = true });
+    defer victim_dir.close(io);
+    var victim_it = victim_dir.iterate();
+    var victim_entries: usize = 0;
+    while (try victim_it.next(io)) |_| victim_entries += 1;
+    try std.testing.expectEqual(@as(usize, 1), victim_entries);
+
+    // Startup cleanup unlinks only the link itself; it never recurses
+    // through the symlink into the victim directory.
+    wipeStagedChatAttachmentDirectory(&daemon);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(io, link_path, .{ .follow_symlinks = false }),
+    );
+    const survivor = try tmp.dir.readFileAlloc(io, "victim/keep.txt", allocator, .limited(64));
+    defer allocator.free(survivor);
+    try std.testing.expectEqualStrings("sentinel", survivor);
+
+    // With the link gone, the same daemon stages normally into a fresh
+    // private real directory.
+    {
+        var response = try testAttachmentRpc(&daemon, .create,
+            \\{"mime":"image/png","byte_size":4096}
+        );
+        defer response.deinit();
+        try std.testing.expect(testRpcResultField(response.value, "attachment_id") != null);
+    }
+    const staging_stat = try std.Io.Dir.cwd().statFile(io, link_path, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(std.Io.File.Kind.directory, staging_stat.kind);
+}
+
+fn createChatTurnFromParams(
+    allocator: std.mem.Allocator,
+    params: std.json.Value,
+    execution_route: ?*const ChatExecutionRoute,
+    claimed_attachments: ?*const ClaimedAttachments,
+) !*ChatTurn {
     const turn = try allocator.create(ChatTurn);
     errdefer allocator.destroy(turn);
-    const image_paths = try jsonStringArray(allocator, params.object.get("image_paths") orelse .null);
+    // Repository-routed turns resolve attachments from staged runtime-local
+    // files; the caller retains claim ownership so the turn dupes here.
+    const image_paths = if (claimed_attachments) |claim|
+        try dupeStringArray(allocator, claim.image_paths)
+    else
+        try jsonStringArray(allocator, params.object.get("image_paths") orelse .null);
     errdefer freeStringArray(allocator, image_paths);
-    const owned_images = try jsonAttachmentArray(allocator, params.object.get("images") orelse .null);
+    const owned_images = if (claimed_attachments) |claim|
+        try dupeAttachmentArray(allocator, claim.images)
+    else
+        try jsonAttachmentArray(allocator, params.object.get("images") orelse .null);
     errdefer freeAttachmentArray(allocator, owned_images);
     const provider = parseEnum(harness.Provider, jsonString(params.object.get("provider") orelse .null) orelse return error.InvalidParams) orelse return error.InvalidParams;
     const harness_kind = parseEnum(harness.HarnessKind, jsonString(params.object.get("harness") orelse .null) orelse "local_cli") orelse return error.InvalidParams;
+    const project_path = if (execution_route) |route|
+        try allocator.dupe(u8, route.project_path)
+    else
+        try requiredDupe(allocator, params, "project_path");
+    errdefer allocator.free(project_path);
+    const prompt = try requiredDupe(allocator, params, "prompt");
+    errdefer allocator.free(prompt);
+    const provider_thread_id = try optionalDupe(allocator, params, "provider_thread_id");
+    errdefer if (provider_thread_id) |value| allocator.free(value);
+    const thread_title = try requiredDupe(allocator, params, "thread_title");
+    errdefer allocator.free(thread_title);
+    const model_ref = try optionalDupe(allocator, params, "model_ref");
+    errdefer if (model_ref) |value| allocator.free(value);
+    const opencode_reasoning_variant = try optionalDupe(allocator, params, "opencode_reasoning_variant");
+    errdefer if (opencode_reasoning_variant) |value| allocator.free(value);
+    const cursor_model_params_json = try optionalDupe(allocator, params, "cursor_model_params_json");
+    errdefer if (cursor_model_params_json) |value| allocator.free(value);
+    const cwd = if (execution_route) |route|
+        if (route.cwd) |value| try allocator.dupe(u8, value) else null
+    else
+        try optionalDupe(allocator, params, "cwd");
+    errdefer if (cwd) |value| allocator.free(value);
     const request: send_runner.Request = .{
         .provider = provider,
         .harness_kind = harness_kind,
-        .project_path = try requiredDupe(allocator, params, "project_path"),
-        .prompt = try requiredDupe(allocator, params, "prompt"),
+        .project_path = project_path,
+        .prompt = prompt,
         .image_paths = image_paths,
-        .provider_thread_id = try optionalDupe(allocator, params, "provider_thread_id"),
-        .thread_title = try requiredDupe(allocator, params, "thread_title"),
-        .model_ref = try optionalDupe(allocator, params, "model_ref"),
+        .provider_thread_id = provider_thread_id,
+        .thread_title = thread_title,
+        .model_ref = model_ref,
         .reasoning_effort = if (jsonString(params.object.get("reasoning_effort") orelse .null)) |value| parseEnum(harness.ReasoningEffort, value) else null,
-        .opencode_reasoning_variant = try optionalDupe(allocator, params, "opencode_reasoning_variant"),
-        .cursor_model_params_json = try optionalDupe(allocator, params, "cursor_model_params_json"),
+        .opencode_reasoning_variant = opencode_reasoning_variant,
+        .cursor_model_params_json = cursor_model_params_json,
         .fast_mode = if (jsonBool(params.object.get("fast_mode") orelse .null) orelse false) .on else .off,
         .access_mode = parseAccessMode(jsonString(params.object.get("access_mode") orelse .null)),
-        .remote_ssh_host = try optionalDupe(allocator, params, "remote_ssh_host"),
-        .remote_cwd = try optionalDupe(allocator, params, "remote_cwd"),
-        .cwd = try optionalDupe(allocator, params, "cwd"),
+        .cwd = cwd,
     };
     const user_message_id = try optionalDupe(allocator, params, "message_id");
     errdefer if (user_message_id) |value| allocator.free(value);
+    const repository_id = if (execution_route) |route| try allocator.dupe(u8, route.repository_id) else null;
+    errdefer if (repository_id) |value| allocator.free(value);
+    const repository_cwd = if (execution_route) |route|
+        if (route.relative_cwd) |value| try allocator.dupe(u8, value) else null
+    else
+        null;
+    errdefer if (repository_cwd) |value| allocator.free(value);
+    const owned_turn_id = try requiredDupe(allocator, params, "turn_id");
+    errdefer allocator.free(owned_turn_id);
+    const workspace_id = try requiredDupe(allocator, params, "workspace_id");
+    errdefer allocator.free(workspace_id);
+    const local_thread_id = try requiredDupe(allocator, params, "local_thread_id");
+    errdefer allocator.free(local_thread_id);
     // MINOR-7: wire test_stub is only honored when the hermetic stub env is
     // also set, so a production client cannot force canned durable rows.
     // Env alone still enables the offline worker for hermetic ITs.
@@ -9913,9 +13503,11 @@ fn createChatTurnFromParams(allocator: std.mem.Allocator, params: std.json.Value
     const use_stub = env_stub or (wire_stub and env_stub);
     turn.* = .{
         .allocator = allocator,
-        .turn_id = try requiredDupe(allocator, params, "turn_id"),
-        .workspace_id = try requiredDupe(allocator, params, "workspace_id"),
-        .local_thread_id = try requiredDupe(allocator, params, "local_thread_id"),
+        .turn_id = owned_turn_id,
+        .workspace_id = workspace_id,
+        .local_thread_id = local_thread_id,
+        .repository_id = repository_id,
+        .repository_cwd = repository_cwd,
         .request = request,
         .owned_image_paths = image_paths,
         .owned_images = owned_images,
@@ -9948,6 +13540,35 @@ fn automaticTitleExpectedTitle(requested_title: []const u8, fallback_title: []co
         return requested_title;
     }
     return null;
+}
+
+fn providerFailureReasonForError(
+    provider: harness.Provider,
+    err: anyerror,
+) ?ProviderFailureReason {
+    return switch (err) {
+        error.CursorSignedOut => if (provider == .cursor) .provider_not_authenticated else null,
+        error.FxSignedOut => if (provider == .fx) .provider_not_authenticated else null,
+        error.GrokSignedOut => if (provider == .grok) .provider_not_authenticated else null,
+        error.AcpSignedOut => switch (provider) {
+            .cursor, .fx, .grok => .provider_not_authenticated,
+            else => null,
+        },
+        error.ProviderBridgeNotFound => if (provider == .claude) .provider_unavailable else null,
+        error.OpencodeServerUnavailable => if (provider == .opencode) .provider_unavailable else null,
+        // FileNotFound is intentionally unknown here: it can identify the
+        // executable, working directory, an attachment, or provider state.
+        // The remote acceptance preflight performs the unambiguous executable
+        // check before durable work is accepted.
+        else => null,
+    };
+}
+
+fn providerFailureMessage(reason: ProviderFailureReason) []const u8 {
+    return switch (reason) {
+        .provider_unavailable => "The provider is unavailable on this runtime.",
+        .provider_not_authenticated => "The provider is not authenticated on this runtime.",
+    };
 }
 
 /// Generate an opening-exchange title under the same durable identity guard
@@ -10065,6 +13686,28 @@ test "automatic title eligibility accepts every empty-thread presentation label"
     try std.testing.expect(automaticTitleExpectedTitle("My Manual Title", "Opening prompt") == null);
 }
 
+test "provider launch failures retain only provable typed reasons" {
+    try std.testing.expect(providerFailureReasonForError(.codex, error.FileNotFound) == null);
+    try std.testing.expect(providerFailureReasonForError(.pi, error.FileNotFound) == null);
+    try std.testing.expectEqual(
+        ProviderFailureReason.provider_unavailable,
+        providerFailureReasonForError(.claude, error.ProviderBridgeNotFound).?,
+    );
+    try std.testing.expectEqual(
+        ProviderFailureReason.provider_not_authenticated,
+        providerFailureReasonForError(.cursor, error.CursorSignedOut).?,
+    );
+    try std.testing.expectEqual(
+        ProviderFailureReason.provider_not_authenticated,
+        providerFailureReasonForError(.fx, error.FxSignedOut).?,
+    );
+    try std.testing.expectEqual(
+        ProviderFailureReason.provider_not_authenticated,
+        providerFailureReasonForError(.grok, error.GrokSignedOut).?,
+    );
+    try std.testing.expect(providerFailureReasonForError(.codex, error.InvalidDaemonResponse) == null);
+}
+
 fn chatTurnThread(daemon: *Daemon, turn: *ChatTurn) void {
     const allocator = daemon.allocator;
     // Acceptance staging before provider work so a mid-turn kill still leaves
@@ -10138,8 +13781,11 @@ fn chatTurnThread(daemon: *Daemon, turn: *ChatTurn) void {
                 allocator.free(value.reply_text);
             } else |err| {
                 turn.status = if (turn.cancel_requested) .aborted else .failed;
+                const reason = providerFailureReasonForError(turn.request.provider, err);
+                turn.failure_reason = reason;
                 if (turn.error_message == null) {
-                    turn.error_message = allocator.dupe(u8, @errorName(err)) catch null;
+                    const message = if (reason) |typed| providerFailureMessage(typed) else @errorName(err);
+                    turn.error_message = allocator.dupe(u8, message) catch null;
                 }
                 const message = turn.error_message orelse @errorName(err);
                 turn.appendStringEvent(allocator, if (turn.status == .aborted) "aborted" else "failed", "message", message);
@@ -10564,6 +14210,43 @@ fn jsonStringArray(allocator: std.mem.Allocator, value: std.json.Value) ![]const
 fn freeStringArray(allocator: std.mem.Allocator, values: []const []const u8) void {
     for (values) |value| allocator.free(value);
     allocator.free(values);
+}
+
+fn dupeStringArray(allocator: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (list.items) |value| allocator.free(value);
+        list.deinit(allocator);
+    }
+    for (values) |value| {
+        const owned = try allocator.dupe(u8, value);
+        errdefer allocator.free(owned);
+        try list.append(allocator, owned);
+    }
+    return try list.toOwnedSlice(allocator);
+}
+
+fn dupeAttachmentArray(allocator: std.mem.Allocator, values: []const store_protocol.Attachment) ![]store_protocol.Attachment {
+    var list: std.ArrayList(store_protocol.Attachment) = .empty;
+    errdefer {
+        for (list.items) |attachment| {
+            allocator.free(attachment.path);
+            allocator.free(attachment.mime);
+        }
+        list.deinit(allocator);
+    }
+    for (values) |attachment| {
+        const owned_path = try allocator.dupe(u8, attachment.path);
+        errdefer allocator.free(owned_path);
+        const owned_mime = try allocator.dupe(u8, attachment.mime);
+        errdefer allocator.free(owned_mime);
+        try list.append(allocator, .{
+            .path = owned_path,
+            .mime = owned_mime,
+            .byte_size = attachment.byte_size,
+        });
+    }
+    return try list.toOwnedSlice(allocator);
 }
 
 fn commandForOptions(allocator: std.mem.Allocator, args: []const []const u8) ![][:0]u8 {
@@ -12409,6 +16092,46 @@ test "daemon keep-alive is durability_pending and live work only (M4-P4)" {
     try std.testing.expect(chatTurnKeepsDaemonAlive(.completed, false, true, true));
 }
 
+test "prepareShutdown expected pid cannot drain a different endpoint owner" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    daemon.idle_exit_ms = null;
+
+    const response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"daemon.prepareShutdown","params":{"expected_pid":0}}
+    );
+    defer allocator.free(response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("result").?.object;
+    try std.testing.expect(!jsonBool(result.get("accepted") orelse .null).?);
+    try std.testing.expect(!jsonBool(result.get("safe_to_exit") orelse .null).?);
+    try std.testing.expect(jsonBool(result.get("owner_mismatch") orelse .null).?);
+    try std.testing.expectEqual(@as(i64, @intCast(platform_runtime.processId())), result.get("pid").?.integer);
+    try std.testing.expect(daemon.accepting_mutations);
+    try std.testing.expect(!daemon.shutdown_requested);
+}
+
+test "prepareShutdown accepts the legacy empty tuple parameter shape" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    daemon.idle_exit_ms = null;
+
+    const response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"daemon.prepareShutdown","params":[]}
+    );
+    defer allocator.free(response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("result").?.object;
+    try std.testing.expect(jsonBool(result.get("accepted") orelse .null).?);
+    try std.testing.expect(jsonBool(result.get("safe_to_exit") orelse .null).?);
+    try std.testing.expect(!daemon.accepting_mutations);
+    try std.testing.expect(daemon.shutdown_requested);
+}
+
 test "prepareShutdown refuses while a live PTY exists" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
 
@@ -12711,6 +16434,11 @@ test "draining dispatcher rejects every state mutator" {
         // Full store mutation surface participates in the drain gate (S3).
         "state.snapshot.replace",
         "workspace.upsert",
+        "workspace.repository.upsert",
+        "workspace.repository.remove",
+        "workspace.repository.default.set",
+        "workspace.repository.binding.upsert",
+        "workspace.repository.binding.remove",
         "chat.thread.upsert",
         "chat.draft.set",
         "chat.message.append",
@@ -12744,6 +16472,194 @@ test "draining dispatcher rejects every state mutator" {
     try std.testing.expectEqualStrings(
         "invalid_state",
         jsonString(slow_parsed.value.object.get("error").?.object.get("code").?).?,
+    );
+}
+
+test "repository manifest RPCs classify through the unlocked store queue" {
+    const methods = [_][]const u8{
+        "workspace.repository.manifest.get",
+        "workspace.repository.upsert",
+        "workspace.repository.remove",
+        "workspace.repository.default.set",
+        "workspace.repository.binding.upsert",
+        "workspace.repository.binding.remove",
+    };
+    for (methods) |method| {
+        const request = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"{s}\",\"params\":{{}}}}",
+            .{method},
+        );
+        defer std.testing.allocator.free(request);
+        try std.testing.expectEqual(
+            ServerRequestClass.store,
+            try classifyServerRequest(std.testing.allocator, request),
+        );
+    }
+}
+
+test "access RPCs classify unlocked and bridge authentication fail closed" {
+    const allocator = std.testing.allocator;
+    const methods = [_][]const u8{
+        access_protocol.METHOD_DAEMON_PAIRING_GRANT_CREATE,
+        access_protocol.METHOD_DAEMON_PAIRING_GRANT_LIST,
+        access_protocol.METHOD_DAEMON_PAIRING_GRANT_REVOKE,
+        access_protocol.METHOD_DAEMON_DEVICE_LIST,
+        access_protocol.METHOD_DAEMON_DEVICE_REVOKE,
+        access_protocol.METHOD_DAEMON_PAIRING_EXCHANGE,
+        access_protocol.METHOD_DAEMON_DEVICE_AUTHENTICATE,
+        access_protocol.METHOD_DAEMON_DEVICE_AUTHORIZE,
+    };
+    for (methods) |method| {
+        const request = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"{s}\",\"params\":{{}}}}",
+            .{method},
+        );
+        defer allocator.free(request);
+        try std.testing.expect(isAccessMethod(method));
+        try std.testing.expect(methodRunsUnlocked(method));
+        try std.testing.expectEqual(
+            ServerRequestClass.unlocked_method,
+            try classifyServerRequest(allocator, request),
+        );
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+
+    const unknown_field_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"daemon.access.pairing.create","params":{"access_protocol_version":1,"ttl_seconds":60,"scopes":["runtime:read"],"future":true}}
+    );
+    defer allocator.free(unknown_field_response);
+    var unknown_field = try std.json.parseFromSlice(std.json.Value, allocator, unknown_field_response, .{});
+    defer unknown_field.deinit();
+    try std.testing.expectEqualStrings(
+        headless.protocol.ERR_INVALID_PARAMS,
+        unknown_field.value.object.get("error").?.object.get("code").?.string,
+    );
+
+    const duplicate_field_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"daemon.access.pairing.create","params":{"access_protocol_version":1,"ttl_seconds":60,"ttl_seconds":30,"scopes":["runtime:read"]}}
+    );
+    defer allocator.free(duplicate_field_response);
+    var duplicate_field = try std.json.parseFromSlice(std.json.Value, allocator, duplicate_field_response, .{});
+    defer duplicate_field.deinit();
+    try std.testing.expectEqualStrings(
+        headless.protocol.ERR_INVALID_REQUEST,
+        duplicate_field.value.object.get("error").?.object.get("code").?.string,
+    );
+
+    const wrong_version_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":2,"method":"daemon.access.pairing.list","params":{"access_protocol_version":2}}
+    );
+    defer allocator.free(wrong_version_response);
+    var wrong_version = try std.json.parseFromSlice(std.json.Value, allocator, wrong_version_response, .{});
+    defer wrong_version.deinit();
+    try std.testing.expectEqualStrings(
+        headless.protocol.ERR_PROTOCOL_INCOMPATIBLE,
+        wrong_version.value.object.get("error").?.object.get("code").?.string,
+    );
+
+    const create_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":3,"method":"daemon.access.pairing.create","params":{"access_protocol_version":1,"label":"Laptop","ttl_seconds":60,"scopes":["runtime:read","chat:write"]}}
+    );
+    defer {
+        std.crypto.secureZero(u8, create_response);
+        allocator.free(create_response);
+    }
+    var created = try std.json.parseFromSlice(std.json.Value, allocator, create_response, .{});
+    defer created.deinit();
+    const create_result = created.value.object.get("result").?.object;
+    const grant_id = create_result.get("grant_id").?.string;
+    const pairing_token = create_result.get("pairing_token").?.string;
+    defer std.crypto.secureZero(u8, @constCast(pairing_token));
+    try access_protocol.validateGrantId(grant_id);
+    try access_protocol.validateSecret(pairing_token);
+    try std.testing.expectEqualStrings(daemon.runtime_id, create_result.get("runtime_id").?.string);
+    try std.testing.expectEqualStrings(daemon.instance_id, create_result.get("instance_id").?.string);
+
+    const list_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":4,"method":"daemon.access.pairing.list","params":{"access_protocol_version":1}}
+    );
+    defer allocator.free(list_response);
+    var listed = try std.json.parseFromSlice(std.json.Value, allocator, list_response, .{});
+    defer listed.deinit();
+    const grants = listed.value.object.get("result").?.object.get("grants").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), grants.len);
+    try std.testing.expectEqualStrings(grant_id, grants[0].object.get("grant_id").?.string);
+
+    const exchange_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"{s}\",\"params\":{{\"access_protocol_version\":1,\"grant_id\":\"{s}\",\"pairing_token\":\"{s}\",\"device_label\":\"Laptop\"}}}}",
+        .{ access_protocol.METHOD_DAEMON_PAIRING_EXCHANGE, grant_id, pairing_token },
+    );
+    defer {
+        std.crypto.secureZero(u8, exchange_request);
+        allocator.free(exchange_request);
+    }
+    const exchange_response = try daemon.handleRequest(exchange_request);
+    defer {
+        std.crypto.secureZero(u8, exchange_response);
+        allocator.free(exchange_response);
+    }
+    var exchanged = try std.json.parseFromSlice(std.json.Value, allocator, exchange_response, .{});
+    defer exchanged.deinit();
+    const exchange_result = exchanged.value.object.get("result").?.object;
+    const device_id = exchange_result.get("device_id").?.string;
+    const device_credential = exchange_result.get("device_credential").?.string;
+    defer std.crypto.secureZero(u8, @constCast(device_credential));
+    try access_protocol.validateDeviceId(device_id);
+    try access_protocol.validateSecret(device_credential);
+
+    const replay_response = try daemon.handleRequest(exchange_request);
+    defer allocator.free(replay_response);
+    var replayed = try std.json.parseFromSlice(std.json.Value, allocator, replay_response, .{});
+    defer replayed.deinit();
+    try std.testing.expectEqualStrings(
+        "authentication_rejected",
+        replayed.value.object.get("error").?.object.get("code").?.string,
+    );
+
+    const authenticate_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"{s}\",\"params\":{{\"access_protocol_version\":1,\"device_id\":\"{s}\",\"device_credential\":\"{s}\",\"requested_scopes\":[\"runtime:read\"]}}}}",
+        .{ access_protocol.METHOD_DAEMON_DEVICE_AUTHENTICATE, device_id, device_credential },
+    );
+    defer {
+        std.crypto.secureZero(u8, authenticate_request);
+        allocator.free(authenticate_request);
+    }
+    const authenticate_response = try daemon.handleRequest(authenticate_request);
+    defer allocator.free(authenticate_response);
+    var authenticated = try std.json.parseFromSlice(std.json.Value, allocator, authenticate_response, .{});
+    defer authenticated.deinit();
+    const authenticated_result = authenticated.value.object.get("result").?.object;
+    try std.testing.expectEqualStrings(device_id, authenticated_result.get("device_id").?.string);
+    try std.testing.expectEqualStrings(
+        "runtime:read",
+        authenticated_result.get("scopes").?.array.items[0].string,
+    );
+
+    const authorize_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"{s}\",\"params\":{{\"access_protocol_version\":1,\"device_id\":\"{s}\",\"required_scopes\":[\"chat:write\"]}}}}",
+        .{ access_protocol.METHOD_DAEMON_DEVICE_AUTHORIZE, device_id },
+    );
+    defer allocator.free(authorize_request);
+    const authorize_response = try daemon.handleRequest(authorize_request);
+    defer allocator.free(authorize_response);
+    var authorized = try std.json.parseFromSlice(std.json.Value, allocator, authorize_response, .{});
+    defer authorized.deinit();
+    try std.testing.expectEqualStrings(
+        device_id,
+        authorized.value.object.get("result").?.object.get("device_id").?.string,
     );
 }
 
@@ -12783,12 +16699,196 @@ fn registerTestClientId(daemon: *Daemon, allocator: std.mem.Allocator) ![]const 
     return try allocator.dupe(u8, client_id);
 }
 
+fn testStoreWriteResult(
+    daemon: *Daemon,
+    allocator: std.mem.Allocator,
+    request: []const u8,
+) !store_protocol.WriteResult {
+    const response = try daemon.handleRequest(request);
+    defer allocator.free(response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("result") orelse return error.TestExpectedStoreWrite;
+    const store_revision = std.math.cast(u64, result.object.get("store_revision").?.integer) orelse
+        return error.TestExpectedStoreWrite;
+    return .{
+        .store_revision = store_revision,
+        .applied = result.object.get("applied").?.bool,
+        .duplicate = result.object.get("duplicate").?.bool,
+    };
+}
+
+fn expectRepositoryManifestAdvertisement(
+    response: []const u8,
+    allocator: std.mem.Allocator,
+    expected: bool,
+) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(
+        expected,
+        result.get("capabilities").?.object.get("repository_manifests").?.bool,
+    );
+    var found_runtime_capability = false;
+    var found_route_capability = false;
+    for (result.get("runtime_capabilities").?.array.items) |capability| {
+        const name = jsonString(capability) orelse continue;
+        if (std.mem.eql(u8, name, "repositories.manifest.v1")) {
+            found_runtime_capability = true;
+        } else if (std.mem.eql(u8, name, "chat.repository_route.v1")) {
+            found_route_capability = true;
+        }
+    }
+    try std.testing.expectEqual(expected, found_runtime_capability);
+    try std.testing.expectEqual(expected, found_route_capability);
+}
+
 fn expectErrorCodeMessage(response: []const u8, allocator: std.mem.Allocator, code: []const u8, message: []const u8) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
     defer parsed.deinit();
     const error_value = parsed.value.object.get("error").?.object;
     try std.testing.expectEqualStrings(code, jsonString(error_value.get("code").?).?);
     try std.testing.expectEqualStrings(message, jsonString(error_value.get("message").?).?);
+}
+
+fn mismatchedTestIdentity(identity: []const u8) [32]u8 {
+    std.debug.assert(identity.len == 32);
+    var mismatched: [32]u8 = undefined;
+    @memcpy(mismatched[0..], identity);
+    mismatched[0] = if (mismatched[0] == '0') '1' else '0';
+    return mismatched;
+}
+
+test "request target validation preserves local calls and accepts the exact daemon generation" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+
+    const local = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"core.status","params":{}}
+    );
+    defer allocator.free(local);
+    var local_parsed = try std.json.parseFromSlice(std.json.Value, allocator, local, .{});
+    defer local_parsed.deinit();
+    try std.testing.expect(local_parsed.value.object.get("result") != null);
+
+    const matching_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"core.status\",\"params\":{{}},\"target\":{{\"runtime_id\":\"{s}\",\"instance_id\":\"{s}\"}}}}",
+        .{ daemon.runtime_id, daemon.instance_id },
+    );
+    defer allocator.free(matching_request);
+    const matching = try daemon.handleRequest(matching_request);
+    defer allocator.free(matching);
+    var matching_parsed = try std.json.parseFromSlice(std.json.Value, allocator, matching, .{});
+    defer matching_parsed.deinit();
+    try std.testing.expect(matching_parsed.value.object.get("result") != null);
+
+    const malformed_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"core.status\",\"params\":{{}},\"target\":{{\"runtime_id\":\"{s}\"}}}}",
+        .{daemon.runtime_id},
+    );
+    defer allocator.free(malformed_request);
+    const malformed = try daemon.handleRequest(malformed_request);
+    defer allocator.free(malformed);
+    try expectErrorCodeMessage(
+        malformed,
+        allocator,
+        headless.protocol.ERR_RUNTIME_IDENTITY_MISSING,
+        "request target is missing or malformed",
+    );
+}
+
+test "wrong request targets scrub access secrets before rejection" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    const wrong_runtime = mismatchedTestIdentity(daemon.runtime_id);
+    const secret = "f" ** access_protocol.SECRET_HEX_BYTES;
+    const cases = [_]struct { method: []const u8, field: []const u8 }{
+        .{ .method = access_protocol.METHOD_DAEMON_PAIRING_EXCHANGE, .field = "pairing_token" },
+        .{ .method = access_protocol.METHOD_DAEMON_DEVICE_AUTHENTICATE, .field = "device_credential" },
+    };
+
+    for (cases) |case| {
+        const request = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"{s}\",\"params\":{{\"{s}\":\"{s}\"}},\"target\":{{\"runtime_id\":\"{s}\",\"instance_id\":\"{s}\"}}}}",
+            .{ case.method, case.field, secret, &wrong_runtime, daemon.instance_id },
+        );
+        defer {
+            std.crypto.secureZero(u8, request);
+            allocator.free(request);
+        }
+        const secret_start = std.mem.indexOf(u8, request, secret) orelse return error.TestSecretMissing;
+        const response = try daemon.handleRequest(request);
+        defer allocator.free(response);
+        try expectErrorCodeMessage(
+            response,
+            allocator,
+            headless.protocol.ERR_RUNTIME_IDENTITY_MISMATCH,
+            "request target does not match this daemon",
+        );
+        for (request[secret_start .. secret_start + secret.len]) |byte| {
+            try std.testing.expectEqual(@as(u8, 0), byte);
+        }
+    }
+}
+
+test "wrong request targets cannot reach store mutation or slow process work" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+    const client_id = try registerTestClientId(&daemon, allocator);
+    defer allocator.free(client_id);
+
+    const wrong_runtime = mismatchedTestIdentity(daemon.runtime_id);
+    const before_revision = try daemon.store_service.?.store.storeRevision();
+    const store_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"workspace.upsert\",\"params\":{{\"mutation\":{{\"request_key\":\"target-ws\",\"client_id\":\"{s}\"}},\"workspace\":{{\"workspace_id\":\"target-ws\",\"label\":\"Target\",\"path\":\"/target\"}}}},\"target\":{{\"runtime_id\":\"{s}\",\"instance_id\":\"{s}\"}}}}",
+        .{ client_id, &wrong_runtime, daemon.instance_id },
+    );
+    defer allocator.free(store_request);
+    const store_response = try daemon.handleRequest(store_request);
+    defer allocator.free(store_response);
+    try expectErrorCodeMessage(
+        store_response,
+        allocator,
+        headless.protocol.ERR_RUNTIME_IDENTITY_MISMATCH,
+        "request target does not match this daemon",
+    );
+    try std.testing.expectEqual(before_revision, try daemon.store_service.?.store.storeRevision());
+    try std.testing.expect(std.mem.indexOf(u8, store_response, daemon.runtime_id) == null);
+    try std.testing.expect(std.mem.indexOf(u8, store_response, daemon.instance_id) == null);
+
+    const wrong_instance = mismatchedTestIdentity(daemon.instance_id);
+    try std.testing.expect(daemon.registry.workspace("target-slow") == null);
+    const slow_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"process.start\",\"params\":{{\"workspace\":{{\"workspace_id\":\"target-slow\"}},\"name\":\"worker\"}},\"target\":{{\"runtime_id\":\"{s}\",\"instance_id\":\"{s}\"}}}}",
+        .{ daemon.runtime_id, &wrong_instance },
+    );
+    defer allocator.free(slow_request);
+    const slow_response = try daemon.handleSlowRegistryRequest(allocator, slow_request);
+    defer allocator.free(slow_response);
+    try expectErrorCodeMessage(
+        slow_response,
+        allocator,
+        headless.protocol.ERR_RUNTIME_IDENTITY_MISMATCH,
+        "request target does not match this daemon",
+    );
+    try std.testing.expect(daemon.registry.workspace("target-slow") == null);
+    try std.testing.expectEqual(@as(usize, 0), daemon.registry_jobs.len());
 }
 
 const WorkerDurableSnapshot = struct {
@@ -12809,7 +16909,7 @@ const WorkerDurableSnapshot = struct {
                 "coalesce((select group_concat(v, char(30)) from (select quote(w.workspace_id)||char(31)||quote(w.label)||char(31)||quote(w.path)||char(31)||quote(t.local_thread_id)||char(31)||quote(t.title)||char(31)||quote(t.provider_thread_id)||char(31)||t.provider||char(31)||t.harness v from workspaces w left join threads t on t.workspace_id=w.id order by w.workspace_id,t.local_thread_id)), ''), " ++
                 "coalesce((select group_concat(v, char(30)) from (select quote(message_id)||char(31)||quote(role)||char(31)||quote(author)||char(31)||quote(body)||char(31)||quote(image_path)||char(31)||quote(image_mime)||char(31)||quote(image_byte_size)||char(31)||quote(created_at_ms)||char(31)||quote(updated_at_ms) v from messages order by thread_id,sort_index)), ''), " ++
                 "coalesce((select group_concat(v, char(30)) from (select quote(message_id)||char(31)||quote(message_fingerprint)||char(31)||quote(sort_index)||char(31)||quote(created_at_ms)||char(31)||quote(updated_at_ms)||char(31)||quote(store_revision) v from client_message_keys order by thread_id,message_id)), ''), " ++
-                "coalesce((select group_concat(v, char(30)) from (select quote(turn_id)||char(31)||quote(workspace_id)||char(31)||quote(local_thread_id)||char(31)||quote(status)||char(31)||quote(started_at_ms)||char(31)||quote(finished_at_ms)||char(31)||quote(provider)||char(31)||quote(provider_thread_id)||char(31)||quote(error_message)||char(31)||quote(user_message_id)||char(31)||quote(committed_store_revision) v from chat_turns order by turn_id)), ''), " ++
+                "coalesce((select group_concat(v, char(30)) from (select quote(turn_id)||char(31)||quote(workspace_id)||char(31)||quote(local_thread_id)||char(31)||quote(status)||char(31)||quote(started_at_ms)||char(31)||quote(finished_at_ms)||char(31)||quote(provider)||char(31)||quote(provider_thread_id)||char(31)||quote(error_message)||char(31)||quote(failure_reason)||char(31)||quote(user_message_id)||char(31)||quote(committed_store_revision) v from chat_turns order by turn_id)), ''), " ++
                 "coalesce((select group_concat(v, char(30)) from (select quote(request_key)||char(31)||quote(operation)||char(31)||quote(fingerprint)||char(31)||quote(store_revision)||char(31)||quote(response_status)||char(31)||quote(response_payload) v from store_receipts order by request_key)), ''), " ++
                 "coalesce((select group_concat(v, char(30)) from (select quote(turn_id)||char(31)||quote(status) v from terminal_turn_replay_guard order by turn_id)), ''), " ++
                 "(select count(*) from chat_completions)",
@@ -13035,6 +17135,30 @@ test "store methods report capability_unavailable on a store-less daemon" {
     );
     defer allocator.free(status);
     try expectErrorCodeMessage(status, allocator, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "store capability is unavailable");
+
+    const manifest = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":3,"method":"workspace.repository.manifest.get","params":{"workspace_id":"w"}}
+    );
+    defer allocator.free(manifest);
+    try expectErrorCodeMessage(manifest, allocator, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "store capability is unavailable");
+}
+
+test "store-less core advertisements withhold repository manifest support" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+
+    inline for (.{ "core.status", "core.capabilities" }) |method| {
+        const request = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"{s}\",\"params\":{{}}}}",
+            .{method},
+        );
+        defer allocator.free(request);
+        const response = try daemon.handleRequest(request);
+        defer allocator.free(response);
+        try expectRepositoryManifestAdvertisement(response, allocator, false);
+    }
 }
 
 test "store dispatch commits mutations and replays duplicates" {
@@ -13084,6 +17208,169 @@ test "store dispatch commits mutations and replays duplicates" {
     try std.testing.expectEqual(@as(i64, 1), status_result.get("store_revision").?.integer);
     try std.testing.expectEqualStrings("open", jsonString(status_result.get("drain_state").?).?);
     try std.testing.expect(status_result.get("writer_ready").?.bool);
+}
+
+test "repository manifest RPCs preserve legacy projection and receipt semantics" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+    const client_id = try registerTestClientId(&daemon, allocator);
+    defer allocator.free(client_id);
+
+    inline for (.{ "core.status", "core.capabilities" }) |method| {
+        const request = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"{s}\",\"params\":{{}}}}",
+            .{method},
+        );
+        defer allocator.free(request);
+        const response = try daemon.handleRequest(request);
+        defer allocator.free(response);
+        try expectRepositoryManifestAdvertisement(response, allocator, true);
+    }
+
+    const workspace_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"workspace.upsert\",\"params\":{{\"mutation\":{{\"request_key\":\"manifest-workspace\",\"client_id\":\"{s}\"}},\"workspace\":{{\"workspace_id\":\"manifest-ws\",\"label\":\"Legacy Workspace\",\"path\":\"/legacy/root\"}}}}}}",
+        .{client_id},
+    );
+    defer allocator.free(workspace_request);
+    _ = try testStoreWriteResult(&daemon, allocator, workspace_request);
+
+    const legacy_response = try daemon.handleRequest(
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"workspace.repository.manifest.get\",\"params\":{\"workspace_id\":\"manifest-ws\"}}",
+    );
+    defer allocator.free(legacy_response);
+    var legacy = try std.json.parseFromSlice(std.json.Value, allocator, legacy_response, .{});
+    defer legacy.deinit();
+    const legacy_result = legacy.value.object.get("result").?.object;
+    try std.testing.expectEqualStrings(
+        store_protocol.PRIMARY_REPOSITORY_ID,
+        jsonString(legacy_result.get("default_repository_id").?).?,
+    );
+    const legacy_repositories = legacy_result.get("repositories").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), legacy_repositories.len);
+    try std.testing.expectEqualStrings(
+        store_protocol.PRIMARY_REPOSITORY_ID,
+        jsonString(legacy_repositories[0].object.get("repository_id").?).?,
+    );
+    const legacy_bindings = legacy_repositories[0].object.get("bindings").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), legacy_bindings.len);
+    try std.testing.expectEqualStrings(
+        "/legacy/root",
+        jsonString(legacy_bindings[0].object.get("root_path").?).?,
+    );
+
+    const upsert_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"workspace.repository.upsert\",\"params\":{{\"mutation\":{{\"request_key\":\"repo-upsert\",\"client_id\":\"{s}\"}},\"workspace_id\":\"manifest-ws\",\"repository\":{{\"repository_id\":\"repo-api\",\"label\":\"API\",\"vcs_identity\":\"git@example.com:org/api.git\",\"default_branch\":\"main\"}}}}}}",
+        .{client_id},
+    );
+    defer allocator.free(upsert_request);
+    const upserted = try testStoreWriteResult(&daemon, allocator, upsert_request);
+    const replayed = try testStoreWriteResult(&daemon, allocator, upsert_request);
+    try std.testing.expectEqual(upserted.store_revision, replayed.store_revision);
+    try std.testing.expectEqual(upserted.applied, replayed.applied);
+
+    const invalid_binding = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"workspace.repository.binding.upsert\",\"params\":{{\"mutation\":{{\"request_key\":\"binding-invalid\",\"client_id\":\"{s}\"}},\"workspace_id\":\"manifest-ws\",\"repository_id\":\"repo-api\",\"binding\":{{\"runtime_id\":\"not-canonical\",\"root_path\":\"/srv/api\",\"availability\":\"available\"}}}}}}",
+        .{client_id},
+    );
+    defer allocator.free(invalid_binding);
+    const invalid_response = try daemon.handleRequest(invalid_binding);
+    defer allocator.free(invalid_response);
+    try expectErrorCodeMessage(
+        invalid_response,
+        allocator,
+        headless.protocol.ERR_INVALID_PARAMS,
+        "invalid params",
+    );
+
+    const binding_upsert = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"workspace.repository.binding.upsert\",\"params\":{{\"mutation\":{{\"request_key\":\"binding-upsert\",\"client_id\":\"{s}\"}},\"workspace_id\":\"manifest-ws\",\"repository_id\":\"repo-api\",\"binding\":{{\"runtime_id\":\"0123456789abcdef0123456789abcdef\",\"root_path\":\"/srv/api\",\"availability\":\"available\"}}}}}}",
+        .{client_id},
+    );
+    defer allocator.free(binding_upsert);
+    _ = try testStoreWriteResult(&daemon, allocator, binding_upsert);
+
+    const default_api = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"workspace.repository.default.set\",\"params\":{{\"mutation\":{{\"request_key\":\"default-api\",\"client_id\":\"{s}\"}},\"workspace_id\":\"manifest-ws\",\"repository_id\":\"repo-api\"}}}}",
+        .{client_id},
+    );
+    defer allocator.free(default_api);
+    _ = try testStoreWriteResult(&daemon, allocator, default_api);
+
+    const manifest_response = try daemon.handleRequest(
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"workspace.repository.manifest.get\",\"params\":{\"workspace_id\":\"manifest-ws\"}}",
+    );
+    defer allocator.free(manifest_response);
+    var manifest = try std.json.parseFromSlice(std.json.Value, allocator, manifest_response, .{});
+    defer manifest.deinit();
+    const manifest_result = manifest.value.object.get("result").?.object;
+    try std.testing.expectEqualStrings(
+        "repo-api",
+        jsonString(manifest_result.get("default_repository_id").?).?,
+    );
+    try std.testing.expectEqual(@as(usize, 2), manifest_result.get("repositories").?.array.items.len);
+    var found_api = false;
+    for (manifest_result.get("repositories").?.array.items) |repository_value| {
+        const repository = repository_value.object;
+        if (!std.mem.eql(u8, jsonString(repository.get("repository_id").?).?, "repo-api")) continue;
+        found_api = true;
+        try std.testing.expectEqualStrings("API", jsonString(repository.get("label").?).?);
+        try std.testing.expectEqualStrings("main", jsonString(repository.get("default_branch").?).?);
+        const bindings = repository.get("bindings").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), bindings.len);
+        try std.testing.expectEqualStrings("/srv/api", jsonString(bindings[0].object.get("root_path").?).?);
+    }
+    try std.testing.expect(found_api);
+
+    const binding_remove = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"workspace.repository.binding.remove\",\"params\":{{\"mutation\":{{\"request_key\":\"binding-remove\",\"client_id\":\"{s}\"}},\"workspace_id\":\"manifest-ws\",\"repository_id\":\"repo-api\",\"runtime_id\":\"0123456789abcdef0123456789abcdef\"}}}}",
+        .{client_id},
+    );
+    defer allocator.free(binding_remove);
+    _ = try testStoreWriteResult(&daemon, allocator, binding_remove);
+
+    const default_primary = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"workspace.repository.default.set\",\"params\":{{\"mutation\":{{\"request_key\":\"default-primary\",\"client_id\":\"{s}\"}},\"workspace_id\":\"manifest-ws\",\"repository_id\":\"primary\"}}}}",
+        .{client_id},
+    );
+    defer allocator.free(default_primary);
+    _ = try testStoreWriteResult(&daemon, allocator, default_primary);
+
+    const repository_remove = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"workspace.repository.remove\",\"params\":{{\"mutation\":{{\"request_key\":\"repo-remove\",\"client_id\":\"{s}\"}},\"workspace_id\":\"manifest-ws\",\"repository_id\":\"repo-api\"}}}}",
+        .{client_id},
+    );
+    defer allocator.free(repository_remove);
+    _ = try testStoreWriteResult(&daemon, allocator, repository_remove);
+
+    const final_response = try daemon.handleRequest(
+        "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"workspace.repository.manifest.get\",\"params\":{\"workspace_id\":\"manifest-ws\"}}",
+    );
+    defer allocator.free(final_response);
+    var final_manifest = try std.json.parseFromSlice(std.json.Value, allocator, final_response, .{});
+    defer final_manifest.deinit();
+    const final_result = final_manifest.value.object.get("result").?.object;
+    try std.testing.expectEqualStrings(
+        store_protocol.PRIMARY_REPOSITORY_ID,
+        jsonString(final_result.get("default_repository_id").?).?,
+    );
+    try std.testing.expectEqual(@as(usize, 1), final_result.get("repositories").?.array.items.len);
 }
 
 test "store mutations from unknown clients are invalid_params" {
@@ -14136,6 +18423,21 @@ const TestCliPathResolver = struct {
     }
 };
 
+test "Linux session CLI path drops replaced executable suffix" {
+    try std.testing.expectEqualStrings(
+        "/opt/verde/bin/verde-daemon",
+        executablePathWithoutDeletedSuffix(.linux, "/opt/verde/bin/verde-daemon (deleted)"),
+    );
+    try std.testing.expectEqualStrings(
+        "/opt/verde/bin/verde-daemon",
+        executablePathWithoutDeletedSuffix(.linux, "/opt/verde/bin/verde-daemon"),
+    );
+    try std.testing.expectEqualStrings(
+        "/opt/verde/bin/verde-daemon (deleted)",
+        executablePathWithoutDeletedSuffix(.macos, "/opt/verde/bin/verde-daemon (deleted)"),
+    );
+}
+
 test "Windows CLI resolver selects packaged console executable" {
     const allocator = std.testing.allocator;
     var resolver: TestCliPathResolver = .{ .mappings = &.{.{
@@ -14241,6 +18543,44 @@ test "durable turn commit is exactly once and interrupt sweep marks running rows
         try std.testing.expectEqualStrings("interrupted", row.text(0));
     }
 
+    const interrupted_tail = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":71,"method":"chat.turn.tail","params":{"turn_id":"turn-running","after_seq":0}}
+    );
+    defer allocator.free(interrupted_tail);
+    var parsed_interrupted_tail = try std.json.parseFromSlice(std.json.Value, allocator, interrupted_tail, .{});
+    defer parsed_interrupted_tail.deinit();
+    const interrupted_result = parsed_interrupted_tail.value.object.get("result").?.object;
+    try std.testing.expectEqualStrings("interrupted", interrupted_result.get("status").?.string);
+    try std.testing.expectEqualStrings(INTERRUPTED_TURN_MESSAGE, interrupted_result.get("error_message").?.string);
+    try std.testing.expect(interrupted_result.get("committed_store_revision").? == .null);
+
+    {
+        lockStoreService(daemon.store_service.?);
+        defer daemon.store_service.?.mutex.unlock();
+        var guard = (try daemon.store_service.?.store.conn.row(
+            "select status from terminal_turn_replay_guard where turn_id = 'turn-running'",
+            .{},
+        )).?;
+        defer guard.deinit();
+        try std.testing.expectEqualStrings("interrupted", guard.text(0));
+    }
+
+    // Reopen the store with no volatile turn state. Reusing the swept ID is a
+    // terminal idempotency error before request validation or worker launch.
+    detachTestStoreService(&daemon);
+    try attachTestStoreService(&daemon, db_path);
+    const replay_start = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":73,"method":"chat.turn.start","params":{"turn_id":"turn-running","workspace_id":"ws-sweep","local_thread_id":"t-sweep","project_path":"/tmp/sweep","prompt":"must not run","thread_title":"Sweep","provider":"codex","harness":"local_cli","message_id":"retry-user","test_stub":true}}
+    );
+    defer allocator.free(replay_start);
+    try expectErrorCodeMessage(
+        replay_start,
+        allocator,
+        headless.protocol.ERR_INVALID_STATE,
+        "turn id is already consumed; retry with a new turn id",
+    );
+    try std.testing.expectEqual(@as(usize, 0), daemon.chat_turns.items.len);
+
     // MAJOR-1/2 pin: pre-stage a 'running' row for the turn that will commit
     // (upsert supersedes it inside commitTurn; no external delete).
     {
@@ -14269,15 +18609,15 @@ test "durable turn commit is exactly once and interrupt sweep marks running rows
         .owned_image_paths = image_paths,
         .started_at_ms = 10,
         .finished_at_ms = 20,
-        .status = .completed,
+        .status = .failed,
         .worker_done = true,
         .durability_pending = true,
-        .result_reply_text = try allocator.dupe(u8, "reply"),
+        .error_message = try allocator.dupe(u8, "Provider login expired."),
+        .failure_reason = .provider_not_authenticated,
         .generated_title = try allocator.dupeZ(u8, "Generated Commit Title"),
         .user_message_id = try allocator.dupe(u8, "user-1"),
     };
-    turn.appendStringEvent(allocator, "assistant_delta", "text", "reply");
-    turn.appendEvent(allocator, "completed", "{}");
+    turn.appendStringEvent(allocator, "failed", "message", "Provider login expired.");
     // Owned by daemon.chat_turns (freed in daemon.deinit).
     try daemon.chat_turns.append(allocator, turn);
 
@@ -14303,28 +18643,49 @@ test "durable turn commit is exactly once and interrupt sweep marks running rows
     try std.testing.expectEqual(first_revision, turn.committed_store_revision.?);
     try std.testing.expect(!turn.durability_pending);
 
-    lockStoreService(daemon.store_service.?);
-    defer daemon.store_service.?.mutex.unlock();
-    var count = (try daemon.store_service.?.store.conn.row(
-        "select count(*) from chat_turns where turn_id = 'turn-commit-once'",
-        .{},
-    )).?;
-    defer count.deinit();
-    try std.testing.expectEqual(@as(i64, 1), count.int(0));
+    {
+        lockStoreService(daemon.store_service.?);
+        defer daemon.store_service.?.mutex.unlock();
+        var count = (try daemon.store_service.?.store.conn.row(
+            "select count(*) from chat_turns where turn_id = 'turn-commit-once'",
+            .{},
+        )).?;
+        defer count.deinit();
+        try std.testing.expectEqual(@as(i64, 1), count.int(0));
 
-    var ledger_status = (try daemon.store_service.?.store.conn.row(
-        "select status from chat_turns where turn_id = 'turn-commit-once'",
-        .{},
-    )).?;
-    defer ledger_status.deinit();
-    try std.testing.expectEqualStrings("completed", ledger_status.text(0));
+        var ledger_status = (try daemon.store_service.?.store.conn.row(
+            "select status, failure_reason from chat_turns where turn_id = 'turn-commit-once'",
+            .{},
+        )).?;
+        defer ledger_status.deinit();
+        try std.testing.expectEqualStrings("failed", ledger_status.text(0));
+        try std.testing.expectEqualStrings("provider_not_authenticated", ledger_status.text(1));
 
-    var receipt = (try daemon.store_service.?.store.conn.row(
-        "select count(*) from store_receipts where request_key = 'turn:turn-commit-once:commit'",
-        .{},
-    )).?;
-    defer receipt.deinit();
-    try std.testing.expectEqual(@as(i64, 1), receipt.int(0));
+        var receipt = (try daemon.store_service.?.store.conn.row(
+            "select count(*) from store_receipts where request_key = 'turn:turn-commit-once:commit'",
+            .{},
+        )).?;
+        defer receipt.deinit();
+        try std.testing.expectEqual(@as(i64, 1), receipt.int(0));
+    }
+
+    // Drop all volatile turn state and reopen the store, matching a daemon
+    // restart. The durable tail must publish the stored stable code.
+    daemon.chat_turns.orderedRemove(0).deinit(allocator);
+    detachTestStoreService(&daemon);
+    try attachTestStoreService(&daemon, db_path);
+    const durable_tail = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":72,"method":"chat.turn.tail","params":{"turn_id":"turn-commit-once","after_seq":0}}
+    );
+    defer allocator.free(durable_tail);
+    var parsed_durable_tail = try std.json.parseFromSlice(std.json.Value, allocator, durable_tail, .{});
+    defer parsed_durable_tail.deinit();
+    const durable_result = parsed_durable_tail.value.object.get("result").?.object;
+    try std.testing.expectEqualStrings("failed", durable_result.get("status").?.string);
+    try std.testing.expectEqualStrings(
+        "provider_not_authenticated",
+        durable_result.get("failure_reason").?.string,
+    );
 }
 
 test "legacy interrupted acceptance conflict never terminalizes unowned work" {
@@ -14352,6 +18713,10 @@ test "durable reads decode canonical and historical daemon chat role codes" {
         .mutation = .{ .request_key = "dto-ws", .client_id = "daemon" },
         .workspace = .{ .workspace_id = "ws-dto", .label = "DTO", .path = "/tmp/dto" },
     });
+    _ = try daemon.store_service.?.store.upsertWorkspace(.{
+        .mutation = .{ .request_key = "dto-ws-2", .client_id = "daemon" },
+        .workspace = .{ .workspace_id = "ws-dto-2", .label = "DTO 2", .path = "/tmp/dto-2" },
+    });
     _ = try daemon.store_service.?.store.upsertThread(.{
         .mutation = .{ .request_key = "dto-thread", .client_id = "daemon" },
         .workspace_id = "ws-dto",
@@ -14366,6 +18731,16 @@ test "durable reads decode canonical and historical daemon chat role codes" {
             .fast_mode = "on",
             .access_mode = "supervised",
             .draft = "staged DTO draft",
+        },
+    });
+    _ = try daemon.store_service.?.store.upsertThread(.{
+        .mutation = .{ .request_key = "dto-thread-2", .client_id = "daemon" },
+        .workspace_id = "ws-dto",
+        .thread = .{
+            .local_thread_id = "t-dto-2",
+            .title = "Second DTO thread",
+            .provider = "claude",
+            .harness = "local_cli",
         },
     });
     const thread_row = (try daemon.store_service.?.store.conn.row(
@@ -14495,6 +18870,164 @@ test "durable reads decode canonical and historical daemon chat role codes" {
     try std.testing.expectEqualStrings("none", listed_thread.get("reasoning_variant").?.string);
     try std.testing.expectEqualStrings("on", listed_thread.get("fast_mode").?.string);
     try std.testing.expectEqualStrings("supervised", listed_thread.get("access_mode").?.string);
+
+    const first_thread_page_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":4,"method":"chat.thread.list","params":{"workspace_id":"ws-dto","limit":1}}
+    );
+    defer allocator.free(first_thread_page_response);
+    var first_thread_page = try std.json.parseFromSlice(std.json.Value, allocator, first_thread_page_response, .{});
+    defer first_thread_page.deinit();
+    const first_thread_result = first_thread_page.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(usize, 1), first_thread_result.get("threads").?.array.items.len);
+    const first_thread_cursor = first_thread_result.get("next_cursor").?.string;
+    const first_thread_revision = std.math.cast(u64, first_thread_result.get("store_revision").?.integer) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(first_thread_cursor.len <= store_protocol.MAX_PAGE_CURSOR_BYTES);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try headless.pagination.decode(first_thread_cursor, .thread, first_thread_revision, "ws-dto"),
+    );
+
+    const second_thread_page_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"chat.thread.list\",\"params\":{{\"workspace_id\":\"ws-dto\",\"limit\":1,\"cursor\":\"{s}\"}}}}",
+        .{first_thread_cursor},
+    );
+    defer allocator.free(second_thread_page_request);
+    const second_thread_page_response = try daemon.handleRequest(second_thread_page_request);
+    defer allocator.free(second_thread_page_response);
+    var second_thread_page = try std.json.parseFromSlice(std.json.Value, allocator, second_thread_page_response, .{});
+    defer second_thread_page.deinit();
+    const second_thread_result = second_thread_page.value.object.get("result").?.object;
+    try std.testing.expectEqualStrings(
+        "t-dto-2",
+        second_thread_result.get("threads").?.array.items[0].object.get("local_thread_id").?.string,
+    );
+    try std.testing.expect(second_thread_result.get("next_cursor").? == .null);
+
+    const workspace_page_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":6,"method":"workspace.list","params":{"limit":1}}
+    );
+    defer allocator.free(workspace_page_response);
+    var workspace_page = try std.json.parseFromSlice(std.json.Value, allocator, workspace_page_response, .{});
+    defer workspace_page.deinit();
+    const workspace_result = workspace_page.value.object.get("result").?.object;
+    const workspace_item = workspace_result.get("workspaces").?.array.items[0].object;
+    try std.testing.expectEqualStrings("primary", workspace_item.get("default_repository_id").?.string);
+    const primary_repository = workspace_item.get("repositories").?.array.items[0].object;
+    try std.testing.expectEqualStrings("primary", primary_repository.get("repository_id").?.string);
+    const primary_binding = primary_repository.get("bindings").?.array.items[0].object;
+    try std.testing.expectEqualStrings(daemon.runtime_id, primary_binding.get("runtime_id").?.string);
+    try std.testing.expectEqualStrings("/tmp/dto", primary_binding.get("root_path").?.string);
+    const workspace_cursor = workspace_result.get("next_cursor").?.string;
+    const workspace_revision = std.math.cast(u64, workspace_result.get("store_revision").?.integer) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try headless.pagination.decode(workspace_cursor, .workspace, workspace_revision, "active"),
+    );
+
+    const mismatched_workspace_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":61,\"method\":\"workspace.list\",\"params\":{{\"limit\":1,\"include_archived\":true,\"cursor\":\"{s}\"}}}}",
+        .{workspace_cursor},
+    );
+    defer allocator.free(mismatched_workspace_request);
+    const mismatched_workspace_response = try daemon.handleRequest(mismatched_workspace_request);
+    defer allocator.free(mismatched_workspace_response);
+    try expectErrorCodeMessage(
+        mismatched_workspace_response,
+        allocator,
+        headless.protocol.ERR_INVALID_PARAMS,
+        "page cursor does not match this query; restart pagination without a cursor",
+    );
+
+    {
+        lockStoreService(daemon.store_service.?);
+        defer daemon.store_service.?.mutex.unlock();
+        _ = try daemon.store_service.?.store.upsertThread(.{
+            .mutation = .{ .request_key = "dto-thread-cursor-stale", .client_id = "daemon" },
+            .workspace_id = "ws-dto",
+            .thread = .{
+                .local_thread_id = "t-dto-cursor-stale",
+                .title = "Cursor invalidation",
+                .provider = "codex",
+                .harness = "local_cli",
+            },
+        });
+    }
+
+    const stale_thread_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":62,\"method\":\"chat.thread.list\",\"params\":{{\"workspace_id\":\"ws-dto\",\"limit\":1,\"cursor\":\"{s}\"}}}}",
+        .{first_thread_cursor},
+    );
+    defer allocator.free(stale_thread_request);
+    const stale_thread_response = try daemon.handleRequest(stale_thread_request);
+    defer allocator.free(stale_thread_response);
+    try expectErrorCodeMessage(
+        stale_thread_response,
+        allocator,
+        headless.protocol.ERR_REVISION_EXPIRED,
+        "page cursor is stale; restart pagination without a cursor",
+    );
+
+    const stale_workspace_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":63,\"method\":\"workspace.list\",\"params\":{{\"limit\":1,\"cursor\":\"{s}\"}}}}",
+        .{workspace_cursor},
+    );
+    defer allocator.free(stale_workspace_request);
+    const stale_workspace_response = try daemon.handleRequest(stale_workspace_request);
+    defer allocator.free(stale_workspace_response);
+    try expectErrorCodeMessage(
+        stale_workspace_response,
+        allocator,
+        headless.protocol.ERR_REVISION_EXPIRED,
+        "page cursor is stale; restart pagination without a cursor",
+    );
+
+    const legacy_cursor_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":64,"method":"workspace.list","params":{"limit":1,"cursor":"o:1"}}
+    );
+    defer allocator.free(legacy_cursor_response);
+    try expectErrorCodeMessage(
+        legacy_cursor_response,
+        allocator,
+        headless.protocol.ERR_INVALID_PARAMS,
+        "invalid page cursor; restart pagination without a cursor",
+    );
+
+    const backward_page_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":7,"method":"chat.message.list","params":{"workspace_id":"ws-dto","local_thread_id":"t-dto","limit":3}}
+    );
+    defer allocator.free(backward_page_response);
+    var backward_page = try std.json.parseFromSlice(std.json.Value, allocator, backward_page_response, .{});
+    defer backward_page.deinit();
+    const backward_result = backward_page.value.object.get("result").?.object;
+    const backward_messages = backward_result.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), backward_messages.len);
+    try std.testing.expectEqual(@as(i64, 6), backward_messages[0].object.get("sort_index").?.integer);
+    try std.testing.expectEqual(@as(i64, 8), backward_messages[2].object.get("sort_index").?.integer);
+    try std.testing.expectEqualStrings("b:6", backward_result.get("next_cursor").?.string);
+
+    const forward_page_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":8,"method":"chat.message.list","params":{"workspace_id":"ws-dto","local_thread_id":"t-dto","direction":"forward","limit":2}}
+    );
+    defer allocator.free(forward_page_response);
+    var forward_page = try std.json.parseFromSlice(std.json.Value, allocator, forward_page_response, .{});
+    defer forward_page.deinit();
+    const forward_result = forward_page.value.object.get("result").?.object;
+    const forward_messages = forward_result.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(i64, 0), forward_messages[0].object.get("sort_index").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), forward_messages[1].object.get("sort_index").?.integer);
+    try std.testing.expectEqualStrings("f:1", forward_result.get("next_cursor").?.string);
+
+    const oversized_page_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":9,"method":"chat.message.list","params":{"workspace_id":"ws-dto","local_thread_id":"t-dto","limit":201}}
+    );
+    defer allocator.free(oversized_page_response);
+    try expectErrorCodeMessage(oversized_page_response, allocator, headless.protocol.ERR_INVALID_PARAMS, "invalid params");
 }
 
 test "chat turn tail pages large replay before publishing terminal status" {
@@ -14609,4 +19142,24 @@ test "chat turn tail falls back to durable terminal record after consume" {
     var unknown_parsed = try std.json.parseFromSlice(std.json.Value, allocator, unknown, .{});
     defer unknown_parsed.deinit();
     try std.testing.expectEqualStrings("not_found", unknown_parsed.value.object.get("error").?.object.get("code").?.string);
+}
+
+test "Connect bootstrap RPC secret copies are erased and retry is bounded" {
+    const encoded = try std.testing.allocator.dupe(u8,
+        \\{"grant_jwt":"secret-bootstrap-grant"}
+    );
+    defer std.testing.allocator.free(encoded);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+    const secret = parsed.value.object.get("grant_jwt").?.string;
+    eraseConnectSecretParams(connect_protocol.METHOD_BOOTSTRAP_CONSUME, parsed.value);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** "secret-bootstrap-grant".len), secret);
+
+    var attempt: u16 = 0;
+    while (attempt < 1_024) : (attempt += 1) {
+        const delay = connectRetryDelayMs("0123456789abcdef0123456789abcdef", attempt);
+        try std.testing.expect(delay >= 1_000 and delay <= 300_000);
+    }
 }
