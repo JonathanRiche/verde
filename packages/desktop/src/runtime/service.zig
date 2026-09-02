@@ -852,12 +852,19 @@ const TestTunnel = struct {
     }
 };
 
+const TEST_ATTACHMENT_ID = "aabbccddeeff00112233445566778899";
+
 const TestRpc = struct {
     retained: std.atomic.Value(usize) = .init(0),
     targeted_calls: std.atomic.Value(usize) = .init(0),
     repository_route_calls: std.atomic.Value(usize) = .init(0),
+    attachment_create_calls: std.atomic.Value(usize) = .init(0),
+    attachment_append_calls: std.atomic.Value(usize) = .init(0),
+    attachment_commit_calls: std.atomic.Value(usize) = .init(0),
+    attachment_turn_reference_calls: std.atomic.Value(usize) = .init(0),
     valid_targets: std.atomic.Value(bool) = .init(true),
     valid_repository_route: std.atomic.Value(bool) = .init(true),
+    valid_attachment_flow: std.atomic.Value(bool) = .init(true),
 
     fn retain(raw_context: ?*anyopaque) void {
         const self: *TestRpc = @ptrCast(@alignCast(raw_context.?));
@@ -920,6 +927,62 @@ const TestRpc = struct {
                 params.object.get("image_paths") == null and
                 params.object.get("images") == null;
             if (!valid) self.valid_repository_route.store(false, .release);
+            // Repository turns may reference staged uploads only as opaque
+            // IDs — never as desktop filesystem paths anywhere in the frame.
+            if (valid) {
+                if (params.object.get("attachments")) |attachments| {
+                    if (attachments == .array and attachments.array.items.len != 0) {
+                        _ = self.attachment_turn_reference_calls.fetchAdd(1, .acq_rel);
+                        for (attachments.array.items) |entry| {
+                            const ok = entry == .string and std.mem.eql(u8, entry.string, TEST_ATTACHMENT_ID);
+                            if (!ok) self.valid_attachment_flow.store(false, .release);
+                        }
+                    }
+                }
+                if (std.mem.indexOf(u8, rpc_json, "/desktop/") != null) {
+                    self.valid_attachment_flow.store(false, .release);
+                }
+            }
+        }
+        if (std.mem.eql(u8, parsed.request.method, "chat.attachment.create")) {
+            _ = self.attachment_create_calls.fetchAdd(1, .acq_rel);
+            const params = parsed.request.params;
+            const valid = params == .object and
+                params.object.get("mime") != null and
+                params.object.get("byte_size") != null and
+                params.object.get("path") == null and
+                std.mem.indexOf(u8, rpc_json, "/desktop/") == null;
+            if (!valid) self.valid_attachment_flow.store(false, .release);
+            return headless.encodeOkResponse(allocator, parsed.request.id, .{
+                .attachment_id = TEST_ATTACHMENT_ID,
+                .max_chunk_bytes = 48_000,
+            }) catch error.OutOfMemory;
+        }
+        if (std.mem.eql(u8, parsed.request.method, "chat.attachment.append")) {
+            _ = self.attachment_append_calls.fetchAdd(1, .acq_rel);
+            const params = parsed.request.params;
+            const id_value = if (params == .object) params.object.get("attachment_id") orelse std.json.Value.null else std.json.Value.null;
+            const valid = params == .object and
+                id_value == .string and
+                std.mem.eql(u8, id_value.string, TEST_ATTACHMENT_ID) and
+                params.object.get("offset") != null and
+                params.object.get("data") != null;
+            if (!valid) self.valid_attachment_flow.store(false, .release);
+            return headless.encodeOkResponse(allocator, parsed.request.id, .{
+                .received_bytes = 16,
+            }) catch error.OutOfMemory;
+        }
+        if (std.mem.eql(u8, parsed.request.method, "chat.attachment.commit")) {
+            _ = self.attachment_commit_calls.fetchAdd(1, .acq_rel);
+            const params = parsed.request.params;
+            const id_value = if (params == .object) params.object.get("attachment_id") orelse std.json.Value.null else std.json.Value.null;
+            const valid = id_value == .string and std.mem.eql(u8, id_value.string, TEST_ATTACHMENT_ID);
+            if (!valid) self.valid_attachment_flow.store(false, .release);
+            return headless.encodeOkResponse(allocator, parsed.request.id, .{
+                .attachment_id = TEST_ATTACHMENT_ID,
+                .byte_size = 16,
+                .mime = "image/png",
+            }) catch error.OutOfMemory;
         }
         return headless.encodeOkResponse(
             allocator,
@@ -949,6 +1012,7 @@ fn testStatus(runtime_id: []const u8) headless.StatusResult {
             "core.snapshot.v1",
             manager_mod.REPOSITORY_MANIFEST_CAPABILITY,
             manager_mod.REPOSITORY_CHAT_ROUTE_CAPABILITY,
+            manager_mod.CHAT_ATTACHMENT_CAPABILITY,
         },
         .limits = .{
             .max_request_bytes = 65_536,
@@ -1099,6 +1163,9 @@ test "service reports first contact without trusting until explicit approval" {
     try std.testing.expect(ready.verified_runtime_matches_pin);
     try std.testing.expect(ready.repository_manifest_capable);
     try std.testing.expect(ready.repository_chat_route_capable);
+    try std.testing.expect(ready.chat_attachment_capable);
+    try std.testing.expectEqual(@as(usize, 1_048_576), ready.max_attachment_bytes);
+    try std.testing.expectEqual(@as(usize, 65_536), ready.max_request_bytes);
     const ticket = try service.beginRpc(configured.id, "core.snapshot", .{});
     var result = try waitForRpcResult(&service, ticket);
     defer result.deinit();
@@ -1131,6 +1198,63 @@ test "service reports first contact without trusting until explicit approval" {
     defer route_result.deinit();
     try std.testing.expectEqual(@as(usize, 1), rpc.repository_route_calls.load(.acquire));
     try std.testing.expect(rpc.valid_repository_route.load(.acquire));
+
+    // Staged attachment upload chain: create -> append -> commit, then a
+    // repository turn that references only the returned opaque id. The fake
+    // runtime asserts no desktop-local path or legacy image params leak
+    // through any frame in the chain.
+    const create_ticket = try service.beginRpc(configured.id, "chat.attachment.create", .{
+        .mime = "image/png",
+        .byte_size = 16,
+    });
+    var create_result = try waitForRpcResult(&service, create_ticket);
+    defer create_result.deinit();
+    switch (create_result) {
+        .response => {},
+        .failed, .canceled => return error.TestExpectedRpcResponse,
+    }
+    const append_ticket = try service.beginRpc(configured.id, "chat.attachment.append", .{
+        .attachment_id = TEST_ATTACHMENT_ID,
+        .offset = 0,
+        .data = "iVBORw0KGgoAAAANSUhEUg==",
+    });
+    var append_result = try waitForRpcResult(&service, append_ticket);
+    defer append_result.deinit();
+    const commit_ticket = try service.beginRpc(configured.id, "chat.attachment.commit", .{
+        .attachment_id = TEST_ATTACHMENT_ID,
+    });
+    var commit_result = try waitForRpcResult(&service, commit_ticket);
+    defer commit_result.deinit();
+    const attachment_ids: []const []const u8 = &.{TEST_ATTACHMENT_ID};
+    const attachment_turn_ticket = try service.beginRpc(configured.id, "chat.turn.start", .{
+        .turn_id = "route-turn-attach",
+        .workspace_id = "workspace",
+        .local_thread_id = "thread",
+        .repository_id = "repo-api",
+        .relative_cwd = "services/api",
+        .provider = "codex",
+        .harness = "local_cli",
+        .prompt = "describe this image",
+        .provider_thread_id = null,
+        .thread_title = "Routed",
+        .model_ref = null,
+        .reasoning_effort = null,
+        .opencode_reasoning_variant = null,
+        .cursor_model_params_json = null,
+        .fast_mode = false,
+        .access_mode = "supervised",
+        .message_id = "route-message-attach",
+        .attachments = attachment_ids,
+    });
+    var attachment_turn_result = try waitForRpcResult(&service, attachment_turn_ticket);
+    defer attachment_turn_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rpc.attachment_create_calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), rpc.attachment_append_calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), rpc.attachment_commit_calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), rpc.attachment_turn_reference_calls.load(.acquire));
+    try std.testing.expect(rpc.valid_attachment_flow.load(.acquire));
+    try std.testing.expect(rpc.valid_repository_route.load(.acquire));
+
     try service.disable(configured.id);
     try waitForCleanup(&service, configured.id);
     try std.testing.expectEqual(@as(usize, 0), tunnel.retained.load(.acquire));

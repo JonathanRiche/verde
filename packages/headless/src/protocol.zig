@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const access_protocol = @import("access_protocol.zig");
+const attachment_protocol = @import("attachment_protocol.zig");
 const runtime_identity = @import("runtime_identity.zig");
 
 /// Current headless protocol version advertised by core.status / core.capabilities.
@@ -356,6 +357,7 @@ pub const RUNTIME_CAPABILITY_NAMES = RUNTIME_CAPABILITY_NAMES_BASE ++
     [_][]const u8{
         "repositories.manifest.v1",
         "chat.repository_route.v1",
+        attachment_protocol.CHAT_ATTACHMENT_CAPABILITY,
         access_protocol.PAIR_RUNTIME_CAPABILITY,
     };
 
@@ -798,6 +800,31 @@ test "store-backed runtimes advertise complete Pair transport enforcement" {
     }
     try std.testing.expect(found_store_backed);
     try std.testing.expect(!found_base);
+}
+
+test "advertised chat attachment capability is reachable through paired sessions" {
+    // A runtime must never advertise chat.attachments.v1 while the paired
+    // gateway policy fails closed on the methods that capability names: the
+    // desktop trusts the capability list to decide whether to stage uploads.
+    var advertised = false;
+    for (RUNTIME_CAPABILITY_NAMES) |capability| {
+        if (std.mem.eql(u8, capability, attachment_protocol.CHAT_ATTACHMENT_CAPABILITY)) advertised = true;
+    }
+    try std.testing.expect(advertised);
+
+    const default_mask = try access_protocol.scopeMask(&access_protocol.DEFAULT_SCOPE_NAMES);
+    const methods = [_][]const u8{
+        attachment_protocol.METHOD_CHAT_ATTACHMENT_CREATE,
+        attachment_protocol.METHOD_CHAT_ATTACHMENT_APPEND,
+        attachment_protocol.METHOD_CHAT_ATTACHMENT_COMMIT,
+        // The turn that claims the staged ids must be reachable too.
+        "chat.turn.start",
+    };
+    for (methods) |method| {
+        const required = access_protocol.requiredScopeMaskForRpc(method) orelse return error.PairedMethodUnreachable;
+        try std.testing.expectEqual(access_protocol.scopeBit(.chat_write), required);
+        try std.testing.expect(access_protocol.scopeMaskContains(default_mask, required));
+    }
 }
 
 test "parseResponse reads error envelopes" {

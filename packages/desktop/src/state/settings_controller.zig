@@ -158,6 +158,9 @@ pub const State = struct {
     provider_onboarding_visible: bool = false,
     provider_onboarding_dismissed: bool = false,
     modal_visible: bool = false,
+    /// One-shot: scroll the body to the Runtimes & connections card on the
+    /// next layout pass (set by "Manage connections" in Workspace Settings).
+    scroll_to_runtimes: bool = false,
     modal_anim_progress: f32 = 0.0,
     modal_anim_last_ms: i64 = 0,
     modal_closing: bool = false,

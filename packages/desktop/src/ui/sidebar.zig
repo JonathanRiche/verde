@@ -87,6 +87,9 @@ const SidebarHitKind = enum {
     /// Search trigger (expanded pill / collapsed icon); opens the command
     /// palette unscoped.
     command_palette,
+    /// Per-workspace gear icon; opens Workspace Settings bound to that
+    /// workspace (distinct from global `settings` below).
+    workspace_settings,
     settings,
 };
 
@@ -114,6 +117,7 @@ const SidebarContextMenuAction = enum {
     workspace_herdr_focus_terminal,
     workspace_herdr_unlink,
     workspace_rename,
+    workspace_open_settings,
     workspace_import_codex,
     workspace_import_opencode,
     workspace_import_claude,
@@ -137,6 +141,7 @@ var sidebar_menu_row_count: usize = 0;
 var settings_hovered: bool = false;
 var terminal_action_hovered: ?usize = null;
 var history_action_hovered: ?usize = null;
+var workspace_settings_action_hovered: ?usize = null;
 var search_trigger_hovered: bool = false;
 
 const WorkspaceDragState = struct {
@@ -250,6 +255,7 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
     var new_new_thread_hover: ?usize = null;
     var new_terminal_hover: ?usize = null;
     var new_history_hover: ?usize = null;
+    var new_workspace_settings_hover: ?usize = null;
     var new_search_hover = false;
     var new_settings_hover = false;
     if (rectContainsPoint(palette_sidebar_rect, x, y)) {
@@ -273,6 +279,9 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
                 .history => {
                     if (!state.isSidebarCollapsed() and new_history_hover == null) new_history_hover = hit.project_index;
                 },
+                .workspace_settings => {
+                    if (!state.isSidebarCollapsed() and new_workspace_settings_hover == null) new_workspace_settings_hover = hit.project_index;
+                },
                 .command_palette => new_search_hover = true,
                 .settings => new_settings_hover = true,
                 else => {},
@@ -284,13 +293,15 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
     const new_thread_changed = state.sidebar_new_thread_hover != new_new_thread_hover;
     const terminal_changed = terminal_action_hovered != new_terminal_hover;
     const history_changed = history_action_hovered != new_history_hover;
+    const workspace_settings_changed = workspace_settings_action_hovered != new_workspace_settings_hover;
     const search_changed = search_trigger_hovered != new_search_hover;
     const settings_changed = settings_hovered != new_settings_hover;
     terminal_action_hovered = new_terminal_hover;
     history_action_hovered = new_history_hover;
+    workspace_settings_action_hovered = new_workspace_settings_hover;
     search_trigger_hovered = new_search_hover;
     settings_hovered = new_settings_hover;
-    if (!project_changed and !new_thread_changed and !terminal_changed and !history_changed and !search_changed and !settings_changed) return;
+    if (!project_changed and !new_thread_changed and !terminal_changed and !history_changed and !workspace_settings_changed and !search_changed and !settings_changed) return;
 
     state.sidebar_project_hover = new_project_hover;
     state.sidebar_new_thread_hover = new_new_thread_hover;
@@ -341,6 +352,11 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .history => {
                 if (hit.project_index < state.project_controller.projects.items.len) {
                     state.openCommandPalette(hit.project_index);
+                }
+            },
+            .workspace_settings => {
+                if (hit.project_index < state.project_controller.projects.items.len) {
+                    state.openWorkspaceSettingsForProject(hit.project_index);
                 }
             },
             .command_palette => {
@@ -746,6 +762,7 @@ fn handleSidebarContextMenuPrimary(state: *runtime.AppState, x: f32, y: f32) boo
                 .workspace_herdr_focus_terminal => _ = state.focusProjectHerdrAttachTerminal(pi),
                 .workspace_herdr_unlink => state.unlinkProjectHerdrFromUi(pi),
                 .workspace_rename => state.beginProjectRename(pi),
+                .workspace_open_settings => state.openWorkspaceSettingsForProject(pi),
                 .workspace_import_codex => state.beginThreadImport(pi, .codex),
                 .workspace_import_opencode => state.beginThreadImport(pi, .opencode),
                 .workspace_import_claude => state.beginThreadImport(pi, .claude),
@@ -828,6 +845,7 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
                 appendSidebarContextMenuRow(.workspace_herdr_handoff, pi < state.project_controller.projects.items.len, "Handoff to Herdr");
             }
             appendSidebarContextMenuRow(.workspace_rename, true, "Rename workspace");
+            appendSidebarContextMenuRow(.workspace_open_settings, pi < state.project_controller.projects.items.len, "Workspace settings");
             appendSidebarContextMenuRow(.workspace_import_codex, true, "Import Codex thread");
             appendSidebarContextMenuRow(.workspace_import_opencode, true, "Import OpenCode thread");
             appendSidebarContextMenuRow(.workspace_import_claude, true, "Import Claude thread");
@@ -1029,12 +1047,13 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
         if (project_visible) queuePaletteFolderIcon(state, tx, cy, theme.scaledUi(14.0), theme.scaledUi(10.0), if (selected) theme.COLOR_GREEN else if (project_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE, selected);
         tx += theme.scaledUi(20.0);
 
-        // Trailing action cluster (new chat, new terminal, history) renders
-        // only on hover/selection to keep quiet rows quiet, but its width is
-        // always reserved so the workspace label never reflows on hover.
+        // Trailing action cluster (new chat, new terminal, history, workspace
+        // settings) renders only on hover/selection to keep quiet rows quiet,
+        // but its width is always reserved so the workspace label never
+        // reflows on hover.
         const action_w = theme.scaledUi(30.0);
         const action_gap = theme.scaledUi(2.0);
-        const action_cluster_w = action_w * 3.0 + action_gap * 2.0;
+        const action_cluster_w = action_w * 4.0 + action_gap * 3.0;
         const show_actions = workspace_shortcut.len == 0 and (selected or project_hovered);
         const content_right = if (workspace_shortcut.len > 0)
             row_rect.x + row_rect.w - theme.scaledUi(32.0)
@@ -1062,6 +1081,9 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
             addClippedPaletteHit(terminal_rect, workspace_clip, .new_terminal, project_index, 0);
             renderPaletteSidebarActionIcon(state, history_rect, NF_COD_HISTORY, history_action_hovered == project_index, workspace_clip);
             addClippedPaletteHit(history_rect, workspace_clip, .history, project_index, 0);
+            const workspace_settings_rect: palette.Rect = .{ .x = action_x + (action_w + action_gap) * 3.0, .y = y, .w = action_w, .h = row_h };
+            renderPaletteSidebarActionIcon(state, workspace_settings_rect, NF_COD_GEAR, workspace_settings_action_hovered == project_index, workspace_clip);
+            addClippedPaletteHit(workspace_settings_rect, workspace_clip, .workspace_settings, project_index, 0);
         }
         y += row_h + theme.scaledUi(4.0);
 
@@ -2990,4 +3012,16 @@ test "ACTIVE wheel stays in the pinned cluster when it overflows" {
     try std.testing.expect(handlePaletteWheel(40, 150, -1.0));
     try std.testing.expectEqual(@as(f32, 0), attention_scroll_y);
     try std.testing.expect(sidebar_scroll_y > 0.0);
+}
+
+test "workspace settings entry points bind to the invoked workspace" {
+    const source = @embedFile("sidebar.zig");
+    // Gear icon in the per-workspace action cluster registers its own hit
+    // kind, distinct from the global settings gear in the footer.
+    try std.testing.expect(std.mem.indexOf(u8, source, "addClippedPaletteHit(workspace_settings_rect, workspace_clip, .workspace_settings, project_index, 0)") != null);
+    // Both the icon and the labelled context-menu row route through the
+    // id-bound opener, never through the currently-selected workspace.
+    try std.testing.expect(std.mem.indexOf(u8, source, "state.openWorkspaceSettingsForProject(hit.project_index)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, ".workspace_open_settings => state.openWorkspaceSettingsForProject(pi)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "\"Workspace settings\"") != null);
 }

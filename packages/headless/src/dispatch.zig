@@ -7,6 +7,7 @@ const std = @import("std");
 const protocol = @import("protocol.zig");
 const access_protocol = @import("access_protocol.zig");
 const connect_protocol = @import("connect_protocol.zig");
+const attachment_protocol = @import("attachment_protocol.zig");
 
 /// Methods that must be refused once the daemon has entered its drain phase.
 ///
@@ -26,6 +27,9 @@ const MUTATING_METHODS = [_][]const u8{
     "chat.followup",
     "chat.turn.cancel",
     "chat.turn.consume",
+    attachment_protocol.METHOD_CHAT_ATTACHMENT_CREATE,
+    attachment_protocol.METHOD_CHAT_ATTACHMENT_APPEND,
+    attachment_protocol.METHOD_CHAT_ATTACHMENT_COMMIT,
     // Registry mutations.
     "process.start",
     "process.stop",
@@ -338,6 +342,9 @@ test "shared mutator table pins the current sessionizer methods" {
         "chat.followup",
         "chat.turn.cancel",
         "chat.turn.consume",
+        "chat.attachment.create",
+        "chat.attachment.append",
+        "chat.attachment.commit",
     };
     for (sessionizer_mutators) |method| {
         try std.testing.expect(isMutatingMethod(method));

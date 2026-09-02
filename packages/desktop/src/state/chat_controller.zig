@@ -155,6 +155,14 @@ pub fn initialSendStartFailureMessage(err: anyerror) []const u8 {
         error.RemoteWorkspaceBindingMissing => "The selected repository is not bound on this runtime. Bind it, then send again; your draft and attachments were restored.",
         error.RemoteProviderUnavailable => "The selected provider is unavailable on this runtime. Install or configure it, then send again; your draft and attachments were restored.",
         error.RemoteProviderNotAuthenticated => "The selected provider is not authenticated on this runtime. Sign in there, then send again; your draft and attachments were restored.",
+        error.RemoteAttachmentsUnsupported => "The selected runtime does not support image attachments yet. Update its Verde daemon or remove the attachments; your draft was kept.",
+        error.RemoteAttachmentTooMany => "This message has more attached images than one turn supports. Remove some and send again; your draft was kept.",
+        error.RemoteAttachmentTooLarge => "An attached image exceeds the runtime's attachment size limit. Remove or shrink it; your draft was kept.",
+        error.RemoteAttachmentInvalid => "An attached file is not a supported image (PNG, JPEG, WebP, or GIF). Remove it; your draft was kept.",
+        error.RemoteAttachmentUnreadable => "An attached image could not be read from disk. Re-attach it, then send again; your draft was kept.",
+        error.RemoteAttachmentUploadFailed => "Verde could not upload the attachments to the selected runtime. Check the connection, then try Send again; your draft and attachments were restored.",
+        error.RuntimeServiceUnavailable => "The runtime connection service is unavailable, so this message could not be sent. Your draft and attachments were restored.",
+        error.RepositoryRouteAttachmentsUnsupported => "Repository-routed local chat does not support attachments yet. Remove them or switch the thread to Local; your draft was kept.",
         else => "Verde could not start this message. Your draft and attachments are still in the composer; try Send again.",
     };
 }
@@ -1234,12 +1242,21 @@ test "prospective prompt preflight rejects before thread staging" {
     try std.testing.expectEqual(@as(usize, 0), prospective.messages.items.len);
 }
 
-test "remote attachments fail before composer or transcript mutation" {
+test "remote attachments pass preflight untouched; capability gating is a visible dispatch failure" {
     const allocator = std.testing.allocator;
+    const routable_runtime: RuntimeService.RuntimeSnapshot = .{
+        .runtime_id = "0123456789abcdef0123456789abcdef",
+        .instance_id = "00112233445566778899aabbccddeeff",
+        .server_version = "test",
+        .protocol_major = 1,
+        .protocol_minor = 0,
+        .negotiated_headless_protocol_version = 1,
+    };
     const FakeState = struct {
         project_controller: struct {
             projects: std.ArrayList(Project) = .empty,
         } = .{},
+        test_remote_route_snapshot: RuntimeService.Snapshot,
         notices: usize = 0,
         daemon_checks: usize = 0,
 
@@ -1250,7 +1267,25 @@ test "remote attachments fail before composer or transcript mutation" {
             self.daemon_checks += 1;
         }
     };
-    var state: FakeState = .{};
+    var state: FakeState = .{ .test_remote_route_snapshot = .{
+        .profile_id = "remote-box",
+        .label = "Remote",
+        .transport = .ssh_tunnel,
+        .phase = .ready,
+        .failure = null,
+        .retry_at_ms = null,
+        .local_port = 1234,
+        .tunnel_lifecycle = .running,
+        .tunnel_pid = 1,
+        .runtime = routable_runtime,
+        .identity_pin_required = false,
+        .rpc_in_flight = false,
+        .last_heartbeat_ms = 1,
+        .verified_runtime_matches_pin = true,
+        .repository_manifest_capable = true,
+        .repository_chat_route_capable = true,
+        .execution_ready = true,
+    } };
     var project = try Project.init(allocator, "remote-attachment", "Remote", "/desktop/private", 0);
     state.project_controller.projects.append(allocator, project) catch |err| {
         project.deinit(allocator);
@@ -1269,11 +1304,106 @@ test "remote attachments fail before composer or transcript mutation" {
     var image = try ChatImageAttachment.init(allocator, "/desktop/private/secret.png", "image/png", 9);
     defer image.deinit(allocator);
 
-    try std.testing.expect(!try preflightThreadPrompt(&state, 0, thread, "send remotely", &.{image}));
+    // Attachments no longer gate a routable remote preflight: no composer or
+    // transcript mutation, no notice, and no local daemon spawn for a remote
+    // route. Capability gaps reject later, inside dispatch, visibly.
+    try std.testing.expect(try preflightThreadPrompt(&state, 0, thread, "send remotely", &.{image}));
     try std.testing.expectEqualStrings("keep this draft", thread.currentDraft());
     try std.testing.expectEqual(@as(usize, 0), thread.messages.items.len);
     try std.testing.expectEqual(@as(usize, 0), state.daemon_checks);
-    try std.testing.expectEqual(@as(usize, 1), state.notices);
+    try std.testing.expectEqual(@as(usize, 0), state.notices);
+}
+
+test "remote attachment capability rejection at dispatch is visible and retains the draft" {
+    const allocator = std.testing.allocator;
+    const FakeState = struct {
+        allocator: std.mem.Allocator,
+        project_controller: struct {
+            projects: std.ArrayList(Project) = .empty,
+            selected_index: usize = 0,
+        } = .{},
+        dispatch_error: anyerror,
+        failure_rows: usize = 0,
+        flushes: usize = 0,
+
+        pub fn providerExecutionTargetForProjectThread(_: *@This(), _: usize, _: *const ChatThread, _: usize) ?ProviderExecutionTarget {
+            return .{ .local = "/tmp" };
+        }
+        pub fn ensureSessionDaemon(_: *@This()) !void {}
+        pub fn appendMessageToThread(
+            self: *@This(),
+            thread: *ChatThread,
+            role: provider_models.ChatRole,
+            author: []const u8,
+            body: []const u8,
+            _: ?*const ChatImageAttachment,
+            _: []const ChatImageAttachment,
+        ) !void {
+            try thread.messages.append(self.allocator, .{
+                .role = role,
+                .author = try self.allocator.dupeZ(u8, author),
+                .body = try self.allocator.dupeZ(u8, body),
+                .extra_images = try self.allocator.alloc(ChatImageAttachment, 0),
+            });
+            thread.touch();
+        }
+        pub fn releaseMessage(self: *@This(), message: ChatMessage) void {
+            self.allocator.free(message.author);
+            self.allocator.free(message.body);
+            self.allocator.free(message.extra_images);
+        }
+        pub fn dispatchDaemonAcceptance(
+            self: *@This(),
+            _: usize,
+            _: *ChatThread,
+            _: []const u8,
+            _: ChatExecutionRoute,
+            _: *InitialSendSnapshot,
+            _: bool,
+        ) !void {
+            // Mirrors the production preflight inside dispatchDaemonAcceptance
+            // (old daemon without chat.attachments.v1, over-limit drafts, or
+            // unusable advertised limits) failing before anything is armed.
+            return self.dispatch_error;
+        }
+        pub fn appendInitialSendFailure(self: *@This(), _: *ChatThread, message: []const u8) void {
+            std.testing.expectEqualStrings(initialSendStartFailureMessage(self.dispatch_error), message) catch unreachable;
+            self.failure_rows += 1;
+        }
+        pub fn requestTranscriptScrollToBottom(_: *@This()) void {}
+        pub fn resetComposerInputWidget(_: *@This()) void {}
+        pub fn setSidebarNotice(_: *@This(), _: []const u8) void {}
+        pub fn flushDirtyBlocking(self: *@This()) void {
+            self.flushes += 1;
+        }
+        pub fn markDirty(_: *@This()) void {}
+    };
+
+    const rejections = [_]anyerror{ error.RemoteAttachmentsUnsupported, error.RemoteAttachmentTooMany, error.RuntimeServiceUnavailable };
+    for (rejections) |dispatch_error| {
+        var state: FakeState = .{ .allocator = allocator, .dispatch_error = dispatch_error };
+        var project = try Project.init(allocator, "reject-attach", "Reject attach", "/tmp/reject-attach", 0);
+        state.project_controller.projects.append(allocator, project) catch |err| {
+            project.deinit(allocator);
+            return err;
+        };
+        defer {
+            for (state.project_controller.projects.items) |*owned| owned.deinit(allocator);
+            state.project_controller.projects.deinit(allocator);
+        }
+        const thread = &state.project_controller.projects.items[0].threads.items[0];
+        thread.setDraft("send with image");
+        try thread.setDraftImage(allocator, "/desktop/private/keep.png", "image/png", 12);
+
+        try std.testing.expectError(dispatch_error, sendThreadDraft(&state, 0, 0));
+        // Visible transcript failure with the typed message, and the draft
+        // plus its attachment stay in the composer for retry.
+        try std.testing.expectEqual(@as(usize, 1), state.failure_rows);
+        try std.testing.expectEqualStrings("send with image", thread.currentDraft());
+        try std.testing.expectEqual(@as(usize, 1), thread.draftImageCount());
+        try std.testing.expectEqualStrings("/desktop/private/keep.png", thread.draft_image.?.path);
+        try std.testing.expectEqual(@as(usize, 0), thread.messages.items.len);
+    }
 }
 
 test "failed dispatch restores retryable draft; async acceptance arms one addressed turn" {
@@ -1699,7 +1829,6 @@ fn resolveChatExecutionRoute(
     self: anytype,
     project_index: usize,
     thread: *const ChatThread,
-    image_count: usize,
 ) ?ChatExecutionRoute {
     if (project_index >= self.project_controller.projects.items.len) return null;
     const project = &self.project_controller.projects.items[project_index];
@@ -1714,13 +1843,10 @@ fn resolveChatExecutionRoute(
     if (local and primary and selected.relative_cwd == null and mayUseLegacyLocalExecution(thread)) {
         return .legacy_local;
     }
-    if (image_count != 0) {
-        self.setSidebarNotice(if (local)
-            "Repository-routed chat does not support attachments yet. Remove them and try again."
-        else
-            "Remote runtime chat does not support attachments yet. Remove them and try again.");
-        return null;
-    }
+    // Attachments no longer gate route resolution: remote routes stage them
+    // through chat.attachments.v1 before chat.turn.start, and unsupported
+    // combinations reject inside dispatch where the failure is a visible
+    // transcript row instead of a silent inert Send.
     if (local) return .{ .repository_local = .{
         .profile_id = selected.profile_id,
         .repository_id = selected.repository_id,
@@ -1728,13 +1854,19 @@ fn resolveChatExecutionRoute(
         .runtime_id = null,
     } };
 
-    const service = runtimeServiceFromState(self) orelse {
-        self.setSidebarNotice("The selected remote runtime is unavailable.");
-        return null;
-    };
-    const snapshot = service.snapshot(selected.profile_id) orelse {
-        self.setSidebarNotice("The selected remote runtime is not configured.");
-        return null;
+    // Fakes inject a routable snapshot the same way they inject
+    // `project_controller`; production state always resolves via the service.
+    const snapshot: RuntimeService.Snapshot = blk: {
+        if (comptime @hasField(std.meta.Child(@TypeOf(self)), "test_remote_route_snapshot"))
+            break :blk self.test_remote_route_snapshot;
+        const service = runtimeServiceFromState(self) orelse {
+            self.setSidebarNotice("The selected remote runtime is unavailable.");
+            return null;
+        };
+        break :blk service.snapshot(selected.profile_id) orelse {
+            self.setSidebarNotice("The selected remote runtime is not configured.");
+            return null;
+        };
     };
     const pinned_runtime_id = if (thread.pinnedRuntimeRoute()) |pinned| pinned.runtime_id else null;
     if (!remoteSnapshotCanRoute(snapshot, pinned_runtime_id)) {
@@ -1980,7 +2112,7 @@ pub fn preflightThreadPrompt(
         return false;
     }
     if (comptime @hasField(std.meta.Child(@TypeOf(self)), "project_controller")) {
-        const execution_route = resolveChatExecutionRoute(self, project_index, thread, images.len) orelse return false;
+        const execution_route = resolveChatExecutionRoute(self, project_index, thread) orelse return false;
         switch (execution_route) {
             .legacy_local, .repository_local => try self.ensureSessionDaemon(),
             .remote => {},
@@ -2088,7 +2220,6 @@ pub fn sendThreadDraftWithUiPolicy(self: anytype, project_index: usize, thread_i
         self,
         project_index,
         thread,
-        draft_image_count,
     ) orelse return false;
 
     switch (execution_route) {
@@ -2642,6 +2773,9 @@ const AcceptanceRepositoryTurnStartParams = struct {
     /// Remote callers request a bounded installed-provider proof before the
     /// daemon accepts durable work. Repository-local sends leave this false.
     require_provider_ready: bool = false,
+    /// Opaque runtime-scoped staged attachment IDs (chat.attachments.v1),
+    /// filled only after every upload commits. Never desktop paths.
+    attachments: []const []const u8 = &.{},
 };
 
 const AcceptanceTurnStartParams = union(enum) {
@@ -2658,13 +2792,47 @@ test "repository chat start params cannot carry an absolute desktop path" {
     try std.testing.expect(!@hasField(AcceptanceRepositoryTurnStartParams, "cwd"));
     try std.testing.expect(!@hasField(AcceptanceRepositoryTurnStartParams, "image_paths"));
     try std.testing.expect(!@hasField(AcceptanceRepositoryTurnStartParams, "images"));
+    // Attachments travel as opaque staged IDs, never local filesystem paths.
+    try std.testing.expect(@hasField(AcceptanceRepositoryTurnStartParams, "attachments"));
 }
 
 const AcceptanceTransport = union(enum) {
     local_worker,
+    /// Pre-turn attachment staging: the poll loop drives the chunked
+    /// chat.attachment.* chain and only then issues chat.turn.start,
+    /// switching this transport to `.remote_rpc`.
+    remote_upload,
     remote_rpc: struct {
         ticket: RuntimeService.RpcTicket,
     },
+};
+
+/// One local image read into the dispatch arena for staged remote upload.
+/// `mime` is the canonical static allowlist slice sniffed from magic bytes.
+const AcceptanceUploadImage = struct {
+    bytes: []const u8,
+    mime: []const u8,
+};
+
+/// Total wall-clock budget for the whole staged-upload chain, bounding
+/// RuntimeRpcBusy retries so a wedged connection rejects visibly instead of
+/// leaving Send armed forever.
+const REMOTE_ATTACHMENT_UPLOAD_TIMEOUT_MS: i64 = 300_000;
+
+const AcceptanceUploadState = struct {
+    stage: enum { create, append, commit, start_turn } = .create,
+    image_index: usize = 0,
+    sent_bytes: usize = 0,
+    pending_chunk_bytes: usize = 0,
+    /// Raw (pre-base64) chunk ceiling derived from the runtime's advertised
+    /// max_request_bytes, possibly lowered by the create response.
+    chunk_bytes: usize = 0,
+    attachment_id: [32]u8 = @splat(0),
+    attachment_id_set: bool = false,
+    /// Committed IDs (arena-owned) referenced by the final turn start.
+    attachment_ids: std.ArrayListUnmanaged([]const u8) = .empty,
+    ticket: ?RuntimeService.RpcTicket = null,
+    deadline_ms: i64 = 0,
 };
 
 /// One in-flight async chat.turn.start acceptance (7.5). The event thread
@@ -2686,6 +2854,9 @@ pub const AcceptanceDispatch = struct {
     message_id: []const u8,
     params: AcceptanceTurnStartParams,
     transport: AcceptanceTransport = .local_worker,
+    /// Arena-owned image payloads staged for remote upload (empty otherwise).
+    upload_images: []const AcceptanceUploadImage = &.{},
+    upload: AcceptanceUploadState = .{},
     /// Owned pre-submit rollback state; allocated with the state allocator.
     snapshot: InitialSendSnapshot,
     /// Submitted attachments move here when the visible composer clears.
@@ -2799,6 +2970,222 @@ fn classifyRemoteAcceptanceResult(dispatch: *AcceptanceDispatch, result: *Runtim
     };
 }
 
+/// Read and validate every draft image for staged remote upload. Rejects
+/// oversize, unreadable, or non-image files before anything is armed. The
+/// canonical MIME comes from magic-byte sniffing, never from the local
+/// attachment metadata, so desktop and daemon validation cannot disagree.
+fn collectRemoteUploadImages(
+    arena: std.mem.Allocator,
+    thread: *const ChatThread,
+    max_attachment_bytes: usize,
+) ![]const AcceptanceUploadImage {
+    var images: std.ArrayListUnmanaged(AcceptanceUploadImage) = .empty;
+    try images.ensureTotalCapacity(arena, thread.draftImageCount());
+    if (thread.draft_image) |image| {
+        images.appendAssumeCapacity(try readRemoteUploadImage(arena, image.path, max_attachment_bytes));
+    }
+    for (thread.draft_extra_images.items) |image| {
+        images.appendAssumeCapacity(try readRemoteUploadImage(arena, image.path, max_attachment_bytes));
+    }
+    return images.items;
+}
+
+fn readRemoteUploadImage(
+    arena: std.mem.Allocator,
+    path: []const u8,
+    max_attachment_bytes: usize,
+) !AcceptanceUploadImage {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(
+        threaded.io(),
+        path,
+        arena,
+        .limited(max_attachment_bytes + 1),
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.StreamTooLong, error.FileTooBig => return error.RemoteAttachmentTooLarge,
+        else => return error.RemoteAttachmentUnreadable,
+    };
+    if (bytes.len > max_attachment_bytes) return error.RemoteAttachmentTooLarge;
+    const mime = headless.attachment_protocol.sniffImageMime(bytes) orelse
+        return error.RemoteAttachmentInvalid;
+    return .{ .bytes = bytes, .mime = mime };
+}
+
+const RemoteUploadStep = enum { pending, failed };
+
+/// Advance the staged-attachment chain one RPC at a time: create → append×N
+/// → commit per image, then the final chat.turn.start (which flips the
+/// transport to `.remote_rpc`). One in-flight user RPC per profile is a
+/// manager invariant, so RuntimeRpcBusy simply retries on a later poll
+/// bounded by the upload deadline. `service` is `anytype` (duck-typed
+/// takeRpcResult/beginRpc) so regressions can drive the machine with a stub.
+fn stepRemoteAttachmentUpload(dispatch: *AcceptanceDispatch, service: anytype) RemoteUploadStep {
+    const up = &dispatch.upload;
+    // Ticket ownership outranks the deadline: failing while Manager still
+    // holds this dispatch's rpc_result would leave the profile's single RPC
+    // slot pending forever (RuntimeRpcResultPending on every later RPC). The
+    // transport bounds one in-flight RPC to seconds, so draining the ticket
+    // first cannot extend the wait unboundedly; the upload deadline applies
+    // between RPCs, including RuntimeRpcBusy retries.
+    if (up.ticket) |ticket| {
+        var result = service.takeRpcResult(ticket) catch |err| {
+            // takeRpcResult errors invalidate the ticket slot-side.
+            up.ticket = null;
+            dispatch.err = err;
+            return .failed;
+        } orelse return .pending;
+        defer result.deinit();
+        up.ticket = null;
+        if (monotonicMs() > up.deadline_ms) {
+            dispatch.err = error.RemoteAttachmentUploadFailed;
+            return .failed;
+        }
+        return consumeRemoteUploadResponse(dispatch, &result);
+    }
+    if (monotonicMs() > up.deadline_ms) {
+        dispatch.err = error.RemoteAttachmentUploadFailed;
+        return .failed;
+    }
+    return issueNextRemoteUploadRpc(dispatch, service);
+}
+
+fn consumeRemoteUploadResponse(dispatch: *AcceptanceDispatch, result: *RuntimeService.RpcCallResult) RemoteUploadStep {
+    const up = &dispatch.upload;
+    const response = switch (result.*) {
+        .response => |*response| response,
+        .failed, .canceled => {
+            dispatch.err = error.RemoteAttachmentUploadFailed;
+            return .failed;
+        },
+    };
+    const alloc = std.heap.page_allocator;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, response.json, .{}) catch |err| {
+        dispatch.err = err;
+        return .failed;
+    };
+    defer parsed.deinit();
+    const rpc_result = jsonRpcResult(parsed.value) catch {
+        dispatch.err = remoteAttachmentMethodFailure(response.failure_reason);
+        return .failed;
+    };
+    switch (up.stage) {
+        .create => {
+            if (rpc_result != .object) {
+                dispatch.err = error.RemoteAttachmentUploadFailed;
+                return .failed;
+            }
+            const id = switch (rpc_result.object.get("attachment_id") orelse std.json.Value.null) {
+                .string => |text| text,
+                else => {
+                    dispatch.err = error.RemoteAttachmentUploadFailed;
+                    return .failed;
+                },
+            };
+            if (!headless.attachment_protocol.isValidAttachmentId(id)) {
+                dispatch.err = error.RemoteAttachmentUploadFailed;
+                return .failed;
+            }
+            @memcpy(up.attachment_id[0..], id);
+            up.attachment_id_set = true;
+            if (rpc_result.object.get("max_chunk_bytes")) |value| {
+                if (jsonValueU64(value)) |remote_chunk| {
+                    if (remote_chunk != 0) up.chunk_bytes = @min(up.chunk_bytes, @as(usize, @intCast(remote_chunk)));
+                }
+            }
+            up.sent_bytes = 0;
+            up.stage = .append;
+        },
+        .append => {
+            up.sent_bytes += up.pending_chunk_bytes;
+            up.pending_chunk_bytes = 0;
+            if (up.sent_bytes >= dispatch.upload_images[up.image_index].bytes.len) up.stage = .commit;
+        },
+        .commit => {
+            const arena = dispatch.arena.allocator();
+            const owned_id = arena.dupe(u8, up.attachment_id[0..]) catch |err| {
+                dispatch.err = err;
+                return .failed;
+            };
+            up.attachment_ids.append(arena, owned_id) catch |err| {
+                dispatch.err = err;
+                return .failed;
+            };
+            up.attachment_id_set = false;
+            up.image_index += 1;
+            up.sent_bytes = 0;
+            up.stage = if (up.image_index < dispatch.upload_images.len) .create else .start_turn;
+        },
+        // chat.turn.start responses are consumed by the `.remote_rpc` path.
+        .start_turn => unreachable,
+    }
+    return .pending;
+}
+
+fn issueNextRemoteUploadRpc(dispatch: *AcceptanceDispatch, service: anytype) RemoteUploadStep {
+    const up = &dispatch.upload;
+    switch (up.stage) {
+        .create => {
+            const image = dispatch.upload_images[up.image_index];
+            up.ticket = service.beginRpc(dispatch.profile_id, "chat.attachment.create", .{
+                .mime = image.mime,
+                .byte_size = image.bytes.len,
+            }) catch |err| return remoteUploadBeginFailure(dispatch, err);
+        },
+        .append => {
+            const image = dispatch.upload_images[up.image_index];
+            const remaining = image.bytes.len - up.sent_bytes;
+            const chunk_len = @min(remaining, up.chunk_bytes);
+            const chunk = image.bytes[up.sent_bytes..][0..chunk_len];
+            const alloc = std.heap.page_allocator;
+            const encoded_buf = alloc.alloc(u8, std.base64.standard.Encoder.calcSize(chunk_len)) catch |err| {
+                dispatch.err = err;
+                return .failed;
+            };
+            defer alloc.free(encoded_buf);
+            const data = std.base64.standard.Encoder.encode(encoded_buf, chunk);
+            const ticket = service.beginRpc(dispatch.profile_id, "chat.attachment.append", .{
+                .attachment_id = up.attachment_id[0..],
+                .offset = up.sent_bytes,
+                .data = data,
+            }) catch |err| return remoteUploadBeginFailure(dispatch, err);
+            up.pending_chunk_bytes = chunk_len;
+            up.ticket = ticket;
+        },
+        .commit => {
+            up.ticket = service.beginRpc(dispatch.profile_id, "chat.attachment.commit", .{
+                .attachment_id = up.attachment_id[0..],
+            }) catch |err| return remoteUploadBeginFailure(dispatch, err);
+        },
+        .start_turn => {
+            dispatch.params.repository.attachments = up.attachment_ids.items;
+            dispatch.rpc_started_at_ms = monotonicMs();
+            const ticket = service.beginRpc(dispatch.profile_id, "chat.turn.start", dispatch.params.repository) catch |err|
+                return remoteUploadBeginFailure(dispatch, err);
+            dispatch.transport = .{ .remote_rpc = .{ .ticket = ticket } };
+        },
+    }
+    return .pending;
+}
+
+fn remoteUploadBeginFailure(dispatch: *AcceptanceDispatch, err: anyerror) RemoteUploadStep {
+    // The single-RPC-per-profile slot is busy (heartbeat or token refresh);
+    // retry on a later poll within the upload deadline.
+    if (err == error.RuntimeRpcBusy) return .pending;
+    dispatch.err = err;
+    return .failed;
+}
+
+/// Errors from the chat.attachment.* methods themselves (staging capacity,
+/// expired/unknown ids, mime rejection) classify as `.unknown` in Manager;
+/// map those to the explicit upload failure so the composer restore message
+/// is accurate, while genuinely specific reasons keep their dedicated arm.
+fn remoteAttachmentMethodFailure(failure_reason: ?RuntimeService.FailureReason) anyerror {
+    const reason = failure_reason orelse return error.RemoteAttachmentUploadFailed;
+    const mapped = remoteAcceptanceFailure(reason);
+    return if (mapped == error.DaemonRequestFailed) error.RemoteAttachmentUploadFailed else mapped;
+}
+
 fn remoteAcceptanceFailure(reason: RuntimeService.FailureReason) anyerror {
     return switch (reason) {
         .workspace_binding_missing => error.RemoteWorkspaceBindingMissing,
@@ -2841,6 +3228,68 @@ test "remote acceptance maps exact structured readiness reasons" {
     try std.testing.expect(std.mem.indexOf(u8, initialSendStartFailureMessage(error.RemoteProviderNotAuthenticated), "Sign in") != null);
 }
 
+test "attachment method failures map to the explicit upload error" {
+    // Server-side chat.attachment.* rejections (capacity, expired ids, mime)
+    // classify as .unknown; they must surface the accurate upload-failure
+    // copy while genuinely specific reasons keep their dedicated arm.
+    try std.testing.expectEqual(error.RemoteAttachmentUploadFailed, remoteAttachmentMethodFailure(null));
+    try std.testing.expectEqual(error.RemoteAttachmentUploadFailed, remoteAttachmentMethodFailure(.unknown));
+    try std.testing.expectEqual(error.RemoteProviderUnavailable, remoteAttachmentMethodFailure(.provider_unavailable));
+    try std.testing.expectEqual(error.RemoteWorkspaceBindingMissing, remoteAttachmentMethodFailure(.workspace_binding_missing));
+    // The shared per-turn count gate carries typed retained-draft copy.
+    try std.testing.expect(std.mem.indexOf(u8, initialSendStartFailureMessage(error.RemoteAttachmentTooMany), "draft was kept") != null);
+}
+
+test "upload step drains an owned ticket before the deadline can fail the dispatch" {
+    const StubService = struct {
+        result: ?RuntimeService.RpcCallResult = null,
+        outstanding: bool = false,
+        takes: usize = 0,
+        begins: usize = 0,
+        pub fn takeRpcResult(self: *@This(), _: RuntimeService.RpcTicket) !?RuntimeService.RpcCallResult {
+            self.takes += 1;
+            if (self.outstanding) return null;
+            defer self.result = null;
+            return self.result;
+        }
+        pub fn beginRpc(self: *@This(), _: []const u8, _: []const u8, _: anytype) !RuntimeService.RpcTicket {
+            self.begins += 1;
+            return .{ .id = 99 };
+        }
+    };
+
+    // Completed result + expired deadline: the ticket is drained first, so
+    // Manager's single rpc_result slot never leaks RuntimeRpcResultPending.
+    var stub: StubService = .{ .result = .{ .failed = .network } };
+    var dispatch: AcceptanceDispatch = undefined;
+    dispatch.err = null;
+    dispatch.upload = .{ .ticket = .{ .id = 7 }, .deadline_ms = 0 };
+    try std.testing.expectEqual(RemoteUploadStep.failed, stepRemoteAttachmentUpload(&dispatch, &stub));
+    try std.testing.expectEqual(@as(usize, 1), stub.takes);
+    try std.testing.expect(dispatch.upload.ticket == null);
+    try std.testing.expectEqual(error.RemoteAttachmentUploadFailed, dispatch.err.?);
+    try std.testing.expectEqual(@as(usize, 0), stub.begins);
+
+    // Outstanding ticket: the dispatch stays pending past the deadline and
+    // keeps ticket ownership; the bounded transport ends the wait, not this
+    // timer, so the deadline never abandons a live ticket.
+    stub = .{ .outstanding = true };
+    dispatch.err = null;
+    dispatch.upload = .{ .ticket = .{ .id = 8 }, .deadline_ms = 0 };
+    try std.testing.expectEqual(RemoteUploadStep.pending, stepRemoteAttachmentUpload(&dispatch, &stub));
+    try std.testing.expect(dispatch.upload.ticket != null);
+    try std.testing.expectEqual(@as(usize, 0), stub.begins);
+    try std.testing.expect(dispatch.err == null);
+
+    // No ticket outstanding: an expired deadline fails before issuing RPCs.
+    stub = .{};
+    dispatch.err = null;
+    dispatch.upload = .{ .deadline_ms = 0 };
+    try std.testing.expectEqual(RemoteUploadStep.failed, stepRemoteAttachmentUpload(&dispatch, &stub));
+    try std.testing.expectEqual(@as(usize, 0), stub.begins);
+    try std.testing.expectEqual(error.RemoteAttachmentUploadFailed, dispatch.err.?);
+}
+
 /// Stages daemon acceptance for a just-appended user row without blocking the
 /// event thread. The pending send is armed before worker spawn; after a
 /// successful spawn the composer clears immediately and this dispatch owns
@@ -2868,8 +3317,10 @@ pub fn dispatchDaemonAcceptance(
         ai_harness.releaseOwnedCodexServer();
     }
     switch (execution_route) {
-        .legacy_local => {},
-        .repository_local, .remote => if (thread.draftImageCount() != 0) {
+        .legacy_local, .remote => {},
+        // Repository-local routing has no staging surface yet; reject before
+        // any state mutates so the caller renders the visible failure row.
+        .repository_local => if (thread.draftImageCount() != 0) {
             return error.RepositoryRouteAttachmentsUnsupported;
         },
     }
@@ -2893,6 +3344,37 @@ pub fn dispatchDaemonAcceptance(
     };
     errdefer dispatch.arena.deinit();
     const arena = dispatch.arena.allocator();
+
+    // Remote routes with attachments: read + validate every local image now,
+    // before anything is armed, so capability gaps, oversize files, and
+    // unreadable/invalid images reject with the draft untouched. The bytes
+    // live in the dispatch arena and upload through the poll loop.
+    if (execution_route == .remote and thread.draftImageCount() != 0) {
+        const service = runtimeServiceFromState(self) orelse return error.RuntimeServiceUnavailable;
+        const runtime_snapshot = service.snapshot(execution_route.remote.profile_id) orelse
+            return error.RuntimeServiceUnavailable;
+        if (!runtime_snapshot.chat_attachment_capable) return error.RemoteAttachmentsUnsupported;
+        if (runtime_snapshot.max_attachment_bytes == 0 or runtime_snapshot.max_request_bytes == 0)
+            return error.RemoteAttachmentsUnsupported;
+        // Enforce the shared per-turn cap before reading any file so an
+        // over-limit draft rejects visibly instead of staging a set the
+        // daemon claim would deterministically refuse.
+        if (thread.draftImageCount() > headless.attachment_protocol.MAX_ATTACHMENTS_PER_TURN)
+            return error.RemoteAttachmentTooMany;
+        dispatch.upload_images = try collectRemoteUploadImages(
+            arena,
+            thread,
+            // The portable cap is the smallest per-image size every audited
+            // provider harness ingests; the runtime's advertised limit can
+            // only tighten it further.
+            @min(runtime_snapshot.max_attachment_bytes, headless.attachment_protocol.MAX_PORTABLE_ATTACHMENT_BYTES),
+        );
+        dispatch.upload.chunk_bytes =
+            headless.attachment_protocol.maxAppendChunkBytes(runtime_snapshot.max_request_bytes);
+        // Zero means the advertised request limit cannot carry any append
+        // chunk: reject before arming instead of spinning a no-progress loop.
+        if (dispatch.upload.chunk_bytes == 0) return error.RemoteAttachmentsUnsupported;
+    }
 
     const turn_id = try std.fmt.allocPrint(arena, "gui:{s}:{s}:{d}", .{ project.id, thread.local_thread_id, now_ms });
     // Stable client identity for the staged user row at acceptance (M4-P3);
@@ -3010,6 +3492,14 @@ pub fn dispatchDaemonAcceptance(
         },
         .remote => |route| blk: {
             const service = runtimeServiceFromState(self) orelse break :blk error.RuntimeServiceUnavailable;
+            if (dispatch.upload_images.len != 0) {
+                // Uploads are issued from the poll loop so a busy heartbeat
+                // RPC retries instead of failing the send at arm time.
+                dispatch.rpc_started_at_ms = monotonicMs();
+                dispatch.upload.deadline_ms = monotonicMs() + REMOTE_ATTACHMENT_UPLOAD_TIMEOUT_MS;
+                dispatch.transport = .remote_upload;
+                break :blk null;
+            }
             const params = switch (dispatch.params) {
                 .repository => |value| value,
                 .legacy_local => unreachable,
@@ -3067,6 +3557,30 @@ pub fn pollAcceptanceDispatches(self: anytype) bool {
                 if (dispatch.worker) |worker| {
                     worker.join();
                     dispatch.worker = null;
+                }
+            },
+            .remote_upload => {
+                if (runtimeServiceFromState(self)) |service| {
+                    switch (stepRemoteAttachmentUpload(dispatch, service)) {
+                        .pending => {
+                            index += 1;
+                            continue;
+                        },
+                        .failed => {
+                            // chat.turn.start was never issued, so this is a
+                            // confirmed rejection: rollback + visible failure.
+                            dispatch.rpc_elapsed_ms = monotonicMs() - dispatch.rpc_started_at_ms;
+                            dispatch.outcome = .rejected;
+                        },
+                    }
+                } else {
+                    // The runtime service vanished mid-upload. The chain can
+                    // never progress without it, so waiting here would bypass
+                    // the upload deadline forever; chat.turn.start was never
+                    // issued, so reject visibly and restore draft + images.
+                    dispatch.err = error.RuntimeServiceUnavailable;
+                    dispatch.rpc_elapsed_ms = monotonicMs() - dispatch.rpc_started_at_ms;
+                    dispatch.outcome = .rejected;
                 }
             },
             .remote_rpc => |remote| {

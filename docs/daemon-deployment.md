@@ -54,14 +54,25 @@ If the browser gateway is installed from the same staging prefix, a complete man
         └── web/                 # contents of packages/web_app/dist
 ```
 
-From a source checkout, the repository build outputs are produced with:
+From a source checkout, produce deployment artifacts for a baseline x86_64
+Linux target with:
 
 ```bash
-zig build daemon --release=safe -Dbrowser-backend=native_webview
+zig build daemon --release=safe -Dtarget=x86_64-linux-gnu.2.36
+zig build server --release=safe -Dtarget=x86_64-linux-gnu.2.36
 mise run web-app
 ```
 
 The daemon staging tree is under `zig-out/`. The gateway binary is under `packages/web_app/zig-out/bin/verde-web`, and its built SPA is under `packages/web_app/dist/`.
+
+CPU portability: the standalone daemon, server, and web-gateway builds default
+to the baseline CPU of the target architecture (matching the container
+packaging pin), so artifacts never inherit the build host's CPU features. A
+host-tuned binary — for example one carrying AVX-512 from the build machine —
+crashes with SIGILL on a deployment CPU without those features. Never deploy
+`zig-out/bin/verde-daemon` produced by the desktop build (`mise run build`);
+that binary is intentionally host-native and is only for the local machine.
+Use `-Dcpu=native` only when the artifact will run on the build host itself.
 
 ## Initialize and inspect a runtime
 

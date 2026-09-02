@@ -2,7 +2,11 @@ const std = @import("std");
 
 /// Standalone web client: Zig HTTP/WebSocket gateway + optional frontend embed path.
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // verde-web deploys next to verde-daemon on other machines, so it must
+    // never inherit the build host's CPU features (an AVX-512 host would emit
+    // instructions that SIGILL on a lesser deployment CPU). Default to the
+    // architecture baseline; opt back in with an explicit `-Dcpu=native`.
+    const target = b.standardTargetOptions(.{ .default_target = .{ .cpu_model = .baseline } });
     const optimize = b.standardOptimizeOption(.{});
 
     const headless_module = b.createModule(.{

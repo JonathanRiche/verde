@@ -40,8 +40,9 @@ pub fn updateSettingsModalHover(state: *runtime.AppState, x: f32, y: f32) void {
     settings_modal.updateHover(state, x, y);
 }
 
-/// Routes wheel input to the settings modal body when it is open.
+/// Routes wheel input to the workspace-settings or settings modal body.
 pub fn handleSettingsModalWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y: f32, wheel_y: f32) bool {
+    if (handleWorkspaceSettingsWheel(state, width, height, x, y, wheel_y)) return true;
     return settings_modal.handleWheel(state, width, height, x, y, wheel_y);
 }
 
@@ -71,6 +72,7 @@ pub fn refreshPaletteModalHits(state: *runtime.AppState, width: f32, height: f32
     registerWorkspaceRenameModalHits(state, width, height);
     registerThreadImportModalHits(state, width, height);
     settings_modal.registerHits(state, width, height, queueModalHit);
+    registerWorkspaceSettingsModalHits(state, width, height);
     registerRuntimeWizardModalHits(state, width, height);
     command_palette.registerHits(state, width, height, queueModalHit);
     registerRuntimeCredentialModalHits(state, width, height);
@@ -202,6 +204,7 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     renderProviderOnboardingModal(state, width, height);
     renderMcpOnboardingModal(state, width, height);
     settings_modal.render(state, width, height);
+    renderWorkspaceSettingsModal(state, width, height);
     renderRuntimeWizardModal(state, width, height);
     command_palette.render(state, width, height);
     renderRuntimeCredentialModal(state, width, height);
@@ -505,6 +508,232 @@ fn drawActionButton(state: *runtime.AppState, rect: palette.Rect, label: []const
         .w = @max(@min(estimated_text_width + theme.scaledUi(2.0), rect.w - theme.scaledUi(8.0)), theme.scaledUi(8.0)),
         .h = font_size * 1.25,
     }, label, paletteColor(theme.foregroundOn(fill)), font_size, rect);
+}
+
+// ---------------------------------------------------------------------------
+// Workspace Settings modal: bound to one workspace by id; first section is
+// "Default runtime for new chats" plus a route to global connection
+// management. Selection changes elsewhere never retarget the modal.
+// ---------------------------------------------------------------------------
+
+const WORKSPACE_SETTINGS_ROW_H_UI: f32 = 46.0;
+
+const WorkspaceSettingsLayout = struct {
+    modal: palette.Rect,
+    title_y: f32,
+    section_y: f32,
+    /// Clip rect of the scrollable option list.
+    list: palette.Rect,
+    row_h: f32,
+    explain_y: f32,
+    notice_y: f32,
+    manage_button: palette.Rect,
+    close_button: palette.Rect,
+    max_scroll_y: f32,
+};
+
+// Fixed vertical bands around a height-clamped option list so the modal fits
+// short laptop heights; only the list scrolls.
+fn workspaceSettingsLayout(state: *const runtime.AppState, width: f32, height: f32) WorkspaceSettingsLayout {
+    const pad = theme.scaledUi(20.0);
+    const gap = theme.scaledUi(10.0);
+    const title_h = theme.scaledUi(24.0);
+    const section_h = theme.scaledUi(20.0);
+    const explain_h = theme.scaledUi(17.0) * 3.0;
+    const notice_h = theme.scaledUi(18.0);
+    const button_h = theme.scaledUi(34.0);
+    const row_h = theme.scaledUi(WORKSPACE_SETTINGS_ROW_H_UI);
+    const modal_w = @min(theme.scaledUi(560.0), @max(width - theme.scaledUi(64.0), theme.scaledUi(320.0)));
+    const rows_h = row_h * @as(f32, @floatFromInt(state.workspaceSettingsOptionCount()));
+    const fixed_h = pad + title_h + gap + section_h + gap + gap + explain_h + gap + notice_h + gap + button_h + pad;
+    const max_modal_h = @max(height - theme.scaledUi(96.0), theme.scaledUi(300.0));
+    const list_h = theme.clampf(rows_h, row_h, @max(max_modal_h - fixed_h, row_h));
+    const modal_h = fixed_h + list_h;
+    const modal: palette.Rect = .{
+        .x = (width - modal_w) * 0.5,
+        .y = @max((height - modal_h) * 0.5, theme.scaledUi(24.0)),
+        .w = modal_w,
+        .h = modal_h,
+    };
+    const title_y = modal.y + pad;
+    const section_y = title_y + title_h + gap;
+    const list: palette.Rect = .{
+        .x = modal.x + pad,
+        .y = section_y + section_h + gap,
+        .w = modal.w - pad * 2.0,
+        .h = list_h,
+    };
+    const explain_y = list.y + list.h + gap;
+    const notice_y = explain_y + explain_h + gap;
+    const button_y = notice_y + notice_h + gap;
+    const close_w = theme.scaledUi(96.0);
+    const manage_w = theme.scaledUi(176.0);
+    const close_button: palette.Rect = .{ .x = modal.x + modal.w - pad - close_w, .y = button_y, .w = close_w, .h = button_h };
+    const manage_button: palette.Rect = .{ .x = close_button.x - theme.scaledUi(8.0) - manage_w, .y = button_y, .w = manage_w, .h = button_h };
+    return .{
+        .modal = modal,
+        .title_y = title_y,
+        .section_y = section_y,
+        .list = list,
+        .row_h = row_h,
+        .explain_y = explain_y,
+        .notice_y = notice_y,
+        .manage_button = manage_button,
+        .close_button = close_button,
+        .max_scroll_y = @max(rows_h - list_h, 0.0),
+    };
+}
+
+fn workspaceSettingsOptionRowRect(layout: WorkspaceSettingsLayout, index: usize, scroll_y: f32) palette.Rect {
+    return .{
+        .x = layout.list.x,
+        .y = layout.list.y + @as(f32, @floatFromInt(index)) * layout.row_h - scroll_y,
+        .w = layout.list.w,
+        .h = layout.row_h - theme.scaledUi(4.0),
+    };
+}
+
+fn rectIntersection(a: palette.Rect, b: palette.Rect) palette.Rect {
+    const x0 = @max(a.x, b.x);
+    const y0 = @max(a.y, b.y);
+    const x1 = @min(a.x + a.w, b.x + b.w);
+    const y1 = @min(a.y + a.h, b.y + b.h);
+    return .{ .x = x0, .y = y0, .w = @max(x1 - x0, 0.0), .h = @max(y1 - y0, 0.0) };
+}
+
+fn registerWorkspaceSettingsModalHits(state: *runtime.AppState, width: f32, height: f32) void {
+    if (!state.workspaceSettingsOpen()) return;
+    if (state.workspaceSettingsProject() == null) return;
+    const layout = workspaceSettingsLayout(state, width, height);
+    registerModalChromeHits(state, width, height, layout.modal, true);
+    const scroll_y = theme.clampf(state.workspace_settings_scroll_y, 0.0, layout.max_scroll_y);
+    const count = state.workspaceSettingsOptionCount();
+    var index: usize = 0;
+    while (index < count) : (index += 1) {
+        // Hits are clipped to the visible list band so scrolled-out rows
+        // cannot be clicked through the explainer text or buttons.
+        const clipped = rectIntersection(workspaceSettingsOptionRowRect(layout, index, scroll_y), layout.list);
+        if (clipped.h <= 0.0) continue;
+        queueModalHit(state, clipped, .workspace_settings_option, index);
+    }
+    queueModalHit(state, layout.manage_button, .workspace_settings_manage, 0);
+    queueModalHit(state, layout.close_button, .workspace_settings_close, 0);
+}
+
+/// Scrolls the workspace-settings option list while the pointer is over it.
+fn handleWorkspaceSettingsWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y: f32, wheel_y: f32) bool {
+    if (!state.workspaceSettingsOpen()) return false;
+    const layout = workspaceSettingsLayout(state, width, height);
+    if (!pointInRect(x, y, layout.modal)) return true; // swallow: modal owns the wheel
+    if (!pointInRect(x, y, layout.list)) return true;
+    state.workspace_settings_scroll_y = theme.clampf(
+        state.workspace_settings_scroll_y - wheel_y * theme.scaledUi(48.0),
+        0.0,
+        layout.max_scroll_y,
+    );
+    state.markDirty();
+    return true;
+}
+
+// Workspace Settings modal body: workspace-identifying title, single-choice
+// default-runtime list with the current default marked, scope explainer, and
+// Manage connections / Close actions.
+fn renderWorkspaceSettingsModal(state: *runtime.AppState, width: f32, height: f32) void {
+    if (!state.workspaceSettingsOpen()) return;
+    const project = state.workspaceSettingsProject() orelse {
+        // The bound workspace was closed/archived while the modal was open.
+        state.closeWorkspaceSettings();
+        return;
+    };
+    const layout = workspaceSettingsLayout(state, width, height);
+    drawModalChromeVisual(state, width, height, layout.modal);
+    const pad = theme.scaledUi(20.0);
+    const content_w = layout.modal.w - pad * 2.0;
+
+    var title_buffer: [192]u8 = undefined;
+    const title = std.fmt.bufPrint(&title_buffer, "Workspace settings — {s}", .{project.label}) catch "Workspace settings";
+    queuePaletteText(state, .{ .x = layout.modal.x + pad, .y = layout.title_y, .w = content_w, .h = theme.scaledUi(24.0) }, title, paletteColor(theme.COLOR_WHITE), theme.scaledUi(17.0), layout.modal);
+    queuePaletteText(state, .{ .x = layout.modal.x + pad, .y = layout.section_y, .w = content_w, .h = theme.scaledUi(20.0) }, "Default runtime for new chats", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.5), layout.modal);
+
+    state.workspace_settings_scroll_y = theme.clampf(state.workspace_settings_scroll_y, 0.0, layout.max_scroll_y);
+    const mouse_x = state.transcript_controller.palette_mouse_x;
+    const mouse_y = state.transcript_controller.palette_mouse_y;
+    const count = state.workspaceSettingsOptionCount();
+    var index: usize = 0;
+    while (index < count) : (index += 1) {
+        const option = state.workspaceSettingsOptionAt(index) orelse continue;
+        const row = workspaceSettingsOptionRowRect(layout, index, state.workspace_settings_scroll_y);
+        if (row.y + row.h < layout.list.y or row.y > layout.list.y + layout.list.h) continue;
+        const hovered = pointInRect(mouse_x, mouse_y, row) and pointInRect(mouse_x, mouse_y, layout.list);
+        if (option.is_current) {
+            queuePaletteRoundedRect(state, rectIntersection(row, layout.list), paletteColor(theme.withAlpha(theme.COLOR_GREEN, 30)), theme.scaledUi(8.0));
+        } else if (hovered) {
+            queuePaletteRoundedRect(state, rectIntersection(row, layout.list), paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 220)), theme.scaledUi(8.0));
+        }
+        // Radio affordance: outer ring always, inner dot only on the current
+        // default so single-choice semantics read at a glance.
+        const radio_size = theme.scaledUi(14.0);
+        const radio: palette.Rect = .{
+            .x = row.x + theme.scaledUi(12.0),
+            .y = row.y + (row.h - radio_size) * 0.5,
+            .w = radio_size,
+            .h = radio_size,
+        };
+        // The ring/dot cannot be partially clipped like the rects above (the
+        // border primitive has no clip rect), so draw them only when the
+        // radio sits fully inside the list band; a half row shows text and
+        // background alone rather than a ring bleeding into the explainer.
+        const radio_fully_visible = radio.y >= layout.list.y and
+            radio.y + radio.h <= layout.list.y + layout.list.h;
+        if (radio_fully_visible) {
+            queuePaletteBorder(state, radio, paletteColor(if (option.is_current) theme.COLOR_GREEN else theme.COLOR_TEXT_SUBTLE), radio_size * 0.5, theme.scaledUi(1.5));
+            if (option.is_current) {
+                const dot_inset = theme.scaledUi(4.0);
+                queuePaletteRoundedRect(state, .{
+                    .x = radio.x + dot_inset,
+                    .y = radio.y + dot_inset,
+                    .w = radio.w - dot_inset * 2.0,
+                    .h = radio.h - dot_inset * 2.0,
+                }, paletteColor(theme.COLOR_GREEN), (radio.w - dot_inset * 2.0) * 0.5);
+            }
+        }
+        const badge = if (option.status) |status| runtime.runtimePickerStatusBadge(status) else "Always available";
+        const badge_color = if (option.status) |status| runtime.runtimeStatusTone(status).color() else theme.COLOR_TEXT_MUTED;
+        const badge_w = theme.scaledUi(170.0);
+        const label_x = radio.x + radio_size + theme.scaledUi(10.0);
+        queuePaletteText(state, .{
+            .x = label_x,
+            .y = row.y + (row.h - theme.scaledUi(20.0)) * 0.5,
+            .w = @max(row.x + row.w - badge_w - theme.scaledUi(20.0) - label_x, theme.scaledUi(48.0)),
+            .h = theme.scaledUi(20.0),
+        }, option.label, paletteColor(if (option.is_current or hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(14.5), layout.list);
+        queuePaletteText(state, .{
+            .x = row.x + row.w - badge_w - theme.scaledUi(12.0),
+            .y = row.y + (row.h - theme.scaledUi(17.0)) * 0.5,
+            .w = badge_w,
+            .h = theme.scaledUi(17.0),
+        }, badge, paletteColor(badge_color), theme.scaledUi(12.0), layout.list);
+    }
+
+    const explain_lines: [3][]const u8 = .{
+        "Applies to new chats in this workspace only.",
+        "Chats that already started keep the runtime they were using.",
+        "Each chat can still pick its own runtime from the composer.",
+    };
+    for (explain_lines, 0..) |line, line_index| {
+        queuePaletteText(state, .{
+            .x = layout.modal.x + pad,
+            .y = layout.explain_y + @as(f32, @floatFromInt(line_index)) * theme.scaledUi(17.0),
+            .w = content_w,
+            .h = theme.scaledUi(17.0),
+        }, line, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), layout.modal);
+    }
+    const notice = state.workspaceSettingsNotice();
+    if (notice.len > 0) {
+        queuePaletteText(state, .{ .x = layout.modal.x + pad, .y = layout.notice_y, .w = content_w, .h = theme.scaledUi(18.0) }, notice, paletteColor(theme.COLOR_GREEN), theme.scaledUi(12.5), layout.modal);
+    }
+    drawActionButton(state, layout.manage_button, "Manage connections", theme.COLOR_PANEL_ALT);
+    drawActionButton(state, layout.close_button, "Close", theme.accent());
 }
 
 fn drawModalChromeVisual(state: *runtime.AppState, width: f32, height: f32, modal: palette.Rect) void {
@@ -935,6 +1164,9 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
                     state.setSidebarNotice("Could not save settings to verde.json.");
                 }
             },
+            .workspace_settings_close => state.closeWorkspaceSettings(),
+            .workspace_settings_option => state.applyWorkspaceSettingsOption(hit.index),
+            .workspace_settings_manage => state.openManageConnectionsFromWorkspaceSettings(),
             .settings_control => settings_modal.applyControlAt(state, hit.index, hit.rect, x),
             .settings_theme_option => settings_modal.applyThemeOption(state, hit.index),
             .settings_title_provider_option => settings_modal.applyChatTitleProviderOption(state, hit.index),
@@ -1040,7 +1272,11 @@ pub fn handlePaletteTextInput(state: *runtime.AppState, text: []const u8) bool {
         // credential-modal chrome blurs its field. Both still own text input:
         // an SDL text_input paired with an already-consumed key-down must not
         // fall through into the obscured composer, browser, or terminal.
-        return state.runtimeCredentialModalOpen() or state.runtimeTrustProposal() != null;
+        // Workspace Settings has no editable field but likewise owns text
+        // input while open.
+        return state.runtimeCredentialModalOpen() or
+            state.runtimeTrustProposal() != null or
+            state.workspaceSettingsOpen();
     }
     if (state.palette_modal_text_focus == .runtime_credential) {
         return insertRuntimeCredentialText(state, text);
@@ -1116,6 +1352,7 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
         state.handoff_controller.modal_open or
         state.project_controller.show_creator or
         state.settings_controller.modal_visible or
+        state.workspaceSettingsOpen() or
         state.runtime_connections.wizard_open or
         state.command_controller.open;
     if (!has_modal_open) return false;
@@ -1149,6 +1386,20 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
     // the shared modal text path below.
     if (state.command_controller.open and command_palette.handleKeyDown(state, event)) return true;
     if (state.settings_controller.modal_visible and settings_modal.handleKeyDown(state, event.key)) return true;
+    // Workspace Settings keyboard ownership: it has no editable field, so
+    // with no higher-priority modal above it Escape closes through the shared
+    // dismiss path and every other key is consumed — Enter, Backspace, and
+    // shortcuts must not fall through to the obscured composer, browser, or
+    // terminal, and rows stay mouse-activated only.
+    if (state.workspaceSettingsOpen() and
+        !state.runtimeCredentialModalOpen() and
+        state.runtimeTrustProposal() == null and
+        !state.runtime_connections.wizard_open and
+        !state.command_controller.open)
+    {
+        if (event.key == .escape) dismissTopModal(state);
+        return true;
+    }
     const primary = (keymodBits(event.mod) & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0;
     const shift = (keymodBits(event.mod) & sdl.Keymod.shift) != 0;
     switch (event.key) {
@@ -1300,6 +1551,8 @@ fn dismissTopModal(state: *runtime.AppState) void {
         state.cancelThreadImport();
     } else if (state.handoff_controller.modal_open) {
         state.cancelHandoff();
+    } else if (state.workspaceSettingsOpen()) {
+        state.closeWorkspaceSettings();
     } else if (state.settings_controller.modal_visible) {
         state.cancelSettingsModal();
     }
@@ -1651,7 +1904,8 @@ fn wizardTestingActionLabel(status: runtime.RuntimePickerStatus) []const u8 {
 test "wizard testing step hides the middle button when recovery has no action" {
     try std.testing.expectEqualStrings("", wizardTestingActionLabel(.ready));
     try std.testing.expectEqualStrings("", wizardTestingActionLabel(.connecting));
-    try std.testing.expectEqualStrings("", wizardTestingActionLabel(.reconnecting));
+    // A scheduled reconnect exposes the manual accelerator.
+    try std.testing.expectEqualStrings("Retry now", wizardTestingActionLabel(.reconnecting));
     try std.testing.expectEqualStrings("", wizardTestingActionLabel(.unavailable));
     try std.testing.expectEqualStrings("Verify…", wizardTestingActionLabel(.trust_required));
     try std.testing.expectEqualStrings("Edit endpoint", wizardTestingActionLabel(.identity_mismatch));
@@ -2928,6 +3182,134 @@ test "Pair wizard form positions only its two visible fields on separate rows" {
     state.runtime_connections.wizard_method = .ssh;
     const ssh_layout = runtimeWizardLayout(&state, 1200.0, 900.0);
     try std.testing.expect(pair_layout.modal.h < ssh_layout.modal.h);
+}
+
+test "workspace settings modal dismisses on escape and routes its actions" {
+    const source = @embedFile("layout.zig");
+    const dismiss_start = std.mem.indexOf(u8, source, "fn dismissTopModal").?;
+    const dismiss_end = std.mem.indexOfPos(u8, source, dismiss_start, "fn keymodBits").?;
+    const dismiss_path = source[dismiss_start..dismiss_end];
+    try std.testing.expect(std.mem.indexOf(u8, dismiss_path, "state.workspaceSettingsOpen()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dismiss_path, "state.closeWorkspaceSettings()") != null);
+
+    const pointer_start = std.mem.indexOf(u8, source, "pub fn handlePaletteMouseButton").?;
+    const pointer_end = std.mem.indexOfPos(u8, source, pointer_start, "fn focusModalInput").?;
+    const pointer_path = source[pointer_start..pointer_end];
+    try std.testing.expect(std.mem.indexOf(u8, pointer_path, ".workspace_settings_option => state.applyWorkspaceSettingsOption(hit.index)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pointer_path, ".workspace_settings_manage => state.openManageConnectionsFromWorkspaceSettings()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pointer_path, ".workspace_settings_close => state.closeWorkspaceSettings()") != null);
+}
+
+test "workspace settings modal owns keyboard and text input while open" {
+    const allocator = std.testing.allocator;
+    var state: runtime.AppState = undefined;
+    state.allocator = allocator;
+    state.lifecycle = .{};
+    state.palette_modal_text_focus = .none;
+    state.modal_text_selection_anchor = null;
+    state.modal_text_drag_active = false;
+    state.runtime_credential_profile_id = null;
+    state.runtime_pin_proposal = null;
+    state.modal_image_path = null;
+    state.settings_controller.mcp_onboarding_visible = false;
+    state.settings_controller.provider_onboarding_visible = false;
+    state.settings_controller.modal_visible = false;
+    state.rename_project_index = null;
+    state.transcript_controller.selection_text = null;
+    state.thread_import_provider = null;
+    state.handoff_controller.modal_open = false;
+    state.project_controller.show_creator = false;
+    state.runtime_connections = .{};
+    state.command_controller.open = false;
+    state.workspace_settings_project_id = null;
+    state.workspace_settings_notice_storage = @splat(0);
+    defer state.closeWorkspaceSettings();
+
+    // With no focused field, an SDL text_input must be swallowed while the
+    // modal is open so printable characters cannot reach the obscured
+    // composer, browser, or terminal.
+    try std.testing.expect(!handlePaletteTextInput(&state, "x"));
+    state.workspace_settings_project_id = try allocator.dupe(u8, "workspace-a");
+    try std.testing.expect(handlePaletteTextInput(&state, "x"));
+
+    // Every key-down is consumed while the modal owns the keyboard; Escape
+    // additionally closes it through the shared dismiss path.
+    var event: sdl.KeyboardEvent = undefined;
+    @memset(std.mem.asBytes(&event), 0);
+    event.type = .key_down;
+    event.down = true;
+    const consumed_keys: [4]sdl.Keycode = .{ .@"return", .c, .backspace, .q };
+    for (consumed_keys) |key| {
+        event.key = key;
+        try std.testing.expect(handlePaletteKeyDown(&state, &event));
+        try std.testing.expect(state.workspaceSettingsOpen());
+    }
+    // Ctrl+C (copy chord) is likewise consumed, not forwarded.
+    event.key = .c;
+    @as(*u16, @ptrCast(&event.mod)).* = sdl.Keymod.ctrl;
+    try std.testing.expect(handlePaletteKeyDown(&state, &event));
+    try std.testing.expect(state.workspaceSettingsOpen());
+    @as(*u16, @ptrCast(&event.mod)).* = sdl.Keymod.none;
+    event.key = .escape;
+    try std.testing.expect(handlePaletteKeyDown(&state, &event));
+    try std.testing.expect(!state.workspaceSettingsOpen());
+    // Once closed, the same keys fall back to normal (unconsumed) routing.
+    event.key = .q;
+    try std.testing.expect(!handlePaletteKeyDown(&state, &event));
+    try std.testing.expect(!handlePaletteTextInput(&state, "x"));
+}
+
+test "workspace settings layout clamps the option list at short heights" {
+    defer theme.applyTheme(1.0);
+    theme.applyTheme(1.0);
+    const allocator = std.testing.allocator;
+
+    var state: runtime.AppState = undefined;
+    state.runtime_picker_profiles = .empty;
+    defer {
+        for (state.runtime_picker_profiles.items) |*profile| {
+            allocator.free(profile.profile_id);
+        }
+        state.runtime_picker_profiles.deinit(allocator);
+    }
+    var index: usize = 0;
+    while (index < 12) : (index += 1) {
+        try state.runtime_picker_profiles.append(allocator, .{
+            .profile_id = try allocator.dupe(u8, "profile-0123456789abcdef0123456789abcdef"),
+            .status = .offline,
+        });
+    }
+
+    const tall = workspaceSettingsLayout(&state, 1200.0, 1000.0);
+    const short = workspaceSettingsLayout(&state, 1200.0, 520.0);
+    // The whole modal stays on screen at short heights; only the list shrinks
+    // and becomes scrollable.
+    try std.testing.expect(short.modal.y >= 0.0);
+    try std.testing.expect(short.modal.y + short.modal.h <= 520.0 + theme.scaledUi(1.0));
+    try std.testing.expect(short.list.h < tall.list.h);
+    try std.testing.expect(short.max_scroll_y > 0.0);
+    // Buttons stay inside the modal below the notice band.
+    try std.testing.expect(short.close_button.y + short.close_button.h <= short.modal.y + short.modal.h);
+    try std.testing.expect(short.manage_button.x + short.manage_button.w < short.close_button.x);
+    // A row scrolled past the clip registers no hit area.
+    const scrolled = workspaceSettingsOptionRowRect(short, 11, short.max_scroll_y);
+    try std.testing.expect(scrolled.y + scrolled.h <= short.list.y + short.list.h + short.row_h);
+    const hidden = rectIntersection(workspaceSettingsOptionRowRect(short, 0, short.max_scroll_y), short.list);
+    try std.testing.expect(hidden.h <= 0.0 or short.max_scroll_y < short.row_h);
+
+    // A half-scrolled top row centers its radio above the list band, so the
+    // renderer must gate the unclippable ring/dot on full containment.
+    const partial = workspaceSettingsOptionRowRect(short, 0, short.row_h * 0.5);
+    const radio_size = theme.scaledUi(14.0);
+    const partial_radio_y = partial.y + (partial.h - radio_size) * 0.5;
+    try std.testing.expect(partial_radio_y < short.list.y);
+    const source = @embedFile("layout.zig");
+    const render_start = std.mem.indexOf(u8, source, "fn renderWorkspaceSettingsModal").?;
+    const render_end = std.mem.indexOfPos(u8, source, render_start, "fn drawModalChromeVisual").?;
+    const render_path = source[render_start..render_end];
+    const guard = std.mem.indexOf(u8, render_path, "const radio_fully_visible = radio.y >= layout.list.y and").?;
+    const ring = std.mem.indexOf(u8, render_path, "queuePaletteBorder(state, radio").?;
+    try std.testing.expect(guard < ring);
 }
 
 test "runtime trust requires the explicit confirmation button" {

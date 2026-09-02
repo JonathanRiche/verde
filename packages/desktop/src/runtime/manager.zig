@@ -22,6 +22,7 @@ pub const HEARTBEAT_INTERVAL_MS: u64 = 15_000;
 pub const MAX_RPC_METHOD_BYTES: usize = 128;
 pub const REPOSITORY_MANIFEST_CAPABILITY: []const u8 = "repositories.manifest.v1";
 pub const REPOSITORY_CHAT_ROUTE_CAPABILITY: []const u8 = "chat.repository_route.v1";
+pub const CHAT_ATTACHMENT_CAPABILITY: []const u8 = headless.attachment_protocol.CHAT_ATTACHMENT_CAPABILITY;
 /// Paired-device access tokens are re-minted this long before they expire so
 /// a heartbeat never races an expiry.
 pub const ACCESS_TOKEN_REFRESH_MARGIN_MS: u64 = 60_000;
@@ -217,6 +218,13 @@ pub const Snapshot = struct {
     verified_runtime_matches_pin: bool = false,
     repository_manifest_capable: bool = false,
     repository_chat_route_capable: bool = false,
+    /// Whether the runtime accepts staged chat attachments (chat.attachments.v1).
+    /// Old daemons leave this false so attachment sends reject visibly.
+    chat_attachment_capable: bool = false,
+    /// Runtime-advertised, connection-validated upload limits. Zero until a
+    /// verified handshake supplies them.
+    max_attachment_bytes: usize = 0,
+    max_request_bytes: usize = 0,
     /// Deliberately false until every general RPC carries the persisted
     /// runtime+instance target and the daemon checks it in the same dispatch;
     /// a separate heartbeat alone cannot authorize later mutation.
@@ -399,6 +407,18 @@ const Entry = struct {
     last_successful_connection_ms: ?u64 = null,
     credential_hydration: CredentialHydration = .not_applicable,
     failure_override: ?Failure = null,
+    /// True after a ready-phase 401 already spent its one silent access-token
+    /// re-mint without an intervening healthy round trip. A daemon restart
+    /// invalidates the daemon's process-memory bearer table while the paired
+    /// device credential stays valid, so the first 401 buys a re-mint, not a
+    /// failure; a second consecutive 401 escalates to a visible auth failure.
+    stale_bearer_remint_attempted: bool = false,
+    /// Set only when the runtime's device-auth endpoint explicitly rejected
+    /// the stored device credential (the gateway answers 401 solely on the
+    /// daemon's authoritative `authentication_rejected`). This is the sole
+    /// path into the permanent `device_credential_revoked` presentation;
+    /// transport, timeout, and generic bearer failures never set it.
+    device_auth_rejected: bool = false,
 
     fn deinit(self: *Entry, allocator: std.mem.Allocator) void {
         // Both handoffs are non-blocking. Their worker-owned state and retained
@@ -559,6 +579,9 @@ pub const Manager = struct {
         }
         try self.secrets.put(key, credential);
         entry.credential_hydration = .loaded;
+        // A newly hydrated credential has no proven auth history.
+        entry.device_auth_rejected = false;
+        entry.stale_bearer_remint_attempted = false;
         if (entry.failure_override == .missing_credential) entry.failure_override = null;
     }
 
@@ -586,6 +609,8 @@ pub const Manager = struct {
         entry.failure_override = null;
         entry.access_token_expires_at_ms = null;
         entry.access_token_refresh_at_ms = null;
+        entry.device_auth_rejected = false;
+        entry.stale_bearer_remint_attempted = false;
         if (entry.tunnel_owned) entry.supervisor.stop();
         self.collectTerminalTunnel(entry);
         _ = self.secrets.remove(profile_id);
@@ -821,6 +846,8 @@ pub const Manager = struct {
         const generation = try entry.connection_state.enable();
         clearHealth(entry);
         entry.failure_override = null;
+        entry.device_auth_rejected = false;
+        entry.stale_bearer_remint_attempted = false;
         if (!entry.tunnel_owned and entry.handshake == null and entry.access_task == null) {
             try self.startAttempt(index, generation, now_ms);
         } else if (entry.tunnel_owned) {
@@ -870,6 +897,10 @@ pub const Manager = struct {
         const generation = try entry.connection_state.retryFailed();
         clearHealth(entry);
         entry.failure_override = null;
+        // A user-driven retry re-probes with the held credential; a genuine
+        // revocation re-proves itself through the device-auth endpoint.
+        entry.device_auth_rejected = false;
+        entry.stale_bearer_remint_attempted = false;
         if (!entry.tunnel_owned and entry.handshake == null and entry.access_task == null) {
             try self.startAttempt(index, generation, now_ms);
         } else if (entry.tunnel_owned) {
@@ -1378,6 +1409,13 @@ pub const Manager = struct {
         failure: AccessFailure,
         now_ms: u64,
     ) !void {
+        // Only the device-auth endpoint's explicit 401 is authoritative for
+        // the credential itself: the gateway answers 503 while the daemon is
+        // unreachable and 429 while rate limiting, so those never claim the
+        // device was revoked.
+        if (kind == .mint_access_token and failure == .authentication) {
+            entry.device_auth_rejected = true;
+        }
         const connection_failure: connection.FailureKind = switch (failure) {
             .authentication, .rate_limited => .authentication,
             .network => .network,
@@ -1457,6 +1495,9 @@ pub const Manager = struct {
 
         if (entry.pending_grant) |*grant| grant.deinit(self.allocator);
         entry.pending_grant = null;
+        // Re-pairing replaces the credential, so prior auth outcomes are void.
+        entry.device_auth_rejected = false;
+        entry.stale_bearer_remint_attempted = false;
         if (entry.pairing_result) |*previous| previous.deinit(self.allocator);
         entry.pairing_result = .{
             .device_id = device_id,
@@ -1480,6 +1521,10 @@ pub const Manager = struct {
         try self.secrets.put(entry.owned_profile.id, value.access_token);
         entry.access_token_expires_at_ms = value.expires_at_ms;
         entry.access_token_refresh_at_ms = accessTokenRefreshAt(self.io, value.expires_at_ms, now_ms);
+        // The runtime just accepted the device credential, so any previous
+        // rejection marker is stale. The remint-attempted bound stays until a
+        // healthy RPC proves the fresh bearer actually works.
+        entry.device_auth_rejected = false;
         if (entry.failure_override == .missing_credential) entry.failure_override = null;
     }
 
@@ -1555,7 +1600,9 @@ pub const Manager = struct {
 
         switch (worker_result.?) {
             .failed => |failure| {
-                try self.invalidateExecution(entry, failure, now_ms);
+                if (!self.recoverStaleBearer(entry, failure)) {
+                    try self.invalidateExecution(entry, failure, now_ms);
+                }
                 if (kind == .user) {
                     entry.rpc_result = .{
                         .ticket = kind.user,
@@ -1583,6 +1630,11 @@ pub const Manager = struct {
                     entry.healthy_generation = generation;
                     entry.last_heartbeat_ms = now_ms;
                     entry.next_heartbeat_at_ms = now_ms +| HEARTBEAT_INTERVAL_MS;
+                    // A successful authenticated round trip is authoritative:
+                    // the credential works, so any stale auth/revoked markers
+                    // must not survive it.
+                    entry.stale_bearer_remint_attempted = false;
+                    entry.device_auth_rejected = false;
                     if (kind == .user) {
                         const failure_reason = classifyRpcResponseFailure(
                             self.allocator,
@@ -1658,6 +1710,26 @@ pub const Manager = struct {
             self.dependencies.rpc_backend,
             if (bearer_lease) |*lease| lease else null,
         );
+    }
+
+    /// A 401 on an authenticated RPC right after a daemon restart usually
+    /// means the daemon lost its process-memory access-token table, not that
+    /// the paired device was revoked. Spend the still-valid device credential
+    /// on one silent re-mint (bounded by `stale_bearer_remint_attempted`)
+    /// before letting authentication surface as a failure. Returns whether
+    /// recovery was scheduled; the ready generation is preserved so a stale
+    /// pre-restart worker cannot outrank the recovering session.
+    fn recoverStaleBearer(_: *Manager, entry: *Entry, failure: connection.FailureKind) bool {
+        if (failure != .authentication) return false;
+        if (!entry.usesDeviceCredential()) return false;
+        if (entry.connection_state.phase() != .ready) return false;
+        if (entry.stale_bearer_remint_attempted) return false;
+        entry.stale_bearer_remint_attempted = true;
+        clearHealth(entry);
+        // Due immediately: the ready branch prefers a re-mint over the next
+        // heartbeat, and a successful mint restores the real refresh deadline.
+        entry.access_token_refresh_at_ms = 0;
+        return true;
     }
 
     fn invalidateExecution(
@@ -2666,7 +2738,10 @@ fn snapshotEntry(entry: *const Entry) Snapshot {
         else if (entry.failure_override == .missing_credential)
             .authentication_required
         else if (connection_failure) |failure|
-            if (failure == .authentication and entry.usesDeviceCredential())
+            // Revoked is claimed only on the device-auth endpoint's explicit
+            // rejection. A generic bearer 401 (daemon restart, stale session)
+            // stays a plain authentication failure with retry affordances.
+            if (failure == .authentication and entry.device_auth_rejected)
                 .device_credential_revoked
             else
                 mapConnectionFailureReason(failure)
@@ -2698,6 +2773,9 @@ fn snapshotEntry(entry: *const Entry) Snapshot {
         .verified_runtime_matches_pin = verifiedRuntimeMatchesPin(entry),
         .repository_manifest_capable = runtimeAdvertisesCapability(entry, REPOSITORY_MANIFEST_CAPABILITY),
         .repository_chat_route_capable = runtimeAdvertisesCapability(entry, REPOSITORY_CHAT_ROUTE_CAPABILITY),
+        .chat_attachment_capable = runtimeAdvertisesCapability(entry, CHAT_ATTACHMENT_CAPABILITY),
+        .max_attachment_bytes = if (entry.connection_state.metadata()) |runtime| runtime.limits.max_attachment_bytes else 0,
+        .max_request_bytes = if (entry.connection_state.metadata()) |runtime| runtime.limits.max_request_bytes else 0,
         .execution_ready = entryExecutionReady(entry),
     };
 }
@@ -3012,6 +3090,9 @@ const TargetRpcMode = enum(u8) {
     method_error,
     identity_mismatch,
     network_failure,
+    /// Targeted calls answer 401 (stale bearer after a daemon restart); the
+    /// untargeted handshake keeps working so a re-minted token can recover.
+    auth_failure,
 };
 
 /// Hermetic daemon seam for proving that every post-handshake exchange carries
@@ -3080,6 +3161,7 @@ const TargetRpc = struct {
 
         const mode: TargetRpcMode = @enumFromInt(self.mode.load(.acquire));
         if (is_targeted and mode == .network_failure) return error.NetworkUnavailable;
+        if (is_targeted and mode == .auth_failure) return error.AuthenticationRequired;
         if (!is_status) {
             while (!self.allow_general_return.load(.acquire)) std.atomic.spinLoopHint();
             return switch (mode) {
@@ -3095,7 +3177,7 @@ const TargetRpc = struct {
                     headless.protocol.ERR_RUNTIME_IDENTITY_MISMATCH,
                     "runtime replaced",
                 ) catch error.OutOfMemory,
-                .normal, .network_failure => headless.encodeOkResponse(
+                .normal, .network_failure, .auth_failure => headless.encodeOkResponse(
                     allocator,
                     parsed.request.id,
                     .{ .ok = true },
@@ -3120,6 +3202,104 @@ const TargetRpc = struct {
         };
     }
 };
+
+const TEST_DEVICE_ID = "0123456789abcdef0123456789abcdef";
+const TEST_MINTED_TOKEN = "0123456789abcdef" ** 4;
+
+const TestAccessMode = enum(u8) {
+    normal,
+    /// The daemon explicitly rejected the device credential (gateway 401).
+    reject,
+    /// The gateway cannot reach the daemon (503): outage, not revocation.
+    unavailable,
+};
+
+/// Hermetic Pair-auth gateway seam serving access-token mints, so restart-
+/// shaped bearer invalidation and authoritative device rejection can both be
+/// exercised without a network.
+const TestAccessGateway = struct {
+    mode: std.atomic.Value(u8) = .init(@intFromEnum(TestAccessMode.normal)),
+    mints: std.atomic.Value(usize) = .init(0),
+    device_authorized: std.atomic.Value(bool) = .init(true),
+    retained: std.atomic.Value(usize) = .init(0),
+
+    fn setMode(self: *TestAccessGateway, mode: TestAccessMode) void {
+        self.mode.store(@intFromEnum(mode), .release);
+    }
+
+    fn retain(raw_context: ?*anyopaque) void {
+        const self: *TestAccessGateway = @ptrCast(@alignCast(raw_context.?));
+        _ = self.retained.fetchAdd(1, .acq_rel);
+    }
+
+    fn release(raw_context: ?*anyopaque) void {
+        const self: *TestAccessGateway = @ptrCast(@alignCast(raw_context.?));
+        _ = self.retained.fetchSub(1, .acq_rel);
+    }
+
+    fn call(
+        raw_context: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        _: TransportTarget,
+        path: []const u8,
+        authorization: ?[]const u8,
+        _: []const u8,
+    ) pair_client.Error![]u8 {
+        const self: *TestAccessGateway = @ptrCast(@alignCast(raw_context.?));
+        if (!std.mem.eql(u8, path, access_protocol.HTTP_ACCESS_TOKEN_PATH)) {
+            return error.ProtocolRejected;
+        }
+        // Every mint must present the stored device credential; recovery from
+        // a stale bearer must never invent or drop it.
+        const expected_header = "VerdeDevice " ++ TEST_DEVICE_ID ++ "." ++ TEST_DEVICE_CREDENTIAL;
+        if (authorization == null or !std.mem.eql(u8, authorization.?, expected_header)) {
+            self.device_authorized.store(false, .release);
+        }
+        switch (@as(TestAccessMode, @enumFromInt(self.mode.load(.acquire)))) {
+            .reject => return error.AuthenticationRequired,
+            .unavailable => return error.ServerUnavailable,
+            .normal => {},
+        }
+        _ = self.mints.fetchAdd(1, .acq_rel);
+        return std.fmt.allocPrint(
+            allocator,
+            "{{\"access_protocol_version\":{d},\"access_token\":\"{s}\",\"token_type\":\"{s}\",\"expires_at_ms\":{d}}}",
+            .{
+                access_protocol.ACCESS_PROTOCOL_VERSION,
+                TEST_MINTED_TOKEN,
+                access_protocol.ACCESS_TOKEN_TYPE,
+                std.math.maxInt(i64),
+            },
+        ) catch error.OutOfMemory;
+    }
+
+    fn backend(self: *TestAccessGateway) AccessBackend {
+        return .{
+            .context = self,
+            .call = call,
+            .retain_context = retain,
+            .release_context = release,
+        };
+    }
+};
+
+fn createPairedDirectTestProfile(label: []const u8) !profile.Profile {
+    var configured = try profile.Profile.createPairedDirect(
+        std.testing.allocator,
+        std.testing.io,
+        label,
+        "https://runtime.example",
+        null,
+    );
+    errdefer configured.deinit(std.testing.allocator);
+    try configured.setPairedDevice(
+        std.testing.allocator,
+        TEST_DEVICE_ID,
+        "verde-runtime/test/device",
+    );
+    try configured.setExpectedIdentity(std.testing.allocator, TEST_RUNTIME_A, TEST_INSTANCE);
+    return configured;
+}
 
 fn testStatus(runtime_id: []const u8) headless.StatusResult {
     return .{
@@ -3499,12 +3679,28 @@ test "transient and wrong-service failures preserve paired device credentials" {
     try std.testing.expect(wrong_service.device_credential_held);
     try std.testing.expect(wrong_service.failure.? != .missing_credential);
 
+    // A generic transport 401 (stale bearer after a daemon restart, proxy
+    // misfire) is not proof of revocation: it must present as a plain
+    // authentication failure with the credential intact.
     const auth_generation = try entry.connection_state.retryFailed();
     _ = try entry.connection_state.failAttempt(auth_generation, .authentication, 1_200, 0);
+    const generic_auth = manager.snapshot(configured.id).?;
+    try std.testing.expectEqual(FailureReason.authentication_required, generic_auth.failure_reason.?);
+    try std.testing.expect(generic_auth.device_credential_held);
+    try std.testing.expect(generic_auth.manual_retry_available);
+
+    // Only the device-auth endpoint's explicit rejection claims revocation.
+    entry.device_auth_rejected = true;
     const revoked = manager.snapshot(configured.id).?;
     try std.testing.expectEqual(FailureReason.device_credential_revoked, revoked.failure_reason.?);
     try std.testing.expect(!revoked.automatic_retry_scheduled);
     try std.testing.expect(revoked.device_credential_held);
+
+    // A manual retry re-probes the same credential; the revoked marker must
+    // not survive the fresh attempt unless the runtime rejects it again.
+    try manager.retry(configured.id, 1_300);
+    try std.testing.expect(!entry.device_auth_rejected);
+    try std.testing.expect(manager.snapshot(configured.id).?.failure_reason == null);
 }
 
 test "targeted heartbeat network failure retries and restores health" {
@@ -3552,6 +3748,171 @@ test "targeted heartbeat network failure retries and restores health" {
     try std.testing.expectEqual(connection.Phase.ready, manager.snapshot(configured.id).?.phase);
     try std.testing.expectEqual(@as(usize, 3), rpc.targeted_heartbeats.load(.acquire));
     try std.testing.expect(rpc.valid_targets.load(.acquire));
+}
+
+test "daemon restart stale bearer re-mints silently and recovers with the same device credential" {
+    var configured = try createPairedDirectTestProfile("Restart VM");
+    defer configured.deinit(std.testing.allocator);
+    var rpc: TargetRpc = .{ .expected_token = TEST_MINTED_TOKEN };
+    var access: TestAccessGateway = .{};
+    var manager = try Manager.init(std.testing.allocator, std.testing.io, &.{configured}, .{
+        .rpc_backend = rpc.backend(),
+        .access_backend = access.backend(),
+    });
+    defer manager.deinit();
+    try manager.hydrateDeviceCredential(configured.id, TEST_DEVICE_CREDENTIAL);
+    try manager.enable(configured.id, 0);
+    try waitForExecutionReady(&manager, configured.id, 5_000);
+    const mints_before = access.mints.load(.acquire);
+    const due_ms = manager.snapshot(configured.id).?.last_heartbeat_ms.? + HEARTBEAT_INTERVAL_MS;
+
+    // The daemon restarts: its process-memory bearer table is gone while the
+    // paired device record stays valid, so targeted calls answer 401.
+    rpc.setMode(.auth_failure);
+    for (0..2_000) |iteration| {
+        try manager.poll(due_ms + iteration);
+        if (!manager.snapshot(configured.id).?.execution_ready) break;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    } else return error.TestExpectedStaleBearer;
+
+    // The 401 reads as a stale bearer: the same ready session, no failure
+    // classification, and never a revoked credential or a pairing flow.
+    const stale = manager.snapshot(configured.id).?;
+    try std.testing.expectEqual(connection.Phase.ready, stale.phase);
+    try std.testing.expect(stale.failure_reason == null);
+    try std.testing.expectEqual(PairingState.none, stale.pairing_state);
+
+    // The daemon is reachable again: one silent re-mint with the identical
+    // device credential restores health without any user action.
+    rpc.setMode(.normal);
+    try waitForExecutionReady(&manager, configured.id, due_ms + 2_000);
+    const recovered = manager.snapshot(configured.id).?;
+    try std.testing.expect(recovered.failure_reason == null);
+    try std.testing.expect(recovered.device_credential_held);
+    // Refreshed runtime limits flow into the same snapshot chat send routes on.
+    try std.testing.expectEqual(@as(usize, 1_048_576), recovered.max_attachment_bytes);
+    try std.testing.expect(access.mints.load(.acquire) > mints_before);
+    try std.testing.expect(access.device_authorized.load(.acquire));
+    try std.testing.expect(rpc.valid_targets.load(.acquire));
+}
+
+test "persistent 401 after a fresh mint escalates to a generic auth failure, never revoked" {
+    var configured = try createPairedDirectTestProfile("Escalation VM");
+    defer configured.deinit(std.testing.allocator);
+    var rpc: TargetRpc = .{ .expected_token = TEST_MINTED_TOKEN };
+    var access: TestAccessGateway = .{};
+    var manager = try Manager.init(std.testing.allocator, std.testing.io, &.{configured}, .{
+        .rpc_backend = rpc.backend(),
+        .access_backend = access.backend(),
+    });
+    defer manager.deinit();
+    try manager.hydrateDeviceCredential(configured.id, TEST_DEVICE_CREDENTIAL);
+    try manager.enable(configured.id, 0);
+    try waitForExecutionReady(&manager, configured.id, 5_000);
+    const mints_before = access.mints.load(.acquire);
+    const due_ms = manager.snapshot(configured.id).?.last_heartbeat_ms.? + HEARTBEAT_INTERVAL_MS;
+
+    // Mints keep succeeding but the runtime keeps answering 401: after the
+    // one silent recovery attempt this must surface as a visible generic
+    // authentication failure with a manual retry, never as revocation.
+    rpc.setMode(.auth_failure);
+    for (0..2_000) |iteration| {
+        try manager.poll(due_ms + iteration);
+        if (manager.snapshot(configured.id).?.phase == .failed) break;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    } else return error.TestExpectedEscalation;
+
+    const failed = manager.snapshot(configured.id).?;
+    try std.testing.expectEqual(FailureReason.authentication_required, failed.failure_reason.?);
+    try std.testing.expect(!failed.automatic_retry_scheduled);
+    try std.testing.expect(failed.manual_retry_available);
+    try std.testing.expect(failed.device_credential_held);
+    try std.testing.expectEqual(mints_before + 1, access.mints.load(.acquire));
+
+    // Manual Reconnect against a healthy runtime recovers with the same
+    // credential and clears the stale failure.
+    rpc.setMode(.normal);
+    try manager.retry(configured.id, due_ms + 3_000);
+    try waitForExecutionReady(&manager, configured.id, due_ms + 3_000);
+    try std.testing.expect(manager.snapshot(configured.id).?.failure_reason == null);
+}
+
+test "explicit device-auth rejection is the only path into device revoked" {
+    var configured = try createPairedDirectTestProfile("Revoked VM Auth");
+    defer configured.deinit(std.testing.allocator);
+    var rpc: TargetRpc = .{ .expected_token = TEST_MINTED_TOKEN };
+    var access: TestAccessGateway = .{};
+    var manager = try Manager.init(std.testing.allocator, std.testing.io, &.{configured}, .{
+        .rpc_backend = rpc.backend(),
+        .access_backend = access.backend(),
+    });
+    defer manager.deinit();
+    try manager.hydrateDeviceCredential(configured.id, TEST_DEVICE_CREDENTIAL);
+    try manager.enable(configured.id, 0);
+    try waitForExecutionReady(&manager, configured.id, 5_000);
+    const due_ms = manager.snapshot(configured.id).?.last_heartbeat_ms.? + HEARTBEAT_INTERVAL_MS;
+
+    // The recovery mint is explicitly rejected by the device-auth endpoint:
+    // that, and only that, presents as a revoked device offering Re-pair.
+    access.setMode(.reject);
+    rpc.setMode(.auth_failure);
+    for (0..2_000) |iteration| {
+        try manager.poll(due_ms + iteration);
+        if (manager.snapshot(configured.id).?.phase == .failed) break;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    } else return error.TestExpectedRejection;
+
+    const revoked = manager.snapshot(configured.id).?;
+    try std.testing.expectEqual(FailureReason.device_credential_revoked, revoked.failure_reason.?);
+    try std.testing.expect(!revoked.automatic_retry_scheduled);
+    try std.testing.expect(revoked.device_credential_held);
+
+    // If the runtime un-revokes the device, a manual retry re-proves the
+    // stored credential instead of forcing a re-pair.
+    access.setMode(.normal);
+    rpc.setMode(.normal);
+    try manager.retry(configured.id, due_ms + 3_000);
+    try waitForExecutionReady(&manager, configured.id, due_ms + 3_000);
+    try std.testing.expect(manager.snapshot(configured.id).?.failure_reason == null);
+}
+
+test "gateway outage during bearer recovery schedules backoff instead of revocation" {
+    var configured = try createPairedDirectTestProfile("Outage VM");
+    defer configured.deinit(std.testing.allocator);
+    var rpc: TargetRpc = .{ .expected_token = TEST_MINTED_TOKEN };
+    var access: TestAccessGateway = .{};
+    var manager = try Manager.init(std.testing.allocator, std.testing.io, &.{configured}, .{
+        .rpc_backend = rpc.backend(),
+        .access_backend = access.backend(),
+    });
+    defer manager.deinit();
+    try manager.hydrateDeviceCredential(configured.id, TEST_DEVICE_CREDENTIAL);
+    try manager.enable(configured.id, 0);
+    try waitForExecutionReady(&manager, configured.id, 5_000);
+    const due_ms = manager.snapshot(configured.id).?.last_heartbeat_ms.? + HEARTBEAT_INTERVAL_MS;
+
+    // Restart window: the bearer is stale and the gateway cannot reach the
+    // daemon yet. This is an outage with bounded automatic retries.
+    access.setMode(.unavailable);
+    rpc.setMode(.auth_failure);
+    for (0..2_000) |iteration| {
+        try manager.poll(due_ms + iteration);
+        if (manager.snapshot(configured.id).?.phase == .reconnecting) break;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    } else return error.TestExpectedOutageBackoff;
+
+    const outage = manager.snapshot(configured.id).?;
+    try std.testing.expectEqual(FailureReason.transport_offline, outage.failure_reason.?);
+    try std.testing.expect(outage.automatic_retry_scheduled);
+    try std.testing.expect(outage.retry_at_ms != null);
+    try std.testing.expect(outage.device_credential_held);
+
+    // Services come back: the scheduled retry reconnects with the held
+    // credential, no user action and no re-pair.
+    access.setMode(.normal);
+    rpc.setMode(.normal);
+    try waitForExecutionReady(&manager, configured.id, outage.retry_at_ms.?);
+    try std.testing.expect(manager.snapshot(configured.id).?.failure_reason == null);
 }
 
 test "runtime without targeted RPC capability never becomes execution ready" {

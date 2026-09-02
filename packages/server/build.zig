@@ -2,7 +2,11 @@ const std = @import("std");
 
 /// Dependency-light operator CLI for the standalone Verde runtime.
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // Server artifacts deploy to other machines, so they must never inherit
+    // the build host's CPU features (an AVX-512 host would emit instructions
+    // that SIGILL on a lesser deployment CPU). Default to the architecture
+    // baseline; opt back into host tuning with an explicit `-Dcpu=native`.
+    const target = b.standardTargetOptions(.{ .default_target = .{ .cpu_model = .baseline } });
     const optimize = b.standardOptimizeOption(.{});
     const version = b.option([]const u8, "version", "Version embedded in verde-server") orelse
         b.graph.environ_map.get("VERDE_VERSION") orelse

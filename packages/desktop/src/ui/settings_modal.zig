@@ -341,6 +341,20 @@ fn stepperRects(card: palette.Rect, card_pad: f32, row_y: f32, m: Metrics) struc
     return .{ .dec = dec, .inc = inc };
 }
 
+/// Applies the one-shot "scroll to Runtimes & connections" request queued by
+/// Workspace Settings once real layout metrics exist. Returns true when the
+/// scroll offset changed and layout must be recomputed.
+fn consumePendingRuntimesScroll(state: *runtime.AppState, layout: SettingsLayout) bool {
+    if (!state.settings_controller.scroll_to_runtimes) return false;
+    state.settings_controller.scroll_to_runtimes = false;
+    state.settings_controller.scroll_y = theme.clampf(
+        state.settings_controller.scroll_y + (layout.runtimes_card.y - layout.body_clip.y),
+        0.0,
+        layout.max_scroll_y,
+    );
+    return true;
+}
+
 fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayout {
     const m = metrics();
 
@@ -1037,7 +1051,8 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
         return;
     }
 
-    const layout = computeLayout(state, width, height);
+    var layout = computeLayout(state, width, height);
+    if (consumePendingRuntimesScroll(state, layout)) layout = computeLayout(state, width, height);
     state.settings_controller.scroll_y = theme.clampf(state.settings_controller.scroll_y, 0.0, layout.max_scroll_y);
     queue_hit(state, .{ .x = 0.0, .y = 0.0, .w = width, .h = height }, .modal_dismiss, 0);
     queue_hit(state, layout.modal, .modal_block, 0);
@@ -1135,7 +1150,8 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     defer current_fade_alpha = 1.0;
 
     const m = metrics();
-    const layout = computeLayout(state, width, height);
+    var layout = computeLayout(state, width, height);
+    if (consumePendingRuntimesScroll(state, layout)) layout = computeLayout(state, width, height);
     state.settings_controller.scroll_y = theme.clampf(state.settings_controller.scroll_y, 0.0, layout.max_scroll_y);
     const dirty = state.isSettingsDraftDirty();
     drawModalChrome(state, width, height, layout.modal);
@@ -2440,6 +2456,9 @@ fn planRuntimeRowButtons(state: *const runtime.AppState, plan: *RuntimeRowPlan, 
     // retry so users are never trapped in a connected-but-blocked state.
     if (snapshot) |live| {
         if (live.phase == .ready and recovery != .none) pushButton(plan, .disable, "Disconnect", .secondary);
+        // Reconnecting rows now surface "Retry now" as the primary; keep the
+        // explicit way out of the retry loop.
+        if (live.phase == .reconnecting) pushButton(plan, .disable, "Disconnect", .secondary);
     }
     if (recovery != .server_setup and runtime.runtimeStatusOffersServerSetup(status)) {
         pushButton(plan, .show_server_setup, "Show server setup", .secondary);

@@ -6,6 +6,7 @@
 //! a transport must use an explicit, immediately cleared wire buffer.
 
 const std = @import("std");
+const attachment_protocol = @import("attachment_protocol.zig");
 
 pub const ACCESS_PROTOCOL_VERSION: u32 = 1;
 
@@ -220,7 +221,14 @@ pub fn requiredScopeMaskForRpc(method: []const u8) ?u16 {
         std.mem.eql(u8, method, "chat.turn.list") or
         std.mem.eql(u8, method, "chat.turn.tail")) return scopeBit(.chat_read);
 
+    // Staged attachment uploads share the chat-write authority of the turn
+    // that will claim them. Named through the protocol constants so the
+    // advertised chat.attachments.v1 capability and this allowlist cannot
+    // drift apart silently (see the protocol.zig reachability test).
     if (std.mem.eql(u8, method, "chat.turn.start") or
+        std.mem.eql(u8, method, attachment_protocol.METHOD_CHAT_ATTACHMENT_CREATE) or
+        std.mem.eql(u8, method, attachment_protocol.METHOD_CHAT_ATTACHMENT_APPEND) or
+        std.mem.eql(u8, method, attachment_protocol.METHOD_CHAT_ATTACHMENT_COMMIT) or
         std.mem.eql(u8, method, "chat.turn.approve") or
         std.mem.eql(u8, method, "chat.turn.steer") or
         std.mem.eql(u8, method, "chat.followup") or
@@ -663,6 +671,20 @@ test "paired RPC scope policy is exact and fails closed" {
     try std.testing.expectEqual(
         scopeBit(.chat_write),
         requiredScopeMaskForRpc("chat.turn.start").?,
+    );
+    // Staged attachment uploads share the chat-write authority of the turn
+    // that will claim them.
+    try std.testing.expectEqual(
+        scopeBit(.chat_write),
+        requiredScopeMaskForRpc("chat.attachment.create").?,
+    );
+    try std.testing.expectEqual(
+        scopeBit(.chat_write),
+        requiredScopeMaskForRpc("chat.attachment.append").?,
+    );
+    try std.testing.expectEqual(
+        scopeBit(.chat_write),
+        requiredScopeMaskForRpc("chat.attachment.commit").?,
     );
     try std.testing.expectEqual(
         scopeBit(.terminal_read),
