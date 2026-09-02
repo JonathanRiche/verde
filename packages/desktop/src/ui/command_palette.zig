@@ -125,6 +125,9 @@ const STATIC_COMMANDS = [_]Command{
     .{ .id = "workspace.scrolling_always", .title = "Scrolling Layout: Always", .keywords = "niri panes mode pin enable", .section = .workspaces, .run = runScrollingAlways, .enabled = hasProjects },
     .{ .id = "workspace.scrolling_disabled", .title = "Scrolling Layout: Disabled", .keywords = "niri panes mode tiled off disable", .section = .workspaces, .run = runScrollingDisabled, .enabled = hasProjects },
     .{ .id = "workspace.scrolling_reset_column_width", .title = "Reset Scrolling Pane Widths", .keywords = "niri panes resize default per view", .section = .workspaces, .run = runResetScrollingColumnWidth, .enabled = hasCustomScrollingColumnWidth },
+    .{ .id = "workspace.runtime_default_current", .title = "Use Current Chat Runtime as Workspace Default", .keywords = "local remote new chat thread route", .section = .workspaces, .run = runUseCurrentRuntimeDefault, .enabled = hasFocusedGuiChat },
+    .{ .id = "workspace.runtime_default_local", .title = "Use Local as Workspace Runtime Default", .keywords = "remote new chat thread route reset", .section = .workspaces, .run = runUseLocalRuntimeDefault, .enabled = hasProjects },
+    .{ .id = "workspace.open_settings", .title = "Workspace: Open Settings", .keywords = "default runtime local remote profile connections configure", .section = .workspaces, .run = runOpenWorkspaceSettings, .enabled = hasCommandTargetProject },
     .{ .id = "workspace.add", .title = "Add Workspace", .keywords = "new project folder directory create", .section = .workspaces, .run = runAddWorkspace },
     .{ .id = "workspace.rename", .title = "Rename Workspace", .keywords = "label", .section = .workspaces, .run = runRenameWorkspace, .enabled = hasProjects },
     .{ .id = "workspace.close", .title = "Close Workspace", .keywords = "archive remove project save state", .section = .workspaces, .keybind = .workspace_close_current, .run = runCloseWorkspace, .enabled = workspaceNotBusy },
@@ -137,7 +140,6 @@ const STATIC_COMMANDS = [_]Command{
     .{ .id = "app.grok_setup", .title = "Set Up Grok Build", .keywords = "install xai agent provider tui", .section = .app, .run = runGrokSetup, .enabled = grokSetupNeeded },
     .{ .id = "workspace.amp_tui", .title = "Start New Amp TUI", .keywords = "agent terminal workspace fresh amp sourcegraph", .section = .workspaces, .run = runOpenAmpTui, .enabled = hasProjects },
     .{ .id = "workspace.herdr_handoff", .title = "Handoff Workspace to Herdr", .keywords = "runtime local terminal tui phone", .section = .workspaces, .run = runHerdrHandoffWorkspace, .enabled = hasProjects },
-    .{ .id = "workspace.herdr_handoff_remote", .title = "Handoff Workspace to Remote Herdr", .keywords = "remote profile ssh tailscale runtime terminal tui phone", .section = .workspaces, .run = runHerdrRemoteHandoffWorkspace, .enabled = hasProjects },
     .{ .id = "workspace.herdr_focus_terminal", .title = "Open/Focus Herdr Terminal", .keywords = "runtime terminal tui", .section = .workspaces, .run = runFocusHerdrTerminal, .enabled = currentWorkspaceHerdrLinked },
     .{ .id = "workspace.herdr_unlink", .title = "Run Workspace Locally", .keywords = "unlink herdr runtime local", .section = .workspaces, .run = runUnlinkHerdrWorkspace, .enabled = currentWorkspaceHerdrLinked },
     .{ .id = "app.history", .title = "History: This Workspace", .keywords = "saved chats threads search recent", .section = .app, .run = runHistoryThisWorkspace, .enabled = hasProjects, .keeps_open = true },
@@ -1065,6 +1067,21 @@ fn alwaysEnabled(_: *runtime.AppState) bool {
     return true;
 }
 
+/// Static workspace commands act on the currently selected workspace at
+/// activation, like the other workspace entries. `scope_project` is
+/// history-filter state that survives `closeCommandPalette`, so reading it
+/// here could retarget a stale prior workspace (especially for live/daemon
+/// `runStaticCommandById` while the palette is closed).
+fn commandTargetProject(state: *runtime.AppState) ?usize {
+    const index = state.project_controller.selected_index;
+    if (index >= state.project_controller.projects.items.len) return null;
+    return index;
+}
+
+fn hasCommandTargetProject(state: *runtime.AppState) bool {
+    return commandTargetProject(state) != null;
+}
+
 fn hasProjects(state: *runtime.AppState) bool {
     return state.project_controller.projects.items.len > 0;
 }
@@ -1413,6 +1430,14 @@ fn runResetScrollingColumnWidth(state: *runtime.AppState) void {
     state.markDirty();
 }
 
+fn runUseCurrentRuntimeDefault(state: *runtime.AppState) void {
+    state.useCurrentThreadRuntimeAsWorkspaceDefault();
+}
+
+fn runUseLocalRuntimeDefault(state: *runtime.AppState) void {
+    state.useLocalAsWorkspaceRuntimeDefault();
+}
+
 fn runAddWorkspace(state: *runtime.AppState) void {
     state.openWorkspaceCreator(true);
 }
@@ -1469,10 +1494,6 @@ fn runHerdrHandoffWorkspace(state: *runtime.AppState) void {
     state.handoffProjectToLocalHerdrFromUi(state.project_controller.selected_index);
 }
 
-fn runHerdrRemoteHandoffWorkspace(state: *runtime.AppState) void {
-    state.beginHerdrProfilePicker(state.project_controller.selected_index);
-}
-
 fn runFocusHerdrTerminal(state: *runtime.AppState) void {
     _ = state.focusProjectHerdrAttachTerminal(state.project_controller.selected_index);
 }
@@ -1500,6 +1521,13 @@ fn runHistoryThisWorkspace(state: *runtime.AppState) void {
 
 fn runSettings(state: *runtime.AppState) void {
     state.openSettingsModal();
+}
+
+fn runOpenWorkspaceSettings(state: *runtime.AppState) void {
+    // The opener binds the modal by workspace id, so a later selection change
+    // cannot retarget the settings surface this command aimed at.
+    const index = commandTargetProject(state) orelse return;
+    state.openWorkspaceSettingsForProject(index);
 }
 
 fn runToggleSidebar(state: *runtime.AppState) void {
@@ -2037,6 +2065,91 @@ test "static commands expose scrolling layout controls" {
         }
         try std.testing.expect(found);
     }
+}
+
+test "static commands expose workspace runtime defaults without replacing thread selection" {
+    const expected_ids = [_][]const u8{
+        "workspace.runtime_default_current",
+        "workspace.runtime_default_local",
+    };
+    for (expected_ids) |expected_id| {
+        var found = false;
+        for (STATIC_COMMANDS) |command| {
+            if (!std.mem.eql(u8, command.id, expected_id)) continue;
+            found = true;
+            break;
+        }
+        try std.testing.expect(found);
+    }
+}
+
+test "workspace open settings command routes to the palette target workspace" {
+    // Registration + searchability: the entry exists under a stable id and
+    // both "workspace" and "settings" query words match its title.
+    var registered: ?Command = null;
+    for (STATIC_COMMANDS) |command| {
+        if (std.mem.eql(u8, command.id, "workspace.open_settings")) registered = command;
+    }
+    const command = registered.?;
+    try std.testing.expectEqualStrings("Workspace: Open Settings", command.title);
+    try std.testing.expect(fuzzyScore(command.title, "workspace settings") != null);
+    try std.testing.expect(fuzzyScore(command.title, "open settings") != null);
+    try std.testing.expect(!command.keeps_open);
+
+    // Routing: activation targets the currently selected workspace and binds
+    // the modal to its id. A stale history-scope left over from a previous
+    // palette session must not override the selection.
+    const allocator = std.testing.allocator;
+    var state: runtime.AppState = undefined;
+    state.allocator = allocator;
+    state.lifecycle = .{};
+    state.sidebar_context_menu_open = false;
+    state.palette_modal_text_focus = .command_palette;
+    state.modal_text_selection_anchor = null;
+    state.command_controller = .{};
+    state.command_controller.open = true;
+    state.command_controller.scope_project = 1;
+    state.composer_controller.composer = @TypeOf(state.composer_controller.composer).init();
+    state.composer_controller.focused = false;
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    state.workspace_settings_project_id = null;
+    state.workspace_settings_notice_storage = @splat(0);
+    state.workspace_settings_scroll_y = 0.0;
+    defer {
+        if (state.workspace_settings_project_id) |id| allocator.free(id);
+        for (state.project_controller.projects.items) |*entry| entry.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+    }
+    inline for (.{ .{ "workspace-a", "Alpha" }, .{ "workspace-b", "Beta" } }) |spec| {
+        var entry = try native_state.Project.init(allocator, spec[0], spec[1], "/tmp/palette-workspace-settings", 0);
+        state.project_controller.projects.append(allocator, entry) catch |err| {
+            entry.deinit(allocator);
+            return err;
+        };
+    }
+
+    state.project_controller.selected_index = 1;
+    try std.testing.expect(command.enabled(&state));
+    try std.testing.expectEqual(RunStaticCommandResult.ran, runStaticCommandById(&state, "workspace.open_settings"));
+    try std.testing.expect(!state.command_controller.open);
+    try std.testing.expectEqualStrings("workspace-b", state.workspace_settings_project_id.?);
+
+    // A stale scope surviving palette close never overrides the selection.
+    allocator.free(state.workspace_settings_project_id.?);
+    state.workspace_settings_project_id = null;
+    state.command_controller.scope_project = 0;
+    runOpenWorkspaceSettings(&state);
+    try std.testing.expectEqualStrings("workspace-b", state.workspace_settings_project_id.?);
+
+    // Without a valid selected workspace the command is unavailable and
+    // safely no-ops.
+    allocator.free(state.workspace_settings_project_id.?);
+    state.workspace_settings_project_id = null;
+    state.project_controller.selected_index = state.project_controller.projects.items.len;
+    try std.testing.expect(!command.enabled(&state));
+    runOpenWorkspaceSettings(&state);
+    try std.testing.expect(state.workspace_settings_project_id == null);
 }
 
 test "shortcut-backed palette commands expose their keybind references" {

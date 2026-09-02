@@ -1,0 +1,64 @@
+services:
+  postgres:
+    image: postgres:17.6-alpine
+    environment:
+      POSTGRES_DB: verde_connect
+      POSTGRES_USER: verde
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - connect-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U verde -d verde_connect"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    restart: unless-stopped
+
+  control-plane:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      additional_contexts:
+        control_plane_spec: ../../specs/control-plane/v1
+    user: "${VERDE_CONTAINER_UID:-1000}:${VERDE_CONTAINER_GID:-1000}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["sh", "-c", "bun src/migrate.ts && exec bun src/main.ts"]
+    environment:
+      VERDE_ENV: test
+      VERDE_LISTEN_HOST: 0.0.0.0
+      VERDE_PORT: 8787
+      VERDE_PUBLIC_BASE_URL: http://127.0.0.1:${VERDE_CONNECT_PORT:-8787}
+      VERDE_CONTROL_PLANE_ISSUER: http://127.0.0.1:${VERDE_CONNECT_PORT:-8787}
+      DATABASE_URL: postgres://verde:${POSTGRES_PASSWORD}@postgres:5432/verde_connect
+      VERDE_AUTH_MODE: test
+      VERDE_TEST_AUTH_TOKEN: ${VERDE_TEST_AUTH_TOKEN:?Set VERDE_TEST_AUTH_TOKEN}
+      VERDE_TEST_PRINCIPAL_ISSUER: http://127.0.0.1:9090
+      VERDE_TEST_PRINCIPAL_SUBJECT: local-operator
+      VERDE_OAUTH_PUBLIC_CLIENT_ID: verde-connect-local
+      VERDE_OAUTH_SCOPES: openid,profile
+      VERDE_OAUTH_REDIRECT_URIS: http://127.0.0.1:48123/callback
+      VERDE_GRANT_SIGNING_JWK_FILE: /run/secrets/grant-signing.jwk
+      VERDE_ENDPOINT_ADAPTER: ${VERDE_ENDPOINT_ADAPTER:-external}
+    volumes:
+      - ${VERDE_GRANT_SIGNING_JWK_HOST_FILE:?Set VERDE_GRANT_SIGNING_JWK_HOST_FILE}:/run/secrets/grant-signing.jwk:ro
+    ports:
+      - "127.0.0.1:${VERDE_CONNECT_PORT:-8787}:8787"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "bun",
+          "-e",
+          "const r=await fetch('http://127.0.0.1:8787/readyz');process.exit(r.ok?0:1)",
+        ]
+      interval: 3s
+      timeout: 2s
+      retries: 30
+    restart: unless-stopped
+
+volumes:
+  connect-postgres:

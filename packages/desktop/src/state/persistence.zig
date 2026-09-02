@@ -7,6 +7,7 @@
 const std = @import("std");
 const headless = @import("headless");
 const db_types = @import("../db/types.zig");
+const thread_binding = @import("../runtime/thread_binding.zig");
 const terminal = @import("../terminal/terminal.zig");
 const chat_types = @import("chat_types.zig");
 const herdr_types = @import("herdr_types.zig");
@@ -454,6 +455,8 @@ fn threadSnapshotWithBodies(
         try messages.append(allocator, try persistedMessageSnapshot(allocator, &message, captured_body));
     }
 
+    const route = thread.selectedRuntimeRoute();
+    const pinned_route = thread.pinnedRuntimeRoute();
     return .{
         .title = try allocator.dupe(u8, thread.title),
         .archived = thread.archived,
@@ -470,6 +473,13 @@ fn threadSnapshotWithBodies(
         .harness = thread.harness,
         .tui_dock_id = thread.tui_dock_id,
         .cwd = try dupeOptionalSlice(allocator, thread.cwd),
+        .profile_id = try allocator.dupe(u8, route.profile_id),
+        .runtime_id = try dupeOptionalSlice(
+            allocator,
+            if (pinned_route) |pinned| pinned.runtime_id else null,
+        ),
+        .repository_id = try allocator.dupe(u8, route.repository_id),
+        .repository_cwd = try dupeOptionalSlice(allocator, route.relative_cwd),
         .draft = try allocator.dupe(u8, thread.currentDraft()),
         .draft_image = try imageSnapshot(allocator, thread.draft_image),
         .draft_extra_images = try imageListSnapshot(allocator, thread.draft_extra_images.items),
@@ -630,7 +640,10 @@ fn projectToProtocol(allocator: std.mem.Allocator, project: PersistedProject) !h
         .workspace_layout_json = try dupeOptionalSlice(allocator, project.workspace_layout_json),
         .selected_thread_index = project.selected_thread_index,
         .companion_thread_local_id = try dupeOptionalSlice(allocator, project.companion_thread_local_id),
-        .herdr_link = if (project.herdr_link) |link| try herdrToProtocol(allocator, link) else null,
+        .herdr_link = if (project.herdr_link) |link|
+            if (link.remote_alias.len == 0) try herdrToProtocol(allocator, link) else null
+        else
+            null,
         .provider = try allocator.dupe(u8, @tagName(project.provider)),
         .harness = try allocator.dupe(u8, @tagName(project.harness)),
         .draft = try allocator.dupe(u8, project.draft),
@@ -668,6 +681,10 @@ fn threadToProtocol(allocator: std.mem.Allocator, thread: PersistedThread, index
         .harness = try allocator.dupe(u8, @tagName(thread.harness)),
         .tui_dock_id = thread.tui_dock_id,
         .cwd = if (thread.cwd) |v| try allocator.dupe(u8, v) else null,
+        .profile_id = try dupeOptionalSlice(allocator, thread.profile_id),
+        .runtime_id = try dupeOptionalSlice(allocator, thread.runtime_id),
+        .repository_id = try dupeOptionalSlice(allocator, thread.repository_id),
+        .repository_cwd = try dupeOptionalSlice(allocator, thread.repository_cwd),
         .draft = try allocator.dupe(u8, thread.draft),
         .draft_image = if (thread.draft_image) |img| try imageToProtocol(allocator, img) else null,
         .draft_images = try imageListToProtocol(allocator, thread.draft_image, thread.draft_extra_images),
@@ -747,8 +764,178 @@ fn herdrToProtocol(allocator: std.mem.Allocator, link: db_types.PersistedHerdrWo
     };
 }
 
+fn restoreThreadRuntimeRoute(
+    allocator: std.mem.Allocator,
+    thread: *ChatThread,
+    persisted: PersistedThread,
+) !void {
+    const route_absent = persisted.profile_id == null and persisted.runtime_id == null and
+        persisted.repository_id == null and persisted.repository_cwd == null;
+    if (!route_absent and (persisted.profile_id == null or persisted.repository_id == null)) {
+        // Only the all-null pre-routing shape is a legacy Local route. A
+        // partial record could otherwise turn a corrupt/remote thread into a
+        // locally executable one, so leave the durable projection untouched.
+        return error.InvalidPersistedThreadRoute;
+    }
+    if (persisted.committed and persisted.profile_id != null and
+        !std.mem.eql(u8, persisted.profile_id.?, chat_types.LOCAL_RUNTIME_PROFILE_ID) and
+        persisted.runtime_id == null)
+    {
+        return error.InvalidPersistedThreadRoute;
+    }
+    const selection: thread_binding.Selection = .{
+        .profile_id = persisted.profile_id orelse chat_types.LOCAL_RUNTIME_PROFILE_ID,
+        .repository_id = persisted.repository_id orelse chat_types.PRIMARY_REPOSITORY_ID,
+        .relative_cwd = persisted.repository_cwd,
+    };
+    const restored = thread_binding.ThreadBinding.initPersisted(
+        allocator,
+        selection,
+        persisted.committed,
+        persisted.runtime_id,
+    ) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        log.err("persisted thread route quarantined err={s}", .{@errorName(err)});
+        return error.InvalidPersistedThreadRoute;
+    };
+    thread.runtime_route.deinit(allocator);
+    thread.runtime_route = restored;
+}
+
+test "thread runtime route snapshots and restores without migration" {
+    const allocator = std.testing.allocator;
+    var thread = try ChatThread.init(allocator, "Remote route");
+    defer thread.deinit(allocator);
+    try std.testing.expectEqual(.updated, try thread.selectRuntimeRoute(allocator, .{
+        .profile_id = "profile-remote",
+        .repository_id = "repo-api",
+        .relative_cwd = "services/api",
+    }));
+    try thread.pinRuntimeRoute(allocator, "0123456789abcdef0123456789abcdef");
+    thread.committed = true;
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const persisted = try threadSnapshot(arena_state.allocator(), &thread);
+    try std.testing.expectEqualStrings("profile-remote", persisted.profile_id.?);
+    try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", persisted.runtime_id.?);
+    try std.testing.expectEqualStrings("repo-api", persisted.repository_id.?);
+    try std.testing.expectEqualStrings("services/api", persisted.repository_cwd.?);
+
+    var restored = try ChatThread.init(allocator, "Restored route");
+    defer restored.deinit(allocator);
+    try restoreThreadRuntimeRoute(allocator, &restored, persisted);
+    restored.committed = persisted.committed;
+    try std.testing.expectEqualStrings("profile-remote", restored.selectedRuntimeRoute().profile_id);
+    try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", restored.pinnedRuntimeRoute().?.runtime_id.?);
+    try std.testing.expectEqual(.new_thread_required, try restored.selectRuntimeRoute(allocator, .{
+        .profile_id = chat_types.LOCAL_RUNTIME_PROFILE_ID,
+        .repository_id = chat_types.PRIMARY_REPOSITORY_ID,
+    }));
+}
+
+test "only fully absent legacy route defaults to locked local primary" {
+    const allocator = std.testing.allocator;
+    var thread = try ChatThread.init(allocator, "Legacy route");
+    defer thread.deinit(allocator);
+    const legacy: PersistedThread = .{
+        .title = "Legacy route",
+        .committed = true,
+    };
+    try restoreThreadRuntimeRoute(allocator, &thread, legacy);
+    thread.committed = true;
+    const route = thread.selectedRuntimeRoute();
+    try std.testing.expectEqualStrings(chat_types.LOCAL_RUNTIME_PROFILE_ID, route.profile_id);
+    try std.testing.expectEqualStrings(chat_types.PRIMARY_REPOSITORY_ID, route.repository_id);
+    try std.testing.expect(thread.pinnedRuntimeRoute().?.runtime_id == null);
+    try std.testing.expectEqual(.new_thread_required, try thread.selectRuntimeRoute(allocator, .{
+        .profile_id = "remote-box",
+        .repository_id = chat_types.PRIMARY_REPOSITORY_ID,
+    }));
+
+    const explicit_local: PersistedThread = .{
+        .title = "Explicit local",
+        .committed = true,
+        .profile_id = chat_types.LOCAL_RUNTIME_PROFILE_ID,
+        .repository_id = chat_types.PRIMARY_REPOSITORY_ID,
+    };
+    try restoreThreadRuntimeRoute(allocator, &thread, explicit_local);
+    try std.testing.expect(thread.pinnedRuntimeRoute().?.runtime_id == null);
+}
+
+test "partial or malformed committed routes stay quarantined" {
+    const allocator = std.testing.allocator;
+    var thread = try ChatThread.init(allocator, "Quarantined route");
+    defer thread.deinit(allocator);
+    try std.testing.expectEqual(.updated, try thread.selectRuntimeRoute(allocator, .{
+        .profile_id = "quarantine-sentinel",
+        .repository_id = "opaque-repository",
+    }));
+    try thread.pinRuntimeRoute(allocator, "fedcba9876543210fedcba9876543210");
+
+    const partial: PersistedThread = .{
+        .title = "Partial",
+        .committed = true,
+        .profile_id = "unknown-remote",
+    };
+    try std.testing.expectError(
+        error.InvalidPersistedThreadRoute,
+        restoreThreadRuntimeRoute(allocator, &thread, partial),
+    );
+    try std.testing.expectEqualStrings("quarantine-sentinel", thread.selectedRuntimeRoute().profile_id);
+    try std.testing.expectEqualStrings(
+        "fedcba9876543210fedcba9876543210",
+        thread.pinnedRuntimeRoute().?.runtime_id.?,
+    );
+
+    const malformed: PersistedThread = .{
+        .title = "Malformed",
+        .committed = true,
+        .profile_id = "unknown-remote",
+        .runtime_id = "not-a-runtime-id",
+        .repository_id = "primary",
+    };
+    try std.testing.expectError(
+        error.InvalidPersistedThreadRoute,
+        restoreThreadRuntimeRoute(allocator, &thread, malformed),
+    );
+    try std.testing.expectEqualStrings("quarantine-sentinel", thread.selectedRuntimeRoute().profile_id);
+    try std.testing.expectEqualStrings(
+        "fedcba9876543210fedcba9876543210",
+        thread.pinnedRuntimeRoute().?.runtime_id.?,
+    );
+
+    const unpinned_remote: PersistedThread = .{
+        .title = "Unpinned remote",
+        .committed = true,
+        .profile_id = "unknown-remote",
+        .repository_id = "primary",
+    };
+    try std.testing.expectError(
+        error.InvalidPersistedThreadRoute,
+        restoreThreadRuntimeRoute(allocator, &thread, unpinned_remote),
+    );
+    try std.testing.expectEqualStrings("quarantine-sentinel", thread.selectedRuntimeRoute().profile_id);
+
+    const unknown: PersistedThread = .{
+        .title = "Unknown",
+        .committed = true,
+        .profile_id = "unknown-remote",
+        .runtime_id = "0123456789abcdef0123456789abcdef",
+        .repository_id = "primary",
+    };
+    try restoreThreadRuntimeRoute(allocator, &thread, unknown);
+    thread.committed = true;
+    try std.testing.expectEqualStrings("unknown-remote", thread.selectedRuntimeRoute().profile_id);
+    try std.testing.expectEqual(.new_thread_required, try thread.selectRuntimeRoute(allocator, .{
+        .profile_id = chat_types.LOCAL_RUNTIME_PROFILE_ID,
+        .repository_id = chat_types.PRIMARY_REPOSITORY_ID,
+    }));
+}
+
 pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
     var cleaned_legacy_companion = false;
+    var cleaned_legacy_remote_herdr = false;
     self.sidebar_collapsed = persisted.sidebar_collapsed;
     if (persisted.projects.len == 0) {
         try self.restorePersistedSurfaceStates(persisted.surface_states);
@@ -776,7 +963,14 @@ pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
         loaded.collapsed = project.collapsed orelse false;
         loaded.thread_list_expanded = project.thread_list_expanded orelse false;
         if (project.herdr_link) |link| {
-            loaded.herdr_link = try HerdrWorkspaceLink.initFromPersisted(self.allocator, link);
+            if (link.remote_alias.len == 0) {
+                loaded.herdr_link = try HerdrWorkspaceLink.initFromPersisted(self.allocator, link);
+            } else {
+                // Remote Herdr links from older builds are intentionally
+                // unlinked. Preserve the workspace itself and persist the
+                // cleanup without attempting SSH or treating remote paths as local.
+                cleaned_legacy_remote_herdr = true;
+            }
         }
         if (project.terminal_height) |height| {
             loaded.terminal_dock.preferred_height = terminal.clampPreferredHeight(height);
@@ -805,6 +999,8 @@ pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
         if (project.threads) |threads| {
             for (threads) |persisted_thread| {
                 var thread = try ChatThread.init(self.allocator, persisted_thread.title);
+                var thread_owned = true;
+                errdefer if (thread_owned) thread.deinit(self.allocator);
                 thread.archived = persisted_thread.archived;
                 thread.committed = persisted_thread.committed;
                 if (persisted_thread.local_thread_id) |local_thread_id| {
@@ -839,6 +1035,7 @@ pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
                     try self.allocator.dupeZ(u8, cwd)
                 else
                     null;
+                try restoreThreadRuntimeRoute(self.allocator, &thread, persisted_thread);
                 thread.persisted_message_offset = persisted_thread.message_offset;
                 thread.setDraft(persisted_thread.draft);
                 if (persisted_thread.draft_image) |image| {
@@ -872,6 +1069,7 @@ pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
                 } else {
                     try loaded.threads.append(self.allocator, thread);
                 }
+                thread_owned = false;
             }
             if (!loaded.archived and loaded.threads.items.len == 0) {
                 _ = try loaded.addThread(self.allocator);
@@ -958,7 +1156,7 @@ pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
     self.restorePersistedChatCompletions(persisted.chat_completions);
     self.syncRenameBuffer();
     self.requestTranscriptScrollToBottom();
-    self.lifecycle.dirty = cleaned_legacy_companion;
+    self.lifecycle.dirty = cleaned_legacy_companion or cleaned_legacy_remote_herdr;
 }
 
 pub fn restorePersistedSurfaceStates(self: anytype, persisted_surfaces: []const PersistedSurfaceState) !void {
@@ -1123,6 +1321,10 @@ fn cloneThreads(
             .harness = thread.harness,
             .tui_dock_id = thread.tui_dock_id,
             .cwd = try cloneOptionalSlice(allocator, thread.cwd),
+            .profile_id = try cloneOptionalSlice(allocator, thread.profile_id),
+            .runtime_id = try cloneOptionalSlice(allocator, thread.runtime_id),
+            .repository_id = try cloneOptionalSlice(allocator, thread.repository_id),
+            .repository_cwd = try cloneOptionalSlice(allocator, thread.repository_cwd),
             .draft = try allocator.dupe(u8, thread.draft),
             .draft_image = try cloneImage(allocator, thread.draft_image),
             .draft_extra_images = try cloneImageList(allocator, thread.draft_extra_images),

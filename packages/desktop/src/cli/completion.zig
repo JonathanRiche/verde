@@ -58,7 +58,7 @@ fn writePowerShell(w: *std.Io.Writer) !void {
     try writePowerShellRoute(w, "state", &spec.state_commands);
     try writePowerShellRoute(w, "theme", &spec.theme_commands);
     try writePowerShellRoute(w, "herdr", &spec.herdr_commands);
-    try writePowerShellRoute(w, "herdr profiles", &spec.herdr_profile_commands);
+    try writePowerShellRoute(w, "runtime", &spec.runtime_commands);
     try writePowerShellRoute(w, "integrations", &spec.integration_commands);
     try writePowerShellRoute(w, "integrations install", &spec.integration_providers);
     try writePowerShellRoute(w, "integrations remove", &spec.integration_providers);
@@ -90,6 +90,7 @@ fn writePowerShell(w: *std.Io.Writer) !void {
     try writePowerShellRoute(w, "--reasoning", &spec.reasoning_values);
     try writePowerShellRoute(w, "--mode", &spec.inspector_mode_values);
     try writePowerShellRoute(w, "--key", &spec.terminal_key_values);
+    try writePowerShellRoute(w, "--profile", &spec.runtime_profile_values);
     try w.writeAll(
         \\  }
         \\  $elements = @($commandAst.CommandElements | ForEach-Object { $_.Extent.Text })
@@ -147,6 +148,8 @@ fn writeBash(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.theme_commands);
     try w.writeAll("\"\n  local herdr=\"");
     try writeWords(w, &spec.herdr_commands);
+    try w.writeAll("\"\n  local runtime=\"");
+    try writeWords(w, &spec.runtime_commands);
     try w.writeAll("\"\n  local integrations=\"");
     try writeWords(w, &spec.integration_commands);
     try w.writeAll("\"\n  local integration_providers=\"");
@@ -185,18 +188,14 @@ fn writeBash(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.json_flags);
     try w.writeAll("\"\n  local project_json_flags=\"");
     try writeWords(w, &spec.project_json_flags);
-    try w.writeAll("\"\n  local herdr_profiles=\"");
-    try writeWords(w, &spec.herdr_profile_commands);
     try w.writeAll("\"\n  local herdr_open_flags=\"");
     try writeWords(w, &spec.herdr_open_flags);
     try w.writeAll("\"\n  local herdr_handoff_flags=\"");
     try writeWords(w, &spec.herdr_handoff_flags);
     try w.writeAll("\"\n  local herdr_unlink_flags=\"");
     try writeWords(w, &spec.herdr_unlink_flags);
-    try w.writeAll("\"\n  local herdr_profile_add_flags=\"");
-    try writeWords(w, &spec.herdr_profile_add_flags);
-    try w.writeAll("\"\n  local herdr_profile_name_flags=\"");
-    try writeWords(w, &spec.herdr_profile_name_flags);
+    try w.writeAll("\"\n  local runtime_default_flags=\"");
+    try writeWords(w, &spec.runtime_default_flags);
     try w.writeAll("\"\n  local pane_flags=\"");
     try writeWords(w, &spec.pane_flags);
     try w.writeAll("\"\n  local pane_split_flags=\"");
@@ -281,7 +280,8 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\    --reasoning) COMPREPLY=( $(compgen -W "$reasoning_values" -- "$cur") ); return 0 ;;
         \\    --mode) COMPREPLY=( $(compgen -W "$inspector_mode_values" -- "$cur") ); return 0 ;;
         \\    --key) COMPREPLY=( $(compgen -W "$terminal_key_values" -- "$cur") ); return 0 ;;
-        \\    --workspace|--herdr-workspace|--project|--thread|--id|--pane|--first|--second|--ratio|--path|--url|--text|--key|--chord|--target|--script|--json-payload|--prompt|--call|--name|--model|--reasoning-variant|--lines|--command|--label|--profile|--remote|--cwd|--remote-cwd|--local-dir) return 0 ;;
+        \\    --profile) COMPREPLY=( $(compgen -W "local" -- "$cur") ); return 0 ;;
+        \\    --workspace|--herdr-workspace|--project|--thread|--id|--pane|--first|--second|--ratio|--path|--url|--text|--key|--chord|--target|--script|--json-payload|--prompt|--call|--name|--model|--reasoning-variant|--lines|--command|--label|--cwd|--local-dir|--host|--user|--ssh-port|--gateway-port|--expected-runtime-id) return 0 ;;
         \\  esac
         \\
         \\  if [[ "$cur" == -* ]]; then
@@ -311,13 +311,14 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\          open) COMPREPLY=( $(compgen -W "$herdr_open_flags" -- "$cur") ) ;;
         \\          handoff) COMPREPLY=( $(compgen -W "$herdr_handoff_flags" -- "$cur") ) ;;
         \\          unlink) COMPREPLY=( $(compgen -W "$herdr_unlink_flags" -- "$cur") ) ;;
-        \\          profiles)
-        \\            case "$third" in
-        \\              add) COMPREPLY=( $(compgen -W "$herdr_profile_add_flags" -- "$cur") ) ;;
-        \\              remove|rm|test) COMPREPLY=( $(compgen -W "$herdr_profile_name_flags" -- "$cur") ) ;;
-        \\              list) COMPREPLY=( $(compgen -W "$json_flags" -- "$cur") ) ;;
-        \\              *) COMPREPLY=( $(compgen -W "$herdr_profiles" -- "$cur") ) ;;
-        \\            esac ;;
+        \\          *) COMPREPLY=( $(compgen -W "$json_flags" -- "$cur") ) ;;
+        \\        esac
+        \\        ;;
+        \\      runtime)
+        \\        case "$sub" in
+        \\          add-ssh) COMPREPLY=( $(compgen -W "--label --host --user --ssh-port --gateway-port --expected-runtime-id --json" -- "$cur") ) ;;
+        \\          remove) COMPREPLY=( $(compgen -W "--id --json" -- "$cur") ) ;;
+        \\          default) COMPREPLY=( $(compgen -W "$runtime_default_flags" -- "$cur") ) ;;
         \\          *) COMPREPLY=( $(compgen -W "$json_flags" -- "$cur") ) ;;
         \\        esac
         \\        ;;
@@ -417,6 +418,7 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\    2:state:*) COMPREPLY=( $(compgen -W "$state" -- "$cur") ) ;;
         \\    2:theme:*) COMPREPLY=( $(compgen -W "$theme" -- "$cur") ) ;;
         \\    2:herdr:*) COMPREPLY=( $(compgen -W "$herdr" -- "$cur") ) ;;
+        \\    2:runtime:*) COMPREPLY=( $(compgen -W "$runtime" -- "$cur") ) ;;
         \\    2:integrations:*) COMPREPLY=( $(compgen -W "$integrations" -- "$cur") ) ;;
         \\    2:session:*) COMPREPLY=( $(compgen -W "$session" -- "$cur") ) ;;
         \\    2:core:*) COMPREPLY=( $(compgen -W "$core" -- "$cur") ) ;;
@@ -463,6 +465,8 @@ fn writeZsh(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.theme_commands);
     try w.writeAll("\"\n  local herdr=\"");
     try writeWords(w, &spec.herdr_commands);
+    try w.writeAll("\"\n  local runtime=\"");
+    try writeWords(w, &spec.runtime_commands);
     try w.writeAll("\"\n  local integrations=\"");
     try writeWords(w, &spec.integration_commands);
     try w.writeAll("\"\n  local integration_providers=\"");
@@ -501,18 +505,14 @@ fn writeZsh(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.json_flags);
     try w.writeAll("\"\n  local project_json_flags=\"");
     try writeWords(w, &spec.project_json_flags);
-    try w.writeAll("\"\n  local herdr_profiles=\"");
-    try writeWords(w, &spec.herdr_profile_commands);
     try w.writeAll("\"\n  local herdr_open_flags=\"");
     try writeWords(w, &spec.herdr_open_flags);
     try w.writeAll("\"\n  local herdr_handoff_flags=\"");
     try writeWords(w, &spec.herdr_handoff_flags);
     try w.writeAll("\"\n  local herdr_unlink_flags=\"");
     try writeWords(w, &spec.herdr_unlink_flags);
-    try w.writeAll("\"\n  local herdr_profile_add_flags=\"");
-    try writeWords(w, &spec.herdr_profile_add_flags);
-    try w.writeAll("\"\n  local herdr_profile_name_flags=\"");
-    try writeWords(w, &spec.herdr_profile_name_flags);
+    try w.writeAll("\"\n  local runtime_default_flags=\"");
+    try writeWords(w, &spec.runtime_default_flags);
     try w.writeAll("\"\n  local pane_flags=\"");
     try writeWords(w, &spec.pane_flags);
     try w.writeAll("\"\n  local pane_split_flags=\"");
@@ -597,7 +597,8 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\    --reasoning) compadd -- ${(s: :)reasoning_values}; return ;;
         \\    --mode) compadd -- ${(s: :)inspector_mode_values}; return ;;
         \\    --key) compadd -- ${(s: :)terminal_key_values}; return ;;
-        \\    --workspace|--herdr-workspace|--project|--thread|--id|--pane|--first|--second|--ratio|--path|--url|--text|--key|--chord|--target|--script|--json-payload|--prompt|--call|--name|--model|--reasoning-variant|--lines|--command|--label|--profile|--remote|--cwd|--remote-cwd|--local-dir) return ;;
+        \\    --profile) compadd -- local; return ;;
+        \\    --workspace|--herdr-workspace|--project|--thread|--id|--pane|--first|--second|--ratio|--path|--url|--text|--key|--chord|--target|--script|--json-payload|--prompt|--call|--name|--model|--reasoning-variant|--lines|--command|--label|--cwd|--local-dir|--host|--user|--ssh-port|--gateway-port|--expected-runtime-id) return ;;
         \\  esac
         \\
         \\  if [[ "$cur" == -* ]]; then
@@ -627,13 +628,14 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\          open) compadd -- ${(s: :)herdr_open_flags} ;;
         \\          handoff) compadd -- ${(s: :)herdr_handoff_flags} ;;
         \\          unlink) compadd -- ${(s: :)herdr_unlink_flags} ;;
-        \\          profiles)
-        \\            case "$third" in
-        \\              add) compadd -- ${(s: :)herdr_profile_add_flags} ;;
-        \\              remove|rm|test) compadd -- ${(s: :)herdr_profile_name_flags} ;;
-        \\              list) compadd -- ${(s: :)json_flags} ;;
-        \\              *) compadd -- ${(s: :)herdr_profiles} ;;
-        \\            esac ;;
+        \\          *) compadd -- ${(s: :)json_flags} ;;
+        \\        esac
+        \\        ;;
+        \\      runtime)
+        \\        case "$sub" in
+        \\          add-ssh) compadd -- --label --host --user --ssh-port --gateway-port --expected-runtime-id --json ;;
+        \\          remove) compadd -- --id --json ;;
+        \\          default) compadd -- ${(s: :)runtime_default_flags} ;;
         \\          *) compadd -- ${(s: :)json_flags} ;;
         \\        esac
         \\        ;;
@@ -733,6 +735,7 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\    3:state:*) compadd -- ${(s: :)state} ;;
         \\    3:theme:*) compadd -- ${(s: :)theme} ;;
         \\    3:herdr:*) compadd -- ${(s: :)herdr} ;;
+        \\    3:runtime:*) compadd -- ${(s: :)runtime} ;;
         \\    3:integrations:*) compadd -- ${(s: :)integrations} ;;
         \\    3:session:*) compadd -- ${(s: :)session} ;;
         \\    3:core:*) compadd -- ${(s: :)core} ;;
@@ -787,8 +790,8 @@ fn writeFish(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.theme_commands);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after herdr' -a '");
     try writeWords(w, &spec.herdr_commands);
-    try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after herdr profiles' -a '");
-    try writeWords(w, &spec.herdr_profile_commands);
+    try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after runtime' -a '");
+    try writeWords(w, &spec.runtime_commands);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after integrations' -a '");
     try writeWords(w, &spec.integration_commands);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after integrations install' -a '");
@@ -830,12 +833,14 @@ fn writeFish(w: *std.Io.Writer) !void {
         \\complete -c verde -l id -r -d 'Persistent session id'
         \\complete -c verde -l workspace -r -d 'Workspace id, index, path, or current'
         \\complete -c verde -l herdr-workspace -r -d 'Herdr workspace id'
-        \\complete -c verde -l ssh-target -r -d 'SSH config alias for a Herdr remote profile'
-        \\complete -c verde -l profile -r -d 'Named Herdr remote profile'
-        \\complete -c verde -l remote -r -d 'Herdr SSH remote alias'
         \\complete -c verde -l cwd -r -d 'Local Herdr workspace cwd'
-        \\complete -c verde -l remote-cwd -r -d 'Remote Herdr workspace cwd'
         \\complete -c verde -l local-dir -r -d 'Local shadow workspace directory'
+        \\complete -c verde -l host -r -d 'SSH host or SSH config alias'
+        \\complete -c verde -l user -r -d 'SSH user'
+        \\complete -c verde -l ssh-port -r -d 'SSH port'
+        \\complete -c verde -l gateway-port -r -d 'Remote loopback gateway port'
+        \\complete -c verde -l expected-runtime-id -r -d 'Pinned Verde runtime identity'
+        \\complete -c verde -l profile -r -d 'Workspace default runtime profile id'
         \\complete -c verde -l all -d 'Target all workspaces'
         \\complete -c verde -l dry-run -d 'Show planned changes without modifying Herdr'
         \\complete -c verde -l thread -r -d 'Thread index or provider id'
@@ -884,5 +889,7 @@ fn writeFish(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.inspector_mode_values);
     try w.writeAll("'\ncomplete -c verde -n '__verde_prev_is --key' -a '");
     try writeWords(w, &spec.terminal_key_values);
+    try w.writeAll("'\ncomplete -c verde -n '__verde_prev_is --profile' -a '");
+    try writeWords(w, &spec.runtime_profile_values);
     try w.writeAll("'\n");
 }

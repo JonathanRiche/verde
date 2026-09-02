@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://verde.dev/specs/control-plane/v1/schemas/audit-event.schema.json",
+  "title": "Security audit event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "event_id",
+    "event_type",
+    "outcome",
+    "actor",
+    "correlation_id",
+    "occurred_at"
+  ],
+  "properties": {
+    "contract_version": {
+      "$ref": "common.schema.json#/$defs/contractVersion"
+    },
+    "event_id": {
+      "$ref": "common.schema.json#/$defs/eventId"
+    },
+    "event_type": {
+      "enum": [
+        "authentication.succeeded",
+        "authentication.failed",
+        "link.challenge_issued",
+        "link.challenge_consumed",
+        "link.challenge_rejected",
+        "link.created",
+        "link.unlinked",
+        "endpoint.enrollment_reserved",
+        "endpoint.enrollment_rejected",
+        "endpoint.enrolled",
+        "endpoint.revoked",
+        "bootstrap.issued",
+        "bootstrap.rejected",
+        "entity.revoked"
+      ]
+    },
+    "outcome": {
+      "enum": ["success", "rejected", "failure"]
+    },
+    "actor": {
+      "oneOf": [
+        {
+          "$ref": "common.schema.json#/$defs/principal"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["service"],
+          "properties": {
+            "service": {
+              "enum": ["control-plane", "operator"]
+            }
+          }
+        }
+      ]
+    },
+    "correlation_id": {
+      "type": "string",
+      "pattern": "^cor_[0-9a-f]{32}$"
+    },
+    "request_id": {
+      "$ref": "common.schema.json#/$defs/requestId"
+    },
+    "runtime_id": {
+      "$ref": "common.schema.json#/$defs/runtimeId"
+    },
+    "instance_id": {
+      "$ref": "common.schema.json#/$defs/instanceId"
+    },
+    "device_id": {
+      "$ref": "common.schema.json#/$defs/deviceId"
+    },
+    "link_id": {
+      "$ref": "common.schema.json#/$defs/linkId"
+    },
+    "grant_id": {
+      "$ref": "common.schema.json#/$defs/grantId"
+    },
+    "enrollment_id": {
+      "$ref": "common.schema.json#/$defs/enrollmentId"
+    },
+    "reason_code": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{2,63}$"
+    },
+    "occurred_at": {
+      "$ref": "common.schema.json#/$defs/timestamp"
+    }
+  }
+}

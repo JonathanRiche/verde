@@ -88,7 +88,11 @@ depends = ["web-app"]
 run = "bash -lc 'exec ./zig-out/bin/verde-web --static dist \"$@\"' --"
 
 [tasks.web-app-dev]
-description = "Vite frontend on :6783, proxying /api and /ws to an already-running verde-web on :7420."
+description = "Loopback Vite frontend on :6783, proxying /login, /auth, /api, and /ws to verde-web on :7420."
 dir = "packages/web_app"
 depends = ["web-app-setup"]
 run = "bun run dev"
+
+[tasks.runtime-container]
+description = "Builds the non-root standalone daemon/gateway container image from target-pinned artifacts."
+run = "bash scripts/release/build-runtime-container.sh"

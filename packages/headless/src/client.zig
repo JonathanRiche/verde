@@ -8,6 +8,9 @@ const protocol = @import("protocol.zig");
 const registry = @import("registry_protocol.zig");
 const store_protocol = @import("store_protocol.zig");
 const changes_protocol = @import("changes_protocol.zig");
+const providers_protocol = @import("providers_protocol.zig");
+const access_protocol = @import("access_protocol.zig");
+const connect_protocol = @import("connect_protocol.zig");
 
 /// Sends one request JSON document and returns an allocator-owned response JSON document.
 pub const TransportFn = *const fn (ctx: *anyopaque, request_json: []const u8) anyerror![]u8;
@@ -24,6 +27,12 @@ pub const RequiredCapability = enum {
     store,
     snapshots,
     changes,
+    workspace_pagination,
+    thread_pagination,
+    message_pagination,
+    provider_status,
+    repository_projection,
+    repository_manifests,
     browser_execution,
     browser_presentation,
     browser_session_state,
@@ -52,6 +61,12 @@ pub const RequiredCapability = enum {
             .store => "store",
             .snapshots => "snapshots",
             .changes => "changes",
+            .workspace_pagination => "workspace_pagination",
+            .thread_pagination => "thread_pagination",
+            .message_pagination => "message_pagination",
+            .provider_status => "provider_status",
+            .repository_projection => "repository_projection",
+            .repository_manifests => "repository_manifests",
             .browser_execution => "browser_execution",
             .browser_presentation => "browser_presentation",
             .browser_session_state => "browser.session_state",
@@ -91,6 +106,12 @@ fn requireCapabilityChecked(capabilities: protocol.Capabilities, feature: Requir
         .store => capabilities.store,
         .snapshots => capabilities.snapshots,
         .changes => capabilities.changes,
+        .workspace_pagination => capabilities.workspace_pagination,
+        .thread_pagination => capabilities.thread_pagination,
+        .message_pagination => capabilities.message_pagination,
+        .provider_status => capabilities.provider_status,
+        .repository_projection => capabilities.repository_projection,
+        .repository_manifests => capabilities.repository_manifests,
         .browser_execution => capabilities.browser_execution,
         .browser_presentation => capabilities.browser_presentation,
         .browser_session_state => capabilities.isFeatureAvailable(.browser_session_state),
@@ -140,6 +161,12 @@ pub fn capabilityUnavailable(feature: RequiredCapability) protocol.Error {
             .store => "store capability is unavailable",
             .snapshots => "snapshots capability is unavailable",
             .changes => "changes capability is unavailable",
+            .workspace_pagination => "workspace_pagination capability is unavailable",
+            .thread_pagination => "thread_pagination capability is unavailable",
+            .message_pagination => "message_pagination capability is unavailable",
+            .provider_status => "provider_status capability is unavailable",
+            .repository_projection => "repository_projection capability is unavailable",
+            .repository_manifests => "repository_manifests capability is unavailable",
             .browser_execution => "browser_execution capability is unavailable",
             .browser_presentation => "browser_presentation capability is unavailable",
             .browser_session_state => "browser.session_state capability is unavailable",
@@ -189,10 +216,50 @@ pub fn advanceChangeCursor(
     };
 }
 
+pub const RuntimeHandshakeError = error{
+    RuntimeIdentityMissing,
+    RuntimeIdentityMismatch,
+    IncompatibleRuntimeProtocol,
+};
+
+/// Validate the network-runtime identity after the ordinary protocol-range
+/// negotiation. Callers persist `runtime_id`, never a mutable label/address.
+pub fn verifyRuntimeHandshake(
+    status: protocol.StatusResult,
+    expected_runtime_id: ?[]const u8,
+) RuntimeHandshakeError!void {
+    if (status.runtime_id.len == 0 or status.instance_id.len == 0) return error.RuntimeIdentityMissing;
+    if (status.protocol.major != protocol.RUNTIME_PROTOCOL_MAJOR) return error.IncompatibleRuntimeProtocol;
+    if (expected_runtime_id) |expected| {
+        if (expected.len == 0 or !std.mem.eql(u8, expected, status.runtime_id)) return error.RuntimeIdentityMismatch;
+    }
+}
+
+const ConfiguredRequestTarget = struct {
+    runtime_id: [32]u8,
+    instance_id: [32]u8,
+
+    fn init(target: protocol.RequestTarget) !ConfiguredRequestTarget {
+        try protocol.validateRequestTarget(target);
+        var configured: ConfiguredRequestTarget = undefined;
+        @memcpy(configured.runtime_id[0..], target.runtime_id);
+        @memcpy(configured.instance_id[0..], target.instance_id);
+        return configured;
+    }
+
+    fn borrow(self: *const ConfiguredRequestTarget) protocol.RequestTarget {
+        return .{
+            .runtime_id = &self.runtime_id,
+            .instance_id = &self.instance_id,
+        };
+    }
+};
+
 pub const Client = struct {
     allocator: std.mem.Allocator,
     transport_ctx: ?*anyopaque,
     transport: ?TransportFn,
+    request_target: ?ConfiguredRequestTarget = null,
     next_id: u64 = 1,
     negotiated_version: ?u32 = null,
 
@@ -215,6 +282,20 @@ pub const Client = struct {
         };
     }
 
+    /// Create a transport client permanently pinned to one runtime generation.
+    /// The identity pair is copied into the client so caller buffer changes
+    /// cannot retarget later requests.
+    pub fn initTargeted(
+        allocator: std.mem.Allocator,
+        transport_ctx: *anyopaque,
+        transport: TransportFn,
+        target: protocol.RequestTarget,
+    ) !Client {
+        var client = init(allocator, transport_ctx, transport);
+        client.request_target = try ConfiguredRequestTarget.init(target);
+        return client;
+    }
+
     /// Creates an encoder/parser-only client for adapters that own transport.
     pub fn initEncoder(allocator: std.mem.Allocator) Client {
         return .{
@@ -222,6 +303,14 @@ pub const Client = struct {
             .transport_ctx = null,
             .transport = null,
         };
+    }
+
+    /// Create an encoder-only client permanently pinned to one runtime
+    /// generation. No per-call API can replace or omit this target.
+    pub fn initTargetedEncoder(allocator: std.mem.Allocator, target: protocol.RequestTarget) !Client {
+        var client = initEncoder(allocator);
+        client.request_target = try ConfiguredRequestTarget.init(target);
+        return client;
     }
 
     /// Encode a typed request, hand it to the transport, and parse the envelope.
@@ -235,10 +324,16 @@ pub const Client = struct {
     /// Encode and send a request with the caller's existing request id.
     pub fn callWithId(self: *Client, id: u64, method: []const u8, params: anytype) !protocol.ParsedResponse {
         const request_json = try self.encodeRequestWithId(id, method, params);
-        defer self.allocator.free(request_json);
+        defer {
+            std.crypto.secureZero(u8, request_json);
+            self.allocator.free(request_json);
+        }
 
         const response_json = try self.send(request_json);
-        defer self.allocator.free(response_json);
+        defer {
+            std.crypto.secureZero(u8, response_json);
+            self.allocator.free(response_json);
+        }
 
         return try self.parseResponseWithId(id, response_json);
     }
@@ -256,7 +351,10 @@ pub const Client = struct {
 
         pub fn deinit(self: *CallResult, allocator: std.mem.Allocator) void {
             self.parsed.deinit();
-            if (self.response_json) |response_json| allocator.free(response_json);
+            if (self.response_json) |response_json| {
+                std.crypto.secureZero(u8, response_json);
+                allocator.free(response_json);
+            }
             self.* = undefined;
         }
     };
@@ -264,10 +362,16 @@ pub const Client = struct {
     /// Encode, send, and parse while retaining ownership of the original response JSON.
     pub fn callAllocWithId(self: *Client, id: u64, method: []const u8, params: anytype) !CallResult {
         const request_json = try self.encodeRequestWithId(id, method, params);
-        defer self.allocator.free(request_json);
+        defer {
+            std.crypto.secureZero(u8, request_json);
+            self.allocator.free(request_json);
+        }
 
         const response_json = try self.send(request_json);
-        errdefer self.allocator.free(response_json);
+        errdefer {
+            std.crypto.secureZero(u8, response_json);
+            self.allocator.free(response_json);
+        }
         var parsed = try self.parseResponseWithId(id, response_json);
         errdefer parsed.deinit();
         return .{
@@ -286,6 +390,9 @@ pub const Client = struct {
 
     /// Build a request envelope with an explicit id without advancing the generated id.
     pub fn encodeRequestWithId(self: *Client, id: u64, method: []const u8, params: anytype) ![]u8 {
+        if (self.request_target) |*target| {
+            return try protocol.encodeTargetedRequest(self.allocator, id, method, params, target.borrow());
+        }
         return try protocol.encodeRequest(self.allocator, id, method, params);
     }
 
@@ -318,6 +425,14 @@ pub const Client = struct {
             .status = status,
             .negotiated_version = self.negotiated_version.?,
         };
+    }
+
+    /// Perform the handshake required for a configured remote runtime and
+    /// reject a replaced/misdirected server before any state is projected.
+    pub fn handshakeRuntime(self: *Client, expected_runtime_id: ?[]const u8) !HandshakeResult {
+        const result = try self.handshake();
+        try verifyRuntimeHandshake(result.status, expected_runtime_id);
+        return result;
     }
 
     /// Return the version selected by the most recent successful status or
@@ -412,9 +527,32 @@ pub const Client = struct {
         return try self.decodeResult(store_protocol.ThreadGetResult, parsed);
     }
 
+    /// Decode a bounded workspace list with repository projections.
+    pub fn decodeWorkspaceList(self: *Client, parsed: *const protocol.ParsedResponse) !store_protocol.WorkspaceListResult {
+        return try self.decodeResult(store_protocol.WorkspaceListResult, parsed);
+    }
+
+    /// Decode one bounded, allocator-owned repository manifest projection.
+    pub fn decodeWorkspaceRepositoryManifest(
+        self: *Client,
+        parsed: *const protocol.ParsedResponse,
+    ) !store_protocol.WorkspaceRepositoryManifestResult {
+        return try self.decodeResult(store_protocol.WorkspaceRepositoryManifestResult, parsed);
+    }
+
     /// Decode a bounded durable thread metadata list.
     pub fn decodeThreadList(self: *Client, parsed: *const protocol.ParsedResponse) !store_protocol.ThreadListResult {
         return try self.decodeResult(store_protocol.ThreadListResult, parsed);
+    }
+
+    /// Decode a bounded bidirectional transcript page.
+    pub fn decodeMessageList(self: *Client, parsed: *const protocol.ParsedResponse) !store_protocol.MessageListResult {
+        return try self.decodeResult(store_protocol.MessageListResult, parsed);
+    }
+
+    /// Decode runtime-scoped installation/authentication status for providers.
+    pub fn decodeProviderStatus(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.StatusResult {
+        return try self.decodeResult(providers_protocol.StatusResult, parsed);
     }
 
     /// Decode one durable turn-ledger record.
@@ -430,6 +568,155 @@ pub const Client = struct {
     /// Decode a successful scoped composite `core.snapshot` response.
     pub fn decodeCompositeSnapshot(self: *Client, parsed: *const protocol.ParsedResponse) !store_protocol.CoreSnapshotResult {
         return try self.decodeResult(store_protocol.CoreSnapshotResult, parsed);
+    }
+
+    /// Decode the owner-only grant creation result with strict access-protocol
+    /// fields. Unlike the legacy tolerant decoders, unknown fields fail closed.
+    pub fn decodePairingGrantCreate(
+        self: *Client,
+        parsed: *const protocol.ParsedResponse,
+    ) !access_protocol.PairingGrantCreateResult {
+        const result = try self.decodeStrictResult(access_protocol.PairingGrantCreateResult, parsed);
+        try validateAccessResultHeader(result.access_protocol_version, result.runtime_id, result.instance_id);
+        try access_protocol.validateGrantId(result.grant_id);
+        try access_protocol.validateSecret(result.pairing_token.reveal());
+        try access_protocol.validateScopeNames(result.scopes);
+        if (result.expires_at_ms < 0) return error.InvalidAccessResponse;
+        return result;
+    }
+
+    /// Decode non-secret pairing grant metadata with strict v1 fields.
+    pub fn decodePairingGrantList(
+        self: *Client,
+        parsed: *const protocol.ParsedResponse,
+    ) !access_protocol.PairingGrantListResult {
+        const result = try self.decodeStrictResult(access_protocol.PairingGrantListResult, parsed);
+        try validateAccessResultHeader(result.access_protocol_version, result.runtime_id, result.instance_id);
+        for (result.grants) |grant| {
+            try access_protocol.validateGrantId(grant.grant_id);
+            if (grant.label) |label| try access_protocol.validateDeviceLabel(label);
+            try access_protocol.validateScopeNames(grant.scopes);
+            if (grant.created_at_ms < 0 or grant.expires_at_ms < grant.created_at_ms or
+                (grant.consumed_at_ms != null and grant.consumed_at_ms.? < 0) or
+                (grant.revoked_at_ms != null and grant.revoked_at_ms.? < 0))
+            {
+                return error.InvalidAccessResponse;
+            }
+        }
+        return result;
+    }
+
+    pub fn decodePairingGrantRevoke(
+        self: *Client,
+        parsed: *const protocol.ParsedResponse,
+    ) !access_protocol.PairingGrantRevokeResult {
+        const result = try self.decodeStrictResult(access_protocol.PairingGrantRevokeResult, parsed);
+        try validateAccessProtocolVersion(result.access_protocol_version);
+        try access_protocol.validateGrantId(result.grant_id);
+        return result;
+    }
+
+    /// Decode non-secret device metadata with strict v1 fields.
+    pub fn decodeDeviceList(
+        self: *Client,
+        parsed: *const protocol.ParsedResponse,
+    ) !access_protocol.DeviceListResult {
+        const result = try self.decodeStrictResult(access_protocol.DeviceListResult, parsed);
+        try validateAccessResultHeader(result.access_protocol_version, result.runtime_id, result.instance_id);
+        for (result.devices) |device| {
+            try access_protocol.validateDeviceId(device.device_id);
+            if (device.grant_id) |grant_id| try access_protocol.validateGrantId(grant_id);
+            try access_protocol.validateDeviceLabel(device.label);
+            try access_protocol.validateScopeNames(device.scopes);
+            if (device.created_at_ms < 0 or
+                (device.last_used_at_ms != null and device.last_used_at_ms.? < 0) or
+                (device.revoked_at_ms != null and device.revoked_at_ms.? < 0))
+            {
+                return error.InvalidAccessResponse;
+            }
+        }
+        return result;
+    }
+
+    pub fn decodeDeviceRevoke(
+        self: *Client,
+        parsed: *const protocol.ParsedResponse,
+    ) !access_protocol.DeviceRevokeResult {
+        const result = try self.decodeStrictResult(access_protocol.DeviceRevokeResult, parsed);
+        try validateAccessProtocolVersion(result.access_protocol_version);
+        try access_protocol.validateDeviceId(result.device_id);
+        return result;
+    }
+
+    /// Decode the owner-only Connect projection without accepting future
+    /// fields or a response for another runtime generation.
+    pub fn decodeConnectStatus(
+        self: *Client,
+        parsed: *const protocol.ParsedResponse,
+    ) !connect_protocol.StatusResult {
+        const result = try self.decodeStrictResult(connect_protocol.StatusResult, parsed);
+        try validateConnectProtocolVersion(result.connect_protocol_version);
+        protocol.validateRequestTarget(.{
+            .runtime_id = result.runtime_id,
+            .instance_id = result.instance_id,
+        }) catch return error.InvalidConnectResponse;
+        if (self.request_target) |target| {
+            const expected = target.borrow();
+            if (!std.mem.eql(u8, result.runtime_id, expected.runtime_id) or
+                !std.mem.eql(u8, result.instance_id, expected.instance_id))
+            {
+                return error.RuntimeIdentityMismatch;
+            }
+        }
+        if (result.retry_attempt > 1024 or
+            (result.next_retry_at_ms != null and result.next_retry_at_ms.? < 0))
+        {
+            return error.InvalidConnectResponse;
+        }
+        return result;
+    }
+
+    pub fn decodeConnectBootstrapConsume(
+        self: *Client,
+        parsed: *const protocol.ParsedResponse,
+    ) !connect_protocol.BootstrapConsumeResult {
+        const result = try self.decodeStrictResult(connect_protocol.BootstrapConsumeResult, parsed);
+        try validateConnectProtocolVersion(result.connect_protocol_version);
+        try access_protocol.validateScopeNames(result.scopes);
+        protocol.validateRequestTarget(.{
+            .runtime_id = result.runtime_id,
+            .instance_id = result.instance_id,
+        }) catch return error.InvalidConnectResponse;
+        access_protocol.validateDeviceId(result.device_id) catch return error.InvalidConnectResponse;
+        access_protocol.validateSecret(result.device_credential.reveal()) catch return error.InvalidConnectResponse;
+        return result;
+    }
+
+    /// Send a bootstrap grant over the owner-only daemon transport. The
+    /// request DTO deliberately redacts under generic serialization, so this
+    /// is the sole typed client path that places the grant in a wire buffer.
+    /// `callWithId` clears that buffer immediately after the transport call.
+    pub fn callConnectBootstrapConsume(
+        self: *Client,
+        request: connect_protocol.BootstrapConsumeRequest,
+    ) !protocol.ParsedResponse {
+        try validateConnectProtocolVersion(request.connect_protocol_version);
+        const grant_jwt = request.grant_jwt.reveal();
+        if (grant_jwt.len == 0 or grant_jwt.len > connect_protocol.MAX_COMPACT_TOKEN_BYTES) {
+            return error.InvalidConnectGrant;
+        }
+        const id = self.next_id;
+        self.next_id += 1;
+        return try self.callWithId(id, connect_protocol.METHOD_BOOTSTRAP_CONSUME, .{
+            .connect_protocol_version = request.connect_protocol_version,
+            .grant_jwt = grant_jwt,
+            .expected_issuer = request.expected_issuer,
+            .expected_audience = request.expected_audience,
+            .client_nonce = request.client_nonce,
+            .device_id = request.device_id,
+            .device_key_thumbprint = request.device_key_thumbprint,
+            .device_label = request.device_label,
+        });
     }
 
     /// Issue an explicitly daemon-direct composite snapshot read. The gate is
@@ -454,6 +741,99 @@ pub const Client = struct {
     ) !protocol.ParsedResponse {
         try requireCapabilityChecked(capabilities, .changes);
         return try self.call(changes_protocol.METHOD_CORE_CHANGES, request);
+    }
+
+    pub fn callWorkspaceList(
+        self: *Client,
+        capabilities: protocol.Capabilities,
+        request: store_protocol.WorkspaceListRequest,
+    ) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .workspace_pagination);
+        try requireCapabilityChecked(capabilities, .repository_projection);
+        return try self.call(store_protocol.METHOD_WORKSPACE_LIST, request);
+    }
+
+    pub fn callWorkspaceRepositoryManifest(
+        self: *Client,
+        capabilities: protocol.Capabilities,
+        request: store_protocol.WorkspaceRepositoryManifestRequest,
+    ) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .repository_manifests);
+        return try self.call(store_protocol.METHOD_WORKSPACE_REPOSITORY_MANIFEST_GET, request);
+    }
+
+    pub fn callWorkspaceRepositoryUpsert(
+        self: *Client,
+        capabilities: protocol.Capabilities,
+        request: store_protocol.WorkspaceRepositoryUpsertRequest,
+    ) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .repository_manifests);
+        return try self.call(store_protocol.METHOD_WORKSPACE_REPOSITORY_UPSERT, request);
+    }
+
+    pub fn callWorkspaceRepositoryRemove(
+        self: *Client,
+        capabilities: protocol.Capabilities,
+        request: store_protocol.WorkspaceRepositoryRemoveRequest,
+    ) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .repository_manifests);
+        return try self.call(store_protocol.METHOD_WORKSPACE_REPOSITORY_REMOVE, request);
+    }
+
+    pub fn callWorkspaceRepositoryDefaultSet(
+        self: *Client,
+        capabilities: protocol.Capabilities,
+        request: store_protocol.WorkspaceDefaultRepositorySetRequest,
+    ) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .repository_manifests);
+        return try self.call(store_protocol.METHOD_WORKSPACE_REPOSITORY_DEFAULT_SET, request);
+    }
+
+    pub fn callWorkspaceRepositoryBindingUpsert(
+        self: *Client,
+        capabilities: protocol.Capabilities,
+        request: store_protocol.WorkspaceRepositoryBindingUpsertRequest,
+    ) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .repository_manifests);
+        return try self.call(store_protocol.METHOD_WORKSPACE_REPOSITORY_BINDING_UPSERT, request);
+    }
+
+    pub fn callWorkspaceRepositoryBindingRemove(
+        self: *Client,
+        capabilities: protocol.Capabilities,
+        request: store_protocol.WorkspaceRepositoryBindingRemoveRequest,
+    ) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .repository_manifests);
+        return try self.call(store_protocol.METHOD_WORKSPACE_REPOSITORY_BINDING_REMOVE, request);
+    }
+
+    pub fn callThreadList(
+        self: *Client,
+        capabilities: protocol.Capabilities,
+        request: store_protocol.ThreadListRequest,
+    ) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .thread_pagination);
+        return try self.call(store_protocol.METHOD_CHAT_THREAD_LIST, request);
+    }
+
+    pub fn callMessageList(
+        self: *Client,
+        capabilities: protocol.Capabilities,
+        request: store_protocol.MessageListRequest,
+    ) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .message_pagination);
+        return try self.call(store_protocol.METHOD_CHAT_MESSAGE_LIST, request);
+    }
+
+    pub fn callProviderStatus(
+        self: *Client,
+        capabilities: protocol.Capabilities,
+    ) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .provider_status);
+        return try self.call(
+            providers_protocol.METHOD_PROVIDERS_STATUS,
+            providers_protocol.StatusRequest{},
+        );
     }
 
     /// Require a capability on this client before a direct daemon request.
@@ -485,7 +865,15 @@ pub const Client = struct {
     }
 
     fn resultValue(_: *Client, parsed: *const protocol.ParsedResponse) !std.json.Value {
-        if (!parsed.response.isOk()) return error.RemoteError;
+        if (parsed.response.err) |remote_error| {
+            if (std.mem.eql(u8, remote_error.code, protocol.ERR_RUNTIME_IDENTITY_MISSING)) {
+                return error.RuntimeIdentityMissing;
+            }
+            if (std.mem.eql(u8, remote_error.code, protocol.ERR_RUNTIME_IDENTITY_MISMATCH)) {
+                return error.RuntimeIdentityMismatch;
+            }
+            return error.RemoteError;
+        }
         return parsed.response.result orelse error.InvalidResponse;
     }
 
@@ -501,12 +889,49 @@ pub const Client = struct {
         });
     }
 
+    /// Access credentials and grants use strict, versioned objects. Parsing
+    /// directly from the response DOM avoids another plaintext secret copy.
+    fn decodeStrictResult(self: *Client, comptime T: type, parsed: *const protocol.ParsedResponse) !T {
+        const result = try self.resultValue(parsed);
+        return try std.json.parseFromValueLeaky(T, self.allocator, result, .{});
+    }
+
     fn send(self: *Client, request_json: []const u8) ![]u8 {
         const transport = self.transport orelse return error.TransportUnavailable;
         const context = self.transport_ctx orelse return error.TransportUnavailable;
         return try transport(context, request_json);
     }
 };
+
+fn validateAccessProtocolVersion(version: u32) !void {
+    if (version != access_protocol.ACCESS_PROTOCOL_VERSION) {
+        return error.IncompatibleAccessProtocol;
+    }
+}
+
+fn validateConnectProtocolVersion(version: u32) !void {
+    if (version != connect_protocol.CONNECT_PROTOCOL_VERSION) {
+        return error.IncompatibleConnectProtocol;
+    }
+}
+
+fn validConnectPrefixedId(value: []const u8, prefix: []const u8) bool {
+    if (value.len != prefix.len + 32 or !std.mem.startsWith(u8, value, prefix)) return false;
+    for (value[prefix.len..]) |byte| if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
+    return true;
+}
+
+fn validateAccessResultHeader(
+    version: u32,
+    runtime_id: []const u8,
+    instance_id: []const u8,
+) !void {
+    try validateAccessProtocolVersion(version);
+    protocol.validateRequestTarget(.{
+        .runtime_id = runtime_id,
+        .instance_id = instance_id,
+    }) catch return error.InvalidAccessResponse;
+}
 
 const MockTransport = struct {
     allocator: std.mem.Allocator,
@@ -515,17 +940,29 @@ const MockTransport = struct {
     canned_response: []const u8,
 
     fn deinit(self: *MockTransport) void {
-        if (self.last_request) |bytes| self.allocator.free(bytes);
+        if (self.last_request) |bytes| {
+            std.crypto.secureZero(u8, bytes);
+            self.allocator.free(bytes);
+        }
     }
 
     fn send(ctx: *anyopaque, request_json: []const u8) anyerror![]u8 {
         const self: *MockTransport = @ptrCast(@alignCast(ctx));
         self.call_count += 1;
-        if (self.last_request) |bytes| self.allocator.free(bytes);
+        if (self.last_request) |bytes| {
+            std.crypto.secureZero(u8, bytes);
+            self.allocator.free(bytes);
+        }
         self.last_request = try self.allocator.dupe(u8, request_json);
         return try self.allocator.dupe(u8, self.canned_response);
     }
 };
+
+fn expectMockRequestMethod(mock: *const MockTransport, expected: []const u8) !void {
+    var parsed = try protocol.parseRequest(std.testing.allocator, mock.last_request.?);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(expected, parsed.request.method);
+}
 
 test "client parses ok envelope via injected transport" {
     const allocator = std.testing.allocator;
@@ -554,7 +991,10 @@ test "client parses ok envelope via injected transport" {
     try std.testing.expectEqual(@as(u32, 1), capabilities.headless_protocol_version);
     try std.testing.expect(capabilities.capabilities.terminal_raw);
     try std.testing.expect(mock.last_request != null);
-    try std.testing.expect(std.mem.indexOf(u8, mock.last_request.?, "core.capabilities") != null);
+    try std.testing.expectEqualStrings(
+        "{\"id\":1,\"method\":\"core.capabilities\",\"params\":[]}",
+        mock.last_request.?,
+    );
 
     const status_body = try protocol.encodeOkResponse(allocator, 2, .{
         .headless_protocol_version = protocol.HEADLESS_PROTOCOL_VERSION,
@@ -572,6 +1012,53 @@ test "client parses ok envelope via injected transport" {
     const status = try client.decodeStatus(&parsed_status);
     try std.testing.expectEqual(@as(u32, 18), status.protocol_version);
     try std.testing.expectEqual(@as(usize, 2), status.session_count);
+}
+
+test "Connect bootstrap uses only the explicit secret wire path" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const secret = "header.payload.signature";
+    const request: connect_protocol.BootstrapConsumeRequest = .{
+        .connect_protocol_version = connect_protocol.CONNECT_PROTOCOL_VERSION,
+        .grant_jwt = .{ .bytes = secret },
+        .expected_issuer = "https://connect.example.test",
+        .expected_audience = "https://runtime.example.test",
+        .client_nonce = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        .device_id = "dev_33333333333333333333333333333333",
+        .device_key_thumbprint = "kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k",
+        .device_label = "Connect laptop",
+    };
+    const response = try allocator.dupe(
+        u8,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"ok\":true,\"result\":{\"connect_protocol_version\":1," ++
+            "\"runtime_id\":\"0123456789abcdef0123456789abcdef\"," ++
+            "\"instance_id\":\"abcdef0123456789abcdef0123456789\"," ++
+            "\"device_id\":\"00112233445566778899aabbccddeeff\"," ++
+            "\"device_credential\":\"" ++ ("a" ** access_protocol.SECRET_HEX_BYTES) ++ "\"," ++
+            "\"scopes\":[\"runtime:read\",\"chat:write\"]}}",
+    );
+    defer allocator.free(response);
+    var mock: MockTransport = .{ .allocator = arena, .canned_response = response };
+    defer mock.deinit();
+    var client = Client.init(arena, &mock, MockTransport.send);
+
+    const generic = try client.encodeRequest(connect_protocol.METHOD_BOOTSTRAP_CONSUME, request);
+    defer {
+        std.crypto.secureZero(u8, generic.json);
+        arena.free(generic.json);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, generic.json, secret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, generic.json, connect_protocol.REDACTED_SECRET) != null);
+
+    client.next_id = 1;
+    var parsed = try client.callConnectBootstrapConsume(request);
+    defer parsed.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, mock.last_request.?, secret) != null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.last_request.?, connect_protocol.REDACTED_SECRET) == null);
+    const result = try client.decodeConnectBootstrapConsume(&parsed);
+    try std.testing.expectEqualStrings("00112233445566778899aabbccddeeff", result.device_id);
 }
 
 test "client parses error envelope via injected transport" {
@@ -596,6 +1083,131 @@ test "client parses error envelope via injected transport" {
 
     try std.testing.expect(!parsed.response.isOk());
     try std.testing.expectEqualStrings(protocol.ERR_UNKNOWN_METHOD, parsed.response.err.?.code);
+}
+
+test "targeted client copies one target into generic and typed requests" {
+    const allocator = std.testing.allocator;
+    const ok_body = try protocol.encodeOkResponse(allocator, 2, .{});
+    defer allocator.free(ok_body);
+    var mock: MockTransport = .{
+        .allocator = allocator,
+        .canned_response = ok_body,
+    };
+    defer mock.deinit();
+
+    var runtime_id: [32]u8 = "0123456789abcdef0123456789abcdef".*;
+    var instance_id: [32]u8 = "00112233445566778899aabbccddeeff".*;
+    var client = try Client.initTargeted(allocator, &mock, MockTransport.send, .{
+        .runtime_id = &runtime_id,
+        .instance_id = &instance_id,
+    });
+    runtime_id[0] = 'f';
+    instance_id[0] = 'f';
+
+    const generic = try client.encodeRequest("core.capabilities", .{});
+    defer allocator.free(generic.json);
+    var parsed_generic = try protocol.parseRequest(allocator, generic.json);
+    defer parsed_generic.deinit();
+    try std.testing.expectEqualStrings(
+        "0123456789abcdef0123456789abcdef",
+        parsed_generic.request.target.?.runtime_id,
+    );
+    try std.testing.expectEqualStrings(
+        "00112233445566778899aabbccddeeff",
+        parsed_generic.request.target.?.instance_id,
+    );
+
+    var typed = try client.callCompositeSnapshot(protocol.Capabilities.phase1(), .{});
+    defer typed.deinit();
+    var parsed_typed = try protocol.parseRequest(allocator, mock.last_request.?);
+    defer parsed_typed.deinit();
+    try std.testing.expectEqualStrings("core.snapshot", parsed_typed.request.method);
+    try std.testing.expectEqualStrings(
+        "0123456789abcdef0123456789abcdef",
+        parsed_typed.request.target.?.runtime_id,
+    );
+}
+
+test "targeted client rejects an invalid configured identity" {
+    try std.testing.expectError(
+        error.RuntimeIdentityMissing,
+        Client.initTargetedEncoder(std.testing.allocator, .{
+            .runtime_id = "not-canonical",
+            .instance_id = "00112233445566778899aabbccddeeff",
+        }),
+    );
+}
+
+test "access result decoders are strict and keep generic secret rendering redacted" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var client = Client.initEncoder(arena);
+    const response =
+        \\{"jsonrpc":"2.0","id":1,"result":{"access_protocol_version":1,"runtime_id":"0123456789abcdef0123456789abcdef","instance_id":"00112233445566778899aabbccddeeff","grant_id":"fedcba9876543210fedcba9876543210","pairing_token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expires_at_ms":1000,"scopes":["runtime:read"]}}
+    ;
+    var parsed = try protocol.parseResponse(arena, response);
+    defer parsed.deinit();
+    var result = try client.decodePairingGrantCreate(&parsed);
+    defer std.crypto.secureZero(u8, @constCast(result.pairing_token.reveal()));
+    try std.testing.expectEqualStrings("a" ** access_protocol.SECRET_HEX_BYTES, result.pairing_token.reveal());
+    const generic = try std.json.Stringify.valueAlloc(arena, result, .{});
+    try std.testing.expect(std.mem.indexOf(u8, generic, "a" ** access_protocol.SECRET_HEX_BYTES) == null);
+    try std.testing.expect(std.mem.indexOf(u8, generic, access_protocol.REDACTED_SECRET) != null);
+
+    const unknown_response =
+        \\{"jsonrpc":"2.0","id":2,"result":{"access_protocol_version":1,"runtime_id":"0123456789abcdef0123456789abcdef","instance_id":"00112233445566778899aabbccddeeff","grant_id":"fedcba9876543210fedcba9876543210","pairing_token":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","expires_at_ms":1000,"scopes":["runtime:read"],"future":true}}
+    ;
+    var unknown = try protocol.parseResponse(arena, unknown_response);
+    defer unknown.deinit();
+    const unknown_token = unknown.response.result.?.object.get("pairing_token").?.string;
+    defer std.crypto.secureZero(u8, @constCast(unknown_token));
+    try std.testing.expectError(error.UnknownField, client.decodePairingGrantCreate(&unknown));
+
+    const missing_version_response =
+        \\{"jsonrpc":"2.0","id":3,"result":{"runtime_id":"0123456789abcdef0123456789abcdef","instance_id":"00112233445566778899aabbccddeeff","grant_id":"fedcba9876543210fedcba9876543210","pairing_token":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","expires_at_ms":1000,"scopes":["runtime:read"]}}
+    ;
+    var missing_version = try protocol.parseResponse(arena, missing_version_response);
+    defer missing_version.deinit();
+    const missing_token = missing_version.response.result.?.object.get("pairing_token").?.string;
+    defer std.crypto.secureZero(u8, @constCast(missing_token));
+    try std.testing.expectError(error.MissingField, client.decodePairingGrantCreate(&missing_version));
+}
+
+test "device list accepts Connect devices without Pair grants and validates present grants" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var client = Client.initEncoder(arena);
+    const connect_response =
+        \\{"jsonrpc":"2.0","id":1,"result":{"access_protocol_version":1,"runtime_id":"0123456789abcdef0123456789abcdef","instance_id":"00112233445566778899aabbccddeeff","devices":[{"device_id":"fedcba9876543210fedcba9876543210","grant_id":null,"source":"connect","source_id":"grt_66666666666666666666666666666666","label":"Connect laptop","scopes":["runtime:read"],"created_at_ms":1000}]}}
+    ;
+    var connect = try protocol.parseResponse(arena, connect_response);
+    defer connect.deinit();
+    const devices = try client.decodeDeviceList(&connect);
+    try std.testing.expect(devices.devices[0].grant_id == null);
+
+    const invalid_pair_response =
+        \\{"jsonrpc":"2.0","id":2,"result":{"access_protocol_version":1,"runtime_id":"0123456789abcdef0123456789abcdef","instance_id":"00112233445566778899aabbccddeeff","devices":[{"device_id":"fedcba9876543210fedcba9876543210","grant_id":"not-a-grant","source":"pair","source_id":null,"label":"Paired laptop","scopes":["runtime:read"],"created_at_ms":1000}]}}
+    ;
+    var invalid_pair = try protocol.parseResponse(arena, invalid_pair_response);
+    defer invalid_pair.deinit();
+    try std.testing.expectError(error.InvalidGrantId, client.decodeDeviceList(&invalid_pair));
+}
+
+test "identity response errors retain their failure classification" {
+    var client = Client.initEncoder(std.testing.allocator);
+    const cases = [_]struct { code: []const u8, expected: anyerror }{
+        .{ .code = protocol.ERR_RUNTIME_IDENTITY_MISSING, .expected = error.RuntimeIdentityMissing },
+        .{ .code = protocol.ERR_RUNTIME_IDENTITY_MISMATCH, .expected = error.RuntimeIdentityMismatch },
+    };
+    for (cases) |case| {
+        const encoded = try protocol.encodeErrorResponse(std.testing.allocator, 1, case.code, "identity rejected");
+        defer std.testing.allocator.free(encoded);
+        var parsed = try protocol.parseResponse(std.testing.allocator, encoded);
+        defer parsed.deinit();
+        try std.testing.expectError(case.expected, client.decodeStatus(&parsed));
+    }
 }
 
 test "client rejects mismatched response ids in both call paths" {
@@ -657,6 +1269,32 @@ test "client handshake returns and records negotiated version" {
     try std.testing.expectEqual(protocol.HEADLESS_PROTOCOL_VERSION, result.negotiated_version);
     try std.testing.expectEqual(result.negotiated_version, try client.negotiatedProtocolVersion());
     try std.testing.expectEqual(@as(u32, 4242), result.status.pid);
+}
+
+test "remote handshake verifies stable runtime identity and protocol major" {
+    const status: protocol.StatusResult = .{
+        .runtime_id = "runtime-a",
+        .instance_id = "instance-a",
+        .server_version = "1.0.0",
+        .headless_protocol_version = protocol.HEADLESS_PROTOCOL_VERSION,
+        .min_supported = protocol.MIN_SUPPORTED_PROTOCOL_VERSION,
+        .max_supported = protocol.MAX_SUPPORTED_PROTOCOL_VERSION,
+        .protocol_version = 26,
+        .pid = 1,
+        .session_count = 0,
+        .chat_turn_count = 0,
+        .capabilities = protocol.Capabilities.phase1(),
+    };
+    try verifyRuntimeHandshake(status, null);
+    try verifyRuntimeHandshake(status, "runtime-a");
+    try std.testing.expectError(error.RuntimeIdentityMismatch, verifyRuntimeHandshake(status, "runtime-b"));
+
+    var missing = status;
+    missing.runtime_id = "";
+    try std.testing.expectError(error.RuntimeIdentityMissing, verifyRuntimeHandshake(missing, null));
+    var incompatible = status;
+    incompatible.protocol.major += 1;
+    try std.testing.expectError(error.IncompatibleRuntimeProtocol, verifyRuntimeHandshake(incompatible, null));
 }
 
 test "client status decode rejects invalid and incompatible daemon ranges" {
@@ -971,6 +1609,183 @@ test "chat read decoders return RemoteError for error envelopes" {
     try std.testing.expectError(error.RemoteError, client.decodeTurnRecord(&parsed));
 }
 
+test "remote projection and provider decoders tolerate additive fields" {
+    var result_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer result_arena.deinit();
+    var client = Client.initEncoder(result_arena.allocator());
+
+    var workspaces = try protocol.parseResponse(
+        std.testing.allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"workspaces\":[{\"workspace_id\":\"w1\",\"label\":\"W\",\"path\":\"/w\",\"repositories\":[{\"repository_id\":\"primary\",\"label\":\"Primary\",\"bindings\":[{\"runtime_id\":\"r1\",\"root_path\":\"/w\"}]}],\"future\":true}],\"store_revision\":2}}",
+    );
+    defer workspaces.deinit();
+    const workspace_result = try client.decodeWorkspaceList(&workspaces);
+    try std.testing.expectEqualStrings("r1", workspace_result.workspaces[0].repositories[0].bindings[0].runtime_id);
+
+    var messages = try protocol.parseResponse(
+        std.testing.allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"messages\":[{\"sort_index\":4,\"message_id\":\"m4\",\"role\":\"assistant\",\"author\":\"Codex\",\"body\":\"done\",\"future\":1}],\"next_cursor\":\"b:4\",\"store_revision\":3}}",
+    );
+    defer messages.deinit();
+    const message_result = try client.decodeMessageList(&messages);
+    try std.testing.expectEqual(@as(usize, 4), message_result.messages[0].sort_index);
+    try std.testing.expectEqualStrings("b:4", message_result.next_cursor.?);
+
+    var providers = try protocol.parseResponse(
+        std.testing.allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"runtime_id\":\"r1\",\"instance_id\":\"i1\",\"probed_at_ms\":5,\"providers\":[{\"provider\":\"amp\",\"label\":\"Amp\",\"surfaces\":{\"terminal_tui\":true,\"mcp\":true,\"lifecycle\":true},\"installed\":true,\"state\":\"ready\",\"authentication\":\"unknown\",\"future\":true}]}}",
+    );
+    defer providers.deinit();
+    const provider_result = try client.decodeProviderStatus(&providers);
+    try std.testing.expect(!provider_result.providers[0].surfaces.native_chat);
+    try std.testing.expect(provider_result.providers[0].surfaces.mcp);
+}
+
+test "repository manifest decoder owns the complete bounded projection" {
+    var result_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer result_arena.deinit();
+    var client = Client.initEncoder(result_arena.allocator());
+    var repository_label: []const u8 = undefined;
+    var binding_root: []const u8 = undefined;
+
+    {
+        var parsed = try protocol.parseResponse(
+            std.testing.allocator,
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"workspace_id\":\"w1\",\"default_repository_id\":\"repo-api\",\"repositories\":[{\"repository_id\":\"repo-api\",\"label\":\"API\",\"bindings\":[{\"runtime_id\":\"0123456789abcdef0123456789abcdef\",\"root_path\":\"/srv/api\",\"availability\":\"available\",\"future\":true}],\"future\":1}],\"store_revision\":9,\"future\":{}}}",
+        );
+        defer parsed.deinit();
+        const result = try client.decodeWorkspaceRepositoryManifest(&parsed);
+        try std.testing.expectEqualStrings("w1", result.workspace_id);
+        try std.testing.expectEqualStrings("repo-api", result.default_repository_id);
+        try std.testing.expectEqual(@as(usize, 1), result.repositories.len);
+        try std.testing.expectEqual(@as(u64, 9), result.store_revision);
+        repository_label = result.repositories[0].label;
+        binding_root = result.repositories[0].bindings[0].root_path;
+    }
+
+    try std.testing.expectEqualStrings("API", repository_label);
+    try std.testing.expectEqualStrings("/srv/api", binding_root);
+}
+
+test "repository manifest typed calls share one fail-closed capability gate" {
+    const allocator = std.testing.allocator;
+    const ok_body = try protocol.encodeOkResponse(allocator, 1, .{
+        .store_revision = @as(u64, 1),
+        .applied = true,
+        .duplicate = false,
+    });
+    defer allocator.free(ok_body);
+    var mock: MockTransport = .{ .allocator = allocator, .canned_response = ok_body };
+    defer mock.deinit();
+    var client = Client.init(allocator, &mock, MockTransport.send);
+    const unavailable: protocol.Capabilities = .{};
+    const current = protocol.Capabilities.phase1();
+    const mutation: store_protocol.MutationHeader = .{
+        .request_key = "repo-test",
+        .client_id = "client-test",
+    };
+
+    try std.testing.expectError(
+        error.CapabilityUnavailable,
+        client.callWorkspaceRepositoryManifest(unavailable, .{ .workspace_id = "w1" }),
+    );
+    try std.testing.expectError(
+        error.CapabilityUnavailable,
+        client.callWorkspaceRepositoryUpsert(unavailable, .{
+            .mutation = mutation,
+            .workspace_id = "w1",
+            .repository = .{ .repository_id = "repo-api", .label = "API" },
+        }),
+    );
+    try std.testing.expectError(
+        error.CapabilityUnavailable,
+        client.callWorkspaceRepositoryRemove(unavailable, .{
+            .mutation = mutation,
+            .workspace_id = "w1",
+            .repository_id = "repo-api",
+        }),
+    );
+    try std.testing.expectError(
+        error.CapabilityUnavailable,
+        client.callWorkspaceRepositoryDefaultSet(unavailable, .{
+            .mutation = mutation,
+            .workspace_id = "w1",
+            .repository_id = "repo-api",
+        }),
+    );
+    try std.testing.expectError(
+        error.CapabilityUnavailable,
+        client.callWorkspaceRepositoryBindingUpsert(unavailable, .{
+            .mutation = mutation,
+            .workspace_id = "w1",
+            .repository_id = "repo-api",
+            .binding = .{
+                .runtime_id = "0123456789abcdef0123456789abcdef",
+                .root_path = "/srv/api",
+            },
+        }),
+    );
+    try std.testing.expectError(
+        error.CapabilityUnavailable,
+        client.callWorkspaceRepositoryBindingRemove(unavailable, .{
+            .mutation = mutation,
+            .workspace_id = "w1",
+            .repository_id = "repo-api",
+            .runtime_id = "0123456789abcdef0123456789abcdef",
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 0), mock.call_count);
+
+    var manifest = try client.callWorkspaceRepositoryManifest(current, .{ .workspace_id = "w1" });
+    defer manifest.deinit();
+    try expectMockRequestMethod(&mock, store_protocol.METHOD_WORKSPACE_REPOSITORY_MANIFEST_GET);
+    client.next_id = 1;
+    var upsert = try client.callWorkspaceRepositoryUpsert(current, .{
+        .mutation = mutation,
+        .workspace_id = "w1",
+        .repository = .{ .repository_id = "repo-api", .label = "API" },
+    });
+    defer upsert.deinit();
+    try expectMockRequestMethod(&mock, store_protocol.METHOD_WORKSPACE_REPOSITORY_UPSERT);
+    client.next_id = 1;
+    var remove = try client.callWorkspaceRepositoryRemove(current, .{
+        .mutation = mutation,
+        .workspace_id = "w1",
+        .repository_id = "repo-api",
+    });
+    defer remove.deinit();
+    try expectMockRequestMethod(&mock, store_protocol.METHOD_WORKSPACE_REPOSITORY_REMOVE);
+    client.next_id = 1;
+    var set_default = try client.callWorkspaceRepositoryDefaultSet(current, .{
+        .mutation = mutation,
+        .workspace_id = "w1",
+        .repository_id = "repo-api",
+    });
+    defer set_default.deinit();
+    try expectMockRequestMethod(&mock, store_protocol.METHOD_WORKSPACE_REPOSITORY_DEFAULT_SET);
+    client.next_id = 1;
+    var binding_upsert = try client.callWorkspaceRepositoryBindingUpsert(current, .{
+        .mutation = mutation,
+        .workspace_id = "w1",
+        .repository_id = "repo-api",
+        .binding = .{
+            .runtime_id = "0123456789abcdef0123456789abcdef",
+            .root_path = "/srv/api",
+        },
+    });
+    defer binding_upsert.deinit();
+    try expectMockRequestMethod(&mock, store_protocol.METHOD_WORKSPACE_REPOSITORY_BINDING_UPSERT);
+    client.next_id = 1;
+    var binding_remove = try client.callWorkspaceRepositoryBindingRemove(current, .{
+        .mutation = mutation,
+        .workspace_id = "w1",
+        .repository_id = "repo-api",
+        .runtime_id = "0123456789abcdef0123456789abcdef",
+    });
+    defer binding_remove.deinit();
+    try expectMockRequestMethod(&mock, store_protocol.METHOD_WORKSPACE_REPOSITORY_BINDING_REMOVE);
+}
+
 test "changes and composite snapshot decoders are tolerant and own result strings" {
     var result_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer result_arena.deinit();
@@ -1103,6 +1918,17 @@ test "store capability gate reports capability_unavailable" {
     try std.testing.expectEqualStrings("store", RequiredCapability.store.wireName());
     try std.testing.expectEqualStrings(protocol.ERR_CAPABILITY_UNAVAILABLE, unavailable.code);
     try std.testing.expectEqualStrings("store capability is unavailable", unavailable.message);
+}
+
+test "remote read and repository manifest capabilities are explicit" {
+    const capabilities = protocol.Capabilities.phase1();
+    try requireCapability(capabilities, .workspace_pagination);
+    try requireCapability(capabilities, .thread_pagination);
+    try requireCapability(capabilities, .message_pagination);
+    try requireCapability(capabilities, .provider_status);
+    try requireCapability(capabilities, .repository_projection);
+    try requireCapability(capabilities, .repository_manifests);
+    try std.testing.expectEqualStrings("provider_status", RequiredCapability.provider_status.wireName());
 }
 
 test "M4-P5 chat flip: current daemon passes, old-daemon shape rejects daemon-direct chat" {

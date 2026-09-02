@@ -490,6 +490,19 @@ fn mainInner(init: std.process.Init) !void {
         .texture_release_fn = if (palette_renderer.activeBackend() == .sdl_gpu) palette_frame_renderer.Renderer.releaseTextureCallback else null,
     });
     defer state.deinit();
+    // AppState.init returns by value, so attach the heap-owned runtime service
+    // only after `state` has its final address. `init.io` is process-owned and
+    // remains valid for every service worker through application shutdown.
+    state.attachRuntimeService(init.io) catch |err| {
+        // Error names are bounded and contain neither profile contents nor
+        // process-memory-only bearer credentials.
+        log.warn("failed to load remote runtime profiles: {s}", .{@errorName(err)});
+    };
+    state.loadWorkspaceRuntimeDefaults() catch |err| {
+        // A malformed or unavailable defaults file must not prevent startup;
+        // new drafts remain Local until the administrator repairs it.
+        log.warn("failed to load workspace runtime defaults: {s}", .{@errorName(err)});
+    };
     state.app_config_file_mtime = app_config.configFileMtime(allocator) catch -1;
     state.attachBrowserHostWindow(nativeBrowserHostWindow(window));
     state.openBrowserOnLaunchIfRequested();
@@ -603,6 +616,11 @@ fn mainInner(init: std.process.Init) !void {
                 app_state.pollUpdateCheck();
             }
         }.run, .{&state});
+        const runtime_now_ms: u64 = std.math.cast(
+            u64,
+            @divTrunc(loop_start_ns, std.time.ns_per_ms),
+        ) orelse if (loop_start_ns < 0) 0 else std.math.maxInt(u64);
+        const runtime_needs_render = state.pollRuntimeService(runtime_now_ms);
         if (state.settings_controller.update_exit_requested and closePreflightPassed(&state)) {
             _ = state.consumeUpdateExitRequest();
             running = false;
@@ -691,7 +709,7 @@ fn mainInner(init: std.process.Init) !void {
         // A wake-driven send change is covered by the display-rate wake frame.
         // Non-wake polling changes still render immediately.
         const immediate_send_render = send_needs_render and event_flags.loop_wakeup_sequence == null;
-        if (immediate_send_render or background_tasks_need_render or browser_needs_render or terminal_needs_render or event_needs_render or framebuffer_size_changed or continuous_frame_due or wake_frame_due or state.workspaceSwitchFramePending()) {
+        if (runtime_needs_render or immediate_send_render or background_tasks_need_render or browser_needs_render or terminal_needs_render or event_needs_render or framebuffer_size_changed or continuous_frame_due or wake_frame_due or state.workspaceSwitchFramePending()) {
             presentation_demand.request();
         }
         if (!presentation_demand.pending) {
@@ -729,6 +747,7 @@ fn mainInner(init: std.process.Init) !void {
         state.code_copy_buttons.clearRetainingCapacity();
         state.card_toggle_hits.clearRetainingCapacity();
         state.background_task_action_hits.clearRetainingCapacity();
+        chat_panel_ui.resetRuntimeBannerHits();
 
         state.noteWorkspaceSwitchRenderStarted();
         recordSpan(&frame_sample, .render_root, struct {
@@ -1850,6 +1869,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             disarmPrefix(state);
             exitPrefixNavigate(state);
             ui_layout.resetCompanionInputCaptures(state);
+            ui_layout.blurPaletteModalTextInput(state);
             state.blurCompanionComposer();
         },
         .key_down => {
@@ -1874,6 +1894,15 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                     "browser-input sdl key_down key=0x{x} scancode={} focused={} visible={}",
                     .{ @intFromEnum(event.key.key), @intFromEnum(event.key.scancode), state.isBrowserPaneFocused(), state.isBrowserVisible() },
                 );
+            }
+            // Credential and first-contact trust are security boundaries, so
+            // they own key-down before terminal selection, prefix chords, and
+            // persistent Companion captures can act on the obscured surface.
+            if ((state.runtimeCredentialModalOpen() or state.runtimeTrustProposal() != null) and
+                ui_layout.handlePaletteKeyDown(state, &event.key))
+            {
+                syncWindowTextInput(window, state);
+                return true;
             }
             if (event.key.key == .escape and ui_layout.companionOwnsEscapeKey(state)) {
                 _ = ui_layout.handleCompanionEscapeKey(state, true);
@@ -2231,7 +2260,6 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             }
             state.notePaletteWorkspaceMouseMotion(event.motion.x, event.motion.y);
             ui_layout.updateThreadImportModalHover(state, event.motion.x, event.motion.y);
-            ui_layout.updateHerdrProfilePickerHover(state, event.motion.x, event.motion.y);
             ui_layout.updateSettingsModalHover(state, event.motion.x, event.motion.y);
             ui_layout.updateCommandPaletteHover(state, event.motion.x, event.motion.y);
             const modal_owns_motion = ui_layout.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
@@ -3361,6 +3389,38 @@ test "startup frame is submitted before the durable projection load" {
     try std.testing.expect(startup_frame < app_state_load);
 }
 
+test "runtime service attaches after AppState reaches stable storage" {
+    const source = @embedFile("main.zig");
+    const app_state_load = std.mem.indexOf(u8, source, "var state = try AppState.init").?;
+    const runtime_attach = std.mem.indexOf(u8, source, "state.attachRuntimeService(init.io)").?;
+    const defaults_load = std.mem.indexOf(u8, source, "state.loadWorkspaceRuntimeDefaults()").?;
+    try std.testing.expect(app_state_load < runtime_attach);
+    try std.testing.expect(runtime_attach < defaults_load);
+}
+
+test "runtime onboarding modals own keys before obscured terminal and prefix routes" {
+    const source = @embedFile("main.zig");
+    const runtime_modal_route = std.mem.indexOf(
+        u8,
+        source,
+        "if ((state.runtimeCredentialModalOpen() or state.runtimeTrustProposal() != null)",
+    ).?;
+    const terminal_selection_route = std.mem.indexOfPos(
+        u8,
+        source,
+        runtime_modal_route,
+        "terminal_panel_ui.handlePaletteKeyDown",
+    ).?;
+    const prefix_route = std.mem.indexOfPos(
+        u8,
+        source,
+        runtime_modal_route,
+        "state.prefix_armed and handleArmedPrefixKeyDown",
+    ).?;
+    try std.testing.expect(runtime_modal_route < terminal_selection_route);
+    try std.testing.expect(runtime_modal_route < prefix_route);
+}
+
 test "visual presentation and Linux window removal precede durability work" {
     const source = @embedFile("main.zig");
     const frame_submit = std.mem.indexOf(u8, source, "state.noteBrowserFramePresented();").?;
@@ -3596,7 +3656,19 @@ test {
     _ = @import("ipc/server.zig");
     _ = @import("platform/mod.zig");
     _ = @import("platform/workspace_identity.zig");
+    _ = @import("runtime/gateway_transport.zig");
+    _ = @import("runtime/connection.zig");
+    _ = @import("runtime/pair_client.zig");
+    _ = @import("runtime/credential_store.zig");
+    _ = @import("runtime/connect_client.zig");
+    _ = @import("runtime/profile.zig");
+    _ = @import("runtime/profile_store.zig");
+    _ = @import("runtime/secret_store.zig");
+    _ = @import("runtime/ssh_tunnel.zig");
+    _ = @import("runtime/ssh_tunnel_supervisor.zig");
+    _ = @import("runtime/thread_binding.zig");
     _ = @import("state/browser_controller.zig");
+    _ = @import("state/runtime_connections_controller.zig");
     _ = @import("state/workspace_layout.zig");
     _ = @import("providers/acp.zig");
     _ = @import("providers/claude.zig");

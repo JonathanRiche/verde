@@ -1,4 +1,4 @@
-//! Herdr profile picker state and owned profile summaries.
+//! Local Herdr workspace handoff and link state.
 
 const std = @import("std");
 const herdr = @import("../workspace/herdr.zig");
@@ -21,30 +21,6 @@ const WorkspacePane = workspace_layout.WorkspacePane;
 const WorkspacePaneId = workspace_layout.WorkspacePaneId;
 const deinitWorkspacePaneRef = workspace_layout.deinitWorkspacePaneRef;
 const log = std.log.scoped(.native_shell);
-
-pub const ProfileSummary = struct {
-    name: [:0]const u8,
-    ssh_target: [:0]const u8,
-    session: [:0]const u8,
-    remote_cwd: ?[:0]const u8 = null,
-    local_dir: ?[:0]const u8 = null,
-
-    pub fn deinit(self: ProfileSummary, allocator: std.mem.Allocator) void {
-        allocator.free(self.name);
-        allocator.free(self.ssh_target);
-        allocator.free(self.session);
-        if (self.remote_cwd) |value| allocator.free(value);
-        if (self.local_dir) |value| allocator.free(value);
-    }
-};
-
-pub const State = struct {
-    notice_storage: [256:0]u8 = [_:0]u8{0} ** 256,
-    picker_project_index: ?usize = null,
-    selected_index: ?usize = null,
-    hover_index: ?usize = null,
-    summaries: std.ArrayList(ProfileSummary) = .empty,
-};
 
 fn herdrPaneProviderForThreadProvider(provider: Provider) HerdrPaneProvider {
     return switch (provider) {
@@ -94,7 +70,6 @@ pub const HerdrOpenResult = struct {
     workspace_path: []const u8,
     created: bool,
     restored: bool,
-    remote: []const u8,
     session: []const u8,
     herdr_workspace: []const u8,
     herdr_pane: ?[]const u8,
@@ -107,7 +82,6 @@ pub const HerdrHandoffWorkspaceResult = struct {
     workspace_id: []const u8,
     label: []const u8,
     path: []const u8,
-    remote: []const u8,
     session: []const u8,
     herdr_workspace: []const u8,
     herdr_tab: ?[]const u8,
@@ -126,10 +100,8 @@ pub const HerdrHandoffResult = struct {
 };
 
 pub const HerdrUnlinkPreviousLink = struct {
-    remote: []const u8,
     session: []const u8,
     herdr_workspace: []const u8,
-    remote_cwd: ?[]const u8 = null,
     herdr_pane: ?[]const u8 = null,
     terminal_dock_id: ?u32 = null,
     terminal_pane_id: ?WorkspacePaneId = null,
@@ -137,21 +109,15 @@ pub const HerdrUnlinkPreviousLink = struct {
     updated_at_ms: i64 = 0,
 
     fn init(allocator: std.mem.Allocator, link: HerdrWorkspaceLink) !HerdrUnlinkPreviousLink {
-        const remote = try allocator.dupe(u8, link.remote_alias);
-        errdefer allocator.free(remote);
         const session = try allocator.dupe(u8, link.session_name);
         errdefer allocator.free(session);
         const workspace = try allocator.dupe(u8, link.workspace_id);
         errdefer allocator.free(workspace);
-        const remote_cwd = if (link.remote_cwd) |value| try allocator.dupe(u8, value) else null;
-        errdefer if (remote_cwd) |value| allocator.free(value);
         const herdr_pane = if (link.last_pane_id) |value| try allocator.dupe(u8, value) else null;
         errdefer if (herdr_pane) |value| allocator.free(value);
         return .{
-            .remote = remote,
             .session = session,
             .herdr_workspace = workspace,
-            .remote_cwd = remote_cwd,
             .herdr_pane = herdr_pane,
             .terminal_dock_id = link.attach_dock_id,
             .terminal_pane_id = link.attach_pane_id,
@@ -161,10 +127,8 @@ pub const HerdrUnlinkPreviousLink = struct {
     }
 
     fn deinit(self: HerdrUnlinkPreviousLink, allocator: std.mem.Allocator) void {
-        allocator.free(self.remote);
         allocator.free(self.session);
         allocator.free(self.herdr_workspace);
-        if (self.remote_cwd) |value| allocator.free(value);
         if (self.herdr_pane) |value| allocator.free(value);
     }
 };
@@ -204,7 +168,6 @@ pub fn consumePendingHerdrOpenRequest(self: anytype) !bool {
 
 pub fn openOrCreateHerdrWorkspace(self: anytype, request: herdr.OpenRequest) !HerdrOpenResult {
     try herdr.validateOpenRequest(request);
-    const remote_alias = herdr.remoteAlias(request);
     var created = false;
     var restored = false;
 
@@ -225,7 +188,7 @@ pub fn openOrCreateHerdrWorkspace(self: anytype, request: herdr.OpenRequest) !He
     const local_dir_for_link = self.project_controller.projects.items[project_index].path;
     try replaceProjectHerdrLink(self, project_index, request, local_dir_for_link, null, null);
     self.syncRenameBuffer();
-    self.setSidebarNotice(if (remote_alias.len > 0) "Remote Herdr workspace opened." else "Herdr workspace opened.");
+    self.setSidebarNotice("Herdr workspace opened.");
     self.markDirty();
 
     const project = &self.project_controller.projects.items[project_index];
@@ -236,7 +199,6 @@ pub fn openOrCreateHerdrWorkspace(self: anytype, request: herdr.OpenRequest) !He
         .workspace_path = project.path,
         .created = created,
         .restored = restored,
-        .remote = remote_alias,
         .session = request.session,
         .herdr_workspace = request.herdr_workspace,
         .herdr_pane = request.pane,
@@ -422,9 +384,7 @@ fn openLinkedHerdrWorkspaceTerminalFromUi(self: anytype, project_index: usize) b
     const request: herdr.OpenRequest = .{
         .session = link.session_name,
         .herdr_workspace = link.workspace_id,
-        .remote = if (link.remote_alias.len > 0) link.remote_alias else null,
-        .cwd = if (link.remote_alias.len == 0) project.path else null,
-        .remote_cwd = link.remote_cwd,
+        .cwd = project.path,
         .local_dir = project.path,
         .pane = link.last_pane_id,
     };
@@ -456,24 +416,8 @@ fn handoffProjectToHerdr(self: anytype, project_index: usize, request: herdr.Han
     if (project_index >= self.project_controller.projects.items.len) return error.NoProjectSelected;
     var project = &self.project_controller.projects.items[project_index];
     const existing_link = project.herdr_link;
-    const remote_alias = request.remote orelse if (existing_link) |link| link.remote_alias else "";
     const session_name = if (existing_link) |link| link.session_name else request.session;
-    var default_remote_cwd: ?[]u8 = null;
-    defer if (default_remote_cwd) |cwd| self.allocator.free(cwd);
-    const remote_cwd = if (remote_alias.len > 0) blk: {
-        if (request.remote_cwd) |cwd| break :blk cwd;
-        if (existing_link) |link| {
-            if (link.remote_cwd) |cwd| {
-                // Earlier builds used the local project path as the
-                // implicit remote cwd. Treat that as unset so existing
-                // links migrate to Verde's remote workspace area.
-                if (!std.mem.eql(u8, cwd, project.path)) break :blk cwd;
-            }
-        }
-        default_remote_cwd = try herdr.defaultRemoteCwd(self.allocator, project.label, project.id);
-        break :blk default_remote_cwd.?;
-    } else null;
-    const herdr_cwd = remote_cwd orelse project.path;
+    const herdr_cwd = project.path;
 
     if (request.dry_run) {
         const workspace_id = if (existing_link) |link| link.workspace_id else "(new)";
@@ -482,7 +426,6 @@ fn handoffProjectToHerdr(self: anytype, project_index: usize, request: herdr.Han
             .workspace_id = project.id,
             .label = project.label,
             .path = project.path,
-            .remote = remote_alias,
             .session = session_name,
             .herdr_workspace = workspace_id,
             .herdr_tab = null,
@@ -491,11 +434,7 @@ fn handoffProjectToHerdr(self: anytype, project_index: usize, request: herdr.Han
         };
     }
 
-    const target: herdr.CliTarget = .{
-        .session = session_name,
-        .remote = if (remote_alias.len > 0) remote_alias else null,
-    };
-    if (remote_alias.len > 0) try ensureHerdrRemoteCwd(self, target, herdr_cwd);
+    const target: herdr.CliTarget = .{ .session = session_name };
     var workspace = if (existing_link) |link|
         try createHerdrMirrorTab(self, target, link.workspace_id, project.label, herdr_cwd)
     else
@@ -516,9 +455,7 @@ fn handoffProjectToHerdr(self: anytype, project_index: usize, request: herdr.Han
     const open_request: herdr.OpenRequest = .{
         .session = session_name,
         .herdr_workspace = workspace.workspace_id,
-        .remote = if (remote_alias.len > 0) remote_alias else null,
-        .cwd = if (remote_alias.len == 0) project.path else null,
-        .remote_cwd = remote_cwd,
+        .cwd = project.path,
         .local_dir = project.path,
         .pane = workspace.root_pane_id,
     };
@@ -535,7 +472,6 @@ fn handoffProjectToHerdr(self: anytype, project_index: usize, request: herdr.Han
         .workspace_id = project.id,
         .label = project.label,
         .path = project.path,
-        .remote = final_link.remote_alias,
         .session = final_link.session_name,
         .herdr_workspace = final_link.workspace_id,
         .herdr_tab = null,
@@ -718,65 +654,6 @@ fn runHerdrCli(self: anytype, target: herdr.CliTarget, cli_args: []const []const
     return try herdr.runCli(self.allocator, threaded.io(), target, cli_args, 512 * 1024);
 }
 
-fn ensureHerdrRemoteCwd(self: anytype, target: herdr.CliTarget, cwd: []const u8) !void {
-    const remote = target.remote orelse return;
-    const command = try herdr.remoteMkdirCommandLineAlloc(self.allocator, cwd);
-    defer self.allocator.free(command);
-    var threaded: std.Io.Threaded = .init(self.allocator, .{});
-    defer threaded.deinit();
-    const result = try herdr.runRemoteShell(self.allocator, threaded.io(), remote, .{ .bytes = command }, 64 * 1024);
-    defer freeHerdrRunResult(self, result);
-    try ensureHerdrCliSuccess(self, result, "remote mkdir");
-}
-
-fn remoteCwdForWorkspaceCwd(self: anytype, project: *const Project, cwd: []const u8) ![]u8 {
-    const link = project.herdr_link orelse return error.WorkspaceNotRemote;
-    const base = link.remote_cwd orelse return error.MissingRemoteCwd;
-    const trimmed = std.mem.trim(u8, cwd, &std.ascii.whitespace);
-    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, ".") or std.mem.eql(u8, trimmed, project.path)) {
-        return try self.allocator.dupe(u8, base);
-    }
-    if (std.mem.startsWith(u8, trimmed, project.path) and trimmed.len > project.path.len and trimmed[project.path.len] == std.fs.path.sep) {
-        return try std.fs.path.join(self.allocator, &.{ base, trimmed[project.path.len + 1 ..] });
-    }
-    if (std.fs.path.isAbsolute(trimmed)) return try self.allocator.dupe(u8, trimmed);
-    return try std.fs.path.join(self.allocator, &.{ base, trimmed });
-}
-
-fn commandArgsForTerminalProfile(profile: terminal.TerminalLaunchProfile) ?[]const []const u8 {
-    if (profile.command.len > 0) return profile.command;
-    return switch (profile.kind) {
-        .shell => null,
-        .claude => &.{"claude"},
-        .opencode => &.{"opencode"},
-        .codex => &.{"codex"},
-        .cursor => &.{"cursor"},
-        .custom => &.{},
-    };
-}
-
-fn remoteTerminalLabel(link: HerdrWorkspaceLink, profile: terminal.TerminalLaunchProfile, buffer: []u8) []const u8 {
-    const label = std.mem.trim(u8, profile.label, &std.ascii.whitespace);
-    if (label.len > 0) return label;
-    return std.fmt.bufPrint(buffer, "Remote {s}", .{link.remote_alias}) catch "Remote terminal";
-}
-
-fn remoteCommandForTerminalProfile(
-    self: anytype,
-    project: *const Project,
-    profile: terminal.TerminalLaunchProfile,
-    cwd: []const u8,
-) ![]u8 {
-    const link = project.herdr_link orelse return error.WorkspaceNotRemote;
-    if (link.remote_alias.len == 0) return error.WorkspaceNotRemote;
-    const remote_cwd = try remoteCwdForWorkspaceCwd(self, project, cwd);
-    defer self.allocator.free(remote_cwd);
-    if (commandArgsForTerminalProfile(profile)) |args| {
-        return try herdr.remoteExecCommandLineAlloc(self.allocator, remote_cwd, args);
-    }
-    return try herdr.remoteLoginShellCommandLineAlloc(self.allocator, remote_cwd);
-}
-
 pub fn restartTerminalDockForWorkspaceProfile(
     self: anytype,
     project_index: usize,
@@ -785,23 +662,7 @@ pub fn restartTerminalDockForWorkspaceProfile(
     profile: terminal.TerminalLaunchProfile,
 ) !void {
     if (project_index >= self.project_controller.projects.items.len) return error.NoProjectSelected;
-    const project = &self.project_controller.projects.items[project_index];
     var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return error.NoProjectSelected;
-    if (project.herdr_link) |link| {
-        if (link.remote_alias.len > 0) {
-            const remote_command = try remoteCommandForTerminalProfile(self, project, profile, cwd);
-            defer self.allocator.free(remote_command);
-            var label_buf: [160]u8 = undefined;
-            const label = remoteTerminalLabel(link, profile, &label_buf);
-            const command_args = [_][]const u8{ "ssh", "-tt", link.remote_alias, remote_command };
-            try dock.restartWithProfilePersistent(self.allocator, project.path, .{
-                .kind = .custom,
-                .label = label,
-                .command = &command_args,
-            }, self.storage.pref_path, dock_id);
-            return;
-        }
-    }
     try dock.restartWithProfilePersistent(self.allocator, cwd, profile, self.storage.pref_path, dock_id);
 }
 
@@ -818,24 +679,7 @@ pub fn createTerminalTabForWorkspaceProfile(
     profile: terminal.TerminalLaunchProfile,
 ) !void {
     if (project_index >= self.project_controller.projects.items.len) return error.NoProjectSelected;
-    const project = &self.project_controller.projects.items[project_index];
     var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return error.NoProjectSelected;
-    if (project.herdr_link) |link| {
-        if (link.remote_alias.len > 0) {
-            const cwd = dock.cwd orelse project.path;
-            const remote_command = try remoteCommandForTerminalProfile(self, project, profile, cwd);
-            defer self.allocator.free(remote_command);
-            var label_buf: [160]u8 = undefined;
-            const label = remoteTerminalLabel(link, profile, &label_buf);
-            const command_args = [_][]const u8{ "ssh", "-tt", link.remote_alias, remote_command };
-            try dock.createTabWithProfile(self.allocator, .{
-                .kind = .custom,
-                .label = label,
-                .command = &command_args,
-            });
-            return;
-        }
-    }
     if (profile.kind == .shell and profile.label.len == 0 and profile.command.len == 0) {
         try dock.createTab(self.allocator);
     } else {
@@ -915,33 +759,15 @@ fn ensureHerdrAttachTerminal(self: anytype, project_index: usize, request: herdr
 fn restartHerdrAttachDock(self: anytype, project_index: usize, dock_id: u32, request: herdr.OpenRequest) !void {
     const project = &self.project_controller.projects.items[project_index];
     var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return error.NoProjectSelected;
-    const remote_alias = herdr.remoteAlias(request);
-    const label = if (remote_alias.len > 0)
-        try std.fmt.allocPrint(self.allocator, "Herdr {s}@{s}", .{ request.session, remote_alias })
-    else
-        try std.fmt.allocPrint(self.allocator, "Herdr {s}", .{request.session});
+    const label = try std.fmt.allocPrint(self.allocator, "Herdr {s}", .{request.session});
     defer self.allocator.free(label);
 
-    if (remote_alias.len > 0) {
-        const remote_command = try herdr.remoteHerdrCommandLineAlloc(self.allocator, request.session, &.{});
-        defer self.allocator.free(remote_command);
-        // Herdr's ratatui frontend opens the remote TTY directly; without
-        // forced allocation it can panic with ENXIO even though Verde's
-        // local side is already a PTY.
-        const command_args = [_][]const u8{ "ssh", "-tt", remote_alias, remote_command };
-        try dock.restartWithProfilePersistent(self.allocator, project.path, .{
-            .kind = .custom,
-            .label = label,
-            .command = &command_args,
-        }, self.storage.pref_path, dock_id);
-    } else {
-        const command_args = [_][]const u8{ "herdr", "--session", request.session };
-        try dock.restartWithProfilePersistent(self.allocator, project.path, .{
-            .kind = .custom,
-            .label = label,
-            .command = &command_args,
-        }, self.storage.pref_path, dock_id);
-    }
+    const command_args = [_][]const u8{ "herdr", "--session", request.session };
+    try dock.restartWithProfilePersistent(self.allocator, project.path, .{
+        .kind = .custom,
+        .label = label,
+        .command = &command_args,
+    }, self.storage.pref_path, dock_id);
     dock.visible = false;
 }
 
@@ -977,11 +803,9 @@ fn replaceProjectHerdrLink(
     const existing_pane_id = attach_pane_id orelse if (project.herdr_link) |link| link.attach_pane_id else null;
     var next = try HerdrWorkspaceLink.init(
         self.allocator,
-        herdr.remoteAlias(request),
         request.session,
         request.herdr_workspace,
         local_dir,
-        request.remote_cwd,
         request.pane,
         existing_dock_id,
         existing_pane_id,
@@ -1009,18 +833,12 @@ fn findHerdrProjectIndex(self: anytype, request: herdr.OpenRequest) ?usize {
 }
 
 fn herdrLinkMatchesRequest(link: HerdrWorkspaceLink, request: herdr.OpenRequest) bool {
-    return std.mem.eql(u8, link.remote_alias, herdr.remoteAlias(request)) and
-        std.mem.eql(u8, link.session_name, request.session) and
+    return std.mem.eql(u8, link.session_name, request.session) and
         std.mem.eql(u8, link.workspace_id, request.herdr_workspace);
 }
 
 fn resolveHerdrLocalProjectDir(self: anytype, request: herdr.OpenRequest) ![]u8 {
     if (request.local_dir) |local_dir| return try self.ensureDirectoryPath(local_dir);
-    if (herdr.remoteAlias(request).len > 0) {
-        const default_dir = try herdr.defaultLocalDir(self.allocator, self.storage.pref_path, request);
-        defer self.allocator.free(default_dir);
-        return try self.ensureDirectoryPath(default_dir);
-    }
     if (request.cwd) |cwd| return try self.resolveProjectPath(cwd);
     const default_dir = try herdr.defaultLocalDir(self.allocator, self.storage.pref_path, request);
     defer self.allocator.free(default_dir);

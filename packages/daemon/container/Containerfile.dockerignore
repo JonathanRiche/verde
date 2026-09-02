@@ -1,0 +1,11 @@
+**
+!LICENSE
+!zig-out/
+!zig-out/container-rootfs/
+!zig-out/container-rootfs/opt/
+!zig-out/container-rootfs/opt/verde/
+!zig-out/container-rootfs/opt/verde/**
+!packages/
+!packages/daemon/
+!packages/daemon/container/
+!packages/daemon/container/entrypoint.sh

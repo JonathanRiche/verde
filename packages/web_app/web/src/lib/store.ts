@@ -96,7 +96,6 @@ export type SidebarContextAction =
   | 'workspace-open-codex-tui'
   | 'workspace-open-terminal'
   | 'workspace-herdr-handoff'
-  | 'workspace-herdr-handoff-remote'
   | 'workspace-herdr-focus-terminal'
   | 'workspace-herdr-unlink'
   | 'workspace-rename'
@@ -2994,15 +2993,6 @@ function createAppStore() {
         case 'workspace-herdr-handoff': {
           const response = await interactiveCall('herdr.handoff', { workspace: current_workspace.workspace_id })
           callSucceeded(response, 'Herdr handoff failed')
-          return
-        }
-        case 'workspace-herdr-handoff-remote': {
-          if (!value?.trim()) return
-          const response = await interactiveCall('herdr.handoff', {
-            workspace: current_workspace.workspace_id,
-            remote: value.trim(),
-          })
-          callSucceeded(response, 'remote Herdr handoff failed')
           return
         }
         case 'workspace-herdr-focus-terminal': {

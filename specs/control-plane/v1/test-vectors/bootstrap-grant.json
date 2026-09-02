@@ -1,0 +1,19 @@
+{
+  "contract_version": "1",
+  "protected_header": {
+    "alg": "EdDSA",
+    "kid": "test-runtime-signing-v1",
+    "typ": "verde-connect-bootstrap+jwt"
+  },
+  "public_jwk": {
+    "kty": "OKP",
+    "crv": "Ed25519",
+    "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+    "kid": "test-runtime-signing-v1",
+    "use": "sig",
+    "alg": "EdDSA"
+  },
+  "jwt": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3QtcnVudGltZS1zaWduaW5nLXYxIiwidHlwIjoidmVyZGUtY29ubmVjdC1ib290c3RyYXArand0In0.eyJjb250cmFjdF92ZXJzaW9uIjoiMSIsInByaW5jaXBhbCI6eyJpc3N1ZXIiOiJodHRwczovL2lkLmV4YW1wbGUudGVzdCIsInN1YmplY3QiOiJ0ZXN0LXN1YmplY3QifSwibGlua19pZCI6Imxua180NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NCIsInJ1bnRpbWVfaWQiOiIwMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsImluc3RhbmNlX2lkIjoiYWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODkiLCJkZXZpY2VfaWQiOiJkZXZfMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMiLCJkZXZpY2Vfa2V5X3RodW1icHJpbnQiOiJrUHJLX3FteFZXYVlWQTl3d0JGNkl1bzN2Vnp6N1R4SENUd1hCeWdyUzRrIiwiY2xpZW50X25vbmNlIjoiQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQSIsInJlcXVlc3RfaWQiOiJyZXFfMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIiLCJzY29wZXMiOlsicnVudGltZTpyZWFkIiwiY2hhdDp3cml0ZSJdLCJpc3MiOiJodHRwczovL2Nvbm5lY3QuZXhhbXBsZS50ZXN0Iiwic3ViIjoiaHR0cHM6Ly9pZC5leGFtcGxlLnRlc3RcdTAwMDB0ZXN0LXN1YmplY3QiLCJhdWQiOiJodHRwczovL3J1bnRpbWUuZXhhbXBsZS50ZXN0IiwianRpIjoiZ3J0XzY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2IiwiaWF0IjoxODkzNDU2MDAwLCJuYmYiOjE4OTM0NTYwMDAsImV4cCI6MTg5MzQ1NjA5MH0.N1mVArVXRAQ0DM8Mn-_uMB3WLRKuEwGvtS66xkrbmMaialYRCntcDmpjPsRoj-SuD_LfcHhJlLb5YNManLeOAA",
+  "maximum_lifetime_seconds": 300,
+  "offline_revocation_semantics": "future issuance stops immediately; this grant remains usable only until exp"
+}

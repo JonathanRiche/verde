@@ -70,7 +70,7 @@ const COMPOSER_DIRECTORY_GLYPH_CSS: f32 = 17.0;
 /// codicon-layers: the directory pill's glyph when the chat runs in an
 /// open workspace root.
 const NF_COD_LAYERS = "\u{EBD2}";
-/// codicon-device-desktop: the runtime pill's glyph for the local runtime.
+/// codicon-device-desktop: the composer runtime-route pill's glyph.
 const NF_COD_DEVICE_DESKTOP = "\u{EA7A}";
 /// Shared max width for the chat content column. The composer card and the
 /// transcript bubble column both clamp to this (via `chatContentColumn`) so
@@ -203,6 +203,161 @@ const ApprovalHitCache = struct {
     deny_rect: palette.Rect = .{},
 };
 var approval_hits: ApprovalHitCache = .{};
+
+/// Banner shown above the composer when the thread's selected remote runtime
+/// cannot run a send. Rendered per frame; hits are cached like approvals.
+const RUNTIME_BLOCK_BANNER_HEIGHT: f32 = 64.0;
+const RuntimeBannerHitCache = struct {
+    pane_id: ?app_state.WorkspacePaneId = null,
+    primary_rect: palette.Rect = .{},
+    setup_rect: palette.Rect = .{},
+    diagnostics_rect: palette.Rect = .{},
+    recovery: app_state.RuntimeRecovery = .none,
+    profile_id: [128]u8 = undefined,
+    profile_id_len: usize = 0,
+};
+var runtime_banner_hits: RuntimeBannerHitCache = .{};
+
+const RuntimeBannerAction = enum { primary, setup, diagnostics };
+
+fn runtimeBannerActionAt(x: f32, y: f32) ?RuntimeBannerAction {
+    if (runtime_banner_hits.profile_id_len == 0) return null;
+    if (rectContains(runtime_banner_hits.primary_rect, x, y)) return .primary;
+    if (rectContains(runtime_banner_hits.setup_rect, x, y)) return .setup;
+    if (rectContains(runtime_banner_hits.diagnostics_rect, x, y)) return .diagnostics;
+    return null;
+}
+
+test "runtime banner actions use their rendered button rectangles" {
+    const previous = runtime_banner_hits;
+    defer runtime_banner_hits = previous;
+    runtime_banner_hits = .{
+        .primary_rect = .{ .x = 10.0, .y = 10.0, .w = 80.0, .h = 30.0 },
+        .setup_rect = .{ .x = 100.0, .y = 10.0, .w = 80.0, .h = 30.0 },
+        .diagnostics_rect = .{ .x = 190.0, .y = 10.0, .w = 80.0, .h = 30.0 },
+        .profile_id_len = 0,
+    };
+    // No profile means no live banner: stale rects never route clicks.
+    try std.testing.expect(runtimeBannerActionAt(20.0, 20.0) == null);
+    runtime_banner_hits.profile_id_len = 1;
+    try std.testing.expectEqual(RuntimeBannerAction.primary, runtimeBannerActionAt(20.0, 20.0).?);
+    try std.testing.expectEqual(RuntimeBannerAction.setup, runtimeBannerActionAt(120.0, 20.0).?);
+    try std.testing.expectEqual(RuntimeBannerAction.diagnostics, runtimeBannerActionAt(200.0, 20.0).?);
+    try std.testing.expect(runtimeBannerActionAt(95.0, 20.0) == null);
+}
+
+/// Per-frame reset, called before the root render. The banner is a global
+/// hit cache, so a frame that never renders the live chat composer (terminal
+/// or browser pane active, chat collapsed) must not keep last frame's
+/// invisible reconnect/setup/diagnostics targets. An active chat republishes
+/// its current rects later in the same frame.
+pub fn resetRuntimeBannerHits() void {
+    runtime_banner_hits = .{};
+}
+
+test "per-frame reset drops runtime banner hits until the composer republishes" {
+    const previous = runtime_banner_hits;
+    defer runtime_banner_hits = previous;
+    publishRuntimeBannerHits(.{
+        .primary_rect = .{ .x = 10.0, .y = 10.0, .w = 80.0, .h = 30.0 },
+        .setup_rect = .{ .x = 100.0, .y = 10.0, .w = 80.0, .h = 30.0 },
+        .diagnostics_rect = .{ .x = 190.0, .y = 10.0, .w = 80.0, .h = 30.0 },
+        .recovery = .reconnect,
+    }, "profile-live");
+    try std.testing.expect(runtimeBannerActionAt(20.0, 20.0) != null);
+    resetRuntimeBannerHits();
+    try std.testing.expectEqual(@as(usize, 0), runtime_banner_hits.profile_id_len);
+    try std.testing.expect(runtimeBannerActionAt(20.0, 20.0) == null);
+    try std.testing.expect(runtimeBannerActionAt(120.0, 20.0) == null);
+    try std.testing.expect(runtimeBannerActionAt(200.0, 20.0) == null);
+    try std.testing.expect(!approvalActionWantsPointerAt(200.0, 20.0));
+}
+
+/// Publishes the banner's hit rects for the next pointer event. Fails closed:
+/// a profile id that does not fit the cache disables every action rather than
+/// routing a truncated id to the wrong runtime.
+fn publishRuntimeBannerHits(hits: RuntimeBannerHitCache, profile_id: []const u8) void {
+    var published = hits;
+    if (profile_id.len == 0 or profile_id.len > published.profile_id.len) {
+        published.primary_rect = .{};
+        published.setup_rect = .{};
+        published.diagnostics_rect = .{};
+        published.profile_id_len = 0;
+        runtime_banner_hits = published;
+        return;
+    }
+    @memcpy(published.profile_id[0..profile_id.len], profile_id);
+    published.profile_id_len = profile_id.len;
+    runtime_banner_hits = published;
+}
+
+test "runtime banner hit cache fails closed on an over-long profile id" {
+    const previous = runtime_banner_hits;
+    defer runtime_banner_hits = previous;
+    const rendered: RuntimeBannerHitCache = .{
+        .primary_rect = .{ .x = 10.0, .y = 10.0, .w = 80.0, .h = 30.0 },
+        .diagnostics_rect = .{ .x = 100.0, .y = 10.0, .w = 80.0, .h = 30.0 },
+        .recovery = .retry,
+    };
+    publishRuntimeBannerHits(rendered, "profile-fits");
+    try std.testing.expectEqualStrings("profile-fits", runtime_banner_hits.profile_id[0..runtime_banner_hits.profile_id_len]);
+    try std.testing.expectEqual(RuntimeBannerAction.primary, runtimeBannerActionAt(20.0, 20.0).?);
+
+    const too_long = [_]u8{'x'} ** (@sizeOf(@FieldType(RuntimeBannerHitCache, "profile_id")) + 1);
+    publishRuntimeBannerHits(rendered, &too_long);
+    try std.testing.expectEqual(@as(usize, 0), runtime_banner_hits.profile_id_len);
+    try std.testing.expectEqual(@as(f32, 0.0), runtime_banner_hits.primary_rect.w);
+    try std.testing.expectEqual(@as(f32, 0.0), runtime_banner_hits.diagnostics_rect.w);
+    try std.testing.expect(runtimeBannerActionAt(20.0, 20.0) == null);
+    try std.testing.expect(runtimeBannerActionAt(110.0, 20.0) == null);
+}
+
+/// Which right-packed banner buttons are shown at a given width. The primary
+/// action is never dropped; "Copy diagnostics" goes first and "Show server
+/// setup" second so the title/detail text keeps at least `min_text_w`.
+const RuntimeBannerButtonPlan = struct { setup: bool, diagnostics: bool };
+
+fn planRuntimeBannerButtons(
+    available_w: f32,
+    min_text_w: f32,
+    gap: f32,
+    primary_w: f32,
+    setup_w: ?f32,
+    diagnostics_w: f32,
+) RuntimeBannerButtonPlan {
+    // Each shown button also costs one gap separating it from the text.
+    var buttons_w: f32 = if (primary_w > 0.0) primary_w + gap else 0.0;
+    var plan: RuntimeBannerButtonPlan = .{ .setup = setup_w != null, .diagnostics = true };
+    if (setup_w) |w| buttons_w += w + gap;
+    buttons_w += diagnostics_w + gap;
+    if (available_w - buttons_w >= min_text_w) return plan;
+    plan.diagnostics = false;
+    buttons_w -= diagnostics_w + gap;
+    if (available_w - buttons_w >= min_text_w) return plan;
+    if (setup_w) |w| {
+        plan.setup = false;
+        buttons_w -= w + gap;
+    }
+    return plan;
+}
+
+test "runtime banner drops diagnostics then setup before squeezing the text" {
+    // Widths already include button padding; gap 8, text needs 96.
+    const wide = planRuntimeBannerButtons(600.0, 96.0, 8.0, 80.0, 120.0, 110.0);
+    try std.testing.expect(wide.setup and wide.diagnostics);
+    // 80+8 + 120+8 + 110+8 = 334; 400-334 = 66 < 96 -> drop diagnostics.
+    const medium = planRuntimeBannerButtons(400.0, 96.0, 8.0, 80.0, 120.0, 110.0);
+    try std.testing.expect(medium.setup and !medium.diagnostics);
+    // 80+8 + 120+8 = 216; 300-216 = 84 < 96 -> drop setup as well.
+    const narrow = planRuntimeBannerButtons(300.0, 96.0, 8.0, 80.0, 120.0, 110.0);
+    try std.testing.expect(!narrow.setup and !narrow.diagnostics);
+    // No setup offered: only diagnostics can be shed.
+    const no_setup = planRuntimeBannerButtons(250.0, 96.0, 8.0, 80.0, null, 110.0);
+    try std.testing.expect(!no_setup.setup and !no_setup.diagnostics);
+    // No primary (transient states): diagnostics alone fits.
+    const transient = planRuntimeBannerButtons(250.0, 96.0, 8.0, 0.0, null, 110.0);
+    try std.testing.expect(transient.diagnostics);
+}
 
 const ApprovalAction = enum {
     copy,
@@ -425,6 +580,13 @@ pub fn renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(
         theme.scaledUi(APPROVAL_CARD_HEIGHT) + theme.scaledUi(10.0)
     else
         0.0;
+    // Selected remote runtime that cannot run right now: explain and offer
+    // recovery on that runtime. Only the live composer owns the banner.
+    const runtime_blocker = if (live_composer) state.runtimeComposerBlocker() else null;
+    const runtime_block_reserve = if (runtime_blocker != null)
+        theme.scaledUi(RUNTIME_BLOCK_BANNER_HEIGHT) + theme.scaledUi(10.0)
+    else
+        0.0;
 
     const browser_visible = state.isBrowserVisible() and pane_id == null;
     const split_chat_browser = browser_visible and rect.w >= theme.scaledUi(900.0);
@@ -477,7 +639,7 @@ pub fn renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(
         .x = rect.x,
         .y = header.y + header.h,
         .w = rect.w,
-        .h = @max(composer_y - (header.y + header.h) - attachment_reserve - bang_mode_reserve - background_task_reserve - followup_reserve - approval_reserve, theme.scaledUi(120.0)),
+        .h = @max(composer_y - (header.y + header.h) - attachment_reserve - bang_mode_reserve - background_task_reserve - followup_reserve - approval_reserve - runtime_block_reserve, theme.scaledUi(120.0)),
     };
     const stacked_chat_browser = browser_visible and !split_chat_browser and body.h >= theme.scaledUi(300.0);
 
@@ -573,6 +735,19 @@ pub fn renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(
         renderApprovalCard(state, card_rect, approval.*, pane_id);
     } else if (live_composer) {
         approval_hits = .{};
+    }
+    // Topmost of the composer stack so the explanation is visible even when an
+    // approval card or follow-up pin is also present.
+    if (runtime_blocker) |blocker| {
+        const banner_rect = palette.Rect{
+            .x = composer_rect.x,
+            .y = composer_rect.y - bang_mode_reserve - attachment_reserve - background_task_reserve - followup_reserve - approval_reserve - theme.scaledUi(RUNTIME_BLOCK_BANNER_HEIGHT) - theme.scaledUi(8.0),
+            .w = composer_rect.w,
+            .h = theme.scaledUi(RUNTIME_BLOCK_BANNER_HEIGHT),
+        };
+        renderRuntimeBlockBanner(state, banner_rect, blocker, pane_id);
+    } else if (live_composer) {
+        runtime_banner_hits = .{};
     }
     if (terminal_height > 0.0) {
         terminal_panel.renderDockAt(state, .{
@@ -963,14 +1138,26 @@ test "transcript action hit testing exposes bang command retry" {
     }
 }
 
-/// True when the mouse rests on either pending-approval action.
+/// True when the mouse rests on a pending-approval or runtime-banner action.
 pub fn approvalActionWantsPointerAt(x: f32, y: f32) bool {
-    return approvalActionAt(x, y) != null;
+    return approvalActionAt(x, y) != null or runtimeBannerActionAt(x, y) != null;
 }
 
-/// Handles the approval card before pane and transcript routing because the
-/// card overlays the strip between those two regions.
+/// Handles the approval card and runtime banner before pane and transcript
+/// routing because both overlay the strip between those two regions.
 pub fn handleApprovalPaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down: bool) bool {
+    if (runtimeBannerActionAt(x, y)) |banner_action| {
+        if (!down) return true;
+        if (runtime_banner_hits.pane_id) |id| _ = state.focusCurrentProjectWorkspacePane(id);
+        const profile_id = runtime_banner_hits.profile_id[0..runtime_banner_hits.profile_id_len];
+        switch (banner_action) {
+            .primary => state.recoverRuntimeFromBanner(profile_id, runtime_banner_hits.recovery),
+            .setup => state.openRuntimeServerSetupGuide(),
+            .diagnostics => state.copyRuntimeDiagnosticsToClipboard(profile_id),
+        }
+        state.noteInteraction();
+        return true;
+    }
     const action = approvalActionAt(x, y) orelse return false;
     if (!down) return true;
 
@@ -7854,6 +8041,122 @@ fn renderComposerDraftImage(state: *app_state.AppState) void {
 }
 
 // Shell-mode banner above the composer, making local command execution explicit.
+// Composer strip: banner for a selected remote runtime that cannot run. Title
+// row carries the badge + runtime label, the detail row explains the typed
+// state, and right-aligned buttons offer recovery on that same runtime.
+fn renderRuntimeBlockBanner(state: *app_state.AppState, rect: palette.Rect, blocker: app_state.RuntimeComposerBlocker, pane_id: ?app_state.WorkspacePaneId) void {
+    const tone = app_state.runtimeStatusTone(blocker.status).color();
+    queuePanel(
+        state,
+        rect,
+        paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 248)),
+        paletteColor(theme.withAlpha(tone, 185)),
+        theme.scaledUi(10.0),
+        @max(theme.scaledUi(1.0), 1.0),
+    );
+
+    const pad = theme.scaledUi(14.0);
+    const button_h = theme.scaledUi(28.0);
+    const button_gap = theme.scaledUi(8.0);
+    const button_font = theme.scaledUi(13.0);
+    const button_pad = theme.scaledUi(12.0);
+    // Minimum room for the badge + first words of the detail; below this the
+    // secondary buttons are shed (diagnostics first, then setup) so text and
+    // buttons never share pixels on a narrow split pane.
+    const min_text_w = theme.scaledUi(96.0);
+    const diagnostics_label = "Copy diagnostics";
+    const setup_label = "Show server setup";
+    const primary_label = app_state.runtimeRecoveryLabel(blocker.recovery, blocker.status);
+    const diagnostics_w = text_measure.textWidth(.ui, button_font, diagnostics_label) + button_pad * 2.0;
+    const setup_w: ?f32 = if (blocker.offers_server_setup and blocker.recovery != .server_setup)
+        text_measure.textWidth(.ui, button_font, setup_label) + button_pad * 2.0
+    else
+        null;
+    const primary_w: f32 = if (blocker.recovery != .none and primary_label.len > 0)
+        text_measure.textWidth(.ui, button_font, primary_label) + button_pad * 2.0
+    else
+        0.0;
+    const plan = planRuntimeBannerButtons(rect.w - pad * 2.0, min_text_w, button_gap, primary_w, setup_w, diagnostics_w);
+
+    // Buttons pack from the right edge; rects stay empty when a button is
+    // not offered or was shed so stale hits cannot fire.
+    var cursor_x = rect.x + rect.w - pad;
+    const button_y = rect.y + (rect.h - button_h) * 0.5;
+    var primary_rect: palette.Rect = .{};
+    var setup_rect: palette.Rect = .{};
+    var diagnostics_rect: palette.Rect = .{};
+
+    if (plan.diagnostics) {
+        cursor_x -= diagnostics_w;
+        diagnostics_rect = .{ .x = cursor_x, .y = button_y, .w = diagnostics_w, .h = button_h };
+        cursor_x -= button_gap;
+    }
+    if (plan.setup) {
+        const w = setup_w.?;
+        cursor_x -= w;
+        setup_rect = .{ .x = cursor_x, .y = button_y, .w = w, .h = button_h };
+        cursor_x -= button_gap;
+    }
+    if (primary_w > 0.0) {
+        cursor_x -= primary_w;
+        primary_rect = .{ .x = cursor_x, .y = button_y, .w = primary_w, .h = button_h };
+        cursor_x -= button_gap;
+    }
+
+    const mouse_x = state.transcript_controller.palette_mouse_x;
+    const mouse_y = state.transcript_controller.palette_mouse_y;
+    const buttons: [3]struct { rect: palette.Rect, label: []const u8, primary: bool } = .{
+        .{ .rect = primary_rect, .label = primary_label, .primary = true },
+        .{ .rect = setup_rect, .label = setup_label, .primary = false },
+        .{ .rect = diagnostics_rect, .label = diagnostics_label, .primary = false },
+    };
+    for (buttons) |button| {
+        if (button.rect.w <= 0.0) continue;
+        const hovered = rectContains(button.rect, mouse_x, mouse_y);
+        const fill = if (button.primary) theme.accent() else theme.COLOR_PANEL_MUTED;
+        queueRounded(state, button.rect, paletteColor(if (hovered) theme.lighten(fill, 0.10) else fill), theme.scaledUi(8.0));
+        if (!button.primary) queueBorder(state, button.rect, paletteColor(if (hovered) theme.COLOR_TEXT_MUTED else theme.borderMuted()), theme.scaledUi(8.0), theme.scaledUi(1.0));
+        queueApprovalButtonLabel(state, button.rect, button.label, paletteColor(if (button.primary or hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED));
+    }
+
+    // Text occupies exactly what the buttons leave. The plan keeps this at
+    // or above `min_text_w` whenever the primary button alone fits; when even
+    // that cannot fit, the text is clipped instead of drawn under a button.
+    const text_w = @max(cursor_x - rect.x - pad, 0.0);
+    var title_buffer: [256]u8 = undefined;
+    const title = std.fmt.bufPrint(&title_buffer, "{s}  ·  {s}", .{
+        app_state.runtimePickerStatusBadge(blocker.status),
+        blocker.label,
+    }) catch app_state.runtimePickerStatusBadge(blocker.status);
+    queueText(state, .{
+        .x = rect.x + pad,
+        .y = rect.y + theme.scaledUi(9.0),
+        .w = text_w,
+        .h = theme.scaledUi(18.0),
+    }, title, paletteColor(tone), theme.scaledUi(12.5), rect);
+
+    var detail_buffer: [320]u8 = undefined;
+    const description = app_state.runtimePickerStatusDescription(blocker.status);
+    const detail = if (blocker.automatic_retry_scheduled)
+        std.fmt.bufPrint(&detail_buffer, "{s}. Retrying automatically (attempt {d}); this thread stays on this runtime.", .{ description, @as(u32, blocker.retry_attempt) + 1 }) catch description
+    else
+        std.fmt.bufPrint(&detail_buffer, "{s}. This thread stays on this runtime; your draft is kept until it can run.", .{description}) catch description;
+    queueText(state, .{
+        .x = rect.x + pad,
+        .y = rect.y + theme.scaledUi(33.0),
+        .w = text_w,
+        .h = theme.scaledUi(18.0),
+    }, detail, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(11.5), rect);
+
+    publishRuntimeBannerHits(.{
+        .pane_id = pane_id,
+        .primary_rect = primary_rect,
+        .setup_rect = setup_rect,
+        .diagnostics_rect = diagnostics_rect,
+        .recovery = blocker.recovery,
+    }, blocker.profile_id);
+}
+
 fn renderBangModeBanner(state: *app_state.AppState, rect: palette.Rect) void {
     const radius = theme.scaledUi(10.0);
     queuePanel(

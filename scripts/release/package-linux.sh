@@ -140,6 +140,17 @@ BUILD_ARGS=(zig build --release=safe -p "$PREFIX_DIR" -Dcpu=baseline -Dbrowser-b
 cd "$DESKTOP_ROOT"
 "${BUILD_ARGS[@]}"
 
+cd "$REPO_ROOT"
+zig build daemon server --release=safe -Dcpu=baseline -Dversion="$VERSION" --prefix "$PREFIX_DIR"
+(
+  cd "$REPO_ROOT/packages/web_app"
+  zig build --release=safe -Dcpu=baseline --prefix "$PREFIX_DIR"
+  bun install --frozen-lockfile
+  bun run build
+)
+rm -rf "$PREFIX_DIR/share/verde/web"
+cp -a "$REPO_ROOT/packages/web_app/dist" "$PREFIX_DIR/share/verde/web"
+
 mkdir -p \
   "$PACKAGE_ROOT/bin" \
   "$PACKAGE_ROOT/share/verde" \
@@ -148,6 +159,9 @@ mkdir -p \
   "$PACKAGE_ROOT/share/icons/hicolor/256x256/apps"
 
 install -m 755 "$PREFIX_DIR/bin/verde" "$PACKAGE_ROOT/bin/verde"
+install -m 755 "$PREFIX_DIR/bin/verde-server" "$PACKAGE_ROOT/bin/verde-server"
+install -m 755 "$PREFIX_DIR/bin/verde-daemon" "$PACKAGE_ROOT/bin/verde-daemon"
+install -m 755 "$PREFIX_DIR/bin/verde-web" "$PACKAGE_ROOT/bin/verde-web"
 install -m 755 "$PREFIX_DIR/bin/libfff_c.so" "$PACKAGE_ROOT/bin/libfff_c.so"
 install -m 755 "$PREFIX_DIR/bin/libSDL3.so" "$PACKAGE_ROOT/bin/libSDL3.so"
 copy_runtime_library "libSDL3_ttf.so" "$PACKAGE_ROOT/bin"
@@ -159,6 +173,7 @@ install -m 644 "$REPO_ROOT/packages/desktop/src/assets/verde_logo.png" "$PACKAGE
 install -m 644 "$REPO_ROOT/packages/desktop/src/assets/verde_logo.png" "$PACKAGE_ROOT/share/icons/hicolor/256x256/apps/verde.png"
 printf '%s\n' "$VERSION" > "$PACKAGE_ROOT/share/verde/VERSION"
 install -m 644 "$PREFIX_DIR/share/verde/provider_bridge.mjs" "$PACKAGE_ROOT/share/verde/provider_bridge.mjs"
+cp -a "$PREFIX_DIR/share/verde/web" "$PACKAGE_ROOT/share/verde/web"
 install -m 755 "$REPO_ROOT/scripts/release/install-linux-local.sh" "$PACKAGE_ROOT/install-local.sh"
 install -m 644 "$REPO_ROOT/README.md" "$PACKAGE_ROOT/README.md"
 
