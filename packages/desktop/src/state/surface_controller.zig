@@ -129,6 +129,8 @@ pub fn updateSurface(self: anytype, update: SurfaceUpdate) !*SurfaceState {
     }
     var s = surface.?;
     var completion_became_pending = false;
+    const previous_status = s.status;
+    var status_changed = false;
     if (update.workspace_id) |value| try replaceOwnedSlice(self.allocator, &s.workspace_id, value);
     if (update.workspace_path) |value| try replaceOwnedSlice(self.allocator, &s.workspace_path, value);
     if (update.dock_id) |value| s.dock_id = value;
@@ -188,7 +190,10 @@ pub fn updateSurface(self: anytype, update: SurfaceUpdate) !*SurfaceState {
     } else {
         if (update.status) |value| {
             const now_ms = update.status_changed_at_ms orelse unixTimestampMs();
-            if (value != s.status) s.status_changed_at_ms = now_ms;
+            if (value != s.status) {
+                s.status_changed_at_ms = now_ms;
+                status_changed = true;
+            }
             s.status = value;
             if (value == .done and !s.completion_pending) {
                 s.completion_pending = true;
@@ -220,10 +225,18 @@ pub fn updateSurface(self: anytype, update: SurfaceUpdate) !*SurfaceState {
             if (update.durability == .durable) try self.storage.upsertSurfaceState(persistedSurfaceState(s));
         }
     }
-    // Notify on the completion edge. Runs on the main thread (live commands
-    // are drained from the main loop), so spawning the notifier here is safe.
-    if (!update.clear and self.app_config.notifications_enabled and completion_became_pending) {
-        fireCompletionNotification(self, s);
+    // Notify on status edges. Runs on the main thread (live commands are
+    // drained from the main loop), so spawning the notifier here is safe.
+    if (!update.clear and self.app_config.notifications_enabled) {
+        if (completion_became_pending) {
+            fireStatusNotification(self, s, .done);
+        } else if (status_changed) {
+            switch (s.status) {
+                .waiting => if (previous_status != .waiting) fireStatusNotification(self, s, .waiting),
+                .@"error" => if (previous_status != .@"error") fireStatusNotification(self, s, .@"error"),
+                else => {},
+            }
+        }
     }
     self.markDirty();
     return s;
@@ -236,8 +249,13 @@ pub fn updateSurface(self: anytype, update: SurfaceUpdate) !*SurfaceState {
 pub fn notifyProjectedCompletionEdges(self: anytype, previous: *const State) void {
     if (!self.app_config.notifications_enabled) return;
     for (self.surface_controller.surfaces.items) |*surface| {
-        if (!projectedCompletionBecamePending(previous, surface)) continue;
-        fireCompletionNotification(self, surface);
+        if (projectedCompletionBecamePending(previous, surface)) {
+            fireStatusNotification(self, surface, .done);
+        } else if (projectedStatusBecame(previous, surface, .waiting)) {
+            fireStatusNotification(self, surface, .waiting);
+        } else if (projectedStatusBecame(previous, surface, .@"error")) {
+            fireStatusNotification(self, surface, .@"error");
+        }
     }
 }
 
@@ -250,6 +268,15 @@ fn projectedCompletionBecamePending(previous: *const State, current: *const Surf
         // while an unchanged timestamp still suppresses replay notifications.
         return !surface.completion_pending or
             (current.completed_at_ms > 0 and current.completed_at_ms > surface.completed_at_ms);
+    }
+    return true;
+}
+
+fn projectedStatusBecame(previous: *const State, current: *const SurfaceState, status: SurfaceStatus) bool {
+    if (current.status != status) return false;
+    for (previous.surfaces.items) |surface| {
+        if (!std.mem.eql(u8, surface.session_id, current.session_id)) continue;
+        return surface.status != status;
     }
     return true;
 }
@@ -306,7 +333,7 @@ fn resolveSurfaceProvider(self: anytype, surface: *const SurfaceState) ?SurfaceP
 // cross-platform notifier. Title prefers the surface's own label, then the
 // provider name; the body names the workspace directory so multiple agents
 // stay distinguishable. The provider also selects the notification logo.
-fn fireCompletionNotification(self: anytype, surface: *const SurfaceState) void {
+fn fireStatusNotification(self: anytype, surface: *const SurfaceState, chime: notifier.Chime) void {
     const provider = resolveSurfaceProvider(self, surface);
     const dir = if (surface.workspace_path.len > 0)
         std.fs.path.basename(surface.workspace_path)
@@ -317,19 +344,51 @@ fn fireCompletionNotification(self: anytype, surface: *const SurfaceState) void 
     const title = if (surface.title.len > 0)
         surface.title
     else if (provider) |p|
-        (std.fmt.bufPrint(&title_buf, "{s} finished", .{surfaceProviderLabel(p)}) catch "Agent finished")
+        (std.fmt.bufPrint(&title_buf, "{s} {s}", .{ surfaceProviderLabel(p), statusVerb(chime) }) catch statusFallbackTitle(chime))
     else
-        "Agent finished";
+        statusFallbackTitle(chime);
 
     var body_buf: [256]u8 = undefined;
     const body = if (dir.len > 0)
-        (std.fmt.bufPrint(&body_buf, "Completed in {s}", .{dir}) catch "Task completed")
+        (std.fmt.bufPrint(&body_buf, "{s} in {s}", .{ statusBodyVerb(chime), dir }) catch statusFallbackBody(chime))
     else
-        "Task completed";
+        statusFallbackBody(chime);
 
     const icon = if (provider) |p| completionNotificationIcon(p) else null;
 
-    notifier.notifyAgentDone(self.allocator, title, body, icon);
+    notifier.notifyAgent(self.allocator, title, body, icon, chime);
+}
+
+fn statusVerb(chime: notifier.Chime) []const u8 {
+    return switch (chime) {
+        .done => "finished",
+        .waiting => "needs input",
+        .@"error" => "failed",
+    };
+}
+
+fn statusFallbackTitle(chime: notifier.Chime) []const u8 {
+    return switch (chime) {
+        .done => "Agent finished",
+        .waiting => "Agent needs input",
+        .@"error" => "Agent failed",
+    };
+}
+
+fn statusBodyVerb(chime: notifier.Chime) []const u8 {
+    return switch (chime) {
+        .done => "Completed",
+        .waiting => "Waiting",
+        .@"error" => "Failed",
+    };
+}
+
+fn statusFallbackBody(chime: notifier.Chime) []const u8 {
+    return switch (chime) {
+        .done => "Task completed",
+        .waiting => "Needs your input",
+        .@"error" => "Agent error",
+    };
 }
 
 fn completionNotificationIcon(provider: SurfaceProvider) ?notifier.Icon {
@@ -373,6 +432,32 @@ test "projected completion edge ignores an already presented completion" {
 
     current.completion_pending = false;
     try std.testing.expect(!projectedCompletionBecamePending(&previous, &current));
+}
+
+test "projected waiting and error edges fire once per transition" {
+    var previous: State = .{};
+    defer previous.surfaces.deinit(std.testing.allocator);
+    try previous.surfaces.append(std.testing.allocator, .{
+        .session_id = @constCast("fx-session"),
+        .title = @constCast("FX task"),
+        .status = .working,
+    });
+
+    var current: SurfaceState = .{
+        .session_id = @constCast("fx-session"),
+        .title = @constCast("FX task"),
+        .status = .waiting,
+    };
+    try std.testing.expect(projectedStatusBecame(&previous, &current, .waiting));
+    try std.testing.expect(!projectedStatusBecame(&previous, &current, .@"error"));
+
+    previous.surfaces.items[0].status = .waiting;
+    try std.testing.expect(!projectedStatusBecame(&previous, &current, .waiting));
+
+    current.status = .@"error";
+    try std.testing.expect(projectedStatusBecame(&previous, &current, .@"error"));
+    previous.surfaces.items[0].status = .@"error";
+    try std.testing.expect(!projectedStatusBecame(&previous, &current, .@"error"));
 }
 
 fn surfaceProviderLabel(provider: SurfaceProvider) []const u8 {
