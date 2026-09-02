@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const platform_paths = @import("platform_paths");
+const provider_models = @import("../state/provider_models.zig");
 const theme = @import("../ui/theme.zig");
 
 const log = std.log.scoped(.native_config);
@@ -320,7 +321,7 @@ pub const AppConfig = struct {
     pub fn chatTitleModel(self: AppConfig) []const u8 {
         return self.chat_title_model orelse switch (self.chat_title_provider) {
             .codex => DEFAULT_CHAT_TITLE_MODEL,
-            .claude => "default",
+            .claude => provider_models.DEFAULT_CLAUDE_MODEL,
             .cursor => "composer-2",
             .opencode => "opencode/gpt-5.4",
         };

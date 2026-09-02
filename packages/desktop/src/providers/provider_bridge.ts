@@ -650,7 +650,7 @@ function buildClaudeOptions(request) {
 function claudeModelDisplayName(model) {
   const fallback = model.displayName ?? model.name ?? model.value ?? model.id ?? String(model);
   const description = typeof model.description === "string" ? model.description : "";
-  const version = description.match(/\b(?:Opus|Sonnet|Haiku)\s+\d+(?:\.\d+)?\b/)?.[0];
+  const version = description.match(/\b(?:Fable|Opus|Sonnet|Haiku)\s+\d+(?:\.\d+)?\b/)?.[0];
   if (!version) return fallback;
 
   const display = String(model.displayName ?? "");
