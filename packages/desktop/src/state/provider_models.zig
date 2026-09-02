@@ -13,7 +13,7 @@ pub const Harness = db_types.Harness;
 pub const DEFAULT_CODEX_MODEL: [:0]const u8 = "gpt-5.6-sol";
 pub const DEFAULT_CODEX_REASONING_EFFORT: ReasoningEffort = .low;
 pub const DEFAULT_OPENCODE_MODEL: [:0]const u8 = "opencode/gpt-5.4";
-pub const DEFAULT_CLAUDE_MODEL: [:0]const u8 = "default";
+pub const DEFAULT_CLAUDE_MODEL: [:0]const u8 = "fable[1m]";
 pub const DEFAULT_CURSOR_MODEL: [:0]const u8 = "composer-2.5";
 pub const DEFAULT_PI_MODEL: [:0]const u8 = "default";
 pub const DEFAULT_FX_MODEL: [:0]const u8 = "default";
@@ -162,9 +162,9 @@ pub const CLAUDE_FULL_EFFORT_VALUES = [_][:0]const u8{ "low", "medium", "high", 
 /// Keep this mirroring the Agent SDK's `supportedModels()` output (labels + ids)
 /// so the picker doesn't flash stale model names while the bridge loads.
 pub const CLAUDE_MODEL_OPTIONS = [_]ModelOption{
-    .{ .label = "Default (Opus 5)", .value = DEFAULT_CLAUDE_MODEL, .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
+    .{ .label = "Fable 5.1", .value = DEFAULT_CLAUDE_MODEL, .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
+    .{ .label = "Default (Opus 5)", .value = "default", .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
     .{ .label = "Opus 5 (1M context)", .value = "opus[1m]", .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
-    .{ .label = "Fable", .value = "claude-fable-5[1m]", .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
     .{ .label = "Sonnet 5", .value = "sonnet", .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
     .{ .label = "Haiku 4.5", .value = "haiku", .reasoning_supported = false },
 };
@@ -274,6 +274,12 @@ test "Codex 5.6 models expose max reasoning" {
     }
     try std.testing.expectEqual(@as(usize, 5), codexReasoningOptions("gpt-5.5").len);
     try std.testing.expectEqual(@as(usize, 5), codexReasoningOptions("gpt-5.3-codex-spark").len);
+}
+
+test "Claude fallback defaults to Fable 5.1" {
+    try std.testing.expectEqualStrings("fable[1m]", DEFAULT_CLAUDE_MODEL);
+    try std.testing.expectEqualStrings("Fable 5.1", CLAUDE_MODEL_OPTIONS[0].label);
+    try std.testing.expectEqualStrings(DEFAULT_CLAUDE_MODEL, CLAUDE_MODEL_OPTIONS[0].value.?);
 }
 
 test "persisted Cursor model cache refreshes duplicate model ids" {

@@ -131,9 +131,9 @@ const CODEX_MODELS: ModelOption[] = [
 ]
 
 const CLAUDE_MODELS: ModelOption[] = [
+  { label: 'Fable 5.1', value: 'fable[1m]', efforts: CLAUDE_FULL_EFFORTS },
   { label: 'Default (Opus 5)', value: 'default', efforts: CLAUDE_FULL_EFFORTS },
   { label: 'Opus 5 (1M context)', value: 'opus[1m]', efforts: CLAUDE_FULL_EFFORTS },
-  { label: 'Fable', value: 'claude-fable-5[1m]', efforts: CLAUDE_FULL_EFFORTS },
   { label: 'Sonnet 5', value: 'sonnet', efforts: CLAUDE_FULL_EFFORTS },
   { label: 'Haiku 4.5', value: 'haiku' },
 ]
