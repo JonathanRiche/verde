@@ -2,7 +2,12 @@ const std = @import("std");
 
 /// Dependency-isolated build for the standalone Verde daemon.
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // Standalone daemon artifacts deploy to other machines (VMs, containers),
+    // so they must never inherit the build host's CPU features: a host with
+    // AVX-512 would emit instructions that SIGILL on a lesser deployment CPU.
+    // Default to the architecture baseline; opt back into host tuning with an
+    // explicit `-Dcpu=native`.
+    const target = b.standardTargetOptions(.{ .default_target = .{ .cpu_model = .baseline } });
     const optimize = b.standardOptimizeOption(.{});
     const version = b.option([]const u8, "version", "Version embedded in verde-daemon") orelse
         b.graph.environ_map.get("VERDE_VERSION") orelse

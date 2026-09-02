@@ -1246,18 +1246,26 @@ fn handleRpc(
         return;
     }
     if (auth_context == .pair) {
-        const required_mask = headless.access_protocol.requiredScopeMaskForRpc(parsed.request.method) orelse {
-            const forbidden = try headless.encodeErrorResponse(
-                allocator,
-                parsed.request.id,
-                "forbidden",
-                "method is not available to paired sessions",
-            );
-            defer allocator.free(forbidden);
-            try respondJson(request, .forbidden, forbidden);
-            return;
-        };
-        if (!try authorizeApiContext(allocator, daemon, auth, auth_context, required_mask, request)) return;
+        switch (pairedRpcPolicy(parsed.request.method, auth_context.pair.scope_mask)) {
+            .forbidden => {
+                const forbidden = try headless.encodeErrorResponse(
+                    allocator,
+                    parsed.request.id,
+                    "forbidden",
+                    "method is not available to paired sessions",
+                );
+                defer allocator.free(forbidden);
+                try respondJson(request, .forbidden, forbidden);
+                return;
+            },
+            .insufficient_scope => {
+                try respondJson(request, .forbidden, "{\"ok\":false,\"error\":\"insufficient_scope\"}");
+                return;
+            },
+            .authorize => |required_mask| {
+                if (!try authorizeApiContext(allocator, daemon, auth, auth_context, required_mask, request)) return;
+            },
+        }
     }
     if (rpcRequestMissingRequiredTarget(parsed.request)) {
         const rejected = try headless.encodeErrorResponse(
@@ -1455,19 +1463,15 @@ const WsSession = struct {
     fn rpcAllowed(self: *WsSession, method: []const u8) bool {
         return switch (self.authentication) {
             .owner_bearer, .owner_session => true,
-            .pair => |claims| allowed: {
-                const required_mask = headless.access_protocol.requiredScopeMaskForRpc(method) orelse
-                    break :allowed false;
-                if (!headless.access_protocol.scopeMaskContains(claims.scope_mask, required_mask)) {
-                    break :allowed false;
-                }
-                break :allowed authorizePairClaims(
+            .pair => |claims| switch (pairedRpcPolicy(method, claims.scope_mask)) {
+                .forbidden, .insufficient_scope => false,
+                .authorize => |required_mask| authorizePairClaims(
                     self.allocator,
                     self.daemon,
                     self.auth,
                     claims,
                     required_mask,
-                );
+                ),
             },
         };
     }
@@ -1810,6 +1814,25 @@ fn webSocketAuthenticationFromOwner(owner: AuthContext) !WsAuthentication {
         },
         .pair => unreachable,
     };
+}
+
+/// Gateway-side decision for one paired-session RPC, shared verbatim by the
+/// HTTP `/api/rpc` and WebSocket forwarding paths. Kept pure so tests can
+/// exercise the exact rejection the gateway emits without a live daemon.
+const PairedRpcPolicy = union(enum) {
+    /// Unknown or owner-only method: never forwarded for a paired session.
+    forbidden,
+    /// Known method, but the session's granted scopes do not cover it.
+    insufficient_scope,
+    /// Forward after the daemon re-authorizes the device for this mask.
+    authorize: u16,
+};
+
+fn pairedRpcPolicy(method: []const u8, scope_mask: u16) PairedRpcPolicy {
+    if (blockedRpcMethod(method)) return .forbidden;
+    const required_mask = headless.access_protocol.requiredScopeMaskForRpc(method) orelse return .forbidden;
+    if (!headless.access_protocol.scopeMaskContains(scope_mask, required_mask)) return .insufficient_scope;
+    return .{ .authorize = required_mask };
 }
 
 fn authorizeApiContext(
@@ -2786,6 +2809,41 @@ test "paired scope policy is shared by HTTP and WebSocket forwarding" {
     );
     try std.testing.expect(headless.access_protocol.requiredScopeMaskForRpc("daemon.stop") == null);
     try std.testing.expect(headless.access_protocol.requiredScopeMaskForRpc("web.directory.list") == null);
+}
+
+test "paired gateway forwards staged attachment uploads with default device scopes" {
+    // Regression: a gateway built without the attachment allowlist answered
+    // chat.attachment.* with `forbidden` even though the daemon advertised
+    // chat.attachments.v1. Drive the exact gateway decision both transports
+    // use, not just the headless lookup.
+    const default_mask = try headless.access_protocol.scopeMask(&headless.access_protocol.DEFAULT_SCOPE_NAMES);
+    const chat_write = headless.access_protocol.scopeBit(.chat_write);
+    const upload_methods = [_][]const u8{
+        headless.attachment_protocol.METHOD_CHAT_ATTACHMENT_CREATE,
+        headless.attachment_protocol.METHOD_CHAT_ATTACHMENT_APPEND,
+        headless.attachment_protocol.METHOD_CHAT_ATTACHMENT_COMMIT,
+        "chat.turn.start",
+    };
+    for (upload_methods) |method| {
+        try std.testing.expect(!blockedRpcMethod(method));
+        switch (pairedRpcPolicy(method, default_mask)) {
+            .authorize => |mask| try std.testing.expectEqual(chat_write, mask),
+            .forbidden, .insufficient_scope => return error.UploadMethodNotForwarded,
+        }
+        // A read-only device must be refused for scope, not treated as an
+        // unknown method.
+        try std.testing.expectEqual(
+            PairedRpcPolicy.insufficient_scope,
+            pairedRpcPolicy(method, headless.access_protocol.scopeBit(.chat_read)),
+        );
+    }
+    // Owner-only and unknown methods stay closed regardless of scope.
+    try std.testing.expectEqual(PairedRpcPolicy.forbidden, pairedRpcPolicy("daemon.stop", default_mask));
+    try std.testing.expectEqual(PairedRpcPolicy.forbidden, pairedRpcPolicy("web.directory.list", default_mask));
+    try std.testing.expectEqual(
+        PairedRpcPolicy.forbidden,
+        pairedRpcPolicy(headless.access_protocol.METHOD_DAEMON_DEVICE_REVOKE, default_mask),
+    );
 }
 
 test "durable device rejection is distinguished from daemon failure" {

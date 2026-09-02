@@ -808,6 +808,19 @@ fn overlayCurrentThreadEdits(
 ) !void {
     if (!std.mem.eql(u8, current.title, baseline.title)) remote.title = current.title;
     if (current.archived != baseline.archived) remote.archived = current.archived;
+    if (!baseline.committed and current.committed and !remote.committed) {
+        // A close-time spool may contain the first durable action for a draft
+        // while SQLite still holds its revision-paired uncommitted baseline.
+        // Replay that promotion only if the durable route did not also move.
+        if (!persistedThreadRoutesEqual(remote.*, baseline)) {
+            return error.CommittedThreadRouteConflict;
+        }
+        remote.committed = true;
+        remote.profile_id = current.profile_id;
+        remote.runtime_id = current.runtime_id;
+        remote.repository_id = current.repository_id;
+        remote.repository_cwd = current.repository_cwd;
+    }
     const route_locked = baseline.committed or current.committed or remote.committed;
     if (route_locked and !remote.committed) return error.CommittedThreadRouteConflict;
     if (!route_locked and current.committed != baseline.committed) remote.committed = current.committed;
@@ -847,6 +860,13 @@ fn overlayCurrentThreadEdits(
 fn persistedThreadRouteAbsent(thread: PersistedThread) bool {
     return thread.profile_id == null and thread.runtime_id == null and
         thread.repository_id == null and thread.repository_cwd == null;
+}
+
+fn persistedThreadRoutesEqual(a: PersistedThread, b: PersistedThread) bool {
+    return optionalSliceEqual(a.profile_id, b.profile_id) and
+        optionalSliceEqual(a.runtime_id, b.runtime_id) and
+        optionalSliceEqual(a.repository_id, b.repository_id) and
+        optionalSliceEqual(a.repository_cwd, b.repository_cwd);
 }
 
 fn committedMergeRoutesCompatible(remote: PersistedThread, current: PersistedThread) bool {
@@ -906,6 +926,32 @@ test "committed thread merge never downgrades an immutable route to legacy local
     try std.testing.expectEqualStrings(
         "0123456789abcdef0123456789abcdef",
         omitted_pin.runtime_id.?,
+    );
+}
+
+test "thread merge replays a revision-paired local route commitment" {
+    const baseline: PersistedThread = .{
+        .title = "Remote draft",
+        .profile_id = "remote-box",
+        .repository_id = "primary",
+    };
+    const committed: PersistedThread = .{
+        .title = "Remote draft",
+        .committed = true,
+        .profile_id = "remote-box",
+        .runtime_id = "0123456789abcdef0123456789abcdef",
+        .repository_id = "primary",
+    };
+    var durable = baseline;
+    try overlayCurrentThreadEdits(&durable, baseline, committed);
+    try std.testing.expect(durable.committed);
+    try std.testing.expectEqualStrings(committed.runtime_id.?, durable.runtime_id.?);
+
+    var moved_durable = baseline;
+    moved_durable.profile_id = "other-box";
+    try std.testing.expectError(
+        error.CommittedThreadRouteConflict,
+        overlayCurrentThreadEdits(&moved_durable, baseline, committed),
     );
 }
 
@@ -2062,6 +2108,10 @@ pub const PaletteModalAction = enum {
     thread_import_input,
     project_import_name_input,
     project_import_input,
+    workspace_settings_close,
+    /// index = option row in the workspace default-runtime list.
+    workspace_settings_option,
+    workspace_settings_manage,
     settings_cancel,
     settings_close,
     settings_save,
@@ -3266,6 +3316,11 @@ pub const RuntimePickerStatus = enum {
     /// The runtime rejected the paired device credential: revoked or the
     /// device record is gone. Only this (and grant states) leads to Re-pair.
     device_revoked,
+    /// The gateway refused the short-lived session bearer while the
+    /// persistent device credential is still held: a stale session after a
+    /// daemon restart/upgrade or a generic unauthorized. Transient and
+    /// retryable with the same credential; never offers Re-pair.
+    session_auth_failed,
     /// Session is open but this workspace has no remote binding.
     workspace_binding_missing,
     /// Session is open but the selected provider is not installed there.
@@ -3302,7 +3357,10 @@ pub const RuntimeRecovery = enum {
 
 pub fn runtimeStatusRecovery(status: RuntimePickerStatus) RuntimeRecovery {
     return switch (status) {
-        .offline, .paired_offline, .connection_failed, .server_unavailable, .invalid_protocol, .failed, .rate_limited, .limited, .credential_store_unavailable => .retry,
+        .offline, .paired_offline, .connection_failed, .server_unavailable, .invalid_protocol, .failed, .rate_limited, .limited, .credential_store_unavailable, .session_auth_failed => .retry,
+        // Automatic backoff is already running; the button is only a manual
+        // accelerator that starts the next attempt immediately.
+        .reconnecting => .retry,
         .credential_required, .authentication_failed => .credential,
         .pairing_required, .pairing_rejected, .device_revoked => .repair,
         .trust_required => .review_trust,
@@ -3312,7 +3370,7 @@ pub fn runtimeStatusRecovery(status: RuntimePickerStatus) RuntimeRecovery {
         // secondary (`runtimeStatusOffersServerSetup`); the primary must
         // re-probe once that fix has been applied.
         .workspace_binding_missing, .provider_unavailable, .provider_not_authenticated => .reconnect,
-        .connecting, .handshaking, .reconnecting, .ready, .unavailable => .none,
+        .connecting, .handshaking, .ready, .unavailable => .none,
     };
 }
 
@@ -3334,7 +3392,8 @@ pub fn runtimeRecoveryLabel(recovery: RuntimeRecovery, status: RuntimePickerStat
         },
         .retry => switch (status) {
             .offline, .paired_offline => "Connect",
-            .limited => "Reconnect",
+            .limited, .session_auth_failed => "Reconnect",
+            .reconnecting => "Retry now",
             else => "Retry",
         },
         .reconnect => "Reconnect",
@@ -3369,7 +3428,7 @@ pub fn runtimeStatusTone(status: RuntimePickerStatus) RuntimeStatusTone {
     return switch (status) {
         .ready => .success,
         .connecting, .handshaking, .reconnecting, .limited, .trust_required, .credential_required, .offline, .paired_offline, .pairing_required, .rate_limited, .runtime_selection_required => .muted,
-        .workspace_binding_missing, .provider_unavailable, .provider_not_authenticated, .server_unavailable => .warning,
+        .workspace_binding_missing, .provider_unavailable, .provider_not_authenticated, .server_unavailable, .session_auth_failed => .warning,
         .authentication_failed, .identity_mismatch, .connection_failed, .failed, .unsupported, .unavailable, .pairing_rejected, .not_verde_runtime, .invalid_protocol, .device_revoked, .credential_store_unavailable => .danger,
     };
 }
@@ -3471,8 +3530,11 @@ fn failureReasonStatus(snapshot: RuntimeService.Snapshot, reason: RuntimeService
         .authentication_required => if (snapshot.failure) |failure| switch (failure) {
             .missing_credential => credentialMissingStatus(snapshot),
             .pairing_rejected => if (snapshot.access == .connect) .runtime_selection_required else .pairing_rejected,
-            else => authenticationRejectedStatus(snapshot),
-        } else authenticationRejectedStatus(snapshot),
+            .rate_limited => .rate_limited,
+            else => sessionAuthFailedStatus(snapshot),
+        } else sessionAuthFailedStatus(snapshot),
+        // Only the manager's explicit revocation reason (set solely on the
+        // device-auth endpoint's authoritative rejection) reads as revoked.
         .device_credential_revoked => authenticationRejectedStatus(snapshot),
         // A malformed stored credential needs re-entry / re-pair, same as a
         // missing one.
@@ -3498,6 +3560,21 @@ fn authenticationRejectedStatus(snapshot: RuntimeService.Snapshot) RuntimePicker
     };
 }
 
+/// Generic unauthorized while a persistent device credential is still held:
+/// stale bearer after a daemon restart, expired session, or an unclassified
+/// 401. Retryable with the held credential; a missing credential falls back
+/// to the real pairing/entry flow and only `device_credential_revoked` may
+/// read as revoked.
+fn sessionAuthFailedStatus(snapshot: RuntimeService.Snapshot) RuntimePickerStatus {
+    return switch (snapshot.access) {
+        .paired_device, .connect => if (snapshot.device_credential_held)
+            .session_auth_failed
+        else
+            credentialMissingStatus(snapshot),
+        .admin_token => .authentication_failed,
+    };
+}
+
 fn runtimeCredentialRecoveryAction(snapshot: RuntimeService.Snapshot) RuntimeActivationAction {
     return switch (snapshot.access) {
         .paired_device => .request_pairing,
@@ -3510,7 +3587,7 @@ fn legacyFailureStatus(snapshot: RuntimeService.Snapshot, failure: RuntimeFailur
     return switch (failure) {
         .missing_credential => credentialMissingStatus(snapshot),
         .unsupported_transport => if (snapshot.access == .connect) .runtime_selection_required else .unsupported,
-        .authentication => authenticationRejectedStatus(snapshot),
+        .authentication => sessionAuthFailedStatus(snapshot),
         .identity => .identity_mismatch,
         .network, .no_loopback_port, .tunnel_spawn, .tunnel_readiness, .tunnel_wait, .tunnel_exited => .connection_failed,
         .protocol => .invalid_protocol,
@@ -3523,11 +3600,23 @@ fn legacyFailureStatus(snapshot: RuntimeService.Snapshot, failure: RuntimeFailur
 fn runtimeActivationAction(snapshot: RuntimeService.Snapshot) RuntimeActivationAction {
     if (snapshot.access == .connect and (snapshot.device_id == null or !snapshot.device_credential_held)) return .request_runtime_selection;
     if (snapshot.failure_reason) |reason| switch (reason) {
-        .authentication_required, .credential_invalid, .device_credential_revoked => return runtimeCredentialRecoveryAction(snapshot),
+        .credential_invalid, .device_credential_revoked => return runtimeCredentialRecoveryAction(snapshot),
+        // Generic unauthorized with the persistent device credential still
+        // held is transient: retry with the same credential. The pair modal
+        // is reserved for a truly missing credential or explicit revocation;
+        // admin-token profiles re-enter the bearer as before.
+        .authentication_required => switch (snapshot.access) {
+            .admin_token => return runtimeCredentialRecoveryAction(snapshot),
+            .paired_device, .connect => if (!snapshot.device_credential_held or snapshot.failure == .missing_credential) {
+                return runtimeCredentialRecoveryAction(snapshot);
+            },
+        },
         else => {},
     };
     if (snapshot.failure) |failure| {
-        if (failure == .missing_credential or failure == .authentication or failure == .pairing_rejected) {
+        if (failure == .missing_credential or failure == .pairing_rejected or
+            (failure == .authentication and (snapshot.access == .admin_token or !snapshot.device_credential_held)))
+        {
             return runtimeCredentialRecoveryAction(snapshot);
         }
     }
@@ -3540,7 +3629,10 @@ fn runtimeActivationAction(snapshot: RuntimeService.Snapshot) RuntimeActivationA
         .ready => if (!snapshot.execution_ready or
             !snapshot.repository_manifest_capable or
             !snapshot.repository_chat_route_capable) .reconnect else .none,
-        .connecting, .handshaking, .awaiting_trust, .reconnecting => .none,
+        // A scheduled reconnect accepts a manual "Retry now" that starts the
+        // due attempt immediately with the held credential.
+        .reconnecting => .retry,
+        .connecting, .handshaking, .awaiting_trust => .none,
     };
 }
 
@@ -3577,6 +3669,7 @@ pub fn runtimePickerStatusBadge(status: RuntimePickerStatus) []const u8 {
         .invalid_protocol => "Invalid protocol",
         .server_unavailable => "Server unavailable",
         .device_revoked => "Device revoked",
+        .session_auth_failed => "Session expired",
         .workspace_binding_missing => "No workspace binding",
         .provider_unavailable => "Provider unavailable",
         .provider_not_authenticated => "Provider not signed in",
@@ -3608,6 +3701,7 @@ pub fn runtimePickerStatusDescription(status: RuntimePickerStatus) []const u8 {
         .invalid_protocol => "The runtime replied with an invalid or incompatible protocol response",
         .server_unavailable => "The runtime is reachable but reports it is unavailable",
         .device_revoked => "The runtime no longer accepts this device; it was revoked or replaced",
+        .session_auth_failed => "The session expired (often a daemon restart); reconnect uses the saved device credential",
         .workspace_binding_missing => "Connected, but this workspace has no binding on the runtime",
         .provider_unavailable => "Connected, but the selected provider is not available on the runtime",
         .provider_not_authenticated => "Connected, but the selected provider is not signed in on the runtime",
@@ -4489,6 +4583,12 @@ pub const AppState = struct {
     /// mapping behaves as Local and never rewrites an existing thread route.
     workspace_runtime_defaults: ?runtime_workspace_defaults.OwnedWorkspaceRuntimeDefaults = null,
     runtime_poll_failure_logged: bool = false,
+    /// Workspace Settings modal binding: the owned id of the workspace the
+    /// modal was opened for. Held by id, not index, so the modal stays on
+    /// that workspace even if selection or ordering changes while open.
+    workspace_settings_project_id: ?[]u8 = null,
+    workspace_settings_notice_storage: [192:0]u8 = @splat(0),
+    workspace_settings_scroll_y: f32 = 0.0,
     /// The only UI-owned bearer copy. It exists solely while the masked
     /// credential modal is open and is securely zeroed before every reset.
     runtime_credential_profile_id: ?[]u8,
@@ -4838,6 +4938,138 @@ pub const AppState = struct {
         self.setSidebarNotice("Future chats in this workspace will use the selected runtime by default.");
     }
 
+    /// Opens Workspace Settings bound to the workspace at `index`. The
+    /// binding is by workspace id so later selection changes cannot retarget
+    /// the modal.
+    pub fn openWorkspaceSettingsForProject(self: *AppState, index: usize) void {
+        if (index >= self.project_controller.projects.items.len) return;
+        const owned = self.allocator.dupe(u8, self.project_controller.projects.items[index].id) catch {
+            self.setSidebarNotice("Could not open workspace settings.");
+            return;
+        };
+        if (self.workspace_settings_project_id) |existing| self.allocator.free(existing);
+        self.workspace_settings_project_id = owned;
+        @memset(&self.workspace_settings_notice_storage, 0);
+        self.workspace_settings_scroll_y = 0.0;
+        self.closeSidebarContextMenu();
+        // Like the global Settings modal: no hidden field may retain text
+        // focus while the modal owns the frame.
+        self.palette_modal_text_focus = .none;
+        self.blurPaletteComposer();
+        self.markDirty();
+    }
+
+    pub fn workspaceSettingsOpen(self: *const AppState) bool {
+        return self.workspace_settings_project_id != null;
+    }
+
+    pub fn closeWorkspaceSettings(self: *AppState) void {
+        if (self.workspace_settings_project_id) |id| self.allocator.free(id);
+        self.workspace_settings_project_id = null;
+        @memset(&self.workspace_settings_notice_storage, 0);
+        self.markDirty();
+    }
+
+    /// Resolves the bound workspace, or null when it was closed or archived
+    /// while the modal was open.
+    pub fn workspaceSettingsProject(self: *const AppState) ?*const Project {
+        const bound = self.workspace_settings_project_id orelse return null;
+        for (self.project_controller.projects.items) |*project| {
+            if (std.mem.eql(u8, project.id, bound)) return project;
+        }
+        return null;
+    }
+
+    pub fn workspaceSettingsNotice(self: *const AppState) []const u8 {
+        return std.mem.sliceTo(self.workspace_settings_notice_storage[0..], 0);
+    }
+
+    fn setWorkspaceSettingsNotice(self: *AppState, value: []const u8) void {
+        @memset(&self.workspace_settings_notice_storage, 0);
+        const len = @min(value.len, self.workspace_settings_notice_storage.len - 1);
+        @memcpy(self.workspace_settings_notice_storage[0..len], value[0..len]);
+        self.markDirty();
+    }
+
+    /// One selectable row in the workspace default-runtime list. Slices are
+    /// borrowed for the current frame; `status` is null for Local, which has
+    /// no connection lifecycle.
+    pub const WorkspaceRuntimeOption = struct {
+        profile_id: []const u8,
+        label: []const u8,
+        status: ?RuntimePickerStatus,
+        is_current: bool,
+    };
+
+    /// Local plus every configured picker-visible runtime profile.
+    pub fn workspaceSettingsOptionCount(self: *const AppState) usize {
+        return 1 + self.runtime_picker_profiles.items.len;
+    }
+
+    /// Effective default for the bound workspace with the same stale-profile
+    /// fallback new chats use: a removed profile resolves to Local instead of
+    /// pointing at nothing.
+    fn workspaceSettingsEffectiveDefault(self: *const AppState) []const u8 {
+        const bound = self.workspace_settings_project_id orelse return runtime_workspace_defaults.LOCAL_PROFILE_ID;
+        const configured = self.workspaceRuntimeDefaultProfile(bound);
+        return if (self.runtimeProfileAvailableForWorkspaceDefault(configured))
+            configured
+        else
+            runtime_workspace_defaults.LOCAL_PROFILE_ID;
+    }
+
+    pub fn workspaceSettingsOptionAt(self: *const AppState, index: usize) ?WorkspaceRuntimeOption {
+        const current = self.workspaceSettingsEffectiveDefault();
+        if (index == 0) {
+            return .{
+                .profile_id = runtime_workspace_defaults.LOCAL_PROFILE_ID,
+                .label = "Local",
+                .status = null,
+                .is_current = std.mem.eql(u8, current, runtime_workspace_defaults.LOCAL_PROFILE_ID),
+            };
+        }
+        const profile_index = index - 1;
+        if (profile_index >= self.runtime_picker_profiles.items.len) return null;
+        const configured = self.runtime_picker_profiles.items[profile_index];
+        const label = if (self.runtimeProfileSnapshot(configured.profile_id)) |snapshot|
+            snapshot.label
+        else
+            configured.profile_id;
+        return .{
+            .profile_id = configured.profile_id,
+            .label = label,
+            .status = self.runtimeProfileStatus(configured.profile_id),
+            .is_current = std.mem.eql(u8, current, configured.profile_id),
+        };
+    }
+
+    /// Persists the chosen default for the bound workspace only. Existing
+    /// threads keep their routes; only future chats read this mapping.
+    pub fn applyWorkspaceSettingsOption(self: *AppState, index: usize) void {
+        const bound = self.workspace_settings_project_id orelse return;
+        const option = self.workspaceSettingsOptionAt(index) orelse return;
+        self.persistWorkspaceRuntimeDefault(bound, option.profile_id) catch |err| {
+            log.warn("workspace settings default failed: {s}", .{@errorName(err)});
+            self.setWorkspaceSettingsNotice(if (err == error.RuntimeProfileNotFound)
+                "That runtime is no longer configured; the default was not changed."
+            else
+                "Could not save the workspace default.");
+            return;
+        };
+        self.setWorkspaceSettingsNotice(if (option.status == null)
+            "Saved. New chats in this workspace start on Local."
+        else
+            "Saved. New chats in this workspace start on this runtime.");
+    }
+
+    /// Routes to global Runtimes & connections instead of duplicating
+    /// connection management inside workspace settings.
+    pub fn openManageConnectionsFromWorkspaceSettings(self: *AppState) void {
+        self.closeWorkspaceSettings();
+        self.openSettingsModal();
+        self.settings_controller.scroll_to_runtimes = true;
+    }
+
     /// Sets Local as the explicit default for future drafts without changing
     /// any thread that already exists.
     pub fn useLocalAsWorkspaceRuntimeDefault(self: *AppState) void {
@@ -5148,6 +5380,7 @@ pub const AppState = struct {
             self.handoff_controller.modal_open or
             self.project_controller.show_creator or
             self.settings_controller.modal_visible or
+            self.workspaceSettingsOpen() or
             self.runtime_connections.wizard_open or
             self.command_controller.open or
             self.prefix_armed or
@@ -12040,6 +12273,9 @@ pub const AppState = struct {
                 .settings_new_chat_model_option,
                 .settings_new_chat_reasoning_option,
                 .settings_close,
+                .workspace_settings_close,
+                .workspace_settings_option,
+                .workspace_settings_manage,
                 .settings_cancel,
                 .settings_save,
                 .command_palette_row,
@@ -13164,6 +13400,8 @@ pub const AppState = struct {
         runtime_log.diagnostic("AppState.deinit runtime service released", .{});
         if (self.workspace_runtime_defaults) |*defaults| defaults.deinit(self.allocator);
         self.workspace_runtime_defaults = null;
+        if (self.workspace_settings_project_id) |id| self.allocator.free(id);
+        self.workspace_settings_project_id = null;
         self.change_cursor_loop.join();
         runtime_log.diagnostic("AppState.deinit change cursor loop joined", .{});
         _ = self.pollSend();
@@ -15309,10 +15547,21 @@ test "runtime picker status separates paired-offline, non-Verde endpoints, and r
     try std.testing.expectEqual(RuntimePickerStatus.invalid_protocol, runtimePickerStatus(snapshot));
     snapshot.failure_reason = .server_unavailable;
     try std.testing.expectEqual(RuntimePickerStatus.server_unavailable, runtimePickerStatus(snapshot));
+    // Generic unauthorized with the persistent device credential still held
+    // (stale bearer after a daemon restart) is transient: retry, never the
+    // pair modal, never "Device revoked".
     snapshot.failure = .authentication;
     snapshot.failure_reason = .authentication_required;
-    try std.testing.expectEqual(RuntimePickerStatus.device_revoked, runtimePickerStatus(snapshot));
+    try std.testing.expectEqual(RuntimePickerStatus.session_auth_failed, runtimePickerStatus(snapshot));
+    try std.testing.expectEqual(RuntimeActivationAction.retry, runtimeActivationAction(snapshot));
+    try std.testing.expectEqual(RuntimeRecovery.retry, runtimeStatusRecovery(.session_auth_failed));
+    try std.testing.expectEqualStrings("Reconnect", runtimeRecoveryLabel(.retry, .session_auth_failed));
+    // The same generic failure without the credential falls back to pairing.
+    snapshot.device_credential_held = false;
+    try std.testing.expectEqual(RuntimePickerStatus.pairing_required, runtimePickerStatus(snapshot));
     try std.testing.expectEqual(RuntimeActivationAction.request_pairing, runtimeActivationAction(snapshot));
+    snapshot.device_credential_held = true;
+    // Only the explicit revocation reason reads as revoked and offers Re-pair.
     snapshot.failure = null;
     snapshot.failure_reason = .device_credential_revoked;
     try std.testing.expectEqual(RuntimePickerStatus.device_revoked, runtimePickerStatus(snapshot));
@@ -15334,8 +15583,14 @@ test "runtime picker status separates paired-offline, non-Verde endpoints, and r
     snapshot.access = .connect;
     snapshot.device_id = "0123456789abcdef0123456789abcdef";
     snapshot.device_credential_held = true;
+    // Connect with a bootstrapped runtime device credential behaves like a
+    // paired device: a generic 401 retries rather than reopening selection.
+    try std.testing.expectEqual(RuntimePickerStatus.session_auth_failed, runtimePickerStatus(snapshot));
+    try std.testing.expectEqual(RuntimeActivationAction.retry, runtimeActivationAction(snapshot));
+    snapshot.device_credential_held = false;
     try std.testing.expectEqual(RuntimePickerStatus.runtime_selection_required, runtimePickerStatus(snapshot));
     try std.testing.expectEqual(RuntimeActivationAction.request_runtime_selection, runtimeActivationAction(snapshot));
+    snapshot.device_credential_held = true;
     // `unknown` defers to the coarse failure; the legacy path stays honest.
     snapshot.failure = .resource;
     snapshot.failure_reason = .unknown;
@@ -15367,6 +15622,12 @@ test "runtime recovery routes only credential states to re-pair" {
     try std.testing.expectEqual(RuntimeRecovery.retry, runtimeStatusRecovery(.paired_offline));
     try std.testing.expectEqualStrings("Connect", runtimeRecoveryLabel(.retry, .paired_offline));
     try std.testing.expectEqualStrings("Retry", runtimeRecoveryLabel(.retry, .connection_failed));
+    // Transient auth states retry with the held credential and a scheduled
+    // reconnect exposes a manual accelerator; neither ever reads as revoked.
+    try std.testing.expectEqual(RuntimeRecovery.retry, runtimeStatusRecovery(.session_auth_failed));
+    try std.testing.expectEqualStrings("Reconnect", runtimeRecoveryLabel(.retry, .session_auth_failed));
+    try std.testing.expectEqual(RuntimeRecovery.retry, runtimeStatusRecovery(.reconnecting));
+    try std.testing.expectEqualStrings("Retry now", runtimeRecoveryLabel(.retry, .reconnecting));
     // Readiness failures re-probe as the primary and keep the server-side
     // guide reachable as a secondary, so neither affordance is lost.
     inline for (.{ RuntimePickerStatus.workspace_binding_missing, .provider_unavailable, .provider_not_authenticated }) |status| {
@@ -15579,6 +15840,95 @@ test "GUI new-chat defaults apply configured provider model and reasoning" {
     try std.testing.expectEqual(Provider.codex, thread.provider);
     try std.testing.expectEqualStrings("gpt-5.6-terra", thread.model_ref.?);
     try std.testing.expectEqual(ReasoningEffort.max, thread.reasoning_effort.?);
+}
+
+test "workspace settings modal stays bound by id and marks the effective default" {
+    const allocator = std.testing.allocator;
+    const remote_profile_id = "profile-0123456789abcdef0123456789abcdef";
+
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.lifecycle = .{};
+    state.sidebar_context_menu_open = false;
+    // The opener blurs the composer, so the widget must be a real instance.
+    state.palette_modal_text_focus = .none;
+    state.composer_controller.composer = PaletteComposerPrompt.init();
+    state.composer_controller.focused = false;
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    state.runtime_picker_profiles = .empty;
+    state.runtime_service = null;
+    state.workspace_runtime_defaults = null;
+    state.workspace_settings_project_id = null;
+    state.workspace_settings_notice_storage = @splat(0);
+    state.workspace_settings_scroll_y = 0.0;
+    defer {
+        if (state.workspace_settings_project_id) |id| allocator.free(id);
+        if (state.workspace_runtime_defaults) |*owned| owned.deinit(allocator);
+        for (state.runtime_picker_profiles.items) |*profile| profile.deinit(allocator);
+        state.runtime_picker_profiles.deinit(allocator);
+        for (state.project_controller.projects.items) |*entry| entry.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+    }
+
+    inline for (.{ .{ "workspace-a", "Alpha" }, .{ "workspace-b", "Beta" } }) |spec| {
+        var entry = try Project.init(allocator, spec[0], spec[1], "/tmp/workspace-settings", 0);
+        state.project_controller.projects.append(allocator, entry) catch |err| {
+            entry.deinit(allocator);
+            return err;
+        };
+    }
+    const defaults = try allocator.alloc(runtime_workspace_defaults.WorkspaceRuntimeDefault, 1);
+    defaults[0] = .{
+        .workspace_id = try allocator.dupe(u8, "workspace-a"),
+        .profile_id = try allocator.dupe(u8, remote_profile_id),
+    };
+    state.workspace_runtime_defaults = .{ .items = defaults };
+    try state.runtime_picker_profiles.append(allocator, .{
+        .profile_id = try allocator.dupe(u8, remote_profile_id),
+        .status = .offline,
+    });
+
+    state.openWorkspaceSettingsForProject(0);
+    try std.testing.expect(state.workspaceSettingsOpen());
+    try std.testing.expectEqualStrings("Alpha", state.workspaceSettingsProject().?.label);
+
+    // Selecting another workspace later must not retarget the open modal.
+    state.project_controller.selected_index = 1;
+    try std.testing.expectEqualStrings("Alpha", state.workspaceSettingsProject().?.label);
+
+    try std.testing.expectEqual(@as(usize, 2), state.workspaceSettingsOptionCount());
+    const local_option = state.workspaceSettingsOptionAt(0).?;
+    try std.testing.expectEqualStrings(runtime_workspace_defaults.LOCAL_PROFILE_ID, local_option.profile_id);
+    try std.testing.expect(local_option.status == null);
+    try std.testing.expect(!local_option.is_current);
+    const remote_option = state.workspaceSettingsOptionAt(1).?;
+    try std.testing.expectEqualStrings(remote_profile_id, remote_option.profile_id);
+    try std.testing.expect(remote_option.is_current);
+    try std.testing.expect(state.workspaceSettingsOptionAt(2) == null);
+
+    // A removed profile falls back to Local, matching new-chat behavior.
+    for (state.runtime_picker_profiles.items) |*profile| profile.deinit(allocator);
+    state.runtime_picker_profiles.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(usize, 1), state.workspaceSettingsOptionCount());
+    try std.testing.expect(state.workspaceSettingsOptionAt(0).?.is_current);
+
+    state.closeWorkspaceSettings();
+    try std.testing.expect(!state.workspaceSettingsOpen());
+    try std.testing.expect(state.workspaceSettingsProject() == null);
+
+    // Opening the modal blurs any focused text surface, and an asynchronous
+    // runtime trust/onboarding proposal must not interrupt the open modal.
+    const source = @embedFile("state.zig");
+    const open_start = std.mem.indexOf(u8, source, "pub fn openWorkspaceSettingsForProject").?;
+    const open_end = std.mem.indexOfPos(u8, source, open_start, "pub fn workspaceSettingsOpen").?;
+    const open_path = source[open_start..open_end];
+    try std.testing.expect(std.mem.indexOf(u8, open_path, "self.palette_modal_text_focus = .none") != null);
+    try std.testing.expect(std.mem.indexOf(u8, open_path, "self.blurPaletteComposer()") != null);
+    const blocked_start = std.mem.indexOf(u8, source, "fn runtimeOnboardingPresentationBlocked").?;
+    const blocked_end = std.mem.indexOfPos(u8, source, blocked_start, "fn maybePresentRuntimeTrustProposal").?;
+    const blocked_path = source[blocked_start..blocked_end];
+    try std.testing.expect(std.mem.indexOf(u8, blocked_path, "self.workspaceSettingsOpen() or") != null);
 }
 
 test "workspace runtime default affects future drafts while each thread can override" {

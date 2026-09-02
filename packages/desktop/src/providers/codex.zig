@@ -181,6 +181,40 @@ fn turnSteerRequestPayloadAlloc(
     return writer.toOwnedSlice();
 }
 
+/// Serialize turn/start input items: prompt text, then each local image. The
+/// legacy single `image` is compatibility-only and is skipped when the full
+/// `images` list already carries the same path, so one attachment never
+/// serializes twice (matching the Claude/Pi/ACP de-duplication contract).
+fn writeTurnStartInputItems(stringify: *std.json.Stringify, request: provider_types.SendPromptRequest) !void {
+    try stringify.beginObject();
+    try stringify.objectField("type");
+    try stringify.write("text");
+    try stringify.objectField("text");
+    try stringify.write(request.prompt);
+    try stringify.endObject();
+    if (request.image) |image| {
+        if (!turnInputImagesContainPath(request.images, image.path))
+            try writeLocalImageInputItem(stringify, image.path);
+    }
+    for (request.images) |image| try writeLocalImageInputItem(stringify, image.path);
+}
+
+fn writeLocalImageInputItem(stringify: *std.json.Stringify, path: []const u8) !void {
+    try stringify.beginObject();
+    try stringify.objectField("type");
+    try stringify.write("localImage");
+    try stringify.objectField("path");
+    try stringify.write(path);
+    try stringify.endObject();
+}
+
+fn turnInputImagesContainPath(images: []const provider_types.ImageAttachment, path: []const u8) bool {
+    for (images) |image| {
+        if (std.mem.eql(u8, image.path, path)) return true;
+    }
+    return false;
+}
+
 pub const Client = struct {
     allocator: std.mem.Allocator,
     config: Config,
@@ -1324,28 +1358,7 @@ pub const Client = struct {
         try writeTurnPolicyOverrides(&stringify, request);
         try stringify.objectField("input");
         try stringify.beginArray();
-        try stringify.beginObject();
-        try stringify.objectField("type");
-        try stringify.write("text");
-        try stringify.objectField("text");
-        try stringify.write(request.prompt);
-        try stringify.endObject();
-        if (request.image) |image| {
-            try stringify.beginObject();
-            try stringify.objectField("type");
-            try stringify.write("localImage");
-            try stringify.objectField("path");
-            try stringify.write(image.path);
-            try stringify.endObject();
-        }
-        for (request.images) |image| {
-            try stringify.beginObject();
-            try stringify.objectField("type");
-            try stringify.write("localImage");
-            try stringify.objectField("path");
-            try stringify.write(image.path);
-            try stringify.endObject();
-        }
+        try writeTurnStartInputItems(&stringify, request);
         try stringify.endArray();
         try stringify.endObject();
         try stringify.endObject();
@@ -3971,6 +3984,61 @@ test "turn steer payload preserves multiple local images" {
     try std.testing.expectEqualStrings("localImage", input.array.items[1].object.get("type").?.string);
     try std.testing.expectEqualStrings("/tmp/first.png", input.array.items[1].object.get("path").?.string);
     try std.testing.expectEqualStrings("/tmp/second.jpg", input.array.items[2].object.get("path").?.string);
+}
+
+test "turn start input de-duplicates the legacy image against the full list" {
+    const allocator = std.testing.allocator;
+    const images = [_]provider_types.ImageAttachment{
+        .{ .path = "/tmp/first.png" },
+        .{ .path = "/tmp/second.jpg" },
+    };
+    const cases = [_]struct {
+        request: provider_types.SendPromptRequest,
+        expected_items: usize,
+        first_image_path: []const u8,
+    }{
+        // Legacy image mirrors images[0]: it must serialize exactly once.
+        .{
+            .request = .{ .prompt = "compare", .image = .{ .path = "/tmp/first.png" }, .images = &images },
+            .expected_items = 3,
+            .first_image_path = "/tmp/first.png",
+        },
+        // Distinct legacy image is preserved ahead of the full list.
+        .{
+            .request = .{ .prompt = "compare", .image = .{ .path = "/tmp/solo.png" }, .images = &images },
+            .expected_items = 4,
+            .first_image_path = "/tmp/solo.png",
+        },
+        // Single legacy-only attachment still serializes.
+        .{
+            .request = .{ .prompt = "compare", .image = .{ .path = "/tmp/solo.png" }, .images = &.{} },
+            .expected_items = 2,
+            .first_image_path = "/tmp/solo.png",
+        },
+    };
+    for (cases) |case| {
+        var writer: std.Io.Writer.Allocating = .init(allocator);
+        defer writer.deinit();
+        var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+        try stringify.beginArray();
+        try writeTurnStartInputItems(&stringify, case.request);
+        try stringify.endArray();
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, writer.written(), .{});
+        defer parsed.deinit();
+        const items = parsed.value.array.items;
+        try std.testing.expectEqual(case.expected_items, items.len);
+        try std.testing.expectEqualStrings("text", items[0].object.get("type").?.string);
+        try std.testing.expectEqualStrings(case.first_image_path, items[1].object.get("path").?.string);
+        for (items[1..]) |item| {
+            try std.testing.expectEqualStrings("localImage", item.object.get("type").?.string);
+        }
+        // No path may appear twice regardless of the legacy/list overlap.
+        for (items[1..], 1..) |item, index| {
+            for (items[index + 1 ..]) |later| {
+                try std.testing.expect(!std.mem.eql(u8, item.object.get("path").?.string, later.object.get("path").?.string));
+            }
+        }
+    }
 }
 
 test "turn steer mismatch extracts the server active turn id" {

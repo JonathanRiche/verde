@@ -2323,6 +2323,85 @@ const SlowProcessPhaseResult = struct {
     }
 };
 
+/// Chat attachment staging (chat.attachments.v1). Remote desktops stream
+/// image bytes here through chunked authenticated RPCs, then a
+/// repository-routed chat.turn.start claims the staged files by opaque ID —
+/// desktop-local filesystem paths never cross the runtime boundary.
+const CHAT_ATTACHMENT_DIR_NAME = "chat-attachments";
+/// Bound total staged records so a misbehaving client cannot exhaust disk
+/// between TTL sweeps (records include consumed files awaiting expiry).
+const MAX_STAGED_CHAT_ATTACHMENTS_TOTAL: usize = 64;
+/// Bound concurrently uploading/unclaimed records more tightly. Shared with
+/// the desktop composer gate and the claim path: one turn can reference at
+/// most this many staged attachments, so a client can never stage a set that
+/// deterministically fails at claim time.
+const MAX_STAGED_CHAT_ATTACHMENTS_PENDING: usize = headless.attachment_protocol.MAX_ATTACHMENTS_PER_TURN;
+/// Aggregate declared-byte budget for pending (unclaimed) staged uploads.
+/// Bounds disk amplification beyond the per-record and count caps.
+const MAX_STAGED_CHAT_ATTACHMENT_PENDING_BYTES: usize = 256 * 1024 * 1024;
+/// Aggregate declared-byte budget across every staged record, including
+/// consumed files awaiting their retention TTL.
+const MAX_STAGED_CHAT_ATTACHMENT_TOTAL_BYTES: usize = 512 * 1024 * 1024;
+/// Uploads that never commit or are never claimed are swept after this window.
+const STAGED_ATTACHMENT_PENDING_TTL_MS: i64 = 15 * std.time.ms_per_min;
+/// Claimed files linger long enough for the provider worker to read them.
+const STAGED_ATTACHMENT_CONSUMED_TTL_MS: i64 = 60 * std.time.ms_per_min;
+/// Every supported image format is identifiable from its first 16 bytes; the
+/// first append chunk must carry at least this much so magic-byte validation
+/// runs before any payload reaches disk.
+const STAGED_ATTACHMENT_MIN_BYTES: usize = 16;
+/// Cadence of the drain-loop staged-attachment sweep. Coarse on purpose: the
+/// TTLs are 15/60 minutes, so a minute of slack is invisible while keeping
+/// the 20ms drain tick free of per-tick sweep work.
+const CHAT_ATTACHMENT_SWEEP_INTERVAL_MS: i64 = 60 * std.time.ms_per_s;
+
+const StagedChatAttachment = struct {
+    /// Opaque daemon-generated 32-hex identity; the only client handle.
+    id: []u8,
+    /// Canonical MIME from the shared allowlist (static slice; never freed).
+    mime: []const u8,
+    declared_bytes: usize,
+    received_bytes: usize = 0,
+    state: enum { staging, committed, consumed } = .staging,
+    /// One in-flight append/commit at a time. Guarded by lockDaemon; file
+    /// I/O runs outside the lock while the flag is held.
+    busy: bool = false,
+    updated_at_ms: i64,
+    /// Daemon-constructed absolute path in the private staging directory.
+    /// Never derived from client input beyond the validated hex id.
+    path: []u8,
+    /// Sequential write handle, open for the staging phase only.
+    file: ?std.Io.File = null,
+
+    fn destroy(self: *StagedChatAttachment, allocator: std.mem.Allocator) void {
+        var threaded = std.Io.Threaded.init_single_threaded;
+        const io = threaded.io();
+        if (self.file) |file| file.close(io);
+        std.Io.Dir.deleteFileAbsolute(io, self.path) catch {};
+        allocator.free(self.id);
+        allocator.free(self.path);
+        allocator.destroy(self);
+    }
+};
+
+const ClaimedAttachmentsError = error{ InvalidParams, ResourceNotFound, InvalidState, OutOfMemory };
+
+/// Runtime-local attachment references a repository-routed turn resolved from
+/// staged IDs. Both slices are daemon-owned copies of daemon-constructed paths.
+const ClaimedAttachments = struct {
+    image_paths: []const []const u8 = &.{},
+    images: []store_protocol.Attachment = &.{},
+    /// Consumed staged-record ids, retained so a turn-start failure after the
+    /// claim can restore the records for a client retry.
+    ids: []const []const u8 = &.{},
+
+    fn deinit(self: *ClaimedAttachments, allocator: std.mem.Allocator) void {
+        freeStringArray(allocator, self.image_paths);
+        freeAttachmentArray(allocator, self.images);
+        freeStringArray(allocator, self.ids);
+    }
+};
+
 pub const Daemon = struct {
     allocator: std.mem.Allocator,
     pref_path: []u8,
@@ -2333,6 +2412,12 @@ pub const Daemon = struct {
     registry: process_registry.ProcessRegistry,
     sessions: std.ArrayList(*PtySession) = .empty,
     chat_turns: std.ArrayList(*ChatTurn) = .empty,
+    /// Staged chat attachments awaiting a claiming turn. Guarded by lockDaemon;
+    /// per-record `busy` flags keep file I/O outside the lock.
+    chat_attachments: std.ArrayList(*StagedChatAttachment) = .empty,
+    /// Next drain-loop sweep of expired staged attachments (monotonic-ish
+    /// wall ms, see CHAT_ATTACHMENT_SWEEP_INTERVAL_MS). Guarded by lockDaemon.
+    chat_attachment_sweep_due_ms: i64 = 0,
     mutex: ParkingMutex = .{},
     /// Serializes verde.json snapshots and web-originated favorite updates.
     /// It is independent of lockDaemon so filesystem I/O never delays chat.
@@ -2422,6 +2507,8 @@ pub const Daemon = struct {
         self.sessions.deinit(self.allocator);
         for (self.chat_turns.items) |turn| turn.deinit(self.allocator);
         self.chat_turns.deinit(self.allocator);
+        for (self.chat_attachments.items) |record| record.destroy(self.allocator);
+        self.chat_attachments.deinit(self.allocator);
         self.registry_jobs.deinit(self.allocator);
         self.registry.deinit(self.allocator);
         self.journal.deinit(self.allocator);
@@ -2800,9 +2887,15 @@ pub const Daemon = struct {
         if (isConnectMethod(method)) return try self.handleConnectRequest(id_value, method, params);
         // chat.turn.start owns its drain check under lockDaemon (unlocked serve
         // path); other mutators still gate here under the `.normal` outer lock.
+        // The chat.attachment.* trio also serves unlocked, so this generic
+        // unlocked read is not safe for them either — each handler confirms
+        // accepting_mutations and pins in_flight under lockDaemon itself.
         if (!std.mem.eql(u8, method, "chat.turn.start") and
             !std.mem.eql(u8, method, "chat.turn.steer") and
             !std.mem.eql(u8, method, "chat.followup") and
+            !std.mem.eql(u8, method, headless.attachment_protocol.METHOD_CHAT_ATTACHMENT_CREATE) and
+            !std.mem.eql(u8, method, headless.attachment_protocol.METHOD_CHAT_ATTACHMENT_APPEND) and
+            !std.mem.eql(u8, method, headless.attachment_protocol.METHOD_CHAT_ATTACHMENT_COMMIT) and
             !self.accepting_mutations and methodMutatesState(method))
         {
             return try errorResponseAlloc(
@@ -2832,6 +2925,9 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, "chat.followup")) return try self.chatFollowupResponse(id_value, params);
         if (std.mem.eql(u8, method, "chat.turn.cancel")) return try self.chatTurnCancelResponse(id_value, params);
         if (std.mem.eql(u8, method, "chat.turn.consume")) return try self.chatTurnConsumeResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.attachment_protocol.METHOD_CHAT_ATTACHMENT_CREATE)) return try self.chatAttachmentCreateResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.attachment_protocol.METHOD_CHAT_ATTACHMENT_APPEND)) return try self.chatAttachmentAppendResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.attachment_protocol.METHOD_CHAT_ATTACHMENT_COMMIT)) return try self.chatAttachmentCommitResponse(id_value, params);
         if (std.mem.eql(u8, method, "provider.models.list")) return try self.providerModelsListResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDERS_STATUS)) return try self.providerStatusResponse(id_value, params);
         if (isFxLifecycleMethod(method)) return try self.fxLifecycleResponse(id_value, method, params);
@@ -6554,7 +6650,40 @@ pub const Daemon = struct {
             }
         }
         const route_ptr: ?*const ChatExecutionRoute = if (execution_route) |*route| route else null;
-        const turn = try createChatTurnFromParams(self.allocator, params, route_ptr);
+        // Staged attachments are claimed after every rejectable precondition
+        // above so a refused turn never consumes uploads the client would
+        // have to redo.
+        var claimed_attachments = self.claimStagedChatAttachments(params, route_ptr != null) catch |err| switch (err) {
+            error.InvalidParams => return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_PARAMS,
+                "invalid attachments param",
+            ),
+            error.ResourceNotFound => return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_RESOURCE_NOT_FOUND,
+                "unknown or expired attachment id",
+            ),
+            error.InvalidState => return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_STATE,
+                "attachment is not committed",
+            ),
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        // If anything past this point stops the new turn from launching
+        // (duplicate turn, shutdown drain, OOM, worker spawn failure), the
+        // claim is rolled back so the client can retry without re-uploading.
+        var turn_launched = false;
+        defer if (claimed_attachments) |*claim| {
+            if (!turn_launched) self.restoreClaimedChatAttachments(claim);
+            claim.deinit(self.allocator);
+        };
+        const claimed_ptr: ?*const ClaimedAttachments = if (claimed_attachments) |*claim| claim else null;
+        const turn = try createChatTurnFromParams(self.allocator, params, route_ptr, claimed_ptr);
         errdefer turn.deinit(self.allocator);
         // Wire the wake path before the turn is reachable by any worker.
         turn.daemon = self;
@@ -6593,6 +6722,7 @@ pub const Daemon = struct {
             return err;
         };
         turn.worker_thread = thread;
+        turn_launched = true;
         self.mutex.unlock();
         return try okValueResponse(self.allocator, id_value, .{ .turn_id = turn.turn_id, .created = true });
     }
@@ -7004,6 +7134,459 @@ pub const Daemon = struct {
             return try okValueResponse(self.allocator, id_value, .{ .accepted = true });
         }
         return try errorResponseAlloc(self.allocator, id_value, "not_found", "turn not found");
+    }
+
+    /// Drain-safe entry for the unlocked chat.attachment.* handlers: confirm
+    /// accepting_mutations and pin the store in-flight counter under one
+    /// lockDaemon window. The generic mutator gate's unlocked read is not
+    /// safe for these methods, and the pin makes prepareShutdown's
+    /// store_writes_in_flight refusal observe staging file work in progress.
+    /// Callers must unpin the returned service when done.
+    fn beginStagedAttachmentRequest(self: *Daemon) error{DaemonDraining}!?*StoreService {
+        lockDaemon(self);
+        defer self.mutex.unlock();
+        if (!self.accepting_mutations) return error.DaemonDraining;
+        const service = self.store_service;
+        if (service) |svc| _ = svc.in_flight.fetchAdd(1, .monotonic);
+        return service;
+    }
+
+    fn stagedAttachmentDrainingResponse(self: *Daemon, id_value: std.json.Value) ![]u8 {
+        return try errorResponseAlloc(
+            self.allocator,
+            id_value,
+            "invalid_state",
+            "daemon is preparing shutdown and is not accepting mutations",
+        );
+    }
+
+    /// chat.attachments.v1: begin a chunked, authenticated attachment upload.
+    /// Runs unlocked (see methodRunsUnlocked); file I/O never holds lockDaemon.
+    /// The path is server-constructed from a random hex id inside the private
+    /// staging directory, and the exclusive create defeats substitution.
+    fn chatAttachmentCreateResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        if (params != .object) return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object");
+        const mime_raw = jsonString(params.object.get("mime") orelse .null) orelse
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing mime");
+        const mime = headless.attachment_protocol.supportedImageMime(mime_raw) orelse
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "unsupported attachment mime type");
+        const declared: usize = blk: {
+            const value = params.object.get("byte_size") orelse .null;
+            if (value != .integer) break :blk 0;
+            break :blk std.math.cast(usize, value.integer) orelse 0;
+        };
+        const limits: headless.RuntimeLimits = .{};
+        // The portable cap is the smallest per-image size every audited
+        // provider harness ingests; accepting more would defer a
+        // deterministic provider failure past acceptance.
+        const max_declared = @min(limits.max_attachment_bytes, headless.attachment_protocol.MAX_PORTABLE_ATTACHMENT_BYTES);
+        if (declared < STAGED_ATTACHMENT_MIN_BYTES or declared > max_declared)
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "attachment byte_size out of range");
+
+        const pinned_service = self.beginStagedAttachmentRequest() catch
+            return try self.stagedAttachmentDrainingResponse(id_value);
+        defer if (pinned_service) |svc| {
+            _ = svc.in_flight.fetchSub(1, .monotonic);
+        };
+        if (pinned_service == null or self.pref_path.len == 0)
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "attachment staging is unavailable on this runtime");
+
+        self.sweepExpiredChatAttachments();
+
+        const dir_path = try std.fs.path.join(self.allocator, &.{ self.pref_path, CHAT_ATTACHMENT_DIR_NAME });
+        defer self.allocator.free(dir_path);
+        var threaded = std.Io.Threaded.init_single_threaded;
+        const io = threaded.io();
+        ensureChatAttachmentStagingDirectory(io, dir_path) catch
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_STATE, "attachment staging directory is unavailable");
+
+        const id = randomEphemeralHexId(self.allocator);
+        // Suffix from the validated MIME (never client input): provider CLIs
+        // and bridges may infer image type from the extension, so a correct
+        // canonical suffix keeps every shared harness working while the
+        // random server-generated id preserves traversal/isolation guarantees.
+        const extension = headless.attachment_protocol.imageExtension(mime);
+        const file_path = std.fmt.allocPrint(self.allocator, "{s}{c}{s}.{s}", .{ dir_path, std.fs.path.sep, id, extension }) catch |err| {
+            self.allocator.free(id);
+            return err;
+        };
+        var file = std.Io.Dir.createFileAbsolute(io, file_path, .{ .exclusive = true }) catch {
+            self.allocator.free(id);
+            self.allocator.free(file_path);
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_STATE, "attachment staging is unavailable");
+        };
+        const record = self.allocator.create(StagedChatAttachment) catch |err| {
+            file.close(io);
+            std.Io.Dir.deleteFileAbsolute(io, file_path) catch {};
+            self.allocator.free(id);
+            self.allocator.free(file_path);
+            return err;
+        };
+        record.* = .{
+            .id = id,
+            .mime = mime,
+            .declared_bytes = declared,
+            .updated_at_ms = nowMs(),
+            .path = file_path,
+            .file = file,
+        };
+        // The record is shared once appended; respond from this stack copy so
+        // a concurrent sweep can never race the response encoding.
+        var id_copy: [headless.attachment_protocol.ATTACHMENT_ID_LENGTH]u8 = undefined;
+        @memcpy(id_copy[0..], id);
+
+        lockDaemon(self);
+        var pending: usize = 0;
+        var pending_bytes: usize = 0;
+        var total_bytes: usize = 0;
+        for (self.chat_attachments.items) |existing| {
+            // Saturating adds: declared sizes are client-influenced, so the
+            // budget comparison must stay correct even at usize extremes.
+            total_bytes +|= existing.declared_bytes;
+            if (existing.state != .consumed) {
+                pending += 1;
+                pending_bytes +|= existing.declared_bytes;
+            }
+        }
+        const over_cap = self.chat_attachments.items.len >= MAX_STAGED_CHAT_ATTACHMENTS_TOTAL or
+            pending >= MAX_STAGED_CHAT_ATTACHMENTS_PENDING or
+            pending_bytes +| declared > MAX_STAGED_CHAT_ATTACHMENT_PENDING_BYTES or
+            total_bytes +| declared > MAX_STAGED_CHAT_ATTACHMENT_TOTAL_BYTES;
+        if (!over_cap) {
+            self.chat_attachments.append(self.allocator, record) catch |err| {
+                self.mutex.unlock();
+                record.destroy(self.allocator);
+                return err;
+            };
+        }
+        self.mutex.unlock();
+        if (over_cap) {
+            record.destroy(self.allocator);
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_STATE, "too many staged attachments; retry shortly");
+        }
+        return try okValueResponse(self.allocator, id_value, .{
+            .attachment_id = id_copy[0..],
+            .max_chunk_bytes = headless.attachment_protocol.maxAppendChunkBytes(limits.max_request_bytes),
+        });
+    }
+
+    /// chat.attachments.v1: append one exact-offset base64 chunk. The first
+    /// chunk must carry the declared MIME's magic bytes so a lying declaration
+    /// never reaches disk. Never logs or echoes attachment bytes.
+    fn chatAttachmentAppendResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        if (params != .object) return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object");
+        const attachment_id = jsonString(params.object.get("attachment_id") orelse .null) orelse
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing attachment_id");
+        if (!headless.attachment_protocol.isValidAttachmentId(attachment_id))
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "invalid attachment_id");
+        const offset: usize = blk: {
+            const value = params.object.get("offset") orelse .null;
+            if (value != .integer) return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing offset");
+            break :blk std.math.cast(usize, value.integer) orelse
+                return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "invalid offset");
+        };
+        const data_b64 = jsonString(params.object.get("data") orelse .null) orelse
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing data");
+        const decoder = std.base64.standard.Decoder;
+        const decoded_len = decoder.calcSizeForSlice(data_b64) catch
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "invalid base64 data");
+        if (decoded_len == 0)
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "empty data");
+        const decoded = try self.allocator.alloc(u8, decoded_len);
+        defer self.allocator.free(decoded);
+        decoder.decode(decoded, data_b64) catch
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "invalid base64 data");
+
+        const pinned_service = self.beginStagedAttachmentRequest() catch
+            return try self.stagedAttachmentDrainingResponse(id_value);
+        defer if (pinned_service) |svc| {
+            _ = svc.in_flight.fetchSub(1, .monotonic);
+        };
+
+        // Reserve the record under lockDaemon; the write runs outside the
+        // lock behind the busy flag (which also shields it from the sweep).
+        lockDaemon(self);
+        const record = self.findStagedChatAttachment(attachment_id) orelse {
+            self.mutex.unlock();
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_RESOURCE_NOT_FOUND, "unknown attachment id");
+        };
+        if (record.state != .staging or record.busy) {
+            self.mutex.unlock();
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_STATE, "attachment is not accepting data");
+        }
+        if (offset != record.received_bytes) {
+            self.mutex.unlock();
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "attachment chunk offset mismatch");
+        }
+        if (record.received_bytes + decoded.len > record.declared_bytes) {
+            self.mutex.unlock();
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "attachment data exceeds declared byte_size");
+        }
+        if (record.received_bytes == 0 and
+            (decoded.len < STAGED_ATTACHMENT_MIN_BYTES or
+                !headless.attachment_protocol.imageBytesMatchMime(record.mime, decoded)))
+        {
+            self.mutex.unlock();
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "attachment bytes do not match declared mime");
+        }
+        record.busy = true;
+        const file = record.file.?;
+        self.mutex.unlock();
+
+        var threaded = std.Io.Threaded.init_single_threaded;
+        const write_failed = blk: {
+            file.writeStreamingAll(threaded.io(), decoded) catch break :blk true;
+            break :blk false;
+        };
+
+        lockDaemon(self);
+        record.busy = false;
+        record.updated_at_ms = nowMs();
+        if (write_failed) {
+            self.removeStagedChatAttachmentLocked(record);
+            self.mutex.unlock();
+            record.destroy(self.allocator);
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_STATE, "attachment staging failed; create a new attachment");
+        }
+        record.received_bytes += decoded.len;
+        const received = record.received_bytes;
+        self.mutex.unlock();
+        return try okValueResponse(self.allocator, id_value, .{ .received_bytes = received });
+    }
+
+    /// chat.attachments.v1: seal a fully uploaded attachment so a
+    /// repository-routed chat.turn.start can claim it by id.
+    fn chatAttachmentCommitResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        if (params != .object) return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object");
+        const attachment_id = jsonString(params.object.get("attachment_id") orelse .null) orelse
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing attachment_id");
+        if (!headless.attachment_protocol.isValidAttachmentId(attachment_id))
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "invalid attachment_id");
+
+        const pinned_service = self.beginStagedAttachmentRequest() catch
+            return try self.stagedAttachmentDrainingResponse(id_value);
+        defer if (pinned_service) |svc| {
+            _ = svc.in_flight.fetchSub(1, .monotonic);
+        };
+
+        lockDaemon(self);
+        const record = self.findStagedChatAttachment(attachment_id) orelse {
+            self.mutex.unlock();
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_RESOURCE_NOT_FOUND, "unknown attachment id");
+        };
+        if (record.state != .staging or record.busy) {
+            self.mutex.unlock();
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_STATE, "attachment is not committable");
+        }
+        if (record.received_bytes != record.declared_bytes) {
+            self.mutex.unlock();
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_STATE, "attachment upload is incomplete");
+        }
+        record.busy = true;
+        const file = record.file;
+        record.file = null;
+        self.mutex.unlock();
+
+        if (file) |open_file| {
+            var threaded = std.Io.Threaded.init_single_threaded;
+            open_file.close(threaded.io());
+        }
+
+        lockDaemon(self);
+        record.busy = false;
+        record.state = .committed;
+        record.updated_at_ms = nowMs();
+        const byte_size = record.declared_bytes;
+        const mime = record.mime;
+        self.mutex.unlock();
+        return try okValueResponse(self.allocator, id_value, .{
+            .attachment_id = attachment_id,
+            .byte_size = byte_size,
+            .mime = mime,
+        });
+    }
+
+    fn findStagedChatAttachment(self: *Daemon, attachment_id: []const u8) ?*StagedChatAttachment {
+        for (self.chat_attachments.items) |record| {
+            if (std.mem.eql(u8, record.id, attachment_id)) return record;
+        }
+        return null;
+    }
+
+    fn removeStagedChatAttachmentLocked(self: *Daemon, record: *StagedChatAttachment) void {
+        for (self.chat_attachments.items, 0..) |candidate, index| {
+            if (candidate == record) {
+                _ = self.chat_attachments.swapRemove(index);
+                return;
+            }
+        }
+    }
+
+    /// Bounded periodic sweep so expired staged uploads are reclaimed even
+    /// when no future chat.attachment.create ever arrives. Called from the
+    /// drain loop every tick; the due timestamp holds the real cadence to
+    /// CHAT_ATTACHMENT_SWEEP_INTERVAL_MS. Returns true when a sweep ran.
+    fn maybeSweepStagedChatAttachments(self: *Daemon, now_ms: i64) bool {
+        lockDaemon(self);
+        if (now_ms < self.chat_attachment_sweep_due_ms) {
+            self.mutex.unlock();
+            return false;
+        }
+        self.chat_attachment_sweep_due_ms = now_ms + CHAT_ATTACHMENT_SWEEP_INTERVAL_MS;
+        self.mutex.unlock();
+        self.sweepExpiredChatAttachments();
+        return true;
+    }
+
+    /// TTL sweep for uploads that never commit / are never claimed, and for
+    /// consumed files after the provider worker window. Busy records are
+    /// skipped; file deletion runs outside lockDaemon.
+    fn sweepExpiredChatAttachments(self: *Daemon) void {
+        const now = nowMs();
+        var expired: std.ArrayList(*StagedChatAttachment) = .empty;
+        defer expired.deinit(self.allocator);
+        lockDaemon(self);
+        expired.ensureTotalCapacity(self.allocator, self.chat_attachments.items.len) catch {
+            self.mutex.unlock();
+            return;
+        };
+        var index: usize = 0;
+        while (index < self.chat_attachments.items.len) {
+            const record = self.chat_attachments.items[index];
+            const ttl: i64 = if (record.state == .consumed)
+                STAGED_ATTACHMENT_CONSUMED_TTL_MS
+            else
+                STAGED_ATTACHMENT_PENDING_TTL_MS;
+            if (!record.busy and now - record.updated_at_ms > ttl) {
+                _ = self.chat_attachments.swapRemove(index);
+                expired.appendAssumeCapacity(record);
+                continue;
+            }
+            index += 1;
+        }
+        self.mutex.unlock();
+        for (expired.items) |record| record.destroy(self.allocator);
+    }
+
+    /// Resolve committed staged attachment IDs into daemon-local files for a
+    /// repository-routed turn. Validation and consumption share one lock
+    /// window: either every id resolves or nothing is consumed.
+    fn claimStagedChatAttachments(
+        self: *Daemon,
+        params: std.json.Value,
+        repository_routed: bool,
+    ) ClaimedAttachmentsError!?ClaimedAttachments {
+        const value = params.object.get("attachments") orelse return null;
+        const array = switch (value) {
+            .null => return null,
+            .array => |entries| entries,
+            else => return error.InvalidParams,
+        };
+        if (array.items.len == 0) return null;
+        // Staged attachments exist for repository/remote routes only; local
+        // turns keep the legacy absolute-path contract.
+        if (!repository_routed) return error.InvalidParams;
+        if (array.items.len > MAX_STAGED_CHAT_ATTACHMENTS_PENDING) return error.InvalidParams;
+
+        var paths: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (paths.items) |path| self.allocator.free(path);
+            paths.deinit(self.allocator);
+        }
+        var images: std.ArrayList(store_protocol.Attachment) = .empty;
+        errdefer {
+            for (images.items) |attachment| {
+                self.allocator.free(attachment.path);
+                self.allocator.free(attachment.mime);
+            }
+            images.deinit(self.allocator);
+        }
+        var ids: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (ids.items) |id| self.allocator.free(id);
+            ids.deinit(self.allocator);
+        }
+
+        // Pure memory work only under this lock (no file/SQLite I/O), and no
+        // record state changes until every fallible step has succeeded — an
+        // OOM or validation failure at any point leaves all records claimable.
+        lockDaemon(self);
+        defer self.mutex.unlock();
+        for (array.items, 0..) |item, index| {
+            const id = jsonString(item) orelse return error.InvalidParams;
+            if (!headless.attachment_protocol.isValidAttachmentId(id)) return error.InvalidParams;
+            // A duplicate id would alias one staged file into two turn slots
+            // and double-consume the record; reject the whole claim.
+            for (array.items[0..index]) |prior| {
+                if (std.mem.eql(u8, jsonString(prior).?, id)) return error.InvalidParams;
+            }
+            const record = self.findStagedChatAttachment(id) orelse return error.ResourceNotFound;
+            if (record.busy or record.state != .committed) return error.InvalidState;
+        }
+        for (array.items) |item| {
+            const record = self.findStagedChatAttachment(jsonString(item).?).?;
+            const owned_path = try self.allocator.dupe(u8, record.path);
+            {
+                errdefer self.allocator.free(owned_path);
+                try paths.append(self.allocator, owned_path);
+            }
+            const owned_id = try self.allocator.dupe(u8, record.id);
+            {
+                errdefer self.allocator.free(owned_id);
+                try ids.append(self.allocator, owned_id);
+            }
+            // Durable projection: the message row persists a stable opaque
+            // reference, never the daemon's absolute staging path (which is
+            // private, ephemeral, and wiped at restart). v1 retains metadata
+            // only — historical bytes are not downloadable after the TTL.
+            // The real path travels solely through image_paths → provider.
+            const image_path = try std.fmt.allocPrint(
+                self.allocator,
+                "{s}{s}",
+                .{ headless.attachment_protocol.ATTACHMENT_REFERENCE_PREFIX, record.id },
+            );
+            const image_mime = self.allocator.dupe(u8, record.mime) catch |err| {
+                self.allocator.free(image_path);
+                return err;
+            };
+            images.append(self.allocator, .{
+                .path = image_path,
+                .mime = image_mime,
+                .byte_size = record.declared_bytes,
+            }) catch |err| {
+                self.allocator.free(image_path);
+                self.allocator.free(image_mime);
+                return err;
+            };
+        }
+        const owned_paths = try paths.toOwnedSlice(self.allocator);
+        errdefer freeStringArray(self.allocator, owned_paths);
+        const owned_images = try images.toOwnedSlice(self.allocator);
+        errdefer freeAttachmentArray(self.allocator, owned_images);
+        const owned_ids = try ids.toOwnedSlice(self.allocator);
+        // Infallible from here: consumption is atomic with the validation
+        // above because the daemon lock was never released.
+        for (array.items) |item| {
+            const record = self.findStagedChatAttachment(jsonString(item).?).?;
+            record.state = .consumed;
+            record.updated_at_ms = nowMs();
+        }
+        return .{ .image_paths = owned_paths, .images = owned_images, .ids = owned_ids };
+    }
+
+    /// Undo a successful claim after a later turn-start failure (duplicate
+    /// turn, shutdown drain, OOM, worker spawn failure): restore records to
+    /// `.committed` so the client can retry without re-uploading. Records
+    /// already swept are simply gone; the retry then reports resource_not_found.
+    fn restoreClaimedChatAttachments(self: *Daemon, claim: *const ClaimedAttachments) void {
+        lockDaemon(self);
+        defer self.mutex.unlock();
+        for (claim.ids) |id| {
+            const record = self.findStagedChatAttachment(id) orelse continue;
+            if (record.state != .consumed) continue;
+            record.state = .committed;
+            record.updated_at_ms = nowMs();
+        }
     }
 
     /// Read-only dynamic model catalog so detached clients (web/CLI) can
@@ -7985,6 +8568,53 @@ fn runSessionizerServer(allocator: std.mem.Allocator, pref_path: []const u8, opt
     });
 }
 
+/// Remove staging leftovers from a previous daemon generation. Runs at ready
+/// time, before any client can stage new attachments. The no-follow stat
+/// gates the recursive delete: a planted symlink is unlinked as a link only,
+/// so cleanup can never recurse through it into a foreign directory.
+fn wipeStagedChatAttachmentDirectory(daemon: *Daemon) void {
+    if (daemon.pref_path.len == 0) return;
+    const dir_path = std.fs.path.join(daemon.allocator, &.{ daemon.pref_path, CHAT_ATTACHMENT_DIR_NAME }) catch return;
+    defer daemon.allocator.free(dir_path);
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    const stat = std.Io.Dir.cwd().statFile(io, dir_path, .{ .follow_symlinks = false }) catch return;
+    switch (stat.kind) {
+        .directory => std.Io.Dir.cwd().deleteTree(io, dir_path) catch {},
+        else => std.Io.Dir.deleteFileAbsolute(io, dir_path) catch {},
+    }
+}
+
+/// Prepare the private chat-attachment staging directory without ever
+/// following a planted symlink. Ordering is the defense: a no-follow stat
+/// runs BEFORE any open/chmod/create so a symlink target is never touched,
+/// creation happens only when the path is genuinely absent, and a no-follow
+/// recheck closes the create race before the directory is opened no-follow
+/// for permission tightening.
+fn ensureChatAttachmentStagingDirectory(io: std.Io, dir_path: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    _ = cwd.statFile(io, dir_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        // mkdir never follows a symlink in the final component.
+        error.FileNotFound => cwd.createDirPath(io, dir_path) catch |create_err| switch (create_err) {
+            error.PathAlreadyExists => {},
+            else => return create_err,
+        },
+        else => return err,
+    };
+    const stat = try cwd.statFile(io, dir_path, .{ .follow_symlinks = false });
+    if (stat.kind != .directory) return error.NotDir;
+    if (builtin.os.tag == .windows) return;
+    // Staged image bytes must stay private to the daemon user, mirroring
+    // ensurePrivateDataDirectory but with a no-follow open. `iterate` is
+    // required even though nothing is listed: without it std opens the
+    // directory as an O_PATH handle and fchmod on that fd fails with EBADF
+    // on every Linux kernel, which made every chat.attachment.create report
+    // the staging directory as unavailable.
+    var dir = try cwd.openDir(io, dir_path, .{ .iterate = true, .follow_symlinks = false });
+    defer dir.close(io);
+    try dir.setPermissions(io, @enumFromInt(0o700));
+}
+
 fn ensurePrivateDataDirectory(io: std.Io, pref_path: []const u8) !void {
     try std.Io.Dir.cwd().createDirPath(io, pref_path);
     if (builtin.os.tag == .windows) return;
@@ -8018,6 +8648,9 @@ fn sessionizerServerReady(raw_context: *anyopaque) !void {
     // so identity creation and SQLite binding share endpoint ownership and a
     // failed cross-check fails readiness loudly (never a silent dual-writer).
     try maybeInitStoreService(context.daemon);
+    // Staged chat attachments never survive a daemon generation: their IDs
+    // live only in this process, so leftovers are unclaimable garbage.
+    wipeStagedChatAttachmentDirectory(context.daemon);
     if (context.mcp_handler) |handler| {
         context.mcp_server = mcp_http.start(context.daemon.allocator, context.pref_path, handler) catch |err| {
             log.err("daemon MCP HTTP transport failed to start: {s}", .{@errorName(err)});
@@ -10683,6 +11316,11 @@ fn methodRunsUnlocked(method: []const u8) bool {
         std.mem.eql(u8, method, "chat.turn.tail") or
         std.mem.eql(u8, method, "chat.turn.steer") or
         std.mem.eql(u8, method, "chat.followup") or
+        // Attachment staging performs file I/O and owns its own short
+        // lockDaemon windows via per-record busy flags.
+        std.mem.eql(u8, method, headless.attachment_protocol.METHOD_CHAT_ATTACHMENT_CREATE) or
+        std.mem.eql(u8, method, headless.attachment_protocol.METHOD_CHAT_ATTACHMENT_APPEND) or
+        std.mem.eql(u8, method, headless.attachment_protocol.METHOD_CHAT_ATTACHMENT_COMMIT) or
         // Read-only provider discovery performs bounded PATH lookups and
         // touches no daemon state, so never hold lockDaemon around filesystem I/O.
         std.mem.eql(u8, method, "provider.models.list") or
@@ -10949,6 +11587,10 @@ fn drainSessionsThread(context: DrainThreadContext) void {
         daemon.reapOrphanedSessions(now_ms);
         const should_exit = daemon.shouldExitForIdle();
         daemon.mutex.unlock();
+        // Staged-attachment TTL sweep: file deletion must never run under
+        // lockDaemon, so it lives outside the locked bookkeeping above and
+        // rate-limits itself with a due timestamp instead of every 20ms tick.
+        _ = daemon.maybeSweepStagedChatAttachments(now_ms);
         if (should_exit) {
             context.stop_requested.store(true, .release);
             platform_ipc.wake(daemon.allocator, context.endpoint, .{
@@ -12120,7 +12762,7 @@ test "repository-routed chat resolves only the daemon binding and persists the s
     try std.testing.expectEqualStrings("primary", route.repository_id);
     try std.testing.expectEqualStrings("services/api", route.relative_cwd.?);
 
-    const turn = try createChatTurnFromParams(allocator, parsed.value, &route);
+    const turn = try createChatTurnFromParams(allocator, parsed.value, &route, null);
     defer turn.deinit(allocator);
     try std.testing.expectEqualStrings(repository_root, turn.request.project_path);
     try std.testing.expectEqualStrings(expected_cwd, turn.request.cwd.?);
@@ -12214,16 +12856,589 @@ test "repository-routed chat rejects client paths attachments storeless use and 
     try std.testing.expectError(error.CapabilityUnavailable, resolveChatExecutionRoute(&daemon, no_store.value));
 }
 
+const TestAttachmentMethod = enum { create, append, commit };
+
+fn testAttachmentRpc(
+    daemon: *Daemon,
+    method: TestAttachmentMethod,
+    params_json: []const u8,
+) !std.json.Parsed(std.json.Value) {
+    const allocator = std.testing.allocator;
+    var params = try std.json.parseFromSlice(std.json.Value, allocator, params_json, .{});
+    defer params.deinit();
+    const response = switch (method) {
+        .create => try daemon.chatAttachmentCreateResponse(.null, params.value),
+        .append => try daemon.chatAttachmentAppendResponse(.null, params.value),
+        .commit => try daemon.chatAttachmentCommitResponse(.null, params.value),
+    };
+    defer allocator.free(response);
+    return try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+}
+
+fn testRpcResultField(root: std.json.Value, field: []const u8) ?std.json.Value {
+    const result = root.object.get("result") orelse return null;
+    if (result != .object) return null;
+    return result.object.get(field);
+}
+
+fn testRpcErrorCode(root: std.json.Value) ?[]const u8 {
+    const err = root.object.get("error") orelse return null;
+    if (err != .object) return null;
+    return jsonString(err.object.get("code") orelse .null);
+}
+
+fn testAppendChunkJsonAlloc(
+    allocator: std.mem.Allocator,
+    attachment_id: []const u8,
+    offset: usize,
+    chunk: []const u8,
+) ![]u8 {
+    const encoder = std.base64.standard.Encoder;
+    const b64 = try allocator.alloc(u8, encoder.calcSize(chunk.len));
+    defer allocator.free(b64);
+    _ = encoder.encode(b64, chunk);
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"attachment_id\":\"{s}\",\"offset\":{d},\"data\":\"{s}\"}}",
+        .{ attachment_id, offset, b64 },
+    );
+}
+
+/// Drive create -> chunked append -> commit for `bytes` and return the owned
+/// staged attachment id.
+fn testUploadCommittedAttachmentAlloc(
+    daemon: *Daemon,
+    mime: []const u8,
+    bytes: []const u8,
+) ![]u8 {
+    const allocator = std.testing.allocator;
+    const create_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mime\":\"{s}\",\"byte_size\":{d}}}",
+        .{ mime, bytes.len },
+    );
+    defer allocator.free(create_json);
+    var create = try testAttachmentRpc(daemon, .create, create_json);
+    defer create.deinit();
+    const id_value = testRpcResultField(create.value, "attachment_id") orelse return error.TestExpectedResult;
+    const attachment_id = try allocator.dupe(u8, id_value.string);
+    errdefer allocator.free(attachment_id);
+    try std.testing.expect(headless.attachment_protocol.isValidAttachmentId(attachment_id));
+    const chunk_value = testRpcResultField(create.value, "max_chunk_bytes") orelse return error.TestExpectedResult;
+    const max_chunk = std.math.cast(usize, chunk_value.integer) orelse return error.TestExpectedResult;
+    try std.testing.expect(max_chunk >= headless.attachment_protocol.MIN_APPEND_CHUNK_BYTES);
+
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const end = @min(offset + max_chunk, bytes.len);
+        const append_json = try testAppendChunkJsonAlloc(allocator, attachment_id, offset, bytes[offset..end]);
+        defer allocator.free(append_json);
+        var append = try testAttachmentRpc(daemon, .append, append_json);
+        defer append.deinit();
+        const received = testRpcResultField(append.value, "received_bytes") orelse return error.TestExpectedResult;
+        try std.testing.expectEqual(@as(i64, @intCast(end)), received.integer);
+        offset = end;
+    }
+
+    const commit_json = try std.fmt.allocPrint(allocator, "{{\"attachment_id\":\"{s}\"}}", .{attachment_id});
+    defer allocator.free(commit_json);
+    var commit = try testAttachmentRpc(daemon, .commit, commit_json);
+    defer commit.deinit();
+    const committed_size = testRpcResultField(commit.value, "byte_size") orelse return error.TestExpectedResult;
+    try std.testing.expectEqual(@as(i64, @intCast(bytes.len)), committed_size.integer);
+    return attachment_id;
+}
+
+test "staged chat attachments upload commit claim and sweep end to end" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+
+    var daemon = Daemon.initWithPrefPath(allocator, root_buffer[0..root_len]);
+    defer daemon.deinit();
+    const service = try allocator.create(StoreService);
+    const store = daemon_store.Store.initWithRuntimeIdentity(allocator, db_path, .none, .{
+        .runtime_id = daemon.runtime_id,
+        .instance_id = daemon.instance_id,
+    }) catch |err| {
+        allocator.destroy(service);
+        return err;
+    };
+    service.* = .{ .store = store };
+    daemon.store_service = service;
+    defer detachTestStoreService(&daemon);
+
+    // Small PNG: real magic bytes plus filler to reach the staging minimum.
+    const png_magic = "\x89PNG\r\n\x1a\n";
+    var small: [16]u8 = undefined;
+    @memcpy(small[0..png_magic.len], png_magic);
+    @memset(small[png_magic.len..], 0xAB);
+    const small_id = try testUploadCommittedAttachmentAlloc(&daemon, "image/png", small[0..]);
+    defer allocator.free(small_id);
+
+    // 2 MiB PNG exercises the multi-chunk path end to end.
+    const big_len: usize = 2 * 1024 * 1024;
+    const big = try allocator.alloc(u8, big_len);
+    defer allocator.free(big);
+    @memset(big, 0x5C);
+    @memcpy(big[0..png_magic.len], png_magic);
+    const big_id = try testUploadCommittedAttachmentAlloc(&daemon, "image/png", big);
+    defer allocator.free(big_id);
+
+    // Claim both ids for a repository-routed turn: paths must be daemon-owned
+    // staging files, never client paths, and the claim must consume records.
+    const claim_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"attachments\":[\"{s}\",\"{s}\"]}}",
+        .{ small_id, big_id },
+    );
+    defer allocator.free(claim_json);
+    var claim_params = try std.json.parseFromSlice(std.json.Value, allocator, claim_json, .{});
+    defer claim_params.deinit();
+    var claim = (try daemon.claimStagedChatAttachments(claim_params.value, true)).?;
+    defer claim.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), claim.image_paths.len);
+    try std.testing.expectEqual(@as(usize, 2), claim.images.len);
+    for (claim.image_paths) |path| {
+        try std.testing.expect(std.mem.indexOf(u8, path, CHAT_ATTACHMENT_DIR_NAME) != null);
+        try std.testing.expect(std.mem.startsWith(u8, path, daemon.pref_path));
+        // Provider harnesses may infer image type from the suffix: the
+        // server-owned path carries the canonical extension of the MIME.
+        try std.testing.expect(std.mem.endsWith(u8, path, ".png"));
+    }
+    try std.testing.expectEqualStrings("image/png", claim.images[0].mime);
+    try std.testing.expectEqual(@as(usize, small.len), claim.images[0].byte_size);
+    try std.testing.expectEqual(@as(usize, big_len), claim.images[1].byte_size);
+
+    // Durable projection: message rows persist only the opaque
+    // `verde-attachment:<id>` reference — never the daemon staging path (and
+    // desktop paths never reached the daemon at all). v1 keeps metadata, not
+    // downloadable bytes, once the staging TTL lapses.
+    for (claim.images) |attachment| {
+        try std.testing.expect(std.mem.startsWith(u8, attachment.path, headless.attachment_protocol.ATTACHMENT_REFERENCE_PREFIX));
+        try std.testing.expect(std.mem.indexOf(u8, attachment.path, daemon.pref_path) == null);
+    }
+    // Durable-store coverage: stage the accepted turn through the real store
+    // path and inspect the persisted message row, not just the in-memory
+    // claim projection.
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+    const repo_root = try std.fs.path.join(allocator, &.{ root_buffer[0..root_len], "repo" });
+    defer allocator.free(repo_root);
+    {
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        _ = try service.store.upsertWorkspace(.{
+            .mutation = .{ .request_key = "attach-workspace", .client_id = "attach-test" },
+            .workspace = .{
+                .workspace_id = "attach-workspace",
+                .label = "Attach workspace",
+                .path = repo_root,
+            },
+        });
+    }
+    const turn_params = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"turn_id":"attach-turn","workspace_id":"attach-workspace","local_thread_id":"attach-thread","repository_id":"primary","provider":"codex","harness":"local_cli","prompt":"look","thread_title":"Attached","access_mode":"supervised","message_id":"attach-message"}
+    , .{});
+    defer turn_params.deinit();
+    var route = (try resolveChatExecutionRoute(&daemon, turn_params.value)).?;
+    defer route.deinit(allocator);
+    const turn = try createChatTurnFromParams(allocator, turn_params.value, &route, &claim);
+    defer turn.deinit(allocator);
+    // The provider request keeps the real staging paths; only the durable
+    // projection carries the opaque reference.
+    try std.testing.expectEqual(@as(usize, 2), turn.request.image_paths.len);
+    try std.testing.expectEqual(AcceptanceOwnership.owned, try stageAcceptedChatTurn(&daemon, turn));
+    {
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        var message_row = (try service.store.conn.row(
+            "select image_path, extra_images_json from messages where message_id = ?1",
+            .{"attach-message"},
+        )).?;
+        defer message_row.deinit();
+        const primary_path = message_row.text(0);
+        try std.testing.expect(std.mem.startsWith(u8, primary_path, headless.attachment_protocol.ATTACHMENT_REFERENCE_PREFIX));
+        const extra_json = message_row.text(1);
+        try std.testing.expect(std.mem.indexOf(u8, extra_json, headless.attachment_protocol.ATTACHMENT_REFERENCE_PREFIX) != null);
+        // Neither the daemon staging path nor a desktop path is durable.
+        try std.testing.expect(std.mem.indexOf(u8, primary_path, daemon.pref_path) == null);
+        try std.testing.expect(std.mem.indexOf(u8, extra_json, daemon.pref_path) == null);
+        try std.testing.expect(std.mem.indexOf(u8, extra_json, CHAT_ATTACHMENT_DIR_NAME) == null);
+    }
+
+    // The staged file carries exactly the uploaded bytes.
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    const staged_bytes = try std.Io.Dir.cwd().readFileAlloc(io, claim.image_paths[0], allocator, .limited(64));
+    defer allocator.free(staged_bytes);
+    try std.testing.expectEqualSlices(u8, small[0..], staged_bytes);
+
+    // Consumed records cannot be claimed again by a second turn.
+    try std.testing.expectError(
+        error.InvalidState,
+        daemon.claimStagedChatAttachments(claim_params.value, true),
+    );
+
+    // A turn-start failure after the claim restores the records so the
+    // client retries without re-uploading; the restored records claim again.
+    daemon.restoreClaimedChatAttachments(&claim);
+    var reclaim = (try daemon.claimStagedChatAttachments(claim_params.value, true)).?;
+    defer reclaim.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), reclaim.image_paths.len);
+
+    // The periodic drain-loop sweep destroys consumed records once their
+    // retention window lapses — and rate-limits itself via the due timestamp.
+    lockDaemon(&daemon);
+    for (daemon.chat_attachments.items) |record| {
+        record.updated_at_ms -= STAGED_ATTACHMENT_CONSUMED_TTL_MS + 1;
+    }
+    daemon.chat_attachment_sweep_due_ms = 0;
+    daemon.mutex.unlock();
+    try std.testing.expect(daemon.maybeSweepStagedChatAttachments(nowMs()));
+    // Immediately after a sweep the next one is not yet due.
+    try std.testing.expect(!daemon.maybeSweepStagedChatAttachments(nowMs()));
+    lockDaemon(&daemon);
+    const remaining = daemon.chat_attachments.items.len;
+    daemon.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 0), remaining);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().readFileAlloc(io, claim.image_paths[0], allocator, .limited(64)),
+    );
+}
+
+test "staged chat attachments reject invalid input at every stage" {
+    const allocator = std.testing.allocator;
+
+    // Store-less runtimes advertise no staging capability and refuse creates.
+    {
+        var storeless = Daemon.init(allocator);
+        defer storeless.deinit();
+        var response = try testAttachmentRpc(&storeless, .create,
+            \\{"mime":"image/png","byte_size":4096}
+        );
+        defer response.deinit();
+        try std.testing.expectEqualStrings(
+            headless.protocol.ERR_CAPABILITY_UNAVAILABLE,
+            testRpcErrorCode(response.value).?,
+        );
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+    var daemon = Daemon.initWithPrefPath(allocator, root_buffer[0..root_len]);
+    defer daemon.deinit();
+    const service = try allocator.create(StoreService);
+    const store = daemon_store.Store.initWithRuntimeIdentity(allocator, db_path, .none, .{
+        .runtime_id = daemon.runtime_id,
+        .instance_id = daemon.instance_id,
+    }) catch |err| {
+        allocator.destroy(service);
+        return err;
+    };
+    service.* = .{ .store = store };
+    daemon.store_service = service;
+    defer detachTestStoreService(&daemon);
+
+    const cases: []const struct { method: TestAttachmentMethod, params: []const u8, code: []const u8 } = &.{
+        // Unsupported MIME and out-of-range declarations never allocate state.
+        .{ .method = .create, .params = "{\"mime\":\"text/plain\",\"byte_size\":4096}", .code = headless.protocol.ERR_INVALID_PARAMS },
+        .{ .method = .create, .params = "{\"mime\":\"image/png\",\"byte_size\":8}", .code = headless.protocol.ERR_INVALID_PARAMS },
+        .{ .method = .create, .params = "{\"mime\":\"image/png\",\"byte_size\":53687091200}", .code = headless.protocol.ERR_INVALID_PARAMS },
+        // Just past the portable per-image cap (16 MiB): accepted staging
+        // must never defer a deterministic provider-harness failure.
+        .{ .method = .create, .params = "{\"mime\":\"image/png\",\"byte_size\":16777217}", .code = headless.protocol.ERR_INVALID_PARAMS },
+        // Traversal-shaped and unknown ids are rejected before any file work.
+        .{ .method = .append, .params = "{\"attachment_id\":\"../../../../etc/passwd0000000000\",\"offset\":0,\"data\":\"aGk=\"}", .code = headless.protocol.ERR_INVALID_PARAMS },
+        .{ .method = .append, .params = "{\"attachment_id\":\"00000000000000000000000000000000\",\"offset\":0,\"data\":\"aGk=\"}", .code = headless.protocol.ERR_RESOURCE_NOT_FOUND },
+        .{ .method = .commit, .params = "{\"attachment_id\":\"00000000000000000000000000000000\"}", .code = headless.protocol.ERR_RESOURCE_NOT_FOUND },
+    };
+    for (cases) |case| {
+        var response = try testAttachmentRpc(&daemon, case.method, case.params);
+        defer response.deinit();
+        try std.testing.expectEqualStrings(case.code, testRpcErrorCode(response.value).?);
+    }
+
+    // Stage one attachment and probe the byte-level guards against it.
+    var create = try testAttachmentRpc(&daemon, .create,
+        \\{"mime":"image/png","byte_size":16}
+    );
+    defer create.deinit();
+    const staged_id = testRpcResultField(create.value, "attachment_id").?.string;
+
+    const png_magic = "\x89PNG\r\n\x1a\n";
+    var payload: [16]u8 = undefined;
+    @memcpy(payload[0..png_magic.len], png_magic);
+    @memset(payload[png_magic.len..], 0x11);
+    var not_png: [16]u8 = @splat(0xFF);
+
+    // First chunk with mismatched magic bytes: the lying MIME never lands.
+    {
+        const chunk_json = try testAppendChunkJsonAlloc(allocator, staged_id, 0, not_png[0..]);
+        defer allocator.free(chunk_json);
+        var response = try testAttachmentRpc(&daemon, .append, chunk_json);
+        defer response.deinit();
+        try std.testing.expectEqualStrings(headless.protocol.ERR_INVALID_PARAMS, testRpcErrorCode(response.value).?);
+    }
+    // Out-of-order offsets are rejected exactly.
+    {
+        const chunk_json = try testAppendChunkJsonAlloc(allocator, staged_id, 4, payload[0..]);
+        defer allocator.free(chunk_json);
+        var response = try testAttachmentRpc(&daemon, .append, chunk_json);
+        defer response.deinit();
+        try std.testing.expectEqualStrings(headless.protocol.ERR_INVALID_PARAMS, testRpcErrorCode(response.value).?);
+    }
+    // Committing before all declared bytes arrive fails.
+    {
+        const commit_json = try std.fmt.allocPrint(allocator, "{{\"attachment_id\":\"{s}\"}}", .{staged_id});
+        defer allocator.free(commit_json);
+        var response = try testAttachmentRpc(&daemon, .commit, commit_json);
+        defer response.deinit();
+        try std.testing.expectEqualStrings(headless.protocol.ERR_INVALID_STATE, testRpcErrorCode(response.value).?);
+    }
+    // Complete the upload, then verify overflow beyond byte_size is refused.
+    {
+        const chunk_json = try testAppendChunkJsonAlloc(allocator, staged_id, 0, payload[0..]);
+        defer allocator.free(chunk_json);
+        var response = try testAttachmentRpc(&daemon, .append, chunk_json);
+        defer response.deinit();
+        try std.testing.expect(testRpcResultField(response.value, "received_bytes") != null);
+    }
+    {
+        const chunk_json = try testAppendChunkJsonAlloc(allocator, staged_id, 16, payload[0..1]);
+        defer allocator.free(chunk_json);
+        var response = try testAttachmentRpc(&daemon, .append, chunk_json);
+        defer response.deinit();
+        try std.testing.expectEqualStrings(headless.protocol.ERR_INVALID_PARAMS, testRpcErrorCode(response.value).?);
+    }
+
+    // Claims: uncommitted records, non-repository routes, and malformed
+    // entries all fail without consuming anything.
+    const uncommitted_json = try std.fmt.allocPrint(allocator, "{{\"attachments\":[\"{s}\"]}}", .{staged_id});
+    defer allocator.free(uncommitted_json);
+    var uncommitted_params = try std.json.parseFromSlice(std.json.Value, allocator, uncommitted_json, .{});
+    defer uncommitted_params.deinit();
+    try std.testing.expectError(
+        error.InvalidState,
+        daemon.claimStagedChatAttachments(uncommitted_params.value, true),
+    );
+    {
+        const commit_json = try std.fmt.allocPrint(allocator, "{{\"attachment_id\":\"{s}\"}}", .{staged_id});
+        defer allocator.free(commit_json);
+        var response = try testAttachmentRpc(&daemon, .commit, commit_json);
+        defer response.deinit();
+        try std.testing.expect(testRpcResultField(response.value, "attachment_id") != null);
+    }
+    try std.testing.expectError(
+        error.InvalidParams,
+        daemon.claimStagedChatAttachments(uncommitted_params.value, false),
+    );
+    var malformed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"attachments":[42]}
+    , .{});
+    defer malformed.deinit();
+    try std.testing.expectError(
+        error.InvalidParams,
+        daemon.claimStagedChatAttachments(malformed.value, true),
+    );
+    // Duplicate ids would double-consume one staged record: whole claim fails
+    // atomically and the record stays committed.
+    const duplicate_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"attachments\":[\"{s}\",\"{s}\"]}}",
+        .{ staged_id, staged_id },
+    );
+    defer allocator.free(duplicate_json);
+    var duplicate_params = try std.json.parseFromSlice(std.json.Value, allocator, duplicate_json, .{});
+    defer duplicate_params.deinit();
+    try std.testing.expectError(
+        error.InvalidParams,
+        daemon.claimStagedChatAttachments(duplicate_params.value, true),
+    );
+    // The committed record survived every failed claim and remains claimable.
+    var claim = (try daemon.claimStagedChatAttachments(uncommitted_params.value, true)).?;
+    defer claim.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), claim.image_paths.len);
+
+    // Aggregate declared-byte budgets bound disk amplification beyond the
+    // count caps; maxInt also exercises the saturating-add comparison.
+    lockDaemon(&daemon);
+    const budget_record = daemon.chat_attachments.items[0];
+    const real_declared = budget_record.declared_bytes;
+    budget_record.declared_bytes = std.math.maxInt(usize);
+    daemon.mutex.unlock();
+    {
+        var response = try testAttachmentRpc(&daemon, .create, "{\"mime\":\"image/png\",\"byte_size\":4096}");
+        defer response.deinit();
+        try std.testing.expectEqualStrings(headless.protocol.ERR_INVALID_STATE, testRpcErrorCode(response.value).?);
+    }
+    lockDaemon(&daemon);
+    budget_record.declared_bytes = real_declared;
+    daemon.mutex.unlock();
+    {
+        var response = try testAttachmentRpc(&daemon, .create, "{\"mime\":\"image/png\",\"byte_size\":4096}");
+        defer response.deinit();
+        try std.testing.expect(testRpcResultField(response.value, "attachment_id") != null);
+    }
+
+    // Drain gate: once prepareShutdown flips accepting_mutations, all three
+    // unlocked staging handlers refuse before any file work (they own the
+    // lockDaemon check because the generic gate's unlocked read is unsafe).
+    lockDaemon(&daemon);
+    daemon.accepting_mutations = false;
+    daemon.mutex.unlock();
+    const drained_cases: []const struct { method: TestAttachmentMethod, params: []const u8 } = &.{
+        .{ .method = .create, .params = "{\"mime\":\"image/png\",\"byte_size\":4096}" },
+        .{ .method = .append, .params = "{\"attachment_id\":\"00000000000000000000000000000000\",\"offset\":0,\"data\":\"aGk=\"}" },
+        .{ .method = .commit, .params = "{\"attachment_id\":\"00000000000000000000000000000000\"}" },
+    };
+    for (drained_cases) |case| {
+        var response = try testAttachmentRpc(&daemon, case.method, case.params);
+        defer response.deinit();
+        try std.testing.expectEqualStrings(headless.protocol.ERR_INVALID_STATE, testRpcErrorCode(response.value).?);
+        const err = response.value.object.get("error").?;
+        try std.testing.expect(std.mem.indexOf(u8, jsonString(err.object.get("message") orelse .null).?, "not accepting mutations") != null);
+    }
+    lockDaemon(&daemon);
+    daemon.accepting_mutations = true;
+    daemon.mutex.unlock();
+}
+
+test "attachment staging directory is created private and reusable" {
+    // Regression: the directory was opened as an O_PATH handle, so the
+    // permission tightening failed with EBADF and every create reported the
+    // staging directory as unavailable — on a fresh directory and on every
+    // later call against the existing one.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+
+    try tmp.dir.createDirPath(io, "pref");
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    const dir_path = try std.fs.path.join(allocator, &.{ root_buffer[0..root_len], "pref", CHAT_ATTACHMENT_DIR_NAME });
+    defer allocator.free(dir_path);
+
+    // Fresh directory, then the idempotent path against the existing one.
+    try ensureChatAttachmentStagingDirectory(io, dir_path);
+    try ensureChatAttachmentStagingDirectory(io, dir_path);
+
+    const stat = try std.Io.Dir.cwd().statFile(io, dir_path, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(std.Io.File.Kind.directory, stat.kind);
+    if (builtin.os.tag != .windows) {
+        try std.testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast(@intFromEnum(stat.permissions) & 0o777)));
+    }
+}
+
+test "attachment staging never follows a planted symlink at create or cleanup" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+
+    // Victim directory with a sentinel file: a symlink attack would redirect
+    // staging writes (or the startup wipe) into it.
+    try tmp.dir.createDirPath(io, "victim");
+    try tmp.dir.writeFile(io, .{ .sub_path = "victim/keep.txt", .data = "sentinel" });
+    try tmp.dir.createDirPath(io, "pref");
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const victim_path = try std.fs.path.join(allocator, &.{ root, "victim" });
+    defer allocator.free(victim_path);
+    const pref_path = try std.fs.path.join(allocator, &.{ root, "pref" });
+    defer allocator.free(pref_path);
+    const link_path = try std.fs.path.join(allocator, &.{ pref_path, CHAT_ATTACHMENT_DIR_NAME });
+    defer allocator.free(link_path);
+    try std.Io.Dir.cwd().symLink(io, victim_path, link_path, .{ .is_directory = true });
+
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+    var daemon = Daemon.initWithPrefPath(allocator, pref_path);
+    defer daemon.deinit();
+    const service = try allocator.create(StoreService);
+    const store = daemon_store.Store.initWithRuntimeIdentity(allocator, db_path, .none, .{
+        .runtime_id = daemon.runtime_id,
+        .instance_id = daemon.instance_id,
+    }) catch |err| {
+        allocator.destroy(service);
+        return err;
+    };
+    service.* = .{ .store = store };
+    daemon.store_service = service;
+    defer detachTestStoreService(&daemon);
+
+    // Create refuses before any open/chmod/write through the link.
+    {
+        var response = try testAttachmentRpc(&daemon, .create,
+            \\{"mime":"image/png","byte_size":4096}
+        );
+        defer response.deinit();
+        try std.testing.expectEqualStrings(headless.protocol.ERR_INVALID_STATE, testRpcErrorCode(response.value).?);
+    }
+    // The victim's contents are untouched and nothing was staged into it.
+    const sentinel = try tmp.dir.readFileAlloc(io, "victim/keep.txt", allocator, .limited(64));
+    defer allocator.free(sentinel);
+    try std.testing.expectEqualStrings("sentinel", sentinel);
+    var victim_dir = try tmp.dir.openDir(io, "victim", .{ .iterate = true });
+    defer victim_dir.close(io);
+    var victim_it = victim_dir.iterate();
+    var victim_entries: usize = 0;
+    while (try victim_it.next(io)) |_| victim_entries += 1;
+    try std.testing.expectEqual(@as(usize, 1), victim_entries);
+
+    // Startup cleanup unlinks only the link itself; it never recurses
+    // through the symlink into the victim directory.
+    wipeStagedChatAttachmentDirectory(&daemon);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(io, link_path, .{ .follow_symlinks = false }),
+    );
+    const survivor = try tmp.dir.readFileAlloc(io, "victim/keep.txt", allocator, .limited(64));
+    defer allocator.free(survivor);
+    try std.testing.expectEqualStrings("sentinel", survivor);
+
+    // With the link gone, the same daemon stages normally into a fresh
+    // private real directory.
+    {
+        var response = try testAttachmentRpc(&daemon, .create,
+            \\{"mime":"image/png","byte_size":4096}
+        );
+        defer response.deinit();
+        try std.testing.expect(testRpcResultField(response.value, "attachment_id") != null);
+    }
+    const staging_stat = try std.Io.Dir.cwd().statFile(io, link_path, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(std.Io.File.Kind.directory, staging_stat.kind);
+}
+
 fn createChatTurnFromParams(
     allocator: std.mem.Allocator,
     params: std.json.Value,
     execution_route: ?*const ChatExecutionRoute,
+    claimed_attachments: ?*const ClaimedAttachments,
 ) !*ChatTurn {
     const turn = try allocator.create(ChatTurn);
     errdefer allocator.destroy(turn);
-    const image_paths = try jsonStringArray(allocator, params.object.get("image_paths") orelse .null);
+    // Repository-routed turns resolve attachments from staged runtime-local
+    // files; the caller retains claim ownership so the turn dupes here.
+    const image_paths = if (claimed_attachments) |claim|
+        try dupeStringArray(allocator, claim.image_paths)
+    else
+        try jsonStringArray(allocator, params.object.get("image_paths") orelse .null);
     errdefer freeStringArray(allocator, image_paths);
-    const owned_images = try jsonAttachmentArray(allocator, params.object.get("images") orelse .null);
+    const owned_images = if (claimed_attachments) |claim|
+        try dupeAttachmentArray(allocator, claim.images)
+    else
+        try jsonAttachmentArray(allocator, params.object.get("images") orelse .null);
     errdefer freeAttachmentArray(allocator, owned_images);
     const provider = parseEnum(harness.Provider, jsonString(params.object.get("provider") orelse .null) orelse return error.InvalidParams) orelse return error.InvalidParams;
     const harness_kind = parseEnum(harness.HarnessKind, jsonString(params.object.get("harness") orelse .null) orelse "local_cli") orelse return error.InvalidParams;
@@ -12995,6 +14210,43 @@ fn jsonStringArray(allocator: std.mem.Allocator, value: std.json.Value) ![]const
 fn freeStringArray(allocator: std.mem.Allocator, values: []const []const u8) void {
     for (values) |value| allocator.free(value);
     allocator.free(values);
+}
+
+fn dupeStringArray(allocator: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (list.items) |value| allocator.free(value);
+        list.deinit(allocator);
+    }
+    for (values) |value| {
+        const owned = try allocator.dupe(u8, value);
+        errdefer allocator.free(owned);
+        try list.append(allocator, owned);
+    }
+    return try list.toOwnedSlice(allocator);
+}
+
+fn dupeAttachmentArray(allocator: std.mem.Allocator, values: []const store_protocol.Attachment) ![]store_protocol.Attachment {
+    var list: std.ArrayList(store_protocol.Attachment) = .empty;
+    errdefer {
+        for (list.items) |attachment| {
+            allocator.free(attachment.path);
+            allocator.free(attachment.mime);
+        }
+        list.deinit(allocator);
+    }
+    for (values) |attachment| {
+        const owned_path = try allocator.dupe(u8, attachment.path);
+        errdefer allocator.free(owned_path);
+        const owned_mime = try allocator.dupe(u8, attachment.mime);
+        errdefer allocator.free(owned_mime);
+        try list.append(allocator, .{
+            .path = owned_path,
+            .mime = owned_mime,
+            .byte_size = attachment.byte_size,
+        });
+    }
+    return try list.toOwnedSlice(allocator);
 }
 
 fn commandForOptions(allocator: std.mem.Allocator, args: []const []const u8) ![][:0]u8 {
