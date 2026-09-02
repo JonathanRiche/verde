@@ -6882,25 +6882,44 @@ fn runChatKillMidTurnScenario(allocator: std.mem.Allocator, io: std.Io) !void {
         }
         if (!saw_user) return error.ChatKillMissingUserMessage;
 
-        // Stable-turn replay after the interrupted sweep keeps the immutable
-        // first-writer prompt while naturally drifting retry timestamps.
+        // The swept ID is terminally consumed: same-ID retry must fail before
+        // launching provider work. An explicit retry uses a fresh turn and
+        // message identity.
+        var rejected = try client2.call("chat.turn.start", .{
+            .turn_id = "turn-kill-1",
+            .workspace_id = "ws-kill",
+            .local_thread_id = "thread-kill",
+            .project_path = pref_path,
+            .prompt = "must not replay",
+            .thread_title = "M4 IT thread",
+            .provider = "codex",
+            .harness = "local_cli",
+            .message_id = "user-kill-replay",
+            .test_stub = true,
+        });
+        defer rejected.deinit();
+        const rejected_error = rejected.response.err orelse return error.ChatKillReplayWasAccepted;
+        if (!std.mem.eql(u8, rejected_error.code, headless.protocol.ERR_INVALID_STATE)) {
+            return error.ChatKillReplayWrongError;
+        }
+
         try startStubChatTurn(
             &client2,
-            "turn-kill-1",
+            "turn-kill-retry-1",
             "ws-kill",
             "thread-kill",
             pref_path,
-            "slow mid-turn",
-            "user-kill-1",
+            "retry after interruption",
+            "user-kill-retry-1",
         );
-        try waitChatTurnTerminal(io, &client2, "turn-kill-1", true);
-        var replay_rec = try client2.call(headless.store.METHOD_CHAT_TURN_RECORD, .{ .turn_id = "turn-kill-1" });
-        defer replay_rec.deinit();
-        if (!replay_rec.response.isOk()) return error.ChatKillReplayRecordFailed;
-        const replayed = try client2.decodeTurnRecord(&replay_rec);
-        if (!std.mem.eql(u8, replayed.status, "completed")) return error.ChatKillReplayNotCompleted;
-        if (replayed.committed_store_revision == null) return error.ChatKillReplayMissingRevision;
-        try consumeChatTurn(&client2, "turn-kill-1");
+        try waitChatTurnTerminal(io, &client2, "turn-kill-retry-1", true);
+        var retry_rec = try client2.call(headless.store.METHOD_CHAT_TURN_RECORD, .{ .turn_id = "turn-kill-retry-1" });
+        defer retry_rec.deinit();
+        if (!retry_rec.response.isOk()) return error.ChatKillRetryRecordFailed;
+        const retried = try client2.decodeTurnRecord(&retry_rec);
+        if (!std.mem.eql(u8, retried.status, "completed")) return error.ChatKillRetryNotCompleted;
+        if (retried.committed_store_revision == null) return error.ChatKillRetryMissingRevision;
+        try consumeChatTurn(&client2, "turn-kill-retry-1");
 
         var prepare = try client2.call("daemon.prepareShutdown", .{});
         defer prepare.deinit();
@@ -6909,7 +6928,8 @@ fn runChatKillMidTurnScenario(allocator: std.mem.Allocator, io: std.Io) !void {
         _ = child2.wait(io) catch {};
     }
 
-    // RO pin: exactly one ledger row + one commit receipt after interrupted→replay.
+    // RO pin: the interrupted ID remains unchanged and receipt-free; only the
+    // explicit fresh-ID retry commits provider output.
     {
         const db_path = try std.fs.path.join(allocator, &.{ store_dir, "state.sqlite" });
         defer allocator.free(db_path);
@@ -6928,13 +6948,25 @@ fn runChatKillMidTurnScenario(allocator: std.mem.Allocator, io: std.Io) !void {
             .{},
         )).?;
         defer receipts.deinit();
-        if (receipts.int(0) != 1) return error.ChatKillReplayReceiptCount;
+        if (receipts.int(0) != 0) return error.ChatKillReplayReceiptCount;
         var status_row = (try conn.row(
             "select status from chat_turns where turn_id = 'turn-kill-1'",
             .{},
         )).?;
         defer status_row.deinit();
-        if (!std.mem.eql(u8, status_row.text(0), "completed")) return error.ChatKillReplayLedgerStatus;
+        if (!std.mem.eql(u8, status_row.text(0), "interrupted")) return error.ChatKillReplayLedgerStatus;
+        var guard_row = (try conn.row(
+            "select status from terminal_turn_replay_guard where turn_id = 'turn-kill-1'",
+            .{},
+        )).?;
+        defer guard_row.deinit();
+        if (!std.mem.eql(u8, guard_row.text(0), "interrupted")) return error.ChatKillReplayGuardStatus;
+        var retry_receipt = (try conn.row(
+            "select count(*) from store_receipts where request_key = 'turn:turn-kill-retry-1:commit'",
+            .{},
+        )).?;
+        defer retry_receipt.deinit();
+        if (retry_receipt.int(0) != 1) return error.ChatKillRetryReceiptCount;
     }
 }
 

@@ -9,11 +9,13 @@
     "types": "tsc --noEmit"
   },
   "dependencies": {
+    "dompurify": "^3.4.14",
     "marked": "^18.0.9",
     "solid-js": "^1.9.14"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.3",
+    "jsdom": "^30.0.1",
     "tailwindcss": "^4.3.3",
     "typescript": "^7.0.2",
     "vite": "^8.2.1",

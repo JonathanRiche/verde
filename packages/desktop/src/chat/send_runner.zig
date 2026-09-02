@@ -24,8 +24,6 @@ pub const Request = struct {
     cursor_model_params_json: ?[]const u8 = null,
     fast_mode: FastMode = .off,
     access_mode: AccessMode = .full_access,
-    remote_ssh_host: ?[]const u8 = null,
-    remote_cwd: ?[]const u8 = null,
 };
 
 pub const Result = struct {
@@ -46,9 +44,8 @@ pub const Sink = struct {
 
 pub fn run(allocator: std.mem.Allocator, request: Request, sink: Sink) !Result {
     if (request.harness_kind != .local_cli) return error.UnsupportedHarnessMode;
-    if (request.remote_ssh_host != null and request.provider != .codex) return error.UnsupportedRemoteProvider;
 
-    const request_cwd = request.remote_cwd orelse request.cwd orelse request.project_path;
+    const request_cwd = request.cwd orelse request.project_path;
     const provider_config = switch (request.provider) {
         .opencode => harness.ProviderConfig{ .opencode = .{
             .allocator = allocator,
@@ -58,7 +55,6 @@ pub fn run(allocator: std.mem.Allocator, request: Request, sink: Sink) !Result {
         .codex => harness.ProviderConfig{ .codex = .{
             .cwd = request_cwd,
             .launch_on_connect = true,
-            .remote_ssh = if (request.remote_ssh_host) |host| .{ .host = host, .cwd = request_cwd } else null,
         } },
         .claude => harness.ProviderConfig{ .claude = .{ .cwd = request_cwd } },
         .cursor => harness.ProviderConfig{ .cursor = .{ .cwd = request_cwd, .model = request.model_ref } },

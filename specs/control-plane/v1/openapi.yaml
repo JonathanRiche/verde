@@ -1,0 +1,380 @@
+openapi: 3.1.0
+info:
+  title: Verde Connect Control Plane API
+  version: 1.0.0
+  license:
+    name: MIT
+  description: |
+    Open, self-hostable identity, runtime linking, discovery, endpoint enrollment,
+    scoped bootstrap, revocation, and audit boundary for Verde Connect. This API
+    never carries prompt content, terminal bytes, repository files, or provider
+    credentials. Identity-bearing inputs use authenticated POST/DELETE bodies,
+    never query parameters.
+servers:
+  - url: https://connect.example.com
+security:
+  - bearerAuth: []
+paths:
+  /.well-known/verde-connect-configuration:
+    get:
+      operationId: getConnectConfiguration
+      security: []
+      summary: Discover the Connect contract, upstream OIDC provider, and grant signer
+      responses:
+        "200":
+          description: Discovery metadata
+          content:
+            application/json:
+              schema:
+                $ref: ./schemas/discovery.schema.json
+  /healthz:
+    get:
+      operationId: getHealth
+      security: []
+      summary: Process liveness without dependency or inventory disclosure
+      responses:
+        "200":
+          description: Alive
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ok]
+                properties:
+                  ok:
+                    const: true
+  /readyz:
+    get:
+      operationId: getReadiness
+      security: []
+      summary: Dependency readiness without inventory disclosure
+      responses:
+        "200":
+          description: Ready
+        "503":
+          description: Not ready
+  /v1/signer-metadata:
+    get:
+      operationId: getSignerMetadata
+      security: []
+      summary: Discover the Connect bootstrap-grant signer
+      responses:
+        "200":
+          description: Signer metadata
+          content:
+            application/json:
+              schema:
+                $ref: ./schemas/signer-discovery.schema.json
+  /v1/.well-known/jwks.json:
+    get:
+      operationId: getGrantJwks
+      security: []
+      summary: Fetch public keys for Connect bootstrap grants
+      responses:
+        "200":
+          description: Public JSON Web Key Set
+          content:
+            application/jwk-set+json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [keys]
+                properties:
+                  keys:
+                    type: array
+                    minItems: 1
+                    items:
+                      $ref: ./schemas/common.schema.json#/$defs/ed25519PublicJwk
+  /v1/runtime-links/challenges:
+    post:
+      operationId: createRuntimeLinkChallenge
+      summary: Issue a one-time challenge bound to a principal, runtime, instance, and key
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ./schemas/runtime-link.schema.json#/$defs/challengeRequest
+      responses:
+        "200":
+          description: Existing challenge returned for an identical request_id and body
+          content:
+            application/json:
+              schema:
+                $ref: ./schemas/runtime-link.schema.json#/$defs/challengeResponse
+        "201":
+          description: Challenge issued
+          content:
+            application/json:
+              schema:
+                $ref: ./schemas/runtime-link.schema.json#/$defs/challengeResponse
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "413": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+        "431": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/runtime-links:
+    post:
+      operationId: createRuntimeLink
+      summary: Consume a challenge and verify the runtime's Ed25519 proof
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ./schemas/runtime-link.schema.json#/$defs/proofRequest
+      responses:
+        "200":
+          description: Existing runtime link returned for the identical consumed proof
+          content:
+            application/json:
+              schema:
+                $ref: ./schemas/runtime-link.schema.json#/$defs/link
+        "201":
+          description: Runtime linked
+          content:
+            application/json:
+              schema:
+                $ref: ./schemas/runtime-link.schema.json#/$defs/link
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "413": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+        "431": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/runtime-links/{link_id}:
+    parameters:
+      - name: link_id
+        in: path
+        required: true
+        schema:
+          $ref: ./schemas/common.schema.json#/$defs/linkId
+    delete:
+      operationId: unlinkRuntime
+      summary: Idempotently unlink a runtime and disable new issuance
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ./schemas/runtime-link.schema.json#/$defs/unlinkRequest
+      responses:
+        "200":
+          description: Current unlinked record
+          content:
+            application/json:
+              schema:
+                $ref: ./schemas/runtime-link.schema.json#/$defs/link
+        "400": { $ref: "#/components/responses/Error" }
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "413": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+        "431": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/runtime-links/{link_id}/endpoint-enrollments:
+    parameters:
+      - name: link_id
+        in: path
+        required: true
+        schema:
+          $ref: ./schemas/common.schema.json#/$defs/linkId
+    post:
+      operationId: enrollRuntimeEndpoint
+      summary: Provision or register an endpoint through the configured provider adapter
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ./schemas/endpoint-enrollment.schema.json#/$defs/request
+      responses:
+        "200":
+          description: Existing enrollment reproduced for an identical request_id and body
+          content:
+            application/json:
+              schema:
+                $ref: ./schemas/endpoint-enrollment.schema.json#/$defs/response
+        "201":
+          description: Endpoint enrolled; connector material, if any, is JWE-encrypted to the linked runtime
+          content:
+            application/json:
+              schema:
+                $ref: ./schemas/endpoint-enrollment.schema.json#/$defs/response
+        "400": { $ref: "#/components/responses/Error" }
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "413": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+        "431": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/runtime-inventory/query:
+    post:
+      operationId: queryRuntimeInventory
+      summary: Query only runtimes linked to the authenticated principal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ./schemas/inventory.schema.json#/$defs/request
+      responses:
+        "200":
+          description: Principal-scoped normalized runtime inventory
+          content:
+            application/json:
+              schema:
+                $ref: ./schemas/inventory.schema.json#/$defs/response
+        "400": { $ref: "#/components/responses/Error" }
+        "401":
+          $ref: "#/components/responses/Error"
+        "413": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+        "431": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/connection-bootstraps:
+    post:
+      operationId: createConnectionBootstrap
+      summary: Issue an idempotent, short-lived, scoped, replay-bound bootstrap grant
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ./schemas/bootstrap.schema.json#/$defs/request
+      responses:
+        "200":
+          description: Existing signed grant returned for an identical request_id and body
+          content:
+            application/json:
+              schema:
+                $ref: ./schemas/bootstrap.schema.json#/$defs/response
+        "201":
+          description: Signed Connect grant; it is not a runtime access token
+          content:
+            application/json:
+              schema:
+                $ref: ./schemas/bootstrap.schema.json#/$defs/response
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "413": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+        "431": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/revocations:
+    post:
+      operationId: revokeConnectEntity
+      summary: Idempotently revoke a principal-owned link, device, or enrollment for future issuance
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ./schemas/revocation.schema.json#/$defs/request
+      responses:
+        "200":
+          description: Current revocation record
+          content:
+            application/json:
+              schema:
+                $ref: ./schemas/revocation.schema.json#/$defs/response
+        "400": { $ref: "#/components/responses/Error" }
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+        "431": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/operator/audit-events/query:
+    post:
+      operationId: queryAuditEvents
+      summary: Export bounded security events under the operator service policy
+      security:
+        - operatorBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [contract_version]
+              properties:
+                contract_version:
+                  $ref: ./schemas/common.schema.json#/$defs/contractVersion
+                after_event_id:
+                  $ref: ./schemas/common.schema.json#/$defs/eventId
+                limit:
+                  type: integer
+                  minimum: 1
+                  maximum: 100
+      responses:
+        "200":
+          description: Bounded audit page
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          description: Operator export is disabled when no operator token is configured
+        "400": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+        "431": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: OIDC access token
+    operatorBearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque operator service token
+  responses:
+    Error:
+      description: Stable fail-closed error
+      content:
+        application/json:
+          schema:
+            $ref: ./schemas/common.schema.json#/$defs/error

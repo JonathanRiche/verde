@@ -50,8 +50,8 @@ pub fn State(
         model_picker_entries: std.ArrayList(ModelPickerEntry) = .empty,
         directory_picker: DirectoryPicker,
         directory_picker_entries: std.ArrayList(DirectoryPickerEntry) = .empty,
-        /// Local/Remote runtime chooser on the directory strip; Remote is a
-        /// reserved "coming soon" row until cloud/remote daemons ship.
+        /// Per-thread runtime chooser on the directory strip. Local is built
+        /// in; configured remote rows and their statuses come from Service.
         runtime_picker: RuntimePicker,
         /// Set while the shared folder dialog was opened from the directory
         /// picker's Browse row, so `pollPicker` routes the result to the

@@ -1,0 +1,37 @@
+{
+  "contract_version": "1",
+  "unsigned_request": {
+    "contract_version": "1",
+    "request_id": "req_22222222222222222222222222222222",
+    "runtime_id": "0123456789abcdef0123456789abcdef",
+    "instance_id": "abcdef0123456789abcdef0123456789",
+    "device_id": "dev_33333333333333333333333333333333",
+    "device_signing_jwk": {
+      "kty": "OKP",
+      "crv": "Ed25519",
+      "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+      "kid": "test-runtime-signing-v1",
+      "use": "sig",
+      "alg": "EdDSA"
+    },
+    "audience": "https://runtime.example.test",
+    "client_nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "scopes": ["runtime:read", "chat:write"],
+    "expires_at": "2030-01-01T00:01:30.000Z"
+  },
+  "request_digest": "yL3ykTICu-Ec-IZRNNZ9s-InqwxsPEG2uBhDEeOMU7w",
+  "jwt": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3QtcnVudGltZS1zaWduaW5nLXYxIiwidHlwIjoidmVyZGUtY29ubmVjdC1kZXZpY2UtcHJvb2Yrand0In0.eyJjb250cmFjdF92ZXJzaW9uIjoiMSIsInJlcXVlc3RfaWQiOiJyZXFfMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIiLCJyZXF1ZXN0X2RpZ2VzdCI6InlMM3lrVElDdS1FYy1JWlJOTlo5cy1JbnF3eHNQRUcydUJoREVlT01VN3ciLCJkZXZpY2VfaWQiOiJkZXZfMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMiLCJkZXZpY2Vfa2V5X3RodW1icHJpbnQiOiJrUHJLX3FteFZXYVlWQTl3d0JGNkl1bzN2Vnp6N1R4SENUd1hCeWdyUzRrIiwicHJpbmNpcGFsIjp7Imlzc3VlciI6Imh0dHBzOi8vaWQuZXhhbXBsZS50ZXN0Iiwic3ViamVjdCI6InRlc3Qtc3ViamVjdCJ9LCJpc3MiOiJ1cm46dmVyZGU6Y29ubmVjdC1kZXZpY2U6ZGV2XzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzIiwic3ViIjoiZGV2XzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzIiwiYXVkIjoiaHR0cHM6Ly9jb25uZWN0LmV4YW1wbGUudGVzdCIsImp0aSI6InJlcV8yMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMiIsImlhdCI6MTg5MzQ1NjAwMCwibmJmIjoxODkzNDU2MDAwLCJleHAiOjE4OTM0NTYwOTB9.uUH5BgpkSQ_7gQgnTYHixJBBIE0Ai9vk46kBPuq7_aB0B10PtAiQIBUwta7WwuqblR-g3M84J-_D5AWkXrtlBA",
+  "public_jwk": {
+    "kty": "OKP",
+    "crv": "Ed25519",
+    "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+    "kid": "test-runtime-signing-v1",
+    "use": "sig",
+    "alg": "EdDSA"
+  },
+  "principal": {
+    "issuer": "https://id.example.test",
+    "subject": "test-subject"
+  },
+  "now": "2030-01-01T00:00:00.000Z"
+}

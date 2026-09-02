@@ -56,6 +56,11 @@ warn_missing_wpe_runtime() {
 }
 
 install -m 755 "$SCRIPT_DIR/bin/verde" "$PREFIX/bin/verde"
+for runtime_binary in verde-server verde-daemon verde-web; do
+  if [[ -x "$SCRIPT_DIR/bin/$runtime_binary" ]]; then
+    install -m 755 "$SCRIPT_DIR/bin/$runtime_binary" "$PREFIX/bin/$runtime_binary"
+  fi
+done
 cat > "$PREFIX/bin/verde-launch" <<EOF
 #!/usr/bin/env sh
 script_dir="$PREFIX/bin"
@@ -113,6 +118,10 @@ fi
 rm -rf "$PREFIX/share/verde/node_modules"
 if [[ -e "$SCRIPT_DIR/share/verde/provider_bridge.mjs" ]]; then
   install -m 644 "$SCRIPT_DIR/share/verde/provider_bridge.mjs" "$PREFIX/share/verde/provider_bridge.mjs"
+fi
+if [[ -d "$SCRIPT_DIR/share/verde/web" ]]; then
+  rm -rf "$PREFIX/share/verde/web"
+  cp -a "$SCRIPT_DIR/share/verde/web" "$PREFIX/share/verde/web"
 fi
 warn_missing_wpe_runtime "$PREFIX/bin/verde-browser-linux"
 

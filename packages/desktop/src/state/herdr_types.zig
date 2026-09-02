@@ -32,22 +32,10 @@ pub const HerdrPaneProvider = enum(u8) {
 
 pub const ProviderExecutionTarget = union(enum) {
     local: []const u8,
-    remote_ssh: struct {
-        host: []const u8,
-        cwd: []const u8,
-    },
 
     pub fn cwd(self: ProviderExecutionTarget) []const u8 {
         return switch (self) {
             .local => |path| path,
-            .remote_ssh => |remote| remote.cwd,
-        };
-    }
-
-    pub fn remoteHost(self: ProviderExecutionTarget) ?[]const u8 {
-        return switch (self) {
-            .local => null,
-            .remote_ssh => |remote| remote.host,
         };
     }
 };
@@ -102,6 +90,8 @@ pub const HerdrPaneLink = struct {
 };
 
 pub const HerdrWorkspaceLink = struct {
+    // Retained as empty/null compatibility fields until the legacy database
+    // columns can be removed in a separate schema migration.
     remote_alias: []u8,
     session_name: []u8,
     workspace_id: []u8,
@@ -115,16 +105,14 @@ pub const HerdrWorkspaceLink = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
-        remote_alias: []const u8,
         session_name: []const u8,
         workspace_id: []const u8,
         local_dir: []const u8,
-        remote_cwd: ?[]const u8,
         last_pane_id: ?[]const u8,
         attach_dock_id: ?u32,
         attach_pane_id: ?WorkspacePaneId,
     ) !HerdrWorkspaceLink {
-        const remote_copy = try allocator.dupe(u8, remote_alias);
+        const remote_copy = try allocator.dupe(u8, "");
         errdefer allocator.free(remote_copy);
         const session_copy = try allocator.dupe(u8, session_name);
         errdefer allocator.free(session_copy);
@@ -132,9 +120,6 @@ pub const HerdrWorkspaceLink = struct {
         errdefer allocator.free(workspace_copy);
         const local_dir_copy = try allocator.dupe(u8, local_dir);
         errdefer allocator.free(local_dir_copy);
-        var remote_cwd_copy: ?[]u8 = null;
-        errdefer if (remote_cwd_copy) |value| allocator.free(value);
-        remote_cwd_copy = if (remote_cwd) |value| try allocator.dupe(u8, value) else null;
         var last_pane_copy: ?[]u8 = null;
         errdefer if (last_pane_copy) |value| allocator.free(value);
         last_pane_copy = if (last_pane_id) |value| try allocator.dupe(u8, value) else null;
@@ -143,7 +128,7 @@ pub const HerdrWorkspaceLink = struct {
             .session_name = session_copy,
             .workspace_id = workspace_copy,
             .local_dir = local_dir_copy,
-            .remote_cwd = remote_cwd_copy,
+            .remote_cwd = null,
             .last_pane_id = last_pane_copy,
             .attach_dock_id = attach_dock_id,
             .attach_pane_id = attach_pane_id,
@@ -155,11 +140,9 @@ pub const HerdrWorkspaceLink = struct {
     pub fn initFromPersisted(allocator: std.mem.Allocator, persisted: PersistedHerdrWorkspaceLink) !HerdrWorkspaceLink {
         var link = try init(
             allocator,
-            persisted.remote_alias,
             persisted.session_name,
             persisted.workspace_id,
             persisted.local_dir,
-            persisted.remote_cwd,
             persisted.last_pane_id,
             persisted.attach_dock_id,
             persisted.attach_pane_id,

@@ -1,67 +1,126 @@
 # Verde web client
 
-A first-party **web client** of the headless Verde daemon: Solid + Vite for presentation, a small Zig HTTP/WebSocket gateway for Zig-to-Zig protocol talk.
+The Verde web client is a Solid + Vite SPA with a small Zig HTTP/WebSocket gateway. `verde-web` is a detached client of the GUI-free session daemon; the desktop app does not need to be running.
 
-The desktop app stays the native Palette/SDL client. This package owns layout, focus, and rendering. It does not own workspaces, transcripts, or PTYs.
+The desktop remains the native Palette/SDL client. This package owns browser presentation, focus, and rendering. The session daemon owns workspaces, transcripts, turns, and PTYs.
 
 ## Layout
 
-```
+```text
 packages/web_app/
-  src/           Zig gateway (HTTP, WebSocket, unix-socket daemon client)
+  src/           Zig gateway: HTTP, WebSocket, auth, daemon client
   web/           Solid SPA
-  dist/          `bun run build` output, served by verde-web
+  dist/          bun run build output, served by verde-web
 ```
 
-Bind address defaults to `127.0.0.1`. Remote access is an SSH tunnel, not a public listen.
+Zig is the repository-pinned 0.16 toolchain from the root [`mise.toml`](../../mise.toml). Use `mise` from the repository root instead of a system Zig installation.
 
-Zig is the repo-pinned `0.16.0` from root [`mise.toml`](../../mise.toml). Use `mise` from the repo root — do not rely on a system `zig`.
+## Current security model
 
-## Dev
+The gateway supports two explicit request envelopes while its listener remains loopback-only:
 
-From the repo root:
+- `verde-web` rejects non-loopback binds.
+- An owner-only token file is required at startup.
+- Browser login uses `POST /auth/session` and receives a bounded, in-memory, `HttpOnly; SameSite=Strict` cookie.
+- Every runtime API and the exact `/ws` WebSocket upgrade requires that cookie or an `Authorization: Bearer` credential.
+- `GET /healthz` is the only unauthenticated health route and exposes liveness, not runtime inventory. `GET /login`, `GET /login.js`, and trusted static assets are public; unauthenticated app navigation redirects to `/login`.
+- The gateway talks only to `verde-sessionizer.sock`. It has no Desktop Live or mock fallback.
+- Arbitrary filesystem browsing and the legacy `/api/file` and `/api/preview` routes are not available.
+- Plain loopback requests support local use and SSH forwarding. Optional trusted-proxy mode accepts only the complete, exact forwarded HTTPS envelope for one configured origin, as used by Tailscale Serve; partial, mixed, duplicate, or standard `Forwarded` headers fail closed.
+
+Do not pass secrets through `--token`, `VERDE_WEB_TOKEN`, `?token=...`, or `X-Verde-Token`. Those legacy forms are rejected. Pass only a token-file path through `--token-file` or `VERDE_WEB_TOKEN_FILE`.
+
+Do not expose the gateway with a public bind, public firewall/NAT port, Tailscale Funnel, or an arbitrary public reverse proxy. Private Tailnet HTTPS through the ownership-checked `verde-server serve --tailscale` flow and SSH forwarding are supported; see [Standalone Daemon Deployment](../../docs/daemon-deployment.md) and [Verde Serve, Pair, and Connect](../../docs/serve-pair-connect.md).
+
+## Build and checks
+
+From the repository root:
 
 ```bash
-mise install          # zig 0.16.0 + zls
-mise run web-app      # zig gateway + Solid SPA
-mise run web-app-run  # serve http://127.0.0.1:7420/
+mise install
+mise run web-app
+mise run web-app-test
+mise run web-app-types
+cd packages/web_app && bun test
 ```
 
-Hot-reload the UI against that gateway (second terminal):
+`mise run web-app` builds `packages/web_app/zig-out/bin/verde-web` and `packages/web_app/dist/`. These build/test commands do not start a server.
+
+## Run the built client
+
+Create a development token without placing the secret in a process argument or URL:
+
+```bash
+gateway_token_dir="$(mktemp -d)"
+chmod 700 "$gateway_token_dir"
+openssl rand -hex 32 > "$gateway_token_dir/token"
+chmod 600 "$gateway_token_dir/token"
+```
+
+With a session daemon already serving its data directory, run the bundled SPA and gateway on loopback port 6783:
+
+```bash
+mise run web-app-run -- \
+  --port 6783 \
+  --token-file "$gateway_token_dir/token" \
+  --pref-path "$HOME/.local/share/verde/runtime"
+```
+
+Open `http://127.0.0.1:6783/login` and enter the token. The login page continues to the SPA after the session cookie is issued. Never append the token to the URL. Remove the temporary token directory after the gateway stops.
+
+The gateway does not start the session daemon. Use `verde-daemon init/serve/status` or the systemd user unit in the deployment guide.
+
+## Hot reload
+
+Start the authenticated gateway on its default loopback port in one terminal:
+
+```bash
+mise run web-app-run -- \
+  --token-file "$gateway_token_dir/token" \
+  --pref-path "$HOME/.local/share/verde/runtime"
+```
+
+Start Vite in a second terminal:
 
 ```bash
 mise run web-app-dev
 ```
 
-Vite is on `http://127.0.0.1:6783` (all interfaces) and proxies `/api` + `/ws` to `:7420`.
+Open `http://127.0.0.1:6783/login`. Vite proxies `/login`, `/auth`, `/api`, and `/ws` to the gateway on port 7420.
+
+Vite also binds `127.0.0.1:6783`. Keep it as a development-only process and use an SSH local forward if the browser is on another machine.
 
 | Task | Command |
 | --- | --- |
-| Install JS deps | `mise run web-app-setup` |
+| Install JS dependencies | `mise run web-app-setup` |
 | Build gateway + SPA | `mise run web-app` |
 | Zig tests | `mise run web-app-test` |
 | Typecheck SPA | `mise run web-app-types` |
-| Serve built SPA | `mise run web-app-run` |
-| Vite proxy / HMR | `mise run web-app-dev` |
+| Frontend tests | `cd packages/web_app && bun test` |
+| Serve built SPA | `mise run web-app-run -- --token-file <path>` |
+| Vite proxy/HMR | `mise run web-app-dev` |
 
-`mise run web-app-run -- --port 7421` forwards extra flags to `verde-web`.
+Do not start duplicate gateway or Vite processes. Inspect `ss -ltnp | rg ':(6783|7420)\b'` first and respect the existing owner.
 
-If the session daemon is not running, the gateway serves a review snapshot so the UI is still usable.
+## Protocol routes
 
-Do not start `web-app-run` from a Verde pane that owns this agent session if you are also iterating on the desktop daemon. The web gateway only talks over sockets; it does not replace `mise run dev`.
+- `GET /healthz` reports gateway liveness without daemon inventory.
+- `GET /login` and `GET /login.js` provide the public, no-store login flow; unauthenticated app navigation redirects there.
+- `POST /auth/session` verifies the token and issues the browser session cookie.
+- `POST /api/rpc` forwards one bounded JSON-RPC envelope to the headless session daemon.
+- `GET /api/status` and `GET /api/snapshot` are authenticated convenience wrappers over `core.status` and `core.snapshot`.
+- Exact `GET /ws` upgrades to the authenticated WebSocket projection. It sends the initial snapshot, pushes bounded `core.changes`, and accepts client RPC calls.
 
-## Protocol
-
-- `POST /api/rpc` — one JSON-RPC envelope, forwarded to the headless session daemon (`verde-sessionizer.sock`). Live (`verde.sock`) is only a fallback for methods the daemon does not implement
-- `GET /api/status`, `GET /api/snapshot` — convenience wrappers over `core.status` / `core.snapshot`
-- `WS /ws` — hello, then `core.snapshot` (`store` + `sessions` + `turns`); `core.changes` is pushed as notifications; client calls go the other way
-
-`core.subscribe` is reserved and not dispatched by the daemon yet. The gateway long-polls `core.changes` and fans the result out over WebSocket.
+`core.subscribe` remains reserved. The gateway paces daemon `core.changes` polling and fans changes out over authenticated WebSockets.
 
 ## Options
 
-```
-verde-web --host 127.0.0.1 --port 7420 --token <secret> --static dist
+```text
+verde-web --token-file <path> [--host 127.0.0.1] [--port 7420]
+          [--pref-path <daemon-data-dir>] [--sessionizer <socket>]
+          [--static <dist-dir>]
 ```
 
-Environment: `VERDE_WEB_HOST`, `VERDE_WEB_PORT`, `VERDE_WEB_TOKEN`, `VERDE_PREF_PATH`, `VERDE_SESSIONIZER_SOCKET`, `VERDE_LIVE_ENDPOINT`.
+Safe configuration environment variables are `VERDE_WEB_HOST`, `VERDE_WEB_PORT`, `VERDE_WEB_TOKEN_FILE`, `VERDE_PREF_PATH`, `VERDE_WEB_STATIC`, and `VERDE_SESSIONIZER_SOCKET`. `VERDE_WEB_HOST` is still subject to the strict loopback check.
+
+Do not run `mise run dev`, relaunch the desktop, or use `pkill verde` from a Verde pane that owns the active agent session. Coordinate and track any gateway/Vite process you start.

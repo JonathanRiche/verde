@@ -1,16 +1,12 @@
 import { For, Show, createEffect, createMemo, createSignal, onCleanup } from 'solid-js'
-import { marked } from 'marked'
 
-import { decorateFileCitations } from '../lib/citations'
 import { chatImageUrl } from '../lib/live'
+import { renderMarkdown as renderSafeMarkdown } from '../lib/markdown'
 import { clipboardImageFiles, store } from '../lib/store'
 import { type Attachment, type LivePane, type Message, isSubagentThreadId } from '../lib/types'
 import { effortLabel, effortOptionsIn, modelOptionsFor, modelSupportsFast, variantOptionsIn } from '../lib/models'
-import { handleFileCitationClick } from './FileViewer'
 import { Icon, ProviderGlyph, ZoomButton } from './Icons'
 import { PaneActionsButton } from './Sidebar'
-
-marked.setOptions({ gfm: true, breaks: true })
 
 // Shared 1s ticker driving working timers and group elapsed labels.
 const [nowMs, setNowMs] = createSignal(Date.now())
@@ -48,7 +44,7 @@ function renderMarkdown(body: string): string {
     markdownCache.set(body, cached)
     return cached
   }
-  const html = marked.parse(decorateFileCitations(body), { async: false }) as string
+  const html = renderSafeMarkdown(body, { fileCitations: true })
   markdownCache.set(body, html)
   if (markdownCache.size > MARKDOWN_CACHE_MAX) {
     const oldest = markdownCache.keys().next().value
@@ -826,7 +822,7 @@ function TranscriptRow(props: { message: Message; pane: LivePane }) {
   return (
     <article class="min-w-0 rounded-[10px] border border-[var(--border-muted)] bg-[var(--assistant-card)] px-3 py-3 lg:px-4">
       <div class="mb-1.5 text-[12px] text-[var(--text-subtle)]">{props.message.author || 'Assistant'}</div>
-      <div class="markdown" innerHTML={html()} onClick={handleFileCitationClick} />
+      <div class="markdown" innerHTML={html()} />
     </article>
   )
 }
@@ -884,10 +880,10 @@ function WorkingRow(props: { message: Message }) {
   const STREAM_PARSE_MAX = 16_000
   const html = () => {
     const body = props.message.body
-    if (body.length <= STREAM_PARSE_MAX) return marked.parse(decorateFileCitations(body), { async: false }) as string
+    if (body.length <= STREAM_PARSE_MAX) return renderSafeMarkdown(body, { fileCitations: true })
     const cut = body.indexOf('\n', body.length - STREAM_PARSE_MAX)
     const tail = cut >= 0 ? body.slice(cut + 1) : body.slice(body.length - STREAM_PARSE_MAX)
-    return marked.parse(decorateFileCitations(tail), { async: false }) as string
+    return renderSafeMarkdown(tail, { fileCitations: true })
   }
   return (
     <article class="min-w-0 rounded-[10px] border border-[var(--border-muted)] bg-[var(--assistant-card)] px-3 py-3 lg:px-4">
@@ -899,7 +895,7 @@ function WorkingRow(props: { message: Message }) {
         when={props.message.body.length > 0}
         fallback={<div class="text-[14px] italic text-[var(--text-subtle)]">Waiting for streamed output...</div>}
       >
-        <div class="markdown" innerHTML={html()} onClick={handleFileCitationClick} />
+        <div class="markdown" innerHTML={html()} />
       </Show>
     </article>
   )
