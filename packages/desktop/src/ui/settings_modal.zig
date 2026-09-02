@@ -1562,13 +1562,13 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     // Notifications
     drawCardTitle(state, layout.notifications_card, "Notifications", layout.body_clip);
     drawFieldLabel(state, layout.notifications_card, m, "Desktop alerts", layout.body_clip);
-    drawSwitchRow(state, layout.notifications_toggle, "On agent completion", state.settings_controller.draft.notifications_enabled, isControlHovered(state, .notifications_toggle), layout.body_clip);
+    drawSwitchRow(state, layout.notifications_toggle, "On agent status", state.settings_controller.draft.notifications_enabled, isControlHovered(state, .notifications_toggle), layout.body_clip);
     queueText(state, .{
         .x = layout.notifications_card.x + m.card_pad,
         .y = layout.notifications_hint_y,
         .w = layout.notifications_card.w - m.card_pad * 2.0,
         .h = m.label_h,
-    }, "System notification when an agent finishes · Windows, macOS & Linux", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
+    }, "System notification when an agent finishes, waits, or errors · Windows, macOS & Linux", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
 
     drawBodyScrollbar(state, layout);
     drawThemeDropdownMenu(state, layout);

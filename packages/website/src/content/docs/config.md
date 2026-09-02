@@ -155,7 +155,8 @@ Most of these options also appear in Settings:
   (off by default). **Appearance → Default companion** chooses Sprout, Moss, or
   Vireo when the companion is on.
 - **Updates** — check now, install an available release, and automatic checks.
-- **Notifications** — enable or disable desktop notifications.
+- **Notifications** — enable or disable desktop notifications when an agent
+  finishes, waits for input, or errors.
 
 Settings that write `verde.json` apply when you choose **Save**. Provider hook
 installation/removal runs immediately because it updates the provider's own
