@@ -1,0 +1,40 @@
+{
+  "name": "@verde/connect-control-plane",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Self-hostable reference implementation of the Verde Connect v1 control plane",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "bun": ">=1.4.0"
+  },
+  "scripts": {
+    "dev": "bun --watch src/main.ts",
+    "start": "bun src/main.ts",
+    "migrate": "bun src/migrate.ts",
+    "keygen": "bun scripts/generate-signing-key.ts",
+    "vectors": "bun scripts/generate-test-vectors.ts",
+    "format": "prettier --write . ../../specs/control-plane/v1",
+    "format:check": "prettier --check . ../../specs/control-plane/v1",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test test/unit",
+    "test:integration": "bun test test/integration",
+    "build": "bun build src/main.ts src/migrate.ts --target=bun --outdir=dist",
+    "check": "bun run format:check && bun run typecheck && bun run test && bun run build"
+  },
+  "dependencies": {
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1",
+    "canonicalize": "4.0.0",
+    "jose": "6.2.10",
+    "lossless-json": "4.3.1",
+    "postgres": "3.4.9",
+    "secure-json-parse": "4.1.0"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.0",
+    "prettier": "3.9.6",
+    "typescript": "7.0.2",
+    "yaml": "2.9.0"
+  }
+}

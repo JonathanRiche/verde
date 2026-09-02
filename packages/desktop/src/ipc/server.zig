@@ -555,6 +555,14 @@ fn terminalsResponse(allocator: std.mem.Allocator, id_value: std.json.Value, sta
 
 fn herdrOpenResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
     if (params != .object) return try errorResponseAlloc(allocator, id_value, "invalid_request", "herdr.open requires params");
+    if (hasRetiredHerdrRemoteParam(params)) {
+        return try errorResponseAlloc(
+            allocator,
+            id_value,
+            "invalid_request",
+            "remote Herdr parameters are no longer supported",
+        );
+    }
     const session = stringParam(params, "session") orelse
         return try errorResponseAlloc(allocator, id_value, "invalid_request", "herdr.open requires session");
     const workspace = stringParam(params, "herdr_workspace") orelse stringParam(params, "herdr-workspace") orelse
@@ -562,9 +570,7 @@ fn herdrOpenResponse(allocator: std.mem.Allocator, id_value: std.json.Value, sta
     const request: herdr.OpenRequest = .{
         .session = session,
         .herdr_workspace = workspace,
-        .remote = stringParam(params, "remote"),
         .cwd = stringParam(params, "cwd"),
-        .remote_cwd = stringParam(params, "remote_cwd") orelse stringParam(params, "remote-cwd"),
         .local_dir = stringParam(params, "local_dir") orelse stringParam(params, "local-dir"),
         .pane = stringParam(params, "pane"),
     };
@@ -578,10 +584,16 @@ fn herdrOpenResponse(allocator: std.mem.Allocator, id_value: std.json.Value, sta
 
 fn herdrHandoffResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
     if (params != .object) return try errorResponseAlloc(allocator, id_value, "invalid_request", "herdr.handoff requires params");
+    if (hasRetiredHerdrRemoteParam(params)) {
+        return try errorResponseAlloc(
+            allocator,
+            id_value,
+            "invalid_request",
+            "remote Herdr parameters are no longer supported",
+        );
+    }
     const request: herdr.HandoffRequest = .{
         .session = stringParam(params, "session") orelse "default",
-        .remote = stringParam(params, "remote"),
-        .remote_cwd = stringParam(params, "remote_cwd") orelse stringParam(params, "remote-cwd"),
         .workspace = stringParam(params, "workspace") orelse stringParam(params, "project"),
         .all = boolParam(params, "all") orelse false,
         .dry_run = boolParam(params, "dry_run") orelse boolParam(params, "dry-run") orelse false,
@@ -595,6 +607,14 @@ fn herdrHandoffResponse(allocator: std.mem.Allocator, id_value: std.json.Value, 
     };
     defer result.deinit(allocator);
     return try okValueResponse(allocator, id_value, result);
+}
+
+fn hasRetiredHerdrRemoteParam(params: std.json.Value) bool {
+    if (params != .object) return false;
+    return params.object.get("remote") != null or
+        params.object.get("remote_cwd") != null or
+        params.object.get("remote-cwd") != null or
+        params.object.get("profile") != null;
 }
 
 fn herdrUnlinkResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
@@ -649,14 +669,10 @@ fn writeHerdrStatusLink(
     try s.write(project.label);
     try s.objectField("path");
     try s.write(project.path);
-    try s.objectField("remote");
-    try s.write(link.remote_alias);
     try s.objectField("session");
     try s.write(link.session_name);
     try s.objectField("herdr_workspace");
     try s.write(link.workspace_id);
-    try s.objectField("remote_cwd");
-    if (link.remote_cwd) |value| try s.write(value) else try s.write(null);
     try s.objectField("herdr_pane");
     if (link.last_pane_id) |value| try s.write(value) else try s.write(null);
     try s.objectField("terminal_dock_id");
@@ -4002,6 +4018,56 @@ fn parseApprovalDecision(value: []const u8) ?provider_types.ApprovalDecision {
     if (std.mem.eql(u8, value, "approve") or std.mem.eql(u8, value, "approved") or std.mem.eql(u8, value, "allow")) return .approve;
     if (std.mem.eql(u8, value, "deny") or std.mem.eql(u8, value, "reject") or std.mem.eql(u8, value, "rejected")) return .deny;
     return null;
+}
+
+fn expectRetiredHerdrRemoteError(allocator: std.mem.Allocator, response: []const u8) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 7), jsonInt(parsed.value.object.get("id").?).?);
+    try std.testing.expect(!boolParam(parsed.value, "ok").?);
+    const response_error = parsed.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings("invalid_request", jsonString(response_error.get("code").?).?);
+    try std.testing.expectEqualStrings(
+        "remote Herdr parameters are no longer supported",
+        jsonString(response_error.get("message").?).?,
+    );
+}
+
+test "Herdr live handlers reject every retired remote parameter by presence" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        \\{"session":"default","herdr_workspace":"local","remote":null}
+        ,
+        \\{"session":"default","herdr_workspace":"local","remote_cwd":null}
+        ,
+        \\{"session":"default","herdr_workspace":"local","remote-cwd":null}
+        ,
+        \\{"session":"default","herdr_workspace":"local","profile":null}
+    };
+    var state: app_state.AppState = undefined;
+    for (cases) |params_json| {
+        var params = try std.json.parseFromSlice(std.json.Value, allocator, params_json, .{});
+        defer params.deinit();
+        try std.testing.expect(hasRetiredHerdrRemoteParam(params.value));
+
+        const open_response = try herdrOpenResponse(allocator, .{ .integer = 7 }, &state, params.value);
+        defer allocator.free(open_response);
+        try expectRetiredHerdrRemoteError(allocator, open_response);
+
+        const handoff_response = try herdrHandoffResponse(allocator, .{ .integer = 7 }, &state, params.value);
+        defer allocator.free(handoff_response);
+        try expectRetiredHerdrRemoteError(allocator, handoff_response);
+    }
+
+    var local = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"session":"default","herdr_workspace":"local","cwd":"/tmp","local_dir":null,"pane":null}
+    ,
+        .{},
+    );
+    defer local.deinit();
+    try std.testing.expect(!hasRetiredHerdrRemoteParam(local.value));
 }
 
 test "pane maximize parses explicit modes and defaults to toggle" {

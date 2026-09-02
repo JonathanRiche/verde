@@ -1,0 +1,179 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://verde.dev/specs/control-plane/v1/schemas/common.schema.json",
+  "title": "Verde Connect v1 common definitions",
+  "$defs": {
+    "contractVersion": {
+      "const": "1"
+    },
+    "runtimeId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "instanceId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "requestId": {
+      "type": "string",
+      "pattern": "^req_[0-9a-f]{32}$"
+    },
+    "challengeId": {
+      "type": "string",
+      "pattern": "^chl_[0-9a-f]{32}$"
+    },
+    "linkId": {
+      "type": "string",
+      "pattern": "^lnk_[0-9a-f]{32}$"
+    },
+    "grantId": {
+      "type": "string",
+      "pattern": "^grt_[0-9a-f]{32}$"
+    },
+    "enrollmentId": {
+      "type": "string",
+      "pattern": "^enr_[0-9a-f]{32}$"
+    },
+    "revocationId": {
+      "type": "string",
+      "pattern": "^rev_[0-9a-f]{32}$"
+    },
+    "eventId": {
+      "type": "string",
+      "pattern": "^evt_[0-9a-f]{32}$"
+    },
+    "deviceId": {
+      "type": "string",
+      "pattern": "^dev_[0-9a-f]{32}$"
+    },
+    "nonce": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{43}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "httpsUrl": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https://"
+    },
+    "wssUrl": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^wss://"
+    },
+    "scope": {
+      "enum": [
+        "runtime:read",
+        "chat:read",
+        "chat:write",
+        "terminal:read",
+        "terminal:write",
+        "repository:read",
+        "repository:write",
+        "device:read"
+      ]
+    },
+    "scopes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/scope"
+      },
+      "minItems": 1,
+      "maxItems": 8,
+      "uniqueItems": true
+    },
+    "principal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["issuer", "subject"],
+      "properties": {
+        "issuer": {
+          "type": "string",
+          "format": "uri",
+          "minLength": 8,
+          "maxLength": 2048,
+          "pattern": "^[\\x21-\\x7e]+$"
+        },
+        "subject": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+        }
+      }
+    },
+    "ed25519PublicJwk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kty", "crv", "x", "kid"],
+      "properties": {
+        "kty": {
+          "const": "OKP"
+        },
+        "crv": {
+          "const": "Ed25519"
+        },
+        "x": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{43}$"
+        },
+        "kid": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{16,128}$"
+        },
+        "use": {
+          "const": "sig"
+        },
+        "alg": {
+          "const": "EdDSA"
+        }
+      }
+    },
+    "x25519PublicJwk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kty", "crv", "x", "kid"],
+      "properties": {
+        "kty": { "const": "OKP" },
+        "crv": { "const": "X25519" },
+        "x": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{43}$"
+        },
+        "kid": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{16,128}$"
+        },
+        "use": { "const": "enc" },
+        "alg": { "const": "ECDH-ES" }
+      }
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["error", "message", "correlation_id"],
+      "properties": {
+        "error": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{2,63}$"
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "correlation_id": {
+          "type": "string",
+          "pattern": "^cor_[0-9a-f]{32}$"
+        },
+        "details": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    }
+  }
+}

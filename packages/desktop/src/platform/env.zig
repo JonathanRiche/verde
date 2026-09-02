@@ -166,9 +166,10 @@ pub fn applyAugmentedPathToCurrentProcess(allocator: std.mem.Allocator) !void {
 
     const path = env_map.get("PATH") orelse return;
     const path_z = try allocator.dupeZ(u8, path);
-    // Do not free path_z after setenv: POSIX permits implementations to retain
-    // the supplied pointer, and PTY child processes exec immediately after this.
-    _ = setenv("PATH", path_z.ptr, 1);
+    defer allocator.free(path_z);
+    // POSIX setenv copies both strings (unlike putenv), so the temporary
+    // allocation remains caller-owned and must not leak on daemon shutdown.
+    if (setenv("PATH", path_z.ptr, 1) != 0) return error.Unexpected;
 }
 
 fn appendUniquePathDir(

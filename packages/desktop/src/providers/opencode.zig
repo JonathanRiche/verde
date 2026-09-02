@@ -2359,12 +2359,25 @@ fn buildPromptBody(
     if (request.image != null or request.images.len > 0) {
         try stringify.objectField("files");
         try stringify.beginArray();
-        if (request.image) |image| try writeInlineFile(allocator, &stringify, image.path);
+        if (request.image) |image| {
+            // Legacy single-image compatibility: skip when the full images
+            // list already carries the same path so one attachment is never
+            // inlined (and uploaded) twice.
+            if (!promptImagesContainPath(request.images, image.path))
+                try writeInlineFile(allocator, &stringify, image.path);
+        }
         for (request.images) |image| try writeInlineFile(allocator, &stringify, image.path);
         try stringify.endArray();
     }
     try stringify.endObject();
     return writer.toOwnedSlice();
+}
+
+fn promptImagesContainPath(images: []const provider_types.ImageAttachment, path: []const u8) bool {
+    for (images) |image| {
+        if (std.mem.eql(u8, image.path, path)) return true;
+    }
+    return false;
 }
 
 fn writeInlineFile(allocator: std.mem.Allocator, stringify: *std.json.Stringify, path: []const u8) !void {
@@ -2728,6 +2741,62 @@ test "buildPromptBody sends text-only prompts without files" {
     const body = try buildPromptBody(allocator, .{ .prompt = "hi there" });
     defer allocator.free(body);
     try std.testing.expectEqualStrings("{\"text\":\"hi there\"}", body);
+}
+
+test "buildPromptBody de-duplicates the legacy image against the full list" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "first.png", .data = "FIRSTBYTES" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "second.png", .data = "SECONDBYTES" });
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &dir_buf);
+    const first_path = try std.fs.path.join(allocator, &.{ dir_buf[0..dir_len], "first.png" });
+    defer allocator.free(first_path);
+    const second_path = try std.fs.path.join(allocator, &.{ dir_buf[0..dir_len], "second.png" });
+    defer allocator.free(second_path);
+    const images = [_]provider_types.ImageAttachment{
+        .{ .path = first_path },
+        .{ .path = second_path },
+    };
+
+    // Legacy image mirrors images[0]: each file must inline exactly once.
+    const duplicated = try buildPromptBody(allocator, .{
+        .prompt = "compare",
+        .image = .{ .path = first_path },
+        .images = &images,
+    });
+    defer allocator.free(duplicated);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, duplicated, .{});
+    defer parsed.deinit();
+    const files = parsed.value.object.get("files").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), files.len);
+    try std.testing.expectEqualStrings("first.png", files[0].object.get("name").?.string);
+    try std.testing.expectEqualStrings("second.png", files[1].object.get("name").?.string);
+
+    // A distinct legacy image is preserved ahead of the full list.
+    const distinct = try buildPromptBody(allocator, .{
+        .prompt = "compare",
+        .image = .{ .path = second_path },
+        .images = &.{.{ .path = first_path }},
+    });
+    defer allocator.free(distinct);
+    var parsed_distinct = try std.json.parseFromSlice(std.json.Value, allocator, distinct, .{});
+    defer parsed_distinct.deinit();
+    const distinct_files = parsed_distinct.value.object.get("files").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), distinct_files.len);
+    try std.testing.expectEqualStrings("second.png", distinct_files[0].object.get("name").?.string);
+    try std.testing.expectEqualStrings("first.png", distinct_files[1].object.get("name").?.string);
+
+    // Single legacy-only attachment still inlines.
+    const solo = try buildPromptBody(allocator, .{
+        .prompt = "compare",
+        .image = .{ .path = first_path },
+    });
+    defer allocator.free(solo);
+    var parsed_solo = try std.json.parseFromSlice(std.json.Value, allocator, solo, .{});
+    defer parsed_solo.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed_solo.value.object.get("files").?.array.items.len);
 }
 
 test "apiPathAlloc scopes requests with an encoded location directory" {

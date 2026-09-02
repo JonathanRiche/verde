@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://verde.dev/specs/control-plane/v1/schemas/bootstrap.schema.json",
+  "title": "Scoped runtime bootstrap messages",
+  "$defs": {
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "request_id",
+        "runtime_id",
+        "instance_id",
+        "device_id",
+        "device_signing_jwk",
+        "device_proof_jwt",
+        "audience",
+        "client_nonce",
+        "scopes",
+        "expires_at"
+      ],
+      "properties": {
+        "contract_version": {
+          "$ref": "common.schema.json#/$defs/contractVersion"
+        },
+        "request_id": {
+          "$ref": "common.schema.json#/$defs/requestId"
+        },
+        "runtime_id": {
+          "$ref": "common.schema.json#/$defs/runtimeId"
+        },
+        "instance_id": {
+          "$ref": "common.schema.json#/$defs/instanceId"
+        },
+        "device_id": {
+          "$ref": "common.schema.json#/$defs/deviceId"
+        },
+        "device_signing_jwk": {
+          "$ref": "common.schema.json#/$defs/ed25519PublicJwk"
+        },
+        "device_proof_jwt": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$",
+          "maxLength": 16384
+        },
+        "audience": {
+          "type": "string",
+          "format": "uri",
+          "minLength": 8,
+          "maxLength": 2048
+        },
+        "client_nonce": {
+          "$ref": "common.schema.json#/$defs/nonce"
+        },
+        "scopes": {
+          "$ref": "common.schema.json#/$defs/scopes"
+        },
+        "expires_at": {
+          "$ref": "common.schema.json#/$defs/timestamp"
+        }
+      }
+    },
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "request_id",
+        "grant_id",
+        "issuer",
+        "audience",
+        "scopes",
+        "expires_at",
+        "grant_jwt"
+      ],
+      "properties": {
+        "contract_version": {
+          "$ref": "common.schema.json#/$defs/contractVersion"
+        },
+        "request_id": {
+          "$ref": "common.schema.json#/$defs/requestId"
+        },
+        "grant_id": {
+          "$ref": "common.schema.json#/$defs/grantId"
+        },
+        "issuer": {
+          "type": "string",
+          "format": "uri"
+        },
+        "audience": {
+          "type": "string",
+          "format": "uri"
+        },
+        "scopes": {
+          "$ref": "common.schema.json#/$defs/scopes"
+        },
+        "expires_at": {
+          "$ref": "common.schema.json#/$defs/timestamp"
+        },
+        "grant_jwt": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$",
+          "maxLength": 16384
+        }
+      }
+    }
+  }
+}

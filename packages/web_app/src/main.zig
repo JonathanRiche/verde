@@ -2,11 +2,10 @@
 
 const std = @import("std");
 
+const auth_mod = @import("auth.zig");
 const config_mod = @import("config.zig");
 const daemon_mod = @import("daemon.zig");
-const directory_browser = @import("directory_browser.zig");
 const http_mod = @import("http.zig");
-const mock = @import("mock.zig");
 const theme_mod = @import("theme.zig");
 
 pub fn main(init: std.process.Init) void {
@@ -16,9 +15,21 @@ pub fn main(init: std.process.Init) void {
             return;
         },
         else => {
-            std.debug.print("verde-web fatal: {s}\n", .{@errorName(err)});
+            if (configurationErrorMessage(err)) |message| {
+                std.debug.print("verde-web: {s}\n", .{message});
+            } else {
+                std.debug.print("verde-web fatal: {s}\n", .{@errorName(err)});
+            }
             std.process.exit(1);
         },
+    };
+}
+
+fn configurationErrorMessage(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.NonLoopbackHost => "non-loopback bind rejected; use --host 127.0.0.1 and connect through an SSH local forward",
+        error.InvalidTrustedProxyOrigin => "trusted proxy origin must be one exact pathless https:// origin",
+        else => null,
     };
 }
 
@@ -33,16 +44,33 @@ fn run(init: std.process.Init) !void {
     }
 
     const config = try config_mod.parse(init.gpa, init.environ_map, argv_list.items);
+    var auth = try auth_mod.Service.initFromTokenFile(
+        init.gpa,
+        init.io,
+        config.token_file,
+        .{},
+        .{},
+    );
+    defer auth.deinit();
+
     var daemon = daemon_mod.Daemon.init(init.gpa, init.io, config);
-    try http_mod.serve(init.gpa, init.io, config, &daemon, init.environ_map);
+    try http_mod.serve(init.gpa, init.io, config, &daemon, &auth, init.environ_map);
 }
 
 test {
     std.testing.refAllDecls(@This());
+    _ = auth_mod;
     _ = config_mod;
     _ = daemon_mod;
-    _ = directory_browser;
     _ = http_mod;
-    _ = mock;
     _ = theme_mod;
+}
+
+test "non-loopback bind failure explains the supported access path" {
+    try std.testing.expectEqualStrings(
+        "non-loopback bind rejected; use --host 127.0.0.1 and connect through an SSH local forward",
+        configurationErrorMessage(error.NonLoopbackHost).?,
+    );
+    try std.testing.expect(configurationErrorMessage(error.TokenFileRequired) == null);
+    try std.testing.expect(configurationErrorMessage(error.InvalidTrustedProxyOrigin) != null);
 }

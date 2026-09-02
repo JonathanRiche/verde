@@ -216,6 +216,16 @@ pub const PersistedThread = struct {
     tui_dock_id: ?u32 = null,
     /// Per-thread working-directory override; null follows the workspace path.
     cwd: ?[]const u8 = null,
+    /// Connection profile selected for this thread. Null is a legacy Local
+    /// profile, preserving old persisted JSON without a migration rewrite.
+    profile_id: ?[]const u8 = null,
+    /// Stable verified daemon identity. Null means it has not yet been learned
+    /// (including committed local threads created by older builds).
+    runtime_id: ?[]const u8 = null,
+    /// Workspace-scoped repository identity. Null is the legacy `primary`.
+    repository_id: ?[]const u8 = null,
+    /// Runtime-independent path beneath the selected repository root.
+    repository_cwd: ?[]const u8 = null,
     draft: []const u8 = "",
     draft_image: ?PersistedImageAttachment = null,
     /// Composer attachments past the primary `draft_image`. Additive

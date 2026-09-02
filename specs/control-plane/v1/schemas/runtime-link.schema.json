@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://verde.dev/specs/control-plane/v1/schemas/runtime-link.schema.json",
+  "title": "Runtime link messages",
+  "$defs": {
+    "challengeRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "request_id",
+        "runtime_id",
+        "instance_id",
+        "runtime_signing_jwk",
+        "runtime_encryption_jwk"
+      ],
+      "properties": {
+        "contract_version": {
+          "$ref": "common.schema.json#/$defs/contractVersion"
+        },
+        "request_id": {
+          "$ref": "common.schema.json#/$defs/requestId"
+        },
+        "runtime_id": {
+          "$ref": "common.schema.json#/$defs/runtimeId"
+        },
+        "instance_id": {
+          "$ref": "common.schema.json#/$defs/instanceId"
+        },
+        "runtime_signing_jwk": {
+          "$ref": "common.schema.json#/$defs/ed25519PublicJwk"
+        },
+        "runtime_encryption_jwk": {
+          "$ref": "common.schema.json#/$defs/x25519PublicJwk"
+        }
+      }
+    },
+    "challengeResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "challenge_id",
+        "audience",
+        "principal",
+        "nonce",
+        "expires_at"
+      ],
+      "properties": {
+        "contract_version": {
+          "$ref": "common.schema.json#/$defs/contractVersion"
+        },
+        "challenge_id": {
+          "$ref": "common.schema.json#/$defs/challengeId"
+        },
+        "audience": {
+          "type": "string",
+          "format": "uri"
+        },
+        "principal": {
+          "$ref": "common.schema.json#/$defs/principal"
+        },
+        "nonce": {
+          "$ref": "common.schema.json#/$defs/nonce"
+        },
+        "expires_at": {
+          "$ref": "common.schema.json#/$defs/timestamp"
+        }
+      }
+    },
+    "proofRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "challenge_id", "proof_jwt"],
+      "properties": {
+        "contract_version": {
+          "$ref": "common.schema.json#/$defs/contractVersion"
+        },
+        "challenge_id": {
+          "$ref": "common.schema.json#/$defs/challengeId"
+        },
+        "proof_jwt": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$",
+          "maxLength": 8192
+        }
+      }
+    },
+    "link": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "link_id",
+        "runtime_id",
+        "instance_id",
+        "runtime_key_thumbprint",
+        "runtime_encryption_key_thumbprint",
+        "status",
+        "created_at"
+      ],
+      "properties": {
+        "contract_version": {
+          "$ref": "common.schema.json#/$defs/contractVersion"
+        },
+        "link_id": {
+          "$ref": "common.schema.json#/$defs/linkId"
+        },
+        "runtime_id": {
+          "$ref": "common.schema.json#/$defs/runtimeId"
+        },
+        "instance_id": {
+          "$ref": "common.schema.json#/$defs/instanceId"
+        },
+        "runtime_key_thumbprint": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{43}$"
+        },
+        "runtime_encryption_key_thumbprint": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{43}$"
+        },
+        "status": {
+          "enum": ["linked", "unlinked"]
+        },
+        "created_at": {
+          "$ref": "common.schema.json#/$defs/timestamp"
+        },
+        "unlinked_at": {
+          "$ref": "common.schema.json#/$defs/timestamp"
+        }
+      }
+    },
+    "unlinkRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "request_id"],
+      "properties": {
+        "contract_version": {
+          "$ref": "common.schema.json#/$defs/contractVersion"
+        },
+        "request_id": {
+          "$ref": "common.schema.json#/$defs/requestId"
+        }
+      }
+    }
+  }
+}

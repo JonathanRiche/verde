@@ -142,6 +142,12 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "local_ipc", local_ipc);
     build_options.addOption(bool, "windows_integrations", windows_integrations);
     const build_options_module = build_options.createModule();
+    // The standalone daemon gets only the build metadata it consumes. Keep
+    // desktop renderer/browser switches out of its module graph so `daemon`
+    // remains a GUI-free build target.
+    const daemon_build_options = b.addOptions();
+    daemon_build_options.addOption([:0]const u8, "version", version_z);
+    const daemon_build_options_module = daemon_build_options.createModule();
     const version_stamp = b.addWriteFiles().add("BUILD_VERSION", b.fmt("{s}\n", .{version}));
     b.getInstallStep().dependOn(&b.addInstallFileWithDir(
         version_stamp,
@@ -200,11 +206,40 @@ pub fn build(b: *std.Build) void {
     const provider_bridge_output = build_provider_bridge.addOutputFileArg("provider_bridge.mjs");
     build_provider_bridge.setCwd(b.path("."));
     build_provider_bridge.addFileInput(b.path("src/providers/provider_bridge.ts"));
-    b.getInstallStep().dependOn(&b.addInstallFileWithDir(
+    const install_provider_bridge = b.addInstallFileWithDir(
         provider_bridge_output,
         .{ .custom = "share/verde" },
         "provider_bridge.mjs",
-    ).step);
+    );
+    b.getInstallStep().dependOn(&install_provider_bridge.step);
+
+    const daemon_exe = b.addExecutable(.{
+        .name = "verde-daemon",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/daemon_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "build_options", .module = daemon_build_options_module },
+                .{ .name = "headless", .module = headless_module },
+                .{ .name = "platform_paths", .module = platform_paths_module },
+                .{ .name = "platform_runtime", .module = platform_runtime_module },
+                .{ .name = "platform_windows_known_folders", .module = platform_windows_known_folders_module },
+                .{ .name = "zqlite", .module = zqlite.module("zqlite") },
+            },
+        }),
+    });
+    daemon_exe.build_id = .sha1;
+    daemon_exe.each_lib_rpath = false;
+    daemon_exe.root_module.link_libc = true;
+    if (target.result.os.tag == .linux) {
+        // forkpty(3), used by daemon-owned PTY sessions, lives in libutil on
+        // Linux. No SDL, Palette, browser helper, fonts, or desktop entrypoint
+        // participates in this executable.
+        daemon_exe.root_module.linkSystemLibrary("util", .{});
+    }
+    const install_daemon = b.addInstallArtifact(daemon_exe, .{});
+    b.getInstallStep().dependOn(&install_daemon.step);
 
     const exe = b.addExecutable(.{
         .name = "verde",
@@ -524,6 +559,27 @@ pub fn build(b: *std.Build) void {
     addTestArtifact(b, headless_test_step, headless_tests, target);
     test_compile_step.dependOn(&headless_tests.step);
     addTestArtifact(b, test_step, headless_tests, target);
+    // Remote-runtime infrastructure has its own GUI-free gate so process,
+    // transport, profile, and route tests do not depend on the SDL app graph.
+    const runtime_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/runtime_test_root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "headless", .module = headless_module },
+                .{ .name = "platform_paths", .module = platform_paths_module },
+                .{ .name = "platform_runtime", .module = platform_runtime_module },
+                .{ .name = "platform_windows_known_folders", .module = platform_windows_known_folders_module },
+                .{ .name = "zqlite", .module = zqlite.module("zqlite") },
+            },
+        }),
+    });
+    runtime_tests.root_module.link_libc = true;
+    const runtime_test_step = b.step("runtime-test", "Run remote-runtime infrastructure tests (no GUI deps)");
+    addTestArtifact(b, runtime_test_step, runtime_tests, target);
+    test_compile_step.dependOn(&runtime_tests.step);
+    addTestArtifact(b, test_step, runtime_tests, target);
     const transcript_apply_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/chat/transcript_apply.zig"),
