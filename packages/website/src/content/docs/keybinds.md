@@ -221,7 +221,8 @@ The table is overridable exactly like `bindings`, under `"navigate"`:
 | `x` / `Shift+X`                  | `workspace.close` / `workspace.close_current`     |
 | `z`                              | `workspace.toggle_maximize`                       |
 | `i`                              | `workspace.focus_prompt`                          |
-| `c`                              | `workspace.add` (new workspace)                    |
+| `c`                              | `workspace.add_tab` (new tab at the end of the strip) |
+| `a`                              | `workspace.add` (new workspace)                    |
 | `Shift+C`                        | `workspace.split_chat_horizontal`                  |
 | `v` / `-`                        | Default pane split, vertical / horizontal          |
 | `Shift+V` / `Shift+-`            | Alternate pane split, vertical / horizontal        |
@@ -250,7 +251,7 @@ exactly like their direct shortcuts.
 ### Prefix action names
 
 Action names mirror the remapping keys below, joined with `.` for nested
-groups: `refresh`, `open`, `open_editor`, `new_thread`, `new_terminal`, `workspace.add`, `command_palette`,
+groups: `refresh`, `open`, `open_editor`, `new_thread`, `new_terminal`, `workspace.add`, `workspace.add_tab`, `command_palette`,
 `companion`, `sidebar`, `sidebar_hidden`, `browser`, `chat_up`, `chat_down`,
 `chat_page_up`, `chat_page_down`, `chat.model_picker`, `chat.run_config`, `chat.directory_picker`,
 `terminal.toggle`, `prefix.keybinds`, `prefix.navigate`, and `terminal.<key>`

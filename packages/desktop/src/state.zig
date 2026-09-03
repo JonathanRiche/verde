@@ -6782,29 +6782,34 @@ pub const AppState = struct {
         self.markDirty();
     }
 
-    /// Opens a new workspace tab for the "+" affordance in the tab strip and the
-    /// `tab.add` IPC command. `kind` null follows the user's
-    /// `ui.workspace_new_tab_pane` preference (chat unless configured
-    /// otherwise); terminal tabs fall back to a chat tab when the workspace has
-    /// no pane to split from.
+    /// Opens a new workspace tab for the "+" affordance in the tab strip, the
+    /// prefix `workspace.add_tab` chord, and the `tab.add` IPC command. `kind`
+    /// null follows the user's `ui.workspace_new_tab_pane` preference (chat
+    /// unless configured otherwise). Like Herdr, the new tab always lands at
+    /// the end of the strip: only these entry points move the created pane
+    /// past the focused one, so ordinary splits keep opening beside their
+    /// origin. An empty workspace seeds its first chat instead.
     pub fn addWorkspaceTab(self: *AppState, index: usize, kind: ?app_config.WorkspaceSplitDefaultPane) void {
         if (index >= self.project_controller.projects.items.len) return;
-        switch (kind orelse self.app_config.workspace_new_tab_pane) {
-            .chat => self.createThreadForProject(index),
-            .terminal => {
-                self.project_controller.selected_index = index;
-                const layout = &self.project_controller.projects.items[index].workspace_layout;
-                if (layout.gridNewPanePlacement()) |placement| {
-                    _ = self.splitWorkspacePaneWithTerminalPlacement(index, placement.pane_id, placement.axis, placement.new_after);
-                    return;
-                }
-                const target_pane_id = layout.focused_pane_id orelse layout.firstVisiblePaneId() orelse {
-                    self.createThreadForProject(index);
-                    return;
-                };
-                _ = self.splitWorkspacePaneWithTerminalPlacement(index, target_pane_id, .vertical, true);
+        self.project_controller.selected_index = index;
+        const layout = &self.project_controller.projects.items[index].workspace_layout;
+        const placement: WorkspacePanePlacement = layout.gridNewPanePlacement() orelse .{
+            .pane_id = layout.focused_pane_id orelse layout.firstVisiblePaneId() orelse {
+                self.createThreadForProject(index);
+                return;
             },
-        }
+            .axis = .vertical,
+            .new_after = true,
+        };
+        const created = switch (kind orelse self.app_config.workspace_new_tab_pane) {
+            .chat => self.splitWorkspacePaneWithChatPlacement(index, placement.pane_id, placement.axis, placement.new_after),
+            .terminal => self.splitWorkspacePaneWithTerminalPlacement(index, placement.pane_id, placement.axis, placement.new_after),
+        };
+        if (!created) return;
+        // The split focused the new pane; tab order is persisted pane order.
+        const updated_layout = &self.project_controller.projects.items[index].workspace_layout;
+        const new_pane_id = updated_layout.focused_pane_id orelse return;
+        if (updated_layout.movePaneBefore(new_pane_id, updated_layout.panes.items.len)) self.markDirty();
     }
 
     /// Activates a workspace tab (the `tab.select` IPC command), focusing the
