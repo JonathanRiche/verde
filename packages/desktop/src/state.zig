@@ -43,6 +43,7 @@ const text_measure = @import("ui/text_measure.zig");
 const utils = @import("utils.zig");
 const browser_pane = @import("state/browser_pane.zig");
 const workspace_layout = @import("state/workspace_layout.zig");
+pub const workspace_tabs = @import("state/workspace_tabs.zig");
 const provider_models = @import("state/provider_models.zig");
 const chat_types = @import("state/chat_types.zig");
 const state_sync = @import("state/sync.zig");
@@ -4202,6 +4203,8 @@ const browserUrlsHaveSameOrigin = browser_controller.browserUrlsHaveSameOrigin;
 
 pub const WorkspacePane = workspace_layout.WorkspacePane;
 pub const WorkspacePanePlacement = workspace_layout.WorkspacePanePlacement;
+pub const WorkspaceTab = workspace_tabs.WorkspaceTab;
+pub const WorkspaceTabId = workspace_tabs.WorkspaceTabId;
 
 pub const TerminalDockEntry = project_state.TerminalDockEntry;
 pub const ManagedProcessStatus = project_state.ManagedProcessStatus;
@@ -6777,6 +6780,43 @@ pub const AppState = struct {
         self.syncRenameBuffer();
         self.setSidebarNotice("New thread ready.");
         self.markDirty();
+    }
+
+    /// Opens a new workspace tab for the "+" affordance in the tab strip and the
+    /// `tab.add` IPC command. `kind` null follows the user's
+    /// `ui.workspace_new_tab_pane` preference (chat unless configured
+    /// otherwise); terminal tabs fall back to a chat tab when the workspace has
+    /// no pane to split from.
+    pub fn addWorkspaceTab(self: *AppState, index: usize, kind: ?app_config.WorkspaceSplitDefaultPane) void {
+        if (index >= self.project_controller.projects.items.len) return;
+        switch (kind orelse self.app_config.workspace_new_tab_pane) {
+            .chat => self.createThreadForProject(index),
+            .terminal => {
+                self.project_controller.selected_index = index;
+                const layout = &self.project_controller.projects.items[index].workspace_layout;
+                if (layout.gridNewPanePlacement()) |placement| {
+                    _ = self.splitWorkspacePaneWithTerminalPlacement(index, placement.pane_id, placement.axis, placement.new_after);
+                    return;
+                }
+                const target_pane_id = layout.focused_pane_id orelse layout.firstVisiblePaneId() orelse {
+                    self.createThreadForProject(index);
+                    return;
+                };
+                _ = self.splitWorkspacePaneWithTerminalPlacement(index, target_pane_id, .vertical, true);
+            },
+        }
+    }
+
+    /// Activates a workspace tab (the `tab.select` IPC command), focusing the
+    /// tab's remembered pane. Returns false when the tab does not exist.
+    pub fn selectWorkspaceTab(self: *AppState, index: usize, tab_id: WorkspaceTabId) bool {
+        if (index >= self.project_controller.projects.items.len) return false;
+        const layout = &self.project_controller.projects.items[index].workspace_layout;
+        var tab_buffer: [workspace_tabs.MAX_WORKSPACE_TABS]WorkspaceTab = undefined;
+        const tabs = workspace_tabs.collect(layout, &tab_buffer);
+        const tab_index = workspace_tabs.indexOfTab(tabs, tab_id) orelse return false;
+        self.focusWorkspaceOpenPaneFromSidebar(index, tabs[tab_index].preferred_pane_id);
+        return true;
     }
 
     /// Applies user-configured provider/model/reasoning defaults to a newly

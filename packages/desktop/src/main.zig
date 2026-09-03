@@ -3670,6 +3670,7 @@ test {
     _ = @import("state/browser_controller.zig");
     _ = @import("state/runtime_connections_controller.zig");
     _ = @import("state/workspace_layout.zig");
+    _ = @import("state/workspace_tabs.zig");
     _ = @import("providers/acp.zig");
     _ = @import("providers/claude.zig");
     _ = @import("providers/cursor.zig");

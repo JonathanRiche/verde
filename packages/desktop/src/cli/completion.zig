@@ -69,6 +69,7 @@ fn writePowerShell(w: *std.Io.Writer) !void {
     try writePowerShellRoute(w, "live", &spec.live_commands);
     try writePowerShellRoute(w, "live workspace", &spec.workspace_commands);
     try writePowerShellRoute(w, "live pane", &spec.pane_commands);
+    try writePowerShellRoute(w, "live tab", &spec.tab_commands);
     try writePowerShellRoute(w, "live chat", &spec.chat_commands);
     try writePowerShellRoute(w, "live chat draft", &spec.chat_draft_commands);
     try writePowerShellRoute(w, "live browser", &spec.browser_commands);
@@ -166,6 +167,8 @@ fn writeBash(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.workspace_commands);
     try w.writeAll("\"\n  local pane=\"");
     try writeWords(w, &spec.pane_commands);
+    try w.writeAll("\"\n  local tab=\"");
+    try writeWords(w, &spec.tab_commands);
     try w.writeAll("\"\n  local chat=\"");
     try writeWords(w, &spec.chat_commands);
     try w.writeAll("\"\n  local draft=\"");
@@ -427,6 +430,7 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\    3:integrations:install:|3:integrations:remove:|3:integrations:disable:) COMPREPLY=( $(compgen -W "$integration_providers" -- "$cur") ) ;;
         \\    3:live:workspace:*) COMPREPLY=( $(compgen -W "$workspace" -- "$cur") ) ;;
         \\    3:live:pane:*) COMPREPLY=( $(compgen -W "$pane" -- "$cur") ) ;;
+        \\    3:live:tab:*) COMPREPLY=( $(compgen -W "$tab" -- "$cur") ) ;;
         \\    3:live:chat:*) COMPREPLY=( $(compgen -W "$chat" -- "$cur") ) ;;
         \\    3:live:browser:*) COMPREPLY=( $(compgen -W "$browser" -- "$cur") ) ;;
         \\    3:live:terminal:*) COMPREPLY=( $(compgen -W "$terminal" -- "$cur") ) ;;
@@ -483,6 +487,8 @@ fn writeZsh(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.workspace_commands);
     try w.writeAll("\"\n  local pane=\"");
     try writeWords(w, &spec.pane_commands);
+    try w.writeAll("\"\n  local tab=\"");
+    try writeWords(w, &spec.tab_commands);
     try w.writeAll("\"\n  local chat=\"");
     try writeWords(w, &spec.chat_commands);
     try w.writeAll("\"\n  local draft=\"");
@@ -744,6 +750,7 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\    4:integrations:install:|4:integrations:remove:|4:integrations:disable:) compadd -- ${(s: :)integration_providers} ;;
         \\    4:live:workspace:*) compadd -- ${(s: :)workspace} ;;
         \\    4:live:pane:*) compadd -- ${(s: :)pane} ;;
+        \\    4:live:tab:*) compadd -- ${(s: :)tab} ;;
         \\    4:live:chat:*) compadd -- ${(s: :)chat} ;;
         \\    4:live:browser:*) compadd -- ${(s: :)browser} ;;
         \\    4:live:terminal:*) compadd -- ${(s: :)terminal} ;;
@@ -812,6 +819,8 @@ fn writeFish(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.workspace_commands);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after live pane' -a '");
     try writeWords(w, &spec.pane_commands);
+    try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after live tab' -a '");
+    try writeWords(w, &spec.tab_commands);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after live chat' -a '");
     try writeWords(w, &spec.chat_commands);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after live chat draft' -a '");

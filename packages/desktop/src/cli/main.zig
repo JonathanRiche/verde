@@ -1487,6 +1487,10 @@ fn handleLive(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv
         try handleLivePane(allocator, out, io, argv, json);
         return;
     }
+    if (std.mem.eql(u8, command, "tab")) {
+        try handleLiveTab(allocator, out, io, argv, json);
+        return;
+    }
     if (std.mem.eql(u8, command, "chat")) {
         try handleLiveChat(allocator, out, io, argv, json);
         return;
@@ -1558,6 +1562,11 @@ fn liveFlagAllowed(argv: []const []const u8, flag: []const u8) bool {
         if (std.mem.eql(u8, subcommand, "move")) return flagIn(flag, &.{ "--workspace", "--project", "--pane", "--focused", "--direction" });
         if (std.mem.eql(u8, subcommand, "maximize")) return flagIn(flag, &.{ "--workspace", "--project", "--pane", "--focused", "--on", "--off", "--toggle" });
         if (std.mem.eql(u8, subcommand, "focus") or std.mem.eql(u8, subcommand, "close")) return flagIn(flag, &pane_flags);
+        return false;
+    }
+    if (std.mem.eql(u8, command, "tab")) {
+        if (std.mem.eql(u8, subcommand, "select")) return flagIn(flag, &.{ "--workspace", "--project", "--tab", "--index", "--pane" });
+        if (std.mem.eql(u8, subcommand, "add")) return flagIn(flag, &.{ "--workspace", "--project", "--kind" });
         return false;
     }
     if (std.mem.eql(u8, command, "chat")) {
@@ -2577,6 +2586,53 @@ fn handleLivePane(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
     const method = try std.fmt.allocPrint(allocator, "pane.{s}", .{subcommand});
     defer allocator.free(method);
     try sendLiveRequest(allocator, out, io, method, commonPaneParams(argv), json);
+}
+
+fn handleLiveTab(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8, json: bool) !void {
+    const subcommand = args.positional(argv, 1) orelse {
+        try out.stderr("missing live tab command\n", .{});
+        std.process.exit(2);
+    };
+    if (std.mem.eql(u8, subcommand, "select")) {
+        // A bare positional is treated as the tab id, matching how `panes` reports tabs.
+        const tab = optionalIntOption(out, argv, "--tab") orelse
+            if (trailingFreeArg(argv, 2)) |value| parseIntOrExit(out, "tab", value) else null;
+        const index = optionalIntOption(out, argv, "--index");
+        const pane = optionalIntOption(out, argv, "--pane");
+        if (tab == null and index == null and pane == null) {
+            try out.stderr("verde live tab select requires --tab, --index, or --pane\n", .{});
+            std.process.exit(2);
+        }
+        try sendLiveRequest(allocator, out, io, "tab.select", .{
+            .workspace = workspaceOption(argv),
+            .tab = tab,
+            .index = index,
+            .pane = pane,
+        }, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "add")) {
+        // Omitted --kind follows the user's ui.workspace_new_tab_pane preference.
+        try sendLiveRequest(allocator, out, io, "tab.add", .{
+            .workspace = workspaceOption(argv),
+            .kind = args.optionValue(argv, "--kind") orelse trailingFreeArg(argv, 2),
+        }, json);
+        return;
+    }
+    try out.stderr("unknown live tab command: {s}\n", .{subcommand});
+    std.process.exit(2);
+}
+
+fn optionalIntOption(out: output.Output, argv: []const []const u8, name: []const u8) ?u32 {
+    const value = args.optionValue(argv, name) orelse return null;
+    return parseIntOrExit(out, name, value);
+}
+
+fn parseIntOrExit(out: output.Output, name: []const u8, value: []const u8) u32 {
+    return std.fmt.parseInt(u32, value, 10) catch {
+        out.stderr("invalid {s} value: {s}\n", .{ name, value }) catch {};
+        std.process.exit(2);
+    };
 }
 
 const LivePaneMaximizeMode = enum { on, off, toggle };
@@ -4323,7 +4379,17 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
     try s.objectField("tools");
     try s.beginArray();
     try writeMcpTypedTool(&s, "list_workspaces", "List durable Verde workspaces and their repository projections from the session daemon.", &.{});
-    try writeMcpTypedTool(&s, "list_panes", "List chat and terminal panes in a Verde workspace.", &.{
+    try writeMcpTypedTool(&s, "list_panes", "List chat and terminal panes in a Verde workspace, grouped into workspace tabs (a split tile is one tab).", &.{
+        .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current; defaults to the desktop-selected workspace." },
+    });
+    try writeMcpTypedTool(&s, "select_workspace_tab", "Activate a workspace tab in the desktop tab strip and focus its remembered pane. Address it by tab_id, strip index, or any member pane_id as reported by list_panes.", &.{
+        .{ .name = "tab_id", .type_name = "integer", .description = "Stable tab id from list_panes." },
+        .{ .name = "index", .type_name = "integer", .description = "Zero-based position in the tab strip." },
+        .{ .name = "pane_id", .type_name = "integer", .description = "Any pane belonging to the tab." },
+        .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current; defaults to the desktop-selected workspace." },
+    });
+    try writeMcpTypedTool(&s, "add_workspace_tab", "Open a new workspace tab, like the + button in the desktop tab strip. Omit kind to follow the user's ui.workspace_new_tab_pane preference (GUI chat unless configured otherwise).", &.{
+        .{ .name = "kind", .type_name = "string", .description = "chat or terminal; omit to use the user's configured default." },
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current; defaults to the desktop-selected workspace." },
     });
     try writeMcpTypedTool(&s, "open_chat", "Create a durable chat thread in an explicitly selected Verde workspace and return its stable ids. The workspace row must already exist in the session daemon store (the desktop dual-write creates it; open_chat never creates workspaces). With the desktop GUI running the thread is also presented as a native chat pane; with no GUI it is created daemon-direct.", &OPEN_CHAT_MCP_INPUTS);
@@ -5188,6 +5254,25 @@ fn mcpToolsCall(
         }
         if (std.mem.eql(u8, tool_name, "list_panes")) {
             break :blk sendLiveRequestAlloc(allocator, io, "panes", .{ .workspace = workspace }, 1);
+        }
+        if (std.mem.eql(u8, tool_name, "select_workspace_tab")) {
+            const tab_id = mcpArgU32(arguments, "tab_id") orelse mcpArgU32(arguments, "tab");
+            const index = mcpArgU32(arguments, "index");
+            if (tab_id == null and index == null and pane_id == null) {
+                return try mcpError(allocator, out, id_value, -32602, "select_workspace_tab requires tab_id, index, or pane_id");
+            }
+            break :blk sendLiveRequestAlloc(allocator, io, "tab.select", .{
+                .workspace = workspace,
+                .tab = tab_id,
+                .index = index,
+                .pane = pane_id,
+            }, 1);
+        }
+        if (std.mem.eql(u8, tool_name, "add_workspace_tab")) {
+            break :blk sendLiveRequestAlloc(allocator, io, "tab.add", .{
+                .workspace = workspace,
+                .kind = mcpArgString(arguments, "kind"),
+            }, 1);
         }
         if (std.mem.eql(u8, tool_name, "browser_status")) {
             break :blk sendLiveRequestAlloc(allocator, io, "browser.status", .{ .workspace = workspace }, 1);
@@ -7628,6 +7713,8 @@ fn optionConsumesValue(name: []const u8) bool {
         std.mem.eql(u8, name, "--project") or
         std.mem.eql(u8, name, "--id") or
         std.mem.eql(u8, name, "--pane") or
+        std.mem.eql(u8, name, "--tab") or
+        std.mem.eql(u8, name, "--index") or
         std.mem.eql(u8, name, "--kind") or
         std.mem.eql(u8, name, "--axis") or
         std.mem.eql(u8, name, "--first") or
