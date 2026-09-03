@@ -179,7 +179,20 @@ pub fn isSubagentAuthorOrKind(author: []const u8, kind: ?ai_harness.ToolCallKind
 /// True for live `tool_call_kind=subagent` rows and for already-persisted
 /// Claude/OpenCode cards that stored the child as a generic tool.
 pub fn looksLikeSubagentCard(author: []const u8, kind: ?ai_harness.ToolCallKind, body: []const u8) bool {
-    if (isSubagentAuthorOrKind(author, kind)) return true;
+    if (kind) |structured_kind| {
+        if (structured_kind == .subagent) return true;
+        // Concrete built-in kinds are authoritative. Generic `.mcp` and
+        // `.other` still need the legacy body sniffing used to recover old
+        // Claude/OpenCode child rows. Skipping that scan for multi-megabyte
+        // read/shell output keeps active Cursor transcripts from getting
+        // progressively slower as tool calls accumulate.
+        switch (structured_kind) {
+            .read, .edit, .delete, .move, .search, .execute, .think, .fetch => return false,
+            .mcp, .other => {},
+            .subagent => unreachable,
+        }
+    }
+    if (isSubagentAuthorOrKind(author, null)) return true;
     if (ai_harness.types.isSubagentToolName(toolBodyField(body, "Tool") orelse "")) return true;
     const input = toolBodyField(body, "Input") orelse "";
     if (std.mem.indexOf(u8, input, "\"subagent_type\"") != null) return true;

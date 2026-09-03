@@ -3967,6 +3967,11 @@ fn isSubagentTimelineEntry(entry: anytype) bool {
 fn shouldGroupCommandRow(entry: anytype) bool {
     if (entry.role != .system) return false;
     if (isSubagentTimelineEntry(entry)) return true;
+    // A provider-supplied kind already proves this is a tool row. Avoid the
+    // legacy author/body heuristics below: Cursor read and shell events can
+    // carry very large output bodies, and grouping walks them during both the
+    // height and paint passes of every active frame.
+    if (@hasField(@TypeOf(entry), "tool_call_kind") and entry.tool_call_kind != null) return true;
     return shouldRenderPaletteCommandRow(entry.author, entry.body);
 }
 
@@ -4076,6 +4081,29 @@ test "subagent rows group separately from ordinary tool calls" {
     try std.testing.expect(commandGroupRendersGrouped(entries[0..], 1, 3));
     try std.testing.expect(commandGroupRendersGrouped(entries[0..], 1, 2));
     try std.testing.expect(!commandGroupRendersGrouped(entries[0..], 0, 1));
+}
+
+test "structured ordinary tools do not scan legacy subagent markers" {
+    const Event = struct {
+        role: app_state.ChatRole = .system,
+        author: []const u8,
+        body: []const u8,
+        tool_call_kind: ?ai_harness.ToolCallKind = null,
+    };
+    const legacy_marker_body =
+        \\Tool:
+        \\task
+        \\
+        \\Input:
+        \\{"subagent_type":"Explore"}
+    ;
+    const events = [_]Event{
+        .{ .author = "Read", .body = legacy_marker_body, .tool_call_kind = .read },
+        .{ .author = "provider-specific tool", .body = "opaque output", .tool_call_kind = .mcp },
+    };
+
+    try std.testing.expect(!isSubagentTimelineEntry(events[0]));
+    try std.testing.expectEqual(@as(usize, 2), toolCallGroupEnd(events[0..], 0));
 }
 
 /// True when the body looks like an executed shell one-liner (e.g. Codex/OpenCode style `/usr/bin/bash -lc '…'`).
