@@ -711,31 +711,57 @@ fn renderPaneRowDragOverlay(state: *runtime.AppState) void {
     queuePaletteRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 232)), theme.scaledUi(8.0));
     queuePaletteBorder(state, rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 180)), theme.scaledUi(8.0), theme.scaledUi(1.0));
     const font = theme.scaledUi(13.5);
+    var term_title_buf: TerminalTitleBuffer = undefined;
     queuePaletteText(state, .{
         .x = rect.x + theme.scaledUi(12.0),
         .y = rect.y + (rect.h - font * 1.25) * 0.5,
         .w = rect.w - theme.scaledUi(20.0),
         .h = font * 1.25,
-    }, paneTitle(state, pane_row_drag.project_index, project, pane), paletteColor(theme.COLOR_WHITE), font, rect);
+    }, paneTitle(state, pane_row_drag.project_index, project, pane, &term_title_buf), paletteColor(theme.COLOR_WHITE), font, rect);
 }
 
-/// Short human label for a pane, shared by the pane drag ghost and the
-/// workspace tab strip: thread title, terminal surface title, or browser
-/// tab title, with a kind-named fallback.
+/// Scratch for `Dock.activeProcessLabel`, sized to its buffer contract.
+pub const TerminalTitleBuffer = [96]u8;
+
+/// Short human label for a pane, shared by the sidebar rows, the pane drag
+/// ghost, and the workspace tab strip: thread title, terminal title, or
+/// browser tab title, with a kind-named fallback. `term_title_buf` backs the
+/// terminal's live-process label when no surface title is set.
 pub fn paneTitle(
     state: *const runtime.AppState,
     project_index: usize,
     project: *const native_state.Project,
     pane: *const native_state.WorkspacePane,
+    term_title_buf: *TerminalTitleBuffer,
 ) []const u8 {
     return switch (pane.ref) {
         .chat => |ref| if (ref.thread_index < project.threads.items.len) project.threads.items[ref.thread_index].title else "Chat",
-        .terminal => |ref| if (state.projectTerminalSurface(project_index, ref.dock_id)) |surface|
-            if (surface.title.len > 0) stripLeadingTitleSymbols(surface.title) else "Terminal"
-        else
-            "Terminal",
+        .terminal => |ref| terminalPaneTitle(state, project_index, ref.dock_id, term_title_buf),
         .browser => browserPaneTitle(pane),
     };
+}
+
+/// Terminal pane label: prefer an agent/notify-provided surface title, then
+/// the terminal's live label (pinned TUI title, OSC title, or cwd), then a
+/// generic fallback. Every surface that names a terminal pane must go through
+/// this so the tab strip and sidebar never disagree.
+fn terminalPaneTitle(
+    state: *const runtime.AppState,
+    project_index: usize,
+    dock_id: u32,
+    term_title_buf: *TerminalTitleBuffer,
+) []const u8 {
+    const title = blk: {
+        if (state.projectTerminalSurface(project_index, dock_id)) |s| if (s.title.len > 0) break :blk s.title;
+        if (state.projectTerminalDock(project_index, dock_id)) |dock| {
+            const live = dock.activeProcessLabel(term_title_buf);
+            if (live.len > 0) break :blk live;
+        }
+        break :blk "Terminal";
+    };
+    // Agents (e.g. Claude Code) prefix their title with a symbol marker like
+    // "✳" the UI font can't render; drop it so it doesn't show as a tofu box.
+    return stripLeadingTitleSymbols(title);
 }
 
 fn handleSidebarContextMenuPrimary(state: *runtime.AppState, x: f32, y: f32) bool {
@@ -2130,20 +2156,7 @@ fn renderOpenPaneRow(
             } else {
                 queuePaletteTerminalMark(state, icon_x, cy, theme.scaledUi(14.0), muted, clip);
             }
-            // Prefer an agent/notify-provided surface title, then the terminal's
-            // live OSC title (or cwd via tabTitle), then a generic fallback.
-            title = blk: {
-                if (surface) |s| if (s.title.len > 0) break :blk s.title;
-                if (state.projectTerminalDock(project_index, ref.dock_id)) |dock| {
-                    const live = dock.activeProcessLabel(&term_title_buf);
-                    if (live.len > 0) break :blk live;
-                }
-                break :blk "Terminal";
-            };
-            // Agents (e.g. Claude Code) prefix their title with a symbol marker
-            // like "✳" the sidebar font can't render; drop it so it doesn't show
-            // as a tofu box before the title.
-            title = stripLeadingTitleSymbols(title);
+            title = terminalPaneTitle(state, project_index, ref.dock_id, &term_title_buf);
         },
         .browser => {
             // Center in the shared provider glyph slot so the smaller globe

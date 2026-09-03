@@ -385,6 +385,31 @@ pub const WorkspaceLayout = struct {
         return self.scroll_mode_override != null or self.scroll_threshold_override != null;
     }
 
+    /// Whether this workspace renders as the scrolling strip (one slot per
+    /// tab) under the given global scroll settings. Zoom does not turn the
+    /// strip off: a zoomed pane fills its own tab's slot.
+    pub fn scrollingStripEnabled(self: *const WorkspaceLayout, global_mode: app_config.WorkspaceScrollMode, global_threshold: u8) bool {
+        return scrollingStripEnabledFor(
+            self.effectiveScrollMode(global_mode),
+            self.effectiveScrollThreshold(global_threshold),
+            self.visiblePaneCount(),
+        );
+    }
+
+    /// Zoomed pane after focus moves to `target_pane_id`. In the strip, zoom
+    /// is contained to its tab: focusing another pane of the zoomed tab hands
+    /// the zoom to it (so the hidden sibling becomes visible), while focusing
+    /// a different tab leaves the zoomed tab as it is. In the tiled layout the
+    /// zoom fills the workspace, so it must follow focus or the focused pane
+    /// would be invisible.
+    pub fn zoomAfterFocus(self: *const WorkspaceLayout, target_pane_id: WorkspacePaneId, strip_active: bool) ?WorkspacePaneId {
+        const zoomed = self.maximized_pane_id orelse return null;
+        if (!strip_active) return target_pane_id;
+        const zoomed_tab = self.scrollGroupIdForPane(zoomed) orelse return target_pane_id;
+        const target_tab = self.scrollGroupIdForPane(target_pane_id) orelse return zoomed;
+        return if (zoomed_tab == target_tab) target_pane_id else zoomed;
+    }
+
     pub fn hasCustomScrollPaneExtent(self: *const WorkspaceLayout) bool {
         if (self.scroll_pane_extent_override != null) return true;
         for (self.panes.items) |pane| {
@@ -1429,6 +1454,16 @@ pub const WorkspaceLayout = struct {
         return switch (node.*) {
             .leaf => 1,
             .split => |split| countWorkspaceNodeLeaves(split.first) + countWorkspaceNodeLeaves(split.second),
+        };
+    }
+
+    /// Pure strip predicate for an already-resolved mode and threshold.
+    pub fn scrollingStripEnabledFor(mode: app_config.WorkspaceScrollMode, threshold: u8, visible_pane_count: usize) bool {
+        if (visible_pane_count == 0) return false;
+        return switch (mode) {
+            .automatic => visible_pane_count >= @as(usize, threshold),
+            .always => true,
+            .disabled => false,
         };
     }
 

@@ -241,6 +241,22 @@ pub fn currentProjectWorkspaceMaximizedPaneId(self: anytype) ?WorkspacePaneId {
     return pane_id;
 }
 
+/// Whether `layout` renders as the scrolling strip under the user's scroll
+/// settings; the strip gives every tab its own slot, so zoom stays inside it.
+pub fn workspaceScrollingStripActive(self: anytype, layout: *const WorkspaceLayout) bool {
+    return layout.scrollingStripEnabled(self.app_config.workspace_scroll_mode, self.app_config.workspace_scroll_threshold);
+}
+
+/// Zoomed pane of the selected workspace when it fills the whole pane region
+/// (tiled layout, or a zoomed pane outside the strip's root tree). Null while
+/// the strip is showing, where a zoomed pane only fills its tab's slot.
+pub fn currentProjectWorkspaceFullZoomPaneId(self: anytype) ?WorkspacePaneId {
+    const pane_id = self.currentProjectWorkspaceMaximizedPaneId() orelse return null;
+    const layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
+    if (self.workspaceScrollingStripActive(layout) and layout.rootContainsPane(pane_id)) return null;
+    return pane_id;
+}
+
 pub fn currentProjectQuickPane(self: anytype) ?FloatingQuickPane {
     if (self.project_controller.projects.items.len == 0) return null;
     const layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;

@@ -1735,7 +1735,9 @@ fn activeContinuousFrames(state: *AppState) bool {
 
 fn currentTranscriptLayoutNeedsFrames(state: *const AppState) bool {
     if (state.project_controller.projects.items.len == 0) return false;
-    if (state.currentProjectWorkspaceMaximizedPaneId()) |pane_id| {
+    // A strip-scoped zoom leaves other tabs visible, so only a full-workspace
+    // zoom can hide every chat pane.
+    if (state.currentProjectWorkspaceFullZoomPaneId()) |pane_id| {
         if (state.workspacePaneKindById(pane_id) != .chat) return false;
     } else if (!state.currentProject().workspace_layout.hasVisiblePaneKind(.chat)) {
         return false;

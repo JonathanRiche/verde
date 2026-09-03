@@ -7443,9 +7443,14 @@ pub const AppState = struct {
             }
         }
         const pane = target orelse return;
-        const preserve_viewport = was_maximized;
+        const strip_active = self.workspaceScrollingStripActive(layout);
+        // A full-workspace zoom has no strip viewport to reveal within; a
+        // zoom inside the strip still scrolls to the selected tab.
+        const preserve_viewport = was_maximized and !strip_active;
         layout.focused_pane_id = pane_id;
-        layout.maximized_pane_id = if (preserve_zoom and was_maximized) pane_id else null;
+        // Zoom is contained to its tab: selecting another tab leaves the
+        // zoomed tab alone, selecting a hidden sibling hands the zoom over.
+        layout.maximized_pane_id = if (preserve_zoom) layout.zoomAfterFocus(pane_id, strip_active) else null;
         self.restorePersistedBrowserPaneAfterProjectSelection(project_index);
         switch (pane.ref) {
             .chat, .terminal => {},
@@ -9482,6 +9487,8 @@ pub const AppState = struct {
     pub const threadIsOpenInTui = workspace_controller.threadIsOpenInTui;
     pub const currentProjectWorkspaceRoot = workspace_controller.currentProjectWorkspaceRoot;
     pub const currentProjectWorkspaceMaximizedPaneId = workspace_controller.currentProjectWorkspaceMaximizedPaneId;
+    pub const workspaceScrollingStripActive = workspace_controller.workspaceScrollingStripActive;
+    pub const currentProjectWorkspaceFullZoomPaneId = workspace_controller.currentProjectWorkspaceFullZoomPaneId;
     pub const currentProjectQuickPane = workspace_controller.currentProjectQuickPane;
     pub const floatFocusedWorkspacePane = workspace_controller.floatFocusedWorkspacePane;
     pub const toggleCurrentProjectQuickPane = workspace_controller.toggleCurrentProjectQuickPane;

@@ -378,28 +378,27 @@ pub fn focusPaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool 
     if (state.project_controller.projects.items.len == 0) return false;
     const layout = &state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout;
     const current_id = layout.focused_pane_id orelse return false;
-    const maximized = state.currentProjectWorkspaceMaximizedPaneId() != null;
-    const scrolling_navigation = scrollingLayoutEnabled(
-        layout.effectiveScrollMode(state.app_config.workspace_scroll_mode),
-        layout.effectiveScrollThreshold(state.app_config.workspace_scroll_threshold),
-        layout.visiblePaneCount(),
-        false,
-    );
-    if (maximized) {
-        if (scrolling_navigation) {
-            const direction = workspacePaneDirection(dir);
-            if (layout.neighborPaneIdInScrollGroup(current_id, direction)) |inner_target| {
-                return focusPaneNavigationTarget(state, inner_target, true);
-            }
-            const strip_direction = scrollingPaneDirection(state.app_config.workspace_scroll_direction, dir) orelse return false;
-            const target = layout.adjacentScrollGroupPaneId(current_id, strip_direction) orelse return false;
-            return focusPaneNavigationTarget(state, target, true);
+    // The strip navigates by tree adjacency whether or not a pane is zoomed:
+    // a zoomed tab hands its zoom to the sibling stepped onto, and stepping
+    // to another tab leaves it zoomed (focusPaneNavigationTarget).
+    if (scrollingLayoutActive(state, layout)) {
+        const direction = workspacePaneDirection(dir);
+        if (layout.neighborPaneIdInScrollGroup(current_id, direction)) |inner_target| {
+            return focusPaneNavigationTarget(state, inner_target);
         }
+        const strip_direction = scrollingPaneDirection(state.app_config.workspace_scroll_direction, dir) orelse return false;
+        const target = layout.adjacentScrollGroupPaneId(current_id, strip_direction) orelse return false;
+        return focusPaneNavigationTarget(state, target);
+    }
+
+    if (state.currentProjectWorkspaceMaximizedPaneId() != null) {
+        // A tiled zoom hides the other panes, so navigate the geometry the
+        // unzoomed tree would have instead of the single rendered rect.
         if (state.currentProjectWorkspaceRoot()) |root| {
             var expanded_rects: [MAX_WORKSPACE_PANE_RECTS]WorkspacePaneRect = undefined;
             var expanded_count: usize = 0;
             collectNodePaneRects(root, pane_rects[0].rect, &expanded_rects, &expanded_count);
-            if (focusPaneInDirectionFromRects(state, current_id, dir, expanded_rects[0..expanded_count], true)) return true;
+            if (focusPaneInDirectionFromRects(state, current_id, dir, expanded_rects[0..expanded_count])) return true;
         }
         return if (state.app_config.unzoom_on_pane_navigation)
             state.clearCurrentProjectWorkspacePaneMaximized()
@@ -407,17 +406,7 @@ pub fn focusPaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool 
             false;
     }
 
-    if (scrolling_navigation) {
-        const direction = workspacePaneDirection(dir);
-        if (layout.neighborPaneIdInScrollGroup(current_id, direction)) |inner_target| {
-            return focusPaneNavigationTarget(state, inner_target, false);
-        }
-        const strip_direction = scrollingPaneDirection(state.app_config.workspace_scroll_direction, dir) orelse return false;
-        const target = layout.adjacentScrollGroupPaneId(current_id, strip_direction) orelse return false;
-        return focusPaneNavigationTarget(state, target, false);
-    }
-
-    return focusPaneInDirectionFromRects(state, current_id, dir, pane_rects[0..pane_rect_count], false);
+    return focusPaneInDirectionFromRects(state, current_id, dir, pane_rects[0..pane_rect_count]);
 }
 
 pub fn openFocusedChatPaneContextMenu(state: *runtime.AppState) bool {
@@ -451,7 +440,6 @@ fn focusPaneInDirectionFromRects(
     current_id: runtime.WorkspacePaneId,
     dir: FocusDirection,
     rects: []const WorkspacePaneRect,
-    navigating_maximized: bool,
 ) bool {
     var current_rect: ?palette.Rect = null;
     var i: usize = 0;
@@ -501,16 +489,18 @@ fn focusPaneInDirectionFromRects(
     }
 
     const target = best_id orelse return false;
-    return focusPaneNavigationTarget(state, target, navigating_maximized);
+    return focusPaneNavigationTarget(state, target);
 }
 
-fn focusPaneNavigationTarget(state: *runtime.AppState, target: runtime.WorkspacePaneId, navigating_maximized: bool) bool {
-    if (navigating_maximized) {
+fn focusPaneNavigationTarget(state: *runtime.AppState, target: runtime.WorkspacePaneId) bool {
+    const layout = &state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout;
+    if (layout.maximized_pane_id != null) {
         if (state.app_config.unzoom_on_pane_navigation) {
             _ = state.clearCurrentProjectWorkspacePaneMaximized();
         } else {
-            const layout = &state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout;
-            layout.maximized_pane_id = target;
+            // Zoom follows focus inside its tab (or across the whole tiled
+            // workspace) but never jumps to another tab of the strip.
+            layout.maximized_pane_id = layout.zoomAfterFocus(target, scrollingLayoutActive(state, layout));
         }
     }
     _ = state.focusCurrentProjectWorkspacePane(target);
@@ -888,7 +878,9 @@ pub fn renderAtWithTranscriptLayoutWidth(state: *runtime.AppState, rect: palette
         empty_workspace_selected_action = 0;
     }
 
-    if (state.currentProjectWorkspaceMaximizedPaneId()) |pane_id| {
+    // In the strip a zoomed pane only takes over its own tab's slot (see
+    // renderScrollingGroup); the full-workspace zoom is the tiled layout's.
+    if (state.currentProjectWorkspaceFullZoomPaneId()) |pane_id| {
         renderLeafWithTranscriptLayoutWidth(state, pane_id, rect, target_workspace_width);
     } else if (state.currentProjectWorkspaceRoot()) |root| {
         const layout = &state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout;
@@ -1514,22 +1506,11 @@ fn threadDropTargetForPane(pane_id: runtime.WorkspacePaneId, rect: palette.Rect,
 }
 
 fn scrollingLayoutActive(state: *const runtime.AppState, layout: *const runtime.WorkspaceLayout) bool {
-    return scrollingLayoutEnabled(
-        layout.effectiveScrollMode(state.app_config.workspace_scroll_mode),
-        layout.effectiveScrollThreshold(state.app_config.workspace_scroll_threshold),
-        layout.visiblePaneCount(),
-        layout.maximized_pane_id != null,
-    );
+    return state.workspaceScrollingStripActive(layout);
 }
 
-fn scrollingLayoutEnabled(mode: app_config.WorkspaceScrollMode, threshold: u8, visible_pane_count: usize, maximized: bool) bool {
-    if (maximized or visible_pane_count == 0) return false;
-    return switch (mode) {
-        .automatic => visible_pane_count >= @as(usize, threshold),
-        .always => true,
-        .disabled => false,
-    };
-}
+// Zoom never disables the strip; a zoomed pane fills its tab's slot.
+const scrollingLayoutEnabled = workspace_layout.WorkspaceLayout.scrollingStripEnabledFor;
 
 // Configurable-axis workspace strip with focus-aware reveal and clipping.
 fn renderScrollingStrip(
@@ -1820,7 +1801,7 @@ fn focusScrollingEdgePane(state: *runtime.AppState, edge: ScrollingEdgeDirection
         .vertical => if (edge == .previous) .up else .down,
     };
     const target = layout.adjacentScrollGroupPaneId(focused_pane_id, direction) orelse return;
-    _ = focusPaneNavigationTarget(state, target, false);
+    _ = focusPaneNavigationTarget(state, target);
 }
 
 // One scrolling workspace item, including any nested tiled panes.
@@ -1851,14 +1832,21 @@ fn renderScrollingGroup(
     // pane never sits edge-to-edge like a zoomed one.
     const pane_count = layout.scrollGroupPaneCount(group_id);
     const inset_group = !viewport_has_margins;
-    renderScrollGroupNode(
-        state,
-        layout,
-        root,
-        group_id,
-        tiledContentRect(rect, gap, inset_group),
-        tiledContentExtent(target_pane_width, gap, inset_group),
-    );
+    if (zoomedPaneInScrollGroup(layout, group_id)) |zoomed_pane_id| {
+        // Zoom is contained to the tab: the zoomed pane takes the whole slot
+        // edge-to-edge and its tile siblings stay hidden, while the rest of
+        // the strip keeps rendering around it.
+        renderLeafWithTranscriptLayoutWidth(state, zoomed_pane_id, rect, target_pane_width);
+    } else {
+        renderScrollGroupNode(
+            state,
+            layout,
+            root,
+            group_id,
+            tiledContentRect(rect, gap, inset_group),
+            tiledContentExtent(target_pane_width, gap, inset_group),
+        );
+    }
     const gutter: palette.Rect = switch (direction) {
         .horizontal => .{ .x = rect.x + rect.w, .y = workspace.y, .w = gap, .h = workspace.h },
         .vertical => .{ .x = workspace.x, .y = rect.y + rect.h, .w = workspace.w, .h = gap },
@@ -1879,6 +1867,13 @@ fn renderScrollingGroup(
     };
     appendScrollingResizeHit(representative_pane_id, axis, leading_grip, workspace, pane_index, offset, origin, pane_extent, true);
     appendScrollingResizeHit(representative_pane_id, axis, trailing_grip, workspace, pane_index, offset, origin, pane_extent, false);
+}
+
+/// The workspace's zoomed pane when it belongs to `group_id` (this tab).
+fn zoomedPaneInScrollGroup(layout: *const runtime.WorkspaceLayout, group_id: runtime.WorkspacePaneId) ?runtime.WorkspacePaneId {
+    const zoomed = layout.maximized_pane_id orelse return null;
+    if (layout.scrollGroupIdForPane(zoomed) != group_id) return null;
+    return zoomed;
 }
 
 fn nodeContainsScrollGroup(
@@ -3035,7 +3030,7 @@ test "directional navigation transfers zoom unless unzoom is configured" {
         .{ .pane_id = first_pane_id, .rect = .{ .x = 0.0, .y = 0.0, .w = 100.0, .h = 100.0 } },
         .{ .pane_id = second_pane_id, .rect = .{ .x = 101.0, .y = 0.0, .w = 100.0, .h = 100.0 } },
     };
-    try std.testing.expect(focusPaneInDirectionFromRects(&state, first_pane_id, .right, &rects, true));
+    try std.testing.expect(focusPaneInDirectionFromRects(&state, first_pane_id, .right, &rects));
     var layout = &state.project_controller.projects.items[0].workspace_layout;
     try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, second_pane_id), layout.focused_pane_id);
     try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, second_pane_id), layout.maximized_pane_id);
@@ -3043,7 +3038,7 @@ test "directional navigation transfers zoom unless unzoom is configured" {
     layout.focused_pane_id = first_pane_id;
     layout.maximized_pane_id = first_pane_id;
     state.app_config.unzoom_on_pane_navigation = true;
-    try std.testing.expect(focusPaneInDirectionFromRects(&state, first_pane_id, .right, &rects, true));
+    try std.testing.expect(focusPaneInDirectionFromRects(&state, first_pane_id, .right, &rects));
     try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, second_pane_id), layout.focused_pane_id);
     try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, null), layout.maximized_pane_id);
 }
@@ -3091,8 +3086,9 @@ test "scrolling navigation restores the last focused tile child with and without
     state.app_config.workspace_scroll_mode = .always;
     state.app_config.workspace_scroll_direction = .horizontal;
 
-    // Zoomed navigation follows hidden split geometry inside a tiled group,
-    // then follows scrolling-group order along the strip axis.
+    // Zoom is contained to its tab: stepping onto a hidden tile sibling hands
+    // the zoom over, while stepping to another tab along the strip axis
+    // focuses that tab and leaves the zoomed tab as it was.
     pane_rect_count = 1;
     pane_rects[0] = .{ .pane_id = first_pane_id, .rect = .{ .x = 0.0, .y = 0.0, .w = 1000.0, .h = 700.0 } };
     const layout = &state.project_controller.projects.items[0].workspace_layout;
@@ -3101,7 +3097,7 @@ test "scrolling navigation restores the last focused tile child with and without
     try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, lower_chat_pane_id), layout.maximized_pane_id);
     try std.testing.expect(focusPaneInDirection(&state, .right));
     try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, terminal_pane_id), layout.focused_pane_id);
-    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, terminal_pane_id), layout.maximized_pane_id);
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, lower_chat_pane_id), layout.maximized_pane_id);
     try std.testing.expect(focusPaneInDirection(&state, .left));
     try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, lower_chat_pane_id), layout.focused_pane_id);
     try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, lower_chat_pane_id), layout.maximized_pane_id);
@@ -3110,10 +3106,10 @@ test "scrolling navigation restores the last focused tile child with and without
     try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, first_pane_id), layout.maximized_pane_id);
     try std.testing.expect(focusPaneInDirection(&state, .right));
     try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, terminal_pane_id), layout.focused_pane_id);
-    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, terminal_pane_id), layout.maximized_pane_id);
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, first_pane_id), layout.maximized_pane_id);
 
     layout.maximized_pane_id = null;
-    try std.testing.expect(focusPaneNavigationTarget(&state, lower_chat_pane_id, false));
+    try std.testing.expect(focusPaneNavigationTarget(&state, lower_chat_pane_id));
     try std.testing.expect(focusPaneInDirection(&state, .right));
     try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, terminal_pane_id), layout.focused_pane_id);
     try std.testing.expect(focusPaneInDirection(&state, .left));
@@ -3650,24 +3646,23 @@ test "scrolling grow resizes only the focused pane" {
 }
 
 test "scrolling layout policy supports automatic always and disabled modes" {
-    try std.testing.expect(!scrollingLayoutEnabled(.automatic, 4, 3, false));
-    try std.testing.expect(scrollingLayoutEnabled(.automatic, 4, 4, false));
-    try std.testing.expect(scrollingLayoutEnabled(.always, 64, 1, false));
-    try std.testing.expect(!scrollingLayoutEnabled(.disabled, 1, 8, false));
-    try std.testing.expect(!scrollingLayoutEnabled(.always, 1, 0, false));
-    try std.testing.expect(!scrollingLayoutEnabled(.always, 1, 4, true));
+    try std.testing.expect(!scrollingLayoutEnabled(.automatic, 4, 3));
+    try std.testing.expect(scrollingLayoutEnabled(.automatic, 4, 4));
+    try std.testing.expect(scrollingLayoutEnabled(.always, 64, 1));
+    try std.testing.expect(!scrollingLayoutEnabled(.disabled, 1, 8));
+    try std.testing.expect(!scrollingLayoutEnabled(.always, 1, 0));
 }
 
 test "scrolling layout automatic mode covers configured threshold matrix" {
     const thresholds = [_]u8{ 1, 2, 4, 8 };
     for (thresholds) |threshold| {
         if (threshold > 1) {
-            try std.testing.expect(!scrollingLayoutEnabled(.automatic, threshold, @as(usize, threshold - 1), false));
+            try std.testing.expect(!scrollingLayoutEnabled(.automatic, threshold, @as(usize, threshold - 1)));
         }
-        try std.testing.expect(scrollingLayoutEnabled(.automatic, threshold, @as(usize, threshold), false));
-        try std.testing.expect(scrollingLayoutEnabled(.automatic, threshold, @as(usize, threshold) + 1, false));
+        try std.testing.expect(scrollingLayoutEnabled(.automatic, threshold, @as(usize, threshold)));
+        try std.testing.expect(scrollingLayoutEnabled(.automatic, threshold, @as(usize, threshold) + 1));
     }
-    try std.testing.expect(!scrollingLayoutEnabled(.disabled, 1, 64, false));
+    try std.testing.expect(!scrollingLayoutEnabled(.disabled, 1, 64));
 }
 
 test "automatic scrolling activation follows tiled pane creation and closure" {
@@ -3675,23 +3670,23 @@ test "automatic scrolling activation follows tiled pane creation and closure" {
     var layout = try runtime.WorkspaceLayout.initDefaultChat(allocator);
     defer layout.deinit(allocator);
 
-    try std.testing.expect(!scrollingLayoutEnabled(.automatic, 2, layout.visiblePaneCount(), false));
+    try std.testing.expect(!scrollingLayoutEnabled(.automatic, 2, layout.visiblePaneCount()));
 
     const second_pane_id = try layout.createTerminalPane(allocator, 10);
     try layout.splitPaneWithLeaf(allocator, 1, second_pane_id, .vertical, true);
-    try std.testing.expect(scrollingLayoutEnabled(.automatic, 2, layout.visiblePaneCount(), false));
+    try std.testing.expect(scrollingLayoutEnabled(.automatic, 2, layout.visiblePaneCount()));
 
     const third_pane_id = try layout.createTerminalPane(allocator, 11);
     try layout.splitPaneWithLeaf(allocator, second_pane_id, third_pane_id, .horizontal, true);
-    try std.testing.expect(scrollingLayoutEnabled(.automatic, 2, layout.visiblePaneCount(), false));
+    try std.testing.expect(scrollingLayoutEnabled(.automatic, 2, layout.visiblePaneCount()));
 
     var removed_ref = layout.closePane(allocator, third_pane_id) orelse return error.TestExpectedEqual;
     workspace_layout.deinitWorkspacePaneRef(&removed_ref, allocator);
-    try std.testing.expect(scrollingLayoutEnabled(.automatic, 2, layout.visiblePaneCount(), false));
+    try std.testing.expect(scrollingLayoutEnabled(.automatic, 2, layout.visiblePaneCount()));
 
     removed_ref = layout.closePane(allocator, second_pane_id) orelse return error.TestExpectedEqual;
     workspace_layout.deinitWorkspacePaneRef(&removed_ref, allocator);
-    try std.testing.expect(!scrollingLayoutEnabled(.automatic, 2, layout.visiblePaneCount(), false));
+    try std.testing.expect(!scrollingLayoutEnabled(.automatic, 2, layout.visiblePaneCount()));
 }
 
 test "scrolling focus direction follows the configured axis" {

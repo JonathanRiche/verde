@@ -251,7 +251,9 @@ pub fn noteTranscriptPresented(self: anytype, pane_id: ?WorkspacePaneId) void {
 pub fn currentTranscriptPresentation(self: anytype) ?TranscriptPresentationIdentity {
     if (self.project_controller.projects.items.len == 0) return null;
     const layout = &self.currentProject().workspace_layout;
-    const pane_id = layout.maximized_pane_id orelse layout.focused_pane_id;
+    // A strip-scoped zoom only fills its own tab, so the focused pane is still
+    // the one being presented; only a full-workspace zoom overrides it.
+    const pane_id = self.currentProjectWorkspaceFullZoomPaneId() orelse layout.focused_pane_id;
     if (pane_id == null and layout.root != null) return null;
     return transcriptPresentationIdentityForPane(self, pane_id);
 }

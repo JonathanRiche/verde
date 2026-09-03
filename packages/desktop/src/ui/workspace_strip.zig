@@ -131,10 +131,10 @@ pub fn plusTabRect(strip: palette.Rect, after_x: f32) palette.Rect {
 /// Label shown on a tab: the title of its preferred pane (the last-focused
 /// child of a split tile), so a chat│terminal tile reads as the chat you
 /// were working in rather than an arbitrary member.
-pub fn tabLabel(state: *const runtime.AppState, project_index: usize, tab: runtime.WorkspaceTab) []const u8 {
+pub fn tabLabel(state: *const runtime.AppState, project_index: usize, tab: runtime.WorkspaceTab, term_title_buf: *sidebar.TerminalTitleBuffer) []const u8 {
     const project = &state.project_controller.projects.items[project_index];
     const pane = project.workspace_layout.paneById(tab.preferred_pane_id) orelse return "Pane";
-    return sidebar.paneTitle(state, project_index, project, pane);
+    return sidebar.paneTitle(state, project_index, project, pane, term_title_buf);
 }
 
 /// Tab strip: a Herdr-style row of rectangular tabs along the top of the
@@ -164,7 +164,9 @@ pub fn render(state: *runtime.AppState, strip: palette.Rect) void {
     const key_tip_w = theme.scaledUi(KEY_TIP_SIZE_UI) + theme.scaledUi(KEY_TIP_INSET_X_UI);
     var x = strip.x + strip_pad;
     for (tabs, 0..) |tab, tab_index| {
-        const title = tabLabel(state, project_index, tab);
+        // Backs a terminal tab's live title for the measure + draw below.
+        var term_title_buf: sidebar.TerminalTitleBuffer = undefined;
+        const title = tabLabel(state, project_index, tab, &term_title_buf);
         var key_tip_buf: [16]u8 = undefined;
         const key_tip = tabKeyTip(state, &key_tip_buf, tab_index);
         const tip_reserve = if (key_tip.len > 0) key_tip_w else 0.0;
@@ -602,5 +604,6 @@ test "workspace strip tabs follow tiles: a split tile is one tab and activation 
     try std.testing.expect(layout.panesShareScrollGroup(first_pane_id, tiled_pane_id));
     try std.testing.expectEqual(@as(?runtime.WorkspaceTabId, tabs[0].id), runtime.workspace_tabs.focusedTabId(layout));
     // Tab labels resolve through the pane title (both tiled panes are chats).
-    try std.testing.expect(tabLabel(&state, 0, tabs[0]).len > 0);
+    var term_title_buf: sidebar.TerminalTitleBuffer = undefined;
+    try std.testing.expect(tabLabel(&state, 0, tabs[0], &term_title_buf).len > 0);
 }
