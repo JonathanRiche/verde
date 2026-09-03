@@ -1404,8 +1404,25 @@ pub fn focusAttentionClusterRowAtIndex(state: *runtime.AppState, row_index: usiz
     const row_count = collectAttentionClusterRows(state, &rows);
     if (row_index >= row_count) return false;
     sortAttentionClusterRows(rows[0..row_count]);
+    const current_pane_id = if (state.project_controller.selected_index < state.project_controller.projects.items.len)
+        state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout.focused_pane_id
+    else
+        null;
+    var current_row: ?usize = null;
+    if (current_pane_id) |pane_id| {
+        for (rows[0..row_count], 0..) |candidate, index| {
+            if (candidate.project_index == state.project_controller.selected_index and candidate.pane.id == pane_id) {
+                current_row = index;
+                break;
+            }
+        }
+    }
     const row = rows[row_index];
     state.focusWorkspaceOpenPaneFromSidebar(row.project_index, row.pane.id);
+    if (row.project_index < state.project_controller.projects.items.len) {
+        const direction: i8 = if (current_row) |from| (if (row_index >= from) 1 else -1) else 1;
+        state.project_controller.projects.items[row.project_index].workspace_layout.noteScrollSkipDirection(direction);
+    }
     return true;
 }
 
@@ -1429,6 +1446,9 @@ pub fn focusAdjacentAttentionClusterRow(state: *runtime.AppState, delta: i32) bo
     );
     const row = rows[target_index];
     state.focusWorkspaceOpenPaneFromSidebar(row.project_index, row.pane.id);
+    if (row.project_index < state.project_controller.projects.items.len) {
+        state.project_controller.projects.items[row.project_index].workspace_layout.noteScrollSkipDirection(if (delta > 0) 1 else -1);
+    }
     return true;
 }
 

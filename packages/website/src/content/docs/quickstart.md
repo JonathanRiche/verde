@@ -150,7 +150,7 @@ The full set of defaults and how to remap them is in [Keybinds](/docs/keybinds).
 workspaces, and app commands in a single searchable list. Press `Ctrl+Enter` on
 any result to open it in a fresh pane.
 
-Closing a workspace with `Ctrl+Shift+W` removes it from the active sidebar but
+Closing a workspace with prefix `Shift+X` removes it from the active sidebar but
 keeps its layout and threads. Use the command palette's reopen action to bring
 it back.
 

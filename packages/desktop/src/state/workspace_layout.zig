@@ -139,9 +139,19 @@ pub const WorkspaceLayout = struct {
     scroll_offset_y: f32 = 0.0,
     scroll_target_y: f32 = 0.0,
     scroll_revealed_pane_id: ?WorkspacePaneId = null,
+    /// Pane the strip was showing before a keyboard/sidebar jump invalidated
+    /// reveal. Rendering consumes it to decide whether to skip-slide.
+    scroll_reveal_from_pane_id: ?WorkspacePaneId = null,
     /// A transient direct-navigation request. Rendering consumes it after
     /// placing the selected pane at the strip's leading edge.
     scroll_leading_pane_id: ?WorkspacePaneId = null,
+    /// Hint from Active prev/next: +1 incoming from trailing edge, -1 from
+    /// leading. Zero means infer from strip indices. Consumed on reveal.
+    scroll_skip_pending_direction: i8 = 0,
+    scroll_skip_from_group_id: ?WorkspacePaneId = null,
+    scroll_skip_to_group_id: ?WorkspacePaneId = null,
+    scroll_skip_direction: i8 = 0,
+    scroll_skip_started_ms: i64 = 0,
     scroll_animation_last_ms: i64 = 0,
     /// Transient wheel-settle deadline. Zero means no pane snap is pending.
     scroll_snap_deadline_ms: i64 = 0,
@@ -529,6 +539,17 @@ pub const WorkspaceLayout = struct {
     pub fn requestLeadingScrollReveal(self: *WorkspaceLayout, pane_id: WorkspacePaneId) void {
         self.scroll_leading_pane_id = if (self.rootContainsPane(pane_id)) pane_id else null;
         self.scroll_revealed_pane_id = null;
+    }
+
+    pub fn noteScrollSkipDirection(self: *WorkspaceLayout, direction: i8) void {
+        self.scroll_skip_pending_direction = if (direction < 0) -1 else if (direction > 0) 1 else 0;
+    }
+
+    pub fn clearScrollSkipSlide(self: *WorkspaceLayout) void {
+        self.scroll_skip_from_group_id = null;
+        self.scroll_skip_to_group_id = null;
+        self.scroll_skip_direction = 0;
+        self.scroll_skip_started_ms = 0;
     }
 
     /// Returns the adjacent tiled pane in the same order as the expanded

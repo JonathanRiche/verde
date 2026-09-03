@@ -87,6 +87,10 @@ describe('verde.json JSON Schema', () => {
 
     const workspace = child(keybinds, 'workspace')
     expect(propertiesOf(workspace)).toEqual([...KEYBIND_WORKSPACE_KEYS])
+    expect(child(workspace, 'close').description).toContain('Unbound by default')
+    expect(child(workspace, 'close').description).toContain('Alt+X')
+    expect(child(workspace, 'active_select').description).toContain('Active')
+    expect(child(workspace, 'active_previous').description).toContain('Alt+Left')
 
     const terminalOneOf = child(keybinds, 'terminal').oneOf
     expect(terminalOneOf).toHaveLength(2)

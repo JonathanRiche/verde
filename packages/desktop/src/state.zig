@@ -1564,7 +1564,13 @@ fn preserveWorkspaceViewportRuntime(
     next_layout.scroll_animation_last_ms = current_layout.scroll_animation_last_ms;
     next_layout.scroll_snap_deadline_ms = current_layout.scroll_snap_deadline_ms;
     next_layout.scroll_revealed_pane_id = current_layout.scroll_revealed_pane_id;
+    next_layout.scroll_reveal_from_pane_id = current_layout.scroll_reveal_from_pane_id;
     next_layout.scroll_leading_pane_id = current_layout.scroll_leading_pane_id;
+    next_layout.scroll_skip_pending_direction = current_layout.scroll_skip_pending_direction;
+    next_layout.scroll_skip_from_group_id = current_layout.scroll_skip_from_group_id;
+    next_layout.scroll_skip_to_group_id = current_layout.scroll_skip_to_group_id;
+    next_layout.scroll_skip_direction = current_layout.scroll_skip_direction;
+    next_layout.scroll_skip_started_ms = current_layout.scroll_skip_started_ms;
 }
 
 /// Pane focus, maximize, and the strip scroll target are GUI-owned
@@ -7474,9 +7480,19 @@ pub const AppState = struct {
         if (preserve_viewport) {
             layout.scroll_leading_pane_id = null;
             layout.scroll_revealed_pane_id = null;
+            layout.scroll_reveal_from_pane_id = null;
+            layout.clearScrollSkipSlide();
         } else if (leading_reveal) {
+            layout.scroll_reveal_from_pane_id = if (previous_project_index == project_index)
+                layout.scroll_revealed_pane_id
+            else
+                null;
             layout.requestLeadingScrollReveal(pane_id);
         } else {
+            layout.scroll_reveal_from_pane_id = if (previous_project_index == project_index)
+                layout.scroll_revealed_pane_id
+            else
+                null;
             layout.scroll_revealed_pane_id = null;
         }
         self.markDirty();

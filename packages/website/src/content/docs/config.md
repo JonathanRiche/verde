@@ -108,6 +108,7 @@ A complete example:
       "focus_right": "Ctrl+L",
       "pane_previous": "Ctrl+Shift+Tab",
       "pane_next": "Ctrl+Tab",
+      "close": "Alt+X",
       "active_select": ["Ctrl+Shift+1", "Ctrl+Shift+2", "Ctrl+Shift+3", "Ctrl+Shift+4", "Ctrl+Shift+5", "Ctrl+Shift+6", "Ctrl+Shift+7", "Ctrl+Shift+8", "Ctrl+Shift+9", "Ctrl+Shift+0"],
       "pane_select": ["Ctrl+1", "Ctrl+2", "Ctrl+3", "Ctrl+4", "Ctrl+5", "Ctrl+6", "Ctrl+7", "Ctrl+8", "Ctrl+9", "Ctrl+0"],
       "previous": "Alt+Up",
@@ -121,8 +122,10 @@ Keybinds are loaded on startup and on app refresh. Use a string for one
 shortcut or a string array for multiple shortcuts. Use `null`, an empty string,
 or an empty array to disable a binding. The `workspace.pane_select` and
 `workspace.active_select` arrays are positional and follow the corresponding
-sidebar lists in displayed order. `new_thread` is unbound by default; the
-example above opts back into its former direct shortcut. See [Keybinds](/docs/keybinds)
+sidebar lists in displayed order. `new_thread`, `workspace.close`, and
+`workspace.close_current` are unbound by default; prefix `x` / `Shift+X` still
+close a pane or workspace when prefix mode is on. The example above opts
+`close` back to `Alt+X`. See [Keybinds](/docs/keybinds)
 for the full keybinds reference.
 
 Most of these options also appear in Settings:

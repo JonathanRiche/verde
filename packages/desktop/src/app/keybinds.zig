@@ -1535,8 +1535,8 @@ const DefaultPrefixEntry = struct { accelerator: []const u8, target: []const u8 
 /// Default prefix table. Every built-in command has a seat here so enabling
 /// prefix mode alone exposes the whole command surface. Letters follow tmux
 /// where a tmux habit exists (`x` close, `z` zoom, `,` rename, `[`/`]`
-/// traversal, digits select); Shift flips a command to its sibling and Ctrl
-/// to its resize/positional variant.
+/// traversal); digits select panes in the current workspace and Shift+digits
+/// jump the sidebar Active list. Workspace digits live on the navigate table.
 const DEFAULT_PREFIX_TABLE = [_]DefaultPrefixEntry{
     // Help / modes
     .{ .accelerator = "Shift+Slash", .target = "prefix.keybinds" },
@@ -1603,26 +1603,16 @@ const DEFAULT_PREFIX_TABLE = [_]DefaultPrefixEntry{
     .{ .accelerator = "8", .target = "workspace.pane_select.8" },
     .{ .accelerator = "9", .target = "workspace.pane_select.9" },
     .{ .accelerator = "0", .target = "workspace.pane_select.10" },
-    .{ .accelerator = "Shift+1", .target = "workspace.select.1" },
-    .{ .accelerator = "Shift+2", .target = "workspace.select.2" },
-    .{ .accelerator = "Shift+3", .target = "workspace.select.3" },
-    .{ .accelerator = "Shift+4", .target = "workspace.select.4" },
-    .{ .accelerator = "Shift+5", .target = "workspace.select.5" },
-    .{ .accelerator = "Shift+6", .target = "workspace.select.6" },
-    .{ .accelerator = "Shift+7", .target = "workspace.select.7" },
-    .{ .accelerator = "Shift+8", .target = "workspace.select.8" },
-    .{ .accelerator = "Shift+9", .target = "workspace.select.9" },
-    .{ .accelerator = "Shift+0", .target = "workspace.select.10" },
-    .{ .accelerator = "Ctrl+1", .target = "workspace.active_select.1" },
-    .{ .accelerator = "Ctrl+2", .target = "workspace.active_select.2" },
-    .{ .accelerator = "Ctrl+3", .target = "workspace.active_select.3" },
-    .{ .accelerator = "Ctrl+4", .target = "workspace.active_select.4" },
-    .{ .accelerator = "Ctrl+5", .target = "workspace.active_select.5" },
-    .{ .accelerator = "Ctrl+6", .target = "workspace.active_select.6" },
-    .{ .accelerator = "Ctrl+7", .target = "workspace.active_select.7" },
-    .{ .accelerator = "Ctrl+8", .target = "workspace.active_select.8" },
-    .{ .accelerator = "Ctrl+9", .target = "workspace.active_select.9" },
-    .{ .accelerator = "Ctrl+0", .target = "workspace.active_select.10" },
+    .{ .accelerator = "Shift+1", .target = "workspace.active_select.1" },
+    .{ .accelerator = "Shift+2", .target = "workspace.active_select.2" },
+    .{ .accelerator = "Shift+3", .target = "workspace.active_select.3" },
+    .{ .accelerator = "Shift+4", .target = "workspace.active_select.4" },
+    .{ .accelerator = "Shift+5", .target = "workspace.active_select.5" },
+    .{ .accelerator = "Shift+6", .target = "workspace.active_select.6" },
+    .{ .accelerator = "Shift+7", .target = "workspace.active_select.7" },
+    .{ .accelerator = "Shift+8", .target = "workspace.active_select.8" },
+    .{ .accelerator = "Shift+9", .target = "workspace.active_select.9" },
+    .{ .accelerator = "Shift+0", .target = "workspace.active_select.10" },
     // Chat
     .{ .accelerator = "Shift+Up", .target = "chat_up" },
     .{ .accelerator = "Shift+Down", .target = "chat_down" },
@@ -1729,16 +1719,11 @@ fn cloneDefaultOpenEditorKeybinds(allocator: std.mem.Allocator) ![]Keybind {
 }
 
 fn cloneDefaultWorkspaceCloseKeybinds(allocator: std.mem.Allocator) ![]Keybind {
-    return allocator.dupe(Keybind, &.{
-        try parseDefaultAccelerator("CommandOrControl+W"),
-        try parseDefaultAccelerator("Alt+X"),
-    });
+    return cloneEmptyKeybinds(allocator);
 }
 
 fn cloneDefaultWorkspaceCloseCurrentKeybinds(allocator: std.mem.Allocator) ![]Keybind {
-    return allocator.dupe(Keybind, &.{
-        try parseDefaultAccelerator("Ctrl+Shift+W"),
-    });
+    return cloneEmptyKeybinds(allocator);
 }
 
 fn cloneDefaultCommandPaletteKeybinds(allocator: std.mem.Allocator) ![]Keybind {
@@ -2704,25 +2689,16 @@ test "default terminal internal split keybinds are disabled" {
     try std.testing.expectEqual(@as(usize, 0), config.terminal_split_right.len);
 }
 
-test "default workspace close supports primary w and alt x" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    try std.testing.expectEqual(@as(usize, 2), config.workspace_close.len);
-    try std.testing.expect(config.workspace_close[0].primary);
-    try std.testing.expectEqual(sdl.Keycode.w, config.workspace_close[0].key);
-    try std.testing.expect(config.workspace_close[1].alt);
-    try std.testing.expectEqual(sdl.Keycode.x, config.workspace_close[1].key);
+test "default workspace close has no direct shortcut" {
+    const close = try cloneDefaultWorkspaceCloseKeybinds(std.testing.allocator);
+    defer std.testing.allocator.free(close);
+    try std.testing.expectEqual(@as(usize, 0), close.len);
 }
 
-test "default workspace close current uses ctrl shift w" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    try std.testing.expectEqual(@as(usize, 1), config.workspace_close_current.len);
-    try std.testing.expect(config.workspace_close_current[0].ctrl);
-    try std.testing.expect(config.workspace_close_current[0].shift);
-    try std.testing.expectEqual(sdl.Keycode.w, config.workspace_close_current[0].key);
+test "default workspace close current has no direct shortcut" {
+    const close_current = try cloneDefaultWorkspaceCloseCurrentKeybinds(std.testing.allocator);
+    defer std.testing.allocator.free(close_current);
+    try std.testing.expectEqual(@as(usize, 0), close_current.len);
 }
 
 test "default workspace focus uses ctrl arrows without hjkl" {
@@ -3152,6 +3128,36 @@ test "default prefix table has no duplicate chords" {
             try std.testing.expect(!binding.key.eql(other.key));
         }
     }
+}
+
+test "default prefix shift digits jump to ACTIVE rows" {
+    var prefix = try cloneDefaultPrefixConfig(std.testing.allocator);
+    defer prefix.deinit(std.testing.allocator);
+
+    var saw_shift_one = false;
+    var saw_shift_zero = false;
+    var saw_ctrl_one = false;
+    var saw_plain_one = false;
+    var saw_workspace_shift = false;
+    for (prefix.bindings.items) |binding| {
+        if (binding.key.eql(.{ .shift = true, .key = .@"1" })) {
+            saw_shift_one = true;
+            try std.testing.expectEqual(@as(usize, 0), binding.target.active_select);
+        }
+        if (binding.key.eql(.{ .shift = true, .key = .@"0" })) {
+            saw_shift_zero = true;
+            try std.testing.expectEqual(@as(usize, 9), binding.target.active_select);
+        }
+        if (binding.key.eql(.{ .ctrl = true, .key = .@"1" })) saw_ctrl_one = true;
+        if (binding.key.eql(.{ .key = .@"1" })) {
+            saw_plain_one = true;
+            try std.testing.expectEqual(@as(usize, 0), binding.target.pane_select);
+        }
+        if (binding.target == .workspace_select) saw_workspace_shift = true;
+    }
+    try std.testing.expect(saw_shift_one and saw_shift_zero and saw_plain_one);
+    try std.testing.expect(!saw_ctrl_one);
+    try std.testing.expect(!saw_workspace_shift);
 }
 
 test "default prefix t chords create chat and terminal panes" {

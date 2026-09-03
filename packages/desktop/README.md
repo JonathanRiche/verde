@@ -160,7 +160,8 @@ Config supports UI and terminal font size, scrolling-pane activation and spacing
       "focus_right": ["Alt+Right", "Ctrl+L"],
       "pane_previous": "Ctrl+Shift+Tab",
       "pane_next": "Ctrl+Tab",
-      "close": ["CommandOrControl+W", "Alt+X"]
+      "active_previous": "Alt+Left",
+      "active_next": "Alt+Right"
     },
     "terminal": {
       "toggle": null,
