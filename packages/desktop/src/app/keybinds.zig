@@ -1452,7 +1452,7 @@ pub fn prefixTargetLabel(buf: []u8, target: PrefixTarget) []const u8 {
         .show_keybinds => "Keybinds",
         .navigate => "Workspace nav",
         .workspace_select => |index| std.fmt.bufPrint(buf, "Workspace {d}", .{index + 1}) catch "Workspace",
-        .pane_select => |index| std.fmt.bufPrint(buf, "Pane {d}", .{index + 1}) catch "Pane",
+        .pane_select => |index| std.fmt.bufPrint(buf, "Tab {d}", .{index + 1}) catch "Tab",
         .active_select => |index| std.fmt.bufPrint(buf, "Active row {d}", .{index + 1}) catch "Active row",
         .command => |command| prefixCommandLabel(buf, command),
     };
@@ -3324,7 +3324,7 @@ test "punctuation accelerators parse and format" {
 
 test "prefix target labels cover positional and script targets" {
     var buf: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("Pane 3", prefixTargetLabel(&buf, .{ .pane_select = 2 }));
+    try std.testing.expectEqualStrings("Tab 3", prefixTargetLabel(&buf, .{ .pane_select = 2 }));
     try std.testing.expectEqualStrings("Command palette", prefixTargetLabel(&buf, .{ .app = .command_palette }));
     var script = [_]u8{ 'l', 's' };
     try std.testing.expectEqualStrings("$ ls", prefixTargetLabel(&buf, .{ .command = .{ .script = &script, .placement = .background } }));

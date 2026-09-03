@@ -1884,6 +1884,10 @@ fn renderOpenPanesSection(
     if (layout.panes.items.len == 0) return y;
 
     const indent = theme.scaledUi(SIDEBAR_ROW_INDENT_CSS);
+    // Ctrl+N badges number tabs, so a split tile shares one ordinal and its
+    // mini-rows show none.
+    var tab_buffer: [native_state.workspace_tabs.MAX_WORKSPACE_TABS]native_state.WorkspaceTab = undefined;
+    const tabs = native_state.workspace_tabs.collect(layout, &tab_buffer);
     for (layout.panes.items, 0..) |*pane, pane_index| {
         const group_id = layout.scrollGroupIdForPane(pane.id) orelse continue;
         const group_count = layout.scrollGroupPaneCount(group_id);
@@ -1902,14 +1906,22 @@ fn renderOpenPanesSection(
             const tile_gap = theme.scaledUi(4.0);
             const group_h = row_h * @as(f32, @floatFromInt(@max(rows, 1))) +
                 tile_gap * @as(f32, @floatFromInt(if (rows > 0) rows - 1 else 0));
+            // The tile carries its tab's Ctrl badge once, in a column beside
+            // the mini-rows, so the sidebar numbering has no hole at a split.
+            var tile_shortcut_buf: [16]u8 = undefined;
+            const tile_shortcut = tileShortcutLabel(state, &tile_shortcut_buf, native_state.workspace_tabs.indexOfTab(tabs, group_id));
+            const badge_column = if (tile_shortcut.len > 0) theme.scaledUi(30.0) else 0.0;
             const group_rect: palette.Rect = .{
                 .x = x + indent,
                 .y = y,
-                .w = rail_w - indent,
+                .w = rail_w - indent - badge_column,
                 .h = group_h,
             };
             if (rowVisible(group_rect, list_clip)) {
                 renderOpenPaneGroupNode(state, project_index, project, root, group_id, group_rect, clip);
+                if (tile_shortcut.len > 0) {
+                    renderSidebarShortcutKeyTip(state, .{ .x = x + indent, .y = y, .w = rail_w - indent, .h = group_h }, clip, tile_shortcut);
+                }
             }
             y += group_h + tile_gap;
             continue;
@@ -1920,7 +1932,7 @@ fn renderOpenPanesSection(
             .w = rail_w - indent,
             .h = theme.scaledUi(SIDEBAR_THREAD_ROW_HEIGHT_CSS),
         };
-        if (rowVisible(row_rect, list_clip)) renderOpenPaneRow(state, project_index, project, pane, row_rect, clip, false, false, pane_index, false);
+        if (rowVisible(row_rect, list_clip)) renderOpenPaneRow(state, project_index, project, pane, row_rect, clip, false, false, native_state.workspace_tabs.indexOfTab(tabs, group_id), false);
         y += theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS);
     }
     y += theme.scaledUi(4.0);
@@ -1960,7 +1972,7 @@ fn renderOpenPaneGroupNode(
             if (layout.scrollGroupIdForPane(pane_id) != group_id) return;
             const pane = layout.paneById(pane_id) orelse return;
             queuePaletteRoundedRect(state, snapRect(rect), paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 150)), theme.scaledUi(6.0));
-            renderOpenPaneRow(state, project_index, project, pane, rect, clip, false, false, layout.paneIndexById(pane_id), true);
+            renderOpenPaneRow(state, project_index, project, pane, rect, clip, false, false, null, true);
             queuePaletteBorder(state, snapRect(rect), paletteColor(theme.withAlpha(theme.COLOR_TEXT_SUBTLE, 105)), theme.scaledUi(6.0), theme.scaledUi(1.0));
         },
         .split => |split| {
@@ -2232,6 +2244,15 @@ fn renderOpenPaneRow(
             }, status_label, paletteColor(pip_color), status_font, clip);
         }
     }
+}
+
+// Plain-Ctrl key tip for a split tile's tab ordinal; empty while hints are
+// hidden, during the Ctrl+Shift reveal, or when the tile is not a tab.
+fn tileShortcutLabel(state: *const runtime.AppState, buf: []u8, tab_index: ?usize) []const u8 {
+    if (!state.ctrl_shortcut_hints_visible or state.shift_shortcut_hints_visible) return "";
+    const index = tab_index orelse return "";
+    const config = state.command_controller.keyboard_config orelse return "";
+    return keybinds.formatCtrlKeyTipAt(buf, config.workspace_pane_select, index);
 }
 
 // Minimal Ctrl-number badge in the row's existing trailing status slot.
