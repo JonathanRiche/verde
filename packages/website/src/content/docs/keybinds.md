@@ -17,12 +17,16 @@ in your Verde config — see [Remapping](#remapping) below.
 | Combo                       | Action                                |
 | -------------------------- | ------------------------------------- |
 | `Ctrl+Shift+P` / `Cmd+Shift+P` | Command palette                    |
-| `Ctrl+W` / `Cmd+W`, `Alt+X` | Close the focused pane                |
-| `Ctrl+Shift+W` / `Cmd+Shift+W` | Close the current workspace (reopen from the command palette) |
 | `Ctrl+Shift+Space`          | Toggle the experimental Companion (when enabled in Settings) |
 | `Ctrl+Shift+R` / `Cmd+Shift+R`, `F5` | Refresh / reload app            |
 | `Alt+O`                     | Open the default project              |
 | `Ctrl+Shift+O`              | Open in external editor               |
+
+Close pane and close workspace have no direct default chords. With prefix
+mode enabled, `x` closes the focused pane and `Shift+X` closes the current
+workspace. Reopen a closed workspace from the command palette. Bind
+`workspace.close` / `workspace.close_current` in `verde.json` if you want a
+direct shortcut back.
 
 ### Sidebar & panes
 
@@ -37,6 +41,7 @@ in your Verde config — see [Remapping](#remapping) below.
 | `Ctrl+Shift+Tab`            | Focus the previous pane in sidebar order |
 | `Ctrl+1 … Ctrl+9, Ctrl+0`  | Focus a pane in the current workspace by sidebar order |
 | `Ctrl+Shift+1 … Ctrl+Shift+9, Ctrl+Shift+0` | Jump to a row in the global Active section by displayed order |
+| `Ctrl+Shift+←` / `Ctrl+Shift+→` | Previous / next row in the global Active section |
 | `Alt+1 … Alt+9, Alt+0`     | Jump between workspaces by sidebar order |
 | `Alt+↑` / `Alt+↓`          | Cycle to the previous / next workspace |
 
@@ -233,8 +238,7 @@ The table is overridable exactly like `bindings`, under `"navigate"`:
 | `[` / `]`                        | `workspace.previous` / `next`                     |
 | `Shift+[` / `Shift+]`            | `workspace.active_previous` / `active_next`       |
 | `1 … 9`, `0`                     | `workspace.pane_select.1 … 10`                    |
-| `Shift+1 … Shift+0`              | `workspace.select.1 … 10`                         |
-| `Ctrl+1 … Ctrl+0`                | `workspace.active_select.1 … 10`                  |
+| `Shift+1 … Shift+0`              | `workspace.active_select.1 … 10`                  |
 | `Shift+Up` / `Shift+Down`        | `chat_up` / `chat_down`                           |
 | `PageUp` / `PageDown`            | `chat_page_up` / `chat_page_down`                 |
 | `m` / `Shift+M`                  | `chat.model_picker` / `chat.run_config`           |
@@ -281,7 +285,6 @@ as shown below.
     "companion": "Ctrl+Shift+Space",
     "workspace": {
       "split_terminal_horizontal": "CommandOrControl+Shift+T",
-      "close_current": "CommandOrControl+Shift+W",
       "focus_up": "Ctrl+K",
       "focus_down": "Ctrl+J",
       "focus_left": "Ctrl+H",
@@ -289,6 +292,8 @@ as shown below.
       "pane_previous": "Ctrl+Shift+Tab",
       "pane_next": "Ctrl+Tab",
       "active_select": ["Ctrl+Shift+1", "Ctrl+Shift+2", "Ctrl+Shift+3", "Ctrl+Shift+4", "Ctrl+Shift+5", "Ctrl+Shift+6", "Ctrl+Shift+7", "Ctrl+Shift+8", "Ctrl+Shift+9", "Ctrl+Shift+0"],
+      "active_previous": "Alt+Left",
+      "active_next": "Alt+Right",
       "pane_select": ["Ctrl+1", "Ctrl+2", "Ctrl+3", "Ctrl+4", "Ctrl+5", "Ctrl+6", "Ctrl+7", "Ctrl+8", "Ctrl+9", "Ctrl+0"],
       "previous": "Alt+Up",
       "next": "Alt+Down",
@@ -297,7 +302,6 @@ as shown below.
       "move_up": "Ctrl+Shift+K",
       "move_down": "Ctrl+Shift+J",
       "toggle_maximize": "Alt+Z",
-      "close": ["CommandOrControl+W", "Alt+X"],
       "select": ["Alt+1", "Alt+2", "Alt+3", "Alt+4", "Alt+5", "Alt+6", "Alt+7", "Alt+8", "Alt+9", "Alt+0"]
     },
     "terminal": {
@@ -321,6 +325,24 @@ the second pane, and so on.
 
 `workspace.active_select` follows the sorted order currently shown in the
 sidebar's global Active section, including rows from other workspaces.
+`workspace.active_previous` / `workspace.active_next` cycle that same list;
+the defaults are `Ctrl+Shift+Left` / `Ctrl+Shift+Right`. Bind `Alt+Left` /
+`Alt+Right` (or any other chord) if you want a different cycle shortcut.
+
+`workspace.close` and `workspace.close_current` are unbound by default. Prefix
+`x` / `Shift+X` close a pane or workspace when prefix mode is on. To restore
+the old direct chords:
+
+```json
+{
+  "keybinds": {
+    "workspace": {
+      "close": ["CommandOrControl+W", "Alt+X"],
+      "close_current": "CommandOrControl+Shift+W"
+    }
+  }
+}
+```
 
 ## Disabling a binding
 
@@ -350,7 +372,7 @@ or an array of shortcuts.
 | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | top         | `refresh`, `open_default`, `open_editor`, `new_thread`, `command_palette`, `companion`, `toggle_sidebar`, `toggle_sidebar_hidden`, `toggle_browser`, `toggle_terminal`                                                                       |
 | chat        | `chat_up`, `chat_down`, `chat_page_up`, `chat_page_down`                                                                                                                                                                          |
-| `workspace` | `split_chat_vertical`, `split_chat_horizontal`, `split_terminal_vertical`, `split_terminal_horizontal`, `toggle_maximize`, `close`, `close_current`, `focus_left`, `focus_right`, `focus_up`, `focus_down`, `focus_prompt`, `pane_previous`, `pane_next`, `active_select`, `pane_select`, `move_*`, `grow_*`, `select`, `previous`, `next` |
+| `workspace` | `split_chat_vertical`, `split_chat_horizontal`, `split_terminal_vertical`, `split_terminal_horizontal`, `toggle_maximize`, `close`, `close_current`, `focus_left`, `focus_right`, `focus_up`, `focus_down`, `focus_prompt`, `pane_previous`, `pane_next`, `active_select`, `active_previous`, `active_next`, `pane_select`, `move_*`, `grow_*`, `select`, `previous`, `next` |
 | `terminal`  | `new_tab`, `close`, `rename_tab`, `tab_previous`, `tab_next`, `split_up`, `split_down`, `split_left`, `split_right`, `focus_up`, `focus_down`, `focus_left`, `focus_right`                                                       |
 | `prefix`    | `enabled`, `key`, `defaults`, `bindings`, `navigate` — see [Prefix mode](#prefix-mode-tmux-style)                                                                                                                                       |
 

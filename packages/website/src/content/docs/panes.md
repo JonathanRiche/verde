@@ -117,7 +117,7 @@ non-destructive — every pane keeps its content and provider.
 ## Zooming and closing
 
 - `Alt+Z` — zoom the focused pane to fill the workspace; press again to restore.
-- Pane context menu — close the pane (or `Ctrl+W` / `Alt+X`).
+- Pane context menu — close the pane (or prefix `x` when prefix mode is on).
 
 ## The sidebar
 
@@ -189,7 +189,7 @@ support, and [CLI reference](/docs/cli) for the full browser command surface.
 Workspace layouts, per-terminal zoom, terminal tab state, and the browser
 pane's URL all persist across launches in Verde's SQLite state. Closing the
 app and reopening it restores the same tiling tree for each project. Closing a
-workspace from the sidebar or with `Ctrl+Shift+W` also preserves that state;
+workspace from the sidebar or with prefix `Shift+X` also preserves that state;
 reopen the workspace from the command palette when you need it again.
 
 You can inspect the persisted layout without launching the app:

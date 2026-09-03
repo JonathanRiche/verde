@@ -302,9 +302,12 @@ pub fn handlePaletteWheel(state: *runtime.AppState, x: f32, y: f32, wheel_x: f32
         applyDirectWheelTarget(offset, target, next_target);
         layout.scroll_animation_last_ms = 0;
         layout.scroll_snap_deadline_ms = timestamp + SCROLLING_SNAP_IDLE_MS;
+        layout.clearScrollSkipSlide();
         state.markDirty();
     }
     layout.scroll_revealed_pane_id = layout.focused_pane_id;
+    layout.scroll_reveal_from_pane_id = null;
+    layout.scroll_skip_pending_direction = 0;
     return true;
 }
 
@@ -1524,6 +1527,8 @@ fn renderScrollingStrip(
     if (layout.scroll_axis_vertical != vertical) {
         layout.scroll_axis_vertical = vertical;
         layout.scroll_revealed_pane_id = null;
+        layout.scroll_reveal_from_pane_id = null;
+        layout.clearScrollSkipSlide();
         layout.scroll_animation_last_ms = 0;
         layout.scroll_snap_deadline_ms = 0;
     }
@@ -1583,6 +1588,7 @@ fn renderScrollingStrip(
     // A live edge drag owns scroll; don't let focus-reveal fight the pointer.
     if (resize_drag != null) {
         layout.scroll_snap_deadline_ms = 0;
+        layout.clearScrollSkipSlide();
     } else {
         if (layout.focused_pane_id) |focused_id| {
             if (layout.rootContainsPane(focused_id) and layout.scroll_revealed_pane_id != focused_id) {
@@ -1601,9 +1607,31 @@ fn renderScrollingStrip(
                         leadingScrollTargetForPane(extents[0..pane_count], gap, focused_index, max_offset)
                     else
                         revealed_target;
-                    setScrollingTarget(state, target, &layout.scroll_animation_last_ms, next_target);
+                    const from_pane_id = layout.scroll_revealed_pane_id orelse layout.scroll_reveal_from_pane_id;
+                    const from_index = if (from_pane_id) |pane_id| scrollGroupIndexForPane(layout, pane_id) else null;
+                    const pending_direction = layout.scroll_skip_pending_direction;
+                    layout.scroll_skip_pending_direction = 0;
+                    if (!state.app_config.reduced_motion and shouldSkipSlide(from_index, focused_index, pending_direction)) {
+                        const inferred: i8 = if (from_index) |from|
+                            if (focused_index >= from) 1 else -1
+                        else if (next_target >= offset.*)
+                            1
+                        else
+                            -1;
+                        const skip_direction: i8 = if (pending_direction != 0) pending_direction else inferred;
+                        const from_group_id = if (from_index) |index| group_ids[index] else null;
+                        beginSkipSlide(layout, from_group_id, group_ids[focused_index], skip_direction, nowMs());
+                        offset.* = next_target;
+                        target.* = next_target;
+                        layout.scroll_animation_last_ms = nowMs();
+                        state.markDirty();
+                    } else {
+                        layout.clearScrollSkipSlide();
+                        setScrollingTarget(state, target, &layout.scroll_animation_last_ms, next_target);
+                    }
                 }
                 layout.scroll_leading_pane_id = null;
+                layout.scroll_reveal_from_pane_id = null;
                 layout.scroll_revealed_pane_id = focused_id;
             }
         }
@@ -1624,6 +1652,9 @@ fn renderScrollingStrip(
     // Keep frame pacing active until the idle deadline can settle even a
     // sub-pixel wheel gesture that finished easing early.
     if (layout.scroll_snap_deadline_ms != 0) scrolling_animating = true;
+    const skip_progress = skipSlideProgress(layout, nowMs(), state.app_config.reduced_motion);
+    if (skip_progress != null and skip_progress.? < 1.0) scrolling_animating = true;
+    if (skip_progress != null and skip_progress.? >= 1.0) layout.clearScrollSkipSlide();
     // The strip owns pane-region motion until it reaches its target. A chat
     // pane rendered below consumes this flag by presenting resident transcript
     // content directly, avoiding a compounded slide-plus-fade.
@@ -1633,8 +1664,32 @@ fn renderScrollingStrip(
 
     const command_start = state.palette_overlay_batch.commands.items.len;
     const text_run_start = state.palette_overlay_batch.text_runs.items.len;
-    var origin: f32 = 0.0;
     const root = layout.root orelse return;
+    if (skip_progress) |progress| {
+        if (progress < 1.0) {
+            renderSkipSlideStrip(
+                state,
+                layout,
+                root,
+                group_ids[0..pane_count],
+                representative_pane_ids[0..pane_count],
+                extents[0..pane_count],
+                target_extents[0..pane_count],
+                viewport,
+                direction,
+                gap,
+                viewport_has_margins,
+                target_viewport_width,
+                vertical,
+                progress,
+            );
+            clipWorkspaceBatch(state, command_start, text_run_start, viewport);
+            clipWorkspaceHitCaches(viewport);
+            renderScrollingEdgeNavigation(state, layout, viewport, direction, pane_count);
+            return;
+        }
+    }
+    var origin: f32 = 0.0;
     for (group_ids[0..pane_count], 0..) |group_id, pane_index| {
         const pane_extent = extents[pane_index];
         const target_pane_width = if (vertical)
@@ -2262,6 +2317,113 @@ fn revealedScrollTarget(current: f32, viewport_w: f32, column_w: f32, gap: f32, 
 fn leadingScrollTarget(column_w: f32, gap: f32, pane_index: usize, max_offset: f32) f32 {
     const column_left = @as(f32, @floatFromInt(pane_index)) * (column_w + gap);
     return std.math.clamp(column_left, 0.0, max_offset);
+}
+
+fn shouldSkipSlide(from_index: ?usize, to_index: usize, pending_direction: i8) bool {
+    if (from_index) |from| {
+        if (from == to_index) return false;
+        const distance = if (from > to_index) from - to_index else to_index - from;
+        return distance > 1;
+    }
+    return pending_direction != 0;
+}
+
+fn beginSkipSlide(
+    layout: *runtime.WorkspaceLayout,
+    from_group_id: ?runtime.WorkspacePaneId,
+    to_group_id: runtime.WorkspacePaneId,
+    direction: i8,
+    now_ms: i64,
+) void {
+    layout.scroll_skip_from_group_id = from_group_id;
+    layout.scroll_skip_to_group_id = to_group_id;
+    layout.scroll_skip_direction = if (direction < 0) -1 else 1;
+    layout.scroll_skip_started_ms = now_ms;
+}
+
+fn skipSlideProgress(layout: *const runtime.WorkspaceLayout, now_ms: i64, reduced_motion: bool) ?f32 {
+    if (layout.scroll_skip_to_group_id == null or layout.scroll_skip_direction == 0) return null;
+    if (reduced_motion or layout.scroll_skip_started_ms == 0) return 1.0;
+    const elapsed = @max(now_ms - layout.scroll_skip_started_ms, 0);
+    return @min(1.0, @as(f32, @floatFromInt(elapsed)) / @as(f32, @floatFromInt(SCROLLING_ANIMATION_DURATION_MS)));
+}
+
+fn skipSlideScreenOrigins(direction: i8, progress: f32, step: f32) struct { from: f32, to: f32 } {
+    const dir: f32 = if (direction < 0) -1.0 else 1.0;
+    const eased = theme.easeOutCubic(progress);
+    return .{
+        .from = -dir * eased * step,
+        .to = dir * (1.0 - eased) * step,
+    };
+}
+
+fn indexOfScrollGroup(group_ids: []const runtime.WorkspacePaneId, group_id: runtime.WorkspacePaneId) ?usize {
+    for (group_ids, 0..) |id, index| {
+        if (id == group_id) return index;
+    }
+    return null;
+}
+
+// Skip-jump strip: only the pane we left and the destination, one slot apart.
+fn renderSkipSlideStrip(
+    state: *runtime.AppState,
+    layout: *const runtime.WorkspaceLayout,
+    root: *const runtime.WorkspaceNode,
+    group_ids: []const runtime.WorkspacePaneId,
+    representative_pane_ids: []const runtime.WorkspacePaneId,
+    extents: []const f32,
+    target_extents: []const f32,
+    viewport: palette.Rect,
+    direction: app_config.WorkspaceScrollDirection,
+    gap: f32,
+    viewport_has_margins: bool,
+    target_viewport_width: f32,
+    vertical: bool,
+    progress: f32,
+) void {
+    const to_group_id = layout.scroll_skip_to_group_id orelse return;
+    const to_index = indexOfScrollGroup(group_ids, to_group_id) orelse return;
+    const from_index = if (layout.scroll_skip_from_group_id) |from_id| indexOfScrollGroup(group_ids, from_id) else null;
+    const from_extent = if (from_index) |index| extents[index] else extents[to_index];
+    const step = @max(from_extent, extents[to_index]) + gap;
+    const origins = skipSlideScreenOrigins(layout.scroll_skip_direction, progress, step);
+    queueRect(state, viewport, paletteColor(theme.background()));
+    if (from_index) |index| {
+        const target_pane_width = if (vertical) target_viewport_width else target_extents[index];
+        renderScrollingGroup(
+            state,
+            layout,
+            root,
+            group_ids[index],
+            representative_pane_ids[index],
+            viewport,
+            direction,
+            origins.from,
+            extents[index],
+            target_pane_width,
+            gap,
+            0.0,
+            index,
+            viewport_has_margins,
+        );
+    }
+    const to_target_width = if (vertical) target_viewport_width else target_extents[to_index];
+    renderScrollingGroup(
+        state,
+        layout,
+        root,
+        group_ids[to_index],
+        representative_pane_ids[to_index],
+        viewport,
+        direction,
+        origins.to,
+        extents[to_index],
+        to_target_width,
+        gap,
+        0.0,
+        to_index,
+        viewport_has_margins,
+    );
 }
 
 fn setScrollingTarget(state: *runtime.AppState, current_target: *f32, animation_last_ms: *i64, target: f32) void {
@@ -3764,6 +3926,33 @@ test "scrolling animation advances without overshooting" {
     try std.testing.expect(partial > 0.0);
     try std.testing.expect(partial < 300.0);
     try std.testing.expectApproxEqAbs(@as(f32, 300.0), advanceScrollOffset(0.0, 300.0, SCROLLING_ANIMATION_DURATION_MS), 0.0001);
+}
+
+test "skip slide is used for distant and hinted jumps but not neighbors" {
+    try std.testing.expect(!shouldSkipSlide(2, 3, 0));
+    try std.testing.expect(!shouldSkipSlide(3, 2, 0));
+    try std.testing.expect(!shouldSkipSlide(4, 4, 1));
+    try std.testing.expect(shouldSkipSlide(0, 8, 0));
+    try std.testing.expect(shouldSkipSlide(8, 0, 0));
+    try std.testing.expect(!shouldSkipSlide(null, 2, 0));
+    try std.testing.expect(shouldSkipSlide(null, 2, 1));
+    try std.testing.expect(shouldSkipSlide(null, 2, -1));
+}
+
+test "skip slide origins move one pane width from and to the viewport" {
+    const step: f32 = 512.0;
+    const start_forward = skipSlideScreenOrigins(1, 0.0, step);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), start_forward.from, 0.0001);
+    try std.testing.expectApproxEqAbs(step, start_forward.to, 0.0001);
+    const end_forward = skipSlideScreenOrigins(1, 1.0, step);
+    try std.testing.expectApproxEqAbs(-step, end_forward.from, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), end_forward.to, 0.0001);
+    const start_back = skipSlideScreenOrigins(-1, 0.0, step);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), start_back.from, 0.0001);
+    try std.testing.expectApproxEqAbs(-step, start_back.to, 0.0001);
+    const end_back = skipSlideScreenOrigins(-1, 1.0, step);
+    try std.testing.expectApproxEqAbs(step, end_back.from, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), end_back.to, 0.0001);
 }
 
 test "scrolling clip intersection stays inside the workspace" {

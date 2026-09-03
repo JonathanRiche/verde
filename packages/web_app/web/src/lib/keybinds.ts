@@ -71,8 +71,6 @@ const DIRECT_CHORDS: Chord[] = [
   { key: 's', ctrl: true, action: 'toggle_sidebar' },
   { key: 's', ctrl: true, shift: true, action: 'toggle_sidebar_hidden' },
   { key: 't', ctrl: true, alt: true, action: 'new_terminal' },
-  { key: 'w', ctrl: true, action: 'close_pane' },
-  { key: 'x', alt: true, action: 'close_pane' },
   { key: 'arrowup', alt: true, action: 'workspace_previous' },
   { key: 'arrowdown', alt: true, action: 'workspace_next' },
   { key: 'tab', ctrl: true, action: 'pane_next' },
@@ -126,8 +124,7 @@ const DEFAULT_PREFIX_ROWS: Array<[string, string]> = [
 for (let index = 1; index <= 10; index += 1) {
   const digit = String(index % 10)
   DEFAULT_PREFIX_ROWS.push([digit, `workspace.pane_select.${index}`])
-  DEFAULT_PREFIX_ROWS.push([`Shift+${digit}`, `workspace.select.${index}`])
-  DEFAULT_PREFIX_ROWS.push([`Ctrl+${digit}`, `workspace.active_select.${index}`])
+  DEFAULT_PREFIX_ROWS.push([`Shift+${digit}`, `workspace.active_select.${index}`])
 }
 
 const DEFAULT_NAVIGATE_ROWS: Array<[string, string]> = [

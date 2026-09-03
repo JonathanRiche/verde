@@ -313,6 +313,49 @@ const keybindValue: JsonSchema = {
   ],
 }
 
+function describedKeybind(description: string): JsonSchema {
+  return { ...keybindValue, description }
+}
+
+const KEYBIND_WORKSPACE_HELP: Record<(typeof KEYBIND_WORKSPACE_KEYS)[number], string> = {
+  split_chat_vertical: 'Split a new chat pane vertically. Unbound by default.',
+  split_chat_horizontal: 'Split a new chat pane horizontally. Unbound by default.',
+  split_terminal_vertical: 'Split a new terminal pane vertically. Unbound by default.',
+  split_terminal_horizontal: 'Split a new terminal pane horizontally. Unbound by default.',
+  toggle_maximize: 'Zoom the focused pane. Default: `Alt+Z`. Prefix: `z`.',
+  toggle_quick_pane: 'Toggle the floating quick pane. Default: `Ctrl+Alt+T`. Prefix: `q`.',
+  close:
+    'Close the focused pane. Unbound by default; prefix `x` still closes. Example: `"Alt+X"`.',
+  close_current:
+    'Close the current workspace. Unbound by default; prefix `Shift+X` still closes.',
+  focus_left: 'Focus the pane to the left. Default: `Ctrl+Left`.',
+  focus_right: 'Focus the pane to the right. Default: `Ctrl+Right`.',
+  focus_up: 'Focus the pane above. Default: `Ctrl+Up`.',
+  focus_down: 'Focus the pane below. Default: `Ctrl+Down`.',
+  focus_prompt: 'Focus the chat prompt. Default: `Tab`. Prefix: `i`.',
+  active_select:
+    'Positional accelerators for the sidebar Active list (first chord → first row). Default: `Ctrl+Shift+1`…`0`. Prefix `Shift+1`…`0` also jumps this list.',
+  pane_select:
+    'Positional accelerators for panes in the current workspace. Default: `Ctrl+1`…`0`. Prefix `1`…`0` also jumps this list.',
+  move_left: 'Swap the focused pane with the one to the left. Default: `Ctrl+Shift+H`.',
+  move_right: 'Swap the focused pane with the one to the right. Default: `Ctrl+Shift+L`.',
+  move_up: 'Swap the focused pane with the one above. Default: `Ctrl+Shift+K`.',
+  move_down: 'Swap the focused pane with the one below. Default: `Ctrl+Shift+J`.',
+  grow_left: 'Grow the focused pane left. Default: `Alt+Shift+Left`.',
+  grow_right: 'Grow the focused pane right. Default: `Alt+Shift+Right`.',
+  grow_up: 'Grow the focused pane up. Default: `Alt+Shift+Up`.',
+  grow_down: 'Grow the focused pane down. Default: `Alt+Shift+Down`.',
+  select: 'Positional accelerators for workspaces. Default: `Alt+1`…`0`.',
+  previous: 'Previous workspace. Default: `Alt+Up`.',
+  next: 'Next workspace. Default: `Alt+Down`.',
+  active_previous:
+    'Previous row in the sidebar Active list. Default: `Ctrl+Shift+Left`. Example: `"Alt+Left"`.',
+  active_next:
+    'Next row in the sidebar Active list. Default: `Ctrl+Shift+Right`. Example: `"Alt+Right"`.',
+  pane_previous: 'Previous pane in sidebar order. Default: `Ctrl+Shift+Tab`.',
+  pane_next: 'Next pane in sidebar order. Default: `Ctrl+Tab`.',
+}
+
 const colorValue: JsonSchema = {
   description: 'Hex `#RRGGBB` / `#RRGGBBAA`, or an RGB/RGBA number array (0–1 or 0–255).',
   oneOf: [
@@ -361,7 +404,7 @@ function themeObject(includeActive: boolean): JsonSchema {
 
 const prefixActionName: JsonSchema = {
   description:
-    'Built-in prefix action. Positional actions use a 1-based ordinal: `workspace.select.N`, `workspace.pane_select.N`, `workspace.active_select.N`.',
+    'Built-in prefix action. Positional actions use a 1-based ordinal: `workspace.select.N`, `workspace.pane_select.N`, `workspace.active_select.N`. Default prefix digits select panes; `Shift+1`…`0` jump the Active list.',
   anyOf: [
     { type: 'string', enum: PREFIX_ACTION_NAMES },
     {
@@ -670,7 +713,10 @@ const keybindTerminalObject = closedObject(
 )
 
 const keybindWorkspaceSchema = closedObject(
-  Object.fromEntries(KEYBIND_WORKSPACE_KEYS.map((key) => [key, keybindValue])),
+  Object.fromEntries(
+    KEYBIND_WORKSPACE_KEYS.map((key) => [key, describedKeybind(KEYBIND_WORKSPACE_HELP[key])]),
+  ),
+  'Workspace, pane, and Active-list shortcuts.',
 )
 
 const keybindsSchema = closedObject(
