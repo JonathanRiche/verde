@@ -1977,8 +1977,8 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                     return true;
                 }
             }
-            if (keyboard.workspacePaneSelectIndexForEvent(&event.key)) |pane_ordinal| {
-                if (state.focusCurrentProjectWorkspacePaneAtSidebarIndex(pane_ordinal)) {
+            if (keyboard.workspacePaneSelectIndexForEvent(&event.key)) |tab_ordinal| {
+                if (state.selectWorkspaceTabAtIndex(tab_ordinal)) {
                     syncWindowTextInput(window, state);
                     return true;
                 }
@@ -2987,7 +2987,7 @@ fn dispatchPrefixTarget(state: *AppState, keyboard: *keybinds.NativeKeyboardConf
             state.markDirty();
         },
         .workspace_select => |index| _ = state.selectProjectAtIndex(index),
-        .pane_select => |index| _ = state.focusCurrentProjectWorkspacePaneAtSidebarIndex(index),
+        .pane_select => |index| _ = state.selectWorkspaceTabAtIndex(index),
         .active_select => |index| _ = sidebar_ui.focusAttentionClusterRowAtIndex(state, index),
         .command => |command| state.runPrefixCommand(command),
     }

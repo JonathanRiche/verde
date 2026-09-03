@@ -6819,6 +6819,19 @@ pub const AppState = struct {
         return true;
     }
 
+    /// Activates the N-th tab of the selected workspace (Ctrl+1…Ctrl+0 and the
+    /// prefix `pane_select` binding). Tabs, not panes, carry the ordinals so a
+    /// split tile costs one number. Returns false when no such tab exists.
+    pub fn selectWorkspaceTabAtIndex(self: *AppState, tab_index: usize) bool {
+        if (self.project_controller.projects.items.len == 0) return false;
+        const project_index = self.project_controller.selected_index;
+        const layout = &self.project_controller.projects.items[project_index].workspace_layout;
+        var tab_buffer: [workspace_tabs.MAX_WORKSPACE_TABS]WorkspaceTab = undefined;
+        const tabs = workspace_tabs.collect(layout, &tab_buffer);
+        if (tab_index >= tabs.len) return false;
+        return self.selectWorkspaceTab(project_index, tabs[tab_index].id);
+    }
+
     /// Applies user-configured provider/model/reasoning defaults to a newly
     /// created GUI chat without changing restored, imported, or CLI threads.
     pub fn applyNewChatDefaults(self: *AppState, project_index: usize, thread_index: usize) !void {
@@ -7354,17 +7367,6 @@ pub const AppState = struct {
     /// Selects a pane from the sidebar while keeping a maximized workspace maximized.
     pub fn focusWorkspaceOpenPaneFromSidebar(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) void {
         self.focusWorkspaceOpenPaneWithZoom(project_index, pane_id, true, false);
-    }
-
-    /// Focuses a pane by its zero-based position in the current workspace's sidebar list.
-    pub fn focusCurrentProjectWorkspacePaneAtSidebarIndex(self: *AppState, pane_index: usize) bool {
-        if (self.project_controller.projects.items.len == 0) return false;
-        const project_index = self.project_controller.selected_index;
-        const layout = &self.project_controller.projects.items[project_index].workspace_layout;
-        if (pane_index >= layout.panes.items.len) return false;
-
-        self.focusWorkspaceOpenPaneFromSidebar(project_index, layout.panes.items[pane_index].id);
-        return true;
     }
 
     /// Cycles through the current workspace's panes in their sidebar list order.
@@ -16702,12 +16704,16 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
     try std.testing.expect(state.composer_controller.focused);
     try std.testing.expect(state.composer_controller.composer.focused);
     try std.testing.expect(!state.terminal_controller.focused);
-    try std.testing.expect(state.focusCurrentProjectWorkspacePaneAtSidebarIndex(2));
-    try std.testing.expectEqual(@as(?WorkspacePaneId, first_terminal_pane_id), layout.focused_pane_id);
-    try std.testing.expectEqual(@as(?WorkspacePaneId, first_terminal_pane_id), layout.maximized_pane_id);
-    try std.testing.expect(state.terminal_controller.focused);
-    try std.testing.expect(!state.composer_controller.focused);
-    try std.testing.expect(!state.focusCurrentProjectWorkspacePaneAtSidebarIndex(3));
+    // Ctrl+N ordinals address tabs; the terminal panes above live outside the
+    // root tree, so only the founding chat pane is a tab here.
+    layout.focused_pane_id = first_terminal_pane_id;
+    layout.maximized_pane_id = first_terminal_pane_id;
+    try std.testing.expect(state.selectWorkspaceTabAtIndex(0));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, chat_pane_id), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, chat_pane_id), layout.maximized_pane_id);
+    try std.testing.expect(state.composer_controller.focused);
+    try std.testing.expect(!state.terminal_controller.focused);
+    try std.testing.expect(!state.selectWorkspaceTabAtIndex(1));
 
     layout.quick_pane = .{
         .pane_id = clicked_terminal_pane_id,

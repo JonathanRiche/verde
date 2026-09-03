@@ -7,6 +7,7 @@ const std = @import("std");
 const sdl = @import("zsdl3");
 const palette = @import("palette");
 const app_config = @import("../app/config.zig");
+const keybinds = @import("../app/keybinds.zig");
 const storage_mod = @import("../state/storage.zig");
 const theme = @import("theme.zig");
 const text_measure = @import("text_measure.zig");
@@ -36,6 +37,12 @@ pub const TAB_PAD_X_UI: f32 = 12.0;
 pub const PLUS_TAB_WIDTH_UI: f32 = 30.0;
 const LABEL_FONT_UI: f32 = 13.0;
 const TAB_RADIUS_UI: f32 = 3.0;
+/// Ctrl-reveal key tip: same square badge the sidebar pane rows draw so the
+/// Ctrl+N ordinal reads identically in both places.
+const KEY_TIP_SIZE_UI: f32 = 18.0;
+const KEY_TIP_FONT_UI: f32 = 11.0;
+const KEY_TIP_RADIUS_UI: f32 = 5.0;
+const KEY_TIP_INSET_X_UI: f32 = 4.0;
 /// Same line box the other Palette UI text queues use (see sidebar/layout).
 const LINE_HEIGHT_FACTOR: f32 = 1.25;
 /// Bounded label buffer; tabs are short so longer titles are truncated.
@@ -152,22 +159,30 @@ pub fn render(state: *runtime.AppState, strip: palette.Rect) void {
     const strip_pad = theme.scaledUi(STRIP_PAD_X_UI);
     // Tabs may not run under the "+" tab's reserved right-edge slot.
     const tabs_right = strip.x + strip.w - strip_pad - plus_w - gap;
+    // Holding Ctrl reveals the Ctrl+N ordinal of each tab, mirroring the
+    // sidebar pane rows; the badge takes a slot at the tab's right edge.
+    const key_tip_w = theme.scaledUi(KEY_TIP_SIZE_UI) + theme.scaledUi(KEY_TIP_INSET_X_UI);
     var x = strip.x + strip_pad;
-    for (tabs) |tab| {
+    for (tabs, 0..) |tab, tab_index| {
         const title = tabLabel(state, project_index, tab);
+        var key_tip_buf: [16]u8 = undefined;
+        const key_tip = tabKeyTip(state, &key_tip_buf, tab_index);
+        const tip_reserve = if (key_tip.len > 0) key_tip_w else 0.0;
         // Measure through the GPU text path so tab widths match drawn glyphs.
         const label_w = runtime.paletteUiTextPrefixWidth(title, font_size, title.len);
-        const rect = tabRect(strip, x, tabWidth(label_w, cap));
+        const rect = tabRect(strip, x, tabWidth(label_w + tip_reserve, cap));
         if (rect.x + theme.scaledUi(MIN_TAB_WIDTH_UI) > tabs_right) break;
         const clip: palette.Rect = .{ .x = strip.x, .y = strip.y, .w = @max(tabs_right - strip.x, 0.0), .h = strip.h };
         const selected = focused_tab_id != null and focused_tab_id.? == tab.id;
         const hovered = hovered_hit == strip_hit_count;
         renderTab(state, rect, clip, selected, hovered);
         var label_buf: [LABEL_BUFFER_LEN]u8 = undefined;
-        const label = truncatedLabel(&label_buf, title, @max(rect.w - pad_x * 2.0, 0.0), font_size);
+        const label_area: palette.Rect = .{ .x = rect.x, .y = rect.y, .w = @max(rect.w - tip_reserve, 0.0), .h = rect.h };
+        const label = truncatedLabel(&label_buf, title, @max(label_area.w - pad_x * 2.0, 0.0), font_size);
         const shown_w = runtime.paletteUiTextPrefixWidth(label, font_size, label.len);
         const text_color = if (selected) theme.COLOR_WHITE else if (hovered) theme.lighten(theme.COLOR_TEXT_MUTED, 0.12) else theme.COLOR_TEXT_MUTED;
-        queueCenteredText(state, rect, label, shown_w, paletteColor(text_color), font_size, clip);
+        queueCenteredText(state, label_area, label, shown_w, paletteColor(text_color), font_size, clip);
+        if (key_tip.len > 0) renderTabKeyTip(state, rect, clip, key_tip);
         addHit(rect, .tab, project_index, tab.preferred_pane_id);
         x = rect.x + rect.w + gap;
     }
@@ -193,6 +208,33 @@ fn renderTab(state: *runtime.AppState, rect: palette.Rect, clip: palette.Rect, s
     queueRoundedRectClipped(state, rect, paletteColor(fill), radius, clip);
     const edge: [4]f32 = if (selected) theme.withAlpha(theme.accent(), 180) else theme.borderMuted();
     queueBorderClipped(state, rect, paletteColor(edge), radius, 1.0, clip);
+}
+
+/// Key label for the tab's Ctrl+N binding while plain Ctrl is held (the
+/// Ctrl+Shift reveal belongs to the attention cluster, not tabs). Empty when
+/// hints are hidden or the ordinal has no plain-Ctrl binding.
+fn tabKeyTip(state: *const runtime.AppState, buf: []u8, tab_index: usize) []const u8 {
+    if (!state.ctrl_shortcut_hints_visible or state.shift_shortcut_hints_visible) return "";
+    const config = state.command_controller.keyboard_config orelse return "";
+    return keybinds.formatCtrlKeyTipAt(buf, config.workspace_pane_select, tab_index);
+}
+
+/// Square key-tip badge at the tab's right edge, styled like the sidebar's
+/// pane-row badge.
+fn renderTabKeyTip(state: *runtime.AppState, tab: palette.Rect, clip: palette.Rect, label: []const u8) void {
+    const size = theme.scaledUi(KEY_TIP_SIZE_UI);
+    const rect: palette.Rect = .{
+        .x = tab.x + tab.w - size - theme.scaledUi(KEY_TIP_INSET_X_UI),
+        .y = tab.y + @max((tab.h - size) * 0.5, 0.0),
+        .w = size,
+        .h = @min(size, tab.h),
+    };
+    const radius = theme.scaledUi(KEY_TIP_RADIUS_UI);
+    queueRoundedRectClipped(state, rect, paletteColor(theme.COLOR_PANEL_ALT), radius, clip);
+    queueBorderClipped(state, rect, paletteColor(theme.borderMuted()), radius, 1.0, clip);
+    const font_size = theme.scaledUi(KEY_TIP_FONT_UI);
+    const text_w = runtime.paletteUiTextPrefixWidth(label, font_size, label.len);
+    queueCenteredText(state, rect, label, text_w, paletteColor(theme.accent()), font_size, clip);
 }
 
 /// Truncates `label` with a trailing ellipsis so it fits `max_w` using
