@@ -13,6 +13,7 @@ pub const NativeKeyboardAction = enum {
     open_editor,
     new_thread,
     add_workspace,
+    add_workspace_tab,
     command_palette,
     companion,
     toggle_sidebar,
@@ -1300,6 +1301,7 @@ const PREFIX_ACTION_NAMES = [_]PrefixActionName{
     .{ .name = "open_editor", .target = .{ .app = .open_editor } },
     .{ .name = "new_thread", .target = .{ .app = .new_thread } },
     .{ .name = "workspace.add", .target = .{ .app = .add_workspace } },
+    .{ .name = "workspace.add_tab", .target = .{ .app = .add_workspace_tab } },
     .{ .name = "new_terminal", .target = .new_terminal },
     .{ .name = "command_palette", .target = .{ .app = .command_palette } },
     .{ .name = "companion", .target = .{ .app = .companion } },
@@ -1386,6 +1388,7 @@ pub fn prefixTargetLabel(buf: []u8, target: PrefixTarget) []const u8 {
             .open_editor => "Open in editor",
             .new_thread => "New thread",
             .add_workspace => "Add workspace",
+            .add_workspace_tab => "New tab",
             .command_palette => "Command palette",
             .companion => "Companion",
             .toggle_sidebar => "Sidebar",
@@ -1556,7 +1559,9 @@ const DEFAULT_PREFIX_TABLE = [_]DefaultPrefixEntry{
     .{ .accelerator = "Shift+X", .target = "workspace.close_current" },
     .{ .accelerator = "Z", .target = "workspace.toggle_maximize" },
     .{ .accelerator = "I", .target = "workspace.focus_prompt" },
-    .{ .accelerator = "C", .target = "workspace.add" },
+    // `c` follows Herdr/tmux: a new tab appended to the end of the strip.
+    .{ .accelerator = "C", .target = "workspace.add_tab" },
+    .{ .accelerator = "A", .target = "workspace.add" },
     .{ .accelerator = "Shift+C", .target = "workspace.split_chat_horizontal" },
     .{ .accelerator = "V", .target = "workspace.split_default_vertical" },
     .{ .accelerator = "Minus", .target = "workspace.split_default_horizontal" },
@@ -3166,21 +3171,25 @@ test "default prefix t chords create chat and terminal panes" {
     try std.testing.expect(chat and terminal);
 }
 
-test "default prefix c opens the workspace creator" {
+test "default prefix c adds a workspace tab and a opens the workspace creator" {
     var prefix = try cloneDefaultPrefixConfig(std.testing.allocator);
     defer prefix.deinit(std.testing.allocator);
 
+    var add_tab = false;
     var add_workspace = false;
     var chat_horizontal = false;
     for (prefix.bindings.items) |binding| {
         if (binding.key.eql(.{ .key = .c })) {
+            add_tab = binding.target == .app and binding.target.app == .add_workspace_tab;
+        }
+        if (binding.key.eql(.{ .key = .a })) {
             add_workspace = binding.target == .app and binding.target.app == .add_workspace;
         }
         if (binding.key.eql(.{ .shift = true, .key = .c })) {
             chat_horizontal = binding.target == .app and binding.target.app == .workspace_split_chat_horizontal;
         }
     }
-    try std.testing.expect(add_workspace and chat_horizontal);
+    try std.testing.expect(add_tab and add_workspace and chat_horizontal);
 }
 
 test "default prefix pane tile chords follow the configured default pane" {

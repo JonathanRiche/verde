@@ -3097,6 +3097,7 @@ fn handleKeyboardAction(
         .open_editor => state.openCurrentProjectEditor(.configured),
         .new_thread => _ = openHotkeyWorkspaceChatThread(state),
         .add_workspace => state.openWorkspaceCreator(true),
+        .add_workspace_tab => state.addWorkspaceTab(state.project_controller.selected_index, null),
         .command_palette => {
             const scope_project = if (state.project_controller.projects.items.len > 0 and
                 state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout.visiblePaneCount() == 0)

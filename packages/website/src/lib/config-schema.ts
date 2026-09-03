@@ -205,6 +205,7 @@ export const PREFIX_ACTION_NAMES = [
   'open_editor',
   'new_thread',
   'workspace.add',
+  'workspace.add_tab',
   'new_terminal',
   'command_palette',
   'companion',

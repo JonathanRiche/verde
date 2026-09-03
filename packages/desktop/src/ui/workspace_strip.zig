@@ -603,6 +603,16 @@ test "workspace strip tabs follow tiles: a split tile is one tab and activation 
     try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, tabs[0].preferred_pane_id), layout.focused_pane_id);
     try std.testing.expect(layout.panesShareScrollGroup(first_pane_id, tiled_pane_id));
     try std.testing.expectEqual(@as(?runtime.WorkspaceTabId, tabs[0].id), runtime.workspace_tabs.focusedTabId(layout));
+
+    // Like Herdr, "+" appends at the end of the strip even when the focused
+    // tab is not the last one, instead of opening beside the focused pane.
+    const second_tab_id = tabs[1].id;
+    activateHit(&state, .{ .rect = .{ .x = 0.0, .y = 0.0, .w = 1.0, .h = 1.0 }, .kind = .add_tab, .project_index = 0, .pane_id = 0 });
+    layout = &state.project_controller.projects.items[0].workspace_layout;
+    tabs = runtime.workspace_tabs.collect(layout, &tab_buffer);
+    try std.testing.expectEqual(@as(usize, 3), tabs.len);
+    try std.testing.expectEqual(second_tab_id, tabs[1].id);
+    try std.testing.expectEqual(@as(?runtime.WorkspaceTabId, tabs[2].id), runtime.workspace_tabs.focusedTabId(layout));
     // Tab labels resolve through the pane title (both tiled panes are chats).
     var term_title_buf: sidebar.TerminalTitleBuffer = undefined;
     try std.testing.expect(tabLabel(&state, 0, tabs[0], &term_title_buf).len > 0);
