@@ -108,6 +108,7 @@ pub const live_commands = [_][]const u8{
     "inspect",
     "workspace",
     "pane",
+    "tab",
     "chat",
     "browser",
     "palette",
@@ -155,6 +156,8 @@ pub const live_capabilities = [_][]const u8{
     "pane.move",
     "pane.maximize",
     "pane.close",
+    "tab.select",
+    "tab.add",
     "chat.open",
     "chat.open_subagent",
     "chat.status",
@@ -244,6 +247,11 @@ pub const pane_commands = [_][]const u8{
     "move",
     "maximize",
     "close",
+};
+
+pub const tab_commands = [_][]const u8{
+    "select",
+    "add",
 };
 
 pub const workspace_commands = [_][]const u8{

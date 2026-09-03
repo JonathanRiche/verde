@@ -202,9 +202,10 @@ pub const WorkspaceScrollDirection = enum {
     }
 };
 
-/// Where the top-of-pane workspace tab strip appears: `automatic` only when
-/// the sidebar is collapsed or hidden, `always` alongside the expanded sidebar
-/// too, `disabled` never.
+/// Where the top-of-pane tab strip (one tab per workspace tile, see
+/// `state/workspace_tabs.zig`) appears: `automatic` only when the sidebar is
+/// collapsed or hidden, `always` alongside the expanded sidebar too,
+/// `disabled` never.
 pub const WorkspaceTabsMode = enum {
     automatic,
     always,
@@ -272,6 +273,8 @@ pub const AppConfig = struct {
     unzoom_on_pane_navigation: bool = false,
     reduced_motion: bool = false,
     workspace_tabs: WorkspaceTabsMode = .automatic,
+    /// Pane kind the tab strip's "+" opens as a new tab.
+    workspace_new_tab_pane: WorkspaceSplitDefaultPane = .chat,
     companion_enabled: bool = false,
     companion_character: CompanionCharacter = .sprout,
     theme_config: theme.ThemeConfig = .{},
@@ -560,6 +563,7 @@ fn writeUiSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, con
     try ui_object.put(allocator, "unzoom_on_pane_navigation", .{ .bool = config.unzoom_on_pane_navigation });
     try ui_object.put(allocator, "reduced_motion", .{ .bool = config.reduced_motion });
     try ui_object.put(allocator, "workspace_tabs", .{ .string = @tagName(config.workspace_tabs) });
+    try ui_object.put(allocator, "workspace_new_tab_pane", .{ .string = @tagName(config.workspace_new_tab_pane) });
     try ui_object.put(allocator, "companion_enabled", .{ .bool = config.companion_enabled });
     try ui_object.put(allocator, "companion_character", .{ .string = @tagName(config.companion_character) });
 }
@@ -1261,6 +1265,15 @@ fn applyUiOverrides(config: *AppConfig, ui_value: std.json.Value) void {
             log.warn("ignoring unsupported ui.workspace_tabs", .{});
         }
     }
+    if (ui_value.object.get("workspace_new_tab_pane")) |pane_value| {
+        if (pane_value != .string) {
+            log.warn("ui.workspace_new_tab_pane must be a string when provided", .{});
+        } else if (WorkspaceSplitDefaultPane.parse(pane_value.string)) |pane_kind| {
+            config.workspace_new_tab_pane = pane_kind;
+        } else {
+            log.warn("ui.workspace_new_tab_pane must be chat or terminal", .{});
+        }
+    }
     if (ui_value.object.get("companion_enabled")) |enabled_value| {
         if (enabled_value == .bool) {
             config.companion_enabled = enabled_value.bool;
@@ -1693,6 +1706,18 @@ test "app config defaults prefix splits to chat and accepts terminal override" {
     applyAppOverrides(std.testing.allocator, &config, root.value);
 
     try std.testing.expectEqual(WorkspaceSplitDefaultPane.terminal, config.workspace_split_default_pane);
+}
+
+test "app config defaults new workspace tabs to chat and accepts terminal override" {
+    var config: AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+    try std.testing.expectEqual(WorkspaceSplitDefaultPane.chat, config.workspace_new_tab_pane);
+
+    var root = try parseTestRoot("{\"ui\":{\"workspace_new_tab_pane\":\"terminal\"}}");
+    defer root.deinit();
+    applyAppOverrides(std.testing.allocator, &config, root.value);
+
+    try std.testing.expectEqual(WorkspaceSplitDefaultPane.terminal, config.workspace_new_tab_pane);
 }
 
 test "app config ignores unsupported ui.workspace_scroll_direction" {

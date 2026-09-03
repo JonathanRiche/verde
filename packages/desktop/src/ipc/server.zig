@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const headless = @import("headless");
 
+const app_config = @import("../app/config.zig");
 const app_state = @import("../state.zig");
 const state_storage = @import("../state/storage.zig");
 const browser_runtime = @import("../browser/mod.zig");
@@ -219,6 +220,7 @@ fn handleRequest(allocator: std.mem.Allocator, state: *app_state.AppState, reque
     if (std.mem.eql(u8, method, "inspect")) return try inspectResponse(allocator, id_value, state, params);
     if (std.mem.startsWith(u8, method, "workspace.")) return try workspaceCommandResponse(allocator, id_value, state, params, method["workspace.".len..]);
     if (std.mem.startsWith(u8, method, "pane.")) return try paneCommandResponse(allocator, id_value, state, params, method["pane.".len..]);
+    if (std.mem.startsWith(u8, method, "tab.")) return try tabCommandResponse(allocator, id_value, state, params, method["tab.".len..]);
     if (std.mem.startsWith(u8, method, "chat.")) return try chatCommandResponse(allocator, id_value, state, params, method["chat.".len..]);
     if (std.mem.startsWith(u8, method, "browser.")) return try browserCommandResponse(allocator, id_value, state, params, method["browser.".len..]);
     if (std.mem.startsWith(u8, method, "palette.")) return try paletteCommandResponse(allocator, id_value, state, params, method["palette.".len..]);
@@ -418,7 +420,7 @@ fn capabilitiesResponse(allocator: std.mem.Allocator, id_value: std.json.Value) 
             "process.inspect",                    "process.start",                       "process.stop",                        "process.restart",
             "process.logs",                       "agent.open",                          "stack.status",                        "stack.start",
             "stack.stop",                         "stack.restart",                       "workspace.processes",                 "workspace.checkCommand",
-            "workspace.acquireLease",             "workspace.releaseLease",
+            "workspace.acquireLease",             "workspace.releaseLease",              "tab.select",                          "tab.add",
         },
         .events = &.{},
         .encodings = &.{"json"},
@@ -1003,6 +1005,56 @@ fn paneCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, s
 
     if (!changed) return try errorResponseAlloc(allocator, id_value, "rejected", "pane operation did not apply");
     return try panesResponseForProject(allocator, id_value, state, target.project_index);
+}
+
+/// `tab.select` and `tab.add` operate on workspace tabs (one per split tile),
+/// so agents can drive the strip without re-deriving the pane grouping rule.
+fn tabCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value, command: []const u8) ![]u8 {
+    const project_index = resolveProjectIndex(state, params) orelse
+        return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
+
+    if (std.mem.eql(u8, command, "select")) {
+        const tab_id = resolveTabId(state, project_index, params) orelse
+            return try errorResponseAlloc(allocator, id_value, "not_found", "tab not found");
+        if (!state.selectWorkspaceTab(project_index, tab_id)) {
+            return try errorResponseAlloc(allocator, id_value, "rejected", "tab select did not apply");
+        }
+        return try panesResponseForProject(allocator, id_value, state, project_index);
+    }
+    if (std.mem.eql(u8, command, "add")) {
+        // Omitted kind defers to the user's ui.workspace_new_tab_pane preference.
+        const kind: ?app_config.WorkspaceSplitDefaultPane = if (stringParam(params, "kind")) |kind_name|
+            app_config.WorkspaceSplitDefaultPane.parse(kind_name) orelse
+                return try errorResponseAlloc(allocator, id_value, "invalid_request", "tab.add kind must be chat or terminal")
+        else
+            null;
+        var tab_buffer: [app_state.workspace_tabs.MAX_WORKSPACE_TABS]app_state.WorkspaceTab = undefined;
+        const layout = &state.project_controller.projects.items[project_index].workspace_layout;
+        const tabs_before = app_state.workspace_tabs.collect(layout, &tab_buffer).len;
+        state.addWorkspaceTab(project_index, kind);
+        const tabs_after = app_state.workspace_tabs.collect(layout, &tab_buffer).len;
+        if (tabs_after <= tabs_before) return try errorResponseAlloc(allocator, id_value, "rejected", "tab add did not apply");
+        return try panesResponseForProject(allocator, id_value, state, project_index);
+    }
+    return try errorResponseAlloc(allocator, id_value, "method_not_found", command);
+}
+
+/// Accepts `tab`/`tab_id` (stable id), `index` (strip position), or `pane`/`pane_id`
+/// (any member pane) so callers can address a tab however `panes` reported it.
+fn resolveTabId(state: *app_state.AppState, project_index: usize, params: std.json.Value) ?app_state.WorkspaceTabId {
+    const layout = &state.project_controller.projects.items[project_index].workspace_layout;
+    var tab_buffer: [app_state.workspace_tabs.MAX_WORKSPACE_TABS]app_state.WorkspaceTab = undefined;
+    const tabs = app_state.workspace_tabs.collect(layout, &tab_buffer);
+    if (u32Param(params, "tab") orelse u32Param(params, "tab_id")) |tab_id| {
+        return if (app_state.workspace_tabs.indexOfTab(tabs, tab_id) != null) tab_id else null;
+    }
+    if (u32Param(params, "index")) |index| {
+        return if (index < tabs.len) tabs[index].id else null;
+    }
+    if (u32Param(params, "pane") orelse u32Param(params, "pane_id")) |pane_id| {
+        return app_state.workspace_tabs.tabIdForPane(layout, pane_id);
+    }
+    return null;
 }
 
 const PaneMaximizeMode = enum { on, off, toggle };
@@ -2168,6 +2220,10 @@ fn writeProjectPanes(s: *std.json.Stringify, state: *app_state.AppState, project
     if (project.workspace_layout.focused_pane_id) |pane_id| try s.write(pane_id) else try s.write(null);
     try s.objectField("maximized_pane_id");
     if (project.workspace_layout.maximized_pane_id) |pane_id| try s.write(pane_id) else try s.write(null);
+    try s.objectField("focused_tab_id");
+    if (app_state.workspace_tabs.focusedTabId(&project.workspace_layout)) |tab_id| try s.write(tab_id) else try s.write(null);
+    try s.objectField("tabs");
+    try writeWorkspaceTabs(s, &project.workspace_layout);
     try s.objectField("panes");
     try s.beginArray();
     for (project.workspace_layout.panes.items) |pane| {
@@ -2183,11 +2239,43 @@ fn writeProjectPanes(s: *std.json.Stringify, state: *app_state.AppState, project
     try s.endObject();
 }
 
+/// Workspace tabs in strip order. A split tile is one tab; `pane_ids` lists
+/// its members so clients can map tabs back to panes without re-deriving
+/// the grouping rule.
+fn writeWorkspaceTabs(s: *std.json.Stringify, layout: *const app_state.WorkspaceLayout) !void {
+    var tab_buffer: [app_state.workspace_tabs.MAX_WORKSPACE_TABS]app_state.WorkspaceTab = undefined;
+    const tabs = app_state.workspace_tabs.collect(layout, &tab_buffer);
+    try s.beginArray();
+    for (tabs, 0..) |tab, index| {
+        try s.beginObject();
+        try s.objectField("tab_id");
+        try s.write(tab.id);
+        try s.objectField("index");
+        try s.write(index);
+        try s.objectField("preferred_pane_id");
+        try s.write(tab.preferred_pane_id);
+        try s.objectField("pane_count");
+        try s.write(tab.pane_count);
+        try s.objectField("focused");
+        try s.write(app_state.workspace_tabs.focusedTabId(layout) == tab.id);
+        try s.objectField("pane_ids");
+        try s.beginArray();
+        for (layout.panes.items) |pane| {
+            if (app_state.workspace_tabs.tabIdForPane(layout, pane.id) == tab.id) try s.write(pane.id);
+        }
+        try s.endArray();
+        try s.endObject();
+    }
+    try s.endArray();
+}
+
 fn writePane(s: *std.json.Stringify, state: *app_state.AppState, project_index: usize, pane: app_state.WorkspacePane) !void {
     const project = &state.project_controller.projects.items[project_index];
     try s.beginObject();
     try s.objectField("pane_id");
     try s.write(pane.id);
+    try s.objectField("tab_id");
+    if (app_state.workspace_tabs.tabIdForPane(&project.workspace_layout, pane.id)) |tab_id| try s.write(tab_id) else try s.write(null);
     if (pane.scroll_group_id) |group_id| {
         try s.objectField("scroll_group");
         try s.write(group_id);
@@ -4881,7 +4969,6 @@ test "surface receipt proof is current while superseded delivery is inert" {
     const db_client = @import("../db/client.zig");
     const persistence = @import("../state/persistence.zig");
     const storage_mod = @import("../state/storage.zig");
-    const app_config = @import("../app/config.zig");
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

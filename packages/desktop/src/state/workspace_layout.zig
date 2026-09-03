@@ -458,7 +458,9 @@ pub const WorkspaceLayout = struct {
         return changed;
     }
 
-    fn preferredScrollGroupPaneId(self: *const WorkspaceLayout, group_id: WorkspacePaneId) ?WorkspacePaneId {
+    /// Pane to focus when entering a tile group: its last-focused child,
+    /// otherwise its first pane in persisted order.
+    pub fn preferredScrollGroupPaneId(self: *const WorkspaceLayout, group_id: WorkspacePaneId) ?WorkspacePaneId {
         var first_pane_id: ?WorkspacePaneId = null;
         for (self.panes.items) |pane| {
             if (!self.rootContainsPane(pane.id)) continue;

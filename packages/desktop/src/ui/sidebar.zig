@@ -716,10 +716,13 @@ fn renderPaneRowDragOverlay(state: *runtime.AppState) void {
         .y = rect.y + (rect.h - font * 1.25) * 0.5,
         .w = rect.w - theme.scaledUi(20.0),
         .h = font * 1.25,
-    }, paneDragLabel(state, pane_row_drag.project_index, project, pane), paletteColor(theme.COLOR_WHITE), font, rect);
+    }, paneTitle(state, pane_row_drag.project_index, project, pane), paletteColor(theme.COLOR_WHITE), font, rect);
 }
 
-fn paneDragLabel(
+/// Short human label for a pane, shared by the pane drag ghost and the
+/// workspace tab strip: thread title, terminal surface title, or browser
+/// tab title, with a kind-named fallback.
+pub fn paneTitle(
     state: *const runtime.AppState,
     project_index: usize,
     project: *const native_state.Project,
@@ -728,7 +731,7 @@ fn paneDragLabel(
     return switch (pane.ref) {
         .chat => |ref| if (ref.thread_index < project.threads.items.len) project.threads.items[ref.thread_index].title else "Chat",
         .terminal => |ref| if (state.projectTerminalSurface(project_index, ref.dock_id)) |surface|
-            if (surface.title.len > 0) surface.title else "Terminal"
+            if (surface.title.len > 0) stripLeadingTitleSymbols(surface.title) else "Terminal"
         else
             "Terminal",
         .browser => browserPaneTitle(pane),

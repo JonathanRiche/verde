@@ -847,15 +847,16 @@ fn focusBorderAlpha(pane_id: runtime.WorkspacePaneId) f32 {
     return 0.0;
 }
 
-fn paneUsesRestingBorder(is_root_pane: bool, visible_pane_count: usize, maximized: bool) bool {
-    return is_root_pane and visible_pane_count > 1 and !maximized;
+// Every unzoomed root pane keeps the muted tile frame, including a lone pane,
+// so zooming is the only state that drops the frame and goes edge-to-edge.
+fn paneUsesRestingBorder(is_root_pane: bool, maximized: bool) bool {
+    return is_root_pane and !maximized;
 }
 
-test "resting pane borders appear only throughout tiled layouts" {
-    try std.testing.expect(paneUsesRestingBorder(true, 2, false));
-    try std.testing.expect(!paneUsesRestingBorder(true, 1, false));
-    try std.testing.expect(!paneUsesRestingBorder(true, 2, true));
-    try std.testing.expect(!paneUsesRestingBorder(false, 2, false));
+test "resting pane borders appear throughout unzoomed layouts" {
+    try std.testing.expect(paneUsesRestingBorder(true, false));
+    try std.testing.expect(!paneUsesRestingBorder(true, true));
+    try std.testing.expect(!paneUsesRestingBorder(false, false));
 }
 
 /// Renders workspace panes with transcript geometry matching the visible pane.
@@ -894,13 +895,14 @@ pub fn renderAtWithTranscriptLayoutWidth(state: *runtime.AppState, rect: palette
         if (scrollingLayoutActive(state, layout)) {
             renderScrollingStrip(state, layout, rect, target_workspace_width);
         } else {
+            // Unzoomed tiles always sit inside the workspace margin, even when
+            // only one pane is open, so zooming reads as a distinct state.
             const gap = theme.scaledUi(state.app_config.workspace_pane_gap);
-            const pane_count = layout.visiblePaneCount();
             renderNode(
                 state,
                 root,
-                tiledContentRect(rect, gap, pane_count),
-                tiledContentExtent(target_workspace_width, gap, pane_count),
+                tiledContentRect(rect, gap, true),
+                tiledContentExtent(target_workspace_width, gap, true),
             );
         }
     } else if (state.project_controller.projects.items.len > 0) {
@@ -1844,15 +1846,18 @@ fn renderScrollingGroup(
         .vertical => .{ .x = workspace.x, .y = workspace.y + screen_origin, .w = workspace.w, .h = pane_extent },
     };
     if (intersectRects(rect, workspace) == null) return;
+    // The viewport margin already insets the strip; margin-less strips (one
+    // pane per view) inset every group, single-pane included, so an unzoomed
+    // pane never sits edge-to-edge like a zoomed one.
     const pane_count = layout.scrollGroupPaneCount(group_id);
-    const content_pane_count = if (viewport_has_margins) @as(usize, 1) else pane_count;
+    const inset_group = !viewport_has_margins;
     renderScrollGroupNode(
         state,
         layout,
         root,
         group_id,
-        tiledContentRect(rect, gap, content_pane_count),
-        tiledContentExtent(target_pane_width, gap, content_pane_count),
+        tiledContentRect(rect, gap, inset_group),
+        tiledContentExtent(target_pane_width, gap, inset_group),
     );
     const gutter: palette.Rect = switch (direction) {
         .horizontal => .{ .x = rect.x + rect.w, .y = workspace.y, .w = gap, .h = workspace.h },
@@ -2012,24 +2017,9 @@ fn appendScrollingResizeHit(
 }
 
 fn scrollGroupIndexForPane(layout: *const runtime.WorkspaceLayout, pane_id: runtime.WorkspacePaneId) ?usize {
-    const wanted_group = layout.scrollGroupIdForPane(pane_id) orelse return null;
-    var group_index: usize = 0;
-    for (layout.panes.items, 0..) |pane, pane_index| {
-        if (!layout.rootContainsPane(pane.id)) continue;
-        const group_id = layout.scrollGroupIdForPane(pane.id) orelse continue;
-        var seen = false;
-        for (layout.panes.items[0..pane_index]) |earlier| {
-            if (!layout.rootContainsPane(earlier.id)) continue;
-            if (layout.scrollGroupIdForPane(earlier.id) == group_id) {
-                seen = true;
-                break;
-            }
-        }
-        if (seen) continue;
-        if (group_id == wanted_group) return group_index;
-        group_index += 1;
-    }
-    return null;
+    var tab_buffer: [MAX_WORKSPACE_PANE_RECTS]runtime.WorkspaceTab = undefined;
+    const tabs = runtime.workspace_tabs.collect(layout, &tab_buffer);
+    return runtime.workspace_tabs.indexOfPane(layout, tabs, pane_id);
 }
 
 fn scrollingPaneExtent(viewport_extent: f32, gap: f32, panes_per_view: u8) f32 {
@@ -2043,12 +2033,12 @@ fn scrollingViewportUsesMargins(group_count: usize, panes_per_view: u8) bool {
 
 fn scrollingViewportExtent(extent: f32, gap: f32, group_count: usize, panes_per_view: u8) f32 {
     if (!scrollingViewportUsesMargins(group_count, panes_per_view)) return extent;
-    return tiledContentExtent(extent, gap, 2);
+    return tiledContentExtent(extent, gap, true);
 }
 
 fn scrollingViewportRect(rect: palette.Rect, gap: f32, group_count: usize, panes_per_view: u8) palette.Rect {
     if (!scrollingViewportUsesMargins(group_count, panes_per_view)) return rect;
-    return tiledContentRect(rect, gap, 2);
+    return tiledContentRect(rect, gap, true);
 }
 
 fn responsiveScrollingPaneExtent(
@@ -2088,25 +2078,15 @@ fn collectScrollingGroups(
     group_ids: *[MAX_WORKSPACE_PANE_RECTS]runtime.WorkspacePaneId,
     representative_pane_ids: *[MAX_WORKSPACE_PANE_RECTS]runtime.WorkspacePaneId,
 ) usize {
-    var count: usize = 0;
-    for (layout.panes.items, 0..) |pane, pane_index| {
-        if (!layout.rootContainsPane(pane.id)) continue;
-        const group_id = layout.scrollGroupIdForPane(pane.id) orelse continue;
-        var seen = false;
-        for (layout.panes.items[0..pane_index]) |earlier| {
-            if (!layout.rootContainsPane(earlier.id)) continue;
-            if (layout.scrollGroupIdForPane(earlier.id) == group_id) {
-                seen = true;
-                break;
-            }
-        }
-        if (seen) continue;
-        if (count >= group_ids.len) break;
-        group_ids[count] = group_id;
-        representative_pane_ids[count] = pane.id;
-        count += 1;
+    // Scrolling items are exactly the workspace tabs, so the strip and the
+    // tab bar can never disagree about item count or order.
+    var tab_buffer: [MAX_WORKSPACE_PANE_RECTS]runtime.WorkspaceTab = undefined;
+    const tabs = runtime.workspace_tabs.collect(layout, &tab_buffer);
+    for (tabs, 0..) |tab, index| {
+        group_ids[index] = tab.id;
+        representative_pane_ids[index] = tab.representative_pane_id;
     }
-    return count;
+    return tabs.len;
 }
 
 fn resolveScrollingGroupExtents(
@@ -2378,14 +2358,14 @@ fn verticalSplitWidths(total_width: f32, ratio: f32, gap: f32) VerticalSplitWidt
     };
 }
 
-fn tiledContentExtent(extent: f32, gap: f32, pane_count: usize) f32 {
-    if (pane_count <= 1) return extent;
-    const inset = @min(gap, @max((extent - 1.0) * 0.5, 0.0));
-    return @max(1.0, extent - inset * 2.0);
+fn tiledContentExtent(extent: f32, gap: f32, inset: bool) f32 {
+    if (!inset) return extent;
+    const margin = @min(gap, @max((extent - 1.0) * 0.5, 0.0));
+    return @max(1.0, extent - margin * 2.0);
 }
 
-fn tiledContentRect(rect: palette.Rect, gap: f32, pane_count: usize) palette.Rect {
-    if (pane_count <= 1) return rect;
+fn tiledContentRect(rect: palette.Rect, gap: f32, inset: bool) palette.Rect {
+    if (!inset) return rect;
     const horizontal_inset = @min(gap, @max((rect.w - 1.0) * 0.5, 0.0));
     const vertical_inset = @min(gap, @max((rect.h - 1.0) * 0.5, 0.0));
     return .{
@@ -2396,18 +2376,18 @@ fn tiledContentRect(rect: palette.Rect, gap: f32, pane_count: usize) palette.Rec
     };
 }
 
-test "tiled content adds four-sided margins only for pane groups" {
+test "tiled content adds four-sided margins when inset" {
     const rect: palette.Rect = .{ .x = 10.0, .y = 20.0, .w = 1000.0, .h = 700.0 };
 
-    try std.testing.expectEqual(rect, tiledContentRect(rect, 12.0, 1));
-    try std.testing.expectEqual(@as(f32, 1000.0), tiledContentExtent(rect.w, 12.0, 1));
+    try std.testing.expectEqual(rect, tiledContentRect(rect, 12.0, false));
+    try std.testing.expectEqual(@as(f32, 1000.0), tiledContentExtent(rect.w, 12.0, false));
 
-    const tiled = tiledContentRect(rect, 12.0, 2);
+    const tiled = tiledContentRect(rect, 12.0, true);
     try std.testing.expectEqual(@as(f32, 22.0), tiled.x);
     try std.testing.expectEqual(@as(f32, 32.0), tiled.y);
     try std.testing.expectEqual(@as(f32, 976.0), tiled.w);
     try std.testing.expectEqual(@as(f32, 676.0), tiled.h);
-    try std.testing.expectEqual(@as(f32, 976.0), tiledContentExtent(rect.w, 12.0, 2));
+    try std.testing.expectEqual(@as(f32, 976.0), tiledContentExtent(rect.w, 12.0, true));
 }
 
 test "target split widths finish without a corrective transcript reflow" {
@@ -2552,7 +2532,7 @@ fn renderLeafWithin(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, 
     }
     renderZoomControl(state, pane_id, kind, rect, header_h, maximized);
     const layout = &state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout;
-    if (paneUsesRestingBorder(layout.rootContainsPane(pane_id), layout.visiblePaneCount(), maximized)) {
+    if (paneUsesRestingBorder(layout.rootContainsPane(pane_id), maximized)) {
         queueBorder(state, rect, paletteColor(theme.borderMuted()), 0.0, theme.scaledUi(INACTIVE_BORDER_WIDTH_CSS));
     }
     // Pane status frame. Live agent states intentionally override the ordinary
