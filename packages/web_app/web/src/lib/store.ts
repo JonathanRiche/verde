@@ -1900,6 +1900,8 @@ function createAppStore() {
         return 'FX'
       case 'grok':
         return 'Grok'
+      case 'muse':
+        return 'Muse'
       default:
         return provider ? provider.charAt(0).toUpperCase() + provider.slice(1) : 'Assistant'
     }

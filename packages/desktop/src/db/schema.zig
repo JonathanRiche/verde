@@ -6,7 +6,7 @@ const zqlite = @import("zqlite");
 /// Latest schema version understood by this build.
 pub const CURRENT_VERSION: i64 = 1;
 /// Maximum schema version understood by read-only clients and the daemon store.
-pub const MAX_SUPPORTED_VERSION: i64 = 10;
+pub const MAX_SUPPORTED_VERSION: i64 = 11;
 /// SQLite busy timeout shared by writer and read-only connections.
 pub const BUSY_TIMEOUT_MS = 5000;
 
@@ -289,6 +289,12 @@ fn migrateToVersionInternal(
                 if (failure_point == .before_version_bump) return error.TestMigrationFailure;
                 try conn.execNoArgs("pragma user_version = 10");
                 version = 10;
+            },
+            10 => {
+                try migrateV10ToV11(conn);
+                if (failure_point == .before_version_bump) return error.TestMigrationFailure;
+                try conn.execNoArgs("pragma user_version = 11");
+                version = 11;
             },
             else => return error.DatabaseSchemaInvalid,
         }
@@ -685,6 +691,81 @@ fn migrateV9ToV10(conn: zqlite.Conn) !void {
     );
 }
 
+fn migrateV10ToV11(conn: zqlite.Conn) !void {
+    // Projection readers need the durable transcript boundary, not transcript
+    // bodies. Persist it on the owning thread so a bounded refresh does not
+    // scan the complete messages index merely to rediscover every extent.
+    try ensureColumn(
+        conn,
+        "threads",
+        "message_extent",
+        "alter table threads add column message_extent integer not null default 0 check (message_extent >= 0)",
+    );
+    try conn.execNoArgs(
+        \\update threads
+        \\set message_extent = (
+        \\    select coalesce(max(sort_index) + 1, 0)
+        \\    from messages
+        \\    where messages.thread_id = threads.id and messages.sort_index >= 0
+        \\);
+        \\create trigger if not exists messages_extent_insert
+        \\after insert on messages
+        \\when new.sort_index >= 0
+        \\begin
+        \\    update threads
+        \\    set message_extent = max(message_extent, new.sort_index + 1)
+        \\    where id = new.thread_id;
+        \\end;
+        \\create trigger if not exists messages_extent_delete
+        \\after delete on messages
+        \\when old.sort_index >= 0
+        \\begin
+        \\    update threads
+        \\    set message_extent = (
+        \\        select coalesce(max(sort_index) + 1, 0)
+        \\        from messages
+        \\        where thread_id = old.thread_id and sort_index >= 0
+        \\    )
+        \\    where id = old.thread_id and message_extent <= old.sort_index + 1;
+        \\end;
+        \\create trigger if not exists messages_extent_update
+        \\after update of thread_id, sort_index on messages
+        \\when old.thread_id != new.thread_id or old.sort_index != new.sort_index
+        \\begin
+        \\    update threads
+        \\    set message_extent = (
+        \\        select coalesce(max(sort_index) + 1, 0)
+        \\        from messages
+        \\        where thread_id = old.thread_id and sort_index >= 0
+        \\    )
+        \\    where id = old.thread_id and message_extent <= old.sort_index + 1;
+        \\    update threads
+        \\    set message_extent = max(message_extent, new.sort_index + 1)
+        \\    where id = new.thread_id and new.sort_index >= 0;
+        \\end;
+    );
+
+    // Fingerprint conversion is a one-time migration, not startup work.
+    // Receipt timestamps support conservative retention of obsolete snapshot
+    // replay records without weakening granular-mutation idempotency.
+    try ensureColumn(
+        conn,
+        "store_state",
+        "fingerprints_migrated",
+        "alter table store_state add column fingerprints_migrated integer not null default 0 check (fingerprints_migrated in (0, 1))",
+    );
+    try ensureColumn(
+        conn,
+        "store_receipts",
+        "created_at_ms",
+        "alter table store_receipts add column created_at_ms integer not null default 0 check (created_at_ms >= 0)",
+    );
+    try conn.execNoArgs(
+        \\create index if not exists store_receipts_snapshot_revision_idx
+        \\on store_receipts(operation, store_revision);
+    );
+}
+
 fn seedLegacyPrimaryRepositories(conn: zqlite.Conn) !void {
     try conn.execNoArgs(
         \\insert or ignore into workspace_repositories (workspace_id, repository_id, sort_index, label)
@@ -938,6 +1019,57 @@ test "schema migration chain advances v1 to v2 to v3 to v4 and preserves populat
     defer legacy_turn.deinit();
     try std.testing.expectEqualStrings("opaque legacy failure", legacy_turn.text(0));
     try std.testing.expect(legacy_turn.nullableText(1) == null);
+
+    try migrateToVersion(conn, 11, .none);
+    try std.testing.expectEqual(@as(i64, 11), try userVersion(conn));
+    try std.testing.expect(try testHasColumn(conn, "threads", "message_extent"));
+    try std.testing.expect(try testHasColumn(conn, "store_state", "fingerprints_migrated"));
+    try std.testing.expect(try testHasColumn(conn, "store_receipts", "created_at_ms"));
+    var extent = (try conn.row(
+        "select message_extent from threads where local_thread_id = 'v3-thread'",
+        .{},
+    )).?;
+    defer extent.deinit();
+    try std.testing.expectEqual(@as(i64, 2), extent.int(0));
+}
+
+test "message extent triggers track append move and top deletion" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const path = try std.fs.path.joinZ(std.testing.allocator, &.{ path_buf[0..path_len], "state.sqlite" });
+    defer std.testing.allocator.free(path);
+
+    const conn = try zqlite.open(path, zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
+    defer conn.close();
+    try migrate(conn, .none);
+    try conn.execNoArgs(
+        \\insert into workspaces (workspace_id, sort_index, label, path) values ('w', 0, 'W', '/w');
+        \\insert into threads (workspace_id, sort_index, title, local_thread_id, provider, harness)
+        \\values ((select id from workspaces where workspace_id = 'w'), 0, 'A', 'a', 0, 0),
+        \\       ((select id from workspaces where workspace_id = 'w'), 1, 'B', 'b', 0, 0);
+        \\insert into messages (thread_id, sort_index, role, author, body)
+        \\values ((select id from threads where local_thread_id = 'a'), 4, 0, 'You', 'one');
+    );
+    try std.testing.expectEqual(@as(i64, 5), try testThreadExtent(conn, "a"));
+    try conn.execNoArgs(
+        "update messages set thread_id = (select id from threads where local_thread_id = 'b'), sort_index = 8 where body = 'one'",
+    );
+    try std.testing.expectEqual(@as(i64, 0), try testThreadExtent(conn, "a"));
+    try std.testing.expectEqual(@as(i64, 9), try testThreadExtent(conn, "b"));
+    try conn.execNoArgs("delete from messages where body = 'one'");
+    try std.testing.expectEqual(@as(i64, 0), try testThreadExtent(conn, "b"));
+}
+
+fn testThreadExtent(conn: zqlite.Conn, local_thread_id: []const u8) !i64 {
+    const row = (try conn.row(
+        "select message_extent from threads where local_thread_id = ?1",
+        .{local_thread_id},
+    )).?;
+    defer row.deinit();
+    return row.int(0);
 }
 
 test "v9 migration preserves legacy path as primary runtime binding" {

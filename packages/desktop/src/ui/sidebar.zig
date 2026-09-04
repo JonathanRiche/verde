@@ -845,6 +845,7 @@ fn openTuiLabel(provider: Provider) []const u8 {
         .pi => "Open in TUI: Pi",
         .fx => "Open in TUI: FX",
         .grok => "Open in TUI: Grok",
+        .muse => "Open in TUI: Muse",
     };
 }
 
@@ -2746,6 +2747,7 @@ pub fn queuePaletteAgentTuiProviderGlyph(state: *runtime.AppState, provider: nat
         .cursor => .cursor,
         .grok => .grok,
         .amp => .amp,
+        .muse => .muse,
         .other => return,
     };
     queuePaletteAgentTerminalGlyph(state, terminal_provider, x, center_y, theme.COLOR_WHITE, clip);
@@ -2760,6 +2762,7 @@ const TerminalAgentProvider = enum {
     amp,
     pi,
     fx,
+    muse,
 };
 
 fn terminalAgentProviderFromChatProvider(provider: Provider) TerminalAgentProvider {
@@ -2771,6 +2774,7 @@ fn terminalAgentProviderFromChatProvider(provider: Provider) TerminalAgentProvid
         .pi => .pi,
         .fx => .fx,
         .grok => .grok,
+        .muse => .muse,
     };
 }
 
@@ -2784,6 +2788,7 @@ fn terminalAgentProviderFromProvider(provider: ?SurfaceProvider) ?TerminalAgentP
         .amp => .amp,
         .pi => .pi,
         .fx => .fx,
+        .muse => .muse,
     };
 }
 
@@ -2811,6 +2816,7 @@ fn queuePaletteProviderGlyphInRect(state: *runtime.AppState, provider: TerminalA
         .amp => state.amp_logo_texture,
         .pi => state.pi_logo_texture,
         .fx => state.fx_logo_texture,
+        .muse => state.muse_logo_texture,
     };
     if (texture) |cached| {
         const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, box.x, box.y, box.w, box.h));
@@ -2827,6 +2833,7 @@ fn queuePaletteProviderGlyphInRect(state: *runtime.AppState, provider: TerminalA
         .amp => "A",
         .pi => "P",
         .fx => "F",
+        .muse => "M",
     };
     const font_size = @min(theme.scaledUi(11.0), box.h);
     const color = if (provider == .amp) theme.COLOR_YELLOW else theme.COLOR_TEXT_SUBTLE;
@@ -2849,6 +2856,7 @@ fn providerFromComm(comm: []const u8) ?TerminalAgentProvider {
     if (std.mem.eql(u8, comm, "grok")) return .grok;
     if (std.mem.eql(u8, comm, "amp")) return .amp;
     if (std.mem.eql(u8, comm, "fx")) return .fx;
+    if (std.mem.eql(u8, comm, "muse") or std.mem.startsWith(u8, comm, "muse-bin-")) return .muse;
     return null;
 }
 

@@ -66,6 +66,7 @@ const file_search_controller = @import("state/file_search_controller.zig");
 const herdr_controller = @import("state/herdr_controller.zig");
 const handoff_controller = @import("state/handoff_controller.zig");
 const settings_controller = @import("state/settings_controller.zig");
+const muse_tui = @import("state/muse_tui.zig");
 const runtime_connections_controller = @import("state/runtime_connections_controller.zig");
 const surface_controller = @import("state/surface_controller.zig");
 const terminal_controller = @import("state/terminal_controller.zig");
@@ -80,6 +81,8 @@ const MANAGED_PROCESS_WATCH_DEBOUNCE_MS: i64 = 500;
 const EXTERNAL_OPEN_CLOSE_SUPPRESS_MS: i64 = 2000;
 const CLOSE_DURABILITY_NOTICE = "Could not close: unsaved changes are not durable. Free space, then close again; keep working to cancel.";
 
+//Manual Comment
+//y
 // ---------------------------------------------------------------------------
 // M5-P4 change-cursor loop (desktop read flip).
 //
@@ -157,6 +160,9 @@ pub const OwnedProjectionRefresh = struct {
     arena: std.heap.ArenaAllocator,
     result: headless.store.CoreSnapshotResult = undefined,
     durable: ?LoadedPersistedState = null,
+    /// Registry-only journal batches do not need the durable workspace tree.
+    /// Preserve the last applied durable revision when publishing their seed.
+    seed_store_revision: ?u64 = null,
     requested_projection_revision: ?u64 = null,
 
     fn create(backing_allocator: std.mem.Allocator) !*OwnedProjectionRefresh {
@@ -316,11 +322,28 @@ fn changeCursorSignalsForTopic(topic: []const u8) ChangeCursorSignals {
     return .{ .registry = true };
 }
 
+fn journalBatchNeedsDurableRefresh(entries: []const headless.changes_protocol.ChangeEntry) bool {
+    for (entries) |entry| if (entry.store_revision != null) return true;
+    return false;
+}
+
 const ChangeCursorPollOutcome = enum { advanced, heartbeat, snapshot_required, busy, unavailable };
 
 /// On null, `failure_reason` names the exact silent arm for the caller's
 /// streak logging (static strings only; safe across the arena teardown).
 fn fetchOwnedCompositeSnapshot(storage: *const Storage, failure_reason: *[]const u8) ?*OwnedProjectionRefresh {
+    return fetchOwnedProjectionSnapshot(storage, true, failure_reason);
+}
+
+fn fetchOwnedVolatileSnapshot(storage: *const Storage, failure_reason: *[]const u8) ?*OwnedProjectionRefresh {
+    return fetchOwnedProjectionSnapshot(storage, false, failure_reason);
+}
+
+fn fetchOwnedProjectionSnapshot(
+    storage: *const Storage,
+    include_durable: bool,
+    failure_reason: *[]const u8,
+) ?*OwnedProjectionRefresh {
     failure_reason.* = "refresh allocation failed";
     const refresh = OwnedProjectionRefresh.create(storage.allocator) catch return null;
     var refresh_owned = true;
@@ -357,15 +380,19 @@ fn fetchOwnedCompositeSnapshot(storage: *const Storage, failure_reason: *[]const
         failure_reason.* = "core.snapshot incomplete (missing scopes, envelope, or cursor)";
         return null;
     }
-    failure_reason.* = "durable projection load failed";
-    var durable = storage.loadProjection(storage.allocator) catch return null;
-    if (durable.store_revision < refresh.result.store_revision) {
-        failure_reason.* = "durable store behind live daemon revision";
-        durable.deinit();
-        return null;
+    if (include_durable) {
+        failure_reason.* = "durable projection load failed";
+        var durable = storage.loadProjection(storage.allocator) catch return null;
+        if (durable.store_revision < refresh.result.store_revision) {
+            failure_reason.* = "durable store behind live daemon revision";
+            durable.deinit();
+            return null;
+        }
+        refresh.result.store_revision = durable.store_revision;
+        refresh.durable = durable;
+    } else {
+        refresh.seed_store_revision = storage.currentProjectionObservedRevision();
     }
-    refresh.result.store_revision = durable.store_revision;
-    refresh.durable = durable;
     refresh_owned = false;
     return refresh;
 }
@@ -413,9 +440,15 @@ fn pollCoreChangesOnce(storage: *const Storage, loop: *ChangeCursorLoopState, cu
         return .advanced;
     }
     var signals: ChangeCursorSignals = .{};
-    for (result.entries) |entry| signals.merge(changeCursorSignalsForTopic(entry.topic));
+    for (result.entries) |entry| {
+        signals.merge(changeCursorSignalsForTopic(entry.topic));
+    }
+    const durable_changed = journalBatchNeedsDurableRefresh(result.entries);
     var fetch_reason: []const u8 = "";
-    const refresh = fetchOwnedCompositeSnapshot(storage, &fetch_reason) orelse {
+    const refresh = (if (durable_changed)
+        fetchOwnedCompositeSnapshot(storage, &fetch_reason)
+    else
+        fetchOwnedVolatileSnapshot(storage, &fetch_reason)) orelse {
         log.warn("change-cursor snapshot after journal entries failed: {s}", .{fetch_reason});
         return .unavailable;
     };
@@ -2032,6 +2065,7 @@ fn harnessProviderForDbProvider(provider: Provider) ai_harness.Provider {
         .pi => .pi,
         .fx => .fx,
         .grok => .grok,
+        .muse => .muse,
     };
 }
 
@@ -2075,21 +2109,10 @@ pub const PaletteModalAction = enum {
     thread_import_select,
     handoff_cancel,
     handoff_prepare,
-    handoff_surface_gui,
-    handoff_surface_tui,
-    handoff_provider_codex,
-    handoff_provider_opencode,
-    handoff_provider_claude,
-    handoff_provider_cursor,
-    handoff_provider_pi,
-    handoff_provider_fx,
-    handoff_provider_grok,
-    handoff_context_summary,
-    handoff_context_recent,
-    handoff_context_full,
-    handoff_target_new,
-    handoff_target_existing,
-    handoff_target_next,
+    handoff_menu_toggle,
+    handoff_menu_option,
+    handoff_menu_close,
+    handoff_preview_toggle,
     project_import_browse,
     project_import_submit,
     project_import_create_dir,
@@ -2119,10 +2142,18 @@ pub const PaletteModalAction = enum {
     /// index = option row in the workspace default-runtime list.
     workspace_settings_option,
     workspace_settings_manage,
+    /// index 0 = app default, 1 = custom.
+    workspace_settings_scroll_scope,
+    /// index 0 = automatic, 1 = always, 2 = disabled.
+    workspace_settings_scroll_mode,
+    workspace_settings_scroll_threshold_dec,
+    workspace_settings_scroll_threshold_inc,
     settings_cancel,
     settings_close,
     settings_save,
     settings_control,
+    settings_category,
+    settings_open_option,
     settings_runtime_action,
     settings_theme_option,
     settings_title_provider_option,
@@ -2449,7 +2480,7 @@ const COMPOSER_MODEL_PICKER_WIDTH: f32 = 430.0;
 const COMPOSER_MODEL_PICKER_RAIL_WIDTH: f32 = 52.0;
 const COMPOSER_MODEL_PICKER_Z: i32 = 1400;
 pub const COMPOSER_RUN_CONFIG_Z: i32 = 1400;
-const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .claude, .cursor, .opencode, .pi, .fx, .grok };
+const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .claude, .cursor, .opencode, .pi, .fx, .grok, .muse };
 
 fn paletteEstimatedFontAdvance(_: ?*anyopaque, text: []const u8, byte_offset: usize, font_size: f32) palette.FontAdvance {
     if (byte_offset >= text.len) return .{ .byte_len = 0, .width = 0.0 };
@@ -2635,6 +2666,7 @@ fn composerModelOptions(state: *const AppState, provider: Provider) []const Mode
         state.piModelOptionsSnapshot(),
         state.fxModelOptionsSnapshot(),
         state.grokModelOptionsSnapshot(),
+        MUSE_MODEL_OPTIONS[0..],
     );
 }
 
@@ -2647,6 +2679,7 @@ fn composerDefaultModelRef(state: *const AppState, provider: Provider) [:0]const
         .pi => DEFAULT_PI_MODEL,
         .fx => DEFAULT_FX_MODEL,
         .grok => DEFAULT_GROK_MODEL,
+        .muse => DEFAULT_MUSE_MODEL,
     };
 }
 
@@ -2698,7 +2731,7 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
                 return;
             }
             // Claude, Pi, and Grok menus carry effort tag names as row variants.
-            if (thread.provider == .claude or thread.provider == .pi or thread.provider == .grok) {
+            if (thread.provider == .claude or thread.provider == .pi or thread.provider == .grok or thread.provider == .muse) {
                 const rows = state.opencode_reasoning_menu.items;
                 if (index >= rows.len) return;
                 const row = rows[index];
@@ -3013,6 +3046,7 @@ fn configChatProvider(provider: Provider) app_config.ChatProvider {
         .pi => .pi,
         .fx => .fx,
         .grok => .grok,
+        .muse => .muse,
     };
 }
 
@@ -3025,6 +3059,7 @@ fn providerFromConfig(provider: app_config.ChatProvider) Provider {
         .pi => .pi,
         .fx => .fx,
         .grok => .grok,
+        .muse => .muse,
     };
 }
 
@@ -3089,6 +3124,7 @@ fn drawModelPickerProviderLetter(
         .pi => "P",
         .fx => "F",
         .grok => "G",
+        .muse => "M",
     };
     const font_size = @min(slot.h, theme.scaledUi(13.0));
     batch.text(allocator, .{
@@ -3997,6 +4033,8 @@ pub const FX_MODEL_OPTIONS = provider_models.FX_MODEL_OPTIONS;
 pub const DEFAULT_FX_MODEL = provider_models.DEFAULT_FX_MODEL;
 pub const GROK_MODEL_OPTIONS = provider_models.GROK_MODEL_OPTIONS;
 pub const DEFAULT_GROK_MODEL = provider_models.DEFAULT_GROK_MODEL;
+pub const MUSE_MODEL_OPTIONS = provider_models.MUSE_MODEL_OPTIONS;
+pub const DEFAULT_MUSE_MODEL = provider_models.DEFAULT_MUSE_MODEL;
 pub const IMAGE_MODAL_ID: [:0]const u8 = "AttachmentPreviewModal";
 pub const THREAD_IMPORT_MODAL_ID: [:0]const u8 = "ThreadImportModal";
 pub const TRANSCRIPT_SELECTION_MODAL_ID: [:0]const u8 = "TranscriptSelectionModal";
@@ -4004,6 +4042,7 @@ pub const VERDE_LOGO_BYTES = @embedFile("assets/verde_logo_mask.png");
 pub const PI_LOGO_BYTES = @embedFile("assets/pi-logo.png");
 pub const FX_LOGO_BYTES = @embedFile("assets/fx-logo.png");
 pub const GROK_LOGO_BYTES = @embedFile("assets/grok-logo.png");
+pub const MUSE_LOGO_BYTES = surface_controller.MUSE_LOGO_BYTES;
 pub const OPENCODE_LOGO_BYTES = surface_controller.OPENCODE_LOGO_BYTES;
 pub const CODEX_LOGO_BYTES = surface_controller.CODEX_LOGO_BYTES;
 pub const CLAUDE_LOGO_BYTES = surface_controller.CLAUDE_LOGO_BYTES;
@@ -4059,6 +4098,7 @@ const codexReasoningOptions = provider_models.codexReasoningOptions;
 pub const ReasoningOption = provider_models.ReasoningOption;
 pub const PI_REASONING_OPTIONS = provider_models.PI_REASONING_OPTIONS;
 pub const GROK_REASONING_OPTIONS = provider_models.GROK_REASONING_OPTIONS;
+pub const MUSE_REASONING_OPTIONS = provider_models.MUSE_REASONING_OPTIONS;
 const FastModeOption = provider_models.FastModeOption;
 const AccessModeOption = provider_models.AccessModeOption;
 
@@ -4524,6 +4564,7 @@ pub const AppState = struct {
     pi_logo_texture: ?CachedImageTexture,
     fx_logo_texture: ?CachedImageTexture,
     grok_logo_texture: ?CachedImageTexture,
+    muse_logo_texture: ?CachedImageTexture,
     thread_edit_texture: ?CachedImageTexture,
     cursor_logo_texture: ?CachedImageTexture,
     emacs_logo_texture: ?CachedImageTexture,
@@ -4722,6 +4763,7 @@ pub const AppState = struct {
             .pi_logo_texture = null,
             .fx_logo_texture = null,
             .grok_logo_texture = null,
+            .muse_logo_texture = null,
             .thread_edit_texture = null,
             .cursor_logo_texture = null,
             .emacs_logo_texture = null,
@@ -4855,6 +4897,7 @@ pub const AppState = struct {
             state.pi_logo_texture = state.loadEmbeddedTexture(PI_LOGO_BYTES);
             state.fx_logo_texture = state.loadEmbeddedTexture(FX_LOGO_BYTES);
             state.grok_logo_texture = state.loadEmbeddedTexture(GROK_LOGO_BYTES);
+            state.muse_logo_texture = state.loadEmbeddedTexture(MUSE_LOGO_BYTES);
             state.thread_edit_texture = state.loadEmbeddedTexture(THREAD_EDIT_BYTES);
             state.cursor_logo_texture = state.loadEmbeddedTexture(CURSOR_LOGO_BYTES);
             state.emacs_logo_texture = state.loadEmbeddedTexture(EMACS_LOGO_BYTES);
@@ -4960,6 +5003,12 @@ pub const AppState = struct {
         self.workspace_settings_project_id = owned;
         @memset(&self.workspace_settings_notice_storage, 0);
         self.workspace_settings_scroll_y = 0.0;
+        if (self.workspaceSettingsProject()) |project| {
+            const layout = project.workspace_layout;
+            self.settings_controller.draft.workspace_scroll_override_enabled = layout.hasScrollOverride();
+            self.settings_controller.draft.workspace_scroll_mode = layout.effectiveScrollMode(self.app_config.workspace_scroll_mode);
+            self.settings_controller.draft.workspace_scroll_threshold = layout.effectiveScrollThreshold(self.app_config.workspace_scroll_threshold);
+        }
         self.closeSidebarContextMenu();
         // Like the global Settings modal: no hidden field may retain text
         // focus while the modal owns the frame.
@@ -4982,6 +5031,14 @@ pub const AppState = struct {
     /// Resolves the bound workspace, or null when it was closed or archived
     /// while the modal was open.
     pub fn workspaceSettingsProject(self: *const AppState) ?*const Project {
+        const bound = self.workspace_settings_project_id orelse return null;
+        for (self.project_controller.projects.items) |*project| {
+            if (std.mem.eql(u8, project.id, bound)) return project;
+        }
+        return null;
+    }
+
+    pub fn workspaceSettingsProjectMutable(self: *AppState) ?*Project {
         const bound = self.workspace_settings_project_id orelse return null;
         for (self.project_controller.projects.items) |*project| {
             if (std.mem.eql(u8, project.id, bound)) return project;
@@ -5075,8 +5132,58 @@ pub const AppState = struct {
     /// connection management inside workspace settings.
     pub fn openManageConnectionsFromWorkspaceSettings(self: *AppState) void {
         self.closeWorkspaceSettings();
-        self.openSettingsModal();
-        self.settings_controller.scroll_to_runtimes = true;
+        self.openSettingsToCategory(.connections);
+    }
+
+    pub fn applyWorkspaceSettingsScrollScope(self: *AppState, override_enabled: bool) void {
+        const project = self.workspaceSettingsProjectMutable() orelse return;
+        const layout = &project.workspace_layout;
+        if (override_enabled) {
+            if (!layout.hasScrollOverride()) {
+                layout.scroll_mode_override = layout.effectiveScrollMode(self.app_config.workspace_scroll_mode);
+                layout.scroll_threshold_override = layout.effectiveScrollThreshold(self.app_config.workspace_scroll_threshold);
+            }
+        } else {
+            layout.scroll_mode_override = null;
+            layout.scroll_threshold_override = null;
+        }
+        self.settings_controller.draft.workspace_scroll_override_enabled = override_enabled;
+        self.settings_controller.draft.workspace_scroll_mode = layout.effectiveScrollMode(self.app_config.workspace_scroll_mode);
+        self.settings_controller.draft.workspace_scroll_threshold = layout.effectiveScrollThreshold(self.app_config.workspace_scroll_threshold);
+        self.setWorkspaceSettingsNotice(if (override_enabled)
+            "This workspace now uses its own scrolling settings."
+        else
+            "This workspace now uses app scrolling settings.");
+        self.markDirty();
+    }
+
+    pub fn applyWorkspaceSettingsScrollMode(self: *AppState, mode: app_config.WorkspaceScrollMode) void {
+        const project = self.workspaceSettingsProjectMutable() orelse return;
+        const layout = &project.workspace_layout;
+        layout.scroll_mode_override = mode;
+        if (layout.scroll_threshold_override == null) {
+            layout.scroll_threshold_override = self.app_config.workspace_scroll_threshold;
+        }
+        self.settings_controller.draft.workspace_scroll_override_enabled = true;
+        self.settings_controller.draft.workspace_scroll_mode = mode;
+        self.settings_controller.draft.workspace_scroll_threshold = layout.effectiveScrollThreshold(self.app_config.workspace_scroll_threshold);
+        self.setWorkspaceSettingsNotice(switch (mode) {
+            .automatic => "Workspace scrolling set to Auto.",
+            .always => "Workspace scrolling pinned on.",
+            .disabled => "Workspace scrolling off; using tiled panes.",
+        });
+        self.markDirty();
+    }
+
+    pub fn applyWorkspaceSettingsScrollThreshold(self: *AppState, threshold: u8) void {
+        const project = self.workspaceSettingsProjectMutable() orelse return;
+        const layout = &project.workspace_layout;
+        const next = std.math.clamp(threshold, app_config.MIN_WORKSPACE_SCROLL_THRESHOLD, app_config.MAX_WORKSPACE_SCROLL_THRESHOLD);
+        layout.scroll_mode_override = layout.effectiveScrollMode(self.app_config.workspace_scroll_mode);
+        layout.scroll_threshold_override = next;
+        self.settings_controller.draft.workspace_scroll_override_enabled = true;
+        self.settings_controller.draft.workspace_scroll_threshold = next;
+        self.markDirty();
     }
 
     /// Sets Local as the explicit default for future drafts without changing
@@ -5386,7 +5493,7 @@ pub const AppState = struct {
             self.rename_project_index != null or
             self.transcriptSelectionBuffer() != null or
             self.thread_import_provider != null or
-            self.handoff_controller.modal_open or
+            self.handoff_controller.sheet_open or
             self.project_controller.show_creator or
             self.settings_controller.modal_visible or
             self.workspaceSettingsOpen() or
@@ -5546,6 +5653,7 @@ pub const AppState = struct {
     pub const refreshClaudeReasoningMenu = provider_controller.refreshClaudeReasoningMenu;
     pub const refreshPiReasoningMenu = provider_controller.refreshPiReasoningMenu;
     pub const refreshGrokReasoningMenu = provider_controller.refreshGrokReasoningMenu;
+    pub const refreshMuseReasoningMenu = provider_controller.refreshMuseReasoningMenu;
     pub const cursorModelOptionForRef = provider_controller.cursorModelOptionForRef;
     pub const claudeModelOptionForRef = provider_controller.claudeModelOptionForRef;
     pub const cursorModelParamsJsonAlloc = provider_controller.cursorModelParamsJsonAlloc;
@@ -6153,6 +6261,7 @@ pub const AppState = struct {
                     .cwd = project.path,
                 },
             },
+            .muse => ai_harness.ProviderConfig{ .muse = .{ .cwd = project.path } },
             .cursor, .fx, .grok => return self.setThreadImportNotice(importThreadFailureMessage(provider, error.UnsupportedOperation)),
         };
 
@@ -6332,6 +6441,7 @@ pub const AppState = struct {
                     .cwd = project.path,
                 },
             },
+            .muse => ai_harness.ProviderConfig{ .muse = .{ .cwd = project.path } },
             .cursor, .fx, .grok => return self.setThreadImportNotice(importThreadFailureMessage(provider, error.UnsupportedOperation)),
         };
 
@@ -6433,6 +6543,7 @@ pub const AppState = struct {
                     .cwd = project.path,
                 },
             },
+            .muse => ai_harness.ProviderConfig{ .muse = .{ .cwd = project.path } },
             .cursor, .fx, .grok => {
                 self.setSidebarNotice(syncThreadFailureMessage(provider, error.UnsupportedOperation));
                 return;
@@ -6900,6 +7011,9 @@ pub const AppState = struct {
                 .grok => if (parseReasoningEffort(raw)) |effort| {
                     reasoning_effort = effort;
                 },
+                .muse => if (parseReasoningEffort(raw)) |effort| {
+                    reasoning_effort = effort;
+                },
             }
         }
         const owned_variant = if (variant_value) |value| try self.allocator.dupeZ(u8, value) else null;
@@ -7077,6 +7191,10 @@ pub const AppState = struct {
     pub const syncSettingsDraftFromConfig = settings_controller.syncSettingsDraftFromConfig;
     pub const isSettingsDraftDirty = settings_controller.isSettingsDraftDirty;
     pub const openSettingsModal = settings_controller.openSettingsModal;
+    pub const openSettingsToCategory = settings_controller.openSettingsToCategory;
+    pub const selectSettingsCategory = settings_controller.selectSettingsCategory;
+    pub const commitSettingsPreference = settings_controller.commitSettingsPreference;
+    pub const closeSettingsPanel = settings_controller.closeSettingsPanel;
     pub const openRuntimeConnectionWizard = runtime_connections_controller.openRuntimeConnectionWizard;
     pub const openRuntimeConnectionEditor = runtime_connections_controller.openRuntimeConnectionEditor;
     pub const openRuntimePairing = runtime_connections_controller.openRuntimePairing;
@@ -7225,6 +7343,10 @@ pub const AppState = struct {
     pub const setHandoffTargetProvider = handoff_controller.setHandoffTargetProvider;
     pub const setHandoffUseExisting = handoff_controller.setHandoffUseExisting;
     pub const cycleHandoffExistingTarget = handoff_controller.cycleHandoffExistingTarget;
+    pub const selectHandoffExistingTarget = handoff_controller.selectHandoffExistingTarget;
+    pub const handoffCompatibleTargetThreadAt = handoff_controller.handoffCompatibleTargetThreadAt;
+    pub const setHandoffMenu = handoff_controller.setHandoffMenu;
+    pub const toggleHandoffPreview = handoff_controller.toggleHandoffPreview;
     pub const handoffExistingTargetLabel = handoff_controller.handoffExistingTargetLabel;
     pub const setHandoffContextMode = handoff_controller.setHandoffContextMode;
     pub const handoffPreviewText = handoff_controller.handoffPreviewText;
@@ -8393,6 +8515,10 @@ pub const AppState = struct {
             cached.deinit();
             self.grok_logo_texture = null;
         }
+        if (self.muse_logo_texture) |cached| {
+            cached.deinit();
+            self.muse_logo_texture = null;
+        }
         if (self.thread_edit_texture) |cached| {
             cached.deinit();
             self.thread_edit_texture = null;
@@ -8630,6 +8756,7 @@ pub const AppState = struct {
             .pi => self.pi_logo_texture,
             .fx => self.fx_logo_texture,
             .grok => self.grok_logo_texture,
+            .muse => self.muse_logo_texture,
         };
     }
 
@@ -8734,6 +8861,10 @@ pub const AppState = struct {
             .grok => return .{
                 .index = composerReasoningIndexForOptions(GROK_REASONING_OPTIONS[0..], thread.reasoning_effort) orelse 0,
                 .count = GROK_REASONING_OPTIONS.len,
+            },
+            .muse => return .{
+                .index = composerReasoningIndexForOptions(MUSE_REASONING_OPTIONS[0..], thread.reasoning_effort) orelse 0,
+                .count = MUSE_REASONING_OPTIONS.len,
             },
         }
     }
@@ -9668,6 +9799,9 @@ pub const AppState = struct {
 
         for (self.project_controller.projects.items[project_index].managed_processes.items) |*process| {
             if (process.explicit_stop) continue;
+            if (process.status == .running and process.provider == .muse and process.notify) {
+                self.pollMuseManagedProcess(project_index, process, now);
+            }
             if (process.watch.items.len > 0 and process.status == .running) {
                 self.pollManagedProcessWatch(project_index, process, now);
             }
@@ -9698,6 +9832,67 @@ pub const AppState = struct {
             _ = self.startManagedProcessWithFocus(project_index, name, .preserve) catch |err| {
                 log.warn("failed to auto-restart managed process {s}: {s}", .{ name, @errorName(err) });
                 continue;
+            };
+        }
+    }
+
+    fn pollMuseManagedProcess(self: *AppState, project_index: usize, process: *ManagedProcess, now_ms: i64) void {
+        const dock_id = process.dock_id orelse return;
+        const dock = self.projectTerminalDock(project_index, dock_id) orelse return;
+        const runtime_process = dock.activeRuntimeProcessSnapshot() orelse return;
+        const pid = runtime_process.process_group orelse runtime_process.pid orelse return;
+        const project = &self.project_controller.projects.items[project_index];
+        const started_at_ms = if (process.last_start_ms != 0) process.last_start_ms else runtime_process.started_at_ms;
+        const batch = muse_tui.poll(
+            self.allocator,
+            &process.muse_tracker,
+            pid,
+            project.path,
+            started_at_ms,
+            now_ms,
+        ) catch |err| {
+            log.debug("could not poll Muse TUI lifecycle log: {s}", .{@errorName(err)});
+            return;
+        };
+        if (batch.len == 0) return;
+        const verde_session_id = dock.activeSessionId() orelse return;
+        for (batch.slice()) |event| {
+            const title = process.muse_tracker.title orelse "Muse";
+            const status: ?SurfaceStatus = switch (event) {
+                .title_changed => null,
+                .working => .working,
+                .done, .cancelled => .done,
+                .failed => .@"error",
+            };
+            const event_title: ?[]const u8 = switch (event) {
+                .title_changed => null,
+                .working => "Muse working",
+                .done => "Muse finished",
+                .cancelled => "Muse stopped",
+                .failed => "Muse failed",
+            };
+            const event_body: ?[]const u8 = switch (event) {
+                .title_changed => null,
+                .working => "Muse started a turn.",
+                .done => "Muse completed the turn.",
+                .cancelled => "Muse cancelled the turn.",
+                .failed => "Muse turn failed.",
+            };
+            _ = self.updateSurface(.{
+                .session_id = verde_session_id,
+                .workspace_id = project.id,
+                .workspace_path = project.path,
+                .dock_id = dock_id,
+                .pane_id = process.pane_id,
+                .provider = .muse,
+                .provider_thread_id = process.muse_tracker.session_id,
+                .title = title,
+                .status = status,
+                .attention = event == .done or event == .cancelled or event == .failed,
+                .last_event_title = event_title,
+                .last_event_body = event_body,
+            }) catch |err| {
+                log.warn("could not project Muse TUI lifecycle event: {s}", .{@errorName(err)});
             };
         }
     }
@@ -9746,6 +9941,7 @@ pub const AppState = struct {
         process.exit_code = null;
         process.signal = null;
         process.last_start_ms = unixTimestampMs();
+        process.muse_tracker.reset(self.allocator);
         process.last_exit_ms = 0;
         process.next_restart_ms = 0;
         process.pending_watch_restart_ms = 0;
@@ -9847,6 +10043,7 @@ pub const AppState = struct {
         process.exit_code = null;
         process.signal = null;
         process.last_start_ms = unixTimestampMs();
+        process.muse_tracker.reset(self.allocator);
         process.last_exit_ms = 0;
         process.next_restart_ms = 0;
         process.pending_watch_restart_ms = 0;
@@ -9908,6 +10105,7 @@ pub const AppState = struct {
             .amp => provider_hooks.ensureAmpGlobalHooks(self.allocator) catch |err| {
                 log.warn("could not install Amp global status plugin: {s}", .{@errorName(err)});
             },
+            .muse => {},
             .other => {},
         }
     }
@@ -10058,6 +10256,7 @@ pub const AppState = struct {
             .cursor => .cursor,
             .grok => .grok,
             .amp => .amp,
+            .muse => .muse,
             .other => null,
         };
     }
@@ -12304,21 +12503,10 @@ pub const AppState = struct {
                 .thread_import_select,
                 .handoff_cancel,
                 .handoff_prepare,
-                .handoff_surface_gui,
-                .handoff_surface_tui,
-                .handoff_provider_codex,
-                .handoff_provider_opencode,
-                .handoff_provider_claude,
-                .handoff_provider_cursor,
-                .handoff_provider_pi,
-                .handoff_provider_fx,
-                .handoff_provider_grok,
-                .handoff_context_summary,
-                .handoff_context_recent,
-                .handoff_context_full,
-                .handoff_target_new,
-                .handoff_target_existing,
-                .handoff_target_next,
+                .handoff_menu_toggle,
+                .handoff_menu_option,
+                .handoff_menu_close,
+                .handoff_preview_toggle,
                 .project_import_browse,
                 .project_import_submit,
                 .project_import_create_dir,
@@ -12335,6 +12523,8 @@ pub const AppState = struct {
                 .runtime_wizard_method,
                 .runtime_wizard_select,
                 .settings_control,
+                .settings_category,
+                .settings_open_option,
                 .settings_runtime_action,
                 .settings_theme_option,
                 .settings_title_provider_option,
@@ -12346,6 +12536,10 @@ pub const AppState = struct {
                 .workspace_settings_close,
                 .workspace_settings_option,
                 .workspace_settings_manage,
+                .workspace_settings_scroll_scope,
+                .workspace_settings_scroll_mode,
+                .workspace_settings_scroll_threshold_dec,
+                .workspace_settings_scroll_threshold_inc,
                 .settings_cancel,
                 .settings_save,
                 .command_palette_row,
@@ -13198,7 +13392,7 @@ pub const AppState = struct {
             return composerReasoningIndexForOptions(codexReasoningOptions(thread.model_ref), thread.reasoning_effort);
         }
         // Claude, Pi, and Grok rows carry effort tag names as variants.
-        if (thread.provider == .claude or thread.provider == .pi or thread.provider == .grok) {
+        if (thread.provider == .claude or thread.provider == .pi or thread.provider == .grok or thread.provider == .muse) {
             const rows = self.opencode_reasoning_menu.items;
             for (rows, 0..) |row, i| {
                 if (thread.reasoning_effort == null and row.variant == null) return i;
@@ -13719,7 +13913,11 @@ pub const AppState = struct {
         if (self.change_cursor_loop.shutdown.load(.acquire)) return;
         if (self.change_cursor_loop.takeRefresh()) |refresh| {
             defer refresh.deinit();
-            self.applyDaemonProjectionRefreshWithDurable(refresh.result, refresh.durable.?.value) catch |err| {
+            const apply_result = if (refresh.durable) |durable|
+                self.applyDaemonProjectionRefreshWithDurable(refresh.result, durable.value)
+            else
+                self.applyDaemonVolatileProjectionRefresh(refresh.result, refresh.seed_store_revision.?);
+            apply_result catch |err| {
                 self.change_cursor_loop.noteProjectionRefreshApplyFailure(refresh, err);
                 // The cursor is deliberately still old: the worker will
                 // re-read this dirty range on its next iteration.
@@ -13732,6 +13930,36 @@ pub const AppState = struct {
         const signals = self.change_cursor_loop.take();
         self.pollDaemonProjectionStaleness();
         if (signals.registry or signals.resync) self.terminal_controller.poll_requested = true;
+    }
+
+    /// Apply registry/session/turn changes without reconstructing the durable
+    /// workspace and thread tree. Full projection swaps remain the recovery
+    /// path for store-backed entries, cursor expiry, and daemon replacement.
+    fn applyDaemonVolatileProjectionRefresh(
+        self: *AppState,
+        result: headless.store.CoreSnapshotResult,
+        seed_store_revision: u64,
+    ) !void {
+        const envelope = result.envelope orelse return error.MissingProjectionEnvelope;
+        const cursor = result.change_cursor orelse return error.MissingProjectionCursor;
+        const prepared_seed = try self.storage.prepareCompositeSnapshotSeed(envelope, cursor, seed_store_revision);
+        var seed_owned = true;
+        errdefer if (seed_owned) self.storage.discardPreparedCompositeSnapshotSeed(prepared_seed);
+
+        var staged_sessions = try terminal_controller.buildDaemonSessionProjection(self.allocator, result.sessions);
+        var sessions_owned = true;
+        errdefer if (sessions_owned) terminal_controller.deinitDaemonSessionProjection(self.allocator, &staged_sessions);
+        try self.applyDaemonRegistryProjection(result.processes, result.leases);
+        try self.applyDaemonSessionProjection(result.sessions);
+        try self.applyDaemonChatTurnsSnapshot(result.turns);
+
+        var old_sessions = self.terminal_controller.daemon_sessions;
+        self.terminal_controller.daemon_sessions = staged_sessions;
+        sessions_owned = false;
+        terminal_controller.deinitDaemonSessionProjection(self.allocator, &old_sessions);
+        self.storage.commitPreparedCompositeSnapshotSeed(prepared_seed);
+        seed_owned = false;
+        self.terminal_controller.poll_requested = true;
     }
 
     pub fn applyDaemonProjectionRefresh(self: *AppState, result: headless.store.CoreSnapshotResult) !void {
@@ -15060,6 +15288,11 @@ fn importThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
             error.UnsupportedOperation => "Grok does not support thread imports yet.",
             else => "Failed to load Grok threads.",
         },
+        .muse => switch (err) {
+            error.FileNotFound => "The muse executable was not found on PATH.",
+            error.MuseSignedOut => "Muse is not authenticated. Run `muse login`.",
+            else => "Failed to load Muse threads.",
+        },
     };
 }
 
@@ -15116,6 +15349,11 @@ fn readThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
             error.MissingSessionId => "The selected Grok thread could not be found.",
             error.UnsupportedOperation => "Grok does not support thread imports yet.",
             else => "Failed to import the selected Grok thread.",
+        },
+        .muse => switch (err) {
+            error.FileNotFound => "The muse executable was not found on PATH.",
+            error.MuseSignedOut => "Muse is not authenticated. Run `muse login`.",
+            else => "Failed to import the selected Muse thread.",
         },
     };
 }
@@ -15218,6 +15456,11 @@ fn syncThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
             error.UnsupportedOperation => "Grok does not support thread sync yet.",
             else => "Failed to sync the Grok thread.",
         },
+        .muse => switch (err) {
+            error.FileNotFound => "The muse executable was not found on PATH.",
+            error.MuseSignedOut => "Muse is not authenticated. Run `muse login`.",
+            else => "Failed to sync the Muse thread.",
+        },
     };
 }
 
@@ -15230,6 +15473,7 @@ fn failedToStoreThreadListNotice(provider: Provider) []const u8 {
         .pi => "Failed to store Pi thread list.",
         .fx => "Failed to store FX thread list.",
         .grok => "Failed to store Grok thread list.",
+        .muse => "Failed to store Muse thread list.",
     };
 }
 
@@ -15242,6 +15486,7 @@ fn noRecentThreadsNotice(provider: Provider) []const u8 {
         .pi => "No recent Pi threads found.",
         .fx => "No recent FX threads found.",
         .grok => "No recent Grok threads found.",
+        .muse => "No recent Muse threads found.",
     };
 }
 
@@ -15254,6 +15499,7 @@ fn selectThreadNotice(provider: Provider) []const u8 {
         .pi => "Select a Pi thread or paste a thread ID.",
         .fx => "Select an FX thread or paste a thread ID.",
         .grok => "Select a Grok thread or paste a thread ID.",
+        .muse => "Select a Muse thread or paste a thread ID.",
     };
 }
 
@@ -15266,6 +15512,7 @@ fn emptyThreadImportIdNotice(provider: Provider) []const u8 {
         .pi => "Enter a Pi thread ID or select one from the list.",
         .fx => "Enter an FX thread ID or select one from the list.",
         .grok => "Enter a Grok thread ID or select one from the list.",
+        .muse => "Enter a Muse thread ID or select one from the list.",
     };
 }
 
@@ -15278,6 +15525,7 @@ fn duplicateThreadNotice(provider: Provider) []const u8 {
         .pi => "Pi thread already exists in this workspace.",
         .fx => "FX thread already exists in this workspace.",
         .grok => "Grok thread already exists in this workspace.",
+        .muse => "Muse thread already exists in this workspace.",
     };
 }
 
@@ -15290,6 +15538,7 @@ fn failedCreateImportedThreadNotice(provider: Provider) []const u8 {
         .pi => "Failed to create the imported thread.",
         .fx => "Failed to create the imported thread.",
         .grok => "Failed to create the imported thread.",
+        .muse => "Failed to create the imported thread.",
     };
 }
 
@@ -15302,6 +15551,7 @@ fn failedAddImportedThreadNotice(provider: Provider) []const u8 {
         .pi => "Failed to add the imported thread.",
         .fx => "Failed to add the imported thread.",
         .grok => "Failed to add the imported thread.",
+        .muse => "Failed to add the imported thread.",
     };
 }
 
@@ -15314,6 +15564,7 @@ fn threadImportedNotice(provider: Provider) []const u8 {
         .pi => "Pi thread imported.",
         .fx => "FX thread imported.",
         .grok => "Grok thread imported.",
+        .muse => "Muse thread imported.",
     };
 }
 
@@ -15326,6 +15577,7 @@ fn threadSyncedNotice(provider: Provider) []const u8 {
         .pi => "Thread synced from Pi.",
         .fx => "Thread synced from FX.",
         .grok => "Thread synced from Grok.",
+        .muse => "Thread synced from Muse.",
     };
 }
 
@@ -18855,6 +19107,20 @@ test "M5-P4 change topic mapping is total over the frozen nine-topic set" {
     }
     // Unknown future additive topics degrade to a conservative registry pull.
     try std.testing.expect(changeCursorSignalsForTopic("future.topic").registry);
+}
+
+test "registry-only change batches skip durable projection reconstruction" {
+    const registry_entries = [_]headless.changes_protocol.ChangeEntry{
+        .{ .change_seq = 1, .topic = "process", .resource_id = "build", .registry_revision = 4 },
+        .{ .change_seq = 2, .topic = "session", .resource_id = "terminal", .registry_revision = 5 },
+    };
+    try std.testing.expect(!journalBatchNeedsDurableRefresh(&registry_entries));
+
+    const mixed_entries = [_]headless.changes_protocol.ChangeEntry{
+        registry_entries[0],
+        .{ .change_seq = 3, .topic = "chat.thread", .resource_id = "thread-1", .store_revision = 9 },
+    };
+    try std.testing.expect(journalBatchNeedsDurableRefresh(&mixed_entries));
 }
 
 test "M5-P4 cursor signal bridge coalesces publishes and drains non-blocking" {

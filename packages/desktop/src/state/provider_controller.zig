@@ -23,6 +23,7 @@ const DEFAULT_CURSOR_MODEL = provider_models.DEFAULT_CURSOR_MODEL;
 const DEFAULT_PI_MODEL = provider_models.DEFAULT_PI_MODEL;
 const DEFAULT_FX_MODEL = provider_models.DEFAULT_FX_MODEL;
 const DEFAULT_GROK_MODEL = provider_models.DEFAULT_GROK_MODEL;
+const DEFAULT_MUSE_MODEL = provider_models.DEFAULT_MUSE_MODEL;
 const OPENCODE_MODEL_OPTIONS = provider_models.OPENCODE_MODEL_OPTIONS;
 const PI_MODEL_OPTIONS = provider_models.PI_MODEL_OPTIONS;
 const FX_MODEL_OPTIONS = provider_models.FX_MODEL_OPTIONS;
@@ -106,6 +107,7 @@ pub const ProviderReadinessSnapshot = struct {
     pi: ProviderReadiness = .checking,
     fx: ProviderReadiness = .checking,
     grok: ProviderReadiness = .checking,
+    muse: ProviderReadiness = .checking,
 
     pub fn forProvider(self: ProviderReadinessSnapshot, provider: Provider) ProviderReadiness {
         return switch (provider) {
@@ -116,11 +118,12 @@ pub const ProviderReadinessSnapshot = struct {
             .pi => self.pi,
             .fx => self.fx,
             .grok => self.grok,
+            .muse => self.muse,
         };
     }
 
     pub fn hasReadyProvider(self: ProviderReadinessSnapshot) bool {
-        return self.codex == .ready or self.opencode == .ready or self.claude == .ready or self.cursor == .ready or self.pi == .ready or self.fx == .ready or self.grok == .ready;
+        return self.codex == .ready or self.opencode == .ready or self.claude == .ready or self.cursor == .ready or self.pi == .ready or self.fx == .ready or self.grok == .ready or self.muse == .ready;
     }
 };
 
@@ -233,6 +236,7 @@ pub fn providerReadinessWorker(state: *ProviderReadinessState) void {
         .pi = detectProviderReadiness(.pi),
         .fx = detectProviderReadiness(.fx),
         .grok = detectProviderReadiness(.grok),
+        .muse = detectProviderReadiness(.muse),
     };
 
     state.mutex.lock();
@@ -382,6 +386,7 @@ pub fn cachedDefaultModelRefForProvider(self: anytype, provider: Provider) [:0]c
         .pi => DEFAULT_PI_MODEL,
         .fx => DEFAULT_FX_MODEL,
         .grok => DEFAULT_GROK_MODEL,
+        .muse => DEFAULT_MUSE_MODEL,
         .opencode => blk: {
             for (self.opencodeModelOptionsSnapshot()) |option| {
                 if (option.value) |value| break :blk value;
@@ -929,6 +934,7 @@ pub fn refreshOpencodeReasoningMenu(self: anytype, thread: *const ChatThread) !v
     if (thread.provider == .claude) return self.refreshClaudeReasoningMenu(thread);
     if (thread.provider == .pi) return self.refreshPiReasoningMenu();
     if (thread.provider == .grok) return self.refreshGrokReasoningMenu();
+    if (thread.provider == .muse) return self.refreshMuseReasoningMenu();
     if (thread.provider != .opencode) return;
     const opt = self.opencodeModelOptionForRef(thread.model_ref) orelse return;
     if (!opt.reasoning_supported) return;
@@ -977,6 +983,15 @@ pub fn refreshPiReasoningMenu(self: anytype) !void {
 /// effort tag names as row variants (parsed back by the shared handler).
 pub fn refreshGrokReasoningMenu(self: anytype) !void {
     for (provider_models.GROK_REASONING_OPTIONS) |option| {
+        const label = try self.allocator.dupeZ(u8, option.label);
+        errdefer self.allocator.free(label);
+        const variant: ?[:0]u8 = if (option.value) |value| try self.allocator.dupeZ(u8, @tagName(value)) else null;
+        try self.opencode_reasoning_menu.append(self.allocator, .{ .label = label, .variant = variant });
+    }
+}
+
+pub fn refreshMuseReasoningMenu(self: anytype) !void {
+    for (provider_models.MUSE_REASONING_OPTIONS) |option| {
         const label = try self.allocator.dupeZ(u8, option.label);
         errdefer self.allocator.free(label);
         const variant: ?[:0]u8 = if (option.value) |value| try self.allocator.dupeZ(u8, @tagName(value)) else null;

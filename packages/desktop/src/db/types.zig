@@ -51,7 +51,7 @@ fn storedAssistantAuthor(author: []const u8) bool {
     // Every provider label emitted by transcript_apply.providerLabel must be
     // listed here, or the daemon decodes its assistant rows as system rows and
     // GUI identity adoption never matches the streamed reply.
-    inline for (.{ "Assistant", "Agent", "OpenCode", "Codex", "Claude", "Cursor", "Pi", "FX", "Grok", "Sprout", "Moss", "Vireo" }) |known| {
+    inline for (.{ "Assistant", "Agent", "OpenCode", "Codex", "Claude", "Cursor", "Pi", "FX", "Grok", "Muse", "Sprout", "Moss", "Vireo" }) |known| {
         if (std.ascii.eqlIgnoreCase(author, known)) return true;
     }
     return false;
@@ -111,6 +111,7 @@ pub const Provider = enum(u8) {
     pi = 4,
     fx = 5,
     grok = 6,
+    muse = 7,
 };
 
 /// Provider identity attached to terminal surface activity. This stays
@@ -124,6 +125,7 @@ pub const SurfaceProvider = enum(u8) {
     amp = 5,
     pi = 6,
     fx = 7,
+    muse = 8,
 };
 
 pub const SurfaceStatus = enum(u8) {

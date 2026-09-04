@@ -15,6 +15,14 @@ run = "bash -lc 'bash scripts/dev/check-desktop-build-deps.sh'"
 description = "Builds the desktop app."
 run = "bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && case \"$(uname -s)\" in Darwin) VERDE_APPLICATIONS_DIR=\"${VERDE_APPLICATIONS_DIR:-/Applications}\" scripts/release/install-macos-local.sh ;; Linux) zig build --release=safe -Dbrowser-backend=native_webview && scripts/dev/check-native-webview-install.sh ;; *) echo \"unsupported build host: $(uname -s)\" >&2; exit 1 ;; esac'"
 
+[tasks.dev-build]
+description = "Builds only the main desktop executable for focused local iteration."
+run = "bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && zig build dev-build --release=safe -Dbrowser-backend=native_webview'"
+
+[tasks.build-verify-install]
+description = "Rebuilds the Linux desktop into an isolated prefix and verifies the packaged runtime payload."
+run = "bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && case \"$(uname -s)\" in Linux) scripts/dev/check-native-webview-install.sh --isolated ;; *) echo \"build-verify-install is only supported on Linux\" >&2; exit 1 ;; esac'"
+
 [tasks.build-windows]
 description = "Cross-builds the Windows x86-64 GNU package from Linux/macOS."
 run = "bash scripts/dev/build-windows.sh"

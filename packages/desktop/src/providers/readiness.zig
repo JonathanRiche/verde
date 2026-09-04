@@ -28,6 +28,7 @@ pub fn detectProviderReadiness(provider: Provider) ProviderReadiness {
         .pi => process_env.commandExists("pi"),
         .fx => process_env.commandExists("fx"),
         .grok => process_env.commandExists("grok"),
+        .muse => process_env.commandExists("muse"),
     };
     if (!executable_ready) return .missing;
 
@@ -43,6 +44,7 @@ pub fn detectProviderReadiness(provider: Provider) ProviderReadiness {
         .pi => harness.ProviderConfig{ .pi = .{} },
         .fx => harness.ProviderConfig{ .fx = .{} },
         .grok => harness.ProviderConfig{ .grok = .{} },
+        .muse => harness.ProviderConfig{ .muse = .{} },
     };
     var client = harness.connect(std.heap.page_allocator, provider_config) catch |err| {
         log.warn("provider readiness connect failed provider={s}: {s}", .{ @tagName(provider), @errorName(err) });

@@ -32,6 +32,9 @@ pub const Harness = struct {
     /// any reply text, become a system event instead of assistant prose.
     diagnostic_chunk_prefix: ?[]const u8 = null,
     diagnostic_event_title: []const u8 = "Agent warning",
+    /// Replaces a provider-specific error emitted as assistant prose with a
+    /// user-facing explanation. Returning null preserves ordinary text.
+    agent_error_message: ?*const fn ([]const u8) ?[]const u8 = null,
 };
 
 const Mutex = struct {
@@ -194,6 +197,7 @@ pub const SendPromptState = struct {
     session_id: ?[]u8 = null,
     prompt_submitted: bool = false,
     reply: std.ArrayList(u8) = .empty,
+    agent_error_emitted: bool = false,
 
     pub fn deinit(self: *SendPromptState, allocator: std.mem.Allocator) void {
         if (self.session_id) |session_id| allocator.free(session_id);
@@ -624,6 +628,18 @@ fn handleReadSessionUpdate(
     else
         return;
     const text = contentText(update) orelse return;
+    if (role == .assistant) {
+        if (harness.agent_error_message) |agent_error_message| {
+            if (agent_error_message(text)) |message| {
+                if (state.messages.items.len > 0) {
+                    const previous = state.messages.items[state.messages.items.len - 1];
+                    if (previous.role == .assistant and std.mem.eql(u8, previous.body, message)) return;
+                }
+                try appendChatMessageChunk(allocator, harness, &state.messages, role, message);
+                return;
+            }
+        }
+    }
     try appendChatMessageChunk(allocator, harness, &state.messages, role, text);
 }
 
@@ -639,6 +655,17 @@ fn handleLiveSessionUpdate(
     if (std.mem.eql(u8, kind, "agent_message_chunk")) {
         const text = contentText(update) orelse return;
         if (text.len == 0) return;
+        if (harness.agent_error_message) |agent_error_message| {
+            if (agent_error_message(text)) |message| {
+                if (state.agent_error_emitted) return;
+                state.agent_error_emitted = true;
+                try state.reply.appendSlice(allocator, message);
+                if (request.on_stream_delta) |on_stream_delta| {
+                    on_stream_delta(request.stream_context, message);
+                }
+                return;
+            }
+        }
         if (harness.diagnostic_chunk_prefix) |prefix| {
             if (state.reply.items.len == 0 and std.mem.startsWith(u8, text, prefix)) {
                 if (request.on_stream_event) |on_stream_event| {
@@ -1392,6 +1419,17 @@ const TEST_HARNESS: Harness = .{
     .permission_default_title = "Permission request",
 };
 
+fn testAgentErrorMessage(text: []const u8) ?[]const u8 {
+    return if (std.mem.indexOf(u8, text, "provider busy") != null) "Friendly provider message" else null;
+}
+
+const ERROR_TEST_HARNESS: Harness = .{
+    .diagnostics_category = .cursor_acp,
+    .assistant_author = "Assistant",
+    .permission_default_title = "Permission request",
+    .agent_error_message = testAgentErrorMessage,
+};
+
 const TestDiffCapture = struct {
     count: usize = 0,
     path: ?[]const u8 = null,
@@ -1520,6 +1558,29 @@ test "handleReadSessionUpdate combines consecutive role chunks" {
     try std.testing.expectEqual(@as(usize, 1), state.messages.items.len);
     try std.testing.expectEqualStrings("hello", state.messages.items[0].body);
     try std.testing.expectEqualStrings("Assistant", state.messages.items[0].author);
+}
+
+test "agent prose errors are rewritten and duplicate retries are suppressed" {
+    const payload =
+        \\{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Error: provider busy"}}}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+
+    var history: ReadThreadState = .{};
+    defer history.deinit(std.testing.allocator);
+    try handleReadSessionUpdate(std.testing.allocator, ERROR_TEST_HARNESS, parsed.value, &history);
+    try handleReadSessionUpdate(std.testing.allocator, ERROR_TEST_HARNESS, parsed.value, &history);
+    try std.testing.expectEqual(@as(usize, 1), history.messages.items.len);
+    try std.testing.expectEqualStrings("Friendly provider message", history.messages.items[0].body);
+
+    var live: SendPromptState = .{ .prompt_submitted = true };
+    defer live.deinit(std.testing.allocator);
+    const request: provider_types.SendPromptRequest = .{ .prompt = "hello" };
+    _ = try handleSendPromptLine(std.testing.allocator, ERROR_TEST_HARNESS, payload, request, &live, null);
+    _ = try handleSendPromptLine(std.testing.allocator, ERROR_TEST_HARNESS, payload, request, &live, null);
+    try std.testing.expect(live.agent_error_emitted);
+    try std.testing.expectEqualStrings("Friendly provider message", live.reply.items);
 }
 
 test "ACP tool updates emit structured diff snapshots" {

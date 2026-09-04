@@ -322,6 +322,23 @@ fn flushWorkerMain(args: *FlushWorkerArgs) void {
         return;
     };
 
+    if (args.selected_project_index) |selected_project_index| {
+        args.storage.setAppStateCaptured(
+            selected_project_index,
+            args.loaded.?.value.sidebar_collapsed,
+            args.observed_revision,
+        ) catch |err| {
+            args.result.conflict = err == error.StoreRevisionConflict;
+            args.result.rejected = err == error.StoreMutationRejected;
+            args.result.done.store(true, .release);
+            return;
+        };
+        args.result.acknowledged_revision = args.storage.currentProjectionObservedRevision();
+        args.result.success = true;
+        args.result.done.store(true, .release);
+        return;
+    }
+
     const fits_transport = args.storage.stateFitsSnapshotTransport(args.loaded.?.value) catch false;
     if (!fits_transport) {
         args.result.spooled = spoolFlushWorkerPayload(args);

@@ -18,6 +18,7 @@ pub const DEFAULT_CURSOR_MODEL: [:0]const u8 = "composer-2.5";
 pub const DEFAULT_PI_MODEL: [:0]const u8 = "default";
 pub const DEFAULT_FX_MODEL: [:0]const u8 = "default";
 pub const DEFAULT_GROK_MODEL: [:0]const u8 = "default";
+pub const DEFAULT_MUSE_MODEL: [:0]const u8 = "default";
 
 pub const ModelOption = struct {
     label: [:0]const u8,
@@ -205,6 +206,12 @@ pub const GROK_MODEL_OPTIONS = [_]ModelOption{
     .{ .label = "Grok 4.5", .value = "grok-4.5", .reasoning_supported = true },
 };
 
+/// Static fallback until Muse's `model/list` MSP response is available.
+pub const MUSE_MODEL_OPTIONS = [_]ModelOption{
+    .{ .label = "Default (Muse config)", .value = DEFAULT_MUSE_MODEL, .reasoning_supported = true },
+    .{ .label = "Muse Spark 1.3 Contributor", .value = "muse-spark-1.3-contributor", .reasoning_supported = true },
+};
+
 pub const PI_REASONING_OPTIONS = [_]ReasoningOption{
     .{ .label = "Default", .value = null },
     .{ .label = "Low", .value = .low },
@@ -222,6 +229,17 @@ pub const GROK_REASONING_OPTIONS = [_]ReasoningOption{
     .{ .label = "Medium", .value = .medium },
     .{ .label = "High", .value = .high },
     .{ .label = "Xhigh", .value = .xhigh },
+};
+
+/// Muse calls its highest protocol tier `ultra`; Verde persists the existing
+/// `max` enum value and the Muse transport maps that value to `ultra`.
+pub const MUSE_REASONING_OPTIONS = [_]ReasoningOption{
+    .{ .label = "Default", .value = null },
+    .{ .label = "Low", .value = .low },
+    .{ .label = "Medium", .value = .medium },
+    .{ .label = "High", .value = .high },
+    .{ .label = "Xhigh", .value = .xhigh },
+    .{ .label = "Ultra", .value = .max },
 };
 
 pub const CODEX_REASONING_OPTIONS = [_]ReasoningOption{

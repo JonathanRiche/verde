@@ -2179,6 +2179,7 @@ fn nativeProviderLabel(provider: provider_models.Provider) []const u8 {
         .pi => "Pi",
         .fx => "FX",
         .grok => "Grok",
+        .muse => "Muse",
     };
 }
 
@@ -2187,10 +2188,11 @@ fn nativeProviderLoginCommand(provider: provider_models.Provider) []const []cons
         .codex => &.{ "codex", "login" },
         .claude => &.{"claude"},
         .cursor => &.{ "agent", "login" },
-        .opencode => &.{ "opencode", "auth", "login" },
+        .opencode => &.{ "opencode2", "auth", "login" },
         .pi => &.{"pi"},
         .fx => &.{ "fx", "login" },
         .grok => &.{ "grok", "login" },
+        .muse => &.{ "muse", "login" },
     };
 }
 
@@ -2199,10 +2201,11 @@ fn nativeProviderInstalled(provider: provider_models.Provider) bool {
         .codex => process_env.commandExists("codex"),
         .claude => process_env.commandExists("node") and process_env.commandExists("claude"),
         .cursor => process_env.commandExists("agent") or process_env.commandExists("cursor-agent"),
-        .opencode => process_env.commandExists("opencode"),
+        .opencode => process_env.commandExists("opencode2"),
         .pi => process_env.commandExists("pi"),
         .fx => process_env.commandExists("fx"),
         .grok => process_env.commandExists("grok"),
+        .muse => process_env.commandExists("muse"),
     };
 }
 
@@ -2215,6 +2218,7 @@ fn nativeProviderFromHarness(provider: harness.Provider) provider_models.Provide
         .pi => .pi,
         .fx => .fx,
         .grok => .grok,
+        .muse => .muse,
     };
 }
 
@@ -2240,7 +2244,10 @@ fn nativeProviderStatus(provider: provider_models.Provider) headless.providers_p
     return .{
         .provider = @tagName(provider),
         .label = nativeProviderLabel(provider),
-        .surfaces = PROVIDER_SURFACES_ALL,
+        .surfaces = if (provider == .muse)
+            .{ .native_chat = true, .terminal_tui = true, .lifecycle = true }
+        else
+            PROVIDER_SURFACES_ALL,
         .installed = installed,
         .state = if (installed) "unknown" else "missing",
         // Provider auth protocols are intentionally heterogeneous. Until each
@@ -3888,6 +3895,18 @@ pub const Daemon = struct {
                 break :blk null;
             };
             if (req) |value| decoded_mutation = .{ .snapshot_replace = value };
+        } else if (std.mem.eql(u8, method, store_protocol.METHOD_APP_STATE_SET)) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.AppStateSetRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_mutation = .{ .app_state_set = value };
         } else if (std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_UPSERT)) {
             const req = std.json.parseFromValueLeaky(
                 store_protocol.WorkspaceUpsertRequest,
@@ -7632,6 +7651,7 @@ pub const Daemon = struct {
             nativeProviderStatus(.pi),
             nativeProviderStatus(.fx),
             nativeProviderStatus(.grok),
+            nativeProviderStatus(.muse),
         };
         const result: headless.providers_protocol.StatusResult = .{
             .runtime_id = self.runtime_id,
@@ -8690,6 +8710,7 @@ fn sessionizerServerClosing(raw_context: *anyopaque) void {
 /// Full store mutation surface plus storeStatus (S3) and M4 durable chat reads.
 fn isStoreMethod(method: []const u8) bool {
     return std.mem.eql(u8, method, store_protocol.METHOD_STATE_SNAPSHOT_REPLACE) or
+        std.mem.eql(u8, method, store_protocol.METHOD_APP_STATE_SET) or
         std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_UPSERT) or
         std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_UPSERT) or
         std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_REMOVE) or
@@ -8790,6 +8811,7 @@ fn storeMutationCommittedHook(context: *anyopaque, mutation: *const daemon_store
             daemon.appendJournalEntryQuiet(.surface, "*", null, revision);
             daemon.signalChangesWaiters();
         },
+        .app_state_set => daemon.appendJournalEntry(.workspace, "*", null, revision),
         .workspace_upsert => |request| daemon.appendJournalEntry(.workspace, request.workspace.workspace_id, request.workspace.workspace_id, revision),
         .workspace_repository_upsert => |request| daemon.appendJournalEntry(.workspace, request.workspace_id, request.workspace_id, revision),
         .workspace_repository_remove => |request| daemon.appendJournalEntry(.workspace, request.workspace_id, request.workspace_id, revision),
@@ -8859,6 +8881,7 @@ fn storeAcceptanceCommittedHook(
 fn mutationHeader(mutation: daemon_store.Mutation) store_protocol.MutationHeader {
     return switch (mutation) {
         .snapshot_replace => |request| request.mutation,
+        .app_state_set => |request| request.mutation,
         .workspace_upsert => |request| request.mutation,
         .workspace_repository_upsert => |request| request.mutation,
         .workspace_repository_remove => |request| request.mutation,
@@ -10173,6 +10196,7 @@ fn providerNameFromCode(code: i64) []const u8 {
         4 => "pi",
         5 => "fx",
         6 => "grok",
+        7 => "muse",
         else => "opencode",
     };
 }
@@ -13550,6 +13574,7 @@ fn providerFailureReasonForError(
         error.CursorSignedOut => if (provider == .cursor) .provider_not_authenticated else null,
         error.FxSignedOut => if (provider == .fx) .provider_not_authenticated else null,
         error.GrokSignedOut => if (provider == .grok) .provider_not_authenticated else null,
+        error.MuseSignedOut => if (provider == .muse) .provider_not_authenticated else null,
         error.AcpSignedOut => switch (provider) {
             .cursor, .fx, .grok => .provider_not_authenticated,
             else => null,

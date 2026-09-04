@@ -9,7 +9,6 @@ const chat_threads = @import("../chat/threads.zig");
 const provider_hooks = @import("../providers/hooks.zig");
 const provider_mcp = @import("../providers/mcp.zig");
 const profiler = @import("../runtime/profiler.zig");
-const runtime_log = @import("../runtime/log.zig");
 const theme = @import("../ui/theme.zig");
 const utils = @import("../utils.zig");
 const provider_models = @import("provider_models.zig");
@@ -24,7 +23,7 @@ const CHAT_TITLE_PROVIDER_OPTIONS = [_]app_config.ChatTitleProvider{
     .cursor,
     .opencode,
 };
-const NEW_CHAT_PROVIDER_OPTIONS = [_]app_config.ChatProvider{ .codex, .claude, .cursor, .opencode, .pi, .fx, .grok };
+const NEW_CHAT_PROVIDER_OPTIONS = [_]app_config.ChatProvider{ .codex, .claude, .cursor, .opencode, .pi, .fx, .grok, .muse };
 const NEW_CHAT_REASONING_OPTIONS = [_]app_config.ChatReasoning{ .provider_default, .low, .medium, .high, .xhigh, .max };
 
 fn monotonicMs() i64 {
@@ -49,6 +48,7 @@ fn dbProviderForChatProvider(provider: app_config.ChatProvider) Provider {
         .pi => .pi,
         .fx => .fx,
         .grok => .grok,
+        .muse => .muse,
     };
 }
 
@@ -59,6 +59,32 @@ pub const OpenAction = enum {
     vscode,
     zed,
     custom,
+};
+
+pub const Category = enum(u8) {
+    appearance,
+    workspace,
+    chat,
+    terminal,
+    browser,
+    connections,
+    agents,
+    app,
+
+    pub const all = [_]Category{ .appearance, .workspace, .chat, .terminal, .browser, .connections, .agents, .app };
+
+    pub fn label(self: Category) []const u8 {
+        return switch (self) {
+            .appearance => "Appearance",
+            .workspace => "Workspace",
+            .chat => "Chat",
+            .terminal => "Terminal",
+            .browser => "Browser",
+            .connections => "Connections",
+            .agents => "Agents",
+            .app => "App",
+        };
+    }
 };
 
 pub const Draft = struct {
@@ -159,9 +185,12 @@ pub const State = struct {
     provider_onboarding_visible: bool = false,
     provider_onboarding_dismissed: bool = false,
     modal_visible: bool = false,
-    /// One-shot: scroll the body to the Runtimes & connections card on the
-    /// next layout pass (set by "Manage connections" in Workspace Settings).
-    scroll_to_runtimes: bool = false,
+    active_category: Category = .appearance,
+    /// Tests set this false so preference commits stay in-memory.
+    persist_to_disk: bool = true,
+    open_action_dropdown_open: bool = false,
+    open_action_hover_index: ?usize = null,
+    hover_category: ?u8 = null,
     modal_anim_progress: f32 = 0.0,
     modal_anim_last_ms: i64 = 0,
     modal_closing: bool = false,
@@ -302,15 +331,8 @@ fn applyCompanionCharacterDraft(settings: *const State, config: *app_config.AppC
 }
 
 pub fn syncSettingsDraftFromConfig(self: anytype) void {
-    var workspace_scroll_override_enabled = false;
-    var workspace_scroll_mode = self.app_config.workspace_scroll_mode;
-    var workspace_scroll_threshold = self.app_config.workspace_scroll_threshold;
-    if (self.project_controller.selected_index < self.project_controller.projects.items.len) {
-        const layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
-        workspace_scroll_override_enabled = layout.hasScrollOverride();
-        workspace_scroll_mode = layout.effectiveScrollMode(workspace_scroll_mode);
-        workspace_scroll_threshold = layout.effectiveScrollThreshold(workspace_scroll_threshold);
-    }
+    // App settings edit the global defaults. Per-workspace scroll overrides
+    // live on the workspace sheet, not in this draft.
     self.settings_controller.draft = .{
         .font_size = self.app_config.font_size,
         .terminal_font_size = self.app_config.terminal_font_size,
@@ -319,9 +341,9 @@ pub fn syncSettingsDraftFromConfig(self: anytype) void {
         .workspace_split_default_pane = self.app_config.workspace_split_default_pane,
         .workspace_new_tab_pane = self.app_config.workspace_new_tab_pane,
         .workspace_scroll_direction = self.app_config.workspace_scroll_direction,
-        .workspace_scroll_override_enabled = workspace_scroll_override_enabled,
-        .workspace_scroll_mode = workspace_scroll_mode,
-        .workspace_scroll_threshold = workspace_scroll_threshold,
+        .workspace_scroll_override_enabled = false,
+        .workspace_scroll_mode = self.app_config.workspace_scroll_mode,
+        .workspace_scroll_threshold = self.app_config.workspace_scroll_threshold,
         .unzoom_on_pane_navigation = self.app_config.unzoom_on_pane_navigation,
         .reduced_motion = self.app_config.reduced_motion,
         .workspace_tabs = self.app_config.workspace_tabs,
@@ -365,18 +387,8 @@ pub fn isSettingsDraftDirty(self: anytype) bool {
     if (draft.workspace_split_default_pane != self.app_config.workspace_split_default_pane) return true;
     if (draft.workspace_new_tab_pane != self.app_config.workspace_new_tab_pane) return true;
     if (draft.workspace_scroll_direction != self.app_config.workspace_scroll_direction) return true;
-    var workspace_scroll_override_enabled = false;
-    var workspace_scroll_mode = self.app_config.workspace_scroll_mode;
-    var workspace_scroll_threshold = self.app_config.workspace_scroll_threshold;
-    if (self.project_controller.selected_index < self.project_controller.projects.items.len) {
-        const layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
-        workspace_scroll_override_enabled = layout.hasScrollOverride();
-        workspace_scroll_mode = layout.effectiveScrollMode(workspace_scroll_mode);
-        workspace_scroll_threshold = layout.effectiveScrollThreshold(workspace_scroll_threshold);
-    }
-    if (draft.workspace_scroll_override_enabled != workspace_scroll_override_enabled) return true;
-    if (draft.workspace_scroll_mode != workspace_scroll_mode) return true;
-    if (draft.workspace_scroll_threshold != workspace_scroll_threshold) return true;
+    if (draft.workspace_scroll_mode != self.app_config.workspace_scroll_mode) return true;
+    if (draft.workspace_scroll_threshold != self.app_config.workspace_scroll_threshold) return true;
     if (draft.unzoom_on_pane_navigation != self.app_config.unzoom_on_pane_navigation) return true;
     if (draft.reduced_motion != self.app_config.reduced_motion) return true;
     if (draft.workspace_tabs != self.app_config.workspace_tabs) return true;
@@ -404,6 +416,18 @@ pub fn isSettingsDraftDirty(self: anytype) bool {
 }
 
 pub fn openSettingsModal(self: anytype) void {
+    if (self.settings_controller.modal_visible and !self.settings_controller.modal_closing) {
+        closeSettingsPanel(self);
+        return;
+    }
+    openSettingsToCategory(self, .appearance);
+}
+
+pub fn openSettingsToCategory(self: anytype, category: Category) void {
+    if (self.settings_controller.modal_visible and !self.settings_controller.modal_closing) {
+        selectSettingsCategory(self, category);
+        return;
+    }
     self.closeSidebarContextMenu();
     self.workspace_header_open_menu_open = false;
     self.workspace_header_open_menu_pane_id = null;
@@ -417,10 +441,38 @@ pub fn openSettingsModal(self: anytype) void {
     self.settings_controller.hook_opencode_installed = provider_hooks.opencodeGlobalHooksInstalled(self.allocator);
     self.settings_controller.hook_pi_installed = provider_hooks.piGlobalHooksInstalled(self.allocator);
     self.settings_controller.mcp_summary = provider_mcp.inspect(self.allocator);
+    self.settings_controller.active_category = category;
     self.settings_controller.scroll_y = 0.0;
     self.settings_controller.hover_control = null;
+    self.settings_controller.hover_category = null;
     self.settings_controller.browser_scroll_speed_drag_active = false;
     self.settings_controller.close_hovered = false;
+    closeSettingsDropdowns(self);
+    self.settings_controller.update_notes_expanded = false;
+    self.settings_controller.modal_closing = false;
+    self.settings_controller.modal_anim_progress = 0.0;
+    self.settings_controller.modal_anim_last_ms = 0;
+    self.settings_controller.modal_visible = true;
+    if (self.app_config.check_for_updates_automatically and self.settings_controller.update.status == .idle) {
+        self.settings_controller.update.start();
+    }
+    self.palette_modal_text_focus = .none;
+    self.blurPaletteComposer();
+    self.noteInteraction();
+    self.markDirty();
+}
+
+pub fn selectSettingsCategory(self: anytype, category: Category) void {
+    if (self.settings_controller.active_category != category) {
+        self.settings_controller.active_category = category;
+        self.settings_controller.scroll_y = 0.0;
+        self.settings_controller.hover_control = null;
+    }
+    closeSettingsDropdowns(self);
+    self.markDirty();
+}
+
+fn closeSettingsDropdowns(self: anytype) void {
     self.settings_controller.companion_character_dropdown_open = false;
     self.settings_controller.companion_character_hover_index = null;
     self.settings_controller.theme_dropdown_open = false;
@@ -435,18 +487,8 @@ pub fn openSettingsModal(self: anytype) void {
     self.settings_controller.new_chat_reasoning_dropdown_open = false;
     self.settings_controller.new_chat_menu_hover_index = null;
     self.settings_controller.new_chat_model_menu_scroll = 0;
-    self.settings_controller.update_notes_expanded = false;
-    self.settings_controller.modal_closing = false;
-    self.settings_controller.modal_anim_progress = 0.0;
-    self.settings_controller.modal_anim_last_ms = 0;
-    self.settings_controller.modal_visible = true;
-    if (self.app_config.check_for_updates_automatically and self.settings_controller.update.status == .idle) {
-        self.settings_controller.update.start();
-    }
-    self.palette_modal_text_focus = .none;
-    self.blurPaletteComposer();
-    self.noteInteraction();
-    self.markDirty();
+    self.settings_controller.open_action_dropdown_open = false;
+    self.settings_controller.open_action_hover_index = null;
 }
 
 /// Installs or removes Verde's user-scoped MCP registration across all
@@ -496,33 +538,22 @@ pub fn toggleGlobalMcpIntegration(self: anytype) void {
 }
 
 pub fn cancelSettingsModal(self: anytype) void {
+    closeSettingsPanel(self);
+}
+
+pub fn closeSettingsPanel(self: anytype) void {
     if (self.settings_controller.modal_closing) return;
     if (self.runtime_connections.wizard_open) self.cancelRuntimeConnectionWizard();
     beginSettingsModalClose(self);
     self.settings_controller.hover_control = null;
+    self.settings_controller.hover_category = null;
     self.settings_controller.close_hovered = false;
-    self.settings_controller.companion_character_dropdown_open = false;
-    self.settings_controller.companion_character_hover_index = null;
-    self.settings_controller.theme_dropdown_open = false;
-    self.settings_controller.theme_hover_index = null;
-    self.settings_controller.title_provider_dropdown_open = false;
-    self.settings_controller.title_model_dropdown_open = false;
-    self.settings_controller.title_menu_hover_index = null;
-    self.settings_controller.new_chat_provider_dropdown_open = false;
-    self.settings_controller.new_chat_model_dropdown_open = false;
-    self.settings_controller.new_chat_reasoning_dropdown_open = false;
-    self.settings_controller.new_chat_menu_hover_index = null;
-    self.syncSettingsDraftFromConfig();
+    closeSettingsDropdowns(self);
     self.palette_modal_text_focus = .none;
     self.markDirty();
 }
 
-pub fn saveSettingsModal(self: anytype) !void {
-    runtime_log.diagnostic("settings save begin theme={s} font={d:.2} terminal_font={d:.2}", .{
-        @tagName(self.settings_controller.draft.theme_source),
-        self.settings_controller.draft.font_size,
-        self.settings_controller.draft.terminal_font_size,
-    });
+fn applySettingsDraftToConfig(self: anytype) !void {
     try self.app_config.selectThemeChoice(self.allocator, self.settings_controller.draft.theme_choice);
     self.app_config.font_size = theme.clampf(self.settings_controller.draft.font_size, app_config.MIN_FONT_SIZE, app_config.MAX_FONT_SIZE);
     self.app_config.terminal_font_size = theme.clampf(self.settings_controller.draft.terminal_font_size, app_config.MIN_TERMINAL_FONT_SIZE, app_config.MAX_TERMINAL_FONT_SIZE);
@@ -537,15 +568,9 @@ pub fn saveSettingsModal(self: anytype) !void {
     self.app_config.reduced_motion = self.settings_controller.draft.reduced_motion;
     self.app_config.workspace_tabs = self.settings_controller.draft.workspace_tabs;
     self.app_config.companion_enabled = self.settings_controller.draft.companion_enabled;
-    self.reconcileCompanionAvailability();
     applyCompanionCharacterDraft(&self.settings_controller, &self.app_config);
-    const has_selected_workspace = self.project_controller.selected_index < self.project_controller.projects.items.len;
-    const use_workspace_scroll_override = self.settings_controller.draft.workspace_scroll_override_enabled and has_selected_workspace;
-    const workspace_scroll_threshold = std.math.clamp(self.settings_controller.draft.workspace_scroll_threshold, app_config.MIN_WORKSPACE_SCROLL_THRESHOLD, app_config.MAX_WORKSPACE_SCROLL_THRESHOLD);
-    if (!use_workspace_scroll_override) {
-        self.app_config.workspace_scroll_mode = self.settings_controller.draft.workspace_scroll_mode;
-        self.app_config.workspace_scroll_threshold = workspace_scroll_threshold;
-    }
+    self.app_config.workspace_scroll_mode = self.settings_controller.draft.workspace_scroll_mode;
+    self.app_config.workspace_scroll_threshold = std.math.clamp(self.settings_controller.draft.workspace_scroll_threshold, app_config.MIN_WORKSPACE_SCROLL_THRESHOLD, app_config.MAX_WORKSPACE_SCROLL_THRESHOLD);
     self.app_config.link_open_target = self.settings_controller.draft.link_open_target;
     self.app_config.chat_link_open_override = self.settings_controller.draft.chat_link_open_override;
     self.app_config.terminal_link_open_override = self.settings_controller.draft.terminal_link_open_override;
@@ -560,48 +585,44 @@ pub fn saveSettingsModal(self: anytype) !void {
     self.app_config.new_chat_pane_behavior = self.settings_controller.draft.new_chat_pane_behavior;
     try self.app_config.setChatTitleModel(self.allocator, self.settingsChatTitleModelRef());
     try self.app_config.setNewChatModel(self.allocator, self.settingsNewChatModelRef());
-    const previous_auto_update_check = self.app_config.check_for_updates_automatically;
-    errdefer self.app_config.check_for_updates_automatically = previous_auto_update_check;
     self.app_config.check_for_updates_automatically = self.settings_controller.draft.check_for_updates_automatically;
     self.app_config.notifications_enabled = self.settings_controller.draft.notifications_enabled;
     try applySettingsDraftOpenAction(self);
-
-    try app_config.saveAppConfig(self.allocator, &self.app_config);
-    self.app_config_file_mtime = app_config.configFileMtime(self.allocator) catch self.app_config_file_mtime;
-    if (has_selected_workspace) {
-        const layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
-        if (use_workspace_scroll_override) {
-            layout.scroll_mode_override = self.settings_controller.draft.workspace_scroll_mode;
-            layout.scroll_threshold_override = workspace_scroll_threshold;
-        } else {
-            layout.scroll_mode_override = null;
-            layout.scroll_threshold_override = null;
-        }
-    }
     if (panes_per_view_changed) {
-        // Editing the global density is an explicit request for that width;
-        // stale manual pane widths must not keep silently overriding it, and
-        // the setting has no per-workspace override, so clear every workspace.
         for (self.project_controller.projects.items) |*project| {
             project.workspace_layout.clearScrollPaneExtents();
         }
     }
+}
+
+/// Applies the in-panel draft immediately. Disk persist is skipped in tests.
+pub fn commitSettingsPreference(self: anytype) void {
+    applySettingsDraftToConfig(self) catch |err| {
+        log.warn("settings apply failed: {s}", .{@errorName(err)});
+        if (self.settings_controller.persist_to_disk) self.setSidebarNotice("Could not apply settings.");
+        self.markDirty();
+        return;
+    };
+    if (!self.settings_controller.persist_to_disk) {
+        self.markDirty();
+        return;
+    }
+    self.reconcileCompanionAvailability();
     self.applyTerminalFontSizesFromConfig();
+    app_config.saveAppConfig(self.allocator, &self.app_config) catch |err| {
+        log.warn("failed to persist settings: {s}", .{@errorName(err)});
+        self.setSidebarNotice("Preference applied, but could not save Verde settings.");
+        self.markDirty();
+        return;
+    };
+    self.app_config_file_mtime = app_config.configFileMtime(self.allocator) catch self.app_config_file_mtime;
     self.app_config_runtime_sync_pending = true;
-    if (self.runtime_connections.wizard_open) self.cancelRuntimeConnectionWizard();
-    beginSettingsModalClose(self);
-    self.settings_controller.hover_control = null;
-    self.settings_controller.close_hovered = false;
-    self.settings_controller.companion_character_dropdown_open = false;
-    self.settings_controller.companion_character_hover_index = null;
-    self.settings_controller.theme_dropdown_open = false;
-    self.settings_controller.theme_hover_index = null;
-    self.settings_controller.title_provider_dropdown_open = false;
-    self.settings_controller.title_model_dropdown_open = false;
-    self.settings_controller.title_menu_hover_index = null;
-    self.palette_modal_text_focus = .none;
     self.markDirty();
-    runtime_log.diagnostic("settings save done", .{});
+}
+
+pub fn saveSettingsModal(self: anytype) !void {
+    commitSettingsPreference(self);
+    closeSettingsPanel(self);
 }
 
 pub fn setWorkspaceScrollMode(self: anytype, mode: ?app_config.WorkspaceScrollMode) void {
@@ -709,7 +730,7 @@ pub fn selectSettingsThemeChoice(self: anytype, choice_index: usize) void {
     }
     self.settings_controller.theme_dropdown_open = false;
     self.settings_controller.theme_hover_index = null;
-    self.markDirty();
+    commitSettingsPreference(self);
 }
 
 pub fn settingsChatTitleProviderCount(self: anytype) usize {
@@ -781,7 +802,7 @@ pub fn selectSettingsChatTitleProvider(self: anytype, option_index: usize) void 
     self.settings_controller.title_provider_dropdown_open = false;
     self.settings_controller.title_menu_hover_index = null;
     self.settings_controller.title_model_menu_scroll = 0;
-    self.markDirty();
+    commitSettingsPreference(self);
 }
 
 pub fn selectSettingsChatTitleModel(self: anytype, option_index: usize) void {
@@ -791,7 +812,7 @@ pub fn selectSettingsChatTitleModel(self: anytype, option_index: usize) void {
     replaceSettingsChatTitleModel(self, model_ref) catch return;
     self.settings_controller.title_model_dropdown_open = false;
     self.settings_controller.title_menu_hover_index = null;
-    self.markDirty();
+    commitSettingsPreference(self);
 }
 
 pub fn settingsChatTitleModelRef(self: anytype) []const u8 {
@@ -809,6 +830,7 @@ fn settingsChatTitleModelOptions(self: anytype) []const ModelOption {
         self.piModelOptionsSnapshot(),
         self.fxModelOptionsSnapshot(),
         self.grokModelOptionsSnapshot(),
+        provider_models.MUSE_MODEL_OPTIONS[0..],
     );
 }
 
@@ -816,7 +838,7 @@ fn defaultChatTitleModelRef(self: anytype, provider: app_config.ChatTitleProvide
     if (provider == .codex) return app_config.DEFAULT_CHAT_TITLE_MODEL;
     return switch (dbProviderForChatTitleProvider(provider)) {
         // ChatTitleProvider deliberately excludes pi, fx, and grok.
-        .codex, .pi, .fx, .grok => unreachable,
+        .codex, .pi, .fx, .grok, .muse => unreachable,
         .opencode => self.cachedDefaultModelRefForProvider(.opencode),
         .claude => provider_models.DEFAULT_CLAUDE_MODEL,
         .cursor => provider_models.DEFAULT_CURSOR_MODEL,
@@ -852,6 +874,7 @@ pub fn settingsNewChatProviderLabel(self: anytype, option_index: usize) []const 
         .pi => "Pi",
         .fx => "FX",
         .grok => "Grok",
+        .muse => "Muse",
     };
 }
 
@@ -866,6 +889,7 @@ fn settingsNewChatModelOptions(self: anytype) []const ModelOption {
         self.piModelOptionsSnapshot(),
         self.fxModelOptionsSnapshot(),
         self.grokModelOptionsSnapshot(),
+        provider_models.MUSE_MODEL_OPTIONS[0..],
     );
 }
 
@@ -878,6 +902,7 @@ fn defaultNewChatModelRef(self: anytype, provider: app_config.ChatProvider) []co
         .pi => provider_models.DEFAULT_PI_MODEL,
         .fx => provider_models.DEFAULT_FX_MODEL,
         .grok => provider_models.DEFAULT_GROK_MODEL,
+        .muse => provider_models.DEFAULT_MUSE_MODEL,
     };
 }
 
@@ -957,6 +982,7 @@ fn settingsNewChatReasoningSupported(self: anytype, reasoning: app_config.ChatRe
         .fx => false,
         // grok accepts Verde effort tags up to xhigh (no max tier).
         .grok => reasoning.configValue().len > 0 and provider_models.parseReasoningEffort(reasoning.configValue()) != null and provider_models.parseReasoningEffort(reasoning.configValue()) != .max,
+        .muse => provider_models.parseReasoningEffort(reasoning.configValue()) != null,
         .opencode => blk: {
             if (!option.reasoning_supported) break :blk false;
             const values = option.reasoning_variant_keys orelse break :blk false;
@@ -1023,6 +1049,7 @@ pub fn selectSettingsNewChatProvider(self: anytype, option_index: usize) void {
             .pi => self.startPiModelOptionsRefresh(),
             .fx => self.startFxModelOptionsRefresh(),
             .grok => self.startGrokModelOptionsRefresh(),
+            .muse => {},
             .claude => self.startClaudeModelOptionsRefresh(),
             .cursor => self.startCursorModelOptionsRefresh(),
             .opencode => self.startOpencodeModelOptionsRefresh(),
@@ -1031,7 +1058,7 @@ pub fn selectSettingsNewChatProvider(self: anytype, option_index: usize) void {
     self.settings_controller.new_chat_provider_dropdown_open = false;
     self.settings_controller.new_chat_menu_hover_index = null;
     self.settings_controller.new_chat_model_menu_scroll = 0;
-    self.markDirty();
+    commitSettingsPreference(self);
 }
 
 pub fn selectSettingsNewChatModel(self: anytype, option_index: usize) void {
@@ -1044,7 +1071,7 @@ pub fn selectSettingsNewChatModel(self: anytype, option_index: usize) void {
     }
     self.settings_controller.new_chat_model_dropdown_open = false;
     self.settings_controller.new_chat_menu_hover_index = null;
-    self.markDirty();
+    commitSettingsPreference(self);
 }
 
 pub fn selectSettingsNewChatReasoning(self: anytype, option_index: usize) void {
@@ -1052,7 +1079,7 @@ pub fn selectSettingsNewChatReasoning(self: anytype, option_index: usize) void {
     self.settings_controller.draft.new_chat_reasoning = reasoning;
     self.settings_controller.new_chat_reasoning_dropdown_open = false;
     self.settings_controller.new_chat_menu_hover_index = null;
-    self.markDirty();
+    commitSettingsPreference(self);
 }
 
 pub fn startUpdateCheck(self: anytype) void {

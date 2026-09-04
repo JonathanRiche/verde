@@ -8,6 +8,7 @@ const stack_config = @import("../workspace/stack.zig");
 const terminal = @import("../terminal/terminal.zig");
 const chat_types = @import("chat_types.zig");
 const herdr_types = @import("herdr_types.zig");
+const muse_tui = @import("muse_tui.zig");
 const provider_models = @import("provider_models.zig");
 const workspace_layout = @import("workspace_layout.zig");
 
@@ -68,6 +69,7 @@ pub const ManagedProcess = struct {
     dock_id: ?u32 = null,
     pane_id: ?WorkspacePaneId = null,
     explicit_stop: bool = false,
+    muse_tracker: muse_tui.Tracker = .{},
 
     pub fn initFromDefinition(allocator: std.mem.Allocator, definition: stack_config.ProcessDefinition) !ManagedProcess {
         const launch = definition.launchForOs(builtin.os.tag) orelse return error.ManagedProcessUnavailableOnPlatform;
@@ -151,6 +153,7 @@ pub const ManagedProcess = struct {
         self.watch.deinit(allocator);
         for (self.resources.items) |resource| allocator.free(resource);
         self.resources.deinit(allocator);
+        self.muse_tracker.deinit(allocator);
     }
 
     pub fn resetWatchState(self: *ManagedProcess) void {

@@ -265,6 +265,7 @@ fn providerLabel(provider: []const u8) []const u8 {
     if (std.ascii.eqlIgnoreCase(provider, "pi") or std.mem.eql(u8, provider, "Pi")) return "Pi";
     if (std.ascii.eqlIgnoreCase(provider, "fx") or std.mem.eql(u8, provider, "FX")) return "FX";
     if (std.ascii.eqlIgnoreCase(provider, "grok") or std.mem.eql(u8, provider, "Grok")) return "Grok";
+    if (std.ascii.eqlIgnoreCase(provider, "muse") or std.mem.eql(u8, provider, "Muse")) return "Muse";
     return if (provider.len == 0) "System" else provider;
 }
 

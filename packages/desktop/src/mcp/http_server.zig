@@ -36,8 +36,14 @@ pub const Server = struct {
 
     pub fn deinit(self: *Server) void {
         const state = self.state;
+        const io = state.threaded.io();
         state.stopping.store(true, .release);
-        state.listener.socket.close(state.threaded.io());
+        // Closing a listening fd from another thread does not reliably wake a
+        // blocking accept on Linux. Shutdown is the std.Io cancellation path
+        // for accept, so use it before closing and joining the server thread.
+        const listener_stream: std.Io.net.Stream = .{ .socket = state.listener.socket };
+        listener_stream.shutdown(io, .both) catch {};
+        state.listener.deinit(io);
         state.thread.join();
         state.endpoint.deinit(state.allocator);
         state.allocator.free(state.pref_path);

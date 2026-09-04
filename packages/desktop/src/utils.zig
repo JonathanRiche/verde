@@ -607,7 +607,7 @@ pub fn sendWorker(state: *chat_types.SendState, request: *SendWorkerRequest) voi
                 @errorName(err),
             },
         );
-        if ((err == error.CodexTurnInterrupted or err == error.ClaudeTurnInterrupted) and state.stop_requested) {
+        if ((err == error.CodexTurnInterrupted or err == error.ClaudeTurnInterrupted or err == error.MuseTurnCancelled) and state.stop_requested) {
             state.error_message = null;
             state.result = null;
             state.status = .aborted;
@@ -1453,6 +1453,10 @@ fn formatSendWorkerError(
                 u8,
                 "The grok CLI was not found. Install Grok Build (https://docs.x.ai/build/overview#install), then run `grok login`.",
             ),
+            .muse => allocator.dupe(
+                u8,
+                "The Muse Code CLI was not found. Install it, ensure `muse` is on PATH, then run `muse login`.",
+            ),
             else => std.fmt.allocPrint(
                 allocator,
                 "{s} CLI was not found. Install it and make sure it is available on PATH for packaged app launches.",
@@ -1514,6 +1518,26 @@ fn formatSendWorkerError(
         error.GrokAcpFailed => allocator.dupe(
             u8,
             "Grok ACP request failed. Check that the grok CLI works with `grok agent stdio` from a terminal.",
+        ),
+        error.MuseSignedOut => allocator.dupe(
+            u8,
+            "Muse is not authenticated. Run `muse login` or set META_API_KEY before sending.",
+        ),
+        error.MuseUnsupportedImageType => allocator.dupe(
+            u8,
+            "Muse supports PNG, JPEG, GIF, and WebP image attachments.",
+        ),
+        error.MuseImageUnreadable => allocator.dupe(
+            u8,
+            "Muse could not read one of the attached images.",
+        ),
+        error.MuseRequestRejected => allocator.dupe(
+            u8,
+            "Muse rejected the model request. Check the Muse account/subscription and selected model.",
+        ),
+        error.MuseTurnFailed, error.MuseProtocolFailed => allocator.dupe(
+            u8,
+            "Muse request failed. Check that `muse` is authenticated and `muse serve` starts correctly.",
         ),
         else => std.fmt.allocPrint(allocator, "{s} request failed. Check the provider status and retry.", .{providerLabel(provider)}),
     };
@@ -1664,7 +1688,7 @@ pub fn serviceTierForMode(provider: provider_models.Provider, fast_mode: provide
 }
 
 pub fn sandboxModeForMode(provider: provider_models.Provider, mode: provider_models.AccessMode) ?ai_harness.SandboxMode {
-    if (provider != .codex and provider != .claude) return null;
+    if (provider != .codex and provider != .claude and provider != .muse) return null;
     return switch (mode) {
         .full_access => .danger_full_access,
         .supervised => .workspace_write,

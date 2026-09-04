@@ -28,14 +28,18 @@ Follow local style: `camelCase` functions, `snake_case` values, `PascalCase` typ
 
 Run builds from the repository root.
 
-- Use `mise run build` for normal build/install verification.
+- Use `mise run build` for normal compile/link and install verification. It is intentionally separate from tests.
+- Use `mise run dev-build` for focused main-executable iteration; it deliberately skips auxiliary executables and payload verification.
+- Use `mise run build-verify-install` only for installation, packaging, runtime-payload, or loader-path changes; it performs the intentionally expensive isolated-prefix rebuild.
 - Use `mise run dev` only for real runtime testing from a safe external shell.
 - Never use bare `zig build`; the default Debug + WPE configuration is known to fail.
 - If a lower-level build is explicitly required: `zig build --release=safe -Dbrowser-backend=native_webview`.
 
 Claude may itself be running inside a Verde terminal. In that case, never run `mise run dev*`, `zig build run`, `pkill verde`, or the generated app: doing so can kill the daemon and Claude's session. Build only and ask the user to relaunch for manual testing.
 
-During iteration, use focused tests or `zig ast-check` for quick feedback. The default Debug build is currently broken and is not an approved fast path. Before completing any Zig change, run `mise run build`.
+During iteration, use `zig ast-check`, `mise run dev-build`, or the narrowest relevant test for quick feedback. `dev-build` installs only the main desktop executable and skips the standalone daemon, browser helper, provider bridge installation, runtime-payload copying, tests, and packaging checks. It must use LLVM: Zig 0.16's self-hosted x86 backend is known to miscompile Verde and crash during startup. The default Debug build is currently broken and is not an approved fast path. Before completing any Zig change, run `mise run build`. Do not run the aggregate desktop `zig build test` for every Zig edit; reserve it for cross-cutting changes, test/build infrastructure changes, or an explicit user request. Use the focused `headless-test` or `runtime-test` build steps when they match the edited subsystem.
+
+Keep verification proportional and hermetic. The build/install graph must never depend on test execution, and the aggregate test step must not run the same tests through overlapping roots. Do not append `zig build test-compile` after `mise run build`; use it only for explicit compile-only validation of tests on a target that cannot run them. Tests may not use live provider CLIs, the user's daemon, external network, or persistent user state. Give every test-owned thread, child process, listener, and long poll deterministic cancellation and finite teardown. If a runner makes no progress for 60 seconds, inspect its named test and wait state instead of waiting indefinitely.
 
 For live CLI checks, prefer JSON and stable IDs: wait for `verde live status --json`, use `--pane <id>` and `--project current`, inspect both exit status and JSON `ok`, and close test panes. Sending chat messages creates real threads and requires judgment. Discover the CLI through `verde capabilities --json`, `verde live capabilities --json`, or shell completion.
 

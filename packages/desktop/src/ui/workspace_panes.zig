@@ -17,6 +17,7 @@ const runtime = @import("runtime.zig");
 const browser_panel = @import("browser.zig");
 const chat_panel = @import("chat_panel.zig");
 const colors = @import("colors.zig");
+const handoff_sheet = @import("handoff_sheet.zig");
 const profiler = @import("../runtime/profiler.zig");
 const terminal_panel = @import("terminal_panel.zig");
 const theme = @import("theme.zig");
@@ -2652,6 +2653,14 @@ fn renderLeafWithTranscriptLayoutWidth(state: *runtime.AppState, pane_id: runtim
     renderLeafWithin(state, pane_id, rect, null, target_width);
 }
 
+/// Returns the pane rect recorded during the most recent workspace render.
+pub fn recordedPaneRect(pane_id: runtime.WorkspacePaneId) ?palette.Rect {
+    for (pane_rects[0..pane_rect_count]) |entry| {
+        if (entry.pane_id == pane_id) return entry.rect;
+    }
+    return null;
+}
+
 fn renderLeafWithin(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, rect: palette.Rect, viewport_clip: ?palette.Rect, target_width: f32) void {
     // Workspace pane contents. Scrolling panes pass the visible workspace so
     // expensive renderers can avoid emitting commands that will be clipped.
@@ -2682,6 +2691,9 @@ fn renderLeafWithin(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, 
             browser_panel.renderDockAtWithReserve(state, rect, theme.scaledUi(BROWSER_TOOLBAR_RIGHT_RESERVE_CSS));
         },
     }
+    // Inline handoff sheet: docks over the source pane (chat or agent TUI)
+    // instead of the former window-blocking modal.
+    handoff_sheet.renderForPane(state, pane_id, rect);
     renderInactivePaneFade(state, pane_id, rect);
     if (kind == .chat and header_h > 0.0) {
         const header_rect = palette.Rect{ .x = rect.x, .y = rect.y, .w = rect.w, .h = header_h };

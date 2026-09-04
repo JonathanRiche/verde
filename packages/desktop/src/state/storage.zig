@@ -413,6 +413,69 @@ pub const Storage = struct {
         try self.reopenReadOnly();
     }
 
+    /// Persist only shell selection state under the revision paired with the
+    /// projection from which the selection was derived.
+    pub fn setAppStateCaptured(
+        self: *const Storage,
+        selected_workspace_index: usize,
+        sidebar_collapsed: bool,
+        observed_revision: u64,
+    ) !void {
+        try self.ensureGranularMutationAllowed();
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var client_id = try self.ensureStoreClientId();
+        defer self.allocator.free(client_id);
+
+        const Payload = struct {
+            selected_workspace_index: usize,
+            sidebar_collapsed: bool,
+        };
+        const payload: Payload = .{
+            .selected_workspace_index = selected_workspace_index,
+            .sidebar_collapsed = sidebar_collapsed,
+        };
+        const call = struct {
+            fn run(
+                storage: *const Storage,
+                allocator: std.mem.Allocator,
+                id: []const u8,
+                expected: u64,
+                value: Payload,
+            ) !headless.store.WriteResult {
+                const request: headless.store.AppStateSetRequest = .{
+                    .mutation = .{
+                        .request_key = try storage.nextRequestKey(allocator, headless.store.METHOD_APP_STATE_SET),
+                        .expected_store_revision = expected,
+                        .client_id = id,
+                    },
+                    .selected_workspace_index = value.selected_workspace_index,
+                    .sidebar_collapsed = value.sidebar_collapsed,
+                };
+                return storage.callStoreMutationAllowConflict(headless.store.METHOD_APP_STATE_SET, request);
+            }
+        }.run;
+
+        const result = call(self, a, client_id, observed_revision, payload) catch |err| switch (err) {
+            error.UnknownClientId => retry: {
+                self.clearCachedClientId();
+                const retry_id = try self.ensureStoreClientId();
+                self.allocator.free(client_id);
+                client_id = retry_id;
+                break :retry try call(self, a, client_id, observed_revision, payload);
+            },
+            error.StoreRevisionConflict => {
+                _ = try self.refreshStoreRevision();
+                return error.StoreRevisionConflict;
+            },
+            else => return err,
+        };
+        self.noteStoreRevision(result.store_revision);
+        self.noteProjectionObservedRevision(result.store_revision);
+        try self.reopenReadOnly();
+    }
+
     // Phase 4 owns incremental thread writes. Phase 3 keep-alive: full snapshot
     // via `save` / `persistThreadBlocking` (lifecycle builds the full state).
     // This stub remains so accidental Client-style call sites fail loudly.

@@ -88,6 +88,8 @@ export function dynamicModelOptions(provider: string, rows: DynamicModelRow[]): 
       // Grok Build reports its catalog over ACP; every model accepts a
       // reasoning effort (low..xhigh), and `max` is not offered.
       options.push({ label, value: row.model_id, efforts: GROK_EFFORTS })
+    } else if (provider === 'muse') {
+      options.push({ label, value: row.model_id, efforts: MUSE_EFFORTS })
     } else {
       options.push({ label, value: row.model_id })
     }
@@ -182,6 +184,22 @@ const GROK_MODELS: ModelOption[] = [
   { label: 'Grok 4.5', value: 'grok-4.5', efforts: GROK_EFFORTS },
 ]
 
+/// Muse's MSP tier `ultra` is persisted as Verde's existing `max` value; the
+/// native transport converts it back to `ultra` on turn/start.
+const MUSE_EFFORTS: EffortOption[] = [
+  DEFAULT_EFFORT,
+  { label: 'Low', value: 'low' },
+  { label: 'Medium', value: 'medium' },
+  { label: 'High', value: 'high' },
+  { label: 'Xhigh', value: 'xhigh' },
+  { label: 'Ultra', value: 'max' },
+]
+
+const MUSE_MODELS: ModelOption[] = [
+  { label: 'Default (Muse config)', value: 'default', efforts: MUSE_EFFORTS },
+  { label: 'Muse Spark 1.3 Contributor', value: 'muse-spark-1.3-contributor', efforts: MUSE_EFFORTS },
+]
+
 const CURSOR_GROK_VARIANTS = ['low', 'medium', 'high']
 const CURSOR_GPT_FULL_VARIANTS = ['none', 'low', 'medium', 'high', 'xhigh', 'max']
 const CURSOR_GPT_55_VARIANTS = ['none', 'low', 'medium', 'high', 'extra-high']
@@ -224,6 +242,8 @@ export function modelOptionsFor(provider: string | null | undefined): ModelOptio
       return FX_MODELS
     case 'grok':
       return GROK_MODELS
+    case 'muse':
+      return MUSE_MODELS
     default:
       return []
   }

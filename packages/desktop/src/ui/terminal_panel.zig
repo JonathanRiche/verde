@@ -2333,9 +2333,85 @@ fn boxLinesForCodepoint(cp: u21) ?BoxLines {
     };
 }
 
+/// Small set of pairwise non-overlapping rects for one box-drawing cell.
+/// `add` subtracts every rect already in the set from the new one and keeps
+/// the fragments, so translucent (faint) glyph colors never double-blend where
+/// arms would otherwise overlap at the cell center.
+const DisjointRects = struct {
+    // A cell emits at most 8 arm rects; 4-way subtraction fragments stay well
+    // under this bound, and overflow falls back to drawing the overlap.
+    const CAPACITY = 32;
+
+    rects: [CAPACITY]palette.Rect = undefined,
+    len: usize = 0,
+
+    fn add(self: *DisjointRects, rect: palette.Rect) void {
+        if (rect.w <= 0.0 or rect.h <= 0.0) return;
+        var pending: [CAPACITY]palette.Rect = undefined;
+        var pending_len: usize = 1;
+        pending[0] = rect;
+        for (self.rects[0..self.len]) |existing| {
+            var next: [CAPACITY]palette.Rect = undefined;
+            var next_len: usize = 0;
+            for (pending[0..pending_len]) |piece| {
+                next_len += subtractRect(piece, existing, next[next_len..]);
+            }
+            pending = next;
+            pending_len = next_len;
+        }
+        for (pending[0..pending_len]) |piece| {
+            if (self.len == CAPACITY) return;
+            self.rects[self.len] = piece;
+            self.len += 1;
+        }
+    }
+
+    fn flush(self: *const DisjointRects, state: *app_state.AppState, color: palette.Color, clip: ?palette.Rect) void {
+        for (self.rects[0..self.len]) |rect| queueClippedRect(state, rect, color, clip);
+    }
+};
+
+/// Writes `a` minus `b` into `out` as up to four disjoint rects (top, bottom,
+/// left, right bands) and returns how many were written. `out` needs room for
+/// four entries; if it is shorter the remainder is dropped.
+fn subtractRect(a: palette.Rect, b: palette.Rect, out: []palette.Rect) usize {
+    const overlap = intersectRect(a, b) orelse {
+        if (out.len == 0) return 0;
+        out[0] = a;
+        return 1;
+    };
+    var count: usize = 0;
+    const a_bottom = a.y + a.h;
+    const a_right = a.x + a.w;
+    const overlap_bottom = overlap.y + overlap.h;
+    const overlap_right = overlap.x + overlap.w;
+    if (overlap.y > a.y and count < out.len) {
+        out[count] = .{ .x = a.x, .y = a.y, .w = a.w, .h = overlap.y - a.y };
+        count += 1;
+    }
+    if (overlap_bottom < a_bottom and count < out.len) {
+        out[count] = .{ .x = a.x, .y = overlap_bottom, .w = a.w, .h = a_bottom - overlap_bottom };
+        count += 1;
+    }
+    if (overlap.x > a.x and count < out.len) {
+        out[count] = .{ .x = a.x, .y = overlap.y, .w = overlap.x - a.x, .h = overlap.h };
+        count += 1;
+    }
+    if (overlap_right < a_right and count < out.len) {
+        out[count] = .{ .x = overlap_right, .y = overlap.y, .w = a_right - overlap_right, .h = overlap.h };
+        count += 1;
+    }
+    return count;
+}
+
 // Box-drawing cells use Ghostty's per-edge join rules so tee and mixed-weight glyphs preserve their direction.
+// Every arm rect passes through `DisjointRects` so no pixel is painted twice.
 fn queueBoxLines(state: *app_state.AppState, rect: palette.Rect, lines: BoxLines, color: palette.Color, clip: ?palette.Rect, light_stroke: f32) void {
     const heavy_stroke = light_stroke * 2.0;
+    // Arms share the cell center; faint glyphs are translucent, so any overlap
+    // double-blends into a brighter dot (a dotted look on long `─` rules).
+    var arms: DisjointRects = .{};
+    defer arms.flush(state, color, clip);
     const h_light_top = rect.y + @floor((rect.h - light_stroke) * 0.5);
     const h_light_bottom = h_light_top + light_stroke;
     const h_heavy_top = rect.y + @floor((rect.h - heavy_stroke) * 0.5);
@@ -2384,46 +2460,46 @@ fn queueBoxLines(state: *app_state.AppState, rect: palette.Rect, lines: BoxLines
 
     switch (lines.up) {
         .none => {},
-        .light => queueClippedRect(state, .{ .x = v_light_left, .y = rect.y, .w = light_stroke, .h = up_bottom - rect.y }, color, clip),
-        .heavy => queueClippedRect(state, .{ .x = v_heavy_left, .y = rect.y, .w = heavy_stroke, .h = up_bottom - rect.y }, color, clip),
+        .light => arms.add(.{ .x = v_light_left, .y = rect.y, .w = light_stroke, .h = up_bottom - rect.y }),
+        .heavy => arms.add(.{ .x = v_heavy_left, .y = rect.y, .w = heavy_stroke, .h = up_bottom - rect.y }),
         .double => {
             const left_bottom = if (lines.left == .double) h_light_top else up_bottom;
             const right_bottom = if (lines.right == .double) h_light_top else up_bottom;
-            queueClippedRect(state, .{ .x = v_double_left, .y = rect.y, .w = light_stroke, .h = left_bottom - rect.y }, color, clip);
-            queueClippedRect(state, .{ .x = v_light_right, .y = rect.y, .w = light_stroke, .h = right_bottom - rect.y }, color, clip);
+            arms.add(.{ .x = v_double_left, .y = rect.y, .w = light_stroke, .h = left_bottom - rect.y });
+            arms.add(.{ .x = v_light_right, .y = rect.y, .w = light_stroke, .h = right_bottom - rect.y });
         },
     }
     switch (lines.right) {
         .none => {},
-        .light => queueClippedRect(state, .{ .x = right_left, .y = h_light_top, .w = rect.x + rect.w - right_left, .h = light_stroke }, color, clip),
-        .heavy => queueClippedRect(state, .{ .x = right_left, .y = h_heavy_top, .w = rect.x + rect.w - right_left, .h = heavy_stroke }, color, clip),
+        .light => arms.add(.{ .x = right_left, .y = h_light_top, .w = rect.x + rect.w - right_left, .h = light_stroke }),
+        .heavy => arms.add(.{ .x = right_left, .y = h_heavy_top, .w = rect.x + rect.w - right_left, .h = heavy_stroke }),
         .double => {
             const top_left = if (lines.up == .double) v_light_right else right_left;
             const bottom_left = if (lines.down == .double) v_light_right else right_left;
-            queueClippedRect(state, .{ .x = top_left, .y = h_double_top, .w = rect.x + rect.w - top_left, .h = light_stroke }, color, clip);
-            queueClippedRect(state, .{ .x = bottom_left, .y = h_light_bottom, .w = rect.x + rect.w - bottom_left, .h = light_stroke }, color, clip);
+            arms.add(.{ .x = top_left, .y = h_double_top, .w = rect.x + rect.w - top_left, .h = light_stroke });
+            arms.add(.{ .x = bottom_left, .y = h_light_bottom, .w = rect.x + rect.w - bottom_left, .h = light_stroke });
         },
     }
     switch (lines.down) {
         .none => {},
-        .light => queueClippedRect(state, .{ .x = v_light_left, .y = down_top, .w = light_stroke, .h = rect.y + rect.h - down_top }, color, clip),
-        .heavy => queueClippedRect(state, .{ .x = v_heavy_left, .y = down_top, .w = heavy_stroke, .h = rect.y + rect.h - down_top }, color, clip),
+        .light => arms.add(.{ .x = v_light_left, .y = down_top, .w = light_stroke, .h = rect.y + rect.h - down_top }),
+        .heavy => arms.add(.{ .x = v_heavy_left, .y = down_top, .w = heavy_stroke, .h = rect.y + rect.h - down_top }),
         .double => {
             const left_top = if (lines.left == .double) h_light_bottom else down_top;
             const right_top = if (lines.right == .double) h_light_bottom else down_top;
-            queueClippedRect(state, .{ .x = v_double_left, .y = left_top, .w = light_stroke, .h = rect.y + rect.h - left_top }, color, clip);
-            queueClippedRect(state, .{ .x = v_light_right, .y = right_top, .w = light_stroke, .h = rect.y + rect.h - right_top }, color, clip);
+            arms.add(.{ .x = v_double_left, .y = left_top, .w = light_stroke, .h = rect.y + rect.h - left_top });
+            arms.add(.{ .x = v_light_right, .y = right_top, .w = light_stroke, .h = rect.y + rect.h - right_top });
         },
     }
     switch (lines.left) {
         .none => {},
-        .light => queueClippedRect(state, .{ .x = rect.x, .y = h_light_top, .w = left_right - rect.x, .h = light_stroke }, color, clip),
-        .heavy => queueClippedRect(state, .{ .x = rect.x, .y = h_heavy_top, .w = left_right - rect.x, .h = heavy_stroke }, color, clip),
+        .light => arms.add(.{ .x = rect.x, .y = h_light_top, .w = left_right - rect.x, .h = light_stroke }),
+        .heavy => arms.add(.{ .x = rect.x, .y = h_heavy_top, .w = left_right - rect.x, .h = heavy_stroke }),
         .double => {
             const top_right = if (lines.up == .double) v_light_left else left_right;
             const bottom_right = if (lines.down == .double) v_light_left else left_right;
-            queueClippedRect(state, .{ .x = rect.x, .y = h_double_top, .w = top_right - rect.x, .h = light_stroke }, color, clip);
-            queueClippedRect(state, .{ .x = rect.x, .y = h_light_bottom, .w = bottom_right - rect.x, .h = light_stroke }, color, clip);
+            arms.add(.{ .x = rect.x, .y = h_double_top, .w = top_right - rect.x, .h = light_stroke });
+            arms.add(.{ .x = rect.x, .y = h_light_bottom, .w = bottom_right - rect.x, .h = light_stroke });
         },
     }
 }
@@ -2468,11 +2544,15 @@ fn queueRoundedBoxCorner(state: *app_state.AppState, rect: palette.Rect, cp: u21
     const arc_cy = if (lines.down != .none) center_y + radius else center_y - radius;
     const outer_radius = radius + stroke * 0.5;
     const circle: palette.Rect = .{ .x = arc_cx - outer_radius, .y = arc_cy - outer_radius, .w = outer_radius * 2.0, .h = outer_radius * 2.0 };
+    // The quadrant runs from the tails' outer edge (half a stroke past the
+    // centerline) to the tangent points, so the ring keeps its full thickness
+    // where it meets each tail instead of losing the outer half to the clip.
+    const half_stroke = stroke * 0.5;
     const quadrant: palette.Rect = .{
-        .x = if (lines.right != .none) center_x else center_x - radius,
-        .y = if (lines.down != .none) center_y else center_y - radius,
-        .w = radius,
-        .h = radius,
+        .x = if (lines.right != .none) center_x - half_stroke else center_x - radius,
+        .y = if (lines.down != .none) center_y - half_stroke else center_y - radius,
+        .w = radius + half_stroke,
+        .h = radius + half_stroke,
     };
     const cell_clip = intersectRect(rect, quadrant) orelse return;
     if (clip) |outer_clip| {
@@ -2481,12 +2561,15 @@ fn queueRoundedBoxCorner(state: *app_state.AppState, rect: palette.Rect, cp: u21
         queueClippedBorder(state, circle, color, outer_radius, stroke, cell_clip);
     }
 
+    // Tails end exactly at the arc's tangent point. The arc ring is full-stroke
+    // thick there, so abutting leaves no gap, while overlapping would
+    // double-blend faint (translucent) colors into a bright dot at the join.
     const center_left = center_x - stroke * 0.5;
     const center_top = center_y - stroke * 0.5;
-    if (lines.up != .none) queueClippedRect(state, .{ .x = center_left, .y = rect.y, .w = stroke, .h = center_y - radius - rect.y + stroke }, color, clip);
-    if (lines.right != .none) queueClippedRect(state, .{ .x = center_x + radius - stroke, .y = center_top, .w = rect.x + rect.w - (center_x + radius) + stroke, .h = stroke }, color, clip);
-    if (lines.down != .none) queueClippedRect(state, .{ .x = center_left, .y = center_y + radius - stroke, .w = stroke, .h = rect.y + rect.h - (center_y + radius) + stroke }, color, clip);
-    if (lines.left != .none) queueClippedRect(state, .{ .x = rect.x, .y = center_top, .w = center_x - radius - rect.x + stroke, .h = stroke }, color, clip);
+    if (lines.up != .none) queueClippedRect(state, .{ .x = center_left, .y = rect.y, .w = stroke, .h = center_y - radius - rect.y }, color, clip);
+    if (lines.right != .none) queueClippedRect(state, .{ .x = center_x + radius, .y = center_top, .w = rect.x + rect.w - (center_x + radius), .h = stroke }, color, clip);
+    if (lines.down != .none) queueClippedRect(state, .{ .x = center_left, .y = center_y + radius, .w = stroke, .h = rect.y + rect.h - (center_y + radius) }, color, clip);
+    if (lines.left != .none) queueClippedRect(state, .{ .x = rect.x, .y = center_top, .w = center_x - radius - rect.x, .h = stroke }, color, clip);
 }
 
 fn queueDiagonalGlyph(state: *app_state.AppState, rect: palette.Rect, color: palette.Color, clip: ?palette.Rect, rising: bool) void {
@@ -2635,6 +2718,33 @@ test "box drawing mappings cover every non-specialized codepoint" {
         };
         try std.testing.expect(specialized or boxLinesForCodepoint(cp) != null);
     }
+}
+
+test "disjoint box arms never overlap and preserve total coverage" {
+    // A `┼` cell: horizontal arms and vertical arms cross at the center.
+    var arms: DisjointRects = .{};
+    arms.add(.{ .x = 0, .y = 7, .w = 8, .h = 2 }); // left arm through center
+    arms.add(.{ .x = 7, .y = 7, .w = 9, .h = 2 }); // right arm, overlaps 2x2 center
+    arms.add(.{ .x = 7, .y = 0, .w = 2, .h = 9 }); // up arm through center
+    arms.add(.{ .x = 7, .y = 7, .w = 2, .h = 25 }); // down arm through center
+    var area: f32 = 0.0;
+    for (arms.rects[0..arms.len], 0..) |a, i| {
+        area += a.w * a.h;
+        for (arms.rects[i + 1 .. arms.len]) |b| try std.testing.expect(intersectRect(a, b) == null);
+    }
+    // Union: 16x2 horizontal band + 2x32 vertical band - 2x2 shared center.
+    try std.testing.expectApproxEqAbs(@as(f32, 16 * 2 + 2 * 32 - 4), area, 0.001);
+}
+
+test "subtractRect splits into top, bottom, left, and right bands" {
+    var out: [4]palette.Rect = undefined;
+    const count = subtractRect(.{ .x = 0, .y = 0, .w = 10, .h = 10 }, .{ .x = 4, .y = 4, .w = 2, .h = 2 }, &out);
+    try std.testing.expectEqual(@as(usize, 4), count);
+    var area: f32 = 0.0;
+    for (out[0..count]) |r| area += r.w * r.h;
+    try std.testing.expectApproxEqAbs(@as(f32, 96), area, 0.001);
+    try std.testing.expectEqual(@as(usize, 1), subtractRect(.{ .x = 0, .y = 0, .w = 4, .h = 4 }, .{ .x = 4, .y = 0, .w = 2, .h = 2 }, &out));
+    try std.testing.expectEqual(@as(usize, 0), subtractRect(.{ .x = 0, .y = 0, .w = 4, .h = 4 }, .{ .x = 0, .y = 0, .w = 4, .h = 4 }, &out));
 }
 
 test "rounded box drawing mappings preserve corner directions" {

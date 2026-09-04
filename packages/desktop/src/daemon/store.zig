@@ -131,6 +131,7 @@ pub fn validateRepositoryRelativeCwd(relative_cwd: ?[]const u8) StoreError!void 
 
 pub const Mutation = union(enum) {
     snapshot_replace: store_protocol.SnapshotReplaceRequest,
+    app_state_set: store_protocol.AppStateSetRequest,
     workspace_upsert: store_protocol.WorkspaceUpsertRequest,
     workspace_repository_upsert: WorkspaceRepositoryUpsertRequest,
     workspace_repository_remove: WorkspaceRepositoryRemoveRequest,
@@ -379,6 +380,7 @@ pub const ImportedLeasesAndOutcomes = struct {
 };
 
 const SNAPSHOT_REPLACE_OPERATION = store_protocol.METHOD_STATE_SNAPSHOT_REPLACE;
+const APP_STATE_SET_OPERATION = store_protocol.METHOD_APP_STATE_SET;
 const WORKSPACE_UPSERT_OPERATION = store_protocol.METHOD_WORKSPACE_UPSERT;
 const WORKSPACE_REPOSITORY_UPSERT_OPERATION: []const u8 = "workspace.repository.upsert";
 const WORKSPACE_REPOSITORY_REMOVE_OPERATION: []const u8 = "workspace.repository.remove";
@@ -397,11 +399,21 @@ const CHAT_COMPLETION_CLEAR_OPERATION = store_protocol.METHOD_NOTIFICATION_CHAT_
 const TURN_COMMIT_OPERATION: []const u8 = "chat.turn.commit";
 const TURN_ACCEPT_OPERATION: []const u8 = "chat.turn.accept";
 const RESPONSE_STATUS_OK: i64 = 0;
+const SNAPSHOT_RECEIPT_RETAIN_COUNT: i64 = 512;
 const FINGERPRINT_PREFIX: []const u8 = "sha256:";
 const FINGERPRINT_HEX_LEN: usize = std.crypto.hash.sha2.Sha256.digest_length * 2;
 const FINGERPRINT_LEN: usize = FINGERPRINT_PREFIX.len + FINGERPRINT_HEX_LEN;
 const COMPACTION_MIN_FREE_BYTES: u64 = 64 * 1024 * 1024;
 
+fn snapshotCarriesMessageTail(message_offset: usize, message_count: usize) bool {
+    return message_count != 0 or message_offset == 0;
+}
+
+test "bounded unhydrated snapshot threads do not carry a message tail" {
+    try std.testing.expect(!snapshotCarriesMessageTail(42, 0));
+    try std.testing.expect(snapshotCarriesMessageTail(0, 0));
+    try std.testing.expect(snapshotCarriesMessageTail(42, 1));
+}
 pub const Store = struct {
     const Self = @This();
 
@@ -468,6 +480,9 @@ pub const Store = struct {
         const migrated_fingerprint_bytes = migrateLegacyFingerprints(allocator, conn) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return mapOpenError(err);
+        };
+        pruneObsoleteSnapshotReceipts(conn) catch |err| {
+            log.warn("snapshot receipt retention deferred: {s}", .{@errorName(err)});
         };
         compactFreedPages(conn, COMPACTION_MIN_FREE_BYTES) catch |err| {
             // Fingerprint conversion is already durable. A failed VACUUM only
@@ -595,6 +610,7 @@ pub const Store = struct {
                 self.applySnapshotFullRewrite(request.snapshot, next_revision_sql) catch |err| return mapStoreError(err)
             else
                 self.applySnapshot(request.snapshot, next_revision_sql) catch |err| return mapStoreError(err),
+            .app_state_set => |request| self.applyAppStateSet(request) catch |err| return mapStoreError(err),
             .workspace_upsert => |request| self.applyWorkspace(request.workspace) catch |err| return mapStoreError(err),
             .workspace_repository_upsert => |request| self.applyWorkspaceRepositoryUpsert(request) catch |err| return mapStoreError(err),
             .workspace_repository_remove => |request| self.applyWorkspaceRepositoryRemove(request) catch |err| return mapStoreError(err),
@@ -1455,7 +1471,7 @@ pub const Store = struct {
         const response_payload = self.encodeValue(result) catch |err| return err;
         defer self.allocator.free(response_payload);
         try self.conn.exec(
-            "insert into store_receipts (request_key, operation, fingerprint, store_revision, response_payload, response_status) values (?1, ?2, ?3, ?4, ?5, ?6)",
+            "insert into store_receipts (request_key, operation, fingerprint, store_revision, response_payload, response_status, created_at_ms) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             .{
                 mutation.request_key,
                 operation,
@@ -1463,8 +1479,18 @@ pub const Store = struct {
                 @as(i64, @intCast(result.store_revision)),
                 response_payload,
                 RESPONSE_STATUS_OK,
+                @max(platform_runtime.unixTimestampMs(), 0),
             },
         );
+        // A stale snapshot request cannot apply after its expected revision
+        // has advanced; bootstrap is likewise rejected once the store is not
+        // pristine. Keep a generous replay window while bounding the only
+        // high-volume receipt class.
+        if (std.mem.eql(u8, operation, store_protocol.METHOD_STATE_SNAPSHOT_REPLACE) and
+            result.store_revision % 256 == 0)
+        {
+            try pruneObsoleteSnapshotReceipts(self.conn);
+        }
     }
 
     const MessageKeyStatus = struct {
@@ -1512,6 +1538,10 @@ pub const Store = struct {
             .snapshot_replace => |request| self.fingerprintValue(.{
                 .snapshot = request.snapshot,
                 .bootstrap = request.bootstrap,
+            }),
+            .app_state_set => |request| self.fingerprintValue(.{
+                .selected_workspace_index = request.selected_workspace_index,
+                .sidebar_collapsed = request.sidebar_collapsed,
             }),
             .workspace_upsert => |request| self.fingerprintValue(request.workspace),
             .workspace_repository_upsert => |request| self.fingerprintValue(.{
@@ -1591,7 +1621,9 @@ pub const Store = struct {
         try self.prepareSnapshotTargets(snapshot);
         try self.conn.exec(
             "insert into app_state (id, selected_workspace_index, sidebar_collapsed) values (1, ?1, ?2) " ++
-                "on conflict(id) do update set selected_workspace_index = excluded.selected_workspace_index, sidebar_collapsed = excluded.sidebar_collapsed",
+                "on conflict(id) do update set selected_workspace_index = excluded.selected_workspace_index, sidebar_collapsed = excluded.sidebar_collapsed " ++
+                "where (app_state.selected_workspace_index, app_state.sidebar_collapsed) is not " ++
+                "(excluded.selected_workspace_index, excluded.sidebar_collapsed)",
             .{ @as(i64, @intCast(snapshot.selected_workspace_index)), boolToInt(snapshot.sidebar_collapsed) },
         );
 
@@ -1627,19 +1659,25 @@ pub const Store = struct {
             \\);
         );
 
-        // Move existing order values out of the non-negative target range.
-        // Retained, omitted workspaces receive deterministic positions after
-        // every workspace carried by this snapshot.
-        try self.conn.exec(
-            \\insert into snapshot_workspace_positions (workspace_row_id, sort_index)
-            \\select w.id, ?1 + row_number() over (order by w.sort_index) - 1
-            \\from workspaces w
-            \\where not exists (
-            \\    select 1 from snapshot_workspace_targets target
-            \\    where target.workspace_id = w.workspace_id
-            \\)
-        , .{@as(i64, @intCast(snapshot.workspaces.len))});
-        try self.conn.execNoArgs("update workspaces set sort_index = -id");
+        // Unique sort indexes require a temporary negative range only when
+        // snapshot membership actually changes the order. Avoiding that
+        // rewrite is critical for routine snapshots with hundreds of
+        // unchanged workspaces and threads.
+        const reconcile_workspace_order = try self.snapshotWorkspaceOrderNeedsReconcile(snapshot.workspaces.len);
+        if (reconcile_workspace_order) {
+            // Retained, omitted workspaces receive deterministic positions
+            // after every workspace carried by this snapshot.
+            try self.conn.exec(
+                \\insert into snapshot_workspace_positions (workspace_row_id, sort_index)
+                \\select w.id, ?1 + row_number() over (order by w.sort_index) - 1
+                \\from workspaces w
+                \\where not exists (
+                \\    select 1 from snapshot_workspace_targets target
+                \\    where target.workspace_id = w.workspace_id
+                \\)
+            , .{@as(i64, @intCast(snapshot.workspaces.len))});
+            try self.conn.execNoArgs("update workspaces set sort_index = -id");
+        }
 
         for (snapshot.workspaces, 0..) |workspace, workspace_index| {
             try self.upsertSnapshotWorkspace(workspace, workspace_index);
@@ -1653,17 +1691,19 @@ pub const Store = struct {
             try self.reconcileWorkspaceRepositories(workspace_row_id, workspace);
         }
 
-        try self.conn.execNoArgs(
-            \\update workspaces
-            \\set sort_index = (
-            \\    select position.sort_index from snapshot_workspace_positions position
-            \\    where position.workspace_row_id = workspaces.id
-            \\)
-            \\where exists (
-            \\    select 1 from snapshot_workspace_positions position
-            \\    where position.workspace_row_id = workspaces.id
-            \\);
-        );
+        if (reconcile_workspace_order) {
+            try self.conn.execNoArgs(
+                \\update workspaces
+                \\set sort_index = (
+                \\    select position.sort_index from snapshot_workspace_positions position
+                \\    where position.workspace_row_id = workspaces.id
+                \\)
+                \\where exists (
+                \\    select 1 from snapshot_workspace_positions position
+                \\    where position.workspace_row_id = workspaces.id
+                \\);
+            );
+        }
         for (snapshot.surface_states) |surface| try self.applySurfaceUpsert(surface);
         for (snapshot.chat_completions) |completion| try self.applyChatCompletionUpsert(completion);
     }
@@ -1721,11 +1761,40 @@ pub const Store = struct {
         }
     }
 
+    fn snapshotWorkspaceOrderNeedsReconcile(self: *Self, snapshot_workspace_count: usize) !bool {
+        const row = (try self.conn.row(
+            \\select
+            \\    exists (
+            \\        select 1
+            \\        from snapshot_workspace_targets target
+            \\        join workspaces workspace on workspace.workspace_id = target.workspace_id
+            \\        where workspace.sort_index != target.sort_index
+            \\    )
+            \\    or exists (
+            \\        select 1
+            \\        from (
+            \\            select workspace.sort_index as current_index,
+            \\                   ?1 + row_number() over (order by workspace.sort_index) - 1 as expected_index
+            \\            from workspaces workspace
+            \\            where not exists (
+            \\                select 1 from snapshot_workspace_targets target
+            \\                where target.workspace_id = workspace.workspace_id
+            \\            )
+            \\        ) omitted
+            \\        where omitted.current_index != omitted.expected_index
+            \\    )
+        , .{@as(i64, @intCast(snapshot_workspace_count))})) orelse return error.StoreCorrupt;
+        defer row.deinit();
+        return row.int(0) != 0;
+    }
+
     fn upsertSnapshotWorkspace(self: *Self, workspace: store_protocol.Workspace, workspace_index: usize) !void {
         try self.conn.exec(
             "insert into workspaces (workspace_id, sort_index, label, path, archived, unread_count, collapsed, thread_list_expanded, terminal_height, terminal_layout_json, terminal_docks_json, workspace_layout_json, selected_thread_index, companion_thread_local_id, herdr_remote_alias, herdr_session_name, herdr_workspace_id, herdr_local_dir, herdr_remote_cwd, herdr_last_pane_id, herdr_attach_dock_id, herdr_attach_pane_id, herdr_pane_links_json, herdr_updated_at_ms) " ++
                 "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24) " ++
-                "on conflict(workspace_id) do update set sort_index = excluded.sort_index, label = excluded.label, path = excluded.path, archived = excluded.archived, unread_count = excluded.unread_count, collapsed = excluded.collapsed, thread_list_expanded = excluded.thread_list_expanded, terminal_height = excluded.terminal_height, terminal_layout_json = excluded.terminal_layout_json, terminal_docks_json = excluded.terminal_docks_json, workspace_layout_json = excluded.workspace_layout_json, selected_thread_index = excluded.selected_thread_index, companion_thread_local_id = excluded.companion_thread_local_id, herdr_remote_alias = excluded.herdr_remote_alias, herdr_session_name = excluded.herdr_session_name, herdr_workspace_id = excluded.herdr_workspace_id, herdr_local_dir = excluded.herdr_local_dir, herdr_remote_cwd = excluded.herdr_remote_cwd, herdr_last_pane_id = excluded.herdr_last_pane_id, herdr_attach_dock_id = excluded.herdr_attach_dock_id, herdr_attach_pane_id = excluded.herdr_attach_pane_id, herdr_pane_links_json = excluded.herdr_pane_links_json, herdr_updated_at_ms = excluded.herdr_updated_at_ms",
+                "on conflict(workspace_id) do update set sort_index = excluded.sort_index, label = excluded.label, path = excluded.path, archived = excluded.archived, unread_count = excluded.unread_count, collapsed = excluded.collapsed, thread_list_expanded = excluded.thread_list_expanded, terminal_height = excluded.terminal_height, terminal_layout_json = excluded.terminal_layout_json, terminal_docks_json = excluded.terminal_docks_json, workspace_layout_json = excluded.workspace_layout_json, selected_thread_index = excluded.selected_thread_index, companion_thread_local_id = excluded.companion_thread_local_id, herdr_remote_alias = excluded.herdr_remote_alias, herdr_session_name = excluded.herdr_session_name, herdr_workspace_id = excluded.herdr_workspace_id, herdr_local_dir = excluded.herdr_local_dir, herdr_remote_cwd = excluded.herdr_remote_cwd, herdr_last_pane_id = excluded.herdr_last_pane_id, herdr_attach_dock_id = excluded.herdr_attach_dock_id, herdr_attach_pane_id = excluded.herdr_attach_pane_id, herdr_pane_links_json = excluded.herdr_pane_links_json, herdr_updated_at_ms = excluded.herdr_updated_at_ms " ++
+                "where (workspaces.sort_index, workspaces.label, workspaces.path, workspaces.archived, workspaces.unread_count, workspaces.collapsed, workspaces.thread_list_expanded, workspaces.terminal_height, workspaces.terminal_layout_json, workspaces.terminal_docks_json, workspaces.workspace_layout_json, workspaces.selected_thread_index, workspaces.companion_thread_local_id, workspaces.herdr_remote_alias, workspaces.herdr_session_name, workspaces.herdr_workspace_id, workspaces.herdr_local_dir, workspaces.herdr_remote_cwd, workspaces.herdr_last_pane_id, workspaces.herdr_attach_dock_id, workspaces.herdr_attach_pane_id, workspaces.herdr_pane_links_json, workspaces.herdr_updated_at_ms) is not " ++
+                "(excluded.sort_index, excluded.label, excluded.path, excluded.archived, excluded.unread_count, excluded.collapsed, excluded.thread_list_expanded, excluded.terminal_height, excluded.terminal_layout_json, excluded.terminal_docks_json, excluded.workspace_layout_json, excluded.selected_thread_index, excluded.companion_thread_local_id, excluded.herdr_remote_alias, excluded.herdr_session_name, excluded.herdr_workspace_id, excluded.herdr_local_dir, excluded.herdr_remote_cwd, excluded.herdr_last_pane_id, excluded.herdr_attach_dock_id, excluded.herdr_attach_pane_id, excluded.herdr_pane_links_json, excluded.herdr_updated_at_ms)",
             workspaceValues(workspace, @as(i64, @intCast(workspace_index))),
         );
     }
@@ -1758,17 +1827,24 @@ pub const Store = struct {
         , .{ workspace_row_id, workspace.workspace_id });
 
         const snapshot_thread_count: usize = if (workspace.threads.len == 0) 1 else workspace.threads.len;
-        try self.conn.exec(
-            \\insert into snapshot_thread_positions (thread_row_id, sort_index)
-            \\select t.id, ?3 + row_number() over (order by t.sort_index) - 1
-            \\from threads t
-            \\where t.workspace_id = ?1
-            \\  and not exists (
-            \\      select 1 from snapshot_thread_targets target
-            \\      where target.workspace_id = ?2 and target.local_thread_id = t.local_thread_id
-            \\  )
-        , .{ workspace_row_id, workspace.workspace_id, @as(i64, @intCast(snapshot_thread_count)) });
-        try self.conn.exec("update threads set sort_index = -id where workspace_id = ?1", .{workspace_row_id});
+        const reconcile_thread_order = try self.snapshotThreadOrderNeedsReconcile(
+            workspace_row_id,
+            workspace.workspace_id,
+            snapshot_thread_count,
+        );
+        if (reconcile_thread_order) {
+            try self.conn.exec(
+                \\insert into snapshot_thread_positions (thread_row_id, sort_index)
+                \\select t.id, ?3 + row_number() over (order by t.sort_index) - 1
+                \\from threads t
+                \\where t.workspace_id = ?1
+                \\  and not exists (
+                \\      select 1 from snapshot_thread_targets target
+                \\      where target.workspace_id = ?2 and target.local_thread_id = t.local_thread_id
+                \\  )
+            , .{ workspace_row_id, workspace.workspace_id, @as(i64, @intCast(snapshot_thread_count)) });
+            try self.conn.exec("update threads set sort_index = -id where workspace_id = ?1", .{workspace_row_id});
+        }
 
         if (workspace.threads.len == 0) {
             const legacy_messages = if (workspace.messages.len != 0)
@@ -1815,17 +1891,52 @@ pub const Store = struct {
             }
         }
 
-        try self.conn.exec(
-            \\update threads
-            \\set sort_index = (
-            \\    select position.sort_index from snapshot_thread_positions position
-            \\    where position.thread_row_id = threads.id
-            \\)
-            \\where workspace_id = ?1 and exists (
-            \\    select 1 from snapshot_thread_positions position
-            \\    where position.thread_row_id = threads.id
-            \\)
-        , .{workspace_row_id});
+        if (reconcile_thread_order) {
+            try self.conn.exec(
+                \\update threads
+                \\set sort_index = (
+                \\    select position.sort_index from snapshot_thread_positions position
+                \\    where position.thread_row_id = threads.id
+                \\)
+                \\where workspace_id = ?1 and exists (
+                \\    select 1 from snapshot_thread_positions position
+                \\    where position.thread_row_id = threads.id
+                \\)
+            , .{workspace_row_id});
+        }
+    }
+
+    fn snapshotThreadOrderNeedsReconcile(
+        self: *Self,
+        workspace_row_id: i64,
+        workspace_id: []const u8,
+        snapshot_thread_count: usize,
+    ) !bool {
+        const row = (try self.conn.row(
+            \\select
+            \\    exists (
+            \\        select 1
+            \\        from snapshot_thread_targets target
+            \\        join threads thread on thread.workspace_id = ?1 and thread.local_thread_id = target.local_thread_id
+            \\        where target.workspace_id = ?2 and thread.sort_index != target.sort_index
+            \\    )
+            \\    or exists (
+            \\        select 1
+            \\        from (
+            \\            select thread.sort_index as current_index,
+            \\                   ?3 + row_number() over (order by thread.sort_index) - 1 as expected_index
+            \\            from threads thread
+            \\            where thread.workspace_id = ?1
+            \\              and not exists (
+            \\                  select 1 from snapshot_thread_targets target
+            \\                  where target.workspace_id = ?2 and target.local_thread_id = thread.local_thread_id
+            \\              )
+            \\        ) omitted
+            \\        where omitted.current_index != omitted.expected_index
+            \\    )
+        , .{ workspace_row_id, workspace_id, @as(i64, @intCast(snapshot_thread_count)) })) orelse return error.StoreCorrupt;
+        defer row.deinit();
+        return row.int(0) != 0;
     }
 
     fn reconcileSnapshotThread(
@@ -1889,7 +2000,9 @@ pub const Store = struct {
         const draft_images_json = try encodeExtraImagesJson(self.allocator, thread.draft_images);
         defer if (draft_images_json) |value| self.allocator.free(value);
         try self.conn.exec(
-            "update threads set sort_index = ?1, title = ?2, archived = ?3, committed = ?4, last_activity_at = ?5, provider_thread_id = ?6, model_ref = ?7, reasoning_effort = ?8, reasoning_variant = ?9, fast_mode = ?10, access_mode = ?11, provider = ?12, harness = ?13, tui_dock_id = ?14, draft = ?15, draft_image_path = ?16, draft_image_mime = ?17, draft_image_byte_size = ?18, draft_images_json = ?19, cwd = ?20, profile_id = ?21, runtime_id = ?22, repository_id = ?23, repository_cwd = ?24 where id = ?25",
+            "update threads set sort_index = ?1, title = ?2, archived = ?3, committed = ?4, last_activity_at = ?5, provider_thread_id = ?6, model_ref = ?7, reasoning_effort = ?8, reasoning_variant = ?9, fast_mode = ?10, access_mode = ?11, provider = ?12, harness = ?13, tui_dock_id = ?14, draft = ?15, draft_image_path = ?16, draft_image_mime = ?17, draft_image_byte_size = ?18, draft_images_json = ?19, cwd = ?20, profile_id = ?21, runtime_id = ?22, repository_id = ?23, repository_cwd = ?24 where id = ?25 and " ++
+                "(sort_index, title, archived, committed, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size, draft_images_json, cwd, profile_id, runtime_id, repository_id, repository_cwd) is not " ++
+                "(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
             .{
                 @as(i64, @intCast(thread_index)),
                 thread.title,
@@ -1918,7 +2031,46 @@ pub const Store = struct {
                 thread_row_id,
             },
         );
-        try self.replaceSnapshotMessageTail(thread_row_id, thread.message_offset, thread.messages, store_revision);
+        // A bounded projection represents an unhydrated transcript as an
+        // empty tail at a non-zero offset. That range carries no transcript
+        // mutation, so reconciling it only rewrites SQLite bookkeeping for
+        // every inactive thread in the snapshot.
+        if (snapshotCarriesMessageTail(thread.message_offset, thread.messages.len) and
+            !try self.snapshotMessageTailAlreadyStored(thread_row_id, thread.message_offset, thread.messages))
+        {
+            try self.replaceSnapshotMessageTail(thread_row_id, thread.message_offset, thread.messages, store_revision);
+        }
+    }
+
+    fn snapshotMessageTailAlreadyStored(
+        self: *Self,
+        thread_row_id: i64,
+        message_offset: usize,
+        messages: []const store_protocol.Message,
+    ) !bool {
+        if (messages.len == 0) return false;
+        for (messages, 0..) |message, message_index| {
+            if (message.message_id.len == 0) return false;
+            const fingerprint = self.fingerprintValue(message) catch |err| return err;
+            defer self.allocator.free(fingerprint);
+            const row = try self.conn.row(
+                \\select 1
+                \\from client_message_keys key
+                \\join messages message on message.thread_id = key.thread_id and message.message_id = key.message_id
+                \\where key.thread_id = ?1 and key.message_id = ?2
+                \\  and key.sort_index = ?3 and message.sort_index = ?3
+                \\  and key.message_fingerprint = ?4
+            , .{
+                thread_row_id,
+                message.message_id,
+                @as(i64, @intCast(message_offset + message_index)),
+                fingerprint,
+            });
+            if (row) |matched| {
+                matched.deinit();
+            } else return false;
+        }
+        return true;
     }
 
     fn replaceSnapshotMessageTail(
@@ -2457,6 +2609,19 @@ pub const Store = struct {
         try self.reconcileWorkspaceRepositories(workspace_row_id, workspace);
     }
 
+    fn applyAppStateSet(self: *Self, request: store_protocol.AppStateSetRequest) !void {
+        const selected_index = std.math.cast(i64, request.selected_workspace_index) orelse
+            return error.InvalidParams;
+        try self.conn.exec(
+            "insert into app_state (id, selected_workspace_index, sidebar_collapsed) values (1, ?1, ?2) " ++
+                "on conflict(id) do update set selected_workspace_index = excluded.selected_workspace_index, " ++
+                "sidebar_collapsed = excluded.sidebar_collapsed where " ++
+                "(app_state.selected_workspace_index, app_state.sidebar_collapsed) is not " ++
+                "(excluded.selected_workspace_index, excluded.sidebar_collapsed)",
+            .{ selected_index, boolToInt(request.sidebar_collapsed) },
+        );
+    }
+
     fn applyWorkspaceRepositoryUpsert(self: *Self, request: WorkspaceRepositoryUpsertRequest) !void {
         const workspace_row_id = try self.requireWorkspaceRowId(request.workspace_id);
         const existing = try self.conn.row(
@@ -2594,7 +2759,11 @@ pub const Store = struct {
             \\create temp table if not exists repository_manifest_targets (
             \\    repository_id text primary key
             \\);
+            \\create temp table if not exists repository_binding_targets (
+            \\    runtime_id text primary key
+            \\);
             \\delete from repository_manifest_targets;
+            \\delete from repository_binding_targets;
         );
         for (workspace.repositories) |repository| {
             try self.conn.exec(
@@ -2625,7 +2794,9 @@ pub const Store = struct {
                 "insert into workspace_repositories (workspace_id, repository_id, sort_index, label, vcs_identity, default_branch) " ++
                     "values (?1, ?2, ?3, ?4, ?5, ?6) " ++
                     "on conflict(workspace_id, repository_id) do update set sort_index = excluded.sort_index, " ++
-                    "label = excluded.label, vcs_identity = excluded.vcs_identity, default_branch = excluded.default_branch",
+                    "label = excluded.label, vcs_identity = excluded.vcs_identity, default_branch = excluded.default_branch " ++
+                    "where (workspace_repositories.sort_index, workspace_repositories.label, workspace_repositories.vcs_identity, workspace_repositories.default_branch) is not " ++
+                    "(excluded.sort_index, excluded.label, excluded.vcs_identity, excluded.default_branch)",
                 .{
                     workspace_row_id,
                     repository.repository_id,
@@ -2636,16 +2807,27 @@ pub const Store = struct {
                 },
             );
             const repository_row_id = try self.requireRepositoryRowId(workspace_row_id, repository.repository_id);
+            try self.conn.execNoArgs("delete from repository_binding_targets");
+            for (repository.bindings) |binding| {
+                try self.conn.exec(
+                    "insert into repository_binding_targets (runtime_id) values (?1)",
+                    .{binding.runtime_id},
+                );
+                try self.upsertRepositoryBindingRow(repository_row_id, binding);
+            }
             try self.conn.exec(
-                "delete from workspace_repository_bindings where repository_row_id = ?1",
-                .{repository_row_id},
-            );
-            for (repository.bindings) |binding| try self.upsertRepositoryBindingRow(repository_row_id, binding);
+                \\delete from workspace_repository_bindings
+                \\where repository_row_id = ?1
+                \\  and not exists (
+                \\      select 1 from repository_binding_targets target
+                \\      where target.runtime_id = workspace_repository_bindings.runtime_id
+                \\  )
+            , .{repository_row_id});
         }
 
         const default_repository_id = workspace.default_repository_id orelse store_protocol.PRIMARY_REPOSITORY_ID;
         try self.conn.exec(
-            "update workspaces set default_repository_id = ?1 where id = ?2",
+            "update workspaces set default_repository_id = ?1 where id = ?2 and default_repository_id is not ?1",
             .{ default_repository_id, workspace_row_id },
         );
         try self.conn.exec(
@@ -2668,6 +2850,13 @@ pub const Store = struct {
             \\)
             \\where id = ?1 and exists (
             \\    select 1
+            \\    from workspace_repository_bindings binding
+            \\    join workspace_repositories repository on repository.id = binding.repository_row_id
+            \\    join store_state state on state.id = 1 and state.runtime_id = binding.runtime_id
+            \\    where repository.workspace_id = ?1 and repository.repository_id = 'primary'
+            \\)
+            \\and path is not (
+            \\    select binding.root_path
             \\    from workspace_repository_bindings binding
             \\    join workspace_repositories repository on repository.id = binding.repository_row_id
             \\    join store_state state on state.id = 1 and state.runtime_id = binding.runtime_id
@@ -2701,7 +2890,9 @@ pub const Store = struct {
         try self.conn.exec(
             "insert into workspace_repository_bindings (repository_row_id, runtime_id, root_path, availability) " ++
                 "values (?1, ?2, ?3, ?4) on conflict(repository_row_id, runtime_id) do update set " ++
-                "root_path = excluded.root_path, availability = excluded.availability",
+                "root_path = excluded.root_path, availability = excluded.availability " ++
+                "where (workspace_repository_bindings.root_path, workspace_repository_bindings.availability) is not " ++
+                "(excluded.root_path, excluded.availability)",
             .{ repository_row_id, binding.runtime_id, binding.root_path, binding.availability },
         );
     }
@@ -3295,7 +3486,10 @@ pub const Store = struct {
     fn applySurfaceUpsert(self: *Self, surface: store_protocol.SurfaceState) !void {
         if (surface.session_id.len == 0) return error.InvalidParams;
         try self.conn.exec(
-            "insert into surface_completions (session_id, workspace_id, workspace_path, dock_id, pane_id, provider, provider_thread_id, title, status, status_changed_at_ms, completed_at_ms, last_event_title, last_event_body) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) on conflict(session_id) do update set workspace_id = excluded.workspace_id, workspace_path = excluded.workspace_path, dock_id = excluded.dock_id, pane_id = excluded.pane_id, provider = excluded.provider, provider_thread_id = excluded.provider_thread_id, title = excluded.title, status = excluded.status, status_changed_at_ms = excluded.status_changed_at_ms, completed_at_ms = excluded.completed_at_ms, last_event_title = excluded.last_event_title, last_event_body = excluded.last_event_body",
+            "insert into surface_completions (session_id, workspace_id, workspace_path, dock_id, pane_id, provider, provider_thread_id, title, status, status_changed_at_ms, completed_at_ms, last_event_title, last_event_body) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) " ++
+                "on conflict(session_id) do update set workspace_id = excluded.workspace_id, workspace_path = excluded.workspace_path, dock_id = excluded.dock_id, pane_id = excluded.pane_id, provider = excluded.provider, provider_thread_id = excluded.provider_thread_id, title = excluded.title, status = excluded.status, status_changed_at_ms = excluded.status_changed_at_ms, completed_at_ms = excluded.completed_at_ms, last_event_title = excluded.last_event_title, last_event_body = excluded.last_event_body " ++
+                "where (surface_completions.workspace_id, surface_completions.workspace_path, surface_completions.dock_id, surface_completions.pane_id, surface_completions.provider, surface_completions.provider_thread_id, surface_completions.title, surface_completions.status, surface_completions.status_changed_at_ms, surface_completions.completed_at_ms, surface_completions.last_event_title, surface_completions.last_event_body) is not " ++
+                "(excluded.workspace_id, excluded.workspace_path, excluded.dock_id, excluded.pane_id, excluded.provider, excluded.provider_thread_id, excluded.title, excluded.status, excluded.status_changed_at_ms, excluded.completed_at_ms, excluded.last_event_title, excluded.last_event_body)",
             .{
                 surface.session_id,
                 surface.workspace_id,
@@ -3330,7 +3524,9 @@ pub const Store = struct {
     fn applyChatCompletionUpsert(self: *Self, completion: store_protocol.ChatCompletion) !void {
         if (completion.workspace_id.len == 0 or completion.local_thread_id.len == 0) return error.InvalidParams;
         try self.conn.exec(
-            "insert into chat_completions (workspace_id, local_thread_id, completed_at_ms) values (?1, ?2, ?3) on conflict(workspace_id, local_thread_id) do update set completed_at_ms = excluded.completed_at_ms",
+            "insert into chat_completions (workspace_id, local_thread_id, completed_at_ms) values (?1, ?2, ?3) " ++
+                "on conflict(workspace_id, local_thread_id) do update set completed_at_ms = excluded.completed_at_ms " ++
+                "where chat_completions.completed_at_ms is not excluded.completed_at_ms",
             .{ completion.workspace_id, completion.local_thread_id, completion.completed_at_ms },
         );
     }
@@ -3626,6 +3822,7 @@ pub const Store = struct {
 fn mutationHeader(mutation: Mutation) store_protocol.MutationHeader {
     return switch (mutation) {
         .snapshot_replace => |request| request.mutation,
+        .app_state_set => |request| request.mutation,
         .workspace_upsert => |request| request.mutation,
         .workspace_repository_upsert => |request| request.mutation,
         .workspace_repository_remove => |request| request.mutation,
@@ -3645,6 +3842,7 @@ fn mutationHeader(mutation: Mutation) store_protocol.MutationHeader {
 fn mutationOperation(mutation: Mutation) []const u8 {
     return switch (mutation) {
         .snapshot_replace => SNAPSHOT_REPLACE_OPERATION,
+        .app_state_set => APP_STATE_SET_OPERATION,
         .workspace_upsert => WORKSPACE_UPSERT_OPERATION,
         .workspace_repository_upsert => WORKSPACE_REPOSITORY_UPSERT_OPERATION,
         .workspace_repository_remove => WORKSPACE_REPOSITORY_REMOVE_OPERATION,
@@ -3677,6 +3875,9 @@ fn validateMutation(mutation: Mutation) StoreError!void {
                 try validateWorkspaceRepositoryManifest(workspace);
                 for (workspace.threads) |thread| try validateThreadRoute(thread);
             }
+        },
+        .app_state_set => |request| {
+            _ = std.math.cast(i64, request.selected_workspace_index) orelse return error.InvalidParams;
         },
         .workspace_upsert => |request| {
             if (request.workspace.workspace_id.len == 0 or request.workspace.label.len == 0 or request.workspace.path.len == 0) return error.InvalidParams;
@@ -4341,6 +4542,7 @@ fn providerCode(value: []const u8) !i64 {
     if (std.mem.eql(u8, value, "pi")) return 4;
     if (std.mem.eql(u8, value, "fx")) return 5;
     if (std.mem.eql(u8, value, "grok")) return 6;
+    if (std.mem.eql(u8, value, "muse")) return 7;
     return error.InvalidParams;
 }
 
@@ -4414,6 +4616,14 @@ const MessageFingerprintUpdate = struct {
 };
 
 fn migrateLegacyFingerprints(allocator: std.mem.Allocator, conn: zqlite.Conn) !u64 {
+    const marker = (try conn.row(
+        "select fingerprints_migrated from store_state where id = 1",
+        .{},
+    )) orelse return error.StoreMetadataMissing;
+    const already_migrated = marker.int(0) != 0;
+    marker.deinit();
+    if (already_migrated) return 0;
+
     var receipt_updates: std.ArrayList(ReceiptFingerprintUpdate) = .empty;
     defer {
         for (receipt_updates.items) |update| allocator.free(update.request_key);
@@ -4479,8 +4689,21 @@ fn migrateLegacyFingerprints(allocator: std.mem.Allocator, conn: zqlite.Conn) !u
             .{ update.fingerprint[0..], update.thread_id, update.message_id },
         );
     }
+    try conn.execNoArgs("update store_state set fingerprints_migrated = 1 where id = 1");
     try conn.commit();
     return migrated_bytes;
+}
+
+fn pruneObsoleteSnapshotReceipts(conn: zqlite.Conn) !void {
+    try conn.exec(
+        \\delete from store_receipts
+        \\where operation = ?1 and request_key not in (
+        \\    select request_key from store_receipts
+        \\    where operation = ?1
+        \\    order by store_revision desc, request_key desc
+        \\    limit ?2
+        \\)
+    , .{ store_protocol.METHOD_STATE_SNAPSHOT_REPLACE, SNAPSHOT_RECEIPT_RETAIN_COUNT });
 }
 
 fn compactFreedPages(conn: zqlite.Conn, min_free_bytes: u64) !void {
@@ -4644,6 +4867,53 @@ fn testHeader(request_key: []const u8, expected_store_revision: ?u64) store_prot
         .expected_store_revision = expected_store_revision,
         .client_id = "test-client",
     };
+}
+
+test "unchanged routine snapshot does not update workspace or thread rows" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+
+    const message: store_protocol.Message = .{
+        .message_id = "stable-message",
+        .role = "assistant",
+        .author = "Codex",
+        .body = "Already durable",
+    };
+    var thread = testThread("stable-thread", "Stable thread");
+    thread.messages = &.{message};
+    var workspace = testWorkspace("stable-workspace", "Stable workspace");
+    workspace.threads = &.{thread};
+    const workspaces = [_]store_protocol.Workspace{workspace};
+    _ = try store.replaceSnapshot(testSnapshotRequest("stable-bootstrap", null, true, testSnapshot(&workspaces)));
+
+    try store.conn.execNoArgs(
+        \\create temp table snapshot_row_updates (kind text not null);
+        \\create temp trigger count_app_state_update after update on app_state begin
+        \\    insert into snapshot_row_updates (kind) values ('app_state');
+        \\end;
+        \\create temp trigger count_workspace_update after update on workspaces begin
+        \\    insert into snapshot_row_updates (kind) values ('workspace');
+        \\end;
+        \\create temp trigger count_thread_update after update on threads begin
+        \\    insert into snapshot_row_updates (kind) values ('thread');
+        \\end;
+        \\create temp trigger count_message_update after update on messages begin
+        \\    insert into snapshot_row_updates (kind) values ('message');
+        \\end;
+        \\create temp trigger count_message_key_update after update on client_message_keys begin
+        \\    insert into snapshot_row_updates (kind) values ('message_key');
+        \\end;
+    );
+
+    const result = try store.replaceSnapshot(testSnapshotRequest("stable-repeat", 1, false, testSnapshot(&workspaces)));
+    try std.testing.expectEqual(@as(u64, 2), result.store_revision);
+    const updates = (try store.conn.row("select count(*) from snapshot_row_updates", .{})).?;
+    defer updates.deinit();
+    try std.testing.expectEqual(@as(i64, 0), updates.int(0));
 }
 
 test "identity-bound store initializes durable access tables" {
@@ -7996,6 +8266,35 @@ test "granular mutations are durable, idempotent, and revision guarded" {
     try std.testing.expectEqual(@as(u64, 10), clear_missing_completion.store_revision);
 }
 
+test "app state mutation does not reconcile workspace or thread rows" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+    _ = try store.upsertWorkspace(.{
+        .mutation = testHeader("app-state-workspace", null),
+        .workspace = testWorkspace("workspace-1", "Workspace"),
+    });
+    const result = try store.applyMutation(.{ .app_state_set = .{
+        .mutation = testHeader("app-state-only", 1),
+        .selected_workspace_index = 7,
+        .sidebar_collapsed = true,
+    } });
+    try std.testing.expectEqual(@as(u64, 2), result.store_revision);
+    var row = (try store.conn.row(
+        "select selected_workspace_index, sidebar_collapsed, (select count(*) from workspaces), (select count(*) from threads) from app_state where id = 1",
+        .{},
+    )).?;
+    defer row.deinit();
+    try std.testing.expectEqual(@as(i64, 7), row.int(0));
+    try std.testing.expectEqual(@as(i64, 1), row.int(1));
+    try std.testing.expectEqual(@as(i64, 1), row.int(2));
+    try std.testing.expectEqual(@as(i64, 0), row.int(3));
+}
+
 test "external chat draft mutation is atomic and rejects a stale GUI snapshot" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8122,6 +8421,7 @@ test "legacy serialized receipt fingerprints migrate without breaking replay" {
             "update store_receipts set fingerprint = ?1 where request_key = ?2",
             .{ legacy_fingerprint, request.mutation.request_key },
         );
+        try store.conn.execNoArgs("update store_state set fingerprints_migrated = 0 where id = 1");
         try store.conn.execNoArgs(
             \\insert into threads (workspace_id, sort_index, title, local_thread_id, provider, harness)
             \\values ((select id from workspaces where workspace_id = 'legacy-fingerprint-workspace'), 0, 'Legacy key', 'legacy-key-thread', 0, 0);
@@ -8187,6 +8487,7 @@ test "legacy fingerprint migration compacts released SQLite pages" {
             "insert into store_receipts (request_key, operation, fingerprint, store_revision, response_payload, response_status) values ('large-legacy', 'test', ?1, 0, '{}', 0)",
             .{legacy_fingerprint},
         );
+        try conn.execNoArgs("update store_state set fingerprints_migrated = 0 where id = 1");
         var checkpoint = (try conn.row("pragma wal_checkpoint(truncate)", .{})).?;
         checkpoint.deinit();
     }
@@ -8199,6 +8500,34 @@ test "legacy fingerprint migration compacts released SQLite pages" {
     }
     const size_after = (try tmp.dir.statFile(std.testing.io, "state.sqlite", .{})).size;
     try std.testing.expect(size_after < size_before);
+}
+
+test "snapshot receipt retention keeps only the newest bounded replay window" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+    var index: usize = 0;
+    while (index < @as(usize, @intCast(SNAPSHOT_RECEIPT_RETAIN_COUNT + 8))) : (index += 1) {
+        const key = try std.fmt.allocPrint(std.testing.allocator, "snapshot-retain-{d}", .{index});
+        defer std.testing.allocator.free(key);
+        try store.conn.exec(
+            "insert into store_receipts (request_key, operation, fingerprint, store_revision, response_payload, response_status, created_at_ms) values (?1, ?2, 'sha256:test', ?3, '{}', 0, ?3)",
+            .{ key, SNAPSHOT_REPLACE_OPERATION, @as(i64, @intCast(index + 1)) },
+        );
+    }
+    try pruneObsoleteSnapshotReceipts(store.conn);
+    var row = (try store.conn.row(
+        "select count(*), min(store_revision), max(store_revision) from store_receipts where operation = ?1",
+        .{SNAPSHOT_REPLACE_OPERATION},
+    )).?;
+    defer row.deinit();
+    try std.testing.expectEqual(SNAPSHOT_RECEIPT_RETAIN_COUNT, row.int(0));
+    try std.testing.expectEqual(@as(i64, 9), row.int(1));
+    try std.testing.expectEqual(@as(i64, SNAPSHOT_RECEIPT_RETAIN_COUNT + 8), row.int(2));
 }
 
 test "receipt response payload replays exactly after store reopen" {

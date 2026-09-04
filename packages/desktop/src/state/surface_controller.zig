@@ -19,6 +19,7 @@ pub const GROK_LOGO_BYTES = @embedFile("../assets/grok-logo.png");
 pub const AMP_LOGO_BYTES = @embedFile("../assets/amp-logo.png");
 pub const PI_LOGO_BYTES = @embedFile("../assets/pi-logo.png");
 pub const FX_LOGO_BYTES = @embedFile("../assets/fx-logo.png");
+pub const MUSE_LOGO_BYTES = @embedFile("../assets/muse-logo.png");
 
 fn unixTimestampMs() i64 {
     return platform_runtime.unixTimestampMs();
@@ -401,6 +402,7 @@ fn completionNotificationIcon(provider: SurfaceProvider) ?notifier.Icon {
         .amp => .{ .key = "amp", .png_bytes = AMP_LOGO_BYTES },
         .pi => .{ .key = "pi", .png_bytes = PI_LOGO_BYTES },
         .fx => .{ .key = "fx", .png_bytes = FX_LOGO_BYTES },
+        .muse => .{ .key = "muse", .png_bytes = MUSE_LOGO_BYTES },
     };
 }
 
@@ -470,6 +472,7 @@ fn surfaceProviderLabel(provider: SurfaceProvider) []const u8 {
         .amp => "Amp",
         .pi => "Pi",
         .fx => "FX",
+        .muse => "Muse",
     };
 }
 

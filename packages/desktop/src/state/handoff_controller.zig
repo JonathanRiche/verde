@@ -20,7 +20,26 @@ fn defaultModelRef(self: anytype, provider: Provider) [:0]const u8 {
         .pi => provider_models.DEFAULT_PI_MODEL,
         .fx => provider_models.DEFAULT_FX_MODEL,
         .grok => provider_models.DEFAULT_GROK_MODEL,
+        .muse => provider_models.DEFAULT_MUSE_MODEL,
     };
+}
+
+/// Providers offered as handoff targets, in menu order. The default target
+/// is the entry after the source so a handoff never lands on the same agent.
+pub const TARGET_PROVIDERS = [_]Provider{ .codex, .opencode, .claude, .cursor, .pi, .fx, .grok };
+
+pub fn defaultTargetProvider(source: Provider) Provider {
+    for (TARGET_PROVIDERS, 0..) |candidate, index| {
+        if (candidate == source) return TARGET_PROVIDERS[(index + 1) % TARGET_PROVIDERS.len];
+    }
+    return TARGET_PROVIDERS[0];
+}
+
+test "default handoff target is the next provider in menu order" {
+    try std.testing.expectEqual(Provider.opencode, defaultTargetProvider(.codex));
+    try std.testing.expectEqual(Provider.codex, defaultTargetProvider(.grok));
+    try std.testing.expectEqual(Provider.codex, defaultTargetProvider(.muse));
+    for (TARGET_PROVIDERS) |source| try std.testing.expect(defaultTargetProvider(source) != source);
 }
 
 pub const TargetSurface = enum {
@@ -28,8 +47,22 @@ pub const TargetSurface = enum {
     tui,
 };
 
+/// Select menus in the inline handoff sheet; at most one is open.
+pub const Menu = enum {
+    surface,
+    provider,
+    thread,
+    context,
+};
+
 pub const State = struct {
-    modal_open: bool = false,
+    sheet_open: bool = false,
+    menu: ?Menu = null,
+    /// Keyboard focus among the sheet's selects, in the sheet's MENUS order.
+    focus_index: usize = 0,
+    /// Keyboard-highlighted option inside the open menu.
+    menu_highlight: usize = 0,
+    preview_expanded: bool = false,
     project_index: usize = 0,
     source_pane_id: WorkspacePaneId = 0,
     source_thread_index: ?usize = null,
@@ -84,6 +117,7 @@ fn chatProviderForSurface(provider: db_types.SurfaceProvider) ?Provider {
         .pi => .pi,
         .fx => .fx,
         .grok => .grok,
+        .muse => .muse,
         .amp => null,
     };
 }
@@ -97,23 +131,24 @@ pub fn beginThreadHandoff(self: anytype, project_index: usize, thread_index: usi
 
 fn beginHandoff(self: anytype, project_index: usize, pane_id: WorkspacePaneId, thread_index: ?usize, provider: Provider) void {
     self.cancelHandoff();
-    self.handoff_controller.modal_open = true;
+    self.handoff_controller.sheet_open = true;
+    self.handoff_controller.menu = null;
+    self.handoff_controller.focus_index = 0;
+    self.handoff_controller.menu_highlight = 0;
+    self.handoff_controller.preview_expanded = false;
     self.handoff_controller.project_index = project_index;
     self.handoff_controller.source_pane_id = pane_id;
     self.handoff_controller.source_thread_index = thread_index;
     self.handoff_controller.source_provider = provider;
     self.handoff_controller.target_surface = .gui_chat;
-    self.handoff_controller.target_provider = switch (provider) {
-        .codex => .claude,
-        .opencode, .claude, .cursor, .pi, .fx, .grok => .codex,
-    };
+    self.handoff_controller.target_provider = defaultTargetProvider(provider);
     self.handoff_controller.use_existing = false;
     self.handoff_controller.target_thread_index = firstCompatibleHandoffTargetThread(self);
     self.handoff_controller.context_mode = .summary;
     self.handoff_controller.preview = buildHandoffPreviewAlloc(self) catch |err| {
         log.warn("failed to build handoff preview: {s}", .{@errorName(err)});
         self.setSidebarNotice("Failed to collect the handoff context.");
-        self.handoff_controller.modal_open = false;
+        self.handoff_controller.sheet_open = false;
         return;
     };
     self.closeSidebarContextMenu();
@@ -122,7 +157,8 @@ fn beginHandoff(self: anytype, project_index: usize, pane_id: WorkspacePaneId, t
 }
 
 pub fn cancelHandoff(self: anytype) void {
-    self.handoff_controller.modal_open = false;
+    self.handoff_controller.sheet_open = false;
+    self.handoff_controller.menu = null;
     if (self.handoff_controller.preview) |preview| {
         self.allocator.free(preview);
         self.handoff_controller.preview = null;
@@ -168,6 +204,39 @@ pub fn cycleHandoffExistingTarget(self: anytype) void {
         self.markDirty();
         return;
     }
+}
+
+pub fn setHandoffMenu(self: anytype, menu: ?Menu) void {
+    if (self.handoff_controller.menu == menu) return;
+    self.handoff_controller.menu = menu;
+    self.markDirty();
+}
+
+pub fn toggleHandoffPreview(self: anytype) void {
+    self.handoff_controller.preview_expanded = !self.handoff_controller.preview_expanded;
+    self.markDirty();
+}
+
+/// Binds the handoff to a specific compatible existing thread.
+pub fn selectHandoffExistingTarget(self: anytype, thread_index: usize) void {
+    if (!isCompatibleHandoffTargetThread(self, thread_index)) return;
+    self.handoff_controller.target_thread_index = thread_index;
+    self.handoff_controller.use_existing = true;
+    self.markDirty();
+}
+
+/// Returns the n-th compatible target thread index for the current target
+/// provider, in project thread order, so menus can enumerate them.
+pub fn handoffCompatibleTargetThreadAt(self: anytype, n: usize) ?usize {
+    if (self.handoff_controller.project_index >= self.project_controller.projects.items.len) return null;
+    const project = &self.project_controller.projects.items[self.handoff_controller.project_index];
+    var seen: usize = 0;
+    for (project.threads.items, 0..) |_, index| {
+        if (!isCompatibleHandoffTargetThread(self, index)) continue;
+        if (seen == n) return index;
+        seen += 1;
+    }
+    return null;
 }
 
 pub fn handoffExistingTargetLabel(self: anytype) []const u8 {
@@ -238,7 +307,7 @@ pub fn handoffTargetModelLabel(self: anytype) []const u8 {
 /// Creates the target and fills its input with the preview. It deliberately
 /// does not submit the prompt, preserving the required review/edit step.
 pub fn prepareHandoffTarget(self: anytype) void {
-    if (!self.handoff_controller.modal_open) return;
+    if (!self.handoff_controller.sheet_open) return;
     const preview = self.handoff_controller.preview orelse return;
     if (self.handoff_controller.project_index >= self.project_controller.projects.items.len) {
         self.cancelHandoff();
@@ -309,6 +378,7 @@ fn prepareTuiHandoffTarget(self: anytype, preview: []const u8) !WorkspacePaneId 
         // Pi and FX have no agent-TUI stack profile yet; the caller reports the error.
         .pi, .fx => return error.UnsupportedOperation,
         .grok => .grok,
+        .muse => .muse,
     };
     if (!try self.openAgentTuiAtPlacement(
         self.handoff_controller.project_index,

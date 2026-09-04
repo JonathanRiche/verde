@@ -10,6 +10,7 @@ pub const Provider = enum(u8) {
     pi,
     fx,
     grok,
+    muse,
 };
 
 pub const ProviderSlashCommandId = enum(u8) {
