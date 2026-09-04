@@ -6816,6 +6816,9 @@ fn adoptTranscriptIdentitiesFromStoreMessages(
     var unresolved = false;
     for (store_messages) |message_value| {
         if (message_value != .object) continue;
+        if (jsonValueU64(message_value.object.get("sort_index") orelse .null)) |sort_index| {
+            if (sort_index < thread.persisted_message_offset) continue;
+        }
         const store_id = jsonValueString(message_value.object.get("message_id") orelse .null) orelse continue;
         if (store_id.len == 0) continue;
         if (projectionHasMessageId(thread, store_id)) continue;
@@ -6823,9 +6826,8 @@ fn adoptTranscriptIdentitiesFromStoreMessages(
             projection_index += 1;
         }
         if (projection_index >= thread.messages.items.len) {
-            // Store rows beyond the projection carry content the projection
-            // never held; the store belt preserves them by identity, so there
-            // is nothing to adopt into — not a retry condition.
+            // Remaining durable rows are outside the materialized projection;
+            // the contiguous suffix hydrator below owns them.
             break;
         }
         const store_role = jsonValueString(message_value.object.get("role") orelse .null) orelse continue;
@@ -6859,8 +6861,136 @@ fn adoptTranscriptIdentitiesFromStoreMessages(
             );
         }
     }
-    if (adopted_any) self.markDirty();
-    return if (unresolved) .incomplete else .complete;
+    const suffix = hydrateTranscriptSuffixFromStoreMessages(self.allocator, thread, store_messages);
+    if (adopted_any or suffix.appended) self.markDirty();
+    return if (unresolved or suffix.incomplete) .incomplete else .complete;
+}
+
+const TranscriptSuffixHydration = struct {
+    appended: bool = false,
+    incomplete: bool = false,
+};
+
+/// Terminal reconciliation for bounded projections. `chat.thread.get` is
+/// durable-first, so rows at or beyond the materialized absolute end are a
+/// committed suffix that the final live tail may not have projected yet.
+fn hydrateTranscriptSuffixFromStoreMessages(
+    allocator: std.mem.Allocator,
+    thread: *ChatThread,
+    store_messages: []const std.json.Value,
+) TranscriptSuffixHydration {
+    var result: TranscriptSuffixHydration = .{};
+    var expected_sort_index = thread.persisted_message_offset +| thread.messages.items.len;
+    for (store_messages) |message_value| {
+        if (message_value != .object) continue;
+        const sort_index_u64 = jsonValueU64(message_value.object.get("sort_index") orelse .null) orelse continue;
+        const sort_index = std.math.cast(usize, sort_index_u64) orelse {
+            result.incomplete = true;
+            break;
+        };
+        if (sort_index < expected_sort_index) continue;
+        if (sort_index != expected_sort_index) {
+            result.incomplete = true;
+            break;
+        }
+        appendStoreMessageToThread(allocator, thread, message_value) catch {
+            result.incomplete = true;
+            break;
+        };
+        expected_sort_index += 1;
+        result.appended = true;
+    }
+    if (result.appended) {
+        thread.rebuildBackgroundTasksFromMessages(allocator);
+        thread.touch();
+    }
+    return result;
+}
+
+fn appendStoreMessageToThread(
+    allocator: std.mem.Allocator,
+    thread: *ChatThread,
+    message_value: std.json.Value,
+) !void {
+    const object = message_value.object;
+    const role_text = jsonValueString(object.get("role") orelse .null) orelse return error.InvalidDaemonResponse;
+    const author = jsonValueString(object.get("author") orelse .null) orelse return error.InvalidDaemonResponse;
+    const body = jsonValueString(object.get("body") orelse .null) orelse return error.InvalidDaemonResponse;
+
+    const image_count = storeMessageImageCount(object);
+    var extra_images = try allocator.alloc(ChatImageAttachment, image_count -| 1);
+    var extra_built: usize = 0;
+    errdefer {
+        for (extra_images[0..extra_built]) |image| image.deinit(allocator);
+        allocator.free(extra_images);
+    }
+    while (extra_built < extra_images.len) : (extra_built += 1) {
+        extra_images[extra_built] = try storeMessageImage(allocator, object, extra_built + 1);
+    }
+
+    const image = if (image_count > 0) try storeMessageImage(allocator, object, 0) else null;
+    errdefer if (image) |owned| owned.deinit(allocator);
+    const owned_author = try allocator.dupeZ(u8, author);
+    errdefer allocator.free(owned_author);
+    const owned_body = try allocator.dupeZ(u8, body);
+    errdefer allocator.free(owned_body);
+    const tool_call_id = if (jsonValueString(object.get("tool_call_id") orelse .null)) |value|
+        try allocator.dupe(u8, value)
+    else
+        null;
+    errdefer if (tool_call_id) |value| allocator.free(value);
+    const message_id = if (jsonValueString(object.get("message_id") orelse .null)) |value|
+        if (value.len > 0) try allocator.dupe(u8, value) else null
+    else
+        null;
+    errdefer if (message_id) |value| allocator.free(value);
+
+    try thread.messages.append(allocator, .{
+        .role = std.meta.stringToEnum(provider_models.ChatRole, role_text) orelse .system,
+        .author = owned_author,
+        .body = owned_body,
+        .image = image,
+        .extra_images = extra_images,
+        .tool_call_id = tool_call_id,
+        .tool_call_kind = if (jsonValueString(object.get("tool_call_kind") orelse .null)) |value|
+            parseToolCallKind(value)
+        else
+            null,
+        .tool_call_status = if (jsonValueString(object.get("tool_call_status") orelse .null)) |value|
+            parseToolCallStatus(value)
+        else
+            null,
+        .message_id = message_id,
+    });
+}
+
+fn storeMessageImageCount(object: std.json.ObjectMap) usize {
+    if (object.get("images")) |images| {
+        if (images == .array and images.array.items.len > 0) return images.array.items.len;
+    }
+    if (object.get("image")) |image| return if (image == .object) 1 else 0;
+    return 0;
+}
+
+fn storeMessageImage(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    index: usize,
+) !ChatImageAttachment {
+    const value = blk: {
+        if (object.get("images")) |images| {
+            if (images == .array and index < images.array.items.len) break :blk images.array.items[index];
+        }
+        if (index == 0) {
+            if (object.get("image")) |image| break :blk image;
+        }
+        return error.InvalidDaemonResponse;
+    };
+    if (value != .object) return error.InvalidDaemonResponse;
+    const path = jsonValueString(value.object.get("path") orelse .null) orelse return error.InvalidDaemonResponse;
+    const mime = jsonValueString(value.object.get("mime") orelse .null) orelse "";
+    const byte_size = jsonValueU64(value.object.get("byte_size") orelse .null) orelse 0;
+    return ChatImageAttachment.init(allocator, path, mime, std.math.cast(usize, byte_size) orelse 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -7593,6 +7723,66 @@ test "M4-P5 amendment: incomplete adoption retries to a single identity set" {
     try std.testing.expectEqual(@as(u32, 2), adoption_retry_pending.get(key).?.attempts);
     clearAdoptionPending("ws-adopt-test", thread.local_thread_id, "turn-adopt-test");
     try std.testing.expect(adoption_retry_pending.get(key) == null);
+}
+
+test "terminal adoption hydrates the committed suffix of a bounded transcript" {
+    const allocator = std.testing.allocator;
+    const AdoptState = struct {
+        allocator: std.mem.Allocator,
+        dirty: bool = false,
+        pub fn markDirty(self: *@This()) void {
+            self.dirty = true;
+        }
+    };
+    var state: AdoptState = .{ .allocator = allocator };
+
+    var thread = try ChatThread.init(allocator, "Bounded adoption thread");
+    defer thread.deinit(allocator);
+    thread.persisted_message_offset = 10;
+    try thread.messages.append(allocator, .{
+        .role = .user,
+        .author = try allocator.dupeZ(u8, "You"),
+        .body = try allocator.dupeZ(u8, "profile it"),
+    });
+    try thread.messages.append(allocator, .{
+        .role = .assistant,
+        .author = try allocator.dupeZ(u8, "Codex"),
+        .body = try allocator.dupeZ(u8, "Still checking."),
+    });
+
+    var store_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\[{"sort_index":9,"message_id":"turn:old:msg:1","role":"assistant","author":"Codex","body":"Old history","images":[]},
+        \\ {"sort_index":10,"message_id":"turn:t1:user","role":"user","author":"You","body":"profile it","images":[]},
+        \\ {"sort_index":11,"message_id":"turn:t1:msg:1","role":"assistant","author":"Codex","body":"Still checking.","images":[]},
+        \\ {"sort_index":12,"message_id":"turn:t1:msg:2","role":"system","author":"Ran command","body":"Output:\\nready","images":[],"tool_call_id":"call-1","tool_call_kind":"execute","tool_call_status":"completed"},
+        \\ {"sort_index":13,"message_id":"turn:t1:msg:3","role":"assistant","author":"Codex","body":"Finished profile.","images":[]}]
+    ,
+        .{},
+    );
+    defer store_parsed.deinit();
+
+    try std.testing.expectEqual(
+        AdoptionOutcome.complete,
+        adoptTranscriptIdentitiesFromStoreMessages(&state, &thread, store_parsed.value.array.items),
+    );
+    try std.testing.expect(state.dirty);
+    try std.testing.expectEqual(@as(usize, 4), thread.messages.items.len);
+    try std.testing.expectEqualStrings("turn:t1:user", thread.messages.items[0].message_id.?);
+    try std.testing.expectEqualStrings("turn:t1:msg:1", thread.messages.items[1].message_id.?);
+    try std.testing.expectEqualStrings("Ran command", thread.messages.items[2].author);
+    try std.testing.expectEqualStrings("call-1", thread.messages.items[2].tool_call_id.?);
+    try std.testing.expectEqual(provider_types.ToolCallKind.execute, thread.messages.items[2].tool_call_kind.?);
+    try std.testing.expectEqual(provider_types.ToolCallStatus.completed, thread.messages.items[2].tool_call_status.?);
+    try std.testing.expectEqualStrings("Finished profile.", thread.messages.items[3].body);
+
+    // The same durable read is idempotent and never appends the suffix twice.
+    try std.testing.expectEqual(
+        AdoptionOutcome.complete,
+        adoptTranscriptIdentitiesFromStoreMessages(&state, &thread, store_parsed.value.array.items),
+    );
+    try std.testing.expectEqual(@as(usize, 4), thread.messages.items.len);
 }
 
 test "adoption refresh veto count survives clear/re-mint and stays terminal" {
