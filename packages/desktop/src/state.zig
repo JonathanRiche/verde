@@ -10429,6 +10429,9 @@ pub const AppState = struct {
     }
 
     fn handleProviderSlashCommand(self: *AppState, raw_text: []const u8) bool {
+        // Provider command metadata is lazy. Ordinary prompts must bypass that
+        // initialization so their first submit is never consumed as a preload.
+        if (!slash_commands.isSlashInput(raw_text)) return false;
         const thread = self.currentThread();
         if (!command_controller.ensureProviderSlashCatalog(self)) {
             self.setSidebarNotice("Loading provider commands...");
