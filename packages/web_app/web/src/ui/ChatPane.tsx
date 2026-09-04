@@ -1096,6 +1096,7 @@ const PROVIDER_OPTIONS = [
   { value: 'pi', label: 'Pi' },
   { value: 'fx', label: 'FX' },
   { value: 'grok', label: 'Grok' },
+  { value: 'muse', label: 'Muse' },
 ] as const
 
 type PickerProvider = typeof PROVIDER_OPTIONS[number]['value'] | 'favorites'

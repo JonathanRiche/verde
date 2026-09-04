@@ -34,6 +34,7 @@ pub const ChatProvider = enum {
     pi,
     fx,
     grok,
+    muse,
 
     pub fn parse(value: []const u8) ?ChatProvider {
         inline for (std.meta.fields(ChatProvider)) |field| {

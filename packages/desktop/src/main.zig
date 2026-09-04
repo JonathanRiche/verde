@@ -879,8 +879,8 @@ fn syncMouseCursor(state: *AppState, cache: *SystemCursorCache) void {
         cache.native_browser_owned = true;
         return;
     }
-    // The settings modal covers the workspace behind a scrim, so shapes from
-    // occluded terminal panes must not win while it is open.
+    // The settings column is docked beside the sidebar; occluded terminal
+    // panes must not win the cursor while it is open.
     if (!state.settings_controller.modal_visible) {
         if (terminal_panel_ui.mouseShapeAtPoint(state, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y)) |shape| {
             applySystemCursor(cache, if (shape == .pointer) .pointer else .default);
@@ -3671,6 +3671,7 @@ test {
     _ = @import("runtime/ssh_tunnel_supervisor.zig");
     _ = @import("runtime/thread_binding.zig");
     _ = @import("state/browser_controller.zig");
+    _ = @import("state/muse_tui.zig");
     _ = @import("state/runtime_connections_controller.zig");
     _ = @import("state/workspace_layout.zig");
     _ = @import("state/workspace_tabs.zig");
@@ -3680,6 +3681,7 @@ test {
     _ = @import("providers/diagnostics.zig");
     _ = @import("providers/fx.zig");
     _ = @import("providers/grok.zig");
+    _ = @import("providers/muse.zig");
     _ = @import("providers/opencode.zig");
     _ = @import("providers/pi.zig");
     _ = @import("providers/mcp.zig");
@@ -3690,6 +3692,8 @@ test {
     _ = @import("ui/command_palette.zig");
     _ = @import("ui/companion.zig");
     _ = @import("ui/diff_view_cache.zig");
+    _ = @import("ui/handoff_sheet.zig");
+    _ = @import("state/handoff_controller.zig");
     _ = @import("ui/workspace_strip.zig");
     _ = @import("compile_tests/windows_conpty.zig");
     _ = @import("daemon/change_journal.zig");

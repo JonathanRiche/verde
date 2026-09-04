@@ -137,6 +137,7 @@ const STATIC_COMMANDS = [_]Command{
     .{ .id = "workspace.opencode_tui", .title = "Start New OpenCode TUI", .keywords = "agent terminal workspace fresh opencode", .section = .workspaces, .run = runOpenOpencodeTui, .enabled = hasProjects },
     .{ .id = "workspace.cursor_tui", .title = "Start New Cursor TUI", .keywords = "agent terminal workspace fresh cursor agent", .section = .workspaces, .run = runOpenCursorTui, .enabled = hasProjects },
     .{ .id = "workspace.grok_tui", .title = "Start New Grok TUI", .keywords = "agent terminal workspace fresh xai grok build", .section = .workspaces, .run = runOpenGrokTui, .enabled = hasProjectsAndGrok },
+    .{ .id = "workspace.muse_tui", .title = "Start New Muse TUI", .keywords = "agent terminal workspace fresh meta muse code", .section = .workspaces, .run = runOpenMuseTui, .enabled = hasProjects },
     .{ .id = "app.grok_setup", .title = "Set Up Grok Build", .keywords = "install xai agent provider tui", .section = .app, .run = runGrokSetup, .enabled = grokSetupNeeded },
     .{ .id = "workspace.amp_tui", .title = "Start New Amp TUI", .keywords = "agent terminal workspace fresh amp sourcegraph", .section = .workspaces, .run = runOpenAmpTui, .enabled = hasProjects },
     .{ .id = "workspace.herdr_handoff", .title = "Handoff Workspace to Herdr", .keywords = "runtime local terminal tui phone", .section = .workspaces, .run = runHerdrHandoffWorkspace, .enabled = hasProjects },
@@ -815,6 +816,7 @@ fn agentTuiSearchLabel(provider: AgentProvider) []const u8 {
         .cursor => "Cursor TUI",
         .grok => "Grok TUI",
         .amp => "Amp TUI",
+        .muse => "Muse TUI",
         .other => "Agent TUI",
     };
 }
@@ -1480,6 +1482,10 @@ fn runOpenCursorTui(state: *runtime.AppState) void {
 
 fn runOpenGrokTui(state: *runtime.AppState) void {
     runOpenAgentTui(state, .grok);
+}
+
+fn runOpenMuseTui(state: *runtime.AppState) void {
+    runOpenAgentTui(state, .muse);
 }
 
 fn runGrokSetup(state: *runtime.AppState) void {

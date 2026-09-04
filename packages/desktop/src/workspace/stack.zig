@@ -32,6 +32,7 @@ pub const AgentProvider = enum {
     cursor,
     grok,
     amp,
+    muse,
     other,
 };
 

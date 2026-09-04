@@ -5,7 +5,7 @@
 - Read the relevant code path before editing and follow existing patterns.
 - Make the smallest correct change; do not add speculative abstractions or unrelated cleanup.
 - Preserve user and other-agent work already present in the worktree.
-- During iteration, use the narrowest useful check. Before finishing any Zig change, run the configured full build.
+- During iteration, use the narrowest useful check. Before finishing any Zig change, run the configured full build; this is a compile/link verification, not the full test suite.
 
 ## Zig 0.16
 
@@ -36,12 +36,24 @@ Important Zig 0.16 conventions in this repository:
 Run commands from the repository root.
 
 - Normal build/install verification: `mise run build`.
+- Fast desktop-only iteration: `mise run dev-build`.
+- Isolated clean-prefix packaging verification: `mise run build-verify-install` (release/packaging work only).
 - Real desktop runtime testing: `mise run dev`.
 - Do not use bare `zig build`; its Debug + WPE default is known to fail at link time.
 - If a lower-level build is explicitly needed, use `zig build --release=safe -Dbrowser-backend=native_webview`.
 - Do not run generated desktop binaries directly for normal verification.
 
-For speed, use focused tests or `zig ast-check` while iterating, but do not treat them as final verification. The default Debug build is currently broken and is not an approved fast path; every completed Zig change must finish with `mise run build`.
+For speed, use `zig ast-check`, `mise run dev-build`, or the narrowest relevant test while iterating, but do not treat those focused checks as final verification. `dev-build` installs only the main desktop executable; it intentionally skips the standalone daemon, browser helper, provider bridge installation, runtime-payload copying, tests, and packaging checks. It must use the production LLVM backend: Zig 0.16's self-hosted x86 backend is known to miscompile this application and crash during startup. Every completed Zig change must still finish with `mise run build`. Do not run the aggregate desktop `zig build test` merely because a Zig file changed: it is a broad, comparatively slow suite and is required only when the change is cross-cutting, changes test/build infrastructure, or the user explicitly requests it. Prefer `zig build headless-test --release=safe -Dbrowser-backend=native_webview` for headless/core work and `zig build runtime-test --release=safe -Dbrowser-backend=native_webview` for remote-runtime work.
+
+Builds and tests are deliberately separate:
+
+- `mise run build` must compile and link without depending on any test runner. Do not add test steps to the install/build graph.
+- `mise run build` validates its existing `zig-out`; do not add a second isolated-prefix rebuild to the routine gate. Use `mise run build-verify-install` only for changes to installation, packaging, runtime payloads, or loader paths.
+- Do not append `zig build test-compile` after `mise run build`; the application build is the required compile check. Use `test-compile` only when explicitly validating test compilation for a target that cannot execute tests.
+- Register a test in one aggregate runner only. Focused runners may overlap the aggregate suite for opt-in iteration, but the aggregate `test` step must not execute the same tests through multiple roots.
+- Unit tests must be hermetic: no live provider CLI, user daemon, external network, or persistent user state. Use temporary state and loopback fixtures with finite deadlines.
+- Every test-owned thread, process, listener, and long poll needs deterministic cancellation and teardown. Never rely on closing a descriptor from another thread to interrupt blocking I/O.
+- If a test makes no progress for 60 seconds, inspect the named test and process/thread wait state. Do not leave an unexplained `run test` command waiting for ten minutes.
 
 Never run `mise run dev`, `mise run dev-term`, `zig build run`, or `pkill verde` from a Verde terminal pane. Verde hosts the agent session, so these commands can kill the session. In that situation, run `mise run build` and ask the user to relaunch for runtime testing.
 

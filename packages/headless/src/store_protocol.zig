@@ -12,6 +12,7 @@ const registry_protocol = @import("registry_protocol.zig");
 // Stable storage method names.  These are wire identifiers, not dispatcher
 // implementation names, and must not be changed after publication.
 pub const METHOD_STATE_SNAPSHOT_REPLACE: []const u8 = "state.snapshot.replace";
+pub const METHOD_APP_STATE_SET: []const u8 = "state.app.set";
 pub const METHOD_WORKSPACE_UPSERT: []const u8 = "workspace.upsert";
 pub const METHOD_CHAT_THREAD_UPSERT: []const u8 = "chat.thread.upsert";
 pub const METHOD_CHAT_DRAFT_SET: []const u8 = "chat.draft.set";
@@ -44,6 +45,7 @@ pub const METHOD_CHAT_TURN_RECORD: []const u8 = "chat.turn.record";
 pub const METHOD_CONFIG_FAVORITE_MODEL_SET: []const u8 = "config.favoriteModel.set";
 
 pub const STATE_SNAPSHOT_REPLACE_METHOD = METHOD_STATE_SNAPSHOT_REPLACE;
+pub const APP_STATE_SET_METHOD = METHOD_APP_STATE_SET;
 pub const WORKSPACE_UPSERT_METHOD = METHOD_WORKSPACE_UPSERT;
 pub const CHAT_THREAD_UPSERT_METHOD = METHOD_CHAT_THREAD_UPSERT;
 pub const CHAT_DRAFT_SET_METHOD = METHOD_CHAT_DRAFT_SET;
@@ -329,6 +331,14 @@ pub const SnapshotReplaceRequest = struct {
     snapshot: Snapshot,
     /// Only bootstrap may omit the expected revision guard.
     bootstrap: bool = false,
+};
+
+/// Targeted shell-selection mutation. Routine selection/sidebar changes must
+/// not require reconciling every workspace and thread.
+pub const AppStateSetRequest = struct {
+    mutation: MutationHeader,
+    selected_workspace_index: usize,
+    sidebar_collapsed: bool,
 };
 
 pub const WorkspaceUpsertRequest = struct {

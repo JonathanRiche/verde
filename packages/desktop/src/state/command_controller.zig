@@ -130,6 +130,11 @@ fn runSlashCommandWorker(
                 .cwd = request_cwd,
             },
         },
+        .muse => ai_harness.ProviderConfig{
+            .muse = .{
+                .cwd = request_cwd,
+            },
+        },
     };
 
     var client = try ai_harness.connect(allocator, provider_config);
@@ -178,6 +183,10 @@ fn formatSlashCommandError(allocator: std.mem.Allocator, provider: Provider, err
         .grok => switch (err) {
             error.UnsupportedOperation => "Grok does not support this slash command yet.",
             else => "Grok slash command failed.",
+        },
+        .muse => switch (err) {
+            error.UnsupportedOperation => "Muse does not support this slash command yet.",
+            else => "Muse slash command failed.",
         },
     };
     return allocator.dupe(u8, message);

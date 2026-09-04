@@ -1514,7 +1514,7 @@ pub fn browserBlockedByPaletteOverlay(self: anytype) bool {
         ) or
         self.project_controller.show_creator or
         self.settings_controller.modal_visible or
-        self.handoff_controller.modal_open or
+        self.handoff_controller.sheet_open or
         self.rename_project_index != null or
         self.thread_import_provider != null or
         self.modal_image_path != null or

@@ -31,6 +31,8 @@ const FX_MODEL_OPTIONS = provider_models.FX_MODEL_OPTIONS;
 const DEFAULT_FX_MODEL = provider_models.DEFAULT_FX_MODEL;
 const GROK_MODEL_OPTIONS = provider_models.GROK_MODEL_OPTIONS;
 const DEFAULT_GROK_MODEL = provider_models.DEFAULT_GROK_MODEL;
+const MUSE_MODEL_OPTIONS = provider_models.MUSE_MODEL_OPTIONS;
+const DEFAULT_MUSE_MODEL = provider_models.DEFAULT_MUSE_MODEL;
 const CLAUDE_STANDARD_EFFORT_VALUES = provider_models.CLAUDE_STANDARD_EFFORT_VALUES;
 const parseReasoningEffort = provider_models.parseReasoningEffort;
 const WorkspacePaneId = workspace_layout.WorkspacePaneId;
@@ -110,6 +112,7 @@ fn composerModelOptions(self: anytype, provider: Provider) []const ModelOption {
         self.piModelOptionsSnapshot(),
         self.fxModelOptionsSnapshot(),
         self.grokModelOptionsSnapshot(),
+        MUSE_MODEL_OPTIONS[0..],
     );
 }
 
@@ -122,6 +125,7 @@ fn composerDefaultModelRef(self: anytype, provider: Provider) [:0]const u8 {
         .pi => DEFAULT_PI_MODEL,
         .fx => DEFAULT_FX_MODEL,
         .grok => DEFAULT_GROK_MODEL,
+        .muse => DEFAULT_MUSE_MODEL,
     };
 }
 
@@ -1740,6 +1744,7 @@ pub fn resolveChatCreationSettings(self: anytype, request: OpenChatRequest, mode
             .opencode, .cursor, .fx => false,
             // grok reasoning efforts stop at xhigh.
             .grok => effort != .max,
+            .muse => true,
         };
         if (!supported) return error.UnsupportedReasoningEffort;
     }
@@ -1751,7 +1756,7 @@ pub fn resolveChatCreationSettings(self: anytype, request: OpenChatRequest, mode
         const values = switch (request.provider) {
             .opencode => option.reasoning_variant_keys,
             .cursor => option.cursor_reasoning_values,
-            .codex, .claude, .pi, .fx, .grok => null,
+            .codex, .claude, .pi, .fx, .grok, .muse => null,
         } orelse return error.UnsupportedReasoningVariant;
         var supported = false;
         for (values) |value| {
@@ -1767,7 +1772,7 @@ pub fn resolveChatCreationSettings(self: anytype, request: OpenChatRequest, mode
         const supported = switch (request.provider) {
             .codex => true,
             .cursor => if (self.modelOptionForProvider(.cursor, model_ref)) |option| option.cursor_fast_supported else false,
-            .opencode, .claude, .pi, .fx, .grok => false,
+            .opencode, .claude, .pi, .fx, .grok, .muse => false,
         };
         if (!supported) return error.UnsupportedFastMode;
     }
@@ -2260,6 +2265,7 @@ pub fn tuiResumeCommand(self: anytype, provider: Provider, thread_id: []const u8
         .pi => std.fmt.allocPrint(self.allocator, "pi --session-id {s}\n", .{thread_id}),
         .fx => std.fmt.allocPrint(self.allocator, "fx --resume {s}\n", .{thread_id}),
         .grok => std.fmt.allocPrint(self.allocator, "grok --resume {s}\n", .{thread_id}),
+        .muse => std.fmt.allocPrint(self.allocator, "muse resume {s}\n", .{thread_id}),
     };
 }
 

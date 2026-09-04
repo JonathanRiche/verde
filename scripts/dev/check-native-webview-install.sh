@@ -2,14 +2,29 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-PREFIX_DIR="$(mktemp -d /tmp/verde-native-install.XXXXXX)"
+PREFIX_DIR="$REPO_ROOT/zig-out"
+TEMP_PREFIX_DIR=""
 SMOKE_CWD="$(mktemp -d /tmp/verde-native-cwd.XXXXXX)"
-trap 'rm -rf "$PREFIX_DIR" "$SMOKE_CWD"' EXIT
 
-(
-  cd "$REPO_ROOT"
-  zig build --release=safe -p "$PREFIX_DIR" -Dbrowser-backend=native_webview
-)
+cleanup() {
+  if [[ -n "$TEMP_PREFIX_DIR" ]]; then
+    rm -rf -- "$TEMP_PREFIX_DIR"
+  fi
+  rm -rf -- "$SMOKE_CWD"
+}
+trap cleanup EXIT
+
+if [[ "${1:-}" == "--isolated" ]]; then
+  TEMP_PREFIX_DIR="$(mktemp -d /tmp/verde-native-install.XXXXXX)"
+  PREFIX_DIR="$TEMP_PREFIX_DIR"
+  (
+    cd "$REPO_ROOT"
+    zig build --release=safe -p "$PREFIX_DIR" -Dbrowser-backend=native_webview
+  )
+elif [[ $# -ne 0 ]]; then
+  echo "usage: $0 [--isolated]" >&2
+  exit 2
+fi
 
 required_payload=(
   "verde"

@@ -3859,6 +3859,7 @@ fn streamAuthorLabel(provider: app_state.Provider) []const u8 {
         .pi => "Pi",
         .fx => "FX",
         .grok => "Grok",
+        .muse => "Muse",
     };
 }
 

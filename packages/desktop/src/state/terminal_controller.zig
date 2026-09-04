@@ -1,7 +1,6 @@
 //! Terminal ownership, focus, input routing, polling, and agent-TUI metadata.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const sdl = @import("zsdl3");
 const profiler = @import("../runtime/profiler.zig");
 const keybinds = @import("../app/keybinds.zig");
@@ -87,27 +86,24 @@ pub const DefaultAgentTui = struct {
     hooks: bool = false,
 };
 
-pub const OPENCODE_TUI_COMMAND =
-    \\candidate=$(find "$HOME/.npm/_npx" -path '*/node_modules/opencode-linux-x64*/bin/opencode' -type f -perm -111 2>/dev/null | sort | tail -n 1)
-    \\if [ -n "$candidate" ]; then exec "$candidate"; fi
-    \\exec opencode
-;
+/// OpenCode 2 ships the TUI and the shared service in one binary. Verde
+/// launches the v2 TUI directly; the lifecycle plugin only loads there.
+pub const OPENCODE_TUI_COMMAND = "opencode2";
 const GROK_TUI_COMMAND = "grok --no-auto-update --no-alt-screen --no-memory --disable-web-search --permission-mode plan --reasoning-effort low";
 const LEGACY_GROK_TUI_COMMAND = "grok --no-auto-update";
 const LEGACY_GROK_NO_SUBAGENTS_TUI_COMMAND = "grok --no-auto-update --no-alt-screen --no-memory --no-subagents --disable-web-search --permission-mode plan --reasoning-effort low";
-
-fn opencodeTuiCommandForOs(comptime os_tag: std.Target.Os.Tag) []const u8 {
-    return if (os_tag == .windows) "opencode" else OPENCODE_TUI_COMMAND;
-}
 
 pub fn defaultAgentTui(provider: stack_config.AgentProvider) ?DefaultAgentTui {
     return switch (provider) {
         .codex => .{ .name = "codex", .command = "codex", .provider = .codex, .notify = true, .mcp = true, .hooks = true },
         .claude => .{ .name = "claude", .command = "claude", .provider = .claude, .notify = true, .hooks = true },
-        .opencode => .{ .name = "opencode", .command = opencodeTuiCommandForOs(builtin.os.tag), .provider = .opencode, .notify = true, .hooks = true },
+        .opencode => .{ .name = "opencode", .command = OPENCODE_TUI_COMMAND, .provider = .opencode, .notify = true, .hooks = true },
         .cursor => .{ .name = "cursor", .command = "agent", .provider = .cursor, .notify = true, .hooks = true },
         .grok => .{ .name = "grok", .command = GROK_TUI_COMMAND, .provider = .grok, .notify = true, .hooks = true },
         .amp => .{ .name = "amp", .command = "amp", .provider = .amp, .notify = true, .hooks = true },
+        // Stable Muse does not expose third-party hooks yet. Verde projects
+        // lifecycle state from Muse's durable local event log instead.
+        .muse => .{ .name = "muse", .command = "muse", .provider = .muse, .notify = true, .hooks = true },
         .other => null,
     };
 }
@@ -116,13 +112,15 @@ pub fn isKnownDefaultAgentTuiCommand(provider: stack_config.AgentProvider, comma
     return switch (provider) {
         .codex => std.mem.eql(u8, command, "codex"),
         .claude => std.mem.eql(u8, command, "claude"),
-        .opencode => std.mem.eql(u8, command, "opencode") or std.mem.eql(u8, command, OPENCODE_TUI_COMMAND),
+        .opencode => std.mem.eql(u8, command, "opencode") or std.mem.eql(u8, command, "opencode2") or
+            std.mem.eql(u8, command, OPENCODE_TUI_COMMAND),
         .cursor => std.mem.eql(u8, command, "agent"),
         .grok => std.mem.eql(u8, command, "grok") or
             std.mem.eql(u8, command, LEGACY_GROK_TUI_COMMAND) or
             std.mem.eql(u8, command, LEGACY_GROK_NO_SUBAGENTS_TUI_COMMAND) or
             std.mem.eql(u8, command, GROK_TUI_COMMAND),
         .amp => std.mem.eql(u8, command, "amp"),
+        .muse => std.mem.eql(u8, command, "muse"),
         .other => false,
     };
 }
@@ -135,6 +133,7 @@ pub fn agentTuiProviderLabel(provider: ?stack_config.AgentProvider) []const u8 {
         .cursor => "Cursor",
         .grok => "Grok",
         .amp => "Amp",
+        .muse => "Muse",
         .other => "Agent",
     };
 }
@@ -147,15 +146,16 @@ pub fn supportedAgentTuiProviderFromName(name: []const u8) ?stack_config.AgentPr
 pub fn agentTuiProviderFromProcessName(name: []const u8) ?stack_config.AgentProvider {
     if (std.mem.eql(u8, name, "codex")) return .codex;
     if (std.mem.eql(u8, name, "claude")) return .claude;
-    if (std.mem.eql(u8, name, "opencode")) return .opencode;
+    if (std.mem.eql(u8, name, "opencode") or std.mem.eql(u8, name, "opencode2")) return .opencode;
     if (std.mem.eql(u8, name, "agent") or std.mem.startsWith(u8, name, "cursor")) return .cursor;
     if (std.mem.eql(u8, name, "grok")) return .grok;
     if (std.mem.eql(u8, name, "amp")) return .amp;
+    if (std.mem.eql(u8, name, "muse") or std.mem.startsWith(u8, name, "muse-bin-")) return .muse;
     return null;
 }
 
 test "managed AI TUI defaults enable lifecycle hooks" {
-    const providers = [_]stack_config.AgentProvider{ .claude, .codex, .cursor, .grok, .amp, .opencode };
+    const providers = [_]stack_config.AgentProvider{ .claude, .codex, .cursor, .grok, .amp, .opencode, .muse };
     for (providers) |provider| {
         const defaults = defaultAgentTui(provider).?;
         try std.testing.expect(defaults.notify);
@@ -176,6 +176,16 @@ test "Grok TUI defaults use the least-privilege launch mode" {
     try std.testing.expect(isKnownDefaultAgentTuiCommand(.grok, LEGACY_GROK_TUI_COMMAND));
     try std.testing.expect(isKnownDefaultAgentTuiCommand(.grok, LEGACY_GROK_NO_SUBAGENTS_TUI_COMMAND));
     try std.testing.expectEqual(stack_config.AgentProvider.grok, agentTuiProviderFromProcessName("grok").?);
+}
+
+test "OpenCode TUI defaults launch OpenCode 2 and keep legacy commands known" {
+    const defaults = defaultAgentTui(.opencode).?;
+    try std.testing.expectEqualStrings("opencode2", defaults.command);
+    try std.testing.expect(isKnownDefaultAgentTuiCommand(.opencode, "opencode2"));
+    // Panes saved before the OpenCode 2 migration still count as managed TUIs.
+    try std.testing.expect(isKnownDefaultAgentTuiCommand(.opencode, "opencode"));
+    try std.testing.expectEqual(stack_config.AgentProvider.opencode, agentTuiProviderFromProcessName("opencode2").?);
+    try std.testing.expectEqual(stack_config.AgentProvider.opencode, agentTuiProviderFromProcessName("opencode").?);
 }
 
 pub const State = struct {

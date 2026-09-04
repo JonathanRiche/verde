@@ -15,14 +15,29 @@ const DEFAULT_EXECUTABLE = "agent";
 const FALLBACK_EXECUTABLE = "cursor-agent";
 const DEFAULT_MODEL = "composer-2.5";
 const MAX_CURSOR_OUTPUT_BYTES = 8 * 1024 * 1024;
+const RESOURCE_EXHAUSTED_MESSAGE =
+    \\**Cursor model temporarily unavailable**
+    \\
+    \\Cursor could not reach the selected model because the model provider is temporarily at capacity. Try again shortly, switch to Auto or another model, or check [Cursor Status](https://status.cursor.com).
+    \\
+    \\Technical details: `RetriableError: [resource_exhausted] Error`
+;
 
 const ACP_HARNESS: acp.Harness = .{
     .diagnostics_category = .cursor_acp,
     .assistant_author = "Cursor",
     .permission_default_title = "Cursor permission request",
+    .agent_error_message = cursorAgentErrorMessage,
 };
 
 var active_process_state: acp.ActiveProcessState = .{};
+
+fn cursorAgentErrorMessage(text: []const u8) ?[]const u8 {
+    if (std.mem.indexOf(u8, text, "[resource_exhausted] Error") != null) {
+        return RESOURCE_EXHAUSTED_MESSAGE;
+    }
+    return null;
+}
 
 pub fn providerSlashCommands() []const provider_types.ProviderSlashCommand {
     return &.{};
@@ -826,6 +841,14 @@ test "resolveCursorExecutableAlloc falls back to cursor-agent after configured c
     defer env_map.deinit();
     try env_map.put("PATH", "/definitely/missing");
     try std.testing.expectError(error.FileNotFound, resolveCursorExecutableAlloc(std.testing.allocator, &env_map, "missing-agent"));
+}
+
+test "Cursor resource exhaustion explains provider capacity and links status" {
+    const message = cursorAgentErrorMessage("Error: RetriableError: [resource_exhausted] Error").?;
+    try std.testing.expect(std.mem.indexOf(u8, message, "temporarily at capacity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "https://status.cursor.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "[resource_exhausted]") != null);
+    try std.testing.expect(cursorAgentErrorMessage("ordinary assistant reply") == null);
 }
 
 test "cursorModelArgAlloc folds legacy SDK params into CLI model id" {

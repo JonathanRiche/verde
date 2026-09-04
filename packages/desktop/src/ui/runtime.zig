@@ -4,6 +4,7 @@ const native_state = @import("../state.zig");
 const utils = @import("../utils.zig");
 
 pub const AppState = native_state.AppState;
+pub const CachedImageTexture = native_state.CachedImageTexture;
 pub const ChatImageAttachment = native_state.ChatImageAttachment;
 pub const ChatThread = native_state.ChatThread;
 pub const ChatRole = native_state.ChatRole;

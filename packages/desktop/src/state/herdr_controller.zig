@@ -29,7 +29,7 @@ fn herdrPaneProviderForThreadProvider(provider: Provider) HerdrPaneProvider {
         .opencode => .opencode,
         .cursor => .cursor,
         // Pi, FX, and Grok have no HERDR pane mapping yet; unknown panes get no TUI command.
-        .pi, .fx, .grok => .unknown,
+        .pi, .fx, .grok, .muse => .unknown,
     };
 }
 

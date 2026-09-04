@@ -55,6 +55,35 @@ pub fn build(b: *std.Build) void {
     });
     b.default_step.dependOn(&build_cmd.step);
 
+    const dev_build_cmd = addDesktopCommand(b, optimize, .{
+        .subcommand = "dev-build",
+        .forward_runtime_args = false,
+        .target = target,
+        .version = version,
+        .ui_debug = ui_debug,
+        .palette_renderer = palette_renderer,
+        .browser_backend = browser_backend,
+        .terminal_backend = terminal_backend,
+        .local_ipc = local_ipc,
+        .windows_integrations = windows_integrations,
+        .build_fff = build_fff,
+        .fff_cargo_target = fff_cargo_target,
+        .fff_lib_dir = fff_lib_dir,
+        .fff_import_lib = fff_import_lib,
+        .fff_runtime_lib = fff_runtime_lib,
+        .sdl3_include_dir = sdl3_include_dir,
+        .sdl3_lib_dir = sdl3_lib_dir,
+        .sdl3_runtime_lib = sdl3_runtime_lib,
+        .sdl3_ttf_include_dir = sdl3_ttf_include_dir,
+        .sdl3_ttf_lib_dir = sdl3_ttf_lib_dir,
+        .sdl3_ttf_runtime_lib = sdl3_ttf_runtime_lib,
+        .webview2_include_dir = webview2_include_dir,
+        .webview2_loader_lib = webview2_loader_lib,
+        .webview2_loader_dll = webview2_loader_dll,
+    });
+    const dev_build_step = b.step("dev-build", "Build only the main desktop executable");
+    dev_build_step.dependOn(&dev_build_cmd.step);
+
     const daemon_cmd = addDaemonCommand(b, optimize, "daemon", target, cpu, version);
     const daemon_step = b.step("daemon", "Build and install the GUI-free Verde daemon");
     daemon_step.dependOn(&daemon_cmd.step);

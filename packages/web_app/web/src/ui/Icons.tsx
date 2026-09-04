@@ -12,6 +12,7 @@ import grokUrl from '../../../../desktop/src/assets/grok-logo.png'
 import piUrl from '../../../../desktop/src/assets/pi-logo.png'
 import fxUrl from '../../../../desktop/src/assets/fx-logo.png'
 import ampUrl from '../../../../desktop/src/assets/amp-logo.png'
+import museUrl from '../../../../desktop/src/assets/muse-logo.png'
 
 export function VerdeLogo(props: { class?: string }) {
   return (
@@ -53,6 +54,8 @@ export function ProviderGlyph(props: { provider?: string; class?: string }) {
         return fxUrl
       case 'amp':
         return ampUrl
+      case 'muse':
+        return museUrl
       default:
         return null
     }

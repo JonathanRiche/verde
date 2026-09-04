@@ -16,8 +16,10 @@ const settings_modal = @import("settings_modal.zig");
 const runtime_connections = @import("../state/runtime_connections_controller.zig");
 const command_palette = @import("command_palette.zig");
 const companion = @import("companion.zig");
+const handoff_sheet = @import("handoff_sheet.zig");
 const companion_controller = @import("../state/companion_controller.zig");
 const profiler = @import("../runtime/profiler.zig");
+const app_config = @import("../app/config.zig");
 
 const RootLayout = struct {
     sidebar: palette.Rect,
@@ -63,11 +65,21 @@ pub fn handleImageModalWheel(state: *runtime.AppState, width: f32, height: f32, 
 pub fn refreshPaletteModalHits(state: *runtime.AppState, width: f32, height: f32) void {
     companion.refreshHits(state, width, height);
     state.palette_modal_hits.clearRetainingCapacity();
+    // Inline handoff sheet: hits come from the source pane's last-rendered
+    // rect (layout is stable across frames; same staleness as pane hits).
+    // The sheet dies with its source: a project switch or closed pane would
+    // leave it invisible but still key-capturing, so cancel instead.
+    if (state.handoff_controller.sheet_open) {
+        if (state.handoff_controller.project_index != state.project_controller.selected_index) {
+            state.cancelHandoff();
+        } else if (workspace_panes.recordedPaneRect(state.handoff_controller.source_pane_id)) |pane_rect| {
+            handoff_sheet.registerHitsForPane(state, pane_rect);
+        }
+    }
     registerProviderOnboardingHits(state, width, height);
     registerMcpOnboardingHits(state, width, height);
     registerImageModalHits(state, width, height);
     registerTranscriptSelectionModalHits(state, width, height);
-    registerHandoffModalHits(state, width, height);
     registerWorkspaceAddModalHits(state, width, height);
     registerWorkspaceRenameModalHits(state, width, height);
     registerThreadImportModalHits(state, width, height);
@@ -197,7 +209,6 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     defer state.palette_overlay_batch.restoreZIndex(modal_z);
     renderImageModal(state, width, height);
     renderTranscriptSelectionModal(state, width, height);
-    renderHandoffModal(state, width, height);
     renderWorkspaceAddModal(state, width, height);
     renderWorkspaceRenameModal(state, width, height);
     renderThreadImportModal(state, width, height);
@@ -526,6 +537,16 @@ const WorkspaceSettingsLayout = struct {
     list: palette.Rect,
     row_h: f32,
     explain_y: f32,
+    scroll_section_y: f32,
+    scroll_scope_app: palette.Rect,
+    scroll_scope_custom: palette.Rect,
+    scroll_mode_automatic: palette.Rect,
+    scroll_mode_always: palette.Rect,
+    scroll_mode_disabled: palette.Rect,
+    scroll_threshold_dec: palette.Rect,
+    scroll_threshold_inc: palette.Rect,
+    show_scroll_mode: bool,
+    show_scroll_threshold: bool,
     notice_y: f32,
     manage_button: palette.Rect,
     close_button: palette.Rect,
@@ -542,10 +563,17 @@ fn workspaceSettingsLayout(state: *const runtime.AppState, width: f32, height: f
     const explain_h = theme.scaledUi(17.0) * 3.0;
     const notice_h = theme.scaledUi(18.0);
     const button_h = theme.scaledUi(34.0);
+    const control_h = theme.scaledUi(36.0);
     const row_h = theme.scaledUi(WORKSPACE_SETTINGS_ROW_H_UI);
+    const override_enabled = state.settings_controller.draft.workspace_scroll_override_enabled;
+    const show_scroll_mode = override_enabled;
+    const show_scroll_threshold = override_enabled and state.settings_controller.draft.workspace_scroll_mode == .automatic;
+    var scroll_block_h = section_h + gap + control_h;
+    if (show_scroll_mode) scroll_block_h += gap + section_h + gap + control_h;
+    if (show_scroll_threshold) scroll_block_h += gap + control_h;
     const modal_w = @min(theme.scaledUi(560.0), @max(width - theme.scaledUi(64.0), theme.scaledUi(320.0)));
     const rows_h = row_h * @as(f32, @floatFromInt(state.workspaceSettingsOptionCount()));
-    const fixed_h = pad + title_h + gap + section_h + gap + gap + explain_h + gap + notice_h + gap + button_h + pad;
+    const fixed_h = pad + title_h + gap + section_h + gap + gap + explain_h + gap + scroll_block_h + gap + notice_h + gap + button_h + pad;
     const max_modal_h = @max(height - theme.scaledUi(96.0), theme.scaledUi(300.0));
     const list_h = theme.clampf(rows_h, row_h, @max(max_modal_h - fixed_h, row_h));
     const modal_h = fixed_h + list_h;
@@ -564,7 +592,35 @@ fn workspaceSettingsLayout(state: *const runtime.AppState, width: f32, height: f
         .h = list_h,
     };
     const explain_y = list.y + list.h + gap;
-    const notice_y = explain_y + explain_h + gap;
+    const scroll_section_y = explain_y + explain_h + gap;
+    const scope_y = scroll_section_y + section_h + gap;
+    const scope_w = list.w * 0.5;
+    const scroll_scope_app: palette.Rect = .{ .x = list.x, .y = scope_y, .w = scope_w, .h = control_h };
+    const scroll_scope_custom: palette.Rect = .{ .x = scroll_scope_app.x + scope_w, .y = scope_y, .w = scope_w, .h = control_h };
+    const mode_label_y = scope_y + control_h + gap;
+    const mode_y = mode_label_y + section_h + gap;
+    const mode_w = list.w / 3.0;
+    const empty: palette.Rect = .{ .x = 0.0, .y = -10000.0, .w = 0.0, .h = 0.0 };
+    const scroll_mode_automatic: palette.Rect = if (show_scroll_mode) .{ .x = list.x, .y = mode_y, .w = mode_w, .h = control_h } else empty;
+    const scroll_mode_always: palette.Rect = if (show_scroll_mode) .{ .x = scroll_mode_automatic.x + mode_w, .y = mode_y, .w = mode_w, .h = control_h } else empty;
+    const scroll_mode_disabled: palette.Rect = if (show_scroll_mode) .{ .x = scroll_mode_always.x + mode_w, .y = mode_y, .w = mode_w, .h = control_h } else empty;
+    const threshold_y = if (show_scroll_mode) mode_y + control_h + gap else scope_y + control_h + gap;
+    const step_w = theme.scaledUi(32.0);
+    const scroll_threshold_inc: palette.Rect = if (show_scroll_threshold)
+        .{ .x = list.x + list.w - step_w, .y = threshold_y, .w = step_w, .h = control_h }
+    else
+        empty;
+    const scroll_threshold_dec: palette.Rect = if (show_scroll_threshold)
+        .{ .x = scroll_threshold_inc.x - theme.scaledUi(44.0) - step_w, .y = threshold_y, .w = step_w, .h = control_h }
+    else
+        empty;
+    const scroll_bottom = if (show_scroll_threshold)
+        threshold_y + control_h
+    else if (show_scroll_mode)
+        mode_y + control_h
+    else
+        scope_y + control_h;
+    const notice_y = scroll_bottom + gap;
     const button_y = notice_y + notice_h + gap;
     const close_w = theme.scaledUi(96.0);
     const manage_w = theme.scaledUi(176.0);
@@ -577,6 +633,16 @@ fn workspaceSettingsLayout(state: *const runtime.AppState, width: f32, height: f
         .list = list,
         .row_h = row_h,
         .explain_y = explain_y,
+        .scroll_section_y = scroll_section_y,
+        .scroll_scope_app = scroll_scope_app,
+        .scroll_scope_custom = scroll_scope_custom,
+        .scroll_mode_automatic = scroll_mode_automatic,
+        .scroll_mode_always = scroll_mode_always,
+        .scroll_mode_disabled = scroll_mode_disabled,
+        .scroll_threshold_dec = scroll_threshold_dec,
+        .scroll_threshold_inc = scroll_threshold_inc,
+        .show_scroll_mode = show_scroll_mode,
+        .show_scroll_threshold = show_scroll_threshold,
         .notice_y = notice_y,
         .manage_button = manage_button,
         .close_button = close_button,
@@ -618,6 +684,17 @@ fn registerWorkspaceSettingsModalHits(state: *runtime.AppState, width: f32, heig
     }
     queueModalHit(state, layout.manage_button, .workspace_settings_manage, 0);
     queueModalHit(state, layout.close_button, .workspace_settings_close, 0);
+    queueModalHit(state, layout.scroll_scope_app, .workspace_settings_scroll_scope, 0);
+    queueModalHit(state, layout.scroll_scope_custom, .workspace_settings_scroll_scope, 1);
+    if (layout.show_scroll_mode) {
+        queueModalHit(state, layout.scroll_mode_automatic, .workspace_settings_scroll_mode, 0);
+        queueModalHit(state, layout.scroll_mode_always, .workspace_settings_scroll_mode, 1);
+        queueModalHit(state, layout.scroll_mode_disabled, .workspace_settings_scroll_mode, 2);
+    }
+    if (layout.show_scroll_threshold) {
+        queueModalHit(state, layout.scroll_threshold_dec, .workspace_settings_scroll_threshold_dec, 0);
+        queueModalHit(state, layout.scroll_threshold_inc, .workspace_settings_scroll_threshold_inc, 0);
+    }
 }
 
 /// Scrolls the workspace-settings option list while the pointer is over it.
@@ -728,12 +805,70 @@ fn renderWorkspaceSettingsModal(state: *runtime.AppState, width: f32, height: f3
             .h = theme.scaledUi(17.0),
         }, line, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), layout.modal);
     }
+    queuePaletteText(state, .{
+        .x = layout.modal.x + pad,
+        .y = layout.scroll_section_y,
+        .w = content_w,
+        .h = theme.scaledUi(20.0),
+    }, "Scrolling", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.5), layout.modal);
+    drawWorkspaceSettingsSegment(
+        state,
+        layout.scroll_scope_app,
+        "App default",
+        !state.settings_controller.draft.workspace_scroll_override_enabled,
+        pointInRect(mouse_x, mouse_y, layout.scroll_scope_app),
+    );
+    drawWorkspaceSettingsSegment(
+        state,
+        layout.scroll_scope_custom,
+        "Custom",
+        state.settings_controller.draft.workspace_scroll_override_enabled,
+        pointInRect(mouse_x, mouse_y, layout.scroll_scope_custom),
+    );
+    if (layout.show_scroll_mode) {
+        queuePaletteText(state, .{
+            .x = layout.modal.x + pad,
+            .y = layout.scroll_mode_automatic.y - theme.scaledUi(28.0),
+            .w = content_w,
+            .h = theme.scaledUi(20.0),
+        }, "Mode", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.5), layout.modal);
+        const mode = state.settings_controller.draft.workspace_scroll_mode;
+        drawWorkspaceSettingsSegment(state, layout.scroll_mode_automatic, "Auto", mode == .automatic, pointInRect(mouse_x, mouse_y, layout.scroll_mode_automatic));
+        drawWorkspaceSettingsSegment(state, layout.scroll_mode_always, "Always", mode == .always, pointInRect(mouse_x, mouse_y, layout.scroll_mode_always));
+        drawWorkspaceSettingsSegment(state, layout.scroll_mode_disabled, "Off", mode == .disabled, pointInRect(mouse_x, mouse_y, layout.scroll_mode_disabled));
+    }
+    if (layout.show_scroll_threshold) {
+        var threshold_buf: [24]u8 = undefined;
+        const threshold_label = std.fmt.bufPrint(&threshold_buf, "Start after {d} panes", .{state.settings_controller.draft.workspace_scroll_threshold}) catch "Start after";
+        queuePaletteText(state, .{
+            .x = layout.modal.x + pad,
+            .y = layout.scroll_threshold_dec.y + (layout.scroll_threshold_dec.h - theme.scaledUi(18.0)) * 0.5,
+            .w = @max(layout.scroll_threshold_dec.x - layout.modal.x - pad - theme.scaledUi(8.0), theme.scaledUi(80.0)),
+            .h = theme.scaledUi(18.0),
+        }, threshold_label, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), layout.modal);
+        drawWorkspaceSettingsSegment(state, layout.scroll_threshold_dec, "−", false, pointInRect(mouse_x, mouse_y, layout.scroll_threshold_dec));
+        drawWorkspaceSettingsSegment(state, layout.scroll_threshold_inc, "+", false, pointInRect(mouse_x, mouse_y, layout.scroll_threshold_inc));
+    }
     const notice = state.workspaceSettingsNotice();
     if (notice.len > 0) {
         queuePaletteText(state, .{ .x = layout.modal.x + pad, .y = layout.notice_y, .w = content_w, .h = theme.scaledUi(18.0) }, notice, paletteColor(theme.COLOR_GREEN), theme.scaledUi(12.5), layout.modal);
     }
     drawActionButton(state, layout.manage_button, "Manage connections", theme.COLOR_PANEL_ALT);
     drawActionButton(state, layout.close_button, "Close", theme.accent());
+}
+
+fn drawWorkspaceSettingsSegment(state: *runtime.AppState, rect: palette.Rect, label: []const u8, selected: bool, hovered: bool) void {
+    if (rect.w <= 0.0 or rect.h <= 0.0) return;
+    const fill = if (selected) theme.withAlpha(theme.accent(), 44) else if (hovered) theme.withAlpha(theme.COLOR_PANEL_ALT, 220) else theme.COLOR_PANEL_ALT;
+    const border = if (selected) theme.withAlpha(theme.accent(), 140) else theme.withAlpha(theme.COLOR_WHITE, 26);
+    queuePaletteRoundedRect(state, rect, paletteColor(fill), theme.scaledUi(7.0));
+    queuePaletteBorder(state, rect, paletteColor(border), theme.scaledUi(7.0), theme.scaledUi(1.0));
+    queuePaletteText(state, .{
+        .x = rect.x + theme.scaledUi(8.0),
+        .y = rect.y + (rect.h - theme.scaledUi(16.0)) * 0.5,
+        .w = @max(rect.w - theme.scaledUi(16.0), theme.scaledUi(8.0)),
+        .h = theme.scaledUi(16.0),
+    }, label, paletteColor(if (selected or hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), rect);
 }
 
 fn drawModalChromeVisual(state: *runtime.AppState, width: f32, height: f32, modal: palette.Rect) void {
@@ -1111,21 +1246,10 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .thread_import_select => state.selectThreadImport(hit.index),
             .handoff_cancel => state.cancelHandoff(),
             .handoff_prepare => state.prepareHandoffTarget(),
-            .handoff_surface_gui => state.setHandoffTargetSurface(.gui_chat),
-            .handoff_surface_tui => state.setHandoffTargetSurface(.tui),
-            .handoff_provider_codex => state.setHandoffTargetProvider(.codex),
-            .handoff_provider_opencode => state.setHandoffTargetProvider(.opencode),
-            .handoff_provider_claude => state.setHandoffTargetProvider(.claude),
-            .handoff_provider_cursor => state.setHandoffTargetProvider(.cursor),
-            .handoff_provider_pi => state.setHandoffTargetProvider(.pi),
-            .handoff_provider_fx => state.setHandoffTargetProvider(.fx),
-            .handoff_provider_grok => state.setHandoffTargetProvider(.grok),
-            .handoff_context_summary => state.setHandoffContextMode(.summary),
-            .handoff_context_recent => state.setHandoffContextMode(.recent),
-            .handoff_context_full => state.setHandoffContextMode(.full),
-            .handoff_target_new => state.setHandoffUseExisting(false),
-            .handoff_target_existing => state.setHandoffUseExisting(true),
-            .handoff_target_next => state.cycleHandoffExistingTarget(),
+            .handoff_menu_toggle => handoff_sheet.toggleMenu(state, hit.index),
+            .handoff_menu_option => handoff_sheet.applyMenuOption(state, hit.index),
+            .handoff_menu_close => state.setHandoffMenu(null),
+            .handoff_preview_toggle => state.toggleHandoffPreview(),
             .project_import_browse => unreachable,
             .project_import_submit => {
                 state.importProjectFromInput() catch |err| {
@@ -1154,19 +1278,33 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .runtime_wizard_select => state.selectRuntimeWizardConnectRuntime(hit.index),
             .runtime_wizard_input => focusModalInput(state, runtimeWizardFocusForIndex(hit.index), hit.rect, x, clicks),
             .settings_runtime_action => state.applyRuntimeRowAction(hit.index),
-            .settings_cancel => state.cancelSettingsModal(),
-            .settings_close => state.cancelSettingsModal(),
-            .settings_save => {
-                if (state.saveSettingsModal()) {
-                    state.setSidebarNotice("Settings saved.");
-                } else |err| {
-                    runtime.log.warn("settings save failed: {s}", .{@errorName(err)});
-                    state.setSidebarNotice("Could not save settings to verde.json.");
-                }
-            },
+            .settings_cancel, .settings_close, .settings_save => state.closeSettingsPanel(),
+            .settings_category => settings_modal.applySettingsCategory(state, hit.index),
+            .settings_open_option => settings_modal.applyOpenActionOption(state, hit.index),
             .workspace_settings_close => state.closeWorkspaceSettings(),
             .workspace_settings_option => state.applyWorkspaceSettingsOption(hit.index),
             .workspace_settings_manage => state.openManageConnectionsFromWorkspaceSettings(),
+            .workspace_settings_scroll_scope => state.applyWorkspaceSettingsScrollScope(hit.index != 0),
+            .workspace_settings_scroll_mode => {
+                const mode: app_config.WorkspaceScrollMode = switch (hit.index) {
+                    0 => .automatic,
+                    1 => .always,
+                    else => .disabled,
+                };
+                state.applyWorkspaceSettingsScrollMode(mode);
+            },
+            .workspace_settings_scroll_threshold_dec => {
+                const current = state.settings_controller.draft.workspace_scroll_threshold;
+                if (current > app_config.MIN_WORKSPACE_SCROLL_THRESHOLD) {
+                    state.applyWorkspaceSettingsScrollThreshold(current - 1);
+                }
+            },
+            .workspace_settings_scroll_threshold_inc => {
+                const current = state.settings_controller.draft.workspace_scroll_threshold;
+                if (current < app_config.MAX_WORKSPACE_SCROLL_THRESHOLD) {
+                    state.applyWorkspaceSettingsScrollThreshold(current + 1);
+                }
+            },
             .settings_control => settings_modal.applyControlAt(state, hit.index, hit.rect, x),
             .settings_theme_option => settings_modal.applyThemeOption(state, hit.index),
             .settings_title_provider_option => settings_modal.applyChatTitleProviderOption(state, hit.index),
@@ -1198,6 +1336,11 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
                     state.settings_controller.new_chat_model_dropdown_open = false;
                     state.settings_controller.new_chat_reasoning_dropdown_open = false;
                     state.settings_controller.new_chat_menu_hover_index = null;
+                    state.markDirty();
+                }
+                if (state.settings_controller.open_action_dropdown_open) {
+                    state.settings_controller.open_action_dropdown_open = false;
+                    state.settings_controller.open_action_hover_index = null;
                     state.markDirty();
                 }
             },
@@ -1349,7 +1492,7 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
         state.rename_project_index != null or
         state.transcriptSelectionBuffer() != null or
         state.thread_import_provider != null or
-        state.handoff_controller.modal_open or
+        state.handoff_controller.sheet_open or
         state.project_controller.show_creator or
         state.settings_controller.modal_visible or
         state.workspaceSettingsOpen() or
@@ -1385,6 +1528,7 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
     // Palette-owned navigation/activation keys; editing keys fall through to
     // the shared modal text path below.
     if (state.command_controller.open and command_palette.handleKeyDown(state, event)) return true;
+    if (state.handoff_controller.sheet_open and handoff_sheet.handleKeyDown(state, event)) return true;
     if (state.settings_controller.modal_visible and settings_modal.handleKeyDown(state, event.key)) return true;
     // Workspace Settings keyboard ownership: it has no editable field, so
     // with no higher-priority modal above it Escape closes through the shared
@@ -1441,7 +1585,10 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
                 };
                 return true;
             }
-            if (state.handoff_controller.modal_open) {
+            if (state.handoff_controller.sheet_open) {
+                // Enter always prepares with the current (default) choices,
+                // even from inside an open select menu.
+                state.setHandoffMenu(null);
                 state.prepareHandoffTarget();
                 return true;
             }
@@ -1549,8 +1696,12 @@ fn dismissTopModal(state: *runtime.AppState) void {
         state.cancelProjectRename();
     } else if (state.thread_import_provider != null) {
         state.cancelThreadImport();
-    } else if (state.handoff_controller.modal_open) {
-        state.cancelHandoff();
+    } else if (state.handoff_controller.sheet_open) {
+        if (state.handoff_controller.menu != null) {
+            state.setHandoffMenu(null);
+        } else {
+            state.cancelHandoff();
+        }
     } else if (state.workspaceSettingsOpen()) {
         state.closeWorkspaceSettings();
     } else if (state.settings_controller.modal_visible) {
@@ -2415,79 +2566,6 @@ fn registerThreadImportModalHits(state: *runtime.AppState, width: f32, height: f
     queueModalHit(state, submit_rect, .thread_import_submit, 0);
 }
 
-fn handoffModalRect(width: f32, height: f32) palette.Rect {
-    const modal_w = theme.clampf(width * 0.58, theme.scaledUi(580.0), theme.scaledUi(780.0));
-    const modal_h = theme.clampf(height * 0.82, theme.scaledUi(560.0), theme.scaledUi(720.0));
-    return .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
-}
-
-fn registerHandoffModalHits(state: *runtime.AppState, width: f32, height: f32) void {
-    if (!state.handoff_controller.modal_open) return;
-    const modal = handoffModalRect(width, height);
-    registerModalChromeHits(state, width, height, modal, true);
-    const pad = theme.scaledUi(20.0);
-    const gap = theme.scaledUi(8.0);
-    const content_w = modal.w - pad * 2.0;
-    const row_h = theme.scaledUi(34.0);
-
-    var y = modal.y + theme.scaledUi(96.0);
-    const surface_w = (content_w - gap) * 0.5;
-    queueModalHit(state, .{ .x = modal.x + pad, .y = y, .w = surface_w, .h = row_h }, .handoff_surface_gui, 0);
-    queueModalHit(state, .{ .x = modal.x + pad + surface_w + gap, .y = y, .w = surface_w, .h = row_h }, .handoff_surface_tui, 0);
-
-    y += theme.scaledUi(58.0);
-    const provider_actions = [_]runtime.PaletteModalAction{
-        .handoff_provider_codex,
-        .handoff_provider_opencode,
-        .handoff_provider_claude,
-        .handoff_provider_cursor,
-        .handoff_provider_pi,
-        .handoff_provider_fx,
-        .handoff_provider_grok,
-    };
-    // Must mirror the render grid: one equal-width button per provider.
-    const provider_count: f32 = @floatFromInt(provider_actions.len);
-    const provider_w = (content_w - gap * (provider_count - 1.0)) / provider_count;
-    for (provider_actions, 0..) |action, index| {
-        queueModalHit(state, .{
-            .x = modal.x + pad + @as(f32, @floatFromInt(index)) * (provider_w + gap),
-            .y = y,
-            .w = provider_w,
-            .h = row_h,
-        }, action, 0);
-    }
-
-    y += theme.scaledUi(58.0);
-    const new_w = content_w * 0.22;
-    const next_w = content_w * 0.16;
-    const existing_w = content_w - new_w - next_w - gap * 2.0;
-    queueModalHit(state, .{ .x = modal.x + pad, .y = y, .w = new_w, .h = row_h }, .handoff_target_new, 0);
-    queueModalHit(state, .{ .x = modal.x + pad + new_w + gap, .y = y, .w = existing_w, .h = row_h }, .handoff_target_existing, 0);
-    queueModalHit(state, .{ .x = modal.x + pad + new_w + gap + existing_w + gap, .y = y, .w = next_w, .h = row_h }, .handoff_target_next, 0);
-
-    y += theme.scaledUi(90.0);
-    const context_w = (content_w - gap * 2.0) / 3.0;
-    const context_actions = [_]runtime.PaletteModalAction{
-        .handoff_context_summary,
-        .handoff_context_recent,
-        .handoff_context_full,
-    };
-    for (context_actions, 0..) |action, index| {
-        queueModalHit(state, .{
-            .x = modal.x + pad + @as(f32, @floatFromInt(index)) * (context_w + gap),
-            .y = y,
-            .w = context_w,
-            .h = row_h,
-        }, action, 0);
-    }
-
-    const button_y = modal.y + modal.h - pad - row_h;
-    const button_w = (content_w - gap) * 0.5;
-    queueModalHit(state, .{ .x = modal.x + pad, .y = button_y, .w = button_w, .h = row_h }, .handoff_cancel, 0);
-    queueModalHit(state, .{ .x = modal.x + pad + button_w + gap, .y = button_y, .w = button_w, .h = row_h }, .handoff_prepare, 0);
-}
-
-// Renders the one-time opt-in for provider-native Verde MCP registration.
 fn renderMcpOnboardingModal(state: *runtime.AppState, width: f32, height: f32) void {
     if (!state.settings_controller.mcp_onboarding_visible or state.settings_controller.provider_onboarding_visible) return;
     const modal = mcpOnboardingRect(width, height);
@@ -2590,6 +2668,7 @@ fn renderProviderReadinessRow(state: *runtime.AppState, rect: palette.Rect, prov
         .pi => "Pi",
         .fx => "FX",
         .grok => "Grok",
+        .muse => "Muse",
     };
     const status = switch (readiness) {
         .checking => "Checking...",
@@ -2617,6 +2696,7 @@ fn providerReadinessStep(provider: runtime.Provider, readiness: runtime.Provider
         .pi => if (readiness == .missing) "Install the pi CLI, then run: pi" else "Open pi, connect a model provider, then check again.",
         .fx => if (readiness == .missing) "Install the fx CLI (curl -fsSL https://fx.sh/setup.sh | bash), then run: fx login" else "Run fx login, then return here and check again.",
         .grok => if (readiness == .missing) "Install Grok Build (docs.x.ai/build), then run: grok login" else "Run grok login, then return here and check again.",
+        .muse => if (readiness == .missing) "Install Muse Code, then run: muse login" else "Run muse login, then return here and check again.",
     };
 }
 
@@ -2877,108 +2957,6 @@ fn renderThreadImportModal(state: *runtime.AppState, width: f32, height: f32) vo
     drawActionButton(state, submit_rect, "Import", theme.COLOR_GREEN);
 }
 
-// Renders the cross-provider handoff target and context chooser.
-fn renderHandoffModal(state: *runtime.AppState, width: f32, height: f32) void {
-    if (!state.handoff_controller.modal_open) return;
-    if (state.handoff_controller.project_index >= state.project_controller.projects.items.len) {
-        state.cancelHandoff();
-        return;
-    }
-    const modal = handoffModalRect(width, height);
-    drawModalChromeVisual(state, width, height, modal);
-    const project = &state.project_controller.projects.items[state.handoff_controller.project_index];
-    const pad = theme.scaledUi(20.0);
-    const gap = theme.scaledUi(8.0);
-    const content_w = modal.w - pad * 2.0;
-    const row_h = theme.scaledUi(34.0);
-    const content_x = modal.x + pad;
-
-    queuePaletteText(state, .{ .x = content_x, .y = modal.y + pad, .w = content_w, .h = theme.scaledUi(24.0) }, "Handoff to another agent", paletteColor(theme.COLOR_WHITE), theme.scaledUi(18.0), modal);
-    var source_buf: [512]u8 = undefined;
-    const source = std.fmt.bufPrint(&source_buf, "Source: {s} · pane {d} · {s}", .{ project.label, state.handoff_controller.source_pane_id, handoffProviderLabel(state.handoff_controller.source_provider) }) catch "Source chat or TUI";
-    queuePaletteText(state, .{ .x = content_x, .y = modal.y + theme.scaledUi(50.0), .w = content_w, .h = theme.scaledUi(20.0) }, source, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), modal);
-
-    queuePaletteText(state, .{ .x = content_x, .y = modal.y + theme.scaledUi(76.0), .w = content_w, .h = theme.scaledUi(18.0) }, "TARGET SURFACE", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), modal);
-    var y = modal.y + theme.scaledUi(96.0);
-    const surface_w = (content_w - gap) * 0.5;
-    drawActionButton(state, .{ .x = content_x, .y = y, .w = surface_w, .h = row_h }, "GUI chat", if (state.handoff_controller.target_surface == .gui_chat) theme.accent() else theme.COLOR_PANEL_ALT);
-    drawActionButton(state, .{ .x = content_x + surface_w + gap, .y = y, .w = surface_w, .h = row_h }, "Agent TUI", if (state.handoff_controller.target_surface == .tui) theme.accent() else theme.COLOR_PANEL_ALT);
-
-    queuePaletteText(state, .{ .x = content_x, .y = y + theme.scaledUi(40.0), .w = content_w, .h = theme.scaledUi(18.0) }, "TARGET PROVIDER", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), modal);
-    y += theme.scaledUi(58.0);
-    const providers = [_]runtime.Provider{ .codex, .opencode, .claude, .cursor, .pi, .fx, .grok };
-    // One equal-width button per provider in the target grid.
-    const provider_count: f32 = @floatFromInt(providers.len);
-    const provider_w = (content_w - gap * (provider_count - 1.0)) / provider_count;
-    for (providers, 0..) |provider, index| {
-        const rect: palette.Rect = .{ .x = content_x + @as(f32, @floatFromInt(index)) * (provider_w + gap), .y = y, .w = provider_w, .h = row_h };
-        drawActionButton(state, rect, handoffProviderLabel(provider), if (state.handoff_controller.target_provider == provider) theme.accent() else theme.COLOR_PANEL_ALT);
-    }
-
-    queuePaletteText(state, .{ .x = content_x, .y = y + theme.scaledUi(40.0), .w = content_w, .h = theme.scaledUi(18.0) }, "TARGET THREAD", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), modal);
-    y += theme.scaledUi(58.0);
-    const new_w = content_w * 0.22;
-    const next_w = content_w * 0.16;
-    const existing_w = content_w - new_w - next_w - gap * 2.0;
-    drawActionButton(state, .{ .x = content_x, .y = y, .w = new_w, .h = row_h }, "New", if (!state.handoff_controller.use_existing) theme.accent() else theme.COLOR_PANEL_ALT);
-    drawActionButton(state, .{ .x = content_x + new_w + gap, .y = y, .w = existing_w, .h = row_h }, state.handoffExistingTargetLabel(), if (state.handoff_controller.use_existing) theme.accent() else theme.COLOR_PANEL_ALT);
-    drawActionButton(state, .{ .x = content_x + new_w + gap + existing_w + gap, .y = y, .w = next_w, .h = row_h }, "Next", theme.COLOR_PANEL_ALT);
-
-    var model_buf: [512]u8 = undefined;
-    const model = std.fmt.bufPrint(&model_buf, "Model: {s} · adjust model, reasoning, and permissions in the editable target", .{state.handoffTargetModelLabel()}) catch "Provider default model";
-    queuePaletteText(state, .{ .x = content_x, .y = y + theme.scaledUi(42.0), .w = content_w, .h = theme.scaledUi(20.0) }, model, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.5), modal);
-
-    queuePaletteText(state, .{ .x = content_x, .y = y + theme.scaledUi(68.0), .w = content_w, .h = theme.scaledUi(18.0) }, "CONTEXT TO EMBED", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), modal);
-    y += theme.scaledUi(90.0);
-    const context_w = (content_w - gap * 2.0) / 3.0;
-    const modes = [_]struct { value: @TypeOf(state.handoff_controller.context_mode), label: []const u8 }{
-        .{ .value = .summary, .label = "Summary" },
-        .{ .value = .recent, .label = "Recent messages" },
-        .{ .value = .full, .label = "Full transcript" },
-    };
-    for (modes, 0..) |mode, index| {
-        const rect: palette.Rect = .{ .x = content_x + @as(f32, @floatFromInt(index)) * (context_w + gap), .y = y, .w = context_w, .h = row_h };
-        drawActionButton(state, rect, mode.label, if (state.handoff_controller.context_mode == mode.value) theme.accent() else theme.COLOR_PANEL_ALT);
-    }
-
-    const disclosure_y = y + theme.scaledUi(46.0);
-    queuePaletteText(state, .{ .x = content_x, .y = disclosure_y, .w = content_w, .h = theme.scaledUi(18.0) }, "Shares transcript selection, workspace/path, Git state, processes, source IDs, and Verde history commands.", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), modal);
-    queuePaletteText(state, .{ .x = content_x, .y = disclosure_y + theme.scaledUi(19.0), .w = content_w, .h = theme.scaledUi(18.0) }, "Attachment bytes and likely credential-bearing lines are excluded. The provider thread ID stays source-only.", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), modal);
-
-    const preview_y = disclosure_y + theme.scaledUi(48.0);
-    const button_y = modal.y + modal.h - pad - row_h;
-    const preview_rect: palette.Rect = .{ .x = content_x, .y = preview_y, .w = content_w, .h = @max(button_y - preview_y - theme.scaledUi(14.0), theme.scaledUi(72.0)) };
-    queuePaletteRoundedRect(state, preview_rect, paletteColor(theme.darken(theme.COLOR_PANEL_ALT, 0.025)), theme.scaledUi(8.0));
-    queuePaletteBorder(state, preview_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0), theme.scaledUi(1.0));
-    var preview_header: [128]u8 = undefined;
-    const header = std.fmt.bufPrint(&preview_header, "PACKAGE PREVIEW · {d} bytes", .{state.handoffPreviewText().len}) catch "PACKAGE PREVIEW";
-    queuePaletteText(state, .{ .x = preview_rect.x + theme.scaledUi(12.0), .y = preview_rect.y + theme.scaledUi(9.0), .w = preview_rect.w - theme.scaledUi(24.0), .h = theme.scaledUi(18.0) }, header, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(10.5), preview_rect);
-    var lines = std.mem.splitScalar(u8, state.handoffPreviewText(), '\n');
-    var line_y = preview_rect.y + theme.scaledUi(31.0);
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        if (line_y + theme.scaledUi(16.0) > preview_rect.y + preview_rect.h - theme.scaledUi(6.0)) break;
-        queuePaletteText(state, .{ .x = preview_rect.x + theme.scaledUi(12.0), .y = line_y, .w = preview_rect.w - theme.scaledUi(24.0), .h = theme.scaledUi(16.0) }, line, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(11.0), preview_rect);
-        line_y += theme.scaledUi(16.0);
-    }
-
-    const button_w = (content_w - gap) * 0.5;
-    drawActionButton(state, .{ .x = content_x, .y = button_y, .w = button_w, .h = row_h }, "Cancel", theme.COLOR_PANEL_ALT);
-    drawActionButton(state, .{ .x = content_x + button_w + gap, .y = button_y, .w = button_w, .h = row_h }, "Prepare editable draft", theme.accent());
-}
-
-fn handoffProviderLabel(provider: runtime.Provider) []const u8 {
-    return switch (provider) {
-        .codex => "Codex",
-        .opencode => "OpenCode",
-        .claude => "Claude",
-        .cursor => "Cursor",
-        .pi => "Pi",
-        .fx => "FX",
-        .grok => "Grok",
-    };
-}
-
 fn threadImportHeading(provider: runtime.Provider) []const u8 {
     return switch (provider) {
         .codex => "Import Codex thread",
@@ -2988,6 +2966,7 @@ fn threadImportHeading(provider: runtime.Provider) []const u8 {
         .pi => "Import Pi thread",
         .fx => "Import FX thread",
         .grok => "Import Grok thread",
+        .muse => "Import Muse thread",
     };
 }
 
@@ -3000,6 +2979,7 @@ fn threadImportDescription(provider: runtime.Provider) []const u8 {
         .pi => "Import loads the existing Pi transcript into this workspace and binds future turns to the same thread.",
         .fx => "Import loads the existing FX transcript into this workspace and binds future turns to the same thread.",
         .grok => "Import loads the existing Grok transcript into this workspace and binds future turns to the same thread.",
+        .muse => "Import loads the existing Muse transcript into this workspace and binds future turns to the same session.",
     };
 }
 
@@ -3012,6 +2992,7 @@ fn threadImportHint(provider: runtime.Provider) [:0]const u8 {
         .pi => "Paste a Pi session ID",
         .fx => "Paste an FX session ID",
         .grok => "Paste a Grok session ID",
+        .muse => "Paste a Muse session ID",
     };
 }
 
@@ -3024,6 +3005,7 @@ fn emptyThreadImportListNotice(provider: runtime.Provider) []const u8 {
         .pi => "No cached Pi threads to show.",
         .fx => "No cached FX threads to show.",
         .grok => "No cached Grok threads to show.",
+        .muse => "No cached Muse sessions to show.",
     };
 }
 
@@ -3217,7 +3199,7 @@ test "workspace settings modal owns keyboard and text input while open" {
     state.rename_project_index = null;
     state.transcript_controller.selection_text = null;
     state.thread_import_provider = null;
-    state.handoff_controller.modal_open = false;
+    state.handoff_controller.sheet_open = false;
     state.project_controller.show_creator = false;
     state.runtime_connections = .{};
     state.command_controller.open = false;
@@ -3266,6 +3248,7 @@ test "workspace settings layout clamps the option list at short heights" {
 
     var state: runtime.AppState = undefined;
     state.runtime_picker_profiles = .empty;
+    state.settings_controller = .{};
     defer {
         for (state.runtime_picker_profiles.items) |*profile| {
             allocator.free(profile.profile_id);

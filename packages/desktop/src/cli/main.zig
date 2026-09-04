@@ -663,7 +663,7 @@ fn handleState(allocator: std.mem.Allocator, out: output.Output, argv: []const [
         return;
     };
     defer client.deinit();
-    var loaded = try client.load(allocator) orelse {
+    var loaded = try client.loadBounded(allocator) orelse {
         if (json) {
             try out.jsonValue(allocator, .{ .workspaces = &.{} });
         } else {
@@ -914,7 +914,7 @@ fn writeOfflineHerdrStatus(allocator: std.mem.Allocator, out: output.Output, jso
         return;
     };
     defer client.deinit();
-    var loaded = try client.load(allocator) orelse {
+    var loaded = try client.loadBounded(allocator) orelse {
         if (json) {
             try out.jsonValue(allocator, .{ .id = 1, .ok = true, .result = .{ .daemon_running = false, .links = &.{} } });
         } else {
@@ -1291,7 +1291,7 @@ fn handleSession(allocator: std.mem.Allocator, out: output.Output, io: std.Io, e
             return;
         };
         defer client.deinit();
-        var loaded = try client.load(allocator) orelse {
+        var loaded = try client.loadBounded(allocator) orelse {
             if (json) {
                 try out.jsonValue(allocator, .{ .daemon_running = false, .sessions = &.{} });
             } else {
@@ -1865,6 +1865,7 @@ const integration_providers = [_]IntegrationProvider{
     .{ .name = "grok", .hook_state = "global", .installable = true, .installed = false, .reason = "Grok Build personal hooks report lifecycle status from ~/.grok/hooks/verde-notify.json without requiring project trust." },
     .{ .name = "pi", .hook_state = "global-extension", .installable = true, .installed = false, .reason = "Pi lifecycle and session-title events are supported through ~/.pi/agent/extensions/verde-notify.ts." },
     .{ .name = "fx", .hook_state = "built-in", .installable = true, .installed = false, .reason = "FX reports lifecycle natively to Verde and supplies its session title through terminal OSC metadata." },
+    .{ .name = "muse", .hook_state = "native-log", .installable = true, .installed = false, .reason = "Verde reads Muse's durable local session events for lifecycle and title reporting; stable Muse does not expose third-party hooks yet." },
 };
 
 fn handleIntegrations(allocator: std.mem.Allocator, out: output.Output, argv: []const []const u8) !void {
@@ -1873,15 +1874,15 @@ fn handleIntegrations(allocator: std.mem.Allocator, out: output.Output, argv: []
             \\Usage:
             \\  verde integrations list [--json]
             \\  verde integrations doctor [--json]
-            \\  verde integrations install <claude|codex|amp|opencode|cursor|grok|pi|fx> [--global]
-            \\  verde integrations remove <claude|codex|amp|opencode|cursor|grok|pi|fx> [--global]
-            \\  verde integrations disable <claude|codex|amp|opencode|cursor|grok|pi|fx>
+            \\  verde integrations install <claude|codex|amp|opencode|cursor|grok|pi|fx|muse> [--global]
+            \\  verde integrations remove <claude|codex|amp|opencode|cursor|grok|pi|fx|muse> [--global]
+            \\  verde integrations disable <claude|codex|amp|opencode|cursor|grok|pi|fx|muse>
             \\
             \\  --global installs Claude/Codex/Cursor/Grok hooks in their user config files,
             \\  plus Amp/OpenCode/Pi plugins in their global plugin directories
             \\  (no-op outside Verde panes); otherwise supported hooks are project-local
             \\  where the provider supports that.
-            \\  FX lifecycle reporting is built into FX and Verde and needs no file install.
+            \\  FX and Muse lifecycle reporting are built into Verde and need no file install.
             \\
             \\Provider hooks are optional. Verde does not overwrite provider config
             \\or change provider login/auth behavior.
@@ -2081,6 +2082,8 @@ fn integrationProvidersWithInstalledState(allocator: std.mem.Allocator) [integra
             provider_hooks.piGlobalHooksInstalled(allocator)
         else if (std.mem.eql(u8, provider.name, "fx"))
             process_env.commandExists("fx")
+        else if (std.mem.eql(u8, provider.name, "muse"))
+            process_env.commandExists("muse")
         else
             false;
     }
@@ -2120,7 +2123,7 @@ fn printIntegrationsDoctor(allocator: std.mem.Allocator, out: output.Output, jso
             .verde_env = std.mem.eql(u8, verde_env, "1"),
             .has_terminal_identity = has_identity,
             .providers = providers[0..],
-            .summary = "Claude/Codex/Cursor/Grok hooks, Amp/OpenCode/Pi global plugins, and FX native lifecycle reporting are available.",
+            .summary = "Claude/Codex/Cursor/Grok hooks, Amp/OpenCode/Pi global plugins, FX native lifecycle, and Muse local-event lifecycle reporting are available.",
         });
         return;
     }
@@ -2128,7 +2131,7 @@ fn printIntegrationsDoctor(allocator: std.mem.Allocator, out: output.Output, jso
         \\Integration doctor:
         \\  VERDE=1: {s}
         \\  terminal identity: {s}
-        \\  hook installers: claude, codex, cursor project-local/global; grok global; amp/opencode/pi global plugins; fx built-in
+        \\  hook installers: claude, codex, cursor project-local/global; grok global; amp/opencode/pi global plugins; fx built-in; muse native-log
         \\  generic paths: verde notify, OSC 777 notify, MCP surface tools
         \\
     , .{
@@ -2404,6 +2407,26 @@ fn installIntegration(allocator: std.mem.Allocator, out: output.Output, json: bo
             std.process.exit(1);
         }
         try out.stdout("verde integrations install fx: FX lifecycle and terminal-title reporting are built in; no hook file is required\n", .{});
+        return;
+    }
+
+    if (std.mem.eql(u8, provider.name, "muse")) {
+        const installed = process_env.commandExists("muse");
+        if (json) {
+            try out.jsonValue(allocator, .{
+                .provider = provider.name,
+                .action = "install",
+                .installed = installed,
+                .status = if (installed) "installed" else "provider_missing",
+                .scope = "native-log",
+            });
+            return;
+        }
+        if (!installed) {
+            try out.stderr("verde integrations install muse: Muse is not installed\n", .{});
+            std.process.exit(1);
+        }
+        try out.stdout("verde integrations install muse: Muse lifecycle and session-title reporting use its local event log; no hook file is required\n", .{});
         return;
     }
 
@@ -3481,7 +3504,7 @@ fn resolveAttachSessionId(
         std.process.exit(4);
     };
     defer client.deinit();
-    var loaded = try client.load(allocator) orelse {
+    var loaded = try client.loadBounded(allocator) orelse {
         try out.stderr("no persisted Verde state found at {s}\n", .{client.path});
         std.process.exit(4);
     };

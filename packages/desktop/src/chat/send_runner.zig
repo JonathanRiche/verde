@@ -61,6 +61,7 @@ pub fn run(allocator: std.mem.Allocator, request: Request, sink: Sink) !Result {
         .pi => harness.ProviderConfig{ .pi = .{ .cwd = request_cwd } },
         .fx => harness.ProviderConfig{ .fx = .{ .cwd = request_cwd, .model = request.model_ref } },
         .grok => harness.ProviderConfig{ .grok = .{ .cwd = request_cwd, .model = request.model_ref } },
+        .muse => harness.ProviderConfig{ .muse = .{ .cwd = request_cwd, .model = request.model_ref } },
     };
 
     log.info("send starting provider={s} cwd={s} model_len={d} thread_id_len={d} prompt_len={d}", .{
@@ -127,6 +128,7 @@ pub fn listModels(
         .pi => harness.ProviderConfig{ .pi = .{ .cwd = project_path } },
         .fx => harness.ProviderConfig{ .fx = .{ .cwd = project_path } },
         .grok => harness.ProviderConfig{ .grok = .{ .cwd = project_path } },
+        .muse => harness.ProviderConfig{ .muse = .{ .cwd = project_path } },
     };
     var client = try harness.connect(allocator, provider_config);
     defer client.deinit();
@@ -149,7 +151,7 @@ fn serviceTierForMode(provider: harness.Provider, fast_mode: FastMode) ?harness.
 }
 
 fn sandboxModeForMode(provider: harness.Provider, mode: AccessMode) ?harness.SandboxMode {
-    if (provider != .codex and provider != .claude) return null;
+    if (provider != .codex and provider != .claude and provider != .muse) return null;
     return switch (mode) {
         .full_access => .danger_full_access,
         .supervised => .workspace_write,

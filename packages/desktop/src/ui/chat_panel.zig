@@ -471,7 +471,9 @@ fn paneOwnsActiveChatState(state: *const app_state.AppState, pane_id: ?app_state
 /// Responsive: per-side inset scales with lane width (clamped 16–48px) and the
 /// column caps at CHAT_CONTENT_MAX_WIDTH on wide panes. x/w are snapped to
 /// whole pixels so both surfaces land on identical device pixels.
-fn chatContentColumn(lane_x: f32, lane_w: f32) struct { x: f32, w: f32 } {
+/// Shared content column for a chat lane: transcript bubbles, the composer,
+/// and pane-docked sheets all align to it so nothing reads as off-axis.
+pub fn chatContentColumn(lane_x: f32, lane_w: f32) struct { x: f32, w: f32 } {
     const side_margin = theme.clampf(lane_w * 0.045, theme.scaledUi(16.0), theme.scaledUi(48.0));
     const width = @max(theme.scaledUi(220.0), @min(lane_w - side_margin * 2.0, theme.scaledUi(CHAT_CONTENT_MAX_WIDTH)));
     return .{ .x = @round(lane_x + (lane_w - width) * 0.5), .w = @round(width) };
@@ -3961,17 +3963,24 @@ fn toolCopyIdentity(message_index: usize, body: []const u8) u64 {
 
 fn isSubagentTimelineEntry(entry: anytype) bool {
     const kind = if (@hasField(@TypeOf(entry), "tool_call_kind")) entry.tool_call_kind else null;
+    if (@hasField(@TypeOf(entry), "tool_call_id") and entry.tool_call_id != null) {
+        // Live provider rows have a stable tool identity. Their structured
+        // kind/title is authoritative, so an unknown or generic ACP kind must
+        // not fall back to scanning a potentially huge output body every frame.
+        return chat_types.isSubagentAuthorOrKind(entry.author, kind);
+    }
     return chat_types.looksLikeSubagentCard(entry.author, kind, entry.body);
 }
 
 fn shouldGroupCommandRow(entry: anytype) bool {
     if (entry.role != .system) return false;
     if (isSubagentTimelineEntry(entry)) return true;
-    // A provider-supplied kind already proves this is a tool row. Avoid the
-    // legacy author/body heuristics below: Cursor read and shell events can
+    // Provider-supplied identity or kind already proves this is a tool row.
+    // Avoid the legacy heuristics below: Cursor tool events can
     // carry very large output bodies, and grouping walks them during both the
     // height and paint passes of every active frame.
-    if (@hasField(@TypeOf(entry), "tool_call_kind") and entry.tool_call_kind != null) return true;
+    if ((@hasField(@TypeOf(entry), "tool_call_id") and entry.tool_call_id != null) or
+        (@hasField(@TypeOf(entry), "tool_call_kind") and entry.tool_call_kind != null)) return true;
     return shouldRenderPaletteCommandRow(entry.author, entry.body);
 }
 
@@ -4088,6 +4097,7 @@ test "structured ordinary tools do not scan legacy subagent markers" {
         role: app_state.ChatRole = .system,
         author: []const u8,
         body: []const u8,
+        tool_call_id: ?[]const u8 = null,
         tool_call_kind: ?ai_harness.ToolCallKind = null,
     };
     const legacy_marker_body =
@@ -4099,7 +4109,7 @@ test "structured ordinary tools do not scan legacy subagent markers" {
     ;
     const events = [_]Event{
         .{ .author = "Read", .body = legacy_marker_body, .tool_call_kind = .read },
-        .{ .author = "provider-specific tool", .body = "opaque output", .tool_call_kind = .mcp },
+        .{ .author = "provider-specific tool", .body = "opaque output", .tool_call_id = "call-1" },
     };
 
     try std.testing.expect(!isSubagentTimelineEntry(events[0]));
@@ -7745,6 +7755,7 @@ fn renderInactiveComposerProviderIcon(state: *app_state.AppState, pill: palette.
         .pi => state.pi_logo_texture,
         .fx => state.fx_logo_texture,
         .grok => state.grok_logo_texture,
+        .muse => null,
     };
     if (provider_icon) |cached| {
         const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, icon_slot.x, icon_slot.y, icon_slot.w, icon_slot.h));
@@ -7758,6 +7769,7 @@ fn renderInactiveComposerProviderIcon(state: *app_state.AppState, pill: palette.
             .pi => "P",
             .fx => "F",
             .grok => "G",
+            .muse => "M",
         };
         queueText(state, icon_slot, fallback_label, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 175)), theme.scaledUi(13.0), pill);
     }
@@ -8438,6 +8450,7 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
         .pi => state.pi_logo_texture,
         .fx => state.fx_logo_texture,
         .grok => state.grok_logo_texture,
+        .muse => null,
     };
     if (provider_icon) |cached| {
         const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, model_icon_slot.x, model_icon_slot.y, model_icon_slot.w, model_icon_slot.h));

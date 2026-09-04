@@ -100,6 +100,15 @@ const ThreadMessages = struct {
     messages: []const PersistedMessage,
 };
 
+const SchemaCapabilities = struct {
+    thread_draft_images: bool,
+    thread_cwd: bool,
+    thread_runtime_route: bool,
+    thread_message_extent: bool,
+    message_id: bool,
+    message_extra_images: bool,
+};
+
 const NoopLoadHook = struct {
     fn afterAppStateRead(_: @This()) !void {}
 };
@@ -187,11 +196,13 @@ pub const Client = struct {
         );
         const row = maybe_row orelse return error.ThreadNotFound;
         defer row.deinit();
+        const capabilities = self.schemaCapabilities();
         const page = try self.loadMessages(
             allocator,
             row.int(0),
             before_offset,
             limit,
+            capabilities,
         );
         return .{ .arena = arena, .offset = page.offset, .messages = page.messages };
     }
@@ -227,50 +238,68 @@ pub const Client = struct {
         try hook.afterAppStateRead();
 
         const arena = loaded.allocator();
+        const capabilities = self.schemaCapabilities();
+        var message_offsets: std.AutoHashMapUnmanaged(i64, usize) = .empty;
+        defer message_offsets.deinit(arena);
+        if (!load_transcripts and !capabilities.thread_message_extent) {
+            try self.loadMessageOffsets(arena, &message_offsets);
+        }
         var workspaces: std.ArrayList(PersistedProject) = .empty;
         defer workspaces.deinit(arena);
+        var workspace_row_ids: std.ArrayList(i64) = .empty;
+        defer workspace_row_ids.deinit(arena);
 
-        var workspace_rows = try self.conn.rows(
-            "select id, workspace_id, label, path, archived, unread_count, collapsed, thread_list_expanded, terminal_height, terminal_layout_json, terminal_docks_json, workspace_layout_json, selected_thread_index, companion_thread_local_id, " ++
-                "herdr_remote_alias, herdr_session_name, herdr_workspace_id, herdr_local_dir, herdr_remote_cwd, herdr_last_pane_id, herdr_attach_dock_id, herdr_attach_pane_id, herdr_pane_links_json, herdr_updated_at_ms " ++
-                "from workspaces order by sort_index",
-            .{},
-        );
-        defer workspace_rows.deinit();
+        {
+            var workspace_rows = try self.conn.rows(
+                "select id, workspace_id, label, path, archived, unread_count, collapsed, thread_list_expanded, terminal_height, terminal_layout_json, terminal_docks_json, workspace_layout_json, selected_thread_index, companion_thread_local_id, " ++
+                    "herdr_remote_alias, herdr_session_name, herdr_workspace_id, herdr_local_dir, herdr_remote_cwd, herdr_last_pane_id, herdr_attach_dock_id, herdr_attach_pane_id, herdr_pane_links_json, herdr_updated_at_ms " ++
+                    "from workspaces order by sort_index",
+                .{},
+            );
+            defer workspace_rows.deinit();
 
-        while (workspace_rows.next()) |workspace_row| {
-            const workspace_id = workspace_row.int(0);
-            try workspaces.append(arena, .{
-                .id = try arena.dupe(u8, workspace_row.text(1)),
-                .label = try arena.dupe(u8, workspace_row.text(2)),
-                .path = try arena.dupe(u8, workspace_row.text(3)),
-                .archived = workspace_row.int(4) != 0,
-                .unread_count = @intCast(workspace_row.int(5)),
-                .collapsed = workspace_row.int(6) != 0,
-                .thread_list_expanded = workspace_row.int(7) != 0,
-                .terminal_height = if (workspace_row.nullableFloat(8)) |value| @floatCast(value) else null,
-                .terminal_layout_json = try dupeOptionalText(arena, workspace_row.nullableText(9)),
-                .terminal_docks_json = try dupeOptionalText(arena, workspace_row.nullableText(10)),
-                .workspace_layout_json = try dupeOptionalText(arena, workspace_row.nullableText(11)),
-                .selected_thread_index = @intCast(workspace_row.int(12)),
-                .companion_thread_local_id = try dupeOptionalText(arena, workspace_row.nullableText(13)),
-                .herdr_link = try loadOptionalHerdrLink(
-                    arena,
-                    workspace_row.nullableText(14),
-                    workspace_row.nullableText(15),
-                    workspace_row.nullableText(16),
-                    workspace_row.nullableText(17),
-                    workspace_row.nullableText(18),
-                    workspace_row.nullableText(19),
-                    workspace_row.nullableInt(20),
-                    workspace_row.nullableInt(21),
-                    workspace_row.nullableText(22),
-                    workspace_row.nullableInt(23),
-                ),
-                .threads = try self.loadThreads(arena, workspace_id, load_transcripts),
-            });
+            while (workspace_rows.next()) |workspace_row| {
+                try workspace_row_ids.append(arena, workspace_row.int(0));
+                try workspaces.append(arena, .{
+                    .id = try arena.dupe(u8, workspace_row.text(1)),
+                    .label = try arena.dupe(u8, workspace_row.text(2)),
+                    .path = try arena.dupe(u8, workspace_row.text(3)),
+                    .archived = workspace_row.int(4) != 0,
+                    .unread_count = @intCast(workspace_row.int(5)),
+                    .collapsed = workspace_row.int(6) != 0,
+                    .thread_list_expanded = workspace_row.int(7) != 0,
+                    .terminal_height = if (workspace_row.nullableFloat(8)) |value| @floatCast(value) else null,
+                    .terminal_layout_json = try dupeOptionalText(arena, workspace_row.nullableText(9)),
+                    .terminal_docks_json = try dupeOptionalText(arena, workspace_row.nullableText(10)),
+                    .workspace_layout_json = try dupeOptionalText(arena, workspace_row.nullableText(11)),
+                    .selected_thread_index = @intCast(workspace_row.int(12)),
+                    .companion_thread_local_id = try dupeOptionalText(arena, workspace_row.nullableText(13)),
+                    .herdr_link = try loadOptionalHerdrLink(
+                        arena,
+                        workspace_row.nullableText(14),
+                        workspace_row.nullableText(15),
+                        workspace_row.nullableText(16),
+                        workspace_row.nullableText(17),
+                        workspace_row.nullableText(18),
+                        workspace_row.nullableText(19),
+                        workspace_row.nullableInt(20),
+                        workspace_row.nullableInt(21),
+                        workspace_row.nullableText(22),
+                        workspace_row.nullableInt(23),
+                    ),
+                    .threads = &.{},
+                });
+            }
+            if (workspace_rows.err) |err| return err;
         }
-        if (workspace_rows.err) |err| return err;
+        try self.loadThreadsForProjects(
+            arena,
+            workspaces.items,
+            workspace_row_ids.items,
+            load_transcripts,
+            &message_offsets,
+            capabilities,
+        );
 
         loaded.value.projects = try workspaces.toOwnedSlice(arena);
         loaded.value.surface_states = try self.loadSurfaceStates(arena);
@@ -593,6 +622,17 @@ pub const Client = struct {
             self.hasColumn("threads", "repository_cwd");
     }
 
+    fn schemaCapabilities(self: *const Self) SchemaCapabilities {
+        return .{
+            .thread_draft_images = self.hasColumn("threads", "draft_images_json"),
+            .thread_cwd = self.hasColumn("threads", "cwd"),
+            .thread_runtime_route = self.hasThreadRouteColumns(),
+            .thread_message_extent = self.hasColumn("threads", "message_extent"),
+            .message_id = self.hasColumn("messages", "message_id"),
+            .message_extra_images = self.hasColumn("messages", "extra_images_json"),
+        };
+    }
+
     fn guardPersistedThreadRoutes(self: *const Self, state: PersistedState) !void {
         const has_route_columns = self.hasThreadRouteColumns();
         for (state.projects, 0..) |project, project_index| {
@@ -735,87 +775,147 @@ pub const Client = struct {
         try guardCommittedRouteRow(row, thread);
     }
 
-    fn loadThreads(
+    fn loadThreadsForProjects(
         self: *const Self,
         allocator: std.mem.Allocator,
-        project_id: i64,
+        projects: []PersistedProject,
+        workspace_row_ids: []const i64,
         load_transcripts: bool,
-    ) ![]const PersistedThread {
-        var threads: std.ArrayList(PersistedThread) = .empty;
-        defer threads.deinit(allocator);
-
-        const has_draft_images = self.hasColumn("threads", "draft_images_json");
-        // v6 adds the per-thread cwd override; older files read it as null.
-        const has_cwd = self.hasColumn("threads", "cwd");
-        // v7 adds the immutable execution-route fields as one migration.
-        const has_runtime_route = self.hasThreadRouteColumns();
-        const select_prefix = "select id, title, archived, committed, local_thread_id, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size, ";
-        const select_suffix = " from threads where workspace_id = ?1 order by sort_index";
-        var thread_rows = try self.conn.rows(
-            if (has_runtime_route)
-                if (has_draft_images and has_cwd)
-                    select_prefix ++ "draft_images_json, cwd, profile_id, runtime_id, repository_id, repository_cwd" ++ select_suffix
-                else if (has_draft_images)
-                    select_prefix ++ "draft_images_json, null, profile_id, runtime_id, repository_id, repository_cwd" ++ select_suffix
-                else if (has_cwd)
-                    select_prefix ++ "null, cwd, profile_id, runtime_id, repository_id, repository_cwd" ++ select_suffix
-                else
-                    select_prefix ++ "null, null, profile_id, runtime_id, repository_id, repository_cwd" ++ select_suffix
-            else if (has_draft_images and has_cwd)
-                select_prefix ++ "draft_images_json, cwd, null, null, null, null" ++ select_suffix
-            else if (has_draft_images)
-                select_prefix ++ "draft_images_json, null, null, null, null, null" ++ select_suffix
-            else if (has_cwd)
-                select_prefix ++ "null, cwd, null, null, null, null" ++ select_suffix
-            else
-                select_prefix ++ "null, null, null, null, null, null" ++ select_suffix,
-            .{project_id},
-        );
-        defer thread_rows.deinit();
-
-        while (thread_rows.next()) |thread_row| {
-            const thread_id = thread_row.int(0);
-            const loaded_messages = try self.loadMessages(
-                allocator,
-                thread_id,
-                null,
-                if (load_transcripts) std.math.maxInt(usize) else 0,
-            );
-            try threads.append(allocator, .{
-                .title = try allocator.dupe(u8, thread_row.text(1)),
-                .archived = thread_row.int(2) != 0,
-                .committed = thread_row.int(3) != 0,
-                .local_thread_id = try dupeOptionalText(allocator, thread_row.nullableText(4)),
-                .last_activity_at = thread_row.nullableInt(5),
-                .provider_thread_id = try dupeOptionalText(allocator, thread_row.nullableText(6)),
-                .model_ref = try dupeOptionalText(allocator, thread_row.nullableText(7)),
-                .reasoning_effort = decodeOptionalEnum(db_types.ReasoningEffort, thread_row.nullableInt(8)),
-                .reasoning_variant = try dupeOptionalText(allocator, thread_row.nullableText(9)),
-                .fast_mode = decodeOptionalEnum(db_types.FastMode, thread_row.nullableInt(10)),
-                .access_mode = decodeOptionalEnum(db_types.AccessMode, thread_row.nullableInt(11)),
-                .provider = decodeEnumOr(db_types.Provider, thread_row.int(12), .opencode),
-                .harness = decodeEnumOr(db_types.Harness, thread_row.int(13), .local_cli),
-                .tui_dock_id = if (thread_row.nullableInt(14)) |value| @intCast(value) else null,
-                .cwd = try dupeOptionalText(allocator, thread_row.nullableText(20)),
-                .profile_id = try dupeOptionalText(allocator, thread_row.nullableText(21)),
-                .runtime_id = try dupeOptionalText(allocator, thread_row.nullableText(22)),
-                .repository_id = try dupeOptionalText(allocator, thread_row.nullableText(23)),
-                .repository_cwd = try dupeOptionalText(allocator, thread_row.nullableText(24)),
-                .draft = try allocator.dupe(u8, thread_row.text(15)),
-                .draft_image = try loadOptionalImage(
-                    allocator,
-                    thread_row.nullableText(16),
-                    thread_row.nullableText(17),
-                    thread_row.nullableInt(18),
-                ),
-                .draft_extra_images = try loadExtraImages(allocator, thread_row.nullableText(19)),
-                .message_offset = loaded_messages.offset,
-                .messages = loaded_messages.messages,
-            });
+        message_offsets: *const std.AutoHashMapUnmanaged(i64, usize),
+        capabilities: SchemaCapabilities,
+    ) !void {
+        if (projects.len != workspace_row_ids.len) return error.DatabaseCorrupt;
+        var project_index_by_row: std.AutoHashMapUnmanaged(i64, usize) = .empty;
+        defer project_index_by_row.deinit(allocator);
+        for (workspace_row_ids, 0..) |row_id, project_index| {
+            try project_index_by_row.put(allocator, row_id, project_index);
         }
-        if (thread_rows.err) |err| return err;
 
-        return try threads.toOwnedSlice(allocator);
+        const PendingThread = struct {
+            project_index: usize,
+            row_id: i64,
+            thread: PersistedThread,
+        };
+        var pending: std.ArrayList(PendingThread) = .empty;
+        defer pending.deinit(allocator);
+
+        const select_prefix = "select t.id, t.title, t.archived, t.committed, t.local_thread_id, t.last_activity_at, t.provider_thread_id, t.model_ref, t.reasoning_effort, t.reasoning_variant, t.fast_mode, t.access_mode, t.provider, t.harness, t.tui_dock_id, t.draft, t.draft_image_path, t.draft_image_mime, t.draft_image_byte_size, ";
+        const route_columns = if (capabilities.thread_runtime_route)
+            if (capabilities.thread_draft_images and capabilities.thread_cwd)
+                "t.draft_images_json, t.cwd, t.profile_id, t.runtime_id, t.repository_id, t.repository_cwd"
+            else if (capabilities.thread_draft_images)
+                "t.draft_images_json, null, t.profile_id, t.runtime_id, t.repository_id, t.repository_cwd"
+            else if (capabilities.thread_cwd)
+                "null, t.cwd, t.profile_id, t.runtime_id, t.repository_id, t.repository_cwd"
+            else
+                "null, null, t.profile_id, t.runtime_id, t.repository_id, t.repository_cwd"
+        else if (capabilities.thread_draft_images and capabilities.thread_cwd)
+            "t.draft_images_json, t.cwd, null, null, null, null"
+        else if (capabilities.thread_draft_images)
+            "t.draft_images_json, null, null, null, null, null"
+        else if (capabilities.thread_cwd)
+            "null, t.cwd, null, null, null, null"
+        else
+            "null, null, null, null, null, null";
+        const extent_column = if (capabilities.thread_message_extent) ", t.message_extent" else ", null";
+        const query = try std.mem.concat(allocator, u8, &.{
+            select_prefix,
+            route_columns,
+            extent_column,
+            ", t.workspace_id from threads t join workspaces w on w.id = t.workspace_id order by w.sort_index, t.sort_index",
+        });
+        defer allocator.free(query);
+        {
+            var thread_rows = try self.conn.rows(query, .{});
+            defer thread_rows.deinit();
+
+            while (thread_rows.next()) |thread_row| {
+                const thread_id = thread_row.int(0);
+                const project_index = project_index_by_row.get(thread_row.int(26)) orelse
+                    return error.DatabaseCorrupt;
+                try pending.append(allocator, .{
+                    .project_index = project_index,
+                    .row_id = thread_id,
+                    .thread = .{
+                        .title = try allocator.dupe(u8, thread_row.text(1)),
+                        .archived = thread_row.int(2) != 0,
+                        .committed = thread_row.int(3) != 0,
+                        .local_thread_id = try dupeOptionalText(allocator, thread_row.nullableText(4)),
+                        .last_activity_at = thread_row.nullableInt(5),
+                        .provider_thread_id = try dupeOptionalText(allocator, thread_row.nullableText(6)),
+                        .model_ref = try dupeOptionalText(allocator, thread_row.nullableText(7)),
+                        .reasoning_effort = decodeOptionalEnum(db_types.ReasoningEffort, thread_row.nullableInt(8)),
+                        .reasoning_variant = try dupeOptionalText(allocator, thread_row.nullableText(9)),
+                        .fast_mode = decodeOptionalEnum(db_types.FastMode, thread_row.nullableInt(10)),
+                        .access_mode = decodeOptionalEnum(db_types.AccessMode, thread_row.nullableInt(11)),
+                        .provider = decodeEnumOr(db_types.Provider, thread_row.int(12), .opencode),
+                        .harness = decodeEnumOr(db_types.Harness, thread_row.int(13), .local_cli),
+                        .tui_dock_id = if (thread_row.nullableInt(14)) |value| @intCast(value) else null,
+                        .cwd = try dupeOptionalText(allocator, thread_row.nullableText(20)),
+                        .profile_id = try dupeOptionalText(allocator, thread_row.nullableText(21)),
+                        .runtime_id = try dupeOptionalText(allocator, thread_row.nullableText(22)),
+                        .repository_id = try dupeOptionalText(allocator, thread_row.nullableText(23)),
+                        .repository_cwd = try dupeOptionalText(allocator, thread_row.nullableText(24)),
+                        .draft = try allocator.dupe(u8, thread_row.text(15)),
+                        .draft_image = try loadOptionalImage(
+                            allocator,
+                            thread_row.nullableText(16),
+                            thread_row.nullableText(17),
+                            thread_row.nullableInt(18),
+                        ),
+                        .draft_extra_images = try loadExtraImages(allocator, thread_row.nullableText(19)),
+                        .message_offset = if (capabilities.thread_message_extent)
+                            @intCast(thread_row.int(25))
+                        else
+                            message_offsets.get(thread_id) orelse 0,
+                        .messages = &.{},
+                    },
+                });
+            }
+            if (thread_rows.err) |err| return err;
+        }
+
+        var thread_lists = try allocator.alloc(std.ArrayList(PersistedThread), projects.len);
+        defer allocator.free(thread_lists);
+        for (thread_lists) |*list| list.* = .empty;
+        defer for (thread_lists) |*list| list.deinit(allocator);
+
+        for (pending.items) |*item| {
+            if (load_transcripts) {
+                const loaded = try self.loadMessages(
+                    allocator,
+                    item.row_id,
+                    null,
+                    std.math.maxInt(usize),
+                    capabilities,
+                );
+                item.thread.message_offset = loaded.offset;
+                item.thread.messages = loaded.messages;
+            }
+            try thread_lists[item.project_index].append(allocator, item.thread);
+        }
+        for (projects, 0..) |*project, project_index| {
+            project.threads = try thread_lists[project_index].toOwnedSlice(allocator);
+        }
+    }
+
+    /// Load every transcript extent once for a bounded projection. The old
+    /// limit=0 path still executed one max(sort_index) statement per thread,
+    /// turning projection refresh into an N+1 query across large histories.
+    fn loadMessageOffsets(
+        self: *const Self,
+        allocator: std.mem.Allocator,
+        offsets: *std.AutoHashMapUnmanaged(i64, usize),
+    ) !void {
+        var rows = try self.conn.rows(
+            "select thread_id, coalesce(max(sort_index) + 1, 0) from messages group by thread_id",
+            .{},
+        );
+        defer rows.deinit();
+        while (rows.next()) |row| {
+            try offsets.put(allocator, row.int(0), @intCast(row.int(1)));
+        }
+        if (rows.err) |err| return err;
     }
 
     fn loadMessages(
@@ -824,6 +924,7 @@ pub const Client = struct {
         thread_id: i64,
         before_offset: ?usize,
         limit: usize,
+        capabilities: SchemaCapabilities,
     ) !ThreadMessages {
         var messages: std.ArrayList(PersistedMessage) = .empty;
         defer messages.deinit(allocator);
@@ -841,21 +942,11 @@ pub const Client = struct {
         // verbatim so the next flush re-carries them instead of re-minting
         // positional ids. Pre-v4 projections (daemon not yet migrated) lack
         // the column; validateReadOnly accepts them, so probe before select.
-        const has_message_id = blk: {
-            const probe = self.conn.row(
-                "select 1 from pragma_table_info('messages') where name = 'message_id'",
-                .{},
-            ) catch break :blk false;
-            const row = probe orelse break :blk false;
-            row.deinit();
-            break :blk true;
-        };
-        const has_extra_images = self.hasColumn("messages", "extra_images_json");
         var message_rows = try self.conn.rows(
-            if (has_message_id and has_extra_images)
+            if (capabilities.message_id and capabilities.message_extra_images)
                 "select role, author, body, image_path, image_mime, image_byte_size, tool_call_id, tool_call_kind, tool_call_status, message_id, extra_images_json " ++
                     "from messages where thread_id = ?1 and sort_index >= ?2 and sort_index < ?3 order by sort_index"
-            else if (has_message_id)
+            else if (capabilities.message_id)
                 "select role, author, body, image_path, image_mime, image_byte_size, tool_call_id, tool_call_kind, tool_call_status, message_id, null " ++
                     "from messages where thread_id = ?1 and sort_index >= ?2 and sort_index < ?3 order by sort_index"
             else

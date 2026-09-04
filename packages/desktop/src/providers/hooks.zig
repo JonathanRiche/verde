@@ -1460,8 +1460,10 @@ pub fn opencodeGlobalHooksInstalled(allocator: std.mem.Allocator) bool {
     return std.mem.indexOf(u8, content, OPENCODE_GLOBAL_PLUGIN_NEEDLE) != null;
 }
 
-/// Installs the OpenCode lifecycle plugin globally. OpenCode discovers TypeScript
-/// plugins from ~/.config/opencode/plugin without modifying user configuration.
+/// Installs the OpenCode lifecycle plugin globally. OpenCode 2 discovers
+/// TypeScript plugins from ~/.config/opencode/plugin (or /plugins) without
+/// modifying user configuration, but only loads them inside the shared
+/// background service, so the plugin resolves Verde panes itself.
 pub fn ensureOpencodeGlobalHooks(allocator: std.mem.Allocator) !void {
     const home = homeDirAlloc(allocator) catch return error.NoHomeDir;
     defer allocator.free(home);
@@ -1491,133 +1493,251 @@ pub fn removeOpencodeGlobalHooks(allocator: std.mem.Allocator) !void {
 }
 
 fn writeOpencodePlugin(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+    // OpenCode 2 loads local plugins only inside the shared background service
+    // (the TUI never loads them), so the plugin cannot see pane environment.
+    // It subscribes to the service event bus, aggregates session state per
+    // directory, resolves matching Verde opencode panes via `verde live
+    // surfaces`, and reports through `verde notify --session <pane>`.
     const plugin =
-        \\// verde-opencode-notify-plugin
-        \\import type { Plugin } from '@opencode-ai/plugin';
+        \\// verde-opencode-notify-plugin (v3 candidate, server-side)
+        \\import { spawn } from 'node:child_process';
         \\
-        \\type AgentStatus = 'idle' | 'busy' | 'retry';
+        \\type SessionRunState = 'idle' | 'busy' | 'retry';
         \\type VerdeStatus = 'working' | 'done' | 'waiting';
         \\type SessionNode = {
+        \\  directory: string;
         \\  parentID?: string;
-        \\  status: AgentStatus;
+        \\  status: SessionRunState;
         \\  title: string;
         \\};
-        \\
-        \\function inVerdePane(): boolean {
-        \\  return process.env.VERDE === '1' && Boolean(process.env.VERDE_SESSION_ID);
-        \\}
         \\
         \\function verdeCli(): string {
         \\  const raw = process.env.VERDE_CLI || (process.platform === 'win32' ? 'verde.exe' : 'verde');
         \\  return raw.endsWith(' (deleted)') ? raw.slice(0, -10) : raw;
         \\}
         \\
-        \\export const VerdeNotificationPlugin: Plugin = async ({ $ }) => {
-        \\  const sessions = new Map<string, SessionNode>();
-        \\  const permissionSessions = new Set<string>();
-        \\  let activitySeen = false;
-        \\  let lastStatus: VerdeStatus | null = null;
-        \\  let lastTitle = '';
-        \\  let pending = Promise.resolve();
-        \\  const normalizeTitle = (value: unknown): string =>
-        \\    typeof value === 'string' ? value.replace(/\\s+/g, ' ').trim().slice(0, 72) : '';
+        \\const debug = typeof process !== 'undefined' && process.env.VERDE_PLUGIN_DEBUG;
         \\
-        \\  const paneStatus = (): VerdeStatus | null => {
-        \\    for (const node of sessions.values()) {
-        \\      if (!node.parentID && (node.status === 'busy' || node.status === 'retry')) return 'working';
-        \\    }
-        \\    if (permissionSessions.size > 0) return 'waiting';
-        \\    for (const node of sessions.values()) {
-        \\      if (node.parentID && (node.status === 'busy' || node.status === 'retry')) return 'waiting';
-        \\    }
-        \\    return activitySeen ? 'done' : null;
-        \\  };
+        \\export default {
+        \\  id: 'verde-opencode-notify',
+        \\  setup: async (context: unknown) => {
+        \\    const host = context as {
+        \\      event?: { subscribe?: unknown };
+        \\      client?: { event?: { subscribe?: unknown } };
+        \\    } | null | undefined;
+        \\    const subscribe = host?.event?.subscribe ?? host?.client?.event?.subscribe;
+        \\    if (typeof subscribe !== 'function') return;
         \\
-        \\  const paneTitle = (): string => {
-        \\    for (const node of sessions.values()) {
-        \\      if (!node.parentID && node.title) return node.title;
-        \\    }
-        \\    return '';
-        \\  };
+        \\    const sessions = new Map<string, SessionNode>();
+        \\    const permissionSessions = new Set<string>();
+        \\    let disposed = false;
+        \\    let pending: Promise<void> = Promise.resolve();
+        \\    let surfaces: Array<{ session_id: string; workspace_path: string; provider: string }> = [];
+        \\    let surfacesFetchedAt = 0;
+        \\    let surfacesFetch: Promise<void> = Promise.resolve();
+        \\    const lastReport = new Map<string, string>();
         \\
-        \\  const notifyStatus = (): void => {
-        \\    if (!inVerdePane()) return;
-        \\    const status = paneStatus();
-        \\    const title = paneTitle();
-        \\    if (status === null || (status === lastStatus && title === lastTitle)) return;
-        \\    lastStatus = status;
-        \\    lastTitle = title;
-        \\    pending = pending.then(async () => {
-        \\      const cli = verdeCli();
-        \\      try {
-        \\        if (title) {
-        \\          await $`${cli} notify --quiet --status ${status} --title ${title} --provider opencode`;
-        \\        } else {
-        \\          await $`${cli} notify --quiet --status ${status} --provider opencode`;
+        \\    const normalizeTitle = (value: unknown): string =>
+        \\      typeof value === 'string' ? value.replace(/\s+/g, ' ').trim().slice(0, 72) : '';
+        \\
+        \\    // State is aggregated per directory because the shared service serves every
+        \\    // Verde pane; a directory with no tracked sessions is never reported.
+        \\    const runStatusFor = (directory: string): VerdeStatus | null => {
+        \\      let hasTrackedSession = false;
+        \\      let hasRootBusy = false;
+        \\      let hasChildBusy = false;
+        \\      for (const node of sessions.values()) {
+        \\        if (node.directory !== directory) continue;
+        \\        hasTrackedSession = true;
+        \\        if (node.status === 'busy' || node.status === 'retry') {
+        \\          if (node.parentID) hasChildBusy = true;
+        \\          else hasRootBusy = true;
         \\        }
+        \\      }
+        \\      if (!hasTrackedSession) return null;
+        \\      if (hasRootBusy) return 'working';
+        \\      for (const sessionID of permissionSessions) {
+        \\        if (sessions.get(sessionID)?.directory === directory) return 'waiting';
+        \\      }
+        \\      if (hasChildBusy) return 'waiting';
+        \\      return 'done';
+        \\    };
+        \\
+        \\    const titleFor = (directory: string): string => {
+        \\      for (const node of sessions.values()) {
+        \\        if (node.directory === directory && !node.parentID && node.title) return node.title;
+        \\      }
+        \\      return '';
+        \\    };
+        \\
+        \\    const spawnNotify = (args: string[]): void => {
+        \\      try {
+        \\        const child = spawn(verdeCli(), args, { stdio: 'ignore' });
+        \\        child.on('error', () => {});
+        \\        child.on('close', () => {});
         \\      } catch {
         \\        // Status reporting is best-effort and must not interrupt OpenCode.
         \\      }
-        \\    });
-        \\  };
+        \\    };
         \\
-        \\  const setSessionInfo = (info: { id: string; parentID?: string; title?: string }): void => {
-        \\    const previous = sessions.get(info.id);
-        \\    const status = previous?.status ?? (info.parentID ? 'busy' : 'idle');
-        \\    sessions.set(info.id, { parentID: info.parentID, status, title: normalizeTitle(info.title) || previous?.title || '' });
-        \\    if (info.parentID && status === 'busy') activitySeen = true;
-        \\    notifyStatus();
-        \\  };
+        \\    let refreshInFlight = false;
+        \\    const refreshSurfaces = (): Promise<void> => {
+        \\      if (!refreshInFlight && Date.now() - surfacesFetchedAt < 5000 && surfacesFetchedAt !== 0) {
+        \\        return Promise.resolve();
+        \\      }
+        \\      if (refreshInFlight) return surfacesFetch;
+        \\      refreshInFlight = true;
+        \\      surfacesFetch = new Promise<void>((resolve) => {
+        \\        try {
+        \\          const child = spawn(verdeCli(), ['live', 'surfaces', '--json'], { stdio: ['ignore', 'pipe', 'ignore'] });
+        \\          let out = '';
+        \\          child.stdout?.on('data', (chunk: Buffer) => {
+        \\            out += chunk.toString();
+        \\          });
+        \\          child.on('error', () => resolve());
+        \\          child.on('close', () => {
+        \\            try {
+        \\              const parsed = JSON.parse(out) as { result?: { surfaces?: typeof surfaces } };
+        \\              const list = parsed?.result?.surfaces;
+        \\              if (Array.isArray(list)) surfaces = list;
+        \\              surfacesFetchedAt = Date.now();
+        \\            } catch {
+        \\              // The daemon may be restarting; keep the previous snapshot.
+        \\            }
+        \\            refreshInFlight = false;
+        \\            resolve();
+        \\          });
+        \\        } catch {
+        \\          refreshInFlight = false;
+        \\          resolve();
+        \\        }
+        \\      });
+        \\      return surfacesFetch;
+        \\    };
         \\
-        \\  const setSessionStatus = (sessionID: string, status: AgentStatus): void => {
-        \\    const previous = sessions.get(sessionID);
-        \\    sessions.set(sessionID, { parentID: previous?.parentID, status, title: previous?.title ?? '' });
-        \\    if (status === 'busy' || status === 'retry') {
-        \\      activitySeen = true;
-        \\      permissionSessions.delete(sessionID);
-        \\    }
-        \\    notifyStatus();
-        \\  };
+        \\    const report = (directory: string): void => {
+        \\      if (disposed || !directory) return;
+        \\      const status = runStatusFor(directory);
+        \\      if (status === null) return;
+        \\      const title = titleFor(directory);
+        \\      const key = `${directory}\u0000${status}\u0000${title}`;
+        \\      if (lastReport.get(directory) === key) return;
+        \\      lastReport.set(directory, key);
+        \\      if (debug) console.log(`[verde-notify] ${directory} -> ${status} ${title}`);
+        \\      pending = pending.then(async () => {
+        \\        if (disposed) return;
+        \\        await refreshSurfaces();
+        \\        for (const surface of surfaces) {
+        \\          if (surface.workspace_path !== directory) continue;
+        \\          // Unclassified panes (provider null) have not been stamped yet; the
+        \\          // notify below claims them as opencode on the first report.
+        \\          if (surface.provider != null && surface.provider !== 'opencode') continue;
+        \\          const args = [
+        \\            'notify', '--quiet', '--session', surface.session_id,
+        \\            '--status', status, '--provider', 'opencode',
+        \\          ];
+        \\          if (title) args.push('--title', title);
+        \\          spawnNotify(args);
+        \\        }
+        \\      });
+        \\    };
         \\
-        \\  return {
-        \\    event: async ({ event }) => {
-        \\      switch (event.type) {
-        \\        case 'session.created':
-        \\        case 'session.updated':
-        \\          setSessionInfo(event.properties.info);
+        \\
+        \\    const setSessionStatus = (sessionID: string, status: SessionRunState): void => {
+        \\      const node = sessions.get(sessionID);
+        \\      if (!node) return;
+        \\      node.status = status;
+        \\      if (status === 'busy' || status === 'retry') permissionSessions.delete(sessionID);
+        \\      report(node.directory);
+        \\    };
+        \\
+        \\    const handleEvent = (event: unknown): void => {
+        \\      if (debug) console.log('[ev] ' + (event as any)?.type + ' ' + ((event as any)?.data?.sessionID ?? ''));
+        \\      const envelope = event as { type?: string; data?: Record<string, any> } | null | undefined;
+        \\      const type = envelope?.type;
+        \\      const data = envelope?.data;
+        \\      if (!type || !data) return;
+        \\
+        \\      if (type === 'session.created') {
+        \\        const sessionID = typeof data.sessionID === 'string' ? data.sessionID : undefined;
+        \\        const directory =
+        \\          typeof data.location?.directory === 'string' ? data.location.directory : undefined;
+        \\        if (!sessionID || !directory) return;
+        \\        sessions.set(sessionID, {
+        \\          directory,
+        \\          parentID: typeof data.parentID === 'string' ? data.parentID : undefined,
+        \\          status: data.parentID ? 'busy' : 'idle',
+        \\          title: normalizeTitle(data.title),
+        \\        });
+        \\        report(directory);
+        \\        return;
+        \\      }
+        \\
+        \\      const sessionID =
+        \\        typeof data.sessionID === 'string'
+        \\          ? data.sessionID
+        \\          : typeof data.info?.id === 'string'
+        \\            ? data.info.id
+        \\            : undefined;
+        \\      const node = sessionID ? sessions.get(sessionID) : undefined;
+        \\      if (!sessionID || !node) { if (debug) console.log('[ev] dropped ' + type + ' ' + sessionID); return; }
+        \\      switch (type) {
+        \\        case 'session.renamed':
+        \\          node.title = normalizeTitle(data.title);
+        \\          report(node.directory);
         \\          break;
-        \\        case 'session.status':
-        \\          setSessionStatus(event.properties.sessionID, event.properties.status.type);
+        \\        case 'session.status': {
+        \\          const runState: SessionRunState =
+        \\            data.status?.type === 'busy' ? 'busy' : data.status?.type === 'retry' ? 'retry' : 'idle';
+        \\          setSessionStatus(sessionID, runState);
         \\          break;
+        \\        }
         \\        case 'session.idle':
-        \\          setSessionStatus(event.properties.sessionID, 'idle');
+        \\          setSessionStatus(sessionID, 'idle');
         \\          break;
         \\        case 'session.deleted':
-        \\          sessions.delete(event.properties.info.id);
-        \\          permissionSessions.delete(event.properties.info.id);
-        \\          notifyStatus();
+        \\          sessions.delete(sessionID);
+        \\          permissionSessions.delete(sessionID);
+        \\          report(node.directory);
         \\          break;
-        \\        case 'permission.updated':
-        \\          activitySeen = true;
-        \\          permissionSessions.add(event.properties.sessionID);
-        \\          notifyStatus();
+        \\        case 'permission.asked':
+        \\          permissionSessions.add(sessionID);
+        \\          report(node.directory);
         \\          break;
         \\        case 'permission.replied':
-        \\          permissionSessions.delete(event.properties.sessionID);
-        \\          notifyStatus();
+        \\          permissionSessions.delete(sessionID);
+        \\          report(node.directory);
         \\          break;
         \\      }
-        \\    },
-        \\    'permission.ask': async (input, output) => {
-        \\      if (output.status === 'ask') {
-        \\        activitySeen = true;
-        \\        permissionSessions.add(input.sessionID);
-        \\        notifyStatus();
-        \\      }
-        \\    },
-        \\  };
-        \\};
+        \\    };
         \\
+        \\    const iterator = (subscribe.call(host) as AsyncIterable<unknown>)[Symbol.asyncIterator]();
+        \\    void (async () => {
+        \\      try {
+        \\        while (!disposed) {
+        \\          const next = await iterator.next();
+        \\          if (next.done || disposed) break;
+        \\          try {
+        \\            handleEvent(next.value);
+        \\          } catch {
+        \\            // One malformed event must not stop the subscription.
+        \\          }
+        \\        }
+        \\      } catch {
+        \\        // Event streaming is best-effort and must not interrupt OpenCode.
+        \\      }
+        \\    })();
+        \\
+        \\    return () => {
+        \\      disposed = true;
+        \\      try {
+        \\        void iterator.return?.();
+        \\      } catch {
+        \\        // The stream may already be closed; cleanup stays best-effort.
+        \\      }
+        \\    };
+        \\  },
+        \\};
     ;
     try writeFileAtomic(allocator, io, path, plugin, .default_file);
 }
@@ -2520,7 +2640,7 @@ test "Claude hook reports a prompt-derived title" {
     }
 }
 
-test "OpenCode plugin reports native session titles" {
+test "OpenCode plugin targets the OpenCode 2 service event contract" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const plugin_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/verde-opencode-notify.ts", .{tmp.sub_path});
@@ -2531,8 +2651,18 @@ test "OpenCode plugin reports native session titles" {
     try writeOpencodePlugin(std.testing.allocator, threaded.io(), plugin_path);
     const plugin = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), plugin_path, std.testing.allocator, .limited(64 * 1024));
     defer std.testing.allocator.free(plugin);
-    try std.testing.expect(std.mem.indexOf(u8, plugin, "title: normalizeTitle(info.title)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, plugin, "--title ${title} --provider opencode") != null);
+    // v2 plugins load only from a default export; named hook exports are ignored.
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "export default {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "id: 'verde-opencode-notify'") != null);
+    // v2 event payloads are flat `{ type, data }`; no v1 `properties.info` reads remain.
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "event.properties") == null);
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "session.created") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "session.renamed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "permission.asked") != null);
+    // Plugins run in the shared service, so panes are resolved through Verde.
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "'live', 'surfaces', '--json'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "'--session', surface.session_id") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "'--provider', 'opencode'") != null);
 }
 
 test "Pi extension reports lifecycle and native session titles" {

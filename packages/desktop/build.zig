@@ -123,16 +123,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zsdl3", .module = zsdl.module("zsdl3") },
         },
     });
-    const chat_markdown = b.createModule(.{
-        .root_source_file = b.path("src/ui/chat_markdown.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "palette", .module = palette_module },
-            .{ .name = "zig_dif", .module = zig_dif.module("zig_dif") },
-            .{ .name = "zig_markdown", .module = zig_markdown.module("zig_markdown") },
-        },
-    });
     const build_options = b.addOptions();
     build_options.addOption([:0]const u8, "version", version_z);
     build_options.addOption(bool, "ui_debug", ui_debug);
@@ -154,18 +144,6 @@ pub fn build(b: *std.Build) void {
         .{ .custom = "share/verde" },
         "BUILD_VERSION",
     ).step);
-    const browser_contract = b.createModule(.{
-        .root_source_file = b.path("src/browser/contract.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "build_options", .module = build_options_module },
-            .{ .name = "loop_wakeup", .module = loop_wakeup_module },
-            .{ .name = "platform_paths", .module = platform_paths_module },
-            .{ .name = "platform_runtime", .module = platform_runtime_module },
-        },
-    });
-
     // Invoke Bun directly so native Windows builds do not require Git Bash.
     const build_inspector_bundle = b.addSystemCommand(&.{
         "bun",
@@ -428,6 +406,8 @@ pub fn build(b: *std.Build) void {
             install_exe.step.dependOn(&normalize_fff_needed.step);
         } else |_| {}
     }
+    const dev_build_step = b.step("dev-build", "Build and install only the main desktop executable");
+    dev_build_step.dependOn(&install_exe.step);
     b.getInstallStep().dependOn(&install_exe.step);
     if (windows_gui_exe) |gui_exe| {
         b.getInstallStep().dependOn(&b.addInstallArtifact(gui_exe, .{}).step);
@@ -557,8 +537,9 @@ pub fn build(b: *std.Build) void {
     });
     const headless_test_step = b.step("headless-test", "Run headless package unit tests (no GUI deps)");
     addTestArtifact(b, headless_test_step, headless_tests, target);
-    test_compile_step.dependOn(&headless_tests.step);
-    addTestArtifact(b, test_step, headless_tests, target);
+    // The full desktop runner below already includes the headless module. Keep
+    // this artifact on its focused step instead of compiling or running the
+    // same tests twice in either aggregate step.
     // Remote-runtime infrastructure has its own GUI-free gate so process,
     // transport, profile, and route tests do not depend on the SDL app graph.
     const runtime_tests = b.addTest(.{
@@ -578,74 +559,9 @@ pub fn build(b: *std.Build) void {
     runtime_tests.root_module.link_libc = true;
     const runtime_test_step = b.step("runtime-test", "Run remote-runtime infrastructure tests (no GUI deps)");
     addTestArtifact(b, runtime_test_step, runtime_tests, target);
-    test_compile_step.dependOn(&runtime_tests.step);
-    addTestArtifact(b, test_step, runtime_tests, target);
-    const transcript_apply_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/chat/transcript_apply.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "headless", .module = headless_module }},
-        }),
-    });
-    addTestArtifact(b, test_step, transcript_apply_tests, target);
-    test_compile_step.dependOn(&transcript_apply_tests.step);
-    // Change journal is std-only by design (process_registry discipline), so
-    // its tests build without GUI deps or the headless module.
-    const change_journal_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/daemon/change_journal.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    addTestArtifact(b, test_step, change_journal_tests, target);
-    test_compile_step.dependOn(&change_journal_tests.step);
-    const chat_markdown_tests = b.addTest(.{
-        .root_module = chat_markdown,
-    });
-    chat_markdown_tests.root_module.link_libc = true;
-    chat_markdown_tests.root_module.addIncludePath(b.path("../../vendor"));
-    if (target.result.os.tag == .linux) {
-        if (zsdl.builder.lazyDependency("sdl3_prebuilt_x86_64_linux_gnu", .{})) |sdl3_prebuilt| {
-            chat_markdown_tests.root_module.addLibraryPath(sdl3_prebuilt.path("lib"));
-        }
-        chat_markdown_tests.root_module.linkSystemLibrary("SDL3", .{});
-        chat_markdown_tests.root_module.linkSystemLibrary("SDL3_ttf", .{});
-        chat_markdown_tests.root_module.linkSystemLibrary("util", .{});
-    }
-    addTestArtifact(b, test_step, chat_markdown_tests, target);
-    test_compile_step.dependOn(&chat_markdown_tests.step);
-    const browser_contract_tests = b.addTest(.{
-        .root_module = browser_contract,
-    });
-    browser_contract_tests.root_module.link_libc = true;
-    if (target.result.os.tag == .linux) {
-        if (zsdl.builder.lazyDependency("sdl3_prebuilt_x86_64_linux_gnu", .{})) |sdl3_prebuilt| {
-            browser_contract_tests.root_module.addLibraryPath(sdl3_prebuilt.path("lib"));
-        }
-        browser_contract_tests.root_module.addCSourceFile(.{
-            .file = b.path("src/browser/platform/linux_wayland_subsurface.c"),
-            .flags = &.{},
-        });
-        browser_contract_tests.root_module.linkSystemLibrary("SDL3", .{});
-        browser_contract_tests.root_module.linkSystemLibrary("SDL3_ttf", .{});
-        browser_contract_tests.root_module.linkSystemLibrary("util", .{});
-        browser_contract_tests.root_module.linkSystemLibrary("wayland-client", .{ .use_pkg_config = .force });
-    } else if (target.result.os.tag == .macos) {
-        addMacOSWebViewTestStub(b, browser_contract_tests);
-        browser_contract_tests.root_module.linkFramework("AppKit", .{});
-        browser_contract_tests.root_module.linkFramework("WebKit", .{});
-    } else if (target.result.os.tag == .windows) {
-        addWindowsWebView2(b, browser_contract_tests, .{
-            .real_webview = browser_backend == .native_webview,
-            .include_dir = webview2_include_dir,
-            .loader_import_lib = webview2_loader_lib,
-        });
-        addWindowsSystemLibraries(browser_contract_tests);
-    }
-    addTestArtifact(b, test_step, browser_contract_tests, target);
-    test_compile_step.dependOn(&browser_contract_tests.step);
+    // main.zig registers these modules in the full desktop runner. Running the
+    // focused runner here as well duplicated the database-heavy tests, while
+    // compiling it here made test-compile rebuild the same graph twice.
     if (target.result.os.tag == .linux and browser_backend == .native_webview) {
         const linux_browser_helper_tests = b.addTest(.{
             .root_module = b.createModule(.{

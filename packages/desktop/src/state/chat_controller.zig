@@ -89,6 +89,20 @@ const PI_LOGO_BYTES = @embedFile("../assets/pi-logo.png");
 const FX_LOGO_BYTES = @embedFile("../assets/fx-logo.png");
 const GROK_LOGO_BYTES = @embedFile("../assets/grok-logo.png");
 
+const ActiveSendRef = struct {
+    project_index: usize,
+    thread_index: usize,
+    send_state: *SendState,
+};
+
+const ActiveTitleRef = struct {
+    archived_project: bool,
+    archived_thread: bool,
+    project_index: usize,
+    thread_index: usize,
+    title_state: *TitleGenerationState,
+};
+
 pub const InitialSendSnapshot = struct {
     message_count: usize,
     committed: bool,
@@ -132,6 +146,7 @@ fn harnessProviderForDbProvider(provider: Provider) ai_harness.Provider {
         .pi => .pi,
         .fx => .fx,
         .grok => .grok,
+        .muse => .muse,
     };
 }
 
@@ -586,6 +601,9 @@ const RemoteControlDispatch = struct {
 
 pub const State = struct {
     pending_send_count: usize = 0,
+    pending_title_generation_count: usize = 0,
+    active_send_refs: std.ArrayListUnmanaged(ActiveSendRef) = .empty,
+    active_title_refs: std.ArrayListUnmanaged(ActiveTitleRef) = .empty,
     codex_background_poll: CodexBackgroundPollState = .{},
     daemon_tail_response_buffer: ?[]u8 = null,
     daemon_tail_connection: sessionizer.ReusableRequestConnection = .{},
@@ -617,6 +635,8 @@ pub const State = struct {
         self.remote_tail_dispatches.deinit(allocator);
         for (self.remote_control_dispatches.items) |*dispatch| dispatch.deinit(allocator);
         self.remote_control_dispatches.deinit(allocator);
+        self.active_send_refs.deinit(allocator);
+        self.active_title_refs.deinit(allocator);
         self.daemon_tail_connection.deinit();
         if (self.daemon_tail_response_buffer) |buffer| allocator.free(buffer);
         self.daemon_tail_response_buffer = null;
@@ -1029,7 +1049,7 @@ test "real addressed control seams roll back missing daemon prerequisites" {
     try std.testing.expect(thread.send_state.control_error_message != null);
 }
 
-test "global polling leaves idle and completed pane-less Companion stop state untouched" {
+test "active polling leaves unregistered pane-less Companion stop state untouched" {
     const allocator = std.testing.allocator;
     const PollState = struct {
         allocator: std.mem.Allocator,
@@ -1060,6 +1080,7 @@ test "global polling leaves idle and completed pane-less Companion stop state un
         pub fn setSidebarNotice(_: *@This(), _: []const u8) void {}
     };
     var state: PollState = .{ .allocator = allocator };
+    defer state.chat_controller.deinit(allocator);
     var project = try Project.init(allocator, "poll-companion", "Poll Companion", "/tmp/poll-companion", 0);
     state.project_controller.projects.append(allocator, project) catch |err| {
         project.deinit(allocator);
@@ -1085,13 +1106,48 @@ test "global polling leaves idle and completed pane-less Companion stop state un
         const ui_revision = companion.send_state.ui_revision;
         const visits_before = state.poll_visits;
         _ = pollSend(&state);
-        try std.testing.expectEqual(visits_before + owned_project.threads.items.len, state.poll_visits);
+        try std.testing.expectEqual(visits_before + 1, state.poll_visits);
         try std.testing.expectEqual(companion_status, companion.send_state.status);
         try std.testing.expect(!companion.send_state.stop_requested);
         try std.testing.expect(!companion.send_state.stop_signal_sent);
         try std.testing.expectEqual(ui_revision, companion.send_state.ui_revision);
         try std.testing.expect(companion.send_state.control_error_message == null);
     }
+}
+
+test "daemon turn lookup retains only active send references" {
+    const allocator = std.testing.allocator;
+    const LookupState = struct {
+        allocator: std.mem.Allocator,
+        chat_controller: State = .{},
+        project_controller: struct {
+            projects: std.ArrayList(Project) = .empty,
+        } = .{},
+    };
+    var state: LookupState = .{ .allocator = allocator };
+    defer state.chat_controller.deinit(allocator);
+    var project = try Project.init(allocator, "lookup-project", "Lookup", "/tmp/lookup", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    defer {
+        for (state.project_controller.projects.items) |*owned_project| owned_project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+    }
+
+    const owned_project = &state.project_controller.projects.items[0];
+    for (0..32) |_| try owned_project.threads.append(allocator, try ChatThread.init(allocator, "Idle"));
+    const active_thread = &owned_project.threads.items[17];
+    active_thread.send_state.status = .pending;
+    active_thread.send_state.daemon_owned = true;
+    active_thread.send_state.daemon_turn_id = try std.heap.page_allocator.dupe(u8, "active-turn");
+    state.chat_controller.pending_send_count = 1;
+
+    try rebuildActiveSendRefs(&state);
+    try std.testing.expectEqual(@as(usize, 1), state.chat_controller.active_send_refs.items.len);
+    try std.testing.expect(threadByDaemonTurnId(&state, "active-turn") == active_thread);
+    try std.testing.expect(threadByDaemonTurnId(&state, "missing-turn") == null);
 }
 
 test "daemon control rejects JSON-RPC error responses" {
@@ -2329,6 +2385,7 @@ pub fn queueOrSteerDraftDuringSend(self: anytype) void {
         .cursor => .queue,
         .fx => .queue,
         .grok => .queue,
+        .muse => .queue,
     };
     self.storeDraftDuringSend(kind);
 }
@@ -2347,7 +2404,7 @@ pub fn storeThreadFollowupPrompt(self: anytype, project_index: usize, thread_ind
 
     const kind: FollowupKind = switch (thread.provider) {
         .codex, .claude, .pi => .steer,
-        .opencode, .cursor, .fx, .grok => .queue,
+        .opencode, .cursor, .fx, .grok, .muse => .queue,
     };
     const send_state = thread.send_state;
     send_state.mutex.lock();
@@ -2544,6 +2601,7 @@ pub fn pendingFollowupHint(self: anytype) ?[:0]const u8 {
         .pi => "Enter to queue \u{00B7} Tab to steer",
         .fx => "Tab to queue",
         .grok => "Tab to queue",
+        .muse => "Tab to queue",
     };
 }
 
@@ -2586,6 +2644,9 @@ pub fn sendPromptViaHarness(self: anytype, prompt: []const u8) !ai_harness.SendP
                 .cwd = provider_cwd,
             },
         },
+        .fx => ai_harness.ProviderConfig{ .fx = .{ .cwd = provider_cwd, .model = thread.model_ref } },
+        .grok => ai_harness.ProviderConfig{ .grok = .{ .cwd = provider_cwd, .model = thread.model_ref } },
+        .muse => ai_harness.ProviderConfig{ .muse = .{ .cwd = provider_cwd, .model = thread.model_ref } },
     };
 
     var client = try ai_harness.connect(self.allocator, provider_config);
@@ -2656,6 +2717,7 @@ pub fn interruptThreadViaHarness(
                 .cwd = provider_cwd,
             },
         },
+        .muse => ai_harness.ProviderConfig{ .muse = .{ .cwd = provider_cwd } },
     };
 
     var client = try ai_harness.connect(self.allocator, provider_config);
@@ -2683,7 +2745,7 @@ pub fn steerThreadViaHarness(
             .launch_on_connect = false,
         } },
         .claude => ai_harness.ProviderConfig{ .claude = .{ .cwd = provider_cwd } },
-        .opencode, .cursor, .pi, .fx, .grok => return error.UnsupportedOperation,
+        .opencode, .cursor, .pi, .fx, .grok, .muse => return error.UnsupportedOperation,
     };
 
     var client = try ai_harness.connect(self.allocator, provider_config);
@@ -3976,7 +4038,7 @@ fn daemonChatTurnExistsRaw(allocator: std.mem.Allocator, pref_path: []const u8, 
 fn daemonReasoningVariant(provider: Provider, variant: ?[:0]const u8) ?[:0]const u8 {
     return switch (provider) {
         .opencode, .cursor => variant,
-        .codex, .claude, .pi, .fx, .grok => null,
+        .codex, .claude, .pi, .fx, .grok, .muse => null,
     };
 }
 
@@ -4588,6 +4650,105 @@ pub const ProjectThreadIndex = struct {
     thread_index: usize,
 };
 
+fn sendStateNeedsPoll(thread: *const ChatThread) bool {
+    const send_state = thread.send_state;
+    send_state.mutex.lock();
+    defer send_state.mutex.unlock();
+    return send_state.status != .idle;
+}
+
+fn activeSendRefsValid(self: anytype) bool {
+    const refs = self.chat_controller.active_send_refs.items;
+    if (refs.len != self.chat_controller.pending_send_count) return false;
+    for (refs) |ref| {
+        if (ref.project_index >= self.project_controller.projects.items.len) return false;
+        const project = &self.project_controller.projects.items[ref.project_index];
+        if (ref.thread_index >= project.threads.items.len) return false;
+        if (project.threads.items[ref.thread_index].send_state != ref.send_state) return false;
+    }
+    return true;
+}
+
+fn rebuildActiveSendRefs(self: anytype) !void {
+    const refs = &self.chat_controller.active_send_refs;
+    refs.clearRetainingCapacity();
+    errdefer refs.clearRetainingCapacity();
+    for (self.project_controller.projects.items, 0..) |*project, project_index| {
+        for (project.threads.items, 0..) |*thread, thread_index| {
+            if (!sendStateNeedsPoll(thread)) continue;
+            try refs.append(self.allocator, .{
+                .project_index = project_index,
+                .thread_index = thread_index,
+                .send_state = thread.send_state,
+            });
+        }
+    }
+    self.chat_controller.pending_send_count = refs.items.len;
+}
+
+fn titleStateNeedsPoll(thread: *const ChatThread) bool {
+    const title_state = thread.title_generation_state;
+    title_state.mutex.lock();
+    defer title_state.mutex.unlock();
+    return title_state.status != .idle;
+}
+
+fn activeTitleRefsValid(self: anytype) bool {
+    const refs = self.chat_controller.active_title_refs.items;
+    if (refs.len != self.chat_controller.pending_title_generation_count) return false;
+    for (refs) |ref| {
+        const projects = if (ref.archived_project)
+            self.project_controller.archived_projects.items
+        else
+            self.project_controller.projects.items;
+        if (ref.project_index >= projects.len) return false;
+        const project = &projects[ref.project_index];
+        const threads = if (ref.archived_thread) project.archived_threads.items else project.threads.items;
+        if (ref.thread_index >= threads.len) return false;
+        if (threads[ref.thread_index].title_generation_state != ref.title_state) return false;
+    }
+    return true;
+}
+
+fn appendActiveTitleRefsForProjects(
+    self: anytype,
+    projects: []Project,
+    archived_project: bool,
+) !void {
+    const refs = &self.chat_controller.active_title_refs;
+    for (projects, 0..) |*project, project_index| {
+        for (project.threads.items, 0..) |*thread, thread_index| {
+            if (!titleStateNeedsPoll(thread)) continue;
+            try refs.append(self.allocator, .{
+                .archived_project = archived_project,
+                .archived_thread = false,
+                .project_index = project_index,
+                .thread_index = thread_index,
+                .title_state = thread.title_generation_state,
+            });
+        }
+        for (project.archived_threads.items, 0..) |*thread, thread_index| {
+            if (!titleStateNeedsPoll(thread)) continue;
+            try refs.append(self.allocator, .{
+                .archived_project = archived_project,
+                .archived_thread = true,
+                .project_index = project_index,
+                .thread_index = thread_index,
+                .title_state = thread.title_generation_state,
+            });
+        }
+    }
+}
+
+fn rebuildActiveTitleRefs(self: anytype) !void {
+    const refs = &self.chat_controller.active_title_refs;
+    refs.clearRetainingCapacity();
+    errdefer refs.clearRetainingCapacity();
+    try appendActiveTitleRefsForProjects(self, self.project_controller.projects.items, false);
+    try appendActiveTitleRefsForProjects(self, self.project_controller.archived_projects.items, true);
+    self.chat_controller.pending_title_generation_count = refs.items.len;
+}
+
 pub fn projectThreadIndexByLocalId(self: anytype, workspace_id: []const u8, local_thread_id: []const u8) ?ProjectThreadIndex {
     for (self.project_controller.projects.items, 0..) |*project, project_index| {
         if (!std.mem.eql(u8, project.id, workspace_id)) continue;
@@ -4634,33 +4795,42 @@ pub fn pollSend(self: anytype) bool {
         }
         changed = serviceDaemonChatTailWorker(self) or changed;
     }
-    if (!self.chat_controller.hasPending()) return changed;
-
-    for (self.project_controller.projects.items, 0..) |*project, project_index| {
-        for (project.threads.items, 0..) |*thread, thread_index| {
-            changed = self.pollThreadSend(project_index, thread_index, thread) or changed;
-        }
+    if (!self.chat_controller.hasPending()) {
+        self.chat_controller.active_send_refs.clearRetainingCapacity();
+        return changed;
+    }
+    if (!activeSendRefsValid(self)) {
+        rebuildActiveSendRefs(self) catch {
+            for (self.project_controller.projects.items, 0..) |*project, project_index| {
+                for (project.threads.items, 0..) |*thread, thread_index| {
+                    changed = self.pollThreadSend(project_index, thread_index, thread) or changed;
+                }
+            }
+            return changed;
+        };
+    }
+    for (self.chat_controller.active_send_refs.items) |ref| {
+        const thread = &self.project_controller.projects.items[ref.project_index].threads.items[ref.thread_index];
+        changed = self.pollThreadSend(ref.project_index, ref.thread_index, thread) or changed;
     }
     return changed;
 }
 
 pub fn pollTitleGenerations(self: anytype) bool {
-    var changed = false;
-    for (self.project_controller.projects.items) |*project| {
-        for (project.threads.items) |*thread| {
-            changed = self.pollThreadTitleGeneration(project, thread) or changed;
-        }
-        for (project.archived_threads.items) |*thread| {
-            changed = self.pollThreadTitleGeneration(project, thread) or changed;
-        }
+    if (self.chat_controller.pending_title_generation_count == 0) {
+        self.chat_controller.active_title_refs.clearRetainingCapacity();
+        return false;
     }
-    for (self.project_controller.archived_projects.items) |*project| {
-        for (project.threads.items) |*thread| {
-            changed = self.pollThreadTitleGeneration(project, thread) or changed;
-        }
-        for (project.archived_threads.items) |*thread| {
-            changed = self.pollThreadTitleGeneration(project, thread) or changed;
-        }
+    if (!activeTitleRefsValid(self)) rebuildActiveTitleRefs(self) catch return false;
+    var changed = false;
+    for (self.chat_controller.active_title_refs.items) |ref| {
+        const projects = if (ref.archived_project)
+            self.project_controller.archived_projects.items
+        else
+            self.project_controller.projects.items;
+        const project = &projects[ref.project_index];
+        const threads = if (ref.archived_thread) project.archived_threads.items else project.threads.items;
+        changed = self.pollThreadTitleGeneration(project, &threads[ref.thread_index]) or changed;
     }
     return changed;
 }
@@ -4698,6 +4868,9 @@ pub fn pollThreadTitleGeneration(self: anytype, project: *Project, thread: *Chat
         state.manual = false;
         state.discard_result = false;
         state.status = .idle;
+        if (self.chat_controller.pending_title_generation_count > 0) {
+            self.chat_controller.pending_title_generation_count -= 1;
+        }
     }
     state.mutex.unlock();
     if (status != .completed and status != .failed) return false;
@@ -4795,6 +4968,7 @@ pub fn startTitleGeneration(self: anytype, project_index: usize, thread: *ChatTh
         state.status = .idle;
         return err;
     };
+    self.chat_controller.pending_title_generation_count += 1;
 }
 
 pub fn maybeStartAutomaticTitleGeneration(self: anytype, project_index: usize, thread: *ChatThread) void {
@@ -5011,6 +5185,7 @@ pub fn currentThreadPendingSlashCommandLabel(self: anytype) ?[]const u8 {
         .pi => "Running Pi command...",
         .fx => "Running FX command...",
         .grok => "Running Grok command...",
+        .muse => "Running Muse command...",
     };
 }
 
@@ -5739,6 +5914,22 @@ pub fn serviceDaemonChatTailWorker(self: anytype) bool {
 /// Resolves the live thread that owns a daemon turn id; the worker's target
 /// may have been reset or deleted while the RPC was in flight.
 fn threadByDaemonTurnId(self: anytype, turn_id: []const u8) ?*ChatThread {
+    // Tail workers can finish many times during one turn. Resolve through the
+    // validated active-send set so the common path locks only in-flight
+    // threads, not every historical thread in every workspace.
+    if (!activeSendRefsValid(self)) rebuildActiveSendRefs(self) catch return threadByDaemonTurnIdSlow(self, turn_id);
+    for (self.chat_controller.active_send_refs.items) |ref| {
+        const thread = &self.project_controller.projects.items[ref.project_index].threads.items[ref.thread_index];
+        const send_state = ref.send_state;
+        send_state.mutex.lock();
+        defer send_state.mutex.unlock();
+        const current = send_state.daemon_turn_id orelse continue;
+        if (std.mem.eql(u8, current, turn_id)) return thread;
+    }
+    return null;
+}
+
+fn threadByDaemonTurnIdSlow(self: anytype, turn_id: []const u8) ?*ChatThread {
     for (self.project_controller.projects.items) |*project| {
         for (project.threads.items) |*thread| {
             const send_state = thread.send_state;
@@ -7698,6 +7889,7 @@ pub fn noteChatCompletion(self: anytype, project_index: usize, thread_index: usi
         .pi => .{ .key = "pi", .png_bytes = PI_LOGO_BYTES },
         .fx => .{ .key = "fx", .png_bytes = FX_LOGO_BYTES },
         .grok => .{ .key = "grok", .png_bytes = GROK_LOGO_BYTES },
+        .muse => null,
     };
     notifier.notifyAgentDone(self.allocator, title, body, icon);
 }
@@ -8249,7 +8441,7 @@ pub fn issuePendingProviderSteer(
             const resolved_turn_id: ?[]const u8 = switch (provider) {
                 .codex => send_state.active_turn_id,
                 .claude, .pi => if (send_state.active_turn_id) |active| active else "",
-                .opencode, .cursor, .fx, .grok => null,
+                .opencode, .cursor, .fx, .grok, .muse => null,
             };
             if (resolved_turn_id) |active_turn_id| {
                 thread_id = self.allocator.dupe(u8, resolved_thread_id) catch null;
