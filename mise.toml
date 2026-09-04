@@ -16,7 +16,7 @@ description = "Builds the desktop app."
 run = "bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && case \"$(uname -s)\" in Darwin) VERDE_APPLICATIONS_DIR=\"${VERDE_APPLICATIONS_DIR:-/Applications}\" scripts/release/install-macos-local.sh ;; Linux) zig build --release=safe -Dbrowser-backend=native_webview && scripts/dev/check-native-webview-install.sh ;; *) echo \"unsupported build host: $(uname -s)\" >&2; exit 1 ;; esac'"
 
 [tasks.dev-build]
-description = "Builds only the main desktop executable for focused local iteration."
+description = "Builds only the private desktop GUI executable for focused local iteration."
 run = "bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && zig build dev-build --release=safe -Dbrowser-backend=native_webview'"
 
 [tasks.build-verify-install]

@@ -26,8 +26,8 @@ if ([string]::IsNullOrWhiteSpace($EvidenceDir)) {
 }
 New-Item -ItemType Directory -Force -Path $EvidenceDir | Out-Null
 
-$AppExe = Join-Path $PrefixDir "bin\Verde.exe"
-$CliExe = Join-Path $PrefixDir "bin\cli\verde.exe"
+$AppExe = Join-Path $PrefixDir "bin\verde-gui.exe"
+$CliExe = Join-Path $PrefixDir "bin\verde.exe"
 foreach ($Path in @($AppExe, $CliExe)) {
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
     throw "Windows WebView2 smoke executable is missing: $Path"

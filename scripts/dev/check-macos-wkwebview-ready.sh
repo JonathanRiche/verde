@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 APP_DIR="${1:-/Users/jhonellebriche/Applications/Verde.app}"
-APP_BIN="$APP_DIR/Contents/MacOS/verde"
+APP_BIN="$APP_DIR/Contents/MacOS/verde-gui"
 manual_helpers=(
   scripts/dev/capture-macos-wkwebview-input-evidence.sh
   scripts/dev/capture-macos-wkwebview-status-evidence.sh

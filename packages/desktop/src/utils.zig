@@ -1,6 +1,5 @@
-const ai_harness = @import("providers/harness.zig");
+const provider_types = @import("headless").provider_types;
 const chat_types = @import("state/chat_types.zig");
-const loop_wakeup = @import("loop_wakeup");
 const platform_runtime = @import("platform_runtime");
 const provider_models = @import("state/provider_models.zig");
 const state_ui_types = @import("state/ui_types.zig");
@@ -526,247 +525,6 @@ fn runDirectoryPickerCommand(
     const trimmed = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
     if (trimmed.len == 0) return error.UserCancelled;
     return allocator.dupe(u8, trimmed);
-}
-
-pub fn sendWorker(state: *chat_types.SendState, request: *SendWorkerRequest) void {
-    const page_alloc = std.heap.page_allocator;
-    const request_cwd = request.project_path;
-    defer {
-        page_alloc.free(request.project_path);
-        page_alloc.free(request.prompt);
-        if (request.image_path) |image_path| page_alloc.free(image_path);
-        for (request.image_paths) |image_path| page_alloc.free(image_path);
-        page_alloc.free(request.image_paths);
-        if (request.provider_thread_id) |thread_id| page_alloc.free(thread_id);
-        page_alloc.free(request.thread_title);
-        if (request.model_ref) |model_ref| page_alloc.free(model_ref);
-        if (request.opencode_reasoning_variant) |variant| page_alloc.free(variant);
-        if (request.cursor_model_params_json) |params| page_alloc.free(params);
-        page_alloc.destroy(request);
-    }
-
-    std.debug.print(
-        "[codex-debug] sendWorker begin provider={s} cwd={s} model_len={d} thread_id_len={d} prompt_len={d}\n",
-        .{
-            @tagName(request.provider),
-            request_cwd,
-            if (request.model_ref) |model| model.len else 0,
-            if (request.provider_thread_id) |thread_id| thread_id.len else 0,
-            request.prompt.len,
-        },
-    );
-    runtime_log.diagnostic(
-        "sendWorker begin provider={s} cwd={s} model_len={d} thread_id_len={d} prompt_len={d}",
-        .{
-            @tagName(request.provider),
-            request_cwd,
-            if (request.model_ref) |model| model.len else 0,
-            if (request.provider_thread_id) |thread_id| thread_id.len else 0,
-            request.prompt.len,
-        },
-    );
-
-    const result = runSendWorker(page_alloc, request);
-
-    state.mutex.lock();
-    defer state.mutex.unlock();
-    // Whatever terminal status we settle on below, wake the render loop so
-    // pollSend commits it immediately instead of on the next timeout tick.
-    defer loop_wakeup.notify();
-
-    if (result) |payload| {
-        if (state.stop_requested) {
-            std.heap.page_allocator.free(payload.provider_thread_id);
-            std.heap.page_allocator.free(payload.reply_text);
-            state.result = null;
-            state.error_message = null;
-            state.status = .aborted;
-            return;
-        }
-        state.result = payload;
-        state.error_message = null;
-        state.status = .completed;
-    } else |err| {
-        std.debug.print(
-            "[codex-debug] sendWorker failed provider={s} cwd={s} model_len={d} thread_id_len={d} err={s}\n",
-            .{
-                @tagName(request.provider),
-                request_cwd,
-                if (request.model_ref) |model| model.len else 0,
-                if (request.provider_thread_id) |thread_id| thread_id.len else 0,
-                @errorName(err),
-            },
-        );
-        runtime_log.diagnostic(
-            "sendWorker failed provider={s} cwd={s} model_len={d} thread_id_len={d} err={s}",
-            .{
-                @tagName(request.provider),
-                request_cwd,
-                if (request.model_ref) |model| model.len else 0,
-                if (request.provider_thread_id) |thread_id| thread_id.len else 0,
-                @errorName(err),
-            },
-        );
-        if ((err == error.CodexTurnInterrupted or err == error.ClaudeTurnInterrupted or err == error.MuseTurnCancelled) and state.stop_requested) {
-            state.error_message = null;
-            state.result = null;
-            state.status = .aborted;
-            return;
-        }
-        if (state.error_message == null) {
-            state.error_message = formatSendWorkerError(page_alloc, request.provider, err) catch null;
-        }
-        state.result = null;
-        state.status = .failed;
-    }
-}
-pub const SendWorkerRequest = struct {
-    send_state_ptr: *chat_types.SendState,
-    provider: provider_models.Provider,
-    harness: provider_models.Harness,
-    project_path: []u8,
-    prompt: []u8,
-    image_path: ?[]u8,
-    image_paths: [][]u8,
-    provider_thread_id: ?[]u8,
-    thread_title: []u8,
-    model_ref: ?[]u8,
-    reasoning_effort: ?provider_models.ReasoningEffort,
-    /// Owned; OpenCode-only. Duplicated from thread `opencode_reasoning_variant`.
-    opencode_reasoning_variant: ?[]u8,
-    cursor_model_params_json: ?[]u8,
-    fast_mode: provider_models.FastMode,
-    access_mode: provider_models.AccessMode,
-};
-pub fn runSendWorker(
-    allocator: std.mem.Allocator,
-    request: *const SendWorkerRequest,
-) !chat_types.SendResultPayload {
-    if (request.harness != .local_cli) {
-        return error.UnsupportedHarnessMode;
-    }
-
-    const request_cwd = request.project_path;
-
-    const provider_config = switch (request.provider) {
-        .opencode => ai_harness.ProviderConfig{
-            .opencode = .{
-                .allocator = allocator,
-                .working_directory = request_cwd,
-                .launch_if_missing = true,
-            },
-        },
-        .codex => ai_harness.ProviderConfig{
-            .codex = .{
-                .cwd = request_cwd,
-                .launch_on_connect = true,
-            },
-        },
-        .claude => ai_harness.ProviderConfig{
-            .claude = .{
-                .cwd = request_cwd,
-            },
-        },
-        .cursor => ai_harness.ProviderConfig{
-            .cursor = .{
-                .cwd = request_cwd,
-                .model = request.model_ref,
-            },
-        },
-        .pi => ai_harness.ProviderConfig{
-            .pi = .{
-                .cwd = request_cwd,
-            },
-        },
-    };
-
-    log.info(
-        "send worker starting provider={s} cwd={s} model_len={d} thread_id_len={d} prompt_len={d}",
-        .{
-            @tagName(request.provider),
-            request_cwd,
-            if (request.model_ref) |model| model.len else 0,
-            if (request.provider_thread_id) |thread_id| thread_id.len else 0,
-            request.prompt.len,
-        },
-    );
-
-    var client = try ai_harness.connect(allocator, provider_config);
-    defer client.deinit();
-    std.debug.print("[codex-debug] send worker connected provider={s}\n", .{@tagName(request.provider)});
-    runtime_log.diagnostic("send worker connected provider={s}", .{@tagName(request.provider)});
-
-    const image_attachments = try allocator.alloc(ai_harness.types.ImageAttachment, request.image_paths.len);
-    defer allocator.free(image_attachments);
-    for (request.image_paths, 0..) |image_path, index| {
-        image_attachments[index] = .{ .path = image_path };
-    }
-
-    const result = client.sendPrompt(allocator, .{
-        .thread_id = request.provider_thread_id,
-        .thread_title = request.thread_title,
-        .prompt = request.prompt,
-        .image = if (request.image_path) |image_path| .{ .path = image_path } else null,
-        .images = image_attachments,
-        .cwd = request_cwd,
-        .model = request.model_ref,
-        .opencode_variant = if (request.provider == .opencode) request.opencode_reasoning_variant else null,
-        .cursor_model_params_json = if (request.provider == .cursor) request.cursor_model_params_json else null,
-        .reasoning_effort = if (request.provider == .opencode and request.opencode_reasoning_variant != null) null else request.reasoning_effort,
-        .service_tier = serviceTierForMode(request.provider, request.fast_mode),
-        .approval_policy = approvalPolicyForMode(request.provider, request.access_mode),
-        .sandbox_mode = sandboxModeForMode(request.provider, request.access_mode),
-        .stream_context = request.send_state_ptr,
-        .on_thread_id = handleSendThreadId,
-        .on_turn_id = handleSendTurnId,
-        .on_stream_delta = handleSendStreamDelta,
-        .on_stream_event = handleSendStreamEvent,
-        .on_failure = handleSendFailure,
-        .on_should_stop = handleSendShouldStop,
-        .on_approval_request = handleSendApprovalRequest,
-    }) catch |err| {
-        std.debug.print(
-            "[codex-debug] client.sendPrompt failed provider={s} cwd={s} model_len={d} thread_id_len={d}: {s}\n",
-            .{
-                @tagName(request.provider),
-                request_cwd,
-                if (request.model_ref) |model| model.len else 0,
-                if (request.provider_thread_id) |thread_id| thread_id.len else 0,
-                @errorName(err),
-            },
-        );
-        runtime_log.diagnostic(
-            "client.sendPrompt failed provider={s} cwd={s} model_len={d} thread_id_len={d}: {s}",
-            .{
-                @tagName(request.provider),
-                request_cwd,
-                if (request.model_ref) |model| model.len else 0,
-                if (request.provider_thread_id) |thread_id| thread_id.len else 0,
-                @errorName(err),
-            },
-        );
-        log.err(
-            "send worker failed provider={s} cwd={s} model_len={d} thread_id_len={d}: {s}",
-            .{
-                @tagName(request.provider),
-                request_cwd,
-                if (request.model_ref) |model| model.len else 0,
-                if (request.provider_thread_id) |thread_id| thread_id.len else 0,
-                @errorName(err),
-            },
-        );
-        return err;
-    };
-
-    log.info(
-        "send worker completed provider={s} provider_thread_id_len={d} reply_len={d}",
-        .{ @tagName(request.provider), result.thread_id.len, result.reply_text.len },
-    );
-
-    return .{
-        .provider_thread_id = result.thread_id,
-        .reply_text = result.reply_text,
-    };
 }
 
 fn escapeAppleScriptString(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
@@ -1430,119 +1188,6 @@ fn commandExists(name: []const u8) bool {
     return process_env.commandExists(name);
 }
 
-fn formatSendWorkerError(
-    allocator: std.mem.Allocator,
-    provider: provider_models.Provider,
-    err: anyerror,
-) ![]u8 {
-    return switch (err) {
-        error.FileNotFound => switch (provider) {
-            .claude => allocator.dupe(
-                u8,
-                "Node was not found on PATH. Install Node.js and make sure packaged app launches can find the node executable.",
-            ),
-            .cursor => allocator.dupe(
-                u8,
-                "Cursor CLI was not found. Install Cursor CLI, make sure `agent` is on PATH, then run `agent login`.",
-            ),
-            .fx => allocator.dupe(
-                u8,
-                "The fx CLI was not found. Install it with `curl -fsSL https://fx.sh/setup.sh | bash`, then run `fx login`.",
-            ),
-            .grok => allocator.dupe(
-                u8,
-                "The grok CLI was not found. Install Grok Build (https://docs.x.ai/build/overview#install), then run `grok login`.",
-            ),
-            .muse => allocator.dupe(
-                u8,
-                "The Muse Code CLI was not found. Install it, ensure `muse` is on PATH, then run `muse login`.",
-            ),
-            else => std.fmt.allocPrint(
-                allocator,
-                "{s} CLI was not found. Install it and make sure it is available on PATH for packaged app launches.",
-                .{providerLabel(provider)},
-            ),
-        },
-        error.ProviderBridgeNotFound => allocator.dupe(
-            u8,
-            "The bundled provider bridge was not found. Rebuild or reinstall Verde so provider_bridge.mjs is installed.",
-        ),
-        error.OpencodeServerUnavailable => allocator.dupe(
-            u8,
-            "OpenCode did not start. Ensure the opencode CLI is installed, authenticated, and reachable from this session.",
-        ),
-        error.OpencodeEmptyReply => allocator.dupe(
-            u8,
-            "OpenCode ended the turn without producing any output. Please retry the prompt.",
-        ),
-        error.CursorAttachmentsUnsupported => allocator.dupe(
-            u8,
-            "Cursor does not currently support local image attachments through this provider.",
-        ),
-        error.CursorSignedOut => allocator.dupe(
-            u8,
-            "Cursor is not authenticated. Run `agent login` or set CURSOR_API_KEY before sending.",
-        ),
-        error.CursorAcpFailed => allocator.dupe(
-            u8,
-            "Cursor ACP request failed. Check that the Cursor CLI works with `agent status` and `agent acp`.",
-        ),
-        error.CursorAcpRefused => allocator.dupe(
-            u8,
-            "Cursor refused this turn; the reply text holds the agent's reason.",
-        ),
-        error.FxAttachmentsUnsupported => allocator.dupe(
-            u8,
-            "FX does not currently support local image attachments through this provider.",
-        ),
-        error.FxSignedOut => allocator.dupe(
-            u8,
-            "FX is not authenticated. Run `fx login` before sending.",
-        ),
-        error.FxAcpFailed => allocator.dupe(
-            u8,
-            "FX ACP request failed. Check that the fx CLI works with `fx acp` from a terminal.",
-        ),
-        error.FxAcpRefused => allocator.dupe(
-            u8,
-            "FX refused this turn; the reply text holds fx's reason. Usually the model id is not offered by the active fx provider (compare `fx models`, gateway ids look like openai/gpt-5.2) or the gateway returned an HTTP error.",
-        ),
-        error.GrokAttachmentsUnsupported => allocator.dupe(
-            u8,
-            "Grok does not currently support local image attachments through this provider.",
-        ),
-        error.GrokSignedOut => allocator.dupe(
-            u8,
-            "Grok is not authenticated. Run `grok login` before sending.",
-        ),
-        error.GrokAcpFailed => allocator.dupe(
-            u8,
-            "Grok ACP request failed. Check that the grok CLI works with `grok agent stdio` from a terminal.",
-        ),
-        error.MuseSignedOut => allocator.dupe(
-            u8,
-            "Muse is not authenticated. Run `muse login` or set META_API_KEY before sending.",
-        ),
-        error.MuseUnsupportedImageType => allocator.dupe(
-            u8,
-            "Muse supports PNG, JPEG, GIF, and WebP image attachments.",
-        ),
-        error.MuseImageUnreadable => allocator.dupe(
-            u8,
-            "Muse could not read one of the attached images.",
-        ),
-        error.MuseRequestRejected => allocator.dupe(
-            u8,
-            "Muse rejected the model request. Check the Muse account/subscription and selected model.",
-        ),
-        error.MuseTurnFailed, error.MuseProtocolFailed => allocator.dupe(
-            u8,
-            "Muse request failed. Check that `muse` is authenticated and `muse serve` starts correctly.",
-        ),
-        else => std.fmt.allocPrint(allocator, "{s} request failed. Check the provider status and retry.", .{providerLabel(provider)}),
-    };
-}
-
 const CLAUDE_USAGE_LIMIT_MESSAGE = "Claude's 5-hour usage limit has been reached. View usage to see the reset time and your other plan limits.";
 const CLAUDE_PLAN_LIMIT_MESSAGE = "Claude's plan usage limit has been reached. View usage to see which window was exhausted and when it resets.";
 const CLAUDE_WEEKLY_LIMIT_MESSAGE = "Claude's weekly usage limit has been reached. View usage to see the reset time and your other plan limits.";
@@ -1672,155 +1317,7 @@ fn shellSingleQuoteEscape(allocator: std.mem.Allocator, value: []const u8) ![]u8
     return escaped.toOwnedSlice(allocator);
 }
 
-pub fn approvalPolicyForMode(_: provider_models.Provider, mode: provider_models.AccessMode) ?ai_harness.ApprovalPolicy {
-    return switch (mode) {
-        .full_access => .never,
-        .supervised => .on_request,
-    };
-}
-
-pub fn serviceTierForMode(provider: provider_models.Provider, fast_mode: provider_models.FastMode) ?ai_harness.ServiceTier {
-    if (provider != .codex) return null;
-    return switch (fast_mode) {
-        .on => .fast,
-        .off => null,
-    };
-}
-
-pub fn sandboxModeForMode(provider: provider_models.Provider, mode: provider_models.AccessMode) ?ai_harness.SandboxMode {
-    if (provider != .codex and provider != .claude and provider != .muse) return null;
-    return switch (mode) {
-        .full_access => .danger_full_access,
-        .supervised => .workspace_write,
-    };
-}
-fn handleSendThreadId(context: ?*anyopaque, thread_id: []const u8) void {
-    const send_state: *chat_types.SendState = @ptrCast(@alignCast(context orelse return));
-    const page_alloc = std.heap.page_allocator;
-
-    send_state.mutex.lock();
-    defer send_state.mutex.unlock();
-    if (send_state.status != .pending) return;
-
-    if (send_state.provisional_provider_thread_id) |existing| {
-        if (std.mem.eql(u8, existing, thread_id)) return;
-        page_alloc.free(existing);
-        send_state.provisional_provider_thread_id = null;
-    }
-
-    send_state.provisional_provider_thread_id = page_alloc.dupe(u8, thread_id) catch |err| {
-        std.debug.print("[codex-debug] failed to store provisional thread id len={d}: {s}\n", .{ thread_id.len, @errorName(err) });
-        runtime_log.diagnostic("failed to store provisional thread id len={d}: {s}", .{ thread_id.len, @errorName(err) });
-        return;
-    };
-    send_state.ui_revision +%= 1;
-    loop_wakeup.notify();
-}
-fn handleSendTurnId(context: ?*anyopaque, turn_id: []const u8) void {
-    const send_state: *chat_types.SendState = @ptrCast(@alignCast(context orelse return));
-    const page_alloc = std.heap.page_allocator;
-
-    send_state.mutex.lock();
-    defer send_state.mutex.unlock();
-    if (send_state.status != .pending) return;
-
-    if (send_state.active_turn_id) |existing| {
-        if (std.mem.eql(u8, existing, turn_id)) return;
-        page_alloc.free(existing);
-        send_state.active_turn_id = null;
-    }
-
-    send_state.active_turn_id = page_alloc.dupe(u8, turn_id) catch |err| {
-        std.debug.print("[codex-debug] failed to store active turn id len={d}: {s}\n", .{ turn_id.len, @errorName(err) });
-        runtime_log.diagnostic("failed to store active turn id len={d}: {s}", .{ turn_id.len, @errorName(err) });
-        return;
-    };
-    send_state.ui_revision +%= 1;
-    loop_wakeup.notify();
-}
-fn handleSendStreamDelta(context: ?*anyopaque, delta: []const u8) void {
-    const send_state: *chat_types.SendState = @ptrCast(@alignCast(context orelse return));
-    const page_alloc = std.heap.page_allocator;
-
-    send_state.mutex.lock();
-    defer send_state.mutex.unlock();
-    if (send_state.status != .pending) return;
-    send_state.partial_text.appendSlice(page_alloc, delta) catch |err| {
-        std.debug.print(
-            "[codex-debug] failed to append stream delta delta_len={d} partial_len={d}: {s}\n",
-            .{ delta.len, send_state.partial_text.items.len, @errorName(err) },
-        );
-        runtime_log.diagnostic(
-            "failed to append stream delta delta_len={d} partial_len={d}: {s}",
-            .{ delta.len, send_state.partial_text.items.len, @errorName(err) },
-        );
-        return;
-    };
-    send_state.ui_revision +%= 1;
-    // Wake the render loop now; otherwise streamed tokens only appear on the
-    // next PENDING_SEND timeout tick (~4fps). loop_wakeup coalesces bursts.
-    loop_wakeup.notify();
-}
-fn handleSendStreamEvent(context: ?*anyopaque, event: ai_harness.StreamEvent) void {
-    const send_state: *chat_types.SendState = @ptrCast(@alignCast(context orelse return));
-    const page_alloc = std.heap.page_allocator;
-
-    send_state.mutex.lock();
-    defer send_state.mutex.unlock();
-    if (send_state.status != .pending) return;
-
-    switch (event) {
-        .message => |message| {
-            flushPendingAssistantTextLocked(send_state, page_alloc);
-            if (send_state.pending_events.items.len > 0) {
-                const last = send_state.pending_events.items[send_state.pending_events.items.len - 1];
-                if (last.role == .system and std.mem.eql(u8, last.author, message.title) and std.mem.eql(u8, last.body, message.body)) {
-                    return;
-                }
-            }
-
-            const owned_author = page_alloc.dupe(u8, message.title) catch return;
-            errdefer page_alloc.free(owned_author);
-            const owned_body = page_alloc.dupe(u8, message.body) catch return;
-            errdefer page_alloc.free(owned_body);
-
-            send_state.pending_events.append(page_alloc, .{
-                .role = .system,
-                .author = owned_author,
-                .body = owned_body,
-            }) catch {
-                page_alloc.free(owned_author);
-                page_alloc.free(owned_body);
-                return;
-            };
-            send_state.ui_revision +%= 1;
-            loop_wakeup.notify();
-        },
-        .tool_call => |tool_call| {
-            // Content-less reasoning drives the "Thinking" header indicator
-            // instead of a timeline row, so no text flush either: nothing is
-            // inserted into the transcript.
-            if (transientThinkStatus(tool_call)) |thinking| {
-                send_state.thinking = thinking;
-                send_state.ui_revision +%= 1;
-                loop_wakeup.notify();
-                return;
-            }
-            flushPendingAssistantTextLocked(send_state, page_alloc);
-            upsertPendingToolCallEvent(page_alloc, &send_state.pending_events, tool_call) catch return;
-            send_state.ui_revision +%= 1;
-            loop_wakeup.notify();
-        },
-        .diff => |diff| {
-            flushPendingAssistantTextLocked(send_state, page_alloc);
-            applyPendingDiffUpdateLocked(page_alloc, send_state, diff);
-            send_state.ui_revision +%= 1;
-            loop_wakeup.notify();
-        },
-    }
-}
-
-fn toolCallDefaultTitle(tool_call: ai_harness.ToolCallUpdate) []const u8 {
+fn toolCallDefaultTitle(tool_call: provider_types.ToolCallUpdate) []const u8 {
     return switch (tool_call.kind orelse .other) {
         .read => "Read",
         .edit => "Edit",
@@ -1845,7 +1342,7 @@ fn isGenericMcpToolTitle(title: []const u8) bool {
         std.ascii.eqlIgnoreCase(title, "MCP tool");
 }
 
-fn toolCallDisplayAuthor(tool_call: ai_harness.ToolCallUpdate) []const u8 {
+fn toolCallDisplayAuthor(tool_call: provider_types.ToolCallUpdate) []const u8 {
     // MCP method names and subagent task titles belong in the card body.
     // Keeping the stable author makes every provider use the structured
     // command-card renderer instead of treating provider-specific names as
@@ -1855,7 +1352,7 @@ fn toolCallDisplayAuthor(tool_call: ai_harness.ToolCallUpdate) []const u8 {
     return toolCallDefaultTitle(tool_call);
 }
 
-fn toolCallBodyAlloc(allocator: std.mem.Allocator, tool_call: ai_harness.ToolCallUpdate) !?[]u8 {
+fn toolCallBodyAlloc(allocator: std.mem.Allocator, tool_call: provider_types.ToolCallUpdate) !?[]u8 {
     const Field = struct {
         label: []const u8,
         value: ?[]const u8,
@@ -1936,7 +1433,7 @@ fn hasToolCallContent(input: ?[]const u8, output: ?[]const u8, error_text: ?[]co
 /// them next to the elapsed-time label instead of a transcript row. Returns
 /// whether reasoning is currently active, or null for think updates that
 /// carry real thought content (those stay timeline rows).
-pub fn transientThinkStatus(tool_call: ai_harness.ToolCallUpdate) ?bool {
+pub fn transientThinkStatus(tool_call: provider_types.ToolCallUpdate) ?bool {
     if ((tool_call.kind orelse .other) != .think) return null;
     if (hasToolCallContent(tool_call.input, tool_call.output, tool_call.error_text)) return null;
     return switch (tool_call.status orelse .unknown) {
@@ -1949,8 +1446,8 @@ pub fn transientThinkStatus(tool_call: ai_harness.ToolCallUpdate) ?bool {
 /// once its terminal status lands there is nothing left worth keeping, so the
 /// row disappears instead of persisting as a confusing "Think - completed".
 fn isTransientThinkTerminal(
-    kind: ?ai_harness.ToolCallKind,
-    status: ?ai_harness.ToolCallStatus,
+    kind: ?provider_types.ToolCallKind,
+    status: ?provider_types.ToolCallStatus,
     input: ?[]const u8,
     output: ?[]const u8,
     error_text: ?[]const u8,
@@ -1966,7 +1463,7 @@ fn isTransientThinkTerminal(
 /// Content-less rows need a placeholder body. Think rows use a quiet ellipsis:
 /// the raw status tagName both reads poorly next to "Thinking" and matches the
 /// status-only-row hiding in the transcript renderer.
-fn toolCallFallbackBody(kind: ?ai_harness.ToolCallKind, status: ?ai_harness.ToolCallStatus) []const u8 {
+fn toolCallFallbackBody(kind: ?provider_types.ToolCallKind, status: ?provider_types.ToolCallStatus) []const u8 {
     if ((kind orelse .other) == .think) return "…";
     return @tagName(status orelse .unknown);
 }
@@ -1979,7 +1476,7 @@ fn toolCallFallbackBody(kind: ?ai_harness.ToolCallKind, status: ?ai_harness.Tool
 pub fn upsertPendingToolCallEvent(
     allocator: std.mem.Allocator,
     events: *std.ArrayListUnmanaged(chat_types.PendingTimelineEvent),
-    tool_call: ai_harness.ToolCallUpdate,
+    tool_call: provider_types.ToolCallUpdate,
 ) !void {
     if (tool_call.call_id.len > 0) {
         for (events.items, 0..) |*existing, index| {
@@ -2009,7 +1506,7 @@ pub fn upsertPendingToolCallEvent(
                 return;
             }
 
-            const merged: ai_harness.ToolCallUpdate = .{
+            const merged: provider_types.ToolCallUpdate = .{
                 .call_id = existing_id,
                 .title = existing.tool_call_title orelse "",
                 .kind = existing.tool_call_kind,
@@ -2093,28 +1590,6 @@ fn dupeOptionalNonEmpty(allocator: std.mem.Allocator, value: []const u8) !?[]u8 
     return try allocator.dupe(u8, value);
 }
 
-fn handleSendFailure(context: ?*anyopaque, message: []const u8) void {
-    const send_state: *chat_types.SendState = @ptrCast(@alignCast(context orelse return));
-    const page_alloc = std.heap.page_allocator;
-
-    send_state.mutex.lock();
-    defer send_state.mutex.unlock();
-    if (send_state.status != .pending) return;
-    if (send_state.error_message) |old| page_alloc.free(old);
-    const display_message = if (send_state.provider) |provider|
-        providerFailureDisplayMessage(provider, message)
-    else
-        message;
-    send_state.error_message = page_alloc.dupe(u8, display_message) catch null;
-}
-
-fn handleSendShouldStop(context: ?*anyopaque) bool {
-    const send_state: *chat_types.SendState = @ptrCast(@alignCast(context orelse return true));
-    send_state.mutex.lock();
-    defer send_state.mutex.unlock();
-    return send_state.stop_requested;
-}
-
 pub fn flushPendingAssistantTextLocked(send_state: *chat_types.SendState, allocator: std.mem.Allocator) void {
     if (send_state.partial_text.items.len == 0) return;
     const provider = send_state.provider orelse return;
@@ -2146,7 +1621,7 @@ pub fn flushPendingAssistantTextLocked(send_state: *chat_types.SendState, alloca
 pub fn mergePendingDiffFilesLocked(
     allocator: std.mem.Allocator,
     target: *std.ArrayListUnmanaged(chat_types.PendingDiffFile),
-    files: []const ai_harness.StreamDiffFile,
+    files: []const provider_types.StreamDiffFile,
 ) void {
     for (files) |file| {
         if (upsertPendingDiffFileLocked(allocator, target, file)) |_| {} else |_| return;
@@ -2158,7 +1633,7 @@ pub fn mergePendingDiffFilesLocked(
 pub fn applyPendingDiffUpdateLocked(
     allocator: std.mem.Allocator,
     send_state: *chat_types.SendState,
-    diff: ai_harness.StreamDiffUpdate,
+    diff: provider_types.StreamDiffUpdate,
 ) void {
     switch (diff.scope) {
         .incremental => {
@@ -2180,7 +1655,7 @@ pub fn applyPendingDiffUpdateLocked(
 fn replacePendingDiffFilesLocked(
     allocator: std.mem.Allocator,
     target: *std.ArrayListUnmanaged(chat_types.PendingDiffFile),
-    files: []const ai_harness.StreamDiffFile,
+    files: []const provider_types.StreamDiffFile,
 ) !void {
     var replacement: std.ArrayListUnmanaged(chat_types.PendingDiffFile) = .empty;
     errdefer freePendingDiffFiles(allocator, &replacement);
@@ -2191,7 +1666,7 @@ fn replacePendingDiffFilesLocked(
 fn upsertPendingDiffFileLocked(
     allocator: std.mem.Allocator,
     target: *std.ArrayListUnmanaged(chat_types.PendingDiffFile),
-    file: ai_harness.StreamDiffFile,
+    file: provider_types.StreamDiffFile,
 ) !void {
     for (target.items) |*existing| {
         if (!std.mem.eql(u8, existing.path, file.path)) continue;
@@ -2213,50 +1688,6 @@ fn upsertPendingDiffFileLocked(
 }
 pub fn providerLabel(provider: provider_models.Provider) [:0]const u8 {
     return chat_threads.providerLabel(provider);
-}
-fn handleSendApprovalRequest(context: ?*anyopaque, request: ai_harness.ApprovalRequest) ai_harness.ApprovalDecision {
-    const send_state: *chat_types.SendState = @ptrCast(@alignCast(context orelse return .deny));
-    const page_alloc = std.heap.page_allocator;
-
-    const owned_call_id = page_alloc.dupe(u8, request.call_id) catch return .deny;
-    errdefer page_alloc.free(owned_call_id);
-    const owned_title = page_alloc.dupe(u8, request.title) catch return .deny;
-    errdefer page_alloc.free(owned_title);
-    const owned_body = page_alloc.dupe(u8, request.body) catch return .deny;
-    errdefer page_alloc.free(owned_body);
-
-    send_state.mutex.lock();
-    defer send_state.mutex.unlock();
-    if (send_state.status != .pending) {
-        page_alloc.free(owned_call_id);
-        page_alloc.free(owned_title);
-        page_alloc.free(owned_body);
-        return .deny;
-    }
-
-    flushPendingAssistantTextLocked(send_state, page_alloc);
-    freePendingApprovalLocked(page_alloc, &send_state.pending_approval);
-    send_state.pending_approval = .{
-        .call_id = owned_call_id,
-        .title = owned_title,
-        .body = owned_body,
-    };
-    send_state.approval_decision = null;
-    send_state.ui_revision +%= 1;
-    // Surface the approval prompt immediately; this thread is about to block
-    // on the user's decision, so a stale 250ms tick would delay the modal.
-    loop_wakeup.notify();
-
-    while (send_state.status == .pending and send_state.approval_decision == null) {
-        send_state.condition.wait(&send_state.mutex);
-    }
-
-    const decision = send_state.approval_decision orelse .deny;
-    send_state.approval_decision = null;
-    freePendingApprovalLocked(page_alloc, &send_state.pending_approval);
-    send_state.ui_revision +%= 1;
-    loop_wakeup.notify();
-    return decision;
 }
 pub fn freePendingApproval(allocator: std.mem.Allocator, approval: *?chat_types.PendingApproval) void {
     if (approval.*) |pending| {
@@ -2457,7 +1888,7 @@ test "structured tool-call updates upsert and merge lifecycle content" {
     try std.testing.expectEqual(@as(usize, 1), events.items.len);
     const event = events.items[0];
     try std.testing.expectEqualStrings("call-1", event.tool_call_id.?);
-    try std.testing.expectEqual(ai_harness.ToolCallStatus.completed, event.tool_call_status.?);
+    try std.testing.expectEqual(provider_types.ToolCallStatus.completed, event.tool_call_status.?);
     try std.testing.expectEqual(@as(i64, 123), event.transcript_card_started_ms);
     try std.testing.expectEqualStrings("Edit", event.author);
     try std.testing.expect(std.mem.indexOf(u8, event.body, "Edit `/tmp/a.txt`") != null);
@@ -2554,8 +1985,8 @@ test "lingering running tool calls are cancelled at turn end" {
     cancelLingeringToolCallEvents(std.testing.allocator, &events);
 
     try std.testing.expectEqual(@as(usize, 2), events.items.len);
-    try std.testing.expectEqual(ai_harness.ToolCallStatus.cancelled, events.items[0].tool_call_status.?);
-    try std.testing.expectEqual(ai_harness.ToolCallStatus.completed, events.items[1].tool_call_status.?);
+    try std.testing.expectEqual(provider_types.ToolCallStatus.cancelled, events.items[0].tool_call_status.?);
+    try std.testing.expectEqual(provider_types.ToolCallStatus.completed, events.items[1].tool_call_status.?);
 }
 
 test "transient think detection drives the pending thinking indicator" {
@@ -3041,22 +2472,6 @@ pub fn extensionForImageMime(mime: []const u8) []const u8 {
     if (std.mem.eql(u8, mime, "image/gif")) return "gif";
     if (std.mem.eql(u8, mime, "image/bmp")) return "bmp";
     return "img";
-}
-
-test "handleSendThreadId stores provisional provider thread id while pending" {
-    var send_state = chat_types.SendState{ .status = .pending };
-    defer if (send_state.provisional_provider_thread_id) |thread_id| std.heap.page_allocator.free(thread_id);
-
-    handleSendThreadId(&send_state, "ses_123");
-    try std.testing.expect(send_state.provisional_provider_thread_id != null);
-    try std.testing.expectEqualStrings("ses_123", send_state.provisional_provider_thread_id.?);
-
-    handleSendThreadId(&send_state, "ses_123");
-    try std.testing.expectEqualStrings("ses_123", send_state.provisional_provider_thread_id.?);
-
-    send_state.status = .idle;
-    handleSendThreadId(&send_state, "ses_456");
-    try std.testing.expectEqualStrings("ses_123", send_state.provisional_provider_thread_id.?);
 }
 
 test "configured editor parsing preserves Windows paths and quoted arguments" {

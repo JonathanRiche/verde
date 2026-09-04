@@ -653,6 +653,56 @@ pub const Store = struct {
         return self.applyMutation(.{ .snapshot_replace = request });
     }
 
+    /// Verify that one exact successful mutation receipt is current.
+    pub fn committedReceiptMatches(
+        self: *const Self,
+        request_key: []const u8,
+        operation: []const u8,
+        fingerprint: []const u8,
+        store_revision: u64,
+    ) StoreError!bool {
+        const row = (self.conn.row(
+            "select operation, fingerprint, store_revision, response_status from store_receipts where request_key = ?1",
+            .{request_key},
+        ) catch return error.StoreUnavailable) orelse return false;
+        defer row.deinit();
+        if (row.int(2) < 0) return false;
+        return std.mem.eql(u8, row.text(0), operation) and
+            std.mem.eql(u8, row.text(1), fingerprint) and
+            @as(u64, @intCast(row.int(2))) == store_revision and
+            row.int(3) == 0;
+    }
+
+    /// Compare a wire surface with the current durable completion row.
+    pub fn surfaceStateMatches(self: *const Self, surface: store_protocol.SurfaceState) StoreError!bool {
+        const row = (self.conn.row(
+            "select workspace_id, workspace_path, dock_id, pane_id, provider, provider_thread_id, title, status, status_changed_at_ms, completed_at_ms, last_event_title, last_event_body from surface_completions where session_id = ?1",
+            .{surface.session_id},
+        ) catch return error.StoreUnavailable) orelse return false;
+        defer row.deinit();
+        return std.mem.eql(u8, row.text(0), surface.workspace_id) and
+            std.mem.eql(u8, row.text(1), surface.workspace_path) and
+            row.int(2) == @as(i64, @intCast(surface.dock_id)) and
+            optionalIntEqual(row.nullableInt(3), if (surface.pane_id) |value| @as(i64, @intCast(value)) else null) and
+            optionalIntEqual(row.nullableInt(4), if (surface.provider) |value| surfaceProviderCode(value) catch return false else null) and
+            optionalBytesEqual(row.nullableText(5), surface.provider_thread_id) and
+            std.mem.eql(u8, row.text(6), surface.title) and
+            row.int(7) == (surfaceStatusCode(surface.status) catch return false) and
+            row.int(8) == surface.status_changed_at_ms and
+            row.int(9) == surface.completed_at_ms and
+            optionalBytesEqual(row.nullableText(10), surface.last_event_title) and
+            optionalBytesEqual(row.nullableText(11), surface.last_event_body);
+    }
+
+    pub fn surfaceStateAbsent(self: *const Self, session_id: []const u8) StoreError!bool {
+        const row = self.conn.row(
+            "select 1 from surface_completions where session_id = ?1",
+            .{session_id},
+        ) catch return error.StoreUnavailable;
+        if (row) |present| present.deinit();
+        return row == null;
+    }
+
     /// Convenience entry point for the first granular phase-1 mutation.
     pub fn upsertWorkspace(self: *Self, request: store_protocol.WorkspaceUpsertRequest) StoreError!store_protocol.WriteResult {
         return self.applyMutation(.{ .workspace_upsert = request });

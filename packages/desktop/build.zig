@@ -132,9 +132,8 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "local_ipc", local_ipc);
     build_options.addOption(bool, "windows_integrations", windows_integrations);
     const build_options_module = build_options.createModule();
-    // The standalone daemon gets only the build metadata it consumes. Keep
-    // desktop renderer/browser switches out of its module graph so `daemon`
-    // remains a GUI-free build target.
+    // The standalone daemon only needs build metadata along the daemon and
+    // daemon-owned MCP paths. Unreached CLI declarations stay lazy.
     const daemon_build_options = b.addOptions();
     daemon_build_options.addOption([:0]const u8, "version", version_z);
     const daemon_build_options_module = daemon_build_options.createModule();
@@ -199,10 +198,12 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "build_options", .module = daemon_build_options_module },
+                .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
                 .{ .name = "headless", .module = headless_module },
                 .{ .name = "platform_paths", .module = platform_paths_module },
                 .{ .name = "platform_runtime", .module = platform_runtime_module },
                 .{ .name = "platform_windows_known_folders", .module = platform_windows_known_folders_module },
+                .{ .name = "zsdl3", .module = zsdl.module("zsdl3") },
                 .{ .name = "zqlite", .module = zqlite.module("zqlite") },
             },
         }),
@@ -215,14 +216,128 @@ pub fn build(b: *std.Build) void {
         // Linux. No SDL, Palette, browser helper, fonts, or desktop entrypoint
         // participates in this executable.
         daemon_exe.root_module.linkSystemLibrary("util", .{});
+    } else if (target.result.os.tag == .windows) {
+        daemon_exe.subsystem = .console;
+        addWindowsApplicationResources(b, daemon_exe, version, "verde-daemon.exe", "verde-daemon-version.rc");
+        addWindowsSystemLibraries(daemon_exe);
     }
     const install_daemon = b.addInstallArtifact(daemon_exe, .{});
     b.getInstallStep().dependOn(&install_daemon.step);
 
-    const exe = b.addExecutable(.{
-        .name = "verde",
+    const gui_exe = b.addExecutable(.{
+        .name = "verde-gui",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "build_options", .module = build_options_module },
+                .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
+                .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
+                .{ .name = "headless", .module = headless_module },
+                .{ .name = "loop_wakeup", .module = loop_wakeup_module },
+                .{ .name = "palette", .module = palette_module },
+                .{ .name = "platform_paths", .module = platform_paths_module },
+                .{ .name = "platform_runtime", .module = platform_runtime_module },
+                .{ .name = "platform_windows_known_folders", .module = platform_windows_known_folders_module },
+                .{ .name = "zig_dif", .module = zig_dif.module("zig_dif") },
+                .{ .name = "zig_markdown", .module = zig_markdown.module("zig_markdown") },
+                .{ .name = "zsdl3", .module = zsdl.module("zsdl3") },
+            },
+        }),
+    });
+    gui_exe.build_id = .sha1;
+    gui_exe.each_lib_rpath = false;
+    if (target.result.os.tag == .macos) {
+        gui_exe.headerpad_max_install_names = true;
+    }
+    const build_fff = if (build_fff_enabled) addFffBuild(b, fff_root, target, fff_cargo_target) else null;
+    if (build_fff) |build_step| gui_exe.step.dependOn(&build_step.step);
+    gui_exe.root_module.link_libc = true;
+    gui_exe.root_module.addIncludePath(b.path("../../vendor"));
+    gui_exe.root_module.addIncludePath(b.path("../../vendor/fff/crates/fff-c/include"));
+    addFffLink(gui_exe, target.result.os.tag, fff_lib_dir, fff_import_lib);
+    gui_exe.root_module.addCSourceFile(.{
+        .file = b.path("../../vendor/stb_image_impl.c"),
+        .flags = &.{},
+    });
+    switch (target.result.os.tag) {
+        .linux => {
+            if (zsdl.builder.lazyDependency("sdl3_prebuilt_x86_64_linux_gnu", .{})) |sdl3_prebuilt| {
+                gui_exe.root_module.addLibraryPath(sdl3_prebuilt.path("lib"));
+            }
+            gui_exe.root_module.addCSourceFile(.{
+                .file = b.path("src/browser/platform/linux_wayland_subsurface.c"),
+                .flags = &.{},
+            });
+            gui_exe.root_module.linkSystemLibrary("SDL3", .{});
+            gui_exe.root_module.linkSystemLibrary("SDL3_ttf", .{});
+            gui_exe.root_module.linkSystemLibrary("util", .{});
+            gui_exe.root_module.linkSystemLibrary("wayland-client", .{ .use_pkg_config = .force });
+        },
+        .windows => {
+            gui_exe.subsystem = .windows;
+            if (target.result.abi == .msvc) {
+                // The MSVC GUI subsystem otherwise selects WinMainCRTStartup,
+                // while Zig's libc startup exports main for this root module.
+                gui_exe.entry = .{ .symbol_name = "mainCRTStartup" };
+            }
+            addWindowsApplicationResources(b, gui_exe, version, "Verde.exe", "verde-gui-version.rc");
+            addWindowsIntegrations(b, gui_exe);
+            addWindowsWebView2(b, gui_exe, .{
+                .real_webview = browser_backend == .native_webview,
+                .include_dir = webview2_include_dir,
+                .loader_import_lib = webview2_loader_lib,
+            });
+            addWindowsSdlPaths(gui_exe, .{
+                .sdl3_include_dir = sdl3_include_dir,
+                .sdl3_lib_dir = sdl3_lib_dir,
+                .sdl3_ttf_include_dir = sdl3_ttf_include_dir,
+                .sdl3_ttf_lib_dir = sdl3_ttf_lib_dir,
+            });
+            addWindowsSdlIncludes(palette_module, sdl3_include_dir, sdl3_ttf_include_dir);
+            gui_exe.root_module.linkSystemLibrary("SDL3", .{});
+            gui_exe.root_module.linkSystemLibrary("SDL3_ttf", .{});
+            addWindowsSystemLibraries(gui_exe);
+        },
+        .macos => {
+            if (zsdl.builder.lazyDependency("sdl3_prebuilt_macos", .{})) |sdl3_prebuilt| {
+                gui_exe.root_module.addFrameworkPath(sdl3_prebuilt.path("Frameworks"));
+            }
+            if (b.graph.environ_map.get("SDKROOT")) |sdkroot| {
+                gui_exe.root_module.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdkroot, "System", "Library", "Frameworks" }) });
+                gui_exe.root_module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdkroot, "usr", "include" }) });
+            }
+            gui_exe.root_module.addCSourceFile(.{
+                .file = b.path("src/platform/macos_clipboard.m"),
+                .flags = &.{},
+            });
+            addMacOSSwiftWebView(b, gui_exe, target.result.cpu.arch);
+            if (macOSHomebrewPrefix(b)) |prefix| {
+                gui_exe.root_module.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include" }) });
+                gui_exe.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "lib" }) });
+                palette_module.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include" }) });
+            }
+            gui_exe.root_module.linkSystemLibrary("sdl3", .{ .use_pkg_config = .yes });
+            gui_exe.root_module.linkSystemLibrary("sdl3-ttf", .{ .use_pkg_config = .yes });
+            gui_exe.root_module.linkFramework("AppKit", .{});
+            gui_exe.root_module.linkFramework("WebKit", .{});
+        },
+        else => {},
+    }
+    switch (target.result.os.tag) {
+        .linux => gui_exe.root_module.addRPathSpecial("$ORIGIN"),
+        .macos => gui_exe.root_module.addRPathSpecial("@executable_path"),
+        else => {},
+    }
+
+    // The stable public command is intentionally a separate compilation
+    // boundary. It dispatches CLI commands and launches the sibling private
+    // GUI without pulling SDL, Palette, rendering, or GUI state into its root.
+    const cli_exe = b.addExecutable(.{
+        .name = "verde",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cli_main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -242,155 +357,22 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    exe.build_id = .sha1;
-    exe.each_lib_rpath = false;
-    if (target.result.os.tag == .macos) {
-        exe.headerpad_max_install_names = true;
-    }
-    const build_fff = if (build_fff_enabled) addFffBuild(b, fff_root, target, fff_cargo_target) else null;
-    if (build_fff) |build_step| exe.step.dependOn(&build_step.step);
-    exe.root_module.link_libc = true;
-    exe.root_module.addIncludePath(b.path("../../vendor"));
-    exe.root_module.addIncludePath(b.path("../../vendor/fff/crates/fff-c/include"));
-    addFffLink(exe, target.result.os.tag, fff_lib_dir, fff_import_lib);
-    exe.root_module.addCSourceFile(.{
-        .file = b.path("../../vendor/stb_image_impl.c"),
-        .flags = &.{},
-    });
-    var windows_gui_exe: ?*std.Build.Step.Compile = null;
+    cli_exe.build_id = .sha1;
+    cli_exe.each_lib_rpath = false;
+    cli_exe.root_module.link_libc = true;
     switch (target.result.os.tag) {
-        .linux => {
-            if (zsdl.builder.lazyDependency("sdl3_prebuilt_x86_64_linux_gnu", .{})) |sdl3_prebuilt| {
-                exe.root_module.addLibraryPath(sdl3_prebuilt.path("lib"));
-            }
-            exe.root_module.addCSourceFile(.{
-                .file = b.path("src/browser/platform/linux_wayland_subsurface.c"),
-                .flags = &.{},
-            });
-            exe.root_module.linkSystemLibrary("SDL3", .{});
-            exe.root_module.linkSystemLibrary("SDL3_ttf", .{});
-            exe.root_module.linkSystemLibrary("util", .{});
-            exe.root_module.linkSystemLibrary("wayland-client", .{ .use_pkg_config = .force });
-        },
+        .linux => cli_exe.root_module.linkSystemLibrary("util", .{}),
         .windows => {
-            exe.subsystem = .console;
-            addWindowsApplicationResources(b, exe, version, "verde.exe", "verde-cli-version.rc");
-            addWindowsIntegrations(b, exe);
-            addWindowsWebView2(b, exe, .{
-                .real_webview = browser_backend == .native_webview,
-                .include_dir = webview2_include_dir,
-                .loader_import_lib = webview2_loader_lib,
-            });
-            addWindowsSdlPaths(exe, .{
-                .sdl3_include_dir = sdl3_include_dir,
-                .sdl3_lib_dir = sdl3_lib_dir,
-                .sdl3_ttf_include_dir = sdl3_ttf_include_dir,
-                .sdl3_ttf_lib_dir = sdl3_ttf_lib_dir,
-            });
-            addWindowsSdlIncludes(palette_module, sdl3_include_dir, sdl3_ttf_include_dir);
-            exe.root_module.linkSystemLibrary("SDL3", .{});
-            exe.root_module.linkSystemLibrary("SDL3_ttf", .{});
-            addWindowsSystemLibraries(exe);
-
-            // Windows needs a GUI-subsystem launcher and a console-subsystem CLI.
-            // They intentionally share the same application modules; only their
-            // PE subsystem and installed location differ.
-            const gui_exe = b.addExecutable(.{
-                .name = "Verde",
-                .root_module = b.createModule(.{
-                    .root_source_file = b.path("src/main.zig"),
-                    .target = target,
-                    .optimize = optimize,
-                    .imports = &.{
-                        .{ .name = "build_options", .module = build_options_module },
-                        .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
-                        .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
-                        .{ .name = "headless", .module = headless_module },
-                        .{ .name = "loop_wakeup", .module = loop_wakeup_module },
-                        .{ .name = "palette", .module = palette_module },
-                        .{ .name = "platform_paths", .module = platform_paths_module },
-                        .{ .name = "platform_runtime", .module = platform_runtime_module },
-                        .{ .name = "platform_windows_known_folders", .module = platform_windows_known_folders_module },
-                        .{ .name = "zig_dif", .module = zig_dif.module("zig_dif") },
-                        .{ .name = "zig_markdown", .module = zig_markdown.module("zig_markdown") },
-                        .{ .name = "zsdl3", .module = zsdl.module("zsdl3") },
-                        .{ .name = "zqlite", .module = zqlite.module("zqlite") },
-                    },
-                }),
-            });
-            gui_exe.subsystem = .windows;
-            if (target.result.abi == .msvc) {
-                // The MSVC GUI subsystem otherwise selects WinMainCRTStartup,
-                // while Zig's libc startup exports main for this root module.
-                gui_exe.entry = .{ .symbol_name = "mainCRTStartup" };
-            }
-            gui_exe.build_id = .sha1;
-            gui_exe.each_lib_rpath = false;
-            if (build_fff) |build_step| gui_exe.step.dependOn(&build_step.step);
-            gui_exe.root_module.link_libc = true;
-            gui_exe.root_module.addIncludePath(b.path("../../vendor"));
-            gui_exe.root_module.addIncludePath(b.path("../../vendor/fff/crates/fff-c/include"));
-            addFffLink(gui_exe, .windows, fff_lib_dir, fff_import_lib);
-            gui_exe.root_module.addCSourceFile(.{
-                .file = b.path("../../vendor/stb_image_impl.c"),
-                .flags = &.{},
-            });
-            addWindowsApplicationResources(b, gui_exe, version, "Verde.exe", "verde-gui-version.rc");
-            addWindowsIntegrations(b, gui_exe);
-            addWindowsWebView2(b, gui_exe, .{
-                .real_webview = browser_backend == .native_webview,
-                .include_dir = webview2_include_dir,
-                .loader_import_lib = webview2_loader_lib,
-            });
-            addWindowsSdlPaths(gui_exe, .{
-                .sdl3_include_dir = sdl3_include_dir,
-                .sdl3_lib_dir = sdl3_lib_dir,
-                .sdl3_ttf_include_dir = sdl3_ttf_include_dir,
-                .sdl3_ttf_lib_dir = sdl3_ttf_lib_dir,
-            });
-            gui_exe.root_module.linkSystemLibrary("SDL3", .{});
-            gui_exe.root_module.linkSystemLibrary("SDL3_ttf", .{});
-            addWindowsSystemLibraries(gui_exe);
-            windows_gui_exe = gui_exe;
-        },
-        .macos => {
-            if (zsdl.builder.lazyDependency("sdl3_prebuilt_macos", .{})) |sdl3_prebuilt| {
-                exe.root_module.addFrameworkPath(sdl3_prebuilt.path("Frameworks"));
-            }
-            if (b.graph.environ_map.get("SDKROOT")) |sdkroot| {
-                exe.root_module.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdkroot, "System", "Library", "Frameworks" }) });
-                exe.root_module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdkroot, "usr", "include" }) });
-            }
-            exe.root_module.addCSourceFile(.{
-                .file = b.path("src/platform/macos_clipboard.m"),
-                .flags = &.{},
-            });
-            addMacOSSwiftWebView(b, exe, target.result.cpu.arch);
-            if (macOSHomebrewPrefix(b)) |prefix| {
-                exe.root_module.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include" }) });
-                exe.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "lib" }) });
-                palette_module.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include" }) });
-            }
-            exe.root_module.linkSystemLibrary("sdl3", .{ .use_pkg_config = .yes });
-            exe.root_module.linkSystemLibrary("sdl3-ttf", .{ .use_pkg_config = .yes });
-            exe.root_module.linkFramework("AppKit", .{});
-            exe.root_module.linkFramework("WebKit", .{});
+            cli_exe.subsystem = .console;
+            addWindowsApplicationResources(b, cli_exe, version, "verde.exe", "verde-cli-version.rc");
+            addWindowsIntegrations(b, cli_exe);
+            addWindowsSystemLibraries(cli_exe);
         },
         else => {},
     }
-    switch (target.result.os.tag) {
-        .linux => exe.root_module.addRPathSpecial("$ORIGIN"),
-        .macos => exe.root_module.addRPathSpecial("@executable_path"),
-        else => {},
-    }
 
-    // Case-insensitive Windows filesystems cannot keep Verde.exe and verde.exe
-    // in one directory. Keep the CLI in bin/cli in the build prefix; the ZIP
-    // assembler exposes it as bin/verde.exe beside its own runtime DLL copies.
-    const install_exe = b.addInstallArtifact(exe, if (target.result.os.tag == .windows)
-        .{ .dest_sub_path = "cli/verde.exe" }
-    else
-        .{});
+    const install_gui = b.addInstallArtifact(gui_exe, .{});
+    const install_cli = b.addInstallArtifact(cli_exe, .{});
     // Normal Linux builds give the Rust cdylib a stable SONAME, so the
     // executable's $ORIGIN runpath can resolve the installed sibling library.
     // Keep patchelf only for caller-supplied libraries that may lack one.
@@ -402,16 +384,14 @@ pub fn build(b: *std.Build) void {
                 fff_runtime_lib,
                 fffRuntimeName(.linux),
             });
-            normalize_fff_needed.addArtifactArg(exe);
-            install_exe.step.dependOn(&normalize_fff_needed.step);
+            normalize_fff_needed.addArtifactArg(gui_exe);
+            install_gui.step.dependOn(&normalize_fff_needed.step);
         } else |_| {}
     }
-    const dev_build_step = b.step("dev-build", "Build and install only the main desktop executable");
-    dev_build_step.dependOn(&install_exe.step);
-    b.getInstallStep().dependOn(&install_exe.step);
-    if (windows_gui_exe) |gui_exe| {
-        b.getInstallStep().dependOn(&b.addInstallArtifact(gui_exe, .{}).step);
-    }
+    const dev_build_step = b.step("dev-build", "Build and install only the private desktop GUI executable");
+    dev_build_step.dependOn(&install_gui.step);
+    b.getInstallStep().dependOn(&install_gui.step);
+    b.getInstallStep().dependOn(&install_cli.step);
     if (target.result.os.tag == .linux and browser_backend == .native_webview) {
         const browser_helper = b.addExecutable(.{
             .name = "verde-browser-linux",
@@ -437,15 +417,6 @@ pub fn build(b: *std.Build) void {
     const install_fff = b.addInstallBinFile(.{ .cwd_relative = fff_runtime_lib }, fffRuntimeName(target.result.os.tag));
     if (build_fff) |build_step| install_fff.step.dependOn(&build_step.step);
     b.getInstallStep().dependOn(&install_fff.step);
-    if (target.result.os.tag == .windows) {
-        const install_cli_fff = b.addInstallFileWithDir(
-            .{ .cwd_relative = fff_runtime_lib },
-            .{ .custom = "bin/cli" },
-            fffRuntimeName(.windows),
-        );
-        if (build_fff) |build_step| install_cli_fff.step.dependOn(&build_step.step);
-        b.getInstallStep().dependOn(&install_cli_fff.step);
-    }
     if (target.result.os.tag == .linux) {
         if (sdl3_runtime_lib) |path| {
             b.getInstallStep().dependOn(&b.addInstallFileWithDir(
@@ -515,7 +486,12 @@ pub fn build(b: *std.Build) void {
         }
     }
 
-    const run_cmd = b.addRunArtifact(windows_gui_exe orelse exe);
+    // Run through the installed public launcher so sibling discovery exercises
+    // the same layout used by desktop entries and packaged applications.
+    const run_cmd = b.addSystemCommand(&.{b.getInstallPath(
+        .bin,
+        if (target.result.os.tag == .windows) "verde.exe" else "verde",
+    )});
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
         run_cmd.addArgs(args);
@@ -585,7 +561,7 @@ pub fn build(b: *std.Build) void {
     }
     const exe_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
+            .root_source_file = b.path("src/desktop_test_root.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -1125,11 +1101,6 @@ fn installWindowsRuntime(b: *std.Build, source_path: ?[]const u8, name: []const 
     b.getInstallStep().dependOn(&b.addInstallFileWithDir(
         .{ .cwd_relative = path },
         .bin,
-        name,
-    ).step);
-    b.getInstallStep().dependOn(&b.addInstallFileWithDir(
-        .{ .cwd_relative = path },
-        .{ .custom = "bin/cli" },
         name,
     ).step);
 }

@@ -6,7 +6,7 @@ const zig_dif = @import("zig_dif");
 
 const app_state = @import("../state.zig");
 const keybinds = @import("../app/keybinds.zig");
-const ai_harness = @import("../providers/harness.zig");
+const provider_types = @import("headless").provider_types;
 const profiler = @import("../runtime/profiler.zig");
 const platform_runtime = @import("platform_runtime");
 const utils = @import("../utils.zig");
@@ -3636,7 +3636,7 @@ fn pendingRowHeightKey(
     column_width: f32,
     turn_started_at_ms: i64,
     msg_idx: usize,
-    status: ?ai_harness.ToolCallStatus,
+    status: ?provider_types.ToolCallStatus,
     image_count: usize,
     body: []const u8,
 ) u64 {
@@ -4005,7 +4005,7 @@ fn toolCallGroupFailed(entries: anytype, start: usize, end: usize) bool {
     return toolCallGroupFailureCount(entries, start, end) > 0;
 }
 
-fn toolCallEntryStatus(entry: anytype) ?ai_harness.ToolCallStatus {
+fn toolCallEntryStatus(entry: anytype) ?provider_types.ToolCallStatus {
     if (@hasField(@TypeOf(entry), "tool_call_status")) return entry.tool_call_status;
     return null;
 }
@@ -4036,7 +4036,7 @@ test "tool call groups stop before user-required system events" {
         role: app_state.ChatRole,
         author: []const u8,
         body: []const u8,
-        tool_call_status: ?ai_harness.ToolCallStatus = null,
+        tool_call_status: ?provider_types.ToolCallStatus = null,
     };
     const entries = [_]Event{
         .{ .role = .system, .author = "Ran command", .body = "git status" },
@@ -4057,7 +4057,7 @@ test "tool call groups use structured lifecycle status" {
         role: app_state.ChatRole = .system,
         author: []const u8,
         body: []const u8,
-        tool_call_status: ?ai_harness.ToolCallStatus,
+        tool_call_status: ?provider_types.ToolCallStatus,
     };
     const entries = [_]Event{
         .{ .author = "Read", .body = "Input", .tool_call_status = .completed },
@@ -4074,8 +4074,8 @@ test "subagent rows group separately from ordinary tool calls" {
         role: app_state.ChatRole = .system,
         author: []const u8,
         body: []const u8,
-        tool_call_kind: ?ai_harness.ToolCallKind = null,
-        tool_call_status: ?ai_harness.ToolCallStatus = null,
+        tool_call_kind: ?provider_types.ToolCallKind = null,
+        tool_call_status: ?provider_types.ToolCallStatus = null,
     };
     const entries = [_]Event{
         .{ .author = "Read", .body = "Input", .tool_call_kind = .read },
@@ -4098,7 +4098,7 @@ test "structured ordinary tools do not scan legacy subagent markers" {
         author: []const u8,
         body: []const u8,
         tool_call_id: ?[]const u8 = null,
-        tool_call_kind: ?ai_harness.ToolCallKind = null,
+        tool_call_kind: ?provider_types.ToolCallKind = null,
     };
     const legacy_marker_body =
         \\Tool:
@@ -4686,7 +4686,7 @@ fn transcriptCommandEventHeight(
     author: []const u8,
     body_raw: []const u8,
     column_width: f32,
-    tool_call_status: ?ai_harness.ToolCallStatus,
+    tool_call_status: ?provider_types.ToolCallStatus,
 ) f32 {
     const pad_x = theme.scaledUi(14.0);
     const pad_y = theme.scaledUi(9.0);
@@ -6562,8 +6562,8 @@ fn renderCommandEventRow(
     message_index: usize,
     running: bool,
     grouped: bool,
-    tool_call_status: ?ai_harness.ToolCallStatus,
-    tool_call_kind: ?ai_harness.ToolCallKind,
+    tool_call_status: ?provider_types.ToolCallStatus,
+    tool_call_kind: ?provider_types.ToolCallKind,
     live_task_index: ?usize,
 ) void {
     // Command transcript card, including controls for tracked background tasks.

@@ -135,6 +135,35 @@ pub fn listModels(
     return client.listModels(allocator);
 }
 
+/// Construct a provider client for daemon-owned metadata and command RPCs.
+/// Callers select whether operations such as imports/slash commands may start
+/// a missing provider server; readiness probes always pass false.
+pub fn connectProvider(
+    allocator: std.mem.Allocator,
+    provider: harness.Provider,
+    project_path: []const u8,
+    launch_if_missing: bool,
+) !harness.ProviderClient {
+    const provider_config: harness.ProviderConfig = switch (provider) {
+        .opencode => .{ .opencode = .{
+            .allocator = allocator,
+            .working_directory = project_path,
+            .launch_if_missing = launch_if_missing,
+        } },
+        .codex => .{ .codex = .{
+            .cwd = project_path,
+            .launch_on_connect = launch_if_missing,
+        } },
+        .claude => .{ .claude = .{ .cwd = project_path } },
+        .cursor => .{ .cursor = .{ .cwd = project_path } },
+        .pi => .{ .pi = .{ .cwd = project_path } },
+        .fx => .{ .fx = .{ .cwd = project_path } },
+        .grok => .{ .grok = .{ .cwd = project_path } },
+        .muse => .{ .muse = .{ .cwd = project_path } },
+    };
+    return harness.connect(allocator, provider_config);
+}
+
 fn approvalPolicyForMode(mode: AccessMode) ?harness.ApprovalPolicy {
     return switch (mode) {
         .full_access => .never,

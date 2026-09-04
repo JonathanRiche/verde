@@ -1,16 +1,17 @@
 //! Provider readiness and asynchronous model-discovery controller state.
 
 const std = @import("std");
-const ai_harness = @import("../providers/harness.zig");
+const headless = @import("headless");
 const app_config = @import("../app/config.zig");
-const provider_mcp = @import("../providers/mcp.zig");
-const provider_readiness = @import("../providers/readiness.zig");
+const daemon_client = @import("../daemon/client.zig");
+const loop_wakeup = @import("loop_wakeup");
 const utils = @import("../utils.zig");
 const chat_types = @import("chat_types.zig");
 const provider_models = @import("provider_models.zig");
 const state_sync = @import("sync.zig");
 
 const log = std.log.scoped(.native_shell);
+const provider_types = headless.provider_types;
 const Provider = provider_models.Provider;
 const ModelOption = provider_models.ModelOption;
 const ChatThread = chat_types.ChatThread;
@@ -47,7 +48,7 @@ pub const OpencodeModelCacheStatus = enum {
 pub const OpencodeModelCacheState = struct {
     mutex: Mutex = .{},
     status: OpencodeModelCacheStatus = .idle,
-    models: ?[]ai_harness.ModelInfo = null,
+    models: ?[]const provider_types.ModelInfo = null,
     worker: ?std.Thread = null,
 };
 
@@ -56,7 +57,7 @@ pub const CursorModelCacheStatus = OpencodeModelCacheStatus;
 pub const CursorModelCacheState = struct {
     mutex: Mutex = .{},
     status: CursorModelCacheStatus = .idle,
-    models: ?[]ai_harness.ModelInfo = null,
+    models: ?[]const provider_types.ModelInfo = null,
     worker: ?std.Thread = null,
 };
 
@@ -67,7 +68,7 @@ pub const PiModelCacheStatus = OpencodeModelCacheStatus;
 pub const PiModelCacheState = struct {
     mutex: Mutex = .{},
     status: PiModelCacheStatus = .idle,
-    models: ?[]ai_harness.ModelInfo = null,
+    models: ?[]const provider_types.ModelInfo = null,
     worker: ?std.Thread = null,
 };
 
@@ -76,7 +77,7 @@ pub const FxModelCacheStatus = OpencodeModelCacheStatus;
 pub const FxModelCacheState = struct {
     mutex: Mutex = .{},
     status: FxModelCacheStatus = .idle,
-    models: ?[]ai_harness.ModelInfo = null,
+    models: ?[]const provider_types.ModelInfo = null,
     worker: ?std.Thread = null,
 };
 
@@ -85,19 +86,24 @@ pub const GrokModelCacheStatus = OpencodeModelCacheStatus;
 pub const GrokModelCacheState = struct {
     mutex: Mutex = .{},
     status: GrokModelCacheStatus = .idle,
-    models: ?[]ai_harness.ModelInfo = null,
+    models: ?[]const provider_types.ModelInfo = null,
     worker: ?std.Thread = null,
 };
 
 pub const ClaudeModelCacheState = struct {
     mutex: Mutex = .{},
     status: ClaudeModelCacheStatus = .idle,
-    models: ?[]ai_harness.ModelInfo = null,
+    models: ?[]const provider_types.ModelInfo = null,
     worker: ?std.Thread = null,
 };
 
-pub const ProviderReadiness = provider_readiness.ProviderReadiness;
-pub const detectProviderReadiness = provider_readiness.detectProviderReadiness;
+pub const ProviderReadiness = enum {
+    checking,
+    missing,
+    signed_out,
+    ready,
+    unavailable,
+};
 
 pub const ProviderReadinessSnapshot = struct {
     codex: ProviderReadiness = .checking,
@@ -140,6 +146,58 @@ pub const ProviderReadinessState = struct {
     worker: ?std.Thread = null,
 };
 
+pub const ProviderThreadOperationKind = enum {
+    list,
+    import_thread,
+    sync_thread,
+};
+
+pub const ProviderThreadOperationRequest = struct {
+    kind: ProviderThreadOperationKind,
+    provider: Provider,
+    project_index: usize,
+    thread_index: ?usize,
+    pref_path: []u8,
+    project_path: []u8,
+    thread_id: ?[]u8,
+
+    pub fn deinit(self: *ProviderThreadOperationRequest) void {
+        const allocator = std.heap.page_allocator;
+        allocator.free(self.pref_path);
+        allocator.free(self.project_path);
+        if (self.thread_id) |thread_id| allocator.free(thread_id);
+        allocator.destroy(self);
+    }
+};
+
+pub const ProviderThreadOperationResult = union(enum) {
+    list: []const provider_types.ChatThreadSummary,
+    read: provider_types.ReadThreadResult,
+
+    pub fn deinit(self: ProviderThreadOperationResult) void {
+        const allocator = std.heap.page_allocator;
+        switch (self) {
+            .list => |threads| freeThreadSummaries(allocator, threads),
+            .read => |thread| thread.deinit(allocator),
+        }
+    }
+};
+
+pub const ProviderThreadOperationStatus = enum {
+    idle,
+    pending,
+    completed,
+};
+
+pub const ProviderThreadOperationState = struct {
+    mutex: Mutex = .{},
+    status: ProviderThreadOperationStatus = .idle,
+    worker: ?std.Thread = null,
+    request: ?*ProviderThreadOperationRequest = null,
+    result: ?ProviderThreadOperationResult = null,
+    failure: ?anyerror = null,
+};
+
 pub const State = struct {
     opencode_model_cache: OpencodeModelCacheState = .{},
     claude_model_cache: ClaudeModelCacheState = .{},
@@ -148,23 +206,153 @@ pub const State = struct {
     fx_model_cache: FxModelCacheState = .{},
     grok_model_cache: GrokModelCacheState = .{},
     readiness: ProviderReadinessState = .{},
+    thread_operation: ProviderThreadOperationState = .{},
 };
 
-/// One short-lived `pi --mode rpc` query (`get_available_models`) on a
-/// background thread; the result replaces the static picker list.
-pub fn piModelCacheWorker(state: *PiModelCacheState) void {
-    const models = blk: {
-        var client = ai_harness.connect(std.heap.page_allocator, .{ .pi = .{} }) catch |err| {
-            log.warn("failed to connect to pi for model discovery: {s}", .{@errorName(err)});
-            break :blk null;
-        };
-        defer client.deinit();
-        break :blk client.listModels(std.heap.page_allocator) catch |err| {
-            log.warn("failed to load pi models: {s}", .{@errorName(err)});
-            break :blk null;
-        };
-    };
+const ModelCacheWorkerRequest = struct {
+    pref_path: []u8,
+    project_path: []u8,
 
+    fn deinit(self: ModelCacheWorkerRequest) void {
+        std.heap.page_allocator.free(self.pref_path);
+        std.heap.page_allocator.free(self.project_path);
+    }
+};
+
+fn providerProtocolTag(provider: Provider) provider_types.Provider {
+    return switch (provider) {
+        .opencode => .opencode,
+        .codex => .codex,
+        .cursor => .cursor,
+        .claude => .claude,
+        .pi => .pi,
+        .fx => .fx,
+        .grok => .grok,
+        .muse => .muse,
+    };
+}
+
+fn providerDisplayName(provider: Provider) []const u8 {
+    return switch (provider) {
+        .opencode => "OpenCode",
+        .codex => "Codex",
+        .cursor => "Cursor",
+        .claude => "Claude",
+        .pi => "pi",
+        .fx => "fx",
+        .grok => "grok",
+        .muse => "Muse",
+    };
+}
+
+fn setProviderMcp(allocator: std.mem.Allocator, pref_path: []const u8, installed: bool) !headless.providers_protocol.McpSummary {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var transport: daemon_client.HeadlessTransport = .{ .allocator = arena.allocator(), .pref_path = pref_path };
+    var client = daemon_client.headlessClient(arena.allocator(), &transport);
+    var parsed = try client.callProviderMcpSet(headless.Capabilities.phase1(), .{ .installed = installed });
+    defer parsed.deinit();
+    return (try client.decodeProviderMcpSet(&parsed)).summary;
+}
+
+fn freeThreadSummaries(allocator: std.mem.Allocator, threads: []const provider_types.ChatThreadSummary) void {
+    for (threads) |thread| {
+        allocator.free(thread.id);
+        allocator.free(thread.title);
+    }
+    allocator.free(threads);
+}
+
+fn runProviderThreadOperation(
+    allocator: std.mem.Allocator,
+    request: *const ProviderThreadOperationRequest,
+) !ProviderThreadOperationResult {
+    var transport: daemon_client.HeadlessTransport = .{
+        .allocator = allocator,
+        .pref_path = request.pref_path,
+    };
+    var client = daemon_client.headlessClient(allocator, &transport);
+    const protocol_provider = providerProtocolTag(request.provider);
+    return switch (request.kind) {
+        .list => blk: {
+            var parsed = try client.callProviderThreadsList(headless.Capabilities.phase1(), .{
+                .provider = protocol_provider,
+                .project_path = request.project_path,
+            });
+            defer parsed.deinit();
+            const response = try client.decodeProviderThreadsList(&parsed);
+            if (response.provider != protocol_provider) {
+                freeThreadSummaries(allocator, response.threads);
+                return error.InvalidDaemonResponse;
+            }
+            break :blk .{ .list = response.threads };
+        },
+        .import_thread, .sync_thread => blk: {
+            var parsed = try client.callProviderThreadRead(headless.Capabilities.phase1(), .{
+                .provider = protocol_provider,
+                .project_path = request.project_path,
+                .thread_id = request.thread_id orelse return error.InvalidProviderThreadId,
+            });
+            defer parsed.deinit();
+            const response = try client.decodeProviderThreadRead(&parsed);
+            if (response.provider != protocol_provider) {
+                response.thread.deinit(allocator);
+                return error.InvalidDaemonResponse;
+            }
+            break :blk .{ .read = response.thread };
+        },
+    };
+}
+
+pub fn providerThreadOperationWorker(
+    state: *ProviderThreadOperationState,
+    request: *const ProviderThreadOperationRequest,
+) void {
+    const result = runProviderThreadOperation(std.heap.page_allocator, request);
+    state.mutex.lock();
+    defer state.mutex.unlock();
+    if (result) |value| {
+        state.result = value;
+        state.failure = null;
+    } else |err| {
+        state.result = null;
+        state.failure = err;
+    }
+    state.status = .completed;
+    loop_wakeup.notify();
+}
+
+fn fetchProviderModels(provider: Provider, request: ModelCacheWorkerRequest) ?[]const provider_types.ModelInfo {
+    defer request.deinit();
+    const allocator = std.heap.page_allocator;
+    var transport: daemon_client.HeadlessTransport = .{
+        .allocator = allocator,
+        .pref_path = request.pref_path,
+    };
+    var client = daemon_client.headlessClient(allocator, &transport);
+    const protocol_provider = providerProtocolTag(provider);
+    var parsed = client.callProviderModelsList(headless.Capabilities.phase1(), .{
+        .provider = protocol_provider,
+        .project_path = request.project_path,
+    }) catch |err| {
+        log.warn("failed to request {s} models from daemon: {s}", .{ providerDisplayName(provider), @errorName(err) });
+        return null;
+    };
+    defer parsed.deinit();
+    const result = client.decodeProviderModelsList(&parsed) catch |err| {
+        log.warn("failed to decode {s} models from daemon: {s}", .{ providerDisplayName(provider), @errorName(err) });
+        return null;
+    };
+    if (result.provider != protocol_provider) {
+        provider_types.freeModelInfos(allocator, result.models);
+        log.warn("daemon returned the wrong provider model catalog for {s}", .{providerDisplayName(provider)});
+        return null;
+    }
+    return result.models;
+}
+
+fn runModelCacheWorker(state: anytype, provider: Provider, request: ModelCacheWorkerRequest) void {
+    const models = fetchProviderModels(provider, request);
     state.mutex.lock();
     defer state.mutex.unlock();
     if (models) |loaded| {
@@ -175,68 +363,76 @@ pub fn piModelCacheWorker(state: *PiModelCacheState) void {
     }
 }
 
-/// One short-lived `fx acp` handshake on a background thread: it reads the
-/// model catalog from the newest existing session's configOptions so startup
-/// never blocks the UI and never spawns extra sessions when one already exists.
-pub fn fxModelCacheWorker(state: *FxModelCacheState) void {
-    const models = blk: {
-        var client = ai_harness.connect(std.heap.page_allocator, .{ .fx = .{} }) catch |err| {
-            log.warn("failed to connect to fx for model discovery: {s}", .{@errorName(err)});
-            break :blk null;
-        };
-        defer client.deinit();
-        break :blk client.listModels(std.heap.page_allocator) catch |err| {
-            log.warn("failed to load fx models: {s}", .{@errorName(err)});
-            break :blk null;
-        };
-    };
-
-    state.mutex.lock();
-    defer state.mutex.unlock();
-    if (models) |loaded| {
-        state.models = loaded;
-        state.status = .completed;
-    } else {
-        state.status = .failed;
-    }
+/// Requests pi's dynamic model catalog through the session daemon.
+pub fn piModelCacheWorker(state: *PiModelCacheState, request: ModelCacheWorkerRequest) void {
+    runModelCacheWorker(state, .pi, request);
 }
 
-/// One short-lived `grok agent stdio` initialize handshake on a background
-/// thread: grok reports its model catalog in the initialize response, so
-/// discovery needs neither auth nor a session and never blocks the UI.
-pub fn grokModelCacheWorker(state: *GrokModelCacheState) void {
-    const models = blk: {
-        var client = ai_harness.connect(std.heap.page_allocator, .{ .grok = .{} }) catch |err| {
-            log.warn("failed to connect to grok for model discovery: {s}", .{@errorName(err)});
-            break :blk null;
-        };
-        defer client.deinit();
-        break :blk client.listModels(std.heap.page_allocator) catch |err| {
-            log.warn("failed to load grok models: {s}", .{@errorName(err)});
-            break :blk null;
-        };
-    };
-
-    state.mutex.lock();
-    defer state.mutex.unlock();
-    if (models) |loaded| {
-        state.models = loaded;
-        state.status = .completed;
-    } else {
-        state.status = .failed;
-    }
+/// Requests fx's dynamic model catalog through the session daemon.
+pub fn fxModelCacheWorker(state: *FxModelCacheState, request: ModelCacheWorkerRequest) void {
+    runModelCacheWorker(state, .fx, request);
 }
 
-pub fn providerReadinessWorker(state: *ProviderReadinessState) void {
+/// Requests grok's dynamic model catalog through the session daemon.
+pub fn grokModelCacheWorker(state: *GrokModelCacheState, request: ModelCacheWorkerRequest) void {
+    runModelCacheWorker(state, .grok, request);
+}
+
+const ProviderReadinessWorkerRequest = struct {
+    pref_path: []u8,
+    project_path: []u8,
+
+    fn deinit(self: ProviderReadinessWorkerRequest) void {
+        const allocator = std.heap.page_allocator;
+        allocator.free(self.pref_path);
+        allocator.free(self.project_path);
+    }
+};
+
+fn fetchProviderReadiness(
+    client: anytype,
+    provider: Provider,
+    project_path: []const u8,
+) ProviderReadiness {
+    var parsed = client.callProviderAuthStatus(headless.Capabilities.phase1(), .{
+        .provider = providerProtocolTag(provider),
+        .project_path = project_path,
+    }) catch |err| {
+        log.warn("failed to request {s} readiness from daemon: {s}", .{ providerDisplayName(provider), @errorName(err) });
+        return .unavailable;
+    };
+    defer parsed.deinit();
+    const result = client.decodeProviderAuthStatus(&parsed) catch |err| {
+        log.warn("failed to decode {s} readiness from daemon: {s}", .{ providerDisplayName(provider), @errorName(err) });
+        return .unavailable;
+    };
+    if (result.provider != providerProtocolTag(provider)) return .unavailable;
+    if (!result.installed) return .missing;
+    if (result.ready) return .ready;
+    return switch (result.auth_state) {
+        .signed_out => .signed_out,
+        .signed_in => .ready,
+        .unknown, .pending => .unavailable,
+    };
+}
+
+pub fn providerReadinessWorker(state: *ProviderReadinessState, request: ProviderReadinessWorkerRequest) void {
+    defer request.deinit();
+    const allocator = std.heap.page_allocator;
+    var transport: daemon_client.HeadlessTransport = .{
+        .allocator = allocator,
+        .pref_path = request.pref_path,
+    };
+    var client = daemon_client.headlessClient(allocator, &transport);
     const snapshot: ProviderReadinessSnapshot = .{
-        .codex = detectProviderReadiness(.codex),
-        .opencode = detectProviderReadiness(.opencode),
-        .claude = detectProviderReadiness(.claude),
-        .cursor = detectProviderReadiness(.cursor),
-        .pi = detectProviderReadiness(.pi),
-        .fx = detectProviderReadiness(.fx),
-        .grok = detectProviderReadiness(.grok),
-        .muse = detectProviderReadiness(.muse),
+        .codex = fetchProviderReadiness(&client, .codex, request.project_path),
+        .opencode = fetchProviderReadiness(&client, .opencode, request.project_path),
+        .claude = fetchProviderReadiness(&client, .claude, request.project_path),
+        .cursor = fetchProviderReadiness(&client, .cursor, request.project_path),
+        .pi = fetchProviderReadiness(&client, .pi, request.project_path),
+        .fx = fetchProviderReadiness(&client, .fx, request.project_path),
+        .grok = fetchProviderReadiness(&client, .grok, request.project_path),
+        .muse = fetchProviderReadiness(&client, .muse, request.project_path),
     };
 
     state.mutex.lock();
@@ -245,95 +441,16 @@ pub fn providerReadinessWorker(state: *ProviderReadinessState) void {
     state.status = .completed;
 }
 
-pub fn opencodeModelCacheWorker(state: *OpencodeModelCacheState) void {
-    const provider_config = ai_harness.ProviderConfig{
-        .opencode = .{
-            .allocator = std.heap.page_allocator,
-            .working_directory = null,
-            .launch_if_missing = true,
-        },
-    };
-
-    const models = blk: {
-        var client = ai_harness.connect(std.heap.page_allocator, provider_config) catch |err| {
-            log.warn("failed to connect to OpenCode for model discovery: {s}", .{@errorName(err)});
-            break :blk null;
-        };
-        defer client.deinit();
-
-        break :blk client.listModels(std.heap.page_allocator) catch |err| {
-            log.warn("failed to load OpenCode configured models: {s}", .{@errorName(err)});
-            break :blk null;
-        };
-    };
-
-    state.mutex.lock();
-    defer state.mutex.unlock();
-
-    if (models) |loaded| {
-        state.models = loaded;
-        state.status = .completed;
-    } else {
-        state.status = .failed;
-    }
+pub fn opencodeModelCacheWorker(state: *OpencodeModelCacheState, request: ModelCacheWorkerRequest) void {
+    runModelCacheWorker(state, .opencode, request);
 }
 
-pub fn cursorModelCacheWorker(state: *CursorModelCacheState) void {
-    const provider_config = ai_harness.ProviderConfig{
-        .cursor = .{},
-    };
-
-    const models = blk: {
-        var client = ai_harness.connect(std.heap.page_allocator, provider_config) catch |err| {
-            log.warn("failed to connect to Cursor for model discovery: {s}", .{@errorName(err)});
-            break :blk null;
-        };
-        defer client.deinit();
-
-        break :blk client.listModels(std.heap.page_allocator) catch |err| {
-            log.warn("failed to load Cursor models: {s}", .{@errorName(err)});
-            break :blk null;
-        };
-    };
-
-    state.mutex.lock();
-    defer state.mutex.unlock();
-
-    if (models) |loaded| {
-        state.models = loaded;
-        state.status = .completed;
-    } else {
-        state.status = .failed;
-    }
+pub fn cursorModelCacheWorker(state: *CursorModelCacheState, request: ModelCacheWorkerRequest) void {
+    runModelCacheWorker(state, .cursor, request);
 }
 
-pub fn claudeModelCacheWorker(state: *ClaudeModelCacheState) void {
-    const provider_config = ai_harness.ProviderConfig{
-        .claude = .{},
-    };
-
-    const models = blk: {
-        var client = ai_harness.connect(std.heap.page_allocator, provider_config) catch |err| {
-            log.warn("failed to connect to Claude for model discovery: {s}", .{@errorName(err)});
-            break :blk null;
-        };
-        defer client.deinit();
-
-        break :blk client.listModels(std.heap.page_allocator) catch |err| {
-            log.warn("failed to load Claude models: {s}", .{@errorName(err)});
-            break :blk null;
-        };
-    };
-
-    state.mutex.lock();
-    defer state.mutex.unlock();
-
-    if (models) |loaded| {
-        state.models = loaded;
-        state.status = .completed;
-    } else {
-        state.status = .failed;
-    }
+pub fn claudeModelCacheWorker(state: *ClaudeModelCacheState, request: ModelCacheWorkerRequest) void {
+    runModelCacheWorker(state, .claude, request);
 }
 
 pub fn opencodeModelOptionsSnapshot(self: anytype) []const ModelOption {
@@ -427,11 +544,29 @@ pub fn startProviderReadinessCheck(self: anytype) void {
     defer self.provider_controller.readiness.mutex.unlock();
     if (self.provider_controller.readiness.status == .pending) return;
 
+    const allocator = std.heap.page_allocator;
+    const pref_path = allocator.dupe(u8, self.storage.pref_path) catch return;
+    const project_path = if (self.project_controller.projects.items.len > 0 and
+        self.project_controller.selected_index < self.project_controller.projects.items.len)
+        self.project_controller.projects.items[self.project_controller.selected_index].path
+    else
+        "";
+    const owned_project_path = allocator.dupe(u8, project_path) catch {
+        allocator.free(pref_path);
+        return;
+    };
+    const request: ProviderReadinessWorkerRequest = .{
+        .pref_path = pref_path,
+        .project_path = owned_project_path,
+    };
+
     self.provider_controller.readiness.status = .pending;
     self.provider_controller.readiness.snapshot = .{};
     self.provider_controller.readiness.worker = std.Thread.spawn(.{}, providerReadinessWorker, .{
         &self.provider_controller.readiness,
+        request,
     }) catch {
+        request.deinit();
         self.provider_controller.readiness.status = .completed;
         self.provider_controller.readiness.snapshot = .{
             .codex = .unavailable,
@@ -449,7 +584,7 @@ pub fn startProviderReadinessCheck(self: anytype) void {
 /// changes and remains reversible from Settings.
 pub fn completeMcpOnboarding(self: anytype, enable: bool) void {
     if (enable) {
-        const summary = provider_mcp.install(self.allocator) catch |err| {
+        const summary = setProviderMcp(self.allocator, self.storage.pref_path, true) catch |err| {
             log.warn("failed to install provider MCP registrations: {s}", .{@errorName(err)});
             self.setSidebarNotice("Could not enable Verde MCP tools.");
             self.markDirty();
@@ -484,6 +619,8 @@ pub fn completeMcpOnboarding(self: anytype, enable: bool) void {
 }
 
 pub fn pollProviderReadiness(self: anytype) void {
+    self.pollProviderThreadOperation();
+    self.pollProviderSlashCatalog();
     var completed = false;
     var snapshot: ProviderReadinessSnapshot = .{};
 
@@ -535,6 +672,35 @@ pub fn openProviderSetupGuide(self: anytype) void {
     self.setSidebarNotice("Opened provider setup guide.");
 }
 
+fn createModelCacheWorkerRequest(self: anytype) ?ModelCacheWorkerRequest {
+    if (self.project_controller.projects.items.len == 0 or
+        self.project_controller.selected_index >= self.project_controller.projects.items.len)
+    {
+        return null;
+    }
+    const allocator = std.heap.page_allocator;
+    const pref_path = allocator.dupe(u8, self.storage.pref_path) catch return null;
+    const project_path = allocator.dupe(
+        u8,
+        self.project_controller.projects.items[self.project_controller.selected_index].path,
+    ) catch {
+        allocator.free(pref_path);
+        return null;
+    };
+    return .{
+        .pref_path = pref_path,
+        .project_path = project_path,
+    };
+}
+
+fn spawnModelCacheWorker(self: anytype, comptime worker: anytype, state: anytype) ?std.Thread {
+    const request = createModelCacheWorkerRequest(self) orelse return null;
+    return std.Thread.spawn(.{}, worker, .{ state, request }) catch {
+        request.deinit();
+        return null;
+    };
+}
+
 pub fn refreshOpencodeModelOptionsCacheAsync(self: anytype) void {
     self.pollOpencodeModelOptionsCache();
 
@@ -543,9 +709,11 @@ pub fn refreshOpencodeModelOptionsCacheAsync(self: anytype) void {
     if (self.provider_controller.opencode_model_cache.status == .pending) return;
 
     self.provider_controller.opencode_model_cache.status = .pending;
-    self.provider_controller.opencode_model_cache.worker = std.Thread.spawn(.{}, opencodeModelCacheWorker, .{
+    self.provider_controller.opencode_model_cache.worker = spawnModelCacheWorker(
+        self,
+        opencodeModelCacheWorker,
         &self.provider_controller.opencode_model_cache,
-    }) catch {
+    ) orelse {
         self.provider_controller.opencode_model_cache.status = .idle;
         return;
     };
@@ -559,9 +727,11 @@ pub fn refreshCursorModelOptionsCacheAsync(self: anytype) void {
     if (self.provider_controller.cursor_model_cache.status == .pending) return;
 
     self.provider_controller.cursor_model_cache.status = .pending;
-    self.provider_controller.cursor_model_cache.worker = std.Thread.spawn(.{}, cursorModelCacheWorker, .{
+    self.provider_controller.cursor_model_cache.worker = spawnModelCacheWorker(
+        self,
+        cursorModelCacheWorker,
         &self.provider_controller.cursor_model_cache,
-    }) catch {
+    ) orelse {
         self.provider_controller.cursor_model_cache.status = .idle;
         return;
     };
@@ -575,9 +745,11 @@ pub fn refreshClaudeModelOptionsCacheAsync(self: anytype) void {
     if (self.provider_controller.claude_model_cache.status == .pending) return;
 
     self.provider_controller.claude_model_cache.status = .pending;
-    self.provider_controller.claude_model_cache.worker = std.Thread.spawn(.{}, claudeModelCacheWorker, .{
+    self.provider_controller.claude_model_cache.worker = spawnModelCacheWorker(
+        self,
+        claudeModelCacheWorker,
         &self.provider_controller.claude_model_cache,
-    }) catch {
+    ) orelse {
         self.provider_controller.claude_model_cache.status = .idle;
         log.warn("failed to spawn Claude model cache worker", .{});
         return;
@@ -592,9 +764,11 @@ pub fn refreshPiModelOptionsCacheAsync(self: anytype) void {
     if (self.provider_controller.pi_model_cache.status == .pending) return;
 
     self.provider_controller.pi_model_cache.status = .pending;
-    self.provider_controller.pi_model_cache.worker = std.Thread.spawn(.{}, piModelCacheWorker, .{
+    self.provider_controller.pi_model_cache.worker = spawnModelCacheWorker(
+        self,
+        piModelCacheWorker,
         &self.provider_controller.pi_model_cache,
-    }) catch {
+    ) orelse {
         self.provider_controller.pi_model_cache.status = .idle;
         log.warn("failed to spawn pi model cache worker", .{});
         return;
@@ -609,9 +783,11 @@ pub fn refreshFxModelOptionsCacheAsync(self: anytype) void {
     if (self.provider_controller.fx_model_cache.status == .pending) return;
 
     self.provider_controller.fx_model_cache.status = .pending;
-    self.provider_controller.fx_model_cache.worker = std.Thread.spawn(.{}, fxModelCacheWorker, .{
+    self.provider_controller.fx_model_cache.worker = spawnModelCacheWorker(
+        self,
+        fxModelCacheWorker,
         &self.provider_controller.fx_model_cache,
-    }) catch {
+    ) orelse {
         self.provider_controller.fx_model_cache.status = .idle;
         log.warn("failed to spawn fx model cache worker", .{});
         return;
@@ -626,9 +802,11 @@ pub fn refreshGrokModelOptionsCacheAsync(self: anytype) void {
     if (self.provider_controller.grok_model_cache.status == .pending) return;
 
     self.provider_controller.grok_model_cache.status = .pending;
-    self.provider_controller.grok_model_cache.worker = std.Thread.spawn(.{}, grokModelCacheWorker, .{
+    self.provider_controller.grok_model_cache.worker = spawnModelCacheWorker(
+        self,
+        grokModelCacheWorker,
         &self.provider_controller.grok_model_cache,
-    }) catch {
+    ) orelse {
         self.provider_controller.grok_model_cache.status = .idle;
         log.warn("failed to spawn grok model cache worker", .{});
         return;
@@ -649,7 +827,7 @@ pub fn duplicateReasoningVariantKeys(allocator: std.mem.Allocator, src: ?[]const
     return out;
 }
 
-pub fn populateOpencodeModelOptions(self: anytype, models: []const ai_harness.ModelInfo) !void {
+pub fn populateOpencodeModelOptions(self: anytype, models: []const provider_types.ModelInfo) !void {
     var order = try self.allocator.alloc(usize, models.len);
     defer self.allocator.free(order);
     for (0..models.len) |i| order[i] = i;
@@ -724,14 +902,14 @@ pub fn opencodeModelIdSuffixFromRef(model_ref: []const u8) ?[]const u8 {
     return model_ref[slash + 1 ..];
 }
 
-pub fn opencodeSortedModelsContainModelIdFromOrder(order: []const usize, model_list: []const ai_harness.ModelInfo, model_id: []const u8) bool {
+pub fn opencodeSortedModelsContainModelIdFromOrder(order: []const usize, model_list: []const provider_types.ModelInfo, model_id: []const u8) bool {
     for (order) |mi| {
         if (std.mem.eql(u8, model_list[mi].model_id, model_id)) return true;
     }
     return false;
 }
 
-pub fn opencodeModelSortLessThan(a: ai_harness.ModelInfo, b: ai_harness.ModelInfo) bool {
+pub fn opencodeModelSortLessThan(a: provider_types.ModelInfo, b: provider_types.ModelInfo) bool {
     const provider_name_a = if (a.provider_name.len > 0) a.provider_name else a.provider_id;
     const provider_name_b = if (b.provider_name.len > 0) b.provider_name else b.provider_id;
     const provider_cmp = asciiCaseInsensitiveCompare(provider_name_a, provider_name_b);
@@ -748,7 +926,7 @@ pub fn opencodeModelSortLessThan(a: ai_harness.ModelInfo, b: ai_harness.ModelInf
     return asciiCaseInsensitiveCompare(a.model_id, b.model_id) == .lt;
 }
 
-pub fn populateCursorModelOptions(self: anytype, models: []const ai_harness.ModelInfo) !void {
+pub fn populateCursorModelOptions(self: anytype, models: []const provider_types.ModelInfo) !void {
     for (models) |model| {
         if (model.model_id.len == 0) continue;
         const label_text = if (model.model_name.len > 0) model.model_name else model.model_id;
@@ -776,7 +954,7 @@ pub fn populateCursorModelOptions(self: anytype, models: []const ai_harness.Mode
     }
 }
 
-pub fn populateClaudeModelOptions(self: anytype, models: []const ai_harness.ModelInfo) !void {
+pub fn populateClaudeModelOptions(self: anytype, models: []const provider_types.ModelInfo) !void {
     for (models) |model| {
         if (model.model_id.len == 0) continue;
         const label_text = if (model.model_name.len > 0) model.model_name else model.model_id;
@@ -801,7 +979,7 @@ pub fn populateClaudeModelOptions(self: anytype, models: []const ai_harness.Mode
 
 /// Rebuilds the pi picker from `get_available_models`. The "Default (pi
 /// config)" row stays first so users can keep deferring to pi's own config.
-pub fn populatePiModelOptions(self: anytype, models: []const ai_harness.ModelInfo) !void {
+pub fn populatePiModelOptions(self: anytype, models: []const provider_types.ModelInfo) !void {
     try appendDefaultModelOption(self, &self.pi_model_options, PI_MODEL_OPTIONS[0]);
     for (models) |model| {
         if (model.model_id.len == 0) continue;
@@ -820,7 +998,7 @@ pub fn populatePiModelOptions(self: anytype, models: []const ai_harness.ModelInf
 
 /// Rebuilds the fx picker from the ACP `model` configOption. The "Default (fx
 /// config)" row stays first so users can keep deferring to fx's own config.
-pub fn populateFxModelOptions(self: anytype, models: []const ai_harness.ModelInfo) !void {
+pub fn populateFxModelOptions(self: anytype, models: []const provider_types.ModelInfo) !void {
     try appendDefaultModelOption(self, &self.fx_model_options, FX_MODEL_OPTIONS[0]);
     for (models) |model| {
         if (model.model_id.len == 0) continue;
@@ -840,7 +1018,7 @@ pub fn populateFxModelOptions(self: anytype, models: []const ai_harness.ModelInf
 /// Rebuilds the grok picker from the initialize `modelState` catalog. The
 /// "Default (grok config)" row stays first so users can keep deferring to
 /// grok's own persisted selection; every grok model supports reasoning effort.
-pub fn populateGrokModelOptions(self: anytype, models: []const ai_harness.ModelInfo) !void {
+pub fn populateGrokModelOptions(self: anytype, models: []const provider_types.ModelInfo) !void {
     try appendDefaultModelOption(self, &self.grok_model_options, GROK_MODEL_OPTIONS[0]);
     for (models) |model| {
         if (model.model_id.len == 0) continue;
@@ -1313,7 +1491,7 @@ pub fn saveCursorModelOptionsDiskCache(self: anytype) !void {
 
 const ModelCachePoll = struct {
     status: OpencodeModelCacheStatus = .idle,
-    models: ?[]ai_harness.ModelInfo = null,
+    models: ?[]const provider_types.ModelInfo = null,
 };
 
 fn takeModelCachePoll(cache: anytype) ModelCachePoll {
@@ -1343,7 +1521,7 @@ pub fn pollOpencodeModelOptionsCache(self: anytype) void {
     switch (poll.status) {
         .completed => {
             const models = poll.models orelse return;
-            defer ai_harness.freeModelInfos(std.heap.page_allocator, models);
+            defer provider_types.freeModelInfos(std.heap.page_allocator, models);
             self.clearOpencodeModelOptions();
             if (models.len == 0) return;
             self.populateOpencodeModelOptions(models) catch |err| {
@@ -1369,7 +1547,7 @@ pub fn pollCursorModelOptionsCache(self: anytype) void {
     switch (poll.status) {
         .completed => {
             const models = poll.models orelse return;
-            defer ai_harness.freeModelInfos(std.heap.page_allocator, models);
+            defer provider_types.freeModelInfos(std.heap.page_allocator, models);
             self.clearCursorModelOptions();
             if (models.len == 0) return;
             self.populateCursorModelOptions(models) catch |err| {
@@ -1397,7 +1575,7 @@ pub fn pollPiModelOptionsCache(self: anytype) void {
     switch (poll.status) {
         .completed => {
             const models = poll.models orelse return;
-            defer ai_harness.freeModelInfos(std.heap.page_allocator, models);
+            defer provider_types.freeModelInfos(std.heap.page_allocator, models);
             self.clearPiModelOptions();
             if (models.len == 0) return;
             self.populatePiModelOptions(models) catch |err| {
@@ -1422,7 +1600,7 @@ pub fn pollFxModelOptionsCache(self: anytype) void {
     switch (poll.status) {
         .completed => {
             const models = poll.models orelse return;
-            defer ai_harness.freeModelInfos(std.heap.page_allocator, models);
+            defer provider_types.freeModelInfos(std.heap.page_allocator, models);
             self.clearFxModelOptions();
             if (models.len == 0) return;
             self.populateFxModelOptions(models) catch |err| {
@@ -1447,7 +1625,7 @@ pub fn pollGrokModelOptionsCache(self: anytype) void {
     switch (poll.status) {
         .completed => {
             const models = poll.models orelse return;
-            defer ai_harness.freeModelInfos(std.heap.page_allocator, models);
+            defer provider_types.freeModelInfos(std.heap.page_allocator, models);
             self.clearGrokModelOptions();
             if (models.len == 0) return;
             self.populateGrokModelOptions(models) catch |err| {
@@ -1472,7 +1650,7 @@ pub fn pollClaudeModelOptionsCache(self: anytype) void {
     switch (poll.status) {
         .completed => {
             const models = poll.models orelse return;
-            defer ai_harness.freeModelInfos(std.heap.page_allocator, models);
+            defer provider_types.freeModelInfos(std.heap.page_allocator, models);
             self.clearClaudeModelOptions();
             if (models.len == 0) return;
             self.populateClaudeModelOptions(models) catch |err| {

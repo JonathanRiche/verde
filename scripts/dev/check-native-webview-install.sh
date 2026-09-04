@@ -28,6 +28,8 @@ fi
 
 required_payload=(
   "verde"
+  "verde-gui"
+  "verde-daemon"
 )
 
 if [[ "$(uname -s)" == "Linux" ]]; then
@@ -48,7 +50,7 @@ if [[ "$(uname -s)" == "Linux" ]]; then
   fi
 
   fff_needed="$(
-    readelf -d "$PREFIX_DIR/bin/verde" |
+    readelf -d "$PREFIX_DIR/bin/verde-gui" |
       sed -n 's/.*Shared library: \[\([^]]*libfff_c\.so\)\].*/\1/p'
   )"
   if [[ -z "$fff_needed" ]]; then

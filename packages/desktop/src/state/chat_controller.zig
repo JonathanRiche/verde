@@ -3,17 +3,16 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const headless = @import("headless");
-const ai_harness = @import("../providers/harness.zig");
+const provider_types = headless.provider_types;
 const app_config = @import("../app/config.zig");
 const bang_commands = @import("../workspace/bang_commands.zig");
 const chat_threads = @import("../chat/threads.zig");
-const db_client = @import("../db/client.zig");
 const db_types = @import("../db/types.zig");
 const notifier = @import("../app/notifier.zig");
 const runtime_log = @import("../runtime/log.zig");
 const RuntimeService = @import("../runtime/service.zig");
-const sessionizer = @import("../terminal/sessionizer.zig");
-const send_runner = @import("../chat/send_runner.zig");
+const daemon_client = @import("../daemon/client.zig");
+const session_protocol = @import("headless").session_protocol;
 const loop_wakeup = @import("loop_wakeup");
 const platform_process = @import("../platform/process.zig");
 const platform_runtime = @import("platform_runtime");
@@ -52,10 +51,7 @@ const freePendingDiffFiles = utils.freePendingDiffFiles;
 const freePendingDiffFilesLocked = utils.freePendingDiffFilesLocked;
 const freePendingTimelineEvents = utils.freePendingTimelineEvents;
 const freePendingTimelineEventsLocked = utils.freePendingTimelineEventsLocked;
-const approvalPolicyForMode = utils.approvalPolicyForMode;
 const cancelLingeringToolCallEvents = utils.cancelLingeringToolCallEvents;
-const sandboxModeForMode = utils.sandboxModeForMode;
-const serviceTierForMode = utils.serviceTierForMode;
 const flushPendingAssistantTextLocked = utils.flushPendingAssistantTextLocked;
 const transientThinkStatus = utils.transientThinkStatus;
 const upsertPendingToolCallEvent = utils.upsertPendingToolCallEvent;
@@ -137,7 +133,7 @@ pub const InitialSendSnapshot = struct {
     }
 };
 
-fn harnessProviderForDbProvider(provider: Provider) ai_harness.Provider {
+fn harnessProviderForDbProvider(provider: Provider) provider_types.Provider {
     return switch (provider) {
         .opencode => .opencode,
         .codex => .codex,
@@ -373,7 +369,7 @@ pub fn bangCommandWorker(request: *BangCommandRequest) void {
         .exited => |code| code,
         else => null,
     } else null;
-    const status: ai_harness.ToolCallStatus = if (cancelled)
+    const status: provider_types.ToolCallStatus = if (cancelled)
         .cancelled
     else if (exit_code != null and exit_code.? == 0)
         .completed
@@ -460,34 +456,47 @@ pub fn titleGenerationWorker(request: *TitleGenerationRequest) void {
     const page_alloc = std.heap.page_allocator;
     const state = request.state;
     defer {
+        page_alloc.free(request.pref_path);
         page_alloc.free(request.project_path);
-        page_alloc.free(request.prompt);
+        page_alloc.free(request.user_text);
+        page_alloc.free(request.assistant_text);
         page_alloc.free(request.model_ref);
         page_alloc.destroy(request);
         loop_wakeup.notify();
         state.worker_done.store(true, .release);
     }
 
-    const send_result = send_runner.run(page_alloc, .{
+    var transport: daemon_client.HeadlessTransport = .{ .allocator = page_alloc, .pref_path = request.pref_path };
+    var client = daemon_client.headlessClient(page_alloc, &transport);
+    var parsed = client.callProviderTitleGenerate(headless.Capabilities.phase1(), .{
         .provider = request.provider,
-        .harness_kind = .local_cli,
-        .project_path = request.project_path,
-        .prompt = request.prompt,
         .model_ref = request.model_ref,
-        .fast_mode = if (request.provider == .codex) .on else .off,
+        .fast = request.provider == .codex,
         .access_mode = .supervised,
-    }, .{}) catch |err| {
+        .cwd = request.project_path,
+        .user_text = request.user_text,
+        .assistant_text = request.assistant_text,
+    }) catch |err| {
         finishTitleGenerationFailure(request.state, @errorName(err));
         return;
     };
-    defer page_alloc.free(send_result.provider_thread_id);
-    defer page_alloc.free(send_result.reply_text);
-
-    const title = chat_threads.makeGeneratedThreadTitle(page_alloc, send_result.reply_text) catch |err| {
+    defer parsed.deinit();
+    const response = client.decodeProviderTitleGenerate(&parsed) catch |err| {
         finishTitleGenerationFailure(request.state, @errorName(err));
         return;
-    } orelse {
+    };
+    defer if (response.title) |title| page_alloc.free(title);
+    defer if (response.error_message) |message| page_alloc.free(message);
+    if (response.error_message) |message| {
+        finishTitleGenerationFailure(request.state, message);
+        return;
+    }
+    const title_text = response.title orelse {
         finishTitleGenerationFailure(request.state, "The model returned an empty title.");
+        return;
+    };
+    const title = page_alloc.dupeZ(u8, title_text) catch |err| {
+        finishTitleGenerationFailure(request.state, @errorName(err));
         return;
     };
 
@@ -580,7 +589,7 @@ const RemoteControlAction = union(enum) {
     cancel,
     approve: struct {
         call_id: []u8,
-        decision: ai_harness.ApprovalDecision,
+        decision: provider_types.ApprovalDecision,
     },
 };
 
@@ -606,7 +615,7 @@ pub const State = struct {
     active_title_refs: std.ArrayListUnmanaged(ActiveTitleRef) = .empty,
     codex_background_poll: CodexBackgroundPollState = .{},
     daemon_tail_response_buffer: ?[]u8 = null,
-    daemon_tail_connection: sessionizer.ReusableRequestConnection = .{},
+    daemon_tail_connection: daemon_client.ReusableRequestConnection = .{},
     /// In-flight chat.turn.start acceptance workers (7.5): the RPC runs off
     /// the event thread; outcomes commit on the main thread in pollSend.
     acceptance_dispatches: std.ArrayListUnmanaged(*AcceptanceDispatch) = .empty,
@@ -656,7 +665,7 @@ pub const State = struct {
 
     fn daemonTailResponseBuffer(self: *State, allocator: std.mem.Allocator) ![]u8 {
         if (self.daemon_tail_response_buffer) |buffer| return buffer;
-        const buffer = try allocator.alloc(u8, sessionizer.MAX_RESPONSE_BYTES);
+        const buffer = try allocator.alloc(u8, daemon_client.MAX_RESPONSE_BYTES);
         self.daemon_tail_response_buffer = buffer;
         return buffer;
     }
@@ -669,7 +678,7 @@ test "daemon chat tail response buffer is reused" {
     const first = try state.daemonTailResponseBuffer(std.testing.allocator);
     const second = try state.daemonTailResponseBuffer(std.testing.allocator);
 
-    try std.testing.expectEqual(sessionizer.MAX_RESPONSE_BYTES, first.len);
+    try std.testing.expectEqual(daemon_client.MAX_RESPONSE_BYTES, first.len);
     try std.testing.expectEqual(@intFromPtr(first.ptr), @intFromPtr(second.ptr));
 }
 
@@ -683,13 +692,16 @@ const CodexBackgroundPollRequest = struct {
     local_thread_id: []u8,
     provider_thread_id: []u8,
     process_id: []u8,
+    pref_path: []u8,
     cwd: []u8,
+    terminate: bool = false,
 
     fn deinit(self: *CodexBackgroundPollRequest) void {
         const allocator = std.heap.page_allocator;
         allocator.free(self.local_thread_id);
         allocator.free(self.provider_thread_id);
         allocator.free(self.process_id);
+        allocator.free(self.pref_path);
         allocator.free(self.cwd);
         allocator.destroy(self);
     }
@@ -705,15 +717,33 @@ const CodexBackgroundPollState = struct {
 
 fn codexBackgroundPollWorker(state: *CodexBackgroundPollState, request: *const CodexBackgroundPollRequest) void {
     const allocator = std.heap.page_allocator;
-    const config: ai_harness.ProviderConfig = .{ .codex = .{
-        .cwd = request.cwd,
-        .launch_on_connect = false,
-    } };
     var running: ?bool = null;
-    if (ai_harness.connect(allocator, config)) |client_value| {
-        var client = client_value;
-        defer client.deinit();
-        running = client.backgroundTerminalIsRunning(request.provider_thread_id, request.process_id) catch null;
+    var transport: daemon_client.HeadlessTransport = .{ .allocator = allocator, .pref_path = request.pref_path };
+    var client = daemon_client.headlessClient(allocator, &transport);
+    const response = if (request.terminate)
+        client.callProviderCodexBackgroundTerminate(headless.Capabilities.phase1(), .{
+            .project_path = request.cwd,
+            .thread_id = request.provider_thread_id,
+            .process_id = request.process_id,
+        })
+    else
+        client.callProviderCodexBackgroundStatus(headless.Capabilities.phase1(), .{
+            .project_path = request.cwd,
+            .thread_id = request.provider_thread_id,
+            .process_id = request.process_id,
+        });
+    if (response) |parsed_value| {
+        var parsed = parsed_value;
+        defer parsed.deinit();
+        running = if (request.terminate)
+            if (client.decodeProviderCodexBackgroundTerminate(&parsed)) |result|
+                if (result.terminated) false else null
+            else |_|
+                null
+        else if (client.decodeProviderCodexBackgroundStatus(&parsed)) |result|
+            result.running
+        else |_|
+            null;
     } else |_| {}
 
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -724,7 +754,7 @@ fn codexBackgroundPollWorker(state: *CodexBackgroundPollState, request: *const C
     loop_wakeup.notify();
 }
 
-pub fn resolveApprovalLocked(send_state: *SendState, decision: ai_harness.ApprovalDecision) bool {
+pub fn resolveApprovalLocked(send_state: *SendState, decision: provider_types.ApprovalDecision) bool {
     if (send_state.pending_approval == null) return false;
     send_state.approval_decision = decision;
     send_state.ui_revision +%= 1;
@@ -788,7 +818,7 @@ test "approval transitions replace clear and resolve pending state" {
     try std.testing.expect(try syncDaemonPendingApprovalLocked(&send_state, parsed.value));
     defer chat_types.freePendingApproval(std.heap.page_allocator, &send_state.pending_approval);
     try std.testing.expect(resolveApprovalLocked(&send_state, .approve));
-    try std.testing.expectEqual(ai_harness.ApprovalDecision.approve, send_state.approval_decision.?);
+    try std.testing.expectEqual(provider_types.ApprovalDecision.approve, send_state.approval_decision.?);
     try std.testing.expect(try syncDaemonPendingApprovalLocked(&send_state, .null));
     try std.testing.expect(send_state.pending_approval == null);
     try std.testing.expect(send_state.approval_decision == null);
@@ -816,7 +846,7 @@ test "control transfer failure stays distinct actionable and clears on success" 
     clearControlFailureLocked(&send_state);
     try std.testing.expect(send_state.control_error_message == null);
     try std.testing.expect(resolveApprovalLocked(&send_state, .approve));
-    try std.testing.expectEqual(ai_harness.ApprovalDecision.approve, send_state.approval_decision.?);
+    try std.testing.expectEqual(provider_types.ApprovalDecision.approve, send_state.approval_decision.?);
 }
 
 test "real addressed control seams roll back missing daemon prerequisites" {
@@ -854,7 +884,7 @@ test "real addressed control seams roll back missing daemon prerequisites" {
             }
             if (self.reject_cancel) return error.DaemonRequestFailed;
         }
-        pub fn approveDaemonChatTurn(self: *@This(), _: []const u8, _: []const u8, _: ai_harness.ApprovalDecision) !void {
+        pub fn approveDaemonChatTurn(self: *@This(), _: []const u8, _: []const u8, _: provider_types.ApprovalDecision) !void {
             if (self.reject_approval) return error.DaemonRequestFailed;
             if (self.approval_mutation != .none) {
                 const send_state = self.thread.?.send_state;
@@ -1017,7 +1047,7 @@ test "real addressed control seams roll back missing daemon prerequisites" {
     };
     fake.approval_mutation = .none;
     try std.testing.expect(resolveThreadPendingApproval(&fake, &thread, .approve));
-    try std.testing.expectEqual(ai_harness.ApprovalDecision.approve, thread.send_state.approval_decision.?);
+    try std.testing.expectEqual(provider_types.ApprovalDecision.approve, thread.send_state.approval_decision.?);
     try std.testing.expect(thread.send_state.control_error_message == null);
 
     thread.send_state.daemon_owned = false;
@@ -2605,71 +2635,6 @@ pub fn pendingFollowupHint(self: anytype) ?[:0]const u8 {
     };
 }
 
-pub fn sendPromptViaHarness(self: anytype, prompt: []const u8) !ai_harness.SendPromptResult {
-    const project = self.currentProject();
-    const thread = self.currentThread();
-
-    if (thread.harness != .local_cli) {
-        return error.UnsupportedHarnessMode;
-    }
-
-    const provider_cwd = effectiveThreadCwd(project.path, thread);
-    const provider_config = switch (thread.provider) {
-        .opencode => ai_harness.ProviderConfig{
-            .opencode = .{
-                .allocator = self.allocator,
-                .working_directory = provider_cwd,
-                .launch_if_missing = true,
-            },
-        },
-        .codex => ai_harness.ProviderConfig{
-            .codex = .{
-                .cwd = provider_cwd,
-                .launch_on_connect = false,
-            },
-        },
-        .claude => ai_harness.ProviderConfig{
-            .claude = .{
-                .cwd = provider_cwd,
-            },
-        },
-        .cursor => ai_harness.ProviderConfig{
-            .cursor = .{
-                .cwd = provider_cwd,
-                .model = if (thread.model_ref) |model_ref| model_ref else null,
-            },
-        },
-        .pi => ai_harness.ProviderConfig{
-            .pi = .{
-                .cwd = provider_cwd,
-            },
-        },
-        .fx => ai_harness.ProviderConfig{ .fx = .{ .cwd = provider_cwd, .model = thread.model_ref } },
-        .grok => ai_harness.ProviderConfig{ .grok = .{ .cwd = provider_cwd, .model = thread.model_ref } },
-        .muse => ai_harness.ProviderConfig{ .muse = .{ .cwd = provider_cwd, .model = thread.model_ref } },
-    };
-
-    var client = try ai_harness.connect(self.allocator, provider_config);
-    defer client.deinit();
-
-    const cursor_model_params_json = if (thread.provider == .cursor) try self.cursorModelParamsJsonAlloc(self.allocator, thread) else null;
-    defer if (cursor_model_params_json) |params| self.allocator.free(params);
-
-    return client.sendPrompt(self.allocator, .{
-        .thread_id = if (thread.provider_thread_id) |thread_id| thread_id else null,
-        .thread_title = thread.title,
-        .prompt = prompt,
-        .cwd = provider_cwd,
-        .model = if (thread.model_ref) |model_ref| model_ref else null,
-        .opencode_variant = if (thread.provider == .opencode) thread.opencode_reasoning_variant else null,
-        .cursor_model_params_json = cursor_model_params_json,
-        .reasoning_effort = if (thread.provider == .opencode and thread.opencode_reasoning_variant != null) null else thread.reasoning_effort,
-        .service_tier = serviceTierForMode(thread.provider, thread.fast_mode),
-        .approval_policy = approvalPolicyForMode(thread.provider, thread.access_mode),
-        .sandbox_mode = sandboxModeForMode(thread.provider, thread.access_mode),
-    });
-}
-
 pub fn interruptThreadViaHarness(
     self: anytype,
     execution_target: ProviderExecutionTarget,
@@ -2677,56 +2642,19 @@ pub fn interruptThreadViaHarness(
     thread_id: []const u8,
     turn_id: ?[]const u8,
 ) !void {
-    const provider_cwd = execution_target.cwd();
-    const provider_config = switch (provider) {
-        .opencode => ai_harness.ProviderConfig{
-            .opencode = .{
-                .allocator = self.allocator,
-                .working_directory = provider_cwd,
-                .launch_if_missing = true,
-            },
-        },
-        .codex => ai_harness.ProviderConfig{
-            .codex = .{
-                .cwd = provider_cwd,
-                .launch_on_connect = false,
-            },
-        },
-        .claude => ai_harness.ProviderConfig{
-            .claude = .{
-                .cwd = provider_cwd,
-            },
-        },
-        .cursor => ai_harness.ProviderConfig{
-            .cursor = .{
-                .cwd = provider_cwd,
-            },
-        },
-        .pi => ai_harness.ProviderConfig{
-            .pi = .{
-                .cwd = provider_cwd,
-            },
-        },
-        .fx => ai_harness.ProviderConfig{
-            .fx = .{
-                .cwd = provider_cwd,
-            },
-        },
-        .grok => ai_harness.ProviderConfig{
-            .grok = .{
-                .cwd = provider_cwd,
-            },
-        },
-        .muse => ai_harness.ProviderConfig{ .muse = .{ .cwd = provider_cwd } },
-    };
-
-    var client = try ai_harness.connect(self.allocator, provider_config);
-    defer client.deinit();
-
-    return client.interruptThread(.{
+    var arena = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena.deinit();
+    var transport: daemon_client.HeadlessTransport = .{ .allocator = arena.allocator(), .pref_path = self.storage.pref_path };
+    var client = daemon_client.headlessClient(arena.allocator(), &transport);
+    var parsed = try client.callProviderThreadInterrupt(headless.Capabilities.phase1(), .{
+        .provider = harnessProviderForDbProvider(provider),
+        .project_path = execution_target.cwd(),
         .thread_id = thread_id,
         .turn_id = turn_id,
     });
+    defer parsed.deinit();
+    const response = try client.decodeProviderThreadInterrupt(&parsed);
+    if (response.status != .accepted) return error.UnsupportedOperation;
 }
 
 pub fn steerThreadViaHarness(
@@ -2738,29 +2666,24 @@ pub fn steerThreadViaHarness(
     prompt: []const u8,
     images: []const ChatImageAttachment,
 ) !void {
-    const provider_cwd = execution_target.cwd();
-    const provider_config = switch (provider) {
-        .codex => ai_harness.ProviderConfig{ .codex = .{
-            .cwd = provider_cwd,
-            .launch_on_connect = false,
-        } },
-        .claude => ai_harness.ProviderConfig{ .claude = .{ .cwd = provider_cwd } },
-        .opencode, .cursor, .pi, .fx, .grok, .muse => return error.UnsupportedOperation,
-    };
-
-    var client = try ai_harness.connect(self.allocator, provider_config);
-    defer client.deinit();
-
-    const image_attachments = try self.allocator.alloc(ai_harness.types.ImageAttachment, images.len);
+    const image_attachments = try self.allocator.alloc(provider_types.ImageAttachment, images.len);
     defer self.allocator.free(image_attachments);
     for (images, 0..) |image, index| image_attachments[index] = .{ .path = image.path };
-
-    return client.steerThread(.{
+    var arena = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena.deinit();
+    var transport: daemon_client.HeadlessTransport = .{ .allocator = arena.allocator(), .pref_path = self.storage.pref_path };
+    var client = daemon_client.headlessClient(arena.allocator(), &transport);
+    var parsed = try client.callProviderThreadSteer(headless.Capabilities.phase1(), .{
+        .provider = harnessProviderForDbProvider(provider),
+        .project_path = execution_target.cwd(),
         .thread_id = thread_id,
         .turn_id = turn_id,
         .prompt = prompt,
         .images = image_attachments,
     });
+    defer parsed.deinit();
+    const response = try client.decodeProviderThreadSteer(&parsed);
+    if (response.status != .accepted) return error.UnsupportedOperation;
 }
 
 pub fn steerDaemonChatTurn(
@@ -2773,7 +2696,7 @@ pub fn steerDaemonChatTurn(
     var image_paths: std.ArrayList([]const u8) = .empty;
     defer image_paths.deinit(self.allocator);
     for (images) |image| try image_paths.append(self.allocator, image.path);
-    const response = try sessionizer.requestAlloc(self.allocator, self.storage.pref_path, "chat.turn.steer", .{
+    const response = try daemon_client.requestAlloc(self.allocator, self.storage.pref_path, "chat.turn.steer", .{
         .turn_id = turn_id,
         .steer_id = steer_id,
         .prompt = prompt,
@@ -2986,8 +2909,8 @@ fn acceptanceWorkerMain(dispatch: *AcceptanceDispatch) void {
     const started_ms = monotonicMs();
     const outcome: AcceptanceOutcome = blk: {
         const response = switch (dispatch.params) {
-            .legacy_local => |params| sessionizer.requestAlloc(alloc, dispatch.pref_path, "chat.turn.start", params, 1),
-            .repository => |params| sessionizer.requestAlloc(alloc, dispatch.pref_path, "chat.turn.start", params, 1),
+            .legacy_local => |params| daemon_client.requestAlloc(alloc, dispatch.pref_path, "chat.turn.start", params, 1),
+            .repository => |params| daemon_client.requestAlloc(alloc, dispatch.pref_path, "chat.turn.start", params, 1),
         } catch |err| {
             break :blk classifyLocalAcceptanceFailure(alloc, dispatch, err);
         };
@@ -3370,14 +3293,6 @@ pub fn dispatchDaemonAcceptance(
     const project = &self.project_controller.projects.items[project_index];
     const now_ms = unixTimestampMs();
 
-    // Readiness checks and other short GUI operations may have launched the
-    // shared Codex app-server in this process. Stop it before the daemon
-    // worker connects so closing Verde cannot kill the server that owns the
-    // durable turn.
-    if (thread.provider == .codex) {
-        self.finishProviderReadinessThread();
-        ai_harness.releaseOwnedCodexServer();
-    }
     switch (execution_route) {
         .legacy_local, .remote => {},
         // Repository-local routing has no staging surface yet; reject before
@@ -3839,17 +3754,8 @@ fn beginSendForThreadWithReadyDaemonImages(
     const cursor_model_params_json = if (thread.provider == .cursor) try self.cursorModelParamsJsonAlloc(page_alloc, thread) else null;
     defer if (cursor_model_params_json) |params| page_alloc.free(params);
 
-    // Readiness checks and other short GUI operations may have launched
-    // the shared Codex app-server in this process. Stop it before the
-    // daemon worker connects so closing Verde cannot kill the server that
-    // owns the durable turn.
-    if (thread.provider == .codex) {
-        self.finishProviderReadinessThread();
-        ai_harness.releaseOwnedCodexServer();
-    }
-
     // The daemon response is owned by self.allocator (startDaemonChatTurn ->
-    // sessionizer.requestAlloc); freeing it with page_alloc trips
+    // daemon_client.requestAlloc); freeing it with page_alloc trips
     // PageAllocator's alignment safety check and crashes the send.
     // Ordering: await the chat.turn.start acceptance receipt before the GUI
     // marks the send pending / clears the draft (caller). Staging SQLite runs
@@ -3958,7 +3864,7 @@ pub fn ensureSessionDaemon(self: anytype) !void {
     // probe (~250ms) so Enter never freezes the UI behind a busy daemon. A
     // busy-but-alive daemon passes; chat.turn.start then carries the full
     // request deadline plus its idempotent lost-reply recovery.
-    try sessionizer.ensureDaemonInteractive(self.allocator, self.storage.pref_path, exe_path);
+    try daemon_client.ensureDaemonInteractive(self.allocator, self.storage.pref_path, exe_path);
 }
 
 pub fn startDaemonChatTurn(
@@ -3995,7 +3901,7 @@ pub fn startDaemonChatTurn(
         }
     }
 
-    return sessionizer.requestAlloc(self.allocator, self.storage.pref_path, "chat.turn.start", .{
+    return daemon_client.requestAlloc(self.allocator, self.storage.pref_path, "chat.turn.start", .{
         .turn_id = turn_id,
         .workspace_id = self.project_controller.projects.items[project_index].id,
         .local_thread_id = thread.local_thread_id,
@@ -4025,7 +3931,7 @@ pub fn daemonChatTurnExists(self: anytype, turn_id: []const u8) bool {
 
 /// Standalone lost-reply probe (no state), callable from acceptance workers.
 fn daemonChatTurnExistsRaw(allocator: std.mem.Allocator, pref_path: []const u8, turn_id: []const u8) bool {
-    const response = sessionizer.requestAlloc(allocator, pref_path, "chat.turn.tail", .{
+    const response = daemon_client.requestAlloc(allocator, pref_path, "chat.turn.tail", .{
         .turn_id = turn_id,
         .after_seq = 0,
         .max_bytes = DAEMON_CHAT_TAIL_PAGE_BYTES,
@@ -4050,13 +3956,13 @@ test "daemon turn preserves provider reasoning variants" {
 }
 
 pub fn cancelDaemonChatTurn(self: anytype, turn_id: []const u8) !void {
-    const response = try sessionizer.requestAlloc(self.allocator, self.storage.pref_path, "chat.turn.cancel", .{ .turn_id = turn_id }, 3);
+    const response = try daemon_client.requestAlloc(self.allocator, self.storage.pref_path, "chat.turn.cancel", .{ .turn_id = turn_id }, 3);
     defer self.allocator.free(response);
     try ensureJsonRpcOk(self.allocator, response);
 }
 
-pub fn approveDaemonChatTurn(self: anytype, turn_id: []const u8, call_id: []const u8, decision: ai_harness.ApprovalDecision) !void {
-    const response = try sessionizer.requestAlloc(self.allocator, self.storage.pref_path, "chat.turn.approve", .{
+pub fn approveDaemonChatTurn(self: anytype, turn_id: []const u8, call_id: []const u8, decision: provider_types.ApprovalDecision) !void {
+    const response = try daemon_client.requestAlloc(self.allocator, self.storage.pref_path, "chat.turn.approve", .{
         .turn_id = turn_id,
         .call_id = call_id,
         .decision = @tagName(decision),
@@ -4068,7 +3974,7 @@ pub fn approveDaemonChatTurn(self: anytype, turn_id: []const u8, call_id: []cons
 pub fn consumeDaemonChatTurn(self: anytype, turn_id: ?[]u8) void {
     const owned_turn_id = turn_id orelse return;
     defer std.heap.page_allocator.free(owned_turn_id);
-    const response = sessionizer.requestAlloc(self.allocator, self.storage.pref_path, "chat.turn.consume", .{ .turn_id = owned_turn_id }, 5) catch |err| {
+    const response = daemon_client.requestAlloc(self.allocator, self.storage.pref_path, "chat.turn.consume", .{ .turn_id = owned_turn_id }, 5) catch |err| {
         log.warn("failed to consume daemon chat turn: {s}", .{@errorName(err)});
         return;
     };
@@ -4087,7 +3993,7 @@ fn consumeDaemonChatTurnForThread(self: anytype, thread: *const ChatThread, turn
 pub fn restoreDaemonChatTurnsOnLaunch(self: anytype) void {
     // Startup must stay bounded when no compatible daemon is reachable. The
     // cursor worker will retry through its ordinary composite-snapshot loop.
-    const response = sessionizer.requestAllocWithTimeout(
+    const response = daemon_client.requestAllocWithTimeout(
         self.allocator,
         self.storage.pref_path,
         "chat.turn.list",
@@ -4322,7 +4228,7 @@ fn consumeReconciledTerminalTurn(args: *TerminalTurnConsumeArgs) void {
         std.heap.page_allocator.free(args.reservation_key);
         std.heap.page_allocator.destroy(args);
     }
-    const response = sessionizer.requestAlloc(
+    const response = daemon_client.requestAlloc(
         std.heap.page_allocator,
         args.pref_path,
         "chat.turn.consume",
@@ -4940,18 +4846,24 @@ pub fn startTitleGeneration(self: anytype, project_index: usize, thread: *ChatTh
         "Image attachment";
     const assistant_text = boundedUtf8Prefix(exchange.assistant.body, 4096);
     const page_alloc = std.heap.page_allocator;
-    const prompt = try chat_threads.makeTitleGenerationPrompt(page_alloc, user_text, assistant_text);
-    errdefer page_alloc.free(prompt);
+    const pref_path = try page_alloc.dupe(u8, self.storage.pref_path);
+    errdefer page_alloc.free(pref_path);
     const project_path = try page_alloc.dupe(u8, self.project_controller.projects.items[project_index].path);
     errdefer page_alloc.free(project_path);
+    const owned_user_text = try page_alloc.dupe(u8, user_text);
+    errdefer page_alloc.free(owned_user_text);
+    const owned_assistant_text = try page_alloc.dupe(u8, assistant_text);
+    errdefer page_alloc.free(owned_assistant_text);
     const model_ref = try page_alloc.dupe(u8, self.app_config.chatTitleModel());
     errdefer page_alloc.free(model_ref);
     const request = try page_alloc.create(TitleGenerationRequest);
     errdefer page_alloc.destroy(request);
     request.* = .{
         .state = thread.title_generation_state,
+        .pref_path = pref_path,
         .project_path = project_path,
-        .prompt = prompt,
+        .user_text = owned_user_text,
+        .assistant_text = owned_assistant_text,
         .provider = harnessProviderForDbProvider(dbProviderForChatTitleProvider(self.app_config.chat_title_provider)),
         .model_ref = model_ref,
     };
@@ -5077,7 +4989,7 @@ test "title regeneration remains available when its opening exchange is paged ou
 }
 
 pub fn pollSlashCommand(self: anytype) bool {
-    var result: ?ai_harness.RunSlashCommandResult = null;
+    var result: ?provider_types.RunSlashCommandResult = null;
     var error_message: ?[]u8 = null;
     var display_name: ?[]u8 = null;
     var project_index: usize = 0;
@@ -5193,7 +5105,7 @@ pub fn applySlashCommandResult(
     self: anytype,
     project_index: usize,
     thread_index: usize,
-    result: ai_harness.RunSlashCommandResult,
+    result: provider_types.RunSlashCommandResult,
 ) void {
     if (!result.handled) {
         if (result.notice) |notice| {
@@ -5316,7 +5228,9 @@ fn startCodexBackgroundPollForThread(
             },
             .provider_thread_id = undefined,
             .process_id = undefined,
+            .pref_path = undefined,
             .cwd = undefined,
+            .terminate = false,
         };
         request.provider_thread_id = allocator.dupe(u8, task.provider_thread_id.?) catch {
             allocator.free(request.local_thread_id);
@@ -5329,7 +5243,15 @@ fn startCodexBackgroundPollForThread(
             allocator.destroy(request);
             return false;
         };
+        request.pref_path = allocator.dupe(u8, self.storage.pref_path) catch {
+            allocator.free(request.process_id);
+            allocator.free(request.provider_thread_id);
+            allocator.free(request.local_thread_id);
+            allocator.destroy(request);
+            return false;
+        };
         request.cwd = allocator.dupe(u8, target.cwd()) catch {
+            allocator.free(request.pref_path);
             allocator.free(request.process_id);
             allocator.free(request.provider_thread_id);
             allocator.free(request.local_thread_id);
@@ -5354,6 +5276,71 @@ fn startCodexBackgroundPollForThread(
     return false;
 }
 
+pub fn requestCodexBackgroundTaskTermination(
+    self: anytype,
+    thread: *ChatThread,
+    task: *BackgroundTask,
+    project_path: []const u8,
+) bool {
+    const poll = &self.chat_controller.codex_background_poll;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    poll.mutex.lockUncancelable(io);
+    defer poll.mutex.unlock(io);
+    if (poll.status != .idle) return false;
+    const provider_thread_id = task.provider_thread_id orelse return false;
+    const process_id = task.process_id orelse return false;
+    const allocator = std.heap.page_allocator;
+    const request = allocator.create(CodexBackgroundPollRequest) catch return false;
+    request.* = .{
+        .local_thread_id = allocator.dupe(u8, thread.local_thread_id) catch {
+            allocator.destroy(request);
+            return false;
+        },
+        .provider_thread_id = undefined,
+        .process_id = undefined,
+        .pref_path = undefined,
+        .cwd = undefined,
+        .terminate = true,
+    };
+    request.provider_thread_id = allocator.dupe(u8, provider_thread_id) catch {
+        allocator.free(request.local_thread_id);
+        allocator.destroy(request);
+        return false;
+    };
+    request.process_id = allocator.dupe(u8, process_id) catch {
+        allocator.free(request.provider_thread_id);
+        allocator.free(request.local_thread_id);
+        allocator.destroy(request);
+        return false;
+    };
+    request.pref_path = allocator.dupe(u8, self.storage.pref_path) catch {
+        allocator.free(request.process_id);
+        allocator.free(request.provider_thread_id);
+        allocator.free(request.local_thread_id);
+        allocator.destroy(request);
+        return false;
+    };
+    request.cwd = allocator.dupe(u8, project_path) catch {
+        allocator.free(request.pref_path);
+        allocator.free(request.process_id);
+        allocator.free(request.provider_thread_id);
+        allocator.free(request.local_thread_id);
+        allocator.destroy(request);
+        return false;
+    };
+    poll.request = request;
+    poll.running = null;
+    poll.status = .pending;
+    poll.worker = std.Thread.spawn(.{}, codexBackgroundPollWorker, .{ poll, request }) catch {
+        poll.request = null;
+        poll.status = .idle;
+        request.deinit();
+        return false;
+    };
+    task.stop_requested = true;
+    return true;
+}
+
 fn finishCodexBackgroundPoll(self: anytype) bool {
     const poll = &self.chat_controller.codex_background_poll;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -5376,7 +5363,9 @@ fn finishCodexBackgroundPoll(self: anytype) bool {
     if (running == null) {
         if (task) |entry| {
             entry.poll_failure_count = std.math.add(u8, entry.poll_failure_count, 1) catch std.math.maxInt(u8);
+            if (request.terminate) entry.stop_requested = false;
         }
+        if (request.terminate) self.setSidebarNotice("Codex could not stop the background task.");
         return false;
     }
     if (task) |entry| entry.poll_failure_count = 0;
@@ -5449,11 +5438,11 @@ fn completeCodexBackgroundTaskInThread(
         if (task.status != .running or task.provider_thread_id == null or task.process_id == null) continue;
         if (!std.mem.eql(u8, task.provider_thread_id.?, request.provider_thread_id) or
             !std.mem.eql(u8, task.process_id.?, request.process_id)) continue;
-        task.status = .completed;
+        task.status = if (request.terminate) .stopped else .completed;
         task.updated_at_ms = unixTimestampMs();
         const body = backgroundTaskCompletionBodyAlloc(self.allocator, task) catch return false;
         defer self.allocator.free(body);
-        self.appendMessageToThread(thread, .system, "Background task completed", body, null, &.{}) catch return false;
+        self.appendMessageToThread(thread, .system, if (request.terminate) "Background task stopped" else "Background task completed", body, null, &.{}) catch return false;
         self.project_controller.projects.items[project_index].invalidateSidebarThreadCache();
         if (project_index == self.project_controller.selected_index and thread_index != null and
             thread_index.? == self.currentProject().selected_thread_index)
@@ -5620,7 +5609,7 @@ pub const DaemonTailWorkerArgs = struct {
     }
 };
 
-fn daemonTailWorkerMain(connection: *sessionizer.ReusableRequestConnection, args: *DaemonTailWorkerArgs) void {
+fn daemonTailWorkerMain(connection: *daemon_client.ReusableRequestConnection, args: *DaemonTailWorkerArgs) void {
     const page_alloc = std.heap.page_allocator;
     const response = connection.requestAllocUsingBuffer(
         page_alloc,
@@ -6354,7 +6343,7 @@ pub fn applyDaemonChatEventLocked(self: anytype, send_state: *SendState, kind: [
         const title = jsonValueString(object.get("title") orelse .null) orelse "";
         const kind_text = jsonValueString(object.get("kind") orelse .null);
         const status_text = jsonValueString(object.get("status") orelse .null);
-        const update: ai_harness.ToolCallUpdate = .{
+        const update: provider_types.ToolCallUpdate = .{
             .call_id = call_id,
             .title = title,
             .kind = if (kind_text) |value| parseToolCallKind(value) else null,
@@ -6399,7 +6388,7 @@ pub fn applyDaemonDiffEventLocked(send_state: *SendState, payload_json: []const 
     const files_value = parsed.value.object.get("files") orelse return error.InvalidDaemonResponse;
     if (files_value != .array) return error.InvalidDaemonResponse;
 
-    var files: std.ArrayList(ai_harness.StreamDiffFile) = .empty;
+    var files: std.ArrayList(provider_types.StreamDiffFile) = .empty;
     defer files.deinit(allocator);
     for (files_value.array.items) |file_value| {
         if (file_value != .object) continue;
@@ -6417,7 +6406,7 @@ pub fn applyDaemonDiffEventLocked(send_state: *SendState, payload_json: []const 
 
     flushPendingAssistantTextLocked(send_state, allocator);
     const scope_text = jsonValueString(parsed.value.object.get("scope") orelse .null) orelse "incremental";
-    const scope: ai_harness.StreamDiffScope = if (std.mem.eql(u8, scope_text, "turn_snapshot"))
+    const scope: provider_types.StreamDiffScope = if (std.mem.eql(u8, scope_text, "turn_snapshot"))
         .turn_snapshot
     else
         .incremental;
@@ -6427,7 +6416,7 @@ pub fn applyDaemonDiffEventLocked(send_state: *SendState, payload_json: []const 
     });
 }
 
-pub fn parseToolCallKind(value: []const u8) ai_harness.ToolCallKind {
+pub fn parseToolCallKind(value: []const u8) provider_types.ToolCallKind {
     if (std.mem.eql(u8, value, "read")) return .read;
     if (std.mem.eql(u8, value, "edit")) return .edit;
     if (std.mem.eql(u8, value, "delete")) return .delete;
@@ -6441,7 +6430,7 @@ pub fn parseToolCallKind(value: []const u8) ai_harness.ToolCallKind {
     return .other;
 }
 
-pub fn parseToolCallStatus(value: []const u8) ai_harness.ToolCallStatus {
+pub fn parseToolCallStatus(value: []const u8) provider_types.ToolCallStatus {
     if (std.mem.eql(u8, value, "pending")) return .pending;
     if (std.mem.eql(u8, value, "in_progress")) return .in_progress;
     if (std.mem.eql(u8, value, "completed")) return .completed;
@@ -6789,7 +6778,7 @@ pub fn adoptDaemonTranscriptIdentities(self: anytype, project_index: usize, thre
 /// the workspace id, so retries can reach archived threads and archived
 /// workspaces where no live project index exists.
 fn adoptDaemonTranscriptIdentitiesByWorkspaceId(self: anytype, workspace_id: []const u8, thread: *ChatThread) AdoptionOutcome {
-    const response = sessionizer.requestAlloc(self.allocator, self.storage.pref_path, "chat.thread.get", .{
+    const response = daemon_client.requestAlloc(self.allocator, self.storage.pref_path, "chat.thread.get", .{
         .workspace_id = workspace_id,
         .local_thread_id = thread.local_thread_id,
     }, 6) catch |err| {
@@ -7048,7 +7037,7 @@ fn markAdoptionPending(workspace_id: []const u8, thread: *const ChatThread, turn
     }
     const backoff_shift: u6 = @intCast(@min(attempts -| 1, 6));
     const backoff_ms = @min(ADOPTION_RETRY_INTERVAL_MS << backoff_shift, ADOPTION_RETRY_MAX_BACKOFF_MS);
-    gop.value_ptr.next_retry_at_ms = sessionizer.nowMs() + backoff_ms;
+    gop.value_ptr.next_retry_at_ms = daemon_client.nowMs() + backoff_ms;
     if (attempts > 1 and attempts % ADOPTION_RETRY_LOG_EVERY == 0) {
         log.warn(
             "daemon transcript identity adoption still incomplete for {s} after {d} attempts; retrying",
@@ -7271,7 +7260,7 @@ fn adoptionRefreshTurnMatch(
             workspace_id,
             local_thread_id,
             before_offset,
-            db_client.TRANSCRIPT_MESSAGE_PAGE_SIZE,
+            session_protocol.TRANSCRIPT_MESSAGE_PAGE_SIZE,
         ) catch return .missing;
         pages[page_count] = page;
         page_count += 1;
@@ -7483,7 +7472,7 @@ fn retryAdoptionThreadByLocalId(self: anytype, workspace_id: []const u8, local_t
 /// their entry. Returns whether an adoption completed this tick.
 fn retryPendingAdoptions(self: anytype) bool {
     if (adoption_retry_pending.count() == 0) return false;
-    const now_ms = sessionizer.nowMs();
+    const now_ms = daemon_client.nowMs();
     var due_key: ?[]const u8 = null;
     var iterator = adoption_retry_pending.iterator();
     while (iterator.next()) |entry| {
@@ -7768,13 +7757,13 @@ test "M5-P4 amendment 2: retry pump backs off, reaches archived threads, and giv
     try std.testing.expect(!pollSend(&state));
     var pump_entry = (try entryState("retry-ws", "thread-live", "turn-live")).?;
     try std.testing.expectEqual(@as(u32, 2), pump_entry.attempts);
-    const after_two = pump_entry.next_retry_at_ms - sessionizer.nowMs();
+    const after_two = pump_entry.next_retry_at_ms - daemon_client.nowMs();
     try std.testing.expect(after_two > ADOPTION_RETRY_INTERVAL_MS);
     try forceDue("retry-ws", "thread-live", "turn-live");
     _ = pollSend(&state);
     pump_entry = (try entryState("retry-ws", "thread-live", "turn-live")).?;
     try std.testing.expectEqual(@as(u32, 3), pump_entry.attempts);
-    const after_three = pump_entry.next_retry_at_ms - sessionizer.nowMs();
+    const after_three = pump_entry.next_retry_at_ms - daemon_client.nowMs();
     try std.testing.expect(after_three > 2 * ADOPTION_RETRY_INTERVAL_MS);
     clearAdoptionPending("retry-ws", "thread-live", "turn-live");
 
@@ -8049,7 +8038,7 @@ fn enqueueRemoteApproval(
     thread: *ChatThread,
     turn_id: []const u8,
     call_id: []const u8,
-    decision: ai_harness.ApprovalDecision,
+    decision: provider_types.ApprovalDecision,
     started_at_ms: i64,
 ) !void {
     if (self.chat_controller.remote_control_dispatches.items.len >= MAX_REMOTE_CONTROL_DISPATCHES) {
@@ -8080,7 +8069,7 @@ fn enqueueRemoteApprovalForState(
     thread: *ChatThread,
     turn_id: []const u8,
     call_id: []const u8,
-    decision: ai_harness.ApprovalDecision,
+    decision: provider_types.ApprovalDecision,
     started_at_ms: i64,
 ) !void {
     if (comptime @hasField(std.meta.Child(@TypeOf(self)), "runtime_service") and
@@ -8751,7 +8740,7 @@ pub fn finishOpencodeModelCacheThread(self: anytype) void {
         worker.join();
     }
     if (maybe_models) |models| {
-        ai_harness.freeModelInfos(std.heap.page_allocator, models);
+        provider_types.freeModelInfos(std.heap.page_allocator, models);
     }
 }
 
@@ -8768,7 +8757,7 @@ pub fn finishClaudeModelCacheThread(self: anytype) void {
         worker.join();
     }
     if (maybe_models) |models| {
-        ai_harness.freeModelInfos(std.heap.page_allocator, models);
+        provider_types.freeModelInfos(std.heap.page_allocator, models);
     }
 }
 
@@ -8785,7 +8774,7 @@ pub fn finishPiModelCacheThread(self: anytype) void {
         worker.join();
     }
     if (maybe_models) |models| {
-        ai_harness.freeModelInfos(std.heap.page_allocator, models);
+        provider_types.freeModelInfos(std.heap.page_allocator, models);
     }
 }
 
@@ -8802,7 +8791,7 @@ pub fn finishFxModelCacheThread(self: anytype) void {
         worker.join();
     }
     if (maybe_models) |models| {
-        ai_harness.freeModelInfos(std.heap.page_allocator, models);
+        provider_types.freeModelInfos(std.heap.page_allocator, models);
     }
 }
 
@@ -8819,7 +8808,7 @@ pub fn finishGrokModelCacheThread(self: anytype) void {
         worker.join();
     }
     if (maybe_models) |models| {
-        ai_harness.freeModelInfos(std.heap.page_allocator, models);
+        provider_types.freeModelInfos(std.heap.page_allocator, models);
     }
 }
 
@@ -8836,7 +8825,7 @@ pub fn finishCursorModelCacheThread(self: anytype) void {
         worker.join();
     }
     if (maybe_models) |models| {
-        ai_harness.freeModelInfos(std.heap.page_allocator, models);
+        provider_types.freeModelInfos(std.heap.page_allocator, models);
     }
 }
 
@@ -9005,12 +8994,12 @@ pub fn pendingApprovalSnapshotCached(self: anytype) ?*const PendingApproval {
     return if (cache.approval) |*value| value else null;
 }
 
-pub fn resolvePendingApproval(self: anytype, decision: ai_harness.ApprovalDecision) void {
+pub fn resolvePendingApproval(self: anytype, decision: provider_types.ApprovalDecision) void {
     if (self.project_controller.projects.items.len == 0) return;
     _ = resolveThreadPendingApproval(self, self.currentThreadMutable(), decision);
 }
 
-pub fn resolveThreadApprovalByLocalId(self: anytype, workspace_id: []const u8, local_thread_id: []const u8, decision: ai_harness.ApprovalDecision) bool {
+pub fn resolveThreadApprovalByLocalId(self: anytype, workspace_id: []const u8, local_thread_id: []const u8, decision: provider_types.ApprovalDecision) bool {
     const thread = self.threadByLocalId(workspace_id, local_thread_id) orelse return false;
     return resolveThreadPendingApproval(self, thread, decision);
 }
@@ -9028,7 +9017,7 @@ fn liveProjectIndexForThread(self: anytype, target: *const ChatThread) ?usize {
     }
 }
 
-fn resolveThreadPendingApproval(self: anytype, thread: *ChatThread, decision: ai_harness.ApprovalDecision) bool {
+fn resolveThreadPendingApproval(self: anytype, thread: *ChatThread, decision: provider_types.ApprovalDecision) bool {
     const send_state = thread.send_state;
     send_state.mutex.lock();
     const remote_runtime = send_state.daemon_owned and threadUsesRemoteRuntime(thread);

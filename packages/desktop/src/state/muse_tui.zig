@@ -1,7 +1,6 @@
 //! Muse TUI lifecycle projection from Muse's durable local session event log.
 
 const std = @import("std");
-const acp = @import("../providers/acp.zig");
 const process_env = @import("../platform/env.zig");
 
 const POLL_INTERVAL_MS: i64 = 500;
@@ -166,12 +165,12 @@ fn routeFactsMatch(bytes: []const u8, expected_pid: u32, workspace_path: []const
         if (line.len == 0) continue;
         var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, line, .{}) catch continue;
         defer parsed.deinit();
-        const payload_type = acp.getOptionalObjectString(parsed.value, "payload_type") orelse continue;
+        const payload_type = getOptionalObjectString(parsed.value, "payload_type") orelse continue;
         if (!std.mem.eql(u8, payload_type, "runtime.session.route_facts")) continue;
-        const payload = acp.getObjectField(parsed.value, "payload") orelse continue;
-        const record = acp.getObjectField(payload, "record") orelse continue;
-        const pid = acp.getOptionalObjectInteger(record, "pid") orelse continue;
-        const cwd = acp.getOptionalObjectString(record, "cwd") orelse continue;
+        const payload = getObjectField(parsed.value, "payload") orelse continue;
+        const record = getObjectField(payload, "record") orelse continue;
+        const pid = getOptionalObjectInteger(record, "pid") orelse continue;
+        const cwd = getOptionalObjectString(record, "cwd") orelse continue;
         return pid == expected_pid and std.mem.eql(u8, cwd, workspace_path);
     }
     return false;
@@ -183,28 +182,28 @@ fn parseCompleteLines(allocator: std.mem.Allocator, tracker: *Tracker, bytes: []
         if (line.len == 0) continue;
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
         defer parsed.deinit();
-        const stream = acp.getObjectField(parsed.value, "stream");
+        const stream = getObjectField(parsed.value, "stream");
         if (stream) |value| {
-            if (acp.getOptionalObjectString(value, "id")) |session_id| {
+            if (getOptionalObjectString(value, "id")) |session_id| {
                 _ = try tracker.replaceOwned(allocator, .session_id, session_id);
             }
         }
-        const payload_type = acp.getOptionalObjectString(parsed.value, "payload_type") orelse continue;
-        const payload = acp.getObjectField(parsed.value, "payload") orelse continue;
+        const payload_type = getOptionalObjectString(parsed.value, "payload_type") orelse continue;
+        const payload = getObjectField(parsed.value, "payload") orelse continue;
         if (std.mem.eql(u8, payload_type, "session.name.changed")) {
-            const title = acp.getOptionalObjectString(payload, "new_name") orelse continue;
+            const title = getOptionalObjectString(payload, "new_name") orelse continue;
             if (try tracker.replaceOwned(allocator, .title, title)) batch.append(.title_changed);
             continue;
         }
         if (!std.mem.eql(u8, payload_type, "runtime.session")) continue;
-        const kind = acp.getOptionalObjectString(payload, "kind") orelse continue;
+        const kind = getOptionalObjectString(payload, "kind") orelse continue;
         if (!std.mem.eql(u8, kind, "run")) continue;
-        const event = acp.getObjectField(payload, "event") orelse continue;
-        const event_kind = acp.getOptionalObjectString(event, "kind") orelse continue;
+        const event = getObjectField(payload, "event") orelse continue;
+        const event_kind = getOptionalObjectString(event, "kind") orelse continue;
         if (std.mem.eql(u8, event_kind, "started")) {
             batch.append(.working);
         } else if (std.mem.eql(u8, event_kind, "terminal")) {
-            const terminal = acp.getOptionalObjectString(event, "terminal") orelse "failed";
+            const terminal = getOptionalObjectString(event, "terminal") orelse "failed";
             if (std.mem.eql(u8, terminal, "completed"))
                 batch.append(.done)
             else if (std.mem.eql(u8, terminal, "cancelled"))
@@ -213,6 +212,27 @@ fn parseCompleteLines(allocator: std.mem.Allocator, tracker: *Tracker, bytes: []
                 batch.append(.failed);
         }
     }
+}
+
+fn getObjectField(value: std.json.Value, key: []const u8) ?std.json.Value {
+    if (value != .object) return null;
+    return value.object.get(key);
+}
+
+fn getOptionalObjectString(value: std.json.Value, key: []const u8) ?[]const u8 {
+    const field = getObjectField(value, key) orelse return null;
+    return switch (field) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
+fn getOptionalObjectInteger(value: std.json.Value, key: []const u8) ?i64 {
+    const field = getObjectField(value, key) orelse return null;
+    return switch (field) {
+        .integer => |number| number,
+        else => null,
+    };
 }
 
 test "Muse TUI log parser preserves ordered title and lifecycle events" {

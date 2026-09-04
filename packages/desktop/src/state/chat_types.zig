@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const palette = @import("palette");
-const ai_harness = @import("../providers/harness.zig");
+const provider_types = @import("headless").provider_types;
 const chat_threads = @import("../chat/threads.zig");
 const chat_markdown = @import("../ui/chat_markdown.zig");
 const platform_paths = @import("platform_paths");
@@ -93,8 +93,8 @@ pub const ChatMessage = struct {
     image: ?ChatImageAttachment = null,
     extra_images: []ChatImageAttachment = &.{},
     tool_call_id: ?[]const u8 = null,
-    tool_call_kind: ?ai_harness.ToolCallKind = null,
-    tool_call_status: ?ai_harness.ToolCallStatus = null,
+    tool_call_kind: ?provider_types.ToolCallKind = null,
+    tool_call_status: ?provider_types.ToolCallStatus = null,
     /// Durable transcript identity (M4-P4): the acceptance-staged client id on
     /// user rows, or the daemon-minted id adopted from `chat.thread.get` at
     /// terminal. Null until an identity is known; persistence carries it
@@ -169,7 +169,7 @@ pub fn mintSubagentLocalThreadId(
     return ChatThread.allocPrintZCompat(allocator, "subagent:{s}:{x}", .{ parent_local_id, hasher.final() });
 }
 
-pub fn isSubagentAuthorOrKind(author: []const u8, kind: ?ai_harness.ToolCallKind) bool {
+pub fn isSubagentAuthorOrKind(author: []const u8, kind: ?provider_types.ToolCallKind) bool {
     if (kind) |value| {
         if (value == .subagent) return true;
     }
@@ -178,7 +178,7 @@ pub fn isSubagentAuthorOrKind(author: []const u8, kind: ?ai_harness.ToolCallKind
 
 /// True for live `tool_call_kind=subagent` rows and for already-persisted
 /// Claude/OpenCode cards that stored the child as a generic tool.
-pub fn looksLikeSubagentCard(author: []const u8, kind: ?ai_harness.ToolCallKind, body: []const u8) bool {
+pub fn looksLikeSubagentCard(author: []const u8, kind: ?provider_types.ToolCallKind, body: []const u8) bool {
     if (kind) |structured_kind| {
         if (structured_kind == .subagent) return true;
         // Concrete built-in kinds are authoritative. Generic `.mcp` and
@@ -193,7 +193,7 @@ pub fn looksLikeSubagentCard(author: []const u8, kind: ?ai_harness.ToolCallKind,
         }
     }
     if (isSubagentAuthorOrKind(author, null)) return true;
-    if (ai_harness.types.isSubagentToolName(toolBodyField(body, "Tool") orelse "")) return true;
+    if (provider_types.isSubagentToolName(toolBodyField(body, "Tool") orelse "")) return true;
     const input = toolBodyField(body, "Input") orelse "";
     if (std.mem.indexOf(u8, input, "\"subagent_type\"") != null) return true;
     const output = toolBodyField(body, "Output") orelse "";
@@ -211,7 +211,7 @@ pub fn parseSubagentConversation(body: []const u8) struct { title: []const u8, p
         (if (input.len > 0) input else if (tool_title.len > 0) tool_title else "");
     const title = if (description.len > 0)
         description
-    else if (tool_title.len > 0 and !ai_harness.types.isSubagentToolName(tool_title))
+    else if (tool_title.len > 0 and !provider_types.isSubagentToolName(tool_title))
         tool_title
     else
         firstNonEmptyLine(if (prompt.len > 0) prompt else body);
@@ -1137,7 +1137,7 @@ pub const SendState = struct {
     polled_working_seconds: i64 = -1,
     pending_followup: ?PendingFollowup = null,
     pending_followup_signal_sent: bool = false,
-    approval_decision: ?ai_harness.ApprovalDecision = null,
+    approval_decision: ?provider_types.ApprovalDecision = null,
     stop_requested: bool = false,
     stop_signal_sent: bool = false,
     worker: ?std.Thread = null,
@@ -1178,9 +1178,11 @@ pub const OpeningExchange = struct {
 };
 pub const TitleGenerationRequest = struct {
     state: *TitleGenerationState,
+    pref_path: []u8,
     project_path: []u8,
-    prompt: []u8,
-    provider: ai_harness.Provider,
+    user_text: []u8,
+    assistant_text: []u8,
+    provider: provider_types.Provider,
     model_ref: []u8,
 };
 pub const PendingApproval = struct {
@@ -1230,8 +1232,8 @@ pub const PendingTimelineEvent = struct {
     /// adopted into the projection row so the persistence flush keeps it.
     message_id: ?[]u8 = null,
     tool_call_id: ?[]u8 = null,
-    tool_call_kind: ?ai_harness.ToolCallKind = null,
-    tool_call_status: ?ai_harness.ToolCallStatus = null,
+    tool_call_kind: ?provider_types.ToolCallKind = null,
+    tool_call_status: ?provider_types.ToolCallStatus = null,
     tool_call_title: ?[]u8 = null,
     tool_call_input: ?[]u8 = null,
     tool_call_output: ?[]u8 = null,

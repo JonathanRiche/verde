@@ -159,6 +159,7 @@ mkdir -p \
   "$PACKAGE_ROOT/share/icons/hicolor/256x256/apps"
 
 install -m 755 "$PREFIX_DIR/bin/verde" "$PACKAGE_ROOT/bin/verde"
+install -m 755 "$PREFIX_DIR/bin/verde-gui" "$PACKAGE_ROOT/bin/verde-gui"
 install -m 755 "$PREFIX_DIR/bin/verde-server" "$PACKAGE_ROOT/bin/verde-server"
 install -m 755 "$PREFIX_DIR/bin/verde-daemon" "$PACKAGE_ROOT/bin/verde-daemon"
 install -m 755 "$PREFIX_DIR/bin/verde-web" "$PACKAGE_ROOT/bin/verde-web"
@@ -183,11 +184,12 @@ if [[ -e "$PACKAGE_ROOT/share/verde/node_modules" ]]; then
 fi
 
 normalize_fff_dependency \
-  "$PACKAGE_ROOT/bin/verde" \
+  "$PACKAGE_ROOT/bin/verde-gui" \
   "$REPO_ROOT/vendor/fff/target/release/libfff_c.so" \
   "libfff_c.so"
 
 strip_debug_symbols "$PACKAGE_ROOT/bin/verde"
+strip_debug_symbols "$PACKAGE_ROOT/bin/verde-gui"
 strip_debug_symbols "$PACKAGE_ROOT/bin/libSDL3.so"
 strip_debug_symbols "$PACKAGE_ROOT/bin/libSDL3_ttf.so"
 strip_debug_symbols "$PACKAGE_ROOT/bin/verde-browser-linux"

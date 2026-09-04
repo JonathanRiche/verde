@@ -7,6 +7,7 @@ const args = @import("args.zig");
 const completion = @import("completion.zig");
 const output = @import("output.zig");
 const runtime_profiles_cli = @import("runtime_profiles.zig");
+const workspace_process_poll = @import("workspace_process_poll.zig");
 const herdr = @import("../workspace/herdr.zig");
 const platform_ipc = @import("../platform/ipc.zig");
 const live_endpoint = @import("../platform/live_endpoint.zig");
@@ -17,7 +18,7 @@ const provider_hooks = @import("../providers/hooks.zig");
 const spec = @import("spec.zig");
 const db_client = @import("../db/client.zig");
 const db_types = @import("../db/types.zig");
-const sessionizer = @import("../terminal/sessionizer.zig");
+const daemon_client = @import("../daemon/client.zig");
 const terminal = @import("../terminal/terminal.zig");
 const app_config = @import("../app/config.zig");
 const chat_threads = @import("../chat/threads.zig");
@@ -122,9 +123,7 @@ fn dispatchArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []const 
         return .handled;
     }
     if (std.mem.eql(u8, parsed.command, "__session-daemon")) {
-        const pref_path = try prefPath(allocator);
-        defer allocator.free(pref_path);
-        try sessionizer.runDaemonWithMcp(allocator, pref_path, handleMcpHttpRequest);
+        try replaceWithSessionDaemon(allocator, io, argv);
         return .handled;
     }
     if (std.mem.eql(u8, parsed.command, "session")) {
@@ -143,6 +142,34 @@ fn dispatchArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []const 
     try out.stderr("unknown verde command: {s}\n\n", .{parsed.command});
     try printHelp(out);
     std.process.exit(2);
+}
+
+fn replaceWithSessionDaemon(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+) !void {
+    const executable_dir = try std.process.executableDirPathAlloc(io, allocator);
+    defer allocator.free(executable_dir);
+    const daemon_name = if (builtin.os.tag == .windows) "verde-daemon.exe" else "verde-daemon";
+    const daemon_path = try std.fs.path.join(allocator, &.{ executable_dir, daemon_name });
+    defer allocator.free(daemon_path);
+
+    const daemon_argv = try allocator.alloc([]const u8, argv.len);
+    defer allocator.free(daemon_argv);
+    daemon_argv[0] = daemon_path;
+    @memcpy(daemon_argv[1..], argv[1..]);
+
+    if (builtin.os.tag != .windows) return std.process.replace(io, .{ .argv = daemon_argv });
+
+    // Windows cannot replace the current process image. Wait for the sibling
+    // console daemon so the compatibility command retains its exit status.
+    var child = try std.process.spawn(io, .{ .argv = daemon_argv });
+    const term = try child.wait(io);
+    switch (term) {
+        .exited => |code| std.process.exit(code),
+        else => std.process.exit(1),
+    }
 }
 
 fn printHelp(out: output.Output) !void {
@@ -1164,11 +1191,11 @@ pub fn handleCore(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
     var decode_arena = std.heap.ArenaAllocator.init(allocator);
     defer decode_arena.deinit();
     const arena = decode_arena.allocator();
-    var transport: sessionizer.HeadlessTransport = .{
+    var transport: daemon_client.HeadlessTransport = .{
         .allocator = arena,
         .pref_path = pref_path,
     };
-    var client = sessionizer.headlessClient(arena, &transport);
+    var client = daemon_client.headlessClient(arena, &transport);
     // Explicit empty object: bare `.{}` can stringify as `[]` and fail params validation.
     const empty_params: struct {} = .{};
     var parsed: headless.protocol.ParsedResponse = if (is_snapshot or is_changes) blk: {
@@ -1306,7 +1333,7 @@ fn handleSession(allocator: std.mem.Allocator, out: output.Output, io: std.Io, e
             if (json) {
                 try out.jsonValue(allocator, .{
                     .daemon_running = false,
-                    .socket_name = sessionizer.SOCKET_NAME,
+                    .socket_name = daemon_client.SOCKET_NAME,
                     .sessions = sessions,
                 });
                 return;
@@ -1378,8 +1405,8 @@ fn handleSession(allocator: std.mem.Allocator, out: output.Output, io: std.Io, e
             .cwd = cwd,
             .label = args.optionValue(argv, "--name") orelse "",
             .command = command_argv,
-            .cols = parseOptionalU32(args.optionValue(argv, "--cols")) orelse sessionizer.DEFAULT_COLS,
-            .rows = parseOptionalU32(args.optionValue(argv, "--rows")) orelse sessionizer.DEFAULT_ROWS,
+            .cols = parseOptionalU32(args.optionValue(argv, "--cols")) orelse daemon_client.DEFAULT_COLS,
+            .rows = parseOptionalU32(args.optionValue(argv, "--rows")) orelse daemon_client.DEFAULT_ROWS,
         }, 1);
         defer allocator.free(response);
         try out.stdout("{s}\n", .{response});
@@ -1776,11 +1803,11 @@ fn persistSurfaceStateViaDaemon(
     defer decode_arena.deinit();
     const arena = decode_arena.allocator();
 
-    var transport: sessionizer.HeadlessTransport = .{
+    var transport: daemon_client.HeadlessTransport = .{
         .allocator = arena,
         .pref_path = pref_path,
     };
-    var client = sessionizer.headlessClient(arena, &transport);
+    var client = daemon_client.headlessClient(arena, &transport);
 
     var registered = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
     defer registered.deinit();
@@ -1830,7 +1857,7 @@ fn persistSurfaceStateViaDaemon(
 
 /// Strict read-only state open for CLI inspection; never initializes schema.
 fn openStateReadOnly(allocator: std.mem.Allocator, pref_path: []const u8) !?db_client.Client {
-    const effective_dir = try sessionizer.effectiveStoreDirectory(allocator, pref_path);
+    const effective_dir = try daemon_client.effectiveStoreDirectory(allocator, pref_path);
     defer allocator.free(effective_dir.path);
     return openStateReadOnlyInDirectory(allocator, effective_dir.path);
 }
@@ -1843,7 +1870,7 @@ fn openStateReadOnlyInDirectory(allocator: std.mem.Allocator, store_dir: []const
 }
 
 fn stateDatabasePath(allocator: std.mem.Allocator, pref_path: []const u8) ![:0]u8 {
-    const effective_dir = try sessionizer.effectiveStoreDirectory(allocator, pref_path);
+    const effective_dir = try daemon_client.effectiveStoreDirectory(allocator, pref_path);
     defer allocator.free(effective_dir.path);
     return db_client.Client.pathForPrefPath(allocator, effective_dir.path);
 }
@@ -3346,7 +3373,7 @@ fn sendLiveRequestAllocWithTimeout(allocator: std.mem.Allocator, method: []const
 fn sendSessionRequestAlloc(allocator: std.mem.Allocator, _: std.Io, method: []const u8, params: anytype, request_id: u64) ![]u8 {
     const pref_path = try prefPath(allocator);
     defer allocator.free(pref_path);
-    return try sessionizer.requestAlloc(allocator, pref_path, method, params, request_id);
+    return try daemon_client.requestAlloc(allocator, pref_path, method, params, request_id);
 }
 
 const SessionReadResult = struct {
@@ -3450,8 +3477,8 @@ fn detachSessionClient(allocator: std.mem.Allocator, io: std.Io, session_id: []c
 
 fn terminalAttachSize(explicit_cols: ?u32, explicit_rows: ?u32) AttachSize {
     const detected = readTerminalAttachSize();
-    const cols = explicit_cols orelse if (detected) |size| size.cols else sessionizer.DEFAULT_COLS;
-    const rows = explicit_rows orelse if (detected) |size| size.rows else sessionizer.DEFAULT_ROWS;
+    const cols = explicit_cols orelse if (detected) |size| size.cols else daemon_client.DEFAULT_COLS;
+    const rows = explicit_rows orelse if (detected) |size| size.rows else daemon_client.DEFAULT_ROWS;
     return .{
         .cols = @intCast(@max(@min(cols, std.math.maxInt(u16)), 1)),
         .rows = @intCast(@max(@min(rows, std.math.maxInt(u16)), 1)),
@@ -3913,7 +3940,7 @@ fn ensureSessionDaemon(allocator: std.mem.Allocator, io: std.Io, exe_path: []con
     _ = io;
     const pref_path = try prefPath(allocator);
     defer allocator.free(pref_path);
-    try sessionizer.ensureDaemon(allocator, pref_path, exe_path);
+    try daemon_client.ensureDaemon(allocator, pref_path, exe_path);
 }
 
 fn sessionIdForNewCommand(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
@@ -5114,7 +5141,7 @@ fn mcpToolsCall(
             return try mcpError(allocator, out, id_value, -32000, "chat.thread.get response omitted store_revision");
 
         var presentation_ambiguous = false;
-        const presentation_deadline_ms = sessionizer.monotonicNowMs() +| CHAT_OPEN_PRESENT_DEADLINE_MS;
+        const presentation_deadline_ms = daemon_client.monotonicNowMs() +| CHAT_OPEN_PRESENT_DEADLINE_MS;
         while (presentationRemainingMs(presentation_deadline_ms)) |remaining_ms| {
             const present = sendLiveRequestAllocWithTimeout(allocator, "chat.present", .{
                 .workspace_id = workspace_id,
@@ -5309,7 +5336,7 @@ fn mcpToolsCall(
             errdefer allocator.free(browser_response);
             if (target_url) |target| {
                 if (liveResponseOk(allocator, browser_response)) {
-                    const deadline_ms = sessionizer.monotonicNowMs() +| @as(i64, @intCast(MCP_BROWSER_ACTION_TIMEOUT_MS));
+                    const deadline_ms = daemon_client.monotonicNowMs() +| @as(i64, @intCast(MCP_BROWSER_ACTION_TIMEOUT_MS));
                     try mcpBrowserWaitForNavigation(allocator, io, workspace, target, null, deadline_ms);
                 }
             }
@@ -5325,7 +5352,7 @@ fn mcpToolsCall(
             const previous_url = try mcpBrowserResponseUrlAlloc(allocator, browser_response);
             defer if (previous_url) |value| allocator.free(value);
             if (liveResponseOk(allocator, browser_response)) {
-                const deadline_ms = sessionizer.monotonicNowMs() +| @as(i64, @intCast(MCP_BROWSER_ACTION_TIMEOUT_MS));
+                const deadline_ms = daemon_client.monotonicNowMs() +| @as(i64, @intCast(MCP_BROWSER_ACTION_TIMEOUT_MS));
                 try mcpBrowserWaitForNavigation(allocator, io, workspace, url, previous_url, deadline_ms);
             }
             break :blk browser_response;
@@ -5550,11 +5577,11 @@ fn mcpDaemonSessionCallAlloc(
 
     const pref_path = try prefPath(allocator);
     defer allocator.free(pref_path);
-    var transport: sessionizer.HeadlessTransport = .{
+    var transport: daemon_client.HeadlessTransport = .{
         .allocator = allocator,
         .pref_path = pref_path,
     };
-    var client = sessionizer.headlessClient(allocator, &transport);
+    var client = daemon_client.headlessClient(allocator, &transport);
     var parsed = try client.call(method, params);
     defer parsed.deinit();
 
@@ -5709,11 +5736,11 @@ fn chatDaemonCallEnvelopeAlloc(
     var decode_arena = std.heap.ArenaAllocator.init(allocator);
     defer decode_arena.deinit();
     const arena = decode_arena.allocator();
-    var transport: sessionizer.HeadlessTransport = .{
+    var transport: daemon_client.HeadlessTransport = .{
         .allocator = arena,
         .pref_path = pref_path,
     };
-    var client = sessionizer.headlessClient(arena, &transport);
+    var client = daemon_client.headlessClient(arena, &transport);
     try chatDaemonRequireCapability(&client);
 
     var parsed = try client.call(method, params);
@@ -5738,11 +5765,11 @@ fn chatDaemonDraftSetEnvelopeAlloc(allocator: std.mem.Allocator, io: std.Io, dra
     var decode_arena = std.heap.ArenaAllocator.init(allocator);
     defer decode_arena.deinit();
     const arena = decode_arena.allocator();
-    var transport: sessionizer.HeadlessTransport = .{
+    var transport: daemon_client.HeadlessTransport = .{
         .allocator = arena,
         .pref_path = pref_path,
     };
-    var client = sessionizer.headlessClient(arena, &transport);
+    var client = daemon_client.headlessClient(arena, &transport);
     try chatDaemonRequireCapability(&client);
 
     var registered = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
@@ -5926,11 +5953,11 @@ fn chatDaemonFollowupEnvelopeAlloc(allocator: std.mem.Allocator, io: std.Io, fol
     var decode_arena = std.heap.ArenaAllocator.init(allocator);
     defer decode_arena.deinit();
     const arena = decode_arena.allocator();
-    var transport: sessionizer.HeadlessTransport = .{
+    var transport: daemon_client.HeadlessTransport = .{
         .allocator = arena,
         .pref_path = pref_path,
     };
-    var client = sessionizer.headlessClient(arena, &transport);
+    var client = daemon_client.headlessClient(arena, &transport);
     try chatDaemonRequireCapability(&client);
 
     var snapshot_response = try client.call(headless.store.METHOD_CORE_SNAPSHOT, headless.store.CoreSnapshotRequest{
@@ -6012,11 +6039,11 @@ fn chatDaemonSendEnvelopeAlloc(allocator: std.mem.Allocator, io: std.Io, send: C
     var decode_arena = std.heap.ArenaAllocator.init(allocator);
     defer decode_arena.deinit();
     const arena = decode_arena.allocator();
-    var transport: sessionizer.HeadlessTransport = .{
+    var transport: daemon_client.HeadlessTransport = .{
         .allocator = arena,
         .pref_path = pref_path,
     };
-    var client = sessionizer.headlessClient(arena, &transport);
+    var client = daemon_client.headlessClient(arena, &transport);
     try chatDaemonRequireCapability(&client);
 
     var get = try client.call(headless.store.METHOD_CHAT_THREAD_GET, .{
@@ -6107,11 +6134,11 @@ fn chatDaemonOpenThreadEnvelopeAlloc(allocator: std.mem.Allocator, io: std.Io, o
     var decode_arena = std.heap.ArenaAllocator.init(allocator);
     defer decode_arena.deinit();
     const arena = decode_arena.allocator();
-    var transport: sessionizer.HeadlessTransport = .{
+    var transport: daemon_client.HeadlessTransport = .{
         .allocator = arena,
         .pref_path = pref_path,
     };
-    var client = sessionizer.headlessClient(arena, &transport);
+    var client = daemon_client.headlessClient(arena, &transport);
     try chatDaemonRequireCapability(&client);
 
     var registered = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
@@ -6264,7 +6291,7 @@ fn nonNegativeJsonInteger(value: std.json.Value) ?i64 {
 }
 
 fn presentationRemainingMs(deadline_ms: i64) ?u32 {
-    const remaining = deadline_ms -| sessionizer.monotonicNowMs();
+    const remaining = deadline_ms -| daemon_client.monotonicNowMs();
     return if (remaining > 0) @intCast(@min(remaining, @as(i64, std.math.maxInt(u32)))) else null;
 }
 
@@ -6485,7 +6512,7 @@ fn presentDaemonChatOpenAlloc(
     const store_revision = nonNegativeJsonInteger(result.object.get("store_revision") orelse .null) orelse return error.InvalidChatOpenResponse;
 
     var ambiguous = false;
-    const deadline_ms = sessionizer.monotonicNowMs() +| CHAT_OPEN_PRESENT_DEADLINE_MS;
+    const deadline_ms = daemon_client.monotonicNowMs() +| CHAT_OPEN_PRESENT_DEADLINE_MS;
     while (presentationRemainingMs(deadline_ms)) |remaining_ms| {
         const response = sendLiveRequestAllocWithTimeout(allocator, "chat.present", .{
             .workspace_id = workspace_id,
@@ -6528,7 +6555,7 @@ fn presentDaemonChatOpenAlloc(
 }
 
 fn confirmationRemainingMs(deadline_ms: i64) ?i64 {
-    const remaining_ms = deadline_ms -| sessionizer.monotonicNowMs();
+    const remaining_ms = deadline_ms -| daemon_client.monotonicNowMs();
     return if (remaining_ms > 0) remaining_ms else null;
 }
 
@@ -6740,7 +6767,7 @@ fn mcpBrowserWaitForNavigation(
                 // WPE can briefly report the target document Ready before a
                 // pane rebind resets it to about:blank. Require a quiet
                 // window so the next MCP action reaches the retained page.
-                const now_ms = sessionizer.monotonicNowMs();
+                const now_ms = daemon_client.monotonicNowMs();
                 const started_ms = stable_since_ms orelse start: {
                     stable_since_ms = now_ms;
                     break :start now_ms;
@@ -6797,7 +6824,7 @@ fn mcpBrowserEvalAndWaitAlloc(
     timeout_ms: u32,
     mode: McpBrowserEvalMode,
 ) ![]u8 {
-    const readiness_deadline_ms = sessionizer.monotonicNowMs() +| @as(i64, @intCast(MCP_BROWSER_ACTION_TIMEOUT_MS));
+    const readiness_deadline_ms = daemon_client.monotonicNowMs() +| @as(i64, @intCast(MCP_BROWSER_ACTION_TIMEOUT_MS));
     // Navigation marks the runtime Opening before its Live response returns.
     // Do not inject the nonce-bearing action into that disposable document:
     // cross-origin startup can replace the JS context and strand it pending.
@@ -6805,7 +6832,7 @@ fn mcpBrowserEvalAndWaitAlloc(
 
     // Cold WPE startup can consume the readiness window. Give the action its
     // own budget once the stable document is available.
-    const action_deadline_ms = sessionizer.monotonicNowMs() +| @as(i64, @intCast(timeout_ms));
+    const action_deadline_ms = daemon_client.monotonicNowMs() +| @as(i64, @intCast(timeout_ms));
 
     const nonce = try std.fmt.allocPrint(allocator, "{d}-{d}", .{ platform_runtime.processId(), platform_runtime.monotonicTimestampNs() });
     defer allocator.free(nonce);
@@ -6978,10 +7005,7 @@ fn mcpWaitForWorkspaceProcessAlloc(
     );
 }
 
-pub const WorkspaceProcessesTransport = struct {
-    context: *anyopaque,
-    request: *const fn (*anyopaque, std.mem.Allocator, std.Io, ?[]const u8) anyerror![]u8,
-};
+pub const WorkspaceProcessesTransport = workspace_process_poll.Transport;
 
 pub fn waitForWorkspaceProcessWithTransportAlloc(
     allocator: std.mem.Allocator,
@@ -6992,24 +7016,15 @@ pub fn waitForWorkspaceProcessWithTransportAlloc(
     transport: WorkspaceProcessesTransport,
     poll_interval_ms: u32,
 ) ![]u8 {
-    const started_ns = platform_runtime.monotonicTimestampNs();
-    while (true) {
-        const response = try transport.request(transport.context, allocator, io, workspace);
-        defer allocator.free(response);
-        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
-        defer parsed.deinit();
-        if (!workspaceProcessResponseOk(parsed.value)) return error.WorkspaceProcessPollRejected;
-        const poll = workspaceProcessPoll(parsed.value, process_id);
-        const elapsed_ms: u64 = @intCast(@divTrunc(platform_runtime.monotonicTimestampNs() - started_ns, std.time.ns_per_ms));
-        if (poll.outcome != .active) {
-            return try workspaceProcessWaitResultAlloc(allocator, process_id, @tagName(poll.outcome), false, elapsed_ms, poll.snapshot);
-        }
-        if (elapsed_ms >= timeout_ms) {
-            return try workspaceProcessWaitResultAlloc(allocator, process_id, "timed_out", true, elapsed_ms, poll.snapshot);
-        }
-        const remaining_ms: u64 = timeout_ms - elapsed_ms;
-        try std.Io.sleep(io, .fromMilliseconds(@min(remaining_ms, poll_interval_ms)), .awake);
-    }
+    return workspace_process_poll.waitAlloc(
+        allocator,
+        io,
+        workspace,
+        process_id,
+        timeout_ms,
+        transport,
+        poll_interval_ms,
+    );
 }
 
 fn liveWorkspaceProcessesRequest(
@@ -7021,82 +7036,16 @@ fn liveWorkspaceProcessesRequest(
     return sendLiveRequestAlloc(allocator, io, "workspace.processes", .{ .workspace = workspace }, 1);
 }
 
-pub const WorkspaceProcessPollOutcome = enum { active, completed, replaced, gone };
+pub const WorkspaceProcessPollOutcome = workspace_process_poll.Outcome;
 
-pub const WorkspaceProcessPoll = struct {
-    outcome: WorkspaceProcessPollOutcome,
-    snapshot: ?std.json.Value = null,
-};
-
-fn workspaceProcessResponseOk(root: std.json.Value) bool {
-    if (root != .object) return false;
-    return jsonBool(root.object.get("ok") orelse .null) orelse false;
-}
+pub const WorkspaceProcessPoll = workspace_process_poll.Poll;
 
 pub fn workspaceProcessPoll(root: std.json.Value, process_id: []const u8) WorkspaceProcessPoll {
-    if (root != .object) return .{ .outcome = .gone };
-    const result = root.object.get("result") orelse return .{ .outcome = .gone };
-    if (result != .object) return .{ .outcome = .gone };
-    const processes = result.object.get("processes") orelse return .{ .outcome = .gone };
-    if (processes != .array) return .{ .outcome = .gone };
-    const terminal_prefix = terminalProcessIdPrefix(process_id);
-    var replaced = false;
-    for (processes.array.items) |process| {
-        if (process != .object) continue;
-        const candidate_id = jsonString(process.object.get("id") orelse .null) orelse continue;
-        if (std.mem.eql(u8, candidate_id, process_id)) {
-            const status = jsonString(process.object.get("status") orelse .null) orelse "unknown";
-            return .{
-                .outcome = if (workspaceProcessStatusActive(status)) .active else .completed,
-                .snapshot = process,
-            };
-        }
-        if (terminal_prefix) |prefix| {
-            if (std.mem.startsWith(u8, candidate_id, prefix)) replaced = true;
-        }
-    }
-    return .{ .outcome = if (replaced) .replaced else .gone };
+    return workspace_process_poll.poll(root, process_id);
 }
 
-fn terminalProcessIdPrefix(process_id: []const u8) ?[]const u8 {
-    if (!std.mem.startsWith(u8, process_id, "term:")) return null;
-    const separator = std.mem.lastIndexOfScalar(u8, process_id, ':') orelse return null;
-    return process_id[0 .. separator + 1];
-}
-
-fn workspaceProcessStatusActive(status: []const u8) bool {
-    return std.mem.eql(u8, status, "starting") or
-        std.mem.eql(u8, status, "running") or
-        std.mem.eql(u8, status, "stopping") or
-        std.mem.eql(u8, status, "restarting") or
-        std.mem.eql(u8, status, "waiting") or
-        std.mem.eql(u8, status, "pending");
-}
-
-fn workspaceProcessWaitResultAlloc(
-    allocator: std.mem.Allocator,
-    process_id: []const u8,
-    outcome: []const u8,
-    timed_out: bool,
-    elapsed_ms: u64,
-    snapshot: ?std.json.Value,
-) ![]u8 {
-    var writer: std.Io.Writer.Allocating = .init(allocator);
-    errdefer writer.deinit();
-    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
-    try s.beginObject();
-    try s.objectField("process_id");
-    try s.write(process_id);
-    try s.objectField("outcome");
-    try s.write(outcome);
-    try s.objectField("timed_out");
-    try s.write(timed_out);
-    try s.objectField("elapsed_ms");
-    try s.write(elapsed_ms);
-    try s.objectField("process");
-    if (snapshot) |value| try writeJsonValue(&s, value) else try s.write(null);
-    try s.endObject();
-    return try writer.toOwnedSlice();
+fn workspaceProcessResponseOk(root: std.json.Value) bool {
+    return workspace_process_poll.responseOk(root);
 }
 
 fn mcpToolResponseWithNameAlloc(allocator: std.mem.Allocator, text: []const u8, tool_name: []const u8) ![]u8 {
@@ -7851,7 +7800,7 @@ fn collectLayoutSessionRefs(
             const session_id = if (raw_session_id) |id|
                 try allocator.dupe(u8, id)
             else
-                try sessionizer.stableSessionId(allocator, project_id, dock_id, pane_id);
+                try daemon_client.stableSessionId(allocator, project_id, dock_id, pane_id);
             const label = jsonString(node.object.get("launch_label") orelse .null) orelse tab_title;
             const revive_policy = jsonString(node.object.get("revive_policy") orelse .null) orelse "attach_or_create";
             try sessions.append(allocator, .{
@@ -8064,7 +8013,7 @@ test "CLI production state readers honor session daemon store override" {
         }} });
     }
 
-    const env_name = sessionizer.SESSION_DAEMON_STORE_DIR_ENV_NAME;
+    const env_name = daemon_client.SESSION_DAEMON_STORE_DIR_ENV_NAME;
     // The configured Zig test runner is serial; still restore the process-wide
     // override on every exit path before any later test can observe it.
     const previous_override = try CliTestProcessEnv.getAlloc(allocator, env_name);
@@ -9080,7 +9029,7 @@ test "daemon-first chat validation requires canonical identity and setting types
 }
 
 test "stale GUI validation falls back only for unsupported methods" {
-    try std.testing.expectEqual(@as(u32, 25), sessionizer.PROTOCOL_VERSION);
+    try std.testing.expectEqual(@as(u32, 28), daemon_client.PROTOCOL_VERSION);
     const allocator = std.testing.allocator;
     const cases = [_]struct { payload: []const u8, expected: ChatOpenValidationRoute }{
         .{

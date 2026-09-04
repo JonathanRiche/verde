@@ -11,7 +11,6 @@ const app_config = @import("app/config.zig");
 const browser_runtime = @import("browser/mod.zig");
 const browser_texture = @import("browser/texture.zig");
 const chat_threads = @import("chat/threads.zig");
-const cli = @import("cli/main.zig");
 const live_ipc = @import("ipc/server.zig");
 const loop_wakeup = @import("loop_wakeup");
 const keybinds = @import("app/keybinds.zig");
@@ -233,11 +232,6 @@ fn mainInner(init: std.process.Init) !void {
         debug_allocator.allocator()
     else
         std.heap.smp_allocator;
-
-    switch (try cli.dispatch(allocator, init.io, init.minimal.args)) {
-        .handled => return,
-        .launch_app => {},
-    }
 
     if (builtin.os.tag == .windows and !windows_integrations.setProcessAppUserModelId()) {
         log.warn("failed to set Windows application identity to {s}", .{windows_integrations.app_user_model_id});
@@ -3652,51 +3646,4 @@ fn reloadApplication(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig)
     state.app_config_file_mtime = app_config.configFileMtime(state.allocator) catch state.app_config_file_mtime;
     applyAppConfigRuntime(state);
     state.setSidebarNotice("Config, keybinds, and theme refreshed.");
-}
-
-test {
-    _ = @import("browser/screenshot.zig");
-    _ = @import("ipc/server.zig");
-    _ = @import("platform/mod.zig");
-    _ = @import("platform/workspace_identity.zig");
-    _ = @import("runtime/gateway_transport.zig");
-    _ = @import("runtime/connection.zig");
-    _ = @import("runtime/pair_client.zig");
-    _ = @import("runtime/credential_store.zig");
-    _ = @import("runtime/connect_client.zig");
-    _ = @import("runtime/profile.zig");
-    _ = @import("runtime/profile_store.zig");
-    _ = @import("runtime/secret_store.zig");
-    _ = @import("runtime/ssh_tunnel.zig");
-    _ = @import("runtime/ssh_tunnel_supervisor.zig");
-    _ = @import("runtime/thread_binding.zig");
-    _ = @import("state/browser_controller.zig");
-    _ = @import("state/muse_tui.zig");
-    _ = @import("state/runtime_connections_controller.zig");
-    _ = @import("state/workspace_layout.zig");
-    _ = @import("state/workspace_tabs.zig");
-    _ = @import("providers/acp.zig");
-    _ = @import("providers/claude.zig");
-    _ = @import("providers/cursor.zig");
-    _ = @import("providers/diagnostics.zig");
-    _ = @import("providers/fx.zig");
-    _ = @import("providers/grok.zig");
-    _ = @import("providers/muse.zig");
-    _ = @import("providers/opencode.zig");
-    _ = @import("providers/pi.zig");
-    _ = @import("providers/mcp.zig");
-    _ = @import("chat/slash_commands.zig");
-    _ = @import("theme/coverage_test.zig");
-    _ = @import("app/update_installer.zig");
-    _ = @import("app/updater.zig");
-    _ = @import("ui/command_palette.zig");
-    _ = @import("ui/companion.zig");
-    _ = @import("ui/diff_view_cache.zig");
-    _ = @import("ui/handoff_sheet.zig");
-    _ = @import("state/handoff_controller.zig");
-    _ = @import("ui/workspace_strip.zig");
-    _ = @import("compile_tests/windows_conpty.zig");
-    _ = @import("daemon/change_journal.zig");
-    _ = @import("daemon/process_registry.zig");
-    _ = @import("daemon/store.zig");
 }

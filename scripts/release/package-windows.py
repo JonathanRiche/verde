@@ -259,7 +259,7 @@ def verify_fff_runtime(path: Path) -> None:
 
 
 def verify_package_tree(root: Path, expected_version: str) -> dict[str, object]:
-    expected_executables = {"app/Verde.exe", "bin/verde.exe"}
+    expected_executables = {"app/Verde.exe", "bin/verde.exe", "bin/verde-daemon.exe"}
     expected_dlls = {
         f"{directory}/{name}" for directory in ("app", "bin") for name in RUNTIME_DLLS
     }
@@ -338,6 +338,10 @@ def verify_package_tree(root: Path, expected_version: str) -> dict[str, object]:
         root / "bin" / "verde.exe", expected_subsystem=3, expected_version=expected_version
     )
     cli_evidence["path"] = "bin/verde.exe"
+    daemon_evidence = verify_executable(
+        root / "bin" / "verde-daemon.exe", expected_subsystem=3, expected_version=expected_version
+    )
+    daemon_evidence["path"] = "bin/verde-daemon.exe"
     return {
         "schema_version": 1,
         "target": "x86_64-windows-gnu",
@@ -354,17 +358,18 @@ def verify_package_tree(root: Path, expected_version: str) -> dict[str, object]:
         "installer_identity_verified": True,
         "shortcut_runtime_verified": False,
         "fff_stub_rejected": True,
-        "executables": [app_evidence, cli_evidence],
+        "executables": [app_evidence, cli_evidence, daemon_evidence],
         "dlls": sorted(expected_dlls),
     }
 
 
 def copy_package_payload(prefix: Path, dependency_root: Path, package_root: Path) -> None:
-    copy_required(prefix / "bin" / "Verde.exe", package_root / "app" / "Verde.exe")
-    copy_required(prefix / "bin" / "cli" / "verde.exe", package_root / "bin" / "verde.exe")
+    copy_required(prefix / "bin" / "verde-gui.exe", package_root / "app" / "Verde.exe")
+    copy_required(prefix / "bin" / "verde.exe", package_root / "bin" / "verde.exe")
+    copy_required(prefix / "bin" / "verde-daemon.exe", package_root / "bin" / "verde-daemon.exe")
     for name in RUNTIME_DLLS:
         copy_required(prefix / "bin" / name, package_root / "app" / name)
-        copy_required(prefix / "bin" / "cli" / name, package_root / "bin" / name)
+        copy_required(prefix / "bin" / name, package_root / "bin" / name)
     copy_required(
         prefix / "share" / "verde" / "provider_bridge.mjs",
         package_root / "share" / "verde" / "provider_bridge.mjs",

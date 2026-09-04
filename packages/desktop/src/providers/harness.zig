@@ -1,7 +1,7 @@
 //! Shared AI harness interface for native provider integrations.
 
 const std = @import("std");
-pub const types = @import("types.zig");
+pub const types = @import("headless").provider_types;
 const opencode = @import("opencode.zig");
 const codex = @import("codex.zig");
 const claude = @import("claude.zig");

@@ -1,26 +1,27 @@
-//! Native state database ownership and legacy JSON loading.
+//! Daemon-backed native state persistence and bounded offline spooling.
 //!
-//! After the M3 Phase 3 authority flip, production mutations go through the
-//! session daemon (`state.snapshot.replace` and granular store methods). The
-//! local SQLite handle is read-only for bulk startup/offline projection and
-//! never runs schema initialization or writes.
+//! Production reads and writes use typed daemon RPC. SQLite imports are
+//! test-only so the GUI artifact does not compile or link the database.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const sdl = @import("zsdl3");
 const headless = @import("headless");
-const db_client = @import("../db/client.zig");
+const db_client = if (builtin.is_test) @import("root").test_backend.db_client else struct {};
 const db_types = @import("../db/types.zig");
-const sessionizer = @import("../terminal/sessionizer.zig");
+const daemon_client = @import("../daemon/client.zig");
 const runtime_log = @import("../runtime/log.zig");
 const platform_runtime = @import("platform_runtime");
 const persistence = @import("persistence.zig");
+const protocol_projection = @import("protocol_projection.zig");
+const test_backend = if (builtin.is_test) @import("root").test_backend else struct {};
 
 const ORG_NAME: [:0]const u8 = "verde";
 const APP_NAME: [:0]const u8 = "Native";
 pub const LEGACY_STATE_FILE_NAME = "state.json";
 pub const PENDING_STATE_SPOOL_FILE_NAME = "pending-state-spool.json";
 const PENDING_STATE_SPOOL_TEMP_FILE_NAME = "pending-state-spool.json.tmp";
+const PENDING_STATE_SPOOL_MAX_BYTES: usize = 8 * 1024 * 1024;
 const SNAPSHOT_REQUEST_HEADROOM_BYTES: usize = 64 * 1024;
 /// Focus acknowledgements are best-effort UI bookkeeping and must never own
 /// more than a short background transport window.
@@ -171,15 +172,15 @@ pub const Storage = struct {
     allocator: std.mem.Allocator,
     pref_path: []const u8,
     projection_store_dir: []const u8,
-    /// Read-only projection handle; null when no DB exists yet.
-    client: ?db_client.Client = null,
+    /// Test-only compatibility handle for hermetic SQLite fixtures.
+    client: if (builtin.is_test) ?db_client.Client else void = if (builtin.is_test) null else {},
     store_session: *StoreSession,
 
     pub fn init(allocator: std.mem.Allocator) !Storage {
         const pref_path = sdl.getPrefPath(ORG_NAME, APP_NAME) orelse return error.SdlError;
         const owned_pref_path = try allocator.dupe(u8, pref_path);
         errdefer allocator.free(owned_pref_path);
-        const effective_dir = try sessionizer.effectiveStoreDirectory(allocator, owned_pref_path);
+        const effective_dir = try daemon_client.effectiveStoreDirectory(allocator, owned_pref_path);
         errdefer allocator.free(effective_dir.path);
         return initOwnedPaths(allocator, owned_pref_path, effective_dir.path);
     }
@@ -188,7 +189,7 @@ pub const Storage = struct {
     pub fn initWithPrefPath(allocator: std.mem.Allocator, pref_path: []const u8) !Storage {
         const owned_pref_path = try allocator.dupe(u8, pref_path);
         errdefer allocator.free(owned_pref_path);
-        const effective_dir = try sessionizer.effectiveStoreDirectory(allocator, owned_pref_path);
+        const effective_dir = try daemon_client.effectiveStoreDirectory(allocator, owned_pref_path);
         errdefer allocator.free(effective_dir.path);
         return initOwnedPaths(allocator, owned_pref_path, effective_dir.path);
     }
@@ -206,7 +207,9 @@ pub const Storage = struct {
         errdefer allocator.destroy(store_session);
         store_session.* = .{};
 
-        const client = try openReadOnlyOptional(allocator, owned_projection_store_dir);
+        const client = if (builtin.is_test)
+            try openReadOnlyOptional(allocator, owned_projection_store_dir)
+        else {};
         return .{
             .allocator = allocator,
             .pref_path = owned_pref_path,
@@ -219,7 +222,7 @@ pub const Storage = struct {
     pub fn deinit(self: *Storage) void {
         // Best-effort unregister so long-lived daemons do not accumulate orphans (NIT-4).
         self.unregisterStoreClientBestEffort();
-        if (self.client) |*client| client.deinit();
+        if (builtin.is_test) if (self.client) |*client| client.deinit();
         self.store_session.deinit(self.allocator);
         self.allocator.destroy(self.store_session);
         self.allocator.free(self.projection_store_dir);
@@ -227,22 +230,23 @@ pub const Storage = struct {
     }
 
     pub fn load(self: *const Storage, allocator: std.mem.Allocator) !?LoadedPersistedState {
-        if (self.client) |*client| {
-            if (try client.loadBounded(allocator)) |loaded| {
-                // Pin the durable revision observed in the same RO transaction so
-                // launch-2 does not resend a guard-less bootstrap against a non-empty store.
-                self.noteStoreRevision(loaded.store_revision);
-                self.noteProjectionObservedRevision(loaded.store_revision);
-                return loaded;
+        if (builtin.is_test) {
+            if (self.client) |*client| {
+                if (try client.loadBounded(allocator)) |loaded| {
+                    self.noteStoreRevision(loaded.store_revision);
+                    self.noteProjectionObservedRevision(loaded.store_revision);
+                    return loaded;
+                }
+                self.noteStoreRevision(client.storeRevision() catch 0);
+                self.noteProjectionObservedRevision(self.currentStoreRevision());
+            } else {
+                self.noteStoreRevision(0);
+                self.noteProjectionObservedRevision(0);
             }
-            // DB exists but has no app snapshot (e.g. CLI-notify-only history):
-            // still pin the real revision so the first flush is guarded.
-            self.noteStoreRevision(client.storeRevision() catch 0);
-            self.noteProjectionObservedRevision(self.currentStoreRevision());
         } else {
-            // No DB yet: revision 0 is known; first write may bootstrap or use expected=0.
-            self.noteStoreRevision(0);
-            self.noteProjectionObservedRevision(0);
+            var loaded = try self.loadDaemonProjection(allocator);
+            if (loaded.store_revision != 0 or loaded.value.projects.len != 0) return loaded;
+            loaded.deinit();
         }
         if (try self.loadLegacyJson(allocator)) |loaded| {
             errdefer {
@@ -254,27 +258,14 @@ pub const Storage = struct {
             // the daemon's conflict check stays meaningful.
             const use_bootstrap = self.currentStoreRevision() == 0;
             try self.replaceSnapshot(loaded.value, use_bootstrap, self.currentProjectionObservedRevision());
-            try self.reopenReadOnly();
             return loaded;
         }
         return null;
     }
 
-    /// Read the current durable projection through an independent RO
-    /// connection. Composite attach uses this after obtaining the daemon's
-    /// cursor and volatile scopes, avoiding a full-store JSON response while
-    /// retaining a revision paired with the SQLite read transaction.
+    /// Read the current bounded durable projection from the daemon.
     pub fn loadProjection(self: *const Storage, allocator: std.mem.Allocator) !LoadedPersistedState {
-        var client = (try openReadOnlyOptional(allocator, self.projection_store_dir)) orelse {
-            var empty = LoadedPersistedState.init(allocator);
-            empty.store_revision = 0;
-            return empty;
-        };
-        defer client.deinit();
-        if (try client.loadBounded(allocator)) |loaded| return loaded;
-        var empty = LoadedPersistedState.init(allocator);
-        empty.store_revision = try client.storeRevision();
-        return empty;
+        return self.loadDaemonProjection(allocator);
     }
 
     pub fn loadMessagePage(
@@ -285,10 +276,46 @@ pub const Storage = struct {
         before_offset: usize,
         limit: usize,
     ) !db_types.LoadedMessagePage {
-        var client = (try openReadOnlyOptional(allocator, self.projection_store_dir)) orelse
-            return error.DatabaseUnavailable;
-        defer client.deinit();
-        return client.loadMessagePage(allocator, workspace_id, local_thread_id, before_offset, limit);
+        var page = db_types.LoadedMessagePage{
+            .arena = std.heap.ArenaAllocator.init(allocator),
+            .offset = 0,
+            .messages = &.{},
+        };
+        errdefer page.deinit();
+        const a = page.arena.allocator();
+        var transport: daemon_client.HeadlessTransport = .{ .allocator = a, .pref_path = self.pref_path };
+        var client = daemon_client.headlessClient(a, &transport);
+        const request: headless.store.MessageListRequest = .{
+            .workspace_id = workspace_id,
+            .local_thread_id = local_thread_id,
+            .direction = "backward",
+            .limit = @intCast(@min(limit, headless.store.MAX_PAGE_ITEMS)),
+            .before_offset = before_offset,
+        };
+        var parsed = try client.call(headless.store.METHOD_CHAT_MESSAGE_LIST, request);
+        defer parsed.deinit();
+        const result = try client.decodeMessageList(&parsed);
+        page.messages = try protocol_projection.messagesToPersisted(a, result.messages);
+        page.offset = if (result.messages.len == 0) 0 else result.messages[0].sort_index;
+        self.noteStoreRevision(result.store_revision);
+        return page;
+    }
+
+    fn loadDaemonProjection(self: *const Storage, allocator: std.mem.Allocator) !LoadedPersistedState {
+        try self.ensureDaemon();
+        var loaded = LoadedPersistedState.init(allocator);
+        errdefer loaded.deinit();
+        const a = loaded.allocator();
+        var transport: daemon_client.HeadlessTransport = .{ .allocator = a, .pref_path = self.pref_path };
+        var client = daemon_client.headlessClient(a, &transport);
+        var parsed = try client.call(headless.store.METHOD_CORE_SNAPSHOT, headless.store.CoreSnapshotRequest{});
+        defer parsed.deinit();
+        const result = try client.decodeCompositeSnapshot(&parsed);
+        loaded.value = try protocol_projection.snapshotToPersisted(a, result.snapshot);
+        loaded.store_revision = result.store_revision;
+        self.noteStoreRevision(result.store_revision);
+        self.noteProjectionObservedRevision(result.store_revision);
+        return loaded;
     }
 
     pub fn loadLegacyJson(self: *const Storage, allocator: std.mem.Allocator) !?LoadedPersistedState {
@@ -322,7 +349,7 @@ pub const Storage = struct {
             threaded.io(),
             PENDING_STATE_SPOOL_FILE_NAME,
             allocator,
-            .unlimited,
+            .limited(PENDING_STATE_SPOOL_MAX_BYTES),
         ) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
@@ -340,6 +367,10 @@ pub const Storage = struct {
 
     /// Atomically replace and fsync the close-time spool before state teardown.
     pub fn writePendingStateSpool(self: *const Storage, spool: PendingStateSpool) !void {
+        var counter: std.Io.Writer.Discarding = .init(&.{});
+        try std.json.Stringify.value(spool, .{ .whitespace = .minified }, &counter.writer);
+        if (counter.fullCount() > PENDING_STATE_SPOOL_MAX_BYTES) return error.PendingStateSpoolTooLarge;
+
         var threaded: std.Io.Threaded = .init(self.allocator, .{});
         defer threaded.deinit();
         // Directory fsync cannot operate on Linux O_PATH handles; iteration
@@ -351,9 +382,7 @@ pub const Storage = struct {
         var file = try dir.createFile(threaded.io(), PENDING_STATE_SPOOL_TEMP_FILE_NAME, .{ .truncate = true });
         var file_open = true;
         defer if (file_open) file.close(threaded.io());
-        // Stream directly to disk: close-state projections can be hundreds of
-        // MiB, and allocating a second encoded copy made shutdown scale with a
-        // fixed replay ceiling instead of the user's actual durable state.
+        // Stream the preflight-bounded payload directly to disk.
         var write_buffer: [64 * 1024]u8 = undefined;
         var writer = file.writer(threaded.io(), &write_buffer);
         try std.json.Stringify.value(spool, .{ .whitespace = .minified }, &writer.interface);
@@ -603,14 +632,27 @@ pub const Storage = struct {
     };
 
     fn observeSurfaceCompletion(self: *const Storage, acknowledged: PersistedSurfaceState) !SurfaceCompletionObservation {
-        var client = (try openReadOnlyOptional(self.allocator, self.projection_store_dir)) orelse return error.SessionDaemonUnavailable;
-        defer client.deinit();
-        // Revision must be read first. A replacement after this read either is
-        // seen by the identity query or makes the guarded clear conflict.
-        const revision = try client.storeRevision();
-        const matches = acknowledged.status == .done and try client.surfaceStateMatches(acknowledged);
-        self.noteStoreRevision(revision);
-        return .{ .store_revision = revision, .matches = matches };
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var transport: daemon_client.HeadlessTransport = .{
+            .allocator = a,
+            .pref_path = self.pref_path,
+            .timeout_ms = ACKNOWLEDGEMENT_TIMEOUT_MS,
+        };
+        var client = daemon_client.headlessClient(a, &transport);
+        const surface = try persistence.surfaceToProtocol(a, acknowledged);
+        var parsed = try client.call(
+            headless.store.METHOD_SURFACE_COMPLETION_OBSERVE,
+            headless.store.SurfaceCompletionObserveRequest{ .surface = surface },
+        );
+        defer parsed.deinit();
+        const result = try client.decodeSurfaceCompletionObserve(&parsed);
+        self.noteStoreRevision(result.store_revision);
+        return .{
+            .store_revision = result.store_revision,
+            .matches = acknowledged.status == .done and result.matches,
+        };
     }
 
     pub fn clearSurfaceState(self: *const Storage, session_id: []const u8) !bool {
@@ -696,18 +738,15 @@ pub const Storage = struct {
         proof: SurfaceCommitProof,
         surface: headless.store.SurfaceState,
     ) !SurfaceCommitProofClassification {
-        const persisted = protocolSurfaceToPersisted(surface) orelse return .invalid;
         const fingerprint = try headless.store.encode(self.allocator, surface);
         defer self.allocator.free(fingerprint);
-        var client = (try openReadOnlyOptional(self.allocator, self.projection_store_dir)) orelse return .invalid;
-        defer client.deinit();
-        if (!try client.committedReceiptMatches(
-            proof.request_key,
-            headless.store.METHOD_SURFACE_UPSERT,
-            fingerprint,
-            proof.store_revision,
-        )) return .invalid;
-        return if (try client.surfaceStateMatches(persisted)) .current else .superseded;
+        return self.classifySurfaceCommitProof(.{
+            .request_key = proof.request_key,
+            .operation = headless.store.METHOD_SURFACE_UPSERT,
+            .fingerprint = fingerprint,
+            .store_revision = proof.store_revision,
+            .surface = surface,
+        });
     }
 
     pub fn classifySurfaceClearCommitProof(
@@ -720,15 +759,31 @@ pub const Storage = struct {
             .workspace_id = @as(?[]const u8, null),
         });
         defer self.allocator.free(fingerprint);
-        var client = (try openReadOnlyOptional(self.allocator, self.projection_store_dir)) orelse return .invalid;
-        defer client.deinit();
-        if (!try client.committedReceiptMatches(
-            proof.request_key,
-            headless.store.METHOD_SURFACE_CLEAR,
-            fingerprint,
-            proof.store_revision,
-        )) return .invalid;
-        return if (try client.surfaceStateAbsent(session_id)) .current else .superseded;
+        return self.classifySurfaceCommitProof(.{
+            .request_key = proof.request_key,
+            .operation = headless.store.METHOD_SURFACE_CLEAR,
+            .fingerprint = fingerprint,
+            .store_revision = proof.store_revision,
+            .cleared_session_id = session_id,
+        });
+    }
+
+    fn classifySurfaceCommitProof(
+        self: *const Storage,
+        request: headless.store.SurfaceCommitProofClassifyRequest,
+    ) !SurfaceCommitProofClassification {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        var transport: daemon_client.HeadlessTransport = .{
+            .allocator = arena.allocator(),
+            .pref_path = self.pref_path,
+            .timeout_ms = ACKNOWLEDGEMENT_TIMEOUT_MS,
+        };
+        var client = daemon_client.headlessClient(arena.allocator(), &transport);
+        var parsed = try client.call(headless.store.METHOD_SURFACE_COMMIT_PROOF_CLASSIFY, request);
+        defer parsed.deinit();
+        const result = try client.decodeSurfaceCommitProofClassify(&parsed);
+        return std.meta.stringToEnum(SurfaceCommitProofClassification, result.classification) orelse .invalid;
     }
 
     pub fn isPersistenceAvailable(self: *const Storage) bool {
@@ -819,32 +874,17 @@ pub const Storage = struct {
         }
     }
 
-    /// Refresh durable revision from the RO projection or daemon.storeStatus.
+    /// Refresh durable revision from daemon.storeStatus.
     pub fn refreshStoreRevision(self: *const Storage) !u64 {
-        // Prefer a fresh RO open of the local projection (no daemon required).
-        // The purpose-built revision read avoids loading the full projection
-        // on the conflict path and also covers projection-less DBs.
-        if (openReadOnlyOptional(self.allocator, self.projection_store_dir)) |maybe_client| {
-            if (maybe_client) |client_owned| {
-                var client = client_owned;
-                defer client.deinit();
-                if (client.storeRevision()) |revision| {
-                    self.noteStoreRevision(revision);
-                    return revision;
-                } else |_| {}
-            }
-        } else |_| {}
-
-        // Fall back to daemon.storeStatus when the RO path cannot pin a revision.
         try self.ensureDaemon();
         var decode_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer decode_arena.deinit();
-        var transport: sessionizer.HeadlessTransport = .{
+        var transport: daemon_client.HeadlessTransport = .{
             .allocator = decode_arena.allocator(),
             .pref_path = self.pref_path,
             .timeout_ms = CLIENT_CLOSE_TIMEOUT_MS,
         };
-        var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+        var client = daemon_client.headlessClient(decode_arena.allocator(), &transport);
         const empty_params: struct {} = .{};
         var parsed = client.call(headless.store.METHOD_DAEMON_STORE_STATUS, empty_params) catch |err| {
             self.markPersistenceUnavailable();
@@ -861,25 +901,14 @@ pub const Storage = struct {
     }
 
     fn refreshStoreRevisionFromExistingDaemon(self: *const Storage, timeout_ms: u32) !u64 {
-        if (openReadOnlyOptional(self.allocator, self.projection_store_dir)) |maybe_client| {
-            if (maybe_client) |client_owned| {
-                var client = client_owned;
-                defer client.deinit();
-                if (client.storeRevision()) |revision| {
-                    self.noteStoreRevision(revision);
-                    return revision;
-                } else |_| {}
-            }
-        } else |_| {}
-
         var decode_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer decode_arena.deinit();
-        var transport: sessionizer.HeadlessTransport = .{
+        var transport: daemon_client.HeadlessTransport = .{
             .allocator = decode_arena.allocator(),
             .pref_path = self.pref_path,
             .timeout_ms = timeout_ms,
         };
-        var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+        var client = daemon_client.headlessClient(decode_arena.allocator(), &transport);
         const empty_params: struct {} = .{};
         var parsed = client.call(headless.store.METHOD_DAEMON_STORE_STATUS, empty_params) catch |err| {
             self.markPersistenceUnavailable();
@@ -1191,7 +1220,7 @@ pub const Storage = struct {
         defer threaded.deinit();
         const exe_path = try std.process.executablePathAlloc(threaded.io(), self.allocator);
         defer self.allocator.free(exe_path);
-        sessionizer.ensureDaemon(self.allocator, self.pref_path, exe_path) catch |err| {
+        daemon_client.ensureDaemon(self.allocator, self.pref_path, exe_path) catch |err| {
             log.warn("session daemon readiness probe failed: {s}", .{@errorName(err)});
             runtime_log.diagnostic(
                 "persistence daemon readiness failure error={s}",
@@ -1223,12 +1252,12 @@ pub const Storage = struct {
 
         var decode_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer decode_arena.deinit();
-        var transport: sessionizer.HeadlessTransport = .{
+        var transport: daemon_client.HeadlessTransport = .{
             .allocator = decode_arena.allocator(),
             .pref_path = self.pref_path,
             .timeout_ms = timeout_ms orelse 5_000,
         };
-        var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+        var client = daemon_client.headlessClient(decode_arena.allocator(), &transport);
         var registered = client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = true }) catch |err| {
             log.warn("session daemon client registration transport failed: {s}", .{@errorName(err)});
             runtime_log.diagnostic(
@@ -1275,11 +1304,11 @@ pub const Storage = struct {
 
         var decode_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer decode_arena.deinit();
-        var transport: sessionizer.HeadlessTransport = .{
+        var transport: daemon_client.HeadlessTransport = .{
             .allocator = decode_arena.allocator(),
             .pref_path = self.pref_path,
         };
-        var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+        var client = daemon_client.headlessClient(decode_arena.allocator(), &transport);
         var closed = client.call(headless.registry.METHOD_DAEMON_CLIENT_CLOSE, .{ .client_id = id_copy }) catch return;
         defer closed.deinit();
         // Tolerate failure silently (daemon already gone, etc.).
@@ -1386,12 +1415,12 @@ pub const Storage = struct {
 
         var decode_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer decode_arena.deinit();
-        var transport: sessionizer.HeadlessTransport = .{
+        var transport: daemon_client.HeadlessTransport = .{
             .allocator = decode_arena.allocator(),
             .pref_path = self.pref_path,
             .timeout_ms = timeout_ms,
         };
-        var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+        var client = daemon_client.headlessClient(decode_arena.allocator(), &transport);
         var parsed = client.call(method, params) catch |err| {
             log.warn("store mutation {s} transport failed: {s}", .{ method, @errorName(err) });
             runtime_log.diagnostic(
@@ -1454,12 +1483,14 @@ pub const Storage = struct {
     }
 
     fn reopenReadOnly(self: *const Storage) !void {
-        const mutable: *Storage = @constCast(self);
-        if (mutable.client) |*client| {
-            client.deinit();
-            mutable.client = null;
+        if (builtin.is_test) {
+            const mutable: *Storage = @constCast(self);
+            if (mutable.client) |*client| {
+                client.deinit();
+                mutable.client = null;
+            }
+            mutable.client = openReadOnlyOptional(self.allocator, self.projection_store_dir) catch |err| return err;
         }
-        mutable.client = openReadOnlyOptional(self.allocator, self.projection_store_dir) catch |err| return err;
     }
 };
 
@@ -1489,8 +1520,7 @@ test "RO load pins store_revision from store_state for launch-2 guard" {
     defer std.testing.allocator.free(db_path);
 
     {
-        const store = @import("../daemon/store.zig");
-        var writer = try store.Store.init(std.testing.allocator, db_path);
+        var writer = try test_backend.daemon_store.Store.init(std.testing.allocator, db_path);
         defer writer.deinit();
         const result = try writer.applyMutation(.{
             .workspace_upsert = .{
@@ -1539,8 +1569,7 @@ test "projection load uses an independent coherent RO transaction" {
         try writer.save(.{ .projects = &projects });
     }
     {
-        const store = @import("../daemon/store.zig");
-        var writer = try store.Store.init(std.testing.allocator, db_path);
+        var writer = try test_backend.daemon_store.Store.init(std.testing.allocator, db_path);
         defer writer.deinit();
         const result = try writer.applyMutation(.{
             .workspace_upsert = .{
@@ -1605,8 +1634,7 @@ test "effective projection store is independent from pref artifacts" {
         try writer.save(.{ .projects = &projects });
     }
     {
-        const store = @import("../daemon/store.zig");
-        var writer = try store.Store.init(allocator, db_path);
+        var writer = try test_backend.daemon_store.Store.init(allocator, db_path);
         defer writer.deinit();
         _ = try writer.applyMutation(.{ .workspace_upsert = .{
             .mutation = .{ .request_key = "override-workspace", .client_id = "test-client" },

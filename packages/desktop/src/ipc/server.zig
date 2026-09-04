@@ -16,6 +16,8 @@ const live_endpoint = @import("../platform/live_endpoint.zig");
 const platform_runtime = @import("platform_runtime");
 const provider_types = @import("../providers/types.zig");
 const terminal = @import("../terminal/terminal.zig");
+const workspace_process_poll = @import("../cli/workspace_process_poll.zig");
+const test_backend = if (builtin.is_test) @import("root").test_backend else struct {};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const SOCKET_NAME = live_endpoint.SOCKET_NAME;
@@ -4331,7 +4333,7 @@ test "terminal lifecycle reaches workspace processes with the exact final wait i
     try std.testing.expectEqual(@as(i64, 17), jsonInt(result.get("exit_code").?).?);
     const wait_responses = [_][]const u8{ active_response, final_response };
     var wait_transport: TestWorkspaceProcessesTransport = .{ .responses = &wait_responses };
-    const wait_result = try @import("../cli/main.zig").waitForWorkspaceProcessWithTransportAlloc(
+    const wait_result = try workspace_process_poll.waitAlloc(
         allocator,
         std.testing.io,
         null,
@@ -4411,8 +4413,8 @@ test "stopped unconfirmed terminal remains waitable through disappearance grace"
     const pending_process = workspaceProcessObjectById(pending_processes, process_id) orelse return error.MissingPendingTerminalProcess;
     try std.testing.expectEqualStrings("stopping", jsonString(pending_process.get("status").?).?);
     try std.testing.expectEqual(
-        @import("../cli/main.zig").WorkspaceProcessPollOutcome.active,
-        @import("../cli/main.zig").workspaceProcessPoll(pending.value, process_id).outcome,
+        workspace_process_poll.Outcome.active,
+        workspace_process_poll.poll(pending.value, process_id).outcome,
     );
 
     try std.Io.sleep(
@@ -4434,13 +4436,13 @@ test "stopped unconfirmed terminal remains waitable through disappearance grace"
     const final_process = workspaceProcessObjectById(final_processes, process_id) orelse return error.MissingRetainedTerminalProcess;
     try std.testing.expectEqualStrings("unknown", jsonString(final_process.get("status").?).?);
     try std.testing.expectEqual(
-        @import("../cli/main.zig").WorkspaceProcessPollOutcome.completed,
-        @import("../cli/main.zig").workspaceProcessPoll(final.value, process_id).outcome,
+        workspace_process_poll.Outcome.completed,
+        workspace_process_poll.poll(final.value, process_id).outcome,
     );
 
     const wait_responses = [_][]const u8{ pending_response, final_response };
     var wait_transport: TestWorkspaceProcessesTransport = .{ .responses = &wait_responses };
-    const wait_result = try @import("../cli/main.zig").waitForWorkspaceProcessWithTransportAlloc(
+    const wait_result = try workspace_process_poll.waitAlloc(
         allocator,
         std.testing.io,
         null,
@@ -4519,8 +4521,8 @@ test "terminal lifecycle preserves an observed signal in workspace processes" {
     const result = workspaceProcessObjectById(processes, active_id) orelse return error.MissingRetainedTerminalProcess;
     try std.testing.expectEqualStrings("crashed", jsonString(result.get("status").?).?);
     try std.testing.expectEqual(@as(i64, 15), jsonInt(result.get("signal").?).?);
-    const wait_poll = @import("../cli/main.zig").workspaceProcessPoll(parsed.value, active_id);
-    try std.testing.expectEqual(@import("../cli/main.zig").WorkspaceProcessPollOutcome.completed, wait_poll.outcome);
+    const wait_poll = workspace_process_poll.poll(parsed.value, active_id);
+    try std.testing.expectEqual(workspace_process_poll.Outcome.completed, wait_poll.outcome);
 }
 
 test "terminal duplicate generations remain unambiguous and unknown exits never report success" {
@@ -4594,7 +4596,7 @@ test "terminal duplicate generations remain unambiguous and unknown exits never 
     const active_response = second_generation_active_response orelse return error.MissingActiveWorkspaceProcesses;
     const old_generation_responses = [_][]const u8{active_response};
     var old_generation_transport: TestWorkspaceProcessesTransport = .{ .responses = &old_generation_responses };
-    const old_generation_wait = try @import("../cli/main.zig").waitForWorkspaceProcessWithTransportAlloc(
+    const old_generation_wait = try workspace_process_poll.waitAlloc(
         allocator,
         std.testing.io,
         null,
@@ -4614,7 +4616,7 @@ test "terminal duplicate generations remain unambiguous and unknown exits never 
 
     const current_generation_responses = [_][]const u8{ active_response, final_response };
     var current_generation_transport: TestWorkspaceProcessesTransport = .{ .responses = &current_generation_responses };
-    const current_generation_wait = try @import("../cli/main.zig").waitForWorkspaceProcessWithTransportAlloc(
+    const current_generation_wait = try workspace_process_poll.waitAlloc(
         allocator,
         std.testing.io,
         null,
@@ -4634,8 +4636,8 @@ test "terminal duplicate generations remain unambiguous and unknown exits never 
     const separator = std.mem.lastIndexOfScalar(u8, generation_ids[0], ':') orelse return error.InvalidTerminalProcessId;
     const replaced_id = try std.fmt.allocPrint(allocator, "{s}0", .{generation_ids[0][0 .. separator + 1]});
     defer allocator.free(replaced_id);
-    const replaced_poll = @import("../cli/main.zig").workspaceProcessPoll(parsed.value, replaced_id);
-    try std.testing.expectEqual(@import("../cli/main.zig").WorkspaceProcessPollOutcome.replaced, replaced_poll.outcome);
+    const replaced_poll = workspace_process_poll.poll(parsed.value, replaced_id);
+    try std.testing.expectEqual(workspace_process_poll.Outcome.replaced, replaced_poll.outcome);
 }
 
 fn writeWorkspaceProcessesTestResponse(
@@ -4881,8 +4883,8 @@ test "terminal key command rejects non-terminal targets and invalid keys" {
 
 test "pane close response matches the next durable projection" {
     const allocator = std.testing.allocator;
-    const daemon_store = @import("../daemon/store.zig");
-    const db_client = @import("../db/client.zig");
+    const daemon_store = test_backend.daemon_store;
+    const db_client = test_backend.db_client;
     const persistence = @import("../state/persistence.zig");
 
     var state: app_state.AppState = undefined;
@@ -4966,8 +4968,8 @@ test "pane close response matches the next durable projection" {
 
 test "surface receipt proof is current while superseded delivery is inert" {
     const allocator = std.testing.allocator;
-    const daemon_store = @import("../daemon/store.zig");
-    const db_client = @import("../db/client.zig");
+    const daemon_store = test_backend.daemon_store;
+    const db_client = test_backend.db_client;
     const persistence = @import("../state/persistence.zig");
     const storage_mod = @import("../state/storage.zig");
 

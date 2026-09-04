@@ -1,9 +1,9 @@
 //! Shared storage types for SQLite-backed app persistence.
 
 const std = @import("std");
-const ai_harness = @import("../providers/harness.zig");
+const provider_types = @import("headless").provider_types;
 
-pub const ReasoningEffort = ai_harness.ReasoningEffort;
+pub const ReasoningEffort = provider_types.ReasoningEffort;
 
 pub const FastMode = enum(u8) {
     off,
@@ -191,8 +191,8 @@ pub const PersistedMessage = struct {
     /// legacy persisted states without the field decode cleanly.
     extra_images: []const PersistedImageAttachment = &.{},
     tool_call_id: ?[]const u8 = null,
-    tool_call_kind: ?ai_harness.ToolCallKind = null,
-    tool_call_status: ?ai_harness.ToolCallStatus = null,
+    tool_call_kind: ?provider_types.ToolCallKind = null,
+    tool_call_status: ?provider_types.ToolCallStatus = null,
     /// Durable transcript identity (M4-P4). Daemon-minted (`turn:{id}:msg:{n}`)
     /// or client-minted (`gui-msg:...`) ids ride the snapshot verbatim so the
     /// GUI flush never re-mints identities positionally. Null on legacy rows
