@@ -45,6 +45,16 @@ Run commands from the repository root.
 
 For speed, use `zig ast-check`, `mise run dev-build`, or the narrowest relevant test while iterating, but do not treat those focused checks as final verification. `dev-build` installs only the main desktop executable; it intentionally skips the standalone daemon, browser helper, provider bridge installation, runtime-payload copying, tests, and packaging checks. It must use the production LLVM backend: Zig 0.16's self-hosted x86 backend is known to miscompile this application and crash during startup. Every completed Zig change must still finish with `mise run build`. Do not run the aggregate desktop `zig build test` merely because a Zig file changed: it is a broad, comparatively slow suite and is required only when the change is cross-cutting, changes test/build infrastructure, or the user explicitly requests it. Prefer `zig build headless-test --release=safe -Dbrowser-backend=native_webview` for headless/core work and `zig build runtime-test --release=safe -Dbrowser-backend=native_webview` for remote-runtime work.
 
+## Module And Build-Graph Boundaries
+
+Put new production code in the lightest artifact that owns it. `verde-gui` may depend only on dependency-light protocol/data contracts and daemon client interfaces; it must never import concrete providers, daemon store/server implementations, SQLite/database implementations, CLI command roots, or test backends. `verde-daemon` owns provider execution, persistence, and session/server implementation. The public `verde` launcher/CLI must not import GUI or rendering code, and shared headless protocol/type modules must remain dependency-light.
+
+- Keep test-only backend imports in `desktop_test_root`, `test_backend`, or other test roots so they never enter production source fingerprints.
+- Avoid catch-all imports in `main.zig`, `state.zig`, and `utils.zig`; import the narrow owning interface instead.
+- Moving Zig files or modules alone does not create a compilation boundary. Build-speed splits require separate artifacts or a deliberate stable compiled ABI.
+- UI edits should rebuild only `verde-gui`; provider or daemon edits should not rebuild it.
+- Changes to these boundaries must run the GUI dependency-boundary audit and representative `dev-build` invalidation measurements. The normal final `mise run build` requirement still applies.
+
 Builds and tests are deliberately separate:
 
 - `mise run build` must compile and link without depending on any test runner. Do not add test steps to the install/build graph.

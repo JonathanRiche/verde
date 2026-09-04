@@ -39,6 +39,16 @@ Claude may itself be running inside a Verde terminal. In that case, never run `m
 
 During iteration, use `zig ast-check`, `mise run dev-build`, or the narrowest relevant test for quick feedback. `dev-build` installs only the main desktop executable and skips the standalone daemon, browser helper, provider bridge installation, runtime-payload copying, tests, and packaging checks. It must use LLVM: Zig 0.16's self-hosted x86 backend is known to miscompile Verde and crash during startup. The default Debug build is currently broken and is not an approved fast path. Before completing any Zig change, run `mise run build`. Do not run the aggregate desktop `zig build test` for every Zig edit; reserve it for cross-cutting changes, test/build infrastructure changes, or an explicit user request. Use the focused `headless-test` or `runtime-test` build steps when they match the edited subsystem.
 
+## Module And Build-Graph Boundaries
+
+Put new production code in the lightest artifact that owns it. `verde-gui` may depend only on dependency-light protocol/data contracts and daemon client interfaces; it must never import concrete providers, daemon store/server implementations, SQLite/database implementations, CLI command roots, or test backends. `verde-daemon` owns provider execution, persistence, and session/server implementation. The public `verde` launcher/CLI must not import GUI or rendering code, and shared headless protocol/type modules must remain dependency-light.
+
+- Keep test-only backend imports in `desktop_test_root`, `test_backend`, or other test roots so they never enter production source fingerprints.
+- Avoid catch-all imports in `main.zig`, `state.zig`, and `utils.zig`; import the narrow owning interface instead.
+- Moving Zig files or modules alone does not create a compilation boundary. Build-speed splits require separate artifacts or a deliberate stable compiled ABI.
+- UI edits should rebuild only `verde-gui`; provider or daemon edits should not rebuild it.
+- Changes to these boundaries must run the GUI dependency-boundary audit and representative `dev-build` invalidation measurements. The normal final `mise run build` requirement still applies.
+
 Keep verification proportional and hermetic. The build/install graph must never depend on test execution, and the aggregate test step must not run the same tests through overlapping roots. Do not append `zig build test-compile` after `mise run build`; use it only for explicit compile-only validation of tests on a target that cannot run them. Tests may not use live provider CLIs, the user's daemon, external network, or persistent user state. Give every test-owned thread, child process, listener, and long poll deterministic cancellation and finite teardown. If a runner makes no progress for 60 seconds, inspect its named test and wait state instead of waiting indefinitely.
 
 For live CLI checks, prefer JSON and stable IDs: wait for `verde live status --json`, use `--pane <id>` and `--project current`, inspect both exit status and JSON `ok`, and close test panes. Sending chat messages creates real threads and requires judgment. Discover the CLI through `verde capabilities --json`, `verde live capabilities --json`, or shell completion.
