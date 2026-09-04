@@ -8890,7 +8890,13 @@ fn runSessionizerServer(allocator: std.mem.Allocator, pref_path: []const u8, opt
     defer allocator.free(pid_path);
 
     var daemon = Daemon.initWithPrefPath(allocator, pref_path);
-    defer daemon.deinit();
+    defer {
+        // Provider processes are daemon-owned and can outlive the socket if a
+        // normal shutdown skips the idle-exit cleanup path. Join/cancel every
+        // turn worker first, then reap the shared provider servers.
+        daemon.deinit();
+        harness.shutdownOwnedProviderProcesses();
+    }
     if (options.idle_exit_ms_override) |idle_exit_ms| daemon.idle_exit_ms = idle_exit_ms;
     // M5-P2 journal hook: volatile revision bumps publish identity entries.
     // `&daemon` is stable for the daemon's whole lifetime (A3: production
