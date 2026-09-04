@@ -38,16 +38,13 @@ if (-not $SkipBuild) {
 }
 
 $RequiredFiles = @(
-  "bin\Verde.exe",
+  "bin\verde-gui.exe",
+  "bin\verde.exe",
+  "bin\verde-daemon.exe",
   "bin\fff_c.dll",
   "bin\SDL3.dll",
   "bin\SDL3_ttf.dll",
   "bin\WebView2Loader.dll",
-  "bin\cli\verde.exe",
-  "bin\cli\fff_c.dll",
-  "bin\cli\SDL3.dll",
-  "bin\cli\SDL3_ttf.dll",
-  "bin\cli\WebView2Loader.dll",
   "share\verde\provider_bridge.mjs"
 )
 $FileEvidence = @()
@@ -70,7 +67,7 @@ $RuntimeEvidence = $null
 $WebView2Evidence = $null
 $TerminalEvidence = $null
 if (-not $SkipLaunch) {
-  $VerdeExe = Join-Path $PrefixDir "bin\cli\verde.exe"
+  $VerdeExe = Join-Path $PrefixDir "bin\verde.exe"
   $VersionOutput = & $VerdeExe version --json
   if ($LASTEXITCODE -ne 0) {
     throw "verde.exe version --json failed with exit code $LASTEXITCODE."

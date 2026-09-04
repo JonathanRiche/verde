@@ -81,7 +81,7 @@ pub fn build(b: *std.Build) void {
         .webview2_loader_lib = webview2_loader_lib,
         .webview2_loader_dll = webview2_loader_dll,
     });
-    const dev_build_step = b.step("dev-build", "Build only the main desktop executable");
+    const dev_build_step = b.step("dev-build", "Build only the private desktop GUI executable");
     dev_build_step.dependOn(&dev_build_cmd.step);
 
     const daemon_cmd = addDaemonCommand(b, optimize, "daemon", target, cpu, version);

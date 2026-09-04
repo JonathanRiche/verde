@@ -76,11 +76,12 @@ $RequiredRuntimeFiles = @(
   "SDL3_ttf.dll",
   "WebView2Loader.dll"
 )
-Copy-RequiredFile (Join-Path $PrefixDir "bin\Verde.exe") (Join-Path $PackageRoot "app\Verde.exe")
-Copy-RequiredFile (Join-Path $PrefixDir "bin\cli\verde.exe") (Join-Path $PackageRoot "bin\verde.exe")
+Copy-RequiredFile (Join-Path $PrefixDir "bin\verde-gui.exe") (Join-Path $PackageRoot "app\Verde.exe")
+Copy-RequiredFile (Join-Path $PrefixDir "bin\verde.exe") (Join-Path $PackageRoot "bin\verde.exe")
+Copy-RequiredFile (Join-Path $PrefixDir "bin\verde-daemon.exe") (Join-Path $PackageRoot "bin\verde-daemon.exe")
 foreach ($Name in $RequiredRuntimeFiles) {
   Copy-RequiredFile (Join-Path $PrefixDir "bin\$Name") (Join-Path $PackageRoot "app\$Name")
-  Copy-RequiredFile (Join-Path $PrefixDir "bin\cli\$Name") (Join-Path $PackageRoot "bin\$Name")
+  Copy-RequiredFile (Join-Path $PrefixDir "bin\$Name") (Join-Path $PackageRoot "bin\$Name")
 }
 Copy-RequiredFile (Join-Path $PrefixDir "share\verde\provider_bridge.mjs") (Join-Path $PackageRoot "share\verde\provider_bridge.mjs")
 Copy-RequiredFile (Join-Path $PrefixDir "share\verde\BUILD_VERSION") (Join-Path $PackageRoot "share\verde\BUILD_VERSION")
@@ -109,6 +110,7 @@ $HasSigningIdentity = -not [string]::IsNullOrWhiteSpace($CertificateThumbprint) 
 $SignablePaths = @(
   (Join-Path $PackageRoot "app\Verde.exe"),
   (Join-Path $PackageRoot "bin\verde.exe"),
+  (Join-Path $PackageRoot "bin\verde-daemon.exe"),
   (Join-Path $PackageRoot "app\fff_c.dll"),
   (Join-Path $PackageRoot "bin\fff_c.dll")
 )
@@ -231,6 +233,7 @@ foreach ($RelativePath in @(
   "app\SDL3_ttf.dll",
   "app\WebView2Loader.dll",
   "bin\verde.exe",
+  "bin\verde-daemon.exe",
   "bin\fff_c.dll",
   "bin\SDL3.dll",
   "bin\SDL3_ttf.dll",

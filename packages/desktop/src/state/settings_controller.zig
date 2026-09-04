@@ -6,8 +6,8 @@ const updater = @import("../app/updater.zig");
 const update_installer = @import("../app/update_installer.zig");
 const app_config = @import("../app/config.zig");
 const chat_threads = @import("../chat/threads.zig");
-const provider_hooks = @import("../providers/hooks.zig");
-const provider_mcp = @import("../providers/mcp.zig");
+const daemon_client = @import("../daemon/client.zig");
+const providers_protocol = @import("headless").providers_protocol;
 const profiler = @import("../runtime/profiler.zig");
 const theme = @import("../ui/theme.zig");
 const utils = @import("../utils.zig");
@@ -28,6 +28,62 @@ const NEW_CHAT_REASONING_OPTIONS = [_]app_config.ChatReasoning{ .provider_defaul
 
 fn monotonicMs() i64 {
     return @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
+}
+
+fn inspectProviderIntegrations(
+    allocator: std.mem.Allocator,
+    pref_path: []const u8,
+) !providers_protocol.IntegrationsInspectResult {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var transport: daemon_client.HeadlessTransport = .{
+        .allocator = arena.allocator(),
+        .pref_path = pref_path,
+    };
+    var client = daemon_client.headlessClient(arena.allocator(), &transport);
+    var parsed = try client.call(
+        providers_protocol.METHOD_PROVIDER_INTEGRATIONS_INSPECT,
+        providers_protocol.IntegrationsInspectRequest{},
+    );
+    defer parsed.deinit();
+    return client.decodeProviderIntegrationsInspect(&parsed);
+}
+
+fn setProviderHooks(
+    allocator: std.mem.Allocator,
+    pref_path: []const u8,
+    request: providers_protocol.HooksSetRequest,
+) !providers_protocol.HooksSetResult {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var transport: daemon_client.HeadlessTransport = .{
+        .allocator = arena.allocator(),
+        .pref_path = pref_path,
+    };
+    var client = daemon_client.headlessClient(arena.allocator(), &transport);
+    var parsed = try client.call(providers_protocol.METHOD_PROVIDER_HOOKS_SET, request);
+    defer parsed.deinit();
+    return client.decodeProviderHooksSet(&parsed);
+}
+
+fn setProviderMcp(
+    allocator: std.mem.Allocator,
+    pref_path: []const u8,
+    installed: bool,
+) !providers_protocol.McpSetResult {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var transport: daemon_client.HeadlessTransport = .{
+        .allocator = arena.allocator(),
+        .pref_path = pref_path,
+    };
+    var client = daemon_client.headlessClient(arena.allocator(), &transport);
+    var parsed = try client.call(
+        providers_protocol.METHOD_PROVIDER_MCP_SET,
+        providers_protocol.McpSetRequest{ .installed = installed },
+    );
+    defer parsed.deinit();
+    return client.decodeProviderMcpSet(&parsed);
 }
 
 fn dbProviderForChatTitleProvider(provider: app_config.ChatTitleProvider) Provider {
@@ -134,15 +190,7 @@ pub const UpdateInstallerTerminal = struct {
     status: UpdateInstallerTerminalStatus = .running,
 };
 
-pub const HookKind = enum {
-    claude,
-    codex,
-    cursor,
-    grok,
-    amp,
-    opencode,
-    pi,
-};
+pub const HookKind = providers_protocol.ManagedHookProvider;
 
 pub fn hookDisplayName(kind: HookKind) []const u8 {
     return switch (kind) {
@@ -204,7 +252,7 @@ pub const State = struct {
     hook_amp_installed: bool = false,
     hook_opencode_installed: bool = false,
     hook_pi_installed: bool = false,
-    mcp_summary: provider_mcp.Summary = .{},
+    mcp_summary: providers_protocol.McpSummary = .{},
     scroll_y: f32 = 0.0,
     hover_control: ?u8 = null,
     /// Encoded `settings_runtime_action` index under the pointer.
@@ -277,26 +325,10 @@ pub fn togglePiGlobalHooks(self: anytype) void {
 
 pub fn toggleProviderGlobalHooks(self: anytype, provider: HookKind, installed: *bool) void {
     const changing_to_installed = !installed.*;
-    const result = if (changing_to_installed)
-        switch (provider) {
-            .claude => provider_hooks.ensureClaudeGlobalHooks(self.allocator),
-            .codex => provider_hooks.ensureCodexGlobalHooks(self.allocator),
-            .cursor => provider_hooks.ensureCursorGlobalHooks(self.allocator),
-            .grok => provider_hooks.ensureGrokGlobalHooks(self.allocator),
-            .amp => provider_hooks.ensureAmpGlobalHooks(self.allocator),
-            .opencode => provider_hooks.ensureOpencodeGlobalHooks(self.allocator),
-            .pi => provider_hooks.ensurePiGlobalHooks(self.allocator),
-        }
-    else switch (provider) {
-        .claude => provider_hooks.removeClaudeGlobalHooks(self.allocator),
-        .codex => provider_hooks.removeCodexGlobalHooks(self.allocator),
-        .cursor => provider_hooks.removeCursorGlobalHooks(self.allocator),
-        .grok => provider_hooks.removeGrokGlobalHooks(self.allocator),
-        .amp => provider_hooks.removeAmpGlobalHooks(self.allocator),
-        .opencode => provider_hooks.removeOpencodeGlobalHooks(self.allocator),
-        .pi => provider_hooks.removePiGlobalHooks(self.allocator),
-    };
-    result catch |err| {
+    const result = setProviderHooks(self.allocator, self.storage.pref_path, .{
+        .provider = provider,
+        .installed = changing_to_installed,
+    }) catch |err| {
         log.warn("failed to {s} global {s} hooks: {s}", .{
             if (changing_to_installed) "install" else "remove",
             hookDisplayName(provider),
@@ -306,8 +338,8 @@ pub fn toggleProviderGlobalHooks(self: anytype, provider: HookKind, installed: *
         self.markDirty();
         return;
     };
-    installed.* = changing_to_installed;
-    self.setSidebarNotice(hookSuccessNotice(provider, changing_to_installed));
+    installed.* = result.installed;
+    self.setSidebarNotice(hookSuccessNotice(provider, result.installed));
     self.markDirty();
 }
 
@@ -433,14 +465,18 @@ pub fn openSettingsToCategory(self: anytype, category: Category) void {
     self.workspace_header_open_menu_pane_id = null;
     self.browser_controller.inspector_menu_open = false;
     self.syncSettingsDraftFromConfig();
-    self.settings_controller.hook_claude_installed = provider_hooks.claudeGlobalHooksInstalled(self.allocator);
-    self.settings_controller.hook_codex_installed = provider_hooks.codexGlobalHooksInstalled(self.allocator);
-    self.settings_controller.hook_cursor_installed = provider_hooks.cursorGlobalHooksInstalled(self.allocator);
-    self.settings_controller.hook_grok_installed = provider_hooks.grokGlobalHooksInstalled(self.allocator);
-    self.settings_controller.hook_amp_installed = provider_hooks.ampGlobalHooksInstalled(self.allocator);
-    self.settings_controller.hook_opencode_installed = provider_hooks.opencodeGlobalHooksInstalled(self.allocator);
-    self.settings_controller.hook_pi_installed = provider_hooks.piGlobalHooksInstalled(self.allocator);
-    self.settings_controller.mcp_summary = provider_mcp.inspect(self.allocator);
+    if (inspectProviderIntegrations(self.allocator, self.storage.pref_path)) |integrations| {
+        self.settings_controller.hook_claude_installed = integrations.hooks.claude;
+        self.settings_controller.hook_codex_installed = integrations.hooks.codex;
+        self.settings_controller.hook_cursor_installed = integrations.hooks.cursor;
+        self.settings_controller.hook_grok_installed = integrations.hooks.grok;
+        self.settings_controller.hook_amp_installed = integrations.hooks.amp;
+        self.settings_controller.hook_opencode_installed = integrations.hooks.opencode;
+        self.settings_controller.hook_pi_installed = integrations.hooks.pi;
+        self.settings_controller.mcp_summary = integrations.mcp;
+    } else |err| {
+        log.warn("failed to inspect provider integrations through daemon: {s}", .{@errorName(err)});
+    }
     self.settings_controller.active_category = category;
     self.settings_controller.scroll_y = 0.0;
     self.settings_controller.hover_control = null;
@@ -495,12 +531,13 @@ fn closeSettingsDropdowns(self: anytype) void {
 /// detected providers. Existing non-Verde entries are never overwritten.
 pub fn toggleGlobalMcpIntegration(self: anytype) void {
     if (self.app_config.mcp_integration_enabled or self.settings_controller.mcp_summary.installedCount() > 0) {
-        self.settings_controller.mcp_summary = provider_mcp.uninstall(self.allocator) catch |err| {
+        const result = setProviderMcp(self.allocator, self.storage.pref_path, false) catch |err| {
             log.warn("failed to remove provider MCP registrations: {s}", .{@errorName(err)});
             self.setSidebarNotice("Could not remove all Verde MCP registrations.");
             self.markDirty();
             return;
         };
+        self.settings_controller.mcp_summary = result.summary;
         self.app_config.mcp_integration_enabled = self.settings_controller.mcp_summary.installedCount() > 0 or self.settings_controller.mcp_summary.failedCount() > 0;
         if (self.settings_controller.mcp_summary.failedCount() > 0) {
             self.setSidebarNotice("Removed Verde MCP where possible; some provider configs could not be updated.");
@@ -508,12 +545,13 @@ pub fn toggleGlobalMcpIntegration(self: anytype) void {
             self.setSidebarNotice("Disabled Verde MCP tools in agent providers.");
         }
     } else {
-        const summary = provider_mcp.install(self.allocator) catch |err| {
+        const result = setProviderMcp(self.allocator, self.storage.pref_path, true) catch |err| {
             log.warn("failed to install provider MCP registrations: {s}", .{@errorName(err)});
             self.setSidebarNotice("Could not enable Verde MCP tools.");
             self.markDirty();
             return;
         };
+        const summary = result.summary;
         self.settings_controller.mcp_summary = summary;
         if (summary.detectedCount() == 0) {
             self.setSidebarNotice("No supported agent providers were detected.");

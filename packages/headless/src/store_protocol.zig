@@ -19,6 +19,8 @@ pub const METHOD_CHAT_DRAFT_SET: []const u8 = "chat.draft.set";
 pub const METHOD_CHAT_MESSAGE_APPEND: []const u8 = "chat.message.append";
 pub const METHOD_SURFACE_UPSERT: []const u8 = "surface.upsert";
 pub const METHOD_SURFACE_CLEAR: []const u8 = "surface.clear";
+pub const METHOD_SURFACE_COMPLETION_OBSERVE: []const u8 = "surface.completion.observe";
+pub const METHOD_SURFACE_COMMIT_PROOF_CLASSIFY: []const u8 = "surface.commitProof.classify";
 pub const METHOD_NOTIFICATION_CHAT_COMPLETION_UPSERT: []const u8 =
     "notification.chatCompletion.upsert";
 pub const METHOD_NOTIFICATION_CHAT_COMPLETION_CLEAR: []const u8 =
@@ -379,6 +381,28 @@ pub const SurfaceClearRequest = struct {
     workspace_id: ?[]const u8 = null,
 };
 
+pub const SurfaceCompletionObserveRequest = struct {
+    surface: SurfaceState,
+};
+
+pub const SurfaceCompletionObserveResult = struct {
+    store_revision: u64,
+    matches: bool,
+};
+
+pub const SurfaceCommitProofClassifyRequest = struct {
+    request_key: []const u8,
+    operation: []const u8,
+    fingerprint: []const u8,
+    store_revision: u64,
+    surface: ?SurfaceState = null,
+    cleared_session_id: ?[]const u8 = null,
+};
+
+pub const SurfaceCommitProofClassifyResult = struct {
+    classification: []const u8,
+};
+
 pub const NotificationChatCompletionUpsertRequest = struct {
     mutation: MutationHeader,
     completion: ChatCompletion,
@@ -595,6 +619,9 @@ pub const MessageListRequest = struct {
     direction: []const u8 = "backward",
     limit: u32 = DEFAULT_PAGE_ITEMS,
     cursor: ?[]const u8 = null,
+    /// Absolute transcript boundary used by GUI projections that already
+    /// retain a durable message offset. Opaque cursors take precedence.
+    before_offset: ?usize = null,
 };
 
 pub const MessageListResult = struct {

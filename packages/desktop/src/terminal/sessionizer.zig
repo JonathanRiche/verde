@@ -10,6 +10,7 @@ const build_options = @import("build_options");
 const zqlite = @import("zqlite");
 const harness = @import("../providers/harness.zig");
 const headless = @import("headless");
+const session_protocol = headless.session_protocol;
 const app_config = @import("../app/config.zig");
 const chat_threads = @import("../chat/threads.zig");
 const db_types = @import("../db/types.zig");
@@ -32,6 +33,8 @@ const workspace_identity = @import("../platform/workspace_identity.zig");
 const stack = @import("../workspace/stack.zig");
 const platform_runtime = @import("platform_runtime");
 const process_env = @import("../platform/env.zig");
+const provider_hooks = @import("../providers/hooks.zig");
+const provider_mcp = @import("../providers/mcp.zig");
 const provider_models = @import("../state/provider_models.zig");
 const send_runner = @import("../chat/send_runner.zig");
 const transcript_apply = @import("../chat/transcript_apply.zig");
@@ -80,9 +83,11 @@ pub const WINDOWS_PIPE_PREFIX = "\\\\.\\pipe\\verde-sessionizer-";
 // when the desktop itself inherited a real Herdr session.
 // Version 26 gives every Verde-owned terminal its own lifecycle endpoint so
 // FX launched from an interactive shell reports to that Verde pane too.
-pub const PROTOCOL_VERSION: u32 = 26;
-pub const DEFAULT_COLS: u16 = 120;
-pub const DEFAULT_ROWS: u16 = 30;
+// Version 27 moves GUI startup persistence behind the daemon snapshot RPC.
+// Version 28 keeps that snapshot bounded by paging transcript bodies.
+pub const PROTOCOL_VERSION = session_protocol.PROTOCOL_VERSION;
+pub const DEFAULT_COLS = session_protocol.DEFAULT_COLS;
+pub const DEFAULT_ROWS = session_protocol.DEFAULT_ROWS;
 const MAX_OUTPUT_RING: usize = 1024 * 1024;
 const DAEMON_POLL_READ_BUDGET: usize = 64 * 1024;
 const SESSIONIZER_MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
@@ -265,110 +270,21 @@ const TERMINAL_GET_PGRP_IOCTL: ?c_int = switch (builtin.os.tag) {
     else => null,
 };
 
-pub const RevivePolicy = enum {
-    attach_or_create,
-    attach_only,
-    restart,
-    manual,
-};
-
-pub const LayoutContext = struct {
-    project_id: []const u8,
-    project_path: []const u8 = "",
-    dock_id: u32,
-};
-
-pub const LeafSessionMetadata = struct {
-    session_id: ?[]const u8 = null,
-    revive_policy: RevivePolicy = .attach_or_create,
-};
-
-pub const SessionStatus = enum {
-    missing,
-    starting,
-    running,
-    exited,
-};
-
-pub const SessionSummary = struct {
-    session_id: []const u8,
-    project_id: []const u8 = "",
-    project_path: []const u8 = "",
-    dock_id: u32 = 0,
-    pane_id: u32 = 0,
-    label: []const u8 = "",
-    status: SessionStatus = .missing,
-    created_at_ms: ?i64 = null,
-    last_attached_at_ms: ?i64 = null,
-};
-
-pub const Method = enum {
-    @"session.list",
-    @"session.inspect",
-    @"session.create",
-    @"session.attach",
-    @"session.detach",
-    @"session.write",
-    @"session.resize",
-    @"session.tail",
-    @"session.tail.batch",
-    @"session.screen",
-    @"session.kill",
-    @"session.cleanup",
-
-    pub fn text(self: Method) []const u8 {
-        return @tagName(self);
-    }
-};
-
-pub const METHOD_NAMES = [_][]const u8{
-    "session.list",
-    "session.inspect",
-    "session.create",
-    "session.attach",
-    "session.detach",
-    "session.write",
-    "session.resize",
-    "session.tail",
-    "session.tail.batch",
-    "session.screen",
-    "session.kill",
-    "session.cleanup",
-};
+pub const RevivePolicy = session_protocol.RevivePolicy;
+pub const LayoutContext = session_protocol.LayoutContext;
+pub const LeafSessionMetadata = session_protocol.LeafSessionMetadata;
+pub const SessionStatus = session_protocol.SessionStatus;
+pub const SessionSummary = session_protocol.SessionSummary;
+pub const Method = session_protocol.Method;
+pub const METHOD_NAMES = session_protocol.METHOD_NAMES;
 
 test "session tail batching is an additive daemon method" {
     try std.testing.expectEqualStrings("session.tail", METHOD_NAMES[7]);
     try std.testing.expectEqualStrings("session.tail.batch", METHOD_NAMES[8]);
 }
 
-pub fn stableSessionId(
-    allocator: std.mem.Allocator,
-    project_id: []const u8,
-    dock_id: u32,
-    pane_id: u32,
-) ![]u8 {
-    var safe_project_id: std.ArrayList(u8) = .empty;
-    defer safe_project_id.deinit(allocator);
-    try appendSafeComponent(allocator, &safe_project_id, project_id);
-    if (safe_project_id.items.len == 0) try safe_project_id.appendSlice(allocator, "project");
-
-    return try std.fmt.allocPrint(
-        allocator,
-        "verde:{s}:dock:{d}:pane:{d}",
-        .{ safe_project_id.items, dock_id, pane_id },
-    );
-}
-
-pub fn sessionIdForLeaf(
-    allocator: std.mem.Allocator,
-    context: ?LayoutContext,
-    pane_id: u32,
-    existing_session_id: ?[]const u8,
-) !?[]u8 {
-    if (existing_session_id) |session_id| return try allocator.dupe(u8, session_id);
-    const ctx = context orelse return null;
-    return try stableSessionId(allocator, ctx.project_id, ctx.dock_id, pane_id);
-}
+pub const stableSessionId = session_protocol.stableSessionId;
+pub const sessionIdForLeaf = session_protocol.sessionIdForLeaf;
 
 /// Env override for the sessionizer endpoint (Unix socket path or Windows
 /// named-pipe path). When set and non-empty, clients and daemons use this
@@ -1072,13 +988,26 @@ fn sessionCliPathAlloc(allocator: std.mem.Allocator) ![:0]u8 {
     const executable = selfExePathAlloc(allocator) catch return allocator.dupeZ(u8, "verde");
     defer allocator.free(executable);
     if (builtin.os.tag != .windows) {
-        return allocator.dupeZ(u8, executablePathWithoutDeletedSuffix(builtin.os.tag, executable));
+        const resolved = try resolvePosixCliPathAlloc(allocator, builtin.os.tag, executable);
+        defer allocator.free(resolved);
+        return allocator.dupeZ(u8, resolved);
     }
 
     const resolved = resolveWindowsCliPathAlloc(allocator, executable) catch
         return allocator.dupeZ(u8, executable);
     defer allocator.free(resolved);
     return allocator.dupeZ(u8, resolved);
+}
+
+fn resolvePosixCliPathAlloc(
+    allocator: std.mem.Allocator,
+    comptime os_tag: std.Target.Os.Tag,
+    executable: []const u8,
+) ![]u8 {
+    const live_executable = executablePathWithoutDeletedSuffix(os_tag, executable);
+    const executable_dir = std.fs.path.dirnamePosix(live_executable) orelse
+        return allocator.dupe(u8, live_executable);
+    return std.fs.path.join(allocator, &.{ executable_dir, "verde" });
 }
 
 fn executablePathWithoutDeletedSuffix(comptime os_tag: std.Target.Os.Tag, executable: []const u8) []const u8 {
@@ -2937,6 +2866,19 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, headless.attachment_protocol.METHOD_CHAT_ATTACHMENT_COMMIT)) return try self.chatAttachmentCommitResponse(id_value, params);
         if (std.mem.eql(u8, method, "provider.models.list")) return try self.providerModelsListResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDERS_STATUS)) return try self.providerStatusResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_AUTH_STATUS)) return try self.providerAuthStatusResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_THREADS_LIST)) return try self.providerThreadsListResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_THREAD_READ)) return try self.providerThreadReadResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_THREAD_INTERRUPT)) return try self.providerThreadInterruptResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_THREAD_STEER)) return try self.providerThreadSteerResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_SLASH_LIST)) return try self.providerSlashListResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_SLASH_RUN)) return try self.providerSlashRunResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_CODEX_BACKGROUND_STATUS)) return try self.providerCodexBackgroundStatusResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_CODEX_BACKGROUND_TERMINATE)) return try self.providerCodexBackgroundTerminateResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_INTEGRATIONS_INSPECT)) return try self.providerIntegrationsInspectResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_HOOKS_SET)) return try self.providerHooksSetResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_MCP_SET)) return try self.providerMcpSetResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_TITLE_GENERATE)) return try self.providerTitleGenerateResponse(id_value, params);
         if (isFxLifecycleMethod(method)) return try self.fxLifecycleResponse(id_value, method, params);
         if (std.mem.eql(u8, method, store_protocol.METHOD_CONFIG_FAVORITE_MODEL_SET)) return try self.configFavoriteModelSetResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_WORKSPACE_RESOLVE)) return try self.workspaceResolveResponse(id_value, params);
@@ -3750,8 +3692,10 @@ pub const Daemon = struct {
         const is_thread_list = std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_LIST);
         const is_message_list = std.mem.eql(u8, method, store_protocol.METHOD_CHAT_MESSAGE_LIST);
         const is_turn_record = std.mem.eql(u8, method, store_protocol.METHOD_CHAT_TURN_RECORD);
+        const is_surface_observe = std.mem.eql(u8, method, store_protocol.METHOD_SURFACE_COMPLETION_OBSERVE);
+        const is_surface_proof = std.mem.eql(u8, method, store_protocol.METHOD_SURFACE_COMMIT_PROOF_CLASSIFY);
         const is_chat_read = is_workspace_list or is_repository_manifest or is_thread_get or
-            is_thread_list or is_message_list or is_turn_record;
+            is_thread_list or is_message_list or is_turn_record or is_surface_observe or is_surface_proof;
         const is_core_snapshot = std.mem.eql(u8, method, store_protocol.METHOD_CORE_SNAPSHOT);
         const is_core_changes = std.mem.eql(u8, method, changes_protocol.METHOD_CORE_CHANGES);
         // Reads never join the mutator drain gate or in_flight write counter.
@@ -3769,6 +3713,8 @@ pub const Daemon = struct {
         var decoded_thread_list: ?store_protocol.ThreadListRequest = null;
         var decoded_message_list: ?store_protocol.MessageListRequest = null;
         var decoded_turn_record: ?store_protocol.TurnRecordRequest = null;
+        var decoded_surface_observe: ?store_protocol.SurfaceCompletionObserveRequest = null;
+        var decoded_surface_proof: ?store_protocol.SurfaceCommitProofClassifyRequest = null;
         var decoded_core_snapshot: ?store_protocol.CoreSnapshotRequest = null;
         var decoded_core_changes: ?changes_protocol.ChangesRequest = null;
         if (is_status) {
@@ -3883,6 +3829,30 @@ pub const Daemon = struct {
                 break :blk null;
             };
             if (req) |value| decoded_turn_record = value;
+        } else if (is_surface_observe) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.SurfaceCompletionObserveRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_surface_observe = value;
+        } else if (is_surface_proof) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.SurfaceCommitProofClassifyRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_surface_proof = value;
         } else if (std.mem.eql(u8, method, store_protocol.METHOD_STATE_SNAPSHOT_REPLACE)) {
             const req = std.json.parseFromValueLeaky(
                 store_protocol.SnapshotReplaceRequest,
@@ -4330,6 +4300,49 @@ pub const Daemon = struct {
             defer freeTurnRecord(self.allocator, result);
             return try okValueResponse(self.allocator, id_value, result);
         }
+        if (is_surface_observe) {
+            const req = decoded_surface_observe orelse return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_PARAMS,
+                "invalid params",
+            );
+            const result: store_protocol.SurfaceCompletionObserveResult = .{
+                .store_revision = service.store.storeRevision() catch |err| {
+                    return try storeErrorResponse(self.allocator, id_value, err);
+                },
+                .matches = service.store.surfaceStateMatches(req.surface) catch |err| {
+                    return try storeErrorResponse(self.allocator, id_value, err);
+                },
+            };
+            return try okValueResponse(self.allocator, id_value, result);
+        }
+        if (is_surface_proof) {
+            const req = decoded_surface_proof orelse return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_PARAMS,
+                "invalid params",
+            );
+            const receipt_matches = service.store.committedReceiptMatches(
+                req.request_key,
+                req.operation,
+                req.fingerprint,
+                req.store_revision,
+            ) catch |err| return try storeErrorResponse(self.allocator, id_value, err);
+            var classification: []const u8 = "invalid";
+            if (receipt_matches) {
+                const current = if (req.surface) |surface|
+                    service.store.surfaceStateMatches(surface) catch |err| return try storeErrorResponse(self.allocator, id_value, err)
+                else if (req.cleared_session_id) |session_id|
+                    service.store.surfaceStateAbsent(session_id) catch |err| return try storeErrorResponse(self.allocator, id_value, err)
+                else
+                    false;
+                classification = if (current) "current" else "superseded";
+            }
+            const result: store_protocol.SurfaceCommitProofClassifyResult = .{ .classification = classification };
+            return try okValueResponse(self.allocator, id_value, result);
+        }
 
         const mutation = decoded_mutation orelse return try errorResponseAlloc(
             self.allocator,
@@ -4624,7 +4637,14 @@ pub const Daemon = struct {
         {
             lockStoreService(service);
             defer service.mutex.unlock();
-            loaded = loadStoreSnapshotTxn(arena, &service.store, request.workspace_id, include_store, include_workspaces) catch |err| {
+            loaded = loadStoreSnapshotTxn(
+                arena,
+                &service.store,
+                request.workspace_id,
+                include_store,
+                include_workspaces,
+                false,
+            ) catch |err| {
                 return try storeErrorResponse(self.allocator, id_value, err);
             };
         }
@@ -7633,6 +7653,327 @@ pub const Daemon = struct {
         });
     }
 
+    // Provider authentication/readiness projection. Provider handshakes run
+    // unlocked and never intentionally launch a missing long-lived server.
+    fn providerAuthStatusResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        var parsed = parseDaemonParams(headless.providers_protocol.AuthStatusRequest, self.allocator, params) catch
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid provider auth request");
+        defer parsed.deinit();
+        const request = parsed.value;
+        const provider: harness.Provider = request.provider;
+        const installed = nativeProviderInstalled(nativeProviderFromHarness(provider));
+        var auth_state: harness.AuthState = .unknown;
+        if (installed) {
+            if (send_runner.connectProvider(self.allocator, provider, request.project_path, false)) |client_value| {
+                var provider_client = client_value;
+                defer provider_client.deinit();
+                auth_state = provider_client.authState() catch .unknown;
+            } else |_| {}
+        }
+        return try okValueResponse(self.allocator, id_value, headless.providers_protocol.AuthStatusResult{
+            .provider = request.provider,
+            .installed = installed,
+            .auth_state = auth_state,
+            .ready = installed and auth_state == .signed_in,
+        });
+    }
+
+    // Provider thread inventory used by the desktop import picker.
+    fn providerThreadsListResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        var parsed = parseDaemonParams(headless.providers_protocol.ThreadsListRequest, self.allocator, params) catch
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid provider thread-list request");
+        defer parsed.deinit();
+        const request = parsed.value;
+        var provider_client = send_runner.connectProvider(self.allocator, request.provider, request.project_path, true) catch |err|
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_PROVIDER_UNAVAILABLE, @errorName(err));
+        defer provider_client.deinit();
+        const threads = provider_client.listThreads(self.allocator) catch |err|
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_PROVIDER_UNAVAILABLE, @errorName(err));
+        defer {
+            for (threads) |thread| {
+                self.allocator.free(thread.id);
+                self.allocator.free(thread.title);
+            }
+            self.allocator.free(threads);
+        }
+        return try okValueResponse(self.allocator, id_value, headless.providers_protocol.ThreadsListResult{
+            .provider = request.provider,
+            .threads = threads,
+        });
+    }
+
+    // Complete provider-native thread payload; the GUI owns projection import.
+    fn providerThreadReadResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        var parsed = parseDaemonParams(headless.providers_protocol.ThreadReadRequest, self.allocator, params) catch
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid provider thread-read request");
+        defer parsed.deinit();
+        const request = parsed.value;
+        if (request.thread_id.len == 0) {
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "thread_id must not be empty");
+        }
+        var provider_client = send_runner.connectProvider(self.allocator, request.provider, request.project_path, true) catch |err|
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_PROVIDER_UNAVAILABLE, @errorName(err));
+        defer provider_client.deinit();
+        const thread = provider_client.readThread(self.allocator, request.thread_id) catch |err|
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_PROVIDER_UNAVAILABLE, @errorName(err));
+        defer thread.deinit(self.allocator);
+        return try okValueResponse(self.allocator, id_value, headless.providers_protocol.ThreadReadResult{
+            .provider = request.provider,
+            .thread = thread,
+        });
+    }
+
+    // Legacy provider-native cancellation used while an older desktop turn is
+    // not yet represented by the daemon turn ledger.
+    fn providerThreadInterruptResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        var parsed = parseDaemonParams(headless.providers_protocol.ThreadInterruptRequest, self.allocator, params) catch
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid provider thread-interrupt request");
+        defer parsed.deinit();
+        const request = parsed.value;
+        if (request.thread_id.len == 0) {
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "thread_id must not be empty");
+        }
+        const launch_if_missing = request.provider == .opencode;
+        var provider_client = send_runner.connectProvider(self.allocator, request.provider, request.project_path, launch_if_missing) catch |err|
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_PROVIDER_UNAVAILABLE, @errorName(err));
+        defer provider_client.deinit();
+        provider_client.interruptThread(.{
+            .thread_id = request.thread_id,
+            .turn_id = request.turn_id,
+        }) catch |err| return try errorResponseAlloc(
+            self.allocator,
+            id_value,
+            headless.protocol.ERR_PROVIDER_UNAVAILABLE,
+            @errorName(err),
+        );
+        return try providerThreadControlResponse(self.allocator, id_value, .accepted);
+    }
+
+    // Legacy provider-native steering used while an older desktop turn is not
+    // yet represented by the daemon turn ledger. Attachments remain ordered.
+    fn providerThreadSteerResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        var parsed = parseDaemonParams(headless.providers_protocol.ThreadSteerRequest, self.allocator, params) catch
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid provider thread-steer request");
+        defer parsed.deinit();
+        const request = parsed.value;
+        if (request.thread_id.len == 0 or request.turn_id.len == 0) {
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "thread_id and turn_id must not be empty");
+        }
+        var provider_client = send_runner.connectProvider(self.allocator, request.provider, request.project_path, false) catch |err|
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_PROVIDER_UNAVAILABLE, @errorName(err));
+        defer provider_client.deinit();
+        provider_client.steerThread(.{
+            .thread_id = request.thread_id,
+            .turn_id = request.turn_id,
+            .prompt = request.prompt,
+            .images = request.images,
+        }) catch |err| switch (err) {
+            error.UnsupportedOperation => return try providerThreadControlResponse(self.allocator, id_value, .unsupported),
+            else => return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_PROVIDER_UNAVAILABLE, @errorName(err)),
+        };
+        return try providerThreadControlResponse(self.allocator, id_value, .accepted);
+    }
+
+    // Static slash metadata is provider-owned but requires no process startup.
+    fn providerSlashListResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        var parsed = parseDaemonParams(headless.providers_protocol.SlashListRequest, self.allocator, params) catch
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid provider slash-list request");
+        defer parsed.deinit();
+        const commands = harness.slashCommandsForProvider(parsed.value.provider);
+        return try okValueResponse(self.allocator, id_value, headless.providers_protocol.SlashListResult{
+            .provider = parsed.value.provider,
+            .commands = commands,
+        });
+    }
+
+    // Provider-native slash execution; potentially blocking provider work is
+    // classified unlocked by methodRunsUnlocked.
+    fn providerSlashRunResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        var parsed = parseDaemonParams(headless.providers_protocol.SlashRunRequest, self.allocator, params) catch
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid provider slash request");
+        defer parsed.deinit();
+        const request = parsed.value;
+        var provider_client = send_runner.connectProvider(self.allocator, request.provider, request.project_path, true) catch |err|
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_PROVIDER_UNAVAILABLE, @errorName(err));
+        defer provider_client.deinit();
+        const result = provider_client.runSlashCommand(self.allocator, .{
+            .thread_id = request.thread_id,
+            .cwd = request.project_path,
+            .command = request.command,
+            .raw_text = request.raw_text,
+            .args = request.args,
+        }) catch |err| return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_PROVIDER_UNAVAILABLE, @errorName(err));
+        defer result.deinit(self.allocator);
+        return try okValueResponse(self.allocator, id_value, headless.providers_protocol.SlashRunResult{
+            .provider = request.provider,
+            .result = result,
+        });
+    }
+
+    // Codex background-terminal liveness query.
+    fn providerCodexBackgroundStatusResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        var parsed = parseDaemonParams(headless.providers_protocol.CodexBackgroundRequest, self.allocator, params) catch
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid Codex background request");
+        defer parsed.deinit();
+        const request = parsed.value;
+        var provider_client = send_runner.connectProvider(self.allocator, .codex, request.project_path, false) catch |err|
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_PROVIDER_UNAVAILABLE, @errorName(err));
+        defer provider_client.deinit();
+        const running = provider_client.backgroundTerminalIsRunning(request.thread_id, request.process_id) catch |err|
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_PROVIDER_UNAVAILABLE, @errorName(err));
+        return try okValueResponse(self.allocator, id_value, headless.providers_protocol.CodexBackgroundStatusResult{ .running = running });
+    }
+
+    // Codex background-terminal termination request.
+    fn providerCodexBackgroundTerminateResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        var parsed = parseDaemonParams(headless.providers_protocol.CodexBackgroundRequest, self.allocator, params) catch
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid Codex background request");
+        defer parsed.deinit();
+        const request = parsed.value;
+        var provider_client = send_runner.connectProvider(self.allocator, .codex, request.project_path, false) catch |err|
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_PROVIDER_UNAVAILABLE, @errorName(err));
+        defer provider_client.deinit();
+        provider_client.terminateBackgroundTerminal(request.thread_id, request.process_id) catch |err|
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_PROVIDER_UNAVAILABLE, @errorName(err));
+        return try okValueResponse(self.allocator, id_value, headless.providers_protocol.CodexBackgroundTerminateResult{ .terminated = true });
+    }
+
+    // Global hook and MCP ownership projection used by desktop settings.
+    fn providerIntegrationsInspectResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        var parsed = parseDaemonParams(headless.providers_protocol.IntegrationsInspectRequest, self.allocator, params) catch
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid provider integration inspect request");
+        defer parsed.deinit();
+        self.config_mutex.lock();
+        defer self.config_mutex.unlock();
+        const hooks: headless.providers_protocol.ManagedHookStatus = .{
+            .claude = provider_hooks.claudeGlobalHooksInstalled(self.allocator),
+            .codex = provider_hooks.codexGlobalHooksInstalled(self.allocator),
+            .cursor = provider_hooks.cursorGlobalHooksInstalled(self.allocator),
+            .grok = provider_hooks.grokGlobalHooksInstalled(self.allocator),
+            .amp = provider_hooks.ampGlobalHooksInstalled(self.allocator),
+            .opencode = provider_hooks.opencodeGlobalHooksInstalled(self.allocator),
+            .pi = provider_hooks.piGlobalHooksInstalled(self.allocator),
+        };
+        return try okValueResponse(self.allocator, id_value, headless.providers_protocol.IntegrationsInspectResult{
+            .hooks = hooks,
+            .mcp = provider_mcp.inspect(self.allocator),
+        });
+    }
+
+    // Install or remove exactly one managed lifecycle integration. Pi keeps
+    // its global-extension implementation; FX has no hook toggle because its
+    // native lifecycle endpoint remains authoritative.
+    fn providerHooksSetResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        var parsed = parseDaemonParams(headless.providers_protocol.HooksSetRequest, self.allocator, params) catch
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid provider hook request");
+        defer parsed.deinit();
+        const request = parsed.value;
+        self.config_mutex.lock();
+        defer self.config_mutex.unlock();
+        const operation = if (request.installed) switch (request.provider) {
+            .claude => provider_hooks.ensureClaudeGlobalHooks(self.allocator),
+            .codex => provider_hooks.ensureCodexGlobalHooks(self.allocator),
+            .cursor => provider_hooks.ensureCursorGlobalHooks(self.allocator),
+            .grok => provider_hooks.ensureGrokGlobalHooks(self.allocator),
+            .amp => provider_hooks.ensureAmpGlobalHooks(self.allocator),
+            .opencode => provider_hooks.ensureOpencodeGlobalHooks(self.allocator),
+            .pi => provider_hooks.ensurePiGlobalHooks(self.allocator),
+        } else switch (request.provider) {
+            .claude => provider_hooks.removeClaudeGlobalHooks(self.allocator),
+            .codex => provider_hooks.removeCodexGlobalHooks(self.allocator),
+            .cursor => provider_hooks.removeCursorGlobalHooks(self.allocator),
+            .grok => provider_hooks.removeGrokGlobalHooks(self.allocator),
+            .amp => provider_hooks.removeAmpGlobalHooks(self.allocator),
+            .opencode => provider_hooks.removeOpencodeGlobalHooks(self.allocator),
+            .pi => provider_hooks.removePiGlobalHooks(self.allocator),
+        };
+        operation catch |err| return try errorResponseAlloc(
+            self.allocator,
+            id_value,
+            headless.protocol.ERR_PROVIDER_UNAVAILABLE,
+            @errorName(err),
+        );
+        return try okValueResponse(self.allocator, id_value, headless.providers_protocol.HooksSetResult{
+            .provider = request.provider,
+            .installed = request.installed,
+        });
+    }
+
+    // Install/remove all eight user-scoped MCP registrations using their
+    // provider-native formats, including Pi's extension and FX's mcp.json.
+    fn providerMcpSetResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        var parsed = parseDaemonParams(headless.providers_protocol.McpSetRequest, self.allocator, params) catch
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid provider MCP request");
+        defer parsed.deinit();
+        self.config_mutex.lock();
+        defer self.config_mutex.unlock();
+        const summary = if (parsed.value.installed)
+            provider_mcp.install(self.allocator)
+        else
+            provider_mcp.uninstall(self.allocator);
+        const result = summary catch |err| return try errorResponseAlloc(
+            self.allocator,
+            id_value,
+            headless.protocol.ERR_PROVIDER_UNAVAILABLE,
+            @errorName(err),
+        );
+        return try okValueResponse(self.allocator, id_value, headless.providers_protocol.McpSetResult{ .summary = result });
+    }
+
+    // Generate and normalize one chat title from the opening exchange. This
+    // is intentionally independent of the durable automatic-title commit;
+    // the requesting GUI still owns manual regeneration state and selection.
+    fn providerTitleGenerateResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        var parsed = parseDaemonParams(headless.providers_protocol.TitleGenerateRequest, self.allocator, params) catch
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid provider title request");
+        defer parsed.deinit();
+        const request = parsed.value;
+        switch (request.provider) {
+            .codex, .claude, .cursor, .opencode => {},
+            .pi, .fx, .grok, .muse => return try providerTitleFailureResponse(self.allocator, id_value, "UnsupportedTitleProvider"),
+        }
+        const user_text = if (std.mem.trim(u8, request.user_text, &std.ascii.whitespace).len > 0)
+            boundedTitleUtf8Prefix(request.user_text, 4096)
+        else
+            "Image attachment";
+        const prompt = chat_threads.makeTitleGenerationPrompt(
+            self.allocator,
+            user_text,
+            boundedTitleUtf8Prefix(request.assistant_text, 4096),
+        ) catch |err| return try providerTitleFailureResponse(self.allocator, id_value, @errorName(err));
+        defer self.allocator.free(prompt);
+
+        const send_result = send_runner.run(self.allocator, .{
+            .provider = request.provider,
+            .harness_kind = .local_cli,
+            .project_path = request.cwd,
+            .cwd = request.cwd,
+            .prompt = prompt,
+            .model_ref = request.model_ref,
+            .reasoning_effort = request.reasoning_effort,
+            .opencode_reasoning_variant = request.reasoning_variant,
+            .fast_mode = if (request.fast) .on else .off,
+            .access_mode = switch (request.access_mode) {
+                .supervised => .supervised,
+                .full_access => .full_access,
+            },
+        }, .{}) catch |err| return try providerTitleFailureResponse(self.allocator, id_value, @errorName(err));
+        defer self.allocator.free(send_result.provider_thread_id);
+        defer self.allocator.free(send_result.reply_text);
+
+        const title = chat_threads.makeGeneratedThreadTitle(self.allocator, send_result.reply_text) catch |err|
+            return try providerTitleFailureResponse(self.allocator, id_value, @errorName(err));
+        const generated_title = title orelse return try providerTitleFailureResponse(
+            self.allocator,
+            id_value,
+            "The model returned an empty title.",
+        );
+        defer self.allocator.free(generated_title);
+        return try okValueResponse(self.allocator, id_value, headless.providers_protocol.TitleGenerateResult{
+            .title = generated_title,
+        });
+    }
+
     /// Runtime-scoped provider inventory. This endpoint performs bounded
     /// executable checks only; authentication remains unknown until provider
     /// adapters expose cancellable, deadline-enforced probes. Login/setup runs
@@ -8731,6 +9072,8 @@ fn isStoreMethod(method: []const u8) bool {
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_LIST) or
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_MESSAGE_LIST) or
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_TURN_RECORD) or
+        std.mem.eql(u8, method, store_protocol.METHOD_SURFACE_COMPLETION_OBSERVE) or
+        std.mem.eql(u8, method, store_protocol.METHOD_SURFACE_COMMIT_PROOF_CLASSIFY) or
         // M5-P2: the composite snapshot and cursor route through the same
         // classify → store-queue seam (A1) so they never run under the outer
         // lockDaemon window and own their lock choreography.
@@ -10104,6 +10447,8 @@ fn loadMessageListResult(
     const cursor_index = try decodeMessageIndex(request.cursor, if (is_backward) 'b' else 'f');
     const boundary: i64 = if (request.cursor) |_|
         (std.math.cast(i64, cursor_index) orelse return error.InvalidParams)
+    else if (is_backward and request.before_offset != null)
+        (std.math.cast(i64, request.before_offset.?) orelse return error.InvalidParams)
     else if (is_backward)
         std.math.maxInt(i64)
     else
@@ -10627,6 +10972,7 @@ fn loadStoreSnapshotTxn(
     workspace_filter: ?[]const u8,
     include_store: bool,
     include_workspaces: bool,
+    include_messages: bool,
 ) daemon_store.StoreError!LoadedStoreSnapshot {
     store.conn.execNoArgs("begin") catch return error.StoreUnavailable;
     var transaction_open = true;
@@ -10637,7 +10983,7 @@ fn loadStoreSnapshotTxn(
     if (include_store or include_workspaces) {
         // The workspaces-only scope skips thread/message hydration so the
         // reply stays far below the transport cap the full store scope hits.
-        snapshot = try loadSnapshotContents(arena, store, workspace_filter, include_store);
+        snapshot = try loadSnapshotContents(arena, store, workspace_filter, include_store, include_messages);
         snapshot.store_revision = store_revision;
     }
     store.conn.commit() catch return error.StoreUnavailable;
@@ -10682,13 +11028,15 @@ fn decodeAttachmentList(
     return list.items;
 }
 
-/// Materialize the typed store snapshot (workspaces → threads → messages,
-/// surfaces, completions) inside the caller's open read transaction.
+/// Materialize the typed store snapshot inside the caller's open read
+/// transaction. Core snapshots omit message bodies and expose the durable row
+/// count as `message_offset`; transcript pages hydrate those bodies separately.
 fn loadSnapshotContents(
     arena: std.mem.Allocator,
     store: *daemon_store.Store,
     workspace_filter: ?[]const u8,
     include_threads: bool,
+    include_messages: bool,
 ) daemon_store.StoreError!store_protocol.Snapshot {
     var snapshot: store_protocol.Snapshot = .{};
     if (store.conn.row("select selected_workspace_index, sidebar_collapsed from app_state where id = 1", .{}) catch return error.StoreUnavailable) |row| {
@@ -10768,7 +11116,8 @@ fn loadSnapshotContents(
                 \\       provider_thread_id, model_ref, reasoning_effort, reasoning_variant,
                 \\       fast_mode, access_mode, provider, harness, tui_dock_id, draft,
                 \\       draft_image_path, draft_image_mime, draft_image_byte_size, draft_images_json, cwd,
-                \\       profile_id, runtime_id, repository_id, repository_cwd
+                \\       profile_id, runtime_id, repository_id, repository_cwd,
+                \\       (select count(*) from messages where messages.thread_id = threads.id)
                 \\from threads where workspace_id = ?1 order by sort_index
             , .{workspace_row.row_id}) catch return error.StoreUnavailable;
             defer rows.deinit();
@@ -10804,6 +11153,10 @@ fn loadSnapshotContents(
                         .runtime_id = dupeOptionalText(arena, row.nullableText(22)) catch return error.OutOfMemory,
                         .repository_id = dupeOptionalText(arena, row.nullableText(23)) catch return error.OutOfMemory,
                         .repository_cwd = dupeOptionalText(arena, row.nullableText(24)) catch return error.OutOfMemory,
+                        .message_offset = if (include_messages)
+                            0
+                        else
+                            (std.math.cast(usize, row.int(25)) orelse return error.StoreCorrupt),
                     },
                 }) catch return error.OutOfMemory;
             }
@@ -10813,36 +11166,38 @@ fn loadSnapshotContents(
         var threads: std.ArrayList(store_protocol.Thread) = .empty;
         for (thread_rows.items) |*thread_row| {
             var messages: std.ArrayList(store_protocol.Message) = .empty;
-            var rows = store.conn.rows(
-                \\select message_id, role, author, body, image_path, image_mime,
-                \\       image_byte_size, tool_call_id, tool_call_kind, tool_call_status,
-                \\       created_at_ms, updated_at_ms, extra_images_json, sort_index
-                \\from messages where thread_id = ?1 order by sort_index
-            , .{thread_row.row_id}) catch return error.StoreUnavailable;
-            defer rows.deinit();
-            while (rows.next()) |row| {
-                const image: ?store_protocol.Attachment = if (row.nullableText(4)) |path| .{
-                    .path = arena.dupe(u8, path) catch return error.OutOfMemory,
-                    .mime = arena.dupe(u8, row.nullableText(5) orelse "") catch return error.OutOfMemory,
-                    .byte_size = if (row.nullableInt(6)) |value| (std.math.cast(usize, value) orelse 0) else 0,
-                } else null;
-                const images = try decodeAttachmentList(arena, image, row.nullableText(12));
-                messages.append(arena, .{
-                    .sort_index = std.math.cast(usize, row.int(13)) orelse return error.StoreCorrupt,
-                    .message_id = arena.dupe(u8, row.nullableText(0) orelse "") catch return error.OutOfMemory,
-                    .role = roleNameFromCode(row.int(1), row.text(2)),
-                    .author = arena.dupe(u8, row.text(2)) catch return error.OutOfMemory,
-                    .body = arena.dupe(u8, row.text(3)) catch return error.OutOfMemory,
-                    .images = images,
-                    .image = image,
-                    .tool_call_id = dupeOptionalText(arena, row.nullableText(7)) catch return error.OutOfMemory,
-                    .tool_call_kind = if (row.nullableInt(8)) |code| toolCallKindNameFromCode(code) else null,
-                    .tool_call_status = if (row.nullableInt(9)) |code| toolCallStatusNameFromCode(code) else null,
-                    .created_at_ms = row.nullableInt(10),
-                    .updated_at_ms = row.nullableInt(11),
-                }) catch return error.OutOfMemory;
+            if (include_messages) {
+                var rows = store.conn.rows(
+                    \\select message_id, role, author, body, image_path, image_mime,
+                    \\       image_byte_size, tool_call_id, tool_call_kind, tool_call_status,
+                    \\       created_at_ms, updated_at_ms, extra_images_json, sort_index
+                    \\from messages where thread_id = ?1 order by sort_index
+                , .{thread_row.row_id}) catch return error.StoreUnavailable;
+                defer rows.deinit();
+                while (rows.next()) |row| {
+                    const image: ?store_protocol.Attachment = if (row.nullableText(4)) |path| .{
+                        .path = arena.dupe(u8, path) catch return error.OutOfMemory,
+                        .mime = arena.dupe(u8, row.nullableText(5) orelse "") catch return error.OutOfMemory,
+                        .byte_size = if (row.nullableInt(6)) |value| (std.math.cast(usize, value) orelse 0) else 0,
+                    } else null;
+                    const images = try decodeAttachmentList(arena, image, row.nullableText(12));
+                    messages.append(arena, .{
+                        .sort_index = std.math.cast(usize, row.int(13)) orelse return error.StoreCorrupt,
+                        .message_id = arena.dupe(u8, row.nullableText(0) orelse "") catch return error.OutOfMemory,
+                        .role = roleNameFromCode(row.int(1), row.text(2)),
+                        .author = arena.dupe(u8, row.text(2)) catch return error.OutOfMemory,
+                        .body = arena.dupe(u8, row.text(3)) catch return error.OutOfMemory,
+                        .images = images,
+                        .image = image,
+                        .tool_call_id = dupeOptionalText(arena, row.nullableText(7)) catch return error.OutOfMemory,
+                        .tool_call_kind = if (row.nullableInt(8)) |code| toolCallKindNameFromCode(code) else null,
+                        .tool_call_status = if (row.nullableInt(9)) |code| toolCallStatusNameFromCode(code) else null,
+                        .created_at_ms = row.nullableInt(10),
+                        .updated_at_ms = row.nullableInt(11),
+                    }) catch return error.OutOfMemory;
+                }
+                if (rows.err) |_| return error.StoreUnavailable;
             }
-            if (rows.err) |_| return error.StoreUnavailable;
             thread_row.thread.messages = messages.items;
             threads.append(arena, thread_row.thread) catch return error.OutOfMemory;
         }
@@ -11349,6 +11704,19 @@ fn methodRunsUnlocked(method: []const u8) bool {
         // touches no daemon state, so never hold lockDaemon around filesystem I/O.
         std.mem.eql(u8, method, "provider.models.list") or
         std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDERS_STATUS) or
+        std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_AUTH_STATUS) or
+        std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_THREADS_LIST) or
+        std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_THREAD_READ) or
+        std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_THREAD_INTERRUPT) or
+        std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_THREAD_STEER) or
+        std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_SLASH_LIST) or
+        std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_SLASH_RUN) or
+        std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_CODEX_BACKGROUND_STATUS) or
+        std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_CODEX_BACKGROUND_TERMINATE) or
+        std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_INTEGRATIONS_INSPECT) or
+        std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_HOOKS_SET) or
+        std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_MCP_SET) or
+        std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_TITLE_GENERATE) or
         // Local access administration is daemon-owned SQLite work and takes
         // only its own short lockDaemon bookkeeping window.
         isAccessMethod(method) or
@@ -13557,6 +13925,26 @@ fn boundedTitleUtf8Prefix(value: []const u8, max_len: usize) []const u8 {
     return value[0..end];
 }
 
+fn providerThreadControlResponse(
+    allocator: std.mem.Allocator,
+    id_value: std.json.Value,
+    status: headless.providers_protocol.ThreadControlStatus,
+) ![]u8 {
+    return okValueResponse(allocator, id_value, headless.providers_protocol.ThreadControlResult{
+        .status = status,
+    });
+}
+
+fn providerTitleFailureResponse(
+    allocator: std.mem.Allocator,
+    id_value: std.json.Value,
+    message: []const u8,
+) ![]u8 {
+    return okValueResponse(allocator, id_value, headless.providers_protocol.TitleGenerateResult{
+        .error_message = message,
+    });
+}
+
 fn automaticTitleExpectedTitle(requested_title: []const u8, fallback_title: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, requested_title, fallback_title) or
         chat_threads.isPlaceholderThreadTitle(requested_title))
@@ -14928,6 +15316,51 @@ test "provider.models.list validates params and reports unavailable providers" {
     );
     defer allocator.free(codex);
     try std.testing.expect(std.mem.indexOf(u8, codex, "provider_unavailable") != null);
+}
+
+test "provider RPCs validate typed requests and expose slash metadata without connecting" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+
+    const invalid_read = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"provider.thread.read","params":{"provider":"codex","project_path":"/tmp"}}
+    );
+    defer allocator.free(invalid_read);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_read, "invalid_params") != null);
+
+    const slash_list = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":2,"method":"provider.slash.list","params":{"provider":"codex","project_path":"/tmp"}}
+    );
+    defer allocator.free(slash_list);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, slash_list, .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("result").?.object;
+    try std.testing.expectEqualStrings("codex", result.get("provider").?.string);
+    try std.testing.expect(result.get("commands").?.array.items.len > 0);
+
+    const fx_hook = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":3,"method":"provider.hooks.set","params":{"provider":"fx","installed":true}}
+    );
+    defer allocator.free(fx_hook);
+    try std.testing.expect(std.mem.indexOf(u8, fx_hook, "invalid_params") != null);
+
+    const missing_mcp_state = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":4,"method":"provider.mcp.set","params":{}}
+    );
+    defer allocator.free(missing_mcp_state);
+    try std.testing.expect(std.mem.indexOf(u8, missing_mcp_state, "invalid_params") != null);
+
+    const unsupported_title = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":5,"method":"provider.title.generate","params":{"provider":"pi","cwd":"/tmp","user_text":"hello","assistant_text":"world"}}
+    );
+    defer allocator.free(unsupported_title);
+    var title_parsed = try std.json.parseFromSlice(std.json.Value, allocator, unsupported_title, .{});
+    defer title_parsed.deinit();
+    try std.testing.expectEqualStrings(
+        "UnsupportedTitleProvider",
+        title_parsed.value.object.get("result").?.object.get("error_message").?.string,
+    );
 }
 
 test "finished retained turns report terminal status and wait maps them" {
@@ -18461,6 +18894,15 @@ test "Linux session CLI path drops replaced executable suffix" {
         "/opt/verde/bin/verde-daemon (deleted)",
         executablePathWithoutDeletedSuffix(.macos, "/opt/verde/bin/verde-daemon (deleted)"),
     );
+
+    const allocator = std.testing.allocator;
+    const daemon_cli = try resolvePosixCliPathAlloc(allocator, .linux, "/opt/verde/bin/verde-daemon (deleted)");
+    defer allocator.free(daemon_cli);
+    try std.testing.expectEqualStrings("/opt/verde/bin/verde", daemon_cli);
+
+    const gui_cli = try resolvePosixCliPathAlloc(allocator, .macos, "/Applications/Verde.app/Contents/MacOS/verde-gui");
+    defer allocator.free(gui_cli);
+    try std.testing.expectEqualStrings("/Applications/Verde.app/Contents/MacOS/verde", gui_cli);
 }
 
 test "Windows CLI resolver selects packaged console executable" {
@@ -18864,6 +19306,7 @@ test "durable reads decode canonical and historical daemon chat role codes" {
         "ws-dto",
         true,
         false,
+        true,
     ) catch |err| {
         daemon.store_service.?.mutex.unlock();
         return err;
@@ -18874,6 +19317,25 @@ test "durable reads decode canonical and historical daemon chat role codes" {
     for (snapshot_messages, expected_roles) |message, expected_role| {
         try std.testing.expectEqualStrings(expected_role, message.role);
     }
+
+    var compact_snapshot_arena: std.heap.ArenaAllocator = .init(allocator);
+    defer compact_snapshot_arena.deinit();
+    lockStoreService(daemon.store_service.?);
+    const compact_snapshot = loadStoreSnapshotTxn(
+        compact_snapshot_arena.allocator(),
+        &daemon.store_service.?.store,
+        "ws-dto",
+        true,
+        false,
+        false,
+    ) catch |err| {
+        daemon.store_service.?.mutex.unlock();
+        return err;
+    };
+    daemon.store_service.?.mutex.unlock();
+    const compact_thread = compact_snapshot.snapshot.workspaces[0].threads[0];
+    try std.testing.expectEqual(@as(usize, 0), compact_thread.messages.len);
+    try std.testing.expectEqual(expected_roles.len, compact_thread.message_offset);
 
     const record_response = try daemon.handleRequest(
         \\{"jsonrpc":"2.0","id":2,"method":"chat.turn.record","params":{"turn_id":"turn-dto"}}

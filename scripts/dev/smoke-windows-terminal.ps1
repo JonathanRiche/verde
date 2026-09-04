@@ -28,9 +28,7 @@ if ([string]::IsNullOrWhiteSpace($CliExe)) {
       $PrefixDir = Join-Path $RepoRoot $PrefixDir
     }
     $PrefixDir = (Resolve-Path -LiteralPath $PrefixDir).Path
-    $BuildCli = Join-Path $PrefixDir "bin\cli\verde.exe"
-    $PackageCli = Join-Path $PrefixDir "bin\verde.exe"
-    $CliExe = if (Test-Path -LiteralPath $BuildCli -PathType Leaf) { $BuildCli } else { $PackageCli }
+    $CliExe = Join-Path $PrefixDir "bin\verde.exe"
   } else {
     $AdjacentCli = Join-Path $ScriptDir "bin\verde.exe"
     $CliExe = if (Test-Path -LiteralPath $AdjacentCli -PathType Leaf) {

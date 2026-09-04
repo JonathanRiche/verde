@@ -332,7 +332,7 @@ function Test-EmbeddedManifest(
   }
 }
 
-$ExpectedExecutables = @("app/Verde.exe", "bin/verde.exe")
+$ExpectedExecutables = @("app/Verde.exe", "bin/verde.exe", "bin/verde-daemon.exe")
 $ExpectedAppUserModelId = "Verde.Desktop"
 $ExpectedDlls = @(
   "app/fff_c.dll",

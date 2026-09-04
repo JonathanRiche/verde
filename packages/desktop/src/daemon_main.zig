@@ -7,6 +7,7 @@ const headless = @import("headless");
 
 const platform_paths = @import("platform_paths");
 const platform_runtime = @import("platform_runtime");
+const cli = @import("cli/main.zig");
 const sessionizer = @import("terminal/sessionizer.zig");
 const access_protocol = headless.access_protocol;
 const connect_protocol = headless.connect_protocol;
@@ -90,6 +91,7 @@ const TerminationWatcher = if (builtin.os.tag == .windows) struct {
 };
 
 const Command = enum {
+    session_daemon_compat,
     help,
     version,
     init,
@@ -287,7 +289,7 @@ fn prepareAndExecute(
     unresolved_data_dir: []const u8,
 ) !void {
     try rejectInheritedSocketOverride(allocator);
-    if (options.command == .init or options.command == .serve) {
+    if (options.command == .session_daemon_compat or options.command == .init or options.command == .serve) {
         try std.Io.Dir.cwd().createDirPath(io, unresolved_data_dir);
     }
     const data_dir = try canonicalDataDir(allocator, io, unresolved_data_dir);
@@ -302,6 +304,7 @@ fn execute(
     data_dir: []const u8,
 ) !void {
     switch (options.command) {
+        .session_daemon_compat => try sessionizer.runDaemonWithMcp(allocator, data_dir, cli.handleMcpHttpRequest),
         .init => try handleInit(allocator, io, data_dir, options.json),
         .serve => try handleServe(allocator, io, data_dir),
         .status => try handleStatus(allocator, io, data_dir, options.json),
@@ -1280,7 +1283,9 @@ fn parseArgs(argv: []const []const u8) ParseError!Options {
 
     var command: Command = undefined;
     var option_start: usize = 2;
-    if (std.mem.eql(u8, first, "version") or std.mem.eql(u8, first, "--version")) {
+    if (std.mem.eql(u8, first, "__session-daemon")) {
+        command = .session_daemon_compat;
+    } else if (std.mem.eql(u8, first, "version") or std.mem.eql(u8, first, "--version")) {
         command = .version;
     } else if (std.mem.eql(u8, first, "init")) {
         command = .init;
@@ -1506,7 +1511,7 @@ fn parseArgs(argv: []const []const u8) ParseError!Options {
         }
         return error.InvalidArguments;
     }
-    if (command == .serve and result.json) return error.JsonUnavailable;
+    if ((command == .session_daemon_compat or command == .serve) and result.json) return error.JsonUnavailable;
     if (command == .workspace_show) {
         if (result.repository_bind.workspace_id == null) return error.InvalidArguments;
     } else if (command == .workspace_bind) {
@@ -1764,6 +1769,9 @@ fn writeStderr(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
 }
 
 test "daemon CLI parses every public command" {
+    const compat_options = try parseArgs(&.{ "verde-daemon", "__session-daemon", "--data-dir", "/srv/verde" });
+    try std.testing.expectEqual(Command.session_daemon_compat, compat_options.command);
+
     const init_options = try parseArgs(&.{ "verde-daemon", "init", "--data-dir", "/srv/verde", "--json" });
     try std.testing.expectEqual(Command.init, init_options.command);
     try std.testing.expectEqualStrings("/srv/verde", init_options.data_dir.?);

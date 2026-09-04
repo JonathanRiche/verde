@@ -21,7 +21,7 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
-if pgrep -f '[V]erde.app/Contents/MacOS/verde' >/dev/null 2>&1; then
+if pgrep -f '[V]erde.app/Contents/MacOS/verde(-gui)?' >/dev/null 2>&1; then
   echo "Verde is already running; close it before this smoke so cleanup is safe" >&2
   exit 1
 fi

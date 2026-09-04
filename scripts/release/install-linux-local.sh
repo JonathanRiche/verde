@@ -56,6 +56,7 @@ warn_missing_wpe_runtime() {
 }
 
 install -m 755 "$SCRIPT_DIR/bin/verde" "$PREFIX/bin/verde"
+install -m 755 "$SCRIPT_DIR/bin/verde-gui" "$PREFIX/bin/verde-gui"
 for runtime_binary in verde-server verde-daemon verde-web; do
   if [[ -x "$SCRIPT_DIR/bin/$runtime_binary" ]]; then
     install -m 755 "$SCRIPT_DIR/bin/$runtime_binary" "$PREFIX/bin/$runtime_binary"

@@ -6,15 +6,13 @@ const profiler = @import("runtime/profiler.zig");
 const chat_markdown = @import("ui/chat_markdown.zig");
 const chat_handoff = @import("chat/handoff.zig");
 const app_config = @import("app/config.zig");
-const ai_harness = @import("providers/harness.zig");
 const browser_inspector = @import("browser/inspector.zig");
 const browser_runtime = @import("browser/mod.zig");
 const browser_screenshot = @import("browser/screenshot.zig");
 const bang_commands = @import("workspace/bang_commands.zig");
 const chat_threads = @import("chat/threads.zig");
-const db_client = @import("db/client.zig");
 const db_types = @import("db/types.zig");
-const daemon_store = @import("daemon/store.zig");
+const test_backend = if (builtin.is_test) @import("root").test_backend else struct {};
 const keybinds = @import("app/keybinds.zig");
 const loop_wakeup = @import("loop_wakeup");
 const platform_paths = @import("platform_paths");
@@ -23,20 +21,20 @@ const platform_process = @import("platform/process.zig");
 const platform_ipc = @import("platform/ipc.zig");
 const workspace_identity = @import("platform/workspace_identity.zig");
 const process_env = @import("platform/env.zig");
-const provider_hooks = @import("providers/hooks.zig");
-const provider_mcp = @import("providers/mcp.zig");
 const runtime_profile_store = @import("runtime/profile_store.zig");
 const runtime_secret_store = @import("runtime/secret_store.zig");
 const runtime_workspace_defaults = @import("runtime/workspace_runtime_defaults.zig");
 const RuntimeService = @import("runtime/service.zig");
 const thread_binding = @import("runtime/thread_binding.zig");
 const runtime_log = @import("runtime/log.zig");
-const send_runner = @import("chat/send_runner.zig");
 const slash_commands = @import("chat/slash_commands.zig");
 const stack_config = @import("workspace/stack.zig");
 const stb_image = @import("media/stb_image.zig");
-const sessionizer = @import("terminal/sessionizer.zig");
+const daemon_client = @import("daemon/client.zig");
 const headless = @import("headless");
+const provider_types = headless.provider_types;
+const providers_protocol = headless.providers_protocol;
+const session_protocol = headless.session_protocol;
 const terminal = @import("terminal/terminal.zig");
 const theme = @import("ui/theme.zig");
 const text_measure = @import("ui/text_measure.zig");
@@ -52,6 +50,7 @@ const herdr_types = @import("state/herdr_types.zig");
 const project_state = @import("state/project.zig");
 const state_storage = @import("state/storage.zig");
 const persistence = @import("state/persistence.zig");
+const protocol_projection = @import("state/protocol_projection.zig");
 const command_controller = @import("state/command_controller.zig");
 const acknowledgement_controller = @import("state/acknowledgement_controller.zig");
 const composer_controller = @import("state/composer_controller.zig");
@@ -349,18 +348,15 @@ fn fetchOwnedProjectionSnapshot(
     var refresh_owned = true;
     defer if (refresh_owned) refresh.deinit();
     const allocator = refresh.arena.allocator();
-    var transport: sessionizer.HeadlessTransport = .{
+    var transport: daemon_client.HeadlessTransport = .{
         .allocator = allocator,
         .pref_path = storage.pref_path,
     };
-    var client = sessionizer.headlessClient(allocator, &transport);
-    // The durable store can be far larger than the protocol-20 8 MiB
-    // transport ceiling. Capture the cursor and volatile scopes from the live
-    // daemon, then read SQLite locally through a separate coherent RO
-    // transaction. Because the daemon captures the cursor first and the RO
-    // load happens last, concurrent changes can only be over-delivered by the
-    // first core.changes poll.
+    var client = daemon_client.headlessClient(allocator, &transport);
+    // The daemon owns both durable and volatile state. Its store snapshot is
+    // already transcript-bounded, so the GUI never opens SQLite directly.
     const scopes = [_][]const u8{
+        headless.store.SNAPSHOT_SCOPE_STORE,
         headless.store.SNAPSHOT_SCOPE_REGISTRY,
         headless.store.SNAPSHOT_SCOPE_SESSIONS,
         headless.store.SNAPSHOT_SCOPE_TURNS,
@@ -381,14 +377,13 @@ fn fetchOwnedProjectionSnapshot(
         return null;
     }
     if (include_durable) {
-        failure_reason.* = "durable projection load failed";
-        var durable = storage.loadProjection(storage.allocator) catch return null;
-        if (durable.store_revision < refresh.result.store_revision) {
-            failure_reason.* = "durable store behind live daemon revision";
-            durable.deinit();
-            return null;
-        }
-        refresh.result.store_revision = durable.store_revision;
+        var durable = LoadedPersistedState.init(storage.allocator);
+        failure_reason.* = "durable projection conversion failed";
+        durable.value = protocol_projection.snapshotToPersisted(
+            durable.allocator(),
+            refresh.result.snapshot,
+        ) catch return null;
+        durable.store_revision = refresh.result.store_revision;
         refresh.durable = durable;
     } else {
         refresh.seed_store_revision = storage.currentProjectionObservedRevision();
@@ -404,11 +399,11 @@ fn fetchOwnedProjectionSnapshot(
 fn pollCoreChangesOnce(storage: *const Storage, loop: *ChangeCursorLoopState, cursor: u64) ChangeCursorPollOutcome {
     var decode_arena = std.heap.ArenaAllocator.init(storage.allocator);
     defer decode_arena.deinit();
-    var transport: sessionizer.HeadlessTransport = .{
+    var transport: daemon_client.HeadlessTransport = .{
         .allocator = decode_arena.allocator(),
         .pref_path = storage.pref_path,
     };
-    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+    var client = daemon_client.headlessClient(decode_arena.allocator(), &transport);
     const request: headless.changes_protocol.ChangesRequest = .{
         .cursor = cursor,
         .wait_ms = CHANGE_CURSOR_WAIT_MS,
@@ -588,14 +583,41 @@ fn changeCursorLoopMain(storage: *const Storage, loop: *ChangeCursorLoopState) v
     log.info("change-cursor loop exiting", .{});
 }
 
-fn refreshProviderMcpRegistrations(allocator: std.mem.Allocator, pref_path: []const u8) !provider_mcp.Summary {
+fn inspectProviderIntegrations(allocator: std.mem.Allocator, pref_path: []const u8) !providers_protocol.IntegrationsInspectResult {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var transport: daemon_client.HeadlessTransport = .{ .allocator = arena.allocator(), .pref_path = pref_path };
+    var client = daemon_client.headlessClient(arena.allocator(), &transport);
+    var parsed = try client.callProviderIntegrationsInspect(headless.Capabilities.phase1());
+    defer parsed.deinit();
+    return client.decodeProviderIntegrationsInspect(&parsed);
+}
+
+fn setProviderHooks(allocator: std.mem.Allocator, pref_path: []const u8, provider: providers_protocol.ManagedHookProvider) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var transport: daemon_client.HeadlessTransport = .{ .allocator = arena.allocator(), .pref_path = pref_path };
+    var client = daemon_client.headlessClient(arena.allocator(), &transport);
+    var parsed = try client.callProviderHooksSet(headless.Capabilities.phase1(), .{ .provider = provider, .installed = true });
+    defer parsed.deinit();
+    const result = try client.decodeProviderHooksSet(&parsed);
+    if (result.provider != provider or !result.installed) return error.InvalidDaemonResponse;
+}
+
+fn refreshProviderMcpRegistrations(allocator: std.mem.Allocator, pref_path: []const u8) !providers_protocol.McpSummary {
     var threaded = std.Io.Threaded.init_single_threaded;
     const exe_path = try std.process.executablePathAlloc(threaded.io(), allocator);
     defer allocator.free(exe_path);
     // The daemon owns the HTTP listener and persists its final bound port.
     // Wait for it before copying that endpoint into all provider configs.
-    try sessionizer.ensureDaemon(allocator, pref_path, exe_path);
-    return provider_mcp.install(allocator);
+    try daemon_client.ensureDaemon(allocator, pref_path, exe_path);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var transport: daemon_client.HeadlessTransport = .{ .allocator = arena.allocator(), .pref_path = pref_path };
+    var client = daemon_client.headlessClient(arena.allocator(), &transport);
+    var parsed = try client.callProviderMcpSet(headless.Capabilities.phase1(), .{ .installed = true });
+    defer parsed.deinit();
+    return (try client.decodeProviderMcpSet(&parsed)).summary;
 }
 
 fn changeCursorSleep(loop: *ChangeCursorLoopState, total_ms: u64) void {
@@ -606,182 +628,6 @@ fn changeCursorSleep(loop: *ChangeCursorLoopState, total_ms: u64) void {
         platform_runtime.sleepMillis(slice);
         remaining -= slice;
     }
-}
-
-fn snapshotEnum(comptime T: type, value: ?[]const u8, fallback: T) T {
-    const text = value orelse return fallback;
-    return std.meta.stringToEnum(T, text) orelse fallback;
-}
-
-fn snapshotOptionalEnum(comptime T: type, value: ?[]const u8) ?T {
-    const text = value orelse return null;
-    return std.meta.stringToEnum(T, text);
-}
-
-fn snapshotAttachment(source: ?headless.store.Attachment) ?PersistedImageAttachment {
-    const image = source orelse return null;
-    return .{ .path = image.path, .mime = image.mime, .byte_size = image.byte_size };
-}
-
-/// Extras past the primary from a wire full-list ([primary] ++ extras).
-/// Borrows strings from the wire snapshot, matching `snapshotAttachment`.
-fn snapshotAttachmentExtras(
-    allocator: std.mem.Allocator,
-    images: []const headless.store.Attachment,
-) ![]const PersistedImageAttachment {
-    if (images.len <= 1) return &.{};
-    const out = try allocator.alloc(PersistedImageAttachment, images.len - 1);
-    for (images[1..], 0..) |image, index| out[index] = snapshotAttachment(image).?;
-    return out;
-}
-
-fn snapshotMessageToPersisted(allocator: std.mem.Allocator, message: headless.store.Message) !PersistedMessage {
-    const image = if (message.images.len > 0) message.images[0] else message.image;
-    return .{
-        .role = snapshotEnum(ChatRole, message.role, .system),
-        .author = message.author,
-        .body = message.body,
-        .image = snapshotAttachment(image),
-        .extra_images = try snapshotAttachmentExtras(allocator, message.images),
-        .tool_call_id = message.tool_call_id,
-        .tool_call_kind = snapshotOptionalEnum(ai_harness.ToolCallKind, message.tool_call_kind),
-        .tool_call_status = snapshotOptionalEnum(ai_harness.ToolCallStatus, message.tool_call_status),
-        .message_id = if (message.message_id.len == 0) null else message.message_id,
-    };
-}
-
-fn snapshotMessagesToPersisted(
-    allocator: std.mem.Allocator,
-    messages: []const headless.store.Message,
-) ![]PersistedMessage {
-    const out = try allocator.alloc(PersistedMessage, messages.len);
-    for (messages, 0..) |message, index| out[index] = try snapshotMessageToPersisted(allocator, message);
-    return out;
-}
-
-fn snapshotThreadToPersisted(
-    allocator: std.mem.Allocator,
-    thread: headless.store.Thread,
-) !PersistedThread {
-    return .{
-        .title = thread.title,
-        .archived = thread.archived,
-        .committed = thread.committed,
-        .local_thread_id = thread.local_thread_id,
-        .last_activity_at = thread.last_activity_at,
-        .provider_thread_id = thread.provider_thread_id,
-        .model_ref = thread.model_ref,
-        .reasoning_effort = snapshotOptionalEnum(ReasoningEffort, thread.reasoning_effort),
-        .reasoning_variant = thread.reasoning_variant,
-        .fast_mode = snapshotOptionalEnum(FastMode, thread.fast_mode),
-        .access_mode = snapshotOptionalEnum(AccessMode, thread.access_mode),
-        .provider = snapshotEnum(Provider, thread.provider, .opencode),
-        .harness = snapshotEnum(Harness, thread.harness, .local_cli),
-        .tui_dock_id = thread.tui_dock_id,
-        .cwd = thread.cwd,
-        .profile_id = thread.profile_id,
-        .runtime_id = thread.runtime_id,
-        .repository_id = thread.repository_id,
-        .repository_cwd = thread.repository_cwd,
-        .draft = thread.draft,
-        .draft_image = snapshotAttachment(thread.draft_image),
-        .draft_extra_images = try snapshotAttachmentExtras(allocator, thread.draft_images),
-        .message_offset = thread.message_offset,
-        .messages = try snapshotMessagesToPersisted(allocator, thread.messages),
-    };
-}
-
-fn snapshotWorkspaceToPersisted(
-    allocator: std.mem.Allocator,
-    workspace: headless.store.Workspace,
-) !PersistedProject {
-    const threads = try allocator.alloc(PersistedThread, workspace.threads.len);
-    for (workspace.threads, 0..) |thread, index| {
-        threads[index] = try snapshotThreadToPersisted(allocator, thread);
-    }
-    const herdr_link: ?PersistedHerdrWorkspaceLink = if (workspace.herdr_link) |link| .{
-        .remote_alias = link.remote_alias,
-        .session_name = link.session_name,
-        .workspace_id = link.workspace_id,
-        .local_dir = link.local_dir,
-        .remote_cwd = link.remote_cwd,
-        .last_pane_id = link.last_pane_id,
-        .attach_dock_id = link.attach_dock_id,
-        .attach_pane_id = link.attach_pane_id,
-        .pane_links_json = link.pane_links_json,
-        .updated_at_ms = link.updated_at_ms,
-    } else null;
-    return .{
-        .id = workspace.workspace_id,
-        .label = workspace.label,
-        .path = workspace.path,
-        .archived = workspace.archived,
-        .unread_count = @intCast(@min(workspace.unread_count, std.math.maxInt(u8))),
-        .collapsed = workspace.collapsed,
-        .thread_list_expanded = workspace.thread_list_expanded,
-        .terminal_height = workspace.terminal_height,
-        .terminal_layout_json = workspace.terminal_layout_json,
-        .terminal_docks_json = workspace.terminal_docks_json,
-        .workspace_layout_json = workspace.workspace_layout_json,
-        .selected_thread_index = workspace.selected_thread_index,
-        .companion_thread_local_id = workspace.companion_thread_local_id,
-        .herdr_link = herdr_link,
-        .threads = threads,
-        .provider = snapshotEnum(Provider, workspace.provider, .opencode),
-        .harness = snapshotEnum(Harness, workspace.harness, .local_cli),
-        .draft = workspace.draft,
-        .messages = try snapshotMessagesToPersisted(allocator, workspace.messages),
-    };
-}
-
-/// Convert the daemon DTO into the exact projection shape used by the legacy
-/// RO pull. The result borrows strings from the owned composite refresh and
-/// owns only its temporary arrays; applyPersisted duplicates durable data.
-fn compositeSnapshotToPersisted(
-    allocator: std.mem.Allocator,
-    snapshot: headless.store.Snapshot,
-) !PersistedState {
-    const projects = try allocator.alloc(PersistedProject, snapshot.workspaces.len);
-    for (snapshot.workspaces, 0..) |workspace, index| {
-        projects[index] = try snapshotWorkspaceToPersisted(allocator, workspace);
-    }
-    const surfaces = try allocator.alloc(PersistedSurfaceState, snapshot.surface_states.len);
-    for (snapshot.surface_states, 0..) |surface, index| {
-        surfaces[index] = .{
-            .session_id = surface.session_id,
-            .workspace_id = surface.workspace_id,
-            .workspace_path = surface.workspace_path,
-            .dock_id = surface.dock_id,
-            .pane_id = surface.pane_id,
-            .provider = snapshotOptionalEnum(db_types.SurfaceProvider, surface.provider),
-            .provider_thread_id = surface.provider_thread_id,
-            .title = surface.title,
-            .status = snapshotEnum(db_types.SurfaceStatus, surface.status, .idle),
-            .status_changed_at_ms = surface.status_changed_at_ms,
-            .completed_at_ms = surface.completed_at_ms,
-            .last_event_title = surface.last_event_title,
-            .last_event_body = surface.last_event_body,
-        };
-    }
-    const completions = try allocator.alloc(PersistedChatCompletion, snapshot.chat_completions.len);
-    for (snapshot.chat_completions, 0..) |completion, index| {
-        completions[index] = .{
-            .workspace_id = completion.workspace_id,
-            .local_thread_id = completion.local_thread_id,
-            .completed_at_ms = completion.completed_at_ms,
-        };
-    }
-    return .{
-        .selected_project_index = snapshot.selected_workspace_index,
-        .sidebar_collapsed = snapshot.sidebar_collapsed,
-        .projects = projects,
-        .surface_states = surfaces,
-        .chat_completions = completions,
-        .provider = snapshotOptionalEnum(Provider, snapshot.provider),
-        .harness = snapshotOptionalEnum(Harness, snapshot.harness),
-        .draft = snapshot.draft,
-        .messages = if (snapshot.messages) |messages| try snapshotMessagesToPersisted(allocator, messages) else null,
-    };
 }
 
 fn projectIndexById(projects: []const PersistedProject, id: []const u8) ?usize {
@@ -2055,19 +1901,6 @@ pub const ChatRole = provider_models.ChatRole;
 pub const Provider = provider_models.Provider;
 pub const AgentTuiProvider = stack_config.AgentProvider;
 pub const Harness = provider_models.Harness;
-
-fn harnessProviderForDbProvider(provider: Provider) ai_harness.Provider {
-    return switch (provider) {
-        .opencode => .opencode,
-        .codex => .codex,
-        .claude => .claude,
-        .cursor => .cursor,
-        .pi => .pi,
-        .fx => .fx,
-        .grok => .grok,
-        .muse => .muse,
-    };
-}
 
 fn slashCommandPrefix(raw_text: []const u8) ?[]const u8 {
     const text = std.mem.trim(u8, raw_text, " \t\r\n");
@@ -4065,8 +3898,6 @@ const PersistedThread = db_types.PersistedThread;
 const LoadedPersistedState = db_types.LoadedState;
 
 // `utils.zig` owns the cross-cutting runtime helpers that are shared with the UI shell.
-const SendWorkerRequest = utils.SendWorkerRequest;
-const approvalPolicyForMode = utils.approvalPolicyForMode;
 const captureClipboardImage = utils.captureClipboardImage;
 const extensionForImageMime = utils.extensionForImageMime;
 const cancelLingeringToolCallEvents = utils.cancelLingeringToolCallEvents;
@@ -4080,9 +3911,6 @@ const freePendingTimelineEvents = utils.freePendingTimelineEvents;
 const freePendingTimelineEventsLocked = utils.freePendingTimelineEventsLocked;
 const pendingTimelineEventsContainAssistant = utils.pendingTimelineEventsContainAssistant;
 const pickerWorker = utils.pickerWorker;
-const sandboxModeForMode = utils.sandboxModeForMode;
-const serviceTierForMode = utils.serviceTierForMode;
-const sendWorker = utils.sendWorker;
 const upsertPendingToolCallEvent = utils.upsertPendingToolCallEvent;
 const uploadTexture = utils.uploadTexture;
 
@@ -4908,7 +4736,8 @@ pub const AppState = struct {
         if (state.app_config.mcp_integration_enabled) {
             state.settings_controller.mcp_summary = refreshProviderMcpRegistrations(state.allocator, state.storage.pref_path) catch |err| blk: {
                 log.warn("failed to refresh enabled provider MCP registrations: {s}", .{@errorName(err)});
-                break :blk provider_mcp.inspect(state.allocator);
+                const integrations = inspectProviderIntegrations(state.allocator, state.storage.pref_path) catch break :blk .{};
+                break :blk integrations.mcp;
             };
         }
         return state;
@@ -6226,6 +6055,64 @@ pub const AppState = struct {
         self.clearThreadImportThreads();
     }
 
+    fn startProviderThreadOperation(
+        self: *AppState,
+        kind: provider_controller.ProviderThreadOperationKind,
+        provider: Provider,
+        project_index: usize,
+        thread_index: ?usize,
+        project_path: []const u8,
+        thread_id: ?[]const u8,
+    ) bool {
+        self.pollProviderThreadOperation();
+        const allocator = std.heap.page_allocator;
+        const request = allocator.create(provider_controller.ProviderThreadOperationRequest) catch return false;
+        request.* = .{
+            .kind = kind,
+            .provider = provider,
+            .project_index = project_index,
+            .thread_index = thread_index,
+            .pref_path = allocator.dupe(u8, self.storage.pref_path) catch {
+                allocator.destroy(request);
+                return false;
+            },
+            .project_path = undefined,
+            .thread_id = null,
+        };
+        request.project_path = allocator.dupe(u8, project_path) catch {
+            allocator.free(request.pref_path);
+            allocator.destroy(request);
+            return false;
+        };
+        if (thread_id) |id| {
+            request.thread_id = allocator.dupe(u8, id) catch {
+                allocator.free(request.project_path);
+                allocator.free(request.pref_path);
+                allocator.destroy(request);
+                return false;
+            };
+        }
+
+        const operation = &self.provider_controller.thread_operation;
+        operation.mutex.lock();
+        defer operation.mutex.unlock();
+        if (operation.status != .idle) {
+            request.deinit();
+            return false;
+        }
+        operation.request = request;
+        operation.result = null;
+        operation.failure = null;
+        operation.status = .pending;
+        operation.worker = std.Thread.spawn(.{}, provider_controller.providerThreadOperationWorker, .{ operation, request }) catch {
+            operation.request = null;
+            operation.status = .idle;
+            request.deinit();
+            return false;
+        };
+        return true;
+    }
+
     pub fn refreshThreadImportList(self: *AppState) void {
         const provider = self.thread_import_provider orelse return;
         const project_index = self.thread_import_project_index orelse return;
@@ -6237,79 +6124,11 @@ pub const AppState = struct {
         self.clearThreadImportThreads();
 
         const project = &self.project_controller.projects.items[project_index];
-        const provider_config = switch (provider) {
-            .codex => ai_harness.ProviderConfig{
-                .codex = .{
-                    .cwd = project.path,
-                    .launch_on_connect = true,
-                },
-            },
-            .opencode => ai_harness.ProviderConfig{
-                .opencode = .{
-                    .allocator = self.allocator,
-                    .working_directory = project.path,
-                    .launch_if_missing = true,
-                },
-            },
-            .claude => ai_harness.ProviderConfig{
-                .claude = .{
-                    .cwd = project.path,
-                },
-            },
-            .pi => ai_harness.ProviderConfig{
-                .pi = .{
-                    .cwd = project.path,
-                },
-            },
-            .muse => ai_harness.ProviderConfig{ .muse = .{ .cwd = project.path } },
-            .cursor, .fx, .grok => return self.setThreadImportNotice(importThreadFailureMessage(provider, error.UnsupportedOperation)),
-        };
-
-        var client = ai_harness.connect(self.allocator, provider_config) catch |err| {
-            self.setThreadImportNotice(importThreadFailureMessage(provider, err));
-            return;
-        };
-        defer client.deinit();
-
-        const provider_threads = client.listThreads(self.allocator) catch |err| {
-            self.setThreadImportNotice(importThreadFailureMessage(provider, err));
-            return;
-        };
-        defer {
-            for (provider_threads) |thread| {
-                self.allocator.free(thread.id);
-                self.allocator.free(thread.title);
-            }
-            self.allocator.free(provider_threads);
-        }
-
-        for (provider_threads) |thread| {
-            const owned_id = self.allocator.dupeZ(u8, thread.id) catch {
-                self.setThreadImportNotice(failedToStoreThreadListNotice(provider));
-                return;
-            };
-            errdefer self.allocator.free(owned_id);
-            const owned_title = self.allocator.dupeZ(u8, thread.title) catch {
-                self.setThreadImportNotice(failedToStoreThreadListNotice(provider));
-                return;
-            };
-            errdefer self.allocator.free(owned_title);
-
-            self.thread_import_threads.append(self.allocator, .{
-                .id = owned_id,
-                .title = owned_title,
-            }) catch {
-                self.setThreadImportNotice(failedToStoreThreadListNotice(provider));
-                return;
-            };
-        }
-
-        if (self.thread_import_threads.items.len == 0) {
-            self.setThreadImportNotice(noRecentThreadsNotice(provider));
+        if (!self.startProviderThreadOperation(.list, provider, project_index, null, project.path, null)) {
+            self.setThreadImportNotice(importThreadFailureMessage(provider, error.ProviderOperationBusy));
             return;
         }
-
-        self.setThreadImportNotice(selectThreadNotice(provider));
+        self.setThreadImportNotice("Loading recent provider threads...");
     }
 
     pub fn threadImportThreadIdBuffer(self: *AppState) [:0]u8 {
@@ -6417,88 +6236,11 @@ pub const AppState = struct {
         }
 
         const project = &self.project_controller.projects.items[project_index];
-        const provider_config = switch (provider) {
-            .codex => ai_harness.ProviderConfig{
-                .codex = .{
-                    .cwd = project.path,
-                    .launch_on_connect = true,
-                },
-            },
-            .opencode => ai_harness.ProviderConfig{
-                .opencode = .{
-                    .allocator = self.allocator,
-                    .working_directory = project.path,
-                    .launch_if_missing = true,
-                },
-            },
-            .claude => ai_harness.ProviderConfig{
-                .claude = .{
-                    .cwd = project.path,
-                },
-            },
-            .pi => ai_harness.ProviderConfig{
-                .pi = .{
-                    .cwd = project.path,
-                },
-            },
-            .muse => ai_harness.ProviderConfig{ .muse = .{ .cwd = project.path } },
-            .cursor, .fx, .grok => return self.setThreadImportNotice(importThreadFailureMessage(provider, error.UnsupportedOperation)),
-        };
-
-        var client = ai_harness.connect(self.allocator, provider_config) catch |err| {
-            self.setThreadImportNotice(importThreadFailureMessage(provider, err));
+        if (!self.startProviderThreadOperation(.import_thread, provider, project_index, null, project.path, trimmed_id)) {
+            self.setThreadImportNotice(importThreadFailureMessage(provider, error.ProviderOperationBusy));
             return;
-        };
-        defer client.deinit();
-
-        const imported_thread = client.readThread(self.allocator, trimmed_id) catch |err| {
-            log.warn("failed to read {s} thread for import id_len={d}: {s}", .{ @tagName(provider), trimmed_id.len, @errorName(err) });
-            self.setThreadImportNotice(readThreadFailureMessage(provider, err));
-            return;
-        };
-        defer imported_thread.deinit(self.allocator);
-
-        var imported = self.buildImportedThread(imported_thread, null) catch |err| {
-            log.warn("failed to build imported {s} thread id_len={d}: {s}", .{ @tagName(provider), trimmed_id.len, @errorName(err) });
-            self.setThreadImportNotice(failedCreateImportedThreadNotice(provider));
-            return;
-        };
-        errdefer imported.deinit(self.allocator);
-
-        if (std.mem.eql(u8, imported.title, trimmed_id)) {
-            if (self.threadImportListTitleForId(trimmed_id)) |list_title| {
-                const title_copy = self.allocator.dupeZ(u8, list_title) catch {
-                    self.setThreadImportNotice(failedCreateImportedThreadNotice(provider));
-                    return;
-                };
-                self.allocator.free(imported.title);
-                imported.title = title_copy;
-            }
         }
-
-        imported.provider = provider;
-        if (imported.model_ref) |model_ref| {
-            self.allocator.free(model_ref);
-            imported.model_ref = null;
-        }
-        const model_ref = imported_thread.model_id orelse self.cachedDefaultModelRefForProvider(provider);
-        imported.model_ref = self.allocator.dupeZ(u8, model_ref) catch {
-            self.setThreadImportNotice(failedCreateImportedThreadNotice(provider));
-            return;
-        };
-
-        self.project_controller.projects.items[project_index].threads.append(self.allocator, imported) catch {
-            self.setThreadImportNotice(failedAddImportedThreadNotice(provider));
-            return;
-        };
-        self.project_controller.projects.items[project_index].invalidateSidebarThreadCache();
-        self.project_controller.selected_index = project_index;
-        self.project_controller.projects.items[project_index].selected_thread_index = self.project_controller.projects.items[project_index].threads.items.len - 1;
-        self.requestComposerFocus();
-        self.requestTranscriptScrollToBottom();
-        self.markDirty();
-        self.setSidebarNotice(threadImportedNotice(provider));
-        self.cancelThreadImport();
+        self.setThreadImportNotice("Importing provider thread...");
     }
 
     pub fn syncThreadFromProvider(self: *AppState, project_index: usize, thread_index: usize) void {
@@ -6519,66 +6261,192 @@ pub const AppState = struct {
         }
 
         const provider = project.threads.items[thread_index].provider;
-        const provider_config = switch (provider) {
-            .codex => ai_harness.ProviderConfig{
-                .codex = .{
-                    .cwd = project.path,
-                    .launch_on_connect = true,
-                },
-            },
-            .opencode => ai_harness.ProviderConfig{
-                .opencode = .{
-                    .allocator = self.allocator,
-                    .working_directory = project.path,
-                    .launch_if_missing = true,
-                },
-            },
-            .claude => ai_harness.ProviderConfig{
-                .claude = .{
-                    .cwd = project.path,
-                },
-            },
-            .pi => ai_harness.ProviderConfig{
-                .pi = .{
-                    .cwd = project.path,
-                },
-            },
-            .muse => ai_harness.ProviderConfig{ .muse = .{ .cwd = project.path } },
-            .cursor, .fx, .grok => {
-                self.setSidebarNotice(syncThreadFailureMessage(provider, error.UnsupportedOperation));
-                return;
-            },
-        };
-
         const provider_thread_id = project.threads.items[thread_index].provider_thread_id orelse {
             self.setSidebarNotice("This thread is not linked to a remote provider session.");
             return;
         };
+        if (!self.startProviderThreadOperation(.sync_thread, provider, project_index, thread_index, project.path, provider_thread_id)) {
+            self.setSidebarNotice(syncThreadFailureMessage(provider, error.ProviderOperationBusy));
+            return;
+        }
+        self.setSidebarNotice("Syncing provider thread...");
+    }
 
-        var client = ai_harness.connect(self.allocator, provider_config) catch |err| {
-            self.setSidebarNotice(syncThreadFailureMessage(provider, err));
+    pub fn pollProviderThreadOperation(self: *AppState) void {
+        const operation = &self.provider_controller.thread_operation;
+        operation.mutex.lock();
+        if (operation.status != .completed) {
+            operation.mutex.unlock();
+            return;
+        }
+        const worker = operation.worker.?;
+        const request = operation.request.?;
+        const result = operation.result;
+        const failure = operation.failure;
+        operation.worker = null;
+        operation.request = null;
+        operation.result = null;
+        operation.failure = null;
+        operation.status = .idle;
+        operation.mutex.unlock();
+
+        worker.join();
+        defer request.deinit();
+        defer if (result) |value| value.deinit();
+
+        if (failure) |err| {
+            switch (request.kind) {
+                .list => if (self.thread_import_provider == request.provider and self.thread_import_project_index == request.project_index)
+                    self.setThreadImportNotice(importThreadFailureMessage(request.provider, err)),
+                .import_thread => if (self.thread_import_provider == request.provider and self.thread_import_project_index == request.project_index)
+                    self.setThreadImportNotice(readThreadFailureMessage(request.provider, err)),
+                .sync_thread => self.setSidebarNotice(syncThreadFailureMessage(request.provider, err)),
+            }
+            self.markDirty();
+            return;
+        }
+
+        switch (result orelse return) {
+            .list => |threads| self.applyProviderThreadList(request, threads),
+            .read => |thread| switch (request.kind) {
+                .import_thread => self.applyProviderThreadImport(request, thread),
+                .sync_thread => self.applyProviderThreadSync(request, thread),
+                .list => {},
+            },
+        }
+    }
+
+    fn finishProviderThreadOperation(self: *AppState) void {
+        const operation = &self.provider_controller.thread_operation;
+        operation.mutex.lock();
+        const worker = operation.worker;
+        operation.mutex.unlock();
+        if (worker) |thread| thread.join();
+
+        operation.mutex.lock();
+        const request = operation.request;
+        const result = operation.result;
+        operation.worker = null;
+        operation.request = null;
+        operation.result = null;
+        operation.failure = null;
+        operation.status = .idle;
+        operation.mutex.unlock();
+        if (result) |value| value.deinit();
+        if (request) |value| value.deinit();
+    }
+
+    fn applyProviderThreadList(
+        self: *AppState,
+        request: *const provider_controller.ProviderThreadOperationRequest,
+        threads: []const provider_types.ChatThreadSummary,
+    ) void {
+        if (self.thread_import_provider != request.provider or self.thread_import_project_index != request.project_index) return;
+        self.clearThreadImportThreads();
+        for (threads) |thread| {
+            const owned_id = self.allocator.dupeZ(u8, thread.id) catch {
+                self.setThreadImportNotice(failedToStoreThreadListNotice(request.provider));
+                return;
+            };
+            const owned_title = self.allocator.dupeZ(u8, thread.title) catch {
+                self.allocator.free(owned_id);
+                self.setThreadImportNotice(failedToStoreThreadListNotice(request.provider));
+                return;
+            };
+            self.thread_import_threads.append(self.allocator, .{
+                .id = owned_id,
+                .title = owned_title,
+            }) catch {
+                self.allocator.free(owned_id);
+                self.allocator.free(owned_title);
+                self.setThreadImportNotice(failedToStoreThreadListNotice(request.provider));
+                return;
+            };
+        }
+        self.setThreadImportNotice(if (threads.len == 0) noRecentThreadsNotice(request.provider) else selectThreadNotice(request.provider));
+        self.markDirty();
+    }
+
+    fn applyProviderThreadImport(
+        self: *AppState,
+        request: *const provider_controller.ProviderThreadOperationRequest,
+        imported_thread: provider_types.ReadThreadResult,
+    ) void {
+        if (self.thread_import_provider != request.provider or self.thread_import_project_index != request.project_index) return;
+        if (request.project_index >= self.project_controller.projects.items.len) return;
+        const requested_id = request.thread_id orelse return;
+        if (self.findThreadIndexByProviderThreadId(request.project_index, request.provider, requested_id)) |thread_index| {
+            self.project_controller.selected_index = request.project_index;
+            self.project_controller.projects.items[request.project_index].selected_thread_index = thread_index;
+            self.setSidebarNotice(duplicateThreadNotice(request.provider));
+            self.cancelThreadImport();
+            return;
+        }
+
+        var imported = self.buildImportedThread(imported_thread, null) catch |err| {
+            log.warn("failed to build imported {s} thread id_len={d}: {s}", .{ @tagName(request.provider), requested_id.len, @errorName(err) });
+            self.setThreadImportNotice(failedCreateImportedThreadNotice(request.provider));
             return;
         };
-        defer client.deinit();
+        var imported_owned = true;
+        defer if (imported_owned) imported.deinit(self.allocator);
 
-        const imported_thread = client.readThread(self.allocator, provider_thread_id) catch |err| {
-            self.setSidebarNotice(syncThreadFailureMessage(provider, err));
+        if (std.mem.eql(u8, imported.title, requested_id)) {
+            if (self.threadImportListTitleForId(requested_id)) |list_title| {
+                const title_copy = self.allocator.dupeZ(u8, list_title) catch {
+                    self.setThreadImportNotice(failedCreateImportedThreadNotice(request.provider));
+                    return;
+                };
+                self.allocator.free(imported.title);
+                imported.title = title_copy;
+            }
+        }
+
+        imported.provider = request.provider;
+        if (imported.model_ref) |model_ref| self.allocator.free(model_ref);
+        const model_ref = imported_thread.model_id orelse self.cachedDefaultModelRefForProvider(request.provider);
+        imported.model_ref = self.allocator.dupeZ(u8, model_ref) catch {
+            self.setThreadImportNotice(failedCreateImportedThreadNotice(request.provider));
             return;
         };
-        defer imported_thread.deinit(self.allocator);
+        self.project_controller.projects.items[request.project_index].threads.append(self.allocator, imported) catch {
+            self.setThreadImportNotice(failedAddImportedThreadNotice(request.provider));
+            return;
+        };
+        imported_owned = false;
+        self.project_controller.projects.items[request.project_index].invalidateSidebarThreadCache();
+        self.project_controller.selected_index = request.project_index;
+        self.project_controller.projects.items[request.project_index].selected_thread_index = self.project_controller.projects.items[request.project_index].threads.items.len - 1;
+        self.requestComposerFocus();
+        self.requestTranscriptScrollToBottom();
+        self.markDirty();
+        self.setSidebarNotice(threadImportedNotice(request.provider));
+        self.cancelThreadImport();
+    }
 
-        self.replaceThreadWithImportedSnapshot(project_index, thread_index, imported_thread) catch {
+    fn applyProviderThreadSync(
+        self: *AppState,
+        request: *const provider_controller.ProviderThreadOperationRequest,
+        imported_thread: provider_types.ReadThreadResult,
+    ) void {
+        if (request.project_index >= self.project_controller.projects.items.len) return;
+        const thread_index = request.thread_index orelse return;
+        const project = &self.project_controller.projects.items[request.project_index];
+        if (thread_index >= project.threads.items.len) return;
+        const expected_id = request.thread_id orelse return;
+        const current_id = project.threads.items[thread_index].provider_thread_id orelse return;
+        if (project.threads.items[thread_index].provider != request.provider or !std.mem.eql(u8, current_id, expected_id)) return;
+        self.replaceThreadWithImportedSnapshot(request.project_index, thread_index, imported_thread) catch {
             self.setSidebarNotice("Failed to sync the local thread.");
             return;
         };
-
-        self.project_controller.selected_index = project_index;
-        self.project_controller.projects.items[project_index].selected_thread_index = thread_index;
+        self.project_controller.selected_index = request.project_index;
+        self.project_controller.projects.items[request.project_index].selected_thread_index = thread_index;
         self.requestComposerFocus();
         self.syncRenameBuffer();
         self.requestTranscriptScrollToBottom();
         self.markDirty();
-        self.setSidebarNotice(threadSyncedNotice(provider));
+        self.setSidebarNotice(threadSyncedNotice(request.provider));
     }
 
     pub fn finishProjectRename(self: *AppState) void {
@@ -7113,7 +6981,6 @@ pub const AppState = struct {
     pub const pendingFollowupSnapshot = chat_controller.pendingFollowupSnapshot;
     pub const pendingFollowupSnapshotCached = chat_controller.pendingFollowupSnapshotCached;
     pub const pendingFollowupHint = chat_controller.pendingFollowupHint;
-    pub const sendPromptViaHarness = chat_controller.sendPromptViaHarness;
     pub const interruptThreadViaHarness = chat_controller.interruptThreadViaHarness;
     pub const steerThreadViaHarness = chat_controller.steerThreadViaHarness;
     pub const steerDaemonChatTurn = chat_controller.steerDaemonChatTurn;
@@ -7356,6 +7223,7 @@ pub const AppState = struct {
     pub const closeCommandPalette = command_controller.closeCommandPalette;
     pub const commandPaletteQuery = command_controller.commandPaletteQuery;
     pub const commandPaletteQueryBuffer = command_controller.commandPaletteQueryBuffer;
+    pub const pollProviderSlashCatalog = command_controller.pollProviderSlashCatalog;
     pub const flushIfDirty = lifecycle_controller.flushIfDirty;
     pub const pollFlushWorker = lifecycle_controller.pollFlushWorker;
     pub const flushDirtyBlocking = lifecycle_controller.flushDirtyBlocking;
@@ -8310,7 +8178,7 @@ pub const AppState = struct {
         self: *AppState,
         project_index: usize,
         thread_index: usize,
-        imported_thread: ai_harness.ReadThreadResult,
+        imported_thread: provider_types.ReadThreadResult,
     ) !void {
         if (project_index >= self.project_controller.projects.items.len) return error.ProjectNotFound;
         const project = &self.project_controller.projects.items[project_index];
@@ -8328,7 +8196,7 @@ pub const AppState = struct {
 
     fn buildImportedThread(
         self: *AppState,
-        imported_thread: ai_harness.ReadThreadResult,
+        imported_thread: provider_types.ReadThreadResult,
         existing_template: ?*const ChatThread,
     ) !ChatThread {
         var hydrated = try ChatThread.init(self.allocator, imported_thread.title);
@@ -8399,7 +8267,7 @@ pub const AppState = struct {
         return hydrated;
     }
 
-    fn importedChatMessage(self: *AppState, message: ai_harness.ChatMessage) !ChatMessage {
+    fn importedChatMessage(self: *AppState, message: provider_types.ChatMessage) !ChatMessage {
         const author = try self.dupeZ(message.author);
         errdefer self.allocator.free(author);
         const body = try self.dupeZ(message.body);
@@ -8896,9 +8764,11 @@ pub const AppState = struct {
         };
     }
 
-    pub fn slashCommandPickerActive(self: *const AppState) bool {
+    pub fn slashCommandPickerActive(self: *AppState) bool {
         if (self.project_controller.projects.items.len == 0) return false;
-        return slashCommandPrefix(self.currentDraft()) != null;
+        if (slashCommandPrefix(self.currentDraft()) == null) return false;
+        _ = command_controller.ensureProviderSlashCatalog(self);
+        return true;
     }
 
     pub fn slashCommandPickerSelectedIndex(self: *const AppState) usize {
@@ -8914,7 +8784,7 @@ pub const AppState = struct {
         for (slash_commands.LOCAL_COMMANDS) |command| {
             if (slashCommandMatchesPrefix(command.name, prefix)) count += 1;
         }
-        const provider_commands = ai_harness.slashCommandsForProvider(harnessProviderForDbProvider(self.currentThread().provider));
+        const provider_commands = command_controller.providerSlashCommands(self);
         for (provider_commands) |command| {
             if (slashCommandMatchesPrefix(command.name, prefix)) count += 1;
         }
@@ -8940,7 +8810,7 @@ pub const AppState = struct {
             current += 1;
         }
         const thread = self.currentThread();
-        const provider_commands = ai_harness.slashCommandsForProvider(harnessProviderForDbProvider(thread.provider));
+        const provider_commands = command_controller.providerSlashCommands(self);
         for (provider_commands) |command| {
             if (!slashCommandMatchesPrefix(command.name, prefix)) continue;
             if (current == index) {
@@ -9028,8 +8898,11 @@ pub const AppState = struct {
             return true;
         }
 
-        const thread = self.currentThread();
-        const commands = ai_harness.slashCommandsForProvider(harnessProviderForDbProvider(thread.provider));
+        if (!command_controller.ensureProviderSlashCatalog(self)) {
+            self.setSidebarNotice("Loading provider commands...");
+            return true;
+        }
+        const commands = command_controller.providerSlashCommands(self);
         for (commands) |command| {
             if (command.id != .usage or command.availability != .available) continue;
 
@@ -9135,9 +9008,9 @@ pub const AppState = struct {
     /// Viewport-sized first page for a cold thread, bulk pages afterwards.
     fn transcriptHydrationPageLimit(materialized_count: usize) usize {
         return if (materialized_count == 0)
-            db_client.TRANSCRIPT_FIRST_PAGE_SIZE
+            session_protocol.TRANSCRIPT_FIRST_PAGE_SIZE
         else
-            db_client.TRANSCRIPT_MESSAGE_PAGE_SIZE;
+            session_protocol.TRANSCRIPT_MESSAGE_PAGE_SIZE;
     }
 
     /// Prepend an already-loaded older durable page to the identified thread,
@@ -10078,36 +9951,22 @@ pub const AppState = struct {
     }
 
     fn ensureManagedAgentProjectHooks(self: *AppState, project_path: []const u8, process: *const ManagedProcess) !void {
+        _ = project_path;
         if (!(process.kind == .agent and process.hooks)) return;
-        switch (process.provider orelse return) {
-            .codex => {
-                try provider_hooks.ensureCodexGlobalHooks(self.allocator);
-                try provider_hooks.removeCodexProjectHooks(self.allocator, project_path);
-            },
-            .claude => provider_hooks.ensureClaudeGlobalHooks(self.allocator) catch |err| {
-                log.warn("could not install Claude global status hooks: {s}", .{@errorName(err)});
-            },
-            // Hooks add status reporting but are not required to run Cursor.
-            // Keep automatic TUI launch fail-open for malformed user config;
-            // explicit Settings/CLI installation still reports the error.
-            .cursor => provider_hooks.ensureCursorProjectHooks(self.allocator, project_path) catch |err| {
-                log.warn("could not install Cursor project status hooks: {s}", .{@errorName(err)});
-            },
-            // Grok project hooks require an explicit folder-trust grant. Its
-            // personal hook is guarded by Verde pane environment variables,
-            // so it remains inert in every other terminal.
-            .grok => provider_hooks.ensureGrokGlobalHooks(self.allocator) catch |err| {
-                log.warn("could not install Grok personal status hooks: {s}", .{@errorName(err)});
-            },
-            .opencode => provider_hooks.ensureOpencodeGlobalHooks(self.allocator) catch |err| {
-                log.warn("could not install OpenCode global status plugin: {s}", .{@errorName(err)});
-            },
-            .amp => provider_hooks.ensureAmpGlobalHooks(self.allocator) catch |err| {
-                log.warn("could not install Amp global status plugin: {s}", .{@errorName(err)});
-            },
-            .muse => {},
-            .other => {},
-        }
+        const provider: providers_protocol.ManagedHookProvider = switch (process.provider orelse return) {
+            .codex => .codex,
+            .claude => .claude,
+            .cursor => .cursor,
+            .grok => .grok,
+            .opencode => .opencode,
+            .amp => .amp,
+            .muse, .other => return,
+        };
+        setProviderHooks(self.allocator, self.storage.pref_path, provider) catch |err| {
+            log.warn("could not install {s} lifecycle integration through daemon: {s}", .{ @tagName(provider), @errorName(err) });
+            // Lifecycle reporting remains fail-open for provider TUI launch.
+            if (provider == .codex) return err;
+        };
     }
 
     pub fn openAgentTui(self: *AppState, project_index: usize, provider: stack_config.AgentProvider) !bool {
@@ -10180,8 +10039,8 @@ pub const AppState = struct {
         new_after: bool,
     ) !bool {
         if (project_index >= self.project_controller.projects.items.len) return false;
-        provider_hooks.ensureAmpGlobalHooks(self.allocator) catch |err| {
-            log.warn("could not install Amp global status plugin: {s}", .{@errorName(err)});
+        setProviderHooks(self.allocator, self.storage.pref_path, .amp) catch |err| {
+            log.warn("could not install Amp global status plugin through daemon: {s}", .{@errorName(err)});
         };
         self.project_controller.selected_index = project_index;
         self.ensureCurrentProjectWorkspace();
@@ -10571,7 +10430,11 @@ pub const AppState = struct {
 
     fn handleProviderSlashCommand(self: *AppState, raw_text: []const u8) bool {
         const thread = self.currentThread();
-        const provider_commands = ai_harness.slashCommandsForProvider(harnessProviderForDbProvider(thread.provider));
+        if (!command_controller.ensureProviderSlashCatalog(self)) {
+            self.setSidebarNotice("Loading provider commands...");
+            return true;
+        }
+        const provider_commands = command_controller.providerSlashCommands(self);
         const parsed = slash_commands.parse(raw_text, provider_commands);
         switch (parsed) {
             .not_slash => return false,
@@ -10591,7 +10454,7 @@ pub const AppState = struct {
                 // names are forwarded rather than rejected.
                 if (thread.provider == .claude or thread.provider == .grok) {
                     const provider_label = utils.providerLabel(thread.provider);
-                    const command: ai_harness.ProviderSlashCommand = .{
+                    const command: provider_types.ProviderSlashCommand = .{
                         .id = .custom,
                         .name = unknown.name,
                         .summary = if (thread.provider == .grok) "Grok agent slash command." else "Claude SDK slash command.",
@@ -10638,7 +10501,7 @@ pub const AppState = struct {
 
     fn beginProviderSlashCommand(
         self: *AppState,
-        command: ai_harness.ProviderSlashCommand,
+        command: provider_types.ProviderSlashCommand,
         args: []const u8,
         raw_text: []const u8,
     ) !void {
@@ -10663,17 +10526,21 @@ pub const AppState = struct {
 
         const request = try page_alloc.create(SlashCommandWorkerRequest);
         errdefer page_alloc.destroy(request);
+        const pref_path = try page_alloc.dupe(u8, self.storage.pref_path);
+        errdefer page_alloc.free(pref_path);
+        const project_path = try page_alloc.dupe(u8, project.path);
+        errdefer page_alloc.free(project_path);
         request.* = .{
             .provider = thread.provider,
             .harness = thread.harness,
-            .project_path = try page_alloc.dupe(u8, project.path),
+            .pref_path = pref_path,
+            .project_path = project_path,
             .thread_id = if (thread.provider_thread_id) |thread_id| try page_alloc.dupe(u8, thread_id) else null,
             .command = command.id,
             .raw_text = try page_alloc.dupe(u8, raw_text),
             .args = try page_alloc.dupe(u8, args),
         };
         errdefer {
-            page_alloc.free(request.project_path);
             if (request.thread_id) |thread_id| page_alloc.free(thread_id);
             page_alloc.free(request.raw_text);
             page_alloc.free(request.args);
@@ -10921,7 +10788,7 @@ pub const AppState = struct {
         };
     }
 
-    fn companionOperationStatus(status: ?ai_harness.ToolCallStatus) ?companion_controller.OperationStatus {
+    fn companionOperationStatus(status: ?provider_types.ToolCallStatus) ?companion_controller.OperationStatus {
         return switch (status orelse .unknown) {
             .pending => .pending,
             .in_progress => .in_progress,
@@ -10932,7 +10799,7 @@ pub const AppState = struct {
         };
     }
 
-    fn companionToolTitle(author: []const u8, kind: ?ai_harness.ToolCallKind, status: ?ai_harness.ToolCallStatus) []const u8 {
+    fn companionToolTitle(author: []const u8, kind: ?provider_types.ToolCallKind, status: ?provider_types.ToolCallStatus) []const u8 {
         if ((kind orelse .other) != .execute) return author;
         return if ((status orelse .unknown) == .failed) "Command failed" else "Ran command";
     }
@@ -10942,8 +10809,8 @@ pub const AppState = struct {
         identity: []const u8,
         author: []const u8,
         body: []const u8,
-        kind: ?ai_harness.ToolCallKind,
-        status: ?ai_harness.ToolCallStatus,
+        kind: ?provider_types.ToolCallKind,
+        status: ?provider_types.ToolCallStatus,
         sequence: i64,
         live_event: ?*const PendingTimelineEvent,
     ) void {
@@ -11389,7 +11256,7 @@ pub const AppState = struct {
         _ = self.companion_composer.handleInput(self.allocator, .{ .focus = false }) catch {};
     }
 
-    pub fn resolveCurrentCompanionApproval(self: *AppState, decision: ai_harness.ApprovalDecision) bool {
+    pub fn resolveCurrentCompanionApproval(self: *AppState, decision: provider_types.ApprovalDecision) bool {
         if (self.project_controller.projects.items.len == 0) return false;
         const project = self.currentProject();
         const local_id = project.companion_thread_local_id orelse return false;
@@ -13636,6 +13503,8 @@ pub const AppState = struct {
         runtime_log.diagnostic("AppState.deinit picker finished", .{});
         self.finishSlashCommandThread();
         runtime_log.diagnostic("AppState.deinit slash command finished", .{});
+        command_controller.finishProviderSlashCatalog(self);
+        runtime_log.diagnostic("AppState.deinit provider slash catalog finished", .{});
         self.finishOpencodeModelCacheThread();
         runtime_log.diagnostic("AppState.deinit opencode model cache finished", .{});
         self.finishClaudeModelCacheThread();
@@ -13650,6 +13519,8 @@ pub const AppState = struct {
         runtime_log.diagnostic("AppState.deinit grok model cache finished", .{});
         self.finishProviderReadinessThread();
         runtime_log.diagnostic("AppState.deinit provider readiness finished", .{});
+        self.finishProviderThreadOperation();
+        runtime_log.diagnostic("AppState.deinit provider thread operation finished", .{});
         self.deinitBackgroundTaskPoller();
         runtime_log.diagnostic("AppState.deinit background task poller finished", .{});
         self.finishTranscriptHydrationWorker();
@@ -13683,8 +13554,6 @@ pub const AppState = struct {
         }
         self.chat_controller.deinit(self.allocator);
         runtime_log.diagnostic("AppState.deinit chat controller finished", .{});
-        ai_harness.shutdownOwnedProviderProcesses();
-        runtime_log.diagnostic("AppState.deinit provider processes shutdown", .{});
         shutdown_watchdog_state_durable.store(true, .release);
         chat_controller.deinitProcessGlobalState(self.storage.pref_path);
         runtime_log.diagnostic("AppState.deinit dirty state durable", .{});
@@ -13998,7 +13867,7 @@ pub const AppState = struct {
         var persisted = if (durable) |projection|
             projection
         else
-            try compositeSnapshotToPersisted(conversion_arena.allocator(), result.snapshot);
+            try protocol_projection.snapshotToPersisted(conversion_arena.allocator(), result.snapshot);
         if (adoption_repair) try self.validateAdoptionRepairsForRefresh(persisted);
         // Keep the user's pane focus/viewport: patch the snapshot before the
         // baseline clone so the applied layout and baseline stay identical.
@@ -14683,26 +14552,12 @@ pub const AppState = struct {
                 return false;
             };
             const target = self.providerExecutionTargetForProjectThread(project_index, thread, 0) orelse return false;
-            const config: ai_harness.ProviderConfig = .{ .codex = .{
-                .cwd = target.cwd(),
-                .launch_on_connect = false,
-            } };
-            var client = ai_harness.connect(self.allocator, config) catch |err| {
-                log.warn("failed to connect for background task stop: {s}", .{@errorName(err)});
-                self.setSidebarNotice("Failed to connect to Codex to stop the background task.");
+            _ = thread_id;
+            _ = process_id;
+            if (!chat_controller.requestCodexBackgroundTaskTermination(self, thread, task, target.cwd())) {
+                self.setSidebarNotice("A Codex background task check is already running. Try again shortly.");
                 return false;
-            };
-            defer client.deinit();
-            client.terminateBackgroundTerminal(thread_id, process_id) catch |err| {
-                log.warn("failed to stop Codex background task: {s}", .{@errorName(err)});
-                self.setSidebarNotice("Codex could not stop the background task.");
-                return false;
-            };
-            task.stop_requested = true;
-            task.status = .stopped;
-            const body = backgroundTaskCompletionBodyAlloc(self.allocator, task) catch return false;
-            defer self.allocator.free(body);
-            self.appendMessageToThread(thread, .system, "Background task stopped", body, null, &.{}) catch return false;
+            }
             self.markDirty();
             return true;
         }
@@ -15046,8 +14901,8 @@ test "lazy transcript hydration trims a durable page overlap by message identity
 }
 
 test "transcript hydration first page is viewport sized, later pages bulk" {
-    try std.testing.expectEqual(db_client.TRANSCRIPT_FIRST_PAGE_SIZE, AppState.transcriptHydrationPageLimit(0));
-    try std.testing.expectEqual(db_client.TRANSCRIPT_MESSAGE_PAGE_SIZE, AppState.transcriptHydrationPageLimit(1));
+    try std.testing.expectEqual(session_protocol.TRANSCRIPT_FIRST_PAGE_SIZE, AppState.transcriptHydrationPageLimit(0));
+    try std.testing.expectEqual(session_protocol.TRANSCRIPT_MESSAGE_PAGE_SIZE, AppState.transcriptHydrationPageLimit(1));
 }
 
 /// Shared harness for the async-hydration commit tests: a minimal AppState
@@ -15092,7 +14947,7 @@ fn testCompletedHydrationArgs(state: *AppState, before_offset: usize) !*Transcri
         .workspace_id = workspace_id,
         .local_thread_id = try allocator.dupe(u8, thread.local_thread_id),
         .before_offset = before_offset,
-        .limit = db_client.TRANSCRIPT_FIRST_PAGE_SIZE,
+        .limit = session_protocol.TRANSCRIPT_FIRST_PAGE_SIZE,
         .generation = state.transcript_hydration.generation,
         .page = .{ .arena = arena, .offset = 0, .messages = page_messages },
     };
@@ -15730,7 +15585,7 @@ test "completed OpenCode model refresh tolerates zero workspaces" {
     const allocator = std.testing.allocator;
     const page = std.heap.page_allocator;
 
-    const models = try page.alloc(ai_harness.ModelInfo, 1);
+    const models = try page.alloc(provider_types.ModelInfo, 1);
     models[0] = .{
         .provider_id = try page.dupe(u8, "test-provider"),
         .provider_name = try page.dupe(u8, "Test Provider"),
@@ -17408,9 +17263,9 @@ test "workspace selection restores focused pane keyboard ownership" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
     const pref_path = path_buf[0..path_len];
-    const db_path = try std.fs.path.joinZ(allocator, &.{ pref_path, db_client.STATE_DB_NAME });
+    const db_path = try std.fs.path.joinZ(allocator, &.{ pref_path, test_backend.db_client.STATE_DB_NAME });
     defer allocator.free(db_path);
-    var store = try daemon_store.Store.init(allocator, db_path);
+    var store = try test_backend.daemon_store.Store.init(allocator, db_path);
     defer store.deinit();
     var protocol_arena = std.heap.ArenaAllocator.init(allocator);
     defer protocol_arena.deinit();
@@ -17500,7 +17355,7 @@ test "workspace selection restores focused pane keyboard ownership" {
     });
     try std.testing.expect(second_write.applied);
     try std.testing.expectEqual(@as(u64, 2), second_write.store_revision);
-    var reader = try db_client.Client.initReadOnly(allocator, pref_path);
+    var reader = try test_backend.db_client.Client.initReadOnly(allocator, pref_path);
     defer reader.deinit();
     var reloaded = (try reader.load(allocator)).?;
     defer reloaded.deinit();
@@ -19163,7 +19018,7 @@ test "M5-P4 composite conversion matches the pull-driven durable projection" {
         .path = "/tmp/daemon-workspace",
         .threads = &threads,
     }};
-    const persisted = try compositeSnapshotToPersisted(arena.allocator(), .{
+    const persisted = try protocol_projection.snapshotToPersisted(arena.allocator(), .{
         .store_revision = 11,
         .workspaces = &workspaces,
         .chat_completions = &.{.{
@@ -19237,7 +19092,7 @@ test "M5-P4 composite conversion matches the pull-driven durable projection" {
 
     // Tombstone/deletion equivalence: both production paths replace the prior
     // workspace projection with the same empty durable snapshot.
-    const deleted = try compositeSnapshotToPersisted(arena.allocator(), .{
+    const deleted = try protocol_projection.snapshotToPersisted(arena.allocator(), .{
         .store_revision = 12,
         .workspaces = &.{},
     });
@@ -20300,7 +20155,7 @@ test "M5-P4 stalled daemon worker cannot block frame-side bridge drain" {
     defer std.testing.allocator.free(pref_path);
     defer std.Io.Dir.cwd().deleteTree(std.testing.io, pref_path) catch {};
     try std.Io.Dir.cwd().createDirPath(std.testing.io, pref_path);
-    const endpoint = try sessionizer.socketPath(std.testing.allocator, pref_path);
+    const endpoint = try daemon_client.socketPath(std.testing.allocator, pref_path);
     defer std.testing.allocator.free(endpoint);
     const StallServer = struct {
         allocator: std.mem.Allocator,

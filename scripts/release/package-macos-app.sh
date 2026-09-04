@@ -121,6 +121,7 @@ mkdir -p \
   "$APP_DIR/Contents/share/verde"
 
 install -m 755 "$PREFIX_DIR/bin/verde" "$APP_DIR/Contents/MacOS/verde"
+install -m 755 "$PREFIX_DIR/bin/verde-gui" "$APP_DIR/Contents/MacOS/verde-gui"
 install -m 755 "$PREFIX_DIR/bin/verde-server" "$APP_DIR/Contents/MacOS/verde-server"
 install -m 755 "$PREFIX_DIR/bin/verde-daemon" "$APP_DIR/Contents/MacOS/verde-daemon"
 install -m 755 "$PREFIX_DIR/bin/verde-web" "$APP_DIR/Contents/MacOS/verde-web"
@@ -134,6 +135,7 @@ if [[ -e "$APP_DIR/Contents/Resources/node_modules" ]]; then
   exit 1
 fi
 set_macos_build_version "$APP_DIR/Contents/MacOS/verde"
+set_macos_build_version "$APP_DIR/Contents/MacOS/verde-gui"
 
 cat > "$APP_DIR/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

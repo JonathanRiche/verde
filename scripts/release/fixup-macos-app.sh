@@ -278,7 +278,7 @@ sign_app_bundle() {
   fi
 }
 
-neutralize_swift_modhash_segment "$MACOS_DIR/verde"
+neutralize_swift_modhash_segment "$MACOS_DIR/verde-gui"
 ensure_bundled_dependency 'libfff_c\.dylib' "$FFF_LIB" "$DESIRED_FFF_REF"
 bundle_dependency_from_existing_ref "$TREE_SITTER_PATTERN"
 bundle_dependency_from_existing_ref "$SDL3_TTF_PATTERN"

@@ -184,7 +184,7 @@ if [[ ! -d "$APP_DIR" ]]; then
   exit 1
 fi
 
-APP_BIN="$APP_DIR/Contents/MacOS/verde"
+APP_BIN="$APP_DIR/Contents/MacOS/verde-gui"
 SWIFT_SHIM="packages/desktop/src/browser/platform/macos_wkwebview.swift"
 
 if [[ ! -x "$APP_BIN" ]]; then

@@ -3,7 +3,7 @@
 const std = @import("std");
 const project_state = @import("project.zig");
 const process_registry = @import("../daemon/process_registry.zig");
-const ai_harness = @import("../providers/harness.zig");
+const provider_types = @import("headless").provider_types;
 const chat_threads = @import("../chat/threads.zig");
 const runtime_log = @import("../runtime/log.zig");
 const terminal = @import("../terminal/terminal.zig");
@@ -591,7 +591,7 @@ pub fn stopWorkspaceChatPane(self: anytype, pane_id: WorkspacePaneId) bool {
     return self.stopWorkspaceChatPaneForProject(self.project_controller.selected_index, pane_id);
 }
 
-pub fn approveWorkspaceChatPaneForProject(self: anytype, project_index: usize, pane_id: WorkspacePaneId, decision: ai_harness.ApprovalDecision) bool {
+pub fn approveWorkspaceChatPaneForProject(self: anytype, project_index: usize, pane_id: WorkspacePaneId, decision: provider_types.ApprovalDecision) bool {
     if (project_index >= self.project_controller.projects.items.len) return false;
     const project = &self.project_controller.projects.items[project_index];
     const pane = project.workspace_layout.paneById(pane_id) orelse return false;
@@ -603,7 +603,7 @@ pub fn approveWorkspaceChatPaneForProject(self: anytype, project_index: usize, p
     return self.resolveThreadApprovalByLocalId(project.id, project.threads.items[thread_index].local_thread_id, decision);
 }
 
-pub fn approveWorkspaceChatPane(self: anytype, pane_id: WorkspacePaneId, decision: ai_harness.ApprovalDecision) bool {
+pub fn approveWorkspaceChatPane(self: anytype, pane_id: WorkspacePaneId, decision: provider_types.ApprovalDecision) bool {
     if (self.project_controller.projects.items.len == 0) return false;
     return self.approveWorkspaceChatPaneForProject(self.project_controller.selected_index, pane_id, decision);
 }
@@ -1698,7 +1698,7 @@ fn buildSubagentSource(
     allocator: std.mem.Allocator,
     identity: []const u8,
     body: []const u8,
-    status: ?ai_harness.ToolCallStatus,
+    status: ?provider_types.ToolCallStatus,
 ) !SubagentSource {
     const parsed = chat_types.parseSubagentConversation(body);
     const result_src = if (parsed.result.len > 0) parsed.result else subagentStatusFallback(status);
@@ -1711,7 +1711,7 @@ fn buildSubagentSource(
     };
 }
 
-fn subagentStatusFallback(status: ?ai_harness.ToolCallStatus) []const u8 {
+fn subagentStatusFallback(status: ?provider_types.ToolCallStatus) []const u8 {
     return switch (status orelse .unknown) {
         .pending, .in_progress => "This subagent is still running.",
         .cancelled => "This subagent was cancelled.",

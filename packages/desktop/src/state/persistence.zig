@@ -12,6 +12,7 @@ const terminal = @import("../terminal/terminal.zig");
 const chat_types = @import("chat_types.zig");
 const herdr_types = @import("herdr_types.zig");
 const project_state = @import("project.zig");
+const test_backend = if (@import("builtin").is_test) @import("root").test_backend else struct {};
 
 const log = std.log.scoped(.native_shell);
 const LoadedPersistedState = db_types.LoadedState;
@@ -1631,7 +1632,6 @@ test "message identities survive the genuine snapshot chain into a real store" {
     // ids) → threadSnapshot → persistedStateToProtocolSnapshot → daemon store
     // applySnapshot — must preserve daemon-minted and client identities and
     // mint `snap-msg-{i}` only for legacy id-less rows.
-    const store_mod = @import("../daemon/store.zig");
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -1681,7 +1681,7 @@ test "message identities survive the genuine snapshot chain into a real store" {
     try std.testing.expectEqualStrings("turn:turn-x:msg:1", wire_messages[1].message_id);
     try std.testing.expectEqualStrings("snap-msg-2", wire_messages[2].message_id);
 
-    var writer = try store_mod.Store.init(allocator, db_path);
+    var writer = try test_backend.daemon_store.Store.init(allocator, db_path);
     defer writer.deinit();
     _ = try writer.replaceSnapshot(.{
         .mutation = .{

@@ -3,7 +3,6 @@
 const std = @import("std");
 
 const storage_mod = @import("storage.zig");
-const db_client = @import("../db/client.zig");
 const db_types = @import("../db/types.zig");
 const platform_runtime = @import("platform_runtime");
 const surface_controller = @import("surface_controller.zig");
@@ -12,6 +11,30 @@ const Storage = storage_mod.Storage;
 const log = std.log.scoped(.native_shell);
 const CHAT_RETRY_MIN_MS: i64 = 1_000;
 const CHAT_RETRY_MAX_MS: i64 = 30_000;
+
+fn optionalTextEqual(actual: ?[]const u8, expected: ?[]const u8) bool {
+    if (actual) |actual_value| {
+        return if (expected) |expected_value| std.mem.eql(u8, actual_value, expected_value) else false;
+    }
+    return expected == null;
+}
+
+// Compare every field in the std-only durable surface representation.
+fn surfaceStatesEqual(a: db_types.PersistedSurfaceState, b: db_types.PersistedSurfaceState) bool {
+    return std.mem.eql(u8, a.session_id, b.session_id) and
+        std.mem.eql(u8, a.workspace_id, b.workspace_id) and
+        std.mem.eql(u8, a.workspace_path, b.workspace_path) and
+        a.dock_id == b.dock_id and
+        a.pane_id == b.pane_id and
+        a.provider == b.provider and
+        optionalTextEqual(a.provider_thread_id, b.provider_thread_id) and
+        std.mem.eql(u8, a.title, b.title) and
+        a.status == b.status and
+        a.status_changed_at_ms == b.status_changed_at_ms and
+        a.completed_at_ms == b.completed_at_ms and
+        optionalTextEqual(a.last_event_title, b.last_event_title) and
+        optionalTextEqual(a.last_event_body, b.last_event_body);
+}
 
 const ChatAcknowledgement = struct {
     workspace_id: []u8,
@@ -65,7 +88,7 @@ const Acknowledgement = union(enum) {
     fn matchesSurfaceCompletion(self: Acknowledgement, canonical: db_types.PersistedSurfaceState) bool {
         return switch (self) {
             .chat => false,
-            .surface => |ack| db_client.surfaceStatesEqual(ack.canonical, canonical),
+            .surface => |ack| surfaceStatesEqual(ack.canonical, canonical),
         };
     }
 };

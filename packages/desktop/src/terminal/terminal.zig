@@ -6,7 +6,8 @@ pub const RenderState = ghostty_vt.RenderState;
 const keybinds = @import("../app/keybinds.zig");
 const process_env = @import("../platform/env.zig");
 const platform_runtime = @import("platform_runtime");
-pub const sessionizer = @import("sessionizer.zig");
+const daemon_client = @import("../daemon/client.zig");
+const session_protocol = @import("headless").session_protocol;
 const stb_image = @import("../media/stb_image.zig");
 const theme = @import("../ui/theme.zig");
 const runtime_log = @import("../runtime/log.zig");
@@ -259,7 +260,7 @@ pub const DaemonPollBatch = struct {
     requests: std.ArrayList(DaemonTailBatchRequest) = .empty,
     response_scratch: std.ArrayList(u8) = .empty,
     last_response: std.ArrayList(u8) = .empty,
-    connection: sessionizer.ReusableRequestConnection = .{},
+    connection: daemon_client.ReusableRequestConnection = .{},
 
     pub fn deinit(self: *DaemonPollBatch, allocator: std.mem.Allocator) void {
         self.sessions.deinit(allocator);
@@ -290,8 +291,8 @@ pub const DaemonPollBatch = struct {
         }
         if (self.requests.items.len == 0) return;
 
-        try self.response_scratch.ensureTotalCapacity(allocator, sessionizer.MAX_RESPONSE_BYTES);
-        self.response_scratch.items.len = sessionizer.MAX_RESPONSE_BYTES;
+        try self.response_scratch.ensureTotalCapacity(allocator, daemon_client.MAX_RESPONSE_BYTES);
+        self.response_scratch.items.len = daemon_client.MAX_RESPONSE_BYTES;
         const response = try self.connection.requestAllocUsingBuffer(
             allocator,
             pref_path,
@@ -395,7 +396,7 @@ pub const TerminalLaunchProfile = struct {
     command: []const []const u8 = &.{},
 };
 
-pub const TerminalRevivePolicy = sessionizer.RevivePolicy;
+pub const TerminalRevivePolicy = session_protocol.RevivePolicy;
 
 fn daemonSessionNeedsLaunchFallback(
     revive_policy: TerminalRevivePolicy,
@@ -1597,7 +1598,7 @@ pub const Dock = struct {
     pub fn persistedLayoutJsonWithContext(
         self: *const Dock,
         allocator: std.mem.Allocator,
-        context: ?sessionizer.LayoutContext,
+        context: ?session_protocol.LayoutContext,
     ) !?[]u8 {
         if (self.tabs.items.len == 0) return null;
 
@@ -1698,7 +1699,7 @@ pub const Dock = struct {
         defer live_session_ids.deinit(allocator);
         for (self.tabs.items) |*tab| try collectPaneSessionIds(allocator, tab.root, &live_session_ids);
 
-        const list_response = try sessionizer.requestAlloc(allocator, pref_path, "session.list", .{}, 1);
+        const list_response = try daemon_client.requestAlloc(allocator, pref_path, "session.list", .{}, 1);
         defer allocator.free(list_response);
 
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, list_response, .{});
@@ -1724,7 +1725,7 @@ pub const Dock = struct {
             const attached_clients = jsonUsize(session.object.get("attached_clients") orelse .null) orelse 0;
             if (attached_clients != 0) continue;
 
-            const kill_response = sessionizer.requestAlloc(allocator, pref_path, "session.kill", .{ .id = session_id }, 1) catch |err| {
+            const kill_response = daemon_client.requestAlloc(allocator, pref_path, "session.kill", .{ .id = session_id }, 1) catch |err| {
                 log.debug("failed to kill orphan daemon terminal session id_len={d}: {s}", .{ session_id.len, @errorName(err) });
                 continue;
             };
@@ -1816,7 +1817,7 @@ pub const Dock = struct {
             leaf.launch_command = try dupeStringSlice(allocator, profile.command);
         }
         if (self.pref_path != null and leaf.session_id == null) {
-            leaf.session_id = try sessionizer.stableSessionId(
+            leaf.session_id = try session_protocol.stableSessionId(
                 allocator,
                 cwd,
                 self.session_dock_id,
@@ -2525,14 +2526,14 @@ fn serializePaneNode(
     node: *const PaneNode,
     nodes: *std.ArrayList(PersistedNode),
     next_node_id: *u32,
-    context: ?sessionizer.LayoutContext,
+    context: ?session_protocol.LayoutContext,
 ) !u32 {
     const node_id = next_node_id.*;
     next_node_id.* += 1;
 
     switch (node.*) {
         .leaf => |leaf| {
-            const session_id = try sessionizer.sessionIdForLeaf(allocator, context, leaf.id, leaf.session_id);
+            const session_id = try session_protocol.sessionIdForLeaf(allocator, context, leaf.id, leaf.session_id);
             const launch_kind: ?TerminalLaunchKind = leaf.launch_kind orelse if (leaf.session) |session| session.launch_kind else null;
             const launch_label: ?[]const u8 = if (leaf.launch_label) |label|
                 try allocator.dupe(u8, label)
@@ -3743,22 +3744,22 @@ const UnixSession = struct {
         const session_id = self.session_id orelse return error.MissingSessionId;
         const exe_path = try selfExePathAlloc(allocator);
         defer allocator.free(exe_path);
-        try sessionizer.ensureDaemon(allocator, pref_path, exe_path);
+        try daemon_client.ensureDaemon(allocator, pref_path, exe_path);
 
         if (options.revive_policy == .restart) {
-            const kill_response = sessionizer.requestAlloc(allocator, pref_path, "session.kill", .{ .id = session_id }, 1) catch null;
+            const kill_response = daemon_client.requestAlloc(allocator, pref_path, "session.kill", .{ .id = session_id }, 1) catch null;
             if (kill_response) |response| allocator.free(response);
         }
         var attached_existing_session = false;
         if (options.revive_policy == .attach_only or options.revive_policy == .manual) {
-            const inspect_response = try sessionizer.requestAlloc(allocator, pref_path, "session.inspect", .{ .id = session_id }, 1);
+            const inspect_response = try daemon_client.requestAlloc(allocator, pref_path, "session.inspect", .{ .id = session_id }, 1);
             defer allocator.free(inspect_response);
             try ensureSessionResponseOk(allocator, inspect_response);
             attached_existing_session = true;
         } else {
             const command = try daemonCommandForProfile(allocator, options.profile);
             defer allocator.free(command);
-            const create_response = try sessionizer.requestAlloc(allocator, pref_path, "session.create", .{
+            const create_response = try daemon_client.requestAlloc(allocator, pref_path, "session.create", .{
                 .id = session_id,
                 .project_id = options.project_id,
                 .project_path = options.project_path,
@@ -3790,7 +3791,7 @@ const UnixSession = struct {
             .{ options.dock_id, options.pane_id, session_id.len, attached_existing_session, @tagName(options.revive_policy) },
         );
 
-        const attach_response = sessionizer.requestAlloc(allocator, pref_path, "session.attach", .{
+        const attach_response = daemon_client.requestAlloc(allocator, pref_path, "session.attach", .{
             .id = session_id,
             .label = "verde-ui",
         }, 1) catch |err| blk: {
@@ -3818,7 +3819,7 @@ const UnixSession = struct {
         const initial_attach_replay = self.suppress_next_daemon_replay and self.remote_output_offset == 0;
         const max_replay_bytes = if (initial_attach_replay) DAEMON_ATTACH_REPLAY_MAX_BYTES else DAEMON_REPLAY_MAX_BYTES;
         const max_response_bytes = max_replay_bytes * 6 + DAEMON_TAIL_RESPONSE_OVERHEAD_BYTES;
-        const response = sessionizer.requestAllocMaxResponse(
+        const response = daemon_client.requestAllocMaxResponse(
             allocator,
             pref_path,
             "session.tail",
@@ -4003,7 +4004,7 @@ const UnixSession = struct {
     fn resizeDaemon(self: *UnixSession, allocator: std.mem.Allocator) !void {
         const pref_path = self.pref_path orelse return;
         const session_id = self.session_id orelse return;
-        const response = try sessionizer.requestAlloc(allocator, pref_path, "session.resize", .{
+        const response = try daemon_client.requestAlloc(allocator, pref_path, "session.resize", .{
             .id = session_id,
             .attach_id = self.attach_id orelse "",
             .cols = self.cols,
@@ -4092,7 +4093,7 @@ const UnixSession = struct {
         }
         const pref_path = self.pref_path orelse return error.MissingSessionPrefPath;
         const session_id = self.session_id orelse return error.MissingSessionId;
-        const response = try sessionizer.requestAlloc(std.heap.smp_allocator, pref_path, "session.kill", .{ .id = session_id }, 1);
+        const response = try daemon_client.requestAlloc(std.heap.smp_allocator, pref_path, "session.kill", .{ .id = session_id }, 1);
         defer std.heap.smp_allocator.free(response);
         try ensureSessionKillSignaled(std.heap.smp_allocator, response);
     }
@@ -4105,7 +4106,7 @@ const UnixSession = struct {
         }
         const pref_path = self.pref_path orelse return false;
         const session_id = self.session_id orelse return false;
-        const response = try sessionizer.requestAlloc(std.heap.smp_allocator, pref_path, "session.write", .{
+        const response = try daemon_client.requestAlloc(std.heap.smp_allocator, pref_path, "session.write", .{
             .id = session_id,
             .attach_id = self.attach_id orelse "",
             .text = bytes,
@@ -4143,7 +4144,7 @@ const UnixSession = struct {
         const pref_path = self.pref_path orelse return;
         const session_id = self.session_id orelse return;
         const attach_id = self.attach_id orelse return;
-        const response = sessionizer.requestAllocWithTimeout(
+        const response = daemon_client.requestAllocWithTimeout(
             allocator,
             pref_path,
             "session.detach",
@@ -4569,7 +4570,7 @@ const UnixSession = struct {
             };
             errdefer allocator.free(cli_path);
             const mcp_token = if (options.pref_path) |pref_path|
-                try sessionizer.mcpTokenZAlloc(allocator, pref_path)
+                try daemon_client.mcpTokenZAlloc(allocator, pref_path)
             else
                 null;
             errdefer if (mcp_token) |value| allocator.free(value);
@@ -4581,11 +4582,11 @@ const UnixSession = struct {
             var live_socket: ?[:0]u8 = null;
             var sessionizer_socket: ?[:0]u8 = null;
             if (options.pref_path) |pref_path| {
-                const live_path = try std.fs.path.join(allocator, &.{ pref_path, sessionizer.LIVE_SOCKET_NAME });
+                const live_path = try std.fs.path.join(allocator, &.{ pref_path, daemon_client.LIVE_SOCKET_NAME });
                 defer allocator.free(live_path);
                 live_socket = try allocator.dupeZ(u8, live_path);
                 errdefer if (live_socket) |value| allocator.free(value);
-                const sessionizer_path = try sessionizer.socketPath(allocator, pref_path);
+                const sessionizer_path = try daemon_client.socketPath(allocator, pref_path);
                 defer allocator.free(sessionizer_path);
                 sessionizer_socket = try allocator.dupeZ(u8, sessionizer_path);
             }

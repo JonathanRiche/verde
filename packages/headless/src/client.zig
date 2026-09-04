@@ -550,9 +550,74 @@ pub const Client = struct {
         return try self.decodeResult(store_protocol.MessageListResult, parsed);
     }
 
+    pub fn decodeSurfaceCompletionObserve(self: *Client, parsed: *const protocol.ParsedResponse) !store_protocol.SurfaceCompletionObserveResult {
+        return try self.decodeResult(store_protocol.SurfaceCompletionObserveResult, parsed);
+    }
+
+    pub fn decodeSurfaceCommitProofClassify(self: *Client, parsed: *const protocol.ParsedResponse) !store_protocol.SurfaceCommitProofClassifyResult {
+        return try self.decodeResult(store_protocol.SurfaceCommitProofClassifyResult, parsed);
+    }
+
+    /// Decode the dynamic model catalog returned by one provider runtime.
+    pub fn decodeProviderModelsList(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.ModelsListResult {
+        return try self.decodeResult(providers_protocol.ModelsListResult, parsed);
+    }
+
     /// Decode runtime-scoped installation/authentication status for providers.
     pub fn decodeProviderStatus(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.StatusResult {
         return try self.decodeResult(providers_protocol.StatusResult, parsed);
+    }
+
+    pub fn decodeProviderAuthStatus(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.AuthStatusResult {
+        return try self.decodeResult(providers_protocol.AuthStatusResult, parsed);
+    }
+
+    pub fn decodeProviderThreadsList(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.ThreadsListResult {
+        return try self.decodeResult(providers_protocol.ThreadsListResult, parsed);
+    }
+
+    pub fn decodeProviderThreadRead(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.ThreadReadResult {
+        return try self.decodeResult(providers_protocol.ThreadReadResult, parsed);
+    }
+
+    pub fn decodeProviderThreadInterrupt(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.ThreadControlResult {
+        return try self.decodeResult(providers_protocol.ThreadControlResult, parsed);
+    }
+
+    pub fn decodeProviderThreadSteer(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.ThreadControlResult {
+        return try self.decodeResult(providers_protocol.ThreadControlResult, parsed);
+    }
+
+    pub fn decodeProviderSlashList(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.SlashListResult {
+        return try self.decodeResult(providers_protocol.SlashListResult, parsed);
+    }
+
+    pub fn decodeProviderSlashRun(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.SlashRunResult {
+        return try self.decodeResult(providers_protocol.SlashRunResult, parsed);
+    }
+
+    pub fn decodeProviderCodexBackgroundStatus(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.CodexBackgroundStatusResult {
+        return try self.decodeResult(providers_protocol.CodexBackgroundStatusResult, parsed);
+    }
+
+    pub fn decodeProviderCodexBackgroundTerminate(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.CodexBackgroundTerminateResult {
+        return try self.decodeResult(providers_protocol.CodexBackgroundTerminateResult, parsed);
+    }
+
+    pub fn decodeProviderIntegrationsInspect(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.IntegrationsInspectResult {
+        return try self.decodeResult(providers_protocol.IntegrationsInspectResult, parsed);
+    }
+
+    pub fn decodeProviderHooksSet(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.HooksSetResult {
+        return try self.decodeResult(providers_protocol.HooksSetResult, parsed);
+    }
+
+    pub fn decodeProviderMcpSet(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.McpSetResult {
+        return try self.decodeResult(providers_protocol.McpSetResult, parsed);
+    }
+
+    pub fn decodeProviderTitleGenerate(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.TitleGenerateResult {
+        return try self.decodeResult(providers_protocol.TitleGenerateResult, parsed);
     }
 
     /// Decode one durable turn-ledger record.
@@ -834,6 +899,83 @@ pub const Client = struct {
             providers_protocol.METHOD_PROVIDERS_STATUS,
             providers_protocol.StatusRequest{},
         );
+    }
+
+    pub fn callProviderModelsList(
+        self: *Client,
+        capabilities: protocol.Capabilities,
+        request: providers_protocol.ModelsListRequest,
+    ) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .provider_status);
+        return try self.call(providers_protocol.METHOD_PROVIDER_MODELS_LIST, request);
+    }
+
+    pub fn callProviderAuthStatus(self: *Client, capabilities: protocol.Capabilities, request: providers_protocol.AuthStatusRequest) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .provider_status);
+        return try self.call(providers_protocol.METHOD_PROVIDER_AUTH_STATUS, request);
+    }
+
+    pub fn callProviderThreadsList(self: *Client, capabilities: protocol.Capabilities, request: providers_protocol.ThreadsListRequest) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .provider_status);
+        return try self.call(providers_protocol.METHOD_PROVIDER_THREADS_LIST, request);
+    }
+
+    pub fn callProviderThreadRead(self: *Client, capabilities: protocol.Capabilities, request: providers_protocol.ThreadReadRequest) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .provider_status);
+        return try self.call(providers_protocol.METHOD_PROVIDER_THREAD_READ, request);
+    }
+
+    pub fn callProviderThreadInterrupt(self: *Client, capabilities: protocol.Capabilities, request: providers_protocol.ThreadInterruptRequest) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .provider_status);
+        return try self.call(providers_protocol.METHOD_PROVIDER_THREAD_INTERRUPT, request);
+    }
+
+    pub fn callProviderThreadSteer(self: *Client, capabilities: protocol.Capabilities, request: providers_protocol.ThreadSteerRequest) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .provider_status);
+        return try self.call(providers_protocol.METHOD_PROVIDER_THREAD_STEER, request);
+    }
+
+    pub fn callProviderSlashList(self: *Client, capabilities: protocol.Capabilities, request: providers_protocol.SlashListRequest) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .provider_status);
+        return try self.call(providers_protocol.METHOD_PROVIDER_SLASH_LIST, request);
+    }
+
+    pub fn callProviderSlashRun(self: *Client, capabilities: protocol.Capabilities, request: providers_protocol.SlashRunRequest) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .provider_status);
+        return try self.call(providers_protocol.METHOD_PROVIDER_SLASH_RUN, request);
+    }
+
+    pub fn callProviderCodexBackgroundStatus(self: *Client, capabilities: protocol.Capabilities, request: providers_protocol.CodexBackgroundRequest) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .provider_status);
+        return try self.call(providers_protocol.METHOD_PROVIDER_CODEX_BACKGROUND_STATUS, request);
+    }
+
+    pub fn callProviderCodexBackgroundTerminate(self: *Client, capabilities: protocol.Capabilities, request: providers_protocol.CodexBackgroundRequest) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .provider_status);
+        return try self.call(providers_protocol.METHOD_PROVIDER_CODEX_BACKGROUND_TERMINATE, request);
+    }
+
+    pub fn callProviderIntegrationsInspect(self: *Client, capabilities: protocol.Capabilities) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .provider_status);
+        return try self.call(
+            providers_protocol.METHOD_PROVIDER_INTEGRATIONS_INSPECT,
+            providers_protocol.IntegrationsInspectRequest{},
+        );
+    }
+
+    pub fn callProviderHooksSet(self: *Client, capabilities: protocol.Capabilities, request: providers_protocol.HooksSetRequest) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .provider_status);
+        return try self.call(providers_protocol.METHOD_PROVIDER_HOOKS_SET, request);
+    }
+
+    pub fn callProviderMcpSet(self: *Client, capabilities: protocol.Capabilities, request: providers_protocol.McpSetRequest) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .provider_status);
+        return try self.call(providers_protocol.METHOD_PROVIDER_MCP_SET, request);
+    }
+
+    pub fn callProviderTitleGenerate(self: *Client, capabilities: protocol.Capabilities, request: providers_protocol.TitleGenerateRequest) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .provider_status);
+        return try self.call(providers_protocol.METHOD_PROVIDER_TITLE_GENERATE, request);
     }
 
     /// Require a capability on this client before a direct daemon request.
@@ -1639,6 +1781,72 @@ test "remote projection and provider decoders tolerate additive fields" {
     const provider_result = try client.decodeProviderStatus(&providers);
     try std.testing.expect(!provider_result.providers[0].surfaces.native_chat);
     try std.testing.expect(provider_result.providers[0].surfaces.mcp);
+}
+
+test "provider model list call preserves wire shape and decodes owned models" {
+    const allocator = std.testing.allocator;
+    const response = try protocol.encodeOkResponse(allocator, 1, .{
+        .provider = "cursor",
+        .models = &[_]struct {
+            provider_id: []const u8,
+            provider_name: []const u8,
+            model_id: []const u8,
+            model_name: []const u8,
+            cursor_fast_supported: bool,
+            cursor_reasoning_param_id: []const u8,
+            cursor_reasoning_values: []const []const u8,
+            future: bool,
+        }{.{
+            .provider_id = "cursor",
+            .provider_name = "Cursor",
+            .model_id = "composer-1",
+            .model_name = "Composer 1",
+            .cursor_fast_supported = true,
+            .cursor_reasoning_param_id = "thinking",
+            .cursor_reasoning_values = &.{ "off", "on" },
+            .future = true,
+        }},
+        .future = true,
+    });
+    defer allocator.free(response);
+
+    var result_arena = std.heap.ArenaAllocator.init(allocator);
+    defer result_arena.deinit();
+    var mock: MockTransport = .{
+        .allocator = result_arena.allocator(),
+        .canned_response = response,
+    };
+    defer mock.deinit();
+    var client = Client.init(result_arena.allocator(), &mock, MockTransport.send);
+
+    var unavailable = protocol.Capabilities.phase1();
+    unavailable.provider_status = false;
+    try std.testing.expectError(
+        error.CapabilityUnavailable,
+        client.callProviderModelsList(unavailable, .{
+            .provider = .cursor,
+            .project_path = "/tmp/project",
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 0), mock.call_count);
+
+    var parsed = try client.callProviderModelsList(.phase1(), .{
+        .provider = .cursor,
+        .project_path = "/tmp/project",
+    });
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(
+        "{\"id\":1,\"method\":\"provider.models.list\",\"params\":{\"provider\":\"cursor\",\"project_path\":\"/tmp/project\"}}",
+        mock.last_request.?,
+    );
+
+    const result = try client.decodeProviderModelsList(&parsed);
+    try std.testing.expect(result.provider == .cursor);
+    try std.testing.expectEqual(@as(usize, 1), result.models.len);
+    try std.testing.expectEqualStrings("composer-1", result.models[0].model_id);
+    try std.testing.expect(result.models[0].cursor_fast_supported);
+    try std.testing.expectEqualStrings("thinking", result.models[0].cursor_reasoning_param_id.?);
+    try std.testing.expectEqualStrings("on", result.models[0].cursor_reasoning_values.?[1]);
 }
 
 test "repository manifest decoder owns the complete bounded projection" {
