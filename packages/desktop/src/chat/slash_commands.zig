@@ -75,6 +75,12 @@ pub fn parse(
     return .{ .unknown = .{ .name = root, .args = args } };
 }
 
+/// Returns whether submission may need provider slash-command metadata.
+pub fn isSlashInput(raw_text: []const u8) bool {
+    const text = std.mem.trim(u8, raw_text, " \t\r\n");
+    return std.mem.startsWith(u8, text, "/");
+}
+
 pub fn findLocalCommand(name: []const u8) ?LocalSlashCommand {
     for (LOCAL_COMMANDS) |command| {
         if (std.mem.eql(u8, command.name, name)) return command;
@@ -173,4 +179,10 @@ test "parse reports unknown slash commands" {
 test "parse ignores ordinary prompts" {
     const parsed = parse("please do /something", TEST_PROVIDER_COMMANDS[0..]);
     try std.testing.expect(parsed == .not_slash);
+}
+
+test "ordinary prompts do not need provider slash metadata" {
+    try std.testing.expect(!isSlashInput("reply exactly READY"));
+    try std.testing.expect(!isSlashInput("  mention /compact in prose  "));
+    try std.testing.expect(isSlashInput("  /compact  "));
 }

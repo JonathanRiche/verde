@@ -913,7 +913,10 @@ pub const Client = struct {
             // inherited pipes, so route app-server stdio to the null device.
             .stdout = .ignore,
             .stderr = .ignore,
-            .cwd = if (self.config.cwd) |path| .{ .path = path } else .inherit,
+            // The app-server is shared across projects and outlives individual
+            // workspaces. Keep its process cwd daemon-owned; request cwd is
+            // carried explicitly by each thread/list/start/resume RPC.
+            .cwd = .inherit,
             .environ_map = &env_map,
         }) catch |err| {
             runtime_log.diagnostic("codex.spawnWebSocketServer process.spawn failed: {s}", .{@errorName(err)});
