@@ -29,6 +29,7 @@ const OPENCODE_MODEL_OPTIONS = provider_models.OPENCODE_MODEL_OPTIONS;
 const PI_MODEL_OPTIONS = provider_models.PI_MODEL_OPTIONS;
 const FX_MODEL_OPTIONS = provider_models.FX_MODEL_OPTIONS;
 const GROK_MODEL_OPTIONS = provider_models.GROK_MODEL_OPTIONS;
+const MUSE_MODEL_OPTIONS = provider_models.MUSE_MODEL_OPTIONS;
 const CLAUDE_MODEL_OPTIONS = provider_models.CLAUDE_MODEL_OPTIONS;
 const CURSOR_MODEL_OPTIONS = provider_models.CURSOR_MODEL_OPTIONS;
 const CLAUDE_STANDARD_EFFORT_VALUES = provider_models.CLAUDE_STANDARD_EFFORT_VALUES;
@@ -86,6 +87,15 @@ pub const GrokModelCacheStatus = OpencodeModelCacheStatus;
 pub const GrokModelCacheState = struct {
     mutex: Mutex = .{},
     status: GrokModelCacheStatus = .idle,
+    models: ?[]const provider_types.ModelInfo = null,
+    worker: ?std.Thread = null,
+};
+
+pub const MuseModelCacheStatus = OpencodeModelCacheStatus;
+
+pub const MuseModelCacheState = struct {
+    mutex: Mutex = .{},
+    status: MuseModelCacheStatus = .idle,
     models: ?[]const provider_types.ModelInfo = null,
     worker: ?std.Thread = null,
 };
@@ -205,6 +215,7 @@ pub const State = struct {
     pi_model_cache: PiModelCacheState = .{},
     fx_model_cache: FxModelCacheState = .{},
     grok_model_cache: GrokModelCacheState = .{},
+    muse_model_cache: MuseModelCacheState = .{},
     readiness: ProviderReadinessState = .{},
     thread_operation: ProviderThreadOperationState = .{},
 };
@@ -378,6 +389,10 @@ pub fn grokModelCacheWorker(state: *GrokModelCacheState, request: ModelCacheWork
     runModelCacheWorker(state, .grok, request);
 }
 
+pub fn museModelCacheWorker(state: *MuseModelCacheState, request: ModelCacheWorkerRequest) void {
+    runModelCacheWorker(state, .muse, request);
+}
+
 const ProviderReadinessWorkerRequest = struct {
     pref_path: []u8,
     project_path: []u8,
@@ -488,6 +503,13 @@ pub fn grokModelOptionsSnapshot(self: anytype) []const ModelOption {
         GROK_MODEL_OPTIONS[0..];
 }
 
+pub fn museModelOptionsSnapshot(self: anytype) []const ModelOption {
+    return if (self.muse_model_options.items.len > 0)
+        self.muse_model_options.items
+    else
+        MUSE_MODEL_OPTIONS[0..];
+}
+
 pub fn cursorModelOptionsSnapshot(self: anytype) []const ModelOption {
     return if (self.cursor_model_options.items.len > 0)
         self.cursor_model_options.items
@@ -535,6 +557,10 @@ pub fn startFxModelOptionsRefresh(self: anytype) void {
 
 pub fn startGrokModelOptionsRefresh(self: anytype) void {
     self.refreshGrokModelOptionsCacheAsync();
+}
+
+pub fn startMuseModelOptionsRefresh(self: anytype) void {
+    self.refreshMuseModelOptionsCacheAsync();
 }
 
 pub fn startProviderReadinessCheck(self: anytype) void {
@@ -813,6 +839,25 @@ pub fn refreshGrokModelOptionsCacheAsync(self: anytype) void {
     };
 }
 
+pub fn refreshMuseModelOptionsCacheAsync(self: anytype) void {
+    self.pollMuseModelOptionsCache();
+
+    self.provider_controller.muse_model_cache.mutex.lock();
+    defer self.provider_controller.muse_model_cache.mutex.unlock();
+    if (self.provider_controller.muse_model_cache.status == .pending) return;
+
+    self.provider_controller.muse_model_cache.status = .pending;
+    self.provider_controller.muse_model_cache.worker = spawnModelCacheWorker(
+        self,
+        museModelCacheWorker,
+        &self.provider_controller.muse_model_cache,
+    ) orelse {
+        self.provider_controller.muse_model_cache.status = .idle;
+        log.warn("failed to spawn muse model cache worker", .{});
+        return;
+    };
+}
+
 pub fn duplicateReasoningVariantKeys(allocator: std.mem.Allocator, src: ?[]const [:0]const u8) !?[][:0]const u8 {
     const keys = src orelse return null;
     if (keys.len == 0) return null;
@@ -1035,6 +1080,31 @@ pub fn populateGrokModelOptions(self: anytype, models: []const provider_types.Mo
     }
 }
 
+/// Rebuilds the Muse picker from MSP `model/list`. Labels stay the catalog
+/// `displayLabel` so the GUI matches the TUI; descriptions stay on the row,
+/// not the composer pill.
+pub fn populateMuseModelOptions(self: anytype, models: []const provider_types.ModelInfo) !void {
+    for (models) |model| {
+        if (model.model_id.len == 0) continue;
+        const label_text = if (model.model_name.len > 0) model.model_name else model.model_id;
+        const label = try self.allocator.dupeZ(u8, label_text);
+        errdefer self.allocator.free(label);
+        const value = try self.allocator.dupeZ(u8, model.model_id);
+        errdefer self.allocator.free(value);
+        const description = if (model.description) |text|
+            if (text.len > 0) try self.allocator.dupeZ(u8, text) else null
+        else
+            null;
+        errdefer if (description) |owned| self.allocator.free(owned);
+        try self.muse_model_options.append(self.allocator, .{
+            .label = label,
+            .value = value,
+            .description = description,
+            .reasoning_supported = true,
+        });
+    }
+}
+
 // Dynamic rows own their strings, so the static default row is copied rather
 // than referenced to keep the clear path uniform.
 fn appendDefaultModelOption(self: anytype, list: *std.ArrayList(ModelOption), template: ModelOption) !void {
@@ -1042,9 +1112,12 @@ fn appendDefaultModelOption(self: anytype, list: *std.ArrayList(ModelOption), te
     errdefer self.allocator.free(label);
     const value = if (template.value) |v| try self.allocator.dupeZ(u8, v) else null;
     errdefer if (value) |v| self.allocator.free(v);
+    const description = if (template.description) |text| try self.allocator.dupeZ(u8, text) else null;
+    errdefer if (description) |owned| self.allocator.free(owned);
     try list.append(self.allocator, .{
         .label = label,
         .value = value,
+        .description = description,
         .reasoning_supported = template.reasoning_supported,
     });
 }
@@ -1360,6 +1433,7 @@ pub fn clearDynamicPiModelOptions(self: anytype) void {
     for (self.pi_model_options.items) |option| {
         self.allocator.free(option.label);
         if (option.value) |value| self.allocator.free(value);
+        if (option.description) |description| self.allocator.free(description);
     }
     self.pi_model_options.clearRetainingCapacity();
 }
@@ -1372,6 +1446,7 @@ pub fn clearDynamicFxModelOptions(self: anytype) void {
     for (self.fx_model_options.items) |option| {
         self.allocator.free(option.label);
         if (option.value) |value| self.allocator.free(value);
+        if (option.description) |description| self.allocator.free(description);
     }
     self.fx_model_options.clearRetainingCapacity();
 }
@@ -1384,12 +1459,26 @@ pub fn clearDynamicGrokModelOptions(self: anytype) void {
     for (self.grok_model_options.items) |option| {
         self.allocator.free(option.label);
         if (option.value) |value| self.allocator.free(value);
+        if (option.description) |description| self.allocator.free(description);
     }
     self.grok_model_options.clearRetainingCapacity();
 }
 
 pub fn clearGrokModelOptions(self: anytype) void {
     self.clearDynamicGrokModelOptions();
+}
+
+pub fn clearDynamicMuseModelOptions(self: anytype) void {
+    for (self.muse_model_options.items) |option| {
+        self.allocator.free(option.label);
+        if (option.value) |value| self.allocator.free(value);
+        if (option.description) |description| self.allocator.free(description);
+    }
+    self.muse_model_options.clearRetainingCapacity();
+}
+
+pub fn clearMuseModelOptions(self: anytype) void {
+    self.clearDynamicMuseModelOptions();
 }
 
 pub fn clearCursorModelOptions(self: anytype) void {
@@ -1636,6 +1725,31 @@ pub fn pollGrokModelOptionsCache(self: anytype) void {
         },
         .failed => {
             log.warn("failed to refresh grok model cache", .{});
+        },
+        else => {},
+    }
+}
+
+pub fn pollMuseModelOptionsCache(self: anytype) void {
+    const poll = takeModelCachePoll(&self.provider_controller.muse_model_cache);
+    if (poll.status != .idle) {
+        self.finishMuseModelCacheThread();
+    }
+
+    switch (poll.status) {
+        .completed => {
+            const models = poll.models orelse return;
+            defer provider_types.freeModelInfos(std.heap.page_allocator, models);
+            self.clearMuseModelOptions();
+            if (models.len == 0) return;
+            self.populateMuseModelOptions(models) catch |err| {
+                log.warn("failed to cache muse models: {s}", .{@errorName(err)});
+                self.clearDynamicMuseModelOptions();
+                return;
+            };
+        },
+        .failed => {
+            log.warn("failed to refresh muse model cache", .{});
         },
         else => {},
     }

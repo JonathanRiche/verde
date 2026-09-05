@@ -868,7 +868,7 @@ fn settingsChatTitleModelOptions(self: anytype) []const ModelOption {
         self.piModelOptionsSnapshot(),
         self.fxModelOptionsSnapshot(),
         self.grokModelOptionsSnapshot(),
-        provider_models.MUSE_MODEL_OPTIONS[0..],
+        self.museModelOptionsSnapshot(),
     );
 }
 
@@ -927,7 +927,7 @@ fn settingsNewChatModelOptions(self: anytype) []const ModelOption {
         self.piModelOptionsSnapshot(),
         self.fxModelOptionsSnapshot(),
         self.grokModelOptionsSnapshot(),
-        provider_models.MUSE_MODEL_OPTIONS[0..],
+        self.museModelOptionsSnapshot(),
     );
 }
 
@@ -1087,7 +1087,7 @@ pub fn selectSettingsNewChatProvider(self: anytype, option_index: usize) void {
             .pi => self.startPiModelOptionsRefresh(),
             .fx => self.startFxModelOptionsRefresh(),
             .grok => self.startGrokModelOptionsRefresh(),
-            .muse => {},
+            .muse => self.startMuseModelOptionsRefresh(),
             .claude => self.startClaudeModelOptionsRefresh(),
             .cursor => self.startCursorModelOptionsRefresh(),
             .opencode => self.startOpencodeModelOptionsRefresh(),

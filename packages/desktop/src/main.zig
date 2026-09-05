@@ -517,6 +517,7 @@ fn mainInner(init: std.process.Init) !void {
     state.startPiModelOptionsRefresh();
     state.startFxModelOptionsRefresh();
     state.startGrokModelOptionsRefresh();
+    state.startMuseModelOptionsRefresh();
     state.startAutomaticUpdateCheck();
     var live_server: ?live_ipc.LiveServer = live_ipc.LiveServer.init(allocator, storage.pref_path) catch |err| blk: {
         log.warn("failed to initialize live-control server: {s}", .{@errorName(err)});
@@ -607,6 +608,7 @@ fn mainInner(init: std.process.Init) !void {
                 app_state.pollPiModelOptionsCache();
                 app_state.pollFxModelOptionsCache();
                 app_state.pollGrokModelOptionsCache();
+                app_state.pollMuseModelOptionsCache();
                 app_state.pollProviderReadiness();
                 app_state.pollUpdateCheck();
             }

@@ -18,11 +18,13 @@ pub const DEFAULT_CURSOR_MODEL: [:0]const u8 = "composer-2.5";
 pub const DEFAULT_PI_MODEL: [:0]const u8 = "default";
 pub const DEFAULT_FX_MODEL: [:0]const u8 = "default";
 pub const DEFAULT_GROK_MODEL: [:0]const u8 = "default";
-pub const DEFAULT_MUSE_MODEL: [:0]const u8 = "default";
+pub const DEFAULT_MUSE_MODEL: [:0]const u8 = "muse-spark-1.3-contributor";
 
 pub const ModelOption = struct {
     label: [:0]const u8,
     value: ?[:0]const u8 = null,
+    /// Shown on picker rows only; the composer pill stays the short label.
+    description: ?[:0]const u8 = null,
     /// From OpenCode model metadata (`capabilities.reasoning`); presets default to true.
     reasoning_supported: bool = true,
     /// Sorted OpenCode `variants` keys; owned with the option row (freed in `clearDynamicOpencodeModelOptions`).
@@ -206,10 +208,25 @@ pub const GROK_MODEL_OPTIONS = [_]ModelOption{
     .{ .label = "Grok 4.5", .value = "grok-4.5", .reasoning_supported = true },
 };
 
+const MUSE_CONTRIBUTOR_DESCRIPTION: [:0]const u8 = "Your content, including inter-session messages, may be used for product improvement.";
+
 /// Static fallback until Muse's `model/list` MSP response is available.
+/// Labels match the TUI catalog (`displayLabel` / `modelId`).
 pub const MUSE_MODEL_OPTIONS = [_]ModelOption{
-    .{ .label = "Default (Muse config)", .value = DEFAULT_MUSE_MODEL, .reasoning_supported = true },
-    .{ .label = "Muse Spark 1.3 Contributor", .value = "muse-spark-1.3-contributor", .reasoning_supported = true },
+    .{ .label = "muse-spark-1.3", .value = "muse-spark-1.3", .reasoning_supported = true },
+    .{
+        .label = "muse-spark-1.3-contributor",
+        .value = DEFAULT_MUSE_MODEL,
+        .description = MUSE_CONTRIBUTOR_DESCRIPTION,
+        .reasoning_supported = true,
+    },
+    .{ .label = "muse-spark-1.2", .value = "muse-spark-1.2", .reasoning_supported = true },
+    .{
+        .label = "muse-spark-1.2-contributor",
+        .value = "muse-spark-1.2-contributor",
+        .description = MUSE_CONTRIBUTOR_DESCRIPTION,
+        .reasoning_supported = true,
+    },
 };
 
 pub const PI_REASONING_OPTIONS = [_]ReasoningOption{

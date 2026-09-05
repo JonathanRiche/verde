@@ -7747,16 +7747,7 @@ fn renderInactiveComposerProviderIcon(state: *app_state.AppState, pill: palette.
         .w = provider_slot,
         .h = provider_slot,
     };
-    const provider_icon = switch (provider) {
-        .codex => state.codex_logo_texture,
-        .opencode => state.opencode_logo_texture,
-        .claude => state.claude_logo_texture,
-        .cursor => state.cursor_logo_texture,
-        .pi => state.pi_logo_texture,
-        .fx => state.fx_logo_texture,
-        .grok => state.grok_logo_texture,
-        .muse => null,
-    };
+    const provider_icon = state.providerLogoTexture(provider);
     if (provider_icon) |cached| {
         const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, icon_slot.x, icon_slot.y, icon_slot.w, icon_slot.h));
         queueImage(state, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }, cached, pill);
@@ -8442,16 +8433,7 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
         .h = provider_slot,
     };
 
-    const provider_icon = switch (state.currentThread().provider) {
-        .codex => state.codex_logo_texture,
-        .opencode => state.opencode_logo_texture,
-        .claude => state.claude_logo_texture,
-        .cursor => state.cursor_logo_texture,
-        .pi => state.pi_logo_texture,
-        .fx => state.fx_logo_texture,
-        .grok => state.grok_logo_texture,
-        .muse => null,
-    };
+    const provider_icon = state.providerLogoTexture(state.currentThread().provider);
     if (provider_icon) |cached| {
         const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, model_icon_slot.x, model_icon_slot.y, model_icon_slot.w, model_icon_slot.h));
         queueImage(state, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }, cached, model_rect);

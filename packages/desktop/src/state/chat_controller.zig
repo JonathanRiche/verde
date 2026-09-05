@@ -9008,6 +9008,23 @@ pub fn finishGrokModelCacheThread(self: anytype) void {
     }
 }
 
+pub fn finishMuseModelCacheThread(self: anytype) void {
+    self.provider_controller.muse_model_cache.mutex.lock();
+    const maybe_worker = self.provider_controller.muse_model_cache.worker;
+    self.provider_controller.muse_model_cache.worker = null;
+    const maybe_models = self.provider_controller.muse_model_cache.models;
+    self.provider_controller.muse_model_cache.models = null;
+    self.provider_controller.muse_model_cache.status = .idle;
+    self.provider_controller.muse_model_cache.mutex.unlock();
+
+    if (maybe_worker) |worker| {
+        worker.join();
+    }
+    if (maybe_models) |models| {
+        provider_types.freeModelInfos(std.heap.page_allocator, models);
+    }
+}
+
 pub fn finishCursorModelCacheThread(self: anytype) void {
     self.provider_controller.cursor_model_cache.mutex.lock();
     const maybe_worker = self.provider_controller.cursor_model_cache.worker;

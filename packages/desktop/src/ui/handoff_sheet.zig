@@ -557,16 +557,7 @@ fn drawProviderLogo(state: *runtime.AppState, provider: runtime.Provider, x: f32
 }
 
 fn providerLogo(state: *runtime.AppState, provider: runtime.Provider) ?runtime.CachedImageTexture {
-    const cached = switch (provider) {
-        .codex => state.codex_logo_texture,
-        .opencode => state.opencode_logo_texture,
-        .claude => state.claude_logo_texture,
-        .cursor => state.cursor_logo_texture,
-        .pi => state.pi_logo_texture,
-        .fx => state.fx_logo_texture,
-        .grok => state.grok_logo_texture,
-        .muse => null,
-    } orelse return null;
+    const cached = state.providerLogoTexture(provider) orelse return null;
     if (!cached.valid or cached.texture_id == 0) return null;
     return cached;
 }

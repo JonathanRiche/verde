@@ -16,6 +16,8 @@ export interface EffortOption {
 export interface ModelOption {
   label: string
   value: string
+  /// Picker-only catalog blurb; the composer pill stays the short label.
+  description?: string
   /// Effort menu for this model; undefined hides the effort picker.
   efforts?: EffortOption[]
   /// OpenCode reasoning variant keys; undefined hides the variant picker.
@@ -29,6 +31,7 @@ export interface DynamicModelRow {
   provider_id?: string
   model_id: string
   model_name?: string
+  description?: string | null
   reasoning_supported?: boolean
   reasoning_variant_keys?: string[] | null
   claude_effort_values?: string[] | null
@@ -89,7 +92,12 @@ export function dynamicModelOptions(provider: string, rows: DynamicModelRow[]): 
       // reasoning effort (low..xhigh), and `max` is not offered.
       options.push({ label, value: row.model_id, efforts: GROK_EFFORTS })
     } else if (provider === 'muse') {
-      options.push({ label, value: row.model_id, efforts: MUSE_EFFORTS })
+      options.push({
+        label,
+        value: row.model_id,
+        ...(row.description ? { description: row.description } : {}),
+        efforts: MUSE_EFFORTS,
+      })
     } else {
       options.push({ label, value: row.model_id })
     }
@@ -195,9 +203,24 @@ const MUSE_EFFORTS: EffortOption[] = [
   { label: 'Ultra', value: 'max' },
 ]
 
+const MUSE_CONTRIBUTOR_DESCRIPTION =
+  'Your content, including inter-session messages, may be used for product improvement.'
+
 const MUSE_MODELS: ModelOption[] = [
-  { label: 'Default (Muse config)', value: 'default', efforts: MUSE_EFFORTS },
-  { label: 'Muse Spark 1.3 Contributor', value: 'muse-spark-1.3-contributor', efforts: MUSE_EFFORTS },
+  { label: 'muse-spark-1.3', value: 'muse-spark-1.3', efforts: MUSE_EFFORTS },
+  {
+    label: 'muse-spark-1.3-contributor',
+    value: 'muse-spark-1.3-contributor',
+    description: MUSE_CONTRIBUTOR_DESCRIPTION,
+    efforts: MUSE_EFFORTS,
+  },
+  { label: 'muse-spark-1.2', value: 'muse-spark-1.2', efforts: MUSE_EFFORTS },
+  {
+    label: 'muse-spark-1.2-contributor',
+    value: 'muse-spark-1.2-contributor',
+    description: MUSE_CONTRIBUTOR_DESCRIPTION,
+    efforts: MUSE_EFFORTS,
+  },
 ]
 
 const CURSOR_GROK_VARIANTS = ['low', 'medium', 'high']
