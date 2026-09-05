@@ -28,7 +28,7 @@ const Menu = handoff_controller.Menu;
 const HANDOFF_SHEET_Z: i32 = 300;
 
 const PROVIDERS = handoff_controller.TARGET_PROVIDERS;
-const SURFACE_LABELS = [2][]const u8{ "Gui chat", "Agent tui" };
+const SURFACE_LABELS = [2][]const u8{ "Chat", "Terminal" };
 const CONTEXT_LABELS = [3][]const u8{ "Summary", "Recent messages", "Full transcript" };
 const NEW_THREAD_LABEL = "New thread";
 const CANCEL_LABEL = "Cancel";
