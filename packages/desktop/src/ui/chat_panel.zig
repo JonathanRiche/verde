@@ -1518,6 +1518,28 @@ fn transcriptMarkdownBubbleLinkHit(
     return assistantTranscriptMarkdownLinkHit(state, column, content_y, assistant_h, .assistant, "", body, stream_text.len == 0, stream_plain, true, mouse_x, mouse_y);
 }
 
+pub const TranscriptLinkKind = enum {
+    file,
+    web,
+    other,
+};
+
+/// Href of the Markdown link under the pointer, if any. The slice borrows
+/// message memory and is only valid until the transcript changes, so callers
+/// that keep it (context menus) must copy it immediately.
+pub fn transcriptMarkdownLinkHrefAt(state: *app_state.AppState, x: f32, y: f32) ?[]const u8 {
+    const hit = transcriptMarkdownBubbleLinkHit(state, x, y) orelse return null;
+    return hit.href;
+}
+
+/// Classifies a link the same way the left-click path does, so the context
+/// menu offers file targets exactly when a click would open a file.
+pub fn transcriptLinkKind(href: []const u8) TranscriptLinkKind {
+    if (webHref(href) != null) return .web;
+    if (localFileHref(href) != null) return .file;
+    return .other;
+}
+
 fn localFileHref(href: []const u8) ?[]const u8 {
     const trimmed = std.mem.trim(u8, href, &std.ascii.whitespace);
     if (trimmed.len == 0 or trimmed[0] == '#') return null;

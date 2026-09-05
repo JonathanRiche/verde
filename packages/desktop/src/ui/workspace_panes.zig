@@ -21,6 +21,7 @@ const handoff_sheet = @import("handoff_sheet.zig");
 const profiler = @import("../runtime/profiler.zig");
 const terminal_panel = @import("terminal_panel.zig");
 const theme = @import("theme.zig");
+const utils = @import("../utils.zig");
 
 const THREAD_DROP_PREVIEW_Z: i32 = 140;
 const PANE_ZOOM_CONTROL_Z: i32 = 150;
@@ -78,7 +79,7 @@ fn nowMs() i64 {
     return @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
 }
 
-const MAX_WORKSPACE_PANE_HITS = 48;
+const MAX_WORKSPACE_PANE_HITS = 64;
 const WorkspacePaneAction = enum {
     focus,
     maximize,
@@ -98,6 +99,16 @@ const WorkspacePaneAction = enum {
     split_terminal_up,
     split_terminal_down,
     close,
+    open_link_nvim_pane,
+    open_link_editor,
+    open_link_cursor,
+    open_link_vscode,
+    open_link_zed,
+    open_link_system,
+    open_link_reveal,
+    open_link_verde_browser,
+    open_link_system_browser,
+    copy_link,
     resize_split,
     resize_scrolling_column,
     scrolling_previous,
@@ -149,6 +160,18 @@ var split_menu_anchor: palette.Rect = .{};
 var split_menu_show_paste: bool = false;
 const SplitMenuKind = enum { split_button, chat_context };
 var split_menu_kind: SplitMenuKind = .split_button;
+/// Markdown link the chat context menu was opened on, copied out of message
+/// memory because the transcript may change while the menu stays open.
+const MAX_CONTEXT_LINK_LEN: usize = 2048;
+var split_menu_link_buf: [MAX_CONTEXT_LINK_LEN]u8 = undefined;
+var split_menu_link_len: usize = 0;
+var split_menu_link_kind: chat_panel.TranscriptLinkKind = .other;
+/// Editor availability (configured, Cursor, VS Code, Zed) resolved once when
+/// the menu opens; launcher lookups touch PATH and must not run per frame.
+var split_menu_link_editors: [4]bool = .{ false, false, false, false };
+var split_menu_link_nvim_pane: bool = false;
+var split_menu_link_editor_label_buf: [64]u8 = undefined;
+var split_menu_link_editor_label_len: usize = 0;
 
 const MAX_WORKSPACE_PANE_RECTS = 16;
 const WorkspacePaneRect = struct {
@@ -426,6 +449,7 @@ pub fn openFocusedChatPaneContextMenu(state: *runtime.AppState) bool {
         }
     }
     const pane_rect = rect orelse return false;
+    split_menu_link_len = 0;
     split_menu_show_paste = false;
     split_menu_kind = .chat_context;
     split_menu_open_for = pane_id;
@@ -1059,6 +1083,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
             if (hit.action != .focus) continue;
             if (!rectContains(hit.rect, x, y)) continue;
             _ = state.focusCurrentProjectWorkspacePane(hit.pane_id);
+            captureContextLink(state, x, y);
             split_menu_show_paste = false;
             split_menu_kind = .chat_context;
             if (state.composer_controller.composer.textRect().contains(.{ .x = x, .y = y })) {
@@ -1077,6 +1102,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
             const pane_rect = pane_rects[ri];
             if (!rectContains(pane_rect.rect, x, y)) continue;
             _ = state.focusCurrentProjectWorkspacePane(pane_rect.pane_id);
+            captureContextLink(state, x, y);
             split_menu_show_paste = false;
             split_menu_kind = .chat_context;
             if (state.composer_controller.composer.textRect().contains(.{ .x = x, .y = y })) {
@@ -1185,6 +1211,46 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
                 _ = state.closeCurrentProjectWorkspacePane(hit.pane_id);
                 split_menu_open_for = null;
             },
+            .open_link_nvim_pane => {
+                state.openTranscriptFileReferenceWith(contextLink(), .neovim_pane);
+                split_menu_open_for = null;
+            },
+            .open_link_editor => {
+                state.openTranscriptFileReferenceWith(contextLink(), .configured_editor);
+                split_menu_open_for = null;
+            },
+            .open_link_cursor => {
+                state.openTranscriptFileReferenceWith(contextLink(), .cursor);
+                split_menu_open_for = null;
+            },
+            .open_link_vscode => {
+                state.openTranscriptFileReferenceWith(contextLink(), .vscode);
+                split_menu_open_for = null;
+            },
+            .open_link_zed => {
+                state.openTranscriptFileReferenceWith(contextLink(), .zed);
+                split_menu_open_for = null;
+            },
+            .open_link_system => {
+                state.openTranscriptFileReferenceWith(contextLink(), .system_handler);
+                split_menu_open_for = null;
+            },
+            .open_link_reveal => {
+                state.openTranscriptFileReferenceWith(contextLink(), .reveal);
+                split_menu_open_for = null;
+            },
+            .open_link_verde_browser => {
+                state.openWebLinkWithTarget(contextLink(), .verde_browser);
+                split_menu_open_for = null;
+            },
+            .open_link_system_browser => {
+                state.openWebLinkWithTarget(contextLink(), .system_browser);
+                split_menu_open_for = null;
+            },
+            .copy_link => {
+                state.copyTranscriptLinkToClipboard(contextLink());
+                split_menu_open_for = null;
+            },
             .resize_split, .resize_scrolling_column => {
                 resize_drag = hit;
                 updateResizeDrag(state, hit, x, y);
@@ -1272,6 +1338,99 @@ pub fn handlePaneChromeMouseButton(state: *runtime.AppState, x: f32, y: f32, but
         return true;
     }
     return false;
+}
+
+/// Records the Markdown link under a right-click (if any) so the chat context
+/// menu can offer alternative open targets for it.
+fn captureContextLink(state: *runtime.AppState, x: f32, y: f32) void {
+    split_menu_link_len = 0;
+    split_menu_link_kind = .other;
+    const href = chat_panel.transcriptMarkdownLinkHrefAt(state, x, y) orelse return;
+    const trimmed = std.mem.trim(u8, href, &std.ascii.whitespace);
+    if (trimmed.len == 0 or trimmed.len > split_menu_link_buf.len) return;
+    @memcpy(split_menu_link_buf[0..trimmed.len], trimmed);
+    split_menu_link_len = trimmed.len;
+    split_menu_link_kind = chat_panel.transcriptLinkKind(trimmed);
+    if (split_menu_link_kind != .file) return;
+
+    split_menu_link_nvim_pane = utils.configuredEditorIsNeovim();
+    split_menu_link_editors = .{
+        utils.editorTargetAvailable(.configured),
+        utils.editorTargetAvailable(.cursor),
+        utils.editorTargetAvailable(.vscode),
+        utils.editorTargetAvailable(.zed),
+    };
+    split_menu_link_editor_label_len = 0;
+    if (utils.configuredEditorDisplayName()) |name| {
+        if (std.fmt.bufPrint(&split_menu_link_editor_label_buf, "Open in {s}", .{name})) |label| {
+            split_menu_link_editor_label_len = label.len;
+        } else |_| {}
+    }
+}
+
+fn contextLink() []const u8 {
+    return split_menu_link_buf[0..split_menu_link_len];
+}
+
+fn contextLinkEditorLabel() []const u8 {
+    if (split_menu_link_editor_label_len == 0) return "Open in Editor";
+    return split_menu_link_editor_label_buf[0..split_menu_link_editor_label_len];
+}
+
+const ContextLinkRow = struct {
+    action: WorkspacePaneAction,
+    label: []const u8,
+};
+
+/// "Open in ..." rows for the captured link. File links list every editor
+/// that can launch plus the system handler and file manager; web links choose
+/// between the Verde and system browsers. Anything else can only be copied.
+fn contextLinkRows(rows: *[8]ContextLinkRow) usize {
+    if (split_menu_link_len == 0) return 0;
+    var count: usize = 0;
+    switch (split_menu_link_kind) {
+        .file => {
+            if (split_menu_link_nvim_pane) {
+                rows[count] = .{ .action = .open_link_nvim_pane, .label = "Open in Neovim Pane" };
+                count += 1;
+            }
+            if (split_menu_link_editors[0]) {
+                rows[count] = .{ .action = .open_link_editor, .label = contextLinkEditorLabel() };
+                count += 1;
+            }
+            if (split_menu_link_editors[1]) {
+                rows[count] = .{ .action = .open_link_cursor, .label = "Open in Cursor" };
+                count += 1;
+            }
+            if (split_menu_link_editors[2]) {
+                rows[count] = .{ .action = .open_link_vscode, .label = "Open in VS Code" };
+                count += 1;
+            }
+            if (split_menu_link_editors[3]) {
+                rows[count] = .{ .action = .open_link_zed, .label = "Open in Zed" };
+                count += 1;
+            }
+            rows[count] = .{ .action = .open_link_system, .label = "Open with System Default" };
+            count += 1;
+            rows[count] = .{ .action = .open_link_reveal, .label = "Reveal in File Manager" };
+            count += 1;
+            rows[count] = .{ .action = .copy_link, .label = "Copy Path" };
+            count += 1;
+        },
+        .web => {
+            rows[count] = .{ .action = .open_link_verde_browser, .label = "Open in Verde Browser" };
+            count += 1;
+            rows[count] = .{ .action = .open_link_system_browser, .label = "Open in System Browser" };
+            count += 1;
+            rows[count] = .{ .action = .copy_link, .label = "Copy Link" };
+            count += 1;
+        },
+        .other => {
+            rows[count] = .{ .action = .copy_link, .label = "Copy Link" };
+            count += 1;
+        },
+    }
+    return count;
 }
 
 fn toggleSplitMenu(state: *runtime.AppState, hit: WorkspacePaneHit) void {
@@ -2949,9 +3108,13 @@ fn renderSplitMenuOverlay(state: *runtime.AppState, workspace_rect: palette.Rect
     const copy_count: usize = if (is_chat_context and state.transcriptMarkdownSelectionActive()) 1 else 0;
     const paste_count: usize = if (is_chat_context and split_menu_show_paste) 1 else 0;
     const chat_command_count: usize = if (is_chat_context) copy_count + paste_count + 2 else 0;
-    const command_count: usize = chat_command_count + 3;
+    var link_rows: [8]ContextLinkRow = undefined;
+    const link_row_count: usize = if (is_chat_context) contextLinkRows(&link_rows) else 0;
+    // A thin rule separates link targets from the pane commands below them.
+    const link_separator_h: f32 = if (link_row_count > 0) theme.scaledUi(9.0) else 0.0;
+    const command_count: usize = link_row_count + chat_command_count + 3;
     const split_count: usize = 8;
-    const menu_h = menu_pad_top + menu_pad_bottom +
+    const menu_h = menu_pad_top + menu_pad_bottom + link_separator_h +
         @as(f32, @floatFromInt(command_count)) * row_h +
         @as(f32, @floatFromInt(command_count - 1)) * row_gap;
     const submenu_h = menu_pad_top + menu_pad_bottom +
@@ -2979,6 +3142,14 @@ fn renderSplitMenuOverlay(state: *runtime.AppState, workspace_rect: palette.Rect
     };
     var y = menu_rect.y + menu_pad_top;
     const row_rect_w = menu_rect.w - menu_pad_x * 2.0;
+    if (link_row_count > 0) {
+        for (link_rows[0..link_row_count]) |row| {
+            y = renderContextMenuRow(state, pane_id, row.action, row.label, menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
+        }
+        const rule_y = y + (link_separator_h - theme.scaledUi(1.0)) * 0.5;
+        queueRect(state, .{ .x = menu_rect.x + menu_pad_x, .y = rule_y, .w = row_rect_w, .h = theme.scaledUi(1.0) }, paletteColor(theme.COLOR_PANEL_MUTED));
+        y += link_separator_h;
+    }
     if (is_chat_context) {
         if (copy_count > 0) y = renderContextMenuRow(state, pane_id, .copy_selection, "Copy", menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
         if (paste_count > 0) y = renderContextMenuRow(state, pane_id, .paste_into_prompt, "Paste", menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
