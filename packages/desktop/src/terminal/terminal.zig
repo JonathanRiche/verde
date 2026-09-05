@@ -500,6 +500,20 @@ pub const RuntimeProcessSnapshot = struct {
     launch_kind: TerminalLaunchKind,
 };
 
+fn shellOwnsForeground(shell_pid: ?usize, foreground_pid: ?usize) bool {
+    const shell = shell_pid orelse return false;
+    const foreground = foreground_pid orelse return false;
+    return shell > 0 and foreground == shell;
+}
+
+test "agent exit requires confirmed shell foreground ownership" {
+    try std.testing.expect(shellOwnsForeground(101, 101));
+    try std.testing.expect(!shellOwnsForeground(101, 202));
+    try std.testing.expect(!shellOwnsForeground(101, null));
+    try std.testing.expect(!shellOwnsForeground(null, 101));
+    try std.testing.expect(!shellOwnsForeground(0, 0));
+}
+
 pub const NotificationEvent = struct {
     session_id: []const u8,
     pane_id: u32,
@@ -1190,6 +1204,28 @@ pub const Dock = struct {
         return session.snapshot();
     }
 
+    /// True only after a live shell is confirmed to own the PTY again.
+    /// Missing/stale attach metadata must not retire a restored agent.
+    pub fn activeSessionAtShellPrompt(self: *const Dock, status_changed_at_ms: i64) bool {
+        if (comptime Session == UnsupportedSession) return false;
+        const pane = self.activePaneConst() orelse return false;
+        const session = pane.session orelse return false;
+        if (!session.running or session.launch_kind != .shell) return false;
+        return switch (session.backend) {
+            .daemon => session.daemon_state == .attached and
+                session.daemon_process_observed_at_ms > status_changed_at_ms +| 500 and
+                shellOwnsForeground(session.daemon_shell_pid, session.daemon_foreground_process_group),
+            .local => blk: {
+                if (platform_runtime.unixTimestampMs() <= status_changed_at_ms +| 500) break :blk false;
+                if (!LOCAL_PTY_SUPPORTED) break :blk false;
+                const ioctl_value = TERMINAL_GET_PGRP_IOCTL orelse break :blk false;
+                var foreground: c_int = 0;
+                if (std.c.ioctl(session.master_fd, ioctl_value, &foreground) != 0) break :blk false;
+                break :blk foreground > 0 and foreground == session.child_pid;
+            },
+        };
+    }
+
     /// Returns the process identity already cached by terminal polling. Shell
     /// panes appear only while a foreground command is active; custom/agent
     /// profiles represent the launched process itself.
@@ -1205,6 +1241,16 @@ pub const Dock = struct {
         const pane = self.activePaneConst() orelse return null;
         const session = pane.session orelse return null;
         return try session.outputTailAlloc(allocator, max_bytes);
+    }
+
+    /// Inspect only the live footer, independent of the user's scrollback view.
+    /// This bounded, allocation-free read never scans transcript history.
+    pub fn activeClaudeBackgroundShells(self: *const Dock) bool {
+        const pane = self.activePaneConst() orelse return false;
+        const session = pane.session orelse return false;
+        if (comptime Session == UnsupportedSession) return false;
+        if (!session.running) return false;
+        return claudeBackgroundShells(&session.terminal);
     }
 
     pub fn activeScreenTextAlloc(self: *const Dock, allocator: std.mem.Allocator) !?[]u8 {
@@ -2831,6 +2877,7 @@ const UnixSession = struct {
     remote_output_offset: usize = 0,
     daemon_shell_pid: ?usize = null,
     daemon_foreground_process_group: ?usize = null,
+    daemon_process_observed_at_ms: i64 = 0,
     created_at_ms: i64 = 0,
     suppress_next_daemon_replay: bool = false,
     suppress_pty_responses: bool = false,
@@ -3905,6 +3952,7 @@ const UnixSession = struct {
         if (jsonU16(result.object.get("rows") orelse .null)) |reported_rows| self.daemon_reported_rows = reported_rows;
         self.daemon_shell_pid = shell_pid;
         self.daemon_foreground_process_group = foreground_process_group;
+        self.daemon_process_observed_at_ms = platform_runtime.unixTimestampMs();
         const stale_alt_screen_replay = suppress_replay_responses and
             shell_pid != null and
             foreground_process_group != null and
@@ -6477,4 +6525,39 @@ test "repair terminal state resets invalid scrolling region" {
     try testing.expectEqual(session.terminal.cols - 1, session.terminal.scrolling_region.right);
     try testing.expectEqual(@as(@TypeOf(session.terminal.scrolling_region.top), 0), session.terminal.scrolling_region.top);
     try testing.expectEqual(session.terminal.rows - 1, session.terminal.scrolling_region.bottom);
+}
+
+fn claudeBackgroundShells(model: *const ghostty_vt.Terminal) bool {
+    const pages = &model.screens.active.pages;
+    var y = model.rows -| 3;
+    while (y < model.rows) : (y += 1) {
+        const pin = pages.pin(.{ .active = .{ .x = 0, .y = y } }) orelse continue;
+        var buffer: [2048]u8 = undefined;
+        var len: usize = 0;
+        for (pin.cells(.all)) |cell| {
+            if (cell.wide == .spacer_tail) continue;
+            const cp = if (cell.hasText()) cell.codepoint() else ' ';
+            if (len + 4 > buffer.len) break;
+            len += std.unicode.utf8Encode(cp, buffer[len..]) catch continue;
+        }
+        if (@import("claude_activity.zig").footerHasBackgroundShells(buffer[0..len])) return true;
+    }
+    return false;
+}
+
+test "Claude background shell footer follows live screen and clears after completion" {
+    const allocator = std.testing.allocator;
+    var model = try ghostty_vt.Terminal.init((ghostty_vt.TinyIo.init).io(), allocator, .{ .cols = 100, .rows = 10 });
+    defer model.deinit(allocator);
+    var stream = model.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("old output\r\n" ** 20);
+    stream.nextSlice("\x1b[9;1Hbypass permissions on · 1 shell · ← for agents");
+    try std.testing.expect(claudeBackgroundShells(&model));
+    model.scrollViewport(.top);
+    try std.testing.expect(claudeBackgroundShells(&model));
+    stream.nextSlice("\x1b[9;1H\x1b[2Kbypass permissions on");
+    try std.testing.expect(!claudeBackgroundShells(&model));
+    stream.nextSlice("\x1b[2;1Hbypass permissions on · 1 shell · ← for agents");
+    try std.testing.expect(!claudeBackgroundShells(&model));
 }

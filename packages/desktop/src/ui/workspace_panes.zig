@@ -801,7 +801,7 @@ fn paneAgentVisualStatus(state: *const runtime.AppState, pane_id: runtime.Worksp
         },
         .terminal => |ref| blk: {
             const surface = state.projectTerminalSurface(state.project_controller.selected_index, ref.dock_id) orelse break :blk .idle;
-            break :blk switch (surface.displayStatus()) {
+            break :blk switch (state.terminalSurfaceDisplayStatus(surface)) {
                 .done => .done,
                 .working => .working,
                 .waiting => .waiting,

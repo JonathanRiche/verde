@@ -588,6 +588,7 @@ fn mainInner(init: std.process.Init) !void {
         state.noteWorkspaceSwitchStage("event_drain_complete");
         frame_sample.waited_ns = loop_wait.waited_ns;
         state.pollAcknowledgements();
+        if (state.acknowledgeFocusedTerminalCompletion()) presentation_demand.request();
         recordSpan(&frame_sample, .poll_picker, struct {
             fn run(app_state: *AppState) void {
                 app_state.processDeferredProjectDirectoryBrowse();

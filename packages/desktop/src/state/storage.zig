@@ -585,6 +585,12 @@ pub const Storage = struct {
     }
 
     pub fn clearSurfaceCompletion(self: *const Storage, acknowledged: PersistedSurfaceState) !bool {
+        if (acknowledged.status != .done) return false;
+        return self.clearObservedSurfaceState(acknowledged);
+    }
+
+    /// Retire only the exact lifecycle observed before a TUI exited.
+    pub fn clearObservedSurfaceState(self: *const Storage, acknowledged: PersistedSurfaceState) !bool {
         try self.ensureGranularMutationAllowed();
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
@@ -651,7 +657,7 @@ pub const Storage = struct {
         self.noteStoreRevision(result.store_revision);
         return .{
             .store_revision = result.store_revision,
-            .matches = acknowledged.status == .done and result.matches,
+            .matches = result.matches,
         };
     }
 

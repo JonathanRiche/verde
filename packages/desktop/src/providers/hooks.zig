@@ -20,6 +20,7 @@ const CodexHookEvent = struct { name: []const u8, status_message: []const u8 };
 const CODEX_HOOK_EVENTS = [_]CodexHookEvent{
     .{ .name = "SessionStart", .status_message = "Syncing Verde session" },
     .{ .name = "UserPromptSubmit", .status_message = "Marking Verde agent busy" },
+    .{ .name = "PreToolUse", .status_message = "Syncing Verde agent title" },
     .{ .name = "PermissionRequest", .status_message = "Marking Verde agent waiting" },
     .{ .name = "SubagentStart", .status_message = "Tracking Verde subagent" },
     .{ .name = "SubagentStop", .status_message = "Updating Verde subagent status" },
@@ -329,14 +330,26 @@ fn writeCodexHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const 
         \\[ -n "$event" ] || event="${1:-}"
         \\
     ++ POSIX_AGENT_ACTIVITY_STATE ++
+        \\session_key="$(printf '%s' "$VERDE_SESSION_ID" | cksum 2>/dev/null | awk '{print $1 "-" $2}')"
+        \\state_dir="${TMPDIR:-/tmp}/verde-agent-status/codex-$session_key"
+        \\if command -v jq >/dev/null 2>&1; then
+        \\  provider_session_id="$(jq -r '.session_id // empty' "$payload" 2>/dev/null)"
+        \\else
+        \\  provider_session_id="$(sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^" ]*\)".*/\1/p' "$payload" | head -n 1)"
+        \\fi
+        \\bound_session="$(cat "$state_dir/provider_session_id" 2>/dev/null)"
+        \\# Subagent tool hooks inherit the pane environment, but own a different thread.
+        \\if [ "$event" != "SessionStart" ] && [ -n "$bound_session" ] && [ -n "$provider_session_id" ] && [ "$bound_session" != "$provider_session_id" ]; then
+        \\  rm -f "$payload"; exit 0
+        \\fi
         \\activity=""
         \\title=""
         \\case "$event" in
         \\  SessionStart) activity="session-start" ;;
         \\  UserPromptSubmit)
         \\    activity="parent-working"
-        \\    # Codex has no session-title field, but UserPromptSubmit carries the
-        \\    # prompt text. Derive a pane label from it (like a chat thread title):
+        \\    # Use the first prompt until Codex saves its generated session name.
+        \\    # Derive a temporary pane label from the prompt:
         \\    # prefer jq for correct JSON decoding, else a best-effort sed fallback;
         \\    # collapse whitespace and truncate to a sidebar-friendly length.
         \\    if command -v jq >/dev/null 2>&1; then
@@ -346,6 +359,7 @@ fn writeCodexHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const 
         \\    fi
         \\    title="$(printf '%s' "$title" | tr '\n\t' '  ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]][[:space:]]*/ /g' | cut -c1-72)"
         \\    ;;
+        \\  PreToolUse) activity="parent-working" ;;
         \\  PermissionRequest) activity="parent-waiting" ;;
         \\  SubagentStart) activity="child-start" ;;
         \\  SubagentStop) activity="child-stop" ;;
@@ -355,13 +369,23 @@ fn writeCodexHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const 
         \\esac
         \\status="$(update_agent_status codex "$activity" working)"
         \\[ -n "$status" ] || { rm -f "$payload"; exit 0; }
-        \\session_key="$(printf '%s' "$VERDE_SESSION_ID" | cksum 2>/dev/null | awk '{print $1 "-" $2}')"
-        \\title_path="${TMPDIR:-/tmp}/verde-agent-status/codex-$session_key/title"
-        \\if [ -n "$title" ]; then
-        \\  printf '%s' "$title" > "$title_path"
-        \\elif [ -f "$title_path" ]; then
+        \\[ -z "$provider_session_id" ] || printf '%s' "$provider_session_id" > "$state_dir/provider_session_id"
+        \\title_path="$state_dir/title"
+        \\# Names are appended to Codex's index after UserPromptSubmit. Refresh
+        \\# at the next tool boundary (or Stop for a reply without tools).
+        \\provider_title=""
+        \\if command -v jq >/dev/null 2>&1; then
+        \\  if [ -n "$provider_session_id" ]; then
+        \\    provider_title="$(jq -Rnr --arg id "$provider_session_id" 'reduce inputs as $line (""; (try ($line | fromjson) catch null) as $row | if ($row | type) == "object" and $row.id == $id and ($row.thread_name | type) == "string" and ($row.thread_name | length) > 0 then $row.thread_name else . end)' "${CODEX_HOME:-${HOME:-}/.codex}/session_index.jsonl" 2>/dev/null)"
+        \\  fi
+        \\fi
+        \\if [ -n "$provider_session_id" ]; then export VERDE_PROVIDER_THREAD_ID="$provider_session_id"; else unset VERDE_PROVIDER_THREAD_ID; fi
+        \\if [ -n "$provider_title" ]; then
+        \\  title="$provider_title"
+        \\elif [ -s "$title_path" ]; then
         \\  title="$(cat "$title_path" 2>/dev/null)"
         \\fi
+        \\[ -z "$title" ] || printf '%s' "$title" > "$title_path"
         \\
         \\cli="${VERDE_CLI:-verde}"
         \\if ! command -v "$cli" >/dev/null 2>&1; then
@@ -487,7 +511,16 @@ fn writeClaudeHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const
         \\activity=""
         \\title=""
         \\case "$event" in
-        \\  SessionStart) activity="session-start" ;;
+        \\  SessionStart)
+        \\    if command -v jq >/dev/null 2>&1; then
+        \\      source="$(jq -r '.source // empty' "$payload" 2>/dev/null)"
+        \\    else
+        \\      source="$(sed -n 's/.*"source"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$payload" | head -n 1)"
+        \\    fi
+        \\    # Compaction preserves the previous lifecycle; manual /compact
+        \\    # can run at an idle prompt without starting an agentic turn.
+        \\    if [ "$source" = "compact" ]; then rm -f "$payload"; exit 0; else activity="session-start"; fi
+        \\    ;;
         \\  UserPromptSubmit)
         \\    activity="parent-working"
         \\    if command -v jq >/dev/null 2>&1; then
@@ -498,11 +531,12 @@ fn writeClaudeHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const
         \\    title="$(printf '%s' "$title" | tr '\n\t' '  ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]][[:space:]]*/ /g' | cut -c1-72)"
         \\    ;;
         \\  Notification)
-        \\    # Claude fires Notification for both permission requests and the
-        \\    # idle "waiting for your input" nudge. Only the former needs you.
+        \\    # An idle nudge reconciles a missed Stop/interrupt; permission
+        \\    # notifications still represent waiting on the user.
         \\    msg="$(sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$payload" | head -n 1)"
-        \\    case "$msg" in
-        \\      *"waiting for your input"*|*"is idle"*) rm -f "$payload"; exit 0 ;;
+        \\    kind="$(sed -n 's/.*"notification_type"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$payload" | head -n 1)"
+        \\    case "$kind:$msg" in
+        \\      idle_prompt:*|*"waiting for your input"*|*"is idle"*) activity="parent-idle" ;;
         \\      *) activity="parent-waiting" ;;
         \\    esac ;;
         \\  SubagentStart) activity="child-start" ;;
@@ -725,6 +759,14 @@ fn codexPowerShellHookScript() []const u8 {
     \\
     ++ POWERSHELL_AGENT_ACTIVITY_STATE ++
         \\$eventName = if ($null -ne $payload -and $null -ne $payload.hook_event_name) { [string]$payload.hook_event_name } elseif ($null -ne $payload -and $null -ne $payload.event) { [string]$payload.event } elseif ($args.Count -gt 0) { [string]$args[0] } else { '' }
+        \\$sessionBytes = [Text.Encoding]::UTF8.GetBytes($env:VERDE_SESSION_ID)
+        \\$sessionSha = [Security.Cryptography.SHA256]::Create()
+        \\try { $sessionFingerprint = [BitConverter]::ToString($sessionSha.ComputeHash($sessionBytes)).Replace('-', '') } finally { $sessionSha.Dispose() }
+        \\$titlePath = Join-Path (Join-Path ([IO.Path]::GetTempPath()) 'verde-agent-status') ('codex-' + $sessionFingerprint + [IO.Path]::DirectorySeparatorChar + 'title')
+        \\$providerSessionId = if ($null -ne $payload -and $null -ne $payload.session_id) { [string]$payload.session_id } else { '' }
+        \\$sessionPath = Join-Path (Split-Path $titlePath) 'provider_session_id'
+        \\$boundSession = if (Test-Path -LiteralPath $sessionPath) { Get-Content -LiteralPath $sessionPath -Raw -ErrorAction SilentlyContinue } else { '' }
+        \\if ($eventName -ne 'SessionStart' -and -not [string]::IsNullOrWhiteSpace($boundSession) -and -not [string]::IsNullOrWhiteSpace($providerSessionId) -and $boundSession -ne $providerSessionId) { exit 0 }
         \\$activity = ''
         \\$title = ''
         \\switch ($eventName) {
@@ -736,6 +778,7 @@ fn codexPowerShellHookScript() []const u8 {
         \\      if ($title.Length -gt 72) { $title = $title.Substring(0, 72) }
         \\    }
         \\  }
+        \\  'PreToolUse' { $activity = 'parent-working' }
         \\  'PermissionRequest' { $activity = 'parent-waiting' }
         \\  'SubagentStart' { $activity = 'child-start' }
         \\  'SubagentStop' { $activity = 'child-stop' }
@@ -744,15 +787,26 @@ fn codexPowerShellHookScript() []const u8 {
         \\}
         \\$status = Update-AgentStatus -Provider 'codex' -Activity $activity -InitialStatus 'working' -PayloadText $payloadText
         \\if ([string]::IsNullOrWhiteSpace($status)) { exit 0 }
-        \\$sessionBytes = [Text.Encoding]::UTF8.GetBytes($env:VERDE_SESSION_ID)
-        \\$sessionSha = [Security.Cryptography.SHA256]::Create()
-        \\try { $sessionFingerprint = [BitConverter]::ToString($sessionSha.ComputeHash($sessionBytes)).Replace('-', '') } finally { $sessionSha.Dispose() }
-        \\$titlePath = Join-Path (Join-Path ([IO.Path]::GetTempPath()) 'verde-agent-status') ('codex-' + $sessionFingerprint + [IO.Path]::DirectorySeparatorChar + 'title')
-        \\if (-not [string]::IsNullOrWhiteSpace($title)) {
-        \\  Set-Content -LiteralPath $titlePath -Value $title -NoNewline -ErrorAction SilentlyContinue
-        \\} elseif (Test-Path -LiteralPath $titlePath) {
-        \\  $title = Get-Content -LiteralPath $titlePath -Raw -ErrorAction SilentlyContinue
+        \\$providerTitle = ''
+        \\if (-not [string]::IsNullOrWhiteSpace($providerSessionId)) { Set-Content -LiteralPath $sessionPath -Value $providerSessionId -NoNewline -ErrorAction SilentlyContinue }
+        \\$env:VERDE_PROVIDER_THREAD_ID = $providerSessionId
+        \\$codexHome = if ([string]::IsNullOrWhiteSpace($env:CODEX_HOME)) { Join-Path $env:USERPROFILE '.codex' } else { $env:CODEX_HOME }
+        \\$indexPath = Join-Path $codexHome 'session_index.jsonl'
+        \\if (-not [string]::IsNullOrWhiteSpace($providerSessionId) -and (Test-Path -LiteralPath $indexPath)) {
+        \\  foreach ($line in [IO.File]::ReadLines($indexPath)) {
+        \\    try {
+        \\      $row = ConvertFrom-Json -InputObject $line
+        \\      if ($row.id -eq $providerSessionId -and $row.thread_name -is [string] -and -not [string]::IsNullOrWhiteSpace($row.thread_name)) { $providerTitle = $row.thread_name }
+        \\    } catch {}
+        \\  }
         \\}
+        \\if (-not [string]::IsNullOrWhiteSpace($providerTitle)) {
+        \\  $title = $providerTitle
+        \\} elseif (Test-Path -LiteralPath $titlePath) {
+        \\  $cachedTitle = Get-Content -LiteralPath $titlePath -Raw -ErrorAction SilentlyContinue
+        \\  if (-not [string]::IsNullOrWhiteSpace($cachedTitle)) { $title = $cachedTitle }
+        \\}
+        \\if (-not [string]::IsNullOrWhiteSpace($title)) { Set-Content -LiteralPath $titlePath -Value $title -NoNewline -ErrorAction SilentlyContinue }
         \\$cli = if ([string]::IsNullOrWhiteSpace($env:VERDE_CLI)) { 'verde.exe' } else { $env:VERDE_CLI }
         \\if ($cli.EndsWith(' (deleted)')) { $cli = $cli.Substring(0, $cli.Length - 10) }
         \\$notifyArgs = @('notify', '--quiet', '--status', $status, '--provider', 'codex')
@@ -780,7 +834,13 @@ fn claudePowerShellHookScript() []const u8 {
         \\$activity = ''
         \\$title = ''
         \\switch ($eventName) {
-        \\  'SessionStart' { $activity = 'session-start' }
+        \\  'SessionStart' {
+        \\    $source = if ($null -ne $payload -and $null -ne $payload.source) { [string]$payload.source } else { '' }
+        \\    # Compaction preserves the previous lifecycle; manual /compact
+        \\    # can run at an idle prompt without starting an agentic turn.
+        \\    if ($source -eq 'compact') { exit 0 }
+        \\    $activity = 'session-start'
+        \\  }
         \\  'UserPromptSubmit' {
         \\    $activity = 'parent-working'
         \\    if ($null -ne $payload -and $null -ne $payload.prompt) {
@@ -790,8 +850,8 @@ fn claudePowerShellHookScript() []const u8 {
         \\  }
         \\  'Notification' {
         \\    $message = if ($null -ne $payload -and $null -ne $payload.message) { [string]$payload.message } else { '' }
-        \\    if ($message -match 'waiting for your input|is idle') { exit 0 }
-        \\    $activity = 'parent-waiting'
+        \\    $kind = if ($null -ne $payload -and $null -ne $payload.notification_type) { [string]$payload.notification_type } else { '' }
+        \\    $activity = if ($kind -eq 'idle_prompt' -or $message -match 'waiting for your input|is idle') { 'parent-idle' } else { 'parent-waiting' }
         \\  }
         \\  'SubagentStart' { $activity = 'child-start' }
         \\  'SubagentStop' { $activity = 'child-stop' }
@@ -2592,6 +2652,8 @@ test "PowerShell hooks use inherited transport-neutral endpoint and safe invocat
     try std.testing.expect(std.mem.indexOf(u8, claude_script, "ConvertFrom-Json") != null);
     try std.testing.expect(std.mem.indexOf(u8, claude_script, "@('--title', $title)") != null);
     try std.testing.expect(std.mem.indexOf(u8, claude_script, "& $cli @notifyArgs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, claude_script, "$source -eq 'compact'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, claude_script, "'parent-working'") != null);
 
     const cursor_script = cursorPowerShellHookScript();
     try std.testing.expect(std.mem.indexOf(u8, cursor_script, "$env:VERDE_LIVE_ENDPOINT") != null);
@@ -2625,6 +2687,8 @@ test "Claude hook reports a prompt-derived title" {
     defer std.testing.allocator.free(script);
     try std.testing.expect(std.mem.indexOf(u8, script, ".prompt // empty") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "--title \"$title\" --provider claude") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "[ \"$source\" = \"compact\" ]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "activity=\"parent-working\"") != null);
     if (builtin.os.tag != .windows) {
         const syntax = try std.process.run(std.testing.allocator, threaded.io(), .{
             .argv = &.{ "sh", "-n", script_path },
@@ -2777,4 +2841,73 @@ test "Amp plugin follows thread state across automatic retries" {
     try std.testing.expect(std.mem.indexOf(u8, plugin, "watch.children.size > 0 ? 'waiting'") != null);
     try std.testing.expect(std.mem.indexOf(u8, plugin, "childThread.state.subscribe") != null);
     try std.testing.expect(std.mem.indexOf(u8, plugin, "amp.on('agent.end'") == null);
+}
+
+test "Codex generated hook synchronizes provider names and lifecycle" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/codex-hook.sh", .{tmp.sub_path});
+    defer allocator.free(path);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    try writeCodexHookScript(allocator, threaded.io(), path);
+    const result = try std.process.run(allocator, threaded.io(), .{
+        .argv = &.{ "python3", "-c", @embedFile("codex_hook_test.py"), path },
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) {
+        std.debug.print("{s}\n{s}\n", .{ result.stdout, result.stderr });
+        return error.CodexHookFixtureFailed;
+    }
+    const ps_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/codex-hook.ps1", .{tmp.sub_path});
+    defer allocator.free(ps_path);
+    try writeFileAtomic(allocator, threaded.io(), ps_path, codexPowerShellHookScript(), .default_file);
+    const ps_result = try std.process.run(allocator, threaded.io(), .{
+        .argv = &.{ "python3", "-c", @embedFile("codex_hook_test.py"), ps_path },
+    });
+    defer allocator.free(ps_result.stdout);
+    defer allocator.free(ps_result.stderr);
+    if (ps_result.term != .exited or ps_result.term.exited != 0) {
+        std.debug.print("{s}\n{s}\n", .{ ps_result.stdout, ps_result.stderr });
+        return error.CodexPowerShellHookFixtureFailed;
+    }
+    const config = try codexHooksJsonAlloc(allocator, path);
+    defer allocator.free(config);
+    try std.testing.expect(std.mem.indexOf(u8, config, "PreToolUse") != null);
+}
+
+test "Claude generated hook preserves compaction and reconciles idle" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/claude-hook.sh", .{tmp.sub_path});
+    defer allocator.free(path);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    try writeClaudeHookScript(allocator, threaded.io(), path);
+    const result = try std.process.run(allocator, threaded.io(), .{
+        .argv = &.{ "python3", "-c", @embedFile("claude_hook_test.py"), path },
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) {
+        std.debug.print("{s}\n{s}\n", .{ result.stdout, result.stderr });
+        return error.ClaudeHookFixtureFailed;
+    }
+    const ps_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/claude-hook.ps1", .{tmp.sub_path});
+    defer allocator.free(ps_path);
+    try writeFileAtomic(allocator, threaded.io(), ps_path, claudePowerShellHookScript(), .default_file);
+    const ps_result = try std.process.run(allocator, threaded.io(), .{
+        .argv = &.{ "python3", "-c", @embedFile("claude_hook_test.py"), ps_path },
+    });
+    defer allocator.free(ps_result.stdout);
+    defer allocator.free(ps_result.stderr);
+    if (ps_result.term != .exited or ps_result.term.exited != 0) {
+        std.debug.print("{s}\n{s}\n", .{ ps_result.stdout, ps_result.stderr });
+        return error.ClaudePowerShellHookFixtureFailed;
+    }
 }
