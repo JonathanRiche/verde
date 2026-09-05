@@ -303,6 +303,57 @@ pub fn openFilePreferEditor(
     return .file_manager;
 }
 
+/// Whether one editor target can open files right now. Resolves PATH and
+/// application lookups, so callers should cache the answer when a menu opens
+/// instead of asking every frame.
+pub fn editorTargetAvailable(target: state_ui_types.ProjectEditorTarget) bool {
+    return switch (target) {
+        .configured => preferredEditorEnv() != null and canOpenConfiguredEditor(),
+        .cursor => hasCursorLauncher(),
+        .vscode => hasVsCodeLauncher(),
+        .zed => hasZedLauncher(),
+    };
+}
+
+/// Opens one file in an explicitly chosen editor, bypassing the
+/// configured-editor-first fallback chain in `openFilePreferEditor`.
+pub fn openFileInEditorTarget(
+    allocator: std.mem.Allocator,
+    file_path: []const u8,
+    location: FileLocation,
+    target: state_ui_types.ProjectEditorTarget,
+) OpenProjectError!void {
+    const parent_dir = std.fs.path.dirname(file_path) orelse file_path;
+    return switch (target) {
+        .configured => {
+            const editor = preferredEditorEnv() orelse return error.LauncherUnavailable;
+            if (!canOpenConfiguredEditor()) return error.LauncherUnavailable;
+            return openConfiguredEditorPath(allocator, editor, parent_dir, file_path, location);
+        },
+        .cursor => openCursorPath(allocator, parent_dir, file_path),
+        .vscode => openVsCodePath(allocator, parent_dir, file_path),
+        .zed => openZedPath(allocator, parent_dir, file_path),
+    };
+}
+
+/// Hands a file to the desktop's default handler for its type. On Linux this
+/// prefers `gio open`: outside GNOME/KDE, xdg-open falls back to `file(1)`
+/// content sniffing, which reports Markdown and similar sources as text/plain
+/// and then launches terminal-only handlers (nvim) with no terminal attached.
+/// GLib resolves by filename glob first, matching what the user configured.
+pub fn openPathWithSystemHandler(allocator: std.mem.Allocator, path: []const u8) OpenProjectError!void {
+    switch (@import("builtin").os.tag) {
+        .linux, .freebsd, .netbsd, .openbsd, .dragonfly => {
+            if (commandExists("gio")) {
+                runtime_log.diagnostic("openPathWithSystemHandler launcher=gio open path={s}", .{path});
+                return spawnDetached(allocator, &.{ "gio", "open", path }, null);
+            }
+        },
+        else => {},
+    }
+    return openProjectDirectory(allocator, path);
+}
+
 pub fn runCustomProjectCommand(
     allocator: std.mem.Allocator,
     project_path: []const u8,
@@ -1147,7 +1198,7 @@ fn openKnownEditorPath(allocator: std.mem.Allocator, working_dir: []const u8, fi
     return openZedPath(allocator, working_dir, file_path);
 }
 
-fn revealFileInFileManager(allocator: std.mem.Allocator, file_path: []const u8) OpenProjectError!void {
+pub fn revealFileInFileManager(allocator: std.mem.Allocator, file_path: []const u8) OpenProjectError!void {
     return switch (@import("builtin").os.tag) {
         .macos => {
             if (!commandExists("open")) return error.LauncherUnavailable;

@@ -3854,6 +3854,18 @@ fn paletteRunStepperEvent(context: ?*anyopaque, event: palette.StepperEvent) voi
 
 pub const ProjectEditorTarget = state_ui_types.ProjectEditorTarget;
 
+/// Where a transcript file link opens when chosen from its context menu.
+pub const TranscriptFileOpenTarget = enum {
+    default,
+    neovim_pane,
+    configured_editor,
+    cursor,
+    vscode,
+    zed,
+    system_handler,
+    reveal,
+};
+
 pub const log = std.log.scoped(.native_shell);
 
 pub const ORG_NAME: [:0]const u8 = "verde";
@@ -7606,6 +7618,13 @@ pub const AppState = struct {
     }
 
     pub fn openTranscriptFileReference(self: *AppState, file_path: []const u8) void {
+        self.openTranscriptFileReferenceWith(file_path, .default);
+    }
+
+    /// Opens a transcript file reference with an explicit target chosen from
+    /// the link context menu. `.default` follows the configured left-click
+    /// behavior (Neovim pane when enabled, else editor, else file manager).
+    pub fn openTranscriptFileReferenceWith(self: *AppState, file_path: []const u8, target: TranscriptFileOpenTarget) void {
         const normalized = std.mem.trim(u8, if (std.mem.startsWith(u8, file_path, "file://localhost/"))
             file_path["file://localhost".len..]
         else if (std.mem.startsWith(u8, file_path, "file://"))
@@ -7633,20 +7652,74 @@ pub const AppState = struct {
         };
         defer self.allocator.free(resolved_path);
 
-        if (self.app_config.file_links_in_neovim_pane and utils.configuredEditorIsNeovim()) {
-            if (self.openTranscriptFileReferenceInNeovimPane(resolved_path, reference.location)) return;
-        }
+        switch (target) {
+            .default => {
+                if (self.app_config.file_links_in_neovim_pane and utils.configuredEditorIsNeovim()) {
+                    if (self.openTranscriptFileReferenceInNeovimPane(resolved_path, reference.location)) return;
+                }
 
-        const result = utils.openFilePreferEditor(self.allocator, resolved_path, reference.location) catch |err| {
-            log.warn("failed to open transcript file reference: {s}", .{@errorName(err)});
-            self.setSidebarNotice("Failed to open file reference.");
+                const result = utils.openFilePreferEditor(self.allocator, resolved_path, reference.location) catch |err| {
+                    log.warn("failed to open transcript file reference: {s}", .{@errorName(err)});
+                    self.setSidebarNotice("Failed to open file reference.");
+                    return;
+                };
+
+                switch (result) {
+                    .editor => self.setSidebarNotice("Opened file in editor."),
+                    .file_manager => self.setSidebarNotice("Opened containing folder."),
+                }
+            },
+            .neovim_pane => {
+                if (!self.openTranscriptFileReferenceInNeovimPane(resolved_path, reference.location)) {
+                    self.setSidebarNotice("Failed to open file in workspace Neovim pane.");
+                }
+            },
+            .configured_editor, .cursor, .vscode, .zed => {
+                const editor_target: ProjectEditorTarget = switch (target) {
+                    .configured_editor => .configured,
+                    .cursor => .cursor,
+                    .vscode => .vscode,
+                    .zed => .zed,
+                    else => unreachable,
+                };
+                utils.openFileInEditorTarget(self.allocator, resolved_path, reference.location, editor_target) catch |err| {
+                    log.warn("failed to open transcript file in editor: {s}", .{@errorName(err)});
+                    self.setSidebarNotice("Failed to open file in editor.");
+                    return;
+                };
+                self.setSidebarNotice("Opened file in editor.");
+            },
+            .system_handler => {
+                utils.openPathWithSystemHandler(self.allocator, resolved_path) catch |err| {
+                    log.warn("failed to open transcript file with system handler: {s}", .{@errorName(err)});
+                    self.setSidebarNotice("Failed to open file with system default app.");
+                    return;
+                };
+                self.setSidebarNotice("Opened file with system default app.");
+            },
+            .reveal => {
+                utils.revealFileInFileManager(self.allocator, resolved_path) catch |err| {
+                    log.warn("failed to reveal transcript file: {s}", .{@errorName(err)});
+                    self.setSidebarNotice("Failed to open containing folder.");
+                    return;
+                };
+                self.setSidebarNotice("Opened containing folder.");
+            },
+        }
+    }
+
+    /// Copies a transcript link (file path or URL) to the clipboard.
+    pub fn copyTranscriptLinkToClipboard(self: *AppState, href: []const u8) void {
+        const trimmed = std.mem.trim(u8, href, &std.ascii.whitespace);
+        if (trimmed.len == 0) {
+            self.setSidebarNotice("No link selected.");
             return;
-        };
-
-        switch (result) {
-            .editor => self.setSidebarNotice("Opened file in editor."),
-            .file_manager => self.setSidebarNotice("Opened containing folder."),
         }
+        if (!self.setClipboardText(trimmed)) {
+            self.setSidebarNotice("Failed to copy link.");
+            return;
+        }
+        self.setSidebarNotice("Copied link.");
     }
 
     /// Prefills the composer with an @-mention of a diff-card file plus that
@@ -7773,7 +7846,7 @@ pub const AppState = struct {
         self.openWebLinkWithTarget(href, self.app_config.terminal_link_open_override.resolve(self.app_config.link_open_target));
     }
 
-    fn openWebLinkWithTarget(self: *AppState, href: []const u8, target: app_config.LinkOpenTarget) void {
+    pub fn openWebLinkWithTarget(self: *AppState, href: []const u8, target: app_config.LinkOpenTarget) void {
         const trimmed = std.mem.trim(u8, href, &std.ascii.whitespace);
         if (trimmed.len == 0) {
             self.setSidebarNotice("No web link selected.");
