@@ -5,7 +5,7 @@
 - Read the relevant code path before editing and follow existing patterns.
 - Make the smallest correct change; do not add speculative abstractions or unrelated cleanup.
 - Preserve user and other-agent work already present in the worktree.
-- During iteration, use the narrowest useful check. Before finishing any Zig change, run the configured full build; this is a compile/link verification, not the full test suite.
+- Use the narrowest useful check during iteration. For routine desktop feature and UI work, finish with `mise run dev-build`; do not automatically run `mise run build`.
 
 ## Zig 0.16
 
@@ -18,7 +18,7 @@ Important Zig 0.16 conventions in this repository:
 - Use `std.mem.trimStart` and `trimEnd`, not `trimLeft` and `trimRight`.
 - Containers are unmanaged by default: initialize with `.empty`, pass allocators to operations, and pass the allocator to `deinit`.
 - Pass allocators explicitly and use `errdefer` for fallible cleanup.
-- `zig ast-check` catches syntax errors but not moved APIs; confirm Zig changes with a full build.
+- `zig ast-check` catches syntax errors but not moved APIs; confirm Zig changes with the build target that owns the changed code.
 
 ### Zig style
 
@@ -35,15 +35,15 @@ Important Zig 0.16 conventions in this repository:
 
 Run commands from the repository root.
 
-- Normal build/install verification: `mise run build`.
-- Fast desktop-only iteration: `mise run dev-build`.
+- Default for desktop development, including final verification: `mise run dev-build`.
+- Full build/install verification: `mise run build` only when the change needs artifacts or installation steps omitted by `dev-build`, or the user requests it.
 - Isolated clean-prefix packaging verification: `mise run build-verify-install` (release/packaging work only).
 - Real desktop runtime testing: `mise run dev`.
 - Do not use bare `zig build`; its Debug + WPE default is known to fail at link time.
-- If a lower-level build is explicitly needed, use `zig build --release=safe -Dbrowser-backend=native_webview`.
+- If a lower-level desktop build is needed, use `zig build dev-build --release=safe -Dbrowser-backend=native_webview`; choose the owning target for non-GUI changes.
 - Do not run generated desktop binaries directly for normal verification.
 
-For speed, use `zig ast-check`, `mise run dev-build`, or the narrowest relevant test while iterating, but do not treat those focused checks as final verification. `dev-build` installs only the main desktop executable; it intentionally skips the standalone daemon, browser helper, provider bridge installation, runtime-payload copying, tests, and packaging checks. It must use the production LLVM backend: Zig 0.16's self-hosted x86 backend is known to miscompile this application and crash during startup. Every completed Zig change must still finish with `mise run build`. Do not run the aggregate desktop `zig build test` merely because a Zig file changed: it is a broad, comparatively slow suite and is required only when the change is cross-cutting, changes test/build infrastructure, or the user explicitly requests it. Prefer `zig build headless-test --release=safe -Dbrowser-backend=native_webview` for headless/core work and `zig build runtime-test --release=safe -Dbrowser-backend=native_webview` for remote-runtime work.
+Use `zig ast-check` or the narrowest relevant test while iterating, then `mise run dev-build` for routine desktop changes. `dev-build` builds and installs only the private GUI executable; it skips the standalone daemon, launcher/CLI, browser helper, provider bridge installation, runtime-payload copying, tests, and packaging checks. For changes to those components, use their owning build/test target; use `mise run build` when full installation is needed. Do not append a full build solely because a Zig file changed. Keep the production LLVM backend: Zig 0.16's self-hosted x86 backend is known to miscompile this application and crash during startup. Do not run the aggregate desktop `zig build test` merely because a Zig file changed: it is a broad, comparatively slow suite and is required only when the change is cross-cutting, changes test/build infrastructure, or the user explicitly requests it. Prefer `zig build headless-test --release=safe -Dbrowser-backend=native_webview` for headless/core work and `zig build runtime-test --release=safe -Dbrowser-backend=native_webview` for remote-runtime work.
 
 ## Module And Build-Graph Boundaries
 
@@ -53,7 +53,7 @@ Put new production code in the lightest artifact that owns it. `verde-gui` may d
 - Avoid catch-all imports in `main.zig`, `state.zig`, and `utils.zig`; import the narrow owning interface instead.
 - Moving Zig files or modules alone does not create a compilation boundary. Build-speed splits require separate artifacts or a deliberate stable compiled ABI.
 - UI edits should rebuild only `verde-gui`; provider or daemon edits should not rebuild it.
-- Changes to these boundaries must run the GUI dependency-boundary audit and representative `dev-build` invalidation measurements. The normal final `mise run build` requirement still applies.
+- Changes to these boundaries must run the GUI dependency-boundary audit and representative `dev-build` invalidation measurements. Select final verification according to the affected artifacts; a boundary audit alone does not require a full install.
 
 Builds and tests are deliberately separate:
 
@@ -65,7 +65,7 @@ Builds and tests are deliberately separate:
 - Every test-owned thread, process, listener, and long poll needs deterministic cancellation and teardown. Never rely on closing a descriptor from another thread to interrupt blocking I/O.
 - If a test makes no progress for 60 seconds, inspect the named test and process/thread wait state. Do not leave an unexplained `run test` command waiting for ten minutes.
 
-Never run `mise run dev`, `mise run dev-term`, `zig build run`, or `pkill verde` from a Verde terminal pane. Verde hosts the agent session, so these commands can kill the session. In that situation, run `mise run build` and ask the user to relaunch for runtime testing.
+Never run `mise run dev`, `mise run dev-term`, `zig build run`, or `pkill verde` from a Verde terminal pane. Verde hosts the agent session, so these commands can kill the session. In that situation, run the appropriate build target (normally `mise run dev-build`) and ask the user to relaunch for runtime testing.
 
 For CLI smoke tests from an external shell:
 

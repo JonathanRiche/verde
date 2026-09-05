@@ -225,3 +225,76 @@ test "title generation prompt keeps conversation inside role tags" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<user>\nfirst request\n</user>") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<assistant>\nfirst answer\n</assistant>") != null);
 }
+
+/// A durable refresh can arrive before the terminal tail is consumed. Match
+/// only this turn's saved rows, in order, so repeated text in other turns or
+/// repeated messages within this turn are not accidentally suppressed.
+pub fn discardHydratedTimelineEvents(
+    allocator: std.mem.Allocator,
+    messages: anytype,
+    turn_id: []const u8,
+    events: anytype,
+) void {
+    var projection_index: usize = 0;
+    var event_index: usize = 0;
+    while (event_index < events.items.len) {
+        const event = events.items[event_index];
+        var match_index: ?usize = null;
+        for (messages[projection_index..], projection_index..) |message, index| {
+            const id = message.message_id orelse continue;
+            const turn_suffix = std.mem.startsWith(u8, id, "turn:") and
+                std.mem.startsWith(u8, id[5..], turn_id) and
+                std.mem.startsWith(u8, id[5 + turn_id.len ..], ":msg:");
+            const same_id = if (event.message_id) |event_id| std.mem.eql(u8, id, event_id) else false;
+            if (event.message_id != null) {
+                if (!same_id) continue;
+            } else if (!turn_suffix) continue;
+            if (message.role != event.role or !std.mem.eql(u8, message.body, event.body)) continue;
+            match_index = index;
+            break;
+        }
+        if (match_index) |index| {
+            projection_index = index + 1;
+            var removed = events.orderedRemove(event_index);
+            removed.deinit(allocator);
+        } else {
+            event_index += 1;
+        }
+    }
+}
+
+test "terminal refresh consumes saved events once within the owning turn" {
+    const Row = struct {
+        role: enum { assistant, system } = .assistant,
+        body: []const u8 = "Progress",
+        message_id: ?[]const u8 = null,
+        pub fn deinit(_: *@This(), _: std.mem.Allocator) void {}
+    };
+    const messages = [_]Row{
+        .{ .message_id = "turn:older:msg:1" },
+        .{ .message_id = "turn:active:msg:1" },
+        .{ .message_id = "turn:active:msg:2" },
+    };
+    var events: std.ArrayList(Row) = .empty;
+    defer events.deinit(std.testing.allocator);
+    try events.appendSlice(std.testing.allocator, &.{ .{}, .{}, .{} });
+    discardHydratedTimelineEvents(std.testing.allocator, &messages, "active", &events);
+    // Two saved rows consume two events, leaving the third identical event
+    // intact. The older turn cannot consume it, nor can a partial turn ID.
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    discardHydratedTimelineEvents(std.testing.allocator, &messages, "act", &events);
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    events.items[0].role = .system;
+    discardHydratedTimelineEvents(std.testing.allocator, &messages, "active", &events);
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    events.items[0] = .{ .body = "New reply" };
+    discardHydratedTimelineEvents(std.testing.allocator, &messages, "active", &events);
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    events.items[0] = .{ .message_id = "turn:active:msg:3" };
+    discardHydratedTimelineEvents(std.testing.allocator, &messages, "active", &events);
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    // Explicit payload identities also work when not minted from the turn ID.
+    events.items[0] = .{ .message_id = "turn:older:msg:1" };
+    discardHydratedTimelineEvents(std.testing.allocator, &messages, "active", &events);
+    try std.testing.expectEqual(@as(usize, 0), events.items.len);
+}
