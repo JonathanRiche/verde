@@ -705,7 +705,8 @@ fn growScrollingPaneInDirection(
         gap,
         ui_scale,
     ) / @max(ui_scale, 0.001);
-    const next_css = scrollingPaneExtentAfterGrow(current_css, delta_css);
+    const max_css = scrollingPaneExtentMaximum(@max(viewport_extent, 1.0), ui_scale) / @max(ui_scale, 0.001);
+    const next_css = scrollingPaneExtentAfterGrow(current_css, delta_css, max_css);
     if (@abs(next_css - current_css) <= 0.001) return false;
 
     const extent_ratio = if (viewport_extent > 1.0)
@@ -734,11 +735,11 @@ fn scrollingGrowDeltaCss(scroll_direction: app_config.WorkspaceScrollDirection, 
     };
 }
 
-fn scrollingPaneExtentAfterGrow(current_css: f32, delta_css: f32) f32 {
+fn scrollingPaneExtentAfterGrow(current_css: f32, delta_css: f32, max_css: f32) f32 {
     return theme.clampf(
         current_css + delta_css,
         workspace_layout.MIN_SCROLL_PANE_EXTENT_CSS,
-        workspace_layout.MAX_SCROLL_PANE_EXTENT_CSS,
+        @max(max_css, workspace_layout.MIN_SCROLL_PANE_EXTENT_CSS),
     );
 }
 
@@ -2078,6 +2079,15 @@ fn scrollingPaneExtent(viewport_extent: f32, gap: f32, panes_per_view: u8) f32 {
     return @max((viewport_extent - gap * (count - 1.0)) / count, 1.0);
 }
 
+/// Largest strip extent a pane may take, in physical pixels. The CSS cap
+/// bounds drags and grow steps, but it must never sit below the viewport:
+/// a persisted full-width pane (ratio 1.0) re-opened on a wider display or
+/// larger font scale would otherwise be clamped narrower than the view,
+/// and the trailing-aligned reveal would expose the neighbouring pane.
+fn scrollingPaneExtentMaximum(viewport_extent: f32, ui_scale: f32) f32 {
+    return @max(workspace_layout.MAX_SCROLL_PANE_EXTENT_CSS * @max(ui_scale, 0.001), viewport_extent);
+}
+
 fn scrollingViewportUsesMargins(group_count: usize, panes_per_view: u8) bool {
     return group_count > 1 and panes_per_view > 1;
 }
@@ -2104,7 +2114,7 @@ fn responsiveScrollingPaneExtent(
     const custom_css = override_css orelse return default_extent;
     const scale = @max(ui_scale, 0.001);
     const minimum = workspace_layout.MIN_SCROLL_PANE_EXTENT_CSS * scale;
-    const maximum = workspace_layout.MAX_SCROLL_PANE_EXTENT_CSS * scale;
+    const maximum = scrollingPaneExtentMaximum(viewport_extent, scale);
     if (override_ratio) |ratio| {
         return theme.clampf((viewport_extent + gap) * ratio - gap, minimum, maximum);
     }
@@ -2196,7 +2206,7 @@ fn scrollingPaneResolvedExtent(
 ) f32 {
     const scale = @max(ui_scale, 0.001);
     const minimum = workspace_layout.MIN_SCROLL_PANE_EXTENT_CSS * scale;
-    const maximum = workspace_layout.MAX_SCROLL_PANE_EXTENT_CSS * scale;
+    const maximum = scrollingPaneExtentMaximum(viewport_extent, scale);
     if (pane.scroll_extent_ratio) |ratio| {
         return theme.clampf((viewport_extent + gap) * ratio - gap, minimum, maximum);
     }
@@ -2623,7 +2633,11 @@ fn updateResizeDrag(state: *runtime.AppState, hit: WorkspacePaneHit, x: f32, y: 
         const layout = &state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout;
         const viewport_extent = if (hit.axis == .vertical) hit.split_rect.w else hit.split_rect.h;
         const extent_ratio = scrollingPaneExtentRatio(
-            theme.clampf(pane_extent_css, workspace_layout.MIN_SCROLL_PANE_EXTENT_CSS, workspace_layout.MAX_SCROLL_PANE_EXTENT_CSS) * ui_scale,
+            theme.clampf(
+                pane_extent_css * ui_scale,
+                workspace_layout.MIN_SCROLL_PANE_EXTENT_CSS * ui_scale,
+                scrollingPaneExtentMaximum(viewport_extent, ui_scale),
+            ),
             viewport_extent,
             theme.scaledUi(state.app_config.workspace_pane_gap),
         );
@@ -3763,9 +3777,26 @@ test "scrolling grow keys follow the strip axis" {
 }
 
 test "scrolling grow step clamps to pane extent limits" {
-    try std.testing.expectApproxEqAbs(@as(f32, 596.0), scrollingPaneExtentAfterGrow(500.0, GROW_SCROLL_PANE_STEP_CSS), 0.0001);
-    try std.testing.expectApproxEqAbs(workspace_layout.MIN_SCROLL_PANE_EXTENT_CSS, scrollingPaneExtentAfterGrow(240.0, -GROW_SCROLL_PANE_STEP_CSS), 0.0001);
-    try std.testing.expectApproxEqAbs(workspace_layout.MAX_SCROLL_PANE_EXTENT_CSS, scrollingPaneExtentAfterGrow(1550.0, GROW_SCROLL_PANE_STEP_CSS), 0.0001);
+    const max_css = workspace_layout.MAX_SCROLL_PANE_EXTENT_CSS;
+    try std.testing.expectApproxEqAbs(@as(f32, 596.0), scrollingPaneExtentAfterGrow(500.0, GROW_SCROLL_PANE_STEP_CSS, max_css), 0.0001);
+    try std.testing.expectApproxEqAbs(workspace_layout.MIN_SCROLL_PANE_EXTENT_CSS, scrollingPaneExtentAfterGrow(240.0, -GROW_SCROLL_PANE_STEP_CSS, max_css), 0.0001);
+    try std.testing.expectApproxEqAbs(max_css, scrollingPaneExtentAfterGrow(1550.0, GROW_SCROLL_PANE_STEP_CSS, max_css), 0.0001);
+    // A viewport wider than the CSS cap raises the ceiling so growing a
+    // full-width pane never shrinks it.
+    try std.testing.expectApproxEqAbs(@as(f32, 1900.0), scrollingPaneExtentAfterGrow(1850.0, GROW_SCROLL_PANE_STEP_CSS, 1900.0), 0.0001);
+}
+
+test "scrolling pane extent cap never falls below the viewport" {
+    // 2116px viewport at font scale 1.1667 exceeds the 1600 CSS cap; a
+    // persisted full-width ratio must still resolve to the whole viewport.
+    const viewport: f32 = 2116.0;
+    const gap: f32 = 14.0;
+    const scale: f32 = 28.0 / 24.0;
+    try std.testing.expectApproxEqAbs(viewport, scrollingPaneExtentMaximum(viewport, scale), 0.0001);
+    try std.testing.expectApproxEqAbs(workspace_layout.MAX_SCROLL_PANE_EXTENT_CSS * scale, scrollingPaneExtentMaximum(1200.0, scale), 0.0001);
+    const pane = workspace_layout.WorkspacePane{ .id = 1, .ref = .{ .chat = .{} }, .scroll_extent_css = 1004.5, .scroll_extent_ratio = 1.0 };
+    try std.testing.expectApproxEqAbs(viewport, scrollingPaneResolvedExtent(&pane, viewport, viewport, gap, scale), 0.01);
+    try std.testing.expectApproxEqAbs(viewport, responsiveScrollingPaneExtent(viewport, gap, 1, 1004.5, 1.0, scale), 0.01);
 }
 
 test "scrolling grow resizes only the focused pane" {
