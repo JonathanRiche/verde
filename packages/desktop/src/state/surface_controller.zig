@@ -166,10 +166,12 @@ pub fn updateSurface(self: anytype, update: SurfaceUpdate) !*SurfaceState {
         // ledger's acknowledgement lifetime.
         if (value.len > 0) {
             if (terminalDockForSurface(self, s)) |dock| {
-                _ = dock.setActiveTabPinnedTitle(self.allocator, value);
+                const title_changed = dock.setActiveTabPinnedTitle(self.allocator, value);
                 // Provider hooks/plugins can supply authoritative first-turn
                 // titles even when submission did not use a local Enter event.
-                if (s.provider != null) {
+                if (s.provider != null and (title_changed or dock.activeTabAgentHistoryAt() == 0 or
+                    (update.status == .working and previous_status != .working)))
+                {
                     _ = dock.noteActiveTabAgentHistory(unixTimestampMs());
                 }
             }
@@ -226,10 +228,16 @@ pub fn updateSurface(self: anytype, update: SurfaceUpdate) !*SurfaceState {
             if (update.durability == .durable) try self.storage.upsertSurfaceState(persistedSurfaceState(s));
         }
     }
+    // A completion that arrives while its pane already owns focus has no
+    // later focus edge to acknowledge it. Clear it immediately, matching the
+    // focused in-app chat completion path.
+    if (!update.clear and completion_became_pending and surfaceIsFocused(self, s)) {
+        if (clearSurfaceAttentionBySession(self, s.session_id)) completion_became_pending = false;
+    }
     // Notify on status edges. Runs on the main thread (live commands are
     // drained from the main loop), so spawning the notifier here is safe.
     if (!update.clear and self.app_config.notifications_enabled) {
-        if (completion_became_pending) {
+        if (completion_became_pending and terminalSurfaceDisplayStatus(self, s) == .done) {
             fireStatusNotification(self, s, .done);
         } else if (status_changed) {
             switch (s.status) {
@@ -243,21 +251,79 @@ pub fn updateSurface(self: anytype, update: SurfaceUpdate) !*SurfaceState {
     return s;
 }
 
+/// Acknowledge a viewed completion even if its event preceded focus or replay.
+/// This is level-triggered; waiting/background work is never acknowledged.
+pub fn acknowledgeFocusedTerminalCompletion(self: anytype) bool {
+    var changed = false;
+    for (self.surface_controller.surfaces.items, 0..) |*surface, index| {
+        if (surfaceReturnedToShell(self, surface)) {
+            if (retireExitedAgentSurface(self, surface)) changed = true;
+            continue;
+        }
+        if (!surfaceIsFocused(self, surface)) continue;
+        if (terminalSurfaceDisplayStatus(self, surface) == .done and clearSurfaceAttentionAtIndex(self, index)) changed = true;
+    }
+    return changed;
+}
+
+fn surfaceReturnedToShell(self: anytype, surface: *const SurfaceState) bool {
+    for (self.project_controller.projects.items, 0..) |_, index| {
+        if (!surfaceBelongsToProject(self, surface, index)) continue;
+        const dock = self.projectTerminalDock(index, surface.dock_id) orelse return false;
+        const session_id = dock.activeSessionId() orelse return false;
+        return std.mem.eql(u8, session_id, surface.session_id) and dock.activeSessionAtShellPrompt(surface.status_changed_at_ms);
+    }
+    return false;
+}
+
+fn retireExitedAgentSurface(self: anytype, surface: *SurfaceState) bool {
+    if (surface.status == .idle and !surface.completion_pending and
+        !surface.attention and surface.unread_count == 0 and surface.progress == null) return false;
+    if (!self.queueSurfaceAcknowledgement(surface)) return false;
+    _ = clearTerminalNotificationBySession(self, surface.session_id);
+    surface.status = .idle;
+    surface.completion_pending = false;
+    surface.completed_at_ms = 0;
+    surface.progress = null;
+    surface.attention = false;
+    surface.unread_count = 0;
+    surface.presentation_generation +%= 1;
+    return true;
+}
+
 /// Fires notifications for completion edges first observed through the daemon
 /// projection. Native reporters such as FX write directly to the daemon store
 /// and therefore do not pass through `notification.update` in the live IPC
 /// server, where hook-backed providers normally trigger the notifier.
 pub fn notifyProjectedCompletionEdges(self: anytype, previous: *const State) void {
-    if (!self.app_config.notifications_enabled) return;
-    for (self.surface_controller.surfaces.items) |*surface| {
-        if (projectedCompletionBecamePending(previous, surface)) {
-            fireStatusNotification(self, surface, .done);
-        } else if (projectedStatusBecame(previous, surface, .waiting)) {
+    for (self.surface_controller.surfaces.items, 0..) |*surface, surface_index| {
+        if (projectedCompletionBecamePending(previous, surface) and terminalSurfaceDisplayStatus(self, surface) == .done) {
+            if (surfaceIsFocused(self, surface) and clearSurfaceAttentionAtIndex(self, surface_index)) continue;
+            if (self.app_config.notifications_enabled) fireStatusNotification(self, surface, .done);
+        } else if (self.app_config.notifications_enabled and projectedStatusBecame(previous, surface, .waiting)) {
             fireStatusNotification(self, surface, .waiting);
-        } else if (projectedStatusBecame(previous, surface, .@"error")) {
+        } else if (self.app_config.notifications_enabled and projectedStatusBecame(previous, surface, .@"error")) {
             fireStatusNotification(self, surface, .@"error");
         }
     }
+}
+
+// True only when the exact terminal pane owns focus in the focused window.
+// A visible sibling or a pane in another workspace must retain its completion.
+fn surfaceIsFocused(self: anytype, surface: *const SurfaceState) bool {
+    if (!self.window_input_focus) return false;
+    const project_index = self.project_controller.selected_index;
+    if (!surfaceBelongsToProject(self, surface, project_index)) return false;
+    const layout = &self.project_controller.projects.items[project_index].workspace_layout;
+    const focused_pane_id = layout.focused_pane_id orelse return false;
+    if (layout.maximized_pane_id) |max_id| {
+        if (max_id != focused_pane_id) return false;
+    }
+    const pane = layout.paneById(focused_pane_id) orelse return false;
+    return switch (pane.ref) {
+        .terminal => |ref| ref.dock_id == surface.dock_id,
+        else => false,
+    };
 }
 
 fn projectedCompletionBecamePending(previous: *const State, current: *const SurfaceState) bool {
@@ -280,6 +346,69 @@ fn projectedStatusBecame(previous: *const State, current: *const SurfaceState, s
         return surface.status != status;
     }
     return true;
+}
+
+test "terminal surface is focused only for the selected focused pane" {
+    const PaneRef = union(enum) {
+        chat: void,
+        terminal: struct { dock_id: u32 },
+        browser: void,
+    };
+    const Pane = struct {
+        id: u32,
+        ref: PaneRef,
+    };
+    const Layout = struct {
+        focused_pane_id: ?u32,
+        maximized_pane_id: ?u32 = null,
+        pane: Pane,
+
+        fn paneById(self: *const @This(), pane_id: u32) ?*const Pane {
+            return if (self.pane.id == pane_id) &self.pane else null;
+        }
+    };
+    const Project = struct {
+        id: []const u8,
+        path: []const u8,
+        workspace_layout: Layout,
+    };
+    const FakeState = struct {
+        window_input_focus: bool = true,
+        project_controller: struct {
+            selected_index: usize = 0,
+            projects: struct { items: []Project },
+        },
+
+        fn projectPathMatches(_: *@This(), first: []const u8, second: []const u8) bool {
+            return std.mem.eql(u8, first, second);
+        }
+    };
+
+    var projects = [_]Project{.{
+        .id = "workspace-a",
+        .path = "/tmp/workspace-a",
+        .workspace_layout = .{
+            .focused_pane_id = 7,
+            .pane = .{ .id = 7, .ref = .{ .terminal = .{ .dock_id = 52 } } },
+        },
+    }};
+    var state: FakeState = .{ .project_controller = .{ .projects = .{ .items = &projects } } };
+    var surface: SurfaceState = .{
+        .session_id = @constCast("session-a"),
+        .workspace_id = @constCast("workspace-a"),
+        .workspace_path = @constCast("/tmp/workspace-a"),
+        .dock_id = 52,
+    };
+
+    try std.testing.expect(surfaceIsFocused(&state, &surface));
+    surface.dock_id = 53;
+    try std.testing.expect(!surfaceIsFocused(&state, &surface));
+    surface.dock_id = 52;
+    state.window_input_focus = false;
+    try std.testing.expect(!surfaceIsFocused(&state, &surface));
+    state.window_input_focus = true;
+    projects[0].workspace_layout.maximized_pane_id = 8;
+    try std.testing.expect(!surfaceIsFocused(&state, &surface));
 }
 
 pub fn persistedSurfaceState(surface: *const SurfaceState) PersistedSurfaceState {
@@ -505,7 +634,7 @@ fn clearSurfaceAttentionAtIndex(self: anytype, surface_index: usize) bool {
     // indicator — it shouldn't re-appear in the sidebar once you've come
     // back and looked. Genuine waiting/error states persist (you still need
     // to act on them).
-    const done_ack = surface.completion_pending or surface.status == .done;
+    const done_ack = terminalSurfaceDisplayStatus(self, surface) == .done;
     if (!surface.attention and surface.unread_count == 0 and !done_ack) return terminal_changed;
     if (done_ack and !self.queueSurfaceAcknowledgement(surface)) return terminal_changed;
     surface.attention = false;
@@ -564,8 +693,24 @@ pub fn isFocusedTerminalSurface(self: anytype, project_index: usize, dock_id: u3
     };
 }
 
-/// Returns the terminal surface (if any) bound to a given dock within a
-/// workspace, so the sidebar can render per-pane agent status.
+/// Supplement Claude Stop hooks with its live background-shell footer.
+/// Keep the hook state intact so completion appears when the footer clears.
+pub fn terminalSurfaceDisplayStatus(self: anytype, surface: *const SurfaceState) SurfaceStatus {
+    const status = surface.displayStatus();
+    if (surface.provider != .claude or (status != .done and status != .idle)) return status;
+    for (self.project_controller.projects.items, 0..) |project, index| {
+        if (!std.mem.eql(u8, surface.workspace_id, project.id) and
+            !self.projectPathMatches(surface.workspace_path, project.path)) continue;
+        const dock = self.projectTerminalDock(index, surface.dock_id) orelse return status;
+        const session_id = dock.activeSessionId() orelse return status;
+        if (!std.mem.eql(u8, surface.session_id, session_id)) return status;
+        if (dock.activeClaudeBackgroundShells()) return .waiting;
+        return status;
+    }
+    return status;
+}
+
+/// Returns the terminal surface bound to a workspace dock.
 pub fn projectTerminalSurface(self: anytype, project_index: usize, dock_id: u32) ?*const SurfaceState {
     if (project_index >= self.project_controller.projects.items.len) return null;
     const project = &self.project_controller.projects.items[project_index];
@@ -621,6 +766,14 @@ test "surface focus clear queues persistence and updates local state immediately
         queued: bool = false,
         dirty: bool = false,
 
+        fn projectPathMatches(_: *@This(), a: []const u8, b: []const u8) bool {
+            return std.mem.eql(u8, a, b);
+        }
+
+        fn projectTerminalDock(_: *@This(), _: usize, _: u32) ?*const terminal.Dock {
+            return null;
+        }
+
         fn queueSurfaceAcknowledgement(self: *@This(), surface: *const SurfaceState) bool {
             self.queued = std.mem.eql(u8, surface.session_id, "session-a");
             return true;
@@ -657,4 +810,139 @@ test "surface focus clear queues persistence and updates local state immediately
     try std.testing.expect(!surface.completion_pending);
     try std.testing.expect(!surface.attention);
     try std.testing.expectEqual(@as(u32, 0), surface.unread_count);
+}
+
+test "Claude background shells override completion without overriding active hook states" {
+    const FakeDock = struct {
+        shells: bool = true,
+        session: []const u8 = "session-a",
+        fn activeSessionId(self: *const @This()) ?[]const u8 {
+            return self.session;
+        }
+        fn activeClaudeBackgroundShells(self: *const @This()) bool {
+            return self.shells;
+        }
+    };
+    const Project = struct { id: []const u8 = "workspace-a", path: []const u8 = "/workspace-a" };
+    const FakeState = struct {
+        project_controller: struct { projects: struct { items: []const Project } },
+        dock: FakeDock = .{},
+        fn projectPathMatches(_: *const @This(), a: []const u8, b: []const u8) bool {
+            return std.mem.eql(u8, a, b);
+        }
+        fn projectTerminalDock(self: *const @This(), _: usize, _: u32) ?*const FakeDock {
+            return &self.dock;
+        }
+    };
+    const projects = [_]Project{.{}};
+    var state: FakeState = .{ .project_controller = .{ .projects = .{ .items = &projects } } };
+    var surface: SurfaceState = .{ .session_id = @constCast("session-a"), .workspace_id = @constCast("workspace-a"), .provider = .claude, .status = .done, .completion_pending = true };
+    try std.testing.expectEqual(.waiting, terminalSurfaceDisplayStatus(&state, &surface));
+    try std.testing.expect(surface.completion_pending);
+    state.dock.shells = false;
+    try std.testing.expectEqual(.done, terminalSurfaceDisplayStatus(&state, &surface));
+    state.dock.shells = true;
+    surface.completion_pending = false;
+    inline for (.{ SurfaceStatus.working, SurfaceStatus.waiting, SurfaceStatus.@"error" }) |status| {
+        surface.status = status;
+        try std.testing.expectEqual(status, terminalSurfaceDisplayStatus(&state, &surface));
+    }
+    surface.status = .idle;
+    try std.testing.expectEqual(.waiting, terminalSurfaceDisplayStatus(&state, &surface));
+    surface.status = .done;
+    surface.provider = .codex;
+    try std.testing.expectEqual(.done, terminalSurfaceDisplayStatus(&state, &surface));
+    surface.provider = .claude;
+    state.dock.session = "different-session";
+    try std.testing.expectEqual(.done, terminalSurfaceDisplayStatus(&state, &surface));
+}
+
+test "focused terminal acknowledges replayed Done but preserves unseen and waiting work" {
+    const FakeDock = struct {
+        shells: bool = false,
+        at_shell: bool = false,
+        fn activeSessionAtShellPrompt(self: *const @This(), _: i64) bool {
+            return self.at_shell;
+        }
+        fn clearNotificationForSession(_: *@This(), _: []const u8) bool {
+            return false;
+        }
+        fn activeSessionId(_: *const @This()) ?[]const u8 {
+            return "session-a";
+        }
+        fn activeClaudeBackgroundShells(self: *const @This()) bool {
+            return self.shells;
+        }
+    };
+    const Pane = struct { ref: union(enum) { terminal: struct { dock_id: u32 = 54 }, chat: void } = .{ .terminal = .{} } };
+    const Layout = struct {
+        focused_pane_id: ?u32 = 7,
+        maximized_pane_id: ?u32 = null,
+        pane: Pane = .{},
+        fn paneById(self: *const @This(), id: u32) ?*const Pane {
+            return if (id == 7) &self.pane else null;
+        }
+    };
+    const Project = struct {
+        id: []const u8 = "workspace-a",
+        path: []const u8 = "/workspace-a",
+        workspace_layout: Layout = .{},
+        terminal_dock: FakeDock = .{},
+        terminal_docks: struct { items: []struct { dock: FakeDock } = &.{} } = .{},
+    };
+    const FakeState = struct {
+        window_input_focus: bool = false,
+        surface_controller: State,
+        project_controller: struct { selected_index: usize = 0, projects: struct { items: []Project } },
+        queued: usize = 0,
+        accept_ack: bool = true,
+        fn projectPathMatches(_: *@This(), a: []const u8, b: []const u8) bool {
+            return std.mem.eql(u8, a, b);
+        }
+        fn projectTerminalDock(self: *@This(), index: usize, _: u32) ?*const FakeDock {
+            return &self.project_controller.projects.items[index].terminal_dock;
+        }
+        fn queueSurfaceAcknowledgement(self: *@This(), _: *const SurfaceState) bool {
+            if (!self.accept_ack) return false;
+            self.queued += 1;
+            return true;
+        }
+    };
+    var projects = [_]Project{.{}};
+    var surfaces = [_]SurfaceState{.{ .session_id = @constCast("session-a"), .workspace_id = @constCast("workspace-a"), .provider = .codex, .dock_id = 54, .status = .done, .completion_pending = true }};
+    var state: FakeState = .{ .surface_controller = .{ .surfaces = .{ .items = &surfaces, .capacity = 1 } }, .project_controller = .{ .projects = .{ .items = &projects } } };
+    try std.testing.expect(!acknowledgeFocusedTerminalCompletion(&state));
+    state.window_input_focus = true;
+    projects[0].workspace_layout.pane.ref = .{ .chat = {} };
+    try std.testing.expect(!acknowledgeFocusedTerminalCompletion(&state));
+    projects[0].workspace_layout.pane.ref = .{ .terminal = .{} };
+    state.accept_ack = false;
+    try std.testing.expect(!acknowledgeFocusedTerminalCompletion(&state));
+    try std.testing.expect(surfaces[0].completion_pending);
+    state.accept_ack = true;
+    try std.testing.expect(acknowledgeFocusedTerminalCompletion(&state));
+    try std.testing.expectEqual(.idle, surfaces[0].status);
+    try std.testing.expect(!surfaces[0].completion_pending);
+    try std.testing.expect(!acknowledgeFocusedTerminalCompletion(&state));
+    try std.testing.expectEqual(@as(usize, 1), state.queued);
+    surfaces[0].status = .waiting;
+    try std.testing.expect(!acknowledgeFocusedTerminalCompletion(&state));
+    surfaces[0].provider = .claude;
+    surfaces[0].status = .done;
+    surfaces[0].completion_pending = true;
+    projects[0].terminal_dock.shells = true;
+    try std.testing.expect(!acknowledgeFocusedTerminalCompletion(&state));
+    projects[0].terminal_dock.shells = false;
+    try std.testing.expect(acknowledgeFocusedTerminalCompletion(&state));
+    // Returning to the shell retires every lifecycle without requiring focus.
+    state.window_input_focus = false;
+    projects[0].terminal_dock.at_shell = true;
+    for ([_]SurfaceStatus{ .working, .waiting, .done, .@"error" }) |status| {
+        surfaces[0].status = status;
+        surfaces[0].attention = true;
+        try std.testing.expect(acknowledgeFocusedTerminalCompletion(&state));
+        try std.testing.expectEqual(.idle, surfaces[0].status);
+        try std.testing.expect(!surfaces[0].attention);
+        try std.testing.expect(!acknowledgeFocusedTerminalCompletion(&state));
+    }
 }

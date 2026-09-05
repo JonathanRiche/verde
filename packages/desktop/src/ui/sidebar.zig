@@ -1752,7 +1752,7 @@ fn workspaceStatusColor(state: *runtime.AppState, project_index: usize) ?[4]f32 
         switch (pane.ref) {
             .terminal => |ref| {
                 if (state.projectTerminalSurface(project_index, ref.dock_id)) |surface| {
-                    switch (surface.displayStatus()) {
+                    switch (state.terminalSurfaceDisplayStatus(surface)) {
                         .@"error" => return theme.COLOR_DIFF_REMOVE,
                         .waiting => has_waiting = true,
                         .done => has_done = true,
@@ -1886,7 +1886,7 @@ fn collapsedPaneIndicator(
         },
         .terminal => |ref| {
             if (state.projectTerminalSurface(project_index, ref.dock_id)) |surface| {
-                status = surface.displayStatus();
+                status = state.terminalSurfaceDisplayStatus(surface);
                 running = !surface.completion_pending and surface.status == .working;
             }
         },
@@ -2150,7 +2150,7 @@ fn renderOpenPaneRow(
         .terminal => |ref| {
             const surface = state.projectTerminalSurface(project_index, ref.dock_id);
             if (surface) |s| {
-                status = s.displayStatus();
+                status = state.terminalSurfaceDisplayStatus(s);
                 if (!s.completion_pending and s.status == .working) {
                     running = true;
                     if (s.status_changed_at_ms > 0) status_started_at_ms = s.status_changed_at_ms;
@@ -2377,7 +2377,7 @@ fn paneNeedsAttention(
             const surface = state.projectTerminalSurface(project_index, ref.dock_id) orelse return false;
             // Done remains visible here until the terminal focus path
             // acknowledges it by resetting the surface to idle.
-            return switch (surface.displayStatus()) {
+            return switch (state.terminalSurfaceDisplayStatus(surface)) {
                 .working, .waiting, .done, .@"error" => true,
                 .idle => false,
             };

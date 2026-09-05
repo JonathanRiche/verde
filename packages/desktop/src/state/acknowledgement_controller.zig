@@ -46,6 +46,7 @@ const ChatAcknowledgement = struct {
 
 const SurfaceAcknowledgement = struct {
     canonical: db_types.PersistedSurfaceState,
+    completion_pending: bool = true,
     attention: bool,
     unread_count: u32,
     consumed_generation: u64,
@@ -200,6 +201,7 @@ fn enqueueSurface(state: *State, allocator: std.mem.Allocator, surface: *const s
     var owned = ownSurfaceAcknowledgement(allocator, canonical) catch return false;
     state.pending.append(allocator, .{ .surface = .{
         .canonical = owned,
+        .completion_pending = surface.completion_pending,
         .attention = surface.attention,
         .unread_count = surface.unread_count,
         .consumed_generation = surface.presentation_generation +% 1,
@@ -343,7 +345,7 @@ fn workerMain(args: *WorkerArgs) void {
             break :blk true;
         },
         .surface => |ack| blk: {
-            _ = args.storage.clearSurfaceCompletion(ack.canonical) catch |err| {
+            _ = args.storage.clearObservedSurfaceState(ack.canonical) catch |err| {
                 log.err("failed to persist surface acknowledgement via daemon: {s}", .{@errorName(err)});
                 break :blk false;
             };
@@ -416,7 +418,7 @@ fn restoreSurfaceFailed(surface: anytype, ack: SurfaceAcknowledgement) bool {
     if (surface.presentation_generation != ack.consumed_generation) return false;
     if (surface.status != .idle or surface.completion_pending or surface.completed_at_ms != 0) return false;
     surface.status = ack.canonical.status;
-    surface.completion_pending = true;
+    surface.completion_pending = ack.completion_pending;
     surface.completed_at_ms = ack.canonical.completed_at_ms;
     surface.attention = ack.attention;
     surface.unread_count = ack.unread_count;

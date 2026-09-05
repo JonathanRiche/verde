@@ -4110,6 +4110,10 @@ pub const Daemon = struct {
             decoded_message_list == null
         else if (is_turn_record)
             decoded_turn_record == null
+        else if (is_surface_observe)
+            decoded_surface_observe == null
+        else if (is_surface_proof)
+            decoded_surface_proof == null
         else
             decoded_mutation == null;
         if (decode_failed or decode_missing) {

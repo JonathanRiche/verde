@@ -3046,6 +3046,23 @@ fn runStorageStaleGranularRetryScenario(allocator: std.mem.Allocator, io: std.Io
     if (!registered.response.isOk()) return error.StorageRetryRegisterFailed;
     const wire_client_id = (try client.decodeClientRegister(&registered)).client_id;
 
+    // These reads must pass the daemon's decoded-request validation even
+    // though they carry no mutation. Rejecting them resurrects focused Done.
+    var observation = try client.call(headless.store.METHOD_SURFACE_COMPLETION_OBSERVE, .{
+        .surface = headless.store.SurfaceState{ .session_id = "missing-ack-surface" },
+    });
+    defer observation.deinit();
+    if ((try client.decodeSurfaceCompletionObserve(&observation)).matches)
+        return error.StorageRetryMissingSurfaceMatched;
+    var proof = try client.call(headless.store.METHOD_SURFACE_COMMIT_PROOF_CLASSIFY, .{
+        .request_key = "missing-ack-receipt",
+        .operation = "surface.clear",
+        .fingerprint = "missing",
+        .store_revision = @as(u64, 0),
+    });
+    defer proof.deinit();
+    if (!proof.response.isOk()) return error.StorageRetryProofReadRejected;
+
     var storage = try state_storage.Storage.initWithPrefPath(allocator, store_dir);
     defer storage.deinit();
     try storage.upsertSurfaceState(.{
@@ -3176,6 +3193,23 @@ fn runStorageStaleGranularRetryScenario(allocator: std.mem.Allocator, io: std.Io
     var exact_reader = try db_client.Client.initReadOnly(allocator, store_dir);
     defer exact_reader.deinit();
     if (!try exact_reader.surfaceStateMatches(newer_same_timestamp)) return error.StorageRetryAckNewerChanged;
+
+    var exited = old_done;
+    exited.session_id = "exited-tui";
+    exited.completed_at_ms = 0;
+    for ([_]db_types.SurfaceStatus{ .working, .waiting, .@"error" }) |status| {
+        exited.status = status;
+        try storage.upsertSurfaceState(exited);
+        if (!try storage.clearObservedSurfaceState(exited)) return error.ExitedTuiStateNotCleared;
+        if (try exact_reader.surfaceStateMatches(exited)) return error.ExitedTuiStateStillPersisted;
+    }
+    try storage.upsertSurfaceState(exited);
+    var restarted = exited;
+    restarted.status = .working;
+    restarted.status_changed_at_ms += 1;
+    try storage.upsertSurfaceState(restarted);
+    if (try storage.clearObservedSurfaceState(exited)) return error.RestartedTuiStateCleared;
+    if (!try exact_reader.surfaceStateMatches(restarted)) return error.RestartedTuiStateLost;
 
     const scopes = [_][]const u8{headless.store.SNAPSHOT_SCOPE_STORE};
     var snapshot = try client.call(headless.store.METHOD_CORE_SNAPSHOT, headless.store.CoreSnapshotRequest{ .scopes = &scopes });

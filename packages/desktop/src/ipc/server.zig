@@ -739,7 +739,7 @@ fn surfacesResponse(allocator: std.mem.Allocator, id_value: std.json.Value, stat
     try s.beginObject();
     try s.objectField("surfaces");
     try s.beginArray();
-    for (state.surface_controller.surfaces.items) |*surface| try writeSurface(&s, surface);
+    for (state.surface_controller.surfaces.items) |*surface| try writeSurface(&s, state, surface);
     try s.endArray();
     try s.endObject();
     try s.endObject();
@@ -758,7 +758,7 @@ fn surfaceInspectResponse(allocator: std.mem.Allocator, id_value: std.json.Value
     try s.objectField("result");
     try s.beginObject();
     try s.objectField("surface");
-    try writeSurface(&s, surface);
+    try writeSurface(&s, state, surface);
     try s.endObject();
     try s.endObject();
     return try writer.toOwnedSlice();
@@ -860,7 +860,7 @@ fn notificationUpdateResponse(allocator: std.mem.Allocator, id_value: std.json.V
         .completed_at_ms = if (durability == .presentation_only) completed_at_ms else null,
         .durability = durability,
     });
-    return try surfaceResultResponse(allocator, id_value, surface);
+    return try surfaceResultResponse(allocator, id_value, state, surface);
 }
 
 fn notificationClearResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
@@ -878,7 +878,7 @@ fn notificationClearResponse(allocator: std.mem.Allocator, id_value: std.json.Va
         .clear = true,
         .durability = durability,
     });
-    return try surfaceResultResponse(allocator, id_value, surface);
+    return try surfaceResultResponse(allocator, id_value, state, surface);
 }
 
 fn inspectResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
@@ -2384,7 +2384,7 @@ fn writeTerminalIdentity(s: *std.json.Stringify, state: *app_state.AppState, pro
     // `working` matches the sidebar's green/active highlight so detached
     // clients classify active terminals exactly like the desktop.
     try s.objectField("status");
-    if (surface) |item| try s.write(@tagName(item.displayStatus())) else try s.write(null);
+    if (surface) |item| try s.write(@tagName(state.terminalSurfaceDisplayStatus(item))) else try s.write(null);
     try s.objectField("working");
     try s.write(if (surface) |item| !item.completion_pending and item.status == .working else false);
 }
@@ -3594,7 +3594,7 @@ fn writeTerminalAttentionReasons(s: *std.json.Stringify, state: *const app_state
     try s.endArray();
 }
 
-fn writeSurface(s: *std.json.Stringify, surface: *const app_state.SurfaceState) !void {
+fn writeSurface(s: *std.json.Stringify, state: *const app_state.AppState, surface: *const app_state.SurfaceState) !void {
     try s.beginObject();
     try s.objectField("session_id");
     try s.write(surface.session_id);
@@ -3615,7 +3615,7 @@ fn writeSurface(s: *std.json.Stringify, surface: *const app_state.SurfaceState) 
     try s.objectField("status");
     try s.write(@tagName(surface.status));
     try s.objectField("display_status");
-    try s.write(@tagName(surface.displayStatus()));
+    try s.write(@tagName(state.terminalSurfaceDisplayStatus(surface)));
     try s.objectField("completion_pending");
     try s.write(surface.completion_pending);
     try s.objectField("completed_at_ms");
@@ -3635,7 +3635,7 @@ fn writeSurface(s: *std.json.Stringify, surface: *const app_state.SurfaceState) 
     try s.endObject();
 }
 
-fn surfaceResultResponse(allocator: std.mem.Allocator, id_value: std.json.Value, surface: *const app_state.SurfaceState) ![]u8 {
+fn surfaceResultResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *const app_state.AppState, surface: *const app_state.SurfaceState) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
     var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
@@ -3643,7 +3643,7 @@ fn surfaceResultResponse(allocator: std.mem.Allocator, id_value: std.json.Value,
     try s.objectField("result");
     try s.beginObject();
     try s.objectField("surface");
-    try writeSurface(&s, surface);
+    try writeSurface(&s, state, surface);
     try s.endObject();
     try s.endObject();
     return try writer.toOwnedSlice();
