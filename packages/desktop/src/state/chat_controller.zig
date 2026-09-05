@@ -6618,6 +6618,11 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
         cancelLingeringToolCallEvents(std.heap.page_allocator, &completed_events);
     }
 
+    const had_assistant_events = pendingTimelineEventsContainAssistant(completed_events.items);
+    if (completed_daemon_turn_id) |turn_id| {
+        chat_threads.discardHydratedTimelineEvents(std.heap.page_allocator, thread.messages.items, turn_id, &completed_events);
+    }
+
     switch (next_status) {
         .completed => {
             if (completed_result) |result| {
@@ -6625,7 +6630,7 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
                 defer std.heap.page_allocator.free(result.reply_text);
                 defer freePendingTimelineEvents(std.heap.page_allocator, &completed_events);
                 defer freePendingDiffFiles(std.heap.page_allocator, &completed_diff_files);
-                const should_append_reply_text = !pendingTimelineEventsContainAssistant(completed_events.items);
+                const should_append_reply_text = !had_assistant_events;
                 self.applyPendingTimelineEvents(thread, &completed_events) catch |err| {
                     log.err("failed to apply timeline events: {s}", .{@errorName(err)});
                 };
@@ -6861,6 +6866,7 @@ fn adoptTranscriptIdentitiesFromStoreMessages(
             );
         }
     }
+    if (unresolved) return .incomplete;
     const suffix = hydrateTranscriptSuffixFromStoreMessages(self.allocator, thread, store_messages);
     if (adopted_any or suffix.appended) self.markDirty();
     return if (unresolved or suffix.incomplete) .incomplete else .complete;

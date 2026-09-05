@@ -274,7 +274,7 @@ Source builds live in [`packages/desktop/`](packages/desktop). Use [`mise`](http
 ```bash
 mise install
 mise run setup
-mise run build    # release-style local build
+mise run dev-build # routine desktop development build
 mise run dev      # build + run (native webview)
 ```
 
@@ -282,14 +282,15 @@ mise run dev      # build + run (native webview)
 | --- | --- |
 | Dependency check | `mise run setup` |
 | Dev run | `mise run dev` |
-| Release-style build | `mise run build` |
+| Desktop development build | `mise run dev-build` |
+| Full build/install | `mise run build` |
 | SDL_GPU Palette renderer | `mise run dev-sdl-gpu` |
 | Web client (Zig gateway + Solid SPA) | `mise run web-app` / `mise run web-app-run` |
 
-**Do not use bare `zig build`** — the default Debug + WPE path is known to fail. Prefer `mise run build` / `mise run dev`, or explicitly:
+**Do not use bare `zig build`** — the default Debug + WPE path is known to fail. Prefer `mise run dev-build` for desktop development or `mise run dev` to launch, or explicitly:
 
 ```bash
-zig build --release=safe -Dbrowser-backend=native_webview
+zig build dev-build --release=safe -Dbrowser-backend=native_webview
 ```
 
 Platform notes (WebView2 SDK, WPE packages, macOS codesign, Windows MSVC): see [Troubleshooting](https://verdeai.dev/docs/troubleshooting) and comments in [`scripts/`](scripts/).
