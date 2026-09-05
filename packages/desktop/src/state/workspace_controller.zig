@@ -31,7 +31,6 @@ const FX_MODEL_OPTIONS = provider_models.FX_MODEL_OPTIONS;
 const DEFAULT_FX_MODEL = provider_models.DEFAULT_FX_MODEL;
 const GROK_MODEL_OPTIONS = provider_models.GROK_MODEL_OPTIONS;
 const DEFAULT_GROK_MODEL = provider_models.DEFAULT_GROK_MODEL;
-const MUSE_MODEL_OPTIONS = provider_models.MUSE_MODEL_OPTIONS;
 const DEFAULT_MUSE_MODEL = provider_models.DEFAULT_MUSE_MODEL;
 const CLAUDE_STANDARD_EFFORT_VALUES = provider_models.CLAUDE_STANDARD_EFFORT_VALUES;
 const parseReasoningEffort = provider_models.parseReasoningEffort;
@@ -112,7 +111,7 @@ fn composerModelOptions(self: anytype, provider: Provider) []const ModelOption {
         self.piModelOptionsSnapshot(),
         self.fxModelOptionsSnapshot(),
         self.grokModelOptionsSnapshot(),
-        MUSE_MODEL_OPTIONS[0..],
+        self.museModelOptionsSnapshot(),
     );
 }
 

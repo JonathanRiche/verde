@@ -77,6 +77,8 @@ pub const ModelInfo = struct {
     provider_name: []const u8,
     model_id: []const u8,
     model_name: []const u8,
+    /// Catalog blurb shown in pickers; null when the provider omitted one.
+    description: ?[]const u8 = null,
     /// From OpenCode model JSON `capabilities.reasoning` (defaults true when absent).
     reasoning_supported: bool = true,
     /// Sorted OpenCode `variants` object keys (API variant names). Null when none are declared.
@@ -92,6 +94,7 @@ pub const ModelInfo = struct {
         allocator.free(self.provider_name);
         allocator.free(self.model_id);
         allocator.free(self.model_name);
+        if (self.description) |description| allocator.free(description);
         if (self.reasoning_variant_keys) |keys| {
             for (keys) |key| allocator.free(key);
             allocator.free(keys);

@@ -116,12 +116,11 @@ pub const Client = struct {
     pub fn listModels(self: *Client, allocator: std.mem.Allocator) ![]provider_types.ModelInfo {
         var proc = try self.spawnServer(allocator, false);
         defer proc.deinit();
-        try writeInitialize(&proc);
-        try proc.writeLine(try makeEmptyRequestAlloc(allocator, 2, "model/list"));
-        try proc.closeStdin();
-
         var read_buffer: [16 * 1024]u8 = undefined;
         var reader = proc.process.child.stdout.?.reader(proc.threaded.io(), &read_buffer);
+        try handshake(&proc, allocator, &reader);
+        try proc.writeLine(try makeEmptyRequestAlloc(allocator, 2, "model/list"));
+        try proc.closeStdin();
         while (try acp.takeLineAlloc(allocator, &reader)) |raw_line| {
             defer allocator.free(raw_line);
             const line = std.mem.trim(u8, raw_line, " \t\r");
@@ -173,28 +172,45 @@ pub const Client = struct {
         const disable_sandbox = (request.sandbox_mode orelse .workspace_write) == .danger_full_access;
         var proc = try self.spawnServer(allocator, disable_sandbox);
         defer proc.deinit();
-        try writeInitialize(&proc);
+
+        var read_buffer: [16 * 1024]u8 = undefined;
+        var reader = proc.process.child.stdout.?.reader(proc.threaded.io(), &read_buffer);
+        try handshake(&proc, allocator, &reader);
 
         const cwd = try self.cwdAbsoluteAllocForRequest(allocator, request);
         defer allocator.free(cwd);
         const setup_command_id = try uuidV7Alloc(allocator, proc.threaded.io());
         defer allocator.free(setup_command_id);
+        const approval_mode = approvalModeForPolicy(request.approval_policy);
         if (request.thread_id) |thread_id| {
             try proc.writeLine(try makeSessionResumeRequestAlloc(allocator, 2, setup_command_id, thread_id));
         } else {
-            // The stable host seals its startup approval ceiling internally and
-            // rejects explicit modes in 1.0.2. Use that default, then enforce
-            // Verde's policy when approval/requested arrives.
+            // Muse 1.0.3 selects approval on the wire. 1.0.2 sealed it at
+            // host start and rejected explicit modes; retry without the field.
             try proc.writeLine(try makeSessionStartRequestAlloc(
                 allocator,
                 2,
                 setup_command_id,
                 cwd,
                 request.model orelse self.config.model,
+                approval_mode,
             ));
         }
 
-        const session_id = try waitForSessionSetupAlloc(allocator, &proc, request.thread_id);
+        const session_id = waitForSessionSetupAlloc(allocator, &reader, request.thread_id) catch |err| blk: {
+            if (request.thread_id != null or err != error.MuseApprovalModeRejected) return err;
+            const retry_command_id = try uuidV7Alloc(allocator, proc.threaded.io());
+            defer allocator.free(retry_command_id);
+            try proc.writeLine(try makeSessionStartRequestAlloc(
+                allocator,
+                2,
+                retry_command_id,
+                cwd,
+                request.model orelse self.config.model,
+                null,
+            ));
+            break :blk try waitForSessionSetupAlloc(allocator, &reader, request.thread_id);
+        };
         errdefer allocator.free(session_id);
         if (request.on_thread_id) |callback| callback(request.stream_context, session_id);
 
@@ -222,17 +238,17 @@ pub const Client = struct {
         defer if (turn_id_storage) |turn_id| allocator.free(turn_id);
         var cancel_sent = false;
 
-        var read_buffer: [16 * 1024]u8 = undefined;
-        var reader = proc.process.child.stdout.?.reader(proc.threaded.io(), &read_buffer);
         while (try acp.takeLineAlloc(allocator, &reader)) |raw_line| {
             defer allocator.free(raw_line);
             const line = std.mem.trim(u8, raw_line, " \t\r");
             if (line.len == 0) continue;
             var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
             defer parsed.deinit();
-            try failIfRpcError(parsed.value);
 
             if (acp.responseId(parsed.value)) |id| {
+                // Best-effort session/setModel (id 4) must not fail the turn.
+                if (id == 4) continue;
+                try failIfRpcError(parsed.value);
                 if (id == 5) {
                     const result = acp.getObjectField(parsed.value, "result") orelse return error.MuseProtocolFailed;
                     const turn_id = acp.getOptionalObjectString(result, "turnId") orelse return error.MuseProtocolFailed;
@@ -241,28 +257,29 @@ pub const Client = struct {
                 }
                 continue;
             }
+            try failIfRpcError(parsed.value);
 
             const method = acp.getOptionalObjectString(parsed.value, "method") orelse continue;
             const params = acp.getObjectField(parsed.value, "params") orelse continue;
-            if (std.mem.eql(u8, method, "item/started")) {
+            if (std.mem.eql(u8, method, "turn/started")) {
+                emitWorkingEvent(request);
+            } else if (std.mem.eql(u8, method, "item/started")) {
                 if (acp.getObjectField(params, "item")) |item| {
                     const item_id = acp.getOptionalObjectString(item, "itemId") orelse "";
                     const kind = acp.getOptionalObjectString(item, "kind") orelse "";
                     if (item_id.len > 0 and std.mem.eql(u8, kind, "agentMessage")) {
                         try agent_items.put(allocator, try allocator.dupe(u8, item_id), {});
                     }
-                    emitToolEvent(request, item);
+                    emitItemEvent(request, item);
                 }
             } else if (std.mem.eql(u8, method, "item/delta")) {
                 const item_id = acp.getOptionalObjectString(params, "itemId") orelse "";
                 const field = acp.getOptionalObjectString(params, "field") orelse "text";
-                if (agent_items.contains(item_id) and std.mem.eql(u8, field, "text")) {
-                    const delta = acp.getOptionalObjectString(params, "delta") orelse "";
-                    if (delta.len > 0) {
-                        try reply.appendSlice(allocator, delta);
-                        if (!streamed_items.contains(item_id)) try streamed_items.put(allocator, try allocator.dupe(u8, item_id), {});
-                        if (request.on_stream_delta) |callback| callback(request.stream_context, delta);
-                    }
+                const delta = acp.getOptionalObjectString(params, "delta") orelse "";
+                if (delta.len > 0 and agent_items.contains(item_id) and isTextField(field)) {
+                    try reply.appendSlice(allocator, delta);
+                    if (!streamed_items.contains(item_id)) try streamed_items.put(allocator, try allocator.dupe(u8, item_id), {});
+                    if (request.on_stream_delta) |callback| callback(request.stream_context, delta);
                 }
             } else if (std.mem.eql(u8, method, "item/updated") or std.mem.eql(u8, method, "item/completed")) {
                 if (acp.getObjectField(params, "item")) |item| {
@@ -276,10 +293,13 @@ pub const Client = struct {
                         try reply.appendSlice(allocator, text);
                         if (request.on_stream_delta) |callback| callback(request.stream_context, text);
                     }
-                    emitToolEvent(request, item);
+                    emitItemEvent(request, item);
                 }
-            } else if (std.mem.eql(u8, method, "approval/requested")) {
+            } else if (std.mem.eql(u8, method, "approval/requested") or std.mem.eql(u8, method, "approval/updated")) {
+                emitApprovalProgress(request, params);
                 try decideApproval(allocator, &proc, request, params);
+            } else if (std.mem.eql(u8, method, "session/todoListChanged")) {
+                emitTodoEvent(request, params);
             } else if (std.mem.eql(u8, method, "userInput/requested")) {
                 try cancelUserInput(allocator, &proc, params);
                 if (request.on_failure) |callback| callback(request.stream_context, "Muse requested structured user input; continue in a new message.");
@@ -318,10 +338,15 @@ pub const Client = struct {
             if (!cancel_sent) {
                 if (request.on_should_stop) |should_stop| {
                     if (should_stop(request.stream_context)) {
-                        const turn_id = turn_id_storage orelse continue;
                         const command_id = try uuidV7Alloc(allocator, proc.threaded.io());
                         defer allocator.free(command_id);
-                        try proc.writeLine(try makeTurnCancelRequestAlloc(allocator, 90, command_id, session_id, turn_id));
+                        try proc.writeLine(try makeTurnInterruptRequestAlloc(
+                            allocator,
+                            91,
+                            command_id,
+                            session_id,
+                            turn_id_storage,
+                        ));
                         cancel_sent = true;
                     }
                 }
@@ -331,14 +356,29 @@ pub const Client = struct {
     }
 
     pub fn interruptThread(self: *Client, request: provider_types.InterruptThreadRequest) !void {
-        _ = self;
+        var threaded: std.Io.Threaded = .init(self.allocator, .{});
+        defer threaded.deinit();
+        const command_id = uuidV7Alloc(self.allocator, threaded.io()) catch null;
+        defer if (command_id) |id| self.allocator.free(id);
+        const line = if (command_id) |id|
+            makeTurnInterruptRequestAlloc(self.allocator, 91, id, request.thread_id, request.turn_id) catch null
+        else
+            null;
+        defer if (line) |payload| self.allocator.free(payload);
+
         active_process_state.lock();
         defer active_process_state.unlock();
         const child = active_process_state.child orelse return;
         const session_id = active_process_state.session_id orelse return;
         if (!std.mem.eql(u8, session_id, request.thread_id)) return;
-        // The send loop performs a graceful `turn/cancel` when its stop flag is
-        // visible. This external path is the fail-safe when it is blocked.
+        // Priority-lane interrupt first so Muse can leave an approval wait.
+        // terminateTree is the fail-safe when stdin is already closed or the
+        // host ignores the command while blocked.
+        if (line) |payload| {
+            if (active_process_state.stdin) |stdin| {
+                acp.writeJsonLineToFile(self.allocator, stdin, payload) catch {};
+            }
+        }
         child.terminateTree();
     }
 
@@ -421,17 +461,35 @@ fn writeInitialize(proc: *acp.Process) !void {
     try proc.writeLine(try makeInitializedNotificationAlloc(proc.allocator));
 }
 
-fn waitForSessionSetupAlloc(allocator: std.mem.Allocator, proc: *acp.Process, existing_id: ?[]const u8) ![]u8 {
-    var read_buffer: [16 * 1024]u8 = undefined;
-    var reader = proc.process.child.stdout.?.reader(proc.threaded.io(), &read_buffer);
-    while (try acp.takeLineAlloc(allocator, &reader)) |raw_line| {
+fn handshake(proc: *acp.Process, allocator: std.mem.Allocator, reader: anytype) !void {
+    try proc.writeLine(try makeInitializeRequestAlloc(proc.allocator, 1));
+    try waitForResponseIdAlloc(allocator, reader, 1);
+    try proc.writeLine(try makeInitializedNotificationAlloc(proc.allocator));
+}
+
+fn waitForResponseIdAlloc(allocator: std.mem.Allocator, reader: anytype, expected_id: i64) !void {
+    while (try acp.takeLineAlloc(allocator, reader)) |raw_line| {
         defer allocator.free(raw_line);
         const line = std.mem.trim(u8, raw_line, " \t\r");
         if (line.len == 0) continue;
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
+        if (acp.responseId(parsed.value) != expected_id) continue;
         try failIfRpcError(parsed.value);
+        return;
+    }
+    return error.MuseProtocolFailed;
+}
+
+fn waitForSessionSetupAlloc(allocator: std.mem.Allocator, reader: anytype, existing_id: ?[]const u8) ![]u8 {
+    while (try acp.takeLineAlloc(allocator, reader)) |raw_line| {
+        defer allocator.free(raw_line);
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0) continue;
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
         if (acp.responseId(parsed.value) != 2) continue;
+        failIfRpcError(parsed.value) catch |err| return err;
         if (existing_id) |session_id| return allocator.dupe(u8, session_id);
         const result = acp.getObjectField(parsed.value, "result") orelse return error.MuseProtocolFailed;
         const session = acp.getObjectField(result, "session") orelse return error.MuseProtocolFailed;
@@ -445,7 +503,25 @@ fn failIfRpcError(value: std.json.Value) !void {
     const error_value = acp.getObjectField(value, "error") orelse return;
     const message = acp.getOptionalObjectString(error_value, "message") orelse "";
     if (containsAuthHint(message)) return error.MuseSignedOut;
+    if (isApprovalModeRejected(message)) return error.MuseApprovalModeRejected;
     return error.MuseProtocolFailed;
+}
+
+fn isApprovalModeRejected(message: []const u8) bool {
+    return std.mem.indexOf(u8, message, "approvalMode") != null or
+        std.mem.indexOf(u8, message, "approval mode") != null or
+        std.mem.indexOf(u8, message, "ApprovalMode") != null;
+}
+
+fn approvalModeForPolicy(policy: ?provider_types.ApprovalPolicy) ?[]const u8 {
+    return switch (policy orelse .on_request) {
+        .never => "allowAll",
+        .on_request => "onRequest",
+    };
+}
+
+fn isTextField(field: []const u8) bool {
+    return std.mem.eql(u8, field, "text") or std.mem.startsWith(u8, field, "text.");
 }
 
 fn containsAuthHint(message: []const u8) bool {
@@ -488,11 +564,16 @@ fn parseModelListAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]p
     for (entries.array.items) |entry| {
         const model_id = acp.getOptionalObjectString(entry, "modelId") orelse continue;
         const label = acp.getOptionalObjectString(entry, "displayLabel") orelse model_id;
+        const description = acp.getOptionalObjectString(entry, "description");
         try models.append(allocator, .{
             .provider_id = try allocator.dupe(u8, "muse"),
             .provider_name = try allocator.dupe(u8, "Muse"),
             .model_id = try allocator.dupe(u8, model_id),
             .model_name = try allocator.dupe(u8, label),
+            .description = if (description) |text|
+                if (text.len > 0) try allocator.dupe(u8, text) else null
+            else
+                null,
         });
     }
     return models.toOwnedSlice(allocator);
@@ -548,12 +629,51 @@ fn parseReadThreadAlloc(
     };
 }
 
+fn emitWorkingEvent(request: provider_types.SendPromptRequest) void {
+    const callback = request.on_stream_event orelse return;
+    callback(request.stream_context, .{ .tool_call = .{
+        .call_id = "muse-turn",
+        .title = "",
+        .kind = .think,
+        .status = .in_progress,
+    } });
+}
+
+fn emitItemEvent(request: provider_types.SendPromptRequest, item: std.json.Value) void {
+    const callback = request.on_stream_event orelse return;
+    const item_kind = acp.getOptionalObjectString(item, "kind") orelse "";
+    if (std.mem.eql(u8, item_kind, "reasoning")) {
+        callback(request.stream_context, .{ .tool_call = .{
+            .call_id = acp.getOptionalObjectString(item, "itemId") orelse "muse-reasoning",
+            .title = "Thinking",
+            .kind = .think,
+            .status = toolStatus(acp.getOptionalObjectString(item, "status") orelse "inProgress"),
+            .output = acp.getOptionalObjectString(item, "text"),
+        } });
+        return;
+    }
+    if (std.mem.eql(u8, item_kind, "toolCall") or
+        std.mem.eql(u8, item_kind, "userShell") or
+        std.mem.eql(u8, item_kind, "subagent") or
+        acp.getOptionalObjectString(item, "tool") != null)
+    {
+        emitToolEvent(request, item);
+        return;
+    }
+    if (item_kind.len == 0 or std.mem.eql(u8, item_kind, "agentMessage") or std.mem.eql(u8, item_kind, "userMessage")) return;
+    const fallback = acp.getOptionalObjectString(item, "fallbackText") orelse acp.getOptionalObjectString(item, "text") orelse return;
+    if (fallback.len == 0) return;
+    callback(request.stream_context, .{ .message = .{
+        .title = if (item_kind.len > 0) item_kind else "Muse",
+        .body = fallback,
+    } });
+}
+
 fn emitToolEvent(request: provider_types.SendPromptRequest, item: std.json.Value) void {
     const callback = request.on_stream_event orelse return;
-    const item_kind = acp.getOptionalObjectString(item, "kind") orelse return;
-    if (!std.mem.eql(u8, item_kind, "toolCall") and !std.mem.eql(u8, item_kind, "userShell") and !std.mem.eql(u8, item_kind, "subagent")) return;
+    const item_kind = acp.getOptionalObjectString(item, "kind") orelse "";
     const tool = acp.getOptionalObjectString(item, "tool") orelse if (std.mem.eql(u8, item_kind, "subagent")) "subagent" else "shell";
-    const status = toolStatus(acp.getOptionalObjectString(item, "status") orelse "unknown");
+    const status = toolStatus(acp.getOptionalObjectString(item, "status") orelse "inProgress");
     const kind = if (std.mem.eql(u8, item_kind, "subagent")) .subagent else toolKind(tool);
     const is_shell = kind == .execute;
     const title = if (is_shell)
@@ -568,8 +688,50 @@ fn emitToolEvent(request: provider_types.SendPromptRequest, item: std.json.Value
         .kind = kind,
         .status = status,
         .input = acp.getOptionalObjectString(item, "args") orelse acp.getOptionalObjectString(item, "commandText"),
-        .output = acp.getOptionalObjectString(item, "output"),
+        .output = acp.getOptionalObjectString(item, "output") orelse acp.getOptionalObjectString(item, "visibleOutput"),
         .error_text = acp.getOptionalObjectString(item, "failureReason"),
+    } });
+}
+
+fn emitApprovalProgress(request: provider_types.SendPromptRequest, params: std.json.Value) void {
+    const callback = request.on_stream_event orelse return;
+    const tool = acp.getOptionalObjectString(params, "toolName") orelse "tool";
+    const kind = toolKind(tool);
+    const title = if (kind == .execute) "Ran command" else tool;
+    callback(request.stream_context, .{ .tool_call = .{
+        .call_id = acp.getOptionalObjectString(params, "toolCallId") orelse
+            acp.getOptionalObjectString(params, "itemId") orelse
+            acp.getOptionalObjectString(params, "approvalId") orelse "muse-approval",
+        .title = title,
+        .kind = kind,
+        .status = .in_progress,
+        .input = acp.getOptionalObjectString(params, "rawArgs"),
+    } });
+}
+
+fn emitTodoEvent(request: provider_types.SendPromptRequest, params: std.json.Value) void {
+    const callback = request.on_stream_event orelse return;
+    const items = acp.getObjectField(params, "items") orelse return;
+    if (items != .array or items.array.items.len == 0) return;
+    var body_buffer: [1024]u8 = undefined;
+    var offset: usize = 0;
+    for (items.array.items) |item| {
+        const text = acp.getOptionalObjectString(item, "text") orelse continue;
+        const status = acp.getOptionalObjectString(item, "status") orelse "pending";
+        const mark: []const u8 = if (std.mem.eql(u8, status, "completed"))
+            "x"
+        else if (std.mem.eql(u8, status, "inProgress"))
+            ">"
+        else
+            " ";
+        const line = std.fmt.bufPrint(body_buffer[offset..], "- [{s}] {s}\n", .{ mark, text }) catch break;
+        offset += line.len;
+        if (offset + 32 >= body_buffer.len) break;
+    }
+    if (offset == 0) return;
+    callback(request.stream_context, .{ .message = .{
+        .title = "Todos",
+        .body = body_buffer[0..offset],
     } });
 }
 
@@ -628,7 +790,7 @@ fn decideApproval(
 
 fn chooseApprovalChoice(choices: []const std.json.Value, decision: provider_types.ApprovalDecision) ?[]const u8 {
     for (choices) |choice| {
-        const value = acp.getOptionalObjectString(choice, "decision") orelse continue;
+        const value = approvalDecisionName(choice) orelse continue;
         const scope = acp.getOptionalObjectString(choice, "scope") orelse "once";
         const matches = switch (decision) {
             .approve => std.mem.startsWith(u8, value, "approved") and std.mem.eql(u8, scope, "once"),
@@ -637,7 +799,7 @@ fn chooseApprovalChoice(choices: []const std.json.Value, decision: provider_type
         if (matches) return acp.getOptionalObjectString(choice, "choiceId");
     }
     for (choices) |choice| {
-        const value = acp.getOptionalObjectString(choice, "decision") orelse continue;
+        const value = approvalDecisionName(choice) orelse continue;
         const matches = switch (decision) {
             .approve => std.mem.startsWith(u8, value, "approved"),
             .deny => std.mem.startsWith(u8, value, "denied") or std.mem.eql(u8, value, "abort"),
@@ -645,6 +807,15 @@ fn chooseApprovalChoice(choices: []const std.json.Value, decision: provider_type
         if (matches) return acp.getOptionalObjectString(choice, "choiceId");
     }
     return null;
+}
+
+fn approvalDecisionName(choice: std.json.Value) ?[]const u8 {
+    const field = acp.getObjectField(choice, "decision") orelse return null;
+    return switch (field) {
+        .string => |text| text,
+        .object => acp.getOptionalObjectString(field, "kind"),
+        else => null,
+    };
 }
 
 fn cancelUserInput(allocator: std.mem.Allocator, proc: *acp.Process, params: std.json.Value) !void {
@@ -750,6 +921,7 @@ fn makeSessionStartRequestAlloc(
     command_id: []const u8,
     cwd: []const u8,
     model: ?[]const u8,
+    approval_mode: ?[]const u8,
 ) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
@@ -766,6 +938,10 @@ fn makeSessionStartRequestAlloc(
             try json.objectField("modelId");
             try json.write(model_id);
         }
+    }
+    if (approval_mode) |mode| {
+        try json.objectField("approvalMode");
+        try json.write(mode);
     }
     try json.endObject();
     try json.endObject();
@@ -855,19 +1031,27 @@ fn makeTurnStartRequestAlloc(
     return writer.toOwnedSlice();
 }
 
-fn makeTurnCancelRequestAlloc(allocator: std.mem.Allocator, id: i64, command_id: []const u8, session_id: []const u8, turn_id: []const u8) ![]u8 {
+fn makeTurnInterruptRequestAlloc(
+    allocator: std.mem.Allocator,
+    id: i64,
+    command_id: []const u8,
+    session_id: []const u8,
+    turn_id: ?[]const u8,
+) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
     var json: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
-    try writeRequestHead(&json, id, "turn/cancel");
+    try writeRequestHead(&json, id, "turn/interrupt");
     try json.objectField("params");
     try json.beginObject();
     try json.objectField("commandId");
     try json.write(command_id);
     try json.objectField("sessionId");
     try json.write(session_id);
-    try json.objectField("turnId");
-    try json.write(turn_id);
+    if (turn_id) |value| {
+        try json.objectField("turnId");
+        try json.write(value);
+    }
     try json.endObject();
     try json.endObject();
     return writer.toOwnedSlice();
@@ -1023,15 +1207,20 @@ fn resolveMuseExecutableAlloc(
 
 test "Muse model list parser preserves catalog ids and labels" {
     const payload =
-        \\{"jsonrpc":"2.0","id":2,"result":{"models":[{"modelId":"muse-spark-1.3-contributor","displayLabel":"Muse Spark 1.3","providerId":"meta"}]}}
+        \\{"jsonrpc":"2.0","id":2,"result":{"models":[{"modelId":"muse-spark-1.3-contributor","displayLabel":"muse-spark-1.3-contributor","description":"Your content, including inter-session messages, may be used for product improvement.","providerId":"meta"},{"modelId":"muse-spark-1.3","displayLabel":"muse-spark-1.3","description":null,"providerId":"meta"}]}}
     ;
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
     defer parsed.deinit();
     const models = try parseModelListAlloc(std.testing.allocator, parsed.value);
     defer provider_types.freeModelInfos(std.testing.allocator, models);
-    try std.testing.expectEqual(@as(usize, 1), models.len);
+    try std.testing.expectEqual(@as(usize, 2), models.len);
     try std.testing.expectEqualStrings("muse", models[0].provider_id);
     try std.testing.expectEqualStrings("muse-spark-1.3-contributor", models[0].model_id);
+    try std.testing.expectEqualStrings(
+        "Your content, including inter-session messages, may be used for product improvement.",
+        models[0].description.?,
+    );
+    try std.testing.expect(models[1].description == null);
 }
 
 test "Muse approval choice prefers once for approval" {
@@ -1044,16 +1233,60 @@ test "Muse approval choice prefers once for approval" {
     try std.testing.expectEqualStrings("deny", chooseApprovalChoice(parsed.value.array.items, .deny).?);
 }
 
-test "Muse session start leaves sealed approval mode to host" {
+test "Muse session start omits approval mode when the host sealed it" {
     const payload = try makeSessionStartRequestAlloc(
         std.testing.allocator,
         2,
         "01991b47-0000-7000-8000-000000000001",
         "/tmp/workspace",
         "muse-spark-1.3-contributor",
+        null,
     );
     defer std.testing.allocator.free(payload);
     try std.testing.expect(std.mem.indexOf(u8, payload, "approvalMode") == null);
+}
+
+test "Muse session start sends allowAll for full-access policy" {
+    try std.testing.expectEqualStrings("allowAll", approvalModeForPolicy(.never).?);
+    try std.testing.expectEqualStrings("onRequest", approvalModeForPolicy(.on_request).?);
+    const payload = try makeSessionStartRequestAlloc(
+        std.testing.allocator,
+        2,
+        "01991b47-0000-7000-8000-000000000001",
+        "/tmp/workspace",
+        "muse-spark-1.3-contributor",
+        "allowAll",
+    );
+    defer std.testing.allocator.free(payload);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"approvalMode\":\"allowAll\"") != null);
+}
+
+test "Muse interrupt uses the priority lane" {
+    const payload = try makeTurnInterruptRequestAlloc(
+        std.testing.allocator,
+        91,
+        "01991b47-0000-7000-8000-000000000002",
+        "session-1",
+        "turn-1",
+    );
+    defer std.testing.allocator.free(payload);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"method\":\"turn/interrupt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"turnId\":\"turn-1\"") != null);
+}
+
+test "Muse approval choice reads object-shaped decisions" {
+    const payload =
+        \\[{"choiceId":"allow_once","decision":{"kind":"approved"},"label":"Allow once","scope":"once"},{"choiceId":"abort","decision":{"kind":"abort"},"label":"Reject","scope":"once"}]
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("allow_once", chooseApprovalChoice(parsed.value.array.items, .approve).?);
+    try std.testing.expectEqualStrings("abort", chooseApprovalChoice(parsed.value.array.items, .deny).?);
+}
+
+test "Muse approval-mode rejection is distinguished from protocol failure" {
+    try std.testing.expect(isApprovalModeRejected("unknown field approvalMode"));
+    try std.testing.expect(!isApprovalModeRejected("session not found"));
 }
 
 test "Muse image MIME types fail visibly for unsupported attachments" {

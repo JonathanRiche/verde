@@ -7150,7 +7150,26 @@ pub const Daemon = struct {
             turn.status = .aborted;
             turn.appendEvent(self.allocator, "aborted", "{}");
         }
+        const provider = turn.request.provider;
+        const project_path = turn.request.cwd orelse turn.request.project_path;
+        const owned_project_path = self.allocator.dupe(u8, project_path) catch null;
+        const owned_thread_id = if (turn.provider_thread_id) |thread_id|
+            self.allocator.dupe(u8, thread_id) catch null
+        else
+            null;
+        const owned_turn_id = if (turn.active_turn_id) |active_turn_id|
+            self.allocator.dupe(u8, active_turn_id) catch null
+        else
+            null;
         turn.mutex.unlock();
+        defer if (owned_project_path) |path| self.allocator.free(path);
+        defer if (owned_thread_id) |thread_id| self.allocator.free(thread_id);
+        defer if (owned_turn_id) |active_turn_id| self.allocator.free(active_turn_id);
+        if (owned_project_path) |path| {
+            if (owned_thread_id) |thread_id| {
+                interruptChatTurnProvider(self.allocator, provider, path, thread_id, owned_turn_id);
+            }
+        }
         return try okValueResponse(self.allocator, id_value, .{ .accepted = true });
     }
 
@@ -14129,6 +14148,32 @@ test "provider launch failures retain only provable typed reasons" {
         providerFailureReasonForError(.grok, error.GrokSignedOut).?,
     );
     try std.testing.expect(providerFailureReasonForError(.codex, error.InvalidDaemonResponse) == null);
+}
+
+fn interruptChatTurnProvider(
+    allocator: std.mem.Allocator,
+    provider: harness.Provider,
+    project_path: []const u8,
+    thread_id: []const u8,
+    turn_id: ?[]const u8,
+) void {
+    var client = send_runner.connectProvider(allocator, provider, project_path, false) catch |err| {
+        log.warn("chat cancel provider connect failed provider={s} err={s}", .{
+            @tagName(provider),
+            @errorName(err),
+        });
+        return;
+    };
+    defer client.deinit();
+    client.interruptThread(.{
+        .thread_id = thread_id,
+        .turn_id = turn_id,
+    }) catch |err| {
+        log.warn("chat cancel provider interrupt failed provider={s} err={s}", .{
+            @tagName(provider),
+            @errorName(err),
+        });
+    };
 }
 
 fn chatTurnThread(daemon: *Daemon, turn: *ChatTurn) void {

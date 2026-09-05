@@ -1370,6 +1370,11 @@ function ComposerPickers(props: { pane: LivePane }) {
                         onClick={() => pickModel(row.provider, row.option.value)}
                       >
                         <span class="block truncate">{row.option.label}</span>
+                        <Show when={row.option.description}>
+                          <span class="mt-0.5 block text-[11px] leading-snug text-[var(--text-subtle)]">
+                            {row.option.description}
+                          </span>
+                        </Show>
                         <Show when={pickerProvider() === 'favorites'}>
                           <span class="mt-0.5 block text-[10px] uppercase tracking-wide text-[var(--text-subtle)]">
                             {PROVIDER_OPTIONS.find((provider) => provider.value === row.provider)?.label ?? row.provider}

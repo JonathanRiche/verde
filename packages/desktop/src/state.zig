@@ -2499,7 +2499,7 @@ fn composerModelOptions(state: *const AppState, provider: Provider) []const Mode
         state.piModelOptionsSnapshot(),
         state.fxModelOptionsSnapshot(),
         state.grokModelOptionsSnapshot(),
-        MUSE_MODEL_OPTIONS[0..],
+        state.museModelOptionsSnapshot(),
     );
 }
 
@@ -2800,9 +2800,13 @@ fn paletteModelPickerLabel(context: ?*anyopaque, index: usize) []const u8 {
 
 fn paletteModelPickerDescription(context: ?*anyopaque, index: usize) []const u8 {
     const state = appStateFromContext(context) orelse return "";
+    const option = modelPickerOptionAt(state, index) orelse return "";
+    if (option.description) |description| {
+        if (description.len > 0) return description;
+    }
     const entry = modelPickerEntryAt(state, index) orelse return "";
     // Rows show the provider under the model name (with its logo rendered by
-    // `leading_on_description`), mirroring the reference picker design.
+    // `leading_on_description`) unless the catalog supplied a blurb.
     return chat_threads.providerLabel(entry.provider);
 }
 
@@ -4381,6 +4385,7 @@ pub const AppState = struct {
     pi_model_options: std.ArrayList(ModelOption),
     fx_model_options: std.ArrayList(ModelOption),
     grok_model_options: std.ArrayList(ModelOption),
+    muse_model_options: std.ArrayList(ModelOption),
     cursor_model_options: std.ArrayList(ModelOption),
     opencode_reasoning_menu: std.ArrayList(OpencodeReasoningMenuRow),
     image_texture_cache: std.StringHashMap(CachedImageTexture),
@@ -4580,6 +4585,7 @@ pub const AppState = struct {
             .pi_model_options = .empty,
             .fx_model_options = .empty,
             .grok_model_options = .empty,
+            .muse_model_options = .empty,
             .cursor_model_options = .empty,
             .opencode_reasoning_menu = .empty,
             .image_texture_cache = std.StringHashMap(CachedImageTexture).init(allocator),
@@ -5444,6 +5450,7 @@ pub const AppState = struct {
     pub const piModelOptionsSnapshot = provider_controller.piModelOptionsSnapshot;
     pub const fxModelOptionsSnapshot = provider_controller.fxModelOptionsSnapshot;
     pub const grokModelOptionsSnapshot = provider_controller.grokModelOptionsSnapshot;
+    pub const museModelOptionsSnapshot = provider_controller.museModelOptionsSnapshot;
     pub const cachedDefaultModelRefForProvider = provider_controller.cachedDefaultModelRefForProvider;
     pub const startOpencodeModelOptionsRefresh = provider_controller.startOpencodeModelOptionsRefresh;
     pub const startCursorModelOptionsRefresh = provider_controller.startCursorModelOptionsRefresh;
@@ -5451,6 +5458,7 @@ pub const AppState = struct {
     pub const startPiModelOptionsRefresh = provider_controller.startPiModelOptionsRefresh;
     pub const startFxModelOptionsRefresh = provider_controller.startFxModelOptionsRefresh;
     pub const startGrokModelOptionsRefresh = provider_controller.startGrokModelOptionsRefresh;
+    pub const startMuseModelOptionsRefresh = provider_controller.startMuseModelOptionsRefresh;
     pub const startProviderReadinessCheck = provider_controller.startProviderReadinessCheck;
     pub const completeMcpOnboarding = provider_controller.completeMcpOnboarding;
     pub const pollProviderReadiness = provider_controller.pollProviderReadiness;
@@ -5464,6 +5472,7 @@ pub const AppState = struct {
     pub const refreshPiModelOptionsCacheAsync = provider_controller.refreshPiModelOptionsCacheAsync;
     pub const refreshFxModelOptionsCacheAsync = provider_controller.refreshFxModelOptionsCacheAsync;
     pub const refreshGrokModelOptionsCacheAsync = provider_controller.refreshGrokModelOptionsCacheAsync;
+    pub const refreshMuseModelOptionsCacheAsync = provider_controller.refreshMuseModelOptionsCacheAsync;
     pub const duplicateReasoningVariantKeys = provider_controller.duplicateReasoningVariantKeys;
     pub const populateOpencodeModelOptions = provider_controller.populateOpencodeModelOptions;
     pub const opencodeModelIdSuffixFromRef = provider_controller.opencodeModelIdSuffixFromRef;
@@ -5474,6 +5483,7 @@ pub const AppState = struct {
     pub const populatePiModelOptions = provider_controller.populatePiModelOptions;
     pub const populateFxModelOptions = provider_controller.populateFxModelOptions;
     pub const populateGrokModelOptions = provider_controller.populateGrokModelOptions;
+    pub const populateMuseModelOptions = provider_controller.populateMuseModelOptions;
     pub const asciiCaseInsensitiveCompare = provider_controller.asciiCaseInsensitiveCompare;
     pub const normalizeCurrentOpencodeThreadModel = provider_controller.normalizeCurrentOpencodeThreadModel;
     pub const opencodeModelOptionForRef = provider_controller.opencodeModelOptionForRef;
@@ -5500,6 +5510,8 @@ pub const AppState = struct {
     pub const clearFxModelOptions = provider_controller.clearFxModelOptions;
     pub const clearDynamicGrokModelOptions = provider_controller.clearDynamicGrokModelOptions;
     pub const clearGrokModelOptions = provider_controller.clearGrokModelOptions;
+    pub const clearDynamicMuseModelOptions = provider_controller.clearDynamicMuseModelOptions;
+    pub const clearMuseModelOptions = provider_controller.clearMuseModelOptions;
     pub const loadCursorModelOptionsDiskCache = provider_controller.loadCursorModelOptionsDiskCache;
     pub const saveCursorModelOptionsDiskCache = provider_controller.saveCursorModelOptionsDiskCache;
 
@@ -8647,6 +8659,19 @@ pub const AppState = struct {
                 if (index < options.len) return std.mem.sliceTo(options[index].label, 0);
             }
         }
+        if (thread.provider == .muse) {
+            // Muse's top MSP tier is `ultra`; picker rows say Ultra while the
+            // persisted effort tag remains `max`.
+            if (thread.reasoning_effort) |effort| {
+                for (MUSE_REASONING_OPTIONS) |option| {
+                    if (option.value) |value| {
+                        if (value == effort) return option.label;
+                    }
+                }
+            } else {
+                return "Default";
+            }
+        }
         // Menu-independent for the other providers: the shared reasoning menu
         // tracks the focused thread only, so unfocused pane previews must
         // label from the thread's own fields. Matches the menu rows' labels
@@ -11596,6 +11621,9 @@ pub const AppState = struct {
         if (self.grok_model_options.items.len == 0) {
             self.refreshGrokModelOptionsCacheAsync();
         }
+        if (self.muse_model_options.items.len == 0) {
+            self.refreshMuseModelOptionsCacheAsync();
+        }
         self.closeRunConfigPopover();
         self.closePaletteDirectoryPicker();
         self.closePaletteRuntimePicker();
@@ -13522,6 +13550,8 @@ pub const AppState = struct {
         runtime_log.diagnostic("AppState.deinit fx model cache finished", .{});
         self.finishGrokModelCacheThread();
         runtime_log.diagnostic("AppState.deinit grok model cache finished", .{});
+        self.finishMuseModelCacheThread();
+        runtime_log.diagnostic("AppState.deinit muse model cache finished", .{});
         self.finishProviderReadinessThread();
         runtime_log.diagnostic("AppState.deinit provider readiness finished", .{});
         self.finishProviderThreadOperation();
@@ -13595,6 +13625,7 @@ pub const AppState = struct {
         self.clearPiModelOptions();
         self.clearFxModelOptions();
         self.clearGrokModelOptions();
+        self.clearMuseModelOptions();
         self.opencode_reasoning_menu.deinit(self.allocator);
         self.opencode_model_options.deinit(self.allocator);
         self.claude_model_options.deinit(self.allocator);
@@ -13602,6 +13633,7 @@ pub const AppState = struct {
         self.pi_model_options.deinit(self.allocator);
         self.fx_model_options.deinit(self.allocator);
         self.grok_model_options.deinit(self.allocator);
+        self.muse_model_options.deinit(self.allocator);
         if (self.settings_controller.chat_title_model) |model| self.allocator.free(model);
         if (self.settings_controller.new_chat_model) |model| self.allocator.free(model);
         self.app_config.deinit(self.allocator);
@@ -13721,6 +13753,7 @@ pub const AppState = struct {
     pub const pollPiModelOptionsCache = provider_controller.pollPiModelOptionsCache;
     pub const pollFxModelOptionsCache = provider_controller.pollFxModelOptionsCache;
     pub const pollGrokModelOptionsCache = provider_controller.pollGrokModelOptionsCache;
+    pub const pollMuseModelOptionsCache = provider_controller.pollMuseModelOptionsCache;
 
     /// Frame-loop entry point (main.zig calls this every frame): starts the
     /// M5-P4 change-cursor loop lazily (AppState.init returns by value, so
@@ -14210,6 +14243,7 @@ pub const AppState = struct {
     pub const finishPiModelCacheThread = chat_controller.finishPiModelCacheThread;
     pub const finishFxModelCacheThread = chat_controller.finishFxModelCacheThread;
     pub const finishGrokModelCacheThread = chat_controller.finishGrokModelCacheThread;
+    pub const finishMuseModelCacheThread = chat_controller.finishMuseModelCacheThread;
     pub const finishProviderReadinessThread = chat_controller.finishProviderReadinessThread;
     pub const finishAllSendThreads = chat_controller.finishAllSendThreads;
     pub const finishAllTitleGenerationThreads = chat_controller.finishAllTitleGenerationThreads;
@@ -16001,6 +16035,7 @@ test "GUI new-chat defaults apply configured provider model and reasoning" {
     state.pi_model_options = .empty;
     state.fx_model_options = .empty;
     state.grok_model_options = .empty;
+    state.muse_model_options = .empty;
     state.cursor_model_options = .empty;
     state.runtime_picker_profiles = .empty;
     state.workspace_runtime_defaults = null;
@@ -16128,6 +16163,7 @@ test "workspace runtime default affects future drafts while each thread can over
     state.pi_model_options = .empty;
     state.fx_model_options = .empty;
     state.grok_model_options = .empty;
+    state.muse_model_options = .empty;
     state.cursor_model_options = .empty;
     state.runtime_picker_profiles = .empty;
 
@@ -16331,6 +16367,7 @@ test "provider-aware chat creation scopes mutation and rejects invalid models" {
     state.pi_model_options = .empty;
     state.fx_model_options = .empty;
     state.grok_model_options = .empty;
+    state.muse_model_options = .empty;
     state.cursor_model_options = .empty;
     state.lifecycle.dirty = false;
     state.lifecycle.last_dirty_at_ms = 0;
