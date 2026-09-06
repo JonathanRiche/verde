@@ -2930,6 +2930,7 @@ fn renderTranscriptContent(state: *app_state.AppState, rect: palette.Rect, layou
         }
     }
     if (active_geometry) state.transcript_controller.palette_scroll_y = scroll_y;
+    if (active_geometry) logTranscriptStreamSettled(thread, has_pending_stream, content_height, max_scroll, scroll_y, saved_scroll, follow_tail, column.h);
 
     var content_y = renderCommittedTranscript(state, thread, column, scroll_y, clip);
 
@@ -3593,6 +3594,36 @@ fn logTranscriptBlankFrameDetail(thread: anytype, reason: []const u8, scroll_y: 
             thread.transcript_layout_committed_height,
             thread.transcript_layout_requested_height,
             thread.transcript_layout_visible_ready,
+        },
+    );
+}
+
+var transcript_stream_was_pending: bool = false;
+
+/// Diagnostic: the first idle frame after a stream, with the geometry the
+/// pane resolved for it (chasing "reply missing after the commit").
+fn logTranscriptStreamSettled(thread: anytype, has_pending_stream: bool, content_height: f32, max_scroll: f32, scroll_y: f32, saved_scroll: ?f32, follow_tail: bool, viewport_h: f32) void {
+    defer transcript_stream_was_pending = has_pending_stream;
+    if (has_pending_stream or !transcript_stream_was_pending) return;
+    const last_role: []const u8 = if (thread.messages.items.len > 0) @tagName(thread.messages.items[thread.messages.items.len - 1].role) else "none";
+    log.info(
+        "transcript stream settled thread={s} messages={d} last_role={s} content_height={d:.1} max_scroll={d:.1} scroll_y={d:.1} saved_scroll={?d:.1} follow_tail={} viewport_h={d:.1} layout_valid={} layout_first={d} layout_count={d} layout_items={d} committed_height={d:.1} persisted_offset={d}",
+        .{
+            thread.local_thread_id,
+            thread.messages.items.len,
+            last_role,
+            content_height,
+            max_scroll,
+            scroll_y,
+            saved_scroll,
+            follow_tail,
+            viewport_h,
+            thread.transcript_layout_valid,
+            thread.transcript_layout_first_message_index,
+            thread.transcript_layout_message_count,
+            thread.transcript_layout_items.items.len,
+            thread.transcript_layout_committed_height,
+            thread.persisted_message_offset,
         },
     );
 }
