@@ -14863,6 +14863,7 @@ pub const AppState = struct {
     pub const finishAllTitleGenerationThreads = chat_controller.finishAllTitleGenerationThreads;
     pub const prepareThreadSendForShutdown = chat_controller.prepareThreadSendForShutdown;
     pub const hasPendingStream = chat_controller.hasPendingStream;
+    pub const streamRevealAnimating = chat_controller.streamRevealAnimating;
     pub const hasAnyPendingSends = chat_controller.hasAnyPendingSends;
     pub const pendingSendCount = chat_controller.pendingSendCount;
     pub const isPickerPending = chat_controller.isPickerPending;

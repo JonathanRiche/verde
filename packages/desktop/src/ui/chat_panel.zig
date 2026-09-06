@@ -1443,7 +1443,7 @@ fn transcriptMarkdownBubbleHit(
         pi += 1;
     }
 
-    const stream_text: []const u8 = send_state.partial_text.items;
+    const stream_text: []const u8 = send_state.streamRevealedText();
     const body: []const u8 = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
     const stream_plain = false; // item 4: stream renders as markdown in place
     const assistant_h = transcriptMessageHeightStream(null, null, body, .assistant, column.w, "", stream_plain, stream_text.len > 0);
@@ -1511,7 +1511,7 @@ fn transcriptMarkdownBubbleLinkHit(
         pi += 1;
     }
 
-    const stream_text: []const u8 = send_state.partial_text.items;
+    const stream_text: []const u8 = send_state.streamRevealedText();
     const body: []const u8 = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
     const stream_plain = false; // item 4: stream renders as markdown in place
     const assistant_h = transcriptMessageHeightStream(null, null, body, .assistant, column.w, "", stream_plain, stream_text.len > 0);
@@ -1881,7 +1881,7 @@ fn transcriptMarkdownMessageSnapshot(state: *app_state.AppState, message_index: 
     }
     if (pi != send_state.pending_events.items.len) return null;
 
-    const stream_text: []const u8 = send_state.partial_text.items;
+    const stream_text: []const u8 = send_state.streamRevealedText();
     const body: []const u8 = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
     const body_trim = std.mem.trim(u8, body, "\n\r\t ");
     const inner = @max(column.w - theme.scaledUi(28.0), theme.scaledUi(80.0));
@@ -2404,6 +2404,77 @@ fn shouldReleaseTranscriptAutoFollowSuspension(manual_scroll_requested: bool, ma
     return manual_scroll_requested and manual_scroll_toward_tail and transcriptScrollNearBottom(scroll_y, max_scroll);
 }
 
+/// Tail-follow easing while a reply streams. The bubble grows a line at a
+/// time, and snapping the viewport to each new max scroll makes the column
+/// hop; instead the shown offset approaches the tail with a short lag. Only
+/// the real (active-geometry) pass owns the slot, only while streaming, and
+/// the slot is dropped as soon as nothing streams so idle frames are unaffected.
+const TAIL_FOLLOW_TAU_MS: f32 = 90.0;
+
+const TailFollowSlot = struct {
+    pane_key: u64,
+    y: f32,
+    target: f32,
+    last_ms: i64,
+};
+
+var tail_follow_slot: ?TailFollowSlot = null;
+
+fn tailFollowPaneKey(pane_id: ?app_state.WorkspacePaneId) u64 {
+    return if (pane_id) |id| @as(u64, id) + 1 else 0;
+}
+
+fn approachTailFollow(y: f32, target: f32, dt_ms: i64) f32 {
+    const gap = target - y;
+    if (gap <= 0.5) return target;
+    const dt: f32 = @floatFromInt(std.math.clamp(dt_ms, 0, 100));
+    return y + gap * (1.0 - @exp(-dt / TAIL_FOLLOW_TAU_MS));
+}
+
+fn tailFollowScrollY(
+    state: *app_state.AppState,
+    pane_id: ?app_state.WorkspacePaneId,
+    max_scroll: f32,
+    viewport_h: f32,
+    has_pending_stream: bool,
+    active_geometry: bool,
+) f32 {
+    if (!active_geometry) return max_scroll;
+    if (!has_pending_stream or state.app_config.reduced_motion) {
+        tail_follow_slot = null;
+        return max_scroll;
+    }
+    const now_ms = monotonicMs();
+    const key = tailFollowPaneKey(pane_id);
+    var slot = tail_follow_slot orelse TailFollowSlot{ .pane_key = key, .y = max_scroll, .target = max_scroll, .last_ms = now_ms };
+    // Snap on a pane change, when the content shrank, or when the tail ran
+    // more than a viewport ahead (cold layout estimates settling).
+    if (slot.pane_key != key or slot.y > max_scroll or max_scroll - slot.y > viewport_h) {
+        slot = .{ .pane_key = key, .y = max_scroll, .target = max_scroll, .last_ms = now_ms };
+    }
+    const dt_ms = now_ms - slot.last_ms;
+    slot.last_ms = now_ms;
+    slot.target = max_scroll;
+    slot.y = approachTailFollow(slot.y, max_scroll, dt_ms);
+    tail_follow_slot = slot;
+    return slot.y;
+}
+
+pub fn isTailFollowAnimating() bool {
+    const slot = tail_follow_slot orelse return false;
+    return slot.target - slot.y > 0.5;
+}
+
+test "tail follow eases toward a growing tail and settles" {
+    try std.testing.expectApproxEqAbs(@as(f32, 100.4), approachTailFollow(100.0, 100.4, 16), 0.001);
+    const eased = approachTailFollow(100.0, 200.0, 16);
+    try std.testing.expect(eased > 100.0 and eased < 200.0);
+    var y: f32 = 0.0;
+    var frame: usize = 0;
+    while (frame < 60) : (frame += 1) y = approachTailFollow(y, 300.0, 16);
+    try std.testing.expectApproxEqAbs(@as(f32, 300.0), y, 0.001);
+}
+
 fn transcriptShouldFollowTail(saved_scroll: ?f32, manual_scroll_requested: bool) bool {
     // The pane-local semantic state is authoritative. A missing offset means
     // tail-follow on every frame, including invalid/rebuilding layouts; the
@@ -2828,7 +2899,7 @@ fn renderTranscriptContent(state: *app_state.AppState, rect: palette.Rect, layou
         manual_scroll_requested,
     );
     if (follow_tail) {
-        scroll_y = max_scroll;
+        scroll_y = tailFollowScrollY(state, pane_id, max_scroll, column.h, has_pending_stream, active_geometry);
     }
     if (!thread.transcript_layout_valid and !follow_tail) {
         // Until an earlier region is ready, clamp to the exact suffix rather
@@ -3817,7 +3888,7 @@ fn pendingStreamBodyHeight(
     column_width: f32,
     variant_hash: u64,
 ) f32 {
-    const stream_text: []const u8 = send_state.partial_text.items;
+    const stream_text: []const u8 = send_state.streamRevealedText();
     const body: []const u8 = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
     const key = pendingRowHeightKey(
         PENDING_STREAM_HEIGHT_SEED,
@@ -3960,7 +4031,7 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
         formatPendingCommandLabel(&status_buf, send_state.started_at_ms)
     else
         formatPendingWorkingLabel(&status_buf, send_state.started_at_ms, thinkingLabelShown(send_state.thinking, send_state.thinking_cleared_at_ms, monotonicMs()));
-    const stream_text: []const u8 = send_state.partial_text.items;
+    const stream_text: []const u8 = send_state.streamRevealedText();
     const body: []const u8 = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
     const stream_plain = false; // item 4: stream renders as markdown in place
     const stream_msg_idx = base_message_index + send_state.pending_events.items.len;

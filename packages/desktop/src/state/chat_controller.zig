@@ -63,6 +63,15 @@ const CODEX_BACKGROUND_TASK_POLL_MAX_MS: i64 = 60_000;
 // Daemon tailing is synchronous IPC. Bounding it to Verde's active frame tier
 // preserves every display opportunity while avoiding duplicate RPCs in event bursts.
 const DAEMON_CHAT_POLL_INTERVAL_MS: i64 = 16;
+/// Streamed-text reveal pacing. Each frame reveals a fraction of the unshown
+/// backlog (first-order lag with this time constant) with a floor so the last
+/// characters do not trickle; a backlog past the cap shows at once (reconnect
+/// catch-up, pasted-size chunks). Completion consumes the whole text at
+/// once: the send lifecycle (refresh guards, stop/steer, adoption) keys on
+/// the status, so the reveal never holds a completed turn open.
+const STREAM_REVEAL_TAU_MS: f32 = 140.0;
+const STREAM_REVEAL_MIN_CHARS_PER_MS: f32 = 0.09;
+const STREAM_REVEAL_MAX_BACKLOG: usize = 4096;
 // Time budget for that synchronous tail: the next poll waits at least
 // FACTOR× the last round trip's measured cost, so a slow daemon consumes at
 // most ~1/FACTOR of the render thread instead of stalling every frame.
@@ -3870,6 +3879,7 @@ fn armSendStateForDaemonTurn(self: anytype, thread: *ChatThread, turn_id: []u8, 
     send_state.thinking = false;
     send_state.thinking_cleared_at_ms = 0;
     send_state.partial_text.clearRetainingCapacity();
+    resetStreamRevealLocked(send_state);
     freePendingTimelineEventsLocked(page_alloc, &send_state.pending_events);
     freePendingDiffFilesLocked(page_alloc, &send_state.pending_diff_files);
     send_state.pending_diff_has_turn_snapshot = false;
@@ -6566,6 +6576,89 @@ pub fn parseToolCallStatus(value: []const u8) provider_types.ToolCallStatus {
     return .unknown;
 }
 
+fn resetStreamRevealLocked(send_state: *SendState) void {
+    send_state.reveal_len = 0;
+    send_state.reveal_last_ms = 0;
+}
+
+/// Next reveal length: a fraction of the backlog per elapsed time with a
+/// per-millisecond floor, whole text once the backlog passes the cap.
+fn streamRevealStep(revealed: usize, total: usize, dt_ms: i64, tau_ms: f32) usize {
+    if (revealed >= total) return total;
+    const backlog = total - revealed;
+    if (backlog > STREAM_REVEAL_MAX_BACKLOG) return total;
+    const dt: f32 = @floatFromInt(std.math.clamp(dt_ms, 0, 100));
+    const proportional = @as(f32, @floatFromInt(backlog)) * (1.0 - @exp(-dt / tau_ms));
+    const floor = STREAM_REVEAL_MIN_CHARS_PER_MS * dt;
+    const step: usize = @intFromFloat(@ceil(@max(proportional, floor)));
+    return @min(total, revealed + @max(step, 1));
+}
+
+/// Move `index` forward past UTF-8 continuation bytes so a reveal never
+/// splits a multi-byte character.
+fn utf8BoundaryAtOrAfter(text: []const u8, index: usize) usize {
+    var i = index;
+    while (i < text.len and (text[i] & 0xC0) == 0x80) : (i += 1) {}
+    return i;
+}
+
+/// Advance the per-frame reveal. Returns true when the shown text changed.
+fn advanceStreamRevealLocked(send_state: *SendState, now_ms: i64, tau_ms: f32) bool {
+    const text = send_state.partial_text.items;
+    if (send_state.local_command) {
+        const changed = send_state.reveal_len != text.len;
+        send_state.reveal_len = text.len;
+        return changed;
+    }
+    // Text flushed into a timeline row mid-turn: restart from the new tail.
+    if (send_state.reveal_len > text.len) send_state.reveal_len = text.len;
+    const dt_ms: i64 = if (send_state.reveal_last_ms == 0) DAEMON_CHAT_POLL_INTERVAL_MS else now_ms - send_state.reveal_last_ms;
+    send_state.reveal_last_ms = now_ms;
+    if (send_state.reveal_len == text.len) return false;
+    const next = utf8BoundaryAtOrAfter(text, streamRevealStep(send_state.reveal_len, text.len, dt_ms, tau_ms));
+    if (next == send_state.reveal_len) return false;
+    send_state.reveal_len = next;
+    return true;
+}
+
+/// Continuous-frame signal: the current thread still has streamed text to
+/// reveal. False whenever nothing is streaming, so idle frames stay zero.
+pub fn streamRevealAnimating(self: anytype) bool {
+    if (self.project_controller.projects.items.len == 0) return false;
+    const send_state = self.currentThread().send_state;
+    if (!send_state.mutex.tryLock()) return false;
+    defer send_state.mutex.unlock();
+    return send_state.status == .pending and send_state.streamRevealPending();
+}
+
+test "stream reveal paces the backlog with a floor and a catch-up cap" {
+    const step = streamRevealStep(0, 1000, 16, 140.0);
+    try std.testing.expect(step >= 100 and step <= 120);
+    try std.testing.expectEqual(@as(usize, 2), streamRevealStep(0, 3, 16, 140.0));
+    try std.testing.expectEqual(@as(usize, 3), streamRevealStep(2, 3, 16, 140.0));
+    try std.testing.expectEqual(@as(usize, 3), streamRevealStep(3, 3, 16, 140.0));
+    try std.testing.expectEqual(@as(usize, 5000), streamRevealStep(0, 5000, 16, 140.0));
+    try std.testing.expectEqual(@as(usize, 3), utf8BoundaryAtOrAfter("\xE2\x80\x94x", 1));
+    try std.testing.expectEqual(@as(usize, 1), utf8BoundaryAtOrAfter("ab", 1));
+}
+
+test "stream reveal advances per frame and clamps after a flush" {
+    var send_state: SendState = .{};
+    defer send_state.partial_text.deinit(std.heap.page_allocator);
+    try send_state.partial_text.appendSlice(std.heap.page_allocator, "hello streamed world");
+    send_state.status = .pending;
+    try std.testing.expect(advanceStreamRevealLocked(&send_state, 1_000, STREAM_REVEAL_TAU_MS));
+    try std.testing.expect(send_state.reveal_len > 0 and send_state.reveal_len < send_state.partial_text.items.len);
+    try std.testing.expectEqualStrings(send_state.partial_text.items[0..send_state.reveal_len], send_state.streamRevealedText());
+    send_state.partial_text.clearRetainingCapacity();
+    try std.testing.expect(!advanceStreamRevealLocked(&send_state, 1_016, STREAM_REVEAL_TAU_MS));
+    try std.testing.expectEqual(@as(usize, 0), send_state.reveal_len);
+    send_state.local_command = true;
+    try send_state.partial_text.appendSlice(std.heap.page_allocator, "tail text");
+    try std.testing.expect(advanceStreamRevealLocked(&send_state, 4_000, STREAM_REVEAL_TAU_MS));
+    try std.testing.expectEqual(send_state.partial_text.items.len, send_state.reveal_len);
+}
+
 pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, thread: *ChatThread) bool {
     thread.send_state.mutex.lock();
     const command_pending = thread.send_state.local_command;
@@ -6609,6 +6702,7 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
                 send_state.polled_ui_revision = send_state.ui_revision;
                 stream_changed = true;
             }
+            if (advanceStreamRevealLocked(send_state, monotonicMs(), STREAM_REVEAL_TAU_MS)) stream_changed = true;
             // Force a repaint exactly when the visible seconds in the
             // "Working - mm:ss" label would change. Without this, the
             // main loop sleeps in SDL_WaitEventTimeout(IDLE) while a
@@ -6636,6 +6730,7 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
                 send_state.active_turn_id = null;
             }
             flushPendingAssistantTextLocked(send_state, std.heap.page_allocator);
+            resetStreamRevealLocked(send_state);
             completed_events = send_state.pending_events;
             send_state.pending_events = .empty;
             completed_diff_files = send_state.pending_diff_files;
@@ -6666,6 +6761,7 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
                 send_state.active_turn_id = null;
             }
             flushPendingAssistantTextLocked(send_state, std.heap.page_allocator);
+            resetStreamRevealLocked(send_state);
             completed_events = send_state.pending_events;
             send_state.pending_events = .empty;
             completed_diff_files = send_state.pending_diff_files;
