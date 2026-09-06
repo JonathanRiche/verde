@@ -740,6 +740,7 @@ fn surfacesResponse(allocator: std.mem.Allocator, id_value: std.json.Value, stat
     try s.objectField("surfaces");
     try s.beginArray();
     for (state.surface_controller.surfaces.items) |*surface| try writeSurface(&s, state, surface);
+    try writeLiveAgentSurfaceProjections(&s, state);
     try s.endArray();
     try s.endObject();
     try s.endObject();
@@ -3632,6 +3633,77 @@ fn writeSurface(s: *std.json.Stringify, state: *const app_state.AppState, surfac
     if (surface.last_event_body) |value| try s.write(value) else try s.write(null);
     try s.objectField("last_event_at_ms");
     try s.write(surface.last_event_at_ms);
+    try s.endObject();
+}
+
+/// Agent-TUI terminal panes have no surface row until their first hook event
+/// arrives. OpenCode 2 reports through the shared background service, which
+/// cannot know a pane's session id before that first notify, so detached
+/// clients would never discover the pane. Project live-classified agent docks
+/// (no stored surface yet) into the list; the first notify then claims the
+/// durable row keyed by the same session id.
+fn writeLiveAgentSurfaceProjections(s: *std.json.Stringify, state: *app_state.AppState) !void {
+    for (state.project_controller.projects.items, 0..) |*project, project_index| {
+        for (project.terminal_docks.items) |*entry| {
+            try writeLiveAgentSurfaceProjection(s, state, project_index, project, entry.id, &entry.dock);
+        }
+        try writeLiveAgentSurfaceProjection(s, state, project_index, project, 0, &project.terminal_dock);
+    }
+}
+
+fn writeLiveAgentSurfaceProjection(
+    s: *std.json.Stringify,
+    state: *app_state.AppState,
+    project_index: usize,
+    project: anytype,
+    dock_id: u32,
+    dock: anytype,
+) !void {
+    const provider = state.workspaceAgentTuiProvider(project_index, dock_id) orelse return;
+    const session_id = dock.activeSessionId() orelse return;
+    if (state.surfaceBySessionIdConst(session_id) != null) return;
+    const pane_id = project.workspace_layout.visibleTerminalPaneIdForDock(dock_id);
+    try s.beginObject();
+    try s.objectField("session_id");
+    try s.write(session_id);
+    try s.objectField("workspace_id");
+    try s.write(project.id);
+    try s.objectField("workspace_path");
+    try s.write(project.path);
+    try s.objectField("dock_id");
+    try s.write(dock_id);
+    try s.objectField("pane_id");
+    if (pane_id) |value| try s.write(value) else try s.write(null);
+    try s.objectField("provider");
+    try s.write(@tagName(provider));
+    // Marks rows that exist only as live projections; the OpenCode service
+    // plugin claims these on first notify while ignoring stale stored rows.
+    try s.objectField("live");
+    try s.write(true);
+    try s.objectField("provider_thread_id");
+    try s.write(null);
+    try s.objectField("title");
+    try s.write("");
+    try s.objectField("status");
+    try s.write("idle");
+    try s.objectField("display_status");
+    try s.write("idle");
+    try s.objectField("completion_pending");
+    try s.write(false);
+    try s.objectField("completed_at_ms");
+    try s.write(null);
+    try s.objectField("progress");
+    try s.write(null);
+    try s.objectField("attention");
+    try s.write(false);
+    try s.objectField("unread_count");
+    try s.write(@as(u32, 0));
+    try s.objectField("last_event_title");
+    try s.write(null);
+    try s.objectField("last_event_body");
+    try s.write(null);
+    try s.objectField("last_event_at_ms");
+    try s.write(@as(i64, 0));
     try s.endObject();
 }
 

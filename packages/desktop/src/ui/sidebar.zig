@@ -2739,16 +2739,17 @@ pub fn queuePaletteProviderGlyph(state: *runtime.AppState, provider: Provider, x
     }, clip);
 }
 
-pub fn queuePaletteAgentTuiProviderGlyph(state: *runtime.AppState, provider: native_state.AgentTuiProvider, x: f32, center_y: f32, clip: palette.Rect) void {
+pub fn queuePaletteAgentTuiProviderGlyph(state: *runtime.AppState, provider: native_state.AgentTuiHistoryProvider, x: f32, center_y: f32, clip: palette.Rect) void {
     const terminal_provider: TerminalAgentProvider = switch (provider) {
         .codex => .codex,
         .opencode => .opencode,
         .claude => .claude,
         .cursor => .cursor,
+        .pi => .pi,
+        .fx => .fx,
         .grok => .grok,
         .amp => .amp,
         .muse => .muse,
-        .other => return,
     };
     queuePaletteAgentTerminalGlyph(state, terminal_provider, x, center_y, theme.COLOR_WHITE, clip);
 }
@@ -2850,7 +2851,7 @@ fn queuePaletteProviderGlyphInRect(state: *runtime.AppState, provider: TerminalA
 fn providerFromComm(comm: []const u8) ?TerminalAgentProvider {
     if (std.mem.eql(u8, comm, "claude")) return .claude;
     if (std.mem.eql(u8, comm, "codex")) return .codex;
-    if (std.mem.eql(u8, comm, "opencode")) return .opencode;
+    if (std.mem.eql(u8, comm, "opencode") or std.mem.eql(u8, comm, "opencode2")) return .opencode;
     if (std.mem.startsWith(u8, comm, "cursor")) return .cursor;
     if (std.mem.eql(u8, comm, "agent")) return .cursor;
     if (std.mem.eql(u8, comm, "grok")) return .grok;
