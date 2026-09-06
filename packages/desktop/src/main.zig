@@ -1725,6 +1725,10 @@ fn activeContinuousFrames(state: *AppState) bool {
         workspace_panes_ui.isScrollAnimating() or
         // Tiled/zoomed pane rects ease for ~180ms after a layout change.
         workspace_panes_ui.isPaneMotionAnimating() or
+        // Streamed reply text reveals a few characters per frame; the
+        // tail-follow scroll eases behind it. Both are false when idle.
+        state.streamRevealAnimating() or
+        chat_panel_ui.isTailFollowAnimating() or
         ui_layout.isSidebarAnimating() or
         // Run-config stepper thumbs slide for ~160ms after a selection.
         state.runConfigStepperAnimating() or

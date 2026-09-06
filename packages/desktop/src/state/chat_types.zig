@@ -1126,6 +1126,13 @@ pub const SendState = struct {
     /// GUI does not spin forever after a mid-turn daemon crash/restart.
     daemon_tail_fail_count: u8 = 0,
     partial_text: std.ArrayListUnmanaged(u8) = .empty,
+    /// Bytes of `partial_text` the pane currently shows. Deltas arrive in
+    /// bursts; the reveal advances once per frame at a pace that tracks the
+    /// backlog so streamed text flows steadily instead of lumping. Guarded by
+    /// `mutex`.
+    reveal_len: usize = 0,
+    reveal_last_ms: i64 = 0,
+
     /// Memoized measured height of the in-flight streamed assistant body.
     /// `partial_text` is append-only within a turn, so the paired key (length,
     /// width, variant, turn identity) fully discriminates. Guarded by `mutex`;
@@ -1171,6 +1178,15 @@ pub const SendState = struct {
     local_command_cwd: ?[]u8 = null,
     local_command_shell: ?[]u8 = null,
     active_local_child: ?*platform_process.OwnedChild = null,
+
+    pub fn streamRevealedText(self: *const SendState) []const u8 {
+        const total = self.partial_text.items.len;
+        return self.partial_text.items[0..@min(self.reveal_len, total)];
+    }
+
+    pub fn streamRevealPending(self: *const SendState) bool {
+        return !self.local_command and self.reveal_len < self.partial_text.items.len;
+    }
 };
 pub const TitleGenerationStatus = enum {
     idle,
