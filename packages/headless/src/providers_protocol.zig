@@ -10,6 +10,7 @@ const provider_types = @import("provider_types.zig");
 pub const METHOD_PROVIDER_MODELS_LIST: []const u8 = "provider.models.list";
 pub const METHOD_PROVIDER_AUTH_STATUS: []const u8 = "provider.auth.status";
 pub const METHOD_PROVIDER_THREADS_LIST: []const u8 = "provider.threads.list";
+pub const METHOD_PROVIDER_THREAD_SYNC: []const u8 = "provider.thread.sync";
 pub const METHOD_PROVIDER_THREAD_READ: []const u8 = "provider.thread.read";
 pub const METHOD_PROVIDER_THREAD_INTERRUPT: []const u8 = "provider.thread.interrupt";
 pub const METHOD_PROVIDER_THREAD_STEER: []const u8 = "provider.thread.steer";
@@ -204,6 +205,13 @@ pub const ThreadReadRequest = struct {
     provider: provider_types.Provider,
     project_path: []const u8,
     thread_id: []const u8,
+};
+
+/// Replace an existing local thread from its provider-owned history.
+pub const ThreadSyncRequest = struct {
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
+    provider_thread_id: []const u8,
 };
 
 pub const ThreadReadResult = struct {

@@ -236,6 +236,8 @@ pub fn requiredScopeMaskForRpc(method: []const u8) ?u16 {
         std.mem.eql(u8, method, "chat.turn.consume") or
         std.mem.eql(u8, method, "chat.turn.record") or
         std.mem.eql(u8, method, "chat.thread.upsert") or
+        std.mem.eql(u8, method, "chat.thread.close") or
+        std.mem.eql(u8, method, "provider.thread.sync") or
         std.mem.eql(u8, method, "chat.draft.set") or
         std.mem.eql(u8, method, "chat.message.append") or
         std.mem.eql(u8, method, "surface.upsert") or
@@ -698,4 +700,8 @@ test "paired RPC scope policy is exact and fails closed" {
     try std.testing.expect(requiredScopeMaskForRpc("process.start") == null);
     try std.testing.expect(requiredScopeMaskForRpc("future.method") == null);
     try std.testing.expect(requiredScopeMaskForRpc(METHOD_DAEMON_DEVICE_AUTHORIZE) == null);
+}
+
+test "thread sync requires chat write authority" {
+    try std.testing.expectEqual(scopeBit(.chat_write), requiredScopeMaskForRpc("provider.thread.sync").?);
 }
