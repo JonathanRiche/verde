@@ -109,6 +109,87 @@ var attention_scroll_y: f32 = 0.0;
 var attention_max_scroll_y: f32 = 0.0;
 var attention_clip: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
 
+// Item 6: eased ACTIVE cluster geometry. Rows slide to their new sort
+// position and the cluster viewport height eases, so a pane entering or
+// leaving the cluster glides the tree instead of yanking it a row height.
+// Only frames after a change cost anything: `attention_motion_animating`
+// is re-derived every sidebar pass and cleared once everything settles.
+const ActiveRowSlot = struct {
+    project_index: usize,
+    pane_id: runtime.WorkspacePaneId,
+    /// Shown y offset (px) relative to the top of the row list content.
+    y: f32,
+    seen: bool,
+};
+const ATTENTION_MOTION_SETTLE_PX: f32 = 0.5;
+var active_row_slots: [palette_hits.len]ActiveRowSlot = undefined;
+var active_row_slot_count: usize = 0;
+var attention_anim_viewport_h: f32 = -1.0;
+var attention_anim_last_ms: i64 = 0;
+var attention_motion_animating: bool = false;
+
+/// True while ACTIVE rows or the cluster height are still easing; polled by
+/// the frame pacer through `layout.isSidebarAnimating`.
+pub fn isAttentionMotionAnimating() bool {
+    return attention_motion_animating;
+}
+
+/// Per-frame easing step in 0..1 from the time since the previous sidebar
+/// pass; 1.0 snaps (first frame, or reduced motion collapses to ~80ms).
+fn attentionMotionStep(state: *const runtime.AppState) f32 {
+    const now_ms: i64 = @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
+    const first = attention_anim_last_ms == 0;
+    const dt_ms = @max(now_ms - attention_anim_last_ms, 0);
+    attention_anim_last_ms = now_ms;
+    if (first) return 1.0;
+    const duration_ms = theme.motionDurationMs(state.app_config.reduced_motion, theme.MOTION_BASE_MS);
+    if (duration_ms <= 0) return 1.0;
+    return theme.easeOutCubic(theme.clampf(@as(f32, @floatFromInt(dt_ms)) / @as(f32, @floatFromInt(duration_ms)), 0.0, 1.0));
+}
+
+fn approachEased(current: f32, target: f32, t: f32) f32 {
+    const next = current + (target - current) * t;
+    return if (@abs(next - target) <= ATTENTION_MOTION_SETTLE_PX) target else next;
+}
+
+/// Eases the cluster viewport toward `target_h`; a collapse to zero still
+/// eases so the tree slides up rather than jumping when the last row leaves.
+fn easedAttentionViewportH(target_h: f32, t: f32) f32 {
+    if (attention_anim_viewport_h < 0.0) attention_anim_viewport_h = target_h;
+    attention_anim_viewport_h = approachEased(attention_anim_viewport_h, target_h, t);
+    if (attention_anim_viewport_h != target_h) attention_motion_animating = true;
+    return attention_anim_viewport_h;
+}
+
+/// Shown y for one ACTIVE row. Known rows ease from where they were last
+/// drawn; rows new to the cluster appear at their target.
+fn activeRowShownY(project_index: usize, pane_id: runtime.WorkspacePaneId, target_y: f32, t: f32) f32 {
+    for (active_row_slots[0..active_row_slot_count]) |*slot| {
+        if (slot.project_index != project_index or slot.pane_id != pane_id) continue;
+        slot.seen = true;
+        slot.y = approachEased(slot.y, target_y, t);
+        if (slot.y != target_y) attention_motion_animating = true;
+        return slot.y;
+    }
+    if (active_row_slot_count < active_row_slots.len) {
+        active_row_slots[active_row_slot_count] = .{ .project_index = project_index, .pane_id = pane_id, .y = target_y, .seen = true };
+        active_row_slot_count += 1;
+    }
+    return target_y;
+}
+
+/// Drops slots for rows that left the cluster and clears `seen` for the next
+/// pass. Slots must be dropped so a pane re-entering later starts fresh.
+fn pruneActiveRowSlots() void {
+    var keep: usize = 0;
+    for (active_row_slots[0..active_row_slot_count]) |slot| {
+        if (!slot.seen) continue;
+        active_row_slots[keep] = .{ .project_index = slot.project_index, .pane_id = slot.pane_id, .y = slot.y, .seen = false };
+        keep += 1;
+    }
+    active_row_slot_count = keep;
+}
+
 const SidebarContextMenuAction = enum {
     workspace_new_chat,
     workspace_open_codex_tui,
@@ -185,6 +266,9 @@ pub fn renderPalette(state: *runtime.AppState, rect: palette.Rect) void {
     palette_hit_count = 0;
     attention_clip = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
     attention_max_scroll_y = 0.0;
+    // Re-armed below by any ACTIVE row or viewport still easing; cleared here
+    // (not in the expanded pass) so a collapsed rail can never leave it stuck on.
+    attention_motion_animating = false;
 
     queuePaletteRect(state, rect, paletteColor(theme.COLOR_PANEL));
     queuePaletteRect(state, .{
@@ -1020,11 +1104,12 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
     const cluster_row_count = collectAttentionClusterRows(state, &cluster_rows);
     if (cluster_row_count > 0) sortAttentionClusterRows(cluster_rows[0..cluster_row_count]);
     const cluster_layout = attentionClusterLayoutForRail(cluster_row_count, available_list_h);
+    const motion_t = attentionMotionStep(state);
     attention_clip = .{
         .x = rect.x,
         .y = list_top,
         .w = rect.w,
-        .h = cluster_layout.viewport_h,
+        .h = easedAttentionViewportH(cluster_layout.viewport_h, motion_t),
     };
 
     const workspace_top = list_top + cluster_layout.viewport_h;
@@ -1179,15 +1264,16 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
 
     // Pin ACTIVE after the workspace tree so any tree row that scrolled into
     // the cluster band is covered — same overwrite trick as the header strip.
-    if (cluster_layout.viewport_h > 0.0) {
+    if (attention_clip.h > 0.0) {
         queuePaletteRect(state, .{
             .x = attention_clip.x,
             .y = attention_clip.y,
             .w = attention_clip.w - theme.scaledUi(1.0),
             .h = attention_clip.h,
         }, paletteColor(theme.COLOR_PANEL));
-        renderAttentionClusterSection(state, x, rail_w, cluster_rows[0..cluster_row_count], attention_clip);
+        renderAttentionClusterSection(state, x, rail_w, cluster_rows[0..cluster_row_count], attention_clip, motion_t);
     }
+    pruneActiveRowSlots();
 
     // Pinned header — painted last so any scrolled rows in the header band
     // are covered by the panel-colored strip before the chrome paints on top.
@@ -1307,6 +1393,7 @@ fn renderAttentionClusterSection(
     rail_w: f32,
     rows: []const AttentionClusterRow,
     clip: palette.Rect,
+    motion_t: f32,
 ) void {
     if (rows.len == 0 or clip.h <= 0.0) return;
 
@@ -1324,14 +1411,15 @@ fn renderAttentionClusterSection(
     attention_max_scroll_y = @max(0.0, content_h - rows_clip.h);
     attention_scroll_y = theme.clampf(attention_scroll_y, 0.0, attention_max_scroll_y);
 
-    var y = rows_clip.y - attention_scroll_y;
+    const rows_top = rows_clip.y - attention_scroll_y;
     for (rows, 0..) |row, active_index| {
         const project = &state.project_controller.projects.items[row.project_index];
-        const row_rect: palette.Rect = .{ .x = x, .y = y, .w = rail_w, .h = row_h };
+        const target_y = @as(f32, @floatFromInt(active_index)) * row_step;
+        const shown_y = activeRowShownY(row.project_index, row.pane.id, target_y, motion_t);
+        const row_rect: palette.Rect = .{ .x = x, .y = rows_top + shown_y, .w = rail_w, .h = row_h };
         if (rowVisible(row_rect, rows_clip)) {
             renderOpenPaneRow(state, row.project_index, project, row.pane, row_rect, rows_clip, true, true, active_index, false);
         }
-        y += row_step;
     }
 
     // Caption and divider paint after the rows so a scrolled row cannot cover
@@ -2933,6 +3021,40 @@ test "live Amp process wins over stale Cursor terminal metadata" {
         TerminalAgentProvider.amp,
         terminalAgentProviderForMetadata(.cursor, "amp", "cursor").?,
     );
+}
+
+test "ACTIVE row slots ease toward a new sort position and prune leavers" {
+    active_row_slot_count = 0;
+    attention_motion_animating = false;
+    // New row appears at its target without motion.
+    try std.testing.expectEqual(@as(f32, 0.0), activeRowShownY(0, 7, 0.0, 0.5));
+    try std.testing.expect(!attention_motion_animating);
+    pruneActiveRowSlots();
+    // Same row re-sorted one step down eases halfway, then settles.
+    try std.testing.expectEqual(@as(f32, 20.0), activeRowShownY(0, 7, 40.0, 0.5));
+    try std.testing.expect(attention_motion_animating);
+    pruneActiveRowSlots();
+    attention_motion_animating = false;
+    try std.testing.expectEqual(@as(f32, 40.0), activeRowShownY(0, 7, 40.0, 1.0));
+    try std.testing.expect(!attention_motion_animating);
+    // A row that was not seen this pass is dropped so it restarts fresh.
+    pruneActiveRowSlots();
+    try std.testing.expectEqual(@as(usize, 1), active_row_slot_count);
+    pruneActiveRowSlots();
+    try std.testing.expectEqual(@as(usize, 0), active_row_slot_count);
+}
+
+test "ACTIVE cluster viewport height eases including collapse to zero" {
+    attention_anim_viewport_h = -1.0;
+    attention_motion_animating = false;
+    try std.testing.expectEqual(@as(f32, 100.0), easedAttentionViewportH(100.0, 0.5));
+    try std.testing.expect(!attention_motion_animating);
+    try std.testing.expectEqual(@as(f32, 50.0), easedAttentionViewportH(0.0, 0.5));
+    try std.testing.expect(attention_motion_animating);
+    attention_motion_animating = false;
+    try std.testing.expectEqual(@as(f32, 0.0), easedAttentionViewportH(0.0, 1.0));
+    try std.testing.expect(!attention_motion_animating);
+    attention_anim_viewport_h = -1.0;
 }
 
 test "ACTIVE rows put durable completions first in finish order" {

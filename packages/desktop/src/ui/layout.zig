@@ -463,7 +463,7 @@ fn renderPrefixWhichKey(state: *runtime.AppState, workspace: palette.Rect) void 
 }
 
 pub fn isSidebarAnimating() bool {
-    return sidebar_animating;
+    return sidebar_animating or sidebar.isAttentionMotionAnimating();
 }
 
 fn computeRootLayout(state: *runtime.AppState, width: f32, height: f32) RootLayout {
