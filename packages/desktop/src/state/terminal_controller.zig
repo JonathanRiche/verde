@@ -86,6 +86,20 @@ pub const DefaultAgentTui = struct {
     hooks: bool = false,
 };
 
+/// Provider identity for terminal history. This is intentionally broader than
+/// stack-managed TUIs because Pi and FX can be opened from a GUI chat thread.
+pub const AgentTuiProvider = enum {
+    codex,
+    claude,
+    opencode,
+    cursor,
+    pi,
+    fx,
+    grok,
+    amp,
+    muse,
+};
+
 /// OpenCode 2 ships the TUI and the shared service in one binary. Verde
 /// launches the v2 TUI directly; the lifecycle plugin only loads there.
 pub const OPENCODE_TUI_COMMAND = "opencode2";
@@ -138,16 +152,30 @@ pub fn agentTuiProviderLabel(provider: ?stack_config.AgentProvider) []const u8 {
     };
 }
 
-pub fn supportedAgentTuiProviderFromName(name: []const u8) ?stack_config.AgentProvider {
-    const provider = std.meta.stringToEnum(stack_config.AgentProvider, name) orelse return null;
-    return if (defaultAgentTui(provider) != null) provider else null;
+pub fn supportedAgentTuiProviderFromName(name: []const u8) ?AgentTuiProvider {
+    return std.meta.stringToEnum(AgentTuiProvider, name);
 }
 
-pub fn agentTuiProviderFromProcessName(name: []const u8) ?stack_config.AgentProvider {
+fn agentTuiProviderFromStack(provider: stack_config.AgentProvider) ?AgentTuiProvider {
+    return switch (provider) {
+        .codex => .codex,
+        .claude => .claude,
+        .opencode => .opencode,
+        .cursor => .cursor,
+        .grok => .grok,
+        .amp => .amp,
+        .muse => .muse,
+        .other => null,
+    };
+}
+
+pub fn agentTuiProviderFromProcessName(name: []const u8) ?AgentTuiProvider {
     if (std.mem.eql(u8, name, "codex")) return .codex;
     if (std.mem.eql(u8, name, "claude")) return .claude;
     if (std.mem.eql(u8, name, "opencode") or std.mem.eql(u8, name, "opencode2")) return .opencode;
     if (std.mem.eql(u8, name, "agent") or std.mem.startsWith(u8, name, "cursor")) return .cursor;
+    if (std.mem.eql(u8, name, "pi")) return .pi;
+    if (std.mem.eql(u8, name, "fx")) return .fx;
     if (std.mem.eql(u8, name, "grok")) return .grok;
     if (std.mem.eql(u8, name, "amp")) return .amp;
     if (std.mem.eql(u8, name, "muse") or std.mem.startsWith(u8, name, "muse-bin-")) return .muse;
@@ -175,7 +203,7 @@ test "Grok TUI defaults use the least-privilege launch mode" {
     try std.testing.expect(isKnownDefaultAgentTuiCommand(.grok, "grok"));
     try std.testing.expect(isKnownDefaultAgentTuiCommand(.grok, LEGACY_GROK_TUI_COMMAND));
     try std.testing.expect(isKnownDefaultAgentTuiCommand(.grok, LEGACY_GROK_NO_SUBAGENTS_TUI_COMMAND));
-    try std.testing.expectEqual(stack_config.AgentProvider.grok, agentTuiProviderFromProcessName("grok").?);
+    try std.testing.expectEqual(AgentTuiProvider.grok, agentTuiProviderFromProcessName("grok").?);
 }
 
 test "OpenCode TUI defaults launch OpenCode 2 and keep legacy commands known" {
@@ -184,8 +212,10 @@ test "OpenCode TUI defaults launch OpenCode 2 and keep legacy commands known" {
     try std.testing.expect(isKnownDefaultAgentTuiCommand(.opencode, "opencode2"));
     // Panes saved before the OpenCode 2 migration still count as managed TUIs.
     try std.testing.expect(isKnownDefaultAgentTuiCommand(.opencode, "opencode"));
-    try std.testing.expectEqual(stack_config.AgentProvider.opencode, agentTuiProviderFromProcessName("opencode2").?);
-    try std.testing.expectEqual(stack_config.AgentProvider.opencode, agentTuiProviderFromProcessName("opencode").?);
+    try std.testing.expectEqual(AgentTuiProvider.opencode, agentTuiProviderFromProcessName("opencode2").?);
+    try std.testing.expectEqual(AgentTuiProvider.opencode, agentTuiProviderFromProcessName("opencode").?);
+    try std.testing.expectEqual(AgentTuiProvider.pi, agentTuiProviderFromProcessName("pi").?);
+    try std.testing.expectEqual(AgentTuiProvider.fx, agentTuiProviderFromProcessName("fx").?);
 }
 
 pub const State = struct {
@@ -465,7 +495,7 @@ pub fn projectTerminalDockMutable(self: anytype, project_index: usize, dock_id: 
 /// Returns the supported agent provider explicitly associated with a TUI
 /// dock. Generic terminals are deliberately not inferred from their live
 /// foreground process, so they never become workspace history entries.
-pub fn workspaceAgentTuiProvider(self: anytype, project_index: usize, dock_id: u32) ?stack_config.AgentProvider {
+pub fn workspaceAgentTuiProvider(self: anytype, project_index: usize, dock_id: u32) ?AgentTuiProvider {
     if (project_index >= self.project_controller.projects.items.len) return null;
     if (self.projectTerminalDock(project_index, dock_id)) |dock| {
         if (dock.activeTabPinnedProvider()) |name| {
@@ -476,7 +506,7 @@ pub fn workspaceAgentTuiProvider(self: anytype, project_index: usize, dock_id: u
     for (project.managed_processes.items) |process| {
         if (process.kind != .agent or process.dock_id != dock_id) continue;
         const provider = process.provider orelse continue;
-        if (defaultAgentTui(provider) != null) return provider;
+        if (defaultAgentTui(provider) != null) return agentTuiProviderFromStack(provider);
     }
     if (self.projectTerminalDock(project_index, dock_id)) |dock| {
         var process_name_buf: [96]u8 = undefined;
@@ -487,45 +517,33 @@ pub fn workspaceAgentTuiProvider(self: anytype, project_index: usize, dock_id: u
     return null;
 }
 
+fn agentTuiHistoryTimestamp(provider: ?AgentTuiProvider, existing: i64, detected_at: i64) i64 {
+    if (provider == null) return 0;
+    return if (existing != 0) existing else detected_at;
+}
+
 pub fn workspaceAgentTuiHistoryAt(self: anytype, project_index: usize, dock_id: u32) i64 {
-    const provider = self.workspaceAgentTuiProvider(project_index, dock_id) orelse return 0;
+    const provider = self.workspaceAgentTuiProvider(project_index, dock_id);
     const dock_snapshot = self.projectTerminalDock(project_index, dock_id) orelse return 0;
     const existing = dock_snapshot.activeTabAgentHistoryAt();
-    if (existing != 0) return existing;
+    const activity_at = agentTuiHistoryTimestamp(provider, existing, unixTimestampMs());
+    if (activity_at == 0 or activity_at == existing) return activity_at;
 
-    // Prompt-submit hooks persist a title for Codex and Cursor. Use it to
-    // migrate panes whose first turn happened before history enrollment.
-    if (provider == .codex or provider == .cursor) {
-        if (dock_snapshot.activeTabPinnedTitle()) |title| {
-            if (title.len > 0) {
-                const activity_at = unixTimestampMs();
-                const dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return 0;
-                if (dock.noteActiveTabAgentHistory(activity_at)) self.markDirty();
-                return activity_at;
-            }
-        }
-    }
-
-    // Amp panes created before TUI history had no persisted provider marker.
-    // Foreground-process detection is their only identity after restart, so
-    // enroll them when first encountered. Newly created panes are pinned and
-    // still wait for their first submitted prompt below.
-    if (provider != .amp) return 0;
-    if (dock_snapshot.activeTabPinnedProvider() == null) {
-        const activity_at = unixTimestampMs();
-        const dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return 0;
-        if (dock.noteActiveTabAgentHistory(activity_at)) self.markDirty();
-        return activity_at;
-    }
-
-    // Programmatic Amp submissions do not pass through terminal key input.
-    // The lifecycle plugin distinguishes startup (`idle`) from a real call.
-    const surface = self.projectTerminalSurface(project_index, dock_id) orelse return 0;
-    if (surface.status == .idle or surface.status_changed_at_ms == 0) return 0;
-    const activity_at = surface.status_changed_at_ms;
+    // Provider identity is enough to make the pane durable. Depending on a
+    // local Enter event, title hook, or lifecycle transition left valid TUIs
+    // out of history when they were closed before that provider-specific edge.
     const dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return 0;
-    if (dock.noteActiveTabAgentHistory(activity_at)) self.markDirty();
+    if (dock.noteActiveTabAgentHistory(activity_at)) self.markWorkspaceDirty(project_index);
     return activity_at;
+}
+
+test "every supported agent TUI enrolls in history when detected" {
+    const providers = [_]AgentTuiProvider{ .codex, .claude, .opencode, .cursor, .pi, .fx, .grok, .amp, .muse };
+    for (providers) |provider| {
+        try std.testing.expectEqual(@as(i64, 123), agentTuiHistoryTimestamp(provider, 0, 123));
+    }
+    try std.testing.expectEqual(@as(i64, 77), agentTuiHistoryTimestamp(.codex, 77, 123));
+    try std.testing.expectEqual(@as(i64, 0), agentTuiHistoryTimestamp(null, 0, 123));
 }
 
 /// Recreates a workspace pane around a saved agent TUI dock. The dock and
@@ -552,7 +570,7 @@ pub fn openWorkspaceAgentTuiHistory(self: anytype, project_index: usize, dock_id
     }
     self.requestTerminalDockFocus(dock_id);
     self.setSidebarNotice("Agent TUI reopened from history.");
-    self.markDirty();
+    self.markWorkspaceDirty(project_index);
     return true;
 }
 
@@ -574,7 +592,7 @@ pub fn createCurrentProjectTerminalTab(self: anytype, dock_id: u32, profile: ter
         return false;
     };
     self.requestTerminalDockFocus(dock_id);
-    self.markDirty();
+    self.markWorkspaceDirty(self.project_controller.selected_index);
     return true;
 }
 
@@ -637,7 +655,7 @@ pub fn toggleCurrentProjectTerminal(self: anytype) void {
     dock.visible = false;
     self.requestTerminalFocus();
     self.setSidebarNotice(if (terminal_open) "Terminal focused." else "Terminal opened.");
-    self.markDirty();
+    self.markWorkspaceDirty(self.project_controller.selected_index);
 }
 
 /// True while a visible terminal recently accepted input or produced
@@ -731,7 +749,7 @@ pub fn pollTerminals(self: anytype) bool {
                 break :blk false;
             };
             self.syncTerminalDockProcessLifecycleAfterTeardownPoll(project_index, 0, &project.terminal_dock, null);
-            if (project.terminal_dock.consumeWorkspaceChange()) self.markDirty();
+            if (project.terminal_dock.consumeWorkspaceChange()) self.markWorkspaceDirty(project_index);
             self.drainTerminalDockNotifications(project_index, 0, &project.terminal_dock) catch |err| {
                 log.warn("failed to apply terminal notification: {s}", .{@errorName(err)});
             };
@@ -783,7 +801,7 @@ pub fn pollTerminals(self: anytype) bool {
                 break :blk false;
             };
             self.syncTerminalDockProcessLifecycleAfterTeardownPoll(project_index, entry.id, &entry.dock, null);
-            if (entry.dock.consumeWorkspaceChange()) self.markDirty();
+            if (entry.dock.consumeWorkspaceChange()) self.markWorkspaceDirty(project_index);
             self.drainTerminalDockNotifications(project_index, entry.id, &entry.dock) catch |err| {
                 log.warn("failed to apply terminal dock notification: {s}", .{@errorName(err)});
             };
@@ -828,7 +846,7 @@ fn closeExitedEditorTerminalPane(self: anytype, project_index: usize, dock_id: u
     defer deinitWorkspacePaneRef(&removed_ref, self.allocator);
     if (self.project_controller.selected_index == project_index and !layout.hasVisiblePaneKind(.terminal)) self.terminal_controller.focused = false;
     self.setSidebarNotice("Editor pane closed.");
-    self.markDirty();
+    self.markWorkspaceDirty(project_index);
     return true;
 }
 
@@ -866,15 +884,60 @@ pub fn handleTerminalKeyDown(
             else => {},
         }
     }
-    const is_agent_tui = self.workspaceAgentTuiProvider(self.project_controller.selected_index, dock_id) != null;
+    const agent_provider = self.workspaceAgentTuiProvider(self.project_controller.selected_index, dock_id);
+    const is_agent_tui = agent_provider != null;
     var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return false;
     const handled = dock.handleKeyDown(self.allocator, keyboard, event);
     if (handled and is_agent_tui and (event.key == .@"return" or event.key == .kp_enter)) {
-        if (dock.noteActiveTabAgentHistory(unixTimestampMs())) self.markDirty();
+        if (dock.noteActiveTabAgentHistory(unixTimestampMs())) self.markWorkspaceDirty(self.project_controller.selected_index);
     }
-    if (dock.consumeWorkspaceChange()) self.markDirty();
+    if (dock.consumeWorkspaceChange()) self.markWorkspaceDirty(self.project_controller.selected_index);
     if (handled) self.noteTerminalInputActivity();
+    completeInterruptedClaudeTurn(self, dock_id, agent_provider, event, handled);
     return handled;
+}
+
+// Claude does not emit its Stop hook when the user interrupts a turn. Close
+// the lifecycle locally after Escape was successfully delivered to a working
+// Claude TUI; updateSurface then applies the normal focused-Done acknowledgement.
+fn completeInterruptedClaudeTurn(
+    self: anytype,
+    dock_id: u32,
+    provider: ?AgentTuiProvider,
+    event: *const sdl.KeyboardEvent,
+    handled: bool,
+) void {
+    const is_escape_press = event.down and !event.repeat and
+        (event.key == .escape or event.scancode == .escape);
+    if (!isHandledClaudeEscape(provider, handled, is_escape_press)) return;
+    const project_index = self.project_controller.selected_index;
+    const dock = self.projectTerminalDock(project_index, dock_id) orelse return;
+    const active_session_id = dock.activeSessionId() orelse return;
+    const surface = self.surfaceBySessionIdConst(active_session_id) orelse return;
+    if (surface.status != .working) return;
+    _ = self.updateSurface(.{
+        .session_id = active_session_id,
+        .status = .done,
+        .completed_at_ms = unixTimestampMs(),
+    }) catch |err| {
+        log.warn("failed to finish interrupted Claude surface: {s}", .{@errorName(err)});
+    };
+}
+
+fn isHandledClaudeEscape(
+    provider: ?AgentTuiProvider,
+    handled: bool,
+    is_escape_press: bool,
+) bool {
+    return provider == .claude and handled and is_escape_press;
+}
+
+test "only a handled Claude Escape is an interrupt lifecycle edge" {
+    try std.testing.expect(isHandledClaudeEscape(.claude, true, true));
+    try std.testing.expect(!isHandledClaudeEscape(.claude, false, true));
+    try std.testing.expect(!isHandledClaudeEscape(.claude, true, false));
+    try std.testing.expect(!isHandledClaudeEscape(.codex, true, true));
+    try std.testing.expect(!isHandledClaudeEscape(null, true, true));
 }
 
 /// Dispatches an already-resolved terminal action (prefix mode) through the
@@ -895,7 +958,7 @@ pub fn handleTerminalAction(self: anytype, action: keybinds.NativeTerminalAction
         log.warn("terminal prefix action failed: {s}", .{@errorName(err)});
         return false;
     };
-    if (dock.consumeWorkspaceChange()) self.markDirty();
+    if (dock.consumeWorkspaceChange()) self.markWorkspaceDirty(self.project_controller.selected_index);
     self.noteTerminalInputActivity();
     return true;
 }
