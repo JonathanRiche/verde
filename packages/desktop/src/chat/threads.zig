@@ -298,3 +298,24 @@ test "terminal refresh consumes saved events once within the owning turn" {
     discardHydratedTimelineEvents(std.testing.allocator, &messages, "active", &events);
     try std.testing.expectEqual(@as(usize, 0), events.items.len);
 }
+
+/// Daemon sync IDs identify a full replacement, not an appended live suffix.
+pub fn transcriptSyncGeneration(messages: anytype) u64 {
+    var generation: u64 = 0;
+    for (messages) |message| {
+        const id = message.message_id orelse continue;
+        if (!std.mem.startsWith(u8, id, "turn:sync:")) continue;
+        const end = std.mem.indexOf(u8, id[10..], ":msg:") orelse continue;
+        const value = std.fmt.parseInt(u64, id[10..][0..end], 10) catch continue;
+        generation = @max(generation, value);
+    }
+    return generation;
+}
+
+test "thread sync generation distinguishes replacement from ordinary tail rows" {
+    const Row = struct { message_id: ?[]const u8 };
+    try std.testing.expectEqual(@as(u64, 0), transcriptSyncGeneration(&[_]Row{.{ .message_id = "turn:old:msg:1" }}));
+    try std.testing.expectEqual(@as(u64, 42), transcriptSyncGeneration(&[_]Row{
+        .{ .message_id = "turn:sync:42:msg:0" }, .{ .message_id = "turn:next:msg:1" }, .{ .message_id = "turn:sync:bad:msg:0" },
+    }));
+}

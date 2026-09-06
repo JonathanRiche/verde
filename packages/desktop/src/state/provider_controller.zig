@@ -170,12 +170,16 @@ pub const ProviderThreadOperationRequest = struct {
     pref_path: []u8,
     project_path: []u8,
     thread_id: ?[]u8,
+    workspace_id: ?[]u8 = null,
+    local_thread_id: ?[]u8 = null,
 
     pub fn deinit(self: *ProviderThreadOperationRequest) void {
         const allocator = std.heap.page_allocator;
         allocator.free(self.pref_path);
         allocator.free(self.project_path);
         if (self.thread_id) |thread_id| allocator.free(thread_id);
+        if (self.workspace_id) |value| allocator.free(value);
+        if (self.local_thread_id) |value| allocator.free(value);
         allocator.destroy(self);
     }
 };
@@ -183,12 +187,17 @@ pub const ProviderThreadOperationRequest = struct {
 pub const ProviderThreadOperationResult = union(enum) {
     list: []const provider_types.ChatThreadSummary,
     read: provider_types.ReadThreadResult,
+    synced: headless.protocol.ParsedResponse,
 
     pub fn deinit(self: ProviderThreadOperationResult) void {
         const allocator = std.heap.page_allocator;
         switch (self) {
             .list => |threads| freeThreadSummaries(allocator, threads),
             .read => |thread| thread.deinit(allocator),
+            .synced => |response| {
+                var owned = response;
+                owned.deinit();
+            },
         }
     }
 };
@@ -298,7 +307,22 @@ fn runProviderThreadOperation(
             }
             break :blk .{ .list = response.threads };
         },
-        .import_thread, .sync_thread => blk: {
+        .sync_thread => blk: {
+            var parsed = try client.call(headless.providers_protocol.METHOD_PROVIDER_THREAD_SYNC, headless.providers_protocol.ThreadSyncRequest{
+                .workspace_id = request.workspace_id orelse return error.InvalidProviderThreadId,
+                .local_thread_id = request.local_thread_id orelse return error.InvalidProviderThreadId,
+                .provider_thread_id = request.thread_id orelse return error.InvalidProviderThreadId,
+            });
+            errdefer parsed.deinit();
+            if (parsed.response.err) |remote_error| {
+                if (std.mem.eql(u8, remote_error.code, headless.protocol.ERR_CONFLICT)) return error.ThreadChangedDuringSync;
+                if (std.mem.eql(u8, remote_error.message, "ProviderHistoryWouldDropAttachments")) return error.ProviderHistoryWouldDropAttachments;
+                return error.RemoteError;
+            }
+            if (parsed.response.result == null) return error.InvalidDaemonResponse;
+            break :blk .{ .synced = parsed };
+        },
+        .import_thread => blk: {
             var parsed = try client.callProviderThreadRead(headless.Capabilities.phase1(), .{
                 .provider = protocol_provider,
                 .project_path = request.project_path,
