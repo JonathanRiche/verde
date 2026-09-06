@@ -3838,6 +3838,7 @@ fn armSendStateForDaemonTurn(self: anytype, thread: *ChatThread, turn_id: []u8, 
     send_state.acceptance_pending = acceptance_pending;
     send_state.daemon_tail_fail_count = 0;
     send_state.thinking = false;
+    send_state.thinking_cleared_at_ms = 0;
     send_state.partial_text.clearRetainingCapacity();
     freePendingTimelineEventsLocked(page_alloc, &send_state.pending_events);
     freePendingDiffFilesLocked(page_alloc, &send_state.pending_diff_files);
@@ -6450,6 +6451,7 @@ pub fn applyDaemonChatEventLocked(self: anytype, send_state: *SendState, kind: [
         // Content-less reasoning drives the "Thinking" header indicator
         // instead of a timeline row; mirror the GUI-owned stream path.
         if (transientThinkStatus(update)) |thinking| {
+            if (send_state.thinking and !thinking) send_state.thinking_cleared_at_ms = monotonicMs();
             send_state.thinking = thinking;
             return;
         }
