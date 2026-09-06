@@ -270,6 +270,9 @@ pub const SendPromptRequest = struct {
     on_turn_id: ?*const fn (?*anyopaque, []const u8) void = null,
     on_stream_delta: ?*const fn (?*anyopaque, []const u8) void = null,
     on_stream_event: ?*const fn (?*anyopaque, StreamEvent) void = null,
+    /// Fired when the visible answer is complete but the provider may still be
+    /// draining housekeeping. The daemon can publish GUI completion here.
+    on_answer_ready: ?*const fn (?*anyopaque, []const u8) void = null,
     on_failure: ?*const fn (?*anyopaque, []const u8) void = null,
     on_should_stop: ?*const fn (?*anyopaque) bool = null,
     on_approval_request: ?*const fn (?*anyopaque, ApprovalRequest) ApprovalDecision = null,
