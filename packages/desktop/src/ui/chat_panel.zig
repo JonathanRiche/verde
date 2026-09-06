@@ -2748,7 +2748,10 @@ fn renderTranscriptContent(state: *app_state.AppState, rect: palette.Rect, layou
         // Durable history exists and is hydrating asynchronously — render a
         // quiet blank frame instead of flashing first-chat onboarding copy
         // over a thread that has messages.
-        if (thread.persisted_message_offset > 0) return false;
+        if (thread.persisted_message_offset > 0) {
+            logTranscriptBlankFrame(thread, "empty-thread-hydrating");
+            return false;
+        }
         queueText(state, .{ .x = column.x, .y = column.y, .w = column.w, .h = theme.scaledUi(30.0) }, "No messages yet", paletteColor(theme.COLOR_WHITE), theme.scaledUi(20.0), clip);
         queueText(state, .{ .x = column.x, .y = column.y + theme.scaledUi(32.0), .w = column.w, .h = theme.scaledUi(26.0) }, "Choose a provider, type a prompt below, and start the first chat for this directory.", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(15.0), clip);
         return true;
@@ -3472,6 +3475,57 @@ test "transcript layout lookup starts at the first row intersecting the viewport
 }
 
 // Renders the visible committed transcript rows from cached layout positions.
+/// Diagnostic for the one-frame transcript blank seen at turn commit. Both
+/// paths are rare (hydration wait, viewport past the materialized rows), and
+/// the key guard keeps a multi-frame wait to a single line.
+var transcript_blank_log_key: u64 = 0;
+
+fn transcriptBlankLogKey(thread: anytype, reason: []const u8) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(thread.local_thread_id);
+    hasher.update(reason);
+    hasher.update(std.mem.asBytes(&thread.persisted_message_offset));
+    hasher.update(std.mem.asBytes(&thread.messages.items.len));
+    return hasher.final();
+}
+
+fn logTranscriptBlankFrame(thread: anytype, reason: []const u8) void {
+    const key = transcriptBlankLogKey(thread, reason);
+    if (key == transcript_blank_log_key) return;
+    transcript_blank_log_key = key;
+    log.info(
+        "transcript blank frame reason={s} thread={s} messages={d} persisted_offset={d} send_pending={} layout_valid={} layout_first={d} layout_count={d} layout_items={d}",
+        .{
+            reason,
+            thread.local_thread_id,
+            thread.messages.items.len,
+            thread.persisted_message_offset,
+            thread.isSendPendingForUi(),
+            thread.transcript_layout_valid,
+            thread.transcript_layout_first_message_index,
+            thread.transcript_layout_message_count,
+            thread.transcript_layout_items.items.len,
+        },
+    );
+}
+
+fn logTranscriptBlankFrameDetail(thread: anytype, reason: []const u8, scroll_y: f32, estimated_height: f32, viewport_h: f32) void {
+    const key = transcriptBlankLogKey(thread, reason);
+    if (key == transcript_blank_log_key) return;
+    logTranscriptBlankFrame(thread, reason);
+    log.info(
+        "transcript blank frame detail scroll_y={d:.1} estimated_height={d:.1} viewport_h={d:.1} committed_height={d:.1} requested_height={d:.1} visible_ready={}",
+        .{
+            scroll_y,
+            estimated_height,
+            viewport_h,
+            thread.transcript_layout_committed_height,
+            thread.transcript_layout_requested_height,
+            thread.transcript_layout_visible_ready,
+        },
+    );
+}
+
 fn renderCommittedTranscript(
     state: *app_state.AppState,
     thread: anytype,
@@ -3481,8 +3535,14 @@ fn renderCommittedTranscript(
 ) f32 {
     const items = thread.transcript_layout_items.items;
     const estimated_height = estimatedPartialTranscriptHeight(thread);
-    var layout_index = oldestVisibleTranscriptLayoutItem(items, scroll_y - estimated_height) orelse
+    var layout_index = oldestVisibleTranscriptLayoutItem(items, scroll_y - estimated_height) orelse {
+        // Only a real gap: the viewport sitting past every committed row is
+        // expected while it shows just the streaming bubble.
+        if (thread.messages.items.len > 0 and scroll_y <= estimated_height) {
+            logTranscriptBlankFrameDetail(thread, "no-visible-rows", scroll_y, estimated_height, column.h);
+        }
         return column.y - scroll_y + estimated_height;
+    };
     const visible_bottom = scroll_y + column.h - estimated_height;
     while (true) {
         const item = items[layout_index];
