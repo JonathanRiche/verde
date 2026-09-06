@@ -41,6 +41,25 @@ function textFromContent(content) {
   return chunks.join("");
 }
 
+// Top-level assistant text from one partial-message stream event; null for
+// anything else (tool input JSON, thinking, subagent streams).
+function claudeTextDeltaFromStreamEvent(message) {
+  if (message?.type !== "stream_event" || message.parent_tool_use_id) return null;
+  const event = message.event;
+  if (event?.type !== "content_block_delta" || event.delta?.type !== "text_delta") return null;
+  return typeof event.delta.text === "string" && event.delta.text.length > 0 ? event.delta.text : null;
+}
+
+// The full assistant message repeats text already streamed token by token.
+// Emit only what the stream did not carry (nothing in the common case), so
+// the transcript never shows the reply twice.
+function claudeUnstreamedText(text, streamedText) {
+  if (!streamedText) return text;
+  if (text === streamedText || streamedText.endsWith(text)) return "";
+  if (text.startsWith(streamedText)) return text.slice(streamedText.length);
+  return text;
+}
+
 let nextApprovalRequestId = 1;
 const pendingApprovals = new Map();
 let activeClaudePromptChannel = null;
@@ -635,6 +654,9 @@ function buildClaudeOptions(request) {
     effort: request.reasoning_effort ?? undefined,
     pathToClaudeCodeExecutable: pathToClaudeCodeExecutable(request),
     hooks: buildVerdeClaudeHooks(),
+    // Token-level `stream_event` messages: without them the SDK only yields
+    // whole assistant messages, so the transcript jumps a block at a time.
+    includePartialMessages: true,
   };
 
   const mode = claudePermissionMode(request.approval_policy, request.sandbox_mode);
@@ -1100,10 +1122,20 @@ async function handleClaudeSendPrompt(sdk, request) {
   try {
     let sessionId = request.thread_id ?? null;
     let reply = "";
+    let streamedText = "";
     const backgroundState = { trackedToolUseIds: new Set(), scheduledToolUseIds: new Set(), pendingBackgrounds: [] };
     for await (const message of query) {
       const rateLimitFailure = claudeRejectedRateLimitMessage(message);
       if (rateLimitFailure) throw new Error(rateLimitFailure);
+      if (message?.type === "stream_event") {
+        const streamedDelta = claudeTextDeltaFromStreamEvent(message);
+        if (streamedDelta) {
+          streamedText += streamedDelta;
+          reply += streamedDelta;
+          write({ type: "delta", text: streamedDelta });
+        }
+        continue;
+      }
       if (message?.type === "system" && message?.subtype === "init" && message.session_id) {
         sessionId = message.session_id;
         write({ type: "thread_id", thread_id: sessionId });
@@ -1130,8 +1162,13 @@ async function handleClaudeSendPrompt(sdk, request) {
       emitClaudeToolEvents(message, commandByToolUseId, mcpByToolUseId, subagentByToolUseId, query, backgroundState);
       const delta = textFromContent(message?.message?.content ?? message?.content);
       if (message?.type === "assistant" && delta) {
-        reply += delta;
-        write({ type: "delta", text: delta });
+        // Subagent replies (parent_tool_use_id set) never streamed above.
+        const unstreamed = message.parent_tool_use_id ? delta : claudeUnstreamedText(delta, streamedText);
+        if (!message.parent_tool_use_id) streamedText = "";
+        if (unstreamed) {
+          reply += unstreamed;
+          write({ type: "delta", text: unstreamed });
+        }
       }
     }
     if (backgroundState.pendingBackgrounds.length > 0) {
