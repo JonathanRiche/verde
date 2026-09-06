@@ -33,6 +33,10 @@ pub const PRIMARY_REPOSITORY_ID: []const u8 = "primary";
 pub const TranscriptBodyKind = enum {
     markdown,
     plain,
+    /// Markdown parsed with `parseStreaming` so unclosed emphasis / code at
+    /// the buffer tail renders optimistically. Only the in-flight assistant
+    /// row uses it; the committed message re-parses as `markdown`.
+    markdown_streaming,
 };
 
 pub const TranscriptRenderCacheKey = struct {

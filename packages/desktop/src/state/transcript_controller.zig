@@ -716,9 +716,16 @@ pub fn transcriptPlainBodyEntry(self: anytype, message_index: usize, body: []con
 
 /// Returns parsed geometry for the current in-flight assistant text.
 pub fn pendingTranscriptPlainBodyEntry(self: anytype, body: []const u8) ?*TranscriptMarkdownBody {
+    return pendingTranscriptBodyEntry(self, body, .plain);
+}
+
+/// Item 4: the streaming reply keeps one cached body per delta in either
+/// parse mode. Animation-only frames replay the cached geometry; a new delta
+/// (or a kind switch from the plain placeholder) rebuilds it once.
+pub fn pendingTranscriptBodyEntry(self: anytype, body: []const u8, kind: TranscriptBodyKind) ?*TranscriptMarkdownBody {
     if (body.len == 0) return null;
     const thread = self.currentThreadMutable();
-    return transcriptBodyEntryForSlot(self, &thread.pending_transcript_body, body, .plain);
+    return transcriptBodyEntryForSlot(self, &thread.pending_transcript_body, body, kind);
 }
 
 /// Releases parsed/render data retained only for an in-flight assistant row.
@@ -755,6 +762,7 @@ pub fn createTranscriptMarkdownBody(self: anytype, body: []const u8) !*Transcrip
 fn buildTranscriptBodyView(allocator: std.mem.Allocator, body: []const u8, kind: TranscriptBodyKind) !chat_markdown.BodyView {
     return switch (kind) {
         .markdown => chat_markdown.buildBodyView(allocator, body),
+        .markdown_streaming => chat_markdown.buildBodyViewStreaming(allocator, body),
         .plain => chat_markdown.buildPlainBodyView(allocator, body),
     };
 }

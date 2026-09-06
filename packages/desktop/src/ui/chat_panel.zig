@@ -1445,7 +1445,7 @@ fn transcriptMarkdownBubbleHit(
 
     const stream_text: []const u8 = send_state.partial_text.items;
     const body: []const u8 = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
-    const stream_plain = stream_text.len > 0;
+    const stream_plain = false; // item 4: stream renders as markdown in place
     const assistant_h = transcriptMessageHeightStream(null, null, body, .assistant, column.w, "", stream_plain, stream_text.len > 0);
     const stream_idx = base_idx + send_state.pending_events.items.len;
     return transcriptSelectableBodyHit(state, column, content_y, assistant_h, .assistant, "", body, stream_text.len == 0, stream_plain, true, stream_idx, mouse_x, mouse_y);
@@ -1513,7 +1513,7 @@ fn transcriptMarkdownBubbleLinkHit(
 
     const stream_text: []const u8 = send_state.partial_text.items;
     const body: []const u8 = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
-    const stream_plain = stream_text.len > 0;
+    const stream_plain = false; // item 4: stream renders as markdown in place
     const assistant_h = transcriptMessageHeightStream(null, null, body, .assistant, column.w, "", stream_plain, stream_text.len > 0);
     return assistantTranscriptMarkdownLinkHit(state, column, content_y, assistant_h, .assistant, "", body, stream_text.len == 0, stream_plain, true, mouse_x, mouse_y);
 }
@@ -3770,7 +3770,7 @@ fn pendingStreamBodyHeight(
         body,
     );
     if (send_state.stream_measured_height >= 0.0 and send_state.stream_measured_key == key) return send_state.stream_measured_height;
-    const stream_plain = stream_text.len > 0;
+    const stream_plain = false; // item 4: stream renders as markdown in place
     const height = transcriptMessageHeightStream(state, stream_msg_idx, body, .assistant, column_width, "", stream_plain, stream_text.len > 0);
     send_state.stream_measured_height = height;
     send_state.stream_measured_key = key;
@@ -3902,7 +3902,7 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
         formatPendingWorkingLabel(&status_buf, send_state.started_at_ms, send_state.thinking);
     const stream_text: []const u8 = send_state.partial_text.items;
     const body: []const u8 = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
-    const stream_plain = stream_text.len > 0;
+    const stream_plain = false; // item 4: stream renders as markdown in place
     const stream_msg_idx = base_message_index + send_state.pending_events.items.len;
     const assistant_h = pendingStreamBodyHeight(state, send_state, stream_msg_idx, column.w, variant_hash);
     if (y + assistant_h >= column.y and y <= column.y + column.h) {
@@ -4825,6 +4825,14 @@ fn transcriptMessageHeightStream(
                         const measured = chat_markdown.measureBodyHeight(view.*, body_inner_width, markdownOptions(font_size));
                         return theme.scaledUi(44.0) + measured;
                     }
+                }
+            }
+        }
+        if (streaming) {
+            if (state) |app| {
+                if (app.pendingTranscriptBodyEntry(body, .markdown_streaming)) |entry| {
+                    const measured = chat_markdown.measureBodyHeight(entry.view, body_inner_width, markdownOptions(font_size));
+                    return theme.scaledUi(46.0) + measured;
                 }
             }
         }
@@ -7066,13 +7074,15 @@ fn transcriptPlainTextOptions(color: [4]f32) chat_markdown.RenderOptions {
 
 fn renderMarkdownBody(state: *app_state.AppState, message_index: usize, rect: palette.Rect, body: []const u8, clip: palette.Rect, streaming: bool) void {
     if (body.len == 0) return;
-    // Cached path only applies to committed (non-streaming) messages — the
-    // stream body changes per frame so the cache key would invalidate anyway.
-    if (!streaming) {
-        if (state.transcriptMarkdownBodyEntry(message_index, body)) |entry| {
-            renderSelectableBodyEntry(state, message_index, rect, entry, clip, transcriptMarkdownOptions(), true);
-            return;
-        }
+    // Committed messages cache per message index; the streaming reply keeps
+    // one slot rebuilt per delta (item 4) so animation frames replay geometry.
+    const cached = if (streaming)
+        state.pendingTranscriptBodyEntry(body, .markdown_streaming)
+    else
+        state.transcriptMarkdownBodyEntry(message_index, body);
+    if (cached) |entry| {
+        renderSelectableBodyEntry(state, message_index, rect, entry, clip, transcriptMarkdownOptions(), true);
+        return;
     }
 
     var view = (if (streaming)
