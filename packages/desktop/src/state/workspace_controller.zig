@@ -188,7 +188,7 @@ pub fn ensureCurrentProjectWorkspace(self: anytype) void {
         log.err("failed to initialize workspace panes: {s}", .{@errorName(err)});
         return;
     };
-    if (changed) self.markDirty();
+    if (changed) self.markWorkspaceDirty(self.project_controller.selected_index);
 }
 
 pub fn focusedWorkspacePaneKind(self: anytype) ?WorkspacePaneKind {
@@ -277,7 +277,7 @@ pub fn floatFocusedWorkspacePane(self: anytype) bool {
         if (quick.pane_id == pane_id and quick.detached) {
             layout.quick_pane.?.visible = true;
             _ = self.focusCurrentProjectWorkspacePane(pane_id);
-            self.markDirty();
+            self.markWorkspaceDirty(self.project_controller.selected_index);
             return true;
         }
         if (quick.pane_id != pane_id) {
@@ -299,7 +299,7 @@ pub fn floatFocusedWorkspacePane(self: anytype) bool {
             .return_focus_pane_id = layout.firstVisiblePaneId(),
         };
     }
-    self.markDirty();
+    self.markWorkspaceDirty(self.project_controller.selected_index);
     return true;
 }
 
@@ -320,7 +320,7 @@ pub fn toggleCurrentProjectQuickPane(self: anytype) bool {
     } else {
         self.restoreFocusBehindQuickPane(layout.quick_pane.?);
     }
-    self.markDirty();
+    self.markWorkspaceDirty(self.project_controller.selected_index);
     return true;
 }
 
@@ -361,7 +361,7 @@ pub fn createFloatingQuickTerminalWithProfile(self: anytype, profile: terminal.T
     dock.visible = false;
     self.requestTerminalDockFocus(dock_id);
     self.setSidebarNotice("Quick terminal ready.");
-    self.markDirty();
+    self.markWorkspaceDirty(project_index);
     return true;
 }
 
@@ -383,7 +383,7 @@ pub fn minimizeCurrentProjectQuickPane(self: anytype) bool {
     const quick = if (layout.quick_pane) |*value| value else return false;
     quick.visible = false;
     self.restoreFocusBehindQuickPane(quick.*);
-    self.markDirty();
+    self.markWorkspaceDirty(self.project_controller.selected_index);
     return true;
 }
 
@@ -393,7 +393,7 @@ pub fn toggleCurrentProjectQuickPaneMaximized(self: anytype) bool {
     const quick = if (layout.quick_pane) |*value| value else return false;
     quick.visible = true;
     quick.maximized = !quick.maximized;
-    self.markDirty();
+    self.markWorkspaceDirty(self.project_controller.selected_index);
     return true;
 }
 
@@ -403,7 +403,7 @@ pub fn toggleCurrentProjectQuickPanePinned(self: anytype) bool {
     const quick = if (layout.quick_pane) |*value| value else return false;
     quick.pinned = !quick.pinned;
     quick.visible = true;
-    self.markDirty();
+    self.markWorkspaceDirty(self.project_controller.selected_index);
     return true;
 }
 
@@ -428,7 +428,7 @@ pub fn returnCurrentProjectQuickPaneToTile(self: anytype) bool {
     }
     layout.quick_pane = null;
     _ = self.focusCurrentProjectWorkspacePane(quick.pane_id);
-    self.markDirty();
+    self.markWorkspaceDirty(self.project_controller.selected_index);
     return true;
 }
 
@@ -443,7 +443,7 @@ pub fn setCurrentProjectQuickPaneGeometry(self: anytype, geometry: FloatingPaneG
         .h = std.math.clamp(geometry.h, 0.05, 1.0),
     };
     quick.maximized = false;
-    self.markDirty();
+    self.markWorkspaceDirty(self.project_controller.selected_index);
 }
 
 pub fn workspacePaneKindById(self: anytype, pane_id: WorkspacePaneId) ?WorkspacePaneKind {
@@ -739,7 +739,6 @@ pub fn pollTerminalDockBeforeRead(self: anytype, project_index: usize, dock_id: 
         const project = &self.project_controller.projects.items[project_index];
         if (dock.visible or project.workspace_layout.hasTerminalDockPane(dock_id)) {
             self.terminal_controller.last_activity_ms = @intCast(@divTrunc(platform_runtime.monotonicTimestampNs(), std.time.ns_per_ms));
-            self.markDirty();
         }
     }
 }
@@ -1038,7 +1037,7 @@ pub fn selectWorkspaceChatPaneThread(self: anytype, pane_id: WorkspacePaneId) bo
     self.unfocusBrowserPane();
     self.browser_controller.address_focused = false;
     self.syncPaletteComposerFromDraft();
-    self.markDirty();
+    self.markWorkspaceDirty(self.project_controller.selected_index);
     return true;
 }
 
@@ -1128,7 +1127,7 @@ fn focusWorkspacePaneWithCompletionPolicy(
             }
         },
     }
-    if (acknowledge_completion and persisted_focus_changed) self.markDirty();
+    if (acknowledge_completion and persisted_focus_changed) self.markWorkspaceDirty(project_index);
     return true;
 }
 
@@ -1156,7 +1155,7 @@ pub fn focusPromptForFocusedChatWorkspacePane(self: anytype) bool {
     self.unfocusBrowserPane();
     self.browser_controller.address_focused = false;
     self.ensurePaletteComposerCursorVisible();
-    self.markDirty();
+    self.markWorkspaceDirty(self.project_controller.selected_index);
     return true;
 }
 
@@ -1164,7 +1163,7 @@ pub fn swapCurrentProjectWorkspacePanes(self: anytype, first_pane_id: WorkspaceP
     if (self.project_controller.projects.items.len == 0) return false;
     var layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
     if (!layout.swapPaneRefs(first_pane_id, second_pane_id)) return false;
-    self.markDirty();
+    self.markWorkspaceDirty(self.project_controller.selected_index);
     return true;
 }
 
@@ -1177,7 +1176,7 @@ pub fn moveWorkspacePaneInSidebarOrder(
     if (project_index >= self.project_controller.projects.items.len) return false;
     var layout = &self.project_controller.projects.items[project_index].workspace_layout;
     if (!layout.movePaneBefore(pane_id, before_index)) return false;
-    self.markDirty();
+    self.markWorkspaceDirty(project_index);
     return true;
 }
 
@@ -1195,7 +1194,7 @@ pub fn moveWorkspacePaneInDirection(
     if (self.project_controller.selected_index == project_index) {
         _ = self.focusCurrentProjectWorkspacePane(neighbor_id);
     } else {
-        self.markDirty();
+        self.markWorkspaceDirty(project_index);
     }
     return true;
 }
@@ -1224,12 +1223,12 @@ pub fn moveCurrentProjectWorkspacePaneToPlacement(
         log.err("failed to move workspace pane: {s}", .{@errorName(err)});
         layout.ensurePaneInRootSplit(self.allocator, source_pane_id, axis, 0.5) catch {};
         self.setSidebarNotice("Failed to move workspace pane.");
-        self.markDirty();
+        self.markWorkspaceDirty(self.project_controller.selected_index);
         return false;
     };
     layout.maximized_pane_id = null;
     _ = self.focusCurrentProjectWorkspacePane(source_pane_id);
-    self.markDirty();
+    self.markWorkspaceDirty(self.project_controller.selected_index);
     return true;
 }
 
@@ -1251,7 +1250,7 @@ pub fn toggleWorkspacePaneMaximized(self: anytype, project_index: usize, pane_id
     layout.maximized_pane_id = if (layout.maximized_pane_id == pane_id) null else pane_id;
     layout.focused_pane_id = pane_id;
     _ = self.focusWorkspacePane(project_index, pane_id);
-    self.markDirty();
+    self.markWorkspaceDirty(project_index);
     runtime_log.diagnostic("pane maximize toggle done project={d} pane={d} maximized={any}", .{
         project_index,
         pane_id,
@@ -1277,13 +1276,17 @@ pub fn clearWorkspacePaneMaximized(self: anytype, project_index: usize) bool {
     var layout = &self.project_controller.projects.items[project_index].workspace_layout;
     if (layout.maximized_pane_id == null) return false;
     layout.maximized_pane_id = null;
-    self.markDirty();
+    self.markWorkspaceDirty(project_index);
     return true;
 }
 
 pub fn closeCurrentProjectWorkspacePane(self: anytype, pane_id: WorkspacePaneId) bool {
     if (self.project_controller.projects.items.len == 0) return false;
     return self.closeWorkspacePane(self.project_controller.selected_index, pane_id);
+}
+
+fn shouldTearDownClosedTerminalDock(has_remaining_pane: bool, preserve_agent_history: bool) bool {
+    return !has_remaining_pane and !preserve_agent_history;
 }
 
 pub fn closeWorkspacePane(self: anytype, project_index: usize, pane_id: WorkspacePaneId) bool {
@@ -1293,10 +1296,17 @@ pub fn closeWorkspacePane(self: anytype, project_index: usize, pane_id: Workspac
     var removed_ref = layout.closePane(self.allocator, pane_id) orelse return false;
     defer deinitWorkspacePaneRef(&removed_ref, self.allocator);
     switch (removed_ref) {
-        .chat => self.setSidebarNotice("Chat pane closed."),
+        .chat => |ref| {
+            // Item 5b: the thread follows its last pane out of the open set.
+            const closed = self.closeThreadAfterPaneClose(project_index, ref.thread_index);
+            self.setSidebarNotice(if (closed) "Chat closed. Find it again in the command palette." else "Chat pane closed.");
+        },
         .terminal => |ref| {
             const preserve_agent_history = self.workspaceAgentTuiHistoryAt(project_index, ref.dock_id) != 0;
-            if (!layout.hasTerminalDockPane(ref.dock_id)) {
+            // Saved agent TUIs stay attached to their daemon session while
+            // hidden. Reopening History must reattach the same conversation,
+            // not a blank shell after a pane-close teardown.
+            if (shouldTearDownClosedTerminalDock(layout.hasTerminalDockPane(ref.dock_id), preserve_agent_history)) {
                 if (ref.dock_id == 0) {
                     self.syncTerminalDockProcessLifecycle(project_index, ref.dock_id, &project.terminal_dock, pane_id);
                     _ = self.finishTerminalSessionsForTeardown(project_index, &project.terminal_dock, .pane_closed);
@@ -1309,6 +1319,11 @@ pub fn closeWorkspacePane(self: anytype, project_index: usize, pane_id: Workspac
             }
             if (preserve_agent_history) {
                 if (project.managedProcessByDockId(ref.dock_id)) |process| process.pane_id = null;
+                if (self.projectTerminalDock(project_index, ref.dock_id)) |dock| {
+                    if (dock.activeSessionId()) |session_id| {
+                        if (self.surfaceBySessionId(session_id)) |surface| surface.pane_id = null;
+                    }
+                }
             }
             if (self.project_controller.selected_index == project_index and !layout.hasVisiblePaneKind(.terminal)) self.terminal_controller.focused = false;
             self.setSidebarNotice(if (preserve_agent_history) "Agent TUI closed. Reopen it from History." else "Terminal pane closed.");
@@ -1337,8 +1352,14 @@ pub fn closeWorkspacePane(self: anytype, project_index: usize, pane_id: Workspac
             self.browser_controller.address_focused = false;
         }
     }
-    self.markDirty();
+    self.markWorkspaceDirty(project_index);
     return true;
+}
+
+test "closing an agent TUI pane keeps its session for history" {
+    try std.testing.expect(!shouldTearDownClosedTerminalDock(false, true));
+    try std.testing.expect(!shouldTearDownClosedTerminalDock(true, false));
+    try std.testing.expect(shouldTearDownClosedTerminalDock(false, false));
 }
 
 pub fn clearHerdrClosedPaneMetadata(self: anytype, project_index: usize, pane_id: WorkspacePaneId, removed_ref: WorkspacePaneRef) void {
@@ -2040,7 +2061,7 @@ pub fn splitCurrentProjectWorkspacePaneWithThread(
     self.terminal_controller.focused = false;
     self.requestComposerFocus();
     self.syncRenameBuffer();
-    self.markDirty();
+    self.markWorkspaceDirty(self.project_controller.selected_index);
     return true;
 }
 
@@ -2095,7 +2116,7 @@ fn openTerminalPaneInEmptyWorkspace(self: anytype, project_index: usize) bool {
     if (self.projectTerminalDockMutable(project_index, dock_id)) |dock| dock.visible = false;
     self.requestTerminalDockFocus(dock_id);
     self.setSidebarNotice("Terminal pane created.");
-    self.markDirty();
+    self.markWorkspaceDirty(project_index);
     return true;
 }
 
@@ -2210,6 +2231,7 @@ pub fn openThreadInTui(self: anytype, project_index: usize, thread_index: usize)
     };
     var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return;
     _ = dock.setActiveTabPinnedProvider(self.allocator, @tagName(thread.provider));
+    _ = self.workspaceAgentTuiHistoryAt(project_index, dock_id);
 
     pane.ref = .{ .terminal = .{ .dock_id = dock_id } };
     layout.focused_pane_id = pane_id;
@@ -2344,7 +2366,7 @@ fn joinCurrentProjectCreatedPaneToScrollGroup(self: anytype, target_pane_id: Wor
     const new_pane_id = layout.focused_pane_id orelse return false;
     if (new_pane_id == target_pane_id) return true;
     if (!layout.joinPaneToScrollGroup(target_pane_id, new_pane_id)) return false;
-    self.markDirty();
+    self.markWorkspaceDirty(self.project_controller.selected_index);
     return true;
 }
 
@@ -2384,7 +2406,7 @@ pub fn splitWorkspacePaneWithTerminalPlacement(self: anytype, project_index: usi
     dock.visible = false;
     if (self.project_controller.selected_index == project_index) self.requestTerminalDockFocus(dock_id);
     self.setSidebarNotice("Terminal pane created.");
-    self.markDirty();
+    self.markWorkspaceDirty(project_index);
     return true;
 }
 
@@ -2416,7 +2438,7 @@ pub fn resizeWorkspaceSplit(
     if (project_index >= self.project_controller.projects.items.len) return false;
     var layout = &self.project_controller.projects.items[project_index].workspace_layout;
     if (!layout.resizeSplit(first_pane_id, second_pane_id, axis, ratio)) return false;
-    self.markDirty();
+    self.markWorkspaceDirty(project_index);
     return true;
 }
 
@@ -2430,7 +2452,7 @@ pub fn nudgeCurrentProjectWorkspaceSplit(
     if (self.project_controller.projects.items.len == 0) return false;
     var layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
     if (layout.nudgeSplitRatio(first_pane_id, second_pane_id, axis, delta)) {
-        self.markDirty();
+        self.markWorkspaceDirty(self.project_controller.selected_index);
         return true;
     }
     return false;

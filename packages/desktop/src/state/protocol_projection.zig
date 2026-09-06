@@ -56,7 +56,7 @@ pub fn messagesToPersisted(
     return out;
 }
 
-fn snapshotThreadToPersisted(
+pub fn snapshotThreadToPersisted(
     allocator: std.mem.Allocator,
     thread: headless.store.Thread,
 ) !db_types.PersistedThread {

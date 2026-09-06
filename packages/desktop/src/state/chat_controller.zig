@@ -75,6 +75,15 @@ const DAEMON_CHAT_POLL_BACKOFF_MAX_MS: i64 = 1000;
 // for bounded replay pages so one synchronous tail cannot exceed the IPC cap
 // or monopolize the render thread.
 const DAEMON_CHAT_TAIL_PAGE_BYTES: usize = 1024 * 1024;
+// Local tails long-poll: the daemon parks the request until the turn has
+// events past `after_seq` or reaches a terminal status, so deltas reach the
+// GUI on arrival instead of on the next pull. Well under the 5s client
+// request timeout, and it bounds how long a shutdown join can wait.
+const DAEMON_CHAT_TAIL_WAIT_MS: u32 = 250;
+// Retry spacing after an empty reply that came back well before the wait
+// elapsed: that is the daemon's over-cap degradation (it refused to park), so
+// re-arming at frame rate would hammer an already saturated daemon.
+const DAEMON_CHAT_TAIL_HEARTBEAT_RETRY_MS: i64 = 100;
 const REMOTE_CHAT_TAIL_PAGE_BYTES: usize = 256 * 1024;
 const MAX_REMOTE_CONTROL_DISPATCHES: usize = 64;
 const OPENCODE_LOGO_BYTES = @embedFile("../assets/opencode-logo-dark.png");
@@ -619,11 +628,11 @@ pub const State = struct {
     /// In-flight chat.turn.start acceptance workers (7.5): the RPC runs off
     /// the event thread; outcomes commit on the main thread in pollSend.
     acceptance_dispatches: std.ArrayListUnmanaged(*AcceptanceDispatch) = .empty,
-    /// Single-slot chat.turn.tail worker: the tail RPC runs off the render
-    /// thread; the response commits on the main thread in pollSend. One slot
-    /// keeps the reusable connection and response buffer exclusive.
-    daemon_tail_worker: ?std.Thread = null,
-    daemon_tail_args: ?*DaemonTailWorkerArgs = null,
+    /// In-flight chat.turn.tail long-polls, one per tailed daemon turn: each
+    /// RPC parks off the render thread and its response commits on the main
+    /// thread in pollSend. A slot per turn keeps one parked tail from
+    /// starving the other pending threads.
+    daemon_tail_slots: std.ArrayListUnmanaged(DaemonTailSlot) = .empty,
     /// Manager-targeted remote RPCs have no controller-owned workers. Every
     /// ticket remains here until the SDL owner drains and validates it.
     remote_tail_dispatches: std.ArrayListUnmanaged(RemoteTailDispatch) = .empty,
@@ -631,10 +640,11 @@ pub const State = struct {
 
     /// Releases chat-controller-owned polling scratch space.
     pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
-        if (self.daemon_tail_worker) |worker| worker.join();
-        self.daemon_tail_worker = null;
-        if (self.daemon_tail_args) |args| args.destroy();
-        self.daemon_tail_args = null;
+        for (self.daemon_tail_slots.items) |*slot| {
+            if (slot.worker) |worker| worker.join();
+            slot.args.destroy();
+        }
+        self.daemon_tail_slots.deinit(std.heap.page_allocator);
         for (self.acceptance_dispatches.items) |dispatch| {
             if (dispatch.worker) |worker| worker.join();
             dispatch.destroy(allocator);
@@ -5588,8 +5598,8 @@ pub fn backgroundTaskProcessIsAlive(pid: u32) bool {
 const DAEMON_CHAT_TAIL_FAIL_THRESHOLD: u8 = 16;
 
 /// One in-flight chat.turn.tail request. `response_buffer` is borrowed from
-/// chat_controller.State scratch — safe because the single worker slot keeps
-/// it (and the reusable connection) exclusive while the worker runs.
+/// chat_controller.State scratch and only read for its length, so concurrent
+/// slots may share it (and the stateless reusable connection).
 pub const DaemonTailWorkerArgs = struct {
     pref_path: []u8,
     turn_id: []u8,
@@ -5609,8 +5619,18 @@ pub const DaemonTailWorkerArgs = struct {
     }
 };
 
+/// One tailed daemon turn's worker and its request/response record.
+pub const DaemonTailSlot = struct {
+    worker: ?std.Thread = null,
+    args: *DaemonTailWorkerArgs,
+};
+
 fn daemonTailWorkerMain(connection: *daemon_client.ReusableRequestConnection, args: *DaemonTailWorkerArgs) void {
     const page_alloc = std.heap.page_allocator;
+    // Wake the frame loop either way: the main thread only commits this
+    // response from pollSend, and without a wake a parked reply would sit
+    // until the next timed tick or an unrelated input event.
+    defer loop_wakeup.notify();
     const response = connection.requestAllocUsingBuffer(
         page_alloc,
         args.pref_path,
@@ -5619,6 +5639,7 @@ fn daemonTailWorkerMain(connection: *daemon_client.ReusableRequestConnection, ar
             .turn_id = args.turn_id,
             .after_seq = args.after_seq,
             .max_bytes = DAEMON_CHAT_TAIL_PAGE_BYTES,
+            .wait_ms = DAEMON_CHAT_TAIL_WAIT_MS,
         },
         2,
         args.response_buffer,
@@ -5630,6 +5651,13 @@ fn daemonTailWorkerMain(connection: *daemon_client.ReusableRequestConnection, ar
     };
     args.response = response;
     args.done.store(true, .release);
+}
+
+fn daemonTailSlotIndex(chat: *const State, turn_id: []const u8) ?usize {
+    for (chat.daemon_tail_slots.items, 0..) |slot, index| {
+        if (std.mem.eql(u8, slot.args.turn_id, turn_id)) return index;
+    }
+    return null;
 }
 
 fn threadUsesRemoteRuntime(thread: *const ChatThread) bool {
@@ -5797,22 +5825,23 @@ fn serviceRemoteChatTails(self: anytype) bool {
     return changed;
 }
 
-/// Dispatch half of the tail poll: when this thread's turn is due and the
-/// single worker slot is free, hand the RPC to a worker so the render thread
-/// never blocks in daemon IPC. The measured-cost backoff still applies at
-/// service time as the fallback pacing for a slow daemon.
+/// Dispatch half of the tail poll: when this thread's turn is due and has no
+/// long-poll parked already, hand the RPC to a worker so the render thread
+/// never blocks in daemon IPC. Pacing is decided at service time from the
+/// reply (news, over-cap heartbeat, timeout, or failure).
 pub fn pollDaemonChatTurn(self: anytype, project_index: usize, thread: *ChatThread) bool {
     if (threadUsesRemoteRuntime(thread)) return pollRemoteDaemonChatTurn(self, project_index, thread);
     const chat = &self.chat_controller;
-    // Single slot in flight: skip until the response is serviced in pollSend.
-    if (chat.daemon_tail_args != null) return false;
 
     const page_alloc = std.heap.page_allocator;
     const send_state = thread.send_state;
     const now_ms = monotonicMs();
     send_state.mutex.lock();
     const active = send_state.status == .pending and send_state.daemon_owned and send_state.daemon_turn_id != null;
-    const poll_due = active and daemonChatPollDue(send_state.daemon_last_poll_ms, now_ms, send_state.daemon_poll_backoff_ms);
+    // One long-poll in flight per turn: skip until pollSend services it.
+    const tail_in_flight = active and daemonTailSlotIndex(chat, send_state.daemon_turn_id.?) != null;
+    const poll_due = active and !tail_in_flight and
+        daemonChatPollDue(send_state.daemon_last_poll_ms, now_ms, send_state.daemon_poll_backoff_ms);
     if (poll_due) send_state.daemon_last_poll_ms = now_ms;
     const turn_id = if (poll_due)
         page_alloc.dupe(u8, send_state.daemon_turn_id.?) catch null
@@ -5844,36 +5873,54 @@ pub fn pollDaemonChatTurn(self: anytype, project_index: usize, thread: *ChatThre
         .started_at_ms = now_ms,
         .response_buffer = response_buffer,
     };
-    chat.daemon_tail_args = args;
-    chat.daemon_tail_worker = std.Thread.spawn(.{}, daemonTailWorkerMain, .{ &chat.daemon_tail_connection, args }) catch |err| {
+    chat.daemon_tail_slots.append(page_alloc, .{ .args = args }) catch |err| {
+        log.warn("failed to track daemon chat tail worker: {s}", .{@errorName(err)});
+        args.destroy();
+        return false;
+    };
+    const slot = &chat.daemon_tail_slots.items[chat.daemon_tail_slots.items.len - 1];
+    slot.worker = std.Thread.spawn(.{}, daemonTailWorkerMain, .{ &chat.daemon_tail_connection, args }) catch |err| {
         log.warn("failed to spawn daemon chat tail worker: {s}", .{@errorName(err)});
-        chat.daemon_tail_args = null;
+        _ = chat.daemon_tail_slots.pop();
         args.destroy();
         return false;
     };
     return false;
 }
 
-/// Service half of the tail poll (main thread, from pollSend): joins a
-/// finished worker, applies pacing from the measured round trip, and commits
-/// the response to whichever thread still owns the tailed turn.
+/// Service half of the tail poll (main thread, from pollSend): joins every
+/// finished worker, applies pacing from its reply, and commits the response
+/// to whichever thread still owns the tailed turn.
 pub fn serviceDaemonChatTailWorker(self: anytype) bool {
     const chat = &self.chat_controller;
-    const args = chat.daemon_tail_args orelse return false;
-    if (!args.done.load(.acquire)) return false;
-    if (chat.daemon_tail_worker) |worker| worker.join();
-    chat.daemon_tail_worker = null;
-    chat.daemon_tail_args = null;
+    var changed = false;
+    var index: usize = 0;
+    while (index < chat.daemon_tail_slots.items.len) {
+        const slot = chat.daemon_tail_slots.items[index];
+        if (!slot.args.done.load(.acquire)) {
+            index += 1;
+            continue;
+        }
+        if (slot.worker) |worker| worker.join();
+        _ = chat.daemon_tail_slots.swapRemove(index);
+        changed = commitDaemonChatTail(self, slot.args) or changed;
+    }
+    return changed;
+}
+
+fn commitDaemonChatTail(self: anytype, args: *DaemonTailWorkerArgs) bool {
     defer args.destroy();
+    const elapsed_ms = monotonicMs() - args.started_at_ms;
 
     const thread = threadByDaemonTurnId(self, args.turn_id) orelse return false;
     const send_state = thread.send_state;
     send_state.mutex.lock();
     const still_active = send_state.status == .pending and send_state.daemon_owned;
-    // Fallback pacing (success or failure): the next poll waits at least
-    // FACTOR× the measured round trip so a slow daemon is tailed at spaced
-    // intervals instead of every frame.
-    send_state.daemon_poll_backoff_ms = daemonChatPollBackoffMs(monotonicMs() - args.started_at_ms);
+    // Failure pacing (transport error, not-found, apply error): the next poll
+    // waits at least FACTOR× the measured round trip so a flapping daemon is
+    // tailed at spaced intervals instead of every frame. A successful
+    // long-poll reply re-paces below from what it carried.
+    send_state.daemon_poll_backoff_ms = daemonChatPollBackoffMs(elapsed_ms);
     send_state.mutex.unlock();
     if (!still_active) return false;
 
@@ -5892,11 +5939,10 @@ pub fn serviceDaemonChatTailWorker(self: anytype) bool {
         log.warn("failed to apply daemon chat turn tail: {s}", .{@errorName(err)});
         return noteDaemonChatTailFailure(thread, "failed to apply daemon chat turn");
     };
-    if (applied) {
-        send_state.mutex.lock();
-        send_state.daemon_tail_fail_count = 0;
-        send_state.mutex.unlock();
-    }
+    send_state.mutex.lock();
+    send_state.daemon_poll_backoff_ms = daemonChatTailBackoffMs(applied, elapsed_ms);
+    if (applied) send_state.daemon_tail_fail_count = 0;
+    send_state.mutex.unlock();
     return applied;
 }
 
@@ -5970,6 +6016,30 @@ fn daemonChatPollDue(last_poll_ms: i64, now_ms: i64, backoff_ms: i64) bool {
 fn daemonChatPollBackoffMs(elapsed_ms: i64) i64 {
     const budget_ms = elapsed_ms * DAEMON_CHAT_POLL_BUDGET_FACTOR - DAEMON_CHAT_POLL_INTERVAL_MS;
     return std.math.clamp(budget_ms, 0, DAEMON_CHAT_POLL_BACKOFF_MAX_MS);
+}
+
+/// Pacing after a successful long-poll reply. The daemon parks the tail up to
+/// DAEMON_CHAT_TAIL_WAIT_MS and answers as soon as there is news, so the
+/// measured round trip says nothing about daemon cost any more:
+/// - news applied: re-arm at the display cadence;
+/// - an empty reply well before the wait elapsed: the daemon refused to park
+///   (shared long-poll cap), so space the retries;
+/// - an empty reply after the full wait: a plain timeout, re-arm now.
+fn daemonChatTailBackoffMs(had_news: bool, elapsed_ms: i64) i64 {
+    if (had_news) return 0;
+    if (elapsed_ms < @as(i64, DAEMON_CHAT_TAIL_WAIT_MS) / 2) return DAEMON_CHAT_TAIL_HEARTBEAT_RETRY_MS;
+    return 0;
+}
+
+test "daemon chat tail long-poll re-arms on news and paces over-cap heartbeats" {
+    // Events arrived mid-park: poll again at the display cadence.
+    try std.testing.expectEqual(@as(i64, 0), daemonChatTailBackoffMs(true, 180));
+    try std.testing.expectEqual(@as(i64, 0), daemonChatTailBackoffMs(true, 3));
+    // Immediate empty reply: the daemon hit its long-poll cap and answered
+    // without parking; retrying every frame would only add load.
+    try std.testing.expectEqual(DAEMON_CHAT_TAIL_HEARTBEAT_RETRY_MS, daemonChatTailBackoffMs(false, 3));
+    // The park timed out without news: re-arm right away.
+    try std.testing.expectEqual(@as(i64, 0), daemonChatTailBackoffMs(false, 251));
 }
 
 test "daemon chat tail polling keeps the active display cadence" {
@@ -6230,7 +6300,6 @@ pub fn applyDaemonChatTurnTail(self: anytype, thread: *ChatThread, response: []c
                     .message_id = owned_id,
                 });
                 thread.touch();
-                self.markDirty();
                 changed = true;
             }
         }
@@ -6257,7 +6326,6 @@ pub fn applyDaemonChatTurnTail(self: anytype, thread: *ChatThread, response: []c
                 self.allocator.free(thread.title);
                 thread.title = owned_title;
                 thread.committed = true;
-                self.markDirty();
             }
         }
         const provider_thread_id = jsonValueString(result.object.get("provider_thread_id") orelse .null) orelse send_state.provisional_provider_thread_id orelse "";
@@ -6631,11 +6699,12 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
                 defer freePendingTimelineEvents(std.heap.page_allocator, &completed_events);
                 defer freePendingDiffFiles(std.heap.page_allocator, &completed_diff_files);
                 const should_append_reply_text = !had_assistant_events;
-                self.applyPendingTimelineEvents(thread, &completed_events) catch |err| {
+                const persist_projection = completed_daemon_turn_id == null;
+                self.applyPendingTimelineEvents(thread, &completed_events, persist_projection) catch |err| {
                     log.err("failed to apply timeline events: {s}", .{@errorName(err)});
                 };
                 if (!completed_local_command) {
-                    self.applySendSuccess(thread, result, should_append_reply_text) catch |err| {
+                    self.applySendSuccess(thread, result, should_append_reply_text, persist_projection) catch |err| {
                         log.err("failed to apply send result: {s}", .{@errorName(err)});
                         self.setSidebarNotice("Failed to apply provider reply.");
                     };
@@ -6674,7 +6743,7 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
             defer freePendingDiffFiles(std.heap.page_allocator, &completed_diff_files);
             if (failed_message) |message| {
                 defer std.heap.page_allocator.free(message);
-                self.applySendFailure(thread, &completed_events, message) catch |err| {
+                self.applySendFailure(thread, &completed_events, message, completed_daemon_turn_id == null) catch |err| {
                     log.err("failed to apply send failure: {s}", .{@errorName(err)});
                 };
                 self.setSidebarNotice(message);
@@ -6693,7 +6762,7 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
         .aborted => {
             defer freePendingTimelineEvents(std.heap.page_allocator, &completed_events);
             defer freePendingDiffFiles(std.heap.page_allocator, &completed_diff_files);
-            self.applyPendingTimelineEvents(thread, &completed_events) catch |err| {
+            self.applyPendingTimelineEvents(thread, &completed_events, completed_daemon_turn_id == null) catch |err| {
                 log.err("failed to apply aborted timeline events: {s}", .{@errorName(err)});
             };
             if (completed_local_command) {
@@ -6817,7 +6886,6 @@ fn adoptTranscriptIdentitiesFromStoreMessages(
     store_messages: []const std.json.Value,
 ) AdoptionOutcome {
     var projection_index: usize = 0;
-    var adopted_any = false;
     var unresolved = false;
     for (store_messages) |message_value| {
         if (message_value != .object) continue;
@@ -6856,7 +6924,7 @@ fn adoptTranscriptIdentitiesFromStoreMessages(
         if (match_index) |matched| {
             const row = &thread.messages.items[matched];
             row.message_id = self.allocator.dupe(u8, store_id) catch null;
-            if (row.message_id != null) adopted_any = true else unresolved = true;
+            if (row.message_id == null) unresolved = true;
             projection_index = matched + 1;
         } else {
             unresolved = true;
@@ -6868,7 +6936,6 @@ fn adoptTranscriptIdentitiesFromStoreMessages(
     }
     if (unresolved) return .incomplete;
     const suffix = hydrateTranscriptSuffixFromStoreMessages(self.allocator, thread, store_messages);
-    if (adopted_any or suffix.appended) self.markDirty();
     return if (unresolved or suffix.incomplete) .incomplete else .complete;
 }
 
@@ -6911,6 +6978,22 @@ fn hydrateTranscriptSuffixFromStoreMessages(
         thread.touch();
     }
     return result;
+}
+
+/// Apply a committed daemon sync without replacing local identity or drafts.
+pub fn replaceThreadTranscriptFromStoreMessages(
+    allocator: std.mem.Allocator,
+    thread: *ChatThread,
+    rows: []const std.json.Value,
+) !void {
+    var staged = try ChatThread.init(allocator, "synced transcript");
+    defer staged.deinit(allocator);
+    for (rows) |row| try appendStoreMessageToThread(allocator, &staged, row);
+    thread.clearMessages(allocator);
+    std.mem.swap(@TypeOf(thread.messages), &thread.messages, &staged.messages);
+    thread.persisted_message_offset = 0;
+    thread.rebuildBackgroundTasksFromMessages(allocator);
+    thread.touch();
 }
 
 fn appendStoreMessageToThread(
@@ -8154,6 +8237,7 @@ pub fn capturePendingProviderThreadId(self: anytype, thread: *ChatThread) void {
 
     const send_state = thread.send_state;
     if (!send_state.mutex.tryLock()) return;
+    const daemon_owned = send_state.daemon_owned;
     const thread_id = if (send_state.status == .pending and send_state.provisional_provider_thread_id != null)
         self.allocator.dupeZ(u8, send_state.provisional_provider_thread_id.?) catch null
     else
@@ -8161,6 +8245,7 @@ pub fn capturePendingProviderThreadId(self: anytype, thread: *ChatThread) void {
     send_state.mutex.unlock();
 
     thread.provider_thread_id = thread_id orelse return;
+    if (daemon_owned) return;
     self.markDirty();
     self.flushDirtyNow();
 }
@@ -9325,14 +9410,20 @@ fn resolveThreadPendingApproval(self: anytype, thread: *ChatThread, decision: pr
     }
 }
 
-pub fn applySendSuccess(self: anytype, thread: *ChatThread, result: SendResultPayload, append_reply_text: bool) !void {
+pub fn applySendSuccess(
+    self: anytype,
+    thread: *ChatThread,
+    result: SendResultPayload,
+    append_reply_text: bool,
+    persist_projection: bool,
+) !void {
     if (thread.provider_thread_id) |thread_id| {
         self.allocator.free(thread_id);
     }
     thread.provider_thread_id = try self.allocator.dupeZ(u8, result.provider_thread_id);
     if (!append_reply_text) {
         thread.touch();
-        self.markDirty();
+        if (persist_projection) self.markDirty();
         self.setSidebarNotice("Provider session updated.");
         return;
     }
@@ -9355,12 +9446,20 @@ pub fn applySendSuccess(self: anytype, thread: *ChatThread, result: SendResultPa
         });
     }
     thread.touch();
-    self.markDirty();
+    if (persist_projection) self.markDirty();
     self.setSidebarNotice("Provider session updated.");
 }
 
-pub fn applyPendingTimelineEvents(self: anytype, thread: *ChatThread, events: *std.ArrayListUnmanaged(PendingTimelineEvent)) !void {
+pub fn applyPendingTimelineEvents(
+    self: anytype,
+    thread: *ChatThread,
+    events: *std.ArrayListUnmanaged(PendingTimelineEvent),
+    persist_projection: bool,
+) !void {
     if (events.items.len == 0) return;
+    // A failed batch can already have appended rows. Preserve those local
+    // edits too, while daemon-owned batches remain projection-only.
+    defer if (persist_projection) self.markDirty();
     for (events.items) |event| {
         // M5-P4 Amendment 1 (reducer alignment): the daemon reducer commits a
         // system row for EVERY message event — including the codex background
@@ -9383,7 +9482,6 @@ pub fn applyPendingTimelineEvents(self: anytype, thread: *ChatThread, events: *s
         }
     }
     thread.touch();
-    self.markDirty();
 }
 
 fn appendPendingTimelineEvent(self: anytype, thread: *ChatThread, event: PendingTimelineEvent) !void {
@@ -9393,7 +9491,9 @@ fn appendPendingTimelineEvent(self: anytype, thread: *ChatThread, event: Pending
     errdefer if (owned_message_id) |id| self.allocator.free(id);
     const first_image: ?*const ChatImageAttachment = if (event.images.items.len > 0) &event.images.items[0] else null;
     const extra_images: []const ChatImageAttachment = if (event.images.items.len > 1) event.images.items[1..] else &.{};
-    try self.appendMessageToThread(thread, event.role, event.author, event.body, first_image, extra_images);
+    // The batch owns the persistence decision. Calling the durable append
+    // here defeats persist_projection=false for daemon-owned completions.
+    try self.appendProjectedMessageToThread(thread, event.role, event.author, event.body, first_image, extra_images);
     const message = &thread.messages.items[thread.messages.items.len - 1];
     message.transcript_card_started_ms = event.transcript_card_started_ms;
     message.tool_call_id = owned_tool_call_id;
@@ -9422,6 +9522,8 @@ pub fn reconcileCodexBackgroundSnapshot(self: anytype, thread: *ChatThread, body
         task.updated_at_ms = now_ms;
         const completion_body = try backgroundTaskCompletionBodyAlloc(self.allocator, task);
         defer self.allocator.free(completion_body);
+        // This row is synthesized locally, so it still needs persistence even
+        // when the provider snapshot itself is already owned by the daemon.
         try self.appendMessageToThread(thread, .system, "Background task completed", completion_body, null, &.{});
     }
 }
@@ -9431,6 +9533,7 @@ pub fn applySendFailure(
     thread: *ChatThread,
     events: *std.ArrayListUnmanaged(PendingTimelineEvent),
     failure_message: []const u8,
+    persist_projection: bool,
 ) !void {
     for (events.items) |event| {
         // M5-P4 Amendment 1 (reducer alignment): keep the failure path
@@ -9462,5 +9565,5 @@ pub fn applySendFailure(
         .image = null,
     });
     thread.touch();
-    self.markDirty();
+    if (persist_projection) self.markDirty();
 }

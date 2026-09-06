@@ -366,6 +366,15 @@ pub const Project = struct {
     sidebar_thread_indices: std.ArrayList(usize) = .empty,
     sidebar_committed_thread_count: usize = 0,
     sidebar_thread_cache_dirty: bool = true,
+    /// Content hash of the persisted record this project was last built
+    /// from (persistence.persistedProjectContentHash). A projection refresh
+    /// whose record hashes the same borrows the live project instead of
+    /// rebuilding it.
+    projection_content_hash: u64 = 0,
+    /// Transient: set on both copies while a refresh stages a borrowed live
+    /// project. The staged copy owns the heap state; container teardown skips
+    /// flagged entries.
+    projection_borrowed: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, id: []const u8, label: []const u8, path: []const u8, unread_count: u8) !Project {
         var terminal_dock = try terminal.Dock.init(allocator);
@@ -531,6 +540,8 @@ pub const Project = struct {
             if (std.mem.eql(u8, thread.local_thread_id, local_id)) break index;
         } else return false;
         const thread = &self.threads.items[thread_index];
+        // A borrowed live thread already survived this cleanup once.
+        if (thread.projection_borrowed) return false;
         if (thread.committed or thread.messages.items.len != 0 or thread.provider_thread_id != null or
             thread.currentDraft().len != 0 or thread.draftImageCount() != 0 or thread.background_tasks.items.len != 0 or
             thread.completion_pending or self.selected_thread_index == thread_index)
@@ -574,6 +585,36 @@ pub const Project = struct {
         }
         self.invalidateSidebarThreadCache();
         return true;
+    }
+
+    /// Removes one thread from the open array and keeps every ordinal that
+    /// points into it (chat pane refs, selected thread) consistent. The caller
+    /// owns the returned thread.
+    pub fn removeThreadAtIndex(self: *Project, thread_index: usize) ChatThread {
+        const removed = self.threads.orderedRemove(thread_index);
+        for (self.workspace_layout.panes.items) |*pane| switch (pane.ref) {
+            .chat => |*ref| if (ref.thread_index > thread_index) {
+                ref.thread_index -= 1;
+            },
+            else => {},
+        };
+        if (thread_index < self.selected_thread_index) {
+            self.selected_thread_index -= 1;
+        } else if (self.threads.items.len == 0) {
+            self.selected_thread_index = 0;
+        } else if (self.selected_thread_index >= self.threads.items.len) {
+            self.selected_thread_index = self.threads.items.len - 1;
+        }
+        self.invalidateSidebarThreadCache();
+        return removed;
+    }
+
+    pub fn hasChatPaneForThread(self: *const Project, thread_index: usize) bool {
+        for (self.workspace_layout.panes.items) |pane| switch (pane.ref) {
+            .chat => |ref| if (ref.thread_index == thread_index) return true,
+            else => {},
+        };
+        return false;
     }
 
     pub fn normalize(self: *Project, allocator: std.mem.Allocator, default_terminal_font_size: f32) !void {
@@ -843,12 +884,14 @@ pub const Project = struct {
         self.pending_terminal_teardowns.deinit(allocator);
         if (self.stack_config_error) |message| allocator.free(message);
         self.workspace_layout.deinit(allocator);
+        // Threads flagged `projection_borrowed` were moved into a staged
+        // projection by a refresh and are owned there.
         for (self.threads.items) |*thread| {
-            thread.deinit(allocator);
+            if (!thread.projection_borrowed) thread.deinit(allocator);
         }
         self.threads.deinit(allocator);
         for (self.archived_threads.items) |*thread| {
-            thread.deinit(allocator);
+            if (!thread.projection_borrowed) thread.deinit(allocator);
         }
         self.archived_threads.deinit(allocator);
         if (self.companion_thread_local_id) |local_id| allocator.free(local_id);

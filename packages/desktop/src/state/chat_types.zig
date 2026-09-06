@@ -408,6 +408,14 @@ pub const ChatThread = struct {
     /// Store revision that durably acknowledged `draft_mutation_generation`.
     /// Zero means the mutation has not reached durable state yet.
     draft_mutation_ack_revision: u64 = 0,
+    /// Content hash of the persisted record this thread was last built from
+    /// (persistence.persistedThreadContentHash); a refresh whose record
+    /// hashes the same borrows the live thread instead of rebuilding it.
+    projection_content_hash: u64 = 0,
+    /// Transient: set on both copies while a refresh stages a borrowed live
+    /// thread. The staged copy owns the heap state; teardown skips flagged
+    /// entries.
+    projection_borrowed: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, title: []const u8) !ChatThread {
         const send_state = try allocator.create(SendState);

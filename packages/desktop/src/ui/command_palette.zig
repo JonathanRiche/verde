@@ -21,6 +21,7 @@ const keybinds = @import("../app/keybinds.zig");
 const platform_runtime = @import("platform_runtime");
 const Provider = native_state.Provider;
 const AgentProvider = native_state.AgentTuiProvider;
+const AgentTuiHistoryProvider = native_state.AgentTuiHistoryProvider;
 
 const log = std.log.scoped(.native_ui_command_palette);
 
@@ -67,6 +68,7 @@ const KeybindRef = enum {
     chat_model_picker,
     chat_run_config,
     chat_directory_picker,
+    settings,
     toggle_sidebar,
     toggle_browser,
     toggle_terminal,
@@ -144,7 +146,7 @@ const STATIC_COMMANDS = [_]Command{
     .{ .id = "workspace.herdr_focus_terminal", .title = "Open/Focus Herdr Terminal", .keywords = "runtime terminal tui", .section = .workspaces, .run = runFocusHerdrTerminal, .enabled = currentWorkspaceHerdrLinked },
     .{ .id = "workspace.herdr_unlink", .title = "Run Workspace Locally", .keywords = "unlink herdr runtime local", .section = .workspaces, .run = runUnlinkHerdrWorkspace, .enabled = currentWorkspaceHerdrLinked },
     .{ .id = "app.history", .title = "History: This Workspace", .keywords = "saved chats threads search recent", .section = .app, .run = runHistoryThisWorkspace, .enabled = hasProjects, .keeps_open = true },
-    .{ .id = "app.settings", .title = "Open Settings", .keywords = "preferences config options", .section = .app, .run = runSettings },
+    .{ .id = "app.settings", .title = "Open Settings", .keywords = "preferences config options", .section = .app, .keybind = .settings, .run = runSettings },
     .{ .id = "app.sidebar", .title = "Toggle Sidebar", .keywords = "rail collapse", .section = .app, .keybind = .toggle_sidebar, .run = runToggleSidebar },
 };
 
@@ -158,6 +160,9 @@ const ResultRef = union(enum) {
     command: usize,
     thread: ThreadRef,
     agent_tui: AgentTuiRef,
+    /// Index into `state.paletteHistoryItems()`: a closed thread fetched on
+    /// demand from the daemon (item 5b).
+    history: usize,
     /// Project index for a "Switch to <workspace>" row.
     workspace: usize,
     /// Archived-project index for a "Reopen <workspace>" row.
@@ -404,6 +409,11 @@ pub fn activateRow(state: *runtime.AppState, row_index: usize, replace: bool) vo
         .thread => |tr| {
             state.closeCommandPalette();
             openThread(state, tr, threadOpenIntentForActivation(replace));
+        },
+        .history => |hi| {
+            // The history cache is freed on close; open first, then close.
+            state.openHistoryThread(hi);
+            state.closeCommandPalette();
         },
         .agent_tui => |tui| {
             state.closeCommandPalette();
@@ -674,6 +684,16 @@ fn buildScopedHistory(state: *runtime.AppState, project_index: usize, query: []c
         };
         entry_count += 1;
     }
+    for (state.paletteHistoryItems(), 0..) |item, hi| {
+        if (entry_count >= entries.len) break;
+        if (!std.mem.eql(u8, item.workspace_id, project.id)) continue;
+        if (query.len > 0 and fuzzyScore(item.title, query) == null) continue;
+        entries[entry_count] = .{
+            .ref = .{ .history = hi },
+            .at = item.last_activity_at orelse 0,
+        };
+        entry_count += 1;
+    }
 
     std.sort.pdq(HistoryEntry, entries[0..entry_count], {}, historyEntryLessThan);
     const now = unixTimestampSeconds();
@@ -746,6 +766,12 @@ fn buildRanked(state: *runtime.AppState, query: []const u8) void {
             });
         }
     }
+    for (state.paletteHistoryItems(), 0..) |item, hi| {
+        const score = fuzzyScore(item.title, query) orelse continue;
+        const age_days: i32 = @intCast(@min(@divTrunc(@max(now - (item.last_activity_at orelse 0), 0), 60 * 60 * 24), 30));
+        // Cold threads rank just under an equally matching open thread.
+        appendCandidate(&candidates, &candidate_count, .{ .ref = .{ .history = hi }, .score = score + (30 - age_days) - 5 });
+    }
     for (state.project_controller.archived_projects.items, 0..) |*project, ai| {
         const label_score = fuzzyScore(project.label, query);
         const path_score = fuzzyScore(project.path, query);
@@ -801,23 +827,24 @@ fn matchThread(thread: anytype, query: []const u8) ?i32 {
     return null;
 }
 
-fn matchAgentTui(state: *runtime.AppState, project_index: usize, dock_id: u32, provider: AgentProvider, query: []const u8) bool {
+fn matchAgentTui(state: *runtime.AppState, project_index: usize, dock_id: u32, provider: AgentTuiHistoryProvider, query: []const u8) bool {
     if (fuzzyScore(agentTuiSearchLabel(provider), query) != null) return true;
     var title_buf: [96]u8 = undefined;
     const dock = state.projectTerminalDock(project_index, dock_id) orelse return false;
     return fuzzyScore(dock.activeProcessLabel(&title_buf), query) != null;
 }
 
-fn agentTuiSearchLabel(provider: AgentProvider) []const u8 {
+fn agentTuiSearchLabel(provider: AgentTuiHistoryProvider) []const u8 {
     return switch (provider) {
         .codex => "Codex TUI",
         .claude => "Claude TUI",
         .opencode => "OpenCode TUI",
         .cursor => "Cursor TUI",
+        .pi => "Pi TUI",
+        .fx => "FX TUI",
         .grok => "Grok TUI",
         .amp => "Amp TUI",
         .muse => "Muse TUI",
-        .other => "Agent TUI",
     };
 }
 
@@ -1643,6 +1670,7 @@ fn renderRows(state: *runtime.AppState) void {
             },
             .command => |ci| renderCommandRow(state, i, ci, rect, row_clip),
             .thread => |tr| renderThreadRow(state, i, tr, rect, row_clip),
+            .history => |hi| renderHistoryRow(state, i, hi, rect, row_clip),
             .agent_tui => |tui| renderAgentTuiRow(state, i, tui, rect, row_clip),
             .workspace => |pi| renderWorkspaceRow(state, i, pi, rect, row_clip),
             .closed_workspace => |ai| renderClosedWorkspaceRow(state, i, ai, rect, row_clip),
@@ -1737,6 +1765,51 @@ fn renderThreadRow(state: *runtime.AppState, row_index: usize, tr: ThreadRef, re
     if (show_workspace) {
         right -= workspace_w;
         queueText(state, .{ .x = right, .y = text_y, .w = workspace_w - theme.scaledUi(8.0), .h = font_size * 1.3 }, project.label, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);
+    }
+}
+
+/// Row for a closed thread fetched from the daemon (item 5b).
+fn renderHistoryRow(state: *runtime.AppState, row_index: usize, history_index: usize, rect: palette.Rect, row_clip: palette.Rect) void {
+    renderRowBackground(state, row_index, rect, row_clip);
+    const items = state.paletteHistoryItems();
+    if (history_index >= items.len) return;
+    const item = items[history_index];
+    const emphasis = state.command_controller.selected == row_index;
+    const font_size = theme.scaledUi(13.5);
+    const text_y = rect.y + (rect.h - font_size * 1.3) * 0.5;
+
+    const provider = std.meta.stringToEnum(Provider, item.provider) orelse .opencode;
+    sidebar.queuePaletteProviderGlyph(state, provider, rect.x + theme.scaledUi(10.0), rect.y + rect.h * 0.5, row_clip);
+
+    const time_w = theme.scaledUi(56.0);
+    const closed_w = theme.scaledUi(48.0);
+    const show_workspace = state.command_controller.scope_project == null;
+    const workspace_w = if (show_workspace) theme.scaledUi(96.0) else 0.0;
+    const title_x = rect.x + theme.scaledUi(42.0);
+    queueText(state, .{
+        .x = title_x,
+        .y = text_y,
+        .w = rect.w - (title_x - rect.x) - workspace_w - closed_w - time_w - theme.scaledUi(16.0),
+        .h = font_size * 1.3,
+    }, item.title, paletteColor(if (emphasis) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), font_size, row_clip);
+
+    var right = rect.x + rect.w - theme.scaledUi(8.0);
+    var time_buf: [24]u8 = undefined;
+    const relative_time = sidebar.formatRelativeTime(&time_buf, item.last_activity_at orelse 0);
+    right -= time_w;
+    queueText(state, .{ .x = right, .y = text_y, .w = time_w, .h = font_size * 1.3 }, relative_time, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);
+    right -= closed_w;
+    queueText(state, .{ .x = right, .y = text_y, .w = closed_w, .h = font_size * 1.3 }, "closed", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);
+    if (show_workspace) {
+        right -= workspace_w;
+        var label: []const u8 = item.workspace_id;
+        for (state.project_controller.projects.items) |*project| {
+            if (std.mem.eql(u8, project.id, item.workspace_id)) {
+                label = project.label;
+                break;
+            }
+        }
+        queueText(state, .{ .x = right, .y = text_y, .w = workspace_w - theme.scaledUi(8.0), .h = font_size * 1.3 }, label, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);
     }
 }
 
@@ -1905,6 +1978,7 @@ fn keybindHintFor(state: *runtime.AppState, ref: ?KeybindRef) []const u8 {
         .chat_model_picker => config.chat_model_picker,
         .chat_run_config => config.chat_run_config,
         .chat_directory_picker => config.chat_directory_picker,
+        .settings => config.settings,
         .toggle_sidebar => config.toggle_sidebar,
         .toggle_browser => config.toggle_browser,
         .toggle_terminal => config.toggle_terminal,
