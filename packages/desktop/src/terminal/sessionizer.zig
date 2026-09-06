@@ -1843,6 +1843,11 @@ const ChatTurn = struct {
     owned_images: []const store_protocol.Attachment = &.{},
     started_at_ms: i64 = 0,
     finished_at_ms: ?i64 = null,
+    /// Item 10 turn timing: first streamed delta (0 = none yet) plus delta
+    /// volume, reported in the `chat turn phase` log lines.
+    first_delta_at_ms: i64 = 0,
+    delta_count: u32 = 0,
+    delta_bytes: usize = 0,
     mutex: ParkingMutex = .{},
     worker_thread: ?std.Thread = null,
     events: std.ArrayList(ChatEvent) = .empty,
@@ -9931,6 +9936,11 @@ fn commitChatTurnDurable(daemon: *Daemon, turn: *ChatTurn) !void {
     turn.committed_store_revision = write_result.store_revision;
     turn.generated_title_applied = generated_title_applied;
     turn.durability_pending = false;
+    const commit_ms = nowMs() - (turn.finished_at_ms orelse turn.started_at_ms);
+    log.info(
+        "chat turn phase turn_id={s} phase=committed since_accept_ms={d} commit_ms={d} store_revision={d} title_applied={}",
+        .{ turn.turn_id, nowMs() - turn.started_at_ms, commit_ms, write_result.store_revision, generated_title_applied },
+    );
     turn.mutex.unlock();
     // Durable-first publication flip: the tail status just became terminal
     // without a new event append, so wake parked wait_ms tail waiters here.
@@ -14102,6 +14112,10 @@ fn createChatTurnFromParams(
         .user_message_id = user_message_id,
         .use_stub = use_stub,
     };
+    log.info(
+        "chat turn phase turn_id={s} phase=accepted provider={s} prompt_bytes={d} images={d}",
+        .{ turn.turn_id, @tagName(turn.request.provider), turn.request.prompt.len, turn.owned_images.len },
+    );
     return turn;
 }
 
@@ -14416,6 +14430,7 @@ fn chatTurnThread(daemon: *Daemon, turn: *ChatTurn) void {
                 if (!already_published) turn.appendEvent(allocator, "completed", "{}");
                 allocator.free(value.provider_thread_id);
                 allocator.free(value.reply_text);
+                logChatTurnPhase(turn, if (already_published) "provider_drained" else "provider_done");
             } else |err| {
                 turn.status = if (turn.cancel_requested) .aborted else .failed;
                 const reason = providerFailureReasonForError(turn.request.provider, err);
@@ -14426,9 +14441,11 @@ fn chatTurnThread(daemon: *Daemon, turn: *ChatTurn) void {
                 }
                 const message = turn.error_message orelse @errorName(err);
                 turn.appendStringEvent(allocator, if (turn.status == .aborted) "aborted" else "failed", "message", message);
+                logChatTurnPhase(turn, if (turn.status == .aborted) "provider_aborted" else "provider_failed");
             }
         } else {
             turn.status = .aborted;
+            logChatTurnPhase(turn, "provider_aborted");
         }
         turn.mutex.unlock();
     }
@@ -14581,6 +14598,15 @@ fn chatSinkDelta(context: ?*anyopaque, delta: []const u8) void {
     const allocator = turn.allocator;
     lockTurn(turn);
     defer turn.mutex.unlock();
+    turn.delta_count +|= 1;
+    turn.delta_bytes +|= delta.len;
+    if (turn.first_delta_at_ms == 0) {
+        turn.first_delta_at_ms = nowMs();
+        log.info(
+            "chat turn phase turn_id={s} phase=first_delta since_accept_ms={d}",
+            .{ turn.turn_id, turn.first_delta_at_ms - turn.started_at_ms },
+        );
+    }
     turn.appendStringEvent(allocator, "assistant_delta", "text", delta);
 }
 
@@ -14597,6 +14623,7 @@ fn chatSinkAnswerReady(context: ?*anyopaque, reply_text: []const u8) void {
     if (turn.result_reply_text) |old| allocator.free(old);
     turn.result_reply_text = allocator.dupe(u8, reply_text) catch null;
     turn.appendEvent(allocator, "completed", "{}");
+    logChatTurnPhase(turn, "answer_ready");
 }
 
 fn chatSinkEvent(context: ?*anyopaque, event: harness.StreamEvent) void {
@@ -14750,6 +14777,17 @@ fn chatSinkApproval(context: ?*anyopaque, request: harness.ApprovalRequest) harn
         }
         turn.mutex.unlock();
     }
+}
+
+/// One `chat turn phase` line; caller holds the turn lock. Fires only on
+/// lifecycle transitions that already happen, never per poll or per frame.
+fn logChatTurnPhase(turn: *const ChatTurn, phase: []const u8) void {
+    const now = nowMs();
+    const first_delta_ms: i64 = if (turn.first_delta_at_ms == 0) -1 else turn.first_delta_at_ms - turn.started_at_ms;
+    log.info(
+        "chat turn phase turn_id={s} phase={s} status={s} since_accept_ms={d} first_delta_ms={d} deltas={d} delta_bytes={d} events={d}",
+        .{ turn.turn_id, phase, @tagName(turn.status), now - turn.started_at_ms, first_delta_ms, turn.delta_count, turn.delta_bytes, turn.events.items.len },
+    );
 }
 
 fn chatTurnFromContext(context: ?*anyopaque) ?*ChatTurn {
