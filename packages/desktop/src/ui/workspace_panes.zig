@@ -226,6 +226,109 @@ pub fn isFocusAnimating() bool {
     return (nowMs() - focus_anim_start_ms) < focus_anim_duration_ms;
 }
 
+// Item 6 (pane half): tiled and zoomed pane rects ease toward their layout
+// target instead of snapping when a pane opens, closes, splits, or zooms.
+// One slot per pane id remembers the last drawn rect. New panes appear at
+// their target (the neighbours make room); panes that left the layout are
+// pruned so a later reopen starts fresh. The scrolling strip is not eased
+// here because it already animates its own offset, and browser panes snap
+// so the native webview is never re-bounded every frame. Frames are only
+// requested while a rect is still more than 0.5 px from its target.
+const PaneRectSlot = struct {
+    pane_id: runtime.WorkspacePaneId,
+    rect: palette.Rect,
+    seen: bool,
+};
+const PANE_MOTION_SETTLE_PX: f32 = 0.5;
+var pane_rect_slots: [MAX_WORKSPACE_PANE_RECTS]PaneRectSlot = undefined;
+var pane_rect_slot_count: usize = 0;
+var pane_motion_last_ms: i64 = 0;
+var pane_motion_t: f32 = 1.0;
+var pane_motion_animating: bool = false;
+
+pub fn isPaneMotionAnimating() bool {
+    return pane_motion_animating;
+}
+
+/// Per-frame easing step in 0..1 from the time since the previous workspace
+/// pass. Snaps (1.0) on the first pass, while the workspace rect itself is
+/// moving, and while a split gutter is being dragged so the drag never
+/// feels rubbery. Reduced motion shortens the tween instead.
+fn tickPaneMotion(state: *const runtime.AppState, workspace_rect: palette.Rect) void {
+    pane_motion_animating = false;
+    const now_ms = nowMs();
+    const first = pane_motion_last_ms == 0;
+    const dt_ms = @max(now_ms - pane_motion_last_ms, 0);
+    pane_motion_last_ms = now_ms;
+    // A moving container (sidebar rail tween, window resize) already drives
+    // every pane rect per frame; easing on top would make panes trail it.
+    const container_moving = !rectsEqual(workspace_rect, last_workspace_rect);
+    if (first or resize_drag != null or container_moving) {
+        pane_motion_t = 1.0;
+        return;
+    }
+    const duration_ms = theme.motionDurationMs(state.app_config.reduced_motion, theme.MOTION_BASE_MS);
+    pane_motion_t = if (duration_ms <= 0)
+        1.0
+    else
+        theme.easeOutCubic(theme.clampf(@as(f32, @floatFromInt(dt_ms)) / @as(f32, @floatFromInt(duration_ms)), 0.0, 1.0));
+}
+
+fn approachSettled(current: f32, target: f32, t: f32) f32 {
+    const next = current + (target - current) * t;
+    return if (@abs(next - target) <= PANE_MOTION_SETTLE_PX) target else next;
+}
+
+fn rectsEqual(a: palette.Rect, b: palette.Rect) bool {
+    return a.x == b.x and a.y == b.y and a.w == b.w and a.h == b.h;
+}
+
+/// Shown rect for a tiled/zoomed pane: eases from the last drawn rect toward
+/// `target`, or appears at `target` when the pane has no slot yet.
+fn easedPaneRect(pane_id: runtime.WorkspacePaneId, target: palette.Rect, t: f32) palette.Rect {
+    for (pane_rect_slots[0..pane_rect_slot_count]) |*slot| {
+        if (slot.pane_id != pane_id) continue;
+        slot.seen = true;
+        slot.rect = .{
+            .x = approachSettled(slot.rect.x, target.x, t),
+            .y = approachSettled(slot.rect.y, target.y, t),
+            .w = approachSettled(slot.rect.w, target.w, t),
+            .h = approachSettled(slot.rect.h, target.h, t),
+        };
+        if (!rectsEqual(slot.rect, target)) pane_motion_animating = true;
+        return slot.rect;
+    }
+    if (pane_rect_slot_count < pane_rect_slots.len) {
+        pane_rect_slots[pane_rect_slot_count] = .{ .pane_id = pane_id, .rect = target, .seen = true };
+        pane_rect_slot_count += 1;
+    }
+    return target;
+}
+
+/// Pane whose eased rect differed from its target in the current leaf pass.
+var moving_pane_id: ?runtime.WorkspacePaneId = null;
+
+fn easedLeafRect(state: *const runtime.AppState, pane_id: runtime.WorkspacePaneId, target: palette.Rect) palette.Rect {
+    moving_pane_id = null;
+    if (state.workspacePaneKindById(pane_id) == .browser) return target;
+    const was_animating = pane_motion_animating;
+    pane_motion_animating = false;
+    const shown = easedPaneRect(pane_id, target, pane_motion_t);
+    if (pane_motion_animating) moving_pane_id = pane_id;
+    pane_motion_animating = pane_motion_animating or was_animating;
+    return shown;
+}
+
+fn prunePaneRectSlots() void {
+    var keep: usize = 0;
+    for (pane_rect_slots[0..pane_rect_slot_count]) |slot| {
+        if (!slot.seen) continue;
+        pane_rect_slots[keep] = .{ .pane_id = slot.pane_id, .rect = slot.rect, .seen = false };
+        keep += 1;
+    }
+    pane_rect_slot_count = keep;
+}
+
 pub fn isScrollAnimating() bool {
     return scrolling_animating;
 }
@@ -887,6 +990,7 @@ pub fn renderAt(state: *runtime.AppState, rect: palette.Rect) void {
 
 /// Renders workspace panes while transcripts use their destination sidebar width.
 pub fn renderAtWithTranscriptLayoutWidth(state: *runtime.AppState, rect: palette.Rect, target_workspace_width: f32) void {
+    tickPaneMotion(state, rect);
     last_workspace_rect = rect;
     focus_anim_duration_ms = theme.motionDurationMs(state.app_config.reduced_motion, theme.MOTION_BASE_MS);
     state.terminal_controller.debug_workspace_visible_pane_count = state.currentProjectWorkspaceVisiblePaneCount();
@@ -912,7 +1016,7 @@ pub fn renderAtWithTranscriptLayoutWidth(state: *runtime.AppState, rect: palette
     // In the strip a zoomed pane only takes over its own tab's slot (see
     // renderScrollingGroup); the full-workspace zoom is the tiled layout's.
     if (state.currentProjectWorkspaceFullZoomPaneId()) |pane_id| {
-        renderLeafWithTranscriptLayoutWidth(state, pane_id, rect, target_workspace_width);
+        renderLeafWithTranscriptLayoutWidth(state, pane_id, easedLeafRect(state, pane_id, rect), target_workspace_width);
     } else if (state.currentProjectWorkspaceRoot()) |root| {
         const layout = &state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout;
         if (scrollingLayoutActive(state, layout)) {
@@ -938,6 +1042,7 @@ pub fn renderAtWithTranscriptLayoutWidth(state: *runtime.AppState, rect: palette
     renderQuickPane(state, rect, target_workspace_width);
     renderSplitMenuOverlay(state, rect);
     if (!browser_pane_rendered) state.noteBrowserPaneNotRendered();
+    prunePaneRectSlots();
 }
 
 // Empty workspace invitation shown after the final pane closes.
@@ -2700,6 +2805,32 @@ fn tiledContentRect(rect: palette.Rect, gap: f32, inset: bool) palette.Rect {
     };
 }
 
+test "pane rects ease toward a new layout, new panes appear in place, leavers prune" {
+    pane_rect_slot_count = 0;
+    pane_motion_animating = false;
+    const a: palette.Rect = .{ .x = 0, .y = 0, .w = 400, .h = 300 };
+    try std.testing.expect(rectsEqual(a, easedPaneRect(1, a, 0.5)));
+    try std.testing.expect(!pane_motion_animating);
+    prunePaneRectSlots();
+    // Splitting: pane 1 narrows to half; it eases halfway there per 0.5 step.
+    const half: palette.Rect = .{ .x = 0, .y = 0, .w = 200, .h = 300 };
+    const mid = easedPaneRect(1, half, 0.5);
+    try std.testing.expectEqual(@as(f32, 300.0), mid.w);
+    try std.testing.expect(pane_motion_animating);
+    // The new pane 2 lands at its target immediately.
+    const right: palette.Rect = .{ .x = 200, .y = 0, .w = 200, .h = 300 };
+    try std.testing.expect(rectsEqual(right, easedPaneRect(2, right, 0.5)));
+    prunePaneRectSlots();
+    try std.testing.expectEqual(@as(usize, 2), pane_rect_slot_count);
+    // Closing pane 2: only pane 1 is seen, so pane 2's slot is dropped.
+    pane_motion_animating = false;
+    try std.testing.expect(rectsEqual(half, easedPaneRect(1, half, 1.0)));
+    try std.testing.expect(!pane_motion_animating);
+    prunePaneRectSlots();
+    try std.testing.expectEqual(@as(usize, 1), pane_rect_slot_count);
+    pane_rect_slot_count = 0;
+}
+
 test "tiled content adds four-sided margins when inset" {
     const rect: palette.Rect = .{ .x = 10.0, .y = 20.0, .w = 1000.0, .h = 700.0 };
 
@@ -2727,7 +2858,7 @@ test "target split widths finish without a corrective transcript reflow" {
 // Tiled workspace region; pane shells animate while transcript widths stay final.
 fn renderNode(state: *runtime.AppState, node: *const runtime.WorkspaceNode, rect: palette.Rect, target_width: f32) void {
     switch (node.*) {
-        .leaf => |pane_id| renderLeafWithTranscriptLayoutWidth(state, pane_id, rect, target_width),
+        .leaf => |pane_id| renderLeafWithTranscriptLayoutWidth(state, pane_id, easedLeafRect(state, pane_id, rect), target_width),
         .split => |split| {
             const gap = theme.scaledUi(state.app_config.workspace_pane_gap);
             if (split.axis == .vertical) {
@@ -2736,8 +2867,10 @@ fn renderNode(state: *runtime.AppState, node: *const runtime.WorkspaceNode, rect
                 const first_rect = palette.Rect{ .x = rect.x, .y = rect.y, .w = widths.first, .h = rect.h };
                 const gutter_rect = palette.Rect{ .x = rect.x + widths.first, .y = rect.y, .w = gap, .h = rect.h };
                 const second_rect = palette.Rect{ .x = rect.x + widths.first + gap, .y = rect.y, .w = widths.second, .h = rect.h };
-                renderNode(state, split.first, first_rect, target_widths.first);
+                // Gutter first so panes still easing toward this layout paint
+                // over it instead of a background bar cutting across them.
                 renderSplitGutter(state, split.first, split.second, .vertical, gutter_rect, rect);
+                renderNode(state, split.first, first_rect, target_widths.first);
                 renderNode(state, split.second, second_rect, target_widths.second);
             } else {
                 const first_h = @max(theme.scaledUi(160.0), rect.h * split.ratio - gap * 0.5);
@@ -2746,8 +2879,8 @@ fn renderNode(state: *runtime.AppState, node: *const runtime.WorkspaceNode, rect
                 const first_rect = palette.Rect{ .x = rect.x, .y = rect.y, .w = rect.w, .h = clamped_first_h };
                 const gutter_rect = palette.Rect{ .x = rect.x, .y = rect.y + clamped_first_h, .w = rect.w, .h = gap };
                 const second_rect = palette.Rect{ .x = rect.x, .y = rect.y + clamped_first_h + gap, .w = rect.w, .h = @max(rect.h - clamped_first_h - gap, theme.scaledUi(120.0)) };
-                renderNode(state, split.first, first_rect, target_width);
                 renderSplitGutter(state, split.first, split.second, .horizontal, gutter_rect, rect);
+                renderNode(state, split.first, first_rect, target_width);
                 renderNode(state, split.second, second_rect, target_width);
             }
         },
@@ -2850,6 +2983,10 @@ fn renderLeafWithin(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, 
         .chat => chat_panel.renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(state, rect, pane_id, reserve, target_width),
         .terminal => {
             const dock_id = state.workspaceTerminalDockIdByPane(pane_id) orelse 0;
+            // Mid-tween the grid keeps its current cell size (clipped to the
+            // eased rect); the daemon gets one resize once the rect settles.
+            terminal_panel.defer_resize_for_motion = viewport_clip == null and moving_pane_id == pane_id;
+            defer terminal_panel.defer_resize_for_motion = false;
             if (viewport_clip) |clip| {
                 terminal_panel.renderDockAtForDockWithin(state, rect, dock_id, reserve, clip);
             } else {

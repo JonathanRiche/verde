@@ -371,6 +371,9 @@ const TerminalHitCache = struct {
 };
 
 var hit_cache: TerminalHitCache = .{};
+/// Set by the workspace pane layout while a tiled pane's rect is easing
+/// (item 6) so the PTY is resized once at the settled size, not per frame.
+pub var defer_resize_for_motion: bool = false;
 var selection_state: TerminalSelection = .{};
 var pending_link_click: PendingLinkClick = .{};
 var draw_cache: TerminalDrawCache = .{};
@@ -665,9 +668,11 @@ fn renderPane(state: *app_state.AppState, dock: anytype, pane_id: u32, rect: pal
     // counts are updated before the fallible daemon/model steps, so a single
     // failure makes later frames see "no size change" and never retry,
     // leaving the PTY/model at the wrong size.
-    dock.resizePaneToFit(state.allocator, pane_id, grid_rect.w, grid_rect.h) catch |err| {
-        runtime_log.diagnostic("terminal resizePaneToFit failed pane={d} err={s}", .{ pane_id, @errorName(err) });
-    };
+    if (!defer_resize_for_motion) {
+        dock.resizePaneToFit(state.allocator, pane_id, grid_rect.w, grid_rect.h) catch |err| {
+            runtime_log.diagnostic("terminal resizePaneToFit failed pane={d} err={s}", .{ pane_id, @errorName(err) });
+        };
+    }
     // Another client (the web app) may have resized the shared daemon PTY.
     // Re-assert this client's grid only when the window is focused AND the
     // user recently interacted with it — tmux `window-size latest` semantics.

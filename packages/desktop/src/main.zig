@@ -1723,6 +1723,8 @@ fn activeContinuousFrames(state: *AppState) bool {
         state.transcriptMarkdownSelectionDragging() or
         workspace_panes_ui.isFocusAnimating() or
         workspace_panes_ui.isScrollAnimating() or
+        // Tiled/zoomed pane rects ease for ~180ms after a layout change.
+        workspace_panes_ui.isPaneMotionAnimating() or
         ui_layout.isSidebarAnimating() or
         // Run-config stepper thumbs slide for ~160ms after a selection.
         state.runConfigStepperAnimating() or
