@@ -14,7 +14,7 @@ pub const MAX_SESSIONS: usize = 128;
 pub const DEFAULT_MAX_SESSIONS: usize = 64;
 pub const DEFAULT_SESSION_TTL_MS: i64 = 8 * 60 * 60 * 1000;
 pub const SESSION_COOKIE_NAME = "verde_session";
-pub const SESSION_COOKIE_ATTRIBUTES = "Path=/; HttpOnly; SameSite=Strict";
+pub const SESSION_COOKIE_ATTRIBUTES = "Path=/; HttpOnly; SameSite=Lax";
 
 /// A fixed-size verifier. Raw token bytes are erased after initialization and
 /// never retained in gateway configuration or authentication state.
@@ -786,7 +786,7 @@ pub const Service = struct {
 };
 
 /// Formats cookie metadata for either an HTTP SSH forward or the configured
-/// HTTPS proxy. HttpOnly and SameSite=Strict remain mandatory in both modes.
+/// HTTPS proxy. HttpOnly and SameSite=Lax remain mandatory in both modes.
 pub fn formatSessionCookie(buffer: []u8, issued: *const IssuedSession, secure: bool) ![]const u8 {
     return std.fmt.bufPrint(
         buffer,
@@ -1019,7 +1019,7 @@ test "browser sessions can be revoked and emit strict cookie metadata" {
     const cookie = try formatSessionCookie(&buffer, &issued, false);
     try std.testing.expect(std.mem.startsWith(u8, cookie, SESSION_COOKIE_NAME ++ "="));
     try std.testing.expect(std.mem.indexOf(u8, cookie, "HttpOnly") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cookie, "SameSite=Strict") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cookie, "SameSite=Lax") != null);
     try std.testing.expect(try sessions.revoke(std.testing.io, issued.id[0..]));
     try std.testing.expect(!try sessions.validate(std.testing.io, issued.id[0..], 2_001));
 }

@@ -323,7 +323,7 @@ The first SSH-safe gateway slice is implemented. `verde-web` now:
 - accepts loopback listeners only and rejects non-loopback configuration;
 - requires an owner-only, no-follow regular token file;
 - rejects raw token arguments, `VERDE_WEB_TOKEN`, query tokens, and legacy Live/mock configuration;
-- exchanges a successful browser login for a bounded, expiring, in-memory, `HttpOnly; SameSite=Strict` session cookie;
+- exchanges a successful browser login for a bounded, expiring, in-memory, `HttpOnly; SameSite=Lax` session cookie;
 - keeps `/healthz` inventory-free, serves only the login and trusted app assets publicly, and authenticates every runtime API plus the exact `/ws` upgrade;
 - validates loopback Host and same-origin browser requests without permissive CORS;
 - talks only to the headless session daemon and does not fall back to Desktop Live or mock state;
