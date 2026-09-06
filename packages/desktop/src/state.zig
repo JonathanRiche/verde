@@ -1284,7 +1284,29 @@ fn prepareProjectionTranscriptContinuity(
     const current_start = current.persisted_message_offset;
     const current_end = current_start + current.messages.items.len;
     const replacement_start = replacement.persisted_message_offset;
-    if (replacement_start < current_start or replacement_start > current_end) return;
+    if (replacement_start < current_start or replacement_start > current_end) {
+        // A lazy-tail replacement (no rows, offset = daemon row count) that
+        // starts past the live rows. When a daemon-owned send is still
+        // pending here, the gap is the turn the daemon just committed and
+        // the tail poll appends exactly those rows moments later; keep the
+        // live rows so the pane does not render an empty thread for the
+        // frame between the durable refresh and the completion apply.
+        // Without an in-flight send the gap is foreign (another client
+        // wrote rows), so fall through and let hydration reload the thread.
+        if (replacement.messages.items.len == 0 and replacement_start > current_end and
+            sendStateIsPendingDaemonTurn(current.send_state))
+        {
+            try keepLiveTranscriptRows(allocator, current, replacement);
+            return;
+        }
+        if (replacement.messages.items.len == 0) {
+            runtime_log.diagnostic(
+                "projection transcript continuity skipped thread={s} current_start={d} current_end={d} replacement_start={d}",
+                .{ current.local_thread_id, current_start, current_end, replacement_start },
+            );
+        }
+        return;
+    }
     const replacement_end = replacement_start + replacement.messages.items.len;
     const prefix_count = replacement_start - current_start;
     const suffix_start = @min(@max(replacement_end, current_start) - current_start, current.messages.items.len);
@@ -1328,6 +1350,70 @@ fn prepareProjectionTranscriptContinuity(
     prefix_owned = false;
     suffix_owned = false;
     replacement.rebuildBackgroundTasksFromMessages(allocator);
+}
+
+fn sendStateIsPendingDaemonTurn(state: *SendState) bool {
+    state.mutex.lock();
+    defer state.mutex.unlock();
+    return state.status == .pending and state.daemon_owned;
+}
+
+/// Replace a rowless replacement page with clones of every live row at the
+/// live offset. Staging work only: on error the replacement is untouched.
+fn keepLiveTranscriptRows(allocator: std.mem.Allocator, current: *const ChatThread, replacement: *ChatThread) !void {
+    var clones: std.ArrayList(ChatMessage) = .empty;
+    errdefer {
+        deinitProjectionMessages(allocator, clones.items);
+        clones.deinit(allocator);
+    }
+    try clones.ensureTotalCapacity(allocator, current.messages.items.len);
+    for (current.messages.items) |message| {
+        const cloned = try cloneProjectionMessage(allocator, message);
+        clones.appendAssumeCapacity(cloned);
+    }
+    replacement.messages.deinit(allocator);
+    replacement.messages = clones;
+    replacement.persisted_message_offset = current.persisted_message_offset;
+    replacement.rebuildBackgroundTasksFromMessages(allocator);
+}
+
+test "lazy-tail refresh during a pending daemon turn keeps the live rows" {
+    const allocator = std.testing.allocator;
+    var current = try ChatThread.init(allocator, "live");
+    defer current.deinit(allocator);
+    try current.messages.append(allocator, .{
+        .role = .user,
+        .author = try allocator.dupeZ(u8, "You"),
+        .body = try allocator.dupeZ(u8, "prompt"),
+    });
+    try current.messages.append(allocator, .{
+        .role = .assistant,
+        .author = try allocator.dupeZ(u8, "Codex"),
+        .body = try allocator.dupeZ(u8, "earlier reply"),
+    });
+    current.send_state.status = .pending;
+    current.send_state.daemon_owned = true;
+
+    // The daemon committed two more rows (reply + snapshot) the tail poll
+    // has not delivered yet: the composite refresh ships offset 4, no rows.
+    var replacement = try ChatThread.init(allocator, "refresh");
+    defer replacement.deinit(allocator);
+    replacement.persisted_message_offset = 4;
+    try prepareProjectionTranscriptContinuity(allocator, &current, &replacement);
+    try std.testing.expectEqual(@as(usize, 2), replacement.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 0), replacement.persisted_message_offset);
+    try std.testing.expectEqualStrings("earlier reply", replacement.messages.items[1].body);
+
+    // Same gap with no send in flight is foreign: leave the lazy tail alone
+    // so hydration reloads the durable rows.
+    current.send_state.status = .idle;
+    current.send_state.daemon_owned = false;
+    var foreign = try ChatThread.init(allocator, "foreign");
+    defer foreign.deinit(allocator);
+    foreign.persisted_message_offset = 4;
+    try prepareProjectionTranscriptContinuity(allocator, &current, &foreign);
+    try std.testing.expectEqual(@as(usize, 0), foreign.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 4), foreign.persisted_message_offset);
 }
 
 fn prepareProjectionTranscriptRuntime(
