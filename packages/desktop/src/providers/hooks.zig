@@ -493,8 +493,10 @@ fn claudeSettingsIsManaged(content: []const u8) bool {
 }
 
 fn writeClaudeHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
-    // Drives Verde surface status and supplies a stable prompt-derived title;
-    // Claude's OSC title is often only the generic "Claude Code" label.
+    // Drives Verde surface status and supplies a stable session title.
+    // Claude's OSC title is often only the generic "Claude Code" label, so the
+    // sidebar uses Claude's own generated (ai-title) or /rename (custom-title)
+    // session name from the transcript, falling back to the first prompt.
     const script = if (builtin.os.tag == .windows) claudePowerShellHookScript() else
         \\#!/bin/sh
         \\# verde-claude-notify-hook
@@ -508,6 +510,13 @@ fn writeClaudeHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const
         \\[ -n "$event" ] || event="${1:-}"
         \\
     ++ POSIX_AGENT_ACTIVITY_STATE ++
+        \\session_key="$(printf '%s' "$VERDE_SESSION_ID" | cksum 2>/dev/null | awk '{print $1 "-" $2}')"
+        \\state_dir="${TMPDIR:-/tmp}/verde-agent-status/claude-$session_key"
+        \\if command -v jq >/dev/null 2>&1; then
+        \\  transcript_path="$(jq -r '.transcript_path // empty' "$payload" 2>/dev/null)"
+        \\else
+        \\  transcript_path="$(sed -n 's/.*"transcript_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$payload" | head -n 1)"
+        \\fi
         \\activity=""
         \\title=""
         \\case "$event" in
@@ -530,6 +539,11 @@ fn writeClaudeHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const
         \\    fi
         \\    title="$(printf '%s' "$title" | tr '\n\t' '  ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]][[:space:]]*/ /g' | cut -c1-72)"
         \\    ;;
+        \\  PreToolUse)
+        \\    # Claude names the session while the first reply streams, after
+        \\    # UserPromptSubmit. Poll at tool boundaries only until it is known.
+        \\    [ ! -s "$state_dir/provider_title" ] || { rm -f "$payload"; exit 0; }
+        \\    activity="parent-working" ;;
         \\  Notification)
         \\    # An idle nudge reconciles a missed Stop/interrupt; permission
         \\    # notifications still represent waiting on the user.
@@ -547,6 +561,29 @@ fn writeClaudeHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const
         \\esac
         \\status="$(update_agent_status claude "$activity" idle)"
         \\[ -n "$status" ] || { rm -f "$payload"; exit 0; }
+        \\title_path="$state_dir/title"
+        \\# Claude appends ai-title rows once it names the session and custom-title
+        \\# rows on /rename. The user's name wins; both beat the prompt excerpt so
+        \\# the sidebar shows the chat title rather than the latest prompt.
+        \\provider_title=""
+        \\if [ -n "$transcript_path" ] && [ -r "$transcript_path" ]; then
+        \\  title_rows="$(grep -E '"type"[[:space:]]*:[[:space:]]*"(ai-title|custom-title)"' "$transcript_path" 2>/dev/null | tail -n 40)"
+        \\  if [ -n "$title_rows" ]; then
+        \\    if command -v jq >/dev/null 2>&1; then
+        \\      provider_title="$(printf '%s\n' "$title_rows" | jq -Rrs 'split("\n") | map(select(length > 0) | (try fromjson catch null)) | map(select(type == "object")) | ((map(select(.type == "custom-title" and (.customTitle | type) == "string" and (.customTitle | length) > 0)) | last | .customTitle) // (map(select(.type == "ai-title" and (.aiTitle | type) == "string" and (.aiTitle | length) > 0)) | last | .aiTitle) // empty)' 2>/dev/null)"
+        \\    else
+        \\      provider_title="$(printf '%s\n' "$title_rows" | sed -n 's/.*"customTitle"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | tail -n 1)"
+        \\      [ -n "$provider_title" ] || provider_title="$(printf '%s\n' "$title_rows" | sed -n 's/.*"aiTitle"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | tail -n 1)"
+        \\    fi
+        \\  fi
+        \\fi
+        \\if [ -n "$provider_title" ]; then
+        \\  title="$(printf '%s' "$provider_title" | tr '\n\t' '  ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]][[:space:]]*/ /g' | cut -c1-72)"
+        \\  [ -z "$title" ] || printf '%s' "$title" > "$state_dir/provider_title" 2>/dev/null
+        \\elif [ -z "$title" ] && [ -s "$title_path" ]; then
+        \\  title="$(cat "$title_path" 2>/dev/null)"
+        \\fi
+        \\[ -z "$title" ] || printf '%s' "$title" > "$title_path" 2>/dev/null
         \\
         \\cli="${VERDE_CLI:-verde}"
         \\case "$cli" in
@@ -831,6 +868,12 @@ fn claudePowerShellHookScript() []const u8 {
     \\
     ++ POWERSHELL_AGENT_ACTIVITY_STATE ++
         \\$eventName = if ($null -ne $payload -and $null -ne $payload.hook_event_name) { [string]$payload.hook_event_name } elseif ($args.Count -gt 0) { [string]$args[0] } else { '' }
+        \\$sessionSha = [System.Security.Cryptography.SHA256]::Create()
+        \\$sessionBytes = [Text.Encoding]::UTF8.GetBytes([string]$env:VERDE_SESSION_ID)
+        \\try { $sessionFingerprint = [BitConverter]::ToString($sessionSha.ComputeHash($sessionBytes)).Replace('-', '') } finally { $sessionSha.Dispose() }
+        \\$claudeStateDir = Join-Path (Join-Path ([IO.Path]::GetTempPath()) 'verde-agent-status') ('claude-' + $sessionFingerprint)
+        \\$titlePath = Join-Path $claudeStateDir 'title'
+        \\$providerTitlePath = Join-Path $claudeStateDir 'provider_title'
         \\$activity = ''
         \\$title = ''
         \\switch ($eventName) {
@@ -848,6 +891,11 @@ fn claudePowerShellHookScript() []const u8 {
         \\      if ($title.Length -gt 72) { $title = $title.Substring(0, 72) }
         \\    }
         \\  }
+        \\  'PreToolUse' {
+        \\    # Claude names the session while the first reply streams; poll at tool boundaries only until it is known.
+        \\    if ((Test-Path -LiteralPath $providerTitlePath) -and -not [string]::IsNullOrWhiteSpace((Get-Content -LiteralPath $providerTitlePath -Raw -ErrorAction SilentlyContinue))) { exit 0 }
+        \\    $activity = 'parent-working'
+        \\  }
         \\  'Notification' {
         \\    $message = if ($null -ne $payload -and $null -ne $payload.message) { [string]$payload.message } else { '' }
         \\    $kind = if ($null -ne $payload -and $null -ne $payload.notification_type) { [string]$payload.notification_type } else { '' }
@@ -860,6 +908,33 @@ fn claudePowerShellHookScript() []const u8 {
         \\}
         \\$status = Update-AgentStatus -Provider 'claude' -Activity $activity -InitialStatus 'idle' -PayloadText $payloadText
         \\if ([string]::IsNullOrWhiteSpace($status)) { exit 0 }
+        \\# Claude appends ai-title rows once it names the session and custom-title rows on /rename.
+        \\# The user's name wins; both beat the prompt excerpt so the sidebar shows the chat title.
+        \\$providerTitle = ''
+        \\$transcriptPath = if ($null -ne $payload -and $null -ne $payload.transcript_path) { [string]$payload.transcript_path } else { '' }
+        \\if (-not [string]::IsNullOrWhiteSpace($transcriptPath) -and (Test-Path -LiteralPath $transcriptPath)) {
+        \\  $aiTitle = ''
+        \\  $customTitle = ''
+        \\  try {
+        \\    foreach ($line in [IO.File]::ReadLines($transcriptPath)) {
+        \\      if ($line -notmatch '"type"\s*:\s*"(ai-title|custom-title)"') { continue }
+        \\      try { $row = ConvertFrom-Json -InputObject $line } catch { continue }
+        \\      if ($null -eq $row) { continue }
+        \\      if ($row.type -eq 'custom-title' -and -not [string]::IsNullOrWhiteSpace([string]$row.customTitle)) { $customTitle = [string]$row.customTitle }
+        \\      elseif ($row.type -eq 'ai-title' -and -not [string]::IsNullOrWhiteSpace([string]$row.aiTitle)) { $aiTitle = [string]$row.aiTitle }
+        \\    }
+        \\  } catch {}
+        \\  $providerTitle = if (-not [string]::IsNullOrWhiteSpace($customTitle)) { $customTitle } else { $aiTitle }
+        \\}
+        \\if (-not [string]::IsNullOrWhiteSpace($providerTitle)) {
+        \\  $title = [regex]::Replace($providerTitle, '\s+', ' ').Trim()
+        \\  if ($title.Length -gt 72) { $title = $title.Substring(0, 72) }
+        \\  Set-Content -LiteralPath $providerTitlePath -Value $title -NoNewline -ErrorAction SilentlyContinue
+        \\} elseif ([string]::IsNullOrWhiteSpace($title) -and (Test-Path -LiteralPath $titlePath)) {
+        \\  $cachedTitle = Get-Content -LiteralPath $titlePath -Raw -ErrorAction SilentlyContinue
+        \\  if (-not [string]::IsNullOrWhiteSpace($cachedTitle)) { $title = $cachedTitle }
+        \\}
+        \\if (-not [string]::IsNullOrWhiteSpace($title)) { Set-Content -LiteralPath $titlePath -Value $title -NoNewline -ErrorAction SilentlyContinue }
         \\$cli = if ([string]::IsNullOrWhiteSpace($env:VERDE_CLI)) { 'verde.exe' } else { $env:VERDE_CLI }
         \\if ($cli.EndsWith(' (deleted)')) { $cli = $cli.Substring(0, $cli.Length - 10) }
         \\$notifyArgs = @('notify', '--quiet', '--status', $status, '--provider', 'claude')
@@ -1023,7 +1098,7 @@ const CLAUDE_GLOBAL_HOOK_REL = ".claude/verde-claude-notify-hook.sh";
 const CLAUDE_WINDOWS_GLOBAL_HOOK_REL = ".claude/verde-claude-notify-hook.ps1";
 const CLAUDE_GLOBAL_SETTINGS_REL = ".claude/settings.json";
 const CLAUDE_GLOBAL_HOOK_NEEDLE = "verde-claude-notify-hook";
-const CLAUDE_HOOK_EVENTS = [_][]const u8{ "SessionStart", "UserPromptSubmit", "Notification", "SubagentStart", "SubagentStop", "Stop" };
+const CLAUDE_HOOK_EVENTS = [_][]const u8{ "SessionStart", "UserPromptSubmit", "PreToolUse", "Notification", "SubagentStart", "SubagentStop", "Stop" };
 
 const CURSOR_GLOBAL_HOOK_REL = ".cursor/hooks/verde-cursor-notify-hook.sh";
 const CURSOR_WINDOWS_GLOBAL_HOOK_REL = ".cursor/hooks/verde-cursor-notify-hook.ps1";
@@ -1689,8 +1764,12 @@ fn writeOpencodePlugin(allocator: std.mem.Allocator, io: std.Io, path: []const u
         \\        await refreshSurfaces();
         \\        for (const surface of surfaces) {
         \\          if (surface.workspace_path !== directory) continue;
-        \\          // Unclassified panes (provider null) have not been stamped yet; the
-        \\          // notify below claims them as opencode on the first report.
+        \\          // Stored rows must already be stamped opencode; live projections
+        \\          // (live: true) are unclaimed agent panes the daemon classified by
+        \\          // their foreground process. Anything else (stale or foreign rows)
+        \\          // must not receive this pane's state.
+        \\          const claimed = surface.provider === 'opencode' || surface.live === true;
+        \\          if (!claimed) continue;
         \\          if (surface.provider != null && surface.provider !== 'opencode') continue;
         \\          const args = [
         \\            'notify', '--quiet', '--session', surface.session_id,
@@ -2686,6 +2765,9 @@ test "Claude hook reports a prompt-derived title" {
     const script = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), script_path, std.testing.allocator, .limited(64 * 1024));
     defer std.testing.allocator.free(script);
     try std.testing.expect(std.mem.indexOf(u8, script, ".prompt // empty") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, ".transcript_path // empty") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "custom-title") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "aiTitle") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "--title \"$title\" --provider claude") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "[ \"$source\" = \"compact\" ]") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "activity=\"parent-working\"") != null);
