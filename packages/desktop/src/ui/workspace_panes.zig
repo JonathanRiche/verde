@@ -3252,7 +3252,7 @@ fn renderContextMenuRow(
     return rect.y + rect.h;
 }
 
-fn copyTranscriptSelectionToClipboard(state: *runtime.AppState) void {
+pub fn copyTranscriptSelectionToClipboard(state: *runtime.AppState) void {
     const text = (chat_panel.transcriptMarkdownSelectionPlainText(state) catch {
         state.setSidebarNotice("Failed to copy selection.");
         return;

@@ -204,6 +204,7 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     const which_key_z = state.palette_overlay_batch.setZIndex(PALETTE_MODAL_Z);
     renderPrefixStatusBar(state, split.content);
     renderPrefixWhichKey(state, split.content);
+    renderNoticeToast(state, split.content);
     state.palette_overlay_batch.restoreZIndex(which_key_z);
     const modal_z = state.palette_overlay_batch.setZIndex(PALETTE_MODAL_Z);
     defer state.palette_overlay_batch.restoreZIndex(modal_z);
@@ -221,6 +222,58 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     renderRuntimeCredentialModal(state, width, height);
     renderRuntimeTrustModal(state, width, height);
     debug_window.render(state, width, height);
+}
+
+// Notice toast (item 11): `setSidebarNotice` text ("Copied selection.",
+// "Chat pane closed.", ...) as a small pill at the bottom centre of the
+// workspace, below pane headers so it never covers header icons. Timing and
+// frame pacing live in AppState (`noticeToast*`); this only draws.
+const NOTICE_TOAST_FONT_UI: f32 = 13.0;
+const NOTICE_TOAST_PAD_X_UI: f32 = 14.0;
+const NOTICE_TOAST_PAD_Y_UI: f32 = 8.0;
+const NOTICE_TOAST_MARGIN_UI: f32 = 18.0;
+const NOTICE_TOAST_RISE_UI: f32 = 10.0;
+
+fn renderNoticeToast(state: *runtime.AppState, workspace: palette.Rect) void {
+    const toast = state.noticeToast() orelse return;
+    if (workspace.w <= 0.0 or workspace.h <= 0.0) return;
+    const font_size = theme.scaledUi(NOTICE_TOAST_FONT_UI);
+    const text_h = font_size * 1.25;
+    const pad_x = theme.scaledUi(NOTICE_TOAST_PAD_X_UI);
+    const pad_y = theme.scaledUi(NOTICE_TOAST_PAD_Y_UI);
+    const max_w = @max(workspace.w - theme.scaledUi(32.0), theme.scaledUi(80.0));
+    // Measure on the GPU text path (same shaping as the drawn glyphs) with a
+    // little slack; the plain ttf measure came up short and clipped the tail.
+    const measured_w = runtime.paletteUiTextPrefixWidth(toast.text, font_size, toast.text.len) + font_size * 0.35;
+    const text_w = @min(measured_w, max_w - pad_x * 2.0);
+    const pill_w = text_w + pad_x * 2.0;
+    const pill_h = text_h + pad_y * 2.0;
+    // Keep clear of the prefix status bar when a chord is armed.
+    const bottom_reserve = if (state.prefix_armed or state.prefix_navigate) prefixBarHeight() else 0.0;
+    const settled_y = workspace.y + workspace.h - bottom_reserve - theme.scaledUi(NOTICE_TOAST_MARGIN_UI) - pill_h;
+    const rise_offset = (1.0 - toast.rise) * theme.scaledUi(NOTICE_TOAST_RISE_UI);
+    const pill: palette.Rect = .{
+        .x = workspace.x + (workspace.w - pill_w) * 0.5,
+        .y = settled_y + rise_offset,
+        .w = pill_w,
+        .h = pill_h,
+    };
+    const alpha = std.math.clamp(toast.alpha, 0.0, 1.0);
+    if (alpha <= 0.0) return;
+    var bg = paletteColor(theme.COLOR_PANEL_ALT);
+    bg.a *= alpha;
+    var border = paletteColor(if (toast.persistent) theme.COLOR_YELLOW else theme.borderMuted());
+    border.a *= alpha;
+    var fg = paletteColor(theme.COLOR_WHITE);
+    fg.a *= alpha;
+    // Rounded shell as two anti-aliased fills (border colour under an inset
+    // fill) instead of a stroked border, which aliases on a pill radius.
+    const radius = pill_h * 0.5;
+    const inset = theme.scaledUi(1.0);
+    queuePaletteRoundedRect(state, pill, border, radius);
+    queuePaletteRoundedRect(state, .{ .x = pill.x + inset, .y = pill.y + inset, .w = pill.w - inset * 2.0, .h = pill.h - inset * 2.0 }, bg, radius - inset);
+    const text_rect: palette.Rect = .{ .x = pill.x + pad_x, .y = pill.y + pad_y, .w = text_w, .h = text_h };
+    queuePaletteText(state, text_rect, toast.text, fg, font_size, pill);
 }
 
 // Which-key overlay: while a tmux-style prefix chord is armed, a bottom-anchored

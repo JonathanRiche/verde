@@ -12838,8 +12838,10 @@ fn writeChatTurnTail(
     // viewing a web-started turn) mirror the user row from these two fields.
     try s.objectField("user_message_id");
     if (turn.user_message_id) |value| try s.write(value) else try s.write(null);
+    // The prompt is only needed once per attach, so it rides the first page
+    // (after_seq == 0) instead of being re-sent on every poll of the turn.
     try s.objectField("user_prompt");
-    try s.write(turn.request.prompt);
+    if (after_seq == 0) try s.write(turn.request.prompt) else try s.write(null);
     try s.objectField("result_reply_text");
     if (!has_more_events) {
         if (turn.result_reply_text) |value| try s.write(value) else try s.write(null);
@@ -12962,7 +12964,7 @@ fn chatTailEventsAfter(turn: *const ChatTurn, after_seq: u64) []const ChatEvent 
 
 fn chatTailPageEndSeq(turn: *const ChatTurn, after_seq: u64, max_bytes: usize) u64 {
     var through_seq = after_seq;
-    var total = chatTailMetadataUpperBound(turn, true);
+    var total = chatTailMetadataUpperBound(turn, after_seq == 0, true);
     for (chatTailEventsAfter(turn, after_seq)) |event| {
         const with_event = saturatedAdd(total, chatEventUpperBound(event));
         if (through_seq != after_seq and with_event > max_bytes) break;
@@ -12979,7 +12981,7 @@ fn chatTailHasEventsAfter(turn: *const ChatTurn, seq: u64) bool {
 }
 
 fn chatTailUpperBound(turn: *const ChatTurn, after_seq: u64, through_seq: u64, include_terminal_fields: bool) usize {
-    var total = chatTailMetadataUpperBound(turn, include_terminal_fields);
+    var total = chatTailMetadataUpperBound(turn, after_seq == 0, include_terminal_fields);
     for (chatTailEventsAfter(turn, after_seq)) |event| {
         if (event.seq > through_seq) break;
         total = saturatedAdd(total, chatEventUpperBound(event));
@@ -12987,12 +12989,12 @@ fn chatTailUpperBound(turn: *const ChatTurn, after_seq: u64, through_seq: u64, i
     return total;
 }
 
-fn chatTailMetadataUpperBound(turn: *const ChatTurn, include_terminal_fields: bool) usize {
+fn chatTailMetadataUpperBound(turn: *const ChatTurn, include_prompt: bool, include_terminal_fields: bool) usize {
     var total: usize = 4096;
     if (turn.provider_thread_id) |value| total = saturatedAdd(total, jsonStringUpperBound(value));
     if (turn.active_turn_id) |value| total = saturatedAdd(total, jsonStringUpperBound(value));
     if (turn.user_message_id) |value| total = saturatedAdd(total, jsonStringUpperBound(value));
-    total = saturatedAdd(total, jsonStringUpperBound(turn.request.prompt));
+    if (include_prompt) total = saturatedAdd(total, jsonStringUpperBound(turn.request.prompt));
     if (include_terminal_fields) {
         if (turn.result_reply_text) |value| total = saturatedAdd(total, jsonStringUpperBound(value));
         if (turn.generated_title_applied) {

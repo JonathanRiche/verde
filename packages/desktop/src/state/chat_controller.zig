@@ -5799,19 +5799,20 @@ fn serviceRemoteChatTails(self: anytype) bool {
             send_state.mutex.unlock();
             switch (result) {
                 .response => |response| {
-                    if (daemonTailResponseIsNotFound(response.json)) {
-                        changed = noteDaemonChatTailFailure(target_thread, "remote daemon chat turn was not found after reconnect") or changed;
-                    } else {
-                        const applied = self.applyDaemonChatTurnTail(target_thread, response.json) catch |err| blk: {
+                    switch (applyDaemonChatTurnTailResponse(self, target_thread, response.json)) {
+                        .not_found => changed = noteDaemonChatTailFailure(target_thread, "remote daemon chat turn was not found after reconnect") or changed,
+                        .apply_failed => |err| {
                             log.warn("failed to apply remote chat turn tail: {s}", .{@errorName(err)});
-                            break :blk noteDaemonChatTailFailure(target_thread, "failed to apply remote daemon chat turn");
-                        };
-                        if (applied) {
-                            send_state.mutex.lock();
-                            send_state.daemon_tail_fail_count = 0;
-                            send_state.mutex.unlock();
-                        }
-                        changed = applied or changed;
+                            changed = noteDaemonChatTailFailure(target_thread, "failed to apply remote daemon chat turn") or changed;
+                        },
+                        .applied => |applied| {
+                            if (applied) {
+                                send_state.mutex.lock();
+                                send_state.daemon_tail_fail_count = 0;
+                                send_state.mutex.unlock();
+                            }
+                            changed = applied or changed;
+                        },
                     }
                 },
                 .failed => changed = noteDaemonChatTailFailure(target_thread, "remote daemon chat turn is unavailable") or changed,
@@ -5931,13 +5932,13 @@ fn commitDaemonChatTail(self: anytype, args: *DaemonTailWorkerArgs) bool {
 
     // JSON-RPC not_found (turn gone after restart / interrupted sweep with no
     // live memory) — surface immediately rather than spinning.
-    if (daemonTailResponseIsNotFound(response)) {
-        return noteDaemonChatTailFailure(thread, "daemon chat turn not found after reconnect; message is preserved above");
-    }
-
-    const applied = self.applyDaemonChatTurnTail(thread, response) catch |err| {
-        log.warn("failed to apply daemon chat turn tail: {s}", .{@errorName(err)});
-        return noteDaemonChatTailFailure(thread, "failed to apply daemon chat turn");
+    const applied = switch (applyDaemonChatTurnTailResponse(self, thread, response)) {
+        .not_found => return noteDaemonChatTailFailure(thread, "daemon chat turn not found after reconnect; message is preserved above"),
+        .apply_failed => |err| {
+            log.warn("failed to apply daemon chat turn tail: {s}", .{@errorName(err)});
+            return noteDaemonChatTailFailure(thread, "failed to apply daemon chat turn");
+        },
+        .applied => |applied| applied,
     };
     send_state.mutex.lock();
     send_state.daemon_poll_backoff_ms = daemonChatTailBackoffMs(applied, elapsed_ms);
@@ -5977,10 +5978,30 @@ fn threadByDaemonTurnIdSlow(self: anytype, turn_id: []const u8) ?*ChatThread {
     return null;
 }
 
-fn daemonTailResponseIsNotFound(response: []const u8) bool {
-    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, response, .{}) catch return false;
+/// Outcome of one tail page. The response is parsed exactly once here; the
+/// not_found check and the apply step share that parse instead of each
+/// re-parsing the page (which used to happen on every poll).
+const DaemonTailOutcome = union(enum) {
+    not_found,
+    apply_failed: anyerror,
+    applied: bool,
+};
+
+fn applyDaemonChatTurnTailResponse(self: anytype, thread: *ChatThread, response: []const u8) DaemonTailOutcome {
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, response, .{}) catch |err| {
+        return .{ .apply_failed = err };
+    };
     defer parsed.deinit();
-    const err_val = parsed.value.object.get("error") orelse return false;
+    if (daemonTailValueIsNotFound(parsed.value)) return .not_found;
+    const applied = applyDaemonChatTurnTailValue(self, thread, parsed.value) catch |err| {
+        return .{ .apply_failed = err };
+    };
+    return .{ .applied = applied };
+}
+
+fn daemonTailValueIsNotFound(root: std.json.Value) bool {
+    if (root != .object) return false;
+    const err_val = root.object.get("error") orelse return false;
     if (err_val != .object) return false;
     const code = jsonValueString(err_val.object.get("code") orelse .null) orelse return false;
     return std.mem.eql(u8, code, "not_found") or std.mem.eql(u8, code, "resource_not_found");
@@ -6259,7 +6280,11 @@ test "daemon generated title replaces a stale opening placeholder" {
 pub fn applyDaemonChatTurnTail(self: anytype, thread: *ChatThread, response: []const u8) !bool {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, response, .{});
     defer parsed.deinit();
-    const result = try jsonRpcResult(parsed.value);
+    return applyDaemonChatTurnTailValue(self, thread, parsed.value);
+}
+
+pub fn applyDaemonChatTurnTailValue(self: anytype, thread: *ChatThread, root: std.json.Value) !bool {
+    const result = try jsonRpcResult(root);
     if (result != .object) return error.InvalidDaemonResponse;
     const status_text = jsonValueString(result.object.get("status") orelse .null) orelse "running";
     const events = result.object.get("events") orelse .null;
