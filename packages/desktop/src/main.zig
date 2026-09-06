@@ -2120,6 +2120,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 .toggle_sidebar,
                 .toggle_sidebar_hidden,
                 .new_thread,
+                .settings,
                 => {
                     handleKeyboardAction(state, keyboard, resolved_app_action);
                     return true;
@@ -3109,6 +3110,7 @@ fn handleKeyboardAction(
                 null;
             state.openCommandPalette(scope_project);
         },
+        .settings => state.openSettingsModal(),
         .companion => state.toggleCompanion(),
         .toggle_sidebar => state.toggleSidebarCollapsed(),
         .toggle_sidebar_hidden => state.toggleSidebarHidden(),

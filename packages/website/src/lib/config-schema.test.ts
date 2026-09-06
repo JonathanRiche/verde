@@ -81,6 +81,7 @@ describe('verde.json JSON Schema', () => {
   test('covers every keybind parser key including prefix command placement', () => {
     const keybinds = child(verdeConfigSchema, 'keybinds')
     expect(propertiesOf(keybinds)).toEqual([...KEYBIND_TOP_KEYS])
+    expect(child(keybinds, 'settings').description).toContain('Unbound by default')
 
     const chat = child(keybinds, 'chat')
     expect(propertiesOf(chat)).toEqual([...KEYBIND_CHAT_KEYS])
@@ -111,7 +112,7 @@ describe('verde.json JSON Schema', () => {
   })
 
   test('lists every named prefix action from keybinds.zig', () => {
-    expect(PREFIX_ACTION_NAMES).toHaveLength(67)
+    expect(PREFIX_ACTION_NAMES).toHaveLength(68)
     expect(new Set(PREFIX_ACTION_NAMES).size).toBe(PREFIX_ACTION_NAMES.length)
 
     const keybinds = child(verdeConfigSchema, 'keybinds')

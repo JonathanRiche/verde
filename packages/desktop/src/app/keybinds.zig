@@ -15,6 +15,7 @@ pub const NativeKeyboardAction = enum {
     add_workspace,
     add_workspace_tab,
     command_palette,
+    settings,
     companion,
     toggle_sidebar,
     toggle_sidebar_hidden,
@@ -209,6 +210,7 @@ pub const NativeKeyboardConfig = struct {
     open_editor: []Keybind,
     new_thread: []Keybind,
     command_palette: []Keybind,
+    settings: []Keybind,
     companion: []Keybind,
     toggle_sidebar: []Keybind,
     toggle_sidebar_hidden: []Keybind,
@@ -274,6 +276,7 @@ pub const NativeKeyboardConfig = struct {
             .open_editor = try cloneDefaultOpenEditorKeybinds(allocator),
             .new_thread = try cloneEmptyKeybinds(allocator),
             .command_palette = try cloneDefaultCommandPaletteKeybinds(allocator),
+            .settings = try cloneEmptyKeybinds(allocator),
             .companion = try cloneDefaultCompanionKeybinds(allocator),
             .toggle_sidebar = try cloneDefaultSidebarKeybinds(allocator),
             .toggle_sidebar_hidden = try cloneDefaultSidebarHiddenKeybinds(allocator),
@@ -350,6 +353,7 @@ pub const NativeKeyboardConfig = struct {
         self.allocator.free(self.open_editor);
         self.allocator.free(self.new_thread);
         self.allocator.free(self.command_palette);
+        self.allocator.free(self.settings);
         self.allocator.free(self.companion);
         self.allocator.free(self.toggle_sidebar);
         self.allocator.free(self.toggle_sidebar_hidden);
@@ -423,6 +427,9 @@ pub const NativeKeyboardConfig = struct {
         }
         if (matchesAny(self.command_palette, event)) {
             return .command_palette;
+        }
+        if (matchesAny(self.settings, event)) {
+            return .settings;
         }
         if (matchesAny(self.companion, event)) {
             return .companion;
@@ -696,6 +703,12 @@ pub const NativeKeyboardConfig = struct {
             if (self.parseOverrideValue(palette_value, "command_palette")) |bindings| {
                 self.allocator.free(self.command_palette);
                 self.command_palette = bindings;
+            }
+        }
+        if (keybinds_value.object.get("settings")) |settings_value| {
+            if (self.parseOverrideValue(settings_value, "settings")) |bindings| {
+                self.allocator.free(self.settings);
+                self.settings = bindings;
             }
         }
         if (keybinds_value.object.get("companion")) |companion_value| {
@@ -1304,6 +1317,7 @@ const PREFIX_ACTION_NAMES = [_]PrefixActionName{
     .{ .name = "workspace.add_tab", .target = .{ .app = .add_workspace_tab } },
     .{ .name = "new_terminal", .target = .new_terminal },
     .{ .name = "command_palette", .target = .{ .app = .command_palette } },
+    .{ .name = "settings", .target = .{ .app = .settings } },
     .{ .name = "companion", .target = .{ .app = .companion } },
     .{ .name = "sidebar", .target = .{ .app = .toggle_sidebar } },
     .{ .name = "sidebar_hidden", .target = .{ .app = .toggle_sidebar_hidden } },
@@ -1390,6 +1404,7 @@ pub fn prefixTargetLabel(buf: []u8, target: PrefixTarget) []const u8 {
             .add_workspace => "Add workspace",
             .add_workspace_tab => "New tab",
             .command_palette => "Command palette",
+            .settings => "Settings",
             .companion => "Companion",
             .toggle_sidebar => "Sidebar",
             .toggle_sidebar_hidden => "Hide sidebar",
@@ -2657,6 +2672,28 @@ test "direct new thread and terminal pane keybinds are disabled by default" {
 
     try std.testing.expectEqual(@as(usize, 0), config.new_thread.len);
     try std.testing.expectEqual(@as(usize, 0), config.workspace_split_terminal_horizontal.len);
+    try std.testing.expectEqual(@as(usize, 0), config.settings.len);
+}
+
+test "settings keybind override accepts a single accelerator" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"keybinds": {"settings": "Ctrl+Comma"}}
+    , .{});
+    defer parsed.deinit();
+
+    config.applyOverrides(parsed.value);
+
+    try std.testing.expectEqual(@as(usize, 1), config.settings.len);
+    try std.testing.expect(config.settings[0].ctrl);
+    try std.testing.expect(!config.settings[0].shift);
+    try std.testing.expectEqual(sdl.Keycode.comma, config.settings[0].key);
+}
+
+test "settings prefix action name is bindable" {
+    try std.testing.expectEqual(NativeKeyboardAction.settings, parsePrefixActionName("settings").?.app);
 }
 
 test "default terminal tab keybind uses primary alt t" {
@@ -3092,6 +3129,7 @@ test "default prefix table covers every app terminal and chat action" {
             .workspace_split_chat_horizontal,
             .workspace_split_terminal_vertical,
             .workspace_split_terminal_horizontal,
+            .settings,
             => true,
             else => false,
         };
