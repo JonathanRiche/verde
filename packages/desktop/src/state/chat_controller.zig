@@ -4305,16 +4305,28 @@ fn consumeReconciledTerminalTurn(args: *TerminalTurnConsumeArgs) void {
 /// Move a reattached runtime send to the durable terminal state carried by a
 /// composite snapshot. Projection replacement preserves live SendState by
 /// thread identity, so reconnect must retire that state by turn identity too.
-fn reconcileAttachedTerminalTurn(thread: *ChatThread, turn: headless.store.TurnRecord) void {
+/// Returns true when the turn is still attached to a live send; the caller
+/// must then leave retention to that send's tail path.
+fn reconcileAttachedTerminalTurn(thread: *ChatThread, turn: headless.store.TurnRecord) bool {
     const send_state = thread.send_state;
     send_state.mutex.lock();
     defer send_state.mutex.unlock();
-    if (send_state.status != .pending or !send_state.daemon_owned) return;
-    const attached_turn_id = send_state.daemon_turn_id orelse return;
-    if (!std.mem.eql(u8, attached_turn_id, turn.turn_id)) return;
+    if (send_state.status != .pending or !send_state.daemon_owned) return false;
+    const attached_turn_id = send_state.daemon_turn_id orelse return false;
+    if (!std.mem.eql(u8, attached_turn_id, turn.turn_id)) return false;
 
     if (std.mem.eql(u8, turn.status, "completed")) {
-        send_state.status = .completed;
+        // The reply text only travels on the tail page. A composite refresh
+        // carrying the committed turn can land before that final tail
+        // response (it did whenever the commit refresh raced the tail: the
+        // send went idle with no result, the reply never appeared, and the
+        // prompt sat at the bottom of the pane). Leave the send pending so
+        // the tail delivers the completion with its result.
+        runtime_log.diagnostic(
+            "terminal snapshot left attached turn={s} thread={s} to its tail",
+            .{ turn.turn_id, thread.local_thread_id },
+        );
+        return true;
     } else if (std.mem.eql(u8, turn.status, "failed")) {
         var failure_buf: [96]u8 = undefined;
         if (send_state.error_message) |old| std.heap.page_allocator.free(old);
@@ -4325,8 +4337,9 @@ fn reconcileAttachedTerminalTurn(thread: *ChatThread, turn: headless.store.TurnR
         send_state.status = .failed;
     } else if (std.mem.eql(u8, turn.status, "aborted")) {
         send_state.status = .aborted;
-    } else return;
+    } else return true;
     send_state.ui_revision +%= 1;
+    return true;
 }
 
 /// Bounded reconnect presentation for terminal rows already carried by the
@@ -4342,7 +4355,10 @@ pub fn reconcileTerminalDaemonChatTurnsSnapshot(self: anytype, turns: []const he
             std.mem.eql(u8, turn.status, "aborted");
         if (!terminal) continue;
         const thread = retryAdoptionThreadByLocalId(self, turn.workspace_id, turn.local_thread_id) orelse continue;
-        reconcileAttachedTerminalTurn(thread, turn);
+        // An attached send's tail path reports the terminal state and
+        // consumes the turn itself; a consume spawned here would race that
+        // final tail poll into not_found.
+        if (reconcileAttachedTerminalTurn(thread, turn)) continue;
         if (std.mem.eql(u8, turn.status, "failed")) {
             log.warn(
                 "chat turn {s} failed while the GUI was closed: {s}",
@@ -4507,24 +4523,37 @@ test "terminal snapshot retires only its matching reattached send" {
     send_state.daemon_owned = true;
     send_state.daemon_turn_id = try std.heap.page_allocator.dupe(u8, "turn-restored");
 
-    reconcileAttachedTerminalTurn(&thread, .{
+    try std.testing.expect(!reconcileAttachedTerminalTurn(&thread, .{
         .turn_id = "turn-other",
         .workspace_id = "ws-restored",
         .local_thread_id = "thread-restored",
         .status = "aborted",
         .started_at_ms = 1,
         .provider = "codex",
-    });
+    }));
     try std.testing.expectEqual(SendStatus.pending, send_state.status);
 
-    reconcileAttachedTerminalTurn(&thread, .{
+    // A committed turn stays with its tail: the reply text only arrives
+    // on the final tail page, so retiring here would drop it.
+    try std.testing.expect(reconcileAttachedTerminalTurn(&thread, .{
+        .turn_id = "turn-restored",
+        .workspace_id = "ws-restored",
+        .local_thread_id = "thread-restored",
+        .status = "completed",
+        .started_at_ms = 1,
+        .provider = "codex",
+    }));
+    try std.testing.expectEqual(SendStatus.pending, send_state.status);
+    try std.testing.expectEqual(@as(u64, 0), send_state.ui_revision);
+
+    try std.testing.expect(reconcileAttachedTerminalTurn(&thread, .{
         .turn_id = "turn-restored",
         .workspace_id = "ws-restored",
         .local_thread_id = "thread-restored",
         .status = "aborted",
         .started_at_ms = 1,
         .provider = "codex",
-    });
+    }));
     try std.testing.expectEqual(SendStatus.aborted, send_state.status);
     try std.testing.expectEqual(@as(u64, 1), send_state.ui_revision);
 }
@@ -6889,9 +6918,30 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
                 if (!threadUsesRemoteRuntime(thread)) {
                     if (completed_daemon_turn_id) |turn_id| adoptDaemonTranscriptIdentitiesWithRetry(self, project_index, thread, turn_id);
                 }
+                {
+                    const last_role: []const u8 = if (thread.messages.items.len > 0) @tagName(thread.messages.items[thread.messages.items.len - 1].role) else "none";
+                    const last_len: usize = if (thread.messages.items.len > 0) thread.messages.items[thread.messages.items.len - 1].body.len else 0;
+                    runtime_log.diagnostic("chat completion consumed thread={s} messages={d} last_role={s} last_body_len={d} persisted_offset={d} had_assistant_events={} reply_bytes={d} layout_first={d} layout_count={d}", .{
+                        thread.local_thread_id,
+                        thread.messages.items.len,
+                        last_role,
+                        last_len,
+                        thread.persisted_message_offset,
+                        had_assistant_events,
+                        result.reply_text.len,
+                        thread.transcript_layout_first_message_index,
+                        thread.transcript_layout_message_count,
+                    });
+                }
                 self.flushDirtyNow();
                 // Consume is a retention hint only (daemon already committed).
                 consumeDaemonChatTurnForThread(self, thread, completed_daemon_turn_id);
+            } else {
+                runtime_log.diagnostic(
+                    "chat completion dropped without a result thread={s} messages={d}",
+                    .{ thread.local_thread_id, thread.messages.items.len },
+                );
+                if (completed_daemon_turn_id) |turn_id| std.heap.page_allocator.free(turn_id);
             }
         },
         .failed => {
