@@ -450,6 +450,34 @@ fn monotonicMs() i64 {
     return @intCast(@divTrunc(platform_runtime.monotonicTimestampNs(), std.time.ns_per_ms));
 }
 
+/// Notice text naming the provider ("Claude request failed.") with the
+/// generic wording as the fallback when the formatted text cannot be built.
+fn providerNotice(buf: []u8, provider: Provider, suffix: []const u8, fallback: []const u8) []const u8 {
+    const label = chat_threads.providerLabel(provider);
+    if (label.len == 0) return fallback;
+    return std.fmt.bufPrint(buf, "{s} {s}", .{ label, suffix }) catch fallback;
+}
+
+/// Mid-sentence form: `fmt` holds one `{s}` for the provider label
+/// ("Waiting for {s} reply...").
+fn providerNoticeFmt(buf: []u8, provider: Provider, comptime fmt: []const u8, fallback: []const u8) []const u8 {
+    const label = chat_threads.providerLabel(provider);
+    if (label.len == 0) return fallback;
+    return std.fmt.bufPrint(buf, fmt, .{label}) catch fallback;
+}
+
+test "provider notices name the provider and fall back to the generic text" {
+    var fmt_buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Waiting for Codex reply...", providerNoticeFmt(&fmt_buf, .codex, "Waiting for {s} reply...", "Waiting for provider reply..."));
+    var fmt_tiny: [4]u8 = undefined;
+    try std.testing.expectEqualStrings("Waiting for provider reply...", providerNoticeFmt(&fmt_tiny, .codex, "Waiting for {s} reply...", "Waiting for provider reply..."));
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Claude request failed.", providerNotice(&buf, .claude, "request failed.", "Provider request failed."));
+    try std.testing.expectEqualStrings("Codex reply stopped.", providerNotice(&buf, .codex, "reply stopped.", "Provider reply stopped."));
+    var tiny: [4]u8 = undefined;
+    try std.testing.expectEqualStrings("Provider session updated.", providerNotice(&tiny, .claude, "session updated.", "Provider session updated."));
+}
+
 fn workerCleanupPending(terminal: bool, has_worker: bool, worker_done: bool) bool {
     return terminal and has_worker and !worker_done;
 }
@@ -2377,7 +2405,8 @@ pub fn sendThreadDraftWithUiPolicy(self: anytype, project_index: usize, thread_i
     if (selected_target) {
         self.requestTranscriptScrollToBottom();
     }
-    self.setSidebarNotice("Waiting for provider reply...");
+    var notice_buf: [96]u8 = undefined;
+    self.setSidebarNotice(providerNoticeFmt(&notice_buf, thread.provider, "Waiting for {s} reply...", "Waiting for provider reply..."));
     return true;
 }
 
@@ -2402,8 +2431,9 @@ fn abortThreadSend(self: anytype, thread: *ChatThread) void {
         return;
     }
 
+    var notice_buf: [96]u8 = undefined;
     if (send_state.stop_requested) {
-        self.setSidebarNotice("Stopping provider reply...");
+        self.setSidebarNotice(providerNoticeFmt(&notice_buf, thread.provider, "Stopping {s} reply...", "Stopping provider reply..."));
         return;
     }
 
@@ -2413,7 +2443,7 @@ fn abortThreadSend(self: anytype, thread: *ChatThread) void {
         send_state.approval_decision = .deny;
         send_state.condition.broadcast();
     }
-    self.setSidebarNotice(if (send_state.local_command) "Stopping command..." else "Stopping provider reply...");
+    self.setSidebarNotice(if (send_state.local_command) "Stopping command..." else providerNoticeFmt(&notice_buf, thread.provider, "Stopping {s} reply...", "Stopping provider reply..."));
 }
 
 pub fn queueOrSteerDraftDuringSend(self: anytype) void {
@@ -4276,10 +4306,11 @@ fn reconcileAttachedTerminalTurn(thread: *ChatThread, turn: headless.store.TurnR
     if (std.mem.eql(u8, turn.status, "completed")) {
         send_state.status = .completed;
     } else if (std.mem.eql(u8, turn.status, "failed")) {
+        var failure_buf: [96]u8 = undefined;
         if (send_state.error_message) |old| std.heap.page_allocator.free(old);
         send_state.error_message = std.heap.page_allocator.dupe(
             u8,
-            turn.error_message orelse "Provider request failed.",
+            turn.error_message orelse providerNotice(&failure_buf, thread.provider, "request failed.", "Provider request failed."),
         ) catch null;
         send_state.status = .failed;
     } else if (std.mem.eql(u8, turn.status, "aborted")) {
@@ -6363,7 +6394,8 @@ pub fn applyDaemonChatTurnTailValue(self: anytype, thread: *ChatThread, root: st
         send_state.status = .completed;
         changed = true;
     } else if (std.mem.eql(u8, status_text, "failed")) {
-        const fallback = jsonValueString(result.object.get("error_message") orelse .null) orelse "Provider request failed.";
+        var failure_buf: [96]u8 = undefined;
+        const fallback = jsonValueString(result.object.get("error_message") orelse .null) orelse providerNotice(&failure_buf, thread.provider, "request failed.", "Provider request failed.");
         const reason = jsonValueString(result.object.get("failure_reason") orelse .null);
         const message = daemonProviderFailureMessage(reason, fallback);
         send_state.error_message = try std.heap.page_allocator.dupe(u8, message);
@@ -6733,7 +6765,8 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
                 if (!completed_local_command) {
                     self.applySendSuccess(thread, result, should_append_reply_text, persist_projection) catch |err| {
                         log.err("failed to apply send result: {s}", .{@errorName(err)});
-                        self.setSidebarNotice("Failed to apply provider reply.");
+                        var notice_buf: [96]u8 = undefined;
+                        self.setSidebarNotice(providerNoticeFmt(&notice_buf, thread.provider, "Failed to apply {s} reply.", "Failed to apply provider reply."));
                     };
                     // Daemon-owned turns generate and durably commit their
                     // title before publishing completion. Keep the local
@@ -6775,7 +6808,8 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
                 };
                 self.setSidebarNotice(message);
             } else {
-                self.setSidebarNotice("Provider request failed.");
+                var notice_buf: [96]u8 = undefined;
+                self.setSidebarNotice(providerNotice(&notice_buf, thread.provider, "request failed.", "Provider request failed."));
             }
             if (!completed_local_command) stopUnownedBackgroundTasksAtTurnEnd(self, thread);
             // M4-P4 fix: identity-preserving flush — adopt ids (failed turns
@@ -6810,7 +6844,8 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
             }
             thread.touch();
             self.markDirty();
-            self.setSidebarNotice(if (completed_local_command) "Workspace command cancelled." else "Provider reply stopped.");
+            var notice_buf: [96]u8 = undefined;
+            self.setSidebarNotice(if (completed_local_command) "Workspace command cancelled." else providerNotice(&notice_buf, thread.provider, "reply stopped.", "Provider reply stopped."));
             if (!completed_local_command) stopUnownedBackgroundTasksAtTurnEnd(self, thread);
             // M4-P4 fix: identity-preserving flush — adopt ids (aborted turns
             // also commit durably), then flush without gating.
@@ -9451,7 +9486,8 @@ pub fn applySendSuccess(
     if (!append_reply_text) {
         thread.touch();
         if (persist_projection) self.markDirty();
-        self.setSidebarNotice("Provider session updated.");
+        var notice_buf: [96]u8 = undefined;
+        self.setSidebarNotice(providerNotice(&notice_buf, thread.provider, "session updated.", "Provider session updated."));
         return;
     }
     if (std.mem.trim(u8, result.reply_text, &std.ascii.whitespace).len > 0 and thread.messages.items.len > 0) {
@@ -9474,7 +9510,8 @@ pub fn applySendSuccess(
     }
     thread.touch();
     if (persist_projection) self.markDirty();
-    self.setSidebarNotice("Provider session updated.");
+    var notice_buf: [96]u8 = undefined;
+    self.setSidebarNotice(providerNotice(&notice_buf, thread.provider, "session updated.", "Provider session updated."));
 }
 
 pub fn applyPendingTimelineEvents(
