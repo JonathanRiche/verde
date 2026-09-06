@@ -400,6 +400,7 @@ pub fn finishProviderSlashCatalog(self: anytype) void {
 /// Opens the global or project-scoped command palette and transfers text focus.
 pub fn openCommandPalette(self: anytype, scope_project: ?usize) void {
     self.command_controller.begin(scope_project);
+    self.refreshPaletteHistory();
     self.modal_text_selection_anchor = null;
     self.palette_modal_text_focus = .command_palette;
     self.closeSidebarContextMenu();
@@ -413,6 +414,7 @@ pub fn openCommandPalette(self: anytype, scope_project: ?usize) void {
 pub fn closeCommandPalette(self: anytype) void {
     if (!self.command_controller.open) return;
     self.command_controller.close();
+    self.clearPaletteHistory();
     if (self.palette_modal_text_focus == .command_palette) self.palette_modal_text_focus = .none;
     self.modal_text_selection_anchor = null;
     self.markDirty();

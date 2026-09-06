@@ -139,6 +139,7 @@ pub const Mutation = union(enum) {
     workspace_repository_binding_upsert: WorkspaceRepositoryBindingUpsertRequest,
     workspace_repository_binding_remove: WorkspaceRepositoryBindingRemoveRequest,
     thread_upsert: store_protocol.ThreadUpsertRequest,
+    thread_close: store_protocol.ThreadCloseRequest,
     chat_draft_set: store_protocol.ChatDraftSetRequest,
     message_append: store_protocol.MessageAppendRequest,
     surface_upsert: store_protocol.SurfaceUpsertRequest,
@@ -388,6 +389,7 @@ const WORKSPACE_DEFAULT_REPOSITORY_SET_OPERATION: []const u8 = "workspace.reposi
 const WORKSPACE_REPOSITORY_BINDING_UPSERT_OPERATION: []const u8 = "workspace.repository.binding.upsert";
 const WORKSPACE_REPOSITORY_BINDING_REMOVE_OPERATION: []const u8 = "workspace.repository.binding.remove";
 const THREAD_UPSERT_OPERATION = store_protocol.METHOD_CHAT_THREAD_UPSERT;
+const THREAD_CLOSE_OPERATION = store_protocol.METHOD_CHAT_THREAD_CLOSE;
 const CHAT_DRAFT_SET_OPERATION = store_protocol.METHOD_CHAT_DRAFT_SET;
 const MESSAGE_APPEND_OPERATION = store_protocol.METHOD_CHAT_MESSAGE_APPEND;
 const SURFACE_UPSERT_OPERATION = store_protocol.METHOD_SURFACE_UPSERT;
@@ -618,6 +620,7 @@ pub const Store = struct {
             .workspace_repository_binding_upsert => |request| self.applyWorkspaceRepositoryBindingUpsert(request) catch |err| return mapStoreError(err),
             .workspace_repository_binding_remove => |request| self.applyWorkspaceRepositoryBindingRemove(request) catch |err| return mapStoreError(err),
             .thread_upsert => |request| self.applyThread(request) catch |err| return mapStoreError(err),
+            .thread_close => |request| applied = self.applyThreadClose(request) catch |err| return mapStoreError(err),
             .chat_draft_set => |request| self.applyChatDraftSet(request) catch |err| return mapStoreError(err),
             .message_append => |request| self.applyMessageAppend(request, next_revision_sql) catch |err| return mapStoreError(err),
             .surface_upsert => |request| self.applySurfaceUpsert(request.surface) catch |err| return mapStoreError(err),
@@ -921,6 +924,57 @@ pub const Store = struct {
 
     pub fn upsertThread(self: *Self, request: store_protocol.ThreadUpsertRequest) StoreError!store_protocol.WriteResult {
         return self.applyMutation(.{ .thread_upsert = request });
+    }
+
+    pub fn closeThread(self: *Self, request: store_protocol.ThreadCloseRequest) StoreError!store_protocol.WriteResult {
+        return self.applyMutation(.{ .thread_close = request });
+    }
+
+    /// Sync preserves metadata, drafts, turn receipts, and existing replay keys.
+    /// The caller holds the store mutex and validates its pre-read snapshot.
+    pub fn replaceThreadTranscript(
+        self: *Self,
+        workspace_id: []const u8,
+        local_thread_id: []const u8,
+        messages: []const store_protocol.Message,
+    ) StoreError!store_protocol.WriteResult {
+        self.conn.execNoArgs("begin immediate") catch |err| return mapStoreError(err);
+        var transaction_open = true;
+        defer if (transaction_open) self.conn.rollback();
+        try self.requireIdleThread(workspace_id, local_thread_id);
+        const row = (self.conn.row(
+            "select t.id from threads t join workspaces w on w.id = t.workspace_id where w.workspace_id = ?1 and t.local_thread_id = ?2",
+            .{ workspace_id, local_thread_id },
+        ) catch |err| return mapStoreError(err)) orelse return error.ResourceNotFound;
+        defer row.deinit();
+        const thread_id = row.int(0);
+        const revision = std.math.add(u64, try self.storeRevision(), 1) catch return error.StoreUnavailable;
+        const revision_sql = std.math.cast(i64, revision) orelse return error.StoreUnavailable;
+        self.conn.exec("delete from messages where thread_id = ?1", .{thread_id}) catch |err| return mapStoreError(err);
+        for (messages, 0..) |source, index| {
+            const id = std.fmt.allocPrint(self.allocator, "turn:sync:{d}:msg:{d}", .{ revision, index }) catch return error.OutOfMemory;
+            defer self.allocator.free(id);
+            var message = source;
+            message.message_id = id;
+            self.insertMessage(thread_id, @intCast(index), message) catch |err| return mapStoreError(err);
+            self.insertMessageKey(thread_id, @intCast(index), message, revision_sql) catch |err| return mapStoreError(err);
+        }
+        self.conn.exec("update store_state set store_revision = ?1 where id = 1", .{revision_sql}) catch |err| return mapStoreError(err);
+        self.conn.commit() catch |err| return mapStoreError(err);
+        transaction_open = false;
+        return .{ .store_revision = revision, .applied = true, .duplicate = false };
+    }
+
+    /// Ledger acceptance precedes provider execution, including other clients.
+    pub fn requireIdleThread(self: *Self, workspace_id: []const u8, local_thread_id: []const u8) StoreError!void {
+        const active = self.conn.row(
+            "select 1 from chat_turns where workspace_id = ?1 and local_thread_id = ?2 and status in ('accepted', 'running', 'waiting_approval') limit 1",
+            .{ workspace_id, local_thread_id },
+        ) catch |err| return mapStoreError(err);
+        if (active) |row| {
+            defer row.deinit();
+            return error.Conflict;
+        }
     }
 
     pub fn setChatDraft(self: *Self, request: store_protocol.ChatDraftSetRequest) StoreError!store_protocol.WriteResult {
@@ -1620,6 +1674,11 @@ pub const Store = struct {
                 .workspace_id = request.workspace_id,
                 .thread = request.thread,
             }),
+            .thread_close => |request| self.fingerprintValue(.{
+                .workspace_id = request.workspace_id,
+                .local_thread_id = request.local_thread_id,
+                .close = true,
+            }),
             .chat_draft_set => |request| self.fingerprintValue(.{
                 .workspace_id = request.workspace_id,
                 .local_thread_id = request.local_thread_id,
@@ -1754,8 +1813,34 @@ pub const Store = struct {
                 \\);
             );
         }
+        for (snapshot.closed_threads) |closed| try self.applySnapshotThreadClose(closed);
         for (snapshot.surface_states) |surface| try self.applySurfaceUpsert(surface);
         for (snapshot.chat_completions) |completion| try self.applyChatCompletionUpsert(completion);
+    }
+
+    /// Item 5b: a close carried by a replace flips the row cold in the same
+    /// transaction as the layout that dropped its pane. Unknown or already
+    /// cold rows are no-ops, and a thread the replace still carries wins over
+    /// a stale close (the client reopened it before the flush went out).
+    fn applySnapshotThreadClose(self: *Self, closed: store_protocol.ClosedThreadRef) !void {
+        const workspace_row = (try self.conn.row(
+            "select id from workspaces where workspace_id = ?1",
+            .{closed.workspace_id},
+        )) orelse return;
+        defer workspace_row.deinit();
+        const workspace_row_id = workspace_row.int(0);
+        try self.conn.exec(
+            \\update threads
+            \\set open = 0,
+            \\    sort_index = (select coalesce(max(sort_index), -1) + 1 from threads other where other.workspace_id = ?1 and other.id <> threads.id)
+            \\where workspace_id = ?1
+            \\  and local_thread_id = ?2
+            \\  and open = 1
+            \\  and not exists (
+            \\      select 1 from temp.snapshot_thread_targets target
+            \\      where target.workspace_id = ?3 and target.local_thread_id = ?2
+            \\  )
+        , .{ workspace_row_id, closed.local_thread_id, closed.workspace_id });
     }
 
     fn prepareSnapshotTargets(self: *Self, snapshot: store_protocol.Snapshot) !void {
@@ -1870,6 +1955,8 @@ pub const Store = struct {
             \\      where target.workspace_id = ?2 and target.local_thread_id = threads.local_thread_id
             \\  )
             \\  and committed = 0
+            \\  and open = 1
+            \\  and local_thread_id is not (select companion_thread_local_id from workspaces where id = ?1)
             \\  and not exists (
             \\      select 1 from chat_turns turn
             \\      where turn.workspace_id = ?2 and turn.local_thread_id = threads.local_thread_id
@@ -1940,6 +2027,21 @@ pub const Store = struct {
                 try self.reconcileSnapshotThread(workspace_row_id, thread, thread_index, store_revision);
             }
         }
+
+        // Carried rows are open (archived payload rows stay cold). Omitted
+        // committed rows keep whatever open bit they have: closing is the
+        // explicit `chat.thread.close` mutation, never an omission.
+        try self.conn.exec(
+            \\update threads
+            \\set open = case when archived = 0 then 1 else 0 end
+            \\where workspace_id = ?1
+            \\  and open != (case when archived = 0 then 1 else 0 end)
+            \\  and local_thread_id is not null
+            \\  and exists (
+            \\      select 1 from snapshot_thread_targets target
+            \\      where target.workspace_id = ?2 and target.local_thread_id = threads.local_thread_id
+            \\  )
+        , .{ workspace_row_id, workspace.workspace_id });
 
         if (reconcile_thread_order) {
             try self.conn.exec(
@@ -2975,6 +3077,31 @@ pub const Store = struct {
         return std.mem.eql(u8, stored_runtime_id, runtime_id);
     }
 
+    /// Close one thread: `open = 0` and the row moves after every open row so
+    /// the open set stays contiguous from sort_index 0 (pane refs are
+    /// ordinals into that set). Returns false when nothing changed.
+    fn applyThreadClose(self: *Self, request: store_protocol.ThreadCloseRequest) !bool {
+        const workspace_row = (try self.conn.row(
+            "select id from workspaces where workspace_id = ?1",
+            .{request.workspace_id},
+        )) orelse return error.ResourceNotFound;
+        defer workspace_row.deinit();
+        const workspace_row_id = workspace_row.int(0);
+        const thread_row = (try self.conn.row(
+            "select id, open from threads where workspace_id = ?1 and local_thread_id = ?2",
+            .{ workspace_row_id, request.local_thread_id },
+        )) orelse return error.ResourceNotFound;
+        defer thread_row.deinit();
+        if (thread_row.int(1) == 0) return false;
+        try self.conn.exec(
+            \\update threads
+            \\set open = 0,
+            \\    sort_index = (select coalesce(max(sort_index), -1) + 1 from threads other where other.workspace_id = ?1)
+            \\where id = ?2
+        , .{ workspace_row_id, thread_row.int(0) });
+        return true;
+    }
+
     fn applyThread(self: *Self, request: store_protocol.ThreadUpsertRequest) !void {
         const thread = request.thread;
         const workspace_row_id = (try self.conn.row(
@@ -3031,6 +3158,7 @@ pub const Store = struct {
                     row.int(0),
                 },
             );
+            try self.conn.exec("update threads set open = ?1 where id = ?2 and open != ?1", .{ boolToInt(!thread.archived), row.int(0) });
             return;
         }
 
@@ -3880,6 +4008,7 @@ fn mutationHeader(mutation: Mutation) store_protocol.MutationHeader {
         .workspace_repository_binding_upsert => |request| request.mutation,
         .workspace_repository_binding_remove => |request| request.mutation,
         .thread_upsert => |request| request.mutation,
+        .thread_close => |request| request.mutation,
         .chat_draft_set => |request| request.mutation,
         .message_append => |request| request.mutation,
         .surface_upsert => |request| request.mutation,
@@ -3900,6 +4029,7 @@ fn mutationOperation(mutation: Mutation) []const u8 {
         .workspace_repository_binding_upsert => WORKSPACE_REPOSITORY_BINDING_UPSERT_OPERATION,
         .workspace_repository_binding_remove => WORKSPACE_REPOSITORY_BINDING_REMOVE_OPERATION,
         .thread_upsert => THREAD_UPSERT_OPERATION,
+        .thread_close => THREAD_CLOSE_OPERATION,
         .chat_draft_set => CHAT_DRAFT_SET_OPERATION,
         .message_append => MESSAGE_APPEND_OPERATION,
         .surface_upsert => SURFACE_UPSERT_OPERATION,
@@ -3970,6 +4100,9 @@ fn validateMutation(mutation: Mutation) StoreError!void {
             if (request.thread.messages.len != 0) return error.InvalidParams;
             try validateThreadRoute(request.thread);
             _ = try firstAttachment(request.thread.draft_image, request.thread.draft_images);
+        },
+        .thread_close => |request| {
+            if (request.workspace_id.len == 0 or request.local_thread_id.len == 0) return error.InvalidParams;
         },
         .chat_draft_set => |request| {
             if (request.workspace_id.len == 0 or request.local_thread_id.len == 0) return error.InvalidParams;
@@ -4917,6 +5050,90 @@ fn testHeader(request_key: []const u8, expected_store_revision: ?u64) store_prot
         .expected_store_revision = expected_store_revision,
         .client_id = "test-client",
     };
+}
+
+test "thread close leaves the open set contiguous and a later replace reopens the row" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+
+    var workspace = testWorkspace("ws", "WS");
+    workspace.threads = &.{ testThread("a", "A"), testThread("b", "B"), testThread("c", "C") };
+    const bootstrap = try store.replaceSnapshot(testSnapshotRequest("boot", null, true, testSnapshot(&.{workspace})));
+
+    const closed = try store.closeThread(.{ .mutation = testHeader("close-b", bootstrap.store_revision), .workspace_id = "ws", .local_thread_id = "b" });
+    try std.testing.expect(closed.applied);
+    try expectThreadOpenState(&store, "a", 0, true);
+    try expectThreadOpenState(&store, "c", 2, true);
+    try expectThreadOpenState(&store, "b", 3, false);
+
+    const again = try store.closeThread(.{ .mutation = testHeader("close-b-again", closed.store_revision), .workspace_id = "ws", .local_thread_id = "b" });
+    try std.testing.expect(!again.applied);
+
+    // The GUI flushes only what it holds; the omitted closed row stays closed
+    // and moves after the open rows.
+    workspace.threads = &.{ testThread("a", "A"), testThread("c", "C") };
+    const omitted = try store.replaceSnapshot(testSnapshotRequest("omit-b", again.store_revision, false, testSnapshot(&.{workspace})));
+    try expectThreadOpenState(&store, "a", 0, true);
+    try expectThreadOpenState(&store, "c", 1, true);
+    try expectThreadOpenState(&store, "b", 2, false);
+
+    // Carrying the row again (open from history) reopens it; an archived
+    // payload row stays closed.
+    var archived = testThread("c", "C");
+    archived.archived = true;
+    workspace.threads = &.{ testThread("a", "A"), testThread("b", "B"), archived };
+    _ = try store.replaceSnapshot(testSnapshotRequest("reopen-b", omitted.store_revision, false, testSnapshot(&.{workspace})));
+    try expectThreadOpenState(&store, "a", 0, true);
+    try expectThreadOpenState(&store, "b", 1, true);
+    try expectThreadOpenState(&store, "c", 2, false);
+}
+
+test "snapshot replace carries thread closes atomically with the layout" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+
+    var workspace = testWorkspace("ws", "WS");
+    workspace.threads = &.{ testThread("a", "A"), testThread("b", "B"), testThread("c", "C") };
+    const bootstrap = try store.replaceSnapshot(testSnapshotRequest("boot", null, true, testSnapshot(&.{workspace})));
+
+    // The GUI drops b from its open array and carries the close in the same
+    // replace, so no revision ever exposes b open with a layout omitting it.
+    workspace.threads = &.{ testThread("a", "A"), testThread("c", "C") };
+    var snapshot = testSnapshot(&.{workspace});
+    snapshot.closed_threads = &.{
+        .{ .workspace_id = "ws", .local_thread_id = "b" },
+        .{ .workspace_id = "ws", .local_thread_id = "missing" },
+        .{ .workspace_id = "other", .local_thread_id = "a" },
+    };
+    const closed = try store.replaceSnapshot(testSnapshotRequest("close-b", bootstrap.store_revision, false, snapshot));
+    try expectThreadOpenState(&store, "a", 0, true);
+    try expectThreadOpenState(&store, "c", 1, true);
+    try expectThreadOpenState(&store, "b", 2, false);
+
+    // A stale close for a thread the replace still carries (reopened before
+    // the flush) is ignored; a repeated close is a no-op.
+    workspace.threads = &.{ testThread("a", "A"), testThread("c", "C"), testThread("b", "B") };
+    var reopen = testSnapshot(&.{workspace});
+    reopen.closed_threads = &.{.{ .workspace_id = "ws", .local_thread_id = "b" }};
+    _ = try store.replaceSnapshot(testSnapshotRequest("reopen-b", closed.store_revision, false, reopen));
+    try expectThreadOpenState(&store, "a", 0, true);
+    try expectThreadOpenState(&store, "c", 1, true);
+    try expectThreadOpenState(&store, "b", 2, true);
+}
+
+fn expectThreadOpenState(store: *Store, local_thread_id: []const u8, sort_index: i64, open: bool) !void {
+    var row = (try store.conn.row("select sort_index, open from threads where local_thread_id = ?1", .{local_thread_id})).?;
+    defer row.deinit();
+    try std.testing.expectEqual(sort_index, row.int(0));
+    try std.testing.expectEqual(@as(i64, @intFromBool(open)), row.int(1));
 }
 
 test "unchanged routine snapshot does not update workspace or thread rows" {
@@ -9007,4 +9224,57 @@ test "read-only reopen succeeds after clean close removes WAL sidecars" {
     const rev_row = (try conn.row("select store_revision from store_state where id = 1", .{})).?;
     defer rev_row.deinit();
     try std.testing.expectEqual(@as(i64, 1), rev_row.int(0));
+}
+
+test "thread sync replaces durable history atomically and preserves metadata" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(path);
+    var store = try Store.init(std.testing.allocator, path);
+    defer store.deinit();
+    var thread = testThread("synced", "Keep my title");
+    thread.provider_thread_id = "provider-thread";
+    thread.draft = "unsent draft";
+    thread.messages = &.{.{ .message_id = "snap-msg-1", .role = "assistant", .author = "Codex", .body = "duplicate" }};
+    var workspace = testWorkspace("sync-workspace", "Workspace");
+    workspace.threads = &.{thread};
+    _ = try store.replaceSnapshot(.{
+        .mutation = testHeader("sync-bootstrap", null),
+        .bootstrap = true,
+        .snapshot = .{ .workspaces = &.{workspace} },
+    });
+    const before = try store.storeRevision();
+    const messages = [_]store_protocol.Message{
+        .{ .message_id = "", .role = "user", .author = "You", .body = "question" },
+        .{ .message_id = "", .role = "assistant", .author = "Codex", .body = "answer" },
+    };
+    const result = try store.replaceThreadTranscript("sync-workspace", "synced", &messages);
+    try std.testing.expectEqual(before + 1, result.store_revision);
+    {
+        const row = (try store.conn.row("select t.title, t.draft, t.provider_thread_id, count(m.id), min(m.sort_index), max(m.sort_index) from threads t join messages m on m.thread_id = t.id where t.local_thread_id = 'synced' group by t.id", .{})).?;
+        defer row.deinit();
+        try std.testing.expectEqualStrings("Keep my title", row.text(0));
+        try std.testing.expectEqualStrings("unsent draft", row.text(1));
+        try std.testing.expectEqualStrings("provider-thread", row.text(2));
+        try std.testing.expectEqual(@as(i64, 2), row.int(3));
+        try std.testing.expectEqual(@as(i64, 0), row.int(4));
+        try std.testing.expectEqual(@as(i64, 1), row.int(5));
+    }
+    // Fail after deletion/insertion starts: rollback retains the prior rows.
+    const invalid = [_]store_protocol.Message{ messages[0], .{ .message_id = "", .role = "invalid-role", .author = "bad", .body = "bad" } };
+    try std.testing.expectError(error.InvalidParams, store.replaceThreadTranscript("sync-workspace", "synced", &invalid));
+    try std.testing.expectEqual(result.store_revision, try store.storeRevision());
+    // A save captured before sync must not bring the old duplicate back.
+    try std.testing.expectError(error.Conflict, store.replaceSnapshot(.{
+        .mutation = testHeader("stale-after-sync", result.store_revision),
+        .snapshot = .{ .store_revision = before, .workspaces = &.{workspace} },
+    }));
+    const after_stale_save = try store.storeRevision();
+    try store.conn.execNoArgs("insert into chat_turns (turn_id, workspace_id, local_thread_id, status, started_at_ms, provider) values ('busy', 'sync-workspace', 'synced', 'running', 1, 'codex')");
+    try std.testing.expectError(error.Conflict, store.replaceThreadTranscript("sync-workspace", "synced", &messages));
+    try std.testing.expectEqual(after_stale_save, try store.storeRevision());
+    const row = (try store.conn.row("select body from messages order by sort_index", .{})).?;
+    defer row.deinit();
+    try std.testing.expectEqualStrings("question", row.text(0));
 }

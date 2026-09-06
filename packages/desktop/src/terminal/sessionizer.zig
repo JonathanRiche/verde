@@ -2868,6 +2868,7 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDERS_STATUS)) return try self.providerStatusResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_AUTH_STATUS)) return try self.providerAuthStatusResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_THREADS_LIST)) return try self.providerThreadsListResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_THREAD_SYNC)) return try self.providerThreadSyncResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_THREAD_READ)) return try self.providerThreadReadResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_THREAD_INTERRUPT)) return try self.providerThreadInterruptResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_THREAD_STEER)) return try self.providerThreadSteerResponse(id_value, params);
@@ -3988,6 +3989,18 @@ pub const Daemon = struct {
                 break :blk null;
             };
             if (req) |value| decoded_mutation = .{ .thread_upsert = value };
+        } else if (std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_CLOSE)) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.ThreadCloseRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_mutation = .{ .thread_close = value };
         } else if (std.mem.eql(u8, method, store_protocol.METHOD_CHAT_DRAFT_SET)) {
             const req = std.json.parseFromValueLeaky(
                 store_protocol.ChatDraftSetRequest,
@@ -7746,6 +7759,88 @@ pub const Daemon = struct {
         });
     }
 
+    // Read the provider outside both daemon/store locks; commit only if the
+    // target still matches the snapshot read before the potentially slow I/O.
+    fn providerThreadSyncResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        var parsed = parseDaemonParams(headless.providers_protocol.ThreadSyncRequest, self.allocator, params) catch
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid thread sync request");
+        defer parsed.deinit();
+        const request = parsed.value;
+        const service = (self.beginStagedAttachmentRequest() catch
+            return try self.stagedAttachmentDrainingResponse(id_value)) orelse
+            return try storeErrorResponse(self.allocator, id_value, error.StoreUnavailable);
+        defer _ = service.in_flight.fetchSub(1, .monotonic);
+        const before = blk: {
+            lockStoreService(service);
+            defer service.mutex.unlock();
+            service.store.requireIdleThread(request.workspace_id, request.local_thread_id) catch |err|
+                return try storeErrorResponse(self.allocator, id_value, err);
+            break :blk loadThreadGetResult(self.allocator, &service.store, .{
+                .workspace_id = request.workspace_id,
+                .local_thread_id = request.local_thread_id,
+            }) catch |err| return try storeErrorResponse(self.allocator, id_value, err);
+        };
+        defer freeThreadGetResult(self.allocator, before);
+        if (!std.mem.eql(u8, before.thread.provider_thread_id orelse "", request.provider_thread_id) or
+            request.provider_thread_id.len == 0 or
+            !std.mem.eql(u8, before.thread.profile_id orelse "local", "local"))
+            return try storeErrorResponse(self.allocator, id_value, error.Conflict);
+        const provider = std.meta.stringToEnum(harness.Provider, before.thread.provider) orelse
+            return try storeErrorResponse(self.allocator, id_value, error.InvalidParams);
+        const project_path = blk: {
+            lockStoreService(service);
+            defer service.mutex.unlock();
+            const row = (try service.store.conn.row("select path from workspaces where workspace_id = ?1", .{request.workspace_id})) orelse
+                return try storeErrorResponse(self.allocator, id_value, error.ResourceNotFound);
+            defer row.deinit();
+            break :blk try self.allocator.dupe(u8, before.thread.cwd orelse row.text(0));
+        };
+        defer self.allocator.free(project_path);
+        var provider_client = send_runner.connectProvider(self.allocator, provider, project_path, true) catch |err|
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_PROVIDER_UNAVAILABLE, @errorName(err));
+        defer provider_client.deinit();
+        const imported = provider_client.readThread(self.allocator, request.provider_thread_id) catch |err|
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_PROVIDER_UNAVAILABLE, @errorName(err));
+        defer imported.deinit(self.allocator);
+        if (!std.mem.eql(u8, imported.thread_id, request.provider_thread_id) or imported.messages.len == 0)
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "provider returned empty or mismatched history; saved thread unchanged");
+        const messages = providerSyncMessagesAlloc(self.allocator, before.thread.messages, imported.messages) catch |err|
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, @errorName(err));
+        defer self.allocator.free(messages);
+        return try self.commitProviderThreadSync(id_value, service, request, before, messages);
+    }
+
+    fn commitProviderThreadSync(
+        self: *Daemon,
+        id_value: std.json.Value,
+        service: *StoreService,
+        request: headless.providers_protocol.ThreadSyncRequest,
+        before: store_protocol.ThreadGetResult,
+        messages: []const store_protocol.Message,
+    ) ![]u8 {
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        const current = loadThreadGetResult(self.allocator, &service.store, .{
+            .workspace_id = request.workspace_id,
+            .local_thread_id = request.local_thread_id,
+        }) catch |err| return try storeErrorResponse(self.allocator, id_value, err);
+        defer freeThreadGetResult(self.allocator, current);
+        const expected = try std.json.Stringify.valueAlloc(self.allocator, before.thread, .{});
+        defer self.allocator.free(expected);
+        const actual = try std.json.Stringify.valueAlloc(self.allocator, current.thread, .{});
+        defer self.allocator.free(actual);
+        if (!std.mem.eql(u8, expected, actual)) return try storeErrorResponse(self.allocator, id_value, error.Conflict);
+        const written = service.store.replaceThreadTranscript(request.workspace_id, request.local_thread_id, messages) catch |err|
+            return try storeErrorResponse(self.allocator, id_value, err);
+        self.appendJournalEntry(.chat_thread, request.local_thread_id, request.workspace_id, .{ .store = written.store_revision });
+        const result = try loadThreadGetResult(self.allocator, &service.store, .{
+            .workspace_id = request.workspace_id,
+            .local_thread_id = request.local_thread_id,
+        });
+        defer freeThreadGetResult(self.allocator, result);
+        return try okValueResponse(self.allocator, id_value, result);
+    }
+
     // Legacy provider-native cancellation used while an older desktop turn is
     // not yet represented by the daemon turn ledger.
     fn providerThreadInterruptResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
@@ -9088,6 +9183,7 @@ fn isStoreMethod(method: []const u8) bool {
         std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_BINDING_UPSERT) or
         std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_BINDING_REMOVE) or
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_UPSERT) or
+        std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_CLOSE) or
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_DRAFT_SET) or
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_MESSAGE_APPEND) or
         std.mem.eql(u8, method, store_protocol.METHOD_SURFACE_UPSERT) or
@@ -9152,6 +9248,9 @@ fn storeMutationCommittedHook(context: *anyopaque, mutation: *const daemon_store
             for (request.snapshot.chat_completions) |completion| {
                 daemon.appendJournalEntryQuiet(.chat_completion, completion.local_thread_id, completion.workspace_id, revision);
             }
+            for (request.snapshot.closed_threads) |closed| {
+                daemon.appendJournalEntryQuiet(.chat_thread, closed.local_thread_id, closed.workspace_id, revision);
+            }
             // M5-P4 Amendment 3 (M5-P3 verify MAJOR): carried surfaces must
             // journal like every other carried resource, matching the
             // surface_upsert arm below.
@@ -9191,6 +9290,7 @@ fn storeMutationCommittedHook(context: *anyopaque, mutation: *const daemon_store
         .workspace_repository_binding_upsert => |request| daemon.appendJournalEntry(.workspace, request.workspace_id, request.workspace_id, revision),
         .workspace_repository_binding_remove => |request| daemon.appendJournalEntry(.workspace, request.workspace_id, request.workspace_id, revision),
         .thread_upsert => |request| daemon.appendJournalEntry(.chat_thread, request.thread.local_thread_id, request.workspace_id, revision),
+        .thread_close => |request| daemon.appendJournalEntry(.chat_thread, request.local_thread_id, request.workspace_id, revision),
         .chat_draft_set => |request| daemon.appendJournalEntry(.chat_thread, request.local_thread_id, request.workspace_id, revision),
         .message_append => |request| daemon.appendJournalEntry(.chat_thread, request.thread_id, request.workspace_id, revision),
         // MAJOR-1 (M5-P3 amendment): store commits are the ONLY surface
@@ -9261,6 +9361,7 @@ fn mutationHeader(mutation: daemon_store.Mutation) store_protocol.MutationHeader
         .workspace_repository_binding_upsert => |request| request.mutation,
         .workspace_repository_binding_remove => |request| request.mutation,
         .thread_upsert => |request| request.mutation,
+        .thread_close => |request| request.mutation,
         .chat_draft_set => |request| request.mutation,
         .message_append => |request| request.mutation,
         .surface_upsert => |request| request.mutation,
@@ -9907,6 +10008,35 @@ fn freeTurnRecord(allocator: std.mem.Allocator, record: store_protocol.TurnRecor
     if (record.user_message_id) |value| allocator.free(value);
 }
 
+// Provider-native history currently carries text only. Retain attachment and
+// tool metadata on matching rows; refuse replacement if an attachment would
+// disappear. The returned array borrows strings/attachments from both inputs.
+fn providerSyncMessagesAlloc(
+    allocator: std.mem.Allocator,
+    saved: []const store_protocol.Message,
+    imported: []const harness.ChatMessage,
+) ![]store_protocol.Message {
+    const messages = try allocator.alloc(store_protocol.Message, imported.len);
+    errdefer allocator.free(messages);
+    const matched = try allocator.alloc(bool, saved.len);
+    defer allocator.free(matched);
+    @memset(matched, false);
+    for (imported, messages) |source, *message| {
+        message.* = .{ .message_id = "", .role = @tagName(source.role), .author = source.author, .body = source.body };
+        for (saved, 0..) |old, index| {
+            if (matched[index] or !std.mem.eql(u8, old.role, message.role) or !std.mem.eql(u8, old.body, message.body)) continue;
+            matched[index] = true;
+            message.* = old;
+            message.author = source.author;
+            break;
+        }
+    }
+    for (saved, matched) |old, retained| {
+        if (!retained and (old.image != null or old.images.len > 0)) return error.ProviderHistoryWouldDropAttachments;
+    }
+    return messages;
+}
+
 fn loadThreadGetResult(
     allocator: std.mem.Allocator,
     store: *daemon_store.Store,
@@ -10157,6 +10287,8 @@ fn decodeOwnedAttachmentList(
     return attachments.toOwnedSlice(allocator) catch return error.OutOfMemory;
 }
 
+const MAX_THREAD_LIST_QUERY_BYTES: usize = 256;
+
 fn boundedPageLimit(requested: u32) daemon_store.StoreError!u32 {
     const limit = if (requested == 0) store_protocol.DEFAULT_PAGE_ITEMS else requested;
     if (limit > store_protocol.MAX_PAGE_ITEMS) return error.InvalidParams;
@@ -10342,10 +10474,20 @@ fn loadThreadListResult(
     store: *daemon_store.Store,
     request: store_protocol.ThreadListRequest,
 ) daemon_store.StoreError!store_protocol.ThreadListResult {
-    if (request.workspace_id.len == 0) return error.InvalidParams;
+    if (request.query.len > MAX_THREAD_LIST_QUERY_BYTES) return error.InvalidParams;
     const limit = try boundedPageLimit(request.limit);
     const store_revision = store.storeRevision() catch return error.StoreUnavailable;
-    const offset = try decodePageCursor(request.cursor, .thread, store_revision, request.workspace_id);
+    // The cursor scope covers every filter so a page never continues a
+    // different query.
+    var scope_buf: [MAX_THREAD_LIST_QUERY_BYTES + 512]u8 = undefined;
+    const open_filter: i64 = if (request.open) |value| @intFromBool(value) else -1;
+    const scope = std.fmt.bufPrint(&scope_buf, "{s}|{d}|{d}|{s}", .{
+        request.workspace_id,
+        open_filter,
+        @intFromBool(request.recent_first),
+        request.query,
+    }) catch return error.InvalidParams;
+    const offset = try decodePageCursor(request.cursor, .thread, store_revision, scope);
     const offset_i64 = std.math.cast(i64, offset) orelse return error.InvalidParams;
     const fetch_limit: i64 = @intCast(limit + 1);
 
@@ -10359,14 +10501,20 @@ fn loadThreadListResult(
         \\select t.local_thread_id, t.title, t.archived, t.committed, t.last_activity_at,
         \\       t.provider_thread_id, t.model_ref, t.reasoning_effort, t.reasoning_variant,
         \\       t.fast_mode, t.access_mode, t.provider, t.harness, t.sort_index, t.cwd,
-        \\       t.profile_id, t.runtime_id, t.repository_id, t.repository_cwd
+        \\       t.profile_id, t.runtime_id, t.repository_id, t.repository_cwd,
+        \\       w.workspace_id, t.open
         \\from threads t
         \\join workspaces w on w.id = t.workspace_id
-        \\where w.workspace_id = ?1
-        \\order by t.sort_index asc, t.local_thread_id asc
+        \\where t.local_thread_id is not null
+        \\  and (?1 = '' or w.workspace_id = ?1)
+        \\  and (?4 < 0 or t.open = ?4)
+        \\  and (?5 = '' or instr(lower(t.title), lower(?5)) > 0)
+        \\order by
+        \\  case when ?6 = 1 then -coalesce(t.last_activity_at, 0) else w.sort_index end asc,
+        \\  t.sort_index asc, t.local_thread_id asc
         \\limit ?2 offset ?3
     ,
-        .{ request.workspace_id, fetch_limit, offset_i64 },
+        .{ request.workspace_id, fetch_limit, offset_i64, open_filter, request.query, @as(i64, @intFromBool(request.recent_first)) },
     ) catch return error.StoreUnavailable;
     defer rows.deinit();
     while (rows.next()) |row| {
@@ -10394,9 +10542,13 @@ fn loadThreadListResult(
         errdefer if (repository_id) |value| allocator.free(value);
         const repository_cwd = dupeOptionalText(allocator, row.nullableText(18)) catch return error.OutOfMemory;
         errdefer if (repository_cwd) |value| allocator.free(value);
+        const item_workspace_id = allocator.dupe(u8, row.text(19)) catch return error.OutOfMemory;
+        errdefer allocator.free(item_workspace_id);
         items.append(allocator, .{
             .local_thread_id = local_thread_id,
             .title = title,
+            .workspace_id = item_workspace_id,
+            .open = row.int(20) != 0,
             .sort_index = std.math.cast(usize, row.int(13)) orelse 0,
             .archived = row.int(2) != 0,
             .committed = row.int(3) != 0,
@@ -10430,7 +10582,7 @@ fn loadThreadListResult(
             allocator,
             .thread,
             store_revision,
-            request.workspace_id,
+            scope,
             next_offset,
         );
     } else null;
@@ -10451,6 +10603,7 @@ fn freeThreadListResult(allocator: std.mem.Allocator, result: store_protocol.Thr
 fn freeThreadListItem(allocator: std.mem.Allocator, item: store_protocol.ThreadListItem) void {
     allocator.free(item.local_thread_id);
     allocator.free(item.title);
+    allocator.free(item.workspace_id);
     if (item.provider_thread_id) |value| allocator.free(value);
     if (item.model_ref) |value| allocator.free(value);
     if (item.reasoning_variant) |value| allocator.free(value);
@@ -11147,7 +11300,17 @@ fn loadSnapshotContents(
                 \\       draft_image_path, draft_image_mime, draft_image_byte_size, draft_images_json, cwd,
                 \\       profile_id, runtime_id, repository_id, repository_cwd,
                 \\       (select count(*) from messages where messages.thread_id = threads.id)
-                \\from threads where workspace_id = ?1 order by sort_index
+                \\from threads
+                \\where workspace_id = ?1
+                \\  and (select archived from workspaces where id = ?1) = 0
+                \\  and (open = 1 or exists (
+                \\      select 1 from chat_turns turn
+                \\      join workspaces w on w.workspace_id = turn.workspace_id
+                \\      where w.id = threads.workspace_id
+                \\        and turn.local_thread_id = threads.local_thread_id
+                \\        and turn.status in ('accepted', 'running', 'waiting_approval')
+                \\  ))
+                \\order by sort_index
             , .{workspace_row.row_id}) catch return error.StoreUnavailable;
             defer rows.deinit();
             while (rows.next()) |row| {
@@ -11736,6 +11899,7 @@ fn methodRunsUnlocked(method: []const u8) bool {
         std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_AUTH_STATUS) or
         std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_THREADS_LIST) or
         std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_THREAD_READ) or
+        std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_THREAD_SYNC) or
         std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_THREAD_INTERRUPT) or
         std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_THREAD_STEER) or
         std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_SLASH_LIST) or
@@ -14233,6 +14397,7 @@ fn chatTurnThread(daemon: *Daemon, turn: *ChatTurn) void {
             .on_turn_id = chatSinkTurnId,
             .on_stream_delta = chatSinkDelta,
             .on_stream_event = chatSinkEvent,
+            .on_answer_ready = chatSinkAnswerReady,
             .on_failure = chatSinkFailure,
             .on_should_stop = chatSinkShouldStop,
             .on_approval_request = chatSinkApproval,
@@ -14240,11 +14405,13 @@ fn chatTurnThread(daemon: *Daemon, turn: *ChatTurn) void {
         lockTurn(turn);
         if (!(turn.cancel_requested or turn.status == .aborted)) {
             if (result) |value| {
+                const already_published = turn.status == .completed;
                 turn.status = .completed;
                 if (turn.provider_thread_id) |old| allocator.free(old);
                 turn.provider_thread_id = allocator.dupe(u8, value.provider_thread_id) catch null;
+                if (turn.result_reply_text) |old| allocator.free(old);
                 turn.result_reply_text = allocator.dupe(u8, value.reply_text) catch null;
-                turn.appendEvent(allocator, "completed", "{}");
+                if (!already_published) turn.appendEvent(allocator, "completed", "{}");
                 allocator.free(value.provider_thread_id);
                 allocator.free(value.reply_text);
             } else |err| {
@@ -14413,6 +14580,21 @@ fn chatSinkDelta(context: ?*anyopaque, delta: []const u8) void {
     lockTurn(turn);
     defer turn.mutex.unlock();
     turn.appendStringEvent(allocator, "assistant_delta", "text", delta);
+}
+
+/// Muse (and similar hosts) may finish the visible answer before the provider
+/// process settles. Publish GUI completion now; the worker still drains.
+fn chatSinkAnswerReady(context: ?*anyopaque, reply_text: []const u8) void {
+    const turn = chatTurnFromContext(context) orelse return;
+    const allocator = turn.allocator;
+    lockTurn(turn);
+    defer turn.mutex.unlock();
+    if (turn.cancel_requested or turn.status == .aborted or turn.status == .failed) return;
+    if (turn.status == .completed) return;
+    turn.status = .completed;
+    if (turn.result_reply_text) |old| allocator.free(old);
+    turn.result_reply_text = allocator.dupe(u8, reply_text) catch null;
+    turn.appendEvent(allocator, "completed", "{}");
 }
 
 fn chatSinkEvent(context: ?*anyopaque, event: harness.StreamEvent) void {
@@ -19704,4 +19886,80 @@ test "Connect bootstrap RPC secret copies are erased and retry is bounded" {
         const delay = connectRetryDelayMs("0123456789abcdef0123456789abcdef", attempt);
         try std.testing.expect(delay >= 1_000 and delay <= 300_000);
     }
+}
+
+test "thread sync preserves multiple attachments and rejects unmatched images" {
+    const saved = [_]store_protocol.Message{.{
+        .message_id = "user-1",
+        .role = "user",
+        .author = "You",
+        .body = "look",
+        .images = &.{
+            .{ .path = "/fixture/one.png", .mime = "image/png", .attachment_id = "a1" },
+            .{ .path = "/fixture/two.png", .mime = "image/png", .attachment_id = "a2" },
+        },
+    }};
+    const imported = [_]harness.ChatMessage{.{ .role = .user, .author = "You", .body = "look" }};
+    const messages = try providerSyncMessagesAlloc(std.testing.allocator, &saved, &imported);
+    defer std.testing.allocator.free(messages);
+    try std.testing.expectEqual(@as(usize, 2), messages[0].images.len);
+    try std.testing.expectEqualStrings("a2", messages[0].images[1].attachment_id.?);
+    try std.testing.expectError(error.ProviderHistoryWouldDropAttachments, providerSyncMessagesAlloc(std.testing.allocator, &saved, &.{}));
+}
+
+test "thread sync commit persists across reload and rejects stale provider reads" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testStoreDbPath(&tmp);
+    defer allocator.free(path);
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, path);
+    defer detachTestStoreService(&daemon);
+    const service = daemon.store_service.?;
+    _ = try service.store.replaceSnapshot(.{
+        .mutation = .{ .request_key = "sync-fixture", .client_id = "fixture" },
+        .bootstrap = true,
+        .snapshot = .{ .workspaces = &.{.{
+            .workspace_id = "workspace",
+            .label = "Workspace",
+            .path = "/fixture",
+            .threads = &.{.{
+                .local_thread_id = "thread",
+                .title = "Manual title",
+                .draft = "keep draft",
+                .provider_thread_id = "provider-thread",
+                .messages = &.{.{ .message_id = "snap-msg-1", .role = "assistant", .author = "Codex", .body = "old duplicate" }},
+            }},
+        }} },
+    });
+    const request: headless.providers_protocol.ThreadSyncRequest = .{
+        .workspace_id = "workspace",
+        .local_thread_id = "thread",
+        .provider_thread_id = "provider-thread",
+    };
+    const before = try loadThreadGetResult(allocator, &service.store, .{ .workspace_id = "workspace", .local_thread_id = "thread" });
+    defer freeThreadGetResult(allocator, before);
+    const replacement = [_]store_protocol.Message{.{ .role = "assistant", .author = "Codex", .body = "canonical reply" }};
+    const response = try daemon.commitProviderThreadSync(.{ .integer = 1 }, service, request, before, &replacement);
+    defer allocator.free(response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("result") != null);
+    const stale = try daemon.commitProviderThreadSync(.{ .integer = 2 }, service, request, before, &replacement);
+    defer allocator.free(stale);
+    var stale_parsed = try std.json.parseFromSlice(std.json.Value, allocator, stale, .{});
+    defer stale_parsed.deinit();
+    try std.testing.expectEqualStrings(headless.protocol.ERR_CONFLICT, testRpcErrorCode(stale_parsed.value).?);
+    detachTestStoreService(&daemon);
+    try attachTestStoreService(&daemon, path);
+    const loaded = try loadThreadGetResult(allocator, &daemon.store_service.?.store, .{ .workspace_id = "workspace", .local_thread_id = "thread" });
+    defer freeThreadGetResult(allocator, loaded);
+    try std.testing.expectEqualStrings("thread", loaded.thread.local_thread_id);
+    try std.testing.expectEqualStrings("Manual title", loaded.thread.title);
+    try std.testing.expectEqualStrings("keep draft", loaded.thread.draft);
+    try std.testing.expectEqual(@as(usize, 1), loaded.thread.messages.len);
+    try std.testing.expectEqualStrings("canonical reply", loaded.thread.messages[0].body);
+    try std.testing.expect(std.mem.startsWith(u8, loaded.thread.messages[0].message_id, "turn:sync:"));
 }

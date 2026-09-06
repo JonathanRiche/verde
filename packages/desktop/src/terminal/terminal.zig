@@ -687,6 +687,52 @@ const PaneFocusCandidate = struct {
     secondary_distance: f32,
 };
 
+/// How long a live OSC title must hold steady before it is persisted as the
+/// tab's observed title. Agent TUIs animate a spinner glyph in their title
+/// about once a second while working; persisting every frame of that
+/// animation flushed the whole workspace at the same rate.
+pub const OBSERVED_TITLE_SETTLE_MS: i64 = 3_000;
+
+/// Tracks the live OSC title against the persisted one. `observe` returns
+/// true once `live` differs from `settled` and has held steady for
+/// OBSERVED_TITLE_SETTLE_MS; the caller then persists it.
+pub const ObservedTitleSettle = struct {
+    pending: ?[]u8 = null,
+    pending_since_ms: i64 = 0,
+
+    pub fn deinit(self: *ObservedTitleSettle, allocator: std.mem.Allocator) void {
+        if (self.pending) |pending| allocator.free(pending);
+        self.pending = null;
+    }
+
+    pub fn observe(
+        self: *ObservedTitleSettle,
+        allocator: std.mem.Allocator,
+        settled: ?[]const u8,
+        live: []const u8,
+        now_ms: i64,
+    ) bool {
+        if (settled) |current| {
+            if (std.mem.eql(u8, current, live)) {
+                self.deinit(allocator);
+                return false;
+            }
+        }
+        if (self.pending) |pending| {
+            if (std.mem.eql(u8, pending, live)) {
+                if (now_ms - self.pending_since_ms < OBSERVED_TITLE_SETTLE_MS) return false;
+                self.deinit(allocator);
+                return true;
+            }
+        }
+        const dup = allocator.dupe(u8, live) catch return false;
+        self.deinit(allocator);
+        self.pending = dup;
+        self.pending_since_ms = now_ms;
+        return false;
+    }
+};
+
 pub const Tab = struct {
     id: u32,
     title: ?[]u8 = null,
@@ -707,12 +753,16 @@ pub const Tab = struct {
     /// Last user-submitted input in an explicitly tagged agent TUI. A nonzero
     /// value enrolls this tab in workspace history and survives restarts.
     agent_history_at: i64 = 0,
+    /// Live OSC title waiting to hold steady before it replaces
+    /// `observed_title`. Not persisted.
+    observed_title_settle: ObservedTitleSettle = .{},
     root: *PaneNode,
     active_pane_id: u32,
 
     fn deinit(self: *Tab, allocator: std.mem.Allocator) void {
         if (self.title) |title| allocator.free(title);
         if (self.observed_title) |observed| allocator.free(observed);
+        self.observed_title_settle.deinit(allocator);
         if (self.pinned_title) |pinned| allocator.free(pinned);
         if (self.pinned_provider) |pinned| allocator.free(pinned);
         deinitPaneNode(self.root, allocator);
@@ -923,11 +973,11 @@ pub const Dock = struct {
     pub fn poll(self: *Dock, allocator: std.mem.Allocator) !bool {
         var changed = false;
         var terminal_modes_changed = false;
+        const now_ms: i64 = @intCast(@divTrunc(platform_runtime.monotonicTimestampNs(), std.time.ns_per_ms));
         for (self.tabs.items) |*tab| {
             changed = (try pollPaneNode(tab.root, allocator, &terminal_modes_changed)) or changed;
-            if (self.captureTabObservedTitle(allocator, tab)) changed = true;
+            if (self.captureTabObservedTitle(allocator, tab, now_ms)) changed = true;
         }
-        const now_ms: i64 = @intCast(@divTrunc(platform_runtime.monotonicTimestampNs(), std.time.ns_per_ms));
         self.auto_restart_backoff.observeHealth(now_ms, self.hasRunningSession());
         if (terminal_modes_changed) self.workspace_changed = true;
         return changed;
@@ -1009,14 +1059,15 @@ pub const Dock = struct {
 
     /// Remembers the active pane's live OSC title on its tab so it can be shown
     /// (and persisted) even after a restart, before the program re-emits it.
-    fn captureTabObservedTitle(self: *Dock, allocator: std.mem.Allocator, tab: *Tab) bool {
+    /// The live label itself comes straight from the session; only the
+    /// persisted copy waits for the title to hold steady, so an agent's
+    /// working-spinner animation never turns into workspace writes.
+    fn captureTabObservedTitle(self: *Dock, allocator: std.mem.Allocator, tab: *Tab, now_ms: i64) bool {
         const pane = findPaneLeaf(tab.root, tab.active_pane_id) orelse findFirstPaneLeaf(tab.root) orelse return false;
         const session = pane.session orelse return false;
         var buf: [96]u8 = undefined;
         const live = session.liveOscTitle(&buf) orelse return false;
-        if (tab.observed_title) |old| {
-            if (std.mem.eql(u8, old, live)) return false;
-        }
+        if (!tab.observed_title_settle.observe(allocator, tab.observed_title, live, now_ms)) return false;
         const dup = allocator.dupe(u8, live) catch return false;
         if (tab.observed_title) |old| allocator.free(old);
         tab.observed_title = dup;
@@ -6525,6 +6576,35 @@ test "repair terminal state resets invalid scrolling region" {
     try testing.expectEqual(session.terminal.cols - 1, session.terminal.scrolling_region.right);
     try testing.expectEqual(@as(@TypeOf(session.terminal.scrolling_region.top), 0), session.terminal.scrolling_region.top);
     try testing.expectEqual(session.terminal.rows - 1, session.terminal.scrolling_region.bottom);
+}
+
+test "observed tab title persists only after the live title holds steady" {
+    const allocator = std.testing.allocator;
+    var settle: ObservedTitleSettle = .{};
+    defer settle.deinit(allocator);
+
+    // An agent's working spinner alternates every second and never settles.
+    try std.testing.expect(!settle.observe(allocator, "✳ summary", "◐ summary", 0));
+    try std.testing.expect(!settle.observe(allocator, "✳ summary", "◑ summary", 1_000));
+    try std.testing.expect(!settle.observe(allocator, "✳ summary", "◐ summary", 2_000));
+    try std.testing.expect(!settle.observe(allocator, "✳ summary", "◑ summary", 3_000));
+    try std.testing.expect(!settle.observe(allocator, "✳ summary", "◐ summary", 4_000));
+
+    // A steady title is promoted once it has held for the settle window.
+    try std.testing.expect(!settle.observe(allocator, "✳ summary", "✳ new summary", 5_000));
+    try std.testing.expect(!settle.observe(allocator, "✳ summary", "✳ new summary", 5_000 + OBSERVED_TITLE_SETTLE_MS - 1));
+    try std.testing.expect(settle.observe(allocator, "✳ summary", "✳ new summary", 5_000 + OBSERVED_TITLE_SETTLE_MS));
+    try std.testing.expect(settle.pending == null);
+
+    // Returning to the persisted title drops any pending candidate.
+    try std.testing.expect(!settle.observe(allocator, "✳ new summary", "◐ new summary", 10_000));
+    try std.testing.expect(settle.pending != null);
+    try std.testing.expect(!settle.observe(allocator, "✳ new summary", "✳ new summary", 10_500));
+    try std.testing.expect(settle.pending == null);
+
+    // A fresh tab's first title also waits for the window.
+    try std.testing.expect(!settle.observe(allocator, null, "claude", 20_000));
+    try std.testing.expect(settle.observe(allocator, null, "claude", 20_000 + OBSERVED_TITLE_SETTLE_MS));
 }
 
 fn claudeBackgroundShells(model: *const ghostty_vt.Terminal) bool {

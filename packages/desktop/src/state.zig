@@ -321,9 +321,78 @@ fn changeCursorSignalsForTopic(topic: []const u8) ChangeCursorSignals {
     return .{ .registry = true };
 }
 
-fn journalBatchNeedsDurableRefresh(entries: []const headless.changes_protocol.ChangeEntry) bool {
-    for (entries) |entry| if (entry.store_revision != null) return true;
+/// Highest durable revision carried by one journal batch; null when every
+/// entry is registry-only.
+fn journalBatchMaxStoreRevision(entries: []const headless.changes_protocol.ChangeEntry) ?u64 {
+    var max_revision: ?u64 = null;
+    for (entries) |entry| {
+        const revision = entry.store_revision orelse continue;
+        if (max_revision == null or revision > max_revision.?) max_revision = revision;
+    }
+    return max_revision;
+}
+
+fn journalBatchHasVolatileEntries(entries: []const headless.changes_protocol.ChangeEntry) bool {
+    for (entries) |entry| if (entry.store_revision == null) return true;
     return false;
+}
+
+/// A durable rebuild is only owed for a revision this client has not projected
+/// yet. Everything at or below `observed_revision` is already reflected: it was
+/// either applied from a snapshot at that revision or written by this client
+/// under CAS against the previous one. In particular the daemon's journal echo
+/// of a GUI flush (one entry per workspace/thread at the flush's revision)
+/// must not rebuild the projection the flush was captured from; that echo was
+/// the dominant source of frame-thread stalls while typing.
+fn journalBatchNeedsDurableRefresh(
+    entries: []const headless.changes_protocol.ChangeEntry,
+    observed_revision: u64,
+) bool {
+    const max_revision = journalBatchMaxStoreRevision(entries) orelse return false;
+    return max_revision > observed_revision;
+}
+
+/// Upper bound on the cursor thread waiting for an in-flight GUI write receipt
+/// before classifying a durable batch. The receipt normally trails the journal
+/// entries by one daemon round trip; the bound only matters when a large
+/// snapshot replace is slow to acknowledge, and then the batch simply takes
+/// the pre-existing full-rebuild path.
+const SELF_WRITE_SETTLE_MS: i64 = 1_500;
+const SELF_WRITE_SETTLE_POLL_MS: u64 = 2;
+
+/// Returns the projection revision to classify a batch against, after letting
+/// an in-flight self write land when the batch would otherwise look foreign.
+fn settleSelfProjectionWrite(
+    storage: *const Storage,
+    loop: *ChangeCursorLoopState,
+    max_store_revision: ?u64,
+) u64 {
+    var observed_revision = storage.currentProjectionObservedRevision();
+    const revision = max_store_revision orelse return observed_revision;
+    const started_ms = platform_runtime.unixTimestampMs();
+    while (revision > observed_revision and storage.selfProjectionWriteInFlight()) {
+        if (loop.shutdown.load(.acquire)) break;
+        if (platform_runtime.unixTimestampMs() - started_ms >= SELF_WRITE_SETTLE_MS) break;
+        platform_runtime.sleepMillis(SELF_WRITE_SETTLE_POLL_MS);
+        observed_revision = storage.currentProjectionObservedRevision();
+    }
+    return observed_revision;
+}
+
+/// Frame-thread counterpart of `journalBatchNeedsDurableRefresh`: a durable
+/// refresh fetched while a self write was still unacknowledged can reach the
+/// frame thread already projected. Only its volatile scopes are news then,
+/// unless a repair needs the full merge path regardless of revision.
+fn durableRefreshAlreadyProjected(
+    store_revision: u64,
+    observed_revision: u64,
+    adoption_repair: bool,
+    rebase_pending: bool,
+    baseline_paired: bool,
+) bool {
+    if (store_revision > observed_revision) return false;
+    if (adoption_repair or rebase_pending) return false;
+    return baseline_paired;
 }
 
 const ChangeCursorPollOutcome = enum { advanced, heartbeat, snapshot_required, busy, unavailable };
@@ -434,11 +503,33 @@ fn pollCoreChangesOnce(storage: *const Storage, loop: *ChangeCursorLoopState, cu
         _ = storage.noteChangesResult(result);
         return .advanced;
     }
+    const max_store_revision = journalBatchMaxStoreRevision(result.entries);
+    const settle_started_ms = platform_runtime.unixTimestampMs();
+    const observed_revision = settleSelfProjectionWrite(storage, loop, max_store_revision);
+    const durable_changed = journalBatchNeedsDurableRefresh(result.entries, observed_revision);
+    const volatile_changed = journalBatchHasVolatileEntries(result.entries);
+    // Decision trace: pairs with the frame-thread "projection refresh applied"
+    // line so a stall can be attributed to a specific journal batch.
+    runtime_log.diagnostic(
+        "change-cursor batch entries={d} max_store_revision={d} observed_revision={d} settle_ms={d} decision={s}",
+        .{
+            result.entries.len,
+            max_store_revision orelse 0,
+            observed_revision,
+            platform_runtime.unixTimestampMs() - settle_started_ms,
+            if (durable_changed) "durable" else if (volatile_changed) "volatile" else "skip_self_echo",
+        },
+    );
+    if (!durable_changed and !volatile_changed) {
+        // Every entry echoes a revision this client already projects (its own
+        // flush receipt). Advance past it without fetching or rebuilding.
+        _ = storage.noteChangesResult(result);
+        return .advanced;
+    }
     var signals: ChangeCursorSignals = .{};
     for (result.entries) |entry| {
         signals.merge(changeCursorSignalsForTopic(entry.topic));
     }
-    const durable_changed = journalBatchNeedsDurableRefresh(result.entries);
     var fetch_reason: []const u8 = "";
     const refresh = (if (durable_changed)
         fetchOwnedCompositeSnapshot(storage, &fetch_reason)
@@ -1186,6 +1277,8 @@ fn prepareProjectionTranscriptContinuity(
     current: *const ChatThread,
     replacement: *ChatThread,
 ) !void {
+    if (chat_threads.transcriptSyncGeneration(replacement.messages.items) >
+        chat_threads.transcriptSyncGeneration(current.messages.items)) return;
     if (replacementTranscriptIsUnchangedCoveredRange(current, replacement)) return;
 
     const current_start = current.persisted_message_offset;
@@ -1245,12 +1338,17 @@ fn prepareProjectionTranscriptRuntime(
     const collections = .{ &replacement.projects, &replacement.archived_projects };
     inline for (collections) |projects| {
         for (projects.items) |*next_project| {
+            // A borrowed project is the live project; its transcripts are
+            // already hydrated.
+            if (next_project.projection_borrowed) continue;
             const current_project = projectByIdForViewport(current, next_project.id) orelse continue;
             for (next_project.threads.items) |*next_thread| {
+                if (next_thread.projection_borrowed) continue;
                 const current_thread = threadByIdForViewport(current_project, next_thread.local_thread_id) orelse continue;
                 try prepareProjectionTranscriptContinuity(allocator, current_thread, next_thread);
             }
             for (next_project.archived_threads.items) |*next_thread| {
+                if (next_thread.projection_borrowed) continue;
                 const current_thread = threadByIdForViewport(current_project, next_thread.local_thread_id) orelse continue;
                 try prepareProjectionTranscriptContinuity(allocator, current_thread, next_thread);
             }
@@ -1366,17 +1464,23 @@ fn preserveProjectionRuntime(
     const collections = .{ &replacement.projects, &replacement.archived_projects };
     inline for (collections) |projects| {
         for (projects.items) |*next_project| {
+            // A borrowed project aliases its live slot's heap state; a
+            // runtime transfer between the two copies would free it.
+            if (next_project.projection_borrowed) continue;
             const current_project = projectByIdForViewport(current, next_project.id) orelse continue;
             transferProjectionTerminalRuntime(current_project, next_project);
             preserveWorkspaceViewportRuntime(current_project, next_project);
 
             for (next_project.threads.items) |*next_thread| {
+                // Borrowed threads alias their live slot; nothing to carry.
+                if (next_thread.projection_borrowed) continue;
                 const current_thread = threadByIdForViewport(current_project, next_thread.local_thread_id) orelse continue;
                 next_thread.transcript_scroll_valid = current_thread.transcript_scroll_valid;
                 next_thread.transcript_scroll_y = current_thread.transcript_scroll_y;
                 transferProjectionThreadRuntime(current_thread, next_thread);
             }
             for (next_project.archived_threads.items) |*next_thread| {
+                if (next_thread.projection_borrowed) continue;
                 const current_thread = threadByIdForViewport(current_project, next_thread.local_thread_id) orelse continue;
                 next_thread.transcript_scroll_valid = current_thread.transcript_scroll_valid;
                 next_thread.transcript_scroll_y = current_thread.transcript_scroll_y;
@@ -1900,6 +2004,7 @@ pub const AccessMode = provider_models.AccessMode;
 pub const ChatRole = provider_models.ChatRole;
 pub const Provider = provider_models.Provider;
 pub const AgentTuiProvider = stack_config.AgentProvider;
+pub const AgentTuiHistoryProvider = terminal_controller.AgentTuiProvider;
 pub const Harness = provider_models.Harness;
 
 fn slashCommandPrefix(raw_text: []const u8) ?[]const u8 {
@@ -3987,6 +4092,8 @@ const TranscriptHydrationArgs = struct {
     }
 };
 
+const PALETTE_HISTORY_LIMIT: usize = 400;
+
 fn transcriptHydrationWorkerMain(args: *TranscriptHydrationArgs) void {
     args.page = args.storage.loadMessagePage(
         args.allocator,
@@ -4301,6 +4408,28 @@ fn nextProjectDisplayNumber(open_workspace_count: usize) usize {
     return open_workspace_count + 1;
 }
 
+/// In-place provider switching is only for a never-sent draft. Bounded
+/// transcript hydration can leave `messages` empty on a committed thread,
+/// so `messages.len == 0` alone is not enough.
+fn threadAllowsInPlaceProviderChoice(thread: *const ChatThread) bool {
+    return !thread.committed and
+        thread.messages.items.len == 0 and
+        thread.provider_thread_id == null and
+        thread.persisted_message_offset == 0 and
+        !thread.isSendPendingForUi();
+}
+
+test "committed or hydrated threads keep their provider" {
+    var thread = try ChatThread.init(std.testing.allocator, "Desktop Settings UX Review");
+    defer thread.deinit(std.testing.allocator);
+    try std.testing.expect(threadAllowsInPlaceProviderChoice(&thread));
+    thread.committed = true;
+    try std.testing.expect(!threadAllowsInPlaceProviderChoice(&thread));
+    thread.committed = false;
+    thread.persisted_message_offset = 12;
+    try std.testing.expect(!threadAllowsInPlaceProviderChoice(&thread));
+}
+
 pub const AppState = struct {
     pub const DRAFT_CAPACITY = chat_types.DRAFT_CAPACITY;
 
@@ -4512,6 +4641,13 @@ pub const AppState = struct {
     change_cursor_spawn_failure_logged: bool = false,
     /// Edge detector for the daemon-projection stale sidebar indicator.
     daemon_projection_stale_notified: bool = false,
+    /// Reject projection responses captured before an authoritative thread sync.
+    provider_sync_store_revision: u64 = 0,
+    /// Workspace reuse counts from the last durable projection refresh
+    /// (diagnostic only).
+    last_projection_reuse: persistence.ProjectionReuseStats = .{},
+    /// Closed threads fetched when the command palette opens (item 5b); freed on close.
+    palette_history: ?state_storage.LoadedThreadHistory = null,
     /// Dedicated synchronization status, independent of generic notices.
     daemon_projection_stale: bool = false,
     daemon_projection_bootstrap_started_at_ms: i64 = 0,
@@ -4706,12 +4842,18 @@ pub const AppState = struct {
             state.lifecycle.projection_baseline_revision = storage.currentProjectionObservedRevision();
             state.daemon_projection_has_saved_state = true;
             if (pending_spool) |*spool| {
+                for (spool.value.current.closed_threads) |closed| {
+                    try state.lifecycle.queueThreadClose(allocator, closed.workspace_id, closed.local_thread_id);
+                }
                 try chat_controller.restorePendingAdoptionRepairs(spool.value.adoption_repairs);
                 state.lifecycle.markDirty(platform_runtime.unixTimestampMs());
                 state.lifecycle.dirty_spooled = true;
             }
         } else if (pending_spool) |*spool| {
             try state.applyPersisted(spool.value.current);
+            for (spool.value.current.closed_threads) |closed| {
+                try state.lifecycle.queueThreadClose(allocator, closed.workspace_id, closed.local_thread_id);
+            }
             state.lifecycle.projection_baseline = LoadedPersistedState.init(allocator);
             state.lifecycle.projection_baseline_revision = storage.currentProjectionObservedRevision();
             try chat_controller.restorePendingAdoptionRepairs(spool.value.adoption_repairs);
@@ -5677,24 +5819,47 @@ pub const AppState = struct {
         image: ?*const ChatImageAttachment,
         extra_images: []const ChatImageAttachment,
     ) !void {
+        try self.appendProjectedMessageToThread(thread, role, author, body, image, extra_images);
+        self.markDirty();
+    }
+
+    /// Adopt a message already owned by the daemon without scheduling a save.
+    pub fn appendProjectedMessageToThread(
+        self: *AppState,
+        thread: *ChatThread,
+        role: ChatRole,
+        author: []const u8,
+        body: []const u8,
+        image: ?*const ChatImageAttachment,
+        extra_images: []const ChatImageAttachment,
+    ) !void {
         const copied_extra = try self.allocator.alloc(ChatImageAttachment, extra_images.len);
-        errdefer self.allocator.free(copied_extra);
+        var copied_count: usize = 0;
+        errdefer {
+            for (copied_extra[0..copied_count]) |attachment| attachment.deinit(self.allocator);
+            self.allocator.free(copied_extra);
+        }
         for (extra_images, 0..) |attachment, index| {
             copied_extra[index] = try ChatImageAttachment.init(self.allocator, attachment.path, attachment.mime, attachment.byte_size);
+            copied_count += 1;
         }
-
+        const copied_author = try self.dupeZ(author);
+        errdefer self.allocator.free(copied_author);
+        const copied_body = try self.dupeZ(body);
+        errdefer self.allocator.free(copied_body);
+        const copied_image: ?ChatImageAttachment = if (image) |attachment|
+            try ChatImageAttachment.init(self.allocator, attachment.path, attachment.mime, attachment.byte_size)
+        else
+            null;
+        errdefer if (copied_image) |attachment| attachment.deinit(self.allocator);
         try thread.messages.append(self.allocator, .{
             .role = role,
-            .author = try self.dupeZ(author),
-            .body = try self.dupeZ(body),
-            .image = if (image) |attachment|
-                try ChatImageAttachment.init(self.allocator, attachment.path, attachment.mime, attachment.byte_size)
-            else
-                null,
+            .author = copied_author,
+            .body = copied_body,
+            .image = copied_image,
             .extra_images = copied_extra,
         });
         thread.touch();
-        self.markDirty();
     }
 
     pub fn appendInitialSendFailure(self: *AppState, thread: *ChatThread, message: []const u8) void {
@@ -6117,6 +6282,19 @@ pub const AppState = struct {
             };
         }
 
+        if (kind == .sync_thread) {
+            const project = &self.project_controller.projects.items[project_index];
+            const thread = &project.threads.items[thread_index.?];
+            request.workspace_id = allocator.dupe(u8, project.id) catch {
+                request.deinit();
+                return false;
+            };
+            request.local_thread_id = allocator.dupe(u8, thread.local_thread_id) catch {
+                request.deinit();
+                return false;
+            };
+        }
+
         const operation = &self.provider_controller.thread_operation;
         operation.mutex.lock();
         defer operation.mutex.unlock();
@@ -6284,6 +6462,10 @@ pub const AppState = struct {
             return;
         }
 
+        if (!std.mem.eql(u8, project.threads.items[thread_index].selectedRuntimeRoute().profile_id, "local")) {
+            self.setSidebarNotice("Sync this thread from its owning remote runtime.");
+            return;
+        }
         const provider = project.threads.items[thread_index].provider;
         const provider_thread_id = project.threads.items[thread_index].provider_thread_id orelse {
             self.setSidebarNotice("This thread is not linked to a remote provider session.");
@@ -6332,9 +6514,10 @@ pub const AppState = struct {
 
         switch (result orelse return) {
             .list => |threads| self.applyProviderThreadList(request, threads),
+            .synced => |response| self.applyProviderThreadSync(request, &response),
             .read => |thread| switch (request.kind) {
                 .import_thread => self.applyProviderThreadImport(request, thread),
-                .sync_thread => self.applyProviderThreadSync(request, thread),
+                .sync_thread => {},
                 .list => {},
             },
         }
@@ -6451,26 +6634,35 @@ pub const AppState = struct {
     fn applyProviderThreadSync(
         self: *AppState,
         request: *const provider_controller.ProviderThreadOperationRequest,
-        imported_thread: provider_types.ReadThreadResult,
+        response: *const headless.protocol.ParsedResponse,
     ) void {
-        if (request.project_index >= self.project_controller.projects.items.len) return;
-        const thread_index = request.thread_index orelse return;
-        const project = &self.project_controller.projects.items[request.project_index];
-        if (thread_index >= project.threads.items.len) return;
-        const expected_id = request.thread_id orelse return;
-        const current_id = project.threads.items[thread_index].provider_thread_id orelse return;
-        if (project.threads.items[thread_index].provider != request.provider or !std.mem.eql(u8, current_id, expected_id)) return;
-        self.replaceThreadWithImportedSnapshot(request.project_index, thread_index, imported_thread) catch {
-            self.setSidebarNotice("Failed to sync the local thread.");
-            return;
-        };
-        self.project_controller.selected_index = request.project_index;
-        self.project_controller.projects.items[request.project_index].selected_thread_index = thread_index;
-        self.requestComposerFocus();
-        self.syncRenameBuffer();
-        self.requestTranscriptScrollToBottom();
-        self.markDirty();
-        self.setSidebarNotice(threadSyncedNotice(request.provider));
+        const result = response.response.result orelse return;
+        if (result != .object) return;
+        const thread_value = result.object.get("thread") orelse return;
+        if (thread_value != .object) return;
+        const rows = thread_value.object.get("messages") orelse return;
+        const revision_value = result.object.get("store_revision") orelse return;
+        if (rows != .array or revision_value != .integer or revision_value.integer < 0) return;
+        const revision: u64 = @intCast(revision_value.integer);
+        self.provider_sync_store_revision = @max(self.provider_sync_store_revision, revision);
+        self.storage.noteStoreRevision(revision);
+        _ = self.requestDaemonProjectionForPresentation(revision);
+        for (self.project_controller.projects.items) |*project| {
+            if (!std.mem.eql(u8, project.id, request.workspace_id orelse return)) continue;
+            for (project.threads.items, 0..) |*thread, thread_index| {
+                if (!std.mem.eql(u8, thread.local_thread_id, request.local_thread_id orelse return)) continue;
+                if (thread.isSendPending()) return;
+                chat_controller.replaceThreadTranscriptFromStoreMessages(self.allocator, thread, rows.array.items) catch {
+                    self.setSidebarNotice("History synced in daemon; waiting for the view to reload.");
+                    return;
+                };
+                thread.transcript_scroll_valid = false;
+                project.workspace_layout.resetChatTranscriptScrollForThread(thread_index);
+                if (self.currentThreadMutable() == thread) self.requestTranscriptScrollToBottom();
+                self.setSidebarNotice(threadSyncedNotice(request.provider));
+                return;
+            }
+        }
     }
 
     pub fn finishProjectRename(self: *AppState) void {
@@ -6561,6 +6753,9 @@ pub const AppState = struct {
         errdefer if (!restored_appended) restored.deinit(self.allocator);
         restored.archived = false;
         restored.unread_count = unread_count;
+        // Item 5b: archived workspaces ship without threads. Pull the open
+        // set back in sort order so the layout's pane ordinals line up.
+        if (restored.threads.items.len == 0) self.hydrateWorkspaceOpenThreads(&restored);
         const created_default_thread = restored.threads.items.len == 0;
         if (created_default_thread) {
             _ = try restored.addThread(self.allocator);
@@ -6662,6 +6857,164 @@ pub const AppState = struct {
         for (project.threads.items) |*thread| if (threadHasRunningBackgroundTasks(thread)) return true;
         for (project.archived_threads.items) |*thread| if (threadHasRunningBackgroundTasks(thread)) return true;
         return false;
+    }
+
+    /// Item 5b: closing the last pane of a thread closes the thread. It leaves
+    /// the open array (pane ordinals are renumbered) and the daemon is told to
+    /// flip it cold, so the next flush and every later snapshot omit it. Busy
+    /// threads, the Companion thread, and threads still shown in another pane
+    /// stay open. Returns true when the thread was removed.
+    pub fn closeThreadAfterPaneClose(self: *AppState, project_index: usize, thread_index: usize) bool {
+        if (project_index >= self.project_controller.projects.items.len) return false;
+        const project = &self.project_controller.projects.items[project_index];
+        if (thread_index >= project.threads.items.len) return false;
+        if (project.hasChatPaneForThread(thread_index)) return false;
+        const thread = &project.threads.items[thread_index];
+        if (project.isCompanionThread(thread)) return false;
+        if (thread.isSendPending() or threadHasRunningBackgroundTasks(thread)) return false;
+
+        var removed = project.removeThreadAtIndex(thread_index);
+        const committed = removed.committed;
+        if (committed) {
+            // The close rides inside the next snapshot flush so the daemon
+            // flips the row cold in the same transaction that persists the
+            // layout without its pane. A separate immediate mutation let a
+            // foreign refresh observe the daemon's stale layout and clamp the
+            // dead pane ordinal onto another thread (duplicate panes).
+            self.lifecycle.queueThreadClose(self.allocator, project.id, removed.local_thread_id) catch |err| {
+                log.warn("failed to queue thread close: {s}", .{@errorName(err)});
+            };
+        }
+        removed.deinit(self.allocator);
+
+        if (project.threads.items.len == 0) {
+            const new_thread_index = project.addThread(self.allocator) catch {
+                self.markDirty();
+                return true;
+            };
+            self.applyNewChatDefaults(project_index, new_thread_index) catch |err| {
+                log.warn("failed to apply new-chat defaults after close: {s}", .{@errorName(err)});
+            };
+        }
+        self.syncRenameBuffer();
+        self.markDirty();
+        runtime_log.diagnostic("thread closed project={d} committed={} open_threads={d}", .{ project_index, committed, project.threads.items.len });
+        return true;
+    }
+
+    /// Fetches every open thread of one workspace by identity and appends
+    /// them in daemon sort order. On any failure the project is left with
+    /// no threads so the caller's default-draft path runs; a partial set
+    /// would misalign pane ordinals.
+    fn hydrateWorkspaceOpenThreads(self: *AppState, project: *Project) void {
+        var listed = self.storage.loadThreadList(self.allocator, .{ .workspace_id = project.id, .open = true }) catch |err| {
+            log.warn("workspace thread list failed: {s}", .{@errorName(err)});
+            return;
+        };
+        defer listed.deinit();
+        var ok = true;
+        for (listed.items) |item| {
+            var loaded = self.storage.loadThread(self.allocator, item.workspace_id, item.local_thread_id) catch |err| {
+                log.warn("workspace thread fetch failed: {s}", .{@errorName(err)});
+                ok = false;
+                break;
+            };
+            defer loaded.deinit();
+            var thread = persistence.buildThreadFromPersisted(self.allocator, loaded.thread) catch |err| {
+                log.warn("workspace thread build failed: {s}", .{@errorName(err)});
+                ok = false;
+                break;
+            };
+            project.threads.append(self.allocator, thread) catch {
+                thread.deinit(self.allocator);
+                ok = false;
+                break;
+            };
+        }
+        if (!ok) {
+            for (project.threads.items) |*thread| thread.deinit(self.allocator);
+            project.threads.clearRetainingCapacity();
+        }
+        project.invalidateSidebarThreadCache();
+        runtime_log.diagnostic("workspace reopened threads={d} ok={}", .{ project.threads.items.len, ok });
+    }
+
+    /// Fetches closed threads for the palette's HISTORY rows. One daemon
+    /// round trip per palette open; nothing is held between opens.
+    pub fn refreshPaletteHistory(self: *AppState) void {
+        self.clearPaletteHistory();
+        self.palette_history = self.storage.loadThreadHistory(self.allocator, PALETTE_HISTORY_LIMIT) catch |err| blk: {
+            log.warn("palette history query failed: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+    }
+
+    pub fn clearPaletteHistory(self: *AppState) void {
+        if (self.palette_history) |*history| history.deinit();
+        self.palette_history = null;
+    }
+
+    pub fn paletteHistoryItems(self: *const AppState) []const headless.store.ThreadListItem {
+        const history = self.palette_history orelse return &.{};
+        return history.items;
+    }
+
+    /// Reopens a closed thread from the palette: fetch it by identity, append
+    /// it to the workspace's open array, and split a pane for it. The flush
+    /// that follows carries the thread, which reopens it in the daemon.
+    pub fn openHistoryThread(self: *AppState, history_index: usize) void {
+        const items = self.paletteHistoryItems();
+        if (history_index >= items.len) return;
+        const item = items[history_index];
+
+        var project_index: ?usize = null;
+        for (self.project_controller.projects.items, 0..) |*project, pi| {
+            if (std.mem.eql(u8, project.id, item.workspace_id)) {
+                project_index = pi;
+                break;
+            }
+        }
+        const pi = project_index orelse {
+            self.setSidebarNotice("Reopen that chat's workspace first.");
+            return;
+        };
+        {
+            const project = &self.project_controller.projects.items[pi];
+            for (project.threads.items, 0..) |*thread, ti| {
+                if (std.mem.eql(u8, thread.local_thread_id, item.local_thread_id)) {
+                    self.openThreadInWorkspaceSplit(pi, ti);
+                    return;
+                }
+            }
+        }
+
+        var loaded = self.storage.loadThread(self.allocator, item.workspace_id, item.local_thread_id) catch |err| {
+            log.warn("history thread fetch failed: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Could not load that chat from the daemon.");
+            return;
+        };
+        defer loaded.deinit();
+        var thread = persistence.buildThreadFromPersisted(self.allocator, loaded.thread) catch |err| {
+            log.warn("history thread build failed: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Could not rebuild that chat.");
+            return;
+        };
+        thread.archived = false;
+        if (self.lifecycle.cancelThreadClose(self.allocator, item.workspace_id, item.local_thread_id)) {
+            runtime_log.diagnostic("pending thread close cancelled by reopen thread={s}", .{item.local_thread_id});
+        }
+        const project = &self.project_controller.projects.items[pi];
+        project.threads.append(self.allocator, thread) catch {
+            thread.deinit(self.allocator);
+            self.setSidebarNotice("Out of memory reopening chat.");
+            return;
+        };
+        project.invalidateSidebarThreadCache();
+        const thread_index = project.threads.items.len - 1;
+        self.openThreadInWorkspaceSplit(pi, thread_index);
+        self.markDirty();
+        self.setSidebarNotice("Chat reopened from history.");
+        runtime_log.diagnostic("history thread reopened project={d} messages={d}", .{ pi, loaded.thread.messages.len });
     }
 
     pub fn archiveThreadAtIndex(self: *AppState, project_index: usize, thread_index: usize) void {
@@ -7048,6 +7401,7 @@ pub const AppState = struct {
     }
     pub const resolveThreadApprovalByLocalId = chat_controller.resolveThreadApprovalByLocalId;
     pub const applyPersisted = persistence.applyPersisted;
+    pub const applyPersistedReusing = persistence.applyPersistedReusing;
     pub const applyDaemonSessionProjection = terminal_controller.applyDaemonSessionProjection;
     pub const restorePersistedSurfaceStates = persistence.restorePersistedSurfaceStates;
     pub const restorePersistedChatCompletions = persistence.restorePersistedChatCompletions;
@@ -8259,26 +8613,6 @@ pub const AppState = struct {
         }
         thread.clearDraftImageAt(self.allocator, index);
         self.noteThreadDraftMutation(thread);
-    }
-
-    fn replaceThreadWithImportedSnapshot(
-        self: *AppState,
-        project_index: usize,
-        thread_index: usize,
-        imported_thread: provider_types.ReadThreadResult,
-    ) !void {
-        if (project_index >= self.project_controller.projects.items.len) return error.ProjectNotFound;
-        const project = &self.project_controller.projects.items[project_index];
-        if (thread_index >= project.threads.items.len) return error.ThreadNotFound;
-
-        const existing = &project.threads.items[thread_index];
-        var refreshed = try self.buildImportedThread(imported_thread, existing);
-        errdefer refreshed.deinit(self.allocator);
-
-        var previous = existing.*;
-        existing.* = refreshed;
-        previous.deinit(self.allocator);
-        self.project_controller.projects.items[project_index].invalidateSidebarThreadCache();
     }
 
     fn buildImportedThread(
@@ -9944,6 +10278,7 @@ pub const AppState = struct {
                 });
             }
         }
+        if (process.kind == .agent) _ = self.workspaceAgentTuiHistoryAt(project_index, dock_id);
         if (focus_policy == .focus) {
             if (terminal_pane_open) {
                 project.workspace_layout.maximized_pane_id = null;
@@ -10041,6 +10376,7 @@ pub const AppState = struct {
                 });
             }
         }
+        if (process.kind == .agent) _ = self.workspaceAgentTuiHistoryAt(project_index, dock_id);
         layout.focusCreatedPane(new_pane_id);
         dock.visible = false;
         self.requestTerminalDockFocus(dock_id);
@@ -10186,6 +10522,7 @@ pub const AppState = struct {
             self.setSidebarNotice("Failed to launch Amp TUI.");
             return false;
         };
+        _ = self.workspaceAgentTuiHistoryAt(project_index, dock_id);
         self.setSidebarNotice("Started Amp TUI.");
         self.markDirty();
         return true;
@@ -12403,10 +12740,7 @@ pub const AppState = struct {
     /// Fresh, never-sent threads may still switch provider; committed threads
     /// keep their provider so transcripts stay consistent.
     fn currentThreadAllowsProviderChoice(self: *const AppState) bool {
-        const thread = self.currentThread();
-        return thread.messages.items.len == 0 and
-            thread.provider_thread_id == null and
-            !thread.isSendPendingForUi();
+        return threadAllowsInPlaceProviderChoice(self.currentThread());
     }
 
     /// Which run-config rows apply right now: reasoning and speed depend on the
@@ -13291,6 +13625,10 @@ pub const AppState = struct {
     fn setCurrentThreadProvider(self: *AppState, provider: Provider) void {
         const thread = self.currentThreadMutable();
         if (thread.provider == provider) return;
+        // Bounded transcript hydration can leave `messages` empty on a
+        // committed Cursor/Codex/… thread. The picker must not rewrite that
+        // thread into another provider in place.
+        if (!threadAllowsInPlaceProviderChoice(thread)) return;
 
         thread.provider = provider;
         if (thread.provider_thread_id) |thread_id| self.allocator.free(thread_id);
@@ -13453,6 +13791,7 @@ pub const AppState = struct {
 
     pub const markDirty = lifecycle_controller.markDirty;
     pub const markSelectionDirty = lifecycle_controller.markSelectionDirty;
+    pub const markWorkspaceDirty = lifecycle_controller.markWorkspaceDirty;
     pub const noteInteraction = lifecycle_controller.noteInteraction;
     pub const requestTranscriptScrollToBottom = transcript_controller.requestTranscriptScrollToBottom;
     pub const requestTranscriptScrollToBottomIfFollowing = transcript_controller.requestTranscriptScrollToBottomIfFollowing;
@@ -13559,7 +13898,8 @@ pub const AppState = struct {
         @memset(&self.sidebar_notice_storage, 0);
         const len = @min(value.len, self.sidebar_notice_storage.len - 1);
         @memcpy(self.sidebar_notice_storage[0..len], value[0..len]);
-        self.markDirty();
+        // Notices are transient. Wake the UI without persisting every thread.
+        loop_wakeup.notify();
     }
 
     fn clearThreadImportThreads(self: *AppState) void {
@@ -13577,6 +13917,7 @@ pub const AppState = struct {
 
     pub fn deinit(self: *AppState) void {
         runtime_log.diagnostic("AppState.deinit begin", .{});
+        self.clearPaletteHistory();
         // Shutdown durability and worker settlement may take time. Remove the
         // UI-owned bearer immediately; RuntimeService keeps only its separate
         // process-memory copy until remote work has been stopped below.
@@ -13665,7 +14006,7 @@ pub const AppState = struct {
         shutdown_watchdog_state_durable.store(true, .release);
         chat_controller.deinitProcessGlobalState(self.storage.pref_path);
         runtime_log.diagnostic("AppState.deinit dirty state durable", .{});
-        self.lifecycle.deinit();
+        self.lifecycle.deinitWithAllocator(self.allocator);
         self.file_search_controller.deinit(self.allocator);
         self.composer_controller.composer.deinit(self.allocator);
         self.deinitDirectoryPickerEntries();
@@ -13893,7 +14234,20 @@ pub const AppState = struct {
         if (self.change_cursor_loop.shutdown.load(.acquire)) return;
         if (self.change_cursor_loop.takeRefresh()) |refresh| {
             defer refresh.deinit();
-            const apply_result = if (refresh.durable) |durable|
+            const observed_revision = self.storage.currentProjectionObservedRevision();
+            const durable_already_projected = refresh.durable != null and durableRefreshAlreadyProjected(
+                refresh.result.store_revision,
+                observed_revision,
+                self.hasUnresolvedAdoptionRows(),
+                self.lifecycle.rebase_snapshot != null,
+                self.lifecycle.projection_baseline != null and
+                    self.lifecycle.projection_baseline_revision == observed_revision,
+            );
+            self.last_projection_reuse = .{};
+            const apply_started_ms = platform_runtime.unixTimestampMs();
+            const apply_result = if (durable_already_projected)
+                self.applyDaemonVolatileProjectionRefresh(refresh.result, observed_revision)
+            else if (refresh.durable) |durable|
                 self.applyDaemonProjectionRefreshWithDurable(refresh.result, durable.value)
             else
                 self.applyDaemonVolatileProjectionRefresh(refresh.result, refresh.seed_store_revision.?);
@@ -13904,6 +14258,19 @@ pub const AppState = struct {
                 log.warn("failed to apply daemon projection refresh: {s}", .{@errorName(err)});
                 return;
             };
+            runtime_log.diagnostic(
+                "projection refresh applied kind={s} store_revision={d} elapsed_ms={d} reuse_gate={s} reused={d} rebuilt={d} threads_reused={d} threads_rebuilt={d}",
+                .{
+                    if (durable_already_projected) "durable_downgraded" else if (refresh.durable != null) "durable" else "volatile",
+                    refresh.result.store_revision,
+                    platform_runtime.unixTimestampMs() - apply_started_ms,
+                    self.last_projection_reuse.gate.name(),
+                    self.last_projection_reuse.reused,
+                    self.last_projection_reuse.rebuilt,
+                    self.last_projection_reuse.reused_threads,
+                    self.last_projection_reuse.rebuilt_threads,
+                },
+            );
             self.change_cursor_loop.noteRefreshApplication(true);
             _ = self.change_cursor_loop.acknowledgeProjectionRevision(self.storage.currentProjectionObservedRevision());
         }
@@ -13959,6 +14326,7 @@ pub const AppState = struct {
         result: headless.store.CoreSnapshotResult,
         durable: ?PersistedState,
     ) !void {
+        if (result.store_revision < self.provider_sync_store_revision) return error.ProjectionRefreshDeferred;
         const adoption_repair = self.hasUnresolvedAdoptionRows();
         const observed_revision = self.storage.currentProjectionObservedRevision();
         const projection_was_initialized = self.lifecycle.projection_baseline != null;
@@ -14010,6 +14378,7 @@ pub const AppState = struct {
         // hidden while adoption vetoes rejected every dirty refresh.
         var current: ?LoadedPersistedState = null;
         defer if (current) |*captured| captured.deinit();
+        var merged_with_baseline = false;
         if (self.lifecycle.dirty or self.lifecycle.rebase_snapshot != null or adoption_repair) {
             current = try self.buildPersistedState(self.allocator);
             const baseline = if (self.lifecycle.rebase_baseline) |*captured| blk: {
@@ -14025,6 +14394,7 @@ pub const AppState = struct {
             } else null;
             if (baseline) |base| {
                 try mergeCurrentLocalEdits(conversion_arena.allocator(), &persisted, base, current.?.value);
+                merged_with_baseline = true;
             } else {
                 // Bootstrap or explicit revision mismatch: never merge through
                 // a stale baseline. This fresh remote rebuild conservatively
@@ -14041,8 +14411,31 @@ pub const AppState = struct {
         staged.surface_controller = .{};
         staged.chat_controller.pending_send_count = 0;
         var staged_owned = true;
-        errdefer if (staged_owned) deinitProjectionContainers(self.allocator, &staged.project_controller, &staged.surface_controller);
-        try staged.applyPersisted(persisted);
+        errdefer if (staged_owned) discardStagedProjection(self.allocator, &self.project_controller, &staged.project_controller, &staged.surface_controller);
+        // Item 5: a daemon-authored revision (turn acceptance, completion
+        // commit, surface update) normally touches one workspace. Borrow every
+        // live project whose persisted record is unchanged since it was last
+        // built and rebuild only the rest.
+        //
+        // The hash compare is exact on the clean path and on the baseline
+        // merge path: `mergeCurrentLocalEdits` overlays only fields where
+        // `current` differs from the baseline, so a workspace with no local
+        // edits keeps its remote record byte-for-byte and a workspace with
+        // edits gets a new hash and rebuilds. Without a baseline nothing
+        // local is merged and a rebuild is the only way to drop those edits,
+        // so borrowing stays off there.
+        const reuse_gate: persistence.ProjectionReuseGate = if (current == null)
+            .clean
+        else if (merged_with_baseline)
+            .merged
+        else
+            .no_baseline;
+        const reuse_live: ?*project_controller.State = switch (reuse_gate) {
+            .clean, .merged => &self.project_controller,
+            .no_baseline, .disabled => null,
+        };
+        self.last_projection_reuse = try staged.applyPersistedReusing(persisted, reuse_live);
+        self.last_projection_reuse.gate = reuse_gate;
         self.applyChatCompletionSuppressions(&staged.project_controller);
         try staged.applyDaemonRegistryProjection(result.processes, result.leases);
         try staged.applyDaemonSessionProjection(result.sessions);
@@ -14088,6 +14481,9 @@ pub const AppState = struct {
 
         var deinit_projects = old_projects;
         var deinit_surfaces = old_surfaces;
+        // Borrowed projects now belong to the published containers; their
+        // old slots stay flagged so the teardown below leaves them alone.
+        persistence.clearBorrowedProjectionFlags(&self.project_controller);
         deinitProjectionContainers(self.allocator, &deinit_projects, &deinit_surfaces);
         terminal_controller.deinitDaemonSessionProjection(self.allocator, &old_sessions);
         self.clearTranscriptMarkdownSelection();
@@ -14167,14 +14563,28 @@ pub const AppState = struct {
         projects: *project_controller.State,
         surfaces: *surface_controller.State,
     ) void {
-        for (projects.projects.items) |*project| project.deinit(allocator);
+        // Slots flagged `projection_borrowed` were moved into another
+        // container by a projection refresh and are owned there.
+        for (projects.projects.items) |*project| if (!project.projection_borrowed) project.deinit(allocator);
         projects.projects.deinit(allocator);
-        for (projects.archived_projects.items) |*project| project.deinit(allocator);
+        for (projects.archived_projects.items) |*project| if (!project.projection_borrowed) project.deinit(allocator);
         projects.archived_projects.deinit(allocator);
         for (surfaces.surfaces.items) |*surface| surface.deinit(allocator);
         surfaces.surfaces.deinit(allocator);
         projects.* = .{};
         surfaces.* = .{};
+    }
+
+    /// Staging of a projection refresh failed after `applyPersistedReusing`:
+    /// return borrowed projects to their live slots, then free the rest.
+    fn discardStagedProjection(
+        allocator: std.mem.Allocator,
+        live: *project_controller.State,
+        projects: *project_controller.State,
+        surfaces: *surface_controller.State,
+    ) void {
+        persistence.restoreBorrowedProjects(live, projects);
+        deinitProjectionContainers(allocator, projects, surfaces);
     }
 
     pub fn projectForDaemonId(self: *AppState, workspace_id: []const u8) ?*Project {
@@ -15377,6 +15787,8 @@ const slashCommandWorker = command_controller.slashCommandWorker;
 const slashCommandFallbackName = command_controller.slashCommandFallbackName;
 
 fn syncThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
+    if (err == error.ThreadChangedDuringSync) return "Thread changed or is running. Wait for it to finish, then sync again.";
+    if (err == error.ProviderHistoryWouldDropAttachments) return "Provider history could not preserve this thread's attachments. Saved history was not changed.";
     return switch (provider) {
         .codex => switch (err) {
             error.CodexRpcFailed => "Failed to sync the Codex thread.",
@@ -15727,9 +16139,57 @@ test "completed OpenCode model refresh tolerates zero workspaces" {
     try std.testing.expect(state.opencode_model_options.items.len > 0);
 }
 
-test "new Codex threads default to GPT-5.6 Sol with low reasoning" {
-    try std.testing.expectEqualStrings("gpt-5.6-sol", DEFAULT_CODEX_MODEL);
-    try std.testing.expectEqual(ReasoningEffort.low, DEFAULT_CODEX_REASONING_EFFORT);
+test "projection-only chat updates do not schedule persistence" {
+    const allocator = std.testing.allocator;
+    const state = try allocator.create(AppState);
+    defer allocator.destroy(state);
+    // These projection helpers need only allocation, lifecycle, and notice
+    // storage; no GUI, daemon, or user database is involved.
+    state.allocator = allocator;
+    state.lifecycle = .{};
+    defer state.lifecycle.deinit();
+    var thread = try ChatThread.init(allocator, "Projection");
+    defer thread.deinit(allocator);
+    var events: std.ArrayList(chat_types.PendingTimelineEvent) = .empty;
+    defer {
+        for (events.items) |*event| event.deinit(allocator);
+        events.deinit(allocator);
+    }
+    try events.append(allocator, .{
+        .role = .assistant,
+        .author = try allocator.dupe(u8, "Assistant"),
+        .body = try allocator.dupe(u8, "Already saved by the daemon"),
+        .message_id = try allocator.dupe(u8, "daemon-message"),
+        .transcript_card_started_ms = 42,
+    });
+    try events.items[0].images.append(allocator, try ChatImageAttachment.init(allocator, "/tmp/projection-a.png", "image/png", 10));
+    try events.items[0].images.append(allocator, try ChatImageAttachment.init(allocator, "/tmp/projection-b.png", "image/png", 20));
+    try chat_controller.applyPendingTimelineEvents(state, &thread, &events, false);
+    state.setSidebarNotice("Provider session updated.");
+    try std.testing.expect(!state.lifecycle.dirty);
+    try std.testing.expectEqual(@as(u64, 0), state.lifecycle.dirty_generation);
+    try std.testing.expectEqual(@as(usize, 1), thread.messages.items.len);
+    try std.testing.expectEqualStrings("daemon-message", thread.messages.items[0].message_id.?);
+    try std.testing.expectEqualStrings("Already saved by the daemon", thread.messages.items[0].body);
+    try std.testing.expectEqual(@as(i64, 42), thread.messages.items[0].transcript_card_started_ms);
+    try std.testing.expectEqualStrings("/tmp/projection-a.png", thread.messages.items[0].image.?.path);
+    try std.testing.expectEqual(@as(usize, 1), thread.messages.items[0].extra_images.len);
+    try std.testing.expectEqualStrings("/tmp/projection-b.png", thread.messages.items[0].extra_images[0].path);
+
+    // Local batches still persist, and projecting another daemon batch must
+    // leave an unrelated pending local edit dirty.
+    try chat_controller.applyPendingTimelineEvents(state, &thread, &events, true);
+    try std.testing.expect(state.lifecycle.dirty);
+    const generation = state.lifecycle.dirty_generation;
+    try chat_controller.applyPendingTimelineEvents(state, &thread, &events, false);
+    state.setSidebarNotice("");
+    try std.testing.expect(state.lifecycle.dirty);
+    try std.testing.expectEqual(generation, state.lifecycle.dirty_generation);
+}
+
+test "new Codex threads default to GPT-6 Astra with medium reasoning" {
+    try std.testing.expectEqualStrings("gpt-6-astra", DEFAULT_CODEX_MODEL);
+    try std.testing.expectEqual(ReasoningEffort.medium, DEFAULT_CODEX_REASONING_EFFORT);
     try std.testing.expectEqualStrings(DEFAULT_CODEX_MODEL, CODEX_MODEL_OPTIONS[0].value.?);
 
     var thread = try ChatThread.init(std.testing.allocator, "New thread");
@@ -19084,13 +19544,49 @@ test "registry-only change batches skip durable projection reconstruction" {
         .{ .change_seq = 1, .topic = "process", .resource_id = "build", .registry_revision = 4 },
         .{ .change_seq = 2, .topic = "session", .resource_id = "terminal", .registry_revision = 5 },
     };
-    try std.testing.expect(!journalBatchNeedsDurableRefresh(&registry_entries));
+    try std.testing.expect(!journalBatchNeedsDurableRefresh(&registry_entries, 0));
+    try std.testing.expect(journalBatchHasVolatileEntries(&registry_entries));
+    try std.testing.expectEqual(@as(?u64, null), journalBatchMaxStoreRevision(&registry_entries));
 
     const mixed_entries = [_]headless.changes_protocol.ChangeEntry{
         registry_entries[0],
         .{ .change_seq = 3, .topic = "chat.thread", .resource_id = "thread-1", .store_revision = 9 },
     };
-    try std.testing.expect(journalBatchNeedsDurableRefresh(&mixed_entries));
+    try std.testing.expect(journalBatchNeedsDurableRefresh(&mixed_entries, 0));
+    try std.testing.expect(journalBatchNeedsDurableRefresh(&mixed_entries, 8));
+    try std.testing.expectEqual(@as(?u64, 9), journalBatchMaxStoreRevision(&mixed_entries));
+}
+
+test "durable change batches at an already projected revision skip reconstruction" {
+    // A GUI flush acknowledged at revision 9 journals one entry per
+    // workspace/thread at that revision: none of them is news to this client.
+    const echo_entries = [_]headless.changes_protocol.ChangeEntry{
+        .{ .change_seq = 4, .topic = "workspace", .resource_id = "ws-1", .store_revision = 9 },
+        .{ .change_seq = 5, .topic = "chat.thread", .resource_id = "thread-1", .store_revision = 9 },
+    };
+    try std.testing.expect(!journalBatchNeedsDurableRefresh(&echo_entries, 9));
+    try std.testing.expect(!journalBatchNeedsDurableRefresh(&echo_entries, 12));
+    try std.testing.expect(!journalBatchHasVolatileEntries(&echo_entries));
+
+    // A later foreign commit in the same batch still owes a rebuild.
+    const trailing_entries = [_]headless.changes_protocol.ChangeEntry{
+        echo_entries[0],
+        .{ .change_seq = 6, .topic = "chat.completion", .resource_id = "completion-1", .store_revision = 10 },
+    };
+    try std.testing.expect(journalBatchNeedsDurableRefresh(&trailing_entries, 9));
+    try std.testing.expectEqual(@as(?u64, 10), journalBatchMaxStoreRevision(&trailing_entries));
+}
+
+test "already projected durable refresh downgrades to volatile apply only when unrepaired" {
+    // Self receipt landed after the fetch: nothing durable left to apply.
+    try std.testing.expect(durableRefreshAlreadyProjected(9, 9, false, false, true));
+    try std.testing.expect(durableRefreshAlreadyProjected(7, 9, false, false, true));
+    // Newer revision than projected: full apply.
+    try std.testing.expect(!durableRefreshAlreadyProjected(10, 9, false, false, true));
+    // Repairs and an unpaired baseline keep the full merge path.
+    try std.testing.expect(!durableRefreshAlreadyProjected(9, 9, true, false, true));
+    try std.testing.expect(!durableRefreshAlreadyProjected(9, 9, false, true, true));
+    try std.testing.expect(!durableRefreshAlreadyProjected(9, 9, false, false, false));
 }
 
 test "M5-P4 cursor signal bridge coalesces publishes and drains non-blocking" {

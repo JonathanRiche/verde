@@ -12,6 +12,7 @@ const terminal = @import("../terminal/terminal.zig");
 const chat_types = @import("chat_types.zig");
 const herdr_types = @import("herdr_types.zig");
 const project_state = @import("project.zig");
+const project_controller = @import("project_controller.zig");
 const test_backend = if (@import("builtin").is_test) @import("root").test_backend else struct {};
 
 const log = std.log.scoped(.native_shell);
@@ -191,17 +192,6 @@ fn persistedProjectSnapshot(
 ) !PersistedProject {
     var threads: std.ArrayList(PersistedThread) = .empty;
     defer threads.deinit(allocator);
-    const terminal_layout_json = try project.terminal_dock.persistedLayoutJsonWithContext(allocator, .{
-        .project_id = project.id,
-        .project_path = project.path,
-        .dock_id = 0,
-    });
-    errdefer if (terminal_layout_json) |value| allocator.free(value);
-    const terminal_docks_json = try persistedTerminalDocksJson(allocator, project);
-    errdefer if (terminal_docks_json) |value| allocator.free(value);
-    const workspace_layout_json = try project.workspace_layout.persistedWorkspaceJson(allocator);
-    errdefer allocator.free(workspace_layout_json);
-
     const retained_thread_index = lastRetainedActiveThreadIndex(project);
     for (project.threads.items, 0..) |thread, thread_index| {
         // Workspace panes and the selected thread persist raw array indexes.
@@ -213,6 +203,24 @@ fn persistedProjectSnapshot(
     for (project.archived_threads.items) |thread| {
         try threads.append(allocator, try threadSnapshotWithBodies(allocator, &thread, captured_bodies, body_index));
     }
+    var persisted = try projectMetadataSnapshot(allocator, project);
+    persisted.threads = try threads.toOwnedSlice(allocator);
+    return persisted;
+}
+
+/// Capture one workspace's metadata without walking or copying transcripts.
+/// Targeted workspace upserts use this for terminal/layout persistence.
+pub fn projectMetadataSnapshot(allocator: std.mem.Allocator, project: *const Project) !PersistedProject {
+    const terminal_layout_json = try project.terminal_dock.persistedLayoutJsonWithContext(allocator, .{
+        .project_id = project.id,
+        .project_path = project.path,
+        .dock_id = 0,
+    });
+    errdefer if (terminal_layout_json) |value| allocator.free(value);
+    const terminal_docks_json = try persistedTerminalDocksJson(allocator, project);
+    errdefer if (terminal_docks_json) |value| allocator.free(value);
+    const workspace_layout_json = try project.workspace_layout.persistedWorkspaceJson(allocator);
+    errdefer allocator.free(workspace_layout_json);
 
     return .{
         .id = try allocator.dupe(u8, project.id),
@@ -229,7 +237,7 @@ fn persistedProjectSnapshot(
         .selected_thread_index = if (project.threads.items.len == 0) 0 else @min(project.selected_thread_index, project.threads.items.len - 1),
         .companion_thread_local_id = try dupeOptionalSlice(allocator, project.companion_thread_local_id),
         .herdr_link = if (project.herdr_link) |*link| try link.toPersisted(allocator) else null,
-        .threads = try threads.toOwnedSlice(allocator),
+        .threads = &.{},
     };
 }
 
@@ -605,6 +613,14 @@ pub fn persistedStateToProtocolSnapshot(
         };
     }
 
+    const closed_threads = try allocator.alloc(headless.store.ClosedThreadRef, state.closed_threads.len);
+    for (state.closed_threads, 0..) |closed, i| {
+        closed_threads[i] = .{
+            .workspace_id = try allocator.dupe(u8, closed.workspace_id),
+            .local_thread_id = try allocator.dupe(u8, closed.local_thread_id),
+        };
+    }
+
     return .{
         .schema_version = 1,
         .store_revision = store_revision,
@@ -617,10 +633,12 @@ pub fn persistedStateToProtocolSnapshot(
         .harness = if (state.harness) |h| try allocator.dupe(u8, @tagName(h)) else null,
         .draft = try dupeOptionalSlice(allocator, state.draft),
         .messages = if (state.messages) |msgs| try messagesToProtocol(allocator, msgs, 0) else null,
+        .closed_threads = closed_threads,
     };
 }
 
-fn projectToProtocol(allocator: std.mem.Allocator, project: PersistedProject) !headless.store.Workspace {
+/// Convert one persisted workspace into the targeted store wire shape.
+pub fn projectToProtocol(allocator: std.mem.Allocator, project: PersistedProject) !headless.store.Workspace {
     const workspace_id = if (project.id) |id| try allocator.dupe(u8, id) else try allocator.dupe(u8, project.path);
     const threads: []const headless.store.Thread = if (project.threads) |src|
         try threadsToProtocol(allocator, src)
@@ -763,6 +781,75 @@ fn herdrToProtocol(allocator: std.mem.Allocator, link: db_types.PersistedHerdrWo
         .pane_links_json = try dupeOptionalSlice(allocator, link.pane_links_json),
         .updated_at_ms = link.updated_at_ms,
     };
+}
+
+/// Builds one live thread from its durable record. This is the path for a
+/// thread fetched on demand (`chat.thread.get`) outside a projection refresh;
+/// the refresh path keeps its own inline builder with reuse bookkeeping.
+pub fn buildThreadFromPersisted(allocator: std.mem.Allocator, persisted_thread: PersistedThread) !ChatThread {
+    var thread = try ChatThread.init(allocator, persisted_thread.title);
+    errdefer thread.deinit(allocator);
+    thread.projection_content_hash = persistedThreadContentHash(persisted_thread);
+    thread.archived = persisted_thread.archived;
+    thread.committed = persisted_thread.committed;
+    if (persisted_thread.local_thread_id) |local_thread_id| {
+        allocator.free(thread.local_thread_id);
+        thread.local_thread_id = try allocator.dupeZ(u8, local_thread_id);
+    }
+    thread.last_activity_at = persisted_thread.last_activity_at orelse 0;
+    thread.provider_thread_id = if (persisted_thread.provider_thread_id) |thread_id|
+        try allocator.dupeZ(u8, thread_id)
+    else
+        null;
+    if (thread.model_ref) |model_ref| allocator.free(model_ref);
+    thread.model_ref = if (persisted_thread.model_ref) |model_ref|
+        try allocator.dupeZ(u8, model_ref)
+    else
+        null;
+    thread.reasoning_effort = persisted_thread.reasoning_effort;
+    if (thread.opencode_reasoning_variant) |v| allocator.free(v);
+    thread.opencode_reasoning_variant = if (persisted_thread.reasoning_variant) |rv|
+        try allocator.dupeZ(u8, rv)
+    else
+        null;
+    thread.fast_mode = persisted_thread.fast_mode orelse .off;
+    thread.access_mode = persisted_thread.access_mode orelse .full_access;
+    thread.provider = persisted_thread.provider;
+    thread.harness = persisted_thread.harness;
+    thread.tui_dock_id = persisted_thread.tui_dock_id;
+    if (thread.cwd) |v| allocator.free(v);
+    thread.cwd = if (persisted_thread.cwd) |cwd|
+        try allocator.dupeZ(u8, cwd)
+    else
+        null;
+    try restoreThreadRuntimeRoute(allocator, &thread, persisted_thread);
+    thread.persisted_message_offset = persisted_thread.message_offset;
+    thread.setDraft(persisted_thread.draft);
+    if (persisted_thread.draft_image) |image| {
+        try thread.setDraftImage(allocator, image.path, image.mime, image.byte_size);
+        for (persisted_thread.draft_extra_images) |extra| {
+            try thread.addDraftImage(allocator, extra.path, extra.mime, extra.byte_size);
+        }
+    }
+    for (persisted_thread.messages) |message| {
+        try thread.messages.append(allocator, .{
+            .role = message.role,
+            .author = try allocator.dupeZ(u8, message.author),
+            .body = try allocator.dupeZ(u8, message.body),
+            .image = if (message.image) |image|
+                try ChatImageAttachment.init(allocator, image.path, image.mime, image.byte_size)
+            else
+                null,
+            .extra_images = try chatImageListFromPersisted(allocator, message.extra_images),
+            .tool_call_id = try dupeOptionalSlice(allocator, message.tool_call_id),
+            .tool_call_kind = message.tool_call_kind,
+            .tool_call_status = message.tool_call_status,
+            .message_id = try dupeOptionalNonEmptySlice(allocator, message.message_id),
+        });
+    }
+    thread.rebuildBackgroundTasksFromMessages(allocator);
+    if (thread.last_activity_at == 0 and thread.messages.items.len > 0) thread.touch();
+    return thread;
 }
 
 fn restoreThreadRuntimeRoute(
@@ -935,6 +1022,117 @@ test "partial or malformed committed routes stay quarantined" {
 }
 
 pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
+    _ = try applyPersistedReusing(self, persisted, null);
+}
+
+pub const ProjectionReuseGate = enum {
+    /// Nothing local merged: every unchanged workspace is borrowable.
+    clean,
+    /// Local edits were three-way merged over a known baseline. Untouched
+    /// workspaces keep their remote record byte-for-byte, so the hash
+    /// compare still identifies them exactly.
+    merged,
+    /// No baseline for the local edits: rebuilt everything.
+    no_baseline,
+    /// Item 5 was skipped on this refresh.
+    disabled,
+
+    pub fn name(self: ProjectionReuseGate) []const u8 {
+        return @tagName(self);
+    }
+};
+
+pub const ProjectionReuseStats = struct {
+    gate: ProjectionReuseGate = .disabled,
+    reused: usize = 0,
+    rebuilt: usize = 0,
+    /// Threads inside rebuilt projects that were borrowed / rebuilt.
+    reused_threads: usize = 0,
+    rebuilt_threads: usize = 0,
+};
+
+/// Stable content hash of one persisted workspace record, covering every
+/// field (layout JSON, thread metadata, drafts, and the bounded message
+/// tail). Two records with the same hash build the same `Project`.
+pub fn persistedProjectContentHash(project: PersistedProject) u64 {
+    var hasher = std.hash.Wyhash.init(0x7052_4f4a_4841_5348);
+    hashPersistedValue(&hasher, project);
+    return hasher.final();
+}
+
+/// Stable content hash of one persisted thread record (metadata, draft,
+/// bounded message tail).
+pub fn persistedThreadContentHash(thread: PersistedThread) u64 {
+    var hasher = std.hash.Wyhash.init(0x7054_4852_4841_5348);
+    hashPersistedValue(&hasher, thread);
+    return hasher.final();
+}
+
+fn hashPersistedValue(hasher: *std.hash.Wyhash, value: anytype) void {
+    const T = @TypeOf(value);
+    switch (@typeInfo(T)) {
+        .bool => hasher.update(&[_]u8{@intFromBool(value)}),
+        .int, .float => hasher.update(std.mem.asBytes(&value)),
+        .@"enum" => hashPersistedValue(hasher, @intFromEnum(value)),
+        .optional => {
+            if (value) |inner| {
+                hasher.update(&[_]u8{1});
+                hashPersistedValue(hasher, inner);
+            } else {
+                hasher.update(&[_]u8{0});
+            }
+        },
+        .pointer => |pointer| switch (pointer.size) {
+            .slice => {
+                hashPersistedValue(hasher, value.len);
+                if (pointer.child == u8) {
+                    hasher.update(value);
+                } else {
+                    for (value) |item| hashPersistedValue(hasher, item);
+                }
+            },
+            .one => hashPersistedValue(hasher, value.*),
+            else => @compileError("unsupported pointer in persisted hash: " ++ @typeName(T)),
+        },
+        .@"struct" => |info| inline for (info.fields) |field| hashPersistedValue(hasher, @field(value, field.name)),
+        .array => for (value) |item| hashPersistedValue(hasher, item),
+        else => @compileError("unsupported type in persisted hash: " ++ @typeName(T)),
+    }
+}
+
+fn liveThreadById(project: *Project, thread_id: []const u8) ?*ChatThread {
+    for (project.threads.items) |*thread| {
+        if (std.mem.eql(u8, thread.local_thread_id, thread_id)) return thread;
+    }
+    for (project.archived_threads.items) |*thread| {
+        if (std.mem.eql(u8, thread.local_thread_id, thread_id)) return thread;
+    }
+    return null;
+}
+
+fn liveProjectById(live: *project_controller.State, project_id: []const u8) ?*Project {
+    for (live.projects.items) |*project| {
+        if (std.mem.eql(u8, project.id, project_id)) return project;
+    }
+    for (live.archived_projects.items) |*project| {
+        if (std.mem.eql(u8, project.id, project_id)) return project;
+    }
+    return null;
+}
+
+/// `applyPersisted` with workspace reuse. When `live` is given, a persisted
+/// project whose content hash matches the live project it was last built
+/// from is borrowed (shallow-copied and flagged on both sides) instead of
+/// rebuilt: its threads, emulators, layout caches, and hydrated transcripts
+/// stay untouched. The caller publishes the staged containers and then
+/// clears the flags (`clearBorrowedProjectionFlags`), or on failure hands
+/// the staged copies back to their live slots.
+pub fn applyPersistedReusing(
+    self: anytype,
+    persisted: PersistedState,
+    live: ?*project_controller.State,
+) !ProjectionReuseStats {
+    var stats: ProjectionReuseStats = .{};
     var cleaned_legacy_companion = false;
     var cleaned_legacy_remote_herdr = false;
     self.sidebar_collapsed = persisted.sidebar_collapsed;
@@ -944,7 +1142,7 @@ pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
         self.project_controller.next_project_number = 1;
         self.syncRenameBuffer();
         self.lifecycle.dirty = false;
-        return;
+        return stats;
     }
 
     for (persisted.projects, 0..) |project, index| {
@@ -954,7 +1152,34 @@ pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
             try self.deriveProjectId(project.path);
         defer self.allocator.free(project_id);
 
+        const content_hash = persistedProjectContentHash(project);
+        if (live) |live_state| {
+            if (liveProjectById(live_state, project_id)) |live_project| {
+                if (!live_project.projection_borrowed and
+                    live_project.projection_content_hash == content_hash and
+                    live_project.archived == project.archived)
+                {
+                    live_project.projection_borrowed = true;
+                    errdefer live_project.projection_borrowed = false;
+                    const borrowed = live_project.*;
+                    if (borrowed.archived) {
+                        try self.project_controller.archived_projects.append(self.allocator, borrowed);
+                    } else {
+                        try self.project_controller.projects.append(self.allocator, borrowed);
+                    }
+                    stats.reused += 1;
+                    continue;
+                }
+            }
+        }
+        stats.rebuilt += 1;
+        // The workspace record changed, but most of its threads did not:
+        // borrow those by their own hash so a turn commit rebuilds one
+        // thread, not the workspace's whole history.
+        const reuse_project: ?*Project = if (live) |live_state| liveProjectById(live_state, project_id) else null;
+
         var loaded = try Project.init(self.allocator, project_id, project.label, project.path, project.unread_count);
+        loaded.projection_content_hash = content_hash;
         var loaded_owned = true;
         errdefer if (loaded_owned) loaded.deinit(self.allocator);
         if (project.companion_thread_local_id) |local_id| {
@@ -999,7 +1224,31 @@ pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
 
         if (project.threads) |threads| {
             for (threads) |persisted_thread| {
+                const thread_hash = persistedThreadContentHash(persisted_thread);
+                if (reuse_project) |live_project| {
+                    if (persisted_thread.local_thread_id) |thread_id| {
+                        if (liveThreadById(live_project, thread_id)) |live_thread| {
+                            if (!live_thread.projection_borrowed and
+                                live_thread.projection_content_hash == thread_hash and
+                                live_thread.archived == persisted_thread.archived)
+                            {
+                                live_thread.projection_borrowed = true;
+                                errdefer live_thread.projection_borrowed = false;
+                                const borrowed = live_thread.*;
+                                if (borrowed.archived) {
+                                    try loaded.archived_threads.append(self.allocator, borrowed);
+                                } else {
+                                    try loaded.threads.append(self.allocator, borrowed);
+                                }
+                                stats.reused_threads += 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                stats.rebuilt_threads += 1;
                 var thread = try ChatThread.init(self.allocator, persisted_thread.title);
+                thread.projection_content_hash = thread_hash;
                 var thread_owned = true;
                 errdefer if (thread_owned) thread.deinit(self.allocator);
                 thread.archived = persisted_thread.archived;
@@ -1158,6 +1407,50 @@ pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
     self.syncRenameBuffer();
     self.requestTranscriptScrollToBottom();
     self.lifecycle.dirty = cleaned_legacy_companion or cleaned_legacy_remote_herdr;
+    return stats;
+}
+
+/// Publication step for `applyPersistedReusing`: the staged containers are
+/// now live, so their borrowed copies become plain owners. The old slots
+/// stay flagged so the old containers' teardown skips them.
+pub fn clearBorrowedProjectionFlags(controller: *project_controller.State) void {
+    const collections = .{ &controller.projects, &controller.archived_projects };
+    inline for (collections) |list| {
+        for (list.items) |*project| {
+            project.projection_borrowed = false;
+            for (project.threads.items) |*thread| thread.projection_borrowed = false;
+            for (project.archived_threads.items) |*thread| thread.projection_borrowed = false;
+        }
+    }
+}
+
+/// Failure step for `applyPersistedReusing`: hand each borrowed copy back to
+/// its live slot. The staged copy carries the up-to-date container headers
+/// (registry/lease lists may have grown during staging), so the copy, not
+/// the stale slot, must survive. Entries stay flagged in `staged`, which the
+/// caller's teardown then skips.
+pub fn restoreBorrowedProjects(live: *project_controller.State, staged: *project_controller.State) void {
+    const collections = .{ &staged.projects, &staged.archived_projects };
+    inline for (collections) |list| {
+        for (list.items) |*project| {
+            const slot = liveProjectById(live, project.id) orelse continue;
+            if (project.projection_borrowed) {
+                slot.* = project.*;
+                slot.projection_borrowed = false;
+                continue;
+            }
+            // Rebuilt project: hand back only its borrowed threads.
+            const thread_lists = .{ &project.threads, &project.archived_threads };
+            inline for (thread_lists) |threads| {
+                for (threads.items) |*thread| {
+                    if (!thread.projection_borrowed) continue;
+                    const thread_slot = liveThreadById(slot, thread.local_thread_id) orelse continue;
+                    thread_slot.* = thread.*;
+                    thread_slot.projection_borrowed = false;
+                }
+            }
+        }
+    }
 }
 
 pub fn restorePersistedSurfaceStates(self: anytype, persisted_surfaces: []const PersistedSurfaceState) !void {
@@ -1444,8 +1737,24 @@ fn clonePersistedStateWithMessages(
             &.{}
         else
             null,
+        .closed_threads = try cloneClosedThreads(allocator, source.closed_threads),
     };
     return loaded;
+}
+
+pub fn cloneClosedThreads(
+    allocator: std.mem.Allocator,
+    source: []const db_types.PersistedClosedThread,
+) ![]const db_types.PersistedClosedThread {
+    if (source.len == 0) return &.{};
+    const cloned = try allocator.alloc(db_types.PersistedClosedThread, source.len);
+    for (source, 0..) |entry, index| {
+        cloned[index] = .{
+            .workspace_id = try allocator.dupe(u8, entry.workspace_id),
+            .local_thread_id = try allocator.dupe(u8, entry.local_thread_id),
+        };
+    }
+    return cloned;
 }
 
 /// Deep-copy a persistence projection without retaining a serialized JSON

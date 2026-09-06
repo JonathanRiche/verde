@@ -132,6 +132,12 @@ const StoreSession = struct {
     /// This is deliberately separate from `store_revision`, which can move
     /// ahead after a status read or another writer's receipt.
     projection_observed_revision: u64 = 0,
+    /// GUI-authored writes that re-pair `projection_observed_revision` on
+    /// receipt (snapshot replace, app-state selection) and are still waiting
+    /// for that receipt. The daemon journals their entries before the reply
+    /// reaches this client, so the cursor thread consults this count to wait
+    /// for the receipt instead of classifying its own echo as foreign.
+    self_projection_writes_in_flight: u32 = 0,
     /// False when the daemon is unavailable or replacement is blocked; GUI stays
     /// visibly read-only/unsaved and never falls back to a direct writer.
     persistence_available: bool = true,
@@ -165,6 +171,26 @@ const StoreSession = struct {
         self.client_id = null;
         if (self.instance_nonce) |nonce| allocator.free(nonce);
         self.instance_nonce = null;
+    }
+};
+
+/// Closed-thread metadata fetched on demand for the command palette.
+pub const LoadedThreadHistory = struct {
+    arena: std.heap.ArenaAllocator,
+    items: []const headless.store.ThreadListItem = &.{},
+
+    pub fn deinit(self: *LoadedThreadHistory) void {
+        self.arena.deinit();
+    }
+};
+
+/// One thread fetched by identity, transcript included.
+pub const LoadedThread = struct {
+    arena: std.heap.ArenaAllocator,
+    thread: PersistedThread,
+
+    pub fn deinit(self: *LoadedThread) void {
+        self.arena.deinit();
     }
 };
 
@@ -299,6 +325,112 @@ pub const Storage = struct {
         page.offset = if (result.messages.len == 0) 0 else result.messages[0].sort_index;
         self.noteStoreRevision(result.store_revision);
         return page;
+    }
+
+    /// Cold-history query: closed threads across every workspace, newest
+    /// activity first. Nothing here is part of the composite snapshot.
+    pub fn loadThreadHistory(self: *const Storage, allocator: std.mem.Allocator, limit: usize) !LoadedThreadHistory {
+        return self.loadThreadList(allocator, .{ .workspace_id = "", .open = false, .recent_first = true, .limit = limit });
+    }
+
+    pub const ThreadListQuery = struct {
+        workspace_id: []const u8 = "",
+        open: ?bool = null,
+        recent_first: bool = false,
+        limit: usize = headless.store.MAX_PAGE_ITEMS,
+    };
+
+    /// Thread metadata by explicit query. With `recent_first = false` items
+    /// come back in workspace then thread sort order, which is the order the
+    /// GUI's open array must have.
+    pub fn loadThreadList(self: *const Storage, allocator: std.mem.Allocator, query: ThreadListQuery) !LoadedThreadHistory {
+        var loaded = LoadedThreadHistory{ .arena = std.heap.ArenaAllocator.init(allocator) };
+        errdefer loaded.deinit();
+        const a = loaded.arena.allocator();
+        var transport: daemon_client.HeadlessTransport = .{ .allocator = a, .pref_path = self.pref_path };
+        var client = daemon_client.headlessClient(a, &transport);
+        const request: headless.store.ThreadListRequest = .{
+            .workspace_id = query.workspace_id,
+            .limit = @intCast(@min(query.limit, headless.store.MAX_PAGE_ITEMS)),
+            .open = query.open,
+            .recent_first = query.recent_first,
+        };
+        var parsed = try client.call(headless.store.METHOD_CHAT_THREAD_LIST, request);
+        defer parsed.deinit();
+        const result = try client.decodeThreadList(&parsed);
+        loaded.items = result.threads;
+        self.noteStoreRevision(result.store_revision);
+        return loaded;
+    }
+
+    /// Fetches one thread (metadata plus its full transcript) by identity.
+    /// Used to reopen a closed thread; the next flush carries it and thereby
+    /// reopens it in the daemon.
+    pub fn loadThread(
+        self: *const Storage,
+        allocator: std.mem.Allocator,
+        workspace_id: []const u8,
+        local_thread_id: []const u8,
+    ) !LoadedThread {
+        var loaded = LoadedThread{ .arena = std.heap.ArenaAllocator.init(allocator), .thread = undefined };
+        errdefer loaded.deinit();
+        const a = loaded.arena.allocator();
+        var transport: daemon_client.HeadlessTransport = .{ .allocator = a, .pref_path = self.pref_path };
+        var client = daemon_client.headlessClient(a, &transport);
+        const request: headless.store.ThreadGetRequest = .{
+            .workspace_id = workspace_id,
+            .local_thread_id = local_thread_id,
+        };
+        var parsed = try client.call(headless.store.METHOD_CHAT_THREAD_GET, request);
+        defer parsed.deinit();
+        const result = try client.decodeThreadGet(&parsed);
+        loaded.thread = try protocol_projection.snapshotThreadToPersisted(a, result.thread);
+        self.noteStoreRevision(result.store_revision);
+        return loaded;
+    }
+
+    /// Closes one thread in the daemon so it leaves the composite snapshot.
+    /// No revision guard: closing is idempotent and never races a flush for
+    /// the same outcome (an omitted committed row is left alone by replace).
+    pub fn closeThread(self: *const Storage, workspace_id: []const u8, local_thread_id: []const u8) !void {
+        try self.ensureGranularMutationAllowed();
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var client_id = try self.ensureStoreClientId();
+        defer self.allocator.free(client_id);
+
+        const Payload = struct { workspace_id: []const u8, local_thread_id: []const u8 };
+        const payload: Payload = .{ .workspace_id = workspace_id, .local_thread_id = local_thread_id };
+        const call = struct {
+            fn run(storage: *const Storage, allocator: std.mem.Allocator, id: []const u8, value: Payload) !headless.store.WriteResult {
+                const request: headless.store.ThreadCloseRequest = .{
+                    .mutation = .{
+                        .request_key = try storage.nextRequestKey(allocator, headless.store.METHOD_CHAT_THREAD_CLOSE),
+                        .expected_store_revision = null,
+                        .client_id = id,
+                    },
+                    .workspace_id = value.workspace_id,
+                    .local_thread_id = value.local_thread_id,
+                };
+                return storage.callStoreMutationAllowConflict(headless.store.METHOD_CHAT_THREAD_CLOSE, request);
+            }
+        }.run;
+
+        self.beginSelfProjectionWrite();
+        defer self.endSelfProjectionWrite();
+        const result = call(self, a, client_id, payload) catch |err| switch (err) {
+            error.UnknownClientId => retry: {
+                self.clearCachedClientId();
+                const retry_id = try self.ensureStoreClientId();
+                self.allocator.free(client_id);
+                client_id = retry_id;
+                break :retry try call(self, a, client_id, payload);
+            },
+            else => return err,
+        };
+        self.noteStoreRevision(result.store_revision);
+        self.noteProjectionObservedRevision(result.store_revision);
     }
 
     fn loadDaemonProjection(self: *const Storage, allocator: std.mem.Allocator) !LoadedPersistedState {
@@ -486,6 +618,8 @@ pub const Storage = struct {
             }
         }.run;
 
+        self.beginSelfProjectionWrite();
+        defer self.endSelfProjectionWrite();
         const result = call(self, a, client_id, observed_revision, payload) catch |err| switch (err) {
             error.UnknownClientId => retry: {
                 self.clearCachedClientId();
@@ -503,6 +637,61 @@ pub const Storage = struct {
         self.noteStoreRevision(result.store_revision);
         self.noteProjectionObservedRevision(result.store_revision);
         try self.reopenReadOnly();
+    }
+
+    /// Persist one workspace's shell metadata without traversing or replacing
+    /// any thread or message rows. The exact capture revision remains the CAS
+    /// guard across an unknown-client retry.
+    pub fn upsertWorkspaceCaptured(
+        self: *const Storage,
+        project: db_types.PersistedProject,
+        observed_revision: u64,
+    ) !u64 {
+        try self.ensureGranularMutationAllowed();
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const workspace = try persistence.projectToProtocol(a, project);
+        var client_id = try self.ensureStoreClientId();
+        defer self.allocator.free(client_id);
+
+        const call = struct {
+            fn run(
+                storage: *const Storage,
+                allocator: std.mem.Allocator,
+                id: []const u8,
+                expected: u64,
+                value: headless.store.Workspace,
+            ) !headless.store.WriteResult {
+                const request: headless.store.WorkspaceUpsertRequest = .{
+                    .mutation = .{
+                        .request_key = try storage.nextRequestKey(allocator, headless.store.METHOD_WORKSPACE_UPSERT),
+                        .expected_store_revision = expected,
+                        .client_id = id,
+                    },
+                    .workspace = value,
+                };
+                return storage.callStoreMutationAllowConflict(headless.store.METHOD_WORKSPACE_UPSERT, request);
+            }
+        }.run;
+
+        const result = call(self, a, client_id, observed_revision, workspace) catch |err| switch (err) {
+            error.UnknownClientId => retry: {
+                self.clearCachedClientId();
+                const retry_id = try self.ensureStoreClientId();
+                self.allocator.free(client_id);
+                client_id = retry_id;
+                break :retry try call(self, a, client_id, observed_revision, workspace);
+            },
+            error.StoreRevisionConflict => {
+                _ = try self.refreshStoreRevision();
+                return error.StoreRevisionConflict;
+            },
+            else => return err,
+        };
+        self.noteStoreRevision(result.store_revision);
+        try self.reopenReadOnly();
+        return result.store_revision;
     }
 
     // Phase 4 owns incremental thread writes. Phase 3 keep-alive: full snapshot
@@ -870,6 +1059,26 @@ pub const Storage = struct {
         self.store_session.projection_observed_revision = revision;
     }
 
+    fn beginSelfProjectionWrite(self: *const Storage) void {
+        self.store_session.lock();
+        defer self.store_session.unlock();
+        self.store_session.self_projection_writes_in_flight += 1;
+    }
+
+    fn endSelfProjectionWrite(self: *const Storage) void {
+        self.store_session.lock();
+        defer self.store_session.unlock();
+        self.store_session.self_projection_writes_in_flight -|= 1;
+    }
+
+    /// True while a GUI write that will advance `projection_observed_revision`
+    /// on receipt is in flight, whether or not its journal echo has arrived.
+    pub fn selfProjectionWriteInFlight(self: *const Storage) bool {
+        self.store_session.lock();
+        defer self.store_session.unlock();
+        return self.store_session.self_projection_writes_in_flight > 0;
+    }
+
     /// Clear cached client identity so the next mutation re-registers (MAJOR-1).
     pub fn clearCachedClientId(self: *const Storage) void {
         self.store_session.lock();
@@ -1148,6 +1357,10 @@ pub const Storage = struct {
             };
         }
 
+        // Bracket the request and its receipt bookkeeping so the cursor thread
+        // can tell a not-yet-acknowledged self write from a foreign commit.
+        self.beginSelfProjectionWrite();
+        defer self.endSelfProjectionWrite();
         const first = try self.replaceSnapshotOnce(state, bootstrap, observed_revision);
         if (first) |result| {
             self.noteStoreRevision(result.store_revision);

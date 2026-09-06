@@ -15,6 +15,7 @@ pub const METHOD_STATE_SNAPSHOT_REPLACE: []const u8 = "state.snapshot.replace";
 pub const METHOD_APP_STATE_SET: []const u8 = "state.app.set";
 pub const METHOD_WORKSPACE_UPSERT: []const u8 = "workspace.upsert";
 pub const METHOD_CHAT_THREAD_UPSERT: []const u8 = "chat.thread.upsert";
+pub const METHOD_CHAT_THREAD_CLOSE: []const u8 = "chat.thread.close";
 pub const METHOD_CHAT_DRAFT_SET: []const u8 = "chat.draft.set";
 pub const METHOD_CHAT_MESSAGE_APPEND: []const u8 = "chat.message.append";
 pub const METHOD_SURFACE_UPSERT: []const u8 = "surface.upsert";
@@ -325,6 +326,16 @@ pub const Snapshot = struct {
     harness: ?[]const u8 = null,
     draft: ?[]const u8 = null,
     messages: ?[]const Message = null,
+    /// Threads the client closed since its last acknowledged replace. They
+    /// flip cold in the same transaction that persists the layout which no
+    /// longer references them, so no reader can observe a layout ordinal that
+    /// points past the open thread array. A carried thread is never closed.
+    closed_threads: []const ClosedThreadRef = &.{},
+};
+
+pub const ClosedThreadRef = struct {
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
 };
 
 /// Request for the transitional whole-state replacement.
@@ -352,6 +363,15 @@ pub const ThreadUpsertRequest = struct {
     mutation: MutationHeader,
     workspace_id: []const u8,
     thread: Thread,
+};
+
+/// Close one thread: it leaves the composite snapshot and the durable
+/// refresh stream until a later `state.snapshot.replace` / `chat.thread.upsert`
+/// carries it again (which reopens it). The row itself is untouched otherwise.
+pub const ThreadCloseRequest = struct {
+    mutation: MutationHeader,
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
 };
 
 /// Atomically replace or append one thread's composer draft.
@@ -543,6 +563,10 @@ pub const ThreadGetRequest = struct {
 pub const ThreadListItem = struct {
     local_thread_id: []const u8,
     title: []const u8,
+    /// Owning workspace; filled so cross-workspace history queries resolve.
+    workspace_id: []const u8 = "",
+    /// Daemon-owned open/closed bit (see `ThreadCloseRequest`).
+    open: bool = true,
     /// Stable position in the workspace's thread array. Persisted workspace
     /// layout JSON references chat panes by this index, so detached UIs need
     /// it to resolve open panes to threads.
@@ -574,9 +598,16 @@ pub const ThreadGetResult = struct {
 /// Bounded per-workspace thread metadata query. Returned cursors are opaque,
 /// revision-bound, and valid only for the same workspace query.
 pub const ThreadListRequest = struct {
-    workspace_id: []const u8,
+    /// Empty lists every workspace (history queries).
+    workspace_id: []const u8 = "",
     limit: u32 = 100,
     cursor: ?[]const u8 = null,
+    /// Null lists open and closed rows; false is the cold-history query.
+    open: ?bool = null,
+    /// Case-insensitive title substring filter; empty matches all.
+    query: []const u8 = "",
+    /// Order by last activity (newest first) instead of sort_index.
+    recent_first: bool = false,
 };
 
 /// Bounded per-workspace thread metadata result.

@@ -6,7 +6,7 @@ const zqlite = @import("zqlite");
 /// Latest schema version understood by this build.
 pub const CURRENT_VERSION: i64 = 1;
 /// Maximum schema version understood by read-only clients and the daemon store.
-pub const MAX_SUPPORTED_VERSION: i64 = 11;
+pub const MAX_SUPPORTED_VERSION: i64 = 13;
 /// SQLite busy timeout shared by writer and read-only connections.
 pub const BUSY_TIMEOUT_MS = 5000;
 
@@ -295,6 +295,18 @@ fn migrateToVersionInternal(
                 if (failure_point == .before_version_bump) return error.TestMigrationFailure;
                 try conn.execNoArgs("pragma user_version = 11");
                 version = 11;
+            },
+            11 => {
+                try migrateV11ToV12(conn);
+                if (failure_point == .before_version_bump) return error.TestMigrationFailure;
+                try conn.execNoArgs("pragma user_version = 12");
+                version = 12;
+            },
+            12 => {
+                try migrateV12ToV13(conn);
+                if (failure_point == .before_version_bump) return error.TestMigrationFailure;
+                try conn.execNoArgs("pragma user_version = 13");
+                version = 13;
             },
             else => return error.DatabaseSchemaInvalid,
         }
@@ -864,6 +876,239 @@ fn userVersion(conn: zqlite.Conn) !i64 {
     var row = (try conn.row("pragma user_version", .{})) orelse return error.MissingSchemaVersion;
     defer row.deinit();
     return row.int(0);
+}
+
+/// v12: threads carry a daemon-owned open/closed bit. Only open rows (plus
+/// uncommitted drafts and threads with a live turn) travel in the composite
+/// snapshot; closed rows are cold until an explicit `chat.thread.list` /
+/// `chat.thread.get`. Existing threads are closed unless a chat pane in the
+/// workspace layout references them, they are the workspace's Companion
+/// thread, or they are uncommitted. Because persisted pane refs and
+/// `selected_thread_index` are ordinals into the open (non-archived) thread
+/// array, the migration renumbers `sort_index` so open rows come first and
+/// rewrites those ordinals to ranks among the open rows.
+fn migrateV11ToV12(conn: zqlite.Conn) !void {
+    try ensureColumn(
+        conn,
+        "threads",
+        "open",
+        "alter table threads add column open integer not null default 1 check (open in (0, 1))",
+    );
+    try conn.execNoArgs("create index if not exists threads_open_idx on threads(workspace_id, open, sort_index)");
+    try recomputeOpenThreadSets(conn, .{ .uncommitted_open = true });
+}
+
+/// v13 tightens v12: an uncommitted draft stays open only when a chat pane
+/// shows it (or it is the Companion). Pane-less "New thread" placeholders
+/// were the bulk of what v12 left open.
+fn migrateV12ToV13(conn: zqlite.Conn) !void {
+    try recomputeOpenThreadSets(conn, .{ .uncommitted_open = false });
+}
+
+const OpenThreadPolicy = struct {
+    uncommitted_open: bool,
+};
+
+fn recomputeOpenThreadSets(conn: zqlite.Conn, policy: OpenThreadPolicy) !void {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const WorkspaceRow = struct {
+        row_id: i64,
+        layout_json: ?[]const u8,
+        selected_thread_index: i64,
+        companion_thread_local_id: ?[]const u8,
+    };
+    var workspaces: std.ArrayList(WorkspaceRow) = .empty;
+    {
+        var rows = try conn.rows(
+            "select id, workspace_layout_json, selected_thread_index, companion_thread_local_id from workspaces order by id",
+            .{},
+        );
+        defer rows.deinit();
+        while (rows.next()) |row| {
+            try workspaces.append(arena, .{
+                .row_id = row.int(0),
+                .layout_json = if (row.nullableText(1)) |value| try arena.dupe(u8, value) else null,
+                .selected_thread_index = row.int(2),
+                .companion_thread_local_id = if (row.nullableText(3)) |value| try arena.dupe(u8, value) else null,
+            });
+        }
+        if (rows.err) |err| return err;
+    }
+
+    for (workspaces.items) |workspace| {
+        try migrateWorkspaceOpenThreads(conn, arena, workspace.row_id, workspace.layout_json, workspace.selected_thread_index, workspace.companion_thread_local_id, policy);
+    }
+}
+
+const MigratedThreadRow = struct {
+    row_id: i64,
+    local_thread_id: ?[]const u8,
+    archived: bool,
+    committed: bool,
+    open: bool = false,
+    /// Ordinal in the pre-migration open array (non-archived rows in sort
+    /// order); null for archived rows.
+    old_ordinal: ?usize = null,
+    new_ordinal: ?usize = null,
+};
+
+fn migrateWorkspaceOpenThreads(
+    conn: zqlite.Conn,
+    arena: std.mem.Allocator,
+    workspace_row_id: i64,
+    layout_json: ?[]const u8,
+    selected_thread_index: i64,
+    companion_thread_local_id: ?[]const u8,
+    policy: OpenThreadPolicy,
+) !void {
+    var threads: std.ArrayList(MigratedThreadRow) = .empty;
+    {
+        var rows = try conn.rows(
+            "select id, local_thread_id, archived, committed from threads where workspace_id = ?1 order by sort_index",
+            .{workspace_row_id},
+        );
+        defer rows.deinit();
+        var ordinal: usize = 0;
+        while (rows.next()) |row| {
+            const archived = row.int(2) != 0;
+            try threads.append(arena, .{
+                .row_id = row.int(0),
+                .local_thread_id = if (row.nullableText(1)) |value| try arena.dupe(u8, value) else null,
+                .archived = archived,
+                .committed = row.int(3) != 0,
+                .old_ordinal = if (archived) null else ordinal,
+            });
+            if (!archived) ordinal += 1;
+        }
+        if (rows.err) |err| return err;
+    }
+    if (threads.items.len == 0) return;
+
+    // Which old ordinals are open: chat pane refs, the Companion thread,
+    // and uncommitted drafts. Archived rows are always closed.
+    var parsed: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed) |*value| value.deinit();
+    if (layout_json) |json| {
+        if (json.len != 0) {
+            parsed = std.json.parseFromSlice(std.json.Value, arena, json, .{}) catch null;
+        }
+    }
+    if (parsed) |value| {
+        if (value.value == .object) {
+            if (value.value.object.get("panes")) |panes| {
+                if (panes == .array) {
+                    for (panes.array.items) |pane| {
+                        if (pane != .object) continue;
+                        const kind = pane.object.get("kind") orelse continue;
+                        if (kind != .string or !std.mem.eql(u8, kind.string, "chat")) continue;
+                        const thread_value = pane.object.get("thread") orelse continue;
+                        const old = migrationJsonInt(thread_value) orelse continue;
+                        if (old < 0) continue;
+                        markMigratedOrdinalOpen(threads.items, @intCast(old));
+                    }
+                }
+            }
+        }
+    }
+    for (threads.items) |*thread| {
+        if (thread.archived) continue;
+        if (policy.uncommitted_open and !thread.committed) thread.open = true;
+        if (companion_thread_local_id) |companion| {
+            if (thread.local_thread_id) |local_id| {
+                if (std.mem.eql(u8, companion, local_id)) thread.open = true;
+            }
+        }
+    }
+
+    // New ordinals: rank among open rows in the old order.
+    var next_ordinal: usize = 0;
+    for (threads.items) |*thread| {
+        if (!thread.open) continue;
+        thread.new_ordinal = next_ordinal;
+        next_ordinal += 1;
+    }
+
+    // Renumber sort_index: open rows first (relative order kept), then closed.
+    try conn.exec("update threads set sort_index = -id where workspace_id = ?1", .{workspace_row_id});
+    var next_sort: i64 = 0;
+    for (threads.items) |thread| {
+        if (!thread.open) continue;
+        try conn.exec("update threads set sort_index = ?1, open = 1 where id = ?2", .{ next_sort, thread.row_id });
+        next_sort += 1;
+    }
+    for (threads.items) |thread| {
+        if (thread.open) continue;
+        try conn.exec("update threads set sort_index = ?1, open = 0 where id = ?2", .{ next_sort, thread.row_id });
+        next_sort += 1;
+    }
+
+    // Rewrite pane ordinals and the selected thread to the compact ranks.
+    var new_selected: i64 = 0;
+    if (selected_thread_index >= 0) {
+        if (migratedNewOrdinal(threads.items, @intCast(selected_thread_index))) |ordinal| new_selected = @intCast(ordinal);
+    }
+    var rewritten_layout: ?[]u8 = null;
+    if (parsed) |*value| {
+        if (value.value == .object) {
+            if (value.value.object.getPtr("panes")) |panes| {
+                if (panes.* == .array) {
+                    for (panes.array.items) |*pane| {
+                        if (pane.* != .object) continue;
+                        const kind = pane.object.get("kind") orelse continue;
+                        if (kind != .string or !std.mem.eql(u8, kind.string, "chat")) continue;
+                        const thread_value = pane.object.getPtr("thread") orelse continue;
+                        const old = migrationJsonInt(thread_value.*) orelse continue;
+                        if (old < 0) continue;
+                        const new_ordinal = migratedNewOrdinal(threads.items, @intCast(old)) orelse 0;
+                        thread_value.* = .{ .integer = @intCast(new_ordinal) };
+                    }
+                }
+            }
+            var writer: std.Io.Writer.Allocating = .init(arena);
+            var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+            try stringify.write(value.value);
+            rewritten_layout = try writer.toOwnedSlice();
+        }
+    }
+    if (rewritten_layout) |json| {
+        try conn.exec(
+            "update workspaces set workspace_layout_json = ?1, selected_thread_index = ?2 where id = ?3",
+            .{ json, new_selected, workspace_row_id },
+        );
+    } else {
+        try conn.exec("update workspaces set selected_thread_index = ?1 where id = ?2", .{ new_selected, workspace_row_id });
+    }
+}
+
+fn migrationJsonInt(value: std.json.Value) ?i64 {
+    return switch (value) {
+        .integer => |i| i,
+        .float => |f| @intFromFloat(f),
+        else => null,
+    };
+}
+
+fn markMigratedOrdinalOpen(threads: []MigratedThreadRow, ordinal: usize) void {
+    for (threads) |*thread| {
+        if (thread.old_ordinal) |old| {
+            if (old == ordinal) {
+                thread.open = true;
+                return;
+            }
+        }
+    }
+}
+
+fn migratedNewOrdinal(threads: []const MigratedThreadRow, old_ordinal: usize) ?usize {
+    for (threads) |thread| {
+        if (thread.old_ordinal) |old| {
+            if (old == old_ordinal) return thread.new_ordinal;
+        }
+    }
+    return null;
 }
 
 fn ensureColumn(conn: zqlite.Conn, table_name: []const u8, column_name: []const u8, alter_sql: [*:0]const u8) !void {
@@ -1443,4 +1688,76 @@ test "v1 to v2 dedupe keeps max-rowid survivor and its messages; idempotent re-r
     , .{})).?;
     defer msg_rerun.deinit();
     try std.testing.expectEqual(@as(i64, 2), msg_rerun.int(0));
+}
+
+test "v12 migration closes pane-less threads, orders open rows first, and rewrites pane ordinals" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const path = try std.fs.path.joinZ(std.testing.allocator, &.{ path_buf[0..path_len], "state.sqlite" });
+    defer std.testing.allocator.free(path);
+
+    const conn = try zqlite.open(path, zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
+    defer conn.close();
+    try migrateToVersion(conn, 11, .none);
+    try conn.execNoArgs(
+        \\insert into app_state (id, selected_workspace_index, sidebar_collapsed) values (1, 0, 0);
+        \\insert into workspaces (workspace_id, sort_index, label, path, workspace_layout_json, selected_thread_index, companion_thread_local_id)
+        \\values ('ws', 0, 'WS', '/ws',
+        \\        '{"v":2,"next":3,"panes":[{"id":1,"kind":"chat","thread":2},{"id":2,"kind":"terminal","dock":0}],"root":{"leaf":1}}',
+        \\        2, 't0');
+        \\insert into threads (workspace_id, sort_index, title, local_thread_id, provider, harness, committed, archived)
+        \\values ((select id from workspaces where workspace_id = 'ws'), 0, 'Companion', 't0', 0, 0, 1, 0),
+        \\       ((select id from workspaces where workspace_id = 'ws'), 1, 'Old chat', 't1', 0, 0, 1, 0),
+        \\       ((select id from workspaces where workspace_id = 'ws'), 2, 'Open chat', 't2', 0, 0, 1, 0),
+        \\       ((select id from workspaces where workspace_id = 'ws'), 3, 'Draft', 't3', 0, 0, 0, 0),
+        \\       ((select id from workspaces where workspace_id = 'ws'), 4, 'Archived', 't4', 0, 0, 1, 1);
+    );
+
+    try migrateToVersion(conn, 12, .none);
+
+    const Expected = struct { id: []const u8, sort_index: i64, open: i64 };
+    const expected = [_]Expected{
+        .{ .id = "t0", .sort_index = 0, .open = 1 },
+        .{ .id = "t2", .sort_index = 1, .open = 1 },
+        .{ .id = "t3", .sort_index = 2, .open = 1 },
+        .{ .id = "t1", .sort_index = 3, .open = 0 },
+        .{ .id = "t4", .sort_index = 4, .open = 0 },
+    };
+    for (expected) |entry| {
+        var row = (try conn.row("select sort_index, open from threads where local_thread_id = ?1", .{entry.id})).?;
+        defer row.deinit();
+        try std.testing.expectEqual(entry.sort_index, row.int(0));
+        try std.testing.expectEqual(entry.open, row.int(1));
+    }
+    var workspace = (try conn.row("select workspace_layout_json, selected_thread_index from workspaces where workspace_id = 'ws'", .{})).?;
+    defer workspace.deinit();
+    try std.testing.expectEqual(@as(i64, 1), workspace.int(1));
+    const layout = workspace.text(0);
+    try std.testing.expect(std.mem.indexOf(u8, layout, "\"thread\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, layout, "\"thread\":2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, layout, "\"dock\":0") != null);
+    workspace.deinit();
+
+    // v13 closes the pane-less draft; the pane ordinal is unchanged because
+    // the draft sat after the pane's thread.
+    try migrateToVersion(conn, 13, .none);
+    const expected_v13 = [_]Expected{
+        .{ .id = "t0", .sort_index = 0, .open = 1 },
+        .{ .id = "t2", .sort_index = 1, .open = 1 },
+        .{ .id = "t3", .sort_index = 2, .open = 0 },
+        .{ .id = "t1", .sort_index = 3, .open = 0 },
+        .{ .id = "t4", .sort_index = 4, .open = 0 },
+    };
+    for (expected_v13) |entry| {
+        var row = (try conn.row("select sort_index, open from threads where local_thread_id = ?1", .{entry.id})).?;
+        defer row.deinit();
+        try std.testing.expectEqual(entry.sort_index, row.int(0));
+        try std.testing.expectEqual(entry.open, row.int(1));
+    }
+    workspace = (try conn.row("select workspace_layout_json, selected_thread_index from workspaces where workspace_id = 'ws'", .{})).?;
+    try std.testing.expectEqual(@as(i64, 1), workspace.int(1));
+    try std.testing.expect(std.mem.indexOf(u8, workspace.text(0), "\"thread\":1") != null);
 }

@@ -260,6 +260,11 @@ pub const PersistedProject = struct {
     messages: []const PersistedMessage = &.{},
 };
 
+pub const PersistedClosedThread = struct {
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
+};
+
 pub const PersistedState = struct {
     selected_project_index: usize = 0,
     sidebar_collapsed: bool = false,
@@ -270,6 +275,9 @@ pub const PersistedState = struct {
     harness: ?Harness = null,
     draft: ?[]const u8 = null,
     messages: ?[]const PersistedMessage = null,
+    /// Thread closes riding along with this snapshot (item 5b). Only ever
+    /// non-empty on an outbound flush or a close-time spool.
+    closed_threads: []const PersistedClosedThread = &.{},
 };
 
 pub const LoadedState = struct {
