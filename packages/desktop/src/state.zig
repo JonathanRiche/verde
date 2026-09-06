@@ -4442,6 +4442,9 @@ pub const AppState = struct {
     import_name_storage: [256:0]u8,
     rename_storage: [256:0]u8,
     sidebar_notice_storage: [256:0]u8,
+    /// Monotonic stamp of the last `setSidebarNotice`; drives the toast
+    /// (item 11). Zero means no transient notice has been set yet.
+    sidebar_notice_set_at_ms: i64 = 0,
     close_durability_notice: bool = false,
     import_thread_id_storage: [256:0]u8,
     import_notice_storage: [256:0]u8,
@@ -13899,8 +13902,49 @@ pub const AppState = struct {
         @memset(&self.sidebar_notice_storage, 0);
         const len = @min(value.len, self.sidebar_notice_storage.len - 1);
         @memcpy(self.sidebar_notice_storage[0..len], value[0..len]);
+        self.sidebar_notice_set_at_ms = if (len > 0) monotonicMs() else 0;
         // Notices are transient. Wake the UI without persisting every thread.
         loop_wakeup.notify();
+    }
+
+    /// The in-app toast for the current notice, or null when nothing should
+    /// be drawn. Persistent health notices (close durability, daemon sync
+    /// stalled) stay up until cleared; plain notices slide in, hold for
+    /// `NOTICE_TOAST_HOLD_MS`, then fade.
+    pub fn noticeToast(self: *const AppState) ?NoticeToast {
+        // Health notices (close durability, daemon sync stalled) are not
+        // shown as toasts yet: their triggers are not trusted enough to put
+        // a persistent pill in front of the user. Flip this to re-enable.
+        if (NOTICE_TOAST_SHOW_HEALTH) {
+            if (self.close_durability_notice) return .{ .text = CLOSE_DURABILITY_NOTICE, .alpha = 1.0, .rise = 1.0, .persistent = true };
+            if (self.daemon_projection_stale) return .{ .text = "Daemon sync stalled; showing last synced state.", .alpha = 1.0, .rise = 1.0, .persistent = true };
+        }
+        const text = std.mem.sliceTo(self.sidebar_notice_storage[0..], 0);
+        if (text.len == 0 or self.sidebar_notice_set_at_ms == 0) return null;
+        const phase = noticeToastPhase(monotonicMs() - self.sidebar_notice_set_at_ms) orelse return null;
+        return .{ .text = text, .alpha = phase.alpha, .rise = phase.rise, .persistent = false };
+    }
+
+    /// True only during the slide-in and fade-out windows, so the loop pumps
+    /// display-rate frames for ~400 ms per notice instead of the whole hold.
+    pub fn noticeToastAnimating(self: *const AppState) bool {
+        if (NOTICE_TOAST_SHOW_HEALTH and (self.close_durability_notice or self.daemon_projection_stale)) return false;
+        if (self.sidebar_notice_set_at_ms == 0) return false;
+        if (std.mem.sliceTo(self.sidebar_notice_storage[0..], 0).len == 0) return false;
+        const phase = noticeToastPhase(monotonicMs() - self.sidebar_notice_set_at_ms) orelse return false;
+        return phase.animating;
+    }
+
+    /// Milliseconds until the held toast must start fading; the main loop
+    /// caps its event wait on this so the fade begins without polling.
+    pub fn noticeToastWakeMs(self: *const AppState) ?i64 {
+        if (NOTICE_TOAST_SHOW_HEALTH and (self.close_durability_notice or self.daemon_projection_stale)) return null;
+        if (self.sidebar_notice_set_at_ms == 0) return null;
+        if (std.mem.sliceTo(self.sidebar_notice_storage[0..], 0).len == 0) return null;
+        const elapsed = monotonicMs() - self.sidebar_notice_set_at_ms;
+        const fade_start = NOTICE_TOAST_HOLD_MS - NOTICE_TOAST_OUT_MS;
+        if (elapsed < 0 or elapsed >= fade_start) return null;
+        return fade_start - elapsed;
     }
 
     fn clearThreadImportThreads(self: *AppState) void {
@@ -19508,6 +19552,54 @@ test "daemon diff event becomes a persisted live timeline event" {
 
 fn unixTimestampSeconds() i64 {
     return @divTrunc(unixTimestampMs(), std.time.ms_per_s);
+}
+
+pub const NOTICE_TOAST_HOLD_MS: i64 = 3200;
+/// Off until the health-notice triggers are trusted (user call, 2026-09-05).
+pub const NOTICE_TOAST_SHOW_HEALTH = false;
+pub const NOTICE_TOAST_IN_MS: i64 = 160;
+pub const NOTICE_TOAST_OUT_MS: i64 = 240;
+
+pub const NoticeToast = struct {
+    text: []const u8,
+    /// 0..1 opacity; 1 while held.
+    alpha: f32,
+    /// 0..1 slide-in progress (eased); 1 once settled.
+    rise: f32,
+    persistent: bool,
+};
+
+const NoticeToastPhase = struct { alpha: f32, rise: f32, animating: bool };
+
+/// Pure toast timing: null once the hold has expired.
+fn noticeToastPhase(elapsed_ms: i64) ?NoticeToastPhase {
+    if (elapsed_ms < 0 or elapsed_ms >= NOTICE_TOAST_HOLD_MS) return null;
+    const in_t: f32 = @min(1.0, @as(f32, @floatFromInt(elapsed_ms)) / @as(f32, @floatFromInt(NOTICE_TOAST_IN_MS)));
+    const remaining = NOTICE_TOAST_HOLD_MS - elapsed_ms;
+    const out_t: f32 = @min(1.0, @as(f32, @floatFromInt(remaining)) / @as(f32, @floatFromInt(NOTICE_TOAST_OUT_MS)));
+    // Ease-out cubic on the slide so it decelerates into place.
+    const inv = 1.0 - in_t;
+    const rise = 1.0 - inv * inv * inv;
+    return .{
+        .alpha = @min(in_t, out_t),
+        .rise = rise,
+        .animating = in_t < 1.0 or out_t < 1.0,
+    };
+}
+
+test "notice toast phase slides in, holds, then fades" {
+    try std.testing.expect(noticeToastPhase(-1) == null);
+    const start = noticeToastPhase(0).?;
+    try std.testing.expectEqual(@as(f32, 0.0), start.alpha);
+    try std.testing.expect(start.animating);
+    const held = noticeToastPhase(NOTICE_TOAST_IN_MS + 500).?;
+    try std.testing.expectEqual(@as(f32, 1.0), held.alpha);
+    try std.testing.expectEqual(@as(f32, 1.0), held.rise);
+    try std.testing.expect(!held.animating);
+    const fading = noticeToastPhase(NOTICE_TOAST_HOLD_MS - NOTICE_TOAST_OUT_MS / 2).?;
+    try std.testing.expect(fading.alpha < 1.0 and fading.alpha > 0.0);
+    try std.testing.expect(fading.animating);
+    try std.testing.expect(noticeToastPhase(NOTICE_TOAST_HOLD_MS) == null);
 }
 
 fn monotonicMs() i64 {

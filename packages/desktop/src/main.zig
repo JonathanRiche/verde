@@ -1727,7 +1727,9 @@ fn activeContinuousFrames(state: *AppState) bool {
         // Run-config stepper thumbs slide for ~160ms after a selection.
         state.runConfigStepperAnimating() or
         // Settings modal fades in/out for ~160ms.
-        state.settingsModalAnimating();
+        state.settingsModalAnimating() or
+        // Notice toast slides in / fades out (~400ms total per notice).
+        state.noticeToastAnimating();
 }
 
 fn currentTranscriptLayoutNeedsFrames(state: *const AppState) bool {
@@ -1803,7 +1805,13 @@ fn eventWaitTimeoutMs(
 }
 
 fn eventWaitBaseTimeoutMs(state: *AppState) c_int {
-    return eventWaitBaseTimeoutForActivity(pacingActivity(state));
+    const base = eventWaitBaseTimeoutForActivity(pacingActivity(state));
+    // A held notice toast needs exactly one wake at its fade start; cap the
+    // idle wait on that instead of pumping frames through the hold.
+    if (state.noticeToastWakeMs()) |wake_ms| {
+        return @intCast(@min(@as(i64, base), @max(wake_ms, 1)));
+    }
+    return base;
 }
 
 fn eventWaitBaseTimeoutForActivity(activity: PacingActivity) c_int {
@@ -2053,6 +2061,9 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
+            if (handleTranscriptMarkdownCopyShortcut(state, &event.key)) {
+                return true;
+            }
             if (state.routePaletteComposerKeyDown(&event.key)) {
                 syncWindowTextInput(window, state);
                 return true;
@@ -2136,9 +2147,6 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             if (handleComposerFocusShortcut(state, &event.key)) {
-                return true;
-            }
-            if (handleTranscriptMarkdownCopyShortcut(state, &event.key)) {
                 return true;
             }
             if (handleTranscriptMarkdownSelectAllShortcut(state, &event.key)) {
@@ -3048,24 +3056,22 @@ fn handleTranscriptMarkdownSelectAllShortcut(state: *AppState, event: *const sdl
     return true;
 }
 
+/// Ctrl+C copies a highlighted transcript selection. Runs before the
+/// composer key route so a focused-but-selection-less composer does not
+/// swallow the copy; when the composer has its own selection it wins.
 fn handleTranscriptMarkdownCopyShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
     if (!event.down or event.repeat) return false;
     if (event.key != .c) return false;
     if (!isPrimaryModifierPressed(event.mod)) return false;
-    if (state.composer_controller.focused) return false;
+    if (isKeymodPressed(event.mod, sdl.Keymod.shift) or isKeymodPressed(event.mod, sdl.Keymod.alt)) return false;
+    if (state.composer_controller.focused and state.composer_controller.composer.selection() != null) return false;
     if (state.terminal_controller.focused) return false;
     if (state.isBrowserPaneFocused()) return false;
+    if (state.browser_controller.address_focused or state.palette_modal_text_focus != .none) return false;
     if (!state.transcriptMarkdownSelectionActive()) return false;
 
-    const maybe = chat_panel_ui.transcriptMarkdownSelectionPlainText(state) catch return false;
-    const plain = maybe orelse return false;
-    defer state.allocator.free(plain);
-    const z = state.allocator.dupeZ(u8, plain) catch return false;
-    defer state.allocator.free(z);
-    sdl.setClipboardText(z) catch |err| {
-        log.warn("failed to set transcript markdown selection clipboard: {s}", .{@errorName(err)});
-        return true;
-    };
+    // Shared with the context-menu copy so the "Copied selection." toast fires.
+    workspace_panes_ui.copyTranscriptSelectionToClipboard(state);
     state.markDirty();
     return true;
 }
