@@ -10,8 +10,8 @@ pub const ChatRole = db_types.ChatRole;
 pub const Provider = db_types.Provider;
 pub const Harness = db_types.Harness;
 
-pub const DEFAULT_CODEX_MODEL: [:0]const u8 = "gpt-5.6-sol";
-pub const DEFAULT_CODEX_REASONING_EFFORT: ReasoningEffort = .low;
+pub const DEFAULT_CODEX_MODEL: [:0]const u8 = "gpt-6-astra";
+pub const DEFAULT_CODEX_REASONING_EFFORT: ReasoningEffort = .medium;
 pub const DEFAULT_OPENCODE_MODEL: [:0]const u8 = "opencode/gpt-5.4";
 pub const DEFAULT_CLAUDE_MODEL: [:0]const u8 = "fable[1m]";
 pub const DEFAULT_CURSOR_MODEL: [:0]const u8 = "composer-2.5";
@@ -125,6 +125,7 @@ pub const OPENCODE_MODEL_OPTIONS = [_]ModelOption{
 };
 
 pub const CODEX_MODEL_OPTIONS = [_]ModelOption{
+    .{ .label = "GPT-6 Astra", .value = "gpt-6-astra" },
     .{ .label = "GPT-5.6 Sol", .value = "gpt-5.6-sol" },
     .{ .label = "GPT-5.5", .value = "gpt-5.5" },
     .{ .label = "GPT-5.6 Terra", .value = "gpt-5.6-terra" },
@@ -267,18 +268,19 @@ pub const CODEX_REASONING_OPTIONS = [_]ReasoningOption{
     .{ .label = "Xhigh", .value = .xhigh },
 };
 
-pub const CODEX_56_REASONING_OPTIONS = CODEX_REASONING_OPTIONS ++ [_]ReasoningOption{
+pub const CODEX_MAX_REASONING_OPTIONS = CODEX_REASONING_OPTIONS ++ [_]ReasoningOption{
     .{ .label = "Max", .value = .max },
 };
 
 /// Returns the reasoning efforts supported by the selected Codex model.
 pub fn codexReasoningOptions(model_ref: ?[]const u8) []const ReasoningOption {
     const model = model_ref orelse DEFAULT_CODEX_MODEL;
-    if (std.mem.eql(u8, model, "gpt-5.6-sol") or
+    if (std.mem.eql(u8, model, "gpt-6-astra") or
+        std.mem.eql(u8, model, "gpt-5.6-sol") or
         std.mem.eql(u8, model, "gpt-5.6-terra") or
         std.mem.eql(u8, model, "gpt-5.6-luna"))
     {
-        return CODEX_56_REASONING_OPTIONS[0..];
+        return CODEX_MAX_REASONING_OPTIONS[0..];
     }
     return CODEX_REASONING_OPTIONS[0..];
 }
@@ -294,16 +296,17 @@ pub const CODEX_ACCESS_MODE_OPTIONS = [_]AccessModeOption{
 };
 
 test "Codex model options omit unsupported subscription models" {
-    try std.testing.expectEqual(@as(usize, 5), CODEX_MODEL_OPTIONS.len);
-    try std.testing.expectEqualStrings("gpt-5.6-sol", CODEX_MODEL_OPTIONS[0].value.?);
-    try std.testing.expectEqualStrings("gpt-5.5", CODEX_MODEL_OPTIONS[1].value.?);
-    try std.testing.expectEqualStrings("gpt-5.6-terra", CODEX_MODEL_OPTIONS[2].value.?);
-    try std.testing.expectEqualStrings("gpt-5.6-luna", CODEX_MODEL_OPTIONS[3].value.?);
-    try std.testing.expectEqualStrings("gpt-5.3-codex-spark", CODEX_MODEL_OPTIONS[4].value.?);
+    try std.testing.expectEqual(@as(usize, 6), CODEX_MODEL_OPTIONS.len);
+    try std.testing.expectEqualStrings("gpt-6-astra", CODEX_MODEL_OPTIONS[0].value.?);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", CODEX_MODEL_OPTIONS[1].value.?);
+    try std.testing.expectEqualStrings("gpt-5.5", CODEX_MODEL_OPTIONS[2].value.?);
+    try std.testing.expectEqualStrings("gpt-5.6-terra", CODEX_MODEL_OPTIONS[3].value.?);
+    try std.testing.expectEqualStrings("gpt-5.6-luna", CODEX_MODEL_OPTIONS[4].value.?);
+    try std.testing.expectEqualStrings("gpt-5.3-codex-spark", CODEX_MODEL_OPTIONS[5].value.?);
 }
 
-test "Codex 5.6 models expose max reasoning" {
-    for ([_][]const u8{ "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna" }) |model| {
+test "Codex 5.6 and 6 models expose max reasoning" {
+    for ([_][]const u8{ "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna" }) |model| {
         const options = codexReasoningOptions(model);
         try std.testing.expectEqual(ReasoningEffort.max, options[options.len - 1].value.?);
     }
