@@ -116,8 +116,8 @@ const CODEX_EFFORTS: EffortOption[] = [
   { label: 'Xhigh', value: 'xhigh' },
 ]
 
-/// GPT-5.6 adds max reasoning effort across Sol, Terra, and Luna.
-const CODEX_56_EFFORTS: EffortOption[] = [
+/// Current Codex models support max reasoning effort.
+const CODEX_MAX_EFFORTS: EffortOption[] = [
   ...CODEX_EFFORTS,
   { label: 'Max', value: 'max' },
 ]
@@ -133,10 +133,11 @@ const CLAUDE_FULL_EFFORTS: EffortOption[] = [
 ]
 
 const CODEX_MODELS: ModelOption[] = [
-  { label: 'GPT-5.6 Sol', value: 'gpt-5.6-sol', efforts: CODEX_56_EFFORTS },
+  { label: 'GPT-6 Astra', value: 'gpt-6-astra', efforts: CODEX_MAX_EFFORTS },
+  { label: 'GPT-5.6 Sol', value: 'gpt-5.6-sol', efforts: CODEX_MAX_EFFORTS },
   { label: 'GPT-5.5', value: 'gpt-5.5', efforts: CODEX_EFFORTS },
-  { label: 'GPT-5.6 Terra', value: 'gpt-5.6-terra', efforts: CODEX_56_EFFORTS },
-  { label: 'GPT-5.6 Luna', value: 'gpt-5.6-luna', efforts: CODEX_56_EFFORTS },
+  { label: 'GPT-5.6 Terra', value: 'gpt-5.6-terra', efforts: CODEX_MAX_EFFORTS },
+  { label: 'GPT-5.6 Luna', value: 'gpt-5.6-luna', efforts: CODEX_MAX_EFFORTS },
   { label: 'GPT-5.3 Codex Spark', value: 'gpt-5.3-codex-spark', efforts: CODEX_EFFORTS },
 ]
 

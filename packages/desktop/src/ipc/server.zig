@@ -4216,7 +4216,7 @@ test "chat open response exposes stable identifiers" {
     try std.testing.expect(boolParam(.{ .object = result }, "created").?);
     try std.testing.expect(boolParam(.{ .object = result }, "presented").?);
     try std.testing.expectEqualStrings("codex", jsonString(result.get("provider").?).?);
-    try std.testing.expectEqualStrings("gpt-5.6-sol", jsonString(result.get("model").?).?);
+    try std.testing.expectEqualStrings("gpt-6-astra", jsonString(result.get("model").?).?);
     try std.testing.expectEqualStrings("high", jsonString(result.get("reasoning_effort").?).?);
     try std.testing.expect(!(boolParam(.{ .object = result }, "fast_mode").?));
     try std.testing.expectEqualStrings("default", jsonString(result.get("service_tier").?).?);
