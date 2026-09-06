@@ -3899,7 +3899,7 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
     const working_label = if (send_state.local_command)
         formatPendingCommandLabel(&status_buf, send_state.started_at_ms)
     else
-        formatPendingWorkingLabel(&status_buf, send_state.started_at_ms, send_state.thinking);
+        formatPendingWorkingLabel(&status_buf, send_state.started_at_ms, thinkingLabelShown(send_state.thinking, send_state.thinking_cleared_at_ms, monotonicMs()));
     const stream_text: []const u8 = send_state.partial_text.items;
     const body: []const u8 = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
     const stream_plain = false; // item 4: stream renders as markdown in place
@@ -3912,6 +3912,28 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
 
 fn unixTimestampMs() i64 {
     return platform_runtime.unixTimestampMs();
+}
+
+/// Item 7: keep "Thinking" up for a short hold after the provider's
+/// reasoning item closes. Providers often report think pending/done around
+/// every delta, which otherwise flips the verb several times a second.
+const THINKING_LABEL_HOLD_MS: i64 = 1500;
+
+fn thinkingLabelShown(thinking: bool, cleared_at_ms: i64, now_ms: i64) bool {
+    if (thinking) return true;
+    if (cleared_at_ms <= 0) return false;
+    return now_ms - cleared_at_ms < THINKING_LABEL_HOLD_MS;
+}
+
+fn monotonicMs() i64 {
+    return @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
+}
+
+test "thinking label holds briefly after reasoning closes" {
+    try std.testing.expect(thinkingLabelShown(true, 0, 10_000));
+    try std.testing.expect(!thinkingLabelShown(false, 0, 10_000));
+    try std.testing.expect(thinkingLabelShown(false, 9_000, 10_000));
+    try std.testing.expect(!thinkingLabelShown(false, 8_000, 10_000));
 }
 
 fn formatPendingWorkingLabel(buf: []u8, started_at_ms: i64, thinking: bool) []const u8 {
@@ -7027,6 +7049,7 @@ fn renderTranscriptBubbleFromParts(
         .h = bubble.h - theme.scaledUi(42.0),
     };
     const body_text = std.mem.trim(u8, body_raw, "\n\r\t ");
+    last_body_tail = null;
     if (role == .assistant and !muted_body and !assistant_plain_layout) {
         renderMarkdownBody(state, message_index, body_rect, body_text, clip, streaming);
     } else {
@@ -7040,6 +7063,43 @@ fn renderTranscriptBubbleFromParts(
             streaming,
         );
     }
+    if (active) renderStreamCaret(state, last_body_tail, clip);
+}
+
+/// End of the last prose line drawn by the most recent body render (fresh
+/// or replayed from cache). Consumed by the pending bubble's caret.
+var last_body_tail: ?chat_markdown.TextTail = null;
+
+/// Item 7: blinking caret at the tail of the in-flight reply (and after the
+/// "Waiting for streamed output..." placeholder). Pure clock math on frames
+/// the pending pane already draws for its status pulse; it never requests
+/// frames of its own.
+const STREAM_CARET_PERIOD_NS: i128 = 1_060_000_000;
+
+fn streamCaretVisible(now_ns: i128, reduced_motion: bool) bool {
+    if (reduced_motion) return true;
+    return @mod(now_ns, STREAM_CARET_PERIOD_NS) < @divTrunc(STREAM_CARET_PERIOD_NS, 2);
+}
+
+test "stream caret blinks on a fixed clock and stays lit under reduced motion" {
+    try std.testing.expect(streamCaretVisible(0, false));
+    try std.testing.expect(streamCaretVisible(STREAM_CARET_PERIOD_NS / 2 - 1, false));
+    try std.testing.expect(!streamCaretVisible(STREAM_CARET_PERIOD_NS / 2, false));
+    try std.testing.expect(streamCaretVisible(STREAM_CARET_PERIOD_NS, false));
+    try std.testing.expect(streamCaretVisible(STREAM_CARET_PERIOD_NS / 2, true));
+}
+
+fn renderStreamCaret(state: *app_state.AppState, tail: ?chat_markdown.TextTail, clip: palette.Rect) void {
+    const at = tail orelse return;
+    if (!streamCaretVisible(profiler.nowNs(), state.app_config.reduced_motion)) return;
+    const caret_h = at.h * 0.72;
+    const caret: palette.Rect = .{
+        .x = at.x + theme.scaledUi(3.0),
+        .y = at.y + (at.h - caret_h) * 0.5,
+        .w = theme.scaledUi(2.0),
+        .h = caret_h,
+    };
+    queueRoundedClipped(state, caret, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 220)), caret.w * 0.5, clip);
 }
 
 fn markdownOptions(font_size: f32) chat_markdown.RenderOptions {
@@ -7169,6 +7229,7 @@ fn renderSelectableBodyView(
         false,
     );
     defer sel_out.deinit(state.allocator);
+    last_body_tail = context.text_tail;
 }
 
 fn renderSelectableBodyEntry(
@@ -7244,6 +7305,7 @@ fn replayTranscriptBodyRenderCache(
         .{ .x = rect.x, .y = rect.y },
         clip,
     ) catch return false;
+    last_body_tail = if (entry.render_cache_tail) |tail| .{ .x = tail.x + rect.x, .y = tail.y + rect.y, .h = tail.h } else null;
     // Re-register the cached copy buttons at their translated positions so
     // clicks keep working on replayed frames; payloads re-enter the live
     // frame text because hit consumers read `palette_frame_text` offsets.
@@ -7312,6 +7374,7 @@ fn ensureTranscriptBodyRenderCache(
     // commands with the shared visual layout path so an incoming stream
     // delta does not allocate throwaway per-line selection geometry.
     chat_markdown.renderPaletteBody(&context, entry.view, options);
+    entry.render_cache_tail = context.text_tail;
     entry.render_cache_key = key;
 }
 

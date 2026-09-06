@@ -59,6 +59,9 @@ pub const TranscriptMarkdownBody = struct {
     // translate and re-register them so fenced-code messages stay
     // replay-cache eligible instead of re-running markdown every frame.
     render_cache_copy_buttons: std.ArrayList(chat_markdown.CodeCopyButtonSink) = .empty,
+    /// Origin-relative end of the last prose line in the cached batch, so a
+    /// replayed frame can still place the streaming caret.
+    render_cache_tail: ?chat_markdown.TextTail = null,
 
     pub fn deinit(self: *TranscriptMarkdownBody, allocator: std.mem.Allocator) void {
         self.render_cache.deinit(allocator);
@@ -1133,6 +1136,10 @@ pub const SendState = struct {
     /// Surfaced as "Thinking - mm:ss" in the pending stream header rather
     /// than as a transcript tool row.
     thinking: bool = false,
+    /// Monotonic ms when `thinking` last dropped to false (0 = never). The
+    /// header keeps showing "Thinking" briefly past it so a reasoning burst
+    /// that flickers pending/done between deltas does not flip the verb.
+    thinking_cleared_at_ms: i64 = 0,
     pending_events: std.ArrayListUnmanaged(PendingTimelineEvent) = .empty,
     pending_diff_files: std.ArrayListUnmanaged(PendingDiffFile) = .empty,
     /// Once present, a cumulative turn snapshot owns the changed-files card;

@@ -116,6 +116,14 @@ pub const CodeCopyButtonRecorder = struct {
     recent_active: bool = false,
 };
 
+/// Where the most recently drawn text chunk ended (line top and height), in
+/// the same space as the render cursor. The streaming caret hangs off it.
+pub const TextTail = struct {
+    x: f32,
+    y: f32,
+    h: f32,
+};
+
 pub const PaletteRenderContext = struct {
     allocator: Allocator,
     batch: *palette.RenderBatch,
@@ -127,6 +135,9 @@ pub const PaletteRenderContext = struct {
     hovered: bool = false,
     clip: ?palette.Rect = null,
     code_copy_recorder: ?CodeCopyButtonRecorder = null,
+    /// Updated by every styled text chunk; after a body render it names the
+    /// end of the last line of prose (null when nothing textual was drawn).
+    text_tail: ?TextTail = null,
 };
 
 pub const SelectionPoint = struct {
@@ -3427,6 +3438,7 @@ fn renderPaletteStyledChunk(
         .w = width,
         .h = line_height,
     }, text, paletteColor(color), draw_font_size, role, context.clip);
+    context.text_tail = .{ .x = position[0] + width, .y = position[1], .h = line_height };
 
     if (inline_style.link or inline_style.emphasis) {
         const underline_color = if (inline_style.link) paletteColor(theme.md.link) else paletteColor(color);
