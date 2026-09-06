@@ -392,7 +392,7 @@ ss -ltnp | rg '127\.0\.0\.1:7420'
 curl -fsS http://127.0.0.1:7420/healthz
 ```
 
-`GET /healthz` is intentionally limited to liveness. `GET /login`, `GET /login.js`, and trusted built SPA assets are also public; unauthenticated app-shell navigation redirects to `/login`. Runtime inventory, RPC, and the exact `/ws` upgrade require either the authenticated browser session cookie or an authorization bearer. Browser login exchanges the administrator token for a bounded, in-memory, `HttpOnly; SameSite=Strict` session cookie. Raw tokens in query strings and `X-Verde-Token` headers are not accepted. The gateway has no production Live/mock fallback: it talks only to the configured headless session daemon.
+`GET /healthz` is intentionally limited to liveness. `GET /login`, `GET /login.js`, and trusted built SPA assets are also public; unauthenticated app-shell navigation redirects to `/login`. Runtime inventory, RPC, and the exact `/ws` upgrade require either the authenticated browser session cookie or an authorization bearer. Browser login exchanges the administrator token for a bounded, in-memory, `HttpOnly; SameSite=Lax` session cookie. Raw tokens in query strings and `X-Verde-Token` headers are not accepted. The gateway has no production Live/mock fallback: it talks only to the configured headless session daemon.
 
 The advanced SSH-loopback browser path uses HTTP at the browser's loopback
 endpoint, so its session cookie is not marked `Secure`; SSH encrypts network
