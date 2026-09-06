@@ -13,6 +13,20 @@ const INSTALL_FALLBACK_RELATIVE = ".local/bin/muse";
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 
 var active_process_state: acp.ActiveProcessState = .{};
+var send_mutex: std.Io.Mutex = .init;
+
+const OPAQUE_HISTORY_NOTICE =
+    "Muse could not replay this thread's private reasoning history. Starting a fresh Muse session.";
+
+fn lockSend() void {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    send_mutex.lockUncancelable(threaded.io());
+}
+
+fn unlockSend() void {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    send_mutex.unlock(threaded.io());
+}
 
 pub fn providerSlashCommands() []const provider_types.ProviderSlashCommand {
     return &.{};
@@ -169,6 +183,22 @@ pub const Client = struct {
         allocator: std.mem.Allocator,
         request: provider_types.SendPromptRequest,
     ) !provider_types.SendPromptResult {
+        lockSend();
+        defer unlockSend();
+        return sendPromptOnce(self, allocator, request) catch |err| {
+            if (err != error.MuseOpaqueHistory or request.thread_id == null) return err;
+            if (request.on_failure) |callback| callback(request.stream_context, OPAQUE_HISTORY_NOTICE);
+            var retry = request;
+            retry.thread_id = null;
+            return sendPromptOnce(self, allocator, retry);
+        };
+    }
+
+    fn sendPromptOnce(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        request: provider_types.SendPromptRequest,
+    ) !provider_types.SendPromptResult {
         const disable_sandbox = (request.sandbox_mode orelse .workspace_write) == .danger_full_access;
         var proc = try self.spawnServer(allocator, disable_sandbox);
         defer proc.deinit();
@@ -236,7 +266,13 @@ pub const Client = struct {
         defer deinitStringSet(allocator, &streamed_items);
         var turn_id_storage: ?[]u8 = null;
         defer if (turn_id_storage) |turn_id| allocator.free(turn_id);
+        var foreground_work: std.StringHashMapUnmanaged(void) = .empty;
+        defer deinitStringSet(allocator, &foreground_work);
         var cancel_sent = false;
+        var agent_message_completed = false;
+        var turn_succeeded = false;
+        var published_answer = false;
+        var turn_started = false;
 
         while (try acp.takeLineAlloc(allocator, &reader)) |raw_line| {
             defer allocator.free(raw_line);
@@ -253,15 +289,29 @@ pub const Client = struct {
                     const result = acp.getObjectField(parsed.value, "result") orelse return error.MuseProtocolFailed;
                     const turn_id = acp.getOptionalObjectString(result, "turnId") orelse return error.MuseProtocolFailed;
                     turn_id_storage = try allocator.dupe(u8, turn_id);
+                    turn_started = true;
                     if (request.on_turn_id) |callback| callback(request.stream_context, turn_id);
                 }
                 continue;
             }
-            try failIfRpcError(parsed.value);
+            failIfRpcError(parsed.value) catch |err| {
+                if (err == error.MuseOpaqueHistory and turn_started) {
+                    if (published_answer) {
+                        turn_succeeded = true;
+                        break;
+                    }
+                    if (request.on_failure) |callback| callback(request.stream_context, OPAQUE_HISTORY_NOTICE);
+                    return error.MuseTurnFailed;
+                }
+                return err;
+            };
 
             const method = acp.getOptionalObjectString(parsed.value, "method") orelse continue;
             const params = acp.getObjectField(parsed.value, "params") orelse continue;
             if (std.mem.eql(u8, method, "turn/started")) {
+                const started_turn_id = acp.getOptionalObjectString(params, "turnId") orelse "";
+                if (!eventBelongsToTurn(turn_id_storage, started_turn_id)) continue;
+                turn_started = true;
                 emitWorkingEvent(request);
             } else if (std.mem.eql(u8, method, "item/started")) {
                 if (acp.getObjectField(params, "item")) |item| {
@@ -270,6 +320,7 @@ pub const Client = struct {
                     if (item_id.len > 0 and std.mem.eql(u8, kind, "agentMessage")) {
                         try agent_items.put(allocator, try allocator.dupe(u8, item_id), {});
                     }
+                    try noteForegroundWork(allocator, &foreground_work, item, false);
                     emitItemEvent(request, item);
                 }
             } else if (std.mem.eql(u8, method, "item/delta")) {
@@ -293,6 +344,10 @@ pub const Client = struct {
                         try reply.appendSlice(allocator, text);
                         if (request.on_stream_delta) |callback| callback(request.stream_context, text);
                     }
+                    if (std.mem.eql(u8, method, "item/completed") and std.mem.eql(u8, kind, "agentMessage")) {
+                        agent_message_completed = true;
+                    }
+                    try noteForegroundWork(allocator, &foreground_work, item, std.mem.eql(u8, method, "item/completed"));
                     emitItemEvent(request, item);
                 }
             } else if (std.mem.eql(u8, method, "approval/requested") or std.mem.eql(u8, method, "approval/updated")) {
@@ -300,14 +355,22 @@ pub const Client = struct {
                 try decideApproval(allocator, &proc, request, params);
             } else if (std.mem.eql(u8, method, "session/todoListChanged")) {
                 emitTodoEvent(request, params);
+            } else if (std.mem.eql(u8, method, "session/tokenUsage")) {
+                // Model call finished (after the assistant message). Reminder
+                // children may still run until turn/completed.
+                publishAnswerIfReady(
+                    request,
+                    reply.items,
+                    agent_message_completed or reply.items.len > 0,
+                    foreground_work.count(),
+                    &published_answer,
+                );
             } else if (std.mem.eql(u8, method, "userInput/requested")) {
                 try cancelUserInput(allocator, &proc, params);
                 if (request.on_failure) |callback| callback(request.stream_context, "Muse requested structured user input; continue in a new message.");
             } else if (std.mem.eql(u8, method, "turn/retryScheduled")) {
                 const retry_turn_id = acp.getOptionalObjectString(params, "turnId") orelse "";
-                if (turn_id_storage) |turn_id| {
-                    if (!std.mem.eql(u8, retry_turn_id, turn_id)) continue;
-                }
+                if (!eventBelongsToTurn(turn_id_storage, retry_turn_id)) continue;
                 const reason = acp.getOptionalObjectString(params, "reason") orelse "request failed";
                 if (isNonRecoverableRetryReason(reason)) {
                     const message = "Muse rejected the model request. Check the Muse account/subscription and selected model.";
@@ -317,23 +380,36 @@ pub const Client = struct {
                 emitRetryEvent(request, params, reason);
             } else if (std.mem.eql(u8, method, "turn/completed")) {
                 const completed_turn_id = acp.getOptionalObjectString(params, "turnId") orelse "";
-                if (turn_id_storage) |turn_id| {
-                    if (!std.mem.eql(u8, completed_turn_id, turn_id)) continue;
-                }
+                // `ifBusy: replace` completes the leftover reminder turn
+                // before `turn/start` acks. That cancel is not this send.
+                if (!eventBelongsToTurn(turn_id_storage, completed_turn_id)) continue;
                 const terminal = acp.getOptionalObjectString(params, "terminal") orelse "failed";
                 if (std.mem.eql(u8, terminal, "failed")) {
                     const error_value = acp.getObjectField(params, "error");
                     const message = if (error_value) |value| acp.getOptionalObjectString(value, "message") orelse "Muse turn failed" else "Muse turn failed";
+                    if (isOpaqueReasoningHistory(message) and !turn_started) return error.MuseOpaqueHistory;
+                    if (published_answer) {
+                        turn_succeeded = true;
+                        break;
+                    }
                     if (request.on_failure) |callback| callback(request.stream_context, message);
                     return error.MuseTurnFailed;
                 }
-                if (std.mem.eql(u8, terminal, "cancelled")) return error.MuseTurnCancelled;
-                proc.stop();
-                return .{
-                    .thread_id = session_id,
-                    .reply_text = try reply.toOwnedSlice(allocator),
-                };
+                if (std.mem.eql(u8, terminal, "cancelled")) {
+                    if (published_answer) {
+                        turn_succeeded = true;
+                        break;
+                    }
+                    if (request.on_failure) |callback| {
+                        callback(request.stream_context, "Muse cancelled this turn. Send the message again.");
+                    }
+                    return error.MuseTurnCancelled;
+                }
+                turn_succeeded = true;
+                break;
             }
+
+            publishAnswerIfReady(request, reply.items, agent_message_completed, foreground_work.count(), &published_answer);
 
             if (!cancel_sent) {
                 if (request.on_should_stop) |should_stop| {
@@ -352,7 +428,13 @@ pub const Client = struct {
                 }
             }
         }
-        return error.MuseProtocolFailed;
+        if (!turn_succeeded and !published_answer) return error.MuseProtocolFailed;
+        publishAnswerIfReady(request, reply.items, true, 0, &published_answer);
+        proc.stop();
+        return .{
+            .thread_id = session_id,
+            .reply_text = try reply.toOwnedSlice(allocator),
+        };
     }
 
     pub fn interruptThread(self: *Client, request: provider_types.InterruptThreadRequest) !void {
@@ -504,7 +586,14 @@ fn failIfRpcError(value: std.json.Value) !void {
     const message = acp.getOptionalObjectString(error_value, "message") orelse "";
     if (containsAuthHint(message)) return error.MuseSignedOut;
     if (isApprovalModeRejected(message)) return error.MuseApprovalModeRejected;
+    if (isOpaqueReasoningHistory(message)) return error.MuseOpaqueHistory;
     return error.MuseProtocolFailed;
+}
+
+fn isOpaqueReasoningHistory(message: []const u8) bool {
+    return std.mem.indexOf(u8, message, "provider-private history") != null or
+        std.mem.indexOf(u8, message, "no provider attribution") != null or
+        std.mem.indexOf(u8, message, "opaque reasoning") != null;
 }
 
 fn isApprovalModeRejected(message: []const u8) bool {
@@ -639,7 +728,114 @@ fn emitWorkingEvent(request: provider_types.SendPromptRequest) void {
     } });
 }
 
+fn emitTurnFinished(request: provider_types.SendPromptRequest) void {
+    const callback = request.on_stream_event orelse return;
+    callback(request.stream_context, .{ .tool_call = .{
+        .call_id = "muse-turn",
+        .title = "",
+        .kind = .think,
+        .status = .completed,
+    } });
+}
+
+fn publishAnswerIfReady(
+    request: provider_types.SendPromptRequest,
+    reply: []const u8,
+    agent_output_done: bool,
+    foreground_work: usize,
+    published: *bool,
+) void {
+    if (published.*) return;
+    if (!shouldFinishMuseTurn(agent_output_done, foreground_work)) return;
+    published.* = true;
+    emitTurnFinished(request);
+    if (request.on_answer_ready) |callback| callback(request.stream_context, reply);
+}
+
+/// Muse keeps the MSP turn open for reminder/memory children after the
+/// assistant message is committed (`eot_gate_ms` ~10–12s). The GUI already
+/// has the answer; do not wait for that housekeeping.
+fn shouldFinishMuseTurn(agent_output_done: bool, foreground_work: usize) bool {
+    return agent_output_done and foreground_work == 0;
+}
+
+/// Lifecycle events without our `turn/start` ack belong to a leftover turn
+/// that `ifBusy: replace` is winding down.
+fn eventBelongsToTurn(our_turn_id: ?[]const u8, event_turn_id: []const u8) bool {
+    const ours = our_turn_id orelse return false;
+    if (event_turn_id.len == 0) return true;
+    return std.mem.eql(u8, event_turn_id, ours);
+}
+
+fn workItemId(item: std.json.Value) []const u8 {
+    if (acp.getOptionalObjectString(item, "itemId")) |item_id| {
+        if (item_id.len > 0) return item_id;
+    }
+    return acp.getOptionalObjectString(item, "callId") orelse "";
+}
+
+fn itemHasTerminalStatus(item: std.json.Value) bool {
+    const status = acp.getOptionalObjectString(item, "status") orelse return false;
+    return std.mem.eql(u8, status, "completed") or
+        std.mem.eql(u8, status, "failed") or
+        std.mem.eql(u8, status, "rejected") or
+        std.mem.eql(u8, status, "timedOut") or
+        std.mem.eql(u8, status, "cancelled");
+}
+
+fn isInterruptedConversationItem(item: std.json.Value) bool {
+    const kind = acp.getOptionalObjectString(item, "kind") orelse "";
+    if (containsIgnoreCase(kind, "interrupted")) return true;
+    const title = acp.getOptionalObjectString(item, "title") orelse "";
+    if (containsIgnoreCase(title, "conversation interrupted")) return true;
+    const text = acp.getOptionalObjectString(item, "fallbackText") orelse acp.getOptionalObjectString(item, "text") orelse "";
+    return containsIgnoreCase(text, "tell the model what to do differently");
+}
+
+fn isReminderLikeItem(item: std.json.Value) bool {
+    const fields = [_][]const u8{ "kind", "tool", "title", "label", "role", "agentId", "working_status_label", "workingStatusLabel" };
+    for (fields) |field| {
+        if (acp.getOptionalObjectString(item, field)) |value| {
+            if (containsIgnoreCase(value, "reminder")) return true;
+        }
+    }
+    if (acp.getOptionalObjectString(item, "role")) |role| {
+        if (std.mem.eql(u8, role, "reminder")) return true;
+    }
+    if (acp.getOptionalObjectString(item, "execution_mode") orelse acp.getOptionalObjectString(item, "executionMode")) |mode| {
+        if (std.mem.eql(u8, mode, "background")) return true;
+    }
+    return false;
+}
+
+fn isForegroundWorkItem(item: std.json.Value) bool {
+    if (isReminderLikeItem(item)) return false;
+    const item_kind = acp.getOptionalObjectString(item, "kind") orelse "";
+    return std.mem.eql(u8, item_kind, "toolCall") or
+        std.mem.eql(u8, item_kind, "userShell") or
+        std.mem.eql(u8, item_kind, "subagent") or
+        acp.getOptionalObjectString(item, "tool") != null;
+}
+
+fn noteForegroundWork(
+    allocator: std.mem.Allocator,
+    work: *std.StringHashMapUnmanaged(void),
+    item: std.json.Value,
+    item_completed: bool,
+) !void {
+    if (!isForegroundWorkItem(item)) return;
+    const id = workItemId(item);
+    if (id.len == 0) return;
+    if (item_completed or itemHasTerminalStatus(item)) {
+        if (work.fetchRemove(id)) |entry| allocator.free(entry.key);
+        return;
+    }
+    if (work.contains(id)) return;
+    try work.put(allocator, try allocator.dupe(u8, id), {});
+}
+
 fn emitItemEvent(request: provider_types.SendPromptRequest, item: std.json.Value) void {
+    if (isReminderLikeItem(item) or isInterruptedConversationItem(item)) return;
     const callback = request.on_stream_event orelse return;
     const item_kind = acp.getOptionalObjectString(item, "kind") orelse "";
     if (std.mem.eql(u8, item_kind, "reasoning")) {
@@ -1022,6 +1218,11 @@ fn makeTurnStartRequestAlloc(
     try json.endObject();
     for (images) |image| try writeImagePart(allocator, &json, image);
     try json.endArray();
+    // Default Muse `ifBusy` is `queue`. Reminder children keep the previous
+    // turn "running" after resume, so a follow-up would wait or cancel.
+    // Replace that leftover turn with the user's new prompt.
+    try json.objectField("ifBusy");
+    try json.write("replace");
     if (request.reasoning_effort) |effort| {
         try json.objectField("reasoningEffort");
         try json.write(reasoningEffortName(effort));
@@ -1261,6 +1462,37 @@ test "Muse session start sends allowAll for full-access policy" {
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"approvalMode\":\"allowAll\"") != null);
 }
 
+test "Muse ignores leftover turn completion before start ack" {
+    try std.testing.expect(!eventBelongsToTurn(null, "old-turn"));
+    try std.testing.expect(!eventBelongsToTurn("new-turn", "old-turn"));
+    try std.testing.expect(eventBelongsToTurn("new-turn", "new-turn"));
+    try std.testing.expect(eventBelongsToTurn("new-turn", ""));
+}
+
+test "Muse hides replace-interrupt housekeeping items" {
+    var item = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        \\{"kind":"agentMessage","title":"Conversation interrupted","fallbackText":"Tell the model what to do differently."}
+    ,
+        .{},
+    );
+    defer item.deinit();
+    try std.testing.expect(isInterruptedConversationItem(item.value));
+}
+
+test "Muse turn start replaces a busy leftover turn" {
+    const payload = try makeTurnStartRequestAlloc(
+        std.testing.allocator,
+        5,
+        "01991b47-0000-7000-8000-000000000003",
+        "session-1",
+        .{ .prompt = "hello" },
+    );
+    defer std.testing.allocator.free(payload);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"ifBusy\":\"replace\"") != null);
+}
+
 test "Muse interrupt uses the priority lane" {
     const payload = try makeTurnInterruptRequestAlloc(
         std.testing.allocator,
@@ -1295,9 +1527,83 @@ test "Muse image MIME types fail visibly for unsupported attachments" {
     try std.testing.expect(imageMimeType("notes.txt") == null);
 }
 
+test "Muse opaque reasoning history is detected from provider errors" {
+    try std.testing.expect(isOpaqueReasoningHistory(
+        "provider-private history is incompatible with the active route: reasoning replay `rs_1` has no provider attribution after a provider switch",
+    ));
+    try std.testing.expect(isOpaqueReasoningHistory("start a fresh turn without opaque reasoning history"));
+    try std.testing.expect(!isOpaqueReasoningHistory("session not found"));
+}
+
 test "Muse retry classification stops non-recoverable client failures" {
     try std.testing.expect(isNonRecoverableRetryReason("client"));
     try std.testing.expect(isNonRecoverableRetryReason(" CLIENT "));
     try std.testing.expect(!isNonRecoverableRetryReason("timeout"));
     try std.testing.expect(!isNonRecoverableRetryReason("server"));
+}
+
+test "Muse reminder children do not count as foreground work" {
+    var reminder = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        \\{"kind":"subagent","itemId":"skill-reminder","role":"reminder","label":"plugin:tbh-reminders:skill-reminder reminder","execution_mode":"background"}
+    ,
+        .{},
+    );
+    defer reminder.deinit();
+    try std.testing.expect(!isForegroundWorkItem(reminder.value));
+    try std.testing.expect(isReminderLikeItem(reminder.value));
+
+    var child = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        \\{"kind":"reminderChild","itemId":"child-1","fallbackText":"Reminder child session"}
+    ,
+        .{},
+    );
+    defer child.deinit();
+    try std.testing.expect(isReminderLikeItem(child.value));
+    try std.testing.expect(!isForegroundWorkItem(child.value));
+
+    var shell = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        \\{"kind":"toolCall","itemId":"bash-1","tool":"bash","status":"inProgress"}
+    ,
+        .{},
+    );
+    defer shell.deinit();
+    try std.testing.expect(isForegroundWorkItem(shell.value));
+}
+
+test "Muse GUI turn finishes after the agent message without waiting for EOT gate" {
+    try std.testing.expect(shouldFinishMuseTurn(true, 0));
+    try std.testing.expect(!shouldFinishMuseTurn(true, 1));
+    try std.testing.expect(!shouldFinishMuseTurn(false, 0));
+
+    var work: std.StringHashMapUnmanaged(void) = .empty;
+    defer deinitStringSet(std.testing.allocator, &work);
+    var shell = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        \\{"kind":"toolCall","itemId":"bash-1","tool":"bash","status":"inProgress"}
+    ,
+        .{},
+    );
+    defer shell.deinit();
+    try noteForegroundWork(std.testing.allocator, &work, shell.value, false);
+    try std.testing.expectEqual(@as(usize, 1), work.count());
+    try std.testing.expect(!shouldFinishMuseTurn(true, work.count()));
+
+    var done = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        \\{"kind":"toolCall","itemId":"bash-1","tool":"bash","status":"completed"}
+    ,
+        .{},
+    );
+    defer done.deinit();
+    try noteForegroundWork(std.testing.allocator, &work, done.value, true);
+    try std.testing.expectEqual(@as(usize, 0), work.count());
+    try std.testing.expect(shouldFinishMuseTurn(true, work.count()));
 }
