@@ -79,6 +79,11 @@ fn nowMs() i64 {
     return @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
 }
 
+fn markCurrentWorkspaceDirty(state: *runtime.AppState) void {
+    if (state.project_controller.projects.items.len == 0) return;
+    state.markWorkspaceDirty(state.project_controller.selected_index);
+}
+
 const MAX_WORKSPACE_PANE_HITS = 64;
 const WorkspacePaneAction = enum {
     focus,
@@ -250,12 +255,10 @@ pub fn handleEmptyWorkspaceKeyDown(state: *runtime.AppState, event: *const sdl.K
     switch (event.key) {
         .up, .left => {
             empty_workspace_selected_action = emptyWorkspaceSelectionAfterMove(empty_workspace_selected_action, -1);
-            state.markDirty();
             return true;
         },
         .down, .right => {
             empty_workspace_selected_action = emptyWorkspaceSelectionAfterMove(empty_workspace_selected_action, 1);
-            state.markDirty();
             return true;
         },
         .@"return", .kp_enter => {
@@ -327,7 +330,7 @@ pub fn handlePaletteWheel(state: *runtime.AppState, x: f32, y: f32, wheel_x: f32
         layout.scroll_animation_last_ms = 0;
         layout.scroll_snap_deadline_ms = timestamp + SCROLLING_SNAP_IDLE_MS;
         layout.clearScrollSkipSlide();
-        state.markDirty();
+        markCurrentWorkspaceDirty(state);
     }
     layout.scroll_revealed_pane_id = layout.focused_pane_id;
     layout.scroll_reveal_from_pane_id = null;
@@ -459,7 +462,6 @@ pub fn openFocusedChatPaneContextMenu(state: *runtime.AppState) bool {
         .w = 0.0,
         .h = 0.0,
     };
-    state.markDirty();
     return true;
 }
 
@@ -532,7 +534,7 @@ fn focusPaneNavigationTarget(state: *runtime.AppState, target: runtime.Workspace
         }
     }
     _ = state.focusCurrentProjectWorkspacePane(target);
-    state.markDirty();
+    markCurrentWorkspaceDirty(state);
     return true;
 }
 
@@ -740,7 +742,7 @@ fn growScrollingPaneInDirection(
     if (!layout.setPaneScrollExtent(extent_pane_id, next_css, extent_ratio)) return false;
     // Re-reveal on the next frame so a wider pane is not left clipped.
     layout.scroll_revealed_pane_id = null;
-    state.markDirty();
+    markCurrentWorkspaceDirty(state);
     return true;
 }
 
@@ -792,7 +794,7 @@ pub fn movePaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool {
     const target = findNeighborId(current_id, cur, dir) orelse return false;
     if (!state.swapCurrentProjectWorkspacePanes(current_id, target)) return false;
     _ = state.focusCurrentProjectWorkspacePane(target);
-    state.markDirty();
+    markCurrentWorkspaceDirty(state);
     return true;
 }
 
@@ -1487,10 +1489,9 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32, ctrl_d
     if (pane_drag.pending or pane_drag.active) {
         if (!ctrl_down) {
             cancelPaneDrag();
-            state.markDirty();
             return true;
         }
-        updatePaneDrag(state, x, y);
+        updatePaneDrag(x, y);
         return true;
     }
     if (resize_drag) |hit| {
@@ -1510,7 +1511,6 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32, ctrl_d
         if (!rectContains(entry.rect, x, y)) continue;
         if (state.isCurrentProjectWorkspacePaneFocused(entry.pane_id)) return false;
         _ = state.focusCurrentProjectWorkspacePane(entry.pane_id);
-        state.markDirty();
         if (split_menu_open_for) |id| {
             if (id != entry.pane_id) split_menu_open_for = null;
         }
@@ -1594,13 +1594,12 @@ fn beginPaneDrag(state: *runtime.AppState, x: f32, y: f32, split_placement: bool
         resize_drag = null;
         _ = state.focusCurrentProjectWorkspacePane(entry.pane_id);
         _ = sdl.captureMouse(true);
-        state.markDirty();
         return true;
     }
     return false;
 }
 
-fn updatePaneDrag(state: *runtime.AppState, x: f32, y: f32) void {
+fn updatePaneDrag(x: f32, y: f32) void {
     pane_drag.x = x;
     pane_drag.y = y;
     if (pane_drag.pending) {
@@ -1613,7 +1612,6 @@ fn updatePaneDrag(state: *runtime.AppState, x: f32, y: f32) void {
         }
     }
     if (pane_drag.active) last_pane_drop_target = paneDragTargetAt(pane_drag.pane_id, x, y, pane_drag.split_placement);
-    state.markDirty();
 }
 
 fn finishPaneDrag(state: *runtime.AppState, x: f32, y: f32) bool {
@@ -1627,7 +1625,6 @@ fn finishPaneDrag(state: *runtime.AppState, x: f32, y: f32) bool {
         _ = state.moveCurrentProjectWorkspacePaneToPlacement(drag.pane_id, target.pane_id, target.axis, target.new_after);
     } else if (state.swapCurrentProjectWorkspacePanes(drag.pane_id, target.pane_id)) {
         _ = state.focusCurrentProjectWorkspacePane(target.pane_id);
-        state.markDirty();
     }
     return true;
 }
@@ -1785,7 +1782,7 @@ fn renderScrollingStrip(
                         offset.* = next_target;
                         target.* = next_target;
                         layout.scroll_animation_last_ms = nowMs();
-                        state.markDirty();
+                        markCurrentWorkspaceDirty(state);
                     } else {
                         layout.clearScrollSkipSlide();
                         setScrollingTarget(state, target, &layout.scroll_animation_last_ms, next_target);
@@ -2600,7 +2597,7 @@ fn setScrollingTarget(state: *runtime.AppState, current_target: *f32, animation_
     if (@abs(target - current_target.*) <= 0.001) return;
     current_target.* = target;
     animation_last_ms.* = nowMs();
-    state.markDirty();
+    markCurrentWorkspaceDirty(state);
 }
 
 fn clampScrollingOffsets(offset: *f32, target: *f32, max_offset: f32) void {
@@ -2812,7 +2809,7 @@ fn updateResizeDrag(state: *runtime.AppState, hit: WorkspacePaneHit, x: f32, y: 
                 layout.scroll_target_y = next_scroll;
             }
         }
-        state.markDirty();
+        markCurrentWorkspaceDirty(state);
         return;
     }
     const ratio = if (hit.axis == .vertical)

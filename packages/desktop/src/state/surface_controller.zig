@@ -247,7 +247,10 @@ pub fn updateSurface(self: anytype, update: SurfaceUpdate) !*SurfaceState {
             }
         }
     }
-    self.markDirty();
+    // Durable lifecycle state was committed by the targeted surface mutation
+    // above. Transient updates are intentionally memory-only. Marking the
+    // compatibility projection dirty here made every provider heartbeat queue
+    // a full state.snapshot.replace after its surface.upsert.
     return s;
 }
 

@@ -1886,15 +1886,12 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             state.prefix_swallow_text_input = false;
             if (event.key.scancode == .lalt or event.key.scancode == .ralt) {
                 state.alt_shortcut_hints_visible = true;
-                state.markDirty();
             }
             if (event.key.scancode == .lctrl or event.key.scancode == .rctrl) {
                 state.ctrl_shortcut_hints_visible = true;
-                state.markDirty();
             }
             if (event.key.scancode == .lshift or event.key.scancode == .rshift) {
                 state.shift_shortcut_hints_visible = true;
-                state.markDirty();
             }
             if (browserInputDebugEnabled()) {
                 log.info(
@@ -2166,15 +2163,12 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
         .key_up => {
             if (event.key.scancode == .lalt or event.key.scancode == .ralt) {
                 state.alt_shortcut_hints_visible = false;
-                state.markDirty();
             }
             if (event.key.scancode == .lctrl or event.key.scancode == .rctrl) {
                 state.ctrl_shortcut_hints_visible = false;
-                state.markDirty();
             }
             if (event.key.scancode == .lshift or event.key.scancode == .rshift) {
                 state.shift_shortcut_hints_visible = false;
-                state.markDirty();
             }
             if (browserInputDebugEnabled()) {
                 log.info(

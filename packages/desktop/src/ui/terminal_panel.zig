@@ -446,7 +446,6 @@ pub fn handlePaletteMouseMotion(state: *app_state.AppState, x: f32, y: f32, butt
     if (!selection_state.active and selectionDragDistanceExceeded(x, y)) {
         selection_state.active = true;
     }
-    state.markDirty();
     return true;
 }
 
@@ -490,12 +489,10 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, butt
             if (!hit.enabled or !rectContains(hit.rect, x, y)) continue;
             performContextMenuAction(state, dock, hit.action);
             hit_cache.menu_open = false;
-            state.markDirty();
             return true;
         }
         if (!rectContains(hit_cache.menu_panel, x, y)) {
             hit_cache.menu_open = false;
-            state.markDirty();
             return true;
         }
         return true;
@@ -507,7 +504,6 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, butt
             _ = updateSelectionFocus(state, x, y);
             selection_state.dragging = false;
             if (!selection_state.moved) selection_state.active = false;
-            state.markDirty();
             return true;
         }
     }
@@ -519,7 +515,7 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, butt
             var dock = state.currentProjectTerminalDockMutable(target.dock_id) orelse return false;
             dock.selectTab(target.index);
             focusTerminal(state);
-            if (dock.consumeWorkspaceChange()) state.markDirty();
+            if (dock.consumeWorkspaceChange()) markCurrentWorkspaceDirty(state);
             hit_cache.menu_open = false;
             return true;
         }
@@ -534,7 +530,7 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, butt
             dock.focusPane(target.pane_id);
             focusTerminal(state);
             clearSelection();
-            if (dock.consumeWorkspaceChange()) state.markDirty();
+            if (dock.consumeWorkspaceChange()) markCurrentWorkspaceDirty(state);
             hit_cache.menu_open = false;
             return true;
         }
@@ -548,7 +544,7 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, butt
             dock.selectTab(target.index);
             focusTerminal(state);
             openContextMenu(.tab, target.index, 0, x, y);
-            if (dock.consumeWorkspaceChange()) state.markDirty();
+            if (dock.consumeWorkspaceChange()) markCurrentWorkspaceDirty(state);
             return true;
         }
         if (paneAtPoint(x, y)) |target| {
@@ -561,7 +557,7 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, butt
             focusTerminal(state);
             if (!selectionAffectsPane(target.dock_id, target.pane_id)) clearSelection();
             openContextMenu(.pane, 0, target.pane_id, x, y);
-            if (dock.consumeWorkspaceChange()) state.markDirty();
+            if (dock.consumeWorkspaceChange()) markCurrentWorkspaceDirty(state);
             return true;
         }
     }
@@ -582,8 +578,7 @@ fn routeTerminalMouseButton(state: *app_state.AppState, x: f32, y: f32, button: 
     }
     clearSelection();
     hit_cache.menu_open = false;
-    if (dock.consumeWorkspaceChange()) state.markDirty();
-    state.markDirty();
+    if (dock.consumeWorkspaceChange()) markCurrentWorkspaceDirty(state);
     return true;
 }
 
@@ -599,8 +594,7 @@ fn rightClickSelectedPane(state: *app_state.AppState, x: f32, y: f32, down: bool
     }
     focusTerminal(state);
     openContextMenu(.pane, 0, target.pane_id, x, y);
-    if (dock.consumeWorkspaceChange()) state.markDirty();
-    state.markDirty();
+    if (dock.consumeWorkspaceChange()) markCurrentWorkspaceDirty(state);
     return true;
 }
 
@@ -612,10 +606,8 @@ pub fn handlePaletteWheel(state: *app_state.AppState, x: f32, y: f32, wheel_y: f
         dock.focusPane(target.pane_id);
         focusTerminal(state);
         hit_cache.menu_open = false;
-        if (dock.handleWheel(state.allocator, target.pane_id, wheel_y, x - target.rect.x, y - target.rect.y, target.rect.w, target.rect.h)) {
-            state.markDirty();
-        }
-        if (dock.consumeWorkspaceChange()) state.markDirty();
+        _ = dock.handleWheel(state.allocator, target.pane_id, wheel_y, x - target.rect.x, y - target.rect.y, target.rect.w, target.rect.h);
+        if (dock.consumeWorkspaceChange()) markCurrentWorkspaceDirty(state);
         return true;
     }
     return false;
@@ -1310,7 +1302,7 @@ fn performContextMenuAction(state: *app_state.AppState, dock: anytype, action: T
         },
     }
     if (focus_menu_dock_after) focusTerminal(state);
-    if (!uses_workspace_pane_action and dock.consumeWorkspaceChange()) state.markDirty();
+    if (!uses_workspace_pane_action and dock.consumeWorkspaceChange()) markCurrentWorkspaceDirty(state);
 }
 
 fn workspacePaneIdForDock(state: *const app_state.AppState, dock_id: u32) ?app_state.WorkspacePaneId {
@@ -1327,6 +1319,11 @@ fn workspacePaneIdForDock(state: *const app_state.AppState, dock_id: u32) ?app_s
 
 fn focusTerminal(state: *app_state.AppState) void {
     state.requestTerminalDockFocus(if (hit_cache.menu_open) hit_cache.menu_dock_id else hit_cache.dock_id);
+}
+
+fn markCurrentWorkspaceDirty(state: *app_state.AppState) void {
+    if (state.project_controller.projects.items.len == 0) return;
+    state.markWorkspaceDirty(state.project_controller.selected_index);
 }
 
 fn beginPendingLinkClick(state: *app_state.AppState, x: f32, y: f32) bool {
@@ -1362,8 +1359,7 @@ fn beginPendingLinkClick(state: *app_state.AppState, x: f32, y: f32) bool {
     };
     @memcpy(pending_link_click.href[0..href.len], href);
     hit_cache.menu_open = false;
-    if (mutable_dock.consumeWorkspaceChange()) state.markDirty();
-    state.markDirty();
+    if (mutable_dock.consumeWorkspaceChange()) markCurrentWorkspaceDirty(state);
     return true;
 }
 
@@ -1377,7 +1373,6 @@ fn finishPendingLinkClick(state: *app_state.AppState, x: f32, y: f32) bool {
     if (coord.x != click.coord.x or coord.y != click.coord.y) return true;
 
     state.openConfiguredTerminalWebLink(click.value());
-    state.markDirty();
     return true;
 }
 
@@ -1522,8 +1517,7 @@ fn beginSelectionCandidate(state: *app_state.AppState, x: f32, y: f32) bool {
         .focus = coord,
     };
     hit_cache.menu_open = false;
-    if (dock.consumeWorkspaceChange()) state.markDirty();
-    state.markDirty();
+    if (dock.consumeWorkspaceChange()) markCurrentWorkspaceDirty(state);
     return true;
 }
 
