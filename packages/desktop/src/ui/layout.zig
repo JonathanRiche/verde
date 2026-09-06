@@ -233,6 +233,8 @@ const NOTICE_TOAST_PAD_X_UI: f32 = 14.0;
 const NOTICE_TOAST_PAD_Y_UI: f32 = 8.0;
 const NOTICE_TOAST_MARGIN_UI: f32 = 18.0;
 const NOTICE_TOAST_RISE_UI: f32 = 10.0;
+const NOTICE_TOAST_MAX_W_UI: f32 = 560.0;
+const NOTICE_TOAST_MAX_LINES: f32 = 4.0;
 
 fn renderNoticeToast(state: *runtime.AppState, workspace: palette.Rect) void {
     const toast = state.noticeToast() orelse return;
@@ -241,13 +243,20 @@ fn renderNoticeToast(state: *runtime.AppState, workspace: palette.Rect) void {
     const text_h = font_size * 1.25;
     const pad_x = theme.scaledUi(NOTICE_TOAST_PAD_X_UI);
     const pad_y = theme.scaledUi(NOTICE_TOAST_PAD_Y_UI);
-    const max_w = @max(workspace.w - theme.scaledUi(32.0), theme.scaledUi(80.0));
-    // Measure on the GPU text path (same shaping as the drawn glyphs) with a
-    // little slack; the plain ttf measure came up short and clipped the tail.
+    const max_w = @min(@max(workspace.w - theme.scaledUi(32.0), theme.scaledUi(80.0)), theme.scaledUi(NOTICE_TOAST_MAX_W_UI));
+    const avail_w = max_w - pad_x * 2.0;
+    // Measure with the `.ui` role and draw with the same role below; the
+    // untyped overlay text path falls back to the prose face, which is wider
+    // than the UI face and clipped the tail of longer notices.
     const measured_w = runtime.paletteUiTextPrefixWidth(toast.text, font_size, toast.text.len) + font_size * 0.35;
-    const text_w = @min(measured_w, max_w - pad_x * 2.0);
+    // Long notices wrap onto extra lines (word wrap in the text engine) and
+    // the pill grows with them rather than clipping. Line count is estimated
+    // from the flat width with one line of headroom for ragged breaks.
+    const wrap = measured_w > avail_w;
+    const lines: f32 = if (wrap) @min(@ceil(measured_w / avail_w) + 1.0, NOTICE_TOAST_MAX_LINES) else 1.0;
+    const text_w = if (wrap) avail_w else measured_w;
     const pill_w = text_w + pad_x * 2.0;
-    const pill_h = text_h + pad_y * 2.0;
+    const pill_h = text_h * lines + pad_y * 2.0;
     // Keep clear of the prefix status bar when a chord is armed.
     const bottom_reserve = if (state.prefix_armed or state.prefix_navigate) prefixBarHeight() else 0.0;
     const settled_y = workspace.y + workspace.h - bottom_reserve - theme.scaledUi(NOTICE_TOAST_MARGIN_UI) - pill_h;
@@ -268,12 +277,14 @@ fn renderNoticeToast(state: *runtime.AppState, workspace: palette.Rect) void {
     fg.a *= alpha;
     // Rounded shell as two anti-aliased fills (border colour under an inset
     // fill) instead of a stroked border, which aliases on a pill radius.
-    const radius = pill_h * 0.5;
+    // A multi-line card keeps a single-line pill's corner radius instead of
+    // turning into a stadium.
+    const radius = (text_h + pad_y * 2.0) * 0.5;
     const inset = theme.scaledUi(1.0);
     queuePaletteRoundedRect(state, pill, border, radius);
     queuePaletteRoundedRect(state, .{ .x = pill.x + inset, .y = pill.y + inset, .w = pill.w - inset * 2.0, .h = pill.h - inset * 2.0 }, bg, radius - inset);
-    const text_rect: palette.Rect = .{ .x = pill.x + pad_x, .y = pill.y + pad_y, .w = text_w, .h = text_h };
-    queuePaletteText(state, text_rect, toast.text, fg, font_size, pill);
+    const text_rect: palette.Rect = .{ .x = pill.x + pad_x, .y = pill.y + pad_y, .w = text_w, .h = text_h * lines };
+    queuePaletteRoleText(state, text_rect, toast.text, fg, font_size, .ui, pill, wrap);
 }
 
 // Which-key overlay: while a tmux-style prefix chord is armed, a bottom-anchored
@@ -539,6 +550,33 @@ fn queuePaletteText(state: *runtime.AppState, rect: palette.Rect, value: []const
         font_size * 0.55,
         font_size * 1.25,
         false,
+    ) catch |err| {
+        runtime.log.warn("failed to queue layout palette text: {s}", .{@errorName(err)});
+    };
+}
+
+/// Overlay text drawn with an explicit font role so callers that measured
+/// with that role (see `runtime.paletteUiTextPrefixWidth`) get matching
+/// glyph advances; `queuePaletteText` leaves the role unset and the renderer
+/// then falls back to its default (prose) face.
+fn queuePaletteRoleText(state: *runtime.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, font_role: palette.FontRole, clip: ?palette.Rect, wrap: bool) void {
+    const stable_value = stablePaletteText(state, value) catch |err| {
+        runtime.log.warn("failed to retain layout palette text: {s}", .{@errorName(err)});
+        return;
+    };
+    state.palette_overlay_batch.fixedRoleText(
+        state.allocator,
+        rect,
+        stable_value,
+        color,
+        font_size,
+        font_role,
+        null,
+        clip,
+        .{},
+        font_size * 0.55,
+        font_size * 1.25,
+        wrap,
     ) catch |err| {
         runtime.log.warn("failed to queue layout palette text: {s}", .{@errorName(err)});
     };
