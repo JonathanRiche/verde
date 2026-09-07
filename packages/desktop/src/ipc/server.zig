@@ -17,7 +17,7 @@ const platform_runtime = @import("platform_runtime");
 const provider_types = @import("../providers/types.zig");
 const terminal = @import("../terminal/terminal.zig");
 const workspace_process_poll = @import("../cli/workspace_process_poll.zig");
-const test_backend = if (builtin.is_test) @import("root").test_backend else struct {};
+const test_backend = if (builtin.is_test) @import("desktop_test_root").test_backend else struct {};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const SOCKET_NAME = live_endpoint.SOCKET_NAME;
