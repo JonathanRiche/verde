@@ -220,7 +220,7 @@ any provider/model row to add or remove it; provider tabs continue to show the
 full model list for that provider.
 
 The workspace pencil button creates and focuses a new chat pane. With prefix
-mode enabled, `Ctrl+B`, then `t` performs the same action. Set
+mode enabled, `Ctrl+B`, then `c` adds a new tab (chat by default). Set
 `chat.new_pane_behavior` to `replace_pane`, or choose **Replace chat pane**
 under **Settings → Workspace → New chat action**, to reuse an existing visible
 chat pane instead.

@@ -176,7 +176,8 @@ const paletteRows = [
 
 const keybinds = [
   { combo: 'Ctrl+Shift+P', desc: 'Command palette — threads, panes, workspaces' },
-  { combo: 'Ctrl+B, then T', desc: 'New chat thread (prefix mode)' },
+  { combo: 'Ctrl+B, then T', desc: 'New terminal tab (prefix mode)' },
+  { combo: 'Ctrl+B, then C', desc: 'New chat tab (prefix mode)' },
   { combo: 'Ctrl+B, then Shift+T', desc: 'New standalone terminal pane (prefix mode)' },
   { combo: 'Ctrl+Shift+B', desc: 'Toggle the embedded browser pane' },
   { combo: 'Ctrl+H / J / K / L', desc: 'Move focus across panes (and the scrolling strip)' },

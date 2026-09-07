@@ -112,7 +112,7 @@ describe('verde.json JSON Schema', () => {
   })
 
   test('lists every named prefix action from keybinds.zig', () => {
-    expect(PREFIX_ACTION_NAMES).toHaveLength(68)
+    expect(PREFIX_ACTION_NAMES).toHaveLength(69)
     expect(new Set(PREFIX_ACTION_NAMES).size).toBe(PREFIX_ACTION_NAMES.length)
 
     const keybinds = child(verdeConfigSchema, 'keybinds')
