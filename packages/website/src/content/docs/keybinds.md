@@ -92,7 +92,8 @@ between workspaces (see the sidebar table above).
 ### Workspace splits
 
 Workspace splits have no direct default keybinds. With prefix mode enabled,
-`Ctrl+B`, then `t` creates a new chat and `Ctrl+B`, then `Shift+T` creates a
+`Ctrl+B`, then `c` adds a new tab (chat by default) and `Ctrl+B`, then `t`
+adds a terminal tab in the same place. `Ctrl+B`, then `Shift+T` creates a
 separate top-level terminal pane. The `v` and `-` prefix chords create tiled
 splits of the configured default pane type (chat or terminal);
 `Shift+V` and `Shift+-` create the other type.
@@ -217,7 +218,7 @@ The table is overridable exactly like `bindings`, under `"navigate"`:
 | `?`                              | `prefix.keybinds` (cheat sheet, stays armed)      |
 | `w`                              | `prefix.navigate` (one-shot workspace menu)        |
 | `p`                              | `command_palette`                                 |
-| `t` / `Shift+T`                  | `new_thread` / `new_terminal`                       |
+| `t` / `Shift+T`                  | `workspace.add_tab_terminal` / `new_terminal`       |
 | `r`                              | `refresh`                                         |
 | `o` / `e`                        | `open` / `open_editor`                            |
 | `Space`                          | `companion`                                       |
@@ -228,7 +229,7 @@ The table is overridable exactly like `bindings`, under `"navigate"`:
 | `x` / `Shift+X`                  | `workspace.close` / `workspace.close_current`     |
 | `z`                              | `workspace.toggle_maximize`                       |
 | `i`                              | `workspace.focus_prompt`                          |
-| `c`                              | `workspace.add_tab` (new tab at the end of the strip) |
+| `c`                              | `workspace.add_tab` (new tab at the end of the strip; chat by default) |
 | `a`                              | `workspace.add` (new workspace)                    |
 | `Shift+C`                        | `workspace.split_chat_horizontal`                  |
 | `v` / `-`                        | Default pane split, vertical / horizontal          |
@@ -257,12 +258,13 @@ exactly like their direct shortcuts.
 ### Prefix action names
 
 Action names mirror the remapping keys below, joined with `.` for nested
-groups: `refresh`, `open`, `open_editor`, `new_thread`, `new_terminal`, `workspace.add`, `workspace.add_tab`, `command_palette`,
+groups: `refresh`, `open`, `open_editor`, `new_thread`, `new_terminal`, `workspace.add`, `workspace.add_tab`, `workspace.add_tab_terminal`, `command_palette`,
 `companion`, `sidebar`, `sidebar_hidden`, `browser`, `chat_up`, `chat_down`,
 `chat_page_up`, `chat_page_down`, `chat.model_picker`, `chat.run_config`, `chat.directory_picker`,
 `terminal.toggle`, `prefix.keybinds`, `prefix.navigate`, and `terminal.<key>`
 for every terminal binding. The dynamic split names are `workspace.split_default_*`
-and `workspace.split_alternate_*`, alongside every `workspace.<key>`. Positional actions take a
+and `workspace.split_alternate_*`, alongside every `workspace.<key>` including
+`workspace.add_tab_terminal`. Positional actions take a
 1-based ordinal: `workspace.select.N`, `workspace.pane_select.N`,
 `workspace.active_select.N`.
 

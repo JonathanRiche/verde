@@ -14,6 +14,7 @@ pub const NativeKeyboardAction = enum {
     new_thread,
     add_workspace,
     add_workspace_tab,
+    add_workspace_tab_terminal,
     command_palette,
     settings,
     companion,
@@ -1315,6 +1316,7 @@ const PREFIX_ACTION_NAMES = [_]PrefixActionName{
     .{ .name = "new_thread", .target = .{ .app = .new_thread } },
     .{ .name = "workspace.add", .target = .{ .app = .add_workspace } },
     .{ .name = "workspace.add_tab", .target = .{ .app = .add_workspace_tab } },
+    .{ .name = "workspace.add_tab_terminal", .target = .{ .app = .add_workspace_tab_terminal } },
     .{ .name = "new_terminal", .target = .new_terminal },
     .{ .name = "command_palette", .target = .{ .app = .command_palette } },
     .{ .name = "settings", .target = .{ .app = .settings } },
@@ -1403,6 +1405,7 @@ pub fn prefixTargetLabel(buf: []u8, target: PrefixTarget) []const u8 {
             .new_thread => "New thread",
             .add_workspace => "Add workspace",
             .add_workspace_tab => "New tab",
+            .add_workspace_tab_terminal => "Terminal tab",
             .command_palette => "Command palette",
             .settings => "Settings",
             .companion => "Companion",
@@ -1558,7 +1561,8 @@ const DEFAULT_PREFIX_TABLE = [_]DefaultPrefixEntry{
     .{ .accelerator = "W", .target = "prefix.navigate" },
     // App
     .{ .accelerator = "P", .target = "command_palette" },
-    .{ .accelerator = "T", .target = "new_thread" },
+    // `t` matches `c` (new tab at the end of the strip) but always a terminal.
+    .{ .accelerator = "T", .target = "workspace.add_tab_terminal" },
     .{ .accelerator = "Shift+T", .target = "new_terminal" },
     .{ .accelerator = "R", .target = "refresh" },
     .{ .accelerator = "O", .target = "open" },
@@ -3130,6 +3134,7 @@ test "default prefix table covers every app terminal and chat action" {
             .workspace_split_terminal_vertical,
             .workspace_split_terminal_horizontal,
             .settings,
+            .new_thread,
             => true,
             else => false,
         };
@@ -3198,21 +3203,21 @@ test "default prefix shift digits jump to ACTIVE rows" {
     try std.testing.expect(!saw_workspace_shift);
 }
 
-test "default prefix t chords create chat and terminal panes" {
+test "default prefix t chords create terminal tabs and split panes" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
 
-    var chat = false;
-    var terminal = false;
+    var terminal_tab = false;
+    var terminal_split = false;
     for (config.prefix.bindings.items) |binding| {
         if (binding.key.eql(.{ .key = .t })) {
-            chat = binding.target == .app and binding.target.app == .new_thread;
+            terminal_tab = binding.target == .app and binding.target.app == .add_workspace_tab_terminal;
         }
         if (binding.key.eql(.{ .shift = true, .key = .t })) {
-            terminal = binding.target == .new_terminal;
+            terminal_split = binding.target == .new_terminal;
         }
     }
-    try std.testing.expect(chat and terminal);
+    try std.testing.expect(terminal_tab and terminal_split);
 }
 
 test "default prefix c adds a workspace tab and a opens the workspace creator" {
@@ -3359,6 +3364,7 @@ test "prefix defaults false drops the built-in table" {
 
 test "prefix action names resolve positional ordinals" {
     try std.testing.expect(parsePrefixActionName("new_terminal").? == .new_terminal);
+    try std.testing.expectEqual(NativeKeyboardAction.add_workspace_tab_terminal, parsePrefixActionName("workspace.add_tab_terminal").?.app);
     try std.testing.expectEqual(@as(usize, 0), parsePrefixActionName("workspace.pane_select.1").?.pane_select);
     try std.testing.expectEqual(@as(usize, 9), parsePrefixActionName("Workspace.Active_Select.10").?.active_select);
     try std.testing.expect(parsePrefixActionName("workspace.select.0") == null);

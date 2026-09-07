@@ -96,11 +96,12 @@ for (let index = 0; index <= 9; index += 1) {
 
 const DEFAULT_PREFIX_ROWS: Array<[string, string]> = [
   ['Shift+Slash', 'prefix.keybinds'], ['W', 'prefix.navigate'],
-  ['P', 'command_palette'], ['T', 'new_thread'], ['Shift+T', 'new_terminal'], ['R', 'refresh'], ['O', 'open'],
+  ['P', 'command_palette'], ['T', 'workspace.add_tab_terminal'], ['Shift+T', 'new_terminal'], ['R', 'refresh'], ['O', 'open'],
   ['E', 'open_editor'], ['Space', 'companion'], ['S', 'sidebar'], ['Shift+S', 'sidebar_hidden'],
   ['B', 'browser'], ['Grave', 'terminal.toggle'], ['Q', 'workspace.toggle_quick_pane'],
   ['X', 'workspace.close'], ['Shift+X', 'workspace.close_current'], ['Z', 'workspace.toggle_maximize'],
-  ['I', 'workspace.focus_prompt'], ['C', 'workspace.add'],
+  ['I', 'workspace.focus_prompt'], ['C', 'workspace.add_tab'],
+  ['A', 'workspace.add'],
   ['Shift+C', 'workspace.split_chat_horizontal'], ['V', 'workspace.split_default_vertical'],
   ['Minus', 'workspace.split_default_horizontal'], ['Shift+V', 'workspace.split_alternate_vertical'],
   ['Shift+Minus', 'workspace.split_alternate_horizontal'],
@@ -363,7 +364,8 @@ export function prefixTargetLabel(target: PrefixTarget): string {
   return ({
     'prefix.keybinds': 'Keybinds', 'prefix.navigate': 'Workspace nav', command_palette: 'Command palette',
     new_thread: 'New thread', sidebar: 'Sidebar', sidebar_hidden: 'Hide sidebar',
-    'workspace.add': 'Add workspace', 'workspace.close': 'Close pane', 'workspace.close_current': 'Close workspace',
+    'workspace.add': 'Add workspace', 'workspace.add_tab': 'New tab', 'workspace.add_tab_terminal': 'Terminal tab',
+    'workspace.close': 'Close pane', 'workspace.close_current': 'Close workspace',
     'workspace.toggle_maximize': 'Zoom pane', 'workspace.focus_prompt': 'Focus prompt',
     'workspace.split_chat_vertical': 'Chat split |', 'workspace.split_chat_horizontal': 'Chat split -',
     'workspace.split_terminal_vertical': 'Term split |', 'workspace.split_terminal_horizontal': 'Term split -',

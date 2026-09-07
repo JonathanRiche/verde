@@ -13,9 +13,10 @@ describe('parseWebKeybindConfig', () => {
     const config = parseWebKeybindConfig({ keybinds: { prefix: true } })
     const target = (label) => config.prefix.bindings.find((row) => row.key.label === label)?.target
 
-    expect(target('T')).toEqual({ action: 'new_thread' })
+    expect(target('T')).toEqual({ action: 'workspace.add_tab_terminal' })
     expect(target('Shift+T')).toEqual({ action: 'new_terminal' })
-    expect(target('C')).toEqual({ action: 'workspace.add' })
+    expect(target('C')).toEqual({ action: 'workspace.add_tab' })
+    expect(target('A')).toEqual({ action: 'workspace.add' })
     expect(target('Shift+C')).toEqual({ action: 'workspace.split_chat_horizontal' })
     expect(target('V')).toEqual({ action: 'workspace.split_default_vertical' })
     expect(target('Minus')).toEqual({ action: 'workspace.split_default_horizontal' })

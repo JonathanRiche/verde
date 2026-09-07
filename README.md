@@ -126,9 +126,9 @@ verde
 ```
 
 1. **Import a project** — sidebar `+` or right-click the rail. Threads and agents run against that workspace root.
-2. **New chat** — click the workspace pencil, or enable prefix mode and press `Ctrl+B`, then `t`. Pick provider + model, set run permissions, send a prompt.
+2. **New chat** — click the workspace pencil, or enable prefix mode and press `Ctrl+B`, then `c`. Pick provider + model, set run permissions, send a prompt.
 3. **Tile a browser** — `Ctrl+Shift+B` (native webview: WPE / WKWebView / WebView2).
-4. **New terminal pane** — with prefix mode enabled, press `Ctrl+B`, then `Shift+T`. Open Codex/Claude/Grok TUIs from the palette or `verde live agent open`.
+4. **New terminal tab** — with prefix mode enabled, press `Ctrl+B`, then `t`. `Shift+T` still opens a standalone terminal pane beside the focused one. Open Codex/Claude/Grok TUIs from the palette or `verde live agent open`.
 5. **Command palette** — `Ctrl+Shift+P` jumps to threads, panes, workspaces, and app commands.
 
 If no GUI provider is ready, Verde shows a **Connect an AI provider** screen so you can finish setup without guessing.
@@ -237,7 +237,8 @@ verde theme import https://verdeai.dev/themes/tokyo-night.json
 | Key | Action |
 | --- | --- |
 | `Ctrl+Shift+P` | Command palette |
-| `Ctrl+B`, then `t` | New chat thread (prefix mode) |
+| `Ctrl+B`, then `c` | New chat tab (prefix mode) |
+| `Ctrl+B`, then `t` | New terminal tab (prefix mode) |
 | `Ctrl+B`, then `Shift+T` | New standalone terminal pane (prefix mode) |
 | `Ctrl+Shift+B` | Toggle browser pane |
 | `Ctrl+Arrow` | Focus panes; `Ctrl+H/J/K/L` remain available as optional `verde.json` bindings |

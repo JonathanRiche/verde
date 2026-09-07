@@ -3265,7 +3265,9 @@ function createAppStore() {
       return
     }
     const simple: Partial<Record<string, KeyAction>> = {
-      command_palette: 'command_palette', new_thread: 'new_thread', sidebar: 'toggle_sidebar',
+      command_palette: 'command_palette', new_thread: 'new_thread', new_terminal: 'new_terminal',
+      'workspace.add_tab': 'new_thread', 'workspace.add_tab_terminal': 'new_terminal',
+      sidebar: 'toggle_sidebar',
       sidebar_hidden: 'toggle_sidebar_hidden', 'workspace.close': 'close_pane',
       'workspace.toggle_maximize': 'maximize', 'workspace.focus_prompt': 'focus_prompt',
       'workspace.previous': 'workspace_previous', 'workspace.next': 'workspace_next',

@@ -21,9 +21,10 @@ launches.
 ## Splitting panes
 
 Splits come from the prefix table and the pane header buttons. With prefix mode
-enabled, `Ctrl+B`, then `t` starts a new chat thread, while `Ctrl+B`, then
-`Shift+T` creates a separate top-level terminal pane. Use `v`, `-`, `Shift+V`,
-or `Shift+-` when you want a tiled split inside the focused scrolling item.
+enabled, `Ctrl+B`, then `c` adds a new tab (chat by default) and `Ctrl+B`,
+then `t` adds a terminal tab in the same place. `Ctrl+B`, then `Shift+T`
+creates a separate top-level terminal pane. Use `v`, `-`, `Shift+V`, or
+`Shift+-` when you want a tiled split inside the focused scrolling item.
 
 With prefix mode enabled, `Ctrl+B`, then `v` creates a vertical split of the
 configured default pane type (chat or terminal) inside the focused pane;

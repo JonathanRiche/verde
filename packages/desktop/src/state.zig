@@ -7234,12 +7234,13 @@ pub const AppState = struct {
     }
 
     /// Opens a new workspace tab for the "+" affordance in the tab strip, the
-    /// prefix `workspace.add_tab` chord, and the `tab.add` IPC command. `kind`
-    /// null follows the user's `ui.workspace_new_tab_pane` preference (chat
-    /// unless configured otherwise). Like Herdr, the new tab always lands at
-    /// the end of the strip: only these entry points move the created pane
-    /// past the focused one, so ordinary splits keep opening beside their
-    /// origin. An empty workspace seeds its first chat instead.
+    /// prefix `workspace.add_tab` / `workspace.add_tab_terminal` chords, and
+    /// the `tab.add` IPC command. `kind` null follows the user's
+    /// `ui.workspace_new_tab_pane` preference (chat unless configured
+    /// otherwise). Like Herdr, the new tab always lands at the end of the
+    /// strip: only these entry points move the created pane past the focused
+    /// one, so ordinary splits keep opening beside their origin. An empty
+    /// workspace seeds its first chat instead.
     pub fn addWorkspaceTab(self: *AppState, index: usize, kind: ?app_config.WorkspaceSplitDefaultPane) void {
         if (index >= self.project_controller.projects.items.len) return;
         self.project_controller.selected_index = index;
