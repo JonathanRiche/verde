@@ -10,6 +10,7 @@ const chat_threads = @import("../chat/threads.zig");
 const db_types = @import("../db/types.zig");
 const notifier = @import("../app/notifier.zig");
 const runtime_log = @import("../runtime/log.zig");
+const zig_markdown = @import("zig_markdown");
 const RuntimeService = @import("../runtime/service.zig");
 const daemon_client = @import("../daemon/client.zig");
 const session_protocol = @import("headless").session_protocol;
@@ -6608,6 +6609,16 @@ pub fn parseToolCallStatus(value: []const u8) provider_types.ToolCallStatus {
 fn resetStreamRevealLocked(send_state: *SendState) void {
     send_state.reveal_len = 0;
     send_state.reveal_last_ms = 0;
+    send_state.reveal_hold = 0;
+}
+
+/// Refresh the hold-back for the revealed prefix. Linear in the revealed
+/// text (a newline scan plus the last few lines); runs only when the reveal
+/// moved, so idle frames never pay for it.
+fn refreshStreamRevealHoldLocked(send_state: *SendState) void {
+    const text = send_state.partial_text.items;
+    const revealed = @min(send_state.reveal_len, text.len);
+    send_state.reveal_hold = zig_markdown.streamingHoldLength(text[0..revealed]);
 }
 
 /// Next reveal length: a fraction of the backlog per elapsed time with a
@@ -6637,17 +6648,37 @@ fn advanceStreamRevealLocked(send_state: *SendState, now_ms: i64, tau_ms: f32) b
     if (send_state.local_command) {
         const changed = send_state.reveal_len != text.len;
         send_state.reveal_len = text.len;
+        send_state.reveal_hold = 0;
         return changed;
     }
     // Text flushed into a timeline row mid-turn: restart from the new tail.
-    if (send_state.reveal_len > text.len) send_state.reveal_len = text.len;
+    if (send_state.reveal_len > text.len) {
+        send_state.reveal_len = text.len;
+        refreshStreamRevealHoldLocked(send_state);
+    }
     const dt_ms: i64 = if (send_state.reveal_last_ms == 0) DAEMON_CHAT_POLL_INTERVAL_MS else now_ms - send_state.reveal_last_ms;
     send_state.reveal_last_ms = now_ms;
     if (send_state.reveal_len == text.len) return false;
     const next = utf8BoundaryAtOrAfter(text, streamRevealStep(send_state.reveal_len, text.len, dt_ms, tau_ms));
     if (next == send_state.reveal_len) return false;
     send_state.reveal_len = next;
+    refreshStreamRevealHoldLocked(send_state);
     return true;
+}
+
+test "stream reveal holds an unfinished table header until its delimiter row lands" {
+    var send_state: SendState = .{};
+    defer send_state.partial_text.deinit(std.heap.page_allocator);
+    try send_state.partial_text.appendSlice(std.heap.page_allocator, "Totals:\n| a | b |");
+    send_state.reveal_len = send_state.partial_text.items.len - 1;
+    _ = advanceStreamRevealLocked(&send_state, 1000, 140.0);
+    try std.testing.expectEqualStrings("Totals:\n", send_state.streamRevealedText());
+    try send_state.partial_text.appendSlice(std.heap.page_allocator, "\n|---|---|\n");
+    send_state.reveal_len = send_state.partial_text.items.len - 1;
+    _ = advanceStreamRevealLocked(&send_state, 1016, 140.0);
+    try std.testing.expectEqualStrings(send_state.partial_text.items, send_state.streamRevealedText());
+    resetStreamRevealLocked(&send_state);
+    try std.testing.expectEqual(@as(usize, 0), send_state.reveal_hold);
 }
 
 /// Continuous-frame signal: the current thread still has streamed text to

@@ -25,7 +25,7 @@ const Line = struct {
     text: []const u8,
 };
 
-const FenceOpen = struct {
+pub const FenceOpen = struct {
     fence: model.Fence,
     info: []const u8,
 };
@@ -500,7 +500,7 @@ pub fn fenceLanguage(info: []const u8) ?[]const u8 {
     return tokens.next();
 }
 
-fn parseOpeningFence(line: []const u8) ?FenceOpen {
+pub fn parseOpeningFence(line: []const u8) ?FenceOpen {
     const stripped = trimMarkdownIndent(line) orelse return null;
     if (stripped.len < 3) return null;
 
@@ -521,7 +521,7 @@ fn parseOpeningFence(line: []const u8) ?FenceOpen {
     };
 }
 
-fn isClosingFence(line: []const u8, fence: model.Fence) bool {
+pub fn isClosingFence(line: []const u8, fence: model.Fence) bool {
     const stripped = trimMarkdownIndent(line) orelse return false;
     if (stripped.len < fence.length) return false;
     if (stripped[0] != fence.marker) return false;
@@ -807,9 +807,7 @@ fn isAutolinkBoundary(byte: u8) bool {
 fn autolinkLength(source: []const u8, start: usize) ?usize {
     const remaining = source[start..];
     const scheme_len: usize =
-        if (std.mem.startsWith(u8, remaining, "https://")) 8
-        else if (std.mem.startsWith(u8, remaining, "http://")) 7
-        else return null;
+        if (std.mem.startsWith(u8, remaining, "https://")) 8 else if (std.mem.startsWith(u8, remaining, "http://")) 7 else return null;
     var end = start + scheme_len;
     while (end < source.len) : (end += 1) {
         switch (source[end]) {
