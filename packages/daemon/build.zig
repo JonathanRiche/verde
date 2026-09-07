@@ -18,6 +18,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // Terminal sessions live in the daemon, so it needs libghostty-vt too.
+    const ghostty = b.dependency("ghostty", .{
+        .target = target,
+        .optimize = optimize,
+        .@"app-runtime" = .none,
+        .@"emit-lib-vt" = true,
+        .@"emit-xcframework" = false,
+    });
     const headless_module = b.createModule(.{
         .root_source_file = b.path("../headless/src/root.zig"),
         .target = target,
@@ -46,6 +54,7 @@ pub fn build(b: *std.Build) void {
     const build_options_module = build_options.createModule();
     const daemon_imports = [_]std.Build.Module.Import{
         .{ .name = "build_options", .module = build_options_module },
+        .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
         .{ .name = "headless", .module = headless_module },
         .{ .name = "platform_paths", .module = platform_paths_module },
         .{ .name = "platform_runtime", .module = platform_runtime_module },
