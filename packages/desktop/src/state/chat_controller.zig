@@ -4323,7 +4323,7 @@ fn reconcileAttachedTerminalTurn(thread: *ChatThread, turn: headless.store.TurnR
         // send went idle with no result, the reply never appeared, and the
         // prompt sat at the bottom of the pane). Leave the send pending so
         // the tail delivers the completion with its result.
-        runtime_log.diagnostic(
+        runtime_log.trace(
             "terminal snapshot left attached turn={s} thread={s} to its tail",
             .{ turn.turn_id, thread.local_thread_id },
         );
@@ -6952,7 +6952,7 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
                 {
                     const last_role: []const u8 = if (thread.messages.items.len > 0) @tagName(thread.messages.items[thread.messages.items.len - 1].role) else "none";
                     const last_len: usize = if (thread.messages.items.len > 0) thread.messages.items[thread.messages.items.len - 1].body.len else 0;
-                    runtime_log.diagnostic("chat completion consumed thread={s} messages={d} last_role={s} last_body_len={d} persisted_offset={d} had_assistant_events={} reply_bytes={d} layout_first={d} layout_count={d}", .{
+                    runtime_log.trace("chat completion consumed thread={s} messages={d} last_role={s} last_body_len={d} persisted_offset={d} had_assistant_events={} reply_bytes={d} layout_first={d} layout_count={d}", .{
                         thread.local_thread_id,
                         thread.messages.items.len,
                         last_role,
@@ -6968,7 +6968,7 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
                 // Consume is a retention hint only (daemon already committed).
                 consumeDaemonChatTurnForThread(self, thread, completed_daemon_turn_id);
             } else {
-                runtime_log.diagnostic(
+                runtime_log.trace(
                     "chat completion dropped without a result thread={s} messages={d}",
                     .{ thread.local_thread_id, thread.messages.items.len },
                 );
