@@ -327,7 +327,7 @@ const KEYBIND_WORKSPACE_HELP: Record<(typeof KEYBIND_WORKSPACE_KEYS)[number], st
   toggle_maximize: 'Zoom the focused pane. Default: `Alt+Z`. Prefix: `z`.',
   toggle_quick_pane: 'Toggle the floating quick pane. Default: `Ctrl+Alt+T`. Prefix: `q`.',
   close:
-    'Close the focused pane. Unbound by default; prefix `x` still closes. Example: `"Alt+X"`.',
+    'Close the focused pane. Unbound by default; prefix `x` still closes, and a second press on an empty workspace closes that workspace. Example: `"Alt+X"`.',
   close_current:
     'Close the current workspace. Unbound by default; prefix `Shift+X` still closes.',
   focus_left: 'Focus the pane to the left. Default: `Ctrl+Left`.',

@@ -25,9 +25,10 @@ in your Verde config — see [Remapping](#remapping) below.
 
 Close pane and close workspace have no direct default chords. With prefix
 mode enabled, `x` closes the focused pane and `Shift+X` closes the current
-workspace. Reopen a closed workspace from the command palette. Bind
-`workspace.close` / `workspace.close_current` in `verde.json` if you want a
-direct shortcut back.
+workspace. After the last pane is gone, prefix `x` again closes the empty
+workspace the same way tmux and herdr do. Reopen a closed workspace from the
+command palette. Bind `workspace.close` / `workspace.close_current` in
+`verde.json` if you want a direct shortcut back.
 
 ### Sidebar & panes
 

@@ -118,6 +118,7 @@ non-destructive — every pane keeps its content and provider.
 
 - `Alt+Z` — zoom the focused pane to fill the workspace; press again to restore.
 - Pane context menu — close the pane (or prefix `x` when prefix mode is on).
+  After the last pane is gone, prefix `x` again closes the empty workspace.
 
 ## The sidebar
 

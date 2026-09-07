@@ -1390,10 +1390,17 @@ pub fn clearHerdrClosedPaneMetadata(self: anytype, project_index: usize, pane_id
     }
 }
 
+/// Close the focused pane. A second press on an empty workspace archives that
+/// workspace, matching tmux/herdr prefix-x.
 pub fn closeFocusedWorkspacePane(self: anytype) bool {
     if (self.project_controller.projects.items.len == 0) return false;
-    const pane_id = self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout.focused_pane_id orelse return false;
-    return self.closeCurrentProjectWorkspacePane(pane_id);
+    const project_index = self.project_controller.selected_index;
+    const layout = &self.project_controller.projects.items[project_index].workspace_layout;
+    if (layout.focused_pane_id) |pane_id| {
+        if (self.closeCurrentProjectWorkspacePane(pane_id)) return true;
+    }
+    if (layout.visiblePaneCount() != 0) return false;
+    return self.closeProjectAtIndexResult(project_index);
 }
 
 pub fn splitCurrentProjectWorkspacePaneWithChat(self: anytype, pane_id: WorkspacePaneId) bool {
@@ -2494,6 +2501,62 @@ pub fn currentProjectWorkspaceVisiblePaneCount(self: anytype) usize {
 pub fn currentProjectGridNewPanePlacement(self: anytype) ?WorkspacePanePlacement {
     if (self.project_controller.projects.items.len == 0) return null;
     return self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout.gridNewPanePlacement();
+}
+
+test "prefix close on an empty workspace archives the workspace" {
+    const allocator = std.testing.allocator;
+    const FakeState = struct {
+        allocator: std.mem.Allocator,
+        project_controller: struct {
+            projects: std.ArrayList(Project) = .empty,
+            selected_index: usize = 0,
+        } = .{},
+        closed_workspace_index: ?usize = null,
+
+        pub fn closeCurrentProjectWorkspacePane(self: *@This(), pane_id: WorkspacePaneId) bool {
+            if (self.project_controller.projects.items.len == 0) return false;
+            var layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
+            var removed_ref = layout.closePane(self.allocator, pane_id) orelse return false;
+            deinitWorkspacePaneRef(&removed_ref, self.allocator);
+            return true;
+        }
+
+        pub fn closeProjectAtIndexResult(self: *@This(), index: usize) bool {
+            self.closed_workspace_index = index;
+            return true;
+        }
+    };
+
+    var state: FakeState = .{ .allocator = allocator };
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+    }
+
+    var empty_project = try Project.init(allocator, "empty", "Empty", "/tmp/empty", 0);
+    var removed_empty_ref = empty_project.workspace_layout.closePane(allocator, 1) orelse return error.TestExpectedEqual;
+    deinitWorkspacePaneRef(&removed_empty_ref, allocator);
+    state.project_controller.projects.append(allocator, empty_project) catch |err| {
+        empty_project.deinit(allocator);
+        return err;
+    };
+    var occupied_project = try Project.init(allocator, "occupied", "Occupied", "/tmp/occupied", 0);
+    state.project_controller.projects.append(allocator, occupied_project) catch |err| {
+        occupied_project.deinit(allocator);
+        return err;
+    };
+
+    try std.testing.expect(closeFocusedWorkspacePane(&state));
+    try std.testing.expectEqual(@as(?usize, 0), state.closed_workspace_index);
+    try std.testing.expectEqual(@as(usize, 0), state.project_controller.projects.items[0].workspace_layout.visiblePaneCount());
+
+    state.closed_workspace_index = null;
+    state.project_controller.selected_index = 1;
+    try std.testing.expect(closeFocusedWorkspacePane(&state));
+    try std.testing.expectEqual(@as(?usize, null), state.closed_workspace_index);
+    try std.testing.expectEqual(@as(usize, 0), state.project_controller.projects.items[1].workspace_layout.visiblePaneCount());
+    try std.testing.expect(closeFocusedWorkspacePane(&state));
+    try std.testing.expectEqual(@as(?usize, 1), state.closed_workspace_index);
 }
 
 test "addressed chat send does not change the visible workspace selection" {
