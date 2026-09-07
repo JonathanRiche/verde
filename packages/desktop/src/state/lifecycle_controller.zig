@@ -488,7 +488,7 @@ fn scheduleFlushWorker(self: anytype, now_ms: i64) void {
     // Single-threaded scheduling: the snapshot above covers every mutation
     // up to this generation, and markDirty cannot interleave within this call.
     self.lifecycle.flush_snapshot_generation = self.lifecycle.dirty_generation;
-    runtime_log.diagnostic("persistence flush scheduled kind=snapshot generation={d} full_dirty_caller=0x{x}", .{
+    runtime_log.trace("persistence flush scheduled kind=snapshot generation={d} full_dirty_caller=0x{x}", .{
         self.lifecycle.flush_snapshot_generation,
         self.lifecycle.last_full_dirty_caller,
     });
@@ -829,10 +829,10 @@ pub fn pollFlushWorker(self: anytype) void {
                 acknowledged_revision,
             );
             const closed = self.lifecycle.dropAcknowledgedThreadCloses(storage.allocator);
-            if (closed != 0) runtime_log.diagnostic("daemon thread closes acknowledged count={d} store_revision={d}", .{ closed, acknowledged_revision });
+            if (closed != 0) runtime_log.trace("daemon thread closes acknowledged count={d} store_revision={d}", .{ closed, acknowledged_revision });
         }
         self.lifecycle.clearDirtyForGeneration(self.lifecycle.flush_snapshot_generation);
-        runtime_log.diagnostic("persistence flush acknowledged kind={s} captured_generation={d} current_generation={d} dirty={any} full_dirty_caller=0x{x}", .{
+        runtime_log.trace("persistence flush acknowledged kind={s} captured_generation={d} current_generation={d} dirty={any} full_dirty_caller=0x{x}", .{
             @tagName(flush_kind),
             self.lifecycle.flush_snapshot_generation,
             self.lifecycle.dirty_generation,

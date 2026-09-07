@@ -557,7 +557,7 @@ fn mainInner(init: std.process.Init) !void {
         const loop_start_ns = profiler.nowNs();
         const loop_gap_ns = profiler.elapsedNs(previous_loop_start_ns);
         if (loop_gap_ns > 100 * std.time.ns_per_ms) {
-            runtime_log.diagnostic(
+            runtime_log.trace(
                 "main-loop gap elapsed_ms={d:.2} sleep_reason={s} wait_requested_ms={d} waited_ms={d:.2} pending_frame_on_entry={}",
                 .{
                     profiler.nsToMs(loop_gap_ns),
@@ -679,7 +679,7 @@ fn mainInner(init: std.process.Init) !void {
             var logical_w: c_int = 0;
             var logical_h: c_int = 0;
             window.getSize(&logical_w, &logical_h) catch {};
-            runtime_log.diagnostic("framebuffer size changed: pixel {d}x{d} logical {d}x{d} scale {d:.3} (prev pixel {d}x{d})", .{
+            runtime_log.trace("framebuffer size changed: pixel {d}x{d} logical {d}x{d} scale {d:.3} (prev pixel {d}x{d})", .{
                 observed_fb_width,
                 observed_fb_height,
                 logical_w,
@@ -1231,7 +1231,7 @@ fn maybeLogFrameProfile(enabled: bool, last_log_ms: *i64, palette_renderer: *con
     const snapshot = profiler.snapshot();
     if (snapshot.count == 0) return;
     const sections = recentSectionStats();
-    runtime_log.diagnostic(
+    runtime_log.trace(
         "frame-profile backend={s} samples={d} avg_ms={d:.2} max_ms={d:.2} slow={d} hitch={d} latest_ms={d:.2} rendered={d} render_root_avg_ms={d:.2} draw_backend_avg_ms={d:.2} poll_send_avg_ms={d:.2} poll_terminals_avg_ms={d:.2} poll_config_avg_ms={d:.2}",
         .{
             @tagName(palette_renderer.activeBackend()),
@@ -1299,7 +1299,7 @@ fn recentSectionStats() SectionStats {
 }
 
 fn logSdlGpuFrameStats(stats: palette.renderer.FrameStats) void {
-    runtime_log.diagnostic(
+    runtime_log.trace(
         "sdlgpu-stage text_cache_rotate_ms={d:.2} text_cache_retire_ms={d:.2}/{d} command_buffer_acquire_ms={d:.2} swapchain_texture_acquire_ms={d:.2} batch_build_ms={d:.2} solid_upload_ms={d:.2} image_prepare_ms={d:.2} image_upload_ms={d:.2} browser_upload_ms={d:.2} text_prepare_ms={d:.2} text_upload_ms={d:.2} render_encode_ms={d:.2} submit_present_ms={d:.2} commands={d} text_draws={d} image_draws={d} image_uploads={d}/{d} browser_uploads={d}/{d} visible_texture_uploads={d} deferred_texture_uploads={d}/{d}",
         .{
             profiler.nsToMs(stats.text_cache_rotate_ns),
@@ -1331,7 +1331,7 @@ fn logSdlGpuFrameStats(stats: palette.renderer.FrameStats) void {
 }
 
 fn logWorkspaceSwitchSdlGpuFrameStats(trace: native_state.WorkspaceSwitchTrace, stats: palette.renderer.FrameStats) void {
-    runtime_log.diagnostic(
+    runtime_log.trace(
         "workspace-switch-trace seq={d} stage=sdlgpu_stages target_index={d} attempt={d} text_cache_rotate_ms={d:.2} text_cache_retire_ms={d:.2}/{d} command_buffer_acquire_ms={d:.2} swapchain_texture_acquire_ms={d:.2} batch_build_ms={d:.2} solid_upload_ms={d:.2} image_prepare_ms={d:.2} image_upload_ms={d:.2} browser_upload_ms={d:.2} text_prepare_ms={d:.2} text_upload_ms={d:.2} render_encode_ms={d:.2} submit_present_ms={d:.2} commands={d} text_draws={d} image_draws={d} visible_texture_uploads={d} deferred_texture_uploads={d}/{d}",
         .{
             trace.sequence,
@@ -2785,7 +2785,7 @@ fn terminalOwnedShortcut(event: *const sdl.KeyboardEvent) bool {
 fn logPasteShortcutEvent(state: *const AppState, event: *const sdl.KeyboardEvent, matched: bool) void {
     if (event.scancode != .v and event.key != .v) return;
     const mod_bits = keymodBits(event.mod);
-    runtime_log.diagnostic(
+    runtime_log.trace(
         "paste key event key={s} scancode={s} down={} repeat={} mod=0x{x} matched={} composer_focused={} palette_composer_focused={} browser_focused={} address_focused={} modal_focus={s}",
         .{
             @tagName(event.key),
@@ -2955,7 +2955,7 @@ fn handleArmedPrefixKeyDown(
     }
     if (event.key == .escape) return true;
     const target = keyboard.prefixTargetForEvent(event) orelse {
-        runtime_log.diagnostic("prefix chord unbound key=0x{x} mod=0x{x}", .{ @intFromEnum(event.key), keymodBits(event.mod) });
+        runtime_log.trace("prefix chord unbound key=0x{x} mod=0x{x}", .{ @intFromEnum(event.key), keymodBits(event.mod) });
         return true;
     };
     state.prefix_swallow_text_input = true;
@@ -3540,7 +3540,7 @@ fn suppressDuplicateMacosTextInput(text: []const u8, timestamp_ns: u64) bool {
     @memcpy(macos_last_text_input[0..macos_last_text_input_len], text[0..macos_last_text_input_len]);
 
     if (duplicate) {
-        runtime_log.diagnostic("suppressed duplicate macOS text_input text_len={d} timestamp={}", .{ text.len, timestamp_ns });
+        runtime_log.trace("suppressed duplicate macOS text_input text_len={d} timestamp={}", .{ text.len, timestamp_ns });
     }
     return duplicate;
 }
@@ -3596,7 +3596,7 @@ fn canHandleTranscriptScrollAction(state: *const AppState) bool {
 }
 
 fn applyAppConfigRuntime(state: *AppState) void {
-    runtime_log.diagnostic("apply app config runtime begin theme={s} font={d:.2} terminal_font={d:.2}", .{
+    runtime_log.trace("apply app config runtime begin theme={s} font={d:.2} terminal_font={d:.2}", .{
         @tagName(state.app_config.theme_config.source),
         state.app_config.font_size,
         state.app_config.terminal_font_size,
@@ -3621,7 +3621,7 @@ fn applyAppConfigRuntime(state: *AppState) void {
         state.enableBrowserInspector(false);
     }
     state.markDirty();
-    runtime_log.diagnostic("apply app config runtime done", .{});
+    runtime_log.trace("apply app config runtime done", .{});
 }
 
 fn pollAppConfigFileChanges(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig) void {

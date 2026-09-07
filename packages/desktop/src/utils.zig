@@ -163,23 +163,23 @@ pub fn canOpenProjectDirectory() bool {
 pub fn openProjectDirectory(allocator: std.mem.Allocator, project_path: []const u8) OpenProjectError!void {
     return switch (@import("builtin").os.tag) {
         .macos => {
-            runtime_log.diagnostic("openProjectDirectory launcher=open path={s}", .{project_path});
+            runtime_log.trace("openProjectDirectory launcher=open path={s}", .{project_path});
             return spawnDetached(allocator, &.{ "open", project_path }, null);
         },
         .linux, .freebsd, .netbsd, .openbsd, .dragonfly => {
             if (commandExists("xdg-open")) {
-                runtime_log.diagnostic("openProjectDirectory launcher=xdg-open path={s}", .{project_path});
+                runtime_log.trace("openProjectDirectory launcher=xdg-open path={s}", .{project_path});
                 return spawnDetached(allocator, &.{ "xdg-open", project_path }, null);
             }
             if (commandExists("gio")) {
-                runtime_log.diagnostic("openProjectDirectory launcher=gio open path={s}", .{project_path});
+                runtime_log.trace("openProjectDirectory launcher=gio open path={s}", .{project_path});
                 return spawnDetached(allocator, &.{ "gio", "open", project_path }, null);
             }
             runtime_log.diagnostic("openProjectDirectory launcher unavailable path={s}", .{project_path});
             return error.LauncherUnavailable;
         },
         .windows => {
-            runtime_log.diagnostic("openProjectDirectory launcher=ShellExecute path={s}", .{project_path});
+            runtime_log.trace("openProjectDirectory launcher=ShellExecute path={s}", .{project_path});
             if (!windows_integrations.shellOpen(project_path, null)) return error.LauncherUnavailable;
         },
         else => error.UnsupportedOperatingSystem,
@@ -189,23 +189,23 @@ pub fn openProjectDirectory(allocator: std.mem.Allocator, project_path: []const 
 pub fn openUrlInDefaultBrowser(allocator: std.mem.Allocator, url: []const u8) OpenProjectError!void {
     return switch (@import("builtin").os.tag) {
         .macos => {
-            runtime_log.diagnostic("openUrlInDefaultBrowser launcher=open url_len={d}", .{url.len});
+            runtime_log.trace("openUrlInDefaultBrowser launcher=open url_len={d}", .{url.len});
             return spawnDetached(allocator, &.{ "open", url }, null);
         },
         .linux, .freebsd, .netbsd, .openbsd, .dragonfly => {
             if (commandExists("xdg-open")) {
-                runtime_log.diagnostic("openUrlInDefaultBrowser launcher=xdg-open url_len={d}", .{url.len});
+                runtime_log.trace("openUrlInDefaultBrowser launcher=xdg-open url_len={d}", .{url.len});
                 return spawnDetached(allocator, &.{ "xdg-open", url }, null);
             }
             if (commandExists("gio")) {
-                runtime_log.diagnostic("openUrlInDefaultBrowser launcher=gio open url_len={d}", .{url.len});
+                runtime_log.trace("openUrlInDefaultBrowser launcher=gio open url_len={d}", .{url.len});
                 return spawnDetached(allocator, &.{ "gio", "open", url }, null);
             }
             runtime_log.diagnostic("openUrlInDefaultBrowser launcher unavailable url_len={d}", .{url.len});
             return error.LauncherUnavailable;
         },
         .windows => {
-            runtime_log.diagnostic("openUrlInDefaultBrowser launcher=ShellExecute url_len={d}", .{url.len});
+            runtime_log.trace("openUrlInDefaultBrowser launcher=ShellExecute url_len={d}", .{url.len});
             if (!windows_integrations.shellOpen(url, null)) return error.LauncherUnavailable;
         },
         else => error.UnsupportedOperatingSystem,
@@ -345,7 +345,7 @@ pub fn openPathWithSystemHandler(allocator: std.mem.Allocator, path: []const u8)
     switch (@import("builtin").os.tag) {
         .linux, .freebsd, .netbsd, .openbsd, .dragonfly => {
             if (commandExists("gio")) {
-                runtime_log.diagnostic("openPathWithSystemHandler launcher=gio open path={s}", .{path});
+                runtime_log.trace("openPathWithSystemHandler launcher=gio open path={s}", .{path});
                 return spawnDetached(allocator, &.{ "gio", "open", path }, null);
             }
         },
@@ -369,19 +369,19 @@ pub fn runCustomProjectCommand(
 pub fn pickerWorker(state: *state_ui_types.PickerState, start_path: []u8) void {
     defer std.heap.page_allocator.free(start_path);
 
-    runtime_log.diagnostic("pickerWorker start path={s}", .{start_path});
+    runtime_log.trace("pickerWorker start path={s}", .{start_path});
     const result = pickDirectory(std.heap.page_allocator, start_path);
 
     state.mutex.lock();
     defer state.mutex.unlock();
 
     if (result) |path| {
-        runtime_log.diagnostic("pickerWorker selected path={s}", .{path});
+        runtime_log.trace("pickerWorker selected path={s}", .{path});
         state.selected_path = path;
         state.status = .selected;
     } else |err| switch (err) {
         error.UserCancelled => {
-            runtime_log.diagnostic("pickerWorker cancelled", .{});
+            runtime_log.trace("pickerWorker cancelled", .{});
             state.status = .cancelled;
         },
         error.UnsupportedOperatingSystem => {
@@ -544,7 +544,7 @@ fn runDirectoryPickerCommand(
     argv: []const []const u8,
     unavailable_exit_code: ?u8,
 ) PickDirectoryError![]u8 {
-    runtime_log.diagnostic("runDirectoryPickerCommand argv={s}", .{argv[0]});
+    runtime_log.trace("runDirectoryPickerCommand argv={s}", .{argv[0]});
     const result = runChild(allocator, argv, null, 16 * 1024) catch |err| switch (err) {
         error.FileNotFound => {
             runtime_log.diagnostic("runDirectoryPickerCommand file not found argv={s}", .{argv[0]});
@@ -560,7 +560,7 @@ fn runDirectoryPickerCommand(
 
     switch (result.term) {
         .exited => |code| {
-            runtime_log.diagnostic("runDirectoryPickerCommand exited argv={s} code={d} stdout_len={d} stderr_len={d}", .{ argv[0], code, result.stdout.len, result.stderr.len });
+            runtime_log.trace("runDirectoryPickerCommand exited argv={s} code={d} stdout_len={d} stderr_len={d}", .{ argv[0], code, result.stdout.len, result.stderr.len });
             if (code == 1) return error.UserCancelled;
             if (unavailable_exit_code) |expected| {
                 if (code == expected) return error.FolderPickerUnavailable;
@@ -632,7 +632,7 @@ fn spawnDetached(
         try argv_storage.appendSlice(allocator, argv);
     }
 
-    runtime_log.diagnostic(
+    runtime_log.trace(
         "spawnDetached begin arg0={s} resolved_arg0={s} argc={d} cwd={s}",
         .{
             if (argv.len > 0) argv[0] else "",
@@ -653,7 +653,7 @@ fn spawnDetached(
         .environ_map = &env_map,
         .create_no_window = builtin.os.tag == .windows,
     });
-    runtime_log.diagnostic("spawnDetached started arg0={s} pid={?}", .{ if (argv.len > 0) argv[0] else "", child.id });
+    runtime_log.trace("spawnDetached started arg0={s} pid={?}", .{ if (argv.len > 0) argv[0] else "", child.id });
     if (builtin.os.tag == .windows) {
         std.os.windows.CloseHandle(child.thread_handle);
         if (child.id) |process| std.os.windows.CloseHandle(process);
@@ -2404,7 +2404,7 @@ fn captureClipboardImageWayland(allocator: std.mem.Allocator) !?ClipboardImageCa
     defer allocator.free(types_output);
 
     const mime = selectClipboardImageMime(types_output) orelse return null;
-    runtime_log.diagnostic("clipboard image wayland mime={s}", .{mime});
+    runtime_log.trace("clipboard image wayland mime={s}", .{mime});
     const output_path = try std.fmt.allocPrint(allocator, "/tmp/verde-clipboard-image-{d}.bin", .{platform_runtime.processId()});
     defer allocator.free(output_path);
     defer std.Io.Dir.deleteFileAbsolute(threaded.io(), output_path) catch {};
@@ -2431,13 +2431,13 @@ fn captureClipboardImageWayland(allocator: std.mem.Allocator) !?ClipboardImageCa
             return null;
         },
     }
-    runtime_log.diagnostic("clipboard image wayland temp written stdout_len={d} stderr_len={d}", .{ image_result.stdout.len, image_result.stderr.len });
+    runtime_log.trace("clipboard image wayland temp written stdout_len={d} stderr_len={d}", .{ image_result.stdout.len, image_result.stderr.len });
 
     const bytes = bytes: {
         var image_file = try std.Io.Dir.openFileAbsolute(threaded.io(), output_path, .{ .mode = .read_only });
         defer image_file.close(threaded.io());
         const image_size = try image_file.stat(threaded.io());
-        runtime_log.diagnostic("clipboard image wayland temp size={d}", .{image_size.size});
+        runtime_log.trace("clipboard image wayland temp size={d}", .{image_size.size});
         if (image_size.size == 0) return null;
         if (image_size.size > CLIPBOARD_IMAGE_MAX_BYTES) return error.StreamTooLong;
         var read_buffer: [8 * 1024]u8 = undefined;

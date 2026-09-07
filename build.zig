@@ -7,7 +7,7 @@ pub fn build(b: *std.Build) void {
         b.graph.environ_map.get("VERDE_VERSION");
     const optimize = b.standardOptimizeOption(.{});
     const ui_debug = b.option(bool, "ui-debug", "Show the desktop UI debug window");
-    const chat_trace = b.option(bool, "chat-trace", "Compile chat streaming/commit trace lines into the GUI (dev builds only)");
+    const dev_trace = b.option(bool, "dev-trace", "Compile GUI flow-trace log lines (frame, RPC, paste, refresh breadcrumbs); dev builds only");
     const palette_renderer = b.option(PaletteRendererBackend, "palette-renderer", "Palette frame renderer backend: sdl_gpu");
     const browser_backend = b.option(BrowserBackendKind, "browser-backend", "Browser backend: native_webview or stub");
     const terminal_backend = b.option(bool, "terminal_backend", "Enable the native terminal backend");
@@ -62,7 +62,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .version = version,
         .ui_debug = ui_debug,
-        .chat_trace = chat_trace,
+        .dev_trace = dev_trace,
         .palette_renderer = palette_renderer,
         .browser_backend = browser_backend,
         .terminal_backend = terminal_backend,
@@ -281,7 +281,7 @@ const DesktopCommandOptions = struct {
     target: ?[]const u8 = null,
     version: ?[]const u8 = null,
     ui_debug: ?bool = null,
-    chat_trace: ?bool = null,
+    dev_trace: ?bool = null,
     palette_renderer: ?PaletteRendererBackend = null,
     browser_backend: ?BrowserBackendKind = null,
     terminal_backend: ?bool = null,
@@ -325,8 +325,8 @@ fn addDesktopCommand(
     if (options.ui_debug) |value| {
         argv.append(b.allocator, b.fmt("-Dui-debug={}", .{value})) catch @panic("OOM");
     }
-    if (options.chat_trace) |value| {
-        argv.append(b.allocator, b.fmt("-Dchat-trace={}", .{value})) catch @panic("OOM");
+    if (options.dev_trace) |value| {
+        argv.append(b.allocator, b.fmt("-Ddev-trace={}", .{value})) catch @panic("OOM");
     }
     if (options.palette_renderer) |value| {
         argv.append(b.allocator, b.fmt("-Dpalette-renderer={s}", .{@tagName(value)})) catch @panic("OOM");

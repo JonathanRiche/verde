@@ -131,7 +131,7 @@ pub fn slashCommandWorker(state: *SlashCommandState, request: *SlashCommandWorke
         page_alloc.destroy(request);
     }
 
-    runtime_log.diagnostic(
+    runtime_log.trace(
         "slash command worker begin provider={s} command={s} thread_id_len={d}",
         .{ @tagName(request.provider), @tagName(request.command), if (request.thread_id) |thread_id| thread_id.len else 0 },
     );
@@ -143,7 +143,7 @@ pub fn slashCommandWorker(state: *SlashCommandState, request: *SlashCommandWorke
     defer loop_wakeup.notify();
 
     if (result) |payload| {
-        runtime_log.diagnostic("slash command worker completed provider={s} command={s}", .{ @tagName(request.provider), @tagName(request.command) });
+        runtime_log.trace("slash command worker completed provider={s} command={s}", .{ @tagName(request.provider), @tagName(request.command) });
         state.result = payload;
         state.error_message = null;
         state.status = .completed;

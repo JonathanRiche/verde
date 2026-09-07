@@ -3,9 +3,12 @@ const std = @import("std");
 const platform_runtime = @import("platform_runtime");
 const build_options = @import("build_options");
 
-/// Chat streaming/commit trace lines exist only in `-Dchat-trace=true`
-/// builds (`mise run dev-build`). Release builds compile them out entirely.
-pub const chat_trace_enabled: bool = @hasDecl(build_options, "chat_trace") and build_options.chat_trace;
+/// Flow-trace lines (frame timing, provider RPC breadcrumbs, paste and
+/// picker flow, projection refresh stats) exist only in `-Ddev-trace=true`
+/// builds (`mise run dev-build`). Release builds compile them out entirely;
+/// failures, shutdown breadcrumbs, and persistence transitions stay on
+/// `diagnostic` so a user's log still explains a hang or a lost write.
+pub const dev_trace_enabled: bool = @hasDecl(build_options, "dev_trace") and build_options.dev_trace;
 
 const STDERR_LOG_FILE_NAME = "verde.stderr.log";
 const LAST_CRASH_LOG_FILE_NAME = "last-crash.log";
@@ -102,9 +105,9 @@ pub fn stderrLogPath() ?[]const u8 {
     return stderr_log_path;
 }
 
-/// Dev-only diagnostic: a no-op unless the build enabled `chat_trace`.
+/// Dev-only diagnostic: a no-op unless the build enabled `dev_trace`.
 pub inline fn trace(comptime format: []const u8, args: anytype) void {
-    if (comptime !chat_trace_enabled) return;
+    if (comptime !dev_trace_enabled) return;
     diagnostic(format, args);
 }
 

@@ -1098,7 +1098,7 @@ pub const Dock = struct {
                 scaledCellPixelHeight(self.font_scale),
             );
             if (terminalLayoutDiagnosticsEnabled()) {
-                runtime_log.diagnostic(
+                runtime_log.trace(
                     "terminal resizePaneToFit pane={d} rect={d:.1}x{d:.1} cells={d}x{d} session={d}x{d}",
                     .{ pane_id, width, height, cols, rows, session.cols, session.rows },
                 );
@@ -3750,7 +3750,7 @@ const UnixSession = struct {
         const first_trimmed = std.mem.trim(u8, first, " \r\t");
         const second_trimmed = std.mem.trim(u8, second, " \r\t");
         const third_trimmed = std.mem.trim(u8, third, " \r\t");
-        runtime_log.diagnostic(
+        runtime_log.trace(
             "terminal render snapshot session_len={d} screen={s} cells={d}x{d} cursor_viewport=({?d},{?d}) row1_len={d} row2_len={d} row3_len={d}",
             .{
                 if (self.session_id) |session_id| session_id.len else 0,
@@ -3884,7 +3884,7 @@ const UnixSession = struct {
         self.suppress_next_daemon_replay = attached_existing_session;
         self.defer_daemon_replay_until_resize = attached_existing_session;
         self.needs_attach_repaint_kick = attached_existing_session;
-        runtime_log.diagnostic(
+        runtime_log.trace(
             "terminal daemon attach dock={d} pane={d} session_len={d} existing={} revive_policy={s}",
             .{ options.dock_id, options.pane_id, session_id.len, attached_existing_session, @tagName(options.revive_policy) },
         );
@@ -4059,7 +4059,7 @@ const UnixSession = struct {
         if (self.terminal.screens.active_key == .alternate) {
             self.terminal.scrollViewport(.{ .top = {} });
             if (terminalLayoutDiagnosticsEnabled()) {
-                runtime_log.diagnostic(
+                runtime_log.trace(
                     "terminal alternate viewport reset session_len={d} anchor=top cells={d}x{d}",
                     .{ if (self.session_id) |session_id| session_id.len else 0, self.cols, self.rows },
                 );
@@ -4094,7 +4094,7 @@ const UnixSession = struct {
         // Mode-2048 clients ignore the SIGWINCH from the jiggle; tell them
         // in-band too (no-op unless the replayed model saw the mode set).
         self.sendInBandSizeReportAfterResize();
-        runtime_log.diagnostic(
+        runtime_log.trace(
             "terminal attach repaint kick session_len={d} cells={d}x{d}",
             .{ if (self.session_id) |session_id| session_id.len else 0, cols, self.rows },
         );

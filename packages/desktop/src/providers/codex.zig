@@ -224,7 +224,7 @@ pub const Client = struct {
     loaded_threads: std.StringHashMap(void),
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
-        runtime_log.diagnostic(
+        runtime_log.trace(
             "codex.Client.init begin transport={s} url_len={d} cwd={s} launch_on_connect={}",
             .{
                 @tagName(config.transport),
@@ -243,7 +243,7 @@ pub const Client = struct {
             runtime_log.diagnostic("codex.Client.init ensureConnected failed: {s}", .{@errorName(err)});
             return err;
         };
-        runtime_log.diagnostic("codex.Client.init connected initialized={}", .{client.initialized});
+        runtime_log.trace("codex.Client.init connected initialized={}", .{client.initialized});
         return client;
     }
 
@@ -390,17 +390,17 @@ pub const Client = struct {
         allocator: std.mem.Allocator,
         request: provider_types.SendPromptRequest,
     ) !provider_types.SendPromptResult {
-        runtime_log.diagnostic(
+        runtime_log.trace(
             "codex.sendPrompt begin thread_id_len={d} model_len={d} prompt_len={d}",
             .{ if (request.thread_id) |thread_id| thread_id.len else 0, if (request.model) |model| model.len else 0, request.prompt.len },
         );
         try self.ensureConnected();
 
         const thread_id = if (request.thread_id) |existing| blk: {
-            runtime_log.diagnostic("codex.sendPrompt using existing thread_id_len={d}", .{existing.len});
+            runtime_log.trace("codex.sendPrompt using existing thread_id_len={d}", .{existing.len});
             break :blk try allocator.dupe(u8, existing);
         } else blk: {
-            runtime_log.diagnostic("codex.sendPrompt starting new thread", .{});
+            runtime_log.trace("codex.sendPrompt starting new thread", .{});
             break :blk try self.startThread(allocator, request);
         };
         errdefer allocator.free(thread_id);
@@ -409,13 +409,13 @@ pub const Client = struct {
             on_thread_id(request.stream_context, thread_id);
         }
 
-        runtime_log.diagnostic("codex.sendPrompt ensuring thread loaded thread_id_len={d}", .{thread_id.len});
+        runtime_log.trace("codex.sendPrompt ensuring thread loaded thread_id_len={d}", .{thread_id.len});
         try self.ensureThreadLoaded(thread_id, .{
             .request = request,
             .idle_timeout_ms = RPC_IDLE_TIMEOUT_MS,
         });
 
-        runtime_log.diagnostic("codex.sendPrompt starting turn thread_id_len={d}", .{thread_id.len});
+        runtime_log.trace("codex.sendPrompt starting turn thread_id_len={d}", .{thread_id.len});
         const reply = try self.startTurnAndCollectReply(allocator, thread_id, request);
         errdefer allocator.free(reply);
         self.emitBackgroundTerminals(thread_id, request) catch |err| {
@@ -423,7 +423,7 @@ pub const Client = struct {
             // turn an otherwise successful conversation turn into a failure.
             runtime_log.diagnostic("codex background terminal list unavailable: {s}", .{@errorName(err)});
         };
-        runtime_log.diagnostic("codex.sendPrompt completed thread_id_len={d} reply_len={d}", .{ thread_id.len, reply.len });
+        runtime_log.trace("codex.sendPrompt completed thread_id_len={d} reply_len={d}", .{ thread_id.len, reply.len });
 
         return .{
             .thread_id = thread_id,
@@ -767,7 +767,7 @@ pub const Client = struct {
 
     fn ensureConnected(self: *Client) !void {
         if (self.stream == null) {
-            runtime_log.diagnostic("codex.ensureConnected stream=null transport={s}", .{@tagName(self.config.transport)});
+            runtime_log.trace("codex.ensureConnected stream=null transport={s}", .{@tagName(self.config.transport)});
             switch (self.config.transport) {
                 .websocket => self.connectWebSocket() catch |err| {
                     runtime_log.diagnostic("codex.ensureConnected connectWebSocket failed: {s}", .{@errorName(err)});
@@ -778,12 +778,12 @@ pub const Client = struct {
         }
 
         if (!self.initialized) {
-            runtime_log.diagnostic("codex.ensureConnected initializing protocol", .{});
+            runtime_log.trace("codex.ensureConnected initializing protocol", .{});
             self.initializeProtocol() catch |err| {
                 runtime_log.diagnostic("codex.ensureConnected initializeProtocol failed: {s}", .{@errorName(err)});
                 return err;
             };
-            runtime_log.diagnostic("codex.ensureConnected protocol initialized", .{});
+            runtime_log.trace("codex.ensureConnected protocol initialized", .{});
         }
     }
 
@@ -800,7 +800,7 @@ pub const Client = struct {
 
     fn connectWebSocket(self: *Client) !void {
         const raw_url = self.effectiveWebSocketUrl() orelse return error.MissingWebSocketUrl;
-        runtime_log.diagnostic("codex.connectWebSocket begin url_len={d}", .{raw_url.len});
+        runtime_log.trace("codex.connectWebSocket begin url_len={d}", .{raw_url.len});
         const uri = std.Uri.parse(raw_url) catch |err| {
             runtime_log.diagnostic("codex.connectWebSocket Uri.parse failed: {s}", .{@errorName(err)});
             return err;
@@ -817,9 +817,9 @@ pub const Client = struct {
         }
 
         const port = uri.port orelse 80;
-        runtime_log.diagnostic("codex.connectWebSocket target host_len={d} port={d}", .{ host.len, port });
+        runtime_log.trace("codex.connectWebSocket target host_len={d} port={d}", .{ host.len, port });
         if (try self.tryConnectWebSocket(uri, host, port)) |stream| {
-            runtime_log.diagnostic("codex.connectWebSocket connected existing server", .{});
+            runtime_log.trace("codex.connectWebSocket connected existing server", .{});
             self.stream = stream;
             return;
         }
@@ -830,13 +830,13 @@ pub const Client = struct {
 
         shared_server_state.mutex.lock();
         defer shared_server_state.mutex.unlock();
-        runtime_log.diagnostic("codex.connectWebSocket acquired shared server lock owns_child={} has_child={}", .{
+        runtime_log.trace("codex.connectWebSocket acquired shared server lock owns_child={} has_child={}", .{
             shared_server_state.owns_child,
             shared_server_state.child != null,
         });
 
         if (try self.tryConnectWebSocket(uri, host, port)) |stream| {
-            runtime_log.diagnostic("codex.connectWebSocket connected after lock", .{});
+            runtime_log.trace("codex.connectWebSocket connected after lock", .{});
             self.stream = stream;
             return;
         }
@@ -862,7 +862,7 @@ pub const Client = struct {
         sleepMs(80);
 
         if (try self.waitForWebSocket(uri, host, port, MAX_CONNECT_WAIT_ATTEMPTS)) |stream| {
-            runtime_log.diagnostic("codex.connectWebSocket connected after spawn", .{});
+            runtime_log.trace("codex.connectWebSocket connected after spawn", .{});
             self.stream = stream;
             return;
         }
@@ -883,7 +883,7 @@ pub const Client = struct {
     fn spawnWebSocketServer(self: *Client, url: []const u8) !void {
         if (shared_server_state.child != null) return;
 
-        runtime_log.diagnostic("codex.spawnWebSocketServer begin url_len={d}", .{url.len});
+        runtime_log.trace("codex.spawnWebSocketServer begin url_len={d}", .{url.len});
         var env_map = process_env.buildAugmentedEnvMap(self.allocator) catch |err| {
             runtime_log.diagnostic("codex.spawnWebSocketServer buildAugmentedEnvMap failed: {s}", .{@errorName(err)});
             return err;
@@ -895,7 +895,7 @@ pub const Client = struct {
             return err;
         };
         defer self.allocator.free(executable);
-        runtime_log.diagnostic("codex.spawnWebSocketServer executable={s}", .{executable});
+        runtime_log.trace("codex.spawnWebSocketServer executable={s}", .{executable});
 
         var argv = [_][]const u8{
             executable,
@@ -923,7 +923,7 @@ pub const Client = struct {
             return err;
         };
 
-        runtime_log.diagnostic("codex.spawnWebSocketServer started pid={d}", .{child.processId() orelse 0});
+        runtime_log.trace("codex.spawnWebSocketServer started pid={d}", .{child.processId() orelse 0});
         shared_server_state.child = child;
         shared_server_state.owns_child = true;
     }
@@ -941,7 +941,7 @@ pub const Client = struct {
         errdefer stream.close(threaded.io());
 
         self.performWebSocketHandshake(stream, uri, host, port) catch |err| {
-            runtime_log.diagnostic("codex.tryConnectWebSocket handshake not ready: {s}", .{@errorName(err)});
+            runtime_log.trace("codex.tryConnectWebSocket handshake not ready: {s}", .{@errorName(err)});
             stream.close(threaded.io());
             return null;
         };
@@ -1128,13 +1128,13 @@ pub const Client = struct {
 
         const payload = try writer.toOwnedSlice();
         defer self.allocator.free(payload);
-        runtime_log.diagnostic("Codex RPC thread/start id={d} payload_len={d}", .{ id, payload.len });
+        runtime_log.trace("Codex RPC thread/start id={d} payload_len={d}", .{ id, payload.len });
         try self.writeTextMessage(payload);
         const result = try self.awaitResultPayloadAlloc(id, .{
             .request = request,
             .idle_timeout_ms = RPC_IDLE_TIMEOUT_MS,
         });
-        runtime_log.diagnostic("Codex RPC thread/start id={d} result_len={d}", .{ id, result.len });
+        runtime_log.trace("Codex RPC thread/start id={d} result_len={d}", .{ id, result.len });
         return result;
     }
 
@@ -1368,7 +1368,7 @@ pub const Client = struct {
 
         const payload = try writer.toOwnedSlice();
         defer self.allocator.free(payload);
-        runtime_log.diagnostic("Codex RPC turn/start id={d} thread_id_len={d} payload_len={d}", .{ id, thread_id.len, payload.len });
+        runtime_log.trace("Codex RPC turn/start id={d} thread_id_len={d} payload_len={d}", .{ id, thread_id.len, payload.len });
         try self.writeTextMessage(payload);
         return id;
     }
@@ -1473,7 +1473,7 @@ pub const Client = struct {
         while (true) {
             const message = try self.readTextMessageAlloc(self.allocator);
             defer self.allocator.free(message);
-            runtime_log.diagnostic("Codex RPC compact await id={d} message_len={d}", .{ id, message.len });
+            runtime_log.trace("Codex RPC compact await id={d} message_len={d}", .{ id, message.len });
 
             var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, message, .{});
             defer parsed.deinit();
@@ -1520,7 +1520,7 @@ pub const Client = struct {
         while (true) {
             const message = try self.readTextMessageAlloc(self.allocator);
             defer self.allocator.free(message);
-            runtime_log.diagnostic("Codex RPC review await id={d} message_len={d}", .{ id, message.len });
+            runtime_log.trace("Codex RPC review await id={d} message_len={d}", .{ id, message.len });
 
             var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, message, .{});
             defer parsed.deinit();
@@ -1575,7 +1575,7 @@ pub const Client = struct {
         while (true) {
             const message = try self.readTextMessageAlloc(self.allocator);
             defer self.allocator.free(message);
-            runtime_log.diagnostic("Codex RPC shell await id={d} message_len={d}", .{ id, message.len });
+            runtime_log.trace("Codex RPC shell await id={d} message_len={d}", .{ id, message.len });
 
             var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, message, .{});
             defer parsed.deinit();
@@ -1635,7 +1635,7 @@ pub const Client = struct {
 
         const payload = try writer.toOwnedSlice();
         defer self.allocator.free(payload);
-        runtime_log.diagnostic("Codex RPC review/start id={d} thread_id_len={d} payload_len={d}", .{ id, thread_id.len, payload.len });
+        runtime_log.trace("Codex RPC review/start id={d} thread_id_len={d} payload_len={d}", .{ id, thread_id.len, payload.len });
         try self.writeTextMessage(payload);
         return id;
     }
@@ -1644,7 +1644,7 @@ pub const Client = struct {
         while (true) {
             const message = try self.readTextMessageAllocInterruptible(self.allocator, wait);
             defer self.allocator.free(message);
-            runtime_log.diagnostic("Codex RPC await id={d} message_len={d}", .{ id, message.len });
+            runtime_log.trace("Codex RPC await id={d} message_len={d}", .{ id, message.len });
 
             var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, message, .{});
             defer parsed.deinit();
@@ -1670,7 +1670,7 @@ pub const Client = struct {
 
             const result = getObjectField(root, "result") orelse return error.MissingRpcResult;
             const payload = try stringifyAlloc(self.allocator, result);
-            runtime_log.diagnostic("Codex RPC response id={d} message_len={d} result_len={d}", .{ id, message.len, payload.len });
+            runtime_log.trace("Codex RPC response id={d} message_len={d} result_len={d}", .{ id, message.len, payload.len });
             return payload;
         }
     }

@@ -3719,7 +3719,7 @@ pub fn commitAcceptanceDispatch(self: anytype, dispatch: *AcceptanceDispatch) bo
                     user_row.message_id = self.allocator.dupe(u8, dispatch.message_id) catch null;
                 }
             }
-            runtime_log.diagnostic("chat submit accepted daemon_start_ms={d} thread_messages={d}", .{
+            runtime_log.trace("chat submit accepted daemon_start_ms={d} thread_messages={d}", .{
                 dispatch.rpc_elapsed_ms,
                 thread.messages.items.len,
             });
