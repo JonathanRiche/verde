@@ -3,6 +3,7 @@
 const std = @import("std");
 const model = @import("model.zig");
 const parser = @import("parser.zig");
+const streaming = @import("streaming.zig");
 
 pub const Allocator = std.mem.Allocator;
 pub const Block = model.Block;
@@ -44,6 +45,17 @@ pub fn parseStreaming(allocator: Allocator, source: []const u8) !Document {
 
 pub fn fenceLanguage(info: []const u8) ?[]const u8 {
     return parser.fenceLanguage(info);
+}
+
+/// Trailing bytes to keep hidden while a reply streams so table headers,
+/// partial rows, half-typed links, and bare block markers never flip
+/// appearance on screen. See `streaming.zig`.
+pub fn streamingHoldLength(source: []const u8) usize {
+    return streaming.streamingHoldLength(source);
+}
+
+test {
+    _ = streaming;
 }
 
 test "parses paragraphs, blank lines, and fenced code blocks" {

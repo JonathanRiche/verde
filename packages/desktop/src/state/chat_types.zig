@@ -1132,6 +1132,11 @@ pub const SendState = struct {
     /// `mutex`.
     reveal_len: usize = 0,
     reveal_last_ms: i64 = 0,
+    /// Trailing bytes of the revealed prefix kept hidden because they would
+    /// reinterpret once more text lands (table header awaiting its delimiter,
+    /// partial row, half-typed link, bare block marker). Recomputed with
+    /// `reveal_len`; released as the construct resolves or at completion.
+    reveal_hold: usize = 0,
 
     /// Memoized measured height of the in-flight streamed assistant body.
     /// `partial_text` is append-only within a turn, so the paired key (length,
@@ -1181,7 +1186,8 @@ pub const SendState = struct {
 
     pub fn streamRevealedText(self: *const SendState) []const u8 {
         const total = self.partial_text.items.len;
-        return self.partial_text.items[0..@min(self.reveal_len, total)];
+        const revealed = @min(self.reveal_len, total);
+        return self.partial_text.items[0 .. revealed - @min(self.reveal_hold, revealed)];
     }
 
     pub fn streamRevealPending(self: *const SendState) bool {
