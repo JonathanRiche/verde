@@ -334,6 +334,9 @@ function Test-EmbeddedManifest(
 
 $ExpectedExecutables = @("app/Verde.exe", "bin/verde.exe", "bin/verde-daemon.exe")
 $ExpectedAppUserModelId = "Verde.Desktop"
+# Only the shell-facing entry points set the explicit process identity; the
+# background daemon has no window, shortcut, or toast identity of its own.
+$IdentityExecutables = @("app/Verde.exe", "bin/verde.exe")
 $ExpectedDlls = @(
   "app/fff_c.dll",
   "app/SDL3.dll",
@@ -417,7 +420,7 @@ foreach ($RelativePath in $ExpectedExecutables) {
   if ($Pe.subsystem -ne $ExpectedSubsystem) {
     throw "$RelativePath has PE subsystem $($Pe.subsystem), expected $ExpectedSubsystem"
   }
-  if (-not (Test-BinaryContainsAscii $Path $ExpectedAppUserModelId)) {
+  if (($IdentityExecutables -contains $RelativePath) -and -not (Test-BinaryContainsAscii $Path $ExpectedAppUserModelId)) {
     throw "$RelativePath does not carry the explicit process identity $ExpectedAppUserModelId"
   }
   foreach ($ManifestSetting in @("asInvoker", "PerMonitorV2", "longPathAware")) {

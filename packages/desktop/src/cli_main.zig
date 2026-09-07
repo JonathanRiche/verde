@@ -4,6 +4,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const cli = @import("cli/main.zig");
+const windows_integrations = if (builtin.os.tag == .windows)
+    @import("platform/windows/integrations.zig")
+else
+    struct {};
 
 pub fn main(init: std.process.Init) void {
     mainInner(init) catch |err| {
@@ -14,6 +18,11 @@ pub fn main(init: std.process.Init) void {
 
 fn mainInner(init: std.process.Init) !void {
     const allocator = init.gpa;
+    // The console launcher shares the GUI's explicit Windows identity so the
+    // package verifier and shell see one application across both entry points.
+    if (builtin.os.tag == .windows and !windows_integrations.setProcessAppUserModelId()) {
+        std.debug.print("verde: failed to set Windows application identity to {s}\n", .{windows_integrations.app_user_model_id});
+    }
     if (try cli.dispatch(allocator, init.io, init.minimal.args) == .handled) return;
 
     var iterator = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
