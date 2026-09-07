@@ -584,6 +584,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe_tests.build_id = .sha1;
+    // Zig 0.16 resolves `@import("root")` inside a test build to the compiler's
+    // test runner, so test-only backend access reaches this root through a
+    // self-import instead. Production modules never analyze the branch.
+    exe_tests.root_module.addImport("desktop_test_root", exe_tests.root_module);
     if (build_fff) |build_step| exe_tests.step.dependOn(&build_step.step);
     exe_tests.root_module.addIncludePath(b.path("../../vendor"));
     exe_tests.root_module.addIncludePath(b.path("../../vendor/fff/crates/fff-c/include"));

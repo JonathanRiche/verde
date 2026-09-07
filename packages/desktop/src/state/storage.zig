@@ -7,14 +7,14 @@ const std = @import("std");
 const builtin = @import("builtin");
 const sdl = @import("zsdl3");
 const headless = @import("headless");
-const db_client = if (builtin.is_test) @import("root").test_backend.db_client else struct {};
+const db_client = if (builtin.is_test) @import("desktop_test_root").test_backend.db_client else struct {};
 const db_types = @import("../db/types.zig");
 const daemon_client = @import("../daemon/client.zig");
 const runtime_log = @import("../runtime/log.zig");
 const platform_runtime = @import("platform_runtime");
 const persistence = @import("persistence.zig");
 const protocol_projection = @import("protocol_projection.zig");
-const test_backend = if (builtin.is_test) @import("root").test_backend else struct {};
+const test_backend = if (builtin.is_test) @import("desktop_test_root").test_backend else struct {};
 
 const ORG_NAME: [:0]const u8 = "verde";
 const APP_NAME: [:0]const u8 = "Native";

@@ -13,7 +13,7 @@ const chat_types = @import("chat_types.zig");
 const herdr_types = @import("herdr_types.zig");
 const project_state = @import("project.zig");
 const project_controller = @import("project_controller.zig");
-const test_backend = if (@import("builtin").is_test) @import("root").test_backend else struct {};
+const test_backend = if (@import("builtin").is_test) @import("desktop_test_root").test_backend else struct {};
 
 const log = std.log.scoped(.native_shell);
 const LoadedPersistedState = db_types.LoadedState;
