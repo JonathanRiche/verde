@@ -17,7 +17,7 @@ run = "bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && case \"$(uname 
 
 [tasks.dev-build]
 description = "Builds only the private desktop GUI executable for focused local iteration."
-run = "bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && zig build dev-build --release=safe -Dbrowser-backend=native_webview -Dchat-trace=true'"
+run = "bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && zig build dev-build --release=safe -Dbrowser-backend=native_webview -Ddev-trace=true'"
 
 [tasks.build-verify-install]
 description = "Rebuilds the Linux desktop into an isolated prefix and verifies the packaged runtime payload."

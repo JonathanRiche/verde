@@ -2442,7 +2442,7 @@ pub fn handleInspectorPromptSubmitted(self: anytype, message: []const u8) void {
     // pane retargets the thread for the send below.
     if (parsed.value.payload.target) |target| {
         if (std.mem.startsWith(u8, target, "tui:")) {
-            runtime_log.diagnostic("inspector prompt path=tui pane_token_len={d} prompt_len={d}", .{ target.len - "tui:".len, prompt.len });
+            runtime_log.trace("inspector prompt path=tui pane_token_len={d} prompt_len={d}", .{ target.len - "tui:".len, prompt.len });
             self.fillInspectorPromptIntoTui(target["tui:".len..], context_block, prompt, capture);
             return;
         }
@@ -2453,7 +2453,7 @@ pub fn handleInspectorPromptSubmitted(self: anytype, message: []const u8) void {
     const draft_text = std.mem.trim(u8, self.currentDraft(), &std.ascii.whitespace);
     const send_busy = thread.isSendPending();
     const composer_dirty = draft_text.len != 0 or thread.draftImageCount() != 0;
-    runtime_log.diagnostic("inspector prompt submitted prompt_len={d} target={} busy={} dirty={} capture={}", .{
+    runtime_log.trace("inspector prompt submitted prompt_len={d} target={} busy={} dirty={} capture={}", .{
         prompt.len,
         parsed.value.payload.target != null,
         send_busy,
@@ -2502,13 +2502,13 @@ pub fn handleInspectorPromptSubmitted(self: anytype, message: []const u8) void {
     };
 
     if (self.currentThread().isSendPending()) {
-        runtime_log.diagnostic("inspector prompt path=auto_send started", .{});
+        runtime_log.trace("inspector prompt path=auto_send started", .{});
         self.setSidebarNotice("Browser inspector prompt sent to the current chat.");
         self.notifyInspectorPromptResult(.sent, null);
     } else {
         // sendDraft bailed without starting (e.g. no provider target); the
         // composed body is still sitting in the composer draft.
-        runtime_log.diagnostic("inspector prompt path=auto_send did_not_start", .{});
+        runtime_log.trace("inspector prompt path=auto_send did_not_start", .{});
         self.syncPaletteComposerFromDraft();
         self.requestComposerFocus();
         self.setSidebarNotice("Browser inspector prompt was added to the composer draft.");
@@ -2552,11 +2552,11 @@ pub fn queueInspectorPromptAsFollowup(
     // queueOrSteerDraftDuringSend consumes and clears the draft on
     // success; a non-empty draft means it could not queue.
     if (self.currentDraft().len == 0) {
-        runtime_log.diagnostic("inspector prompt path=followup queued", .{});
+        runtime_log.trace("inspector prompt path=followup queued", .{});
         self.notifyInspectorPromptResult(.sent, null);
         return;
     }
-    runtime_log.diagnostic("inspector prompt path=followup queue_failed", .{});
+    runtime_log.trace("inspector prompt path=followup queue_failed", .{});
     self.syncPaletteComposerFromDraft();
     self.requestComposerFocus();
     self.notifyInspectorPromptResult(.drafted, null);
@@ -2652,7 +2652,7 @@ pub fn fallbackInspectorPromptToDraft(
     // prompt is actually visible to the user.
     self.syncPaletteComposerFromDraft();
     self.requestComposerFocus();
-    runtime_log.diagnostic("inspector prompt path=draft busy={}", .{send_busy});
+    runtime_log.trace("inspector prompt path=draft busy={}", .{send_busy});
     self.setSidebarNotice(if (send_busy)
         "Browser inspector prompt added to the draft; a send is already running."
     else
@@ -2669,14 +2669,14 @@ pub fn captureInspectorSelectionImage(
     viewport: ?InspectorViewportPayload,
 ) ?InspectorCapture {
     const vp = viewport orelse {
-        runtime_log.diagnostic("inspector capture skipped: no viewport payload", .{});
+        runtime_log.trace("inspector capture skipped: no viewport payload", .{});
         return null;
     };
     if (vp.width <= 0.0 or vp.height <= 0.0) return null;
     const css_rect: InspectorRectPayload = selection.rect orelse blk: {
         const element = selection.element orelse return null;
         break :blk element.rect orelse {
-            runtime_log.diagnostic("inspector capture skipped: selection has no rect", .{});
+            runtime_log.trace("inspector capture skipped: selection has no rect", .{});
             return null;
         };
     };
@@ -2685,7 +2685,7 @@ pub fn captureInspectorSelectionImage(
         log.warn("failed to copy browser frame for inspector capture: {s}", .{@errorName(err)});
         return null;
     }) orelse {
-        runtime_log.diagnostic("inspector capture skipped: no CPU frame available", .{});
+        runtime_log.trace("inspector capture skipped: no CPU frame available", .{});
         return null;
     };
     defer frame.deinit(self.allocator);
@@ -2827,7 +2827,7 @@ pub fn pushInspectorPromptTargets(self: anytype) void {
     ) catch return;
     defer self.allocator.free(script);
 
-    runtime_log.diagnostic("inspector targets push count={d}", .{targets.items.len});
+    runtime_log.trace("inspector targets push count={d}", .{targets.items.len});
     self.browser_controller.runtime.expectSuppressedEvalResult();
     self.browser_controller.runtime.controller.eval(script) catch |err| {
         _ = self.browser_controller.runtime.consumeSuppressedEvalResult();
@@ -2840,14 +2840,14 @@ pub fn pushInspectorPromptTargets(self: anytype) void {
 // into a JS string without escaping).
 pub fn notifyInspectorPromptResult(self: anytype, result: InspectorPromptResult, message: ?[]const u8) void {
     if (!self.canUseBrowserInspector() or !self.browser_controller.runtime.inspectorEnabled()) {
-        runtime_log.diagnostic("inspector ack skipped result={s} usable={} enabled={}", .{
+        runtime_log.trace("inspector ack skipped result={s} usable={} enabled={}", .{
             result.jsValue(),
             self.canUseBrowserInspector(),
             self.browser_controller.runtime.inspectorEnabled(),
         });
         return;
     }
-    runtime_log.diagnostic("inspector ack dispatch result={s}", .{result.jsValue()});
+    runtime_log.trace("inspector ack dispatch result={s}", .{result.jsValue()});
     const script = std.fmt.allocPrint(
         self.allocator,
         "(function() {{ const h = window.VerdeInspector && window.VerdeInspector.get ? window.VerdeInspector.get() : null; if (h && typeof h.notifyPromptResult === \"function\") h.notifyPromptResult(\"{s}\", \"{s}\"); }})();",

@@ -331,7 +331,7 @@ pub const Client = struct {
         if (request.reasoning_effort) |effort| try argv.appendSlice(self.allocator, &.{ "--thinking", @tagName(effort) });
 
         const cwd = request.cwd orelse self.config.cwd;
-        runtime_log.diagnostic("pi.sendPrompt spawning cwd={s}", .{cwd orelse "(inherit)"});
+        runtime_log.trace("pi.sendPrompt spawning cwd={s}", .{cwd orelse "(inherit)"});
         var child = try platform_process.spawn(self.allocator, threaded.io(), .{
             .argv = argv.items,
             .stdin = .pipe,
@@ -407,7 +407,7 @@ pub const Client = struct {
         }
 
         const thread_id = turn.thread_id orelse request.thread_id orelse return error.MissingSessionId;
-        runtime_log.diagnostic("pi.sendPrompt completed", .{});
+        runtime_log.trace("pi.sendPrompt completed", .{});
         return .{
             .thread_id = try allocator.dupe(u8, thread_id),
             .reply_text = try allocator.dupe(u8, turn.reply.items),

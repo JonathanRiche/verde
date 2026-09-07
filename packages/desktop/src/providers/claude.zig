@@ -432,7 +432,7 @@ pub const Client = struct {
 
         var threaded: std.Io.Threaded = .init(self.allocator, .{});
         defer threaded.deinit();
-        runtime_log.diagnostic("claude.runBridge spawning cwd={s} bridge={s}", .{ self.config.cwd orelse "(inherit)", bridge_path });
+        runtime_log.trace("claude.runBridge spawning cwd={s} bridge={s}", .{ self.config.cwd orelse "(inherit)", bridge_path });
         var child = try platform_process.spawn(self.allocator, threaded.io(), .{
             .argv = &.{ executable, bridge_path },
             .stdin = .pipe,
@@ -503,7 +503,7 @@ pub const Client = struct {
             .exited => |code| if (code != 0) return error.ClaudeRequestFailed,
             else => return error.ClaudeRequestFailed,
         }
-        runtime_log.diagnostic("claude.runBridge completed", .{});
+        runtime_log.trace("claude.runBridge completed", .{});
         return response;
     }
 

@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
     }
     const version_z: [:0]const u8 = b.allocator.dupeSentinel(u8, version, 0) catch @panic("OOM");
     const ui_debug = b.option(bool, "ui-debug", "Show the desktop UI debug window") orelse false;
-    const chat_trace = b.option(bool, "chat-trace", "Compile chat streaming/commit trace lines into the GUI (dev builds only)") orelse false;
+    const dev_trace = b.option(bool, "dev-trace", "Compile GUI flow-trace log lines (frame, RPC, paste, refresh breadcrumbs); dev builds only") orelse false;
     const palette_renderer = b.option(PaletteRendererBackend, "palette-renderer", "Palette frame renderer backend: sdl_gpu") orelse .sdl_gpu;
     const browser_backend = b.option(BrowserBackendKind, "browser-backend", "Browser backend: native_webview or stub") orelse .native_webview;
     const terminal_backend = b.option(bool, "terminal_backend", "Enable the native terminal backend") orelse true;
@@ -127,7 +127,7 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption([:0]const u8, "version", version_z);
     build_options.addOption(bool, "ui_debug", ui_debug);
-    build_options.addOption(bool, "chat_trace", chat_trace);
+    build_options.addOption(bool, "dev_trace", dev_trace);
     build_options.addOption(PaletteRendererBackend, "palette_renderer", palette_renderer);
     build_options.addOption(BrowserBackendKind, "browser_backend", browser_backend);
     build_options.addOption(bool, "terminal_backend", terminal_backend);

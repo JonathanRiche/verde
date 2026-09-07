@@ -1241,7 +1241,7 @@ pub fn toggleWorkspacePaneMaximized(self: anytype, project_index: usize, pane_id
     if (project_index >= self.project_controller.projects.items.len) return false;
     var layout = &self.project_controller.projects.items[project_index].workspace_layout;
     const pane = layout.paneById(pane_id) orelse return false;
-    runtime_log.diagnostic("pane maximize toggle begin project={d} pane={d} kind={s} currently_maximized={any}", .{
+    runtime_log.trace("pane maximize toggle begin project={d} pane={d} kind={s} currently_maximized={any}", .{
         project_index,
         pane_id,
         @tagName(pane.ref),
@@ -1251,7 +1251,7 @@ pub fn toggleWorkspacePaneMaximized(self: anytype, project_index: usize, pane_id
     layout.focused_pane_id = pane_id;
     _ = self.focusWorkspacePane(project_index, pane_id);
     self.markWorkspaceDirty(project_index);
-    runtime_log.diagnostic("pane maximize toggle done project={d} pane={d} maximized={any}", .{
+    runtime_log.trace("pane maximize toggle done project={d} pane={d} maximized={any}", .{
         project_index,
         pane_id,
         layout.maximized_pane_id,

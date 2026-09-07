@@ -510,7 +510,7 @@ fn pollCoreChangesOnce(storage: *const Storage, loop: *ChangeCursorLoopState, cu
     const volatile_changed = journalBatchHasVolatileEntries(result.entries);
     // Decision trace: pairs with the frame-thread "projection refresh applied"
     // line so a stall can be attributed to a specific journal batch.
-    runtime_log.diagnostic(
+    runtime_log.trace(
         "change-cursor batch entries={d} max_store_revision={d} observed_revision={d} settle_ms={d} decision={s}",
         .{
             result.entries.len,
@@ -1300,7 +1300,7 @@ fn prepareProjectionTranscriptContinuity(
             return;
         }
         if (replacement.messages.items.len == 0) {
-            runtime_log.diagnostic(
+            runtime_log.trace(
                 "projection transcript continuity skipped thread={s} current_start={d} current_end={d} replacement_start={d}",
                 .{ current.local_thread_id, current_start, current_end, replacement_start },
             );
@@ -6020,16 +6020,16 @@ pub const AppState = struct {
     }
 
     pub fn browseForProjectDirectory(self: *AppState) void {
-        runtime_log.diagnostic("browseForWorkspaceDirectory entry show_project_creator={} draft_len={d}", .{ self.project_controller.show_creator, self.importDirectoryDraft().len });
+        runtime_log.trace("browseForWorkspaceDirectory entry show_project_creator={} draft_len={d}", .{ self.project_controller.show_creator, self.importDirectoryDraft().len });
         log.info("browseForWorkspaceDirectory entry show_project_creator={} draft_len={d}", .{ self.project_controller.show_creator, self.importDirectoryDraft().len });
         const target_path = self.defaultExplorerPath() catch |err| {
-            runtime_log.diagnostic("browseForWorkspaceDirectory defaultExplorerPath failed: {s}", .{@errorName(err)});
+            runtime_log.trace("browseForWorkspaceDirectory defaultExplorerPath failed: {s}", .{@errorName(err)});
             log.warn("browseForWorkspaceDirectory defaultExplorerPath failed: {s}", .{@errorName(err)});
             self.project_directory_picker_create_parent = false;
             self.setSidebarNotice(@errorName(err));
             return;
         };
-        runtime_log.diagnostic("browseForWorkspaceDirectory target_path={s}", .{target_path});
+        runtime_log.trace("browseForWorkspaceDirectory target_path={s}", .{target_path});
         log.info("browseForWorkspaceDirectory target_path={s}", .{target_path});
         defer self.allocator.free(target_path);
         self.startDirectoryPickerWorker(target_path);
@@ -6048,7 +6048,7 @@ pub const AppState = struct {
         defer self.picker_state.mutex.unlock();
 
         if (self.picker_state.status == .pending) {
-            runtime_log.diagnostic("browseForWorkspaceDirectory ignored: picker already pending", .{});
+            runtime_log.trace("browseForWorkspaceDirectory ignored: picker already pending", .{});
             log.info("browseForWorkspaceDirectory ignored: picker already pending", .{});
             page_alloc.free(owned_target);
             self.project_directory_picker_create_parent = false;
@@ -6062,18 +6062,18 @@ pub const AppState = struct {
             page_alloc.free(owned_target);
             self.picker_state.status = .failed;
             self.project_directory_picker_create_parent = false;
-            runtime_log.diagnostic("browseForWorkspaceDirectory failed to spawn picker worker", .{});
+            runtime_log.trace("browseForWorkspaceDirectory failed to spawn picker worker", .{});
             log.warn("browseForWorkspaceDirectory failed to spawn picker worker", .{});
             self.setSidebarNotice("Failed to start folder picker.");
             return;
         };
-        runtime_log.diagnostic("browseForWorkspaceDirectory spawned picker worker", .{});
+        runtime_log.trace("browseForWorkspaceDirectory spawned picker worker", .{});
         log.info("browseForWorkspaceDirectory spawned picker worker", .{});
         self.setSidebarNotice("Waiting for folder selection...");
     }
 
     pub fn requestBrowseForProjectDirectory(self: *AppState) void {
-        runtime_log.diagnostic("requestBrowseForWorkspaceDirectory queued", .{});
+        runtime_log.trace("requestBrowseForWorkspaceDirectory queued", .{});
         log.info("requestBrowseForWorkspaceDirectory queued", .{});
         self.project_directory_picker_create_parent = false;
         self.project_directory_browse_requested = true;
@@ -6094,7 +6094,7 @@ pub const AppState = struct {
 
     pub fn processDeferredProjectDirectoryBrowse(self: *AppState) void {
         if (!self.project_directory_browse_requested) return;
-        runtime_log.diagnostic("processDeferredWorkspaceDirectoryBrowse running", .{});
+        runtime_log.trace("processDeferredWorkspaceDirectoryBrowse running", .{});
         log.info("processDeferredWorkspaceDirectoryBrowse running", .{});
         self.project_directory_browse_requested = false;
         self.browseForProjectDirectory();
@@ -6192,7 +6192,7 @@ pub const AppState = struct {
     /// Captures the SDL timestamp and main-thread arrival for a workspace hotkey.
     pub fn noteWorkspaceSwitchInput(self: *AppState, target_index: usize, sdl_timestamp_ns: u64, arrival_monotonic_ns: i128) void {
         if (self.workspace_switch_trace_pending) |pending| {
-            runtime_log.diagnostic(
+            runtime_log.trace(
                 "workspace-switch-trace seq={d} stage=superseded target_index={d} by_seq={d}",
                 .{ pending.sequence, pending.target_index, self.workspace_switch_trace_next_sequence },
             );
@@ -6205,7 +6205,7 @@ pub const AppState = struct {
             .last_stage_monotonic_ns = arrival_monotonic_ns,
         };
         self.workspace_switch_trace_input = trace;
-        runtime_log.diagnostic(
+        runtime_log.trace(
             "workspace-switch-trace seq={d} stage=input_receipt target_index={d} sdl_timestamp_ns={d} arrival_monotonic_ns={d}",
             .{ trace.sequence, target_index, sdl_timestamp_ns, arrival_monotonic_ns },
         );
@@ -6224,7 +6224,7 @@ pub const AppState = struct {
         const now_ns = profiler.nowNs();
         const stage_ns: u64 = if (now_ns > trace.last_stage_monotonic_ns) @intCast(now_ns - trace.last_stage_monotonic_ns) else 0;
         const total_ns: u64 = if (now_ns > trace.input_arrival_monotonic_ns) @intCast(now_ns - trace.input_arrival_monotonic_ns) else 0;
-        runtime_log.diagnostic(
+        runtime_log.trace(
             "workspace-switch-trace seq={d} stage=" ++ stage ++ " target_index={d} stage_ms={d:.2} elapsed_from_arrival_ms={d:.2}",
             .{ trace.sequence, trace.target_index, profiler.nsToMs(stage_ns), profiler.nsToMs(total_ns) },
         );
@@ -6234,7 +6234,7 @@ pub const AppState = struct {
     pub fn noteWorkspaceSwitchRenderStarted(self: *AppState) void {
         const trace = &(self.workspace_switch_trace_pending orelse return);
         trace.render_attempt +|= 1;
-        runtime_log.diagnostic(
+        runtime_log.trace(
             "workspace-switch-trace seq={d} stage=render_start target_index={d} attempt={d}",
             .{ trace.sequence, trace.target_index, trace.render_attempt },
         );
@@ -6242,7 +6242,7 @@ pub const AppState = struct {
 
     pub fn noteWorkspaceSwitchPresentDeferred(self: *const AppState) void {
         const trace = self.workspace_switch_trace_pending orelse return;
-        runtime_log.diagnostic(
+        runtime_log.trace(
             "workspace-switch-trace seq={d} stage=present_deferred target_index={d} attempt={d} reason=no_swapchain_texture",
             .{ trace.sequence, trace.target_index, trace.render_attempt },
         );
@@ -6250,7 +6250,7 @@ pub const AppState = struct {
 
     pub fn noteWorkspaceSwitchPresented(self: *AppState) void {
         const trace = self.workspace_switch_trace_pending orelse return;
-        runtime_log.diagnostic(
+        runtime_log.trace(
             "workspace-switch-trace seq={d} stage=present_submit_complete target_index={d} attempt={d} elapsed_from_arrival_ms={d:.2}",
             .{
                 trace.sequence,
@@ -6287,11 +6287,11 @@ pub const AppState = struct {
         trace.target_index = index;
         self.workspace_switch_trace_pending = trace;
         self.workspace_switch_frame_pending = true;
-        runtime_log.diagnostic(
+        runtime_log.trace(
             "workspace-switch-trace seq={d} stage=selection_applied target_index={d} selected_index={d}",
             .{ trace.sequence, index, self.project_controller.selected_index },
         );
-        runtime_log.diagnostic(
+        runtime_log.trace(
             "workspace-switch-trace seq={d} stage=frame_scheduled target_index={d} reason=selection_pending",
             .{ trace.sequence, index },
         );
@@ -6987,7 +6987,7 @@ pub const AppState = struct {
         }
         self.syncRenameBuffer();
         self.markDirty();
-        runtime_log.diagnostic("thread closed project={d} committed={} open_threads={d}", .{ project_index, committed, project.threads.items.len });
+        runtime_log.trace("thread closed project={d} committed={} open_threads={d}", .{ project_index, committed, project.threads.items.len });
         return true;
     }
 
@@ -7025,7 +7025,7 @@ pub const AppState = struct {
             project.threads.clearRetainingCapacity();
         }
         project.invalidateSidebarThreadCache();
-        runtime_log.diagnostic("workspace reopened threads={d} ok={}", .{ project.threads.items.len, ok });
+        runtime_log.trace("workspace reopened threads={d} ok={}", .{ project.threads.items.len, ok });
     }
 
     /// Fetches closed threads for the palette's HISTORY rows. One daemon
@@ -7090,7 +7090,7 @@ pub const AppState = struct {
         };
         thread.archived = false;
         if (self.lifecycle.cancelThreadClose(self.allocator, item.workspace_id, item.local_thread_id)) {
-            runtime_log.diagnostic("pending thread close cancelled by reopen thread={s}", .{item.local_thread_id});
+            runtime_log.trace("pending thread close cancelled by reopen thread={s}", .{item.local_thread_id});
         }
         const project = &self.project_controller.projects.items[pi];
         project.threads.append(self.allocator, thread) catch {
@@ -7103,7 +7103,7 @@ pub const AppState = struct {
         self.openThreadInWorkspaceSplit(pi, thread_index);
         self.markDirty();
         self.setSidebarNotice("Chat reopened from history.");
-        runtime_log.diagnostic("history thread reopened project={d} messages={d}", .{ pi, loaded.thread.messages.len });
+        runtime_log.trace("history thread reopened project={d} messages={d}", .{ pi, loaded.thread.messages.len });
     }
 
     pub fn archiveThreadAtIndex(self: *AppState, project_index: usize, thread_index: usize) void {
@@ -8012,7 +8012,7 @@ pub const AppState = struct {
         };
         log.info("openCurrentProjectDirectory completed", .{});
         self.external_open_close_suppress_until_ms = unixTimestampMs() + EXTERNAL_OPEN_CLOSE_SUPPRESS_MS;
-        runtime_log.diagnostic("openCurrentProjectDirectory close suppress until={d}", .{self.external_open_close_suppress_until_ms});
+        runtime_log.trace("openCurrentProjectDirectory close suppress until={d}", .{self.external_open_close_suppress_until_ms});
         self.setSidebarNotice("Opened workspace folder.");
     }
 
@@ -8548,7 +8548,7 @@ pub const AppState = struct {
 
         const image = capture.?;
         defer self.allocator.free(image.bytes);
-        runtime_log.diagnostic("clipboard image captured mime={s} bytes={d}", .{ image.mime, image.bytes.len });
+        runtime_log.trace("clipboard image captured mime={s} bytes={d}", .{ image.mime, image.bytes.len });
 
         const image_path = self.writeClipboardImageToStorage(image.mime, image.bytes) catch |err| {
             log.err("failed to persist clipboard image: {s}", .{@errorName(err)});
@@ -8565,7 +8565,7 @@ pub const AppState = struct {
             self.setSidebarNotice("Failed to attach clipboard image.");
             return true;
         };
-        runtime_log.diagnostic("clipboard image attached mime={s} bytes={d}", .{ image.mime, image.bytes.len });
+        runtime_log.trace("clipboard image attached mime={s} bytes={d}", .{ image.mime, image.bytes.len });
         self.setSidebarNotice("Clipboard image attached.");
         self.noteThreadDraftMutation(thread);
         return true;
@@ -8574,7 +8574,7 @@ pub const AppState = struct {
     pub fn pasteClipboardTextIntoPaletteComposer(self: *AppState) bool {
         if (self.project_controller.projects.items.len == 0) return false;
         if (self.isBrowserPaneFocused() or self.browser_controller.address_focused or self.palette_modal_text_focus != .none) {
-            runtime_log.diagnostic(
+            runtime_log.trace(
                 "palette paste blocked browser_focused={} address_focused={} modal_focus={s}",
                 .{ self.isBrowserPaneFocused(), self.browser_controller.address_focused, @tagName(self.palette_modal_text_focus) },
             );
@@ -8582,39 +8582,39 @@ pub const AppState = struct {
         }
         if (self.paletteComposerEditBlockedByAcceptance()) return true;
         const text = self.readClipboardTextForPaste() orelse {
-            runtime_log.diagnostic("palette paste clipboard text unavailable", .{});
+            runtime_log.trace("palette paste clipboard text unavailable", .{});
             return false;
         };
         defer self.allocator.free(text);
-        runtime_log.diagnostic("palette paste clipboard text len={d}", .{text.len});
+        runtime_log.trace("palette paste clipboard text len={d}", .{text.len});
         const handled = self.insertTextIntoPaletteComposer(text);
-        runtime_log.diagnostic("palette paste insert handled={} draft_len={d}", .{ handled, self.currentDraft().len });
+        runtime_log.trace("palette paste insert handled={} draft_len={d}", .{ handled, self.currentDraft().len });
         return handled;
     }
 
     pub fn readClipboardTextForPaste(self: *AppState) ?[]u8 {
         const clipboard_text = sdl.getClipboardText() catch |err| {
             log.warn("failed to read clipboard text: {s}", .{@errorName(err)});
-            runtime_log.diagnostic("palette paste SDL clipboard read failed: {s}", .{@errorName(err)});
+            runtime_log.trace("palette paste SDL clipboard read failed: {s}", .{@errorName(err)});
             return utils.captureClipboardText(self.allocator) catch |fallback_err| {
                 log.warn("failed to read fallback clipboard text: {s}", .{@errorName(fallback_err)});
-                runtime_log.diagnostic("palette paste fallback clipboard read failed: {s}", .{@errorName(fallback_err)});
+                runtime_log.trace("palette paste fallback clipboard read failed: {s}", .{@errorName(fallback_err)});
                 return null;
             };
         };
         defer sdl.free(@ptrCast(clipboard_text));
         const text = std.mem.span(clipboard_text);
         if (text.len > 0) {
-            runtime_log.diagnostic("palette paste SDL clipboard text len={d}", .{text.len});
+            runtime_log.trace("palette paste SDL clipboard text len={d}", .{text.len});
             return self.allocator.dupe(u8, text) catch |err| {
-                runtime_log.diagnostic("palette paste clipboard dupe failed: {s}", .{@errorName(err)});
+                runtime_log.trace("palette paste clipboard dupe failed: {s}", .{@errorName(err)});
                 return null;
             };
         }
-        runtime_log.diagnostic("palette paste SDL clipboard empty; trying fallback", .{});
+        runtime_log.trace("palette paste SDL clipboard empty; trying fallback", .{});
         return utils.captureClipboardText(self.allocator) catch |fallback_err| {
             log.warn("failed to read fallback clipboard text: {s}", .{@errorName(fallback_err)});
-            runtime_log.diagnostic("palette paste fallback clipboard read failed: {s}", .{@errorName(fallback_err)});
+            runtime_log.trace("palette paste fallback clipboard read failed: {s}", .{@errorName(fallback_err)});
             return null;
         };
     }
@@ -13196,7 +13196,7 @@ pub const AppState = struct {
         if (self.routeRunConfigKey(palette_key)) return true;
         if (palette_key.primary and palette_key.code == .v) {
             if (self.paletteComposerEditBlockedByAcceptance()) return true;
-            runtime_log.diagnostic(
+            runtime_log.trace(
                 "palette composer received primary-v focused={} draft_len={d}",
                 .{ self.composer_controller.composer.focused, self.currentDraft().len },
             );
@@ -14237,7 +14237,7 @@ pub const AppState = struct {
         self.picker_state.mutex.unlock();
 
         if (next_status != .idle) {
-            runtime_log.diagnostic("pollPicker completed status={s}", .{@tagName(next_status)});
+            runtime_log.trace("pollPicker completed status={s}", .{@tagName(next_status)});
             log.info("pollPicker completed status={s}", .{@tagName(next_status)});
             self.finishPickerThread();
         }
@@ -14389,7 +14389,7 @@ pub const AppState = struct {
                 log.warn("failed to apply daemon projection refresh: {s}", .{@errorName(err)});
                 return;
             };
-            runtime_log.diagnostic(
+            runtime_log.trace(
                 "projection refresh applied kind={s} store_revision={d} elapsed_ms={d} reuse_gate={s} reused={d} rebuilt={d} threads_reused={d} threads_rebuilt={d}",
                 .{
                     if (durable_already_projected) "durable_downgraded" else if (refresh.durable != null) "durable" else "volatile",
