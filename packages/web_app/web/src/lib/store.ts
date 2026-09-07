@@ -2866,7 +2866,15 @@ function createAppStore() {
     const ws = pane
       ? workspaces().find((item) => item.workspace_id === pane.workspace_id)
       : workspace()
-    if (!pane || !ws) return
+    if (!pane || !ws) {
+      // Prefix x / Close pane on an empty workspace archives it, matching
+      // desktop and tmux. A targeted close (header/menu) no-ops.
+      if (target != null) return
+      const current = workspace()
+      if (!current || openPanes().length !== 0) return
+      void runSidebarContextAction({ action: 'workspace-close', workspace: current })
+      return
+    }
     // Optimistic close: drop the pane from every local projection source so
     // the strip updates immediately. The scoped refresh after the close RPC
     // reconciles — and restores the pane if the close was rejected.
