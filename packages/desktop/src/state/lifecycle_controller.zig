@@ -18,6 +18,9 @@ const runtime_log = @import("../runtime/log.zig");
 const SAVE_DEBOUNCE_MS: i64 = 750;
 /// Minimum delay before retrying a failed frame-loop flush (avoids per-frame storms).
 const FLUSH_RETRY_BACKOFF_MS: i64 = 2000;
+/// Consecutive revision conflicts double the retry delay up to this bound so a
+/// save that keeps losing races never becomes a steady capture-and-reject loop.
+const FLUSH_CONFLICT_BACKOFF_MAX_MS: i64 = 60_000;
 /// When persistence is unavailable, probe no more often than this interval.
 const FLUSH_UNAVAILABLE_PROBE_MS: i64 = 5000;
 /// A rejected payload cannot become valid through rapid retries. This path is
@@ -83,6 +86,8 @@ pub const State = struct {
     flush_snapshot_generation: u64 = 0,
     /// Earliest wall-clock ms to attempt another frame-loop flush after a failure.
     next_flush_attempt_ms: i64 = 0,
+    /// Revision conflicts since the last acknowledged or spooled flush.
+    flush_conflict_streak: u32 = 0,
     /// First failed save in the current uninterrupted dirty-state episode.
     /// Daemon read heartbeats must not clear this; only a durable save or spool
     /// can prove the user's pending changes are safe.
@@ -278,6 +283,36 @@ pub const State = struct {
         self.clearPersistenceFailure();
         if (self.snapshot_capture) |*capture| capture.deinit();
         self.snapshot_capture = null;
+    }
+
+    /// Retain a conflicted flush capture so the refresh gate lets the next
+    /// daemon projection apply and rebase the local edits. Every flush kind
+    /// needs this: the dirty-state gate defers refreshes until a rebase
+    /// capture exists, and only an applied refresh advances the observed
+    /// revision the retry sends. Workspace and selection conflicts used to
+    /// skip the stash, so the retry carried the same stale revision every two
+    /// seconds for as long as the app stayed open. The merge path rebuilds
+    /// the local overlay from live state, so the capture contents only mark
+    /// that a rebase is pending; a null baseline falls back to the retained
+    /// projection baseline when its revision still matches.
+    pub fn stashConflictRebase(self: *State, args: *FlushWorkerArgs) void {
+        if (self.rebase_snapshot) |*old| old.deinit();
+        if (self.rebase_baseline) |*old| old.deinit();
+        self.rebase_snapshot = args.loaded;
+        args.loaded = null;
+        self.rebase_baseline = args.baseline;
+        args.baseline = null;
+        self.rebase_baseline_revision = if (self.rebase_baseline != null) args.observed_revision else null;
+        self.rebase_capture_revision = args.observed_revision;
+    }
+
+    /// Record one more consecutive conflict and schedule the retry with the
+    /// doubled backoff. Returns the delay chosen.
+    pub fn noteFlushConflict(self: *State, now_ms: i64) i64 {
+        self.flush_conflict_streak +|= 1;
+        const backoff_ms = conflictRetryBackoffMs(self.flush_conflict_streak);
+        self.next_flush_attempt_ms = now_ms + backoff_ms;
+        return backoff_ms;
     }
 
     pub fn deinit(self: *State) void {
@@ -773,15 +808,8 @@ pub fn pollFlushWorker(self: anytype) void {
     var flush_kind: FlushKind = .snapshot;
     if (self.lifecycle.flush_args) |args| {
         flush_kind = args.kind;
-        if (conflict and args.kind == .snapshot) {
-            if (self.lifecycle.rebase_snapshot) |*old| old.deinit();
-            if (self.lifecycle.rebase_baseline) |*old| old.deinit();
-            self.lifecycle.rebase_snapshot = args.loaded;
-            args.loaded = null;
-            self.lifecycle.rebase_baseline = args.baseline;
-            args.baseline = null;
-            self.lifecycle.rebase_baseline_revision = if (self.lifecycle.rebase_baseline != null) args.observed_revision else null;
-            self.lifecycle.rebase_capture_revision = args.observed_revision;
+        if (conflict) {
+            self.lifecycle.stashConflictRebase(args);
         } else if (success and args.kind != .workspace) {
             // Save acknowledgement and baseline publication are one frame-thread
             // transaction. Conflict merges only inspect metadata, so retain a
@@ -840,16 +868,22 @@ pub fn pollFlushWorker(self: anytype) void {
             self.lifecycle.last_full_dirty_caller,
         });
         self.lifecycle.next_flush_attempt_ms = 0;
+        self.lifecycle.flush_conflict_streak = 0;
         clearCloseDurabilityNoticeAfterSuccess(self);
     } else if (spooled) {
         // The spool owns exactly the captured generation. A newer edit resets
         // dirty_spooled through markDirty and schedules a replacement spool.
         if (rejected) log.warn("durably spooled daemon-rejected native state snapshot", .{});
         noteCompletedSpool(&self.lifecycle, self.lifecycle.flush_snapshot_generation);
+        self.lifecycle.flush_conflict_streak = 0;
         clearCloseDurabilityNoticeAfterSuccess(self);
     } else if (conflict) {
-        log.warn("async native state save conflicted; awaiting cursor rebase", .{});
-        self.lifecycle.next_flush_attempt_ms = now + FLUSH_RETRY_BACKOFF_MS;
+        const backoff_ms = self.lifecycle.noteFlushConflict(now);
+        log.warn("async native state save conflicted kind={s} streak={d} retry_in_ms={d}; awaiting cursor rebase", .{
+            @tagName(flush_kind),
+            self.lifecycle.flush_conflict_streak,
+            backoff_ms,
+        });
     } else if (rejected) {
         // A rejected payload cannot heal through immediate retries. If the
         // durable spool itself failed, keep the state dirty but make retries
@@ -863,6 +897,62 @@ pub fn pollFlushWorker(self: anytype) void {
         storage.markPersistenceUnavailable();
         self.lifecycle.next_flush_attempt_ms = now + FLUSH_UNAVAILABLE_PROBE_MS;
     }
+}
+
+/// Retry delay after `streak` consecutive revision conflicts: the base
+/// backoff doubled per extra conflict and capped at the bound above.
+fn conflictRetryBackoffMs(streak: u32) i64 {
+    const doublings: u6 = @intCast(@min(streak -| 1, 16));
+    return @min(FLUSH_RETRY_BACKOFF_MS << doublings, FLUSH_CONFLICT_BACKOFF_MAX_MS);
+}
+
+test "conflict retry backoff doubles per consecutive conflict up to the bound" {
+    try std.testing.expectEqual(FLUSH_RETRY_BACKOFF_MS, conflictRetryBackoffMs(0));
+    try std.testing.expectEqual(FLUSH_RETRY_BACKOFF_MS, conflictRetryBackoffMs(1));
+    try std.testing.expectEqual(FLUSH_RETRY_BACKOFF_MS * 2, conflictRetryBackoffMs(2));
+    try std.testing.expectEqual(FLUSH_RETRY_BACKOFF_MS * 8, conflictRetryBackoffMs(4));
+    try std.testing.expectEqual(FLUSH_CONFLICT_BACKOFF_MAX_MS, conflictRetryBackoffMs(6));
+    try std.testing.expectEqual(FLUSH_CONFLICT_BACKOFF_MAX_MS, conflictRetryBackoffMs(std.math.maxInt(u32)));
+}
+
+test "workspace flush conflict stashes a rebase capture and backs off" {
+    const allocator = std.testing.allocator;
+    var lifecycle: State = .{};
+    defer lifecycle.deinit();
+    lifecycle.dirty = true;
+    lifecycle.projection_baseline = LoadedPersistedState.init(allocator);
+    lifecycle.projection_baseline_revision = 7;
+
+    for ([_]u32{ 1, 2, 3 }) |expected_streak| {
+        var result: FlushWorkerResult = .{ .conflict = true };
+        var args: FlushWorkerArgs = .{
+            .allocator = allocator,
+            .storage = undefined,
+            .loaded = LoadedPersistedState.init(allocator),
+            .baseline = null,
+            .kind = .workspace,
+            .observed_revision = 7,
+            .result = &result,
+        };
+        defer if (args.loaded) |*loaded| loaded.deinit();
+        lifecycle.stashConflictRebase(&args);
+        const backoff_ms = lifecycle.noteFlushConflict(1000);
+
+        try std.testing.expect(args.loaded == null);
+        try std.testing.expect(lifecycle.dirty);
+        try std.testing.expect(lifecycle.rebase_snapshot != null);
+        try std.testing.expect(lifecycle.rebase_baseline == null);
+        try std.testing.expectEqual(@as(?u64, null), lifecycle.rebase_baseline_revision);
+        try std.testing.expectEqual(@as(?u64, 7), lifecycle.rebase_capture_revision);
+        // The retained projection baseline still pairs with the observed
+        // revision, so the rebase merge keeps local edits.
+        try std.testing.expect(lifecycle.projection_baseline != null);
+        try std.testing.expectEqual(@as(?u64, 7), lifecycle.projection_baseline_revision);
+        try std.testing.expectEqual(expected_streak, lifecycle.flush_conflict_streak);
+        try std.testing.expectEqual(conflictRetryBackoffMs(expected_streak), backoff_ms);
+        try std.testing.expectEqual(1000 + backoff_ms, lifecycle.next_flush_attempt_ms);
+    }
+    try std.testing.expectEqual(FLUSH_RETRY_BACKOFF_MS * 4, lifecycle.next_flush_attempt_ms - 1000);
 }
 
 fn snapshotContext(self: anytype) persistence.SnapshotContext {
