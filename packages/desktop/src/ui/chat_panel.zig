@@ -24,6 +24,7 @@ const text_measure = @import("text_measure.zig");
 const theme = @import("theme.zig");
 
 const log = std.log.scoped(.chat_panel);
+const runtime_log = @import("../runtime/log.zig");
 
 const TOP_BAR_HEIGHT: f32 = 57.0; // ~70% of legacy 82px cap
 const WORKSPACE_HEADER_ICON_CONTROL_CSS: f32 = 30.0;
@@ -3562,10 +3563,11 @@ fn transcriptBlankLogKey(thread: anytype, reason: []const u8) u64 {
 }
 
 fn logTranscriptBlankFrame(thread: anytype, reason: []const u8) void {
+    if (comptime !runtime_log.chat_trace_enabled) return;
     const key = transcriptBlankLogKey(thread, reason);
     if (key == transcript_blank_log_key) return;
     transcript_blank_log_key = key;
-    log.info(
+    runtime_log.trace(
         "transcript blank frame reason={s} thread={s} messages={d} persisted_offset={d} send_pending={} layout_valid={} layout_first={d} layout_count={d} layout_items={d}",
         .{
             reason,
@@ -3582,10 +3584,11 @@ fn logTranscriptBlankFrame(thread: anytype, reason: []const u8) void {
 }
 
 fn logTranscriptBlankFrameDetail(thread: anytype, reason: []const u8, scroll_y: f32, estimated_height: f32, viewport_h: f32) void {
+    if (comptime !runtime_log.chat_trace_enabled) return;
     const key = transcriptBlankLogKey(thread, reason);
     if (key == transcript_blank_log_key) return;
     logTranscriptBlankFrame(thread, reason);
-    log.info(
+    runtime_log.trace(
         "transcript blank frame detail scroll_y={d:.1} estimated_height={d:.1} viewport_h={d:.1} committed_height={d:.1} requested_height={d:.1} visible_ready={}",
         .{
             scroll_y,
@@ -3603,10 +3606,11 @@ var transcript_stream_was_pending: bool = false;
 /// Diagnostic: the first idle frame after a stream, with the geometry the
 /// pane resolved for it (chasing "reply missing after the commit").
 fn logTranscriptStreamSettled(thread: anytype, has_pending_stream: bool, content_height: f32, max_scroll: f32, scroll_y: f32, saved_scroll: ?f32, follow_tail: bool, viewport_h: f32) void {
+    if (comptime !runtime_log.chat_trace_enabled) return;
     defer transcript_stream_was_pending = has_pending_stream;
     if (has_pending_stream or !transcript_stream_was_pending) return;
     const last_role: []const u8 = if (thread.messages.items.len > 0) @tagName(thread.messages.items[thread.messages.items.len - 1].role) else "none";
-    log.info(
+    runtime_log.trace(
         "transcript stream settled thread={s} messages={d} last_role={s} content_height={d:.1} max_scroll={d:.1} scroll_y={d:.1} saved_scroll={?d:.1} follow_tail={} viewport_h={d:.1} layout_valid={} layout_first={d} layout_count={d} layout_items={d} committed_height={d:.1} persisted_offset={d}",
         .{
             thread.local_thread_id,

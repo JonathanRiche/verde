@@ -1,6 +1,11 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const platform_runtime = @import("platform_runtime");
+const build_options = @import("build_options");
+
+/// Chat streaming/commit trace lines exist only in `-Dchat-trace=true`
+/// builds (`mise run dev-build`). Release builds compile them out entirely.
+pub const chat_trace_enabled: bool = @hasDecl(build_options, "chat_trace") and build_options.chat_trace;
 
 const STDERR_LOG_FILE_NAME = "verde.stderr.log";
 const LAST_CRASH_LOG_FILE_NAME = "last-crash.log";
@@ -95,6 +100,12 @@ pub fn init(io: std.Io, pref_path: []const u8) !void {
 
 pub fn stderrLogPath() ?[]const u8 {
     return stderr_log_path;
+}
+
+/// Dev-only diagnostic: a no-op unless the build enabled `chat_trace`.
+pub inline fn trace(comptime format: []const u8, args: anytype) void {
+    if (comptime !chat_trace_enabled) return;
+    diagnostic(format, args);
 }
 
 pub fn diagnostic(comptime format: []const u8, args: anytype) void {
