@@ -305,43 +305,47 @@ fn handleUpdate(allocator: std.mem.Allocator, out: output.Output, argv: []const 
         return;
     }
 
-    const launch = update_installer.launch(allocator) catch |err| {
-        if (json) {
-            try out.jsonValue(allocator, .{
-                .ok = false,
-                .@"error" = .{ .code = "launch_failed", .message = @errorName(err) },
-            });
-        } else {
-            try out.stderr("failed to start Verde updater: {s}\n", .{@errorName(err)});
-        }
+    const package_command = update_installer.packageUpdateCommand(allocator) catch |err| {
+        try reportUpdateError(allocator, out, json, @errorName(err));
         std.process.exit(1);
     };
-
-    if (update_installer.aurCommand(launch)) |command| {
+    if (package_command) |command| {
         if (json) {
             try out.jsonValue(allocator, .{
                 .ok = true,
-                .result = .{
-                    .status = "package_manager_required",
-                    .command = if (launch == .aur_yay) "yay -S verde-bin" else "paru -S verde-bin",
-                },
+                .result = .{ .status = "package_manager_required", .command = command },
             });
         } else {
-            try out.stdout("This Verde installation is managed by the AUR. Run `{s} -S verde-bin` in a terminal.\n", .{command[0]});
+            try out.stdout("Update this installation with your package manager: {s}\nAUR packages require yay or paru.\n", .{command});
         }
         return;
     }
-    if (launch == .aur_helper_missing) {
-        if (json) {
-            try out.jsonValue(allocator, .{
-                .ok = false,
-                .@"error" = .{ .code = "aur_helper_missing", .message = "Install yay or paru to update the AUR package." },
-            });
-        } else {
-            try out.stderr("Verde is managed by the AUR, but neither yay nor paru was found.\n", .{});
+    if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
+        const exit_code = update_installer.run(allocator, json) catch |err| {
+            try reportUpdateError(allocator, out, json, @errorName(err));
+            std.process.exit(1);
+        };
+        if (exit_code != 0) {
+            if (json) {
+                try out.jsonValue(allocator, .{
+                    .ok = false,
+                    .@"error" = .{ .code = "installer_failed", .exit_code = exit_code, .message = "The installer failed. See stderr for details." },
+                });
+            } else {
+                try out.stderr("Verde update failed (exit {d}). Review the installer output above.\n", .{exit_code});
+            }
+            std.process.exit(exit_code);
         }
-        std.process.exit(1);
+        if (json) try out.jsonValue(allocator, .{
+            .ok = true,
+            .result = .{ .status = "installed", .restart_required = true, .app_exit_required = false },
+        });
+        return;
     }
+    const launch = update_installer.launch(allocator) catch |err| {
+        try reportUpdateError(allocator, out, json, @errorName(err));
+        std.process.exit(1);
+    };
 
     const app_exit_required = launch == .started_and_exit_required;
     if (json) {
@@ -359,6 +363,14 @@ fn handleUpdate(allocator: std.mem.Allocator, out: output.Output, argv: []const 
         try out.stdout("Verde updater started. Installation will continue after this process exits.\n", .{});
     } else {
         try out.stdout("Verde updater started. Restart Verde after installation completes.\n", .{});
+    }
+}
+
+fn reportUpdateError(allocator: std.mem.Allocator, out: output.Output, json: bool, message: []const u8) !void {
+    if (json) {
+        try out.jsonValue(allocator, .{ .ok = false, .@"error" = .{ .code = "update_failed", .message = message } });
+    } else {
+        try out.stderr("Verde update failed: {s}\n", .{message});
     }
 }
 
