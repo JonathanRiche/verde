@@ -130,7 +130,7 @@ stops, the view stops. Do not expect a multi-frame glide.
 
 ## Prefix mode (tmux-style)
 
-Prefix mode is **off by default**. When enabled, pressing the prefix chord
+Prefix mode is **on by default**. Pressing the prefix chord
 (`Ctrl+B` by default) arms Verde for one keypress: the next key resolves
 against the prefix table below instead of reaching the focused pane. While
 armed, a one-line status bar appears along the bottom (`PREFIX  esc cancel
@@ -140,11 +140,11 @@ chord. `Esc` cancels,
 an unbound key is swallowed, and pressing the prefix twice sends the literal
 chord to the focused terminal (tmux `send-prefix`).
 
-Every built-in command has a default seat in the prefix table, so turning it
-on exposes the whole command surface without remapping anything:
+Every built-in command has a default seat in the prefix table, with no
+configuration required. To disable prefix mode:
 
 ```json
-{ "keybinds": { "prefix": true } }
+{ "keybinds": { "prefix": false } }
 ```
 
 Change the prefix chord with a string (which also enables prefix mode), or use

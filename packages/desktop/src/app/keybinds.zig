@@ -133,9 +133,9 @@ pub const DEFAULT_PREFIX_ACCELERATOR = "Ctrl+B";
 
 /// tmux-style prefix mode. Pressing any `keys` chord arms the next keypress,
 /// which then resolves against `bindings` instead of the direct tables.
-/// Disabled by default so existing direct shortcuts keep working unchanged.
+/// Enabled by default; configuration can disable it or change the prefix chord.
 pub const PrefixConfig = struct {
-    enabled: bool = false,
+    enabled: bool = true,
     keys: []Keybind,
     bindings: std.ArrayList(PrefixBinding),
     /// Second table used while navigate mode is active.
@@ -1710,7 +1710,7 @@ fn cloneDefaultPrefixConfig(allocator: std.mem.Allocator) !PrefixConfig {
     errdefer bindings.deinit(allocator);
     const navigate = try cloneDefaultPrefixTable(allocator, &DEFAULT_NAVIGATE_TABLE);
 
-    return .{ .enabled = false, .keys = keys, .bindings = bindings, .navigate = navigate };
+    return .{ .keys = keys, .bindings = bindings, .navigate = navigate };
 }
 
 fn cloneDefaultKeybinds(allocator: std.mem.Allocator) ![]Keybind {
@@ -3109,13 +3109,13 @@ test "legacy terminal keybind override still maps to terminal toggle" {
     try std.testing.expectEqual(sdl.Keycode.j, config.toggle_terminal[0].key);
 }
 
-test "prefix mode is off by default and arms on ctrl b" {
+test "prefix mode is on by default and arms on ctrl b" {
     // Built-in defaults only: `load` merges the developer's real verde.json,
-    // which may legitimately enable prefix mode.
+    // which may legitimately disable prefix mode.
     var prefix = try cloneDefaultPrefixConfig(std.testing.allocator);
     defer prefix.deinit(std.testing.allocator);
 
-    try std.testing.expect(!prefix.enabled);
+    try std.testing.expect(prefix.enabled);
     try std.testing.expectEqual(@as(usize, 1), prefix.keys.len);
     try std.testing.expect(prefix.keys[0].ctrl);
     try std.testing.expectEqual(sdl.Keycode.b, prefix.keys[0].key);
