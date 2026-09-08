@@ -1205,11 +1205,9 @@ pub fn updateInstallerButtonLabel(self: anytype) []const u8 {
 }
 
 fn startUpdateTerminal(self: anytype) !void {
-    var threaded: std.Io.Threaded = .init(self.allocator, .{});
-    defer threaded.deinit();
-    const executable = try std.process.executablePathAlloc(threaded.io(), self.allocator);
-    defer self.allocator.free(executable);
-    const command: []const []const u8 = &.{ "sh", "-c", update_installer.TERMINAL_INSTALL_SCRIPT, "verde-update", executable };
+    const launcher = try update_installer.launcherPathAlloc(self.allocator);
+    defer self.allocator.free(launcher);
+    const command: []const []const u8 = &.{ launcher, "update" };
     if (self.project_controller.projects.items.len == 0) return error.NoProjectSelected;
     self.ensureCurrentProjectWorkspace();
 
