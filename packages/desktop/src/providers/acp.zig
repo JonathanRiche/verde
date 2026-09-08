@@ -198,6 +198,11 @@ pub const SendPromptState = struct {
     prompt_submitted: bool = false,
     reply: std.ArrayList(u8) = .empty,
     agent_error_emitted: bool = false,
+    /// True while `agent_thought_chunk` updates are streaming and no visible
+    /// reply text or tool call has followed them yet.
+    thinking: bool = false,
+    /// Count of thought segments seen this turn; keys the transient row ids.
+    thought_segments: u32 = 0,
 
     pub fn deinit(self: *SendPromptState, allocator: std.mem.Allocator) void {
         if (self.session_id) |session_id| allocator.free(session_id);
@@ -279,7 +284,11 @@ pub fn handleSendPromptLine(
 ) !SendLineAction {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
     defer parsed.deinit();
-    try failIfJsonRpcError(harness, parsed.value);
+    failIfJsonRpcError(harness, parsed.value) catch |err| {
+        finishThinking(request, state);
+        reportJsonRpcFailure(request, parsed.value);
+        return err;
+    };
 
     // ACP server requests have their own JSON-RPC id sequence. Handle them
     // before matching response ids so a permission request cannot collide
@@ -303,6 +312,7 @@ pub fn handleSendPromptLine(
             return .session_ready;
         }
         if (id == 3) {
+            finishThinking(request, state);
             // ACP reports agent-side turn failures (unknown model for the
             // active provider, gateway HTTP errors) as a successful response
             // with stopReason "refused"; the only diagnostic is the streamed
@@ -652,9 +662,16 @@ fn handleLiveSessionUpdate(
 ) !void {
     const update = sessionUpdateObject(value) orelse return;
     const kind = getOptionalObjectString(update, "sessionUpdate") orelse return;
+    if (std.mem.eql(u8, kind, "agent_thought_chunk")) {
+        // Reasoning text is never shown; like Codex, it only drives the
+        // transient "Thinking" indicator until visible output arrives.
+        startThinking(request, state);
+        return;
+    }
     if (std.mem.eql(u8, kind, "agent_message_chunk")) {
         const text = contentText(update) orelse return;
         if (text.len == 0) return;
+        finishThinking(request, state);
         if (harness.agent_error_message) |agent_error_message| {
             if (agent_error_message(text)) |message| {
                 if (state.agent_error_emitted) return;
@@ -684,6 +701,7 @@ fn handleLiveSessionUpdate(
         return;
     }
     if (std.mem.eql(u8, kind, "tool_call") or std.mem.eql(u8, kind, "tool_call_update")) {
+        finishThinking(request, state);
         const event = (try toolEventAlloc(allocator, update)) orelse return;
         defer event.deinit(allocator);
         if (request.on_stream_event) |on_stream_event| {
@@ -701,6 +719,45 @@ fn handleLiveSessionUpdate(
             emitDiffUpdate(allocator, update, event.output, request.stream_context, on_stream_event);
         }
     }
+}
+
+/// Opens a content-less `think` row so the GUI shows "Thinking" while an
+/// agent streams reasoning. The shared upsert drops the row again once the
+/// terminal status lands, mirroring Codex reasoning items.
+fn startThinking(request: provider_types.SendPromptRequest, state: *SendPromptState) void {
+    if (state.thinking) return;
+    state.thinking = true;
+    state.thought_segments +|= 1;
+    emitThinkStatus(request, state.thought_segments, .in_progress);
+}
+
+fn finishThinking(request: provider_types.SendPromptRequest, state: *SendPromptState) void {
+    if (!state.thinking) return;
+    state.thinking = false;
+    emitThinkStatus(request, state.thought_segments, .completed);
+}
+
+fn emitThinkStatus(request: provider_types.SendPromptRequest, segment: u32, status: provider_types.ToolCallStatus) void {
+    const on_stream_event = request.on_stream_event orelse return;
+    var id_buf: [32]u8 = undefined;
+    const call_id = std.fmt.bufPrint(&id_buf, "acp-thought-{d}", .{segment}) catch return;
+    on_stream_event(request.stream_context, .{ .tool_call = .{
+        .call_id = call_id,
+        .title = "",
+        .kind = .think,
+        .status = status,
+    } });
+}
+
+/// Surfaces the agent's own JSON-RPC error text (image rejected, session
+/// inactive, credential expired) so the failed turn explains itself instead
+/// of showing a bare error name.
+fn reportJsonRpcFailure(request: provider_types.SendPromptRequest, value: std.json.Value) void {
+    const on_failure = request.on_failure orelse return;
+    const error_value = getObjectField(value, "error") orelse return;
+    const message = std.mem.trim(u8, getOptionalObjectString(error_value, "message") orelse return, " \t\r\n");
+    if (message.len == 0) return;
+    on_failure(request.stream_context, message);
 }
 
 fn emitDiffUpdate(
@@ -1407,10 +1464,15 @@ fn mimeTypeForPath(path: []const u8) []const u8 {
 }
 
 fn isAuthError(message: []const u8) bool {
+    // fx 0.0.8 reports expired or replaced credentials at prompt time as
+    // "<provider> requires a new sign-in." / "Credential ..." notices.
     return std.mem.indexOf(u8, message, "auth") != null or
         std.mem.indexOf(u8, message, "login") != null or
         std.mem.indexOf(u8, message, "API key") != null or
-        std.mem.indexOf(u8, message, "unauthorized") != null;
+        std.mem.indexOf(u8, message, "unauthorized") != null or
+        std.mem.indexOf(u8, message, "sign-in") != null or
+        std.mem.indexOf(u8, message, "sign in") != null or
+        std.ascii.indexOfIgnoreCase(message, "credential") != null;
 }
 
 const TEST_HARNESS: Harness = .{
@@ -1790,6 +1852,102 @@ test "handleSendPromptLine fails the turn when the prompt result is refused" {
         \\{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}
     ;
     try std.testing.expectEqual(SendLineAction.prompt_done, try handleSendPromptLine(std.testing.allocator, TEST_HARNESS, done, request, &state, null));
+}
+
+test "agent_thought_chunk drives a transient think lifecycle" {
+    const Capture = struct {
+        var in_progress: usize = 0;
+        var completed: usize = 0;
+        var last_call_id: [32]u8 = undefined;
+        var last_call_id_len: usize = 0;
+        fn onEvent(_: ?*anyopaque, event: provider_types.StreamEvent) void {
+            switch (event) {
+                .tool_call => |call| {
+                    if ((call.kind orelse .other) != .think) return;
+                    if (call.input != null or call.output != null) return;
+                    switch (call.status orelse .unknown) {
+                        .in_progress => in_progress += 1,
+                        .completed => completed += 1,
+                        else => {},
+                    }
+                    last_call_id_len = @min(call.call_id.len, last_call_id.len);
+                    @memcpy(last_call_id[0..last_call_id_len], call.call_id[0..last_call_id_len]);
+                },
+                else => {},
+            }
+        }
+    };
+    Capture.in_progress = 0;
+    Capture.completed = 0;
+    var state: SendPromptState = .{};
+    defer state.deinit(std.testing.allocator);
+    state.prompt_submitted = true;
+    const request = provider_types.SendPromptRequest{ .prompt = "yo", .on_stream_event = Capture.onEvent };
+    const thought =
+        \\{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"considering"}}}}
+    ;
+    const reply =
+        \\{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","messageId":"m1","content":{"type":"text","text":"Ready."}}}}
+    ;
+    const done =
+        \\{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn","usage":{"inputTokens":10,"outputTokens":2}}}
+    ;
+    // Consecutive thought chunks open one row; the first visible text closes it.
+    _ = try handleSendPromptLine(std.testing.allocator, TEST_HARNESS, thought, request, &state, null);
+    _ = try handleSendPromptLine(std.testing.allocator, TEST_HARNESS, thought, request, &state, null);
+    try std.testing.expect(state.thinking);
+    try std.testing.expectEqual(@as(usize, 1), Capture.in_progress);
+    try std.testing.expectEqual(@as(usize, 0), Capture.completed);
+    _ = try handleSendPromptLine(std.testing.allocator, TEST_HARNESS, reply, request, &state, null);
+    try std.testing.expect(!state.thinking);
+    try std.testing.expectEqual(@as(usize, 1), Capture.completed);
+    try std.testing.expectEqualStrings("acp-thought-1", Capture.last_call_id[0..Capture.last_call_id_len]);
+    // A second reasoning segment gets a fresh row id and is closed by the
+    // prompt response when nothing visible follows it.
+    _ = try handleSendPromptLine(std.testing.allocator, TEST_HARNESS, thought, request, &state, null);
+    try std.testing.expectEqual(@as(usize, 2), Capture.in_progress);
+    try std.testing.expectEqualStrings("acp-thought-2", Capture.last_call_id[0..Capture.last_call_id_len]);
+    try std.testing.expectEqual(SendLineAction.prompt_done, try handleSendPromptLine(std.testing.allocator, TEST_HARNESS, done, request, &state, null));
+    try std.testing.expect(!state.thinking);
+    try std.testing.expectEqual(@as(usize, 2), Capture.completed);
+    // Thought text never reaches the reply.
+    try std.testing.expectEqualStrings("Ready.", state.reply.items);
+}
+
+test "handleSendPromptLine reports JSON-RPC error text through on_failure" {
+    const Capture = struct {
+        var message: [128]u8 = undefined;
+        var message_len: usize = 0;
+        fn onFailure(_: ?*anyopaque, text: []const u8) void {
+            message_len = @min(text.len, message.len);
+            @memcpy(message[0..message_len], text[0..message_len]);
+        }
+    };
+    Capture.message_len = 0;
+    var state: SendPromptState = .{};
+    defer state.deinit(std.testing.allocator);
+    state.prompt_submitted = true;
+    const request = provider_types.SendPromptRequest{ .prompt = "look", .on_failure = Capture.onFailure };
+    const rejected =
+        \\{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"Image prompt exceeds size limit"}}
+    ;
+    try std.testing.expectError(error.AcpFailed, handleSendPromptLine(std.testing.allocator, TEST_HARNESS, rejected, request, &state, null));
+    try std.testing.expectEqualStrings("Image prompt exceeds size limit", Capture.message[0..Capture.message_len]);
+
+    const expired =
+        \\{"jsonrpc":"2.0","id":3,"error":{"code":-32600,"message":"Vercel AI Gateway requires a new sign-in."}}
+    ;
+    try std.testing.expectError(error.AcpSignedOut, handleSendPromptLine(std.testing.allocator, TEST_HARNESS, expired, request, &state, null));
+    try std.testing.expectEqualStrings("Vercel AI Gateway requires a new sign-in.", Capture.message[0..Capture.message_len]);
+}
+
+test "isAuthError recognizes fx credential notices" {
+    try std.testing.expect(isAuthError("fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY."));
+    try std.testing.expect(isAuthError("Codex requires a new sign-in."));
+    try std.testing.expect(isAuthError("Credential refresh is temporarily unavailable. Retry shortly."));
+    try std.testing.expect(isAuthError("The credential account or team changed. Review authentication before retrying."));
+    try std.testing.expect(!isAuthError("Session is not active"));
+    try std.testing.expect(!isAuthError("Image prompt exceeds size limit"));
 }
 
 test "handleSendPromptLine routes leading diagnostic chunks to a system event" {

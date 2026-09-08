@@ -141,9 +141,10 @@ The default model entry, **Default (fx config)**, defers to the model
 persisted inside fx itself; the model picker also lists every model fx
 reports through ACP `configOptions`. FX has no reasoning-effort or speed-tier
 controls, so those rows are hidden. Image attachments are forwarded when the
-ACP session advertises image support. FX does not use Verde's slash-command
-surface yet, and existing fx sessions cannot be imported as Verde threads
-yet.
+ACP session advertises image support; fx 0.0.8 and later advertise it and
+reject any single image above 3.75 MiB, which Verde reports as the failed
+turn's message. FX does not use Verde's slash-command surface yet, and
+existing fx sessions cannot be imported as Verde threads yet.
 
 To use the interactive TUI instead, open the current FX thread with **Open
 Current Thread in TUI**, or launch `fx` in a terminal pane.
