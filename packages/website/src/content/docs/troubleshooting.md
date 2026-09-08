@@ -105,7 +105,7 @@ instruction and DOM context without an image; this is expected. See
 
 ## Update check or install fails
 
-Open **Settings → Updates** and choose **Check now** again. Update checks and
+Open **Settings → App → Updates** and choose **Check now** again. Update checks and
 installers need access to GitHub release metadata and assets. If the in-app
 flow still fails, run:
 
@@ -115,9 +115,11 @@ verde update --json
 
 The JSON error is suitable for scripts and issue reports. Standalone
 Linux/macOS installs need `curl`; Windows uses PowerShell. A `verde-bin`
-installation owned by pacman needs either `yay` or `paru`, and the in-app flow
-opens that helper in a terminal pane. You can always use the install command on
-the [homepage](/#install) to replace a standalone installation manually.
+installation from the AUR needs either `yay` or `paru`; Settings shows a
+copyable update command for your package manager. For standalone installs,
+review the updater terminal for download or installation errors and keep Verde
+open until the installer finishes. You can also use the install command on the
+[homepage](/#install) to replace a standalone installation manually.
 
 ## Source-build errors
 

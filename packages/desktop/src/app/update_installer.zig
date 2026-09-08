@@ -89,6 +89,67 @@ pub fn launch(allocator: std.mem.Allocator) !Launch {
     };
 }
 
+/// Runs the same public installer as a manual install, with visible terminal output.
+/// Download separately so curl failures cannot be mistaken for a successful install.
+pub const TERMINAL_INSTALL_SCRIPT =
+    \\set -eu
+    \\case "$(uname -s)" in
+    \\  Darwin)
+    \\    case "$1" in
+    \\      */Verde.app/Contents/MacOS/*) export VERDE_MACOS_APP_DIR="$(dirname "$(dirname "$(dirname "$(dirname "$1")")")")" ;;
+    \\    esac
+    \\    ;;
+    \\  Linux) export VERDE_INSTALL_PREFIX="$(dirname "$(dirname "$1")")" ;;
+    \\esac
+    \\installer=$(mktemp)
+    \\trap 'rm -f "$installer"' EXIT HUP INT TERM
+    \\curl -fSL --retry 3 https://verdeai.dev/install.sh -o "$installer"
+    \\sh "$installer"
+    \\printf '\nUpdate complete. Restart Verde to use the installed version.\n'
+;
+
+/// A package-owned executable must be updated through its package manager.
+/// Foreign (AUR) packages need an AUR helper, including when none is installed yet.
+pub fn packageUpdateCommand(allocator: std.mem.Allocator) !?[]const u8 {
+    if (builtin.os.tag != .linux) return null;
+    var env_map = try process_env.buildAugmentedEnvMap(allocator);
+    defer env_map.deinit();
+    const pacman = process_env.resolveExecutableInEnvMapAlloc(allocator, &env_map, "pacman") catch return null;
+    defer allocator.free(pacman);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const path = try std.process.executablePathAlloc(threaded.io(), allocator);
+    defer allocator.free(path);
+    const owner = try std.process.run(allocator, threaded.io(), .{
+        .argv = &.{ pacman, "-Qoq", path },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer allocator.free(owner.stdout);
+    defer allocator.free(owner.stderr);
+    switch (owner.term) {
+        .exited => |code| if (code != 0) return null,
+        else => return error.PackageOwnershipCheckFailed,
+    }
+    const package = std.mem.trim(u8, owner.stdout, &std.ascii.whitespace);
+    if (package.len == 0) return error.PackageOwnershipCheckFailed;
+    if (resolveAndFree(allocator, &env_map, "yay")) return "yay -Syu";
+    if (resolveAndFree(allocator, &env_map, "paru")) return "paru -Syu";
+    const foreign = try std.process.run(allocator, threaded.io(), .{
+        .argv = &.{ pacman, "-Qm", package },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer allocator.free(foreign.stdout);
+    defer allocator.free(foreign.stderr);
+    return switch (foreign.term) {
+        .exited => |code| if (code == 0) "yay -Syu" else "sudo pacman -Syu",
+        else => error.PackageOwnershipCheckFailed,
+    };
+}
+
 fn detectLinuxAurLaunch(allocator: std.mem.Allocator) !?Launch {
     var env_map = try process_env.buildAugmentedEnvMap(allocator);
     defer env_map.deinit();
