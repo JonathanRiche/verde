@@ -1,8 +1,9 @@
 //! FX provider harness backed by the fx CLI ACP server (`fx acp`).
 //! Generic ACP transport/protocol machinery lives in `acp.zig`; this module
 //! owns fx binary discovery, argv construction, and fx's handshake-based
-//! auth/model discovery (fx exposes its model catalog only through ACP
-//! `configOptions`, not a CLI subcommand).
+//! auth/model discovery. Model discovery stays on ACP `configOptions` rather
+//! than `fx models --json`: the CLI command prints the whole gateway catalog
+//! with exit 0 when signed out, so it cannot double as an auth signal.
 
 const std = @import("std");
 const acp = @import("acp.zig");
