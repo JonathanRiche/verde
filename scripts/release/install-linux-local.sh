@@ -23,7 +23,8 @@ copy_glob_if_present() {
   local pattern="$1"
   local dest_dir="$2"
   if compgen -G "$pattern" >/dev/null; then
-    cp -a $pattern "$dest_dir/"
+    # Keep libraries mapped by a running Verde intact until it restarts.
+    cp -a --remove-destination $pattern "$dest_dir/"
   fi
 }
 

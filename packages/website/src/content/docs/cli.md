@@ -55,11 +55,20 @@ installer finishes. On Windows, the updater waits for the running app to exit,
 installs the new release, and starts Verde again. The command requires network
 access to the release assets.
 
-You can also check and install releases from **Settings → Updates**. For an AUR
-install, Verde opens `yay` or `paru` in an interactive terminal pane so sudo
-password prompts and package progress remain visible. The card shows the
-installed version, release notes, **Check now**, **Install update**, and the
-**Check automatically** preference.
+You can also check and install releases from **Settings → App → Updates**.
+For standalone Linux and macOS installs, **Install update** runs the public
+installer in a terminal pane with visible progress and errors. Keep Verde open
+until it finishes, then restart it. The installer targets the running app's
+installation directory.
+
+For Arch package-managed installs, the card shows a package-manager command
+and **Copy update command**. Run the copied `yay -Syu`, `paru -Syu`, or
+`sudo pacman -Syu` command in your terminal. AUR packages need an AUR helper;
+if neither helper is installed, install one before running the suggested
+`yay` command. Curl installs on Arch still use the public installer.
+
+The card also shows the installed version, release notes, **Check now**, and
+the **Check automatically** preference.
 
 ## Runtime connection profiles
 

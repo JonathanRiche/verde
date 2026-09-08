@@ -278,6 +278,8 @@ pub const State = struct {
     update_notes_expanded: bool = false,
     update: updater.State = .{},
     update_installer_started: bool = false,
+    package_update_command: ?[]const u8 = null,
+    package_update_check_failed: bool = false,
     update_installer_terminal: ?UpdateInstallerTerminal = null,
     update_exit_requested: bool = false,
 };
@@ -484,6 +486,11 @@ pub fn openSettingsToCategory(self: anytype, category: Category) void {
     self.settings_controller.browser_scroll_speed_drag_active = false;
     self.settings_controller.close_hovered = false;
     closeSettingsDropdowns(self);
+    self.settings_controller.package_update_check_failed = false;
+    self.settings_controller.package_update_command = update_installer.packageUpdateCommand(self.allocator) catch blk: {
+        self.settings_controller.package_update_check_failed = true;
+        break :blk null;
+    };
     self.settings_controller.update_notes_expanded = false;
     self.settings_controller.modal_closing = false;
     self.settings_controller.modal_anim_progress = 0.0;
@@ -1140,6 +1147,22 @@ pub fn installAvailableUpdate(self: anytype) void {
         _ = focusUpdateInstallerTerminal(self);
         return;
     }
+    if (self.settings_controller.package_update_check_failed) return;
+    if (self.settings_controller.package_update_command) |command| {
+        self.setSidebarNotice(if (self.setClipboardText(command))
+            "Update command copied. Run it in your terminal; AUR packages require yay or paru."
+        else
+            "Could not copy the update command.");
+        return;
+    }
+    if (@import("builtin").os.tag == .linux or @import("builtin").os.tag == .macos) {
+        startUpdateTerminal(self) catch |err| {
+            log.warn("failed to open update terminal: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Could not open updater terminal. Run the install command from verdeai.dev in your terminal.");
+            self.markDirty();
+        };
+        return;
+    }
     const launch = update_installer.launch(self.allocator) catch |err| {
         log.warn("failed to launch update installer: {s}", .{@errorName(err)});
         const url = self.settings_controller.update.downloadUrl() orelse updater.State.releasesUrl();
@@ -1150,19 +1173,6 @@ pub fn installAvailableUpdate(self: anytype) void {
         self.setSidebarNotice("Could not start the installer; opened the release download instead.");
         return;
     };
-    if (launch == .aur_helper_missing) {
-        self.setSidebarNotice("Verde is AUR-managed, but yay or paru was not found.");
-        self.markDirty();
-        return;
-    }
-    if (update_installer.aurCommand(launch) != null) {
-        startAurUpdateTerminal(self, launch) catch |err| {
-            log.warn("failed to open AUR update terminal: {s}", .{@errorName(err)});
-            self.setSidebarNotice("Could not open the AUR updater terminal.");
-            self.markDirty();
-        };
-        return;
-    }
     self.settings_controller.update_installer_started = true;
     self.settings_controller.update_exit_requested = launch == .started_and_exit_required;
     self.setSidebarNotice(if (self.settings_controller.update_exit_requested)
@@ -1173,11 +1183,15 @@ pub fn installAvailableUpdate(self: anytype) void {
 }
 
 pub fn updateInstallerButtonEnabled(self: anytype) bool {
+    if (self.settings_controller.package_update_check_failed) return false;
+    if (self.settings_controller.package_update_command != null) return true;
     if (self.settings_controller.update.status != .update_available) return false;
     return !self.settings_controller.update_installer_started or self.settings_controller.update_installer_terminal != null;
 }
 
 pub fn updateInstallerButtonLabel(self: anytype) []const u8 {
+    if (self.settings_controller.package_update_check_failed) return "Install check failed";
+    if (self.settings_controller.package_update_command != null) return "Copy update command";
     if (self.settings_controller.update_installer_terminal) |update_terminal| {
         return switch (update_terminal.status) {
             .running => "Updating — view terminal",
@@ -1190,8 +1204,12 @@ pub fn updateInstallerButtonLabel(self: anytype) []const u8 {
     return "No update available";
 }
 
-fn startAurUpdateTerminal(self: anytype, launch: update_installer.Launch) !void {
-    const command = update_installer.aurCommand(launch) orelse return error.InvalidAurLaunch;
+fn startUpdateTerminal(self: anytype) !void {
+    var threaded: std.Io.Threaded = .init(self.allocator, .{});
+    defer threaded.deinit();
+    const executable = try std.process.executablePathAlloc(threaded.io(), self.allocator);
+    defer self.allocator.free(executable);
+    const command: []const []const u8 = &.{ "sh", "-c", update_installer.TERMINAL_INSTALL_SCRIPT, "verde-update", executable };
     if (self.project_controller.projects.items.len == 0) return error.NoProjectSelected;
     self.ensureCurrentProjectWorkspace();
 
@@ -1216,6 +1234,8 @@ fn startAurUpdateTerminal(self: anytype, launch: update_installer.Launch) !void 
     layout.focusCreatedPane(pane_id);
     dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return error.NoProjectSelected;
     dock.visible = false;
+    // Reopening a saved terminal must never run the installer again.
+    if (dock.activePane()) |leaf| leaf.revive_policy = .attach_only;
 
     self.settings_controller.update_installer_started = true;
     self.settings_controller.update_installer_terminal = .{
@@ -1224,7 +1244,7 @@ fn startAurUpdateTerminal(self: anytype, launch: update_installer.Launch) !void 
     };
     self.cancelSettingsModal();
     self.requestTerminalDockFocus(dock_id);
-    self.setSidebarNotice("AUR updater opened in a terminal. Complete any password prompt there.");
+    self.setSidebarNotice("Installer opened in a terminal. Keep Verde open until it finishes.");
     self.noteTerminalInputActivity();
     self.markDirty();
 }
@@ -1249,7 +1269,7 @@ pub fn pollUpdateInstallerTerminal(self: anytype) bool {
     if (update_terminal.status != .running) return false;
     const dock = self.projectTerminalDock(update_terminal.project_index, update_terminal.dock_id) orelse {
         self.settings_controller.update_installer_terminal.?.status = .failed;
-        self.setSidebarNotice("The AUR updater terminal was closed before it finished.");
+        self.setSidebarNotice("The updater terminal was closed before it finished.");
         self.markDirty();
         return true;
     };
@@ -1261,7 +1281,7 @@ pub fn pollUpdateInstallerTerminal(self: anytype) bool {
     self.setSidebarNotice(if (succeeded)
         "Verde was updated. Restart Verde to use the new version."
     else
-        "The AUR update failed. Review the updater terminal for details.");
+        "The update failed. Review the updater terminal for details.");
     self.markDirty();
     return true;
 }

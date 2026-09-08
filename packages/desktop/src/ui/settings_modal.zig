@@ -432,7 +432,8 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const notifications_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
     const updates_notes_w = @max(content_w - m.card_pad * 2.0, theme.scaledUi(80.0));
     const updates_notes_h = notesBlockHeight(state, updates_notes_w, m);
-    const updates_h = m.card_pad * 2.0 + m.title_h + m.inner_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.row_h + m.inner_gap + updates_notes_h + m.inner_gap + m.label_h;
+    const package_hint_h = if (state.settings_controller.package_update_command != null) wrappedNotesRows(PACKAGE_UPDATE_HINT, updates_notes_w) * notesLineHeight() + m.label_h + m.inner_gap else 0.0;
+    const updates_h = package_hint_h + m.card_pad * 2.0 + m.title_h + m.inner_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.row_h + m.inner_gap + updates_notes_h + m.inner_gap + m.label_h;
 
     const appearance_page_h = appearance_h;
     const chat_page_h = transcript_h + m.card_gap + chat_h;
@@ -688,7 +689,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const updates_check: palette.Rect = .{ .x = updates_card.x + m.card_pad, .y = updates_actions_y, .w = update_action_w, .h = m.row_h };
     const updates_download: palette.Rect = .{ .x = updates_check.x + update_action_w + m.inner_gap, .y = updates_actions_y, .w = update_action_w, .h = m.row_h };
     const updates_automatic: palette.Rect = .{ .x = updates_check.x, .y = updates_actions_y + m.row_h + m.inner_gap, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
-    const updates_notes_y = updates_automatic.y + m.row_h + m.inner_gap;
+    const updates_notes_y = updates_automatic.y + m.row_h + m.inner_gap + package_hint_h;
     const updates_links_y = updates_notes_y + updates_notes_h + m.inner_gap;
     var updates_notes_toggle: ?palette.Rect = null;
     if (state.settings_controller.update.release != null) {
@@ -1486,6 +1487,23 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
             .primary;
         drawActionButton(state, layout.updates_download, state.updateInstallerButtonLabel(), update_button_style, isControlHovered(state, .updates_download), layout.body_clip);
         drawSwitchRow(state, layout.updates_automatic, "Check automatically", state.settings_controller.draft.check_for_updates_automatically, isControlHovered(state, .updates_automatic), layout.body_clip);
+        if (state.settings_controller.package_update_command) |command| {
+            const hint_y = layout.updates_automatic.y + m.row_h + m.inner_gap;
+            const hint_w = layout.updates_card.w - m.card_pad * 2.0;
+            const hint_h = wrappedNotesRows(PACKAGE_UPDATE_HINT, hint_w) * notesLineHeight();
+            queueWrappedText(state, .{
+                .x = layout.updates_card.x + m.card_pad,
+                .y = hint_y,
+                .w = hint_w,
+                .h = hint_h,
+            }, PACKAGE_UPDATE_HINT, paletteColor(textHint()), theme.scaledUi(NOTES_FONT_SIZE), layout.body_clip);
+            queueText(state, .{
+                .x = layout.updates_card.x + m.card_pad,
+                .y = hint_y + hint_h,
+                .w = hint_w,
+                .h = m.label_h,
+            }, command, paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
+        }
         const notes_x = layout.updates_card.x + m.card_pad;
         const notes_w = layout.updates_card.w - m.card_pad * 2.0;
         if (state.settings_controller.update_notes_expanded and state.settings_controller.update.release != null) {
@@ -1912,7 +1930,7 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
             return;
         },
         .updates_download => {
-            if (state.settings_controller.update.status == .update_available) state.installAvailableUpdate();
+            if (state.updateInstallerButtonEnabled()) state.installAvailableUpdate();
             return;
         },
         .updates_automatic => state.settings_controller.draft.check_for_updates_automatically = !state.settings_controller.draft.check_for_updates_automatically,
@@ -2190,6 +2208,7 @@ fn ensureNewChatModelChoiceVisible(state: *runtime.AppState, option_index: usize
 const NOTES_FONT_SIZE = 12.0;
 const NOTES_LINK_FONT_SIZE = 12.5;
 const RELEASE_PAGE_LABEL = "Open release page";
+const PACKAGE_UPDATE_HINT = "Update with your package manager. AUR packages need yay or paru.";
 // Keeps a pathological release body from producing an unbounded card; the
 // release-page link below the notes covers the tail.
 const MAX_EXPANDED_NOTES_LINES: usize = 60;
