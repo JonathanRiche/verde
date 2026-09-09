@@ -251,7 +251,7 @@ fn daemonPayloadStringAlloc(payload_json: []const u8, field: []const u8) ?[]u8 {
 /// system rows whose body maps to a tracked background task (mirroring the
 /// rows the pre-M5-P4 reducer used to skip appending).
 pub fn shouldHideBackgroundTranscriptRow(thread: *const ChatThread, author: []const u8, body: []const u8) bool {
-    if (std.mem.eql(u8, author, "__verde_codex_background_snapshot")) return true;
+    if (ChatThread.isCodexBackgroundSnapshotEvent(author)) return true;
     if (!ChatThread.isBackgroundCommandEvent(author)) return false;
     // Read-only membership probe: backgroundTaskForEventBody returns mutable
     // task pointers for its other callers, so cast away const here instead of
@@ -9709,7 +9709,7 @@ pub fn applyPendingTimelineEvents(
         // compare to hold across restarts. The GUI-only side effects still
         // run (below); hiding these rows is display-time only, via
         // shouldHideBackgroundTranscriptRow in the transcript renderer.
-        if (std.mem.eql(u8, event.author, "__verde_codex_background_snapshot")) {
+        if (ChatThread.isCodexBackgroundSnapshotEvent(event.author)) {
             try self.reconcileCodexBackgroundSnapshot(thread, event.body);
         }
         try appendPendingTimelineEvent(self, thread, event);
@@ -9744,21 +9744,9 @@ fn appendPendingTimelineEvent(self: anytype, thread: *ChatThread, event: Pending
 }
 
 pub fn reconcileCodexBackgroundSnapshot(self: anytype, thread: *ChatThread, body: []const u8) !void {
-    const provider_thread_id = ChatThread.backgroundTaskMetadataValue(body, "Provider thread ID:") orelse return;
     const now_ms = unixTimestampMs();
     for (thread.background_tasks.items) |*task| {
-        if (task.status != .running or task.provider != .codex or task.item_id == null or task.provider_thread_id == null) continue;
-        if (!std.mem.eql(u8, task.provider_thread_id.?, provider_thread_id)) continue;
-        var present = false;
-        var lines = std.mem.splitScalar(u8, body, '\n');
-        while (lines.next()) |line| {
-            const prefix = "Codex item ID:";
-            if (std.mem.startsWith(u8, line, prefix) and std.mem.eql(u8, std.mem.trim(u8, line[prefix.len..], " \t"), task.item_id.?)) {
-                present = true;
-                break;
-            }
-        }
-        if (present) continue;
+        if (!ChatThread.codexBackgroundTaskAbsentFromSnapshot(task, body)) continue;
         task.status = .completed;
         task.updated_at_ms = now_ms;
         const completion_body = try backgroundTaskCompletionBodyAlloc(self.allocator, task);

@@ -7939,8 +7939,14 @@ pub const Daemon = struct {
             return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid Codex background request");
         defer parsed.deinit();
         const request = parsed.value;
-        var provider_client = send_runner.connectProvider(self.allocator, .codex, request.project_path, false) catch |err|
-            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_PROVIDER_UNAVAILABLE, @errorName(err));
+        var provider_client = send_runner.connectProvider(self.allocator, .codex, request.project_path, false) catch |err| switch (err) {
+            // Retained terminals live inside the app-server. With launching
+            // disabled, NotConnected means no app-server is listening, so the
+            // terminal is gone (typically after a reboot); reporting an error
+            // instead would leave the GUI polling a dead task forever.
+            error.NotConnected => return try okValueResponse(self.allocator, id_value, headless.providers_protocol.CodexBackgroundStatusResult{ .running = false }),
+            else => return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_PROVIDER_UNAVAILABLE, @errorName(err)),
+        };
         defer provider_client.deinit();
         const running = provider_client.backgroundTerminalIsRunning(request.thread_id, request.process_id) catch |err|
             return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_PROVIDER_UNAVAILABLE, @errorName(err));
@@ -11221,8 +11227,10 @@ fn decodeAttachmentList(
 }
 
 /// Materialize the typed store snapshot inside the caller's open read
-/// transaction. Core snapshots omit message bodies and expose the durable row
-/// count as `message_offset`; transcript pages hydrate those bodies separately.
+/// transaction. Core snapshots omit message bodies and expose the durable
+/// extent (max sort_index + 1, not the row count: compaction and snapshot
+/// tails leave index gaps) as `message_offset`, which transcript pages then
+/// hydrate backward from with `sort_index < message_offset`.
 fn loadSnapshotContents(
     arena: std.mem.Allocator,
     store: *daemon_store.Store,
@@ -11309,7 +11317,7 @@ fn loadSnapshotContents(
                 \\       fast_mode, access_mode, provider, harness, tui_dock_id, draft,
                 \\       draft_image_path, draft_image_mime, draft_image_byte_size, draft_images_json, cwd,
                 \\       profile_id, runtime_id, repository_id, repository_cwd,
-                \\       (select count(*) from messages where messages.thread_id = threads.id)
+                \\       message_extent
                 \\from threads
                 \\where workspace_id = ?1
                 \\  and (select archived from workspaces where id = ?1) = 0
@@ -19613,6 +19621,41 @@ test "durable reads decode canonical and historical daemon chat role codes" {
     const compact_thread = compact_snapshot.snapshot.workspaces[0].threads[0];
     try std.testing.expectEqual(@as(usize, 0), compact_thread.messages.len);
     try std.testing.expectEqual(expected_roles.len, compact_thread.message_offset);
+
+    // A row past a gap (compaction and snapshot tails leave holes) must move
+    // the compact offset to the extent (max sort_index + 1), not the row
+    // count: the GUI hydrates the tail with `sort_index < message_offset`, so
+    // a count-based offset silently drops the newest row (a lost "Background
+    // task stopped" row left a dead task pinned above the composer).
+    const gap_index: usize = expected_roles.len + 1;
+    lockStoreService(daemon.store_service.?);
+    daemon.store_service.?.store.conn.exec(
+        "insert into messages (thread_id, sort_index, role, author, body, message_id) values (?1, ?2, 2, 'System', 'gap probe', 'gap probe')",
+        .{ thread_row_id, @as(i64, @intCast(gap_index)) },
+    ) catch |err| {
+        daemon.store_service.?.mutex.unlock();
+        return err;
+    };
+    const gapped_snapshot = loadStoreSnapshotTxn(
+        compact_snapshot_arena.allocator(),
+        &daemon.store_service.?.store,
+        "ws-dto",
+        true,
+        false,
+        false,
+    ) catch |err| {
+        daemon.store_service.?.mutex.unlock();
+        return err;
+    };
+    daemon.store_service.?.store.conn.exec(
+        "delete from messages where thread_id = ?1 and sort_index = ?2",
+        .{ thread_row_id, @as(i64, @intCast(gap_index)) },
+    ) catch |err| {
+        daemon.store_service.?.mutex.unlock();
+        return err;
+    };
+    daemon.store_service.?.mutex.unlock();
+    try std.testing.expectEqual(gap_index + 1, gapped_snapshot.snapshot.workspaces[0].threads[0].message_offset);
 
     const record_response = try daemon.handleRequest(
         \\{"jsonrpc":"2.0","id":2,"method":"chat.turn.record","params":{"turn_id":"turn-dto"}}

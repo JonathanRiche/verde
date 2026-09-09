@@ -784,6 +784,44 @@ pub const ChatThread = struct {
             std.mem.eql(u8, author, "Backgrounded command");
     }
 
+    /// Codex emits this marker after each turn listing the retained background
+    /// terminals of one provider thread. It is committed to the transcript and
+    /// hidden at render time.
+    pub const CODEX_BACKGROUND_SNAPSHOT_AUTHOR = "__verde_codex_background_snapshot";
+
+    pub fn isCodexBackgroundSnapshotEvent(author: []const u8) bool {
+        return std.mem.eql(u8, author, CODEX_BACKGROUND_SNAPSHOT_AUTHOR);
+    }
+
+    /// True when `task` is a running Codex terminal of the snapshot's provider
+    /// thread that the snapshot no longer lists, meaning Codex has released it.
+    pub fn codexBackgroundTaskAbsentFromSnapshot(task: *const BackgroundTask, snapshot_body: []const u8) bool {
+        const provider_thread_id = backgroundTaskMetadataValue(snapshot_body, "Provider thread ID:") orelse return false;
+        if (task.status != .running or task.provider != .codex or task.item_id == null or task.provider_thread_id == null) return false;
+        if (!std.mem.eql(u8, task.provider_thread_id.?, provider_thread_id)) return false;
+        var lines = std.mem.splitScalar(u8, snapshot_body, '\n');
+        while (lines.next()) |line| {
+            const prefix = "Codex item ID:";
+            if (std.mem.startsWith(u8, line, prefix) and std.mem.eql(u8, std.mem.trim(u8, line[prefix.len..], " \t"), task.item_id.?)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Marks running Codex tasks the snapshot omits as completed. Returns the
+    /// number of tasks that changed.
+    pub fn applyCodexBackgroundSnapshot(self: *ChatThread, snapshot_body: []const u8) usize {
+        var completed: usize = 0;
+        for (self.background_tasks.items) |*task| {
+            if (!codexBackgroundTaskAbsentFromSnapshot(task, snapshot_body)) continue;
+            task.status = .completed;
+            task.updated_at_ms = unixTimestampMs();
+            completed += 1;
+        }
+        return completed;
+    }
+
     pub fn isBackgroundTaskTerminalEvent(author: []const u8) bool {
         const status = backgroundTaskStatusForEvent(author) orelse return false;
         return status != .running;
@@ -945,6 +983,13 @@ pub const ChatThread = struct {
             };
             if (std.mem.eql(u8, message.author, "Conversation interrupted")) {
                 _ = self.stopUnownedBackgroundTasks();
+            }
+            // The live reducer synthesizes a completion row from this marker,
+            // but that row can be skipped (hydrated turns) or lost with the
+            // process. The marker itself is durable, so replay it here or a
+            // released terminal comes back as running after every restart.
+            if (isCodexBackgroundSnapshotEvent(message.author)) {
+                _ = self.applyCodexBackgroundSnapshot(message.body);
             }
         }
     }
@@ -1419,6 +1464,51 @@ test "interrupted transcript rebuild stops unowned background work" {
     try std.testing.expectEqual(@as(usize, 1), thread.background_tasks.items.len);
     try std.testing.expectEqual(BackgroundTaskStatus.stopped, thread.background_tasks.items[0].status);
     try std.testing.expectEqual(ChatActivityStatus.idle, thread.activityStatusForUi());
+}
+
+test "transcript rebuild completes Codex terminals a later snapshot no longer lists" {
+    const allocator = std.testing.allocator;
+    var thread = try ChatThread.init(allocator, "Codex snapshot rebuild");
+    defer thread.deinit(allocator);
+    const command_body =
+        "bun serve.ts\n\nProvider: codex\nCodex item ID: exec-1\nProcess ID: 27749\nProvider thread ID: thread-a\nCWD: /tmp";
+    try thread.messages.append(allocator, .{
+        .role = .system,
+        .author = try allocator.dupeZ(u8, "Background command"),
+        .body = try allocator.dupeZ(u8, command_body),
+    });
+    try thread.messages.append(allocator, .{
+        .role = .system,
+        .author = try allocator.dupeZ(u8, ChatThread.CODEX_BACKGROUND_SNAPSHOT_AUTHOR),
+        .body = try allocator.dupeZ(u8, "Provider thread ID: thread-a\nCodex item ID: exec-1"),
+    });
+
+    thread.rebuildBackgroundTasksFromMessages(allocator);
+    try std.testing.expectEqual(@as(usize, 1), thread.background_tasks.items.len);
+    try std.testing.expectEqual(BackgroundTaskStatus.running, thread.background_tasks.items[0].status);
+
+    // A snapshot for another provider thread says nothing about this task.
+    try thread.messages.append(allocator, .{
+        .role = .system,
+        .author = try allocator.dupeZ(u8, ChatThread.CODEX_BACKGROUND_SNAPSHOT_AUTHOR),
+        .body = try allocator.dupeZ(u8, "Provider thread ID: thread-b"),
+    });
+    for (thread.background_tasks.items) |task| task.deinit(allocator);
+    thread.background_tasks.clearRetainingCapacity();
+    thread.rebuildBackgroundTasksFromMessages(allocator);
+    try std.testing.expectEqual(BackgroundTaskStatus.running, thread.background_tasks.items[0].status);
+
+    try thread.messages.append(allocator, .{
+        .role = .system,
+        .author = try allocator.dupeZ(u8, ChatThread.CODEX_BACKGROUND_SNAPSHOT_AUTHOR),
+        .body = try allocator.dupeZ(u8, "Provider thread ID: thread-a"),
+    });
+    for (thread.background_tasks.items) |task| task.deinit(allocator);
+    thread.background_tasks.clearRetainingCapacity();
+    thread.rebuildBackgroundTasksFromMessages(allocator);
+    try std.testing.expectEqual(@as(usize, 1), thread.background_tasks.items.len);
+    try std.testing.expectEqual(BackgroundTaskStatus.completed, thread.background_tasks.items[0].status);
+    try std.testing.expect(!thread.backgroundCommandIsRunning(command_body));
 }
 
 test "terminal events resolve repeated anonymous background commands in order" {
