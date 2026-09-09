@@ -12719,7 +12719,11 @@ pub const AppState = struct {
 
     fn routePaletteRuntimePickerMouseButton(self: *AppState, point: palette.draw.Vec2, down: bool, clicks: u8) bool {
         if (!self.composer_controller.runtime_picker.isOpen()) return false;
+        // Clicking another toolbar pill swaps popovers in one click, but only
+        // when the press lands outside this popover: the list can overlay the
+        // model pill, and a row there must select, not reopen the model picker.
         if (down and self.composer_controller.toolbar_overlay_valid and
+            !self.composer_controller.runtime_picker.pickerRect().contains(point) and
             (self.composer_controller.toolbar_model_rect.contains(point) or
                 self.composer_controller.toolbar_reasoning_rect.contains(point) or
                 self.composer_controller.toolbar_directory_rect.contains(point)))
@@ -13445,9 +13449,11 @@ pub const AppState = struct {
 
     fn routePaletteDirectoryPickerMouseButton(self: *AppState, point: palette.draw.Vec2, down: bool, clicks: u8) bool {
         if (!self.composer_controller.directory_picker.isOpen()) return false;
-        // Clicking another toolbar pill swaps popovers in one click: dismiss
-        // this picker and let the toolbar overlay handler open the next one.
+        // Clicking another toolbar pill outside this popover swaps popovers in
+        // one click: dismiss this picker and let the toolbar overlay handler
+        // open the next one. Rows overlaying a pill still select.
         if (down and self.composer_controller.toolbar_overlay_valid and
+            !self.composer_controller.directory_picker.pickerRect().contains(point) and
             (self.composer_controller.toolbar_model_rect.contains(point) or
                 self.composer_controller.toolbar_reasoning_rect.contains(point) or
                 self.composer_controller.toolbar_runtime_rect.contains(point)))
@@ -13477,9 +13483,11 @@ pub const AppState = struct {
 
     fn routePaletteModelPickerMouseButton(self: *AppState, point: palette.draw.Vec2, down: bool, clicks: u8) bool {
         if (!self.composer_controller.model_picker.isOpen()) return false;
-        // Clicking another toolbar pill swaps popovers in one click: dismiss
-        // the picker and let the toolbar overlay handler open the next one.
+        // Clicking another toolbar pill outside this popover swaps popovers in
+        // one click: dismiss the picker and let the toolbar overlay handler
+        // open the next one. Rows overlaying a pill still select.
         if (down and self.composer_controller.toolbar_overlay_valid and
+            !self.composer_controller.model_picker.pickerRect().contains(point) and
             (self.composer_controller.toolbar_reasoning_rect.contains(point) or
                 self.composer_controller.toolbar_directory_rect.contains(point) or
                 self.composer_controller.toolbar_runtime_rect.contains(point)))
