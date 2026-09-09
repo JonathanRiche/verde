@@ -10038,6 +10038,7 @@ pub const AppState = struct {
     pub const currentProjectWorkspaceRoot = workspace_controller.currentProjectWorkspaceRoot;
     pub const currentProjectWorkspaceMaximizedPaneId = workspace_controller.currentProjectWorkspaceMaximizedPaneId;
     pub const workspaceScrollingStripActive = workspace_controller.workspaceScrollingStripActive;
+    pub const workspaceScrollingStripScrolls = workspace_controller.workspaceScrollingStripScrolls;
     pub const currentProjectWorkspaceFullZoomPaneId = workspace_controller.currentProjectWorkspaceFullZoomPaneId;
     pub const currentProjectQuickPane = workspace_controller.currentProjectQuickPane;
     pub const floatFocusedWorkspacePane = workspace_controller.floatFocusedWorkspacePane;
