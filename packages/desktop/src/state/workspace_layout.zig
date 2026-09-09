@@ -395,6 +395,25 @@ pub const WorkspaceLayout = struct {
         return self.scroll_mode_override != null or self.scroll_threshold_override != null;
     }
 
+    /// Number of tabs (scrolling tile groups) inside the root tree.
+    pub fn visibleTabCount(self: *const WorkspaceLayout) usize {
+        var count: usize = 0;
+        for (self.panes.items, 0..) |pane, index| {
+            if (!self.rootContainsPane(pane.id)) continue;
+            const group_id = pane.scroll_group_id orelse pane.id;
+            var seen = false;
+            for (self.panes.items[0..index]) |earlier| {
+                if (!self.rootContainsPane(earlier.id)) continue;
+                if ((earlier.scroll_group_id orelse earlier.id) == group_id) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) count += 1;
+        }
+        return count;
+    }
+
     /// Whether this workspace renders as the scrolling strip (one slot per
     /// tab) under the given global scroll settings. Zoom does not turn the
     /// strip off: a zoomed pane fills its own tab's slot.
@@ -402,7 +421,17 @@ pub const WorkspaceLayout = struct {
         return scrollingStripEnabledFor(
             self.effectiveScrollMode(global_mode),
             self.effectiveScrollThreshold(global_threshold),
-            self.visiblePaneCount(),
+            self.visibleTabCount(),
+        );
+    }
+
+    /// Whether the strip scrolls (wheel, eased reveal) rather than switching
+    /// tabs in place. Only the "Start after" threshold separates the two.
+    pub fn scrollingStripScrolls(self: *const WorkspaceLayout, global_mode: app_config.WorkspaceScrollMode, global_threshold: u8) bool {
+        return scrollingStripScrollsFor(
+            self.effectiveScrollMode(global_mode),
+            self.effectiveScrollThreshold(global_threshold),
+            self.visibleTabCount(),
         );
     }
 
@@ -1479,10 +1508,22 @@ pub const WorkspaceLayout = struct {
     }
 
     /// Pure strip predicate for an already-resolved mode and threshold.
-    pub fn scrollingStripEnabledFor(mode: app_config.WorkspaceScrollMode, threshold: u8, visible_pane_count: usize) bool {
-        if (visible_pane_count == 0) return false;
+    /// Tabs are separate views, never tiles of one shared view: in automatic
+    /// mode every multi-tab workspace is a strip, and the threshold only
+    /// decides when that strip starts scrolling (`scrollingStripScrollsFor`).
+    pub fn scrollingStripEnabledFor(mode: app_config.WorkspaceScrollMode, threshold: u8, visible_tab_count: usize) bool {
+        if (visible_tab_count == 0) return false;
         return switch (mode) {
-            .automatic => visible_pane_count >= @as(usize, threshold),
+            .automatic => visible_tab_count > 1 or visible_tab_count >= @as(usize, threshold),
+            .always => true,
+            .disabled => false,
+        };
+    }
+
+    pub fn scrollingStripScrollsFor(mode: app_config.WorkspaceScrollMode, threshold: u8, visible_tab_count: usize) bool {
+        if (visible_tab_count == 0) return false;
+        return switch (mode) {
+            .automatic => visible_tab_count >= @as(usize, threshold),
             .always => true,
             .disabled => false,
         };

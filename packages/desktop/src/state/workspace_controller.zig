@@ -250,6 +250,13 @@ pub fn workspaceScrollingStripActive(self: anytype, layout: *const WorkspaceLayo
     return layout.scrollingStripEnabled(self.app_config.workspace_scroll_mode, self.app_config.workspace_scroll_threshold);
 }
 
+/// Whether the strip scrolls between tabs (wheel, eased reveal). Below the
+/// "Start after" threshold it still gives every tab its own view but jumps
+/// to the focused tab in place.
+pub fn workspaceScrollingStripScrolls(self: anytype, layout: *const WorkspaceLayout) bool {
+    return layout.scrollingStripScrolls(self.app_config.workspace_scroll_mode, self.app_config.workspace_scroll_threshold);
+}
+
 /// Zoomed pane of the selected workspace when it fills the whole pane region
 /// (tiled layout, or a zoomed pane outside the strip's root tree). Null while
 /// the strip is showing, where a zoomed pane only fills its tab's slot.

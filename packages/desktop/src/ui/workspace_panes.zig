@@ -411,6 +411,9 @@ pub fn handlePaletteWheel(state: *runtime.AppState, x: f32, y: f32, wheel_x: f32
     if (state.project_controller.projects.items.len == 0) return false;
     const layout = &state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout;
     if (!scrollingLayoutActive(state, layout)) return false;
+    // Below "Start after" the strip switches tabs in place; the wheel stays
+    // with the pane content.
+    if (!state.workspaceScrollingStripScrolls(layout)) return false;
 
     const delta = scrollingWheelDelta(state.app_config.workspace_scroll_direction, wheel_x, wheel_y, ctrl_held) orelse return false;
     const target: *f32 = switch (state.app_config.workspace_scroll_direction) {
@@ -1777,6 +1780,7 @@ fn scrollingLayoutActive(state: *const runtime.AppState, layout: *const runtime.
 
 // Zoom never disables the strip; a zoomed pane fills its tab's slot.
 const scrollingLayoutEnabled = workspace_layout.WorkspaceLayout.scrollingStripEnabledFor;
+const scrollingStripScrolls = workspace_layout.WorkspaceLayout.scrollingStripScrollsFor;
 
 // Configurable-axis workspace strip with focus-aware reveal and clipping.
 fn renderScrollingStrip(
@@ -1797,6 +1801,13 @@ fn renderScrollingStrip(
     }
 
     const gap = theme.scaledUi(state.app_config.workspace_pane_gap);
+    // Below "Start after" every tab still owns a slot, but the strip jumps
+    // between tabs instead of scrolling: no wheel, slide, easing, or idle snap.
+    const strip_scrolls = state.workspaceScrollingStripScrolls(layout);
+    if (!strip_scrolls) {
+        layout.scroll_snap_deadline_ms = 0;
+        layout.clearScrollSkipSlide();
+    }
     var group_ids: [MAX_WORKSPACE_PANE_RECTS]runtime.WorkspacePaneId = undefined;
     var representative_pane_ids: [MAX_WORKSPACE_PANE_RECTS]runtime.WorkspacePaneId = undefined;
     const pane_count = collectScrollingGroups(layout, &group_ids, &representative_pane_ids);
@@ -1874,7 +1885,16 @@ fn renderScrollingStrip(
                     const from_index = if (from_pane_id) |pane_id| scrollGroupIndexForPane(layout, pane_id) else null;
                     const pending_direction = layout.scroll_skip_pending_direction;
                     layout.scroll_skip_pending_direction = 0;
-                    if (!state.app_config.reduced_motion and shouldSkipSlide(from_index, focused_index, pending_direction)) {
+                    if (!strip_scrolls) {
+                        // Tab switch, not a scroll: land on the focused tab
+                        // this frame with no slide or easing.
+                        layout.clearScrollSkipSlide();
+                        if (@abs(next_target - offset.*) > 0.001 or @abs(next_target - target.*) > 0.001) {
+                            offset.* = next_target;
+                            target.* = next_target;
+                            markCurrentWorkspaceDirty(state);
+                        }
+                    } else if (!state.app_config.reduced_motion and shouldSkipSlide(from_index, focused_index, pending_direction)) {
                         const inferred: i8 = if (from_index) |from|
                             if (focused_index >= from) 1 else -1
                         else if (next_target >= offset.*)
@@ -1911,7 +1931,12 @@ fn renderScrollingStrip(
         }
     }
 
-    tickScrollingAnimation(offset, target.*, &layout.scroll_animation_last_ms);
+    if (strip_scrolls) {
+        tickScrollingAnimation(offset, target.*, &layout.scroll_animation_last_ms);
+    } else {
+        offset.* = target.*;
+        layout.scroll_animation_last_ms = 0;
+    }
     // Keep frame pacing active until the idle deadline can settle even a
     // sub-pixel wheel gesture that finished easing early.
     if (layout.scroll_snap_deadline_ms != 0) scrolling_animating = true;
@@ -4156,47 +4181,71 @@ test "scrolling grow resizes only the focused pane" {
 }
 
 test "scrolling layout policy supports automatic always and disabled modes" {
-    try std.testing.expect(!scrollingLayoutEnabled(.automatic, 4, 3));
+    // Automatic: a lone tab tiles below the threshold, any second tab is a strip.
+    try std.testing.expect(!scrollingLayoutEnabled(.automatic, 4, 1));
+    try std.testing.expect(scrollingLayoutEnabled(.automatic, 4, 2));
     try std.testing.expect(scrollingLayoutEnabled(.automatic, 4, 4));
+    try std.testing.expect(scrollingLayoutEnabled(.automatic, 1, 1));
     try std.testing.expect(scrollingLayoutEnabled(.always, 64, 1));
     try std.testing.expect(!scrollingLayoutEnabled(.disabled, 1, 8));
     try std.testing.expect(!scrollingLayoutEnabled(.always, 1, 0));
 }
 
-test "scrolling layout automatic mode covers configured threshold matrix" {
+test "scrolling strip scrolls only from the configured threshold" {
     const thresholds = [_]u8{ 1, 2, 4, 8 };
     for (thresholds) |threshold| {
         if (threshold > 1) {
-            try std.testing.expect(!scrollingLayoutEnabled(.automatic, threshold, @as(usize, threshold - 1)));
+            try std.testing.expect(!scrollingStripScrolls(.automatic, threshold, @as(usize, threshold - 1)));
+            // Below the threshold the multi-tab strip is shown but static.
+            try std.testing.expect(scrollingLayoutEnabled(.automatic, threshold, @as(usize, threshold - 1)) == (threshold > 2));
         }
+        try std.testing.expect(scrollingStripScrolls(.automatic, threshold, @as(usize, threshold)));
+        try std.testing.expect(scrollingStripScrolls(.automatic, threshold, @as(usize, threshold) + 1));
         try std.testing.expect(scrollingLayoutEnabled(.automatic, threshold, @as(usize, threshold)));
-        try std.testing.expect(scrollingLayoutEnabled(.automatic, threshold, @as(usize, threshold) + 1));
     }
+    try std.testing.expect(scrollingStripScrolls(.always, 64, 1));
+    try std.testing.expect(!scrollingStripScrolls(.always, 1, 0));
+    try std.testing.expect(!scrollingStripScrolls(.disabled, 1, 64));
     try std.testing.expect(!scrollingLayoutEnabled(.disabled, 1, 64));
 }
 
-test "automatic scrolling activation follows tiled pane creation and closure" {
+test "automatic scrolling activation follows tab creation and closure" {
     const allocator = std.testing.allocator;
     var layout = try runtime.WorkspaceLayout.initDefaultChat(allocator);
     defer layout.deinit(allocator);
 
-    try std.testing.expect(!scrollingLayoutEnabled(.automatic, 2, layout.visiblePaneCount()));
+    try std.testing.expectEqual(@as(usize, 1), layout.visibleTabCount());
+    try std.testing.expect(!scrollingLayoutEnabled(.automatic, 3, layout.visibleTabCount()));
 
+    // A split inside the first tab stays one tab: still tiled.
+    const sibling_pane_id = try layout.createTerminalPane(allocator, 9);
+    try layout.splitPaneWithLeaf(allocator, 1, sibling_pane_id, .vertical, true);
+    try std.testing.expect(layout.joinPaneToScrollGroup(1, sibling_pane_id));
+    try std.testing.expectEqual(@as(usize, 1), layout.visibleTabCount());
+    try std.testing.expect(!scrollingLayoutEnabled(.automatic, 3, layout.visibleTabCount()));
+
+    // A second tab is its own view even below "Start after", without scrolling.
     const second_pane_id = try layout.createTerminalPane(allocator, 10);
-    try layout.splitPaneWithLeaf(allocator, 1, second_pane_id, .vertical, true);
-    try std.testing.expect(scrollingLayoutEnabled(.automatic, 2, layout.visiblePaneCount()));
+    try layout.splitPaneWithLeaf(allocator, sibling_pane_id, second_pane_id, .vertical, true);
+    try std.testing.expectEqual(@as(usize, 2), layout.visibleTabCount());
+    try std.testing.expect(scrollingLayoutEnabled(.automatic, 3, layout.visibleTabCount()));
+    try std.testing.expect(!scrollingStripScrolls(.automatic, 3, layout.visibleTabCount()));
 
     const third_pane_id = try layout.createTerminalPane(allocator, 11);
     try layout.splitPaneWithLeaf(allocator, second_pane_id, third_pane_id, .horizontal, true);
-    try std.testing.expect(scrollingLayoutEnabled(.automatic, 2, layout.visiblePaneCount()));
+    try std.testing.expectEqual(@as(usize, 3), layout.visibleTabCount());
+    try std.testing.expect(scrollingStripScrolls(.automatic, 3, layout.visibleTabCount()));
 
     var removed_ref = layout.closePane(allocator, third_pane_id) orelse return error.TestExpectedEqual;
     workspace_layout.deinitWorkspacePaneRef(&removed_ref, allocator);
-    try std.testing.expect(scrollingLayoutEnabled(.automatic, 2, layout.visiblePaneCount()));
+    try std.testing.expectEqual(@as(usize, 2), layout.visibleTabCount());
+    try std.testing.expect(scrollingLayoutEnabled(.automatic, 3, layout.visibleTabCount()));
+    try std.testing.expect(!scrollingStripScrolls(.automatic, 3, layout.visibleTabCount()));
 
     removed_ref = layout.closePane(allocator, second_pane_id) orelse return error.TestExpectedEqual;
     workspace_layout.deinitWorkspacePaneRef(&removed_ref, allocator);
-    try std.testing.expect(!scrollingLayoutEnabled(.automatic, 2, layout.visiblePaneCount()));
+    try std.testing.expectEqual(@as(usize, 1), layout.visibleTabCount());
+    try std.testing.expect(!scrollingLayoutEnabled(.automatic, 3, layout.visibleTabCount()));
 }
 
 test "scrolling focus direction follows the configured axis" {
