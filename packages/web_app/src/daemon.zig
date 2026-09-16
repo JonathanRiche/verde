@@ -20,6 +20,7 @@ pub const Daemon = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     config: config_mod,
+    runtime_router: @import("web_runtime").Router,
     next_id: std.atomic.Value(u64) = .init(1),
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: config_mod) Daemon {
@@ -27,6 +28,7 @@ pub const Daemon = struct {
             .allocator = allocator,
             .io = io,
             .config = config,
+            .runtime_router = @import("web_runtime").Router.init(allocator, io),
         };
     }
 

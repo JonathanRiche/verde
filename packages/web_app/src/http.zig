@@ -1084,6 +1084,46 @@ fn handleApi(
         return;
     }
 
+    if (std.mem.eql(u8, split.path, "/api/chat-connections")) {
+        // Paired clients are scoped to this runtime, not the host's other accounts.
+        if (auth_context == .pair) return respondJson(request, .forbidden, "{\"ok\":false,\"error\":{\"message\":\"Owner login required for saved connections\"}}");
+        if (request.head.method != .GET) return respondMethodNotAllowed(request);
+        const body = daemon.runtime_router.catalog() catch |err| {
+            const message = try std.json.Stringify.valueAlloc(allocator, .{ .ok = false, .@"error" = .{ .message = @errorName(err) } }, .{});
+            defer allocator.free(message);
+            return respondJson(request, .service_unavailable, message);
+        };
+        defer allocator.free(body);
+        return respondJson(request, .ok, body);
+    }
+    if (std.mem.eql(u8, split.path, "/api/chat-connection-rpc")) {
+        if (auth_context == .pair) return respondJson(request, .forbidden, "{\"ok\":false,\"error\":{\"message\":\"Owner login required for saved connections\"}}");
+        if (request.head.method != .POST) return respondMethodNotAllowed(request);
+        if (request.head.content_length) |length| {
+            if (length > MAX_RPC_FRAME_BYTES) {
+                request.head.keep_alive = false;
+                return respondJson(request, .payload_too_large, "{\"ok\":false,\"error\":{\"message\":\"Connection request too large\"}}");
+            }
+        }
+        const reader = try request.readerExpectContinue(&.{});
+        const body = reader.allocRemaining(allocator, .limited(MAX_RPC_FRAME_BYTES)) catch {
+            request.head.keep_alive = false;
+            return respondJson(request, .payload_too_large, "{\"ok\":false,\"error\":{\"message\":\"Connection request too large\"}}");
+        };
+        defer allocator.free(body);
+        const Input = struct { profile_id: []const u8, runtime_id: []const u8, method: []const u8, params: std.json.Value };
+        var input = std.json.parseFromSlice(Input, allocator, body, .{}) catch
+            return respondJson(request, .bad_request, "{\"ok\":false,\"error\":{\"message\":\"Invalid connection request\"}}");
+        defer input.deinit();
+        const result = daemon.runtime_router.call(input.value.profile_id, input.value.runtime_id, input.value.method, input.value.params) catch |err| {
+            const message = try std.json.Stringify.valueAlloc(allocator, .{ .ok = false, .@"error" = .{ .message = @errorName(err) } }, .{});
+            defer allocator.free(message);
+            return respondJson(request, .service_unavailable, message);
+        };
+        defer allocator.free(result);
+        return respondJson(request, .ok, result);
+    }
+
     if (std.mem.eql(u8, split.path, "/api/theme")) {
         if (request.head.method != .GET) return respondMethodNotAllowed(request);
         if (!try authorizeApiContext(allocator, daemon, auth, auth_context, headless.access_protocol.scopeBit(.runtime_read), request)) return;

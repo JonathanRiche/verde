@@ -3543,7 +3543,8 @@ pub fn dispatchDaemonAcceptance(
         disarmSendStateAfterFailedDispatch(self, thread);
         snapshot.* = dispatch.snapshot;
         dispatch.snapshot = .{ .message_count = 0, .committed = true, .last_activity_at = 0, .title = null };
-        dispatch.destroy(self.allocator);
+        // The allocation and arena errdefers own cleanup on this error path.
+        // The snapshot is back with the caller; composer ownership has not moved.
         return err;
     }
     // Once the worker exists, submission is visibly complete. Clear the

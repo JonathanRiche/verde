@@ -7242,25 +7242,49 @@ pub const AppState = struct {
     /// one, so ordinary splits keep opening beside their origin. An empty
     /// workspace seeds its first chat instead.
     pub fn addWorkspaceTab(self: *AppState, index: usize, kind: ?app_config.WorkspaceSplitDefaultPane) void {
+        self.addWorkspaceTabWithFocus(index, kind, true);
+    }
+
+    /// Creates a tab with optional activation for background automation.
+    pub fn addWorkspaceTabWithFocus(self: *AppState, index: usize, kind: ?app_config.WorkspaceSplitDefaultPane, focus: bool) void {
         if (index >= self.project_controller.projects.items.len) return;
-        self.project_controller.selected_index = index;
+        if (focus) self.project_controller.selected_index = index;
         const layout = &self.project_controller.projects.items[index].workspace_layout;
+        const previous_revealed_pane_id = layout.scroll_revealed_pane_id;
+        defer if (!focus) {
+            layout.scroll_revealed_pane_id = previous_revealed_pane_id;
+        };
         const placement: WorkspacePanePlacement = layout.gridNewPanePlacement() orelse .{
             .pane_id = layout.focused_pane_id orelse layout.firstVisiblePaneId() orelse {
-                self.createThreadForProject(index);
+                if (focus) {
+                    self.createThreadForProject(index);
+                } else {
+                    const project = &self.project_controller.projects.items[index];
+                    const previous_thread_index = project.selected_thread_index;
+                    const previous_pane_id = layout.focused_pane_id;
+                    defer project.selected_thread_index = previous_thread_index;
+                    defer layout.focused_pane_id = previous_pane_id;
+                    const thread_index = project.addThread(self.allocator) catch return;
+                    self.applyNewChatDefaults(index, thread_index) catch |err| {
+                        log.warn("failed to apply new-chat defaults: {s}", .{@errorName(err)});
+                    };
+                    const pane_id = layout.createChatPane(self.allocator, thread_index) catch return;
+                    layout.replaceRootWithLeaf(self.allocator, pane_id) catch return;
+                    self.markWorkspaceDirty(index);
+                }
                 return;
             },
             .axis = .vertical,
             .new_after = true,
         };
+        const new_pane_id = layout.next_pane_id;
         const created = switch (kind orelse self.app_config.workspace_new_tab_pane) {
-            .chat => self.splitWorkspacePaneWithChatPlacement(index, placement.pane_id, placement.axis, placement.new_after),
-            .terminal => self.splitWorkspacePaneWithTerminalPlacement(index, placement.pane_id, placement.axis, placement.new_after),
+            .chat => workspace_controller.splitWorkspacePaneWithChatPlacementAndFocus(self, index, placement.pane_id, placement.axis, placement.new_after, focus),
+            .terminal => workspace_controller.splitWorkspacePaneWithTerminalPlacementAndFocus(self, index, placement.pane_id, placement.axis, placement.new_after, focus),
         };
         if (!created) return;
-        // The split focused the new pane; tab order is persisted pane order.
+        // Tab order is persisted pane order, independent of focus.
         const updated_layout = &self.project_controller.projects.items[index].workspace_layout;
-        const new_pane_id = updated_layout.focused_pane_id orelse return;
         if (updated_layout.movePaneBefore(new_pane_id, updated_layout.panes.items.len)) self.markDirty();
     }
 
@@ -10300,7 +10324,7 @@ pub const AppState = struct {
         return try self.startManagedProcessWithFocus(project_index, name, .focus);
     }
 
-    fn startManagedProcessWithFocus(self: *AppState, project_index: usize, name: []const u8, focus_policy: ManagedProcessFocusPolicy) !bool {
+    pub fn startManagedProcessWithFocus(self: *AppState, project_index: usize, name: []const u8, focus_policy: ManagedProcessFocusPolicy) !bool {
         try self.refreshProjectStackConfig(project_index);
         if (project_index >= self.project_controller.projects.items.len) return false;
         if (focus_policy == .focus) self.project_controller.selected_index = project_index;
@@ -10330,12 +10354,17 @@ pub const AppState = struct {
         try self.ensureManagedAgentProjectHooks(project.path, process);
         var launch = try self.managedProcessLaunchArgs(process);
         defer launch.deinit(self.allocator);
+        const previous_dock_visible = (self.projectTerminalDockMutable(project_index, dock_id) orelse return false).visible;
         try self.restartTerminalDockForWorkspaceProfile(project_index, dock_id, cwd, .{
             .kind = .custom,
             .label = process.name,
             .command = launch.argv.items,
         });
         var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return false;
+        if (focus_policy == .preserve) {
+            dock.focus_requested = false;
+            dock.visible = previous_dock_visible;
+        }
         process.status = .running;
         process.exit_code = null;
         process.signal = null;
@@ -10346,6 +10375,11 @@ pub const AppState = struct {
         process.pending_watch_restart_ms = 0;
         process.explicit_stop = false;
         const previous_focused_pane_id = project.workspace_layout.focused_pane_id;
+        const previous_revealed_pane_id = project.workspace_layout.scroll_revealed_pane_id;
+        defer if (focus_policy == .preserve) {
+            project.workspace_layout.focused_pane_id = previous_focused_pane_id;
+            project.workspace_layout.scroll_revealed_pane_id = previous_revealed_pane_id;
+        };
         const terminal_pane_open = project.workspace_layout.visibleTerminalPaneIdForDock(dock_id) != null;
         process.pane_id = try project.workspace_layout.ensureTerminalPane(self.allocator, dock_id);
         if (focus_policy == .preserve) {
@@ -10765,6 +10799,10 @@ pub const AppState = struct {
     }
 
     pub fn restartManagedProcess(self: *AppState, project_index: usize, name: []const u8) !bool {
+        return self.restartManagedProcessWithFocus(project_index, name, .focus);
+    }
+
+    pub fn restartManagedProcessWithFocus(self: *AppState, project_index: usize, name: []const u8, focus_policy: ManagedProcessFocusPolicy) !bool {
         try self.refreshProjectStackConfig(project_index);
         if (project_index >= self.project_controller.projects.items.len) return false;
         if (self.project_controller.projects.items[project_index].managedProcessByName(name)) |process| {
@@ -10772,7 +10810,7 @@ pub const AppState = struct {
             process.status = .restarting;
         }
         _ = try self.stopManagedProcess(project_index, name);
-        return try self.startManagedProcess(project_index, name);
+        return try self.startManagedProcessWithFocus(project_index, name, focus_policy);
     }
 
     pub fn startProjectStack(self: *AppState, project_index: usize) !usize {

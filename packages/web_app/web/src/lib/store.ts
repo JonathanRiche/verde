@@ -22,6 +22,12 @@ import {
   uploadChatImage,
   type EventHandler,
 } from './live'
+import { connectionRpc, effectiveConnection, fetchConnections, type ConnectionCatalog } from './connections'
+import {
+  owningWorkspaceId,
+  reconcileViewSelection,
+  resolveWorkspaceId,
+} from './selection'
 import { linuxWorkspaceId } from './wyhash'
 import { DEFAULT_UI_CONFIG, parseUiConfig, type UiConfig } from './ui_config'
 import {
@@ -715,8 +721,12 @@ interface PersistedPaneRow {
   title?: string
   /// Live chat rows carry the provider so the sidebar can show its logo.
   provider?: string
+  /// Durable thread identity from the desktop `panes` listing / `chat.status`.
+  /// Title and sort_index drift; this is what the transcript fetch keys on.
+  local_thread_id?: string
   /// Live chat enrichment from `chat.status`: the provider-side thread id is
-  /// the only rename-proof key into the store thread catalog.
+  /// a rename-proof key into the store thread catalog when local_thread_id is
+  /// absent (older desktops).
   provider_thread_id?: string
   model?: string
   reasoning_effort?: string | null
@@ -768,6 +778,8 @@ export function layoutFromLivePanes(response: unknown): PersistedWorkspaceLayout
       kind?: string
       thread_index?: number
       thread_title?: string
+      local_thread_id?: string
+      provider_thread_id?: string | null
       provider?: string
       model?: string | null
       dock_id?: number
@@ -790,6 +802,8 @@ export function layoutFromLivePanes(response: unknown): PersistedWorkspaceLayout
         kind: 'chat',
         thread: row.thread_index,
         title: row.thread_title,
+        local_thread_id: typeof row.local_thread_id === 'string' ? row.local_thread_id : undefined,
+        provider_thread_id: typeof row.provider_thread_id === 'string' ? row.provider_thread_id : undefined,
         provider: row.provider,
         model: typeof row.model === 'string' ? row.model : undefined,
         send_pending: row.send_pending ?? false,
@@ -821,6 +835,27 @@ export function layoutFromLivePanes(response: unknown): PersistedWorkspaceLayout
     panes,
     root: parseLayoutNode(result.root),
   }
+}
+
+/// Keep durable chat identity when a live `panes` tick omits thread ids
+/// (`enrich_chat_status: false`, older desktops). Otherwise the next
+/// projection turns a real chat into a title-only placeholder and the web
+/// transcript goes blank while the desktop still has the thread.
+export function carryLiveChatIdentity(
+  previous: PersistedPaneRow[] | undefined,
+  next: PersistedPaneRow[],
+): PersistedPaneRow[] {
+  if (!previous?.length) return next
+  return next.map((pane) => {
+    if (pane.kind !== 'chat' || pane.id == null) return pane
+    const prior = previous.find((row) => row.kind === 'chat' && row.id === pane.id)
+    if (!prior) return pane
+    return {
+      ...pane,
+      local_thread_id: pane.local_thread_id || prior.local_thread_id,
+      provider_thread_id: pane.provider_thread_id || prior.provider_thread_id,
+    }
+  })
 }
 
 /// Desktop live `workspaces` listing: the set of workspaces actually open in
@@ -858,6 +893,11 @@ function chatPane(workspace: Workspace, thread: Thread, turns: SnapshotTurn[]): 
     kind: 'chat',
     thread_id: thread.local_thread_id,
     provider_thread_id: thread.provider_thread_id,
+    profile_id: thread.profile_id,
+    runtime_id: thread.runtime_id,
+    repository_id: thread.repository_id,
+    repository_cwd: thread.repository_cwd,
+    committed: thread.committed,
     thread_title: thread.title || 'Chat',
     provider: thread.provider ?? workspace.provider,
     model: thread.model_ref ?? null,
@@ -929,6 +969,9 @@ export function panesForWorkspace(
             )
           : undefined
         const thread =
+          (pane.local_thread_id
+            ? threads.find((item) => item.local_thread_id === pane.local_thread_id)
+            : undefined) ??
           (pane.provider_thread_id
             ? threads.find((item) => item.provider_thread_id === pane.provider_thread_id)
             : undefined) ??
@@ -1184,7 +1227,6 @@ function createAppStore() {
   const [initialViewReady, setInitialViewReady] = createSignal(!restoreLastChatOnStartup)
   let pendingLastChatPane = startupLastChatPane
   let instantFocusPaneId: number | null = null
-  let pinnedWorkspaceId: string | null = null
   let storeClientId: string | null = null
   let lastSessions: SnapshotSession[] = []
   let lastTurns: SnapshotTurn[] = []
@@ -1197,23 +1239,35 @@ function createAppStore() {
   // desktop-persisted layout has no pane for them.
   const localThreadIds = new Set<string>()
 
-  const workspace = createMemo(
-    () => workspaces().find((item) => item.workspace_id === workspaceId()) ?? workspaces()[0],
-  )
+  const workspace = createMemo(() => {
+    const id = workspaceId()
+    if (id) return workspaces().find((item) => item.workspace_id === id) ?? null
+    return workspaces()[0] ?? null
+  })
   const openPanes = createMemo(() => {
-    const id = workspace()?.workspace_id
+    const id = workspaceId() ?? workspace()?.workspace_id
     if (!id) return []
     return panesByWorkspace()[id] ?? []
   })
   const paneGroups = createMemo(() => {
+    const id = workspaceId() ?? workspace()?.workspace_id
+    if (!id) return []
     const current = workspace()
-    if (!current) return []
-    const layout = liveLayouts[current.workspace_id] ?? parseWorkspaceLayout(current.workspace_layout_json)
+    const layout = liveLayouts[id] ?? (current ? parseWorkspaceLayout(current.workspace_layout_json) : null)
     return workspacePaneGroups(openPanes(), layout?.root ?? null)
   })
   const focusedPane = createMemo(() => {
     const id = focusedPaneId()
-    return openPanes().find((pane) => pane.pane_id === id) ?? openPanes()[0] ?? null
+    const current = openPanes()
+    if (id != null) {
+      const local = current.find((pane) => pane.pane_id === id)
+      if (local) return local
+      for (const panes of Object.values(panesByWorkspace())) {
+        const pane = panes.find((item) => item.pane_id === id)
+        if (pane) return pane
+      }
+    }
+    return current[0] ?? null
   })
   const canvasLayout = createMemo((): LayoutNode | null => {
     const panes = openPanes()
@@ -1305,28 +1359,27 @@ function createAppStore() {
   const publishPanes = (list: Workspace[]) => {
     const panes = projectPanes(workspacesWithThreads(list), lastSessions, lastTurns, localThreadIds, liveLayouts)
     setPanesByWorkspace((prev) => (sameJson(prev, panes) ? prev : panes))
-    const keep = workspaceId() ?? list[0]?.workspace_id ?? null
-    const current_panes = keep ? panes[keep] ?? [] : []
-    const restored = pendingLastChatPane && keep === pendingLastChatPane.workspace_id
-      ? findLastChatPane(current_panes, pendingLastChatPane)
+    const restored = pendingLastChatPane
+      ? findLastChatPane(panes[pendingLastChatPane.workspace_id] ?? [], pendingLastChatPane)
       : null
+    const next = reconcileViewSelection({
+      workspace_id: restored?.workspace_id ?? workspaceId(),
+      pane_id: restored?.pane_id ?? focusedPaneId(),
+      panes_by_workspace: panes,
+      workspace_ids: list.map((item) => item.workspace_id),
+    })
+    if (next.workspace_id && next.workspace_id !== workspaceId()) setWorkspaceId(next.workspace_id)
+    if (next.pane_id !== focusedPaneId()) {
+      if (typeof next.pane_id === 'number' && (restored || !initialViewReady())) {
+        instantFocusPaneId = next.pane_id
+      }
+      setFocusedPaneId(next.pane_id)
+    }
     if (restored) {
-      // Startup restoration should place the strip before paint, not animate
-      // across every pane between the default and the persisted chat.
-      instantFocusPaneId = restored.pane_id
-      setFocusedPaneId(restored.pane_id)
-      // A live-layout placeholder has no durable thread id yet. Keep the
-      // stronger persisted identity until the catalog resolves it.
       if (restored.thread_id) writeLastChatPaneLocation(restored)
       pendingLastChatPane = null
-    } else if (focusedPaneId() == null || !current_panes.some((pane) => pane.pane_id === focusedPaneId())) {
-      const preferred =
-        current_panes.find((pane) => pane.focused) ??
-        current_panes.find((pane) => pane.kind === 'chat') ??
-        current_panes[0]
-      if (!initialViewReady() && preferred) instantFocusPaneId = preferred.pane_id
-      setFocusedPaneId(preferred?.pane_id ?? null)
     }
+    const current_panes = next.workspace_id ? panes[next.workspace_id] ?? [] : []
     if (maximizedPaneId() != null && !current_panes.some((pane) => pane.pane_id === maximizedPaneId())) {
       setMaximizedPaneId(null)
     }
@@ -1375,17 +1428,13 @@ function createAppStore() {
     setWorkspaces((prev) => (sameJson(prev, list) ? prev : list))
 
     const selectedIndex = typeof snapshot.selected_workspace_index === 'number' ? snapshot.selected_workspace_index : 0
-    const restore_workspace_id = pendingLastChatPane?.workspace_id
-    const keep =
-      (pinnedWorkspaceId && list.some((item) => item.workspace_id === pinnedWorkspaceId) && pinnedWorkspaceId) ||
-      (preferId && list.some((item) => item.workspace_id === preferId) && preferId) ||
-      (restore_workspace_id &&
-        list.some((item) => item.workspace_id === restore_workspace_id) &&
-        restore_workspace_id) ||
-      (workspaceId() && list.some((item) => item.workspace_id === workspaceId()) && workspaceId()) ||
-      list[selectedIndex]?.workspace_id ||
-      list[0]?.workspace_id ||
-      null
+    const keep = resolveWorkspaceId({
+      workspace_ids: list.map((item) => item.workspace_id),
+      focused_workspace_id: focusedPane()?.workspace_id ?? null,
+      current_workspace_id: preferId ?? workspaceId(),
+      restore_workspace_id: pendingLastChatPane?.workspace_id,
+      snapshot_selected_index: selectedIndex,
+    })
     if (keep && keep !== workspaceId()) setWorkspaceId(keep)
     publishPanes(list)
 
@@ -1473,11 +1522,13 @@ function createAppStore() {
         targets.map(async (row) => {
           const panes = await client.call('panes', { workspace: row.workspace_id })
           const layout = layoutFromLivePanes(panes)
+          if (layout?.panes) {
+            layout.panes = carryLiveChatIdentity(liveLayouts[row.workspace_id]?.panes, layout.panes)
+          }
           layouts[row.workspace_id] = layout
           if (!layout?.panes || !enrich_chat_status) return
-          // The pane listing has no thread ids; chat.status carries the
-          // provider-side thread id plus the model/effort controls, which is
-          // what lets a pane bind to the right store thread even when the
+          // The pane listing on older desktops has no thread ids; chat.status
+          // carries local and provider ids so a pane can bind even when the
           // store's title and sort_index are stale.
           await Promise.all(
             layout.panes.map(async (pane) => {
@@ -1488,6 +1539,7 @@ function createAppStore() {
               })
               const thread = unwrapResult<{
                 thread?: {
+                  local_thread_id?: string
                   provider_thread_id?: string | null
                   model?: string | null
                   reasoning_effort?: string | null
@@ -1496,6 +1548,7 @@ function createAppStore() {
                 }
               }>(status)?.thread
               if (!thread) return
+              if (thread.local_thread_id) pane.local_thread_id = thread.local_thread_id
               if (thread.provider_thread_id) pane.provider_thread_id = thread.provider_thread_id
               if (typeof thread.model === 'string') pane.model = thread.model
               if (thread.reasoning_effort !== undefined) pane.reasoning_effort = thread.reasoning_effort
@@ -1549,7 +1602,7 @@ function createAppStore() {
       await refreshLive(only, opts.enrich_chat_status ?? true)
       const response = await client.call('core.snapshot', { scopes: SNAPSHOT_SCOPES })
       if (response.error || response.ok === false) return
-      applySnapshot(response, workspaceId())
+      applySnapshot(response, opts.workspace_id ?? workspaceId())
       const listed = workspaces()
       if (listed.length === 0) return
       const scoped = only ? listed.filter((item) => item.workspace_id === only) : listed
@@ -1595,7 +1648,7 @@ function createAppStore() {
       projectionInFlight = false
       if (projectionQueued) {
         projectionQueued = false
-        void refreshProjection({ scope: 'selected' })
+        void refreshProjection({ scope: 'selected', workspace_id: workspaceId() ?? undefined })
       }
     }
   }
@@ -1621,7 +1674,11 @@ function createAppStore() {
       catalog_response.error ||
       catalog_response.ok === false
     ) {
-      await refreshProjection({ scope: 'selected', enrich_chat_status: false })
+      await refreshProjection({
+        scope: 'selected',
+        workspace_id: location.workspace_id,
+        enrich_chat_status: false,
+      })
       return
     }
     const listed = threadListFrom(catalog_response)
@@ -1639,7 +1696,11 @@ function createAppStore() {
     if (pendingLastChatPane) {
       // The persisted layout can lag a newly opened pane; fall back to the
       // live listing only when the durable projection cannot resolve it.
-      await refreshProjection({ scope: 'selected', enrich_chat_status: false })
+      await refreshProjection({
+        scope: 'selected',
+        workspace_id: location.workspace_id,
+        enrich_chat_status: false,
+      })
     }
   }
 
@@ -1651,6 +1712,64 @@ function createAppStore() {
     })
   }
 
+  const [connections, setConnections] = createSignal<ConnectionCatalog | null>(null)
+  const [connectionError, setConnectionError] = createSignal<string | null>(null)
+  let connectionRefresh: Promise<void> | null = null
+  const refreshConnections = (): Promise<void> => {
+    if (connectionRefresh) return connectionRefresh
+    connectionRefresh = fetchConnections().then((catalog) => {
+      setConnections(catalog)
+      setConnectionError(null)
+    }).catch((error) => { setConnectionError(error instanceof Error ? error.message : 'Connections unavailable') })
+      .finally(() => { connectionRefresh = null })
+    return connectionRefresh
+  }
+  const paneOwningWorkspaceId = (pane: LivePane): string =>
+    owningWorkspaceId(pane, threadsByWorkspace())
+  const routeThread = (pane: LivePane): Thread => {
+    const workspace_id = paneOwningWorkspaceId(pane)
+    return threadsByWorkspace()[workspace_id]?.find((thread) => thread.local_thread_id === pane.thread_id)
+      ?? { ...openingThreadFromPane(pane), profile_id: pane.profile_id, runtime_id: pane.runtime_id, repository_id: pane.repository_id, repository_cwd: pane.repository_cwd, committed: pane.committed }
+  }
+  const connectionFor = (pane: LivePane): string =>
+    effectiveConnection(routeThread(pane), paneOwningWorkspaceId(pane), connections() ?? { connections: [], defaults: [] })
+  const paneRpc = async (pane: LivePane, method: string, params: unknown): Promise<RpcEnvelope> => {
+    if (!connections()) await refreshConnections()
+    const catalog = connections()
+    if (!catalog) throw new Error(connectionError() ?? 'Connections are loading')
+    const profile = connectionFor(pane)
+    if (profile === 'local') return interactiveCall(method, params)
+    const connection = catalog.connections.find((row) => row.profile_id === profile)
+    if (!connection) throw new Error('The saved connection for this chat is unavailable')
+    return connectionRpc(connection, routeThread(pane).runtime_id, method, params)
+  }
+  const setChatConnection = async (pane: LivePane, profile: string | null): Promise<boolean> => {
+    if (sending()) return false
+    setSending(true)
+    try {
+      if (paneWorking(pane) || routeThread(pane).committed || routeThread(pane).provider_thread_id) {
+        setNotice('Start a new chat to change its connection.')
+        return false
+      }
+      const ws = workspaces().find((row) => row.workspace_id === paneOwningWorkspaceId(pane))
+      if (!ws) return false
+      const patch = { profile_id: profile, runtime_id: null, repository_id: 'primary', repository_cwd: null }
+      const response = await upsertThreadMetadata(ws, pane, patch)
+      if (!response || response.error || response.ok === false) {
+        setNotice(response?.error?.message ?? 'Could not save this chat connection')
+        return false
+      }
+      setThreadsByWorkspace((prev) => ({ ...prev, [ws.workspace_id]: (prev[ws.workspace_id] ?? []).map((row) => row.local_thread_id === pane.thread_id ? { ...row, ...patch } : row) }))
+      publishPanes(workspaces())
+      return true
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'Could not save this chat connection')
+      return false
+    } finally {
+      setSending(false)
+    }
+  }
+
   const loadTranscript = async (pane: LivePane) => {
     if (pane.kind !== 'chat' || !pane.thread_id) return
     const key = paneKey(pane.workspace_id, pane.pane_id)
@@ -1660,14 +1779,17 @@ function createAppStore() {
       // HTTP on purpose: a focused pane's first transcript is user-visible
       // latency, and multi-megabyte thread bodies would otherwise queue
       // behind the projection sweep on the serial websocket loop.
-      const response = await interactiveCall('chat.thread.get', {
-        workspace_id: pane.workspace_id,
+      const workspace_id = paneOwningWorkspaceId(pane)
+      const response = await paneRpc(pane, 'chat.thread.get', {
+        workspace_id,
         local_thread_id: pane.thread_id,
       })
       if (response.error || response.ok === false) return
       const messages = mapTranscriptRows(response, pane.thread_id)
       if (messages.length === 0 && transcripts()[key]?.length) return
       storeTranscript(key, messages)
+    } catch {
+      // The connection picker shows readiness; keep the durable transcript while offline.
     } finally {
       pendingTranscript.delete(key)
     }
@@ -1941,10 +2063,10 @@ function createAppStore() {
         // in its read loop, so a parked long-poll over the socket would stall
         // pings and every other in-flight call. Each HTTP request rides its
         // own gateway connection task and may hang safely.
-        response = await fetchRpc('chat.turn.tail', {
+        response = await paneRpc(pane, 'chat.turn.tail', {
           turn_id: tail.turn_id,
           after_seq: tail.last_seq,
-          wait_ms: TAIL_WAIT_MS,
+          wait_ms: connectionFor(pane) === 'local' ? TAIL_WAIT_MS : 0,
         })
       } catch {
         // A mobile page freeze commonly terminates the parked HTTP request.
@@ -2067,6 +2189,14 @@ function createAppStore() {
       // transcript each tick shipped multi-megabyte threads through JSON
       // parse/merge over and over and made typing lag; loading them
       // sequentially keeps each JSON parse/merge in its own frame budget.
+      if (connections() && connectionFor(pane) !== 'local' && !turnTails.has(paneKey(pane.workspace_id, pane.pane_id))) {
+        try {
+          const response = await paneRpc(pane, 'chat.turn.list', { workspace_id: pane.workspace_id })
+          const remote_turns = unwrapResult<{ turns?: SnapshotTurn[] }>(response)?.turns ?? []
+          const matching = remote_turns.filter((turn) => turn.workspace_id === pane.workspace_id && turn.local_thread_id === pane.thread_id)
+          lastTurns = [...lastTurns.filter((turn) => !(turn.workspace_id === pane.workspace_id && turn.local_thread_id === pane.thread_id)), ...matching]
+        } catch { /* Keep the current view until the connection recovers. */ }
+      }
       tailActiveTurn(pane)
       const key = paneKey(pane.workspace_id, pane.pane_id)
       const uncached = !transcripts()[key]?.length
@@ -2110,7 +2240,7 @@ function createAppStore() {
         )
         .at(-1)?.turn_id
     if (!turn_id) return
-    const response = await interactiveCall('chat.turn.cancel', { turn_id })
+    const response = await paneRpc(pane, 'chat.turn.cancel', { turn_id })
     if (response.error || response.ok === false) {
       setNotice(response.error?.message ?? 'could not stop the turn')
     }
@@ -2126,7 +2256,6 @@ function createAppStore() {
 
   const selectWorkspace = (id: string) => {
     pendingLastChatPane = null
-    pinnedWorkspaceId = id
     setWorkspaceId(id)
     setDrawerOpen(false)
     const first = panesByWorkspace()[id]?.[0]
@@ -2134,12 +2263,11 @@ function createAppStore() {
     if (first?.kind === 'chat') writeLastChatPaneLocation(first)
     // The switch itself renders instantly from cached panes/transcripts; the
     // scoped refresh only reconciles this workspace in the background.
-    void refreshProjection({ scope: 'selected' }).then(() => refreshTranscripts())
+    void refreshProjection({ scope: 'selected', workspace_id: id }).then(() => refreshTranscripts())
   }
 
   const focusPane = (pane: LivePane) => {
     pendingLastChatPane = null
-    pinnedWorkspaceId = pane.workspace_id
     setWorkspaceId(pane.workspace_id)
     setFocusedPaneId(pane.pane_id)
     writeLastChatPaneLocation(pane)
@@ -2264,18 +2392,34 @@ function createAppStore() {
 
   const sendDraft = async (pane = focusedChat()) => {
     const current = pane
-    const ws = workspace()
-    if (!current || current.kind !== 'chat' || !ws) return
+    if (!current || current.kind !== 'chat') return
+    const ws = workspaces().find((row) => row.workspace_id === paneOwningWorkspaceId(current))
+    if (!ws) return
     if (isSubagentThreadId(current.thread_id)) return
     if (!current.thread_id) {
       setNotice('thread is not ready yet')
       return
     }
     if (uploadingAttachmentsFor(current) || sending()) return
+    setSending(true)
+    await refreshConnections()
+    if (!connections()) { setSending(false); setNotice(connectionError() ?? 'Connections unavailable'); return }
+    const profile = connectionFor(current)
+    const remote = profile !== 'local'
+    const connection = connections()!.connections.find((row) => row.profile_id === profile)
+    if (remote && (!connection?.ready || !connection.runtime_id)) {
+      setNotice(`${connection?.label ?? profile}: ${connection?.failure ?? connection?.phase ?? 'unavailable'}`)
+      setSending(false)
+      return
+    }
+    if (remote && attachmentsFor(current).length) {
+      setNotice('Remote chat attachments are not supported by the web connection bridge yet. Your attachments are kept.')
+      setSending(false)
+      return
+    }
     const text = draftFor(current).trim()
     const images = [...attachmentsFor(current)]
-    if (!text && images.length === 0) return
-    setSending(true)
+    if (!text && images.length === 0) { setSending(false); return }
     setNotice(null)
     // Optimistic send: clear the box and show the user row before any RPC.
     // The pre-send thread fetch plus turn.start round-trips took seconds on
@@ -2317,8 +2461,14 @@ function createAppStore() {
       // a quick mobile tap cannot race the selected settings.
       const pending_settings = settingsUpdateQueues.get(key)
       if (pending_settings) await pending_settings
+      const route = routeThread(current)
+      if (route.runtime_id && remote && route.runtime_id !== connection!.runtime_id) throw new Error('This chat belongs to a different runtime')
+      const route_patch = { profile_id: profile, runtime_id: remote ? connection!.runtime_id : null, repository_id: route.repository_id ?? 'primary', repository_cwd: route.repository_cwd ?? null }
+      const saved_route = await upsertThreadMetadata(ws, current, route_patch)
+      if (!saved_route || saved_route.error || saved_route.ok === false) throw new Error(saved_route?.error?.message ?? 'Could not save the chat connection')
+      setThreadsByWorkspace((prev) => ({ ...prev, [ws.workspace_id]: (prev[ws.workspace_id] ?? []).map((row) => row.local_thread_id === current.thread_id ? { ...row, ...route_patch } : row) }))
       const got = await interactiveCall('chat.thread.get', {
-        workspace_id: current.workspace_id,
+        workspace_id: ws.workspace_id,
         local_thread_id: current.thread_id,
       })
       const thread = threadFromDaemonGet(got)
@@ -2329,17 +2479,23 @@ function createAppStore() {
         setNotice(got.error?.message ?? 'thread is not on the daemon')
         return
       }
+      let execution_thread = thread
+      if (remote) {
+        const remote_thread = await paneRpc(current, 'chat.thread.get', { workspace_id: ws.workspace_id, local_thread_id: current.thread_id })
+        if ((remote_thread.error || remote_thread.ok === false) && !isAbsentDaemonThread(remote_thread)) throw new Error(remote_thread.error?.message ?? 'Could not read remote conversation')
+        execution_thread = threadFromDaemonGet(remote_thread)
+      }
       const stored_title = thread?.title ?? current.thread_title ?? 'New Chat'
       const fallback_prompt = text || (images.length > 0 ? 'Image' : '')
       const thread_title = isOpeningThread(thread, stored_title)
         ? makeThreadTitle(fallback_prompt)
         : stored_title
       const turn_id = mintId('web-turn-')
-      const sent = await interactiveCall('chat.turn.start', {
+      const sent = await paneRpc(current, 'chat.turn.start', {
         turn_id,
-        workspace_id: current.workspace_id,
+        workspace_id: ws.workspace_id,
         local_thread_id: current.thread_id,
-        project_path: ws.path,
+        ...(remote ? { repository_id: route_patch.repository_id, relative_cwd: route_patch.repository_cwd, require_provider_ready: true } : { project_path: ws.path }),
         prompt: text,
         image_paths: images.map((image) => image.path),
         images: images.map((image) => ({
@@ -2354,7 +2510,7 @@ function createAppStore() {
         reasoning_effort: thread?.reasoning_effort ?? current.reasoning_effort,
         opencode_reasoning_variant: thread?.reasoning_variant ?? current.reasoning_variant,
         fast_mode: (thread?.fast_mode ?? (current.fast_mode ? 'on' : 'off')) === 'on',
-        provider_thread_id: thread?.provider_thread_id,
+        provider_thread_id: execution_thread?.provider_thread_id,
         access_mode: thread?.access_mode ?? current.access_mode,
       })
       if (sent.error || sent.ok === false) {
@@ -2362,10 +2518,14 @@ function createAppStore() {
         setNotice(sent.error?.message ?? 'send did not apply')
         return
       }
-      if (thread_title !== stored_title) {
+      if (remote) {
+        const committed = await upsertThreadMetadata(ws, current, { ...route_patch, title: thread_title, committed: true })
+        if (committed?.error || committed?.ok === false) setNotice('Remote turn started, but saving its local metadata failed.')
+      }
+      if (thread_title !== stored_title || remote) {
         setThreadsByWorkspace((prev) => ({
           ...prev,
-          [current.workspace_id]: (prev[current.workspace_id] ?? []).map((row) =>
+          [ws.workspace_id]: (prev[ws.workspace_id] ?? []).map((row) =>
             row.local_thread_id === current.thread_id ? { ...row, title: thread_title, committed: true } : row,
           ),
         }))
@@ -2377,7 +2537,7 @@ function createAppStore() {
         ...lastTurns,
         {
           turn_id,
-          workspace_id: current.workspace_id,
+          workspace_id: ws.workspace_id,
           local_thread_id: current.thread_id,
           status: 'working',
           started_at_ms: Date.now(),
@@ -2527,6 +2687,11 @@ function createAppStore() {
           provider_thread_id: provider_changed ? null : thread.provider_thread_id ?? null,
           harness: thread.harness ?? 'local_cli',
           draft: thread.draft ?? '',
+          profile_id: thread.profile_id,
+          runtime_id: thread.runtime_id,
+          repository_id: thread.repository_id,
+          repository_cwd: thread.repository_cwd,
+          committed: thread.committed,
           ...merged,
         },
       })
@@ -2627,8 +2792,8 @@ function createAppStore() {
       }
       liveWorkspaces = null
       liveLayouts = {}
-      pinnedWorkspaceId = workspace_id ?? null
-      await refreshProjection()
+      if (workspace_id) setWorkspaceId(workspace_id)
+      await refreshProjection({ workspace_id })
       if (workspace_id) selectWorkspace(workspace_id)
       setWorkspaceDialogOpen(false)
       return true
@@ -2650,6 +2815,8 @@ function createAppStore() {
       thread: {
         local_thread_id,
         title: 'New Chat',
+        committed: false,
+        profile_id: connections()?.defaults.find((row) => row.workspace_id === current.workspace_id)?.profile_id ?? 'local',
         provider,
         harness: 'local_cli',
         last_activity_at: Date.now(),
@@ -2663,6 +2830,8 @@ function createAppStore() {
     const created: Thread = {
       local_thread_id,
       title: 'New Chat',
+      committed: false,
+      profile_id: connections()?.defaults.find((row) => row.workspace_id === current.workspace_id)?.profile_id ?? 'local',
       provider,
       last_activity_at: Date.now(),
     }
@@ -2674,8 +2843,12 @@ function createAppStore() {
   }
 
   const newThread = async (workspace_id?: string) => {
+    await refreshConnections()
+    if (!connections()) { setNotice(connectionError() ?? 'Connections unavailable'); return }
     pendingLastChatPane = null
-    const current = workspaces().find((item) => item.workspace_id === workspace_id) ?? workspace()
+    const current = workspace_id
+      ? workspaces().find((item) => item.workspace_id === workspace_id)
+      : workspace()
     if (!current) return
     const provider =
       (current.workspace_id === workspace()?.workspace_id ? focusedChat()?.provider : undefined) ??
@@ -2737,15 +2910,14 @@ function createAppStore() {
       }
     }
     if (pane_id == null) return
-    pinnedWorkspaceId = current.workspace_id
+    const focused_id = opened_thread_id ? stablePaneId('chat', opened_thread_id) : pane_id
     setWorkspaceId(current.workspace_id)
+    setFocusedPaneId(focused_id)
     // Instant transition: the optimistic thread row above already projects a
     // pane through localThreadIds, so publish and focus it now. The live
     // pane/layout reconciliation lands in the background and rebinds the
     // pane to the desktop layout entry once it appears.
     publishPanes(workspaces())
-    const focused_id = opened_thread_id ? stablePaneId('chat', opened_thread_id) : pane_id
-    setFocusedPaneId(focused_id)
     const focused = (panesByWorkspace()[current.workspace_id] ?? []).find(
       (pane) => pane.pane_id === focused_id,
     )
@@ -2755,7 +2927,9 @@ function createAppStore() {
   }
 
   const newTerminal = async (workspace_id?: string) => {
-    const ws = workspaces().find((item) => item.workspace_id === workspace_id) ?? workspace()
+    const ws = workspace_id
+      ? workspaces().find((item) => item.workspace_id === workspace_id)
+      : workspace()
     if (!ws) return
     const session_id = mintId('web-sess-')
     const opened = await requestTerminalOpen(interactiveCall, ws, session_id)
@@ -2764,7 +2938,6 @@ function createAppStore() {
       return
     }
     if (opened.native) {
-      pinnedWorkspaceId = ws.workspace_id
       setWorkspaceId(ws.workspace_id)
       const layout = layoutFromLivePanes(opened.response)
       if (layout) {
@@ -2790,10 +2963,9 @@ function createAppStore() {
         running: true,
       },
     ]
-    pinnedWorkspaceId = ws.workspace_id
     setWorkspaceId(ws.workspace_id)
-    publishPanes(workspaces())
     setFocusedPaneId(stablePaneId('term', session_id))
+    publishPanes(workspaces())
     void refreshProjection({ workspace_id: ws.workspace_id })
   }
 
@@ -2827,11 +2999,11 @@ function createAppStore() {
       workspace_id: current_workspace.workspace_id,
       local_thread_id: pane.thread_id,
     })
-    if (got.error || got.ok === false) return got
+    if ((got.error || got.ok === false) && !isAbsentDaemonThread(got)) return got
     const thread_root = unwrapResult<{ thread?: Thread } & Thread>(got)
-    const existing = thread_root?.thread ?? (thread_root as Thread | null)
+    const existing = thread_root?.thread ?? (thread_root as Thread | null) ?? openingThreadFromPane(pane)
     if (!existing?.local_thread_id) return got
-    const thread = { ...existing, ...patch }
+    const thread = { ...existing, committed: existing.committed ?? false, ...patch }
     delete thread.messages
     const client_id = await ensureClientId()
     return interactiveCall('chat.thread.upsert', {
@@ -2917,7 +3089,7 @@ function createAppStore() {
   }
 
   const openSubagent = async (pane: LivePane, message: Message) => {
-    const current_workspace = workspace()
+    const current_workspace = workspaces().find((item) => item.workspace_id === paneOwningWorkspaceId(pane))
     if (!current_workspace) return
     if (pane.native_pane_id == null) {
       setNotice('Opening a subagent pane requires the desktop runtime.')
@@ -2940,7 +3112,9 @@ function createAppStore() {
 
   const splitFocusedPane = async (kind: 'chat' | 'terminal', axis: 'vertical' | 'horizontal') => {
     const pane = focusedPane()
-    const current_workspace = workspace()
+    const current_workspace = pane
+      ? workspaces().find((item) => item.workspace_id === pane.workspace_id)
+      : workspace()
     if (!pane || !current_workspace || pane.native_pane_id == null) {
       setNotice('Pane splitting requires the desktop runtime.')
       return
@@ -2964,7 +3138,9 @@ function createAppStore() {
   ) => {
     const first = openPanes().find((pane) => pane.pane_id === first_pane_id)
     const second = openPanes().find((pane) => pane.pane_id === second_pane_id)
-    const current_workspace = workspace()
+    const current_workspace = first
+      ? workspaces().find((item) => item.workspace_id === first.workspace_id)
+      : workspace()
     if (first?.native_pane_id == null || second?.native_pane_id == null || !current_workspace) return
     const response = await interactiveCall('pane.resize', {
       workspace: current_workspace.workspace_id,
@@ -2980,7 +3156,12 @@ function createAppStore() {
   }
 
   const runSidebarContextAction = async (request: SidebarContextActionRequest) => {
-    const { action, workspace: current_workspace, pane, value } = request
+    const { action, pane, value } = request
+    let { workspace: current_workspace } = request
+    if (pane && (action.startsWith('thread-') || action.startsWith('pane-'))) {
+      current_workspace = workspaces().find((item) => item.workspace_id === paneOwningWorkspaceId(pane))
+        ?? current_workspace
+    }
     setNotice(null)
     try {
       switch (action) {
@@ -3053,9 +3234,14 @@ function createAppStore() {
           let response = await interactiveCall('workspace.close', { workspace: current_workspace.workspace_id })
           if (methodUnavailable(response)) response = await upsertWorkspaceMetadata(current_workspace, { archived: true })
           if (callSucceeded(response, 'could not close workspace')) {
-            pinnedWorkspaceId = null
+            const closing_current = workspaceId() === current_workspace.workspace_id
             liveWorkspaces = null
             setWorkspaces((prev) => prev.filter((row) => row.workspace_id !== current_workspace.workspace_id))
+            if (closing_current) {
+              const next = workspaces()[0]
+              setWorkspaceId(next?.workspace_id ?? null)
+              setFocusedPaneId(null)
+            }
             await refreshProjection()
           }
           return
@@ -3072,7 +3258,7 @@ function createAppStore() {
             ),
           }))
           publishPanes(workspaces())
-          await refreshProjection({ scope: 'selected' })
+          await refreshProjection({ workspace_id: current_workspace.workspace_id })
           return
         }
         case 'thread-regenerate-title':
@@ -3111,7 +3297,7 @@ function createAppStore() {
             ),
           }))
           publishPanes(workspaces())
-          await refreshProjection({ scope: 'selected' })
+          await refreshProjection({ workspace_id: current_workspace.workspace_id })
           return
         }
         case 'pane-zoom':
@@ -3303,7 +3489,9 @@ function createAppStore() {
     }
     const move = /^workspace\.move_(left|right|up|down)$/.exec(action)
     const pane = focusedPane()
-    const current = workspace()
+    const current = pane
+      ? workspaces().find((item) => item.workspace_id === pane.workspace_id)
+      : workspace()
     if (move && pane?.native_pane_id != null && current) {
       void interactiveCall('pane.move', {
         workspace: current.workspace_id,
@@ -3444,7 +3632,11 @@ function createAppStore() {
       foregroundRecoveryRunning = true
       setConnected(false)
       client.reconnect()
-      void refreshProjection({ scope: 'selected', enrich_chat_status: false })
+      void refreshProjection({
+        scope: 'selected',
+        workspace_id: workspaceId() ?? pendingLastChatPane?.workspace_id ?? undefined,
+        enrich_chat_status: false,
+      })
         .then(() => refreshTranscripts())
         .catch(() => {})
         .finally(() => {
@@ -3488,6 +3680,8 @@ function createAppStore() {
     window.addEventListener('pagehide', handlePageHide)
     window.addEventListener('pageshow', handlePageShow)
     window.addEventListener('online', recoverForeground)
+    void refreshConnections()
+    const connectionTick = window.setInterval(() => { void refreshConnections() }, 5000)
     const tick = window.setInterval(() => setConnected(client.connected), 1000)
     const transcriptsTick = window.setInterval(() => {
       if (client.connected) void refreshTranscripts()
@@ -3510,6 +3704,7 @@ function createAppStore() {
         if (restoreLastChatOnStartup) void refreshProjection({ scope: 'selected' })
       })
     onCleanup(() => {
+      window.clearInterval(connectionTick)
       persistComposerState()
       window.clearInterval(tick)
       window.clearInterval(transcriptsTick)
@@ -3527,6 +3722,9 @@ function createAppStore() {
   }
 
   return {
+    connections, connectionError, refreshConnections, connectionFor, setChatConnection, newThread,
+    owningWorkspaceId: paneOwningWorkspaceId,
+    inheritsConnection: (pane: LivePane) => !routeThread(pane).profile_id && !routeThread(pane).committed && !routeThread(pane).provider_thread_id,
     client,
     source,
     connected,

@@ -68,11 +68,11 @@ export function Palette() {
             class="w-full border-b border-[var(--border-muted)] bg-transparent px-4 py-3 text-[15px] outline-none placeholder:text-[var(--text-subtle)]"
             placeholder="Jump to a pane, workspace, or command"
             autofocus
-            value={query()}
             onInput={(event) => setQuery(event.currentTarget.value)}
             onKeyDown={(event) => {
               if (event.key === 'Escape') store.setPaletteOpen(false)
-              if (event.key === 'Enter' && results()[0]) run(results()[0].id)
+              if (event.key !== 'Enter' || event.isComposing || event.keyCode === 229) return
+              if (results()[0]) run(results()[0].id)
             }}
           />
           <ul class="max-h-[50vh] overflow-y-auto p-1.5 scrollbar-thin">
@@ -138,6 +138,7 @@ export function Settings() {
 }
 
 export function WorkspaceDialog() {
+  let pathField: HTMLInputElement | undefined
   const [path, setPath] = createSignal('')
   const [submitting, setSubmitting] = createSignal(false)
   const [browserOpen, setBrowserOpen] = createSignal(false)
@@ -161,7 +162,7 @@ export function WorkspaceDialog() {
   const browse = async (requested_path?: string) => {
     // The projected workspace can belong to a different host than verde-web,
     // so an empty browser must start from the gateway machine's filesystem.
-    const target = requested_path ?? (path().trim() || '/')
+    const target = requested_path ?? ((pathField?.value ?? path()).trim() || '/')
     setBrowserOpen(true)
     setBrowserLoading(true)
     setBrowserError(null)
@@ -184,6 +185,7 @@ export function WorkspaceDialog() {
       }
       setDirectoryListing(listing)
       setPath(listing.path)
+      if (pathField) pathField.value = listing.path
     } catch (err) {
       setBrowserError(err instanceof Error ? err.message : 'could not list directory')
     } finally {
@@ -193,11 +195,16 @@ export function WorkspaceDialog() {
 
   const submit = async (event: SubmitEvent) => {
     event.preventDefault()
-    if (!path().trim() || submitting()) return
+    const next = (pathField?.value ?? path()).trim()
+    if (!next || submitting()) return
+    setPath(next)
     setSubmitting(true)
-    const created = await store.createWorkspace(path())
+    const created = await store.createWorkspace(next)
     setSubmitting(false)
-    if (created) setPath('')
+    if (created) {
+      setPath('')
+      if (pathField) pathField.value = ''
+    }
   }
 
   return (
@@ -214,11 +221,11 @@ export function WorkspaceDialog() {
           </p>
           <div class="mt-4 flex gap-2">
             <input
+              ref={(node) => { pathField = node }}
               class="mono min-w-0 flex-1 rounded-[7px] border border-[var(--border-muted)] bg-[var(--chat-black)] px-3 py-2 text-[13px] outline-none focus:border-[var(--accent)]"
               aria-label="Workspace path"
               placeholder="/path/to/project"
               autofocus
-              value={path()}
               onInput={(event) => setPath(event.currentTarget.value)}
               onKeyDown={(event) => {
                 if (event.key === 'Escape') close()

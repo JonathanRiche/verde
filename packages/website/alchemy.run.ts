@@ -25,6 +25,7 @@ export const worker = await TanStackStart('website', {
     { domainName: 'open-verde.com', adopt: true },
     { domainName: 'verdeai.dev', adopt: true },
     { domainName: 'verdeapp.dev', adopt: true },
+    { domainName: 'verdeeditor.com', adopt: true },
   ],
   wrangler: {
     main: 'dist/server/server.js',
