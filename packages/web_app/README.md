@@ -124,3 +124,28 @@ verde-web --token-file <path> [--host 127.0.0.1] [--port 7420]
 Safe configuration environment variables are `VERDE_WEB_HOST`, `VERDE_WEB_PORT`, `VERDE_WEB_TOKEN_FILE`, `VERDE_PREF_PATH`, `VERDE_WEB_STATIC`, and `VERDE_SESSIONIZER_SOCKET`. `VERDE_WEB_HOST` is still subject to the strict loopback check.
 
 Do not run `mise run dev`, relaunch the desktop, or use `pkill verde` from a Verde pane that owns the active agent session. Coordinate and track any gateway/Vite process you start.
+
+### Per-chat connections
+
+The chat actions menu contains Workspace and Connection selectors on desktop and
+mobile. New chats inherit `workspace-runtime-defaults.json`; an explicit Local or
+remote choice overrides the default. Changing workspace opens a new chat there.
+Committed conversations retain their connection. Model/effort edits preserve the
+route, and remote sends use the runtime's repository binding rather than the
+local workspace path.
+
+The gateway reads the same user's `runtime-profiles.json` and workspace defaults
+as the desktop and uses the shared runtime connection service. Deploy the gateway
+and SPA together. Profiles must exist on the **gateway host**; the browser does
+not import profiles from another computer. Saved paired-device credentials are
+loaded from that user's OS keyring. Process-memory-only desktop credentials are
+not available to the gateway. Missing credentials, unverified identities, and
+unavailable repositories fail without falling back to Local.
+
+`GET /api/chat-connections` and `POST /api/chat-connection-rpc` require an owner
+login (or the gateway owner bearer); runtime-scoped paired clients cannot use the
+host's other saved connections. The browser receives only connection labels,
+readiness, runtime IDs, and workspace defaults. Credentials and remote endpoints
+remain server-side. The bridge permits only chat execution/control/read methods
+and repository inspection. Remote web-chat image uploads are currently rejected
+with the draft attachments retained; local uploads continue to work.

@@ -54,6 +54,7 @@ fn run(init: std.process.Init) !void {
     defer auth.deinit();
 
     var daemon = daemon_mod.Daemon.init(init.gpa, init.io, config);
+    defer daemon.runtime_router.deinit();
     try http_mod.serve(init.gpa, init.io, config, &daemon, &auth, init.environ_map);
 }
 

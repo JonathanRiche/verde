@@ -4,6 +4,13 @@ import { Portal } from 'solid-js/web'
 import { store, type SidebarContextAction } from '../lib/store'
 import { paneIsActive, type LayoutNode, type LivePane, type Workspace } from '../lib/types'
 import { Icon, ProviderGlyph, StatusPip, VerdeLogo } from './Icons'
+import { ChatRouting } from './ChatRouting'
+
+function actionWorkspace(pane?: LivePane): Workspace | undefined {
+  if (!pane) return undefined
+  const workspace_id = pane.kind === 'chat' ? store.owningWorkspaceId(pane) : pane.workspace_id
+  return store.workspaces().find((item) => item.workspace_id === workspace_id)
+}
 
 type SidebarMenuTarget =
   | { kind: 'workspace'; workspace: Workspace; x: number; y: number }
@@ -36,25 +43,26 @@ export function Sidebar() {
   }
   const openPaneMenu = (pane: LivePane, x: number, y: number) => {
     if (pane.kind !== 'chat' && pane.kind !== 'terminal') return
-    const workspace = store.workspaces().find((item) => item.workspace_id === pane.workspace_id)
+    const workspace = actionWorkspace(pane)
     if (workspace) setMenu({ kind: pane.kind === 'chat' ? 'thread' : 'terminal', workspace, pane, x, y })
   }
   const chooseMenuItem = (target: SidebarMenuTarget, item: MenuItem) => {
     setMenu(null)
+    const workspace = actionWorkspace(target.kind === 'workspace' ? undefined : target.pane) ?? target.workspace
     if (item.action === 'workspace-rename') {
       setPrompt({
         action: item.action,
-        workspace: target.workspace,
+        workspace,
         title: 'Rename workspace',
         label: 'Workspace name',
-        initial: target.workspace.label,
+        initial: workspace.label,
       })
       return
     }
     if (item.action === 'thread-rename' && target.kind === 'thread') {
       setPrompt({
         action: item.action,
-        workspace: target.workspace,
+        workspace,
         pane: target.pane,
         title: 'Rename chat',
         label: 'Chat title',
@@ -64,7 +72,7 @@ export function Sidebar() {
     }
     void store.runSidebarContextAction({
       action: item.action,
-      workspace: target.workspace,
+      workspace,
       ...(target.kind !== 'workspace' ? { pane: target.pane } : {}),
     })
   }
@@ -193,9 +201,7 @@ export function PaneActionsButton(props: { pane: LivePane; mobile?: boolean }) {
   }
   const openMenu = (event: MouseEvent) => {
     event.stopPropagation()
-    const workspace = store.workspaces().find(
-      (item) => item.workspace_id === props.pane.workspace_id,
-    )
+    const workspace = actionWorkspace(props.pane)
     if (!workspace) return
     const rect = event.currentTarget instanceof HTMLElement
       ? event.currentTarget.getBoundingClientRect()
@@ -210,10 +216,11 @@ export function PaneActionsButton(props: { pane: LivePane; mobile?: boolean }) {
   }
   const chooseMenuItem = (target: SidebarMenuTarget, item: MenuItem) => {
     setMenu(null)
+    const workspace = actionWorkspace(target.kind === 'workspace' ? undefined : target.pane) ?? target.workspace
     if (item.action === 'thread-rename' && target.kind === 'thread') {
       setPrompt({
         action: item.action,
-        workspace: target.workspace,
+        workspace,
         pane: target.pane,
         title: 'Rename chat',
         label: 'Chat title',
@@ -223,7 +230,7 @@ export function PaneActionsButton(props: { pane: LivePane; mobile?: boolean }) {
     }
     void store.runSidebarContextAction({
       action: item.action,
-      workspace: target.workspace,
+      workspace,
       pane: target.kind !== 'workspace' ? target.pane : undefined,
     })
   }
@@ -285,7 +292,7 @@ function WorkspaceGroup(props: {
   onOpenContext: (x: number, y: number) => void
   onOpenPaneContext: (pane: LivePane, x: number, y: number) => void
 }) {
-  const selected = () => store.workspace()?.workspace_id === props.workspace.workspace_id
+  const selected = () => store.workspaceId() === props.workspace.workspace_id
   const context = createContextTrigger(props.onOpenContext)
   return (
     <section class="relative mb-2">
@@ -454,7 +461,7 @@ function CollapsedRail(props: { onOpenContext: (workspace: Workspace, x: number,
     <div class="flex min-h-0 flex-1 flex-col items-center gap-2 overflow-y-auto pt-1 scrollbar-thin">
       <For each={store.workspaces()}>
         {(workspace) => {
-          const selected = () => store.workspace()?.workspace_id === workspace.workspace_id
+          const selected = () => store.workspaceId() === workspace.workspace_id
           const context = createContextTrigger((x, y) => props.onOpenContext(workspace, x, y))
           return (
             <button
@@ -505,7 +512,7 @@ function SidebarContextMenu(props: {
     }
     const width = Math.min(268, Math.max(1, viewport_w - 16))
     const available_h = Math.max(1, viewport_h - 16)
-    const estimated_h = Math.min(items().length * 42 + 16, available_h)
+    const estimated_h = Math.min(items().length * 42 + 16 + (props.target.kind === 'thread' ? 220 : 0), available_h)
     return {
       left: `${Math.max(8, Math.min(props.target.x, viewport_w - width - 8))}px`,
       top: `${Math.max(8, Math.min(props.target.y, viewport_h - estimated_h - 8))}px`,
@@ -520,6 +527,7 @@ function SidebarContextMenu(props: {
       props.onClose()
       return
     }
+    if (event.target instanceof HTMLSelectElement) return
     if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return
     event.preventDefault()
     const buttons = enabledButtons()
@@ -577,6 +585,9 @@ function SidebarContextMenu(props: {
               </div>
             </div>
           </Show>
+          <Show when={props.target.kind === 'thread' ? props.target.pane : null} keyed>
+            {(pane) => <ChatRouting pane={pane} onClose={props.onClose} />}
+          </Show>
           <For each={items()}>
             {(item) => (
               <button
@@ -612,6 +623,8 @@ function SidebarPrompt(props: {
   createEffect(() => {
     props.state
     queueMicrotask(() => {
+      input.value = props.state.initial
+      setValue(props.state.initial)
       input.focus()
       input.select()
     })
@@ -624,7 +637,7 @@ function SidebarPrompt(props: {
           onPointerDown={(event) => event.stopPropagation()}
           onSubmit={(event) => {
             event.preventDefault()
-            const next = value().trim()
+            const next = (input.value || value()).trim()
             if (next) props.onSubmit(next)
           }}
         >
@@ -634,7 +647,6 @@ function SidebarPrompt(props: {
           </label>
           <input
             ref={input}
-            value={value()}
             placeholder={props.state.placeholder}
             class="mt-2 h-11 w-full rounded-[8px] border border-[var(--border-muted)] bg-[var(--chat-black)] px-3 text-[14px] text-white outline-none focus:border-[var(--accent)]"
             onInput={(event) => setValue(event.currentTarget.value)}

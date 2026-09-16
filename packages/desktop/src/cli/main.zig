@@ -4450,11 +4450,11 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
         .{ .name = "pane_id", .type_name = "integer", .description = "Any pane belonging to the tab." },
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current; defaults to the desktop-selected workspace." },
     });
-    try writeMcpTypedTool(&s, "add_workspace_tab", "Open a new workspace tab, like the + button in the desktop tab strip. Omit kind to follow the user's ui.workspace_new_tab_pane preference (GUI chat unless configured otherwise).", &.{
+    try writeMcpTypedTool(&s, "add_workspace_tab", "Open a new workspace tab in the background without changing the selected workspace or pane. Omit kind to follow the user's ui.workspace_new_tab_pane preference (GUI chat unless configured otherwise).", &.{
         .{ .name = "kind", .type_name = "string", .description = "chat or terminal; omit to use the user's configured default." },
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current; defaults to the desktop-selected workspace." },
     });
-    try writeMcpTypedTool(&s, "open_chat", "Create a durable chat thread in an explicitly selected Verde workspace and return its stable ids. The workspace row must already exist in the session daemon store (the desktop dual-write creates it; open_chat never creates workspaces). With the desktop GUI running the thread is also presented as a native chat pane; with no GUI it is created daemon-direct.", &OPEN_CHAT_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "open_chat", "Create a durable chat thread in an explicitly selected Verde workspace and return its stable ids. The workspace row must already exist in the session daemon store (the desktop dual-write creates it; open_chat never creates workspaces). With the desktop GUI running the thread is also presented as a native chat pane without changing focus; with no GUI it is created daemon-direct.", &OPEN_CHAT_MCP_INPUTS);
     try writeMcpTypedTool(&s, "present_chat", "Present an existing durable chat thread in the desktop GUI. Use this to recover a headless or deferred open_chat result.", &CHAT_PRESENT_MCP_INPUTS);
     try writeMcpTypedTool(&s, "set_chat_draft", "Stage or append a composer draft without sending it. Address either a live pane_id or a durable local_thread_id.", &CHAT_DRAFT_SET_MCP_INPUTS);
     try writeMcpTypedTool(&s, "get_chat_draft", "Read a staged composer draft without sending it. Address either a live pane_id or a durable local_thread_id.", &CHAT_DRAFT_GET_MCP_INPUTS);
@@ -4508,7 +4508,7 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current." },
         .{ .name = "lines", .type_name = "integer", .description = "Optional number of recent lines to return." },
     });
-    try writeMcpTypedTool(&s, "restart_process", "Restart a configured Verde process.", &.{
+    try writeMcpTypedTool(&s, "restart_process", "Restart a configured Verde process without changing focus.", &.{
         .{ .name = "name", .type_name = "string", .description = "Configured process name.", .required = true },
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current." },
     });
@@ -4516,7 +4516,7 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
         .{ .name = "name", .type_name = "string", .description = "Configured process name.", .required = true },
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current." },
     });
-    try writeMcpTypedTool(&s, "start_process", "Start a configured Verde process.", &.{
+    try writeMcpTypedTool(&s, "start_process", "Start a configured Verde process without changing focus.", &.{
         .{ .name = "name", .type_name = "string", .description = "Configured process name.", .required = true },
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current." },
     });
@@ -4705,7 +4705,7 @@ const CHAT_PRESENT_MCP_INPUTS = [_]McpToolInput{
     .{ .name = "local_thread_id", .type_name = "string", .description = "Stable existing thread id.", .required = true },
     .{ .name = "target_pane_id", .type_name = "integer", .description = "Optional pane beside which to place the chat." },
     .{ .name = "axis", .type_name = "string", .enum_values = &.{ "horizontal", "vertical" }, .description = "Optional split axis; defaults to horizontal." },
-    .{ .name = "focus", .type_name = "boolean", .description = "Focus the presented chat; defaults to true." },
+    .{ .name = "focus", .type_name = "boolean", .description = "Focus the presented chat; defaults to false." },
 };
 
 const CHAT_DRAFT_SET_MCP_INPUTS = [_]McpToolInput{
@@ -5161,7 +5161,7 @@ fn mcpToolsCall(
                 .store_revision = store_revision,
                 .target_pane_id = target_pane_id,
                 .axis = axis orelse "horizontal",
-                .focus = focus orelse true,
+                .focus = focus orelse false,
             }, 1, presentationTransportTimeoutMs(remaining_ms)) catch {
                 presentation_ambiguous = true;
                 sleepChatPresentationRetry(io, presentation_deadline_ms);
@@ -5248,7 +5248,7 @@ fn mcpToolsCall(
                 .fast_mode = creation_settings.fast_mode,
                 .target_pane_id = target_pane_id,
                 .axis = axis orelse "horizontal",
-                .focus = true,
+                .focus = false,
             }, 1) catch |err| live_blk: {
                 if (!isLiveSocketUnavailable(err)) return try mcpError(allocator, out, id_value, -32000, @errorName(err));
                 break :live_blk null;
@@ -5334,6 +5334,7 @@ fn mcpToolsCall(
             break :blk sendLiveRequestAlloc(allocator, io, "tab.add", .{
                 .workspace = workspace,
                 .kind = mcpArgString(arguments, "kind"),
+                .focus = false,
             }, 1);
         }
         if (std.mem.eql(u8, tool_name, "browser_status")) {
@@ -5559,7 +5560,7 @@ fn mcpToolsCall(
         }
         if (std.mem.eql(u8, tool_name, "restart_process")) {
             const name = process_name orelse return try mcpError(allocator, out, id_value, -32602, "restart_process requires name");
-            break :blk sendLiveRequestAlloc(allocator, io, "process.restart", .{ .workspace = workspace, .name = name }, 1);
+            break :blk sendLiveRequestAlloc(allocator, io, "process.restart", .{ .workspace = workspace, .name = name, .focus = false }, 1);
         }
         if (std.mem.eql(u8, tool_name, "stop_process")) {
             const name = process_name orelse return try mcpError(allocator, out, id_value, -32602, "stop_process requires name");
@@ -5567,7 +5568,7 @@ fn mcpToolsCall(
         }
         if (std.mem.eql(u8, tool_name, "start_process")) {
             const name = process_name orelse return try mcpError(allocator, out, id_value, -32602, "start_process requires name");
-            break :blk sendLiveRequestAlloc(allocator, io, "process.start", .{ .workspace = workspace, .name = name }, 1);
+            break :blk sendLiveRequestAlloc(allocator, io, "process.start", .{ .workspace = workspace, .name = name, .focus = false }, 1);
         }
         return try mcpError(allocator, out, id_value, -32602, "unknown tool");
     } catch |err| {
@@ -6532,7 +6533,7 @@ fn presentDaemonChatOpenAlloc(
             .store_revision = store_revision,
             .target_pane_id = target_pane_id,
             .axis = axis,
-            .focus = true,
+            .focus = false,
         }, 1, presentationTransportTimeoutMs(remaining_ms)) catch {
             ambiguous = true;
             sleepChatPresentationRetry(io, deadline_ms);

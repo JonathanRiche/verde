@@ -1844,10 +1844,22 @@ pub fn providerSupportsModel(self: anytype, provider: Provider, model_ref: []con
 }
 
 pub fn splitWorkspacePaneWithChatPlacement(self: anytype, project_index: usize, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis, new_after: bool) bool {
+    return splitWorkspacePaneWithChatPlacementAndFocus(self, project_index, pane_id, axis, new_after, true);
+}
+
+pub fn splitWorkspacePaneWithChatPlacementAndFocus(self: anytype, project_index: usize, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis, new_after: bool, focus: bool) bool {
     if (project_index >= self.project_controller.projects.items.len) return false;
     var project = &self.project_controller.projects.items[project_index];
     var layout = &project.workspace_layout;
     _ = layout.paneById(pane_id) orelse return false;
+    const previous_pane_id = layout.focused_pane_id;
+    const previous_revealed_pane_id = layout.scroll_revealed_pane_id;
+    const previous_thread_index = project.selected_thread_index;
+    defer if (!focus) {
+        layout.focused_pane_id = previous_pane_id;
+        layout.scroll_revealed_pane_id = previous_revealed_pane_id;
+        project.selected_thread_index = previous_thread_index;
+    };
     const thread_index = project.addThread(self.allocator) catch |err| {
         log.err("failed to create chat thread for workspace pane: {s}", .{@errorName(err)});
         self.setSidebarNotice("Failed to create a new thread.");
@@ -1866,9 +1878,9 @@ pub fn splitWorkspacePaneWithChatPlacement(self: anytype, project_index: usize, 
         self.setSidebarNotice("Failed to split workspace.");
         return false;
     };
-    layout.focusCreatedPane(new_pane_id);
+    if (focus) layout.focusCreatedPane(new_pane_id);
     project.selected_thread_index = thread_index;
-    if (self.project_controller.selected_index == project_index) {
+    if (focus and self.project_controller.selected_index == project_index) {
         self.terminal_controller.focused = false;
         self.requestComposerFocus();
         self.syncRenameBuffer();
@@ -2389,10 +2401,22 @@ pub fn splitWorkspacePaneWithTerminalAxis(self: anytype, project_index: usize, p
 }
 
 pub fn splitWorkspacePaneWithTerminalPlacement(self: anytype, project_index: usize, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis, new_after: bool) bool {
+    return splitWorkspacePaneWithTerminalPlacementAndFocus(self, project_index, pane_id, axis, new_after, true);
+}
+
+pub fn splitWorkspacePaneWithTerminalPlacementAndFocus(self: anytype, project_index: usize, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis, new_after: bool, focus: bool) bool {
     if (project_index >= self.project_controller.projects.items.len) return false;
     var project = &self.project_controller.projects.items[project_index];
     var layout = &project.workspace_layout;
     _ = layout.paneById(pane_id) orelse return false;
+    const previous_pane_id = layout.focused_pane_id;
+    const previous_revealed_pane_id = layout.scroll_revealed_pane_id;
+    const previous_thread_index = project.selected_thread_index;
+    defer if (!focus) {
+        layout.focused_pane_id = previous_pane_id;
+        layout.scroll_revealed_pane_id = previous_revealed_pane_id;
+        project.selected_thread_index = previous_thread_index;
+    };
 
     const dock_id = self.createProjectTerminalDock(project_index) catch |err| {
         log.err("failed to allocate terminal dock: {s}", .{@errorName(err)});
@@ -2405,6 +2429,8 @@ pub fn splitWorkspacePaneWithTerminalPlacement(self: anytype, project_index: usi
         return false;
     };
     var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return false;
+    // Terminal startup queues a focus request consumed by the next UI frame.
+    if (!focus) dock.focus_requested = false;
 
     const new_pane_id = layout.createTerminalPane(self.allocator, dock_id) catch |err| {
         log.err("failed to create terminal workspace pane: {s}", .{@errorName(err)});
@@ -2416,9 +2442,9 @@ pub fn splitWorkspacePaneWithTerminalPlacement(self: anytype, project_index: usi
         self.setSidebarNotice("Failed to split workspace.");
         return false;
     };
-    layout.focusCreatedPane(new_pane_id);
+    if (focus) layout.focusCreatedPane(new_pane_id);
     dock.visible = false;
-    if (self.project_controller.selected_index == project_index) self.requestTerminalDockFocus(dock_id);
+    if (focus and self.project_controller.selected_index == project_index) self.requestTerminalDockFocus(dock_id);
     self.setSidebarNotice("Terminal pane created.");
     self.markWorkspaceDirty(project_index);
     return true;
@@ -2604,6 +2630,80 @@ test "addressed chat send does not change the visible workspace selection" {
     try std.testing.expectEqual(@as(usize, 0), state.project_controller.selected_index);
     try std.testing.expectEqual(selected_thread_before, state.project_controller.projects.items[0].selected_thread_index);
     try std.testing.expectEqual(focused_pane_before, state.project_controller.projects.items[0].workspace_layout.focused_pane_id);
+}
+
+test "background splits preserve selection and viewport without requesting input focus" {
+    const allocator = std.testing.allocator;
+    const FakeState = struct {
+        allocator: std.mem.Allocator,
+        project_controller: struct {
+            projects: std.ArrayList(Project) = .empty,
+            selected_index: usize = 0,
+        } = .{},
+        terminal_controller: struct { focused: bool = true } = .{},
+        dock: struct { visible: bool = false, focus_requested: bool = false } = .{},
+        focus_requests: usize = 0,
+        terminal_starts: usize = 0,
+
+        pub fn applyNewChatDefaults(_: *@This(), _: usize, _: usize) !void {}
+        pub fn setSidebarNotice(_: *@This(), _: []const u8) void {}
+        pub fn markDirty(_: *@This()) void {}
+        pub fn markWorkspaceDirty(_: *@This(), _: usize) void {}
+        pub fn syncRenameBuffer(_: *@This()) void {}
+        pub fn requestComposerFocus(self: *@This()) void {
+            self.focus_requests += 1;
+        }
+        pub fn requestTerminalDockFocus(self: *@This(), _: u32) void {
+            self.focus_requests += 1;
+        }
+        pub fn createProjectTerminalDock(_: *@This(), _: usize) !u32 {
+            return 7;
+        }
+        pub fn restartTerminalDockForWorkspace(self: *@This(), _: usize, _: u32) !void {
+            self.terminal_starts += 1;
+            self.dock.focus_requested = true;
+        }
+        pub fn projectTerminalDockMutable(self: *@This(), _: usize, _: u32) ?*@TypeOf(self.dock) {
+            return &self.dock;
+        }
+    };
+    var state: FakeState = .{ .allocator = allocator };
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+    }
+    try state.project_controller.projects.ensureUnusedCapacity(allocator, 1);
+    state.project_controller.projects.appendAssumeCapacity(try Project.init(allocator, "split", "Split", "/tmp/split", 0));
+    const project = &state.project_controller.projects.items[0];
+    const layout = &project.workspace_layout;
+    const pane_id = layout.focused_pane_id.?;
+    const thread_index = project.selected_thread_index;
+    layout.maximized_pane_id = pane_id;
+    layout.scroll_revealed_pane_id = pane_id;
+    layout.scroll_offset_x = 120;
+    layout.scroll_target_x = 180;
+    for ([_]bool{ false, true }) |terminal_pane| {
+        const created = if (terminal_pane)
+            splitWorkspacePaneWithTerminalPlacementAndFocus(&state, 0, pane_id, .horizontal, true, false)
+        else
+            splitWorkspacePaneWithChatPlacementAndFocus(&state, 0, pane_id, .horizontal, true, false);
+        try std.testing.expect(created);
+        try std.testing.expectEqual(pane_id, layout.focused_pane_id.?);
+        try std.testing.expectEqual(pane_id, layout.maximized_pane_id.?);
+        try std.testing.expectEqual(pane_id, layout.scroll_revealed_pane_id.?);
+        try std.testing.expectEqual(thread_index, project.selected_thread_index);
+        try std.testing.expectEqual(@as(f32, 120), layout.scroll_offset_x);
+        try std.testing.expectEqual(@as(f32, 180), layout.scroll_target_x);
+        try std.testing.expectEqual(@as(usize, 0), state.focus_requests);
+        try std.testing.expect(state.terminal_controller.focused);
+    }
+    try std.testing.expectEqual(@as(usize, 3), layout.visiblePaneCount());
+    try std.testing.expectEqual(@as(usize, 2), project.threads.items.len);
+    try std.testing.expectEqual(@as(usize, 1), state.terminal_starts);
+    try std.testing.expect(!state.dock.focus_requested);
+    try std.testing.expect(splitWorkspacePaneWithChatPlacement(&state, 0, pane_id, .horizontal, true));
+    try std.testing.expect(layout.focused_pane_id.? != pane_id);
+    try std.testing.expectEqual(@as(usize, 1), state.focus_requests);
 }
 
 test "background chat creation preserves the scrolling viewport" {

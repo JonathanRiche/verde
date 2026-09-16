@@ -1,5 +1,6 @@
 import { For, Show, createEffect, createMemo, createSignal, onCleanup } from 'solid-js'
 
+import { composerEnterShouldSubmit } from '../lib/composer_input'
 import { chatImageUrl } from '../lib/live'
 import { renderMarkdown as renderSafeMarkdown } from '../lib/markdown'
 import { clipboardImageFiles, store } from '../lib/store'
@@ -320,7 +321,7 @@ export function ChatPane(props: { pane: LivePane }) {
                 : <TranscriptRow message={item.message} pane={props.pane} />}
           </For>
           <Show when={messages().length === 0}>
-            <EmptyTranscript />
+            <EmptyTranscript pending={!props.pane.thread_id} />
           </Show>
           </Show>
         </div>
@@ -332,11 +333,17 @@ export function ChatPane(props: { pane: LivePane }) {
   )
 }
 
-function EmptyTranscript() {
+function EmptyTranscript(props: { pending?: boolean }) {
   return (
     <div class="px-2 py-16 text-[var(--text-subtle)]">
-      <div class="wordmark text-[28px] text-[var(--text)]">Ask anything</div>
-      <p class="mt-2 max-w-md text-[15px]">or use / to show available commands</p>
+      <div class="wordmark text-[28px] text-[var(--text)]">
+        {props.pending ? 'Opening conversation' : 'Ask anything'}
+      </div>
+      <p class="mt-2 max-w-md text-[15px]">
+        {props.pending
+          ? 'This chat is open on the desktop; its transcript is still attaching.'
+          : 'or use / to show available commands'}
+      </p>
     </div>
   )
 }
@@ -927,38 +934,56 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
   let field: HTMLTextAreaElement | undefined
   let filePicker: HTMLInputElement | undefined
 
-  // Pane projections are refreshed in the background, but a mounted
-  // composer's cache key never changes. Capturing it keeps those refreshes
-  // from redundantly assigning the controlled textarea value, which can
-  // disturb Android selection/IME state even when the string is unchanged.
+  // Draft cache key is captured at mount. The textarea itself is
+  // uncontrolled: the browser owns the caret/IME until submit, so snapshot
+  // refreshes and per-keystroke store writes cannot assign `value` mid-edit
+  // (that path ate Android/iOS composition and made Return feel like Send).
   const composer_pane = props.pane
 
   const attachments = () => store.attachmentsFor(composer_pane)
   const uploading = () => store.uploadingAttachmentsFor(composer_pane)
+  const [blank, setBlank] = createSignal(store.draftFor(composer_pane).trim().length === 0)
+
+  const persistDraft = () => {
+    if (field) store.setDraftFor(composer_pane, field.value)
+  }
+
+  const syncFieldFromStore = () => {
+    if (!field) return
+    field.value = store.draftFor(composer_pane)
+    setBlank(field.value.trim().length === 0)
+  }
+
+  const submitDraft = () => {
+    if (uploading() || store.sending()) return
+    persistDraft()
+    void store.sendDraft(props.pane).then(syncFieldFromStore)
+  }
+
+  onCleanup(persistDraft)
 
   createEffect(() => {
     const nonce = store.composerNonce()
     if (!props.focused || nonce <= handledComposerFocusNonce) return
     handledComposerFocusNonce = nonce
+    // Diff-comment prefills (and focus_prompt) land in the store; copy once.
+    syncFieldFromStore()
     if (!store.compact()) field?.focus()
   })
 
   const onKeyDown = (event: KeyboardEvent) => {
-    if (event.key === 'Enter' && !event.shiftKey) {
-      event.preventDefault()
-      if (uploading()) return
-      void store.sendDraft(props.pane)
-    }
+    if (!composerEnterShouldSubmit(event, {
+      compact: store.compact(),
+      coarsePointer: window.matchMedia('(pointer: coarse)').matches,
+    })) return
+    event.preventDefault()
+    submitDraft()
   }
 
   return (
     <form
       class="min-w-0 bg-[var(--chat-black)] px-3 pb-[max(12px,var(--safe-bottom))] lg:px-5 lg:pb-[max(16px,var(--safe-bottom))]"
-      onSubmit={(event) => {
-        event.preventDefault()
-        if (uploading()) return
-        void store.sendDraft(props.pane)
-      }}
+      onSubmit={(event) => event.preventDefault()}
     >
       <Show when={props.focused && store.notice()}>
         <p class="mx-auto mb-2 max-w-[900px] text-right text-xs text-[var(--warning)]">{store.notice()}</p>
@@ -998,11 +1023,15 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
           </div>
         </Show>
         <textarea
-          ref={(node) => { field = node }}
+          ref={(node) => {
+            field = node
+            if (node) node.value = store.draftFor(composer_pane)
+          }}
           class="min-h-[52px] w-full bg-transparent text-[16px] leading-[21px] outline-none placeholder:text-[var(--text-subtle)] lg:min-h-[88px] lg:text-[18px] lg:leading-[22px]"
           placeholder="Ask anything…"
-          value={store.draftFor(composer_pane)}
-          onInput={(event) => store.setDraftFor(composer_pane, event.currentTarget.value)}
+          enterkeyhint="enter"
+          onInput={(event) => setBlank(event.currentTarget.value.trim().length === 0)}
+          onBlur={persistDraft}
           onKeyDown={onKeyDown}
           onPaste={(event) => {
             const files = clipboardImageFiles(event.clipboardData)
@@ -1065,13 +1094,14 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
             }
           >
             <button
-              type="submit"
+              type="button"
               class="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-[var(--accent)] text-[#06210f] disabled:opacity-35"
               disabled={
                 store.sending() ||
                 uploading() ||
-                (store.draftFor(composer_pane).trim().length === 0 && attachments().length === 0)
+                (blank() && attachments().length === 0)
               }
+              onClick={submitDraft}
               aria-label="Send"
             >
               <svg class="h-4 w-4" viewBox="0 0 24 24" aria-hidden="true">
@@ -1101,6 +1131,35 @@ const PROVIDER_OPTIONS = [
 
 type PickerProvider = typeof PROVIDER_OPTIONS[number]['value'] | 'favorites'
 
+interface PanePickerSnapshot {
+  provider: string
+  model: string | null
+  effort: string | null
+  variant: string | null
+  fast: boolean
+  access: string
+}
+
+function panePickerSnapshot(pane: LivePane): PanePickerSnapshot {
+  return {
+    provider: pane.provider ?? 'codex',
+    model: pane.model ?? null,
+    effort: pane.reasoning_effort ?? null,
+    variant: pane.reasoning_variant ?? null,
+    fast: pane.fast_mode === true,
+    access: pane.access_mode ?? 'supervised',
+  }
+}
+
+function pickerSnapshotsEqual(a: PanePickerSnapshot, b: PanePickerSnapshot): boolean {
+  return a.provider === b.provider
+    && a.model === b.model
+    && a.effort === b.effort
+    && a.variant === b.variant
+    && a.fast === b.fast
+    && a.access === b.access
+}
+
 function FavoriteStar(props: { active: boolean }) {
   return (
     <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
@@ -1126,15 +1185,20 @@ function ComposerPickers(props: { pane: LivePane }) {
   const [selectedAccess, setSelectedAccess] = createSignal(props.pane.access_mode ?? 'supervised')
   const [pickerProvider, setPickerProvider] = createSignal<PickerProvider>(selectedProvider() as PickerProvider)
   const [modelMenuStyle, setModelMenuStyle] = createSignal('left:12px;bottom:64px;width:calc(100vw - 24px);max-height:55vh')
-  // Picker feedback is local and synchronous; the pane projection catches up
-  // after the durable daemon write. Reconcile external/desktop changes when a
-  // fresh pane value arrives without making the click wait on that round trip.
-  createEffect(() => setSelectedProvider(props.pane.provider ?? 'codex'))
-  createEffect(() => setSelectedModel(props.pane.model ?? null))
-  createEffect(() => setSelectedEffort(props.pane.reasoning_effort ?? null))
-  createEffect(() => setSelectedVariant(props.pane.reasoning_variant ?? null))
-  createEffect(() => setSelectedFast(props.pane.fast_mode === true))
-  createEffect(() => setSelectedAccess(props.pane.access_mode ?? 'supervised'))
+  // Picker feedback is local and synchronous. Only copy pane → local when the
+  // projection itself changed, so a stale snapshot cannot rewind a click.
+  let appliedPane = panePickerSnapshot(props.pane)
+  createEffect(() => {
+    const next = panePickerSnapshot(props.pane)
+    if (pickerSnapshotsEqual(appliedPane, next)) return
+    appliedPane = next
+    setSelectedProvider(next.provider)
+    setSelectedModel(next.model)
+    setSelectedEffort(next.effort)
+    setSelectedVariant(next.variant)
+    setSelectedFast(next.fast)
+    setSelectedAccess(next.access)
+  })
   // Daemon catalog (provider.models.list) when the provider is reachable,
   // otherwise the static desktop-parity tables.
   createEffect(() => store.ensureProviderModels(selectedProvider()))

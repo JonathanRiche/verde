@@ -2176,9 +2176,9 @@ fn renderOpenPaneRow(
     // Accent-tinted fills (not the gray border token) so focus/hover track
     // the active theme; alphas follow the command palette's selection washes.
     if (focused) {
-        queuePaletteRoundedRect(state, snapRect(rect), paletteColor(theme.withAlpha(theme.COLOR_GREEN, 72)), theme.scaledUi(7.0));
+        queuePaletteRoundedRectClipped(state, rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 72)), theme.scaledUi(7.0), clip);
     } else if (hovered) {
-        queuePaletteRoundedRect(state, snapRect(rect), paletteColor(theme.withAlpha(theme.COLOR_GREEN, 48)), theme.scaledUi(7.0));
+        queuePaletteRoundedRectClipped(state, rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 48)), theme.scaledUi(7.0), clip);
     }
     addClippedPaletteHit(rect, clip, if (show_workspace_tag) .open_pane else .open_pane_reorder, project_index, pane.id);
 
@@ -2194,7 +2194,7 @@ fn renderOpenPaneRow(
         // cross-workspace rows reuse an already-learned identity cue.
         const chip = theme.scaledUi(18.0);
         const chip_rect: palette.Rect = .{ .x = rect.x + theme.scaledUi(4.0), .y = cy - chip * 0.5, .w = chip, .h = chip };
-        queuePaletteRoundedRect(state, chip_rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(5.0));
+        queuePaletteRoundedRectClipped(state, chip_rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(5.0), clip);
         var letter_buf: [1]u8 = undefined;
         const letter = workspaceInitial(&letter_buf, project.label);
         const letter_font = theme.scaledUi(10.0);
@@ -2231,7 +2231,8 @@ fn renderOpenPaneRow(
                 running = status.? == .working;
                 if (running) status_started_at_ms = thread.sendStartedAtMsForUi();
             } else {
-                queuePaletteChatBubbleIcon(state, icon_x, cy, muted);
+                if (intersectRects(.{ .x = icon_x, .y = cy - theme.scaledUi(8.0), .w = theme.scaledUi(12.0), .h = theme.scaledUi(16.0) }, clip) != null)
+                    queuePaletteChatBubbleIcon(state, icon_x, cy, muted);
                 title = "Chat";
             }
         },
@@ -2272,7 +2273,11 @@ fn renderOpenPaneRow(
             // lines up with chat/provider icons rather than hugging the left.
             const globe_size = theme.scaledUi(13.0);
             const slot = theme.scaledUi(SIDEBAR_THREAD_PROVIDER_GLYPH_CSS);
-            globe_icon.queue(state, icon_x + slot * 0.5, cy, globe_size, paletteColor(muted));
+            // Unclipped primitive: skip it when the row straddles the list
+            // edge so the globe cannot bleed into the section below.
+            if (intersectRects(.{ .x = icon_x, .y = cy - globe_size * 0.5, .w = slot, .h = globe_size }, clip)) |visible| {
+                if (visible.h >= globe_size) globe_icon.queue(state, icon_x + slot * 0.5, cy, globe_size, paletteColor(muted));
+            }
             title = browserPaneTitle(pane);
         },
     }
@@ -2351,12 +2356,12 @@ fn renderOpenPaneRow(
         // the title truncation uses; labels are short and near-uniform.
         const est_w = @as(f32, @floatFromInt(status_label.len)) * status_font * 0.54;
         const label_x = rect.x + rect.w - theme.scaledUi(10.0) - est_w;
-        queuePaletteRoundedRect(state, .{
+        queuePaletteRoundedRectClipped(state, .{
             .x = label_x - dot - theme.scaledUi(6.0),
             .y = cy - dot * 0.5,
             .w = dot,
             .h = dot,
-        }, paletteColor(theme.withAlpha(pip_color, @intFromFloat(pulse * 255.0))), dot * 0.5);
+        }, paletteColor(theme.withAlpha(pip_color, @intFromFloat(pulse * 255.0))), dot * 0.5, clip);
         if (status_label.len > 0) {
             queuePaletteText(state, .{
                 .x = label_x,
@@ -2571,6 +2576,14 @@ test "pane row drag owns move cursor from press through active drag" {
 
 fn queuePaletteRoundedRect(state: *runtime.AppState, rect: palette.Rect, color: palette.Color, radius: f32) void {
     state.palette_overlay_batch.roundedRect(state.allocator, snapRect(rect), color, radius) catch |err| {
+        log.warn("failed to queue sidebar palette rounded rect: {s}", .{@errorName(err)});
+    };
+}
+
+/// Clipped variant for shapes inside a scrolling list: a row straddling the
+/// viewport edge must not bleed its fill, chip, or pip past the section.
+fn queuePaletteRoundedRectClipped(state: *runtime.AppState, rect: palette.Rect, color: palette.Color, radius: f32, clip: palette.Rect) void {
+    state.palette_overlay_batch.roundedRectClipped(state.allocator, snapRect(rect), color, radius, clip) catch |err| {
         log.warn("failed to queue sidebar palette rounded rect: {s}", .{@errorName(err)});
     };
 }

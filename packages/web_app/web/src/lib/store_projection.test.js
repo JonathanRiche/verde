@@ -7,6 +7,7 @@ import {
   isAbsentDaemonThread,
   lastDeliveredTailSeq,
   layoutFromLivePanes,
+  carryLiveChatIdentity,
   mapTranscriptRows,
   mergeThreadCatalogSettings,
   panesForWorkspace,
@@ -445,6 +446,70 @@ describe('panesForWorkspace', () => {
       send_pending: true,
       completion_pending: true,
     })
+  })
+
+  test('binds a live pane by local_thread_id when title and index have drifted', () => {
+    const workspace = {
+      workspace_id: 'workspace-1',
+      label: 'Workspace',
+      path: '/workspace',
+      threads: [
+        {
+          local_thread_id: 'thread-1',
+          title: 'Automatic Title',
+          sort_index: 12,
+          provider: 'codex',
+        },
+      ],
+    }
+    const live_layout = {
+      panes: [{
+        id: 7,
+        kind: 'chat',
+        thread: 0,
+        title: 'New thread',
+        local_thread_id: 'thread-1',
+        provider: 'codex',
+      }],
+    }
+
+    const [pane] = panesForWorkspace(workspace, [], [], new Set(), live_layout)
+
+    expect(pane).toMatchObject({ thread_id: 'thread-1', thread_title: 'Automatic Title' })
+  })
+})
+
+describe('carryLiveChatIdentity', () => {
+  test('keeps thread ids when a later live tick omits them', () => {
+    const previous = [{
+      id: 7,
+      kind: 'chat',
+      thread: 0,
+      title: 'New thread',
+      local_thread_id: 'thread-1',
+      provider_thread_id: 'provider-1',
+    }]
+    const next = [{
+      id: 7,
+      kind: 'chat',
+      thread: 0,
+      title: 'New thread',
+    }]
+
+    expect(carryLiveChatIdentity(previous, next)).toEqual([{
+      id: 7,
+      kind: 'chat',
+      thread: 0,
+      title: 'New thread',
+      local_thread_id: 'thread-1',
+      provider_thread_id: 'provider-1',
+    }])
+  })
+
+  test('does not invent identity for a different native pane', () => {
+    const previous = [{ id: 7, kind: 'chat', local_thread_id: 'thread-1' }]
+    const next = [{ id: 8, kind: 'chat', title: 'New thread' }]
+    expect(carryLiveChatIdentity(previous, next)[0].local_thread_id).toBeUndefined()
   })
 })
 

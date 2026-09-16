@@ -15,6 +15,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const known_folders = b.createModule(.{ .root_source_file = b.path("../desktop/src/platform/windows/known_folders.zig"), .target = target, .optimize = optimize });
+    const paths = b.createModule(.{ .root_source_file = b.path("../desktop/src/platform/paths.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "platform_windows_known_folders", .module = known_folders }} });
+    const runtime = b.createModule(.{ .root_source_file = b.path("../desktop/src/web_runtime.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "headless", .module = headless_module }, .{ .name = "platform_paths", .module = paths } } });
+
     const exe = b.addExecutable(.{
         .name = "verde-web",
         .root_module = b.createModule(.{
@@ -23,9 +27,11 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "headless", .module = headless_module },
+                .{ .name = "web_runtime", .module = runtime },
             },
         }),
     });
+    exe.root_module.link_libc = true;
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -41,9 +47,11 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "headless", .module = headless_module },
+                .{ .name = "web_runtime", .module = runtime },
             },
         }),
     });
+    tests.root_module.link_libc = true;
     _ = tests.getEmittedBin();
 
     const test_step = b.step("test", "Run web_app unit tests");

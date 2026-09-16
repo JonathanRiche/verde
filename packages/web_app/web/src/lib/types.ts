@@ -25,6 +25,10 @@ export interface Message {
 }
 
 export interface Thread {
+  profile_id?: string | null
+  runtime_id?: string | null
+  repository_id?: string | null
+  repository_cwd?: string | null
   local_thread_id: string
   title: string
   /// Stable position in the workspace thread array; persisted workspace
@@ -74,6 +78,11 @@ export interface Workspace {
 }
 
 export interface LivePane {
+  profile_id?: string | null
+  runtime_id?: string | null
+  repository_id?: string | null
+  repository_cwd?: string | null
+  committed?: boolean
   pane_id: number
   workspace_id: string
   focused?: boolean

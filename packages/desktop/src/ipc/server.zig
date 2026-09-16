@@ -1034,7 +1034,9 @@ fn tabCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, st
         var tab_buffer: [app_state.workspace_tabs.MAX_WORKSPACE_TABS]app_state.WorkspaceTab = undefined;
         const layout = &state.project_controller.projects.items[project_index].workspace_layout;
         const tabs_before = app_state.workspace_tabs.collect(layout, &tab_buffer).len;
-        state.addWorkspaceTab(project_index, kind);
+        if (paramIsNonNull(params, "focus") and boolParam(params, "focus") == null)
+            return try errorResponseAlloc(allocator, id_value, "invalid_request", "tab.add focus must be a boolean");
+        state.addWorkspaceTabWithFocus(project_index, kind, boolParam(params, "focus") orelse true);
         const tabs_after = app_state.workspace_tabs.collect(layout, &tab_buffer).len;
         if (tabs_after <= tabs_before) return try errorResponseAlloc(allocator, id_value, "rejected", "tab add did not apply");
         return try panesResponseForProject(allocator, id_value, state, project_index);
@@ -2029,12 +2031,15 @@ fn processCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value
     }
     if (std.mem.eql(u8, command, "start") or std.mem.eql(u8, command, "stop") or std.mem.eql(u8, command, "restart")) {
         const name = stringParam(params, "name") orelse return try errorResponseAlloc(allocator, id_value, "invalid_request", "process command requires --name");
+        if (paramIsNonNull(params, "focus") and boolParam(params, "focus") == null)
+            return try errorResponseAlloc(allocator, id_value, "invalid_request", "process focus must be a boolean");
+        const focus = boolParam(params, "focus") orelse true;
         const changed = (if (std.mem.eql(u8, command, "start"))
-            state.startManagedProcess(project_index, name)
+            state.startManagedProcessWithFocus(project_index, name, if (focus) .focus else .preserve)
         else if (std.mem.eql(u8, command, "stop"))
             state.stopManagedProcess(project_index, name)
         else
-            state.restartManagedProcess(project_index, name)) catch |err| switch (err) {
+            state.restartManagedProcessWithFocus(project_index, name, if (focus) .focus else .preserve)) catch |err| switch (err) {
             error.InvalidStackConfig => return try errorResponseAlloc(allocator, id_value, "invalid_stack_config", stackConfigErrorMessage(state, project_index, err)),
             else => return err,
         };
@@ -2295,6 +2300,10 @@ fn writePane(s: *std.json.Stringify, state: *app_state.AppState, project_index: 
             try s.write(ref.thread_index);
             if (ref.thread_index < project.threads.items.len) {
                 const thread = &project.threads.items[ref.thread_index];
+                try s.objectField("local_thread_id");
+                try s.write(thread.local_thread_id);
+                try s.objectField("provider_thread_id");
+                if (thread.provider_thread_id) |thread_id| try s.write(thread_id) else try s.write(null);
                 try s.objectField("thread_title");
                 try s.write(thread.title);
                 try s.objectField("provider");
@@ -2394,6 +2403,8 @@ fn writeThreadSummary(s: *std.json.Stringify, thread: app_state.ChatThread, inde
     try s.beginObject();
     try s.objectField("index");
     try s.write(index);
+    try s.objectField("local_thread_id");
+    try s.write(thread.local_thread_id);
     try s.objectField("title");
     try s.write(thread.title);
     try s.objectField("provider");
