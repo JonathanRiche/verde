@@ -646,6 +646,10 @@ async function listTranscriptMessages(
     const next = messageListCursor(response)
     if (!next || rows.length === 0) return collected
     cursor = next
+    // A too-large page shrinks `limit` to walk past a megabyte command card.
+    // Restore the default afterward so the rest of the thread is not fetched
+    // one row at a time (Workspace 8 was ~100 RPCs on a phone).
+    limit = TRANSCRIPT_PAGE_LIMIT
   }
   return collected
 }
@@ -1298,7 +1302,11 @@ function createAppStore() {
   const [sending, setSending] = createSignal(false)
   const [notice, setNotice] = createSignal<string | null>(null)
   const [composerNonce, setComposerNonce] = createSignal(0)
-  const [compact, setCompact] = createSignal(false)
+  const [compact, setCompact] = createSignal(
+    typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+      ? window.matchMedia('(max-width: 1023px)').matches
+      : false,
+  )
   const [uiConfig, setUiConfig] = createSignal<UiConfig>(DEFAULT_UI_CONFIG)
   const [keybindConfig, setKeybindConfig] = createSignal<WebKeybindConfig>(DEFAULT_WEB_KEYBINDS)
   const [prefixMode, setPrefixMode] = createSignal<'armed' | 'navigate' | null>(null)
@@ -2272,17 +2280,21 @@ function createAppStore() {
       jobs.push(pane)
     }
     // Focused pane first: on initial open it must paint before background
-    // panes queue their multi-megabyte transcript downloads/parses.
+    // panes queue their multi-megabyte transcript downloads/parses. Phones
+    // show one chat, so background panes wait until they are focused.
     consider(focusedPane())
-    for (const pane of openPanes()) consider(pane)
+    if (!compact()) {
+      for (const pane of openPanes()) consider(pane)
+    }
     for (const pane of jobs) {
       // Streaming rides its own long-poll loop; this tick only (re)starts
       // loops after turn discovery. The committed base re-downloads only
-      // when missing or while a turn is live — a finished turn's tail loop
-      // reloads it once on commit. Unconditionally refetching every open
-      // transcript each tick shipped multi-megabyte threads through JSON
-      // parse/merge over and over and made typing lag; loading them
-      // sequentially keeps each JSON parse/merge in its own frame budget.
+      // when missing — a finished turn's tail loop reloads it once on
+      // commit. Refetching while a turn was live shipped multi-megabyte
+      // threads through JSON parse/merge every 1.5s (this chat's ~1 MiB
+      // command card included) and froze the composer on phones. Loading
+      // uncached panes sequentially keeps each parse/merge in its own
+      // frame budget.
       if (connections() && connectionFor(pane) !== 'local' && !turnTails.has(paneKey(pane.workspace_id, pane.pane_id))) {
         try {
           const response = await paneRpc(pane, 'chat.turn.list', { workspace_id: pane.workspace_id })
@@ -2294,8 +2306,7 @@ function createAppStore() {
       tailActiveTurn(pane)
       const key = paneKey(pane.workspace_id, pane.pane_id)
       const uncached = !transcripts()[key]?.length
-      const live = turnTails.has(key) || Boolean(pane.send_pending)
-      if (uncached || live) await loadTranscript(pane)
+      if (uncached) await loadTranscript(pane)
     }
   }
 
@@ -2634,10 +2645,15 @@ function createAppStore() {
         },
       ]
       tailActiveTurn(current)
-      window.setTimeout(() => {
-        void loadTranscript(current)
-        void refreshProjection()
-      }, 400)
+      // The optimistic user row plus the tail overlay cover the in-flight
+      // turn. Reloading the committed transcript here raced the 1.5s poll
+      // and re-parsed multi-megabyte threads on every send; commit reloads
+      // once when the tail loop sees a terminal status.
+      void refreshProjection({
+        scope: 'selected',
+        workspace_id: ws.workspace_id,
+        enrich_chat_status: false,
+      })
     } catch (err) {
       rollback()
       setNotice(err instanceof Error ? err.message : 'send failed')
