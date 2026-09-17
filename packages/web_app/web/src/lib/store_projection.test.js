@@ -264,6 +264,33 @@ describe('fetchPagedTranscript', () => {
     expect(messages).toMatchObject([{ message_id: 'ok', body: 'fits' }])
   })
 
+  test('restores the default page size after walking past a too-large row', async () => {
+    const limits = []
+    const messages = await fetchPagedTranscript(async (method, params) => {
+      expect(method).toBe('chat.message.list')
+      limits.push(params.limit)
+      if (!params.cursor) {
+        if (params.limit > 1) return { ok: false, error: { code: 'unavailable', message: 'daemon unavailable' } }
+        return {
+          result: {
+            messages: [{ message_id: 'huge', role: 'system', author: 'Ran command', body: 'big' }],
+            next_cursor: 'b:older',
+          },
+        }
+      }
+      return {
+        result: {
+          messages: [{ message_id: 'old', role: 'user', author: 'You', body: 'hi' }],
+        },
+      }
+    }, { workspace_id: 'ws-1', local_thread_id: 'thread-1' })
+
+    expect(limits[0]).toBe(40)
+    expect(limits).toContain(1)
+    expect(limits.at(-1)).toBe(40)
+    expect(messages.map((row) => row.message_id)).toEqual(['old', 'huge'])
+  })
+
   test('keeps later pages in front of already-loaded newer rows', () => {
     expect(prependTranscriptPage(
       [{ message_id: 'm0', role: 'user', author: 'You', body: 'old' }],

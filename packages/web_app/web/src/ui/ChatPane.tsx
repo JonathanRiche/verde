@@ -109,7 +109,7 @@ export function ChatPane(props: { pane: LivePane }) {
   }
 
   createEffect(() => {
-    store.ensureTranscript(props.pane)
+    if (focused() || !store.compact()) store.ensureTranscript(props.pane)
   })
 
   createEffect(() => {
@@ -390,6 +390,9 @@ function isCommandCardRow(message: Message): boolean {
 
 function isSubagentCardRow(message: Message): boolean {
   if (message.tool_call_kind === 'subagent' || message.author === 'Subagent') return true
+  // Shell/command cards are never subagents; skip scanning a megabyte of
+  // output for Tool/Input/Output labels on every header paint.
+  if (message.author === 'Ran command' || message.author === 'Command failed') return false
   const tool = toolBodyField(message.body, 'Tool')
   if (tool && /^(task|agent|subagent|taskexecute|spawnagent|spawn_agent)$/i.test(tool.trim())) return true
   const input = toolBodyField(message.body, 'Input') ?? ''
@@ -428,8 +431,36 @@ function commandRunning(message: Message): boolean {
 
 /// Whitespace-collapsed single-line preview, exactly like the desktop's
 /// commandRowPreviewAlloc (labels like "Input:" are kept, runs collapse).
+/// Only the leading slice is scanned: a 1 MiB command card would otherwise
+/// run a global whitespace regex on every header paint.
+const COMMAND_PREVIEW_CHARS = 400
 function commandPreview(body: string): string {
-  return body.replace(/[\s\r\n\t]+/g, ' ').trim()
+  const sample = body.length > COMMAND_PREVIEW_CHARS ? body.slice(0, COMMAND_PREVIEW_CHARS) : body
+  return sample.replace(/[\s\r\n\t]+/g, ' ').trim()
+}
+
+/// First `max` lines without splitting the rest of a huge tool body into an
+/// array of strings (the 1 MiB Workspace 8 command card froze phones).
+function takeLeadingLines(body: string, max: number): { text: string; truncated: boolean } {
+  const text = body.trim()
+  if (text.length === 0 || max <= 0) return { text: '', truncated: false }
+  let from = 0
+  for (let n = 0; n < max; n++) {
+    const nl = text.indexOf('\n', from)
+    if (nl < 0) return { text, truncated: false }
+    from = nl + 1
+  }
+  return { text: text.slice(0, from - 1), truncated: from < text.length }
+}
+
+function countLines(body: string): number {
+  const text = body.trim()
+  if (text.length === 0) return 0
+  let lines = 1
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) === 10) lines += 1
+  }
+  return lines
 }
 
 function formatElapsed(startedAtMs: number, now: number): string {
@@ -483,7 +514,7 @@ function CopyPill(props: { payload: string }) {
 function CommandCard(props: { message: Message; child?: boolean; pane?: LivePane }) {
   const failed = () => commandFailed(props.message)
   const running = () => commandRunning(props.message)
-  const subagent = () => isSubagentCardRow(props.message)
+  const subagent = createMemo(() => isSubagentCardRow(props.message))
   const [expanded, toggleExpanded] = usePersistedFlag(
     () => `cmd:${props.message.message_id}`,
     failed,
@@ -493,11 +524,14 @@ function CommandCard(props: { message: Message; child?: boolean; pane?: LivePane
     () => false,
   )
   const label = () => props.message.author || 'Ran command'
-  const preview = () => commandPreview(props.message.body)
-  const bodyLines = () => props.message.body.trim().split('\n')
-  const truncated = () => !showAll() && bodyLines().length > TOOL_OUTPUT_COLLAPSED_LINES
-  const visibleBody = () =>
-    (showAll() ? bodyLines() : bodyLines().slice(0, TOOL_OUTPUT_COLLAPSED_LINES)).join('\n')
+  const preview = createMemo(() => commandPreview(props.message.body))
+  const leading = createMemo(() => takeLeadingLines(props.message.body, TOOL_OUTPUT_COLLAPSED_LINES))
+  const truncated = () => !showAll() && leading().truncated
+  const visibleBody = () => (showAll() ? props.message.body.trim() : leading().text)
+  const lineCount = createMemo(() => {
+    if (!expanded() || !truncated()) return 0
+    return countLines(props.message.body)
+  })
   const textColor = () => (failed() ? 'text-[var(--danger)]' : 'text-[var(--text-muted)]')
   const openSubagent = (event: MouseEvent) => {
     event.stopPropagation()
@@ -549,7 +583,7 @@ function CommandCard(props: { message: Message; child?: boolean; pane?: LivePane
               class="mt-1.5 rounded-[5px] bg-[rgba(56,57,62,0.34)] px-2.5 py-1 text-[11px] text-[var(--text-muted)] hover:text-white"
               onClick={toggleShowAll}
             >
-              Show all {bodyLines().length} lines
+              Show all {lineCount()} lines
             </button>
           </Show>
         </div>
