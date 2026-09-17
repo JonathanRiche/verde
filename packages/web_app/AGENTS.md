@@ -21,7 +21,7 @@ Browser-facing port is **6783**; the HMR gateway uses **7420**, with Vite proxyi
 - Require an owner-only, regular, non-symlink token file containing at least 32 printable bytes. Pass its path via `--token-file` / `VERDE_WEB_TOKEN_FILE`; never accept raw `--token`, `VERDE_WEB_TOKEN`, query tokens, or `X-Verde-Token`.
 - Browser sessions are bounded, in-memory, `HttpOnly; SameSite=Lax`; API clients may use Bearer auth. Never expose credentials in URLs, process arguments, logs, screenshots, or support output.
 - Only liveness-only `GET /healthz`, login pages/scripts, and trusted static assets are public. Redirect unauthenticated app navigation to login; authenticate APIs and the exact `GET /ws` upgrade.
-- Serve static files only from the trusted built SPA. No permissive CORS, arbitrary file access, `/api/file`, `/api/preview`, or repository HTML/SVG previews.
+- Serve static files only from the trusted built SPA. No permissive CORS, arbitrary directory browsing, or repository HTML/SVG previews. Authenticated `/api/file` and `/api/preview` serve workspace documents from chat links (PDF/office) after path validation.
 - Preserve plain loopback/SSH access. Trusted proxy mode accepts one configured origin's complete exact Tailscale-style HTTPS envelope; reject partial/mixed/duplicate or standard `Forwarded` headers. No public bind/NAT, Funnel, or arbitrary public proxy; use ownership-checked `verde-server serve --tailscale` or local SSH forwarding. Never overwrite user tunnels.
 
 ## Terminal and PWA

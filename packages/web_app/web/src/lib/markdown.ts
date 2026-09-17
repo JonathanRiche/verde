@@ -2,7 +2,7 @@ import DOMPurify from 'dompurify'
 import { Marked } from 'marked'
 import type { Config, DOMPurify as DOMPurifyApi } from 'dompurify'
 
-import { decorateFileCitations } from './citations'
+import { decorateTranscriptFiles } from './citations'
 
 const markdown = new Marked({ gfm: true, breaks: true })
 
@@ -47,6 +47,7 @@ const MARKDOWN_SANITIZE_CONFIG: Config = {
     'href',
     'rel',
     'src',
+    'target',
     'title',
   ],
   ALLOW_ARIA_ATTR: false,
@@ -71,7 +72,7 @@ export function renderMarkdownWith(
   // DOMPurify reports unsupported legacy DOM implementations instead of
   // sanitizing. Fail closed as inert text if Verde ever runs in one.
   if (!sanitizer.isSupported) return escapeHtml(body)
-  const source = options.fileCitations ? decorateFileCitations(body) : body
+  const source = options.fileCitations ? decorateTranscriptFiles(body) : body
   const unsafe_html = markdown.parse(source, { async: false }) as string
   return String(sanitizer.sanitize(unsafe_html, MARKDOWN_SANITIZE_CONFIG))
 }

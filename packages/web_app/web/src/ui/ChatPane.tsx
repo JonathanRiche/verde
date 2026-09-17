@@ -6,6 +6,7 @@ import { renderMarkdown as renderSafeMarkdown } from '../lib/markdown'
 import { clipboardImageFiles, store } from '../lib/store'
 import { type Attachment, type LivePane, type Message, isSubagentThreadId } from '../lib/types'
 import { effortLabel, effortOptionsIn, modelOptionsFor, modelSupportsFast, variantOptionsIn } from '../lib/models'
+import { handleFileCitationClick } from './FileViewer'
 import { Icon, ProviderGlyph, ZoomButton } from './Icons'
 import { PaneActionsButton } from './Sidebar'
 
@@ -850,8 +851,8 @@ function TranscriptRow(props: { message: Message; pane: LivePane }) {
 
   return (
     <article class="min-w-0 rounded-[10px] border border-[var(--border-muted)] bg-[var(--assistant-card)] px-3 py-3 lg:px-4">
-      <div class="mb-1.5 text-[12px] text-[var(--text-subtle)]">{props.message.author || 'Assistant'}</div>
-      <div class="markdown" innerHTML={html()} />
+          <div class="mb-1.5 text-[12px] text-[var(--text-subtle)]">{props.message.author || 'Assistant'}</div>
+          <div class="markdown" innerHTML={html()} onClick={handleFileCitationClick} />
     </article>
   )
 }
@@ -924,7 +925,7 @@ function WorkingRow(props: { message: Message }) {
         when={props.message.body.length > 0}
         fallback={<div class="text-[14px] italic text-[var(--text-subtle)]">Waiting for streamed output...</div>}
       >
-        <div class="markdown" innerHTML={html()} />
+        <div class="markdown" innerHTML={html()} onClick={handleFileCitationClick} />
       </Show>
     </article>
   )
@@ -945,6 +946,9 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
   const [blank, setBlank] = createSignal(store.draftFor(composer_pane).trim().length === 0)
 
   const persistDraft = () => {
+    // While send owns the draft (optimistic clear / rollback), a remount
+    // must not write the textarea back over that store state.
+    if (store.sending()) return
     if (field) store.setDraftFor(composer_pane, field.value)
   }
 
@@ -957,6 +961,10 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
   const submitDraft = () => {
     if (uploading() || store.sending()) return
     persistDraft()
+    if (field) {
+      field.value = ''
+      setBlank(true)
+    }
     void store.sendDraft(props.pane).then(syncFieldFromStore)
   }
 

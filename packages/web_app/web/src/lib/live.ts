@@ -308,6 +308,19 @@ export function chatImageUrl(attachment: Attachment): string | null {
   return `/api/attachment?${query.toString()}`
 }
 
+/// Gateway URL that serves a workspace file for inline viewing, or as a
+/// browser download when `download` is set (content-disposition attachment).
+export function workspaceFileUrl(path: string, download = false): string {
+  const query = new URLSearchParams({ path })
+  if (download) query.set('download', '1')
+  return `/api/file?${query.toString()}`
+}
+
+/// Gateway URL that serves an office document as a PDF converted on the host.
+export function officePreviewUrl(path: string): string {
+  return `/api/preview?${new URLSearchParams({ path }).toString()}`
+}
+
 function webChatAttachmentId(attachment: Attachment): string | null {
   if (attachment.attachment_id?.startsWith('web-')) return attachment.attachment_id
   const marker = '/web-chat-images/'

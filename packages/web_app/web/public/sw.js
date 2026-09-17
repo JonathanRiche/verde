@@ -1,4 +1,4 @@
-const CACHE = 'verde-web-v4'
+const CACHE = 'verde-web-v5'
 
 const PRECACHE = [
   '/',
