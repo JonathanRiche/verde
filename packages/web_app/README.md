@@ -25,7 +25,7 @@ The gateway supports two explicit request envelopes while its listener remains l
 - Every runtime API and the exact `/ws` WebSocket upgrade requires that cookie or an `Authorization: Bearer` credential.
 - `GET /healthz` is the only unauthenticated health route and exposes liveness, not runtime inventory. `GET /login`, `GET /login.js`, and trusted static assets are public; unauthenticated app navigation redirects to `/login`.
 - The gateway talks only to `verde-sessionizer.sock`. It has no Desktop Live or mock fallback.
-- Arbitrary filesystem browsing and the legacy `/api/file` and `/api/preview` routes are not available.
+- Arbitrary filesystem browsing is not available. Authenticated `/api/file` and `/api/preview` serve workspace documents opened from chat (PDF and office files) after absolute-path validation; HTML/SVG/JS are rejected.
 - Plain loopback requests support local use and SSH forwarding. Optional trusted-proxy mode accepts only the complete, exact forwarded HTTPS envelope for one configured origin, as used by Tailscale Serve; partial, mixed, duplicate, or standard `Forwarded` headers fail closed.
 
 Do not pass secrets through `--token`, `VERDE_WEB_TOKEN`, `?token=...`, or `X-Verde-Token`. Those legacy forms are rejected. Pass only a token-file path through `--token-file` or `VERDE_WEB_TOKEN_FILE`.

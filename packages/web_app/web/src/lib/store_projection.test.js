@@ -9,6 +9,8 @@ import {
   layoutFromLivePanes,
   carryLiveChatIdentity,
   mapTranscriptRows,
+  fetchPagedTranscript,
+  prependTranscriptPage,
   mergeThreadCatalogSettings,
   panesForWorkspace,
   parseFavoriteModels,
@@ -16,6 +18,7 @@ import {
   requestTerminalOpen,
   setFavoriteModelInList,
   threadFromDaemonGet,
+  mergeThreadMetadata,
 } from './store.ts'
 import { adjacentPaneInGroups, workspacePaneGroups } from './types.ts'
 
@@ -168,6 +171,104 @@ describe('mapTranscriptRows', () => {
     }, 'thread-legacy')
 
     expect(message.images).toEqual([{ ...image, attachment_id: null }])
+  })
+
+  test('reads a chat.message.list page the same way as thread.get', () => {
+    const [message] = mapTranscriptRows({
+      result: {
+        messages: [{ message_id: 'm1', role: 'user', author: 'You', body: 'Hi' }],
+        next_cursor: 'b:1',
+      },
+    }, 'thread-1')
+    expect(message).toMatchObject({ message_id: 'm1', body: 'Hi' })
+  })
+})
+
+describe('fetchPagedTranscript', () => {
+  test('walks backward pages into oldest-to-newest order', async () => {
+    const calls = []
+    const messages = await fetchPagedTranscript(async (method, params) => {
+      calls.push({ method, params })
+      if (params.cursor === 'b:2') {
+        return {
+          result: {
+            messages: [
+              { message_id: 'm0', role: 'user', author: 'You', body: 'first' },
+              { message_id: 'm1', role: 'assistant', author: 'Codex', body: 'second' },
+            ],
+            next_cursor: null,
+          },
+        }
+      }
+      return {
+        result: {
+          messages: [
+            { message_id: 'm2', role: 'user', author: 'You', body: 'third' },
+            { message_id: 'm3', role: 'assistant', author: 'Codex', body: 'fourth' },
+          ],
+          next_cursor: 'b:2',
+        },
+      }
+    }, { workspace_id: 'ws-1', local_thread_id: 'thread-1' })
+
+    expect(calls).toEqual([
+      { method: 'chat.message.list', params: {
+        workspace_id: 'ws-1',
+        local_thread_id: 'thread-1',
+        direction: 'backward',
+        limit: 40,
+      } },
+      { method: 'chat.message.list', params: {
+        workspace_id: 'ws-1',
+        local_thread_id: 'thread-1',
+        direction: 'backward',
+        limit: 40,
+        cursor: 'b:2',
+      } },
+    ])
+    expect(messages.map((row) => row.message_id)).toEqual(['m0', 'm1', 'm2', 'm3'])
+  })
+
+  test('falls back to chat.thread.get when message.list is unavailable', async () => {
+    const messages = await fetchPagedTranscript(async (method) => {
+      if (method === 'chat.message.list') {
+        return { error: { code: 'method_not_found', message: 'unknown' } }
+      }
+      return {
+        result: {
+          thread: {
+            messages: [{ message_id: 'legacy', role: 'user', author: 'You', body: 'from get' }],
+          },
+        },
+      }
+    }, { workspace_id: 'ws-1', local_thread_id: 'thread-1' })
+
+    expect(messages).toMatchObject([{ message_id: 'legacy', body: 'from get' }])
+  })
+
+  test('retries a too-large first page with a smaller limit', async () => {
+    const limits = []
+    const messages = await fetchPagedTranscript(async (method, params) => {
+      expect(method).toBe('chat.message.list')
+      limits.push(params.limit)
+      if (params.limit > 10) return { ok: false, error: { code: 'unavailable', message: 'daemon unavailable' } }
+      return {
+        result: {
+          messages: [{ message_id: 'ok', role: 'assistant', author: 'Codex', body: 'fits' }],
+        },
+      }
+    }, { workspace_id: 'ws-1', local_thread_id: 'thread-1' })
+
+    expect(limits[0]).toBe(40)
+    expect(limits.at(-1)).toBeLessThanOrEqual(10)
+    expect(messages).toMatchObject([{ message_id: 'ok', body: 'fits' }])
+  })
+
+  test('keeps later pages in front of already-loaded newer rows', () => {
+    expect(prependTranscriptPage(
+      [{ message_id: 'm0', role: 'user', author: 'You', body: 'old' }],
+      [{ message_id: 'm1', role: 'assistant', author: 'Codex', body: 'new' }],
+    ).map((row) => row.message_id)).toEqual(['m0', 'm1'])
   })
 })
 
@@ -560,6 +661,31 @@ describe('opening-thread daemon get', () => {
     expect(threadFromDaemonGet({
       result: { thread: { local_thread_id: 'thread-1', title: 'New thread', committed: false } },
     })).toMatchObject({ local_thread_id: 'thread-1', committed: false })
+  })
+})
+
+describe('mergeThreadMetadata', () => {
+  test('keeps catalog fields and drops transcript bodies', () => {
+    const merged = mergeThreadMetadata(
+      {
+        local_thread_id: 'chat-1',
+        title: "I'm starting a new venture with my family.",
+        committed: true,
+        provider: 'codex',
+        provider_thread_id: 'thr_abc',
+        messages: [{ message_id: 'huge', role: 'assistant', author: 'Codex', body: 'x'.repeat(100) }],
+      },
+      { profile_id: 'local' },
+    )
+    expect(merged).toMatchObject({
+      local_thread_id: 'chat-1',
+      title: "I'm starting a new venture with my family.",
+      committed: true,
+      provider: 'codex',
+      provider_thread_id: 'thr_abc',
+      profile_id: 'local',
+    })
+    expect(merged.messages).toBeUndefined()
   })
 })
 

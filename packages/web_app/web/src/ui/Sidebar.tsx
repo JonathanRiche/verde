@@ -711,9 +711,8 @@ function contextMenuItems(target: SidebarMenuTarget): MenuItem[] {
   if (target.kind === 'terminal') {
     const desktop_only_disabled = pane.native_pane_id == null
     const close_disabled = desktop_only_disabled && !pane.session_id
-    const zoomed = store.maximizedPaneId() === pane.pane_id
     return [
-      { action: 'pane-zoom', label: zoomed ? 'Unzoom pane' : 'Zoom pane' },
+      paneZoomItem(pane),
       { action: 'pane-split-chat-right', label: 'Split with chat to right', disabled: desktop_only_disabled },
       { action: 'pane-split-chat-down', label: 'Split with chat below', disabled: desktop_only_disabled },
       { action: 'pane-split-terminal-right', label: 'Split with terminal to right', disabled: desktop_only_disabled },
@@ -737,6 +736,7 @@ function contextMenuItems(target: SidebarMenuTarget): MenuItem[] {
               ? 'Grok'
               : 'Codex'
   return [
+    paneZoomItem(pane),
     { action: 'thread-rename', label: 'Rename chat', disabled: !pane.thread_id },
     { action: 'thread-regenerate-title', label: 'Regenerate title', disabled: busy || desktop_only_disabled },
     { action: 'thread-sync', label: 'Sync thread', disabled: busy || desktop_only_disabled || !pane.provider_thread_id },
@@ -745,6 +745,11 @@ function contextMenuItems(target: SidebarMenuTarget): MenuItem[] {
     { action: 'thread-archive', label: 'Archive thread', disabled: busy || !pane.thread_id, danger: true },
     { action: 'pane-close', label: 'Close pane', disabled: desktop_only_disabled, danger: true },
   ]
+}
+
+function paneZoomItem(pane: LivePane): MenuItem {
+  const zoomed = store.maximizedPaneId() === pane.pane_id
+  return { action: 'pane-zoom', label: zoomed ? 'Unzoom pane' : 'Zoom pane' }
 }
 
 function createContextTrigger(onOpen: (x: number, y: number) => void) {

@@ -11,6 +11,7 @@
   "dependencies": {
     "dompurify": "^3.4.14",
     "marked": "^18.0.9",
+    "pdfjs-dist": "^6.3.289",
     "solid-js": "^1.9.14"
   },
   "devDependencies": {

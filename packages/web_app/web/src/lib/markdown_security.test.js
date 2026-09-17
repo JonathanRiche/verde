@@ -35,21 +35,40 @@ describe('sanitized Markdown', () => {
     expect(html).toContain('<a>raw</a>')
   })
 
-  test('keeps a file citation inert while remote file access is unavailable', () => {
+  test('turns a file citation into a chip that points at the file endpoint', () => {
     const html = renderMarkdownWith(
       sanitizer,
-      ':codex-file-citation{path="/tmp/report one.md" purpose="output"}',
+      ':codex-file-citation{path="/tmp/report one.pdf" purpose="output"}',
       { fileCitations: true },
     )
     const document = new JSDOM(html).window.document
-    const citation = document.querySelector('span.file-citation')
+    const citation = document.querySelector('a.file-citation')
 
     expect(citation).not.toBeNull()
-    expect(citation?.getAttribute('title')).toBe('/tmp/report one.md')
-    expect(citation?.getAttribute('href')).toBeNull()
+    expect(citation?.getAttribute('title')).toBe('/tmp/report one.pdf')
+    expect(citation?.getAttribute('href')).toContain('/api/file?')
+    expect(new URL(citation?.getAttribute('href') ?? '', 'https://verde.example/').searchParams.get('path')).toBe(
+      '/tmp/report one.pdf',
+    )
     expect(citation?.getAttribute('data-verde-file')).toBeNull()
-    expect(citation?.textContent).toBe('report one.md')
+    expect(citation?.textContent).toBe('report one.pdf')
     expect(citation?.querySelector('svg')).toBeNull()
+  })
+
+  test('rewrites absolute Word and PDF markdown links onto the file endpoint', () => {
+    const html = renderMarkdownWith(
+      sanitizer,
+      '- [Business Plan — Word](/home/rtg/development/sideb/sjevents/SJ-Co-Events-Business-Plan.docx)\n' +
+        '- [Pitch Deck — PDF](/home/rtg/development/sideb/sjevents/SJ-Co-Events-Pitch-Deck.pdf)',
+      { fileCitations: true },
+    )
+    const document = new JSDOM(html).window.document
+    const hrefs = [...document.querySelectorAll('a')].map((anchor) => anchor.getAttribute('href') ?? '')
+
+    expect(hrefs).toHaveLength(2)
+    expect(hrefs[0]).toContain('/api/file?')
+    expect(hrefs[0]).toContain(encodeURIComponent('/home/rtg/development/sideb/sjevents/SJ-Co-Events-Business-Plan.docx'))
+    expect(hrefs[1]).toContain(encodeURIComponent('/home/rtg/development/sideb/sjevents/SJ-Co-Events-Pitch-Deck.pdf'))
   })
 
   test('sanitizes repository Markdown through the same boundary', () => {

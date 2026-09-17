@@ -56,6 +56,11 @@ const MAX_OPEN_THREADS = 16
 /// Thread metadata rows are small; fetch enough that persisted layout pane
 /// indexes (thread sort_index) always resolve.
 const THREAD_LIST_LIMIT = 100
+/// Backward pages stay inside the gateway RPC frame. A 1 MiB command card in
+/// Workspace 8 overflowed a single `chat.thread.get` and left the phone empty.
+const TRANSCRIPT_PAGE_LIMIT = 40
+const TRANSCRIPT_PAGE_LIMIT_MIN = 1
+const TRANSCRIPT_MAX_PAGES = 64
 
 interface SnapshotSession {
   session_id?: string
@@ -184,6 +189,8 @@ function mintId(prefix: string): string {
 
 function isOpeningThread(thread: Thread | null, title: string): boolean {
   if ((thread?.messages?.length ?? 0) > 0) return false
+  if (thread?.provider_thread_id) return false
+  if (thread?.committed === true) return false
   return thread?.committed === false || isPlaceholderThreadTitle(title)
 }
 
@@ -207,11 +214,26 @@ export function threadFromDaemonGet(response: RpcEnvelope): Thread | null {
   return thread?.local_thread_id ? thread : null
 }
 
+/// `chat.thread.upsert` overwrites metadata. Never copy transcript bodies into
+/// that write: a 1 MiB command card makes `chat.thread.get` exceed the
+/// transport limit, which is what blocked send on this Workspace 8 thread.
+export function mergeThreadMetadata(existing: Thread, patch: Partial<Thread> = {}): Thread {
+  const base = { ...existing }
+  delete base.messages
+  const rest = { ...patch }
+  delete rest.messages
+  return {
+    ...base,
+    committed: existing.committed ?? false,
+    ...rest,
+  }
+}
+
 function openingThreadFromPane(pane: LivePane): Thread {
   return {
     local_thread_id: pane.thread_id ?? '',
     title: pane.thread_title ?? 'New Chat',
-    committed: false,
+    committed: pane.committed ?? false,
     last_activity_at: Date.now(),
     provider: pane.provider ?? 'codex',
     harness: 'local_cli',
@@ -222,6 +244,11 @@ function openingThreadFromPane(pane: LivePane): Thread {
     access_mode: pane.access_mode ?? 'supervised',
     archived: false,
     draft: '',
+    provider_thread_id: pane.provider_thread_id ?? null,
+    profile_id: pane.profile_id,
+    runtime_id: pane.runtime_id,
+    repository_id: pane.repository_id,
+    repository_cwd: pane.repository_cwd,
   }
 }
 
@@ -552,6 +579,75 @@ export function diffCommentLineSummary(patch: string): string | null {
   if (hunk_count === 0) return null
   const more = hunk_count > MAX_LISTED_HUNKS ? `, +${hunk_count - MAX_LISTED_HUNKS} more` : ''
   return `lines ${pieces.join(', ')}${more}`
+}
+
+function rpcFailed(response: RpcEnvelope): boolean {
+  return Boolean(response.error) || response.ok === false
+}
+
+/// Oldest-to-newest merge of one `chat.message.list` backward page onto the
+/// messages already collected from newer pages.
+export function prependTranscriptPage(page: Message[], existing: Message[]): Message[] {
+  if (page.length === 0) return existing
+  if (existing.length === 0) return page
+  const seen = new Set(existing.map((row) => row.message_id))
+  return [...page.filter((row) => !seen.has(row.message_id)), ...existing]
+}
+
+function messageListCursor(response: RpcEnvelope): string | undefined {
+  const result = unwrapResult<{ next_cursor?: string | null }>(response)
+  const cursor = result?.next_cursor
+  return typeof cursor === 'string' && cursor.length > 0 ? cursor : undefined
+}
+
+/// Load a durable transcript in gateway-sized pages. Falls back to a single
+/// `chat.thread.get` on daemons that do not serve `chat.message.list`.
+export async function fetchPagedTranscript(
+  call: (method: string, params: unknown) => Promise<RpcEnvelope>,
+  args: { workspace_id: string; local_thread_id: string },
+): Promise<Message[]> {
+  const listed = await listTranscriptMessages(call, args)
+  if (listed !== null) return listed
+  const response = await call('chat.thread.get', {
+    workspace_id: args.workspace_id,
+    local_thread_id: args.local_thread_id,
+  })
+  if (rpcFailed(response)) return []
+  return mapTranscriptRows(response, args.local_thread_id)
+}
+
+async function listTranscriptMessages(
+  call: (method: string, params: unknown) => Promise<RpcEnvelope>,
+  args: { workspace_id: string; local_thread_id: string },
+): Promise<Message[] | null> {
+  let cursor: string | undefined
+  let limit = TRANSCRIPT_PAGE_LIMIT
+  let collected: Message[] = []
+  for (let attempt = 0; attempt < TRANSCRIPT_MAX_PAGES; attempt++) {
+    const params: Record<string, unknown> = {
+      workspace_id: args.workspace_id,
+      local_thread_id: args.local_thread_id,
+      direction: 'backward',
+      limit,
+    }
+    if (cursor) params.cursor = cursor
+    const response = await call('chat.message.list', params)
+    if (rpcFailed(response)) {
+      if (collected.length > 0) break
+      if (methodUnavailable(response)) return null
+      if (limit > TRANSCRIPT_PAGE_LIMIT_MIN) {
+        limit = Math.max(TRANSCRIPT_PAGE_LIMIT_MIN, Math.floor(limit / 2))
+        continue
+      }
+      return null
+    }
+    const rows = mapTranscriptRows(response, args.local_thread_id)
+    collected = prependTranscriptPage(rows, collected)
+    const next = messageListCursor(response)
+    if (!next || rows.length === 0) return collected
+    cursor = next
+  }
+  return collected
 }
 
 export function mapTranscriptRows(raw: unknown, fallbackId: string): Message[] {
@@ -1780,12 +1876,10 @@ function createAppStore() {
       // latency, and multi-megabyte thread bodies would otherwise queue
       // behind the projection sweep on the serial websocket loop.
       const workspace_id = paneOwningWorkspaceId(pane)
-      const response = await paneRpc(pane, 'chat.thread.get', {
-        workspace_id,
-        local_thread_id: pane.thread_id,
-      })
-      if (response.error || response.ok === false) return
-      const messages = mapTranscriptRows(response, pane.thread_id)
+      const messages = await fetchPagedTranscript(
+        (method, params) => paneRpc(pane, method, params),
+        { workspace_id, local_thread_id: pane.thread_id },
+      )
       if (messages.length === 0 && transcripts()[key]?.length) return
       storeTranscript(key, messages)
     } catch {
@@ -2401,29 +2495,14 @@ function createAppStore() {
       return
     }
     if (uploadingAttachmentsFor(current) || sending()) return
-    setSending(true)
-    await refreshConnections()
-    if (!connections()) { setSending(false); setNotice(connectionError() ?? 'Connections unavailable'); return }
-    const profile = connectionFor(current)
-    const remote = profile !== 'local'
-    const connection = connections()!.connections.find((row) => row.profile_id === profile)
-    if (remote && (!connection?.ready || !connection.runtime_id)) {
-      setNotice(`${connection?.label ?? profile}: ${connection?.failure ?? connection?.phase ?? 'unavailable'}`)
-      setSending(false)
-      return
-    }
-    if (remote && attachmentsFor(current).length) {
-      setNotice('Remote chat attachments are not supported by the web connection bridge yet. Your attachments are kept.')
-      setSending(false)
-      return
-    }
     const text = draftFor(current).trim()
     const images = [...attachmentsFor(current)]
-    if (!text && images.length === 0) { setSending(false); return }
-    setNotice(null)
-    // Optimistic send: clear the box and show the user row before any RPC.
-    // The pre-send thread fetch plus turn.start round-trips took seconds on
-    // large threads, and holding the draft hostage made Enter feel broken.
+    if (!text && images.length === 0) return
+    setSending(true)
+    // Optimistic send: clear the store draft immediately. The textarea is
+    // uncontrolled, so ChatPane also blanks the DOM node at click time;
+    // waiting for turn.start on this large thread left the prompt visible
+    // for seconds.
     const key = paneKey(current.workspace_id, current.pane_id)
     const local_message_id = mintId('local-user-')
     setDraftFor(current, '')
@@ -2456,6 +2535,26 @@ function createAppStore() {
       }
     }
     try {
+      await refreshConnections()
+      if (!connections()) {
+        rollback()
+        setNotice(connectionError() ?? 'Connections unavailable')
+        return
+      }
+      const profile = connectionFor(current)
+      const remote = profile !== 'local'
+      const connection = connections()!.connections.find((row) => row.profile_id === profile)
+      if (remote && (!connection?.ready || !connection.runtime_id)) {
+        rollback()
+        setNotice(`${connection?.label ?? profile}: ${connection?.failure ?? connection?.phase ?? 'unavailable'}`)
+        return
+      }
+      if (remote && images.length) {
+        rollback()
+        setNotice('Remote chat attachments are not supported by the web connection bridge yet. Your attachments are kept.')
+        return
+      }
+      setNotice(null)
       // A model click persists asynchronously. Keep the optimistic submit
       // immediate, but read/start only after that queued write has landed so
       // a quick mobile tap cannot race the selected settings.
@@ -2467,24 +2566,15 @@ function createAppStore() {
       const saved_route = await upsertThreadMetadata(ws, current, route_patch)
       if (!saved_route || saved_route.error || saved_route.ok === false) throw new Error(saved_route?.error?.message ?? 'Could not save the chat connection')
       setThreadsByWorkspace((prev) => ({ ...prev, [ws.workspace_id]: (prev[ws.workspace_id] ?? []).map((row) => row.local_thread_id === current.thread_id ? { ...row, ...route_patch } : row) }))
-      const got = await interactiveCall('chat.thread.get', {
-        workspace_id: ws.workspace_id,
-        local_thread_id: current.thread_id,
-      })
-      const thread = threadFromDaemonGet(got)
+      const thread = mergeThreadMetadata(routeThread(current), route_patch)
       // Opening GUI threads are not in the daemon yet. chat.turn.start creates
-      // that row, so a not-found get must not roll the optimistic submit back.
-      if (!thread && !isAbsentDaemonThread(got) && (got.error || got.ok === false)) {
+      // that row, so a missing catalog row must not roll the optimistic submit back.
+      if (!thread.local_thread_id) {
         rollback()
-        setNotice(got.error?.message ?? 'thread is not on the daemon')
+        setNotice('thread is not on the daemon')
         return
       }
-      let execution_thread = thread
-      if (remote) {
-        const remote_thread = await paneRpc(current, 'chat.thread.get', { workspace_id: ws.workspace_id, local_thread_id: current.thread_id })
-        if ((remote_thread.error || remote_thread.ok === false) && !isAbsentDaemonThread(remote_thread)) throw new Error(remote_thread.error?.message ?? 'Could not read remote conversation')
-        execution_thread = threadFromDaemonGet(remote_thread)
-      }
+      const execution_thread = thread
       const stored_title = thread?.title ?? current.thread_title ?? 'New Chat'
       const fallback_prompt = text || (images.length > 0 ? 'Image' : '')
       const thread_title = isOpeningThread(thread, stored_title)
@@ -2623,9 +2713,9 @@ function createAppStore() {
 
   /// Persist model/effort/variant changes onto the daemon thread record.
   /// The daemon's chat.thread.upsert is a full metadata overwrite, so this
-  /// merges the patch over a fresh chat.thread.get before writing. The next
-  /// chat.turn.start re-reads the thread, so the change applies to the next
-  /// send — same contract as the desktop composer pickers.
+  /// merges the patch over the catalog row (never a full transcript get).
+  /// The next chat.turn.start re-reads the thread, so the change applies to
+  /// the next send — same contract as the desktop composer pickers.
   const settingsUpdateQueues = new Map<string, Promise<void>>()
 
   const persistThreadSettings = async (
@@ -2642,19 +2732,8 @@ function createAppStore() {
     if (pane.kind !== 'chat' || !pane.thread_id) return
     setNotice(null)
     try {
-      const got = await interactiveCall('chat.thread.get', {
-        workspace_id: pane.workspace_id,
-        local_thread_id: pane.thread_id,
-      })
-      const loaded = threadFromDaemonGet(got)
-      if (!loaded && !isAbsentDaemonThread(got) && (got.error || got.ok === false)) {
-        setNotice(got.error?.message ?? 'thread is not on the daemon')
-        void refreshProjection()
-        return
-      }
-      // Opening GUI threads have no daemon row to merge into. Seed one from
-      // the pane so the first model/effort click is not dropped.
-      const thread = loaded ?? openingThreadFromPane(pane)
+      const loaded = routeThread(pane)
+      const thread = loaded.local_thread_id ? loaded : openingThreadFromPane(pane)
       if (!thread.local_thread_id) {
         setNotice('thread is not on the daemon')
         return
@@ -2995,16 +3074,9 @@ function createAppStore() {
     patch: Partial<Thread>,
   ) => {
     if (!pane.thread_id) return null
-    const got = await interactiveCall('chat.thread.get', {
-      workspace_id: current_workspace.workspace_id,
-      local_thread_id: pane.thread_id,
-    })
-    if ((got.error || got.ok === false) && !isAbsentDaemonThread(got)) return got
-    const thread_root = unwrapResult<{ thread?: Thread } & Thread>(got)
-    const existing = thread_root?.thread ?? (thread_root as Thread | null) ?? openingThreadFromPane(pane)
-    if (!existing?.local_thread_id) return got
-    const thread = { ...existing, committed: existing.committed ?? false, ...patch }
-    delete thread.messages
+    const existing = routeThread(pane)
+    if (!existing.local_thread_id) return null
+    const thread = mergeThreadMetadata(existing, patch)
     const client_id = await ensureClientId()
     return interactiveCall('chat.thread.upsert', {
       mutation: {

@@ -6,6 +6,7 @@ const headless = @import("headless");
 const auth_mod = @import("auth.zig");
 const config_mod = @import("config.zig");
 const daemon_mod = @import("daemon.zig");
+const office_preview = @import("office_preview.zig");
 const theme_mod = @import("theme.zig");
 
 const log = std.log.scoped(.web_http);
@@ -22,7 +23,11 @@ pub const MAX_RPC_FRAME_BYTES: usize = daemon_mod.MAX_GATEWAY_RPC_BYTES;
 const MIN_CHANGES_RETRY_MS: u64 = 250;
 const WEB_CHAT_IMAGE_DIR = "web-chat-images";
 const MAX_CHAT_IMAGE_BYTES: usize = 10 * 1024 * 1024;
-const CSP = "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; worker-src 'self'";
+/// Workspace files opened from chat citations are read into memory.
+const MAX_SERVED_FILE_BYTES: usize = 32 * 1024 * 1024;
+const CSP = "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; worker-src 'self' blob:; frame-src 'self' blob:";
+/// PDF bytes are not HTML. `default-src 'none'` here blanks Safari's viewer.
+const FILE_FRAME_CSP = "frame-ancestors 'self'";
 
 const LOGIN_HTML =
     \\<!doctype html>
@@ -1067,20 +1072,8 @@ fn handleApi(
     split: SplitTarget,
     request: *std.http.Server.Request,
 ) !void {
-    if (disabledFileApi(split.path)) {
-        if (!try authorizeApiContext(
-            allocator,
-            daemon,
-            auth,
-            auth_context,
-            headless.access_protocol.scopeBit(.repository_read),
-            request,
-        )) return;
-        try respondJson(
-            request,
-            .not_implemented,
-            "{\"ok\":false,\"error\":\"unsupported\",\"feature\":\"remote_workspace_file_access\"}",
-        );
+    if (std.mem.eql(u8, split.path, "/api/file") or std.mem.eql(u8, split.path, "/api/preview")) {
+        try handleWorkspaceFile(allocator, io, config, daemon, auth, env_map, auth_context, split, request);
         return;
     }
 
@@ -1244,6 +1237,93 @@ fn handleApi(
     }
 
     try respondJson(request, .not_found, "{\"ok\":false,\"error\":\"not_found\"}");
+}
+
+fn handleWorkspaceFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    config: config_mod,
+    daemon: *daemon_mod.Daemon,
+    auth: *auth_mod.Service,
+    env_map: *const std.process.Environ.Map,
+    auth_context: AuthContext,
+    split: SplitTarget,
+    request: *std.http.Server.Request,
+) !void {
+    if (!try authorizeApiContext(
+        allocator,
+        daemon,
+        auth,
+        auth_context,
+        headless.access_protocol.scopeBit(.repository_read),
+        request,
+    )) return;
+    if (request.head.method != .GET and request.head.method != .HEAD) return respondMethodNotAllowed(request);
+
+    const raw_path = queryValue(split.query, "path") orelse {
+        try respondJson(request, .bad_request, "{\"ok\":false,\"error\":\"missing_path\"}");
+        return;
+    };
+    const decoded = try decodeQueryComponent(allocator, raw_path);
+    defer allocator.free(decoded);
+    if (!validServedFilePath(decoded)) {
+        try respondJson(request, .bad_request, "{\"ok\":false,\"error\":\"invalid_path\"}");
+        return;
+    }
+    if (executableDocumentPath(decoded)) {
+        try respondJson(request, .unsupported_media_type, "{\"ok\":false,\"error\":\"unsupported_document_type\"}");
+        return;
+    }
+
+    const preview = std.mem.eql(u8, split.path, "/api/preview");
+    if (preview) {
+        if (!office_preview.convertible(decoded)) {
+            try respondJson(request, .bad_request, "{\"ok\":false,\"error\":\"unsupported_document_type\"}");
+            return;
+        }
+        const pdf_path = office_preview.previewPdf(allocator, io, config.pref_path, env_map, decoded) catch |err| switch (err) {
+            error.SourceNotFound => {
+                try respondJson(request, .not_found, "{\"ok\":false,\"error\":\"file_not_found\"}");
+                return;
+            },
+            error.ConverterUnavailable => {
+                try respondJson(request, .not_implemented, "{\"ok\":false,\"error\":\"preview_needs_libreoffice_on_the_verde_host\"}");
+                return;
+            },
+            error.ConversionFailed => {
+                try respondJson(request, .internal_server_error, "{\"ok\":false,\"error\":\"preview_conversion_failed\"}");
+                return;
+            },
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        defer allocator.free(pdf_path);
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, pdf_path, allocator, .limited(MAX_SERVED_FILE_BYTES)) catch {
+            try respondJson(request, .internal_server_error, "{\"ok\":false,\"error\":\"preview_conversion_failed\"}");
+            return;
+        };
+        defer allocator.free(bytes);
+        try respondFramedFile(request, "application/pdf", bytes);
+        return;
+    }
+
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, decoded, allocator, .limited(MAX_SERVED_FILE_BYTES)) catch |err| switch (err) {
+        error.StreamTooLong => {
+            try respondJson(request, .payload_too_large, "{\"ok\":false,\"error\":\"file_too_large\"}");
+            return;
+        },
+        else => {
+            try respondJson(request, .not_found, "{\"ok\":false,\"error\":\"file_not_found\"}");
+            return;
+        },
+    };
+    defer allocator.free(bytes);
+    if (queryValue(split.query, "download") != null) {
+        const disposition = try attachmentDisposition(allocator, decoded);
+        defer allocator.free(disposition);
+        try respondDownload(request, servedFileMime(decoded), disposition, bytes);
+        return;
+    }
+    try respondFramedFile(request, servedFileMime(decoded), bytes);
 }
 
 fn handleRpc(
@@ -2228,10 +2308,6 @@ fn isApiPath(path: []const u8) bool {
     return std.mem.eql(u8, path, "/api") or std.mem.startsWith(u8, path, "/api/");
 }
 
-fn disabledFileApi(path: []const u8) bool {
-    return std.mem.eql(u8, path, "/api/file") or std.mem.eql(u8, path, "/api/preview");
-}
-
 fn blockedRpcMethod(method: []const u8) bool {
     return std.mem.eql(u8, method, "web.directory.list") or
         headless.connect_protocol.isMethod(method) or
@@ -2264,6 +2340,56 @@ fn queryValue(query: []const u8, key: []const u8) ?[]const u8 {
         }
     }
     return null;
+}
+
+/// Decodes one query-string component: '+' means space (URLSearchParams
+/// convention; a literal '+' arrives as %2B) and %XX escapes are resolved.
+fn decodeQueryComponent(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    const buffer = try allocator.dupe(u8, raw);
+    for (buffer) |*byte| {
+        if (byte.* == '+') byte.* = ' ';
+    }
+    const decoded = std.Uri.percentDecodeInPlace(buffer);
+    if (decoded.len == buffer.len) return buffer;
+    const shrunk = try allocator.dupe(u8, decoded);
+    allocator.free(buffer);
+    return shrunk;
+}
+
+/// Served file paths must be absolute and free of traversal segments so a
+/// citation link can never be a relative escape from a logged path.
+fn validServedFilePath(path: []const u8) bool {
+    if (path.len == 0 or !std.fs.path.isAbsolute(path)) return false;
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return false;
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |component| {
+        if (std.mem.eql(u8, component, "..")) return false;
+    }
+    return true;
+}
+
+fn executableDocumentPath(path: []const u8) bool {
+    const extensions = [_][]const u8{ ".html", ".htm", ".svg", ".js", ".mjs", ".cjs", ".wasm" };
+    for (extensions) |extension| {
+        if (std.ascii.endsWithIgnoreCase(path, extension)) return true;
+    }
+    return false;
+}
+
+/// content-disposition value advertising the file's basename; header-unsafe
+/// bytes are replaced so the value never breaks out of the quoted string.
+fn attachmentDisposition(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const basename = std.fs.path.basename(path);
+    const name = if (basename.len == 0) "download" else basename;
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    try writer.writer.writeAll("attachment; filename=\"");
+    for (name) |byte| {
+        const safe = byte >= 0x20 and byte != '"' and byte != '\\' and byte != 0x7f;
+        try writer.writer.writeByte(if (safe) byte else '_');
+    }
+    try writer.writer.writeByte('"');
+    return try writer.toOwnedSlice();
 }
 
 fn requestContentType(request: *const std.http.Server.Request) ?[]const u8 {
@@ -2455,6 +2581,44 @@ fn respondData(
     };
     try request.respond(body, .{
         .status = status,
+        .extra_headers = &headers,
+    });
+}
+
+fn respondFramedFile(
+    request: *std.http.Server.Request,
+    content_type: []const u8,
+    body: []const u8,
+) !void {
+    // Same-origin FileViewer iframes need to embed this response. The SPA
+    // itself still sends x-frame-options DENY / frame-ancestors 'none'.
+    const headers = [_]std.http.Header{
+        .{ .name = "content-security-policy", .value = FILE_FRAME_CSP },
+        .{ .name = "x-content-type-options", .value = "nosniff" },
+        .{ .name = "referrer-policy", .value = "no-referrer" },
+        .{ .name = "cross-origin-resource-policy", .value = "same-origin" },
+        .{ .name = "content-type", .value = content_type },
+        .{ .name = "cache-control", .value = "no-store" },
+    };
+    try request.respond(body, .{
+        .status = .ok,
+        .extra_headers = &headers,
+    });
+}
+
+fn respondDownload(
+    request: *std.http.Server.Request,
+    content_type: []const u8,
+    disposition: []const u8,
+    body: []const u8,
+) !void {
+    const headers = BASE_SECURITY_HEADERS ++ [_]std.http.Header{
+        .{ .name = "content-type", .value = content_type },
+        .{ .name = "content-disposition", .value = disposition },
+        .{ .name = "cache-control", .value = "no-store" },
+    };
+    try request.respond(body, .{
+        .status = .ok,
         .extra_headers = &headers,
     });
 }
@@ -2754,7 +2918,9 @@ fn respondWebSocketTicketResult(
 
 fn mimeType(path: []const u8) []const u8 {
     if (std.mem.endsWith(u8, path, ".html")) return "text/html; charset=utf-8";
-    if (std.mem.endsWith(u8, path, ".js")) return "text/javascript; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".js") or std.mem.endsWith(u8, path, ".mjs") or std.mem.endsWith(u8, path, ".cjs")) {
+        return "text/javascript; charset=utf-8";
+    }
     if (std.mem.endsWith(u8, path, ".css")) return "text/css; charset=utf-8";
     if (std.mem.endsWith(u8, path, ".svg")) return "image/svg+xml";
     if (std.mem.endsWith(u8, path, ".png")) return "image/png";
@@ -2767,6 +2933,22 @@ fn mimeType(path: []const u8) []const u8 {
     if (std.mem.endsWith(u8, path, ".wasm")) return "application/wasm";
     if (std.mem.endsWith(u8, path, ".json") or std.mem.endsWith(u8, path, ".map")) return "application/json";
     if (std.mem.endsWith(u8, path, ".webmanifest")) return "application/manifest+json";
+    return "application/octet-stream";
+}
+
+fn servedFileMime(path: []const u8) []const u8 {
+    if (std.ascii.endsWithIgnoreCase(path, ".pdf")) return "application/pdf";
+    if (std.ascii.endsWithIgnoreCase(path, ".pptx")) return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+    if (std.ascii.endsWithIgnoreCase(path, ".docx")) return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    if (std.ascii.endsWithIgnoreCase(path, ".xlsx")) return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    if (std.ascii.endsWithIgnoreCase(path, ".md") or std.ascii.endsWithIgnoreCase(path, ".markdown")) return "text/markdown; charset=utf-8";
+    if (std.ascii.endsWithIgnoreCase(path, ".txt") or std.ascii.endsWithIgnoreCase(path, ".log")) return "text/plain; charset=utf-8";
+    if (std.ascii.endsWithIgnoreCase(path, ".csv")) return "text/csv; charset=utf-8";
+    if (std.ascii.endsWithIgnoreCase(path, ".png")) return "image/png";
+    if (std.ascii.endsWithIgnoreCase(path, ".jpg") or std.ascii.endsWithIgnoreCase(path, ".jpeg")) return "image/jpeg";
+    if (std.ascii.endsWithIgnoreCase(path, ".webp")) return "image/webp";
+    if (std.ascii.endsWithIgnoreCase(path, ".gif")) return "image/gif";
+    if (std.ascii.endsWithIgnoreCase(path, ".bmp")) return "image/bmp";
     return "application/octet-stream";
 }
 
@@ -2790,12 +2972,10 @@ test "every api route and exact websocket target require authentication" {
     try std.testing.expect(!webSocketTargetAllowed(.GET, "/ws?token=secret"));
 }
 
-test "query token and disabled file surfaces are rejected by policy" {
+test "query token stays rejected and file paths stay traversal-safe" {
     const split = splitTarget("/ws?token=abc&x=1");
     try std.testing.expectEqualStrings("/ws", split.path);
     try std.testing.expectEqualStrings("abc", queryValue(split.query, "token").?);
-    try std.testing.expect(disabledFileApi("/api/file"));
-    try std.testing.expect(disabledFileApi("/api/preview"));
     try std.testing.expect(blockedRpcMethod("web.directory.list"));
     try std.testing.expect(blockedRpcMethod(headless.access_protocol.METHOD_DAEMON_PAIRING_GRANT_CREATE));
     try std.testing.expect(blockedRpcMethod(headless.access_protocol.METHOD_DAEMON_PAIRING_GRANT_LIST));
@@ -3122,6 +3302,8 @@ test "security headers omit CORS and constrain active content" {
             saw_csp = true;
             try std.testing.expect(std.mem.indexOf(u8, header.value, "object-src 'none'") != null);
             try std.testing.expect(std.mem.indexOf(u8, header.value, "frame-ancestors 'none'") != null);
+            try std.testing.expect(std.mem.indexOf(u8, header.value, "frame-src 'self' blob:") != null);
+            try std.testing.expect(std.mem.indexOf(u8, header.value, "worker-src 'self' blob:") != null);
         }
         if (std.ascii.eqlIgnoreCase(header.name, "x-content-type-options")) saw_nosniff = true;
         if (std.ascii.eqlIgnoreCase(header.name, "referrer-policy")) saw_referrer = true;
@@ -3142,10 +3324,45 @@ test "web chat image upload validation accepts supported signatures only" {
     try std.testing.expect(!validAttachmentId("web-user.html"));
 }
 
+test "static javascript modules advertise a script mime type" {
+    try std.testing.expectEqualStrings("text/javascript; charset=utf-8", mimeType("/assets/index-abc.js"));
+    try std.testing.expectEqualStrings("text/javascript; charset=utf-8", mimeType("/assets/pdf.worker.min-Dswkl-cV.mjs"));
+    try std.testing.expectEqualStrings("application/wasm", mimeType("/assets/ghostty-vt.wasm"));
+}
+
+test "served file path validation rejects traversal, relative paths, and HTML" {
+    try std.testing.expect(validServedFilePath("/home/user/deliverables/report.pdf"));
+    try std.testing.expect(!validServedFilePath("deliverables/report.pdf"));
+    try std.testing.expect(!validServedFilePath("/home/user/../../etc/passwd"));
+    try std.testing.expect(!validServedFilePath(""));
+    try std.testing.expect(executableDocumentPath("/tmp/note.html"));
+    try std.testing.expect(executableDocumentPath("/tmp/icon.SVG"));
+    try std.testing.expect(!executableDocumentPath("/tmp/report.docx"));
+    try std.testing.expectEqualStrings("application/pdf", servedFileMime("/tmp/Pitch-Deck.pdf"));
+    try std.testing.expect(std.mem.indexOf(u8, FILE_FRAME_CSP, "frame-ancestors 'self'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, FILE_FRAME_CSP, "default-src") == null);
+}
+
+test "query component decoding resolves percent escapes and plus" {
+    const decoded = try decodeQueryComponent(std.testing.allocator, "/home/rtg/My%20Files/a%2Bb.pdf");
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualStrings("/home/rtg/My Files/a+b.pdf", decoded);
+
+    const plus = try decodeQueryComponent(std.testing.allocator, "/tmp/a+b.txt");
+    defer std.testing.allocator.free(plus);
+    try std.testing.expectEqualStrings("/tmp/a b.txt", plus);
+}
+
+test "attachment disposition quotes and sanitizes the basename" {
+    const disposition = try attachmentDisposition(std.testing.allocator, "/tmp/Report \"final\".pdf");
+    defer std.testing.allocator.free(disposition);
+    try std.testing.expectEqualStrings("attachment; filename=\"Report _final_.pdf\"", disposition);
+}
+
 test "gateway resource policies stay explicitly bounded" {
     try std.testing.expectEqual(@as(usize, 64), MAX_CONNECTIONS);
     try std.testing.expectEqual(@as(usize, 16), MAX_WEBSOCKETS);
     try std.testing.expectEqual(@as(usize, 32), MAX_KEEPALIVE_REQUESTS);
     try std.testing.expectEqual(@as(usize, 4 * 1024), MAX_HEADER_BYTES);
-    try std.testing.expectEqual(@as(usize, 1024 * 1024), MAX_RPC_FRAME_BYTES);
+    try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), MAX_RPC_FRAME_BYTES);
 }

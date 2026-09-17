@@ -38,6 +38,13 @@ pub fn respondParsed(allocator: std.mem.Allocator, request: protocol.Request) ![
     if (std.mem.eql(u8, request.method, "chat.thread.get")) {
         return protocol.encodeOkResponse(allocator, id, .{ .thread = threads[0], .store_revision = 12 });
     }
+    if (std.mem.eql(u8, request.method, store.METHOD_CHAT_MESSAGE_LIST)) {
+        return protocol.encodeOkResponse(allocator, id, .{
+            .messages = &messages,
+            .next_cursor = null,
+            .store_revision = 12,
+        });
+    }
     if (std.mem.eql(u8, request.method, "daemon.client.register")) {
         return protocol.encodeOkResponse(allocator, id, .{ .client_id = "web-mock-client", .persistent = false });
     }
@@ -54,7 +61,7 @@ pub fn respondParsed(allocator: std.mem.Allocator, request: protocol.Request) ![
         allocator,
         id,
         protocol.ERR_CAPABILITY_UNAVAILABLE,
-        "daemon offline; only core.*, chat.thread.get, and session.list/tail are mocked",
+        "daemon offline; only core.*, chat.thread.get, chat.message.list, and session.list/tail are mocked",
     );
 }
 

@@ -10,7 +10,10 @@ const access_protocol = headless.access_protocol;
 const connect_protocol = headless.connect_protocol;
 
 const INITIAL_RESPONSE_CAPACITY: usize = 64 * 1024;
-pub const MAX_GATEWAY_RPC_BYTES: usize = 1024 * 1024;
+/// Match the sessionizer's 8 MiB message cap. 1 MiB dropped real
+/// `chat.thread.get` payloads (a single command card can exceed that), which
+/// left the web client showing an empty chat while desktop still had the thread.
+pub const MAX_GATEWAY_RPC_BYTES: usize = 8 * 1024 * 1024;
 
 pub const CallResult = struct {
     json: []u8,
