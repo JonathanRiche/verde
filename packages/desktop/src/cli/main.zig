@@ -4059,6 +4059,11 @@ pub fn handleMcpHttpRequest(
     request: []const u8,
     context: mcp_http.RequestContext,
 ) !?[]u8 {
+    if (context.internal_task_watch) {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, request, .{});
+        defer parsed.deinit();
+        return try chatDaemonCallEnvelopeAlloc(allocator, io, "chat.tasks.watch", parsed.value);
+    }
     const started_ns = platform_runtime.monotonicTimestampNs();
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
@@ -4131,6 +4136,8 @@ fn handleMcpMessage(
         try mcpInitialize(allocator, out, id_value, params);
     } else if (std.mem.eql(u8, method, "server/discover")) {
         try mcpServerDiscover(allocator, out, id_value);
+    } else if (std.mem.startsWith(u8, method, "tasks/")) {
+        try mcpTaskMethod(allocator, out, io, id_value, method, params);
     } else if (std.mem.eql(u8, method, "tools/list")) {
         try mcpToolsList(allocator, out, id_value);
     } else if (std.mem.eql(u8, method, "tools/call")) {
@@ -4142,6 +4149,94 @@ fn handleMcpMessage(
         try mcpError(allocator, out, id_value, -32601, "method not found");
     }
     return true;
+}
+
+fn mcpTasksSupported(params: std.json.Value) bool {
+    if (params != .object) return false;
+    const meta = params.object.get("_meta") orelse return false;
+    if (meta != .object) return false;
+    if (!std.mem.eql(u8, jsonString(meta.object.get("io.modelcontextprotocol/protocolVersion") orelse .null) orelse "", mcp_http.MODERN_PROTOCOL_VERSION)) return false;
+    const capabilities = meta.object.get("io.modelcontextprotocol/clientCapabilities") orelse return false;
+    if (capabilities != .object) return false;
+    const extensions = capabilities.object.get("extensions") orelse return false;
+    return extensions == .object and extensions.object.contains("io.modelcontextprotocol/tasks");
+}
+
+fn mcpTaskGet(allocator: std.mem.Allocator, out: output.Output, io: std.Io, id: std.json.Value, task: []const u8, created: bool) !void {
+    const response = try chatDaemonCallEnvelopeAlloc(allocator, io, "chat.tasks.get", .{ .task_id = task });
+    defer allocator.free(response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.getPtr("result") orelse return mcpError(allocator, out, id, -32602, "unknown task");
+    if (result.* != .object) return error.InvalidResponse;
+    try result.object.put(parsed.arena.allocator(), "resultType", .{ .string = if (created) "task" else "complete" });
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer };
+    try mcpBeginResult(&s, id);
+    try s.write(result.*);
+    try s.endObject();
+    try out.stdout("{s}\n", .{writer.written()});
+}
+
+fn mcpTaskAck(allocator: std.mem.Allocator, out: output.Output, id: std.json.Value) !void {
+    const encoded = try std.json.Stringify.valueAlloc(allocator, .{ .jsonrpc = "2.0", .id = id, .result = .{ .resultType = "complete" } }, .{});
+    defer allocator.free(encoded);
+    try out.stdout("{s}\n", .{encoded});
+}
+
+fn mcpTaskCapabilityError(allocator: std.mem.Allocator, out: output.Output, id: std.json.Value) !void {
+    const encoded = try std.json.Stringify.valueAlloc(allocator, .{ .jsonrpc = "2.0", .id = id, .@"error" = .{
+        .code = @as(i32, -32021),
+        .message = "Missing required client capability",
+        .data = .{ .requiredCapabilities = .{ .extensions = .{ .@"io.modelcontextprotocol/tasks" = .{} } } },
+    } }, .{});
+    defer allocator.free(encoded);
+    try out.stdout("{s}\n", .{encoded});
+}
+
+fn mcpTaskMethod(allocator: std.mem.Allocator, out: output.Output, io: std.Io, id: std.json.Value, method: []const u8, params: std.json.Value) !void {
+    if (!mcpTasksSupported(params)) return mcpTaskCapabilityError(allocator, out, id);
+    const task = jsonString(params.object.get("taskId") orelse .null) orelse return mcpError(allocator, out, id, -32602, "missing taskId");
+    if (std.mem.eql(u8, method, "tasks/get")) return mcpTaskGet(allocator, out, io, id, task, false);
+    const known = try chatDaemonCallEnvelopeAlloc(allocator, io, "chat.tasks.get", .{ .task_id = task });
+    defer allocator.free(known);
+    var known_parsed = try std.json.parseFromSlice(std.json.Value, allocator, known, .{});
+    defer known_parsed.deinit();
+    if (!known_parsed.value.object.contains("result")) return mcpError(allocator, out, id, -32602, "unknown task");
+    if (std.mem.eql(u8, method, "tasks/cancel")) {
+        const response = try chatDaemonCallEnvelopeAlloc(allocator, io, "chat.turn.cancel", .{ .turn_id = task });
+        defer allocator.free(response);
+        return mcpTaskAck(allocator, out, id);
+    }
+    if (std.mem.eql(u8, method, "tasks/update")) {
+        const responses = params.object.get("inputResponses") orelse return mcpError(allocator, out, id, -32602, "missing inputResponses");
+        if (responses != .object or responses.object.count() != 1) return mcpError(allocator, out, id, -32602, "one approval response required");
+        var it = responses.object.iterator();
+        const entry = it.next().?;
+        const value = entry.value_ptr.*;
+        const result = if (value == .object) value.object.get("result") orelse value else value;
+        const action = if (result == .object) jsonString(result.object.get("action") orelse .null) orelse "decline" else "decline";
+        if (!std.mem.eql(u8, action, "accept") and !std.mem.eql(u8, action, "decline") and !std.mem.eql(u8, action, "cancel")) return mcpError(allocator, out, id, -32602, "invalid elicitation action");
+        const response = try chatDaemonCallEnvelopeAlloc(allocator, io, "chat.turn.approve", .{ .turn_id = task, .call_id = entry.key_ptr.*, .decision = if (std.mem.eql(u8, action, "accept")) "approve" else "deny" });
+        defer allocator.free(response);
+        return mcpTaskAck(allocator, out, id);
+    }
+    return mcpError(allocator, out, id, -32601, "unknown task method");
+}
+
+fn mcpLinkOpenedChat(allocator: std.mem.Allocator, io: std.Io, response: []const u8, parent: ?[]const u8) !void {
+    const parent_id = parent orelse return;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("result") orelse return;
+    const workspace = jsonString(result.object.get("workspace_id") orelse .null) orelse return;
+    const child = jsonString(result.object.get("local_thread_id") orelse .null) orelse return;
+    const linked = try chatDaemonCallEnvelopeAlloc(allocator, io, "chat.links.create", .{ .workspace_id = workspace, .parent_thread_id = parent_id, .local_thread_id = child });
+    defer allocator.free(linked);
+    var decoded = try std.json.parseFromSlice(std.json.Value, allocator, linked, .{});
+    defer decoded.deinit();
+    if (!(jsonBool(decoded.value.object.get("ok") orelse .null) orelse false)) return error.InvalidParentThread;
 }
 
 fn mcpRequestUsesModernProtocol(allocator: std.mem.Allocator, request: []const u8) bool {
@@ -4417,6 +4512,8 @@ fn mcpServerDiscover(allocator: std.mem.Allocator, out: output.Output, id_value:
     try s.write(&.{mcp_http.MODERN_PROTOCOL_VERSION});
     try s.objectField("capabilities");
     try s.beginObject();
+    try s.objectField("extensions");
+    try s.write(.{ .@"io.modelcontextprotocol/tasks" = .{} });
     try s.objectField("tools");
     try s.beginObject();
     try s.endObject();
@@ -4458,7 +4555,13 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
     try writeMcpTypedTool(&s, "present_chat", "Present an existing durable chat thread in the desktop GUI. Use this to recover a headless or deferred open_chat result.", &CHAT_PRESENT_MCP_INPUTS);
     try writeMcpTypedTool(&s, "set_chat_draft", "Stage or append a composer draft without sending it. Address either a live pane_id or a durable local_thread_id.", &CHAT_DRAFT_SET_MCP_INPUTS);
     try writeMcpTypedTool(&s, "get_chat_draft", "Read a staged composer draft without sending it. Address either a live pane_id or a durable local_thread_id.", &CHAT_DRAFT_GET_MCP_INPUTS);
-    try writeMcpTypedTool(&s, "send_chat_message", "Send a prompt on an existing chat thread daemon-direct (no GUI required) and return the accepted turn_id. The thread and its workspace row must already exist in the daemon store (open_chat creates the thread, the desktop dual-write creates the workspace). Poll tail_chat_turn for streaming events and completion.", &CHAT_SEND_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "report_chat_blocked", "Report a concrete blocker to the orchestrating parent, then yield. A follow-up chat turn resumes work. Use your current Verde turn_id.", &.{
+        .{ .name = "turn_id", .type_name = "string", .description = "Your current Verde turn id.", .required = true },
+        .{ .name = "reason", .type_name = "string", .description = "What input or dependency is needed to continue.", .required = true },
+    });
+    try writeMcpTypedTool(&s, "list_linked_chats", "List chats delegated by a parent conversation and their current status.", &CHAT_LINKS_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "clear_linked_chats", "Hide a specific linked chat or finished links. Does not cancel work, delete chats, or disable delivery.", &CHAT_LINKS_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "send_chat_message", "Send a prompt on an existing chat thread daemon-direct (no GUI required) and return the accepted turn_id. The thread and its workspace row must already exist in the daemon store (open_chat creates the thread, the desktop dual-write creates the workspace). Task-capable clients receive an asynchronous task handle; subscribe through subscriptions/listen for completion and input-needed notifications. Set parent_thread_id for automatic Verde parent delivery. Legacy clients can read tail_chat_turn.", &CHAT_SEND_MCP_INPUTS);
     try writeMcpTypedTool(&s, "queue_chat_followup", "Steer a running chat pane daemon-direct. Reuse steer_id after an ambiguous response; idle or unsupported panes return invalid_state.", &CHAT_FOLLOWUP_MCP_INPUTS);
     try writeMcpTypedTool(&s, "tail_chat_turn", "Read streamed events and status. Accepted steering is kind=steer with steer_id, message_id, title, body, and images; terminal status follows durable commit.", &CHAT_TAIL_MCP_INPUTS);
     try writeMcpTypedTool(&s, "approve_chat_turn", "Approve or deny a chat turn's pending tool approval daemon-direct. Returns not_found both for an unknown turn and for a turn with no pending approval matching call_id; re-check tail_chat_turn before retrying.", &CHAT_APPROVE_MCP_INPUTS);
@@ -4588,7 +4691,7 @@ fn modernizeMcpResponseAlloc(allocator: std.mem.Allocator, response: []const u8)
     if (result_value.* != .object) return allocator.dupe(u8, trimmed);
     const arena = parsed.arena.allocator();
     const result = &result_value.object;
-    try result.put(arena, "resultType", .{ .string = "complete" });
+    if (!result.contains("resultType")) try result.put(arena, "resultType", .{ .string = "complete" });
     if (result.get("tools") != null) {
         try result.put(arena, "ttlMs", .{ .integer = 60_000 });
         try result.put(arena, "cacheScope", .{ .string = "public" });
@@ -4690,6 +4793,7 @@ const McpToolInput = struct {
 };
 
 const OPEN_CHAT_MCP_INPUTS = [_]McpToolInput{
+    .{ .name = "parent_thread_id", .type_name = "string", .description = "Your Verde local thread id; show the new child in your linked chats panel." },
     .{ .name = "workspace_id", .type_name = "string", .description = "Required workspace id, index, or path. Pass a stable id to avoid desktop-selection dependence.", .required = true },
     .{ .name = "provider", .type_name = "string", .description = "GUI provider: opencode, codex, claude, or cursor.", .required = true },
     .{ .name = "model", .type_name = "string", .description = "Optional model id; defaults to the provider's current default." },
@@ -4728,7 +4832,14 @@ const CHAT_DRAFT_GET_MCP_INPUTS = [_]McpToolInput{
 // on the session daemon behind the shared chat capability check; an old daemon
 // (chat=false) yields a structured capability_unavailable error and is never
 // silently re-routed through Live.
+const CHAT_LINKS_MCP_INPUTS = [_]McpToolInput{
+    .{ .name = "workspace_id", .type_name = "string", .description = "Workspace owning the parent chat.", .required = true },
+    .{ .name = "parent_thread_id", .type_name = "string", .description = "Your Verde conversation local thread id.", .required = true },
+    .{ .name = "link_id", .type_name = "string", .description = "Optional specific link to hide; otherwise clear finished links." },
+};
+
 const CHAT_SEND_MCP_INPUTS = [_]McpToolInput{
+    .{ .name = "parent_thread_id", .type_name = "string", .description = "Your Verde local thread id; links this child and enables automatic status delivery to your conversation." },
     .{ .name = "workspace_id", .type_name = "string", .description = "Stable workspace id owning the thread.", .required = true },
     .{ .name = "local_thread_id", .type_name = "string", .description = "Stable thread id returned by open_chat or read from the thread list.", .required = true },
     .{ .name = "prompt", .type_name = "string", .description = "User prompt text for the new turn.", .required = true },
@@ -5027,6 +5138,23 @@ fn mcpToolsCall(
         defer allocator.free(resolved);
         return try mcpToolLiveTextResult(allocator, out, id_value, resolved, tool_name);
     }
+    if (std.mem.eql(u8, tool_name, "report_chat_blocked")) {
+        const response = try chatDaemonCallEnvelopeAlloc(allocator, io, "chat.tasks.blocked", .{
+            .task_id = mcpArgString(arguments, "turn_id") orelse return error.InvalidParams,
+            .reason = mcpArgString(arguments, "reason") orelse return error.InvalidParams,
+        });
+        defer allocator.free(response);
+        return mcpToolTextResult(allocator, out, id_value, response, tool_name);
+    }
+    if (std.mem.eql(u8, tool_name, "list_linked_chats") or std.mem.eql(u8, tool_name, "clear_linked_chats")) {
+        const response = try chatDaemonCallEnvelopeAlloc(allocator, io, if (std.mem.eql(u8, tool_name, "list_linked_chats")) "chat.links.list" else "chat.links.clear", .{
+            .workspace_id = mcpArgString(arguments, "workspace_id") orelse return error.InvalidParams,
+            .parent_thread_id = mcpArgString(arguments, "parent_thread_id") orelse return error.InvalidParams,
+            .link_id = mcpArgString(arguments, "link_id"),
+        });
+        defer allocator.free(response);
+        return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
+    }
     if (std.mem.eql(u8, tool_name, "send_chat_message")) {
         const workspace_id = mcpArgString(arguments, "workspace_id") orelse
             return try mcpError(allocator, out, id_value, -32602, "send_chat_message requires workspace_id");
@@ -5043,8 +5171,17 @@ fn mcpToolsCall(
             .prompt = prompt,
             .project_path = project_path,
             .turn_id = mcpArgString(arguments, "turn_id"),
+            .task_owner = default_owner,
+            .parent_thread_id = mcpArgString(arguments, "parent_thread_id"),
         }) catch |err| return try mcpChatDaemonError(allocator, out, id_value, err);
         defer allocator.free(response);
+        if (mcpTasksSupported(params)) {
+            var accepted = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+            defer accepted.deinit();
+            if (accepted.value.object.get("result")) |result| {
+                if (jsonString(result.object.get("turn_id") orelse .null)) |task_id| return mcpTaskGet(allocator, out, io, id_value, task_id, true);
+            }
+        }
         return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
     }
     if (std.mem.eql(u8, tool_name, "queue_chat_followup")) {
@@ -5278,6 +5415,7 @@ fn mcpToolsCall(
                         .fast_mode = if (creation_settings.fast_mode != null) validated.fast_mode else null,
                     }) catch |err| return try mcpChatDaemonError(allocator, out, id_value, err);
                     defer allocator.free(daemon_response);
+                    try mcpLinkOpenedChat(allocator, io, daemon_response, mcpArgString(arguments, "parent_thread_id"));
                     const presented = try presentDaemonChatOpenAlloc(
                         allocator,
                         io,
@@ -5301,6 +5439,7 @@ fn mcpToolsCall(
                 .fast_mode = creation_settings.fast_mode,
             }) catch |err| return try mcpChatDaemonError(allocator, out, id_value, err);
             defer allocator.free(daemon_response);
+            try mcpLinkOpenedChat(allocator, io, daemon_response, mcpArgString(arguments, "parent_thread_id"));
             return try mcpToolTextResult(allocator, out, id_value, daemon_response, tool_name);
         }
         if (std.mem.eql(u8, tool_name, "list_workspaces")) {
@@ -5753,6 +5892,7 @@ fn chatDaemonCallEnvelopeAlloc(
         .allocator = arena,
         .pref_path = pref_path,
     };
+    if (std.mem.eql(u8, method, "chat.tasks.watch")) transport.timeout_ms = 30000;
     var client = daemon_client.headlessClient(arena, &transport);
     try chatDaemonRequireCapability(&client);
 
@@ -6030,6 +6170,8 @@ fn chatDaemonFollowupEnvelopeAlloc(allocator: std.mem.Allocator, io: std.Io, fol
 }
 
 const ChatDaemonSendArgs = struct {
+    task_owner: ?[]const u8 = null,
+    parent_thread_id: ?[]const u8 = null,
     workspace_id: []const u8,
     local_thread_id: []const u8,
     prompt: []const u8,
@@ -6079,6 +6221,8 @@ fn chatDaemonSendEnvelopeAlloc(allocator: std.mem.Allocator, io: std.Io, send: C
         thread.title;
     var start = try client.call("chat.turn.start", .{
         .turn_id = turn_id,
+        .task_owner = send.task_owner,
+        .parent_thread_id = send.parent_thread_id,
         .workspace_id = send.workspace_id,
         .local_thread_id = send.local_thread_id,
         .project_path = send.project_path,
@@ -7189,6 +7333,8 @@ fn mcpUnavailableCapability(tool_name: []const u8) ?McpUnavailableCapability {
         std.mem.eql(u8, tool_name, "tail_chat_turn") or
         std.mem.eql(u8, tool_name, "approve_chat_turn") or
         std.mem.eql(u8, tool_name, "stop_chat_turn") or
+        std.mem.eql(u8, tool_name, "list_linked_chats") or
+        std.mem.eql(u8, tool_name, "clear_linked_chats") or
         std.mem.eql(u8, tool_name, "read_chat_thread"))
     {
         return mcpChatUnavailableCapability();

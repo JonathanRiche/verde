@@ -193,6 +193,13 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    const scenario = currentEnviron().getAlloc(allocator, "VERDE_IT_SCENARIO") catch null;
+    defer if (scenario) |value| allocator.free(value);
+    if (scenario) |value| if (std.mem.eql(u8, value, "orchestration")) {
+        try runChatOrchestrationScenario(allocator, io);
+        return;
+    };
+
     // Transport tier first so a Windows subset exits cleanly without PTY work.
     try runRegistryFixtureScenario(allocator, io);
     try runRegistryCapabilityScenario(allocator, io);
@@ -235,6 +242,7 @@ pub fn main(init: std.process.Init) !void {
     // including both the legacy handshake and modern stateless lifecycle.
     // Self-gates POSIX-only (bounded pipe reads use std.posix.poll).
     try runChatMcpToolLayerScenario(allocator, io);
+    try runChatOrchestrationScenario(allocator, io);
     // M4-P5 fix amendment: failed-first identity adoption converges via retry
     // to a single identity set across flush + daemon restart. POSIX-gated.
     try runChatAdoptionRetryDurabilityScenario(allocator, io);
@@ -10733,3 +10741,314 @@ fn runLifecycleIdleExitOverride(allocator: std.mem.Allocator, io: std.Io) !void 
     // Reap the exited child to avoid zombies.
     _ = child.wait(io) catch {};
 }
+
+/// Orchestration regression: real MCP task calls, durable linkage, immediate
+/// watch snapshots, parent continuation, and clear without deletion.
+fn runChatOrchestrationScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref = try makePrefPath(allocator, "orchestration");
+    defer allocator.free(pref);
+    defer std.Io.Dir.cwd().deleteTree(io, pref) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref);
+    var isolation = try EndpointIsolation.install(allocator, pref);
+    defer isolation.deinit(allocator);
+    const exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(exe);
+    var daemon = try spawnIsolatedDaemonWithEnv(allocator, io, exe, pref, .{ .store_dir = pref, .chat_stub = true });
+    defer daemon.kill(io);
+    var arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var transport: sessionizer.HeadlessTransport = .{ .allocator = arena, .pref_path = pref };
+    var client = sessionizer.headlessClient(arena, &transport);
+    var registered = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    const client_id = (try client.decodeClientRegister(&registered)).client_id;
+    var workspace = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, headless.store.WorkspaceUpsertRequest{
+        .mutation = .{ .request_key = "orch-ws", .client_id = client_id },
+        .workspace = .{ .workspace_id = "orch", .label = "Orchestration", .path = pref },
+    });
+    if (!workspace.response.isOk()) return error.OrchestrationWorkspace;
+    for ([_][]const u8{ "parent", "child", "blocked-child", "approval-child", "cancel-child", "live-child", "restart-child", "busy-parent", "busy-child", "image-child", "other-parent" }) |id| {
+        var thread = try client.call(headless.store.METHOD_CHAT_THREAD_UPSERT, headless.store.ThreadUpsertRequest{
+            .mutation = .{ .request_key = id, .client_id = client_id },
+            .workspace_id = "orch",
+            .thread = .{ .local_thread_id = id, .title = id, .provider = "codex", .harness = "local_cli" },
+        });
+        if (!thread.response.isOk()) return error.OrchestrationThread;
+    }
+    var runtime_status = try client.call("core.status", @as(struct {}, .{}));
+    if (!runtime_status.response.isOk()) {
+        std.debug.print("attachment fixture status: {any}\n", .{runtime_status.response.err});
+        return error.LocalImageRuntimeStatus;
+    }
+    const runtime_id = (try client.decodeStatus(&runtime_status)).runtime_id;
+    var repository = try client.call(headless.store.METHOD_WORKSPACE_REPOSITORY_UPSERT, headless.store.WorkspaceRepositoryUpsertRequest{ .mutation = .{ .request_key = "image-repo", .client_id = client_id }, .workspace_id = "orch", .repository = .{ .repository_id = "primary", .label = "Primary" } });
+    if (!repository.response.isOk()) return error.LocalImageRepositoryMissing;
+    var binding = try client.call(headless.store.METHOD_WORKSPACE_REPOSITORY_BINDING_UPSERT, headless.store.WorkspaceRepositoryBindingUpsertRequest{ .mutation = .{ .request_key = "image-binding", .client_id = client_id }, .workspace_id = "orch", .repository_id = "primary", .binding = .{ .runtime_id = runtime_id, .root_path = pref } });
+    if (!binding.response.isOk()) return error.LocalImageBindingMissing;
+    // Repository-local GUI uploads use staged IDs, including multiple images.
+    const png_fixture = try arena.alloc(u8, 70_000);
+    @memset(png_fixture, 0);
+    @memcpy(png_fixture[0..8], "\x89PNG\r\n\x1a\n");
+    const image_ids = try chat_controller.uploadLocalChatImages(arena, pref, &.{
+        .{ .mime = "image/png", .bytes = png_fixture },
+        .{ .mime = "image/jpeg", .bytes = "\xff\xd8\xfffixture-with-enough-header-bytes" },
+    });
+    if (image_ids.len != 2 or std.mem.eql(u8, image_ids[0], image_ids[1])) return error.LocalImageStagingLostImage;
+    var image_turn = try client.call("chat.turn.start", .{ .turn_id = "local-image-turn", .thread_title = "Images", .workspace_id = "orch", .local_thread_id = "image-child", .repository_id = "primary", .attachments = image_ids, .provider = "codex", .harness = "local_cli", .prompt = "inspect both images" });
+    if (!image_turn.response.isOk()) {
+        std.debug.print("local image acceptance rejected: {any}\n", .{image_turn.response.err});
+        return error.LocalRepositoryImagesRejected;
+    }
+    try waitChatTurnTerminal(io, &client, "local-image-turn", true);
+    var image_tail = try client.call("chat.turn.tail", .{ .turn_id = "local-image-turn" });
+    if (!image_tail.response.isOk()) return error.LocalRepositoryImagesMissing;
+    var text_turn = try client.call("chat.turn.start", .{ .turn_id = "local-text-turn", .thread_title = "Images", .workspace_id = "orch", .local_thread_id = "image-child", .repository_id = "primary", .provider = "codex", .harness = "local_cli", .prompt = "text only follow-up" });
+    if (!text_turn.response.isOk()) return error.LocalRepositoryTextRejected;
+    try waitChatTurnTerminal(io, &client, "local-text-turn", true);
+
+    const meta = .{ .@"io.modelcontextprotocol/protocolVersion" = mcp_http.MODERN_PROTOCOL_VERSION, .@"io.modelcontextprotocol/clientCapabilities" = .{ .extensions = .{ .@"io.modelcontextprotocol/tasks" = .{} } } };
+    const send = try std.json.Stringify.valueAlloc(arena, .{ .jsonrpc = "2.0", .id = 1, .method = "tools/call", .params = .{
+        ._meta = meta,
+        .name = "send_chat_message",
+        .arguments = .{ .workspace_id = "orch", .local_thread_id = "child", .parent_thread_id = "parent", .project_path = pref, .turn_id = "orch-child-turn", .prompt = "hello orchestration" },
+    } }, .{});
+    const context: mcp_http.RequestContext = .{ .protocol_version = mcp_http.MODERN_PROTOCOL_VERSION, .client_name = "orchestration-it", .owner = "orchestration-it" };
+    const send_reply = (try cli_main.handleMcpHttpRequest(arena, io, send, context)).?;
+    const created = try std.json.parseFromSlice(std.json.Value, arena, send_reply, .{});
+    const task = jsonObjectField(created.value, "result") orelse return error.OrchestrationTaskMissing;
+    if (!std.mem.eql(u8, jsonObjectField(task, "resultType").?.string, "task")) return error.OrchestrationTaskDiscriminator;
+    if (!std.mem.eql(u8, jsonObjectField(task, "taskId").?.string, "orch-child-turn")) return error.OrchestrationTaskId;
+    try waitChatTurnTerminal(io, &client, "orch-child-turn", true);
+    var status = try client.call("chat.tasks.get", .{ .task_id = "orch-child-turn" });
+    if (!status.response.isOk()) return error.OrchestrationTaskGet;
+    if (!std.mem.eql(u8, jsonObjectField(status.response.result.?, "status").?.string, "completed")) return error.OrchestrationTaskStatus;
+    var watch = try client.call("chat.tasks.watch", .{ .task_ids = .{"orch-child-turn"}, .wait_ms = 25000 });
+    if (!watch.response.isOk()) return error.OrchestrationWatch;
+    var links = try client.call("chat.links.list", .{ .workspace_id = "orch", .parent_thread_id = "parent" });
+    if (!links.response.isOk()) return error.OrchestrationLinks;
+    const rows = jsonObjectField(links.response.result.?, "links").?.array.items;
+    if (rows.len != 1 or !std.mem.eql(u8, jsonObjectField(rows[0], "local_thread_id").?.string, "child")) return error.OrchestrationLinkIdentity;
+    const parent_turn = "child-event:orch-child-turn:parent:2";
+    const deadline = platform_runtime.unixTimestampMs() + 10000;
+    while (true) {
+        var tail = try client.call("chat.turn.tail", .{ .turn_id = parent_turn });
+        if (tail.response.isOk()) break;
+        if (platform_runtime.unixTimestampMs() >= deadline) return error.OrchestrationParentNotResumed;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try waitChatTurnTerminal(io, &client, parent_turn, true);
+    // A notification steered into a busy parent must be acknowledged rather
+    // than replayed as a fresh parent turn after that parent finishes.
+    var busy = try client.call("chat.turn.start", .{ .turn_id = "busy-parent-turn", .workspace_id = "orch", .local_thread_id = "busy-parent", .project_path = pref, .thread_title = "busy-parent", .provider = "claude", .harness = "local_cli", .prompt = "slow steer target" });
+    if (!busy.response.isOk()) return error.OrchestrationBusyParentStart;
+    var busy_child = try client.call("chat.turn.start", .{ .turn_id = "busy-child-turn", .workspace_id = "orch", .local_thread_id = "busy-child", .parent_thread_id = "busy-parent", .task_owner = "orchestration-it", .project_path = pref, .thread_title = "busy-child", .provider = "codex", .harness = "local_cli", .prompt = "hello" });
+    if (!busy_child.response.isOk()) return error.OrchestrationBusyChildStart;
+    try waitChatTurnTerminal(io, &client, "busy-child-turn", true);
+    const db_path = try std.fs.path.join(arena, &.{ pref, "state.sqlite" });
+    var conn = try zqlite.open(try arena.dupeZ(u8, db_path), zqlite.OpenFlags.ReadOnly | zqlite.OpenFlags.EXResCode);
+    defer conn.close();
+    {
+        const row = (try conn.row("select m.image_path,m.extra_images_json from messages m join threads t on t.id=m.thread_id where t.local_thread_id='image-child' and m.role=0 and m.body='inspect both images'", .{})) orelse return error.LocalImagesNotPersisted;
+        defer row.deinit();
+        if (std.mem.indexOf(u8, row.nullableText(0) orelse "", image_ids[0]) == null or std.mem.indexOf(u8, row.nullableText(1) orelse "", image_ids[1]) == null) return error.LocalImagesNotPreserved;
+    }
+    const delivery_deadline = platform_runtime.unixTimestampMs() + 10000;
+    while (true) {
+        const row = try conn.row("select delivered,parent_turn_id from chat_deliveries where task_id='busy-child-turn'", .{});
+        if (row) |r| {
+            defer r.deinit();
+            if (r.int(0) != 0) {
+                if (!std.mem.eql(u8, r.nullableText(1) orelse "", "busy-parent-turn")) return error.OrchestrationSteerNotAcknowledged;
+                break;
+            }
+        }
+        if (platform_runtime.unixTimestampMs() >= delivery_deadline) return error.OrchestrationDeliveryUnacknowledged;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try waitChatTurnTerminal(io, &client, "busy-parent-turn", true);
+    {
+        const row = (try conn.row("select delivered from chat_deliveries where task_id='busy-child-turn'", .{})).?;
+        defer row.deinit();
+        if (row.int(0) != 1) return error.OrchestrationSteerNotDurable;
+    }
+    var clear = try client.call("chat.links.clear", .{ .workspace_id = "orch", .parent_thread_id = "parent", .completed_only = true });
+    if (!clear.response.isOk()) return error.OrchestrationClear;
+    const hidden = try client.call("chat.links.list", .{ .workspace_id = "orch", .parent_thread_id = "parent" });
+    if (jsonObjectField(hidden.response.result.?, "links").?.array.items.len != 0) return error.OrchestrationClearVisible;
+    var child = try client.call(headless.store.METHOD_CHAT_THREAD_GET, .{ .workspace_id = "orch", .local_thread_id = "child" });
+    if (!child.response.isOk()) return error.OrchestrationClearDeletedChat;
+    // Reverse relationships survive clearing the parent's drawer and support
+    // multiple orchestrators without conflating parents with child links.
+    var second_parent = try client.call("chat.links.create", .{ .workspace_id = "orch", .parent_thread_id = "other-parent", .local_thread_id = "child" });
+    if (!second_parent.response.isOk()) return error.OrchestrationSecondParent;
+    const reverse = try client.call("chat.links.list", .{ .workspace_id = "orch", .parent_thread_id = "child" });
+    if (!reverse.response.isOk()) return error.OrchestrationParents;
+    const parents = jsonObjectField(reverse.response.result.?, "parents").?.array.items;
+    if (parents.len != 2 or jsonObjectField(reverse.response.result.?, "links").?.array.items.len != 0) return error.OrchestrationParentsCount;
+    var found_cleared_parent = false;
+    for (parents) |row| {
+        const id = jsonObjectField(row, "local_thread_id").?.string;
+        if (std.mem.eql(u8, id, "parent")) found_cleared_parent = true;
+        if (jsonObjectField(row, "title").?.string.len == 0 or !std.mem.eql(u8, jsonObjectField(row, "provider").?.string, "codex")) return error.OrchestrationParentIdentity;
+    }
+    if (!found_cleared_parent) return error.OrchestrationClearedParentLost;
+
+    var cycle = try client.call("chat.links.create", .{ .workspace_id = "orch", .parent_thread_id = "child", .local_thread_id = "parent" });
+    if (cycle.response.isOk()) return error.OrchestrationCycleAccepted;
+    for ([_][]const u8{ "blocked-child", "approval-child", "cancel-child" }) |id| {
+        var started = try client.call("chat.turn.start", .{
+            .turn_id = id,
+            .workspace_id = "orch",
+            .local_thread_id = id,
+            .task_owner = "orchestration-it",
+            .project_path = pref,
+            .thread_title = id,
+            .provider = "codex",
+            .harness = "local_cli",
+            .prompt = if (std.mem.eql(u8, id, "approval-child")) "orchestration approval" else "slow steer target",
+        });
+        if (!started.response.isOk()) return error.OrchestrationExtraStart;
+        if (std.mem.eql(u8, id, "blocked-child")) {
+            var linked = try client.call("chat.links.create", .{ .workspace_id = "orch", .parent_thread_id = "parent", .local_thread_id = id });
+            if (!linked.response.isOk()) return error.OrchestrationResumeLink;
+            var blocked = try client.call("chat.tasks.blocked", .{ .task_id = id, .reason = "Choose an implementation strategy" });
+            if (!blocked.response.isOk()) return error.OrchestrationBlockReport;
+            try waitChatTurnTerminal(io, &client, id, true);
+            const task_state = try client.call("chat.tasks.get", .{ .task_id = id });
+            const tool_result = jsonObjectField(task_state.response.result.?, "result") orelse return error.OrchestrationBlockResult;
+            if (!jsonObjectField(tool_result, "isError").?.bool) return error.OrchestrationBlockNotError;
+            const before = try client.call("chat.links.list", .{ .workspace_id = "orch", .parent_thread_id = "parent" });
+            const before_row = jsonObjectField(before.response.result.?, "links").?.array.items[0];
+            if (!std.mem.eql(u8, jsonObjectField(before_row, "status").?.string, "blocked")) return error.OrchestrationLinkedBlockStatus;
+            const blocked_at = jsonObjectField(before_row, "updated_at_ms").?.integer;
+            // A normal GUI-style follow-up has neither task_owner nor parent.
+            // It must still replace the old delegated task's status and age.
+            const resumed_at = platform_runtime.unixTimestampMs();
+            var resumed = try client.call("chat.turn.start", .{ .turn_id = "blocked-child-resumed", .workspace_id = "orch", .local_thread_id = id, .project_path = pref, .thread_title = id, .provider = "codex", .harness = "local_cli", .prompt = "blocker resolved" });
+            if (!resumed.response.isOk()) return error.OrchestrationResumeStart;
+            try waitChatTurnTerminal(io, &client, "blocked-child-resumed", true);
+            const after = try client.call("chat.links.list", .{ .workspace_id = "orch", .parent_thread_id = "parent" });
+            const after_row = jsonObjectField(after.response.result.?, "links").?.array.items[0];
+            if (!std.mem.eql(u8, jsonObjectField(after_row, "status").?.string, "completed")) return error.OrchestrationResumeStatusStale;
+            if (!std.mem.eql(u8, jsonObjectField(after_row, "turn_id").?.string, "blocked-child-resumed")) return error.OrchestrationResumeTurnStale;
+            const updated_at = jsonObjectField(after_row, "updated_at_ms").?.integer;
+            if (updated_at < resumed_at or updated_at < blocked_at or updated_at > platform_runtime.unixTimestampMs()) return error.OrchestrationResumeTimeStale;
+        } else if (std.mem.eql(u8, id, "approval-child")) {
+            const approval_deadline = platform_runtime.unixTimestampMs() + 10000;
+            while (true) {
+                const task_state = try client.call("chat.tasks.get", .{ .task_id = id });
+                if (task_state.response.isOk() and std.mem.eql(u8, jsonObjectField(task_state.response.result.?, "status").?.string, "input_required")) break;
+                if (platform_runtime.unixTimestampMs() >= approval_deadline) return error.OrchestrationApprovalNotPublished;
+                try io.sleep(.fromMilliseconds(10), .awake);
+            }
+            const update = try std.json.Stringify.valueAlloc(arena, .{ .jsonrpc = "2.0", .id = 2, .method = "tasks/update", .params = .{ ._meta = meta, .taskId = id, .inputResponses = .{ .@"orch-approval" = .{ .result = .{ .action = "accept", .content = .{} } } } } }, .{});
+            const reply = (try cli_main.handleMcpHttpRequest(arena, io, update, context)).?;
+            const ack = try std.json.parseFromSlice(std.json.Value, arena, reply, .{});
+            if (jsonObjectField(ack.value, "result") == null) return error.OrchestrationApprovalAck;
+            try waitChatTurnTerminal(io, &client, id, true);
+        } else {
+            const cancel = try std.json.Stringify.valueAlloc(arena, .{ .jsonrpc = "2.0", .id = 3, .method = "tasks/cancel", .params = .{ ._meta = meta, .taskId = id } }, .{});
+            const reply = (try cli_main.handleMcpHttpRequest(arena, io, cancel, context)).?;
+            const ack = try std.json.parseFromSlice(std.json.Value, arena, reply, .{});
+            if (jsonObjectField(ack.value, "result") == null) return error.OrchestrationCancelAck;
+            try waitChatTurnTerminal(io, &client, id, true);
+            const task_state = try client.call("chat.tasks.get", .{ .task_id = id });
+            if (!std.mem.eql(u8, jsonObjectField(task_state.response.result.?, "status").?.string, "cancelled")) return error.OrchestrationCancelStatus;
+        }
+    }
+
+    var interrupted = try client.call("chat.turn.start", .{ .turn_id = "restart-child", .workspace_id = "orch", .local_thread_id = "restart-child", .task_owner = "orchestration-it", .project_path = pref, .thread_title = "restart-child", .provider = "codex", .harness = "local_cli", .prompt = "orchestration approval" });
+    if (!interrupted.response.isOk()) return error.OrchestrationRestartStart;
+    daemon.kill(io);
+    daemon = try spawnIsolatedDaemonWithEnv(allocator, io, exe, pref, .{ .store_dir = pref, .chat_stub = true });
+    const recovered = try client.call("chat.tasks.get", .{ .task_id = "restart-child" });
+    if (!recovered.response.isOk()) return error.OrchestrationRestartMissing;
+    if (!std.mem.eql(u8, jsonObjectField(recovered.response.result.?, "status").?.string, "completed")) return error.OrchestrationRestartStillWorking;
+    if (!jsonObjectField(jsonObjectField(recovered.response.result.?, "result").?, "isError").?.bool) return error.OrchestrationRestartNotError;
+
+    // Reconnecting after completion must receive an ack followed immediately
+    // by the complete task result; no periodic model-side wait is involved.
+    var server = try mcp_http.start(allocator, pref, cli_main.handleMcpHttpRequest);
+    defer server.deinit();
+    const endpoint = server.endpoint();
+    const url = try endpoint.urlAlloc(arena);
+    const authorization = try endpoint.authorizationAlloc(arena);
+    const listen = try std.json.Stringify.valueAlloc(arena, .{ .jsonrpc = "2.0", .id = 9, .method = "subscriptions/listen", .params = .{ ._meta = meta, .notifications = .{ .taskIds = .{"orch-child-turn"} } } }, .{});
+    var check: OrchestrationSseCheck = .{ .io = io, .url = url, .authorization = authorization, .payload = listen };
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, OrchestrationSseCheck.run, .{&check});
+    try check.done.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+    if (check.failure) |err| return err;
+    // Hold a real approval open until the subscription has observed it, then
+    // verify the same stream wakes with completion after answering the input.
+    var live = try client.call("chat.turn.start", .{ .turn_id = "live-child", .workspace_id = "orch", .local_thread_id = "live-child", .task_owner = "orchestration-it", .project_path = pref, .thread_title = "live-child", .provider = "codex", .harness = "local_cli", .prompt = "orchestration approval" });
+    if (!live.response.isOk()) return error.OrchestrationLiveStart;
+    const live_listen = try std.json.Stringify.valueAlloc(arena, .{ .jsonrpc = "2.0", .id = 10, .method = "subscriptions/listen", .params = .{ ._meta = meta, .notifications = .{ .taskIds = .{"live-child"} } } }, .{});
+    var live_check: OrchestrationSseCheck = .{ .io = io, .url = url, .authorization = authorization, .payload = live_listen, .require_pending = true };
+    try group.concurrent(io, OrchestrationSseCheck.run, .{&live_check});
+    try live_check.pending.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+    var approved = try client.call("chat.turn.approve", .{ .turn_id = "live-child", .call_id = "orch-approval", .decision = "approve" });
+    if (!approved.response.isOk()) return error.OrchestrationLiveApprove;
+    try live_check.done.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+    if (live_check.failure) |err| return err;
+    std.debug.print("headless-daemon-it: orchestration passed\n", .{});
+}
+
+const OrchestrationSseCheck = struct {
+    io: std.Io,
+    url: []const u8,
+    authorization: []const u8,
+    payload: []u8,
+    done: std.Io.Event = .unset,
+    failure: ?anyerror = null,
+    require_pending: bool = false,
+    pending: std.Io.Event = .unset,
+
+    fn run(self: *@This()) void {
+        defer self.done.set(self.io);
+        self.check() catch |err| {
+            self.failure = err;
+        };
+    }
+
+    fn check(self: *@This()) !void {
+        var client: std.http.Client = .{ .allocator = std.heap.page_allocator, .io = self.io };
+        defer client.deinit();
+        var request = try client.request(.POST, try std.Uri.parse(self.url), .{
+            .keep_alive = false,
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/json" },
+                .{ .name = "accept", .value = "text/event-stream" },
+                .{ .name = "authorization", .value = self.authorization },
+                .{ .name = "mcp-protocol-version", .value = mcp_http.MODERN_PROTOCOL_VERSION },
+                .{ .name = "mcp-method", .value = "subscriptions/listen" },
+            },
+        });
+        defer request.deinit();
+        try request.sendBodyComplete(self.payload);
+        var response = try request.receiveHead(&.{});
+        if (response.head.status != .ok) return error.OrchestrationSseStatus;
+        var buffer: [8192]u8 = undefined;
+        const reader = response.reader(&buffer);
+        var acknowledged = false;
+        var lines: usize = 0;
+        while (try reader.takeDelimiter('\n')) |line| {
+            lines += 1;
+            if (lines > 32) return error.OrchestrationSseNoTask;
+            if (std.mem.indexOf(u8, line, "notifications/subscriptions/acknowledged") != null) acknowledged = true;
+            if (std.mem.indexOf(u8, line, "notifications/tasks") != null) {
+                if (!acknowledged) return error.OrchestrationSseMissingAck;
+                if (self.require_pending and std.mem.indexOf(u8, line, "input_required") != null) {
+                    self.pending.set(self.io);
+                    continue;
+                }
+                if (self.require_pending and std.mem.indexOf(u8, line, "working") != null) continue;
+                if (std.mem.indexOf(u8, line, "stub-ok") == null) return error.OrchestrationSseMissingResult;
+                if (std.mem.indexOf(u8, line, "io.modelcontextprotocol/subscriptionId") == null) return error.OrchestrationSseMissingSubscription;
+                return;
+            }
+        }
+        return error.OrchestrationSseClosed;
+    }
+};

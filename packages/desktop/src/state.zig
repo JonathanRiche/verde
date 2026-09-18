@@ -55,6 +55,7 @@ const command_controller = @import("state/command_controller.zig");
 const acknowledgement_controller = @import("state/acknowledgement_controller.zig");
 const composer_controller = @import("state/composer_controller.zig");
 const companion_controller = @import("state/companion_controller.zig");
+const linked_chats_controller = @import("state/linked_chats_controller.zig");
 const browser_controller = @import("state/browser_controller.zig");
 const workspace_controller = @import("state/workspace_controller.zig");
 const lifecycle_controller = @import("state/lifecycle_controller.zig");
@@ -4559,6 +4560,8 @@ pub const AppState = struct {
     prefix_swallow_text_input: bool,
     composer_controller: ComposerControllerState,
     companion_controller: companion_controller,
+    /// Daemon-linked child chats shown in the parent pane drawer.
+    linked_chats: linked_chats_controller = .{},
     companion_composer: CompanionComposerPrompt,
     palette_overlay_batch: palette.RenderBatch,
     palette_frame_text: std.ArrayList(u8),
@@ -4785,6 +4788,7 @@ pub const AppState = struct {
             .prefix_swallow_text_input = false,
             .composer_controller = ComposerControllerState.init(),
             .companion_controller = companion_controller.init(),
+            .linked_chats = linked_chats_controller.init(),
             .companion_composer = CompanionComposerPrompt.init(),
             .palette_overlay_batch = .{},
             .palette_frame_text = .empty,
@@ -6483,6 +6487,42 @@ pub const AppState = struct {
 
     pub const openSubagent = workspace_controller.openSubagent;
 
+    /// Main-tick hook for the parent-pane linked-chats drawer. Returns true
+    /// when a list changed and the UI should render.
+    pub fn pollLinkedChats(self: *AppState) bool {
+        const now = unixTimestampMs();
+        // Idle panes may not redraw for minutes. Keep visible parents alive
+        // from pane membership, rather than treating lack of paint as hiding.
+        if (self.project_controller.projects.items.len > 0) {
+            const project = &self.project_controller.projects.items[self.project_controller.selected_index];
+            for (project.workspace_layout.panes.items) |pane| {
+                if (!project.workspace_layout.rootContainsPane(pane.id)) continue;
+                switch (pane.ref) {
+                    .chat => |chat| {
+                        if (chat.thread_index >= project.threads.items.len) continue;
+                        const thread = &project.threads.items[chat.thread_index];
+                        if (self.linked_chats.find(project.id, thread.local_thread_id)) |parent| parent.last_wanted_ms = now;
+                    },
+                    else => {},
+                }
+            }
+        }
+        return self.linked_chats.poll(self.allocator, self.storage.pref_path, now);
+    }
+
+    /// Opens a linked child, loading its durable transcript when it is not
+    /// already in the GUI's open thread list.
+    pub fn openLinkedChat(self: *AppState, workspace_id: []const u8, local_thread_id: []const u8) void {
+        self.openStoredThread(workspace_id, local_thread_id);
+    }
+
+    /// Hides one linked row (or every finished row when `link_id` is null).
+    /// Never cancels or deletes the child conversation.
+    pub fn clearLinkedChats(self: *AppState, workspace_id: []const u8, parent_thread_id: []const u8, link_id: ?[]const u8) void {
+        self.linked_chats.requestClear(self.allocator, self.storage.pref_path, workspace_id, parent_thread_id, link_id);
+        loop_wakeup.notify();
+    }
+
     pub fn threadImportNotice(self: *const AppState) []const u8 {
         return std.mem.sliceTo(self.import_notice_storage[0..], 0);
     }
@@ -7056,9 +7096,15 @@ pub const AppState = struct {
         if (history_index >= items.len) return;
         const item = items[history_index];
 
+        self.openStoredThread(item.workspace_id, item.local_thread_id);
+    }
+
+    // History entries and MCP links both refer to durable chats that may no
+    // longer be present in the GUI projection. Reuse the same reopen path.
+    fn openStoredThread(self: *AppState, workspace_id: []const u8, local_thread_id: []const u8) void {
         var project_index: ?usize = null;
         for (self.project_controller.projects.items, 0..) |*project, pi| {
-            if (std.mem.eql(u8, project.id, item.workspace_id)) {
+            if (std.mem.eql(u8, project.id, workspace_id)) {
                 project_index = pi;
                 break;
             }
@@ -7070,27 +7116,27 @@ pub const AppState = struct {
         {
             const project = &self.project_controller.projects.items[pi];
             for (project.threads.items, 0..) |*thread, ti| {
-                if (std.mem.eql(u8, thread.local_thread_id, item.local_thread_id)) {
+                if (std.mem.eql(u8, thread.local_thread_id, local_thread_id)) {
                     self.openThreadInWorkspaceSplit(pi, ti);
                     return;
                 }
             }
         }
 
-        var loaded = self.storage.loadThread(self.allocator, item.workspace_id, item.local_thread_id) catch |err| {
-            log.warn("history thread fetch failed: {s}", .{@errorName(err)});
+        var loaded = self.storage.loadThread(self.allocator, workspace_id, local_thread_id) catch |err| {
+            log.warn("stored thread fetch failed: {s}", .{@errorName(err)});
             self.setSidebarNotice("Could not load that chat from the daemon.");
             return;
         };
         defer loaded.deinit();
         var thread = persistence.buildThreadFromPersisted(self.allocator, loaded.thread) catch |err| {
-            log.warn("history thread build failed: {s}", .{@errorName(err)});
+            log.warn("stored thread build failed: {s}", .{@errorName(err)});
             self.setSidebarNotice("Could not rebuild that chat.");
             return;
         };
         thread.archived = false;
-        if (self.lifecycle.cancelThreadClose(self.allocator, item.workspace_id, item.local_thread_id)) {
-            runtime_log.trace("pending thread close cancelled by reopen thread={s}", .{item.local_thread_id});
+        if (self.lifecycle.cancelThreadClose(self.allocator, workspace_id, local_thread_id)) {
+            runtime_log.trace("pending thread close cancelled by reopen thread={s}", .{local_thread_id});
         }
         const project = &self.project_controller.projects.items[pi];
         project.threads.append(self.allocator, thread) catch {
@@ -7102,8 +7148,8 @@ pub const AppState = struct {
         const thread_index = project.threads.items.len - 1;
         self.openThreadInWorkspaceSplit(pi, thread_index);
         self.markDirty();
-        self.setSidebarNotice("Chat reopened from history.");
-        runtime_log.trace("history thread reopened project={d} messages={d}", .{ pi, loaded.thread.messages.len });
+        self.setSidebarNotice("Chat opened.");
+        runtime_log.trace("stored thread reopened project={d} messages={d}", .{ pi, loaded.thread.messages.len });
     }
 
     pub fn archiveThreadAtIndex(self: *AppState, project_index: usize, thread_index: usize) void {
@@ -14116,6 +14162,8 @@ pub const AppState = struct {
             break;
         }
         startShutdownWatchdog();
+        // Join linked-chat fetch workers before any owner they read from goes away.
+        self.linked_chats.deinit(self.allocator);
         // Flag the cursor loop first so an in-flight long-poll (bounded by
         // the 4s wait budget + 5s transport timeout) drains concurrently with
         // the shutdown work below; the blocking join happens further down,

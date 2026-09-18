@@ -192,7 +192,6 @@ pub fn initialSendStartFailureMessage(err: anyerror) []const u8 {
         error.RemoteAttachmentUnreadable => "An attached image could not be read from disk. Re-attach it, then send again; your draft was kept.",
         error.RemoteAttachmentUploadFailed => "Verde could not upload the attachments to the selected runtime. Check the connection, then try Send again; your draft and attachments were restored.",
         error.RuntimeServiceUnavailable => "The runtime connection service is unavailable, so this message could not be sent. Your draft and attachments were restored.",
-        error.RepositoryRouteAttachmentsUnsupported => "Repository-routed local chat does not support attachments yet. Remove them or switch the thread to Local; your draft was kept.",
         else => "Verde could not start this message. Your draft and attachments are still in the composer; try Send again.",
     };
 }
@@ -2958,6 +2957,13 @@ fn acceptanceWorkerMain(dispatch: *AcceptanceDispatch) void {
     const alloc = std.heap.page_allocator;
     const started_ms = monotonicMs();
     const outcome: AcceptanceOutcome = blk: {
+        if (dispatch.upload_images.len != 0) {
+            dispatch.params.repository.attachments = uploadLocalChatImages(dispatch.arena.allocator(), dispatch.pref_path, dispatch.upload_images) catch |err| {
+                // Staging failed before chat.turn.start: safe to restore the draft.
+                dispatch.err = err;
+                break :blk .rejected;
+            };
+        }
         const response = switch (dispatch.params) {
             .legacy_local => |params| daemon_client.requestAlloc(alloc, dispatch.pref_path, "chat.turn.start", params, 1),
             .repository => |params| daemon_client.requestAlloc(alloc, dispatch.pref_path, "chat.turn.start", params, 1),
@@ -2973,6 +2979,54 @@ fn acceptanceWorkerMain(dispatch: *AcceptanceDispatch) void {
     dispatch.rpc_elapsed_ms = monotonicMs() - started_ms;
     dispatch.outcome = outcome;
     dispatch.done.store(true, .release);
+}
+
+/// Stage repository-local images using the same opaque attachment contract
+/// as remote runtimes. Runs on the acceptance worker, never the render thread.
+pub fn uploadLocalChatImages(allocator: std.mem.Allocator, pref_path: []const u8, images: []const AcceptanceUploadImage) ![]const []const u8 {
+    var scratch: std.heap.ArenaAllocator = .init(allocator);
+    defer scratch.deinit();
+    const temp = scratch.allocator();
+    var ids: std.ArrayList([]const u8) = .empty;
+    const deadline = monotonicMs() + REMOTE_ATTACHMENT_UPLOAD_TIMEOUT_MS;
+    for (images) |image| {
+        const created = try daemon_client.requestAlloc(temp, pref_path, "chat.attachment.create", .{ .mime = image.mime, .byte_size = image.bytes.len }, 1);
+        const parsed = try std.json.parseFromSlice(std.json.Value, temp, created, .{});
+        const result = jsonRpcResult(parsed.value) catch return error.RemoteAttachmentUploadFailed;
+        if (result != .object) return error.RemoteAttachmentUploadFailed;
+        const id = switch (result.object.get("attachment_id") orelse .null) {
+            .string => |value| value,
+            else => return error.RemoteAttachmentUploadFailed,
+        };
+        if (!headless.attachment_protocol.isValidAttachmentId(id)) return error.RemoteAttachmentUploadFailed;
+        const max_chunk = jsonValueU64(result.object.get("max_chunk_bytes") orelse .null) orelse return error.RemoteAttachmentUploadFailed;
+        const chunk_bytes: usize = @intCast(@min(max_chunk, 64 * 1024));
+        if (chunk_bytes == 0) return error.RemoteAttachmentUploadFailed;
+        var offset: usize = 0;
+        while (offset < image.bytes.len) {
+            if (monotonicMs() > deadline) return error.RemoteAttachmentUploadFailed;
+            const bytes = image.bytes[offset..][0..@min(chunk_bytes, image.bytes.len - offset)];
+            const buffer = try temp.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
+            const encoded = std.base64.standard.Encoder.encode(buffer, bytes);
+            const appended = try daemon_client.requestAlloc(temp, pref_path, "chat.attachment.append", .{ .attachment_id = id, .offset = offset, .data = encoded }, 1);
+            ensureJsonRpcOk(temp, appended) catch return error.RemoteAttachmentUploadFailed;
+            offset += bytes.len;
+        }
+        const committed = try daemon_client.requestAlloc(temp, pref_path, "chat.attachment.commit", .{ .attachment_id = id }, 1);
+        ensureJsonRpcOk(temp, committed) catch return error.RemoteAttachmentUploadFailed;
+        try ids.append(temp, id);
+    }
+    const result = try allocator.alloc([]const u8, ids.items.len);
+    var count: usize = 0;
+    errdefer {
+        for (result[0..count]) |id| allocator.free(id);
+        allocator.free(result);
+    }
+    for (ids.items, result) |id, *owned| {
+        owned.* = try allocator.dupe(u8, id);
+        count += 1;
+    }
+    return result;
 }
 
 /// M4-P3 classification, unchanged from the synchronous path: a lost reply
@@ -3343,15 +3397,6 @@ pub fn dispatchDaemonAcceptance(
     const project = &self.project_controller.projects.items[project_index];
     const now_ms = unixTimestampMs();
 
-    switch (execution_route) {
-        .legacy_local, .remote => {},
-        // Repository-local routing has no staging surface yet; reject before
-        // any state mutates so the caller renders the visible failure row.
-        .repository_local => if (thread.draftImageCount() != 0) {
-            return error.RepositoryRouteAttachmentsUnsupported;
-        },
-    }
-
     const dispatch = try page_alloc.create(AcceptanceDispatch);
     errdefer page_alloc.destroy(dispatch);
     dispatch.* = .{
@@ -3401,6 +3446,12 @@ pub fn dispatchDaemonAcceptance(
         // Zero means the advertised request limit cannot carry any append
         // chunk: reject before arming instead of spinning a no-progress loop.
         if (dispatch.upload.chunk_bytes == 0) return error.RemoteAttachmentsUnsupported;
+    }
+
+    if (execution_route == .repository_local and thread.draftImageCount() != 0) {
+        if (thread.draftImageCount() > headless.attachment_protocol.MAX_ATTACHMENTS_PER_TURN)
+            return error.RemoteAttachmentTooMany;
+        dispatch.upload_images = try collectRemoteUploadImages(arena, thread, headless.attachment_protocol.MAX_PORTABLE_ATTACHMENT_BYTES);
     }
 
     const turn_id = try std.fmt.allocPrint(arena, "gui:{s}:{s}:{d}", .{ project.id, thread.local_thread_id, now_ms });
