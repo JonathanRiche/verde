@@ -17,6 +17,7 @@ pub const SUPPORTED_PROTOCOL_VERSIONS = [_][]const u8{
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
 pub const RequestContext = struct {
+    internal_task_watch: bool = false,
     protocol_version: []const u8,
     client_name: []const u8,
     owner: []const u8,
@@ -64,6 +65,7 @@ const State = struct {
     endpoint: endpoint_mod.Endpoint,
     pref_path: []u8,
     handler: Handler,
+    subscriptions: std.atomic.Value(u32) = .init(0),
     stopping: std.atomic.Value(bool) = .init(false),
     thread: std.Thread = undefined,
 };
@@ -277,6 +279,11 @@ fn handleRequest(state: *State, io: std.Io, request: *std.http.Server.Request) !
     const client_name = sanitizeClientName(&headers, &client_buffer);
     var owner_buffer: [96]u8 = undefined;
     const owner = try std.fmt.bufPrint(&owner_buffer, "mcp:http:{s}", .{client_name});
+    if (std.mem.eql(u8, method, "subscriptions/listen")) return taskSubscription(state, io, request, id_value, params, .{
+        .protocol_version = protocol_version,
+        .client_name = client_name,
+        .owner = owner,
+    });
     const response = state.handler(state.allocator, io, body, .{
         .protocol_version = protocol_version,
         .client_name = client_name,
@@ -290,6 +297,107 @@ fn handleRequest(state: *State, io: std.Io, request: *std.http.Server.Request) !
         return respondJson(request, .ok, std.mem.trimEnd(u8, bytes, "\r\n"), protocol_version);
     }
     return request.respond("", .{ .status = .accepted, .keep_alive = false });
+}
+
+fn taskCapability(params: std.json.Value) bool {
+    if (params != .object) return false;
+    const meta = params.object.get("_meta") orelse return false;
+    if (meta != .object) return false;
+    const caps = meta.object.get("io.modelcontextprotocol/clientCapabilities") orelse return false;
+    if (caps != .object) return false;
+    const extensions = caps.object.get("extensions") orelse return false;
+    return extensions == .object and extensions.object.contains("io.modelcontextprotocol/tasks");
+}
+
+fn writeSse(body: *std.http.BodyWriter, allocator: std.mem.Allocator, value: anytype) !void {
+    const encoded = try std.json.Stringify.valueAlloc(allocator, value, .{});
+    defer allocator.free(encoded);
+    try body.writer.print("event: message\ndata: {s}\n\n", .{encoded});
+    try body.writer.flush();
+    try body.flush();
+}
+
+/// The stream waits on daemon event signals. Reconnection snapshots every task,
+/// so completion between creation and subscription cannot be missed.
+fn taskSubscription(state: *State, io: std.Io, request: *std.http.Server.Request, id: std.json.Value, params: std.json.Value, context: RequestContext) !void {
+    if (!std.mem.eql(u8, context.protocol_version, MODERN_PROTOCOL_VERSION) or !taskCapability(params)) {
+        const encoded = try std.json.Stringify.valueAlloc(state.allocator, .{ .jsonrpc = "2.0", .id = id, .@"error" = .{
+            .code = @as(i32, -32021),
+            .message = "Missing required client capability",
+            .data = .{ .requiredCapabilities = .{ .extensions = .{ .@"io.modelcontextprotocol/tasks" = .{} } } },
+        } }, .{});
+        defer state.allocator.free(encoded);
+        return respondJson(request, .bad_request, encoded, MODERN_PROTOCOL_VERSION);
+    }
+    const notifications = if (params == .object) params.object.get("notifications") orelse .null else .null;
+    const ids = if (notifications == .object) notifications.object.get("taskIds") orelse .null else .null;
+    if (ids != .array or ids.array.items.len == 0 or ids.array.items.len > 64)
+        return respondJsonRpcError(request, .bad_request, id, -32602, "taskIds must contain 1 to 64 task ids");
+    for (ids.array.items) |value| if (value != .string) return respondJsonRpcError(request, .bad_request, id, -32602, "taskIds must be strings");
+    if (state.subscriptions.fetchAdd(1, .acq_rel) >= 32) {
+        _ = state.subscriptions.fetchSub(1, .release);
+        return respondJsonRpcError(request, .service_unavailable, id, -32000, "subscription capacity reached");
+    }
+    defer _ = state.subscriptions.fetchSub(1, .release);
+    var revisions: [64]i64 = @splat(-1);
+    var stream_context = context;
+    stream_context.internal_task_watch = true;
+    const first_request = try std.json.Stringify.valueAlloc(state.allocator, .{ .task_ids = ids, .wait_ms = 0 }, .{});
+    defer state.allocator.free(first_request);
+    const first = (try state.handler(state.allocator, io, first_request, stream_context)) orelse return error.InvalidResponse;
+    defer state.allocator.free(first);
+    var first_parsed = try std.json.parseFromSlice(std.json.Value, state.allocator, first, .{});
+    defer first_parsed.deinit();
+    if (first_parsed.value != .object or !first_parsed.value.object.contains("result"))
+        return respondJsonRpcError(request, .bad_request, id, -32602, "unknown or unavailable task");
+    var buffer: [4096]u8 = undefined;
+    var body = try request.respondStreaming(&buffer, .{ .respond_options = .{
+        .keep_alive = false,
+        .extra_headers = &.{ .{ .name = "content-type", .value = "text/event-stream" }, .{ .name = "cache-control", .value = "no-cache" }, .{ .name = "mcp-protocol-version", .value = MODERN_PROTOCOL_VERSION } },
+    } });
+    const subscription_meta = .{ .@"io.modelcontextprotocol/subscriptionId" = id };
+    try writeSse(&body, state.allocator, .{ .jsonrpc = "2.0", .method = "notifications/subscriptions/acknowledged", .params = .{ .notifications = .{ .taskIds = ids }, ._meta = subscription_meta } });
+    try writeTaskUpdates(&body, state.allocator, first_parsed.value, &revisions, id);
+    while (!state.stopping.load(.acquire)) {
+        const started = monotonicTimestampNs(io);
+        const watch = try std.json.Stringify.valueAlloc(state.allocator, .{ .task_ids = ids, .revisions = revisions[0..ids.array.items.len], .wait_ms = 25000 }, .{});
+        defer state.allocator.free(watch);
+        const reply = (try state.handler(state.allocator, io, watch, stream_context)) orelse return error.InvalidResponse;
+        defer state.allocator.free(reply);
+        var parsed = try std.json.parseFromSlice(std.json.Value, state.allocator, reply, .{});
+        defer parsed.deinit();
+        try writeTaskUpdates(&body, state.allocator, parsed.value, &revisions, id);
+        try body.writer.writeAll(": keep-alive\n\n");
+        try body.writer.flush();
+        try body.flush();
+        // A saturated daemon parking pool returns immediately; pace that
+        // exceptional path rather than spinning. Normal changes wake instantly.
+        if (elapsedMs(io, started) < 20) try io.sleep(.fromMilliseconds(50), .awake);
+    }
+    try writeSse(&body, state.allocator, .{ .jsonrpc = "2.0", .id = id, .result = .{ .resultType = "complete" } });
+    try body.end();
+}
+
+fn writeTaskUpdates(body: *std.http.BodyWriter, allocator: std.mem.Allocator, envelope: std.json.Value, revisions: *[64]i64, subscription: std.json.Value) !void {
+    if (envelope != .object) return error.InvalidResponse;
+    const result = envelope.object.get("result") orelse return error.InvalidResponse;
+    const tasks = result.object.get("tasks") orelse return error.InvalidResponse;
+    if (tasks != .array or tasks.array.items.len > 64) return error.InvalidResponse;
+    for (tasks.array.items, 0..) |entry, index| {
+        const revision = entry.object.get("revision").?.integer;
+        if (revisions[index] == revision) continue;
+        var arena_state: std.heap.ArenaAllocator = .init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var task = entry.object.get("task").?;
+        var fields = try task.object.clone(arena);
+        var meta: std.json.ObjectMap = .empty;
+        try meta.put(arena, "io.modelcontextprotocol/subscriptionId", subscription);
+        try fields.put(arena, "_meta", .{ .object = meta });
+        task = .{ .object = fields };
+        try writeSse(body, allocator, .{ .jsonrpc = "2.0", .method = "notifications/tasks", .params = task });
+        revisions[index] = revision;
+    }
 }
 
 fn recordHttpFailure(
@@ -435,6 +543,7 @@ fn validateModernHeaders(headers: *const RequestHeaders, method: []const u8, par
 }
 
 fn requestName(method: []const u8, params: std.json.Value) ?[]const u8 {
+    if (std.mem.startsWith(u8, method, "tasks/") and params == .object) return jsonString(params.object.get("taskId") orelse .null);
     const named = std.mem.eql(u8, method, "tools/call") or
         std.mem.eql(u8, method, "resources/read") or
         std.mem.eql(u8, method, "prompts/get");

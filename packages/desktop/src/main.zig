@@ -628,7 +628,8 @@ fn mainInner(init: std.process.Init) !void {
             fn run(app_state: *AppState, changed: *bool) void {
                 const send_changed = app_state.pollSend();
                 const slash_changed = app_state.pollSlashCommand();
-                changed.* = send_changed or slash_changed;
+                const linked_changed = app_state.pollLinkedChats();
+                changed.* = send_changed or slash_changed or linked_changed;
             }
         }.run, .{ &state, &send_needs_render });
         var background_tasks_need_render = false;
@@ -902,6 +903,7 @@ fn syncMouseCursor(state: *AppState, cache: *SystemCursorCache) void {
             chat_panel_ui.workspaceHeaderWantsPointerAt(state, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) or
             chat_panel_ui.approvalActionWantsPointerAt(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) or
             chat_panel_ui.backgroundTaskPinWantsPointerAt(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) or
+            chat_panel_ui.linkedChatsWantsPointerAt(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) or
             chat_panel_ui.transcriptActionWantsPointerAt(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) or
             chat_panel_ui.transcriptLinkWantsPointerAt(state, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y)))
     {
@@ -2393,6 +2395,12 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
+            // The linked-chats drawer sits inside the parent pane beside the
+            // transcript, so it claims its rows before pane/transcript routing.
+            if (event.button.button == 1 and chat_panel_ui.handleLinkedChatsMouseButton(state, event.button.x, event.button.y, event.button.down)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             // Pane chrome overlays native browser and terminal content, so its
             // precise hits must be handled before either content surface.
             if (workspace_panes_ui.handlePaneChromeMouseButton(state, event.button.x, event.button.y, event.button.button, event.button.down)) {
@@ -2556,6 +2564,9 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             if (terminal_panel_ui.handlePaletteWheel(state, event.wheel.mouse_x, event.wheel.mouse_y, event.wheel.y)) {
+                return true;
+            }
+            if (chat_panel_ui.handleLinkedChatsWheel(state, event.wheel.mouse_x, event.wheel.mouse_y, event.wheel.y)) {
                 return true;
             }
             if (chat_panel_ui.handleTranscriptPaletteWheel(state, event.wheel.mouse_x, event.wheel.mouse_y, event.wheel.y)) {

@@ -218,6 +218,9 @@ pub fn requiredScopeMaskForRpc(method: []const u8) ?u16 {
     if (std.mem.eql(u8, method, "chat.thread.get") or
         std.mem.eql(u8, method, "chat.thread.list") or
         std.mem.eql(u8, method, "chat.message.list") or
+        std.mem.eql(u8, method, "chat.links.list") or
+        std.mem.eql(u8, method, "chat.tasks.get") or
+        std.mem.eql(u8, method, "chat.tasks.watch") or
         std.mem.eql(u8, method, "chat.turn.list") or
         std.mem.eql(u8, method, "chat.turn.tail")) return scopeBit(.chat_read);
 
@@ -225,7 +228,10 @@ pub fn requiredScopeMaskForRpc(method: []const u8) ?u16 {
     // that will claim them. Named through the protocol constants so the
     // advertised chat.attachments.v1 capability and this allowlist cannot
     // drift apart silently (see the protocol.zig reachability test).
-    if (std.mem.eql(u8, method, "chat.turn.start") or
+    if (std.mem.eql(u8, method, "chat.links.create") or
+        std.mem.eql(u8, method, "chat.links.clear") or
+        std.mem.eql(u8, method, "chat.tasks.blocked") or
+        std.mem.eql(u8, method, "chat.turn.start") or
         std.mem.eql(u8, method, attachment_protocol.METHOD_CHAT_ATTACHMENT_CREATE) or
         std.mem.eql(u8, method, attachment_protocol.METHOD_CHAT_ATTACHMENT_APPEND) or
         std.mem.eql(u8, method, attachment_protocol.METHOD_CHAT_ATTACHMENT_COMMIT) or

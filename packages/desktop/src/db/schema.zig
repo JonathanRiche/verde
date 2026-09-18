@@ -6,7 +6,7 @@ const zqlite = @import("zqlite");
 /// Latest schema version understood by this build.
 pub const CURRENT_VERSION: i64 = 1;
 /// Maximum schema version understood by read-only clients and the daemon store.
-pub const MAX_SUPPORTED_VERSION: i64 = 13;
+pub const MAX_SUPPORTED_VERSION: i64 = 14;
 /// SQLite busy timeout shared by writer and read-only connections.
 pub const BUSY_TIMEOUT_MS = 5000;
 
@@ -307,6 +307,12 @@ fn migrateToVersionInternal(
                 if (failure_point == .before_version_bump) return error.TestMigrationFailure;
                 try conn.execNoArgs("pragma user_version = 13");
                 version = 13;
+            },
+            13 => {
+                try conn.execNoArgs(@import("chat_links_schema.zig").SCHEMA_SQL);
+                if (failure_point == .before_version_bump) return error.TestMigrationFailure;
+                try conn.execNoArgs("pragma user_version = 14");
+                version = 14;
             },
             else => return error.DatabaseSchemaInvalid,
         }
