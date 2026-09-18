@@ -12,6 +12,10 @@ pub const Controller = struct {
     queue: browser_queue.EventQueue = .{},
     visible: bool = false,
     current_url: ?[]u8 = null,
+    show_requests: usize = 0,
+    hide_requests: usize = 0,
+    focus_requests: usize = 0,
+    blur_requests: usize = 0,
 
     /// Initializes the temporary browser backend.
     pub fn init(allocator: std.mem.Allocator) !Controller {
@@ -95,6 +99,7 @@ pub const Controller = struct {
 
     /// Marks the browser as visible and emits the corresponding lifecycle event.
     pub fn show(self: *Controller) !void {
+        self.show_requests += 1;
         if (self.visible) return;
         self.visible = true;
         try self.queue.push(self.allocator, .opened);
@@ -102,6 +107,7 @@ pub const Controller = struct {
 
     /// Marks the browser as hidden and emits the corresponding lifecycle event.
     pub fn hide(self: *Controller) !void {
+        self.hide_requests += 1;
         if (!self.visible) return;
         self.visible = false;
         try self.queue.push(self.allocator, .closed);
@@ -125,6 +131,7 @@ pub const Controller = struct {
         try self.queue.push(self.allocator, .{
             .navigated = try self.allocator.dupe(u8, url),
         });
+        try self.queue.push(self.allocator, .document_loaded);
     }
 
     /// Emits a placeholder eval result so the JS response path can be wired now.
@@ -171,12 +178,12 @@ pub const Controller = struct {
 
     /// Stub focus is accepted but has no platform surface to update.
     pub fn focus(self: *Controller) !void {
-        _ = self;
+        self.focus_requests += 1;
     }
 
     /// Stub blur is accepted but has no platform surface to update.
     pub fn blur(self: *Controller) !void {
-        _ = self;
+        self.blur_requests += 1;
     }
 
     /// Reports that pointer input is not implemented by the stub backend.

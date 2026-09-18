@@ -6,6 +6,8 @@ const app_config = @import("../app/config.zig");
 const app_state = @import("../state.zig");
 const state_storage = @import("../state/storage.zig");
 const browser_runtime = @import("../browser/mod.zig");
+const browser_runtime_access = @import("../state/browser_runtime_access.zig");
+const browser_state_controller = @import("../state/browser_controller.zig");
 const browser_ui = @import("../ui/browser.zig");
 const command_palette = @import("../ui/command_palette.zig");
 const sidebar_ui = @import("../ui/sidebar.zig");
@@ -322,6 +324,9 @@ fn writeBrowserStatus(s: *std.json.Stringify, state: *app_state.AppState) !void 
     try s.write(browser.statusLabel());
     try s.objectField("visible");
     try s.write(state.isBrowserRuntimeActive());
+    try s.objectField("presentation");
+    try s.write(if (state.isBrowserVisible() and !state.isBrowserSurfaceSuspendedForLayout() and
+        !state.isBrowserSurfaceSuspendedForPaletteOverlay() and !state.isBrowserSurfaceSuspendedForEmptyState()) "visible" else "background");
     try s.objectField("suspended");
     try s.write(state.isBrowserSurfaceSuspendedForLayout() or state.isBrowserSurfaceSuspendedForPaletteOverlay() or state.isBrowserSurfaceSuspendedForEmptyState());
     try s.objectField("workspace_index");
@@ -1403,17 +1408,51 @@ fn chatPresentResultResponse(allocator: std.mem.Allocator, id_value: std.json.Va
 }
 
 fn browserCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value, command: []const u8) ![]u8 {
+    const project_index = if (std.mem.eql(u8, command, "open"))
+        resolveProjectIndex(state, params)
+    else
+        browserCommandProjectIndex(state, params);
+    if (project_index) |index| {
+        if (index != state.project_controller.selected_index and !backgroundBrowserCommandAllowed(command)) {
+            return try errorResponseAlloc(allocator, id_value, "rejected", "browser presentation commands require the selected workspace");
+        }
+        var access = try browser_runtime_access.Scope(@TypeOf(state.browser_controller)).begin(state, index);
+        defer access.end(state);
+        defer if (!std.mem.eql(u8, command, "status")) browser_state_controller.finishBackgroundBrowserAccess(state);
+        const notice = state.sidebar_notice_storage;
+        const notice_time = state.sidebar_notice_set_at_ms;
+        defer if (access.saved != null) {
+            state.sidebar_notice_storage = notice;
+            state.sidebar_notice_set_at_ms = notice_time;
+        };
+        return try browserCommandResponseInScope(allocator, id_value, state, params, command);
+    }
+    return try browserCommandResponseInScope(allocator, id_value, state, params, command);
+}
+
+fn backgroundBrowserCommandAllowed(command: []const u8) bool {
+    const commands = [_][]const u8{
+        "status", "open",     "close",      "restart",     "reset",       "navigate",  "back", "forward", "reload",
+        "eval",   "postJson", "screenshot", "pointerDown", "pointerMove", "pointerUp",
+    };
+    for (commands) |allowed| if (std.mem.eql(u8, command, allowed)) return true;
+    return false;
+}
+
+fn browserCommandResponseInScope(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value, command: []const u8) ![]u8 {
     if (std.mem.eql(u8, command, "status")) {
         if (browserCommandHasProjectRef(params)) {
             const project_index = browserCommandProjectIndex(state, params) orelse
                 return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
             if (state.browserPaneIdInWorkspace(project_index) == null)
                 return try errorResponseAlloc(allocator, id_value, "rejected", "browser pane is not open in workspace");
-            _ = state.activateBrowserInWorkspace(project_index) catch |err| switch (err) {
-                error.BrowserDisabled => return try errorResponseAlloc(allocator, id_value, "unsupported", "browser runtime is disabled"),
-                error.BrowserNotVisible => return try errorResponseAlloc(allocator, id_value, "rejected", "browser pane is not open in workspace"),
-                else => return try errorResponseAlloc(allocator, id_value, "rejected", @errorName(err)),
-            };
+            // Status must not navigate, show a surface, or dirty persisted layout.
+            if (state.browser_controller.runtime_pane_id == null and !state.browser_controller.runtime.controller.hasBackend()) {
+                const pane_id = state.browserPaneIdInWorkspace(project_index).?;
+                state.browser_controller.runtime_project_index = project_index;
+                state.browser_controller.runtime_pane_id = pane_id;
+                state.applyBrowserPaneSnapshotToRuntime(project_index, pane_id);
+            }
         }
         return try browserStatusResponse(allocator, id_value, state);
     }

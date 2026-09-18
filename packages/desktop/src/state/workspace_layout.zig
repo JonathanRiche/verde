@@ -789,6 +789,19 @@ pub const WorkspaceLayout = struct {
         return pane_id;
     }
 
+    /// Creates an automation browser without changing the workspace's selected pane or zoom.
+    pub fn ensureBrowserPanePreservingFocus(self: *WorkspaceLayout, allocator: std.mem.Allocator) !WorkspacePaneId {
+        const focused = self.focused_pane_id;
+        const maximized = self.maximized_pane_id;
+        const revealed = self.scroll_revealed_pane_id;
+        defer {
+            self.focused_pane_id = focused;
+            self.maximized_pane_id = maximized;
+            self.scroll_revealed_pane_id = revealed;
+        }
+        return self.ensureBrowserPane(allocator);
+    }
+
     pub fn ensureBrowserPane(self: *WorkspaceLayout, allocator: std.mem.Allocator) !WorkspacePaneId {
         for (self.panes.items) |*pane| {
             switch (pane.ref) {
@@ -2399,4 +2412,22 @@ test "workspace chat scroll shift rebases saved offsets without breaking tail-fo
     layout.shiftChatTranscriptScrollForThread(2, -9_000.0);
     try std.testing.expectEqual(@as(f32, 0.0), layout.paneById(second_pane_id).?.ref.chat.transcript_scroll_y);
     try std.testing.expect(layout.paneById(second_pane_id).?.ref.chat.transcript_scroll_valid);
+}
+
+test "background browser creation and reuse preserve pane selection and zoom" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+    const focused = layout.focused_pane_id;
+    layout.maximized_pane_id = focused;
+    layout.scroll_revealed_pane_id = focused;
+    const browser = try layout.ensureBrowserPanePreservingFocus(allocator);
+    try std.testing.expectEqual(focused, layout.focused_pane_id);
+    try std.testing.expectEqual(focused, layout.maximized_pane_id);
+    try std.testing.expectEqual(focused, layout.scroll_revealed_pane_id);
+    try std.testing.expectEqual(browser, try layout.ensureBrowserPanePreservingFocus(allocator));
+    try std.testing.expectEqual(focused, layout.focused_pane_id);
+    try std.testing.expectEqual(focused, layout.maximized_pane_id);
+    try std.testing.expectEqual(focused, layout.scroll_revealed_pane_id);
+    try std.testing.expect(layout.paneById(browser).?.ref == .browser);
 }

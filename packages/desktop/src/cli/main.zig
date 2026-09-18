@@ -4,6 +4,7 @@ const build_options = @import("build_options");
 const headless = @import("headless");
 
 const args = @import("args.zig");
+const browser_arguments = @import("browser_arguments.zig");
 const completion = @import("completion.zig");
 const output = @import("output.zig");
 const runtime_profiles_cli = @import("runtime_profiles.zig");
@@ -4456,7 +4457,7 @@ fn mcpDefaultWorkspace(workspace_id: ?[]const u8, workspace_path: ?[]const u8, c
     return workspace_id orelse workspace_path orelse cwd;
 }
 
-const MCP_INSTRUCTIONS = "Use explicit workspace and stable process/session ids when available. Read-only list, inspect, status, check, read, and tail tools are safe to call without confirmation. Acquire a lease before exclusive builds, dependency changes, database work, shared browser automation, or long-running shared commands; release it when finished.";
+const MCP_INSTRUCTIONS = "Use explicit workspace and stable process/session ids when available. Read-only list, inspect, status, check, read, and tail tools are safe to call without confirmation. Acquire a lease before exclusive builds, dependency changes, database work, shared browser automation, or long-running shared commands; release it when finished. Preserve the user's desktop focus. Browser tools operate on the addressed workspace without selecting its tab; never switch tabs or focus panes to inspect, interact with, or capture a browser page.";
 
 fn mcpInitialize(
     allocator: std.mem.Allocator,
@@ -4541,18 +4542,12 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
     try writeMcpTypedTool(&s, "list_panes", "List chat and terminal panes in a Verde workspace, grouped into workspace tabs (a split tile is one tab).", &.{
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current; defaults to the desktop-selected workspace." },
     });
-    try writeMcpTypedTool(&s, "select_workspace_tab", "Activate a workspace tab in the desktop tab strip and focus its remembered pane. Address it by tab_id, strip index, or any member pane_id as reported by list_panes.", &.{
-        .{ .name = "tab_id", .type_name = "integer", .description = "Stable tab id from list_panes." },
-        .{ .name = "index", .type_name = "integer", .description = "Zero-based position in the tab strip." },
-        .{ .name = "pane_id", .type_name = "integer", .description = "Any pane belonging to the tab." },
-        .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current; defaults to the desktop-selected workspace." },
-    });
     try writeMcpTypedTool(&s, "add_workspace_tab", "Open a new workspace tab in the background without changing the selected workspace or pane. Omit kind to follow the user's ui.workspace_new_tab_pane preference (GUI chat unless configured otherwise).", &.{
         .{ .name = "kind", .type_name = "string", .description = "chat or terminal; omit to use the user's configured default." },
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current; defaults to the desktop-selected workspace." },
     });
     try writeMcpTypedTool(&s, "open_chat", "Create a durable chat thread in an explicitly selected Verde workspace and return its stable ids. The workspace row must already exist in the session daemon store (the desktop dual-write creates it; open_chat never creates workspaces). With the desktop GUI running the thread is also presented as a native chat pane without changing focus; with no GUI it is created daemon-direct.", &OPEN_CHAT_MCP_INPUTS);
-    try writeMcpTypedTool(&s, "present_chat", "Present an existing durable chat thread in the desktop GUI. Use this to recover a headless or deferred open_chat result.", &CHAT_PRESENT_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "present_chat", "Present an existing durable chat thread in the desktop GUI without changing focus. Use this to recover a headless or deferred open_chat result.", &CHAT_PRESENT_MCP_INPUTS);
     try writeMcpTypedTool(&s, "set_chat_draft", "Stage or append a composer draft without sending it. Address either a live pane_id or a durable local_thread_id.", &CHAT_DRAFT_SET_MCP_INPUTS);
     try writeMcpTypedTool(&s, "get_chat_draft", "Read a staged composer draft without sending it. Address either a live pane_id or a durable local_thread_id.", &CHAT_DRAFT_GET_MCP_INPUTS);
     try writeMcpTypedTool(&s, "report_chat_blocked", "Report a concrete blocker to the orchestrating parent, then yield. A follow-up chat turn resumes work. Use your current Verde turn_id.", &.{
@@ -4634,14 +4629,14 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
         .{ .name = "url", .type_name = "string", .description = "URL to navigate to.", .required = true },
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, or path; defaults to the agent's workspace." },
     });
-    try writeMcpTypedTool(&s, "restart_browser", "Recreate the shared browser backend with this workspace's current URL.", &.{
+    try writeMcpTypedTool(&s, "restart_browser", "Recreate the shared browser backend with this workspace's current URL and wait boundedly for document readiness.", &.{
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, or path; defaults to the agent's workspace." },
     });
-    try writeMcpTypedTool(&s, "reset_browser", "Reset this workspace's browser to a fresh blank document.", &.{
+    try writeMcpTypedTool(&s, "reset_browser", "Reset this workspace's browser to a fresh blank document and wait boundedly for document readiness.", &.{
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, or path; defaults to the agent's workspace." },
     });
     try writeMcpTypedTool(&s, "evaluate_browser_js", "Evaluate JavaScript in the embedded browser and return a structured result or serialized exception.", &.{
-        .{ .name = "script", .type_name = "string", .description = "JavaScript function body; return the value to serialize.", .required = true },
+        .{ .name = "script", .type_name = "string", .description = "JavaScript function body, not an expression. Use an outer return, e.g. return {url: location.href}; or return (() => { return document.title; })();. Without it the result is null with a warning.", .required = true },
         .{ .name = "timeout_ms", .type_name = "integer", .description = "Execution timeout in milliseconds; browser readiness has a separate 30000 ms allowance. Defaults to 30000 and is capped at 60000." },
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, or path; defaults to the agent's workspace." },
     });
@@ -4656,18 +4651,26 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
         .{ .name = "super", .type_name = "boolean", .description = "Hold Super/Command." },
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, or path; defaults to the agent's workspace." },
     });
-    try writeMcpTypedTool(&s, "inspect_browser_page", "Read visible page text and interactive elements with reusable CSS selectors.", &.{
+    try writeMcpTypedTool(&s, "inspect_browser_page", "Read visible page text and interactive elements with snapshot-scoped refs and CSS selectors. Role/name/label are top-document DOM approximations, not a full accessibility tree. A new inspection invalidates prior refs.", &.{
         .{ .name = "max_elements", .type_name = "integer", .description = "Maximum interactive elements to return; defaults to 100." },
         .{ .name = "text_limit", .type_name = "integer", .description = "Maximum visible-text characters to return; defaults to 12000." },
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, or path; defaults to the agent's workspace." },
     });
-    try writeMcpTypedTool(&s, "click_browser_element", "Click by CSS selector. Sensitive actions require confirmed=true after user confirmation.", &.{
-        .{ .name = "selector", .type_name = "string", .description = "CSS selector for the element to click.", .required = true },
+    try writeMcpTypedTool(&s, "click_browser_element", "Click using exactly one selector, ref, role (with optional name), or label. Semantic matches must be unique. Sensitive actions require confirmed=true after user confirmation.", &.{
+        .{ .name = "selector", .type_name = "string", .description = "CSS selector; preserves first-match behavior. Supply exactly one targeting mode." },
+        .{ .name = "ref", .type_name = "string", .description = "Opaque ref from the latest inspection of this document; stale refs fail without fallback." },
+        .{ .name = "role", .type_name = "string", .description = "Exact DOM-derived role, optionally narrowed by name." },
+        .{ .name = "name", .type_name = "string", .description = "Exact whitespace-normalized accessible name; only valid with role." },
+        .{ .name = "label", .type_name = "string", .description = "Exact whitespace-normalized associated label or aria-label." },
         .{ .name = "confirmed", .type_name = "boolean", .description = "True only after the user confirms a sensitive action." },
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, or path; defaults to the agent's workspace." },
     });
-    try writeMcpTypedTool(&s, "type_browser_text", "Replace text by CSS selector. Password fields and form submission require confirmed=true after user confirmation.", &.{
-        .{ .name = "selector", .type_name = "string", .description = "CSS selector for the input or editable element.", .required = true },
+    try writeMcpTypedTool(&s, "type_browser_text", "Replace text using exactly one selector, ref, role (with optional name), or label. Semantic matches must be unique. Password fields and form submission require confirmed=true after user confirmation.", &.{
+        .{ .name = "selector", .type_name = "string", .description = "CSS selector; preserves first-match behavior. Supply exactly one targeting mode." },
+        .{ .name = "ref", .type_name = "string", .description = "Opaque ref from the latest inspection of this document; stale refs fail without fallback." },
+        .{ .name = "role", .type_name = "string", .description = "Exact DOM-derived role, optionally narrowed by name." },
+        .{ .name = "name", .type_name = "string", .description = "Exact whitespace-normalized accessible name; only valid with role." },
+        .{ .name = "label", .type_name = "string", .description = "Exact whitespace-normalized associated label or aria-label." },
         .{ .name = "text", .type_name = "string", .description = "Replacement text to enter.", .required = true },
         .{ .name = "submit", .type_name = "boolean", .description = "Submit the containing form after typing." },
         .{ .name = "confirmed", .type_name = "boolean", .description = "True only after the user confirms password entry or submission." },
@@ -4809,7 +4812,6 @@ const CHAT_PRESENT_MCP_INPUTS = [_]McpToolInput{
     .{ .name = "local_thread_id", .type_name = "string", .description = "Stable existing thread id.", .required = true },
     .{ .name = "target_pane_id", .type_name = "integer", .description = "Optional pane beside which to place the chat." },
     .{ .name = "axis", .type_name = "string", .enum_values = &.{ "horizontal", "vertical" }, .description = "Optional split axis; defaults to horizontal." },
-    .{ .name = "focus", .type_name = "boolean", .description = "Focus the presented chat; defaults to false." },
 };
 
 const CHAT_DRAFT_SET_MCP_INPUTS = [_]McpToolInput{
@@ -4934,6 +4936,17 @@ fn writeMcpTypedTool(s: *std.json.Stringify, name: []const u8, description: []co
         try s.write(input.description);
         try s.endObject();
     }
+    if (browser_arguments.fields(name) != null) {
+        inline for (.{ "workspace_id", "project" }) |alias| {
+            try s.objectField(alias);
+            try s.beginObject();
+            try s.objectField("type");
+            try s.write("string");
+            try s.objectField("description");
+            try s.write("Alias for workspace. Supply one workspace selector; differing aliases are rejected.");
+            try s.endObject();
+        }
+    }
     try s.endObject();
     try s.objectField("required");
     try s.beginArray();
@@ -4985,9 +4998,14 @@ fn mcpToolsCall(
     const tool_name = jsonString(params.object.get("name") orelse .null) orelse
         return try mcpError(allocator, out, id_value, -32602, "tools/call requires name");
     const arguments = params.object.get("arguments") orelse .null;
-    const workspace = mcpArgString(arguments, "workspace") orelse
-        mcpArgString(arguments, "project") orelse
-        default_workspace;
+    const workspace = if (browser_arguments.fields(tool_name)) |allowed|
+        browser_arguments.workspace(arguments, allowed, default_workspace) catch |err| {
+            const message = try std.fmt.allocPrint(allocator, "{s}: browser tools accept workspace or workspace_id (matching aliases only). Supply an explicit workspace when no agent workspace is configured. Use script, not code, with an outer return for JavaScript results; unknown arguments are rejected.", .{@errorName(err)});
+            defer allocator.free(message);
+            return try mcpError(allocator, out, id_value, -32602, message);
+        }
+    else
+        mcpArgString(arguments, "workspace") orelse mcpArgString(arguments, "project") orelse default_workspace;
     const process_name = mcpArgString(arguments, "name");
     const coordination_owner: ?[]const u8 = mcpArgString(arguments, "owner") orelse default_owner;
     const session_id = mcpArgString(arguments, "session_id") orelse mcpArgString(arguments, "session");
@@ -5010,9 +5028,9 @@ fn mcpToolsCall(
         return try mcpToolLiveTextResult(allocator, out, id_value, response, tool_name);
     }
     if (std.mem.eql(u8, tool_name, "click_browser_element")) {
-        const selector = mcpArgString(arguments, "selector") orelse
-            return try mcpError(allocator, out, id_value, -32602, "click_browser_element requires selector");
-        const script = try mcpBrowserClickScriptAlloc(allocator, selector, mcpArgBool(arguments, "confirmed") orelse false);
+        const target = mcpBrowserTarget(arguments) catch
+            return try mcpError(allocator, out, id_value, -32602, "Supply exactly one nonempty selector, ref, role (with optional string name), or label");
+        const script = try mcpBrowserClickScriptAlloc(allocator, target, mcpArgBool(arguments, "confirmed") orelse false);
         defer allocator.free(script);
         const response = mcpBrowserEvalAndWaitAlloc(allocator, io, workspace, script, MCP_BROWSER_ACTION_TIMEOUT_MS, .synchronous) catch |err|
             return try mcpLiveCallError(allocator, out, id_value, tool_name, err);
@@ -5020,13 +5038,13 @@ fn mcpToolsCall(
         return try mcpToolLiveTextResult(allocator, out, id_value, response, tool_name);
     }
     if (std.mem.eql(u8, tool_name, "type_browser_text")) {
-        const selector = mcpArgString(arguments, "selector") orelse
-            return try mcpError(allocator, out, id_value, -32602, "type_browser_text requires selector");
+        const target = mcpBrowserTarget(arguments) catch
+            return try mcpError(allocator, out, id_value, -32602, "Supply exactly one nonempty selector, ref, role (with optional string name), or label");
         const input_text = mcpArgString(arguments, "text") orelse
             return try mcpError(allocator, out, id_value, -32602, "type_browser_text requires text");
         const script = try mcpBrowserTypeScriptAlloc(
             allocator,
-            selector,
+            target,
             input_text,
             mcpArgBool(arguments, "submit") orelse false,
             mcpArgBool(arguments, "confirmed") orelse false,
@@ -5266,10 +5284,6 @@ fn mcpToolsCall(
         if (mcpArgIsNonNull(arguments, "axis") and axis == null) {
             return try mcpError(allocator, out, id_value, -32602, "present_chat axis must be a string");
         }
-        const focus = mcpArgBool(arguments, "focus");
-        if (mcpArgIsNonNull(arguments, "focus") and focus == null) {
-            return try mcpError(allocator, out, id_value, -32602, "present_chat focus must be a boolean");
-        }
 
         const thread_response = chatDaemonCallEnvelopeAlloc(allocator, io, headless.store.METHOD_CHAT_THREAD_GET, .{
             .workspace_id = workspace_id,
@@ -5298,7 +5312,7 @@ fn mcpToolsCall(
                 .store_revision = store_revision,
                 .target_pane_id = target_pane_id,
                 .axis = axis orelse "horizontal",
-                .focus = focus orelse false,
+                .focus = false,
             }, 1, presentationTransportTimeoutMs(remaining_ms)) catch {
                 presentation_ambiguous = true;
                 sleepChatPresentationRetry(io, presentation_deadline_ms);
@@ -5457,17 +5471,8 @@ fn mcpToolsCall(
             break :blk sendLiveRequestAlloc(allocator, io, "panes", .{ .workspace = workspace }, 1);
         }
         if (std.mem.eql(u8, tool_name, "select_workspace_tab")) {
-            const tab_id = mcpArgU32(arguments, "tab_id") orelse mcpArgU32(arguments, "tab");
-            const index = mcpArgU32(arguments, "index");
-            if (tab_id == null and index == null and pane_id == null) {
-                return try mcpError(allocator, out, id_value, -32602, "select_workspace_tab requires tab_id, index, or pane_id");
-            }
-            break :blk sendLiveRequestAlloc(allocator, io, "tab.select", .{
-                .workspace = workspace,
-                .tab = tab_id,
-                .index = index,
-                .pane = pane_id,
-            }, 1);
+            // Older clients can retain a cached tool list after upgrading.
+            return try mcpError(allocator, out, id_value, -32602, "MCP cannot change desktop focus. Use workspace-addressed browser tools directly; screenshots and page actions do not require selecting a tab.");
         }
         if (std.mem.eql(u8, tool_name, "add_workspace_tab")) {
             break :blk sendLiveRequestAlloc(allocator, io, "tab.add", .{
@@ -5510,10 +5515,22 @@ fn mcpToolsCall(
             break :blk browser_response;
         }
         if (std.mem.eql(u8, tool_name, "restart_browser")) {
-            break :blk sendLiveRequestAlloc(allocator, io, "browser.restart", .{ .workspace = workspace }, 1);
+            const browser_response = try sendLiveRequestAlloc(allocator, io, "browser.restart", .{ .workspace = workspace }, 1);
+            errdefer allocator.free(browser_response);
+            if (liveResponseOk(allocator, browser_response)) {
+                const deadline_ms = daemon_client.monotonicNowMs() +| @as(i64, @intCast(MCP_BROWSER_ACTION_TIMEOUT_MS));
+                try mcpBrowserWaitForLifecycle(allocator, io, workspace, deadline_ms);
+            }
+            break :blk browser_response;
         }
         if (std.mem.eql(u8, tool_name, "reset_browser")) {
-            break :blk sendLiveRequestAlloc(allocator, io, "browser.reset", .{ .workspace = workspace }, 1);
+            const browser_response = try sendLiveRequestAlloc(allocator, io, "browser.reset", .{ .workspace = workspace }, 1);
+            errdefer allocator.free(browser_response);
+            if (liveResponseOk(allocator, browser_response)) {
+                const deadline_ms = daemon_client.monotonicNowMs() +| @as(i64, @intCast(MCP_BROWSER_ACTION_TIMEOUT_MS));
+                try mcpBrowserWaitForLifecycle(allocator, io, workspace, deadline_ms);
+            }
+            break :blk browser_response;
         }
         if (std.mem.eql(u8, tool_name, "list_surfaces")) {
             break :blk sendLiveRequestAlloc(allocator, io, "surfaces", .{}, 1);
@@ -6871,6 +6888,7 @@ fn mcpBrowserProbeNavigationReadiness(
     workspace: ?[]const u8,
     target_url: []const u8,
     previous_url: ?[]const u8,
+    deadline_ms: i64,
 ) !McpBrowserNavigationReadiness {
     const nonce = try std.fmt.allocPrint(allocator, "{d}-{d}", .{
         platform_runtime.processId(),
@@ -6892,17 +6910,17 @@ fn mcpBrowserProbeNavigationReadiness(
     defer allocator.free(accepted);
     if (!liveResponseOk(allocator, accepted)) return .passthrough;
 
-    const status = try sendLiveRequestAlloc(allocator, io, "browser.status", .{ .workspace = workspace }, 1);
-    defer allocator.free(status);
-    const action = try mcpBrowserActionResultAlloc(allocator, status, nonce);
-    const response = action orelse return .wait;
-    defer allocator.free(response);
-    return mcpBrowserNavigationReadinessFromAction(
-        allocator,
-        response,
-        target_url,
-        previous_url,
-    );
+    while (confirmationRemainingMs(deadline_ms)) |remaining_ms| {
+        const status = try sendLiveRequestAlloc(allocator, io, "browser.status", .{ .workspace = workspace }, 1);
+        defer allocator.free(status);
+        if (!liveResponseOk(allocator, status)) return .passthrough;
+        if (try mcpBrowserActionResultAlloc(allocator, status, nonce)) |response| {
+            defer allocator.free(response);
+            return mcpBrowserNavigationReadinessFromAction(allocator, response, target_url, previous_url);
+        }
+        try std.Io.sleep(io, .fromMilliseconds(@min(remaining_ms, MCP_BROWSER_POLL_INTERVAL_MS)), .awake);
+    }
+    return error.BrowserActionTimeout;
 }
 
 fn mcpBrowserWaitForNavigation(
@@ -6940,6 +6958,7 @@ fn mcpBrowserWaitForNavigation(
                         workspace,
                         target_url,
                         previous_url,
+                        deadline_ms,
                     )) {
                         .target, .stable_other => return,
                         .wait => stable_since_ms = null,
@@ -6952,6 +6971,41 @@ fn mcpBrowserWaitForNavigation(
         const sleep_ms: u32 = @intCast(@min(remaining_ms, @as(i64, MCP_BROWSER_POLL_INTERVAL_MS)));
         try std.Io.sleep(io, .fromMilliseconds(sleep_ms), .awake);
     }
+}
+
+// Lifecycle acknowledgements only mean the replacement was requested. Wait for
+// a settled runtime and a matching in-document readyState probe, without calling
+// the action evaluator (which itself waits for readiness).
+fn mcpBrowserWaitForLifecycle(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    workspace: ?[]const u8,
+    deadline_ms: i64,
+) !void {
+    var stable_since_ms: ?i64 = null;
+    while (confirmationRemainingMs(deadline_ms)) |remaining_ms| {
+        const status = try sendLiveRequestAlloc(allocator, io, "browser.status", .{ .workspace = workspace }, 1);
+        defer allocator.free(status);
+        switch (mcpBrowserReadinessFromStatus(allocator, status)) {
+            .passthrough => return error.BrowserUnavailable,
+            .wait => stable_since_ms = null,
+            .ready => {
+                const now_ms = daemon_client.monotonicNowMs();
+                if (stable_since_ms == null) stable_since_ms = now_ms;
+                if (now_ms - stable_since_ms.? >= MCP_BROWSER_NAVIGATION_SETTLE_MS) {
+                    const url = try mcpBrowserResponseUrlAlloc(allocator, status) orelse return error.BrowserUnavailable;
+                    defer allocator.free(url);
+                    switch (try mcpBrowserProbeNavigationReadiness(allocator, io, workspace, url, null, deadline_ms)) {
+                        .target => return,
+                        .passthrough => return error.BrowserUnavailable,
+                        .wait, .stable_other => stable_since_ms = null,
+                    }
+                }
+            },
+        }
+        try std.Io.sleep(io, .fromMilliseconds(@min(remaining_ms, MCP_BROWSER_POLL_INTERVAL_MS)), .awake);
+    }
+    return error.BrowserActionTimeout;
 }
 
 fn mcpBrowserWaitUntilReady(
@@ -7008,10 +7062,13 @@ fn mcpBrowserEvalAndWaitAlloc(
     defer allocator.free(initial_status);
     if (try mcpBrowserActionResultAlloc(allocator, initial_status, nonce)) |result| return result;
 
+    var start_observed = mcpBrowserActionStarted(allocator, initial_status, nonce);
     while (confirmationRemainingMs(action_deadline_ms)) |remaining_ms| {
         // Synchronous evaluations return their payload directly. Submitting a
         // poll script can race that result and overwrite it with pending.
-        if (poll_script) |script| {
+        // The Live acknowledgement precedes JS execution. A missing state is
+        // only evidence of context loss after this nonce was seen in the page.
+        if (if (start_observed) poll_script else null) |script| {
             const poll_accepted = try sendLiveRequestAlloc(allocator, io, "browser.eval", .{ .workspace = workspace, .script = script }, 1);
             defer allocator.free(poll_accepted);
             if (!liveResponseOk(allocator, poll_accepted)) return try allocator.dupe(u8, poll_accepted);
@@ -7019,6 +7076,7 @@ fn mcpBrowserEvalAndWaitAlloc(
         const status = try sendLiveRequestAlloc(allocator, io, "browser.status", .{ .workspace = workspace }, 1);
         defer allocator.free(status);
         if (try mcpBrowserActionResultAlloc(allocator, status, nonce)) |result| return result;
+        start_observed = start_observed or mcpBrowserActionStarted(allocator, status, nonce);
         const sleep_ms: u32 = @intCast(@min(remaining_ms, @as(i64, MCP_BROWSER_POLL_INTERVAL_MS)));
         try std.Io.sleep(io, .fromMilliseconds(sleep_ms), .awake);
     }
@@ -7030,6 +7088,20 @@ fn liveResponseOk(allocator: std.mem.Allocator, response: []const u8) bool {
     defer parsed.deinit();
     if (parsed.value != .object) return false;
     return jsonBool(parsed.value.object.get("ok") orelse .null) orelse false;
+}
+
+fn mcpBrowserActionStarted(allocator: std.mem.Allocator, status: []const u8, nonce: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, status, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const result = parsed.value.object.get("result") orelse return false;
+    if (result != .object) return false;
+    const raw = jsonString(result.object.get("last_eval_result") orelse .null) orelse return false;
+    var action = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return false;
+    defer action.deinit();
+    if (action.value != .object) return false;
+    const actual_nonce = jsonString(action.value.object.get("verdeAgentBrowserNonce") orelse .null) orelse return false;
+    return std.mem.eql(u8, actual_nonce, nonce);
 }
 
 fn mcpBrowserActionResultAlloc(allocator: std.mem.Allocator, status: []const u8, nonce: []const u8) !?[]u8 {
@@ -7060,7 +7132,7 @@ fn mcpBrowserStartScriptAlloc(
     try writer.writer.writeAll("(()=>{const __verdeNonce=");
     var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
     try s.write(nonce);
-    try writer.writer.writeAll(",__verdeKey='__verdeAgentEval_'+__verdeNonce;window[__verdeKey]={done:false};const __verdeResolve=result=>{const payload={verdeAgentBrowserNonce:__verdeNonce,ok:true,url:String(location.href),result};window[__verdeKey]={done:true,payload};return payload},__verdeReject=error=>{const payload={verdeAgentBrowserNonce:__verdeNonce,ok:false,url:String(location.href),error:{name:String(error&&error.name||'Error'),message:String(error&&error.message||error),stack:String(error&&error.stack||'')}};window[__verdeKey]={done:true,payload};return payload};");
+    try writer.writer.writeAll(",__verdeKey='__verdeAgentEval_'+__verdeNonce;window[__verdeKey]={done:false};const __verdeResolve=result=>{const payload={verdeAgentBrowserNonce:__verdeNonce,ok:true,url:String(location.href),result:result===undefined?null:result,...(result===undefined?{result_undefined:true,warning:'Script returned undefined. Use an outer return to receive a value; the script has already run and was not retried.'}:{})};window[__verdeKey]={done:true,payload};return payload},__verdeReject=error=>{const payload={verdeAgentBrowserNonce:__verdeNonce,ok:false,url:String(location.href),error:{name:String(error&&error.name||'Error'),message:String(error&&error.message||error),stack:String(error&&error.stack||''),code:String(error&&error.code||error&&error.name||'javascript_error'),details:(()=>{try{return error&&error.details?JSON.parse(JSON.stringify(error.details)):null}catch(_){return null}})()}};window[__verdeKey]={done:true,payload};return payload};");
     switch (mode) {
         .synchronous => {
             // Hidden WPE surfaces pause page microtasks, so ordinary inspect,
@@ -7095,52 +7167,78 @@ fn mcpBrowserPollScriptAlloc(allocator: std.mem.Allocator, nonce: []const u8) ![
     try writer.writer.writeAll("(()=>{const nonce=");
     var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
     try s.write(nonce);
-    try writer.writer.writeAll(",key='__verdeAgentEval_'+nonce,state=window[key];if(!state||!state.done)return {verdeAgentBrowserNonce:nonce,pending:true};delete window[key];return state.payload;})()");
+    try writer.writer.writeAll(",key='__verdeAgentEval_'+nonce,state=window[key];if(!state)return {verdeAgentBrowserNonce:nonce,ok:false,lost:true,url:String(location.href),error:{name:'BrowserDocumentReplaced',code:'document_replaced',message:'Browser document was replaced while the action was pending; the action was not retried',details:{action_may_have_run:true}}};if(!state.done)return {verdeAgentBrowserNonce:nonce,pending:true};return state.payload;})()");
     return try writer.toOwnedSlice();
+}
+
+const McpBrowserTarget = struct {
+    selector: ?[]const u8 = null,
+    ref: ?[]const u8 = null,
+    role: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+    label: ?[]const u8 = null,
+};
+
+fn mcpBrowserTarget(arguments: std.json.Value) !McpBrowserTarget {
+    if (arguments != .object) return error.InvalidBrowserTarget;
+    var target: McpBrowserTarget = .{};
+    var modes: usize = 0;
+    inline for (.{ "selector", "ref", "role", "name", "label" }) |field| {
+        if (arguments.object.get(field)) |value| {
+            const text = jsonString(value) orelse return error.InvalidBrowserTarget;
+            if (!std.mem.eql(u8, field, "name")) {
+                if (std.mem.trim(u8, text, " \t\r\n").len == 0) return error.InvalidBrowserTarget;
+                modes += 1;
+            }
+            @field(target, field) = text;
+        }
+    }
+    if (modes != 1 or (target.name != null and target.role == null)) return error.InvalidBrowserTarget;
+    return target;
+}
+
+fn mcpBrowserTargetScriptAlloc(allocator: std.mem.Allocator, target: McpBrowserTarget) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    try writer.writer.writeAll("const targeting=" ++ @embedFile("browser_targeting.js") ++ ";const target=");
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try s.beginObject();
+    inline for (.{ "selector", "ref", "role", "name", "label" }) |field| {
+        if (@field(target, field)) |value| {
+            try s.objectField(field);
+            try s.write(value);
+        }
+    }
+    try s.endObject();
+    try writer.writer.writeAll(";");
+    return writer.toOwnedSlice();
 }
 
 fn mcpBrowserInspectScriptAlloc(allocator: std.mem.Allocator, requested_elements: u32, requested_text_limit: u32) ![]u8 {
-    const max_elements = std.math.clamp(requested_elements, 1, 250);
-    const text_limit = std.math.clamp(requested_text_limit, 1_000, 50_000);
-    return try std.fmt.allocPrint(allocator,
-        \\const visible=(el)=>{{const r=el.getBoundingClientRect(),s=getComputedStyle(el);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none'}};
-        \\const selectorFor=(el)=>{{if(el.id)return '#'+CSS.escape(el.id);const parts=[];let node=el;while(node&&node.nodeType===1&&parts.length<6){{let part=node.localName;if(node.getAttribute('name'))part+='[name="'+CSS.escape(node.getAttribute('name'))+'"]';else{{let i=1,p=node;while((p=p.previousElementSibling))if(p.localName===node.localName)i++;part+=':nth-of-type('+i+')'}}parts.unshift(part);node=node.parentElement}}return parts.join(' > ')}};
-        \\const nodes=[...document.querySelectorAll('a[href],button,input,textarea,select,[role="button"],[role="link"],[contenteditable="true"],[tabindex]')].filter(visible).slice(0,{d});
-        \\return {{title:document.title,text:String(document.body?.innerText||'').slice(0,{d}),elements:nodes.map((el)=>{{const r=el.getBoundingClientRect();return {{selector:selectorFor(el),tag:el.localName,role:el.getAttribute('role'),type:el.getAttribute('type'),name:el.getAttribute('name'),text:String(el.innerText||el.value||el.getAttribute('aria-label')||'').trim().slice(0,300),href:el.href||null,disabled:Boolean(el.disabled||el.getAttribute('aria-disabled')==='true'),rect:{{x:r.x,y:r.y,width:r.width,height:r.height}}}}}})}};
-    , .{ max_elements, text_limit });
+    return std.fmt.allocPrint(allocator, "const targeting={s};return targeting.inspect({d},{d});", .{
+        @embedFile("browser_targeting.js"),
+        std.math.clamp(requested_elements, 1, 250),
+        std.math.clamp(requested_text_limit, 1_000, 50_000),
+    });
 }
 
-fn mcpBrowserClickScriptAlloc(allocator: std.mem.Allocator, selector: []const u8, confirmed: bool) ![]u8 {
+fn mcpBrowserClickScriptAlloc(allocator: std.mem.Allocator, target: McpBrowserTarget, confirmed: bool) ![]u8 {
+    const prefix = try mcpBrowserTargetScriptAlloc(allocator, target);
+    defer allocator.free(prefix);
+    return std.fmt.allocPrint(allocator, "{s}return targeting.click(target,{s});", .{ prefix, if (confirmed) "true" else "false" });
+}
+
+fn mcpBrowserTypeScriptAlloc(allocator: std.mem.Allocator, target: McpBrowserTarget, text: []const u8, submit: bool, confirmed: bool) ![]u8 {
+    const prefix = try mcpBrowserTargetScriptAlloc(allocator, target);
+    defer allocator.free(prefix);
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
-    try writer.writer.writeAll("const selector=");
+    try writer.writer.writeAll(prefix);
+    try writer.writer.writeAll("return targeting.type(target,");
     var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
-    try s.write(selector);
-    try writer.writer.writeAll(";const el=document.querySelector(selector);if(!el)throw new Error('No element matches selector');if(el.disabled||el.getAttribute('aria-disabled')==='true')throw new Error('Element is disabled');const label=String(el.innerText||el.value||el.getAttribute('aria-label')||'').trim();const sensitive=el.matches('input[type=submit],button[type=submit]')||/(buy|purchase|pay|delete|remove|send|submit|confirm|publish)/i.test(label);if(sensitive&&!");
-    try writer.writer.writeAll(if (confirmed) "true" else "false");
-    try writer.writer.writeAll(")return {clicked:false,sensitive:true,confirmation_required:true,selector,label};el.scrollIntoView({block:'center',inline:'center'});if(typeof el.focus==='function')el.focus({preventScroll:true});if(typeof el.click==='function')el.click();else el.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,view:window}));return {clicked:true,sensitive,selector,tag:el.localName,label,href:el.href||null};");
-    return try writer.toOwnedSlice();
-}
-
-fn mcpBrowserTypeScriptAlloc(allocator: std.mem.Allocator, selector: []const u8, text: []const u8, submit: bool, confirmed: bool) ![]u8 {
-    var writer: std.Io.Writer.Allocating = .init(allocator);
-    errdefer writer.deinit();
-    try writer.writer.writeAll("const selector=");
-    var selector_stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
-    try selector_stringify.write(selector);
-    try writer.writer.writeAll(";const text=");
-    var text_stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
-    try text_stringify.write(text);
-    try writer.writer.writeAll(";const el=document.querySelector(selector);if(!el)throw new Error('No element matches selector');const isField=el instanceof HTMLInputElement||el instanceof HTMLTextAreaElement||el.isContentEditable;if(!isField)throw new Error('Element is not an editable field');const sensitive=(el instanceof HTMLInputElement&&el.type==='password')||");
-    try writer.writer.writeAll(if (submit) "true" else "false");
-    try writer.writer.writeAll(";if(sensitive&&!");
-    try writer.writer.writeAll(if (confirmed) "true" else "false");
-    try writer.writer.writeAll(")return {typed:false,sensitive:true,confirmation_required:true,selector};el.focus();if(el.isContentEditable)el.textContent=text;else{const proto=el instanceof HTMLTextAreaElement?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;const setter=Object.getOwnPropertyDescriptor(proto,'value')?.set;if(setter)setter.call(el,text);else el.value=text}el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:text}));el.dispatchEvent(new Event('change',{bubbles:true}));if(");
-    try writer.writer.writeAll(if (submit) "true" else "false");
-    try writer.writer.writeAll("){if(el.form&&typeof el.form.requestSubmit==='function')el.form.requestSubmit();else el.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',code:'Enter',bubbles:true,cancelable:true}))}return {typed:true,submitted:");
-    try writer.writer.writeAll(if (submit) "true" else "false");
-    try writer.writer.writeAll(",sensitive,selector,tag:el.localName};");
-    return try writer.toOwnedSlice();
+    try s.write(text);
+    try writer.writer.print(",{s},{s});", .{ if (submit) "true" else "false", if (confirmed) "true" else "false" });
+    return writer.toOwnedSlice();
 }
 
 fn mcpWaitForWorkspaceProcessAlloc(
@@ -8538,6 +8636,23 @@ test "Windows attach console handler catches only interrupt controls" {
     try std.testing.expect(windowsAttachControlEventBit(2) == null);
 }
 
+test "browser MCP polling waits for start acknowledgement and preserves lost results" {
+    const allocator = std.testing.allocator;
+    const pending =
+        \\{"ok":true,"result":{"last_eval_result":"{\"verdeAgentBrowserNonce\":\"test-nonce\",\"pending\":true}"}}
+    ;
+    const lost =
+        \\{"ok":true,"result":{"last_eval_result":"{\"verdeAgentBrowserNonce\":\"test-nonce\",\"ok\":false,\"lost\":true,\"error\":{\"code\":\"document_replaced\"}}"}}
+    ;
+    try std.testing.expect(!mcpBrowserActionStarted(allocator, "{}", "test-nonce"));
+    try std.testing.expect(!mcpBrowserActionStarted(allocator, pending, "other-nonce"));
+    try std.testing.expect(mcpBrowserActionStarted(allocator, pending, "test-nonce"));
+    try std.testing.expect((try mcpBrowserActionResultAlloc(allocator, pending, "test-nonce")) == null);
+    const result = (try mcpBrowserActionResultAlloc(allocator, lost, "test-nonce")) orelse return error.MissingLostResult;
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "document_replaced") != null);
+}
+
 test "browser MCP action result is correlated by nonce" {
     const allocator = std.testing.allocator;
     const status =
@@ -8552,6 +8667,15 @@ test "browser MCP action result is correlated by nonce" {
         \\{"ok":true,"result":{"last_eval_result":"{\"verdeAgentBrowserNonce\":\"test-nonce\",\"pending\":true}"}}
     ;
     try std.testing.expect((try mcpBrowserActionResultAlloc(allocator, pending, "test-nonce")) == null);
+}
+
+test "browser MCP lifecycle readiness accepts a ready blank document but not loading" {
+    const allocator = std.testing.allocator;
+    const ready = "{\"ok\":true,\"url\":\"about:blank\",\"result\":\"complete\"}";
+    const loading = "{\"ok\":true,\"url\":\"about:blank\",\"result\":\"loading\"}";
+    try std.testing.expectEqual(McpBrowserNavigationReadiness.target, mcpBrowserNavigationReadinessFromAction(allocator, ready, "about:blank", null));
+    try std.testing.expectEqual(McpBrowserNavigationReadiness.wait, mcpBrowserNavigationReadinessFromAction(allocator, loading, "about:blank", null));
+    try std.testing.expectEqual(McpBrowserNavigationReadiness.wait, mcpBrowserNavigationReadinessFromAction(allocator, ready, "https://example.com", null));
 }
 
 test "browser MCP actions wait for runtime and pending navigation" {
@@ -8686,7 +8810,8 @@ test "browser MCP scripts keep synchronous actions off the page microtask queue"
     try std.testing.expect(std.mem.indexOf(u8, promise_aware, "return {verdeAgentBrowserNonce:__verdeNonce,pending:true}") != null);
     try std.testing.expect(std.mem.indexOf(u8, promise_aware, "name:String(error&&error.name") != null);
     try std.testing.expect(std.mem.indexOf(u8, promise_aware, "stack:String(error&&error.stack") != null);
-    try std.testing.expect(std.mem.indexOf(u8, poll_script, "delete window[key]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, poll_script, "delete window[key]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, poll_script, "document_replaced") != null);
 }
 
 test "MCP workspace defaults prefer identity and fall back to agent cwd" {
@@ -8880,14 +9005,44 @@ test "MCP tool responses preserve nested objects and arrays" {
     );
 }
 
+test "browser MCP targeting validates mutually exclusive string locators" {
+    const allocator = std.testing.allocator;
+    inline for (.{
+        "{}",
+        "{\"selector\":null}",
+        "{\"selector\":false}",
+        "{\"selector\":\"  \"}",
+        "{\"role\":\"button\",\"ref\":\"r1\"}",
+        "{\"selector\":\"#save\",\"label\":\"\"}",
+        "{\"name\":\"Save\"}",
+        "{\"label\":\"Save\",\"name\":\"Save\"}",
+        "{\"role\":\"button\",\"name\":42}",
+    }) |input| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, input, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.InvalidBrowserTarget, mcpBrowserTarget(parsed.value));
+    }
+    inline for (.{
+        "{\"selector\":\"#save\"}",
+        "{\"ref\":\"snapshot:1\"}",
+        "{\"role\":\"button\",\"name\":\"Save\"}",
+        "{\"role\":\"button\",\"name\":\"\"}",
+        "{\"label\":\"Email\"}",
+    }) |input| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, input, .{});
+        defer parsed.deinit();
+        _ = try mcpBrowserTarget(parsed.value);
+    }
+}
+
 test "browser MCP scripts JSON-escape selectors and typed text" {
     const allocator = std.testing.allocator;
-    const click = try mcpBrowserClickScriptAlloc(allocator, "button[data-label='say \\\"hi\\\"']", false);
+    const click = try mcpBrowserClickScriptAlloc(allocator, .{ .selector = "button[data-label='say \\\"hi\\\"']" }, false);
     defer allocator.free(click);
-    try std.testing.expect(std.mem.indexOf(u8, click, "const selector=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, click, "const target=") != null);
     try std.testing.expect(std.mem.indexOf(u8, click, "confirmation_required") != null);
 
-    const typed = try mcpBrowserTypeScriptAlloc(allocator, "#message", "hello\nworld", true, true);
+    const typed = try mcpBrowserTypeScriptAlloc(allocator, .{ .selector = "#message" }, "hello\nworld", true, true);
     defer allocator.free(typed);
     try std.testing.expect(std.mem.indexOf(u8, typed, "hello\\nworld") != null);
     try std.testing.expect(std.mem.indexOf(u8, typed, "requestSubmit") != null);
@@ -9319,4 +9474,42 @@ test "notify handler requires a dedicated exe_path separate from flag argv" {
     // parameters so parsed.rest can never masquerade as the daemon binary.
     const info = @typeInfo(@TypeOf(handleNotify)).@"fn";
     try std.testing.expectEqual(@as(usize, 5), info.params.len);
+}
+
+test "MCP discovery exposes background tools without desktop focus controls" {
+    const allocator = std.testing.allocator;
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    const captured: output.Output = .{ .io = std.testing.io, .stdout_writer = &writer.writer };
+    try mcpToolsList(allocator, captured, .{ .integer = 1 });
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, writer.written(), .{});
+    defer parsed.deinit();
+    const tools = parsed.value.object.get("result").?.object.get("tools").?.array.items;
+    var browser_tools: usize = 0;
+    for (tools) |tool| {
+        const name = tool.object.get("name").?.string;
+        try std.testing.expect(!std.mem.eql(u8, name, "select_workspace_tab"));
+        if (tool.object.get("inputSchema").?.object.get("properties")) |properties| {
+            try std.testing.expect(!properties.object.contains("focus"));
+        }
+        if (std.mem.indexOf(u8, name, "browser") != null) browser_tools += 1;
+    }
+    try std.testing.expect(browser_tools >= 10);
+}
+
+test "cached MCP tab selection is rejected without contacting Live" {
+    const allocator = std.testing.allocator;
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    const captured: output.Output = .{ .io = std.testing.io, .stdout_writer = &writer.writer };
+    var params = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"name":"select_workspace_tab","arguments":{"workspace":"missing-focus-test-workspace","pane_id":67}}
+    , .{});
+    defer params.deinit();
+    try mcpToolsCall(allocator, captured, std.testing.io, .{ .integer = 1 }, params.value, null, "focus-test");
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, writer.written(), .{});
+    defer parsed.deinit();
+    const failure = parsed.value.object.get("error").?.object;
+    try std.testing.expectEqual(@as(i64, -32602), failure.get("code").?.integer);
+    try std.testing.expect(std.mem.startsWith(u8, failure.get("message").?.string, "MCP cannot change desktop focus."));
 }

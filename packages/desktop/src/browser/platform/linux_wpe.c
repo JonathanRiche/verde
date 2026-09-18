@@ -117,6 +117,9 @@ struct verde_browser_linux {
     guint context_item_count;
     GQueue *events;
     char *cursor_shape;
+    gboolean document_requested;
+    gboolean document_committed;
+    gboolean awaiting_load_start;
 
     EGLDisplay egl_display;
     EGLContext egl_context;
@@ -1189,20 +1192,8 @@ static void verde_browser_linux_export_fdo_egl_image(void *data, struct wpe_fdo_
     const gint64 now_us = g_get_monotonic_time();
     verde_browser_linux_note_export(browser, now_us);
     const gint64 min_interval_us = verde_browser_linux_frame_min_interval_us(browser, now_us);
-    const gint64 paced_interval_us = MAX(min_interval_us - browser->frame_production_lead_us - VERDE_BROWSER_LINUX_FRAME_TIMER_LEAD_US, 1);
-    const gint64 elapsed_us = now_us - browser->last_frame_published_us;
-    if (browser->last_frame_published_us > 0 && elapsed_us < paced_interval_us) {
-        wpe_view_backend_exportable_fdo_egl_dispatch_release_exported_image(browser->exportable, image);
-        browser->metric_delayed_exports += 1;
-        verde_browser_linux_schedule_frame_complete_at(browser, verde_browser_linux_completion_deadline_us(
-            browser->last_frame_published_us,
-            now_us,
-            min_interval_us,
-            browser->frame_production_lead_us
-        ));
-        verde_browser_linux_maybe_log_frame_metrics(browser, now_us);
-        return;
-    }
+    // Pace the next frame through completion below, never discard this damage.
+    // A static page may not export another frame after an automated mutation.
     const enum verde_browser_linux_frame_export_result result = verde_browser_linux_export_egl_image(browser, image, now_us);
     if (result == VERDE_BROWSER_LINUX_FRAME_EXPORT_OK) {
         // Include EGL readback/publication work in the lead so dispatch occurs
@@ -1293,10 +1284,45 @@ static void verde_browser_linux_on_load_changed(WebKitWebView *web_view, WebKitL
     (void)web_view;
     verde_browser_linux_mark_active(browser);
     if (load_event == WEBKIT_LOAD_STARTED) {
+        browser->awaiting_load_start = FALSE;
+        browser->document_committed = FALSE;
         verde_browser_linux_queue_cursor(browser, "default");
     }
-    if (load_event == WEBKIT_LOAD_FINISHED) {
+    if (load_event == WEBKIT_LOAD_COMMITTED && !browser->awaiting_load_start) browser->document_committed = TRUE;
+    // WebKit also finishes cancelled loads. They must not make a replacement
+    // navigation ready before its own document has committed and loaded.
+    if (load_event == WEBKIT_LOAD_FINISHED && !browser->awaiting_load_start && browser->document_committed) {
+        browser->document_committed = FALSE;
         verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_DOCUMENT_LOADED, NULL);
+    }
+}
+
+static gboolean verde_browser_linux_on_load_failed(WebKitWebView *web_view, WebKitLoadEvent load_event, const char *uri, GError *error, gpointer user_data) {
+    struct verde_browser_linux *browser = user_data;
+    (void)web_view;
+    (void)load_event;
+    (void)uri;
+    browser->document_committed = FALSE;
+    if (!g_error_matches(error, WEBKIT_NETWORK_ERROR, WEBKIT_NETWORK_ERROR_CANCELLED)) {
+        verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_FAILED, error->message);
+    }
+    return TRUE;
+}
+
+static void verde_browser_linux_begin_navigation(struct verde_browser_linux *browser) {
+    browser->document_requested = TRUE;
+    browser->awaiting_load_start = TRUE;
+    browser->document_committed = FALSE;
+    // A completed old document may still be queued when a new command arrives.
+    for (GList *link = browser->events->head; link != NULL;) {
+        GList *next = link->next;
+        struct verde_browser_linux_event *event = link->data;
+        if (event->kind == VERDE_BROWSER_LINUX_EVENT_DOCUMENT_LOADED) {
+            g_free(event->payload);
+            g_free(event);
+            g_queue_delete_link(browser->events, link);
+        }
+        link = next;
     }
 }
 
@@ -1605,11 +1631,13 @@ struct verde_browser_linux *verde_browser_linux_create(void) {
     g_signal_connect(browser->web_view, "notify::uri", G_CALLBACK(verde_browser_linux_on_uri_changed), browser);
     g_signal_connect(browser->web_view, "notify::title", G_CALLBACK(verde_browser_linux_on_title_changed), browser);
     g_signal_connect(browser->web_view, "load-changed", G_CALLBACK(verde_browser_linux_on_load_changed), browser);
+    g_signal_connect(browser->web_view, "load-failed", G_CALLBACK(verde_browser_linux_on_load_failed), browser);
     g_signal_connect(browser->web_view, "web-process-terminated", G_CALLBACK(verde_browser_linux_on_web_process_terminated), browser);
     g_signal_connect(browser->web_view, "context-menu", G_CALLBACK(verde_browser_linux_on_context_menu), browser);
     g_signal_connect(browser->web_view, "context-menu-dismissed", G_CALLBACK(verde_browser_linux_on_context_menu_dismissed), browser);
     g_signal_connect(browser->web_view, "show-option-menu", G_CALLBACK(verde_browser_linux_on_show_option_menu), browser);
-    webkit_web_view_load_uri(browser->web_view, "about:blank");
+    // The first show or navigate owns the initial document. An eager blank
+    // load here can finish after the host has requested its actual URL.
     return browser;
 }
 
@@ -1673,7 +1701,10 @@ int verde_browser_linux_show(struct verde_browser_linux *browser, int width, int
         wpe_view_backend_add_activity_state(browser->view_backend, wpe_view_activity_state_visible | wpe_view_activity_state_in_window);
         verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_OPENED, NULL);
     }
-    if (url != NULL) webkit_web_view_load_uri(browser->web_view, url);
+    if (url != NULL || !browser->document_requested) {
+        verde_browser_linux_begin_navigation(browser);
+        webkit_web_view_load_uri(browser->web_view, url != NULL ? url : "about:blank");
+    }
     return 1;
 }
 
@@ -1681,7 +1712,9 @@ int verde_browser_linux_hide(struct verde_browser_linux *browser) {
     if (browser == NULL) return 0;
     if (browser->visible) {
         browser->visible = FALSE;
-        wpe_view_backend_remove_activity_state(browser->view_backend, wpe_view_activity_state_visible);
+        // This backend only exports offscreen pixels. Keep WebKit painting so
+        // background MCP screenshots remain current; `visible` above selects
+        // the lower hidden-frame cadence without revealing or focusing a pane.
         verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_CLOSED, NULL);
     }
     return 1;
@@ -1706,6 +1739,7 @@ int verde_browser_linux_resize(struct verde_browser_linux *browser, int width, i
 int verde_browser_linux_navigate(struct verde_browser_linux *browser, const char *url) {
     if (browser == NULL || url == NULL) return 0;
     verde_browser_linux_mark_active(browser);
+    verde_browser_linux_begin_navigation(browser);
     webkit_web_view_load_uri(browser->web_view, url);
     return 1;
 }
@@ -1727,20 +1761,27 @@ int verde_browser_linux_post_json(struct verde_browser_linux *browser, const cha
 int verde_browser_linux_go_back(struct verde_browser_linux *browser) {
     if (browser == NULL) return 0;
     verde_browser_linux_mark_active(browser);
-    if (webkit_web_view_can_go_back(browser->web_view)) webkit_web_view_go_back(browser->web_view);
+    if (webkit_web_view_can_go_back(browser->web_view)) {
+        verde_browser_linux_begin_navigation(browser);
+        webkit_web_view_go_back(browser->web_view);
+    }
     return 1;
 }
 
 int verde_browser_linux_go_forward(struct verde_browser_linux *browser) {
     if (browser == NULL) return 0;
     verde_browser_linux_mark_active(browser);
-    if (webkit_web_view_can_go_forward(browser->web_view)) webkit_web_view_go_forward(browser->web_view);
+    if (webkit_web_view_can_go_forward(browser->web_view)) {
+        verde_browser_linux_begin_navigation(browser);
+        webkit_web_view_go_forward(browser->web_view);
+    }
     return 1;
 }
 
 int verde_browser_linux_reload(struct verde_browser_linux *browser) {
     if (browser == NULL) return 0;
     verde_browser_linux_mark_active(browser);
+    verde_browser_linux_begin_navigation(browser);
     webkit_web_view_reload(browser->web_view);
     return 1;
 }
