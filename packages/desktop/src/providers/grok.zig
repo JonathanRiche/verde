@@ -16,10 +16,6 @@ const DEFAULT_EXECUTABLE = "grok";
 // The Grok Build installer places the binary here, which desktop launch
 // environments often lack on PATH.
 const INSTALL_FALLBACK_RELATIVE = ".grok/bin/grok";
-// grok answers session/new and session/load with AuthorizationRequired until
-// the client authenticates explicitly. The cached credential written by
-// `grok login` (or XAI_API_KEY) is the only non-interactive method.
-const AUTH_METHOD_ID = "cached_token";
 /// grok 1.0.x advertises `promptCapabilities.image: false` yet its session
 /// turn parses standard ACP `image` blocks and feeds them to the model
 /// (verified live: a 512px block is described correctly; images under
@@ -218,29 +214,13 @@ pub const Client = struct {
         };
         defer proc.deinit();
 
-        proc.writeLine(acp.makeInitializeRequestAlloc(self.allocator, 1) catch return .unknown) catch return .unknown;
-        proc.writeLine(makeAuthenticateRequestAlloc(self.allocator, AUTHENTICATE_REQUEST_ID) catch return .unknown) catch return .unknown;
-
         var read_buffer: [16 * 1024]u8 = undefined;
         var reader = proc.process.child.stdout.?.reader(proc.threaded.io(), &read_buffer);
-        while (true) {
-            const raw_line = (acp.takeLineAlloc(self.allocator, &reader) catch return .unknown) orelse return .unknown;
-            defer self.allocator.free(raw_line);
-            const line = std.mem.trim(u8, raw_line, " \t\r");
-            if (line.len == 0) continue;
-            var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch return .unknown;
-            defer parsed.deinit();
-            acp.failIfJsonRpcError(ACP_HARNESS, parsed.value) catch |err| switch (err) {
-                error.AcpSignedOut => return .signed_out,
-                else => return .unknown,
-            };
-            if (acp.responseId(parsed.value)) |id| {
-                if (id == AUTHENTICATE_REQUEST_ID) {
-                    proc.stop();
-                    return .signed_in;
-                }
-            }
-        }
+        _ = authenticate(&proc, &reader) catch |err| return switch (err) {
+            error.AcpSignedOut => .signed_out,
+            else => .unknown,
+        };
+        return .signed_in;
     }
 
     pub fn listThreads(self: *Client, allocator: std.mem.Allocator) ![]provider_types.ChatThreadSummary {
@@ -301,12 +281,13 @@ pub const Client = struct {
         var state: acp.ListThreadsState = .{};
         errdefer state.deinit(allocator);
 
-        try proc.writeLine(try acp.makeInitializeRequestAlloc(allocator, 1));
-        try proc.writeLine(try makeAuthenticateRequestAlloc(allocator, AUTHENTICATE_REQUEST_ID));
-        try proc.writeLine(try acp.makeSessionListRequestAlloc(allocator, 2, try self.cwdAbsoluteAlloc(allocator)));
-
         var read_buffer: [16 * 1024]u8 = undefined;
         var reader = proc.process.child.stdout.?.reader(proc.threaded.io(), &read_buffer);
+        const capabilities = try authenticate(&proc, &reader);
+        if (!capabilities.list_sessions) return error.UnsupportedOperation;
+        state.saw_initialize = true;
+        try proc.writeLine(try acp.makeSessionListRequestAlloc(allocator, 2, try self.cwdAbsoluteAlloc(allocator)));
+
         while (try acp.takeLineAlloc(allocator, &reader)) |raw_line| {
             defer allocator.free(raw_line);
             const line = std.mem.trim(u8, raw_line, " \t\r");
@@ -363,14 +344,15 @@ pub const Client = struct {
         var state: acp.ReadThreadState = .{};
         errdefer state.deinit(allocator);
 
-        try proc.writeLine(try acp.makeInitializeRequestAlloc(allocator, 1));
-        try proc.writeLine(try makeAuthenticateRequestAlloc(allocator, AUTHENTICATE_REQUEST_ID));
+        var read_buffer: [16 * 1024]u8 = undefined;
+        var reader = proc.process.child.stdout.?.reader(proc.threaded.io(), &read_buffer);
+        const capabilities = try authenticate(&proc, &reader);
+        if (!capabilities.load_session) return error.UnsupportedOperation;
+        state.saw_initialize = true;
         // grok already registers Verde's MCP server from its own global
         // config, so client-supplied servers stay empty to avoid a duplicate.
         try proc.writeLine(try acp.makeSessionLoadRequestAlloc(allocator, 2, thread_id, cwd, null));
 
-        var read_buffer: [16 * 1024]u8 = undefined;
-        var reader = proc.process.child.stdout.?.reader(proc.threaded.io(), &read_buffer);
         while (try acp.takeLineAlloc(allocator, &reader)) |raw_line| {
             defer allocator.free(raw_line);
             const line = std.mem.trim(u8, raw_line, " \t\r");
@@ -418,16 +400,16 @@ pub const Client = struct {
         var resumed_model: ?[]u8 = null;
         defer if (resumed_model) |model| allocator.free(model);
 
-        try proc.writeLine(try acp.makeInitializeRequestAlloc(allocator, 1));
-        try proc.writeLine(try makeAuthenticateRequestAlloc(allocator, AUTHENTICATE_REQUEST_ID));
+        var read_buffer: [16 * 1024]u8 = undefined;
+        var reader = proc.process.child.stdout.?.reader(proc.threaded.io(), &read_buffer);
+        const capabilities = try authenticate(&proc, &reader);
+        state.capabilities = capabilities;
         if (request.thread_id) |thread_id| {
             try proc.writeLine(try acp.makeSessionLoadRequestAlloc(allocator, 2, thread_id, cwd, null));
         } else {
             try proc.writeLine(try acp.makeSessionNewRequestAlloc(allocator, 2, cwd, null));
         }
 
-        var read_buffer: [16 * 1024]u8 = undefined;
-        var reader = proc.process.child.stdout.?.reader(proc.threaded.io(), &read_buffer);
         while (try acp.takeLineAlloc(allocator, &reader)) |raw_line| {
             defer allocator.free(raw_line);
             const line = std.mem.trim(u8, raw_line, " \t\r");
@@ -488,7 +470,7 @@ pub const Client = struct {
 
         var threaded: std.Io.Threaded = .init(allocator, .{});
         errdefer threaded.deinit();
-        var argv_storage: [7][]const u8 = undefined;
+        var argv_storage: [8][]const u8 = undefined;
         const argv = buildArgv(&argv_storage, executable, model_arg, effort_arg);
         var child = try platform_process.spawn(allocator, threaded.io(), .{
             .argv = argv,
@@ -563,9 +545,11 @@ fn mapAcpError(err: anyerror) anyerror {
 
 // The model/effort flags belong to `grok agent`, ahead of the `stdio`
 // subcommand.
-fn buildArgv(storage: *[7][]const u8, executable: []const u8, model_arg: ?[]const u8, effort_arg: ?[]const u8) []const []const u8 {
+fn buildArgv(storage: *[8][]const u8, executable: []const u8, model_arg: ?[]const u8, effort_arg: ?[]const u8) []const []const u8 {
     var len: usize = 0;
     storage[len] = executable;
+    len += 1;
+    storage[len] = "--no-auto-update";
     len += 1;
     storage[len] = "agent";
     len += 1;
@@ -595,7 +579,45 @@ fn reasoningEffortArg(effort: provider_types.ReasoningEffort) []const u8 {
     };
 }
 
-fn makeAuthenticateRequestAlloc(allocator: std.mem.Allocator, id: i64) ![]u8 {
+/// Negotiates authentication before any session request; keep the same reader
+/// so buffered notifications are not discarded between handshake and session.
+fn authenticate(proc: *acp.Process, reader: anytype) !acp.Capabilities {
+    const allocator = proc.allocator;
+    try proc.writeLine(try acp.makeInitializeRequestAlloc(allocator, 1));
+    var capabilities: acp.Capabilities = .{};
+    var auth_sent = false;
+    while (try acp.takeLineAlloc(allocator, reader)) |line| {
+        defer allocator.free(line);
+        if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        try acp.failIfJsonRpcError(ACP_HARNESS, parsed.value);
+        const id = acp.responseId(parsed.value) orelse continue;
+        if (id == 1 and !auth_sent) {
+            capabilities = acp.parseCapabilities(parsed.value);
+            const key = proc.env_map.get("XAI_API_KEY") orelse "";
+            const method = try selectAuthMethod(parsed.value, key.len > 0);
+            try proc.writeLine(try makeAuthenticateRequestAlloc(allocator, AUTHENTICATE_REQUEST_ID, method));
+            auth_sent = true;
+        } else if (id == AUTHENTICATE_REQUEST_ID and auth_sent) return capabilities;
+    }
+    return error.AcpFailed;
+}
+
+fn selectAuthMethod(value: std.json.Value, has_api_key: bool) ![]const u8 {
+    const result = acp.getObjectField(value, "result") orelse return error.AcpFailed;
+    const methods = acp.getObjectField(result, "authMethods") orelse return error.AcpSignedOut;
+    if (methods != .array) return error.AcpSignedOut;
+    var cached = false;
+    for (methods.array.items) |method| {
+        const id = acp.getOptionalObjectString(method, "id") orelse continue;
+        if (has_api_key and std.mem.eql(u8, id, "xai.api_key")) return "xai.api_key";
+        if (std.mem.eql(u8, id, "cached_token")) cached = true;
+    }
+    return if (cached) "cached_token" else error.AcpSignedOut;
+}
+
+fn makeAuthenticateRequestAlloc(allocator: std.mem.Allocator, id: i64, method: []const u8) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
     var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
@@ -604,7 +626,9 @@ fn makeAuthenticateRequestAlloc(allocator: std.mem.Allocator, id: i64) ![]u8 {
     try stringify.objectField("params");
     try stringify.beginObject();
     try stringify.objectField("methodId");
-    try stringify.write(AUTH_METHOD_ID);
+    try stringify.write(method);
+    try stringify.objectField("_meta");
+    try stringify.write(.{ .headless = true });
     try stringify.endObject();
     try stringify.endObject();
     return writer.toOwnedSlice();
@@ -742,28 +766,29 @@ test "resolveGrokExecutableAlloc reports missing grok binary" {
 }
 
 test "buildArgv places model and effort flags ahead of the stdio subcommand" {
-    var storage: [7][]const u8 = undefined;
+    var storage: [8][]const u8 = undefined;
     const plain = buildArgv(&storage, "/bin/grok", null, null);
-    try std.testing.expectEqual(@as(usize, 3), plain.len);
-    try std.testing.expectEqualStrings("agent", plain[1]);
-    try std.testing.expectEqualStrings("stdio", plain[2]);
+    try std.testing.expectEqual(@as(usize, 4), plain.len);
+    try std.testing.expectEqualStrings("--no-auto-update", plain[1]);
+    try std.testing.expectEqualStrings("agent", plain[2]);
+    try std.testing.expectEqualStrings("stdio", plain[3]);
 
-    var storage_full: [7][]const u8 = undefined;
+    var storage_full: [8][]const u8 = undefined;
     const full = buildArgv(&storage_full, "/bin/grok", "grok-4.5", reasoningEffortArg(.max));
-    try std.testing.expectEqual(@as(usize, 7), full.len);
-    try std.testing.expectEqualStrings("--model", full[2]);
-    try std.testing.expectEqualStrings("grok-4.5", full[3]);
-    try std.testing.expectEqualStrings("--reasoning-effort", full[4]);
+    try std.testing.expectEqual(@as(usize, 8), full.len);
+    try std.testing.expectEqualStrings("--model", full[3]);
+    try std.testing.expectEqualStrings("grok-4.5", full[4]);
+    try std.testing.expectEqualStrings("--reasoning-effort", full[5]);
     // Verde's max tier clamps to grok's top effort.
-    try std.testing.expectEqualStrings("xhigh", full[5]);
-    try std.testing.expectEqualStrings("stdio", full[6]);
+    try std.testing.expectEqualStrings("xhigh", full[6]);
+    try std.testing.expectEqualStrings("stdio", full[7]);
 }
 
 test "makeAuthenticateRequestAlloc uses the cached token method" {
-    const json = try makeAuthenticateRequestAlloc(std.testing.allocator, AUTHENTICATE_REQUEST_ID);
+    const json = try makeAuthenticateRequestAlloc(std.testing.allocator, AUTHENTICATE_REQUEST_ID, "cached_token");
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings(
-        \\{"jsonrpc":"2.0","id":10,"method":"authenticate","params":{"methodId":"cached_token"}}
+        \\{"jsonrpc":"2.0","id":10,"method":"authenticate","params":{"methodId":"cached_token","_meta":{"headless":true}}}
     , json);
 }
 
@@ -922,4 +947,20 @@ test "sendPrompt forwards image attachments despite grok's image=false flag" {
 
 fn mapAcpErrorResult(result: anytype) !void {
     _ = result catch |err| return mapAcpError(err);
+}
+
+test "Grok authentication negotiates advertised methods with API key preference" {
+    const allocator = std.testing.allocator;
+    var init = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"result":{"authMethods":[{"id":"cached_token"},{"id":"xai.api_key"}]}}
+    , .{});
+    defer init.deinit();
+    try std.testing.expectEqualStrings("xai.api_key", try selectAuthMethod(init.value, true));
+    try std.testing.expectEqualStrings("cached_token", try selectAuthMethod(init.value, false));
+    var key_only = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"result":{"authMethods":[{"id":"xai.api_key"}]}}
+    , .{});
+    defer key_only.deinit();
+    try std.testing.expectError(error.AcpSignedOut, selectAuthMethod(key_only.value, false));
+    try std.testing.expectEqualStrings("xai.api_key", try selectAuthMethod(key_only.value, true));
 }

@@ -14,6 +14,7 @@ const std = @import("std");
 const provider_diagnostics = @import("diagnostics.zig");
 const platform_process = @import("../platform/process.zig");
 const provider_types = @import("types.zig");
+const cursor_extensions = @import("cursor_extensions.zig");
 
 pub const MAX_LINE_BYTES = 16 * 1024 * 1024;
 pub const MCP_TOOL_NAME_FIELD = "_verdeMcpTool";
@@ -21,6 +22,7 @@ pub const MCP_TOOL_NAME_FIELD = "_verdeMcpTool";
 /// Per-provider knobs threaded through the generic line handlers so shared
 /// code can log, label, and title output without provider branches.
 pub const Harness = struct {
+    cursor_extensions_enabled: bool = false,
     /// Diagnostics category for content-safe JSON-RPC error logging.
     diagnostics_category: provider_diagnostics.ErrorCategory,
     /// Author label for assistant messages reconstructed from history replay.
@@ -193,6 +195,7 @@ pub const ReadThreadState = struct {
 };
 
 pub const SendPromptState = struct {
+    cursor: cursor_extensions.State = .{},
     capabilities: Capabilities = .{},
     session_id: ?[]u8 = null,
     prompt_submitted: bool = false,
@@ -207,6 +210,7 @@ pub const SendPromptState = struct {
     pub fn deinit(self: *SendPromptState, allocator: std.mem.Allocator) void {
         if (self.session_id) |session_id| allocator.free(session_id);
         self.reply.deinit(allocator);
+        self.cursor.deinit(allocator);
     }
 };
 
@@ -296,6 +300,15 @@ pub fn handleSendPromptLine(
     if (isMethod(parsed.value, "session/request_permission")) {
         try handlePermissionRequest(allocator, harness, parsed.value, request, stdin);
         return .continue_reading;
+    }
+
+    if (harness.cursor_extensions_enabled) {
+        const method = getOptionalObjectString(parsed.value, "method") orelse "";
+        if (std.mem.startsWith(u8, method, "cursor/")) {
+            finishThinking(request, state);
+            _ = try cursor_extensions.handle(allocator, parsed.value, request, &state.cursor, stdin);
+            return .continue_reading;
+        }
     }
 
     if (responseId(parsed.value)) |id| {
@@ -489,7 +502,7 @@ pub fn makeCancelNotificationAlloc(allocator: std.mem.Allocator, session_id: []c
     return writer.toOwnedSlice();
 }
 
-pub fn makePermissionResponseAlloc(allocator: std.mem.Allocator, id: i64, option_id: []const u8) ![]u8 {
+pub fn makePermissionResponseAlloc(allocator: std.mem.Allocator, id: std.json.Value, option_id: ?[]const u8) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
     var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
@@ -503,9 +516,11 @@ pub fn makePermissionResponseAlloc(allocator: std.mem.Allocator, id: i64, option
     try stringify.objectField("outcome");
     try stringify.beginObject();
     try stringify.objectField("outcome");
-    try stringify.write("selected");
-    try stringify.objectField("optionId");
-    try stringify.write(option_id);
+    try stringify.write(if (option_id != null) "selected" else "cancelled");
+    if (option_id) |selected| {
+        try stringify.objectField("optionId");
+        try stringify.write(selected);
+    }
     try stringify.endObject();
     try stringify.endObject();
     try stringify.endObject();
@@ -516,10 +531,20 @@ pub fn writeJsonLineToFile(allocator: std.mem.Allocator, file: std.Io.File, line
     var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
     var write_buffer: [16 * 1024]u8 = undefined;
-    var writer = file.writer(threaded.io(), &write_buffer);
+    var writer = file.writerStreaming(threaded.io(), &write_buffer);
     try writer.interface.writeAll(line);
     try writer.interface.writeByte('\n');
     try writer.interface.flush();
+}
+
+/// Server request IDs are independent of our numeric response sequence.
+pub fn serverRequestId(value: std.json.Value) ?std.json.Value {
+    if (getOptionalObjectString(value, "method") == null) return null;
+    const id = getObjectField(value, "id") orelse return null;
+    return switch (id) {
+        .integer, .string => id,
+        else => null,
+    };
 }
 
 pub fn responseId(value: std.json.Value) ?i64 {
@@ -965,11 +990,12 @@ fn handlePermissionRequest(
     request: provider_types.SendPromptRequest,
     stdin: ?std.Io.File,
 ) !void {
-    const id = responseId(value) orelse return;
+    const id = serverRequestId(value) orelse return;
     const params = getObjectField(value, "params") orelse value;
-    const title = getOptionalObjectString(params, "title") orelse harness.permission_default_title;
+    const tool_call = getObjectField(params, "toolCall") orelse params;
+    const title = getOptionalObjectString(tool_call, "title") orelse getOptionalObjectString(params, "title") orelse harness.permission_default_title;
     const body = permissionBody(params);
-    const call_id = getOptionalObjectString(params, "toolCallId") orelse getOptionalObjectString(params, "permissionId") orelse "acp-tool";
+    const call_id = getOptionalObjectString(tool_call, "toolCallId") orelse getOptionalObjectString(params, "permissionId") orelse "acp-tool";
     const decision: provider_types.ApprovalDecision = if (shouldAutoApprovePermission(request))
         .approve
     else if (request.on_approval_request) |on_approval_request|
@@ -988,30 +1014,20 @@ fn handlePermissionRequest(
     }
 }
 
-fn permissionOptionId(params: std.json.Value, decision: provider_types.ApprovalDecision) []const u8 {
-    const fallback = if (decision == .approve) "allow-once" else "reject-once";
-    const options = getObjectField(params, "options") orelse return fallback;
-    if (options != .array) return fallback;
-
-    var first: ?[]const u8 = null;
+fn permissionOptionId(params: std.json.Value, decision: provider_types.ApprovalDecision) ?[]const u8 {
+    const options = getObjectField(params, "options") orelse return null;
+    if (options != .array) return null;
+    const desired = if (decision == .approve) "allow_once" else "reject_once";
+    const persistent = if (decision == .approve) "allow_always" else "reject_always";
+    var fallback: ?[]const u8 = null;
     for (options.array.items) |option| {
-        if (option != .object) continue;
         const id = getOptionalObjectString(option, "optionId") orelse getOptionalObjectString(option, "id") orelse continue;
-        if (first == null) first = id;
-        if (decision == .approve) {
-            if (containsAnyIgnoreCase(id, &.{ "allow", "approve", "accept" })) return id;
-        } else {
-            if (containsAnyIgnoreCase(id, &.{ "reject", "deny", "disallow" })) return id;
-        }
+        const kind = getOptionalObjectString(option, "kind") orelse id;
+        if (std.mem.eql(u8, kind, desired) or std.mem.eql(u8, kind, if (decision == .approve) "allow-once" else "reject-once")) return id;
+        if (std.mem.eql(u8, kind, persistent) or std.mem.eql(u8, kind, if (decision == .approve) "allow-always" else "reject-always")) fallback = id;
     }
-    return first orelse fallback;
-}
-
-fn containsAnyIgnoreCase(haystack: []const u8, needles: []const []const u8) bool {
-    for (needles) |needle| {
-        if (std.ascii.indexOfIgnoreCase(haystack, needle) != null) return true;
-    }
-    return false;
+    // Never answer a rejection with an unrelated (possibly approving) option.
+    return fallback;
 }
 
 fn permissionBody(params: std.json.Value) []const u8 {
@@ -1130,6 +1146,17 @@ fn toolKind(update: std.json.Value) ?provider_types.ToolCallKind {
             "";
     };
     if (provider_types.isSubagentToolName(title) or provider_types.isSubagentToolName(tool_name)) return .subagent;
+    // Grok uses the task description as its title and identifies the native
+    // tool through rawInput.variant, rather than ACP's toolName field.
+    const raw_input = getObjectField(update, "rawInput") orelse nested_input: {
+        const tool_call = getObjectField(update, "toolCall") orelse break :nested_input null;
+        break :nested_input getObjectField(tool_call, "rawInput");
+    };
+    if (raw_input) |input| {
+        if (getTrimmedObjectString(input, "variant")) |variant| {
+            if (std.mem.eql(u8, variant, "Task")) return .subagent;
+        }
+    }
     if (std.ascii.startsWithIgnoreCase(title, "mcp") or std.ascii.startsWithIgnoreCase(title, "verde:")) return .mcp;
     if (getTrimmedObjectString(update, "command") != null or title.len > 0 and title[0] == '`') return .execute;
     if (std.ascii.startsWithIgnoreCase(title, "read")) return .read;
@@ -1785,6 +1812,27 @@ test "toolEvent classifies ACP task tools as subagents" {
     try std.testing.expectEqualStrings("Explore website", event.title);
 }
 
+test "toolEvent recognizes Grok native task variants without guessing from prompts" {
+    const cases = .{
+        .{ .payload =
+        \\{"sessionUpdate":"tool_call","toolCallId":"task-1","title":"Calculate 23 times 17","kind":"other","rawInput":{"variant":"Task","description":"Calculate 23 times 17","subagent_type":"general-purpose"},"status":"in_progress"}
+        , .expected = provider_types.ToolCallKind.subagent },
+        .{ .payload =
+        \\{"sessionUpdate":"tool_call_update","toolCall":{"id":"task-1","title":"Calculate 23 times 17","kind":"other","rawInput":{"variant":"Task"}},"status":"completed"}
+        , .expected = provider_types.ToolCallKind.subagent },
+        .{ .payload =
+        \\{"sessionUpdate":"tool_call","toolCallId":"read-1","title":"Read file","kind":"read","rawInput":{"variant":"Read","prompt":"Task"},"status":"completed"}
+        , .expected = provider_types.ToolCallKind.read },
+    };
+    inline for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, case.payload, .{});
+        defer parsed.deinit();
+        const event = (try toolEventAlloc(std.testing.allocator, parsed.value)).?;
+        defer event.deinit(std.testing.allocator);
+        try std.testing.expectEqual(case.expected, event.tool_kind.?);
+    }
+}
+
 test "toolEvent ignores empty ACP input containers" {
     const payload =
         \\{"sessionUpdate":"tool_call","toolCallId":"call-2","title":"Read File","kind":"read","rawInput":{},"locations":[{"path":"/tmp/a.txt"}],"status":"pending"}
@@ -2072,9 +2120,9 @@ test "auto-approve permission requests when approval policy is never" {
 }
 
 test "makePermissionResponseAlloc writes selected ACP option id" {
-    const approve = try makePermissionResponseAlloc(std.testing.allocator, 9, "allow-always");
+    const approve = try makePermissionResponseAlloc(std.testing.allocator, .{ .integer = 9 }, "allow-always");
     defer std.testing.allocator.free(approve);
-    const deny = try makePermissionResponseAlloc(std.testing.allocator, 10, "reject-once");
+    const deny = try makePermissionResponseAlloc(std.testing.allocator, .{ .integer = 10 }, "reject-once");
     defer std.testing.allocator.free(deny);
     try std.testing.expect(std.mem.indexOf(u8, approve, "allow-always") != null);
     try std.testing.expect(std.mem.indexOf(u8, deny, "reject-once") != null);
@@ -2086,8 +2134,8 @@ test "permissionOptionId chooses matching ACP request options" {
     ;
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("allow-once", permissionOptionId(parsed.value, .approve));
-    try std.testing.expectEqualStrings("reject-once", permissionOptionId(parsed.value, .deny));
+    try std.testing.expectEqualStrings("allow-once", permissionOptionId(parsed.value, .approve).?);
+    try std.testing.expectEqualStrings("reject-once", permissionOptionId(parsed.value, .deny).?);
 }
 
 test "permissionOptionId matches FX underscore option ids" {
@@ -2096,6 +2144,108 @@ test "permissionOptionId matches FX underscore option ids" {
     ;
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("allow_once", permissionOptionId(parsed.value, .approve));
-    try std.testing.expectEqualStrings("reject_once", permissionOptionId(parsed.value, .deny));
+    try std.testing.expectEqualStrings("allow_once", permissionOptionId(parsed.value, .approve).?);
+    try std.testing.expectEqualStrings("reject_once", permissionOptionId(parsed.value, .deny).?);
+}
+
+test "ACP permission server requests invoke the callback for string and numeric IDs" {
+    const Capture = struct {
+        calls: usize = 0,
+        fn approve(context: ?*anyopaque, _: provider_types.ApprovalRequest) provider_types.ApprovalDecision {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.calls += 1;
+            return .approve;
+        }
+    };
+    const allocator = std.testing.allocator;
+    var state: SendPromptState = .{};
+    defer state.deinit(allocator);
+    var capture: Capture = .{};
+    for ([_][]const u8{
+        \\{"id":3,"method":"session/request_permission","params":{}}
+        ,
+        \\{"id":"permission-3","method":"session/request_permission","params":{}}
+        ,
+    }) |line| {
+        _ = try handleSendPromptLine(allocator, TEST_HARNESS, line, .{ .prompt = "test", .stream_context = &capture, .on_approval_request = Capture.approve }, &state, null);
+    }
+    try std.testing.expectEqual(@as(usize, 2), capture.calls);
+    const response = try makePermissionResponseAlloc(allocator, .{ .string = "permission-3" }, "allow-once");
+    defer allocator.free(response);
+    try std.testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":"permission-3","result":{"outcome":{"outcome":"selected","optionId":"allow-once"}}}
+    , response);
+}
+
+test "ACP permission decisions use kinds and never approve an unrecognized rejection" {
+    var params = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"options":[{"optionId":"opaque-always","kind":"allow_always"},{"optionId":"opaque-once","kind":"allow_once"},{"optionId":"opaque-reject","kind":"reject_once"}]}
+    , .{});
+    defer params.deinit();
+    try std.testing.expectEqualStrings("opaque-once", permissionOptionId(params.value, .approve).?);
+    try std.testing.expectEqualStrings("opaque-reject", permissionOptionId(params.value, .deny).?);
+    var only_allow = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"options":[{"optionId":"allow-once"}]}
+    , .{});
+    defer only_allow.deinit();
+    try std.testing.expect(permissionOptionId(only_allow.value, .deny) == null);
+    const response = try makePermissionResponseAlloc(std.testing.allocator, .{ .integer = 3 }, null);
+    defer std.testing.allocator.free(response);
+    try std.testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":3,"result":{"outcome":{"outcome":"cancelled"}}}
+    , response);
+}
+
+test "Cursor blocking extensions reply on the wire without ending the prompt" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const output = try tmp.dir.createFile(std.testing.io, "responses", .{});
+    defer output.close(std.testing.io);
+    var state: SendPromptState = .{ .prompt_submitted = true };
+    defer state.deinit(allocator);
+    var harness = TEST_HARNESS;
+    harness.cursor_extensions_enabled = true;
+    for ([_][]const u8{
+        \\{"id":3,"method":"cursor/ask_question","params":{"questions":[]}}
+        ,
+        \\{"id":"plan-3","method":"cursor/create_plan","params":{"plan":"Inspect and implement"}}
+        ,
+        \\{"id":4,"method":"cursor/future_extension","params":{}}
+        ,
+    }) |line| {
+        try std.testing.expectEqual(SendLineAction.continue_reading, try handleSendPromptLine(allocator, harness, line, .{ .prompt = "test" }, &state, output));
+    }
+    const responses = try tmp.dir.readFileAlloc(std.testing.io, "responses", allocator, .limited(4096));
+    defer allocator.free(responses);
+    try std.testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":3,"result":{"outcome":{"outcome":"skipped"}}}
+        \\{"jsonrpc":"2.0","id":"plan-3","result":{"outcome":{"outcome":"rejected"}}}
+        \\{"jsonrpc":"2.0","id":4,"error":{"code":-32601,"message":"Unsupported Cursor extension"}}
+        \\
+    , responses);
+}
+
+test "ACP prompts preserve multiple images and reject unsupported attachments" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.png", .data = "first-image" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "b.png", .data = "second-image" });
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &dir_buf);
+    const first = try std.fs.path.join(allocator, &.{ dir_buf[0..dir_len], "a.png" });
+    defer allocator.free(first);
+    const second = try std.fs.path.join(allocator, &.{ dir_buf[0..dir_len], "b.png" });
+    defer allocator.free(second);
+    const request: provider_types.SendPromptRequest = .{ .prompt = "Compare", .images = &.{ .{ .path = first }, .{ .path = second } } };
+    const json = try makePromptRequestAlloc(allocator, 3, "session", request, true);
+    defer allocator.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    const blocks = getObjectField(getObjectField(parsed.value, "params").?, "prompt").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), blocks.len);
+    try std.testing.expectEqualStrings("Zmlyc3QtaW1hZ2U=", getOptionalObjectString(blocks[1], "data").?);
+    try std.testing.expectEqualStrings("c2Vjb25kLWltYWdl", getOptionalObjectString(blocks[2], "data").?);
+    try std.testing.expectError(error.AcpAttachmentsUnsupported, makePromptRequestAlloc(allocator, 3, "session", request, false));
 }

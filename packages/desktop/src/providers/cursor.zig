@@ -24,6 +24,7 @@ const RESOURCE_EXHAUSTED_MESSAGE =
 ;
 
 const ACP_HARNESS: acp.Harness = .{
+    .cursor_extensions_enabled = true,
     .diagnostics_category = .cursor_acp,
     .assistant_author = "Cursor",
     .permission_default_title = "Cursor permission request",
@@ -291,7 +292,7 @@ pub const Client = struct {
         } else null;
 
         var state: acp.SendPromptState = .{};
-        errdefer state.deinit(allocator);
+        defer state.deinit(allocator);
 
         try proc.writeLine(try acp.makeInitializeRequestAlloc(allocator, 1));
         if (request.thread_id) |thread_id| {
@@ -335,8 +336,8 @@ pub const Client = struct {
         proc.stop();
 
         const thread_id = state.session_id orelse return error.CursorAcpFailed;
-        state.session_id = null;
         const reply_text = try state.reply.toOwnedSlice(allocator);
+        state.session_id = null;
         state.reply = .empty;
         return .{
             .thread_id = thread_id,

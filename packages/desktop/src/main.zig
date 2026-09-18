@@ -2288,12 +2288,12 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             chat_panel_ui.handleTranscriptPaletteMouseMotion(state);
             workspace_strip_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
             const ctrl_down = isCtrlPressed() or isKeymodPressed(SDL_GetModState(), sdl.Keymod.ctrl);
-            if (workspace_panes_ui.hasActivePaneDrag() and workspace_panes_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y, ctrl_down)) {
+            if (workspace_panes_ui.hasActivePaneDrag() and workspace_panes_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y, event.motion.xrel, event.motion.yrel, ctrl_down)) {
                 return true;
             }
             // Focus the workspace leaf before forwarding motion to its content.
             // Mouse-aware TUIs consume motion, which must not prevent hover focus.
-            if (workspace_panes_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y, ctrl_down)) {
+            if (workspace_panes_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y, event.motion.xrel, event.motion.yrel, ctrl_down)) {
                 return true;
             }
             if (terminal_panel_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y, event.motion.state)) {

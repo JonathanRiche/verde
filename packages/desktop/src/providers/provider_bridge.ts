@@ -438,9 +438,30 @@ function backgroundTaskBody(command, summary) {
   return command;
 }
 
-function emitClaudeTaskNotification(message, commandByToolUseId, backgroundState) {
+function emitClaudeTaskNotification(message, commandByToolUseId, backgroundState, subagentByToolUseId) {
+  if (message?.type === "system" && message?.subtype === "task_started") {
+    if (message.task_id && message.tool_use_id) backgroundState.taskToolUseIds.set(message.task_id, message.tool_use_id);
+    return false;
+  }
   if (message?.type !== "system" || message?.subtype !== "task_notification") return false;
-  const toolUseId = message.tool_use_id;
+  const toolUseId = message.tool_use_id ?? backgroundState.taskToolUseIds.get(message.task_id);
+  backgroundState.taskToolUseIds.delete(message.task_id);
+  const subagentTitle = subagentByToolUseId.get(toolUseId);
+  if (subagentTitle && backgroundState.trackedToolUseIds.has(toolUseId)) {
+    backgroundState.trackedToolUseIds.delete(toolUseId);
+    subagentByToolUseId.delete(toolUseId);
+    const failed = message.status !== "completed";
+    write({
+      type: "tool_call_event",
+      call_id: toolUseId,
+      title: subagentTitle,
+      kind: "subagent",
+      status: failed ? "failed" : "completed",
+      output: failed ? undefined : message.summary,
+      error_text: failed ? message.summary || `Background agent ${message.status}` : undefined,
+    });
+    return true;
+  }
   if (typeof toolUseId !== "string" || !backgroundState.trackedToolUseIds.has(toolUseId)) return false;
   const command = typeof toolUseId === "string"
     ? commandByToolUseId.get(toolUseId)
@@ -539,6 +560,7 @@ function emitClaudeToolEvents(message, commandByToolUseId, mcpByToolUseId, subag
     const subagent = subagentFromClaudeToolUse(item);
     if (subagent && typeof item.id === "string") {
       subagentByToolUseId.set(item.id, subagent.title);
+      if (item.input?.run_in_background === true) backgroundState.trackedToolUseIds.add(item.id);
       write({
         type: "tool_call_event",
         call_id: item.id,
@@ -571,6 +593,9 @@ function emitClaudeToolEvents(message, commandByToolUseId, mcpByToolUseId, subag
       if (completedSubagentTitle) {
         const result = claudeToolResultText(item);
         const failed = item.is_error === true;
+        // An async launch acknowledgement is not the agent's completion.
+        if (!failed && backgroundState.trackedToolUseIds.has(item.tool_use_id)) continue;
+        backgroundState.trackedToolUseIds.delete(item.tool_use_id);
         write({
           type: "tool_call_event",
           call_id: item.tool_use_id,
@@ -589,7 +614,7 @@ function emitClaudeToolEvents(message, commandByToolUseId, mcpByToolUseId, subag
       const failedCommand = commandByToolUseId.get(item.tool_use_id);
       if (failedCommand) {
         backgroundState.trackedToolUseIds.delete(item.tool_use_id);
-        write({ type: "stream_event", title: "Command failed", body: failedCommand });
+        write({ type: "stream_event", title: "Command failed", body: backgroundTaskBody(failedCommand, claudeToolResultText(item)) });
       }
     }
   }
@@ -1123,7 +1148,7 @@ async function handleClaudeSendPrompt(sdk, request) {
     let sessionId = request.thread_id ?? null;
     let reply = "";
     let streamedText = "";
-    const backgroundState = { trackedToolUseIds: new Set(), scheduledToolUseIds: new Set(), pendingBackgrounds: [] };
+    const backgroundState = { trackedToolUseIds: new Set(), scheduledToolUseIds: new Set(), pendingBackgrounds: [], taskToolUseIds: new Map(), liveBackgroundTasks: [] };
     for await (const message of query) {
       const rateLimitFailure = claudeRejectedRateLimitMessage(message);
       if (rateLimitFailure) throw new Error(rateLimitFailure);
@@ -1141,6 +1166,11 @@ async function handleClaudeSendPrompt(sdk, request) {
         write({ type: "thread_id", thread_id: sessionId });
         continue;
       }
+      if (message?.type === "system" && message?.subtype === "background_tasks_changed") {
+        // SDK membership snapshots also cover agents backgrounded after launch.
+        backgroundState.liveBackgroundTasks = message.tasks ?? [];
+        continue;
+      }
       if (message?.type === "result") {
         sessionId = message.session_id ?? sessionId;
         if (message.is_error) {
@@ -1152,12 +1182,12 @@ async function handleClaudeSendPrompt(sdk, request) {
           await Promise.allSettled(backgroundState.pendingBackgrounds);
           backgroundState.pendingBackgrounds.length = 0;
         }
-        if (backgroundState.trackedToolUseIds.size === 0) finishInput();
+        if (backgroundState.trackedToolUseIds.size === 0 && backgroundState.liveBackgroundTasks.length === 0) finishInput();
         continue;
       }
       // Claude auto-continues after background task notifications. Keep the
       // query open so it can inspect the result and finish the turn itself.
-      emitClaudeTaskNotification(message, commandByToolUseId, backgroundState);
+      emitClaudeTaskNotification(message, commandByToolUseId, backgroundState, subagentByToolUseId);
       emitClaudeSdkMessage(message);
       emitClaudeToolEvents(message, commandByToolUseId, mcpByToolUseId, subagentByToolUseId, query, backgroundState);
       const delta = textFromContent(message?.message?.content ?? message?.content);
