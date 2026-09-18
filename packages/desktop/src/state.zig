@@ -2739,6 +2739,7 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
             const options = composerModelOptions(state, state.currentThread().provider);
             if (index >= options.len) return;
             state.setCurrentThreadModelRef(options[index].value);
+            state.rememberCurrentModelOptions();
         },
         .reasoning_changed => |index| {
             const thread = state.currentThreadMutable();
@@ -2752,6 +2753,7 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
                     thread.reasoning_effort != null;
                 if (!changed) return;
                 thread.reasoning_effort = next;
+                state.rememberCurrentModelOptions();
                 state.markDirty();
                 return;
             }
@@ -2774,6 +2776,7 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
                     state.allocator.free(old);
                     thread.opencode_reasoning_variant = null;
                 }
+                state.rememberCurrentModelOptions();
                 state.markDirty();
                 return;
             }
@@ -2790,6 +2793,7 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
             if (matches) return;
             if (thread.opencode_reasoning_variant) |old| state.allocator.free(old);
             thread.opencode_reasoning_variant = if (row.variant) |rv| state.allocator.dupeZ(u8, rv) catch null else null;
+            state.rememberCurrentModelOptions();
             state.markDirty();
         },
         .fast_changed => |enabled| {
@@ -2798,6 +2802,7 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
             const thread = state.currentThreadMutable();
             if (thread.fast_mode == next) return;
             thread.fast_mode = next;
+            state.rememberCurrentModelOptions();
             state.markDirty();
         },
         .access_changed => |enabled| {
@@ -3884,8 +3889,10 @@ fn paletteModelPickerEvent(context: ?*anyopaque, event: palette.RichPickerEvent)
             const option = modelPickerOptionAt(state, index) orelse return;
             if (entry.provider != state.currentThread().provider) {
                 state.setCurrentThreadProvider(entry.provider);
+                if (state.currentThread().provider != entry.provider) return;
             }
             state.setCurrentThreadModelRef(option.value);
+            state.rememberCurrentModelOptions();
             state.syncPaletteComposerControls();
         },
         .action => |index| {
@@ -7366,17 +7373,33 @@ pub const AppState = struct {
         const project = &self.project_controller.projects.items[project_index];
         if (thread_index >= project.threads.items.len) return;
 
-        const provider = providerFromConfig(self.app_config.new_chat_provider);
-        const configured_model = self.app_config.new_chat_model orelse composerDefaultModelRef(self, provider);
+        const thread = &project.threads.items[thread_index];
+        // A GUI choice carries its provider as well as its model into the next chat.
+        // Configured defaults bootstrap chats until the user makes that choice.
+        const last_provider = self.app_config.last_chat_provider;
+        const provider = last_provider orelse self.app_config.new_chat_provider;
+        try self.applyProviderModelDefaults(thread, providerFromConfig(provider), last_provider == null);
+        _ = try self.applyWorkspaceRuntimeDefaultToThread(project.id, thread);
+    }
+
+    fn applyProviderModelDefaults(self: *AppState, thread: *ChatThread, provider: Provider, use_configured: bool) !void {
+        // Explicit new-chat model defaults take precedence over remembered choices.
+        const explicit_model = if (use_configured) self.app_config.new_chat_model else null;
+        const saved = self.app_config.remembered_models[@intFromEnum(configChatProvider(provider))];
+        const remembered = if (explicit_model == null and saved != null and self.providerSupportsModel(provider, saved.?.model)) saved else null;
+        const configured_model = explicit_model orelse if (remembered) |entry| entry.model else composerDefaultModelRef(self, provider);
         const model = if (self.providerSupportsModel(provider, configured_model)) configured_model else composerDefaultModelRef(self, provider);
         const owned_model = try self.allocator.dupeZ(u8, model);
         errdefer self.allocator.free(owned_model);
 
         var reasoning_effort: ?ReasoningEffort = null;
         var variant_value: ?[]const u8 = null;
-        const configured_reasoning = self.app_config.new_chat_reasoning;
-        if (configured_reasoning != .provider_default) {
-            const raw = configured_reasoning.configValue();
+        const raw_reasoning: ?[]const u8 = if (remembered) |entry| entry.reasoning else if (use_configured) (if (self.app_config.new_chat_reasoning == .provider_default) null else self.app_config.new_chat_reasoning.configValue()) else switch (provider) {
+            .codex => @tagName(DEFAULT_CODEX_REASONING_EFFORT),
+            .claude => "medium",
+            else => null,
+        };
+        if (raw_reasoning) |raw| {
             switch (provider) {
                 .codex => if (parseReasoningEffort(raw)) |effort| {
                     if (workspace_controller.codexSupportsReasoningEffort(model, effort)) reasoning_effort = effort;
@@ -7392,14 +7415,14 @@ pub const AppState = struct {
                 },
                 .cursor => if (self.cursorModelOptionForRef(owned_model)) |option| {
                     if (option.cursor_reasoning_values) |values| for (values) |value| {
-                        if (std.mem.eql(u8, value, raw) or (configured_reasoning == .xhigh and std.mem.eql(u8, value, "extra-high"))) {
+                        if (std.mem.eql(u8, value, raw) or (std.mem.eql(u8, raw, "xhigh") and std.mem.eql(u8, value, "extra-high"))) {
                             variant_value = value;
                             break;
                         }
                     };
                 },
                 .opencode => if (self.opencodeModelOptionForRef(owned_model)) |option| {
-                    if (option.reasoning_variant_keys) |values| for (values) |value| {
+                    if (option.reasoning_supported) if (option.reasoning_variant_keys) |values| for (values) |value| {
                         if (std.mem.eql(u8, value, raw)) {
                             variant_value = value;
                             break;
@@ -7423,7 +7446,6 @@ pub const AppState = struct {
         }
         const owned_variant = if (variant_value) |value| try self.allocator.dupeZ(u8, value) else null;
 
-        const thread = &project.threads.items[thread_index];
         if (thread.model_ref) |previous| self.allocator.free(previous);
         if (thread.provider_thread_id) |previous| self.allocator.free(previous);
         if (thread.opencode_reasoning_variant) |previous| self.allocator.free(previous);
@@ -7433,7 +7455,15 @@ pub const AppState = struct {
         thread.reasoning_effort = reasoning_effort;
         thread.opencode_reasoning_variant = owned_variant;
         thread.fast_mode = .off;
-        _ = try self.applyWorkspaceRuntimeDefaultToThread(project.id, thread);
+        if (remembered) |entry| {
+            if (entry.fast) switch (provider) {
+                .codex => thread.fast_mode = .on,
+                .cursor => if (self.cursorModelOptionForRef(thread.model_ref)) |option| {
+                    if (option.cursor_fast_supported) thread.fast_mode = .on;
+                },
+                else => {},
+            };
+        }
     }
 
     pub fn selectThreadForProject(self: *AppState, project_index: usize, thread_index: usize) void {
@@ -13806,6 +13836,21 @@ pub const AppState = struct {
         return false;
     }
 
+    fn rememberCurrentModelOptions(self: *AppState) void {
+        const thread = self.currentThread();
+        const reasoning: ?[]const u8 = if (thread.opencode_reasoning_variant) |value| value else if (thread.reasoning_effort) |value| @tagName(value) else null;
+        self.app_config.rememberGuiModelSelection(self.allocator, configChatProvider(thread.provider), thread.model_ref orelse composerDefaultModelRef(self, thread.provider), reasoning, thread.fast_mode == .on) catch |err| {
+            log.warn("failed to remember model options: {s}", .{@errorName(err)});
+            return;
+        };
+        app_config.saveAppConfig(self.allocator, &self.app_config) catch |err| {
+            log.warn("failed to persist model options: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Model options changed, but Verde settings could not be saved.");
+            return;
+        };
+        self.app_config_file_mtime = app_config.configFileMtime(self.allocator) catch self.app_config_file_mtime;
+    }
+
     fn setCurrentThreadProvider(self: *AppState, provider: Provider) void {
         const thread = self.currentThreadMutable();
         if (thread.provider == provider) return;
@@ -13814,21 +13859,10 @@ pub const AppState = struct {
         // thread into another provider in place.
         if (!threadAllowsInPlaceProviderChoice(thread)) return;
 
-        thread.provider = provider;
-        if (thread.provider_thread_id) |thread_id| self.allocator.free(thread_id);
-        thread.provider_thread_id = null;
-        if (thread.model_ref) |model_ref| self.allocator.free(model_ref);
-        thread.model_ref = self.allocator.dupeZ(u8, composerDefaultModelRef(self, provider)) catch null;
-        thread.reasoning_effort = switch (provider) {
-            .codex => DEFAULT_CODEX_REASONING_EFFORT,
-            .claude => .medium,
-            else => null,
+        self.applyProviderModelDefaults(thread, provider, false) catch |err| {
+            log.warn("failed to restore provider model options: {s}", .{@errorName(err)});
+            return;
         };
-        if (thread.opencode_reasoning_variant) |v| {
-            self.allocator.free(v);
-            thread.opencode_reasoning_variant = null;
-        }
-        thread.fast_mode = .off;
         self.markDirty();
     }
 
@@ -16818,10 +16852,94 @@ test "GUI new-chat defaults apply configured provider model and reasoning" {
     };
     try state.applyNewChatDefaults(0, 0);
 
-    const thread = &state.project_controller.projects.items[0].threads.items[0];
+    var thread = &state.project_controller.projects.items[0].threads.items[0];
     try std.testing.expectEqual(Provider.codex, thread.provider);
     try std.testing.expectEqualStrings("gpt-5.6-terra", thread.model_ref.?);
     try std.testing.expectEqual(ReasoningEffort.max, thread.reasoning_effort.?);
+
+    try state.app_config.rememberModel(allocator, .codex, "gpt-5.6-sol", "high", true);
+    try state.app_config.rememberModel(allocator, .claude, "sonnet", "low", true);
+    // Explicit settings still win for new chats.
+    try state.applyNewChatDefaults(0, 0);
+    try std.testing.expectEqualStrings("gpt-5.6-terra", thread.model_ref.?);
+    try std.testing.expectEqual(ReasoningEffort.max, thread.reasoning_effort.?);
+    try std.testing.expectEqual(FastMode.off, thread.fast_mode);
+
+    // Regression: choosing Claude then creating another chat must not return to Codex,
+    // even when a Codex model is configured as the initial default.
+    try state.app_config.rememberGuiModelSelection(allocator, .claude, "sonnet", "low", false);
+    const next_index = try state.project_controller.projects.items[0].addThread(allocator);
+    thread = &state.project_controller.projects.items[0].threads.items[0];
+    try state.applyNewChatDefaults(0, next_index);
+    const next_thread = &state.project_controller.projects.items[0].threads.items[next_index];
+    try std.testing.expectEqual(Provider.claude, next_thread.provider);
+    try std.testing.expectEqualStrings("sonnet", next_thread.model_ref.?);
+    try std.testing.expectEqual(ReasoningEffort.low, next_thread.reasoning_effort.?);
+    try std.testing.expectEqual(Provider.codex, state.project_controller.projects.items[0].threads.items[0].provider);
+    try state.app_config.rememberGuiModelSelection(allocator, .codex, "gpt-5.6-sol", "high", true);
+
+    allocator.free(state.app_config.new_chat_model.?);
+    state.app_config.new_chat_model = null;
+    try state.applyNewChatDefaults(0, 0);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", thread.model_ref.?);
+    try std.testing.expectEqual(ReasoningEffort.high, thread.reasoning_effort.?);
+    try std.testing.expectEqual(FastMode.on, thread.fast_mode);
+
+    // Provider switches restore their own options without changing the saved values.
+    try state.applyProviderModelDefaults(thread, .claude, false);
+    try std.testing.expectEqualStrings("sonnet", thread.model_ref.?);
+    try std.testing.expectEqual(ReasoningEffort.low, thread.reasoning_effort.?);
+    try std.testing.expectEqual(FastMode.off, thread.fast_mode);
+    try state.applyProviderModelDefaults(thread, .codex, false);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", thread.model_ref.?);
+    try std.testing.expectEqual(FastMode.on, thread.fast_mode);
+
+    try state.app_config.rememberModel(allocator, .codex, "gpt-5.6-sol", null, false);
+    try state.applyNewChatDefaults(0, 0);
+    try std.testing.expectEqual(@as(?ReasoningEffort, null), thread.reasoning_effort);
+    try std.testing.expectEqual(FastMode.off, thread.fast_mode);
+    try state.app_config.rememberModel(allocator, .codex, "gpt-5.6-sol", "obsolete-effort", false);
+    try state.applyNewChatDefaults(0, 0);
+    try std.testing.expectEqual(@as(?ReasoningEffort, null), thread.reasoning_effort);
+
+    try state.app_config.rememberModel(allocator, .codex, "removed-model", "high", true);
+    try state.applyNewChatDefaults(0, 0);
+    try std.testing.expectEqualStrings(composerDefaultModelRef(&state, .codex), thread.model_ref.?);
+    try std.testing.expectEqual(FastMode.off, thread.fast_mode);
+    try std.testing.expectEqualStrings("removed-model", state.app_config.remembered_models[@intFromEnum(app_config.ChatProvider.codex)].?.model);
+
+    // Provider-specific variants survive, but stale variants and unsupported speed do not.
+    defer state.cursor_model_options.deinit(allocator);
+    try state.cursor_model_options.append(allocator, .{
+        .label = "Cursor test model",
+        .value = "cursor-test",
+        .cursor_fast_supported = true,
+        .cursor_reasoning_values = &.{ "low", "extra-high" },
+    });
+    try state.app_config.rememberModel(allocator, .cursor, "cursor-test", "extra-high", true);
+    try state.applyProviderModelDefaults(thread, .cursor, false);
+    try std.testing.expectEqualStrings("extra-high", thread.opencode_reasoning_variant.?);
+    try std.testing.expectEqual(FastMode.on, thread.fast_mode);
+    state.cursor_model_options.items[0].cursor_fast_supported = false;
+    state.cursor_model_options.items[0].cursor_reasoning_values = &.{"low"};
+    try state.applyProviderModelDefaults(thread, .cursor, false);
+    try std.testing.expect(thread.opencode_reasoning_variant == null);
+    try std.testing.expectEqual(FastMode.off, thread.fast_mode);
+
+    defer state.opencode_model_options.deinit(allocator);
+    var variants = [_][:0]const u8{"custom"};
+    try state.opencode_model_options.append(allocator, .{
+        .label = "OpenCode test model",
+        .value = "opencode-test",
+        .reasoning_variant_keys = &variants,
+    });
+    try state.app_config.rememberModel(allocator, .opencode, "opencode-test", "custom", true);
+    try state.applyProviderModelDefaults(thread, .opencode, false);
+    try std.testing.expectEqualStrings("custom", thread.opencode_reasoning_variant.?);
+    try std.testing.expectEqual(FastMode.off, thread.fast_mode);
+    state.opencode_model_options.items[0].reasoning_supported = false;
+    try state.applyProviderModelDefaults(thread, .opencode, false);
+    try std.testing.expect(thread.opencode_reasoning_variant == null);
 }
 
 test "workspace settings modal stays bound by id and marks the effective default" {
