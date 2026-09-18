@@ -65,6 +65,18 @@ pub const ChatReasoning = enum {
     }
 };
 
+/// Last explicit GUI selection for one provider; never populated by thread restore.
+pub const RememberedModel = struct {
+    model: []u8,
+    reasoning: ?[]u8 = null,
+    fast: bool = false,
+
+    pub fn deinit(self: *RememberedModel, allocator: std.mem.Allocator) void {
+        allocator.free(self.model);
+        if (self.reasoning) |value| allocator.free(value);
+    }
+};
+
 pub const FavoriteModel = struct {
     provider: ChatProvider,
     model: []u8,
@@ -297,6 +309,8 @@ pub const AppConfig = struct {
     new_chat_provider: ChatProvider = .codex,
     new_chat_model: ?[]u8 = null,
     new_chat_reasoning: ChatReasoning = .medium,
+    last_chat_provider: ?ChatProvider = null,
+    remembered_models: [std.meta.fields(ChatProvider).len]?RememberedModel = @splat(null),
     favorite_models: []FavoriteModel = &.{},
     new_chat_pane_behavior: NewChatPaneBehavior = .new_pane,
     check_for_updates_automatically: bool = true,
@@ -313,6 +327,7 @@ pub const AppConfig = struct {
         if (self.active_theme) |name| allocator.free(name);
         if (self.chat_title_model) |model| allocator.free(model);
         if (self.new_chat_model) |model| allocator.free(model);
+        for (&self.remembered_models) |*entry| if (entry.*) |*value| value.deinit(allocator);
         for (self.favorite_models) |*favorite| favorite.deinit(allocator);
         allocator.free(self.favorite_models);
         for (self.installed_themes) |*installed| installed.deinit(allocator);
@@ -341,6 +356,21 @@ pub const AppConfig = struct {
         const owned_model = try allocator.dupe(u8, model);
         if (self.new_chat_model) |previous| allocator.free(previous);
         self.new_chat_model = owned_model;
+    }
+
+    /// Record an explicit GUI choice, including the provider for the next chat.
+    pub fn rememberGuiModelSelection(self: *AppConfig, allocator: std.mem.Allocator, provider: ChatProvider, model: []const u8, reasoning: ?[]const u8, fast: bool) !void {
+        try self.rememberModel(allocator, provider, model, reasoning, fast);
+        self.last_chat_provider = provider;
+    }
+
+    pub fn rememberModel(self: *AppConfig, allocator: std.mem.Allocator, provider: ChatProvider, model: []const u8, reasoning: ?[]const u8, fast: bool) !void {
+        const owned_model = try allocator.dupe(u8, model);
+        errdefer allocator.free(owned_model);
+        const owned_reasoning = if (reasoning) |value| try allocator.dupe(u8, value) else null;
+        const entry = &self.remembered_models[@intFromEnum(provider)];
+        if (entry.*) |*previous| previous.deinit(allocator);
+        entry.* = .{ .model = owned_model, .reasoning = owned_reasoning, .fast = fast };
     }
 
     pub fn isFavoriteModel(self: AppConfig, provider: ChatProvider, model: []const u8) bool {
@@ -710,6 +740,22 @@ fn writeChatSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, c
         _ = chat_object.swapRemove("default_model");
     }
     try chat_object.put(allocator, "default_reasoning", .{ .string = config.new_chat_reasoning.configValue() });
+    if (config.last_chat_provider) |provider| {
+        try chat_object.put(allocator, "last_provider", .{ .string = @tagName(provider) });
+    } else {
+        _ = chat_object.swapRemove("last_provider");
+    }
+    var remembered: std.json.ObjectMap = .empty;
+    inline for (std.meta.fields(ChatProvider)) |field| {
+        if (config.remembered_models[field.value]) |entry| {
+            var selection: std.json.ObjectMap = .empty;
+            try selection.put(allocator, "model", .{ .string = entry.model });
+            try selection.put(allocator, "reasoning", if (entry.reasoning) |value| .{ .string = value } else .null);
+            try selection.put(allocator, "fast", .{ .bool = entry.fast });
+            try remembered.put(allocator, field.name, .{ .object = selection });
+        }
+    }
+    try chat_object.put(allocator, "remembered_models", .{ .object = remembered });
     var favorites = std.json.Array.init(allocator);
     for (config.favorite_models) |favorite| {
         var favorite_object: std.json.ObjectMap = .empty;
@@ -873,6 +919,28 @@ fn applyChatOverrides(allocator: std.mem.Allocator, config: *AppConfig, chat_val
     if (chat_value != .object) {
         log.warn("chat must be an object when provided", .{});
         return;
+    }
+    if (chat_value.object.get("last_provider")) |provider| {
+        if (provider == .string) config.last_chat_provider = ChatProvider.parse(provider.string);
+    }
+    if (chat_value.object.get("remembered_models")) |remembered| {
+        if (remembered == .object) {
+            var entries = remembered.object.iterator();
+            while (entries.next()) |entry| {
+                const provider = ChatProvider.parse(entry.key_ptr.*) orelse continue;
+                if (entry.value_ptr.* != .object) continue;
+                const selection = entry.value_ptr.object;
+                const model = selection.get("model") orelse continue;
+                if (model != .string or model.string.len == 0) continue;
+                const reasoning = selection.get("reasoning") orelse .null;
+                if (reasoning != .null and reasoning != .string) continue;
+                const fast: std.json.Value = selection.get("fast") orelse .{ .bool = false };
+                if (fast != .bool) continue;
+                config.rememberModel(allocator, provider, model.string, if (reasoning == .string) reasoning.string else null, fast.bool) catch {
+                    log.warn("could not allocate remembered model", .{});
+                };
+            }
+        }
     }
     if (chat_value.object.get("automatic_titles")) |enabled_value| {
         if (enabled_value == .bool) {
@@ -2111,4 +2179,49 @@ fn parseTestRoot(raw: []const u8) !std.json.Parsed(std.json.Value) {
     return std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{
         .allocate = .alloc_always,
     });
+}
+
+test "remembered model options round trip and stay separate per provider" {
+    const allocator = std.testing.allocator;
+    var config: AppConfig = .{};
+    defer config.deinit(allocator);
+    try config.rememberModel(allocator, .codex, "old-model", null, false);
+    try config.rememberModel(allocator, .codex, "gpt-5.6-sol", "high", true);
+    try config.rememberModel(allocator, .opencode, "custom/model", "custom-variant", false);
+    try config.rememberGuiModelSelection(allocator, .claude, "sonnet", null, false);
+    var root = try parseTestRoot("{}");
+    defer root.deinit();
+    try writeChatSection(root.arena.allocator(), &root.value.object, &config);
+    const encoded = try std.json.Stringify.valueAlloc(allocator, root.value, .{});
+    defer allocator.free(encoded);
+    var saved = try parseTestRoot(encoded);
+    defer saved.deinit();
+    var loaded: AppConfig = .{};
+    defer loaded.deinit(allocator);
+    applyAppOverrides(allocator, &loaded, saved.value);
+    try std.testing.expectEqual(ChatProvider.claude, loaded.last_chat_provider.?);
+    const codex = loaded.remembered_models[@intFromEnum(ChatProvider.codex)].?;
+    try std.testing.expectEqualStrings("gpt-5.6-sol", codex.model);
+    try std.testing.expectEqualStrings("high", codex.reasoning.?);
+    try std.testing.expect(codex.fast);
+    const opencode = loaded.remembered_models[@intFromEnum(ChatProvider.opencode)].?;
+    try std.testing.expectEqualStrings("custom/model", opencode.model);
+    try std.testing.expectEqualStrings("custom-variant", opencode.reasoning.?);
+    try std.testing.expect(!opencode.fast);
+    try std.testing.expect(loaded.remembered_models[@intFromEnum(ChatProvider.claude)].?.reasoning == null);
+    try std.testing.expect(loaded.remembered_models[@intFromEnum(ChatProvider.cursor)] == null);
+}
+
+test "remembered model options ignore malformed entries and unknown providers" {
+    var root = try parseTestRoot(
+        \\{"chat":{"remembered_models":{"unknown":{"model":"x"},"codex":{"model":""},"claude":{"model":"sonnet","reasoning":9},"cursor":{"model":"auto","fast":"yes"},"pi":{"model":"valid","reasoning":null}}}}
+    );
+    defer root.deinit();
+    var config: AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+    applyAppOverrides(std.testing.allocator, &config, root.value);
+    try std.testing.expect(config.remembered_models[@intFromEnum(ChatProvider.codex)] == null);
+    try std.testing.expect(config.remembered_models[@intFromEnum(ChatProvider.claude)] == null);
+    try std.testing.expect(config.remembered_models[@intFromEnum(ChatProvider.cursor)] == null);
+    try std.testing.expectEqualStrings("valid", config.remembered_models[@intFromEnum(ChatProvider.pi)].?.model);
 }
