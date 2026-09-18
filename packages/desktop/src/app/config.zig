@@ -525,7 +525,9 @@ pub fn saveAppConfig(allocator: std.mem.Allocator, config: *const AppConfig) !vo
     const io = threaded.io();
 
     if (std.fs.path.dirname(config_path)) |parent| {
-        try std.Io.Dir.cwd().createDirPath(io, parent);
+        // Open existing directories first so dotfile-managed symlinks are followed.
+        var parent_dir = try std.Io.Dir.cwd().createDirPathOpen(io, parent, .{});
+        parent_dir.close(io);
     }
 
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{config_path});
