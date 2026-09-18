@@ -5,6 +5,8 @@ const sdl = @import("zsdl3");
 const app_config = @import("../app/config.zig");
 const browser_inspector = @import("../browser/inspector.zig");
 const browser_runtime = @import("../browser/mod.zig");
+const browser_readiness = @import("../browser/readiness.zig");
+const browser_background_events = @import("browser_background_events.zig");
 const browser_screenshot = @import("../browser/screenshot.zig");
 const runtime_log = @import("../runtime/log.zig");
 const theme = @import("../ui/theme.zig");
@@ -181,6 +183,8 @@ fn browserUriEffectivePort(uri: std.Uri) ?u16 {
 
 pub const State = struct {
     runtime: browser_runtime.State,
+    /// Commands borrow background runtimes without changing the presented controller.
+    background_access: bool = false,
     retained_runtimes: std.ArrayList(RetainedBrowserRuntime) = .empty,
     runtime_project_index: ?usize = null,
     /// The exact workspace pane whose page is loaded in the project's single
@@ -513,6 +517,8 @@ pub fn toggleBrowser(self: anytype) void {
         self.setSidebarNotice("Failed to open browser pane.");
         return;
     };
+    // Explicit user navigation reveals the browser; automation preserves zoom.
+    self.project_controller.projects.items[result.workspace_index].workspace_layout.maximized_pane_id = null;
     _ = self.focusCurrentProjectWorkspacePane(result.pane_id);
     self.browser_controller.address_focused = true;
     self.browser_controller.address_cursor = self.browser_controller.runtime.addressInput().len;
@@ -525,7 +531,11 @@ pub fn toggleBrowser(self: anytype) void {
 
 /// Ensures a workspace-local browser pane exists and activates its retained runtime.
 pub fn openBrowserInWorkspace(self: anytype, project_index: usize, url: ?[]const u8) !BrowserOpenResult {
-    return openBrowserInWorkspaceWithDirtyPolicy(self, project_index, url, null, true);
+    const bound_pane_id = if (self.browser_controller.background_access and project_index < self.project_controller.projects.items.len)
+        liveBrowserPaneId(&self.project_controller.projects.items[project_index].workspace_layout, self.browser_controller.runtime_pane_id)
+    else
+        null;
+    return openBrowserInWorkspaceWithDirtyPolicy(self, project_index, url, bound_pane_id, true);
 }
 
 fn openBrowserInWorkspaceWithDirtyPolicy(
@@ -561,8 +571,7 @@ fn openBrowserInWorkspaceWithDirtyPolicy(
             .browser => break :exact pane_id,
             else => return error.BrowserPaneNotFound,
         }
-    } else try layout.ensureBrowserPane(self.allocator);
-    if (restore_pane_id == null) layout.maximized_pane_id = null;
+    } else try layout.ensureBrowserPanePreservingFocus(self.allocator);
     const binding_changed = self.browser_controller.runtime_pane_id != browser_pane_id;
     if (!restored_live_runtime or binding_changed) self.applyBrowserPaneSnapshotToRuntime(project_index, browser_pane_id);
     const restore_url = self.browserPaneSnapshotUrl(project_index, browser_pane_id);
@@ -575,7 +584,6 @@ fn openBrowserInWorkspaceWithDirtyPolicy(
     }
 
     self.browser_controller.runtime.setControlsVisible(true);
-    self.browser_controller.address_focused = false;
     self.browser_controller.inspector_menu_open = false;
     self.browser_controller.address_cursor = self.browser_controller.runtime.addressInput().len;
 
@@ -588,12 +596,12 @@ fn openBrowserInWorkspaceWithDirtyPolicy(
         } else {
             try navigateBrowserRuntimeForRestore(self, restored_url);
         }
-    } else if (switching_workspace or project_index == selected_index or !self.browser_controller.surface_suspended_for_layout) {
+    } else if (!self.browser_controller.background_access and (switching_workspace or project_index == selected_index or !self.browser_controller.surface_suspended_for_layout)) {
         try self.showBrowserRuntimeForLiveOpen();
     }
     self.browser_controller.runtime_pane_id = browser_pane_id;
 
-    if (project_index == selected_index) {
+    if (project_index == selected_index and !self.browser_controller.background_access) {
         self.restoreBrowserSurfaceForRenderedLayout();
         self.syncBrowserPaneBoundsToBackend();
     } else {
@@ -632,7 +640,26 @@ fn navigateBrowserRuntimeForRestore(self: anytype, value: []const u8) !void {
 pub fn activateBrowserInWorkspace(self: anytype, project_index: usize) !BrowserOpenResult {
     if (project_index >= self.project_controller.projects.items.len) return error.WorkspaceNotFound;
     const layout = &self.project_controller.projects.items[project_index].workspace_layout;
-    const pane_id = preferredBrowserPaneId(layout) orelse return error.BrowserNotVisible;
+    const bound_pane_id = if (self.browser_controller.runtime_project_index == project_index)
+        self.browser_controller.runtime_pane_id
+    else retained: {
+        for (self.browser_controller.retained_runtimes.items) |entry| {
+            if (entry.project_index == project_index) break :retained entry.pane_id;
+        }
+        break :retained null;
+    };
+    const pane_id = liveBrowserPaneId(layout, bound_pane_id) orelse return error.BrowserNotVisible;
+    if (self.browser_controller.background_access and self.browser_controller.runtime_pane_id == pane_id and
+        self.browser_controller.runtime.controller.runtimeInitialized())
+    {
+        self.browser_controller.runtime.setControlsVisible(true);
+        if (self.browser_controller.runtime.status == .hidden) {
+            const ref = self.browserPaneRefMutable(project_index, pane_id);
+            const tab = if (ref) |pane| pane.activeTab() else null;
+            self.browser_controller.runtime.status = if (tab != null and tab.?.loading) .opening else .ready;
+        }
+        return .{ .pane_id = pane_id, .workspace_index = project_index, .moved_from_workspace = null };
+    }
     if (self.browser_controller.runtime.controls_visible) {
         if (self.browser_controller.runtime_project_index) |runtime_project_index| {
             if (runtime_project_index == project_index and self.browser_controller.runtime_pane_id == pane_id) {
@@ -647,7 +674,16 @@ pub fn activateBrowserInWorkspace(self: anytype, project_index: usize) !BrowserO
             }
         }
     }
-    return openBrowserInWorkspaceWithDirtyPolicy(self, project_index, null, pane_id, true);
+    return openBrowserInWorkspaceWithDirtyPolicy(self, project_index, null, pane_id, false);
+}
+
+fn liveBrowserPaneId(layout: anytype, bound_pane_id: ?WorkspacePaneId) ?WorkspacePaneId {
+    if (bound_pane_id) |pane_id| {
+        if (layout.paneById(pane_id)) |pane| {
+            if (pane.ref == .browser) return pane_id;
+        }
+    }
+    return preferredBrowserPaneId(layout);
 }
 
 fn preferredBrowserPaneId(layout: anytype) ?WorkspacePaneId {
@@ -720,6 +756,12 @@ pub fn recoverBrowser(self: anytype, restore_url: bool) !void {
     try self.browser_controller.runtime.setLastError(null);
     self.browser_controller.runtime.controller.shutdown();
     self.browser_controller.runtime.status = .opening;
+    self.setActiveBrowserTabLoadState(true, false);
+    errdefer {
+        self.browser_controller.runtime.status = .failed;
+        self.setActiveBrowserTabLoadState(false, true);
+        self.browser_controller.runtime.setLastError("Failed to recover browser runtime.") catch {};
+    }
 
     if (current_url) |url| {
         try self.browser_controller.runtime.controller.navigate(url);
@@ -1050,7 +1092,7 @@ pub fn resumeBrowserAfterHostWindowShown(self: anytype) void {
 
 /// Reports whether the selected workspace owns the active browser runtime.
 pub fn isBrowserVisible(self: anytype) bool {
-    return self.isBrowserRuntimeActiveInWorkspace(self.project_controller.selected_index);
+    return !self.browser_controller.background_access and self.isBrowserRuntimeActiveInWorkspace(self.project_controller.selected_index);
 }
 
 /// Reports whether any workspace currently owns the shared browser runtime.
@@ -2084,6 +2126,8 @@ pub fn pollBrowser(self: anytype) bool {
     if (!self.browser_textures_enabled) return false;
 
     var needs_render = self.pollPendingBrowserDevServer();
+    // Retained helpers keep running even when the presented slot has no backend.
+    needs_render = pollRetainedBrowserRuntimes(self) or needs_render;
     if (self.browser_controller.launch_open_delay_frames == 0 and !self.browser_controller.runtime.controller.hasBackend()) return needs_render;
 
     if (self.browser_controller.launch_open_delay_frames > 0) {
@@ -2103,21 +2147,29 @@ pub fn pollBrowser(self: anytype) bool {
             needs_render = true;
         }
     }
+    if (self.browser_controller.runtime_project_index) |project_index| {
+        if (project_index != self.project_controller.selected_index) {
+            return pollBackgroundBrowserRuntime(self, &self.browser_controller.runtime, project_index, self.browser_controller.runtime_pane_id) or needs_render;
+        }
+    }
     needs_render = self.browser_controller.runtime.controller.uploadFrame() or needs_render;
     while (self.browser_controller.runtime.controller.pollEvent()) |event| {
         defer event.deinit(self.allocator);
         needs_render = true;
         switch (event) {
             .opened => {
-                self.browser_controller.runtime.status = .ready;
-                self.browser_controller.runtime.setLastError(null) catch {};
+                const ref = self.visibleBrowserPaneRefMutable();
+                const tab = if (ref) |pane| pane.activeTab() else null;
+                const loading = if (tab) |active| active.loading else self.browser_controller.runtime.status == .opening;
+                self.browser_controller.runtime.status = browser_readiness.afterEvent(self.browser_controller.runtime.status, .opened, loading);
+                if (self.browser_controller.runtime.status != .failed) self.browser_controller.runtime.setLastError(null) catch {};
             },
             .closed => {
-                self.browser_controller.pane_focused = false;
-                self.clearBrowserContextMenuLocal();
                 if (self.consumeSuppressedBrowserClosedEvent()) {
                     continue;
                 }
+                self.browser_controller.pane_focused = false;
+                self.clearBrowserContextMenuLocal();
                 self.browser_controller.runtime.status = .hidden;
                 self.setSidebarNotice("Browser window closed.");
             },
@@ -2127,18 +2179,20 @@ pub fn pollBrowser(self: anytype) bool {
                 // the workspace tab snapshot used by live/MCP commands.
                 if (!browserNavigationUrlIsPersistable(url)) continue;
                 self.clearBrowserContextMenuLocal();
-                self.browser_controller.runtime.status = .ready;
-                self.setActiveBrowserTabLoadState(true, false);
+                self.browser_controller.runtime.status = browser_readiness.afterEvent(self.browser_controller.runtime.status, .navigated, false);
+                if (self.browser_controller.runtime.status != .failed) self.setActiveBrowserTabLoadState(true, false);
                 self.browser_controller.runtime.setCurrentUrl(url) catch {};
                 self.browser_controller.runtime.setAddress(url);
                 self.recordVisibleBrowserPaneNavigation(url);
-                self.browser_controller.runtime.setLastError(null) catch {};
+                if (self.browser_controller.runtime.status != .failed) self.browser_controller.runtime.setLastError(null) catch {};
             },
             .title_changed => |title| {
                 self.browser_controller.runtime.setCurrentTitle(title) catch {};
                 self.recordVisibleBrowserPaneTitle(title);
             },
             .document_loaded => {
+                self.browser_controller.runtime.status = browser_readiness.afterEvent(self.browser_controller.runtime.status, .document_loaded, false);
+                if (self.browser_controller.runtime.status == .failed) continue;
                 self.setActiveBrowserTabLoadState(false, false);
                 self.reapplyBrowserInspectorAfterLoad();
                 self.runBrowserStartupEvalIfRequested();
@@ -2188,18 +2242,7 @@ pub fn pollBrowser(self: anytype) bool {
                 self.browser_controller.runtime.setLastJsMessage(message) catch {};
                 self.setSidebarNotice("Browser bridge message received.");
             },
-            .eval_result => |result| {
-                self.browser_controller.runtime.setLastEvalResult(result) catch {};
-                if (self.browser_controller.clipboard_copy_pending) {
-                    self.browser_controller.clipboard_copy_pending = false;
-                    self.copyBrowserEvalResultToClipboard(result);
-                    continue;
-                }
-                if (self.browser_controller.runtime.consumeSuppressedEvalResult()) {
-                    continue;
-                }
-                self.setSidebarNotice("Browser script evaluation completed.");
-            },
+            .eval_result => |result| recordBrowserEvalResult(self, result),
             .context_menu => |payload| {
                 self.openBrowserContextMenuFromPayload(payload);
             },
@@ -2219,6 +2262,47 @@ pub fn pollBrowser(self: anytype) bool {
         needs_render = true;
     }
     return needs_render;
+}
+
+/// Drains retained sessions independently of the currently presented backend.
+pub fn pollRetainedBrowserRuntimes(self: anytype) bool {
+    var changed = false;
+    for (self.browser_controller.retained_runtimes.items) |*entry| {
+        changed = pollBackgroundBrowserRuntime(self, &entry.runtime, entry.project_index, entry.pane_id) or changed;
+    }
+    return changed;
+}
+
+fn pollBackgroundBrowserRuntime(self: anytype, runtime: *browser_runtime.State, project_index: usize, pane_id: ?WorkspacePaneId) bool {
+    const ref = if (pane_id) |id| self.browserPaneRefMutable(project_index, id) else null;
+    const tab = if (ref) |pane| pane.activeTab() else null;
+    var changed = false;
+    while (runtime.controller.pollEvent()) |event| {
+        defer event.deinit(self.allocator);
+        if (browser_background_events.apply(runtime, tab, self.allocator, event, .{
+            .allow_untrusted = browserBridgePolicyAllowsUntrustedPages(),
+        })) self.markDirty();
+        changed = true;
+    }
+    return changed;
+}
+
+/// Collects immediate background events before restoring presentation ownership.
+pub fn finishBackgroundBrowserAccess(self: anytype) void {
+    if (!self.browser_controller.background_access) return;
+    const project_index = self.browser_controller.runtime_project_index orelse return;
+    _ = pollBackgroundBrowserRuntime(self, &self.browser_controller.runtime, project_index, self.browser_controller.runtime_pane_id);
+}
+
+fn recordBrowserEvalResult(self: anytype, result: []const u8) void {
+    if (self.browser_controller.clipboard_copy_pending) {
+        self.browser_controller.clipboard_copy_pending = false;
+        self.copyBrowserEvalResultToClipboard(result);
+        return;
+    }
+    if (self.browser_controller.runtime.consumeSuppressedEvalResult()) return;
+    self.browser_controller.runtime.setLastEvalResult(result) catch {};
+    self.setSidebarNotice("Browser script evaluation completed.");
 }
 
 /// Records browser presentation after the main renderer successfully submits a frame.
@@ -3489,4 +3573,62 @@ test "scaled WPE pointer coordinates stay in physical pane space" {
 test "browser automation pointer coordinates scale logical input once" {
     try std.testing.expectEqual(@as(f32, 360.0), browserAutomationPointerCoordinate(360.0, 1.0));
     try std.testing.expectEqual(@as(f32, 600.0), browserAutomationPointerCoordinate(360.0, 5.0 / 3.0));
+}
+
+test "Live browser activation prefers a valid runtime binding over user focus" {
+    const Layout = struct {
+        const Pane = struct { ref: enum { browser, chat } };
+        panes: [3]Pane = .{ .{ .ref = .browser }, .{ .ref = .browser }, .{ .ref = .chat } },
+        focused_pane_id: ?WorkspacePaneId = 1,
+        pub fn paneById(self: *const @This(), id: WorkspacePaneId) ?*const Pane {
+            return if (id < self.panes.len) &self.panes[@intCast(id)] else null;
+        }
+        pub fn visibleBrowserPaneId(_: *const @This()) ?WorkspacePaneId {
+            return 0;
+        }
+    };
+    var layout = Layout{};
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 0), liveBrowserPaneId(&layout, 0));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 1), liveBrowserPaneId(&layout, 2));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 1), liveBrowserPaneId(&layout, 99));
+    layout.focused_pane_id = 2;
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 0), liveBrowserPaneId(&layout, null));
+}
+
+test "internal and clipboard evals preserve the last automation result" {
+    const Mock = struct {
+        const Runtime = struct {
+            result: ?[]const u8 = null,
+            suppressed: bool = false,
+            pub fn consumeSuppressedEvalResult(self: *@This()) bool {
+                const value = self.suppressed;
+                self.suppressed = false;
+                return value;
+            }
+            pub fn setLastEvalResult(self: *@This(), value: []const u8) !void {
+                self.result = value;
+            }
+        };
+        browser_controller: struct { runtime: Runtime = .{}, clipboard_copy_pending: bool = false } = .{},
+        copied: ?[]const u8 = null,
+        notices: usize = 0,
+        pub fn copyBrowserEvalResultToClipboard(self: *@This(), value: []const u8) void {
+            self.copied = value;
+        }
+        pub fn setSidebarNotice(self: *@This(), _: []const u8) void {
+            self.notices += 1;
+        }
+    };
+    var app = Mock{};
+    recordBrowserEvalResult(&app, "automation nonce result");
+    app.browser_controller.runtime.suppressed = true;
+    recordBrowserEvalResult(&app, "internal inspector result");
+    try std.testing.expectEqualStrings("automation nonce result", app.browser_controller.runtime.result.?);
+    app.browser_controller.clipboard_copy_pending = true;
+    recordBrowserEvalResult(&app, "clipboard text");
+    try std.testing.expectEqualStrings("clipboard text", app.copied.?);
+    try std.testing.expectEqualStrings("automation nonce result", app.browser_controller.runtime.result.?);
+    try std.testing.expectEqual(@as(usize, 1), app.notices);
+    recordBrowserEvalResult(&app, "next automation result");
+    try std.testing.expectEqualStrings("next automation result", app.browser_controller.runtime.result.?);
 }

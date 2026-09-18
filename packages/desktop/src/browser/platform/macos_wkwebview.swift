@@ -81,7 +81,6 @@ private final class VerdeMacBrowser: NSObject, WKScriptMessageHandler, WKNavigat
 
     init(window: NSWindow) {
         self.window = window
-        Self.configureForegroundApp(window: window)
 
         let contentController = WKUserContentController()
         let bridgeScript = """
@@ -179,7 +178,7 @@ private final class VerdeMacBrowser: NSObject, WKScriptMessageHandler, WKNavigat
     }
 
     func show() {
-        Self.configureForegroundApp(window: window)
+        // Background automation may create or reveal a view without activating the app.
         if !visible {
             visible = true
             queueEvent(.opened)

@@ -28,7 +28,9 @@ pub const Controller = struct {
     backend: ?Backend = null,
     visible: bool = false,
     host_window: ?*anyopaque = null,
-    pane_bounds: browser_types.PaneBounds = .{},
+    // Background automation may navigate before the pane has ever been laid out.
+    // Match the offscreen backend's initial viewport instead of overriding it with 1x1.
+    pane_bounds: browser_types.PaneBounds = .{ .width = 1280, .height = 720 },
     /// Unit-test-only capture at the real controller navigation boundary.
     /// Production construction leaves this null and follows the backend path.
     test_navigation_capture: ?*std.ArrayList(u8) = null,
@@ -463,9 +465,13 @@ test "host window and pane bounds preserve lazy backend startup" {
     defer controller.deinit();
 
     try std.testing.expect(!controller.hasBackend());
+    try std.testing.expectEqual(@as(u32, 1280), controller.pane_bounds.width);
+    try std.testing.expectEqual(@as(u32, 720), controller.pane_bounds.height);
     try controller.setHostWindow(@ptrFromInt(0x1));
     try controller.setPaneBounds(.{ .screen_x = 10, .screen_y = 20, .width = 640, .height = 360 });
     try controller.resizePane(800, 450);
+    try std.testing.expectEqual(@as(u32, 800), controller.pane_bounds.width);
+    try std.testing.expectEqual(@as(u32, 450), controller.pane_bounds.height);
 
     try std.testing.expect(!controller.hasBackend());
     try std.testing.expect(!controller.runtimeInitialized());
