@@ -1576,7 +1576,7 @@ fn resizeSystemCursor(axis: runtime.WorkspaceSplitAxis) sdl.SystemCursor {
     return if (axis == .vertical) .ew_resize else .ns_resize;
 }
 
-pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32, ctrl_down: bool) bool {
+pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32, motion_dx: f32, motion_dy: f32, ctrl_down: bool) bool {
     if (quick_pane_drag) |drag| {
         const dx = (x - drag.start_x) / @max(drag.workspace.w, 1.0);
         const dy = (y - drag.start_y) / @max(drag.workspace.h, 1.0);
@@ -1609,7 +1609,8 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32, ctrl_d
     // The edge affordance owns hover intent so a partially visible pane below
     // it cannot focus first and make the subsequent click skip two panes.
     if (scrollingEdgeProximityContains(x, y)) return false;
-    // Focus-follows-mouse: hovering into a pane focuses it. Skip while a split
+    // Focus follows pointer entry, not motion within a pane that moved under
+    // the cursor or was left behind by keyboard navigation. Skip while a split
     // menu is open and the cursor is inside that menu so the open pane stays put.
     if (split_menu_open_for != null and (rectContains(split_menu_rect, x, y) or rectContains(split_submenu_rect, x, y))) return false;
     var i: usize = pane_rect_count;
@@ -1617,6 +1618,7 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32, ctrl_d
         i -= 1;
         const entry = pane_rects[i];
         if (!rectContains(entry.rect, x, y)) continue;
+        if (rectContains(entry.rect, x - motion_dx, y - motion_dy)) return false;
         if (state.isCurrentProjectWorkspacePaneFocused(entry.pane_id)) return false;
         _ = state.focusCurrentProjectWorkspacePane(entry.pane_id);
         if (split_menu_open_for) |id| {
@@ -1793,6 +1795,7 @@ fn renderScrollingStrip(
     const vertical = direction == .vertical;
     if (layout.scroll_axis_vertical != vertical) {
         layout.scroll_axis_vertical = vertical;
+        layout.scroll_viewport_extent = null;
         layout.scroll_revealed_pane_id = null;
         layout.scroll_reveal_from_pane_id = null;
         layout.clearScrollSkipSlide();
@@ -1858,6 +1861,27 @@ fn renderScrollingStrip(
     const offset: *f32 = if (vertical) &layout.scroll_offset_y else &layout.scroll_offset_x;
     const target: *f32 = if (vertical) &layout.scroll_target_y else &layout.scroll_target_x;
     clampScrollingOffsets(offset, target, max_offset);
+
+    const previous_viewport = layout.scroll_viewport_extent;
+    layout.scroll_viewport_extent = viewport_extent;
+    const viewport_changed = previous_viewport == null or @abs(previous_viewport.? - viewport_extent) > 0.001;
+    // Restore and resize against pane identity, not pixels from the old window.
+    // Explicit navigation still owns its usual minimal-reveal behavior.
+    if (viewport_changed and resize_drag == null and
+        (previous_viewport == null or layout.scroll_revealed_pane_id == layout.focused_pane_id))
+    {
+        if (layout.focused_pane_id) |focused_id| {
+            if (scrollGroupIndexForPane(layout, focused_id)) |index| {
+                const aligned = leadingScrollTargetForPane(extents[0..pane_count], gap, index, max_offset);
+                if (target.* != aligned) markCurrentWorkspaceDirty(state);
+                offset.* = aligned;
+                target.* = aligned;
+                layout.scroll_animation_last_ms = 0;
+                layout.scroll_snap_deadline_ms = 0;
+                layout.clearScrollSkipSlide();
+            }
+        }
+    }
 
     // A live edge drag owns scroll; don't let focus-reveal fight the pointer.
     if (resize_drag != null) {

@@ -156,6 +156,8 @@ pub const WorkspaceLayout = struct {
     /// Transient wheel-settle deadline. Zero means no pane snap is pending.
     scroll_snap_deadline_ms: i64 = 0,
     scroll_axis_vertical: bool = false,
+    /// Last rendered viewport; pixel offsets cannot be reused across resizing.
+    scroll_viewport_extent: ?f32 = null,
     /// Null values inherit the global app configuration. Both fields are
     /// persisted with the workspace layout so a local pin/threshold survives
     /// restart without requiring a database schema change.

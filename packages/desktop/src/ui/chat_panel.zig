@@ -2639,8 +2639,12 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
 
     const actions_right = rect.x + rect.w - right_reserve - button_gap;
     const actions_x = actions_right - actions_w;
-    const badge_w: f32 = if (subagent) theme.scaledUi(78.0) else 0.0;
-    const badge_gap: f32 = if (subagent) theme.scaledUi(10.0) else 0.0;
+    const badge_font = theme.scaledUi(12.0);
+    const badge_pad_x = theme.scaledUi(10.0);
+    // Size the pill to its label so the text sits centered instead of hugging
+    // the left edge of a fixed-width box.
+    const badge_w: f32 = if (subagent) chromeLabelWidth(badge_font, "Subagent") + badge_pad_x * 2.0 else 0.0;
+    const badge_gap: f32 = if (subagent) theme.scaledUi(12.0) else 0.0;
     const title_x = rect.x + padding_x + badge_w + badge_gap;
     const title_max_w = @max(actions_x - title_x - title_gap, theme.scaledUi(96.0));
 
@@ -2650,10 +2654,12 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
     const title_y = rect.y + @max((rect.h - title_line_h) * 0.5, theme.scaledUi(4.0));
     if (subagent) {
         const badge_h = theme.scaledUi(22.0);
-        const badge_y = rect.y + @max((rect.h - badge_h) * 0.5, theme.scaledUi(6.0));
-        const badge_rect = palette.Rect{ .x = rect.x + padding_x, .y = badge_y, .w = badge_w, .h = badge_h };
-        queueRounded(state, badge_rect, paletteColor(theme.withAlpha(theme.accent(), 46)), theme.scaledUi(11.0));
-        queueText(state, badge_rect, "Subagent", paletteColor(theme.accent()), label_font, rect);
+        // Center on the title's line box so the pill and title share a baseline
+        // band rather than drifting apart when the header height changes.
+        const badge_y = title_y + @max((title_line_h - badge_h) * 0.5, 0.0);
+        const badge_rect = snapRect(.{ .x = rect.x + padding_x, .y = badge_y, .w = badge_w, .h = badge_h });
+        queueRounded(state, badge_rect, paletteColor(theme.withAlpha(theme.accent(), 46)), badge_h * 0.5);
+        queueCenteredChromeLabel(state, badge_rect, "Subagent", paletteColor(theme.accent()), badge_font, rect);
     }
     queueText(state, .{
         .x = title_x,
@@ -8441,17 +8447,25 @@ fn renderSubagentComposerBanner(state: *app_state.AppState, rect: palette.Rect) 
         @max(theme.scaledUi(1.0), 1.0),
     );
     const pad = theme.scaledUi(18.0);
+    const title_h = theme.scaledUi(20.0);
+    const body_h = theme.scaledUi(18.0);
+    const line_gap = theme.scaledUi(2.0);
+    // Stack both lines as one block and center it vertically so the banner
+    // never shows a large empty band below the text.
+    const block_h = title_h + line_gap + body_h;
+    const top = rect.y + @max((rect.h - block_h) * 0.5, theme.scaledUi(10.0));
+    const text_w = @max(rect.w - pad * 2.0, theme.scaledUi(1.0));
     queueText(state, .{
         .x = rect.x + pad,
-        .y = rect.y + theme.scaledUi(16.0),
-        .w = @max(rect.w - pad * 2.0, theme.scaledUi(1.0)),
-        .h = theme.scaledUi(20.0),
+        .y = top,
+        .w = text_w,
+        .h = title_h,
     }, "Read-only subagent", paletteColor(theme.accent()), theme.scaledUi(14.0), rect);
     queueText(state, .{
         .x = rect.x + pad,
-        .y = rect.y + theme.scaledUi(38.0),
-        .w = @max(rect.w - pad * 2.0, theme.scaledUi(1.0)),
-        .h = @max(rect.h - theme.scaledUi(48.0), theme.scaledUi(20.0)),
+        .y = top + title_h + line_gap,
+        .w = text_w,
+        .h = body_h,
     }, "This pane shows a child agent from the parent chat. Continue the work there.", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), rect);
 }
 

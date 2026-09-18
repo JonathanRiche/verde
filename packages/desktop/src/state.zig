@@ -13819,7 +13819,11 @@ pub const AppState = struct {
         thread.provider_thread_id = null;
         if (thread.model_ref) |model_ref| self.allocator.free(model_ref);
         thread.model_ref = self.allocator.dupeZ(u8, composerDefaultModelRef(self, provider)) catch null;
-        thread.reasoning_effort = if (provider == .codex) DEFAULT_CODEX_REASONING_EFFORT else null;
+        thread.reasoning_effort = switch (provider) {
+            .codex => DEFAULT_CODEX_REASONING_EFFORT,
+            .claude => .medium,
+            else => null,
+        };
         if (thread.opencode_reasoning_variant) |v| {
             self.allocator.free(v);
             thread.opencode_reasoning_variant = null;
