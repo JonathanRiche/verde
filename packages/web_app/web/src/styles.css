@@ -66,15 +66,39 @@
   --safe-bottom: env(safe-area-inset-bottom, 0px);
 }
 
+/* With the on-screen keyboard up, the home-indicator inset is covered by the
+   keyboard; keeping it would leave a blank band above the keys. */
+html.keyboard-open {
+  --safe-bottom: 0px;
+}
+
 * { box-sizing: border-box; }
 
 html, body, #app {
   height: 100%;
+  /* iOS standalone PWA (viewport-fit=cover + translucent status bar) lays the
+     page out in a viewport shorter than the screen it actually displays. Both
+     percentage and viewport-unit heights stop short, and fixed-position boxes
+     are clipped to that short viewport. trackAppViewport (lib/pwa.ts)
+     publishes the real height; sizing the document itself to it is what makes
+     iOS paint the strip above the home indicator. */
+  height: var(--app-height, 100dvh);
   width: 100%;
   max-width: 100%;
   overflow: hidden;
   -webkit-text-size-adjust: 100%;
   text-size-adjust: 100%;
+}
+
+/* In-flow (never fixed: see above). trackAppViewport resets any document
+   scroll iOS applies when an input focuses. */
+html, body {
+  overscroll-behavior: none;
+}
+#app {
+  position: absolute;
+  top: 0;
+  left: 0;
 }
 
 body {
@@ -214,7 +238,8 @@ textarea { resize: none; }
   overscroll-behavior-x: contain;
   -webkit-overflow-scrolling: touch;
   scrollbar-width: thin;
-  padding-bottom: env(safe-area-inset-bottom, 0px);
+  /* No bottom inset here: each pane pads its own content (the chat composer
+     and PaneFrame), so padding the strip too doubled the home-indicator gap. */
   background: var(--chat-black);
 }
 

@@ -6,6 +6,10 @@ import { paneIsActive, type LayoutNode, type LivePane, type Workspace } from '..
 import { Icon, ProviderGlyph, StatusPip, VerdeLogo } from './Icons'
 import { ChatRouting } from './ChatRouting'
 
+// Sidebar-only view state: the selected workspace whose pane list is folded.
+// Keyed by id so selecting a different workspace always shows its panes.
+const [foldedWorkspaceId, setFoldedWorkspaceId] = createSignal<string | null>(null)
+
 function actionWorkspace(pane?: LivePane): Workspace | undefined {
   if (!pane) return undefined
   const workspace_id = pane.kind === 'chat' ? store.owningWorkspaceId(pane) : pane.workspace_id
@@ -104,12 +108,12 @@ export function Sidebar() {
           <Show when={!store.sidebarCollapsed()}>
             <button
               type="button"
-              class="mt-2.5 flex h-[30px] w-full items-center rounded-[6px] px-2 text-[12.5px] text-[var(--text-subtle)] hover:bg-[var(--accent-hover)] hover:text-white"
+              class="mt-2.5 flex h-10 w-full items-center rounded-[6px] px-2 text-[15px] lg:h-[30px] lg:text-[12.5px] text-[var(--text-subtle)] hover:bg-[var(--accent-hover)] hover:text-white"
               onClick={() => store.setPaletteOpen(true)}
             >
               <Icon name="search" class="h-3.5 w-3.5" />
               <span class="ml-2">Search</span>
-              <span class="mono ml-auto text-[10px] text-[var(--text-subtle)]">Ctrl+Shift+P</span>
+              <span class="mono ml-auto hidden text-[10px] text-[var(--text-subtle)] lg:inline">Ctrl+Shift+P</span>
             </button>
           </Show>
         </div>
@@ -293,6 +297,9 @@ function WorkspaceGroup(props: {
   onOpenPaneContext: (pane: LivePane, x: number, y: number) => void
 }) {
   const selected = () => store.workspaceId() === props.workspace.workspace_id
+  // Tapping the already-open workspace folds its pane list; selecting any
+  // workspace (including this one again) unfolds it.
+  const expanded = () => selected() && foldedWorkspaceId() !== props.workspace.workspace_id
   const context = createContextTrigger(props.onOpenContext)
   return (
     <section class="relative mb-2">
@@ -300,7 +307,7 @@ function WorkspaceGroup(props: {
         <span class="absolute top-1 bottom-1 -left-3 w-[3px] rounded-full bg-[var(--accent)]" />
       </Show>
       <div
-        class="group flex h-[30px] w-full touch-pan-y select-none items-center rounded-[6px] pr-1 hover:bg-[var(--accent-hover)]"
+        class="group flex h-11 w-full touch-pan-y select-none items-center rounded-[6px] pr-1 hover:bg-[var(--accent-hover)] lg:h-[30px]"
         style={{ '-webkit-touch-callout': 'none' }}
         onContextMenu={context.onContextMenu}
         onPointerDown={context.onPointerDown}
@@ -313,22 +320,27 @@ function WorkspaceGroup(props: {
           class="flex h-full min-w-0 flex-1 items-center text-left"
           onClick={(event) => {
             if (context.consumeClick(event)) return
+            if (selected()) {
+              setFoldedWorkspaceId((value) => value === props.workspace.workspace_id ? null : props.workspace.workspace_id)
+              return
+            }
+            setFoldedWorkspaceId(null)
             store.selectWorkspace(props.workspace.workspace_id)
           }}
         >
           <Icon
-            name={selected() ? 'chevronDown' : 'chevron'}
-            class={`h-3.5 w-3.5 ${selected() ? 'text-white' : 'text-[var(--text-subtle)]'}`}
+            name={expanded() ? 'chevronDown' : 'chevron'}
+            class={`h-4 w-4 lg:h-3.5 lg:w-3.5 ${selected() ? 'text-white' : 'text-[var(--text-subtle)]'}`}
           />
           <Icon
             name="folder"
-            class={`ml-1 h-3.5 w-3.5 ${selected() ? 'text-[var(--accent)]' : 'text-[var(--text-subtle)]'}`}
+            class={`ml-1 h-4 w-4 lg:h-3.5 lg:w-3.5 ${selected() ? 'text-[var(--accent)]' : 'text-[var(--text-subtle)]'}`}
           />
-          <span class={`ml-2 min-w-0 flex-1 truncate text-[15px] ${selected() ? 'text-white' : 'text-[var(--text-muted)]'}`}>
+          <span class={`ml-2 min-w-0 flex-1 truncate text-[17px] lg:text-[15px] ${selected() ? 'text-white' : 'text-[var(--text-muted)]'}`}>
             {props.workspace.label}
           </span>
         </button>
-        <span class="hidden items-center gap-0.5 group-hover:flex">
+        <span class={`${selected() ? 'flex lg:hidden' : 'hidden'} items-center gap-1 lg:gap-0.5 lg:group-hover:flex`}>
           <TinyIcon label="New chat" onClick={(event) => { event.stopPropagation(); void store.runCommand('new-thread', props.workspace.workspace_id) }}>
             <Icon name="chat" class="h-3.5 w-3.5" />
           </TinyIcon>
@@ -340,9 +352,9 @@ function WorkspaceGroup(props: {
           </TinyIcon>
         </span>
       </div>
-      <Show when={selected()}>
+      <Show when={expanded()}>
         <div class="mt-1 ml-4">
-          <For each={selected() ? store.paneGroups() : []}>
+          <For each={expanded() ? store.paneGroups() : []}>
             {(group) => (
               <Show
                 when={group.panes.length > 1}
@@ -428,7 +440,7 @@ function PaneRow(props: {
   return (
     <button
       type="button"
-      class={`${props.tiled ? 'h-full min-h-[38px]' : 'mb-[4px] h-[38px]'} flex w-full touch-pan-y select-none items-center gap-2.5 rounded-[7px] px-2.5 text-left ${focused() ? 'bg-[var(--accent-row)]' : 'hover:bg-[var(--accent-hover)]'}`}
+      class={`${props.tiled ? 'h-full min-h-[38px]' : 'mb-[4px] h-[46px] lg:h-[38px]'} flex w-full touch-pan-y select-none items-center gap-2.5 rounded-[7px] px-2.5 text-left ${focused() ? 'bg-[var(--accent-row)]' : 'hover:bg-[var(--accent-hover)]'}`}
       style={{ '-webkit-touch-callout': 'none' }}
       onClick={(event) => {
         if (context.consumeClick(event)) return
@@ -448,7 +460,7 @@ function PaneRow(props: {
       >
         <ProviderGlyph provider={props.pane.provider} />
       </Show>
-      <span class="min-w-0 flex-1 truncate text-[13px] text-[var(--text-muted)]">{store.paneTitle(props.pane)}</span>
+      <span class="min-w-0 flex-1 truncate text-[15px] text-[var(--text-muted)] lg:text-[13px]">{store.paneTitle(props.pane)}</span>
       <Show when={working()}>
         <StatusPip active />
       </Show>
@@ -806,7 +818,7 @@ function IconButton(props: { label: string; onClick: () => void; children: JSX.E
   return (
     <button
       type="button"
-      class="grid h-7 w-7 place-items-center rounded-[6px] text-[var(--text-subtle)] hover:bg-[var(--accent-hover)] hover:text-white"
+      class="grid h-10 w-10 place-items-center rounded-[6px] text-[var(--text-subtle)] hover:bg-[var(--accent-hover)] hover:text-white lg:h-7 lg:w-7"
       aria-label={props.label}
       onClick={props.onClick}
     >
@@ -819,7 +831,7 @@ function TinyIcon(props: { label: string; onClick: (event: MouseEvent) => void; 
   return (
     <button
       type="button"
-      class="grid h-[30px] w-[30px] place-items-center text-[var(--text-subtle)] hover:text-white"
+      class="grid h-10 w-10 place-items-center text-[var(--text-subtle)] hover:text-white lg:h-[30px] lg:w-[30px]"
       aria-label={props.label}
       onClick={props.onClick}
     >

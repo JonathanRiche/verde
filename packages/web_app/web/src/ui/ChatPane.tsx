@@ -1022,6 +1022,28 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
     submitDraft()
   }
 
+  // Mobile composer resize: height is view state for this composer only.
+  const COMPOSER_MIN_HEIGHT = 52
+  const [composerHeight, setComposerHeight] = createSignal<number | null>(null)
+  let composerDrag: { pointer_id: number; start_y: number; start_height: number } | null = null
+  const composerMaxHeight = () =>
+    Math.max(COMPOSER_MIN_HEIGHT, Math.round((window.visualViewport?.height ?? window.innerHeight) * 0.6))
+  const startComposerDrag = (event: PointerEvent) => {
+    if (!field) return
+    event.preventDefault()
+    ;(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId)
+    composerDrag = { pointer_id: event.pointerId, start_y: event.clientY, start_height: field.getBoundingClientRect().height }
+  }
+  const moveComposerDrag = (event: PointerEvent) => {
+    if (!composerDrag || event.pointerId !== composerDrag.pointer_id) return
+    // Dragging up (smaller clientY) grows the box.
+    const next = composerDrag.start_height + (composerDrag.start_y - event.clientY)
+    setComposerHeight(Math.min(composerMaxHeight(), Math.max(COMPOSER_MIN_HEIGHT, Math.round(next))))
+  }
+  const endComposerDrag = (event: PointerEvent) => {
+    if (composerDrag?.pointer_id === event.pointerId) composerDrag = null
+  }
+
   return (
     <form
       class="min-w-0 bg-[var(--chat-black)] px-3 pb-[max(12px,var(--safe-bottom))] lg:px-5 lg:pb-[max(16px,var(--safe-bottom))]"
@@ -1064,12 +1086,30 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
             </For>
           </div>
         </Show>
+        {/* Touch-only grip: long prompts are unreadable in the two-line mobile
+            box, so the user can drag the composer taller (up to ~60% of the
+            visible viewport, which already excludes the on-screen keyboard).
+            Double-tap restores the compact height. */}
+        <div
+          class="-mt-2 mb-1 flex h-5 cursor-ns-resize touch-none items-center justify-center lg:hidden"
+          role="separator"
+          aria-orientation="horizontal"
+          aria-label="Drag to resize the prompt box"
+          onPointerDown={startComposerDrag}
+          onPointerMove={moveComposerDrag}
+          onPointerUp={endComposerDrag}
+          onPointerCancel={endComposerDrag}
+          onDblClick={() => setComposerHeight(null)}
+        >
+          <span class="h-1 w-10 rounded-full bg-[var(--border-muted)]" />
+        </div>
         <textarea
           ref={(node) => {
             field = node
             if (node) node.value = store.draftFor(composer_pane)
           }}
-          class="min-h-[52px] w-full bg-transparent text-[16px] leading-[21px] outline-none placeholder:text-[var(--text-subtle)] lg:min-h-[88px] lg:text-[18px] lg:leading-[22px]"
+          style={composerHeight() != null ? { height: `${composerHeight()}px` } : undefined}
+          class="min-h-[52px] w-full resize-none lg:resize-y bg-transparent text-[16px] leading-[21px] outline-none placeholder:text-[var(--text-subtle)] lg:min-h-[88px] lg:text-[18px] lg:leading-[22px]"
           placeholder="Ask anything…"
           enterkeyhint="enter"
           onInput={(event) => setBlank(event.currentTarget.value.trim().length === 0)}

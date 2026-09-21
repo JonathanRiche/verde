@@ -2,6 +2,7 @@ import { For, Show, createMemo, createResource, createSignal } from 'solid-js'
 
 import { fetchRpc, unwrapResult } from '../lib/live'
 import { store } from '../lib/store'
+import { viewportDiagnostics } from '../lib/pwa'
 import { loadTheme } from '../lib/theme'
 
 const COMMANDS = [
@@ -123,6 +124,7 @@ export function Settings() {
             <Row label="Workspace" value={store.workspace()?.label ?? '—'} />
             <Row label="Open panes" value={String(store.openPanes().length)} />
             <Row label="Focused pane" value={store.focusedPane() ? store.paneTitle(store.focusedPane()!) : '—'} />
+            <Row label="Viewport" value={viewportDiagnostics()} />
           </dl>
           <button
             type="button"
@@ -144,6 +146,18 @@ export function WorkspaceDialog() {
   const [browserOpen, setBrowserOpen] = createSignal(false)
   const [browserLoading, setBrowserLoading] = createSignal(false)
   const [browserError, setBrowserError] = createSignal<string | null>(null)
+  // The gateway refuses directory listing by design (security contract), so
+  // once it says so the Browse button is replaced by known-parent shortcuts.
+  const [browseUnsupported, setBrowseUnsupported] = createSignal(false)
+  const parentFolders = () => {
+    const parents = new Set<string>()
+    for (const workspace of store.workspaces()) {
+      const path = workspace.path ?? ''
+      const cut = path.lastIndexOf('/')
+      if (path.startsWith('/') && cut > 0) parents.add(`${path.slice(0, cut)}/`)
+    }
+    return [...parents].sort().slice(0, 6)
+  }
   const [directoryListing, setDirectoryListing] = createSignal<{
     path: string
     parent?: string | null
@@ -171,6 +185,12 @@ export function WorkspaceDialog() {
       // interactive browse must not queue behind a background projection sweep.
       const response = await fetchRpc('web.directory.list', { path: target })
       if (response.error || response.ok === false) {
+        if (response.error?.code === 'unsupported') {
+          setBrowseUnsupported(true)
+          setBrowserOpen(false)
+          setBrowserError('Folder browsing is turned off for web access. Type the full path, or tap a folder below to start from it.')
+          return
+        }
         setBrowserError(response.error?.message ?? 'could not list directory')
         return
       }
@@ -222,7 +242,7 @@ export function WorkspaceDialog() {
           <div class="mt-4 flex gap-2">
             <input
               ref={(node) => { pathField = node }}
-              class="mono min-w-0 flex-1 rounded-[7px] border border-[var(--border-muted)] bg-[var(--chat-black)] px-3 py-2 text-[13px] outline-none focus:border-[var(--accent)]"
+              class="mono min-w-0 flex-1 rounded-[7px] border border-[var(--border-muted)] bg-[var(--chat-black)] px-3 py-2 text-[16px] outline-none lg:text-[13px] focus:border-[var(--accent)]"
               aria-label="Workspace path"
               placeholder="/path/to/project"
               autofocus
@@ -231,14 +251,37 @@ export function WorkspaceDialog() {
                 if (event.key === 'Escape') close()
               }}
             />
-            <button
-              type="button"
-              class="shrink-0 rounded-[7px] border border-[var(--border-muted)] px-3 py-2 text-[13px] hover:bg-[var(--accent-hover)]"
-              onClick={() => void browse()}
-            >
-              Browse…
-            </button>
+            <Show when={!browseUnsupported()}>
+              <button
+                type="button"
+                class="shrink-0 rounded-[7px] border border-[var(--border-muted)] px-3 py-2 text-[13px] hover:bg-[var(--accent-hover)]"
+                onClick={() => void browse()}
+              >
+                Browse…
+              </button>
+            </Show>
           </div>
+          <Show when={parentFolders().length > 0}>
+            <div class="mt-2 flex flex-wrap gap-1.5">
+              <For each={parentFolders()}>
+                {(folder) => (
+                  <button
+                    type="button"
+                    class="mono max-w-full truncate rounded-[6px] border border-[var(--border-muted)] px-2 py-1.5 text-[12px] text-[var(--text-muted)] hover:bg-[var(--accent-hover)]"
+                    onClick={() => {
+                      setPath(folder)
+                      if (pathField) {
+                        pathField.value = folder
+                        pathField.focus()
+                      }
+                    }}
+                  >
+                    {folder}
+                  </button>
+                )}
+              </For>
+            </div>
+          </Show>
           <Show when={browserOpen()}>
             <div class="mt-3 overflow-hidden rounded-[7px] border border-[var(--border-muted)] bg-[var(--chat-black)]">
               <div class="flex items-center gap-2 border-b border-[var(--border-muted)] p-2">

@@ -269,7 +269,7 @@ function PaneFrame(props: { pane: LivePane }) {
   const focused = () => store.focusedPaneId() === props.pane.pane_id
   return (
     <div
-      class={`flex h-full min-h-0 min-w-0 flex-1 flex-col bg-[var(--panel)] ${focused() ? 'ring-1 ring-inset ring-[var(--accent)]' : ''}`}
+      class={`flex h-full min-h-0 min-w-0 flex-1 flex-col bg-[var(--panel)] ${props.pane.kind === 'chat' ? '' : 'pb-[var(--safe-bottom)]'} ${focused() ? 'ring-1 ring-inset ring-[var(--accent)]' : ''}`}
       onMouseDown={() => store.focusPane(props.pane)}
     >
       <Show when={props.pane.kind === 'terminal'}>

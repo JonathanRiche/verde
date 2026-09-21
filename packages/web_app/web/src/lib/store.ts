@@ -2573,7 +2573,10 @@ function createAppStore() {
       if (pending_settings) await pending_settings
       const route = routeThread(current)
       if (route.runtime_id && remote && route.runtime_id !== connection!.runtime_id) throw new Error('This chat belongs to a different runtime')
-      const route_patch = { profile_id: profile, runtime_id: remote ? connection!.runtime_id : null, repository_id: route.repository_id ?? 'primary', repository_cwd: route.repository_cwd ?? null }
+      // A committed thread's pinned runtime_id is immutable in the store; a
+      // local chat that already carries one must keep it or the upsert is
+      // rejected with invalid_params.
+      const route_patch = { profile_id: profile, runtime_id: remote ? connection!.runtime_id : route.runtime_id ?? null, repository_id: route.repository_id ?? 'primary', repository_cwd: route.repository_cwd ?? null }
       const saved_route = await upsertThreadMetadata(ws, current, route_patch)
       if (!saved_route || saved_route.error || saved_route.ok === false) throw new Error(saved_route?.error?.message ?? 'Could not save the chat connection')
       setThreadsByWorkspace((prev) => ({ ...prev, [ws.workspace_id]: (prev[ws.workspace_id] ?? []).map((row) => row.local_thread_id === current.thread_id ? { ...row, ...route_patch } : row) }))

@@ -2,12 +2,13 @@ import { ErrorBoundary } from 'solid-js'
 import { render } from 'solid-js/web'
 
 import './styles.css'
-import { registerPwa } from './lib/pwa'
+import { registerPwa, trackAppViewport } from './lib/pwa'
 import { startThemeSync } from './lib/theme'
 import { App } from './ui/App'
 
 startThemeSync()
 registerPwa()
+trackAppViewport()
 
 const root = document.getElementById('app')
 if (!root) throw new Error('missing #app')
