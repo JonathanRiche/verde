@@ -13,10 +13,19 @@ function isStandalone(): boolean {
   return legacy || window.matchMedia('(display-mode: standalone)').matches
 }
 
+/// iPadOS reports a desktop UA, so touch points disambiguate it from a Mac.
+function isIos(): boolean {
+  return /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+}
+
 function restingHeight(): number {
   let height = window.innerHeight
+  // Only iOS under-reports the standalone window. Elsewhere (Android Chrome)
+  // screen.height includes the system status/navigation bars, so using it
+  // made the shell taller than the window and clipped the composer.
   // iOS keeps screen.width/height in portrait terms regardless of rotation.
-  if (isStandalone() && window.matchMedia('(pointer: coarse)').matches) {
+  if (isIos() && isStandalone()) {
     const portrait = window.matchMedia('(orientation: portrait)').matches
     const long_side = Math.max(window.screen.width, window.screen.height)
     const short_side = Math.min(window.screen.width, window.screen.height)
@@ -58,6 +67,7 @@ export function viewportDiagnostics(): string {
     `screen ${window.screen.width}x${window.screen.height}`,
     `client ${document.documentElement.clientHeight}`,
     isStandalone() ? 'standalone' : 'browser',
+    isIos() ? 'ios' : 'other',
   ].join(' · ')
 }
 

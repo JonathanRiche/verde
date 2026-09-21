@@ -34,7 +34,7 @@ export function App() {
             onClick={() => store.setDrawerOpen(false)}
           />
           <div class="absolute inset-y-0 left-0 w-[min(380px,92vw)] bg-[var(--panel)] pt-[var(--safe-top)] shadow-[8px_0_40px_rgba(0,0,0,0.45)]">
-            <Sidebar />
+            <Sidebar drawer />
           </div>
         </div>
       </Show>

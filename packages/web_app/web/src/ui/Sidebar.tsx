@@ -38,7 +38,10 @@ interface PromptState {
   placeholder?: string
 }
 
-export function Sidebar() {
+export function Sidebar(props: { drawer?: boolean }) {
+  // The icon rail only makes sense for the docked desktop sidebar. In the
+  // phone drawer the panel is always full, and its header button closes it.
+  const collapsed = () => !props.drawer && store.sidebarCollapsed()
   const [menu, setMenu] = createSignal<SidebarMenuTarget | null>(null)
   const [prompt, setPrompt] = createSignal<PromptState | null>(null)
 
@@ -87,17 +90,20 @@ export function Sidebar() {
         <div class="shrink-0 px-4 pt-3.5 pb-2">
           <div class="flex h-8 items-center">
             <VerdeLogo class="h-7 w-7" />
-            <Show when={!store.sidebarCollapsed()}>
+            <Show when={!collapsed()}>
               <div class="ml-auto flex items-center gap-1">
                 <IconButton label="Add workspace" onClick={() => { store.setNotice(null); store.setWorkspaceDialogOpen(true) }}>
                   <Icon name="plus" class="h-3.5 w-3.5" />
                 </IconButton>
-                <IconButton label="Collapse sidebar" onClick={() => store.setSidebarCollapsed(true)}>
-                  <Icon name="collapse" class="h-3.5 w-3.5" />
+                <IconButton
+                  label={props.drawer ? 'Close menu' : 'Collapse sidebar'}
+                  onClick={() => (props.drawer ? store.setDrawerOpen(false) : store.setSidebarCollapsed(true))}
+                >
+                  <Icon name={props.drawer ? 'close' : 'collapse'} class="h-4 w-4 lg:h-3.5 lg:w-3.5" />
                 </IconButton>
               </div>
             </Show>
-            <Show when={store.sidebarCollapsed()}>
+            <Show when={collapsed()}>
               <div class="ml-auto">
                 <IconButton label="Expand sidebar" onClick={() => store.setSidebarCollapsed(false)}>
                   <Icon name="expand" class="h-3.5 w-3.5" />
@@ -105,7 +111,7 @@ export function Sidebar() {
               </div>
             </Show>
           </div>
-          <Show when={!store.sidebarCollapsed()}>
+          <Show when={!collapsed()}>
             <button
               type="button"
               class="mt-2.5 flex h-10 w-full items-center rounded-[6px] px-2 text-[15px] lg:h-[30px] lg:text-[12.5px] text-[var(--text-subtle)] hover:bg-[var(--accent-hover)] hover:text-white"
@@ -119,7 +125,7 @@ export function Sidebar() {
         </div>
 
         <Show
-          when={!store.sidebarCollapsed()}
+          when={!collapsed()}
           fallback={<CollapsedRail onOpenContext={openWorkspaceMenu} />}
         >
           <div
