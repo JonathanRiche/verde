@@ -1949,10 +1949,10 @@ export function createAppStore() {
   const chatRuntimeBlocker = (pane: LivePane) => runtimeBlocker(connectionFor(pane), routeThread(pane).runtime_id, connections())
   const providerReadiness = (pane: LivePane, provider = routeThread(pane).provider ?? pane.provider ?? 'codex') =>
     readiness.providerReadiness(provider, connectionFor(pane) !== 'local')
-  const recheckProviderReadiness = async (pane: LivePane): Promise<void> => {
+  const recheckProviderReadiness = async (pane: LivePane, options: { silent?: boolean } = {}): Promise<void> => {
     await refreshConnections()
     if (connectionFor(pane) !== 'local') {
-      setNotice('Provider checks on remote connections are not exposed by the web bridge. Connection status was refreshed.')
+      if (!options.silent) setNotice('Provider checks on remote connections are not exposed by the web bridge. Connection status was refreshed.')
       return
     }
     await readiness.recheckProviderReadiness()
