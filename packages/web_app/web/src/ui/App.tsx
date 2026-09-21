@@ -1,4 +1,4 @@
-import { Show, onCleanup, onMount } from 'solid-js'
+import { Show, createEffect, createSignal, onCleanup, onMount } from 'solid-js'
 
 import { store } from '../lib/store'
 import { FileViewer } from './FileViewer'
@@ -16,24 +16,37 @@ export function App() {
     onCleanup(() => window.removeEventListener('keydown', onKey))
   })
 
+  // Keep the drawer mounted for its slide-out so closing animates too.
+  const DRAWER_EXIT_MS = 200
+  const [drawerMounted, setDrawerMounted] = createSignal(false)
+  let drawerExitTimer: ReturnType<typeof setTimeout> | undefined
+  createEffect(() => {
+    clearTimeout(drawerExitTimer)
+    if (store.drawerOpen()) setDrawerMounted(true)
+    else drawerExitTimer = setTimeout(() => setDrawerMounted(false), DRAWER_EXIT_MS)
+  })
+  onCleanup(() => clearTimeout(drawerExitTimer))
+
   const railWidth = () => (store.sidebarCollapsed() ? 'var(--sidebar-collapsed)' : 'var(--sidebar-w)')
   const focused = () => store.focusedPane()
 
   return (
     <div class="flex h-full min-h-0 bg-[var(--chat-black)]">
-      <div class="hidden shrink-0 lg:block" style={{ width: railWidth() }}>
+      <div class="sidebar-rail hidden shrink-0 lg:block" style={{ width: railWidth() }}>
         <Sidebar />
       </div>
 
-      <Show when={store.drawerOpen()}>
-        <div class="fixed inset-0 z-30 lg:hidden">
+      <Show when={drawerMounted()}>
+        {/* absolute, not fixed: iOS standalone clips fixed boxes to its short
+            layout viewport (see styles.css), and #app already fills the screen. */}
+        <div class={`absolute inset-0 z-30 lg:hidden ${store.drawerOpen() ? 'drawer-open' : 'drawer-closing'}`}>
           <button
             type="button"
-            class="absolute inset-0 bg-black/50"
+            class="drawer-backdrop absolute inset-0 bg-black/50"
             aria-label="Close workspace drawer"
             onClick={() => store.setDrawerOpen(false)}
           />
-          <div class="absolute inset-y-0 left-0 w-[min(380px,92vw)] bg-[var(--panel)] pt-[var(--safe-top)] shadow-[8px_0_40px_rgba(0,0,0,0.45)]">
+          <div class="drawer-panel absolute inset-y-0 left-0 w-[min(380px,92vw)] bg-[var(--panel)] pt-[var(--safe-top)] shadow-[8px_0_40px_rgba(0,0,0,0.45)]">
             <Sidebar drawer />
           </div>
         </div>

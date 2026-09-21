@@ -359,7 +359,7 @@ function WorkspaceGroup(props: {
         </span>
       </div>
       <Show when={expanded()}>
-        <div class="mt-1 ml-4">
+        <div class="anim-reveal mt-1 ml-4">
           <For each={expanded() ? store.paneGroups() : []}>
             {(group) => (
               <Show
@@ -567,7 +567,7 @@ function SidebarContextMenu(props: {
   return (
     <Portal>
       <div
-        class={`fixed inset-0 z-50 ${props.placement === 'trigger' ? 'bg-black/40 lg:bg-transparent' : ''}`}
+        class={`anim-fade fixed inset-0 z-50 ${props.placement === 'trigger' ? 'bg-black/40 lg:bg-transparent' : ''}`}
         onContextMenu={(event) => event.preventDefault()}
       >
         <button
@@ -578,7 +578,7 @@ function SidebarContextMenu(props: {
         />
         <div
           ref={panel}
-          class={`fixed z-10 overflow-y-auto border border-[var(--border-muted)] bg-[var(--panel-alt)] p-2 shadow-[0_18px_55px_rgba(0,0,0,0.5)] outline-none scrollbar-thin ${
+          class={`anim-menu fixed z-10 overflow-y-auto border border-[var(--border-muted)] bg-[var(--panel-alt)] p-2 shadow-[0_18px_55px_rgba(0,0,0,0.5)] outline-none scrollbar-thin ${
             props.placement === 'trigger' ? 'rounded-[18px] lg:rounded-[12px]' : 'rounded-[12px]'
           }`}
           style={position()}
@@ -649,9 +649,9 @@ function SidebarPrompt(props: {
   })
   return (
     <Portal>
-      <div class="fixed inset-0 z-[60] grid place-items-center bg-black/60 p-4" onPointerDown={props.onClose}>
+      <div class="anim-fade fixed inset-0 z-[60] grid place-items-center bg-black/60 p-4" onPointerDown={props.onClose}>
         <form
-          class="w-full max-w-[420px] rounded-[14px] border border-[var(--border-muted)] bg-[var(--panel-alt)] p-5 shadow-[0_24px_70px_rgba(0,0,0,0.55)]"
+          class="anim-pop w-full max-w-[420px] rounded-[14px] border border-[var(--border-muted)] bg-[var(--panel-alt)] p-5 shadow-[0_24px_70px_rgba(0,0,0,0.55)]"
           onPointerDown={(event) => event.stopPropagation()}
           onSubmit={(event) => {
             event.preventDefault()

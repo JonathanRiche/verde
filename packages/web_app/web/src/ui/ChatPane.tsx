@@ -1050,7 +1050,7 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
       onSubmit={(event) => event.preventDefault()}
     >
       <Show when={props.focused && store.notice()}>
-        <p class="mx-auto mb-2 max-w-[900px] text-right text-xs text-[var(--warning)]">{store.notice()}</p>
+        <p class="anim-reveal mx-auto mb-2 max-w-[900px] text-right text-xs text-[var(--warning)]">{store.notice()}</p>
       </Show>
       {/* Desktop prompt-box parity (state.zig paletteComposerStyle): panel-
           muted 1px border at rest, 1.5px accent border while focused — the
@@ -1419,7 +1419,7 @@ function ComposerPickers(props: { pane: LivePane }) {
     void store.updateThreadSettings(props.pane, { access_mode: value })
   }
   const menuClass =
-    'absolute bottom-full left-0 z-30 mb-1.5 max-h-[50vh] min-w-[12rem] overflow-y-auto rounded-[10px] border border-[var(--border-muted)] bg-[var(--panel)] py-1 shadow-lg'
+    'anim-menu absolute bottom-full left-0 z-30 mb-1.5 max-h-[50vh] min-w-[12rem] overflow-y-auto rounded-[10px] border border-[var(--border-muted)] bg-[var(--panel)] py-1 shadow-lg'
   const rowClass = (selected: boolean) =>
     `block w-full px-3 py-1.5 text-left text-[13px] ${
       selected ? 'text-[var(--accent)]' : 'text-[var(--text-muted)] hover:text-[var(--text)]'
@@ -1451,7 +1451,7 @@ function ComposerPickers(props: { pane: LivePane }) {
         </button>
         <Show when={open() === 'model'}>
           <div
-            class="fixed z-30 flex min-w-0 overflow-hidden rounded-[10px] border border-[var(--border-muted)] bg-[var(--panel)] shadow-lg max-[479px]:flex-col"
+            class="anim-menu fixed z-30 flex min-w-0 overflow-hidden rounded-[10px] border border-[var(--border-muted)] bg-[var(--panel)] shadow-lg max-[479px]:flex-col"
             style={modelMenuStyle()}
             role="menu"
           >

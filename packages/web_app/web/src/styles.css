@@ -119,6 +119,56 @@ body {
 button { cursor: pointer; }
 textarea { resize: none; }
 
+/* ---- Motion --------------------------------------------------------------
+   Enter animations are plain keyframes so Solid's <Show> needs no wrapper;
+   only the drawer also animates out (App.tsx keeps it mounted briefly).
+   Menus avoid scale: they measure themselves to position on first paint. */
+:root {
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+}
+@layer base {
+  /* Layered so transition-* utilities on individual elements still win. */
+  button, a, [role='menuitem'], input, textarea {
+    transition: background-color 130ms ease, color 130ms ease, border-color 130ms ease,
+      opacity 130ms ease, box-shadow 130ms ease;
+  }
+}
+/* Press feedback for compact controls only: full-width rows, the drawer
+   backdrop and the split gutters would visibly jump if they scaled. */
+button:active:not(:disabled):not(.w-full):not(.flex-1):not(.drawer-backdrop):not(.pane-split-gutter) {
+  transform: scale(0.96);
+}
+button { transition-property: background-color, color, border-color, opacity, box-shadow, transform; }
+
+.anim-fade { animation: anim-fade 150ms ease-out both; }
+.anim-pop { animation: anim-pop 190ms var(--ease-out) both; }
+.anim-menu { animation: anim-menu 140ms var(--ease-out) both; }
+.anim-reveal { animation: anim-reveal 180ms var(--ease-out) both; }
+@keyframes anim-fade { from { opacity: 0; } }
+@keyframes anim-pop { from { opacity: 0; transform: translateY(10px) scale(0.975); } }
+@keyframes anim-menu { from { opacity: 0; transform: translateY(6px); } }
+@keyframes anim-reveal { from { opacity: 0; transform: translateY(-5px); } }
+
+.drawer-open .drawer-panel { animation: drawer-in 240ms var(--ease-out) both; }
+.drawer-open .drawer-backdrop { animation: anim-fade 200ms ease-out both; }
+.drawer-closing { pointer-events: none; }
+.drawer-closing .drawer-panel { animation: drawer-out 200ms ease-in both; }
+.drawer-closing .drawer-backdrop { animation: drawer-backdrop-out 200ms ease-in both; }
+@keyframes drawer-in { from { transform: translateX(-100%); } }
+@keyframes drawer-out { to { transform: translateX(-100%); } }
+@keyframes drawer-backdrop-out { to { opacity: 0; } }
+
+/* Desktop rail collapse/expand. */
+.sidebar-rail { transition: width 200ms var(--ease-out); overflow: hidden; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+  }
+}
+
 .mono { font-family: var(--font-mono); }
 .wordmark { font-family: var(--font-display); letter-spacing: -0.03em; }
 

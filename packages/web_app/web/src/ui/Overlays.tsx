@@ -60,9 +60,9 @@ export function Palette() {
 
   return (
     <Show when={store.paletteOpen()}>
-      <div class="fixed inset-0 z-40 bg-black/55" onClick={() => store.setPaletteOpen(false)}>
+      <div class="anim-fade fixed inset-0 z-40 bg-black/55" onClick={() => store.setPaletteOpen(false)}>
         <div
-          class="mx-auto mt-[12vh] max-w-[560px] overflow-hidden rounded-[10px] border border-[var(--border-muted)] bg-[var(--panel)] shadow-[0_24px_80px_rgba(0,0,0,0.55)]"
+          class="anim-pop mx-auto mt-[12vh] max-w-[560px] overflow-hidden rounded-[10px] border border-[var(--border-muted)] bg-[var(--panel)] shadow-[0_24px_80px_rgba(0,0,0,0.55)]"
           onClick={(event) => event.stopPropagation()}
         >
           <input
@@ -102,9 +102,9 @@ export function Settings() {
   const [theme] = createResource(loadTheme)
   return (
     <Show when={store.settingsOpen()}>
-      <div class="fixed inset-0 z-40 bg-black/55" onClick={() => store.setSettingsOpen(false)}>
+      <div class="anim-fade fixed inset-0 z-40 bg-black/55" onClick={() => store.setSettingsOpen(false)}>
         <div
-          class="absolute top-16 right-8 w-[28rem] max-w-[calc(100vw-2rem)] rounded-[10px] border border-[var(--border-muted)] bg-[var(--panel)] p-5 max-md:right-3 max-md:bottom-3 max-md:left-3 max-md:w-auto max-md:rounded-[14px]"
+          class="anim-pop absolute top-16 right-8 w-[28rem] max-w-[calc(100vw-2rem)] rounded-[10px] border border-[var(--border-muted)] bg-[var(--panel)] p-5 max-md:right-3 max-md:bottom-3 max-md:left-3 max-md:w-auto max-md:rounded-[14px]"
           onClick={(event) => event.stopPropagation()}
         >
           <div class="wordmark text-[28px] leading-none">Settings</div>
@@ -229,9 +229,9 @@ export function WorkspaceDialog() {
 
   return (
     <Show when={store.workspaceDialogOpen()}>
-      <div class="fixed inset-0 z-40 bg-black/55" onClick={close}>
+      <div class="anim-fade fixed inset-0 z-40 bg-black/55" onClick={close}>
         <form
-          class="mx-auto mt-[16vh] w-[32rem] max-w-[calc(100vw-2rem)] rounded-[10px] border border-[var(--border-muted)] bg-[var(--panel)] p-5 shadow-[0_24px_80px_rgba(0,0,0,0.55)]"
+          class="anim-pop mx-auto mt-[16vh] w-[32rem] max-w-[calc(100vw-2rem)] rounded-[10px] border border-[var(--border-muted)] bg-[var(--panel)] p-5 shadow-[0_24px_80px_rgba(0,0,0,0.55)]"
           onClick={(event) => event.stopPropagation()}
           onSubmit={submit}
         >
@@ -283,7 +283,7 @@ export function WorkspaceDialog() {
             </div>
           </Show>
           <Show when={browserOpen()}>
-            <div class="mt-3 overflow-hidden rounded-[7px] border border-[var(--border-muted)] bg-[var(--chat-black)]">
+            <div class="anim-reveal mt-3 overflow-hidden rounded-[7px] border border-[var(--border-muted)] bg-[var(--chat-black)]">
               <div class="flex items-center gap-2 border-b border-[var(--border-muted)] p-2">
                 <button
                   type="button"

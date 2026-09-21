@@ -52,9 +52,9 @@ export function FileViewer() {
   return (
     <Show when={viewerPath()}>
       {(path) => (
-        <div class="fixed inset-0 z-40 bg-black/55" onClick={close}>
+        <div class="anim-fade fixed inset-0 z-40 bg-black/55" onClick={close}>
           <div
-            class={`mx-auto mt-[6vh] flex h-[86vh] flex-col overflow-hidden rounded-[10px] border border-[var(--border-muted)] bg-[var(--panel)] shadow-[0_24px_80px_rgba(0,0,0,0.55)] ${
+            class={`anim-pop mx-auto mt-[6vh] flex h-[86vh] flex-col overflow-hidden rounded-[10px] border border-[var(--border-muted)] bg-[var(--panel)] shadow-[0_24px_80px_rgba(0,0,0,0.55)] ${
               extLooksWide(path())
                 ? 'w-[min(1360px,calc(100vw-1.5rem))]'
                 : 'w-[min(920px,calc(100vw-1.5rem))]'
