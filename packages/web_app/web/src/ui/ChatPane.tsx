@@ -1,4 +1,4 @@
-import { For, Show, createEffect, createMemo, createSignal, onCleanup } from 'solid-js'
+import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from 'solid-js'
 
 import { composerEnterShouldSubmit } from '../lib/composer_input'
 import { registerChatCommandPickers } from '../lib/commands'
@@ -64,37 +64,6 @@ function renderMarkdown(body: string): string {
   return html
 }
 
-// Serialized deferred-reveal queue for off-screen panes. WebKit (the embedded
-// Verde browser) has no requestIdleCallback, and a shared timeout fallback
-// revealed every off-screen pane in the same task — the combined cold
-// markdown parse + DOM mount blocked the main thread for seconds right after
-// a workspace switch. Chaining reveals keeps each block to one pane and
-// yields a frame between panes so input/paint stay responsive. A pane that
-// gains focus reveals itself immediately regardless of its queue position.
-let deferredRevealChain: Promise<void> = Promise.resolve()
-function queueDeferredReveal(reveal: () => void): () => void {
-  let cancelled = false
-  const w = window as Window & {
-    requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number
-  }
-  deferredRevealChain = deferredRevealChain.then(
-    () =>
-      new Promise<void>((resolve) => {
-        const run = () => {
-          if (!cancelled) reveal()
-          // Let this pane's layout/paint finish before the next pane mounts.
-          requestAnimationFrame(() => window.setTimeout(resolve, 0))
-        }
-        if (cancelled) resolve()
-        else if (w.requestIdleCallback) w.requestIdleCallback(run, { timeout: 1000 })
-        else window.setTimeout(run, 120)
-      }),
-  )
-  return () => {
-    cancelled = true
-  }
-}
-
 export function ChatPane(props: { pane: LivePane }) {
   let scroller: HTMLDivElement | undefined
   let pinToBottom = true
@@ -102,28 +71,34 @@ export function ChatPane(props: { pane: LivePane }) {
   const messages = createMemo(() => store.messagesFor(props.pane))
   const focused = () => store.focusedPaneId() === props.pane.pane_id
 
-  // Workspace switches mount every open pane in the niri strip at once;
-  // building all transcripts' DOM synchronously blocked the switch for
-  // ~700ms. Paint the focused pane's transcript immediately and fill the
-  // off-screen ones in during idle frames — one pane per slot via the shared
-  // reveal queue, because revealing them all on one timer froze the strip
-  // for seconds on workspaces with several large threads.
+  // Load only the viewport and its immediate neighbors, independent of focus.
+  // Swiping the strip must not require a second tap to attach a transcript.
+  let section: HTMLElement | undefined
+  const [nearViewport, setNearViewport] = createSignal(false)
   const [revealed, setRevealed] = createSignal(focused())
+  const transcript = () => store.transcriptState(props.pane)
   createEffect(() => {
     if (focused()) setRevealed(true)
+    if (focused() || nearViewport()) store.ensureTranscript(props.pane)
   })
-  if (!revealed()) {
-    const cancel = queueDeferredReveal(() => setRevealed(true))
-    onCleanup(cancel)
-  }
-
-  createEffect(() => {
-    if (focused() || !store.compact()) store.ensureTranscript(props.pane)
+  onMount(() => {
+    if (!section || typeof IntersectionObserver === 'undefined') return
+    const root = section.closest('.niri-strip')
+    const preload = new IntersectionObserver(([entry]) => {
+      setNearViewport(entry.isIntersecting && entry.intersectionRect.width > 0 && entry.intersectionRect.height > 0)
+    }, { root, rootMargin: '0px 100% 0px 100%' })
+    const visible = new IntersectionObserver(([entry]) => {
+      if (entry.isIntersecting && entry.intersectionRect.width > 0 && entry.intersectionRect.height > 0) setRevealed(true)
+    }, { root })
+    preload.observe(section)
+    visible.observe(section)
+    onCleanup(() => { preload.disconnect(); visible.disconnect() })
   })
 
   createEffect(() => {
     const row_count = messages().length
     const rendered = revealed()
+    const loaded = transcript().loaded
     const node = scroller
     if (!node) return
     queueMicrotask(() => {
@@ -133,7 +108,7 @@ export function ChatPane(props: { pane: LivePane }) {
         // Don't spend the one-shot jump while the transcript is still empty
         // or unrevealed — a PWA relaunch runs this effect before the rows
         // exist and used to leave the view stuck at the top of the thread.
-        if (row_count === 0 || !rendered) return
+        if (row_count === 0 || !rendered || !loaded) return
         initial_jump = false
         el.scrollTop = el.scrollHeight
         return
@@ -147,10 +122,20 @@ export function ChatPane(props: { pane: LivePane }) {
     })
   })
 
+  let readIntentUntil = 0
+  let lastScrollTop = 0
+  let touchY: number | null = null
+  const markReadIntent = () => { readIntentUntil = performance.now() + 1200 }
   const onScroll = () => {
     const node = scroller
     if (!node) return
     pinToBottom = node.scrollHeight - node.scrollTop - node.clientHeight < 96
+    const movingUp = node.scrollTop < lastScrollTop
+    lastScrollTop = node.scrollTop
+    if (movingUp && node.scrollTop < 160 && performance.now() < readIntentUntil) {
+      readIntentUntil = 0
+      void showEarlier()
+    }
   }
 
   // Desktop parity: consecutive command/tool rows collapse into one grouped
@@ -197,9 +182,22 @@ export function ChatPane(props: { pane: LivePane }) {
     flush()
     if (!prev?.length) return out
     const prevByKey = new Map<string, RenderItem>()
-    for (const item of prev) prevByKey.set(itemKey(item), item)
+    const prevGroupByMessage = new Map<string, Extract<RenderItem, { kind: 'group' }>>()
+    for (const item of prev) {
+      prevByKey.set(itemKey(item), item)
+      if (item.kind === 'group') for (const message of item.items) prevGroupByMessage.set(message.message_id, item)
+    }
     return out.map((item) => {
       const old = prevByKey.get(itemKey(item))
+      if (!old && item.kind === 'group') {
+        // Earlier pages can extend the first group. Keep an expanded group
+        // expanded so its existing child remains available as a scroll anchor.
+        const prior = item.items.map((message) => prevGroupByMessage.get(message.message_id)).find(Boolean)
+        if (prior && prior.groupKind === item.groupKind) {
+          const expanded = cardExpanded.get(`group:${prior.groupKind}:${prior.items[0]?.message_id ?? ''}`) ?? prior.items.some(commandFailed)
+          cardExpanded.set(`group:${item.groupKind}:${item.items[0]?.message_id ?? ''}`, expanded)
+        }
+      }
       if (!old || old.kind !== item.kind) return item
       if (old.kind === 'row' && item.kind === 'row') {
         return old.message === item.message ? old : item
@@ -270,9 +268,35 @@ export function ChatPane(props: { pane: LivePane }) {
   // Growing the target alone mounts nothing; the budgeted slices above
   // prepend the extra rows, so a 200-row expansion no longer freezes input.
   // Expanding is explicit read intent, so it also lifts the unfocused cap.
-  const showEarlier = () => {
+  const showEarlier = async () => {
+    if (transcript().loadingOlder) return
+    pinToBottom = false
     setEverFocused(true)
-    setWindowTarget((target) => target + TRANSCRIPT_WINDOW_STEP)
+    if (hiddenCount() > 0) {
+      setWindowTarget((target) => Math.max(target, rowLimit()) + TRANSCRIPT_WINDOW_STEP)
+      return
+    }
+    if (!transcript().hasOlder) return
+    const route = JSON.stringify([props.pane.thread_id, props.pane.runtime_id, store.connectionFor(props.pane)])
+    const node = scroller
+    const previousTop = node?.scrollTop
+    const viewportTop = node?.getBoundingClientRect().top ?? 0
+    const anchor = node && [...node.querySelectorAll<HTMLElement>('[data-transcript-item]')]
+      .find((row) => !row.querySelector('[data-transcript-item]') && row.getBoundingClientRect().bottom > viewportTop)
+    const anchorKey = anchor?.dataset.transcriptItem
+    const anchorTop = anchor?.getBoundingClientRect().top
+    await store.loadOlderTranscript(props.pane)
+    if (route !== JSON.stringify([props.pane.thread_id, props.pane.runtime_id, store.connectionFor(props.pane)])) return
+    // A page boundary can merge into an already visible tool group before
+    // row slices run. Preserve its viewport offset without counting unrelated
+    // appended live rows; later slices anchor only their own DOM changes.
+    if (node && node.scrollTop === previousTop && anchorKey && anchorTop !== undefined) {
+      const current = [...node.querySelectorAll<HTMLElement>('[data-transcript-item]')]
+        .find((row) => row.dataset.transcriptItem === anchorKey)
+      if (current) node.scrollTop += current.getBoundingClientRect().top - anchorTop
+    }
+    // Budgeted mount slices preserve the position for newly revealed rows.
+    setWindowTarget((target) => Math.max(target, rowLimit()) + TRANSCRIPT_WINDOW_STEP)
   }
 
   // Turn acceptance time while streaming — drives live group elapsed labels.
@@ -282,7 +306,7 @@ export function ChatPane(props: { pane: LivePane }) {
   const subagent = () => isSubagentThreadId(props.pane.thread_id)
 
   return (
-    <section class={`flex min-h-0 flex-1 flex-col ${subagent() ? 'bg-[color-mix(in_srgb,var(--accent)_8%,var(--chat-black))]' : 'bg-[var(--chat-black)]'}`}>
+    <section ref={section} class={`flex min-h-0 flex-1 flex-col ${subagent() ? 'bg-[color-mix(in_srgb,var(--accent)_8%,var(--chat-black))]' : 'bg-[var(--chat-black)]'}`}>
       <header
         class={`hidden h-10 shrink-0 items-center gap-2 border-b px-3 lg:flex ${
           subagent() ? 'border-[color-mix(in_srgb,var(--accent)_55%,var(--border-muted))]' : 'border-[var(--border-muted)]'
@@ -319,27 +343,59 @@ export function ChatPane(props: { pane: LivePane }) {
         data-chat-scroller
         ref={(node) => { scroller = node }}
         onScroll={onScroll}
+        tabIndex={0}
+        onWheel={(event) => { if (event.deltaY < 0) markReadIntent() }}
+        onTouchStart={(event) => { touchY = event.touches[0]?.clientY ?? null }}
+        onTouchMove={(event) => {
+          const y = event.touches[0]?.clientY
+          if (y !== undefined && touchY !== null && y > touchY) markReadIntent()
+          touchY = y ?? null
+        }}
+        onKeyDown={(event) => {
+          if (event.target === event.currentTarget && ['ArrowUp', 'PageUp', 'Home'].includes(event.key)) markReadIntent()
+        }}
         onMouseDown={() => store.focusPane(props.pane)}
       >
         <div class="mx-auto flex w-full max-w-[900px] flex-col gap-3">
           <Show when={revealed()}>
-          <Show when={hiddenCount() > 0}>
+          <Show when={messages().length > 0 && !transcript().loaded}>
+            <div class="text-center text-[12px] text-[var(--text-muted)]" role="status">
+              <Show when={transcript().error} fallback="Loading conversation…">
+                <button type="button" class="rounded-full bg-[var(--panel-alt)] px-3 py-1.5" onClick={() => void store.retryTranscript(props.pane)}>Retry loading conversation</button>
+              </Show>
+            </div>
+          </Show>
+          <Show when={hiddenCount() > 0 || transcript().hasOlder}>
             <button
               type="button"
               class="mx-auto rounded-full bg-[var(--panel-alt)] px-3 py-1.5 text-[12px] text-[var(--text-muted)] hover:text-[var(--text)]"
-              onClick={showEarlier}
+              disabled={transcript().loadingOlder}
+              onClick={() => void showEarlier()}
             >
-              Show {Math.min(hiddenCount(), TRANSCRIPT_WINDOW_STEP)} earlier…
+              {transcript().loadingOlder ? 'Loading earlier messages…' : transcript().olderError ? 'Retry earlier messages' : 'Show earlier messages'}
             </button>
           </Show>
+          <Show when={transcript().olderError}>
+            <p class="text-center text-[12px] text-[var(--text-muted)]" role="status">{transcript().olderError}</p>
+          </Show>
           <For each={items()}>
-            {(item) =>
-              item.kind === 'group'
+            {(item) => <div data-transcript-item={itemKey(item)}>
+              {item.kind === 'group'
                 ? <ToolCallGroup items={item.items} workingSince={workingSince()} groupKind={item.groupKind} pane={props.pane} />
                 : <TranscriptRow message={item.message} pane={props.pane} />}
+            </div>}
           </For>
           <Show when={messages().length === 0}>
-            <EmptyTranscript pending={!props.pane.thread_id} />
+            <Show when={!props.pane.thread_id || transcript().loaded} fallback={
+              <div class="px-2 py-16 text-[var(--text-muted)]" role="status">
+                <p>{transcript().error ? 'Could not load this conversation.' : 'Loading conversation…'}</p>
+                <Show when={transcript().error}>
+                  <button type="button" class="mt-3 rounded-full bg-[var(--panel-alt)] px-3 py-1.5 text-[13px]" onClick={() => void store.retryTranscript(props.pane)}>Retry loading conversation</button>
+                </Show>
+              </div>
+            }>
+              <EmptyTranscript pending={!props.pane.thread_id} />
+            </Show>
           </Show>
           </Show>
         </div>
@@ -684,7 +740,7 @@ function ToolCallGroup(props: { items: Message[]; workingSince: number | null; g
       </button>
       <Show when={expanded()}>
         <div class="flex flex-col gap-2 px-2.5 pb-2.5">
-          <For each={props.items}>{(message) => <CommandCard message={message} child pane={props.pane} />}</For>
+          <For each={props.items}>{(message) => <div data-transcript-item={`r:${message.message_id}`}><CommandCard message={message} child pane={props.pane} /></div>}</For>
         </div>
       </Show>
     </div>

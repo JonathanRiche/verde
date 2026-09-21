@@ -9,7 +9,7 @@ import {
   layoutFromLivePanes,
   carryLiveChatIdentity,
   mapTranscriptRows,
-  fetchPagedTranscript,
+  fetchTranscriptPage,
   prependTranscriptPage,
   mergeThreadCatalogSettings,
   panesForWorkspace,
@@ -184,118 +184,51 @@ describe('mapTranscriptRows', () => {
   })
 })
 
-describe('fetchPagedTranscript', () => {
-  test('walks backward pages into oldest-to-newest order', async () => {
+describe('fetchTranscriptPage', () => {
+  test('returns the recent tail after one request and leaves the older cursor lazy', async () => {
     const calls = []
-    const messages = await fetchPagedTranscript(async (method, params) => {
+    const page = await fetchTranscriptPage(async (method, params) => {
       calls.push({ method, params })
-      if (params.cursor === 'b:2') {
-        return {
-          result: {
-            messages: [
-              { message_id: 'm0', role: 'user', author: 'You', body: 'first' },
-              { message_id: 'm1', role: 'assistant', author: 'Codex', body: 'second' },
-            ],
-            next_cursor: null,
-          },
-        }
-      }
-      return {
-        result: {
-          messages: [
-            { message_id: 'm2', role: 'user', author: 'You', body: 'third' },
-            { message_id: 'm3', role: 'assistant', author: 'Codex', body: 'fourth' },
-          ],
-          next_cursor: 'b:2',
-        },
-      }
-    }, { workspace_id: 'ws-1', local_thread_id: 'thread-1' })
-
-    expect(calls).toEqual([
-      { method: 'chat.message.list', params: {
-        workspace_id: 'ws-1',
-        local_thread_id: 'thread-1',
-        direction: 'backward',
-        limit: 40,
-      } },
-      { method: 'chat.message.list', params: {
-        workspace_id: 'ws-1',
-        local_thread_id: 'thread-1',
-        direction: 'backward',
-        limit: 40,
-        cursor: 'b:2',
-      } },
-    ])
-    expect(messages.map((row) => row.message_id)).toEqual(['m0', 'm1', 'm2', 'm3'])
+      return { result: { messages: [{ message_id: 'new', body: 'recent' }], next_cursor: 'b:2' } }
+    }, { workspace_id: 'ws', local_thread_id: 'thread' })
+    expect(calls).toEqual([{ method: 'chat.message.list', params: { workspace_id: 'ws', local_thread_id: 'thread', direction: 'backward', limit: 40 } }])
+    expect(page.messages.map(row => row.message_id)).toEqual(['new'])
+    expect(page.cursor).toBe('b:2')
   })
-
-  test('falls back to chat.thread.get when message.list is unavailable', async () => {
-    const messages = await fetchPagedTranscript(async (method) => {
-      if (method === 'chat.message.list') {
-        return { error: { code: 'method_not_found', message: 'unknown' } }
-      }
-      return {
-        result: {
-          thread: {
-            messages: [{ message_id: 'legacy', role: 'user', author: 'You', body: 'from get' }],
-          },
-        },
-      }
-    }, { workspace_id: 'ws-1', local_thread_id: 'thread-1' })
-
-    expect(messages).toMatchObject([{ message_id: 'legacy', body: 'from get' }])
+  test('falls back to a legacy full get only when pagination is unsupported', async () => {
+    const page = await fetchTranscriptPage(async method => method === 'chat.message.list'
+      ? { error: { code: 'method_not_found', message: 'unknown' } }
+      : { result: { thread: { messages: [{ message_id: 'legacy', body: 'from get' }] } } },
+    { workspace_id: 'ws', local_thread_id: 'thread' })
+    expect(page.messages).toMatchObject([{ message_id: 'legacy', body: 'from get' }])
+    expect(page.cursor).toBeNull()
   })
-
-  test('retries a too-large first page with a smaller limit', async () => {
+  test('shrinks oversized pages, and restores the limit for an explicit older request', async () => {
     const limits = []
-    const messages = await fetchPagedTranscript(async (method, params) => {
+    const call = async (method, params) => {
       expect(method).toBe('chat.message.list')
       limits.push(params.limit)
-      if (params.limit > 10) return { ok: false, error: { code: 'unavailable', message: 'daemon unavailable' } }
-      return {
-        result: {
-          messages: [{ message_id: 'ok', role: 'assistant', author: 'Codex', body: 'fits' }],
-        },
-      }
-    }, { workspace_id: 'ws-1', local_thread_id: 'thread-1' })
-
-    expect(limits[0]).toBe(40)
-    expect(limits.at(-1)).toBeLessThanOrEqual(10)
-    expect(messages).toMatchObject([{ message_id: 'ok', body: 'fits' }])
-  })
-
-  test('restores the default page size after walking past a too-large row', async () => {
-    const limits = []
-    const messages = await fetchPagedTranscript(async (method, params) => {
-      expect(method).toBe('chat.message.list')
-      limits.push(params.limit)
-      if (!params.cursor) {
-        if (params.limit > 1) return { ok: false, error: { code: 'unavailable', message: 'daemon unavailable' } }
-        return {
-          result: {
-            messages: [{ message_id: 'huge', role: 'system', author: 'Ran command', body: 'big' }],
-            next_cursor: 'b:older',
-          },
-        }
-      }
-      return {
-        result: {
-          messages: [{ message_id: 'old', role: 'user', author: 'You', body: 'hi' }],
-        },
-      }
-    }, { workspace_id: 'ws-1', local_thread_id: 'thread-1' })
-
-    expect(limits[0]).toBe(40)
-    expect(limits).toContain(1)
+      if (!params.cursor && params.limit > 1) return { ok: false, error: { code: 'unavailable' } }
+      return { result: { messages: [{ message_id: params.cursor ? 'old' : 'huge', body: 'fits' }], next_cursor: params.cursor ? null : 'b:older' } }
+    }
+    const args = { workspace_id: 'ws', local_thread_id: 'thread' }
+    const first = await fetchTranscriptPage(call, args)
+    expect(limits).toEqual([40, 20, 10, 5, 2, 1])
+    expect(first.cursor).toBe('b:older')
+    const older = await fetchTranscriptPage(call, args, first.cursor)
     expect(limits.at(-1)).toBe(40)
-    expect(messages.map((row) => row.message_id)).toEqual(['old', 'huge'])
+    expect(older.messages[0].message_id).toBe('old')
   })
-
-  test('keeps later pages in front of already-loaded newer rows', () => {
-    expect(prependTranscriptPage(
-      [{ message_id: 'm0', role: 'user', author: 'You', body: 'old' }],
-      [{ message_id: 'm1', role: 'assistant', author: 'Codex', body: 'new' }],
-    ).map((row) => row.message_id)).toEqual(['m0', 'm1'])
+  test('persistent page failure remains retryable without silently returning an empty transcript', async () => {
+    await expect(fetchTranscriptPage(async method => {
+      expect(method).toBe('chat.message.list')
+      return { error: { code: 'unavailable', message: 'offline' } }
+    }, { workspace_id: 'ws', local_thread_id: 'thread' })).rejects.toThrow('offline')
+  })
+  test('blank legacy IDs use stable sort indexes across pages', () => {
+    const older = mapTranscriptRows({ messages: [{ message_id: '', sort_index: 1, body: 'same' }] }, 'thread')
+    const newer = mapTranscriptRows({ messages: [{ message_id: '', sort_index: 2, body: 'same' }] }, 'thread')
+    expect(prependTranscriptPage(older, newer).map(row => row.message_id)).toEqual(['thread-1', 'thread-2'])
   })
 })
 

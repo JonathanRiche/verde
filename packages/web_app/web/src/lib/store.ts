@@ -18,6 +18,7 @@ import { watchNotifications } from './notify'
 import { createChatCwdApi, chatCwdLocked, chatCwdTurnParams } from './chat_cwd'
 import { createProviderReadinessApi, runtimeBlocker } from './provider_readiness'
 import { latestPaneUsage } from './usage'
+import { createTranscriptHistory, mergeTranscriptPage, type TranscriptContext, type TranscriptPage } from './transcript_history'
 import { dispatchWebCommand, openChatCommandPicker, sidebarActionUnavailableReason, requestSidebarThreadSync, type ChatPickerCommand } from './commands'
 import { archiveCommand, requestNewThread, requestWorkspaceCommand } from './command_requests'
 import { createHistoryApi, groupHistory, reconcileHistoryArchives, registerHistoryClient } from './history'
@@ -73,7 +74,6 @@ const THREAD_LIST_LIMIT = 100
 /// Workspace 8 overflowed a single `chat.thread.get` and left the phone empty.
 const TRANSCRIPT_PAGE_LIMIT = 40
 const TRANSCRIPT_PAGE_LIMIT_MIN = 1
-const TRANSCRIPT_MAX_PAGES = 64
 
 interface SnapshotSession {
   session_id?: string
@@ -340,6 +340,7 @@ function stablePaneId(kind: 'chat' | 'term' | 'browser', key: string): number {
 
 function sameMessage(a: Message, b: Message): boolean {
   return (
+    a.message_id === b.message_id &&
     a.role === b.role &&
     a.author === b.author &&
     a.body === b.body &&
@@ -352,8 +353,9 @@ function mergeMessages(previous: Message[] | undefined, next: Message[]): Messag
   if (previous.length === next.length && previous.every((row, index) => sameMessage(row, next[index]!))) {
     return previous
   }
-  return next.map((row, index) => {
-    const old = previous[index]
+  const byId = new Map(previous.map(row => [row.message_id, row]))
+  return next.map((row) => {
+    const old = byId.get(row.message_id)
     return old && sameMessage(old, row) ? old : row
   })
 }
@@ -615,58 +617,33 @@ function messageListCursor(response: RpcEnvelope): string | undefined {
   return typeof cursor === 'string' && cursor.length > 0 ? cursor : undefined
 }
 
-/// Load a durable transcript in gateway-sized pages. Falls back to a single
-/// `chat.thread.get` on daemons that do not serve `chat.message.list`.
-export async function fetchPagedTranscript(
+/// Fetch only the newest page (or one requested older page), reducing the
+/// size when a large command card exceeds the gateway response limit.
+export async function fetchTranscriptPage(
   call: (method: string, params: unknown) => Promise<RpcEnvelope>,
   args: { workspace_id: string; local_thread_id: string },
-): Promise<Message[]> {
-  const listed = await listTranscriptMessages(call, args)
-  if (listed !== null) return listed
-  const response = await call('chat.thread.get', {
-    workspace_id: args.workspace_id,
-    local_thread_id: args.local_thread_id,
-  })
-  if (rpcFailed(response)) return []
-  return mapTranscriptRows(response, args.local_thread_id)
-}
-
-async function listTranscriptMessages(
-  call: (method: string, params: unknown) => Promise<RpcEnvelope>,
-  args: { workspace_id: string; local_thread_id: string },
-): Promise<Message[] | null> {
-  let cursor: string | undefined
+  cursor?: string,
+): Promise<TranscriptPage> {
   let limit = TRANSCRIPT_PAGE_LIMIT
-  let collected: Message[] = []
-  for (let attempt = 0; attempt < TRANSCRIPT_MAX_PAGES; attempt++) {
-    const params: Record<string, unknown> = {
-      workspace_id: args.workspace_id,
-      local_thread_id: args.local_thread_id,
-      direction: 'backward',
-      limit,
+  for (;;) {
+    const response = await call('chat.message.list', {
+      ...args, direction: 'backward', limit, ...(cursor ? { cursor } : {}),
+    })
+    if (!rpcFailed(response)) {
+      const messages = mapTranscriptRows(response, args.local_thread_id)
+      return { messages, cursor: messages.length ? messageListCursor(response) ?? null : null }
     }
-    if (cursor) params.cursor = cursor
-    const response = await call('chat.message.list', params)
-    if (rpcFailed(response)) {
-      if (collected.length > 0) break
-      if (methodUnavailable(response)) return null
-      if (limit > TRANSCRIPT_PAGE_LIMIT_MIN) {
-        limit = Math.max(TRANSCRIPT_PAGE_LIMIT_MIN, Math.floor(limit / 2))
-        continue
-      }
-      return null
+    if (methodUnavailable(response) && !cursor) {
+      // Compatibility only: older daemons have no paginated endpoint.
+      const legacy = await call('chat.thread.get', args)
+      if (rpcFailed(legacy)) throw new Error(legacy.error?.message ?? 'Could not load messages.')
+      return { messages: mapTranscriptRows(legacy, args.local_thread_id), cursor: null }
     }
-    const rows = mapTranscriptRows(response, args.local_thread_id)
-    collected = prependTranscriptPage(rows, collected)
-    const next = messageListCursor(response)
-    if (!next || rows.length === 0) return collected
-    cursor = next
-    // A too-large page shrinks `limit` to walk past a megabyte command card.
-    // Restore the default afterward so the rest of the thread is not fetched
-    // one row at a time (Workspace 8 was ~100 RPCs on a phone).
-    limit = TRANSCRIPT_PAGE_LIMIT
+    if (limit <= TRANSCRIPT_PAGE_LIMIT_MIN || methodUnavailable(response)) {
+      throw new Error(response.error?.message ?? 'Could not load messages.')
+    }
+    limit = Math.max(TRANSCRIPT_PAGE_LIMIT_MIN, Math.floor(limit / 2))
   }
-  return collected
 }
 
 export function mapTranscriptRows(raw: unknown, fallbackId: string): Message[] {
@@ -680,7 +657,7 @@ export function mapTranscriptRows(raw: unknown, fallbackId: string): Message[] {
     const body = record.body ?? record.content ?? record.text ?? record.prompt ?? ''
     const images = transcriptAttachments(record)
     return {
-      message_id: String(record.message_id ?? `${fallbackId}-${index}`),
+      message_id: typeof record.message_id === 'string' && record.message_id.length > 0 ? record.message_id : `${fallbackId}-${record.sort_index ?? index}`,
       role: String(record.role ?? 'assistant'),
       author: String(record.author ?? ''),
       body: typeof body === 'string' ? body : JSON.stringify(body),
@@ -1409,7 +1386,6 @@ export function createAppStore() {
   /// reachable; they then override the (possibly stale) store projection.
   let liveWorkspaces: Workspace[] | null = null
   let liveLayouts: Record<string, PersistedWorkspaceLayout | null> = {}
-  const pendingTranscript = new Set<string>()
   // Threads opened from this web client stay visible even though the
   // desktop-persisted layout has no pane for them.
   const localThreadIds = new Set<string>()
@@ -1644,7 +1620,7 @@ export function createAppStore() {
           // narrowing the row here used to replace its persisted images with
           // an otherwise-identical image-less message.
           const mapped = mapTranscriptRows({ thread }, thread.local_thread_id)
-          const merged = mergeMessages(prev[key], mapped)
+          const merged = mergeMessages(prev[key], mergeTranscriptPage(prev[key] ?? [], mapped))
           if (merged !== prev[key]) {
             next[key] = merged
             changed = true
@@ -2086,28 +2062,47 @@ export function createAppStore() {
     }
   }
 
-  const loadTranscript = async (pane: LivePane) => {
-    if (pane.kind !== 'chat' || !pane.thread_id) return
+  const transcriptHistory = createTranscriptHistory({
+    read: key => transcripts()[key] ?? [],
+    write: storeTranscript,
+  })
+  const requestedTranscripts = new Set<string>()
+  const transcriptIdentity = (pane: LivePane): string => {
+    const thread = routeThread(pane)
+    const profile = connectionFor(pane)
+    const runtime = profile === 'local' ? null : connections()?.connections.find(row => row.profile_id === profile)?.runtime_id ?? null
+    return JSON.stringify([paneOwningWorkspaceId(pane), pane.thread_id, profile, thread.runtime_id ?? null, runtime])
+  }
+  const transcriptState = (pane: LivePane) => transcriptHistory.state(paneKey(pane.workspace_id, pane.pane_id), transcriptIdentity(pane))
+  const transcriptContext = (pane: LivePane): TranscriptContext => {
+    const identity = transcriptIdentity(pane)
     const key = paneKey(pane.workspace_id, pane.pane_id)
-    if (pendingTranscript.has(key)) return
-    pendingTranscript.add(key)
-    try {
-      // HTTP on purpose: a focused pane's first transcript is user-visible
-      // latency, and multi-megabyte thread bodies would otherwise queue
-      // behind the projection sweep on the serial websocket loop.
-      const workspace_id = paneOwningWorkspaceId(pane)
-      const messages = await fetchPagedTranscript(
-        (method, params) => paneRpc(pane, method, params),
-        { workspace_id, local_thread_id: pane.thread_id },
-      )
-      if (messages.length === 0 && transcripts()[key]?.length) return
-      storeTranscript(key, messages)
-    } catch {
-      // The connection picker shows readiness; keep the durable transcript while offline.
-    } finally {
-      pendingTranscript.delete(key)
+    const current = () => {
+      const latest = panesByWorkspace()[pane.workspace_id]?.find(row => row.pane_id === pane.pane_id) ?? pane
+      return latest.thread_id === pane.thread_id && transcriptIdentity(latest) === identity
+    }
+    return {
+      key, identity, current,
+      fetch: cursor => {
+        if (!current()) return Promise.reject(new Error('Chat connection changed.'))
+        return fetchTranscriptPage((method, params) => {
+          if (!current()) return Promise.reject(new Error('Chat connection changed.'))
+          return paneRpc(pane, method, params)
+        }, { workspace_id: paneOwningWorkspaceId(pane), local_thread_id: pane.thread_id! }, cursor)
+      },
     }
   }
+  const loadTranscript = async (pane: LivePane, force = false) => {
+    if (pane.kind !== 'chat' || !pane.thread_id) return
+    // Resolve inherited routes before capturing the cache/request identity.
+    if (!connections() && !knownLocalConnection(pane)) await refreshConnections()
+    await transcriptHistory.load(transcriptContext(pane), force)
+  }
+  const loadOlderTranscript = async (pane: LivePane) => {
+    if (pane.kind !== 'chat' || !pane.thread_id) return
+    await transcriptHistory.loadOlder(transcriptContext(pane))
+  }
+  const retryTranscript = (pane: LivePane) => loadTranscript(pane, true)
 
   // ---- Live turn streaming ------------------------------------------------
   // The daemon executes every chat turn (desktop-started ones included) and
@@ -2472,9 +2467,14 @@ export function createAppStore() {
         // Durable-first: a terminal status is published only after the turn's
         // messages commit, so the committed transcript fetched here already
         // contains everything the overlay showed.
-        finishedTurns.add(tail.turn_id)
         followups.observeTurn(pane, tail.turn_id, result.status)
-        await loadTranscript(pane)
+        await loadTranscript(pane, true)
+        if (turnTails.get(key) !== tail) return
+        if (transcriptState(pane).error) {
+          await sleep(TAIL_FALLBACK_DELAY_MS)
+          continue
+        }
+        finishedTurns.add(tail.turn_id)
         await refreshProjection({ scope: 'selected' })
         clearOverlay(key)
         await followups.flushReady()
@@ -2501,6 +2501,8 @@ export function createAppStore() {
       )
       .at(-1)
     if (!turn?.turn_id || finishedTurns.has(turn.turn_id)) {
+      const existing = turnTails.get(key)
+      if (existing && runningTails.has(existing)) return
       if (turnTails.has(key)) clearOverlay(key)
       return
     }
@@ -2538,13 +2540,13 @@ export function createAppStore() {
       seen.add(key)
       jobs.push(pane)
     }
-    // Focused pane first: on initial open it must paint before background
-    // panes queue their multi-megabyte transcript downloads/parses. Phones
-    // show one chat, so background panes wait until they are focused.
+    // Focused/followup history is needed immediately; other panes request
+    // their first page when they approach the viewport.
     consider(focusedPane())
     for (const pane of followups.panes()) consider(pane)
-    if (!compact()) {
-      for (const pane of openPanes()) consider(pane)
+    const eager = new Set(seen)
+    for (const pane of openPanes()) {
+      if (!compact() || requestedTranscripts.has(paneKey(pane.workspace_id, pane.pane_id))) consider(pane)
     }
     for (const pane of jobs) {
       // Streaming rides its own long-poll loop; this tick only (re)starts
@@ -2581,17 +2583,18 @@ export function createAppStore() {
         followups.observeTurn(pane, pending.turn_id, turn?.status)
       }
       tailActiveTurn(pane)
+      const history = transcriptState(pane)
       const key = paneKey(pane.workspace_id, pane.pane_id)
-      const uncached = !transcripts()[key]?.length
-      if (uncached) await loadTranscript(pane)
+      if ((eager.has(key) || requestedTranscripts.has(key)) && !history.loaded && !history.error) await loadTranscript(pane)
     }
     await followups.flushReady()
   }
 
   const ensureTranscript = (pane: LivePane | null | undefined) => {
     if (!pane || pane.kind !== 'chat') return
-    const key = paneKey(pane.workspace_id, pane.pane_id)
-    if (transcripts()[key]) return
+    requestedTranscripts.add(paneKey(pane.workspace_id, pane.pane_id))
+    const history = transcriptState(pane)
+    if (history.loaded || history.loading || history.error) return
     void loadTranscript(pane)
   }
 
@@ -2771,7 +2774,7 @@ export function createAppStore() {
   const messagesFor = (pane: LivePane | null | undefined) => {
     if (!pane) return []
     const key = paneKey(pane.workspace_id, pane.pane_id)
-    const committed = transcripts()[key] ?? []
+    const committed = transcriptHistory.matches(key, transcriptIdentity(pane)) ? transcripts()[key] ?? [] : []
     const overlay = overlays()[key]
     return overlay?.length ? [...committed, ...overlay] : committed
   }
@@ -4158,7 +4161,7 @@ export function createAppStore() {
     uploadingAttachmentsFor,
     attachFiles,
     removeAttachment,
-    messagesFor,
+    messagesFor, transcriptState, loadOlderTranscript, retryTranscript,
     ensureTranscript,
     selectWorkspace,
     focusPane,
