@@ -224,14 +224,16 @@ fn tryUnix(io: std.Io, allocator: std.mem.Allocator, endpoint: []const u8, reque
     var write_buf: [4096]u8 = undefined;
     defer std.crypto.secureZero(u8, write_buf[0..]);
     var writer = stream.writer(io, &write_buf);
-    try writer.interface.writeAll(request_json);
-    try writer.interface.writeByte('\n');
-    try writer.interface.flush();
+    // Reader/Writer interfaces erase transport errors. Preserve cancellation
+    // so bounded callers stop instead of retrying after its one-shot delivery.
+    writer.interface.writeAll(request_json) catch |err| return writer.err orelse err;
+    writer.interface.writeByte('\n') catch |err| return writer.err orelse err;
+    writer.interface.flush() catch |err| return writer.err orelse err;
 
     var read_buf: [64 * 1024]u8 = undefined;
     defer std.crypto.secureZero(u8, read_buf[0..]);
     var reader = stream.reader(io, &read_buf);
-    return try readResponseAlloc(allocator, &reader.interface, MAX_GATEWAY_RPC_BYTES);
+    return readResponseAlloc(allocator, &reader.interface, MAX_GATEWAY_RPC_BYTES) catch |err| return reader.err orelse err;
 }
 
 fn readResponseAlloc(
@@ -463,4 +465,48 @@ test "gateway request and response bounds are enforced" {
 
 test {
     _ = protocol;
+}
+
+test "Unix transport preserves cancellation through buffered readers and writers" {
+    const Fixture = struct {
+        cancel_write: bool,
+        closed: usize = 0,
+        reads: usize = 0,
+
+        fn connect(_: ?*anyopaque, _: *const std.Io.net.UnixAddress) std.Io.net.UnixAddress.ConnectError!std.Io.net.Socket.Handle {
+            return 0;
+        }
+        fn write(raw: ?*anyopaque, _: std.Io.net.Socket.Handle, header: []const u8, data: []const []const u8, splat: usize) std.Io.net.Stream.Writer.Error!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.cancel_write) return error.Canceled;
+            var count = header.len;
+            for (data, 0..) |bytes, index| count += bytes.len * (if (index + 1 == data.len) splat else 1);
+            return count;
+        }
+        fn read(raw: ?*anyopaque, _: std.Io.net.Socket.Handle, _: [][]u8) std.Io.net.Stream.Reader.Error!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.reads += 1;
+            return error.Canceled;
+        }
+        fn close(raw: ?*anyopaque, handles: []const std.Io.net.Socket.Handle) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.closed += handles.len;
+        }
+    };
+    // Replace only the OS socket operations, exercising the real buffered
+    // Stream interfaces and transport cleanup without sockets or shared state.
+    var vtable = std.testing.io.vtable.*;
+    vtable.netConnectUnix = Fixture.connect;
+    vtable.netWrite = Fixture.write;
+    vtable.netRead = Fixture.read;
+    vtable.netClose = Fixture.close;
+    for ([_]bool{ false, true }) |cancel_write| {
+        for ([_][]const u8{ "{}", "x" ** 8192 }) |request| {
+            var fixture: Fixture = .{ .cancel_write = cancel_write };
+            const io: std.Io = .{ .userdata = &fixture, .vtable = &vtable };
+            try std.testing.expectError(error.Canceled, tryUnix(io, std.testing.allocator, "/hermetic-unused.sock", request));
+            try std.testing.expectEqual(@as(usize, 1), fixture.closed);
+            try std.testing.expectEqual(@as(usize, if (cancel_write) 0 else 1), fixture.reads);
+        }
+    }
 }

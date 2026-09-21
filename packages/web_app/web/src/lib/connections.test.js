@@ -46,8 +46,14 @@ describe('remote chat transport', () => {
     expect(sent.body).toEqual({ profile_id: 'zod', runtime_id: 'runtime-a', method: 'chat.turn.start', params: { workspace_id: 'mirage', repository_id: 'primary' } })
     expect(sent.headers.Authorization).toBeUndefined()
   })
-  test('catalog failures remain failures instead of empty Local defaults', async () => {
-    globalThis.fetch = async () => Response.json({ error: { message: 'Owner login required' } }, { status: 403 })
-    await expect(fetchConnections()).rejects.toThrow('Owner login required')
+  test('paired catalog denial leaves local chat available', async () => {
+    globalThis.fetch = async () => Response.json({ error: { message: 'Owner login required for saved connections' } }, { status: 403 })
+    expect(await fetchConnections()).toEqual({ connections: [], defaults: [] })
+  })
+  test('authentication and service failures do not become local defaults', async () => {
+    for (const status of [401, 500]) {
+      globalThis.fetch = async () => Response.json({ error: { message: 'unavailable' } }, { status })
+      await expect(fetchConnections()).rejects.toThrow('unavailable')
+    }
   })
 })

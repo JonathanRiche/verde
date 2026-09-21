@@ -662,6 +662,7 @@ pub const Service = struct {
     device_rate_limiter: LoginRateLimiter,
     ticket_rate_limiter: LoginRateLimiter,
     pair_credentials: PairCredentialManager,
+    paired_clients: @import("paired_clients.zig").Manager = .{},
 
     pub fn initFromTokenFile(
         allocator: std.mem.Allocator,

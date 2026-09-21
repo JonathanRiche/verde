@@ -24,6 +24,30 @@ export interface Message {
   created_at_ms?: number | null
 }
 
+export type FollowupKind = 'queue' | 'steer'
+export type FollowupState = 'pending' | 'sent_inline' | 'fallback_next_turn'
+
+export interface PendingFollowup {
+  kind: FollowupKind
+  state: FollowupState
+  text: string
+  images: Attachment[]
+  turn_id: string
+  steer_id: string
+  next_turn_id: string
+  event_seq?: number
+  delivery: 'unsent' | 'sending' | 'uncertain' | 'accepted'
+}
+
+export type ApprovalDecision = 'approve' | 'deny'
+
+export interface PendingApproval {
+  turn_id: string
+  call_id: string
+  title: string
+  body: string
+}
+
 export interface Thread {
   profile_id?: string | null
   runtime_id?: string | null

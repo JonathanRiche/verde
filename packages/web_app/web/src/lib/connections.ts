@@ -23,6 +23,8 @@ export function effectiveConnection(thread: Pick<Thread, 'profile_id' | 'committ
 
 export async function fetchConnections(): Promise<ConnectionCatalog> {
   const response = await fetch('/api/chat-connections', { credentials: 'same-origin', cache: 'no-store' })
+  // Paired sessions intentionally cannot inspect the owner's saved connections.
+  if (response.status === 403) return { connections: [], defaults: [] }
   const data = await response.json()
   if (!response.ok || !Array.isArray(data.connections) || !Array.isArray(data.defaults)) {
     throw new Error(data.error?.message ?? 'Could not load saved connections')

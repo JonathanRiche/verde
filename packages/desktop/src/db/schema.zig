@@ -1295,7 +1295,7 @@ test "message extent triggers track append move and top deletion" {
 
     const conn = try zqlite.open(path, zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
     defer conn.close();
-    try migrate(conn, .none);
+    try migrateToVersion(conn, 11, .none);
     try conn.execNoArgs(
         \\insert into workspaces (workspace_id, sort_index, label, path) values ('w', 0, 'W', '/w');
         \\insert into threads (workspace_id, sort_index, title, local_thread_id, provider, harness)

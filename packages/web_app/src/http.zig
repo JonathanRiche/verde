@@ -160,7 +160,9 @@ pub fn serve(
 
     var runtime: Runtime = .{};
     var group: std.Io.Group = .init;
+    defer auth.paired_clients.closeAll(allocator, io, daemon) catch {};
     defer group.cancel(io);
+    try group.concurrent(io, reapPairedClients, .{ allocator, io, daemon, auth });
 
     while (true) {
         try runtime.connection_slots.wait(io);
@@ -184,6 +186,15 @@ pub fn serve(
             log.err("unable to spawn connection: {s}", .{@errorName(err)});
             var copy = stream;
             copy.close(io);
+        };
+    }
+}
+
+fn reapPairedClients(allocator: std.mem.Allocator, io: std.Io, daemon: *daemon_mod.Daemon, auth: *auth_mod.Service) void {
+    while (true) {
+        std.Io.sleep(io, .fromMilliseconds(30_000), .awake) catch return;
+        auth.paired_clients.reap(allocator, io, daemon) catch |err| {
+            if (err == error.Canceled) return;
         };
     }
 }
@@ -1399,7 +1410,11 @@ fn handleRpc(
         return;
     }
 
-    const result = daemon.callRaw(trimmed) catch {
+    const result = (if (auth_context == .pair)
+        callPairedRpc(allocator, daemon, auth, auth_context.pair, trimmed)
+    else
+        daemon.callRaw(trimmed)) catch |err| {
+        if (err == error.Canceled) return error.Canceled;
         try respondDaemonUnavailable(request);
         return;
     };
@@ -1686,7 +1701,11 @@ fn serveWebSocket(
                     continue;
                 }
 
-                const result = session.daemon.callRaw(trimmed) catch {
+                const result = (if (session.authentication == .pair)
+                    callPairedRpc(allocator, daemon, auth, session.authentication.pair, trimmed)
+                else
+                    session.daemon.callRaw(trimmed)) catch |err| {
+                    if (err == error.Canceled) return error.Canceled;
                     const encoded = try headless.encodeErrorResponse(allocator, 0, "unavailable", "daemon unavailable");
                     defer allocator.free(encoded);
                     session.send(encoded) catch {};
@@ -1950,9 +1969,22 @@ const PairedRpcPolicy = union(enum) {
 
 fn pairedRpcPolicy(method: []const u8, scope_mask: u16) PairedRpcPolicy {
     if (blockedRpcMethod(method)) return .forbidden;
+    // Registration is intercepted below, never forwarded with browser params.
+    // Permit either store-writing scope; all actual writes retain their own gate.
+    if (std.mem.eql(u8, method, "daemon.client.register")) {
+        inline for (.{ .chat_write, .repository_write }) |scope| {
+            const mask = headless.access_protocol.scopeBit(scope);
+            if (headless.access_protocol.scopeMaskContains(scope_mask, mask)) return .{ .authorize = mask };
+        }
+        return .insufficient_scope;
+    }
     const required_mask = headless.access_protocol.requiredScopeMaskForRpc(method) orelse return .forbidden;
     if (!headless.access_protocol.scopeMaskContains(scope_mask, required_mask)) return .insufficient_scope;
     return .{ .authorize = required_mask };
+}
+
+fn callPairedRpc(allocator: std.mem.Allocator, daemon: *daemon_mod.Daemon, auth: *auth_mod.Service, claims: auth_mod.PairClaims, raw: []const u8) !daemon_mod.CallResult {
+    return .{ .json = try auth.paired_clients.forward(allocator, daemon.io, claims, raw, daemon) };
 }
 
 fn authorizeApiContext(
@@ -2014,6 +2046,9 @@ fn authorizePairClaims(
                 daemon.io,
                 claims.device_id[0..],
             ) catch {};
+            auth.paired_clients.closeDevice(allocator, daemon.io, daemon, &claims.device_id) catch |err| {
+                if (err == error.Canceled) daemon.io.recancel();
+            };
             break :rejected false;
         },
         .unavailable => false,
@@ -3031,6 +3066,47 @@ test "paired scope policy is shared by HTTP and WebSocket forwarding" {
     try std.testing.expect(headless.access_protocol.requiredScopeMaskForRpc("web.directory.list") == null);
 }
 
+test "gateway followup routes require chat write and allow the remote bridge" {
+    for ([_][]const u8{ "chat.turn.steer", "chat.followup", "chat.turn.start" }) |method| {
+        try std.testing.expect(!blockedRpcMethod(method));
+        const chat_write = headless.access_protocol.scopeBit(.chat_write);
+        switch (pairedRpcPolicy(method, chat_write)) {
+            .authorize => |mask| try std.testing.expectEqual(chat_write, mask),
+            else => return error.FollowupMethodNotForwarded,
+        }
+        try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy(method, headless.access_protocol.scopeBit(.chat_read)));
+        try std.testing.expect(@import("web_runtime").allowedMethod(method));
+    }
+}
+
+test "gateway slash commands require runtime read or chat write" {
+    inline for (.{ "provider.slash.list", "provider.slash.run" }, .{ .runtime_read, .chat_write }) |method, scope| {
+        const required = headless.access_protocol.scopeBit(scope);
+        try std.testing.expect(!blockedRpcMethod(method));
+        switch (pairedRpcPolicy(method, required)) {
+            .authorize => |mask| try std.testing.expectEqual(required, mask),
+            else => return error.SlashMethodNotForwarded,
+        }
+        try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy(method, headless.access_protocol.scopeBit(.chat_read)));
+    }
+    try std.testing.expect(blockedRpcMethod("web.directory.list"));
+    try std.testing.expect(!@import("web_runtime").allowedMethod("web.directory.list"));
+    try std.testing.expectEqual(PairedRpcPolicy.forbidden, pairedRpcPolicy("workspace.file.search", 0xffff));
+    try std.testing.expect(!@import("web_runtime").allowedMethod("session.create"));
+}
+
+test "gateway approval requires chat write and is allowed by the remote bridge" {
+    const method = "chat.turn.approve";
+    try std.testing.expect(!blockedRpcMethod(method));
+    const chat_write = headless.access_protocol.scopeBit(.chat_write);
+    switch (pairedRpcPolicy(method, chat_write)) {
+        .authorize => |mask| try std.testing.expectEqual(chat_write, mask),
+        else => return error.ApprovalMethodNotForwarded,
+    }
+    try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy(method, headless.access_protocol.scopeBit(.chat_read)));
+    try std.testing.expect(@import("web_runtime").allowedMethod(method));
+}
+
 test "paired gateway forwards staged attachment uploads with default device scopes" {
     // Regression: a gateway built without the attachment allowlist answered
     // chat.attachment.* with `forbidden` even though the daemon advertised
@@ -3365,4 +3441,16 @@ test "gateway resource policies stay explicitly bounded" {
     try std.testing.expectEqual(@as(usize, 32), MAX_KEEPALIVE_REQUESTS);
     try std.testing.expectEqual(@as(usize, 4 * 1024), MAX_HEADER_BYTES);
     try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), MAX_RPC_FRAME_BYTES);
+}
+
+test "history mutation and gateway registration preserve paired scope boundaries" {
+    const access = headless.access_protocol;
+    const write = access.scopeBit(.chat_write);
+    try std.testing.expectEqual(pairedRpcPolicy("chat.thread.upsert", write), pairedRpcPolicy("chat.thread.archive.set", write));
+    try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy("chat.thread.archive.set", access.scopeBit(.chat_read)));
+    try std.testing.expectEqual(PairedRpcPolicy{ .authorize = write }, pairedRpcPolicy("daemon.client.register", write));
+    try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy("daemon.client.register", access.scopeBit(.chat_read)));
+    try std.testing.expectEqual(PairedRpcPolicy.forbidden, pairedRpcPolicy("daemon.client.close", 0xffff));
+    // Store metadata belongs to the local daemon, just like upsert.
+    try std.testing.expectEqual(@import("web_runtime").allowedMethod("chat.thread.upsert"), @import("web_runtime").allowedMethod("chat.thread.archive.set"));
 }

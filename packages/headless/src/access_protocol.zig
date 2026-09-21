@@ -212,6 +212,7 @@ pub fn requiredScopeMaskForRpc(method: []const u8) ?u16 {
         std.mem.eql(u8, method, "core.capabilities") or
         std.mem.eql(u8, method, "status") or
         std.mem.eql(u8, method, "provider.models.list") or
+        std.mem.eql(u8, method, "provider.slash.list") or
         std.mem.eql(u8, method, "providers.status") or
         std.mem.eql(u8, method, "daemon.storeStatus")) return scopeBit(.runtime_read);
 
@@ -232,6 +233,7 @@ pub fn requiredScopeMaskForRpc(method: []const u8) ?u16 {
         std.mem.eql(u8, method, "chat.links.clear") or
         std.mem.eql(u8, method, "chat.tasks.blocked") or
         std.mem.eql(u8, method, "chat.turn.start") or
+        std.mem.eql(u8, method, "provider.slash.run") or
         std.mem.eql(u8, method, attachment_protocol.METHOD_CHAT_ATTACHMENT_CREATE) or
         std.mem.eql(u8, method, attachment_protocol.METHOD_CHAT_ATTACHMENT_APPEND) or
         std.mem.eql(u8, method, attachment_protocol.METHOD_CHAT_ATTACHMENT_COMMIT) or
@@ -243,6 +245,7 @@ pub fn requiredScopeMaskForRpc(method: []const u8) ?u16 {
         std.mem.eql(u8, method, "chat.turn.record") or
         std.mem.eql(u8, method, "chat.thread.upsert") or
         std.mem.eql(u8, method, "chat.thread.close") or
+        std.mem.eql(u8, method, "chat.thread.archive.set") or
         std.mem.eql(u8, method, "provider.thread.sync") or
         std.mem.eql(u8, method, "chat.draft.set") or
         std.mem.eql(u8, method, "chat.message.append") or

@@ -1,7 +1,9 @@
 import { Show, createEffect, createSignal, onCleanup, onMount } from 'solid-js'
 
 import { store } from '../lib/store'
-import { FileViewer } from './FileViewer'
+import { isSubagentThreadId } from '../lib/types'
+import { FileViewer, fileViewerOpen } from './FileViewer'
+import { History, historyOpen } from './History'
 import { Icon } from './Icons'
 import { Palette, Settings, WorkspaceDialog } from './Overlays'
 import { PrefixBar } from './PrefixBar'
@@ -80,7 +82,59 @@ export function App() {
       <Palette />
       <Settings />
       <WorkspaceDialog />
+      <History />
       <FileViewer />
+      <NoticeToast />
+    </div>
+  )
+}
+
+const NOTICE_TOAST_MS = 4000
+
+/// Global home for store.notice. The focused chat composer renders the notice
+/// inline, so the toast only covers what that misses: a terminal or empty
+/// workspace in focus, a sub-agent pane, or an overlay covering the composer.
+function NoticeToast() {
+  const overlayOpen = () =>
+    store.paletteOpen() || store.settingsOpen() || store.workspaceDialogOpen() || historyOpen() || fileViewerOpen()
+  const composerShows = () => {
+    const pane = store.focusedPane()
+    return pane?.kind === 'chat' && !isSubagentThreadId(pane.thread_id)
+  }
+  const [dismissed, setDismissed] = createSignal<string | null>(null)
+  const text = () => {
+    const notice = store.notice()
+    if (!notice || notice === dismissed()) return null
+    return overlayOpen() || !composerShows() ? notice : null
+  }
+  createEffect(() => {
+    const notice = store.notice()
+    if (!notice) return setDismissed(null)
+    // Hides only the toast: the composer keeps its own copy until the store
+    // clears it.
+    const timer = setTimeout(() => setDismissed(notice), NOTICE_TOAST_MS)
+    onCleanup(() => clearTimeout(timer))
+  })
+  return (
+    // absolute, not fixed: see the drawer note above. The live region stays
+    // mounted so the text change is announced.
+    <div
+      role="status"
+      aria-live="polite"
+      class="pointer-events-none absolute inset-x-0 bottom-[calc(16px+var(--safe-bottom))] z-50 flex justify-center px-3"
+    >
+      <Show when={text()} keyed>
+        {(notice) => (
+          <button
+            type="button"
+            class="anim-reveal pointer-events-auto w-full max-w-[28rem] rounded-[10px] border border-[color-mix(in_srgb,var(--warning)_55%,var(--border-muted))] bg-[var(--panel)] px-3.5 py-2.5 text-left text-[13px] text-[var(--text)] shadow-lg"
+            aria-label={`${notice} (dismiss)`}
+            onClick={() => setDismissed(notice)}
+          >
+            {notice}
+          </button>
+        )}
+      </Show>
     </div>
   )
 }

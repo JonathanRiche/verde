@@ -2047,3 +2047,8 @@ test "signal watcher recognizes only an accepted prepare-shutdown result" {
     try std.testing.expect(!prepareShutdownAccepted(std.testing.allocator, remote_error));
     try std.testing.expect(!prepareShutdownAccepted(std.testing.allocator, "not json"));
 }
+
+// Include the daemon's RPC/store regression tests in its owning test target.
+test {
+    _ = sessionizer;
+}

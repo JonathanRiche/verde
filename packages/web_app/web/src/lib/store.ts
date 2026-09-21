@@ -1,4 +1,4 @@
-import { createMemo, createRoot, createSignal, onCleanup } from 'solid-js'
+import { batch, createMemo, createRoot, createSignal, onCleanup } from 'solid-js'
 
 import {
   acceleratorMatches,
@@ -12,6 +12,16 @@ import {
 } from './keybinds'
 import { dynamicModelOptions, type DynamicModelRow, type ModelOption } from './models'
 import { writePane } from './pty'
+import { createApprovalTracker } from './approvals'
+import { createFollowupApi, followupKind, followupRpcError, FollowupRejectedError } from './followups'
+import { watchNotifications } from './notify'
+import { createChatCwdApi, chatCwdLocked, chatCwdTurnParams } from './chat_cwd'
+import { createProviderReadinessApi, runtimeBlocker } from './provider_readiness'
+import { latestPaneUsage } from './usage'
+import { dispatchWebCommand, openChatCommandPicker, sidebarActionUnavailableReason, requestSidebarThreadSync, type ChatPickerCommand } from './commands'
+import { archiveCommand, requestNewThread, requestWorkspaceCommand } from './command_requests'
+import { createHistoryApi, groupHistory, reconcileHistoryArchives, registerHistoryClient } from './history'
+import { createComposerCommands, parseSlashCommand, classifyBangCommand, repositoryCommandPath, type SlashCommandResult } from './composer_commands'
 import { isPlaceholderThreadTitle, makeThreadTitle } from './thread_title'
 import {
   LiveClient,
@@ -39,6 +49,9 @@ import {
   parseLayoutNode,
   synthesizeSplit,
   workspacePaneGroups,
+  type FollowupKind,
+  type ApprovalDecision,
+  type PendingApproval,
   type Attachment,
   type FavoriteModel,
   type LayoutNode,
@@ -76,11 +89,16 @@ interface SnapshotSession {
   status?: string
 }
 
-interface SnapshotTurn {
+export interface SnapshotTurn {
+  /// Client route for remote discoveries; daemon summaries are local.
+  profile_id?: string
   turn_id?: string
   workspace_id?: string
   local_thread_id?: string
+  provider_thread_id?: string | null
   status?: string
+  pending_approval?: { call_id: string; title: string; body: string } | null
+  next_seq?: number
   /// Daemon acceptance timestamp; absent on daemons predating the field.
   started_at_ms?: number
 }
@@ -295,12 +313,9 @@ export async function requestTerminalOpen(
 
 export async function requestPaneClose(
   call: (method: string, params: unknown) => Promise<RpcEnvelope>,
-  workspace_id: string,
+  _workspace_id: string,
   pane: Pick<LivePane, 'kind' | 'native_pane_id' | 'session_id'>,
 ): Promise<RpcEnvelope> {
-  if (pane.native_pane_id != null) {
-    return call('pane.close', { workspace: workspace_id, pane: pane.native_pane_id })
-  }
   if (pane.kind === 'terminal' && pane.session_id) {
     return call('session.kill', { id: pane.session_id })
   }
@@ -308,7 +323,7 @@ export async function requestPaneClose(
     ok: false,
     error: {
       code: 'capability_unavailable',
-      message: 'This pane is not open in the desktop runtime.',
+      message: 'Available in the desktop app',
     },
   }
 }
@@ -724,7 +739,56 @@ export function clipboardImageFiles(data: Pick<DataTransfer, 'items' | 'files'> 
 }
 
 function turnIsActive(status: string | undefined): boolean {
-  return status === 'working' || status === 'waiting' || status === 'accepted' || status === 'running'
+  return status === 'working' || status === 'waiting' || status === 'accepted' || status === 'running' || status === 'waiting_approval'
+}
+
+/// Summaries and tail responses carry the current approval independently of
+/// paginated events (approval_requested itself contains only the call id).
+export function approvalFromTurn(turn: SnapshotTurn): PendingApproval | null {
+  const approval = turn.pending_approval
+  if (!turn.turn_id || !turnIsActive(turn.status) || !approval ||
+      typeof approval.call_id !== 'string' || !approval.call_id ||
+      typeof approval.title !== 'string' || typeof approval.body !== 'string') return null
+  return { turn_id: turn.turn_id, call_id: approval.call_id, title: approval.title, body: approval.body }
+}
+
+export function pendingApprovalForPane(
+  pane: LivePane,
+  turns: SnapshotTurn[],
+  tails: Record<string, PendingApproval | null>,
+): PendingApproval | null {
+  if (pane.kind !== 'chat' || !pane.thread_id) return null
+  const turn = turns.filter((item) => item.workspace_id === pane.workspace_id &&
+    item.local_thread_id === pane.thread_id).at(-1)
+  if (!turn?.turn_id || !turnIsActive(turn.status)) return null
+  return Object.hasOwn(tails, turn.turn_id) ? tails[turn.turn_id] : approvalFromTurn(turn)
+}
+
+export function mergeLocalTurnSnapshot(previous: SnapshotTurn[], local: SnapshotTurn[]): SnapshotTurn[] {
+  const remote = previous.filter((turn) => turn.profile_id && turn.profile_id !== 'local')
+  return [...local.filter((turn) => !remote.some((item) =>
+    item.workspace_id === turn.workspace_id && item.local_thread_id === turn.local_thread_id)), ...remote]
+}
+
+/// A turn discovered on this daemon needs no owner-only connection catalog.
+export function isLocalTurnRequest(pane: LivePane, turns: SnapshotTurn[], params: unknown): boolean {
+  const turn_id = asRecord(params)?.turn_id
+  return typeof turn_id === 'string' && turns.some((turn) =>
+    turn.turn_id === turn_id && turn.workspace_id === pane.workspace_id &&
+    turn.local_thread_id === pane.thread_id && (!turn.profile_id || turn.profile_id === 'local'))
+}
+
+export async function requestApprovalResolution(
+  approval: PendingApproval,
+  decision: ApprovalDecision,
+  call: (method: string, params: unknown) => Promise<RpcEnvelope>,
+): Promise<void> {
+  const response = await call('chat.turn.approve', {
+    turn_id: approval.turn_id, call_id: approval.call_id, decision,
+  })
+  if (response.error || response.ok === false) {
+    throw new Error(response.error?.message ?? 'Could not resolve the approval')
+  }
 }
 
 /// Completion-pending is an unread/acknowledgement state, not live work. The
@@ -1278,7 +1342,7 @@ function projectPanes(
   return next
 }
 
-function createAppStore() {
+export function createAppStore() {
   const client = new LiveClient()
   const composerCache = readComposerCache()
   const [source, setSource] = createSignal<Source>('mock')
@@ -1302,6 +1366,13 @@ function createAppStore() {
   const [sending, setSending] = createSignal(false)
   const [notice, setNotice] = createSignal<string | null>(null)
   const [composerNonce, setComposerNonce] = createSignal(0)
+  const [explicitComposerNonce, setExplicitComposerNonce] = createSignal(-1)
+  const composerFocusExplicit = () => explicitComposerNonce() === composerNonce()
+  const requestComposerFocus = () => batch(() => {
+    const nonce = composerNonce() + 1
+    setExplicitComposerNonce(nonce)
+    setComposerNonce(nonce)
+  })
   const [compact, setCompact] = createSignal(
     typeof window !== 'undefined' && typeof window.matchMedia === 'function'
       ? window.matchMedia('(max-width: 1023px)').matches
@@ -1333,7 +1404,7 @@ function createAppStore() {
   let instantFocusPaneId: number | null = null
   let storeClientId: string | null = null
   let lastSessions: SnapshotSession[] = []
-  let lastTurns: SnapshotTurn[] = []
+  const [lastTurns, setLastTurns] = createSignal<SnapshotTurn[]>([])
   /// Desktop live-IPC mirrors. Non-null only while the desktop app is
   /// reachable; they then override the (possibly stale) store projection.
   let liveWorkspaces: Workspace[] | null = null
@@ -1460,8 +1531,13 @@ function createAppStore() {
     }))
   }
 
+  const archivedHistoryThreads = new Map<string, number>()
+
   const publishPanes = (list: Workspace[]) => {
-    const panes = projectPanes(workspacesWithThreads(list), lastSessions, lastTurns, localThreadIds, liveLayouts)
+    const panes = projectPanes(workspacesWithThreads(list), lastSessions, lastTurns(), localThreadIds, liveLayouts)
+    for (const [id, rows] of Object.entries(panes)) {
+      panes[id] = rows.filter((pane) => !pane.thread_id || !archivedHistoryThreads.has(`${id}\u0000${pane.thread_id}`))
+    }
     setPanesByWorkspace((prev) => (sameJson(prev, panes) ? prev : panes))
     const restored = pendingLastChatPane
       ? findLastChatPane(panes[pendingLastChatPane.workspace_id] ?? [], pendingLastChatPane)
@@ -1495,7 +1571,20 @@ function createAppStore() {
     if (!root) return
     const snapshot = root.snapshot ?? root
     if (root.sessions) lastSessions = root.sessions
-    if (root.turns) lastTurns = root.turns
+    if (root.turns) {
+      // Local snapshots cannot observe turns running on a saved connection.
+      batch(() => {
+        const turns = root.turns!.map((turn) => approvalTracker.reconcile(turn, 'snapshot'))
+        setLastTurns((previous) => mergeLocalTurnSnapshot(previous, turns))
+        setTailApprovals((previous) => {
+          const next = { ...previous }
+          for (const turn of turns) {
+            if (turn.turn_id) next[turn.turn_id] = approvalFromTurn(turn)
+          }
+          return next
+        })
+      })
+    }
     if (root.config !== undefined) {
       const next = parseUiConfig(root.config)
       setUiConfig((prev) => (sameJson(prev, next) ? prev : next))
@@ -1717,6 +1806,10 @@ function createAppStore() {
             workspace_id: item.workspace_id,
             limit: THREAD_LIST_LIMIT,
           })
+          const fresh = unwrapResult<{ store_revision: number }>(threads)
+          if (!threads.error && threads.ok !== false && fresh) {
+            reconcileHistoryArchives(archivedHistoryThreads, item.workspace_id, threadListFrom(threads), fresh.store_revision)
+          }
           return {
             workspace_id: item.workspace_id,
             threads: threadListFrom(threads),
@@ -1837,7 +1930,12 @@ function createAppStore() {
   }
   const connectionFor = (pane: LivePane): string =>
     effectiveConnection(routeThread(pane), paneOwningWorkspaceId(pane), connections() ?? { connections: [], defaults: [] })
+  const knownLocalConnection = (pane: LivePane): boolean => {
+    const thread = routeThread(pane)
+    return thread.profile_id === 'local' || (!thread.profile_id && Boolean(thread.committed || thread.provider_thread_id))
+  }
   const paneRpc = async (pane: LivePane, method: string, params: unknown): Promise<RpcEnvelope> => {
+    if (isLocalTurnRequest(pane, lastTurns(), params) || knownLocalConnection(pane)) return interactiveCall(method, params)
     if (!connections()) await refreshConnections()
     const catalog = connections()
     if (!catalog) throw new Error(connectionError() ?? 'Connections are loading')
@@ -1847,6 +1945,120 @@ function createAppStore() {
     if (!connection) throw new Error('The saved connection for this chat is unavailable')
     return connectionRpc(connection, routeThread(pane).runtime_id, method, params)
   }
+  const readiness = createProviderReadinessApi(interactiveCall)
+  const chatRuntimeBlocker = (pane: LivePane) => runtimeBlocker(connectionFor(pane), routeThread(pane).runtime_id, connections())
+  const providerReadiness = (pane: LivePane, provider = routeThread(pane).provider ?? pane.provider ?? 'codex') =>
+    readiness.providerReadiness(provider, connectionFor(pane) !== 'local')
+  const recheckProviderReadiness = async (pane: LivePane): Promise<void> => {
+    await refreshConnections()
+    if (connectionFor(pane) !== 'local') {
+      setNotice('Provider checks on remote connections are not exposed by the web bridge. Connection status was refreshed.')
+      return
+    }
+    await readiness.recheckProviderReadiness()
+  }
+  const cwdKey = (pane: LivePane) => JSON.stringify([paneOwningWorkspaceId(pane), connectionFor(pane), routeThread(pane).runtime_id ?? null, connectionFor(pane) === 'local' ? readiness.providerRuntimeId() : connections()?.connections.find((row) => row.profile_id === connectionFor(pane))?.runtime_id ?? null])
+  const chatCwdIsLocked = (pane: LivePane) => chatCwdLocked(routeThread(pane), paneWorking(pane))
+  const cwdApi = createChatCwdApi<LivePane>({
+    locked: chatCwdIsLocked, call: paneRpc, notice: setNotice,
+    context: async (pane) => {
+      if (pane.kind !== 'chat' || !pane.thread_id) throw new Error('Select a chat first.')
+      if (!knownLocalConnection(pane) && !connections()) await refreshConnections()
+      if (!knownLocalConnection(pane) && !connections()) throw new Error('Connections are unavailable.')
+      const ws = workspaces().find((row) => row.workspace_id === paneOwningWorkspaceId(pane))
+      if (!ws) throw new Error('Workspace is unavailable.')
+      const profile = connectionFor(pane)
+      const local = profile === 'local'
+      if (local && !readiness.providerRuntimeId()) await readiness.recheckProviderReadiness()
+      const runtimeId = local ? readiness.providerRuntimeId() : connections()!.connections.find((row) => row.profile_id === profile)?.runtime_id ?? null
+      return {
+        key: cwdKey(pane), workspace: ws, runtimeId, local,
+        known: (threadsByWorkspace()[ws.workspace_id] ?? []).filter((thread) => effectiveConnection(thread, ws.workspace_id, connections() ?? { connections: [], defaults: [] }) === profile),
+      }
+    },
+    save: async (pane, choice) => {
+      const ws = workspaces().find((row) => row.workspace_id === paneOwningWorkspaceId(pane))
+      if (!ws || chatCwdIsLocked(pane)) { setNotice('The chat route is locked or unavailable.'); return false }
+      const patch = { repository_id: choice.repository_id, repository_cwd: choice.relative_cwd }
+      const updated = mergeThreadMetadata(routeThread(pane), patch)
+      const response = await upsertThreadMetadata(ws, pane, patch)
+      if (!response || response.error || response.ok === false) { setNotice(response?.error?.message ?? 'Could not save the working directory.'); return false }
+      setThreadsByWorkspace((previous) => ({ ...previous, [ws.workspace_id]: [updated, ...(previous[ws.workspace_id] ?? []).filter((row) => row.local_thread_id !== updated.local_thread_id)] }))
+      publishPanes(workspaces())
+      return true
+    },
+  })
+  const setChatCwd = async (pane: LivePane, choiceId: string): Promise<boolean> => {
+    if (sending()) { setNotice('Wait for the current operation before changing the working directory.'); return false }
+    setSending(true)
+    try {
+      const pending = settingsUpdateQueues.get(paneKey(pane.workspace_id, pane.pane_id))
+      if (pending) await pending
+      return await cwdApi.setChatCwd(pane, choiceId)
+    } catch { setNotice('Could not change the working directory.'); return false }
+    finally { setSending(false) }
+  }
+  const composerRouteKey = (pane: LivePane): string => {
+    const thread = routeThread(pane)
+    const workspace = workspaces().find((row) => row.workspace_id === paneOwningWorkspaceId(pane))
+    return JSON.stringify([workspace?.workspace_id, workspace?.path, pane.thread_id, connectionFor(pane),
+      thread.provider, thread.provider_thread_id, thread.harness, thread.runtime_id, thread.repository_id, thread.repository_cwd])
+  }
+  const composerCommands = createComposerCommands<LivePane>({
+    key: (pane) => paneKey(pane.workspace_id, pane.pane_id),
+    notice: setNotice,
+    call: paneRpc,
+    context: async (pane) => {
+      if (pane.kind !== 'chat') throw new Error('Slash commands require a chat pane.')
+      const ws = workspaces().find((row) => row.workspace_id === paneOwningWorkspaceId(pane))
+      if (!ws) throw new Error('The chat workspace is unavailable.')
+      if (!knownLocalConnection(pane) && !connections()) await refreshConnections()
+      if (!knownLocalConnection(pane) && !connections()) throw new Error('Connections are unavailable.')
+      const thread = routeThread(pane)
+      const routeKey = composerRouteKey(pane)
+      if (thread.harness && thread.harness !== 'local_cli') throw new Error('Slash commands are unsupported by this harness.')
+      if (connectionFor(pane) !== 'local') throw new Error('Slash commands are unavailable for saved remote connections in the web app.')
+      if (!readiness.providerRuntimeId()) await readiness.recheckProviderReadiness()
+      const runtime = readiness.providerRuntimeId()
+      if (!runtime || (thread.runtime_id && thread.runtime_id !== runtime)) throw new Error('The chat runtime is unavailable or changed.')
+      const response = await interactiveCall('workspace.repository.manifest.get', { workspace_id: ws.workspace_id })
+      if (response.error || response.ok === false) throw new Error(response.error?.message ?? 'Could not resolve the repository.')
+      const manifest = unwrapResult<Parameters<typeof repositoryCommandPath>[0] & { workspace_id: string }>(response)
+      if (!manifest || manifest.workspace_id !== ws.workspace_id) throw new Error('The repository manifest is unavailable.')
+      const project_path = repositoryCommandPath(manifest, thread.repository_id ?? 'primary', runtime, thread.repository_cwd)
+      if (project_path !== ws.path) throw new Error('The workspace repository root changed. Reload the workspace before running commands.')
+      if (routeKey !== composerRouteKey(pane) || runtime !== readiness.providerRuntimeId()) throw new Error('The chat route changed. Select the command again.')
+      return { provider: thread.provider ?? pane.provider ?? 'codex', project_path, thread_id: thread.provider_thread_id ?? pane.provider_thread_id ?? null }
+    },
+  })
+  const [slashStates, setSlashStates] = createSignal<Record<string, { pending: boolean; result: SlashCommandResult | null }>>({})
+  const slashCommandState = (pane: LivePane) => slashStates()[paneKey(pane.workspace_id, pane.pane_id)] ?? { pending: false, result: null }
+  const submitSlashCommand = async (pane: LivePane, draft = draftFor(pane)): Promise<SlashCommandResult | null> => {
+    if (slashCommandState(pane).pending || sending() || paneWorking(pane) || activeFollowupTurn(pane)) {
+      setNotice('Wait for the current operation before running a slash command.')
+      return null
+    }
+    if (attachmentsFor(pane).length || uploadingAttachmentsFor(pane)) {
+      setNotice('Slash commands do not accept attachments. Remove them or send a chat message.')
+      return null
+    }
+    const key = paneKey(pane.workspace_id, pane.pane_id)
+    setSlashStates((previous) => ({ ...previous, [key]: { pending: true, result: null } }))
+    setSending(true)
+    let result: SlashCommandResult | null = null
+    try {
+      const pendingSettings = settingsUpdateQueues.get(key)
+      if (pendingSettings) await pendingSettings
+      result = await composerCommands.submitSlashCommand(pane, draft)
+      if (result?.handled && draftFor(pane) === draft) setDraftFor(pane, '')
+      return result
+    } finally {
+      setSending(false)
+      setSlashStates((previous) => ({ ...previous, [key]: { pending: false, result } }))
+    }
+  }
+  onCleanup(composerCommands.cancelAllFileSearches)
+
   const setChatConnection = async (pane: LivePane, profile: string | null): Promise<boolean> => {
     if (sending()) return false
     setSending(true)
@@ -1923,10 +2135,32 @@ function createAppStore() {
     /// provider label so live and durable transcripts read identically.
     author_label: string
   }
+  const [tailApprovals, setTailApprovals] = createSignal<Record<string, PendingApproval | null>>({})
+  const approvalTracker = createApprovalTracker()
+  const pendingApproval = (pane: LivePane): PendingApproval | null => {
+    const approval = pendingApprovalForPane(pane, lastTurns(), tailApprovals())
+    return approval && !approvalTracker.isSubmitted(approval) ? approval : null
+  }
+  const resolveApproval = async (pane: LivePane, decision: ApprovalDecision): Promise<boolean> => {
+    const approval = pendingApproval(pane)
+    if (!approval) {
+      setNotice('This chat has no pending approval.')
+      return false
+    }
+    try {
+      return await approvalTracker.resolve(approval, () =>
+        requestApprovalResolution(approval, decision, (method, params) => paneRpc(pane, method, params)))
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'Could not resolve the approval')
+      return false
+    }
+  }
   const turnTails = new Map<string, TurnTail>()
   const [overlays, setOverlays] = createSignal<TranscriptMap>({})
 
   const clearOverlay = (key: string) => {
+    const turn_id = turnTails.get(key)?.turn_id
+    if (turn_id) setTailApprovals((prev) => ({ ...prev, [turn_id]: null }))
     turnTails.delete(key)
     setOverlays((prev) => {
       if (!(key in prev)) return prev
@@ -2028,6 +2262,15 @@ function createAppStore() {
   }
 
   const applyTailEvent = (tail: TurnTail, kind: string, payload: Record<string, unknown>) => {
+    if (kind === 'steer') {
+      flushStreamPart(tail)
+      const message_id = typeof payload.message_id === 'string' ? payload.message_id : `${tail.turn_id}-steer-${payload.steer_id}`
+      if (!tail.parts.some((row) => row.message_id === message_id)) tail.parts.push({
+        message_id, role: 'user', author: 'You', body: typeof payload.body === 'string' ? payload.body : '',
+        images: Array.isArray(payload.images) ? payload.images as Attachment[] : [],
+      })
+      return
+    }
     if (kind === 'assistant_delta') {
       if (typeof payload.text === 'string') tail.stream += payload.text
       tail.thinking = false
@@ -2099,8 +2342,9 @@ function createAppStore() {
       }
       if (call_id) tail.tool_rows.set(call_id, row)
     }
-    // thread_id/turn_id/diff/approval bookkeeping events carry no transcript
-    // row; failures surface through the committed transcript on finalize.
+    // Approval details come from the tail response, not the call-id-only event.
+    // Other bookkeeping events carry no transcript row; failures surface
+    // through the committed transcript on finalize.
   }
 
   const turnIsTerminal = (status: string | undefined) =>
@@ -2186,6 +2430,9 @@ function createAppStore() {
       }
       const result = unwrapResult<{
         status?: string
+        provider_thread_id?: string | null
+        pending_approval?: SnapshotTurn['pending_approval']
+        next_seq?: number
         started_at_ms?: number
         page_last_seq?: number
         events?: Array<{ seq?: number; kind?: string; payload_json?: string }>
@@ -2208,17 +2455,29 @@ function createAppStore() {
         } catch {
           continue
         }
+        if (event.kind === 'steer') followups.observeSteer(pane, tail.turn_id, payload, event.seq)
         applyTailEvent(tail, event.kind, payload)
       }
+      batch(() => {
+        const observed = approvalTracker.reconcile({
+          turn_id: tail.turn_id, status: result.status,
+          ...(result.provider_thread_id ? { provider_thread_id: result.provider_thread_id } : {}),
+          pending_approval: result.pending_approval, next_seq: result.next_seq,
+        }, 'tail')
+        setLastTurns((turns) => turns.map((turn) => turn.turn_id === tail.turn_id ? { ...turn, ...observed } : turn))
+        setTailApprovals((prev) => ({ ...prev, [tail.turn_id]: approvalFromTurn(observed) }))
+      })
       tail.last_seq = lastDeliveredTailSeq(tail.last_seq, events, result.page_last_seq)
       if (turnIsTerminal(result.status)) {
         // Durable-first: a terminal status is published only after the turn's
         // messages commit, so the committed transcript fetched here already
         // contains everything the overlay showed.
         finishedTurns.add(tail.turn_id)
+        followups.observeTurn(pane, tail.turn_id, result.status)
         await loadTranscript(pane)
         await refreshProjection({ scope: 'selected' })
         clearOverlay(key)
+        await followups.flushReady()
         return
       }
       setOverlays((prev) => ({ ...prev, [key]: overlayMessages(pane, tail) }))
@@ -2232,7 +2491,7 @@ function createAppStore() {
   const tailActiveTurn = (pane: LivePane) => {
     if (pane.kind !== 'chat' || !pane.thread_id) return
     const key = paneKey(pane.workspace_id, pane.pane_id)
-    const turn = lastTurns
+    const turn = lastTurns()
       .filter(
         (item) =>
           item.turn_id &&
@@ -2283,6 +2542,7 @@ function createAppStore() {
     // panes queue their multi-megabyte transcript downloads/parses. Phones
     // show one chat, so background panes wait until they are focused.
     consider(focusedPane())
+    for (const pane of followups.panes()) consider(pane)
     if (!compact()) {
       for (const pane of openPanes()) consider(pane)
     }
@@ -2299,15 +2559,33 @@ function createAppStore() {
         try {
           const response = await paneRpc(pane, 'chat.turn.list', { workspace_id: pane.workspace_id })
           const remote_turns = unwrapResult<{ turns?: SnapshotTurn[] }>(response)?.turns ?? []
-          const matching = remote_turns.filter((turn) => turn.workspace_id === pane.workspace_id && turn.local_thread_id === pane.thread_id)
-          lastTurns = [...lastTurns.filter((turn) => !(turn.workspace_id === pane.workspace_id && turn.local_thread_id === pane.thread_id)), ...matching]
+          batch(() => {
+            const matching = remote_turns
+              .filter((turn) => turn.workspace_id === pane.workspace_id && turn.local_thread_id === pane.thread_id)
+              .map((turn) => ({ ...turn, profile_id: connectionFor(pane) }))
+              .map((turn) => approvalTracker.reconcile(turn, 'snapshot'))
+            setLastTurns((turns) => [...turns.filter((turn) => !(turn.workspace_id === pane.workspace_id && turn.local_thread_id === pane.thread_id)), ...matching])
+            setTailApprovals((previous) => {
+              const next = { ...previous }
+              for (const turn of matching) {
+                if (turn.turn_id) next[turn.turn_id] = approvalFromTurn(turn)
+              }
+              return next
+            })
+          })
         } catch { /* Keep the current view until the connection recovers. */ }
+      }
+      const pending = followups.pendingFollowup(pane)
+      if (pending) {
+        const turn = lastTurns().find((turn) => turn.turn_id === pending.turn_id)
+        followups.observeTurn(pane, pending.turn_id, turn?.status)
       }
       tailActiveTurn(pane)
       const key = paneKey(pane.workspace_id, pane.pane_id)
       const uncached = !transcripts()[key]?.length
       if (uncached) await loadTranscript(pane)
     }
+    await followups.flushReady()
   }
 
   const ensureTranscript = (pane: LivePane | null | undefined) => {
@@ -2332,10 +2610,12 @@ function createAppStore() {
   /// for the committed transcript.
   const stopTurn = async (pane: LivePane | null | undefined) => {
     if (!pane || pane.kind !== 'chat' || !pane.thread_id) return
+    // Pause queued work before looking up the turn: completion may race Stop.
+    followups.inhibit(pane)
     const key = paneKey(pane.workspace_id, pane.pane_id)
     const turn_id =
       turnTails.get(key)?.turn_id ??
-      lastTurns
+      lastTurns()
         .filter(
           (item) =>
             item.turn_id &&
@@ -2353,9 +2633,7 @@ function createAppStore() {
 
   const ensureClientId = async (): Promise<string> => {
     if (storeClientId) return storeClientId
-    const registered = await interactiveCall('daemon.client.register', { persistent: false })
-    const result = unwrapResult<{ client_id?: string }>(registered)
-    storeClientId = result?.client_id ?? mintId('web-client-')
+    storeClientId = await registerHistoryClient(interactiveCall)
     return storeClientId
   }
 
@@ -2484,7 +2762,10 @@ function createAppStore() {
       [key]: (prev[key] ?? []).filter((item) => item.path !== attachment.path),
     }))
     scheduleComposerCacheWrite()
-    void deleteChatImage(attachment).catch(() => {})
+    if (!followups.ownsAttachment(attachment.path) &&
+        !Object.values(draftAttachments()).some((images) => images.some((image) => image.path === attachment.path))) {
+      void deleteChatImage(attachment).catch(() => {})
+    }
   }
 
   const messagesFor = (pane: LivePane | null | undefined) => {
@@ -2493,6 +2774,109 @@ function createAppStore() {
     const committed = transcripts()[key] ?? []
     const overlay = overlays()[key]
     return overlay?.length ? [...committed, ...overlay] : committed
+  }
+
+  const activeFollowupTurn = (pane: LivePane): string | null => lastTurns()
+    .filter((turn) => turn.workspace_id === pane.workspace_id && turn.local_thread_id === pane.thread_id &&
+      turn.turn_id && turnIsActive(turn.status) && !finishedTurns.has(turn.turn_id))
+    .at(-1)?.turn_id ?? null
+
+  const followups = createFollowupApi({
+    storage: { getItem: (key) => sessionStorage.getItem(key), setItem: (key, value) => sessionStorage.setItem(key, value) },
+    route: (pane) => {
+      const thread = routeThread(pane)
+      const profile = connectionFor(pane)
+      const runtime = profile === 'local' ? readiness.providerRuntimeId() : connections()?.connections.find((row) => row.profile_id === profile)?.runtime_id
+      return JSON.stringify([paneOwningWorkspaceId(pane), profile, thread.runtime_id ?? null, runtime ?? null, thread.repository_id ?? 'primary', thread.repository_cwd ?? null])
+    },
+    staged: (pane, value) => {
+      // The durable receipt now owns these uploads before the RPC can yield.
+      setDraftFor(pane, '')
+      const key = paneKey(pane.workspace_id, pane.pane_id)
+      setDraftAttachments((prev) => ({ ...prev, [key]: (prev[key] ?? []).filter((image) => !value.images.some((owned) => owned.path === image.path)) }))
+      persistComposerState()
+      setComposerNonce((value) => value + 1)
+    },
+    discard: (images) => {
+      for (const image of images) {
+        if (!followups.ownsAttachment(image.path) && !Object.values(draftAttachments()).some((draft) => draft.some((item) => item.path === image.path))) {
+          void deleteChatImage(image).catch(() => {})
+        }
+      }
+    },
+    activeTurn: activeFollowupTurn,
+    kind: (pane) => followupKind(routeThread(pane).provider ?? pane.provider, routeThread(pane).harness),
+    remote: (pane) => connectionFor(pane) !== 'local',
+    rpc: paneRpc,
+    busy: sending,
+    notice: setNotice,
+    id: () => mintId('web-followup-'),
+    restore: (pane, text, images) => {
+      const draft = draftFor(pane)
+      setDraftFor(pane, draft ? `${draft}\n\n${text}` : text)
+      const key = paneKey(pane.workspace_id, pane.pane_id)
+      setDraftAttachments((prev) => ({ ...prev, [key]: [...(prev[key] ?? []), ...images] }))
+      scheduleComposerCacheWrite()
+      setComposerNonce((value) => value + 1)
+    },
+    start: async (pane, followup) => {
+      const ws = workspaces().find((row) => row.workspace_id === paneOwningWorkspaceId(pane))
+      if (!ws || !pane.thread_id) throw new FollowupRejectedError('The follow-up workspace or thread is unavailable')
+      if (!followupImagesSupported(pane, followup.images)) throw new FollowupRejectedError('The follow-up image route is unsupported')
+      setSending(true)
+      try {
+        const thread = routeThread(pane)
+        const remote = connectionFor(pane) !== 'local'
+        const params = {
+          turn_id: followup.next_turn_id, workspace_id: ws.workspace_id, local_thread_id: pane.thread_id,
+          ...chatCwdTurnParams(thread, remote, ws.path),
+          prompt: followup.text,
+          image_paths: followup.images.map((image) => image.path),
+          images: followup.images.map((image) => ({ path: image.path, mime: image.mime, byte_size: image.byte_size ?? 0 })),
+          thread_title: thread.title, provider: thread.provider ?? pane.provider ?? 'codex',
+          harness: thread.harness ?? 'local_cli',
+          provider_thread_id: lastTurns().find((turn) => turn.turn_id === followup.turn_id)?.provider_thread_id ?? thread.provider_thread_id,
+          model_ref: thread.model_ref ?? pane.model, reasoning_effort: thread.reasoning_effort ?? pane.reasoning_effort,
+          opencode_reasoning_variant: thread.reasoning_variant ?? pane.reasoning_variant,
+          fast_mode: (thread.fast_mode ?? (pane.fast_mode ? 'on' : 'off')) === 'on',
+          access_mode: thread.access_mode ?? pane.access_mode,
+        }
+        const response = remote ? await paneRpc(pane, 'chat.turn.start', params) : await interactiveCall('chat.turn.start', params)
+        if (response.error || response.ok === false) throw followupRpcError(response)
+        if (!unwrapResult<{ turn_id?: string }>(response)?.turn_id) throw new Error('Follow-up acceptance was not confirmed')
+        setLastTurns((turns) => [...turns.filter((turn) => turn.turn_id !== followup.next_turn_id), {
+          turn_id: followup.next_turn_id, workspace_id: pane.workspace_id, local_thread_id: pane.thread_id,
+          status: 'working', profile_id: connectionFor(pane), started_at_ms: Date.now(),
+        }])
+        tailActiveTurn(pane)
+        void loadTranscript(pane)
+      } finally {
+        setSending(false)
+      }
+    },
+  })
+
+  const followupImagesSupported = (pane: LivePane, images: Attachment[]): boolean => {
+    if (!images.length) return true
+    const thread = routeThread(pane)
+    if (connectionFor(pane) === 'local' && !thread.repository_cwd && (!thread.repository_id || thread.repository_id === 'primary')) return true
+    setNotice('Images are not supported for remote or repository-routed chats. Your draft and attachments are kept.')
+    return false
+  }
+
+  const submitFollowup = async (pane: LivePane, kind?: FollowupKind): Promise<boolean> => {
+    if (pane.kind !== 'chat' || !pane.thread_id || isSubagentThreadId(pane.thread_id) ||
+        sending() || uploadingAttachmentsFor(pane)) return false
+    const text = draftFor(pane)
+    const slash = parseSlashCommand(text)
+    const bang = classifyBangCommand(text)
+    if (slash.kind === 'local' || slash.kind === 'provider' || slash.kind === 'unknown' || bang.kind === 'shell') {
+      setNotice('Slash commands and shell commands cannot be submitted as follow-ups.')
+      return false
+    }
+    const images = [...attachmentsFor(pane)]
+    if (!followupImagesSupported(pane, images)) return false
+    return followups.submit(pane, slash.kind === 'literal' ? slash.text : bang.text, images, kind)
   }
 
   const sendDraft = async (pane = focusedChat()) => {
@@ -2505,9 +2889,30 @@ function createAppStore() {
       setNotice('thread is not ready yet')
       return
     }
+    const pending = followups.pendingFollowup(current)
+    if (pending && pending.state !== 'sent_inline') {
+      setNotice('Resolve the pending follow-up with Retry, Pull back, or Cancel before sending another message.')
+      return
+    }
     if (uploadingAttachmentsFor(current) || sending()) return
-    const text = draftFor(current).trim()
+    const rawDraft = draftFor(current)
+    const slash = parseSlashCommand(rawDraft)
+    if (slash.kind === 'local' || slash.kind === 'provider' || slash.kind === 'unknown') {
+      await submitSlashCommand(current, rawDraft)
+      return
+    }
+    const bang = classifyBangCommand(rawDraft)
+    if (bang.kind === 'shell') {
+      setNotice('Composer shell mode is unavailable in the web app; no supported command-result RPC exists.')
+      return
+    }
+    if (activeFollowupTurn(current) || paneWorking(current)) {
+      await submitFollowup(current)
+      return
+    }
+    const text = (slash.kind === 'literal' ? slash.text : bang.text).trim()
     const images = [...attachmentsFor(current)]
+    if (!followupImagesSupported(current, images)) return
     if (!text && images.length === 0) return
     setSending(true)
     // Optimistic send: clear the store draft immediately. The textarea is
@@ -2599,7 +3004,7 @@ function createAppStore() {
         turn_id,
         workspace_id: ws.workspace_id,
         local_thread_id: current.thread_id,
-        ...(remote ? { repository_id: route_patch.repository_id, relative_cwd: route_patch.repository_cwd, require_provider_ready: true } : { project_path: ws.path }),
+        ...chatCwdTurnParams(route_patch, remote, ws.path),
         prompt: text,
         image_paths: images.map((image) => image.path),
         images: images.map((image) => ({
@@ -2637,16 +3042,17 @@ function createAppStore() {
       }
       // Register the turn locally and start its streaming loop right away
       // instead of waiting for the projection poll to surface its record.
-      lastTurns = [
-        ...lastTurns,
+      setLastTurns((turns) => [
+        ...turns,
         {
           turn_id,
           workspace_id: ws.workspace_id,
           local_thread_id: current.thread_id,
           status: 'working',
+          profile_id: connectionFor(current),
           started_at_ms: Date.now(),
         },
-      ]
+      ])
       tailActiveTurn(current)
       // The optimistic user row plus the tail overlay cover the in-flight
       // turn. Reloading the committed transcript here raced the 1.5s poll
@@ -2831,6 +3237,10 @@ function createAppStore() {
       access_mode?: string | null
     },
   ): Promise<void> => {
+    if (slashCommandState(pane).pending) {
+      setNotice('Wait for the slash command before changing chat settings.')
+      return Promise.resolve()
+    }
     const key = paneKey(pane.workspace_id, pane.pane_id)
     const optimistic_patch: Partial<Thread> = {
       ...patch,
@@ -2904,21 +3314,17 @@ function createAppStore() {
   const createHeadlessThread = async (current: Workspace, provider: string): Promise<number | null> => {
     const client_id = await ensureClientId()
     const local_thread_id = mintId('web-thread-')
-    const opened = await interactiveCall('chat.thread.upsert', {
-      mutation: {
-        request_key: `web:chat.open:${local_thread_id}`,
-        client_id,
-      },
-      workspace_id: current.workspace_id,
-      thread: {
-        local_thread_id,
-        title: 'New Chat',
-        committed: false,
-        profile_id: connections()?.defaults.find((row) => row.workspace_id === current.workspace_id)?.profile_id ?? 'local',
-        provider,
-        harness: 'local_cli',
-        last_activity_at: Date.now(),
-      },
+    const opened = await requestNewThread(interactiveCall, async () => ({
+      request_key: `web:chat.open:${local_thread_id}`,
+      client_id,
+    }), current, {
+      local_thread_id,
+      title: 'New Chat',
+      committed: false,
+      profile_id: connections()?.defaults.find((row) => row.workspace_id === current.workspace_id)?.profile_id ?? 'local',
+      provider,
+      harness: 'local_cli',
+      last_activity_at: Date.now(),
     })
     if (opened.error || opened.ok === false) {
       setNotice(opened.error?.message ?? 'could not open chat')
@@ -2954,61 +3360,8 @@ function createAppStore() {
       current.provider ??
       'codex'
     setNotice(null)
-    const opened = await interactiveCall('chat.open', {
-      workspace_id: current.workspace_id,
-      provider,
-      focus: true,
-    })
-    if ((opened.error || opened.ok === false) && !methodUnavailable(opened)) {
-      setNotice(opened.error?.message ?? 'could not open chat')
-      return
-    }
-    let opened_thread_id: string | null = null
-    let pane_id: number | null
-    if (opened.error || opened.ok === false) {
-      pane_id = await createHeadlessThread(current, provider)
-    } else {
-      const result = unwrapResult<{
-        pane_id?: number
-        thread_id?: string
-        local_thread_id?: string
-        thread_index?: number
-        provider?: string
-        model?: string | null
-        reasoning_effort?: string | null
-        reasoning_variant?: string | null
-        fast_mode?: boolean | null
-      }>(opened)
-      pane_id = result?.pane_id ?? null
-      opened_thread_id = result?.local_thread_id ?? result?.thread_id ?? null
-      if (opened_thread_id) {
-        localThreadIds.add(opened_thread_id)
-        const created: Thread = {
-          local_thread_id: opened_thread_id,
-          title: 'New thread',
-          sort_index: result?.thread_index,
-          committed: false,
-          last_activity_at: null,
-          provider: result?.provider ?? provider,
-          harness: 'local_cli',
-          model_ref: result?.model ?? null,
-          reasoning_effort: result?.reasoning_effort ?? null,
-          reasoning_variant: result?.reasoning_variant ?? null,
-          fast_mode: result?.fast_mode ? 'on' : 'off',
-        }
-        setThreadsByWorkspace((prev) => ({
-          ...prev,
-          [current.workspace_id]: [
-            created,
-            ...(prev[current.workspace_id] ?? []).filter(
-              (thread) => thread.local_thread_id !== opened_thread_id,
-            ),
-          ],
-        }))
-      }
-    }
-    if (pane_id == null) return
-    const focused_id = opened_thread_id ? stablePaneId('chat', opened_thread_id) : pane_id
+    const focused_id = await createHeadlessThread(current, provider)
+    if (focused_id == null) return
     setWorkspaceId(current.workspace_id)
     setFocusedPaneId(focused_id)
     // Instant transition: the optimistic thread row above already projects a
@@ -3067,25 +3420,57 @@ function createAppStore() {
     void refreshProjection({ workspace_id: ws.workspace_id })
   }
 
+  const historyApi = createHistoryApi({
+    call: interactiveCall,
+    mutation: async () => ({ client_id: await ensureClientId(), request_key: mintId('web:history:') }),
+    notice: setNotice,
+    threadChanged: (workspaceId, thread, revision) => {
+      const key = `${workspaceId}\u0000${thread.local_thread_id}`
+      if (thread.archived) {
+        localThreadIds.delete(thread.local_thread_id)
+        archivedHistoryThreads.set(key, revision)
+      } else {
+        archivedHistoryThreads.delete(key)
+        localThreadIds.add(thread.local_thread_id)
+        setWorkspaceId(workspaceId)
+        setFocusedPaneId(stablePaneId('chat', thread.local_thread_id))
+      }
+      setThreadsByWorkspace((previous) => ({
+        ...previous,
+        [workspaceId]: [
+          { title: 'Chat', ...previous[workspaceId]?.find((row) => row.local_thread_id === thread.local_thread_id), ...thread },
+          ...(previous[workspaceId] ?? []).filter((row) => row.local_thread_id !== thread.local_thread_id),
+        ],
+      }))
+      publishPanes(workspaces())
+      if (!thread.archived) {
+        const pane = (panesByWorkspace()[workspaceId] ?? []).find((row) => row.thread_id === thread.local_thread_id)
+        if (pane) {
+          focusPane(pane)
+          ensureTranscript(pane)
+        }
+      }
+      void refreshProjection({ workspace_id: workspaceId })
+    },
+    workspaceReopened: (reopened) => {
+      setWorkspaces((previous) => [...previous.filter((row) => row.workspace_id !== reopened.workspace_id), reopened])
+      setWorkspaceId(reopened.workspace_id)
+      publishPanes(workspaces())
+      void refreshProjection({ workspace_id: reopened.workspace_id })
+    },
+  })
+
   const callSucceeded = (response: RpcEnvelope, fallback: string): boolean => {
     if (!(response.error || response.ok === false)) return true
     setNotice(response.error?.message ?? fallback)
     return false
   }
 
-  const upsertWorkspaceMetadata = async (current: Workspace, patch: Partial<Workspace>) => {
-    const metadata = { ...current, ...patch }
-    delete metadata.threads
-    delete metadata.messages
-    const client_id = await ensureClientId()
-    return interactiveCall('workspace.upsert', {
-      mutation: {
-        request_key: `web:workspace.context:${current.workspace_id}:${mintId('')}`,
-        client_id,
-      },
-      workspace: metadata,
-    })
-  }
+  const workspaceCommand = (current: Workspace, patch: { label: string } | { archived: true }) =>
+    requestWorkspaceCommand(interactiveCall, async () => ({
+      client_id: await ensureClientId(),
+      request_key: `web:workspace.context:${current.workspace_id}:${mintId('')}`,
+    }), current, patch)
 
   const upsertThreadMetadata = async (
     current_workspace: Workspace,
@@ -3107,25 +3492,10 @@ function createAppStore() {
     })
   }
 
-  /// Run a command which is implemented by the native desktop UI. The web
-  /// gateway automatically falls through to Live for methods the detached
-  /// daemon does not implement. Workspace and pane travel with palette.run so
-  /// Live applies the target before checking whether the command is enabled.
-  const runDesktopSidebarCommand = async (
-    current_workspace: Workspace,
-    command: string,
-    pane?: LivePane,
-  ): Promise<boolean> => {
-    const response = await interactiveCall('palette.run', {
-      command,
-      workspace: current_workspace.workspace_id,
-      ...(pane?.native_pane_id != null ? { pane: pane.native_pane_id } : {}),
-    })
-    return callSucceeded(response, 'desktop command did not run')
-  }
-
   const closePane = async (target?: LivePane) => {
     const pane = target ?? focusedPane()
+    const unavailable = sidebarActionUnavailableReason('pane-close', pane ?? undefined)
+    if (unavailable) { setNotice(unavailable); return }
     const ws = pane
       ? workspaces().find((item) => item.workspace_id === pane.workspace_id)
       : workspace()
@@ -3201,24 +3571,8 @@ function createAppStore() {
     }
   }
 
-  const splitFocusedPane = async (kind: 'chat' | 'terminal', axis: 'vertical' | 'horizontal') => {
-    const pane = focusedPane()
-    const current_workspace = pane
-      ? workspaces().find((item) => item.workspace_id === pane.workspace_id)
-      : workspace()
-    if (!pane || !current_workspace || pane.native_pane_id == null) {
-      setNotice('Pane splitting requires the desktop runtime.')
-      return
-    }
-    const response = await interactiveCall('pane.split', {
-      workspace: current_workspace.workspace_id,
-      pane: pane.native_pane_id,
-      kind,
-      axis,
-    })
-    if (callSucceeded(response, `could not split ${kind} pane`)) {
-      await refreshProjection({ workspace_id: current_workspace.workspace_id })
-    }
+  const splitFocusedPane = async (_kind: 'chat' | 'terminal', _axis: 'vertical' | 'horizontal') => {
+    setNotice(sidebarActionUnavailableReason('pane-split-chat-right'))
   }
 
   const resizePaneSplit = async (
@@ -3248,6 +3602,8 @@ function createAppStore() {
 
   const runSidebarContextAction = async (request: SidebarContextActionRequest) => {
     const { action, pane, value } = request
+    const unavailable = sidebarActionUnavailableReason(action, pane)
+    if (unavailable) { setNotice(unavailable); return }
     let { workspace: current_workspace } = request
     if (pane && (action.startsWith('thread-') || action.startsWith('pane-'))) {
       current_workspace = workspaces().find((item) => item.workspace_id === paneOwningWorkspaceId(pane))
@@ -3259,50 +3615,13 @@ function createAppStore() {
         case 'workspace-new-chat':
           await newThread(current_workspace.workspace_id)
           return
-        case 'workspace-open-codex-tui': {
-          const response = await interactiveCall('agent.open', {
-            workspace: current_workspace.workspace_id,
-            provider: 'codex',
-          })
-          if (callSucceeded(response, 'could not open Codex TUI')) {
-            await refreshProjection({ workspace_id: current_workspace.workspace_id })
-          }
-          return
-        }
         case 'workspace-open-terminal':
           await newTerminal(current_workspace.workspace_id)
           return
-        case 'workspace-herdr-handoff': {
-          const response = await interactiveCall('herdr.handoff', { workspace: current_workspace.workspace_id })
-          callSucceeded(response, 'Herdr handoff failed')
-          return
-        }
-        case 'workspace-herdr-focus-terminal': {
-          const native_pane_id = current_workspace.herdr_link?.attach_pane_id
-          if (native_pane_id != null) {
-            const response = await interactiveCall('pane.focus', {
-              workspace: current_workspace.workspace_id,
-              pane: native_pane_id,
-            })
-            callSucceeded(response, 'could not focus Herdr terminal')
-          } else {
-            await runDesktopSidebarCommand(current_workspace, 'workspace.herdr_focus_terminal')
-          }
-          return
-        }
-        case 'workspace-herdr-unlink': {
-          const response = await interactiveCall('herdr.unlink', { workspace: current_workspace.workspace_id })
-          if (callSucceeded(response, 'could not unlink Herdr')) await refreshProjection()
-          return
-        }
         case 'workspace-rename': {
           const label = value?.trim()
           if (!label) return
-          let response = await interactiveCall('workspace.rename', {
-            workspace: current_workspace.workspace_id,
-            label,
-          })
-          if (methodUnavailable(response)) response = await upsertWorkspaceMetadata(current_workspace, { label })
+          const response = await workspaceCommand(current_workspace, { label })
           if (callSucceeded(response, 'could not rename workspace')) {
             setWorkspaces((prev) => prev.map((row) =>
               row.workspace_id === current_workspace.workspace_id ? { ...row, label } : row,
@@ -3312,18 +3631,8 @@ function createAppStore() {
           }
           return
         }
-        case 'workspace-import-codex':
-          await runDesktopSidebarCommand(current_workspace, 'thread.import_codex')
-          return
-        case 'workspace-import-opencode':
-          await runDesktopSidebarCommand(current_workspace, 'thread.import_opencode')
-          return
-        case 'workspace-import-claude':
-          await runDesktopSidebarCommand(current_workspace, 'thread.import_claude')
-          return
         case 'workspace-close': {
-          let response = await interactiveCall('workspace.close', { workspace: current_workspace.workspace_id })
-          if (methodUnavailable(response)) response = await upsertWorkspaceMetadata(current_workspace, { archived: true })
+          const response = await workspaceCommand(current_workspace, { archived: true })
           if (callSucceeded(response, 'could not close workspace')) {
             const closing_current = workspaceId() === current_workspace.workspace_id
             liveWorkspaces = null
@@ -3352,71 +3661,23 @@ function createAppStore() {
           await refreshProjection({ workspace_id: current_workspace.workspace_id })
           return
         }
-        case 'thread-regenerate-title':
-          if (pane) await runDesktopSidebarCommand(current_workspace, 'thread.regenerate_title', pane)
-          return
-        case 'thread-sync':
-          if (pane) await runDesktopSidebarCommand(current_workspace, 'thread.sync_current', pane)
-          return
-        case 'thread-handoff':
-          if (pane) await runDesktopSidebarCommand(current_workspace, 'thread.handoff_current', pane)
-          return
-        case 'thread-open-tui':
-          if (pane) {
-            const command = pane.provider === 'codex'
-              ? 'thread.open_current_codex_tui'
-              : 'thread.open_current_tui'
-            await runDesktopSidebarCommand(current_workspace, command, pane)
+        case 'thread-sync': {
+          if (!pane) { setNotice('Focus a chat first.'); return }
+          const response = await requestSidebarThreadSync(
+            interactiveCall, paneOwningWorkspaceId(pane), routeThread(pane), paneWorking(pane),
+          )
+          if (callSucceeded(response, 'Could not sync thread')) {
+            await loadTranscript(pane)
+            await refreshProjection({ workspace_id: paneOwningWorkspaceId(pane) })
           }
-          return
-        case 'thread-open-chat':
-          setNotice('Open as chat is available from the linked TUI row in the desktop app.')
-          return
-        case 'thread-archive': {
-          if (!pane) return
-          if (pane.native_pane_id != null) {
-            const ran = await runDesktopSidebarCommand(current_workspace, 'thread.archive_current', pane)
-            if (ran) await refreshProjection()
-            return
-          }
-          const response = await upsertThreadMetadata(current_workspace, pane, { archived: true })
-          if (!response || !callSucceeded(response, 'could not archive thread')) return
-          setThreadsByWorkspace((prev) => ({
-            ...prev,
-            [current_workspace.workspace_id]: (prev[current_workspace.workspace_id] ?? []).filter(
-              (thread) => thread.local_thread_id !== pane.thread_id,
-            ),
-          }))
-          publishPanes(workspaces())
-          await refreshProjection({ workspace_id: current_workspace.workspace_id })
           return
         }
+        case 'thread-archive':
+          if (pane) await archiveCommand(pane, paneOwningWorkspaceId, historyApi.archiveThread)
+          return
         case 'pane-zoom':
           if (pane) await maximizePane(pane)
           return
-        case 'pane-split-chat-right':
-        case 'pane-split-chat-down':
-        case 'pane-split-terminal-right':
-        case 'pane-split-terminal-down': {
-          if (pane?.native_pane_id == null) return
-          const kind = action === 'pane-split-chat-right' || action === 'pane-split-chat-down'
-            ? 'chat'
-            : 'terminal'
-          const axis = action === 'pane-split-chat-right' || action === 'pane-split-terminal-right'
-            ? 'vertical'
-            : 'horizontal'
-          const response = await interactiveCall('pane.split', {
-            workspace: current_workspace.workspace_id,
-            pane: pane.native_pane_id,
-            kind,
-            axis,
-          })
-          if (callSucceeded(response, `could not split ${kind} pane`)) {
-            // Scoped: only this workspace's pane listing can have changed.
-            await refreshProjection({ workspace_id: current_workspace.workspace_id })
-          }
-          return
-        }
         case 'pane-close':
           if (pane) await closePane(pane)
           return
@@ -3484,7 +3745,7 @@ function createAppStore() {
         void closePane()
         break
       case 'focus_prompt':
-        setComposerNonce((value) => value + 1)
+        requestComposerFocus()
         break
       case 'workspace_previous':
         stepWorkspace(-1)
@@ -3597,11 +3858,7 @@ function createAppStore() {
       'chat.run_config': 'thread.run_config', open: 'workspace.add', 'workspace.add': 'workspace.add', open_editor: 'workspace.open_editor',
     }
     const command = paletteCommands[action]
-    if (command && current) {
-      void runDesktopSidebarCommand(current, command, pane ?? undefined)
-      return
-    }
-    setNotice(`${action} is not available in the web client.`)
+    void runCommand(command ?? action)
   }
 
   const sendPrefix = (event: KeyboardEvent) => {
@@ -3687,29 +3944,54 @@ function createAppStore() {
   }
 
   const runCommand = async (id: string, workspace_id?: string) => {
-    setPaletteOpen(false)
-    switch (id) {
-      case 'new-thread':
-        await newThread(workspace_id)
-        break
-      case 'new-terminal':
-        await newTerminal(workspace_id)
-        break
-      case 'toggle-sidebar':
-        dispatchAction('toggle_sidebar')
-        break
-      case 'settings':
-        setSettingsOpen(true)
-        break
-      case 'maximize':
-        await maximizePane()
-        break
-      default:
-        break
+    const current = workspace_id
+      ? workspaces().find((row) => row.workspace_id === workspace_id)
+      : workspace()
+    const pane = focusedPane()
+    const openPicker = (command: ChatPickerCommand) => {
+      if (!openChatCommandPicker(pane!, command)) setNotice('The chat picker is not mounted. Open the chat and try again.')
     }
+    const rename = async (chat: boolean) => {
+      const value = window.prompt(chat ? 'Chat title' : 'Workspace name', chat ? paneTitle(pane!) : current!.label)
+      if (value == null) return
+      if (!value.trim()) { setNotice('Enter a non-empty name.'); return }
+      await runSidebarContextAction({
+        action: chat ? 'thread-rename' : 'workspace-rename', workspace: current!,
+        ...(chat ? { pane: pane! } : {}), value,
+      })
+    }
+    await dispatchWebCommand(id, {
+      workspace: current, pane, notice: setNotice,
+      accepted: () => setPaletteOpen(false),
+      handlers: {
+        'thread.new': () => newThread(current!.workspace_id),
+        'thread.rename_current': () => rename(true),
+        'thread.choose_model': () => openPicker('model'),
+        'thread.run_config': () => openPicker('run_config'),
+        'thread.archive_current': () => archiveCommand(pane!, paneOwningWorkspaceId, historyApi.archiveThread),
+        'pane.terminal': () => newTerminal(current!.workspace_id),
+        'pane.close': () => closePane(pane!),
+        'pane.zoom': () => maximizePane(pane!),
+        'pane.previous': () => stepPane(-1),
+        'pane.next': () => stepPane(1),
+        'pane.focus_left': () => stepPaneDirection('left'),
+        'pane.focus_right': () => stepPaneDirection('right'),
+        'pane.focus_up': () => stepPaneDirection('up'),
+        'pane.focus_down': () => stepPaneDirection('down'),
+        'pane.focus_prompt': requestComposerFocus,
+        'workspace.add': () => setWorkspaceDialogOpen(true),
+        'workspace.rename': () => rename(false),
+        'workspace.close': () => runSidebarContextAction({ action: 'workspace-close', workspace: current! }),
+        'workspace.previous': () => stepWorkspace(-1),
+        'workspace.next': () => stepWorkspace(1),
+        'app.settings': () => setSettingsOpen(true),
+        'app.sidebar': () => dispatchAction('toggle_sidebar'),
+      },
+    })
   }
 
   const start = () => {
+    watchNotifications({ panes: panesByWorkspace, workspaces, focused: focusedPane, turns: lastTurns, approval: pendingApproval, focus: focusPane })
     const removeClientListener = client.onEvent(onEvent)
     client.connect()
     const media = window.matchMedia('(max-width: 1023px)')
@@ -3814,6 +4096,18 @@ function createAppStore() {
 
   return {
     connections, connectionError, refreshConnections, connectionFor, setChatConnection, newThread,
+    listChatCwdChoices: cwdApi.listChatCwdChoices,
+    chatCwdChoices: (pane: LivePane) => cwdApi.chatCwdChoices(cwdKey(pane)),
+    chatCwdIsLocked, setChatCwd,
+    usageFor: (pane: LivePane) => latestPaneUsage(messagesFor(pane), slashCommandState(pane).result),
+    providerReadiness, recheckProviderReadiness, chatRuntimeBlocker,
+    ...historyApi,
+    listSlashCommands: composerCommands.listSlashCommands,
+    searchFiles: composerCommands.searchFiles,
+    cancelFileSearch: composerCommands.cancelFileSearch,
+    submitSlashCommand,
+    slashCommandState,
+    groupHistory,
     owningWorkspaceId: paneOwningWorkspaceId,
     inheritsConnection: (pane: LivePane) => !routeThread(pane).profile_id && !routeThread(pane).committed && !routeThread(pane).provider_thread_id,
     client,
@@ -3848,6 +4142,7 @@ function createAppStore() {
     notice,
     setNotice,
     composerNonce,
+    composerFocusExplicit,
     compact,
     uiConfig,
     keybindConfig,
@@ -3869,7 +4164,16 @@ function createAppStore() {
     focusPane,
     takeInstantFocus,
     sendDraft,
+    submitFollowup,
+    followupKindFor: (pane: LivePane) => followupKind(routeThread(pane).provider ?? pane.provider, routeThread(pane).harness),
+    pendingFollowup: followups.pendingFollowup,
+    pendingFollowupHint: followups.pendingFollowupHint,
+    pullBackFollowup: followups.pullBackFollowup,
+    cancelFollowup: followups.cancelFollowup,
+    retryFollowup: followups.retryFollowup,
     stopTurn,
+    pendingApproval,
+    resolveApproval,
     paneWorking,
     updateThreadSettings,
     createWorkspace,

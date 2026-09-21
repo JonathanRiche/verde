@@ -51,6 +51,7 @@
   --accent-hover: rgba(80, 200, 120, 0.19);
   --warning: #fbbf24;
   --danger: #ff6464;
+  --diff-add: #34e094;
   --user-bubble: #2a4636;
   --assistant-card: #161c1e;
   --radius-row: 7px;
@@ -135,7 +136,7 @@ textarea { resize: none; }
 }
 /* Press feedback for compact controls only: full-width rows, the drawer
    backdrop and the split gutters would visibly jump if they scaled. */
-button:active:not(:disabled):not(.w-full):not(.flex-1):not(.drawer-backdrop):not(.pane-split-gutter) {
+button:active:not(:disabled):not(.w-full):not(.flex-1):not(.drawer-backdrop):not(.pane-split-gutter):not(.vt-action) {
   transform: scale(0.96);
 }
 button { transition-property: background-color, color, border-color, opacity, box-shadow, transform; }
@@ -216,7 +217,7 @@ button { transition-property: background-color, color, border-color, opacity, bo
 .markdown pre {
   overflow-x: auto;
   max-width: 100%;
-  background: #0b1012;
+  background: var(--chat-black);
   border: 1px solid var(--border-muted);
   border-radius: 8px;
   padding: 12px;
@@ -235,6 +236,49 @@ button { transition-property: background-color, color, border-color, opacity, bo
   }
 }
 .markdown pre code { background: none; padding: 0; }
+.code-block { margin-block: 0.75em; border: 1px solid var(--border-muted); border-radius: 8px; overflow: hidden; background: var(--chat-black); }
+.code-toolbar { display: flex; align-items: center; gap: 12px; min-height: 36px; padding: 0 8px 0 12px; border-bottom: 1px solid var(--border-muted); background: var(--panel-alt); }
+.code-language { font-family: var(--font-mono); color: var(--text-subtle); font-size: 11px; }
+.code-copy-status { margin-left: auto; color: var(--text-muted); font-size: 11px; line-height: 1.4; }
+.code-block pre { margin: 0; border: 0; border-radius: 0; }
+.code-copy, .copy-pill, .diff-action {
+  flex-shrink: 0; border-radius: 5px; background: var(--panel-muted); padding: 5px 10px; font-size: 11px; color: var(--text-muted);
+}
+.code-copy { opacity: 0; transition: opacity 120ms var(--ease-out); }
+.code-block:hover .code-copy, .code-block:focus-within .code-copy { opacity: 1; }
+.code-copy:hover, .copy-pill:hover, .diff-action:hover { background: var(--accent-wash); color: var(--text); }
+.code-copy:focus-visible, .copy-pill:focus-visible, .diff-action:focus-visible, .diff-file-toggle:focus-visible, .diff-show-all:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.copy-control { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.copy-status { font-size: 11px; color: var(--text-muted); max-width: 190px; white-space: normal; }
+.tok-comment { color: var(--text-subtle); font-style: italic; }
+.tok-string { color: var(--diff-add); }
+.tok-number { color: var(--warning); }
+.tok-keyword { color: var(--accent-hi); }
+.tok-call { color: var(--selection, var(--accent-hi)); }
+
+/* One gutter in stacked mode leaves room for code on narrow screens. */
+.diff-grid { display: grid; min-width: 0; }
+.diff-grid-stacked { grid-template-columns: max-content minmax(0, 1fr); }
+.diff-grid-split { grid-template-columns: max-content minmax(0, 1fr) max-content minmax(0, 1fr); }
+.diff-full { grid-column: 1 / -1; white-space: pre-wrap; overflow-wrap: anywhere; padding: 1px 6px; }
+.diff-no {
+  min-width: calc(5ch + 12px); padding: 0 6px; text-align: right; color: var(--text-subtle);
+  user-select: none; font-variant-numeric: tabular-nums;
+}
+.diff-text { min-width: 0; padding-right: 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.diff-sign { display: inline-block; width: 1.4ch; user-select: none; }
+.diff-blank { background: color-mix(in srgb, var(--text) 3%, transparent); }
+.diff-bg-add { background: color-mix(in srgb, var(--diff-add) 8%, transparent); }
+.diff-bg-del { background: color-mix(in srgb, var(--danger) 10%, transparent); }
+.diff-emph-add { background: color-mix(in srgb, var(--diff-add) 26%, transparent); color: var(--text); border-radius: 2px; }
+.diff-emph-del { background: color-mix(in srgb, var(--danger) 32%, transparent); color: var(--text); border-radius: 2px; }
+.diff-file-toggle { display: flex; min-height: 44px; width: 100%; min-width: 0; align-items: center; gap: 8px; text-align: left; }
+.diff-file-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding-bottom: 8px; }
+.diff-show-all { display: block; padding: 12px; width: 100%; text-align: left; color: var(--accent-hi); background: var(--panel-muted); white-space: normal; }
+@media (max-width: 1023px), (hover: none) {
+  .code-copy, .copy-pill, .diff-action { opacity: 1; min-width: 44px; min-height: 44px; }
+  .code-toolbar { min-height: 48px; }
+}
 .markdown ul, .markdown ol { padding-left: 1.2em; margin: 0.4em 0; }
 .markdown a { color: var(--accent-hi); }
 .markdown h1, .markdown h2, .markdown h3 {
@@ -471,6 +515,87 @@ button { transition-property: background-color, color, border-color, opacity, bo
     overflow: auto;
   }
 }
+/* Terminal selection overlay: lives inside the scroller so it pans with the
+   canvas. The host is its offset parent. */
+.ghostty-host {
+  position: relative;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+.vt-select-layer {
+  position: absolute;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+}
+.vt-select-rect {
+  position: absolute;
+  /* Theme selection colour; the outline keeps it visible over green cells. */
+  background: color-mix(in srgb, var(--selection, var(--accent)) 40%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--selection, var(--accent)) 70%, transparent);
+}
+.vt-select-handle {
+  position: absolute;
+  /* Matches HANDLE_PX in Terminals.tsx. */
+  width: 20px;
+  height: 20px;
+  margin: -10px 0 0 -10px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px var(--vt-bg, var(--chat-black));
+}
+/* Floating Copy/Paste bar, clamped inside the pane and the safe areas. */
+.vt-actions {
+  position: absolute;
+  z-index: 30;
+  /* --vt-left is the measured, pane-clamped left edge (set from JS). */
+  /* --vt-w is the measured bar width, for the right-inset clamp. */
+  left: clamp(
+    calc(8px + env(safe-area-inset-left)),
+    var(--vt-left, 8px),
+    max(calc(8px + env(safe-area-inset-left)), calc(100% - var(--vt-w, 0px) - 8px - env(safe-area-inset-right)))
+  );
+  top: clamp(8px, var(--vt-y), calc(100% - 52px - env(safe-area-inset-bottom)));
+  max-width: calc(100% - 16px);
+}
+.vt-action {
+  min-width: 40px;
+  height: 40px;
+  padding: 0 14px;
+  font-size: 13px;
+  color: var(--text);
+  white-space: nowrap;
+}
+/* Unlayered like .vt-action, so a colour utility could not override it. */
+.vt-action-primary { color: var(--accent-hi); }
+.vt-action:focus-visible {
+  /* Inset: the bar clips overflow. */
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+@media (max-width: 1023px) {
+  .vt-action { height: 44px; min-width: 44px; }
+}
+.vt-action:hover,
+.vt-action:active {
+  background: var(--accent-hover);
+}
+.vt-action + .vt-action {
+  border-left: 1px solid var(--border-muted);
+}
+.vt-paste-field {
+  width: 100%;
+  resize: none;
+  border-radius: 6px;
+  border: 1px solid var(--border-muted);
+  background: var(--chat-black);
+  color: var(--text);
+  padding: 6px 8px;
+  /* 16px stops iOS focus-zoom. */
+  font-size: 16px;
+  outline: none;
+}
 .ghostty-canvas {
   display: block;
   flex: 1 0 auto;
@@ -508,4 +633,171 @@ button { transition-property: background-color, color, border-color, opacity, bo
   white-space: pre;
   tab-size: 8;
   overflow: hidden;
+}
+
+/* History overlay: full-height sheet on phones, centred dialog on desktop. */
+/* Layered so Tailwind utilities on the element can still override it. */
+@layer components {
+  .history-panel {
+    position: absolute;
+    inset: 0;
+    padding-top: var(--safe-top);
+    padding-bottom: var(--safe-bottom);
+  }
+  @media (min-width: 1024px) {
+    .history-panel {
+      inset: 12vh auto auto 50%;
+      width: min(600px, calc(100vw - 2rem));
+      max-height: 70vh;
+      margin-left: calc(min(600px, 100vw - 2rem) / -2);
+      padding: 0;
+      border-width: 1px;
+      border-radius: 10px;
+    }
+  }
+}
+
+/* Command palette + Settings sections (ui/Overlays.tsx). */
+.palette-section {
+  padding: 10px 12px 4px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-subtle);
+}
+.palette-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  padding: 0 12px;
+  border-radius: 7px;
+  font-size: 14px;
+  cursor: pointer;
+  scroll-margin: 28px 0 6px;
+}
+@media (min-width: 1024px) {
+  .palette-row { min-height: 34px; }
+}
+.palette-row-active { background: var(--accent-hover); }
+.palette-row-disabled {
+  cursor: default;
+  color: var(--text-subtle);
+}
+.palette-tag {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border: 1px solid var(--border-muted);
+  border-radius: 999px;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: var(--text-subtle);
+}
+.palette-kbd {
+  min-width: 18px;
+  padding: 1px 5px;
+  border: 1px solid var(--border-muted);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--panel-alt);
+  font-family: inherit;
+  font-size: 10px;
+  line-height: 1.5;
+  text-align: center;
+  color: var(--text-muted);
+}
+.settings-switch {
+  position: relative;
+  flex-shrink: 0;
+  width: 44px;
+  height: 26px;
+  border-radius: 999px;
+  border: 1px solid var(--border-muted);
+  background: var(--panel-muted);
+  transition: background-color 140ms var(--ease-out), border-color 140ms var(--ease-out);
+}
+/* 44px touch target around the 26px track. */
+.settings-switch::before {
+  content: '';
+  position: absolute;
+  inset: -10px 0;
+}
+.settings-switch::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  transition: transform 140ms var(--ease-out), background-color 140ms var(--ease-out);
+}
+.settings-switch[aria-checked='true'] {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.settings-switch[aria-checked='true']::after {
+  transform: translateX(18px);
+  background: var(--chat-black);
+}
+.settings-switch:disabled { opacity: 0.45; cursor: default; }
+.settings-switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+@layer components {
+  /* Composer accessories follow the desktop palette and compact surface rhythm. */
+  .composer-surface { width: calc(100% - 24px); max-width: 900px; margin: 0 auto 8px; padding: 10px 12px; border: 1px solid var(--border-muted); border-radius: 10px; background: var(--panel); font-size: 12px; color: var(--text-muted); }
+  .composer-surface-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 6px; font-size: 12px; }
+  .composer-surface-heading strong { color: var(--text); font-weight: 600; }
+  .composer-surface-heading > span { color: var(--text-subtle); font-size: 11px; }
+  .composer-detail { margin: 4px 0; color: var(--text-subtle); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+  .composer-surface button, .composer-surface-actions button { min-height: 32px; padding: 5px 10px; border: 1px solid var(--border-muted); border-radius: 7px; color: var(--text); font-size: 12px; }
+  .composer-surface button:hover, .chat-cwd-options button:hover { background: var(--panel-alt); }
+  .composer-surface button:disabled { opacity: .5; }
+  .composer-surface button:focus-visible, .chat-cwd-picker button:focus-visible, .composer-suggest button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .composer-followup { border-left: 3px solid var(--accent); flex-shrink: 0; max-height: min(220px, 28dvh); overflow-y: auto; overscroll-behavior: contain; }
+  .composer-followup-text { max-height: 96px; overflow-y: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text); }
+  .composer-followup-images { display: flex; gap: 6px; overflow-x: auto; margin: 8px 0; }
+  .composer-followup-images img { height: 48px; width: 60px; object-fit: contain; background: var(--chat-black); border-radius: 5px; }
+  .composer-surface-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .composer-readiness { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; }
+  .composer-readiness > div { min-width: 0; }
+  .composer-readiness > button { flex-shrink: 0; }
+  .composer-send-label { color: var(--text-subtle); font-size: 11px; }
+  .composer-followup-hint { margin-bottom: 0; }
+  .composer-suggest { position: absolute; bottom: calc(100% + 8px); left: 0; right: 0; z-index: 35; max-height: min(320px, 38dvh); overflow: auto; overscroll-behavior: contain; padding: 8px; border: 1px solid var(--border-muted); border-radius: 12px; background: var(--panel); box-shadow: 0 12px 32px #0006; }
+  .composer-suggest .composer-surface-heading { padding: 0 8px; }
+  .composer-suggest .composer-surface-heading button { min-width: 32px; min-height: 32px; font-size: 18px; }
+  .composer-suggest .composer-detail { padding: 6px 8px; }
+  .composer-suggestion { display: flex; flex-direction: column; width: 100%; min-height: 44px; gap: 3px; padding: 8px; text-align: left; border-radius: 7px; }
+  .composer-suggestion[aria-selected="true"] { background: var(--panel-alt); box-shadow: inset 2px 0 var(--accent); }
+  .composer-suggestion strong { font-size: 13px; color: var(--text); }
+  .composer-suggestion small, .composer-suggestion span { font-size: 12px; color: var(--text-subtle); font-weight: normal; }
+  .composer-command-status { position: relative; width: 100%; max-height: 220px; overflow: auto; }
+  .composer-command-status pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; margin-top: 8px; }
+  .composer-command-status .composer-result-dismiss { float: right; margin-left: 8px; }
+  .chat-cwd-trigger { width: 100%; display: flex; gap: 8px; align-items: center; min-height: 44px; padding: 8px; border: 1px solid var(--border-muted); border-radius: 7px; background: var(--panel); font-size: 12px; text-align: left; }
+  .chat-cwd-trigger > span { color: var(--text-subtle); flex-shrink: 0; }
+  .chat-cwd-trigger strong { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: normal; }
+  .chat-cwd-options { padding: 6px 0; }
+  .chat-cwd-options > button { display: flex; flex-direction: column; gap: 3px; min-height: 44px; width: 100%; text-align: left; padding: 8px; border-radius: 7px; overflow-wrap: anywhere; }
+  .chat-cwd-options > button[aria-pressed="true"] { background: var(--panel-alt); box-shadow: inset 2px 0 var(--accent); }
+  .chat-cwd-options button strong { font-size: 12px; }
+  .chat-cwd-options button span { color: var(--text-subtle); font-size: 11px; }
+  .usage-card { padding: 12px; border: 1px solid var(--border-muted); border-radius: 10px; background: var(--assistant-card); font-size: 12px; }
+  .usage-limit { margin-top: 12px; }
+  .usage-limit > div { display: flex; justify-content: space-between; gap: 12px; }
+  .usage-limit meter { display: block; width: 100%; height: 8px; margin-top: 6px; accent-color: var(--accent); }
+  .usage-limit meter::-webkit-meter-bar { background: var(--panel-muted); border: 0; border-radius: 4px; }
+  .usage-limit meter::-webkit-meter-optimum-value { background: var(--accent); border-radius: 4px; }
+  .usage-limit meter::-moz-meter-bar { background: var(--accent); }
+  .usage-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin-top: 12px; }
+  .usage-stats dt { color: var(--text-subtle); font-size: 11px; }
+  .usage-stats dd { margin-top: 2px; color: var(--text); overflow-wrap: anywhere; }
+  .usage-card summary { min-height: 32px; padding-top: 12px; color: var(--text-muted); cursor: pointer; }
+  @media (pointer: coarse) {
+    .composer-surface button, .composer-stop, .composer-send { min-height: 44px; min-width: 44px; }
+    .composer-suggest { max-height: min(260px, 30dvh); }
+  }
 }

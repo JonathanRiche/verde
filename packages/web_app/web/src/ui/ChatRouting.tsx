@@ -1,6 +1,7 @@
 import { For, Show, createEffect, createSignal, onMount } from 'solid-js'
 
 import { workspaceSelectIntent } from '../lib/selection'
+import { ChatCwdPicker } from './ChatCwdPicker'
 import { store } from '../lib/store'
 import type { LivePane } from '../lib/types'
 
@@ -116,6 +117,7 @@ export function ChatRouting(props: { pane: LivePane; onClose: () => void }) {
           {locked() ? 'This conversation keeps its original connection.' : 'New chats inherit the workspace’s default connection.'}
         </span>
       </label>
+      <ChatCwdPicker pane={props.pane} />
       <Show when={store.connectionError()}>
         <p role="status" class="text-[12px] leading-4 text-[var(--accent)]">{store.connectionError()}</p>
       </Show>

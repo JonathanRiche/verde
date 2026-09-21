@@ -5,6 +5,8 @@ import { store, type SidebarContextAction } from '../lib/store'
 import { paneIsActive, type LayoutNode, type LivePane, type Workspace } from '../lib/types'
 import { Icon, ProviderGlyph, StatusPip, VerdeLogo } from './Icons'
 import { ChatRouting } from './ChatRouting'
+import { openHistory } from './History'
+import { sidebarMenuAvailability } from '../lib/commands'
 
 // Sidebar-only view state: the selected workspace whose pane list is folded.
 // Keyed by id so selecting a different workspace always shows its panes.
@@ -22,7 +24,8 @@ type SidebarMenuTarget =
   | { kind: 'terminal'; workspace: Workspace; pane: LivePane; x: number; y: number }
 
 interface MenuItem {
-  action: SidebarContextAction
+  // 'workspace-history' is view-only: it opens the overlay, not a store action.
+  action: SidebarContextAction | 'workspace-history'
   label: string
   disabled?: boolean
   danger?: boolean
@@ -56,6 +59,10 @@ export function Sidebar(props: { drawer?: boolean }) {
   const chooseMenuItem = (target: SidebarMenuTarget, item: MenuItem) => {
     setMenu(null)
     const workspace = actionWorkspace(target.kind === 'workspace' ? undefined : target.pane) ?? target.workspace
+    if (item.action === 'workspace-history') {
+      openHistory(workspace.workspace_id)
+      return
+    }
     if (item.action === 'workspace-rename') {
       setPrompt({
         action: item.action,
@@ -238,6 +245,10 @@ export function PaneActionsButton(props: { pane: LivePane; mobile?: boolean }) {
       })
       return
     }
+    if (item.action === 'workspace-history') {
+      openHistory(workspace.workspace_id)
+      return
+    }
     void store.runSidebarContextAction({
       action: item.action,
       workspace,
@@ -353,7 +364,7 @@ function WorkspaceGroup(props: {
           <TinyIcon label="New terminal" onClick={(event) => { event.stopPropagation(); void store.runCommand('new-terminal', props.workspace.workspace_id) }}>
             <Icon name="terminal" class="h-3.5 w-3.5" />
           </TinyIcon>
-          <TinyIcon label="History" onClick={(event) => { event.stopPropagation(); store.setPaletteOpen(true) }}>
+          <TinyIcon label="History" onClick={(event) => { event.stopPropagation(); openHistory(props.workspace.workspace_id) }}>
             <Icon name="history" class="h-3.5 w-3.5" />
           </TinyIcon>
         </span>
@@ -712,31 +723,32 @@ function contextMenuItems(target: SidebarMenuTarget): MenuItem[] {
       : [
           { action: 'workspace-herdr-handoff', label: 'Handoff to Herdr' },
         ]
-    return [
+    return ([
       { action: 'workspace-new-chat', label: 'Start a new chat' },
       { action: 'workspace-open-codex-tui', label: 'Open Codex TUI' },
       { action: 'workspace-open-terminal', label: 'Open terminal' },
+      { action: 'workspace-history', label: 'History' },
       ...herdr,
       { action: 'workspace-rename', label: 'Rename workspace' },
       { action: 'workspace-import-codex', label: 'Import Codex thread' },
       { action: 'workspace-import-opencode', label: 'Import OpenCode thread' },
       { action: 'workspace-import-claude', label: 'Import Claude thread' },
       { action: 'workspace-close', label: 'Close workspace', disabled: busy, danger: true },
-    ]
+    ] satisfies MenuItem[]).map((item) => sidebarMenuAvailability(item))
   }
 
   const pane = target.pane
   if (target.kind === 'terminal') {
     const desktop_only_disabled = pane.native_pane_id == null
     const close_disabled = desktop_only_disabled && !pane.session_id
-    return [
+    return ([
       paneZoomItem(pane),
       { action: 'pane-split-chat-right', label: 'Split with chat to right', disabled: desktop_only_disabled },
       { action: 'pane-split-chat-down', label: 'Split with chat below', disabled: desktop_only_disabled },
       { action: 'pane-split-terminal-right', label: 'Split with terminal to right', disabled: desktop_only_disabled },
       { action: 'pane-split-terminal-down', label: 'Split with terminal below', disabled: desktop_only_disabled },
       { action: 'pane-close', label: 'Close pane', disabled: close_disabled, danger: true },
-    ]
+    ] satisfies MenuItem[]).map((item) => sidebarMenuAvailability(item, pane))
   }
   const busy = paneIsActive(pane)
   const desktop_only_disabled = pane.native_pane_id == null
@@ -753,16 +765,16 @@ function contextMenuItems(target: SidebarMenuTarget): MenuItem[] {
             : pane.provider === 'grok'
               ? 'Grok'
               : 'Codex'
-  return [
+  return ([
     paneZoomItem(pane),
     { action: 'thread-rename', label: 'Rename chat', disabled: !pane.thread_id },
     { action: 'thread-regenerate-title', label: 'Regenerate title', disabled: busy || desktop_only_disabled },
-    { action: 'thread-sync', label: 'Sync thread', disabled: busy || desktop_only_disabled || !pane.provider_thread_id },
+    { action: 'thread-sync', label: 'Sync thread', disabled: busy || !pane.thread_id || !pane.provider_thread_id || store.connectionFor(pane) !== 'local' },
     { action: 'thread-handoff', label: 'Handoff to another agent', disabled: busy || desktop_only_disabled },
     { action: 'thread-open-tui', label: `Open in TUI: ${provider}`, disabled: busy || desktop_only_disabled || !pane.provider_thread_id },
-    { action: 'thread-archive', label: 'Archive thread', disabled: busy || !pane.thread_id, danger: true },
+    { action: 'thread-archive', label: 'Archive chat', disabled: busy || !pane.thread_id, danger: true },
     { action: 'pane-close', label: 'Close pane', disabled: desktop_only_disabled, danger: true },
-  ]
+  ] satisfies MenuItem[]).map((item) => sidebarMenuAvailability(item, { ...pane, profile_id: store.connectionFor(pane) }))
 }
 
 function paneZoomItem(pane: LivePane): MenuItem {

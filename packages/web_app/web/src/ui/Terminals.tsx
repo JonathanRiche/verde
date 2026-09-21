@@ -1,9 +1,26 @@
-import { onCleanup, onMount } from 'solid-js'
+import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from 'solid-js'
 
 import { alignPtyStream, resizeSession, tailSession, writePane } from '../lib/pty'
 import { store } from '../lib/store'
+import { orderRange, pasteBytes, selectionText, wordBounds } from '../lib/term_select'
 
 import type { GhosttySnapshot, GhosttyTerminal } from '../lib/ghostty'
+import type { CellPoint, CellRange } from '../lib/term_select'
+
+/// Painted grid geometry; the selection overlay is laid out from this.
+interface GridGeo {
+  cw: number
+  ch: number
+  start: number
+  cols: number
+  rows: number
+  ox: number
+  oy: number
+}
+
+const LONG_PRESS_MS = 450
+const HANDLE_REACH_PX = 32
+const HANDLE_PX = 20
 
 const KEY_NAMES: Record<string, string> = {
   Enter: 'enter',
@@ -25,6 +42,57 @@ export function TerminalView(props: { workspaceId: string; paneId: number; sessi
   let canvas: HTMLCanvasElement | undefined
   let host: HTMLDivElement | undefined
   let key_input: HTMLTextAreaElement | undefined
+  let frame: HTMLElement | undefined
+
+  const [sel, setSel] = createSignal<CellRange | null>(null)
+  const [geo, setGeo] = createSignal<GridGeo | null>(null)
+  // Touch selections get drag handles; mouse selections do not.
+  const [handles, setHandles] = createSignal(false)
+  const [bar, setBar] = createSignal<{ x: number; y: number } | null>(null)
+  const [paste_box, setPasteBox] = createSignal(false)
+  const [copied, setCopied] = createSignal(false)
+  let actions: { copy(): void; paste(): void; selectAll(): void; sendPaste(text: string): void } | null = null
+
+  const closeBar = () => {
+    // The paste box owned focus; hand it back so keys (and the soft keyboard)
+    // keep working.
+    if (paste_box()) key_input?.focus({ preventScroll: true })
+    setBar(null)
+    setPasteBox(false)
+    setCopied(false)
+  }
+
+  const highlight = createMemo(() => {
+    const range = sel()
+    const grid = geo()
+    if (!range || !grid) return []
+    const rects: { left: number; top: number; width: number }[] = []
+    const first = Math.max(range.start.row, grid.start)
+    const last = Math.min(range.end.row, grid.start + grid.rows - 1)
+    for (let row = first; row <= last; row += 1) {
+      const from = row === range.start.row ? range.start.x : 0
+      const to = row === range.end.row ? range.end.x : grid.cols - 1
+      rects.push({ left: from * grid.cw, top: (row - grid.start) * grid.ch, width: (to - from + 1) * grid.cw })
+    }
+    return rects
+  })
+
+  /// Handle centers in canvas CSS pixels, or null when scrolled out of view.
+  const handlePoint = (which: 'start' | 'end') => {
+    const range = sel()
+    const grid = geo()
+    if (!range || !grid) return null
+    const point = range[which]
+    const y = point.row - grid.start
+    if (y < 0 || y >= grid.rows) return null
+    // Kept inside the canvas: an overhanging handle would add scroll overflow
+    // to the host and turn history pans into DOM nudges.
+    const x = (which === 'start' ? point.x : point.x + 1) * grid.cw
+    return {
+      x: Math.max(HANDLE_PX / 2, Math.min(grid.cols * grid.cw - HANDLE_PX / 2, x)),
+      y: Math.min(grid.rows * grid.ch - HANDLE_PX / 2, (y + 1) * grid.ch + 7),
+    }
+  }
 
   onMount(() => {
     const surface = canvas
@@ -43,6 +111,8 @@ export function TerminalView(props: { workspaceId: string; paneId: number; sessi
     let viewport_bottom = true
     // TUIs own scrolling themselves, so wheel/drag become arrow keys there.
     let alt_screen = false
+    // DEC 2004, tracked from the raw stream like alt_screen.
+    let bracketed_paste = false
     let cell_h_px = 20
     let scroll_rows_carry = 0
     let composing = false
@@ -109,8 +179,154 @@ export function TerminalView(props: { workspaceId: string; paneId: number; sessi
     const trackAltScreen = (bytes: string) => {
       const on = Math.max(bytes.lastIndexOf('\x1b[?1049h'), bytes.lastIndexOf('\x1b[?1047h'))
       const off = Math.max(bytes.lastIndexOf('\x1b[?1049l'), bytes.lastIndexOf('\x1b[?1047l'))
-      if (on >= 0 || off >= 0) alt_screen = on > off
+      if (on >= 0 || off >= 0) {
+        const next = on > off
+        // Row numbers mean nothing across a screen switch.
+        if (next !== alt_screen && sel()) clearSelection()
+        alt_screen = next
+      }
+      const paste_on = bytes.lastIndexOf('\x1b[?2004h')
+      const paste_off = bytes.lastIndexOf('\x1b[?2004l')
+      if (paste_on >= 0 || paste_off >= 0) bracketed_paste = paste_on > paste_off
     }
+
+    // Glyphs of selected rows, kept as they scroll by so a selection that
+    // extends beyond the viewport still copies in full.
+    const lines = new Map<number, string[]>()
+    const captureLines = (snap: GhosttySnapshot | null) => {
+      const range = sel()
+      if (!range || !snap) return
+      snap.rows.forEach((row, y) => {
+        const abs = snap.startRow + y
+        if (abs < range.start.row || abs > range.end.row) return
+        const line = new Array<string>(snap.cols).fill(' ')
+        for (const cell of row.cells) {
+          if (cell.x >= snap.cols) continue
+          line[cell.x] = cell.text || ' '
+          if (cell.width === 2 && cell.x + 1 < snap.cols) line[cell.x + 1] = ''
+        }
+        lines.set(abs, line)
+      })
+    }
+
+    let copied_timer = 0
+    const clearSelection = () => {
+      window.clearTimeout(copied_timer)
+      lines.clear()
+      setSel(null)
+      setHandles(false)
+      closeBar()
+    }
+
+    const select = (a: CellPoint, b: CellPoint) => {
+      window.clearTimeout(copied_timer)
+      const range = orderRange(a, b)
+      for (const row of lines.keys()) if (row < range.start.row || row > range.end.row) lines.delete(row)
+      setSel(range)
+      captureLines(snapshotSafe())
+    }
+
+    const pointAt = (client_x: number, client_y: number): CellPoint | null => {
+      const grid = geo()
+      if (!grid) return null
+      const rect = surface.getBoundingClientRect()
+      const x = Math.floor((client_x - rect.left) / grid.cw)
+      const y = Math.floor((client_y - rect.top) / grid.ch)
+      return {
+        x: Math.max(0, Math.min(grid.cols - 1, x)),
+        row: grid.start + Math.max(0, Math.min(grid.rows - 1, y)),
+      }
+    }
+
+    const selectWordAt = (point: CellPoint) => {
+      select(point, point)
+      const word = wordBounds(lines.get(point.row) ?? [], point.x)
+      select({ x: word.from, row: point.row }, { x: word.to, row: point.row })
+      return word
+    }
+
+    /// Anchor the action bar above the selection (below when there is no room).
+    const showBarAtSelection = () => {
+      const range = sel()
+      const grid = geo()
+      if (!range || !grid || !frame) return
+      const rect = surface.getBoundingClientRect()
+      const outer = frame.getBoundingClientRect()
+      const top_row = Math.max(0, Math.min(grid.rows - 1, range.start.row - grid.start))
+      const bottom_row = Math.max(0, Math.min(grid.rows - 1, range.end.row - grid.start))
+      const mid = range.start.row === range.end.row ? ((range.start.x + range.end.x + 1) / 2) * grid.cw : outer.width / 2
+      const above = rect.top - outer.top + top_row * grid.ch - 52
+      const below = rect.top - outer.top + (bottom_row + 1) * grid.ch + 24
+      setBar({ x: rect.left - outer.left + mid, y: above >= 4 ? above : below })
+    }
+
+    const sendPaste = (text: string) => {
+      closeBar()
+      if (!text) return
+      void writePane(
+        store.client,
+        props.workspaceId,
+        props.paneId,
+        pasteBytes(text, bracketed_paste),
+        sessionId(),
+      ).then(kick)
+    }
+
+    const copySelection = () => {
+      const range = sel()
+      if (!range) return
+      const text = selectionText(range, lines)
+      const done = () => {
+        setCopied(true)
+        copied_timer = window.setTimeout(clearSelection, 600)
+      }
+      const legacy = () => {
+        // Insecure contexts (plain http over LAN) have no async clipboard.
+        const scratch = document.createElement('textarea')
+        const focused = document.activeElement as HTMLElement | null
+        scratch.value = text
+        // readOnly + 16px: no soft keyboard, no iOS focus-zoom.
+        scratch.readOnly = true
+        scratch.style.position = 'fixed'
+        scratch.style.opacity = '0'
+        scratch.style.fontSize = '16px'
+        document.body.append(scratch)
+        scratch.select()
+        let ok = false
+        try {
+          ok = document.execCommand('copy')
+        } catch {
+          ok = false
+        }
+        scratch.remove()
+        focused?.focus({ preventScroll: true })
+        if (ok) done()
+        else store.setNotice('Copy failed')
+      }
+      if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text).then(done, legacy)
+      else legacy()
+    }
+
+    const pasteClipboard = () => {
+      const fallback = () => {
+        // Permission denied or unsupported: offer a real field so the
+        // platform's own paste gesture can deliver the text.
+        // Top-anchored: the box is taller than the bar clamp allows for, and the
+        // soft keyboard shrinks the pane from the bottom.
+        if (frame) setBar({ x: bar()?.x ?? frame.clientWidth / 2, y: 8 })
+        setPasteBox(true)
+      }
+      if (!navigator.clipboard?.readText) return fallback()
+      navigator.clipboard.readText().then(sendPaste, fallback)
+    }
+
+    const selectAllVisible = () => {
+      const grid = geo()
+      if (!grid) return
+      select({ x: 0, row: grid.start }, { x: grid.cols - 1, row: grid.start + grid.rows - 1 })
+    }
+
+    actions = { copy: copySelection, paste: pasteClipboard, selectAll: selectAllVisible, sendPaste }
 
     const snapshotSafe = (): GhosttySnapshot | null => {
       if (!term || !wasm_ok) return null
@@ -149,6 +365,22 @@ export function TerminalView(props: { workspaceId: string; paneId: number; sessi
         cursor: view?.cursor ?? undefined,
       })
       if (metrics) cell_h_px = metrics.cell_h
+      if (metrics && view) {
+        const next: GridGeo = {
+          cw: metrics.cell_w,
+          ch: metrics.cell_h,
+          start: view.startRow,
+          cols: view.cols,
+          rows: view.visibleRows || view.rows.length,
+          ox: surface.offsetLeft,
+          oy: surface.offsetTop,
+        }
+        const prev = geo()
+        // A reflow renumbers rows, so a selection cannot survive a column change.
+        if (prev && prev.cols !== next.cols && sel()) clearSelection()
+        if (!prev || (Object.keys(next) as (keyof GridGeo)[]).some((key) => prev[key] !== next[key])) setGeo(next)
+        captureLines(view)
+      }
       if (metrics?.compact && pinned_bottom) {
         const x = metrics.cursor_x * metrics.cell_w
         const margin = metrics.cell_w * 4
@@ -257,6 +489,27 @@ export function TerminalView(props: { workspaceId: string; paneId: number; sessi
     }
 
     const onKeyDown = (event: KeyboardEvent) => {
+      // An armed prefix owns every key, including the clipboard chords.
+      if (store.prefixMode()) return
+      const key = event.key.toLowerCase()
+      if (event.ctrlKey && event.shiftKey && !event.altKey && (key === 'c' || key === 'v')) {
+        event.stopPropagation()
+        if (key === 'v') {
+          // Native paste-as-plain-text lands in onPaste with no permission
+          // prompt; the canvas has no paste target, so move focus first.
+          if (event.target !== input) input.focus({ preventScroll: true })
+          return
+        }
+        event.preventDefault()
+        copySelection()
+        return
+      }
+      if (event.metaKey && !event.ctrlKey && !event.altKey && key === 'c' && sel()) {
+        event.preventDefault()
+        event.stopPropagation()
+        copySelection()
+        return
+      }
       if (store.shouldHandleKey(event)) return
       // Let the IME/soft keyboard deliver text through the input event instead.
       if (
@@ -270,6 +523,8 @@ export function TerminalView(props: { workspaceId: string; paneId: number; sessi
         return
       event.preventDefault()
       event.stopPropagation()
+      if ((sel() || bar()) && event.key === 'Escape') return clearSelection()
+      if (sel() && !['Control', 'Shift', 'Alt', 'Meta'].includes(event.key)) clearSelection()
       void sendTerminalInput(props.workspaceId, props.paneId, sessionId(), event).then(kick)
     }
 
@@ -340,6 +595,98 @@ export function TerminalView(props: { workspaceId: string; paneId: number; sessi
       scrollVertical(px)
     }
 
+    // A finished drag/long-press still emits a click; swallow it so it neither
+    // clears the new selection nor raises the soft keyboard.
+    let suppress_click = false
+    const suppressClick = () => {
+      suppress_click = true
+      window.setTimeout(() => {
+        suppress_click = false
+      }, 400)
+    }
+    const onClickCapture = (event: MouseEvent) => {
+      if (suppress_click) {
+        suppress_click = false
+        event.stopPropagation()
+        return
+      }
+      if (sel() || bar()) {
+        clearSelection()
+        // A dismiss tap must not also raise the soft keyboard.
+        if (Date.now() - last_touch_ms < 1000) event.stopPropagation()
+      }
+    }
+
+    let mouse_anchor: { point: CellPoint; x: number; y: number; dragged: boolean } | null = null
+    const onMouseMove = (event: MouseEvent) => {
+      if (!mouse_anchor) return
+      if (!mouse_anchor.dragged && Math.hypot(event.clientX - mouse_anchor.x, event.clientY - mouse_anchor.y) < 4) return
+      const head = pointAt(event.clientX, event.clientY)
+      if (!head) return
+      mouse_anchor.dragged = true
+      closeBar()
+      setHandles(false)
+      select(mouse_anchor.point, head)
+    }
+    const onMouseUp = () => {
+      if (mouse_anchor?.dragged) suppressClick()
+      mouse_anchor = null
+      window.removeEventListener('mousemove', onMouseMove)
+      window.removeEventListener('mouseup', onMouseUp)
+    }
+    const onMouseDown = (event: MouseEvent) => {
+      if (event.button !== 0 || Date.now() - last_touch_ms < 1000) return
+      // The host's own scrollbars are not text.
+      if (event.target !== surface) return
+      const point = pointAt(event.clientX, event.clientY)
+      if (!point) return
+      mouse_anchor = { point, x: event.clientX, y: event.clientY, dragged: false }
+      window.addEventListener('mousemove', onMouseMove)
+      window.addEventListener('mouseup', onMouseUp)
+    }
+    const onDoubleClick = (event: MouseEvent) => {
+      const point = pointAt(event.clientX, event.clientY)
+      if (!point) return
+      setHandles(false)
+      selectWordAt(point)
+      suppressClick()
+    }
+    const onContextMenu = (event: MouseEvent) => {
+      event.preventDefault()
+      // Touch long-press also raises contextmenu; the touch path owns that.
+      if (Date.now() - last_touch_ms < 1000 || !frame) return
+      const outer = frame.getBoundingClientRect()
+      setPasteBox(false)
+      setCopied(false)
+      setBar({ x: event.clientX - outer.left, y: event.clientY - outer.top + 6 })
+    }
+
+    let last_touch_ms = 0
+    let long_press = 0
+    let touch_select: CellPoint | null = null
+    // The long-pressed word stays whole while the finger extends past it.
+    let touch_word: { from: number; to: number; row: number } | null = null
+    const cancelLongPress = () => {
+      window.clearTimeout(long_press)
+      long_press = 0
+    }
+    const grabbedHandle = (touch: Touch): CellPoint | null => {
+      const range = sel()
+      if (!range || !handles()) return null
+      const rect = surface.getBoundingClientRect()
+      let best: { reach: number; anchor: CellPoint } | null = null
+      for (const which of ['start', 'end'] as const) {
+        const at = handlePoint(which)
+        if (!at) continue
+        const reach = Math.hypot(touch.clientX - rect.left - at.x, touch.clientY - rect.top - at.y)
+        // Dragging one handle pivots around the opposite end.
+        if (reach <= HANDLE_REACH_PX && (!best || reach < best.reach)) {
+          best = { reach, anchor: which === 'start' ? range.end : range.start }
+        }
+      }
+      return best?.anchor ?? null
+    }
+
     let pinch: { distance: number; zoom: number } | null = null
     let touch_pan: { x: number; y: number } | null = null
     const touchDistance = (touches: TouchList) => {
@@ -349,14 +696,56 @@ export function TerminalView(props: { workspaceId: string; paneId: number; sessi
       return Math.hypot(dx, dy)
     }
     const onTouchStart = (event: TouchEvent) => {
+      last_touch_ms = Date.now()
+      cancelLongPress()
       if (event.touches.length === 2) {
         pinch = { distance: touchDistance(event.touches), zoom }
         touch_pan = null
+        touch_select = null
       } else if (event.touches.length === 1) {
-        touch_pan = { x: event.touches[0].clientX, y: event.touches[0].clientY }
+        const touch = event.touches[0]
+        touch_pan = { x: touch.clientX, y: touch.clientY }
+        touch_word = null
+        touch_select = grabbedHandle(touch)
+        if (touch_select) {
+          closeBar()
+          return
+        }
+        const { clientX, clientY } = touch
+        long_press = window.setTimeout(() => {
+          long_press = 0
+          const point = pointAt(clientX, clientY)
+          if (!point) return
+          setHandles(true)
+          closeBar()
+          const word = selectWordAt(point)
+          touch_select = { x: word.from, row: point.row }
+          touch_word = { ...word, row: point.row }
+          navigator.vibrate?.(8)
+        }, LONG_PRESS_MS)
       }
     }
     const onTouchMove = (event: TouchEvent) => {
+      last_touch_ms = Date.now()
+      if (touch_select && event.touches.length === 1) {
+        if (event.cancelable) event.preventDefault()
+        const head = pointAt(event.touches[0].clientX, event.touches[0].clientY)
+        if (head && touch_word) {
+          const before = head.row < touch_word.row || (head.row === touch_word.row && head.x < touch_word.from)
+          const after = head.row > touch_word.row || (head.row === touch_word.row && head.x > touch_word.to)
+          select(
+            before ? head : { x: touch_word.from, row: touch_word.row },
+            after ? head : { x: touch_word.to, row: touch_word.row },
+          )
+        } else if (head) select(touch_select, head)
+        return
+      }
+      if (long_press && touch_pan && event.touches.length === 1) {
+        const moved = Math.hypot(event.touches[0].clientX - touch_pan.x, event.touches[0].clientY - touch_pan.y)
+        // Finger jitter must not cancel the hold, and must not pan either.
+        if (moved < 10) return
+        cancelLongPress()
+      }
       if (pinch && event.touches.length === 2) {
         event.preventDefault()
         const distance = touchDistance(event.touches)
@@ -376,8 +765,21 @@ export function TerminalView(props: { workspaceId: string; paneId: number; sessi
       scrollVertical(dy)
     }
     const onTouchEnd = () => {
+      last_touch_ms = Date.now()
+      cancelLongPress()
+      if (touch_select) {
+        touch_select = null
+        touch_word = null
+        suppressClick()
+        showBarAtSelection()
+      }
       pinch = null
       touch_pan = null
+    }
+
+    const onPaste = (event: ClipboardEvent) => {
+      event.preventDefault()
+      sendPaste(event.clipboardData?.getData('text/plain') ?? '')
     }
 
     const onScroll = () => {
@@ -435,6 +837,12 @@ export function TerminalView(props: { workspaceId: string; paneId: number; sessi
     input.addEventListener('compositionstart', onCompositionStart)
     input.addEventListener('compositionend', onCompositionEnd)
     input.addEventListener('blur', onBlur)
+    input.addEventListener('paste', onPaste)
+    scroller.addEventListener('click', onClickCapture, true)
+    scroller.addEventListener('mousedown', onMouseDown)
+    scroller.addEventListener('dblclick', onDoubleClick)
+    scroller.addEventListener('contextmenu', onContextMenu)
+    scroller.addEventListener('touchcancel', onTouchEnd)
     scroller.addEventListener('wheel', onWheel, { passive: false })
     scroller.addEventListener('scroll', onScroll, { passive: true })
     scroller.addEventListener('touchstart', onTouchStart, { passive: true })
@@ -472,6 +880,16 @@ export function TerminalView(props: { workspaceId: string; paneId: number; sessi
       input.removeEventListener('compositionstart', onCompositionStart)
       input.removeEventListener('compositionend', onCompositionEnd)
       input.removeEventListener('blur', onBlur)
+      input.removeEventListener('paste', onPaste)
+      cancelLongPress()
+      window.clearTimeout(copied_timer)
+      onMouseUp()
+      actions = null
+      scroller.removeEventListener('click', onClickCapture, true)
+      scroller.removeEventListener('mousedown', onMouseDown)
+      scroller.removeEventListener('dblclick', onDoubleClick)
+      scroller.removeEventListener('contextmenu', onContextMenu)
+      scroller.removeEventListener('touchcancel', onTouchEnd)
       scroller.removeEventListener('wheel', onWheel)
       scroller.removeEventListener('scroll', onScroll)
       scroller.removeEventListener('touchstart', onTouchStart)
@@ -490,6 +908,9 @@ export function TerminalView(props: { workspaceId: string; paneId: number; sessi
 
   return (
     <section
+      ref={(node) => {
+        frame = node
+      }}
       class="relative flex min-h-0 min-w-0 flex-1 flex-col bg-[var(--chat-black)]"
       onMouseDown={() => {
         const pane = store.openPanes().find((item) => item.pane_id === props.paneId)
@@ -509,7 +930,119 @@ export function TerminalView(props: { workspaceId: string; paneId: number; sessi
             canvas = node
           }}
         />
+        <div class="vt-select-layer" style={{ left: `${geo()?.ox ?? 0}px`, top: `${geo()?.oy ?? 0}px` }}>
+          <For each={highlight()}>
+            {(rect) => (
+              <div
+                class="vt-select-rect"
+                style={{
+                  left: `${rect.left}px`,
+                  top: `${rect.top}px`,
+                  width: `${rect.width}px`,
+                  height: `${geo()?.ch ?? 0}px`,
+                }}
+              />
+            )}
+          </For>
+          <Show when={handles()}>
+            <For each={['start', 'end'] as const}>
+              {(which) => (
+                <Show when={handlePoint(which)}>
+                  {(at) => <div class="vt-select-handle" style={{ left: `${at().x}px`, top: `${at().y}px` }} />}
+                </Show>
+              )}
+            </For>
+          </Show>
+        </div>
       </div>
+      <Show when={bar()}>
+        {(at) => (
+          <div
+            class="vt-actions"
+            style={{ '--vt-y': `${at().y}px` }}
+            ref={(node) => {
+              // Center on the anchor, then clamp inside the pane and safe areas.
+              const place = () => {
+                const pane = node.parentElement
+                if (!pane) return
+                const hi = pane.clientWidth - node.offsetWidth - 8
+                node.style.setProperty('--vt-w', `${node.offsetWidth}px`)
+                node.style.setProperty('--vt-left', `${Math.max(8, Math.min(hi, (bar()?.x ?? 0) - node.offsetWidth / 2))}px`)
+              }
+              // Re-place when the anchor moves or the contents change width.
+              createEffect(() => {
+                bar()
+                paste_box()
+                sel()
+                queueMicrotask(place)
+              })
+            }}
+            onMouseDown={(event) => {
+              // Keep terminal focus (and the soft keyboard state) while tapping.
+              if (!paste_box()) event.preventDefault()
+              event.stopPropagation()
+            }}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <Show
+              when={paste_box()}
+              fallback={
+                <div
+                  class="anim-menu flex overflow-hidden rounded-[10px] border border-[var(--border-muted)] bg-[var(--panel)] shadow-lg"
+                  role="toolbar"
+                  aria-label="Terminal selection"
+                >
+                  <span class="sr-only" aria-live="polite">{copied() ? 'Copied' : ''}</span>
+                  <Show when={sel()}>
+                    <button type="button" class="vt-action" onClick={() => actions?.copy()}>
+                      {copied() ? 'Copied' : 'Copy'}
+                    </button>
+                  </Show>
+                  <button type="button" class="vt-action" onClick={() => actions?.paste()}>
+                    Paste
+                  </button>
+                  <button type="button" class="vt-action" onClick={() => actions?.selectAll()}>
+                    Select all
+                  </button>
+                </div>
+              }
+            >
+              <div role="dialog" aria-label="Paste into terminal" class="anim-pop flex w-[15rem] flex-col gap-2 rounded-[10px] border border-[var(--border-muted)] bg-[var(--panel)] p-2 shadow-lg">
+                <textarea
+                  class="vt-paste-field"
+                  rows={2}
+                  placeholder="Clipboard access is blocked. Paste here."
+                  aria-label="Paste text for the terminal"
+                  ref={(node) => queueMicrotask(() => node.focus())}
+                  onPaste={(event) => {
+                    event.preventDefault()
+                    actions?.sendPaste(event.clipboardData?.getData('text/plain') ?? '')
+                  }}
+                  onKeyDown={(event) => {
+                    event.stopPropagation()
+                    if (event.key === 'Escape') closeBar()
+                  }}
+                />
+                <div class="flex justify-end">
+                  <button type="button" class="vt-action" onClick={closeBar}>
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    class="vt-action vt-action-primary"
+                    onClick={(event) => {
+                      const field = event.currentTarget.closest('.vt-actions')?.querySelector('textarea')
+                      actions?.sendPaste(field?.value ?? '')
+                    }}
+                  >
+                    Send
+                  </button>
+                </div>
+              </div>
+            </Show>
+          </div>
+        )}
+      </Show>
       <textarea
         class="ghostty-key-input"
         ref={(node) => {

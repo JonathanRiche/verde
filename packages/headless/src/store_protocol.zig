@@ -15,6 +15,7 @@ pub const METHOD_STATE_SNAPSHOT_REPLACE: []const u8 = "state.snapshot.replace";
 pub const METHOD_APP_STATE_SET: []const u8 = "state.app.set";
 pub const METHOD_WORKSPACE_UPSERT: []const u8 = "workspace.upsert";
 pub const METHOD_CHAT_THREAD_UPSERT: []const u8 = "chat.thread.upsert";
+pub const METHOD_CHAT_THREAD_ARCHIVE_SET: []const u8 = "chat.thread.archive.set";
 pub const METHOD_CHAT_THREAD_CLOSE: []const u8 = "chat.thread.close";
 pub const METHOD_CHAT_DRAFT_SET: []const u8 = "chat.draft.set";
 pub const METHOD_CHAT_MESSAGE_APPEND: []const u8 = "chat.message.append";
@@ -363,6 +364,14 @@ pub const ThreadUpsertRequest = struct {
     mutation: MutationHeader,
     workspace_id: []const u8,
     thread: Thread,
+};
+
+/// Change only archive/open state, preserving transcript and composer metadata.
+pub const ThreadArchiveSetRequest = struct {
+    mutation: MutationHeader,
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
+    archived: bool,
 };
 
 /// Close one thread: it leaves the composite snapshot and the durable

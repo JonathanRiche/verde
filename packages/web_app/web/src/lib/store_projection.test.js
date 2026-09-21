@@ -772,16 +772,19 @@ describe('requestTerminalOpen', () => {
 })
 
 describe('requestPaneClose', () => {
-  test('closes a native pane by its desktop identity', async () => {
+  test('native pane identity cannot create a desktop transport route', async () => {
+    const response = await requestPaneClose(async () => { throw new Error('unexpected RPC') },
+      'workspace-1', { kind: 'chat', native_pane_id: 42 })
+    expect(response.error?.message).toBe('Available in the desktop app')
+  })
+
+  test('a daemon terminal session can close even with a native pane identity', async () => {
     const calls = []
     await requestPaneClose(async (method, params) => {
       calls.push({ method, params })
-      return { id: 1, result: { panes: [] } }
-    }, 'workspace-1', { kind: 'chat', native_pane_id: 42 })
-
-    expect(calls).toEqual([
-      { method: 'pane.close', params: { workspace: 'workspace-1', pane: 42 } },
-    ])
+      return { result: { stopped: true } }
+    }, 'workspace-1', { kind: 'terminal', native_pane_id: 42, session_id: 'session-1' })
+    expect(calls).toEqual([{ method: 'session.kill', params: { id: 'session-1' } }])
   })
 
   test('falls back to killing a detached terminal session', async () => {

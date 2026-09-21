@@ -1,94 +1,277 @@
-import { For, Show, createMemo, createResource, createSignal } from 'solid-js'
+import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup } from 'solid-js'
+import type { JSX } from 'solid-js'
 
 import { fetchRpc, unwrapResult } from '../lib/live'
 import { store } from '../lib/store'
+import { COMMANDS } from '../lib/commands'
+import { notifications } from '../lib/notify'
 import { viewportDiagnostics } from '../lib/pwa'
+import { openHistory } from './History'
 import { loadTheme } from '../lib/theme'
 
-const COMMANDS = [
-  { id: 'new-thread', title: 'New chat thread', hint: 'Ctrl+T' },
-  { id: 'new-terminal', title: 'New terminal split', hint: 'Ctrl+Alt+T' },
-  { id: 'toggle-sidebar', title: 'Toggle sidebar', hint: 'Ctrl+S' },
-  { id: 'maximize', title: 'Zoom / unzoom pane', hint: 'Alt+Z' },
-  { id: 'settings', title: 'Open settings', hint: 'Ctrl+,' },
-]
+
+/** Keep keyboard focus in the visible sheet and return it to its opener. */
+function containModalFocus(open: () => boolean, panel: () => HTMLElement | undefined, initial?: () => HTMLElement | undefined) {
+  createEffect(() => {
+    if (!open()) return
+    const restore = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    let disposed = false
+    const focusable = () => [...(panel()?.querySelectorAll<HTMLElement>(
+      'button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), a[href], [tabindex]:not([tabindex="-1"])',
+    ) ?? [])].filter((element) => element.tabIndex >= 0 && element.getClientRects().length > 0)
+    queueMicrotask(() => {
+      if (!disposed) (initial?.() ?? focusable()[0] ?? panel())?.focus()
+    })
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== 'Tab' || event.isComposing) return
+      // The app maps plain Tab on buttons to focus_prompt. Modal navigation
+      // owns this key even when native focus movement needs no wrapping.
+      event.stopPropagation()
+      const root = panel()
+      if (!root) return
+      const items = focusable()
+      const first = items[0], last = items.at(-1)
+      const active = document.activeElement
+      if (!first || !root.contains(active) || active === root || (event.shiftKey ? active === first : active === last)) {
+        event.preventDefault()
+        ;(event.shiftKey ? last : first)?.focus()
+        if (!first) root.focus()
+      }
+    }
+    window.addEventListener('keydown', onKey, true)
+    onCleanup(() => {
+      disposed = true
+      window.removeEventListener('keydown', onKey, true)
+      if (restore?.isConnected) restore.focus()
+    })
+  })
+}
+
+type PaletteSection = 'threads' | 'panes' | 'workspaces' | 'app'
+// Same sections, same order, as the desktop palette (command_palette.zig Section).
+const SECTIONS: PaletteSection[] = ['threads', 'panes', 'workspaces', 'app']
+const HISTORY_COMMAND = 'thread.history'
+
+interface PaletteItem {
+  id: string
+  title: string
+  section: PaletteSection
+  /// Keyboard accelerator, rendered as kbd chips (desktop layouts only).
+  keys?: string
+  /// Muted trailing label (pane kind, "active").
+  hint?: string
+  desktop?: boolean
+  disabled?: boolean
+}
+
+function sectionOf(id: string): PaletteSection {
+  const prefix = id.slice(0, id.indexOf('.'))
+  return prefix === 'thread' ? 'threads' : prefix === 'pane' ? 'panes' : prefix === 'workspace' ? 'workspaces' : 'app'
+}
 
 export function Palette() {
   const [query, setQuery] = createSignal('')
+  const [active, setActive] = createSignal(0)
+  let list: HTMLUListElement | undefined
+  let panel: HTMLDivElement | undefined
+  let field: HTMLInputElement | undefined
+  containModalFocus(store.paletteOpen, () => panel, () => field)
+
   const results = createMemo(() => {
     const needle = query().trim().toLowerCase()
-    const panes = store.openPanes().map((pane) => ({
+    const has_workspace = Boolean(store.workspace())
+    const desktop_pane = store.focusedPane()?.native_pane_id != null
+    const commands: PaletteItem[] = COMMANDS.map((command) => ({
+      id: command.id,
+      // The catalog suffixes desktop-only titles; the row shows a tag instead.
+      title: command.title.replace(/ \(desktop\)$/, ''),
+      section: sectionOf(command.id),
+      keys: command.hint || undefined,
+      desktop: command.desktop,
+      disabled: command.desktop && !desktop_pane,
+    }))
+    const history: PaletteItem = { id: HISTORY_COMMAND, title: 'History', section: 'threads', disabled: !has_workspace }
+    const panes: PaletteItem[] = [
+      ...store.activePanes().map((pane) => ({ pane, hint: 'active' })),
+      ...store.openPanes().map((pane) => ({ pane, hint: pane.kind as string })),
+    ].map(({ pane, hint }) => ({
       id: `pane:${pane.workspace_id}:${pane.pane_id}`,
       title: store.paneTitle(pane),
-      hint: pane.kind,
+      section: 'panes',
+      hint,
     }))
-    const actives = store.activePanes().map((pane) => ({
-      id: `pane:${pane.workspace_id}:${pane.pane_id}`,
-      title: store.paneTitle(pane),
-      hint: 'active',
-    }))
-    const workspaces = store.workspaces().map((workspace) => ({
+    const workspaces: PaletteItem[] = store.workspaces().map((workspace) => ({
       id: `workspace:${workspace.workspace_id}`,
       title: workspace.label,
-      hint: 'workspace',
+      section: 'workspaces',
     }))
     const seen = new Set<string>()
-    return [...COMMANDS, ...actives, ...panes, ...workspaces].filter((item) => {
+    const matched = [history, ...commands, ...panes, ...workspaces].filter((item) => {
       if (seen.has(item.id)) return false
       seen.add(item.id)
       return item.title.toLowerCase().includes(needle)
     })
+    // Flat, section-ordered list: row index doubles as the keyboard cursor.
+    return SECTIONS.flatMap((section) => matched.filter((item) => item.section === section))
   })
 
-  const run = (id: string) => {
+  const close = () => {
+    setQuery('')
+    setActive(0)
+    store.setPaletteOpen(false)
+  }
+
+  const run = (item: PaletteItem | undefined) => {
+    if (!item || item.disabled) return
+    const id = item.id
+    if (id === HISTORY_COMMAND) {
+      const workspace = store.workspace()
+      close()
+      if (workspace) openHistory(workspace.workspace_id)
+      return
+    }
     if (id.startsWith('pane:')) {
       const [, workspaceId, paneId] = id.split(':')
       const pane = [...store.openPanes(), ...store.activePanes()].find(
-        (item) => item.workspace_id === workspaceId && item.pane_id === Number(paneId),
+        (row) => row.workspace_id === workspaceId && row.pane_id === Number(paneId),
       )
       if (pane) store.focusPane(pane)
-      store.setPaletteOpen(false)
+      close()
       return
     }
     if (id.startsWith('workspace:')) {
       store.selectWorkspace(id.slice('workspace:'.length))
-      store.setPaletteOpen(false)
+      close()
       return
     }
+    close()
     void store.runCommand(id)
   }
 
+  /// Move the cursor, skipping rows that cannot run.
+  const step = (delta: number) => {
+    const rows = results()
+    if (!rows.length) return
+    let next = active()
+    for (let tries = 0; tries < rows.length; tries += 1) {
+      next = (next + delta + rows.length) % rows.length
+      if (!rows[next].disabled) break
+    }
+    setActive(next)
+  }
+
+  createEffect(() => {
+    const rows = results()
+    // A new query (or a vanished row) lands on the first runnable result.
+    const index = active()
+    if (index >= rows.length || rows[index]?.disabled) {
+      const first = rows.findIndex((row) => !row.disabled)
+      setActive(first < 0 ? 0 : first)
+    }
+  })
+  createEffect(() => {
+    const index = active()
+    if (!store.paletteOpen()) return
+    queueMicrotask(() => list?.querySelector(`[data-index="${index}"]`)?.scrollIntoView({ block: 'nearest' }))
+  })
+
   return (
     <Show when={store.paletteOpen()}>
-      <div class="anim-fade fixed inset-0 z-40 bg-black/55" onClick={() => store.setPaletteOpen(false)}>
+      {/* absolute, not fixed: iOS standalone clips fixed boxes to its short
+          layout viewport; the app root is already sized from --app-height. */}
+      <div class="anim-fade absolute inset-0 z-40 bg-black/55" onClick={close}>
         <div
-          class="anim-pop mx-auto mt-[12vh] max-w-[560px] overflow-hidden rounded-[10px] border border-[var(--border-muted)] bg-[var(--panel)] shadow-[0_24px_80px_rgba(0,0,0,0.55)]"
+          class="palette-panel anim-pop mx-auto flex max-w-[560px] flex-col overflow-hidden border-[var(--border-muted)] bg-[var(--panel)] shadow-[0_24px_80px_rgba(0,0,0,0.55)] max-md:h-full max-md:pt-[var(--safe-top)] max-md:pb-[var(--safe-bottom)] md:mt-[12vh] md:max-h-[70%] md:rounded-[10px] md:border"
+          role="dialog"
+          aria-label="Command palette"
+          aria-modal="true"
+          tabindex="-1"
+          ref={node => { panel = node }}
           onClick={(event) => event.stopPropagation()}
         >
-          <input
-            class="w-full border-b border-[var(--border-muted)] bg-transparent px-4 py-3 text-[15px] outline-none placeholder:text-[var(--text-subtle)]"
-            placeholder="Jump to a pane, workspace, or command"
-            autofocus
-            onInput={(event) => setQuery(event.currentTarget.value)}
-            onKeyDown={(event) => {
-              if (event.key === 'Escape') store.setPaletteOpen(false)
-              if (event.key !== 'Enter' || event.isComposing || event.keyCode === 229) return
-              if (results()[0]) run(results()[0].id)
+          <div class="flex shrink-0 items-center border-b border-[var(--border-muted)]">
+            <input
+              class="min-w-0 flex-1 bg-transparent px-4 py-3 text-[16px] outline-none placeholder:text-[var(--text-subtle)] md:text-[15px]"
+              placeholder="Jump to a pane, workspace, or command"
+              role="combobox"
+              aria-expanded="true"
+              aria-controls="palette-results"
+              aria-activedescendant={results().length ? `palette-row-${active()}` : undefined}
+              autocomplete="off"
+              autocapitalize="none"
+              spellcheck={false}
+              ref={node => { field = node }}
+              onInput={(event) => {
+                setQuery(event.currentTarget.value)
+                setActive(0)
+              }}
+              onKeyDown={(event) => {
+                if (event.isComposing || event.keyCode === 229) return
+                if (event.key === 'Escape') close()
+                else if (event.key === 'ArrowDown') step(1)
+                else if (event.key === 'ArrowUp') step(-1)
+                else if (event.key === 'Enter') run(results()[active()])
+                else return
+                event.preventDefault()
+              }}
+            />
+            <button
+              type="button"
+              class="mr-1 min-h-[44px] shrink-0 rounded-[7px] px-3 text-[13px] text-[var(--text-muted)] hover:bg-[var(--accent-hover)] md:hidden"
+              onClick={close}
+            >
+              Cancel
+            </button>
+          </div>
+          <ul
+            id="palette-results"
+            role="listbox"
+            class="min-h-0 flex-1 overflow-y-auto overscroll-contain p-1.5 scrollbar-thin"
+            ref={(node) => {
+              list = node
             }}
-          />
-          <ul class="max-h-[50vh] overflow-y-auto p-1.5 scrollbar-thin">
-            <For each={results()} fallback={<li class="px-3 py-4 text-sm text-[var(--text-subtle)]">Nothing matches.</li>}>
-              {(item) => (
-                <li>
-                  <button
-                    type="button"
-                    class="flex w-full items-center justify-between rounded-[7px] px-3 py-2 text-left text-[14px] hover:bg-[var(--accent-hover)]"
-                    onClick={() => run(item.id)}
-                  >
-                    <span>{item.title}</span>
-                    <span class="mono text-[10px] text-[var(--text-subtle)]">{item.hint}</span>
-                  </button>
+          >
+            <For
+              each={results()}
+              fallback={
+                <li class="px-3 py-10 text-center text-[13px] text-[var(--text-subtle)]">
+                  <div class="text-[var(--text-muted)]">No matches for “{query().trim()}”</div>
+                  <div class="mt-1">Try a pane title, a workspace name, or a command.</div>
                 </li>
+              }
+            >
+              {(item, index) => (
+                <>
+                  <Show when={index() === 0 || results()[index() - 1].section !== item.section}>
+                    <li role="presentation" class="palette-section">{item.section}</li>
+                  </Show>
+                  <li
+                    id={`palette-row-${index()}`}
+                    data-index={index()}
+                    role="option"
+                    aria-selected={index() === active()}
+                    aria-disabled={item.disabled}
+                    title={item.disabled && item.desktop ? 'Needs a focused pane in the running desktop app' : undefined}
+                    class={`palette-row ${index() === active() ? 'palette-row-active' : ''} ${item.disabled ? 'palette-row-disabled' : ''}`}
+                    onMouseMove={() => {
+                      if (!item.disabled && active() !== index()) setActive(index())
+                    }}
+                    onClick={() => run(item)}
+                  >
+                    <span class="min-w-0 flex-1 truncate">{item.title}</span>
+                    <Show when={item.desktop}>
+                      <span class="palette-tag">Desktop</span>
+                    </Show>
+                    <Show when={item.hint}>
+                      <span class="mono shrink-0 text-[10px] text-[var(--text-subtle)]">{item.hint}</span>
+                    </Show>
+                    <Show when={item.keys}>
+                      <span class="hidden shrink-0 items-center gap-1 lg:flex" aria-hidden="true">
+                        <For each={item.keys!.split('+')}>{(key) => <kbd class="palette-kbd">{key}</kbd>}</For>
+                      </span>
+                    </Show>
+                  </li>
+                </>
               )}
             </For>
           </ul>
@@ -98,44 +281,127 @@ export function Palette() {
   )
 }
 
+/// iOS only delivers web notifications to a Home Screen install.
+function iosNeedsInstall(): boolean {
+  const ios =
+    /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+  const standalone =
+    (navigator as Navigator & { standalone?: boolean }).standalone === true ||
+    window.matchMedia('(display-mode: standalone)').matches
+  return ios && !standalone
+}
+
 export function Settings() {
+  let panel: HTMLDivElement | undefined
+  containModalFocus(store.settingsOpen, () => panel)
   const [theme] = createResource(loadTheme)
+  const permission = () => notifications.permission()
+  const blocked = () => permission() === 'denied' || permission() === 'unsupported'
+  const on = () => notifications.enabled() && permission() === 'granted'
+  // Permission is requested only from this tap, never on open.
+  const toggle = async () => {
+    if (on()) return notifications.setEnabled(false)
+    const state = permission() === 'default' ? await notifications.requestPermission() : permission()
+    notifications.setEnabled(state === 'granted')
+  }
+  const explain = () => {
+    if (permission() === 'unsupported') {
+      return iosNeedsInstall()
+        ? 'On iPhone and iPad, notifications need the installed app: tap Share, then Add to Home Screen, and open Verde from its icon.'
+        : 'This browser does not support notifications.'
+    }
+    if (permission() === 'denied') {
+      return 'Notifications are blocked for this site. Re-enable them from the lock icon in the address bar (or Settings → Notifications → Verde for the installed app), then reload.'
+    }
+    if (permission() === 'default') return 'Turning this on asks your browser for permission.'
+    return on()
+      ? 'You are told when an agent finishes, needs approval, or fails while you are looking elsewhere.'
+      : 'Permission is granted; notifications are switched off here.'
+  }
   return (
     <Show when={store.settingsOpen()}>
-      <div class="anim-fade fixed inset-0 z-40 bg-black/55" onClick={() => store.setSettingsOpen(false)}>
+      <div class="anim-fade absolute inset-0 z-40 bg-black/55" onClick={() => store.setSettingsOpen(false)}>
         <div
-          class="anim-pop absolute top-16 right-8 w-[28rem] max-w-[calc(100vw-2rem)] rounded-[10px] border border-[var(--border-muted)] bg-[var(--panel)] p-5 max-md:right-3 max-md:bottom-3 max-md:left-3 max-md:w-auto max-md:rounded-[14px]"
+          class="anim-pop absolute top-16 right-8 flex max-h-[calc(100%-5rem)] w-[28rem] max-w-[calc(100vw-2rem)] flex-col rounded-[10px] border border-[var(--border-muted)] bg-[var(--panel)] max-md:top-auto max-md:right-3 max-md:bottom-[calc(0.75rem+var(--safe-bottom))] max-md:left-3 max-md:max-h-[calc(100%-1.5rem-var(--safe-top)-var(--safe-bottom))] max-md:w-auto max-md:rounded-[14px]"
+          role="dialog"
+          aria-label="Settings"
+          aria-modal="true"
+          tabindex="-1"
+          ref={node => { panel = node }}
           onClick={(event) => event.stopPropagation()}
         >
-          <div class="wordmark text-[28px] leading-none">Settings</div>
-          <p class="mt-2 text-[13px] text-[var(--text-muted)]">
-            This client is a live projection of the running desktop daemon. Colors come from the same
-            verde.json / Omarchy path as the desktop app.
-          </p>
-          <p class="mt-2 text-[13px] text-[var(--text-muted)]">
-            On a phone, open this URL over HTTPS (Tailscale) and use <strong>Add to Home Screen</strong>
-            (Safari) or <strong>Install app</strong> (Chrome) for a standalone Verde icon.
-          </p>
-          <dl class="mt-4 space-y-0 text-[13px]">
-            <Row label="Theme" value={theme()?.active ?? '…'} />
-            <Row label="Theme source" value={theme()?.source ?? '…'} />
-            <Row label="Daemon" value={store.source()} />
-            <Row label="Socket" value={store.connected() ? 'websocket open' : 'reconnecting'} />
-            <Row label="Workspace" value={store.workspace()?.label ?? '—'} />
-            <Row label="Open panes" value={String(store.openPanes().length)} />
-            <Row label="Focused pane" value={store.focusedPane() ? store.paneTitle(store.focusedPane()!) : '—'} />
-            <Row label="Viewport" value={viewportDiagnostics()} />
-          </dl>
-          <button
-            type="button"
-            class="mt-5 w-full rounded-[7px] border border-[var(--border-muted)] py-2 text-[14px] hover:bg-[var(--accent-hover)]"
-            onClick={() => store.setSettingsOpen(false)}
-          >
-            Close
-          </button>
+          <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain p-5 pb-2 scrollbar-thin">
+            <div class="wordmark text-[28px] leading-none">Settings</div>
+            <p class="mt-2 text-[13px] text-[var(--text-muted)]">
+              This client is a live projection of the running desktop daemon.
+            </p>
+
+            <SettingsSection title="Appearance" note="Colors come from the same verde.json / Omarchy path as the desktop app.">
+              <Row label="Theme" value={theme()?.active ?? '…'} />
+              <Row label="Theme source" value={theme()?.source ?? '…'} />
+            </SettingsSection>
+
+            <SettingsSection title="Notifications">
+              <div class="flex min-h-[44px] items-center justify-between gap-4 border-b border-[var(--border-muted)] py-2">
+                <span id="settings-notify-label">Agent notifications</span>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={on()}
+                  aria-labelledby="settings-notify-label"
+                  aria-describedby="settings-notify-help"
+                  class="settings-switch"
+                  disabled={blocked()}
+                  onClick={() => void toggle()}
+                />
+              </div>
+              <p
+                id="settings-notify-help"
+                class={`mt-2 text-[12px] leading-[1.45] ${blocked() ? 'text-[var(--warning)]' : 'text-[var(--text-muted)]'}`}
+              >
+                {explain()}
+              </p>
+            </SettingsSection>
+
+            <SettingsSection
+              title="Connection"
+              note="On a phone, open this URL over HTTPS (Tailscale) and use Add to Home Screen (Safari) or Install app (Chrome) for a standalone Verde icon."
+            >
+              <Row label="Daemon" value={store.source()} />
+              <Row label="Socket" value={store.connected() ? 'websocket open' : 'reconnecting'} />
+              <Row label="Workspace" value={store.workspace()?.label ?? '—'} />
+            </SettingsSection>
+
+            <SettingsSection title="Diagnostics">
+              <Row label="Open panes" value={String(store.openPanes().length)} />
+              <Row label="Focused pane" value={store.focusedPane() ? store.paneTitle(store.focusedPane()!) : '—'} />
+              <Row label="Viewport" value={viewportDiagnostics()} />
+            </SettingsSection>
+          </div>
+          <div class="shrink-0 p-5 pt-3">
+            <button
+              type="button"
+              class="min-h-[44px] w-full rounded-[7px] border border-[var(--border-muted)] text-[14px] hover:bg-[var(--accent-hover)] lg:min-h-0 lg:py-2"
+              onClick={() => store.setSettingsOpen(false)}
+            >
+              Close
+            </button>
+          </div>
         </div>
       </div>
     </Show>
+  )
+}
+
+function SettingsSection(props: { title: string; note?: string; children: JSX.Element }) {
+  return (
+    <section class="mt-5 text-[13px]">
+      <h3 class="palette-section !px-0">{props.title}</h3>
+      <dl>{props.children}</dl>
+      <Show when={props.note}>
+        <p class="mt-2 text-[12px] leading-[1.45] text-[var(--text-subtle)]">{props.note}</p>
+      </Show>
+    </section>
   )
 }
 
@@ -354,7 +620,7 @@ function Row(props: { label: string; value: string }) {
   return (
     <div class="flex items-center justify-between gap-4 border-b border-[var(--border-muted)] py-2">
       <dt class="text-[var(--text-subtle)]">{props.label}</dt>
-      <dd class="mono text-right text-[12px]">{props.value}</dd>
+      <dd class="mono min-w-0 break-words text-right text-[12px]">{props.value}</dd>
     </div>
   )
 }

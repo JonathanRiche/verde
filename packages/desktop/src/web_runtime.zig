@@ -109,7 +109,7 @@ pub const Router = struct {
 };
 
 pub fn allowedMethod(method: []const u8) bool {
-    inline for (.{ "chat.turn.start", "chat.turn.list", "chat.turn.tail", "chat.turn.cancel", "chat.turn.approve", "chat.thread.get", "workspace.repository.manifest.get", "provider.models.list" }) |allowed| {
+    inline for (.{ "chat.turn.start", "chat.turn.list", "chat.turn.tail", "chat.turn.cancel", "chat.turn.approve", "chat.turn.steer", "chat.followup", "chat.thread.get", "workspace.repository.manifest.get", "provider.models.list" }) |allowed| {
         if (std.mem.eql(u8, method, allowed)) return true;
     }
     return false;

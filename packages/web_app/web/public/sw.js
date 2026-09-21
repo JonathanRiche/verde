@@ -1,4 +1,4 @@
-const CACHE = 'verde-web-v5'
+const CACHE = 'verde-web-v6'
 
 const PRECACHE = [
   '/',
@@ -87,4 +87,20 @@ self.addEventListener('fetch', (event) => {
       })
       .catch(() => caches.match(request)),
   )
+})
+
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close()
+  const key = event.notification.data?.key
+  if (typeof key !== 'string') return
+  event.waitUntil((async () => {
+    const clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true })
+    const client = clients.find((item) => new URL(item.url).origin === self.location.origin)
+    if (client) {
+      await client.focus()
+      client.postMessage({ type: 'verde:notification-focus', key })
+    } else {
+      await self.clients.openWindow('/?notification-pane=' + encodeURIComponent(key))
+    }
+  })())
 })

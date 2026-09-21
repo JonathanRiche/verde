@@ -11,6 +11,9 @@ import { PdfPages } from './PdfPages'
 // threading state through the pane tree.
 const [viewerPath, setViewerPath] = createSignal<string | null>(null)
 
+/// Read by the global notice toast.
+export const fileViewerOpen = () => viewerPath() != null
+
 export function openFileViewer(path: string): void {
   setViewerPath(path)
 }

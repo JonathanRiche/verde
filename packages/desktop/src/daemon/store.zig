@@ -140,6 +140,7 @@ pub const Mutation = union(enum) {
     workspace_repository_binding_remove: WorkspaceRepositoryBindingRemoveRequest,
     thread_upsert: store_protocol.ThreadUpsertRequest,
     thread_close: store_protocol.ThreadCloseRequest,
+    thread_archive_set: store_protocol.ThreadArchiveSetRequest,
     chat_draft_set: store_protocol.ChatDraftSetRequest,
     message_append: store_protocol.MessageAppendRequest,
     surface_upsert: store_protocol.SurfaceUpsertRequest,
@@ -620,6 +621,7 @@ pub const Store = struct {
             .workspace_repository_binding_upsert => |request| self.applyWorkspaceRepositoryBindingUpsert(request) catch |err| return mapStoreError(err),
             .workspace_repository_binding_remove => |request| self.applyWorkspaceRepositoryBindingRemove(request) catch |err| return mapStoreError(err),
             .thread_upsert => |request| self.applyThread(request) catch |err| return mapStoreError(err),
+            .thread_archive_set => |request| applied = self.applyThreadArchiveSet(request) catch |err| return mapStoreError(err),
             .thread_close => |request| applied = self.applyThreadClose(request) catch |err| return mapStoreError(err),
             .chat_draft_set => |request| self.applyChatDraftSet(request) catch |err| return mapStoreError(err),
             .message_append => |request| self.applyMessageAppend(request, next_revision_sql) catch |err| return mapStoreError(err),
@@ -1673,6 +1675,11 @@ pub const Store = struct {
             .thread_upsert => |request| self.fingerprintValue(.{
                 .workspace_id = request.workspace_id,
                 .thread = request.thread,
+            }),
+            .thread_archive_set => |request| self.fingerprintValue(.{
+                .workspace_id = request.workspace_id,
+                .local_thread_id = request.local_thread_id,
+                .archived = request.archived,
             }),
             .thread_close => |request| self.fingerprintValue(.{
                 .workspace_id = request.workspace_id,
@@ -3102,6 +3109,19 @@ pub const Store = struct {
         return true;
     }
 
+    fn applyThreadArchiveSet(self: *Self, request: store_protocol.ThreadArchiveSetRequest) !bool {
+        const row = (try self.conn.row(
+            "select t.id, t.archived, t.open from threads t join workspaces w on w.id = t.workspace_id where w.workspace_id = ?1 and t.local_thread_id = ?2",
+            .{ request.workspace_id, request.local_thread_id },
+        )) orelse return error.ResourceNotFound;
+        defer row.deinit();
+        const archived = boolToInt(request.archived);
+        const open = boolToInt(!request.archived);
+        if (row.int(1) == archived and row.int(2) == open) return false;
+        try self.conn.exec("update threads set archived = ?1, open = ?2 where id = ?3", .{ archived, open, row.int(0) });
+        return true;
+    }
+
     fn applyThread(self: *Self, request: store_protocol.ThreadUpsertRequest) !void {
         const thread = request.thread;
         const workspace_row_id = (try self.conn.row(
@@ -4009,6 +4029,7 @@ fn mutationHeader(mutation: Mutation) store_protocol.MutationHeader {
         .workspace_repository_binding_remove => |request| request.mutation,
         .thread_upsert => |request| request.mutation,
         .thread_close => |request| request.mutation,
+        .thread_archive_set => |request| request.mutation,
         .chat_draft_set => |request| request.mutation,
         .message_append => |request| request.mutation,
         .surface_upsert => |request| request.mutation,
@@ -4030,6 +4051,7 @@ fn mutationOperation(mutation: Mutation) []const u8 {
         .workspace_repository_binding_remove => WORKSPACE_REPOSITORY_BINDING_REMOVE_OPERATION,
         .thread_upsert => THREAD_UPSERT_OPERATION,
         .thread_close => THREAD_CLOSE_OPERATION,
+        .thread_archive_set => store_protocol.METHOD_CHAT_THREAD_ARCHIVE_SET,
         .chat_draft_set => CHAT_DRAFT_SET_OPERATION,
         .message_append => MESSAGE_APPEND_OPERATION,
         .surface_upsert => SURFACE_UPSERT_OPERATION,
@@ -4100,6 +4122,9 @@ fn validateMutation(mutation: Mutation) StoreError!void {
             if (request.thread.messages.len != 0) return error.InvalidParams;
             try validateThreadRoute(request.thread);
             _ = try firstAttachment(request.thread.draft_image, request.thread.draft_images);
+        },
+        .thread_archive_set => |request| {
+            if (request.workspace_id.len == 0 or request.local_thread_id.len == 0) return error.InvalidParams;
         },
         .thread_close => |request| {
             if (request.workspace_id.len == 0 or request.local_thread_id.len == 0) return error.InvalidParams;

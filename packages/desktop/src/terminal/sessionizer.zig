@@ -1783,7 +1783,7 @@ const ChatEvent = struct {
 };
 
 const SteerAudit = struct {
-    const State = enum { in_flight, provider_accepted, published };
+    const State = enum { in_flight, uncertain, provider_accepted, published };
 
     steer_id: []u8,
     prompt: []u8,
@@ -4005,6 +4005,18 @@ pub const Daemon = struct {
                 break :blk null;
             };
             if (req) |value| decoded_mutation = .{ .thread_upsert = value };
+        } else if (std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_ARCHIVE_SET)) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.ThreadArchiveSetRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_mutation = .{ .thread_archive_set = value };
         } else if (std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_CLOSE)) {
             const req = std.json.parseFromValueLeaky(
                 store_protocol.ThreadCloseRequest,
@@ -7048,6 +7060,13 @@ pub const Daemon = struct {
     /// acknowledgement, retries return the original sequenced audit event and
     /// never call the provider again.
     fn chatTurnSteerResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        // Match turn.start: draining takes precedence over malformed params.
+        // This handler runs unlocked; retain the acceptance check below too.
+        lockDaemon(self);
+        const draining = !self.accepting_mutations;
+        self.mutex.unlock();
+        if (draining) return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "daemon is preparing shutdown and is not accepting mutations");
+
         if (params != .object) return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object");
         const turn_id = jsonString(params.object.get("turn_id") orelse .null) orelse
             return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing turn_id");
@@ -7111,6 +7130,11 @@ pub const Daemon = struct {
                     turn.mutex.unlock();
                     self.mutex.unlock();
                     return response;
+                },
+                .uncertain => {
+                    turn.mutex.unlock();
+                    self.mutex.unlock();
+                    return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "steer delivery is unconfirmed");
                 },
                 .in_flight => {
                     turn.mutex.unlock();
@@ -7217,9 +7241,10 @@ pub const Daemon = struct {
         lockTurn(turn);
         const audit_index = findSteerAuditIndex(turn, steer_id) orelse unreachable;
         if (!provider_accepted) {
-            var rejected = turn.steers.orderedRemove(audit_index);
+            // Provider errors include lost acknowledgements after acceptance.
+            // Keep the identity reserved so retries never contact it twice.
+            turn.steers.items[audit_index].state = .uncertain;
             turn.mutex.unlock();
-            rejected.deinit(self.allocator);
             return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "provider could not accept steering for this turn");
         }
         defer turn.mutex.unlock();
@@ -9324,6 +9349,7 @@ fn isStoreMethod(method: []const u8) bool {
         std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_BINDING_UPSERT) or
         std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_BINDING_REMOVE) or
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_UPSERT) or
+        std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_ARCHIVE_SET) or
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_CLOSE) or
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_DRAFT_SET) or
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_MESSAGE_APPEND) or
@@ -9431,6 +9457,7 @@ fn storeMutationCommittedHook(context: *anyopaque, mutation: *const daemon_store
         .workspace_repository_binding_upsert => |request| daemon.appendJournalEntry(.workspace, request.workspace_id, request.workspace_id, revision),
         .workspace_repository_binding_remove => |request| daemon.appendJournalEntry(.workspace, request.workspace_id, request.workspace_id, revision),
         .thread_upsert => |request| daemon.appendJournalEntry(.chat_thread, request.thread.local_thread_id, request.workspace_id, revision),
+        .thread_archive_set => |request| daemon.appendJournalEntry(.chat_thread, request.local_thread_id, request.workspace_id, revision),
         .thread_close => |request| daemon.appendJournalEntry(.chat_thread, request.local_thread_id, request.workspace_id, revision),
         .chat_draft_set => |request| daemon.appendJournalEntry(.chat_thread, request.local_thread_id, request.workspace_id, revision),
         .message_append => |request| daemon.appendJournalEntry(.chat_thread, request.thread_id, request.workspace_id, revision),
@@ -9503,6 +9530,7 @@ fn mutationHeader(mutation: daemon_store.Mutation) store_protocol.MutationHeader
         .workspace_repository_binding_remove => |request| request.mutation,
         .thread_upsert => |request| request.mutation,
         .thread_close => |request| request.mutation,
+        .thread_archive_set => |request| request.mutation,
         .chat_draft_set => |request| request.mutation,
         .message_append => |request| request.mutation,
         .surface_upsert => |request| request.mutation,
@@ -12253,11 +12281,13 @@ fn retentionExpiredForDaemon(start_ms: i64, now_ms: i64, retention_ms: i64) bool
 
 fn handleSessionizerServerRequest(raw_context: *anyopaque, request: []u8) anyerror![]u8 {
     const context: *SessionizerServerContext = @ptrCast(@alignCast(raw_context));
-    const daemon = context.daemon;
-    defer {
-        std.crypto.secureZero(u8, request);
-        daemon.allocator.free(request);
-    }
+    defer context.daemon.allocator.free(request);
+    return handleSessionizerRequestBytes(context.daemon, request);
+}
+
+/// Dispatch and erase borrowed transport bytes before the owner releases them.
+fn handleSessionizerRequestBytes(daemon: *Daemon, request: []u8) anyerror![]u8 {
+    defer std.crypto.secureZero(u8, request);
     const trimmed = std.mem.trim(u8, request, "\r");
 
     // One envelope parse outside lockDaemon classifies W5 slow-work vs store vs
@@ -15907,6 +15937,15 @@ test "Codex daemon steering uses provider identities and deduplicates ambiguous 
     try std.testing.expectEqualStrings("invalid_state", rejected.value.object.get("error").?.object.get("code").?.string);
     try std.testing.expectEqual(@as(usize, 2), provider_calls);
     try std.testing.expectEqual(@as(usize, 1), turn.events.items.len);
+    const uncertain_retry_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":4,"method":"chat.followup","params":{"workspace_id":"steer-workspace","local_thread_id":"local-thread","steer_id":"steer-rejected","prompt":"reject steer"}}
+    );
+    defer allocator.free(uncertain_retry_response);
+    var uncertain_retry = try std.json.parseFromSlice(std.json.Value, allocator, uncertain_retry_response, .{});
+    defer uncertain_retry.deinit();
+    try std.testing.expectEqualStrings("steer delivery is unconfirmed", uncertain_retry.value.object.get("error").?.object.get("message").?.string);
+    try std.testing.expectEqual(@as(usize, 2), provider_calls);
+    try std.testing.expectEqual(@as(usize, 2), turn.steers.items.len);
 }
 
 test "Codex daemon steering rejects a missing active turn identity without audit" {
@@ -17819,6 +17858,18 @@ fn attachTestStoreServiceWithFault(daemon: *Daemon, db_path: []const u8, fault: 
     daemon.store_service = service;
 }
 
+fn attachTestRuntimeStoreService(daemon: *Daemon, db_path: []const u8) !void {
+    const service = try daemon.allocator.create(StoreService);
+    errdefer daemon.allocator.destroy(service);
+    service.* = .{
+        .store = try daemon_store.Store.initWithRuntimeIdentity(daemon.allocator, db_path, .none, .{
+            .runtime_id = daemon.runtime_id,
+            .instance_id = daemon.instance_id,
+        }),
+    };
+    daemon.store_service = service;
+}
+
 fn detachTestStoreService(daemon: *Daemon) void {
     if (daemon.store_service) |service| {
         service.store.deinit();
@@ -17961,12 +18012,9 @@ test "wrong request targets scrub access secrets before rejection" {
             "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"{s}\",\"params\":{{\"{s}\":\"{s}\"}},\"target\":{{\"runtime_id\":\"{s}\",\"instance_id\":\"{s}\"}}}}",
             .{ case.method, case.field, secret, &wrong_runtime, daemon.instance_id },
         );
-        defer {
-            std.crypto.secureZero(u8, request);
-            allocator.free(request);
-        }
+        defer allocator.free(request);
         const secret_start = std.mem.indexOf(u8, request, secret) orelse return error.TestSecretMissing;
-        const response = try daemon.handleRequest(request);
+        const response = try handleSessionizerRequestBytes(&daemon, request);
         defer allocator.free(response);
         try expectErrorCodeMessage(
             response,
@@ -18159,7 +18207,12 @@ fn seedLegacyAcceptanceWorker(store: *daemon_store.Store, turn_id: []const u8) !
         "insert into chat_turns (turn_id,workspace_id,local_thread_id,status,started_at_ms,provider,user_message_id) values (?1,'ownership-workspace','ownership-thread','running',10,'codex','ownership-user')",
         .{turn_id},
     );
-    try sweepInterruptedChatTurns(store);
+    // Reproduce the historical interrupted ledger, not today's sweep, which
+    // adds a diagnostic and replay guard that deliberately forbid adoption.
+    try store.conn.exec(
+        "update chat_turns set status = 'interrupted', finished_at_ms = 101 where turn_id = ?1",
+        .{turn_id},
+    );
 }
 
 fn seedNewAcceptanceWorker(store: *daemon_store.Store, turn_id: []const u8) !void {
@@ -18362,7 +18415,7 @@ test "repository manifest RPCs preserve legacy projection and receipt semantics"
 
     var daemon = Daemon.init(allocator);
     defer daemon.deinit();
-    try attachTestStoreService(&daemon, db_path);
+    try attachTestRuntimeStoreService(&daemon, db_path);
     defer detachTestStoreService(&daemon);
     const client_id = try registerTestClientId(&daemon, allocator);
     defer allocator.free(client_id);
@@ -19857,7 +19910,7 @@ test "durable reads decode canonical and historical daemon chat role codes" {
 
     var daemon = Daemon.init(allocator);
     defer daemon.deinit();
-    try attachTestStoreService(&daemon, db_path);
+    try attachTestRuntimeStoreService(&daemon, db_path);
     defer detachTestStoreService(&daemon);
 
     lockStoreService(daemon.store_service.?);
@@ -20092,7 +20145,7 @@ test "durable reads decode canonical and historical daemon chat role codes" {
     try std.testing.expect(first_thread_cursor.len <= store_protocol.MAX_PAGE_CURSOR_BYTES);
     try std.testing.expectEqual(
         @as(usize, 1),
-        try headless.pagination.decode(first_thread_cursor, .thread, first_thread_revision, "ws-dto"),
+        try headless.pagination.decode(first_thread_cursor, .thread, first_thread_revision, "ws-dto|-1|0|"),
     );
 
     const second_thread_page_request = try std.fmt.allocPrint(
@@ -20445,4 +20498,78 @@ test "thread sync commit persists across reload and rejects stale provider reads
     try std.testing.expectEqual(@as(usize, 1), loaded.thread.messages.len);
     try std.testing.expectEqualStrings("canonical reply", loaded.thread.messages[0].body);
     try std.testing.expect(std.mem.startsWith(u8, loaded.thread.messages[0].message_id, "turn:sync:"));
+}
+
+test "archive mutation preserves metadata and large transcripts with normal mutation guards" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+    const client_id = try registerTestClientId(&daemon, allocator);
+    defer allocator.free(client_id);
+    const store = &daemon.store_service.?.store;
+    _ = try store.upsertWorkspace(.{
+        .mutation = .{ .client_id = client_id, .request_key = "archive-ws" },
+        .workspace = .{ .workspace_id = "archive-ws", .label = "WS", .path = "/tmp" },
+    });
+    const images = [_]store_protocol.Attachment{
+        .{ .path = "/tmp/a.png", .mime = "image/png", .byte_size = 12 },
+        .{ .path = "/tmp/b.png", .mime = "image/png", .byte_size = 34 },
+    };
+    const initial = try store.upsertThread(.{
+        .mutation = .{ .client_id = client_id, .request_key = "archive-thread" },
+        .workspace_id = "archive-ws",
+        .thread = .{ .local_thread_id = "archive-thread", .title = "Saved", .draft = "draft", .draft_image = images[0], .draft_images = &images, .tui_dock_id = 77 },
+    });
+    try store.conn.execNoArgs("insert into messages (thread_id, sort_index, role, author, body, message_id) select id, 0, 0, 'You', hex(zeroblob(4500000)), 'large' from threads where local_thread_id = 'archive-thread'");
+    const metadata_sql = "select title || draft || draft_image_path || draft_image_mime || draft_image_byte_size || draft_images_json || tui_dock_id from threads where local_thread_id = 'archive-thread'";
+    const before_row = (try store.conn.row(metadata_sql, .{})).?;
+    const before = try allocator.dupe(u8, before_row.text(0));
+    before_row.deinit();
+    defer allocator.free(before);
+
+    var revision = initial.store_revision;
+    for ([_]bool{ true, false }, 0..) |archived, index| {
+        const request = try std.fmt.allocPrint(allocator,
+            \\{{"jsonrpc":"2.0","id":1,"method":"chat.thread.archive.set","params":{{"mutation":{{"client_id":"{s}","request_key":"archive-{d}","expected_store_revision":{d}}},"workspace_id":"archive-ws","local_thread_id":"archive-thread","archived":{s}}}}}
+        , .{ client_id, index, revision, if (archived) "true" else "false" });
+        defer allocator.free(request);
+        const response = try daemon.handleRequest(request);
+        defer allocator.free(response);
+        try std.testing.expect(response.len < 1024);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("result") != null);
+        revision = @intCast(parsed.value.object.get("result").?.object.get("store_revision").?.integer);
+        const replay = try daemon.handleRequest(request);
+        defer allocator.free(replay);
+        try std.testing.expectEqualStrings(response, replay);
+        const state = (try store.conn.row("select archived, open from threads where local_thread_id = 'archive-thread'", .{})).?;
+        defer state.deinit();
+        try std.testing.expectEqual(@as(i64, @intFromBool(archived)), state.int(0));
+        try std.testing.expectEqual(@as(i64, @intFromBool(!archived)), state.int(1));
+        const after = (try store.conn.row(metadata_sql, .{})).?;
+        defer after.deinit();
+        try std.testing.expectEqualStrings(before, after.text(0));
+    }
+    const body = (try store.conn.row("select length(body) from messages where message_id = 'large'", .{})).?;
+    defer body.deinit();
+    try std.testing.expectEqual(@as(i64, 9_000_000), body.int(0));
+    const stale = try std.fmt.allocPrint(allocator,
+        \\{{"jsonrpc":"2.0","id":1,"method":"chat.thread.archive.set","params":{{"mutation":{{"client_id":"{s}","request_key":"stale-archive","expected_store_revision":0}},"workspace_id":"archive-ws","local_thread_id":"archive-thread","archived":true}}}}
+    , .{client_id});
+    defer allocator.free(stale);
+    const stale_response = try daemon.handleRequest(stale);
+    defer allocator.free(stale_response);
+    try expectErrorCodeMessage(stale_response, allocator, headless.protocol.ERR_CONFLICT, "store revision conflict");
+    const unknown = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"chat.thread.archive.set","params":{"mutation":{"client_id":"unregistered","request_key":"unknown-archive"},"workspace_id":"archive-ws","local_thread_id":"archive-thread","archived":true}}
+    );
+    defer allocator.free(unknown);
+    try std.testing.expect(std.mem.indexOf(u8, unknown, "unknown client_id") != null);
 }

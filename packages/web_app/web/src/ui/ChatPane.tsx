@@ -1,14 +1,23 @@
 import { For, Show, createEffect, createMemo, createSignal, onCleanup } from 'solid-js'
 
 import { composerEnterShouldSubmit } from '../lib/composer_input'
+import { registerChatCommandPickers } from '../lib/commands'
+import { focusChatPrompt } from '../lib/command_requests'
 import { chatImageUrl } from '../lib/live'
 import { renderMarkdown as renderSafeMarkdown } from '../lib/markdown'
 import { clipboardImageFiles, store } from '../lib/store'
 import { type Attachment, type LivePane, type Message, isSubagentThreadId } from '../lib/types'
 import { effortLabel, effortOptionsIn, modelOptionsFor, modelSupportsFast, variantOptionsIn } from '../lib/models'
-import { handleFileCitationClick } from './FileViewer'
+import { handleFileCitationClick, openFileViewer } from './FileViewer'
 import { Icon, ProviderGlyph, ZoomButton } from './Icons'
 import { PaneActionsButton } from './Sidebar'
+
+import { ComposerFollowup } from './ComposerFollowup'
+import { ComposerSuggest, ComposerCommandStatus, type ComposerSuggestControls } from './ComposerSuggest'
+import { ProviderReadiness } from './ProviderReadiness'
+import { UsageCard } from './UsageCard'
+import { parseUsageSummary } from '../lib/usage'
+import { copyText, decorateCodeBlocks, emphasisSpans } from '../lib/highlight'
 
 // Shared 1s ticker driving working timers and group elapsed labels.
 const [nowMs, setNowMs] = createSignal(Date.now())
@@ -288,7 +297,15 @@ export function ChatPane(props: { pane: LivePane }) {
         <ProviderGlyph provider={props.pane.provider} />
         <div class="min-w-0 flex-1 truncate text-[14px] font-medium">{store.paneTitle(props.pane)}</div>
         <Show when={props.pane.send_pending}>
-          <span class="text-[11px] tracking-wide text-[var(--accent)]">Working</span>
+          <Show
+            when={store.pendingApproval(props.pane)}
+            fallback={<span class="shrink-0 whitespace-nowrap text-[11px] tracking-wide text-[var(--accent)]">Working</span>}
+          >
+            <span class="shrink-0 whitespace-nowrap text-[11px] tracking-wide text-[var(--warning)]">
+              <span class="lg:hidden">Needs approval</span>
+              <span class="hidden lg:inline">Waiting for approval</span>
+            </span>
+          </Show>
         </Show>
         <ZoomButton pane={props.pane} />
         <PaneActionsButton pane={props.pane} />
@@ -327,6 +344,8 @@ export function ChatPane(props: { pane: LivePane }) {
           </Show>
         </div>
       </div>
+      <ApprovalCard pane={props.pane} />
+      <Show when={!subagent()}><ComposerFollowup pane={props.pane} /></Show>
       <Show when={!subagent()} fallback={<SubagentComposerBanner />}>
         <Composer pane={props.pane} focused={focused()} />
       </Show>
@@ -496,18 +515,29 @@ function Chevron(props: { open: boolean }) {
   )
 }
 
-function CopyPill(props: { payload: string }) {
+function CopyPill(props: { payload: string; label?: string; class?: string }) {
+  const [status, setStatus] = createSignal('')
+  let timer: ReturnType<typeof setTimeout> | undefined
+  onCleanup(() => clearTimeout(timer))
   return (
-    <button
-      type="button"
-      class="shrink-0 rounded-[5px] bg-[rgba(56,57,62,0.34)] px-2.5 py-1 text-[11px] text-[var(--text-muted)] hover:bg-[rgba(72,73,79,0.82)] hover:text-white"
-      onClick={(event) => {
-        event.stopPropagation()
-        void navigator.clipboard?.writeText(props.payload)
-      }}
-    >
-      Copy
-    </button>
+    <span class="copy-control">
+      <button
+        type="button"
+        class={props.class ?? 'copy-pill'}
+        aria-label={props.label ?? 'Copy output'}
+        title={props.label ?? 'Copy output'}
+        onClick={async (event) => {
+          event.stopPropagation()
+          clearTimeout(timer)
+          try {
+            await copyText(props.payload)
+            setStatus('Copied')
+            timer = setTimeout(() => setStatus(''), 1800)
+          } catch { setStatus('Copy failed. Select and copy manually.') }
+        }}
+      >Copy</button>
+      <span class="copy-status" role="status" aria-live="polite">{status()}</span>
+    </span>
   )
 }
 
@@ -697,7 +727,7 @@ function parseDiffV2(rest: string): DiffFileEntry[] | null {
     const fields = header.slice('FILE\t'.length).split('\t')
     if (fields.length !== 4) return null
     const [path_len, additions, deletions, patch_len] = fields.map(Number)
-    if (![path_len, additions, deletions, patch_len].every(Number.isFinite)) return null
+    if (![path_len, additions, deletions, patch_len].every((value) => Number.isSafeInteger(value) && value >= 0)) return null
     if (path_len > bytes.length - offset || patch_len > bytes.length - offset - path_len) return null
     const path = decoder.decode(bytes.subarray(offset, offset + path_len))
     offset += path_len
@@ -725,6 +755,7 @@ function parseDiffV1(rest: string): DiffFileEntry[] | null {
     const additions = Number(fields[1] ?? '0') || 0
     const deletions = Number(fields[2] ?? '0') || 0
     const patch_len = Number(fields[3] ?? '0') || 0
+    if (![additions, deletions, patch_len].every((value) => Number.isSafeInteger(value) && value >= 0)) return null
     if (patch_len > bytes.length - offset) break
     const patch = decoder.decode(bytes.subarray(offset, offset + patch_len))
     offset += patch_len
@@ -740,13 +771,206 @@ function parseDiffSummary(body: string): DiffFileEntry[] | null {
   return null
 }
 
-function diffLineClass(line: string): string {
-  if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('@@')) {
-    return 'text-[var(--text-subtle)]'
+type DiffLayout = 'stacked' | 'split'
+const DIFF_LAYOUT_KEY = 'verde.web.diff_layout'
+function readDiffLayout(): DiffLayout {
+  try {
+    return localStorage.getItem(DIFF_LAYOUT_KEY) === 'split' ? 'split' : 'stacked'
+  } catch {
+    return 'stacked'
   }
-  if (line.startsWith('+')) return 'text-[#34e094]'
-  if (line.startsWith('-')) return 'text-[var(--danger)]'
-  return 'text-[var(--text-muted)]'
+}
+// One preference for every diff card (desktop parity), so it is module state.
+const [diffLayout, setDiffLayoutSignal] = createSignal<DiffLayout>(readDiffLayout())
+function setDiffLayout(layout: DiffLayout) {
+  setDiffLayoutSignal(layout)
+  try {
+    localStorage.setItem(DIFF_LAYOUT_KEY, layout)
+  } catch {
+    // Private mode: the preference just lasts for this page.
+  }
+}
+// Split needs two readable columns; below lg it always renders stacked.
+const wideQuery = typeof matchMedia === 'function' ? matchMedia('(min-width: 1024px)') : null
+const [wideScreen, setWideScreen] = createSignal(wideQuery?.matches ?? false)
+wideQuery?.addEventListener('change', (event) => setWideScreen(event.matches))
+
+type DiffLineKind = 'meta' | 'hunk' | 'add' | 'del' | 'ctx'
+interface DiffLine {
+  kind: DiffLineKind
+  text: string
+  old_no: number | null
+  new_no: number | null
+  // [start, end) of the changed span within text, for paired -/+ lines.
+  emph?: [number, number]
+}
+interface DiffSplitRow {
+  full?: DiffLine
+  left?: DiffLine
+  right?: DiffLine
+}
+
+function parsePatchLines(patch: string): DiffLine[] {
+  const lines: DiffLine[] = []
+  let old_no = 0
+  let new_no = 0
+  let in_hunk = false
+  for (const raw of patch.split('\n')) {
+    const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(raw)
+    if (hunk) {
+      old_no = Number(hunk[1])
+      new_no = Number(hunk[2])
+      in_hunk = true
+      lines.push({ kind: 'hunk', text: raw, old_no: null, new_no: null })
+    } else if (!in_hunk || raw.startsWith('\\')) {
+      lines.push({ kind: 'meta', text: raw, old_no: null, new_no: null })
+    } else if (raw.startsWith('+')) {
+      lines.push({ kind: 'add', text: raw.slice(1), old_no: null, new_no: new_no++ })
+    } else if (raw.startsWith('-')) {
+      lines.push({ kind: 'del', text: raw.slice(1), old_no: old_no++, new_no: null })
+    } else if (raw.startsWith('diff ') || raw.startsWith('index ')) {
+      in_hunk = false
+      lines.push({ kind: 'meta', text: raw, old_no: null, new_no: null })
+    } else {
+      lines.push({ kind: 'ctx', text: raw.slice(1), old_no: old_no++, new_no: new_no++ })
+    }
+  }
+  if (lines.at(-1)?.kind === 'ctx' && lines.at(-1)?.text === '') lines.pop()
+  markWordEmphasis(lines)
+  return lines
+}
+
+/// Pairs each run of deletions with the additions that follow it and marks the
+/// span between their common prefix and suffix (desktop word-level emphasis).
+function markWordEmphasis(lines: DiffLine[]) {
+  let i = 0
+  while (i < lines.length) {
+    if (lines[i].kind !== 'del') { i += 1; continue }
+    let adds = i
+    while (adds < lines.length && lines[adds].kind === 'del') adds += 1
+    let end = adds
+    while (end < lines.length && lines[end].kind === 'add') end += 1
+    const pairs = Math.min(adds - i, end - adds)
+    for (let k = 0; k < pairs; k += 1) {
+      const a = lines[i + k]
+      const b = lines[adds + k]
+      const spans = emphasisSpans(a.text, b.text)
+      if (!spans) continue
+      a.emph = spans.a
+      b.emph = spans.b
+    }
+    i = end
+  }
+}
+
+function splitRows(lines: DiffLine[]): DiffSplitRow[] {
+  const rows: DiffSplitRow[] = []
+  let i = 0
+  while (i < lines.length) {
+    const line = lines[i]
+    if (line.kind === 'meta' || line.kind === 'hunk') { rows.push({ full: line }); i += 1; continue }
+    if (line.kind === 'ctx') { rows.push({ left: line, right: line }); i += 1; continue }
+    let adds = i
+    while (adds < lines.length && lines[adds].kind === 'del') adds += 1
+    let end = adds
+    while (end < lines.length && lines[end].kind === 'add') end += 1
+    const count = Math.max(adds - i, end - adds)
+    for (let k = 0; k < count; k += 1) {
+      rows.push({
+        left: i + k < adds ? lines[i + k] : undefined,
+        right: adds + k < end ? lines[adds + k] : undefined,
+      })
+    }
+    i = end
+  }
+  return rows
+}
+
+function diffTextClass(kind: DiffLineKind): string {
+  if (kind === 'add') return 'text-[var(--diff-add)]'
+  if (kind === 'del') return 'text-[var(--danger)]'
+  if (kind === 'ctx') return 'text-[var(--text-muted)]'
+  return 'text-[var(--text-subtle)]'
+}
+
+function DiffText(props: { line: DiffLine }) {
+  const emph = () => props.line.emph
+  return (
+    <Show when={emph() && emph()![1] > emph()![0]} fallback={<>{props.line.text.length > 0 ? props.line.text : ' '}</>}>
+      {props.line.text.slice(0, emph()![0])}
+      <span class={props.line.kind === 'add' ? 'diff-emph-add' : 'diff-emph-del'}>
+        {props.line.text.slice(emph()![0], emph()![1])}
+      </span>
+      {props.line.text.slice(emph()![1])}
+    </Show>
+  )
+}
+
+function DiffCell(props: { line?: DiffLine; side: 'old' | 'new' }) {
+  return (
+    <Show when={props.line} fallback={<><span class="diff-no" aria-hidden="true" /><span class="diff-blank" aria-hidden="true" /></>}>
+      {(line) => (
+        <>
+          <span class="diff-no">{(props.side === 'old' ? line().old_no : line().new_no) ?? ''}</span>
+          <span class={`diff-text diff-bg-${line().kind} ${diffTextClass(line().kind)}`}>
+            <span class="diff-sign">{line().kind === 'add' ? '+' : line().kind === 'del' ? '−' : ' '}</span>
+            <DiffText line={line()} />
+          </span>
+        </>
+      )}
+    </Show>
+  )
+}
+
+function DiffPatch(props: { patch: string; path: string }) {
+  const [showAll, setShowAll] = createSignal(false)
+  const allLines = createMemo(() => parsePatchLines(props.patch))
+  const lines = createMemo(() => showAll() ? allLines() : allLines().slice(0, 2000))
+  const split = () => diffLayout() === 'split' && wideScreen()
+  return (
+    <div class="mono diff-patch mb-2 max-w-full overflow-x-auto text-[12.5px] leading-[1.45] scrollbar-thin">
+      <Show
+        when={split()}
+        fallback={
+          <div class="diff-grid diff-grid-stacked">
+            <For each={lines()}>
+              {(line) => (
+                <Show
+                  when={line.kind !== 'meta' && line.kind !== 'hunk'}
+                  fallback={<span class={`diff-full ${diffTextClass(line.kind)}`}>{line.text.length > 0 ? line.text : ' '}</span>}
+                >
+                  <span class="diff-no">{line.new_no ?? line.old_no ?? ''}</span>
+                  <span class={`diff-text diff-bg-${line.kind} ${diffTextClass(line.kind)}`}>
+                    <span class="diff-sign">{line.kind === 'add' ? '+' : line.kind === 'del' ? '-' : ' '}</span>
+                    <DiffText line={line} />
+                  </span>
+                </Show>
+              )}
+            </For>
+          </div>
+        }
+      >
+        <div class="diff-grid diff-grid-split">
+          <For each={splitRows(lines())}>
+            {(row) => (
+              <Show
+                when={!row.full}
+                fallback={<span class={`diff-full ${diffTextClass(row.full!.kind)}`}>{row.full!.text.length > 0 ? row.full!.text : ' '}</span>}
+              >
+                <DiffCell line={row.left} side="old" />
+                <DiffCell line={row.right} side="new" />
+              </Show>
+            )}
+          </For>
+        </div>
+      </Show>
+      <Show when={!showAll() && allLines().length > 2000}>
+        <button type="button" class="diff-show-all" aria-label={`Show all ${allLines().length} patch lines for ${props.path}`} onClick={() => setShowAll(true)}>
+          Showing 2,000 of {allLines().length.toLocaleString()} lines · Show all
+        </button>
+      </Show>
+    </div>
+  )
 }
 
 function DiffFileRow(props: { file: DiffFileEntry; cardId: string; pane: LivePane }) {
@@ -770,35 +994,28 @@ function DiffFileRow(props: { file: DiffFileEntry; cardId: string; pane: LivePan
   }
   return (
     <div ref={(node) => { row_el = node }}>
-      <div class="flex h-11 min-w-0 items-center gap-2">
-        <button
-          type="button"
-          class="flex h-full min-w-0 flex-1 items-center gap-2 text-left"
-          onClick={toggleAnchored}
-        >
-          <Chevron open={expanded()} />
-          <span class="mono min-w-0 flex-1 truncate text-[13px] text-[var(--text)]">{props.file.path}</span>
-          <span class="mono shrink-0 text-[12px] text-[#34e094]">+{props.file.additions}</span>
-          <span class="mono shrink-0 text-[12px] text-[var(--danger)]">-{props.file.deletions}</span>
-        </button>
-        <button
-          type="button"
-          class="shrink-0 rounded-[5px] bg-[rgba(56,57,62,0.34)] px-2.5 py-1 text-[11px] text-[var(--text-muted)] hover:bg-[rgba(72,73,79,0.82)] hover:text-white"
-          onClick={(event) => {
-            event.stopPropagation()
-            store.beginDiffComment(props.pane, props.file)
-          }}
-        >
-          Comment
-        </button>
-        <CopyPill payload={props.file.patch} />
-      </div>
+      <button
+        type="button"
+        class="diff-file-toggle"
+        aria-expanded={expanded()}
+        aria-label={`${expanded() ? 'Collapse' : 'Expand'} patch for ${props.file.path}`}
+        title={props.file.path}
+        onClick={toggleAnchored}
+      >
+        <Chevron open={expanded()} />
+        <span class="mono min-w-0 flex-1 truncate text-[13px] text-[var(--text)]">{props.file.path}</span>
+        <span class="mono shrink-0 text-[12px] text-[var(--diff-add)]">+{props.file.additions}</span>
+        <span class="mono shrink-0 text-[12px] text-[var(--danger)]">−{props.file.deletions}</span>
+      </button>
       <Show when={expanded()}>
-        <pre class="mono mb-2 max-w-full overflow-x-auto text-[12.5px] leading-[1.45] whitespace-pre-wrap break-words">
-          <For each={props.file.patch.split('\n')}>
-            {(line) => <div class={diffLineClass(line)}>{line.length > 0 ? line : ' '}</div>}
-          </For>
-        </pre>
+        <div class="diff-file-actions" role="group" aria-label={`Actions for ${props.file.path}`}>
+          <button type="button" class="diff-action" aria-label={`Comment on ${props.file.path}`}
+            onClick={() => store.beginDiffComment(props.pane, props.file)}>Comment</button>
+          <button type="button" class="diff-action" aria-label={`Open ${props.file.path}`}
+            onClick={() => openFileViewer(props.file.path)}>Open</button>
+          <CopyPill payload={props.file.patch} label={`Copy patch for ${props.file.path}`} class="diff-action" />
+        </div>
+        <DiffPatch patch={props.file.patch} path={props.file.path} />
       </Show>
     </div>
   )
@@ -833,6 +1050,20 @@ function DiffCard(props: { message: Message; pane: LivePane }) {
             <div class="min-w-0 flex-1 truncate text-[14px] text-[var(--text)]">
               Changed files — {parsed().length} {parsed().length === 1 ? 'file' : 'files'}
             </div>
+            <div role="group" aria-label="Diff layout" class="hidden shrink-0 overflow-hidden rounded-[6px] bg-[var(--panel-muted)] text-[11px] lg:flex">
+              <For each={['stacked', 'split'] as const}>
+                {(layout) => (
+                  <button
+                    type="button"
+                    aria-pressed={diffLayout() === layout}
+                    class={`px-2.5 py-1 capitalize ${diffLayout() === layout ? 'bg-[var(--accent-wash)] text-[var(--text)]' : 'text-[var(--text-muted)] hover:text-[var(--text)]'}`}
+                    onClick={() => setDiffLayout(layout)}
+                  >
+                    {layout}
+                  </button>
+                )}
+              </For>
+            </div>
             <div class="mono flex shrink-0 gap-2 text-[13px] text-[var(--text-muted)]">
               <span>+{totals().additions}</span>
               <span>-{totals().deletions}</span>
@@ -853,11 +1084,23 @@ function DiffCard(props: { message: Message; pane: LivePane }) {
   )
 }
 
+// ---- Code blocks -----------------------------------------------------------
+
+/// Sanitized markdown body plus code-block decoration.
+function MarkdownBody(props: { html: string; highlight: boolean }) {
+  let el: HTMLDivElement | undefined
+  createEffect(() => {
+    void props.html
+    if (el) decorateCodeBlocks(el, props.highlight)
+  })
+  return <div class="markdown" ref={(node) => { el = node }} innerHTML={props.html} onClick={handleFileCitationClick} />
+}
+
 // ---- Rows ------------------------------------------------------------------
 
 function TranscriptRow(props: { message: Message; pane: LivePane }) {
   if (props.message.message_id.endsWith('-stream')) {
-    return <WorkingRow message={props.message} />
+    return <WorkingRow message={props.message} pane={props.pane} />
   }
   if (isDiffSummaryRow(props.message)) {
     return <DiffCard message={props.message} pane={props.pane} />
@@ -865,6 +1108,9 @@ function TranscriptRow(props: { message: Message; pane: LivePane }) {
   if (isCommandCardRow(props.message)) {
     return <CommandCard message={props.message} pane={props.pane} />
   }
+
+  const usage = props.message.role === 'system' ? parseUsageSummary(props.message.author, props.message.body) : null
+  if (usage && (usage.limits.length || usage.stats.length || usage.recent.length)) return <UsageCard usage={usage} />
 
   const mine = props.message.role === 'user'
   const html = () => renderMarkdown(props.message.body)
@@ -886,7 +1132,7 @@ function TranscriptRow(props: { message: Message; pane: LivePane }) {
   return (
     <article class="min-w-0 rounded-[10px] border border-[var(--border-muted)] bg-[var(--assistant-card)] px-3 py-3 lg:px-4">
           <div class="mb-1.5 text-[12px] text-[var(--text-subtle)]">{props.message.author || 'Assistant'}</div>
-          <div class="markdown" innerHTML={html()} onClick={handleFileCitationClick} />
+          <MarkdownBody html={html()} highlight />
     </article>
   )
 }
@@ -928,12 +1174,117 @@ function attachmentLabel(attachment: Attachment): string {
 }
 
 /// The streaming assistant bubble: author slot carries the desktop's ticking
+/// Pending tool approval, pinned between transcript and composer so the
+/// decision is reachable without scrolling; long bodies scroll inside the card.
+function ApprovalCard(props: { pane: LivePane }) {
+  const approval = () => store.pendingApproval(props.pane)
+  // Busy is keyed to the call so a follow-up approval starts enabled.
+  const callKey = () => {
+    const current = approval()
+    return current ? current.call_id || current.turn_id : undefined
+  }
+  const [busyCall, setBusyCall] = createSignal<string | null>(null)
+  const [sent, setSent] = createSignal<'approve' | 'deny' | null>(null)
+  let release: ReturnType<typeof setTimeout> | undefined
+  onCleanup(() => clearTimeout(release))
+  const resolve = async (decision: 'approve' | 'deny') => {
+    const key = callKey()
+    if (!key || busyCall() === key) return
+    setBusyCall(key)
+    setSent(decision)
+    const ok = await store.resolveApproval(props.pane, decision).catch(() => false)
+    // Success keeps the buttons disabled until the card leaves (the key
+    // changes); only a failure hands them back. The timer is a safety net for
+    // a resolution the daemon accepted but never reflected.
+    clearTimeout(release)
+    if (!ok) setBusyCall(null)
+    else release = setTimeout(() => setBusyCall((held) => (held === key ? null : held)), 15000)
+  }
+  const busy = () => busyCall() != null && busyCall() === callKey()
+  // Keyboard-open phones: the body collapses so the transcript keeps some room.
+  const viewHeight = () => window.visualViewport?.height ?? window.innerHeight
+  const [short, setShort] = createSignal(viewHeight() < 420)
+  const [details, setDetails] = createSignal(false)
+  const onViewport = () => setShort(viewHeight() < 420)
+  const viewport: EventTarget = window.visualViewport ?? window
+  viewport.addEventListener('resize', onViewport)
+  onCleanup(() => viewport.removeEventListener('resize', onViewport))
+  const button = 'min-h-[44px] min-w-[88px] rounded-[8px] px-4 text-[13px] font-medium disabled:cursor-default focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent)] lg:min-h-[32px]'
+  const dimmed = (decision: 'approve' | 'deny') => (busy() && sent() !== decision ? 'opacity-40' : busy() ? 'opacity-80' : '')
+  return (
+    // Keyed by call id (turn id when the provider sends none): snapshot polls
+    // hand back fresh objects, which must not remount (and re-animate) the card.
+    <Show when={callKey()} keyed>
+      {(_key) => { const current = approval()!; return (
+        <div class="flex min-h-0 shrink flex-col px-3 pb-2 lg:px-5">
+          <span class="sr-only" aria-live="polite">{`Approval required: ${current.title}`}</span>
+          <section
+            role="group"
+            aria-label={`Approval required: ${current.title}`}
+            aria-busy={busy()}
+            class="anim-pop mx-auto flex min-h-0 w-full max-w-[900px] flex-col gap-2 rounded-[10px] border border-[color-mix(in_srgb,var(--warning)_55%,var(--border-muted))] bg-[var(--assistant-card)] px-3 py-2.5 lg:px-4"
+          >
+            <div class="flex shrink-0 items-center gap-2">
+              <span aria-hidden="true" class="cmd-dot-pulse h-2 w-2 shrink-0 rounded-full bg-[var(--warning)]" />
+              <div class="min-w-0 flex-1">
+                <div class="text-[11px] tracking-wide text-[var(--warning)]">Approval required</div>
+                <div class="line-clamp-2 text-[14px] font-medium lg:line-clamp-none lg:truncate" title={current.title}>{current.title}</div>
+              </div>
+              <CopyPill payload={current.body} />
+            </div>
+            <Show when={current.body.length > 0}>
+              <Show
+                when={!short() || details()}
+                fallback={
+                  <button
+                    type="button"
+                    class="min-h-[40px] shrink-0 self-start rounded-[6px] px-2 text-[12px] text-[var(--text-muted)] hover:bg-[var(--panel-muted)] hover:text-[var(--text)]"
+                    aria-expanded="false"
+                    onClick={() => setDetails(true)}
+                  >
+                    Show details
+                  </button>
+                }
+              >
+                <pre
+                  tabindex="0"
+                  role="region"
+                  aria-label="Approval details"
+                  class="max-h-[calc(var(--app-height,100dvh)*0.22)] min-h-[3.5em] flex-1 overflow-auto overscroll-contain whitespace-pre-wrap break-words rounded-[6px] bg-[var(--chat-black)] px-2.5 py-2 font-mono text-[12px] leading-[1.45] text-[var(--text-muted)] scrollbar-thin lg:max-h-[calc(var(--app-height,100dvh)*0.3)]"
+                >{current.body}</pre>
+              </Show>
+            </Show>
+            <div class="flex shrink-0 justify-end gap-2">
+              <button
+                type="button"
+                class={`${button} border border-[var(--border-muted)] bg-[var(--panel-muted)] text-[var(--text)] enabled:hover:bg-[var(--border-muted)] ${dimmed('deny')}`}
+                disabled={busy()}
+                onClick={() => void resolve('deny')}
+              >
+                {busy() && sent() === 'deny' ? 'Sending…' : 'Decline'}
+              </button>
+              <button
+                type="button"
+                class={`${button} bg-[var(--accent)] text-[var(--chat-black)] enabled:hover:bg-[var(--accent-hi)] ${dimmed('approve')}`}
+                disabled={busy()}
+                onClick={() => void resolve('approve')}
+              >
+                {busy() && sent() === 'approve' ? 'Sending…' : 'Allow'}
+              </button>
+            </div>
+          </section>
+        </div>
+      ) }}
+    </Show>
+  )
+}
+
 /// "Working - m:ss" / "Thinking - m:ss" label; an empty stream shows the
 /// waiting placeholder.
-function WorkingRow(props: { message: Message }) {
+function WorkingRow(props: { message: Message; pane: LivePane }) {
   const label = () => {
     const started = props.message.created_at_ms
-    const verb = props.message.author || 'Working'
+    const verb = store.pendingApproval(props.pane) ? 'Waiting for approval' : props.message.author || 'Working'
     return started ? `${verb} - ${formatElapsed(started, nowMs())}` : verb
   }
   // Every streamed delta re-renders this row with a longer body, and each
@@ -959,7 +1310,8 @@ function WorkingRow(props: { message: Message }) {
         when={props.message.body.length > 0}
         fallback={<div class="text-[14px] italic text-[var(--text-subtle)]">Waiting for streamed output...</div>}
       >
-        <div class="markdown" innerHTML={html()} onClick={handleFileCitationClick} />
+        {/* No highlighting while streaming: re-tokenizing per delta stalls input. */}
+        <MarkdownBody html={html()} highlight={false} />
       </Show>
     </article>
   )
@@ -968,6 +1320,13 @@ function WorkingRow(props: { message: Message }) {
 function Composer(props: { pane: LivePane; focused: boolean }) {
   let field: HTMLTextAreaElement | undefined
   let filePicker: HTMLInputElement | undefined
+  const [suggestions, setSuggestions] = createSignal<ComposerSuggestControls>()
+  const [suggestDraft, setSuggestDraft] = createSignal('')
+  const [caret, setCaret] = createSignal(0), [composing, setComposing] = createSignal(false)
+  const updateSuggestions = () => { if (field) { setSuggestDraft(field.value); setCaret(field.selectionStart) } }
+  const running = () => store.paneWorking(props.pane)
+  const sendLabel = () => running() ? (store.followupKindFor(props.pane) === 'steer' ? 'Steer' : 'Queue') : 'Send'
+
 
   // Draft cache key is captured at mount. The textarea itself is
   // uncontrolled: the browser owns the caret/IME until submit, so snapshot
@@ -995,6 +1354,7 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
   const submitDraft = () => {
     if (uploading() || store.sending()) return
     persistDraft()
+    suggestions()?.close()
     if (field) {
       field.value = ''
       setBlank(true)
@@ -1010,10 +1370,12 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
     handledComposerFocusNonce = nonce
     // Diff-comment prefills (and focus_prompt) land in the store; copy once.
     syncFieldFromStore()
-    if (!store.compact()) field?.focus()
+    focusChatPrompt(field, store.compact(), store.composerFocusExplicit())
   })
 
   const onKeyDown = (event: KeyboardEvent) => {
+    if (composing()) return
+    if (suggestions()?.keydown(event)) { event.stopPropagation(); return }
     if (!composerEnterShouldSubmit(event, {
       compact: store.compact(),
       coarsePointer: window.matchMedia('(pointer: coarse)').matches,
@@ -1026,8 +1388,12 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
   const COMPOSER_MIN_HEIGHT = 52
   const [composerHeight, setComposerHeight] = createSignal<number | null>(null)
   let composerDrag: { pointer_id: number; start_y: number; start_height: number } | null = null
+  // A pending approval card shares the column, so the composer yields room.
   const composerMaxHeight = () =>
-    Math.max(COMPOSER_MIN_HEIGHT, Math.round((window.visualViewport?.height ?? window.innerHeight) * 0.6))
+    Math.max(
+      COMPOSER_MIN_HEIGHT,
+      Math.round((window.visualViewport?.height ?? window.innerHeight) * (store.pendingApproval(props.pane) ? 0.35 : 0.6)),
+    )
   const startComposerDrag = (event: PointerEvent) => {
     if (!field) return
     event.preventDefault()
@@ -1052,13 +1418,22 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
       <Show when={props.focused && store.notice()}>
         <p class="anim-reveal mx-auto mb-2 max-w-[900px] text-right text-xs text-[var(--warning)]">{store.notice()}</p>
       </Show>
+      <ProviderReadiness pane={props.pane} />
+      <ComposerCommandStatus pane={props.pane} />
       {/* Desktop prompt-box parity (state.zig paletteComposerStyle): panel-
           muted 1px border at rest, 1.5px accent border while focused — the
           extra 0.5px focus weight comes from a ring shadow so the border
           swap never shifts layout. @container lets the toolbar shrink the
           model label in a split column instead of wrapping a second row and
           making side-by-side composers different heights. */}
-      <div class="@container mx-auto w-full max-w-[900px] rounded-[14px] border border-[var(--panel-muted)] bg-[var(--panel)] px-4 pt-3 pb-3 transition-colors focus-within:border-[var(--accent)] focus-within:shadow-[0_0_0_0.5px_var(--accent)]">
+      <div class="@container relative mx-auto w-full max-w-[900px] rounded-[14px] border border-[var(--panel-muted)] bg-[var(--panel)] px-4 pt-3 pb-3 transition-colors focus-within:border-[var(--accent)] focus-within:shadow-[0_0_0_0.5px_var(--accent)]">
+        <ComposerSuggest pane={props.pane} draft={suggestDraft()} caret={caret()} composing={composing()} controls={setSuggestions} accept={replacement => {
+          if (!field) return
+          field.value = replacement.draft
+          field.setSelectionRange(replacement.caret, replacement.caret)
+          setBlank(field.value.trim().length === 0)
+          persistDraft(); updateSuggestions()
+        }} />
         <Show when={attachments().length > 0}>
           <div class="mb-2 flex gap-2 overflow-x-auto pb-1">
             <For each={attachments()}>
@@ -1108,12 +1483,21 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
             field = node
             if (node) node.value = store.draftFor(composer_pane)
           }}
-          style={composerHeight() != null ? { height: `${composerHeight()}px` } : undefined}
+          style={composerHeight() != null ? { height: `${Math.min(composerHeight()!, composerMaxHeight())}px` } : undefined}
           class="min-h-[52px] w-full resize-none lg:resize-y bg-transparent text-[16px] leading-[21px] outline-none placeholder:text-[var(--text-subtle)] lg:min-h-[88px] lg:text-[18px] lg:leading-[22px]"
           placeholder="Ask anything…"
           enterkeyhint="enter"
-          onInput={(event) => setBlank(event.currentTarget.value.trim().length === 0)}
-          onBlur={persistDraft}
+          aria-label="Message"
+          aria-autocomplete="list"
+          aria-controls={suggestions()?.listId}
+          aria-expanded={suggestions()?.expanded() ?? false}
+          aria-activedescendant={suggestions()?.activeId()}
+          onInput={(event) => { setBlank(event.currentTarget.value.trim().length === 0); updateSuggestions() }}
+          onClick={updateSuggestions}
+          onSelect={updateSuggestions}
+          onCompositionStart={() => setComposing(true)}
+          onCompositionEnd={() => { setComposing(false); updateSuggestions() }}
+          onBlur={() => { persistDraft(); suggestions()?.close() }}
           onKeyDown={onKeyDown}
           onPaste={(event) => {
             const files = clipboardImageFiles(event.clipboardData)
@@ -1161,37 +1545,28 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
             <ComposerPickers pane={props.pane} />
           </div>
           <div class="min-w-0 flex-1 lg:hidden" />
-          <Show
-            when={!store.paneWorking(props.pane)}
-            fallback={
-              <button
-                type="button"
-                class="composer-stop grid h-8 w-8 shrink-0 place-items-center rounded-full bg-[var(--warning)]"
-                onClick={() => void store.stopTurn(props.pane)}
-                aria-label="Stop"
-                title="Stop this turn"
-              >
-                <span class="h-[9px] w-[9px] rounded-[2px] bg-[rgba(13,18,19,0.9)]" />
-              </button>
-            }
-          >
+          <Show when={running()}>
+            <button type="button" class="composer-stop grid h-8 w-8 shrink-0 place-items-center rounded-full bg-[var(--warning)]" onClick={() => void store.stopTurn(props.pane)} aria-label="Stop" title="Stop this turn"><span class="h-[9px] w-[9px] rounded-[2px] bg-[rgba(13,18,19,0.9)]" /></button>
+          </Show>
             <button
               type="button"
-              class="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-[var(--accent)] text-[#06210f] disabled:opacity-35"
+              class="composer-send grid h-8 w-8 shrink-0 place-items-center rounded-full bg-[var(--accent)] text-[#06210f] disabled:opacity-35"
               disabled={
                 store.sending() ||
                 uploading() ||
                 (blank() && attachments().length === 0)
               }
               onClick={submitDraft}
-              aria-label="Send"
+              aria-label={sendLabel()}
+              title={sendLabel()}
             >
               <svg class="h-4 w-4" viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M12 6l-6 7h4v5h4v-5h4z" fill="currentColor" />
               </svg>
             </button>
-          </Show>
+          <Show when={running()}><span class="composer-send-label">{sendLabel()}</span></Show>
         </div>
+        <Show when={running() && !store.pendingFollowup(props.pane)}><p class="composer-detail composer-followup-hint">{store.pendingFollowupHint(props.pane)}</p></Show>
       </div>
     </form>
   )
@@ -1367,6 +1742,17 @@ function ComposerPickers(props: { pane: LivePane }) {
     setOpen('model')
     queueMicrotask(placeModelMenu)
   }
+  createEffect(() => {
+    onCleanup(registerChatCommandPickers(props.pane, (command) => {
+      if (command === 'model') {
+        setPickerProvider(selectedProvider() as PickerProvider)
+        setOpen('model')
+        queueMicrotask(placeModelMenu)
+      } else {
+        setOpen(efforts().length > 0 ? 'effort' : variants().length > 0 ? 'variant' : showsFast() ? 'fast' : 'access')
+      }
+    }))
+  })
   const pickModel = (provider: string, value: string) => {
     setOpen(null)
     const provider_changed = provider !== selectedProvider()

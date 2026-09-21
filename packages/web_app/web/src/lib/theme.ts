@@ -61,6 +61,7 @@ export function applyTheme(payload: ThemePayload): void {
   set('--accent-hover', rgba(accent, 0.14))
   set('--warning', warning)
   set('--danger', colors.diff_remove ?? '#ff6464')
+  set('--diff-add', colors.diff_add ?? '#34e094')
   set('--user-bubble', mix(selection, panel, 0.55))
   set('--assistant-card', mix(bg, text, 0.04))
   set('--selection', selection)
