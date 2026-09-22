@@ -1773,6 +1773,7 @@ fn transcriptSelectableBodyKind(
         if (shouldRenderPaletteCommandRow(author, body) or
             isDiffSummaryMessage(author, body) or
             isUsageSummaryMessage(author, body) or
+            isTodoListMessage(author, body) or
             utils.providerFailureActionProvider(body) != null)
         {
             return null;
@@ -1807,6 +1808,7 @@ fn transcriptSelectableBodyRect(
     if (role == .system and (shouldRenderPaletteCommandRow(author, body) or
         isDiffSummaryMessage(author, body) or
         isUsageSummaryMessage(author, body) or
+        isTodoListMessage(author, body) or
         utils.providerFailureActionProvider(body) != null))
     {
         return null;
@@ -4577,6 +4579,10 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
             if (y + item_h >= column.y and y <= column.y + column.h) {
                 renderDiffSummaryCard(state, column, y, item_h, event.body, clip, msg_idx);
             }
+        } else if (event.role == .system and isTodoListMessage(event.author, event.body)) {
+            if (y + item_h >= column.y and y <= column.y + column.h) {
+                renderTodoCard(state, column, y, item_h, event.body, clip);
+            }
         } else {
             const role_label: []const u8 = switch (event.role) {
                 .user => "You",
@@ -5599,6 +5605,9 @@ fn transcriptMessageHeightStream(
     if (role == .system and isUsageSummaryMessage(message_author, body_raw)) {
         return usageSummaryHeight(body_raw, column_width);
     }
+    if (role == .system and isTodoListMessage(message_author, body_raw)) {
+        return todoCardHeight(body_raw, column_width);
+    }
     if (role == .system and utils.providerFailureActionProvider(body_raw) != null) {
         return providerFailureActionHeight(body_raw, column_width);
     }
@@ -5708,6 +5717,10 @@ fn renderTranscriptMessage(state: *app_state.AppState, thread: *const app_state.
     }
     if (message.role == .system and isUsageSummaryMessage(message.author, message.body)) {
         renderUsageSummaryCard(state, column, y, height, message.body, clip, message_index);
+        return;
+    }
+    if (message.role == .system and isTodoListMessage(message.author, message.body)) {
+        renderTodoCard(state, column, y, height, message.body, clip);
         return;
     }
     if (message.role == .system) {
@@ -6282,6 +6295,379 @@ const DiffFileEntry = struct {
 
 /// True when this system message was emitted by `appendPendingDiffSummaryEvent`
 /// (author "Changed files", body framed with PERSISTED_DIFF_MARKER).
+// ---- Todo / plan card ----
+//
+// Providers report agent task lists as a system message titled "Todos" whose
+// body is a GFM-style task list (`- [x]`, `- [>]`, `- [ ]`). Rendering that
+// through the generic system bubble read as a warning-tinted blob, so the
+// list gets a dedicated card: neutral chrome, a progress header, and a
+// timeline of status glyphs.
+
+const TODO_MESSAGE_AUTHOR = "Todos";
+
+const TodoItemStatus = enum { pending, in_progress, completed, cancelled };
+
+const TodoItem = struct {
+    status: TodoItemStatus,
+    text: []const u8,
+};
+
+/// Parses one task-list line. Accepts the bracket glyphs Muse emits and the
+/// spelled-out statuses Cursor uses so either provider lands on this card.
+fn parseTodoLine(line_raw: []const u8) ?TodoItem {
+    const line = std.mem.trim(u8, line_raw, " \t\r");
+    if (line.len < 3 or line[0] != '-' or line[1] != ' ') return null;
+    const rest = std.mem.trimStart(u8, line[2..], " ");
+    if (rest.len < 2 or rest[0] != '[') return null;
+    const close = std.mem.indexOfScalar(u8, rest, ']') orelse return null;
+    const tag = rest[1..close];
+    const status: TodoItemStatus = if (std.mem.eql(u8, tag, " ") or std.mem.eql(u8, tag, "pending"))
+        .pending
+    else if (std.mem.eql(u8, tag, ">") or std.mem.eql(u8, tag, "in_progress") or std.mem.eql(u8, tag, "inProgress"))
+        .in_progress
+    else if (std.mem.eql(u8, tag, "x") or std.mem.eql(u8, tag, "X") or std.mem.eql(u8, tag, "completed"))
+        .completed
+    else if (std.mem.eql(u8, tag, "-") or std.mem.eql(u8, tag, "cancelled") or std.mem.eql(u8, tag, "canceled"))
+        .cancelled
+    else
+        return null;
+    const text = std.mem.trim(u8, rest[close + 1 ..], " \t");
+    if (text.len == 0) return null;
+    return .{ .status = status, .text = text };
+}
+
+const TodoIterator = struct {
+    rest: []const u8,
+
+    fn init(body: []const u8) TodoIterator {
+        return .{ .rest = body };
+    }
+
+    fn next(self: *TodoIterator) ?TodoItem {
+        while (self.rest.len > 0) {
+            const line_end = std.mem.indexOfScalar(u8, self.rest, '\n') orelse self.rest.len;
+            const line = self.rest[0..line_end];
+            self.rest = if (line_end < self.rest.len) self.rest[line_end + 1 ..] else self.rest[self.rest.len..];
+            if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
+            return parseTodoLine(line);
+        }
+        return null;
+    }
+};
+
+const TodoSummary = struct {
+    total: usize = 0,
+    completed: usize = 0,
+    in_progress: usize = 0,
+};
+
+fn summarizeTodos(body: []const u8) TodoSummary {
+    var summary: TodoSummary = .{};
+    var it = TodoIterator.init(body);
+    while (it.next()) |item| {
+        summary.total += 1;
+        switch (item.status) {
+            .completed => summary.completed += 1,
+            .in_progress => summary.in_progress += 1,
+            else => {},
+        }
+    }
+    return summary;
+}
+
+/// A system message is a todo card when it carries the provider todo title and
+/// every non-blank line parses as a task item. Any stray line falls back to
+/// the generic bubble so malformed payloads stay readable.
+fn isTodoListMessage(author: []const u8, body_raw: []const u8) bool {
+    if (!std.mem.eql(u8, author, TODO_MESSAGE_AUTHOR)) return false;
+    const body = std.mem.trim(u8, body_raw, "\n\r\t ");
+    if (body.len == 0) return false;
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    var count: usize = 0;
+    while (lines.next()) |line| {
+        if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
+        if (parseTodoLine(line) == null) return false;
+        count += 1;
+    }
+    return count > 0;
+}
+
+/// Measured word-wrap over the UI font. Yields one slice per rendered line;
+/// a single word wider than the column is placed alone on its line rather
+/// than truncated so nothing silently disappears.
+const MeasuredLineIterator = struct {
+    text: []const u8,
+    font_size: f32,
+    max_w: f32,
+    pos: usize = 0,
+
+    fn next(self: *MeasuredLineIterator) ?[]const u8 {
+        while (self.pos < self.text.len and self.text[self.pos] == ' ') self.pos += 1;
+        if (self.pos >= self.text.len) return null;
+        const start = self.pos;
+        var line_end = start;
+        var cursor = start;
+        while (cursor < self.text.len) {
+            var word_end = cursor;
+            while (word_end < self.text.len and self.text[word_end] != ' ') word_end += 1;
+            const fits = chromeLabelWidth(self.font_size, self.text[start..word_end]) <= self.max_w;
+            if (!fits and line_end > start) break;
+            line_end = word_end;
+            cursor = word_end;
+            while (cursor < self.text.len and self.text[cursor] == ' ') cursor += 1;
+            if (!fits) break;
+        }
+        self.pos = line_end;
+        return self.text[start..line_end];
+    }
+};
+
+fn measuredLineCount(text: []const u8, font_size: f32, max_w: f32) usize {
+    var it: MeasuredLineIterator = .{ .text = text, .font_size = font_size, .max_w = max_w };
+    var count: usize = 0;
+    while (it.next() != null) count += 1;
+    return @max(count, 1);
+}
+
+const TodoCardMetrics = struct {
+    pad_x: f32,
+    pad_y: f32,
+    header_h: f32,
+    glyph_d: f32,
+    glyph_col_w: f32,
+    row_gap: f32,
+    line_h: f32,
+    font_size: f32,
+
+    fn init() TodoCardMetrics {
+        return .{
+            .pad_x = theme.scaledUi(16.0),
+            .pad_y = theme.scaledUi(14.0),
+            .header_h = theme.scaledUi(38.0),
+            .glyph_d = theme.scaledUi(12.0),
+            .glyph_col_w = theme.scaledUi(28.0),
+            .row_gap = theme.scaledUi(8.0),
+            .line_h = theme.scaledUi(20.0),
+            .font_size = theme.scaledUi(14.0),
+        };
+    }
+
+    fn textWidth(self: TodoCardMetrics, column_width: f32) f32 {
+        return @max(column_width - self.pad_x * 2.0 - self.glyph_col_w, theme.scaledUi(60.0));
+    }
+};
+
+fn todoCardHeight(body_raw: []const u8, column_width: f32) f32 {
+    const metrics = TodoCardMetrics.init();
+    const text_w = metrics.textWidth(column_width);
+    var height = metrics.pad_y * 2.0 + metrics.header_h;
+    var it = TodoIterator.init(std.mem.trim(u8, body_raw, "\n\r\t "));
+    var first = true;
+    while (it.next()) |item| {
+        if (!first) height += metrics.row_gap;
+        first = false;
+        height += @as(f32, @floatFromInt(measuredLineCount(item.text, metrics.font_size, text_w))) * metrics.line_h;
+    }
+    return height;
+}
+
+/// Region: agent plan card. Header carries the running count and a slim
+/// progress bar; each item is a status glyph on a shared timeline spine with
+/// wrapped text beside it.
+fn renderTodoCard(
+    state: *app_state.AppState,
+    column: palette.Rect,
+    y: f32,
+    height: f32,
+    body_raw: []const u8,
+    clip: palette.Rect,
+) void {
+    const metrics = TodoCardMetrics.init();
+    const body = std.mem.trim(u8, body_raw, "\n\r\t ");
+    const summary = summarizeTodos(body);
+    const bubble = snapRect(palette.Rect{ .x = column.x, .y = y, .w = column.w, .h = height });
+    const accent = theme.accent();
+    const active = summary.in_progress > 0;
+    const all_done = summary.total > 0 and summary.completed == summary.total;
+    const pulse = if (active) theme.activityPulse(profiler.nowNs()) else 0.0;
+
+    // The shell matches tool-call groups so the plan reads as agent chrome,
+    // not a warning; only the border hints at live progress.
+    const border = if (active)
+        theme.withAlpha(accent, @intFromFloat(70.0 + pulse * 60.0))
+    else
+        theme.borderMuted();
+    queueRoundedShellClipped(state, bubble, paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 235)), paletteColor(border), transcriptBubbleCornerRadius(), clip);
+
+    const inner_x = bubble.x + metrics.pad_x;
+    const inner_w = bubble.w - metrics.pad_x * 2.0;
+    const header_y = bubble.y + metrics.pad_y;
+    const label_font = theme.scaledUi(12.0);
+    const label_h = theme.scaledUi(18.0);
+
+    // Header: title on the left, "done / total" on the right, bar beneath.
+    var count_buf: [48]u8 = undefined;
+    const count_label = if (all_done)
+        "All done"
+    else
+        std.fmt.bufPrint(&count_buf, "{d} of {d} done", .{ summary.completed, summary.total }) catch "";
+    const count_w = chromeLabelWidth(label_font, count_label);
+    queueChromeLabel(state, .{ .x = inner_x, .y = header_y, .w = @max(inner_w - count_w - theme.scaledUi(12.0), theme.scaledUi(40.0)), .h = label_h }, "Plan", paletteColor(theme.COLOR_TEXT_MUTED), label_font, clip);
+    queueChromeLabel(state, .{ .x = inner_x + inner_w - count_w, .y = header_y, .w = count_w, .h = label_h }, count_label, paletteColor(if (all_done) accent else theme.COLOR_TEXT_MUTED), label_font, clip);
+
+    const bar_h = theme.scaledUi(3.0);
+    const bar_y = header_y + label_h + theme.scaledUi(7.0);
+    const bar_rect = snapRect(.{ .x = inner_x, .y = bar_y, .w = inner_w, .h = bar_h });
+    queueRoundedClipped(state, bar_rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 200)), bar_h * 0.5, clip);
+    if (summary.total > 0) {
+        // Completed work fills solid; the in-progress item adds a faint
+        // leading segment so the bar moves before the task closes.
+        const done_ratio = @as(f32, @floatFromInt(summary.completed)) / @as(f32, @floatFromInt(summary.total));
+        const active_ratio = @as(f32, @floatFromInt(summary.completed + summary.in_progress)) / @as(f32, @floatFromInt(summary.total));
+        if (active) {
+            queueRoundedClipped(state, .{ .x = bar_rect.x, .y = bar_rect.y, .w = bar_rect.w * active_ratio, .h = bar_h }, paletteColor(theme.withAlpha(accent, @intFromFloat(60.0 + pulse * 50.0))), bar_h * 0.5, clip);
+        }
+        if (summary.completed > 0) {
+            queueRoundedClipped(state, .{ .x = bar_rect.x, .y = bar_rect.y, .w = bar_rect.w * done_ratio, .h = bar_h }, paletteColor(accent), bar_h * 0.5, clip);
+        }
+    }
+
+    // Items.
+    const text_w = metrics.textWidth(bubble.w);
+    const text_x = inner_x + metrics.glyph_col_w;
+    const glyph_cx = inner_x + metrics.glyph_d * 0.5 + theme.scaledUi(2.0);
+    var row_y = header_y + metrics.header_h;
+    var first_glyph_cy: ?f32 = null;
+    var last_glyph_cy: f32 = row_y;
+
+    // First pass lays out rows and remembers glyph centers for the spine;
+    // the spine must be queued before glyphs so it sits behind them.
+    var row_tops_buf: [64]f32 = undefined;
+    var row_count: usize = 0;
+    {
+        var it = TodoIterator.init(body);
+        var probe_y = row_y;
+        var first = true;
+        while (it.next()) |item| {
+            if (!first) probe_y += metrics.row_gap;
+            first = false;
+            if (row_count < row_tops_buf.len) row_tops_buf[row_count] = probe_y;
+            row_count += 1;
+            const cy = probe_y + metrics.line_h * 0.5;
+            if (first_glyph_cy == null) first_glyph_cy = cy;
+            last_glyph_cy = cy;
+            probe_y += @as(f32, @floatFromInt(measuredLineCount(item.text, metrics.font_size, text_w))) * metrics.line_h;
+        }
+    }
+    if (row_count > 1) {
+        if (first_glyph_cy) |top| {
+            queueRectClipped(state, snapRect(.{ .x = glyph_cx - 0.5, .y = top, .w = 1.0, .h = last_glyph_cy - top }), paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 220)), clip);
+        }
+    }
+
+    var it = TodoIterator.init(body);
+    var index: usize = 0;
+    while (it.next()) |item| : (index += 1) {
+        if (index > 0) row_y += metrics.row_gap;
+        const line_count = measuredLineCount(item.text, metrics.font_size, text_w);
+        const row_h = @as(f32, @floatFromInt(line_count)) * metrics.line_h;
+        const glyph_cy = row_y + metrics.line_h * 0.5;
+        const glyph_rect = palette.Rect{ .x = glyph_cx - metrics.glyph_d * 0.5, .y = glyph_cy - metrics.glyph_d * 0.5, .w = metrics.glyph_d, .h = metrics.glyph_d };
+        const ring_inset = @max(theme.scaledUi(1.5), 1.0);
+        const inner_rect = palette.Rect{ .x = glyph_rect.x + ring_inset, .y = glyph_rect.y + ring_inset, .w = glyph_rect.w - ring_inset * 2.0, .h = glyph_rect.h - ring_inset * 2.0 };
+
+        var text_color = theme.COLOR_WHITE;
+        switch (item.status) {
+            .completed => {
+                queueRoundedClipped(state, glyph_rect, paletteColor(accent), metrics.glyph_d * 0.5, clip);
+                // A short tick drawn from two bars keeps the glyph legible at
+                // small sizes without a glyph font dependency.
+                const tick = theme.foregroundOn(accent);
+                const stroke = @max(theme.scaledUi(1.6), 1.0);
+                const short_len = metrics.glyph_d * 0.22;
+                const long_len = metrics.glyph_d * 0.42;
+                const base_x = glyph_cx - metrics.glyph_d * 0.20;
+                const base_y = glyph_cy + metrics.glyph_d * 0.18;
+                queueRotatedBar(state, .{ .x = base_x, .y = base_y }, short_len, stroke, -std.math.pi * 0.75, paletteColor(tick), clip);
+                queueRotatedBar(state, .{ .x = base_x, .y = base_y }, long_len, stroke, -std.math.pi * 0.25, paletteColor(tick), clip);
+                text_color = theme.COLOR_TEXT_MUTED;
+            },
+            .in_progress => {
+                // Subtle row wash keeps the eye on the live task.
+                queueRoundedClipped(state, snapRect(.{ .x = inner_x - theme.scaledUi(6.0), .y = row_y - theme.scaledUi(3.0), .w = inner_w + theme.scaledUi(12.0), .h = row_h + theme.scaledUi(6.0) }), paletteColor(theme.withAlpha(accent, 22)), theme.scaledUi(7.0), clip);
+                queueRoundedClipped(state, glyph_rect, paletteColor(accent), metrics.glyph_d * 0.5, clip);
+                queueRoundedClipped(state, inner_rect, paletteColor(theme.COLOR_PANEL_ALT), inner_rect.w * 0.5, clip);
+                const core_d = metrics.glyph_d * (0.30 + pulse * 0.18);
+                queueRoundedClipped(state, .{ .x = glyph_cx - core_d * 0.5, .y = glyph_cy - core_d * 0.5, .w = core_d, .h = core_d }, paletteColor(accent), core_d * 0.5, clip);
+                text_color = theme.COLOR_WHITE;
+            },
+            .pending => {
+                queueRoundedClipped(state, glyph_rect, paletteColor(theme.withAlpha(theme.COLOR_TEXT_MUTED, 150)), metrics.glyph_d * 0.5, clip);
+                queueRoundedClipped(state, inner_rect, paletteColor(theme.COLOR_PANEL_ALT), inner_rect.w * 0.5, clip);
+                text_color = theme.mix(theme.COLOR_WHITE, theme.COLOR_TEXT_MUTED, 0.25);
+            },
+            .cancelled => {
+                queueRoundedClipped(state, glyph_rect, paletteColor(theme.withAlpha(theme.COLOR_TEXT_MUTED, 110)), metrics.glyph_d * 0.5, clip);
+                text_color = theme.withAlpha(theme.COLOR_TEXT_MUTED, 170);
+            },
+        }
+
+        var lines: MeasuredLineIterator = .{ .text = item.text, .font_size = metrics.font_size, .max_w = text_w };
+        var line_y = row_y;
+        while (lines.next()) |line| {
+            if (line_y + metrics.line_h >= clip.y and line_y <= clip.y + clip.h) {
+                queueChromeLabel(state, .{ .x = text_x, .y = line_y, .w = text_w, .h = metrics.line_h }, line, paletteColor(text_color), metrics.font_size, clip);
+            }
+            line_y += metrics.line_h;
+        }
+        if (item.status == .completed) {
+            // Strike-through across the first line only; wrapped continuation
+            // lines stay clean so long items remain readable.
+            const first_line_w = @min(chromeLabelWidth(metrics.font_size, firstMeasuredLine(item.text, metrics.font_size, text_w)), text_w);
+            queueRectClipped(state, snapRect(.{ .x = text_x, .y = row_y + metrics.line_h * 0.54, .w = first_line_w, .h = 1.0 }), paletteColor(theme.withAlpha(theme.COLOR_TEXT_MUTED, 140)), clip);
+        }
+        row_y += row_h;
+    }
+}
+
+fn firstMeasuredLine(text: []const u8, font_size: f32, max_w: f32) []const u8 {
+    var it: MeasuredLineIterator = .{ .text = text, .font_size = font_size, .max_w = max_w };
+    return it.next() orelse "";
+}
+
+/// Thin bar of `length` rotated by `angle` about its start point, built from
+/// two triangles so it works with the plain triangle primitive.
+fn queueRotatedBar(state: *app_state.AppState, origin: palette.draw.Vec2, length: f32, thickness: f32, angle: f32, color: palette.Color, clip: palette.Rect) void {
+    const dx = std.math.cos(angle);
+    const dy = std.math.sin(angle);
+    const nx = -dy * thickness * 0.5;
+    const ny = dx * thickness * 0.5;
+    const a: palette.draw.Vec2 = .{ .x = origin.x + nx, .y = origin.y + ny };
+    const b: palette.draw.Vec2 = .{ .x = origin.x - nx, .y = origin.y - ny };
+    const c: palette.draw.Vec2 = .{ .x = origin.x + dx * length - nx, .y = origin.y + dy * length - ny };
+    const d: palette.draw.Vec2 = .{ .x = origin.x + dx * length + nx, .y = origin.y + dy * length + ny };
+    queueTriangleClipped(state, a, b, c, color, clip);
+    queueTriangleClipped(state, a, c, d, color, clip);
+}
+
+test "todo list detection accepts provider task lists and rejects prose" {
+    try std.testing.expect(isTodoListMessage("Todos", "- [>] Confirm routing\n- [ ] Harden gate\n- [x] Run tests\n"));
+    try std.testing.expect(isTodoListMessage("Todos", "- [completed] Read\n- [pending] Build"));
+    try std.testing.expect(!isTodoListMessage("Todos", "- [>] Confirm routing\nSome trailing prose"));
+    try std.testing.expect(!isTodoListMessage("Notice", "- [ ] Not a todo author"));
+    try std.testing.expect(!isTodoListMessage("Todos", ""));
+}
+
+test "todo summary counts statuses" {
+    const summary = summarizeTodos("- [x] one\n- [>] two\n- [ ] three\n- [-] four");
+    try std.testing.expectEqual(@as(usize, 4), summary.total);
+    try std.testing.expectEqual(@as(usize, 1), summary.completed);
+    try std.testing.expectEqual(@as(usize, 1), summary.in_progress);
+    const item = parseTodoLine("-  [X]   spaced   ").?;
+    try std.testing.expectEqual(TodoItemStatus.completed, item.status);
+    try std.testing.expectEqualStrings("spaced", item.text);
+}
+
 fn isDiffSummaryMessage(author: []const u8, body_raw: []const u8) bool {
     if (!std.mem.eql(u8, author, "Changed files")) return false;
     return utils.isPersistedDiffBody(body_raw);
