@@ -2029,6 +2029,13 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                     if (state.pasteClipboardTextIntoPaletteComposer()) return true;
                 }
             }
+            // A focused browser pane reserves the conventional reload chord
+            // for its active tab, ahead of any app-refresh override that
+            // still binds plain Ctrl+R.
+            if (handleBrowserReloadShortcut(state, &event.key)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             // Palette and config refresh must win from anywhere — including
             // while a TUI owns focus — so Ctrl+Shift+R is not typed into
             // Claude/Codex as a redraw chord.
@@ -2082,10 +2089,6 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                     syncWindowTextInput(window, state);
                     return true;
                 }
-            }
-            if (handleBrowserReloadShortcut(state, &event.key)) {
-                syncWindowTextInput(window, state);
-                return true;
             }
             const native_browser_focused = state.isNativeBrowserSurfaceFocused();
             if (native_browser_focused) {

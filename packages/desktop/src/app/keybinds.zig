@@ -2408,6 +2408,60 @@ test "parse accelerator matches desktop-style refresh binding" {
     try std.testing.expectEqual(sdl.Keycode.r, binding.key);
 }
 
+/// Primary modifier bits for synthesized key events, mirroring Keybind's
+/// platform mapping (Cmd on macOS, Ctrl elsewhere).
+fn primaryModBits() u16 {
+    return if (builtin.os.tag == .macos) sdl.Keymod.gui else sdl.Keymod.ctrl;
+}
+
+fn testKeyEvent(key: sdl.Keycode, mod_bits: u16) sdl.KeyboardEvent {
+    var event: sdl.KeyboardEvent = undefined;
+    @memset(std.mem.asBytes(&event), 0);
+    event.type = .key_down;
+    event.down = true;
+    event.key = key;
+    @as(*u16, @ptrCast(&event.mod)).* = mod_bits;
+    return event;
+}
+
+test "browser reload reserves plain primary+R while app refresh stays on Shift+R" {
+    const allocator = std.testing.allocator;
+    const defaults = try cloneDefaultKeybinds(allocator);
+    defer allocator.free(defaults);
+
+    const reload_event = testKeyEvent(.r, primaryModBits());
+    try std.testing.expect(isBrowserReloadEvent(&reload_event));
+
+    // No default app-refresh binding claims the bare chord, so Ctrl+R
+    // (Cmd+R on macOS) in a focused browser pane always reaches the active
+    // tab instead of reloading app config.
+    var saw_shift_r = false;
+    var saw_f5 = false;
+    for (defaults) |binding| {
+        try std.testing.expect(!binding.matches(&reload_event));
+        if (binding.key == .r) {
+            try std.testing.expect(binding.shift);
+            saw_shift_r = true;
+        }
+        if (binding.key == .f5) saw_f5 = true;
+    }
+    try std.testing.expect(saw_shift_r);
+    try std.testing.expect(saw_f5);
+
+    // The shifted chord stays an app refresh and never a tab reload.
+    const refresh_event = testKeyEvent(.r, primaryModBits() | sdl.Keymod.shift);
+    try std.testing.expect(!isBrowserReloadEvent(&refresh_event));
+    var refresh_matched = false;
+    for (defaults) |binding| {
+        if (binding.matches(&refresh_event)) refresh_matched = true;
+    }
+    try std.testing.expect(refresh_matched);
+
+    var repeat_event = testKeyEvent(.r, primaryModBits());
+    repeat_event.repeat = true;
+    try std.testing.expect(!isBrowserReloadEvent(&repeat_event));
+}
+
 test "ctrl shift key tip follows the first matching configured binding" {
     const bindings: [2]Keybind = .{
         .{ .alt = true, .shift = true, .key = .x },
