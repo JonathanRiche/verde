@@ -11,12 +11,12 @@ Run commands from the repository root. Use the narrowest check during iteration.
 
 | Change | Final verification |
 | --- | --- |
-| Routine desktop feature/UI | `mise run dev-build` |
-| Daemon, CLI, provider bridge, or other non-GUI artifact | Owning build/test target; `mise run build` when full installation is needed |
+| Routine desktop feature/UI, including provider/chat UI | `mise run dev-build` |
+| Daemon, CLI, provider bridge executable, or other non-GUI artifact | Owning build/test target; `mise run build` only when the bridge executable, payloads, or installer changed |
 | Packaging, installation, runtime payloads, loader paths | `mise run build-verify-install` |
 | Documentation only | Check diff and references; no build |
 
-`dev-build` installs only `verde-gui`; it skips auxiliary executables, payloads, and tests. Do not append a full build merely because Zig changed. Use LLVM; the self-hosted x86 backend miscompiles Verde. Never use bare `zig build` (broken Debug + WPE defaults). Lower-level targets need `--release=safe -Dbrowser-backend=native_webview`.
+`dev-build` installs only `verde-gui`; it skips auxiliary executables, payloads, and tests. Do not append a full build merely because Zig changed. `tmp/` holds scratch notes, not build instructions; ignore any build commands quoted there. Use LLVM; the self-hosted x86 backend miscompiles Verde. Never use bare `zig build` (broken Debug + WPE defaults). Lower-level targets need `--release=safe -Dbrowser-backend=native_webview`.
 
 - Keep tests separate from build/install. Do not add a second isolated-prefix build to routine verification.
 - Prefer `headless-test` for core work and `runtime-test` for remote runtime work. Reserve aggregate `test` for cross-cutting/test-infrastructure changes or explicit requests. Use `test-compile` only for targets that cannot execute tests.
