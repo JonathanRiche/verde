@@ -126,11 +126,12 @@ pub const OPENCODE_MODEL_OPTIONS = [_]ModelOption{
 
 pub const CODEX_MODEL_OPTIONS = [_]ModelOption{
     .{ .label = "GPT-6 Astra", .value = "gpt-6-astra" },
+    .{ .label = "GPT-6 Sol", .value = "gpt-6-sol" },
+    .{ .label = "GPT-6 Luna", .value = "gpt-6-luna" },
     .{ .label = "GPT-5.6 Sol", .value = "gpt-5.6-sol" },
     .{ .label = "GPT-5.5", .value = "gpt-5.5" },
     .{ .label = "GPT-5.6 Terra", .value = "gpt-5.6-terra" },
     .{ .label = "GPT-5.6 Luna", .value = "gpt-5.6-luna" },
-    .{ .label = "GPT-5.3 Codex Spark", .value = "gpt-5.3-codex-spark" },
 };
 
 const CURSOR_GROK_EFFORT_VALUES = [_][:0]const u8{ "low", "medium", "high" };
@@ -276,6 +277,8 @@ pub const CODEX_MAX_REASONING_OPTIONS = CODEX_REASONING_OPTIONS ++ [_]ReasoningO
 pub fn codexReasoningOptions(model_ref: ?[]const u8) []const ReasoningOption {
     const model = model_ref orelse DEFAULT_CODEX_MODEL;
     if (std.mem.eql(u8, model, "gpt-6-astra") or
+        std.mem.eql(u8, model, "gpt-6-sol") or
+        std.mem.eql(u8, model, "gpt-6-luna") or
         std.mem.eql(u8, model, "gpt-5.6-sol") or
         std.mem.eql(u8, model, "gpt-5.6-terra") or
         std.mem.eql(u8, model, "gpt-5.6-luna"))
@@ -296,22 +299,22 @@ pub const CODEX_ACCESS_MODE_OPTIONS = [_]AccessModeOption{
 };
 
 test "Codex model options omit unsupported subscription models" {
-    try std.testing.expectEqual(@as(usize, 6), CODEX_MODEL_OPTIONS.len);
+    try std.testing.expectEqual(@as(usize, 7), CODEX_MODEL_OPTIONS.len);
     try std.testing.expectEqualStrings("gpt-6-astra", CODEX_MODEL_OPTIONS[0].value.?);
-    try std.testing.expectEqualStrings("gpt-5.6-sol", CODEX_MODEL_OPTIONS[1].value.?);
-    try std.testing.expectEqualStrings("gpt-5.5", CODEX_MODEL_OPTIONS[2].value.?);
-    try std.testing.expectEqualStrings("gpt-5.6-terra", CODEX_MODEL_OPTIONS[3].value.?);
-    try std.testing.expectEqualStrings("gpt-5.6-luna", CODEX_MODEL_OPTIONS[4].value.?);
-    try std.testing.expectEqualStrings("gpt-5.3-codex-spark", CODEX_MODEL_OPTIONS[5].value.?);
+    try std.testing.expectEqualStrings("gpt-6-sol", CODEX_MODEL_OPTIONS[1].value.?);
+    try std.testing.expectEqualStrings("gpt-6-luna", CODEX_MODEL_OPTIONS[2].value.?);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", CODEX_MODEL_OPTIONS[3].value.?);
+    try std.testing.expectEqualStrings("gpt-5.5", CODEX_MODEL_OPTIONS[4].value.?);
+    try std.testing.expectEqualStrings("gpt-5.6-terra", CODEX_MODEL_OPTIONS[5].value.?);
+    try std.testing.expectEqualStrings("gpt-5.6-luna", CODEX_MODEL_OPTIONS[6].value.?);
 }
 
 test "Codex 5.6 and 6 models expose max reasoning" {
-    for ([_][]const u8{ "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna" }) |model| {
+    for ([_][]const u8{ "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna" }) |model| {
         const options = codexReasoningOptions(model);
         try std.testing.expectEqual(ReasoningEffort.max, options[options.len - 1].value.?);
     }
     try std.testing.expectEqual(@as(usize, 5), codexReasoningOptions("gpt-5.5").len);
-    try std.testing.expectEqual(@as(usize, 5), codexReasoningOptions("gpt-5.3-codex-spark").len);
 }
 
 test "Claude fallback defaults to Fable 5.1" {
