@@ -105,6 +105,9 @@ var palette_hit_count: usize = 0;
 var palette_sidebar_rect: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
 var sidebar_scroll_y: f32 = 0.0;
 var sidebar_max_scroll_y: f32 = 0.0;
+var sidebar_revealed_project_index: ?usize = null;
+var sidebar_revealed_pane_id: ?native_state.WorkspacePaneId = null;
+var sidebar_revealed_view_h: f32 = 0.0;
 var attention_scroll_y: f32 = 0.0;
 var attention_max_scroll_y: f32 = 0.0;
 var attention_clip: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
@@ -1119,6 +1122,36 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
         .w = rect.w,
         .h = @max(list_bottom - workspace_top, 0.0),
     };
+    const focused_project_index = state.project_controller.selected_index;
+    const focused_pane_id = if (focused_project_index < state.project_controller.projects.items.len)
+        state.project_controller.projects.items[focused_project_index].workspace_layout.focused_pane_id
+    else
+        null;
+    const focus_changed = sidebar_revealed_project_index != focused_project_index or
+        sidebar_revealed_pane_id != focused_pane_id or sidebar_revealed_view_h != workspace_clip.h;
+    var content_y = workspace_top;
+    var focused_row: ?palette.Rect = null;
+    for (state.project_controller.projects.items, 0..) |*project, index| {
+        content_y += theme.scaledUi(34.0);
+        if (index == focused_project_index and !project.collapsed) {
+            const measured = measureSidebarPaneRows(&project.workspace_layout, focused_pane_id);
+            if (measured.focused_top) |top| {
+                focused_row = .{ .x = 0.0, .y = content_y + top, .w = 0.0, .h = measured.focused_h };
+            }
+            content_y += measured.height;
+        }
+        content_y += theme.scaledUi(8.0);
+    }
+    sidebar_max_scroll_y = @max(0.0, content_y - (workspace_clip.y + workspace_clip.h) + theme.scaledUi(8.0));
+    sidebar_scroll_y = theme.clampf(sidebar_scroll_y, 0.0, sidebar_max_scroll_y);
+    if (focus_changed) {
+        if (focused_row) |row| {
+            sidebar_scroll_y = revealSidebarRow(sidebar_scroll_y, row.y, row.h, workspace_clip, sidebar_max_scroll_y);
+        }
+        sidebar_revealed_project_index = focused_project_index;
+        sidebar_revealed_pane_id = focused_pane_id;
+        sidebar_revealed_view_h = workspace_clip.h;
+    }
     var y = workspace_top - sidebar_scroll_y;
 
     var project_index: usize = 0;
@@ -1291,6 +1324,65 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
     addPaletteHit(add_rect, .add_workspace, 0, 0);
 
     renderPaletteSearchTrigger(state, .{ .x = x, .y = search_top, .w = rail_w, .h = search_h });
+}
+
+const SidebarPaneRowsMeasurement = struct {
+    height: f32 = 0.0,
+    focused_top: ?f32 = null,
+    focused_h: f32 = 0.0,
+};
+
+fn measureSidebarPaneRows(layout: *const native_state.WorkspaceLayout, focused_pane_id: ?native_state.WorkspacePaneId) SidebarPaneRowsMeasurement {
+    var measured: SidebarPaneRowsMeasurement = .{};
+    if (layout.panes.items.len == 0) return measured;
+    const row_h = theme.scaledUi(SIDEBAR_THREAD_ROW_HEIGHT_CSS);
+    const row_step = theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS);
+    const tile_gap = theme.scaledUi(4.0);
+    for (layout.panes.items, 0..) |pane, pane_index| {
+        const group_id = layout.scrollGroupIdForPane(pane.id) orelse continue;
+        const group_count = layout.scrollGroupPaneCount(group_id);
+        if (group_count > 1) {
+            var seen = false;
+            for (layout.panes.items[0..pane_index]) |earlier| {
+                if (layout.scrollGroupIdForPane(earlier.id) == group_id) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) continue;
+            const root = layout.root orelse continue;
+            const rows = sidebarScrollGroupRows(layout, root, group_id);
+            const group_h = row_h * @as(f32, @floatFromInt(@max(rows, 1))) +
+                tile_gap * @as(f32, @floatFromInt(if (rows > 0) rows - 1 else 0));
+            if (focused_pane_id != null and layout.scrollGroupIdForPane(focused_pane_id.?) == group_id) {
+                measured.focused_top = measured.height;
+                measured.focused_h = group_h;
+            }
+            measured.height += group_h + tile_gap;
+        } else {
+            if (focused_pane_id == pane.id) {
+                measured.focused_top = measured.height;
+                measured.focused_h = row_h;
+            }
+            measured.height += row_step;
+        }
+    }
+    measured.height += theme.scaledUi(4.0);
+    return measured;
+}
+
+fn revealSidebarRow(scroll_y: f32, row_y: f32, row_h: f32, clip: palette.Rect, max_scroll_y: f32) f32 {
+    const visible_y = row_y - scroll_y;
+    if (visible_y < clip.y) return theme.clampf(scroll_y + visible_y - clip.y, 0.0, max_scroll_y);
+    if (visible_y + row_h > clip.y + clip.h) return theme.clampf(scroll_y + visible_y + row_h - clip.y - clip.h, 0.0, max_scroll_y);
+    return scroll_y;
+}
+
+test "sidebar reveals a newly focused row past the viewport edge" {
+    const clip: palette.Rect = .{ .x = 0.0, .y = 100.0, .w = 240.0, .h = 200.0 };
+    try std.testing.expectEqual(@as(f32, 48.0), revealSidebarRow(0.0, 304.0, 44.0, clip, 80.0));
+    try std.testing.expectEqual(@as(f32, 12.0), revealSidebarRow(80.0, 112.0, 44.0, clip, 80.0));
+    try std.testing.expectEqual(@as(f32, 0.0), revealSidebarRow(0.0, 150.0, 44.0, clip, 80.0));
 }
 
 /// Pinned command-palette trigger, kept deliberately quiet: a search glyph,
