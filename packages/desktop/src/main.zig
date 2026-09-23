@@ -2045,6 +2045,12 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
+            // Ctrl+T / Ctrl+W open and close browser tabs, only while the
+            // browser pane owns focus so terminals and chats keep the chords.
+            if (handleBrowserTabShortcut(state, &event.key)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             // Palette and config refresh must win from anywhere — including
             // while a TUI owns focus — so Ctrl+Shift+R is not typed into
             // Claude/Codex as a redraw chord.
@@ -2652,6 +2658,22 @@ fn handleBrowserReloadShortcut(state: *AppState, event: *const sdl.KeyboardEvent
     if (!keybinds.isBrowserReloadEvent(event)) return false;
     state.reloadBrowser();
     return true;
+}
+
+fn handleBrowserTabShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+    if (!state.isBrowserVisible()) return false;
+    if (!state.isBrowserPaneFocused() and !state.browser_controller.address_focused) return false;
+    if (keybinds.isBrowserNewTabEvent(event)) {
+        browser_ui.blurAddress(state);
+        state.createBrowserTab();
+        return true;
+    }
+    if (keybinds.isBrowserCloseTabEvent(event)) {
+        browser_ui.blurAddress(state);
+        if (state.browserTabCount() > 0) state.closeBrowserTab(state.activeBrowserTabIndex());
+        return true;
+    }
+    return false;
 }
 
 fn handleBrowserInspectorEscape(state: *AppState, event: *const sdl.KeyboardEvent) bool {

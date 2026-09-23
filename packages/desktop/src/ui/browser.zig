@@ -992,12 +992,12 @@ fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect, right_rese
             .h = tab_close_size,
         };
         const leading = renderTabIndicator(state, 0, tab_rect);
-        queuePaletteText(state, .{
+        renderTabTitle(state, .{
             .x = tab_rect.x + theme.scaledUi(6.0) + leading,
             .y = row_y + theme.scaledUi(6.0),
             .w = @max(tab_close_rect.x - tab_rect.x - theme.scaledUi(10.0) - leading, 1.0),
             .h = theme.scaledUi(18.0),
-        }, state.browserTabTitle(0), paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), tab_rect);
+        }, state.browserTabTitle(0), paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0));
         renderCompactIconButton(state, tab_close_rect, NF_COD_CLOSE, rectHovered(tab_close_rect), false);
         palette_tab_hits[palette_tab_hit_count] = .{ .rect = tab_close_rect, .index = 0, .kind = .close };
         palette_tab_hit_count += 1;
@@ -1035,12 +1035,12 @@ fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect, right_rese
                 .h = tab_close_size,
             };
             const leading = renderTabIndicator(state, tab_index, tab_rect);
-            queuePaletteText(state, .{
+            renderTabTitle(state, .{
                 .x = tab_rect.x + theme.scaledUi(8.0) + leading,
                 .y = tab_rect.y + theme.scaledUi(6.0),
                 .w = @max(tab_close_rect.x - tab_rect.x - theme.scaledUi(12.0) - leading, 1.0),
                 .h = theme.scaledUi(18.0),
-            }, state.browserTabTitle(tab_index), paletteColor(if (tab_index == state.activeBrowserTabIndex()) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), tab_rect);
+            }, state.browserTabTitle(tab_index), paletteColor(if (tab_index == state.activeBrowserTabIndex()) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0));
             renderCompactIconButton(state, tab_close_rect, NF_COD_CLOSE, rectHovered(tab_close_rect), false);
             palette_tab_hits[palette_tab_hit_count] = .{ .rect = tab_rect, .index = tab_index, .kind = .select };
             palette_tab_hit_count += 1;
@@ -1117,6 +1117,34 @@ fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect, right_rese
         state.browser_controller.inspector_menu_open = false;
     }
     if (toolbar_overflow_open) renderToolbarOverflowMenu(state, overflow_rect, show_copy, show_external, show_inspector);
+}
+
+/// Draws a tab title ellipsized to `rect.w` and clipped to `rect`, so long
+/// titles never run under the tab's close button.
+fn renderTabTitle(state: *app_state.AppState, rect: palette.Rect, title: []const u8, color: palette.Color, font_size: f32) void {
+    var buffer: [256]u8 = undefined;
+    queuePaletteText(state, rect, ellipsizedTabTitle(&buffer, title, rect.w, font_size), color, font_size, rect);
+}
+
+/// Truncates `title` with a trailing ellipsis to fit `max_w`, cutting only at
+/// UTF-8 codepoint boundaries.
+fn ellipsizedTabTitle(buffer: []u8, title: []const u8, max_w: f32, font_size: f32) []const u8 {
+    const ellipsis = "\u{2026}";
+    const bounded = title[0..@min(title.len, buffer.len - ellipsis.len)];
+    if (bounded.len == title.len and app_state.paletteUiTextPrefixWidth(bounded, font_size, bounded.len) <= max_w) return title;
+    const ellipsis_w = app_state.paletteUiTextPrefixWidth(ellipsis, font_size, ellipsis.len);
+    var end: usize = 0;
+    var fit_end: usize = 0;
+    while (end < bounded.len) {
+        const cp_len = std.unicode.utf8ByteSequenceLength(bounded[end]) catch 1;
+        const next = @min(end + cp_len, bounded.len);
+        if (app_state.paletteUiTextPrefixWidth(bounded, font_size, next) + ellipsis_w > max_w) break;
+        fit_end = next;
+        end = next;
+    }
+    @memcpy(buffer[0..fit_end], bounded[0..fit_end]);
+    @memcpy(buffer[fit_end .. fit_end + ellipsis.len], ellipsis);
+    return buffer[0 .. fit_end + ellipsis.len];
 }
 
 fn firstVisibleBrowserTabIndex(tab_count: usize, active_index: usize, slot_count: usize) usize {
@@ -1777,7 +1805,7 @@ fn focusAddress(state: *app_state.AppState) void {
     state.browser_controller.address_cursor = @min(state.browser_controller.address_cursor, state.browserState().addressInput().len);
 }
 
-fn blurAddress(state: *app_state.AppState) void {
+pub fn blurAddress(state: *app_state.AppState) void {
     state.browser_controller.address_focused = false;
     state.browser_controller.address_cursor = @min(state.browser_controller.address_cursor, state.browserState().addressInput().len);
     state.browser_controller.address_drag_active = false;

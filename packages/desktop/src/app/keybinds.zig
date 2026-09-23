@@ -204,6 +204,18 @@ pub fn isBrowserReloadEvent(event: *const sdl.KeyboardEvent) bool {
     return binding.matches(event);
 }
 
+/// Matches the conventional new-tab chord reserved for focused browser panes.
+pub fn isBrowserNewTabEvent(event: *const sdl.KeyboardEvent) bool {
+    const binding: Keybind = .{ .primary = true, .key = .t };
+    return binding.matches(event);
+}
+
+/// Matches the conventional close-tab chord reserved for focused browser panes.
+pub fn isBrowserCloseTabEvent(event: *const sdl.KeyboardEvent) bool {
+    const binding: Keybind = .{ .primary = true, .key = .w };
+    return binding.matches(event);
+}
+
 pub const NativeKeyboardConfig = struct {
     allocator: std.mem.Allocator,
     refresh: []Keybind,

@@ -2368,7 +2368,9 @@ fn renderOpenPaneRow(
             // Unclipped primitive: skip it when the row straddles the list
             // edge so the globe cannot bleed into the section below.
             if (intersectRects(.{ .x = icon_x, .y = cy - globe_size * 0.5, .w = slot, .h = globe_size }, clip)) |visible| {
-                if (visible.h >= globe_size) globe_icon.queue(state, icon_x + slot * 0.5, cy, globe_size, paletteColor(muted));
+                // Tolerate float rounding: eased rows sit at fractional y, so a
+                // fully visible globe can intersect to a hair under its size.
+                if (visible.h + 0.5 >= globe_size) globe_icon.queue(state, icon_x + slot * 0.5, cy, globe_size, paletteColor(muted));
             }
             title = browserPaneTitle(pane);
         },
