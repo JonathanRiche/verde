@@ -253,21 +253,93 @@ const DaemonTailBatchRequest = struct {
     max_bytes: usize,
 };
 
-/// Coalesces same-frame daemon tails and reuses the request connection without
-/// changing terminal poll cadence.
+// Workers own request data only: panes may close, move or change workspace while
+// IPC is pending. The UI resolves live sessions again before applying a reply.
+const DaemonTailJob = struct {
+    arena: std.heap.ArenaAllocator,
+    pref_path: []const u8,
+    requests: []const DaemonTailBatchRequest,
+    worker: ?std.Thread = null,
+    done: std.atomic.Value(bool) = .init(false),
+    response: ?[]u8 = null,
+    failure: ?anyerror = null,
+
+    fn create(pref_path: []const u8, requests: []const DaemonTailBatchRequest) !*DaemonTailJob {
+        const allocator = std.heap.page_allocator;
+        const job = try allocator.create(DaemonTailJob);
+        errdefer allocator.destroy(job);
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const owned = try arena.allocator().dupe(DaemonTailBatchRequest, requests);
+        for (owned) |*request| {
+            request.id = try arena.allocator().dupe(u8, request.id);
+            request.attach_id = try arena.allocator().dupe(u8, request.attach_id);
+        }
+        const owned_pref_path = try arena.allocator().dupe(u8, pref_path);
+        job.* = .{
+            .arena = arena,
+            .pref_path = owned_pref_path,
+            .requests = owned,
+        };
+        return job;
+    }
+
+    fn destroy(self: *DaemonTailJob) void {
+        if (self.worker) |worker| worker.join();
+        if (self.response) |response| std.heap.page_allocator.free(response);
+        self.arena.deinit();
+        std.heap.page_allocator.destroy(self);
+    }
+
+    fn run(self: *DaemonTailJob) void {
+        defer self.done.store(true, .release);
+        self.response = self.fetch() catch |err| {
+            self.failure = err;
+            return;
+        };
+    }
+
+    fn fetch(self: *DaemonTailJob) ![]u8 {
+        const allocator = std.heap.page_allocator;
+        const started_ns = platform_runtime.monotonicTimestampNs();
+        const response = try daemon_client.requestAlloc(allocator, self.pref_path, "session.tail.batch", .{ .requests = self.requests }, 1);
+        errdefer allocator.free(response);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+        defer parsed.deinit();
+        if (parsed.value == .object) {
+            if (parsed.value.object.get("error")) |err_value| {
+                const code = if (err_value == .object) jsonString(err_value.object.get("code") orelse .null) orelse "" else "";
+                if (std.mem.eql(u8, code, "method_not_found")) {
+                    // Compatibility with older daemons stays off the UI thread too.
+                    var replies: std.ArrayList(std.json.Value) = .empty;
+                    const arena = self.arena.allocator();
+                    for (self.requests) |request| {
+                        const elapsed_ms = (platform_runtime.monotonicTimestampNs() - started_ns) / std.time.ns_per_ms;
+                        if (elapsed_ms >= 5_000) return error.ConnectionTimedOut;
+                        const single = try daemon_client.requestAllocWithTimeout(arena, self.pref_path, "session.tail", request, 1, @intCast(5_000 - elapsed_ms));
+                        const value = try std.json.parseFromSlice(std.json.Value, arena, single, .{});
+                        try replies.append(arena, value.value);
+                    }
+                    const combined = try std.json.Stringify.valueAlloc(allocator, .{ .result = .{ .responses = replies.items } }, .{});
+                    allocator.free(response);
+                    return combined;
+                }
+            }
+        }
+        return response;
+    }
+};
+
+/// One bounded background request for the visible workspace's terminal tails.
 pub const DaemonPollBatch = struct {
     sessions: std.ArrayList(*Session) = .empty,
     requests: std.ArrayList(DaemonTailBatchRequest) = .empty,
-    response_scratch: std.ArrayList(u8) = .empty,
-    last_response: std.ArrayList(u8) = .empty,
-    connection: daemon_client.ReusableRequestConnection = .{},
+    job: ?*DaemonTailJob = null,
 
     pub fn deinit(self: *DaemonPollBatch, allocator: std.mem.Allocator) void {
+        if (self.job) |job| job.destroy();
         self.sessions.deinit(allocator);
         self.requests.deinit(allocator);
-        self.response_scratch.deinit(allocator);
-        self.last_response.deinit(allocator);
-        self.connection.deinit();
     }
 
     pub fn reset(self: *DaemonPollBatch) void {
@@ -275,9 +347,27 @@ pub const DaemonPollBatch = struct {
         self.requests.clearRetainingCapacity();
     }
 
-    pub fn prefetch(self: *DaemonPollBatch, allocator: std.mem.Allocator, pref_path: []const u8) !void {
-        if (!SESSION_SUPPORTED or self.sessions.items.len == 0) return;
+    pub fn suppressFallback(self: *DaemonPollBatch) void {
+        if (!SESSION_SUPPORTED) return;
+        for (self.sessions.items) |session| {
+            session.daemon_prefetched = true;
+            session.daemon_prefetched_changed = false;
+        }
+    }
 
+    pub fn prefetch(self: *DaemonPollBatch, allocator: std.mem.Allocator, pref_path: []const u8) !void {
+        if (!SESSION_SUPPORTED) return;
+        self.suppressFallback();
+        if (self.job) |job| {
+            if (!job.done.load(.acquire)) return;
+            self.job = null;
+            defer job.destroy();
+            if (std.mem.eql(u8, job.pref_path, pref_path)) {
+                if (job.failure) |err| return err;
+                try self.applyResponse(allocator, job);
+            }
+        }
+        if (self.sessions.items.len == 0) return;
         self.requests.clearRetainingCapacity();
         try self.requests.ensureTotalCapacity(allocator, self.sessions.items.len);
         for (self.sessions.items) |session| {
@@ -290,55 +380,89 @@ pub const DaemonPollBatch = struct {
             });
         }
         if (self.requests.items.len == 0) return;
+        const job = try DaemonTailJob.create(pref_path, self.requests.items);
+        errdefer job.destroy();
+        job.worker = try std.Thread.spawn(.{}, DaemonTailJob.run, .{job});
+        self.job = job;
+    }
 
-        try self.response_scratch.ensureTotalCapacity(allocator, daemon_client.MAX_RESPONSE_BYTES);
-        self.response_scratch.items.len = daemon_client.MAX_RESPONSE_BYTES;
-        const response = try self.connection.requestAllocUsingBuffer(
-            allocator,
-            pref_path,
-            "session.tail.batch",
-            .{ .requests = self.requests.items },
-            1,
-            self.response_scratch.items,
-        );
-        defer allocator.free(response);
-        if (cachedDaemonResponseMatches(&self.last_response, response) and
-            daemonSessionsCanReuseResponse(self.sessions.items[0..self.requests.items.len]))
-        {
-            for (self.sessions.items[0..self.requests.items.len]) |session| {
-                session.daemon_poll_failures = 0;
-                session.daemon_prefetched_changed = false;
-                session.daemon_prefetched = true;
-            }
-            return;
-        }
-        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    fn applyResponse(self: *DaemonPollBatch, allocator: std.mem.Allocator, job: *DaemonTailJob) !void {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, job.response orelse return error.InvalidSessionResponse, .{});
         defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidSessionResponse;
-        if (parsed.value.object.get("error")) |error_value| {
-            if (error_value == .object) {
-                const code = jsonString(error_value.object.get("code") orelse .null) orelse "";
-                if (std.mem.eql(u8, code, "method_not_found")) return error.UnsupportedDaemonBatch;
-            }
-            return error.InvalidSessionResponse;
-        }
+        if (parsed.value != .object or parsed.value.object.contains("error")) return error.InvalidSessionResponse;
         const result = parsed.value.object.get("result") orelse return error.InvalidSessionResponse;
         if (result != .object) return error.InvalidSessionResponse;
         const responses = result.object.get("responses") orelse return error.InvalidSessionResponse;
-        if (responses != .array or responses.array.items.len != self.requests.items.len) return error.InvalidSessionResponse;
-
-        for (self.sessions.items[0..self.requests.items.len], responses.array.items) |session, item| {
-            const initial_attach_replay = session.suppress_next_daemon_replay and session.remote_output_offset == 0;
-            session.daemon_prefetched_changed = try session.applyDaemonTailResponseValue(allocator, item, initial_attach_replay);
-            session.daemon_prefetched = true;
-        }
-        if (daemonSessionsCanReuseResponse(self.sessions.items[0..self.requests.items.len])) {
-            rememberDaemonResponse(&self.last_response, allocator, response);
-        } else {
-            self.last_response.clearRetainingCapacity();
+        if (responses != .array or responses.array.items.len != job.requests.len) return error.InvalidSessionResponse;
+        for (job.requests, responses.array.items) |request, item| {
+            for (self.sessions.items) |session| {
+                if (!daemonTailRequestMatchesSession(request, session)) continue;
+                const initial_attach_replay = session.suppress_next_daemon_replay and session.remote_output_offset == 0;
+                session.daemon_prefetched_changed = try session.applyDaemonTailResponseValue(allocator, item, initial_attach_replay);
+                session.daemon_poll_failures = 0;
+                break;
+            }
         }
     }
 };
+
+fn daemonTailRequestMatchesSession(request: DaemonTailBatchRequest, session: *const Session) bool {
+    return std.mem.eql(u8, request.id, session.session_id orelse return false) and
+        std.mem.eql(u8, request.attach_id, session.attach_id orelse "") and
+        request.offset == session.remote_output_offset;
+}
+
+test "daemon terminal polling returns while a request is pending and suppresses timeout fallback" {
+    if (!SESSION_SUPPORTED) return error.SkipZigTest;
+    // No emulator is needed: neither pending IPC nor a transport failure may
+    // touch it or issue an individual session.tail request on this thread.
+    var session: Session = undefined;
+    var batch: DaemonPollBatch = .{};
+    defer batch.deinit(std.testing.allocator);
+    try batch.sessions.append(std.testing.allocator, &session);
+    const job = try DaemonTailJob.create("unused-test-endpoint", &.{});
+    batch.job = job;
+
+    try batch.prefetch(std.testing.allocator, "unused-test-endpoint");
+    try std.testing.expect(batch.job == job);
+    try std.testing.expect(session.daemon_prefetched);
+    try std.testing.expect(!session.daemon_prefetched_changed);
+
+    job.failure = error.ConnectionTimedOut;
+    job.done.store(true, .release);
+    try std.testing.expectError(error.ConnectionTimedOut, batch.prefetch(std.testing.allocator, "unused-test-endpoint"));
+    try std.testing.expect(batch.job == null);
+    try std.testing.expect(session.daemon_prefetched);
+    try std.testing.expect(!session.daemon_prefetched_changed);
+}
+
+test "daemon terminal polling owns identities and rejects replies after reattach or cursor advance" {
+    if (!SESSION_SUPPORTED) return error.SkipZigTest;
+    var id = [_]u8{ 'p', 't', 'y' };
+    var attach = [_]u8{ 'o', 'l', 'd' };
+    const job = try DaemonTailJob.create("test-endpoint", &.{.{ .id = &id, .attach_id = &attach, .offset = 10, .max_bytes = 100 }});
+    defer job.destroy();
+    id[0] = 'x';
+    attach[0] = 'x';
+    try std.testing.expectEqualStrings("pty", job.requests[0].id);
+    try std.testing.expectEqualStrings("old", job.requests[0].attach_id);
+
+    var session: Session = undefined;
+    var live_id = [_]u8{ 'p', 't', 'y' };
+    var live_attach = [_]u8{ 'o', 'l', 'd' };
+    session.session_id = &live_id;
+    session.attach_id = &live_attach;
+    session.remote_output_offset = 10;
+    try std.testing.expect(daemonTailRequestMatchesSession(job.requests[0], &session));
+    session.remote_output_offset = 11;
+    try std.testing.expect(!daemonTailRequestMatchesSession(job.requests[0], &session));
+    session.remote_output_offset = 10;
+    live_attach[0] = 'n';
+    try std.testing.expect(!daemonTailRequestMatchesSession(job.requests[0], &session));
+    live_attach[0] = 'o';
+    live_id[0] = 'n';
+    try std.testing.expect(!daemonTailRequestMatchesSession(job.requests[0], &session));
+}
 
 fn cachedDaemonResponseMatches(cached: *const std.ArrayList(u8), response: []const u8) bool {
     return cached.items.len > 0 and std.mem.eql(u8, cached.items, response);
@@ -347,13 +471,6 @@ fn cachedDaemonResponseMatches(cached: *const std.ArrayList(u8), response: []con
 fn rememberDaemonResponse(cached: *std.ArrayList(u8), allocator: std.mem.Allocator, response: []const u8) void {
     cached.clearRetainingCapacity();
     cached.appendSlice(allocator, response) catch cached.clearRetainingCapacity();
-}
-
-fn daemonSessionsCanReuseResponse(sessions: []const *Session) bool {
-    for (sessions) |session| {
-        if (session.daemon_state != .attached or session.suppress_next_daemon_replay) return false;
-    }
-    return true;
 }
 
 test "daemon response cache only reuses an identical successful payload" {

@@ -2,6 +2,10 @@
     .name = .verde,
     .version = "0.0.0",
     .dependencies = .{
+        .toml = .{
+            .url = "https://github.com/eneskemalergin/z-toml/archive/74a8915cf1301c848c728a9d245892c3b5d14e25.tar.gz",
+            .hash = "z_toml-0.4.0-QKon8xw2CABxiUmkgbN-Wx4v7ur-oXk6JZTQBhbAaK78",
+        },
         .zig_dif = .{
             .path = "../zig_dif",
         },

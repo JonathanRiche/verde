@@ -4412,6 +4412,10 @@ fn writeTurnPolicyOverrides(
             .workspace_write => "workspaceWrite",
             .danger_full_access => "dangerFullAccess",
         });
+        if (sandbox_mode == .workspace_write) {
+            try stringify.objectField("writableRoots");
+            try stringify.write(request.workspace_roots);
+        }
         try stringify.endObject();
     }
 }
@@ -4437,6 +4441,7 @@ test "turn policy overrides preserve supervised and full access on resumed threa
             .prompt = "hi",
             .approval_policy = case.approval_policy,
             .sandbox_mode = case.sandbox_mode,
+            .workspace_roots = &.{ "/work/app", "/work/api" },
         });
         try stringify.endObject();
         const payload = try writer.toOwnedSlice();
@@ -4445,6 +4450,12 @@ test "turn policy overrides preserve supervised and full access on resumed threa
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
         defer parsed.deinit();
         try std.testing.expectEqualStrings(case.expected_approval, parsed.value.object.get("approvalPolicy").?.string);
+        const policy = parsed.value.object.get("sandboxPolicy").?.object;
+        if (case.sandbox_mode == .workspace_write) {
+            const roots = policy.get("writableRoots").?.array.items;
+            try std.testing.expectEqual(@as(usize, 2), roots.len);
+            try std.testing.expectEqualStrings("/work/api", roots[1].string);
+        } else try std.testing.expect(policy.get("writableRoots") == null);
         try std.testing.expectEqualStrings(
             case.expected_sandbox_type,
             parsed.value.object.get("sandboxPolicy").?.object.get("type").?.string,

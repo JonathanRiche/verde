@@ -1158,11 +1158,11 @@ fn runProcessLifecycleScenario(allocator: std.mem.Allocator, io: std.Io) !void {
 
 fn writeManagedProcessConfig(io: std.Io, workspace_path: []const u8, command: []const u8) !void {
     try std.Io.Dir.cwd().createDirPath(io, workspace_path);
-    const config_path = try std.fs.path.join(std.heap.page_allocator, &.{ workspace_path, "verde.yml" });
+    const config_path = try std.fs.path.join(std.heap.page_allocator, &.{ workspace_path, "verde.toml" });
     defer std.heap.page_allocator.free(config_path);
     var file = try std.Io.Dir.cwd().createFile(io, config_path, .{});
     defer file.close(io);
-    try file.writeStreamingAll(io, "processes:\n  sleeper:\n    command: \"");
+    try file.writeStreamingAll(io, "[processes.sleeper]\ncommand = \"");
     try file.writeStreamingAll(io, command);
     try file.writeStreamingAll(io, "\"\n");
 }

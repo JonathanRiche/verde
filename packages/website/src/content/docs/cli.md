@@ -296,9 +296,9 @@ verde live stack status [--project <id|index|path|current>] [--json]
   inspect the target before sending Enter or another consequential key.
 - `terminal tail` returns recent terminal output; `screen` returns the current
   visible terminal screen.
-- `process start`, `stop`, and `restart` control entries loaded from `verde.yml`.
+- `process start`, `stop`, and `restart` control entries loaded from `verde.toml`.
 - `agent open --provider <name>` opens that provider's first-class TUI in the
-  selected workspace without requiring a `verde.yml` entry. Grok is detected
+  selected workspace without requiring a `verde.toml` entry. Grok is detected
   from `PATH` and launched with `--no-auto-update`.
 - `stack start`, `stop`, and `restart` apply the same action to every configured process and agent in the selected workspace.
 

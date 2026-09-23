@@ -242,3 +242,16 @@ test('nested child agents stay on the top-level call and carry their parent', { 
   assert.equal(entries[6].id, 'nested');
   assert.equal(entries[6].output, 'nested report');
 });
+
+test('workspace roots reach Claude on resumed turns without widening permission mode', () => {
+  const { context } = bridge();
+  const options = context.buildClaudeOptions({
+    cwd: '/work/app', thread_id: 'existing',
+    workspace_roots: ['/work/app', '/work/api with spaces'],
+    approval_policy: 'on_request', sandbox_mode: 'workspace_write',
+  });
+  assert.deepEqual(Array.from(options.additionalDirectories), ['/work/app', '/work/api with spaces']);
+  assert.equal(options.resume, 'existing');
+  assert.equal(options.permissionMode, 'default');
+  assert.equal(options.allowDangerouslySkipPermissions, undefined);
+});

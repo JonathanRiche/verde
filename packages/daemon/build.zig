@@ -26,6 +26,7 @@ pub fn build(b: *std.Build) void {
         .@"emit-lib-vt" = true,
         .@"emit-xcframework" = false,
     });
+    const toml_module = b.dependency("toml", .{ .target = target, .optimize = optimize }).module("toml");
     const headless_module = b.createModule(.{
         .root_source_file = b.path("../headless/src/root.zig"),
         .target = target,
@@ -56,6 +57,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "build_options", .module = build_options_module },
         .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
         .{ .name = "headless", .module = headless_module },
+        .{ .name = "toml", .module = toml_module },
         .{ .name = "platform_paths", .module = platform_paths_module },
         .{ .name = "platform_runtime", .module = platform_runtime_module },
         .{ .name = "platform_windows_known_folders", .module = platform_windows_known_folders_module },

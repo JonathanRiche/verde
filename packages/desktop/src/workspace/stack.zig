@@ -1,8 +1,10 @@
 //! Project-local managed stack config parsing.
 
 const std = @import("std");
+const toml = @import("toml");
+pub const folders = @import("folders.zig");
 
-pub const CONFIG_FILENAMES = [_][]const u8{ "verde.yml", "verde.yaml" };
+pub const CONFIG_FILENAMES = [_][]const u8{"verde.toml"};
 
 /// Keep config fan-out and launch payloads bounded before daemon-owned PTYs
 /// are created. These limits protect both registry snapshots and responses.
@@ -160,21 +162,6 @@ pub fn validateDefinitionBounds(config: *const Config) ?BoundsViolation {
     return null;
 }
 
-const Section = enum {
-    none,
-    processes,
-    agents,
-};
-
-const ListField = enum {
-    none,
-    watch,
-    resources,
-    argv,
-    argv_windows,
-    argv_unix,
-};
-
 pub fn loadFromProject(allocator: std.mem.Allocator, project_path: []const u8) !?Config {
     var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
@@ -199,355 +186,110 @@ pub fn loadFromProject(allocator: std.mem.Allocator, project_path: []const u8) !
 }
 
 pub fn parse(allocator: std.mem.Allocator, content: []const u8, source_path: []const u8) !Config {
+    const root = try toml.parseSlice(allocator, content, null);
+    defer toml.deinit(root, allocator);
+    // Validate the complete workspace manifest even when only loading its stack.
+    var workspace = try folders.parse(allocator, content);
+    defer workspace.deinit(allocator);
     var config: Config = .{ .path = try allocator.dupe(u8, source_path) };
     errdefer config.deinit(allocator);
-
-    var section: Section = .none;
-    var current_index: ?usize = null;
-    var list_field: ListField = .none;
-
-    var lines = std.mem.splitScalar(u8, content, '\n');
-    while (lines.next()) |raw_line| {
-        const line_without_comment = stripYamlComment(raw_line);
-        if (std.mem.trim(u8, line_without_comment, " \t\r").len == 0) continue;
-
-        const indent = leadingSpaces(line_without_comment);
-        const trimmed = std.mem.trim(u8, line_without_comment, " \t\r");
-
-        if (indent == 0) {
-            current_index = null;
-            list_field = .none;
-            if (std.mem.eql(u8, trimmed, "processes:")) {
-                section = .processes;
-            } else if (std.mem.eql(u8, trimmed, "agents:")) {
-                section = .agents;
-            } else {
-                section = .none;
+    inline for (.{ "processes", "agents" }, .{ ProcessKind.process, ProcessKind.agent }) |section, kind| {
+        if (root.get(section)) |value| {
+            if (value != .table) return error.InvalidStackConfig;
+            var entries = value.table.iterator();
+            while (entries.next()) |entry| {
+                if (entry.value_ptr.* != .table) return error.InvalidStackConfig;
+                const table = entry.value_ptr.table;
+                var pending = true;
+                const name = try allocator.dupe(u8, entry.key_ptr.*);
+                errdefer if (pending) allocator.free(name);
+                const command = try allocator.dupe(u8, try folders.string(table, "command", ""));
+                errdefer if (pending) allocator.free(command);
+                const cwd = try allocator.dupe(u8, try folders.string(table, "cwd", "."));
+                errdefer if (pending) allocator.free(cwd);
+                try config.processes.append(allocator, .{
+                    .name = name,
+                    .command = command,
+                    .cwd = cwd,
+                    .kind = kind,
+                    .restart = try enumValue(RestartPolicy, table, "restart", .manual),
+                    .revive = try enumValue(RevivePolicy, table, "revive", .attach_or_create),
+                    .provider = if (table.contains("provider")) try enumValue(AgentProvider, table, "provider", .other) else null,
+                    .notify = try folders.boolean(table, "notify", false),
+                    .mcp = try folders.boolean(table, "mcp", false),
+                    .hooks = try folders.boolean(table, "hooks", false),
+                });
+                pending = false;
+                const process = &config.processes.items[config.processes.items.len - 1];
+                inline for (.{ "command_windows", "command_unix" }) |key| {
+                    if (table.contains(key)) @field(process, key) = try allocator.dupe(u8, try folders.string(table, key, ""));
+                }
+                inline for (.{ "argv", "argv_windows", "argv_unix", "watch", "resources" }) |key| {
+                    if (table.get(key)) |array| {
+                        if (array != .array) return error.InvalidStackConfig;
+                        for (array.array.items) |item| {
+                            if (item != .string) return error.InvalidStackConfig;
+                            const owned = try allocator.dupe(u8, item.string);
+                            errdefer allocator.free(owned);
+                            try @field(process, key).append(allocator, owned);
+                        }
+                    }
+                }
+                if (!process.hasAnyLaunch()) return error.InvalidStackConfig;
             }
-            continue;
-        }
-
-        if ((section == .processes or section == .agents) and indent == 2 and std.mem.endsWith(u8, trimmed, ":")) {
-            const raw_name = std.mem.trim(u8, trimmed[0 .. trimmed.len - 1], " \t\r\"'");
-            if (raw_name.len == 0) return error.InvalidStackConfig;
-            try config.processes.append(allocator, .{
-                .name = try allocator.dupe(u8, raw_name),
-                .kind = if (section == .agents) .agent else .process,
-                .command = try allocator.dupe(u8, ""),
-                .command_windows = null,
-                .command_unix = null,
-                .argv = .empty,
-                .argv_windows = .empty,
-                .argv_unix = .empty,
-                .cwd = try allocator.dupe(u8, "."),
-                .restart = if (section == .agents) .manual else .manual,
-                .provider = null,
-                .revive = .attach_or_create,
-                .notify = false,
-                .mcp = false,
-                .hooks = false,
-                .watch = .empty,
-                .resources = .empty,
-            });
-            current_index = config.processes.items.len - 1;
-            list_field = .none;
-            continue;
-        }
-
-        const index = current_index orelse continue;
-        var process = &config.processes.items[index];
-        if (indent >= 4 and list_field != .none and std.mem.startsWith(u8, trimmed, "-")) {
-            const value = try parseScalarAlloc(allocator, std.mem.trim(u8, trimmed[1..], " \t\r"));
-            errdefer allocator.free(value);
-            switch (list_field) {
-                .watch => try process.watch.append(allocator, value),
-                .resources => try process.resources.append(allocator, value),
-                .argv => try process.argv.append(allocator, value),
-                .argv_windows => try process.argv_windows.append(allocator, value),
-                .argv_unix => try process.argv_unix.append(allocator, value),
-                .none => unreachable,
-            }
-            continue;
-        }
-
-        if (indent < 4) continue;
-        const colon_index = std.mem.indexOfScalar(u8, trimmed, ':') orelse continue;
-        const key = std.mem.trim(u8, trimmed[0..colon_index], " \t\r");
-        const raw_value = std.mem.trim(u8, trimmed[colon_index + 1 ..], " \t\r");
-        list_field = .none;
-
-        if (std.mem.eql(u8, key, "command")) {
-            const value = try parseScalarAlloc(allocator, raw_value);
-            allocator.free(process.command);
-            process.command = value;
-        } else if (std.mem.eql(u8, key, "command_windows")) {
-            const value = try parseScalarAlloc(allocator, raw_value);
-            if (process.command_windows) |old| allocator.free(old);
-            process.command_windows = value;
-        } else if (std.mem.eql(u8, key, "command_unix")) {
-            const value = try parseScalarAlloc(allocator, raw_value);
-            if (process.command_unix) |old| allocator.free(old);
-            process.command_unix = value;
-        } else if (std.mem.eql(u8, key, "argv")) {
-            if (raw_value.len != 0) return error.InvalidStackConfig;
-            list_field = .argv;
-        } else if (std.mem.eql(u8, key, "argv_windows")) {
-            if (raw_value.len != 0) return error.InvalidStackConfig;
-            list_field = .argv_windows;
-        } else if (std.mem.eql(u8, key, "argv_unix")) {
-            if (raw_value.len != 0) return error.InvalidStackConfig;
-            list_field = .argv_unix;
-        } else if (std.mem.eql(u8, key, "cwd")) {
-            const value = try parseScalarAlloc(allocator, raw_value);
-            allocator.free(process.cwd);
-            process.cwd = value;
-        } else if (std.mem.eql(u8, key, "restart")) {
-            process.restart = parseRestart(raw_value) orelse return error.InvalidStackConfig;
-        } else if (std.mem.eql(u8, key, "provider")) {
-            process.provider = parseProvider(raw_value) orelse return error.InvalidStackConfig;
-        } else if (std.mem.eql(u8, key, "revive")) {
-            process.revive = parseRevive(raw_value) orelse return error.InvalidStackConfig;
-        } else if (std.mem.eql(u8, key, "notify")) {
-            process.notify = parseBool(raw_value) orelse return error.InvalidStackConfig;
-        } else if (std.mem.eql(u8, key, "mcp")) {
-            process.mcp = parseBool(raw_value) orelse return error.InvalidStackConfig;
-        } else if (std.mem.eql(u8, key, "hooks")) {
-            process.hooks = parseBool(raw_value) orelse return error.InvalidStackConfig;
-        } else if (std.mem.eql(u8, key, "watch")) {
-            if (raw_value.len != 0) return error.InvalidStackConfig;
-            list_field = .watch;
-        } else if (std.mem.eql(u8, key, "resources")) {
-            if (raw_value.len != 0) return error.InvalidStackConfig;
-            list_field = .resources;
         }
     }
-
-    var index: usize = 0;
-    while (index < config.processes.items.len) {
-        if (config.processes.items[index].hasAnyLaunch()) {
-            index += 1;
-            continue;
-        }
-        var removed = config.processes.orderedRemove(index);
-        removed.deinit(allocator);
-    }
-
     return config;
 }
 
-fn stripYamlComment(line: []const u8) []const u8 {
-    var in_single = false;
-    var in_double = false;
-    for (line, 0..) |byte, index| {
-        if (byte == '\'' and !in_double) in_single = !in_single;
-        if (byte == '"' and !in_single) in_double = !in_double;
-        if (byte == '#' and !in_single and !in_double) return line[0..index];
-    }
-    return line;
+fn enumValue(comptime T: type, table: *const toml.Table, key: []const u8, default: T) !T {
+    return std.meta.stringToEnum(T, try folders.string(table, key, @tagName(default))) orelse error.InvalidStackConfig;
 }
 
-fn leadingSpaces(line: []const u8) usize {
-    var count: usize = 0;
-    while (count < line.len and line[count] == ' ') : (count += 1) {}
-    return count;
-}
-
-fn parseScalarAlloc(allocator: std.mem.Allocator, raw_value: []const u8) ![]u8 {
-    var value = std.mem.trim(u8, raw_value, " \t\r");
-    if (value.len >= 2 and ((value[0] == '"' and value[value.len - 1] == '"') or (value[0] == '\'' and value[value.len - 1] == '\''))) {
-        value = value[1 .. value.len - 1];
-    }
-    return allocator.dupe(u8, value);
-}
-
-fn parseRestart(raw_value: []const u8) ?RestartPolicy {
-    const value = std.mem.trim(u8, raw_value, " \t\r\"'");
-    if (std.mem.eql(u8, value, "manual")) return .manual;
-    if (std.mem.eql(u8, value, "on_crash")) return .on_crash;
-    if (std.mem.eql(u8, value, "always")) return .always;
-    return null;
-}
-
-fn parseProvider(raw_value: []const u8) ?AgentProvider {
-    const value = std.mem.trim(u8, raw_value, " \t\r\"'");
-    if (std.mem.eql(u8, value, "codex")) return .codex;
-    if (std.mem.eql(u8, value, "claude")) return .claude;
-    if (std.mem.eql(u8, value, "opencode")) return .opencode;
-    if (std.mem.eql(u8, value, "cursor")) return .cursor;
-    if (std.mem.eql(u8, value, "grok")) return .grok;
-    if (std.mem.eql(u8, value, "amp")) return .amp;
-    if (std.mem.eql(u8, value, "other")) return .other;
-    return null;
-}
-
-fn parseRevive(raw_value: []const u8) ?RevivePolicy {
-    const value = std.mem.trim(u8, raw_value, " \t\r\"'");
-    if (std.mem.eql(u8, value, "attach_or_create")) return .attach_or_create;
-    if (std.mem.eql(u8, value, "attach_only")) return .attach_only;
-    if (std.mem.eql(u8, value, "restart")) return .restart;
-    if (std.mem.eql(u8, value, "manual")) return .manual;
-    return null;
-}
-
-fn parseBool(raw_value: []const u8) ?bool {
-    const value = std.mem.trim(u8, raw_value, " \t\r\"'");
-    if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "yes") or std.mem.eql(u8, value, "1")) return true;
-    if (std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "no") or std.mem.eql(u8, value, "0")) return false;
-    return null;
-}
-
-test "parse verde stack config" {
-    const content =
-        \\version: 1
-        \\processes:
-        \\  web:
-        \\    command: "npm run dev"
-        \\    cwd: "."
-        \\    restart: on_crash
-        \\    resources:
-        \\      - "build"
-        \\      - "port:3000"
-        \\    watch:
-        \\      - "src/**"
-        \\agents:
-        \\  codex:
-        \\    provider: codex
-        \\    command: "codex"
-        \\    revive: attach_or_create
-        \\    notify: true
-        \\    mcp: true
-        \\    hooks: false
-        \\
-    ;
-    var config = try parse(std.testing.allocator, content, "verde.yml");
+test "TOML stack supports strings arrays providers and platform overrides" {
+    var config = try parse(std.testing.allocator,
+        \\version = 1
+        \\[processes.web]
+        \\command = "npm run dev # keep hash"
+        \\command_windows = 'pwsh.exe scripts\serve.ps1'
+        \\resources = ["build", "port:3000"]
+        \\watch = ["src/**"]
+        \\restart = "on_crash"
+        \\[agents.codex]
+        \\provider = "codex"
+        \\argv = ["codex", "--add-dir", "a folder"]
+        \\notify = true
+        \\hooks = true
+    , "verde.toml");
     defer config.deinit(std.testing.allocator);
-
     try std.testing.expectEqual(@as(usize, 2), config.processes.items.len);
-    try std.testing.expectEqualStrings("web", config.processes.items[0].name);
-    try std.testing.expectEqual(ProcessKind.process, config.processes.items[0].kind);
-    try std.testing.expectEqual(RestartPolicy.on_crash, config.processes.items[0].restart);
-    try std.testing.expectEqualStrings("build", config.processes.items[0].resources.items[0]);
+    try std.testing.expectEqualStrings("npm run dev # keep hash", config.processes.items[0].launchForOs(.linux).?.command);
+    try std.testing.expectEqualStrings("pwsh.exe scripts\\serve.ps1", config.processes.items[0].launchForOs(.windows).?.command);
     try std.testing.expectEqualStrings("port:3000", config.processes.items[0].resources.items[1]);
-    try std.testing.expectEqualStrings("src/**", config.processes.items[0].watch.items[0]);
-    try std.testing.expectEqualStrings("codex", config.processes.items[1].name);
-    try std.testing.expectEqual(ProcessKind.agent, config.processes.items[1].kind);
+    try std.testing.expectEqual(RestartPolicy.on_crash, config.processes.items[0].restart);
+    try std.testing.expectEqualStrings("a folder", config.processes.items[1].launchForOs(.linux).?.argv[2]);
+    try std.testing.expect(config.processes.items[1].hooks);
     try std.testing.expectEqual(AgentProvider.codex, config.processes.items[1].provider.?);
-    try std.testing.expectEqual(RevivePolicy.attach_or_create, config.processes.items[1].revive);
-    try std.testing.expect(config.processes.items[1].notify);
-    try std.testing.expect(config.processes.items[1].mcp);
-    try std.testing.expect(!config.processes.items[1].hooks);
 }
 
-test "parse amp agent provider" {
-    const content =
-        \\version: 1
-        \\agents:
-        \\  amp:
-        \\    provider: amp
-        \\    command: "amp"
-        \\
-    ;
-    var config = try parse(std.testing.allocator, content, "verde.yml");
-    defer config.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), config.processes.items.len);
-    try std.testing.expectEqualStrings("amp", config.processes.items[0].name);
-    try std.testing.expectEqual(ProcessKind.agent, config.processes.items[0].kind);
-    try std.testing.expectEqual(AgentProvider.amp, config.processes.items[0].provider.?);
-}
-
-test "parse grok agent provider" {
-    const content =
-        \\version: 1
-        \\agents:
-        \\  grok:
-        \\    provider: grok
-        \\    command: "grok --no-auto-update"
-        \\
-    ;
-    var config = try parse(std.testing.allocator, content, "verde.yml");
-    defer config.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), config.processes.items.len);
-    try std.testing.expectEqualStrings("grok", config.processes.items[0].name);
-    try std.testing.expectEqual(ProcessKind.agent, config.processes.items[0].kind);
-    try std.testing.expectEqual(AgentProvider.grok, config.processes.items[0].provider.?);
-}
-
-test "platform commands override legacy command without changing Unix semantics" {
-    const content =
-        \\version: 1
-        \\processes:
-        \\  web:
-        \\    command: "npm run dev"
-        \\    command_windows: "npm.cmd run dev:windows"
-        \\    command_unix: "exec npm run dev:unix"
-        \\
-    ;
-    var config = try parse(std.testing.allocator, content, "verde.yml");
-    defer config.deinit(std.testing.allocator);
-
-    const definition = &config.processes.items[0];
-    try std.testing.expectEqualStrings("npm.cmd run dev:windows", definition.launchForOs(.windows).?.command);
-    try std.testing.expectEqualStrings("exec npm run dev:unix", definition.launchForOs(.linux).?.command);
-    try std.testing.expectEqualStrings("exec npm run dev:unix", definition.launchForOs(.macos).?.command);
-}
-
-test "structured argv preserves spaces and supports platform overrides" {
-    const content =
-        \\version: 1
-        \\processes:
-        \\  worker:
-        \\    argv:
-        \\      - "node"
-        \\      - "scripts/worker task.mjs"
-        \\      - "--label=client repo"
-        \\    argv_windows:
-        \\      - "node.exe"
-        \\      - "scripts\worker task.mjs"
-        \\
-    ;
-    var config = try parse(std.testing.allocator, content, "verde.yml");
-    defer config.deinit(std.testing.allocator);
-
-    const windows_launch = config.processes.items[0].launchForOs(.windows).?.argv;
-    try std.testing.expectEqual(@as(usize, 2), windows_launch.len);
-    try std.testing.expectEqualStrings("node.exe", windows_launch[0]);
-    try std.testing.expectEqualStrings("scripts\\worker task.mjs", windows_launch[1]);
-
-    const unix_launch = config.processes.items[0].launchForOs(.linux).?.argv;
-    try std.testing.expectEqual(@as(usize, 3), unix_launch.len);
-    try std.testing.expectEqualStrings("scripts/worker task.mjs", unix_launch[1]);
-    try std.testing.expectEqualStrings("--label=client repo", unix_launch[2]);
-}
-
-test "platform-only managed process is retained" {
-    const content =
-        \\processes:
-        \\  windows-only:
-        \\    command_windows: "pwsh.exe -File scripts\serve.ps1"
-        \\
-    ;
-    var config = try parse(std.testing.allocator, content, "verde.yml");
-    defer config.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), config.processes.items.len);
-    try std.testing.expect(config.processes.items[0].launchForOs(.linux) == null);
-    try std.testing.expectEqualStrings("pwsh.exe -File scripts\\serve.ps1", config.processes.items[0].launchForOs(.windows).?.command);
+test "stack rejects invalid types missing launches and YAML" {
+    inline for (.{ "[processes.x]\ncommand = 42", "[agents.x]\nprovider = \"claude\"", "processes:\n  x:\n    command: test" }) |content| {
+        if (parse(std.testing.allocator, content, "verde.toml")) |result| {
+            var owned = result;
+            owned.deinit(std.testing.allocator);
+            return error.ExpectedInvalidConfig;
+        } else |_| {}
+    }
 }
 
 test "definition bounds validator names the broken limit" {
-    var content: std.ArrayList(u8) = .empty;
-    defer content.deinit(std.testing.allocator);
-    try content.appendSlice(
-        std.testing.allocator,
-        "processes:\n  oversized:\n    command: \"",
-    );
-    try content.appendNTimes(std.testing.allocator, 'x', MAX_PROCESS_COMMAND_BYTES + 1);
-    try content.appendSlice(std.testing.allocator, "\"\n");
-    var config = try parse(std.testing.allocator, content.items, "verde.yml");
-    defer config.deinit(std.testing.allocator);
-    const violation = validateDefinitionBounds(&config) orelse return error.ExpectedBoundsViolation;
-    try std.testing.expectEqualStrings("process_definition", violation.resource);
-    try std.testing.expectEqual(MAX_PROCESS_COMMAND_BYTES, violation.limit);
+    const a = std.testing.allocator;
+    const command = try a.alloc(u8, MAX_PROCESS_COMMAND_BYTES + 1);
+    defer a.free(command);
+    @memset(command, 'x');
+    const content = try std.fmt.allocPrint(a, "[processes.x]\ncommand = \"{s}\"", .{command});
+    defer a.free(content);
+    var config = try parse(a, content, "verde.toml");
+    defer config.deinit(a);
+    try std.testing.expectEqualStrings("process_definition", validateDefinitionBounds(&config).?.resource);
 }

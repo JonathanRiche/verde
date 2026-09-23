@@ -551,13 +551,9 @@ pub const Client = struct {
         var files: std.ArrayList(provider_types.StreamDiffFile) = .empty;
         defer files.deinit(std.heap.page_allocator);
         try appendSessionDiffFiles(parsed.value, &files);
-        var baseline_files: std.ArrayList(provider_types.StreamDiffFile) = .empty;
-        defer baseline_files.deinit(std.heap.page_allocator);
-        try appendSessionDiffFilesFromPayload(self.allocator, baseline_diff_payload, &baseline_files);
-
         var changed_files: std.ArrayList(provider_types.StreamDiffFile) = .empty;
         defer changed_files.deinit(std.heap.page_allocator);
-        try appendChangedSessionDiffFiles(&changed_files, files.items, baseline_files.items);
+        try appendChangedSessionDiffFilesFromPayload(self.allocator, baseline_diff_payload, files.items, &changed_files);
 
         if (changed_files.items.len > 0) {
             on_stream_event(request.stream_context, .{ .diff = .{
@@ -565,8 +561,9 @@ pub const Client = struct {
             } });
         }
 
+        const next_diff_payload = try self.allocator.dupe(u8, current_payload);
         self.allocator.free(last_diff_payload.*);
-        last_diff_payload.* = try self.allocator.dupe(u8, current_payload);
+        last_diff_payload.* = next_diff_payload;
     }
 
     /// v2 has no per-session diff; the working-tree diff scoped to the
@@ -615,7 +612,7 @@ pub const Client = struct {
             const request_id = getOptionalObjectString(item, "id") orelse continue;
             if (containsString(handled_permission_ids.items, request_id)) continue;
 
-            const decision = switch (request.approval_policy orelse .on_request) {
+            const decision: provider_types.ApprovalDecision = if (try workspaceDirectoryApproved(self.allocator, item, request.workspace_roots)) .approve else switch (request.approval_policy orelse .on_request) {
                 .never => .approve,
                 .on_request => if (request.on_approval_request) |on_approval_request|
                     try self.requestPermissionApproval(item, request_id, request.stream_context, on_approval_request)
@@ -657,12 +654,7 @@ pub const Client = struct {
         request_id: []const u8,
         decision: provider_types.ApprovalDecision,
     ) !void {
-        const reply = switch (decision) {
-            .approve => "once",
-            .deny => "reject",
-        };
-
-        const body = try stringifyAlloc(self.allocator, .{ .reply = reply });
+        const body = try buildPermissionReplyBody(self.allocator, decision);
         defer self.allocator.free(body);
 
         const path = try self.apiPathAlloc("/session/{s}/permission/{s}/reply", .{ session_id, request_id }, null);
@@ -2437,6 +2429,47 @@ fn truncateChildTranscriptOutput(text: []const u8) []const u8 {
 // Permissions -----------------------------------------------------------------
 
 /// Summarizes a `Permission.Request` (`action`, `resources`, `message`, `source`).
+fn workspaceDirectoryApproved(allocator: std.mem.Allocator, value: std.json.Value, roots: []const []const u8) !bool {
+    if (roots.len == 0) return false;
+    const action = getOptionalObjectString(value, "action") orelse return false;
+    if (!std.mem.eql(u8, action, "external_directory")) return false;
+    const resources = getObjectField(value, "resources") orelse return false;
+    if (resources != .array or resources.array.items.len == 0) return false;
+    var io_state: std.Io.Threaded = .init(allocator, .{});
+    defer io_state.deinit();
+    for (resources.array.items) |resource| {
+        if (resource != .string) return false;
+        const path = if (std.mem.endsWith(u8, resource.string, "/*")) resource.string[0 .. resource.string.len - 2] else resource.string;
+        if (!std.fs.path.isAbsolute(path) or std.mem.indexOfAny(u8, path, "*?[]") != null) return false;
+        const real = std.Io.Dir.cwd().realPathFileAlloc(io_state.io(), path, allocator) catch return false;
+        defer allocator.free(real);
+        for (roots) |root| {
+            if (root.len > 0 and (std.mem.eql(u8, real, root) or
+                (std.mem.startsWith(u8, real, root) and real.len > root.len and
+                    (std.fs.path.isSep(root[root.len - 1]) or std.fs.path.isSep(real[root.len]))))) break;
+        } else return false;
+    }
+    return true;
+}
+
+fn buildPermissionReplyBody(allocator: std.mem.Allocator, decision: provider_types.ApprovalDecision) ![]u8 {
+    return stringifyAlloc(allocator, .{ .decision = switch (decision) {
+        .approve => "once",
+        .deny => "reject",
+    } });
+}
+
+test "permission replies use the v2 decision field for approval and denial" {
+    for ([_]provider_types.ApprovalDecision{ .approve, .deny }, [_][]const u8{ "once", "reject" }) |decision, expected| {
+        const body = try buildPermissionReplyBody(std.testing.allocator, decision);
+        defer std.testing.allocator.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(expected, parsed.value.object.get("decision").?.string);
+        try std.testing.expect(!parsed.value.object.contains("reply"));
+    }
+}
+
 fn buildPermissionBody(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(allocator);
@@ -2496,16 +2529,24 @@ fn appendSessionDiffFiles(value: std.json.Value, files: *std.ArrayList(provider_
     }
 }
 
-fn appendSessionDiffFilesFromPayload(
+fn appendChangedSessionDiffFilesFromPayload(
     allocator: std.mem.Allocator,
     payload: []const u8,
-    files: *std.ArrayList(provider_types.StreamDiffFile),
+    current: []const provider_types.StreamDiffFile,
+    target: *std.ArrayList(provider_types.StreamDiffFile),
 ) !void {
-    if (std.mem.trim(u8, payload, &std.ascii.whitespace).len == 0) return;
+    if (std.mem.trim(u8, payload, &std.ascii.whitespace).len == 0) {
+        return appendChangedSessionDiffFiles(target, current, &.{});
+    }
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
     defer parsed.deinit();
-    try appendSessionDiffFiles(parsed.value, files);
+    var baseline: std.ArrayList(provider_types.StreamDiffFile) = .empty;
+    defer baseline.deinit(std.heap.page_allocator);
+    try appendSessionDiffFiles(parsed.value, &baseline);
+    // Decoded paths and patches borrow the JSON arena. Compare before freeing it;
+    // only entries borrowed from the caller's current files may escape.
+    try appendChangedSessionDiffFiles(target, current, baseline.items);
 }
 
 fn appendChangedSessionDiffFiles(
@@ -3119,6 +3160,35 @@ test "appendSessionDiffFiles reads the vcs diff data wrapper" {
     try std.testing.expectEqualStrings("@@ -1 +1 @@\n-old\n+new\n", files.items[0].patch.?);
 }
 
+test "diff progress compares escaped baseline paths and patches while their JSON is alive" {
+    const baseline =
+        \\{"data":[
+        \\  {"file":"src/\u0061.zig","patch":"@@ -1 +1 @@\n-old\n+same\n"},
+        \\  {"file":"src/\u0062.zig","patch":"@@ -1 +1 @@\n-old\n+before\n"}
+        \\]}
+    ;
+    const current = [_]provider_types.StreamDiffFile{
+        .{ .path = "src/a.zig", .patch = "@@ -1 +1 @@\n-old\n+same\n", .additions = 1, .deletions = 1 },
+        .{ .path = "src/b.zig", .patch = "@@ -1 +1 @@\n-old\n+after\n", .additions = 1, .deletions = 1 },
+        .{ .path = "src/new.zig", .patch = "+new\n", .additions = 1, .deletions = 0 },
+    };
+    var changed: std.ArrayList(provider_types.StreamDiffFile) = .empty;
+    defer changed.deinit(std.heap.page_allocator);
+
+    try appendChangedSessionDiffFilesFromPayload(std.testing.allocator, baseline, &current, &changed);
+    try std.testing.expectEqual(@as(usize, 2), changed.items.len);
+    try std.testing.expectEqualStrings("src/b.zig", changed.items[0].path);
+    try std.testing.expectEqualStrings(current[1].patch.?, changed.items[0].patch.?);
+    try std.testing.expectEqualStrings("src/new.zig", changed.items[1].path);
+    // Results must still refer to the current snapshot after the baseline is freed.
+    try std.testing.expectEqual(current[1].path.ptr, changed.items[0].path.ptr);
+    try std.testing.expectEqual(current[1].patch.?.ptr, changed.items[0].patch.?.ptr);
+
+    changed.clearRetainingCapacity();
+    try appendChangedSessionDiffFilesFromPayload(std.testing.allocator, " \n", &current, &changed);
+    try std.testing.expectEqual(current.len, changed.items.len);
+}
+
 test "parseModelsAlloc reads v2 models with provider names and variants" {
     const allocator = std.testing.allocator;
     var parsed_models = try std.json.parseFromSlice(std.json.Value, allocator,
@@ -3288,4 +3358,42 @@ test "health probe times out against a server that accepts but never responds" {
     // upper bound is loose to tolerate slow CI machines.
     try std.testing.expect(elapsed_ms >= 1_000);
     try std.testing.expect(elapsed_ms < 8_000);
+}
+
+test "workspace directory approval checks real roots and never grants other tools" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDirPath(io, "api/sub");
+    try tmp.dir.createDirPath(io, "api-other");
+    const root = try tmp.dir.realPathFileAlloc(io, "api", a);
+    defer a.free(root);
+    const sibling = try tmp.dir.realPathFileAlloc(io, "api-other", a);
+    defer a.free(sibling);
+    const inside = try std.fs.path.join(a, &.{ root, "sub" });
+    defer a.free(inside);
+    for ([_]struct { action: []const u8, path: []const u8, allowed: bool }{
+        .{ .action = "external_directory", .path = root, .allowed = true },
+        .{ .action = "external_directory", .path = inside, .allowed = true },
+        .{ .action = "external_directory", .path = sibling, .allowed = false },
+        .{ .action = "read", .path = inside, .allowed = false },
+        .{ .action = "bash", .path = inside, .allowed = false },
+    }) |case| {
+        const source = try std.json.Stringify.valueAlloc(a, .{ .action = case.action, .resources = [_][]const u8{case.path} }, .{});
+        defer a.free(source);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, source, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.allowed, try workspaceDirectoryApproved(a, parsed.value, &.{root}));
+    }
+    if (@import("builtin").os.tag != .windows) {
+        try tmp.dir.symLink(io, sibling, "api/escape", .{ .is_directory = true });
+        const escape = try std.fs.path.join(a, &.{ root, "escape" });
+        defer a.free(escape);
+        const source = try std.json.Stringify.valueAlloc(a, .{ .action = "external_directory", .resources = [_][]const u8{escape} }, .{});
+        defer a.free(source);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, source, .{});
+        defer parsed.deinit();
+        try std.testing.expect(!try workspaceDirectoryApproved(a, parsed.value, &.{root}));
+    }
 }

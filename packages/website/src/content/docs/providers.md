@@ -261,10 +261,10 @@ verde live process restart --name codex
 ```
 
 The first two commands open managed provider TUIs without requiring a
-`verde.yml` entry. Verde detects Grok from `PATH` without running it, offers a
+`verde.toml` entry. Verde detects Grok from `PATH` without running it, offers a
 setup-guide action when it is absent, and launches it with `--no-auto-update`.
 The last command launches or restarts a Codex agent declared in your
-`verde.yml` `agents:` block. See [Configuration & state](/docs/config) for the
+`verde.toml` `[agents.<name>]` table. See [Configuration & state](/docs/config) for the
 stack schema and the [CLI reference](/docs/cli) for the full command surface.
 
 ## Troubleshooting provider auth

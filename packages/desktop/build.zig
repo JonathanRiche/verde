@@ -91,6 +91,7 @@ pub fn build(b: *std.Build) void {
     const palette_module = palette.module("palette");
     // GUI-free protocol core. Linked into the session daemon for core.* methods;
     // headless-test runs this package alone with no SDL/Palette/Ghostty deps.
+    const toml_module = b.dependency("toml", .{ .target = target, .optimize = optimize }).module("toml");
     const headless_module = b.createModule(.{
         .root_source_file = b.path("../headless/src/root.zig"),
         .target = target,
@@ -202,6 +203,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "build_options", .module = daemon_build_options_module },
                 .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
                 .{ .name = "headless", .module = headless_module },
+                .{ .name = "toml", .module = toml_module },
                 .{ .name = "platform_paths", .module = platform_paths_module },
                 .{ .name = "platform_runtime", .module = platform_runtime_module },
                 .{ .name = "platform_windows_known_folders", .module = platform_windows_known_folders_module },
@@ -237,6 +239,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
                 .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
                 .{ .name = "headless", .module = headless_module },
+                .{ .name = "toml", .module = toml_module },
                 .{ .name = "loop_wakeup", .module = loop_wakeup_module },
                 .{ .name = "palette", .module = palette_module },
                 .{ .name = "platform_paths", .module = platform_paths_module },
@@ -347,6 +350,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
                 .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
                 .{ .name = "headless", .module = headless_module },
+                .{ .name = "toml", .module = toml_module },
                 .{ .name = "loop_wakeup", .module = loop_wakeup_module },
                 .{ .name = "palette", .module = palette_module },
                 .{ .name = "platform_paths", .module = platform_paths_module },
@@ -527,6 +531,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "headless", .module = headless_module },
+                .{ .name = "toml", .module = toml_module },
                 .{ .name = "platform_paths", .module = platform_paths_module },
                 .{ .name = "platform_runtime", .module = platform_runtime_module },
                 .{ .name = "platform_windows_known_folders", .module = platform_windows_known_folders_module },
@@ -571,6 +576,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
                 .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
                 .{ .name = "headless", .module = headless_module },
+                .{ .name = "toml", .module = toml_module },
                 .{ .name = "loop_wakeup", .module = loop_wakeup_module },
                 .{ .name = "palette", .module = palette.module("palette") },
                 .{ .name = "platform_paths", .module = platform_paths_module },
@@ -659,6 +665,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
                 .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
                 .{ .name = "headless", .module = headless_module },
+                .{ .name = "toml", .module = toml_module },
                 .{ .name = "loop_wakeup", .module = loop_wakeup_module },
                 .{ .name = "palette", .module = palette.module("palette") },
                 .{ .name = "platform_paths", .module = platform_paths_module },

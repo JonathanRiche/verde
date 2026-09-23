@@ -22,8 +22,9 @@ pub const Result = struct {
 };
 
 pub const State = struct {
-    finder: ?fff.Finder = null,
+    finder: ?fff.WorkspaceFinder = null,
     project_path: ?[]u8 = null,
+    config_hash: u64 = 0,
     last_query: ?[]u8 = null,
     token: ?Token = null,
     results: std.ArrayList(Result) = .empty,
@@ -89,6 +90,14 @@ pub fn updateFileSearch(self: anytype) void {
     };
 
     const project_path = self.currentProject().path;
+    // Check hand-edited TOML once per mention interaction, not per keystroke.
+    if (!self.file_search_controller.visible) {
+        const hash = @import("../workspace/folders.zig").sourceHash(self.allocator, project_path) catch 0;
+        if (hash != self.file_search_controller.config_hash) {
+            self.file_search_controller.deinit(self.allocator);
+            self.file_search_controller.config_hash = hash;
+        }
+    }
     self.ensureFileSearchFinder(project_path) catch {
         self.clearFileSearch();
         self.setSidebarNotice("Failed to initialize file search.");
@@ -166,7 +175,9 @@ pub fn selectFileSearchResult(self: anytype, index: usize) bool {
 
     const draft = self.currentDraft();
     const choice = self.file_search_controller.results.items[index];
-    const replacement = std.fmt.allocPrint(self.allocator, "@{s} ", .{choice.relative_path}) catch return false;
+    // The displayed alias is not necessarily a filesystem path: attached
+    // folders need no symlinks, and the agent's cwd can be another root.
+    const replacement = std.fmt.allocPrint(self.allocator, "@{s} ", .{choice.path}) catch return false;
     defer self.allocator.free(replacement);
 
     const next_draft = std.fmt.allocPrint(
@@ -203,7 +214,7 @@ pub fn ensureFileSearchFinder(self: anytype, project_path: []const u8) !void {
         self.file_search_controller.finder = null;
     }
 
-    self.file_search_controller.finder = try fff.Finder.init(self.allocator, self.storage.pref_path, project_path);
+    self.file_search_controller.finder = try fff.WorkspaceFinder.init(self.allocator, self.storage.pref_path, project_path);
     self.file_search_controller.project_path = try self.allocator.dupe(u8, project_path);
     self.file_search_controller.clearQuery(self.allocator);
 }
@@ -230,4 +241,50 @@ pub fn trailingFileSearchToken(draft: []const u8) ?Token {
         .query_start = token_start + 1,
         .end = draft.len,
     };
+}
+
+test "file mention selection uses the real path rather than the folder display alias" {
+    const clear_search = clearFileSearch;
+    const Composer = struct {
+        allocator: std.mem.Allocator,
+        file_search_controller: State = .{},
+        draft: []u8,
+
+        pub fn currentDraft(self: *@This()) []const u8 {
+            return self.draft;
+        }
+
+        pub fn setDraft(self: *@This(), value: []const u8) void {
+            const next = self.allocator.dupe(u8, value) catch @panic("out of memory");
+            self.allocator.free(self.draft);
+            self.draft = next;
+        }
+
+        pub fn clearFileSearch(self: *@This()) void {
+            clear_search(self);
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    const paths = [_][]const u8{ "/projects/api/src/main.zig", "/projects/docs folder/src/main.zig" };
+    for (paths, 0..) |path, index| {
+        var composer: Composer = .{ .allocator = allocator, .draft = try allocator.dupe(u8, "Review @main") };
+        defer allocator.free(composer.draft);
+        defer composer.file_search_controller.deinit(allocator);
+        for (paths, 0..) |candidate, result_index| {
+            try composer.file_search_controller.results.append(allocator, .{
+                .path = try allocator.dupe(u8, candidate),
+                .relative_path = try allocator.dupe(u8, if (result_index == 0) "api/src/main.zig" else "docs/src/main.zig"),
+                .file_name = try allocator.dupe(u8, "main.zig"),
+            });
+        }
+        composer.file_search_controller.visible = true;
+        composer.file_search_controller.token = trailingFileSearchToken(composer.draft);
+        try std.testing.expect(selectFileSearchResult(&composer, index));
+        const expected = try std.fmt.allocPrint(allocator, "Review @{s} ", .{path});
+        defer allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, composer.draft);
+        try std.testing.expect(!composer.file_search_controller.visible);
+        try std.testing.expectEqual(@as(usize, 0), composer.file_search_controller.results.items.len);
+    }
 }

@@ -78,7 +78,7 @@ Right-click the sidebar or click the **+** button to import a project. Verde
 watches the project directory you import; threads, processes, and agents all
 operate against that workspace root.
 
-A project can optionally declare a stack in `verde.yml` (or `verde.yaml`) at its
+A project can optionally declare a stack in `verde.toml` at its
 root — long-running processes and agent CLIs to drive from the terminal dock.
 See [Configuration & state](/docs/config) for the schema.
 
@@ -167,5 +167,5 @@ surface.
 - [Panes & tiling](/docs/panes) — splits, focus, resize, zoom, the terminal dock, and the browser pane.
 - [Keybinds](/docs/keybinds) — every default and how to remap.
 - [CLI reference](/docs/cli) — drive Verde from your shell with `verde live` and `verde state`.
-- [Configuration & state](/docs/config) — `verde.json`, `verde.yml`, themes, Omarchy integration.
+- [Configuration & state](/docs/config) — `verde.json`, `verde.toml`, themes, Omarchy integration.
 - [Troubleshooting](/docs/troubleshooting) — provider auth, browser runtime, source-build issues.

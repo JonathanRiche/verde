@@ -236,7 +236,7 @@ shows a pending row in the transcript while it executes, then a result card
 
 Workspace commands, available with every provider:
 
-- `/stack` — start / stop / restart / status for every process and agent declared in the workspace's `verde.yml`.
+- `/stack` — start / stop / restart / status for every process and agent declared in the workspace's `verde.toml`.
 - `/process` — start / stop / restart / focus a single declared process by name; `/process crashed` refreshes status and reports the number of crashed processes.
 - `//text` — escape hatch: send a literal prompt that begins with a slash.
 

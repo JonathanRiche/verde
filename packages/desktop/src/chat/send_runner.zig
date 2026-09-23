@@ -1,6 +1,7 @@
 //! UI-independent provider send runner used by daemon-owned chat turns.
 
 const std = @import("std");
+const workspace_folders = @import("../workspace/folders.zig");
 const harness = @import("../providers/harness.zig");
 
 const log = std.log.scoped(.chat_send_runner);
@@ -46,7 +47,23 @@ pub const Sink = struct {
 pub fn run(allocator: std.mem.Allocator, request: Request, sink: Sink) !Result {
     if (request.harness_kind != .local_cli) return error.UnsupportedHarnessMode;
 
-    const request_cwd = request.cwd orelse request.project_path;
+    var workspace = try workspace_folders.resolve(allocator, request.project_path);
+    defer workspace.deinit();
+    if (workspace.configured) try workspace_folders.sync(allocator, request.project_path);
+    const requested_cwd = request.cwd orelse request.project_path;
+    const request_cwd = if (std.mem.eql(u8, requested_cwd, request.project_path)) workspace.cwd else requested_cwd;
+    const contextual_prompt = if (workspace.configured)
+        try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ request.prompt, workspace.context })
+    else
+        null;
+    defer if (contextual_prompt) |value| allocator.free(value);
+    // Muse's supervised sandbox only supports one writable root. Preserve its
+    // access policy instead of silently disabling the sandbox for extra folders.
+    if (request.provider == .muse and request.access_mode == .supervised and workspace.roots.len > 1) {
+        if (sink.on_failure) |on_failure| on_failure(sink.context, "Muse in Supervised mode supports only one writable folder. Choose another provider for this multi-folder workspace.");
+        return error.ProviderDoesNotSupportAdditionalWorkspaceRoots;
+    }
+
     const provider_config = switch (request.provider) {
         .opencode => harness.ProviderConfig{ .opencode = .{
             .allocator = allocator,
@@ -83,7 +100,8 @@ pub fn run(allocator: std.mem.Allocator, request: Request, sink: Sink) !Result {
     const send_result = try client.sendPrompt(allocator, .{
         .thread_id = request.provider_thread_id,
         .thread_title = request.thread_title,
-        .prompt = request.prompt,
+        .prompt = contextual_prompt orelse request.prompt,
+        .workspace_roots = if (workspace.folders.len > 0) workspace.roots else &.{},
         .image = if (request.image_paths.len > 0) .{ .path = request.image_paths[0] } else null,
         .images = image_attachments,
         .cwd = request_cwd,

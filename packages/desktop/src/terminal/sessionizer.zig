@@ -1517,13 +1517,17 @@ const PtySession = struct {
         const self = try allocator.create(PtySession);
         errdefer allocator.destroy(self);
 
-        const cwd = if (std.mem.trim(u8, options.cwd, &std.ascii.whitespace).len > 0)
-            options.cwd
-        else
-            ".";
-        const command = try commandForOptions(allocator, options.command);
+        const requested_cwd = if (std.mem.trim(u8, options.cwd, &std.ascii.whitespace).len > 0) options.cwd else ".";
+        var workspace = try stack.folders.resolve(allocator, if (options.project_path.len > 0) options.project_path else requested_cwd);
+        defer workspace.deinit();
+        if (workspace.configured) try stack.folders.sync(allocator, workspace.home);
+        const cwd = if (std.mem.eql(u8, requested_cwd, options.project_path)) workspace.cwd else requested_cwd;
+        const command = try commandForOptions(allocator, try stack.folders.terminalCommand(&workspace, options.command));
         defer freeCommand(allocator, command);
-        const command_label = try commandLabel(allocator, command);
+        // Keep generated context out of terminal titles and process summaries.
+        const original_command = try commandForOptions(allocator, options.command);
+        defer freeCommand(allocator, original_command);
+        const command_label = try commandLabel(allocator, original_command);
         errdefer allocator.free(command_label);
 
         const identity = try ChildIdentity.init(allocator, options);
@@ -16736,11 +16740,10 @@ test "process.start rejects unknown definitions and unstartable platforms" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const config =
-        \\processes:
-        \\  windows-only:
-        \\    command_windows: "pwsh.exe"
+        \\[processes.windows-only]
+        \\command_windows = "pwsh.exe"
     ;
-    var file = try tmp.dir.createFile(std.testing.io, "verde.yml", .{});
+    var file = try tmp.dir.createFile(std.testing.io, "verde.toml", .{});
     try file.writeStreamingAll(std.testing.io, config);
     file.close(std.testing.io);
 
@@ -16791,11 +16794,10 @@ test "process.start cap returns a structured managed-process limit" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const config =
-        \\processes:
-        \\  overflow-target:
-        \\    command: "/bin/true"
+        \\[processes.overflow-target]
+        \\command = "/bin/true"
     ;
-    var file = try tmp.dir.createFile(std.testing.io, "verde.yml", .{});
+    var file = try tmp.dir.createFile(std.testing.io, "verde.toml", .{});
     try file.writeStreamingAll(std.testing.io, config);
     file.close(std.testing.io);
 

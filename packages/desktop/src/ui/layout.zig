@@ -640,6 +640,7 @@ const WorkspaceSettingsLayout = struct {
     show_scroll_threshold: bool,
     notice_y: f32,
     manage_button: palette.Rect,
+    folders_button: palette.Rect,
     close_button: palette.Rect,
     max_scroll_y: f32,
 };
@@ -713,8 +714,8 @@ fn workspaceSettingsLayout(state: *const runtime.AppState, width: f32, height: f
         scope_y + control_h;
     const notice_y = scroll_bottom + gap;
     const button_y = notice_y + notice_h + gap;
-    const close_w = theme.scaledUi(96.0);
-    const manage_w = theme.scaledUi(176.0);
+    const close_w = (list.w - theme.scaledUi(16.0)) / 3.0;
+    const manage_w = close_w;
     const close_button: palette.Rect = .{ .x = modal.x + modal.w - pad - close_w, .y = button_y, .w = close_w, .h = button_h };
     const manage_button: palette.Rect = .{ .x = close_button.x - theme.scaledUi(8.0) - manage_w, .y = button_y, .w = manage_w, .h = button_h };
     return .{
@@ -736,6 +737,7 @@ fn workspaceSettingsLayout(state: *const runtime.AppState, width: f32, height: f
         .show_scroll_threshold = show_scroll_threshold,
         .notice_y = notice_y,
         .manage_button = manage_button,
+        .folders_button = .{ .x = modal.x + pad, .y = button_y, .w = close_w, .h = button_h },
         .close_button = close_button,
         .max_scroll_y = @max(rows_h - list_h, 0.0),
     };
@@ -761,6 +763,10 @@ fn rectIntersection(a: palette.Rect, b: palette.Rect) palette.Rect {
 fn registerWorkspaceSettingsModalHits(state: *runtime.AppState, width: f32, height: f32) void {
     if (!state.workspaceSettingsOpen()) return;
     if (state.workspaceSettingsProject() == null) return;
+    if (state.workspace_folders_view) {
+        renderWorkspaceFolders(state, width, height, true);
+        return;
+    }
     const layout = workspaceSettingsLayout(state, width, height);
     registerModalChromeHits(state, width, height, layout.modal, true);
     const scroll_y = theme.clampf(state.workspace_settings_scroll_y, 0.0, layout.max_scroll_y);
@@ -773,6 +779,7 @@ fn registerWorkspaceSettingsModalHits(state: *runtime.AppState, width: f32, heig
         if (clipped.h <= 0.0) continue;
         queueModalHit(state, clipped, .workspace_settings_option, index);
     }
+    queueModalHit(state, layout.folders_button, .workspace_settings_folders, 0);
     queueModalHit(state, layout.manage_button, .workspace_settings_manage, 0);
     queueModalHit(state, layout.close_button, .workspace_settings_close, 0);
     queueModalHit(state, layout.scroll_scope_app, .workspace_settings_scroll_scope, 0);
@@ -791,6 +798,11 @@ fn registerWorkspaceSettingsModalHits(state: *runtime.AppState, width: f32, heig
 /// Scrolls the workspace-settings option list while the pointer is over it.
 fn handleWorkspaceSettingsWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y: f32, wheel_y: f32) bool {
     if (!state.workspaceSettingsOpen()) return false;
+    if (state.workspace_folders_view) {
+        state.workspace_settings_scroll_y = @max(0, state.workspace_settings_scroll_y - wheel_y * theme.scaledUi(48));
+        state.markDirty();
+        return true;
+    }
     const layout = workspaceSettingsLayout(state, width, height);
     if (!pointInRect(x, y, layout.modal)) return true; // swallow: modal owns the wheel
     if (!pointInRect(x, y, layout.list)) return true;
@@ -813,6 +825,10 @@ fn renderWorkspaceSettingsModal(state: *runtime.AppState, width: f32, height: f3
         state.closeWorkspaceSettings();
         return;
     };
+    if (state.workspace_folders_view) {
+        renderWorkspaceFolders(state, width, height, false);
+        return;
+    }
     const layout = workspaceSettingsLayout(state, width, height);
     drawModalChromeVisual(state, width, height, layout.modal);
     const pad = theme.scaledUi(20.0);
@@ -944,8 +960,78 @@ fn renderWorkspaceSettingsModal(state: *runtime.AppState, width: f32, height: f3
     if (notice.len > 0) {
         queuePaletteText(state, .{ .x = layout.modal.x + pad, .y = layout.notice_y, .w = content_w, .h = theme.scaledUi(18.0) }, notice, paletteColor(theme.COLOR_GREEN), theme.scaledUi(12.5), layout.modal);
     }
-    drawActionButton(state, layout.manage_button, "Manage connections", theme.COLOR_PANEL_ALT);
+    drawActionButton(state, layout.folders_button, "Folders…", theme.COLOR_PANEL_ALT);
+    drawActionButton(state, layout.manage_button, "Connections", theme.COLOR_PANEL_ALT);
     drawActionButton(state, layout.close_button, "Close", theme.accent());
+}
+
+// Folder management shares the workspace-bound modal and native picker. Rows
+// are clipped for both painting and hit testing on short screens.
+fn renderWorkspaceFolders(state: *runtime.AppState, width: f32, height: f32, hits: bool) void {
+    const project = state.workspaceSettingsProject() orelse return;
+    const pad = theme.scaledUi(20);
+    const w = @min(theme.scaledUi(700), @max(width - pad * 2, theme.scaledUi(300)));
+    const h = @min(theme.scaledUi(510), @max(height - pad * 2, theme.scaledUi(260)));
+    const modal: palette.Rect = .{ .x = (width - w) * 0.5, .y = (height - h) * 0.5, .w = w, .h = h };
+    const row_h = theme.scaledUi(68);
+    const list: palette.Rect = .{ .x = modal.x + pad, .y = modal.y + theme.scaledUi(100), .w = w - pad * 2, .h = h - theme.scaledUi(200) };
+    // The workspace home is always an accessible root, even with no additions.
+    const count = state.workspaceFolderCount() + 1;
+    var home_label_buffer: [256]u8 = undefined;
+    const home_label = std.fmt.bufPrint(&home_label_buffer, "{s} · Workspace home", .{project.label}) catch "Workspace home";
+    const max_scroll = @max(0, @as(f32, @floatFromInt(count)) * row_h - list.h);
+    state.workspace_settings_scroll_y = theme.clampf(state.workspace_settings_scroll_y, 0, max_scroll);
+    if (hits) registerModalChromeHits(state, width, height, modal, true) else {
+        drawModalChromeVisual(state, width, height, modal);
+        queuePaletteText(state, .{ .x = list.x, .y = modal.y + pad, .w = list.w, .h = theme.scaledUi(26) }, "Workspace folders", paletteColor(theme.COLOR_WHITE), theme.scaledUi(18), modal);
+        queuePaletteText(state, .{ .x = list.x, .y = modal.y + theme.scaledUi(54), .w = list.w, .h = theme.scaledUi(20) }, "Agents can use the workspace home and every folder listed below.", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12), modal);
+    }
+    for (0..count) |index| {
+        const is_home = index == 0;
+        const folder = if (is_home) null else state.workspaceFolderAt(index - 1) orelse continue;
+        const name = if (folder) |entry| entry.name else home_label;
+        const path = if (folder) |entry| entry.path else project.path;
+        const row: palette.Rect = .{ .x = list.x, .y = list.y + @as(f32, @floatFromInt(index)) * row_h - state.workspace_settings_scroll_y, .w = list.w, .h = row_h - theme.scaledUi(6) };
+        const visible = rectIntersection(row, list);
+        if (visible.h <= 0) continue;
+        const remove: palette.Rect = .{ .x = row.x + row.w - theme.scaledUi(72), .y = row.y + theme.scaledUi(4), .w = theme.scaledUi(72), .h = theme.scaledUi(27) };
+        const make_default: palette.Rect = .{ .x = remove.x - theme.scaledUi(92), .y = remove.y, .w = theme.scaledUi(86), .h = remove.h };
+        const is_default = if (state.workspace_folders_config) |config|
+            if (folder) |entry| std.mem.eql(u8, entry.name, config.default_folder) else config.default_folder.len == 0
+        else
+            false;
+        if (hits) {
+            const remove_hit = rectIntersection(remove, list);
+            const default_hit = rectIntersection(make_default, list);
+            if (!is_home and remove_hit.h > 0) queueModalHit(state, remove_hit, .workspace_folder_remove, index - 1);
+            if (!is_default and default_hit.h > 0) {
+                if (is_home) queueModalHit(state, default_hit, .workspace_folder_home_default, 0) else queueModalHit(state, default_hit, .workspace_folder_default, index - 1);
+            }
+        } else {
+            queuePaletteRoundedRect(state, visible, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(6));
+            queuePaletteText(state, .{ .x = row.x + theme.scaledUi(8), .y = row.y + theme.scaledUi(7), .w = @max(0, make_default.x - row.x - theme.scaledUi(12)), .h = theme.scaledUi(20) }, name, paletteColor(theme.COLOR_WHITE), theme.scaledUi(14), list);
+            queuePaletteText(state, .{ .x = row.x + theme.scaledUi(8), .y = row.y + theme.scaledUi(34), .w = row.w - theme.scaledUi(16), .h = theme.scaledUi(20) }, path, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12), list);
+            queuePaletteText(state, make_default, if (is_default) "Default" else "Make default", paletteColor(theme.COLOR_GREEN), theme.scaledUi(11), list);
+            queuePaletteText(state, remove, if (is_home) "Included" else "Remove", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(11), list);
+        }
+    }
+    const button_y = modal.y + h - pad - theme.scaledUi(34);
+    const button_w = (list.w - theme.scaledUi(16)) / 3;
+    const buttons = [_]palette.Rect{
+        .{ .x = list.x, .y = button_y, .w = button_w, .h = theme.scaledUi(34) },
+        .{ .x = list.x + button_w + theme.scaledUi(8), .y = button_y, .w = button_w, .h = theme.scaledUi(34) },
+        .{ .x = list.x + (button_w + theme.scaledUi(8)) * 2, .y = button_y, .w = button_w, .h = theme.scaledUi(34) },
+    };
+    if (hits) {
+        queueModalHit(state, buttons[0], .workspace_folder_add, 0);
+        queueModalHit(state, buttons[1], .workspace_folder_config, 0);
+        queueModalHit(state, buttons[2], .workspace_settings_folders, 0);
+    } else {
+        queuePaletteText(state, .{ .x = list.x, .y = button_y - theme.scaledUi(28), .w = list.w, .h = theme.scaledUi(20) }, state.workspaceSettingsNotice(), paletteColor(theme.COLOR_GREEN), theme.scaledUi(11), modal);
+        drawActionButton(state, buttons[0], "Add folder…", theme.accent());
+        drawActionButton(state, buttons[1], "Edit TOML", theme.COLOR_PANEL_ALT);
+        drawActionButton(state, buttons[2], "Back", theme.COLOR_PANEL_ALT);
+    }
 }
 
 fn drawWorkspaceSettingsSegment(state: *runtime.AppState, rect: palette.Rect, label: []const u8, selected: bool, hovered: bool) void {
@@ -1372,6 +1458,12 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .settings_cancel, .settings_close, .settings_save => state.closeSettingsPanel(),
             .settings_category => settings_modal.applySettingsCategory(state, hit.index),
             .settings_open_option => settings_modal.applyOpenActionOption(state, hit.index),
+            .workspace_settings_folders => state.openWorkspaceFolders(),
+            .workspace_folder_add => state.addWorkspaceFolder(),
+            .workspace_folder_remove => state.changeWorkspaceFolder(hit.index, true),
+            .workspace_folder_default => state.changeWorkspaceFolder(hit.index, false),
+            .workspace_folder_home_default => state.changeWorkspaceFolder(null, false),
+            .workspace_folder_config => state.openWorkspaceFolderConfig(),
             .workspace_settings_close => state.closeWorkspaceSettings(),
             .workspace_settings_option => state.applyWorkspaceSettingsOption(hit.index),
             .workspace_settings_manage => state.openManageConnectionsFromWorkspaceSettings(),

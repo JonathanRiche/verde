@@ -711,9 +711,11 @@ pub fn pollTerminals(self: anytype) bool {
                 log.debug("failed to collect terminal dock daemon batch: {s}", .{@errorName(err)});
             };
         }
+        // A pending/failed batch must never fall back to blocking per-pane IPC.
+        daemon_batch.suppressFallback();
         if (now_ms >= self.terminal_controller.daemon_batch_retry_at_ms) {
             daemon_batch.prefetch(self.allocator, self.storage.pref_path) catch |err| {
-                // Per-session polling below is the compatibility and failure fallback.
+                // Keep the current terminal frame while the daemon recovers.
                 self.terminal_controller.daemon_batch_retry_at_ms = now_ms + daemonBatchRetryDelayMs(err);
                 log.debug("terminal daemon batch unavailable: {s}", .{@errorName(err)});
             };

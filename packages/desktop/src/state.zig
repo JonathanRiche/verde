@@ -2163,6 +2163,12 @@ pub const PaletteModalAction = enum {
     thread_import_input,
     project_import_name_input,
     project_import_input,
+    workspace_settings_folders,
+    workspace_folder_add,
+    workspace_folder_remove,
+    workspace_folder_default,
+    workspace_folder_home_default,
+    workspace_folder_config,
     workspace_settings_close,
     /// index = option row in the workspace default-runtime list.
     workspace_settings_option,
@@ -4711,6 +4717,10 @@ pub const AppState = struct {
     /// modal was opened for. Held by id, not index, so the modal stays on
     /// that workspace even if selection or ordering changes while open.
     workspace_settings_project_id: ?[]u8 = null,
+    workspace_folders_view: bool = false,
+    workspace_folders_config: ?stack_config.folders.Config = null,
+    workspace_folder_picker_id: ?[]u8 = null,
+
     workspace_settings_notice_storage: [192:0]u8 = @splat(0),
     workspace_settings_scroll_y: f32 = 0.0,
     /// The only UI-owned bearer copy. It exists solely while the masked
@@ -5093,6 +5103,7 @@ pub const AppState = struct {
         self.workspace_settings_project_id = owned;
         @memset(&self.workspace_settings_notice_storage, 0);
         self.workspace_settings_scroll_y = 0.0;
+        self.workspace_folders_view = false;
         if (self.workspaceSettingsProject()) |project| {
             const layout = project.workspace_layout;
             self.settings_controller.draft.workspace_scroll_override_enabled = layout.hasScrollOverride();
@@ -5107,6 +5118,93 @@ pub const AppState = struct {
         self.markDirty();
     }
 
+    pub fn openWorkspaceFolders(self: *AppState) void {
+        self.workspace_folders_view = !self.workspace_folders_view;
+        self.workspace_settings_scroll_y = 0;
+        self.reloadWorkspaceFolders();
+        self.markDirty();
+    }
+
+    pub fn reloadWorkspaceFolders(self: *AppState) void {
+        if (self.workspace_folders_config) |*config| config.deinit(self.allocator);
+        self.workspace_folders_config = null;
+        const project = self.workspaceSettingsProject() orelse return;
+        self.workspace_folders_config = stack_config.folders.load(self.allocator, project.path) catch |err| {
+            self.setWorkspaceSettingsNotice(@errorName(err));
+            return;
+        };
+    }
+
+    pub fn workspaceFolderCount(self: *const AppState) usize {
+        const config = self.workspace_folders_config orelse return 0;
+        var count: usize = 0;
+        for (config.folders) |folder| {
+            if (folder.enabled) count += 1;
+        }
+        return count;
+    }
+
+    pub fn workspaceFolderAt(self: *const AppState, index: usize) ?stack_config.folders.Folder {
+        const config = self.workspace_folders_config orelse return null;
+        var current: usize = 0;
+        for (config.folders) |folder| {
+            if (!folder.enabled) continue;
+            if (current == index) return folder;
+            current += 1;
+        }
+        return null;
+    }
+
+    pub fn addWorkspaceFolder(self: *AppState) void {
+        const project = self.workspaceSettingsProject() orelse return;
+        self.picker_state.mutex.lock();
+        const pending = self.picker_state.status == .pending;
+        self.picker_state.mutex.unlock();
+        if (pending) return;
+        if (self.workspace_folder_picker_id) |id| self.allocator.free(id);
+        self.workspace_folder_picker_id = self.allocator.dupe(u8, project.id) catch return;
+        self.startDirectoryPickerWorker(project.path);
+    }
+
+    pub fn changeWorkspaceFolder(self: *AppState, index: ?usize, remove: bool) void {
+        const project = self.workspaceSettingsProject() orelse return;
+        const folder = if (index) |value| self.workspaceFolderAt(value) orelse return else null;
+        if (remove) {
+            const entry = folder orelse return; // The workspace home cannot be removed.
+            stack_config.folders.remove(self.allocator, project.path, entry.name) catch |err| {
+                self.setWorkspaceSettingsNotice(@errorName(err));
+                self.reloadWorkspaceFolders();
+                return;
+            };
+        } else {
+            stack_config.folders.setDefault(self.allocator, project.path, if (folder) |entry| entry.name else "") catch |err| {
+                self.setWorkspaceSettingsNotice(@errorName(err));
+                return;
+            };
+        }
+        self.reloadWorkspaceFolders();
+        self.file_search_controller.deinit(self.allocator);
+        self.setWorkspaceSettingsNotice("Saved. New turns use these folders; relaunch terminal agents.");
+        self.markDirty();
+    }
+
+    pub fn openWorkspaceFolderConfig(self: *AppState) void {
+        const project = self.workspaceSettingsProject() orelse return;
+        // Ensure there is a real file for editors, without changing existing settings.
+        var config = stack_config.folders.load(self.allocator, project.path) catch |err| {
+            self.setWorkspaceSettingsNotice(@errorName(err));
+            return;
+        };
+        defer config.deinit(self.allocator);
+        stack_config.folders.setDefault(self.allocator, project.path, config.default_folder) catch |err| {
+            self.setWorkspaceSettingsNotice(@errorName(err));
+            return;
+        };
+        const path = std.fs.path.join(self.allocator, &.{ project.path, "verde.toml" }) catch return;
+        defer self.allocator.free(path);
+        _ = utils.openFilePreferEditor(self.allocator, path, .{}) catch |err| self.setWorkspaceSettingsNotice(@errorName(err));
+    }
+
     pub fn workspaceSettingsOpen(self: *const AppState) bool {
         return self.workspace_settings_project_id != null;
     }
@@ -5114,6 +5212,8 @@ pub const AppState = struct {
     pub fn closeWorkspaceSettings(self: *AppState) void {
         if (self.workspace_settings_project_id) |id| self.allocator.free(id);
         self.workspace_settings_project_id = null;
+        if (self.workspace_folders_config) |*config| config.deinit(self.allocator);
+        self.workspace_folders_config = null;
         @memset(&self.workspace_settings_notice_storage, 0);
         self.markDirty();
     }
@@ -5991,6 +6091,7 @@ pub const AppState = struct {
         defer if (created_path) |path| self.allocator.free(path);
         const effective_path = if (managed_workspace) blk: {
             created_path = try self.ensureDirectoryPath(project_path);
+            try stack_config.folders.initManaged(self.allocator, created_path.?);
             break :blk created_path.?;
         } else project_path;
 
@@ -13056,6 +13157,12 @@ pub const AppState = struct {
                 .settings_new_chat_model_option,
                 .settings_new_chat_reasoning_option,
                 .settings_close,
+                .workspace_settings_folders,
+                .workspace_folder_add,
+                .workspace_folder_remove,
+                .workspace_folder_default,
+                .workspace_folder_home_default,
+                .workspace_folder_config,
                 .workspace_settings_close,
                 .workspace_settings_option,
                 .workspace_settings_manage,
@@ -14255,8 +14362,12 @@ pub const AppState = struct {
         runtime_log.diagnostic("AppState.deinit runtime service released", .{});
         if (self.workspace_runtime_defaults) |*defaults| defaults.deinit(self.allocator);
         self.workspace_runtime_defaults = null;
+        if (self.workspace_folder_picker_id) |id| self.allocator.free(id);
+        self.workspace_folder_picker_id = null;
         if (self.workspace_settings_project_id) |id| self.allocator.free(id);
         self.workspace_settings_project_id = null;
+        if (self.workspace_folders_config) |*config| config.deinit(self.allocator);
+        self.workspace_folders_config = null;
         self.change_cursor_loop.join();
         runtime_log.diagnostic("AppState.deinit change cursor loop joined", .{});
         _ = self.pollSend();
@@ -14380,6 +14491,32 @@ pub const AppState = struct {
             runtime_log.trace("pollPicker completed status={s}", .{@tagName(next_status)});
             log.info("pollPicker completed status={s}", .{@tagName(next_status)});
             self.finishPickerThread();
+        }
+
+        if (next_status != .idle) {
+            if (self.workspace_folder_picker_id) |workspace_id| {
+                defer self.allocator.free(workspace_id);
+                self.workspace_folder_picker_id = null;
+                if (picked_path) |path| {
+                    defer std.heap.page_allocator.free(path);
+                    for (self.project_controller.projects.items) |project| {
+                        if (!std.mem.eql(u8, project.id, workspace_id)) continue;
+                        stack_config.folders.add(self.allocator, project.path, path) catch |err| {
+                            self.setWorkspaceSettingsNotice(@errorName(err));
+                            self.reloadWorkspaceFolders();
+                            return;
+                        };
+                        self.reloadWorkspaceFolders();
+                        self.file_search_controller.deinit(self.allocator);
+                        self.setWorkspaceSettingsNotice("Folder added. Relaunch existing terminal agents to apply.");
+                        self.markDirty();
+                        break;
+                    }
+                } else if (next_status == .failed or next_status == .unavailable) {
+                    self.setWorkspaceSettingsNotice("Folder picker unavailable. Add paths in verde.toml.");
+                }
+                return;
+            }
         }
 
         const create_parent = self.project_directory_picker_create_parent;
@@ -16966,6 +17103,9 @@ test "workspace settings modal stays bound by id and marks the effective default
     state.runtime_service = null;
     state.workspace_runtime_defaults = null;
     state.workspace_settings_project_id = null;
+    state.workspace_folders_config = null;
+    state.workspace_folders_view = false;
+    state.workspace_folder_picker_id = null;
     state.workspace_settings_notice_storage = @splat(0);
     state.workspace_settings_scroll_y = 0.0;
     defer {

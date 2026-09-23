@@ -800,6 +800,7 @@ function pathToClaudeCodeExecutable(request) {
 function buildClaudeOptions(request) {
   const options = {
     cwd: request.cwd ?? undefined,
+    additionalDirectories: request.workspace_roots ?? [],
     resume: request.thread_id ?? undefined,
     model: request.model ?? undefined,
     effort: request.reasoning_effort ?? undefined,

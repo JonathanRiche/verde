@@ -1,6 +1,6 @@
 ---
 title: Configuration & state
-description: verde.json settings, update and transcript preferences, verde.yml stacks, themes, state files, and runtime logs.
+description: verde.json settings, update and transcript preferences, verde.toml stacks, themes, state files, and runtime logs.
 section: Reference
 order: 8
 slug: config
@@ -258,43 +258,84 @@ open: `collapsed`, `expanded`, or `remember_last`. Failed groups open so their
 error remains visible. With `remember_last`, Verde also maintains its internal
 last-expanded state for the next group. See [Chat, models & runs](/docs/chat).
 
-## verde.yml stack config
+## verde.toml stack config
 
-Project stack config is loaded from `verde.yml` or `verde.yaml` in the workspace
-root. `processes:` and `agents:` entries both run in terminal docks; agent
+Project stack config is loaded from `verde.toml` in the workspace
+root. `[processes.<name>]` and `[agents.<name>]` entries both run in terminal docks; agent
 entries may also declare `provider` (`codex`, `claude`, `opencode`, `cursor`,
 `grok`, `amp`, or `other`), `revive`, `notify`, `mcp`, and `hooks` metadata. New agent
 metadata defaults to disabled unless explicitly set.
 
-```yaml
-processes:
-  web:
-    command: "npm run dev"
-    cwd: "."
-    restart: on_crash
+```toml
+version = 1
 
-agents:
-  codex:
-    provider: codex
-    command: "codex"
-    cwd: "."
-    revive: attach_or_create
-    notify: true
-    mcp: true
-    hooks: true
-  grok:
-    provider: grok
-    command: "grok --no-auto-update --continue"
-    cwd: "."
-    revive: attach_or_create
+[workspace]
+default_folder = "app"
+
+[folders.app]
+path = "."
+
+[folders.api]
+path = "../api"
+
+[processes.web]
+command = "npm run dev"
+cwd = "."
+restart = "on_crash"
+
+[agents.codex]
+provider = "codex"
+command = "codex"
+cwd = "."
+revive = "attach_or_create"
+notify = true
+mcp = true
+hooks = true
+
+[agents.grok]
+provider = "grok"
+command = "grok --no-auto-update --continue"
+cwd = "."
+revive = "attach_or_create"
 ```
 
-Use `processes:` for normal long-running commands such as dev servers. Use
-`agents:` for terminal/TUI AI tools that should behave like first-class Verde
+Open **Workspace settings → Folders** to add existing directories, remove them,
+or choose the default working folder. **Edit TOML** opens the manifest for renaming
+folder aliases and editing paths. Relative paths resolve from `verde.toml`, not the
+agent's current directory. Folder aliases use letters, numbers, hyphens, and
+underscores (up to 64 characters); a workspace supports up to 32 active entries.
+
+All native chats receive the folder map on each turn, including resumed and
+Verde-delegated chats. Codex writable roots and Claude additional directories are
+configured explicitly. OpenCode external-directory requests are approved only when
+they resolve inside the configured roots; its other tool permissions are unchanged.
+Other providers retain their native approval rules; Muse
+Supervised mode cannot currently grant multiple writable roots and reports that
+limitation. Full access is never enabled just by adding a folder. Relaunch existing
+terminal agents after changing folders. Verde-launched Codex, Claude, and Pi TUIs
+receive the directory context automatically.
+
+New automatic workspace directories set `workspace.links = true`. Verde creates
+named symlinks, `.verde/WORKSPACE.md`, and initial `AGENTS.md` / `CLAUDE.md` files.
+Existing instruction files are preserved. Imported directories do not create links
+unless you enable that option. A folder's original files and Git checkout remain
+shared; removing it never deletes its files. Removal sets `enabled = false` in its
+TOML table, retaining comments, and removes only unchanged links owned by Verde.
+Disabled entries can be deleted manually or re-enabled in the manifest.
+
+`workspace.default_folder` selects the working directory for chats following the workspace; omitting it (or
+setting it to an empty string) uses the workspace home. Explicit per-thread working
+directories take precedence. File mentions search all configured real roots.
+Each repository retains its own Git history; run Git commands within that folder.
+
+Only `verde.toml` is loaded. YAML stack files are no longer supported.
+
+Use `[processes.<name>]` for normal long-running commands such as dev servers. Use
+`[agents.<name>]` for terminal/TUI AI tools that should behave like first-class Verde
 surfaces. With the Codex example above, Verde creates or reuses a terminal dock
 for the agent and wires Codex hook events into pane/workspace attention. Plain
 `codex` managed commands are launched with `features.hooks=true` when
-`hooks: true` is set, so `PermissionRequest` can mark the surface `waiting` and
+`hooks = true` is set, so `PermissionRequest` can mark the surface `waiting` and
 `Stop` can mark it `done`.
 
 Use `grok --no-auto-update` for a fresh Grok session, `--continue` for the most
@@ -310,14 +351,14 @@ verde live process restart --name codex
 
 Use `verde live agent open --provider codex` for the default Codex TUI flow; it
 creates a managed terminal surface, applies Codex hook setup, and does not need
-a `verde.yml` entry. Use `verde live process restart --name codex` when you want
-to launch or restart the named agent declared in `verde.yml`. The same default
+a `verde.toml` entry. Use `verde live process restart --name codex` when you want
+to launch or restart the named agent declared in `verde.toml`. The same default
 Codex TUI action is available from the workspace sidebar by right-clicking the
 workspace new-thread/pencil button and choosing `Open Codex TUI`.
 
 A Codex TUI opened manually in any Verde terminal still gets Verde identity
 environment variables and can update the surface through `verde notify`, BEL,
-OSC 777, or MCP, but it is not automatically a managed `verde.yml` agent unless
+OSC 777, or MCP, but it is not automatically a managed `verde.toml` agent unless
 it is launched through the configured process entry.
 
 ## Themes

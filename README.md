@@ -167,23 +167,20 @@ Opt-in under **Settings → Experimental**: a pane-less orchestration sidecar (S
 
 Ghostty-powered terminals under every workspace. Shell tabs, agent launch profiles, OSC titles, and zoom that stick with the layout.
 
-### Managed processes (`verde.yml`)
+### Managed processes (`verde.toml`)
 
 Declare dev servers and agents once; start/stop/restart from chat or CLI:
 
-```yaml
-processes:
-  web:
-    command: "npm run dev"
-    resources:
-      - "port:3000"
+```toml
+[processes.web]
+command = "npm run dev"
+resources = ["port:3000"]
 
-agents:
-  codex:
-    provider: codex
-    command: "codex"
-    revive: attach_or_create
-    hooks: true
+[agents.codex]
+provider = "codex"
+command = "codex"
+revive = "attach_or_create"
+hooks = true
 ```
 
 ### Headless session daemon
@@ -261,7 +258,7 @@ verde theme import https://verdeai.dev/themes/tokyo-night.json
 | Panes & tiling | [docs/panes](https://verdeai.dev/docs/panes) |
 | Design Mode | [docs/design-mode](https://verdeai.dev/docs/design-mode) |
 | CLI (`verde live`, state, browser) | [docs/cli](https://verdeai.dev/docs/cli) |
-| Config, themes, `verde.yml` | [docs/config](https://verdeai.dev/docs/config) |
+| Config, themes, `verde.toml` | [docs/config](https://verdeai.dev/docs/config) |
 | Troubleshooting | [docs/troubleshooting](https://verdeai.dev/docs/troubleshooting) |
 
 Agent-friendly crawl: [llms.txt](https://verdeai.dev/llms.txt) · [llms-full.txt](https://verdeai.dev/llms-full.txt) · any page as `/docs/<slug>.md`
@@ -321,7 +318,7 @@ Third-party notices and licenses for vendored components are listed under [Third
 | --- | --- |
 | App state | SDL pref path → `state.sqlite` |
 | User config | `~/.config/verde/verde.json` (Unix) · `%APPDATA%\Verde\verde.json` (Windows) · override with `VERDE_CONFIG` |
-| Project stack | `verde.yml` / `verde.yaml` in the workspace root |
+| Project stack | `verde.toml` in the workspace root |
 | Logs (Linux) | `~/.local/share/verde/Native/logs/verde.stderr.log` |
 | Logs (any) | `verde state path --json` then open `logs/` under that directory |
 

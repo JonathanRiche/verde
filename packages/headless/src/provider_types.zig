@@ -264,6 +264,8 @@ pub const StreamEvent = union(enum) {
 };
 
 pub const SendPromptRequest = struct {
+    /// Canonical workspace roots, resolved by the execution runtime.
+    workspace_roots: []const []const u8 = &.{},
     thread_id: ?[]const u8 = null,
     thread_title: ?[]const u8 = null,
     prompt: []const u8,
