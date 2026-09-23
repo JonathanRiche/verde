@@ -399,13 +399,13 @@ function WorkspaceGroup(props: {
         </button>
         <span class={`${selected() ? 'flex lg:hidden' : 'hidden'} items-center gap-1 lg:gap-0.5 lg:group-hover:flex`}>
           <TinyIcon label="New chat" onClick={(event) => { event.stopPropagation(); void store.runCommand('new-thread', props.workspace.workspace_id) }}>
-            <Icon name="chat" class="h-3.5 w-3.5" />
+            <Icon name="chat" class="h-[18px] w-[18px]" />
           </TinyIcon>
           <TinyIcon label="New terminal" onClick={(event) => { event.stopPropagation(); void store.runCommand('new-terminal', props.workspace.workspace_id) }}>
-            <Icon name="terminal" class="h-3.5 w-3.5" />
+            <Icon name="terminal" class="h-[18px] w-[18px]" />
           </TinyIcon>
           <TinyIcon label="History" onClick={(event) => { event.stopPropagation(); openHistory(props.workspace.workspace_id) }}>
-            <Icon name="history" class="h-3.5 w-3.5" />
+            <Icon name="history" class="h-[18px] w-[18px]" />
           </TinyIcon>
         </span>
       </div>
