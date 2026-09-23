@@ -3081,7 +3081,7 @@ fn tailFollowScrollY(
     active_geometry: bool,
 ) f32 {
     if (!active_geometry) return max_scroll;
-    if (!has_pending_stream or state.app_config.reduced_motion) {
+    if (!has_pending_stream or state.app_config.reduced_motion.chat) {
         tail_follow_slot = null;
         return max_scroll;
     }
@@ -3252,8 +3252,8 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, lane: Transc
 
     const now_ms = platform_runtime.unixTimestampMs();
     const generation = state.transcriptHydrationGeneration();
-    const fade_out_ms = theme.motionDurationMs(state.app_config.reduced_motion, theme.MOTION_FAST_MS);
-    const fade_in_ms = theme.motionDurationMs(state.app_config.reduced_motion, theme.MOTION_BASE_MS);
+    const fade_out_ms = theme.motionDurationMs(state.app_config.reduced_motion.chat, theme.MOTION_FAST_MS);
+    const fade_in_ms = theme.motionDurationMs(state.app_config.reduced_motion.chat, theme.MOTION_BASE_MS);
     var transition = &state.transcript_controller.transition;
 
     if (transition.phase != .idle and transition.generation != generation) {
@@ -4312,7 +4312,7 @@ fn renderCommittedTranscript(
                 transcriptCardEntranceOpacity(
                     message.transcript_card_started_ms,
                     unixTimestampMs(),
-                    state.app_config.reduced_motion,
+                    state.app_config.reduced_motion.chat,
                 ),
             );
         } else {
@@ -4647,7 +4647,7 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
             pi + 1;
         if (commandGroupRendersGrouped(send_state.pending_events.items, pi, group_end)) {
             const item_h = pendingToolCallGroupHeight(state, send_state.pending_events.items, pi, group_end, base_message_index, column.w, send_state.started_at_ms, variant_hash);
-            const entrance_opacity = pendingTranscriptCardOpacity(event, now_ms, state.app_config.reduced_motion);
+            const entrance_opacity = pendingTranscriptCardOpacity(event, now_ms, state.app_config.reduced_motion.chat);
             if (y + item_h >= column.y and y <= column.y + column.h) {
                 const batch_start = transcriptBatchStart(state);
                 renderToolCallGroup(
@@ -4706,7 +4706,7 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
         multiplyTranscriptBatchOpacity(
             state,
             batch_start,
-            pendingTranscriptCardOpacity(event, now_ms, state.app_config.reduced_motion),
+            pendingTranscriptCardOpacity(event, now_ms, state.app_config.reduced_motion.chat),
         );
         y += item_h + theme.scaledUi(12.0);
         pi += 1;
@@ -5809,7 +5809,7 @@ fn renderTranscriptMessage(state: *app_state.AppState, thread: *const app_state.
         transcriptCardEntranceOpacity(
             message.transcript_card_started_ms,
             unixTimestampMs(),
-            state.app_config.reduced_motion,
+            state.app_config.reduced_motion.chat,
         ),
     );
     if (message.role == .system and isSlashCommandResultMessage(message.author, message.body)) {
@@ -8407,7 +8407,7 @@ test "stream caret blinks on a fixed clock and stays lit under reduced motion" {
 
 fn renderStreamCaret(state: *app_state.AppState, tail: ?chat_markdown.TextTail, clip: palette.Rect) void {
     const at = tail orelse return;
-    if (!streamCaretVisible(profiler.nowNs(), state.app_config.reduced_motion)) return;
+    if (!streamCaretVisible(profiler.nowNs(), state.app_config.reduced_motion.chat)) return;
     const caret_h = at.h * 0.72;
     const caret: palette.Rect = .{
         .x = at.x + theme.scaledUi(3.0),

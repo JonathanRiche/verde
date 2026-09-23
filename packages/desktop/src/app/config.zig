@@ -219,6 +219,45 @@ pub const WorkspaceScrollDirection = enum {
 /// `state/workspace_tabs.zig`) appears: `automatic` only when the sidebar is
 /// collapsed or hidden, `always` alongside the expanded sidebar too,
 /// `disabled` never.
+/// Per-area reduced-motion switches. Each area snaps (or shortens) its own
+/// animations; the Settings "Reduce motion" master sets them all at once.
+pub const ReducedMotion = struct {
+    /// Strip scroll and skip-slide when moving focus between panes. Snaps by
+    /// default; every other area animates until the user opts out.
+    pane_scroll: bool = true,
+    /// Pane rect easing on split/close/zoom and the focus-ring crossfade.
+    pane_layout: bool = false,
+    /// Breathing pulse on agent-status pane borders and sidebar pips.
+    status_pulse: bool = false,
+    /// Transcript card fade-in, streaming tail glide, caret blink, thread switch fade.
+    chat: bool = false,
+    /// Sidebar slide/reorder and the settings modal fade.
+    chrome: bool = false,
+
+    pub const Part = std.meta.FieldEnum(ReducedMotion);
+
+    pub fn allOn() ReducedMotion {
+        var value: ReducedMotion = .{};
+        value.setAll(true);
+        return value;
+    }
+
+    pub fn all(self: ReducedMotion) bool {
+        inline for (std.meta.fields(ReducedMotion)) |field| {
+            if (!@field(self, field.name)) return false;
+        }
+        return true;
+    }
+
+    pub fn setAll(self: *ReducedMotion, enabled: bool) void {
+        inline for (std.meta.fields(ReducedMotion)) |field| @field(self, field.name) = enabled;
+    }
+
+    pub fn eql(a: ReducedMotion, b: ReducedMotion) bool {
+        return std.meta.eql(a, b);
+    }
+};
+
 pub const WorkspaceTabsMode = enum {
     automatic,
     always,
@@ -284,7 +323,7 @@ pub const AppConfig = struct {
     workspace_scroll_mode: WorkspaceScrollMode = .automatic,
     workspace_scroll_threshold: u8 = DEFAULT_WORKSPACE_SCROLL_THRESHOLD,
     unzoom_on_pane_navigation: bool = false,
-    reduced_motion: bool = false,
+    reduced_motion: ReducedMotion = .{},
     workspace_tabs: WorkspaceTabsMode = .automatic,
     /// Pane kind the tab strip's "+" opens as a new tab.
     workspace_new_tab_pane: WorkspaceSplitDefaultPane = .chat,
@@ -632,7 +671,14 @@ fn writeUiSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, con
     try ui_object.put(allocator, "workspace_scroll_mode", .{ .string = @tagName(config.workspace_scroll_mode) });
     try ui_object.put(allocator, "workspace_scroll_threshold", .{ .integer = config.workspace_scroll_threshold });
     try ui_object.put(allocator, "unzoom_on_pane_navigation", .{ .bool = config.unzoom_on_pane_navigation });
-    try ui_object.put(allocator, "reduced_motion", .{ .bool = config.reduced_motion });
+    // `reduced_motion` stays a bool (all areas) for older readers; the
+    // per-area object refines it.
+    try ui_object.put(allocator, "reduced_motion", .{ .bool = config.reduced_motion.all() });
+    var motion_parts: std.json.ObjectMap = .empty;
+    inline for (std.meta.fields(ReducedMotion)) |field| {
+        try motion_parts.put(allocator, field.name, .{ .bool = @field(config.reduced_motion, field.name) });
+    }
+    try ui_object.put(allocator, "reduced_motion_parts", .{ .object = motion_parts });
     try ui_object.put(allocator, "workspace_tabs", .{ .string = @tagName(config.workspace_tabs) });
     try ui_object.put(allocator, "workspace_new_tab_pane", .{ .string = @tagName(config.workspace_new_tab_pane) });
     try ui_object.put(allocator, "companion_enabled", .{ .bool = config.companion_enabled });
@@ -1370,9 +1416,26 @@ fn applyUiOverrides(config: *AppConfig, ui_value: std.json.Value) void {
     }
     if (ui_value.object.get("reduced_motion")) |reduced_motion_value| {
         if (reduced_motion_value == .bool) {
-            config.reduced_motion = reduced_motion_value.bool;
+            // Older builds always wrote this bool, so `false` only means "not
+            // everything"; keep the per-area defaults and let parts refine.
+            if (reduced_motion_value.bool) config.reduced_motion.setAll(true);
         } else {
             log.warn("ui.reduced_motion must be a boolean when provided", .{});
+        }
+    }
+    if (ui_value.object.get("reduced_motion_parts")) |parts_value| {
+        if (parts_value == .object) {
+            inline for (std.meta.fields(ReducedMotion)) |field| {
+                if (parts_value.object.get(field.name)) |part| {
+                    if (part == .bool) {
+                        @field(config.reduced_motion, field.name) = part.bool;
+                    } else {
+                        log.warn("ui.reduced_motion_parts." ++ field.name ++ " must be a boolean when provided", .{});
+                    }
+                }
+            }
+        } else {
+            log.warn("ui.reduced_motion_parts must be an object when provided", .{});
         }
     }
     if (ui_value.object.get("workspace_tabs")) |tabs_value| {
@@ -1749,7 +1812,8 @@ test "app config reduced motion round trips explicit values" {
         var root = try parseTestRoot("{\"plugin_owned\":true,\"ui\":{\"plugin_value\":\"keep\"}}");
         defer root.deinit();
 
-        const config: AppConfig = .{ .reduced_motion = enabled };
+        var config: AppConfig = .{};
+        config.reduced_motion.setAll(enabled);
         try writeUiSection(root.arena.allocator(), &root.value.object, &config);
         const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, root.value, .{});
         defer std.testing.allocator.free(encoded);
@@ -1764,8 +1828,53 @@ test "app config reduced motion round trips explicit values" {
         var loaded: AppConfig = .{};
         defer loaded.deinit(std.testing.allocator);
         applyAppOverrides(std.testing.allocator, &loaded, saved.value);
-        try std.testing.expectEqual(enabled, loaded.reduced_motion);
+        try std.testing.expect(loaded.reduced_motion.eql(config.reduced_motion));
     }
+}
+
+test "app config reduced motion parts round trip independently" {
+    var root = try parseTestRoot("{\"ui\":{}}");
+    defer root.deinit();
+
+    const config: AppConfig = .{ .reduced_motion = .{ .pane_scroll = false, .chat = true } };
+    try writeUiSection(root.arena.allocator(), &root.value.object, &config);
+    const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, root.value, .{});
+    defer std.testing.allocator.free(encoded);
+
+    var saved = try parseTestRoot(encoded);
+    defer saved.deinit();
+    const saved_ui = saved.value.object.get("ui").?.object;
+    try std.testing.expect(!saved_ui.get("reduced_motion").?.bool);
+
+    var loaded: AppConfig = .{};
+    defer loaded.deinit(std.testing.allocator);
+    applyAppOverrides(std.testing.allocator, &loaded, saved.value);
+    try std.testing.expect(!loaded.reduced_motion.pane_scroll);
+    try std.testing.expect(!loaded.reduced_motion.pane_layout);
+    try std.testing.expect(loaded.reduced_motion.chat);
+}
+
+test "app config defaults snap pane scrolling only, even with a legacy false bool" {
+    var root = try parseTestRoot("{\"ui\":{\"reduced_motion\":false}}");
+    defer root.deinit();
+    var loaded: AppConfig = .{};
+    defer loaded.deinit(std.testing.allocator);
+    applyAppOverrides(std.testing.allocator, &loaded, root.value);
+    try std.testing.expect(loaded.reduced_motion.eql(.{}));
+    try std.testing.expect(loaded.reduced_motion.pane_scroll);
+    try std.testing.expect(!loaded.reduced_motion.pane_layout);
+    try std.testing.expect(!loaded.reduced_motion.status_pulse);
+    try std.testing.expect(!loaded.reduced_motion.chat);
+    try std.testing.expect(!loaded.reduced_motion.chrome);
+}
+
+test "app config legacy reduced motion bool enables every part" {
+    var root = try parseTestRoot("{\"ui\":{\"reduced_motion\":true}}");
+    defer root.deinit();
+    var loaded: AppConfig = .{};
+    defer loaded.deinit(std.testing.allocator);
+    applyAppOverrides(std.testing.allocator, &loaded, root.value);
+    try std.testing.expect(loaded.reduced_motion.all());
 }
 
 test "app config workspace tabs mode round trips and rejects unknown values" {

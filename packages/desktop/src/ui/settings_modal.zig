@@ -35,6 +35,11 @@ pub const Control = enum(u8) {
     workspace_scroll_vertical,
     theme_dropdown,
     reduced_motion,
+    reduced_motion_pane_scroll,
+    reduced_motion_pane_layout,
+    reduced_motion_status_pulse,
+    reduced_motion_chat,
+    reduced_motion_chrome,
     workspace_tabs_automatic,
     workspace_tabs_always,
     workspace_tabs_disabled,
@@ -216,6 +221,7 @@ const SettingsLayout = struct {
     ui_font_dec: palette.Rect,
     ui_font_inc: palette.Rect,
     reduced_motion: palette.Rect,
+    reduced_motion_parts: [REDUCED_MOTION_PARTS.len]palette.Rect,
     reduced_motion_hint_y: f32,
     workspace_tabs_label_y: f32,
     workspace_tabs_automatic: palette.Rect,
@@ -431,6 +437,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         labeled + m.row_gap +
         m.row_h + m.row_gap +
         m.row_h + m.row_gap +
+        @as(f32, @floatFromInt(REDUCED_MOTION_PARTS.len)) * (m.row_h + m.row_gap) +
         m.row_h +
         if (companion_enabled) m.row_gap + labeled else 0.0;
     const transcript_h = m.card_pad * 2.0 + m.title_h + m.row_gap +
@@ -537,7 +544,15 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const reduced_motion_y = ui_font_y + m.row_h + m.row_gap;
     const reduced_motion: palette.Rect = .{ .x = theme_x, .y = reduced_motion_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
     const reduced_motion_hint_y = reduced_motion_y + m.row_h;
-    const companion_toggle_y = reduced_motion_y + m.row_h + m.row_gap;
+    // Per-area switches sit indented under the master toggle.
+    const motion_part_indent = theme.scaledUi(18.0);
+    var reduced_motion_parts: [REDUCED_MOTION_PARTS.len]palette.Rect = undefined;
+    var motion_part_y = reduced_motion_y + m.row_h + m.row_gap;
+    for (&reduced_motion_parts) |*rect| {
+        rect.* = .{ .x = theme_x + motion_part_indent, .y = motion_part_y, .w = content_w - m.card_pad * 2.0 - motion_part_indent, .h = m.row_h };
+        motion_part_y += m.row_h + m.row_gap;
+    }
+    const companion_toggle_y = motion_part_y;
     const companion_toggle: palette.Rect = .{ .x = theme_x, .y = companion_toggle_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
     const companion_hint_y = companion_toggle_y + m.row_h;
     const companion_character_label_y = if (companion_enabled) companion_toggle_y + m.row_h + m.row_gap else offscreen_y;
@@ -824,6 +839,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .ui_font_dec = ui_stepper.dec,
         .ui_font_inc = ui_stepper.inc,
         .reduced_motion = reduced_motion,
+        .reduced_motion_parts = reduced_motion_parts,
         .reduced_motion_hint_y = reduced_motion_hint_y,
         .workspace_tabs_label_y = workspace_tabs_label_y,
         .workspace_tabs_automatic = workspace_tabs_automatic,
@@ -1243,6 +1259,9 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
         queueControlHit(state, layout.ui_font_dec, layout.body_clip, .ui_font_dec, queue_hit);
         queueControlHit(state, layout.ui_font_inc, layout.body_clip, .ui_font_inc, queue_hit);
         queueControlHit(state, layout.reduced_motion, layout.body_clip, .reduced_motion, queue_hit);
+        for (REDUCED_MOTION_PARTS, layout.reduced_motion_parts) |part, rect| {
+            queueControlHit(state, rect, layout.body_clip, part.control, queue_hit);
+        }
         queueControlHit(state, layout.companion_toggle, layout.body_clip, .companion_toggle, queue_hit);
     }
     if (category == .workspace) {
@@ -1392,7 +1411,11 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         drawFieldLabel(state, layout.appearance_card, m, "Theme", layout.body_clip);
         drawThemeDropdown(state, layout);
         drawStepperRow(state, layout.appearance_card, m, layout.ui_font_dec.y, "UI font", state.settings_controller.draft.font_size, app_config.MIN_FONT_SIZE, app_config.MAX_FONT_SIZE, .ui_font_dec, .ui_font_inc, layout.ui_font_dec, layout.ui_font_inc, layout.body_clip);
-        drawSwitchRow(state, layout.reduced_motion, "Reduce motion", state.settings_controller.draft.reduced_motion, isControlHovered(state, .reduced_motion), layout.body_clip);
+        const motion = state.settings_controller.draft.reduced_motion;
+        drawSwitchRow(state, layout.reduced_motion, "Reduce motion", motion.all(), isControlHovered(state, .reduced_motion), layout.body_clip);
+        for (REDUCED_MOTION_PARTS, layout.reduced_motion_parts) |part, rect| {
+            drawSwitchRow(state, rect, part.label, reducedMotionPart(motion, part.part), isControlHovered(state, part.control), layout.body_clip);
+        }
         drawCompanionExperimentalRow(state, layout.companion_toggle, state.settings_controller.draft.companion_enabled, isControlHovered(state, .companion_toggle), layout.body_clip);
         if (state.settings_controller.draft.companion_enabled) {
             queueText(state, .{
@@ -1905,7 +1928,21 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         },
         .workspace_scroll_horizontal => state.settings_controller.draft.workspace_scroll_direction = .horizontal,
         .workspace_scroll_vertical => state.settings_controller.draft.workspace_scroll_direction = .vertical,
-        .reduced_motion => state.settings_controller.draft.reduced_motion = !state.settings_controller.draft.reduced_motion,
+        .reduced_motion => {
+            const motion = &state.settings_controller.draft.reduced_motion;
+            motion.setAll(!motion.all());
+        },
+        .reduced_motion_pane_scroll,
+        .reduced_motion_pane_layout,
+        .reduced_motion_status_pulse,
+        .reduced_motion_chat,
+        .reduced_motion_chrome,
+        => {
+            const motion = &state.settings_controller.draft.reduced_motion;
+            for (REDUCED_MOTION_PARTS) |part| {
+                if (part.control == control) toggleReducedMotionPart(motion, part.part);
+            }
+        },
         .workspace_tabs_automatic => state.settings_controller.draft.workspace_tabs = .automatic,
         .workspace_tabs_always => state.settings_controller.draft.workspace_tabs = .always,
         .workspace_tabs_disabled => state.settings_controller.draft.workspace_tabs = .disabled,
@@ -3462,6 +3499,33 @@ fn drawToggleCell(state: *runtime.AppState, rect: palette.Rect, label: []const u
 }
 
 // Boolean setting row: label on the left, switch track on the right.
+const ReducedMotionRow = struct {
+    part: app_config.ReducedMotion.Part,
+    control: Control,
+    label: []const u8,
+};
+
+/// Sub-switches under "Reduce motion", in display order.
+const REDUCED_MOTION_PARTS = [_]ReducedMotionRow{
+    .{ .part = .pane_scroll, .control = .reduced_motion_pane_scroll, .label = "Pane scrolling" },
+    .{ .part = .pane_layout, .control = .reduced_motion_pane_layout, .label = "Pane resize & focus" },
+    .{ .part = .status_pulse, .control = .reduced_motion_status_pulse, .label = "Status pulses" },
+    .{ .part = .chat, .control = .reduced_motion_chat, .label = "Chat animations" },
+    .{ .part = .chrome, .control = .reduced_motion_chrome, .label = "Sidebar & dialogs" },
+};
+
+fn reducedMotionPart(motion: app_config.ReducedMotion, part: app_config.ReducedMotion.Part) bool {
+    return switch (part) {
+        inline else => |tag| @field(motion, @tagName(tag)),
+    };
+}
+
+fn toggleReducedMotionPart(motion: *app_config.ReducedMotion, part: app_config.ReducedMotion.Part) void {
+    switch (part) {
+        inline else => |tag| @field(motion, @tagName(tag)) = !@field(motion, @tagName(tag)),
+    }
+}
+
 fn drawSwitchRow(state: *runtime.AppState, rect: palette.Rect, label: []const u8, on: bool, hovered: bool, clip: palette.Rect) void {
     if (hovered) {
         queueRoundedRectClipped(state, rect, paletteColor(controlHoverSurface()), radiusSm(), clip);
@@ -4038,12 +4102,33 @@ test "reduced motion setting is a persisted draft toggle" {
     var state = testSettingsState(allocator);
     defer deinitTestSettingsState(&state, allocator);
 
-    try std.testing.expect(!state.settings_controller.draft.reduced_motion);
-    try std.testing.expect(!state.app_config.reduced_motion);
+    try std.testing.expect(!state.settings_controller.draft.reduced_motion.all());
+    try std.testing.expect(!state.app_config.reduced_motion.all());
     applyControl(&state, @intFromEnum(Control.reduced_motion));
-    try std.testing.expect(state.settings_controller.draft.reduced_motion);
-    try std.testing.expect(state.app_config.reduced_motion);
+    try std.testing.expect(state.settings_controller.draft.reduced_motion.all());
+    try std.testing.expect(state.app_config.reduced_motion.all());
     try std.testing.expect(!state.isSettingsDraftDirty());
+}
+
+test "reduced motion sub-switch toggles only its area" {
+    const allocator = std.testing.allocator;
+    var state = testSettingsState(allocator);
+    defer deinitTestSettingsState(&state, allocator);
+
+    // Default: only pane scrolling snaps.
+    try std.testing.expect(state.app_config.reduced_motion.pane_scroll);
+    applyControl(&state, @intFromEnum(Control.reduced_motion_pane_layout));
+    try std.testing.expect(state.app_config.reduced_motion.pane_layout);
+    try std.testing.expect(state.app_config.reduced_motion.pane_scroll);
+    try std.testing.expect(!state.app_config.reduced_motion.chat);
+    try std.testing.expect(!state.app_config.reduced_motion.all());
+    try std.testing.expect(!state.isSettingsDraftDirty());
+
+    // Master turns every area on; a second press clears them all.
+    applyControl(&state, @intFromEnum(Control.reduced_motion));
+    try std.testing.expect(state.app_config.reduced_motion.all());
+    applyControl(&state, @intFromEnum(Control.reduced_motion));
+    try std.testing.expect(!state.app_config.reduced_motion.pane_scroll);
 }
 
 test "browser scroll speed slider snaps across the supported range" {

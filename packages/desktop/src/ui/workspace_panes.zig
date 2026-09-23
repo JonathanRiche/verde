@@ -265,11 +265,11 @@ fn tickPaneMotion(state: *const runtime.AppState, workspace_rect: palette.Rect) 
     // A moving container (sidebar rail tween, window resize) already drives
     // every pane rect per frame; easing on top would make panes trail it.
     const container_moving = !rectsEqual(workspace_rect, last_workspace_rect);
-    if (first or resize_drag != null or container_moving or state.app_config.reduced_motion) {
+    if (first or resize_drag != null or container_moving or state.app_config.reduced_motion.pane_layout) {
         pane_motion_t = 1.0;
         return;
     }
-    const duration_ms = theme.motionDurationMs(state.app_config.reduced_motion, theme.MOTION_BASE_MS);
+    const duration_ms: i64 = theme.MOTION_BASE_MS;
     pane_motion_t = if (duration_ms <= 0)
         1.0
     else
@@ -997,7 +997,7 @@ pub fn renderAt(state: *runtime.AppState, rect: palette.Rect) void {
 pub fn renderAtWithTranscriptLayoutWidth(state: *runtime.AppState, rect: palette.Rect, target_workspace_width: f32) void {
     tickPaneMotion(state, rect);
     last_workspace_rect = rect;
-    focus_anim_duration_ms = theme.motionDurationMs(state.app_config.reduced_motion, theme.MOTION_BASE_MS);
+    focus_anim_duration_ms = theme.motionDurationMs(state.app_config.reduced_motion.pane_layout, theme.MOTION_BASE_MS);
     state.terminal_controller.debug_workspace_visible_pane_count = state.currentProjectWorkspaceVisiblePaneCount();
     tickFocusAnimation(state);
     pane_status_animating = false;
@@ -1920,7 +1920,7 @@ fn renderScrollingStrip(
                             target.* = next_target;
                             markCurrentWorkspaceDirty(state);
                         }
-                    } else if (!state.app_config.reduced_motion and shouldSkipSlide(from_index, focused_index, pending_direction)) {
+                    } else if (!state.app_config.reduced_motion.pane_scroll and shouldSkipSlide(from_index, focused_index, pending_direction)) {
                         const inferred: i8 = if (from_index) |from|
                             if (focused_index >= from) 1 else -1
                         else if (next_target >= offset.*)
@@ -1957,7 +1957,7 @@ fn renderScrollingStrip(
         }
     }
 
-    if (strip_scrolls and !state.app_config.reduced_motion) {
+    if (strip_scrolls and !state.app_config.reduced_motion.pane_scroll) {
         tickScrollingAnimation(offset, target.*, &layout.scroll_animation_last_ms);
     } else {
         // Tab mode, or reduced motion: land on the target with no easing.
@@ -1967,7 +1967,7 @@ fn renderScrollingStrip(
     // Keep frame pacing active until the idle deadline can settle even a
     // sub-pixel wheel gesture that finished easing early.
     if (layout.scroll_snap_deadline_ms != 0) scrolling_animating = true;
-    const skip_progress = skipSlideProgress(layout, nowMs(), state.app_config.reduced_motion);
+    const skip_progress = skipSlideProgress(layout, nowMs(), state.app_config.reduced_motion.pane_scroll);
     if (skip_progress != null and skip_progress.? < 1.0) scrolling_animating = true;
     if (skip_progress != null and skip_progress.? >= 1.0) layout.clearScrollSkipSlide();
     // The strip owns pane-region motion until it reaches its target. A chat
@@ -3068,9 +3068,9 @@ fn renderLeafWithin(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, 
     // maximized layouts without tinting the pane's content.
     const agent_status = paneAgentVisualStatus(state, pane_id);
     if (agent_status != .idle) {
-        const animated = !state.app_config.reduced_motion;
+        const animated = !state.app_config.reduced_motion.status_pulse;
         pane_status_animating = pane_status_animating or animated;
-        const pulse = paneStatusPulseForMotion(agent_status, nowMs(), state.app_config.reduced_motion);
+        const pulse = paneStatusPulseForMotion(agent_status, nowMs(), state.app_config.reduced_motion.status_pulse);
         var border_color = switch (agent_status) {
             .done => theme.success(),
             .working => theme.accent(),

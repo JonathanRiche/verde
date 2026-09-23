@@ -25,7 +25,7 @@ const log = std.log.scoped(.native_ui_sidebar);
 /// pips draw the same clock-driven pulse but deliberately step at the ~1Hz
 /// pollSend repaint instead of forcing continuous frames app-wide.
 fn attentionPulse(state: *runtime.AppState, project_index: usize) f32 {
-    if (state.app_config.reduced_motion) return 1.0;
+    if (state.app_config.reduced_motion.status_pulse) return 1.0;
     if (project_index == state.project_controller.selected_index) state.sidebar_pulse_animating = true;
     return 0.35 + 0.65 * theme.activityPulse(profiler.nowNs());
 }
@@ -146,7 +146,7 @@ fn attentionMotionStep(state: *const runtime.AppState) f32 {
     const dt_ms = @max(now_ms - attention_anim_last_ms, 0);
     attention_anim_last_ms = now_ms;
     if (first) return 1.0;
-    const duration_ms = theme.motionDurationMs(state.app_config.reduced_motion, theme.MOTION_BASE_MS);
+    const duration_ms = theme.motionDurationMs(state.app_config.reduced_motion.chrome, theme.MOTION_BASE_MS);
     if (duration_ms <= 0) return 1.0;
     return theme.easeOutCubic(theme.clampf(@as(f32, @floatFromInt(dt_ms)) / @as(f32, @floatFromInt(duration_ms)), 0.0, 1.0));
 }

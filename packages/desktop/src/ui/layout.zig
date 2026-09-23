@@ -664,7 +664,7 @@ fn computeRootLayout(state: *runtime.AppState, width: f32, height: f32) RootLayo
     }
     const dt_ms = @max(now_ms - sidebar_anim_last_ms, 0);
     sidebar_anim_last_ms = now_ms;
-    const duration_ms = theme.motionDurationMs(state.app_config.reduced_motion, theme.MOTION_BASE_MS);
+    const duration_ms = theme.motionDurationMs(state.app_config.reduced_motion.chrome, theme.MOTION_BASE_MS);
     const step = if (duration_ms <= 0)
         1.0
     else

@@ -337,8 +337,8 @@ fn transcriptPresentationIdentityForPane(self: anytype, pane_id: ?WorkspacePaneI
 }
 
 pub fn transcriptTransitionNeedsContinuousFrames(self: anytype, now_ms: i64) bool {
-    const fade_out_ms = theme.motionDurationMs(self.app_config.reduced_motion, theme.MOTION_FAST_MS);
-    const fade_in_ms = theme.motionDurationMs(self.app_config.reduced_motion, theme.MOTION_BASE_MS);
+    const fade_out_ms = theme.motionDurationMs(self.app_config.reduced_motion.chat, theme.MOTION_FAST_MS);
+    const fade_in_ms = theme.motionDurationMs(self.app_config.reduced_motion.chat, theme.MOTION_BASE_MS);
     return self.transcript_controller.transition.needsContinuousFrames(now_ms, fade_out_ms, fade_in_ms);
 }
 

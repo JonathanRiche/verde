@@ -161,7 +161,7 @@ pub const Draft = struct {
     workspace_scroll_mode: app_config.WorkspaceScrollMode = .automatic,
     workspace_scroll_threshold: u8 = app_config.DEFAULT_WORKSPACE_SCROLL_THRESHOLD,
     unzoom_on_pane_navigation: bool = false,
-    reduced_motion: bool = false,
+    reduced_motion: app_config.ReducedMotion = .{},
     workspace_tabs: app_config.WorkspaceTabsMode = .automatic,
     companion_enabled: bool = false,
     companion_character: app_config.CompanionCharacter = .sprout,
@@ -443,7 +443,7 @@ pub fn isSettingsDraftDirty(self: anytype) bool {
     if (draft.workspace_scroll_mode != self.app_config.workspace_scroll_mode) return true;
     if (draft.workspace_scroll_threshold != self.app_config.workspace_scroll_threshold) return true;
     if (draft.unzoom_on_pane_navigation != self.app_config.unzoom_on_pane_navigation) return true;
-    if (draft.reduced_motion != self.app_config.reduced_motion) return true;
+    if (!draft.reduced_motion.eql(self.app_config.reduced_motion)) return true;
     if (draft.workspace_tabs != self.app_config.workspace_tabs) return true;
     if (draft.companion_enabled != self.app_config.companion_enabled) return true;
     if (isCompanionCharacterDraftDirty(&self.settings_controller, &self.app_config)) return true;
@@ -746,7 +746,7 @@ pub fn tickSettingsModalAnimation(self: anytype) void {
     if (last == 0 or now <= last) return;
     // Clamp so a stalled frame advances the fade instead of skipping it.
     const elapsed: f32 = @floatFromInt(@min(now - last, 100));
-    const duration_ms = theme.motionDurationMs(self.app_config.reduced_motion, theme.MOTION_BASE_MS);
+    const duration_ms = theme.motionDurationMs(self.app_config.reduced_motion.chrome, theme.MOTION_BASE_MS);
     const step = elapsed / @as(f32, @floatFromInt(duration_ms));
     if (self.settings_controller.modal_closing) {
         self.settings_controller.modal_anim_progress -= step;

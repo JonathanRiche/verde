@@ -11148,7 +11148,7 @@ fn configSnapshotFromApp(allocator: std.mem.Allocator, config: *const app_config
             .workspace_scroll_mode = @tagName(config.workspace_scroll_mode),
             .workspace_scroll_threshold = config.workspace_scroll_threshold,
             .unzoom_on_pane_navigation = config.unzoom_on_pane_navigation,
-            .reduced_motion = config.reduced_motion,
+            .reduced_motion = config.reduced_motion.all(),
         },
         .chat = .{ .favorite_models = favorites },
     };
@@ -11319,7 +11319,7 @@ test "config snapshot projects workspace strip settings and model favorites" {
         .workspace_scroll_mode = .always,
         .workspace_scroll_threshold = 4,
         .unzoom_on_pane_navigation = true,
-        .reduced_motion = true,
+        .reduced_motion = app_config.ReducedMotion.allOn(),
     };
     defer config.deinit(std.testing.allocator);
     try std.testing.expect(try config.toggleFavoriteModel(std.testing.allocator, .claude, "claude-opus-4-1"));
