@@ -31,12 +31,6 @@ for (const action of unavailable) {
   })
 }
 
-test('archive stays available on native panes and preserves busy disabling', () => {
-  const item = { action: 'thread-archive', label: 'Archive chat', disabled: false }
-  expect(sidebarMenuAvailability(item, pane)).toEqual(item)
-  expect(sidebarMenuAvailability({ ...item, disabled: true }, pane).disabled).toBe(true)
-})
-
 test('sync calls the daemon contract with the owning workspace, independent of native pane ID', async () => {
   const calls = []
   const thread = { local_thread_id: 'local', provider_thread_id: 'provider', title: 'Saved', profile_id: 'local' }

@@ -20,7 +20,7 @@ import { createProviderReadinessApi, runtimeBlocker } from './provider_readiness
 import { latestPaneUsage } from './usage'
 import { createTranscriptHistory, mergeTranscriptPage, type TranscriptContext, type TranscriptPage } from './transcript_history'
 import { dispatchWebCommand, openChatCommandPicker, sidebarActionUnavailableReason, requestSidebarThreadSync, type ChatPickerCommand } from './commands'
-import { archiveCommand, requestNewThread, requestWorkspaceCommand } from './command_requests'
+import { requestNewThread, requestWorkspaceCommand } from './command_requests'
 import { createHistoryApi, groupHistory, reconcileHistoryArchives, registerHistoryClient } from './history'
 import { createComposerCommands, parseSlashCommand, classifyBangCommand, repositoryCommandPath, type SlashCommandResult } from './composer_commands'
 import { isPlaceholderThreadTitle, makeThreadTitle } from './thread_title'
@@ -138,7 +138,6 @@ export type SidebarContextAction =
   | 'thread-handoff'
   | 'thread-open-tui'
   | 'thread-open-chat'
-  | 'thread-archive'
   | 'pane-zoom'
   | 'pane-split-chat-right'
   | 'pane-split-chat-down'
@@ -3695,9 +3694,6 @@ export function createAppStore() {
           }
           return
         }
-        case 'thread-archive':
-          if (pane) await archiveCommand(pane, paneOwningWorkspaceId, historyApi.archiveThread)
-          return
         case 'pane-zoom':
           if (pane) await maximizePane(pane)
           return
@@ -3991,7 +3987,6 @@ export function createAppStore() {
         'thread.rename_current': () => rename(true),
         'thread.choose_model': () => openPicker('model'),
         'thread.run_config': () => openPicker('run_config'),
-        'thread.archive_current': () => archiveCommand(pane!, paneOwningWorkspaceId, historyApi.archiveThread),
         'pane.terminal': () => newTerminal(current!.workspace_id),
         'pane.close': () => closePane(pane!),
         'pane.zoom': () => maximizePane(pane!),

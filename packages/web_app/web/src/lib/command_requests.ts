@@ -1,4 +1,4 @@
-import type { LivePane, RpcEnvelope, Thread, Workspace } from './types'
+import type { RpcEnvelope, Thread, Workspace } from './types'
 
 type Call = (method: string, params: unknown) => Promise<RpcEnvelope>
 type Mutation = () => Promise<{ client_id: string; request_key: string }>
@@ -24,14 +24,6 @@ export async function requestWorkspaceCommand(
   delete metadata.messages
   // The gateway still authorizes workspace.upsert against repository:write.
   return call('workspace.upsert', { mutation: await mutation(), workspace: metadata })
-}
-
-export function archiveCommand(
-  pane: LivePane,
-  owner: (pane: LivePane) => string,
-  archive: (workspace: string, thread: string) => Promise<boolean>,
-) {
-  return archive(owner(pane), pane.thread_id!)
 }
 
 /** Automatic focus must not summon a mobile keyboard; an explicit request must. */

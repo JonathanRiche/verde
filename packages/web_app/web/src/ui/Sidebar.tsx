@@ -772,7 +772,6 @@ function contextMenuItems(target: SidebarMenuTarget): MenuItem[] {
     { action: 'thread-sync', label: 'Sync thread', disabled: busy || !pane.thread_id || !pane.provider_thread_id || store.connectionFor(pane) !== 'local' },
     { action: 'thread-handoff', label: 'Handoff to another agent', disabled: busy || desktop_only_disabled },
     { action: 'thread-open-tui', label: `Open in TUI: ${provider}`, disabled: busy || desktop_only_disabled || !pane.provider_thread_id },
-    { action: 'thread-archive', label: 'Archive chat', disabled: busy || !pane.thread_id, danger: true },
     // Desktop-hosted chat panes are gated by sidebarMenuAvailability; daemon-only
     // chats close through chat.thread.close.
     { action: 'pane-close', label: 'Close pane', danger: true },

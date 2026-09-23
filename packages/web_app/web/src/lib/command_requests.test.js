@@ -1,7 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { archiveCommand, focusChatPrompt, requestNewThread, requestWorkspaceCommand } from './command_requests'
-import { owningWorkspaceId } from './selection'
-import { createHistoryApi } from './history'
+import { focusChatPrompt, requestNewThread, requestWorkspaceCommand } from './command_requests'
 
 const workspace = { workspace_id: 'owner', label: 'Saved', path: '/repo', workspace_layout_json: 'layout', threads: [{ local_thread_id: 't' }], messages: [{ body: 'keep out' }] }
 const mutation = async () => ({ client_id: 'paired-client', request_key: 'command-request' })
@@ -46,29 +44,6 @@ test('new chat calls only the daemon draft upsert, never the forbidden chat.open
   }, mutation, workspace, thread)
   expect(result).toBe(ok)
   expect(calls).toEqual([{ method: 'chat.thread.upsert', params: { mutation: await mutation(), workspace_id: 'owner', thread } }])
-})
-
-test('archive follows the catalog owner through the real history handler', async () => {
-  const pane = { workspace_id: 'displayed', pane_id: 1, kind: 'chat', thread_id: 't' }
-  const catalogs = { owner: [{ local_thread_id: 't', title: 'Saved' }] }
-  const calls = []
-  const history = createHistoryApi({
-    call: async (method, params) => {
-      calls.push({ method, params })
-      if (method === 'daemon.storeStatus') return { result: { store_revision: 42 } }
-      if (method === 'chat.thread.archive.set') return { result: { store_revision: 43 } }
-      throw new Error(`Unexpected RPC: ${method}`)
-    },
-    mutation, notice: () => {}, threadChanged: () => {}, workspaceReopened: () => {},
-  })
-  expect(await archiveCommand(pane, (target) => owningWorkspaceId(target, catalogs), history.archiveThread)).toBe(true)
-  expect(calls).toEqual([
-    { method: 'daemon.storeStatus', params: {} },
-    { method: 'chat.thread.archive.set', params: {
-      workspace_id: 'owner', local_thread_id: 't', archived: true,
-      mutation: { ...await mutation(), expected_store_revision: 42 },
-    } },
-  ])
 })
 
 test('explicit compact prompt focus reaches the textarea; automatic focus does not', () => {

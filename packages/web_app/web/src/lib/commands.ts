@@ -10,7 +10,6 @@ export const COMMANDS = [
   native('thread.rename_current', 'Rename current chat', 'chat'),
   native('thread.choose_model', 'Choose chat model', 'chat'),
   native('thread.run_config', 'Configure reasoning and run settings', 'chat'),
-  native('thread.archive_current', 'Archive current chat', 'chat'),
   native('pane.terminal', 'Open terminal pane', 'workspace', 'Ctrl+Alt+T'),
   native('pane.close', 'Close pane', 'pane'),
   native('pane.zoom', 'Zoom / unzoom pane', 'pane', 'Alt+Z'),
