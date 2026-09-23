@@ -420,6 +420,9 @@ button { transition-property: background-color, color, border-color, opacity, bo
 .niri-strip.niri-inset {
   padding: var(--workspace-pane-gap, 12px);
   gap: var(--workspace-pane-gap, 12px);
+  /* Snap columns to the padded edge, not the scrollport edge; otherwise the
+     focused column sits flush against the sidebar and the next one peeks in. */
+  scroll-padding-inline: var(--workspace-pane-gap, 12px);
 }
 .niri-column {
   display: flex;
@@ -441,6 +444,10 @@ button { transition-property: background-color, color, border-color, opacity, bo
   border: 1px solid var(--border-muted);
   border-radius: 2px;
 }
+/* Inset columns clip to 8px corners; a smaller tile radius (and the square
+   focus ring inside it) got notched by that clip. Round every layer alike. */
+.niri-inset .pane-tile { border-radius: 8px; }
+.niri-inset .niri-column [data-pane-id] > * { border-radius: inherit; }
 .pane-split-gutter {
   position: relative;
   z-index: 2;
