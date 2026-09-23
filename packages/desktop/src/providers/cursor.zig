@@ -11,8 +11,10 @@ const process_env = @import("../platform/env.zig");
 const provider_types = @import("types.zig");
 const runtime_log = @import("../runtime/log.zig");
 
-const DEFAULT_EXECUTABLE = "agent";
-const FALLBACK_EXECUTABLE = "cursor-agent";
+/// `cursor-agent` first: Grok also installs an `agent` binary that can shadow
+/// Cursor's when its bin directory precedes `~/.local/bin` on PATH.
+const DEFAULT_EXECUTABLE = "cursor-agent";
+const FALLBACK_EXECUTABLE = "agent";
 const DEFAULT_MODEL = "composer-2.5";
 const MAX_CURSOR_OUTPUT_BYTES = 8 * 1024 * 1024;
 const RESOURCE_EXHAUSTED_MESSAGE =
@@ -754,7 +756,7 @@ fn resolveCursorExecutableAlloc(
             else => return err,
         };
     }
-    runtime_log.diagnostic("cursor CLI not found; install Cursor Agent for this platform, ensure `agent` or `cursor-agent` is on PATH, then run `agent login`.", .{});
+    runtime_log.diagnostic("cursor CLI not found; install Cursor Agent for this platform, ensure `cursor-agent` or `agent` is on PATH, then run `cursor-agent login`.", .{});
     return error.FileNotFound;
 }
 

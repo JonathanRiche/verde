@@ -172,6 +172,8 @@ pub const Parent = struct {
     /// User preference for this parent; survives projection rebuilds because
     /// it is keyed by thread identity rather than stored on the ChatThread.
     collapsed: bool = true,
+    /// Frame-local harness count; never persisted as MCP links.
+    subagent_count: usize = 0,
     narrow_expanded: bool = false,
     narrow: bool = false,
     scroll_y: f32 = 0.0,

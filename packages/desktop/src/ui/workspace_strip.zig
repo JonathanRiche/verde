@@ -202,7 +202,7 @@ pub fn render(state: *runtime.AppState, strip: palette.Rect) void {
 fn renderTab(state: *runtime.AppState, rect: palette.Rect, clip: palette.Rect, selected: bool, hovered: bool) void {
     const radius = theme.scaledUi(TAB_RADIUS_UI);
     const fill: [4]f32 = if (selected)
-        theme.withAlpha(theme.accent(), 64)
+        theme.wash(theme.accent(), 64)
     else if (hovered)
         theme.raise(theme.COLOR_PANEL_ALT, 0.06)
     else

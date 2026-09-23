@@ -626,16 +626,30 @@ fn handleProvidersStatus(allocator: std.mem.Allocator, io: std.Io, data_dir: []c
 
     try writeStdout(io, "Provider status for runtime {s}\n", .{provider_status.runtime_id});
     for (provider_status.providers) |provider| {
-        try writeStdout(
-            io,
-            "{s}: {s} (installed={s}, auth={s})\n",
-            .{
-                provider.label,
-                provider.state,
-                if (provider.installed) "yes" else "no",
-                provider.authentication,
-            },
-        );
+        if (provider.version) |version| {
+            try writeStdout(
+                io,
+                "{s}: {s} (installed={s}, auth={s}, version={s})\n",
+                .{
+                    provider.label,
+                    provider.state,
+                    if (provider.installed) "yes" else "no",
+                    provider.authentication,
+                    version,
+                },
+            );
+        } else {
+            try writeStdout(
+                io,
+                "{s}: {s} (installed={s}, auth={s})\n",
+                .{
+                    provider.label,
+                    provider.state,
+                    if (provider.installed) "yes" else "no",
+                    provider.authentication,
+                },
+            );
+        }
         if (provider.remediation) |remediation| {
             try writeStdout(io, "  Next: {s}\n", .{remediation.label});
         }

@@ -451,6 +451,26 @@ pub const WorkspaceLayout = struct {
         return if (zoomed_tab == target_tab) target_pane_id else zoomed;
     }
 
+    /// Puts zoom back on `previous_zoom` after a new pane was focused, when
+    /// that pane opened a different space group and the strip is showing.
+    /// `focusCreatedPane` hands zoom to every new pane; a fresh space should
+    /// not take it. Returns whether zoom moved. Full-workspace zoom is left
+    /// on the new pane, because that zoom fills the workspace and hiding the
+    /// pane that was just focused would make the new space unreachable.
+    pub fn restoreZoomToPreviousSpace(
+        self: *WorkspaceLayout,
+        new_pane_id: WorkspacePaneId,
+        previous_zoom: WorkspacePaneId,
+        strip_active: bool,
+    ) bool {
+        if (!strip_active or self.paneById(previous_zoom) == null) return false;
+        const new_group = self.scrollGroupIdForPane(new_pane_id) orelse return false;
+        const zoomed_group = self.scrollGroupIdForPane(previous_zoom) orelse return false;
+        if (new_group == zoomed_group or self.maximized_pane_id == previous_zoom) return false;
+        self.maximized_pane_id = previous_zoom;
+        return true;
+    }
+
     pub fn hasCustomScrollPaneExtent(self: *const WorkspaceLayout) bool {
         if (self.scroll_pane_extent_override != null) return true;
         for (self.panes.items) |pane| {
@@ -2258,6 +2278,32 @@ test "workspace layout persists per-pane scrolling extents" {
     restored.clearScrollPaneExtents();
     try std.testing.expect(!restored.hasCustomScrollPaneExtent());
     try std.testing.expectEqual(@as(?f32, null), restored.paneById(second_pane_id).?.scroll_extent_css);
+}
+
+test "a fresh space group keeps zoom on the space that already had it" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+
+    const first_pane_id = layout.focused_pane_id orelse return error.TestExpectedEqual;
+    layout.maximized_pane_id = first_pane_id;
+    const second_pane_id = try layout.createTerminalPane(allocator, 10);
+    try layout.splitPaneWithLeaf(allocator, first_pane_id, second_pane_id, .vertical, true);
+    layout.focusCreatedPane(second_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.maximized_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.focused_pane_id);
+
+    try std.testing.expect(layout.restoreZoomToPreviousSpace(second_pane_id, first_pane_id, true));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, first_pane_id), layout.maximized_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.focused_pane_id);
+
+    layout.focusCreatedPane(second_pane_id);
+    try std.testing.expect(!layout.restoreZoomToPreviousSpace(second_pane_id, first_pane_id, false));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.maximized_pane_id);
+
+    try std.testing.expect(layout.joinPaneToScrollGroup(first_pane_id, second_pane_id));
+    try std.testing.expect(!layout.restoreZoomToPreviousSpace(second_pane_id, first_pane_id, true));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.maximized_pane_id);
 }
 
 test "closing a maximized pane transfers zoom to the left pane" {

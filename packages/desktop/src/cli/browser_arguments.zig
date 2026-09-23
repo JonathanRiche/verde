@@ -6,6 +6,7 @@ pub fn fields(tool: []const u8) ?[]const []const u8 {
     const entries = [_]Entry{
         .{ .name = "browser_status", .keys = &.{} },
         .{ .name = "open_browser", .keys = &.{"url"} },
+        .{ .name = "open_browser_tab", .keys = &.{"url"} },
         .{ .name = "navigate_browser", .keys = &.{"url"} },
         .{ .name = "restart_browser", .keys = &.{} },
         .{ .name = "reset_browser", .keys = &.{} },

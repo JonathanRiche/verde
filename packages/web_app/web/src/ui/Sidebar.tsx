@@ -1,4 +1,4 @@
-import { For, Show, createEffect, createSignal, onCleanup, type JSX } from 'solid-js'
+import { For, Show, createEffect, createMemo, createSignal, onCleanup, type JSX } from 'solid-js'
 import { Portal } from 'solid-js/web'
 
 import { store, type SidebarContextAction } from '../lib/store'
@@ -11,6 +11,32 @@ import { sidebarMenuAvailability } from '../lib/commands'
 // Sidebar-only view state: the selected workspace whose pane list is folded.
 // Keyed by id so selecting a different workspace always shows its panes.
 const [foldedWorkspaceId, setFoldedWorkspaceId] = createSignal<string | null>(null)
+
+function sameKeys(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((key, index) => key === b[index])
+}
+
+/// Background refreshes (`core.snapshot` pushes, catalog refetches) rebuild
+/// workspace and pane objects even when only one field changed, and <For>
+/// keys rows by object identity, so each refresh remounted every row and
+/// replayed the `anim-reveal` fold-out. Iterate stable string keys instead and
+/// read the latest row through an accessor so DOM nodes survive refreshes.
+function keyedRows<T>(rows: () => readonly T[], key: (row: T) => string) {
+  const keys = createMemo(() => rows().map(key), [], { equals: sameKeys })
+  const by_key = createMemo(() => new Map(rows().map((row) => [key(row), row] as const)))
+  return {
+    keys,
+    row(id: string): () => T {
+      // A removed row's accessor can still be read before <For> disposes it.
+      let last = by_key().get(id)!
+      return () => (last = by_key().get(id) ?? last)
+    },
+  }
+}
+
+function activePaneKey(pane: LivePane): string {
+  return `${pane.workspace_id}\u0000${pane.pane_id}`
+}
 
 function actionWorkspace(pane?: LivePane): Workspace | undefined {
   if (!pane) return undefined
@@ -47,6 +73,8 @@ export function Sidebar(props: { drawer?: boolean }) {
   const collapsed = () => !props.drawer && store.sidebarCollapsed()
   const [menu, setMenu] = createSignal<SidebarMenuTarget | null>(null)
   const [prompt, setPrompt] = createSignal<PromptState | null>(null)
+  const active_rows = keyedRows(() => store.activePanes(), activePaneKey)
+  const workspace_rows = keyedRows(() => store.workspaces(), (workspace) => workspace.workspace_id)
 
   const openWorkspaceMenu = (workspace: Workspace, x: number, y: number) => {
     setMenu({ kind: 'workspace', workspace, x, y })
@@ -141,27 +169,33 @@ export function Sidebar(props: { drawer?: boolean }) {
           >
             <Show when={store.activePanes().length > 0}>
               <div class="mb-1 text-[11px] tracking-wide text-[var(--text-subtle)]">ACTIVE</div>
-              <For each={store.activePanes()}>
-                {(pane) => (
-                  <PaneRow
-                    pane={pane}
-                    activeCluster
-                    onClick={() => store.focusPane(pane)}
-                    onOpenContext={(x, y) => openPaneMenu(pane, x, y)}
-                  />
-                )}
+              <For each={active_rows.keys()}>
+                {(key) => {
+                  const pane = active_rows.row(key)
+                  return (
+                    <PaneRow
+                      pane={pane()}
+                      activeCluster
+                      onClick={() => store.focusPane(pane())}
+                      onOpenContext={(x, y) => openPaneMenu(pane(), x, y)}
+                    />
+                  )
+                }}
               </For>
               <div class="my-3 h-px bg-[var(--border-muted)]" />
             </Show>
 
-            <For each={store.workspaces()}>
-              {(workspace) => (
-                <WorkspaceGroup
-                  workspace={workspace}
-                  onOpenContext={(x, y) => openWorkspaceMenu(workspace, x, y)}
-                  onOpenPaneContext={openPaneMenu}
-                />
-              )}
+            <For each={workspace_rows.keys()}>
+              {(id) => {
+                const workspace = workspace_rows.row(id)
+                return (
+                  <WorkspaceGroup
+                    workspace={workspace()}
+                    onOpenContext={(x, y) => openWorkspaceMenu(workspace(), x, y)}
+                    onOpenPaneContext={openPaneMenu}
+                  />
+                )
+              }}
             </For>
           </div>
         </Show>
@@ -318,6 +352,12 @@ function WorkspaceGroup(props: {
   // workspace (including this one again) unfolds it.
   const expanded = () => selected() && foldedWorkspaceId() !== props.workspace.workspace_id
   const context = createContextTrigger(props.onOpenContext)
+  // Split groups render their layout tree once per mount, so a layout change
+  // is part of the key; everything else updates in place.
+  const group_rows = keyedRows(
+    () => (expanded() ? store.paneGroups() : []),
+    (group) => (group.panes.length > 1 ? `${group.key}\u0000${JSON.stringify(group.layout)}` : group.key),
+  )
   return (
     <section class="relative mb-2">
       <Show when={selected()}>
@@ -371,28 +411,31 @@ function WorkspaceGroup(props: {
       </div>
       <Show when={expanded()}>
         <div class="anim-reveal mt-1 ml-4">
-          <For each={expanded() ? store.paneGroups() : []}>
-            {(group) => (
-              <Show
-                when={group.panes.length > 1}
-                fallback={<PaneRow
-                  pane={group.panes[0]!}
-                  onClick={() => store.focusPane(group.panes[0]!)}
-                  onOpenContext={(x, y) => props.onOpenPaneContext(group.panes[0]!, x, y)}
-                />}
-              >
-                <div
-                  class="mb-1 flex min-h-0 min-w-0 overflow-hidden"
-                  style={{ height: `${sidebarGroupRows(group.layout) * 38 + (sidebarGroupRows(group.layout) - 1) * 4}px` }}
+          <For each={group_rows.keys()}>
+            {(key) => {
+              const group = group_rows.row(key)
+              return (
+                <Show
+                  when={group().panes.length > 1}
+                  fallback={<PaneRow
+                    pane={group().panes[0]!}
+                    onClick={() => store.focusPane(group().panes[0]!)}
+                    onOpenContext={(x, y) => props.onOpenPaneContext(group().panes[0]!, x, y)}
+                  />}
                 >
-                  <SidebarGroupNode
-                    node={group.layout}
-                    panes={group.panes}
-                    onOpenPaneContext={props.onOpenPaneContext}
-                  />
-                </div>
-              </Show>
-            )}
+                  <div
+                    class="mb-1 flex min-h-0 min-w-0 overflow-hidden"
+                    style={{ height: `${sidebarGroupRows(group().layout) * 38 + (sidebarGroupRows(group().layout) - 1) * 4}px` }}
+                  >
+                    <SidebarGroupNode
+                      node={group().layout}
+                      panes={group().panes}
+                      onOpenPaneContext={props.onOpenPaneContext}
+                    />
+                  </div>
+                </Show>
+              )
+            }}
           </For>
         </div>
       </Show>
@@ -414,16 +457,17 @@ function SidebarGroupNode(props: {
 }) {
   if ('leaf' in props.node) {
     const leaf_id = props.node.leaf
-    const pane = props.panes.find((item) => item.pane_id === leaf_id)
+    // Non-keyed: refreshed pane objects update the row instead of remounting it.
+    const pane = () => props.panes.find((item) => item.pane_id === leaf_id)
     return (
-      <Show when={pane} keyed>
+      <Show when={pane()}>
         {(item) => (
           <div class="min-h-0 min-w-0 flex-1 overflow-hidden rounded-[7px] border border-[var(--border-muted)] bg-[var(--panel-alt)]">
             <PaneRow
-              pane={item}
+              pane={item()}
               tiled
-              onClick={() => store.focusPane(item)}
-              onOpenContext={(x, y) => props.onOpenPaneContext(item, x, y)}
+              onClick={() => store.focusPane(item())}
+              onOpenContext={(x, y) => props.onOpenPaneContext(item(), x, y)}
             />
           </div>
         )}
@@ -486,21 +530,23 @@ function PaneRow(props: {
 }
 
 function CollapsedRail(props: { onOpenContext: (workspace: Workspace, x: number, y: number) => void }) {
+  const workspace_rows = keyedRows(() => store.workspaces(), (workspace) => workspace.workspace_id)
   return (
     <div class="flex min-h-0 flex-1 flex-col items-center gap-2 overflow-y-auto pt-1 scrollbar-thin">
-      <For each={store.workspaces()}>
-        {(workspace) => {
-          const selected = () => store.workspaceId() === workspace.workspace_id
-          const context = createContextTrigger((x, y) => props.onOpenContext(workspace, x, y))
+      <For each={workspace_rows.keys()}>
+        {(id) => {
+          const row = workspace_rows.row(id)
+          const selected = () => store.workspaceId() === id
+          const context = createContextTrigger((x, y) => props.onOpenContext(row(), x, y))
           return (
             <button
               type="button"
               class={`relative grid h-9 w-9 touch-pan-y select-none place-items-center rounded-[6px] ${selected() ? 'bg-[var(--accent-row)]' : 'hover:bg-[var(--accent-hover)]'}`}
               style={{ '-webkit-touch-callout': 'none' }}
-              title={workspace.label}
+              title={row().label}
               onClick={(event) => {
                 if (context.consumeClick(event)) return
-                store.selectWorkspace(workspace.workspace_id)
+                store.selectWorkspace(id)
               }}
               onContextMenu={context.onContextMenu}
               onPointerDown={context.onPointerDown}
@@ -511,7 +557,7 @@ function CollapsedRail(props: { onOpenContext: (workspace: Workspace, x: number,
               <Show when={selected()}>
                 <span class="absolute top-1 bottom-1 left-0 w-[3px] rounded-full bg-[var(--accent)]" />
               </Show>
-              <span class="text-[11px] font-bold text-[var(--text-muted)]">{workspace.label.slice(0, 1).toUpperCase()}</span>
+              <span class="text-[11px] font-bold text-[var(--text-muted)]">{row().label.slice(0, 1).toUpperCase()}</span>
             </button>
           )
         }}

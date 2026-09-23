@@ -335,6 +335,15 @@ fn writeBrowserStatus(s: *std.json.Stringify, state: *app_state.AppState) !void 
     if (location) |loc| try s.write(state.project_controller.projects.items[loc.index].id) else try s.write(null);
     try s.objectField("pane_id");
     if (location) |loc| try s.write(loc.pane_id) else try s.write(null);
+    try s.objectField("active_tab_index");
+    const pane_ref = if (location) |loc| state.browserPaneRefMutable(loc.index, loc.pane_id) else null;
+    if (pane_ref) |pane| try s.write(pane.active_tab_index) else try s.write(null);
+    try s.objectField("tabs");
+    try s.beginArray();
+    if (pane_ref) |pane| for (pane.tabs.items, 0..) |tab, index| {
+        try s.write(.{ .tab_index = index, .active = index == pane.active_tab_index, .url = tab.url, .title = tab.title });
+    };
+    try s.endArray();
     try s.objectField("pane_focused");
     try s.write(state.isBrowserPaneFocused());
     try s.objectField("address_focused");
@@ -400,34 +409,35 @@ fn capabilitiesResponse(allocator: std.mem.Allocator, id_value: std.json.Value) 
     return try okValueResponse(allocator, id_value, .{
         .protocol_version = PROTOCOL_VERSION,
         .commands = &.{
-            "status",                             "capabilities",                        "workspaces",                          "panes",
-            "active",                             "inspect",                             "threads",                             "terminals",
-            "herdr.open",                         "herdr.handoff",                       "herdr.unlink",                        "herdr.status",
-            "surfaces",                           "surface.list",                        "surface.inspect",                     "surface.focus",
-            "surface.clearAttention",             "notification.create",                 "notification.update",                 "notification.clear",
-            "processes",                          "workspace.select",                    "workspace.create",                    "workspace.rename",
-            "workspace.close",                    "workspace.reopen",                    "workspace.archive",                   "pane.focus",
-            "pane.split",                         "pane.resize",                         "pane.move",                           "pane.maximize",
-            "pane.close",                         "chat.open",                           "chat.open.validate",                  "chat.present",
-            "chat.open_subagent",                 "chat.status",                         "chat.transcript",                     "chat.draft.get",
-            "chat.draft.set",                     "chat.draft.append",                   "chat.send",                           "chat.followup",
-            "chat.stop",                          "chat.approve",                        "browser.open",                        "browser.navigate",
-            "browser.status",                     "browser.close",                       "browser.toggle",                      "browser.back",
-            "browser.forward",                    "browser.reload",                      "browser.focus",                       "browser.blur",
-            "browser.restart",                    "browser.reset",                       "browser.pointerDown",                 "browser.pointerMove",
-            "browser.pointerUp",                  "browser.toolbarHit",                  "browser.selectAllFocused",            "browser.copyFocused",
-            "browser.pasteTextFocused",           "browser.eval",                        "browser.postJson",                    "browser.screenshot",
-            "browser.inspector.enable",           "browser.inspector.disable",           "browser.inspector.toggle",            "browser.inspector.mode",
-            "browser.inspector.menuOpen",         "browser.inspector.menuClose",         "browser.overlay.workspaceMenuOpen",   "browser.overlay.workspaceMenuClose",
-            "browser.overlay.sidebarMenuOpen",    "browser.overlay.sidebarMenuClose",    "browser.overlay.composerMenuOpen",    "browser.overlay.composerMenuClose",
-            "browser.overlay.workspaceModalOpen", "browser.overlay.workspaceModalClose", "browser.overlay.threadModalOpen",     "browser.overlay.threadModalClose",
-            "browser.overlay.imageModalOpen",     "browser.overlay.imageModalClose",     "browser.overlay.transcriptModalOpen", "browser.overlay.transcriptModalClose",
-            "palette.list",                       "palette.run",                         "terminal.open",                       "terminal.write",
-            "terminal.key",                       "terminal.tail",                       "terminal.screen",                     "process.list",
-            "process.inspect",                    "process.start",                       "process.stop",                        "process.restart",
-            "process.logs",                       "agent.open",                          "stack.status",                        "stack.start",
-            "stack.stop",                         "stack.restart",                       "workspace.processes",                 "workspace.checkCommand",
-            "workspace.acquireLease",             "workspace.releaseLease",              "tab.select",                          "tab.add",
+            "status",                               "capabilities",                       "workspaces",                          "panes",
+            "active",                               "inspect",                            "threads",                             "terminals",
+            "herdr.open",                           "herdr.handoff",                      "herdr.unlink",                        "herdr.status",
+            "surfaces",                             "surface.list",                       "surface.inspect",                     "surface.focus",
+            "surface.clearAttention",               "notification.create",                "notification.update",                 "notification.clear",
+            "processes",                            "workspace.select",                   "workspace.create",                    "workspace.rename",
+            "workspace.close",                      "workspace.reopen",                   "workspace.archive",                   "pane.focus",
+            "pane.split",                           "pane.resize",                        "pane.move",                           "pane.maximize",
+            "pane.close",                           "chat.open",                          "chat.open.validate",                  "chat.present",
+            "chat.open_subagent",                   "chat.status",                        "chat.transcript",                     "chat.draft.get",
+            "chat.draft.set",                       "chat.draft.append",                  "chat.send",                           "chat.followup",
+            "chat.stop",                            "chat.approve",                       "browser.open",                        "browser.navigate",
+            "browser.tabOpen",                      "browser.status",                     "browser.close",                       "browser.toggle",
+            "browser.back",                         "browser.forward",                    "browser.reload",                      "browser.focus",
+            "browser.blur",                         "browser.restart",                    "browser.reset",                       "browser.pointerDown",
+            "browser.pointerMove",                  "browser.pointerUp",                  "browser.toolbarHit",                  "browser.selectAllFocused",
+            "browser.copyFocused",                  "browser.pasteTextFocused",           "browser.eval",                        "browser.postJson",
+            "browser.screenshot",                   "browser.inspector.enable",           "browser.inspector.disable",           "browser.inspector.toggle",
+            "browser.inspector.mode",               "browser.inspector.menuOpen",         "browser.inspector.menuClose",         "browser.overlay.workspaceMenuOpen",
+            "browser.overlay.workspaceMenuClose",   "browser.overlay.sidebarMenuOpen",    "browser.overlay.sidebarMenuClose",    "browser.overlay.composerMenuOpen",
+            "browser.overlay.composerMenuClose",    "browser.overlay.workspaceModalOpen", "browser.overlay.workspaceModalClose", "browser.overlay.threadModalOpen",
+            "browser.overlay.threadModalClose",     "browser.overlay.imageModalOpen",     "browser.overlay.imageModalClose",     "browser.overlay.transcriptModalOpen",
+            "browser.overlay.transcriptModalClose", "palette.list",                       "palette.run",                         "terminal.open",
+            "terminal.write",                       "terminal.key",                       "terminal.tail",                       "terminal.screen",
+            "process.list",                         "process.inspect",                    "process.start",                       "process.stop",
+            "process.restart",                      "process.logs",                       "agent.open",                          "stack.status",
+            "stack.start",                          "stack.stop",                         "stack.restart",                       "workspace.processes",
+            "workspace.checkCommand",               "workspace.acquireLease",             "workspace.releaseLease",              "tab.select",
+            "tab.add",
         },
         .events = &.{},
         .encodings = &.{"json"},
@@ -1432,7 +1442,7 @@ fn browserCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value
 
 fn backgroundBrowserCommandAllowed(command: []const u8) bool {
     const commands = [_][]const u8{
-        "status", "open",     "close",      "restart",     "reset",       "navigate",  "back", "forward", "reload",
+        "status", "tabOpen",  "open",       "close",       "restart",     "reset",     "navigate", "back", "forward", "reload",
         "eval",   "postJson", "screenshot", "pointerDown", "pointerMove", "pointerUp",
     };
     for (commands) |allowed| if (std.mem.eql(u8, command, allowed)) return true;
@@ -1455,6 +1465,33 @@ fn browserCommandResponseInScope(allocator: std.mem.Allocator, id_value: std.jso
             }
         }
         return try browserStatusResponse(allocator, id_value, state);
+    }
+
+    if (std.mem.eql(u8, command, "tabOpen")) {
+        const project_index = browserCommandProjectIndex(state, params) orelse
+            return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
+        const pane_id = (if (state.browser_controller.runtime_project_index == project_index) state.browser_controller.runtime_pane_id else null) orelse state.browserPaneIdInWorkspace(project_index) orelse
+            return try errorResponseAlloc(allocator, id_value, "rejected", "open a browser pane with open_browser before adding tabs");
+        const url = stringParam(params, "url") orelse
+            return try errorResponseAlloc(allocator, id_value, "invalid_request", "browser.tabOpen requires url");
+        const normalized = state.normalizeBrowserUrl(url) catch |err|
+            return try errorResponseAlloc(allocator, id_value, "invalid_request", @errorName(err));
+        defer state.allocator.free(normalized);
+        const pane = state.browserPaneRefMutable(project_index, pane_id) orelse
+            return try errorResponseAlloc(allocator, id_value, "not_found", "browser pane not found");
+        const tab_index = try pane.appendBackgroundTab(state.allocator, normalized);
+        state.markDirty();
+        return try okValueResponse(allocator, id_value, .{
+            .accepted = true,
+            .workspace_id = state.project_controller.projects.items[project_index].id,
+            .pane_id = pane_id,
+            .tab_index = tab_index,
+            .active_tab_index = pane.active_tab_index,
+            .tab_count = pane.tabs.items.len,
+            .url = normalized,
+            .activated = false,
+            .loaded = false,
+        });
     }
 
     if (std.mem.eql(u8, command, "open")) {

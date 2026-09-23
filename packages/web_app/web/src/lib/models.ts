@@ -190,6 +190,7 @@ const GROK_EFFORTS: EffortOption[] = [
 /// model persisted in the user's grok config.
 const GROK_MODELS: ModelOption[] = [
   { label: 'Default (grok config)', value: 'default', efforts: GROK_EFFORTS },
+  { label: 'Grok 4.7', value: 'grok-4.7', efforts: GROK_EFFORTS },
   { label: 'Grok 4.6', value: 'grok-4.6', efforts: GROK_EFFORTS },
   { label: 'Grok 4.5', value: 'grok-4.5', efforts: GROK_EFFORTS },
 ]
@@ -235,6 +236,7 @@ const CURSOR_CLAUDE_VARIANTS = ['low', 'medium', 'high', 'xhigh', 'max']
 /// the same model rows marked cursor_fast_supported by the desktop.
 const CURSOR_MODELS: ModelOption[] = [
   { label: 'Auto', value: 'auto' },
+  { label: 'Grok 4.7', value: 'grok-4.7-medium', variants: ['low', 'medium', 'high', 'xhigh'], fast_supported: true },
   { label: 'Composer 2.5', value: 'composer-2.5', fast_supported: true },
   { label: 'Cursor Grok 4.5', value: 'cursor-grok-4.5-high', variants: CURSOR_GROK_VARIANTS, fast_supported: true },
   { label: 'Opus 4.8 Thinking', value: 'claude-opus-4-8-thinking-high', variants: CURSOR_CLAUDE_VARIANTS, fast_supported: true },

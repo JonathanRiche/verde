@@ -3,6 +3,7 @@ import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show }
 import { alignPtyStream, resizeSession, tailSession, writePane } from '../lib/pty'
 import { store } from '../lib/store'
 import { orderRange, pasteBytes, selectionText, wordBounds } from '../lib/term_select'
+import { engineFailureIsPermanent, TextScreen } from '../lib/text_screen'
 
 import type { GhosttySnapshot, GhosttyTerminal } from '../lib/ghostty'
 import type { CellPoint, CellRange } from '../lib/term_select'
@@ -21,6 +22,9 @@ interface GridGeo {
 const LONG_PRESS_MS = 450
 const HANDLE_REACH_PX = 32
 const HANDLE_PX = 20
+/// Engine crashes/transient load failures tolerated before text fallback.
+const WASM_MAX_CRASHES = 6
+let fallback_warned = false
 
 const KEY_NAMES: Record<string, string> = {
   Enter: 'enter',
@@ -51,6 +55,8 @@ export function TerminalView(props: { workspaceId: string; paneId: number; sessi
   const [bar, setBar] = createSignal<{ x: number; y: number } | null>(null)
   const [paste_box, setPasteBox] = createSignal(false)
   const [copied, setCopied] = createSignal(false)
+  // libghostty-vt is unavailable; the pane paints a plain-text grid instead.
+  const [text_mode, setTextMode] = createSignal(false)
   let actions: { copy(): void; paste(): void; selectAll(): void; sendPaste(text: string): void } | null = null
 
   const closeBar = () => {
@@ -119,6 +125,8 @@ export function TerminalView(props: { workspaceId: string; paneId: number; sessi
     let wasm_ok = true
     let wasm_crashes = 0
     let load: typeof import('../lib/ghostty') | null = null
+    // Monochrome VT grid fed by the same session.tail stream once wasm is off.
+    let text_screen: TextScreen | null = null
     let resize_sent = ''
 
     const engine = async () => {
@@ -167,11 +175,47 @@ export function TerminalView(props: { workspaceId: string; paneId: number; sessi
 
     const killWasm = () => {
       wasm_crashes += 1
-      term?.dispose()
+      try {
+        term?.dispose()
+      } catch {
+        // A trapped instance may not dispose cleanly; it is dropped either way.
+      }
       term = null
       tail_offset = null
       viewport_bottom = true
-      if (wasm_crashes >= 6) wasm_ok = false
+      if (wasm_crashes >= WASM_MAX_CRASHES) disableWasm()
+    }
+
+    /// Switch this pane to the text fallback for its lifetime. tail_offset is
+    /// already null, so the next pump replays the ring into the text grid.
+    const disableWasm = (error?: unknown) => {
+      if (!wasm_ok) return
+      wasm_ok = false
+      term = null
+      tail_offset = null
+      viewport_bottom = true
+      setTextMode(true)
+      if (!fallback_warned) {
+        fallback_warned = true
+        console.warn('Verde terminal: libghostty-vt unavailable; using plain-text fallback.', error ?? '')
+      }
+    }
+
+    // A failed engine load counts as a crash; deterministic failures (CSP,
+    // no SIMD128, invalid module) switch to the text fallback at once.
+    const engineLoadFailed = (error: unknown) => {
+      if (engineFailureIsPermanent(error)) {
+        wasm_crashes += 1
+        disableWasm(error)
+      } else {
+        killWasm()
+      }
+    }
+
+    const textScreen = () => {
+      text_screen ??= new TextScreen(cols, rows)
+      text_screen.resize(cols, rows)
+      return text_screen
     }
 
     // DEC 1049/1047 track alternate-screen apps in the raw stream; the WASM
@@ -209,6 +253,20 @@ export function TerminalView(props: { workspaceId: string; paneId: number; sessi
       })
     }
 
+    // Text-fallback twin of captureLines: rows are screen-relative (start 0).
+    const captureText = (screen: TextScreen) => {
+      const range = sel()
+      if (!range) return
+      screen.text().split('\n').forEach((text, y) => {
+        if (y < range.start.row || y > range.end.row) return
+        const line = new Array<string>(screen.cols).fill(' ')
+        ;[...text].slice(0, screen.cols).forEach((glyph, x) => {
+          line[x] = glyph
+        })
+        lines.set(y, line)
+      })
+    }
+
     let copied_timer = 0
     const clearSelection = () => {
       window.clearTimeout(copied_timer)
@@ -223,7 +281,8 @@ export function TerminalView(props: { workspaceId: string; paneId: number; sessi
       const range = orderRange(a, b)
       for (const row of lines.keys()) if (row < range.start.row || row > range.end.row) lines.delete(row)
       setSel(range)
-      captureLines(snapshotSafe())
+      if (text_screen && !wasm_ok) captureText(text_screen)
+      else captureLines(snapshotSafe())
     }
 
     const pointAt = (client_x: number, client_y: number): CellPoint | null => {
@@ -349,9 +408,41 @@ export function TerminalView(props: { workspaceId: string; paneId: number; sessi
       }
     }
 
+    const paintText = (ghostty: typeof import('../lib/ghostty'), screen: TextScreen) => {
+      const metrics = ghostty.paintGhostty(surface, {
+        screen: screen.text(),
+        cols: screen.cols,
+        rows: screen.rows,
+        zoom,
+        cursor: screen.cursor.visible ? { ...screen.cursor } : { visible: false },
+      })
+      if (metrics) cell_h_px = metrics.cell_h
+      if (metrics) {
+        const next: GridGeo = {
+          cw: metrics.cell_w,
+          ch: metrics.cell_h,
+          start: 0,
+          cols: screen.cols,
+          rows: screen.rows,
+          ox: surface.offsetLeft,
+          oy: surface.offsetTop,
+        }
+        const prev = geo()
+        if (prev && prev.cols !== next.cols && sel()) clearSelection()
+        if (!prev || (Object.keys(next) as (keyof GridGeo)[]).some((key) => prev[key] !== next[key])) setGeo(next)
+        captureText(screen)
+      }
+      if (pinned_bottom) scroller.scrollTop = scroller.scrollHeight
+    }
+
     const paint = async (snap?: GhosttySnapshot | null) => {
       const ghostty = await engine()
       if (disposed) return
+      if (!wasm_ok) {
+        if (text_screen) paintText(ghostty, text_screen)
+        else ghostty.paintGhostty(surface, { screen: '', cols, rows, zoom })
+        return
+      }
       const raw_view = snap ?? snapshotSafe()
       // Snapshot cursor coordinates are screen-relative; hide the cursor while
       // scrolled into history so it does not overlay old rows.
@@ -399,6 +490,7 @@ export function TerminalView(props: { workspaceId: string; paneId: number; sessi
       cols = grid.cols
       rows = grid.rows
       term?.resize(cols, rows)
+      text_screen?.resize(cols, rows)
       resize_sent = `${id}:${cols}x${rows}`
       await resizeSession(store.client, id, cols, rows)
     }
@@ -412,8 +504,22 @@ export function TerminalView(props: { workspaceId: string; paneId: number; sessi
         }
         if (scroller.clientWidth < 8 || scroller.clientHeight < 8) return
         await syncSize(session_id)
-        const vt = wasm_ok ? await ensure() : null
+        let vt: GhosttyTerminal | null = null
+        if (wasm_ok) {
+          try {
+            vt = await ensure()
+          } catch (error) {
+            engineLoadFailed(error)
+            // Transient failure: leave tail_offset unset so the retry replays
+            // the ring into the engine instead of skipping this output.
+            if (wasm_ok) {
+              await paint(null)
+              return
+            }
+          }
+        }
         if (disposed) return
+        const text = wasm_ok ? null : textScreen()
 
         const tailed = await tailSession(store.client, session_id, tail_offset)
         if (disposed) return
@@ -422,12 +528,20 @@ export function TerminalView(props: { workspaceId: string; paneId: number; sessi
         if (tail_offset == null) {
           const tail = alignPtyStream(raw)
           if (vt && tail) writeSafe(vt, tail)
+          if (text) {
+            text.reset()
+            text.write(tail)
+          }
           trackAltScreen(tail)
         } else if (raw) {
           if (vt) writeSafe(vt, raw)
+          text?.write(raw)
           trackAltScreen(raw)
         }
-        if (typeof tailed?.next_offset === 'number') tail_offset = tailed.next_offset
+        // Wasm disabled mid-pump: keep tail_offset null so the next pump
+        // replays the ring into the new text grid.
+        const disabled_now = !wasm_ok && !text
+        if (typeof tailed?.next_offset === 'number' && !disabled_now) tail_offset = tailed.next_offset
 
         if (pinned_bottom && term && wasm_ok) {
           try {
@@ -955,6 +1069,14 @@ export function TerminalView(props: { workspaceId: string; paneId: number; sessi
           </Show>
         </div>
       </div>
+      <Show when={text_mode()}>
+        <span
+          class="absolute right-2 top-1.5 z-10 rounded-[6px] border border-[var(--border-muted)] bg-[var(--panel)] px-1.5 py-0.5 text-[11px] text-[var(--text-subtle)] opacity-80"
+          title="The terminal engine could not load; showing plain text without colours or scrollback."
+        >
+          Text mode
+        </span>
+      </Show>
       <Show when={bar()}>
         {(at) => (
           <div

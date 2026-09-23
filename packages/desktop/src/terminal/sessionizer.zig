@@ -34,6 +34,7 @@ const workspace_identity = @import("../platform/workspace_identity.zig");
 const stack = @import("../workspace/stack.zig");
 const platform_runtime = @import("platform_runtime");
 const process_env = @import("../platform/env.zig");
+const provider_cli_version = @import("../providers/cli_version.zig");
 const provider_hooks = @import("../providers/hooks.zig");
 const provider_mcp = @import("../providers/mcp.zig");
 const provider_models = @import("../state/provider_models.zig");
@@ -92,6 +93,13 @@ pub const DEFAULT_ROWS = session_protocol.DEFAULT_ROWS;
 const MAX_OUTPUT_RING: usize = 1024 * 1024;
 const DAEMON_POLL_READ_BUDGET: usize = 64 * 1024;
 const SESSIONIZER_MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+/// Raw transcript bytes one paged response may carry before the daemon
+/// closes the page early. Chat pages are sized by row count, but a single
+/// tool card can hold megabytes (whole-file edits), so a 48-row tail can
+/// exceed the transport limit and every history load fails with
+/// response_too_large. Quarter of the transport cap leaves room for JSON
+/// escaping; a page always carries at least one row.
+const TRANSCRIPT_PAGE_BYTE_BUDGET: usize = SESSIONIZER_MAX_MESSAGE_BYTES / 4;
 /// Maximum response capacity accepted by the sessionizer protocol.
 pub const MAX_RESPONSE_BYTES: usize = SESSIONIZER_MAX_MESSAGE_BYTES;
 const SESSIONIZER_REQUEST_TIMEOUT_MS: u32 = 5000;
@@ -2129,16 +2137,7 @@ fn nativeProviderLabel(provider: provider_models.Provider) []const u8 {
 }
 
 fn nativeProviderLoginCommand(provider: provider_models.Provider) []const []const u8 {
-    return switch (provider) {
-        .codex => &.{ "codex", "login" },
-        .claude => &.{"claude"},
-        .cursor => &.{ "agent", "login" },
-        .opencode => &.{ "opencode2", "auth", "login" },
-        .pi => &.{"pi"},
-        .fx => &.{ "fx", "login" },
-        .grok => &.{ "grok", "login" },
-        .muse => &.{ "muse", "login" },
-    };
+    return headless.provider_install.loginArgv(protocolProvider(provider));
 }
 
 fn nativeProviderInstalled(provider: provider_models.Provider) bool {
@@ -2146,7 +2145,7 @@ fn nativeProviderInstalled(provider: provider_models.Provider) bool {
         .codex => process_env.commandExists("codex"),
         .claude => process_env.commandExists("node") and process_env.commandExists("claude"),
         .cursor => process_env.commandExists("agent") or process_env.commandExists("cursor-agent"),
-        .opencode => process_env.commandExists("opencode2"),
+        .opencode => process_env.commandExists("opencode"),
         .pi => process_env.commandExists("pi"),
         .fx => process_env.commandExists("fx"),
         .grok => process_env.commandExists("grok"),
@@ -2167,7 +2166,34 @@ fn nativeProviderFromHarness(provider: harness.Provider) provider_models.Provide
     };
 }
 
+fn protocolProvider(provider: provider_models.Provider) headless.provider_types.Provider {
+    return switch (provider) {
+        .codex => .codex,
+        .claude => .claude,
+        .cursor => .cursor,
+        .opencode => .opencode,
+        .pi => .pi,
+        .fx => .fx,
+        .grok => .grok,
+        .muse => .muse,
+    };
+}
+
+fn nativeProviderVersionExecutable(provider: provider_models.Provider) ?[]const u8 {
+    return switch (provider) {
+        .codex => if (process_env.commandExists("codex")) "codex" else null,
+        .claude => if (process_env.commandExists("claude")) "claude" else null,
+        .cursor => if (process_env.commandExists("cursor-agent")) "cursor-agent" else if (process_env.commandExists("agent")) "agent" else null,
+        .opencode => if (process_env.commandExists("opencode")) "opencode" else null,
+        .pi => if (process_env.commandExists("pi")) "pi" else null,
+        .fx => if (process_env.commandExists("fx")) "fx" else null,
+        .grok => if (process_env.commandExists("grok")) "grok" else null,
+        .muse => if (process_env.commandExists("muse")) "muse" else null,
+    };
+}
+
 fn providerRemediation(
+    provider: provider_models.Provider,
     installed: bool,
     login_command: []const []const u8,
 ) headless.providers_protocol.Remediation {
@@ -2175,6 +2201,7 @@ fn providerRemediation(
         .{
             .kind = "install",
             .label = "Install this provider CLI on the runtime",
+            .command = headless.provider_install.installArgv(protocolProvider(provider)),
         }
     else
         .{
@@ -2184,8 +2211,16 @@ fn providerRemediation(
         };
 }
 
-fn nativeProviderStatus(provider: provider_models.Provider) headless.providers_protocol.ProviderStatus {
+fn nativeProviderStatus(
+    allocator: std.mem.Allocator,
+    provider: provider_models.Provider,
+    version_buf: []u8,
+) headless.providers_protocol.ProviderStatus {
     const installed = nativeProviderInstalled(provider);
+    const version = if (installed) blk: {
+        const executable = nativeProviderVersionExecutable(provider) orelse break :blk null;
+        break :blk provider_cli_version.probe(allocator, executable, version_buf);
+    } else null;
     return .{
         .provider = @tagName(provider),
         .label = nativeProviderLabel(provider),
@@ -2199,12 +2234,14 @@ fn nativeProviderStatus(provider: provider_models.Provider) headless.providers_p
         // adapter has a cancellable deadline, the daemon must not occupy a
         // transport worker with a potentially unbounded login handshake.
         .authentication = "unknown",
-        .remediation = providerRemediation(installed, nativeProviderLoginCommand(provider)),
+        .version = version,
+        .remediation = providerRemediation(provider, installed, nativeProviderLoginCommand(provider)),
     };
 }
 
-fn ampProviderStatus() headless.providers_protocol.ProviderStatus {
+fn ampProviderStatus(allocator: std.mem.Allocator, version_buf: []u8) headless.providers_protocol.ProviderStatus {
     const installed = process_env.commandExists("amp");
+    const version = if (installed) provider_cli_version.probe(allocator, "amp", version_buf) else null;
     return .{
         .provider = "amp",
         .label = "Amp",
@@ -2212,6 +2249,7 @@ fn ampProviderStatus() headless.providers_protocol.ProviderStatus {
         .installed = installed,
         .state = if (installed) "unknown" else "missing",
         .authentication = "unknown",
+        .version = version,
         .remediation = if (installed)
             .{
                 .kind = "login",
@@ -7861,6 +7899,11 @@ pub const Daemon = struct {
         const request = parsed.value;
         const provider: harness.Provider = request.provider;
         const installed = nativeProviderInstalled(nativeProviderFromHarness(provider));
+        var version_buf: [48]u8 = undefined;
+        const version = if (installed) blk: {
+            const executable = nativeProviderVersionExecutable(nativeProviderFromHarness(provider)) orelse break :blk null;
+            break :blk provider_cli_version.probe(self.allocator, executable, &version_buf);
+        } else null;
         var auth_state: harness.AuthState = .unknown;
         if (installed) {
             if (send_runner.connectProvider(self.allocator, provider, request.project_path, false)) |client_value| {
@@ -7874,6 +7917,7 @@ pub const Daemon = struct {
             .installed = installed,
             .auth_state = auth_state,
             .ready = installed and auth_state == .signed_in,
+            .version = version,
         });
     }
 
@@ -8001,7 +8045,15 @@ pub const Daemon = struct {
             .local_thread_id = request.local_thread_id,
         });
         defer freeThreadGetResult(self.allocator, result);
-        return try okValueResponse(self.allocator, id_value, result);
+        // The synced transcript can exceed the transport limit as a whole
+        // (large tool cards), which would fail the RPC after the commit
+        // already landed. Ship a bounded tail with its durable offset; the
+        // client pages older rows through chat.message.list like any other
+        // projection.
+        var bounded = result;
+        bounded.thread.messages = boundedTranscriptTail(result.thread.messages, TRANSCRIPT_PAGE_BYTE_BUDGET);
+        bounded.thread.message_offset = if (bounded.thread.messages.len == 0) 0 else bounded.thread.messages[0].sort_index;
+        return try okValueResponse(self.allocator, id_value, bounded);
     }
 
     // Legacy provider-native cancellation used while an older desktop turn is
@@ -8261,25 +8313,26 @@ pub const Daemon = struct {
         });
     }
 
-    /// Runtime-scoped provider inventory. This endpoint performs bounded
-    /// executable checks only; authentication remains unknown until provider
-    /// adapters expose cancellable, deadline-enforced probes. Login/setup runs
-    /// explicitly in a runtime PTY under the daemon user's HOME.
+    /// Runtime-scoped provider inventory. Installation is a PATH check plus a
+    /// deadline-bounded `--version` probe. Authentication stays unknown until
+    /// each adapter has a cancellable probe. Login and install run in a
+    /// terminal under the daemon user's HOME.
     fn providerStatusResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
         if (params != .null and params != .object) {
             return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object or null");
         }
         const ProviderStatus = headless.providers_protocol.ProviderStatus;
+        var version_storage: [9][48]u8 = undefined;
         const statuses = [_]ProviderStatus{
-            nativeProviderStatus(.codex),
-            nativeProviderStatus(.claude),
-            nativeProviderStatus(.cursor),
-            nativeProviderStatus(.opencode),
-            ampProviderStatus(),
-            nativeProviderStatus(.pi),
-            nativeProviderStatus(.fx),
-            nativeProviderStatus(.grok),
-            nativeProviderStatus(.muse),
+            nativeProviderStatus(self.allocator, .codex, &version_storage[0]),
+            nativeProviderStatus(self.allocator, .claude, &version_storage[1]),
+            nativeProviderStatus(self.allocator, .cursor, &version_storage[2]),
+            nativeProviderStatus(self.allocator, .opencode, &version_storage[3]),
+            ampProviderStatus(self.allocator, &version_storage[4]),
+            nativeProviderStatus(self.allocator, .pi, &version_storage[5]),
+            nativeProviderStatus(self.allocator, .fx, &version_storage[6]),
+            nativeProviderStatus(self.allocator, .grok, &version_storage[7]),
+            nativeProviderStatus(self.allocator, .muse, &version_storage[8]),
         };
         const result: headless.providers_protocol.StatusResult = .{
             .runtime_id = self.runtime_id,
@@ -10716,7 +10769,9 @@ fn loadThreadListResult(
         \\  and (?4 < 0 or t.open = ?4)
         \\  and (?5 = '' or instr(lower(t.title), lower(?5)) > 0)
         \\order by
-        \\  case when ?6 = 1 then -coalesce(t.last_activity_at, 0) else w.sort_index end asc,
+        \\  case when ?6 = 1 then -(case when t.last_activity_at >= 1000000000000
+        \\    then t.last_activity_at / 1000 else coalesce(t.last_activity_at, 0) end)
+        \\    else w.sort_index end asc,
         \\  t.sort_index asc, t.local_thread_id asc
         \\limit ?2 offset ?3
     ,
@@ -10831,6 +10886,41 @@ fn loadMessageListResult(
     const is_backward = std.mem.eql(u8, request.direction, "backward");
     const is_forward = std.mem.eql(u8, request.direction, "forward");
     if (!is_backward and !is_forward) return error.InvalidParams;
+    return loadMessageListResultBudgeted(allocator, store, request, TRANSCRIPT_PAGE_BYTE_BUDGET);
+}
+
+/// Estimated wire size of one transcript row: text fields doubled for JSON
+/// escaping plus fixed field overhead. Deliberately generous; the budget only
+/// has to keep a page under the transport limit, not fill it.
+fn transcriptMessageWireBytes(message: store_protocol.Message) usize {
+    var total: usize = 256;
+    total += 2 * (message.body.len + message.author.len + message.role.len + message.message_id.len);
+    if (message.tool_call_id) |value| total += 2 * value.len;
+    for (message.images) |image| total += 128 + 2 * (image.path.len + image.mime.len);
+    return total;
+}
+
+/// Newest suffix of `messages` whose estimated wire size fits `budget`. The
+/// last row is always retained so a single oversized card still ships.
+fn boundedTranscriptTail(messages: []const store_protocol.Message, budget: usize) []const store_protocol.Message {
+    var start = messages.len;
+    var used: usize = 0;
+    while (start > 0) {
+        const cost = transcriptMessageWireBytes(messages[start - 1]);
+        if (start < messages.len and used + cost > budget) break;
+        used += cost;
+        start -= 1;
+    }
+    return messages[start..];
+}
+
+fn loadMessageListResultBudgeted(
+    allocator: std.mem.Allocator,
+    store: *daemon_store.Store,
+    request: store_protocol.MessageListRequest,
+    byte_budget: usize,
+) daemon_store.StoreError!store_protocol.MessageListResult {
+    const is_backward = std.mem.eql(u8, request.direction, "backward");
     const limit = try boundedPageLimit(request.limit);
     const cursor_index = try decodeMessageIndex(request.cursor, if (is_backward) 'b' else 'f');
     const boundary: i64 = if (request.cursor) |_|
@@ -10878,15 +10968,28 @@ fn loadMessageListResult(
             \\limit ?3
         , .{ thread_row_id, boundary, fetch_limit })) catch return error.StoreUnavailable;
     defer rows.deinit();
+    var budget_used: usize = 0;
+    var budget_truncated = false;
     while (rows.next()) |row| {
         const message = try decodeOwnedMessage(allocator, row);
         errdefer freeOwnedMessage(allocator, message);
+        const cost = transcriptMessageWireBytes(message);
+        if (messages.items.len > 0 and budget_used + cost > byte_budget) {
+            // Rows are fetched newest-first (backward) or oldest-first
+            // (forward), so stopping here keeps the page contiguous; the
+            // remainder is reachable through next_cursor / before_offset.
+            freeOwnedMessage(allocator, message);
+            budget_truncated = true;
+            break;
+        }
+        budget_used += cost;
         messages.append(allocator, message) catch return error.OutOfMemory;
     }
     if (rows.err) |_| return error.StoreUnavailable;
 
-    const has_more = messages.items.len > @as(usize, limit);
-    if (has_more) {
+    const over_limit = messages.items.len > @as(usize, limit);
+    const has_more = over_limit or budget_truncated;
+    if (over_limit) {
         const extra_index = messages.items.len - 1;
         freeOwnedMessage(allocator, messages.items[extra_index]);
         messages.items.len = extra_index;
@@ -12742,8 +12845,7 @@ fn chatTurnKeepsDaemonAlive(
     // alive. Only in-flight work and durability_pending do. `consumed` is a
     // retention hint for GC, not a keep-alive / prepareShutdown gate.
     _ = consumed;
-    _ = worker_done;
-    if (durability_pending) return true;
+    if (!worker_done or durability_pending) return true;
     return status == .running or status == .waiting_approval;
 }
 
@@ -14412,7 +14514,7 @@ fn maybeGenerateAutomaticChatTurnTitle(daemon: *Daemon, turn: *ChatTurn) void {
     if (turn.use_stub) return;
 
     lockTurn(turn);
-    const completed = turn.status == .completed and turn.result_reply_text != null;
+    const completed = turn.status == .completed and turn.result_reply_text != null and turn.committed_store_revision == null;
     const reply_text = turn.result_reply_text orelse "";
     turn.mutex.unlock();
     if (!completed) return;
@@ -14634,7 +14736,15 @@ fn chatTurnThread(daemon: *Daemon, turn: *ChatTurn) void {
             .on_approval_request = chatSinkApproval,
         });
         lockTurn(turn);
-        if (!(turn.cancel_requested or turn.status == .aborted)) {
+        if (turn.committed_store_revision != null) {
+            // A visible answer was committed before provider housekeeping.
+            // Its outcome is immutable, including when draining fails.
+            if (result) |value| {
+                allocator.free(value.provider_thread_id);
+                allocator.free(value.reply_text);
+            } else |_| {}
+            logChatTurnPhase(turn, "provider_drained");
+        } else if (!(turn.cancel_requested or turn.status == .aborted)) {
             if (result) |value| {
                 const already_published = turn.status == .completed;
                 turn.status = .completed;
@@ -14673,8 +14783,20 @@ fn chatTurnThread(daemon: *Daemon, turn: *ChatTurn) void {
 /// both the turn lock and lockDaemon (store service seam only). Bounded retry
 /// with backoff sleeps taken while holding NO locks (MAJOR-3).
 fn finalizeChatTurnWorker(daemon: *Daemon, turn: *ChatTurn) void {
+    publishChatTurnDurable(daemon, turn, true);
+}
+
+// Answer-ready commits use the same retry policy without releasing the live
+// worker. Consume may hide the turn, but GC must retain it until draining ends.
+fn publishChatTurnDurable(daemon: *Daemon, turn: *ChatTurn, worker_done: bool) void {
     const should_commit = daemonStoreIsOpen(daemon);
     lockTurn(turn);
+    if (worker_done) turn.worker_done = true;
+    if (turn.committed_store_revision != null) {
+        turn.mutex.unlock();
+        daemon.signalTurnEventWaiters();
+        return;
+    }
     turn.finished_at_ms = turn.finished_at_ms orelse nowMs();
     if (should_commit) {
         turn.durability_pending = true;
@@ -14686,7 +14808,6 @@ fn finalizeChatTurnWorker(daemon: *Daemon, turn: *ChatTurn) void {
         if (turn.durability_error) |old| daemon.allocator.free(old);
         turn.durability_error = daemon.allocator.dupe(u8, "store_closed") catch null;
     }
-    turn.worker_done = true;
     turn.mutex.unlock();
     // No-writer path publishes the terminal status via the pending flip;
     // commit path re-arms pending. Either way tail content changed.
@@ -14982,6 +15103,7 @@ fn chatSinkDelta(context: ?*anyopaque, delta: []const u8) void {
     const allocator = turn.allocator;
     lockTurn(turn);
     defer turn.mutex.unlock();
+    if (turn.committed_store_revision != null) return;
     turn.delta_count +|= 1;
     turn.delta_bytes +|= delta.len;
     if (turn.first_delta_at_ms == 0) {
@@ -14999,15 +15121,22 @@ fn chatSinkDelta(context: ?*anyopaque, delta: []const u8) void {
 fn chatSinkAnswerReady(context: ?*anyopaque, reply_text: []const u8) void {
     const turn = chatTurnFromContext(context) orelse return;
     const allocator = turn.allocator;
-    lockTurn(turn);
-    defer turn.mutex.unlock();
-    if (turn.cancel_requested or turn.status == .aborted or turn.status == .failed) return;
-    if (turn.status == .completed) return;
-    turn.status = .completed;
-    if (turn.result_reply_text) |old| allocator.free(old);
-    turn.result_reply_text = allocator.dupe(u8, reply_text) catch null;
-    turn.appendEvent(allocator, "completed", "{}");
-    logChatTurnPhase(turn, "answer_ready");
+    {
+        lockTurn(turn);
+        defer turn.mutex.unlock();
+        if (turn.cancel_requested or turn.status == .aborted or turn.status == .failed) return;
+        if (turn.status == .completed) return;
+        const answer = allocator.dupe(u8, reply_text) catch return;
+        turn.status = .completed;
+        if (turn.result_reply_text) |old| allocator.free(old);
+        turn.result_reply_text = answer;
+        turn.appendEvent(allocator, "completed", "{}");
+        logChatTurnPhase(turn, "answer_ready");
+    }
+    if (turn.daemon) |daemon| {
+        maybeGenerateAutomaticChatTurnTitle(daemon, turn);
+        publishChatTurnDurable(daemon, turn, false);
+    }
 }
 
 /// Attribute actual Verde MCP tool results to the executing parent turn. This
@@ -15071,6 +15200,7 @@ fn chatSinkEvent(context: ?*anyopaque, event: harness.StreamEvent) void {
     const allocator = turn.allocator;
     lockTurn(turn);
     defer turn.mutex.unlock();
+    if (turn.committed_store_revision != null) return;
     switch (event) {
         .message => |message| {
             var writer: std.Io.Writer.Allocating = .init(allocator);
@@ -15160,6 +15290,7 @@ fn chatSinkFailure(context: ?*anyopaque, message: []const u8) void {
     const allocator = turn.allocator;
     lockTurn(turn);
     defer turn.mutex.unlock();
+    if (turn.committed_store_revision != null) return;
     if (turn.error_message) |old| allocator.free(old);
     turn.error_message = allocator.dupe(u8, message) catch null;
 }
@@ -17271,6 +17402,8 @@ test "daemon keep-alive is durability_pending and live work only (M4-P4)" {
     try std.testing.expect(!chatTurnKeepsDaemonAlive(.failed, false, true, false));
     try std.testing.expect(!chatTurnKeepsDaemonAlive(.aborted, false, true, false));
     try std.testing.expect(!chatTurnKeepsDaemonAlive(.completed, true, true, false));
+    // A committed answer may still have a live provider draining housekeeping.
+    try std.testing.expect(chatTurnKeepsDaemonAlive(.completed, true, false, false));
     // Durable commit in flight still keeps the daemon alive (even if consumed).
     try std.testing.expect(chatTurnKeepsDaemonAlive(.completed, true, true, true));
     try std.testing.expect(chatTurnKeepsDaemonAlive(.completed, false, true, true));
@@ -20502,6 +20635,151 @@ test "thread sync commit persists across reload and rejects stale provider reads
     try std.testing.expect(std.mem.startsWith(u8, loaded.thread.messages[0].message_id, "turn:sync:"));
 }
 
+test "bounded transcript tail keeps the newest rows and never drops the last" {
+    const rows = [_]store_protocol.Message{
+        .{ .sort_index = 0, .role = "user", .author = "You", .body = "a" ** 400 },
+        .{ .sort_index = 1, .role = "assistant", .author = "Bot", .body = "b" ** 400 },
+        .{ .sort_index = 2, .role = "assistant", .author = "Bot", .body = "c" ** 400 },
+    };
+    const two_rows = transcriptMessageWireBytes(rows[1]) + transcriptMessageWireBytes(rows[2]);
+    const tail = boundedTranscriptTail(&rows, two_rows);
+    try std.testing.expectEqual(@as(usize, 2), tail.len);
+    try std.testing.expectEqual(@as(usize, 1), tail[0].sort_index);
+    // A single oversized row still ships rather than producing an empty tail.
+    const oversized = boundedTranscriptTail(&rows, 16);
+    try std.testing.expectEqual(@as(usize, 1), oversized.len);
+    try std.testing.expectEqual(@as(usize, 2), oversized[0].sort_index);
+    try std.testing.expectEqual(@as(usize, 3), boundedTranscriptTail(&rows, std.math.maxInt(usize)).len);
+    try std.testing.expectEqual(@as(usize, 0), boundedTranscriptTail(&.{}, 16).len);
+}
+
+test "message list pages close early at the transcript byte budget" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testStoreDbPath(&tmp);
+    defer allocator.free(path);
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, path);
+    defer detachTestStoreService(&daemon);
+    const service = daemon.store_service.?;
+    _ = try service.store.replaceSnapshot(.{
+        .mutation = .{ .request_key = "budget-fixture", .client_id = "fixture" },
+        .bootstrap = true,
+        .snapshot = .{ .workspaces = &.{.{
+            .workspace_id = "workspace",
+            .label = "Workspace",
+            .path = "/fixture",
+            .threads = &.{.{
+                .local_thread_id = "thread",
+                .title = "Budget",
+                .messages = &.{
+                    .{ .message_id = "m0", .role = "user", .author = "You", .body = "0" ** 400 },
+                    .{ .message_id = "m1", .role = "assistant", .author = "Bot", .body = "1" ** 400 },
+                    .{ .message_id = "m2", .role = "assistant", .author = "Bot", .body = "2" ** 400 },
+                    .{ .message_id = "m3", .role = "assistant", .author = "Bot", .body = "3" ** 400 },
+                },
+            }},
+        }} },
+    });
+    // Budget for exactly two of the (larger) assistant rows.
+    const one_row = transcriptMessageWireBytes(.{ .message_id = "m3", .role = "assistant", .author = "Bot", .body = "3" ** 400 });
+    const request: store_protocol.MessageListRequest = .{
+        .workspace_id = "workspace",
+        .local_thread_id = "thread",
+        .direction = "backward",
+        .limit = 48,
+    };
+    // The 48-row tail request is cut to whatever fits, newest first, and
+    // still reports more history behind it.
+    const tail = try loadMessageListResultBudgeted(allocator, &service.store, request, one_row * 2);
+    defer freeMessageListResult(allocator, tail);
+    try std.testing.expectEqual(@as(usize, 2), tail.messages.len);
+    try std.testing.expectEqual(@as(usize, 2), tail.messages[0].sort_index);
+    try std.testing.expectEqual(@as(usize, 3), tail.messages[1].sort_index);
+    try std.testing.expect(tail.next_cursor != null);
+    // The GUI's durable-offset paging continues from the cut without gaps.
+    var older_request = request;
+    older_request.before_offset = tail.messages[0].sort_index;
+    const older = try loadMessageListResultBudgeted(allocator, &service.store, older_request, one_row * 2);
+    defer freeMessageListResult(allocator, older);
+    try std.testing.expectEqual(@as(usize, 2), older.messages.len);
+    try std.testing.expectEqual(@as(usize, 0), older.messages[0].sort_index);
+    try std.testing.expectEqual(@as(usize, 1), older.messages[1].sort_index);
+    try std.testing.expect(older.next_cursor == null);
+    // A row larger than the whole budget is still delivered on its own page.
+    const single = try loadMessageListResultBudgeted(allocator, &service.store, request, 16);
+    defer freeMessageListResult(allocator, single);
+    try std.testing.expectEqual(@as(usize, 1), single.messages.len);
+    try std.testing.expectEqual(@as(usize, 3), single.messages[0].sort_index);
+    try std.testing.expect(single.next_cursor != null);
+    // Within budget the row limit governs as before.
+    const all = try loadMessageListResultBudgeted(allocator, &service.store, request, std.math.maxInt(usize));
+    defer freeMessageListResult(allocator, all);
+    try std.testing.expectEqual(@as(usize, 4), all.messages.len);
+    try std.testing.expect(all.next_cursor == null);
+}
+
+test "thread sync response ships a bounded tail with its durable offset" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testStoreDbPath(&tmp);
+    defer allocator.free(path);
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, path);
+    defer detachTestStoreService(&daemon);
+    const service = daemon.store_service.?;
+    _ = try service.store.replaceSnapshot(.{
+        .mutation = .{ .request_key = "sync-tail-fixture", .client_id = "fixture" },
+        .bootstrap = true,
+        .snapshot = .{ .workspaces = &.{.{
+            .workspace_id = "workspace",
+            .label = "Workspace",
+            .path = "/fixture",
+            .threads = &.{.{
+                .local_thread_id = "thread",
+                .title = "Sync tail",
+                .provider_thread_id = "provider-thread",
+                .messages = &.{.{ .message_id = "snap-msg-1", .role = "assistant", .author = "Codex", .body = "old" }},
+            }},
+        }} },
+    });
+    const request: headless.providers_protocol.ThreadSyncRequest = .{
+        .workspace_id = "workspace",
+        .local_thread_id = "thread",
+        .provider_thread_id = "provider-thread",
+    };
+    const before = try loadThreadGetResult(allocator, &service.store, .{ .workspace_id = "workspace", .local_thread_id = "thread" });
+    defer freeThreadGetResult(allocator, before);
+    // Each card alone exceeds the page budget, so only the newest one can
+    // travel in the sync response; the rest stay reachable by offset.
+    const big = try allocator.alloc(u8, TRANSCRIPT_PAGE_BYTE_BUDGET / 2 + 1);
+    defer allocator.free(big);
+    @memset(big, 'x');
+    const replacement = [_]store_protocol.Message{
+        .{ .role = "assistant", .author = "Cursor", .body = big },
+        .{ .role = "assistant", .author = "Cursor", .body = big },
+        .{ .role = "assistant", .author = "Cursor", .body = "done" },
+    };
+    const response = try daemon.commitProviderThreadSync(.{ .integer = 1 }, service, request, before, &replacement);
+    defer allocator.free(response);
+    try std.testing.expect(response.len < SESSIONIZER_MAX_MESSAGE_BYTES);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const thread = parsed.value.object.get("result").?.object.get("thread").?.object;
+    const messages = thread.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expectEqual(@as(i64, 2), thread.get("message_offset").?.integer);
+    try std.testing.expectEqualStrings("done", jsonString(messages[0].object.get("body").?).?);
+    // The store itself keeps the full synced transcript.
+    const loaded = try loadThreadGetResult(allocator, &service.store, .{ .workspace_id = "workspace", .local_thread_id = "thread" });
+    defer freeThreadGetResult(allocator, loaded);
+    try std.testing.expectEqual(@as(usize, 3), loaded.thread.messages.len);
+}
+
 test "archive mutation preserves metadata and large transcripts with normal mutation guards" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -20574,4 +20852,64 @@ test "archive mutation preserves metadata and large transcripts with normal muta
     );
     defer allocator.free(unknown);
     try std.testing.expect(std.mem.indexOf(u8, unknown, "unknown client_id") != null);
+}
+
+test "answer-ready is durable and consumable while the provider worker still drains" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+    {
+        const store = &daemon.store_service.?.store;
+        _ = try store.upsertWorkspace(.{
+            .mutation = .{ .request_key = "answer-ws", .client_id = "test" },
+            .workspace = .{ .workspace_id = "answer-ws", .label = "Answer", .path = "/tmp/answer" },
+        });
+        _ = try store.upsertThread(.{
+            .mutation = .{ .request_key = "answer-thread", .client_id = "test" },
+            .workspace_id = "answer-ws",
+            .thread = .{ .local_thread_id = "local-thread", .title = "Answer", .provider = "muse", .harness = "local_cli" },
+        });
+    }
+    const turn = try appendTestChatTurn(&daemon, allocator, "answer-turn", "answer-ws", "/tmp/answer", "Answer", "hello", .running, 10);
+    turn.daemon = &daemon;
+    turn.use_stub = true; // No config reads or live title provider.
+    turn.request.provider = .muse;
+    turn.durability_pending = true;
+    chatSinkDelta(turn, "Finished answer");
+    chatSinkAnswerReady(turn, "Finished answer");
+    try std.testing.expectEqual(ChatTurnStatus.completed, chatTurnPublishedStatus(turn));
+    try std.testing.expect(!turn.worker_done);
+    try std.testing.expect(!turn.durability_pending);
+    const revision = turn.committed_store_revision.?;
+    const seq = turn.next_seq;
+    {
+        var row = (try daemon.store_service.?.store.conn.row("select status from chat_turns where turn_id = 'answer-turn'", .{})).?;
+        defer row.deinit();
+        try std.testing.expectEqualStrings("completed", row.text(0));
+    }
+    const consumed = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"chat.turn.consume","params":{"turn_id":"answer-turn"}}
+    );
+    defer allocator.free(consumed);
+    try std.testing.expect(std.mem.indexOf(u8, consumed, "\"accepted\":true") != null);
+    try std.testing.expect(turn.consumed);
+    try std.testing.expectEqual(@as(usize, 1), daemon.chat_turns.items.len);
+    // Late housekeeping cannot change the already durable transcript/outcome.
+    chatSinkFailure(turn, "housekeeping failed");
+    chatSinkDelta(turn, "late output");
+    chatSinkEvent(turn, .{ .message = .{ .title = "Housekeeping", .body = "late event" } });
+    chatSinkAnswerReady(turn, "duplicate answer");
+    try std.testing.expect(turn.error_message == null);
+    try std.testing.expectEqual(seq, turn.next_seq);
+    finalizeChatTurnWorker(&daemon, turn);
+    try std.testing.expect(turn.worker_done);
+    try std.testing.expect(!turn.durability_pending);
+    try std.testing.expectEqual(revision, turn.committed_store_revision.?);
+    try std.testing.expectEqualStrings("Finished answer", turn.result_reply_text.?);
 }

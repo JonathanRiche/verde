@@ -51,7 +51,7 @@ fn herdrAgentCommandForProvider(allocator: std.mem.Allocator, provider: HerdrPan
         .codex => "codex",
         .claude => "claude",
         .opencode => terminal_controller.OPENCODE_TUI_COMMAND,
-        .cursor => "agent",
+        .cursor => "cursor-agent",
         .terminal, .browser, .unknown => null,
     };
     return if (command) |value| try allocator.dupe(u8, value) else null;

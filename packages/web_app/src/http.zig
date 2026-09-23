@@ -25,7 +25,7 @@ const WEB_CHAT_IMAGE_DIR = "web-chat-images";
 const MAX_CHAT_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 /// Workspace files opened from chat citations are read into memory.
 const MAX_SERVED_FILE_BYTES: usize = 32 * 1024 * 1024;
-const CSP = "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; worker-src 'self' blob:; frame-src 'self' blob:";
+const CSP = "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; worker-src 'self' blob:; frame-src 'self' blob:";
 /// PDF bytes are not HTML. `default-src 'none'` here blanks Safari's viewer.
 const FILE_FRAME_CSP = "frame-ancestors 'self'";
 
@@ -3380,6 +3380,11 @@ test "security headers omit CORS and constrain active content" {
             try std.testing.expect(std.mem.indexOf(u8, header.value, "frame-ancestors 'none'") != null);
             try std.testing.expect(std.mem.indexOf(u8, header.value, "frame-src 'self' blob:") != null);
             try std.testing.expect(std.mem.indexOf(u8, header.value, "worker-src 'self' blob:") != null);
+            // The web terminal engine is libghostty-vt WebAssembly; without
+            // this source compiling it throws and every terminal pane stays
+            // blank. It permits wasm compilation only, never JS eval.
+            try std.testing.expect(std.mem.indexOf(u8, header.value, "script-src 'self' 'wasm-unsafe-eval';") != null);
+            try std.testing.expect(std.mem.indexOf(u8, header.value, "'unsafe-eval'") == null);
         }
         if (std.ascii.eqlIgnoreCase(header.name, "x-content-type-options")) saw_nosniff = true;
         if (std.ascii.eqlIgnoreCase(header.name, "referrer-policy")) saw_referrer = true;

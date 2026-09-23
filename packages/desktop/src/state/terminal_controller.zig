@@ -100,9 +100,9 @@ pub const AgentTuiProvider = enum {
     muse,
 };
 
-/// OpenCode 2 ships the TUI and the shared service in one binary. Verde
-/// launches the v2 TUI directly; the lifecycle plugin only loads there.
-pub const OPENCODE_TUI_COMMAND = "opencode2";
+/// OpenCode (2.x) ships the TUI and the shared service in one binary. Verde
+/// launches the TUI directly; the lifecycle plugin only loads there.
+pub const OPENCODE_TUI_COMMAND = "opencode";
 const GROK_TUI_COMMAND = "grok --no-auto-update --no-alt-screen --no-memory --disable-web-search --permission-mode plan --reasoning-effort low";
 const LEGACY_GROK_TUI_COMMAND = "grok --no-auto-update";
 const LEGACY_GROK_NO_SUBAGENTS_TUI_COMMAND = "grok --no-auto-update --no-alt-screen --no-memory --no-subagents --disable-web-search --permission-mode plan --reasoning-effort low";
@@ -112,7 +112,8 @@ pub fn defaultAgentTui(provider: stack_config.AgentProvider) ?DefaultAgentTui {
         .codex => .{ .name = "codex", .command = "codex", .provider = .codex, .notify = true, .mcp = true, .hooks = true },
         .claude => .{ .name = "claude", .command = "claude", .provider = .claude, .notify = true, .hooks = true },
         .opencode => .{ .name = "opencode", .command = OPENCODE_TUI_COMMAND, .provider = .opencode, .notify = true, .hooks = true },
-        .cursor => .{ .name = "cursor", .command = "agent", .provider = .cursor, .notify = true, .hooks = true },
+        // `cursor-agent`, not `agent`: Grok installs an `agent` that can shadow Cursor's.
+        .cursor => .{ .name = "cursor", .command = "cursor-agent", .provider = .cursor, .notify = true, .hooks = true },
         .grok => .{ .name = "grok", .command = GROK_TUI_COMMAND, .provider = .grok, .notify = true, .hooks = true },
         .amp => .{ .name = "amp", .command = "amp", .provider = .amp, .notify = true, .hooks = true },
         // Stable Muse does not expose third-party hooks yet. Verde projects
@@ -128,7 +129,7 @@ pub fn isKnownDefaultAgentTuiCommand(provider: stack_config.AgentProvider, comma
         .claude => std.mem.eql(u8, command, "claude"),
         .opencode => std.mem.eql(u8, command, "opencode") or std.mem.eql(u8, command, "opencode2") or
             std.mem.eql(u8, command, OPENCODE_TUI_COMMAND),
-        .cursor => std.mem.eql(u8, command, "agent"),
+        .cursor => std.mem.eql(u8, command, "cursor-agent") or std.mem.eql(u8, command, "agent"),
         .grok => std.mem.eql(u8, command, "grok") or
             std.mem.eql(u8, command, LEGACY_GROK_TUI_COMMAND) or
             std.mem.eql(u8, command, LEGACY_GROK_NO_SUBAGENTS_TUI_COMMAND) or
@@ -206,10 +207,10 @@ test "Grok TUI defaults use the least-privilege launch mode" {
     try std.testing.expectEqual(AgentTuiProvider.grok, agentTuiProviderFromProcessName("grok").?);
 }
 
-test "OpenCode TUI defaults launch OpenCode 2 and keep legacy commands known" {
+test "OpenCode TUI defaults launch opencode and keep the legacy opencode2 name known" {
     const defaults = defaultAgentTui(.opencode).?;
-    try std.testing.expectEqualStrings("opencode2", defaults.command);
-    try std.testing.expect(isKnownDefaultAgentTuiCommand(.opencode, "opencode2"));
+    try std.testing.expectEqualStrings("opencode", defaults.command);
+    try std.testing.expect(isKnownDefaultAgentTuiCommand(.opencode, "opencode"));
     // Panes saved before the OpenCode 2 migration still count as managed TUIs.
     try std.testing.expect(isKnownDefaultAgentTuiCommand(.opencode, "opencode"));
     try std.testing.expectEqual(AgentTuiProvider.opencode, agentTuiProviderFromProcessName("opencode2").?);
@@ -809,6 +810,7 @@ pub fn pollTerminals(self: anytype) bool {
             };
             if (changed and project_index == self.project_controller.selected_index and dock_visible) visible_changed = true;
         }
+        visible_changed = self.pollProviderInstallTerminal() or visible_changed;
         if (exited_editor_dock_id) |dock_id| {
             if (closeExitedEditorTerminalPane(self, project_index, dock_id) and project_index == self.project_controller.selected_index) {
                 visible_changed = true;
@@ -826,6 +828,7 @@ fn closeExitedEditorTerminalPane(self: anytype, project_index: usize, dock_id: u
     // The updater is an interactive one-shot command whose final output
     // must remain visible instead of being auto-closed like editor tasks.
     if (self.isUpdateInstallerTerminal(project_index, dock_id)) return false;
+    const provider_install = self.isProviderInstallTerminal(project_index, dock_id);
     if (project_index >= self.project_controller.projects.items.len) return false;
     var project = &self.project_controller.projects.items[project_index];
     var layout = &project.workspace_layout;
@@ -847,7 +850,9 @@ fn closeExitedEditorTerminalPane(self: anytype, project_index: usize, dock_id: u
     var removed_ref = layout.closePane(self.allocator, pane_id) orelse return false;
     defer deinitWorkspacePaneRef(&removed_ref, self.allocator);
     if (self.project_controller.selected_index == project_index and !layout.hasVisiblePaneKind(.terminal)) self.terminal_controller.focused = false;
-    self.setSidebarNotice("Editor pane closed.");
+    // A provider installer already reported its own result. Don't replace
+    // "FX Updated to 0.0.10" with the generic editor-pane notice.
+    if (!provider_install) self.setSidebarNotice("Editor pane closed.");
     self.markWorkspaceDirty(project_index);
     return true;
 }

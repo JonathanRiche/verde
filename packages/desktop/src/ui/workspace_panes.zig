@@ -17,6 +17,7 @@ const runtime = @import("runtime.zig");
 const browser_panel = @import("browser.zig");
 const chat_panel = @import("chat_panel.zig");
 const colors = @import("colors.zig");
+const context_menu = @import("context_menu.zig");
 const handoff_sheet = @import("handoff_sheet.zig");
 const profiler = @import("../runtime/profiler.zig");
 const terminal_panel = @import("terminal_panel.zig");
@@ -40,6 +41,7 @@ const TERMINAL_ZOOM_HOVER_HEIGHT_CSS: f32 = 48.0;
 const INACTIVE_BORDER_WIDTH_CSS: f32 = 1.0;
 const FOCUS_BORDER_WIDTH_CSS: f32 = 2.0;
 const ZOOM_BORDER_WIDTH_CSS: f32 = 3.0;
+const LIGHT_PALETTE_FOCUS_BORDER_ALPHA: f32 = 0.55;
 const STATUS_BORDER_WIDTH_CSS: f32 = 3.0;
 const STATUS_ZOOM_BORDER_WIDTH_CSS: f32 = 4.0;
 const ZOOM_ICON_FOREGROUND_MIX: f32 = 0.30;
@@ -253,7 +255,7 @@ pub fn isPaneMotionAnimating() bool {
 /// Per-frame easing step in 0..1 from the time since the previous workspace
 /// pass. Snaps (1.0) on the first pass, while the workspace rect itself is
 /// moving, and while a split gutter is being dragged so the drag never
-/// feels rubbery. Reduced motion shortens the tween instead.
+/// feels rubbery. Reduced motion always snaps.
 fn tickPaneMotion(state: *const runtime.AppState, workspace_rect: palette.Rect) void {
     pane_motion_animating = false;
     const now_ms = nowMs();
@@ -263,7 +265,7 @@ fn tickPaneMotion(state: *const runtime.AppState, workspace_rect: palette.Rect) 
     // A moving container (sidebar rail tween, window resize) already drives
     // every pane rect per frame; easing on top would make panes trail it.
     const container_moving = !rectsEqual(workspace_rect, last_workspace_rect);
-    if (first or resize_drag != null or container_moving) {
+    if (first or resize_drag != null or container_moving or state.app_config.reduced_motion) {
         pane_motion_t = 1.0;
         return;
     }
@@ -1955,9 +1957,10 @@ fn renderScrollingStrip(
         }
     }
 
-    if (strip_scrolls) {
+    if (strip_scrolls and !state.app_config.reduced_motion) {
         tickScrollingAnimation(offset, target.*, &layout.scroll_animation_last_ms);
     } else {
+        // Tab mode, or reduced motion: land on the target with no easing.
         offset.* = target.*;
         layout.scroll_animation_last_ms = 0;
     }
@@ -3087,7 +3090,8 @@ fn renderLeafWithin(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, 
     const alpha = @max(focus_alpha, if (maximized) @as(f32, 1.0) else @as(f32, 0.0));
     if (alpha > 0.01) {
         var border_color = if (maximized) zoomBorderAccent() else theme.accent();
-        border_color[3] *= alpha;
+        // A full-strength dark accent frame reads heavy on light palettes.
+        border_color[3] *= alpha * (if (theme.isLightPalette()) LIGHT_PALETTE_FOCUS_BORDER_ALPHA else 1.0);
         const border_width = theme.scaledUi(if (maximized) ZOOM_BORDER_WIDTH_CSS else FOCUS_BORDER_WIDTH_CSS);
         queueBorder(state, rect, paletteColor(border_color), 0.0, border_width);
     }
@@ -3281,11 +3285,11 @@ fn renderSplitMenuOverlay(state: *runtime.AppState, workspace_rect: palette.Rect
 
     const menu_w = theme.scaledUi(230.0);
     const submenu_w = theme.scaledUi(210.0);
-    const row_h = theme.scaledUi(28.0);
-    const row_gap = theme.scaledUi(4.0);
-    const menu_pad_x = theme.scaledUi(14.0);
-    const menu_pad_top = theme.scaledUi(12.0);
-    const menu_pad_bottom = theme.scaledUi(12.0);
+    const row_h = theme.scaledUi(context_menu.ROW_HEIGHT_UI);
+    const row_gap: f32 = 0.0;
+    const menu_pad_x = theme.scaledUi(context_menu.PAD_UI);
+    const menu_pad_top = theme.scaledUi(context_menu.PAD_UI);
+    const menu_pad_bottom = theme.scaledUi(context_menu.PAD_UI);
     const pane_kind = state.workspacePaneKindById(pane_id);
     const is_chat_context = split_menu_kind == .chat_context and pane_kind == .chat;
     const copy_count: usize = if (is_chat_context and state.transcriptMarkdownSelectionActive()) 1 else 0;
@@ -3294,7 +3298,7 @@ fn renderSplitMenuOverlay(state: *runtime.AppState, workspace_rect: palette.Rect
     var link_rows: [8]ContextLinkRow = undefined;
     const link_row_count: usize = if (is_chat_context) contextLinkRows(&link_rows) else 0;
     // A thin rule separates link targets from the pane commands below them.
-    const link_separator_h: f32 = if (link_row_count > 0) theme.scaledUi(9.0) else 0.0;
+    const link_separator_h: f32 = if (link_row_count > 0) theme.scaledUi(context_menu.SEPARATOR_HEIGHT_UI) else 0.0;
     const command_count: usize = link_row_count + chat_command_count + 3;
     const split_count: usize = 8;
     const menu_h = menu_pad_top + menu_pad_bottom + link_separator_h +
@@ -3312,12 +3316,9 @@ fn renderSplitMenuOverlay(state: *runtime.AppState, workspace_rect: palette.Rect
     const max_y = workspace_rect.y + workspace_rect.h - menu_h - theme.scaledUi(8.0);
     if (menu_y > max_y) menu_y = max_y;
 
-    const menu_rect = palette.Rect{ .x = menu_x, .y = menu_y, .w = menu_w, .h = menu_h };
+    const menu_rect = context_menu.queuePanel(state, .{ .x = menu_x, .y = menu_y, .w = menu_w, .h = menu_h });
     split_menu_rect = menu_rect;
     split_submenu_rect = .{};
-
-    queueRounded(state, menu_rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(10.0));
-    queueBorder(state, menu_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(10.0), theme.scaledUi(1.0));
 
     const MenuRow = struct {
         action: WorkspacePaneAction,
@@ -3329,8 +3330,7 @@ fn renderSplitMenuOverlay(state: *runtime.AppState, workspace_rect: palette.Rect
         for (link_rows[0..link_row_count]) |row| {
             y = renderContextMenuRow(state, pane_id, row.action, row.label, menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
         }
-        const rule_y = y + (link_separator_h - theme.scaledUi(1.0)) * 0.5;
-        queueRect(state, .{ .x = menu_rect.x + menu_pad_x, .y = rule_y, .w = row_rect_w, .h = theme.scaledUi(1.0) }, paletteColor(theme.COLOR_PANEL_MUTED));
+        context_menu.queueSeparator(state, menu_rect.x + menu_pad_x, y, row_rect_w);
         y += link_separator_h;
     }
     if (is_chat_context) {
@@ -3364,12 +3364,10 @@ fn renderSplitMenuOverlay(state: *runtime.AppState, workspace_rect: palette.Rect
     const submenu_max_y = workspace_rect.y + workspace_rect.h - submenu_h - theme.scaledUi(8.0);
     if (submenu_y > submenu_max_y) submenu_y = submenu_max_y;
     if (submenu_y < workspace_rect.y + theme.scaledUi(8.0)) submenu_y = workspace_rect.y + theme.scaledUi(8.0);
-    const submenu_rect = palette.Rect{ .x = submenu_x, .y = submenu_y, .w = submenu_w, .h = submenu_h };
+    const submenu_rect = context_menu.snap(.{ .x = submenu_x, .y = submenu_y, .w = submenu_w, .h = submenu_h });
     const submenu_visible = rectContains(split_trigger_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) or rectContains(submenu_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
     if (submenu_visible) {
-        split_submenu_rect = submenu_rect;
-        queueRounded(state, submenu_rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(10.0));
-        queueBorder(state, submenu_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(10.0), theme.scaledUi(1.0));
+        split_submenu_rect = context_menu.queuePanel(state, submenu_rect);
         y = submenu_rect.y + menu_pad_top;
         const submenu_row_w = submenu_rect.w - menu_pad_x * 2.0;
         for (rows) |row| {
@@ -3390,21 +3388,11 @@ fn renderContextMenuStaticRow(
 ) palette.Rect {
     const rect = palette.Rect{ .x = menu_rect.x + pad_x, .y = y, .w = w, .h = h };
     const hovered = rectContains(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
-    if (hovered) queueRounded(state, rect, paletteColor(theme.raise(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
-    queueText(state, .{
-        .x = rect.x + theme.scaledUi(8.0),
-        .y = rect.y + (rect.h - theme.scaledUi(14.0)) * 0.5,
-        .w = @max(rect.w - theme.scaledUi(32.0), 1.0),
-        .h = theme.scaledUi(14.0),
-    }, label, paletteColor(theme.COLOR_WHITE), theme.scaledUi(12.0), menu_rect);
-    if (arrow) {
-        queueText(state, .{
-            .x = rect.x + rect.w - theme.scaledUi(20.0),
-            .y = rect.y + (rect.h - theme.scaledUi(14.0)) * 0.5,
-            .w = theme.scaledUi(12.0),
-            .h = theme.scaledUi(14.0),
-        }, ">", paletteColor(theme.COLOR_WHITE), theme.scaledUi(12.0), menu_rect);
-    }
+    if (hovered) context_menu.queueRowHighlight(state, rect);
+    const text_color = context_menu.labelColor(true, hovered);
+    const trailing = if (arrow) theme.scaledUi(context_menu.CHEVRON_SLOT_UI) else 0.0;
+    context_menu.queueLabel(state, rect, label, text_color, 0.0, trailing, menu_rect);
+    if (arrow) context_menu.queueChevron(state, rect, text_color, menu_rect);
     return rect;
 }
 
@@ -3421,16 +3409,8 @@ fn renderContextMenuRow(
 ) f32 {
     const rect = palette.Rect{ .x = menu_rect.x + pad_x, .y = y, .w = w, .h = h };
     const hovered = rectContains(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
-    if (hovered) {
-        queueRounded(state, rect, paletteColor(theme.raise(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
-    }
-    const text_color = if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
-    queueText(state, .{
-        .x = rect.x + theme.scaledUi(8.0),
-        .y = rect.y + (rect.h - theme.scaledUi(14.0)) * 0.5,
-        .w = @max(rect.w - theme.scaledUi(16.0), 1.0),
-        .h = theme.scaledUi(14.0),
-    }, label, paletteColor(text_color), theme.scaledUi(12.0), menu_rect);
+    if (hovered) context_menu.queueRowHighlight(state, rect);
+    context_menu.queueLabel(state, rect, label, context_menu.labelColor(true, hovered), 0.0, 0.0, menu_rect);
     appendHit(.{ .pane_id = pane_id, .action = action, .rect = rect });
     return rect.y + rect.h;
 }

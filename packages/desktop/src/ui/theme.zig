@@ -452,6 +452,21 @@ pub fn withAlpha(color: [4]f32, alpha: u8) [4]f32 {
     return .{ color[0], color[1], color[2], @as(f32, @floatFromInt(alpha)) / 255.0 };
 }
 
+/// True when the active palette puts dark text on a light background.
+pub fn isLightPalette() bool {
+    return relativeLuma(current_colors.background) > relativeLuma(current_colors.text);
+}
+
+/// Translucent tint of `color` for selected, hovered and owned surfaces
+/// (user bubbles, selected rows and tabs). `alpha` is the dark-palette
+/// strength; light palettes use 40% of it, because accents dark enough to
+/// read as text on a light background turn a dark-theme wash into a heavy
+/// mid-tone block.
+pub fn wash(color: [4]f32, alpha: u8) [4]f32 {
+    const light_alpha: u8 = @intCast((@as(u16, alpha) * 2 + 4) / 5);
+    return withAlpha(color, if (isLightPalette()) light_alpha else alpha);
+}
+
 /// Tint for a provider logo bitmap, keyed by the provider's tag name. The
 /// white/grey marks (OpenAI, Cursor, Grok, Pi, FX) are drawn in the text
 /// colour so they stay visible on light themes; logos with their own brand
@@ -1335,6 +1350,21 @@ test "legibleOn separates fixed hues from the backing" {
     const pale_yellow = rgb(0xFA, 0xF7, 0x43);
     const adjusted = legibleOn(pale_yellow, current_colors.background);
     try std.testing.expect(@abs(relativeLuma(adjusted) - relativeLuma(current_colors.background)) >= 0.28);
+}
+
+test "wash keeps dark-theme strength and softens light-theme fills" {
+    const saved = current_colors;
+    defer current_colors = saved;
+
+    current_colors = verde_dark_colors;
+    try std.testing.expect(!isLightPalette());
+    try std.testing.expectEqual(@as(f32, 64.0 / 255.0), wash(current_colors.accent, 64)[3]);
+
+    current_colors = verde_light_colors;
+    try std.testing.expect(isLightPalette());
+    try std.testing.expectEqual(@as(f32, 26.0 / 255.0), wash(current_colors.accent, 64)[3]);
+    try std.testing.expectEqual(@as(f32, 0.0), wash(current_colors.accent, 0)[3]);
+    try std.testing.expectEqual(@as(f32, 102.0 / 255.0), wash(current_colors.accent, 255)[3]);
 }
 
 test "withHue keeps lightness and moves the hue" {

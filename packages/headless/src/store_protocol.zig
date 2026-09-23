@@ -254,12 +254,28 @@ pub const Message = struct {
     updated_at_ms: ?i64 = null,
 };
 
+/// Thread activity is Unix seconds. Older CLI clients wrote milliseconds;
+/// normalize those values before comparing or displaying persisted activity.
+pub fn threadActivitySeconds(timestamp: ?i64) ?i64 {
+    const value = timestamp orelse return null;
+    return if (value >= 1_000_000_000_000) @divTrunc(value, std.time.ms_per_s) else value;
+}
+
+test "thread activity normalizes legacy milliseconds without changing seconds or missing values" {
+    try std.testing.expectEqual(@as(?i64, null), threadActivitySeconds(null));
+    try std.testing.expectEqual(@as(?i64, 0), threadActivitySeconds(0));
+    try std.testing.expectEqual(@as(?i64, 1_790_000_000), threadActivitySeconds(1_790_000_000));
+    try std.testing.expectEqual(@as(?i64, 1_700_000_000), threadActivitySeconds(1_700_000_000_999));
+    try std.testing.expect(threadActivitySeconds(1_700_000_000_999).? < threadActivitySeconds(1_790_000_000).?);
+}
+
 /// Thread metadata keyed by (workspace_id, local_thread_id).
 pub const Thread = struct {
     local_thread_id: []const u8,
     title: []const u8,
     archived: bool = false,
     committed: bool = true,
+    /// Unix seconds since the last chat activity.
     last_activity_at: ?i64 = null,
     provider_thread_id: ?[]const u8 = null,
     model_ref: ?[]const u8 = null,
@@ -582,6 +598,7 @@ pub const ThreadListItem = struct {
     sort_index: usize = 0,
     archived: bool = false,
     committed: bool = true,
+    /// Unix seconds since the last chat activity.
     last_activity_at: ?i64 = null,
     provider_thread_id: ?[]const u8 = null,
     model_ref: ?[]const u8 = null,

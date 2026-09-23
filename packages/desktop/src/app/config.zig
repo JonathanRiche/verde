@@ -313,6 +313,8 @@ pub const AppConfig = struct {
     new_chat_model: ?[]u8 = null,
     new_chat_reasoning: ChatReasoning = .medium,
     last_chat_provider: ?ChatProvider = null,
+    /// Providers hidden from the model picker and new-chat defaults; indexed by ChatProvider.
+    disabled_providers: [std.meta.fields(ChatProvider).len]bool = @splat(false),
     remembered_models: [std.meta.fields(ChatProvider).len]?RememberedModel = @splat(null),
     favorite_models: []FavoriteModel = &.{},
     new_chat_pane_behavior: NewChatPaneBehavior = .new_pane,
@@ -359,6 +361,10 @@ pub const AppConfig = struct {
         const owned_model = try allocator.dupe(u8, model);
         if (self.new_chat_model) |previous| allocator.free(previous);
         self.new_chat_model = owned_model;
+    }
+
+    pub fn isProviderEnabled(self: AppConfig, provider: ChatProvider) bool {
+        return !self.disabled_providers[@intFromEnum(provider)];
     }
 
     /// Record an explicit GUI choice, including the provider for the next chat.
@@ -772,6 +778,11 @@ fn writeChatSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, c
     } else {
         _ = chat_object.swapRemove("last_provider");
     }
+    var disabled = std.json.Array.init(allocator);
+    inline for (std.meta.fields(ChatProvider)) |field| {
+        if (config.disabled_providers[field.value]) try disabled.append(.{ .string = field.name });
+    }
+    try chat_object.put(allocator, "disabled_providers", .{ .array = disabled });
     var remembered: std.json.ObjectMap = .empty;
     inline for (std.meta.fields(ChatProvider)) |field| {
         if (config.remembered_models[field.value]) |entry| {
@@ -949,6 +960,17 @@ fn applyChatOverrides(allocator: std.mem.Allocator, config: *AppConfig, chat_val
     }
     if (chat_value.object.get("last_provider")) |provider| {
         if (provider == .string) config.last_chat_provider = ChatProvider.parse(provider.string);
+    }
+    if (chat_value.object.get("disabled_providers")) |disabled| {
+        if (disabled == .array) {
+            for (disabled.array.items) |item| {
+                if (item != .string) continue;
+                const provider = ChatProvider.parse(item.string) orelse continue;
+                config.disabled_providers[@intFromEnum(provider)] = true;
+            }
+        } else {
+            log.warn("chat.disabled_providers must be an array when provided", .{});
+        }
     }
     if (chat_value.object.get("remembered_models")) |remembered| {
         if (remembered == .object) {

@@ -5,11 +5,13 @@ const build_options = @import("build_options");
 const palette = @import("palette");
 const sdl = @import("zsdl3");
 const app_config = @import("../app/config.zig");
+const provider_cli_version = @import("../providers/cli_version.zig");
 const settings_controller = @import("../state/settings_controller.zig");
 const updater = @import("../app/updater.zig");
 const theme = @import("theme.zig");
 const runtime = @import("runtime.zig");
 const text_measure = @import("text_measure.zig");
+const utils = @import("../utils.zig");
 const runtime_connections = @import("../state/runtime_connections_controller.zig");
 
 pub const Control = enum(u8) {
@@ -85,7 +87,52 @@ pub const Control = enum(u8) {
     updates_notes_toggle,
     updates_release_page,
     notifications_toggle,
+    providers_recheck,
+    // One per settings_controller.PROVIDER_OPTIONS row. Each group stays contiguous.
+    provider_update_first,
+    provider_update_1,
+    provider_update_2,
+    provider_update_3,
+    provider_update_4,
+    provider_update_5,
+    provider_update_6,
+    provider_update_last,
+    provider_row_first,
+    provider_row_1,
+    provider_row_2,
+    provider_row_3,
+    provider_row_4,
+    provider_row_5,
+    provider_row_6,
+    provider_row_last,
 };
+
+const PROVIDER_ROW_COUNT = settings_controller.PROVIDER_OPTIONS.len;
+
+comptime {
+    std.debug.assert(@intFromEnum(Control.provider_row_last) - @intFromEnum(Control.provider_row_first) + 1 == PROVIDER_ROW_COUNT);
+    std.debug.assert(@intFromEnum(Control.provider_update_last) - @intFromEnum(Control.provider_update_first) + 1 == PROVIDER_ROW_COUNT);
+}
+
+fn providerRowControl(row: usize) Control {
+    return @enumFromInt(@intFromEnum(Control.provider_row_first) + @as(u8, @intCast(row)));
+}
+
+fn providerUpdateControl(row: usize) Control {
+    return @enumFromInt(@intFromEnum(Control.provider_update_first) + @as(u8, @intCast(row)));
+}
+
+fn providerUpdateRowForControl(control: Control) ?usize {
+    const index = @intFromEnum(control);
+    if (index < @intFromEnum(Control.provider_update_first) or index > @intFromEnum(Control.provider_update_last)) return null;
+    return index - @intFromEnum(Control.provider_update_first);
+}
+
+fn providerRowForControl(control: Control) ?usize {
+    const index = @intFromEnum(control);
+    if (index < @intFromEnum(Control.provider_row_first) or index > @intFromEnum(Control.provider_row_last)) return null;
+    return index - @intFromEnum(Control.provider_row_first);
+}
 
 const OpenChoice = struct {
     label: []const u8,
@@ -267,6 +314,12 @@ const SettingsLayout = struct {
     notifications_card: palette.Rect,
     notifications_toggle: palette.Rect,
     notifications_hint_y: f32,
+    providers_card: palette.Rect,
+    provider_rows: [PROVIDER_ROW_COUNT]palette.Rect,
+    provider_updates: [PROVIDER_ROW_COUNT]palette.Rect,
+    providers_hint_y: f32,
+    providers_update_hint_y: f32,
+    providers_recheck: palette.Rect,
 };
 
 const log = std.log.scoped(.native_ui_settings);
@@ -435,6 +488,8 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const package_hint_h = if (state.settings_controller.package_update_command != null) wrappedNotesRows(PACKAGE_UPDATE_HINT, updates_notes_w) * notesLineHeight() + m.label_h + m.inner_gap else 0.0;
     const updates_h = package_hint_h + m.card_pad * 2.0 + m.title_h + m.inner_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.row_h + m.inner_gap + updates_notes_h + m.inner_gap + m.label_h;
 
+    const provider_rows_h = @as(f32, @floatFromInt(PROVIDER_ROW_COUNT)) * providerRowHeight();
+    const providers_h = m.card_pad * 2.0 + m.title_h + m.row_gap + provider_rows_h + m.label_h * 2.0 + m.row_gap + m.row_h;
     const appearance_page_h = appearance_h;
     const chat_page_h = transcript_h + m.card_gap + chat_h;
     const workspace_page_h = workspace_h;
@@ -443,6 +498,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .appearance => appearance_page_h,
         .workspace => workspace_page_h,
         .chat => chat_page_h,
+        .providers => providers_h,
         .terminal => terminal_h,
         .browser => browser_h,
         .connections => runtimes_h,
@@ -562,6 +618,41 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const file_links_y = new_chat_defaults_y + m.row_h + m.row_gap;
     const file_links_neovim_pane: palette.Rect = .{ .x = chat_card.x + m.card_pad, .y = file_links_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
     const file_links_hint_y = file_links_y + m.row_h;
+
+    y = if (category == .providers) page_y else offscreen_y;
+
+    const providers_card: palette.Rect = .{ .x = content_x, .y = y, .w = content_w, .h = providers_h };
+    var provider_rows: [PROVIDER_ROW_COUNT]palette.Rect = undefined;
+    var provider_updates: [PROVIDER_ROW_COUNT]palette.Rect = undefined;
+    var provider_row_y = providers_card.y + m.card_pad + m.title_h + m.row_gap;
+    const provider_action_w = @max(
+        @max(@max(buttonWidth("Install"), buttonWidth("Update")), buttonWidth("Sign in")),
+        @max(buttonWidth("Latest"), buttonWidth("Checking…")),
+    );
+    const provider_badge_w = providerBadgeColumnWidth();
+    const provider_switch_reserve = theme.scaledUi(10.0 + 40.0 + 20.0);
+    const provider_dot = theme.scaledUi(7.0);
+    for (&provider_rows, &provider_updates) |*row, *update| {
+        row.* = .{ .x = providers_card.x + m.card_pad, .y = provider_row_y, .w = content_w - m.card_pad * 2.0, .h = providerRowHeight() };
+        const badge_x = row.x + row.w - provider_switch_reserve - provider_badge_w;
+        // Keep the installer button on the name line so the version line underneath can use the full width.
+        const update_h = theme.scaledUi(22.0);
+        update.* = .{
+            .x = badge_x - provider_dot - theme.scaledUi(7.0 + 8.0) - provider_action_w,
+            .y = row.y + theme.scaledUi(3.0),
+            .w = provider_action_w,
+            .h = update_h,
+        };
+        provider_row_y += providerRowHeight();
+    }
+    const providers_hint_y = provider_row_y + m.row_gap;
+    const providers_update_hint_y = providers_hint_y + m.label_h;
+    const providers_recheck: palette.Rect = .{
+        .x = providers_card.x + m.card_pad,
+        .y = providers_update_hint_y + m.label_h + m.row_gap,
+        .w = buttonWidth(PROVIDERS_RECHECK_LABEL),
+        .h = m.row_h,
+    };
 
     y = if (category == .terminal) page_y else offscreen_y;
 
@@ -836,6 +927,12 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .notifications_card = notifications_card,
         .notifications_toggle = notifications_toggle,
         .notifications_hint_y = notifications_hint_y,
+        .providers_card = providers_card,
+        .provider_rows = provider_rows,
+        .provider_updates = provider_updates,
+        .providers_hint_y = providers_hint_y,
+        .providers_update_hint_y = providers_update_hint_y,
+        .providers_recheck = providers_recheck,
     };
 }
 
@@ -1205,6 +1302,22 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
         queueControlHit(state, layout.terminal_links_system_browser, layout.body_clip, .terminal_links_system_browser, queue_hit);
         queueControlHit(state, browserScrollSliderHitRect(layout.browser_scroll_speed), layout.body_clip, .browser_scroll_speed, queue_hit);
     }
+    if (category == .providers) {
+        for (layout.provider_rows, 0..) |row, index| {
+            queueControlHit(state, row, layout.body_clip, providerRowControl(index), queue_hit);
+        }
+        // Registered after the row so Install/Update wins the overlap.
+        // Latest and an unfinished check are labels, not buttons.
+        const provider_snapshot = state.providerReadinessSnapshot();
+        for (layout.provider_updates, 0..) |update, index| {
+            const provider = settings_controller.settingsProviderForRow(index);
+            switch (providerAction(provider_snapshot.forProvider(provider), provider_snapshot.releaseForProvider(provider))) {
+                .install, .update, .sign_in => queueControlHit(state, update, layout.body_clip, providerUpdateControl(index), queue_hit),
+                .latest, .pending, .none => {},
+            }
+        }
+        queueControlHit(state, layout.providers_recheck, layout.body_clip, .providers_recheck, queue_hit);
+    }
     if (category == .agents) {
         queueControlHit(state, layout.mcp_tools, layout.body_clip, .mcp_tools, queue_hit);
         queueControlHit(state, layout.hooks_claude, layout.body_clip, .hooks_claude, queue_hit);
@@ -1420,6 +1533,8 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         queueText(state, .{ .x = layout.terminal_links_global.x, .y = layout.terminal_links_global.y - m.inner_gap - m.label_h, .w = layout.terminal_links_global.w * 3.0, .h = m.label_h }, "Terminal links", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
         drawSegmentedTriple(state, layout.terminal_links_global, layout.terminal_links_verde_browser, layout.terminal_links_system_browser, .{ "Global", "Verde", "System" }, @intFromEnum(state.settings_controller.draft.terminal_link_open_override), .{ isControlHovered(state, .terminal_links_global), isControlHovered(state, .terminal_links_verde_browser), isControlHovered(state, .terminal_links_system_browser) }, layout.body_clip);
         drawBrowserScrollSpeedSlider(state, layout.browser_scroll_speed, state.settings_controller.draft.browser_scroll_speed, isControlHovered(state, .browser_scroll_speed), layout.body_clip);
+    } else if (category == .providers) {
+        drawProvidersCard(state, layout, m);
     } else if (category == .connections) {
         drawRuntimeCard(state, layout);
     } else if (category == .agents) {
@@ -1947,6 +2062,27 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         },
         // Draft toggle: persisted to verde.json on Save, like the other fields.
         .notifications_toggle => state.settings_controller.draft.notifications_enabled = !state.settings_controller.draft.notifications_enabled,
+        .providers_recheck => {
+            state.startProviderReadinessCheck();
+            state.markDirty();
+            return;
+        },
+        .provider_update_first, .provider_update_1, .provider_update_2, .provider_update_3, .provider_update_4, .provider_update_5, .provider_update_6, .provider_update_last => {
+            const row = providerUpdateRowForControl(control).?;
+            const provider = settings_controller.settingsProviderForRow(row);
+            const provider_snapshot = state.providerReadinessSnapshot();
+            switch (providerAction(provider_snapshot.forProvider(provider), provider_snapshot.releaseForProvider(provider))) {
+                .install, .update => state.installSettingsProvider(row),
+                .sign_in => state.loginSettingsProvider(row),
+                .latest, .pending, .none => {},
+            }
+            return;
+        },
+        .provider_row_first, .provider_row_1, .provider_row_2, .provider_row_3, .provider_row_4, .provider_row_5, .provider_row_6, .provider_row_last => {
+            // Commits on its own; it may also move the new-chat default.
+            state.toggleSettingsProviderEnabled(providerRowForControl(control).?);
+            return;
+        },
     }
     state.commitSettingsPreference();
 }
@@ -2306,6 +2442,150 @@ fn drawHeaderBar(state: *runtime.AppState, layout: SettingsLayout) void {
     }, "Settings", paletteColor(theme.COLOR_WHITE), theme.scaledUi(17.0), layout.modal);
 
     drawIconButton(state, layout.close, "×", state.settings_controller.close_hovered);
+}
+
+const PROVIDERS_RECHECK_LABEL = "Check again";
+const PROVIDERS_UPDATE_HINT = "Update uses the tool that installed that copy, such as mise.";
+
+fn providerRowHeight() f32 {
+    return theme.scaledUi(46.0);
+}
+
+fn providerBadgeColumnWidth() f32 {
+    const badge_font = theme.scaledUi(12.0);
+    var badge_col_w: f32 = 0.0;
+    for ([_]runtime.ProviderReadiness{ .checking, .missing, .signed_out, .ready, .unavailable }) |value| {
+        badge_col_w = @max(badge_col_w, text_measure.textWidth(.ui, badge_font, providerReadinessBadge(value)));
+    }
+    return badge_col_w + theme.scaledUi(4.0);
+}
+
+const ProviderAction = enum { install, sign_in, update, latest, pending, none };
+
+fn providerAction(readiness: runtime.ProviderReadiness, release: runtime.ProviderRelease) ProviderAction {
+    if (readiness == .missing) return .install;
+    // Installed but not authenticated (or auth could not be confirmed): sign-in
+    // is the step that unblocks chats, so it takes the slot over Update.
+    if (readiness == .signed_out or readiness == .unavailable) return .sign_in;
+    return switch (release) {
+        .available => .update,
+        .current => .latest,
+        .unknown => if (readiness == .checking) .pending else .none,
+    };
+}
+
+fn providerReadinessColor(readiness: runtime.ProviderReadiness) [4]f32 {
+    return switch (readiness) {
+        .ready => theme.success(),
+        .signed_out => theme.warning(),
+        .missing, .unavailable => theme.danger(),
+        .checking => theme.COLOR_TEXT_SUBTLE,
+    };
+}
+
+fn providerReadinessBadge(readiness: runtime.ProviderReadiness) []const u8 {
+    return switch (readiness) {
+        .checking => "Checking…",
+        .missing => "Not installed",
+        .signed_out => "Signed out",
+        .ready => "Authenticated",
+        .unavailable => "Unavailable",
+    };
+}
+
+fn drawProvidersCard(state: *runtime.AppState, layout: SettingsLayout, m: Metrics) void {
+    // Providers page: logo, name, daemon-reported CLI version, installer
+    // button, auth badge, and enable switch.
+    const clip = layout.body_clip;
+    drawCard(state, layout.providers_card, clip);
+    drawCardTitle(state, layout.providers_card, "Model providers", clip);
+    const snapshot = state.providerReadinessSnapshot();
+    const badge_font = theme.scaledUi(12.0);
+    const name_font = theme.scaledUi(13.0);
+    const version_font = theme.scaledUi(11.0);
+    const dot = theme.scaledUi(7.0);
+    const inset = theme.scaledUi(10.0);
+    const logo = theme.scaledUi(18.0);
+    const logo_gap = theme.scaledUi(10.0);
+    const switch_reserve = theme.scaledUi(10.0 + 40.0 + 20.0);
+    const badge_col_w = providerBadgeColumnWidth();
+    for (layout.provider_rows, layout.provider_updates, 0..) |row, update, index| {
+        const enabled = state.settingsProviderEnabled(index);
+        const provider = settings_controller.settingsProviderForRow(index);
+        const readiness = snapshot.forProvider(provider);
+        const version = snapshot.versionForProvider(provider);
+        const action = providerAction(readiness, snapshot.releaseForProvider(provider));
+        drawSwitchRow(state, row, "", enabled, isControlHovered(state, providerRowControl(index)), clip);
+
+        const logo_rect: palette.Rect = .{ .x = row.x + inset, .y = row.y + (row.h - logo) * 0.5, .w = logo, .h = logo };
+        const label = state.settingsNewChatProviderLabel(index);
+        const texture = state.providerLogoTexture(provider);
+        if (texture != null and texture.?.valid and texture.?.texture_id != 0) {
+            const cached = texture.?;
+            const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, logo_rect.x, logo_rect.y, logo_rect.w, logo_rect.h));
+            const alpha: f32 = (if (enabled) @as(f32, 1.0) else 0.45) * current_fade_alpha;
+            const tint = theme.providerLogoTint(@tagName(provider));
+            state.palette_overlay_batch.image(state.allocator, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }, palette.TextureId.init(cached.texture_id), .{ .x = 0.0, .y = 0.0, .w = 1.0, .h = 1.0 }, .{ .r = tint[0], .g = tint[1], .b = tint[2], .a = tint[3] * alpha }, clip) catch |err| {
+                log.warn("failed to queue provider logo: {s}", .{@errorName(err)});
+            };
+        } else {
+            queueCenteredText(state, logo_rect, label[0..1], paletteColor(textLabel()), theme.scaledUi(11.0), clip);
+        }
+
+        const badge_x = row.x + row.w - switch_reserve - badge_col_w;
+        const dot_x = badge_x - dot - theme.scaledUi(7.0);
+        const name_x = logo_rect.x + logo + logo_gap;
+        const name_w = @max(update.x - theme.scaledUi(8.0) - name_x, 0.0);
+        const name_y = row.y + theme.scaledUi(4.0);
+        queueText(state, .{
+            .x = name_x,
+            .y = name_y,
+            .w = name_w,
+            .h = theme.scaledUi(16.0),
+        }, label, paletteColor(if (enabled) theme.COLOR_WHITE else textLabel()), name_font, clip);
+        const version_label = if (version.len > 0)
+            provider_cli_version.shortVersion(version)
+        else if (readiness == .checking)
+            "Checking…"
+        else
+            "—";
+        queueText(state, .{
+            .x = name_x,
+            .y = name_y + theme.scaledUi(16.0),
+            .w = @max(dot_x - theme.scaledUi(8.0) - name_x, 0.0),
+            .h = theme.scaledUi(14.0),
+        }, version_label, paletteColor(textHint()), version_font, clip);
+
+        const color = if (enabled) providerReadinessColor(readiness) else theme.COLOR_TEXT_SUBTLE;
+        queueRoundedRectClipped(state, .{ .x = dot_x, .y = row.y + (row.h - dot) * 0.5, .w = dot, .h = dot }, paletteColor(color), dot * 0.5, clip);
+        queueText(state, .{
+            .x = badge_x,
+            .y = row.y + (row.h - m.label_h) * 0.5,
+            .w = badge_col_w,
+            .h = m.label_h,
+        }, providerReadinessBadge(readiness), paletteColor(if (enabled) textLabel() else textHint()), badge_font, clip);
+        switch (action) {
+            .install => drawActionButton(state, update, "Install", .secondary, isControlHovered(state, providerUpdateControl(index)), clip),
+            .update => drawActionButton(state, update, "Update", .secondary, isControlHovered(state, providerUpdateControl(index)), clip),
+            .sign_in => drawActionButton(state, update, "Sign in", .primary, isControlHovered(state, providerUpdateControl(index)), clip),
+            .pending => drawActionButton(state, update, "Checking…", .disabled, false, clip),
+            .latest => queueCenteredText(state, update, "Latest", paletteColor(textHint()), theme.scaledUi(12.0), clip),
+            .none => {},
+        }
+    }
+    queueText(state, .{
+        .x = layout.providers_card.x + m.card_pad,
+        .y = layout.providers_hint_y,
+        .w = layout.providers_card.w - m.card_pad * 2.0,
+        .h = m.label_h,
+    }, "Disabled providers are hidden from the model picker and new chats.", paletteColor(textHint()), theme.scaledUi(12.0), clip);
+    queueText(state, .{
+        .x = layout.providers_card.x + m.card_pad,
+        .y = layout.providers_update_hint_y,
+        .w = layout.providers_card.w - m.card_pad * 2.0,
+        .h = m.label_h,
+    }, PROVIDERS_UPDATE_HINT, paletteColor(textHint()), theme.scaledUi(12.0), clip);
+    drawActionButton(state, layout.providers_recheck, PROVIDERS_RECHECK_LABEL, .secondary, isControlHovered(state, .providers_recheck), clip);
 }
 
 fn drawCategoryNav(state: *runtime.AppState, layout: SettingsLayout) void {

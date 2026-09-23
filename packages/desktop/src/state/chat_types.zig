@@ -102,6 +102,8 @@ pub const ChatMessage = struct {
     tool_call_id: ?[]const u8 = null,
     tool_call_kind: ?provider_types.ToolCallKind = null,
     tool_call_status: ?provider_types.ToolCallStatus = null,
+    /// Actual transcript update time; absent for legacy records.
+    updated_at_ms: ?i64 = null,
     /// Durable transcript identity (M4-P4): the acceptance-staged client id on
     /// user rows, or the daemon-minted id adopted from `chat.thread.get` at
     /// terminal. Null until an identity is known; persistence carries it
@@ -1345,6 +1347,8 @@ pub const PendingTimelineEvent = struct {
     tool_call_id: ?[]u8 = null,
     tool_call_kind: ?provider_types.ToolCallKind = null,
     tool_call_status: ?provider_types.ToolCallStatus = null,
+    /// Actual transcript update time; absent for legacy records.
+    updated_at_ms: ?i64 = null,
     tool_call_title: ?[]u8 = null,
     tool_call_input: ?[]u8 = null,
     tool_call_output: ?[]u8 = null,

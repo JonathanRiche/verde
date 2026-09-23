@@ -1556,6 +1556,7 @@ pub fn upsertPendingToolCallEvent(
             }
             if (tool_call.kind) |kind| existing.tool_call_kind = kind;
             if (tool_call.status) |status| existing.tool_call_status = status;
+            existing.updated_at_ms = platform_runtime.unixTimestampMs();
 
             if (isTransientThinkTerminal(
                 existing.tool_call_kind,
@@ -1633,6 +1634,7 @@ pub fn upsertPendingToolCallEvent(
         .tool_call_id = owned_call_id,
         .tool_call_kind = tool_call.kind orelse .other,
         .tool_call_status = tool_call.status orelse .unknown,
+        .updated_at_ms = platform_runtime.unixTimestampMs(),
         .tool_call_title = owned_title,
         .tool_call_input = owned_input,
         .tool_call_output = owned_output,

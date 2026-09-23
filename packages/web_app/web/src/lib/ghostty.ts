@@ -7,6 +7,7 @@ import {
   type GhosttySnapshot,
   type GhosttyTerminal,
 } from './ghostty_vt'
+import { engineFailureIsPermanent } from './text_screen'
 
 import type { ScreenCell, ScreenCursor } from './pty'
 import { terminalDefaults, terminalPalette } from './theme'
@@ -27,9 +28,11 @@ function sharedRuntime(): Promise<GhosttyRuntime> {
       if (!response.ok) throw new Error(`ghostty-vt.wasm fetch failed (${response.status})`)
       return instantiateGhostty(await response.arrayBuffer())
     })()
-    // A transient failure (offline fetch) should not poison every later pane.
-    runtime_promise.catch(() => {
-      runtime_promise = null
+    // A transient failure (offline fetch) should not poison every later pane,
+    // but a deterministic one (CSP, no SIMD, bad module) is cached so panes in
+    // text fallback do not re-fetch the wasm on every poll.
+    runtime_promise.catch((error: unknown) => {
+      if (!engineFailureIsPermanent(error)) runtime_promise = null
     })
   }
   return runtime_promise

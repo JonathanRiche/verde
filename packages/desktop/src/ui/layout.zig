@@ -296,6 +296,18 @@ const WHICH_KEY_MAX_HEIGHT_RATIO: f32 = 0.55;
 // chord arms — a PREFIX pill plus `esc cancel`, `<chord> send prefix`, and
 // `? keybinds` hints. Instant and unobtrusive; the full table stays behind `?`.
 const PREFIX_BAR_HEIGHT_UI: f32 = 26.0;
+const PREFIX_PILL_FONT_UI: f32 = 11.0;
+const PREFIX_PILL_PAD_X_UI: f32 = 9.0;
+const PREFIX_PILL_PAD_Y_UI: f32 = 2.5;
+
+/// Prefix bar/which-key text, drawn with the `.ui` role its widths are measured with.
+fn queuePrefixText(state: *runtime.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: palette.Rect) void {
+    queuePaletteRoleText(state, rect, value, color, font_size, .ui, clip, false);
+}
+
+fn snapRect(rect: palette.Rect) palette.Rect {
+    return .{ .x = @round(rect.x), .y = @round(rect.y), .w = @round(rect.w), .h = @round(rect.h) };
+}
 
 fn prefixBarHeight() f32 {
     return theme.scaledUi(PREFIX_BAR_HEIGHT_UI);
@@ -318,16 +330,27 @@ fn renderPrefixStatusBar(state: *runtime.AppState, workspace: palette.Rect) void
     var x = bar.x + theme.scaledUi(12.0);
 
     const chevron = "\u{00bb}";
-    queuePaletteText(state, .{ .x = x, .y = text_y, .w = runtime.paletteUiTextPrefixWidth(chevron, font_size, chevron.len), .h = text_h }, chevron, paletteColor(theme.current_colors.text_subtle), font_size, bar);
+    queuePrefixText(state, .{ .x = x, .y = text_y, .w = runtime.paletteUiTextPrefixWidth(chevron, font_size, chevron.len), .h = text_h }, chevron, paletteColor(theme.current_colors.text_subtle), font_size, bar);
     x += runtime.paletteUiTextPrefixWidth(chevron, font_size, chevron.len) + gap;
 
+    // The pill is sized from the same bold face it draws with and centred in
+    // the bar; measuring `.ui` while drawing the untyped (bold prose)
+    // fallback left the label crowding the pill's right edge.
     const pill_label: []const u8 = if (navigate) "NAVIGATE" else "PREFIX";
-    const pill_pad = theme.scaledUi(8.0);
-    const pill_w = runtime.paletteUiTextPrefixWidth(pill_label, font_size, pill_label.len) + pill_pad * 2.0;
-    const pill: palette.Rect = .{ .x = x, .y = bar.y + theme.scaledUi(4.0), .w = pill_w, .h = bar_h - theme.scaledUi(8.0) };
-    queuePaletteRoundedRect(state, pill, paletteColor(theme.accent()), theme.scaledUi(3.0));
-    queuePaletteText(state, .{ .x = pill.x + pill_pad, .y = text_y, .w = pill_w - pill_pad * 2.0, .h = text_h }, pill_label, paletteColor(theme.background()), font_size, bar);
-    x += pill_w + hint_gap;
+    const pill_font = theme.scaledUi(PREFIX_PILL_FONT_UI);
+    const pill_text_h = pill_font * 1.25;
+    const pill_pad_x = theme.scaledUi(PREFIX_PILL_PAD_X_UI);
+    const pill_label_w = text_measure.textWidth(.ui_bold, pill_font, pill_label);
+    const pill_h = @min(pill_text_h + theme.scaledUi(PREFIX_PILL_PAD_Y_UI) * 2.0, bar_h - theme.scaledUi(4.0));
+    const pill = snapRect(.{ .x = x, .y = bar.y + (bar_h - pill_h) * 0.5, .w = pill_label_w + pill_pad_x * 2.0, .h = pill_h });
+    queuePaletteRoundedRect(state, pill, paletteColor(theme.accent()), theme.scaledUi(4.0));
+    queuePaletteRoleText(state, .{
+        .x = pill.x + (pill.w - pill_label_w) * 0.5,
+        .y = pill.y + (pill.h - pill_text_h) * 0.5,
+        .w = pill_label_w + theme.scaledUi(2.0),
+        .h = pill_text_h,
+    }, pill_label, paletteColor(theme.background()), pill_font, .ui_bold, bar, false);
+    x += pill.w + hint_gap;
 
     var chord_buf: [32]u8 = undefined;
     const chord = keybinds.formatFirstKeybind(&chord_buf, config.prefix.keys);
@@ -364,10 +387,10 @@ fn queuePrefixHint(state: *runtime.AppState, x_in: f32, text_y: f32, text_h: f32
     if (key.len == 0) return x_in;
     var x = x_in;
     const key_w = runtime.paletteUiTextPrefixWidth(key, font_size, key.len);
-    queuePaletteText(state, .{ .x = x, .y = text_y, .w = key_w, .h = text_h }, key, paletteColor(theme.accent()), font_size, clip);
+    queuePrefixText(state, .{ .x = x, .y = text_y, .w = key_w, .h = text_h }, key, paletteColor(theme.accent()), font_size, clip);
     x += key_w + gap * 0.6;
     const label_w = runtime.paletteUiTextPrefixWidth(label, font_size, label.len);
-    queuePaletteText(state, .{ .x = x, .y = text_y, .w = label_w, .h = text_h }, label, paletteColor(theme.current_colors.text_muted), font_size, clip);
+    queuePrefixText(state, .{ .x = x, .y = text_y, .w = label_w, .h = text_h }, label, paletteColor(theme.current_colors.text_muted), font_size, clip);
     return x + label_w + hint_gap;
 }
 
@@ -394,22 +417,26 @@ fn prefixHelpKeyLabel(config: *const keybinds.NativeKeyboardConfig, table: []con
 var prefix_help_key_buf: [32]u8 = undefined;
 
 // Prefix cheat sheet: full which-key table above the status bar, only after `?`.
+// `/` filters rows by label or key; arrows move a selection that Enter runs.
 fn renderPrefixWhichKey(state: *runtime.AppState, workspace: palette.Rect) void {
     if (!state.prefix_help_visible or (!state.prefix_armed and !state.prefix_navigate)) return;
     const config = state.command_controller.keyboard_config orelse return;
     const navigate = state.prefix_navigate and !state.prefix_armed;
-    const bindings = if (navigate) config.prefix.navigate.items else config.prefix.bindings.items;
+    const bindings = prefixHelpBindings(state) orelse return;
+    const query = state.prefixHelpQuery();
 
     const font_size = theme.scaledUi(12.0);
     const header_size = theme.scaledUi(12.5);
-    const line_h = font_size * 1.25 + theme.scaledUi(4.0);
+    const text_h = font_size * 1.25;
+    const line_h = text_h + theme.scaledUi(6.0);
     const pad = theme.scaledUi(14.0);
     const margin = theme.scaledUi(12.0);
     const key_gap = theme.scaledUi(10.0);
     const col_gap = theme.scaledUi(22.0);
+    const cell_pad_x = theme.scaledUi(6.0);
 
-    // Column geometry comes from measured text so long script labels and
-    // multi-token chords never overlap their neighbours.
+    // Column geometry comes from measured text over the whole table (not
+    // just the matches) so columns stay put while the filter is typed.
     var key_buf: [32]u8 = undefined;
     var label_buf: [96]u8 = undefined;
     var key_w: f32 = 0.0;
@@ -421,19 +448,30 @@ fn renderPrefixWhichKey(state: *runtime.AppState, workspace: palette.Rect) void 
         label_w = @max(label_w, runtime.paletteUiTextPrefixWidth(label, font_size, label.len));
     }
     label_w = @min(label_w, theme.scaledUi(180.0));
-    const col_w = key_w + key_gap + label_w;
+    const col_w = cell_pad_x * 2.0 + key_w + key_gap + label_w;
+
+    var matches: [PREFIX_HELP_MAX_ROWS]usize = undefined;
+    const match_count = prefixHelpMatchIndexes(bindings, query, &matches);
 
     const panel_w = @max(workspace.w - margin * 2.0, theme.scaledUi(320.0));
     const inner_w = panel_w - pad * 2.0;
     const columns: usize = @max(1, @as(usize, @intFromFloat(@floor((inner_w + col_gap) / (col_w + col_gap)))));
     const max_rows: usize = @max(1, @as(usize, @intFromFloat(@floor(((workspace.h - prefixBarHeight()) * WHICH_KEY_MAX_HEIGHT_RATIO - pad * 2.0 - line_h * 1.5) / line_h))));
+    // Size the grid from the unfiltered table so the panel does not jump as rows filter out.
     const wanted_rows = (bindings.len + columns - 1) / columns;
-    const rows = @min(wanted_rows, max_rows);
-    const shown = @min(bindings.len, rows * columns);
-    const hidden = bindings.len - shown;
+    const rows = @max(@min(wanted_rows, max_rows), 1);
+    const shown = @min(match_count, rows * columns);
+    const hidden = match_count - shown;
+    prefix_help_rows = rows;
+    prefix_help_shown = shown;
+    if (shown == 0) {
+        state.prefix_help_selected = 0;
+    } else if (state.prefix_help_selected >= shown) {
+        state.prefix_help_selected = shown - 1;
+    }
 
     const panel_h = pad * 2.0 + line_h * 1.5 + line_h * @as(f32, @floatFromInt(rows));
-    const rect: palette.Rect = .{ .x = workspace.x + margin, .y = workspace.y + workspace.h - prefixBarHeight() - margin - panel_h, .w = panel_w, .h = panel_h };
+    const rect = snapRect(.{ .x = workspace.x + margin, .y = workspace.y + workspace.h - prefixBarHeight() - margin - panel_h, .w = panel_w, .h = panel_h });
     const radius = theme.scaledUi(8.0);
     queuePaletteRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 245)), radius);
     queuePaletteBorder(state, rect, paletteColor(theme.accent()), radius, theme.scaledUi(1.0));
@@ -445,21 +483,159 @@ fn renderPrefixWhichKey(state: *runtime.AppState, workspace: palette.Rect) void 
         if (navigate) "Workspace nav" else chord,
         if (hidden > 0) "  (table truncated)" else "",
     }) catch chord;
-    queuePaletteText(state, .{ .x = rect.x + pad, .y = rect.y + pad, .w = inner_w, .h = header_size * 1.25 }, header, paletteColor(theme.current_colors.text_muted), header_size, rect);
+    const header_h = header_size * 1.25;
+    const header_w = runtime.paletteUiTextPrefixWidth(header, header_size, header.len);
+    queuePrefixText(state, .{ .x = rect.x + pad, .y = rect.y + pad, .w = header_w, .h = header_h }, header, paletteColor(theme.current_colors.text_muted), header_size, rect);
+    renderPrefixWhichKeySearch(state, .{
+        .x = rect.x + pad + header_w + theme.scaledUi(16.0),
+        .y = rect.y + pad - theme.scaledUi(3.0),
+        .w = @max(rect.x + rect.w - pad - (rect.x + pad + header_w + theme.scaledUi(16.0)), 0.0),
+        .h = header_h + theme.scaledUi(6.0),
+    }, query, font_size, rect);
 
     const grid_y = rect.y + pad + line_h * 1.5;
-    for (bindings[0..shown], 0..) |binding, index| {
+    if (shown == 0) {
+        const empty = "No keybinds match";
+        queuePrefixText(state, .{ .x = rect.x + pad + cell_pad_x, .y = grid_y + (line_h - text_h) * 0.5, .w = inner_w, .h = text_h }, empty, paletteColor(theme.current_colors.text_subtle), font_size, rect);
+        return;
+    }
+    for (matches[0..shown], 0..) |binding_index, index| {
+        const binding = bindings[binding_index];
         const col = index / rows;
         const row = index % rows;
-        const x = rect.x + pad + @as(f32, @floatFromInt(col)) * (col_w + col_gap);
-        const y = grid_y + @as(f32, @floatFromInt(row)) * line_h;
+        const cell: palette.Rect = .{
+            .x = rect.x + pad + @as(f32, @floatFromInt(col)) * (col_w + col_gap),
+            .y = grid_y + @as(f32, @floatFromInt(row)) * line_h,
+            .w = col_w,
+            .h = line_h,
+        };
+        const selected = index == state.prefix_help_selected;
+        if (selected) {
+            queuePaletteRoundedRect(state, snapRect(cell), paletteColor(theme.withAlpha(theme.accent(), 38)), theme.scaledUi(5.0));
+        }
+        const text_y = cell.y + (line_h - text_h) * 0.5;
+        const x = cell.x + cell_pad_x;
         const key = keybinds.formatKeybind(&key_buf, binding.key);
         const label = keybinds.prefixTargetLabel(&label_buf, binding.target);
         const this_key_w = runtime.paletteUiTextPrefixWidth(key, font_size, key.len);
         // Right-align keys inside the key column so labels start on one edge.
-        queuePaletteText(state, .{ .x = x + key_w - this_key_w, .y = y, .w = this_key_w, .h = font_size * 1.25 }, key, paletteColor(theme.accent()), font_size, rect);
-        queuePaletteText(state, .{ .x = x + key_w + key_gap, .y = y, .w = label_w, .h = font_size * 1.25 }, label, paletteColor(theme.current_colors.text), font_size, rect);
+        queuePrefixText(state, .{ .x = x + key_w - this_key_w, .y = text_y, .w = this_key_w, .h = text_h }, key, paletteColor(theme.accent()), font_size, rect);
+        queuePrefixText(state, .{ .x = x + key_w + key_gap, .y = text_y, .w = label_w, .h = text_h }, label, paletteColor(if (selected) theme.COLOR_WHITE else theme.current_colors.text), font_size, rect);
     }
+}
+
+// Header search affordance: a `/ search` hint, or the live query with a caret
+// once `/` has been pressed.
+fn renderPrefixWhichKeySearch(state: *runtime.AppState, area: palette.Rect, query: []const u8, font_size: f32, clip: palette.Rect) void {
+    const text_h = font_size * 1.25;
+    const pad_x = theme.scaledUi(8.0);
+    const text_y = area.y + (area.h - text_h) * 0.5;
+    if (!state.prefix_help_search_active) {
+        var x = area.x;
+        const hints = [_][2][]const u8{
+            .{ "/", "search" },
+            .{ "arrows", "select" },
+            .{ "enter", "run" },
+        };
+        for (hints) |hint| {
+            const key_w = runtime.paletteUiTextPrefixWidth(hint[0], font_size, hint[0].len);
+            const label_w = runtime.paletteUiTextPrefixWidth(hint[1], font_size, hint[1].len);
+            if (x + key_w + label_w > area.x + area.w) break;
+            queuePrefixText(state, .{ .x = x, .y = text_y, .w = key_w, .h = text_h }, hint[0], paletteColor(theme.accent()), font_size, clip);
+            x += key_w + theme.scaledUi(5.0);
+            queuePrefixText(state, .{ .x = x, .y = text_y, .w = label_w, .h = text_h }, hint[1], paletteColor(theme.current_colors.text_subtle), font_size, clip);
+            x += label_w + theme.scaledUi(14.0);
+        }
+        return;
+    }
+
+    const field_w = @min(area.w, theme.scaledUi(260.0));
+    if (field_w <= pad_x * 2.0) return;
+    const field = snapRect(.{ .x = area.x, .y = area.y, .w = field_w, .h = area.h });
+    queuePaletteRoundedRect(state, field, paletteColor(theme.sink(theme.COLOR_PANEL_ALT, 0.06)), theme.scaledUi(5.0));
+    queuePaletteBorder(state, field, paletteColor(theme.accent()), theme.scaledUi(5.0), theme.scaledUi(1.0));
+    const slash_w = runtime.paletteUiTextPrefixWidth("/", font_size, 1);
+    queuePrefixText(state, .{ .x = field.x + pad_x, .y = text_y, .w = slash_w, .h = text_h }, "/", paletteColor(theme.accent()), font_size, field);
+    const text_x = field.x + pad_x + slash_w + theme.scaledUi(5.0);
+    const text_max_w = field.x + field.w - pad_x - text_x;
+    const query_w = runtime.paletteUiTextPrefixWidth(query, font_size, query.len);
+    if (query.len == 0) {
+        queuePrefixText(state, .{ .x = text_x, .y = text_y, .w = text_max_w, .h = text_h }, "filter keybinds", paletteColor(theme.current_colors.text_subtle), font_size, field);
+    } else {
+        queuePrefixText(state, .{ .x = text_x, .y = text_y, .w = text_max_w, .h = text_h }, query, paletteColor(theme.COLOR_WHITE), font_size, field);
+    }
+    const caret_x = @min(text_x + query_w, field.x + field.w - pad_x);
+    queuePaletteRoundedRect(state, snapRect(.{ .x = caret_x, .y = text_y + theme.scaledUi(1.0), .w = @max(theme.scaledUi(1.0), 1.0), .h = text_h - theme.scaledUi(2.0) }), paletteColor(theme.accent()), 0.0);
+}
+
+/// Upper bound on cheat-sheet rows considered for filtering and selection.
+const PREFIX_HELP_MAX_ROWS = 256;
+/// Grid geometry from the last rendered cheat sheet, read by arrow-key
+/// navigation so Left/Right jump whole columns and selection never lands on a
+/// truncated row.
+var prefix_help_rows: usize = 1;
+var prefix_help_shown: usize = 0;
+
+/// The table the cheat sheet is showing, or null when no config is loaded.
+fn prefixHelpBindings(state: *const runtime.AppState) ?[]const keybinds.PrefixBinding {
+    const config = state.command_controller.keyboard_config orelse return null;
+    const navigate = state.prefix_navigate and !state.prefix_armed;
+    return if (navigate) config.prefix.navigate.items else config.prefix.bindings.items;
+}
+
+/// Case-insensitive match of the `/` filter against a row's label or key.
+fn prefixHelpMatches(binding: keybinds.PrefixBinding, query: []const u8) bool {
+    if (query.len == 0) return true;
+    var key_buf: [32]u8 = undefined;
+    var label_buf: [96]u8 = undefined;
+    const label = keybinds.prefixTargetLabel(&label_buf, binding.target);
+    if (std.ascii.indexOfIgnoreCase(label, query) != null) return true;
+    const key = keybinds.formatKeybind(&key_buf, binding.key);
+    return std.ascii.indexOfIgnoreCase(key, query) != null;
+}
+
+/// Writes the indexes of rows matching `query` into `out`, in table order.
+fn prefixHelpMatchIndexes(bindings: []const keybinds.PrefixBinding, query: []const u8, out: *[PREFIX_HELP_MAX_ROWS]usize) usize {
+    var count: usize = 0;
+    for (bindings, 0..) |binding, index| {
+        if (count >= out.len) break;
+        if (!prefixHelpMatches(binding, query)) continue;
+        out[count] = index;
+        count += 1;
+    }
+    return count;
+}
+
+/// Moves the cheat-sheet selection. `rows` steps jump a whole column, since
+/// the grid fills column-major.
+pub fn movePrefixHelpSelection(state: *runtime.AppState, direction: enum { up, down, left, right }) void {
+    if (prefix_help_shown == 0) return;
+    const last = prefix_help_shown - 1;
+    const current = @min(state.prefix_help_selected, last);
+    state.prefix_help_selected = switch (direction) {
+        .up => if (current > 0) current - 1 else current,
+        .down => @min(current + 1, last),
+        .left => if (current >= prefix_help_rows) current - prefix_help_rows else current,
+        .right => if (current + prefix_help_rows <= last) current + prefix_help_rows else current,
+    };
+}
+
+/// The binding under the cheat-sheet selection after filtering, if any.
+pub fn selectedPrefixHelpTarget(state: *const runtime.AppState) ?keybinds.PrefixTarget {
+    const bindings = prefixHelpBindings(state) orelse return null;
+    var matches: [PREFIX_HELP_MAX_ROWS]usize = undefined;
+    const count = @min(prefixHelpMatchIndexes(bindings, state.prefixHelpQuery(), &matches), prefix_help_shown);
+    if (state.prefix_help_selected >= count) return null;
+    return bindings[matches[state.prefix_help_selected]].target;
+}
+
+test "prefix cheat-sheet filter matches labels and keys case-insensitively" {
+    const binding: keybinds.PrefixBinding = .{ .key = .{ .key = .t }, .target = .new_terminal };
+    var label_buf: [96]u8 = undefined;
+    const label = keybinds.prefixTargetLabel(&label_buf, binding.target);
+    try std.testing.expect(prefixHelpMatches(binding, ""));
+    try std.testing.expect(prefixHelpMatches(binding, label[0..@min(label.len, 3)]));
+    try std.testing.expect(!prefixHelpMatches(binding, "zzqx-no-such-keybind"));
 }
 
 pub fn isSidebarAnimating() bool {
@@ -2873,9 +3049,9 @@ fn providerReadinessStep(provider: runtime.Provider, readiness: runtime.Provider
     if (readiness == .checking) return "Checking the local CLI and account session...";
     return switch (provider) {
         .codex => if (readiness == .missing) "Install the Codex CLI, then run: codex login" else "Run codex login, then return here and check again.",
-        .opencode => if (readiness == .missing) "Install OpenCode, then run: opencode" else "Open opencode, connect a model provider, then check again.",
-        .claude => if (readiness == .missing) "Install Claude Code, then run: claude" else "Open claude, complete sign-in, then check again.",
-        .cursor => if (readiness == .missing) "Install the Cursor CLI, then run: agent login" else "Run agent login, then return here and check again.",
+        .opencode => if (readiness == .missing) "Install OpenCode, then run: opencode auth login" else "Run opencode auth login, then return here and check again.",
+        .claude => if (readiness == .missing) "Install Claude Code, then run: claude auth login" else "Run claude auth login, then return here and check again.",
+        .cursor => if (readiness == .missing) "Install the Cursor CLI, then run: cursor-agent login" else "Run cursor-agent login, then return here and check again.",
         .pi => if (readiness == .missing) "Install the pi CLI, then run: pi" else "Open pi, connect a model provider, then check again.",
         .fx => if (readiness == .missing) "Install the fx CLI (curl -fsSL https://fx.sh/setup.sh | bash), then run: fx login" else "Run fx login, then return here and check again.",
         .grok => if (readiness == .missing) "Install Grok Build (docs.x.ai/build), then run: grok login" else "Run grok login, then return here and check again.",

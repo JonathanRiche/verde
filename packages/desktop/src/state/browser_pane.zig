@@ -84,6 +84,16 @@ pub const BrowserPaneRef = struct {
     tabs: std.ArrayList(BrowserTabRef) = .empty,
     active_tab_index: usize = 0,
 
+    /// Adds a saved tab without touching the active document or its history.
+    /// The browser loads this URL when the user selects the new tab.
+    pub fn appendBackgroundTab(self: *BrowserPaneRef, allocator: std.mem.Allocator, url: []const u8) !usize {
+        var tab: BrowserTabRef = .{};
+        errdefer tab.deinit(allocator);
+        try tab.recordNavigation(allocator, url);
+        try self.tabs.append(allocator, tab);
+        return self.tabs.items.len - 1;
+    }
+
     pub fn deinit(self: *BrowserPaneRef, allocator: std.mem.Allocator) void {
         for (self.tabs.items) |*tab| tab.deinit(allocator);
         self.tabs.deinit(allocator);
@@ -161,4 +171,26 @@ test "browser pane tab clone and reorder preserve ownership and active state" {
     try std.testing.expect(pane.tabs.items[0].pinned);
     try std.testing.expectEqualStrings("One", pane.tabs.items[0].title.?);
     try std.testing.expectEqualStrings("https://one.example/", pane.tabs.items[0].history.items[0]);
+}
+
+test "background tab append preserves active page history and selection" {
+    const allocator = std.testing.allocator;
+    var pane: BrowserPaneRef = .{};
+    defer pane.deinit(allocator);
+    const current = try pane.ensureTab(allocator);
+    try current.recordNavigation(allocator, "https://planner.example/");
+    try current.setTitle(allocator, "Planner");
+    current.pinned = true;
+    const index = try pane.appendBackgroundTab(allocator, "http://localhost:7180/flow.html");
+    try std.testing.expectEqual(@as(usize, 1), index);
+    try std.testing.expectEqual(@as(usize, 0), pane.active_tab_index);
+    try std.testing.expectEqualStrings("https://planner.example/", pane.activeTab().?.url.?);
+    try std.testing.expectEqualStrings("Planner", pane.activeTab().?.title.?);
+    try std.testing.expect(pane.activeTab().?.pinned);
+    try std.testing.expectEqual(@as(usize, 1), pane.activeTab().?.history.items.len);
+    try std.testing.expectEqualStrings("http://localhost:7180/flow.html", pane.tabs.items[index].url.?);
+    try std.testing.expect(!pane.tabs.items[index].loading);
+    pane.active_tab_index = index;
+    _ = try pane.appendBackgroundTab(allocator, "about:blank");
+    try std.testing.expectEqual(index, pane.active_tab_index);
 }

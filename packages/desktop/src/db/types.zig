@@ -193,6 +193,8 @@ pub const PersistedMessage = struct {
     tool_call_id: ?[]const u8 = null,
     tool_call_kind: ?provider_types.ToolCallKind = null,
     tool_call_status: ?provider_types.ToolCallStatus = null,
+    /// Actual transcript update time; absent for legacy records.
+    updated_at_ms: ?i64 = null,
     /// Durable transcript identity (M4-P4). Daemon-minted (`turn:{id}:msg:{n}`)
     /// or client-minted (`gui-msg:...`) ids ride the snapshot verbatim so the
     /// GUI flush never re-mints identities positionally. Null on legacy rows

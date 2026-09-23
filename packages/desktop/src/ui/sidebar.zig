@@ -5,6 +5,7 @@ const palette = @import("palette");
 const sdl = @import("zsdl3");
 const theme = @import("theme.zig");
 const colors = @import("colors.zig");
+const context_menu = @import("context_menu.zig");
 const globe_icon = @import("globe_icon.zig");
 const runtime = @import("runtime.zig");
 const command_palette = @import("command_palette.zig");
@@ -941,9 +942,8 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
 
     const pad = theme.scaledUi(6.0);
     const menu_w = theme.scaledUi(248.0);
-    const menu_pad = theme.scaledUi(8.0);
-    const menu_row_h = theme.scaledUi(34.0);
-    const font_size = theme.scaledUi(14.0);
+    const menu_pad = theme.scaledUi(context_menu.PAD_UI);
+    const menu_row_h = theme.scaledUi(context_menu.ROW_HEIGHT_UI);
 
     sidebar_menu_row_count = 0;
     switch (state.sidebar_context_menu_kind) {
@@ -1025,46 +1025,27 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
     menu_x = theme.clampf(menu_x, sidebar_rect.x + pad, sidebar_rect.x + sidebar_rect.w - menu_w - pad);
     menu_y = theme.clampf(menu_y, sidebar_rect.y + pad, sidebar_rect.y + sidebar_rect.h - menu_h - pad);
 
-    sidebar_menu_panel_rect = .{ .x = menu_x, .y = menu_y, .w = menu_w, .h = menu_h };
+    sidebar_menu_panel_rect = context_menu.queuePanel(state, .{ .x = menu_x, .y = menu_y, .w = menu_w, .h = menu_h });
     const clip = sidebar_menu_panel_rect;
-
-    queuePaletteRoundedRect(state, sidebar_menu_panel_rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(12.0));
-    queuePaletteBorder(state, sidebar_menu_panel_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(12.0), theme.scaledUi(1.0));
 
     const mx = state.transcript_controller.palette_mouse_x;
     const my = state.transcript_controller.palette_mouse_y;
     const mouse_ok = state.transcript_controller.palette_mouse_in_workspace;
 
-    var ry = menu_y + menu_pad;
+    var ry = sidebar_menu_panel_rect.y + menu_pad;
     var ri: usize = 0;
     while (ri < sidebar_menu_row_count) : (ri += 1) {
         const rr: palette.Rect = .{
-            .x = menu_x + theme.scaledUi(4.0),
+            .x = sidebar_menu_panel_rect.x + menu_pad,
             .y = ry,
-            .w = menu_w - theme.scaledUi(8.0),
+            .w = sidebar_menu_panel_rect.w - menu_pad * 2.0,
             .h = menu_row_h,
         };
         sidebar_menu_row_rects[ri] = rr;
 
         const row_hover = mouse_ok and sidebar_menu_row_enabled[ri] and rectContainsPoint(rr, mx, my);
-        if (row_hover) {
-            queuePaletteRoundedRect(state, rr, paletteColor(theme.raise(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(8.0));
-        }
-
-        const row_col = paletteColor(if (!sidebar_menu_row_enabled[ri])
-            theme.COLOR_TEXT_SUBTLE
-        else if (row_hover)
-            theme.COLOR_WHITE
-        else
-            theme.COLOR_TEXT_MUTED);
-
-        const label = sidebar_menu_row_labels[ri];
-        queuePaletteText(state, .{
-            .x = rr.x + theme.scaledUi(12.0),
-            .y = rr.y + (menu_row_h - font_size * 1.25) * 0.5,
-            .w = rr.w - theme.scaledUi(16.0),
-            .h = font_size * 1.25,
-        }, label, row_col, font_size, clip);
+        if (row_hover) context_menu.queueRowHighlight(state, rr);
+        context_menu.queueLabel(state, rr, sidebar_menu_row_labels[ri], context_menu.labelColor(sidebar_menu_row_enabled[ri], row_hover), 0.0, 0.0, clip);
 
         ry += menu_row_h;
     }
@@ -1180,7 +1161,7 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
             "";
         if (project_visible) {
             if (project_hovered and !selected) {
-                queuePaletteRoundedRect(state, snapRect(row_rect), paletteColor(theme.withAlpha(theme.COLOR_GREEN, 48)), theme.scaledUi(6.0));
+                queuePaletteRoundedRect(state, snapRect(row_rect), paletteColor(theme.wash(theme.COLOR_GREEN, 48)), theme.scaledUi(6.0));
             }
             addClippedPaletteHit(row_rect, workspace_clip, .workspace_row, project_index, 0);
         }
@@ -1392,7 +1373,7 @@ test "sidebar reveals a newly focused row past the viewport edge" {
 fn renderPaletteSearchTrigger(state: *runtime.AppState, rect: palette.Rect) void {
     const hovered = search_trigger_hovered;
     if (hovered) {
-        queuePaletteRoundedRect(state, snapRect(rect), paletteColor(theme.withAlpha(theme.COLOR_GREEN, 48)), theme.scaledUi(6.0));
+        queuePaletteRoundedRect(state, snapRect(rect), paletteColor(theme.wash(theme.COLOR_GREEN, 48)), theme.scaledUi(6.0));
     }
     addPaletteHit(rect, .command_palette, 0, 0);
 
@@ -1711,7 +1692,7 @@ fn renderHerdrRuntimeBadge(state: *runtime.AppState, rect: palette.Rect, label: 
     const bg = if (emphasized)
         theme.withAlpha(theme.COLOR_GREEN, 200)
     else
-        theme.withAlpha(theme.COLOR_GREEN, 56);
+        theme.wash(theme.COLOR_GREEN, 56);
     queuePaletteRoundedRect(state, rect, paletteColor(bg), theme.scaledUi(6.0));
     queuePaletteText(state, .{
         .x = rect.x + theme.scaledUi(6.0),
@@ -1771,7 +1752,7 @@ fn renderPaletteCollapsedSidebar(state: *runtime.AppState, rect: palette.Rect) v
         const bg = if (selected)
             paletteColor(theme.COLOR_GREEN)
         else if (hovered)
-            paletteColor(theme.withAlpha(theme.COLOR_GREEN, 56))
+            paletteColor(theme.wash(theme.COLOR_GREEN, 56))
         else
             paletteColor(theme.COLOR_PANEL_ALT);
         queuePaletteRoundedRect(state, avatar_rect, bg, theme.scaledUi(9.0));
@@ -1851,7 +1832,7 @@ fn renderPaletteCollapsedSidebar(state: *runtime.AppState, rect: palette.Rect) v
 fn renderPaletteSidebarToggle(state: *runtime.AppState, rect: palette.Rect, expanded: bool) void {
     const hovered = state.transcript_controller.palette_mouse_in_workspace and rectContainsPoint(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
     if (hovered) {
-        queuePaletteRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 56)), theme.scaledUi(8.0));
+        queuePaletteRoundedRect(state, rect, paletteColor(theme.wash(theme.COLOR_GREEN, 56)), theme.scaledUi(8.0));
     }
     const fg = if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
     const icon_font = theme.scaledUi(17.0);
@@ -1869,7 +1850,7 @@ fn renderPaletteSidebarToggle(state: *runtime.AppState, rect: palette.Rect, expa
 fn renderPaletteSidebarActionIcon(state: *runtime.AppState, rect: palette.Rect, glyph: []const u8, hover_override: ?bool, clip: ?palette.Rect) void {
     const hovered = hover_override orelse (state.transcript_controller.palette_mouse_in_workspace and rectContainsPoint(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y));
     if (hovered) {
-        queuePaletteRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 56)), theme.scaledUi(8.0));
+        queuePaletteRoundedRect(state, rect, paletteColor(theme.wash(theme.COLOR_GREEN, 56)), theme.scaledUi(8.0));
     }
     const fg = if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
     const icon_font = theme.scaledUi(17.0);
@@ -1885,7 +1866,7 @@ fn renderPaletteSidebarActionIcon(state: *runtime.AppState, rect: palette.Rect, 
 fn renderPaletteSettingsButton(state: *runtime.AppState, rect: palette.Rect, clip: ?palette.Rect) void {
     const settings_hover = state.transcript_controller.palette_mouse_in_workspace and rectContainsPoint(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
     if (settings_hover) {
-        queuePaletteRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 56)), theme.scaledUi(8.0));
+        queuePaletteRoundedRect(state, rect, paletteColor(theme.wash(theme.COLOR_GREEN, 56)), theme.scaledUi(8.0));
     }
     const fg = if (settings_hover) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
     const icon_font = theme.scaledUi(17.0);
@@ -2268,9 +2249,20 @@ fn renderOpenPaneRow(
     // Accent-tinted fills (not the gray border token) so focus/hover track
     // the active theme; alphas follow the command palette's selection washes.
     if (focused) {
-        queuePaletteRoundedRectClipped(state, rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 72)), theme.scaledUi(7.0), clip);
+        queuePaletteRoundedRectClipped(state, rect, paletteColor(theme.wash(theme.COLOR_GREEN, 72)), theme.scaledUi(7.0), clip);
+        // Light palettes soften the wash, so a solid accent bar marks the row.
+        if (theme.isLightPalette()) {
+            const bar_w = theme.scaledUi(3.0);
+            const bar_inset = theme.scaledUi(6.0);
+            queuePaletteRoundedRectClipped(state, snapRect(.{
+                .x = rect.x,
+                .y = rect.y + bar_inset,
+                .w = bar_w,
+                .h = @max(rect.h - bar_inset * 2.0, bar_w),
+            }), paletteColor(theme.accent()), bar_w * 0.5, clip);
+        }
     } else if (hovered) {
-        queuePaletteRoundedRectClipped(state, rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 48)), theme.scaledUi(7.0), clip);
+        queuePaletteRoundedRectClipped(state, rect, paletteColor(theme.wash(theme.COLOR_GREEN, 48)), theme.scaledUi(7.0), clip);
     }
     addClippedPaletteHit(rect, clip, if (show_workspace_tag) .open_pane else .open_pane_reorder, project_index, pane.id);
 

@@ -23,6 +23,7 @@ pub const runtimeRecoveryLabel = native_state.runtimeRecoveryLabel;
 pub const runtimeStatusOffersServerSetup = native_state.runtimeStatusOffersServerSetup;
 pub const runtimeStatusTone = native_state.runtimeStatusTone;
 pub const ProviderReadiness = native_state.ProviderReadiness;
+pub const ProviderRelease = native_state.ProviderRelease;
 pub const SurfaceProvider = native_state.SurfaceProvider;
 pub const SurfaceStatus = native_state.SurfaceStatus;
 pub const WorkspaceNode = native_state.WorkspaceNode;

@@ -7,8 +7,10 @@ const daemon_client = @import("../daemon/client.zig");
 const loop_wakeup = @import("loop_wakeup");
 const utils = @import("../utils.zig");
 const chat_types = @import("chat_types.zig");
+const provider_cli_version = @import("../providers/cli_version.zig");
 const provider_models = @import("provider_models.zig");
 const state_sync = @import("sync.zig");
+const runtime_log = @import("../runtime/log.zig");
 
 const log = std.log.scoped(.native_shell);
 const provider_types = headless.provider_types;
@@ -115,6 +117,48 @@ pub const ProviderReadiness = enum {
     unavailable,
 };
 
+/// Result of comparing the installed CLI with the provider's published release.
+/// `unknown` means the check did not run or the versions could not be ordered.
+pub const ProviderRelease = enum {
+    unknown,
+    current,
+    available,
+};
+
+pub const HARNESS_VERSION_BYTES = 48;
+const UPDATE_SHELL_BYTES = 192;
+
+/// First line of a provider CLI's `--version`, copied out of the daemon response.
+pub const ProviderHarnessVersion = struct {
+    bytes: [HARNESS_VERSION_BYTES]u8 = .{0} ** HARNESS_VERSION_BYTES,
+    len: u8 = 0,
+
+    pub fn slice(self: *const ProviderHarnessVersion) []const u8 {
+        return self.bytes[0..self.len];
+    }
+
+    pub fn set(self: *ProviderHarnessVersion, text: []const u8) void {
+        const n = @min(text.len, self.bytes.len);
+        @memcpy(self.bytes[0..n], text[0..n]);
+        self.len = @intCast(n);
+    }
+};
+
+const ProviderUpdateShell = struct {
+    bytes: [UPDATE_SHELL_BYTES]u8 = .{0} ** UPDATE_SHELL_BYTES,
+    len: u8 = 0,
+
+    pub fn slice(self: *const ProviderUpdateShell) []const u8 {
+        return self.bytes[0..self.len];
+    }
+
+    pub fn set(self: *ProviderUpdateShell, text: []const u8) void {
+        const n = @min(text.len, self.bytes.len);
+        @memcpy(self.bytes[0..n], text[0..n]);
+        self.len = @intCast(n);
+    }
+};
+
 pub const ProviderReadinessSnapshot = struct {
     codex: ProviderReadiness = .checking,
     opencode: ProviderReadiness = .checking,
@@ -124,6 +168,15 @@ pub const ProviderReadinessSnapshot = struct {
     fx: ProviderReadiness = .checking,
     grok: ProviderReadiness = .checking,
     muse: ProviderReadiness = .checking,
+    /// Indexed by `Provider`'s enum value. Empty when the daemon reported no version.
+    versions: [8]ProviderHarnessVersion = @splat(.{}),
+    /// Indexed by `Provider`'s enum value. `available` is the only state that offers Update.
+    releases: [8]ProviderRelease = @splat(.unknown),
+    /// Indexed by `Provider`'s enum value. True when the PATH binary is owned by
+    /// mise, Homebrew, or npm, so Update must not run the official installer.
+    package_managed: [8]bool = @splat(false),
+    /// Indexed by `Provider`'s enum value. Empty uses the official installer.
+    update_shells: [8]ProviderUpdateShell = @splat(.{}),
 
     pub fn forProvider(self: ProviderReadinessSnapshot, provider: Provider) ProviderReadiness {
         return switch (provider) {
@@ -136,6 +189,22 @@ pub const ProviderReadinessSnapshot = struct {
             .grok => self.grok,
             .muse => self.muse,
         };
+    }
+
+    pub fn versionForProvider(self: *const ProviderReadinessSnapshot, provider: Provider) []const u8 {
+        return self.versions[@intFromEnum(provider)].slice();
+    }
+
+    pub fn releaseForProvider(self: *const ProviderReadinessSnapshot, provider: Provider) ProviderRelease {
+        return self.releases[@intFromEnum(provider)];
+    }
+
+    pub fn packageManagedForProvider(self: *const ProviderReadinessSnapshot, provider: Provider) bool {
+        return self.package_managed[@intFromEnum(provider)];
+    }
+
+    pub fn updateShellForProvider(self: *const ProviderReadinessSnapshot, provider: Provider) []const u8 {
+        return self.update_shells[@intFromEnum(provider)].slice();
     }
 
     pub fn hasReadyProvider(self: ProviderReadinessSnapshot) bool {
@@ -154,6 +223,10 @@ pub const ProviderReadinessState = struct {
     status: ProviderReadinessStatus = .idle,
     snapshot: ProviderReadinessSnapshot = .{},
     worker: ?std.Thread = null,
+    /// Bumped on the worker after a provider row is published. The main thread
+    /// copies `seen_revision` and redraws; the worker never reads it.
+    revision: std.atomic.Value(u32) = .init(0),
+    seen_revision: u32 = 0,
 };
 
 pub const ProviderThreadOperationKind = enum {
@@ -317,6 +390,9 @@ fn runProviderThreadOperation(
             if (parsed.response.err) |remote_error| {
                 if (std.mem.eql(u8, remote_error.code, headless.protocol.ERR_CONFLICT)) return error.ThreadChangedDuringSync;
                 if (std.mem.eql(u8, remote_error.message, "ProviderHistoryWouldDropAttachments")) return error.ProviderHistoryWouldDropAttachments;
+                // The sidebar notice only says "failed"; keep the daemon's
+                // reason in the pref-dir log.
+                runtime_log.diagnostic("provider thread sync rejected code={s} message={s}", .{ remote_error.code, remote_error.message });
                 return error.RemoteError;
             }
             if (parsed.response.result == null) return error.InvalidDaemonResponse;
@@ -428,56 +504,192 @@ const ProviderReadinessWorkerRequest = struct {
     }
 };
 
+const FetchedProvider = struct {
+    readiness: ProviderReadiness,
+    version: ProviderHarnessVersion = .{},
+    release: ProviderRelease = .unknown,
+    package_managed: bool = false,
+    update_shell: ProviderUpdateShell = .{},
+};
+
+fn releaseForInstalledVersion(provider_name: []const u8, installed: []const u8, plan: *const provider_cli_version.UpdatePlan) ProviderRelease {
+    if (installed.len == 0) return .unknown;
+    var latest_buf: [HARNESS_VERSION_BYTES]u8 = undefined;
+    const latest = provider_cli_version.fetchPlanLatest(std.heap.page_allocator, provider_name, plan, &latest_buf) orelse return .unknown;
+    const order = provider_cli_version.compareInstalled(installed, latest) orelse return .unknown;
+    return if (order == .lt) .available else .current;
+}
+
 fn fetchProviderReadiness(
     client: anytype,
     provider: Provider,
     project_path: []const u8,
-) ProviderReadiness {
+) FetchedProvider {
     var parsed = client.callProviderAuthStatus(headless.Capabilities.phase1(), .{
         .provider = providerProtocolTag(provider),
         .project_path = project_path,
     }) catch |err| {
         log.warn("failed to request {s} readiness from daemon: {s}", .{ providerDisplayName(provider), @errorName(err) });
-        return .unavailable;
+        return .{ .readiness = .unavailable };
     };
     defer parsed.deinit();
     const result = client.decodeProviderAuthStatus(&parsed) catch |err| {
         log.warn("failed to decode {s} readiness from daemon: {s}", .{ providerDisplayName(provider), @errorName(err) });
-        return .unavailable;
+        return .{ .readiness = .unavailable };
     };
-    if (result.provider != providerProtocolTag(provider)) return .unavailable;
-    if (!result.installed) return .missing;
-    if (result.ready) return .ready;
-    return switch (result.auth_state) {
+    defer if (result.version) |text| client.allocator.free(text);
+    if (result.provider != providerProtocolTag(provider)) return .{ .readiness = .unavailable };
+    var fetched: FetchedProvider = .{ .readiness = .unavailable };
+    if (result.version) |text| fetched.version.set(text);
+    if (!result.installed) {
+        fetched.readiness = .missing;
+        return fetched;
+    }
+    if (result.ready) {
+        fetched.readiness = .ready;
+        return fetched;
+    }
+    fetched.readiness = switch (result.auth_state) {
         .signed_out => .signed_out,
         .signed_in => .ready,
         .unknown, .pending => .unavailable,
     };
+    return fetched;
+}
+
+const ReadinessJob = struct {
+    state: *ProviderReadinessState,
+    provider: Provider,
+    pref_path: []const u8,
+    project_path: []const u8,
+};
+
+fn publishProviderReadiness(state: *ProviderReadinessState, provider: Provider, fetched: FetchedProvider) void {
+    state.mutex.lock();
+    switch (provider) {
+        .codex => state.snapshot.codex = fetched.readiness,
+        .opencode => state.snapshot.opencode = fetched.readiness,
+        .claude => state.snapshot.claude = fetched.readiness,
+        .cursor => state.snapshot.cursor = fetched.readiness,
+        .pi => state.snapshot.pi = fetched.readiness,
+        .fx => state.snapshot.fx = fetched.readiness,
+        .grok => state.snapshot.grok = fetched.readiness,
+        .muse => state.snapshot.muse = fetched.readiness,
+    }
+    const index = @intFromEnum(provider);
+    state.snapshot.versions[index] = fetched.version;
+    state.snapshot.releases[index] = fetched.release;
+    state.snapshot.package_managed[index] = fetched.package_managed;
+    state.snapshot.update_shells[index] = fetched.update_shell;
+    state.mutex.unlock();
+    _ = state.revision.fetchAdd(1, .release);
+    loop_wakeup.notify();
+}
+
+fn publishVersionWhileChecking(state: *ProviderReadinessState, provider: Provider, version: ProviderHarnessVersion) void {
+    state.mutex.lock();
+    const checking = state.snapshot.forProvider(provider) == .checking;
+    if (checking) state.snapshot.versions[@intFromEnum(provider)] = version;
+    state.mutex.unlock();
+    if (!checking) return;
+    _ = state.revision.fetchAdd(1, .release);
+    loop_wakeup.notify();
+}
+
+fn computeProviderRelease(
+    state: *ProviderReadinessState,
+    provider: Provider,
+    version: ProviderHarnessVersion,
+    plan: provider_cli_version.UpdatePlan,
+    out: *ProviderRelease,
+) void {
+    const release = releaseForInstalledVersion(@tagName(provider), version.slice(), &plan);
+    out.* = release;
+    if (release == .unknown) return;
+    var shell: ProviderUpdateShell = .{};
+    shell.set(plan.shellSlice());
+    state.mutex.lock();
+    const index = @intFromEnum(provider);
+    state.snapshot.releases[index] = release;
+    state.snapshot.package_managed[index] = plan.managed;
+    state.snapshot.update_shells[index] = shell;
+    if (state.snapshot.versions[index].slice().len == 0) state.snapshot.versions[index] = version;
+    state.mutex.unlock();
+    _ = state.revision.fetchAdd(1, .release);
+    loop_wakeup.notify();
+}
+
+fn runProviderReadinessJob(job: ReadinessJob) void {
+    var local_version: ProviderHarnessVersion = .{};
+    var plan: provider_cli_version.UpdatePlan = .{};
+    if (provider_cli_version.executableForProvider(@tagName(job.provider))) |executable| {
+        var buf: [HARNESS_VERSION_BYTES]u8 = undefined;
+        if (provider_cli_version.probe(std.heap.page_allocator, executable, &buf)) |line| {
+            local_version.set(line);
+        }
+        provider_cli_version.planUpdate(std.heap.page_allocator, executable, &plan);
+    }
+    if (local_version.slice().len > 0) publishVersionWhileChecking(job.state, job.provider, local_version);
+
+    // Latest-channel lookup overlaps the daemon auth handshake. Both are
+    // network or process waits; running them one after another is most of
+    // the multi-second Providers page delay.
+    var release: ProviderRelease = .unknown;
+    const release_thread: ?std.Thread = if (local_version.slice().len == 0) null else std.Thread.spawn(.{}, computeProviderRelease, .{
+        job.state,
+        job.provider,
+        local_version,
+        plan,
+        &release,
+    }) catch null;
+    if (release_thread == null and local_version.slice().len > 0) {
+        computeProviderRelease(job.state, job.provider, local_version, plan, &release);
+    }
+
+    const allocator = std.heap.page_allocator;
+    var transport: daemon_client.HeadlessTransport = .{
+        .allocator = allocator,
+        .pref_path = job.pref_path,
+    };
+    var client = daemon_client.headlessClient(allocator, &transport);
+    var fetched = fetchProviderReadiness(&client, job.provider, job.project_path);
+    if (release_thread) |thread| thread.join();
+
+    // The local probe is the binary this process would run. A daemon that
+    // searched PATH earlier can still report a different copy.
+    if (fetched.readiness != .missing and local_version.slice().len > 0) fetched.version = local_version;
+    if (fetched.readiness != .missing and fetched.version.slice().len > 0) {
+        if (local_version.slice().len == 0) {
+            release = releaseForInstalledVersion(@tagName(job.provider), fetched.version.slice(), &plan);
+        }
+        fetched.package_managed = plan.managed;
+        fetched.update_shell.set(plan.shellSlice());
+        fetched.release = release;
+    }
+    publishProviderReadiness(job.state, job.provider, fetched);
 }
 
 pub fn providerReadinessWorker(state: *ProviderReadinessState, request: ProviderReadinessWorkerRequest) void {
     defer request.deinit();
-    const allocator = std.heap.page_allocator;
-    var transport: daemon_client.HeadlessTransport = .{
-        .allocator = allocator,
-        .pref_path = request.pref_path,
-    };
-    var client = daemon_client.headlessClient(allocator, &transport);
-    const snapshot: ProviderReadinessSnapshot = .{
-        .codex = fetchProviderReadiness(&client, .codex, request.project_path),
-        .opencode = fetchProviderReadiness(&client, .opencode, request.project_path),
-        .claude = fetchProviderReadiness(&client, .claude, request.project_path),
-        .cursor = fetchProviderReadiness(&client, .cursor, request.project_path),
-        .pi = fetchProviderReadiness(&client, .pi, request.project_path),
-        .fx = fetchProviderReadiness(&client, .fx, request.project_path),
-        .grok = fetchProviderReadiness(&client, .grok, request.project_path),
-        .muse = fetchProviderReadiness(&client, .muse, request.project_path),
-    };
+    const providers = [_]Provider{ .codex, .opencode, .claude, .cursor, .pi, .fx, .grok, .muse };
+    var threads: [providers.len]?std.Thread = @splat(null);
+    for (providers, 0..) |provider, index| {
+        const job: ReadinessJob = .{
+            .state = state,
+            .provider = provider,
+            .pref_path = request.pref_path,
+            .project_path = request.project_path,
+        };
+        threads[index] = std.Thread.spawn(.{}, runProviderReadinessJob, .{job}) catch null;
+        if (threads[index] == null) runProviderReadinessJob(job);
+    }
+    for (threads) |maybe_thread| if (maybe_thread) |thread| thread.join();
 
     state.mutex.lock();
-    defer state.mutex.unlock();
-    state.snapshot = snapshot;
     state.status = .completed;
+    state.mutex.unlock();
+    _ = state.revision.fetchAdd(1, .release);
+    loop_wakeup.notify();
 }
 
 pub fn opencodeModelCacheWorker(state: *OpencodeModelCacheState, request: ModelCacheWorkerRequest) void {
@@ -611,7 +823,9 @@ pub fn startProviderReadinessCheck(self: anytype) void {
     };
 
     self.provider_controller.readiness.status = .pending;
-    self.provider_controller.readiness.snapshot = .{};
+    // Keep the last versions and Update/Latest labels visible. The worker
+    // replaces each row as that provider finishes instead of blanking all
+    // eight until the slowest lookup returns.
     self.provider_controller.readiness.worker = std.Thread.spawn(.{}, providerReadinessWorker, .{
         &self.provider_controller.readiness,
         request,
@@ -671,6 +885,11 @@ pub fn completeMcpOnboarding(self: anytype, enable: bool) void {
 pub fn pollProviderReadiness(self: anytype) void {
     self.pollProviderThreadOperation();
     self.pollProviderSlashCatalog();
+    const revision = self.provider_controller.readiness.revision.load(.acquire);
+    if (revision != self.provider_controller.readiness.seen_revision) {
+        self.provider_controller.readiness.seen_revision = revision;
+        self.markDirty();
+    }
     var completed = false;
     var snapshot: ProviderReadinessSnapshot = .{};
 
@@ -999,7 +1218,7 @@ pub fn populateCursorModelOptions(self: anytype, models: []const provider_types.
     for (models) |model| {
         if (model.model_id.len == 0) continue;
         const label_text = if (model.model_name.len > 0) model.model_name else model.model_id;
-        const label = try self.allocator.dupeZ(u8, label_text);
+        const label = try self.allocator.dupeZ(u8, provider_models.cursorModelLabel(model.model_id, label_text));
         errdefer self.allocator.free(label);
         const value = try self.allocator.dupeZ(u8, model.model_id);
         errdefer self.allocator.free(value);
@@ -1532,7 +1751,7 @@ pub fn loadCursorModelOptionsDiskCache(self: anytype) !void {
     errdefer self.clearCursorModelOptions();
     for (parsed.value) |option| {
         if (option.label.len == 0 or option.value.len == 0) continue;
-        const label = try self.allocator.dupeZ(u8, option.label);
+        const label = try self.allocator.dupeZ(u8, provider_models.cursorModelLabel(option.value, option.label));
         errdefer self.allocator.free(label);
         const value = try self.allocator.dupeZ(u8, option.value);
         errdefer self.allocator.free(value);

@@ -119,14 +119,22 @@ fn projectionStaleAt(
     return now_ms - basis > CHANGE_CURSOR_STALE_AFTER_MS;
 }
 
+/// Dirty state normally waits for its own flush to land (or conflict into a
+/// rebase) before a remote refresh applies. Spooled dirty state gets no such
+/// flush: a snapshot too large for the daemon transport is parked on disk and
+/// no retry is scheduled until the next local edit. Waiting on it deferred
+/// every refresh until restart, so web/MCP/CLI turns never reached the GUI.
+/// The spool keeps those edits durable, and the apply path merges them over
+/// the revision-paired baseline like any other dirty refresh.
 fn projectionRefreshApplyGate(
     dirty: bool,
+    dirty_spooled: bool,
     flush_in_flight: bool,
     has_rebase: bool,
     adoption_repair: bool,
     baseline_repair: bool,
 ) bool {
-    return !flush_in_flight and (!dirty or has_rebase or adoption_repair or baseline_repair);
+    return !flush_in_flight and (!dirty or dirty_spooled or has_rebase or adoption_repair or baseline_repair);
 }
 
 /// Coalesced main-loop refresh signals derived from change-journal entries.
@@ -1252,6 +1260,7 @@ fn cloneProjectionMessage(allocator: std.mem.Allocator, source: ChatMessage) !Ch
         .tool_call_status = source.tool_call_status,
         .message_id = message_id,
         .transcript_card_started_ms = source.transcript_card_started_ms,
+        .updated_at_ms = source.updated_at_ms,
     };
 }
 
@@ -4160,6 +4169,12 @@ const TranscriptHeightEntry = chat_types.TranscriptHeightEntry;
 /// DB connection, and the frame loop commits it — atomically, into the
 /// workspace/thread the request identified (which may be an unfocused pane's
 /// thread, not the current selection).
+/// Consecutive daemon page-load failures after which pollTranscriptHydration
+/// stops scheduling retry renders. Past that point the daemon is not
+/// answering, and every retry would spawn another worker + RPC while the pane
+/// stays blank; the notice points at Sync thread instead.
+const TRANSCRIPT_HYDRATION_FAILURE_NOTICE_AFTER: u32 = 3;
+
 const TranscriptHydration = struct {
     /// Selection generation stamped into every request; bumped on real
     /// (user-driven) project/thread selection changes so a slow load for a
@@ -4170,6 +4185,11 @@ const TranscriptHydration = struct {
     in_flight: bool = false,
     worker: ?std.Thread = null,
     args: ?*TranscriptHydrationArgs = null,
+    /// Consecutive page-load failures (daemon RPC error or empty page).
+    /// Reset on every committed page and every selection change; while below
+    /// the notice threshold a failure schedules a retry render so the render
+    /// path re-requests the page.
+    consecutive_failures: u32 = 0,
 };
 
 const TranscriptHydrationArgs = struct {
@@ -4251,6 +4271,7 @@ const CursorModelCacheState = provider_controller.CursorModelCacheState;
 const ClaudeModelCacheStatus = provider_controller.ClaudeModelCacheStatus;
 const ClaudeModelCacheState = provider_controller.ClaudeModelCacheState;
 pub const ProviderReadiness = provider_controller.ProviderReadiness;
+pub const ProviderRelease = provider_controller.ProviderRelease;
 pub const ProviderReadinessSnapshot = provider_controller.ProviderReadinessSnapshot;
 const ProviderReadinessStatus = provider_controller.ProviderReadinessStatus;
 const ProviderReadinessState = provider_controller.ProviderReadinessState;
@@ -4572,6 +4593,14 @@ pub const AppState = struct {
     /// The key that completed a prefix chord still emits an SDL text_input;
     /// drop that one event so the letter does not leak into a terminal or composer.
     prefix_swallow_text_input: bool,
+    /// `/` inside the cheat sheet: typed text filters the table instead of
+    /// firing chords until Esc.
+    prefix_help_search_active: bool,
+    /// Cheat-sheet filter typed after `/` (see `prefixHelpQuery`).
+    prefix_help_query_buf: [64]u8,
+    prefix_help_query_len: usize,
+    /// Arrow-key selection among the filtered cheat-sheet rows; Enter runs it.
+    prefix_help_selected: usize,
     composer_controller: ComposerControllerState,
     companion_controller: companion_controller,
     /// Daemon-linked child chats shown in the parent pane drawer.
@@ -4647,6 +4676,10 @@ pub const AppState = struct {
     muse_logo_texture: ?CachedImageTexture,
     thread_edit_texture: ?CachedImageTexture,
     cursor_logo_texture: ?CachedImageTexture,
+    /// Editor logos are monochrome masks (see `loadEmbeddedEditorMaskTexture`)
+    /// so the Open menu never borrows AI-provider brand colour; Cursor keeps a
+    /// separate mask because its provider logo stays in colour.
+    cursor_editor_logo_texture: ?CachedImageTexture,
     emacs_logo_texture: ?CachedImageTexture,
     neovim_logo_texture: ?CachedImageTexture,
     vscode_logo_texture: ?CachedImageTexture,
@@ -4804,6 +4837,10 @@ pub const AppState = struct {
             .prefix_help_visible = false,
             .prefix_navigate = false,
             .prefix_swallow_text_input = false,
+            .prefix_help_search_active = false,
+            .prefix_help_query_buf = undefined,
+            .prefix_help_query_len = 0,
+            .prefix_help_selected = 0,
             .composer_controller = ComposerControllerState.init(),
             .companion_controller = companion_controller.init(),
             .linked_chats = linked_chats_controller.init(),
@@ -4859,6 +4896,7 @@ pub const AppState = struct {
             .muse_logo_texture = null,
             .thread_edit_texture = null,
             .cursor_logo_texture = null,
+            .cursor_editor_logo_texture = null,
             .emacs_logo_texture = null,
             .neovim_logo_texture = null,
             .vscode_logo_texture = null,
@@ -4999,10 +5037,11 @@ pub const AppState = struct {
             state.muse_logo_texture = state.loadEmbeddedTexture(MUSE_LOGO_BYTES);
             state.thread_edit_texture = state.loadEmbeddedTexture(THREAD_EDIT_BYTES);
             state.cursor_logo_texture = state.loadEmbeddedTexture(CURSOR_LOGO_BYTES);
-            state.emacs_logo_texture = state.loadEmbeddedTexture(EMACS_LOGO_BYTES);
-            state.neovim_logo_texture = state.loadEmbeddedTexture(NEOVIM_LOGO_BYTES);
-            state.vscode_logo_texture = state.loadEmbeddedTexture(VSCODE_LOGO_BYTES);
-            state.zed_logo_texture = state.loadEmbeddedTexture(ZED_LOGO_BYTES);
+            state.cursor_editor_logo_texture = state.loadEmbeddedEditorMaskTexture(CURSOR_LOGO_BYTES);
+            state.emacs_logo_texture = state.loadEmbeddedEditorMaskTexture(EMACS_LOGO_BYTES);
+            state.neovim_logo_texture = state.loadEmbeddedEditorMaskTexture(NEOVIM_LOGO_BYTES);
+            state.vscode_logo_texture = state.loadEmbeddedEditorMaskTexture(VSCODE_LOGO_BYTES);
+            state.zed_logo_texture = state.loadEmbeddedEditorMaskTexture(ZED_LOGO_BYTES);
         }
         if (state.app_config.mcp_integration_enabled) {
             state.settings_controller.mcp_summary = refreshProviderMcpRegistrations(state.allocator, state.storage.pref_path) catch |err| blk: {
@@ -5762,12 +5801,64 @@ pub const AppState = struct {
         }
     }
 
+    /// Cheat-sheet filter text typed after `/`.
+    pub fn prefixHelpQuery(self: *const AppState) []const u8 {
+        return self.prefix_help_query_buf[0..self.prefix_help_query_len];
+    }
+
+    /// Clears the cheat sheet's search and selection.
+    pub fn resetPrefixHelpInteraction(self: *AppState) void {
+        self.prefix_help_search_active = false;
+        self.prefix_help_query_len = 0;
+        self.prefix_help_selected = 0;
+    }
+
+    /// Appends one text_input event to the cheat-sheet filter, dropping
+    /// control characters. Input that would overflow the buffer is ignored
+    /// whole so a multi-byte codepoint is never split.
+    pub fn appendPrefixHelpQuery(self: *AppState, text: []const u8) void {
+        if (self.prefix_help_query_len + text.len > self.prefix_help_query_buf.len) return;
+        for (text) |byte| {
+            if (byte < 0x20 or byte == 0x7f) continue;
+            self.prefix_help_query_buf[self.prefix_help_query_len] = byte;
+            self.prefix_help_query_len += 1;
+        }
+        self.prefix_help_selected = 0;
+    }
+
+    /// Removes the last UTF-8 codepoint from the cheat-sheet filter. Returns
+    /// false when it was already empty.
+    pub fn popPrefixHelpQuery(self: *AppState) bool {
+        if (self.prefix_help_query_len == 0) return false;
+        var len = self.prefix_help_query_len - 1;
+        while (len > 0 and (self.prefix_help_query_buf[len] & 0xc0) == 0x80) len -= 1;
+        self.prefix_help_query_len = len;
+        self.prefix_help_selected = 0;
+        return true;
+    }
+
     fn loadEmbeddedTexture(self: *AppState, bytes: []const u8) ?CachedImageTexture {
         const loaded = stb_image.loadFromMemory(bytes) catch |err| {
             log.err("failed to decode embedded texture: {s}", .{@errorName(err)});
             return null;
         };
         defer loaded.deinit();
+        return self.uploadLoadedTexture(loaded);
+    }
+
+    /// Decodes an editor logo into a white coverage mask that callers tint
+    /// with the surrounding icon colour. Coverage is alpha × luminance,
+    /// normalised to the logo's brightest opaque pixel, so glyph detail that
+    /// only differs by colour (Zed's Z on its dark tile, Emacs' E on purple)
+    /// survives instead of collapsing into a flat silhouette.
+    fn loadEmbeddedEditorMaskTexture(self: *AppState, bytes: []const u8) ?CachedImageTexture {
+        const loaded = stb_image.loadFromMemory(bytes) catch |err| {
+            log.err("failed to decode embedded editor logo: {s}", .{@errorName(err)});
+            return null;
+        };
+        defer loaded.deinit();
+        const pixel_count: usize = @as(usize, @intCast(loaded.width)) * @as(usize, @intCast(loaded.height));
+        convertToLuminanceMask(loaded.pixels[0 .. pixel_count * 4]);
         return self.uploadLoadedTexture(loaded);
     }
 
@@ -6749,7 +6840,10 @@ pub const AppState = struct {
                     self.setThreadImportNotice(importThreadFailureMessage(request.provider, err)),
                 .import_thread => if (self.thread_import_provider == request.provider and self.thread_import_project_index == request.project_index)
                     self.setThreadImportNotice(readThreadFailureMessage(request.provider, err)),
-                .sync_thread => self.setSidebarNotice(syncThreadFailureMessage(request.provider, err)),
+                .sync_thread => {
+                    runtime_log.diagnostic("provider thread sync failed provider={s} err={s}", .{ @tagName(request.provider), @errorName(err) });
+                    self.setSidebarNotice(syncThreadFailureMessage(request.provider, err));
+                },
             }
             self.markDirty();
             return;
@@ -6899,6 +6993,13 @@ pub const AppState = struct {
                     self.setSidebarNotice("History synced in daemon; waiting for the view to reload.");
                     return;
                 };
+                // The daemon ships a bounded tail of the synced transcript;
+                // keep its durable offset so older rows hydrate on scroll
+                // instead of reading as the start of the thread.
+                if (thread_value.object.get("message_offset")) |offset_value| {
+                    if (offset_value == .integer and offset_value.integer > 0)
+                        thread.persisted_message_offset = @intCast(offset_value.integer);
+                }
                 thread.transcript_scroll_valid = false;
                 project.workspace_layout.resetChatTranscriptScrollForThread(thread_index);
                 if (self.currentThreadMutable() == thread) self.requestTranscriptScrollToBottom();
@@ -7213,6 +7314,17 @@ pub const AppState = struct {
         self.openStoredThread(item.workspace_id, item.local_thread_id);
     }
 
+    /// Resolves a durable chat id to its open thread and, when one is tiled in
+    /// the workspace (any tab), the pane that should be revealed. `pane_id` is
+    /// null when the thread is open but has no pane, so the caller splits one.
+    fn openChatPaneForLocalThread(project: *const Project, local_thread_id: []const u8) ?struct { thread_index: usize, pane_id: ?WorkspacePaneId } {
+        for (project.threads.items, 0..) |*thread, ti| {
+            if (!std.mem.eql(u8, thread.local_thread_id, local_thread_id)) continue;
+            return .{ .thread_index = ti, .pane_id = project.workspace_layout.visibleChatPaneIdForThread(ti) };
+        }
+        return null;
+    }
+
     // History entries and MCP links both refer to durable chats that may no
     // longer be present in the GUI projection. Reuse the same reopen path.
     fn openStoredThread(self: *AppState, workspace_id: []const u8, local_thread_id: []const u8) void {
@@ -7227,14 +7339,15 @@ pub const AppState = struct {
             self.setSidebarNotice("Reopen that chat's workspace first.");
             return;
         };
-        {
-            const project = &self.project_controller.projects.items[pi];
-            for (project.threads.items, 0..) |*thread, ti| {
-                if (std.mem.eql(u8, thread.local_thread_id, local_thread_id)) {
-                    self.openThreadInWorkspaceSplit(pi, ti);
-                    return;
-                }
+        // Repeated parent/child navigation must land on the chat that is
+        // already open instead of splitting another copy every click.
+        if (openChatPaneForLocalThread(&self.project_controller.projects.items[pi], local_thread_id)) |target| {
+            if (target.pane_id) |pane_id| {
+                self.focusWorkspaceOpenPaneFromSidebar(pi, pane_id);
+            } else {
+                self.openThreadInWorkspaceSplit(pi, target.thread_index);
             }
+            return;
         }
 
         var loaded = self.storage.loadThread(self.allocator, workspace_id, local_thread_id) catch |err| {
@@ -7400,7 +7513,8 @@ pub const AppState = struct {
     /// otherwise). Like Herdr, the new tab always lands at the end of the
     /// strip: only these entry points move the created pane past the focused
     /// one, so ordinary splits keep opening beside their origin. An empty
-    /// workspace seeds its first chat instead.
+    /// workspace seeds its first chat instead. The new space does not inherit
+    /// zoom; zoom stays on the space group that already had it.
     pub fn addWorkspaceTab(self: *AppState, index: usize, kind: ?app_config.WorkspaceSplitDefaultPane) void {
         self.addWorkspaceTabWithFocus(index, kind, true);
     }
@@ -7410,6 +7524,7 @@ pub const AppState = struct {
         if (index >= self.project_controller.projects.items.len) return;
         if (focus) self.project_controller.selected_index = index;
         const layout = &self.project_controller.projects.items[index].workspace_layout;
+        const previous_maximized_pane_id = layout.maximized_pane_id;
         const previous_revealed_pane_id = layout.scroll_revealed_pane_id;
         defer if (!focus) {
             layout.scroll_revealed_pane_id = previous_revealed_pane_id;
@@ -7446,6 +7561,18 @@ pub const AppState = struct {
         // Tab order is persisted pane order, independent of focus.
         const updated_layout = &self.project_controller.projects.items[index].workspace_layout;
         if (updated_layout.movePaneBefore(new_pane_id, updated_layout.panes.items.len)) self.markDirty();
+        // focusCreatedPane copies zoom onto the new pane. A fresh space group
+        // is not that pane's tile, so put the zoom back while the strip can
+        // show both spaces.
+        if (focus) {
+            if (previous_maximized_pane_id) |previous_zoom| {
+                if (updated_layout.restoreZoomToPreviousSpace(
+                    new_pane_id,
+                    previous_zoom,
+                    self.workspaceScrollingStripActive(updated_layout),
+                )) self.markDirty();
+            }
+        }
     }
 
     /// Activates a workspace tab (the `tab.select` IPC command), focusing the
@@ -7483,7 +7610,11 @@ pub const AppState = struct {
         const thread = &project.threads.items[thread_index];
         // A GUI choice carries its provider as well as its model into the next chat.
         // Configured defaults bootstrap chats until the user makes that choice.
-        const last_provider = self.app_config.last_chat_provider;
+        var last_provider = self.app_config.last_chat_provider;
+        if (last_provider) |last| {
+            if (!self.app_config.isProviderEnabled(last)) last_provider = null;
+        }
+        // Settings keeps the configured default enabled whenever it disables a provider.
         const provider = last_provider orelse self.app_config.new_chat_provider;
         try self.applyProviderModelDefaults(thread, providerFromConfig(provider), last_provider == null);
         _ = try self.applyWorkspaceRuntimeDefaultToThread(project.id, thread);
@@ -7842,6 +7973,10 @@ pub const AppState = struct {
     pub const settingsNewChatReasoningSelectedIndex = settings_controller.settingsNewChatReasoningSelectedIndex;
     pub const settingsNewChatReasoningSelectedLabel = settings_controller.settingsNewChatReasoningSelectedLabel;
     pub const selectSettingsNewChatProvider = settings_controller.selectSettingsNewChatProvider;
+    pub const toggleSettingsProviderEnabled = settings_controller.toggleSettingsProviderEnabled;
+    pub const installSettingsProvider = settings_controller.installSettingsProvider;
+    pub const loginSettingsProvider = settings_controller.loginSettingsProvider;
+    pub const settingsProviderEnabled = settings_controller.settingsProviderEnabled;
     pub const selectSettingsNewChatModel = settings_controller.selectSettingsNewChatModel;
     pub const selectSettingsNewChatReasoning = settings_controller.selectSettingsNewChatReasoning;
     pub const startUpdateCheck = settings_controller.startUpdateCheck;
@@ -7852,6 +7987,8 @@ pub const AppState = struct {
     pub const updateInstallerButtonLabel = settings_controller.updateInstallerButtonLabel;
     pub const pollUpdateInstallerTerminal = settings_controller.pollUpdateInstallerTerminal;
     pub const isUpdateInstallerTerminal = settings_controller.isUpdateInstallerTerminal;
+    pub const pollProviderInstallTerminal = settings_controller.pollProviderInstallTerminal;
+    pub const isProviderInstallTerminal = settings_controller.isProviderInstallTerminal;
     pub const consumeUpdateExitRequest = settings_controller.consumeUpdateExitRequest;
     pub const currentProjectTerminal = terminal_controller.currentProjectTerminal;
     pub const currentProjectTerminalMutable = terminal_controller.currentProjectTerminalMutable;
@@ -8192,14 +8329,14 @@ pub const AppState = struct {
     pub fn editorLogoTextureForTarget(self: *const AppState, target: ProjectEditorTarget) ?CachedImageTexture {
         return switch (target) {
             .configured => self.configuredEditorLogoTexture(),
-            .cursor => self.cursor_logo_texture,
+            .cursor => self.cursor_editor_logo_texture,
             .vscode => self.vscode_logo_texture,
             .zed => self.zed_logo_texture,
         };
     }
 
     fn editorLogoTextureForCommand(self: *const AppState, command: []const u8) ?CachedImageTexture {
-        if (std.ascii.eqlIgnoreCase(command, "cursor")) return self.cursor_logo_texture;
+        if (std.ascii.eqlIgnoreCase(command, "cursor")) return self.cursor_editor_logo_texture;
         if (std.ascii.eqlIgnoreCase(command, "code") or std.ascii.eqlIgnoreCase(command, "code-insiders")) return self.vscode_logo_texture;
         if (std.ascii.eqlIgnoreCase(command, "zed") or std.ascii.eqlIgnoreCase(command, "zeditor")) return self.zed_logo_texture;
         if (std.ascii.eqlIgnoreCase(command, "nvim")) return self.neovim_logo_texture;
@@ -9113,6 +9250,10 @@ pub const AppState = struct {
             cached.deinit();
             self.cursor_logo_texture = null;
         }
+        if (self.cursor_editor_logo_texture) |cached| {
+            cached.deinit();
+            self.cursor_editor_logo_texture = null;
+        }
         if (self.emacs_logo_texture) |cached| {
             cached.deinit();
             self.emacs_logo_texture = null;
@@ -9886,10 +10027,10 @@ pub const AppState = struct {
     }
 
     /// Render-path entry: request one older durable page for the focused
-    /// thread. Returns immediately; the page loads on a worker thread (each
-    /// Storage.loadMessagePage opens its own read-only connection, so the
-    /// worker shares no DB state with the render thread) and commits in
-    /// pollTranscriptHydration. At most one request is in flight.
+    /// thread. Returns immediately; the page loads on a worker thread over a
+    /// dedicated daemon RPC transport, so the worker shares no DB state with
+    /// the render thread, and commits in pollTranscriptHydration. At most one
+    /// request is in flight.
     pub fn requestOlderCurrentThreadMessages(self: *AppState) void {
         if (self.transcript_hydration.in_flight) return;
         const project = self.currentProjectMutable();
@@ -9936,10 +10077,14 @@ pub const AppState = struct {
     /// while their thread is only temporarily swapped in, so by poll time the
     /// selection may differ; committing by identity is what keeps those panes
     /// from looping request→drop→re-request and rendering blank. A page for a
-    /// superseded target (generation bump on a real selection change, identity
-    /// no longer present, or offset mismatch against a prior commit) is
-    /// dropped so it commits nowhere. Returns true when rows were prepended
-    /// and a render is needed.
+    /// superseded target (generation bump on a real selection change, or
+    /// identity no longer present) is dropped so it commits nowhere. An offset
+    /// mismatch against a prior commit also drops the page — committing it
+    /// would orphan the newer tail rows — but still schedules a render so the
+    /// render path re-requests at the fresh offset: without that retry the
+    /// thread can sit blank indefinitely, since nothing else schedules a
+    /// frame for an idle thread. Returns true when rows were prepended or a
+    /// retry render is needed.
     pub fn pollTranscriptHydration(self: *AppState) bool {
         if (!self.transcript_hydration.in_flight) return false;
         const args = self.transcript_hydration.args orelse return false;
@@ -9949,26 +10094,62 @@ pub const AppState = struct {
         self.transcript_hydration.args = null;
         self.transcript_hydration.in_flight = false;
         defer args.deinitAndDestroy();
-        if (args.failed) return false;
-        const page = if (args.page) |*loaded| loaded else return false;
+        if (args.failed or args.page == null) {
+            log.warn("transcript hydration page load failed thread={s} before_offset={d}", .{ args.local_thread_id, args.before_offset });
+            // std.log goes to the GUI's stderr, which is not the pref-dir log;
+            // record the failure where support actually looks.
+            runtime_log.diagnostic("transcript hydration page load failed thread={s} before_offset={d} failures={d}", .{ args.local_thread_id, args.before_offset, self.transcript_hydration.consecutive_failures + 1 });
+            return self.noteHydrationLoadFailure();
+        }
+        const page = &args.page.?;
         if (args.generation != self.transcript_hydration.generation) return false;
         const project = for (self.project_controller.projects.items) |*candidate| {
             if (std.mem.eql(u8, candidate.id, args.workspace_id)) break candidate;
-        } else return false;
-        const thread_index = for (project.threads.items, 0..) |*candidate, index| {
-            if (std.mem.eql(u8, candidate.local_thread_id, args.local_thread_id)) break index;
-        } else return false;
-        if (project.threads.items[thread_index].persisted_message_offset != args.before_offset) return false;
-        return self.commitOlderTranscriptPage(project, thread_index, page) catch |err| {
-            log.warn("failed to commit older transcript page: {s}", .{@errorName(err)});
+        } else {
+            log.warn("transcript hydration target workspace gone thread={s}", .{args.local_thread_id});
             return false;
         };
+        const thread_index = for (project.threads.items, 0..) |*candidate, index| {
+            if (std.mem.eql(u8, candidate.local_thread_id, args.local_thread_id)) break index;
+        } else {
+            log.warn("transcript hydration target thread gone thread={s}", .{args.local_thread_id});
+            return false;
+        };
+        if (project.threads.items[thread_index].persisted_message_offset != args.before_offset) {
+            log.warn("transcript hydration offset moved thread={s} requested_before={d} current_offset={d}", .{ args.local_thread_id, args.before_offset, project.threads.items[thread_index].persisted_message_offset });
+            return true;
+        }
+        const committed = self.commitOlderTranscriptPage(project, thread_index, page) catch |err| {
+            log.warn("failed to commit older transcript page: {s}", .{@errorName(err)});
+            return self.noteHydrationLoadFailure();
+        };
+        if (!committed) {
+            log.warn("transcript hydration page empty thread={s} before_offset={d}", .{ args.local_thread_id, args.before_offset });
+            return self.noteHydrationLoadFailure();
+        }
+        self.transcript_hydration.consecutive_failures = 0;
+        return true;
+    }
+
+    /// Records one failed hydration page load and reports whether the frame
+    /// loop should render (so the render path retries the page). Retries stop
+    /// after TRANSCRIPT_HYDRATION_FAILURE_NOTICE_AFTER consecutive failures:
+    /// past that point the daemon is not answering, and every retry would
+    /// spawn another worker + RPC while the pane stays blank. The notice
+    /// points at Sync thread, which reloads the transcript out of band.
+    fn noteHydrationLoadFailure(self: *AppState) bool {
+        self.transcript_hydration.consecutive_failures +|= 1;
+        if (self.transcript_hydration.consecutive_failures == TRANSCRIPT_HYDRATION_FAILURE_NOTICE_AFTER) {
+            self.setSidebarNotice("Chat history failed to load. Sync the thread to retry.");
+        }
+        return self.transcript_hydration.consecutive_failures <= TRANSCRIPT_HYDRATION_FAILURE_NOTICE_AFTER;
     }
 
     /// Invalidate any in-flight or future hydration commit for the previous
     /// selection. Call on every focused project/thread change.
     pub fn noteTranscriptSelectionChanged(self: *AppState) void {
         self.transcript_hydration.generation +%= 1;
+        self.transcript_hydration.consecutive_failures = 0;
         const target = self.currentTranscriptPresentation();
         if (target) |identity| {
             // A projection refresh can bump hydration while the same target is
@@ -12264,7 +12445,11 @@ pub const AppState = struct {
         defer self.allocator.free(previous);
         self.composer_controller.model_picker_entries.clearRetainingCapacity();
         if (self.currentThreadAllowsProviderChoice()) {
-            for (COMPOSER_PROVIDER_OPTIONS) |candidate| try self.appendModelPickerEntries(candidate);
+            for (COMPOSER_PROVIDER_OPTIONS) |candidate| {
+                // The thread's own provider stays listed so its current model remains selectable.
+                if (!self.app_config.isProviderEnabled(configChatProvider(candidate)) and candidate != self.currentThread().provider) continue;
+                try self.appendModelPickerEntries(candidate);
+            }
         } else {
             try self.appendModelPickerEntries(self.currentThread().provider);
         }
@@ -14742,6 +14927,7 @@ pub const AppState = struct {
             self.lifecycle.projection_baseline_revision != observed_revision;
         if (!projectionRefreshApplyGate(
             self.lifecycle.dirty,
+            self.lifecycle.dirty_spooled,
             self.lifecycle.flush_in_flight,
             self.lifecycle.rebase_snapshot != null,
             adoption_repair,
@@ -15846,6 +16032,10 @@ fn testTranscriptHydrationState(allocator: std.mem.Allocator) !AppState {
     state.project_controller.selected_index = 0;
     state.transcript_controller = .{};
     state.transcript_hydration = .{};
+    state.sidebar_notice_storage = std.mem.zeroes([256:0]u8);
+    state.sidebar_notice_set_at_ms = 0;
+    state.close_durability_notice = false;
+    state.daemon_projection_stale = false;
     var project = try Project.init(allocator, "hydrate-ws", "Hydrate", "/tmp/hydrate", 0);
     state.project_controller.projects.append(allocator, project) catch |err| {
         project.deinit(allocator);
@@ -16013,18 +16203,64 @@ test "async transcript hydration commits by identity into an unfocused thread ex
     try std.testing.expect(!state.transcript_hydration.in_flight);
 }
 
-test "async transcript hydration ignores a stale before-offset after a prior commit" {
+test "async transcript hydration retries a stale before-offset instead of stalling" {
     const allocator = std.testing.allocator;
     var state = try testTranscriptHydrationState(allocator);
     defer testTranscriptHydrationCleanup(&state);
     const thread = state.currentProjectMutable().currentThreadMutable();
-    // The thread's paged-out offset moved (another commit landed): a request
-    // minted against the old offset would double-prepend, so it is dropped.
+    // The thread's paged-out offset moved (a projection refresh rebuilt it
+    // while the page was in flight): a request minted against the old offset
+    // must not commit — it would orphan the newer tail rows — but the poll
+    // must schedule a render so the render path re-requests at the fresh
+    // offset. Dropping silently here left idle threads blank indefinitely,
+    // since nothing else schedules a frame that would retry the load.
     thread.persisted_message_offset = 4;
     _ = try testCompletedHydrationArgs(&state, 2);
-    try std.testing.expect(!state.pollTranscriptHydration());
+    try std.testing.expect(state.pollTranscriptHydration());
     try std.testing.expectEqual(@as(usize, 0), thread.messages.items.len);
     try std.testing.expectEqual(@as(usize, 4), thread.persisted_message_offset);
+}
+
+test "async transcript hydration retries failed loads, then points at sync" {
+    const allocator = std.testing.allocator;
+    var state = try testTranscriptHydrationState(allocator);
+    defer testTranscriptHydrationCleanup(&state);
+    const thread = state.currentProjectMutable().currentThreadMutable();
+    thread.persisted_message_offset = 2;
+    // Consecutive daemon failures keep scheduling retry renders so the
+    // render path re-requests the page.
+    var failures: u32 = 0;
+    while (failures < TRANSCRIPT_HYDRATION_FAILURE_NOTICE_AFTER) : (failures += 1) {
+        const args = try testCompletedHydrationArgs(&state, 2);
+        args.failed = true;
+        try std.testing.expect(state.pollTranscriptHydration());
+    }
+    try std.testing.expectEqual(TRANSCRIPT_HYDRATION_FAILURE_NOTICE_AFTER, state.transcript_hydration.consecutive_failures);
+    try std.testing.expectEqualStrings("Chat history failed to load. Sync the thread to retry.", state.sidebarNotice());
+    // Past the threshold retries stop, so a dead daemon does not spin
+    // worker threads + RPCs while the pane stays blank.
+    const args = try testCompletedHydrationArgs(&state, 2);
+    args.failed = true;
+    try std.testing.expect(!state.pollTranscriptHydration());
+    try std.testing.expectEqual(@as(usize, 0), thread.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 2), thread.persisted_message_offset);
+}
+
+test "async transcript hydration success resets the failure streak" {
+    const allocator = std.testing.allocator;
+    var state = try testTranscriptHydrationState(allocator);
+    defer testTranscriptHydrationCleanup(&state);
+    const thread = state.currentProjectMutable().currentThreadMutable();
+    thread.persisted_message_offset = 2;
+    const failed_args = try testCompletedHydrationArgs(&state, 2);
+    failed_args.failed = true;
+    try std.testing.expect(state.pollTranscriptHydration());
+    try std.testing.expectEqual(@as(u32, 1), state.transcript_hydration.consecutive_failures);
+    _ = try testCompletedHydrationArgs(&state, 2);
+    try std.testing.expect(state.pollTranscriptHydration());
+    try std.testing.expectEqual(@as(u32, 0), state.transcript_hydration.consecutive_failures);
+    try std.testing.expectEqual(@as(usize, 2), thread.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 0), thread.persisted_message_offset);
 }
 
 fn importThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
@@ -17784,6 +18020,31 @@ test "activating a thread already visible focuses its pane without changing spli
     try std.testing.expectEqual(@as(?WorkspacePaneId, null), layout.scroll_leading_pane_id);
     try std.testing.expectEqual(@as(f32, 73.25), layout.scroll_offset_x);
     try std.testing.expectEqual(@as(f32, 73.25), layout.scroll_target_x);
+}
+
+test "linked chat navigation reuses the open pane and only splits when absent" {
+    const allocator = std.testing.allocator;
+    var project = try Project.init(allocator, "linked", "Linked", "/tmp/linked", 0);
+    defer project.deinit(allocator);
+    const child_index = try project.addThread(allocator);
+    const child_id = project.threads.items[child_index].local_thread_id;
+    // Open thread without a pane: the caller must split one exactly once.
+    const absent_pane = AppState.openChatPaneForLocalThread(&project, child_id).?;
+    try std.testing.expectEqual(child_index, absent_pane.thread_index);
+    try std.testing.expect(absent_pane.pane_id == null);
+    const child_pane_id = try project.workspace_layout.createChatPane(allocator, child_index);
+    try project.workspace_layout.splitPaneWithLeaf(allocator, 1, child_pane_id, .vertical, true);
+    const pane_count = project.workspace_layout.panes.items.len;
+    // Every later click resolves to the same pane, never a new one.
+    var clicks: usize = 0;
+    while (clicks < 3) : (clicks += 1) {
+        const target = AppState.openChatPaneForLocalThread(&project, child_id).?;
+        try std.testing.expectEqual(child_index, target.thread_index);
+        try std.testing.expectEqual(@as(?WorkspacePaneId, child_pane_id), target.pane_id);
+        try std.testing.expectEqual(pane_count, project.workspace_layout.panes.items.len);
+    }
+    // Unknown durable id falls back to the daemon load path.
+    try std.testing.expect(AppState.openChatPaneForLocalThread(&project, "chat-not-open") == null);
 }
 
 test "focused chat creation transfers zoom to the new pane" {
@@ -21394,11 +21655,15 @@ test "M5-P4 stale status covers saved bootstrap and clears after applied refresh
     try std.testing.expect(!projectionStaleAt(true, started_ms, applied_ms, applied_ms));
     // Exercise the same gate used by applyDaemonProjectionRefresh: neither an
     // in-flight capture nor unrebased dirty state may clear stale status.
-    try std.testing.expect(!projectionRefreshApplyGate(false, true, false, false, false));
-    try std.testing.expect(!projectionRefreshApplyGate(true, false, false, false, false));
-    try std.testing.expect(projectionRefreshApplyGate(true, false, true, false, false));
-    try std.testing.expect(projectionRefreshApplyGate(true, false, false, true, false));
-    try std.testing.expect(projectionRefreshApplyGate(true, false, false, false, true));
+    try std.testing.expect(!projectionRefreshApplyGate(false, false, true, false, false, false));
+    try std.testing.expect(!projectionRefreshApplyGate(true, false, false, false, false, false));
+    try std.testing.expect(projectionRefreshApplyGate(true, false, false, true, false, false));
+    try std.testing.expect(projectionRefreshApplyGate(true, false, false, false, true, false));
+    try std.testing.expect(projectionRefreshApplyGate(true, false, false, false, false, true));
+    // Spooled dirty state has no flush coming; waiting on it starved every
+    // remote refresh until restart. An in-flight flush still defers.
+    try std.testing.expect(projectionRefreshApplyGate(true, true, false, false, false, false));
+    try std.testing.expect(!projectionRefreshApplyGate(true, true, true, false, false, false));
 }
 
 test "M5-P4 stale refresh is rejected by the actual transactional apply path" {
@@ -21502,4 +21767,41 @@ test "runtime picker add-connection row follows the configured profiles" {
     try std.testing.expectEqual(@as(usize, 2), runtimePickerAddIndex(&state));
     try std.testing.expectEqualStrings("Unavailable runtime", paletteRuntimePickerLabel(@ptrCast(&state), 1));
     try std.testing.expectEqualStrings("Add connection…", paletteRuntimePickerLabel(@ptrCast(&state), 2));
+}
+
+/// Rewrites RGBA pixels in place into white with alpha = coverage (see
+/// `AppState.loadEmbeddedEditorMaskTexture`).
+fn convertToLuminanceMask(rgba: []u8) void {
+    var max_luma: f32 = 0.0;
+    var index: usize = 0;
+    while (index + 4 <= rgba.len) : (index += 4) {
+        if (rgba[index + 3] < 128) continue;
+        max_luma = @max(max_luma, pixelLuma(rgba[index..][0..4]));
+    }
+    if (max_luma <= 0.0) max_luma = 1.0;
+    index = 0;
+    while (index + 4 <= rgba.len) : (index += 4) {
+        const pixel = rgba[index..][0..4];
+        const coverage = @min(pixelLuma(pixel) / max_luma, 1.0) * @as(f32, @floatFromInt(pixel[3]));
+        pixel.* = .{ 255, 255, 255, @intFromFloat(@round(coverage)) };
+    }
+}
+
+fn pixelLuma(pixel: *const [4]u8) f32 {
+    const r: f32 = @floatFromInt(pixel[0]);
+    const g: f32 = @floatFromInt(pixel[1]);
+    const b: f32 = @floatFromInt(pixel[2]);
+    return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
+}
+
+test "editor logo mask keeps bright glyph detail and drops dark tiles" {
+    var pixels = [_]u8{
+        0, 0, 0, 255, // dark tile
+        255, 255, 255, 255, // white glyph
+        84, 162, 61, 0, // transparent padding
+    };
+    convertToLuminanceMask(&pixels);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255, 0 }, pixels[0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255, 255 }, pixels[4..8]);
+    try std.testing.expectEqual(@as(u8, 0), pixels[11]);
 }

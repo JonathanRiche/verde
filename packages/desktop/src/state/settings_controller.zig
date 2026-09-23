@@ -7,10 +7,12 @@ const update_installer = @import("../app/update_installer.zig");
 const app_config = @import("../app/config.zig");
 const chat_threads = @import("../chat/threads.zig");
 const daemon_client = @import("../daemon/client.zig");
-const providers_protocol = @import("headless").providers_protocol;
+const headless = @import("headless");
+const providers_protocol = headless.providers_protocol;
 const profiler = @import("../runtime/profiler.zig");
 const theme = @import("../ui/theme.zig");
 const utils = @import("../utils.zig");
+const provider_cli_version = @import("../providers/cli_version.zig");
 const provider_models = @import("provider_models.zig");
 
 const ModelOption = provider_models.ModelOption;
@@ -24,6 +26,8 @@ const CHAT_TITLE_PROVIDER_OPTIONS = [_]app_config.ChatTitleProvider{
     .opencode,
 };
 const NEW_CHAT_PROVIDER_OPTIONS = [_]app_config.ChatProvider{ .codex, .claude, .cursor, .opencode, .pi, .fx, .grok, .muse };
+/// Settings > Providers rows, in display order.
+pub const PROVIDER_OPTIONS = NEW_CHAT_PROVIDER_OPTIONS;
 const NEW_CHAT_REASONING_OPTIONS = [_]app_config.ChatReasoning{ .provider_default, .low, .medium, .high, .xhigh, .max };
 
 fn monotonicMs() i64 {
@@ -121,19 +125,21 @@ pub const Category = enum(u8) {
     appearance,
     workspace,
     chat,
+    providers,
     terminal,
     browser,
     connections,
     agents,
     app,
 
-    pub const all = [_]Category{ .appearance, .workspace, .chat, .terminal, .browser, .connections, .agents, .app };
+    pub const all = [_]Category{ .appearance, .workspace, .chat, .providers, .terminal, .browser, .connections, .agents, .app };
 
     pub fn label(self: Category) []const u8 {
         return switch (self) {
             .appearance => "Appearance",
             .workspace => "Workspace",
             .chat => "Chat",
+            .providers => "Providers",
             .terminal => "Terminal",
             .browser => "Browser",
             .connections => "Connections",
@@ -172,6 +178,7 @@ pub const Draft = struct {
     automatic_chat_titles_enabled: bool = true,
     chat_title_provider: app_config.ChatTitleProvider = .codex,
     new_chat_provider: app_config.ChatProvider = .codex,
+    disabled_providers: [PROVIDER_OPTIONS.len]bool = @splat(false),
     new_chat_reasoning: app_config.ChatReasoning = .medium,
     new_chat_pane_behavior: app_config.NewChatPaneBehavior = .new_pane,
     check_for_updates_automatically: bool = true,
@@ -187,6 +194,16 @@ pub const UpdateInstallerTerminalStatus = enum {
 pub const UpdateInstallerTerminal = struct {
     project_index: usize,
     dock_id: u32,
+    status: UpdateInstallerTerminalStatus = .running,
+};
+
+pub const ProviderInstallTerminal = struct {
+    project_index: usize,
+    dock_id: u32,
+    provider: app_config.ChatProvider,
+    missing: bool,
+    /// Sign-in terminal rather than an install/update.
+    login: bool = false,
     status: UpdateInstallerTerminalStatus = .running,
 };
 
@@ -281,6 +298,7 @@ pub const State = struct {
     package_update_command: ?[]const u8 = null,
     package_update_check_failed: bool = false,
     update_installer_terminal: ?UpdateInstallerTerminal = null,
+    provider_install_terminal: ?ProviderInstallTerminal = null,
     update_exit_requested: bool = false,
 };
 
@@ -395,6 +413,7 @@ pub fn syncSettingsDraftFromConfig(self: anytype) void {
         .automatic_chat_titles_enabled = self.app_config.automatic_chat_titles_enabled,
         .chat_title_provider = self.app_config.chat_title_provider,
         .new_chat_provider = self.app_config.new_chat_provider,
+        .disabled_providers = self.app_config.disabled_providers,
         .new_chat_reasoning = self.app_config.new_chat_reasoning,
         .new_chat_pane_behavior = self.app_config.new_chat_pane_behavior,
         .check_for_updates_automatically = self.app_config.check_for_updates_automatically,
@@ -439,6 +458,7 @@ pub fn isSettingsDraftDirty(self: anytype) bool {
     if (draft.automatic_chat_titles_enabled != self.app_config.automatic_chat_titles_enabled) return true;
     if (draft.chat_title_provider != self.app_config.chat_title_provider) return true;
     if (draft.new_chat_provider != self.app_config.new_chat_provider) return true;
+    if (!std.mem.eql(bool, &draft.disabled_providers, &self.app_config.disabled_providers)) return true;
     if (draft.new_chat_reasoning != self.app_config.new_chat_reasoning) return true;
     const configured_new_chat_model = self.app_config.new_chat_model orelse defaultNewChatModelRef(self, self.app_config.new_chat_provider);
     if (!std.mem.eql(u8, self.settingsNewChatModelRef(), configured_new_chat_model)) return true;
@@ -510,6 +530,8 @@ pub fn selectSettingsCategory(self: anytype, category: Category) void {
         self.settings_controller.active_category = category;
         self.settings_controller.scroll_y = 0.0;
         self.settings_controller.hover_control = null;
+        // Install/sign-in state changes outside Verde; refresh it when the page opens.
+        if (category == .providers) self.startProviderReadinessCheck();
     }
     closeSettingsDropdowns(self);
     self.markDirty();
@@ -626,6 +648,7 @@ fn applySettingsDraftToConfig(self: anytype) !void {
     self.app_config.automatic_chat_titles_enabled = self.settings_controller.draft.automatic_chat_titles_enabled;
     self.app_config.chat_title_provider = self.settings_controller.draft.chat_title_provider;
     self.app_config.new_chat_provider = self.settings_controller.draft.new_chat_provider;
+    self.app_config.disabled_providers = self.settings_controller.draft.disabled_providers;
     self.app_config.new_chat_reasoning = self.settings_controller.draft.new_chat_reasoning;
     self.app_config.new_chat_pane_behavior = self.settings_controller.draft.new_chat_pane_behavior;
     try self.app_config.setChatTitleModel(self.allocator, self.settingsChatTitleModelRef());
@@ -1075,6 +1098,42 @@ pub fn settingsNewChatReasoningSelectedLabel(self: anytype) []const u8 {
     return self.settingsNewChatReasoningLabel(self.settingsNewChatReasoningSelectedIndex());
 }
 
+pub fn settingsProviderForRow(row: usize) Provider {
+    return dbProviderForChatProvider(PROVIDER_OPTIONS[row]);
+}
+
+pub fn settingsProviderEnabled(self: anytype, row: usize) bool {
+    return !self.settings_controller.draft.disabled_providers[@intFromEnum(PROVIDER_OPTIONS[row])];
+}
+
+/// Flips one provider's availability. The last enabled provider stays on so
+/// new chats always have somewhere to go.
+pub fn toggleSettingsProviderEnabled(self: anytype, row: usize) void {
+    if (row >= PROVIDER_OPTIONS.len) return;
+    const draft = &self.settings_controller.draft;
+    const slot = &draft.disabled_providers[@intFromEnum(PROVIDER_OPTIONS[row])];
+    if (!slot.*) {
+        var enabled_count: usize = 0;
+        for (draft.disabled_providers) |disabled| {
+            if (!disabled) enabled_count += 1;
+        }
+        if (enabled_count <= 1) {
+            self.setSidebarNotice("At least one provider must stay enabled.");
+            return;
+        }
+    }
+    slot.* = !slot.*;
+    if (slot.* and draft.new_chat_provider == PROVIDER_OPTIONS[row]) {
+        for (PROVIDER_OPTIONS, 0..) |candidate, index| {
+            if (draft.disabled_providers[@intFromEnum(candidate)]) continue;
+            // Commits the draft, including the flipped toggle.
+            selectSettingsNewChatProvider(self, index);
+            return;
+        }
+    }
+    commitSettingsPreference(self);
+}
+
 pub fn selectSettingsNewChatProvider(self: anytype, option_index: usize) void {
     if (option_index >= NEW_CHAT_PROVIDER_OPTIONS.len) return;
     const provider = NEW_CHAT_PROVIDER_OPTIONS[option_index];
@@ -1118,6 +1177,154 @@ pub fn selectSettingsNewChatReasoning(self: anytype, option_index: usize) void {
     self.settings_controller.new_chat_reasoning_dropdown_open = false;
     self.settings_controller.new_chat_menu_hover_index = null;
     commitSettingsPreference(self);
+}
+
+fn providerInstallShell(provider: app_config.ChatProvider) []const u8 {
+    return headless.provider_install.installShell(providerProtocol(provider));
+}
+
+fn providerProtocol(provider: app_config.ChatProvider) headless.provider_types.Provider {
+    return switch (provider) {
+        .codex => .codex,
+        .claude => .claude,
+        .cursor => .cursor,
+        .opencode => .opencode,
+        .pi => .pi,
+        .fx => .fx,
+        .grok => .grok,
+        .muse => .muse,
+    };
+}
+
+fn providerLoginTerminalLabel(provider: app_config.ChatProvider) []const u8 {
+    return switch (provider) {
+        .codex => "Sign in to Codex",
+        .claude => "Sign in to Claude",
+        .cursor => "Sign in to Cursor",
+        .opencode => "Sign in to OpenCode",
+        .pi => "Sign in to Pi",
+        .fx => "Sign in to FX",
+        .grok => "Sign in to Grok",
+        .muse => "Sign in to Muse",
+    };
+}
+
+fn providerInstallTerminalLabel(provider: app_config.ChatProvider, missing: bool) []const u8 {
+    if (missing) return switch (provider) {
+        .codex => "Install Codex",
+        .claude => "Install Claude",
+        .cursor => "Install Cursor",
+        .opencode => "Install OpenCode",
+        .pi => "Install Pi",
+        .fx => "Install FX",
+        .grok => "Install Grok",
+        .muse => "Install Muse",
+    };
+    return switch (provider) {
+        .codex => "Update Codex",
+        .claude => "Update Claude",
+        .cursor => "Update Cursor",
+        .opencode => "Update OpenCode",
+        .pi => "Update Pi",
+        .fx => "Update FX",
+        .grok => "Update Grok",
+        .muse => "Update Muse",
+    };
+}
+
+/// Opens an update in a workspace terminal. A missing CLI uses the official
+/// installer. An installed CLI uses the package manager that owns that PATH
+/// copy, so a mise or npm binary is not replaced by the curl installer.
+pub fn installSettingsProvider(self: anytype, row: usize) void {
+    if (row >= PROVIDER_OPTIONS.len) return;
+    const provider = PROVIDER_OPTIONS[row];
+    const installed = dbProviderForChatProvider(provider);
+    const snapshot = self.providerReadinessSnapshot();
+    const missing = snapshot.forProvider(installed) == .missing;
+    if (!missing and snapshot.packageManagedForProvider(installed) and snapshot.updateShellForProvider(installed).len == 0) {
+        self.setSidebarNotice("This copy is managed by another tool. Update it there so Verde keeps using the same binary.");
+        self.markDirty();
+        return;
+    }
+    const custom = if (missing) "" else snapshot.updateShellForProvider(installed);
+    const shell = if (custom.len > 0) custom else providerInstallShell(provider);
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) {
+        self.setSidebarNotice(if (self.setClipboardText(shell))
+            "Install command copied. Run it in a terminal on this machine."
+        else
+            "Could not copy the install command.");
+        return;
+    }
+    startProviderInstallTerminal(self, provider, shell, missing, false) catch |err| {
+        log.warn("failed to open provider installer terminal: {s}", .{@errorName(err)});
+        self.setSidebarNotice("Could not open a terminal for the provider installer.");
+        self.markDirty();
+    };
+}
+
+/// Opens the provider's own sign-in command in a workspace terminal. The CLI
+/// owns the flow (browser OAuth, device code, or a TUI `/login`); Verde
+/// rechecks readiness when the terminal exits.
+pub fn loginSettingsProvider(self: anytype, row: usize) void {
+    if (row >= PROVIDER_OPTIONS.len) return;
+    const provider = PROVIDER_OPTIONS[row];
+    const shell = headless.provider_install.loginShell(providerProtocol(provider));
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) {
+        self.setSidebarNotice(if (self.setClipboardText(shell))
+            "Sign-in command copied. Run it in a terminal on this machine."
+        else
+            "Could not copy the sign-in command.");
+        return;
+    }
+    startProviderInstallTerminal(self, provider, shell, false, true) catch |err| {
+        log.warn("failed to open provider sign-in terminal: {s}", .{@errorName(err)});
+        self.setSidebarNotice("Could not open a terminal for provider sign-in.");
+        self.markDirty();
+    };
+}
+
+fn startProviderInstallTerminal(self: anytype, provider: app_config.ChatProvider, shell: []const u8, missing: bool, login: bool) !void {
+    if (self.project_controller.projects.items.len == 0) return error.NoProjectSelected;
+    self.ensureCurrentProjectWorkspace();
+    const project_index = self.project_controller.selected_index;
+    const dock_id = try self.createProjectTerminalDock(project_index);
+    errdefer _ = self.project_controller.projects.items[project_index].removeTerminalDockById(self.allocator, dock_id);
+    var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return error.NoProjectSelected;
+    const project_path = self.project_controller.projects.items[project_index].path;
+    const command = [_][]const u8{ "bash", "-lc", shell };
+    try dock.restartWithProfilePersistent(self.allocator, project_path, .{
+        .kind = .custom,
+        .label = if (login) providerLoginTerminalLabel(provider) else providerInstallTerminalLabel(provider, missing),
+        .command = &command,
+    }, self.storage.pref_path, dock_id);
+
+    var layout = &self.project_controller.projects.items[project_index].workspace_layout;
+    const pane_id = try layout.ensureTerminalPane(self.allocator, dock_id);
+    const pane = layout.paneByIdMutable(pane_id) orelse return error.TerminalPaneUnavailable;
+    switch (pane.ref) {
+        .terminal => |*terminal_ref| terminal_ref.purpose = .editor,
+        else => return error.TerminalPaneUnavailable,
+    }
+    layout.focusCreatedPane(pane_id);
+    dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return error.NoProjectSelected;
+    dock.visible = false;
+    if (dock.activePane()) |leaf| leaf.revive_policy = .attach_only;
+
+    self.cancelSettingsModal();
+    self.requestTerminalDockFocus(dock_id);
+    self.settings_controller.provider_install_terminal = .{
+        .project_index = project_index,
+        .dock_id = dock_id,
+        .provider = provider,
+        .missing = missing,
+        .login = login,
+    };
+    self.setSidebarNotice(if (login)
+        "Sign-in opened in a terminal. Verde checks again when it exits."
+    else
+        "Installer opened in a terminal. Check providers again when it finishes.");
+    self.noteTerminalInputActivity();
+    self.markDirty();
 }
 
 pub fn startUpdateCheck(self: anytype) void {
@@ -1275,6 +1482,72 @@ pub fn pollUpdateInstallerTerminal(self: anytype) bool {
         "The update failed. Review the updater terminal for details.");
     self.markDirty();
     return true;
+}
+
+pub fn pollProviderInstallTerminal(self: anytype) bool {
+    const install = self.settings_controller.provider_install_terminal orelse return false;
+    if (install.status != .running) return false;
+    const dock = self.projectTerminalDock(install.project_index, install.dock_id) orelse {
+        self.settings_controller.provider_install_terminal.?.status = .failed;
+        self.setSidebarNotice("The installer terminal was closed before it finished.");
+        self.markDirty();
+        return true;
+    };
+    const snapshot = dock.activeSessionSnapshot() orelse return false;
+    if (snapshot.running) return false;
+    if (snapshot.exit_code == null and snapshot.signal == null) return false;
+    const succeeded = snapshot.exit_code != null and snapshot.exit_code.? == 0;
+    self.settings_controller.provider_install_terminal.?.status = if (succeeded) .succeeded else .failed;
+
+    var notice_buf: [160]u8 = undefined;
+    const name = providerDisplayName(install.provider);
+    if (install.login) {
+        // Exit code is a weak signal for interactive logins (Pi's TUI exits 0
+        // either way); the readiness recheck is the real answer.
+        self.setSidebarNotice(if (succeeded)
+            std.fmt.bufPrint(&notice_buf, "{s} sign-in finished. Checking again…", .{name}) catch "Sign-in finished."
+        else
+            std.fmt.bufPrint(&notice_buf, "{s} sign-in did not complete.", .{name}) catch "Sign-in did not complete.");
+        self.startProviderReadinessCheck();
+        self.markDirty();
+        return true;
+    }
+    var version_buf: [48]u8 = undefined;
+    const version = if (succeeded) installedProviderVersion(install.provider, &version_buf) else null;
+    const notice = if (!succeeded)
+        std.fmt.bufPrint(&notice_buf, "{s} {s} failed.", .{ name, if (install.missing) "install" else "update" }) catch "Provider update failed."
+    else if (version) |installed|
+        std.fmt.bufPrint(&notice_buf, "{s} Updated to {s}", .{ name, installed }) catch "Provider updated."
+    else
+        std.fmt.bufPrint(&notice_buf, "{s} updated.", .{name}) catch "Provider updated.";
+    self.setSidebarNotice(notice);
+    if (succeeded) self.startProviderReadinessCheck();
+    self.markDirty();
+    return true;
+}
+
+pub fn isProviderInstallTerminal(self: anytype, project_index: usize, dock_id: u32) bool {
+    const install = self.settings_controller.provider_install_terminal orelse return false;
+    return install.project_index == project_index and install.dock_id == dock_id;
+}
+
+fn installedProviderVersion(provider: app_config.ChatProvider, out: []u8) ?[]const u8 {
+    const executable = provider_cli_version.executableForProvider(@tagName(provider)) orelse return null;
+    const line = provider_cli_version.probe(std.heap.page_allocator, executable, out) orelse return null;
+    return provider_cli_version.shortVersion(line);
+}
+
+fn providerDisplayName(provider: app_config.ChatProvider) []const u8 {
+    return switch (provider) {
+        .codex => "Codex",
+        .claude => "Claude",
+        .cursor => "Cursor",
+        .opencode => "OpenCode",
+        .pi => "Pi",
+        .fx => "FX",
+        .grok => "Grok",
+        .muse => "Muse",
+    };
 }
 
 pub fn isUpdateInstallerTerminal(self: anytype, project_index: usize, dock_id: u32) bool {

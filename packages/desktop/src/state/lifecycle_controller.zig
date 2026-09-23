@@ -105,6 +105,8 @@ pub const State = struct {
     projection_baseline_revision: ?u64 = null,
     /// True once the current dirty projection has durable spool ownership.
     dirty_spooled: bool = false,
+    /// Logs the first oversized-snapshot spool of a streak; reset on a save.
+    oversize_spool_logged: bool = false,
     /// True only while every mutation in this generation is workspace
     /// selection. The worker can derive that projection from the immutable
     /// daemon baseline without touching live AppState.
@@ -568,13 +570,22 @@ fn flushWorkerMain(args: *FlushWorkerArgs) void {
         return;
     }
 
-    const fits_transport = args.storage.stateFitsSnapshotTransport(args.loaded.?.value) catch false;
+    // Wire only local-only transcript rows: the revision-paired baseline
+    // proves every row below its extent is already daemon-durable.
+    // `args.loaded` stays the full capture for baseline/rebase publication.
+    var wire: ?LoadedPersistedState = if (args.baseline) |baseline|
+        persistence.clonePersistedSpoolDelta(args.allocator, args.loaded.?.value, baseline.value) catch null
+    else
+        null;
+    defer if (wire) |*owned| owned.deinit();
+    const payload = if (wire) |owned| owned.value else args.loaded.?.value;
+    const fits_transport = args.storage.stateFitsSnapshotTransport(payload) catch false;
     if (!fits_transport) {
         args.result.spooled = spoolFlushWorkerPayload(args);
         args.result.done.store(true, .release);
         return;
     }
-    args.storage.saveCaptured(args.loaded.?.value, args.observed_revision) catch |err| {
+    args.storage.saveCaptured(payload, args.observed_revision) catch |err| {
         args.result.success = false;
         args.result.conflict = err == error.StoreRevisionConflict;
         args.result.rejected = err == error.StoreMutationRejected;
@@ -869,11 +880,23 @@ pub fn pollFlushWorker(self: anytype) void {
         });
         self.lifecycle.next_flush_attempt_ms = 0;
         self.lifecycle.flush_conflict_streak = 0;
+        self.lifecycle.oversize_spool_logged = false;
         clearCloseDurabilityNoticeAfterSuccess(self);
     } else if (spooled) {
         // The spool owns exactly the captured generation. A newer edit resets
         // dirty_spooled through markDirty and schedules a replacement spool.
-        if (rejected) log.warn("durably spooled daemon-rejected native state snapshot", .{});
+        if (rejected) {
+            log.warn("durably spooled daemon-rejected native state snapshot", .{});
+        } else if (!self.lifecycle.oversize_spool_logged) {
+            // Otherwise silent: remote refreshes now apply over spooled state,
+            // but the daemon store does not receive GUI edits until the
+            // snapshot fits again or the spool replays at the next launch.
+            self.lifecycle.oversize_spool_logged = true;
+            runtime_log.diagnostic("native state snapshot exceeds daemon transport; spooled locally kind={s} generation={d}", .{
+                @tagName(flush_kind),
+                self.lifecycle.flush_snapshot_generation,
+            });
+        }
         noteCompletedSpool(&self.lifecycle, self.lifecycle.flush_snapshot_generation);
         self.lifecycle.flush_conflict_streak = 0;
         clearCloseDurabilityNoticeAfterSuccess(self);
@@ -1042,7 +1065,19 @@ fn flushDirtyBlockingResult(self: anytype) !void {
         };
         var persisted_owned = true;
         defer if (persisted_owned) persisted.deinit();
-        self.storage.saveCaptured(persisted.value, observed_revision) catch |err| {
+        // Same baseline-relative wire payload as the flush worker.
+        const baseline_current = self.lifecycle.projection_baseline != null and
+            self.lifecycle.projection_baseline_revision == observed_revision;
+        var wire: ?LoadedPersistedState = if (baseline_current)
+            persistence.clonePersistedSpoolDelta(
+                self.storage.allocator,
+                persisted.value,
+                self.lifecycle.projection_baseline.?.value,
+            ) catch null
+        else
+            null;
+        defer if (wire) |*owned| owned.deinit();
+        self.storage.saveCaptured(if (wire) |owned| owned.value else persisted.value, observed_revision) catch |err| {
             if (err == error.StoreRevisionConflict) {
                 var baseline_copy: ?LoadedPersistedState = null;
                 if (self.lifecycle.projection_baseline) |baseline| {

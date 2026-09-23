@@ -7,6 +7,7 @@ const sdl = @import("zsdl3");
 
 const app_state = @import("../state.zig");
 const colors = @import("colors.zig");
+const context_menu = @import("context_menu.zig");
 const theme = @import("theme.zig");
 const terminal = @import("../terminal/terminal.zig");
 const runtime_log = @import("../runtime/log.zig");
@@ -17,8 +18,6 @@ const log = std.log.scoped(.terminal_panel);
 const MAX_PANE_HITS = 64;
 const MAX_TAB_HITS = 32;
 const TERMINAL_CONTEXT_MENU_WIDTH: f32 = 180.0;
-const TERMINAL_CONTEXT_MENU_ROW_HEIGHT: f32 = 30.0;
-const TERMINAL_CONTEXT_MENU_PAD: f32 = 6.0;
 const TERMINAL_SCROLLBAR_MIN_THUMB_CSS: f32 = 28.0;
 const TERMINAL_SCROLLBAR_TRACK_WIDTH_CSS: f32 = 3.0;
 const TERMINAL_SCROLLBAR_EDGE_PAD_CSS: f32 = 2.0;
@@ -1233,8 +1232,8 @@ fn renderContextMenu(state: *app_state.AppState, dock: anytype, dock_rect: palet
     }
 
     const menu_w = theme.scaledUi(TERMINAL_CONTEXT_MENU_WIDTH);
-    const pad = theme.scaledUi(TERMINAL_CONTEXT_MENU_PAD);
-    const row_h = theme.scaledUi(TERMINAL_CONTEXT_MENU_ROW_HEIGHT);
+    const pad = theme.scaledUi(context_menu.PAD_UI);
+    const row_h = theme.scaledUi(context_menu.ROW_HEIGHT_UI);
     const menu_h = pad * 2.0 + row_h * @as(f32, @floatFromInt(count));
     var menu_x = hit_cache.menu_anchor.x;
     var menu_y = hit_cache.menu_anchor.y;
@@ -1243,25 +1242,17 @@ fn renderContextMenu(state: *app_state.AppState, dock: anytype, dock_rect: palet
 
     menu_x = @max(dock_rect.x + theme.scaledUi(4.0), menu_x);
     menu_y = @max(dock_rect.y + theme.scaledUi(4.0), menu_y);
-    hit_cache.menu_panel = .{ .x = menu_x, .y = menu_y, .w = menu_w, .h = menu_h };
-
-    queueRounded(state, hit_cache.menu_panel, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(8.0));
-    queueBorder(state, hit_cache.menu_panel, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0), theme.scaledUi(1.0));
+    hit_cache.menu_panel = context_menu.queuePanel(state, .{ .x = menu_x, .y = menu_y, .w = menu_w, .h = menu_h });
 
     hit_cache.menu_count = count;
     var i: usize = 0;
-    var y = menu_y + pad;
+    var y = hit_cache.menu_panel.y + pad;
     while (i < count) : (i += 1) {
-        const row = palette.Rect{ .x = menu_x + pad, .y = y, .w = menu_w - pad * 2.0, .h = row_h };
+        const row = palette.Rect{ .x = hit_cache.menu_panel.x + pad, .y = y, .w = hit_cache.menu_panel.w - pad * 2.0, .h = row_h };
         hit_cache.menu_hits[i] = .{ .action = actions[i], .rect = row, .enabled = enabled[i] };
         const hovered = mouse_ok and enabled[i] and rectContains(row, mx, my);
-        if (hovered) queueRounded(state, row, paletteColor(theme.raise(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(6.0));
-        queueText(state, .{
-            .x = row.x + theme.scaledUi(10.0),
-            .y = row.y + theme.scaledUi(6.0),
-            .w = row.w - theme.scaledUi(20.0),
-            .h = row.h,
-        }, labels[i], paletteColor(if (enabled[i]) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), hit_cache.menu_panel);
+        if (hovered) context_menu.queueRowHighlight(state, row);
+        context_menu.queueLabel(state, row, labels[i], context_menu.labelColor(enabled[i], hovered), 0.0, 0.0, hit_cache.menu_panel);
         y += row_h;
     }
 }

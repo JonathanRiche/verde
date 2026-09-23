@@ -43,6 +43,7 @@ fn snapshotMessageToPersisted(
         .tool_call_id = message.tool_call_id,
         .tool_call_kind = snapshotOptionalEnum(headless.provider_types.ToolCallKind, message.tool_call_kind),
         .tool_call_status = snapshotOptionalEnum(headless.provider_types.ToolCallStatus, message.tool_call_status),
+        .updated_at_ms = message.updated_at_ms,
         .message_id = if (message.message_id.len == 0) null else message.message_id,
     };
 }

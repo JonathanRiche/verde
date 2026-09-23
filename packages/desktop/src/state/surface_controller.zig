@@ -722,14 +722,62 @@ pub fn projectTerminalSurface(self: anytype, project_index: usize, dock_id: u32)
     for (self.surface_controller.surfaces.items) |*surface| {
         if (surface.dock_id != dock_id) continue;
         if (std.mem.eql(u8, surface.workspace_id, project.id) or self.projectPathMatches(surface.workspace_path, project.path)) {
-            if (surface.completion_pending) return surface;
             if (active_session_id) |session_id| {
                 if (std.mem.eql(u8, surface.session_id, session_id)) return surface;
+                // A reused dock must not inherit another session's status,
+                // including unacknowledged completion from that session.
+                continue;
             }
+            if (surface.completion_pending) return surface;
             fallback = surface;
         }
     }
     return fallback;
+}
+
+test "terminal surface lookup excludes stale sessions in a reused dock" {
+    const FakeDock = struct {
+        session: ?[]const u8 = "current-session",
+        fn activeSessionId(self: *const @This()) ?[]const u8 {
+            return self.session;
+        }
+    };
+    const Project = struct { id: []const u8 = "workspace-a", path: []const u8 = "/workspace-a" };
+    const FakeState = struct {
+        surface_controller: State,
+        project_controller: struct { projects: struct { items: []const Project } },
+        dock: FakeDock = .{},
+        fn projectPathMatches(_: *const @This(), a: []const u8, b: []const u8) bool {
+            return std.mem.eql(u8, a, b);
+        }
+        fn projectTerminalDock(self: *const @This(), _: usize, _: u32) ?*const FakeDock {
+            return &self.dock;
+        }
+    };
+    const projects = [_]Project{.{}};
+    var surfaces = [_]SurfaceState{
+        .{ .session_id = @constCast("old-session"), .workspace_id = @constCast("/workspace-a"), .workspace_path = @constCast("/workspace-a"), .dock_id = 4, .status = .working },
+        .{ .session_id = @constCast("current-session"), .workspace_id = @constCast("workspace-a"), .dock_id = 4, .status = .idle },
+    };
+    var state: FakeState = .{
+        .surface_controller = .{ .surfaces = .{ .items = surfaces[0..1], .capacity = surfaces.len } },
+        .project_controller = .{ .projects = .{ .items = &projects } },
+    };
+    try std.testing.expect(projectTerminalSurface(&state, 0, 4) == null);
+    surfaces[0].status = .done;
+    surfaces[0].completion_pending = true;
+    try std.testing.expect(projectTerminalSurface(&state, 0, 4) == null);
+    state.surface_controller.surfaces.items = &surfaces;
+    try std.testing.expect(projectTerminalSurface(&state, 0, 4).? == &surfaces[1]);
+    surfaces[1].status = .working;
+    try std.testing.expect(projectTerminalSurface(&state, 0, 4).? == &surfaces[1]);
+    surfaces[1].status = .done;
+    surfaces[1].completion_pending = true;
+    try std.testing.expect(projectTerminalSurface(&state, 0, 4).? == &surfaces[1]);
+    try std.testing.expect(projectTerminalSurface(&state, 1, 4) == null);
+    try std.testing.expect(projectTerminalSurface(&state, 0, 5) == null);
+    state.dock.session = null;
+    try std.testing.expect(projectTerminalSurface(&state, 0, 4).? == &surfaces[0]);
 }
 
 fn replaceOwnedSlice(allocator: std.mem.Allocator, dest: *[]u8, value: []const u8) !void {

@@ -7,6 +7,7 @@ const sdl = @import("zsdl3");
 const app_state = @import("../state.zig");
 const browser_runtime = @import("../browser/mod.zig");
 const colors = @import("colors.zig");
+const context_menu = @import("context_menu.zig");
 const theme = @import("theme.zig");
 
 // Nerd Font Symbols codicon glyphs. Codepoints match the Microsoft Codicons
@@ -1373,7 +1374,7 @@ fn renderInspectorModeMenuRow(state: *app_state.AppState, rect: palette.Rect, la
         queuePaletteRoundedRect(
             state,
             rect,
-            paletteColor(if (selected) theme.withAlpha(theme.accent(), 64) else theme.raise(theme.COLOR_PANEL_ALT, 0.08)),
+            paletteColor(if (selected) theme.wash(theme.accent(), 64) else theme.raise(theme.COLOR_PANEL_ALT, 0.08)),
             theme.scaledUi(6.0),
         );
     }
@@ -1408,9 +1409,9 @@ fn renderBrowserContextMenu(state: *app_state.AppState) void {
 }
 
 fn browserContextMenuContentHeight(state: *const app_state.AppState, parent_index: ?u32) f32 {
-    const row_height = theme.scaledUi(30.0);
-    const separator_height = theme.scaledUi(9.0);
-    const pad = theme.scaledUi(6.0);
+    const row_height = theme.scaledUi(context_menu.ROW_HEIGHT_UI);
+    const separator_height = theme.scaledUi(context_menu.SEPARATOR_HEIGHT_UI);
+    const pad = theme.scaledUi(context_menu.PAD_UI);
     var height = pad * 2.0;
     if (parent_index == null and state.browserContextMenuHasLink()) height += row_height * 2.0 + separator_height;
     for (state.browser_controller.context_menu_items.items) |item| {
@@ -1449,83 +1450,49 @@ fn browserContextMenuParentIsOpen(state: *const app_state.AppState, candidate: u
 }
 
 // Renders one menu level and recursively places the open child beside its parent row.
-fn renderBrowserContextMenuPanel(state: *app_state.AppState, parent_index: ?u32, panel_rect: palette.Rect, depth: usize) void {
+fn renderBrowserContextMenuPanel(state: *app_state.AppState, parent_index: ?u32, requested_rect: palette.Rect, depth: usize) void {
     if (depth >= palette_context_menu_panels.len) return;
+    const panel_rect = context_menu.queuePanel(state, requested_rect);
     palette_context_menu_panels[palette_context_menu_panel_count] = panel_rect;
     palette_context_menu_panel_count += 1;
 
-    queuePaletteRoundedRect(state, panel_rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 245)), theme.scaledUi(8.0));
-    queuePaletteBorder(state, panel_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0), theme.scaledUi(1.0));
-
-    const row_height = theme.scaledUi(30.0);
-    const separator_height = theme.scaledUi(9.0);
-    const pad = theme.scaledUi(6.0);
+    const row_height = theme.scaledUi(context_menu.ROW_HEIGHT_UI);
+    const separator_height = theme.scaledUi(context_menu.SEPARATOR_HEIGHT_UI);
+    const pad = theme.scaledUi(context_menu.PAD_UI);
+    const row_w = panel_rect.w - pad * 2.0;
     var row_y = panel_rect.y + pad;
     var open_child: ?app_state.BrowserContextMenuItem = null;
     var open_child_y: f32 = 0.0;
 
     if (parent_index == null and state.browserContextMenuHasLink()) {
-        const current_rect: palette.Rect = .{ .x = panel_rect.x + pad, .y = row_y, .w = panel_rect.w - pad * 2.0, .h = row_height };
-        renderBrowserContextLinkRow(state, current_rect, "Open Link", .open_link_current);
+        renderBrowserContextLinkRow(state, .{ .x = panel_rect.x + pad, .y = row_y, .w = row_w, .h = row_height }, "Open Link", .open_link_current, panel_rect);
         row_y += row_height;
-        const new_tab_rect: palette.Rect = .{ .x = panel_rect.x + pad, .y = row_y, .w = panel_rect.w - pad * 2.0, .h = row_height };
-        renderBrowserContextLinkRow(state, new_tab_rect, "Open Link in New Tab", .open_link_new_tab);
+        renderBrowserContextLinkRow(state, .{ .x = panel_rect.x + pad, .y = row_y, .w = row_w, .h = row_height }, "Open Link in New Tab", .open_link_new_tab, panel_rect);
         row_y += row_height;
-        queuePaletteRect(state, snapRect(.{
-            .x = panel_rect.x + pad,
-            .y = row_y + separator_height * 0.5,
-            .w = panel_rect.w - pad * 2.0,
-            .h = theme.scaledUi(1.0),
-        }), paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 180)));
+        context_menu.queueSeparator(state, panel_rect.x + pad, row_y, row_w);
         row_y += separator_height;
     }
 
     for (state.browser_controller.context_menu_items.items) |item| {
         if (item.parent_index != parent_index) continue;
         if (item.separator) {
-            queuePaletteRect(state, snapRect(.{
-                .x = panel_rect.x + pad,
-                .y = row_y + separator_height * 0.5,
-                .w = panel_rect.w - pad * 2.0,
-                .h = theme.scaledUi(1.0),
-            }), paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 180)));
+            context_menu.queueSeparator(state, panel_rect.x + pad, row_y, row_w);
             row_y += separator_height;
             continue;
         }
 
-        const row_rect: palette.Rect = .{
-            .x = panel_rect.x + pad,
-            .y = row_y,
-            .w = panel_rect.w - pad * 2.0,
-            .h = row_height,
-        };
-        const selected = state.browser_controller.context_menu_selected_index == item.index;
-        if (selected or (rectHovered(row_rect) and item.enabled)) {
-            queuePaletteRoundedRect(state, row_rect, paletteColor(theme.raise(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
-        }
-        const leading_width = if (state.browser_controller.context_menu_is_option) theme.scaledUi(18.0) else 0.0;
-        const trailing_width = if (item.submenu) theme.scaledUi(22.0) else 0.0;
-        queuePaletteText(state, .{
-            .x = row_rect.x + theme.scaledUi(8.0) + leading_width,
-            .y = row_rect.y + (row_rect.h - theme.scaledUi(13.0) * 1.25) * 0.5,
-            .w = row_rect.w - theme.scaledUi(16.0) - leading_width - trailing_width,
-            .h = theme.scaledUi(13.0) * 1.25,
-        }, item.label, paletteColor(if (item.enabled) theme.COLOR_TEXT_MUTED else theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), row_rect);
+        const row_rect: palette.Rect = .{ .x = panel_rect.x + pad, .y = row_y, .w = row_w, .h = row_height };
+        const highlighted = item.enabled and (state.browser_controller.context_menu_selected_index == item.index or rectHovered(row_rect));
+        if (highlighted) context_menu.queueRowHighlight(state, row_rect);
+        const label_color = context_menu.labelColor(item.enabled, highlighted);
+        const leading_width = if (state.browser_controller.context_menu_is_option) theme.scaledUi(context_menu.CHECK_SLOT_UI) else 0.0;
+        const trailing_width = if (item.submenu) theme.scaledUi(context_menu.CHEVRON_SLOT_UI) else 0.0;
+        context_menu.queueLabel(state, row_rect, item.label, label_color, leading_width, trailing_width, panel_rect);
         if (state.browser_controller.context_menu_is_option and item.selected) {
-            queuePaletteText(state, .{
-                .x = row_rect.x + theme.scaledUi(7.0),
-                .y = row_rect.y + (row_rect.h - theme.scaledUi(13.0) * 1.25) * 0.5,
-                .w = theme.scaledUi(14.0),
-                .h = theme.scaledUi(13.0) * 1.25,
-            }, "*", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), row_rect);
+            context_menu.queueCheck(state, row_rect, theme.accent(), panel_rect);
         }
         if (item.submenu) {
-            queuePaletteText(state, .{
-                .x = row_rect.x + row_rect.w - theme.scaledUi(18.0),
-                .y = row_rect.y + (row_rect.h - theme.scaledUi(13.0) * 1.25) * 0.5,
-                .w = theme.scaledUi(12.0),
-                .h = theme.scaledUi(13.0) * 1.25,
-            }, ">", paletteColor(if (item.enabled) theme.COLOR_TEXT_MUTED else theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), row_rect);
+            context_menu.queueChevron(state, row_rect, label_color, panel_rect);
             if (browserContextMenuParentIsOpen(state, item.index)) {
                 open_child = item;
                 open_child_y = row_rect.y - pad;
@@ -1536,28 +1503,12 @@ fn renderBrowserContextMenuPanel(state: *app_state.AppState, parent_index: ?u32,
     }
 
     if (parent_index == null and !state.browser_controller.context_menu_is_option and state.currentProjectVisibleBrowserPaneId() != null) {
-        queuePaletteRect(state, snapRect(.{
-            .x = panel_rect.x + pad,
-            .y = row_y + separator_height * 0.5,
-            .w = panel_rect.w - pad * 2.0,
-            .h = theme.scaledUi(1.0),
-        }), paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 180)));
+        context_menu.queueSeparator(state, panel_rect.x + pad, row_y, row_w);
         row_y += separator_height;
-        const close_rect: palette.Rect = .{
-            .x = panel_rect.x + pad,
-            .y = row_y,
-            .w = panel_rect.w - pad * 2.0,
-            .h = row_height,
-        };
-        if (state.browser_controller.context_menu_selected_index == CLOSE_PANE_MENU_INDEX or rectHovered(close_rect)) {
-            queuePaletteRoundedRect(state, close_rect, paletteColor(theme.raise(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
-        }
-        queuePaletteText(state, .{
-            .x = close_rect.x + theme.scaledUi(8.0),
-            .y = close_rect.y + (close_rect.h - theme.scaledUi(13.0) * 1.25) * 0.5,
-            .w = close_rect.w - theme.scaledUi(16.0),
-            .h = theme.scaledUi(13.0) * 1.25,
-        }, "Close Pane", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), close_rect);
+        const close_rect: palette.Rect = .{ .x = panel_rect.x + pad, .y = row_y, .w = row_w, .h = row_height };
+        const highlighted = state.browser_controller.context_menu_selected_index == CLOSE_PANE_MENU_INDEX or rectHovered(close_rect);
+        if (highlighted) context_menu.queueRowHighlight(state, close_rect);
+        context_menu.queueLabel(state, close_rect, "Close Pane", context_menu.labelColor(true, highlighted), 0.0, 0.0, panel_rect);
         addBrowserContextMenuHit(close_rect, .close_pane);
     }
 
@@ -1578,16 +1529,10 @@ fn renderBrowserContextMenuPanel(state: *app_state.AppState, parent_index: ?u32,
     }
 }
 
-fn renderBrowserContextLinkRow(state: *app_state.AppState, rect: palette.Rect, label: []const u8, action: BrowserContextMenuAction) void {
-    if (rectHovered(rect)) {
-        queuePaletteRoundedRect(state, rect, paletteColor(theme.raise(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
-    }
-    queuePaletteText(state, .{
-        .x = rect.x + theme.scaledUi(8.0),
-        .y = rect.y + (rect.h - theme.scaledUi(13.0) * 1.25) * 0.5,
-        .w = rect.w - theme.scaledUi(16.0),
-        .h = theme.scaledUi(13.0) * 1.25,
-    }, label, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), rect);
+fn renderBrowserContextLinkRow(state: *app_state.AppState, rect: palette.Rect, label: []const u8, action: BrowserContextMenuAction, clip: palette.Rect) void {
+    const highlighted = rectHovered(rect);
+    if (highlighted) context_menu.queueRowHighlight(state, rect);
+    context_menu.queueLabel(state, rect, label, context_menu.labelColor(true, highlighted), 0.0, 0.0, clip);
     addBrowserContextMenuHit(rect, action);
 }
 

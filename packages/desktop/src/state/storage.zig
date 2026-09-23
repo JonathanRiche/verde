@@ -358,7 +358,9 @@ pub const Storage = struct {
         var parsed = try client.call(headless.store.METHOD_CHAT_THREAD_LIST, request);
         defer parsed.deinit();
         const result = try client.decodeThreadList(&parsed);
-        loaded.items = result.threads;
+        const items = try a.dupe(headless.store.ThreadListItem, result.threads);
+        for (items) |*item| item.last_activity_at = headless.store.threadActivitySeconds(item.last_activity_at);
+        loaded.items = items;
         self.noteStoreRevision(result.store_revision);
         return loaded;
     }

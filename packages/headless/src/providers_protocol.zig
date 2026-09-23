@@ -192,6 +192,9 @@ pub const AuthStatusResult = struct {
     installed: bool,
     auth_state: provider_types.AuthState,
     ready: bool,
+    /// First line of `<cli> --version` as seen by this daemon. Absent when the
+    /// CLI is missing or the probe did not finish.
+    version: ?[]const u8 = null,
 };
 
 pub const ThreadsListRequest = ProviderRequest;

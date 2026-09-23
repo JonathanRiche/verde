@@ -489,10 +489,45 @@ fn paneOwnsActiveChatState(state: *const app_state.AppState, pane_id: ?app_state
 /// whole pixels so both surfaces land on identical device pixels.
 /// Shared content column for a chat lane: transcript bubbles, the composer,
 /// and pane-docked sheets all align to it so nothing reads as off-axis.
-pub fn chatContentColumn(lane_x: f32, lane_w: f32) struct { x: f32, w: f32 } {
+pub const ChatColumn = struct { x: f32, w: f32 };
+
+pub fn chatContentColumn(lane_x: f32, lane_w: f32) ChatColumn {
     const side_margin = theme.clampf(lane_w * 0.045, theme.scaledUi(16.0), theme.scaledUi(48.0));
     const width = @max(theme.scaledUi(220.0), @min(lane_w - side_margin * 2.0, theme.scaledUi(CHAT_CONTENT_MAX_WIDTH)));
     return .{ .x = @round(lane_x + (lane_w - width) * 0.5), .w = @round(width) };
+}
+
+/// Content column for a chat lane whose right edge may be claimed by the
+/// linked-chats drawer (`right_reserve`, zero when nothing is linked). The
+/// composer and transcript both use this so they share one axis: the
+/// full-lane column is kept whenever it already clears the drawer (so the
+/// composer stays full width on wide panes) and only falls back to centering
+/// in the remaining lane when the drawer would otherwise cover it.
+pub fn chatLaneColumn(lane_x: f32, lane_w: f32, right_reserve: f32) ChatColumn {
+    const full = chatContentColumn(lane_x, lane_w);
+    if (right_reserve <= 0.0 or full.x + full.w <= lane_x + lane_w - right_reserve) return full;
+    return chatContentColumn(lane_x, @max(lane_w - right_reserve, 0.0));
+}
+
+test "chat lane column keeps the full-lane axis until the linked drawer collides" {
+    defer theme.applyTheme(1.0);
+    theme.applyTheme(1.0);
+    // Wide lane: the 900px-capped column clears a 48px rail, so composer and
+    // transcript keep the exact full-lane column.
+    const full = chatContentColumn(100.0, 1600.0);
+    const wide = chatLaneColumn(100.0, 1600.0, 48.0);
+    try std.testing.expectEqual(full.x, wide.x);
+    try std.testing.expectEqual(full.w, wide.w);
+    // Narrow lane: the column would run under the drawer, so it re-centers in
+    // the lane that remains and stays clear of the reserve.
+    const narrow = chatLaneColumn(100.0, 600.0, 258.0);
+    const reduced = chatContentColumn(100.0, 600.0 - 258.0);
+    try std.testing.expectEqual(reduced.x, narrow.x);
+    try std.testing.expectEqual(reduced.w, narrow.w);
+    try std.testing.expect(narrow.x + narrow.w <= 100.0 + 600.0 - 258.0);
+    // No reserve is the plain shared formula.
+    const none = chatLaneColumn(100.0, 600.0, 0.0);
+    try std.testing.expectEqual(chatContentColumn(100.0, 600.0).x, none.x);
 }
 
 pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: palette.Rect, pane_id: ?app_state.WorkspacePaneId, header_right_reserve: f32) void {
@@ -531,7 +566,8 @@ pub fn renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(
     const live_composer = !blocked_by_quick and !subagent_view and paneOwnsActiveChatState(state, pane_id);
     // Linked chats occupy a compact transcript-side panel. The composer
     // keeps its normal width, including attachment previews and controls.
-    const linked = linkedChatsLayoutFor(state, rect.w, subagent_view);
+    var linked = linkedChatsLayoutFor(state, rect.w, subagent_view);
+    defer linked.subagents.deinit(state.allocator);
     const linked_lane_w = linked.lane_reserve;
     const target_linked_lane_w = linkedChatsLaneReserve(transcript_layout_width, linked.parent);
 
@@ -616,12 +652,15 @@ pub fn renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(
     const browser_width = if (split_chat_browser) state.browserPanelWidth(rect.w) else 0.0;
     const target_split_chat_browser = browser_visible and transcript_layout_width >= theme.scaledUi(900.0);
     const target_browser_width = if (target_split_chat_browser) state.browserPanelWidth(transcript_layout_width) else 0.0;
-    const target_chat_width = (if (target_split_chat_browser) transcript_layout_width - target_browser_width else transcript_layout_width) - target_linked_lane_w;
+    // Destination-width lane (browser removed, linked drawer still inside it).
+    const target_chat_width = if (target_split_chat_browser) transcript_layout_width - target_browser_width else transcript_layout_width;
     const composer_lane_w = if (split_chat_browser) rect.w - browser_width else rect.w;
     const composer_lane_x = rect.x;
 
-    // The composer uses the full chat lane even when linked chats are visible.
-    const composer_column = chatContentColumn(composer_lane_x, composer_lane_w);
+    // The composer and transcript share one lane column so their edges line up;
+    // it only narrows when the linked drawer would otherwise cover it.
+    const composer_column = chatLaneColumn(composer_lane_x, composer_lane_w, linked_lane_w);
+    const transcript_lane: TranscriptLane = .{ .layout_width = target_chat_width, .linked_reserve = target_linked_lane_w };
     const composer_rect = palette.Rect{
         .x = composer_column.x,
         .y = composer_y,
@@ -660,6 +699,8 @@ pub fn renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(
     const body = palette.Rect{
         .x = rect.x,
         .y = header.y + header.h,
+        // Keeps the scrollbar track and clip clear of the linked drawer; the
+        // content column itself comes from the full lane via chatLaneColumn.
         .w = rect.w - linked_lane_w,
         .h = @max(composer_y - (header.y + header.h) - attachment_reserve - bang_mode_reserve - background_task_reserve - followup_reserve - approval_reserve - runtime_block_reserve, theme.scaledUi(120.0)),
     };
@@ -667,7 +708,7 @@ pub fn renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(
 
     if (split_chat_browser) {
         const chat_rect = palette.Rect{ .x = body.x, .y = body.y, .w = body.w - browser_width, .h = body.h };
-        renderTranscript(state, chat_rect, target_chat_width, pane_id);
+        renderTranscript(state, chat_rect, transcript_lane, pane_id);
         // Transcript uses only `body` (above composer). The browser column is empty to the right of the
         // composer, so extend the dock through that strip to the same bottom as the composer row.
         const browser_dock_h = composer_bottom - body.y;
@@ -682,7 +723,7 @@ pub fn renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(
         const browser_height = @min(state.browserPanelHeight(body.h), body.h * 0.48);
         const chat_h = @max(body.h - browser_height - browser_gap, theme.scaledUi(96.0));
         const chat_rect = palette.Rect{ .x = body.x, .y = body.y, .w = body.w, .h = chat_h };
-        renderTranscript(state, chat_rect, target_chat_width, pane_id);
+        renderTranscript(state, chat_rect, transcript_lane, pane_id);
         browser_panel.renderDockAt(state, .{
             .x = body.x,
             .y = body.y + chat_h + browser_gap,
@@ -690,7 +731,7 @@ pub fn renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(
             .h = @max(browser_height, theme.scaledUi(120.0)),
         });
     } else {
-        renderTranscript(state, body, target_chat_width, pane_id);
+        renderTranscript(state, body, transcript_lane, pane_id);
     }
 
     const drawer_y = body.y + theme.scaledUi(LINKED_DRAWER_EDGE_CSS);
@@ -798,7 +839,17 @@ pub fn renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(
 // Data comes from `state.linked_chats`; this file only presents it and turns
 // clicks into open/hide requests. Hiding never cancels or deletes a child.
 
+const SidebarSubagent = struct {
+    title: LinkedBoundedId = .{},
+    identity: LinkedBoundedId = .{},
+    tool_call_id: LinkedBoundedId = .{},
+    message_index: usize,
+    updated_at_ms: i64 = 0,
+    status: linked_chats.Status,
+};
+
 const LinkedChatsLayout = struct {
+    subagents: std.ArrayList(SidebarSubagent) = .empty,
     parent: ?*linked_chats.Parent = null,
     /// Horizontal space removed from the transcript lane
     /// (drawer or rail width plus the gap and edge inset).
@@ -807,7 +858,7 @@ const LinkedChatsLayout = struct {
     overlay_width: f32 = 0.0,
 };
 
-const LinkedChatHitKind = enum { toggle, open, hide, clear_done };
+const LinkedChatHitKind = enum { toggle, open, subagent_open, hide, clear_done };
 
 const LINKED_ID_CAPACITY: usize = 192;
 
@@ -911,6 +962,18 @@ pub fn handleLinkedChatsMouseButton(state: *app_state.AppState, x: f32, y: f32, 
                 } else parent.collapsed = !parent.collapsed;
             }
         },
+        .subagent_open => {
+            const index = std.fmt.parseInt(usize, hit.link_id.slice(), 10) catch return true;
+            _ = state.openSubagent(state.project_controller.selected_index, .{
+                .parent_local_thread_id = hit.parent_id.slice(),
+                .tool_call_id = if (hit.local_thread_id.len > 0) hit.local_thread_id.slice() else null,
+                .message_index = index,
+                .axis = .vertical,
+                .focus = true,
+            }) catch {
+                state.setSidebarNotice("Could not open that subagent.");
+            };
+        },
         .open => state.openLinkedChat(hit.workspace_id.slice(), hit.local_thread_id.slice()),
         .hide => state.clearLinkedChats(hit.workspace_id.slice(), hit.parent_id.slice(), hit.link_id.slice()),
         .clear_done => state.clearLinkedChats(hit.workspace_id.slice(), hit.parent_id.slice(), null),
@@ -938,7 +1001,7 @@ pub fn handleLinkedChatsWheel(state: *app_state.AppState, x: f32, y: f32, wheel_
 /// transcript layout and the live pane agree.
 fn linkedChatsLaneReserve(pane_w: f32, parent_opt: ?*linked_chats.Parent) f32 {
     const parent = parent_opt orelse return 0.0;
-    if (parent.entries.items.len == 0) return 0.0;
+    if (parent.entries.items.len + parent.subagent_count == 0) return 0.0;
     const rail = parent.collapsed or pane_w < theme.scaledUi(LINKED_DRAWER_NARROW_PANE_W_CSS);
     const width = if (rail)
         theme.scaledUi(LINKED_DRAWER_RAIL_W_CSS)
@@ -956,14 +1019,51 @@ fn linkedChatsLayoutFor(state: *app_state.AppState, pane_w: f32, subagent_view: 
     const thread = state.currentThread();
     if (!thread.committed) return .{};
     const parent = state.linked_chats.markWanted(state.allocator, project.id, thread.local_thread_id, unixTimestampMs()) orelse return .{};
+    var subagents: std.ArrayList(SidebarSubagent) = .empty;
+    for (thread.messages.items, 0..) |message, index| appendSidebarSubagent(state, &subagents, message, index);
+    {
+        thread.send_state.mutex.lock();
+        defer thread.send_state.mutex.unlock();
+        for (thread.send_state.pending_events.items, 0..) |event, index| appendSidebarSubagent(state, &subagents, event, thread.messages.items.len + index);
+    }
+    parent.subagent_count = subagents.items.len;
     parent.narrow = pane_w < theme.scaledUi(LINKED_DRAWER_NARROW_PANE_W_CSS);
     const reserve = linkedChatsLaneReserve(pane_w, parent);
     return .{
         .parent = parent,
+        .subagents = subagents,
         .lane_reserve = reserve,
         .rail = reserve > 0.0 and (parent.collapsed or (parent.narrow and !parent.narrow_expanded)),
         .overlay_width = if (parent.narrow and parent.narrow_expanded) @min(pane_w - theme.scaledUi(24.0), theme.scaledUi(LINKED_DRAWER_MAX_W_CSS)) else 0.0,
     };
+}
+
+/// Snapshot pending text under the send mutex; keep provider agents out of daemon links.
+fn appendSidebarSubagent(state: *app_state.AppState, rows: *std.ArrayList(SidebarSubagent), entry: anytype, index: usize) void {
+    if (!isSubagentTimelineEntry(entry)) return;
+    const parsed = chat_types.parseSubagentConversation(entry.body);
+    var row: SidebarSubagent = .{ .message_index = index, .updated_at_ms = entry.updated_at_ms orelse 0, .status = switch (entry.tool_call_status orelse .unknown) {
+        .pending, .in_progress => .running,
+        .completed => .completed,
+        .failed => .failed,
+        .cancelled => .aborted,
+        .unknown => .unknown,
+    } };
+    const title = if (parsed.title.len > 0) parsed.title else "Subagent";
+    // UTF-8 truncation for display happens later using measured text.
+    if (!row.title.set(title)) _ = row.title.set("Subagent");
+    if (entry.tool_call_id) |id| _ = row.tool_call_id.set(id);
+    if (entry.tool_call_id orelse parsed.session_id) |id| {
+        if (row.identity.set(id)) {
+            for (rows.items) |*existing| {
+                if (std.mem.eql(u8, existing.identity.slice(), id)) {
+                    existing.* = row;
+                    return;
+                }
+            }
+        }
+    }
+    rows.append(state.allocator, row) catch {};
 }
 
 fn linkedChatStatusColor(status: linked_chats.Status) [4]f32 {
@@ -1020,9 +1120,9 @@ fn truncateUiLabel(buf: []u8, text: []const u8, max_w: f32, font_size: f32) []co
 }
 
 fn linkedChatsPanelHeight(layout: LinkedChatsLayout, available: f32) f32 {
-    const count = if (layout.parent) |parent| @min(parent.entries.items.len, 3) else 0;
+    const count = if (layout.parent) |parent| @min(parent.entries.items.len + parent.subagent_count, 3) else 0;
     const sections: f32 = if (layout.parent) |parent| if (parent.parentCount() > 0) (if (parent.entries.items.len > parent.parentCount()) @as(f32, 2.0) else 1.0) else 0.0 else 0.0;
-    const desired = if (layout.rail) theme.scaledUi(56.0) else theme.scaledUi(LINKED_DRAWER_HEADER_H_CSS + 12.0 + sections * 22.0 + LINKED_DRAWER_ROW_H_CSS * @as(f32, @floatFromInt(count)));
+    const desired = if (layout.rail) theme.scaledUi(56.0) else theme.scaledUi(LINKED_DRAWER_HEADER_H_CSS + 12.0 + (sections + (if (layout.subagents.items.len > 0) @as(f32, 1.0) else 0.0)) * 22.0 + LINKED_DRAWER_ROW_H_CSS * @as(f32, @floatFromInt(count)));
     return @min(desired, available);
 }
 
@@ -1086,7 +1186,7 @@ fn renderLinkedChatsDrawer(state: *app_state.AppState, rect: palette.Rect, layou
     }
 
     var title_buf: [48]u8 = undefined;
-    const title = std.fmt.bufPrint(&title_buf, "Linked chats \u{00B7} {d}", .{entries.len}) catch "Linked chats";
+    const title = std.fmt.bufPrint(&title_buf, "Linked chats \u{00B7} {d}", .{entries.len + layout.subagents.items.len}) catch "Linked chats";
     const title_font = theme.scaledUi(12.0);
     const title_h = title_font * 1.4;
     queueChromeLabel(state, .{
@@ -1113,7 +1213,7 @@ fn renderLinkedChatsDrawer(state: *app_state.AppState, rect: palette.Rect, layou
     const parent_count = parent.parentCount();
     const section_h = theme.scaledUi(22.0);
     const sections: f32 = if (parent_count > 0) (if (entries.len > parent_count) @as(f32, 2.0) else 1.0) else 0.0;
-    const content_h = row_h * @as(f32, @floatFromInt(entries.len)) + sections * section_h;
+    const content_h = row_h * @as(f32, @floatFromInt(entries.len + layout.subagents.items.len)) + (sections + (if (layout.subagents.items.len > 0) @as(f32, 1.0) else 0.0)) * section_h;
     const max_scroll = @max(content_h - list.h, 0.0);
     parent.scroll_y = theme.clampf(parent.scroll_y, 0.0, max_scroll);
     appendLinkedChatScrollHit(list, max_scroll, workspace_id, parent_id);
@@ -1135,6 +1235,30 @@ fn renderLinkedChatsDrawer(state: *app_state.AppState, rect: palette.Rect, layou
             .h = row_h - theme.scaledUi(4.0),
         };
         renderLinkedChatRow(state, row, list_clip, entry, pane_id, workspace_id, parent_id);
+    }
+    if (layout.subagents.items.len > 0) {
+        var label_buf: [96]u8 = undefined;
+        const label = std.fmt.bufPrint(&label_buf, "{s} Subagents", .{runtime.providerLabel(state.currentThread().provider)}) catch "Subagents";
+        queueChromeLabel(state, .{ .x = list.x + pad, .y = y + theme.scaledUi(2.0), .w = list.w - pad * 2.0, .h = section_h }, label, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), list_clip);
+        y += section_h;
+        for (layout.subagents.items) |agent| {
+            defer y += row_h;
+            if (y + row_h < list.y or y > list.y + list.h) continue;
+            const row = palette.Rect{ .x = list.x + pad, .y = y, .w = list.w - pad * 2.0, .h = row_h - theme.scaledUi(4.0) };
+            if (rectContains(intersectRect(row, list_clip), mouse_x, mouse_y)) queueRoundedClipped(state, row, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 10)), theme.scaledUi(8.0), list_clip);
+            var title_buffer: [256]u8 = undefined;
+            const title_text = truncateUiLabel(&title_buffer, agent.title.slice(), row.w, theme.scaledUi(13.0));
+            queueChromeLabel(state, .{ .x = row.x, .y = y + theme.scaledUi(6.0), .w = row.w, .h = theme.scaledUi(18.0) }, title_text, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), list_clip);
+            var age_buf: [16]u8 = undefined;
+            const age = linkedChatAgeLabel(&age_buf, agent.updated_at_ms);
+            var meta_buf: [64]u8 = undefined;
+            const meta = if (age.len > 0) std.fmt.bufPrint(&meta_buf, "{s} \u{00B7} {s}", .{ agent.status.label(), age }) catch agent.status.label() else agent.status.label();
+            queueChromeLabel(state, .{ .x = row.x, .y = y + theme.scaledUi(24.0), .w = row.w, .h = theme.scaledUi(16.0) }, meta, paletteColor(linkedChatStatusColor(agent.status)), theme.scaledUi(11.0), list_clip);
+            var index_buf: [32]u8 = undefined;
+            const index_text = std.fmt.bufPrint(&index_buf, "{d}", .{agent.message_index}) catch continue;
+            const visible = intersectRect(row, list_clip);
+            if (visible.w > 0 and visible.h > 0) appendLinkedChatHit(pane_id, visible, .subagent_open, workspace_id, parent_id, index_text, agent.tool_call_id.slice());
+        }
     }
 }
 
@@ -1262,7 +1386,7 @@ fn renderLinkedChatsRail(state: *app_state.AppState, rect: palette.Rect, parent:
     });
     queueRounded(state, badge, paletteColor(theme.withAlpha(badge_color, 56)), badge_d * 0.5);
     var count_buf: [8]u8 = undefined;
-    const count = std.fmt.bufPrint(&count_buf, "{d}", .{@min(entries.len, 99)}) catch "9";
+    const count = std.fmt.bufPrint(&count_buf, "{d}", .{@min(entries.len + parent.subagent_count, 99)}) catch "9";
     queueCenteredChromeLabel(state, badge, count, paletteColor(badge_color), theme.scaledUi(10.0), rect);
     appendLinkedChatHit(pane_id, rect, .toggle, parent.workspace_id, parent.parent_thread_id, "", "");
 }
@@ -2703,12 +2827,12 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
         queueWorkspaceHeaderFolderIcon(state, open_main_rect.x + (open_main_rect.w - folder_w) * 0.5, icon_cy, text_color_open);
     } else if (open_tex) |cached| {
         const scaled = runtime.scaledImageSize(cached.width, cached.height, icon_slot, icon_slot);
-        queueImage(state, .{
+        queueTintedImage(state, .{
             .x = icon_x + (icon_slot - scaled[0]) * 0.5,
             .y = open_main_rect.y + (button_h - scaled[1]) * 0.5,
             .w = scaled[0],
             .h = scaled[1],
-        }, cached, rect);
+        }, cached, text_color_open, rect);
     } else {
         queueIconText(state, .{
             .x = open_main_rect.x + (open_main_rect.w - icon_slot) * 0.5,
@@ -2827,52 +2951,27 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
         else
             theme.COLOR_TEXT_MUTED);
 
-        switch (kinds[ri]) {
-            .folder => queueWorkspaceHeaderFolderIcon(state, row_icon_x, row_icon_cy, row_col),
-            .configured_editor => {
-                if (state.editorLogoTextureForTarget(.configured)) |cached| {
-                    const scaled = runtime.scaledImageSize(cached.width, cached.height, theme.scaledUi(18.0), theme.scaledUi(18.0));
-                    queueImage(state, .{
-                        .x = row_icon_x + (theme.scaledUi(18.0) - scaled[0]) * 0.5,
-                        .y = rr.y + (menu_row_h - scaled[1]) * 0.5,
-                        .w = scaled[0],
-                        .h = scaled[1],
-                    }, cached, menu_clip);
-                }
-            },
-            .cursor => {
-                if (state.editorLogoTextureForTarget(.cursor)) |cached| {
-                    const scaled = runtime.scaledImageSize(cached.width, cached.height, theme.scaledUi(18.0), theme.scaledUi(18.0));
-                    queueImage(state, .{
-                        .x = row_icon_x + (theme.scaledUi(18.0) - scaled[0]) * 0.5,
-                        .y = rr.y + (menu_row_h - scaled[1]) * 0.5,
-                        .w = scaled[0],
-                        .h = scaled[1],
-                    }, cached, menu_clip);
-                }
-            },
-            .vscode => {
-                if (state.editorLogoTextureForTarget(.vscode)) |cached| {
-                    const scaled = runtime.scaledImageSize(cached.width, cached.height, theme.scaledUi(18.0), theme.scaledUi(18.0));
-                    queueImage(state, .{
-                        .x = row_icon_x + (theme.scaledUi(18.0) - scaled[0]) * 0.5,
-                        .y = rr.y + (menu_row_h - scaled[1]) * 0.5,
-                        .w = scaled[0],
-                        .h = scaled[1],
-                    }, cached, menu_clip);
-                }
-            },
-            .zed => {
-                if (state.editorLogoTextureForTarget(.zed)) |cached| {
-                    const scaled = runtime.scaledImageSize(cached.width, cached.height, theme.scaledUi(18.0), theme.scaledUi(18.0));
-                    queueImage(state, .{
-                        .x = row_icon_x + (theme.scaledUi(18.0) - scaled[0]) * 0.5,
-                        .y = rr.y + (menu_row_h - scaled[1]) * 0.5,
-                        .w = scaled[0],
-                        .h = scaled[1],
-                    }, cached, menu_clip);
-                }
-            },
+        const editor_target: ?app_state.ProjectEditorTarget = switch (kinds[ri]) {
+            .folder => null,
+            .configured_editor => .configured,
+            .cursor => .cursor,
+            .vscode => .vscode,
+            .zed => .zed,
+        };
+        if (editor_target) |target| {
+            // Editor logos are monochrome masks tinted like the folder glyph
+            // so they never read as AI-provider brand marks.
+            if (state.editorLogoTextureForTarget(target)) |cached| {
+                const scaled = runtime.scaledImageSize(cached.width, cached.height, theme.scaledUi(18.0), theme.scaledUi(18.0));
+                queueTintedImage(state, .{
+                    .x = row_icon_x + (theme.scaledUi(18.0) - scaled[0]) * 0.5,
+                    .y = rr.y + (menu_row_h - scaled[1]) * 0.5,
+                    .w = scaled[0],
+                    .h = scaled[1],
+                }, cached, row_col, menu_clip);
+            }
+        } else {
+            queueWorkspaceHeaderFolderIcon(state, row_icon_x, row_icon_cy, row_col);
         }
 
         queueFixedTextLine(state, .{
@@ -3098,8 +3197,15 @@ test "transcript hit geometry remains pane-local through scrolling clips" {
     try std.testing.expect(findTranscriptHit(100.0, 300.0) == null);
 }
 
-fn transcriptColumnAtLayoutWidth(rect: palette.Rect, layout_width: f32) palette.Rect {
-    const content_column = chatContentColumn(rect.x, layout_width);
+/// Lane geometry the transcript wraps against: the destination lane width and
+/// the linked-drawer reserve at that width, so the column matches the composer.
+const TranscriptLane = struct {
+    layout_width: f32,
+    linked_reserve: f32 = 0.0,
+};
+
+fn transcriptColumnAtLayoutWidth(rect: palette.Rect, lane: TranscriptLane) palette.Rect {
+    const content_column = chatLaneColumn(rect.x, lane.layout_width, lane.linked_reserve);
     return snapRect(.{
         .x = content_column.x,
         .y = rect.y + theme.scaledUi(28.0),
@@ -3112,8 +3218,8 @@ test "sidebar animation keeps transcript wrapping at the destination width" {
     defer theme.applyTheme(1.0);
     theme.applyTheme(1.0);
 
-    const first = transcriptColumnAtLayoutWidth(.{ .x = 100.0, .y = 40.0, .w = 620.0, .h = 500.0 }, 480.0);
-    const second = transcriptColumnAtLayoutWidth(.{ .x = 140.0, .y = 40.0, .w = 540.0, .h = 500.0 }, 480.0);
+    const first = transcriptColumnAtLayoutWidth(.{ .x = 100.0, .y = 40.0, .w = 620.0, .h = 500.0 }, .{ .layout_width = 480.0 });
+    const second = transcriptColumnAtLayoutWidth(.{ .x = 140.0, .y = 40.0, .w = 540.0, .h = 500.0 }, .{ .layout_width = 480.0 });
     try std.testing.expectEqual(first.w, second.w);
     try std.testing.expectEqual(first.x - 100.0, second.x - 140.0);
 }
@@ -3131,7 +3237,7 @@ const TranscriptBatchStart = struct {
 };
 
 // Transcript switch region; the shell is queued separately and remains opaque.
-fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, layout_width: f32, pane_id: ?app_state.WorkspacePaneId) void {
+fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, lane: TranscriptLane, pane_id: ?app_state.WorkspacePaneId) void {
     const active_geometry = paneOwnsActiveChatState(state, pane_id);
     const normal_options: TranscriptRenderOptions = .{
         .pane_id = pane_id,
@@ -3140,7 +3246,7 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, layout_width
         .request_hydration = true,
     };
     if (!active_geometry) {
-        _ = renderTranscriptContent(state, rect, layout_width, normal_options);
+        _ = renderTranscriptContent(state, rect, lane, normal_options);
         return;
     }
 
@@ -3154,7 +3260,7 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, layout_width
         state.cancelTranscriptTransition();
     }
     if (transition.phase == .idle) {
-        _ = renderTranscriptContent(state, rect, layout_width, normal_options);
+        _ = renderTranscriptContent(state, rect, lane, normal_options);
         state.noteTranscriptPresented(pane_id);
         return;
     }
@@ -3164,7 +3270,7 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, layout_width
         state.transcript_controller.motion_suppressed,
     )) {
         state.cancelTranscriptTransition();
-        _ = renderTranscriptContent(state, rect, layout_width, normal_options);
+        _ = renderTranscriptContent(state, rect, lane, normal_options);
         state.noteTranscriptPresented(pane_id);
         return;
     }
@@ -3181,7 +3287,7 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, layout_width
             // Materialize first. A resident target is already stable, so it
             // presents directly instead of compounding U1 with pane motion.
             const incoming_start = transcriptBatchStart(state);
-            const incoming_ready = renderTranscriptContent(state, rect, layout_width, preparation_options);
+            const incoming_ready = renderTranscriptContent(state, rect, lane, preparation_options);
             if (app_state.shouldPresentTranscriptImmediately(
                 transition.phase,
                 incoming_ready,
@@ -3195,7 +3301,7 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, layout_width
 
             if (state.outgoingTranscriptPresentation()) |outgoing| {
                 const batch_start = transcriptBatchStart(state);
-                renderOutgoingTranscript(state, rect, layout_width, outgoing);
+                renderOutgoingTranscript(state, rect, lane, outgoing);
                 multiplyTranscriptBatchOpacity(state, batch_start, transition.fadeOutOpacity(now_ms, fade_out_ms));
             } else {
                 transition.phase = .loading;
@@ -3208,7 +3314,7 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, layout_width
         },
         .loading => {
             const incoming_start = transcriptBatchStart(state);
-            const incoming_ready = renderTranscriptContent(state, rect, layout_width, preparation_options);
+            const incoming_ready = renderTranscriptContent(state, rect, lane, preparation_options);
             multiplyTranscriptBatchOpacity(state, incoming_start, 0.0);
             transition.advance(now_ms, generation, incoming_ready, fade_out_ms, fade_in_ms);
             if (transition.phase == .fading_in) state.noteTranscriptPresented(pane_id);
@@ -3216,7 +3322,7 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, layout_width
         },
         .fading_in => {
             const batch_start = transcriptBatchStart(state);
-            _ = renderTranscriptContent(state, rect, layout_width, normal_options);
+            _ = renderTranscriptContent(state, rect, lane, normal_options);
             multiplyTranscriptBatchOpacity(state, batch_start, transition.fadeInOpacity(now_ms, fade_in_ms));
             state.noteTranscriptPresented(pane_id);
             transition.advance(now_ms, generation, true, fade_out_ms, fade_in_ms);
@@ -3278,7 +3384,7 @@ test "streamed transcript cards fade with the fast token and reduced motion is i
 fn renderOutgoingTranscript(
     state: *app_state.AppState,
     rect: palette.Rect,
-    layout_width: f32,
+    lane: TranscriptLane,
     identity: app_state.TranscriptPresentationIdentity,
 ) void {
     if (identity.project_index >= state.project_controller.projects.items.len) return;
@@ -3294,7 +3400,7 @@ fn renderOutgoingTranscript(
         state.project_controller.selected_index = restore_project_index;
     }
 
-    _ = renderTranscriptContent(state, rect, layout_width, .{
+    _ = renderTranscriptContent(state, rect, lane, .{
         .pane_id = identity.pane_id,
         .active_geometry = false,
         .register_hits = false,
@@ -3322,10 +3428,10 @@ fn renderTranscriptLoadingIndicator(state: *app_state.AppState, rect: palette.Re
 }
 
 // Transcript content: final-width layout clipped to the pane body.
-fn renderTranscriptContent(state: *app_state.AppState, rect: palette.Rect, layout_width: f32, options: TranscriptRenderOptions) bool {
+fn renderTranscriptContent(state: *app_state.AppState, rect: palette.Rect, lane: TranscriptLane, options: TranscriptRenderOptions) bool {
     // At rest this is the shared composer/transcript formula. During the sidebar
     // slide only its width is final, preventing a fresh message wrap every frame.
-    const column = transcriptColumnAtLayoutWidth(rect, layout_width);
+    const column = transcriptColumnAtLayoutWidth(rect, lane);
     // Clip to full transcript body (same x/w as layout rect) so GL text and bubbles
     // stay below the workspace header when scrolled.
     const clip = rect;
@@ -7928,9 +8034,9 @@ fn renderCommandEventRow(
     if (show_open) {
         const open_hovered = rectContains(open_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
         const open_bg = if (open_hovered)
-            theme.withAlpha(theme.accent(), 64)
+            theme.wash(theme.accent(), 64)
         else
-            theme.withAlpha(theme.accent(), 36);
+            theme.wash(theme.accent(), 36);
         queueRoundedClipped(state, open_rect, paletteColor(open_bg), theme.scaledUi(5.0), clip);
         queueFixedTextLine(state, .{
             .x = open_rect.x + theme.scaledUi(10.0),
@@ -8209,17 +8315,21 @@ fn renderTranscriptBubbleFromParts(
     const bubble_width = if (role == .user) column.w * 0.62 else column.w;
     const bubble_x = if (role == .user) column.x + column.w - bubble_width else column.x;
     const bubble = snapRect(palette.Rect{ .x = bubble_x, .y = y, .w = bubble_width, .h = height });
+    // Replies sit on the panel surface so they lift off the pane background;
+    // the user's own turns carry a light accent wash with an accent edge.
     const bg = switch (role) {
-        .user => theme.withAlpha(theme.accent(), 64),
-        .assistant => theme.withAlpha(theme.background(), 242),
-        .system => theme.withAlpha(theme.COLOR_YELLOW, 54),
+        .user => theme.wash(theme.accent(), 64),
+        .assistant => theme.withAlpha(theme.COLOR_PANEL, 250),
+        .system => theme.wash(theme.COLOR_YELLOW, 54),
     };
     const rr = transcriptBubbleCornerRadius();
     const activity = if (active) theme.activityPulse(profiler.nowNs()) else 0.0;
     const border_color = if (active)
         theme.withAlpha(theme.COLOR_GREEN, @intFromFloat(92.0 + activity * 88.0))
+    else if (role == .user)
+        theme.border()
     else
-        theme.COLOR_PANEL_MUTED;
+        theme.borderMuted();
     queueRoundedShellClipped(state, bubble, paletteColor(bg), paletteColor(border_color), rr, clip);
 
     var label_x = bubble.x + theme.scaledUi(14.0);
@@ -10040,6 +10150,17 @@ fn queueImage(state: *app_state.AppState, rect: palette.Rect, texture: app_state
         .w = 1.0,
         .h = 1.0,
     }, .{ .r = 1.0, .g = 1.0, .b = 1.0, .a = 1.0 }, clip) catch {};
+}
+
+/// Draws a mask texture (white RGB, coverage in alpha) in `tint`.
+fn queueTintedImage(state: *app_state.AppState, rect: palette.Rect, texture: app_state.CachedImageTexture, tint: palette.Color, clip: ?palette.Rect) void {
+    if (!texture.valid or texture.texture_id == 0) return;
+    state.palette_overlay_batch.image(state.allocator, snapRect(rect), palette.TextureId.init(texture.texture_id), .{
+        .x = 0.0,
+        .y = 0.0,
+        .w = 1.0,
+        .h = 1.0,
+    }, tint, clip) catch {};
 }
 
 fn queueProviderLogo(state: *app_state.AppState, rect: palette.Rect, texture: app_state.CachedImageTexture, provider: app_state.Provider, clip: ?palette.Rect) void {

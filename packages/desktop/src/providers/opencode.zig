@@ -1,9 +1,9 @@
-//! OpenCode provider harness backed by the user's shared OpenCode 2 background service.
+//! OpenCode provider harness backed by the user's shared OpenCode background service (v2+).
 //!
-//! OpenCode 2 runs one background service per user account. Verde never owns
+//! OpenCode (2.x) runs one background service per user account. Verde never owns
 //! that process: it discovers the registration the service writes to
 //! `$XDG_STATE_HOME/opencode/service.json`, health-checks it with the
-//! registered password, and only asks the CLI (`opencode2 service start`) to
+//! registered password, and only asks the CLI (`opencode service start`) to
 //! bring one up when none is reachable. Every request is scoped to the
 //! workspace through the `location[directory]` query parameter.
 
@@ -18,7 +18,7 @@ const log = std.log.scoped(.native_opencode);
 const MAX_HTTP_BODY_BYTES = 8 * 1024 * 1024;
 const MAX_SERVICE_FILE_BYTES = 64 * 1024;
 const MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024;
-/// `opencode2 service start` returns once the service is registered; a few
+/// `opencode service start` returns once the service is registered; a few
 /// extra probes cover slow filesystems and the first health response.
 const MAX_HEALTH_WAIT_ATTEMPTS = 30;
 /// Health-probe receive deadline: long enough for a healthy local service under
@@ -64,7 +64,7 @@ const Condition = struct {
 
 pub const Config = struct {
     allocator: std.mem.Allocator,
-    executable: []const u8 = "opencode2",
+    executable: []const u8 = "opencode",
     /// Explicit server override. When null, Verde discovers the user's shared
     /// background service through its registration file.
     base_url: ?[]const u8 = null,
@@ -922,9 +922,9 @@ fn startBackgroundService(allocator: std.mem.Allocator, config: Config) !void {
     const term = try child.wait(threaded_spawn.io());
     switch (term) {
         .exited => |code| if (code != 0) {
-            log.warn("opencode2 service start exited with code {d}", .{code});
+            log.warn("opencode service start exited with code {d}", .{code});
         },
-        else => log.warn("opencode2 service start ended abnormally", .{}),
+        else => log.warn("opencode service start ended abnormally", .{}),
     }
 }
 
@@ -975,6 +975,12 @@ fn parseServiceRegistrationAlloc(allocator: std.mem.Allocator, contents: []const
 // inside std.http.Client.fetch — which has no read timeout — hanging the
 // provider-readiness worker and app shutdown, which joins that worker. So the
 // probe speaks minimal HTTP/1.1 over a stream raced against a std.Io timeout.
+//
+// The probe targets `GET /api/info`: 2.0 GA dropped the beta `/api/health`
+// route (404), and `/api/info` is the cheapest authenticated JSON route
+// (`{version, pid, urls}`) that proves the service is alive and the
+// registered password is accepted. Non-`/api` paths must not be used: the
+// bundled web UI answers every unknown path with `200 text/html`.
 fn checkHealth(allocator: std.mem.Allocator, base_url: []const u8, username: ?[]const u8, password: ?[]const u8) bool {
     return probeHealthBounded(allocator, base_url, username, password) catch |err| {
         log.debug("opencode health probe failed: {s}", .{@errorName(err)});
@@ -1008,13 +1014,13 @@ fn probeHealthBounded(allocator: std.mem.Allocator, base_url: []const u8, userna
     const request = if (auth_header) |header|
         try std.fmt.allocPrint(
             allocator,
-            "GET /api/health HTTP/1.1\r\nHost: {s}:{d}\r\n{s}: {s}\r\nConnection: close\r\n\r\n",
+            "GET /api/info HTTP/1.1\r\nHost: {s}:{d}\r\n{s}: {s}\r\nConnection: close\r\n\r\n",
             .{ host.bytes, port, header.name, header.value },
         )
     else
         try std.fmt.allocPrint(
             allocator,
-            "GET /api/health HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\n\r\n",
+            "GET /api/info HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\n\r\n",
             .{ host.bytes, port },
         );
     defer allocator.free(request);

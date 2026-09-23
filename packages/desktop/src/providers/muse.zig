@@ -12,21 +12,65 @@ const DEFAULT_EXECUTABLE = "muse";
 const INSTALL_FALLBACK_RELATIVE = ".local/bin/muse";
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 
-var active_process_state: acp.ActiveProcessState = .{};
-var send_mutex: std.Io.Mutex = .init;
+var active_processes: ActiveProcesses = .{};
+
+// Entries live on each send's stack and are removed before its pipes or
+// process are destroyed. The mutex protects only tracking and interruption,
+// never a provider turn or a blocking read from its stdout.
+const ActiveProcesses = struct {
+    const Entry = struct {
+        child: *platform_process.OwnedChild,
+        stdin: ?std.Io.File,
+        session_id: []const u8,
+        next: ?*Entry = null,
+    };
+
+    mutex: std.Io.Mutex = .init,
+    head: ?*Entry = null,
+
+    fn lock(self: *ActiveProcesses) void {
+        var threaded = std.Io.Threaded.init_single_threaded;
+        self.mutex.lockUncancelable(threaded.io());
+    }
+
+    fn unlock(self: *ActiveProcesses) void {
+        var threaded = std.Io.Threaded.init_single_threaded;
+        self.mutex.unlock(threaded.io());
+    }
+
+    fn register(self: *ActiveProcesses, entry: *Entry) void {
+        self.lock();
+        defer self.unlock();
+        entry.next = self.head;
+        self.head = entry;
+    }
+
+    fn unregister(self: *ActiveProcesses, entry: *Entry) void {
+        self.lock();
+        defer self.unlock();
+        var link = &self.head;
+        while (link.*) |current| {
+            if (current == entry) {
+                link.* = current.next;
+                entry.next = null;
+                return;
+            }
+            link = &current.next;
+        }
+    }
+
+    // Caller holds the registry lock while using the borrowed entry.
+    fn findLocked(self: *ActiveProcesses, session_id: []const u8) ?*Entry {
+        var current = self.head;
+        while (current) |entry| : (current = entry.next) {
+            if (std.mem.eql(u8, entry.session_id, session_id)) return entry;
+        }
+        return null;
+    }
+};
 
 const OPAQUE_HISTORY_NOTICE =
     "Muse could not replay this thread's private reasoning history. Starting a fresh Muse session.";
-
-fn lockSend() void {
-    var threaded = std.Io.Threaded.init_single_threaded;
-    send_mutex.lockUncancelable(threaded.io());
-}
-
-fn unlockSend() void {
-    var threaded = std.Io.Threaded.init_single_threaded;
-    send_mutex.unlock(threaded.io());
-}
 
 pub fn providerSlashCommands() []const provider_types.ProviderSlashCommand {
     return &.{};
@@ -183,8 +227,6 @@ pub const Client = struct {
         allocator: std.mem.Allocator,
         request: provider_types.SendPromptRequest,
     ) !provider_types.SendPromptResult {
-        lockSend();
-        defer unlockSend();
         return sendPromptOnce(self, allocator, request) catch |err| {
             if (err != error.MuseOpaqueHistory or request.thread_id == null) return err;
             if (request.on_failure) |callback| callback(request.stream_context, OPAQUE_HISTORY_NOTICE);
@@ -244,7 +286,13 @@ pub const Client = struct {
         errdefer allocator.free(session_id);
         if (request.on_thread_id) |callback| callback(request.stream_context, session_id);
 
-        active_process_state.register(&proc.process, proc.process.child.stdin, session_id);
+        var active: ActiveProcesses.Entry = .{
+            .child = &proc.process,
+            .stdin = proc.process.child.stdin,
+            .session_id = session_id,
+        };
+        active_processes.register(&active);
+        defer active_processes.unregister(&active);
         if (request.thread_id != null) {
             if (request.model orelse self.config.model) |model| {
                 if (!std.mem.eql(u8, model, "default")) {
@@ -274,19 +322,57 @@ pub const Client = struct {
         var published_answer = false;
         var turn_started = false;
 
-        while (try acp.takeLineAlloc(allocator, &reader)) |raw_line| {
+        const ReadEvent = union(enum) { line: anyerror!?[]u8, tick: std.Io.Cancelable!void };
+        var select_buffer: [2]ReadEvent = undefined;
+        var pending = std.Io.Select(ReadEvent).init(proc.threaded.io(), &select_buffer);
+        defer while (pending.cancel()) |event| {
+            switch (event) {
+                .line => |result| if (result catch null) |line| allocator.free(line),
+                .tick => {},
+            }
+        };
+        try pending.concurrent(.tick, waitForTerminalProbe, .{proc.threaded.io()});
+        var read_pending = false;
+        var probe_pending = false;
+        while (true) {
+            if (!read_pending) {
+                try pending.concurrent(.line, readMuseLine, .{ allocator, &reader });
+                read_pending = true;
+            }
+            const raw_line = switch (try pending.await()) {
+                .tick => |result| blk: {
+                    try result;
+                    try pending.concurrent(.tick, waitForTerminalProbe, .{proc.threaded.io()});
+                    // One bounded read-only request at a time. Keep the pending
+                    // stdout read intact: canceling it could lose a partial line.
+                    if (!probe_pending and turn_id_storage != null) {
+                        try proc.writeLine(try makeTerminalProbeAlloc(allocator, session_id));
+                        probe_pending = true;
+                    }
+                    break :blk null;
+                },
+                .line => |result| blk: {
+                    read_pending = false;
+                    break :blk (try result) orelse break;
+                },
+            } orelse continue;
             defer allocator.free(raw_line);
             const line = std.mem.trim(u8, raw_line, " \t\r");
             if (line.len == 0) continue;
             var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
             defer parsed.deinit();
+            var frame = parsed.value;
+            if (acp.responseId(frame) == 90) {
+                probe_pending = false;
+                frame = recoveredTerminal(frame, session_id, turn_id_storage) orelse continue;
+            }
 
-            if (acp.responseId(parsed.value)) |id| {
+            if (acp.responseId(frame)) |id| {
                 // Best-effort session/setModel (id 4) must not fail the turn.
                 if (id == 4) continue;
-                try failIfRpcError(parsed.value);
+                try failIfRpcError(frame);
                 if (id == 5) {
-                    const result = acp.getObjectField(parsed.value, "result") orelse return error.MuseProtocolFailed;
+                    const result = acp.getObjectField(frame, "result") orelse return error.MuseProtocolFailed;
                     const turn_id = acp.getOptionalObjectString(result, "turnId") orelse return error.MuseProtocolFailed;
                     turn_id_storage = try allocator.dupe(u8, turn_id);
                     turn_started = true;
@@ -294,7 +380,7 @@ pub const Client = struct {
                 }
                 continue;
             }
-            failIfRpcError(parsed.value) catch |err| {
+            failIfRpcError(frame) catch |err| {
                 if (err == error.MuseOpaqueHistory and turn_started) {
                     if (published_answer) {
                         turn_succeeded = true;
@@ -306,9 +392,18 @@ pub const Client = struct {
                 return err;
             };
 
-            const method = acp.getOptionalObjectString(parsed.value, "method") orelse continue;
-            const params = acp.getObjectField(parsed.value, "params") orelse continue;
-            if (std.mem.eql(u8, method, "turn/started")) {
+            const method = acp.getOptionalObjectString(frame, "method") orelse continue;
+            const params = acp.getObjectField(frame, "params") orelse continue;
+            if (std.mem.eql(u8, method, "session/viewHealthChanged")) {
+                if (std.mem.eql(u8, acp.getOptionalObjectString(params, "sessionId") orelse "", session_id) and
+                    std.mem.eql(u8, acp.getOptionalObjectString(params, "health") orelse "", "unavailable"))
+                {
+                    if (request.on_stream_event) |callback| callback(request.stream_context, .{ .message = .{
+                        .title = "Muse updates delayed",
+                        .body = "Muse's live updates are unavailable. Checking its saved turn status for completion.",
+                    } });
+                }
+            } else if (std.mem.eql(u8, method, "turn/started")) {
                 const started_turn_id = acp.getOptionalObjectString(params, "turnId") orelse "";
                 if (!eventBelongsToTurn(turn_id_storage, started_turn_id)) continue;
                 turn_started = true;
@@ -392,7 +487,7 @@ pub const Client = struct {
                         turn_succeeded = true;
                         break;
                     }
-                    if (request.on_failure) |callback| callback(request.stream_context, message);
+                    reportMuseFailure(allocator, request, message);
                     return error.MuseTurnFailed;
                 }
                 if (std.mem.eql(u8, terminal, "cancelled")) {
@@ -430,6 +525,7 @@ pub const Client = struct {
         }
         if (!turn_succeeded and !published_answer) return error.MuseProtocolFailed;
         publishAnswerIfReady(request, reply.items, true, 0, &published_answer);
+        active_processes.unregister(&active);
         proc.stop();
         return .{
             .thread_id = session_id,
@@ -448,16 +544,15 @@ pub const Client = struct {
             null;
         defer if (line) |payload| self.allocator.free(payload);
 
-        active_process_state.lock();
-        defer active_process_state.unlock();
-        const child = active_process_state.child orelse return;
-        const session_id = active_process_state.session_id orelse return;
-        if (!std.mem.eql(u8, session_id, request.thread_id)) return;
+        active_processes.lock();
+        defer active_processes.unlock();
+        const active = active_processes.findLocked(request.thread_id) orelse return;
+        const child = active.child;
         // Priority-lane interrupt first so Muse can leave an approval wait.
         // terminateTree is the fail-safe when stdin is already closed or the
         // host ignores the command while blocked.
         if (line) |payload| {
-            if (active_process_state.stdin) |stdin| {
+            if (active.stdin) |stdin| {
                 acp.writeJsonLineToFile(self.allocator, stdin, payload) catch {};
             }
         }
@@ -494,7 +589,6 @@ pub const Client = struct {
             .process = child,
             .env_map = env_map,
             .executable = executable,
-            .active_state = &active_process_state,
         };
     }
 
@@ -511,10 +605,74 @@ pub const Client = struct {
     }
 };
 
+fn readMuseLine(allocator: std.mem.Allocator, reader: *std.Io.File.Reader) anyerror!?[]u8 {
+    return acp.takeLineAlloc(allocator, reader);
+}
+
+fn waitForTerminalProbe(io: std.Io) std.Io.Cancelable!void {
+    try io.sleep(.fromSeconds(10), .awake);
+}
+
+fn makeTerminalProbeAlloc(allocator: std.mem.Allocator, session_id: []const u8) ![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .id = 90,
+        .method = "view/page",
+        .params = .{ .sessionId = session_id, .direction = "backward", .limit = 100 },
+    }, .{});
+}
+
+// View delivery can stop while Muse continues appending durable records.
+// Only reconcile the exact active turn; old turns and reminder children are
+// not evidence that this request finished. No transcript events are replayed.
+fn recoveredTerminal(value: std.json.Value, session_id: []const u8, turn_id: ?[]const u8) ?std.json.Value {
+    const result = acp.getObjectField(value, "result") orelse return null;
+    const events = acp.getObjectField(result, "events") orelse return null;
+    if (events != .array) return null;
+    for (events.array.items) |event| {
+        if (!std.mem.eql(u8, acp.getOptionalObjectString(event, "method") orelse "", "turn/completed")) continue;
+        const params = acp.getObjectField(event, "params") orelse continue;
+        if (!std.mem.eql(u8, acp.getOptionalObjectString(params, "sessionId") orelse "", session_id)) continue;
+        const id = acp.getOptionalObjectString(params, "turnId") orelse continue;
+        if (turn_id == null or !std.mem.eql(u8, turn_id.?, id)) continue;
+        // A successful turn requires its full answer, not just a terminal
+        // receipt. This probe recovers failures, never invents empty success.
+        const terminal = acp.getOptionalObjectString(params, "terminal") orelse continue;
+        if (!std.mem.eql(u8, terminal, "failed") and !std.mem.eql(u8, terminal, "cancelled")) continue;
+        return event;
+    }
+    return null;
+}
+
+fn reportMuseFailure(allocator: std.mem.Allocator, request: provider_types.SendPromptRequest, message: []const u8) void {
+    const callback = request.on_failure orelse return;
+    const friendly = friendlyQuotaMessageAlloc(allocator, message) catch null;
+    defer if (friendly) |text| allocator.free(text);
+    callback(request.stream_context, friendly orelse message);
+}
+
+fn friendlyQuotaMessageAlloc(allocator: std.mem.Allocator, message: []const u8) !?[]u8 {
+    if (!containsIgnoreCase(message, "subscription quota exhausted")) return null;
+    const marker = "resets at ";
+    var reset: ?[]const u8 = null;
+    if (std.mem.indexOf(u8, message, marker)) |start| {
+        const suffix = message[start + marker.len ..];
+        if (suffix.len >= 20 and suffix[4] == '-' and suffix[7] == '-' and suffix[10] == 'T' and suffix[13] == ':' and suffix[16] == ':' and suffix[19] == 'Z') reset = suffix[0..20];
+    }
+    if (reset) |stamp| {
+        const month = std.fmt.parseInt(usize, stamp[5..7], 10) catch 0;
+        const day = std.fmt.parseInt(u8, stamp[8..10], 10) catch 0;
+        const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+        if (month >= 1 and month <= 12 and day >= 1 and day <= 31) return try std.fmt.allocPrint(allocator, "Muse usage limit reached\n\nYou've used your plan's allowance for this usage window.\nResets {s} {d}, {s} at {s} UTC.\n\nTry again after the reset, or switch providers to keep working.", .{ months[month - 1], day, stamp[0..4], stamp[11..16] });
+    }
+    return try allocator.dupe(u8, "Muse usage limit reached\n\nYou've used your plan's allowance for this usage window.\n\nTry again when your usage window resets, or switch providers to keep working.");
+}
+
 pub fn shutdownOwnedServer() void {
-    active_process_state.lock();
-    defer active_process_state.unlock();
-    if (active_process_state.child) |child| child.terminateTree();
+    active_processes.lock();
+    defer active_processes.unlock();
+    var current = active_processes.head;
+    while (current) |entry| : (current = entry.next) entry.child.terminateTree();
 }
 
 fn isNonRecoverableRetryReason(reason: []const u8) bool {
@@ -1606,4 +1764,114 @@ test "Muse GUI turn finishes after the agent message without waiting for EOT gat
     try noteForegroundWork(std.testing.allocator, &work, done.value, true);
     try std.testing.expectEqual(@as(usize, 0), work.count());
     try std.testing.expect(shouldFinishMuseTurn(true, work.count()));
+}
+
+test "Muse concurrent sessions retain independent interrupt targets through cleanup" {
+    var registry: ActiveProcesses = .{};
+    // No child is launched: only identity and lifetime are exercised here.
+    var first_child: platform_process.OwnedChild = undefined;
+    var second_child: platform_process.OwnedChild = undefined;
+    var third_child: platform_process.OwnedChild = undefined;
+    var first: ActiveProcesses.Entry = .{ .child = &first_child, .stdin = null, .session_id = "first" };
+    var second: ActiveProcesses.Entry = .{ .child = &second_child, .stdin = null, .session_id = "second" };
+    var third: ActiveProcesses.Entry = .{ .child = &third_child, .stdin = null, .session_id = "third" };
+    registry.register(&first);
+    registry.register(&second);
+    registry.register(&third);
+    {
+        registry.lock();
+        defer registry.unlock();
+        try std.testing.expectEqual(&first_child, registry.findLocked("first").?.child);
+        try std.testing.expectEqual(&second_child, registry.findLocked("second").?.child);
+        try std.testing.expectEqual(@as(?*ActiveProcesses.Entry, null), registry.findLocked("unknown"));
+    }
+    registry.unregister(&second);
+    registry.unregister(&second); // Explicit stop followed by deferred cleanup.
+    {
+        registry.lock();
+        defer registry.unlock();
+        try std.testing.expect(registry.findLocked("second") == null);
+        try std.testing.expectEqual(&first_child, registry.findLocked("first").?.child);
+        try std.testing.expectEqual(&third_child, registry.findLocked("third").?.child);
+    }
+    registry.unregister(&first);
+    registry.unregister(&third);
+    try std.testing.expect(registry.head == null);
+}
+
+test "Muse failure reconciliation selects only the exact session and turn" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"result":{"events":[{"method":"turn/completed","params":{"sessionId":"other","turnId":"active","terminal":"failed"}},{"method":"turn/completed","params":{"sessionId":"session","turnId":"old","terminal":"failed"}},{"method":"turn/completed","params":{"sessionId":"session","turnId":"active","terminal":"failed","error":{"message":"Subscription quota exhausted."}}}]}}
+    , .{});
+    defer parsed.deinit();
+    const event = recoveredTerminal(parsed.value, "session", "active").?;
+    const params = acp.getObjectField(event, "params").?;
+    try std.testing.expectEqualStrings("Subscription quota exhausted.", acp.getOptionalObjectString(acp.getObjectField(params, "error").?, "message").?);
+    try std.testing.expect(recoveredTerminal(parsed.value, "session", null) == null);
+    try std.testing.expect(recoveredTerminal(parsed.value, "session", "missing") == null);
+    var success = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"result":{"events":[{"method":"turn/completed","params":{"sessionId":"session","turnId":"active","terminal":"succeeded"}}]}}
+    , .{});
+    defer success.deinit();
+    try std.testing.expect(recoveredTerminal(success.value, "session", "active") == null);
+}
+
+test "Muse quota notice strips API details and preserves the reset date" {
+    const allocator = std.testing.allocator;
+    const friendly = (try friendlyQuotaMessageAlloc(allocator, "API error 429 [request_id=secret-id]: Subscription quota exhausted. Your usage window resets at 2026-09-22T19:21:20Z. (rate_limit_error)")).?;
+    defer allocator.free(friendly);
+    try std.testing.expect(std.mem.startsWith(u8, friendly, "Muse usage limit reached\n\n"));
+    try std.testing.expect(std.mem.indexOf(u8, friendly, "Sep 22, 2026 at 19:21 UTC") != null);
+    try std.testing.expect(std.mem.indexOf(u8, friendly, "request_id") == null);
+    try std.testing.expect(std.mem.indexOf(u8, friendly, "rate_limit_error") == null);
+    const fallback = (try friendlyQuotaMessageAlloc(allocator, "Subscription quota exhausted. Your usage window resets at unknown.")).?;
+    defer allocator.free(fallback);
+    try std.testing.expect(std.mem.indexOf(u8, fallback, "when your usage window resets") != null);
+    try std.testing.expect(try friendlyQuotaMessageAlloc(allocator, "Connection lost") == null);
+}
+
+test "Muse recovers a missing failure push from the saved view without hanging" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The fake host has a finite input deadline and never launches a provider.
+    // It deliberately omits turn/completed, just like the stalled live turn.
+    const script =
+        \\#!/bin/bash
+        \\while IFS= read -r -t 20 line; do
+        \\  case "$line" in
+        \\    *'"method":"initialize"'*) echo '{"jsonrpc":"2.0","id":1,"result":{}}' ;;
+        \\    *'"method":"session/start"'*) echo '{"jsonrpc":"2.0","id":2,"result":{"session":{"sessionId":"fixture-session"}}}' ;;
+        \\    *'"method":"turn/start"'*) echo '{"jsonrpc":"2.0","id":5,"result":{"turnId":"fixture-turn"}}' ;;
+        \\    *'"method":"view/page"'*) echo '{"jsonrpc":"2.0","id":90,"result":{"events":[{"method":"turn/completed","params":{"sessionId":"fixture-session","turnId":"fixture-turn","terminal":"failed","error":{"message":"Subscription quota exhausted. Your usage window resets at 2026-09-22T19:21:20Z."}}}]}}' ;;
+        \\  esac
+        \\done
+    ;
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "fake-muse", .{ .permissions = .fromMode(0o700) });
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, script);
+    }
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buffer);
+    const executable = try std.fs.path.join(allocator, &.{ path_buffer[0..path_len], "fake-muse" });
+    defer allocator.free(executable);
+    var client = try Client.init(allocator, .{ .executable = executable, .cwd = path_buffer[0..path_len] });
+    defer client.deinit();
+    const Sink = struct {
+        saw_quota: bool = false,
+        fn failure(context: ?*anyopaque, message: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.saw_quota = std.mem.startsWith(u8, message, "Muse usage limit reached");
+        }
+    };
+    var sink: Sink = .{};
+    try std.testing.expectError(error.MuseTurnFailed, client.sendPrompt(allocator, .{
+        .prompt = "fixture",
+        .stream_context = &sink,
+        .on_failure = Sink.failure,
+    }));
+    try std.testing.expect(sink.saw_quota);
 }

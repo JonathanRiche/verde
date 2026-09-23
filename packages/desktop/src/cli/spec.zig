@@ -171,6 +171,7 @@ pub const live_capabilities = [_][]const u8{
     "chat.approve",
     "browser.open",
     "browser.navigate",
+    "browser.tabOpen",
     "browser.status",
     "browser.close",
     "browser.toggle",

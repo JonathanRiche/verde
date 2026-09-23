@@ -2229,6 +2229,12 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             const text_input = std.mem.sliceTo(event.text.text, 0);
+            if (state.prefix_help_search_active) {
+                state.appendPrefixHelpQuery(text_input);
+                state.markDirty();
+                syncWindowTextInput(window, state);
+                return true;
+            }
             if (suppressDuplicateMacosTextInput(text_input, event.text.timestamp)) return true;
             if (ui_layout.handlePaletteTextInput(state, text_input)) {
                 syncWindowTextInput(window, state);
@@ -2617,6 +2623,7 @@ fn syncWindowTextInput(window: *sdl.Window, state: *AppState) void {
         return;
     }
     const needs_sdl_text_input = state.terminal_controller.focused or
+        state.prefix_help_search_active or
         state.composer_controller.composer.focused or
         (state.isCompanionEnabled() and state.companion_composer.focused) or
         // The model picker's embedded search field consumes typed characters
@@ -2935,6 +2942,7 @@ fn disarmPrefix(state: *AppState) void {
     if (!state.prefix_armed and !state.prefix_help_visible) return;
     state.prefix_armed = false;
     state.prefix_help_visible = false;
+    state.resetPrefixHelpInteraction();
     state.markDirty();
 }
 
@@ -2942,6 +2950,7 @@ fn exitPrefixNavigate(state: *AppState) void {
     if (!state.prefix_navigate) return;
     state.prefix_navigate = false;
     state.prefix_help_visible = false;
+    state.resetPrefixHelpInteraction();
     state.markDirty();
 }
 
@@ -2953,6 +2962,7 @@ fn handleNavigateKeyDown(
 ) bool {
     if (!event.down) return true;
     if (isModifierOnlyKey(event.scancode)) return true;
+    if (state.prefix_help_visible and handlePrefixHelpKeyDown(state, keyboard, event)) return true;
     if (event.key == .escape) {
         exitPrefixNavigate(state);
         return true;
@@ -2989,6 +2999,7 @@ fn handleArmedPrefixKeyDown(
     if (!event.down) return true;
     // Holding Shift/Ctrl for the second key must not cancel the chord.
     if (isModifierOnlyKey(event.scancode)) return true;
+    if (state.prefix_help_visible and handlePrefixHelpKeyDown(state, keyboard, event)) return true;
     if (event.repeat) return true;
     disarmPrefix(state);
     if (keyboard.isPrefixKeyEvent(event)) {
@@ -3005,6 +3016,55 @@ fn handleArmedPrefixKeyDown(
     };
     state.prefix_swallow_text_input = true;
     dispatchPrefixTarget(state, keyboard, target);
+    return true;
+}
+
+/// Cheat-sheet keys: `/` opens a filter, arrows move the selection and Enter
+/// runs it. While the filter is open every key belongs to it (typed text
+/// arrives as text_input); otherwise unclaimed keys fall through to chords.
+fn handlePrefixHelpKeyDown(
+    state: *AppState,
+    keyboard: *keybinds.NativeKeyboardConfig,
+    event: *const sdl.KeyboardEvent,
+) bool {
+    const plain = !isKeymodPressed(event.mod, sdl.Keymod.shift) and
+        !isKeymodPressed(event.mod, sdl.Keymod.ctrl) and
+        !isKeymodPressed(event.mod, sdl.Keymod.alt) and
+        !isKeymodPressed(event.mod, sdl.Keymod.gui);
+    switch (event.key) {
+        .up => ui_layout.movePrefixHelpSelection(state, .up),
+        .down => ui_layout.movePrefixHelpSelection(state, .down),
+        .left => ui_layout.movePrefixHelpSelection(state, .left),
+        .right => ui_layout.movePrefixHelpSelection(state, .right),
+        .@"return", .kp_enter => {
+            if (event.repeat) return true;
+            const target = ui_layout.selectedPrefixHelpTarget(state) orelse return true;
+            state.prefix_swallow_text_input = true;
+            const navigate = state.prefix_navigate and !state.prefix_armed;
+            if (navigate) exitPrefixNavigate(state) else disarmPrefix(state);
+            if (!(navigate and target == .navigate)) dispatchPrefixTarget(state, keyboard, target);
+            return true;
+        },
+        else => {
+            if (state.prefix_help_search_active) {
+                switch (event.key) {
+                    .escape => state.prefix_help_search_active = false,
+                    .backspace => if (!state.popPrefixHelpQuery()) {
+                        state.prefix_help_search_active = false;
+                    },
+                    // Printable keys reach the query through text_input.
+                    else => return true,
+                }
+            } else if (event.key == .slash and plain and !event.repeat) {
+                state.prefix_help_search_active = true;
+                // The `/` itself must not land in the new query.
+                state.prefix_swallow_text_input = true;
+            } else {
+                return false;
+            }
+        },
+    }
+    state.markDirty();
     return true;
 }
 
@@ -3032,6 +3092,7 @@ fn dispatchPrefixTarget(state: *AppState, keyboard: *keybinds.NativeKeyboardConf
             // Cheat sheet keeps the chord live so the next key still fires.
             state.prefix_armed = true;
             state.prefix_help_visible = true;
+            state.resetPrefixHelpInteraction();
             state.markDirty();
         },
         .navigate => {

@@ -511,6 +511,7 @@ fn persistedMessageSnapshot(
         .tool_call_id = try dupeOptionalSlice(allocator, message.tool_call_id),
         .tool_call_kind = message.tool_call_kind,
         .tool_call_status = message.tool_call_status,
+        .updated_at_ms = message.updated_at_ms,
         // Identity carriage (M4-P4): the flush must never re-mint an id the
         // projection already knows (daemon-adopted or client-staged).
         .message_id = try dupeOptionalSlice(allocator, message.message_id),
@@ -755,6 +756,7 @@ fn messagesToProtocol(
             .tool_call_id = try dupeOptionalSlice(allocator, message.tool_call_id),
             .tool_call_kind = if (message.tool_call_kind) |v| try allocator.dupe(u8, @tagName(v)) else null,
             .tool_call_status = if (message.tool_call_status) |v| try allocator.dupe(u8, @tagName(v)) else null,
+            .updated_at_ms = message.updated_at_ms,
         };
     }
     return out;
@@ -796,7 +798,7 @@ pub fn buildThreadFromPersisted(allocator: std.mem.Allocator, persisted_thread: 
         allocator.free(thread.local_thread_id);
         thread.local_thread_id = try allocator.dupeZ(u8, local_thread_id);
     }
-    thread.last_activity_at = persisted_thread.last_activity_at orelse 0;
+    thread.last_activity_at = headless.store.threadActivitySeconds(persisted_thread.last_activity_at) orelse 0;
     thread.provider_thread_id = if (persisted_thread.provider_thread_id) |thread_id|
         try allocator.dupeZ(u8, thread_id)
     else
@@ -844,6 +846,7 @@ pub fn buildThreadFromPersisted(allocator: std.mem.Allocator, persisted_thread: 
             .tool_call_id = try dupeOptionalSlice(allocator, message.tool_call_id),
             .tool_call_kind = message.tool_call_kind,
             .tool_call_status = message.tool_call_status,
+            .updated_at_ms = message.updated_at_ms,
             .message_id = try dupeOptionalNonEmptySlice(allocator, message.message_id),
         });
     }
@@ -1257,7 +1260,7 @@ pub fn applyPersistedReusing(
                     self.allocator.free(thread.local_thread_id);
                     thread.local_thread_id = try self.allocator.dupeZ(u8, local_thread_id);
                 }
-                thread.last_activity_at = persisted_thread.last_activity_at orelse 0;
+                thread.last_activity_at = headless.store.threadActivitySeconds(persisted_thread.last_activity_at) orelse 0;
                 thread.provider_thread_id = if (persisted_thread.provider_thread_id) |thread_id|
                     try self.allocator.dupeZ(u8, thread_id)
                 else
@@ -1307,6 +1310,7 @@ pub fn applyPersistedReusing(
                         .tool_call_id = try dupeOptionalSlice(self.allocator, message.tool_call_id),
                         .tool_call_kind = message.tool_call_kind,
                         .tool_call_status = message.tool_call_status,
+                        .updated_at_ms = message.updated_at_ms,
                         .message_id = try dupeOptionalNonEmptySlice(self.allocator, message.message_id),
                     });
                 }
@@ -1350,6 +1354,7 @@ pub fn applyPersistedReusing(
                     .tool_call_id = try dupeOptionalSlice(self.allocator, message.tool_call_id),
                     .tool_call_kind = message.tool_call_kind,
                     .tool_call_status = message.tool_call_status,
+                    .updated_at_ms = message.updated_at_ms,
                     .message_id = try dupeOptionalNonEmptySlice(self.allocator, message.message_id),
                 });
             }
@@ -1379,6 +1384,7 @@ pub fn applyPersistedReusing(
                     .tool_call_id = try dupeOptionalSlice(self.allocator, message.tool_call_id),
                     .tool_call_kind = message.tool_call_kind,
                     .tool_call_status = message.tool_call_status,
+                    .updated_at_ms = message.updated_at_ms,
                     .message_id = try dupeOptionalNonEmptySlice(self.allocator, message.message_id),
                 });
             }
@@ -1585,6 +1591,7 @@ fn cloneMessages(allocator: std.mem.Allocator, messages: []const PersistedMessag
             .tool_call_id = try cloneOptionalSlice(allocator, message.tool_call_id),
             .tool_call_kind = message.tool_call_kind,
             .tool_call_status = message.tool_call_status,
+            .updated_at_ms = message.updated_at_ms,
             .message_id = try cloneOptionalSlice(allocator, message.message_id),
         };
     }
@@ -1790,9 +1797,12 @@ fn persistedThreadIndexById(threads: []const PersistedThread, id: []const u8) ?u
     return null;
 }
 
-/// Build the close sidecar's local overlay. Existing durable identities need
-/// metadata only for the three-way merge; transcript payloads are retained
-/// solely for locally added workspaces/threads that have no durable owner yet.
+/// Build the baseline-relative payload used both as the close sidecar's local
+/// overlay and as the `state.snapshot.replace` wire body. Rows below the
+/// baseline extent are daemon-owned and immutable in the GUI, so only the
+/// suffix past that extent (or the whole transcript of a thread/workspace the
+/// baseline lacks) is carried. Hydrated history never rides the wire, which
+/// keeps snapshots of large transcripts under the daemon transport limit.
 pub fn clonePersistedSpoolDelta(
     backing_allocator: std.mem.Allocator,
     current: PersistedState,
@@ -1841,12 +1851,67 @@ pub fn clonePersistedSpoolDelta(
                             allocator,
                             thread.messages[suffix_start - thread.message_offset ..],
                         );
+                    } else if (current_end < baseline_end) {
+                        // Local truncation (e.g. a rejected send rolled back
+                        // its staged row). Only a carried tail lets the
+                        // daemon drop rows past current_end.
+                        loaded_threads[thread_index].message_offset = thread.message_offset;
+                        loaded_threads[thread_index].messages = try cloneMessages(allocator, thread.messages);
                     }
                 }
             }
         }
     }
     return loaded;
+}
+
+test "transport delta keeps hydrated durable history off the snapshot wire" {
+    const a = std.testing.allocator;
+    const huge = try a.alloc(u8, 3 * 1024 * 1024);
+    defer a.free(huge);
+    @memset(huge, 'x');
+    const hydrated = [_]PersistedMessage{
+        .{ .role = .assistant, .author = "A", .body = huge, .message_id = "turn:t:msg:1" },
+        .{ .role = .assistant, .author = "A", .body = huge, .message_id = "turn:t:msg:2" },
+        .{ .role = .assistant, .author = "A", .body = huge, .message_id = "turn:t:msg:3" },
+        .{ .role = .system, .author = "Handoff prepared", .body = "local-only row" },
+    };
+    const rolled_back = [_]PersistedMessage{.{ .role = .user, .author = "You", .body = "kept" }};
+    const base_threads = [_]PersistedThread{
+        .{ .title = "Big", .local_thread_id = "big", .message_offset = 43 },
+        .{ .title = "Cold", .local_thread_id = "cold", .message_offset = 3 },
+        .{ .title = "Trunc", .local_thread_id = "trunc", .message_offset = 2 },
+    };
+    const cur_threads = [_]PersistedThread{
+        .{ .title = "Big", .local_thread_id = "big", .message_offset = 40, .messages = &hydrated },
+        .{ .title = "Cold", .local_thread_id = "cold", .message_offset = 0, .messages = hydrated[0..3] },
+        .{ .title = "Trunc", .local_thread_id = "trunc", .message_offset = 0, .messages = &rolled_back },
+    };
+    const base_projects = [_]PersistedProject{.{ .id = "w", .label = "W", .path = "/w", .threads = &base_threads }};
+    const cur_projects = [_]PersistedProject{.{ .id = "w", .label = "W", .path = "/w", .threads = &cur_threads }};
+    const base: PersistedState = .{ .projects = &base_projects };
+    const cur: PersistedState = .{ .projects = &cur_projects };
+
+    var wire = try clonePersistedSpoolDelta(a, cur, base);
+    defer wire.deinit();
+    const t = wire.value.projects[0].threads.?;
+    // Hydrated history below the baseline extent stays off the wire; only
+    // the local-only suffix rides.
+    try std.testing.expectEqual(@as(usize, 43), t[0].message_offset);
+    try std.testing.expectEqual(@as(usize, 1), t[0].messages.len);
+    try std.testing.expectEqualStrings("local-only row", t[0].messages[0].body);
+    // Unchanged thread: an empty tail at its extent is a daemon no-op.
+    try std.testing.expectEqual(@as(usize, 3), t[1].message_offset);
+    try std.testing.expectEqual(@as(usize, 0), t[1].messages.len);
+    // Local truncation carries the whole tail so the daemon drops the rest.
+    try std.testing.expectEqual(@as(usize, 0), t[2].message_offset);
+    try std.testing.expectEqual(@as(usize, 1), t[2].messages.len);
+
+    // Extents survive the acknowledgement baseline.
+    var compact = try clonePersistedBaseline(a, wire.value);
+    defer compact.deinit();
+    try std.testing.expectEqual(@as(usize, 44), compact.value.projects[0].threads.?[0].message_offset);
+    try std.testing.expectEqual(@as(usize, 3), compact.value.projects[0].threads.?[1].message_offset);
 }
 
 test "compact baseline and spool delta omit durable transcript bodies" {

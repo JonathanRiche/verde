@@ -1993,7 +1993,7 @@ pub fn captureBrowserScreenshot(self: anytype) !BrowserScreenshotResult {
 
 /// Reuses the workspace process manager for the browser empty-state CTA.
 /// Existing process configuration wins; otherwise the workspace opens in
-/// the configured editor so the user can add a `verde.yml` process.
+/// the configured editor so the user can add a `verde.toml` process.
 pub fn setupBrowserDevServer(self: anytype) void {
     if (self.project_controller.projects.items.len == 0) {
         self.setSidebarNotice("Import a workspace before setting up a dev server.");
@@ -2002,7 +2002,7 @@ pub fn setupBrowserDevServer(self: anytype) void {
     const project_index = self.project_controller.selected_index;
     self.refreshProjectStackConfig(project_index) catch |err| {
         log.warn("failed to load dev-server process config: {s}", .{@errorName(err)});
-        self.setSidebarNotice("Fix the workspace verde.yml before starting its dev server.");
+        self.setSidebarNotice("Fix the workspace verde.toml before starting its dev server.");
         return;
     };
 
@@ -2027,7 +2027,7 @@ pub fn setupBrowserDevServer(self: anytype) void {
     }
 
     self.openCurrentProjectEditor(.configured);
-    self.setSidebarNotice("Add a dev-server process to verde.yml, then use this action again.");
+    self.setSidebarNotice("Add a dev-server process to verde.toml, then use this action again.");
 }
 
 /// Navigates typed addresses or reloads when the URL bar already matches the current page.

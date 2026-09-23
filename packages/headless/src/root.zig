@@ -12,6 +12,7 @@ pub const registry = @import("registry_protocol.zig");
 pub const store_protocol = @import("store_protocol.zig");
 pub const changes_protocol = @import("changes_protocol.zig");
 pub const provider_types = @import("provider_types.zig");
+pub const provider_install = @import("provider_install.zig");
 pub const providers_protocol = @import("providers_protocol.zig");
 pub const session_protocol = @import("session_protocol.zig");
 pub const access_protocol = @import("access_protocol.zig");

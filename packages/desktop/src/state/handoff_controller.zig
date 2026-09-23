@@ -297,11 +297,15 @@ pub fn handoffTargetModelLabel(self: anytype) []const u8 {
         if (self.handoff_controller.target_thread_index) |index| {
             if (self.handoff_controller.project_index < self.project_controller.projects.items.len) {
                 const project = &self.project_controller.projects.items[self.handoff_controller.project_index];
-                if (index < project.threads.items.len) return project.threads.items[index].model_ref orelse "Provider default";
+                if (index < project.threads.items.len) return handoffModelLabel(self.handoff_controller.target_provider, project.threads.items[index].model_ref orelse "Provider default");
             }
         }
     }
-    return defaultModelRef(self, self.handoff_controller.target_provider);
+    return handoffModelLabel(self.handoff_controller.target_provider, defaultModelRef(self, self.handoff_controller.target_provider));
+}
+
+fn handoffModelLabel(provider: Provider, model_ref: []const u8) []const u8 {
+    return if (provider == .cursor) provider_models.cursorModelLabel(model_ref, model_ref) else model_ref;
 }
 
 /// Creates the target and fills its input with the preview. It deliberately

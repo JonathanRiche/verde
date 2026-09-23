@@ -22,9 +22,9 @@ pub const ProviderReadiness = enum {
 pub fn detectProviderReadiness(provider: Provider) ProviderReadiness {
     const executable_ready = switch (provider) {
         .codex => process_env.commandExists("codex"),
-        .opencode => process_env.commandExists("opencode2"),
+        .opencode => process_env.commandExists("opencode"),
         .claude => process_env.commandExists("node") and process_env.commandExists("claude"),
-        .cursor => process_env.commandExists("agent"),
+        .cursor => process_env.commandExists("cursor-agent") or process_env.commandExists("agent"),
         .pi => process_env.commandExists("pi"),
         .fx => process_env.commandExists("fx"),
         .grok => process_env.commandExists("grok"),

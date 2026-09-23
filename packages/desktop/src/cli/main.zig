@@ -4627,6 +4627,10 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
         .{ .name = "url", .type_name = "string", .description = "Optional URL to open." },
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, or path; defaults to the agent's workspace." },
     });
+    try writeMcpTypedTool(&s, "open_browser_tab", "Add a background tab inside this workspace's existing browser pane. Preserves the active page and desktop focus; the URL loads when the user selects the tab. Use this to share another page without replacing the current one. Returns tab_index; browser_status lists tabs.", &.{
+        .{ .name = "url", .type_name = "string", .description = "URL for the new background browser tab.", .required = true },
+        .{ .name = "workspace", .type_name = "string", .description = "Workspace containing the existing browser pane." },
+    });
     try writeMcpTypedTool(&s, "navigate_browser", "Navigate this workspace's open embedded browser to a URL.", &.{
         .{ .name = "url", .type_name = "string", .description = "URL to navigate to.", .required = true },
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, or path; defaults to the agent's workspace." },
@@ -5501,6 +5505,10 @@ fn mcpToolsCall(
             }
             break :blk browser_response;
         }
+        if (std.mem.eql(u8, tool_name, "open_browser_tab")) {
+            const url = mcpArgString(arguments, "url") orelse return try mcpError(allocator, out, id_value, -32602, "open_browser_tab requires url");
+            break :blk sendLiveRequestAlloc(allocator, io, "browser.tabOpen", .{ .workspace = workspace, .url = url }, 1);
+        }
         if (std.mem.eql(u8, tool_name, "navigate_browser")) {
             const url = mcpArgString(arguments, "url") orelse return try mcpError(allocator, out, id_value, -32602, "navigate_browser requires url");
             const browser_response = try sendLiveRequestAlloc(allocator, io, "browser.navigate", .{
@@ -6339,7 +6347,7 @@ fn chatDaemonOpenThreadEnvelopeAlloc(allocator: std.mem.Allocator, io: std.Io, o
             .reasoning_effort = open.reasoning_effort,
             .reasoning_variant = open.reasoning_variant,
             .fast_mode = if (open.fast_mode) |value| (if (value) "on" else "off") else null,
-            .last_activity_at = unixTimestampMs(),
+            .last_activity_at = @divTrunc(unixTimestampMs(), std.time.ms_per_s),
         },
     };
     var parsed = try client.call(headless.store.METHOD_CHAT_THREAD_UPSERT, request);
@@ -7392,7 +7400,7 @@ fn mcpUnavailableCapability(tool_name: []const u8) ?McpUnavailableCapability {
     if (std.mem.eql(u8, tool_name, "browser_status")) {
         return mcpHeadlessUnavailableCapability(.browser_session_state);
     }
-    if (std.mem.eql(u8, tool_name, "open_browser")) {
+    if (std.mem.eql(u8, tool_name, "open_browser") or std.mem.eql(u8, tool_name, "open_browser_tab")) {
         return mcpHeadlessUnavailableCapability(.browser_create);
     }
     if (std.mem.eql(u8, tool_name, "navigate_browser")) {

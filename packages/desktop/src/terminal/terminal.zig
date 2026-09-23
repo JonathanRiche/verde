@@ -5162,9 +5162,9 @@ fn daemonCommandForProfile(allocator: std.mem.Allocator, profile: TerminalLaunch
     const args: []const []const u8 = switch (profile.kind) {
         .shell => unreachable,
         .claude => &.{"claude"},
-        .opencode => &.{"opencode2"},
+        .opencode => &.{"opencode"},
         .codex => &.{"codex"},
-        .cursor => &.{"agent"},
+        .cursor => &.{"cursor-agent"},
         .custom => &.{},
     };
     const command = try allocator.alloc([]const u8, args.len);
@@ -5774,7 +5774,7 @@ fn commandForProfile(allocator: std.mem.Allocator, profile: TerminalLaunchProfil
             break :blk dupeCommand(allocator, &.{ defaultInteractiveShell(), "-i" });
         },
         .claude => dupeCommand(allocator, &.{"claude"}),
-        .opencode => dupeCommand(allocator, &.{"opencode2"}),
+        .opencode => dupeCommand(allocator, &.{"opencode"}),
         .codex => dupeCommand(allocator, &.{"codex"}),
         .cursor => dupeCommand(allocator, &.{"cursor"}),
         .custom => {

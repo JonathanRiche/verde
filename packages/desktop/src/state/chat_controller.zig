@@ -6582,6 +6582,12 @@ pub fn applyDaemonChatEventLocked(self: anytype, send_state: *SendState, kind: [
         // Content-less reasoning drives the "Thinking" header indicator
         // instead of a timeline row; mirror the GUI-owned stream path.
         if (transientThinkStatus(update)) |thinking| {
+            // The durable reducer (transcript_apply) skips only pending or
+            // in-progress think; a terminal one ends the assistant segment.
+            // Split identically, or the live row concatenates two committed
+            // rows (Codex reasons between its reply to the prompt and its
+            // reply to a steer) and turn adoption can never match.
+            if (!thinking) flushPendingAssistantTextLocked(send_state, std.heap.page_allocator);
             if (send_state.thinking and !thinking) send_state.thinking_cleared_at_ms = monotonicMs();
             send_state.thinking = thinking;
             return;
@@ -7348,6 +7354,7 @@ fn appendStoreMessageToThread(
         else
             null,
         .message_id = message_id,
+        .updated_at_ms = if (object.get("updated_at_ms")) |value| (if (value == .integer) value.integer else null) else null,
     });
 }
 
@@ -7675,6 +7682,14 @@ pub fn validateAdoptionRepairsForRefresh(self: anytype, persisted: db_types.Pers
                     continue;
                 },
                 .missing => break :blk error.AdoptionRepairMismatch,
+                .divergent => {
+                    log.warn(
+                        "dropping adoption repair for thread {s} turn {s}: committed durable turn diverges from live rows; durable projection wins",
+                        .{ parts.local_thread_id, parts.turn_id },
+                    );
+                    try dropped_keys.append(std.heap.page_allocator, entry.key_ptr.*);
+                    continue;
+                },
                 // Multiple ordered fingerprint correspondences are not enough
                 // to prove identity.
                 .ambiguous => break :blk error.AdoptionRepairAmbiguous,
@@ -7701,7 +7716,7 @@ pub fn validateAdoptionRepairsForRefresh(self: anytype, persisted: db_types.Pers
     if (veto) |err| return err;
 }
 
-const AdoptionTurnMatch = enum { missing, unique, ambiguous };
+const AdoptionTurnMatch = enum { missing, unique, ambiguous, divergent };
 
 /// Count ordered fingerprint correspondences within one durable turn. Counts
 /// saturate at two because the repair only distinguishes unique from ambiguous.
@@ -7715,9 +7730,18 @@ fn adoptionTurnMatch(
     defer std.heap.page_allocator.free(counts);
     @memset(counts, 0);
     counts[0] = 1;
+    var saw_committed_row = false;
+    var saw_preceding_row = false;
     for (messages) |durable| {
-        const message_id = durable.message_id orelse continue;
-        if (!messageIdBelongsToTurn(message_id, turn_id)) continue;
+        const message_id = durable.message_id orelse {
+            if (!saw_committed_row) saw_preceding_row = true;
+            continue;
+        };
+        if (!messageIdBelongsToTurn(message_id, turn_id)) {
+            if (!saw_committed_row) saw_preceding_row = true;
+            continue;
+        }
+        if (std.mem.startsWith(u8, message_id["turn:".len + turn_id.len ..], ":msg:")) saw_committed_row = true;
         var reverse_index = expected_rows.len;
         while (reverse_index > 0) {
             reverse_index -= 1;
@@ -7732,7 +7756,10 @@ fn adoptionTurnMatch(
         }
     }
     return switch (counts[expected_rows.len]) {
-        0 => .missing,
+        // `turn:{id}:msg:*` rows land in one commit transaction and are never
+        // rewritten. With the whole turn in view (a row precedes it), zero
+        // correspondences cannot improve on a later refresh.
+        0 => if (saw_committed_row and saw_preceding_row) .divergent else .missing,
         1 => .unique,
         else => .ambiguous,
     };
@@ -7829,6 +7856,49 @@ test "turn-scoped adoption matcher retains ambiguous fingerprints" {
         AdoptionTurnMatch.ambiguous,
         try adoptionTurnMatch(&messages, &expected_rows, "target"),
     );
+}
+
+test "daemon tail splits assistant text at terminal think like the durable reducer" {
+    var send_state: SendState = .{ .provider = .codex };
+    defer {
+        send_state.partial_text.deinit(std.heap.page_allocator);
+        freePendingTimelineEventsLocked(std.heap.page_allocator, &send_state.pending_events);
+    }
+    try applyDaemonChatEventLocked({}, &send_state, "assistant_delta", "{\"text\":\"Reply to prompt.\"}");
+    try applyDaemonChatEventLocked({}, &send_state, "tool_call", "{\"call_id\":\"r1\",\"kind\":\"think\",\"status\":\"in_progress\"}");
+    try std.testing.expect(send_state.thinking);
+    try applyDaemonChatEventLocked({}, &send_state, "tool_call", "{\"call_id\":\"r1\",\"kind\":\"think\",\"status\":\"completed\"}");
+    try applyDaemonChatEventLocked({}, &send_state, "assistant_delta", "{\"text\":\"Reply to steer.\"}");
+    flushPendingAssistantTextLocked(&send_state, std.heap.page_allocator);
+    try std.testing.expectEqual(@as(usize, 2), send_state.pending_events.items.len);
+    try std.testing.expectEqualStrings("Reply to prompt.", send_state.pending_events.items[0].body);
+    try std.testing.expectEqualStrings("Reply to steer.", send_state.pending_events.items[1].body);
+    try std.testing.expect(!send_state.thinking);
+}
+
+test "adoption matcher reports committed divergence only with the whole turn in view" {
+    const allocator = std.testing.allocator;
+    const expected = AdoptionExpectedRow{
+        .row_index_hint = 1,
+        .role = .assistant,
+        .author = try allocator.dupe(u8, "Codex"),
+        .body = try allocator.dupe(u8, "A.B."),
+    };
+    defer {
+        allocator.free(expected.author);
+        allocator.free(expected.body);
+    }
+    const rows = [_]AdoptionExpectedRow{expected};
+    const full = [_]db_types.PersistedMessage{
+        .{ .message_id = "turn:earlier:msg:1", .role = .assistant, .author = "Codex", .body = "before" },
+        .{ .message_id = "turn:t:msg:1", .role = .assistant, .author = "Codex", .body = "A." },
+        .{ .message_id = "turn:t:msg:2", .role = .assistant, .author = "Codex", .body = "B." },
+    };
+    try std.testing.expectEqual(AdoptionTurnMatch.divergent, try adoptionTurnMatch(&full, &rows, "t"));
+    // A window starting inside the turn is not provably complete.
+    try std.testing.expectEqual(AdoptionTurnMatch.missing, try adoptionTurnMatch(full[1..], &rows, "t"));
+    // The commit is not visible yet: still the retryable race.
+    try std.testing.expectEqual(AdoptionTurnMatch.missing, try adoptionTurnMatch(full[0..1], &rows, "t"));
 }
 
 fn messageIdBelongsToTurn(message_id: []const u8, turn_id: []const u8) bool {
@@ -9799,6 +9869,7 @@ fn appendPendingTimelineEvent(self: anytype, thread: *ChatThread, event: Pending
     message.tool_call_id = owned_tool_call_id;
     message.tool_call_kind = event.tool_call_kind;
     message.tool_call_status = event.tool_call_status;
+    message.updated_at_ms = event.updated_at_ms;
     message.message_id = owned_message_id;
 }
 
