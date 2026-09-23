@@ -160,7 +160,7 @@ pub const Draft = struct {
     companion_enabled: bool = false,
     companion_character: app_config.CompanionCharacter = .sprout,
     theme_source: theme.ThemeSource = .omarchy,
-    theme_choice: usize = 1,
+    theme_choice: usize = 0,
     open_action: OpenAction = .folder,
     link_open_target: app_config.LinkOpenTarget = .system_browser,
     chat_link_open_override: app_config.LinkOpenOverride = .global,
@@ -743,15 +743,11 @@ pub fn settingsModalAnimating(self: anytype) bool {
 }
 
 pub fn settingsThemeChoiceCount(self: anytype) usize {
-    return self.app_config.installed_themes.len + 2;
+    return self.app_config.themeChoiceCount();
 }
 
 pub fn settingsThemeChoiceLabel(self: anytype, choice_index: usize) []const u8 {
-    if (choice_index == 0) return "Verde";
-    if (choice_index == 1) return "Omarchy";
-    const installed_index = choice_index - 2;
-    if (installed_index >= self.app_config.installed_themes.len) return "Unknown theme";
-    return self.app_config.installed_themes[installed_index].name;
+    return self.app_config.themeChoiceLabel(choice_index);
 }
 
 pub fn selectSettingsThemeChoice(self: anytype, choice_index: usize) void {
@@ -763,15 +759,12 @@ pub fn selectSettingsThemeChoice(self: anytype, choice_index: usize) void {
         return;
     }
     self.settings_controller.draft.theme_choice = choice_index;
-    if (choice_index == 0) {
-        self.settings_controller.draft.theme_source = .default;
-    } else if (choice_index == 1) {
-        self.settings_controller.draft.theme_source = .omarchy;
-    } else {
-        const installed = self.app_config.installed_themes[choice_index - 2];
+    if (self.app_config.installedThemeForChoice(choice_index)) |installed| {
         self.settings_controller.draft.theme_source = installed.theme_config.source;
         if (installed.font_size) |value| self.settings_controller.draft.font_size = value;
         if (installed.terminal_font_size) |value| self.settings_controller.draft.terminal_font_size = value;
+    } else {
+        self.settings_controller.draft.theme_source = self.app_config.builtinThemeChoices()[choice_index];
     }
     self.settings_controller.theme_dropdown_open = false;
     self.settings_controller.theme_hover_index = null;

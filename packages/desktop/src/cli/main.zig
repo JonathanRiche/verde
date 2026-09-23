@@ -520,7 +520,7 @@ fn handleThemeImportOrValidate(
         ) catch |err| {
             failThemeCommand(allocator, out, json, "install theme", err);
         };
-        config.selectThemeChoice(allocator, installed_index + 2) catch |err| {
+        config.selectThemeChoice(allocator, config.builtinThemeChoices().len + installed_index) catch |err| {
             failThemeCommand(allocator, out, json, "activate theme", err);
         };
         app_config.saveAppConfig(allocator, &config) catch |err| {
@@ -545,7 +545,7 @@ fn writeThemeImportResult(
             .action = if (dry_run) "validated" else "imported",
             .source = source,
             .name = display_name,
-            .theme_source = @tagName(package.theme_config.source),
+            .theme_source = package.theme_config.source.configName(),
             .ui_font_size = package.font_size,
             .terminal_font_size = package.terminal_font_size,
             .ignored_unsupported_fonts = package.ignored_font_settings,
@@ -605,6 +605,8 @@ fn handleThemeReset(allocator: std.mem.Allocator, out: output.Output, json: bool
     config.selectThemeChoice(allocator, 0) catch |err| {
         failThemeCommand(allocator, out, json, "select Verde theme", err);
     };
+    // Omarchy installs reset to Omarchy; everything else resets to Auto.
+    config.theme_config.source = ui_theme.defaultThemeSource(config.omarchy_detected);
     config.font_size = ui_theme.DEFAULT_FONT_SIZE;
     config.terminal_font_size = app_config.DEFAULT_TERMINAL_FONT_SIZE;
     app_config.saveAppConfig(allocator, &config) catch |err| {

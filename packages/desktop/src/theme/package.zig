@@ -11,7 +11,8 @@ const FETCH_TIMEOUT_SECONDS: u64 = 15;
 
 pub const Package = struct {
     name: ?[]u8 = null,
-    theme_config: theme.ThemeConfig = .{ .source = .default },
+    /// Packages without a source were authored against the original palette.
+    theme_config: theme.ThemeConfig = .{ .source = .verde_legacy },
     font_size: ?f32 = null,
     terminal_font_size: ?f32 = null,
     ignored_font_settings: bool = false,
@@ -79,13 +80,15 @@ fn selectThemeObject(root: std.json.ObjectMap) !std.json.ObjectMap {
     return error.MissingThemeSection;
 }
 
+/// Package sources share the config spelling (`theme.ThemeSource.parse`).
+/// `default`/`verde` keep meaning the original palette. `auto` used to be an
+/// alias for `omarchy`; it now means "follow the OS appearance" everywhere,
+/// and since `omarchy` itself falls back to Auto off Omarchy, old packages
+/// only differ on Omarchy systems, where Auto still tracks light/dark.
 fn parseThemeSource(object: std.json.ObjectMap) !theme.ThemeSource {
-    const value = object.get("source") orelse object.get("theme") orelse return .default;
+    const value = object.get("source") orelse object.get("theme") orelse return .verde_legacy;
     if (value != .string) return error.InvalidThemeSource;
-    const source = std.mem.trim(u8, value.string, &std.ascii.whitespace);
-    if (std.ascii.eqlIgnoreCase(source, "default") or std.ascii.eqlIgnoreCase(source, "verde")) return .default;
-    if (std.ascii.eqlIgnoreCase(source, "omarchy") or std.ascii.eqlIgnoreCase(source, "auto")) return .omarchy;
-    return error.UnsupportedThemeSource;
+    return theme.ThemeSource.parse(value.string) orelse error.UnsupportedThemeSource;
 }
 
 fn parseThemeColors(object: std.json.ObjectMap) !theme.ThemeColorOverrides {
@@ -355,7 +358,7 @@ test "parse canonical portable theme package" {
     defer package.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings("Forest", package.name.?);
-    try std.testing.expectEqual(theme.ThemeSource.default, package.theme_config.source);
+    try std.testing.expectEqual(theme.ThemeSource.verde_legacy, package.theme_config.source);
     try std.testing.expectApproxEqAbs(@as(f32, 0x10) / 255.0, package.theme_config.colors.background.?[0], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 0x30) / 255.0, package.theme_config.colors.accent_dim.?[3], 0.0001);
     try std.testing.expectEqual(@as(?f32, 22.0), package.font_size);
@@ -374,7 +377,28 @@ test "parse existing Verde config theme section and bare theme" {
         \\{"theme":"default","colors":{"text":"#f0f0f0"}}
     );
     defer bare_package.deinit(std.testing.allocator);
-    try std.testing.expectEqual(theme.ThemeSource.default, bare_package.theme_config.source);
+    try std.testing.expectEqual(theme.ThemeSource.verde_legacy, bare_package.theme_config.source);
+}
+
+test "theme package sources accept new names and keep old packages importing" {
+    const cases = [_]struct { raw: []const u8, source: theme.ThemeSource }{
+        .{ .raw = "{\"theme\":{\"source\":\"default\"}}", .source = .verde_legacy },
+        .{ .raw = "{\"theme\":{\"source\":\"verde\"}}", .source = .verde_legacy },
+        .{ .raw = "{\"theme\":{\"source\":\"omarchy\"}}", .source = .omarchy },
+        .{ .raw = "{\"theme\":{\"source\":\"auto\"}}", .source = .auto },
+        .{ .raw = "{\"theme\":{\"source\":\"verde-dark\"}}", .source = .verde_dark },
+        .{ .raw = "{\"theme\":{\"source\":\"verde_light\"}}", .source = .verde_light },
+        .{ .raw = "{\"theme\":{\"source\":\"verde-legacy\"}}", .source = .verde_legacy },
+        .{ .raw = "{\"theme\":{\"colors\":{\"text\":\"#f0f0f0\"}}}", .source = .verde_legacy },
+    };
+    for (cases) |case| {
+        var package = try parse(std.testing.allocator, case.raw);
+        defer package.deinit(std.testing.allocator);
+        try std.testing.expectEqual(case.source, package.theme_config.source);
+    }
+    try std.testing.expectError(error.UnsupportedThemeSource, parse(std.testing.allocator,
+        \\{"theme":{"source":"solarized"}}
+    ));
 }
 
 test "theme validation rejects unknown colors and versions" {
@@ -400,13 +424,13 @@ test "GitHub file page URLs normalize to raw content URLs" {
 
 test "exported theme is versioned, portable, and parseable" {
     var config: app_config.AppConfig = .{};
-    config.theme_config.source = .default;
+    config.theme_config.source = .verde_legacy;
     config.theme_config.colors.accent = .{ 0.25, 0.5, 0.75, 0.5 };
     const encoded = try exportAlloc(std.testing.allocator, config, "Portable");
     defer std.testing.allocator.free(encoded);
 
     var package = try parse(std.testing.allocator, encoded);
     defer package.deinit(std.testing.allocator);
-    try std.testing.expectEqual(theme.ThemeSource.default, package.theme_config.source);
+    try std.testing.expectEqual(theme.ThemeSource.verde_legacy, package.theme_config.source);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), package.theme_config.colors.accent.?[3], 0.01);
 }

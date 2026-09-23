@@ -60,6 +60,8 @@ extern fn SDL_SetWindowFocusable(window: *sdl.Window, focusable: bool) bool;
 extern fn SDL_SyncWindow(window: *sdl.Window) bool;
 extern fn SDL_WaitEventTimeout(event: *sdl.Event, timeout_ms: c_int) bool;
 extern fn SDL_TextInputActive(window: *sdl.Window) bool;
+/// Returns SDL_SystemTheme: 0 unknown, 1 light, 2 dark. zsdl does not wrap it.
+extern fn SDL_GetSystemTheme() c_int;
 
 pub const std_options: std.Options = .{
     .enable_segfault_handler = true,
@@ -305,6 +307,7 @@ fn mainInner(init: std.process.Init) !void {
         log.warn("failed to load app config: {s}", .{@errorName(err)});
         break :blk app_config.AppConfig{ .font_size = DEFAULT_FONT_SIZE };
     };
+    _ = syncSystemAppearance();
     ui_theme.applyConfigTheme(allocator, loaded_app_config.theme_config);
 
     // Install the font metrics used by the Palette desktop UI.
@@ -1871,6 +1874,11 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
         },
         .window_shown, .window_restored => {
             state.resumeBrowserAfterHostWindowShown();
+        },
+        .system_theme_changed => {
+            // Auto follows the OS appearance live; other sources ignore it.
+            const source = ui_theme.effectiveThemeSource(state.app_config.theme_config.source, state.app_config.omarchy_detected);
+            if (syncSystemAppearance() and source == .auto) applyAppConfigRuntime(state);
         },
         .window_focus_gained => {
             state.window_input_focus = true;
@@ -3608,6 +3616,13 @@ fn canHandleTranscriptScrollAction(state: *const AppState) bool {
     if (state.isBrowserPaneFocused()) return false;
     if (state.terminal_controller.focused) return false;
     return !state.composer_controller.focused and state.palette_modal_text_focus == .none;
+}
+
+/// Reads the OS light/dark preference into the theme module. Unknown (for
+/// example no appearance portal on Linux) keeps dark. Returns true on change.
+fn syncSystemAppearance() bool {
+    const appearance: ui_theme.Appearance = if (SDL_GetSystemTheme() == 1) .light else .dark;
+    return ui_theme.setSystemAppearance(appearance);
 }
 
 fn applyAppConfigRuntime(state: *AppState) void {

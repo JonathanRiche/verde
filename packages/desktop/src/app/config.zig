@@ -293,6 +293,9 @@ pub const AppConfig = struct {
     theme_config: theme.ThemeConfig = .{},
     active_theme: ?[]u8 = null,
     installed_themes: []InstalledTheme = &.{},
+    /// Runtime-only: whether an Omarchy theme resolves on this machine. Set by
+    /// `loadAppConfig`; never persisted. Controls the Omarchy dropdown entry.
+    omarchy_detected: bool = false,
     default_open_action: DefaultOpenAction = .folder,
     link_open_target: LinkOpenTarget = .system_browser,
     chat_link_open_override: LinkOpenOverride = .global,
@@ -409,9 +412,39 @@ pub const AppConfig = struct {
         return null;
     }
 
+    /// Built-in dropdown entries, followed by installed themes. Omarchy is
+    /// only offered when an Omarchy install was detected.
+    pub fn builtinThemeChoices(self: AppConfig) []const theme.ThemeSource {
+        const all = &theme.ThemeSource.builtin_choices;
+        return if (self.omarchy_detected) all else all[0 .. all.len - 1];
+    }
+
+    pub fn themeChoiceCount(self: AppConfig) usize {
+        return self.builtinThemeChoices().len + self.installed_themes.len;
+    }
+
     pub fn themeChoiceIndex(self: AppConfig) usize {
-        if (self.activeThemeIndex()) |index| return index + 2;
-        return if (self.theme_config.source == .omarchy) 1 else 0;
+        const builtins = self.builtinThemeChoices();
+        if (self.activeThemeIndex()) |index| return builtins.len + index;
+        const source = theme.effectiveThemeSource(self.theme_config.source, self.omarchy_detected);
+        return std.mem.indexOfScalar(theme.ThemeSource, builtins, source) orelse 0;
+    }
+
+    pub fn themeChoiceLabel(self: AppConfig, choice_index: usize) []const u8 {
+        const builtins = self.builtinThemeChoices();
+        if (choice_index < builtins.len) return builtins[choice_index].label();
+        const installed_index = choice_index - builtins.len;
+        if (installed_index >= self.installed_themes.len) return "Unknown theme";
+        return self.installed_themes[installed_index].name;
+    }
+
+    /// Installed theme behind a dropdown index, or null for built-in entries.
+    pub fn installedThemeForChoice(self: AppConfig, choice_index: usize) ?InstalledTheme {
+        const builtins = self.builtinThemeChoices();
+        if (choice_index < builtins.len) return null;
+        const installed_index = choice_index - builtins.len;
+        if (installed_index >= self.installed_themes.len) return null;
+        return self.installed_themes[installed_index];
     }
 
     pub fn installTheme(
@@ -452,20 +485,17 @@ pub const AppConfig = struct {
     }
 
     pub fn selectThemeChoice(self: *AppConfig, allocator: std.mem.Allocator, choice_index: usize) !void {
-        if (choice_index >= self.installed_themes.len + 2) return error.InvalidThemeChoice;
+        if (choice_index >= self.themeChoiceCount()) return error.InvalidThemeChoice;
         if (self.active_theme) |name| allocator.free(name);
         self.active_theme = null;
 
-        if (choice_index == 0) {
-            self.theme_config = .{ .source = .default };
-            return;
-        }
-        if (choice_index == 1) {
-            self.theme_config = .{ .source = .omarchy };
+        const builtins = self.builtinThemeChoices();
+        if (choice_index < builtins.len) {
+            self.theme_config = .{ .source = builtins[choice_index] };
             return;
         }
 
-        const installed = self.installed_themes[choice_index - 2];
+        const installed = self.installed_themes[choice_index - builtins.len];
         const active_name = try allocator.dupe(u8, installed.name);
         installed.apply(self);
         self.active_theme = active_name;
@@ -474,6 +504,8 @@ pub const AppConfig = struct {
 
 pub fn loadAppConfig(allocator: std.mem.Allocator) !AppConfig {
     var config: AppConfig = .{};
+    config.omarchy_detected = theme.omarchyThemeAvailable(allocator);
+    config.theme_config.source = theme.defaultThemeSource(config.omarchy_detected);
 
     const parsed = readRootValue(allocator) catch |err| switch (err) {
         error.FileNotFound => return config,
@@ -604,11 +636,7 @@ fn writeUiSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, con
 fn writeThemeSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
     const theme_object = try objectSection(allocator, object, "theme");
 
-    const source_name = switch (config.theme_config.source) {
-        .omarchy => "omarchy",
-        .default => "default",
-    };
-    try theme_object.put(allocator, "theme", .{ .string = source_name });
+    try theme_object.put(allocator, "theme", .{ .string = config.theme_config.source.configName() });
     if (config.active_theme) |active_name| {
         try theme_object.put(allocator, "active", .{ .string = active_name });
     } else {
@@ -643,8 +671,7 @@ fn writeInstalledThemesSection(allocator: std.mem.Allocator, object: *std.json.O
         try installed_object.put(allocator, "name", .{ .string = installed.name });
 
         var package_theme: std.json.ObjectMap = .empty;
-        const source_name = if (installed.theme_config.source == .omarchy) "omarchy" else "default";
-        try package_theme.put(allocator, "theme", .{ .string = source_name });
+        try package_theme.put(allocator, "theme", .{ .string = installed.theme_config.source.configName() });
         var colors_object: std.json.ObjectMap = .empty;
         var has_colors = false;
         inline for (std.meta.fields(theme.ThemeColorOverrides)) |field| {
@@ -1141,10 +1168,8 @@ fn applyThemeConfigOverrides(theme_config: *theme.ThemeConfig, theme_value: std.
 }
 
 fn parseThemeSource(raw: []const u8) ?theme.ThemeSource {
-    const value = std.mem.trim(u8, raw, &std.ascii.whitespace);
-    if (std.ascii.eqlIgnoreCase(value, "omarchy") or std.ascii.eqlIgnoreCase(value, "auto")) return .omarchy;
-    if (std.ascii.eqlIgnoreCase(value, "default") or std.ascii.eqlIgnoreCase(value, "verde")) return .default;
-    log.warn("ignoring unsupported theme.theme value_len={d}", .{value.len});
+    if (theme.ThemeSource.parse(raw)) |source| return source;
+    log.warn("ignoring unsupported theme.theme value_len={d}", .{raw.len});
     return null;
 }
 
@@ -1182,7 +1207,8 @@ fn applyInstalledThemeOverrides(allocator: std.mem.Allocator, config: *AppConfig
             continue;
         }
 
-        var theme_config: theme.ThemeConfig = .{ .source = .default };
+        // Packages without a source were authored against the original palette.
+        var theme_config: theme.ThemeConfig = .{ .source = .verde_legacy };
         applyThemeConfigOverrides(&theme_config, theme_value);
         const font_size = parseInstalledFontSize(item.object.get("ui_font_size"), MIN_FONT_SIZE, MAX_FONT_SIZE);
         const terminal_font_size = parseInstalledFontSize(item.object.get("terminal_font_size"), MIN_TERMINAL_FONT_SIZE, MAX_TERMINAL_FONT_SIZE);
@@ -1960,7 +1986,7 @@ test "app config accepts theme source and color overrides" {
     defer config.deinit(std.testing.allocator);
     applyAppOverrides(std.testing.allocator, &config, root.value);
 
-    try std.testing.expectEqual(theme.ThemeSource.default, config.theme_config.source);
+    try std.testing.expectEqual(theme.ThemeSource.verde_legacy, config.theme_config.source);
     try std.testing.expectEqual(@as(f32, 0x10) / 255.0, config.theme_config.colors.background.?[0]);
     try std.testing.expectEqual(@as(f32, 80) / 255.0, config.theme_config.colors.accent.?[0]);
 }
@@ -1979,24 +2005,81 @@ test "app config loads and selects installed themes" {
     );
     defer root.deinit();
 
-    var config: AppConfig = .{};
+    var config: AppConfig = .{ .omarchy_detected = true };
     defer config.deinit(std.testing.allocator);
     applyAppOverrides(std.testing.allocator, &config, root.value);
 
+    // Auto, Verde Dark, Verde Light, Verde Legacy, Omarchy, then installed.
     try std.testing.expectEqual(@as(usize, 1), config.installed_themes.len);
     try std.testing.expectEqualStrings("Forest", config.installed_themes[0].name);
-    try std.testing.expectEqual(@as(usize, 2), config.themeChoiceIndex());
+    try std.testing.expectEqual(@as(usize, 5), config.themeChoiceIndex());
+    try std.testing.expectEqualStrings("Forest", config.themeChoiceLabel(5));
     try std.testing.expectEqual(@as(?f32, 22), config.installed_themes[0].font_size);
+    try std.testing.expectEqual(theme.ThemeSource.verde_legacy, config.installed_themes[0].theme_config.source);
 
-    try config.selectThemeChoice(std.testing.allocator, 2);
+    try config.selectThemeChoice(std.testing.allocator, 5);
     try std.testing.expectEqualStrings("Forest", config.active_theme.?);
     try std.testing.expectEqual(@as(f32, 0x10) / 255.0, config.theme_config.colors.background.?[0]);
     try std.testing.expectEqual(@as(f32, 19), config.terminal_font_size);
 
-    try config.selectThemeChoice(std.testing.allocator, 1);
+    try config.selectThemeChoice(std.testing.allocator, 4);
     try std.testing.expect(config.active_theme == null);
     try std.testing.expectEqual(theme.ThemeSource.omarchy, config.theme_config.source);
     try std.testing.expect(config.theme_config.colors.background == null);
+}
+
+test "theme dropdown hides Omarchy without an install and shows a saved omarchy as Auto" {
+    var config: AppConfig = .{ .omarchy_detected = false };
+    defer config.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 4), config.themeChoiceCount());
+    try std.testing.expectEqualStrings("Auto", config.themeChoiceLabel(0));
+    try std.testing.expectEqualStrings("Verde Dark", config.themeChoiceLabel(1));
+    try std.testing.expectEqualStrings("Verde Light", config.themeChoiceLabel(2));
+    try std.testing.expectEqualStrings("Verde Legacy", config.themeChoiceLabel(3));
+
+    config.theme_config.source = .omarchy;
+    try std.testing.expectEqual(@as(usize, 0), config.themeChoiceIndex());
+    config.theme_config.source = .verde_light;
+    try std.testing.expectEqual(@as(usize, 2), config.themeChoiceIndex());
+
+    try config.selectThemeChoice(std.testing.allocator, 1);
+    try std.testing.expectEqual(theme.ThemeSource.verde_dark, config.theme_config.source);
+    try std.testing.expectError(error.InvalidThemeChoice, config.selectThemeChoice(std.testing.allocator, 4));
+
+    config.omarchy_detected = true;
+    try std.testing.expectEqualStrings("Omarchy", config.themeChoiceLabel(4));
+}
+
+test "app config theme sources keep legacy names working and persist new names" {
+    const cases = [_]struct { raw: []const u8, source: theme.ThemeSource }{
+        .{ .raw = "default", .source = .verde_legacy },
+        .{ .raw = "verde", .source = .verde_legacy },
+        .{ .raw = "omarchy", .source = .omarchy },
+        .{ .raw = "auto", .source = .auto },
+        .{ .raw = "verde-dark", .source = .verde_dark },
+        .{ .raw = "verde-light", .source = .verde_light },
+        .{ .raw = "verde-legacy", .source = .verde_legacy },
+    };
+    for (cases) |case| {
+        const raw = try std.fmt.allocPrint(std.testing.allocator, "{{\"theme\":{{\"theme\":\"{s}\"}}}}", .{case.raw});
+        defer std.testing.allocator.free(raw);
+        var root = try parseTestRoot(raw);
+        defer root.deinit();
+        var config: AppConfig = .{};
+        defer config.deinit(std.testing.allocator);
+        applyAppOverrides(std.testing.allocator, &config, root.value);
+        try std.testing.expectEqual(case.source, config.theme_config.source);
+    }
+
+    var config: AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+    config.theme_config.source = .verde_light;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var object: std.json.ObjectMap = .empty;
+    try writeThemeSection(arena.allocator(), &object, &config);
+    try std.testing.expectEqualStrings("verde-light", object.get("theme").?.object.get("theme").?.string);
 }
 
 test "app config accepts named open default" {
