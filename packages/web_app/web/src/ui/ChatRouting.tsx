@@ -75,7 +75,9 @@ export function ChatRouting(props: { pane: LivePane; onClose: () => void }) {
         >
           <For each={store.workspaces().filter((workspace) => !workspace.archived)}>
             {(workspace) => (
-              <option value={workspace.workspace_id}>
+              // `selected` survives option re-creation when the workspace list
+              // refreshes; otherwise the select falls back to the first row.
+              <option value={workspace.workspace_id} selected={workspace.workspace_id === owningWorkspaceId()}>
                 {workspace.label}
               </option>
             )}
@@ -110,7 +112,7 @@ export function ChatRouting(props: { pane: LivePane; onClose: () => void }) {
             <option value={profile()}>Saved connection unavailable</option>
           </Show>
           <For each={store.connections()?.connections ?? []}>
-            {(connection) => <option value={connection.profile_id}>{connection.label}{connection.ready ? '' : ` · ${connection.failure ?? connection.phase}`}</option>}
+            {(connection) => <option value={connection.profile_id} selected={connection.profile_id === connectionValue()}>{connection.label}{connection.ready ? '' : ` · ${connection.failure ?? connection.phase}`}</option>}
           </For>
         </select>
         <span class="mt-1 block text-[11px] leading-4 text-[var(--text-subtle)]">

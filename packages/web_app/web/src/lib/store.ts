@@ -3505,8 +3505,11 @@ export function createAppStore() {
     const pane = target ?? focusedPane()
     const unavailable = sidebarActionUnavailableReason('pane-close', pane ?? undefined)
     if (unavailable) { setNotice(unavailable); return }
+    // Chat panes belong to their thread's workspace, which can differ from
+    // the projected pane workspace (cross-workspace ACTIVE rows).
+    const pane_workspace_id = pane ? (pane.kind === 'chat' ? paneOwningWorkspaceId(pane) : pane.workspace_id) : null
     const ws = pane
-      ? workspaces().find((item) => item.workspace_id === pane.workspace_id)
+      ? workspaces().find((item) => item.workspace_id === pane_workspace_id)
       : workspace()
     if (!pane || !ws) {
       // Prefix x / Close pane on an empty workspace archives it, matching
@@ -3536,9 +3539,20 @@ export function createAppStore() {
     }
     if (maximizedPaneId() === pane.pane_id) setMaximizedPaneId(null)
     publishPanes(workspaces())
-    // A web-local chat pane has nothing to close on the daemon or desktop;
-    // removing it from the projection above is the whole operation.
-    if (pane.kind === 'chat' && pane.native_pane_id == null && !pane.session_id) return
+    // A daemon-only chat pane closes its thread in the store so the snapshot
+    // stops projecting it; History reopens it. No desktop transport needed.
+    if (pane.kind === 'chat' && pane.native_pane_id == null && !pane.session_id) {
+      if (!pane.thread_id) return
+      const client_id = await ensureClientId()
+      const closed = await interactiveCall('chat.thread.close', {
+        mutation: { request_key: `web:chat.thread.close:${pane.thread_id}:${mintId('')}`, client_id },
+        workspace_id: ws.workspace_id,
+        local_thread_id: pane.thread_id,
+      })
+      callSucceeded(closed, 'could not close chat')
+      await refreshProjection({ workspace_id: ws.workspace_id })
+      return
+    }
     const response = await requestPaneClose(interactiveCall, ws.workspace_id, pane)
     callSucceeded(response, 'could not close pane')
     // Scoped: only this pane's workspace changed (the target can live in the

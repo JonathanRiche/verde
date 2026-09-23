@@ -773,7 +773,9 @@ function contextMenuItems(target: SidebarMenuTarget): MenuItem[] {
     { action: 'thread-handoff', label: 'Handoff to another agent', disabled: busy || desktop_only_disabled },
     { action: 'thread-open-tui', label: `Open in TUI: ${provider}`, disabled: busy || desktop_only_disabled || !pane.provider_thread_id },
     { action: 'thread-archive', label: 'Archive chat', disabled: busy || !pane.thread_id, danger: true },
-    { action: 'pane-close', label: 'Close pane', disabled: desktop_only_disabled, danger: true },
+    // Desktop-hosted chat panes are gated by sidebarMenuAvailability; daemon-only
+    // chats close through chat.thread.close.
+    { action: 'pane-close', label: 'Close pane', danger: true },
   ] satisfies MenuItem[]).map((item) => sidebarMenuAvailability(item, { ...pane, profile_id: store.connectionFor(pane) }))
 }
 
