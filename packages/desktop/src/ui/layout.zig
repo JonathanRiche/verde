@@ -598,8 +598,8 @@ fn queueModalHit(state: *runtime.AppState, rect: palette.Rect, action: runtime.P
 
 fn drawActionButton(state: *runtime.AppState, rect: palette.Rect, label: []const u8, color: [4]f32) void {
     const hovered = pointInRect(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y, rect);
-    const fill = if (hovered) theme.lighten(color, 0.055) else color;
-    const border = if (hovered) theme.lighten(color, 0.14) else theme.lighten(color, 0.06);
+    const fill = if (hovered) theme.raise(color, 0.055) else color;
+    const border = if (hovered) theme.raise(color, 0.14) else theme.raise(color, 0.06);
     queuePaletteRoundedRect(state, rect, paletteColor(fill), theme.scaledUi(7.0));
     queuePaletteBorder(state, rect, paletteColor(border), theme.scaledUi(7.0), theme.scaledUi(if (hovered) 1.5 else 1.0));
     const font_size = theme.scaledUi(14.0);
@@ -977,7 +977,7 @@ fn registerModalChromeHits(state: *runtime.AppState, width: f32, height: f32, mo
 
 fn drawTextField(state: *runtime.AppState, rect: palette.Rect, value: []const u8, hint: []const u8, focused: bool, cursor: usize) void {
     const border = if (focused) theme.accent() else theme.COLOR_PANEL_MUTED;
-    queuePaletteRoundedRect(state, rect, paletteColor(theme.darken(theme.COLOR_PANEL_ALT, 0.03)), theme.scaledUi(7.0));
+    queuePaletteRoundedRect(state, rect, paletteColor(theme.sink(theme.COLOR_PANEL_ALT, 0.03)), theme.scaledUi(7.0));
     queuePaletteBorder(state, rect, paletteColor(border), theme.scaledUi(7.0), theme.scaledUi(1.0));
     const text = if (value.len > 0) value else hint;
     const color = if (value.len > 0) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE;
@@ -2245,7 +2245,7 @@ fn renderRuntimeWizardModal(state: *runtime.AppState, width: f32, height: f32) v
             for (layout.methods, 0..) |rect, index| {
                 const method: runtime_connections.WizardMethod = @enumFromInt(index);
                 const hovered = pointInRect(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y, rect);
-                queuePaletteRoundedRect(state, rect, paletteColor(if (hovered) theme.lighten(theme.COLOR_PANEL_ALT, 0.055) else theme.COLOR_PANEL_ALT), theme.scaledUi(7.0));
+                queuePaletteRoundedRect(state, rect, paletteColor(if (hovered) theme.raise(theme.COLOR_PANEL_ALT, 0.055) else theme.COLOR_PANEL_ALT), theme.scaledUi(7.0));
                 queuePaletteBorder(state, rect, paletteColor(if (hovered) theme.accent() else theme.COLOR_PANEL_MUTED), theme.scaledUi(7.0), theme.scaledUi(1.0));
                 queuePaletteText(state, .{ .x = rect.x + theme.scaledUi(12.0), .y = rect.y + theme.scaledUi(8.0), .w = rect.w - theme.scaledUi(24.0), .h = theme.scaledUi(20.0) }, method.title(), paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), rect);
                 queuePaletteText(state, .{ .x = rect.x + theme.scaledUi(12.0), .y = rect.y + theme.scaledUi(30.0), .w = rect.w - theme.scaledUi(24.0), .h = theme.scaledUi(18.0) }, method.description(), paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), rect);
@@ -2313,7 +2313,7 @@ fn renderRuntimeWizardModal(state: *runtime.AppState, width: f32, height: f32) v
             for (rc.connect_runtimes.items[0..visible], 0..) |row, index| {
                 const rect = layout.inventory[index];
                 const selected = rc.connect_selected == index;
-                queuePaletteRoundedRect(state, rect, paletteColor(if (selected) theme.lighten(theme.COLOR_PANEL_ALT, 0.08) else theme.COLOR_PANEL_ALT), theme.scaledUi(7.0));
+                queuePaletteRoundedRect(state, rect, paletteColor(if (selected) theme.raise(theme.COLOR_PANEL_ALT, 0.08) else theme.COLOR_PANEL_ALT), theme.scaledUi(7.0));
                 queuePaletteBorder(state, rect, paletteColor(if (selected) theme.accent() else theme.COLOR_PANEL_MUTED), theme.scaledUi(7.0), theme.scaledUi(if (selected) 1.5 else 1.0));
                 queuePaletteText(state, .{ .x = rect.x + theme.scaledUi(12.0), .y = rect.y + theme.scaledUi(6.0), .w = rect.w - theme.scaledUi(24.0), .h = theme.scaledUi(18.0) }, row.https_url, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), rect);
                 var id_buf: [256]u8 = undefined;
@@ -2692,7 +2692,7 @@ fn renderMcpBenefitRow(state: *runtime.AppState, rect: palette.Rect, title: []co
     queuePaletteBorder(state, rect, paletteColor(theme.withAlpha(theme.borderMuted(), 90)), theme.scaledUi(9.0), theme.scaledUi(1.0));
     const text_x = rect.x + theme.scaledUi(14.0);
     queuePaletteText(state, .{ .x = text_x, .y = rect.y + theme.scaledUi(7.0), .w = rect.w - theme.scaledUi(28.0), .h = theme.scaledUi(18.0) }, title, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.5), clip);
-    queuePaletteText(state, .{ .x = text_x, .y = rect.y + theme.scaledUi(27.0), .w = rect.w - theme.scaledUi(28.0), .h = theme.scaledUi(17.0) }, detail, paletteColor(theme.lighten(theme.COLOR_TEXT_SUBTLE, 0.1)), theme.scaledUi(12.5), clip);
+    queuePaletteText(state, .{ .x = text_x, .y = rect.y + theme.scaledUi(27.0), .w = rect.w - theme.scaledUi(28.0), .h = theme.scaledUi(17.0) }, detail, paletteColor(theme.raise(theme.COLOR_TEXT_SUBTLE, 0.1)), theme.scaledUi(12.5), clip);
 }
 
 /// Shows the attachment preview modal for the selected image.
@@ -2738,7 +2738,7 @@ fn renderProviderOnboardingModal(state: *runtime.AppState, width: f32, height: f
 
 // Renders one provider's executable/auth status and its shortest recovery step.
 fn renderProviderReadinessRow(state: *runtime.AppState, rect: palette.Rect, provider: runtime.Provider, readiness: runtime.ProviderReadiness, clip: palette.Rect) void {
-    queuePaletteRoundedRect(state, rect, paletteColor(theme.darken(theme.COLOR_PANEL_ALT, 0.025)), theme.scaledUi(9.0));
+    queuePaletteRoundedRect(state, rect, paletteColor(theme.sink(theme.COLOR_PANEL_ALT, 0.025)), theme.scaledUi(9.0));
     queuePaletteBorder(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 190)), theme.scaledUi(9.0), theme.scaledUi(1.0));
 
     const dot_color = switch (readiness) {
@@ -2867,7 +2867,8 @@ fn renderImageModal(state: *runtime.AppState, width: f32, height: f32) void {
             },
             palette.TextureId.init(cached.texture_id),
             .{ .x = 0.0, .y = 0.0, .w = 1.0, .h = 1.0 },
-            paletteColor(theme.COLOR_WHITE),
+            // Untinted: the theme text colour would darken the image on light themes.
+            palette.Color.white,
             canvas,
         ) catch {};
     } else {
@@ -3003,7 +3004,7 @@ fn renderThreadImportModal(state: *runtime.AppState, width: f32, height: f32) vo
     const notice_h = if (state.threadImportNotice().len > 0) theme.scaledUi(24.0) else 0.0;
     const button_h = theme.scaledUi(34.0);
     const list_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = input_rect.w, .h = modal.y + modal.h - pad - button_h - notice_h - theme.scaledUi(16.0) - y };
-    queuePaletteRoundedRect(state, list_rect, paletteColor(theme.darken(theme.COLOR_PANEL_ALT, 0.03)), theme.scaledUi(8.0));
+    queuePaletteRoundedRect(state, list_rect, paletteColor(theme.sink(theme.COLOR_PANEL_ALT, 0.03)), theme.scaledUi(8.0));
     queuePaletteBorder(state, list_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0), theme.scaledUi(1.0));
     if (state.thread_import_threads.items.len == 0) {
         queuePaletteText(state, .{ .x = list_rect.x + theme.scaledUi(12.0), .y = list_rect.y + theme.scaledUi(12.0), .w = list_rect.w - theme.scaledUi(24.0), .h = theme.scaledUi(20.0) }, emptyThreadImportListNotice(provider), paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), list_rect);
@@ -3016,13 +3017,13 @@ fn renderThreadImportModal(state: *runtime.AppState, width: f32, height: f32) vo
             const row_hovered = state.thread_import_hover_index != null and state.thread_import_hover_index.? == index;
             if (selected) {
                 const sel_bg = if (row_hovered)
-                    paletteColor(theme.lighten(theme.COLOR_PANEL_MUTED, 0.10))
+                    paletteColor(theme.raise(theme.COLOR_PANEL_MUTED, 0.10))
                 else
                     paletteColor(theme.COLOR_PANEL_MUTED);
                 queuePaletteRoundedRect(state, row, sel_bg, theme.scaledUi(6.0));
             } else if (row_hovered) {
-                queuePaletteRoundedRect(state, row, paletteColor(theme.lighten(theme.COLOR_PANEL_MUTED, 0.06)), theme.scaledUi(6.0));
-                queuePaletteBorder(state, row, paletteColor(theme.lighten(theme.borderMuted(), 0.02)), theme.scaledUi(6.0), theme.scaledUi(1.0));
+                queuePaletteRoundedRect(state, row, paletteColor(theme.raise(theme.COLOR_PANEL_MUTED, 0.06)), theme.scaledUi(6.0));
+                queuePaletteBorder(state, row, paletteColor(theme.raise(theme.borderMuted(), 0.02)), theme.scaledUi(6.0), theme.scaledUi(1.0));
             }
             const title_col = paletteColor(theme.COLOR_WHITE);
             const id_col = paletteColor(if (row_hovered) theme.COLOR_TEXT_MUTED else theme.COLOR_TEXT_SUBTLE);

@@ -822,9 +822,9 @@ fn renderToolbarIconButton(
     disabled: bool,
 ) void {
     const bg = if (disabled)
-        theme.darken(base_color, 0.04)
+        theme.sink(base_color, 0.04)
     else if (hovered)
-        theme.lighten(base_color, 0.10)
+        theme.raise(base_color, 0.10)
     else
         base_color;
     queuePaletteRoundedRect(state, rect, paletteColor(bg), theme.scaledUi(TOOLBAR_BUTTON_RADIUS));
@@ -908,13 +908,13 @@ fn renderInspectorSplitButton(
         .w = inspect_rect.w + dropdown_rect.w,
         .h = inspect_rect.h,
     };
-    const bg = if (disabled) theme.darken(base_color, 0.04) else base_color;
+    const bg = if (disabled) theme.sink(base_color, 0.04) else base_color;
     queuePaletteRoundedRect(state, combined, paletteColor(bg), theme.scaledUi(TOOLBAR_BUTTON_RADIUS));
 
     if (!disabled and (inspect_hovered or dropdown_hovered)) {
         const pill_inset = theme.scaledUi(2.0);
         const pill_radius = theme.scaledUi(TOOLBAR_BUTTON_RADIUS - 2.0);
-        const hover_color = paletteColor(theme.lighten(base_color, 0.10));
+        const hover_color = paletteColor(theme.raise(base_color, 0.10));
         const seg = if (inspect_hovered) inspect_rect else dropdown_rect;
         queuePaletteRoundedRect(state, .{
             .x = seg.x + pill_inset,
@@ -1210,7 +1210,7 @@ fn renderToolbarOverflowRow(
 ) void {
     const hovered = rectHovered(rect);
     if (hovered and enabled) {
-        queuePaletteRoundedRect(state, rect, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(6.0));
+        queuePaletteRoundedRect(state, rect, paletteColor(theme.raise(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(6.0));
     }
     queuePaletteText(state, .{
         .x = rect.x + theme.scaledUi(8.0),
@@ -1345,7 +1345,7 @@ fn renderInspectorModeMenuRow(state: *app_state.AppState, rect: palette.Rect, la
         queuePaletteRoundedRect(
             state,
             rect,
-            paletteColor(if (selected) theme.withAlpha(theme.accent(), 64) else theme.lighten(theme.COLOR_PANEL_ALT, 0.08)),
+            paletteColor(if (selected) theme.withAlpha(theme.accent(), 64) else theme.raise(theme.COLOR_PANEL_ALT, 0.08)),
             theme.scaledUi(6.0),
         );
     }
@@ -1473,7 +1473,7 @@ fn renderBrowserContextMenuPanel(state: *app_state.AppState, parent_index: ?u32,
         };
         const selected = state.browser_controller.context_menu_selected_index == item.index;
         if (selected or (rectHovered(row_rect) and item.enabled)) {
-            queuePaletteRoundedRect(state, row_rect, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
+            queuePaletteRoundedRect(state, row_rect, paletteColor(theme.raise(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
         }
         const leading_width = if (state.browser_controller.context_menu_is_option) theme.scaledUi(18.0) else 0.0;
         const trailing_width = if (item.submenu) theme.scaledUi(22.0) else 0.0;
@@ -1522,7 +1522,7 @@ fn renderBrowserContextMenuPanel(state: *app_state.AppState, parent_index: ?u32,
             .h = row_height,
         };
         if (state.browser_controller.context_menu_selected_index == CLOSE_PANE_MENU_INDEX or rectHovered(close_rect)) {
-            queuePaletteRoundedRect(state, close_rect, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
+            queuePaletteRoundedRect(state, close_rect, paletteColor(theme.raise(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
         }
         queuePaletteText(state, .{
             .x = close_rect.x + theme.scaledUi(8.0),
@@ -1552,7 +1552,7 @@ fn renderBrowserContextMenuPanel(state: *app_state.AppState, parent_index: ?u32,
 
 fn renderBrowserContextLinkRow(state: *app_state.AppState, rect: palette.Rect, label: []const u8, action: BrowserContextMenuAction) void {
     if (rectHovered(rect)) {
-        queuePaletteRoundedRect(state, rect, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
+        queuePaletteRoundedRect(state, rect, paletteColor(theme.raise(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
     }
     queuePaletteText(state, .{
         .x = rect.x + theme.scaledUi(8.0),
@@ -1634,7 +1634,7 @@ fn renderPaletteAddressField(state: *app_state.AppState, rect: palette.Rect) voi
     queuePaletteRoundedRect(
         state,
         rect,
-        paletteColor(if (focused) theme.lighten(theme.COLOR_PANEL_ALT, 0.10) else theme.COLOR_PANEL_ALT),
+        paletteColor(if (focused) theme.raise(theme.COLOR_PANEL_ALT, 0.10) else theme.COLOR_PANEL_ALT),
         theme.scaledUi(8.0),
     );
     queuePaletteBorder(
@@ -1970,7 +1970,7 @@ fn renderPanePlaceholder(state: *app_state.AppState, pane_rect: palette.Rect) vo
         .w = button_width,
         .h = button_height,
     };
-    const button_fill = if (rectHovered(button_rect)) theme.lighten(theme.accent(), 0.08) else theme.accent();
+    const button_fill = if (rectHovered(button_rect)) theme.raise(theme.accent(), 0.08) else theme.accent();
     queuePaletteRoundedRect(state, button_rect, paletteColor(button_fill), theme.scaledUi(8.0));
     queuePaletteText(state, .{
         .x = button_rect.x + theme.scaledUi(14.0),

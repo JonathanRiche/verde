@@ -164,14 +164,14 @@ pub const verde_light_colors: ThemeColors = .{
     .background = hexColor("#F7F9F8"),
     .panel = hexColor("#FFFFFF"),
     .panel_alt = hexColor("#F3F6F4"),
-    .panel_muted = hexColor("#E3E8E6"),
+    .panel_muted = hexColor("#DCE2DF"),
     .text = hexColor("#0F1715"),
     .text_muted = hexColor("#3B4743"),
     .text_subtle = hexColor("#5C6964"),
     .accent = hexColor("#15803D"),
     .accent_dim = hexColor("#15803D1F"),
     .border = hexColor("#A6D4B8"),
-    .border_muted = hexColor("#D5DCD9"),
+    .border_muted = hexColor("#C5CECA"),
     .warning = hexColor("#B45309"),
     .diff_add = hexColor("#1A7F43"),
     .diff_remove = hexColor("#C4302B"),
@@ -452,6 +452,18 @@ pub fn withAlpha(color: [4]f32, alpha: u8) [4]f32 {
     return .{ color[0], color[1], color[2], @as(f32, @floatFromInt(alpha)) / 255.0 };
 }
 
+/// Tint for a provider logo bitmap, keyed by the provider's tag name. The
+/// white/grey marks (OpenAI, Cursor, Grok, Pi, FX) are drawn in the text
+/// colour so they stay visible on light themes; logos with their own brand
+/// colours, and OpenCode's two-tone mark, are drawn untinted.
+pub fn providerLogoTint(provider_tag: []const u8) [4]f32 {
+    const branded = [_][]const u8{ "claude", "amp", "muse", "opencode" };
+    for (branded) |name| {
+        if (std.mem.eql(u8, provider_tag, name)) return .{ 1.0, 1.0, 1.0, 1.0 };
+    }
+    return COLOR_WHITE;
+}
+
 pub fn syncLegacyColors() void {
     COLOR_GREEN = current_colors.accent;
     COLOR_SECONDARY_GREEN = current_colors.border;
@@ -484,7 +496,7 @@ fn syncMarkdownColors() void {
 
     md.quote_bg = withAlpha(current_colors.panel_alt, 180);
     md.quote_accent = md.link;
-    md.code_bg = darken(current_colors.panel, 0.035);
+    md.code_bg = sink(current_colors.panel, 0.035);
     md.code_border = current_colors.panel_muted;
     md.inline_code_pill = withAlpha(current_colors.panel_alt, 235);
     md.rule = current_colors.panel_muted;
@@ -504,7 +516,7 @@ fn syncMarkdownColors() void {
     md.tok_punct = current_colors.text_muted;
 
     md.copy_bg_idle = withAlpha(current_colors.panel_alt, 210);
-    md.copy_bg_hover = withAlpha(lighten(current_colors.panel_alt, 0.10), 240);
+    md.copy_bg_hover = withAlpha(raise(current_colors.panel_alt, 0.10), 240);
     md.copy_bg_recent = withAlpha(mix(current_colors.accent, current_colors.background, 0.34), 235);
     md.copy_glyph_idle = current_colors.text_muted;
     md.copy_glyph_hover = current_colors.text;
@@ -649,15 +661,24 @@ pub fn omarchyThemeAvailable(allocator: std.mem.Allocator) bool {
     return fileExists(path);
 }
 
+/// True while the palette comes from an Omarchy colors.toml. Terminals then
+/// honour the Ghostty config Omarchy themes alongside it; built-in palettes
+/// keep terminals on Verde's own colours.
+pub var omarchy_palette_active: bool = false;
+
 pub fn applyConfigTheme(allocator: std.mem.Allocator, config: ThemeConfig) void {
     switch (config.source) {
         .omarchy => {
             // Omarchy files layer over the original palette, as they always
             // have; without an install the source behaves like Auto.
             current_colors = verde_legacy_colors;
-            if (!loadOmarchyThemeFromDefaultLocations(allocator)) current_colors = autoColors(system_appearance);
+            omarchy_palette_active = loadOmarchyThemeFromDefaultLocations(allocator);
+            if (!omarchy_palette_active) current_colors = autoColors(system_appearance);
         },
-        else => current_colors = builtinColors(config.source, system_appearance),
+        else => {
+            omarchy_palette_active = false;
+            current_colors = builtinColors(config.source, system_appearance);
+        },
     }
     syncLegacyColors();
     applyThemeColorOverrides(config.colors);
@@ -739,6 +760,64 @@ pub fn darken(color: [4]f32, amount: f32) [4]f32 {
         clampf(color[2] - amount, 0.0, 1.0),
         color[3],
     };
+}
+
+/// Moves `color` away from the active background: lighter on dark palettes,
+/// darker on light ones. UI code uses this (not `lighten`) for hover, raised
+/// and emphasis states so they stay visible on every theme.
+pub fn raise(color: [4]f32, amount: f32) [4]f32 {
+    return raiseAgainst(color, amount, current_colors.background, current_colors.text);
+}
+
+/// Moves `color` toward the active background: darker on dark palettes,
+/// lighter on light ones. The polarity-aware counterpart of `darken`, used
+/// for insets, wells and disabled states.
+pub fn sink(color: [4]f32, amount: f32) [4]f32 {
+    return sinkAgainst(color, amount, current_colors.background, current_colors.text);
+}
+
+/// `raise` for an explicit palette given by its background and text poles.
+pub fn raiseAgainst(color: [4]f32, amount: f32, backing: [4]f32, foreground: [4]f32) [4]f32 {
+    return if (relativeLuma(backing) > relativeLuma(foreground)) darken(color, amount) else lighten(color, amount);
+}
+
+/// `sink` for an explicit palette given by its background and text poles.
+pub fn sinkAgainst(color: [4]f32, amount: f32, backing: [4]f32, foreground: [4]f32) [4]f32 {
+    return if (relativeLuma(backing) > relativeLuma(foreground)) lighten(color, amount) else darken(color, amount);
+}
+
+/// Returns `color` with its hue replaced by `hue_degrees`, keeping its HSL
+/// saturation and lightness. Terminal ANSI hues the palette has no role for
+/// (blue, magenta, cyan) borrow the accent's tuned contrast this way.
+pub fn withHue(color: [4]f32, hue_degrees: f32) [4]f32 {
+    const max_c = @max(color[0], @max(color[1], color[2]));
+    const min_c = @min(color[0], @min(color[1], color[2]));
+    const lightness = (max_c + min_c) * 0.5;
+    const delta = max_c - min_c;
+    const saturation = if (delta <= 0.0001) 0.0 else delta / (1.0 - @abs(2.0 * lightness - 1.0));
+    const chroma = (1.0 - @abs(2.0 * lightness - 1.0)) * saturation;
+    const h = @mod(hue_degrees, 360.0) / 60.0;
+    const x = chroma * (1.0 - @abs(@mod(h, 2.0) - 1.0));
+    const rgb_prime: [3]f32 = if (h < 1.0) .{ chroma, x, 0.0 } else if (h < 2.0) .{ x, chroma, 0.0 } else if (h < 3.0) .{ 0.0, chroma, x } else if (h < 4.0) .{ 0.0, x, chroma } else if (h < 5.0) .{ x, 0.0, chroma } else .{ chroma, 0.0, x };
+    const m = lightness - chroma * 0.5;
+    return .{
+        clampf(rgb_prime[0] + m, 0.0, 1.0),
+        clampf(rgb_prime[1] + m, 0.0, 1.0),
+        clampf(rgb_prime[2] + m, 0.0, 1.0),
+        color[3],
+    };
+}
+
+/// Keeps a fixed-hue mark (file-type icons and similar) readable on `backing`
+/// by mixing it toward the active text colour until it separates enough.
+pub fn legibleOn(color: [4]f32, backing: [4]f32) [4]f32 {
+    const min_distance: f32 = 0.28;
+    var result = color;
+    var amount: f32 = 0.2;
+    while (@abs(relativeLuma(result) - relativeLuma(backing)) < min_distance and amount <= 1.0) : (amount += 0.2) {
+        result = mix(color, current_colors.text, amount);
+    }
+    return result;
 }
 
 const TomlSection = enum { top_level, verde, other };
@@ -824,8 +903,11 @@ fn applyOmarchyPalette(parsed: OmarchyPalette, target: *ThemeColors) void {
     if (parsed.background) |value| {
         target.background = value;
         target.panel = value;
-        target.panel_alt = lighten(value, 0.035);
-        target.panel_muted = lighten(value, 0.12);
+        // Surfaces step away from the background toward the text pole, so
+        // light Omarchy themes get visible panels instead of clamped white.
+        const text = parsed.foreground orelse target.text;
+        target.panel_alt = raiseAgainst(value, 0.035, value, text);
+        target.panel_muted = raiseAgainst(value, 0.12, value, text);
     }
     if (parsed.foreground) |value| {
         target.text = value;
@@ -1168,4 +1250,36 @@ test "Verde Legacy [verde] roles reproduce the original palette exactly" {
         \\
     , &parsed);
     try std.testing.expectEqual(default_colors, parsed);
+}
+
+test "raise and sink follow the palette polarity" {
+    const saved = current_colors;
+    defer current_colors = saved;
+
+    current_colors = verde_dark_colors;
+    try std.testing.expect(relativeLuma(raise(current_colors.panel_alt, 0.08)) > relativeLuma(current_colors.panel_alt));
+    try std.testing.expect(relativeLuma(sink(current_colors.panel_alt, 0.08)) < relativeLuma(current_colors.panel_alt));
+
+    current_colors = verde_light_colors;
+    try std.testing.expect(relativeLuma(raise(current_colors.panel, 0.08)) < relativeLuma(current_colors.panel));
+    try std.testing.expect(relativeLuma(sink(current_colors.panel_alt, 0.03)) > relativeLuma(current_colors.panel_alt));
+}
+
+test "legibleOn separates fixed hues from the backing" {
+    const saved = current_colors;
+    defer current_colors = saved;
+
+    current_colors = verde_light_colors;
+    const pale_yellow = rgb(0xFA, 0xF7, 0x43);
+    const adjusted = legibleOn(pale_yellow, current_colors.background);
+    try std.testing.expect(@abs(relativeLuma(adjusted) - relativeLuma(current_colors.background)) >= 0.28);
+}
+
+test "withHue keeps lightness and moves the hue" {
+    const blue = withHue(verde_dark_colors.accent, 212.0);
+    try std.testing.expect(blue[2] > blue[0] and blue[2] > blue[1]);
+    const original_lightness = (@max(verde_dark_colors.accent[0], @max(verde_dark_colors.accent[1], verde_dark_colors.accent[2])) +
+        @min(verde_dark_colors.accent[0], @min(verde_dark_colors.accent[1], verde_dark_colors.accent[2]))) * 0.5;
+    const blue_lightness = (@max(blue[0], @max(blue[1], blue[2])) + @min(blue[0], @min(blue[1], blue[2]))) * 0.5;
+    try std.testing.expectApproxEqAbs(original_lightness, blue_lightness, 0.01);
 }

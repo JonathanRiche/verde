@@ -45,11 +45,15 @@ export interface OmarchyTheme {
 }
 
 /* bg/accent/fg/warm are copied verbatim from each theme's Omarchy colors.toml
-   (warm = color3). 'verde' matches the site's own default tokens.
+   (warm = color3). 'verde' matches the site's own default tokens and stays
+   first so it remains the site default. Verde Dark/Light appear once
+   screenshots land in theme_shots/.
    'mist-deep' has no upstream colors.toml — it is a Verde-native light theme,
    so its four values are the source of truth rather than a copy. */
 const OMARCHY_THEMES: OmarchyTheme[] = [
   { slug: 'verde', name: 'Verde Legacy', bg: '#101820', accent: '#50c878', fg: '#eaf0f2', warm: '#e8a44a', fallbackShot: appScreenshot },
+  { slug: 'verde-dark', name: 'Verde Dark', bg: '#0b0f0e', accent: '#4fd18b', fg: '#e8eeeb', warm: '#e8c15a' },
+  { slug: 'verde-light', name: 'Verde Light', bg: '#f7f9f8', accent: '#15803d', fg: '#0f1715', warm: '#9a6700' },
   { slug: 'tokyo-night', name: 'Tokyo Night', bg: '#1a1b26', accent: '#7aa2f7', fg: '#a9b1d6', warm: '#e0af68' },
   { slug: 'catppuccin', name: 'Catppuccin', bg: '#1e1e2e', accent: '#89b4fa', fg: '#cdd6f4', warm: '#f9e2af' },
   { slug: 'everforest', name: 'Everforest', bg: '#2d353b', accent: '#7fbbb3', fg: '#d3c6aa', warm: '#dbbc7f' },

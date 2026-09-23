@@ -2269,15 +2269,16 @@ fn renderApprovalCard(state: *app_state.AppState, rect: palette.Rect, approval: 
     const copy_hovered = rectContains(copy_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
     const deny_hovered = rectContains(deny_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
     const approve_hovered = rectContains(approve_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
-    queueRounded(state, copy_rect, paletteColor(if (copy_hovered) theme.lighten(theme.COLOR_PANEL_MUTED, 0.10) else theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0));
+    queueRounded(state, copy_rect, paletteColor(if (copy_hovered) theme.raise(theme.COLOR_PANEL_MUTED, 0.10) else theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0));
     queueBorder(state, copy_rect, paletteColor(if (copy_hovered) theme.COLOR_TEXT_MUTED else theme.borderMuted()), theme.scaledUi(8.0), theme.scaledUi(1.0));
     queueApprovalButtonLabel(state, copy_rect, "Copy", paletteColor(if (copy_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED));
     state.recordTranscriptCopyHit(copy_rect, approval.body, toolCopyIdentity(@intFromPtr(approval.body.ptr), approval.body));
-    queueRounded(state, deny_rect, paletteColor(if (deny_hovered) theme.lighten(theme.COLOR_PANEL_MUTED, 0.10) else theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0));
+    queueRounded(state, deny_rect, paletteColor(if (deny_hovered) theme.raise(theme.COLOR_PANEL_MUTED, 0.10) else theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0));
     queueBorder(state, deny_rect, paletteColor(if (deny_hovered) theme.COLOR_TEXT_MUTED else theme.borderMuted()), theme.scaledUi(8.0), theme.scaledUi(1.0));
     queueApprovalButtonLabel(state, deny_rect, "Decline", paletteColor(if (deny_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED));
-    queueRounded(state, approve_rect, paletteColor(if (approve_hovered) theme.lighten(theme.COLOR_GREEN, 0.08) else theme.COLOR_GREEN), theme.scaledUi(8.0));
-    queueApprovalButtonLabel(state, approve_rect, "Allow", paletteColor(theme.COLOR_WHITE));
+    const approve_fill = if (approve_hovered) theme.raise(theme.COLOR_GREEN, 0.08) else theme.COLOR_GREEN;
+    queueRounded(state, approve_rect, paletteColor(approve_fill), theme.scaledUi(8.0));
+    queueApprovalButtonLabel(state, approve_rect, "Allow", paletteColor(theme.foregroundOn(approve_fill)));
     approval_hits = .{ .pane_id = pane_id, .copy_rect = copy_rect, .approve_rect = approve_rect, .deny_rect = deny_rect };
 }
 
@@ -2813,7 +2814,7 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
 
         const row_hover = mouse_ok and enabled[ri] and rectContains(rr, mx, my);
         if (row_hover) {
-            queueRounded(state, rr, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(8.0));
+            queueRounded(state, rr, paletteColor(theme.raise(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(8.0));
         }
 
         const row_icon_x = rr.x + theme.scaledUi(12.0);
@@ -5812,7 +5813,7 @@ fn renderProviderFailureActionCard(
     });
     const hovered = rectContains(button, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
     const button_fill = if (hovered)
-        theme.withAlpha(theme.lighten(theme.COLOR_PANEL_ALT, 0.10), 245)
+        theme.withAlpha(theme.raise(theme.COLOR_PANEL_ALT, 0.10), 245)
     else
         theme.withAlpha(theme.COLOR_PANEL_MUTED, 205);
     queueRoundedShellClipped(
@@ -7787,7 +7788,7 @@ fn renderCommandEventRow(
     const subagent_row = chat_types.looksLikeSubagentCard(original_author, tool_call_kind, body_raw);
     const fill_color = if (subagent_row)
         theme.mix(theme.background(), theme.accent(), 0.07)
-    else if (grouped) theme.darken(theme.background(), 0.035) else theme.COLOR_PANEL_ALT;
+    else if (grouped) theme.sink(theme.background(), 0.035) else theme.COLOR_PANEL_ALT;
     const resting_border = if (grouped) theme.withAlpha(theme.borderMuted(), 185) else theme.borderMuted();
     queueRoundedShellClipped(
         state,
@@ -7904,7 +7905,7 @@ fn renderCommandEventRow(
     // Match the composer model pill: a quiet translucent resting fill that
     // becomes lighter and more opaque when the pointer enters the control.
     const copy_bg = if (copy_hovered)
-        theme.withAlpha(theme.lighten(theme.COLOR_PANEL_ALT, 0.08), 210)
+        theme.withAlpha(theme.raise(theme.COLOR_PANEL_ALT, 0.08), 210)
     else
         theme.withAlpha(theme.COLOR_PANEL_MUTED, 86);
     const copy_text_color = if (copy_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
@@ -8059,7 +8060,7 @@ fn renderCommandEventRow(
                 .y = bubble.y + header_h,
                 .w = @max(bubble.w - theme.scaledUi(2.0), 1.0),
                 .h = @max(bubble.h - header_h - theme.scaledUi(1.0), 1.0),
-            }, paletteColor(theme.darken(theme.background(), 0.065)), theme.scaledUi(6.0), clip);
+            }, paletteColor(theme.sink(theme.background(), 0.065)), theme.scaledUi(6.0), clip);
             queueRoundedClipped(state, .{
                 .x = bubble.x + pad_x,
                 .y = bubble.y + header_h,
@@ -8989,7 +8990,7 @@ fn renderInactiveComposerRunPill(state: *app_state.AppState, pill: palette.Rect,
     const font = theme.scaledUi(12.5);
     const cell_w = theme.scaledUi(INACTIVE_RUN_PILL_ICON_CELL_CSS);
     const icon_size = theme.scaledUi(INACTIVE_RUN_PILL_ICON_SIZE_CSS);
-    const icon_color = paletteColor(.{ 0.82, 0.85, 0.91, 1.0 });
+    const icon_color = paletteColor(theme.COLOR_TEXT_MUTED);
     const label_right = pill.x + pill.w - theme.scaledUi(10.0);
     const label_y = pill.y + (pill.h - theme.scaledUi(15.0)) * 0.5;
     const label_h = theme.scaledUi(16.0);
@@ -9058,7 +9059,7 @@ fn renderInactiveComposerProviderIcon(state: *app_state.AppState, pill: palette.
     const provider_icon = state.providerLogoTexture(provider);
     if (provider_icon) |cached| {
         const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, icon_slot.x, icon_slot.y, icon_slot.w, icon_slot.h));
-        queueImage(state, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }, cached, pill);
+        queueProviderLogo(state, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }, cached, provider, pill);
     } else {
         const fallback_label = switch (provider) {
             .codex => "C",
@@ -9217,7 +9218,7 @@ fn renderComposerFileSearchResults(state: *app_state.AppState) void {
             .y = row.y + theme.scaledUi(9.0),
             .w = icon_w,
             .h = row.h,
-        }, icon.glyph, paletteColor(icon.color), theme.scaledUi(17.0), row);
+        }, icon.glyph, paletteColor(theme.legibleOn(icon.color, theme.background())), theme.scaledUi(17.0), row);
 
         const text_x = row.x + theme.scaledUi(10.0) + icon_w;
         queueText(state, .{
@@ -9453,7 +9454,7 @@ fn renderRuntimeBlockBanner(state: *app_state.AppState, rect: palette.Rect, bloc
         if (button.rect.w <= 0.0) continue;
         const hovered = rectContains(button.rect, mouse_x, mouse_y);
         const fill = if (button.primary) theme.accent() else theme.COLOR_PANEL_MUTED;
-        queueRounded(state, button.rect, paletteColor(if (hovered) theme.lighten(fill, 0.10) else fill), theme.scaledUi(8.0));
+        queueRounded(state, button.rect, paletteColor(if (hovered) theme.raise(fill, 0.10) else fill), theme.scaledUi(8.0));
         if (!button.primary) queueBorder(state, button.rect, paletteColor(if (hovered) theme.COLOR_TEXT_MUTED else theme.borderMuted()), theme.scaledUi(8.0), theme.scaledUi(1.0));
         queueApprovalButtonLabel(state, button.rect, button.label, paletteColor(if (button.primary or hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED));
     }
@@ -9576,7 +9577,7 @@ fn renderComposerDraftImageChip(state: *app_state.AppState, image: app_state.Cha
         state,
         clear_rect,
         paletteColor(theme.COLOR_PANEL_MUTED),
-        paletteColor(theme.lighten(theme.COLOR_PANEL_MUTED, 0.08)),
+        paletteColor(theme.raise(theme.COLOR_PANEL_MUTED, 0.08)),
         clear_size * 0.5,
         clear_rect,
     );
@@ -9668,7 +9669,7 @@ fn renderPendingFollowupPin(
         .y = rect.y + theme.scaledUi(8.0),
         .w = @max(label_room, theme.scaledUi(1.0)),
         .h = label_font + theme.scaledUi(2.0),
-    }, label, paletteColor(theme.lighten(theme.COLOR_YELLOW, 0.18)), label_font, rect);
+    }, label, paletteColor(theme.raise(theme.COLOR_YELLOW, 0.18)), label_font, rect);
 
     if (rect.w >= theme.scaledUi(360.0)) {
         queueText(state, .{
@@ -9726,7 +9727,7 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
     const previous_z = state.palette_overlay_batch.setZIndex(COMPOSER_TOOLBAR_OVERLAY_Z);
     defer state.palette_overlay_batch.restoreZIndex(previous_z);
 
-    const icon_color = paletteColor(.{ 0.82, 0.85, 0.91, 1.0 });
+    const icon_color = paletteColor(theme.COLOR_TEXT_MUTED);
     const model_rect = state.composer_controller.composer.modelRect();
     const fast_rect = state.composer_controller.composer.fastRect();
     const access_rect = state.composer_controller.composer.accessRect();
@@ -9744,7 +9745,7 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
     const provider_icon = state.providerLogoTexture(state.currentThread().provider);
     if (provider_icon) |cached| {
         const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, model_icon_slot.x, model_icon_slot.y, model_icon_slot.w, model_icon_slot.h));
-        queueImage(state, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }, cached, model_rect);
+        queueProviderLogo(state, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }, cached, state.currentThread().provider, model_rect);
     }
 
     // The directory pill reserves the same leading cell as the model pill;
@@ -10039,6 +10040,17 @@ fn queueImage(state: *app_state.AppState, rect: palette.Rect, texture: app_state
         .w = 1.0,
         .h = 1.0,
     }, .{ .r = 1.0, .g = 1.0, .b = 1.0, .a = 1.0 }, clip) catch {};
+}
+
+fn queueProviderLogo(state: *app_state.AppState, rect: palette.Rect, texture: app_state.CachedImageTexture, provider: app_state.Provider, clip: ?palette.Rect) void {
+    if (!texture.valid or texture.texture_id == 0) return;
+    const tint = theme.providerLogoTint(@tagName(provider));
+    state.palette_overlay_batch.image(state.allocator, snapRect(rect), palette.TextureId.init(texture.texture_id), .{
+        .x = 0.0,
+        .y = 0.0,
+        .w = 1.0,
+        .h = 1.0,
+    }, .{ .r = tint[0], .g = tint[1], .b = tint[2], .a = tint[3] }, clip) catch {};
 }
 
 fn queueText(state: *app_state.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect) void {

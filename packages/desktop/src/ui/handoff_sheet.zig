@@ -468,7 +468,7 @@ fn drawSheet(state: *runtime.AppState, layout: *const SheetLayout) void {
     // Card surface derives from the always-dark theme background (not
     // panel_alt, which omarchy themes may source from light terminal
     // colors) so the text tokens keep their contrast, matching the palette.
-    roundedRect(state, card, theme.lighten(theme.background(), 0.04), radius, clip);
+    roundedRect(state, card, theme.raise(theme.background(), 0.04), radius, clip);
     border(state, card, theme.COLOR_PANEL_MUTED, radius, theme.scaledUi(1.0), clip);
 
     // Header: bold title, source in muted text on the same line, key hints right.
@@ -548,7 +548,7 @@ fn drawProviderLogo(state: *runtime.AppState, provider: runtime.Provider, x: f32
     const slot_rect: palette.Rect = .{ .x = x, .y = row_y + (row_h - slot) * 0.5, .w = slot, .h = slot };
     if (providerLogo(state, provider)) |cached| {
         const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, slot_rect.x, slot_rect.y, slot_rect.w, slot_rect.h));
-        queueImage(state, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }, cached, clip);
+        queueImage(state, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }, cached, theme.providerLogoTint(@tagName(provider)), clip);
     } else {
         const initial = providerLabel(provider)[0..1];
         centeredLabel(state, slot_rect, initial, theme.COLOR_TEXT_MUTED, theme.scaledUi(11.0), clip);
@@ -562,13 +562,13 @@ fn providerLogo(state: *runtime.AppState, provider: runtime.Provider) ?runtime.C
     return cached;
 }
 
-fn queueImage(state: *runtime.AppState, rect: palette.Rect, texture: runtime.CachedImageTexture, clip: palette.Rect) void {
+fn queueImage(state: *runtime.AppState, rect: palette.Rect, texture: runtime.CachedImageTexture, tint: [4]f32, clip: palette.Rect) void {
     state.palette_overlay_batch.image(state.allocator, snapRect(rect), palette.TextureId.init(texture.texture_id), .{
         .x = 0.0,
         .y = 0.0,
         .w = 1.0,
         .h = 1.0,
-    }, .{ .r = 1.0, .g = 1.0, .b = 1.0, .a = 1.0 }, clip) catch |err| {
+    }, .{ .r = tint[0], .g = tint[1], .b = tint[2], .a = tint[3] }, clip) catch |err| {
         log.warn("failed to queue handoff sheet logo: {s}", .{@errorName(err)});
     };
 }
@@ -584,7 +584,7 @@ fn drawCaret(state: *runtime.AppState, rect: palette.Rect, open: bool, color: [4
 
 fn drawMenu(state: *runtime.AppState, menu: *const MenuLayout, pane_clip: palette.Rect) void {
     const radius = theme.scaledUi(8.0);
-    roundedRect(state, menu.frame, theme.lighten(theme.background(), 0.08), radius, pane_clip);
+    roundedRect(state, menu.frame, theme.raise(theme.background(), 0.08), radius, pane_clip);
     border(state, menu.frame, theme.withAlpha(theme.COLOR_WHITE, 34), radius, theme.scaledUi(1.0), pane_clip);
 
     const mouse_x = state.transcript_controller.palette_mouse_x;
@@ -641,7 +641,7 @@ fn drawPreviewToggle(state: *runtime.AppState, rect: palette.Rect, hovered: bool
 fn drawPreview(state: *runtime.AppState, rect: palette.Rect, clip: palette.Rect) void {
     const radius = theme.scaledUi(8.0);
     const inset = theme.scaledUi(10.0);
-    roundedRect(state, rect, theme.darken(theme.background(), 0.02), radius, clip);
+    roundedRect(state, rect, theme.sink(theme.background(), 0.02), radius, clip);
     border(state, rect, theme.withAlpha(theme.COLOR_PANEL_MUTED, 190), radius, theme.scaledUi(1.0), clip);
 
     // Preview body renders the package in the mono face so it reads like the

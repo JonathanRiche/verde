@@ -1048,7 +1048,7 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
 
         const row_hover = mouse_ok and sidebar_menu_row_enabled[ri] and rectContainsPoint(rr, mx, my);
         if (row_hover) {
-            queuePaletteRoundedRect(state, rr, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(8.0));
+            queuePaletteRoundedRect(state, rr, paletteColor(theme.raise(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(8.0));
         }
 
         const row_col = paletteColor(if (!sidebar_menu_row_enabled[ri])
@@ -3015,7 +3015,7 @@ fn queuePaletteProviderGlyphInRect(state: *runtime.AppState, provider: TerminalA
     if (texture) |cached| {
         const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, box.x, box.y, box.w, box.h));
         const draw = snapRect(.{ .x = r.x, .y = r.y, .w = r.w, .h = r.h });
-        if (queuePaletteImage(state, draw, cached, paletteColor(theme.COLOR_WHITE), clip)) return;
+        if (queuePaletteImage(state, draw, cached, paletteColor(theme.providerLogoTint(@tagName(provider))), clip)) return;
     }
 
     const label = switch (provider) {

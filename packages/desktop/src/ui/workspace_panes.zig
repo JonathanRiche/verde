@@ -1104,7 +1104,7 @@ fn renderEmptyWorkspaceAction(
     const hovered = state.transcript_controller.palette_mouse_in_workspace and
         rectContains(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
     const base_color = if (primary) theme.accent() else theme.COLOR_PANEL_ALT;
-    const button_color = if (hovered or selected) theme.lighten(base_color, 0.08) else base_color;
+    const button_color = if (hovered or selected) theme.raise(base_color, 0.08) else base_color;
     queueRounded(state, rect, paletteColor(button_color), theme.scaledUi(7.0));
     const border_color = if (selected and primary)
         theme.COLOR_WHITE
@@ -3243,7 +3243,7 @@ fn renderPaneOverlay(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId,
 fn renderSplitTriggerButton(state: *runtime.AppState, rect: palette.Rect, active: bool, emphasized: bool, clip: palette.Rect) void {
     _ = clip;
     if (active) {
-        queueRounded(state, rect, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
+        queueRounded(state, rect, paletteColor(theme.raise(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
         queueBorder(state, rect, paletteColor(theme.accent()), theme.scaledUi(5.0), theme.scaledUi(1.0));
     } else if (emphasized) {
         queueRounded(state, rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(5.0));
@@ -3390,7 +3390,7 @@ fn renderContextMenuStaticRow(
 ) palette.Rect {
     const rect = palette.Rect{ .x = menu_rect.x + pad_x, .y = y, .w = w, .h = h };
     const hovered = rectContains(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
-    if (hovered) queueRounded(state, rect, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
+    if (hovered) queueRounded(state, rect, paletteColor(theme.raise(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
     queueText(state, .{
         .x = rect.x + theme.scaledUi(8.0),
         .y = rect.y + (rect.h - theme.scaledUi(14.0)) * 0.5,
@@ -3422,7 +3422,7 @@ fn renderContextMenuRow(
     const rect = palette.Rect{ .x = menu_rect.x + pad_x, .y = y, .w = w, .h = h };
     const hovered = rectContains(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
     if (hovered) {
-        queueRounded(state, rect, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
+        queueRounded(state, rect, paletteColor(theme.raise(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
     }
     const text_color = if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
     queueText(state, .{

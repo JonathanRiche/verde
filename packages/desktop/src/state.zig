@@ -2291,13 +2291,13 @@ fn paletteComposerStyle() PaletteComposerPrompt.Style {
         .focus_border_color = paletteColor(theme.COLOR_GREEN),
         .focus_border_width = 1.5,
         .control_background_color = paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 86)),
-        .control_hover_color = paletteColor(theme.withAlpha(theme.lighten(theme.COLOR_PANEL_ALT, 0.08), 210)),
+        .control_hover_color = paletteColor(theme.withAlpha(theme.raise(theme.COLOR_PANEL_ALT, 0.08), 210)),
         .separator_color = paletteColor(theme.withAlpha(theme.COLOR_TEXT_SUBTLE, 90)),
         .send_color = paletteColor(theme.COLOR_GREEN),
-        .send_hover_color = paletteColor(theme.lighten(theme.COLOR_GREEN, 0.08)),
+        .send_hover_color = paletteColor(theme.raise(theme.COLOR_GREEN, 0.08)),
         .send_foreground_color = paletteColor(theme.foregroundOn(theme.COLOR_GREEN)),
         .stop_button_color = paletteColor(theme.COLOR_YELLOW),
-        .stop_button_hover_color = paletteColor(theme.lighten(theme.COLOR_YELLOW, 0.08)),
+        .stop_button_hover_color = paletteColor(theme.raise(theme.COLOR_YELLOW, 0.08)),
         .stop_foreground_color = paletteColor(theme.foregroundOn(theme.COLOR_YELLOW)),
         .text_color = paletteColor(theme.COLOR_WHITE),
         .placeholder_color = paletteColor(theme.withAlpha(theme.COLOR_TEXT_SUBTLE, 220)),
@@ -2309,7 +2309,7 @@ fn paletteComposerStyle() PaletteComposerPrompt.Style {
         .menu_background_color = paletteColor(theme.COLOR_PANEL_ALT),
         .menu_border_color = paletteColor(theme.COLOR_PANEL_MUTED),
         .menu_selected_color = paletteColor(theme.withAlpha(theme.selection(), 218)),
-        .menu_hover_color = paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)),
+        .menu_hover_color = paletteColor(theme.raise(theme.COLOR_PANEL_ALT, 0.08)),
     };
 }
 
@@ -2327,7 +2327,7 @@ fn companionComposerStyle() CompanionComposerPrompt.Style {
         .send_hover_color = paletteColor(chrome.accent_hi),
         .send_foreground_color = paletteColor(chrome.accent_fg),
         .stop_button_color = paletteColor(chrome.warning),
-        .stop_button_hover_color = paletteColor(theme.lighten(chrome.warning, 0.08)),
+        .stop_button_hover_color = paletteColor(theme.raise(chrome.warning, 0.08)),
         .stop_foreground_color = paletteColor(chrome.warning_fg),
         .text_color = paletteColor(chrome.text),
         .placeholder_color = paletteColor(theme.withAlpha(chrome.text_subtle, 220)),
@@ -2405,17 +2405,17 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     // renderer's heavy NotoSans-Bold, which reads as a different typeface.
     .bold_font_role = .ui,
     .control_background_color = paletteColor(theme.withAlpha(theme.default_colors.panel_muted, 86)),
-    .control_hover_color = paletteColor(theme.withAlpha(theme.lighten(theme.default_colors.panel_alt, 0.08), 210)),
+    .control_hover_color = paletteColor(theme.withAlpha(theme.raiseAgainst(theme.default_colors.panel_alt, 0.08, theme.default_colors.background, theme.default_colors.text), 210)),
     .separator_color = paletteColor(theme.withAlpha(theme.default_colors.text_subtle, 90)),
     .menu_background_color = paletteColor(theme.default_colors.panel_alt),
     .menu_border_color = paletteColor(theme.default_colors.panel_muted),
     .menu_selected_color = paletteColor(theme.withAlpha(theme.default_colors.selection, 218)),
-    .menu_hover_color = paletteColor(theme.lighten(theme.default_colors.panel_alt, 0.08)),
+    .menu_hover_color = paletteColor(theme.raiseAgainst(theme.default_colors.panel_alt, 0.08, theme.default_colors.background, theme.default_colors.text)),
     .send_color = paletteColor(theme.default_colors.accent),
-    .send_hover_color = paletteColor(theme.lighten(theme.default_colors.accent, 0.08)),
+    .send_hover_color = paletteColor(theme.raiseAgainst(theme.default_colors.accent, 0.08, theme.default_colors.background, theme.default_colors.text)),
     .send_foreground_color = paletteColor(theme.default_colors.background),
     .stop_button_color = paletteColor(theme.default_colors.warning),
-    .stop_button_hover_color = paletteColor(theme.lighten(theme.default_colors.warning, 0.08)),
+    .stop_button_hover_color = paletteColor(theme.raiseAgainst(theme.default_colors.warning, 0.08, theme.default_colors.background, theme.default_colors.text)),
     .stop_foreground_color = paletteColor(theme.default_colors.background),
     .text_color = paletteColor(theme.default_colors.text),
     .icon_color = paletteColor(theme.default_colors.text_muted),
@@ -2470,7 +2470,7 @@ pub const CompanionComposerPrompt = palette.composerPrompt(.{
     .send_hover_color = paletteColor(theme.companionChromeFor(theme.default_colors).accent_hi),
     .send_foreground_color = paletteColor(theme.companionChromeFor(theme.default_colors).accent_fg),
     .stop_button_color = paletteColor(theme.default_colors.warning),
-    .stop_button_hover_color = paletteColor(theme.lighten(theme.default_colors.warning, 0.08)),
+    .stop_button_hover_color = paletteColor(theme.raiseAgainst(theme.default_colors.warning, 0.08, theme.default_colors.background, theme.default_colors.text)),
     .stop_foreground_color = paletteColor(theme.companionChromeFor(theme.default_colors).warning_fg),
     .text_color = paletteColor(theme.default_colors.text),
     .icon_color = paletteColor(theme.default_colors.text_muted),
@@ -3131,12 +3131,13 @@ fn drawModelPickerProviderLogo(
         .h = inner,
     };
     const c = utils.snapImageRectToPixels(utils.imageRectContain(tex.width, tex.height, square.x, square.y, square.w, square.h));
+    const tint = theme.providerLogoTint(@tagName(provider));
     batch.image(allocator, .{ .x = c.x, .y = c.y, .w = c.w, .h = c.h }, palette.TextureId.init(tex.texture_id), .{
         .x = 0.0,
         .y = 0.0,
         .w = 1.0,
         .h = 1.0,
-    }, .{ .r = 1.0, .g = 1.0, .b = 1.0, .a = 1.0 }, clip) catch {};
+    }, .{ .r = tint[0], .g = tint[1], .b = tint[2], .a = tint[3] }, clip) catch {};
 }
 
 // Letter stand-in for providers without a bundled logo texture (Pi, FX), so
@@ -3199,7 +3200,7 @@ fn paletteModelPickerStyle() palette.RichPickerStyle {
     return .{
         .background_color = paletteColor(theme.COLOR_PANEL_ALT),
         .border_color = paletteColor(theme.COLOR_PANEL_MUTED),
-        .highlighted_color = paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)),
+        .highlighted_color = paletteColor(theme.raise(theme.COLOR_PANEL_ALT, 0.08)),
         // The inline accent check marks the active model, so the row fill
         // stays subtle instead of a solid selection block.
         .selected_color = paletteColor(theme.withAlpha(theme.selection(), 70)),
@@ -3210,8 +3211,8 @@ fn paletteModelPickerStyle() palette.RichPickerStyle {
         .badge_text_color = paletteColor(theme.COLOR_TEXT_MUTED),
         .icon_color = paletteColor(theme.COLOR_GREEN),
         .accent_color = paletteColor(theme.COLOR_GREEN),
-        .rail_background_color = paletteColor(theme.darken(theme.COLOR_PANEL_ALT, 0.35)),
-        .search_background_color = paletteColor(theme.darken(theme.COLOR_PANEL_ALT, 0.25)),
+        .rail_background_color = paletteColor(theme.sink(theme.COLOR_PANEL_ALT, 0.35)),
+        .search_background_color = paletteColor(theme.sink(theme.COLOR_PANEL_ALT, 0.25)),
         .search_border_color = paletteColor(theme.COLOR_PANEL_MUTED),
         .search_selection_color = paletteColor(theme.withAlpha(theme.selection(), 140)),
         .scrollbar_track_color = paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 110)),
@@ -4013,7 +4014,7 @@ fn paletteRunStepperStyle() palette.StepperStyle {
     return .{
         .track_color = paletteColor(theme.withAlpha(theme.background(), 160)),
         .segment_color = paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 140)),
-        .segment_hover_color = paletteColor(theme.lighten(theme.COLOR_PANEL_MUTED, 0.10)),
+        .segment_hover_color = paletteColor(theme.raise(theme.COLOR_PANEL_MUTED, 0.10)),
         // The selected thumb uses the theme accent (like the send button) so
         // it stands out from the muted base segments in every theme.
         .segment_selected_color = paletteColor(theme.withAlpha(theme.COLOR_GREEN, 230)),

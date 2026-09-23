@@ -59,7 +59,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     };
     debug_window_rect = rect;
 
-    queuePaletteRoundedRect(state, rect, paletteColor(.{ 0.06, 0.065, 0.075, 0.96 }), theme.scaledUi(10.0));
+    queuePaletteRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL, 245)), theme.scaledUi(10.0));
     queuePaletteBorder(state, rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(10.0), theme.scaledUi(1.0));
 
     const pad = theme.scaledUi(18.0);

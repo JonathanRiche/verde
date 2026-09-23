@@ -1669,8 +1669,8 @@ fn deriveSproutPalette(active: CharacterTheme) SproutPalette {
     const pole_light = if (text_is_lighter) active.text else active.background;
     const pole_dark = if (text_is_lighter) active.background else active.text;
     const accent_hi = theme.mix(active.accent, pole_light, 0.28);
-    const well = theme.lighten(active.background, 0.02);
-    const char_surface = theme.lighten(active.background, 0.035);
+    const well = theme.raiseAgainst(active.background, 0.02, active.background, active.text);
+    const char_surface = theme.raiseAgainst(active.background, 0.035, active.background, active.text);
 
     var head_top = theme.mix(active.text, accent_hi, 0.45);
     var head_bottom = theme.mix(active.text, active.accent, 0.38);
@@ -1864,7 +1864,7 @@ fn deriveMossPalette(active: CharacterTheme) MossPalette {
     const panel = theme.mix(active.background, active.panel_muted, 0.55);
     const bronze = theme.mix(active.panel_muted, theme.mix(active.accent, active.warning, 0.30), 0.16);
     var outline = theme.mix(active.border, theme.mix(active.accent, active.warning, 0.30), 0.22);
-    const char_surface = theme.lighten(active.background, 0.035);
+    const char_surface = theme.raiseAgainst(active.background, 0.035, active.background, active.text);
     if (lumaDistance(outline, bronze) < 0.10) {
         outline = active.border;
         if (lumaDistance(outline, bronze) < 0.10) outline = active.text_subtle;
@@ -1901,7 +1901,7 @@ fn deriveVireoPalette(active: CharacterTheme) VireoPalette {
     const olive = theme.mix(theme.mix(active.accent, active.warning, 0.45), panel, 0.42);
     const breast = theme.mix(pole_light, active.accent, 0.12);
     var outline = theme.mix(active.border, active.accent, 0.35);
-    const char_surface = theme.lighten(active.background, 0.035);
+    const char_surface = theme.raiseAgainst(active.background, 0.035, active.background, active.text);
     if (lumaDistance(outline, olive) < 0.10) {
         outline = active.border;
         if (lumaDistance(outline, olive) < 0.10) outline = active.text_subtle;
@@ -3659,7 +3659,7 @@ test "Sprout contrast fallbacks use top eye stop and character surface backing" 
     const raw_head_top = theme.mix(top_stop_fixture.text, top_accent_hi, 0.45);
     const raw_head_bottom = theme.mix(top_stop_fixture.text, top_stop_fixture.accent, 0.38);
     const raw_iris_top = theme.mix(top_stop_fixture.text, top_stop_fixture.danger, 0.76);
-    const raw_iris_bottom = theme.mix(theme.lighten(top_stop_fixture.background, 0.02), top_stop_fixture.danger, 0.66);
+    const raw_iris_bottom = theme.mix(theme.raiseAgainst(top_stop_fixture.background, 0.02, top_stop_fixture.background, top_stop_fixture.text), top_stop_fixture.danger, 0.66);
     try std.testing.expect(lumaDistance(raw_iris_top, raw_head_top) < 0.18);
     try std.testing.expect(lumaDistance(theme.mix(raw_iris_top, raw_iris_bottom, 0.5), theme.mix(raw_head_top, raw_head_bottom, 0.5)) >= 0.18);
     const top_result = deriveSproutPalette(top_stop_fixture);
@@ -3682,7 +3682,7 @@ test "Sprout contrast fallbacks use top eye stop and character surface backing" 
         theme.mix(backing_fixture.text, backing_fixture.accent, 0.38),
         0.5,
     );
-    const backing_surface = theme.lighten(backing_fixture.background, 0.035);
+    const backing_surface = theme.raiseAgainst(backing_fixture.background, 0.035, backing_fixture.background, backing_fixture.text);
     const raw_outline = theme.mix(backing_fixture.border, backing_fixture.accent, 0.55);
     try std.testing.expect(lumaDistance(raw_outline, backing_surface) < 0.10);
     try std.testing.expect(lumaDistance(raw_outline, backing_head) >= 0.10);
@@ -3713,7 +3713,7 @@ fn expectSproutPaletteValid(source: CharacterTheme, sprout: SproutPalette) !void
     try std.testing.expectEqual(source.warning, sprout.warning);
     try std.testing.expectEqual(characterForegroundOn(source.warning, source.text, source.background), sprout.warning_foreground);
     try std.testing.expectEqual(source.danger, sprout.danger);
-    try std.testing.expectEqual(theme.mix(theme.lighten(source.background, 0.02), source.danger, 0.40), sprout.eye_ring);
+    try std.testing.expectEqual(theme.mix(theme.raiseAgainst(source.background, 0.02, source.background, source.text), source.danger, 0.40), sprout.eye_ring);
 }
 
 fn testRgb(r: u8, g: u8, b: u8) [4]f32 {

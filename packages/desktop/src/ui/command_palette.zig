@@ -493,7 +493,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     // on a dark surface, matching the contrast the rest of the UI gets on PANEL.
     // The scrim is a touch heavier (0.55) so background content reads as dimmed.
     queueRect(state, .{ .x = 0.0, .y = 0.0, .w = width, .h = height }, paletteColor(theme.scrim(0.55)));
-    queueRoundedRect(state, modal_rect, paletteColor(theme.lighten(theme.background(), 0.04)), theme.scaledUi(16.0));
+    queueRoundedRect(state, modal_rect, paletteColor(theme.raise(theme.background(), 0.04)), theme.scaledUi(16.0));
     queueBorder(state, modal_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(16.0), theme.scaledUi(1.0));
 
     renderSearchField(state);
@@ -1920,7 +1920,7 @@ fn renderActionMenu(state: *runtime.AppState) void {
     // Lightened from the dark background (a bit more than the modal panel's
     // 0.04) so the submenu reads as a layer above it. Derived from background
     // rather than COLOR_PANEL_ALT for the same readability reason as the modal.
-    queueRoundedRect(state, action_menu_rect, paletteColor(theme.lighten(theme.background(), 0.07)), theme.scaledUi(10.0));
+    queueRoundedRect(state, action_menu_rect, paletteColor(theme.raise(theme.background(), 0.07)), theme.scaledUi(10.0));
     queueBorder(state, action_menu_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(10.0), theme.scaledUi(1.0));
     const font_size = theme.scaledUi(13.0);
     var i: usize = 0;

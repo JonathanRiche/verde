@@ -2295,7 +2295,7 @@ fn drawModalChrome(state: *runtime.AppState, width: f32, height: f32, modal: pal
 
 fn drawHeaderBar(state: *runtime.AppState, layout: SettingsLayout) void {
     const m = metrics();
-    drawEdgeStrip(state, layout.header, theme.lighten(theme.COLOR_PANEL, 0.02), true);
+    drawEdgeStrip(state, layout.header, theme.raise(theme.COLOR_PANEL, 0.02), true);
     drawHairline(state, layout.header.x, layout.header.y + layout.header.h - 1.0, layout.header.w);
 
     queueText(state, .{

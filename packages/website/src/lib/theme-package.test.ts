@@ -91,6 +91,25 @@ describe('portable website themes', () => {
     expect(luminance(dark.diff_add!)).toBeGreaterThan(luminance(dark.background!))
   })
 
+  test('step light-theme surfaces toward the text instead of clamping to white', () => {
+    const latte = {
+      slug: 'catppuccin-latte',
+      name: 'Catppuccin Latte',
+      bg: '#eff1f5',
+      accent: '#1e66f5',
+      fg: '#4c4f69',
+      warm: '#df8e1d',
+    }
+
+    const light = portableThemePackage(latte).theme.colors
+    const dark = portableThemePackage(kanagawa).theme.colors
+
+    expect(luminance(light.panel_alt!)).toBeLessThan(luminance(light.background!))
+    expect(luminance(light.panel_muted!)).toBeLessThan(luminance(light.panel_alt!))
+    expect(luminance(light.background!) - luminance(light.border_muted!)).toBeGreaterThan(20)
+    expect(luminance(dark.panel_muted!)).toBeGreaterThan(luminance(dark.background!))
+  })
+
   test('exposes stable production URLs and import commands', () => {
     expect(themePackageUrl('kanagawa')).toBe('https://verdeai.dev/themes/kanagawa.json')
     expect(themeImportCommand('kanagawa')).toBe(

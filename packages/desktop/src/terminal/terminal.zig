@@ -4438,9 +4438,13 @@ const UnixSession = struct {
 
     fn configureTerminalTheme(allocator: std.mem.Allocator, terminal: *ghostty_vt.Terminal) void {
         var terminal_theme = defaultTerminalTheme();
-        loadGhosttyTheme(allocator, &terminal_theme) catch |err| {
-            log.debug("using built-in terminal theme fallback: {s}", .{@errorName(err)});
-        };
+        // Ghostty's config is themed by Omarchy, so it only matches Verde when
+        // Verde follows Omarchy too; built-in palettes keep their own colours.
+        if (theme.omarchy_palette_active) {
+            loadGhosttyTheme(allocator, &terminal_theme) catch |err| {
+                log.debug("using built-in terminal theme fallback: {s}", .{@errorName(err)});
+            };
+        }
 
         terminal.colors.background = ghostty_vt.color.DynamicRGB.init(terminal_theme.background);
         terminal.colors.foreground = ghostty_vt.color.DynamicRGB.init(terminal_theme.foreground);
@@ -4459,23 +4463,28 @@ const UnixSession = struct {
 
     fn defaultTerminalPalette() [256]ghostty_vt.color.RGB {
         var palette = ghostty_vt.color.default;
+        // The palette has no blue/magenta/cyan roles; derive them from the
+        // accent so they inherit its contrast against this theme's background.
+        const blue = theme.withHue(theme.accent(), 212.0);
+        const magenta = theme.withHue(theme.accent(), 300.0);
+        const cyan = theme.withHue(theme.accent(), 186.0);
         const ansi = [_]ghostty_vt.color.RGB{
             terminalRgbFromTheme(theme.COLOR_TEXT_SUBTLE),
             terminalRgbFromTheme(theme.COLOR_DIFF_REMOVE),
             terminalRgbFromTheme(theme.COLOR_GREEN),
             terminalRgbFromTheme(theme.COLOR_YELLOW),
-            terminalRgbFromTheme(theme.selection()),
-            terminalRgbFromTheme(theme.COLOR_ACCENT_DIM),
-            terminalRgbFromTheme(theme.COLOR_TEXT_MUTED),
+            terminalRgbFromTheme(blue),
+            terminalRgbFromTheme(magenta),
+            terminalRgbFromTheme(cyan),
             terminalRgbFromTheme(theme.COLOR_WHITE),
             terminalRgbFromTheme(theme.COLOR_TEXT_MUTED),
-            terminalRgbFromTheme(theme.lighten(theme.COLOR_DIFF_REMOVE, 0.12)),
-            terminalRgbFromTheme(theme.lighten(theme.COLOR_GREEN, 0.12)),
-            terminalRgbFromTheme(theme.lighten(theme.COLOR_YELLOW, 0.12)),
-            terminalRgbFromTheme(theme.lighten(theme.selection(), 0.12)),
-            terminalRgbFromTheme(theme.lighten(theme.COLOR_ACCENT_DIM, 0.2)),
-            terminalRgbFromTheme(theme.lighten(theme.COLOR_TEXT_MUTED, 0.14)),
-            terminalRgbFromTheme(theme.lighten(theme.COLOR_WHITE, 0.04)),
+            terminalRgbFromTheme(theme.raise(theme.COLOR_DIFF_REMOVE, 0.12)),
+            terminalRgbFromTheme(theme.raise(theme.COLOR_GREEN, 0.12)),
+            terminalRgbFromTheme(theme.raise(theme.COLOR_YELLOW, 0.12)),
+            terminalRgbFromTheme(theme.raise(blue, 0.12)),
+            terminalRgbFromTheme(theme.raise(magenta, 0.12)),
+            terminalRgbFromTheme(theme.raise(cyan, 0.12)),
+            terminalRgbFromTheme(theme.raise(theme.COLOR_WHITE, 0.04)),
         };
         @memcpy(palette[0..ansi.len], &ansi);
         return palette;

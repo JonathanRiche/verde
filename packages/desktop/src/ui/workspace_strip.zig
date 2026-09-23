@@ -182,7 +182,7 @@ pub fn render(state: *runtime.AppState, strip: palette.Rect) void {
         const label_area: palette.Rect = .{ .x = rect.x, .y = rect.y, .w = @max(rect.w - tip_reserve, 0.0), .h = rect.h };
         const label = truncatedLabel(&label_buf, title, @max(label_area.w - pad_x * 2.0, 0.0), font_size);
         const shown_w = runtime.paletteUiTextPrefixWidth(label, font_size, label.len);
-        const text_color = if (selected) theme.COLOR_WHITE else if (hovered) theme.lighten(theme.COLOR_TEXT_MUTED, 0.12) else theme.COLOR_TEXT_MUTED;
+        const text_color = if (selected) theme.COLOR_WHITE else if (hovered) theme.raise(theme.COLOR_TEXT_MUTED, 0.12) else theme.COLOR_TEXT_MUTED;
         queueCenteredText(state, label_area, label, shown_w, paletteColor(text_color), font_size, clip);
         if (key_tip.len > 0) renderTabKeyTip(state, rect, clip, key_tip);
         addHit(rect, .tab, project_index, tab.preferred_pane_id);
@@ -204,7 +204,7 @@ fn renderTab(state: *runtime.AppState, rect: palette.Rect, clip: palette.Rect, s
     const fill: [4]f32 = if (selected)
         theme.withAlpha(theme.accent(), 64)
     else if (hovered)
-        theme.lighten(theme.COLOR_PANEL_ALT, 0.06)
+        theme.raise(theme.COLOR_PANEL_ALT, 0.06)
     else
         theme.COLOR_PANEL_ALT;
     queueRoundedRectClipped(state, rect, paletteColor(fill), radius, clip);

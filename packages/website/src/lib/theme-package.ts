@@ -39,11 +39,26 @@ function mix(from: string, to: string, amount: number): string {
   ) as [number, number, number])
 }
 
-function lighten(hex: string, amount: number): string {
+function shift(hex: string, amount: number): string {
   const offset = amount * 255
   return rgbToHex(hexToRgb(hex).map((channel) =>
-    Math.min(255, Math.round(channel + offset)),
+    Math.min(255, Math.max(0, Math.round(channel + offset))),
   ) as [number, number, number])
+}
+
+function relativeLuma(hex: string): number {
+  const [r, g, b] = hexToRgb(hex).map((channel) => {
+    const c = channel / 255
+    return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4
+  }) as [number, number, number]
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b
+}
+
+/* Mirrors desktop `theme.raiseAgainst`: surfaces step away from the
+   background toward the text pole, so light themes get visibly darker panels
+   and borders instead of clamping to white. */
+function raise(hex: string, amount: number, background: string, foreground: string): string {
+  return shift(hex, relativeLuma(background) > relativeLuma(foreground) ? -amount : amount)
 }
 
 /* Diff colors carry fixed semantic meaning — additions read green, removals
@@ -56,7 +71,7 @@ const DIFF_REMOVE_BASE = '#f85149'
 
 /** Build the same semantic palette Verde derives from an Omarchy colors.toml. */
 export function portableThemePackage(theme: PortableThemeSource): PortableThemePackage {
-  const panelMuted = lighten(theme.bg, 0.12)
+  const panelMuted = raise(theme.bg, 0.12, theme.bg, theme.fg)
   return {
     schema_version: 1,
     name: theme.name,
@@ -65,7 +80,7 @@ export function portableThemePackage(theme: PortableThemeSource): PortableThemeP
       colors: {
         background: theme.bg,
         panel: theme.bg,
-        panel_alt: lighten(theme.bg, 0.035),
+        panel_alt: raise(theme.bg, 0.035, theme.bg, theme.fg),
         panel_muted: panelMuted,
         text: theme.fg,
         text_muted: mix(theme.fg, theme.bg, 0.18),

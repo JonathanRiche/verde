@@ -1255,7 +1255,7 @@ fn renderContextMenu(state: *app_state.AppState, dock: anytype, dock_rect: palet
         const row = palette.Rect{ .x = menu_x + pad, .y = y, .w = menu_w - pad * 2.0, .h = row_h };
         hit_cache.menu_hits[i] = .{ .action = actions[i], .rect = row, .enabled = enabled[i] };
         const hovered = mouse_ok and enabled[i] and rectContains(row, mx, my);
-        if (hovered) queueRounded(state, row, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(6.0));
+        if (hovered) queueRounded(state, row, paletteColor(theme.raise(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(6.0));
         queueText(state, .{
             .x = row.x + theme.scaledUi(10.0),
             .y = row.y + theme.scaledUi(6.0),

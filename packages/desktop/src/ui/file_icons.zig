@@ -1,4 +1,6 @@
-/// File icons for FFF file search
+/// File icons for FFF file search. The colours are each language's brand
+/// hue; renderers pass them through `theme.legibleOn` so they stay readable
+/// on light and dark themes.
 const std = @import("std");
 
 const colors = @import("colors.zig");
