@@ -901,6 +901,8 @@ fn emitBridgeToolCallEvent(root: std.json.Value, request: provider_types.SendPro
         .input = getOptionalObjectString(root, "input"),
         .output = getOptionalObjectString(root, "output"),
         .error_text = getOptionalObjectString(root, "error_text"),
+        .transcript = getOptionalObjectString(root, "transcript"),
+        .transcript_delta = getOptionalObjectString(root, "transcript_delta"),
     } });
     return true;
 }
@@ -931,6 +933,8 @@ const ClaudeTestToolCapture = struct {
     status: ?provider_types.ToolCallStatus = null,
     input: ?[]const u8 = null,
     output: ?[]const u8 = null,
+    transcript: ?[]const u8 = null,
+    transcript_delta: ?[]const u8 = null,
     count: usize = 0,
 
     fn handle(context: ?*anyopaque, event: provider_types.StreamEvent) void {
@@ -943,6 +947,8 @@ const ClaudeTestToolCapture = struct {
                 self.status = tool_call.status;
                 self.input = tool_call.input;
                 self.output = tool_call.output;
+                self.transcript = tool_call.transcript;
+                self.transcript_delta = tool_call.transcript_delta;
                 self.count += 1;
             },
             else => {},
@@ -1218,6 +1224,43 @@ test "Claude bridge subagent events preserve title and status" {
     try std.testing.expectEqualStrings("Explore the web app", capture.title.?);
     try std.testing.expectEqual(provider_types.ToolCallKind.subagent, capture.kind.?);
     try std.testing.expectEqual(provider_types.ToolCallStatus.in_progress, capture.status.?);
+}
+
+test "Claude bridge subagent transcript chunks reach the stream without a status" {
+    const allocator = std.testing.allocator;
+    const line =
+        \\{"type":"tool_call_event","call_id":"agent-1","title":"","kind":"subagent","transcript":"{\"type\":\"text\",\"text\":\"hi\"}\n"}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer parsed.deinit();
+    var capture: ClaudeTestToolCapture = .{};
+    try std.testing.expect(emitBridgeToolCallEvent(parsed.value, .{
+        .prompt = "",
+        .stream_context = @ptrCast(&capture),
+        .on_stream_event = ClaudeTestToolCapture.handle,
+    }));
+    try std.testing.expectEqualStrings("agent-1", capture.call_id.?);
+    try std.testing.expectEqual(provider_types.ToolCallKind.subagent, capture.kind.?);
+    try std.testing.expect(capture.status == null);
+    try std.testing.expectEqualStrings("{\"type\":\"text\",\"text\":\"hi\"}\n", capture.transcript.?);
+}
+
+test "Claude bridge subagent transcript deltas carry partial child text" {
+    const allocator = std.testing.allocator;
+    const line =
+        \\{"type":"tool_call_event","call_id":"agent-1","title":"","kind":"subagent","transcript_delta":"par"}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer parsed.deinit();
+    var capture: ClaudeTestToolCapture = .{};
+    try std.testing.expect(emitBridgeToolCallEvent(parsed.value, .{
+        .prompt = "",
+        .stream_context = @ptrCast(&capture),
+        .on_stream_event = ClaudeTestToolCapture.handle,
+    }));
+    try std.testing.expectEqualStrings("agent-1", capture.call_id.?);
+    try std.testing.expect(capture.transcript == null);
+    try std.testing.expectEqualStrings("par", capture.transcript_delta.?);
 }
 
 test "Windows provider bridge probes CLI and package-root GUI layouts" {

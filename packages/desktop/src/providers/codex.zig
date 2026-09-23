@@ -1195,6 +1195,10 @@ pub const Client = struct {
         defer if (started_turn_id) |turn_id| allocator.free(turn_id);
         var reply: std.ArrayList(u8) = .empty;
         defer reply.deinit(allocator);
+        // Collab children live inside the turn that spawned them, so their
+        // routing table dies with it.
+        var collab_agents: CollabAgentTracker = .{ .allocator = self.allocator };
+        defer collab_agents.deinit();
 
         // True once the accepted turn has produced any message after its
         // turn/start response; before that, total socket silence can only mean
@@ -1256,9 +1260,12 @@ pub const Client = struct {
                 }
             }
 
+            if (try emitCollabChildNotification(self.allocator, &collab_agents, root, request)) continue;
+            if (try self.handleCollabChildItemsResponse(&collab_agents, root, request)) continue;
+
             saw_mcp_tool_call = saw_mcp_tool_call or isMcpToolCallNotification(root);
 
-            try emitNotificationEvent(self, root, request);
+            try emitNotificationEvent(self, root, &collab_agents, request);
 
             if (try appendNotificationDelta(root, allocator, &reply)) {
                 if (request.on_stream_delta) |on_stream_delta| {
@@ -1290,6 +1297,10 @@ pub const Client = struct {
             };
         }
 
+        self.emitCollabChildFinalItems(&collab_agents, request) catch |err| {
+            runtime_log.diagnostic("failed to read Codex collab child items: {s}", .{@errorName(err)});
+        };
+
         return reply.toOwnedSlice(allocator);
     }
 
@@ -1315,6 +1326,119 @@ pub const Client = struct {
             request.stream_context,
             on_stream_event,
         );
+    }
+
+    /// Asks for a collab child's items without waiting: a blocking RPC here
+    /// would consume the turn's own notifications, so the response is matched
+    /// back in the turn loop.
+    fn requestCollabChildItems(
+        self: *Client,
+        collab_agents: *CollabAgentTracker,
+        thread_id: []const u8,
+    ) void {
+        const child = collab_agents.lookup(thread_id) orelse return;
+        if (child.pending_read_id != null) return;
+        const id = self.sendRequest("thread/read", .{
+            .threadId = thread_id,
+            .includeTurns = true,
+        }) catch |err| {
+            runtime_log.diagnostic("failed to request Codex collab child items: {s}", .{@errorName(err)});
+            return;
+        };
+        child.pending_read_id = id;
+    }
+
+    /// Every collab item names the child threads it touched; refresh them so
+    /// the card keeps up with a child this connection cannot subscribe to.
+    fn requestCollabChildItemsForItem(
+        self: *Client,
+        collab_agents: *CollabAgentTracker,
+        root: std.json.Value,
+    ) void {
+        const params = getObjectField(root, "params") orelse return;
+        const item = getObjectField(params, "item") orelse return;
+        if (getOptionalObjectString(item, "agentThreadId")) |thread_id| {
+            self.requestCollabChildItems(collab_agents, thread_id);
+        }
+        const field = getObjectField(item, "receiverThreadIds") orelse return;
+        if (field != .array) return;
+        for (field.array.items) |entry| {
+            const thread_id = stringValue(entry) orelse continue;
+            self.requestCollabChildItems(collab_agents, thread_id);
+        }
+    }
+
+    fn handleCollabChildItemsResponse(
+        self: *Client,
+        collab_agents: *CollabAgentTracker,
+        root: std.json.Value,
+        request: provider_types.SendPromptRequest,
+    ) !bool {
+        const response_id = parseMessageId(root) orelse return false;
+        const thread_id = collab_agents.threadForPendingRead(response_id) orelse return false;
+        if (collab_agents.lookup(thread_id)) |child| child.pending_read_id = null;
+        const on_stream_event = request.on_stream_event orelse return true;
+        // An error payload (a paginated thread rejects `includeTurns`) simply
+        // leaves the card on whatever the live notifications carried.
+        const result = getObjectField(root, "result") orelse return true;
+        try emitCollabChildThreadItems(
+            self.allocator,
+            collab_agents,
+            thread_id,
+            result,
+            request.stream_context,
+            on_stream_event,
+        );
+        return true;
+    }
+
+    /// Final catch-up once the parent turn is done: reads each child thread so
+    /// the card ends with the child's full activity and closing report.
+    fn emitCollabChildFinalItems(
+        self: *Client,
+        collab_agents: *CollabAgentTracker,
+        request: provider_types.SendPromptRequest,
+    ) !void {
+        const on_stream_event = request.on_stream_event orelse return;
+        if (collab_agents.children.count() == 0) return;
+
+        // Reads register grandchild threads, so iterate over a stable copy.
+        var thread_ids: std.ArrayList([]const u8) = .empty;
+        defer thread_ids.deinit(self.allocator);
+        var entries = collab_agents.children.keyIterator();
+        while (entries.next()) |key| try thread_ids.append(self.allocator, key.*);
+
+        for (thread_ids.items) |thread_id| {
+            const payload = self.callRpcForResultAlloc("thread/read", .{
+                .threadId = thread_id,
+                .includeTurns = true,
+            }) catch |err| {
+                runtime_log.diagnostic("failed to read Codex collab child thread: {s}", .{@errorName(err)});
+                continue;
+            };
+            defer self.allocator.free(payload);
+
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{});
+            defer parsed.deinit();
+            try emitCollabChildThreadItems(
+                self.allocator,
+                collab_agents,
+                thread_id,
+                parsed.value,
+                request.stream_context,
+                on_stream_event,
+            );
+
+            const child = collab_agents.lookup(thread_id) orelse continue;
+            const report = child.last_text orelse continue;
+            on_stream_event(request.stream_context, .{ .tool_call = .{
+                .call_id = child.parent_call_id,
+                .title = "",
+                .kind = .subagent,
+                .status = null,
+                .output = report,
+            } });
+        }
     }
 
     fn sendTurnStartRequest(
@@ -2855,12 +2979,21 @@ fn extractNotificationDelta(root: std.json.Value) ?[]const u8 {
         findFirstStringByPath(params, &.{"text"});
 }
 
-fn emitNotificationEvent(self: *Client, root: std.json.Value, request: provider_types.SendPromptRequest) !void {
+fn emitNotificationEvent(
+    self: *Client,
+    root: std.json.Value,
+    collab_agents: *CollabAgentTracker,
+    request: provider_types.SendPromptRequest,
+) !void {
     const method = getOptionalObjectString(root, "method") orelse return;
 
     const on_stream_event = request.on_stream_event orelse return;
 
     if (std.mem.eql(u8, method, "item/started") or std.mem.eql(u8, method, "item/completed")) {
+        if (try emitCollabAgentItem(collab_agents, root, request.stream_context, on_stream_event)) {
+            self.requestCollabChildItemsForItem(collab_agents, root);
+            return;
+        }
         if (try emitItemEvent(self.allocator, root, request.stream_context, on_stream_event)) {
             return;
         }
@@ -2951,12 +3084,6 @@ fn emitItemEvent(
 
     if (std.mem.eql(u8, item_type, "mcpToolCall"))
         return emitMcpToolCallItem(allocator, item, started, context, on_stream_event);
-
-    if (std.mem.eql(u8, item_type, "collabAgentToolCall"))
-        return emitCollabAgentToolCallItem(item, started, context, on_stream_event);
-
-    if (std.mem.eql(u8, item_type, "subAgentActivity"))
-        return emitSubAgentActivityItem(item, context, on_stream_event);
 
     if (std.mem.eql(u8, item_type, "reasoning")) {
         const call_id = getOptionalObjectString(item, "id") orelse return false;
@@ -3178,22 +3305,68 @@ fn collabAgentStatus(item: std.json.Value, started: bool) provider_types.ToolCal
     return .completed;
 }
 
+/// Routes the collab-agent item types, which need the child-thread routing
+/// table that plain items never touch.
+fn emitCollabAgentItem(
+    collab_agents: *CollabAgentTracker,
+    root: std.json.Value,
+    context: ?*anyopaque,
+    on_stream_event: *const fn (?*anyopaque, provider_types.StreamEvent) void,
+) !bool {
+    const method = getOptionalObjectString(root, "method") orelse return false;
+    const params = getObjectField(root, "params") orelse return false;
+    const item = getObjectField(params, "item") orelse return false;
+    const item_type = getOptionalObjectString(item, "type") orelse return false;
+    const started = std.mem.eql(u8, method, "item/started");
+
+    if (std.mem.eql(u8, item_type, "collabAgentToolCall"))
+        return emitCollabAgentToolCallItem(collab_agents, item, started, context, on_stream_event);
+
+    if (std.mem.eql(u8, item_type, "subAgentActivity"))
+        return emitSubAgentActivityItem(collab_agents, item, context, on_stream_event);
+
+    return false;
+}
+
 fn emitCollabAgentToolCallItem(
+    collab_agents: *CollabAgentTracker,
     item: std.json.Value,
     started: bool,
     context: ?*anyopaque,
     on_stream_event: *const fn (?*anyopaque, provider_types.StreamEvent) void,
-) bool {
+) !bool {
     const tool = getOptionalObjectString(item, "tool") orelse "";
+    const call_id = collabAgentCallId(item);
+    if (call_id.len == 0) return false;
+    // Every collab tool names the child threads it targets. Track them before
+    // the child's own items start arriving on the shared connection.
+    try trackCollabReceivers(collab_agents, item, call_id);
+
     // Spawn/resume are child-agent lifecycle. Wait/send/list are parent
-    // orchestration around an already-visible child and would duplicate rows.
+    // orchestration around an already-visible child and would duplicate rows;
+    // only their hand-back matters, as the child's answer to the parent.
     const is_child_lifecycle = std.mem.eql(u8, tool, "spawnAgent") or
         std.mem.eql(u8, tool, "resumeAgent") or
         tool.len == 0;
-    if (!is_child_lifecycle) return true;
+    if (!is_child_lifecycle) {
+        if (started) return true;
+        // `wait` carries no receiver thread, so there is no card to update and
+        // no id that would not mint a stray one.
+        if (firstReceiverThreadId(item) == null) return true;
+        const report = collabAgentReportText(item) orelse return true;
+        on_stream_event(context, .{
+            .tool_call = .{
+                .call_id = call_id,
+                .title = "",
+                .kind = .subagent,
+                // A null status leaves the card's own lifecycle status untouched.
+                .status = null,
+                .output = report,
+            },
+        });
+        return true;
+    }
 
-    const call_id = collabAgentCallId(item);
-    if (call_id.len == 0) return false;
     const prompt = getOptionalObjectString(item, "prompt");
     const model = getOptionalObjectString(item, "model");
     const input = if (prompt) |text|
@@ -3206,26 +3379,33 @@ fn emitCollabAgentToolCallItem(
         getOptionalObjectString(error_value, "message")
     else
         null;
-    on_stream_event(context, .{ .tool_call = .{
-        .call_id = call_id,
-        .title = if (prompt) |text| text else "Codex subagent",
-        .kind = .subagent,
-        .status = collabAgentStatus(item, started),
-        .input = if (input.len > 0) input else null,
-        .error_text = error_text,
-    } });
+    on_stream_event(context, .{
+        .tool_call = .{
+            .call_id = call_id,
+            .title = if (prompt) |text| text else "Codex subagent",
+            .kind = .subagent,
+            .status = collabAgentStatus(item, started),
+            .input = if (input.len > 0) input else null,
+            // The subagent pane reads its final "Child agent" bubble from the
+            // card output; fall back to the last message the child streamed.
+            .output = if (started) null else collabAgentReportText(item) orelse collab_agents.lastText(call_id),
+            .error_text = error_text,
+        },
+    });
     return true;
 }
 
 fn emitSubAgentActivityItem(
+    collab_agents: *CollabAgentTracker,
     item: std.json.Value,
     context: ?*anyopaque,
     on_stream_event: *const fn (?*anyopaque, provider_types.StreamEvent) void,
-) bool {
+) !bool {
     const call_id = getOptionalObjectString(item, "agentThreadId") orelse
         getOptionalObjectString(item, "id") orelse
         return false;
     const kind = getOptionalObjectString(item, "kind") orelse "";
+    const finished = std.mem.eql(u8, kind, "completed") or std.mem.eql(u8, kind, "interrupted");
     const status: provider_types.ToolCallStatus = if (std.mem.eql(u8, kind, "completed"))
         .completed
     else if (std.mem.eql(u8, kind, "interrupted"))
@@ -3233,14 +3413,414 @@ fn emitSubAgentActivityItem(
     else
         .in_progress;
     const path = getOptionalObjectString(item, "agentPath") orelse "Codex subagent";
+    // Activity for a tracked child updates a card the collab tool call already
+    // filled in; its prompt input and streamed transcript must survive.
+    const tracked = collab_agents.lookup(call_id) != null;
+    if (getOptionalObjectString(item, "agentThreadId")) |thread_id| {
+        try collab_agents.track(thread_id, call_id);
+    }
     on_stream_event(context, .{ .tool_call = .{
         .call_id = call_id,
         .title = path,
         .kind = .subagent,
         .status = status,
-        .input = path,
+        .input = if (tracked) null else path,
+        .output = if (finished) collab_agents.lastText(call_id) else null,
     } });
     return true;
+}
+
+/// Collab children run as their own app-server threads, which this connection
+/// is not subscribed to: their items arrive only when the server does tag them
+/// with the child `threadId`, otherwise they must be read back per thread. The
+/// tracker maps each child thread to the parent subagent call, remembers which
+/// of its items already reached the card, and keeps one read in flight.
+const CollabAgentTracker = struct {
+    const Child = struct {
+        parent_call_id: []const u8,
+        /// Last message the child completed, used as the parent card output
+        /// when the collab tool call reports no final text of its own.
+        last_text: ?[]u8 = null,
+        /// Item ids already streamed, mapped to whether their terminal entry
+        /// was written, so live events and item reads never duplicate a row.
+        emitted: std.StringHashMapUnmanaged(bool) = .empty,
+        /// In-flight `thread/read` request id for this child, if any.
+        pending_read_id: ?u64 = null,
+    };
+
+    allocator: std.mem.Allocator,
+    children: std.StringHashMapUnmanaged(Child) = .empty,
+
+    fn deinit(self: *CollabAgentTracker) void {
+        var entries = self.children.iterator();
+        while (entries.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.parent_call_id);
+            if (entry.value_ptr.last_text) |text| self.allocator.free(text);
+            var emitted = entry.value_ptr.emitted.iterator();
+            while (emitted.next()) |emitted_entry| self.allocator.free(emitted_entry.key_ptr.*);
+            entry.value_ptr.emitted.deinit(self.allocator);
+        }
+        self.children.deinit(self.allocator);
+    }
+
+    fn track(self: *CollabAgentTracker, child_thread_id: []const u8, parent_call_id: []const u8) !void {
+        if (child_thread_id.len == 0 or parent_call_id.len == 0) return;
+        if (self.children.contains(child_thread_id)) return;
+        const key = try self.allocator.dupe(u8, child_thread_id);
+        errdefer self.allocator.free(key);
+        const call_id = try self.allocator.dupe(u8, parent_call_id);
+        errdefer self.allocator.free(call_id);
+        try self.children.put(self.allocator, key, .{ .parent_call_id = call_id });
+    }
+
+    fn lookup(self: *CollabAgentTracker, thread_id: []const u8) ?*Child {
+        return self.children.getPtr(thread_id);
+    }
+
+    fn lastText(self: *CollabAgentTracker, thread_id: []const u8) ?[]const u8 {
+        const child = self.children.getPtr(thread_id) orelse return null;
+        return child.last_text;
+    }
+
+    fn rememberText(self: *CollabAgentTracker, thread_id: []const u8, text: []const u8) !void {
+        const child = self.children.getPtr(thread_id) orelse return;
+        const owned = try self.allocator.dupe(u8, text);
+        if (child.last_text) |previous| self.allocator.free(previous);
+        child.last_text = owned;
+    }
+
+    /// Records that `item_id` reached the card. Returns false when this stage
+    /// was already streamed, so the caller drops the duplicate entry.
+    fn markEmitted(self: *CollabAgentTracker, thread_id: []const u8, item_id: []const u8, terminal: bool) !bool {
+        const child = self.children.getPtr(thread_id) orelse return false;
+        if (child.emitted.getPtr(item_id)) |stage| {
+            if (stage.* or !terminal) return false;
+            stage.* = true;
+            return true;
+        }
+        const key = try self.allocator.dupe(u8, item_id);
+        errdefer self.allocator.free(key);
+        try child.emitted.put(self.allocator, key, terminal);
+        return true;
+    }
+
+    fn sawItem(self: *CollabAgentTracker, thread_id: []const u8, item_id: []const u8) bool {
+        const child = self.children.getPtr(thread_id) orelse return false;
+        return child.emitted.contains(item_id);
+    }
+
+    fn threadForPendingRead(self: *CollabAgentTracker, request_id: u64) ?[]const u8 {
+        var entries = self.children.iterator();
+        while (entries.next()) |entry| {
+            const pending = entry.value_ptr.pending_read_id orelse continue;
+            if (pending == request_id) return entry.key_ptr.*;
+        }
+        return null;
+    }
+};
+
+fn trackCollabReceivers(collab_agents: *CollabAgentTracker, item: std.json.Value, parent_call_id: []const u8) !void {
+    if (getOptionalObjectString(item, "agentThreadId")) |thread_id| {
+        try collab_agents.track(thread_id, parent_call_id);
+    }
+    const field = getObjectField(item, "receiverThreadIds") orelse
+        getObjectField(item, "receiver_thread_ids") orelse
+        return;
+    if (field != .array) return;
+    for (field.array.items) |entry| {
+        const thread_id = stringValue(entry) orelse continue;
+        try collab_agents.track(thread_id, parent_call_id);
+    }
+}
+
+/// The app-server labels a collab hand-back differently across versions and
+/// tools; accept the first field carrying text so the parent card keeps a real
+/// `Output:` section for the subagent pane.
+fn collabAgentReportText(item: std.json.Value) ?[]const u8 {
+    const keys = [_][]const u8{ "output", "result", "response", "finalResponse", "report", "lastAgentMessage" };
+    for (keys) |key| {
+        const value = getObjectField(item, key) orelse continue;
+        if (value == .string) {
+            if (value.string.len > 0) return value.string;
+            continue;
+        }
+        if (value != .object) continue;
+        for ([_][]const u8{ "text", "message", "content", "output" }) |nested| {
+            const text = getOptionalObjectString(value, nested) orelse continue;
+            if (text.len > 0) return text;
+        }
+    }
+    return null;
+}
+
+// Child tool output is display-only context inside the parent card, and the
+// card is persisted with the chat; cap one noisy command from bloating it.
+const CHILD_TRANSCRIPT_OUTPUT_LIMIT = 4000;
+
+/// Returns true when the notification belongs to a tracked collab child
+/// thread. Those items stream into the parent subagent card's transcript and
+/// must never reach the parent transcript or its reply text.
+fn emitCollabChildNotification(
+    allocator: std.mem.Allocator,
+    collab_agents: *CollabAgentTracker,
+    root: std.json.Value,
+    request: provider_types.SendPromptRequest,
+) !bool {
+    const method = getOptionalObjectString(root, "method") orelse return false;
+    const params = getObjectField(root, "params") orelse return false;
+    const thread_id = getOptionalObjectString(params, "threadId") orelse return false;
+    const child = collab_agents.lookup(thread_id) orelse return false;
+    // The tracker owns this slice for the whole turn, so it survives the map
+    // insertions a nested collab item may trigger below.
+    const parent_call_id = child.parent_call_id;
+    const on_stream_event = request.on_stream_event orelse return true;
+
+    if (std.mem.eql(u8, method, "item/agentMessage/delta")) {
+        const delta = extractNotificationDelta(root) orelse return true;
+        on_stream_event(request.stream_context, .{ .tool_call = .{
+            .call_id = parent_call_id,
+            .title = "",
+            .kind = .subagent,
+            .status = null,
+            .transcript_delta = delta,
+        } });
+        return true;
+    }
+
+    if (!std.mem.eql(u8, method, "item/started") and !std.mem.eql(u8, method, "item/completed")) return true;
+    const item = getObjectField(params, "item") orelse return true;
+    const started = std.mem.eql(u8, method, "item/started");
+    const item_id = getOptionalObjectString(item, "id") orelse "";
+    // An item read may already have streamed this stage from the child thread.
+    if (item_id.len > 0 and !try collab_agents.markEmitted(thread_id, item_id, !started)) return true;
+
+    var entries: std.Io.Writer.Allocating = .init(allocator);
+    defer entries.deinit();
+    if (!try writeChildTranscriptEntry(allocator, collab_agents, thread_id, parent_call_id, item, started, &entries.writer)) return true;
+
+    const chunk = entries.written();
+    if (chunk.len == 0) return true;
+    on_stream_event(request.stream_context, .{
+        .tool_call = .{
+            .call_id = parent_call_id,
+            .title = "",
+            .kind = .subagent,
+            // A null status keeps the parent card on its own lifecycle status.
+            .status = null,
+            .transcript = chunk,
+        },
+    });
+    return true;
+}
+
+/// Streams the items a `thread/read` returned for a child thread. Items the
+/// live notifications already covered are skipped, and an item seen only as
+/// started contributes just its terminal entry.
+fn emitCollabChildThreadItems(
+    allocator: std.mem.Allocator,
+    collab_agents: *CollabAgentTracker,
+    thread_id: []const u8,
+    result: std.json.Value,
+    context: ?*anyopaque,
+    on_stream_event: *const fn (?*anyopaque, provider_types.StreamEvent) void,
+) !void {
+    const child = collab_agents.lookup(thread_id) orelse return;
+    const parent_call_id = child.parent_call_id;
+    const thread = getObjectField(result, "thread") orelse return;
+    const turns = getObjectField(thread, "turns") orelse return;
+    if (turns != .array) return;
+
+    var entries: std.Io.Writer.Allocating = .init(allocator);
+    defer entries.deinit();
+
+    for (turns.array.items) |turn| {
+        const items = getObjectField(turn, "items") orelse continue;
+        if (items != .array) continue;
+        for (items.array.items) |item| {
+            const item_id = getOptionalObjectString(item, "id") orelse continue;
+            const saw_start = collab_agents.sawItem(thread_id, item_id);
+            if (!try collab_agents.markEmitted(thread_id, item_id, true)) continue;
+            // A read only ever returns settled items, so both entries of an
+            // unseen tool call are written in one go.
+            if (!saw_start) _ = try writeChildTranscriptEntry(allocator, collab_agents, thread_id, parent_call_id, item, true, &entries.writer);
+            _ = try writeChildTranscriptEntry(allocator, collab_agents, thread_id, parent_call_id, item, false, &entries.writer);
+        }
+    }
+
+    const chunk = entries.written();
+    if (chunk.len == 0) return;
+    on_stream_event(context, .{ .tool_call = .{
+        .call_id = parent_call_id,
+        .title = "",
+        .kind = .subagent,
+        .status = null,
+        .transcript = chunk,
+    } });
+}
+
+/// Maps one child-thread item to JSON-Lines transcript entries. Returns false
+/// for item types the pane has no row for (reasoning, todo lists, ...).
+fn writeChildTranscriptEntry(
+    allocator: std.mem.Allocator,
+    collab_agents: *CollabAgentTracker,
+    thread_id: []const u8,
+    parent_call_id: []const u8,
+    item: std.json.Value,
+    started: bool,
+    writer: *std.Io.Writer,
+) !bool {
+    const item_type = getOptionalObjectString(item, "type") orelse return false;
+    const call_id = getOptionalObjectString(item, "id") orelse "";
+
+    if (std.mem.eql(u8, item_type, "agentMessage")) {
+        if (started) return false;
+        const text = getOptionalObjectString(item, "text") orelse return false;
+        if (std.mem.trim(u8, text, &std.ascii.whitespace).len == 0) return false;
+        try collab_agents.rememberText(thread_id, text);
+        try writeChildTextEntry(writer, text);
+        return true;
+    }
+
+    if (std.mem.eql(u8, item_type, "commandExecution")) {
+        const command = getOptionalObjectString(item, "command") orelse return false;
+        if (started) {
+            try writeChildToolUseEntry(writer, call_id, "execute", "", command);
+            return true;
+        }
+        const status = getOptionalObjectString(item, "status") orelse "completed";
+        const output = try formatCommandExecutionOutputAlloc(allocator, item);
+        defer if (output) |text| allocator.free(text);
+        try writeChildToolResultEntry(allocator, writer, call_id, isFailedCodexStatus(status), output orelse "");
+        return true;
+    }
+
+    if (std.mem.eql(u8, item_type, "fileChange")) {
+        const changes = getObjectField(item, "changes");
+        const summary = if (changes) |value| try buildImportedFileChangeSummaryAlloc(allocator, value) else null;
+        defer if (summary) |text| allocator.free(text);
+        if (started) {
+            try writeChildToolUseEntry(writer, call_id, "edit", "", summary orelse "");
+            return true;
+        }
+        const status = getOptionalObjectString(item, "status") orelse "completed";
+        try writeChildToolResultEntry(allocator, writer, call_id, isFailedCodexStatus(status), summary orelse "");
+        return true;
+    }
+
+    if (std.mem.eql(u8, item_type, "mcpToolCall")) {
+        var label_buf: [512]u8 = undefined;
+        const label = formatMcpToolCallLabel(&label_buf, item) orelse return false;
+        if (started) {
+            const arguments = if (getObjectField(item, "arguments")) |value| try stringifyAlloc(allocator, value) else null;
+            defer if (arguments) |text| allocator.free(text);
+            try writeChildToolUseEntry(writer, call_id, "mcp", label, arguments orelse "");
+            return true;
+        }
+        const status = getOptionalObjectString(item, "status") orelse "completed";
+        const output = try formatMcpToolCallOutputAlloc(allocator, item);
+        defer if (output) |text| allocator.free(text);
+        try writeChildToolResultEntry(allocator, writer, call_id, isFailedCodexStatus(status), output orelse "");
+        return true;
+    }
+
+    if (std.mem.eql(u8, item_type, "webSearch")) {
+        const query = getOptionalObjectString(item, "query") orelse "";
+        if (started) {
+            try writeChildToolUseEntry(writer, call_id, "search", "Web search", query);
+            return true;
+        }
+        try writeChildToolResultEntry(allocator, writer, call_id, false, query);
+        return true;
+    }
+
+    // A child that spawns its own agent keeps streaming into the same card:
+    // route the grandchild's thread there too instead of losing its items.
+    if (std.mem.eql(u8, item_type, "collabAgentToolCall")) {
+        const child_call_id = collabAgentCallId(item);
+        if (child_call_id.len == 0) return false;
+        try trackCollabReceivers(collab_agents, item, parent_call_id);
+        const prompt = getOptionalObjectString(item, "prompt") orelse "";
+        if (started) {
+            try writeChildToolUseEntry(writer, child_call_id, "subagent", prompt, prompt);
+            return true;
+        }
+        const report = collabAgentReportText(item) orelse collab_agents.lastText(child_call_id) orelse "";
+        try writeChildToolResultEntry(allocator, writer, child_call_id, false, report);
+        return true;
+    }
+
+    return false;
+}
+
+fn isFailedCodexStatus(status: []const u8) bool {
+    return toolCallStatusFromCodex(status) == .failed;
+}
+
+fn writeChildTextEntry(writer: *std.Io.Writer, text: []const u8) !void {
+    var stringify: std.json.Stringify = .{ .writer = writer, .options = .{} };
+    try stringify.beginObject();
+    try stringify.objectField("type");
+    try stringify.write("text");
+    try stringify.objectField("text");
+    try stringify.write(text);
+    try stringify.endObject();
+    try writer.writeAll("\n");
+}
+
+fn writeChildToolUseEntry(
+    writer: *std.Io.Writer,
+    call_id: []const u8,
+    kind: []const u8,
+    title: []const u8,
+    input: []const u8,
+) !void {
+    var stringify: std.json.Stringify = .{ .writer = writer, .options = .{} };
+    try stringify.beginObject();
+    try stringify.objectField("type");
+    try stringify.write("tool_use");
+    try stringify.objectField("id");
+    try stringify.write(call_id);
+    try stringify.objectField("kind");
+    try stringify.write(kind);
+    try stringify.objectField("title");
+    try stringify.write(title);
+    try stringify.objectField("input");
+    try stringify.write(input);
+    try stringify.endObject();
+    try writer.writeAll("\n");
+}
+
+fn writeChildToolResultEntry(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    call_id: []const u8,
+    is_error: bool,
+    output: []const u8,
+) !void {
+    const capped = try truncateChildOutputAlloc(allocator, output);
+    defer if (capped) |text| allocator.free(text);
+    var stringify: std.json.Stringify = .{ .writer = writer, .options = .{} };
+    try stringify.beginObject();
+    try stringify.objectField("type");
+    try stringify.write("tool_result");
+    try stringify.objectField("id");
+    try stringify.write(call_id);
+    try stringify.objectField("is_error");
+    try stringify.write(is_error);
+    try stringify.objectField("output");
+    try stringify.write(capped orelse output);
+    try stringify.endObject();
+    try writer.writeAll("\n");
+}
+
+/// Returns null when `text` already fits. Truncation stops on a UTF-8
+/// boundary so the entry stays valid JSON.
+fn truncateChildOutputAlloc(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
+    if (text.len <= CHILD_TRANSCRIPT_OUTPUT_LIMIT) return null;
+    var end: usize = CHILD_TRANSCRIPT_OUTPUT_LIMIT;
+    while (end > 0 and text[end] & 0xC0 == 0x80) end -= 1;
+    return try std.fmt.allocPrint(allocator, "{s}\n… ({d} more characters)", .{ text[0..end], text.len - end });
 }
 
 fn handleCommandApprovalRequest(self: *Client, root: std.json.Value, request_id: std.json.Value, request: provider_types.SendPromptRequest) !void {
@@ -3900,6 +4480,10 @@ const TestStreamEventCapture = struct {
     tool_status: ?provider_types.ToolCallStatus = null,
     tool_input: ?[]const u8 = null,
     tool_output: ?[]const u8 = null,
+    transcript_storage: [4096]u8 = undefined,
+    transcript_len: usize = 0,
+    transcript_delta_storage: [512]u8 = undefined,
+    transcript_delta_len: usize = 0,
     diff_count: usize = 0,
     diff_path: ?[]const u8 = null,
     diff_patch: ?[]const u8 = null,
@@ -3942,6 +4526,19 @@ const TestStreamEventCapture = struct {
                 } else {
                     self.tool_output = null;
                 }
+                // Transcript chunks are append-only, exactly as consumers merge them.
+                if (tool_call.transcript) |chunk| {
+                    const room = self.transcript_storage.len - self.transcript_len;
+                    const len = @min(chunk.len, room);
+                    @memcpy(self.transcript_storage[self.transcript_len..][0..len], chunk[0..len]);
+                    self.transcript_len += len;
+                }
+                if (tool_call.transcript_delta) |chunk| {
+                    const room = self.transcript_delta_storage.len - self.transcript_delta_len;
+                    const len = @min(chunk.len, room);
+                    @memcpy(self.transcript_delta_storage[self.transcript_delta_len..][0..len], chunk[0..len]);
+                    self.transcript_delta_len += len;
+                }
                 self.tool_call_count += 1;
             },
             .diff => |diff| {
@@ -3959,6 +4556,14 @@ const TestStreamEventCapture = struct {
                 self.diff_count += 1;
             },
         }
+    }
+
+    fn transcript(self: *const TestStreamEventCapture) []const u8 {
+        return self.transcript_storage[0..self.transcript_len];
+    }
+
+    fn transcriptDelta(self: *const TestStreamEventCapture) []const u8 {
+        return self.transcript_delta_storage[0..self.transcript_delta_len];
     }
 };
 
@@ -4682,13 +5287,16 @@ test "collab agent spawn emits subagent lifecycle updates" {
     var started = try std.json.parseFromSlice(std.json.Value, allocator, started_json, .{});
     defer started.deinit();
 
+    var collab_agents: CollabAgentTracker = .{ .allocator = allocator };
+    defer collab_agents.deinit();
     var capture: TestStreamEventCapture = .{};
-    try std.testing.expect(try emitItemEvent(allocator, started.value, &capture, TestStreamEventCapture.handle));
+    try std.testing.expect(try emitCollabAgentItem(&collab_agents, started.value, &capture, TestStreamEventCapture.handle));
     try std.testing.expectEqual(@as(usize, 1), capture.tool_call_count);
     try std.testing.expectEqualStrings("child-1", capture.tool_call_id.?);
     try std.testing.expectEqual(provider_types.ToolCallKind.subagent, capture.tool_kind.?);
     try std.testing.expectEqual(provider_types.ToolCallStatus.in_progress, capture.tool_status.?);
     try std.testing.expectEqualStrings("Explore the web app", capture.tool_input.?);
+    try std.testing.expect(collab_agents.lookup("child-1") != null);
 
     const activity_json =
         \\{
@@ -4707,10 +5315,172 @@ test "collab agent spawn emits subagent lifecycle updates" {
     var activity = try std.json.parseFromSlice(std.json.Value, allocator, activity_json, .{});
     defer activity.deinit();
 
-    try std.testing.expect(try emitItemEvent(allocator, activity.value, &capture, TestStreamEventCapture.handle));
+    try std.testing.expect(try emitCollabAgentItem(&collab_agents, activity.value, &capture, TestStreamEventCapture.handle));
     try std.testing.expectEqual(@as(usize, 2), capture.tool_call_count);
     try std.testing.expectEqualStrings("child-1", capture.tool_call_id.?);
     try std.testing.expectEqual(provider_types.ToolCallStatus.completed, capture.tool_status.?);
+    // The spawn call already stored the child prompt the pane shows as "You";
+    // activity must not overwrite that input with the agent path.
+    try std.testing.expect(capture.tool_input == null);
+}
+
+test "collab child thread items stream into the parent card transcript" {
+    const allocator = std.testing.allocator;
+    var collab_agents: CollabAgentTracker = .{ .allocator = allocator };
+    defer collab_agents.deinit();
+    var capture: TestStreamEventCapture = .{};
+    const request: provider_types.SendPromptRequest = .{
+        .prompt = "Delegate",
+        .stream_context = &capture,
+        .on_stream_event = TestStreamEventCapture.handle,
+    };
+
+    const notifications = [_][]const u8{
+        \\{"method":"item/started","params":{"threadId":"parent-1","item":{"id":"collab-1","type":"collabAgentToolCall","tool":"spawnAgent","status":"inProgress","senderThreadId":"parent-1","receiverThreadIds":["child-1"],"prompt":"Audit the parser"}}}
+        ,
+        \\{"method":"item/started","params":{"threadId":"child-1","item":{"id":"child-cmd-1","type":"commandExecution","command":"rg todo","status":"inProgress"}}}
+        ,
+        \\{"method":"item/completed","params":{"threadId":"child-1","item":{"id":"child-cmd-1","type":"commandExecution","command":"rg todo","status":"completed","aggregatedOutput":"src/main.zig: TODO","exitCode":0}}}
+        ,
+        \\{"method":"item/agentMessage/delta","params":{"threadId":"child-1","delta":{"text":"Found "}}}
+        ,
+        \\{"method":"item/completed","params":{"threadId":"child-1","item":{"id":"child-msg-1","type":"agentMessage","text":"Found one TODO."}}}
+        ,
+        \\{"method":"item/completed","params":{"threadId":"child-1","item":{"id":"child-reasoning-1","type":"reasoning"}}}
+        ,
+    };
+
+    for (notifications, 0..) |payload, index| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+        defer parsed.deinit();
+        const routed = try emitCollabChildNotification(allocator, &collab_agents, parsed.value, request);
+        // The spawn notification belongs to the parent thread and stays there.
+        try std.testing.expectEqual(index != 0, routed);
+        if (index == 0) {
+            try std.testing.expect(try emitCollabAgentItem(&collab_agents, parsed.value, &capture, TestStreamEventCapture.handle));
+        }
+    }
+
+    // Every child event lands on the parent's call id, never as its own row.
+    try std.testing.expectEqualStrings("child-1", capture.tool_call_id.?);
+    try std.testing.expectEqualStrings("Found ", capture.transcriptDelta());
+    try std.testing.expectEqualStrings(
+        \\{"type":"tool_use","id":"child-cmd-1","kind":"execute","title":"","input":"rg todo"}
+    ++ "\n" ++
+        \\{"type":"tool_result","id":"child-cmd-1","is_error":false,"output":"CWD: \nExit code: 0\nDuration ms: -1\n\nsrc/main.zig: TODO"}
+    ++ "\n" ++
+        \\{"type":"text","text":"Found one TODO."}
+    ++ "\n",
+        capture.transcript(),
+    );
+
+    // The child's last message stands in as the card output when the collab
+    // tool call reports no final text of its own.
+    const completed_json =
+        \\{"method":"item/completed","params":{"threadId":"parent-1","item":{"id":"collab-1","type":"collabAgentToolCall","tool":"spawnAgent","status":"completed","receiverThreadIds":["child-1"],"prompt":"Audit the parser"}}}
+    ;
+    var completed = try std.json.parseFromSlice(std.json.Value, allocator, completed_json, .{});
+    defer completed.deinit();
+    try std.testing.expect(try emitCollabAgentItem(&collab_agents, completed.value, &capture, TestStreamEventCapture.handle));
+    try std.testing.expectEqual(provider_types.ToolCallStatus.completed, capture.tool_status.?);
+    try std.testing.expectEqualStrings("Audit the parser", capture.tool_input.?);
+    try std.testing.expectEqualStrings("Found one TODO.", capture.tool_output.?);
+}
+
+test "collab wait hand-back fills the parent card output" {
+    const allocator = std.testing.allocator;
+    var collab_agents: CollabAgentTracker = .{ .allocator = allocator };
+    defer collab_agents.deinit();
+    var capture: TestStreamEventCapture = .{};
+
+    const payload =
+        \\{"method":"item/completed","params":{"threadId":"parent-1","item":{"id":"collab-2","type":"collabAgentToolCall","tool":"waitAgent","status":"completed","receiverThreadIds":["child-9"],"result":{"text":"The parser handles escapes."}}}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(try emitCollabAgentItem(&collab_agents, parsed.value, &capture, TestStreamEventCapture.handle));
+    try std.testing.expectEqual(@as(usize, 1), capture.tool_call_count);
+    try std.testing.expectEqualStrings("child-9", capture.tool_call_id.?);
+    try std.testing.expectEqualStrings("The parser handles escapes.", capture.tool_output.?);
+    // Wait/send only report; they must not restate the card's lifecycle.
+    try std.testing.expectEqual(@as(?provider_types.ToolCallStatus, null), capture.tool_status);
+}
+
+test "collab child thread reads backfill items the connection never received" {
+    const allocator = std.testing.allocator;
+    var collab_agents: CollabAgentTracker = .{ .allocator = allocator };
+    defer collab_agents.deinit();
+    var capture: TestStreamEventCapture = .{};
+    const request: provider_types.SendPromptRequest = .{
+        .prompt = "Delegate",
+        .stream_context = &capture,
+        .on_stream_event = TestStreamEventCapture.handle,
+    };
+    try collab_agents.track("child-1", "child-1");
+
+    const started_json =
+        \\{"method":"item/started","params":{"threadId":"child-1","item":{"id":"child-cmd-1","type":"commandExecution","command":"zig build","status":"inProgress"}}}
+    ;
+    var started = try std.json.parseFromSlice(std.json.Value, allocator, started_json, .{});
+    defer started.deinit();
+    try std.testing.expect(try emitCollabChildNotification(allocator, &collab_agents, started.value, request));
+
+    const read_json =
+        \\{
+        \\  "thread": {
+        \\    "id": "child-1",
+        \\    "turns": [{
+        \\      "id": "turn-1",
+        \\      "items": [
+        \\        {"id": "child-cmd-1", "type": "commandExecution", "command": "zig build", "status": "completed", "aggregatedOutput": "ok"},
+        \\        {"id": "child-msg-1", "type": "agentMessage", "text": "Build is green."},
+        \\        {"id": "child-reasoning-1", "type": "reasoning"}
+        \\      ]
+        \\    }]
+        \\  }
+        \\}
+    ;
+    var read = try std.json.parseFromSlice(std.json.Value, allocator, read_json, .{});
+    defer read.deinit();
+    try emitCollabChildThreadItems(allocator, &collab_agents, "child-1", read.value, &capture, TestStreamEventCapture.handle);
+
+    // The started entry came from the live notification, so the read adds only
+    // the result and the child's message.
+    try std.testing.expectEqualStrings(
+        \\{"type":"tool_use","id":"child-cmd-1","kind":"execute","title":"","input":"zig build"}
+    ++ "\n" ++
+        \\{"type":"tool_result","id":"child-cmd-1","is_error":false,"output":"CWD: \nExit code: -1\nDuration ms: -1\n\nok"}
+    ++ "\n" ++
+        \\{"type":"text","text":"Build is green."}
+    ++ "\n",
+        capture.transcript(),
+    );
+    try std.testing.expectEqualStrings("Build is green.", collab_agents.lastText("child-1").?);
+
+    // A later read of the same thread repeats nothing.
+    const before = capture.tool_call_count;
+    try emitCollabChildThreadItems(allocator, &collab_agents, "child-1", read.value, &capture, TestStreamEventCapture.handle);
+    try std.testing.expectEqual(before, capture.tool_call_count);
+}
+
+test "child transcript entries cap oversized tool output" {
+    const allocator = std.testing.allocator;
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+
+    const output = "x" ** (CHILD_TRANSCRIPT_OUTPUT_LIMIT + 32);
+    try writeChildToolResultEntry(allocator, &writer.writer, "child-cmd-2", true, output);
+
+    const line = writer.written();
+    try std.testing.expect(std.mem.endsWith(u8, line, "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"is_error\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "(32 more characters)") != null);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer parsed.deinit();
+    const parsed_output = getOptionalObjectString(parsed.value, "output").?;
+    try std.testing.expect(parsed_output.len < output.len);
 }
 
 test "hydrated Codex turn items backfill MCP output" {

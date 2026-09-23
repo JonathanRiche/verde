@@ -50,6 +50,18 @@ function claudeTextDeltaFromStreamEvent(message) {
   return typeof event.delta.text === "string" && event.delta.text.length > 0 ? event.delta.text : null;
 }
 
+// Same shape, but for a child agent's partial text. The parent's own dedupe
+// (`claudeUnstreamedText`) never sees these, so they stay ephemeral.
+function claudeChildTextDeltaFromStreamEvent(message) {
+  if (message?.type !== "stream_event") return null;
+  const parentId = message.parent_tool_use_id;
+  if (typeof parentId !== "string" || parentId.length === 0) return null;
+  const event = message.event;
+  if (event?.type !== "content_block_delta" || event.delta?.type !== "text_delta") return null;
+  if (typeof event.delta.text !== "string" || event.delta.text.length === 0) return null;
+  return { parentId, text: event.delta.text };
+}
+
 // The full assistant message repeats text already streamed token by token.
 // Emit only what the stream did not carry (nothing in the common case), so
 // the transcript never shows the reply twice.
@@ -246,6 +258,120 @@ function subagentFromClaudeToolUse(item) {
     (typeof input.subagent_type === "string" && input.subagent_type.trim()) ||
     name;
   return { title, input: jsonText(item.input) };
+}
+
+const CHILD_TOOL_RESULT_LIMIT = 4000;
+
+// Provider-neutral kind for a tool the child agent invoked, so the subagent
+// pane renders the same cards as a top-level transcript.
+function claudeChildToolKind(item) {
+  const name = String(item?.name ?? "");
+  const lower = name.toLowerCase();
+  if (subagentFromClaudeToolUse(item)) return "subagent";
+  if (name.startsWith("mcp__")) return "mcp";
+  if (lower === "bash" || lower === "shell") return "execute";
+  if (lower === "read" || lower === "notebookread") return "read";
+  if (lower === "edit" || lower === "write" || lower === "multiedit" || lower === "notebookedit") return "edit";
+  if (lower === "grep" || lower === "glob" || lower === "ls") return "search";
+  if (lower === "webfetch" || lower === "websearch") return "fetch";
+  return "other";
+}
+
+function claudeChildToolTitle(item, kind) {
+  const input = item?.input && typeof item.input === "object" ? item.input : {};
+  switch (kind) {
+    case "execute":
+      return "";
+    case "mcp":
+      return mcpNameFromClaudeToolUse(item) ?? String(item?.name ?? "");
+    case "subagent":
+      return subagentFromClaudeToolUse(item)?.title ?? String(item?.name ?? "");
+    default: {
+      const target = input.file_path ?? input.path ?? input.pattern ?? input.url ?? input.query;
+      const name = String(item?.name ?? "Tool");
+      return typeof target === "string" && target.length > 0 ? `${name} ${target}` : name;
+    }
+  }
+}
+
+function claudeChildToolInput(item, kind) {
+  if (kind === "execute") return commandFromClaudeToolUse(item) ?? jsonText(item?.input);
+  return jsonText(item?.input);
+}
+
+function truncateChildText(text) {
+  if (typeof text !== "string") return text;
+  if (text.length <= CHILD_TOOL_RESULT_LIMIT) return text;
+  return `${text.slice(0, CHILD_TOOL_RESULT_LIMIT)}\n… (${text.length - CHILD_TOOL_RESULT_LIMIT} more characters)`;
+}
+
+// Child-agent messages (parent_tool_use_id set) become transcript chunks on
+// the parent's subagent call instead of rows in the parent transcript.
+// `nestedAncestorByToolUseId` maps a nested agent's Task tool_use id to the
+// top-level call that owns it, so grandchildren never address a call id the
+// consumers have never seen (which would mint a stray top-level card).
+function emitClaudeChildTranscript(message, subagentByToolUseId, nestedAncestorByToolUseId) {
+  const originId = message?.parent_tool_use_id;
+  if (typeof originId !== "string" || originId.length === 0) return false;
+  if (message.type !== "assistant" && message.type !== "user") return false;
+  const parentId = nestedAncestorByToolUseId.get(originId) ?? originId;
+  // Entries from a nested agent stay on the ancestor's transcript but carry
+  // the nested call they belong to, so the pane can nest them one level down.
+  const nestedId = parentId === originId ? null : originId;
+  const content = message?.message?.content ?? message?.content;
+  // Text in a child `user` message is the task prompt the SDK echoes back
+  // (the pane already shows it as the "You" row); only tool results matter.
+  const keepText = message.type === "assistant";
+  const entries = [];
+  const push = (entry) => entries.push(nestedId ? { ...entry, parent: nestedId } : entry);
+  if (typeof content === "string") {
+    if (keepText && content.length > 0) push({ type: "text", text: content });
+  } else if (Array.isArray(content)) {
+    for (const item of content) {
+      if (item?.type === "text" && typeof item.text === "string" && item.text.length > 0) {
+        if (keepText) push({ type: "text", text: item.text });
+      } else if (item?.type === "thinking" && typeof item.thinking === "string" && item.thinking.length > 0) {
+        if (keepText) push({ type: "thinking", text: truncateChildText(item.thinking) });
+      } else if (item?.type === "tool_use" && typeof item.id === "string") {
+        const kind = claudeChildToolKind(item);
+        // Deeper levels resolve to the same top-level ancestor, so one lookup
+        // routes any depth while `parent` still names the immediate agent.
+        if (kind === "subagent") nestedAncestorByToolUseId.set(item.id, parentId);
+        push({ type: "tool_use", id: item.id, kind, title: claudeChildToolTitle(item, kind), input: claudeChildToolInput(item, kind) });
+      } else if (item?.type === "tool_result" && typeof item.tool_use_id === "string") {
+        push({ type: "tool_result", id: item.tool_use_id, is_error: item.is_error === true, output: truncateChildText(claudeToolResultText(item)) });
+      }
+    }
+  }
+  if (entries.length === 0) return true;
+  write({
+    type: "tool_call_event",
+    call_id: parentId,
+    title: subagentByToolUseId.get(parentId) ?? "",
+    kind: "subagent",
+    transcript: entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n",
+  });
+  return true;
+}
+
+// Token-level child text. `transcript_delta` is ephemeral: consumers show it
+// while the child block streams and drop it once the block's `text` entry
+// lands in `transcript`, so nothing is persisted twice.
+function emitClaudeChildTranscriptDelta(message, subagentByToolUseId, nestedAncestorByToolUseId) {
+  const delta = claudeChildTextDeltaFromStreamEvent(message);
+  if (!delta) return false;
+  // A nested agent has no live card of its own: streaming its tokens onto the
+  // ancestor would show them as the direct child's reply. They arrive with the
+  // block's `text` entry instead, tagged with their `parent`.
+  if (nestedAncestorByToolUseId.has(delta.parentId)) return true;
+  write({
+    type: "tool_call_event",
+    call_id: delta.parentId,
+    title: subagentByToolUseId.get(delta.parentId) ?? "",
+    kind: "subagent",
+    transcript_delta: delta.text,
+  });
+  return true;
 }
 
 function jsonText(value) {
@@ -682,6 +808,9 @@ function buildClaudeOptions(request) {
     // Token-level `stream_event` messages: without them the SDK only yields
     // whole assistant messages, so the transcript jumps a block at a time.
     includePartialMessages: true,
+    // Child-agent text/thinking arrive as messages with parent_tool_use_id
+    // set, so the subagent pane can render the nested conversation.
+    forwardSubagentText: true,
   };
 
   const mode = claudePermissionMode(request.approval_policy, request.sandbox_mode);
@@ -1129,6 +1258,7 @@ async function handleClaudeSendPrompt(sdk, request) {
   const commandByToolUseId = new Map();
   const mcpByToolUseId = new Map();
   const subagentByToolUseId = new Map();
+  const nestedAncestorByToolUseId = new Map();
   const options = buildClaudeOptions(request);
   options.stderr = (data) => {
     if (typeof data === "string" && data.length > 0) stderrChunks.push(data);
@@ -1153,6 +1283,7 @@ async function handleClaudeSendPrompt(sdk, request) {
       const rateLimitFailure = claudeRejectedRateLimitMessage(message);
       if (rateLimitFailure) throw new Error(rateLimitFailure);
       if (message?.type === "stream_event") {
+        if (emitClaudeChildTranscriptDelta(message, subagentByToolUseId, nestedAncestorByToolUseId)) continue;
         const streamedDelta = claudeTextDeltaFromStreamEvent(message);
         if (streamedDelta) {
           streamedText += streamedDelta;
@@ -1185,6 +1316,7 @@ async function handleClaudeSendPrompt(sdk, request) {
         if (backgroundState.trackedToolUseIds.size === 0 && backgroundState.liveBackgroundTasks.length === 0) finishInput();
         continue;
       }
+      if (emitClaudeChildTranscript(message, subagentByToolUseId, nestedAncestorByToolUseId)) continue;
       // Claude auto-continues after background task notifications. Keep the
       // query open so it can inspect the result and finish the turn itself.
       emitClaudeTaskNotification(message, commandByToolUseId, backgroundState, subagentByToolUseId);
@@ -1192,9 +1324,8 @@ async function handleClaudeSendPrompt(sdk, request) {
       emitClaudeToolEvents(message, commandByToolUseId, mcpByToolUseId, subagentByToolUseId, query, backgroundState);
       const delta = textFromContent(message?.message?.content ?? message?.content);
       if (message?.type === "assistant" && delta) {
-        // Subagent replies (parent_tool_use_id set) never streamed above.
-        const unstreamed = message.parent_tool_use_id ? delta : claudeUnstreamedText(delta, streamedText);
-        if (!message.parent_tool_use_id) streamedText = "";
+        const unstreamed = claudeUnstreamedText(delta, streamedText);
+        streamedText = "";
         if (unstreamed) {
           reply += unstreamed;
           write({ type: "delta", text: unstreamed });

@@ -208,7 +208,7 @@ pub fn looksLikeSubagentCard(author: []const u8, kind: ?provider_types.ToolCallK
 }
 
 /// Child-agent prompt/title/result parsed from a structured tool-call body.
-pub fn parseSubagentConversation(body: []const u8) struct { title: []const u8, prompt: []const u8, result: []const u8, session_id: ?[]const u8 } {
+pub fn parseSubagentConversation(body: []const u8) struct { title: []const u8, prompt: []const u8, result: []const u8, session_id: ?[]const u8, transcript: ?[]const u8 } {
     const tool_title = toolBodyField(body, "Tool") orelse "";
     const input = toolBodyField(body, "Input") orelse "";
     const output = toolBodyField(body, "Output");
@@ -228,6 +228,7 @@ pub fn parseSubagentConversation(body: []const u8) struct { title: []const u8, p
         .prompt = if (prompt.len > 0) prompt else "No task prompt was stored.",
         .result = unwrapChildAgentResult(raw_result),
         .session_id = openCodeChildSessionId(output orelse input),
+        .transcript = toolBodyField(body, "Transcript"),
     };
 }
 
@@ -300,9 +301,31 @@ pub fn toolBodyField(body: []const u8, label: []const u8) ?[]const u8 {
     };
     if (start >= body.len) return null;
     const rest = body[start..];
-    const end = std.mem.indexOf(u8, rest, "\n\n") orelse rest.len;
+    const end = nextToolBodyLabel(rest) orelse rest.len;
     const value = std.mem.trim(u8, rest[0..end], " \n\r\t");
     return if (value.len == 0) null else value;
+}
+
+const TOOL_BODY_LABELS = [_][]const u8{ "Tool", "Input", "Output", "Error", "Locations", "Transcript", "Raw event" };
+
+/// Offset of the next `\n\n<Label>:\n` section header in `rest`, so values
+/// keep their own blank lines (multi-paragraph reports, JSON lines).
+fn nextToolBodyLabel(rest: []const u8) ?usize {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, rest, from, "\n\n")) |idx| : (from = idx + 1) {
+        const after = rest[idx + 2 ..];
+        for (TOOL_BODY_LABELS) |label| {
+            if (after.len > label.len + 1 and std.mem.startsWith(u8, after, label) and after[label.len] == ':' and after[label.len + 1] == '\n') return idx;
+        }
+    }
+    return null;
+}
+
+/// Body without the trailing child transcript, for parent-card display/copy.
+pub fn toolBodyWithoutTranscript(body: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, body, "Transcript:\n")) return "";
+    const idx = std.mem.indexOf(u8, body, "\n\nTranscript:\n") orelse return body;
+    return body[0..idx];
 }
 
 pub const BackgroundTaskStatus = enum {
@@ -405,6 +428,9 @@ pub const ChatThread = struct {
     transcript_layout_valid: bool = false,
     transcript_scroll_valid: bool = false,
     transcript_scroll_y: f32 = 0.0,
+    /// Hash of the parent tool-call state a subagent view was last built
+    /// from; unchanged sources skip the rebuild.
+    subagent_view_signature: u64 = 0,
     draft_image: ?ChatImageAttachment = null,
     draft_extra_images: std.ArrayList(ChatImageAttachment),
     draft_storage: [DRAFT_CAPACITY:0]u8,
@@ -611,43 +637,42 @@ pub const ChatThread = struct {
         self.title = owned;
     }
 
-    /// Rebuilds the child-agent pane as a small chat: task prompt, then result.
-    pub fn replaceSubagentViewMessages(
+    /// Rebuilds the child-agent pane from prepared rows (intro, task prompt,
+    /// streamed child activity, result/status). `signature` identifies the
+    /// parent state the rows came from; a matching one skips the rebuild so
+    /// live polling does not reset layout every frame.
+    pub fn replaceSubagentViewRows(
         self: *ChatThread,
         allocator: std.mem.Allocator,
         task_title: []const u8,
-        prompt: []const u8,
-        result_text: []const u8,
+        rows: []const PendingTimelineEvent,
+        signature: u64,
     ) !void {
-        const intro = "Read-only view of a child agent. This is not an independent Verde chat.";
-        if (self.messages.items.len == 3) {
-            const same_intro = std.mem.eql(u8, self.messages.items[0].body, intro);
-            const same_prompt = std.mem.eql(u8, self.messages.items[1].body, prompt);
-            const same_result = std.mem.eql(u8, self.messages.items[2].body, result_text);
-            if (same_intro and same_prompt and same_result) {
-                try self.setTitleText(allocator, task_title);
-                return;
-            }
+        if (self.subagent_view_signature == signature and self.messages.items.len == rows.len) {
+            try self.setTitleText(allocator, task_title);
+            return;
         }
 
         self.clearMessages(allocator);
-        try self.messages.append(allocator, .{
-            .role = .system,
-            .author = try allocator.dupeZ(u8, "System"),
-            .body = try allocator.dupeZ(u8, intro),
-        });
         errdefer self.clearMessages(allocator);
-        try self.messages.append(allocator, .{
-            .role = .user,
-            .author = try allocator.dupeZ(u8, "You"),
-            .body = try allocator.dupeZ(u8, prompt),
-        });
-        try self.messages.append(allocator, .{
-            .role = .assistant,
-            .author = try allocator.dupeZ(u8, "Child agent"),
-            .body = try allocator.dupeZ(u8, result_text),
-        });
+        for (rows) |row| {
+            const author = try allocator.dupeZ(u8, row.author);
+            errdefer allocator.free(author);
+            const body = try allocator.dupeZ(u8, row.body);
+            errdefer allocator.free(body);
+            const call_id = if (row.tool_call_id) |id| try allocator.dupe(u8, id) else null;
+            errdefer if (call_id) |id| allocator.free(id);
+            try self.messages.append(allocator, .{
+                .role = row.role,
+                .author = author,
+                .body = body,
+                .tool_call_id = call_id,
+                .tool_call_kind = row.tool_call_kind,
+                .tool_call_status = row.tool_call_status,
+            });
+        }
         self.committed = true;
+        self.subagent_view_signature = signature;
         try self.setTitleText(allocator, task_title);
         self.touch();
     }
@@ -1326,6 +1351,12 @@ pub const PendingTimelineEvent = struct {
     tool_call_error: ?[]u8 = null,
     tool_call_locations: ?[]u8 = null,
     tool_call_raw: ?[]u8 = null,
+    /// Accumulated child-agent transcript (JSON lines) for subagent calls.
+    tool_call_transcript: ?[]u8 = null,
+    /// Live partial text of the child block still being written. Display only:
+    /// it never reaches `body` (and so never the durable row), and it is
+    /// dropped once the completed block arrives in `tool_call_transcript`.
+    tool_call_transcript_partial: ?[]u8 = null,
     /// Carries the card entrance across pending-to-committed promotion.
     transcript_card_started_ms: i64 = 0,
     /// Memoized measured transcript row height (whole-group height when this
@@ -1349,6 +1380,8 @@ pub const PendingTimelineEvent = struct {
         if (self.tool_call_error) |value| allocator.free(value);
         if (self.tool_call_locations) |value| allocator.free(value);
         if (self.tool_call_raw) |value| allocator.free(value);
+        if (self.tool_call_transcript) |value| allocator.free(value);
+        if (self.tool_call_transcript_partial) |value| allocator.free(value);
         self.* = undefined;
     }
 };
@@ -1550,6 +1583,13 @@ test "subagent local thread ids encode the parent and stay stable" {
     try std.testing.expect(isSubagentLocalThreadId(first));
     try std.testing.expectEqualStrings("chat-1-abc", subagentParentLocalId(first).?);
     try std.testing.expect(!std.mem.eql(u8, first, other));
+
+    // A nested agent's pane hangs off the child pane, so the encoded parent
+    // stays resolvable through the extra `subagent:` level.
+    const grandchild = try mintSubagentLocalThreadId(allocator, first, "nested-call");
+    defer allocator.free(grandchild);
+    try std.testing.expect(isSubagentLocalThreadId(grandchild));
+    try std.testing.expectEqualStrings(first, subagentParentLocalId(grandchild).?);
     try std.testing.expect(isSubagentAuthorOrKind("Subagent", null));
     try std.testing.expect(isSubagentAuthorOrKind("Read", .subagent));
     try std.testing.expect(!isSubagentAuthorOrKind("Read", .read));
@@ -1561,6 +1601,18 @@ test "structured tool bodies expose title input and output sections" {
     try std.testing.expectEqualStrings("{\"prompt\":\"look around\"}", toolBodyField(body, "Input").?);
     try std.testing.expectEqualStrings("found 3 pages", toolBodyField(body, "Output").?);
     try std.testing.expect(toolBodyField(body, "Error") == null);
+}
+
+test "tool body sections keep blank lines until the next label" {
+    const body = "Input:\n{\"prompt\":\"plan\"}\n\nOutput:\nFirst paragraph.\n\nSecond paragraph.\n\nTranscript:\n{\"type\":\"text\",\"text\":\"hi\"}\n{\"type\":\"tool_use\",\"id\":\"c1\"}";
+    try std.testing.expectEqualStrings("First paragraph.\n\nSecond paragraph.", toolBodyField(body, "Output").?);
+    try std.testing.expectEqualStrings("{\"type\":\"text\",\"text\":\"hi\"}\n{\"type\":\"tool_use\",\"id\":\"c1\"}", toolBodyField(body, "Transcript").?);
+    const parsed = parseSubagentConversation(body);
+    try std.testing.expectEqualStrings("First paragraph.\n\nSecond paragraph.", parsed.result);
+    try std.testing.expect(parsed.transcript != null);
+    try std.testing.expectEqualStrings("Input:\n{\"prompt\":\"plan\"}\n\nOutput:\nFirst paragraph.\n\nSecond paragraph.", toolBodyWithoutTranscript(body));
+    try std.testing.expectEqualStrings("", toolBodyWithoutTranscript("Transcript:\n{}"));
+    try std.testing.expectEqualStrings("Input:\nls", toolBodyWithoutTranscript("Input:\nls"));
 }
 
 test "looksLikeSubagentCard recovers persisted Claude and OpenCode rows" {

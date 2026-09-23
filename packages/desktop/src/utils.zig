@@ -1413,6 +1413,8 @@ fn toolCallBodyAlloc(allocator: std.mem.Allocator, tool_call: provider_types.Too
         .{ .label = "Output", .value = tool_call.output },
         .{ .label = "Error", .value = tool_call.error_text },
         .{ .label = "Locations", .value = tool_call.locations },
+        // Last, so parent cards can trim it without disturbing other fields.
+        .{ .label = "Transcript", .value = tool_call.transcript },
     };
 
     var writer: std.Io.Writer.Allocating = .init(allocator);
@@ -1542,6 +1544,16 @@ pub fn upsertPendingToolCallEvent(
             if (tool_call.error_text) |value| try replaceOptionalOwned(allocator, &existing.tool_call_error, value);
             if (tool_call.locations) |value| try replaceOptionalOwned(allocator, &existing.tool_call_locations, value);
             if (tool_call.raw) |value| try replaceOptionalOwned(allocator, &existing.tool_call_raw, value);
+            // Child transcripts stream as chunks; keep everything received so far.
+            if (tool_call.transcript) |value| try appendOptionalOwned(allocator, &existing.tool_call_transcript, value);
+            // A completed block supersedes the partial text it streamed from,
+            // and a terminal status ends any block still in flight.
+            if (tool_call.transcript != null or isTerminalToolCallStatus(tool_call.status)) {
+                clearOptionalOwned(allocator, &existing.tool_call_transcript_partial);
+            }
+            if (tool_call.transcript_delta) |value| {
+                try appendOptionalOwned(allocator, &existing.tool_call_transcript_partial, value);
+            }
             if (tool_call.kind) |kind| existing.tool_call_kind = kind;
             if (tool_call.status) |status| existing.tool_call_status = status;
 
@@ -1567,6 +1579,7 @@ pub fn upsertPendingToolCallEvent(
                 .error_text = existing.tool_call_error,
                 .locations = existing.tool_call_locations,
                 .raw = existing.tool_call_raw,
+                .transcript = existing.tool_call_transcript,
             };
             const owned_author = try allocator.dupe(u8, toolCallDisplayAuthor(merged));
             errdefer allocator.free(owned_author);
@@ -1608,6 +1621,10 @@ pub fn upsertPendingToolCallEvent(
     errdefer if (owned_locations) |value| allocator.free(value);
     const owned_raw = try dupeOptional(allocator, tool_call.raw);
     errdefer if (owned_raw) |value| allocator.free(value);
+    const owned_transcript = try dupeOptional(allocator, tool_call.transcript);
+    errdefer if (owned_transcript) |value| allocator.free(value);
+    const owned_transcript_partial = try dupeOptional(allocator, tool_call.transcript_delta);
+    errdefer if (owned_transcript_partial) |value| allocator.free(value);
 
     try events.append(allocator, .{
         .role = .system,
@@ -1622,7 +1639,31 @@ pub fn upsertPendingToolCallEvent(
         .tool_call_error = owned_error,
         .tool_call_locations = owned_locations,
         .tool_call_raw = owned_raw,
+        .tool_call_transcript = owned_transcript,
+        .tool_call_transcript_partial = owned_transcript_partial,
     });
+}
+
+fn isTerminalToolCallStatus(status: ?provider_types.ToolCallStatus) bool {
+    return switch (status orelse .unknown) {
+        .completed, .failed, .cancelled => true,
+        else => false,
+    };
+}
+
+fn clearOptionalOwned(allocator: std.mem.Allocator, target: *?[]u8) void {
+    if (target.*) |old| allocator.free(old);
+    target.* = null;
+}
+
+fn appendOptionalOwned(allocator: std.mem.Allocator, target: *?[]u8, value: []const u8) !void {
+    const existing = target.* orelse {
+        target.* = try allocator.dupe(u8, value);
+        return;
+    };
+    const joined = try std.mem.concat(allocator, u8, &.{ existing, value });
+    allocator.free(existing);
+    target.* = joined;
 }
 
 fn replaceOptionalOwned(allocator: std.mem.Allocator, target: *?[]u8, value: []const u8) !void {
@@ -1912,6 +1953,39 @@ pub fn pendingTimelineEventsContainAssistant(events: []const chat_types.PendingT
         if (event.role == .assistant) return true;
     }
     return false;
+}
+
+test "subagent transcript deltas accumulate separately from the card body" {
+    const allocator = std.testing.allocator;
+    var events: std.ArrayListUnmanaged(chat_types.PendingTimelineEvent) = .empty;
+    defer freePendingTimelineEvents(allocator, &events);
+
+    try upsertPendingToolCallEvent(allocator, &events, .{
+        .call_id = "agent-1",
+        .title = "Explore repo",
+        .kind = .subagent,
+        .status = .in_progress,
+    });
+    try upsertPendingToolCallEvent(allocator, &events, .{ .call_id = "agent-1", .title = "", .kind = .subagent, .transcript_delta = "par" });
+    try upsertPendingToolCallEvent(allocator, &events, .{ .call_id = "agent-1", .title = "", .kind = .subagent, .transcript_delta = "tial" });
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    try std.testing.expectEqualStrings("partial", events.items[0].tool_call_transcript_partial.?);
+    try std.testing.expect(std.mem.indexOf(u8, events.items[0].body, "partial") == null);
+
+    // The completed block arrives as a transcript entry; the partial goes away.
+    try upsertPendingToolCallEvent(allocator, &events, .{
+        .call_id = "agent-1",
+        .title = "",
+        .kind = .subagent,
+        .transcript = "{\"type\":\"text\",\"text\":\"partial done\"}\n",
+    });
+    try std.testing.expect(events.items[0].tool_call_transcript_partial == null);
+    try std.testing.expectEqualStrings("{\"type\":\"text\",\"text\":\"partial done\"}\n", events.items[0].tool_call_transcript.?);
+
+    // A terminal status ends any block still streaming.
+    try upsertPendingToolCallEvent(allocator, &events, .{ .call_id = "agent-1", .title = "", .kind = .subagent, .transcript_delta = "orphan" });
+    try upsertPendingToolCallEvent(allocator, &events, .{ .call_id = "agent-1", .title = "", .kind = .subagent, .status = .completed, .output = "done" });
+    try std.testing.expect(events.items[0].tool_call_transcript_partial == null);
 }
 
 test "structured tool-call updates upsert and merge lifecycle content" {

@@ -1121,8 +1121,13 @@ const EventStreamContext = struct {
     request: provider_types.SendPromptRequest,
     child: ?platform_process.OwnedChild = null,
     streamed_text: std.ArrayListUnmanaged(u8) = .empty,
-    /// callID → tool name, so success/failure events can be titled and classified.
+    /// Tool call id → tool name, so success/failure events can be titled and
+    /// classified. Child-session calls share the map: OpenCode call ids are
+    /// unique across the service, and only the name lookup is shared.
     tool_names: std.StringHashMapUnmanaged([]u8) = .empty,
+    /// Child session id → the parent subagent call its activity streams into.
+    /// Only the SSE worker touches this, so it needs no lock.
+    child_subagents: std.StringHashMapUnmanaged(ChildSubagent) = .empty,
     mutex: Mutex = .{},
     condition: Condition = .{},
     open_state: EventStreamOpenState = .starting,
@@ -1138,6 +1143,33 @@ const EventStreamContext = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.tool_names.deinit(self.allocator);
+        var child_it = self.child_subagents.iterator();
+        while (child_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.child_subagents.deinit(self.allocator);
+    }
+};
+
+/// Live link from a `task`/`subagent` child session to the parent tool call
+/// whose append-only transcript its activity streams into.
+const ChildSubagent = struct {
+    call_id: []u8,
+    /// Newest completed child answer. OpenCode's subagent tool result content
+    /// is only a `<subagent sessionID=… />` marker, so the parent card's
+    /// `Output:` has to come from the child's own stream.
+    final_text: ?[]u8 = null,
+    /// `assistantMessageID:ordinal` of blocks already appended, so a repeated
+    /// `session.text.ended` cannot duplicate a bubble in the durable transcript.
+    emitted_text: std.StringHashMapUnmanaged(void) = .empty,
+
+    fn deinit(self: *ChildSubagent, allocator: std.mem.Allocator) void {
+        allocator.free(self.call_id);
+        if (self.final_text) |text| allocator.free(text);
+        var it = self.emitted_text.keyIterator();
+        while (it.next()) |key| allocator.free(key.*);
+        self.emitted_text.deinit(allocator);
     }
 };
 
@@ -1878,12 +1910,23 @@ fn processEventStreamMessage(context: *EventStreamContext, raw_event_name: []con
     const envelope = parseEventEnvelope(parsed.value, raw_event_name) orelse return;
     const event_type = envelope.event_type;
     const properties = envelope.properties;
-    if (!eventTargetsSession(properties, context.session_id)) return;
+    if (!eventTargetsSession(properties, context.session_id)) {
+        // Task children run in their own session on the same global stream.
+        // They must never produce parent rows or end the parent's turn.
+        if (getOptionalObjectString(properties, "sessionID")) |child_session_id| {
+            try handleChildSessionEvent(context, child_session_id, event_type, properties);
+        }
+        return;
+    }
 
     if (eventTypeIs(event_type, "session.text.delta")) {
         try handleTextDelta(context, properties);
+    } else if (eventTypeIs(event_type, "session.tool.input.started")) {
+        try handleToolInputStarted(context, properties);
     } else if (eventTypeIs(event_type, "session.tool.called")) {
         try handleToolCalled(context, properties);
+    } else if (eventTypeIs(event_type, "session.tool.progress")) {
+        try handleToolProgress(context, properties);
     } else if (eventTypeIs(event_type, "session.tool.success")) {
         try handleToolFinished(context, properties, .completed);
     } else if (eventTypeIs(event_type, "session.tool.failed")) {
@@ -1971,33 +2014,88 @@ fn handleTextDelta(context: *EventStreamContext, properties: std.json.Value) !vo
     on_stream_delta(context.request.stream_context, delta);
 }
 
+/// OpenCode 2 streams a tool's name once, on `session.tool.input.started`;
+/// every later event for that call carries only its id.
+fn handleToolInputStarted(context: *EventStreamContext, properties: std.json.Value) !void {
+    const call_id = toolCallIdOf(properties) orelse return;
+    const tool_name = toolNameOf(properties) orelse return;
+    try rememberToolName(context, call_id, tool_name);
+}
+
 fn handleToolCalled(context: *EventStreamContext, properties: std.json.Value) !void {
-    const call_id = getOptionalObjectString(properties, "callID") orelse return;
-    const tool_name = getOptionalObjectString(properties, "tool") orelse return;
+    const call_id = toolCallIdOf(properties) orelse return;
+    if (toolNameOf(properties)) |tool_name| try rememberToolName(context, call_id, tool_name);
+    const tool_name = lookupToolName(context, call_id) orelse return;
 
-    {
-        context.mutex.lock();
-        defer context.mutex.unlock();
-        if (context.tool_names.get(call_id) == null) {
-            const owned_call_id = try context.allocator.dupe(u8, call_id);
-            errdefer context.allocator.free(owned_call_id);
-            const owned_name = try context.allocator.dupe(u8, tool_name);
-            errdefer context.allocator.free(owned_name);
-            try context.tool_names.put(context.allocator, owned_call_id, owned_name);
-        }
-    }
+    _ = try emitToolCalled(context.allocator, context.request, tool_name, properties);
+}
 
-    _ = try emitToolCalled(context.allocator, context.request, properties);
+/// The subagent tool reports `{sessionID, status}` as progress metadata as
+/// soon as it has a child session, which is the only pre-completion link
+/// between a task call and the session its transcript arrives on.
+fn handleToolProgress(context: *EventStreamContext, properties: std.json.Value) !void {
+    const call_id = toolCallIdOf(properties) orelse return;
+    const tool_name = lookupToolName(context, call_id) orelse return;
+    if (openCodeToolKind(tool_name) != .subagent) return;
+    const metadata = getObjectField(properties, "metadata") orelse return;
+    const child_session_id = getOptionalObjectString(metadata, "sessionID") orelse return;
+    try linkChildSubagent(context, child_session_id, call_id);
 }
 
 fn handleToolFinished(context: *EventStreamContext, properties: std.json.Value, status: provider_types.ToolCallStatus) !void {
-    const call_id = getOptionalObjectString(properties, "callID") orelse return;
+    const call_id = toolCallIdOf(properties) orelse return;
 
-    context.mutex.lock();
-    const tool_name: []const u8 = context.tool_names.get(call_id) orelse "tool";
-    context.mutex.unlock();
+    const tool_name: []const u8 = lookupToolName(context, call_id) orelse "tool";
 
     _ = try emitToolResult(context.allocator, context.request, tool_name, properties, status);
+    emitSubagentFinalOutput(context, call_id, status);
+}
+
+/// 2.0 keys tool events by `id`; the beta spelling was `callID`.
+fn toolCallIdOf(properties: std.json.Value) ?[]const u8 {
+    return getOptionalObjectString(properties, "callID") orelse getOptionalObjectString(properties, "id");
+}
+
+/// The beta repeated `tool` on every tool event; 2.0 names it `name` and sends
+/// it only with the call's input.
+fn toolNameOf(properties: std.json.Value) ?[]const u8 {
+    return getOptionalObjectString(properties, "tool") orelse getOptionalObjectString(properties, "name");
+}
+
+fn rememberToolName(context: *EventStreamContext, call_id: []const u8, tool_name: []const u8) !void {
+    context.mutex.lock();
+    defer context.mutex.unlock();
+    if (context.tool_names.get(call_id) != null) return;
+
+    const owned_call_id = try context.allocator.dupe(u8, call_id);
+    errdefer context.allocator.free(owned_call_id);
+    const owned_name = try context.allocator.dupe(u8, tool_name);
+    errdefer context.allocator.free(owned_name);
+    try context.tool_names.put(context.allocator, owned_call_id, owned_name);
+}
+
+fn lookupToolName(context: *EventStreamContext, call_id: []const u8) ?[]const u8 {
+    context.mutex.lock();
+    defer context.mutex.unlock();
+    return context.tool_names.get(call_id);
+}
+
+fn linkChildSubagent(context: *EventStreamContext, child_session_id: []const u8, call_id: []const u8) !void {
+    if (context.child_subagents.contains(child_session_id)) return;
+
+    const owned_session_id = try context.allocator.dupe(u8, child_session_id);
+    errdefer context.allocator.free(owned_session_id);
+    const owned_call_id = try context.allocator.dupe(u8, call_id);
+    errdefer context.allocator.free(owned_call_id);
+    try context.child_subagents.put(context.allocator, owned_session_id, .{ .call_id = owned_call_id });
+}
+
+fn childSubagentForCall(context: *EventStreamContext, call_id: []const u8) ?*ChildSubagent {
+    var it = context.child_subagents.valueIterator();
+    while (it.next()) |child| {
+        if (std.mem.eql(u8, child.call_id, call_id)) return child;
+    }
+    return null;
 }
 
 fn emitRetryMessage(context: *EventStreamContext, properties: std.json.Value) !void {
@@ -2062,15 +2160,15 @@ fn openCodeTaskTitle(input: std.json.Value, fallback: []const u8) []const u8 {
     return fallback;
 }
 
-/// Emits a `session.tool.called` event (`{callID, tool, input}`) as an in-progress tool row.
+/// Emits a `session.tool.called` event (`{id, input}`) as an in-progress tool row.
 fn emitToolCalled(
     allocator: std.mem.Allocator,
     request: provider_types.SendPromptRequest,
+    tool_name: []const u8,
     properties: std.json.Value,
 ) !bool {
     const on_stream_event = request.on_stream_event orelse return false;
-    const tool_name = getOptionalObjectString(properties, "tool") orelse return false;
-    const call_id = getOptionalObjectString(properties, "callID") orelse return false;
+    const call_id = toolCallIdOf(properties) orelse return false;
     const input_value = getObjectField(properties, "input") orelse .null;
     const input = if (input_value != .null) try stringifyAlloc(allocator, input_value) else null;
     defer if (input) |value| allocator.free(value);
@@ -2097,19 +2195,12 @@ fn emitToolResult(
     status: provider_types.ToolCallStatus,
 ) !bool {
     const on_stream_event = request.on_stream_event orelse return false;
-    const call_id = getOptionalObjectString(properties, "callID") orelse return false;
+    const call_id = toolCallIdOf(properties) orelse return false;
 
     const output = try extractToolOutputAlloc(allocator, properties);
     defer if (output) |value| allocator.free(value);
 
-    const error_text = blk: {
-        const error_value = getObjectField(properties, "error") orelse break :blk null;
-        break :blk switch (error_value) {
-            .string => |text| text,
-            .object => getOptionalObjectString(error_value, "message"),
-            else => null,
-        };
-    };
+    const error_text = extractToolErrorText(properties);
 
     const kind = openCodeToolKind(tool_name);
     // Result events often omit `input`. Leave subagent titles empty so the
@@ -2127,6 +2218,16 @@ fn emitToolResult(
         .error_text = error_text,
     } });
     return true;
+}
+
+/// `error` is a string on older services and an error object on 2.0.
+fn extractToolErrorText(properties: std.json.Value) ?[]const u8 {
+    const error_value = getObjectField(properties, "error") orelse return null;
+    return switch (error_value) {
+        .string => |text| text,
+        .object => getOptionalObjectString(error_value, "message"),
+        else => null,
+    };
 }
 
 fn extractToolOutputAlloc(allocator: std.mem.Allocator, properties: std.json.Value) !?[]u8 {
@@ -2147,6 +2248,190 @@ fn extractToolOutputAlloc(allocator: std.mem.Allocator, properties: std.json.Val
     }
     if (text.items.len == 0) return null;
     return try text.toOwnedSlice(allocator);
+}
+
+// Child subagent transcripts ---------------------------------------------------
+
+/// Cap for one child tool result inside the durable transcript.
+const MAX_CHILD_TRANSCRIPT_OUTPUT_BYTES = 4000;
+
+/// Maps one event from a task's child session onto the parent subagent card's
+/// append-only `transcript`. Events for sessions Verde has not linked to a
+/// running task call are dropped, so unrelated sessions on the shared stream
+/// stay out of this turn entirely.
+fn handleChildSessionEvent(
+    context: *EventStreamContext,
+    child_session_id: []const u8,
+    event_type: []const u8,
+    properties: std.json.Value,
+) !void {
+    const child = context.child_subagents.getPtr(child_session_id) orelse return;
+
+    if (eventTypeIs(event_type, "session.tool.input.started")) {
+        const call_id = toolCallIdOf(properties) orelse return;
+        const tool_name = toolNameOf(properties) orelse return;
+        try rememberToolName(context, call_id, tool_name);
+        return;
+    }
+    if (eventTypeIs(event_type, "session.text.ended")) {
+        try appendChildText(context, child, properties);
+        return;
+    }
+    if (eventTypeIs(event_type, "session.tool.called")) {
+        try appendChildToolUse(context, child, properties);
+        return;
+    }
+    if (eventTypeIs(event_type, "session.tool.success")) {
+        try appendChildToolResult(context, child, properties, false);
+        return;
+    }
+    if (eventTypeIs(event_type, "session.tool.failed")) {
+        try appendChildToolResult(context, child, properties, true);
+        return;
+    }
+    // `session.text.delta` is a partial block and the transcript is durable;
+    // step and reasoning parts have no parent-side row to mirror.
+}
+
+/// Child assistant text lands on `session.text.ended`, which carries the whole
+/// completed block, so the transcript never stores a half-written answer.
+fn appendChildText(context: *EventStreamContext, child: *ChildSubagent, properties: std.json.Value) !void {
+    const text = getOptionalObjectString(properties, "text") orelse return;
+    if (std.mem.trim(u8, text, &std.ascii.whitespace).len == 0) return;
+
+    const message_id = getOptionalObjectString(properties, "assistantMessageID") orelse "";
+    const ordinal = jsonInteger(getObjectField(properties, "ordinal")) orelse 0;
+    const key = try std.fmt.allocPrint(context.allocator, "{s}:{d}", .{ message_id, ordinal });
+    errdefer context.allocator.free(key);
+    if (child.emitted_text.contains(key)) {
+        context.allocator.free(key);
+        return;
+    }
+    try child.emitted_text.put(context.allocator, key, {});
+
+    const owned_final = try context.allocator.dupe(u8, text);
+    if (child.final_text) |existing| context.allocator.free(existing);
+    child.final_text = owned_final;
+
+    var lines: std.ArrayList(u8) = .empty;
+    defer lines.deinit(context.allocator);
+    try appendTranscriptEntry(context.allocator, &lines, .{ .type = "text", .text = text });
+    emitChildTranscript(context, child, lines.items);
+}
+
+fn appendChildToolUse(context: *EventStreamContext, child: *ChildSubagent, properties: std.json.Value) !void {
+    const call_id = toolCallIdOf(properties) orelse return;
+    if (toolNameOf(properties)) |tool_name| try rememberToolName(context, call_id, tool_name);
+    const tool_name = lookupToolName(context, call_id) orelse "tool";
+
+    const input_value = getObjectField(properties, "input") orelse .null;
+    const kind = openCodeToolKind(tool_name);
+    const title = if (kind == .subagent) openCodeTaskTitle(input_value, tool_name) else tool_name;
+    const input = try childToolInputAlloc(context.allocator, kind, input_value);
+    defer if (input) |value| context.allocator.free(value);
+
+    var lines: std.ArrayList(u8) = .empty;
+    defer lines.deinit(context.allocator);
+    try appendTranscriptEntry(context.allocator, &lines, .{
+        .type = "tool_use",
+        .id = call_id,
+        .kind = @tagName(kind),
+        .title = title,
+        .input = input,
+    });
+    emitChildTranscript(context, child, lines.items);
+}
+
+fn appendChildToolResult(
+    context: *EventStreamContext,
+    child: *ChildSubagent,
+    properties: std.json.Value,
+    failed: bool,
+) !void {
+    const call_id = toolCallIdOf(properties) orelse return;
+
+    const output = try extractToolOutputAlloc(context.allocator, properties);
+    defer if (output) |value| context.allocator.free(value);
+    const error_text = extractToolErrorText(properties);
+    const body = if (failed) (error_text orelse output orelse "") else (output orelse "");
+
+    var lines: std.ArrayList(u8) = .empty;
+    defer lines.deinit(context.allocator);
+    try appendTranscriptEntry(context.allocator, &lines, .{
+        .type = "tool_result",
+        .id = call_id,
+        .is_error = failed,
+        .output = truncateChildTranscriptOutput(body),
+    });
+    emitChildTranscript(context, child, lines.items);
+}
+
+/// Child chunks ride the parent's call id with a null status, so the parent
+/// card keeps the status its own `session.tool.*` events set.
+fn emitChildTranscript(context: *EventStreamContext, child: *const ChildSubagent, lines: []const u8) void {
+    const on_stream_event = context.request.on_stream_event orelse return;
+    if (lines.len == 0) return;
+    on_stream_event(context.request.stream_context, .{ .tool_call = .{
+        .call_id = child.call_id,
+        .title = "",
+        .kind = .subagent,
+        .status = null,
+        .transcript = lines,
+    } });
+}
+
+/// OpenCode's subagent result content is a `<subagent sessionID=… />` marker
+/// rather than the answer, so the card's `Output:` is restored from the last
+/// block the child streamed.
+fn emitSubagentFinalOutput(
+    context: *EventStreamContext,
+    call_id: []const u8,
+    status: provider_types.ToolCallStatus,
+) void {
+    const on_stream_event = context.request.on_stream_event orelse return;
+    const child = childSubagentForCall(context, call_id) orelse return;
+    const final_text = child.final_text orelse return;
+    if (std.mem.trim(u8, final_text, &std.ascii.whitespace).len == 0) return;
+
+    on_stream_event(context.request.stream_context, .{ .tool_call = .{
+        .call_id = call_id,
+        .title = "",
+        .kind = .subagent,
+        .status = status,
+        .output = final_text,
+    } });
+}
+
+fn appendTranscriptEntry(allocator: std.mem.Allocator, lines: *std.ArrayList(u8), entry: anytype) !void {
+    const encoded = try stringifyAlloc(allocator, entry);
+    defer allocator.free(encoded);
+    try lines.appendSlice(allocator, encoded);
+    try lines.append(allocator, '\n');
+}
+
+/// Shell cards read better with the bare command; everything else keeps the
+/// pretty JSON the parent transcript already shows for tool inputs.
+fn childToolInputAlloc(
+    allocator: std.mem.Allocator,
+    kind: provider_types.ToolCallKind,
+    input_value: std.json.Value,
+) !?[]u8 {
+    if (input_value == .null) return null;
+    if (kind == .execute) {
+        if (getOptionalObjectString(input_value, "command")) |command| {
+            return try allocator.dupe(u8, command);
+        }
+    }
+    return try stringifyAlloc(allocator, input_value);
+}
+
+/// Trims on a UTF-8 boundary so a truncated result never carries a split
+/// sequence into the JSON line.
+fn truncateChildTranscriptOutput(text: []const u8) []const u8 {
+    if (text.len <= MAX_CHILD_TRANSCRIPT_OUTPUT_BYTES) return text;
+    var end: usize = MAX_CHILD_TRANSCRIPT_OUTPUT_BYTES;
+    while (end > 0 and (text[end] & 0xC0) == 0x80) end -= 1;
+    return text[0..end];
 }
 
 // Permissions -----------------------------------------------------------------
@@ -2483,7 +2768,7 @@ test "OpenCode tool called events preserve MCP input" {
         .prompt = "",
         .stream_context = &capture,
         .on_stream_event = OpenCodeTestToolCapture.handle,
-    }, parsed.value));
+    }, "verde:list_processes", parsed.value));
     try std.testing.expectEqual(@as(usize, 1), capture.count);
     try std.testing.expectEqualStrings("call-1", capture.call_id.?);
     try std.testing.expectEqualStrings("verde:list_processes", capture.title.?);
@@ -2504,7 +2789,7 @@ test "OpenCode tool called events classify task tools as subagents" {
         .prompt = "",
         .stream_context = &capture,
         .on_stream_event = OpenCodeTestToolCapture.handle,
-    }, parsed.value));
+    }, "task", parsed.value));
     try std.testing.expectEqual(provider_types.ToolCallKind.subagent, capture.kind.?);
     try std.testing.expectEqualStrings("Explore website package", capture.title.?);
 }
@@ -2559,6 +2844,150 @@ test "OpenCode tool success events join text content into output" {
     try std.testing.expectEqual(provider_types.ToolCallKind.execute, capture.kind.?);
     try std.testing.expectEqual(provider_types.ToolCallStatus.completed, capture.status.?);
     try std.testing.expectEqualStrings("clean\nfile:///tmp/x", capture.output_buffer[0..capture.output_len]);
+}
+
+const OpenCodeTestTranscriptCapture = struct {
+    transcript_buffer: [4096]u8 = undefined,
+    transcript_len: usize = 0,
+    output_buffer: [1024]u8 = undefined,
+    output_len: usize = 0,
+    transcript_updates: usize = 0,
+    events: usize = 0,
+
+    fn handle(context: ?*anyopaque, event: provider_types.StreamEvent) void {
+        const self: *OpenCodeTestTranscriptCapture = @ptrCast(@alignCast(context orelse return));
+        switch (event) {
+            .tool_call => |tool_call| {
+                self.events += 1;
+                if (tool_call.transcript) |chunk| {
+                    const take = @min(chunk.len, self.transcript_buffer.len - self.transcript_len);
+                    @memcpy(self.transcript_buffer[self.transcript_len..][0..take], chunk[0..take]);
+                    self.transcript_len += take;
+                    self.transcript_updates += 1;
+                }
+                if (tool_call.output) |value| {
+                    self.output_len = @min(value.len, self.output_buffer.len);
+                    @memcpy(self.output_buffer[0..self.output_len], value[0..self.output_len]);
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn transcript(self: *const OpenCodeTestTranscriptCapture) []const u8 {
+        return self.transcript_buffer[0..self.transcript_len];
+    }
+
+    fn output(self: *const OpenCodeTestTranscriptCapture) []const u8 {
+        return self.output_buffer[0..self.output_len];
+    }
+};
+
+fn openCodeTestEventContext(
+    session_id: []const u8,
+    capture: *OpenCodeTestTranscriptCapture,
+) !EventStreamContext {
+    return .{
+        .allocator = std.testing.allocator,
+        .base_url = "http://127.0.0.1:1",
+        .username = null,
+        .password = null,
+        .working_directory = null,
+        .session_id = try std.testing.allocator.dupe(u8, session_id),
+        .request = .{
+            .prompt = "",
+            .stream_context = capture,
+            .on_stream_event = OpenCodeTestTranscriptCapture.handle,
+        },
+    };
+}
+
+fn feedOpenCodeTestEvents(context: *EventStreamContext, frames: []const []const u8) !void {
+    for (frames) |frame| try processEventStreamMessage(context, "", frame);
+}
+
+test "OpenCode child subagent activity streams into the parent task transcript" {
+    var capture: OpenCodeTestTranscriptCapture = .{};
+    var context = try openCodeTestEventContext("ses_parent", &capture);
+    defer context.deinit();
+
+    try feedOpenCodeTestEvents(&context, &.{
+        \\{"type":"session.tool.input.started","data":{"sessionID":"ses_parent","assistantMessageID":"msg_1","id":"call-task","name":"subagent"}}
+        ,
+        \\{"type":"session.tool.called","data":{"sessionID":"ses_parent","assistantMessageID":"msg_1","id":"call-task","input":{"agent":"explore","description":"Explore website package","prompt":"Find the router"}}}
+        ,
+        \\{"type":"session.tool.progress","data":{"sessionID":"ses_parent","assistantMessageID":"msg_1","id":"call-task","metadata":{"sessionID":"ses_child","status":"running"}}}
+        ,
+        \\{"type":"session.tool.input.started","data":{"sessionID":"ses_child","assistantMessageID":"msg_2","id":"call-bash","name":"bash"}}
+        ,
+        \\{"type":"session.tool.called","data":{"sessionID":"ses_child","assistantMessageID":"msg_2","id":"call-bash","input":{"command":"ls packages"}}}
+        ,
+        \\{"type":"session.tool.success","data":{"sessionID":"ses_child","assistantMessageID":"msg_2","id":"call-bash","content":[{"type":"text","text":"web_app"}]}}
+        ,
+        \\{"type":"session.text.ended","data":{"sessionID":"ses_child","assistantMessageID":"msg_2","ordinal":0,"text":"The router lives in web_app."}}
+        ,
+        // A resent block must not duplicate a bubble in the durable transcript.
+        \\{"type":"session.text.ended","data":{"sessionID":"ses_child","assistantMessageID":"msg_2","ordinal":0,"text":"The router lives in web_app."}}
+        ,
+        \\{"type":"session.tool.success","data":{"sessionID":"ses_parent","assistantMessageID":"msg_1","id":"call-task","content":[{"type":"text","text":"<subagent sessionID=\"ses_child\" state=\"completed\">"}],"metadata":{"sessionID":"ses_child","status":"completed"}}}
+        ,
+    });
+
+    try std.testing.expectEqual(@as(usize, 3), capture.transcript_updates);
+    try std.testing.expectEqualStrings(
+        \\{"type":"tool_use","id":"call-bash","kind":"execute","title":"bash","input":"ls packages"}
+    ++ "\n" ++
+        \\{"type":"tool_result","id":"call-bash","is_error":false,"output":"web_app"}
+    ++ "\n" ++
+        \\{"type":"text","text":"The router lives in web_app."}
+    ++ "\n",
+        capture.transcript(),
+    );
+    // The `<subagent …>` result marker never carries the answer, so the card's
+    // Output is restored from the child's last block.
+    try std.testing.expectEqualStrings("The router lives in web_app.", capture.output());
+}
+
+test "OpenCode child tool failures become error transcript results" {
+    var capture: OpenCodeTestTranscriptCapture = .{};
+    var context = try openCodeTestEventContext("ses_parent", &capture);
+    defer context.deinit();
+
+    try feedOpenCodeTestEvents(&context, &.{
+        \\{"type":"session.tool.input.started","data":{"sessionID":"ses_parent","id":"call-task","name":"task"}}
+        ,
+        \\{"type":"session.tool.progress","data":{"sessionID":"ses_parent","id":"call-task","metadata":{"sessionID":"ses_child","status":"running"}}}
+        ,
+        \\{"type":"session.tool.input.started","data":{"sessionID":"ses_child","id":"call-read","name":"read"}}
+        ,
+        \\{"type":"session.tool.failed","data":{"sessionID":"ses_child","id":"call-read","error":{"message":"File not found"}}}
+        ,
+    });
+
+    try std.testing.expectEqualStrings(
+        \\{"type":"tool_result","id":"call-read","is_error":true,"output":"File not found"}
+    ++ "\n",
+        capture.transcript(),
+    );
+}
+
+test "OpenCode ignores sessions that are not linked to a running task call" {
+    var capture: OpenCodeTestTranscriptCapture = .{};
+    var context = try openCodeTestEventContext("ses_parent", &capture);
+    defer context.deinit();
+
+    try feedOpenCodeTestEvents(&context, &.{
+        \\{"type":"session.text.ended","data":{"sessionID":"ses_other","assistantMessageID":"msg_9","ordinal":0,"text":"unrelated"}}
+        ,
+        \\{"type":"session.tool.called","data":{"sessionID":"ses_other","id":"call-x","input":{}}}
+        ,
+        // A child session's idle must not end the parent turn either.
+        \\{"type":"session.idle","data":{"sessionID":"ses_other"}}
+        ,
+    });
+
+    try std.testing.expectEqual(@as(usize, 0), capture.events);
+    try std.testing.expect(!eventStreamReachedTerminal(&context));
 }
 
 test "eventTypeIs accepts live and schema event spellings" {

@@ -15099,7 +15099,7 @@ fn chatSinkEvent(context: ?*anyopaque, event: harness.StreamEvent) void {
                 s.objectField("status") catch return;
                 s.write(@tagName(status)) catch return;
             }
-            inline for (.{ "input", "output", "error_text", "locations", "raw" }) |field_name| {
+            inline for (.{ "input", "output", "error_text", "locations", "raw", "transcript", "transcript_delta" }) |field_name| {
                 const value = @field(tool_call, field_name);
                 if (value) |text| {
                     s.objectField(field_name) catch return;

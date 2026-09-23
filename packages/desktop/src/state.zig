@@ -6494,6 +6494,11 @@ pub const AppState = struct {
 
     pub const openSubagent = workspace_controller.openSubagent;
 
+    /// Poll-loop hook: refresh child panes from their parent's streamed rows.
+    pub fn syncSubagentViews(self: *AppState, project_index: usize, thread_index: usize) void {
+        workspace_controller.syncSubagentViews(self, project_index, thread_index);
+    }
+
     /// Main-tick hook for the parent-pane linked-chats drawer. Returns true
     /// when a list changed and the UI should render.
     pub fn pollLinkedChats(self: *AppState) bool {

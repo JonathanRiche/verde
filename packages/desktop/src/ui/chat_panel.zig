@@ -4903,7 +4903,7 @@ fn isCursorToolSystemEvent(author_raw: []const u8, body_raw: []const u8) bool {
     // Older provider builds persisted the provider-specific MCP method as the
     // author. Recognize the shared structured body so those rows still render
     // as bounded tool cards after an upgrade.
-    inline for (.{ "Tool:\n", "Input:\n", "Output:\n", "Error:\n", "Locations:\n" }) |prefix| {
+    inline for (.{ "Tool:\n", "Input:\n", "Output:\n", "Error:\n", "Locations:\n", "Transcript:\n" }) |prefix| {
         if (std.mem.startsWith(u8, body, prefix)) return true;
     }
 
@@ -5438,10 +5438,12 @@ fn transcriptCommandEventHeight(
     state: ?*app_state.AppState,
     message_index: ?usize,
     author: []const u8,
-    body_raw: []const u8,
+    body_raw_full: []const u8,
     column_width: f32,
     tool_call_status: ?provider_types.ToolCallStatus,
 ) f32 {
+    // A child agent's streamed transcript belongs to its own pane.
+    const body_raw = chat_types.toolBodyWithoutTranscript(body_raw_full);
     const pad_x = theme.scaledUi(14.0);
     const pad_y = theme.scaledUi(9.0);
     const font_size = theme.scaledUi(15.0);
@@ -7762,7 +7764,7 @@ fn renderCommandEventRow(
     y: f32,
     height: f32,
     original_author: []const u8,
-    body_raw: []const u8,
+    body_raw_full: []const u8,
     clip: palette.Rect,
     message_index: usize,
     running: bool,
@@ -7772,6 +7774,8 @@ fn renderCommandEventRow(
     live_task_index: ?usize,
 ) void {
     // Command transcript card, including controls for tracked background tasks.
+    // A child agent's streamed transcript belongs to its own pane.
+    const body_raw = chat_types.toolBodyWithoutTranscript(body_raw_full);
     const bubble = palette.Rect{ .x = column.x, .y = y, .w = column.w, .h = height };
     const rr = if (grouped) theme.scaledUi(8.0) else transcriptBubbleCornerRadius();
     const is_running = if (tool_call_status) |status|

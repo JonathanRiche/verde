@@ -4852,6 +4852,11 @@ pub fn pollSend(self: anytype) bool {
     for (self.chat_controller.active_send_refs.items) |ref| {
         const thread = &self.project_controller.projects.items[ref.project_index].threads.items[ref.thread_index];
         changed = self.pollThreadSend(ref.project_index, ref.thread_index, thread) or changed;
+        // Open child panes mirror the parent's subagent rows, so refresh them
+        // while the parent streams. Gated so slim poll-test states compile.
+        if (comptime @hasDecl(std.meta.Child(@TypeOf(self)), "syncSubagentViews")) {
+            self.syncSubagentViews(ref.project_index, ref.thread_index);
+        }
     }
     return changed;
 }
@@ -6571,6 +6576,8 @@ pub fn applyDaemonChatEventLocked(self: anytype, send_state: *SendState, kind: [
             .error_text = jsonValueString(object.get("error_text") orelse .null),
             .locations = jsonValueString(object.get("locations") orelse .null),
             .raw = jsonValueString(object.get("raw") orelse .null),
+            .transcript = jsonValueString(object.get("transcript") orelse .null),
+            .transcript_delta = jsonValueString(object.get("transcript_delta") orelse .null),
         };
         // Content-less reasoning drives the "Thinking" header indicator
         // instead of a timeline row; mirror the GUI-owned stream path.

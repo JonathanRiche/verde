@@ -8,6 +8,7 @@ const chat_threads = @import("../chat/threads.zig");
 const runtime_log = @import("../runtime/log.zig");
 const terminal = @import("../terminal/terminal.zig");
 const chat_types = @import("chat_types.zig");
+const utils = @import("../utils.zig");
 const provider_models = @import("provider_models.zig");
 const workspace_layout = @import("workspace_layout.zig");
 const platform_runtime = @import("platform_runtime");
@@ -15,6 +16,7 @@ const log = std.log.scoped(.native_shell);
 
 const ChatThread = chat_types.ChatThread;
 const ChatImageAttachment = chat_types.ChatImageAttachment;
+const PendingTimelineEvent = chat_types.PendingTimelineEvent;
 const Provider = provider_models.Provider;
 const ReasoningEffort = provider_models.ReasoningEffort;
 const FastMode = provider_models.FastMode;
@@ -1541,14 +1543,39 @@ const SubagentSource = struct {
     title: []u8,
     prompt: []u8,
     result: []u8,
+    /// Child activity as JSON lines (see `ToolCallUpdate.transcript`).
+    transcript: []u8,
+    /// Live partial text of the block the child is still writing; absent for
+    /// durable rows, which only carry completed blocks.
+    partial: []u8,
+    status: ?provider_types.ToolCallStatus,
 
     fn deinit(self: SubagentSource, allocator: std.mem.Allocator) void {
         allocator.free(self.identity);
         allocator.free(self.title);
         allocator.free(self.prompt);
         allocator.free(self.result);
+        allocator.free(self.transcript);
+        allocator.free(self.partial);
+    }
+
+    /// Identifies the parent state these rows came from.
+    fn signature(self: SubagentSource) u64 {
+        var hasher = std.hash.Wyhash.init(0x5B4A6E7);
+        hasher.update(self.prompt);
+        hasher.update("\x00");
+        hasher.update(self.transcript);
+        hasher.update("\x00");
+        hasher.update(self.partial);
+        hasher.update("\x00");
+        hasher.update(self.result);
+        hasher.update("\x00");
+        hasher.update(@tagName(self.status orelse .unknown));
+        return hasher.final();
     }
 };
+
+const SUBAGENT_VIEW_INTRO = "Read-only view of a child agent. This is not an independent Verde chat.";
 
 pub fn openSubagentFromParentMessage(
     self: anytype,
@@ -1589,14 +1616,255 @@ pub fn openSubagent(self: anytype, project_index: usize, request: OpenSubagentRe
         source.title,
     );
     project = &self.project_controller.projects.items[project_index];
-    try project.threads.items[child_index].replaceSubagentViewMessages(
-        self.allocator,
-        source.title,
-        source.prompt,
-        source.result,
-    );
+    try applySubagentSource(self.allocator, &project.threads.items[child_index], source);
 
     return try presentSubagentThread(self, project_index, child_index, request.target_pane_id, request.axis, request.focus);
+}
+
+/// Refreshes every open child pane of `parent_thread_index` from the parent's
+/// current subagent rows, so a running child's streamed activity and its
+/// eventual result appear without reopening the pane.
+pub fn syncSubagentViews(self: anytype, project_index: usize, parent_thread_index: usize) void {
+    if (project_index >= self.project_controller.projects.items.len) return;
+    const project = &self.project_controller.projects.items[project_index];
+    if (parent_thread_index >= project.threads.items.len) return;
+    const parent_local_id = project.threads.items[parent_thread_index].local_thread_id;
+    for (project.threads.items, 0..) |thread, child_index| {
+        const parent_id = chat_types.subagentParentLocalId(thread.local_thread_id) orelse continue;
+        if (!std.mem.eql(u8, parent_id, parent_local_id)) continue;
+        syncSubagentView(self, project, parent_thread_index, child_index) catch |err| {
+            log.warn("failed to refresh subagent pane: {s}", .{@errorName(err)});
+        };
+        // A child pane can host a nested agent card of its own, so its
+        // grandchild panes rebuild from the rows we just refreshed. Minted
+        // parent ids grow with each level, so this recursion cannot cycle.
+        syncSubagentViews(self, project_index, child_index);
+    }
+}
+
+fn syncSubagentView(self: anytype, project: *project_state.Project, parent_index: usize, child_index: usize) !void {
+    const parent = &project.threads.items[parent_index];
+    const child = &project.threads.items[child_index];
+    const source = (try findSubagentSourceForChild(self.allocator, parent, child.local_thread_id)) orelse return;
+    defer source.deinit(self.allocator);
+    if (child.subagent_view_signature == source.signature()) return;
+    try applySubagentSource(self.allocator, child, source);
+    self.markDirty();
+}
+
+fn applySubagentSource(allocator: std.mem.Allocator, child: *ChatThread, source: SubagentSource) !void {
+    var rows = try buildSubagentViewRows(allocator, source);
+    defer utils.freePendingTimelineEvents(allocator, &rows);
+    try child.replaceSubagentViewRows(allocator, source.title, rows.items, source.signature());
+}
+
+/// Locates the parent row that minted `child_local_id`. Returns null when the
+/// send worker holds the pending stream this frame; the next poll retries.
+fn findSubagentSourceForChild(allocator: std.mem.Allocator, parent: *ChatThread, child_local_id: []const u8) !?SubagentSource {
+    for (parent.messages.items, 0..) |message, index| {
+        if (!chat_types.looksLikeSubagentCard(message.author, message.tool_call_kind, message.body)) continue;
+        var identity_buf: [32]u8 = undefined;
+        const identity = subagentIdentity(&identity_buf, message.tool_call_id, message.body, index);
+        if (!try subagentIdentityMatches(allocator, parent.local_thread_id, identity, child_local_id)) continue;
+        return try buildSubagentSource(allocator, identity, message.body, message.tool_call_status, null);
+    }
+    if (!parent.send_state.mutex.tryLock()) return null;
+    defer parent.send_state.mutex.unlock();
+    for (parent.send_state.pending_events.items, 0..) |event, pending_index| {
+        if (!chat_types.looksLikeSubagentCard(event.author, event.tool_call_kind, event.body)) continue;
+        var identity_buf: [32]u8 = undefined;
+        const identity = subagentIdentity(&identity_buf, event.tool_call_id, event.body, parent.messages.items.len + pending_index);
+        if (!try subagentIdentityMatches(allocator, parent.local_thread_id, identity, child_local_id)) continue;
+        return try buildSubagentSource(allocator, identity, event.body, event.tool_call_status, event.tool_call_transcript_partial);
+    }
+    return null;
+}
+
+fn subagentIdentityMatches(allocator: std.mem.Allocator, parent_local_id: []const u8, identity: []const u8, child_local_id: []const u8) !bool {
+    const minted = try chat_types.mintSubagentLocalThreadId(allocator, parent_local_id, identity);
+    defer allocator.free(minted);
+    return std.mem.eql(u8, minted, child_local_id);
+}
+
+/// The task prompt is lifted verbatim from the call's input JSON, so it still
+/// carries `\n`/`\"` escapes; decode them for the "You" bubble. Text that is
+/// not a valid JSON string body is kept as is.
+fn unescapeJsonStringAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    if (std.mem.indexOfScalar(u8, raw, '\\') == null) return allocator.dupe(u8, raw);
+    const quoted = try std.mem.concat(allocator, u8, &.{ "\"", raw, "\"" });
+    defer allocator.free(quoted);
+    const parsed = std.json.parseFromSlice([]const u8, allocator, quoted, .{}) catch return allocator.dupe(u8, raw);
+    defer parsed.deinit();
+    return allocator.dupe(u8, parsed.value);
+}
+
+/// Child pane rows: intro, task prompt, the child's streamed activity
+/// (assistant text plus tool cards), then its result or a status note.
+fn buildSubagentViewRows(allocator: std.mem.Allocator, source: SubagentSource) !std.ArrayListUnmanaged(PendingTimelineEvent) {
+    var rows: std.ArrayListUnmanaged(PendingTimelineEvent) = .empty;
+    errdefer utils.freePendingTimelineEvents(allocator, &rows);
+    try appendSubagentTextRow(allocator, &rows, .system, "System", SUBAGENT_VIEW_INTRO);
+    try appendSubagentTextRow(allocator, &rows, .user, "You", source.prompt);
+    var lines = std.mem.splitScalar(u8, source.transcript, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \r\t");
+        if (line.len == 0) continue;
+        appendSubagentTranscriptEntry(allocator, &rows, line) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // A malformed line loses one entry, not the whole pane.
+            else => continue,
+        };
+    }
+    // The block the child is still writing has no transcript entry yet; show
+    // it as the trailing bubble it will become once the entry lands.
+    if (std.mem.trim(u8, source.partial, " \n\r\t").len > 0) {
+        try appendSubagentChildText(allocator, &rows, source.partial);
+    }
+    const result = std.mem.trim(u8, source.result, " \n\r\t");
+    if (result.len > 0) {
+        // Claude's hand-back repeats the child's last reply (indented, with a
+        // usage trailer); the streamed bubble already shows it.
+        if (!subagentResultRepeatsLastText(rows.items, result)) {
+            try appendSubagentTextRow(allocator, &rows, .assistant, "Child agent", result);
+        }
+    } else {
+        try appendSubagentTextRow(allocator, &rows, .system, "Child agent", subagentStatusFallback(source.status));
+    }
+    return rows;
+}
+
+fn subagentResultRepeatsLastText(rows: []const PendingTimelineEvent, result: []const u8) bool {
+    if (rows.len == 0) return false;
+    const last = rows[rows.len - 1];
+    if (last.role != .assistant or last.tool_call_id != null) return false;
+    var lines = std.mem.splitScalar(u8, last.body, '\n');
+    const first_line = std.mem.trim(u8, lines.first(), " \r\t");
+    if (first_line.len < 16) return std.mem.eql(u8, std.mem.trim(u8, last.body, " \n\r\t"), result);
+    return std.mem.indexOf(u8, result, first_line) != null;
+}
+
+fn appendSubagentTextRow(
+    allocator: std.mem.Allocator,
+    rows: *std.ArrayListUnmanaged(PendingTimelineEvent),
+    role: provider_models.ChatRole,
+    author: []const u8,
+    body: []const u8,
+) !void {
+    const owned_author = try allocator.dupe(u8, author);
+    errdefer allocator.free(owned_author);
+    const owned_body = try allocator.dupe(u8, body);
+    errdefer allocator.free(owned_body);
+    try rows.append(allocator, .{ .role = role, .author = owned_author, .body = owned_body });
+}
+
+fn appendSubagentTranscriptEntry(
+    allocator: std.mem.Allocator,
+    rows: *std.ArrayListUnmanaged(PendingTimelineEvent),
+    line: []const u8,
+) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidTranscriptEntry;
+    const object = parsed.value.object;
+    const entry_type = jsonObjectStringField(object, "type") orelse return error.InvalidTranscriptEntry;
+    // A nested agent's work belongs inside the card that launched it, not in
+    // this pane's timeline: file it as that card's own transcript so the card
+    // drills down exactly like the one this pane was opened from.
+    if (jsonObjectStringField(object, "parent")) |nested_call_id| {
+        if (nested_call_id.len > 0) {
+            const nested_line = try nestedTranscriptLineAlloc(allocator, object);
+            defer allocator.free(nested_line);
+            try utils.upsertPendingToolCallEvent(allocator, rows, .{
+                .call_id = nested_call_id,
+                .title = "",
+                // Only an agent's own Task call is ever tagged as a parent, so
+                // a level deeper than this pane knows still lands on a card
+                // that reads (and drills down) as the agent it came from.
+                .kind = .subagent,
+                .transcript = nested_line,
+            });
+            return;
+        }
+    }
+    if (std.mem.eql(u8, entry_type, "text")) {
+        const text = jsonObjectStringField(object, "text") orelse return;
+        try appendSubagentChildText(allocator, rows, text);
+        return;
+    }
+    if (std.mem.eql(u8, entry_type, "thinking")) {
+        const text = jsonObjectStringField(object, "text") orelse return;
+        if (std.mem.trim(u8, text, " \n\r\t").len == 0) return;
+        // No provider surfaces parent reasoning as a row today, so the child's
+        // gets the quiet tool-card treatment the panel gives "Thinking".
+        try appendSubagentTextRow(allocator, rows, .system, "Thinking", text);
+        return;
+    }
+    const call_id = jsonObjectStringField(object, "id") orelse return error.InvalidTranscriptEntry;
+    if (std.mem.eql(u8, entry_type, "tool_use")) {
+        const kind_text = jsonObjectStringField(object, "kind");
+        try utils.upsertPendingToolCallEvent(allocator, rows, .{
+            .call_id = call_id,
+            .title = jsonObjectStringField(object, "title") orelse "",
+            .kind = if (kind_text) |value| std.meta.stringToEnum(provider_types.ToolCallKind, value) else null,
+            .status = .in_progress,
+            .input = jsonObjectStringField(object, "input"),
+        });
+        return;
+    }
+    if (std.mem.eql(u8, entry_type, "tool_result")) {
+        const failed = if (object.get("is_error")) |value| value == .bool and value.bool else false;
+        const output = jsonObjectStringField(object, "output");
+        try utils.upsertPendingToolCallEvent(allocator, rows, .{
+            .call_id = call_id,
+            .title = "",
+            .status = if (failed) .failed else .completed,
+            .output = if (failed) null else output,
+            .error_text = if (failed) output else null,
+        });
+    }
+}
+
+/// Appends child assistant text, merging into the trailing bubble so
+/// consecutive chunks (and the partial that precedes them) read as one reply.
+fn appendSubagentChildText(
+    allocator: std.mem.Allocator,
+    rows: *std.ArrayListUnmanaged(PendingTimelineEvent),
+    text: []const u8,
+) !void {
+    if (std.mem.trim(u8, text, " \n\r\t").len == 0) return;
+    if (rows.items.len > 0) {
+        const last = &rows.items[rows.items.len - 1];
+        if (last.role == .assistant and last.tool_call_id == null) {
+            const joined = try std.mem.concat(allocator, u8, &.{ last.body, "\n\n", text });
+            allocator.free(last.body);
+            last.body = joined;
+            return;
+        }
+    }
+    try appendSubagentTextRow(allocator, rows, .assistant, "Child agent", text);
+}
+
+/// Re-serializes a nested entry without its `parent` tag, so the nested card's
+/// `Transcript:` section reads exactly like a direct child's.
+fn nestedTranscriptLineAlloc(allocator: std.mem.Allocator, object: std.json.ObjectMap) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try stringify.beginObject();
+    var it = object.iterator();
+    while (it.next()) |field| {
+        if (std.mem.eql(u8, field.key_ptr.*, "parent")) continue;
+        try stringify.objectField(field.key_ptr.*);
+        try stringify.write(field.value_ptr.*);
+    }
+    try stringify.endObject();
+    try writer.writer.writeByte('\n');
+    return try writer.toOwnedSlice();
+}
+
+fn jsonObjectStringField(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = object.get(key) orelse return null;
+    return if (value == .string) value.string else null;
 }
 
 fn presentSubagentThread(
@@ -1705,27 +1973,23 @@ fn captureSubagentSource(
 fn subagentSourceFromMessage(allocator: std.mem.Allocator, message: chat_types.ChatMessage, message_index: usize) !SubagentSource {
     if (!chat_types.looksLikeSubagentCard(message.author, message.tool_call_kind, message.body)) return error.NotASubagent;
     var identity_buf: [32]u8 = undefined;
-    const parsed = chat_types.parseSubagentConversation(message.body);
-    const identity = if (message.tool_call_id) |call_id|
-        call_id
-    else if (parsed.session_id) |session_id|
-        session_id
-    else
-        std.fmt.bufPrint(&identity_buf, "m{d}", .{message_index}) catch "m";
-    return try buildSubagentSource(allocator, identity, message.body, message.tool_call_status);
+    const identity = subagentIdentity(&identity_buf, message.tool_call_id, message.body, message_index);
+    return try buildSubagentSource(allocator, identity, message.body, message.tool_call_status, null);
 }
 
 fn subagentSourceFromPending(allocator: std.mem.Allocator, event: chat_types.PendingTimelineEvent, message_index: usize) !SubagentSource {
     if (!chat_types.looksLikeSubagentCard(event.author, event.tool_call_kind, event.body)) return error.NotASubagent;
     var identity_buf: [32]u8 = undefined;
-    const parsed = chat_types.parseSubagentConversation(event.body);
-    const identity = if (event.tool_call_id) |call_id|
-        call_id
-    else if (parsed.session_id) |session_id|
-        session_id
-    else
-        std.fmt.bufPrint(&identity_buf, "m{d}", .{message_index}) catch "m";
-    return try buildSubagentSource(allocator, identity, event.body, event.tool_call_status);
+    const identity = subagentIdentity(&identity_buf, event.tool_call_id, event.body, message_index);
+    return try buildSubagentSource(allocator, identity, event.body, event.tool_call_status, event.tool_call_transcript_partial);
+}
+
+/// Stable child identity: the provider call id, else an OpenCode child
+/// session id, else the row position.
+fn subagentIdentity(buf: *[32]u8, tool_call_id: ?[]const u8, body: []const u8, message_index: usize) []const u8 {
+    if (tool_call_id) |call_id| return call_id;
+    if (chat_types.parseSubagentConversation(body).session_id) |session_id| return session_id;
+    return std.fmt.bufPrint(buf, "m{d}", .{message_index}) catch "m";
 }
 
 fn buildSubagentSource(
@@ -1733,15 +1997,29 @@ fn buildSubagentSource(
     identity: []const u8,
     body: []const u8,
     status: ?provider_types.ToolCallStatus,
+    partial: ?[]const u8,
 ) !SubagentSource {
     const parsed = chat_types.parseSubagentConversation(body);
-    const result_src = if (parsed.result.len > 0) parsed.result else subagentStatusFallback(status);
-
+    const owned_identity = try allocator.dupe(u8, identity);
+    errdefer allocator.free(owned_identity);
+    const owned_title = try allocator.dupe(u8, parsed.title);
+    errdefer allocator.free(owned_title);
+    const owned_prompt = try unescapeJsonStringAlloc(allocator, parsed.prompt);
+    errdefer allocator.free(owned_prompt);
+    const owned_result = try allocator.dupe(u8, parsed.result);
+    errdefer allocator.free(owned_result);
+    const owned_transcript = try allocator.dupe(u8, parsed.transcript orelse "");
+    errdefer allocator.free(owned_transcript);
+    const owned_partial = try allocator.dupe(u8, partial orelse "");
+    errdefer allocator.free(owned_partial);
     return .{
-        .identity = try allocator.dupe(u8, identity),
-        .title = try allocator.dupe(u8, parsed.title),
-        .prompt = try allocator.dupe(u8, parsed.prompt),
-        .result = try allocator.dupe(u8, result_src),
+        .identity = owned_identity,
+        .title = owned_title,
+        .prompt = owned_prompt,
+        .result = owned_result,
+        .transcript = owned_transcript,
+        .partial = owned_partial,
+        .status = status,
     };
 }
 
@@ -2766,4 +3044,174 @@ test "TUI restoration associates provider sessions by dock instead of title" {
     try std.testing.expectEqualStrings("provider-first", threadForTuiDock(&project, 7).?.provider_thread_id.?);
     try std.testing.expectEqualStrings("provider-second", threadForTuiDock(&project, 11).?.provider_thread_id.?);
     try std.testing.expect(threadForTuiDock(&project, 99) == null);
+}
+
+test "subagent view rows render streamed child activity as text and tool cards" {
+    const allocator = std.testing.allocator;
+    const source: SubagentSource = .{
+        .identity = try allocator.dupe(u8, "agent-1"),
+        .title = try allocator.dupe(u8, "Explore repo"),
+        .prompt = try allocator.dupe(u8, "Look around"),
+        .result = try allocator.dupe(u8, ""),
+        .transcript = try allocator.dupe(u8,
+            \\{"type":"text","text":"Looking around."}
+            \\{"type":"tool_use","id":"c1","kind":"execute","title":"","input":"ls"}
+            \\{"type":"tool_result","id":"c1","is_error":false,"output":"README.md"}
+            \\{"type":"text","text":"Found one file."}
+            \\{"type":"text","text":"Reading it next."}
+            \\not json
+            \\{"type":"tool_use","id":"c2","kind":"read","title":"Read README.md","input":"{\"file_path\":\"README.md\"}"}
+        ),
+        .partial = try allocator.dupe(u8, ""),
+        .status = .in_progress,
+    };
+    defer source.deinit(allocator);
+
+    var rows = try buildSubagentViewRows(allocator, source);
+    defer utils.freePendingTimelineEvents(allocator, &rows);
+    try std.testing.expectEqual(@as(usize, 7), rows.items.len);
+    try std.testing.expectEqual(provider_models.ChatRole.user, rows.items[1].role);
+    try std.testing.expectEqualStrings("Look around", rows.items[1].body);
+    try std.testing.expectEqualStrings("Looking around.", rows.items[2].body);
+    try std.testing.expectEqualStrings("Ran command", rows.items[3].author);
+    try std.testing.expectEqual(provider_types.ToolCallStatus.completed, rows.items[3].tool_call_status.?);
+    try std.testing.expectEqualStrings("Input:\nls\n\nOutput:\nREADME.md", rows.items[3].body);
+    try std.testing.expectEqualStrings("Found one file.\n\nReading it next.", rows.items[4].body);
+    try std.testing.expectEqual(provider_types.ToolCallKind.read, rows.items[5].tool_call_kind.?);
+    try std.testing.expectEqual(provider_types.ToolCallStatus.in_progress, rows.items[5].tool_call_status.?);
+    try std.testing.expectEqualStrings("This subagent is still running.", rows.items[6].body);
+
+    var thread = try ChatThread.init(allocator, "child");
+    defer thread.deinit(allocator);
+    try thread.replaceSubagentViewRows(allocator, source.title, rows.items, source.signature());
+    try std.testing.expectEqual(@as(usize, 7), thread.messages.items.len);
+    try std.testing.expectEqualStrings("c1", thread.messages.items[3].tool_call_id.?);
+    try std.testing.expectEqualStrings("Explore repo", thread.title);
+    try std.testing.expectEqual(source.signature(), thread.subagent_view_signature);
+}
+
+test "subagent view renders child thinking and the still-streaming block" {
+    const allocator = std.testing.allocator;
+    const source: SubagentSource = .{
+        .identity = try allocator.dupe(u8, "agent-4"),
+        .title = try allocator.dupe(u8, "Explore repo"),
+        .prompt = try allocator.dupe(u8, "Look around"),
+        .result = try allocator.dupe(u8, ""),
+        .transcript = try allocator.dupe(u8,
+            \\{"type":"thinking","text":"Weighing where to start."}
+            \\{"type":"text","text":"Looking around."}
+            \\{"type":"surprise","text":"ignored"}
+        ),
+        .partial = try allocator.dupe(u8, "Reading the README"),
+        .status = .in_progress,
+    };
+    defer source.deinit(allocator);
+
+    var rows = try buildSubagentViewRows(allocator, source);
+    defer utils.freePendingTimelineEvents(allocator, &rows);
+    // intro, prompt, thinking, child text merged with the partial, status note
+    try std.testing.expectEqual(@as(usize, 5), rows.items.len);
+    try std.testing.expectEqual(provider_models.ChatRole.system, rows.items[2].role);
+    try std.testing.expectEqualStrings("Thinking", rows.items[2].author);
+    try std.testing.expectEqualStrings("Weighing where to start.", rows.items[2].body);
+    try std.testing.expectEqualStrings("Child agent", rows.items[3].author);
+    try std.testing.expectEqualStrings("Looking around.\n\nReading the README", rows.items[3].body);
+    try std.testing.expectEqualStrings("This subagent is still running.", rows.items[4].body);
+
+    // The partial is part of the pane identity, so the next delta re-syncs it.
+    const grown: SubagentSource = .{
+        .identity = source.identity,
+        .title = source.title,
+        .prompt = source.prompt,
+        .result = source.result,
+        .transcript = source.transcript,
+        .partial = try allocator.dupe(u8, "Reading the README now"),
+        .status = source.status,
+    };
+    defer allocator.free(grown.partial);
+    try std.testing.expect(source.signature() != grown.signature());
+}
+
+test "subagent view skips a result that repeats the child's final reply" {
+    const allocator = std.testing.allocator;
+    const source: SubagentSource = .{
+        .identity = try allocator.dupe(u8, "agent-2"),
+        .title = try allocator.dupe(u8, "Summarize"),
+        .prompt = try allocator.dupe(u8, "Summarize the repo"),
+        .result = try allocator.dupe(u8, "[Subagent hand-back] The report follows:\n  Verde is a Zig-based desktop application.\n  \n  It hosts agents.\nagentId: abc\n<usage>tool_uses: 2</usage>"),
+        .transcript = try allocator.dupe(u8,
+            \\{"type":"text","text":"Verde is a Zig-based desktop application.\n\nIt hosts agents."}
+        ),
+        .partial = try allocator.dupe(u8, ""),
+        .status = .completed,
+    };
+    defer source.deinit(allocator);
+    var rows = try buildSubagentViewRows(allocator, source);
+    defer utils.freePendingTimelineEvents(allocator, &rows);
+    try std.testing.expectEqual(@as(usize, 3), rows.items.len);
+    try std.testing.expectEqualStrings("Verde is a Zig-based desktop application.\n\nIt hosts agents.", rows.items[2].body);
+}
+
+test "subagent prompts decode JSON string escapes for the You bubble" {
+    const allocator = std.testing.allocator;
+    const body = "Tool:\nExplore\n\nInput:\n{\"description\":\"Explore\",\"prompt\":\"Line one.\\n\\nSay \\\"hi\\\" then stop.\"}";
+    const source = try buildSubagentSource(allocator, "agent-3", body, .in_progress, null);
+    defer source.deinit(allocator);
+    try std.testing.expectEqualStrings("Line one.\n\nSay \"hi\" then stop.", source.prompt);
+    const plain = try unescapeJsonStringAlloc(allocator, "no escapes here");
+    defer allocator.free(plain);
+    try std.testing.expectEqualStrings("no escapes here", plain);
+    const broken = try unescapeJsonStringAlloc(allocator, "trailing backslash \\");
+    defer allocator.free(broken);
+    try std.testing.expectEqualStrings("trailing backslash \\", broken);
+}
+
+test "nested agent entries fill the nested card instead of the child pane timeline" {
+    const allocator = std.testing.allocator;
+    const source: SubagentSource = .{
+        .identity = try allocator.dupe(u8, "agent-5"),
+        .title = try allocator.dupe(u8, "Explore repo"),
+        .prompt = try allocator.dupe(u8, "Explore"),
+        .result = try allocator.dupe(u8, ""),
+        .transcript = try allocator.dupe(u8,
+            \\{"type":"text","text":"Delegating."}
+            \\{"type":"tool_use","id":"nested","kind":"subagent","title":"Read README","input":"{\"description\":\"Read README\",\"prompt\":\"Read README.md\"}"}
+            \\{"type":"thinking","text":"Open the file.","parent":"nested"}
+            \\{"type":"tool_use","id":"g1","kind":"read","title":"Read README.md","input":"{\"file_path\":\"README.md\"}","parent":"nested"}
+            \\{"type":"tool_result","id":"g1","is_error":false,"output":"hi","parent":"nested"}
+            \\{"type":"text","text":"README says hi.","parent":"nested"}
+            \\{"type":"tool_result","id":"nested","is_error":false,"output":"nested report"}
+        ),
+        .partial = try allocator.dupe(u8, ""),
+        .status = .in_progress,
+    };
+    defer source.deinit(allocator);
+
+    var rows = try buildSubagentViewRows(allocator, source);
+    defer utils.freePendingTimelineEvents(allocator, &rows);
+    // intro, prompt, the child's own text, the nested card, status note
+    try std.testing.expectEqual(@as(usize, 5), rows.items.len);
+    try std.testing.expectEqualStrings("Delegating.", rows.items[2].body);
+    const nested = rows.items[3];
+    try std.testing.expectEqualStrings("nested", nested.tool_call_id.?);
+    try std.testing.expectEqual(provider_types.ToolCallKind.subagent, nested.tool_call_kind.?);
+    try std.testing.expectEqual(provider_types.ToolCallStatus.completed, nested.tool_call_status.?);
+    try std.testing.expect(chat_types.looksLikeSubagentCard(nested.author, nested.tool_call_kind, nested.body));
+    // The nested card carries the grandchild's activity, stripped of the tag.
+    try std.testing.expect(std.mem.indexOf(u8, nested.body, "\"parent\"") == null);
+    try std.testing.expectEqualStrings("nested report", chat_types.parseSubagentConversation(nested.body).result);
+
+    // Clicking that card opens a grandchild pane built from the same row.
+    const nested_source = try buildSubagentSource(allocator, "nested", nested.body, nested.tool_call_status, null);
+    defer nested_source.deinit(allocator);
+    try std.testing.expectEqualStrings("Read README", nested_source.title);
+    try std.testing.expectEqualStrings("Read README.md", nested_source.prompt);
+    var nested_rows = try buildSubagentViewRows(allocator, nested_source);
+    defer utils.freePendingTimelineEvents(allocator, &nested_rows);
+    try std.testing.expectEqual(@as(usize, 6), nested_rows.items.len);
+    try std.testing.expectEqualStrings("Open the file.", nested_rows.items[2].body);
+    try std.testing.expectEqualStrings("g1", nested_rows.items[3].tool_call_id.?);
+    try std.testing.expectEqual(provider_types.ToolCallStatus.completed, nested_rows.items[3].tool_call_status.?);
+    try std.testing.expectEqualStrings("README says hi.", nested_rows.items[4].body);
+    try std.testing.expectEqualStrings("nested report", nested_rows.items[5].body);
 }

@@ -239,6 +239,19 @@ pub const ToolCallUpdate = struct {
     error_text: ?[]const u8 = null,
     locations: ?[]const u8 = null,
     raw: ?[]const u8 = null,
+    /// Child-agent conversation chunk for `subagent` calls, as JSON lines
+    /// (`{"type":"text"|"tool_use"|"tool_result",...}`). Unlike `output`,
+    /// consumers append chunks per `call_id` instead of replacing, so a
+    /// running child streams into its pane without resending history.
+    /// An entry may carry `"parent":"<tool_use id>"`, naming a nested agent
+    /// the child itself launched: such entries belong inside that nested
+    /// call's card rather than the child's own timeline. Nested agents have
+    /// no top-level `call_id` of their own, so every level streams here.
+    transcript: ?[]const u8 = null,
+    /// Ephemeral partial child text for the block the agent is still writing.
+    /// Consumers accumulate it for live display only and drop it once the
+    /// block arrives as a `text` entry in `transcript`; it is never persisted.
+    transcript_delta: ?[]const u8 = null,
 };
 
 pub const StreamEvent = union(enum) {

@@ -44,6 +44,7 @@ const Row = struct {
     tool_error: ?[]u8 = null,
     tool_locations: ?[]u8 = null,
     tool_raw: ?[]u8 = null,
+    tool_transcript: ?[]u8 = null,
 };
 
 const DiffFile = struct {
@@ -187,7 +188,11 @@ const ToolUpdate = struct {
     error_text: ?[]const u8 = null,
     locations: ?[]const u8 = null,
     raw: ?[]const u8 = null,
+    transcript: ?[]const u8 = null,
 
+    /// `transcript_delta` is deliberately absent: partial child text is live
+    /// display only, and the block it belongs to arrives again as a complete
+    /// `transcript` entry, so persisting it would duplicate the text.
     fn fromJson(object: std.json.ObjectMap) ToolUpdate {
         return .{
             .call_id = jsonString(object, "call_id") orelse "",
@@ -199,6 +204,7 @@ const ToolUpdate = struct {
             .error_text = jsonString(object, "error_text"),
             .locations = jsonString(object, "locations"),
             .raw = jsonString(object, "raw"),
+            .transcript = jsonString(object, "transcript"),
         };
     }
 
@@ -402,6 +408,7 @@ fn upsertTool(
     row.tool_error = try dupeOptional(allocator, update.error_text);
     row.tool_locations = try dupeOptional(allocator, update.locations);
     row.tool_raw = try dupeOptional(allocator, update.raw);
+    row.tool_transcript = try dupeOptional(allocator, update.transcript);
 }
 
 fn mergeTool(allocator: std.mem.Allocator, row: *Row, update: ToolUpdate) !void {
@@ -411,6 +418,8 @@ fn mergeTool(allocator: std.mem.Allocator, row: *Row, update: ToolUpdate) !void 
     if (update.error_text) |value| try replaceOptional(allocator, &row.tool_error, value);
     if (update.locations) |value| try replaceOptional(allocator, &row.tool_locations, value);
     if (update.raw) |value| try replaceOptional(allocator, &row.tool_raw, value);
+    // Child transcripts stream as chunks; keep everything received so far.
+    if (update.transcript) |value| try appendOptional(allocator, &row.tool_transcript, value);
     if (update.kind) |value| try replaceMessageOptional(allocator, &row.message.tool_call_kind, value);
     if (update.status) |value| try replaceMessageOptional(allocator, &row.message.tool_call_status, value);
 
@@ -428,6 +437,7 @@ fn mergeTool(allocator: std.mem.Allocator, row: *Row, update: ToolUpdate) !void 
         .error_text = row.tool_error,
         .locations = row.tool_locations,
         .raw = row.tool_raw,
+        .transcript = row.tool_transcript,
     }, title, author);
     defer allocator.free(body);
     allocator.free(row.message.author);
@@ -440,6 +450,16 @@ fn replaceOptional(allocator: std.mem.Allocator, target: *?[]u8, value: []const 
     const owned = try allocator.dupe(u8, value);
     if (target.*) |old| allocator.free(old);
     target.* = owned;
+}
+
+fn appendOptional(allocator: std.mem.Allocator, target: *?[]u8, value: []const u8) !void {
+    const existing = target.* orelse {
+        target.* = try allocator.dupe(u8, value);
+        return;
+    };
+    const joined = try std.mem.concat(allocator, u8, &.{ existing, value });
+    allocator.free(existing);
+    target.* = joined;
 }
 
 fn replaceMessageOptional(allocator: std.mem.Allocator, target: *?[]const u8, value: []const u8) !void {
@@ -492,6 +512,8 @@ fn toolBodyAlloc(
         .{ .label = "Output", .value = update.output },
         .{ .label = "Error", .value = update.error_text },
         .{ .label = "Locations", .value = update.locations },
+        // Last, so parent cards can trim it without disturbing other fields.
+        .{ .label = "Transcript", .value = update.transcript },
     };
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
@@ -659,12 +681,14 @@ fn freeToolMetadata(allocator: std.mem.Allocator, row: *Row) void {
     if (row.tool_error) |value| allocator.free(value);
     if (row.tool_locations) |value| allocator.free(value);
     if (row.tool_raw) |value| allocator.free(value);
+    if (row.tool_transcript) |value| allocator.free(value);
     row.tool_title = null;
     row.tool_input = null;
     row.tool_output = null;
     row.tool_error = null;
     row.tool_locations = null;
     row.tool_raw = null;
+    row.tool_transcript = null;
 }
 
 fn freeMessage(allocator: std.mem.Allocator, message: *store_protocol.Message) void {
@@ -722,6 +746,42 @@ test "delta flushes at message, tool, and diff boundaries" {
     try std.testing.expect(std.mem.startsWith(u8, messages[5].body, "VERDE_DIFF_V2\n"));
     try std.testing.expect(std.mem.indexOf(u8, messages[5].body, "b.zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, messages[5].body, "a.zig") == null);
+}
+
+test "subagent transcript chunks append across tool_call events" {
+    const allocator = std.testing.allocator;
+    const events = [_]ChatEvent{
+        .{ .kind = "tool_call", .payload_json = "{\"call_id\":\"a1\",\"title\":\"Explore\",\"kind\":\"subagent\",\"status\":\"in_progress\",\"input\":\"{\\\"prompt\\\":\\\"look\\\"}\"}" },
+        .{ .kind = "tool_call", .payload_json = "{\"call_id\":\"a1\",\"title\":\"\",\"kind\":\"subagent\",\"transcript\":\"{\\\"type\\\":\\\"text\\\",\\\"text\\\":\\\"hi\\\"}\\n\"}" },
+        .{ .kind = "tool_call", .payload_json = "{\"call_id\":\"a1\",\"title\":\"\",\"kind\":\"subagent\",\"transcript\":\"{\\\"type\\\":\\\"tool_use\\\",\\\"id\\\":\\\"c1\\\"}\\n\"}" },
+        .{ .kind = "tool_call", .payload_json = "{\"call_id\":\"a1\",\"title\":\"Explore\",\"kind\":\"subagent\",\"status\":\"completed\",\"output\":\"done\"}" },
+    };
+    const messages = try apply(allocator, &events, .{ .status = .completed, .provider = "claude" });
+    defer freeMessages(allocator, messages);
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expectEqualStrings("Subagent", messages[0].author);
+    try std.testing.expectEqualStrings("completed", messages[0].tool_call_status.?);
+    try std.testing.expectEqualStrings(
+        "Tool:\nExplore\n\nInput:\n{\"prompt\":\"look\"}\n\nOutput:\ndone\n\nTranscript:\n{\"type\":\"text\",\"text\":\"hi\"}\n{\"type\":\"tool_use\",\"id\":\"c1\"}",
+        messages[0].body,
+    );
+}
+
+test "subagent transcript deltas stay out of the durable body" {
+    const allocator = std.testing.allocator;
+    const events = [_]ChatEvent{
+        .{ .kind = "tool_call", .payload_json = "{\"call_id\":\"a1\",\"title\":\"Explore\",\"kind\":\"subagent\",\"status\":\"in_progress\"}" },
+        .{ .kind = "tool_call", .payload_json = "{\"call_id\":\"a1\",\"title\":\"\",\"kind\":\"subagent\",\"transcript_delta\":\"par\"}" },
+        .{ .kind = "tool_call", .payload_json = "{\"call_id\":\"a1\",\"title\":\"\",\"kind\":\"subagent\",\"transcript_delta\":\"tial\"}" },
+        .{ .kind = "tool_call", .payload_json = "{\"call_id\":\"a1\",\"title\":\"\",\"kind\":\"subagent\",\"transcript\":\"{\\\"type\\\":\\\"text\\\",\\\"text\\\":\\\"partial done\\\"}\\n\"}" },
+    };
+    const messages = try apply(allocator, &events, .{ .status = .completed, .provider = "claude" });
+    defer freeMessages(allocator, messages);
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expectEqualStrings(
+        "Tool:\nExplore\n\nTranscript:\n{\"type\":\"text\",\"text\":\"partial done\"}",
+        messages[0].body,
+    );
 }
 
 test "tool calls upsert and merge while retaining one row" {
