@@ -1,0 +1,54 @@
+# Verde Dark: default dark theme (brand: refined emerald).
+#
+# Top-level keys are the Omarchy colors.toml format, so this folder can be
+# copied to ~/.config/omarchy/themes/verde-dark/ as-is.
+# [verde] holds Verde's 15 desktop UI colour roles (ThemeColors in
+# packages/desktop/src/ui/theme.zig) so nothing has to be derived.
+mode = "dark"
+
+accent = "#4FD18B"
+selection = "#245A40"
+muted = "#4A5753"
+
+background = "#0B0F0E"
+dark_background = "#080B0A"
+darker_background = "#050706"
+lighter_background = "#17201D"
+
+foreground = "#E8EEEB"
+dark_foreground = "#7F8C87"
+light_foreground = "#C2CCC8"
+bright_foreground = "#F6FAF8"
+
+red = "#F07A70"
+yellow = "#E8C15A"
+orange = "#F0A060"
+green = "#4FD18B"
+cyan = "#5CC8DE"
+blue = "#6AAEF5"
+magenta = "#D98AD0"
+brown = "#7A5A3A"
+
+bright_red = "#FF9C92"
+bright_yellow = "#F5D67E"
+bright_green = "#7BE0A8"
+bright_cyan = "#8ADCEB"
+bright_blue = "#94C6FA"
+bright_magenta = "#E8AEE0"
+
+[verde]
+background = "#0B0F0E"
+panel = "#121917"
+panel_alt = "#17201D"
+panel_muted = "#222C29"
+text = "#E8EEEB"
+text_muted = "#C2CCC8"
+text_subtle = "#97A39E"
+accent = "#4FD18B"
+accent_dim = "#4FD18B29"
+border = "#2B5A40"
+border_muted = "#2A3431"
+warning = "#F0B450"
+diff_add = "#5ED49A"
+diff_remove = "#F07A70"
+selection = "#245A40"

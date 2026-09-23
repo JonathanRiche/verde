@@ -1,0 +1,54 @@
+# Verde Legacy: the original Verde default, kept for comparison and for
+# anyone who prefers it. [verde] matches the defaults in
+# packages/desktop/src/ui/theme.zig (ThemeColors) exactly.
+#
+# Top-level keys are the Omarchy colors.toml format, so this folder can be
+# copied to ~/.config/omarchy/themes/verde-legacy/ as-is.
+mode = "dark"
+
+accent = "#50C878"
+selection = "#2B4A3A"
+muted = "#3C474C"
+
+background = "#0D1213"
+dark_background = "#0A0E0F"
+darker_background = "#070A0B"
+lighter_background = "#20272A"
+
+foreground = "#F0F0F5"
+dark_foreground = "#787A87"
+light_foreground = "#B9BBC3"
+bright_foreground = "#FFFFFF"
+
+red = "#FF6464"
+yellow = "#FBBF24"
+orange = "#F5A25D"
+green = "#34E094"
+cyan = "#63C9DF"
+blue = "#58A6FF"
+magenta = "#BBA3DF"
+brown = "#807557"
+
+bright_red = "#FF8A8A"
+bright_yellow = "#FCD34D"
+bright_green = "#59D99A"
+bright_cyan = "#8ADCEB"
+bright_blue = "#7ABCFF"
+bright_magenta = "#D2C0EE"
+
+[verde]
+background = "#0D1213"
+panel = "#20272A"
+panel_alt = "#28292E"
+panel_muted = "#38393E"
+text = "#F0F0F5"
+text_muted = "#B9BBC3"
+text_subtle = "#787A87"
+accent = "#50C878"
+accent_dim = "#7CDD5E30"
+border = "#375846"
+border_muted = "#3C474C"
+warning = "#FBBF24"
+diff_add = "#34E094"
+diff_remove = "#FF6464"
+selection = "#58A6FF"
