@@ -49,7 +49,7 @@ export interface OmarchyTheme {
    'mist-deep' has no upstream colors.toml — it is a Verde-native light theme,
    so its four values are the source of truth rather than a copy. */
 const OMARCHY_THEMES: OmarchyTheme[] = [
-  { slug: 'verde', name: 'Verde default', bg: '#101820', accent: '#50c878', fg: '#eaf0f2', warm: '#e8a44a', fallbackShot: appScreenshot },
+  { slug: 'verde', name: 'Verde Legacy', bg: '#101820', accent: '#50c878', fg: '#eaf0f2', warm: '#e8a44a', fallbackShot: appScreenshot },
   { slug: 'tokyo-night', name: 'Tokyo Night', bg: '#1a1b26', accent: '#7aa2f7', fg: '#a9b1d6', warm: '#e0af68' },
   { slug: 'catppuccin', name: 'Catppuccin', bg: '#1e1e2e', accent: '#89b4fa', fg: '#cdd6f4', warm: '#f9e2af' },
   { slug: 'everforest', name: 'Everforest', bg: '#2d353b', accent: '#7fbbb3', fg: '#d3c6aa', warm: '#dbbc7f' },

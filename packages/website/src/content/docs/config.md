@@ -44,7 +44,7 @@ A complete example:
 {
   "$schema": "https://verdeai.dev/config.schema.json",
   "theme": {
-    "theme": "default",
+    "theme": "verde-dark",
     "colors": {
       "background": "#101820",
       "panel": "#151b24",
@@ -322,8 +322,13 @@ it is launched through the configured process entry.
 
 ## Themes
 
-Verde ships a warm-green native theme out of the box. Choose Verde, Omarchy, or
-an installed theme from **Settings → Appearance → Theme**. The website's theme
+Verde ships three built-in palettes: **Verde Dark**, **Verde Light** and
+**Verde Legacy** (the original Verde colors). Pick one, **Auto**, **Omarchy**, or
+an installed theme from **Settings → Appearance → Theme**. Auto follows the
+operating system's light/dark appearance and switches live when it changes; it
+is the default on macOS, Windows and Linux without Omarchy. When an Omarchy
+install is detected, the default is Omarchy and that entry appears in the
+dropdown. The website's theme
 gallery provides portable packages that import and activate in one command:
 
 ```bash
@@ -353,12 +358,15 @@ To override individual theme tokens manually, edit `verde.json` under
 }
 ```
 
-Omit `theme.theme` to keep Omarchy auto-detection (see below), or set it to
-`"default"` to start from Verde's built-in colors.
+`theme.theme` selects the base palette: `"auto"`, `"verde-dark"`,
+`"verde-light"`, `"verde-legacy"`, or `"omarchy"`. Omit it to get the platform
+default (Omarchy when installed, otherwise Auto). The older `"default"` and
+`"verde"` values still work and mean Verde Legacy. `"omarchy"` falls back to
+Auto on systems without Omarchy.
 
 ## Omarchy color auto-detection
 
-On Omarchy systems, UI colors are loaded from an Omarchy-compatible
+With the Omarchy source, UI colors are loaded from an Omarchy-compatible
 `colors.toml`. Verde honors the first found of:
 
 1. `VERDE_OMARCHY_COLORS=/path/to/colors.toml`
@@ -367,9 +375,16 @@ On Omarchy systems, UI colors are loaded from an Omarchy-compatible
 4. Named Omarchy themes such as `$XDG_CONFIG_HOME/omarchy/themes/verde/colors.toml`
    or `~/.config/omarchy/themes/verde/colors.toml`
 
-Missing values fall back to Verde defaults. See
-[`examples/omarchy/verde/colors.toml`](https://github.com/JonathanRiche/verde/blob/master/examples/omarchy/verde/colors.toml)
-for the shape.
+Verde reads the current Omarchy (Quattro) keys (`background`,
+`lighter_background`, `foreground`, `light_foreground`, `dark_foreground`,
+`accent`, `selection`, `muted`, `red`, `green`, `yellow`) as well as the older
+`color0`–`color8` and `selection_background` keys. A `[verde]` section, when
+present, sets Verde's UI roles directly and wins over the mapped values; other
+sections are ignored. Missing values fall back to Verde Legacy for dark themes
+and Verde Light for `mode = "light"` themes. The
+[`examples/omarchy/`](https://github.com/JonathanRiche/verde/tree/master/examples/omarchy)
+folders contain installable Omarchy themes for Verde Dark, Verde Light and
+Verde Legacy, including wallpapers.
 
 ## State files
 

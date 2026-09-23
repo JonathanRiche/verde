@@ -100,8 +100,9 @@ existing thread.
 
 Theme commands run without launching the desktop UI. Imports accept local JSON,
 ordinary HTTP(S) URLs, and GitHub `blob` links. A successful import installs and
-activates the theme; it then appears alongside Verde and Omarchy in the Settings
-theme dropdown.
+activates the theme; it then appears alongside the built-in themes in the
+Settings theme dropdown. `verde theme reset` returns to the platform default
+(Omarchy when installed, otherwise Auto).
 
 ```bash
 verde theme import <file-or-url> [--dry-run] [--json]

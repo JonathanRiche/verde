@@ -382,9 +382,9 @@ const themeColors: JsonSchema = {
 
 const themeSource: JsonSchema = {
   type: 'string',
-  enum: ['omarchy', 'auto', 'default', 'verde'],
+  enum: ['auto', 'verde-dark', 'verde-light', 'verde-legacy', 'omarchy', 'default', 'verde'],
   description:
-    '`omarchy`/`auto` follow Omarchy colors when present. `default`/`verde` use Verde built-in colors.',
+    '`auto` follows the OS light/dark appearance. `verde-dark`, `verde-light` and `verde-legacy` are built-in palettes. `omarchy` follows the active Omarchy theme (Auto without Omarchy). `default`/`verde` are legacy aliases for `verde-legacy`. Omit for the platform default.',
 }
 
 function themeObject(includeActive: boolean): JsonSchema {
