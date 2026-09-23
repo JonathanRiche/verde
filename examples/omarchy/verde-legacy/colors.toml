@@ -1,6 +1,8 @@
 # Verde Legacy: the original Verde default, kept for comparison and for
 # anyone who prefers it. [verde] matches the defaults in
-# packages/desktop/src/ui/theme.zig (ThemeColors) exactly.
+# packages/desktop/src/ui/theme.zig (ThemeColors), except selection: Omarchy
+# ignores section headers, so a [verde] selection would override the terminal
+# selection below. Verde maps the top-level selection instead.
 #
 # Top-level keys are the Omarchy colors.toml format, so this folder can be
 # copied to ~/.config/omarchy/themes/verde-legacy/ as-is.
@@ -51,4 +53,3 @@ border_muted = "#3C474C"
 warning = "#FBBF24"
 diff_add = "#34E094"
 diff_remove = "#FF6464"
-selection = "#58A6FF"
