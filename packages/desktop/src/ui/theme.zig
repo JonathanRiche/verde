@@ -661,6 +661,42 @@ pub fn omarchyThemeAvailable(allocator: std.mem.Allocator) bool {
     return fileExists(path);
 }
 
+/// Identity of the resolved Omarchy colors.toml. `omarchy-theme-set` swaps the
+/// whole theme directory in with a rename, so a switch always changes the
+/// inode, even back to a theme with identical bytes.
+pub const OmarchyThemeStamp = struct {
+    inode: std.Io.File.INode = 0,
+    mtime_ns: i96 = 0,
+    size: u64 = 0,
+};
+
+/// Stamp of the Omarchy colors.toml, or the zero stamp when none resolves.
+/// Touches the filesystem; callers poll it on a slow cadence.
+pub fn omarchyThemeStamp(allocator: std.mem.Allocator) OmarchyThemeStamp {
+    if (builtin.os.tag != .linux) return .{};
+    const path = resolveOmarchyThemePath(allocator) catch return .{};
+    defer allocator.free(path);
+    return stampFile(std.Io.Dir.cwd(), path);
+}
+
+fn stampFile(dir: std.Io.Dir, path: []const u8) OmarchyThemeStamp {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    var file = dir.openFile(threaded.io(), path, .{}) catch return .{};
+    defer file.close(threaded.io());
+    const stat = file.stat(threaded.io()) catch return .{};
+    return .{ .inode = stat.inode, .mtime_ns = stat.mtime.toNanoseconds(), .size = stat.size };
+}
+
+/// Stamp of the Omarchy theme the palette was last loaded from.
+pub var omarchy_theme_stamp: OmarchyThemeStamp = .{};
+
+/// True when the Omarchy source is selected and the active Omarchy theme has
+/// changed since the palette was loaded, e.g. after `omarchy-theme-set`.
+pub fn omarchyThemeChanged(allocator: std.mem.Allocator, config: ThemeConfig) bool {
+    if (config.source != .omarchy) return false;
+    return !std.meta.eql(omarchyThemeStamp(allocator), omarchy_theme_stamp);
+}
+
 /// True while the palette comes from an Omarchy colors.toml. Terminals then
 /// honour the Ghostty config Omarchy themes alongside it; built-in palettes
 /// keep terminals on Verde's own colours.
@@ -672,6 +708,7 @@ pub fn applyConfigTheme(allocator: std.mem.Allocator, config: ThemeConfig) void 
             // Omarchy files layer over the original palette, as they always
             // have; without an install the source behaves like Auto.
             current_colors = verde_legacy_colors;
+            omarchy_theme_stamp = omarchyThemeStamp(allocator);
             omarchy_palette_active = loadOmarchyThemeFromDefaultLocations(allocator);
             if (!omarchy_palette_active) current_colors = autoColors(system_appearance);
         },
@@ -1250,6 +1287,31 @@ test "Verde Legacy [verde] roles reproduce the original palette exactly" {
         \\
     , &parsed);
     try std.testing.expectEqual(default_colors, parsed);
+}
+
+test "omarchy theme stamp changes when the theme directory is swapped in" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+
+    try tmp.dir.createDirPath(io, "theme");
+    try tmp.dir.writeFile(io, .{ .sub_path = "theme/colors.toml", .data = "accent = \"#4FD18B\"\n" });
+    const before = stampFile(tmp.dir, "theme/colors.toml");
+    try std.testing.expect(before.inode != 0);
+    try std.testing.expect(std.meta.eql(before, stampFile(tmp.dir, "theme/colors.toml")));
+
+    // omarchy-theme-set: stage next-theme, remove the current one, rename.
+    try tmp.dir.createDirPath(io, "next-theme");
+    try tmp.dir.writeFile(io, .{ .sub_path = "next-theme/colors.toml", .data = "accent = \"#4FD18B\"\n" });
+    try tmp.dir.deleteTree(io, "theme");
+    try tmp.dir.rename("next-theme", tmp.dir, "theme", io);
+    try std.testing.expect(!std.meta.eql(before, stampFile(tmp.dir, "theme/colors.toml")));
+
+    try std.testing.expect(std.meta.eql(OmarchyThemeStamp{}, stampFile(tmp.dir, "missing/colors.toml")));
+}
+
+test "omarchy theme polling ignores built-in sources" {
+    try std.testing.expect(!omarchyThemeChanged(std.testing.allocator, .{ .source = .verde_light }));
 }
 
 test "raise and sink follow the palette polarity" {

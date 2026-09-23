@@ -662,6 +662,7 @@ fn mainInner(init: std.process.Init) !void {
             recordSpan(&frame_sample, .poll_config, struct {
                 fn run(app_state: *AppState, kb: *keybinds.NativeKeyboardConfig) void {
                     pollAppConfigFileChanges(app_state, kb);
+                    pollOmarchyThemeChanges(app_state);
                 }
             }.run, .{ &state, &keyboard });
         }
@@ -3665,6 +3666,14 @@ fn pollAppConfigFileChanges(state: *AppState, keyboard: *keybinds.NativeKeyboard
     // Prefix bindings live in the same file as ui/theme. Reloading only
     // AppConfig left `keybinds.prefix.bindings` stale after an in-app edit.
     reloadApplication(state, keyboard);
+}
+
+/// Follows `omarchy-theme-set` live while the Omarchy source is selected, the
+/// way Omarchy's own apps retint on a theme switch, so no Ctrl+R is needed.
+fn pollOmarchyThemeChanges(state: *AppState) void {
+    if (!ui_theme.omarchyThemeChanged(state.allocator, state.app_config.theme_config)) return;
+    log.info("omarchy theme changed; reapplying palette", .{});
+    applyAppConfigRuntime(state);
 }
 
 fn reloadApplication(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig) void {
