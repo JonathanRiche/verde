@@ -3317,6 +3317,10 @@ export function createAppStore() {
   const createHeadlessThread = async (current: Workspace, provider: string): Promise<number | null> => {
     const client_id = await ensureClientId()
     const local_thread_id = mintId('web-thread-')
+    // The daemon rejects a partial route: a profile_id must travel with its
+    // repository_id, or chat.thread.upsert fails with invalid_params.
+    const profile_id = connections()?.defaults.find((row) => row.workspace_id === current.workspace_id)?.profile_id ?? 'local'
+    const repository_id = 'primary'
     const opened = await requestNewThread(interactiveCall, async () => ({
       request_key: `web:chat.open:${local_thread_id}`,
       client_id,
@@ -3324,7 +3328,8 @@ export function createAppStore() {
       local_thread_id,
       title: 'New Chat',
       committed: false,
-      profile_id: connections()?.defaults.find((row) => row.workspace_id === current.workspace_id)?.profile_id ?? 'local',
+      profile_id,
+      repository_id,
       provider,
       harness: 'local_cli',
       last_activity_at: Date.now(),
@@ -3338,7 +3343,8 @@ export function createAppStore() {
       local_thread_id,
       title: 'New Chat',
       committed: false,
-      profile_id: connections()?.defaults.find((row) => row.workspace_id === current.workspace_id)?.profile_id ?? 'local',
+      profile_id,
+      repository_id,
       provider,
       last_activity_at: Date.now(),
     }
