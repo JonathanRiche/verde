@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { portableThemePackage, themeImportCommand, themePackageUrl } from './theme-package'
+import { portableThemePackage, themeImportCommand, themePackageUrl, verdeRoleTable } from './theme-package'
 
 function hexChannels(hex: string): [number, number, number] {
   const value = hex.replace('#', '')
@@ -115,5 +115,35 @@ describe('portable website themes', () => {
     expect(themeImportCommand('kanagawa')).toBe(
       'verde theme import https://verdeai.dev/themes/kanagawa.json',
     )
+  })
+})
+
+describe('Verde role tables', () => {
+  const toml = [
+    'accent = "#15803D"',
+    'background = "#F7F9F8"',
+    '[verde]',
+    'panel = "#FFFFFF"',
+    'border = "#A6D4B8"',
+    'accent_dim = "#15803D1F"',
+    '[web]',
+    'sidebar = "#F1F4F2"',
+  ].join('\n')
+
+  test('read only the [verde] section', () => {
+    expect(verdeRoleTable(toml)).toEqual({
+      panel: '#FFFFFF',
+      border: '#A6D4B8',
+      accent_dim: '#15803D1F',
+    })
+  })
+
+  test('override the derived palette with the exact roles', () => {
+    const light = { slug: 'verde-light', name: 'Verde Light', bg: '#f7f9f8', accent: '#15803d', fg: '#0f1715', warm: '#9a6700' }
+    const colors = portableThemePackage(light, verdeRoleTable(toml)).theme.colors
+    expect(colors.panel).toBe('#FFFFFF')
+    expect(colors.border).toBe('#A6D4B8')
+    // Roles the table leaves out still come from the derivation.
+    expect(colors.text).toBe('#0f1715')
   })
 })

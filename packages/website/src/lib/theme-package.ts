@@ -69,8 +69,30 @@ function raise(hex: string, amount: number, background: string, foreground: stri
 const DIFF_ADD_BASE = '#3fb950'
 const DIFF_REMOVE_BASE = '#f85149'
 
-/** Build the same semantic palette Verde derives from an Omarchy colors.toml. */
-export function portableThemePackage(theme: PortableThemeSource): PortableThemePackage {
+/** Read the `[verde]` role table from an Omarchy colors.toml. Verde's own
+    themes ship exact UI roles there, which the four-color derivation below
+    can only approximate. */
+export function verdeRoleTable(toml: string): Record<string, string> {
+  const roles: Record<string, string> = {}
+  let inVerde = false
+  for (const line of toml.split('\n')) {
+    const header = line.match(/^\s*\[([^\]]+)\]/)
+    if (header) {
+      inVerde = header[1] === 'verde'
+      continue
+    }
+    const entry = inVerde ? line.match(/^\s*([a-z_]+)\s*=\s*"(#[0-9A-Fa-f]{6,8})"/) : null
+    if (entry) roles[entry[1]!] = entry[2]!
+  }
+  return roles
+}
+
+/** Build the same semantic palette Verde derives from an Omarchy colors.toml.
+    `roles` (a theme's `[verde]` table) wins over the derived values. */
+export function portableThemePackage(
+  theme: PortableThemeSource,
+  roles: Record<string, string> = {},
+): PortableThemePackage {
   const panelMuted = raise(theme.bg, 0.12, theme.bg, theme.fg)
   return {
     schema_version: 1,
@@ -96,6 +118,7 @@ export function portableThemePackage(theme: PortableThemeSource): PortableThemeP
         // rather than the full-strength accent — otherwise selected text loses
         // all contrast against it.
         selection: mix(theme.accent, theme.bg, 0.78),
+        ...roles,
       },
     },
   }

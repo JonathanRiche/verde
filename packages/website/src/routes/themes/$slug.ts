@@ -2,6 +2,7 @@ import { createFileRoute } from '@tanstack/solid-router'
 
 import { themeBySlug } from '../../lib/site-theme'
 import { portableThemePackage } from '../../lib/theme-package'
+import { verdeThemeRoles } from '../../lib/verde-theme-roles'
 
 export const Route = createFileRoute('/themes/$slug')({
   server: {
@@ -17,7 +18,7 @@ export const Route = createFileRoute('/themes/$slug')({
           return new Response(`Unknown Verde theme: ${slug}\n`, { status: 404 })
         }
 
-        return Response.json(portableThemePackage(theme), {
+        return Response.json(portableThemePackage(theme, verdeThemeRoles(theme.slug)), {
           headers: {
             'Cache-Control': 'public, max-age=3600, s-maxage=86400',
             'Content-Disposition': `inline; filename="${theme.slug}.json"`,
