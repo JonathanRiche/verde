@@ -49,6 +49,12 @@ pub const METHOD_CHAT_MESSAGE_LIST: []const u8 = "chat.message.list";
 pub const METHOD_CHAT_TURN_RECORD: []const u8 = "chat.turn.record";
 pub const METHOD_CONFIG_FAVORITE_MODEL_SET: []const u8 = "config.favoriteModel.set";
 pub const METHOD_CONFIG_UI_SET: []const u8 = "config.ui.set";
+/// Durable browsing history behind address-bar suggestions. `record` counts
+/// a user-driven page load (`visit: false` only refreshes the title); `query`
+/// returns frecency-ranked matches; `clear` wipes the table.
+pub const METHOD_BROWSER_HISTORY_RECORD: []const u8 = "browser.history.record";
+pub const METHOD_BROWSER_HISTORY_QUERY: []const u8 = "browser.history.query";
+pub const METHOD_BROWSER_HISTORY_CLEAR: []const u8 = "browser.history.clear";
 
 pub const STATE_SNAPSHOT_REPLACE_METHOD = METHOD_STATE_SNAPSHOT_REPLACE;
 pub const APP_STATE_SET_METHOD = METHOD_APP_STATE_SET;
@@ -755,6 +761,28 @@ pub const TurnRecord = struct {
 };
 
 /// Direct lookup request for one durable turn ledger row.
+pub const BrowserHistoryRecordRequest = struct {
+    url: []const u8,
+    title: ?[]const u8 = null,
+    visit: bool = true,
+};
+
+pub const BrowserHistoryQueryRequest = struct {
+    query: []const u8 = "",
+    limit: u32 = 8,
+};
+
+pub const BrowserHistoryEntry = struct {
+    url: []const u8,
+    title: []const u8 = "",
+    visit_count: u32 = 1,
+    last_visit_ms: i64 = 0,
+};
+
+pub const BrowserHistoryQueryResult = struct {
+    entries: []const BrowserHistoryEntry = &.{},
+};
+
 pub const TurnRecordRequest = struct {
     turn_id: []const u8,
 };
@@ -1195,6 +1223,9 @@ test "store method names and error codes are pinned" {
     try std.testing.expectEqualStrings("chat.turn.record", METHOD_CHAT_TURN_RECORD);
     try std.testing.expectEqualStrings("config.favoriteModel.set", METHOD_CONFIG_FAVORITE_MODEL_SET);
     try std.testing.expectEqualStrings("config.ui.set", METHOD_CONFIG_UI_SET);
+    try std.testing.expectEqualStrings("browser.history.record", METHOD_BROWSER_HISTORY_RECORD);
+    try std.testing.expectEqualStrings("browser.history.query", METHOD_BROWSER_HISTORY_QUERY);
+    try std.testing.expectEqualStrings("browser.history.clear", METHOD_BROWSER_HISTORY_CLEAR);
     try std.testing.expectEqualStrings("store", SNAPSHOT_SCOPE_STORE);
     try std.testing.expectEqualStrings("registry", SNAPSHOT_SCOPE_REGISTRY);
     try std.testing.expectEqualStrings("sessions", SNAPSHOT_SCOPE_SESSIONS);

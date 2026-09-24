@@ -8,6 +8,7 @@ const state_storage = @import("../state/storage.zig");
 const browser_runtime = @import("../browser/mod.zig");
 const browser_runtime_access = @import("../state/browser_runtime_access.zig");
 const browser_state_controller = @import("../state/browser_controller.zig");
+const browser_history_controller = @import("../state/browser_history_controller.zig");
 const browser_ui = @import("../ui/browser.zig");
 const command_palette = @import("../ui/command_palette.zig");
 const sidebar_ui = @import("../ui/sidebar.zig");
@@ -1497,6 +1498,8 @@ fn browserCommandResponseInScope(allocator: std.mem.Allocator, id_value: std.jso
     if (std.mem.eql(u8, command, "open")) {
         const project_index = resolveProjectIndex(state, params) orelse
             return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
+        // Automation-driven loads stay out of the address-bar history.
+        if (stringParam(params, "url") != null) browser_history_controller.beginSuppressedBrowserNavigation(state);
         const result = state.openBrowserInWorkspace(project_index, stringParam(params, "url")) catch |err| switch (err) {
             error.WorkspaceNotFound => return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found"),
             error.BrowserDisabled => return try errorResponseAlloc(allocator, id_value, "unsupported", "browser runtime is disabled"),
@@ -1553,6 +1556,7 @@ fn browserCommandResponseInScope(allocator: std.mem.Allocator, id_value: std.jso
 
     if (std.mem.eql(u8, command, "navigate")) {
         const url = stringParam(params, "url") orelse return try errorResponseAlloc(allocator, id_value, "invalid_request", "browser.navigate requires url");
+        browser_history_controller.beginSuppressedBrowserNavigation(state);
         state.navigateBrowserToUrl(url) catch |err| switch (err) {
             error.EmptyBrowserUrl => return try errorResponseAlloc(allocator, id_value, "invalid_request", "browser.navigate requires a non-empty url"),
             error.BrowserNavigationFailed => return try errorResponseAlloc(allocator, id_value, "rejected", "browser navigation failed"),
@@ -1565,11 +1569,13 @@ fn browserCommandResponseInScope(allocator: std.mem.Allocator, id_value: std.jso
     }
 
     if (std.mem.eql(u8, command, "back")) {
+        browser_history_controller.beginSuppressedBrowserNavigation(state);
         state.navigateBrowserHistory(-1);
         return try okValueResponse(allocator, id_value, .{ .accepted = true });
     }
 
     if (std.mem.eql(u8, command, "forward")) {
+        browser_history_controller.beginSuppressedBrowserNavigation(state);
         state.navigateBrowserHistory(1);
         return try okValueResponse(allocator, id_value, .{ .accepted = true });
     }

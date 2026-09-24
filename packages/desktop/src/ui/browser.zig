@@ -5,6 +5,7 @@ const palette = @import("palette");
 const sdl = @import("zsdl3");
 
 const app_state = @import("../state.zig");
+const browser_history_controller = @import("../state/browser_history_controller.zig");
 const browser_runtime = @import("../browser/mod.zig");
 const colors = @import("colors.zig");
 const context_menu = @import("context_menu.zig");
@@ -113,6 +114,7 @@ const BrowserOverflowAction = union(enum) {
     copy_url,
     open_external,
     toggle_inspector,
+    clear_history,
     close_pane,
 };
 
@@ -124,6 +126,11 @@ const BrowserOverflowHit = struct {
 
 var palette_overflow_hits: [32]BrowserOverflowHit = undefined;
 var palette_overflow_hit_count: usize = 0;
+
+/// Address-bar suggestion dropdown geometry; one rect per visible row.
+var palette_suggestion_rect: palette.Rect = .{};
+var palette_suggestion_hits: [12]palette.Rect = undefined;
+var palette_suggestion_hit_count: usize = 0;
 
 const CLOSE_PANE_MENU_INDEX = std.math.maxInt(u32);
 
@@ -140,6 +147,8 @@ pub fn resetPaletteHitCache() void {
     palette_context_menu_hit_count = 0;
     palette_overflow_menu_rect = .{};
     palette_overflow_hit_count = 0;
+    palette_suggestion_rect = .{};
+    palette_suggestion_hit_count = 0;
 }
 
 /// Renders the browser dock that manages the in-app browser pane and bridge controls.
@@ -160,6 +169,7 @@ pub fn renderDockAtWithReserve(state: *app_state.AppState, rect: palette.Rect, t
         .h = @max(rect.h - toolbar_height, theme.scaledUi(180.0)),
     });
     renderToolbar(state, rect, toolbar_right_reserve);
+    renderAddressSuggestions(state);
     renderBrowserContextMenu(state);
     renderToolbarTooltip(state);
 }
@@ -176,6 +186,9 @@ pub fn paneToolbarActionRowHeight() f32 {
 
 pub fn handlePaletteMouseMotion(state: *app_state.AppState, x: f32, y: f32) void {
     palette_mouse_pos = .{ x, y };
+    if (browser_history_controller.browserSuggestionsVisible(state)) {
+        if (suggestionRowAtPoint(x, y)) |row| browser_history_controller.selectBrowserSuggestion(state, row);
+    }
     if (state.browser_controller.context_menu_open) {
         if (browserContextMenuActionAtPoint(x, y)) |action| {
             switch (action) {
@@ -219,6 +232,7 @@ pub fn handlePaletteMouseMotion(state: *app_state.AppState, x: f32, y: f32) void
 pub fn wantsPointerAt(state: *app_state.AppState, x: f32, y: f32) bool {
     if (!state.isBrowserVisible()) return false;
 
+    if (browser_history_controller.browserSuggestionsVisible(state) and suggestionRowAtPoint(x, y) != null) return true;
     if (toolbar_overflow_open and rectContainsPoint(palette_overflow_menu_rect, x, y)) return true;
 
     var index = palette_hit_count;
@@ -297,6 +311,20 @@ fn toolbarHitKindByName(name: []const u8) ?BrowserHitKind {
 pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down: bool, clicks: u8) bool {
     if (!state.isBrowserVisible()) return false;
     palette_mouse_pos = .{ x, y };
+
+    if (browser_history_controller.browserSuggestionsVisible(state)) {
+        if (!down and rectContainsPoint(palette_suggestion_rect, x, y)) return true;
+        if (down) {
+            if (suggestionRowAtPoint(x, y)) |row| {
+                browser_history_controller.selectBrowserSuggestion(state, row);
+                blurAddress(state);
+                _ = browser_history_controller.acceptBrowserSuggestion(state);
+                state.noteInteraction();
+                return true;
+            }
+            if (rectContainsPoint(palette_suggestion_rect, x, y)) return true;
+        }
+    }
 
     if (toolbar_overflow_open) {
         if (!down) return rectContainsPoint(palette_overflow_menu_rect, x, y) or rectContainsPoint(palette_toolbar_rect, x, y);
@@ -494,6 +522,7 @@ pub fn handlePaletteTextInput(state: *app_state.AppState, text: []const u8) bool
     if (!state.browser_controller.address_focused) return false;
     _ = deleteAddressSelection(state);
     insertAddressText(state, text);
+    browser_history_controller.refreshBrowserSuggestions(state);
     state.noteInteraction();
     return true;
 }
@@ -508,10 +537,30 @@ pub fn handlePaletteKeyDown(state: *app_state.AppState, event: *const sdl.Keyboa
     const address_len = state.browserState().addressInput().len;
     switch (event.key) {
         .@"return", .kp_enter => {
+            // A highlighted suggestion wins; otherwise the typed text loads.
+            const suggestion_taken = browser_history_controller.browserSuggestionsVisible(state) and
+                state.browser_controller.suggestions.selected != null;
             blurAddress(state);
-            state.navigateBrowserFromAddress();
+            if (!suggestion_taken or !browser_history_controller.acceptBrowserSuggestion(state)) {
+                state.navigateBrowserFromAddress();
+            }
         },
-        .escape => blurAddress(state),
+        .escape => {
+            if (browser_history_controller.browserSuggestionsVisible(state)) {
+                browser_history_controller.hideBrowserSuggestions(state);
+            } else {
+                blurAddress(state);
+            }
+        },
+        .up => browser_history_controller.moveBrowserSuggestionSelection(state, -1),
+        .down => {
+            if (browser_history_controller.browserSuggestionsVisible(state)) {
+                browser_history_controller.moveBrowserSuggestionSelection(state, 1);
+            } else {
+                browser_history_controller.refreshBrowserSuggestions(state);
+            }
+        },
+        .tab => acceptAddressCompletion(state),
         .left => {
             const target = state.browser_controller.address_cursor -| 1;
             moveAddressCursor(state, target, shift);
@@ -524,9 +573,11 @@ pub fn handlePaletteKeyDown(state: *app_state.AppState, event: *const sdl.Keyboa
         .end => moveAddressCursor(state, address_len, shift),
         .backspace, .kp_backspace => {
             if (!deleteAddressSelection(state)) deleteAddressBackward(state);
+            browser_history_controller.refreshBrowserSuggestions(state);
         },
         .delete => {
             if (!deleteAddressSelection(state)) deleteAddressForward(state);
+            browser_history_controller.refreshBrowserSuggestions(state);
         },
         .a => {
             if (primary) {
@@ -541,10 +592,14 @@ pub fn handlePaletteKeyDown(state: *app_state.AppState, event: *const sdl.Keyboa
             if (primary) {
                 copyAddressSelection(state);
                 _ = deleteAddressSelection(state);
+                browser_history_controller.refreshBrowserSuggestions(state);
             }
         },
         .v => {
-            if (primary) pasteIntoAddress(state);
+            if (primary) {
+                pasteIntoAddress(state);
+                browser_history_controller.refreshBrowserSuggestions(state);
+            }
         },
         else => return true,
     }
@@ -1176,7 +1231,7 @@ fn renderToolbarOverflowMenu(
         @as(usize, if (copy_visible) 0 else 1) +
         @as(usize, if (external_visible) 0 else 1) +
         @as(usize, if (inspector_visible) 0 else 1);
-    const action_rows: usize = 6 + hidden_action_rows;
+    const action_rows: usize = 7 + hidden_action_rows;
     const row_count = max_tab_rows + action_rows;
     const menu_h = pad * 2.0 + row_h * @as(f32, @floatFromInt(row_count));
     const min_x = palette_toolbar_rect.x + theme.scaledUi(4.0);
@@ -1230,6 +1285,8 @@ fn renderToolbarOverflowMenu(
         renderToolbarOverflowRow(state, overflowRowRect(y, row_h, pad, menu_w), if (state.isBrowserInspectorEnabled()) "Disable inspector" else "Enable inspector", .toggle_inspector, state.canUseBrowserInspector());
         y += row_h;
     }
+    renderToolbarOverflowRow(state, overflowRowRect(y, row_h, pad, menu_w), "Clear browsing history", .clear_history, true);
+    y += row_h;
     renderToolbarOverflowRow(state, overflowRowRect(y, row_h, pad, menu_w), "Close browser pane", .close_pane, pane_id != null);
 }
 
@@ -1294,6 +1351,7 @@ fn activateOverflowAction(state: *app_state.AppState, action: BrowserOverflowAct
         .copy_url => copyCurrentUrl(state),
         .open_external => state.openCurrentBrowserUrlExternally(),
         .toggle_inspector => if (state.canUseBrowserInspector()) state.toggleBrowserInspector(),
+        .clear_history => browser_history_controller.clearBrowserHistory(state),
         .close_pane => if (state.currentProjectVisibleBrowserPaneId()) |pane_id| {
             _ = state.closeCurrentProjectWorkspacePane(pane_id);
         },
@@ -1683,7 +1741,90 @@ fn renderPaletteAddressField(state: *app_state.AppState, rect: palette.Rect) voi
             .w = theme.scaledUi(1.5),
             .h = text_rect.h - theme.scaledUi(2.0),
         }, paletteColor(theme.COLOR_WHITE));
+        // Inline host completion reads as ghost text after the caret; Tab
+        // (or Enter on the leading history row) takes it.
+        const completion = state.browser_controller.suggestions.completion;
+        if (completion.len > 0 and cursor == address.len and addressSelectionRange(state, address) == null and
+            caret_x < text_rect.x + text_rect.w)
+        {
+            queuePaletteText(state, .{
+                .x = caret_x + theme.scaledUi(1.5),
+                .y = text_rect.y,
+                .w = text_rect.x + text_rect.w - caret_x,
+                .h = text_rect.h,
+            }, completion, paletteColor(theme.COLOR_TEXT_SUBTLE), font_size, rect);
+        }
     }
+}
+
+/// Commits the ghost host completion into the address text.
+fn acceptAddressCompletion(state: *app_state.AppState) void {
+    const completion = state.browser_controller.suggestions.completion;
+    if (completion.len == 0) return;
+    const address = state.browserState().addressInput();
+    if (state.browser_controller.address_cursor != address.len) return;
+    var buffer: [256]u8 = undefined;
+    const len = @min(completion.len, buffer.len);
+    @memcpy(buffer[0..len], completion[0..len]);
+    clearAddressSelection(state);
+    insertAddressText(state, buffer[0..len]);
+    browser_history_controller.refreshBrowserSuggestions(state);
+}
+
+/// Region: address-bar suggestion dropdown. Drawn below the URL field while
+/// it is focused with text; rows share the context-menu chrome.
+fn renderAddressSuggestions(state: *app_state.AppState) void {
+    palette_suggestion_hit_count = 0;
+    palette_suggestion_rect = .{};
+    if (!state.browser_controller.address_focused) return;
+    if (!browser_history_controller.browserSuggestionsVisible(state)) return;
+    const address_hit = findHit(.address) orelse return;
+    const suggestions = &state.browser_controller.suggestions;
+    const row_count = @min(suggestions.items.len, palette_suggestion_hits.len);
+
+    const row_h = theme.scaledUi(context_menu.ROW_HEIGHT_UI);
+    const pad = theme.scaledUi(context_menu.PAD_UI);
+    const anchor = address_hit.rect;
+    const panel = context_menu.queuePanel(state, .{
+        .x = anchor.x,
+        .y = anchor.y + anchor.h + theme.scaledUi(4.0),
+        .w = @max(anchor.w, theme.scaledUi(320.0)),
+        .h = pad * 2.0 + row_h * @as(f32, @floatFromInt(row_count)),
+    });
+    palette_suggestion_rect = panel;
+
+    const font_size = theme.scaledUi(context_menu.FONT_SIZE_UI);
+    const inset = theme.scaledUi(context_menu.LABEL_INSET_UI);
+    const gap = theme.scaledUi(10.0);
+    var y = panel.y + pad;
+    for (suggestions.items[0..row_count], 0..) |item, index| {
+        const row: palette.Rect = .{ .x = panel.x + pad, .y = y, .w = panel.w - pad * 2.0, .h = row_h };
+        palette_suggestion_hits[index] = row;
+        palette_suggestion_hit_count = index + 1;
+        const highlighted = suggestions.selected == index;
+        if (highlighted) context_menu.queueRowHighlight(state, row);
+
+        // Title first, URL after it in a muted tone; the title yields once it
+        // would crowd out the URL.
+        const label_w = @max(row.w - inset * 2.0, 1.0);
+        const show_url = item.kind != .search;
+        const title_w = app_state.paletteUiTextPrefixWidth(item.title, font_size, item.title.len);
+        const title_max = if (show_url) label_w * 0.45 else label_w;
+        const title_clip_w = @min(title_w, title_max);
+        const title_clip: palette.Rect = .{ .x = row.x, .y = row.y, .w = inset + title_clip_w, .h = row.h };
+        context_menu.queueLabel(state, row, item.title, context_menu.labelColor(true, highlighted), 0.0, 0.0, title_clip);
+        if (show_url) {
+            context_menu.queueLabel(state, row, item.url, theme.COLOR_TEXT_SUBTLE, title_clip_w + gap, 0.0, row);
+        }
+        y += row_h;
+    }
+}
+
+fn suggestionRowAtPoint(x: f32, y: f32) ?usize {
+    for (palette_suggestion_hits[0..palette_suggestion_hit_count], 0..) |rect, index| {
+        if (rectContainsPoint(rect, x, y)) return index;
+    }
+    return null;
 }
 
 const SelectionRange = struct { start: usize, end: usize };
@@ -1759,6 +1900,7 @@ fn focusAddress(state: *app_state.AppState) void {
 
 pub fn blurAddress(state: *app_state.AppState) void {
     state.browser_controller.address_focused = false;
+    browser_history_controller.hideBrowserSuggestions(state);
     state.browser_controller.address_cursor = @min(state.browser_controller.address_cursor, state.browserState().addressInput().len);
     state.browser_controller.address_drag_active = false;
     clearAddressSelection(state);

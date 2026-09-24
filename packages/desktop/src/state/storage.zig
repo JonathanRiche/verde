@@ -29,6 +29,10 @@ const ACKNOWLEDGEMENT_TIMEOUT_MS: u32 = 500;
 /// Client unregister runs after all durable state is owned and must not hold
 /// process exit behind an unhealthy daemon.
 const CLIENT_CLOSE_TIMEOUT_MS: u32 = 750;
+/// Address-bar suggestions block the render thread; give up fast rather than
+/// stall typing when the daemon is busy.
+const BROWSER_HISTORY_QUERY_TIMEOUT_MS: u32 = 250;
+const BROWSER_HISTORY_WRITE_TIMEOUT_MS: u32 = 750;
 const LoadedPersistedState = db_types.LoadedState;
 const PersistedState = db_types.PersistedState;
 const PersistedThread = db_types.PersistedThread;
@@ -180,6 +184,17 @@ pub const LoadedThreadHistory = struct {
     items: []const headless.store.ThreadListItem = &.{},
 
     pub fn deinit(self: *LoadedThreadHistory) void {
+        self.arena.deinit();
+    }
+};
+
+/// Frecency-ranked browser history matches for the address bar; entries are
+/// arena-owned so a suggestion refresh can swap the whole set at once.
+pub const LoadedBrowserHistory = struct {
+    arena: std.heap.ArenaAllocator,
+    entries: []const headless.store.BrowserHistoryEntry = &.{},
+
+    pub fn deinit(self: *LoadedBrowserHistory) void {
         self.arena.deinit();
     }
 };
@@ -363,6 +378,49 @@ pub const Storage = struct {
         loaded.items = items;
         self.noteStoreRevision(result.store_revision);
         return loaded;
+    }
+
+    /// Queries browser history for the address-bar dropdown. Runs on the
+    /// render thread per keystroke, so the socket timeout is short.
+    pub fn queryBrowserHistory(self: *const Storage, allocator: std.mem.Allocator, query: []const u8, limit: u32) !LoadedBrowserHistory {
+        var loaded = LoadedBrowserHistory{ .arena = std.heap.ArenaAllocator.init(allocator) };
+        errdefer loaded.deinit();
+        const a = loaded.arena.allocator();
+        var transport: daemon_client.HeadlessTransport = .{ .allocator = a, .pref_path = self.pref_path, .timeout_ms = BROWSER_HISTORY_QUERY_TIMEOUT_MS };
+        var client = daemon_client.headlessClient(a, &transport);
+        const request: headless.store.BrowserHistoryQueryRequest = .{ .query = query, .limit = limit };
+        var parsed = try client.call(headless.store.METHOD_BROWSER_HISTORY_QUERY, request);
+        defer parsed.deinit();
+        if (parsed.response.err != null) return error.RemoteError;
+        const result_value = parsed.response.result orelse return error.InvalidResponse;
+        const result = try std.json.parseFromValueLeaky(headless.store.BrowserHistoryQueryResult, a, result_value, .{ .ignore_unknown_fields = true });
+        loaded.entries = result.entries;
+        return loaded;
+    }
+
+    /// Records a user-driven page load (`visit`) or a later title update for
+    /// the address-bar history. Failures are non-fatal for the browser pane.
+    pub fn recordBrowserVisit(self: *const Storage, url: []const u8, title: []const u8, visit: bool) !void {
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        var transport: daemon_client.HeadlessTransport = .{ .allocator = a, .pref_path = self.pref_path, .timeout_ms = BROWSER_HISTORY_WRITE_TIMEOUT_MS };
+        var client = daemon_client.headlessClient(a, &transport);
+        const request: headless.store.BrowserHistoryRecordRequest = .{ .url = url, .title = title, .visit = visit };
+        var parsed = try client.call(headless.store.METHOD_BROWSER_HISTORY_RECORD, request);
+        defer parsed.deinit();
+        if (parsed.response.err != null) return error.RemoteError;
+    }
+
+    pub fn clearBrowserHistory(self: *const Storage) !void {
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        var transport: daemon_client.HeadlessTransport = .{ .allocator = a, .pref_path = self.pref_path, .timeout_ms = BROWSER_HISTORY_WRITE_TIMEOUT_MS };
+        var client = daemon_client.headlessClient(a, &transport);
+        var parsed = try client.call(headless.store.METHOD_BROWSER_HISTORY_CLEAR, .{});
+        defer parsed.deinit();
+        if (parsed.response.err != null) return error.RemoteError;
     }
 
     /// Fetches one thread (metadata plus its full transcript) by identity.

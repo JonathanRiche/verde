@@ -21,6 +21,9 @@ test {
     _ = @import("daemon/connect_store.zig");
     _ = @import("daemon/connect_grants.zig");
     _ = @import("daemon/repository_path.zig");
+    _ = @import("daemon/browser_history.zig");
     _ = @import("db/client.zig");
+    _ = @import("state/browser_suggestions.zig");
+    _ = @import("state/browser_history_controller.zig");
     _ = @import("cli/runtime_profiles.zig");
 }

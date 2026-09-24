@@ -6,7 +6,7 @@ const zqlite = @import("zqlite");
 /// Latest schema version understood by this build.
 pub const CURRENT_VERSION: i64 = 1;
 /// Maximum schema version understood by read-only clients and the daemon store.
-pub const MAX_SUPPORTED_VERSION: i64 = 14;
+pub const MAX_SUPPORTED_VERSION: i64 = 15;
 /// SQLite busy timeout shared by writer and read-only connections.
 pub const BUSY_TIMEOUT_MS = 5000;
 
@@ -313,6 +313,12 @@ fn migrateToVersionInternal(
                 if (failure_point == .before_version_bump) return error.TestMigrationFailure;
                 try conn.execNoArgs("pragma user_version = 14");
                 version = 14;
+            },
+            14 => {
+                try migrateV14ToV15(conn);
+                if (failure_point == .before_version_bump) return error.TestMigrationFailure;
+                try conn.execNoArgs("pragma user_version = 15");
+                version = 15;
             },
             else => return error.DatabaseSchemaInvalid,
         }
@@ -909,6 +915,24 @@ fn migrateV11ToV12(conn: zqlite.Conn) !void {
 /// were the bulk of what v12 left open.
 fn migrateV12ToV13(conn: zqlite.Conn) !void {
     try recomputeOpenThreadSets(conn, .{ .uncommitted_open = false });
+}
+
+/// v15: durable browser history backing address-bar suggestions. One row per
+/// URL; `visit_count` and `last_visit_ms` feed frecency ranking.
+pub const BROWSER_HISTORY_SCHEMA_SQL =
+    \\create table if not exists browser_history (
+    \\    id integer primary key,
+    \\    url text not null unique,
+    \\    title text not null default '',
+    \\    visit_count integer not null default 1 check (visit_count >= 1),
+    \\    last_visit_ms integer not null default 0 check (last_visit_ms >= 0)
+    \\);
+    \\create index if not exists browser_history_last_visit_idx
+    \\    on browser_history (last_visit_ms desc);
+;
+
+fn migrateV14ToV15(conn: zqlite.Conn) !void {
+    try conn.execNoArgs(BROWSER_HISTORY_SCHEMA_SQL);
 }
 
 const OpenThreadPolicy = struct {

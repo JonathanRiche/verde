@@ -7,6 +7,8 @@ const browser_inspector = @import("../browser/inspector.zig");
 const browser_runtime = @import("../browser/mod.zig");
 const browser_readiness = @import("../browser/readiness.zig");
 const browser_background_events = @import("browser_background_events.zig");
+const browser_history_controller = @import("browser_history_controller.zig");
+const browser_suggestions = @import("browser_suggestions.zig");
 const browser_screenshot = @import("../browser/screenshot.zig");
 const runtime_log = @import("../runtime/log.zig");
 const theme = @import("../ui/theme.zig");
@@ -221,12 +223,18 @@ pub const State = struct {
     context_menu_link_url: ?[]u8 = null,
     context_menu_selected_index: ?u32 = null,
     context_menu_active_parent: ?u32 = null,
+    /// Address-bar history dropdown plus the visit-recording gate.
+    suggestions: browser_suggestions.State,
 
     pub fn init(allocator: std.mem.Allocator) !State {
-        return .{ .runtime = try browser_runtime.State.init(allocator) };
+        return .{
+            .runtime = try browser_runtime.State.init(allocator),
+            .suggestions = browser_suggestions.State.init(allocator),
+        };
     }
 
     pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
+        self.suggestions.deinit(allocator);
         for (self.context_menu_items.items) |item| allocator.free(item.label);
         self.context_menu_items.deinit(allocator);
         if (self.context_menu_link_url) |url| allocator.free(url);
@@ -591,6 +599,8 @@ fn openBrowserInWorkspaceWithDirtyPolicy(
         try self.navigateBrowserToUrl(target_url);
     } else if (!restored_live_runtime or binding_changed or !self.browser_controller.runtime.controller.runtimeInitialized()) {
         const restored_url = restore_url orelse "about:blank";
+        // Re-opening the pane replays a page already in history.
+        browser_history_controller.beginSuppressedBrowserNavigation(self);
         if (mark_dirty) {
             try self.navigateBrowserToUrl(restored_url);
         } else {
@@ -763,6 +773,7 @@ pub fn recoverBrowser(self: anytype, restore_url: bool) !void {
         self.browser_controller.runtime.setLastError("Failed to recover browser runtime.") catch {};
     }
 
+    browser_history_controller.beginSuppressedBrowserNavigation(self);
     if (current_url) |url| {
         try self.browser_controller.runtime.controller.navigate(url);
     } else {
@@ -1927,6 +1938,7 @@ pub fn openBrowserContextLink(self: anytype, new_tab: bool) void {
     defer self.allocator.free(owned);
     self.dismissBrowserContextMenu();
     if (new_tab) self.createBrowserTab();
+    browser_history_controller.noteUserBrowserNavigation(self);
     self.navigateBrowserToUrl(owned) catch |err| {
         log.warn("failed to open browser context-menu link: {s}", .{@errorName(err)});
         self.setSidebarNotice("Failed to open link.");
@@ -1952,6 +1964,7 @@ pub fn reopenBrowserWindow(self: anytype) void {
 
 /// Navigates the browser runtime using the current browser address input buffer.
 pub fn navigateBrowserFromAddress(self: anytype) void {
+    browser_history_controller.noteUserBrowserNavigation(self);
     self.navigateBrowserToUrl(self.browser_controller.runtime.addressInput()) catch |err| switch (err) {
         error.EmptyBrowserUrl => {
             self.setSidebarNotice("Enter a browser URL first.");
@@ -2032,6 +2045,7 @@ pub fn setupBrowserDevServer(self: anytype) void {
 
 /// Navigates typed addresses or reloads when the URL bar already matches the current page.
 pub fn navigateOrReloadBrowserFromAddress(self: anytype) void {
+    browser_history_controller.noteUserBrowserNavigation(self);
     const trimmed = std.mem.trim(u8, self.browser_controller.runtime.addressInput(), &std.ascii.whitespace);
     if (trimmed.len == 0) {
         self.reloadBrowser();
@@ -2184,16 +2198,22 @@ pub fn pollBrowser(self: anytype) bool {
                 self.browser_controller.runtime.setCurrentUrl(url) catch {};
                 self.browser_controller.runtime.setAddress(url);
                 self.recordVisibleBrowserPaneNavigation(url);
+                browser_history_controller.noteBrowserNavigated(self, url);
                 if (self.browser_controller.runtime.status != .failed) self.browser_controller.runtime.setLastError(null) catch {};
             },
             .title_changed => |title| {
                 self.browser_controller.runtime.setCurrentTitle(title) catch {};
                 self.recordVisibleBrowserPaneTitle(title);
+                browser_history_controller.noteBrowserTitleChanged(self);
             },
             .document_loaded => {
                 self.browser_controller.runtime.status = browser_readiness.afterEvent(self.browser_controller.runtime.status, .document_loaded, false);
-                if (self.browser_controller.runtime.status == .failed) continue;
+                if (self.browser_controller.runtime.status == .failed) {
+                    browser_history_controller.noteBrowserLoadFailed(self);
+                    continue;
+                }
                 self.setActiveBrowserTabLoadState(false, false);
+                browser_history_controller.noteBrowserDocumentLoaded(self);
                 self.reapplyBrowserInspectorAfterLoad();
                 self.runBrowserStartupEvalIfRequested();
             },
@@ -2253,6 +2273,7 @@ pub fn pollBrowser(self: anytype) bool {
                 self.browser_controller.runtime.status = .failed;
                 self.setActiveBrowserTabLoadState(false, true);
                 self.browser_controller.runtime.setLastError(message) catch {};
+                browser_history_controller.noteBrowserLoadFailed(self);
                 self.setSidebarNotice("Browser runtime reported a failure.");
             },
         }
@@ -3304,6 +3325,8 @@ pub fn closeBrowserTab(self: anytype, index: usize) void {
 }
 
 pub fn activateBrowserTabRuntime(self: anytype, url: ?[]const u8, title: ?[]const u8) void {
+    // Switching tabs replays a page the user already visited.
+    browser_history_controller.beginSuppressedBrowserNavigation(self);
     self.restartBrowserRuntimeForCrossOriginNavigation(url orelse "about:blank");
     self.browser_controller.runtime.setCurrentUrl(url) catch {};
     self.browser_controller.runtime.setCurrentTitle(title) catch {};

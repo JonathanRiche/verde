@@ -24,6 +24,7 @@ const connect_keys = @import("../daemon/connect_keys.zig");
 const connect_lifecycle = @import("../daemon/connect_lifecycle.zig");
 const connect_store = @import("../daemon/connect_store.zig");
 const chat_links = @import("../daemon/chat_links.zig");
+const browser_history = @import("../daemon/browser_history.zig");
 const daemon_store = @import("../daemon/store.zig");
 const daemon_runtime_identity = @import("../daemon/runtime_identity.zig");
 const mcp_http = @import("../mcp/http_server.zig");
@@ -2883,6 +2884,7 @@ pub const Daemon = struct {
         // unlocked read is not safe for them either — each handler confirms
         // accepting_mutations and pins in_flight under lockDaemon itself.
         if (!std.mem.startsWith(u8, method, "chat.links.") and !std.mem.startsWith(u8, method, "chat.tasks.") and
+            !std.mem.startsWith(u8, method, "browser.history.") and
             !std.mem.eql(u8, method, "chat.turn.start") and
             !std.mem.eql(u8, method, "chat.turn.steer") and
             !std.mem.eql(u8, method, "chat.followup") and
@@ -2911,6 +2913,7 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, "session.kill")) return try self.killResponse(id_value, params);
         if (std.mem.eql(u8, method, "session.cleanup")) return try self.cleanupResponse(id_value);
         if (std.mem.startsWith(u8, method, "chat.links.") or std.mem.startsWith(u8, method, "chat.tasks.")) return try self.chatOrchestrationResponse(id_value, method, params);
+        if (std.mem.startsWith(u8, method, "browser.history.")) return try browserHistoryResponse(self, id_value, method, params);
         if (std.mem.eql(u8, method, "chat.turn.start")) return try self.chatTurnStartResponse(id_value, params);
         if (std.mem.eql(u8, method, "chat.turn.list")) return try self.chatTurnListResponse(id_value, params);
         if (std.mem.eql(u8, method, "chat.turn.tail")) return try self.chatTurnTailResponse(id_value, params);
@@ -12395,6 +12398,9 @@ fn methodRunsUnlocked(method: []const u8) bool {
     // M4-P4: ledger identity guard on accept must read SQLite under the store
     // mutex only; the `.normal` outer lockDaemon window cannot nest that work.
     return std.mem.startsWith(u8, method, "chat.links.") or std.mem.startsWith(u8, method, "chat.tasks.") or
+        // Browser history is per-keystroke SQLite work under the store mutex
+        // only; it pins in_flight and checks the drain flag itself.
+        std.mem.startsWith(u8, method, "browser.history.") or
         std.mem.eql(u8, method, "chat.turn.start") or
         std.mem.eql(u8, method, "chat.turn.tail") or
         std.mem.eql(u8, method, "chat.turn.steer") or
@@ -13791,6 +13797,95 @@ fn resolveChatExecutionRoute(
         .relative_cwd = owned_relative_cwd,
     };
 }
+
+/// browser.history.{record,query,clear}: daemon-owned browsing history behind
+/// the GUI address-bar suggestions. Serves unlocked; SQLite work runs under
+/// the store mutex with `in_flight` pinned so shutdown drains it like
+/// chat.links, and mutations respect the drain flag.
+fn browserHistoryResponse(daemon: *Daemon, id_value: std.json.Value, method: []const u8, params: std.json.Value) ![]u8 {
+    const allocator = daemon.allocator;
+    if (params != .object) {
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "browser history params must be an object");
+    }
+    const is_query = std.mem.eql(u8, method, store_protocol.METHOD_BROWSER_HISTORY_QUERY);
+    const is_record = std.mem.eql(u8, method, store_protocol.METHOD_BROWSER_HISTORY_RECORD);
+    const is_clear = std.mem.eql(u8, method, store_protocol.METHOD_BROWSER_HISTORY_CLEAR);
+    if (!is_query and !is_record and !is_clear) {
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_UNKNOWN_METHOD, "unknown browser history method");
+    }
+
+    lockDaemon(daemon);
+    const service = daemon.store_service;
+    if (service) |svc| _ = svc.in_flight.fetchAdd(1, .monotonic);
+    const accepting = daemon.accepting_mutations;
+    daemon.mutex.unlock();
+    const svc = service orelse return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_STORE_UNAVAILABLE, "store is unavailable");
+    defer _ = svc.in_flight.fetchSub(1, .monotonic);
+    if (!accepting and !is_query) {
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_STATE, "daemon is preparing shutdown and is not accepting mutations");
+    }
+
+    if (is_query) {
+        const query_text = jsonString(params.object.get("query") orelse .null) orelse "";
+        if (query_text.len > browser_history.MAX_QUERY_BYTES or std.mem.indexOfScalar(u8, query_text, 0) != null) {
+            return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid browser history query");
+        }
+        const limit: usize = switch (params.object.get("limit") orelse .null) {
+            .null => browser_history.DEFAULT_LIMIT,
+            .integer => |value| if (value >= 1) @intCast(@min(value, @as(i64, browser_history.MAX_LIMIT))) else {
+                return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid browser history limit");
+            },
+            else => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid browser history limit"),
+        };
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const entries = blk: {
+            lockStoreService(svc);
+            defer svc.mutex.unlock();
+            break :blk browser_history.query(svc.store.conn, arena_state.allocator(), query_text, limit, nowMs()) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvalidParams => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid browser history query"),
+                else => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_STORE_UNAVAILABLE, "browser history is unavailable"),
+            };
+        };
+        return try okValueResponse(allocator, id_value, .{ .entries = entries });
+    }
+
+    if (is_record) {
+        const url = jsonString(params.object.get("url") orelse .null) orelse {
+            return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "browser history url is required");
+        };
+        if (!browser_history.isRecordableUrl(url)) {
+            return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "browser history url is not recordable");
+        }
+        const title = jsonString(params.object.get("title") orelse .null) orelse "";
+        const visit = jsonBool(params.object.get("visit") orelse .null) orelse true;
+        {
+            lockStoreService(svc);
+            defer svc.mutex.unlock();
+            const outcome = if (visit)
+                browser_history.recordVisit(svc.store.conn, url, title, nowMs())
+            else
+                browser_history.updateTitle(svc.store.conn, url, title);
+            outcome catch |err| switch (err) {
+                error.InvalidParams => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "browser history url is not recordable"),
+                else => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_STORE_UNAVAILABLE, "browser history is unavailable"),
+            };
+        }
+        return try okValueResponse(allocator, id_value, .{ .recorded = true });
+    }
+
+    {
+        lockStoreService(svc);
+        defer svc.mutex.unlock();
+        browser_history.clear(svc.store.conn) catch {
+            return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_STORE_UNAVAILABLE, "browser history is unavailable");
+        };
+    }
+    return try okValueResponse(allocator, id_value, .{ .cleared = true });
+}
+
+
 
 fn jsonArrayHasItems(value: ?std.json.Value) error{InvalidParams}!bool {
     const present = value orelse return false;
