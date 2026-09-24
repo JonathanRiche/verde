@@ -10,7 +10,7 @@ function fixture(overrides = {}) {
     calls, notices,
     context: {
       workspace, pane,
-      handlers: Object.fromEntries(COMMANDS.filter((row) => !row.desktop).map((row) => [row.id, async () => calls.push(['native', row.id])])),
+      handlers: Object.fromEntries(COMMANDS.map((row) => [row.id, async () => calls.push(['native', row.id])])),
       notice: (message) => notices.push(message),
       ...overrides,
     },
@@ -26,18 +26,18 @@ describe('web command catalog and dispatch', () => {
     test(`${command.id} dispatches through its declared handler`, async () => {
       const { context, calls, notices } = fixture()
       await dispatchWebCommand(command.id, context)
-      expect(calls).toEqual(command.available ? [['native', command.id]] : [])
-      expect(notices).toEqual(command.available ? [] : [command.unavailableReason])
+      expect(calls).toEqual([['native', command.id]])
+      expect(notices).toEqual([])
     })
-    if (command.desktop) {
-      test(`${command.id} never reaches desktop without a native pane`, async () => {
-        const { context, calls, notices } = fixture({ pane: { ...pane, native_pane_id: undefined } })
-        await dispatchWebCommand(command.id, context)
-        expect(calls).toEqual([])
-        expect(notices[0]).toBe(command.unavailableReason)
-      })
-    }
   }
+  test('every catalog command runs without a native desktop pane', async () => {
+    for (const command of COMMANDS) {
+      const { context, calls, notices } = fixture({ pane: { ...pane, native_pane_id: undefined } })
+      await dispatchWebCommand(command.id, context)
+      expect(calls).toEqual([['native', command.id]])
+      expect(notices).toEqual([])
+    }
+  })
   test('legacy sidebar command IDs still work', async () => {
     const { context, calls } = fixture()
     for (const id of ['new-thread', 'new-terminal', 'toggle-sidebar', 'settings', 'maximize']) await dispatchWebCommand(id, context)
@@ -76,12 +76,11 @@ describe('web command catalog and dispatch', () => {
     await dispatchWebCommand('thread.new', context)
     expect(calls).toEqual([['native', 'thread.new']])
   })
-  test('unsupported commands do not silently disappear or fall through to Live', async () => {
+  test('unknown commands do not silently disappear or fall through to Live', async () => {
     const { context, calls, notices } = fixture()
-    await dispatchWebCommand('workspace.open_editor', context)
     await dispatchWebCommand('invented.command', context)
     expect(calls).toEqual([])
-    expect(notices.length).toBe(2)
+    expect(notices.length).toBe(1)
     expect(notices.every((message) => message.includes('not available'))).toBe(true)
   })
   test('handler failures become notices without exposing exception contents', async () => {
@@ -113,13 +112,11 @@ test('picker bridge isolates workspaces and preserves replacement registrations 
 test('validation rejects without dismissing the palette; accepted handlers dismiss first', async () => {
   let open = true
   const { context, notices } = fixture({ accepted: () => { open = false } })
-  for (const id of ['pane.browser', 'missing']) {
-    await dispatchWebCommand(id, context)
-    expect(open).toBe(true)
-  }
+  await dispatchWebCommand('missing', context)
+  expect(open).toBe(true)
   await dispatchWebCommand('pane.close', { ...context, pane: null })
   expect(open).toBe(true)
-  expect(notices).toHaveLength(3)
+  expect(notices).toHaveLength(2)
   context.handlers['app.settings'] = () => expect(open).toBe(false)
   await dispatchWebCommand('app.settings', context)
 })

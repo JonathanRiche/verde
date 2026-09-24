@@ -1,10 +1,9 @@
 import { paneKey, type LivePane, type Workspace, type Thread, type RpcEnvelope } from './types'
 
 type Target = 'none' | 'workspace' | 'pane' | 'chat'
-const native = <Id extends string>(id: Id, title: string, target: Target, hint = '') => ({ id, title, target, hint, desktop: false as const, available: true as const, unavailableReason: '' })
-const desktop = <Id extends string>(id: Id, title: string) => ({ id, title: `${title} (desktop)`, target: 'pane' as const, hint: '', desktop: true as const, available: false as const, unavailableReason: 'This command is unavailable in the web client. Use the desktop app; the daemon has no supported operation for it.' })
+const native = <Id extends string>(id: Id, title: string, target: Target, hint = '') => ({ id, title, target, hint })
 
-/** One catalog drives both the palette and dispatch; unavailable commands never reach a transport. */
+/** One catalog drives both the palette and dispatch. */
 export const COMMANDS = [
   native('thread.new', 'New chat', 'workspace'),
   native('thread.rename_current', 'Rename current chat', 'chat'),
@@ -27,15 +26,20 @@ export const COMMANDS = [
   native('workspace.next', 'Next workspace', 'workspace', 'Alt+Down'),
   native('app.settings', 'Open settings', 'none', 'Ctrl+,'),
   native('app.sidebar', 'Toggle sidebar', 'none', 'Ctrl+S'),
-  desktop('pane.browser', 'Toggle browser pane'),
-  desktop('pane.quick_toggle', 'New or toggle quick terminal'),
-  desktop('pane.split_chat_right', 'Split chat right'),
-  desktop('pane.split_chat_down', 'Split chat down'),
-  desktop('pane.split_terminal_right', 'Split terminal right'),
-  desktop('pane.split_terminal_down', 'Split terminal down'),
+  native('thread.handoff', 'Handoff chat to another agent', 'chat'),
+  native('thread.open_tui', 'Open chat in its agent TUI', 'chat'),
+  native('thread.regenerate_title', 'Regenerate chat title', 'chat'),
+  native('workspace.open_codex_tui', 'Open Codex TUI', 'workspace'),
+  native('workspace.open_editor', 'Open in editor', 'workspace'),
+  native('pane.quick_toggle', 'New or toggle quick terminal', 'workspace'),
+  native('pane.browser', 'Open in browser', 'none'),
+  native('pane.split_chat_right', 'Split chat right', 'workspace'),
+  native('pane.split_chat_down', 'Split chat down', 'workspace'),
+  native('pane.split_terminal_right', 'Split terminal right', 'workspace'),
+  native('pane.split_terminal_down', 'Split terminal down', 'workspace'),
 ] as const
 
-export type NativeCommandId = Extract<typeof COMMANDS[number], { desktop: false }>['id']
+export type NativeCommandId = typeof COMMANDS[number]['id']
 export type CommandHandlers = Record<NativeCommandId, () => unknown | Promise<unknown>>
 const ALIASES: Record<string, string> = {
   'new-thread': 'thread.new', 'new-terminal': 'pane.terminal',
@@ -54,7 +58,6 @@ export async function dispatchWebCommand(id: string, context: {
 }): Promise<void> {
   const command = COMMANDS.find((row) => row.id === (ALIASES[id] ?? id))
   if (!command) { context.notice(`Command “${id}” is not available in the web client.`); return }
-  if (!command.available) { context.notice(command.unavailableReason); return }
   const { workspace, pane } = context
   if (command.target !== 'none' && !workspace) { context.notice('Select a workspace first.'); return }
   if ((command.target === 'pane' || command.target === 'chat') && (!pane || pane.workspace_id !== workspace?.workspace_id)) {
@@ -86,23 +89,14 @@ export function openChatCommandPicker(pane: LivePane, command: ChatPickerCommand
 }
 
 
-export const DESKTOP_ACTION_REASON = 'Available in the desktop app'
-const DESKTOP_SIDEBAR_ACTIONS = new Set([
-  'workspace-open-codex-tui', 'workspace-herdr-handoff',
-  'workspace-herdr-focus-terminal', 'workspace-herdr-unlink',
-  'workspace-import-codex', 'workspace-import-opencode', 'workspace-import-claude',
-  'thread-regenerate-title', 'thread-handoff', 'thread-open-tui', 'thread-open-chat',
-  'pane-split-chat-right', 'pane-split-chat-down',
-  'pane-split-terminal-right', 'pane-split-terminal-down',
-])
-
 export function sidebarActionUnavailableReason(action: string, pane?: LivePane): string | null {
-  if (DESKTOP_SIDEBAR_ACTIONS.has(action)) return DESKTOP_ACTION_REASON
-  if (action === 'thread-sync' && pane?.profile_id && pane.profile_id !== 'local') return DESKTOP_ACTION_REASON
+  // provider.thread.sync runs on the runtime that owns the chat's provider
+  // binding; a chat routed to another machine syncs there.
+  if (action === 'thread-sync' && pane?.profile_id && pane.profile_id !== 'local') return 'This chat runs on another machine. Sync it from that machine’s Verde.'
   // Chats close through the daemon store (which also prunes the stored
-  // layout), and daemon-backed terminals through session.kill. Only desktop
-  // panes with no daemon identity (browser, stopped terminal) need the app.
-  if (action === 'pane-close' && pane?.native_pane_id != null && !paneClosableFromWeb(pane)) return DESKTOP_ACTION_REASON
+  // layout), and daemon-backed terminals through session.kill. A stopped
+  // terminal pane with no session has nothing left to close.
+  if (action === 'pane-close' && pane?.native_pane_id != null && !paneClosableFromWeb(pane)) return 'This pane has no running session to close.'
   return null
 }
 
@@ -125,7 +119,7 @@ export async function requestSidebarThreadSync(
   if (!workspaceId || !thread.local_thread_id || !thread.provider_thread_id) throw new Error('This chat has no saved provider thread to sync.')
   // The daemon sync handler requires a local binding; do not redirect a
   // remote thread to this host or guess a matching remote store record.
-  if (thread.profile_id && thread.profile_id !== 'local') throw new Error('Syncing a remote chat is available in the desktop app.')
+  if (thread.profile_id && thread.profile_id !== 'local') throw new Error('This chat runs on another machine. Sync it from that machine’s Verde.')
   return call('provider.thread.sync', {
     workspace_id: workspaceId, local_thread_id: thread.local_thread_id,
     provider_thread_id: thread.provider_thread_id,

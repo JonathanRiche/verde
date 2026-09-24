@@ -1,10 +1,8 @@
 import { expect, test } from 'bun:test'
-import { sidebarMenuAvailability, requestSidebarThreadSync, DESKTOP_ACTION_REASON } from './commands'
-import { store } from './store'
+import { sidebarMenuAvailability, requestSidebarThreadSync } from './commands'
 
-const workspace = { workspace_id: 'ws', label: 'Workspace', path: '/repo' }
 const pane = { workspace_id: 'ws', pane_id: 1, native_pane_id: 42, kind: 'chat', thread_id: 'local', provider_thread_id: 'provider', profile_id: 'local' }
-const unavailable = [
+const webActions = [
   'workspace-open-codex-tui', 'workspace-herdr-handoff', 'workspace-herdr-focus-terminal', 'workspace-herdr-unlink',
   'workspace-import-codex', 'workspace-import-opencode', 'workspace-import-claude',
   'thread-regenerate-title', 'thread-handoff', 'thread-open-tui', 'thread-open-chat',
@@ -15,28 +13,19 @@ test('desktop-tiled chat and daemon terminal panes close from the web; browser p
   const close = { action: 'pane-close', label: 'Close pane' }
   expect(sidebarMenuAvailability(close, pane).disabled).not.toBe(true)
   expect(sidebarMenuAvailability(close, { ...pane, kind: 'terminal', thread_id: undefined, session_id: 's' }).disabled).not.toBe(true)
-  expect(sidebarMenuAvailability(close, { ...pane, kind: 'browser', thread_id: undefined }).label).toContain(DESKTOP_ACTION_REASON)
-  expect(sidebarMenuAvailability(close, { ...pane, kind: 'terminal', thread_id: undefined }).label).toContain(DESKTOP_ACTION_REASON)
+  expect(sidebarMenuAvailability(close, { ...pane, kind: 'browser', thread_id: undefined }).label).toContain('no running session')
+  expect(sidebarMenuAvailability(close, { ...pane, kind: 'terminal', thread_id: undefined }).label).toContain('no running session')
 })
 
-for (const action of unavailable) {
-  test(`${action} is visibly disabled and direct store dispatch reports why without RPC`, async () => {
-    const item = sidebarMenuAvailability({ action, label: 'Action' }, pane)
-    expect(item.disabled).toBe(true)
-    expect(item.label).toContain(DESKTOP_ACTION_REASON)
-    const originalFetch = globalThis.fetch
-    let requests = 0
-    globalThis.fetch = async () => { requests++; throw new Error('No transport allowed') }
-    try {
-      await store.runSidebarContextAction({ action, workspace, pane })
-      expect(store.notice()).toBe(DESKTOP_ACTION_REASON)
-      expect(requests).toBe(0)
-    } finally {
-      globalThis.fetch = originalFetch
-      store.setNotice(null)
+test('former desktop-only actions are enabled in the web client', () => {
+  for (const action of webActions) {
+    for (const target of [pane, { ...pane, native_pane_id: undefined }]) {
+      const item = sidebarMenuAvailability({ action, label: 'Action' }, target)
+      expect(item.disabled).not.toBe(true)
+      expect(item.label).toBe('Action')
     }
-  })
-}
+  }
+})
 
 test('sync calls the daemon contract with the owning workspace, independent of native pane ID', async () => {
   const calls = []
@@ -56,8 +45,8 @@ test('remote, missing and busy sync targets cannot issue a mutation', async () =
   const thread = { local_thread_id: 'local', provider_thread_id: 'provider', title: 'Saved' }
   await expect(requestSidebarThreadSync(call, 'ws', thread, true)).rejects.toThrow('finish')
   await expect(requestSidebarThreadSync(call, 'ws', { ...thread, provider_thread_id: null }, false)).rejects.toThrow('saved provider thread')
-  await expect(requestSidebarThreadSync(call, 'ws', { ...thread, profile_id: 'remote' }, false)).rejects.toThrow('desktop app')
-  expect(sidebarMenuAvailability({ action: 'thread-sync', label: 'Sync thread' }, { ...pane, profile_id: 'remote' }).label).toContain(DESKTOP_ACTION_REASON)
+  await expect(requestSidebarThreadSync(call, 'ws', { ...thread, profile_id: 'remote' }, false)).rejects.toThrow('another machine')
+  expect(sidebarMenuAvailability({ action: 'thread-sync', label: 'Sync thread' }, { ...pane, profile_id: 'remote' }).label).toContain('another machine')
 })
 
 test('sync failures propagate without trying palette.run or transcript upserts', async () => {

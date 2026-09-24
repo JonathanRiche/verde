@@ -728,7 +728,7 @@ describe('requestPaneClose', () => {
   test('native pane identity cannot create a desktop transport route', async () => {
     const response = await requestPaneClose(async () => { throw new Error('unexpected RPC') },
       'workspace-1', { kind: 'chat', native_pane_id: 42 })
-    expect(response.error?.message).toBe('Available in the desktop app')
+    expect(response.error?.message).toBe('This pane has no running session to close.')
   })
 
   test('a daemon terminal session can close even with a native pane identity', async () => {

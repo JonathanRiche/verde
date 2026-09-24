@@ -7,6 +7,7 @@ import {
   matchKeyAction,
   parseWebKeybindConfig,
   type KeyAction,
+  type PrefixCommandPlacement,
   type PrefixTarget,
   type WebKeybindConfig,
 } from './keybinds'
@@ -22,6 +23,11 @@ import { createTranscriptHistory, mergeTranscriptPage, type TranscriptContext, t
 import { dispatchWebCommand, openChatCommandPicker, sidebarActionUnavailableReason, requestSidebarThreadSync, type ChatPickerCommand } from './commands'
 import { requestNewThread, requestWorkspaceCommand } from './command_requests'
 import { createHistoryApi, groupHistory, reconcileHistoryArchives, registerHistoryClient } from './history'
+import {
+  HANDOFF_PROVIDERS, TITLE_PROVIDERS, agentResumeCommand, agentTerminalArgv, agentTuiCommand, buildHandoffPackage,
+  buildHerdrHandoffScript, chainLayouts, herdrPanePlan, openingExchange, parseHerdrLinkMarker, providerLabel,
+  type HandoffContextMode, type HerdrPanePlan,
+} from './web_actions'
 import { createComposerCommands, parseSlashCommand, classifyBangCommand, repositoryCommandPath, type SlashCommandResult } from './composer_commands'
 import { isPlaceholderThreadTitle, makeThreadTitle } from './thread_title'
 import {
@@ -153,6 +159,14 @@ export type SidebarContextAction =
   | 'pane-split-terminal-right'
   | 'pane-split-terminal-down'
   | 'pane-close'
+
+export interface ActionDialogRequest {
+  title: string
+  description?: string
+  submitLabel?: string
+  /// A field without options is a free-text input.
+  fields: Array<{ key: string; label: string; initial?: string; placeholder?: string; options?: Array<{ value: string; label: string }> }>
+}
 
 export interface SidebarContextActionRequest {
   action: SidebarContextAction
@@ -299,22 +313,35 @@ async function interactiveCall(method: string, params: unknown = {}): Promise<Rp
   }
 }
 
+export interface TerminalLaunch {
+  /// argv for the PTY; omitted runs the user's interactive shell.
+  command?: string[]
+  label?: string
+  cwd?: string
+}
+
 export async function requestTerminalOpen(
   call: (method: string, params: unknown) => Promise<RpcEnvelope>,
   workspace: Pick<Workspace, 'workspace_id' | 'path'>,
   session_id: string,
+  launch: TerminalLaunch = {},
 ): Promise<{ response: RpcEnvelope; native: boolean }> {
-  const opened = await call('terminal.open', { workspace_id: workspace.workspace_id })
-  if (!(opened.error || opened.ok === false) || !methodUnavailable(opened)) {
-    return { response: opened, native: true }
+  // A plain shell prefers the desktop's native terminal.open when a desktop
+  // is attached; launches with a command always go straight to the daemon.
+  if (!launch.command) {
+    const opened = await call('terminal.open', { workspace_id: workspace.workspace_id })
+    if (!(opened.error || opened.ok === false) || !methodUnavailable(opened)) {
+      return { response: opened, native: true }
+    }
   }
   return {
     response: await call('session.create', {
       id: session_id,
-      cwd: workspace.path,
+      cwd: launch.cwd ?? workspace.path,
       workspace_path: workspace.path,
       workspace_id: workspace.workspace_id,
-      label: 'Terminal',
+      label: launch.label ?? 'Terminal',
+      ...(launch.command ? { command: launch.command } : {}),
     }),
     native: false,
   }
@@ -332,7 +359,7 @@ export async function requestPaneClose(
     ok: false,
     error: {
       code: 'capability_unavailable',
-      message: 'Available in the desktop app',
+      message: 'This pane has no running session to close.',
     },
   }
 }
@@ -1383,6 +1410,24 @@ export function createAppStore() {
   const [prefixMode, setPrefixMode] = createSignal<'armed' | 'navigate' | null>(null)
   const [prefixHelpVisible, setPrefixHelpVisible] = createSignal(false)
   const [favoriteModels, setFavoriteModels] = createSignal<FavoriteModel[]>([])
+  /// verde.json chat.title_provider / title_model as resolved by the daemon.
+  let titleConfig: { provider: string; model: string | null } = { provider: 'codex', model: null }
+  const [actionDialog, setActionDialog] = createSignal<ActionDialogRequest | null>(null)
+  let actionDialogResolve: ((values: Record<string, string> | null) => void) | null = null
+  /// Show the shared choice dialog and wait for the user's selection.
+  const askAction = (request: ActionDialogRequest): Promise<Record<string, string> | null> => {
+    actionDialogResolve?.(null)
+    return new Promise((resolve) => {
+      actionDialogResolve = resolve
+      setActionDialog(request)
+    })
+  }
+  const resolveActionDialog = (values: Record<string, string> | null) => {
+    const resolve = actionDialogResolve
+    actionDialogResolve = null
+    setActionDialog(null)
+    resolve?.(values)
+  }
   // Snapshot polling can race a user click. Keep the requested final state
   // authoritative until its idempotent config RPC settles.
   const pendingFavoriteModels = new Map<string, boolean>()
@@ -1601,6 +1646,11 @@ export function createAppStore() {
         next_favorites = setFavoriteModelInList(next_favorites, provider, model, favorite)
       }
       setFavoriteModels((prev) => (sameJson(prev, next_favorites) ? prev : next_favorites))
+      const chat_config = asRecord(asRecord(root.config)?.chat)
+      titleConfig = {
+        provider: typeof chat_config?.title_provider === 'string' && chat_config.title_provider ? chat_config.title_provider : 'codex',
+        model: typeof chat_config?.title_model === 'string' && chat_config.title_model ? chat_config.title_model : null,
+      }
     }
     const stored = snapshot.workspaces ?? root.workspaces ?? []
     // The desktop live listing decides which workspaces are open whenever the
@@ -2006,6 +2056,7 @@ export function createAppStore() {
   const composerCommands = createComposerCommands<LivePane>({
     key: (pane) => paneKey(pane.workspace_id, pane.pane_id),
     notice: setNotice,
+    local: (pane, name, args) => runLocalComposerCommand(pane, name, args),
     call: paneRpc,
     context: async (pane) => {
       if (pane.kind !== 'chat') throw new Error('Slash commands require a chat pane.')
@@ -3481,16 +3532,16 @@ export function createAppStore() {
     void refreshProjection({ workspace_id: current.workspace_id })
   }
 
-  const newTerminal = async (workspace_id?: string) => {
+  const newTerminal = async (workspace_id?: string, launch: TerminalLaunch = {}): Promise<string | null> => {
     const ws = workspace_id
       ? workspaces().find((item) => item.workspace_id === workspace_id)
       : workspace()
-    if (!ws) return
+    if (!ws) return null
     const session_id = mintId('web-sess-')
-    const opened = await requestTerminalOpen(interactiveCall, ws, session_id)
+    const opened = await requestTerminalOpen(interactiveCall, ws, session_id, launch)
     if (opened.response.error || opened.response.ok === false) {
       setNotice(opened.response.error?.message ?? 'could not create session')
-      return
+      return null
     }
     if (opened.native) {
       setWorkspaceId(ws.workspace_id)
@@ -3503,7 +3554,7 @@ export function createAppStore() {
         publishPanes(workspaces())
       }
       void refreshProjection({ workspace_id: ws.workspace_id })
-      return
+      return null
     }
     // Instant transition: project the created daemon session as a live pane
     // now; the background snapshot refresh confirms (or corrects) it.
@@ -3513,8 +3564,8 @@ export function createAppStore() {
         session_id,
         workspace_id: ws.workspace_id,
         workspace_path: ws.path,
-        cwd: ws.path,
-        label: 'Terminal',
+        cwd: launch.cwd ?? ws.path,
+        label: launch.label ?? 'Terminal',
         running: true,
       },
     ]
@@ -3522,6 +3573,7 @@ export function createAppStore() {
     setFocusedPaneId(stablePaneId('term', session_id))
     publishPanes(workspaces())
     void refreshProjection({ workspace_id: ws.workspace_id })
+    return session_id
   }
 
   const historyApi = createHistoryApi({
@@ -3594,6 +3646,386 @@ export function createAppStore() {
       workspace_id: current_workspace.workspace_id,
       thread,
     })
+  }
+
+  // ---- Agent TUI, handoff, titles, imports, Herdr, stacks ---------------
+  // Everything below runs through the shared daemon (session.create,
+  // provider.*, chat.thread.upsert, process.*), the same backend the desktop
+  // uses, so none of it depends on a desktop being attached.
+
+  const workspaceById = (workspace_id: string) => workspaces().find((row) => row.workspace_id === workspace_id)
+
+  const localChatOnly = (pane: LivePane): boolean => {
+    if (connectionFor(pane) === 'local') return true
+    setNotice('This chat runs on another machine. Open it from that machine’s Verde.')
+    return false
+  }
+
+  const chatCwdPath = (ws: Workspace, thread: Thread): string => {
+    const relative = thread.repository_cwd?.replace(/^\/+|\/+$/g, '')
+    return relative && (!thread.repository_id || thread.repository_id === 'primary') ? `${ws.path.replace(/\/+$/, '')}/${relative}` : ws.path
+  }
+
+  /// Whole thread transcript, oldest first, bounded to keep huge threads cheap.
+  const fetchThreadMessages = async (workspace_id: string, local_thread_id: string, maxPages = 40): Promise<Message[]> => {
+    let messages: Message[] = []
+    let cursor: string | undefined
+    for (let page = 0; page < maxPages; page++) {
+      const next = await fetchTranscriptPage(interactiveCall, { workspace_id, local_thread_id }, cursor)
+      messages = prependTranscriptPage(next.messages, messages)
+      if (!next.cursor) break
+      cursor = next.cursor
+    }
+    return messages
+  }
+
+  const openAgentTui = async (ws: Workspace, provider: string) => {
+    const base = agentTuiCommand(provider)
+    if (!base) { setNotice(`${providerLabel(provider)} has no terminal UI.`); return }
+    let command = base
+    if (provider === 'codex') {
+      // Same as the desktop: Codex TUIs launch with Verde's managed hooks.
+      const hooks = await interactiveCall('provider.hooks.set', { provider: 'codex', installed: true })
+      if (!rpcFailed(hooks)) command = 'codex -c features.hooks=true'
+    }
+    await newTerminal(ws.workspace_id, { command: agentTerminalArgv(command), label: `${providerLabel(provider)} TUI` })
+  }
+
+  const openThreadInTui = async (ws: Workspace, pane: LivePane) => {
+    if (!localChatOnly(pane)) return
+    const thread = routeThread(pane)
+    const provider = thread.provider ?? pane.provider ?? 'codex'
+    const provider_thread_id = thread.provider_thread_id ?? pane.provider_thread_id
+    if (!provider_thread_id) { setNotice('Send a message first; this chat has no provider thread to resume yet.'); return }
+    const resume = agentResumeCommand(provider, provider_thread_id)
+    if (!resume) { setNotice(`${providerLabel(provider)} chats cannot be resumed in a terminal.`); return }
+    await newTerminal(ws.workspace_id, {
+      command: agentTerminalArgv(resume),
+      label: `${providerLabel(provider)}: ${paneTitle(pane)}`,
+      cwd: chatCwdPath(ws, thread),
+    })
+  }
+
+  const regenerateTitle = async (ws: Workspace, pane: LivePane) => {
+    if (!pane.thread_id || !localChatOnly(pane)) return
+    const messages = await fetchThreadMessages(ws.workspace_id, pane.thread_id, 4)
+    const exchange = openingExchange(messages.length ? messages : transcripts()[paneKey(pane.workspace_id, pane.pane_id)] ?? [])
+    if (!exchange) { setNotice('Title generation needs a first message and a reply.'); return }
+    const provider = (TITLE_PROVIDERS as readonly string[]).includes(titleConfig.provider) ? titleConfig.provider : 'codex'
+    setNotice('Generating title…')
+    const response = await interactiveCall('provider.title.generate', {
+      provider,
+      ...(titleConfig.model ? { model_ref: titleConfig.model } : {}),
+      fast: provider === 'codex',
+      access_mode: 'supervised',
+      cwd: chatCwdPath(ws, routeThread(pane)),
+      user_text: exchange.user,
+      assistant_text: exchange.assistant,
+    })
+    const result = unwrapResult<{ title?: string | null; error_message?: string | null }>(response)
+    const title = result?.title?.trim()
+    if (rpcFailed(response) || !title) {
+      setNotice(response.error?.message ?? result?.error_message ?? 'Could not generate a title.')
+      return
+    }
+    await runSidebarContextAction({ action: 'thread-rename', workspace: ws, pane, value: title })
+    setNotice(null)
+  }
+
+  const handoffThread = async (ws: Workspace, pane: LivePane) => {
+    if (!pane.thread_id) return
+    const thread = routeThread(pane)
+    const source_provider = thread.provider ?? pane.provider ?? 'codex'
+    const targets = HANDOFF_PROVIDERS.filter((provider) => provider !== source_provider)
+    const choice = await askAction({
+      title: 'Handoff to another agent',
+      description: 'Verde fills the new agent’s prompt with this chat’s context. Review it before sending.',
+      submitLabel: 'Prepare handoff',
+      fields: [
+        { key: 'provider', label: 'Agent', options: [...targets, source_provider].map((value) => ({ value, label: providerLabel(value) })) },
+        { key: 'surface', label: 'Open as', options: [{ value: 'chat', label: 'Chat pane' }, { value: 'tui', label: 'Terminal UI' }] },
+        { key: 'mode', label: 'Context', options: [
+          { value: 'summary', label: 'Summary (first ask, latest exchange)' },
+          { value: 'recent', label: 'Recent messages' },
+          { value: 'full', label: 'Full transcript' },
+        ] },
+      ],
+    })
+    if (!choice) return
+    const provider = choice.provider ?? targets[0] ?? 'codex'
+    const messages = (await fetchThreadMessages(ws.workspace_id, pane.thread_id))
+      .filter((message) => !message.tool_call_id && message.body.trim())
+    const listed = await interactiveCall('process.list', { workspace: { workspace_id: ws.workspace_id, workspace_path: ws.path } })
+    const processes = (unwrapResult<{ processes?: Array<{ id: string; name?: string; command?: string; status?: string; kind?: string }> }>(listed)?.processes ?? [])
+      .filter((row) => row.status === 'running' && !row.id.startsWith('turn:'))
+      .map((row) => `- ${row.name || row.id}: ${row.command ?? ''}`.trimEnd())
+      .join('\n')
+    const preview = buildHandoffPackage({
+      workspace_id: ws.workspace_id,
+      workspace_label: ws.label,
+      workspace_path: ws.path,
+      pane_id: pane.native_pane_id ?? pane.pane_id,
+      source_provider,
+      verde_thread_id: pane.thread_id,
+      provider_thread_id: thread.provider_thread_id ?? pane.provider_thread_id,
+      title: paneTitle(pane),
+      messages,
+      process_context: processes,
+      context_mode: (choice.mode as HandoffContextMode) ?? 'summary',
+    })
+    if (choice.surface === 'tui') {
+      const base = agentTuiCommand(provider)
+      if (!base) { setNotice(`${providerLabel(provider)} has no terminal UI.`); return }
+      const session_id = await newTerminal(ws.workspace_id, { command: agentTerminalArgv(base), label: `${providerLabel(provider)} handoff`, cwd: chatCwdPath(ws, thread) })
+      if (!session_id) return
+      // Bracketed paste, not submitted: the review/edit step stays with the user.
+      await interactiveCall('session.write', { id: session_id, text: `\x1b[200~${preview}\x1b[201~` })
+      setNotice('Handoff pasted into the terminal. Review and edit it before sending.')
+      return
+    }
+    const pane_id = await createHeadlessThread(ws, provider)
+    if (pane_id == null) return
+    setWorkspaceId(ws.workspace_id)
+    setFocusedPaneId(pane_id)
+    publishPanes(workspaces())
+    const target = (panesByWorkspace()[ws.workspace_id] ?? []).find((row) => row.pane_id === pane_id)
+    if (target) setDraftFor(target, preview)
+    setComposerNonce((value) => value + 1)
+    void refreshProjection({ workspace_id: ws.workspace_id })
+    setNotice('Handoff prepared. Review and edit it before sending.')
+  }
+
+  const importProviderThread = async (ws: Workspace, provider: string) => {
+    setNotice(`Loading ${providerLabel(provider)} threads…`)
+    const listed = await interactiveCall('provider.threads.list', { provider, project_path: ws.path })
+    const rows = unwrapResult<{ threads?: Array<{ id: string; title: string }> }>(listed)?.threads ?? []
+    if (rpcFailed(listed)) { setNotice(listed.error?.message ?? `Could not list ${providerLabel(provider)} threads.`); return }
+    setNotice(null)
+    const known = new Set((threadsByWorkspace()[ws.workspace_id] ?? []).map((row) => row.provider_thread_id).filter(Boolean))
+    const importable = rows.filter((row) => row.id && !known.has(row.id))
+    if (importable.length === 0) {
+      setNotice(rows.length ? `Every ${providerLabel(provider)} thread here is already in Verde.` : `No ${providerLabel(provider)} threads found for this workspace.`)
+      return
+    }
+    const choice = await askAction({
+      title: `Import ${providerLabel(provider)} thread`,
+      submitLabel: 'Import',
+      fields: [{ key: 'thread', label: 'Thread', options: importable.slice(0, 200).map((row) => ({ value: row.id, label: row.title || row.id })) }],
+    })
+    const picked = importable.find((row) => row.id === choice?.thread)
+    if (!picked) return
+    const client_id = await ensureClientId()
+    const local_thread_id = mintId('web-thread-')
+    const title = picked.title || `${providerLabel(provider)} thread`
+    const created = await interactiveCall('chat.thread.upsert', {
+      mutation: { request_key: `web:thread.import:${local_thread_id}`, client_id },
+      workspace_id: ws.workspace_id,
+      thread: {
+        local_thread_id, title, committed: true, profile_id: 'local', repository_id: 'primary',
+        provider, harness: 'local_cli', access_mode: 'full_access',
+        provider_thread_id: picked.id, last_activity_at: Math.floor(Date.now() / 1000),
+      },
+    })
+    if (!callSucceeded(created, 'Could not import the thread.')) return
+    const synced = await interactiveCall('provider.thread.sync', {
+      workspace_id: ws.workspace_id, local_thread_id, provider_thread_id: picked.id,
+    })
+    callSucceeded(synced, 'Imported the thread, but its history could not be loaded yet. Use “Sync thread” to retry.')
+    localThreadIds.add(local_thread_id)
+    await refreshProjection({ workspace_id: ws.workspace_id })
+    const pane = (panesByWorkspace()[ws.workspace_id] ?? []).find((row) => row.thread_id === local_thread_id)
+    if (pane) { focusPane(pane); void loadTranscript(pane, true) }
+  }
+
+  const saveHerdrLink = async (ws: Workspace, link: Record<string, unknown> | null) => {
+    const current = workspaceById(ws.workspace_id) ?? ws
+    const metadata: Record<string, unknown> = { ...current, herdr_link: link }
+    delete metadata.threads
+    delete metadata.messages
+    const response = await interactiveCall('workspace.upsert', {
+      mutation: { request_key: `web:workspace.herdr:${ws.workspace_id}:${mintId('')}`, client_id: await ensureClientId() },
+      workspace: metadata,
+    })
+    if (!callSucceeded(response, 'Could not save the Herdr link.')) return false
+    setWorkspaces((prev) => prev.map((row) => row.workspace_id === ws.workspace_id ? { ...row, herdr_link: link as Workspace['herdr_link'] } : row))
+    liveWorkspaces = null
+    void refreshProjection({ workspace_id: ws.workspace_id })
+    return true
+  }
+
+  const herdrSession = (ws: Workspace) => ws.herdr_link?.session_name || 'default'
+
+  const focusHerdrTerminal = async (ws: Workspace) => {
+    const existing = openPanes().find((pane) =>
+      pane.kind === 'terminal' && pane.workspace_id === ws.workspace_id && pane.running !== false &&
+      lastSessions.some((row) => sessionKey(row) === pane.session_id && row.label === 'Herdr'))
+    if (existing) { focusPane(existing); return }
+    await newTerminal(ws.workspace_id, { command: ['/bin/sh', '-lc', 'exec "${HERDR_BIN:-herdr}" --session "$1"', 'verde-herdr', herdrSession(ws)], label: 'Herdr' })
+  }
+
+  const handoffToHerdr = async (ws: Workspace) => {
+    const groups = paneGroups().filter((group) => group.panes.some((pane) => pane.workspace_id === ws.workspace_id))
+    const plans = new Map<number, HerdrPanePlan>()
+    for (const group of groups) for (const pane of group.panes) plans.set(pane.pane_id, herdrPanePlan(pane, paneTitle(pane)))
+    const session = herdrSession(ws)
+    const script = buildHerdrHandoffScript({
+      session, label: ws.label, cwd: ws.path,
+      existing_workspace_id: ws.herdr_link?.workspace_id,
+      layout: chainLayouts(groups.map((group) => group.layout)),
+      panes: plans,
+    })
+    const session_id = await newTerminal(ws.workspace_id, { command: ['/bin/sh', '-c', script], label: 'Herdr' })
+    if (!session_id) return
+    setNotice('Handing off to Herdr…')
+    // The script prints one marker line with the Herdr ids before attaching.
+    for (let attempt = 0; attempt < 60; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 500))
+      const tail = unwrapResult<{ text?: string; running?: boolean }>(await interactiveCall('session.tail', { id: session_id, max_bytes: 64 * 1024 }))
+      const marker = parseHerdrLinkMarker(tail?.text ?? '')
+      if (marker) {
+        await saveHerdrLink(ws, {
+          session_name: session, workspace_id: marker.workspace_id, local_dir: ws.path,
+          last_pane_id: marker.pane_id, updated_at_ms: Date.now(),
+        })
+        setNotice('Workspace handed off to Herdr.')
+        return
+      }
+      if (tail?.running === false) break
+    }
+    setNotice('Herdr handoff did not finish. Check the Herdr terminal for details.')
+  }
+
+  /// `/stack` and `/process` from the composer, via the daemon's registry.
+  const runStackCommand = async (ws: Workspace, root: '/stack' | '/process', args: string[]) => {
+    const workspace_ref = { workspace_id: ws.workspace_id, workspace_path: ws.path }
+    const [action, name] = args
+    const usage = root === '/stack' ? 'Usage: /stack start|stop|restart|status' : 'Usage: /process start|stop|restart|focus|crashed <name>'
+    const listProcesses = async () => {
+      const response = await interactiveCall('process.list', { workspace: workspace_ref })
+      if (rpcFailed(response)) throw new Error(response.error?.message ?? 'Could not list processes.')
+      return (unwrapResult<{ processes?: Array<{ id: string; name: string; source?: string; status?: string; owner_session_id?: string | null }> }>(response)?.processes ?? [])
+        .filter((row) => row.source === 'managed' || row.source === undefined)
+    }
+    const definitions = async () => {
+      const response = await interactiveCall('process.definitions', { workspace: workspace_ref })
+      if (rpcFailed(response)) throw new Error(response.error?.message ?? 'Could not read verde.toml.')
+      return unwrapResult<{ definitions?: Array<{ name: string }> }>(response)?.definitions ?? []
+    }
+    const start = async (process_name: string) => callSucceeded(await interactiveCall('process.start', { workspace: workspace_ref, name: process_name }), `Could not start ${process_name}.`)
+    const restart = async (process_name: string) => callSucceeded(await interactiveCall('process.restart', { workspace: workspace_ref, name: process_name }), `Could not restart ${process_name}.`)
+    const stop = async (process_id: string) => callSucceeded(await interactiveCall('process.stop', { workspace: workspace_ref, process_id }), 'Could not stop the process.')
+    const refresh = () => void refreshProjection({ workspace_id: ws.workspace_id })
+    if (root === '/stack') {
+      if (action === 'status') {
+        const [defs, running] = await Promise.all([definitions(), listProcesses()])
+        const live = running.filter((row) => row.status === 'running' || row.status === 'starting').length
+        setNotice(`Stack has ${defs.length} configured process(es); ${live} running.`)
+        return
+      }
+      if (action === 'start' || action === 'restart') {
+        const defs = await definitions()
+        if (defs.length === 0) { setNotice('No processes are configured in this workspace’s verde.toml.'); return }
+        let count = 0
+        for (const def of defs) if (await (action === 'start' ? start(def.name) : restart(def.name))) count++
+        setNotice(`Stack ${action}: ${count} process(es).`)
+        refresh()
+        return
+      }
+      if (action === 'stop') {
+        const running = (await listProcesses()).filter((row) => row.status === 'running' || row.status === 'starting')
+        let count = 0
+        for (const row of running) if (await stop(row.id)) count++
+        setNotice(`Stack stop: ${count} process(es).`)
+        refresh()
+        return
+      }
+      setNotice(usage)
+      return
+    }
+    if (action === 'crashed') {
+      const crashed = (await listProcesses()).filter((row) => row.status === 'crashed' || row.status === 'failed').length
+      setNotice(`${crashed} crashed process(es).`)
+      return
+    }
+    if (!name || !['start', 'stop', 'restart', 'focus'].includes(action ?? '')) { setNotice(usage); return }
+    if (action === 'start') { if (await start(name)) setNotice(`Started ${name}.`); refresh(); return }
+    if (action === 'restart') { if (await restart(name)) setNotice(`Restarted ${name}.`); refresh(); return }
+    const row = (await listProcesses()).find((process) => process.name === name)
+    if (!row) { setNotice(`No process named ${name} is running.`); return }
+    if (action === 'stop') { if (await stop(row.id)) setNotice(`Stopped ${name}.`); refresh(); return }
+    const pane = openPanes().find((candidate) => candidate.kind === 'terminal' && candidate.session_id && candidate.session_id === row.owner_session_id)
+    if (pane) focusPane(pane)
+    else setNotice(`${name} has no open terminal pane.`)
+  }
+
+  /// Local composer commands (/handoff, /stack, /process).
+  const runLocalComposerCommand = async (pane: LivePane, name: string, args: string): Promise<boolean> => {
+    const ws = workspaceById(paneOwningWorkspaceId(pane))
+    if (!ws) return false
+    const parts = args.split(/[ \t\r\n]+/).filter(Boolean)
+    if (name === '/handoff') {
+      if (parts.length) { setNotice('Usage: /handoff'); return false }
+      await handoffThread(ws, pane)
+      return true
+    }
+    if (name === '/stack' || name === '/process') {
+      await runStackCommand(ws, name, parts)
+      return true
+    }
+    return false
+  }
+
+  /// User-defined prefix commands: same launch shape as the desktop's
+  /// `prefixCommandLaunchProfile` (`sh -lc <script> verde-prefix-command <path>`).
+  const runPrefixCommand = async (script: string, placement: PrefixCommandPlacement | undefined) => {
+    const ws = workspace()
+    if (!ws) { setNotice('Select a workspace first.'); return }
+    const focused = focusedPane()
+    if (placement === 'terminal' && focused?.kind === 'terminal' && focused.session_id) {
+      await interactiveCall('session.write', { id: focused.session_id, text: `${script}\r` })
+      return
+    }
+    const command = ['sh', '-lc', script, 'verde-prefix-command', ws.path]
+    if (!placement || placement === 'background') {
+      // Background commands still run as a daemon session so their output
+      // stays inspectable; focus is left where it was.
+      const previous = focusedPaneId()
+      await newTerminal(ws.workspace_id, { command, label: script.slice(0, 40) })
+      setFocusedPaneId(previous)
+      publishPanes(workspaces())
+      return
+    }
+    await newTerminal(ws.workspace_id, { command: [...command.slice(0, 2), `${script}; exec "\${SHELL:-/bin/sh}" -i`, ...command.slice(3)], label: script.slice(0, 40) })
+  }
+
+  /// The web client already runs in a browser, so the browser pane becomes
+  /// a real browser tab.
+  const openBrowserTab = async () => {
+    const choice = await askAction({
+      title: 'Open in browser',
+      submitLabel: 'Open',
+      fields: [{ key: 'url', label: 'Address', placeholder: 'localhost:3000 or https://…' }],
+    })
+    const raw = choice?.url?.trim()
+    if (!raw) return
+    const url = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `${/^(localhost|127\.|\[::1\])/.test(raw) ? 'http' : 'https'}://${raw}`
+    window.open(url, '_blank', 'noopener')
+  }
+
+  /// Quick terminal: one reusable scratch shell per workspace, toggled.
+  const toggleQuickTerminal = async () => {
+    const ws = workspace()
+    if (!ws) return
+    const quick = openPanes().find((pane) => pane.kind === 'terminal' && pane.workspace_id === ws.workspace_id &&
+      lastSessions.some((row) => sessionKey(row) === pane.session_id && row.label === 'Quick terminal'))
+    if (!quick) { await newTerminal(ws.workspace_id, { command: [], label: 'Quick terminal' }); return }
+    if (focusedPaneId() === quick.pane_id) {
+      const other = openPanes().find((pane) => pane.pane_id !== quick.pane_id)
+      if (other) focusPane(other)
+      if (maximizedPaneId() === quick.pane_id) setMaximizedPaneId(null)
+      return
+    }
+    focusPane(quick)
   }
 
   const closePane = async (target?: LivePane) => {
@@ -3672,10 +4104,7 @@ export function createAppStore() {
   const openSubagent = async (pane: LivePane, message: Message) => {
     const current_workspace = workspaces().find((item) => item.workspace_id === paneOwningWorkspaceId(pane))
     if (!current_workspace) return
-    if (pane.native_pane_id == null) {
-      setNotice('Opening a subagent pane requires the desktop runtime.')
-      return
-    }
+    if (pane.native_pane_id == null) return
     setNotice(null)
     const response = await interactiveCall('chat.open_subagent', {
       workspace_id: current_workspace.workspace_id,
@@ -3691,8 +4120,13 @@ export function createAppStore() {
     }
   }
 
-  const splitFocusedPane = async (_kind: 'chat' | 'terminal', _axis: 'vertical' | 'horizontal') => {
-    setNotice(sidebarActionUnavailableReason('pane-split-chat-right'))
+  /// The web canvas lays panes out itself, so a split opens the new pane
+  /// next to the focused one in the strip.
+  const splitFocusedPane = async (kind: 'chat' | 'terminal', _axis: 'vertical' | 'horizontal') => {
+    const ws = workspace()
+    if (!ws) return
+    if (kind === 'chat') await newThread(ws.workspace_id)
+    else await newTerminal(ws.workspace_id)
   }
 
   const resizePaneSplit = async (
@@ -3792,6 +4226,43 @@ export function createAppStore() {
           }
           return
         }
+        case 'workspace-open-codex-tui':
+          await openAgentTui(current_workspace, 'codex')
+          return
+        case 'workspace-import-codex':
+        case 'workspace-import-opencode':
+        case 'workspace-import-claude':
+          await importProviderThread(current_workspace, action.slice('workspace-import-'.length))
+          return
+        case 'workspace-herdr-handoff':
+          await handoffToHerdr(current_workspace)
+          return
+        case 'workspace-herdr-focus-terminal':
+          await focusHerdrTerminal(current_workspace)
+          return
+        case 'workspace-herdr-unlink':
+          if (await saveHerdrLink(current_workspace, null)) setNotice('Workspace unlinked from Herdr; it runs locally again.')
+          return
+        case 'thread-regenerate-title':
+          if (pane) await regenerateTitle(current_workspace, pane)
+          return
+        case 'thread-handoff':
+          if (pane) await handoffThread(current_workspace, pane)
+          return
+        case 'thread-open-tui':
+          if (pane) await openThreadInTui(current_workspace, pane)
+          return
+        case 'thread-open-chat':
+          if (pane) focusPane(pane)
+          return
+        case 'pane-split-chat-right':
+        case 'pane-split-chat-down':
+          await newThread(current_workspace.workspace_id)
+          return
+        case 'pane-split-terminal-right':
+        case 'pane-split-terminal-down':
+          await newTerminal(current_workspace.workspace_id)
+          return
         case 'pane-zoom':
           if (pane) await maximizePane(pane)
           return
@@ -3904,9 +4375,7 @@ export function createAppStore() {
 
   const dispatchPrefixTarget = (target: PrefixTarget) => {
     if ('command' in target) {
-      setNotice(target.in
-        ? 'Custom prefix pane commands run from the desktop app only.'
-        : 'Custom prefix shell commands run from the desktop app only.')
+      void runPrefixCommand(target.command, target.in)
       return
     }
     const action = target.action
@@ -4102,6 +4571,19 @@ export function createAppStore() {
         'workspace.next': () => stepWorkspace(1),
         'app.settings': () => setSettingsOpen(true),
         'app.sidebar': () => dispatchAction('toggle_sidebar'),
+        'thread.handoff': () => handoffThread(workspaceById(paneOwningWorkspaceId(pane!)) ?? current!, pane!),
+        'thread.open_tui': () => openThreadInTui(workspaceById(paneOwningWorkspaceId(pane!)) ?? current!, pane!),
+        'thread.regenerate_title': () => regenerateTitle(workspaceById(paneOwningWorkspaceId(pane!)) ?? current!, pane!),
+        'workspace.open_codex_tui': () => openAgentTui(current!, 'codex'),
+        // Terminal editor in the workspace: the browser can't raise a GUI
+        // editor window on the host.
+        'workspace.open_editor': () => newTerminal(current!.workspace_id, { command: agentTerminalArgv('${VISUAL:-${EDITOR:-nvim}} .'), label: 'Editor' }),
+        'pane.quick_toggle': toggleQuickTerminal,
+        'pane.browser': openBrowserTab,
+        'pane.split_chat_right': () => splitFocusedPane('chat', 'vertical'),
+        'pane.split_chat_down': () => splitFocusedPane('chat', 'horizontal'),
+        'pane.split_terminal_right': () => splitFocusedPane('terminal', 'vertical'),
+        'pane.split_terminal_down': () => splitFocusedPane('terminal', 'horizontal'),
       },
     })
   }
@@ -4297,6 +4779,8 @@ export function createAppStore() {
     providerModels,
     ensureProviderModels,
     runSidebarContextAction,
+    actionDialog,
+    resolveActionDialog,
     runCommand,
     shouldHandleKey,
     handleKey,

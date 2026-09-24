@@ -13,9 +13,9 @@ export interface SlashCommand {
 }
 
 export const LOCAL_COMMANDS: readonly SlashCommand[] = [
-  { id: 'handoff', name: '/handoff', summary: 'Hand off this chat (desktop only).', usage: '/handoff', requires_thread: true, local: true, availability: 'unsupported' },
-  { id: 'stack', name: '/stack', summary: 'Manage workspace processes (desktop only).', usage: '/stack start|stop|restart|status', requires_thread: false, local: true, availability: 'unsupported' },
-  { id: 'process', name: '/process', summary: 'Control a managed process (desktop only).', usage: '/process start|stop|restart|focus|crashed <name>', requires_thread: false, local: true, availability: 'unsupported' },
+  { id: 'handoff', name: '/handoff', summary: 'Hand off this chat to another agent.', usage: '/handoff', requires_thread: true, local: true, availability: 'available' },
+  { id: 'stack', name: '/stack', summary: 'Manage the workspace stack from verde.toml.', usage: '/stack start|stop|restart|status', requires_thread: false, local: true, availability: 'available' },
+  { id: 'process', name: '/process', summary: 'Control one managed process.', usage: '/process start|stop|restart|focus|crashed <name>', requires_thread: false, local: true, availability: 'available' },
 ]
 
 export type ParsedSlash =
@@ -116,6 +116,8 @@ export function createComposerCommands<Pane>(deps: {
   context: (pane: Pane) => Promise<ComposerCommandContext>
   call: (pane: Pane, method: string, params: unknown) => Promise<RpcEnvelope>
   notice: (message: string | null) => void
+  /** Runs /handoff, /stack, /process; resolves whether the command ran. */
+  local?: (pane: Pane, name: string, args: string) => Promise<boolean>
 }, debounceMs = 150) {
   const searches = new Map<string, () => void>()
   async function request<T>(pane: Pane, method: string, params: unknown): Promise<T> {
@@ -139,7 +141,10 @@ export function createComposerCommands<Pane>(deps: {
     deps.notice(null)
     try {
       const preliminary = parseSlashCommand(draft)
-      if (preliminary.kind === 'local') throw new Error(`${preliminary.name} is only available in the desktop app.`)
+      if (preliminary.kind === 'local') {
+        if (!deps.local) throw new Error(`${preliminary.name} is unavailable here.`)
+        return { handled: await deps.local(pane, preliminary.name, preliminary.args) }
+      }
       if (preliminary.kind === 'prompt' || preliminary.kind === 'literal') throw new Error('This is a chat prompt, not a slash command.')
       const context = await deps.context(pane)
       const parsed = parseSlashCommand(draft, await catalog(pane, context))

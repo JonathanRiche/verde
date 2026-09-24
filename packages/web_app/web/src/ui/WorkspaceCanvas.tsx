@@ -295,7 +295,7 @@ function PaneFrame(props: { pane: LivePane }) {
       </Show>
       <Show when={props.pane.kind === 'browser'}>
         <div class="grid flex-1 place-items-center px-6 text-center text-[13px] text-[var(--text-subtle)]">
-          Browser panes stay on the desktop runtime.
+          This browser pane renders in the Verde window on the host machine. Use “Open in browser” from the command palette to browse here.
         </div>
       </Show>
     </div>

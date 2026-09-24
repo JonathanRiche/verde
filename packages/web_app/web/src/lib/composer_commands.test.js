@@ -73,11 +73,18 @@ test('provider commands execute on the supplied pane with provider thread identi
   expect(f.calls[1]).toEqual({ pane: 'remote-pane', method: 'provider.slash.run', params: { provider: 'codex', project_path: '/repo', thread_id: 'provider-thread', command: 'compact', raw_text: '/compact please', args: 'please' } })
 })
 
-test('desktop local commands never call a provider', async () => {
-  const f = fixture()
-  expect(await f.api.submitSlashCommand('pane', '/handoff')).toBeNull()
-  expect(f.calls).toEqual([])
-  expect(f.notices.at(-1)).toContain('desktop')
+test('local commands run through the local handler and never call a provider', async () => {
+  const calls = [], local = []
+  const api = createComposerCommands({
+    key: (pane) => pane,
+    context: async () => ({ provider: 'codex', project_path: '/repo', thread_id: 'id' }),
+    call: async (pane, method) => { calls.push(method); return catalog() },
+    notice: () => {},
+    local: async (pane, name, args) => { local.push([pane, name, args]); return true },
+  }, 1)
+  expect(await api.submitSlashCommand('pane', '/stack restart web')).toEqual({ handled: true })
+  expect(local).toEqual([['pane', '/stack', 'restart web']])
+  expect(calls.every((method) => method !== 'provider.slash.run')).toBe(true)
 })
 
 test('disabled, unknown and thread-required commands never execute', async () => {

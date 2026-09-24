@@ -61,7 +61,6 @@ interface PaletteItem {
   keys?: string
   /// Muted trailing label (pane kind, "active").
   hint?: string
-  desktop?: boolean
   disabled?: boolean
 }
 
@@ -81,15 +80,11 @@ export function Palette() {
   const results = createMemo(() => {
     const needle = query().trim().toLowerCase()
     const has_workspace = Boolean(store.workspace())
-    const desktop_pane = store.focusedPane()?.native_pane_id != null
     const commands: PaletteItem[] = COMMANDS.map((command) => ({
       id: command.id,
-      // The catalog suffixes desktop-only titles; the row shows a tag instead.
-      title: command.title.replace(/ \(desktop\)$/, ''),
+      title: command.title,
       section: sectionOf(command.id),
       keys: command.hint || undefined,
-      desktop: command.desktop,
-      disabled: command.desktop && !desktop_pane,
     }))
     const history: PaletteItem = { id: HISTORY_COMMAND, title: 'History', section: 'threads', disabled: !has_workspace }
     const panes: PaletteItem[] = [
@@ -252,7 +247,6 @@ export function Palette() {
                     role="option"
                     aria-selected={index() === active()}
                     aria-disabled={item.disabled}
-                    title={item.disabled && item.desktop ? 'Needs a focused pane in the running desktop app' : undefined}
                     class={`palette-row ${index() === active() ? 'palette-row-active' : ''} ${item.disabled ? 'palette-row-disabled' : ''}`}
                     onMouseMove={() => {
                       if (!item.disabled && active() !== index()) setActive(index())
@@ -260,9 +254,6 @@ export function Palette() {
                     onClick={() => run(item)}
                   >
                     <span class="min-w-0 flex-1 truncate">{item.title}</span>
-                    <Show when={item.desktop}>
-                      <span class="palette-tag">Desktop</span>
-                    </Show>
                     <Show when={item.hint}>
                       <span class="mono shrink-0 text-[10px] text-[var(--text-subtle)]">{item.hint}</span>
                     </Show>

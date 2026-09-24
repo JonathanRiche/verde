@@ -2943,6 +2943,7 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, store_protocol.METHOD_CONFIG_UI_SET)) return try self.configUiSetResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_WORKSPACE_RESOLVE)) return try self.workspaceResolveResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_PROCESS_LIST)) return try self.processListResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.registry.METHOD_PROCESS_DEFINITIONS)) return try self.processDefinitionsResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_PROCESS_INSPECT)) return try self.processInspectResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_PROCESS_WAIT)) return try self.processWaitResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_PROCESS_LOGS)) return try self.processLogsResponse(id_value, params);
@@ -4935,6 +4936,47 @@ pub const Daemon = struct {
         try writeRegistryEnvelope(&s, self);
         try s.objectField("workspace");
         try writeWorkspaceInfo(&s, self, workspace);
+        try s.endObject();
+        try s.endObject();
+        return try writer.toOwnedSlice();
+    }
+
+    /// Stack definitions from the workspace's `verde.toml`. The file is
+    /// small and bounded (256 KiB), so it is read inline like process.list.
+    fn processDefinitionsResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        const workspace = self.resolveWorkspaceFromParams(params) catch |err| return self.registryErrorResponse(id_value, err);
+        const fields = workspaceRefFields(params) catch return self.registryErrorResponse(id_value, error.InvalidParams);
+        const workspace_path = workspace.canonical_path orelse fields.workspace_path orelse
+            return self.registryErrorResponse(id_value, error.WorkspacePathRequired);
+        const loaded = stack.loadFromProject(self.allocator, workspace_path) catch |err|
+            return try errorResponseAlloc(self.allocator, id_value, "config_unavailable", @errorName(err));
+        var config = loaded orelse return try okValueResponse(self.allocator, id_value, .{
+            .workspace_id = workspace.id,
+            .config_path = @as(?[]const u8, null),
+            .definitions = &[_]struct { name: []const u8, command: []const u8 }{},
+        });
+        defer config.deinit(self.allocator);
+        var writer: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer writer.deinit();
+        var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+        try beginOk(&s, id_value);
+        try s.objectField("result");
+        try s.beginObject();
+        try s.objectField("workspace_id");
+        try s.write(workspace.id);
+        try s.objectField("config_path");
+        try s.write(config.path);
+        try s.objectField("definitions");
+        try s.beginArray();
+        for (config.processes.items) |definition| {
+            try s.beginObject();
+            try s.objectField("name");
+            try s.write(definition.name);
+            try s.objectField("command");
+            try s.write(definition.command);
+            try s.endObject();
+        }
+        try s.endArray();
         try s.endObject();
         try s.endObject();
         return try writer.toOwnedSlice();
@@ -11193,7 +11235,11 @@ fn configSnapshotFromApp(allocator: std.mem.Allocator, config: *const app_config
                 .chrome = config.reduced_motion.chrome,
             },
         },
-        .chat = .{ .favorite_models = favorites },
+        .chat = .{
+            .favorite_models = favorites,
+            .title_provider = @tagName(config.chat_title_provider),
+            .title_model = config.chatTitleModel(),
+        },
     };
 }
 

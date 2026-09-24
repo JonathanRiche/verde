@@ -535,6 +535,10 @@ pub const ConfigFavoriteModel = struct {
 
 pub const ConfigChatSnapshot = struct {
     favorite_models: []const ConfigFavoriteModel = &.{},
+    /// Resolved `chat.title_provider` / `chat.title_model`, so detached
+    /// clients regenerate titles with the same model as the desktop.
+    title_provider: []const u8 = "codex",
+    title_model: []const u8 = "",
 };
 
 pub const ConfigSnapshot = struct {

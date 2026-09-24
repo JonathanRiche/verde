@@ -785,19 +785,18 @@ function contextMenuItems(target: SidebarMenuTarget): MenuItem[] {
 
   const pane = target.pane
   if (target.kind === 'terminal') {
-    const desktop_only_disabled = pane.native_pane_id == null
-    const close_disabled = desktop_only_disabled && !pane.session_id
+    const close_disabled = pane.native_pane_id == null && !pane.session_id
     return ([
       paneZoomItem(pane),
-      { action: 'pane-split-chat-right', label: 'Split with chat to right', disabled: desktop_only_disabled },
-      { action: 'pane-split-chat-down', label: 'Split with chat below', disabled: desktop_only_disabled },
-      { action: 'pane-split-terminal-right', label: 'Split with terminal to right', disabled: desktop_only_disabled },
-      { action: 'pane-split-terminal-down', label: 'Split with terminal below', disabled: desktop_only_disabled },
+      { action: 'pane-split-chat-right', label: 'Split with chat to right' },
+      { action: 'pane-split-chat-down', label: 'Split with chat below' },
+      { action: 'pane-split-terminal-right', label: 'Split with terminal to right' },
+      { action: 'pane-split-terminal-down', label: 'Split with terminal below' },
       { action: 'pane-close', label: 'Close pane', disabled: close_disabled, danger: true },
     ] satisfies MenuItem[]).map((item) => sidebarMenuAvailability(item, pane))
   }
   const busy = paneIsActive(pane)
-  const desktop_only_disabled = pane.native_pane_id == null
+  const remote = store.connectionFor(pane) !== 'local'
   const provider = pane.provider === 'opencode'
     ? 'OpenCode'
     : pane.provider === 'claude'
@@ -814,12 +813,11 @@ function contextMenuItems(target: SidebarMenuTarget): MenuItem[] {
   return ([
     paneZoomItem(pane),
     { action: 'thread-rename', label: 'Rename chat', disabled: !pane.thread_id },
-    { action: 'thread-regenerate-title', label: 'Regenerate title', disabled: busy || desktop_only_disabled },
-    { action: 'thread-sync', label: 'Sync thread', disabled: busy || !pane.thread_id || !pane.provider_thread_id || store.connectionFor(pane) !== 'local' },
-    { action: 'thread-handoff', label: 'Handoff to another agent', disabled: busy || desktop_only_disabled },
-    { action: 'thread-open-tui', label: `Open in TUI: ${provider}`, disabled: busy || desktop_only_disabled || !pane.provider_thread_id },
-    // Desktop-hosted chat panes are gated by sidebarMenuAvailability; daemon-only
-    // chats close through chat.thread.close.
+    { action: 'thread-regenerate-title', label: 'Regenerate title', disabled: busy || !pane.thread_id || remote },
+    { action: 'thread-sync', label: 'Sync thread', disabled: busy || !pane.thread_id || !pane.provider_thread_id || remote },
+    { action: 'thread-handoff', label: 'Handoff to another agent', disabled: busy || !pane.thread_id },
+    { action: 'thread-open-tui', label: `Open in TUI: ${provider}`, disabled: busy || !pane.provider_thread_id || remote },
+    // Chats close through chat.thread.close.
     { action: 'pane-close', label: 'Close pane', danger: true },
   ] satisfies MenuItem[]).map((item) => sidebarMenuAvailability(item, { ...pane, profile_id: store.connectionFor(pane) }))
 }

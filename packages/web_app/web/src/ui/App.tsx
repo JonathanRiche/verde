@@ -7,6 +7,7 @@ import { FileViewer, fileViewerOpen } from './FileViewer'
 import { History, historyOpen } from './History'
 import { Icon } from './Icons'
 import { Palette, Settings, WorkspaceDialog } from './Overlays'
+import { ActionDialog } from './ActionDialog'
 import { PrefixBar } from './PrefixBar'
 import { PaneActionsButton, Sidebar } from './Sidebar'
 import { WorkspaceCanvas } from './WorkspaceCanvas'
@@ -86,6 +87,7 @@ export function App() {
       <Palette />
       <Settings />
       <WorkspaceDialog />
+      <ActionDialog />
       <History />
       <FileViewer />
       <NoticeToast />

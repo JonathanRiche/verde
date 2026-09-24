@@ -624,6 +624,13 @@ function CommandCard(props: { message: Message; child?: boolean; pane?: LivePane
     event.stopPropagation()
     const pane = props.pane
     if (!pane) return
+    // A desktop-tiled chat opens the child as its own pane; otherwise show
+    // the subagent's full transcript right here.
+    if (pane.native_pane_id == null) {
+      if (!expanded()) toggleExpanded()
+      if (!showAll()) toggleShowAll()
+      return
+    }
     void store.openSubagent(pane, props.message)
   }
 

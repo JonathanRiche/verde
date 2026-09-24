@@ -22,6 +22,9 @@ pub const METHOD_PROCESS_STOP: []const u8 = "process.stop";
 pub const METHOD_PROCESS_RESTART: []const u8 = "process.restart";
 pub const METHOD_PROCESS_LOGS: []const u8 = "process.logs";
 pub const METHOD_PROCESS_WAIT: []const u8 = "process.wait";
+/// Read-only list of the workspace's `verde.toml` stack definitions, so
+/// detached clients can start a whole stack by name.
+pub const METHOD_PROCESS_DEFINITIONS: []const u8 = "process.definitions";
 pub const METHOD_LEASE_CHECK: []const u8 = "lease.check";
 pub const METHOD_LEASE_ACQUIRE: []const u8 = "lease.acquire";
 pub const METHOD_LEASE_RENEW: []const u8 = "lease.renew";
