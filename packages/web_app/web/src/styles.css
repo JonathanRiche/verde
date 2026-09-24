@@ -52,6 +52,17 @@
   --warning: #fbbf24;
   --danger: #ff6464;
   --diff-add: #34e094;
+  /* Desktop syncMarkdownColors derivations of the legacy palette. */
+  --md-link: #6bd08d;
+  --md-h1: #f5c84a;
+  --md-h2: #f6d27a;
+  --md-h3: #99dcb3;
+  --md-h4: #d0d1d6;
+  --md-inline-code: #f5c84a;
+  --tok-string: #4ee29e;
+  --tok-number: #f5c84a;
+  --tok-keyword: #fbc12d;
+  --tok-function: #5ecb83;
   --user-bubble: #2a4636;
   --assistant-card: #161c1e;
   --radius-row: 7px;
@@ -262,10 +273,10 @@ button { transition-property: background-color, color, border-color, opacity, bo
 .copy-control { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .copy-status { font-size: 11px; color: var(--text-muted); max-width: 190px; white-space: normal; }
 .tok-comment { color: var(--text-subtle); font-style: italic; }
-.tok-string { color: var(--diff-add); }
-.tok-number { color: var(--warning); }
-.tok-keyword { color: var(--accent-hi); }
-.tok-call { color: var(--selection, var(--accent-hi)); }
+.tok-string { color: var(--tok-string); }
+.tok-number { color: var(--tok-number); }
+.tok-keyword { color: var(--tok-keyword); }
+.tok-call { color: var(--tok-function); }
 
 /* One gutter in stacked mode leaves room for code on narrow screens. */
 .diff-grid { display: grid; min-width: 0; }
@@ -291,7 +302,12 @@ button { transition-property: background-color, color, border-color, opacity, bo
   .code-toolbar { min-height: 48px; }
 }
 .markdown ul, .markdown ol { padding-left: 1.2em; margin: 0.4em 0; }
-.markdown a { color: var(--accent-hi); }
+.markdown a { color: var(--md-link); }
+.markdown h1 { color: var(--md-h1); }
+.markdown h2 { color: var(--md-h2); }
+.markdown h3 { color: var(--md-h3); }
+.markdown h4, .markdown h5, .markdown h6 { color: var(--md-h4); }
+.markdown :not(pre) > code { color: var(--md-inline-code); }
 .markdown h1, .markdown h2, .markdown h3 {
   font-family: var(--font-display);
   font-weight: 400;

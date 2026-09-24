@@ -65,6 +65,17 @@ export function applyTheme(payload: ThemePayload): void {
   set('--user-bubble', mix(selection, panel, 0.55))
   set('--assistant-card', mix(bg, text, 0.04))
   set('--selection', selection)
+  // Markdown/code roles derived exactly like desktop syncMarkdownColors (ui/theme.zig).
+  set('--md-link', mix(accent, text, 0.18))
+  set('--md-h1', mix(warning, text, 0.18))
+  set('--md-h2', mix(warning, text, 0.32))
+  set('--md-h3', mix(accent, text, 0.45))
+  set('--md-h4', mix(text, bg, 0.14))
+  set('--md-inline-code', mix(warning, text, 0.18))
+  set('--tok-string', mix(colors.diff_add ?? '#34e094', text, 0.12))
+  set('--tok-number', mix(warning, text, 0.18))
+  set('--tok-keyword', mix(warning, text, 0.05))
+  set('--tok-function', mix(accent, text, 0.1))
   root.style.setProperty('--accent-rgb', hexToRgb(accent).join(', '))
   document.body.style.background = bg
   applyTerminalTheme(payload)
