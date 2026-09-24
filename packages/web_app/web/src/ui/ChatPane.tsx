@@ -8,6 +8,7 @@ import { renderMarkdown as renderSafeMarkdown } from '../lib/markdown'
 import { clipboardImageFiles, store } from '../lib/store'
 import { type Attachment, type LivePane, type Message, isSubagentThreadId } from '../lib/types'
 import { effortLabel, effortOptionsIn, modelOptionsFor, modelSupportsFast, variantOptionsIn } from '../lib/models'
+import type { ModelOption } from '../lib/models'
 import { handleFileCitationClick, openFileViewer } from './FileViewer'
 import { Icon, ProviderGlyph, ZoomButton } from './Icons'
 import { PaneActionsButton } from './Sidebar'
@@ -1731,19 +1732,40 @@ function ComposerPickers(props: { pane: LivePane }) {
     store.messagesFor(props.pane).length === 0 &&
     !props.pane.provider_thread_id &&
     !store.paneWorking(props.pane)
-  const pickerRows = () => {
-    const provider = allowsProviderChoice() ? pickerProvider() : selectedProvider()
-    if (provider !== 'favorites') {
-      return modelsFor(provider).map((option) => ({ provider, option }))
-    }
-    return store.favoriteModels().map((favorite) => ({
-      provider: favorite.provider,
-      option: modelsFor(favorite.provider).find((option) => option.value === favorite.model) ?? {
-        value: favorite.model,
-        label: shortModel(favorite.model),
-      },
-    }))
+  // <For> keys rows by identity. Projection polls replace props.pane, which
+  // re-runs this; fresh row objects would recreate every button mid-click
+  // (mousedown and mouseup on different nodes → no click). Reuse rows.
+  type PickerRow = { provider: string; option: ModelOption }
+  let pickerRowCache = new Map<string, PickerRow>()
+  const stableRow = (next: Map<string, PickerRow>, provider: string, option: ModelOption): PickerRow => {
+    const key = `${provider}\u0000${option.value}`
+    const prev = pickerRowCache.get(key)
+    const row =
+      prev && prev.option.label === option.label && prev.option.description === option.description
+        ? prev
+        : { provider, option }
+    next.set(key, row)
+    return row
   }
+  const pickerRows = createMemo((): PickerRow[] => {
+    const provider = allowsProviderChoice() ? pickerProvider() : selectedProvider()
+    const next = new Map<string, PickerRow>()
+    const rows =
+      provider !== 'favorites'
+        ? modelsFor(provider).map((option) => stableRow(next, provider, option))
+        : store.favoriteModels().map((favorite) =>
+            stableRow(
+              next,
+              favorite.provider,
+              modelsFor(favorite.provider).find((option) => option.value === favorite.model) ?? {
+                value: favorite.model,
+                label: shortModel(favorite.model),
+              },
+            ),
+          )
+    pickerRowCache = next
+    return rows
+  })
   const pickerHeading = () => {
     const provider = allowsProviderChoice() ? pickerProvider() : selectedProvider()
     if (provider === 'favorites') return 'Favorites'
