@@ -213,8 +213,24 @@ const SidebarContextMenuAction = enum {
     thread_regenerate_title,
     thread_sync,
     thread_handoff,
-    thread_archive,
+    thread_close_pane,
 };
+
+/// The workspace pane showing this thread: its chat pane, or the agent TUI
+/// terminal pane when the thread is open in TUI mode.
+fn threadPaneId(state: *const runtime.AppState, project_index: usize, thread_index: usize) ?runtime.WorkspacePaneId {
+    if (project_index >= state.project_controller.projects.items.len) return null;
+    const project = &state.project_controller.projects.items[project_index];
+    for (project.workspace_layout.panes.items) |pane| {
+        switch (pane.ref) {
+            .chat => |ref| if (ref.thread_index == thread_index) return pane.id,
+            else => {},
+        }
+    }
+    if (thread_index >= project.threads.items.len) return null;
+    const dock_id = project.threads.items[thread_index].tui_dock_id orelse return null;
+    return project.workspace_layout.visibleTerminalPaneIdForDock(dock_id);
+}
 
 var sidebar_menu_panel_rect: palette.Rect = .{};
 var sidebar_menu_row_rects: [16]palette.Rect = undefined;
@@ -902,7 +918,9 @@ fn handleSidebarContextMenuPrimary(state: *runtime.AppState, x: f32, y: f32) boo
                         }
                     }
                 },
-                .thread_archive => state.archiveThreadAtIndex(pi, ti),
+                .thread_close_pane => if (threadPaneId(state, pi, ti)) |pane_id| {
+                    _ = state.closeWorkspacePane(pi, pane_id);
+                },
             }
             return true;
         }
@@ -987,7 +1005,7 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
             const ti = state.sidebar_context_menu_thread_index;
             var can_sync = false;
             var can_regenerate_title = false;
-            var can_archive = true;
+            var can_handoff = true;
             var provider: Provider = .opencode;
             var in_tui = false;
             if (pi < state.project_controller.projects.items.len) {
@@ -996,7 +1014,7 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
                     const th = proj.threads.items[ti];
                     can_sync = th.provider_thread_id != null and !th.isSendPendingForUi();
                     can_regenerate_title = state.canRegenerateThreadTitle(pi, ti);
-                    can_archive = !th.isSendPendingForUi();
+                    can_handoff = !th.isSendPendingForUi();
                     provider = th.provider;
                     in_tui = state.threadIsOpenInTui(pi, ti);
                 }
@@ -1004,13 +1022,13 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
             appendSidebarContextMenuRow(.thread_rename, true, "Rename chat");
             appendSidebarContextMenuRow(.thread_regenerate_title, can_regenerate_title, "Regenerate title");
             appendSidebarContextMenuRow(.thread_sync, can_sync, "Sync thread");
-            appendSidebarContextMenuRow(.thread_handoff, can_archive, "Handoff to another agent");
+            appendSidebarContextMenuRow(.thread_handoff, can_handoff, "Handoff to another agent");
             if (in_tui) {
                 appendSidebarContextMenuRow(.thread_open_chat, true, "Open as chat");
             } else {
                 appendSidebarContextMenuRow(.thread_open_tui, can_sync, openTuiLabel(provider));
             }
-            appendSidebarContextMenuRow(.thread_archive, can_archive, "Archive thread");
+            appendSidebarContextMenuRow(.thread_close_pane, threadPaneId(state, pi, ti) != null, "Close pane");
         },
     }
 
