@@ -14538,6 +14538,7 @@ pub const AppState = struct {
         self.finishTranscriptHydrationWorker();
         runtime_log.diagnostic("AppState.deinit transcript hydration finished", .{});
         self.settings_controller.update.deinit();
+        self.settings_controller.package_update_probe.deinit();
         runtime_log.diagnostic("AppState.deinit updater finished", .{});
         self.finishAllSendThreads();
         runtime_log.diagnostic("AppState.deinit send threads finished", .{});

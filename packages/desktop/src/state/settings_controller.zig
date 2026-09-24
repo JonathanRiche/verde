@@ -295,6 +295,9 @@ pub const State = struct {
     update_notes_expanded: bool = false,
     update: updater.State = .{},
     update_installer_started: bool = false,
+    package_update_probe: update_installer.PackageUpdateProbe = .{},
+    /// Probe status last copied into the two fields below.
+    package_update_synced_status: update_installer.PackageUpdateProbe.Status = .idle,
     package_update_command: ?[]const u8 = null,
     package_update_check_failed: bool = false,
     update_installer_terminal: ?UpdateInstallerTerminal = null,
@@ -487,6 +490,11 @@ pub fn openSettingsToCategory(self: anytype, category: Category) void {
     self.workspace_header_open_menu_pane_id = null;
     self.browser_controller.inspector_menu_open = false;
     self.syncSettingsDraftFromConfig();
+    const inspect_started_ms = monotonicMs();
+    defer {
+        const inspect_ms = monotonicMs() - inspect_started_ms;
+        if (inspect_ms >= 100) log.warn("settings open blocked the UI thread for {d}ms (daemon integrations inspect + setup)", .{inspect_ms});
+    }
     if (inspectProviderIntegrations(self.allocator, self.storage.pref_path)) |integrations| {
         self.settings_controller.hook_claude_installed = integrations.hooks.claude;
         self.settings_controller.hook_codex_installed = integrations.hooks.codex;
@@ -506,11 +514,9 @@ pub fn openSettingsToCategory(self: anytype, category: Category) void {
     self.settings_controller.browser_scroll_speed_drag_active = false;
     self.settings_controller.close_hovered = false;
     closeSettingsDropdowns(self);
-    self.settings_controller.package_update_check_failed = false;
-    self.settings_controller.package_update_command = update_installer.packageUpdateCommand(self.allocator) catch blk: {
-        self.settings_controller.package_update_check_failed = true;
-        break :blk null;
-    };
+    // Normally already resolved at launch; the probe never blocks this path.
+    self.settings_controller.package_update_probe.start();
+    _ = syncPackageUpdateProbe(self);
     self.settings_controller.update_notes_expanded = false;
     self.settings_controller.modal_closing = false;
     self.settings_controller.modal_anim_progress = 0.0;
@@ -1333,6 +1339,7 @@ pub fn startUpdateCheck(self: anytype) void {
 }
 
 pub fn startAutomaticUpdateCheck(self: anytype) void {
+    self.settings_controller.package_update_probe.start();
     if (self.app_config.check_for_updates_automatically) self.startUpdateCheck();
 }
 
@@ -1340,6 +1347,26 @@ pub fn pollUpdateCheck(self: anytype) void {
     const previous = self.settings_controller.update.status;
     self.settings_controller.update.poll();
     if (self.settings_controller.update.status != previous) self.markDirty();
+    if (syncPackageUpdateProbe(self)) self.markDirty();
+}
+
+/// Copies a finished package-ownership probe into the settings fields.
+/// Returns true when the visible state changed.
+fn syncPackageUpdateProbe(self: anytype) bool {
+    const controller = &self.settings_controller;
+    const status = controller.package_update_probe.status();
+    if (status == controller.package_update_synced_status) return false;
+    controller.package_update_synced_status = status;
+    controller.package_update_check_failed = status == .failed;
+    controller.package_update_command = if (status == .done) controller.package_update_probe.command else null;
+    return true;
+}
+
+fn packageUpdatePending(self: anytype) bool {
+    return switch (self.settings_controller.package_update_probe.status()) {
+        .idle, .running => true,
+        .done, .failed => false,
+    };
 }
 
 pub fn installAvailableUpdate(self: anytype) void {
@@ -1347,6 +1374,8 @@ pub fn installAvailableUpdate(self: anytype) void {
         _ = focusUpdateInstallerTerminal(self);
         return;
     }
+    // Until ownership is known, the curl installer could clobber a package install.
+    if (packageUpdatePending(self)) return;
     if (self.settings_controller.package_update_check_failed) return;
     if (self.settings_controller.package_update_command) |command| {
         self.setSidebarNotice(if (self.setClipboardText(command))
@@ -1383,6 +1412,7 @@ pub fn installAvailableUpdate(self: anytype) void {
 }
 
 pub fn updateInstallerButtonEnabled(self: anytype) bool {
+    if (packageUpdatePending(self)) return false;
     if (self.settings_controller.package_update_check_failed) return false;
     if (self.settings_controller.package_update_command != null) return true;
     if (self.settings_controller.update.status != .update_available) return false;
@@ -1390,6 +1420,7 @@ pub fn updateInstallerButtonEnabled(self: anytype) bool {
 }
 
 pub fn updateInstallerButtonLabel(self: anytype) []const u8 {
+    if (packageUpdatePending(self)) return "Checking install…";
     if (self.settings_controller.package_update_check_failed) return "Install check failed";
     if (self.settings_controller.package_update_command != null) return "Copy update command";
     if (self.settings_controller.update_installer_terminal) |update_terminal| {

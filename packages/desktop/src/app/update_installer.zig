@@ -76,6 +76,44 @@ pub const TERMINAL_INSTALL_SCRIPT =
     \\printf '\nUpdate complete. Restart Verde to use the installed version.\n'
 ;
 
+/// Resolves `packageUpdateCommand` once per process on a worker thread. The
+/// pacman queries read the package database and can take seconds on a cold
+/// page cache, so they must never run on the UI thread.
+pub const PackageUpdateProbe = struct {
+    status_value: std.atomic.Value(u8) = .init(@intFromEnum(Status.idle)),
+    worker: ?std.Thread = null,
+    /// Static string written by the worker before it publishes `.done`.
+    command: ?[]const u8 = null,
+
+    pub const Status = enum(u8) { idle, running, done, failed };
+
+    pub fn start(self: *PackageUpdateProbe) void {
+        if (self.status() != .idle) return;
+        self.status_value.store(@intFromEnum(Status.running), .release);
+        self.worker = std.Thread.spawn(.{}, probeWorker, .{self}) catch {
+            self.status_value.store(@intFromEnum(Status.failed), .release);
+            return;
+        };
+    }
+
+    pub fn status(self: *const PackageUpdateProbe) Status {
+        return @enumFromInt(self.status_value.load(.acquire));
+    }
+
+    pub fn deinit(self: *PackageUpdateProbe) void {
+        if (self.worker) |worker| worker.join();
+        self.worker = null;
+    }
+
+    fn probeWorker(self: *PackageUpdateProbe) void {
+        self.command = packageUpdateCommand(std.heap.page_allocator) catch {
+            self.status_value.store(@intFromEnum(Status.failed), .release);
+            return;
+        };
+        self.status_value.store(@intFromEnum(Status.done), .release);
+    }
+};
+
 /// A package-owned executable must be updated through its package manager.
 /// Foreign (AUR) packages need an AUR helper, including when none is installed yet.
 pub fn packageUpdateCommand(allocator: std.mem.Allocator) !?[]const u8 {
