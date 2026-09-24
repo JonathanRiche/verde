@@ -1013,6 +1013,7 @@ pub fn renderAtWithTranscriptLayoutWidth(state: *runtime.AppState, rect: palette
     chat_panel.resetWorkspaceHeaderHitCache();
     chat_panel.resetTranscriptHitCache();
     terminal_panel.resetHitCache();
+    browser_panel.resetPaletteHitCache();
 
     if (state.project_controller.projects.items.len == 0 or state.currentProjectWorkspaceRoot() != null) {
         empty_workspace_selected_action = 0;

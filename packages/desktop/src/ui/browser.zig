@@ -127,14 +127,10 @@ var palette_overflow_hit_count: usize = 0;
 
 const CLOSE_PANE_MENU_INDEX = std.math.maxInt(u32);
 
-/// Renders the browser dock that manages the in-app browser pane and bridge controls.
-pub fn renderDockAt(state: *app_state.AppState, rect: palette.Rect) void {
-    renderDockAtWithReserve(state, rect, 0.0);
-}
-
-/// Renders the browser dock while leaving toolbar space for workspace chrome.
-pub fn renderDockAtWithReserve(state: *app_state.AppState, rect: palette.Rect, toolbar_right_reserve: f32) void {
-    if (!state.isBrowserVisible()) return;
+/// Clears browser chrome hit geometry. The workspace calls this every frame so a
+/// browser pane that is no longer drawn (another strip tab is shown) cannot keep
+/// claiming clicks over the pane that replaced it.
+pub fn resetPaletteHitCache() void {
     palette_hit_count = 0;
     palette_tab_hit_count = 0;
     palette_toolbar_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
@@ -144,6 +140,17 @@ pub fn renderDockAtWithReserve(state: *app_state.AppState, rect: palette.Rect, t
     palette_context_menu_hit_count = 0;
     palette_overflow_menu_rect = .{};
     palette_overflow_hit_count = 0;
+}
+
+/// Renders the browser dock that manages the in-app browser pane and bridge controls.
+pub fn renderDockAt(state: *app_state.AppState, rect: palette.Rect) void {
+    renderDockAtWithReserve(state, rect, 0.0);
+}
+
+/// Renders the browser dock while leaving toolbar space for workspace chrome.
+pub fn renderDockAtWithReserve(state: *app_state.AppState, rect: palette.Rect, toolbar_right_reserve: f32) void {
+    if (!state.isBrowserVisible()) return;
+    resetPaletteHitCache();
 
     const toolbar_height = theme.scaledUi(TOOLBAR_HEIGHT);
     renderPaneCanvas(state, .{
