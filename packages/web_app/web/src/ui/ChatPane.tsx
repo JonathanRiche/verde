@@ -1661,7 +1661,7 @@ function panePickerSnapshot(pane: LivePane): PanePickerSnapshot {
     effort: pane.reasoning_effort ?? null,
     variant: pane.reasoning_variant ?? null,
     fast: pane.fast_mode === true,
-    access: pane.access_mode ?? 'supervised',
+    access: pane.access_mode ?? 'full_access',
   }
 }
 
@@ -1696,7 +1696,7 @@ function ComposerPickers(props: { pane: LivePane }) {
   const [selectedEffort, setSelectedEffort] = createSignal<string | null>(props.pane.reasoning_effort ?? null)
   const [selectedVariant, setSelectedVariant] = createSignal<string | null>(props.pane.reasoning_variant ?? null)
   const [selectedFast, setSelectedFast] = createSignal(props.pane.fast_mode === true)
-  const [selectedAccess, setSelectedAccess] = createSignal(props.pane.access_mode ?? 'supervised')
+  const [selectedAccess, setSelectedAccess] = createSignal(props.pane.access_mode ?? 'full_access')
   const [pickerProvider, setPickerProvider] = createSignal<PickerProvider>(selectedProvider() as PickerProvider)
   const [modelMenuStyle, setModelMenuStyle] = createSignal('left:12px;bottom:64px;width:calc(100vw - 24px);max-height:55vh')
   // Picker feedback is local and synchronous. Only copy pane → local when the

@@ -258,7 +258,7 @@ function openingThreadFromPane(pane: LivePane): Thread {
     reasoning_effort: pane.reasoning_effort ?? null,
     reasoning_variant: pane.reasoning_variant ?? null,
     fast_mode: pane.fast_mode ? 'on' : 'off',
-    access_mode: pane.access_mode ?? 'supervised',
+    access_mode: pane.access_mode ?? 'full_access',
     archived: false,
     draft: '',
     provider_thread_id: pane.provider_thread_id ?? null,
@@ -1044,7 +1044,7 @@ function chatPane(workspace: Workspace, thread: Thread, turns: SnapshotTurn[]): 
     reasoning_effort: thread.reasoning_effort ?? null,
     reasoning_variant: thread.reasoning_variant ?? null,
     fast_mode: thread.fast_mode === 'on',
-    access_mode: thread.access_mode ?? 'supervised',
+    access_mode: thread.access_mode ?? 'full_access',
     send_pending: active,
     completion_pending: active,
   }
@@ -1165,7 +1165,7 @@ export function panesForWorkspace(
             reasoning_effort,
             reasoning_variant,
             fast_mode,
-            access_mode: thread.access_mode ?? 'supervised',
+            access_mode: thread.access_mode ?? 'full_access',
             // Live desktop activity beats the store-turn heuristic, which can
             // report long-finished turns as active while the flush lags.
             ...(pane.send_pending !== undefined
@@ -3186,7 +3186,7 @@ export function createAppStore() {
           patch.reasoning_variant !== undefined ? patch.reasoning_variant : thread.reasoning_variant ?? null,
         fast_mode:
           patch.fast_mode !== undefined ? patch.fast_mode : provider_changed ? 'off' : thread.fast_mode ?? 'off',
-        access_mode: patch.access_mode !== undefined ? patch.access_mode : thread.access_mode ?? 'supervised',
+        access_mode: patch.access_mode !== undefined ? patch.access_mode : thread.access_mode ?? 'full_access',
       }
       const client_id = await ensureClientId()
       const saved = await interactiveCall('chat.thread.upsert', {
@@ -3341,6 +3341,9 @@ export function createAppStore() {
       repository_id,
       provider,
       harness: 'local_cli',
+      // Match the desktop and daemon default (full access) so a new web chat
+      // runs with the same access the desktop pane shows for it.
+      access_mode: 'full_access',
       last_activity_at: Date.now(),
     })
     if (opened.error || opened.ok === false) {
@@ -3355,6 +3358,7 @@ export function createAppStore() {
       profile_id,
       repository_id,
       provider,
+      access_mode: 'full_access',
       last_activity_at: Date.now(),
     }
     setThreadsByWorkspace((prev) => ({
