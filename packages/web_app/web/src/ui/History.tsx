@@ -41,7 +41,6 @@ function HistorySheet(props: { workspaceId: string }) {
   const [query, setQuery] = createSignal('')
   const [threads, setThreads] = createSignal<Loaded<HistoryThread>>({ state: 'loading' })
   const [closed, setClosed] = createSignal<Loaded<Workspace>>({ state: 'loading' })
-  const [confirming, setConfirming] = createSignal<string | null>(null)
   const [busy, setBusy] = createSignal<string | null>(null)
   const now = Math.floor(Date.now() / 1000)
   // Action failures surface here: store.notice only renders behind the backdrop.
@@ -95,26 +94,6 @@ function HistorySheet(props: { workspaceId: string }) {
       store.setDrawerOpen(false)
     } else setFailure(failureOf('Could not open that chat.'))
   }
-  const archive = async (thread: HistoryThread) => {
-    if (busy()) return
-    if (confirming() !== thread.local_thread_id) {
-      setConfirming(thread.local_thread_id)
-      return
-    }
-    setBusy(thread.local_thread_id)
-    setFailure(null)
-    const ok = await store.archiveThread(props.workspaceId, thread.local_thread_id)
-    if (disposed) return
-    setBusy(null)
-    setConfirming(null)
-    if (!ok) {
-      setFailure(failureOf('Could not archive that chat.'))
-      return
-    }
-    setThreads((current) => current.state === 'ready'
-      ? { state: 'ready', rows: current.rows.filter((row) => row.local_thread_id !== thread.local_thread_id) }
-      : current)
-  }
   const reopen = async (row: Workspace) => {
     if (busy()) return
     setBusy(row.workspace_id)
@@ -127,13 +106,6 @@ function HistorySheet(props: { workspaceId: string }) {
       store.setDrawerOpen(false)
     } else setFailure(failureOf('Could not reopen that workspace.'))
   }
-
-  // An armed Confirm must not linger: it reverts on its own after a pause.
-  createEffect(() => {
-    if (!confirming() || busy()) return
-    const timer = setTimeout(() => setConfirming(null), 4000)
-    onCleanup(() => clearTimeout(timer))
-  })
 
   let panel: HTMLDivElement | undefined
   let filter: HTMLInputElement | undefined
@@ -152,8 +124,7 @@ function HistorySheet(props: { workspaceId: string }) {
       if (event.key === 'Escape') {
         event.preventDefault()
         event.stopPropagation()
-        if (confirming()) setConfirming(null)
-        else close()
+        close()
         return
       }
       if (event.key !== 'Tab' || !panel) return
@@ -193,12 +164,7 @@ function HistorySheet(props: { workspaceId: string }) {
         aria-label="Chat history"
         tabindex="-1"
         ref={(node) => { panel = node }}
-        onClick={(event) => {
-          event.stopPropagation()
-          // Any click that is not on the armed Confirm button cancels it; the
-          // check lives here so it does not depend on the button's propagation.
-          if (!(event.target as HTMLElement | null)?.closest?.('[data-archive-confirm]')) setConfirming(null)
-        }}
+        onClick={(event) => event.stopPropagation()}
       >
         <div class="flex shrink-0 items-center gap-2 px-4 pt-3">
           <div class="flex min-w-0 flex-1 items-baseline gap-2 text-[15px] font-medium text-white">
@@ -293,24 +259,6 @@ function HistorySheet(props: { workspaceId: string }) {
                             <span class="hidden lg:inline">{thread.provider ?? ''} </span>
                             {relativeTime(thread.last_activity_at, now)}
                           </span>
-                        </button>
-                        <button
-                          type="button"
-                          data-archive-confirm={confirming() === thread.local_thread_id ? '' : undefined}
-                          aria-label={confirming() === thread.local_thread_id
-                            ? `Confirm archive of ${thread.title || 'Untitled chat'}`
-                            : `Archive ${thread.title || 'Untitled chat'}`}
-                          class={`mr-1 h-11 shrink-0 rounded-[6px] px-2.5 text-[12px] lg:h-7 ${busy() === thread.local_thread_id ? 'opacity-50' : ''} ${
-                            confirming() === thread.local_thread_id
-                              ? 'bg-[var(--danger)] font-bold text-[#0d1213]'
-                              : 'text-[var(--text-subtle)] hover:text-white'
-                          }`}
-                          disabled={busy() != null}
-                          onClick={() => void archive(thread)}
-                        >
-                          {busy() === thread.local_thread_id && confirming() === thread.local_thread_id
-                            ? 'Archiving…'
-                            : confirming() === thread.local_thread_id ? 'Archive?' : 'Archive'}
                         </button>
                       </div>
                     )}
