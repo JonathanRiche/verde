@@ -4791,6 +4791,9 @@ pub const AppState = struct {
     last_projection_reuse: persistence.ProjectionReuseStats = .{},
     /// Closed threads fetched when the command palette opens (item 5b); freed on close.
     palette_history: ?state_storage.LoadedThreadHistory = null,
+    /// Web-started chats this session already tiled (or saw tiled). A chat is
+    /// tiled at most once, so a pane the user later moves or closes stays so.
+    tiled_web_threads: std.StringHashMapUnmanaged(void) = .{},
     /// Dedicated synchronization status, independent of generic notices.
     daemon_projection_stale: bool = false,
     daemon_projection_bootstrap_started_at_ms: i64 = 0,
@@ -14479,6 +14482,7 @@ pub const AppState = struct {
     pub fn deinit(self: *AppState) void {
         runtime_log.diagnostic("AppState.deinit begin", .{});
         self.clearPaletteHistory();
+        self.clearTiledWebThreads();
         // Shutdown durability and worker settlement may take time. Remove the
         // UI-owned bearer immediately; RuntimeService keeps only its separate
         // process-memory copy until remote work has been stopped below.
@@ -14867,10 +14871,51 @@ pub const AppState = struct {
             );
             self.change_cursor_loop.noteRefreshApplication(true);
             _ = self.change_cursor_loop.acknowledgeProjectionRevision(self.storage.currentProjectionObservedRevision());
+            self.tileWebClientThreads();
         }
         const signals = self.change_cursor_loop.take();
         self.pollDaemonProjectionStaleness();
         if (signals.registry or signals.resync) self.terminal_controller.poll_requested = true;
+    }
+
+    fn clearTiledWebThreads(self: *AppState) void {
+        var keys = self.tiled_web_threads.keyIterator();
+        while (keys.next()) |key| self.allocator.free(key.*);
+        self.tiled_web_threads.deinit(self.allocator);
+        self.tiled_web_threads = .{};
+    }
+
+    /// Chats started in a web client (`web-thread-*`) live only in the daemon
+    /// until a pane references them, so the desktop listed them without
+    /// showing them. Tile each open, sent-to chat once, in the background:
+    /// focus, selection, and viewport stay where the user left them.
+    pub fn tileWebClientThreads(self: *AppState) void {
+        for (self.project_controller.projects.items, 0..) |*project, project_index| {
+            if (project.archived) continue;
+            for (project.threads.items, 0..) |*thread, thread_index| {
+                if (!isWebClientThreadId(thread.local_thread_id) or !thread.committed or thread.archived) continue;
+                if (self.tiled_web_threads.contains(thread.local_thread_id)) continue;
+                const key = self.allocator.dupe(u8, thread.local_thread_id) catch return;
+                self.tiled_web_threads.put(self.allocator, key, {}) catch {
+                    self.allocator.free(key);
+                    return;
+                };
+                if (project.hasChatPaneForThread(thread_index)) continue;
+                _ = self.presentWorkspaceChat(project_index, .{
+                    .local_thread_id = key,
+                    .axis = .vertical,
+                    .focus = false,
+                }) catch |err| {
+                    log.warn("failed to tile web chat {s}: {s}", .{ key, @errorName(err) });
+                    continue;
+                };
+                runtime_log.trace("tiled web chat project={d} thread={s}", .{ project_index, key });
+            }
+        }
+    }
+
+    fn isWebClientThreadId(local_thread_id: []const u8) bool {
+        return std.mem.startsWith(u8, local_thread_id, "web-thread-");
     }
 
     /// Apply registry/session/turn changes without reconstructing the durable
@@ -17860,6 +17905,70 @@ test "durable projected chat presentation is idempotent and never mints identity
     const repeated = try state.presentWorkspaceChat(0, .{ .local_thread_id = stable_id, .focus = false });
     try std.testing.expectEqual(first.pane_id, repeated.pane_id);
     try std.testing.expectEqual(pane_count + 1, state.project_controller.projects.items[0].workspace_layout.panes.items.len);
+}
+
+test "web client chats tile once in the background" {
+    const allocator = std.testing.allocator;
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    state.lifecycle.dirty = false;
+    state.lifecycle.last_dirty_at_ms = 0;
+    state.lifecycle.last_interaction_at_ms = 0;
+    state.terminal_controller.focused = false;
+    state.composer_controller.focused = false;
+    state.composer_controller.composer = PaletteComposerPrompt.init();
+    state.composer_controller.model_picker = PaletteModelPicker.init(0);
+    state.tiled_web_threads = .{};
+    @memset(&state.sidebar_notice_storage, 0);
+    defer {
+        state.clearTiledWebThreads();
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.composer_controller.composer.deinit(allocator);
+    }
+    var project = try Project.init(allocator, "web-workspace", "Web", "/tmp/web", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    const workspace = &state.project_controller.projects.items[0];
+    const web_index = try workspace.addThread(allocator);
+    const draft_index = try workspace.addThread(allocator);
+    const native_index = try workspace.addThread(allocator);
+    for ([_]usize{ web_index, draft_index }, [_][:0]const u8{ "web-thread-1-committed", "web-thread-2-draft" }) |index, id| {
+        const thread = &workspace.threads.items[index];
+        allocator.free(thread.local_thread_id);
+        thread.local_thread_id = try allocator.dupeZ(u8, id);
+    }
+    workspace.threads.items[web_index].committed = true;
+    workspace.threads.items[native_index].committed = true;
+    const layout = &workspace.workspace_layout;
+    const focused_before = layout.focused_pane_id;
+    const pane_count = layout.panes.items.len;
+
+    state.tileWebClientThreads();
+    try std.testing.expectEqual(pane_count + 1, layout.panes.items.len);
+    try std.testing.expect(workspace.hasChatPaneForThread(web_index));
+    try std.testing.expect(!workspace.hasChatPaneForThread(draft_index));
+    try std.testing.expect(!workspace.hasChatPaneForThread(native_index));
+    try std.testing.expectEqual(focused_before, layout.focused_pane_id);
+
+    // Once tiled, a pane the user closes stays closed on later refreshes.
+    var tiled_pane_id: ?WorkspacePaneId = null;
+    for (layout.panes.items) |pane| switch (pane.ref) {
+        .chat => |ref| if (ref.thread_index == web_index) {
+            tiled_pane_id = pane.id;
+        },
+        else => {},
+    };
+    if (layout.closePane(allocator, tiled_pane_id.?)) |removed| {
+        var removed_ref = removed;
+        deinitWorkspacePaneRef(&removed_ref, allocator);
+    }
+    state.tileWebClientThreads();
+    try std.testing.expect(!workspace.hasChatPaneForThread(web_index));
 }
 
 test "requested projection revision coalesces and failures stay generation scoped" {
