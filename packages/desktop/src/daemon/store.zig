@@ -178,10 +178,6 @@ pub const TurnCommitRequest = struct {
     /// observed by the worker. This keeps a concurrent manual rename intact.
     expected_thread_title: ?[]const u8 = null,
     generated_title: ?[]const u8 = null,
-    /// A prompt-only title this turn applied while it ran. The final title
-    /// may replace it as well as the fallback. Deliberately outside the
-    /// receipt fingerprint: it widens the guard, not the committed outcome.
-    previous_generated_title: ?[]const u8 = null,
     error_message: ?[]const u8 = null,
     failure_reason: ?store_protocol.ProviderFailureReason = null,
     user_message_id: ?[]const u8 = null,
@@ -1252,7 +1248,6 @@ pub const Store = struct {
                 request.workspace_id,
                 request.local_thread_id,
                 request.expected_thread_title.?,
-                request.previous_generated_title,
                 generated_title,
             ) catch |err| return mapStoreError(err);
         }
@@ -3483,50 +3478,13 @@ pub const Store = struct {
         workspace_id: []const u8,
         local_thread_id: []const u8,
         expected_title: []const u8,
-        previous_generated_title: ?[]const u8,
         generated_title: []const u8,
     ) !void {
-        // A null ?5 never compares equal, so it only widens the guard when set.
         try self.conn.exec(
             "update threads set title = ?1 where workspace_id = (select id from workspaces where workspace_id = ?2) " ++
-                "and local_thread_id = ?3 and (title = ?4 or title = ?5)",
-            .{ generated_title, workspace_id, local_thread_id, expected_title, previous_generated_title },
-        );
-    }
-
-    /// Apply a prompt-only automatic title while the opening turn still runs.
-    /// The eligibility guard and the write share one transaction so a
-    /// concurrent manual rename wins; a real change advances store_revision
-    /// so store observers see the title before the turn commits. Returns the
-    /// new revision, or null when the guard no longer matched.
-    pub fn applyInFlightAutomaticTitle(
-        self: *Self,
-        workspace_id: []const u8,
-        local_thread_id: []const u8,
-        expected_title: []const u8,
-        generated_title: []const u8,
-    ) StoreError!?u64 {
-        self.conn.execNoArgs("begin immediate") catch |err| return mapStoreError(err);
-        var transaction_open = true;
-        defer if (transaction_open) self.conn.rollback();
-
-        self.conn.exec(
-            "update threads set title = ?1 where workspace_id = (select id from workspaces where workspace_id = ?2) " ++
-                "and local_thread_id = ?3 and title = ?4 " ++
-                "and (select count(*) from messages m where m.thread_id = threads.id and m.role = 0) = 1",
+                "and local_thread_id = ?3 and title = ?4",
             .{ generated_title, workspace_id, local_thread_id, expected_title },
-        ) catch |err| return mapStoreError(err);
-        if (self.conn.changes() == 0) return null;
-        const revision = self.readStoreRevision() catch |err| return mapStoreError(err);
-        const next_revision = std.math.add(u64, revision, 1) catch return error.StoreUnavailable;
-        const next_revision_sql: i64 = std.math.cast(i64, next_revision) orelse return error.StoreUnavailable;
-        self.conn.exec(
-            "update store_state set store_revision = ?1 where id = 1",
-            .{next_revision_sql},
-        ) catch |err| return mapStoreError(err);
-        self.conn.commit() catch |err| return mapStoreError(err);
-        transaction_open = false;
-        return next_revision;
+        );
     }
 
     /// True only for the opening user prompt while the durable title still
@@ -7280,82 +7238,6 @@ test "turn acceptance provider switch clears stale identity without touching GUI
     try std.testing.expect(failed.nullableText(0) == null);
     try std.testing.expect(failed.nullableText(1) == null);
     try std.testing.expectEqualStrings("failed", failed.text(2));
-}
-
-test "in-flight automatic titles apply mid-turn and yield to refinement or manual renames" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const db_path = try testDbPath(&tmp);
-    defer std.testing.allocator.free(db_path);
-    var store = try Store.init(std.testing.allocator, db_path);
-    defer store.deinit();
-
-    const workspace = testWorkspace("workspace-early-title", "Early title workspace");
-    _ = try store.upsertWorkspace(.{
-        .mutation = testHeader("early-title-workspace", null),
-        .workspace = workspace,
-    });
-    _ = try store.acceptTurn(.{
-        .mutation = testHeader("turn:early-title:accept", null),
-        .turn_id = "turn-early-title",
-        .workspace = workspace,
-        .thread = .{ .local_thread_id = "thread-early-title", .title = "Explain early titles", .provider = "codex" },
-        .started_at_ms = 10,
-        .provider = "codex",
-        .harness = "local_cli",
-        .user_message = .{
-            .message_id = "early-title-user",
-            .role = "user",
-            .author = "You",
-            .body = "Explain early titles",
-        },
-    });
-
-    const before = try store.storeRevision();
-    try std.testing.expect((try store.applyInFlightAutomaticTitle(workspace.workspace_id, "thread-early-title", "Wrong fallback", "Nope")) == null);
-    try std.testing.expectEqual(before, try store.storeRevision());
-    try std.testing.expectEqual(before + 1, (try store.applyInFlightAutomaticTitle(workspace.workspace_id, "thread-early-title", "Explain early titles", "Early Titles")).?);
-    try std.testing.expectEqual(before + 1, try store.storeRevision());
-    try std.testing.expect(try store.threadTitleEquals(workspace.workspace_id, "thread-early-title", "Early Titles"));
-
-    // The completion title may replace the in-flight title it refines.
-    _ = try store.commitTurn(.{
-        .turn_id = "turn-early-title",
-        .workspace_id = workspace.workspace_id,
-        .local_thread_id = "thread-early-title",
-        .status = .completed,
-        .started_at_ms = 10,
-        .finished_at_ms = 20,
-        .provider = "codex",
-        .expected_thread_title = "Explain early titles",
-        .previous_generated_title = "Early Titles",
-        .generated_title = "Refined Early Titles",
-    });
-    try std.testing.expect(try store.threadTitleEquals(workspace.workspace_id, "thread-early-title", "Refined Early Titles"));
-
-    // A manual rename before the in-flight write keeps the user's title.
-    _ = try store.acceptTurn(.{
-        .mutation = testHeader("turn:early-title-manual:accept", null),
-        .turn_id = "turn-early-title-manual",
-        .workspace = workspace,
-        .thread = .{ .local_thread_id = "thread-early-title-manual", .title = "Rename me", .provider = "codex" },
-        .started_at_ms = 30,
-        .provider = "codex",
-        .harness = "local_cli",
-        .user_message = .{
-            .message_id = "early-title-manual-user",
-            .role = "user",
-            .author = "You",
-            .body = "Rename me",
-        },
-    });
-    _ = try store.upsertThread(.{
-        .mutation = testHeader("early-title-manual-rename", null),
-        .workspace_id = workspace.workspace_id,
-        .thread = testThread("thread-early-title-manual", "My Manual Title"),
-    });
-    try std.testing.expect((try store.applyInFlightAutomaticTitle(workspace.workspace_id, "thread-early-title-manual", "Rename me", "Should Not Win")) == null);
-    try std.testing.expect(try store.threadTitleEquals(workspace.workspace_id, "thread-early-title-manual", "My Manual Title"));
 }
 
 test "daemon turn titles commit the first prompt and preserve later manual renames" {
