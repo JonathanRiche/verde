@@ -1067,6 +1067,15 @@ function termPane(workspace: Workspace, session: SnapshotSession): LivePane {
   }
 }
 
+/// A chat another browser (or tab) opened. Web clients never get a desktop
+/// layout pane, so without this every other web client — and this one after
+/// a reload — would lose the chat. Uncommitted drafts stay private to their
+/// opener; CLI/MCP threads are excluded because the store keeps many of them
+/// open long after their desktop panes closed.
+export function isOpenWebClientThread(thread: Thread): boolean {
+  return thread.local_thread_id.startsWith('web-thread-') && thread.open !== false && thread.committed !== false
+}
+
 /// Panes actually open in a workspace. The desktop-persisted layout in the
 /// daemon store is the source of truth; the old N-most-recent-threads
 /// heuristic remains only as a fallback for daemons that cannot serve the
@@ -1261,11 +1270,12 @@ export function panesForWorkspace(
         })
       }
     }
-    // Threads this client opened that the desktop layout does not know about.
+    // Threads the desktop layout does not know about: ones this client
+    // opened, plus open committed chats started by any web client.
     for (const thread of threads) {
       if (thread.archived || used_threads.has(thread.local_thread_id)) continue
       if (isSubagentThreadId(thread.local_thread_id)) continue
-      if (!localThreadIds.has(thread.local_thread_id)) continue
+      if (!localThreadIds.has(thread.local_thread_id) && !isOpenWebClientThread(thread)) continue
       rows.push(chatPane(workspace, thread, turns))
     }
   } else {

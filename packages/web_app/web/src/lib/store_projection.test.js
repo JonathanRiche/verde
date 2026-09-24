@@ -343,6 +343,26 @@ describe('lastDeliveredTailSeq', () => {
 })
 
 describe('panesForWorkspace', () => {
+  test('shows open committed chats started by another web client', () => {
+    const workspace = {
+      workspace_id: 'workspace-1',
+      label: 'Workspace',
+      path: '/workspace',
+      threads: [
+        { local_thread_id: 'desktop-thread', title: 'Desktop', sort_index: 0, open: true },
+        { local_thread_id: 'web-thread-other', title: 'Other browser', sort_index: 1, open: true, committed: true },
+        { local_thread_id: 'web-thread-closed', title: 'Closed', sort_index: 2, open: false, committed: true },
+        { local_thread_id: 'web-thread-draft', title: 'New Chat', sort_index: 3, open: true, committed: false },
+        { local_thread_id: 'cli-thread-stale', title: 'Stale MCP child', sort_index: 4, open: true, committed: true },
+      ],
+    }
+    const layout = { panes: [{ id: 1, kind: 'chat', thread: 0, title: 'Desktop' }] }
+
+    const titles = panesForWorkspace(workspace, [], [], new Set(), layout).map((pane) => pane.thread_title)
+
+    expect(titles).toEqual(['Desktop', 'Other browser'])
+  })
+
   test('keeps daemon thread settings ahead of a stale live pane', () => {
     const workspace = {
       workspace_id: 'workspace-1',

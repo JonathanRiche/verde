@@ -60,6 +60,8 @@ export interface Thread {
   sort_index?: number
   archived?: boolean
   committed?: boolean
+  /// Daemon-owned open/closed bit from chat.thread.list; chat.thread.close clears it.
+  open?: boolean
   last_activity_at?: number | null
   model_ref?: string | null
   access_mode?: string | null
