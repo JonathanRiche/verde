@@ -196,6 +196,9 @@ var list_rect: palette.Rect = .{};
 var scroll_y: f32 = 0.0;
 var max_scroll_y: f32 = 0.0;
 var hovered_row: ?usize = null;
+/// Set by keyboard navigation so layout scrolls the selection into view once;
+/// wheel scrolling must not be snapped back to the selection every frame.
+var reveal_selected: bool = false;
 /// Query snapshot used to detect edits and reset selection/scroll.
 var last_query: [256]u8 = undefined;
 var last_query_len: usize = 0;
@@ -562,7 +565,10 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) void {
     max_scroll_y = @max(content_h - list_rect.h, 0.0);
     scroll_y = theme.clampf(scroll_y, 0.0, max_scroll_y);
 
-    ensureSelectedVisible(state);
+    if (reveal_selected) {
+        reveal_selected = false;
+        ensureSelectedVisible(state);
+    }
 
     // Re-derive row rects after any scroll adjustment so hits match visuals.
     y = list_rect.y - scroll_y;
@@ -941,6 +947,7 @@ fn moveSelection(state: *runtime.AppState, delta: i32) void {
         if (isSelectable(@intCast(index))) {
             state.command_controller.selected = @intCast(index);
             state.command_controller.action_menu_open = false;
+            reveal_selected = true;
             state.markDirty();
             return;
         }
