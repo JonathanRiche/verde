@@ -1474,6 +1474,34 @@ static void verde_browser_linux_destroy_exportable(gpointer user_data) {
     if (exportable != NULL) wpe_view_backend_exportable_fdo_destroy(exportable);
 }
 
+/* Every helper process opens the same Verde-owned data directory so browser
+ * panes share one login state. WebKit's default session keeps cookies in
+ * memory only, which signed users out whenever a helper restarted; the
+ * SQLite cookie jar persists them. Created once per process and never freed:
+ * web views in this helper keep referencing it until exit. */
+static WebKitNetworkSession *verde_browser_linux_network_session(void) {
+    static WebKitNetworkSession *session = NULL;
+    if (session != NULL) return session;
+
+    gchar *data_dir = g_build_filename(g_get_user_data_dir(), "verde", "browser", NULL);
+    gchar *cache_dir = g_build_filename(g_get_user_cache_dir(), "verde", "browser", NULL);
+    if (g_mkdir_with_parents(data_dir, 0700) != 0) {
+        fprintf(stderr, "verde-browser-linux WPE: failed to create browser data directory\n");
+        fflush(stderr);
+    }
+    session = webkit_network_session_new(data_dir, cache_dir);
+
+    gchar *cookie_path = g_build_filename(data_dir, "cookies.sqlite", NULL);
+    WebKitCookieManager *cookies = webkit_network_session_get_cookie_manager(session);
+    webkit_cookie_manager_set_persistent_storage(cookies, cookie_path, WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE);
+
+    g_free(cookie_path);
+    g_free(cache_dir);
+    g_free(data_dir);
+    return session;
+}
+
+
 struct verde_browser_linux *verde_browser_linux_create(void) {
     struct verde_browser_linux *browser = g_new0(struct verde_browser_linux, 1);
     browser->events = g_queue_new();
@@ -1528,6 +1556,7 @@ struct verde_browser_linux *verde_browser_linux_create(void) {
         WEBKIT_TYPE_WEB_VIEW,
         "backend", browser->webkit_backend,
         "web-context", webkit_web_context_get_default(),
+        "network-session", verde_browser_linux_network_session(),
         "settings", settings,
         NULL
     ));
