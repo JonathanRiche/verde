@@ -8,6 +8,7 @@ import { notifications } from '../lib/notify'
 import { viewportDiagnostics } from '../lib/pwa'
 import { openHistory } from './History'
 import { loadTheme } from '../lib/theme'
+import { UI_CONFIG_LIMITS, type ReducedMotionParts } from '../lib/ui_config'
 
 
 /** Keep keyboard focus in the visible sheet and return it to its opener. */
@@ -341,6 +342,9 @@ export function Settings() {
               <Row label="Theme source" value={theme()?.source ?? '…'} />
             </SettingsSection>
 
+            <MotionSettings />
+            <WorkspaceSettings />
+
             <SettingsSection title="Notifications">
               <div class="flex min-h-[44px] items-center justify-between gap-4 border-b border-[var(--border-muted)] py-2">
                 <span id="settings-notify-label">Agent notifications</span>
@@ -390,6 +394,160 @@ export function Settings() {
         </div>
       </div>
     </Show>
+  )
+}
+
+const MOTION_PART_ROWS: Array<{ part: keyof ReducedMotionParts; label: string }> = [
+  { part: 'pane_scroll', label: 'Pane scrolling' },
+  { part: 'pane_layout', label: 'Pane resize & focus' },
+  { part: 'status_pulse', label: 'Status pulses' },
+  { part: 'chat', label: 'Chat animations' },
+  { part: 'chrome', label: 'Sidebar & dialogs' },
+]
+
+/// Same switches as desktop Settings > Appearance, written to verde.json.
+function MotionSettings() {
+  const parts = () => store.uiConfig().reduced_motion_parts
+  const setAll = (enabled: boolean) => {
+    const next: Partial<ReducedMotionParts> = {}
+    for (const row of MOTION_PART_ROWS) next[row.part] = enabled
+    store.updateUiConfig({ reduced_motion_parts: next })
+  }
+  return (
+    <SettingsSection title="Motion" note="Shared with the desktop app through verde.json.">
+      <SwitchRow id="settings-motion-all" label="Reduce motion" checked={store.uiConfig().reduced_motion} onChange={setAll} />
+      <For each={MOTION_PART_ROWS}>
+        {(row) => (
+          <SwitchRow
+            id={`settings-motion-${row.part}`}
+            label={row.label}
+            indent
+            checked={parts()[row.part]}
+            onChange={(enabled) => store.updateUiConfig({ reduced_motion_parts: { [row.part]: enabled } })}
+          />
+        )}
+      </For>
+    </SettingsSection>
+  )
+}
+
+/// Desktop Settings > Workspace: the strip/split settings the web projects.
+function WorkspaceSettings() {
+  const ui = () => store.uiConfig()
+  return (
+    <SettingsSection title="Workspace" note="Shared with the desktop app through verde.json.">
+      <SegmentRow
+        label="New pane"
+        value={ui().workspace_split_default_pane}
+        options={[{ value: 'chat', label: 'Chat' }, { value: 'terminal', label: 'Terminal' }]}
+        onChange={(value) => store.updateUiConfig({ workspace_split_default_pane: value })}
+      />
+      <SwitchRow
+        id="settings-unzoom-on-navigate"
+        label="Unzoom on navigate"
+        checked={ui().unzoom_on_pane_navigation}
+        onChange={(enabled) => store.updateUiConfig({ unzoom_on_pane_navigation: enabled })}
+      />
+      <StepperRow
+        label="Pane gap"
+        value={ui().workspace_pane_gap}
+        {...UI_CONFIG_LIMITS.pane_gap}
+        onChange={(value) => store.updateUiConfig({ workspace_pane_gap: value })}
+      />
+      <StepperRow
+        label="Panes per view"
+        value={ui().workspace_panes_per_view}
+        {...UI_CONFIG_LIMITS.panes_per_view}
+        onChange={(value) => store.updateUiConfig({ workspace_panes_per_view: value })}
+      />
+      <SegmentRow
+        label="Scrolling"
+        value={ui().workspace_scroll_mode}
+        options={[
+          { value: 'automatic', label: 'Auto' },
+          { value: 'always', label: 'Always' },
+          { value: 'disabled', label: 'Off' },
+        ]}
+        onChange={(value) => store.updateUiConfig({ workspace_scroll_mode: value })}
+      />
+      <Show when={ui().workspace_scroll_mode === 'automatic'}>
+        <StepperRow
+          label="Start after"
+          value={ui().workspace_scroll_threshold}
+          {...UI_CONFIG_LIMITS.scroll_threshold}
+          onChange={(value) => store.updateUiConfig({ workspace_scroll_threshold: value })}
+        />
+      </Show>
+      <SegmentRow
+        label="Direction"
+        value={ui().workspace_scroll_direction}
+        options={[{ value: 'horizontal', label: 'Horizontal' }, { value: 'vertical', label: 'Vertical' }]}
+        onChange={(value) => store.updateUiConfig({ workspace_scroll_direction: value })}
+      />
+    </SettingsSection>
+  )
+}
+
+function SwitchRow(props: { id: string; label: string; checked: boolean; indent?: boolean; onChange: (checked: boolean) => void }) {
+  return (
+    <div class={`flex min-h-[44px] items-center justify-between gap-4 border-b border-[var(--border-muted)] py-2 ${props.indent ? 'pl-4' : ''}`}>
+      <span id={`${props.id}-label`} class={props.indent ? 'text-[var(--text-muted)]' : ''}>{props.label}</span>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={props.checked}
+        aria-labelledby={`${props.id}-label`}
+        class="settings-switch"
+        onClick={() => props.onChange(!props.checked)}
+      />
+    </div>
+  )
+}
+
+function SegmentRow<T extends string>(props: {
+  label: string
+  value: T
+  options: Array<{ value: T; label: string }>
+  onChange: (value: T) => void
+}) {
+  return (
+    <div class="flex min-h-[44px] items-center justify-between gap-4 border-b border-[var(--border-muted)] py-2">
+      <span>{props.label}</span>
+      <div role="radiogroup" aria-label={props.label} class="flex overflow-hidden rounded-[7px] border border-[var(--border-muted)]">
+        <For each={props.options}>
+          {(option) => (
+            <button
+              type="button"
+              role="radio"
+              aria-checked={props.value === option.value}
+              class={`min-h-[32px] px-3 text-[12px] ${
+                props.value === option.value
+                  ? 'bg-[var(--accent-dim)] text-[var(--accent)]'
+                  : 'text-[var(--text-muted)] hover:bg-[var(--accent-hover)]'
+              }`}
+              onClick={() => props.onChange(option.value)}
+            >
+              {option.label}
+            </button>
+          )}
+        </For>
+      </div>
+    </div>
+  )
+}
+
+function StepperRow(props: { label: string; value: number; min: number; max: number; onChange: (value: number) => void }) {
+  const step = (delta: number) => props.onChange(Math.min(props.max, Math.max(props.min, Math.round(props.value) + delta)))
+  const button = 'grid h-8 w-8 place-items-center rounded-[7px] border border-[var(--border-muted)] text-[14px] hover:bg-[var(--accent-hover)] disabled:opacity-40'
+  return (
+    <div class="flex min-h-[44px] items-center justify-between gap-4 border-b border-[var(--border-muted)] py-2">
+      <span>{props.label}</span>
+      <div class="flex items-center gap-2">
+        <button type="button" class={button} aria-label={`Decrease ${props.label}`} disabled={props.value <= props.min} onClick={() => step(-1)}>−</button>
+        <span class="mono w-8 text-center text-[12px]" aria-live="polite">{Math.round(props.value)}</span>
+        <button type="button" class={button} aria-label={`Increase ${props.label}`} disabled={props.value >= props.max} onClick={() => step(1)}>+</button>
+      </div>
+    </div>
   )
 }
 

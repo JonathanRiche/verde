@@ -63,6 +63,7 @@ const MUTATING_METHODS = [_][]const u8{
     "notification.chatCompletion.upsert",
     "notification.chatCompletion.clear",
     "config.favoriteModel.set",
+    "config.ui.set",
     // Owner-only access administration. Lists are included because they
     // transactionally prune bounded terminal records before replying.
     access_protocol.METHOD_DAEMON_PAIRING_GRANT_CREATE,
@@ -424,6 +425,7 @@ test "reads are not mutators and store mutators drain" {
         "notification.chatCompletion.upsert",
         "notification.chatCompletion.clear",
         "config.favoriteModel.set",
+        "config.ui.set",
     };
     for (store_mutators) |method| {
         try std.testing.expect(isMutatingMethod(method));

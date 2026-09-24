@@ -2940,6 +2940,7 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_TITLE_GENERATE)) return try self.providerTitleGenerateResponse(id_value, params);
         if (isFxLifecycleMethod(method)) return try self.fxLifecycleResponse(id_value, method, params);
         if (std.mem.eql(u8, method, store_protocol.METHOD_CONFIG_FAVORITE_MODEL_SET)) return try self.configFavoriteModelSetResponse(id_value, params);
+        if (std.mem.eql(u8, method, store_protocol.METHOD_CONFIG_UI_SET)) return try self.configUiSetResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_WORKSPACE_RESOLVE)) return try self.workspaceResolveResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_PROCESS_LIST)) return try self.processListResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_PROCESS_INSPECT)) return try self.processInspectResponse(id_value, params);
@@ -8381,6 +8382,41 @@ pub const Daemon = struct {
         });
     }
 
+    /// Web Settings writes the same `ui` keys the desktop Settings modal
+    /// does. The desktop watches verde.json and reloads on the change.
+    fn configUiSetResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        var parsed = parseDaemonParams(store_protocol.ConfigUiSetRequest, self.allocator, params) catch {
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "invalid ui settings");
+        };
+        defer parsed.deinit();
+
+        self.config_mutex.lock();
+        defer self.config_mutex.unlock();
+        var config = app_config.loadAppConfig(self.allocator) catch |err| {
+            return try errorResponseAlloc(self.allocator, id_value, "config_unavailable", @errorName(err));
+        };
+        defer config.deinit(self.allocator);
+        const before = config;
+        applyConfigUiPatch(&config, parsed.value) catch |err| {
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", switch (err) {
+                error.PaneGapOutOfRange => "workspace_pane_gap out of range",
+                error.PanesPerViewOutOfRange => "workspace_panes_per_view out of range",
+                error.ScrollThresholdOutOfRange => "workspace_scroll_threshold out of range",
+                error.UnknownSplitDefaultPane => "unknown workspace_split_default_pane",
+                error.UnknownScrollDirection => "unknown workspace_scroll_direction",
+                error.UnknownScrollMode => "unknown workspace_scroll_mode",
+            });
+        };
+        if (!configUiEql(&before, &config)) {
+            app_config.saveAppConfig(self.allocator, &config) catch |err| {
+                return try errorResponseAlloc(self.allocator, id_value, "config_unavailable", @errorName(err));
+            };
+        }
+        const snapshot = try configSnapshotFromApp(self.allocator, &config);
+        defer self.allocator.free(snapshot.chat.favorite_models);
+        return try okValueResponse(self.allocator, id_value, snapshot.ui);
+    }
+
     fn findChatTurn(self: *Daemon, turn_id: []const u8) ?*ChatTurn {
         for (self.chat_turns.items) |turn| if (std.mem.eql(u8, turn.turn_id, turn_id)) return turn;
         return null;
@@ -11161,6 +11197,65 @@ fn configSnapshotFromApp(allocator: std.mem.Allocator, config: *const app_config
     };
 }
 
+const ConfigUiPatchError = error{
+    PaneGapOutOfRange,
+    PanesPerViewOutOfRange,
+    ScrollThresholdOutOfRange,
+    UnknownSplitDefaultPane,
+    UnknownScrollDirection,
+    UnknownScrollMode,
+};
+
+/// Validate the whole patch before touching `config`, so a bad field leaves
+/// every other setting unwritten.
+fn applyConfigUiPatch(config: *app_config.AppConfig, patch: store_protocol.ConfigUiSetRequest) ConfigUiPatchError!void {
+    if (patch.workspace_pane_gap) |gap| {
+        if (!std.math.isFinite(gap) or gap < app_config.MIN_WORKSPACE_PANE_GAP or gap > app_config.MAX_WORKSPACE_PANE_GAP) return error.PaneGapOutOfRange;
+    }
+    if (patch.workspace_panes_per_view) |count| {
+        if (count < app_config.MIN_WORKSPACE_PANES_PER_VIEW or count > app_config.MAX_WORKSPACE_PANES_PER_VIEW) return error.PanesPerViewOutOfRange;
+    }
+    if (patch.workspace_scroll_threshold) |threshold| {
+        if (threshold < app_config.MIN_WORKSPACE_SCROLL_THRESHOLD or threshold > app_config.MAX_WORKSPACE_SCROLL_THRESHOLD) return error.ScrollThresholdOutOfRange;
+    }
+    const split_default = if (patch.workspace_split_default_pane) |raw|
+        app_config.WorkspaceSplitDefaultPane.parse(raw) orelse return error.UnknownSplitDefaultPane
+    else
+        config.workspace_split_default_pane;
+    const direction = if (patch.workspace_scroll_direction) |raw|
+        app_config.WorkspaceScrollDirection.parse(raw) orelse return error.UnknownScrollDirection
+    else
+        config.workspace_scroll_direction;
+    const mode = if (patch.workspace_scroll_mode) |raw|
+        app_config.WorkspaceScrollMode.parse(raw) orelse return error.UnknownScrollMode
+    else
+        config.workspace_scroll_mode;
+
+    if (patch.workspace_pane_gap) |gap| config.workspace_pane_gap = gap;
+    if (patch.workspace_panes_per_view) |count| config.workspace_panes_per_view = count;
+    if (patch.workspace_scroll_threshold) |threshold| config.workspace_scroll_threshold = threshold;
+    if (patch.unzoom_on_pane_navigation) |enabled| config.unzoom_on_pane_navigation = enabled;
+    config.workspace_split_default_pane = split_default;
+    config.workspace_scroll_direction = direction;
+    config.workspace_scroll_mode = mode;
+    if (patch.reduced_motion_parts) |parts| {
+        inline for (std.meta.fields(store_protocol.ConfigReducedMotionPartsPatch)) |field| {
+            if (@field(parts, field.name)) |enabled| @field(config.reduced_motion, field.name) = enabled;
+        }
+    }
+}
+
+fn configUiEql(a: *const app_config.AppConfig, b: *const app_config.AppConfig) bool {
+    return a.workspace_pane_gap == b.workspace_pane_gap and
+        a.workspace_panes_per_view == b.workspace_panes_per_view and
+        a.workspace_split_default_pane == b.workspace_split_default_pane and
+        a.workspace_scroll_direction == b.workspace_scroll_direction and
+        a.workspace_scroll_mode == b.workspace_scroll_mode and
+        a.workspace_scroll_threshold == b.workspace_scroll_threshold and
+        a.unzoom_on_pane_navigation == b.unzoom_on_pane_navigation and
+        a.reduced_motion.eql(b.reduced_motion);
+}
+
 /// Load verde.json off the daemon lock and project the client-visible UI
 /// slice. Missing or unreadable files fall back to AppConfig defaults so a
 /// detached UI still gets a coherent strip instead of omitting the field.
@@ -11316,6 +11411,32 @@ test "incomplete scope policy pins both chat-authority arms" {
     try std.testing.expect(scopeIsIncomplete("chat", false));
     // The runtime constant documents the landed authority flip.
     try std.testing.expect(CHAT_AUTHORITY_LANDED);
+}
+
+test "config ui patch validates every field before applying any" {
+    var config: app_config.AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+    try std.testing.expectError(error.UnknownScrollMode, applyConfigUiPatch(&config, .{
+        .workspace_pane_gap = 20.0,
+        .workspace_scroll_mode = "sideways",
+    }));
+    try std.testing.expectEqual(app_config.DEFAULT_WORKSPACE_PANE_GAP, config.workspace_pane_gap);
+    try std.testing.expectError(error.PanesPerViewOutOfRange, applyConfigUiPatch(&config, .{ .workspace_panes_per_view = 0 }));
+
+    const before = config;
+    try applyConfigUiPatch(&config, .{
+        .workspace_pane_gap = 20.0,
+        .workspace_scroll_mode = "always",
+        .unzoom_on_pane_navigation = true,
+        .reduced_motion_parts = .{ .pane_scroll = false, .chrome = true },
+    });
+    try std.testing.expect(!configUiEql(&before, &config));
+    try std.testing.expectEqual(@as(f32, 20.0), config.workspace_pane_gap);
+    try std.testing.expectEqual(app_config.WorkspaceScrollMode.always, config.workspace_scroll_mode);
+    try std.testing.expect(config.unzoom_on_pane_navigation);
+    try std.testing.expect(!config.reduced_motion.pane_scroll);
+    try std.testing.expect(config.reduced_motion.chrome);
+    try std.testing.expect(!config.reduced_motion.chat);
 }
 
 test "config snapshot projects workspace strip settings and model favorites" {
@@ -12240,7 +12361,8 @@ fn methodRunsUnlocked(method: []const u8) bool {
         // lockDaemon window, like the other unlocked mutation paths.
         isFxLifecycleMethod(method) or
         // Shared config writes have their own leaf lock and filesystem I/O.
-        std.mem.eql(u8, method, store_protocol.METHOD_CONFIG_FAVORITE_MODEL_SET);
+        std.mem.eql(u8, method, store_protocol.METHOD_CONFIG_FAVORITE_MODEL_SET) or
+        std.mem.eql(u8, method, store_protocol.METHOD_CONFIG_UI_SET);
 }
 
 fn isAccessMethod(method: []const u8) bool {
@@ -17772,6 +17894,7 @@ test "draining dispatcher rejects every state mutator" {
         "notification.chatCompletion.upsert",
         "notification.chatCompletion.clear",
         "config.favoriteModel.set",
+        "config.ui.set",
     };
     for (methods, 0..) |method, index| {
         const request = try std.fmt.allocPrint(

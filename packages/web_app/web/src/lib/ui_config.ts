@@ -123,6 +123,58 @@ export function parseUiConfig(raw: unknown): UiConfig {
   }
 }
 
+/// A `config.ui.set` request: omitted fields keep their current value.
+export type UiConfigPatch = Partial<Omit<UiConfig, 'reduced_motion' | 'reduced_motion_parts'>> & {
+  reduced_motion_parts?: Partial<ReducedMotionParts>
+}
+
+export const UI_CONFIG_LIMITS = {
+  pane_gap: { min: MIN_PANE_GAP, max: MAX_PANE_GAP },
+  panes_per_view: { min: MIN_PANES_PER_VIEW, max: MAX_PANES_PER_VIEW },
+  scroll_threshold: { min: MIN_SCROLL_THRESHOLD, max: MAX_SCROLL_THRESHOLD },
+} as const
+
+export function mergeUiConfigPatch(base: UiConfigPatch, patch: UiConfigPatch): UiConfigPatch {
+  const merged: UiConfigPatch = { ...base, ...patch }
+  if (base.reduced_motion_parts || patch.reduced_motion_parts) {
+    merged.reduced_motion_parts = { ...base.reduced_motion_parts, ...patch.reduced_motion_parts }
+  }
+  return merged
+}
+
+/// Overlay a patch on a parsed config (optimistic web edits, and in-flight
+/// edits a stale snapshot must not revert).
+export function applyUiConfigPatch(config: UiConfig, patch: UiConfigPatch): UiConfig {
+  const { reduced_motion_parts: parts_patch, ...fields } = patch
+  const reduced_motion_parts = { ...config.reduced_motion_parts, ...parts_patch }
+  return {
+    ...config,
+    ...fields,
+    reduced_motion_parts,
+    reduced_motion: MOTION_PARTS.every((part) => reduced_motion_parts[part]),
+  }
+}
+
+/// Drop the fields of `sent` that `pending` still holds unchanged: the
+/// request carrying them settled, newer edits stay pending.
+export function settleUiConfigPatch(pending: UiConfigPatch, sent: UiConfigPatch): UiConfigPatch {
+  const next: UiConfigPatch = { ...pending }
+  const record = next as Record<string, unknown>
+  for (const [key, value] of Object.entries(sent)) {
+    if (key === 'reduced_motion_parts') continue
+    if (record[key] === value) delete record[key]
+  }
+  if (sent.reduced_motion_parts && next.reduced_motion_parts) {
+    const parts = { ...next.reduced_motion_parts }
+    for (const [part, value] of Object.entries(sent.reduced_motion_parts)) {
+      if (parts[part as keyof ReducedMotionParts] === value) delete parts[part as keyof ReducedMotionParts]
+    }
+    if (Object.keys(parts).length === 0) delete next.reduced_motion_parts
+    else next.reduced_motion_parts = parts
+  }
+  return next
+}
+
 /// How many columns the strip should fit, matching desktop scrollingLayoutEnabled.
 export function effectivePanesPerView(ui: UiConfig, visible_count: number, maximized: boolean): number {
   if (maximized || visible_count <= 1) return 1

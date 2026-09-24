@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'bun:test'
 
-import { DEFAULT_REDUCED_MOTION, DEFAULT_UI_CONFIG, applyReducedMotion, effectivePanesPerView, parseUiConfig } from './ui_config.ts'
+import {
+  DEFAULT_REDUCED_MOTION, DEFAULT_UI_CONFIG, applyReducedMotion, applyUiConfigPatch, effectivePanesPerView,
+  mergeUiConfigPatch, parseUiConfig, settleUiConfigPatch,
+} from './ui_config.ts'
 
 describe('parseUiConfig', () => {
   test('keeps desktop defaults for an empty snapshot', () => {
@@ -74,5 +77,22 @@ describe('reduced motion parts', () => {
     ])
     applyReducedMotion({ ...DEFAULT_REDUCED_MOTION, pane_scroll: false }, root)
     expect(attrs.size).toBe(0)
+  })
+})
+
+describe('ui config patches', () => {
+  test('apply overlays fields and motion parts and recomputes the master switch', () => {
+    const all = Object.fromEntries(Object.keys(DEFAULT_REDUCED_MOTION).map((part) => [part, true]))
+    const next = applyUiConfigPatch(DEFAULT_UI_CONFIG, { workspace_pane_gap: 20, reduced_motion_parts: all })
+    expect(next.workspace_pane_gap).toBe(20)
+    expect(next.reduced_motion).toBe(true)
+    expect(applyUiConfigPatch(next, { reduced_motion_parts: { chat: false } }).reduced_motion).toBe(false)
+  })
+
+  test('settle keeps newer pending edits and drops confirmed ones', () => {
+    const first = { workspace_pane_gap: 20, reduced_motion_parts: { chat: true } }
+    const pending = mergeUiConfigPatch(first, { workspace_pane_gap: 21, reduced_motion_parts: { chrome: true } })
+    expect(settleUiConfigPatch(pending, first)).toEqual({ workspace_pane_gap: 21, reduced_motion_parts: { chrome: true } })
+    expect(settleUiConfigPatch({ workspace_pane_gap: 20 }, { workspace_pane_gap: 20 })).toEqual({})
   })
 })

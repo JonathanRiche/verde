@@ -47,6 +47,7 @@ pub const METHOD_WORKSPACE_REPOSITORY_BINDING_REMOVE: []const u8 =
 pub const METHOD_CHAT_MESSAGE_LIST: []const u8 = "chat.message.list";
 pub const METHOD_CHAT_TURN_RECORD: []const u8 = "chat.turn.record";
 pub const METHOD_CONFIG_FAVORITE_MODEL_SET: []const u8 = "config.favoriteModel.set";
+pub const METHOD_CONFIG_UI_SET: []const u8 = "config.ui.set";
 
 pub const STATE_SNAPSHOT_REPLACE_METHOD = METHOD_STATE_SNAPSHOT_REPLACE;
 pub const APP_STATE_SET_METHOD = METHOD_APP_STATE_SET;
@@ -72,6 +73,7 @@ pub const WORKSPACE_REPOSITORY_BINDING_REMOVE_METHOD = METHOD_WORKSPACE_REPOSITO
 pub const CHAT_MESSAGE_LIST_METHOD = METHOD_CHAT_MESSAGE_LIST;
 pub const CHAT_TURN_RECORD_METHOD = METHOD_CHAT_TURN_RECORD;
 pub const CONFIG_FAVORITE_MODEL_SET_METHOD = METHOD_CONFIG_FAVORITE_MODEL_SET;
+pub const CONFIG_UI_SET_METHOD = METHOD_CONFIG_UI_SET;
 
 // Re-export the shared storage error names from the one protocol error owner.
 pub const ERR_CONFLICT = protocol.ERR_CONFLICT;
@@ -554,6 +556,27 @@ pub const ConfigFavoriteModelSetResult = struct {
     provider: []const u8,
     model: []const u8,
     favorite: bool,
+};
+
+/// Patch the client-visible `verde.json` `ui` slice. Omitted fields keep
+/// their current value; the result is the full slice after the write.
+pub const ConfigUiSetRequest = struct {
+    workspace_pane_gap: ?f32 = null,
+    workspace_panes_per_view: ?u8 = null,
+    workspace_split_default_pane: ?[]const u8 = null,
+    workspace_scroll_direction: ?[]const u8 = null,
+    workspace_scroll_mode: ?[]const u8 = null,
+    workspace_scroll_threshold: ?u8 = null,
+    unzoom_on_pane_navigation: ?bool = null,
+    reduced_motion_parts: ?ConfigReducedMotionPartsPatch = null,
+};
+
+pub const ConfigReducedMotionPartsPatch = struct {
+    pane_scroll: ?bool = null,
+    pane_layout: ?bool = null,
+    status_pulse: ?bool = null,
+    chat: ?bool = null,
+    chrome: ?bool = null,
 };
 
 pub const CoreSnapshotResult = struct {
@@ -1154,6 +1177,7 @@ test "store method names and error codes are pinned" {
     try std.testing.expectEqualStrings("chat.message.list", METHOD_CHAT_MESSAGE_LIST);
     try std.testing.expectEqualStrings("chat.turn.record", METHOD_CHAT_TURN_RECORD);
     try std.testing.expectEqualStrings("config.favoriteModel.set", METHOD_CONFIG_FAVORITE_MODEL_SET);
+    try std.testing.expectEqualStrings("config.ui.set", METHOD_CONFIG_UI_SET);
     try std.testing.expectEqualStrings("store", SNAPSHOT_SCOPE_STORE);
     try std.testing.expectEqualStrings("registry", SNAPSHOT_SCOPE_REGISTRY);
     try std.testing.expectEqualStrings("sessions", SNAPSHOT_SCOPE_SESSIONS);

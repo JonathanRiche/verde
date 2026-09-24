@@ -41,7 +41,15 @@ import {
   resolveWorkspaceId,
 } from './selection'
 import { linuxWorkspaceId } from './wyhash'
-import { DEFAULT_UI_CONFIG, parseUiConfig, type UiConfig } from './ui_config'
+import {
+  DEFAULT_UI_CONFIG,
+  applyUiConfigPatch,
+  mergeUiConfigPatch,
+  parseUiConfig,
+  settleUiConfigPatch,
+  type UiConfig,
+  type UiConfigPatch,
+} from './ui_config'
 import {
   adjacentPaneInGroups,
   paneIsActive,
@@ -1367,6 +1375,10 @@ export function createAppStore() {
       : false,
   )
   const [uiConfig, setUiConfig] = createSignal<UiConfig>(DEFAULT_UI_CONFIG)
+  // Web Settings edits not yet confirmed by config.ui.set; a snapshot polled
+  // before the write lands must not flip the control back.
+  let pendingUiConfigPatch: UiConfigPatch = {}
+  let uiConfigUpdateQueue: Promise<void> = Promise.resolve()
   const [keybindConfig, setKeybindConfig] = createSignal<WebKeybindConfig>(DEFAULT_WEB_KEYBINDS)
   const [prefixMode, setPrefixMode] = createSignal<'armed' | 'navigate' | null>(null)
   const [prefixHelpVisible, setPrefixHelpVisible] = createSignal(false)
@@ -1573,7 +1585,7 @@ export function createAppStore() {
       })
     }
     if (root.config !== undefined) {
-      const next = parseUiConfig(root.config)
+      const next = applyUiConfigPatch(parseUiConfig(root.config), pendingUiConfigPatch)
       setUiConfig((prev) => (sameJson(prev, next) ? prev : next))
       const next_keybinds = parseWebKeybindConfig(root.config)
       setKeybindConfig((prev) => (sameJson(prev, next_keybinds) ? prev : next_keybinds))
@@ -3195,6 +3207,29 @@ export function createAppStore() {
     })
   }
 
+  /// Write one or more `verde.json` `ui` settings through the daemon, the
+  /// same file the desktop Settings modal edits (the desktop reloads it).
+  const updateUiConfig = (patch: UiConfigPatch) => {
+    pendingUiConfigPatch = mergeUiConfigPatch(pendingUiConfigPatch, patch)
+    setUiConfig((prev) => applyUiConfigPatch(prev, patch))
+    setNotice(null)
+    const settle = () => {
+      pendingUiConfigPatch = settleUiConfigPatch(pendingUiConfigPatch, patch)
+      void refreshProjection({ scope: 'selected', enrich_chat_status: false })
+    }
+    const update = uiConfigUpdateQueue.then(async () => {
+      const response = await interactiveCall('config.ui.set', patch)
+      if (response.error || response.ok === false) {
+        setNotice(response.error?.message ?? 'setting did not apply')
+      }
+      settle()
+    })
+    uiConfigUpdateQueue = update.catch((err) => {
+      setNotice(err instanceof Error ? err.message : 'setting change failed')
+      settle()
+    })
+  }
+
   /// Persist model/effort/variant changes onto the daemon thread record.
   /// The daemon's chat.thread.upsert is a full metadata overwrite, so this
   /// merges the patch over the catalog row (never a full transcript get).
@@ -4226,6 +4261,7 @@ export function createAppStore() {
     composerFocusExplicit,
     compact,
     uiConfig,
+    updateUiConfig,
     keybindConfig,
     prefixMode,
     prefixHelpVisible,
