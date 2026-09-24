@@ -327,7 +327,7 @@ button { transition-property: background-color, color, border-color, opacity, bo
 
 .niri-strip {
   --workspace-pane-gap: 12px;
-  --workspace-panes-per-view: 2;
+  --workspace-panes-per-view: 1;
   scroll-snap-type: x mandatory;
   overscroll-behavior-x: contain;
   -webkit-overflow-scrolling: touch;

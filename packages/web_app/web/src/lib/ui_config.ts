@@ -13,11 +13,11 @@ export interface UiConfig {
 
 export const DEFAULT_UI_CONFIG: UiConfig = {
   workspace_pane_gap: 12,
-  workspace_panes_per_view: 2,
+  workspace_panes_per_view: 1,
   workspace_split_default_pane: 'chat',
   workspace_scroll_direction: 'horizontal',
   workspace_scroll_mode: 'automatic',
-  workspace_scroll_threshold: 2,
+  workspace_scroll_threshold: 3,
   unzoom_on_pane_navigation: false,
   reduced_motion: false,
 }

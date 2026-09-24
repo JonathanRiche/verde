@@ -506,11 +506,11 @@ pub const SessionSummary = struct {
 /// scrolling strip from these values instead of local defaults.
 pub const ConfigUiSnapshot = struct {
     workspace_pane_gap: f32 = 12.0,
-    workspace_panes_per_view: u8 = 2,
+    workspace_panes_per_view: u8 = 1,
     workspace_split_default_pane: []const u8 = "chat",
     workspace_scroll_direction: []const u8 = "horizontal",
     workspace_scroll_mode: []const u8 = "automatic",
-    workspace_scroll_threshold: u8 = 2,
+    workspace_scroll_threshold: u8 = 3,
     unzoom_on_pane_navigation: bool = false,
     reduced_motion: bool = false,
 };
