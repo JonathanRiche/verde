@@ -16,7 +16,6 @@ export function ChatCwdPicker(props: { pane: LivePane }) {
         <Show when={!busy() && !store.chatCwdChoices(props.pane).length}><p class="composer-detail">No validated working directories are available. Close and reopen to check again.</p></Show>
         <For each={store.chatCwdChoices(props.pane)}>{choice => <button type="button" disabled={busy()} aria-pressed={selected() === choice.id} onClick={async () => { setBusy(true); try { if (await store.setChatCwd(props.pane, choice.id)) setOpen(false) } finally { setBusy(false) } }}><strong>{choice.label}</strong><span>{choice.path}</span></button>}</For>
       </>}><p class="composer-detail">This conversation keeps its working directory after work begins. Start a new chat to change it.</p></Show>
-      <p class="composer-detail">Images and slash commands are unavailable in secondary repositories and subfolders. Remote connections also do not support images.</p>
     </div></Show>
   </div>
 }

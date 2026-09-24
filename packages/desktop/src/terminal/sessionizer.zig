@@ -16,6 +16,9 @@ const chat_threads = @import("../chat/threads.zig");
 const db_types = @import("../db/types.zig");
 const process_registry = @import("../daemon/process_registry.zig");
 const repository_path = @import("../daemon/repository_path.zig");
+const shell_command = @import("../daemon/shell_command.zig");
+const bang_commands = @import("../workspace/bang_commands.zig");
+const workspace_file_search = @import("../daemon/workspace_file_search.zig");
 const access_store = @import("../daemon/access_store.zig");
 const connect_auth = @import("../daemon/connect_auth.zig");
 const connect_client = @import("../daemon/connect_client.zig");
@@ -2888,6 +2891,7 @@ pub const Daemon = struct {
             !std.mem.eql(u8, method, "chat.turn.start") and
             !std.mem.eql(u8, method, "chat.turn.steer") and
             !std.mem.eql(u8, method, "chat.followup") and
+            !std.mem.eql(u8, method, store_protocol.METHOD_CHAT_SHELL_RUN) and
             !std.mem.eql(u8, method, headless.attachment_protocol.METHOD_CHAT_ATTACHMENT_CREATE) and
             !std.mem.eql(u8, method, headless.attachment_protocol.METHOD_CHAT_ATTACHMENT_APPEND) and
             !std.mem.eql(u8, method, headless.attachment_protocol.METHOD_CHAT_ATTACHMENT_COMMIT) and
@@ -2922,6 +2926,7 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, "chat.followup")) return try self.chatFollowupResponse(id_value, params);
         if (std.mem.eql(u8, method, "chat.turn.cancel")) return try self.chatTurnCancelResponse(id_value, params);
         if (std.mem.eql(u8, method, "chat.turn.consume")) return try self.chatTurnConsumeResponse(id_value, params);
+        if (std.mem.eql(u8, method, store_protocol.METHOD_CHAT_SHELL_RUN)) return try self.chatShellRunResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.attachment_protocol.METHOD_CHAT_ATTACHMENT_CREATE)) return try self.chatAttachmentCreateResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.attachment_protocol.METHOD_CHAT_ATTACHMENT_APPEND)) return try self.chatAttachmentAppendResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.attachment_protocol.METHOD_CHAT_ATTACHMENT_COMMIT)) return try self.chatAttachmentCommitResponse(id_value, params);
@@ -2945,6 +2950,7 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, store_protocol.METHOD_CONFIG_FAVORITE_MODEL_SET)) return try self.configFavoriteModelSetResponse(id_value, params);
         if (std.mem.eql(u8, method, store_protocol.METHOD_CONFIG_UI_SET)) return try self.configUiSetResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_WORKSPACE_RESOLVE)) return try self.workspaceResolveResponse(id_value, params);
+        if (std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_FILES_SEARCH)) return try workspaceFilesSearchResponse(self, id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_PROCESS_LIST)) return try self.processListResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_PROCESS_DEFINITIONS)) return try self.processDefinitionsResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_PROCESS_INSPECT)) return try self.processInspectResponse(id_value, params);
@@ -8179,6 +8185,160 @@ pub const Daemon = struct {
 
     // Provider-native slash execution; potentially blocking provider work is
     // classified unlocked by methodRunsUnlocked.
+    /// chat.shell.run: composer shell mode (`!command`) for detached clients,
+    /// matching the desktop bang command. Runs unlocked: the working directory
+    /// is resolved from the stored thread/route, the command runs with no
+    /// daemon or store lock held, and the `!command` and result rows are
+    /// appended in short store windows so every client sees them.
+    fn chatShellRunResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        const service = (self.beginStagedAttachmentRequest() catch
+            return try self.stagedAttachmentDrainingResponse(id_value)) orelse
+            return try storeErrorResponse(self.allocator, id_value, error.StoreUnavailable);
+        defer _ = service.in_flight.fetchSub(1, .monotonic);
+
+        var parsed = parseDaemonParams(store_protocol.ShellRunRequest, self.allocator, params) catch
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid shell command request");
+        defer parsed.deinit();
+        const request = parsed.value;
+        const command = std.mem.trim(u8, request.command, &std.ascii.whitespace);
+        if (command.len == 0 or command.len > shell_command.MAX_COMMAND_BYTES or std.mem.indexOfScalar(u8, command, 0) != null) {
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid shell command");
+        }
+
+        const ThreadFacts = struct { supervised: bool, legacy_path_matches: bool };
+        const facts: ThreadFacts = blk: {
+            lockStoreService(service);
+            defer service.mutex.unlock();
+            service.store.requireIdleThread(request.workspace_id, request.local_thread_id) catch |err| return switch (err) {
+                error.Conflict => try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_CONFLICT, "This chat already has a running provider request."),
+                else => try storeErrorResponse(self.allocator, id_value, err),
+            };
+            const row = (service.store.conn.row(
+                "select t.access_mode, w.path, t.cwd from threads t join workspaces w on w.id = t.workspace_id where w.workspace_id = ?1 and t.local_thread_id = ?2",
+                .{ request.workspace_id, request.local_thread_id },
+            ) catch return try storeErrorResponse(self.allocator, id_value, error.StoreUnavailable)) orelse
+                return try storeErrorResponse(self.allocator, id_value, error.ResourceNotFound);
+            defer row.deinit();
+            const legacy_path_matches = if (request.project_path) |path|
+                std.mem.eql(u8, path, row.text(1)) or
+                    (if (row.nullableText(2)) |thread_cwd| std.mem.eql(u8, path, thread_cwd) else false)
+            else
+                false;
+            break :blk .{
+                .supervised = if (row.nullableInt(0)) |code| std.mem.eql(u8, accessModeNameFromCode(code), "supervised") else false,
+                .legacy_path_matches = legacy_path_matches,
+            };
+        };
+
+        // Routed chats resolve through this runtime's repository binding and
+        // never trust a client path; legacy local chats may only name the
+        // stored workspace path or thread cwd.
+        const cwd: []u8 = if (params.object.get("repository_id") != null) route_blk: {
+            var route = (resolveChatExecutionRoute(self, params) catch |err| return switch (err) {
+                error.InvalidParams, error.RouteAttachmentsUnsupported => try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid repository route params"),
+                error.CapabilityUnavailable => try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "repository checkout is unavailable on this runtime"),
+                error.ResourceNotFound => try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_RESOURCE_NOT_FOUND, "repository binding not found on this runtime"),
+                error.StoreCorrupt => try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_STORE_CORRUPT, "store is corrupt"),
+                error.StoreUnavailable => try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_STORE_UNAVAILABLE, "store is unavailable"),
+                error.OutOfMemory => error.OutOfMemory,
+            }) orelse return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid repository route params");
+            defer route.deinit(self.allocator);
+            break :route_blk try self.allocator.dupe(u8, route.cwd orelse route.project_path);
+        } else legacy_blk: {
+            const path = request.project_path orelse
+                return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "repository_id or project_path is required");
+            if (!facts.legacy_path_matches) {
+                return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "project_path does not match this chat's workspace");
+            }
+            break :legacy_blk try self.allocator.dupe(u8, path);
+        };
+        defer self.allocator.free(cwd);
+
+        const destructive = bang_commands.looksDestructive(command);
+        if ((destructive or facts.supervised) and !request.confirmed) {
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                store_protocol.ERR_SHELL_CONFIRMATION_REQUIRED,
+                if (destructive) "Destructive command; explicit approval required." else "Supervised chat; approval required.",
+            );
+        }
+
+        var random_bytes: [8]u8 = undefined;
+        std.Io.Threaded.global_single_threaded.io().random(&random_bytes);
+        const token = std.fmt.bytesToHex(random_bytes, .lower);
+        const command_message_id = try std.fmt.allocPrint(self.allocator, "shell:{s}:command", .{token});
+        defer self.allocator.free(command_message_id);
+        const result_message_id = try std.fmt.allocPrint(self.allocator, "shell:{s}:result", .{token});
+        defer self.allocator.free(result_message_id);
+        const submitted = try std.fmt.allocPrint(self.allocator, "!{s}", .{command});
+        defer self.allocator.free(submitted);
+
+        const started_ms = nowMs();
+        _ = appendShellTranscriptMessage(service, request, .{
+            .message_id = command_message_id,
+            .role = "user",
+            .author = "You",
+            .body = submitted,
+            .created_at_ms = started_ms,
+            .updated_at_ms = started_ms,
+        }) catch |err| return try storeErrorResponse(self.allocator, id_value, err);
+
+        var outcome = shell_command.run(self.allocator, command, cwd, .{}) catch |err| start_failed: {
+            const stderr = try std.fmt.allocPrint(self.allocator, "Could not start command: {s}", .{@errorName(err)});
+            errdefer self.allocator.free(stderr);
+            break :start_failed shell_command.Outcome{
+                .status = .failed,
+                .exit_code = null,
+                .duration_ms = 0,
+                .stdout = try self.allocator.alloc(u8, 0),
+                .stderr = stderr,
+                .truncated = false,
+            };
+        };
+        defer outcome.deinit(self.allocator);
+        const body = try shell_command.formatResultBody(self.allocator, command, cwd, outcome);
+        defer self.allocator.free(body);
+        const finished_ms = nowMs();
+        const written = appendShellTranscriptMessage(service, request, .{
+            .message_id = result_message_id,
+            .role = "system",
+            .author = shell_command.resultAuthor(outcome.status),
+            .body = body,
+            .tool_call_kind = "execute",
+            .tool_call_status = if (outcome.status == .completed) "completed" else "failed",
+            .created_at_ms = finished_ms,
+            .updated_at_ms = finished_ms,
+        }) catch |err| return try storeErrorResponse(self.allocator, id_value, err);
+
+        return try okValueResponse(self.allocator, id_value, store_protocol.ShellRunResult{
+            .status = @tagName(outcome.status),
+            .exit_code = outcome.exit_code,
+            .cwd = cwd,
+            .shell = bang_commands.shellName(),
+            .duration_ms = outcome.duration_ms,
+            .truncated = outcome.truncated,
+            .command_message_id = command_message_id,
+            .result_message_id = result_message_id,
+            .store_revision = written.store_revision,
+        });
+    }
+
+    fn appendShellTranscriptMessage(
+        service: *StoreService,
+        request: store_protocol.ShellRunRequest,
+        message: store_protocol.Message,
+    ) daemon_store.StoreError!store_protocol.WriteResult {
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        return service.store.appendMessage(.{
+            .mutation = .{ .request_key = message.message_id, .client_id = "daemon" },
+            .workspace_id = request.workspace_id,
+            .thread_id = request.local_thread_id,
+            .message = message,
+        });
+    }
+
     fn providerSlashRunResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
         var parsed = parseDaemonParams(headless.providers_protocol.SlashRunRequest, self.allocator, params) catch
             return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid provider slash request");
@@ -12405,6 +12565,9 @@ fn methodRunsUnlocked(method: []const u8) bool {
         std.mem.eql(u8, method, "chat.turn.tail") or
         std.mem.eql(u8, method, "chat.turn.steer") or
         std.mem.eql(u8, method, "chat.followup") or
+        // Composer shell commands run for up to shell_command.TIMEOUT_MS and
+        // take only short store windows around the transcript appends.
+        std.mem.eql(u8, method, store_protocol.METHOD_CHAT_SHELL_RUN) or
         // Attachment staging performs file I/O and owns its own short
         // lockDaemon windows via per-record busy flags.
         std.mem.eql(u8, method, headless.attachment_protocol.METHOD_CHAT_ATTACHMENT_CREATE) or
@@ -12428,6 +12591,9 @@ fn methodRunsUnlocked(method: []const u8) bool {
         std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_HOOKS_SET) or
         std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_MCP_SET) or
         std.mem.eql(u8, method, headless.providers_protocol.METHOD_PROVIDER_TITLE_GENERATE) or
+        // Composer file search resolves its route under short lockDaemon/store
+        // windows, then lists files (git subprocess/walk) with no lock held.
+        std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_FILES_SEARCH) or
         // Local access administration is daemon-owned SQLite work and takes
         // only its own short lockDaemon bookkeeping window.
         isAccessMethod(method) or
@@ -13798,6 +13964,60 @@ fn resolveChatExecutionRoute(
     };
 }
 
+fn workspaceFilesSearchResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+    const allocator = daemon.allocator;
+    if (params != .object) {
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "file search params must be an object");
+    }
+    const query = jsonString(params.object.get("query") orelse .null) orelse "";
+    if (query.len > workspace_file_search.MAX_QUERY_BYTES or std.mem.indexOfAny(u8, query, "\x00\r\n") != null) {
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid file search query");
+    }
+    const limit: usize = switch (params.object.get("limit") orelse .null) {
+        .null => workspace_file_search.DEFAULT_LIMIT,
+        .integer => |value| if (value >= 1) @intCast(@min(value, @as(i64, workspace_file_search.MAX_LIMIT))) else {
+            return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid file search limit");
+        },
+        else => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid file search limit"),
+    };
+
+    // Route resolution is shared with chat.turn.start; the primary repository
+    // is the default so plain workspace chats need not name it.
+    var route_params: std.json.ObjectMap = .empty;
+    defer route_params.deinit(allocator);
+    for ([_][]const u8{ "workspace_id", "relative_cwd", "project_path", "cwd" }) |key| {
+        if (params.object.get(key)) |value| try route_params.put(allocator, key, value);
+    }
+    try route_params.put(allocator, "repository_id", switch (params.object.get("repository_id") orelse .null) {
+        .null => .{ .string = store_protocol.PRIMARY_REPOSITORY_ID },
+        else => |value| value,
+    });
+    var route = (resolveChatExecutionRoute(daemon, .{ .object = route_params }) catch |err| return switch (err) {
+        error.InvalidParams, error.RouteAttachmentsUnsupported => try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid repository route params"),
+        error.CapabilityUnavailable => try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "repository checkout is unavailable on this runtime"),
+        error.ResourceNotFound => try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_RESOURCE_NOT_FOUND, "repository binding not found on this runtime"),
+        error.StoreCorrupt => try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_STORE_CORRUPT, "store is corrupt"),
+        error.StoreUnavailable => try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_STORE_UNAVAILABLE, "store is unavailable"),
+        error.OutOfMemory => error.OutOfMemory,
+    }) orelse return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid repository route params");
+    defer route.deinit(allocator);
+
+    var results = workspace_file_search.search(allocator, route.cwd orelse route.project_path, query, limit) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.SearchUnavailable => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "repository files could not be listed"),
+    };
+    defer results.deinit();
+    return try okValueResponse(allocator, id_value, .{
+        .repository_id = route.repository_id,
+        .relative_cwd = route.relative_cwd,
+        .query = query,
+        .files = results.files,
+        .total_files = results.total_files,
+        .truncated = results.truncated,
+        .source = @tagName(results.source),
+    });
+}
+
 /// browser.history.{record,query,clear}: daemon-owned browsing history behind
 /// the GUI address-bar suggestions. Serves unlocked; SQLite work runs under
 /// the store mutex with `in_flight` pinned so shutdown drains it like
@@ -14008,6 +14228,70 @@ test "repository-routed chat resolves only the daemon binding and persists the s
         });
     }
     try std.testing.expectError(error.CapabilityUnavailable, resolveChatExecutionRoute(&daemon, parsed.value));
+}
+
+test "workspace file search resolves the stored route and returns relative paths only" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/services/api");
+    try tmp.dir.createDirPath(io, "repo/node_modules/dep");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/services/api/search_needle.zig", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/node_modules/dep/search_needle.js", .data = "x" });
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const temporary_root_len = try tmp.dir.realPath(io, &root_buffer);
+    const repository_root = try std.fs.path.join(allocator, &.{ root_buffer[0..temporary_root_len], "repo" });
+    defer allocator.free(repository_root);
+
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    const service = try allocator.create(StoreService);
+    const store = daemon_store.Store.initWithRuntimeIdentity(allocator, db_path, .none, .{
+        .runtime_id = daemon.runtime_id,
+        .instance_id = daemon.instance_id,
+    }) catch |err| {
+        allocator.destroy(service);
+        return err;
+    };
+    service.* = .{ .store = store };
+    daemon.store_service = service;
+    defer detachTestStoreService(&daemon);
+    {
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        _ = try service.store.upsertWorkspace(.{
+            .mutation = .{ .request_key = "search-workspace", .client_id = "search-test" },
+            .workspace = .{ .workspace_id = "search-workspace", .label = "Search", .path = repository_root },
+        });
+    }
+
+    const Case = struct { params: []const u8, expected: ?[]const u8, error_code: ?[]const u8 = null };
+    const cases = [_]Case{
+        .{ .params = "{\"workspace_id\":\"search-workspace\",\"query\":\"needle\"}", .expected = "services/api/search_needle.zig" },
+        .{ .params = "{\"workspace_id\":\"search-workspace\",\"repository_id\":\"primary\",\"relative_cwd\":\"services\",\"query\":\"needle\",\"limit\":5}", .expected = "api/search_needle.zig" },
+        .{ .params = "{\"workspace_id\":\"search-workspace\",\"project_path\":\"/etc\",\"query\":\"passwd\"}", .expected = null, .error_code = headless.protocol.ERR_INVALID_PARAMS },
+        .{ .params = "{\"workspace_id\":\"search-workspace\",\"relative_cwd\":\"../\",\"query\":\"x\"}", .expected = null, .error_code = headless.protocol.ERR_INVALID_PARAMS },
+        .{ .params = "{\"workspace_id\":\"search-workspace\",\"repository_id\":\"missing\",\"query\":\"x\"}", .expected = null, .error_code = headless.protocol.ERR_RESOURCE_NOT_FOUND },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.params, .{});
+        defer parsed.deinit();
+        const response = try workspaceFilesSearchResponse(&daemon, .{ .integer = 1 }, parsed.value);
+        defer allocator.free(response);
+        const decoded = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+        defer decoded.deinit();
+        if (case.error_code) |code| {
+            try std.testing.expectEqualStrings(code, decoded.value.object.get("error").?.object.get("code").?.string);
+            continue;
+        }
+        const files = decoded.value.object.get("result").?.object.get("files").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), files.len);
+        try std.testing.expectEqualStrings(case.expected.?, files[0].object.get("path").?.string);
+        try std.testing.expectEqualStrings("search_needle.zig", files[0].object.get("file_name").?.string);
+    }
 }
 
 test "repository-routed chat rejects client paths attachments storeless use and orphan cwd" {
@@ -18034,6 +18318,7 @@ test "draining dispatcher rejects every state mutator" {
         "chat.followup",
         "chat.turn.cancel",
         "chat.turn.consume",
+        "chat.shell.run",
         "process.start",
         "process.stop",
         "process.restart",
@@ -20331,6 +20616,102 @@ test "legacy interrupted acceptance conflict never terminalizes unowned work" {
 
 test "new interrupted acceptance conflict never terminalizes unowned work" {
     try runAcceptanceOwnershipWorkerScenario(false);
+}
+
+test "chat.shell.run records the command and its bounded result in the transcript" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+    const workspace_path = std.fs.path.dirname(db_path).?;
+
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestRuntimeStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+
+    lockStoreService(daemon.store_service.?);
+    _ = try daemon.store_service.?.store.upsertWorkspace(.{
+        .mutation = .{ .request_key = "shell-ws", .client_id = "daemon" },
+        .workspace = .{ .workspace_id = "ws-shell", .label = "Shell", .path = workspace_path },
+    });
+    _ = try daemon.store_service.?.store.upsertThread(.{
+        .mutation = .{ .request_key = "shell-thread", .client_id = "daemon" },
+        .workspace_id = "ws-shell",
+        .thread = .{ .local_thread_id = "t-shell", .title = "Shell", .provider = "codex", .harness = "local_cli" },
+    });
+    daemon.store_service.?.mutex.unlock();
+
+    const run_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"chat.shell.run\",\"params\":{{\"workspace_id\":\"ws-shell\",\"local_thread_id\":\"t-shell\",\"command\":\" printf hello \",\"project_path\":\"{s}\"}}}}",
+        .{workspace_path},
+    );
+    defer allocator.free(run_request);
+    const run_response = try daemon.handleRequest(run_request);
+    defer allocator.free(run_response);
+    var run_parsed = try std.json.parseFromSlice(std.json.Value, allocator, run_response, .{});
+    defer run_parsed.deinit();
+    const result = run_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqualStrings("completed", result.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 0), result.get("exit_code").?.integer);
+    try std.testing.expectEqualStrings(workspace_path, result.get("cwd").?.string);
+
+    lockStoreService(daemon.store_service.?);
+    var rows = try daemon.store_service.?.store.conn.rows(
+        "select m.role, m.author, m.body, m.tool_call_kind, m.tool_call_status from messages m join threads t on t.id = m.thread_id where t.local_thread_id = ?1 order by m.sort_index",
+        .{"t-shell"},
+    );
+    var count: usize = 0;
+    while (rows.next()) |row| : (count += 1) {
+        if (count == 0) {
+            try std.testing.expectEqual(@as(i64, 0), row.int(0));
+            try std.testing.expectEqualStrings("!printf hello", row.text(2));
+        } else {
+            try std.testing.expectEqual(@as(i64, 2), row.int(0));
+            try std.testing.expectEqualStrings("Ran command", row.text(1));
+            try std.testing.expect(std.mem.startsWith(u8, row.text(2), "$ printf hello\n"));
+            try std.testing.expect(std.mem.endsWith(u8, row.text(2), "stdout:\nhello"));
+            try std.testing.expect(row.nullableInt(3) != null and row.nullableInt(4) != null);
+        }
+    }
+    rows.deinit();
+    daemon.store_service.?.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 2), count);
+
+    // Destructive commands need explicit confirmation; nothing is recorded.
+    const destructive_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"chat.shell.run\",\"params\":{{\"workspace_id\":\"ws-shell\",\"local_thread_id\":\"t-shell\",\"command\":\"rm -f missing-file\",\"project_path\":\"{s}\"}}}}",
+        .{workspace_path},
+    );
+    defer allocator.free(destructive_request);
+    const destructive_response = try daemon.handleRequest(destructive_request);
+    defer allocator.free(destructive_response);
+    try std.testing.expect(std.mem.indexOf(u8, destructive_response, store_protocol.ERR_SHELL_CONFIRMATION_REQUIRED) != null);
+
+    // Legacy chats cannot redirect execution to an arbitrary client path.
+    const smuggled_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":3,"method":"chat.shell.run","params":{"workspace_id":"ws-shell","local_thread_id":"t-shell","command":"pwd","project_path":"/"}}
+    );
+    defer allocator.free(smuggled_response);
+    try std.testing.expect(std.mem.indexOf(u8, smuggled_response, headless.protocol.ERR_INVALID_PARAMS) != null);
+
+    // Routed chats resolve through this runtime's binding and reject client paths.
+    const routed_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":4,"method":"chat.shell.run","params":{"workspace_id":"ws-shell","local_thread_id":"t-shell","command":"pwd","repository_id":"primary","project_path":"/"}}
+    );
+    defer allocator.free(routed_response);
+    try std.testing.expect(std.mem.indexOf(u8, routed_response, headless.protocol.ERR_INVALID_PARAMS) != null);
+
+    lockStoreService(daemon.store_service.?);
+    const total = (try daemon.store_service.?.store.conn.row("select count(*) from messages", .{})).?;
+    const total_count = total.int(0);
+    total.deinit();
+    daemon.store_service.?.mutex.unlock();
+    try std.testing.expectEqual(@as(i64, 2), total_count);
 }
 
 test "durable reads decode canonical and historical daemon chat role codes" {

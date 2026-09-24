@@ -109,7 +109,7 @@ pub const Router = struct {
 };
 
 pub fn allowedMethod(method: []const u8) bool {
-    inline for (.{ "chat.turn.start", "chat.turn.list", "chat.turn.tail", "chat.turn.cancel", "chat.turn.approve", "chat.turn.steer", "chat.followup", "chat.thread.get", "workspace.repository.manifest.get", "provider.models.list" }) |allowed| {
+    inline for (.{ "chat.turn.start", "chat.turn.list", "chat.turn.tail", "chat.turn.cancel", "chat.turn.approve", "chat.turn.steer", "chat.followup", "chat.thread.get", "workspace.repository.manifest.get", "workspace.files.search", "provider.models.list", "providers.status", "chat.message.list", "provider.slash.list", "provider.slash.run", "provider.thread.sync", "chat.shell.run", "chat.attachment.create", "chat.attachment.append", "chat.attachment.commit" }) |allowed| {
         if (std.mem.eql(u8, method, allowed)) return true;
     }
     return false;
@@ -118,6 +118,9 @@ pub fn allowedMethod(method: []const u8) bool {
 test "web runtime routing exposes only chat execution and repository inspection" {
     try std.testing.expect(allowedMethod("chat.turn.start"));
     try std.testing.expect(allowedMethod("chat.turn.cancel"));
+    try std.testing.expect(allowedMethod("chat.attachment.append"));
+    try std.testing.expect(allowedMethod("provider.slash.run"));
+    try std.testing.expect(allowedMethod("chat.shell.run"));
     try std.testing.expect(!allowedMethod("access.pairing.create"));
     try std.testing.expect(!allowedMethod("workspace.repository.binding.upsert"));
 }

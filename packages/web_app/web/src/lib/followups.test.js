@@ -153,11 +153,11 @@ describe('follow-up contract', () => {
     f.observeSteer(pane, 'turn-1', { steer_id: 'first', body: 'first' }, 2)
     expect(f.pendingFollowup(pane)?.text).toBe('second')
   })
-  test('remote images, empty submissions, and replacement cannot lose an existing draft', async () => {
+  test('remote images queue as the next turn; empty submissions and replacement cannot lose an existing draft', async () => {
     const remote = fixture({ remote: () => true })
-    expect(await remote.submit(pane, 'image', [image])).toBe(false)
+    expect(await remote.submit(pane, 'image', [image])).toBe(true)
     expect(remote.calls).toHaveLength(0)
-    expect(remote.notices[0]).toContain('images are not supported')
+    expect(remote.pendingFollowup(pane)).toMatchObject({ kind: 'queue', state: 'pending', images: [image] })
     const f = fixture({ kind: () => 'queue' })
     expect(await f.submit(pane, ' ', [])).toBe(false)
     await f.submit(pane, 'first', [])

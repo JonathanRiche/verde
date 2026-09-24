@@ -28,10 +28,13 @@ import {
   buildHerdrHandoffScript, chainLayouts, herdrPanePlan, openingExchange, parseHerdrLinkMarker, providerLabel,
   type HandoffContextMode, type HerdrPanePlan,
 } from './web_actions'
+import { turnImageParams } from './staged_attachments'
+import { pendingShellRows, runComposerShellCommand, shellRunParams } from './shell_mode'
 import { createComposerCommands, parseSlashCommand, classifyBangCommand, repositoryCommandPath, type SlashCommandResult } from './composer_commands'
 import { isPlaceholderThreadTitle, makeThreadTitle } from './thread_title'
 import {
   LiveClient,
+  chatImageUrl,
   deleteChatImage,
   fetchRpc,
   unwrapList,
@@ -1996,12 +1999,37 @@ export function createAppStore() {
   }
   const readiness = createProviderReadinessApi(interactiveCall)
   const chatRuntimeBlocker = (pane: LivePane) => runtimeBlocker(connectionFor(pane), routeThread(pane).runtime_id, connections())
-  const providerReadiness = (pane: LivePane, provider = routeThread(pane).provider ?? pane.provider ?? 'codex') =>
-    readiness.providerReadiness(provider, connectionFor(pane) !== 'local')
-  const recheckProviderReadiness = async (pane: LivePane, options: { silent?: boolean } = {}): Promise<void> => {
+  /// Per-connection provider status, fetched from that runtime's daemon.
+  const remoteReadiness = new Map<string, { api: ReturnType<typeof createProviderReadinessApi>; requested: boolean }>()
+  const readinessFor = (profile: string) => {
+    let entry = remoteReadiness.get(profile)
+    if (!entry) {
+      entry = { requested: false, api: createProviderReadinessApi(async (method, params) => {
+        const connection = connections()?.connections.find((row) => row.profile_id === profile)
+        if (!connection) throw new Error('The saved connection is unavailable')
+        return connectionRpc(connection, null, method, params)
+      }) }
+      remoteReadiness.set(profile, entry)
+    }
+    return entry
+  }
+  const providerReadiness = (pane: LivePane, provider = routeThread(pane).provider ?? pane.provider ?? 'codex') => {
+    const profile = connectionFor(pane)
+    if (profile === 'local') return readiness.providerReadiness(provider)
+    const entry = readinessFor(profile)
+    if (!entry.requested && connections()) {
+      entry.requested = true
+      queueMicrotask(() => void entry.api.recheckProviderReadiness())
+    }
+    return entry.api.providerReadiness(provider)
+  }
+  const recheckProviderReadiness = async (pane: LivePane, _options: { silent?: boolean } = {}): Promise<void> => {
     await refreshConnections()
-    if (connectionFor(pane) !== 'local') {
-      if (!options.silent) setNotice('Provider checks on remote connections are not exposed by the web bridge. Connection status was refreshed.')
+    const profile = connectionFor(pane)
+    if (profile !== 'local') {
+      const entry = readinessFor(profile)
+      entry.requested = true
+      await entry.api.recheckProviderReadiness()
       return
     }
     await readiness.recheckProviderReadiness()
@@ -2058,6 +2086,12 @@ export function createAppStore() {
     notice: setNotice,
     local: (pane, name, args) => runLocalComposerCommand(pane, name, args),
     call: paneRpc,
+    // `@` search runs where the chat runs (paneRpc routes local vs remote);
+    // the daemon resolves this stable route to its own checkout.
+    fileRoute: (pane) => {
+      const thread = routeThread(pane)
+      return { workspace_id: paneOwningWorkspaceId(pane), repository_id: thread.repository_id ?? 'primary', relative_cwd: thread.repository_cwd ?? null }
+    },
     context: async (pane) => {
       if (pane.kind !== 'chat') throw new Error('Slash commands require a chat pane.')
       const ws = workspaces().find((row) => row.workspace_id === paneOwningWorkspaceId(pane))
@@ -2067,17 +2101,20 @@ export function createAppStore() {
       const thread = routeThread(pane)
       const routeKey = composerRouteKey(pane)
       if (thread.harness && thread.harness !== 'local_cli') throw new Error('Slash commands are unsupported by this harness.')
-      if (connectionFor(pane) !== 'local') throw new Error('Slash commands are unavailable for saved remote connections in the web app.')
-      if (!readiness.providerRuntimeId()) await readiness.recheckProviderReadiness()
-      const runtime = readiness.providerRuntimeId()
+      const profile = connectionFor(pane)
+      const remoteRuntime = () => connections()?.connections.find((row) => row.profile_id === profile)?.runtime_id ?? null
+      if (profile === 'local' && !readiness.providerRuntimeId()) await readiness.recheckProviderReadiness()
+      const runtime = profile === 'local' ? readiness.providerRuntimeId() : remoteRuntime()
       if (!runtime || (thread.runtime_id && thread.runtime_id !== runtime)) throw new Error('The chat runtime is unavailable or changed.')
-      const response = await interactiveCall('workspace.repository.manifest.get', { workspace_id: ws.workspace_id })
+      const response = await paneRpc(pane, 'workspace.repository.manifest.get', { workspace_id: ws.workspace_id })
       if (response.error || response.ok === false) throw new Error(response.error?.message ?? 'Could not resolve the repository.')
       const manifest = unwrapResult<Parameters<typeof repositoryCommandPath>[0] & { workspace_id: string }>(response)
       if (!manifest || manifest.workspace_id !== ws.workspace_id) throw new Error('The repository manifest is unavailable.')
-      const project_path = repositoryCommandPath(manifest, thread.repository_id ?? 'primary', runtime, thread.repository_cwd)
-      if (project_path !== ws.path) throw new Error('The workspace repository root changed. Reload the workspace before running commands.')
-      if (routeKey !== composerRouteKey(pane) || runtime !== readiness.providerRuntimeId()) throw new Error('The chat route changed. Select the command again.')
+      const repository_id = thread.repository_id ?? 'primary'
+      const project_path = repositoryCommandPath(manifest, repository_id, runtime, thread.repository_cwd)
+      if (profile === 'local' && repository_id === 'primary' && !thread.repository_cwd && project_path !== ws.path) throw new Error('The workspace repository root changed. Reload the workspace before running commands.')
+      const currentRuntime = profile === 'local' ? readiness.providerRuntimeId() : remoteRuntime()
+      if (routeKey !== composerRouteKey(pane) || runtime !== currentRuntime) throw new Error('The chat route changed. Select the command again.')
       return { provider: thread.provider ?? pane.provider ?? 'codex', project_path, thread_id: thread.provider_thread_id ?? pane.provider_thread_id ?? null }
     },
   })
@@ -2944,17 +2981,16 @@ export function createAppStore() {
     start: async (pane, followup) => {
       const ws = workspaces().find((row) => row.workspace_id === paneOwningWorkspaceId(pane))
       if (!ws || !pane.thread_id) throw new FollowupRejectedError('The follow-up workspace or thread is unavailable')
-      if (!followupImagesSupported(pane, followup.images)) throw new FollowupRejectedError('The follow-up image route is unsupported')
       setSending(true)
       try {
         const thread = routeThread(pane)
         const remote = connectionFor(pane) !== 'local'
+        const cwd_params = chatCwdTurnParams(thread, remote, ws.path)
         const params = {
           turn_id: followup.next_turn_id, workspace_id: ws.workspace_id, local_thread_id: pane.thread_id,
-          ...chatCwdTurnParams(thread, remote, ws.path),
+          ...cwd_params,
           prompt: followup.text,
-          image_paths: followup.images.map((image) => image.path),
-          images: followup.images.map((image) => ({ path: image.path, mime: image.mime, byte_size: image.byte_size ?? 0 })),
+          ...await chatTurnImages(pane, followup.images, cwd_params),
           thread_title: thread.title, provider: thread.provider ?? pane.provider ?? 'codex',
           harness: thread.harness ?? 'local_cli',
           provider_thread_id: lastTurns().find((turn) => turn.turn_id === followup.turn_id)?.provider_thread_id ?? thread.provider_thread_id,
@@ -2978,13 +3014,17 @@ export function createAppStore() {
     },
   })
 
-  const followupImagesSupported = (pane: LivePane, images: Attachment[]): boolean => {
-    if (!images.length) return true
-    const thread = routeThread(pane)
-    if (connectionFor(pane) === 'local' && !thread.repository_cwd && (!thread.repository_id || thread.repository_id === 'primary')) return true
-    setNotice('Images are not supported for remote or repository-routed chats. Your draft and attachments are kept.')
-    return false
+  /// Gateway-stored image bytes, re-read so they can be staged on the daemon
+  /// that actually runs a routed or remote chat.
+  const readChatImageBytes = async (image: Attachment): Promise<Uint8Array> => {
+    const url = chatImageUrl(image)
+    if (!url) throw new Error(`${image.name ?? 'An image'} is no longer available. Attach it again.`)
+    const response = await fetch(url, { credentials: 'same-origin' })
+    if (!response.ok) throw new Error(`${image.name ?? 'An image'} is no longer available. Attach it again.`)
+    return new Uint8Array(await response.arrayBuffer())
   }
+  const chatTurnImages = (pane: LivePane, images: Attachment[], cwdParams: object) =>
+    turnImageParams(images, !('project_path' in cwdParams), (method, params) => paneRpc(pane, method, params), readChatImageBytes)
 
   const submitFollowup = async (pane: LivePane, kind?: FollowupKind): Promise<boolean> => {
     if (pane.kind !== 'chat' || !pane.thread_id || isSubagentThreadId(pane.thread_id) ||
@@ -2997,8 +3037,71 @@ export function createAppStore() {
       return false
     }
     const images = [...attachmentsFor(pane)]
-    if (!followupImagesSupported(pane, images)) return false
     return followups.submit(pane, slash.kind === 'literal' ? slash.text : bang.text, images, kind)
+  }
+
+  /** Composer `!command`: the daemon runs it in the chat's workspace and records both rows. */
+  const runShellDraft = async (current: LivePane, ws: Workspace, rawCommand: string) => {
+    const command = rawCommand.trim()
+    const local_thread_id = current.thread_id
+    if (!command || !local_thread_id) return
+    if (attachmentsFor(current).length > 0) {
+      setNotice('Remove image attachments before running a shell command.')
+      return
+    }
+    if (activeFollowupTurn(current) || paneWorking(current)) {
+      setNotice('Wait for the current response to finish before running a shell command.')
+      return
+    }
+    setSending(true)
+    const key = paneKey(current.workspace_id, current.pane_id)
+    const ids = { command: mintId('local-shell-'), running: mintId('local-shell-run-') }
+    setDraftFor(current, '')
+    scheduleComposerCacheWrite()
+    setTranscripts((prev) => ({ ...prev, [key]: [...(prev[key] ?? []), ...pendingShellRows(command, Date.now(), ids)] }))
+    const dropPending = () => setTranscripts((prev) => ({
+      ...prev,
+      [key]: (prev[key] ?? []).filter((row) => row.message_id !== ids.command && row.message_id !== ids.running),
+    }))
+    let ran = false
+    try {
+      await refreshConnections()
+      const profile = connectionFor(current)
+      const remote = profile !== 'local'
+      const connection = connections()?.connections.find((row) => row.profile_id === profile)
+      if (remote && (!connection?.ready || !connection.runtime_id)) {
+        setNotice(`${connection?.label ?? profile}: ${connection?.failure ?? connection?.phase ?? 'unavailable'}`)
+        return
+      }
+      const route = routeThread(current)
+      const stored_title = route.title ?? current.thread_title ?? 'New Chat'
+      if (!remote) {
+        // Local chats may still be opening; commit the row so the daemon can
+        // record the command in its transcript (desktop commits on `!` too).
+        const title = isOpeningThread(route, stored_title) ? makeThreadTitle(`!${command}`) : stored_title
+        const patch = { profile_id: profile, runtime_id: route.runtime_id ?? null, repository_id: route.repository_id ?? 'primary', repository_cwd: route.repository_cwd ?? null, title, committed: true }
+        const saved = await upsertThreadMetadata(ws, current, patch)
+        if (!saved || saved.error || saved.ok === false) throw new Error(saved?.error?.message ?? 'Could not save the chat')
+        setThreadsByWorkspace((prev) => ({ ...prev, [ws.workspace_id]: (prev[ws.workspace_id] ?? []).map((row) => row.local_thread_id === current.thread_id ? { ...row, ...patch } : row) }))
+        publishPanes(workspaces())
+      }
+      const outcome = await runComposerShellCommand(
+        { call: (params) => paneRpc(current, 'chat.shell.run', params), confirm: (message) => globalThis.confirm?.(message) ?? false },
+        shellRunParams({ workspace_id: ws.workspace_id, local_thread_id }, command, route, remote, ws.path),
+      )
+      ran = outcome.kind === 'ran'
+      setNotice(outcome.notice)
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : String(err))
+    } finally {
+      if (ran) await loadTranscript(current, true).catch(() => undefined)
+      dropPending()
+      if (!ran && !draftFor(current)) {
+        setDraftFor(current, `!${command}`)
+        scheduleComposerCacheWrite()
+      }
+      setSending(false)
+    }
   }
 
   const sendDraft = async (pane = focusedChat()) => {
@@ -3025,7 +3128,7 @@ export function createAppStore() {
     }
     const bang = classifyBangCommand(rawDraft)
     if (bang.kind === 'shell') {
-      setNotice('Composer shell mode is unavailable in the web app; no supported command-result RPC exists.')
+      await runShellDraft(current, ws, bang.text)
       return
     }
     if (activeFollowupTurn(current) || paneWorking(current)) {
@@ -3034,7 +3137,6 @@ export function createAppStore() {
     }
     const text = (slash.kind === 'literal' ? slash.text : bang.text).trim()
     const images = [...attachmentsFor(current)]
-    if (!followupImagesSupported(current, images)) return
     if (!text && images.length === 0) return
     setSending(true)
     // Optimistic send: clear the store draft immediately. The textarea is
@@ -3087,11 +3189,6 @@ export function createAppStore() {
         setNotice(`${connection?.label ?? profile}: ${connection?.failure ?? connection?.phase ?? 'unavailable'}`)
         return
       }
-      if (remote && images.length) {
-        rollback()
-        setNotice('Remote chat attachments are not supported by the web connection bridge yet. Your attachments are kept.')
-        return
-      }
       setNotice(null)
       // A model click persists asynchronously. Keep the optimistic submit
       // immediate, but read/start only after that queued write has landed so
@@ -3122,18 +3219,15 @@ export function createAppStore() {
         ? makeThreadTitle(fallback_prompt)
         : stored_title
       const turn_id = mintId('web-turn-')
+      const cwd_params = chatCwdTurnParams(route_patch, remote, ws.path)
+      const image_params = await chatTurnImages(current, images, cwd_params)
       const sent = await paneRpc(current, 'chat.turn.start', {
         turn_id,
         workspace_id: ws.workspace_id,
         local_thread_id: current.thread_id,
-        ...chatCwdTurnParams(route_patch, remote, ws.path),
+        ...cwd_params,
         prompt: text,
-        image_paths: images.map((image) => image.path),
-        images: images.map((image) => ({
-          path: image.path,
-          mime: image.mime,
-          byte_size: image.byte_size ?? 0,
-        })),
+        ...image_params,
         thread_title,
         provider: thread?.provider ?? current.provider ?? 'codex',
         harness: thread?.harness ?? 'local_cli',
@@ -3667,11 +3761,11 @@ export function createAppStore() {
   }
 
   /// Whole thread transcript, oldest first, bounded to keep huge threads cheap.
-  const fetchThreadMessages = async (workspace_id: string, local_thread_id: string, maxPages = 40): Promise<Message[]> => {
+  const fetchThreadMessages = async (pane: LivePane, workspace_id: string, local_thread_id: string, maxPages = 40): Promise<Message[]> => {
     let messages: Message[] = []
     let cursor: string | undefined
     for (let page = 0; page < maxPages; page++) {
-      const next = await fetchTranscriptPage(interactiveCall, { workspace_id, local_thread_id }, cursor)
+      const next = await fetchTranscriptPage((method, params) => paneRpc(pane, method, params), { workspace_id, local_thread_id }, cursor)
       messages = prependTranscriptPage(next.messages, messages)
       if (!next.cursor) break
       cursor = next.cursor
@@ -3707,8 +3801,8 @@ export function createAppStore() {
   }
 
   const regenerateTitle = async (ws: Workspace, pane: LivePane) => {
-    if (!pane.thread_id || !localChatOnly(pane)) return
-    const messages = await fetchThreadMessages(ws.workspace_id, pane.thread_id, 4)
+    if (!pane.thread_id) return
+    const messages = await fetchThreadMessages(pane, ws.workspace_id, pane.thread_id, 4)
     const exchange = openingExchange(messages.length ? messages : transcripts()[paneKey(pane.workspace_id, pane.pane_id)] ?? [])
     if (!exchange) { setNotice('Title generation needs a first message and a reply.'); return }
     const provider = (TITLE_PROVIDERS as readonly string[]).includes(titleConfig.provider) ? titleConfig.provider : 'codex'
@@ -3718,7 +3812,8 @@ export function createAppStore() {
       ...(titleConfig.model ? { model_ref: titleConfig.model } : {}),
       fast: provider === 'codex',
       access_mode: 'supervised',
-      cwd: chatCwdPath(ws, routeThread(pane)),
+      // Title generation is text-only; remote chats run it on this host.
+      cwd: connectionFor(pane) === 'local' ? chatCwdPath(ws, routeThread(pane)) : ws.path,
       user_text: exchange.user,
       assistant_text: exchange.assistant,
     })
@@ -3753,7 +3848,7 @@ export function createAppStore() {
     })
     if (!choice) return
     const provider = choice.provider ?? targets[0] ?? 'codex'
-    const messages = (await fetchThreadMessages(ws.workspace_id, pane.thread_id))
+    const messages = (await fetchThreadMessages(pane, ws.workspace_id, pane.thread_id))
       .filter((message) => !message.tool_call_id && message.body.trim())
     const listed = await interactiveCall('process.list', { workspace: { workspace_id: ws.workspace_id, workspace_path: ws.path } })
     const processes = (unwrapResult<{ processes?: Array<{ id: string; name?: string; command?: string; status?: string; kind?: string }> }>(listed)?.processes ?? [])

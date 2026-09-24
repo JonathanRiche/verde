@@ -35,6 +35,10 @@ pub const METHOD_CHAT_THREAD_LIST: []const u8 = "chat.thread.list";
 pub const METHOD_WORKSPACE_LIST: []const u8 = "workspace.list";
 pub const METHOD_WORKSPACE_REPOSITORY_MANIFEST_GET: []const u8 =
     "workspace.repository.manifest.get";
+/// Read-only composer `@` mention search inside a daemon-resolved repository
+/// route. Clients send `{workspace_id, repository_id?, relative_cwd?, query,
+/// limit?}`; results are root-relative paths only.
+pub const METHOD_WORKSPACE_FILES_SEARCH: []const u8 = "workspace.files.search";
 pub const METHOD_WORKSPACE_REPOSITORY_UPSERT: []const u8 =
     "workspace.repository.upsert";
 pub const METHOD_WORKSPACE_REPOSITORY_REMOVE: []const u8 =
@@ -47,6 +51,11 @@ pub const METHOD_WORKSPACE_REPOSITORY_BINDING_REMOVE: []const u8 =
     "workspace.repository.binding.remove";
 pub const METHOD_CHAT_MESSAGE_LIST: []const u8 = "chat.message.list";
 pub const METHOD_CHAT_TURN_RECORD: []const u8 = "chat.turn.record";
+/// Composer shell mode (`!command`): run one bounded command in the chat's
+/// daemon-resolved working directory and record it in the transcript.
+pub const METHOD_CHAT_SHELL_RUN: []const u8 = "chat.shell.run";
+/// Returned by `chat.shell.run` when the command needs `confirmed: true`.
+pub const ERR_SHELL_CONFIRMATION_REQUIRED: []const u8 = "confirmation_required";
 pub const METHOD_CONFIG_FAVORITE_MODEL_SET: []const u8 = "config.favoriteModel.set";
 pub const METHOD_CONFIG_UI_SET: []const u8 = "config.ui.set";
 /// Durable browsing history behind address-bar suggestions. `record` counts
@@ -723,6 +732,32 @@ pub const WorkspaceListResult = struct {
     workspaces: []const WorkspaceListItem = &.{},
     next_cursor: ?[]const u8 = null,
     store_revision: u64 = 0,
+};
+
+/// `chat.shell.run` params. The working directory uses the same route fields
+/// as `chat.turn.start`: `repository_id` (+ optional `relative_cwd`) resolves
+/// through this runtime's repository binding; legacy local chats send
+/// `project_path`, which must equal the stored workspace path or thread cwd.
+pub const ShellRunRequest = struct {
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
+    command: []const u8,
+    /// Destructive commands and supervised chats require explicit approval.
+    confirmed: bool = false,
+    project_path: ?[]const u8 = null,
+};
+
+pub const ShellRunResult = struct {
+    /// `completed`, `failed`, or `timed_out`.
+    status: []const u8,
+    exit_code: ?u8 = null,
+    cwd: []const u8,
+    shell: []const u8,
+    duration_ms: i64,
+    truncated: bool = false,
+    command_message_id: []const u8,
+    result_message_id: []const u8,
+    store_revision: u64,
 };
 
 /// Bidirectional bounded transcript request. A returned cursor is opaque and

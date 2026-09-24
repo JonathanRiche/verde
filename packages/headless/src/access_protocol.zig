@@ -225,6 +225,10 @@ pub fn requiredScopeMaskForRpc(method: []const u8) ?u16 {
         std.mem.eql(u8, method, "chat.turn.list") or
         std.mem.eql(u8, method, "chat.turn.tail")) return scopeBit(.chat_read);
 
+    // Composer shell mode appends to the transcript and executes arbitrary
+    // commands, so it needs both chat and terminal write authority.
+    if (std.mem.eql(u8, method, "chat.shell.run")) return scopeBit(.chat_write) | scopeBit(.terminal_write);
+
     // Staged attachment uploads share the chat-write authority of the turn
     // that will claim them. Named through the protocol constants so the
     // advertised chat.attachments.v1 capability and this allowlist cannot
@@ -271,7 +275,8 @@ pub fn requiredScopeMaskForRpc(method: []const u8) ?u16 {
 
     if (std.mem.eql(u8, method, "workspace.resolve") or
         std.mem.eql(u8, method, "workspace.list") or
-        std.mem.eql(u8, method, "workspace.repository.manifest.get")) return scopeBit(.repository_read);
+        std.mem.eql(u8, method, "workspace.repository.manifest.get") or
+        std.mem.eql(u8, method, "workspace.files.search")) return scopeBit(.repository_read);
 
     if (std.mem.eql(u8, method, "workspace.upsert") or
         std.mem.eql(u8, method, "workspace.repository.upsert") or
@@ -714,4 +719,11 @@ test "paired RPC scope policy is exact and fails closed" {
 
 test "thread sync requires chat write authority" {
     try std.testing.expectEqual(scopeBit(.chat_write), requiredScopeMaskForRpc("provider.thread.sync").?);
+}
+
+test "composer shell commands require chat and terminal write authority" {
+    const required = requiredScopeMaskForRpc("chat.shell.run").?;
+    try std.testing.expect(scopeMaskContains(required, scopeBit(.chat_write)));
+    try std.testing.expect(scopeMaskContains(required, scopeBit(.terminal_write)));
+    try std.testing.expect(scopeMaskContains(try scopeMask(&DEFAULT_SCOPE_NAMES), required));
 }

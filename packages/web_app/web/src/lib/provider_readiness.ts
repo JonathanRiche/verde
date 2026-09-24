@@ -59,8 +59,7 @@ export function createProviderReadinessApi(call: (method: string, params: unknow
     })()
     return pending
   }
-  function providerReadiness(provider: string, remote = false): ProviderReadiness {
-    if (remote) return { provider, state: 'unsupported', label: 'Provider status not supported', detail: 'This connection does not support provider status checks.' }
+  function providerReadiness(provider: string): ProviderReadiness {
     if (checking() || !checked()) return { provider, state: 'checking', label: 'Checking', detail: 'Checking provider installation.' }
     return rows()[provider] ?? { provider, state: 'unavailable', label: 'Provider status unavailable', detail: 'The daemon could not report provider status. You can still try sending a message.' }
   }

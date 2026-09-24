@@ -813,7 +813,7 @@ function contextMenuItems(target: SidebarMenuTarget): MenuItem[] {
   return ([
     paneZoomItem(pane),
     { action: 'thread-rename', label: 'Rename chat', disabled: !pane.thread_id },
-    { action: 'thread-regenerate-title', label: 'Regenerate title', disabled: busy || !pane.thread_id || remote },
+    { action: 'thread-regenerate-title', label: 'Regenerate title', disabled: busy || !pane.thread_id },
     { action: 'thread-sync', label: 'Sync thread', disabled: busy || !pane.thread_id || !pane.provider_thread_id || remote },
     { action: 'thread-handoff', label: 'Handoff to another agent', disabled: busy || !pane.thread_id },
     { action: 'thread-open-tui', label: `Open in TUI: ${provider}`, disabled: busy || !pane.provider_thread_id || remote },

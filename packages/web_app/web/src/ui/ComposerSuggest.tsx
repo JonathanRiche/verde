@@ -1,5 +1,5 @@
 import { For, Show, createEffect, createMemo, createSignal, createUniqueId, onCleanup, onMount } from 'solid-js'
-import { acceptSlashCommand, fileMentionAtCaret, slashTokenAtCaret, type ComposerReplacement, type SlashCommand } from '../lib/composer_commands'
+import { acceptFileMention, acceptSlashCommand, fileMentionAtCaret, slashTokenAtCaret, type ComposerReplacement, type FileMatch, type SlashCommand } from '../lib/composer_commands'
 import { store } from '../lib/store'
 import { parseUsageSummary } from '../lib/usage'
 import type { LivePane } from '../lib/types'
@@ -30,16 +30,29 @@ export function ComposerSuggest(props: {
     onCleanup(() => { viewport?.removeEventListener('resize', measure); window.removeEventListener('resize', measure) })
   })
   const [commands, setCommands] = createSignal<SlashCommand[]>([])
+  const [files, setFiles] = createSignal<FileMatch[]>([])
   const [busy, setBusy] = createSignal(false), [message, setMessage] = createSignal('')
   const [selected, setSelected] = createSignal(0), [dismissed, setDismissed] = createSignal(false)
   const token = createMemo(() => props.composing ? null : slashTokenAtCaret(props.draft, props.caret) ?? fileMentionAtCaret(props.draft, props.caret))
   const slash = () => Boolean(token() && props.draft[token()!.start] === '/')
-  const matches = () => commands().filter(command => command.name.slice(1).toLowerCase().includes(token()?.query.toLowerCase() ?? ''))
+  type Option = { key: string; title: string; detail: string; badge?: string; accept: () => ComposerReplacement | null }
+  const matches = (): Option[] => slash()
+    ? commands().filter(command => command.name.slice(1).toLowerCase().includes(token()?.query.toLowerCase() ?? '')).map(command => ({
+      key: command.name, title: command.name, detail: command.summary,
+      badge: command.availability && command.availability !== 'available' ? command.availability : undefined,
+      accept: () => acceptSlashCommand(props.draft, props.caret, command.name),
+    }))
+    : files().map(file => {
+      const slashAt = file.path.lastIndexOf('/')
+      return { key: file.path, title: file.file_name, detail: slashAt > 0 ? file.path.slice(0, slashAt) : '', accept: () => acceptFileMention(props.draft, props.caret, file.path) }
+    })
   let generation = 0
   createEffect(() => {
     const current = token()
     const request = ++generation
     setDismissed(false); setSelected(0); setCommands([]); setMessage('')
+    // Keep the previous file list while the next query loads to avoid flicker.
+    if (!current || slash()) setFiles([])
     if (!current) { setBusy(false); return }
     const isSlash = slash()
     setBusy(true)
@@ -54,15 +67,16 @@ export function ComposerSuggest(props: {
         } else {
           const result = await store.searchFiles(props.pane, current.query, abort.signal)
           if (generation !== request) return
-          setMessage(result.status === 'unsupported' ? 'Workspace file search is not available in the web app. You can still type a file reference.' : 'Search cancelled.')
+          if (result.status === 'ok') setFiles(result.files)
+          else if (result.status === 'error') { setFiles([]); setMessage(result.message ?? 'File search failed.') }
         }
       } finally { if (generation === request) setBusy(false) }
     }, 100)
     onCleanup(() => { clearTimeout(timer); abort.abort() })
   })
   const expanded = () => Boolean(token()) && !dismissed()
-  const accept = (command: SlashCommand) => {
-    const replacement = acceptSlashCommand(props.draft, props.caret, command.name)
+  const accept = (option: Option) => {
+    const replacement = option.accept()
     if (replacement) props.accept(replacement)
     setDismissed(true)
   }
@@ -87,9 +101,9 @@ export function ComposerSuggest(props: {
     <div class="composer-surface-heading"><strong>{slash() ? 'Commands' : 'Files'}</strong><button type="button" onPointerDown={event => event.preventDefault()} onClick={close} aria-label="Dismiss suggestions">×</button></div>
     <Show when={busy()}><p class="composer-detail" role="status">Loading…</p></Show>
     <Show when={message()}><p class="composer-detail" role="status">{message()}</p></Show>
-    <Show when={!busy() && !message() && !matches().length}><p class="composer-detail">No matching commands.</p></Show>
-    <div id={id} role="listbox" aria-label="Commands"><For each={matches()}>{(command, index) => <button type="button" role="option" id={`${id}-${index()}`} aria-selected={selected() === index()} class="composer-suggestion" onPointerDown={event => event.preventDefault()} onClick={() => accept(command)}>
-      <strong>{command.name}<Show when={command.availability && command.availability !== 'available'}><small> · {command.availability}</small></Show></strong><span>{command.summary}</span>
+    <Show when={!busy() && !message() && !matches().length}><p class="composer-detail">{slash() ? 'No matching commands.' : 'No matching files.'}</p></Show>
+    <div id={id} role="listbox" aria-label={slash() ? 'Commands' : 'Files'}><For each={matches()}>{(option, index) => <button type="button" role="option" id={`${id}-${index()}`} aria-selected={selected() === index()} class="composer-suggestion" onPointerDown={event => event.preventDefault()} onClick={() => accept(option)}>
+      <strong>{option.title}<Show when={option.badge}><small> · {option.badge}</small></Show></strong><span>{option.detail}</span>
     </button>}</For></div>
   </div></Show>
 }

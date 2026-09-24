@@ -72,7 +72,7 @@ export function acceptSlashCommand(draft: string, caret: number, name: string): 
 export function acceptFileMention(draft: string, caret: number, relativePath: string): ComposerReplacement | null {
   const token = fileMentionAtCaret(draft, caret)
   // Only accept repository-relative paths. This is insertion validation, not
-  // authorization to read files; no filesystem RPC is available here.
+  // authorization to read files; daemon search results are re-checked here.
   if (!token || !relativePath || /[\r\n\0\\]/.test(relativePath) || relativePath.startsWith('/') || /^[a-z]:/i.test(relativePath) || relativePath.split('/').some((part) => part === '..' || !part)) return null
   return replaceToken(draft, token, `@${relativePath}`)
 }
@@ -97,23 +97,47 @@ export interface ComposerCommandContext {
   thread_id: string | null
 }
 
-/** Only the primary root is safe until slash RPCs support repository path resolution. */
+/**
+ * The checkout a chat's provider runs in on `runtimeId`: the repository
+ * binding root plus the chat's validated relative working directory.
+ */
 export function repositoryCommandPath(manifest: { repositories?: Array<{
   repository_id: string; bindings?: Array<{ runtime_id: string; root_path: string; availability?: string }>
 }> }, repositoryId: string, runtimeId: string, relativeCwd?: string | null): string {
-  if (repositoryId !== 'primary' || relativeCwd) throw new Error('Slash commands are unavailable for repository or subfolder working directories until the daemon supports safe path resolution.')
   const binding = manifest.repositories?.find((row) => row.repository_id === repositoryId)
     ?.bindings?.find((row) => row.runtime_id === runtimeId && (!row.availability || row.availability === 'available'))
   if (!binding?.root_path) throw new Error('The selected repository is unavailable on this runtime.')
-  if (!binding.root_path.startsWith('/') || /[\\\x00-\x1f]/.test(binding.root_path) || binding.root_path.split('/').some((part) => part === '..' || part === '.')) throw new Error('Invalid repository root.')
-  return binding.root_path
+  const unsafe = (path: string) => /[\\\x00-\x1f]/.test(path) || path.split('/').some((part) => part === '..' || part === '.')
+  if (!binding.root_path.startsWith('/') || unsafe(binding.root_path)) throw new Error('Invalid repository root.')
+  if (!relativeCwd) return binding.root_path
+  if (relativeCwd.startsWith('/') || unsafe(relativeCwd) || relativeCwd.split('/').some((part) => part === '')) throw new Error('Invalid chat working directory.')
+  return `${binding.root_path.replace(/\/+$/, '')}/${relativeCwd}`
 }
 
-export type FileSearchResult = { status: 'unsupported' | 'cancelled'; files: never[] }
+export interface FileMatch { path: string; file_name: string }
+export type FileSearchResult =
+  | { status: 'ok'; files: FileMatch[] }
+  | { status: 'cancelled' | 'error'; files: FileMatch[]; message?: string }
+
+/** Daemon-resolved repository route for `workspace.files.search`; never a client path. */
+export interface ComposerFileRoute { workspace_id: string; repository_id: string; relative_cwd: string | null }
+
+/** Keep only mention-safe, root-relative daemon results (see acceptFileMention). */
+export function sanitizeFileMatches(value: unknown): FileMatch[] {
+  if (!Array.isArray(value)) return []
+  return value.flatMap((row) => {
+    const path = row && typeof row === 'object' ? (row as { path?: unknown }).path : null
+    if (typeof path !== 'string' || !acceptFileMention('@', 1, path)) return []
+    const name = (row as { file_name?: unknown }).file_name
+    return [{ path, file_name: typeof name === 'string' && name ? name : path.slice(path.lastIndexOf('/') + 1) }]
+  })
+}
 
 export function createComposerCommands<Pane>(deps: {
   key: (pane: Pane) => string
   context: (pane: Pane) => Promise<ComposerCommandContext>
+  /** Route used for `@` file search; resolved server-side from the stored binding. */
+  fileRoute?: (pane: Pane) => ComposerFileRoute | Promise<ComposerFileRoute>
   call: (pane: Pane, method: string, params: unknown) => Promise<RpcEnvelope>
   notice: (message: string | null) => void
   /** Runs /handoff, /stack, /process; resolves whether the command ran. */
@@ -168,20 +192,30 @@ export function createComposerCommands<Pane>(deps: {
   }
   function cancelFileSearch(pane: Pane): void { searches.get(deps.key(pane))?.() }
   function cancelAllFileSearches(): void { for (const cancel of searches.values()) cancel() }
-  function searchFiles(pane: Pane, _query: string, signal?: AbortSignal): Promise<FileSearchResult> {
+  function searchFiles(pane: Pane, query: string, signal?: AbortSignal): Promise<FileSearchResult> {
     const key = deps.key(pane)
     cancelFileSearch(pane)
     return new Promise((resolve) => {
-      const finish = (status: FileSearchResult['status']) => {
+      let settled = false
+      const finish = (result: FileSearchResult) => {
+        if (settled) return
+        settled = true
         clearTimeout(timer)
         signal?.removeEventListener('abort', cancel)
         if (searches.get(key) === cancel) searches.delete(key)
-        resolve({ status, files: [] })
+        resolve(result)
       }
-      const cancel = () => finish('cancelled')
-      const timer = setTimeout(() => {
-        deps.notice('Workspace file search is unavailable: the daemon has no repository-scoped file-search RPC.')
-        finish('unsupported')
+      const cancel = () => finish({ status: 'cancelled', files: [] })
+      const timer = setTimeout(async () => {
+        try {
+          if (!deps.fileRoute) throw new Error('File search is unavailable for this chat.')
+          const route = await deps.fileRoute(pane)
+          if (settled) return
+          const result = await request<{ files?: unknown }>(pane, 'workspace.files.search', { ...route, query, limit: 20 })
+          finish({ status: 'ok', files: sanitizeFileMatches(result.files) })
+        } catch (error) {
+          finish({ status: 'error', files: [], message: error instanceof Error ? error.message : 'File search failed.' })
+        }
       }, debounceMs)
       searches.set(key, cancel)
       signal?.addEventListener('abort', cancel, { once: true })

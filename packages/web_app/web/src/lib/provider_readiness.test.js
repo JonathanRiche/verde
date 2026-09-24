@@ -59,7 +59,6 @@ test('recheck uses daemon status, deduplicates inflight probes and clears stale 
   await Promise.all([first, second])
   expect(api.providerReadiness('codex').state).toBe('missing')
   expect(api.providerRuntimeId()).toBe('runtime')
-  expect(api.providerReadiness('codex', true).state).toBe('unsupported')
   const again = api.recheckProviderReadiness()
   resolve({ ok: false, error: { code: 'network' } })
   await again

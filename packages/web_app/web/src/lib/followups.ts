@@ -168,10 +168,10 @@ export function createFollowupApi(deps: FollowupDependencies) {
       deps.notice('Pull back or cancel the pending follow-up before replacing it.')
       return false
     }
-    if (images.length && deps.remote(pane)) {
-      deps.notice('Remote follow-up images are not supported by the web connection bridge. Your draft and attachments are kept.')
-      return false
-    }
+    // Remote steer cannot carry images (gateway paths do not exist on the
+    // remote runtime). Like desktop, queue it as the next turn, which stages
+    // the image bytes on the remote daemon.
+    if (images.length && deps.remote(pane)) kind = 'queue'
     const value: PendingFollowup = {
       kind, state: 'pending', text, images: [...images], turn_id,
       steer_id: deps.id(), next_turn_id: deps.id(), delivery: 'unsent',

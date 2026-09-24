@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { parseSlashCommand, slashTokenAtCaret, fileMentionAtCaret, acceptSlashCommand, acceptFileMention, classifyBangCommand, repositoryCommandPath, createComposerCommands } from './composer_commands'
+import { parseSlashCommand, slashTokenAtCaret, fileMentionAtCaret, acceptSlashCommand, acceptFileMention, classifyBangCommand, repositoryCommandPath, createComposerCommands, sanitizeFileMatches } from './composer_commands'
 
 const commands = [{ id: 'compact', name: '/compact', summary: 'Compact', usage: '/compact', requires_thread: true }]
 
@@ -43,13 +43,15 @@ test('bang commands retain desktop escape and bare-bang semantics', () => {
   expect(classifyBangCommand(' !ls').kind).toBe('prompt')
 })
 
-test('slash paths resolve the primary runtime root and fail closed for unvalidated subfolders', () => {
+test('slash paths resolve the runtime checkout for repositories and subfolders and reject escapes', () => {
   const manifest = { repositories: [{ repository_id: 'primary', bindings: [
     { runtime_id: 'host', root_path: '/host' }, { runtime_id: 'remote', root_path: '/remote', availability: 'available' },
   ] }] }
   expect(repositoryCommandPath(manifest, 'primary', 'remote')).toBe('/remote')
-  expect(() => repositoryCommandPath(manifest, 'primary', 'remote', 'src')).toThrow('safe path resolution')
-  expect(() => repositoryCommandPath({ repositories: [{ repository_id: 'api', bindings: [{ runtime_id: 'local', root_path: '/api' }] }] }, 'api', 'local')).toThrow('safe path resolution')
+  expect(repositoryCommandPath(manifest, 'primary', 'remote', 'services/api')).toBe('/remote/services/api')
+  expect(repositoryCommandPath({ repositories: [{ repository_id: 'api', bindings: [{ runtime_id: 'local', root_path: '/api' }] }] }, 'api', 'local')).toBe('/api')
+  expect(() => repositoryCommandPath(manifest, 'primary', 'remote', 'a//b')).toThrow()
+  expect(() => repositoryCommandPath(manifest, 'primary', 'remote', 'a/./b')).toThrow()
   expect(() => repositoryCommandPath(manifest, 'primary', 'missing')).toThrow()
   expect(() => repositoryCommandPath(manifest, 'primary', 'remote', '../outside')).toThrow()
   expect(() => repositoryCommandPath(manifest, 'primary', 'remote', '/absolute')).toThrow()
@@ -105,21 +107,48 @@ test('catalog errors surface without trying another route', async () => {
   expect(f.calls).toHaveLength(1)
 })
 
-test('file search debounces per pane and cancellation settles without browsing', async () => {
-  const f = fixture()
-  const first = f.api.searchFiles('a', 'old')
-  const latest = f.api.searchFiles('a', 'new')
+test('file search debounces per pane, cancels stale queries and returns daemon matches', async () => {
+  const calls = []
+  const route = { workspace_id: 'ws', repository_id: 'api', relative_cwd: 'services' }
+  const api = createComposerCommands({
+    key: (pane) => pane,
+    context: async () => { throw new Error('file search must not need slash context') },
+    fileRoute: () => route,
+    call: async (pane, method, params) => { calls.push({ pane, method, params }); return { result: { files: [
+      { path: 'src/main.ts', file_name: 'main.ts' }, { path: '/etc/passwd' }, { path: '../secret' }, { path: 'lib/util.ts' }, 7,
+    ] } } },
+    notice: () => {},
+  }, 1)
+  const first = api.searchFiles('a', 'old')
+  const latest = api.searchFiles('a', 'new')
   expect(await first).toEqual({ status: 'cancelled', files: [] })
-  expect(await latest).toEqual({ status: 'unsupported', files: [] })
+  expect(await latest).toEqual({ status: 'ok', files: [{ path: 'src/main.ts', file_name: 'main.ts' }, { path: 'lib/util.ts', file_name: 'util.ts' }] })
+  expect(calls).toEqual([{ pane: 'a', method: 'workspace.files.search', params: { ...route, query: 'new', limit: 20 } }])
   const abort = new AbortController()
-  const pending = f.api.searchFiles('b', 'x', abort.signal)
+  const pending = api.searchFiles('b', 'x', abort.signal)
   abort.abort()
   expect((await pending).status).toBe('cancelled')
-  const other = f.api.searchFiles('c', 'x')
-  f.api.cancelAllFileSearches()
+  const other = api.searchFiles('c', 'x')
+  api.cancelAllFileSearches()
   expect((await other).status).toBe('cancelled')
+  expect(calls).toHaveLength(1)
+})
+
+test('file search errors settle with the daemon message and never widen the route', async () => {
+  const f = fixture([{ error: { message: 'repository binding not found on this runtime' } }])
+  expect(await f.api.searchFiles('a', 'x')).toEqual({ status: 'error', files: [], message: 'File search is unavailable for this chat.' })
   expect(f.calls).toEqual([])
-  expect(f.notices).toHaveLength(1)
+  const api = createComposerCommands({
+    key: (pane) => pane, context: async () => ({}), notice: () => {},
+    fileRoute: async () => ({ workspace_id: 'ws', repository_id: 'primary', relative_cwd: null }),
+    call: async () => ({ error: { message: 'repository binding not found on this runtime' } }),
+  }, 1)
+  expect(await api.searchFiles('a', 'x')).toEqual({ status: 'error', files: [], message: 'repository binding not found on this runtime' })
+})
+
+test('sanitized file matches are always insertable mentions', () => {
+  expect(sanitizeFileMatches(null)).toEqual([])
+  expect(sanitizeFileMatches([{ path: 'a//b' }, { path: 'C:\\x' }, { path: 'dir/my file.ts' }])).toEqual([{ path: 'dir/my file.ts', file_name: 'my file.ts' }])
 })
 
 test('a provider directory or thread change during catalog loading prevents command execution', async () => {
