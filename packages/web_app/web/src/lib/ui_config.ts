@@ -1,5 +1,29 @@
 /// Daemon-projected `verde.json` `ui` slice. Defaults match desktop AppConfig.
 
+/// Per-area `ui.reduced_motion_parts`; true means that area does not animate.
+export interface ReducedMotionParts {
+  /// Strip scroll when focus moves between panes (snaps by default).
+  pane_scroll: boolean
+  /// Pane resize/zoom easing and the focus-ring crossfade.
+  pane_layout: boolean
+  /// Breathing pulse on status dots and the running stop button.
+  status_pulse: boolean
+  /// Transcript and composer fades inside chat panes.
+  chat: boolean
+  /// Sidebar, drawer, menus, and dialogs.
+  chrome: boolean
+}
+
+export const DEFAULT_REDUCED_MOTION: ReducedMotionParts = {
+  pane_scroll: true,
+  pane_layout: false,
+  status_pulse: false,
+  chat: false,
+  chrome: false,
+}
+
+const MOTION_PARTS = Object.keys(DEFAULT_REDUCED_MOTION) as Array<keyof ReducedMotionParts>
+
 export interface UiConfig {
   workspace_pane_gap: number
   workspace_panes_per_view: number
@@ -8,7 +32,9 @@ export interface UiConfig {
   workspace_scroll_mode: 'automatic' | 'always' | 'disabled'
   workspace_scroll_threshold: number
   unzoom_on_pane_navigation: boolean
+  /// Every area reduced; kept for callers that want one switch.
   reduced_motion: boolean
+  reduced_motion_parts: ReducedMotionParts
 }
 
 export const DEFAULT_UI_CONFIG: UiConfig = {
@@ -20,6 +46,7 @@ export const DEFAULT_UI_CONFIG: UiConfig = {
   workspace_scroll_threshold: 3,
   unzoom_on_pane_navigation: false,
   reduced_motion: false,
+  reduced_motion_parts: DEFAULT_REDUCED_MOTION,
 }
 
 const MIN_PANES_PER_VIEW = 1
@@ -41,6 +68,29 @@ function numberField(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback
 }
 
+/// Same precedence as desktop config load: a legacy `reduced_motion: true`
+/// reduces every area (`false` only means "not everything"), then
+/// `reduced_motion_parts` refines per area.
+function parseReducedMotion(ui: Record<string, unknown>): ReducedMotionParts {
+  const parts = { ...DEFAULT_REDUCED_MOTION }
+  if (ui.reduced_motion === true) for (const part of MOTION_PARTS) parts[part] = true
+  const overrides = asRecord(ui.reduced_motion_parts)
+  if (overrides) {
+    for (const part of MOTION_PARTS) {
+      if (typeof overrides[part] === 'boolean') parts[part] = overrides[part] as boolean
+    }
+  }
+  return parts
+}
+
+/// Mirror the parts onto `<html data-reduce-motion-*>` so CSS can disable
+/// each area's animations independently.
+export function applyReducedMotion(parts: ReducedMotionParts, root: HTMLElement = document.documentElement): void {
+  for (const part of MOTION_PARTS) {
+    root.toggleAttribute(`data-reduce-motion-${part.replace('_', '-')}`, parts[part])
+  }
+}
+
 /// Decode `core.snapshot` `config` (or a bare `ui` object). Unknown or
 /// partial payloads keep desktop defaults so an older daemon still renders.
 export function parseUiConfig(raw: unknown): UiConfig {
@@ -51,6 +101,7 @@ export function parseUiConfig(raw: unknown): UiConfig {
     ui.workspace_scroll_mode === 'always' || ui.workspace_scroll_mode === 'disabled'
       ? ui.workspace_scroll_mode
       : 'automatic'
+  const reduced_motion_parts = parseReducedMotion(ui)
   return {
     workspace_pane_gap: clamp(numberField(ui.workspace_pane_gap, DEFAULT_UI_CONFIG.workspace_pane_gap), MIN_PANE_GAP, MAX_PANE_GAP),
     workspace_panes_per_view: clamp(
@@ -67,7 +118,8 @@ export function parseUiConfig(raw: unknown): UiConfig {
       MAX_SCROLL_THRESHOLD,
     ),
     unzoom_on_pane_navigation: ui.unzoom_on_pane_navigation === true,
-    reduced_motion: ui.reduced_motion === true,
+    reduced_motion: MOTION_PARTS.every((part) => reduced_motion_parts[part]),
+    reduced_motion_parts,
   }
 }
 

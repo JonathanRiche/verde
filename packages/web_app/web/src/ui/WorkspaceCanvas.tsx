@@ -50,7 +50,7 @@ export function WorkspaceCanvas() {
     if (!(leaf instanceof HTMLElement)) return
     const column = leaf.closest('.niri-column')
     if (!(column instanceof HTMLElement)) return
-    const instant = store.takeInstantFocus(id) || last_focused_id === id
+    const instant = store.takeInstantFocus(id) || last_focused_id === id || store.uiConfig().reduced_motion_parts.pane_scroll
     last_focused_id = id
     ignore_scroll = true
     window.clearTimeout(focus_timer)

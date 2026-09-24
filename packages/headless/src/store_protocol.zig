@@ -512,7 +512,18 @@ pub const ConfigUiSnapshot = struct {
     workspace_scroll_mode: []const u8 = "automatic",
     workspace_scroll_threshold: u8 = 3,
     unzoom_on_pane_navigation: bool = false,
+    /// True only when every motion area is reduced (legacy readers).
     reduced_motion: bool = false,
+    reduced_motion_parts: ConfigReducedMotionParts = .{},
+};
+
+/// Per-area `ui.reduced_motion_parts`; defaults match desktop `ReducedMotion`.
+pub const ConfigReducedMotionParts = struct {
+    pane_scroll: bool = true,
+    pane_layout: bool = false,
+    status_pulse: bool = false,
+    chat: bool = false,
+    chrome: bool = false,
 };
 
 pub const ConfigFavoriteModel = struct {

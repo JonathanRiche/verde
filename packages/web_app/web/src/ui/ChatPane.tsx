@@ -307,7 +307,7 @@ export function ChatPane(props: { pane: LivePane }) {
   const subagent = () => isSubagentThreadId(props.pane.thread_id)
 
   return (
-    <section ref={section} class={`flex min-h-0 flex-1 flex-col ${subagent() ? 'bg-[color-mix(in_srgb,var(--accent)_8%,var(--chat-black))]' : 'bg-[var(--chat-black)]'}`}>
+    <section ref={section} class={`chat-pane flex min-h-0 flex-1 flex-col ${subagent() ? 'bg-[color-mix(in_srgb,var(--accent)_8%,var(--chat-black))]' : 'bg-[var(--chat-black)]'}`}>
       <header
         class={`hidden h-10 shrink-0 items-center gap-2 border-b px-3 lg:flex ${
           subagent() ? 'border-[color-mix(in_srgb,var(--accent)_55%,var(--border-muted))]' : 'border-[var(--border-muted)]'

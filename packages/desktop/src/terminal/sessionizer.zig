@@ -11149,6 +11149,13 @@ fn configSnapshotFromApp(allocator: std.mem.Allocator, config: *const app_config
             .workspace_scroll_threshold = config.workspace_scroll_threshold,
             .unzoom_on_pane_navigation = config.unzoom_on_pane_navigation,
             .reduced_motion = config.reduced_motion.all(),
+            .reduced_motion_parts = .{
+                .pane_scroll = config.reduced_motion.pane_scroll,
+                .pane_layout = config.reduced_motion.pane_layout,
+                .status_pulse = config.reduced_motion.status_pulse,
+                .chat = config.reduced_motion.chat,
+                .chrome = config.reduced_motion.chrome,
+            },
         },
         .chat = .{ .favorite_models = favorites },
     };
@@ -11332,6 +11339,7 @@ test "config snapshot projects workspace strip settings and model favorites" {
     try std.testing.expectEqual(@as(u8, 4), snapshot.ui.workspace_scroll_threshold);
     try std.testing.expect(snapshot.ui.unzoom_on_pane_navigation);
     try std.testing.expect(snapshot.ui.reduced_motion);
+    try std.testing.expect(snapshot.ui.reduced_motion_parts.chrome);
     try std.testing.expectEqual(@as(usize, 1), snapshot.chat.favorite_models.len);
     try std.testing.expectEqualStrings("claude", snapshot.chat.favorite_models[0].provider);
     try std.testing.expectEqualStrings("claude-opus-4-1", snapshot.chat.favorite_models[0].model);

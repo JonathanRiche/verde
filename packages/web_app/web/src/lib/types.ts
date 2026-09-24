@@ -387,6 +387,7 @@ export interface SnapshotResult {
       workspace_scroll_threshold?: number
       unzoom_on_pane_navigation?: boolean
       reduced_motion?: boolean
+      reduced_motion_parts?: Partial<Record<'pane_scroll' | 'pane_layout' | 'status_pulse' | 'chat' | 'chrome', boolean>>
     }
     chat?: {
       favorite_models?: FavoriteModel[]

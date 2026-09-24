@@ -170,6 +170,17 @@ button { transition-property: background-color, color, border-color, opacity, bo
   }
 }
 
+/* verde.json ui.reduced_motion_parts, mirrored from the desktop per area
+   (see applyReducedMotion). Pane scrolling is handled in WorkspaceCanvas. */
+:root[data-reduce-motion-status-pulse] :is(.pulse, .cmd-dot-pulse, .composer-stop) { animation: none !important; }
+:root[data-reduce-motion-chat] .chat-pane :is(.anim-fade, .anim-pop, .anim-menu, .anim-reveal) { animation: none !important; }
+:root[data-reduce-motion-chat] .chat-pane * { transition-duration: 0s !important; }
+:root[data-reduce-motion-chrome] :is(.anim-fade, .anim-pop, .anim-menu, .anim-reveal, .drawer-panel, .drawer-backdrop):not(.chat-pane *) { animation: none !important; }
+:root[data-reduce-motion-chrome] .sidebar-rail { transition: none; }
+/* Without the slide-out the drawer would sit open for its exit timer. */
+:root[data-reduce-motion-chrome] .drawer-closing { display: none; }
+:root[data-reduce-motion-pane-layout] .pane-split-gutter::after { transition: none; }
+
 .mono { font-family: var(--font-mono); }
 .wordmark { font-family: var(--font-display); letter-spacing: -0.03em; }
 

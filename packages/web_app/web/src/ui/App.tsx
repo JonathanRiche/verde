@@ -1,6 +1,7 @@
 import { Show, createEffect, createSignal, onCleanup, onMount } from 'solid-js'
 
 import { store } from '../lib/store'
+import { applyReducedMotion } from '../lib/ui_config'
 import { isSubagentThreadId } from '../lib/types'
 import { FileViewer, fileViewerOpen } from './FileViewer'
 import { History, historyOpen } from './History'
@@ -17,6 +18,9 @@ export function App() {
     window.addEventListener('keydown', onKey)
     onCleanup(() => window.removeEventListener('keydown', onKey))
   })
+
+  // verde.json is the source of truth for motion, per area like the desktop.
+  createEffect(() => applyReducedMotion(store.uiConfig().reduced_motion_parts))
 
   // Keep the drawer mounted for its slide-out so closing animates too.
   const DRAWER_EXIT_MS = 200

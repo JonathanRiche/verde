@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { DEFAULT_UI_CONFIG, effectivePanesPerView, parseUiConfig } from './ui_config.ts'
+import { DEFAULT_REDUCED_MOTION, DEFAULT_UI_CONFIG, applyReducedMotion, effectivePanesPerView, parseUiConfig } from './ui_config.ts'
 
 describe('parseUiConfig', () => {
   test('keeps desktop defaults for an empty snapshot', () => {
@@ -46,5 +46,33 @@ describe('effectivePanesPerView', () => {
     const ui = { ...DEFAULT_UI_CONFIG, workspace_panes_per_view: 1, workspace_scroll_threshold: 3 }
     expect(effectivePanesPerView(ui, 2, false)).toBe(2)
     expect(effectivePanesPerView(ui, 3, false)).toBe(1)
+  })
+})
+
+describe('reduced motion parts', () => {
+  test('defaults snap pane scrolling only, like the desktop', () => {
+    expect(parseUiConfig({}).reduced_motion_parts).toEqual(DEFAULT_REDUCED_MOTION)
+    expect(parseUiConfig({ ui: { reduced_motion: false } }).reduced_motion_parts).toEqual(DEFAULT_REDUCED_MOTION)
+    expect(parseUiConfig({}).reduced_motion).toBe(false)
+  })
+
+  test('legacy true reduces every area; parts refine it', () => {
+    const all = parseUiConfig({ ui: { reduced_motion: true } })
+    expect(Object.values(all.reduced_motion_parts).every(Boolean)).toBe(true)
+    const refined = parseUiConfig({ ui: { reduced_motion: true, reduced_motion_parts: { pane_scroll: false, chat: 'yes' } } })
+    expect(refined.reduced_motion_parts.pane_scroll).toBe(false)
+    expect(refined.reduced_motion_parts.chat).toBe(true)
+    expect(refined.reduced_motion).toBe(false)
+  })
+
+  test('parts map to root data attributes', () => {
+    const attrs = new Map()
+    const root = { toggleAttribute: (name, on) => { if (on) attrs.set(name, ''); else attrs.delete(name) } }
+    applyReducedMotion({ ...DEFAULT_REDUCED_MOTION, status_pulse: true, chrome: true }, root)
+    expect([...attrs.keys()].sort()).toEqual([
+      'data-reduce-motion-chrome', 'data-reduce-motion-pane-scroll', 'data-reduce-motion-status-pulse',
+    ])
+    applyReducedMotion({ ...DEFAULT_REDUCED_MOTION, pane_scroll: false }, root)
+    expect(attrs.size).toBe(0)
   })
 })
