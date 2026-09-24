@@ -17,6 +17,7 @@ pub const METHOD_WORKSPACE_UPSERT: []const u8 = "workspace.upsert";
 pub const METHOD_CHAT_THREAD_UPSERT: []const u8 = "chat.thread.upsert";
 pub const METHOD_CHAT_THREAD_ARCHIVE_SET: []const u8 = "chat.thread.archive.set";
 pub const METHOD_CHAT_THREAD_CLOSE: []const u8 = "chat.thread.close";
+pub const METHOD_CHAT_THREAD_MOVE: []const u8 = "chat.thread.move";
 pub const METHOD_CHAT_DRAFT_SET: []const u8 = "chat.draft.set";
 pub const METHOD_CHAT_MESSAGE_APPEND: []const u8 = "chat.message.append";
 pub const METHOD_SURFACE_UPSERT: []const u8 = "surface.upsert";
@@ -399,6 +400,18 @@ pub const ThreadCloseRequest = struct {
     mutation: MutationHeader,
     workspace_id: []const u8,
     local_thread_id: []const u8,
+};
+
+/// Reassign one idle thread, with its transcript and turn/link records, to
+/// another workspace. The thread lands open at the end of the target's open
+/// set; `cwd` replaces its working-directory override so a provider session
+/// stays pinned to the directory it started in (null keeps the stored value).
+pub const ThreadMoveRequest = struct {
+    mutation: MutationHeader,
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
+    target_workspace_id: []const u8,
+    cwd: ?[]const u8 = null,
 };
 
 /// Atomically replace or append one thread's composer draft.

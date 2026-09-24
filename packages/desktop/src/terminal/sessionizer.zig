@@ -4073,6 +4073,18 @@ pub const Daemon = struct {
                 break :blk null;
             };
             if (req) |value| decoded_mutation = .{ .thread_close = value };
+        } else if (std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_MOVE)) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.ThreadMoveRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_mutation = .{ .thread_move = value };
         } else if (std.mem.eql(u8, method, store_protocol.METHOD_CHAT_DRAFT_SET)) {
             const req = std.json.parseFromValueLeaky(
                 store_protocol.ChatDraftSetRequest,
@@ -9486,6 +9498,7 @@ fn isStoreMethod(method: []const u8) bool {
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_UPSERT) or
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_ARCHIVE_SET) or
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_CLOSE) or
+        std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_MOVE) or
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_DRAFT_SET) or
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_MESSAGE_APPEND) or
         std.mem.eql(u8, method, store_protocol.METHOD_SURFACE_UPSERT) or
@@ -9594,6 +9607,17 @@ fn storeMutationCommittedHook(context: *anyopaque, mutation: *const daemon_store
         .thread_upsert => |request| daemon.appendJournalEntry(.chat_thread, request.thread.local_thread_id, request.workspace_id, revision),
         .thread_archive_set => |request| daemon.appendJournalEntry(.chat_thread, request.local_thread_id, request.workspace_id, revision),
         .thread_close => |request| daemon.appendJournalEntry(.chat_thread, request.local_thread_id, request.workspace_id, revision),
+        .thread_move => |request| {
+            // Both workspaces change: the thread leaves one list and layout
+            // and joins the other, and its turn/completion rows are rekeyed.
+            daemon.appendJournalEntryQuiet(.chat_thread, request.local_thread_id, request.workspace_id, revision);
+            daemon.appendJournalEntryQuiet(.chat_thread, request.local_thread_id, request.target_workspace_id, revision);
+            daemon.appendJournalEntryQuiet(.workspace, request.workspace_id, request.workspace_id, revision);
+            daemon.appendJournalEntryQuiet(.workspace, request.target_workspace_id, request.target_workspace_id, revision);
+            daemon.appendJournalEntryQuiet(.chat_turn, "*", null, revision);
+            daemon.appendJournalEntryQuiet(.chat_completion, "*", null, revision);
+            daemon.signalChangesWaiters();
+        },
         .chat_draft_set => |request| daemon.appendJournalEntry(.chat_thread, request.local_thread_id, request.workspace_id, revision),
         .message_append => |request| daemon.appendJournalEntry(.chat_thread, request.thread_id, request.workspace_id, revision),
         // MAJOR-1 (M5-P3 amendment): store commits are the ONLY surface
@@ -9665,6 +9689,7 @@ fn mutationHeader(mutation: daemon_store.Mutation) store_protocol.MutationHeader
         .workspace_repository_binding_remove => |request| request.mutation,
         .thread_upsert => |request| request.mutation,
         .thread_close => |request| request.mutation,
+        .thread_move => |request| request.mutation,
         .thread_archive_set => |request| request.mutation,
         .chat_draft_set => |request| request.mutation,
         .message_append => |request| request.mutation,

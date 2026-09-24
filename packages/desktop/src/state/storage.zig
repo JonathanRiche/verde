@@ -435,6 +435,65 @@ pub const Storage = struct {
         self.noteProjectionObservedRevision(result.store_revision);
     }
 
+    pub const MoveThreadError = error{
+        /// The daemon predates `chat.thread.move`; it needs a restart.
+        MoveUnsupported,
+        /// A turn is running, the thread is the Companion, or the target
+        /// cannot host its repository.
+        MoveRefused,
+        MoveFailed,
+    };
+
+    /// Reassigns one idle thread to another workspace in the daemon. Errors
+    /// are reported to the caller without pausing persistence: a refusal or
+    /// an older daemon is not a connectivity failure.
+    pub fn moveThread(
+        self: *const Storage,
+        workspace_id: []const u8,
+        local_thread_id: []const u8,
+        target_workspace_id: []const u8,
+        cwd: ?[]const u8,
+    ) MoveThreadError!void {
+        self.ensureGranularMutationAllowed() catch return error.MoveFailed;
+        self.ensureDaemon() catch return error.MoveFailed;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const client_id = self.ensureStoreClientId() catch return error.MoveFailed;
+        defer self.allocator.free(client_id);
+        const request: headless.store.ThreadMoveRequest = .{
+            .mutation = .{
+                .request_key = self.nextRequestKey(a, headless.store.METHOD_CHAT_THREAD_MOVE) catch return error.MoveFailed,
+                .expected_store_revision = null,
+                .client_id = client_id,
+            },
+            .workspace_id = workspace_id,
+            .local_thread_id = local_thread_id,
+            .target_workspace_id = target_workspace_id,
+            .cwd = cwd,
+        };
+
+        self.beginSelfProjectionWrite();
+        defer self.endSelfProjectionWrite();
+        var transport: daemon_client.HeadlessTransport = .{ .allocator = a, .pref_path = self.pref_path, .timeout_ms = 5_000 };
+        var client = daemon_client.headlessClient(a, &transport);
+        var parsed = client.call(headless.store.METHOD_CHAT_THREAD_MOVE, request) catch |err| {
+            log.warn("chat.thread.move transport failed: {s}", .{@errorName(err)});
+            return error.MoveFailed;
+        };
+        defer parsed.deinit();
+        if (parsed.response.err) |err| {
+            log.warn("chat.thread.move failed: {s} ({s})", .{ err.code, err.message });
+            if (std.mem.eql(u8, err.code, headless.protocol.ERR_UNKNOWN_METHOD) or
+                std.mem.eql(u8, err.code, "method_not_found")) return error.MoveUnsupported;
+            if (std.mem.eql(u8, err.code, headless.protocol.ERR_CONFLICT)) return error.MoveRefused;
+            return error.MoveFailed;
+        }
+        const result = client.decodeWriteResult(&parsed) catch return error.MoveFailed;
+        self.noteStoreRevision(result.store_revision);
+        self.noteProjectionObservedRevision(result.store_revision);
+    }
+
     fn loadDaemonProjection(self: *const Storage, allocator: std.mem.Allocator) !LoadedPersistedState {
         try self.ensureDaemon();
         var loaded = LoadedPersistedState.init(allocator);

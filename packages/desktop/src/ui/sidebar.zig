@@ -279,6 +279,10 @@ var pane_row_drag: PaneRowDragState = .{};
 var pane_drop_before: usize = 0;
 var pane_drop_line_rect: palette.Rect = .{};
 var pane_drop_valid: bool = false;
+/// Another workspace under the cursor while dragging a chat row; dropping
+/// there moves the chat into that workspace instead of reordering.
+var pane_drop_target_project: ?usize = null;
+var pane_drop_target_rect: palette.Rect = .{};
 
 /// Renders the sidebar with Palette-owned drawing and retained hit regions.
 pub fn renderPalette(state: *runtime.AppState, rect: palette.Rect) void {
@@ -583,8 +587,41 @@ fn updatePaneRowDrag(state: *runtime.AppState, x: f32, y: f32) void {
             pane_row_drag.active = true;
         }
     }
-    if (pane_row_drag.active) computePaneDropTarget(state, y);
+    if (pane_row_drag.active) {
+        if (!computePaneMoveTarget(state, x, y)) computePaneDropTarget(state, y);
+    }
     state.markDirty();
+}
+
+/// A dragged chat row over another workspace's header or rows targets that
+/// workspace. Returns true when a move target is set; reorder is then off.
+fn computePaneMoveTarget(state: *const runtime.AppState, x: f32, y: f32) bool {
+    pane_drop_target_project = null;
+    const source = pane_row_drag.project_index;
+    if (openPaneChatThreadIndex(state, source, pane_row_drag.pane_id) == null) return false;
+    var index = palette_hit_count;
+    const target = while (index > 0) {
+        index -= 1;
+        const hit = palette_hits[index];
+        if (hit.project_index == source or !rectContainsPoint(hit.rect, x, y)) continue;
+        switch (hit.kind) {
+            .workspace_row, .workspace_avatar, .open_pane_reorder => break hit.project_index,
+            else => {},
+        }
+    } else return false;
+    if (target >= state.project_controller.projects.items.len) return false;
+    if (state.project_controller.projects.items[target].herdr_link != null) return false;
+    index = 0;
+    while (index < palette_hit_count) : (index += 1) {
+        const hit = palette_hits[index];
+        if (hit.project_index != target) continue;
+        if (hit.kind != .workspace_row and hit.kind != .workspace_avatar) continue;
+        pane_drop_target_rect = hit.rect;
+        pane_drop_target_project = target;
+        pane_drop_valid = false;
+        return true;
+    }
+    return false;
 }
 
 /// Finds the insertion slot among the visible rows of the dragged pane's
@@ -616,6 +653,7 @@ fn startPaneRowDrag(state: *runtime.AppState, project_index: usize, pane_id: nat
     const layout = &state.project_controller.projects.items[project_index].workspace_layout;
     _ = layout.paneById(pane_id) orelse return;
     pane_drop_valid = false;
+    pane_drop_target_project = null;
     pane_row_drag = .{
         .pending = true,
         .project_index = project_index,
@@ -635,9 +673,13 @@ fn finishPaneRowDrag(state: *runtime.AppState, x: f32, y: f32) bool {
     const drag = pane_row_drag;
     pane_row_drag = .{};
     _ = sdl.captureMouse(false);
+    const move_target = pane_drop_target_project;
+    pane_drop_target_project = null;
 
     if (!drag.active) {
         state.focusWorkspaceOpenPaneFromSidebar(drag.project_index, drag.pane_id);
+    } else if (move_target) |target| {
+        _ = state.moveChatPaneToProject(drag.project_index, drag.pane_id, target);
     } else if (pane_drop_valid) {
         _ = state.moveWorkspacePaneInSidebarOrder(drag.project_index, drag.pane_id, pane_drop_before);
     }
@@ -795,7 +837,11 @@ fn renderPaneRowDragOverlay(state: *runtime.AppState) void {
     const previous_z = state.palette_overlay_batch.setZIndex(THREAD_DRAG_FLOATING_Z);
     defer state.palette_overlay_batch.restoreZIndex(previous_z);
 
-    if (pane_drop_valid) {
+    if (pane_drop_target_project != null) {
+        const radius = theme.scaledUi(6.0);
+        queuePaletteRoundedRect(state, pane_drop_target_rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 40)), radius);
+        queuePaletteBorder(state, pane_drop_target_rect, paletteColor(theme.COLOR_GREEN), radius, theme.scaledUi(1.5));
+    } else if (pane_drop_valid) {
         queuePaletteRoundedRect(state, .{
             .x = pane_drop_line_rect.x,
             .y = pane_drop_line_rect.y - pane_drop_line_rect.h * 0.5,

@@ -7249,6 +7249,122 @@ pub const AppState = struct {
         return true;
     }
 
+    /// Sidebar drag-and-drop: reassigns the chat shown by `pane_id` in one
+    /// workspace to another. The daemon moves the durable row first; only on
+    /// success does the GUI detach the thread (and every pane showing it) from
+    /// the source and tile it in the target without switching workspaces.
+    /// A thread with a provider session and no directory override keeps the
+    /// source path as its working directory, so the session can resume.
+    pub fn moveChatPaneToProject(self: *AppState, source_index: usize, pane_id: WorkspacePaneId, target_index: usize) bool {
+        const projects = self.project_controller.projects.items;
+        if (source_index >= projects.len or target_index >= projects.len or source_index == target_index) return false;
+        const source = &projects[source_index];
+        const target = &projects[target_index];
+        if (source.herdr_link != null or target.herdr_link != null) {
+            self.setSidebarNotice("Chats cannot move into or out of linked remote workspaces.");
+            return false;
+        }
+        const pane = source.workspace_layout.paneById(pane_id) orelse return false;
+        const thread_index = switch (pane.ref) {
+            .chat => |ref| ref.thread_index,
+            else => return false,
+        };
+        if (thread_index >= source.threads.items.len) return false;
+        const thread = &source.threads.items[thread_index];
+        if (source.isCompanionThread(thread)) {
+            self.setSidebarNotice("The Companion thread stays with its workspace.");
+            return false;
+        }
+        if (thread.isSubagentView()) {
+            self.setSidebarNotice("Subagent views follow their parent chat.");
+            return false;
+        }
+        if (thread.isSendPendingForUi() or threadHasRunningBackgroundTasks(thread)) {
+            self.setSidebarNotice("Wait for this chat to finish before moving it.");
+            return false;
+        }
+
+        const pinned_cwd: ?[]const u8 = if (thread.cwd == null and thread.provider_thread_id != null) source.path else null;
+        if (thread.committed) {
+            self.storage.moveThread(source.id, thread.local_thread_id, target.id, pinned_cwd) catch |err| {
+                self.setSidebarNotice(switch (err) {
+                    error.MoveUnsupported => "Restart Verde to move chats between workspaces.",
+                    error.MoveRefused => "This chat can't move there right now.",
+                    error.MoveFailed => "Could not move the chat.",
+                });
+                return false;
+            };
+        }
+        const owned_cwd: ?[:0]const u8 = if (pinned_cwd) |path| (self.allocator.dupeZ(u8, path) catch null) else null;
+        _ = self.lifecycle.cancelThreadClose(self.allocator, source.id, thread.local_thread_id);
+
+        // Detach every pane showing the thread without routing through
+        // pane close, which would close the thread in the source workspace.
+        var source_layout = &source.workspace_layout;
+        var pane_index: usize = source_layout.panes.items.len;
+        while (pane_index > 0) {
+            pane_index -= 1;
+            const candidate = source_layout.panes.items[pane_index];
+            switch (candidate.ref) {
+                .chat => |ref| if (ref.thread_index == thread_index) {
+                    var removed = source_layout.closePane(self.allocator, candidate.id) orelse continue;
+                    workspace_layout.deinitWorkspacePaneRef(&removed, self.allocator);
+                },
+                else => {},
+            }
+        }
+        if (source_layout.root == null) {
+            if (source_layout.firstVisiblePaneId()) |next_id| {
+                source_layout.replaceRootWithLeaf(self.allocator, next_id) catch {
+                    source_layout.focused_pane_id = next_id;
+                };
+            }
+        }
+        var moved = source.removeThreadAtIndex(thread_index);
+        if (owned_cwd) |cwd| {
+            if (moved.cwd) |previous| self.allocator.free(previous);
+            moved.cwd = cwd;
+        }
+        if (source.threads.items.len == 0) {
+            if (source.addThread(self.allocator)) |new_thread_index| {
+                self.applyNewChatDefaults(source_index, new_thread_index) catch |err| {
+                    log.warn("failed to apply new-chat defaults after move: {s}", .{@errorName(err)});
+                };
+            } else |_| {}
+        }
+
+        target.threads.append(self.allocator, moved) catch {
+            moved.deinit(self.allocator);
+            self.setSidebarNotice("Out of memory moving chat; it is saved in the target workspace.");
+            self.markDirty();
+            return false;
+        };
+        target.invalidateSidebarThreadCache();
+        const target_thread_index = target.threads.items.len - 1;
+        var target_layout = &target.workspace_layout;
+        if (target_layout.createChatPane(self.allocator, target_thread_index)) |new_pane_id| {
+            if (target_layout.focused_pane_id orelse target_layout.firstVisiblePaneId()) |anchor_id| {
+                target_layout.splitPaneWithLeaf(self.allocator, anchor_id, new_pane_id, .vertical, true) catch |err| {
+                    log.warn("failed to tile moved chat: {s}", .{@errorName(err)});
+                };
+            } else {
+                target_layout.replaceRootWithLeaf(self.allocator, new_pane_id) catch |err| {
+                    log.warn("failed to seed moved chat pane: {s}", .{@errorName(err)});
+                };
+            }
+        } else |err| log.warn("failed to create pane for moved chat: {s}", .{@errorName(err)});
+
+        if (self.project_controller.selected_index == source_index) {
+            if (source_layout.focused_pane_id) |focused_pane_id| _ = self.focusWorkspacePane(source_index, focused_pane_id);
+        }
+        self.markWorkspaceDirty(source_index);
+        self.markWorkspaceDirty(target_index);
+        self.syncRenameBuffer();
+        self.markDirty();
+        self.setSidebarNotice(if (owned_cwd != null) "Chat moved. It keeps working in its original folder." else "Chat moved.");
+        return true;
+    }
+
     /// Fetches every open thread of one workspace by identity and appends
     /// them in daemon sort order. On any failure the project is left with
     /// no threads so the caller's default-draft path runs; a partial set

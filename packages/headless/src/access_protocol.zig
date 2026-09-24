@@ -245,6 +245,7 @@ pub fn requiredScopeMaskForRpc(method: []const u8) ?u16 {
         std.mem.eql(u8, method, "chat.turn.record") or
         std.mem.eql(u8, method, "chat.thread.upsert") or
         std.mem.eql(u8, method, "chat.thread.close") or
+        std.mem.eql(u8, method, "chat.thread.move") or
         std.mem.eql(u8, method, "chat.thread.archive.set") or
         std.mem.eql(u8, method, "provider.thread.sync") or
         std.mem.eql(u8, method, "chat.draft.set") or

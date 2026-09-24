@@ -141,6 +141,7 @@ pub const Mutation = union(enum) {
     workspace_repository_binding_remove: WorkspaceRepositoryBindingRemoveRequest,
     thread_upsert: store_protocol.ThreadUpsertRequest,
     thread_close: store_protocol.ThreadCloseRequest,
+    thread_move: store_protocol.ThreadMoveRequest,
     thread_archive_set: store_protocol.ThreadArchiveSetRequest,
     chat_draft_set: store_protocol.ChatDraftSetRequest,
     message_append: store_protocol.MessageAppendRequest,
@@ -392,6 +393,7 @@ const WORKSPACE_REPOSITORY_BINDING_UPSERT_OPERATION: []const u8 = "workspace.rep
 const WORKSPACE_REPOSITORY_BINDING_REMOVE_OPERATION: []const u8 = "workspace.repository.binding.remove";
 const THREAD_UPSERT_OPERATION = store_protocol.METHOD_CHAT_THREAD_UPSERT;
 const THREAD_CLOSE_OPERATION = store_protocol.METHOD_CHAT_THREAD_CLOSE;
+const THREAD_MOVE_OPERATION = store_protocol.METHOD_CHAT_THREAD_MOVE;
 const CHAT_DRAFT_SET_OPERATION = store_protocol.METHOD_CHAT_DRAFT_SET;
 const MESSAGE_APPEND_OPERATION = store_protocol.METHOD_CHAT_MESSAGE_APPEND;
 const SURFACE_UPSERT_OPERATION = store_protocol.METHOD_SURFACE_UPSERT;
@@ -624,6 +626,7 @@ pub const Store = struct {
             .thread_upsert => |request| self.applyThread(request) catch |err| return mapStoreError(err),
             .thread_archive_set => |request| applied = self.applyThreadArchiveSet(request) catch |err| return mapStoreError(err),
             .thread_close => |request| applied = self.applyThreadClose(request) catch |err| return mapStoreError(err),
+            .thread_move => |request| self.applyThreadMove(request) catch |err| return mapStoreError(err),
             .chat_draft_set => |request| self.applyChatDraftSet(request) catch |err| return mapStoreError(err),
             .message_append => |request| self.applyMessageAppend(request, next_revision_sql) catch |err| return mapStoreError(err),
             .surface_upsert => |request| self.applySurfaceUpsert(request.surface) catch |err| return mapStoreError(err),
@@ -931,6 +934,10 @@ pub const Store = struct {
 
     pub fn closeThread(self: *Self, request: store_protocol.ThreadCloseRequest) StoreError!store_protocol.WriteResult {
         return self.applyMutation(.{ .thread_close = request });
+    }
+
+    pub fn moveThread(self: *Self, request: store_protocol.ThreadMoveRequest) StoreError!store_protocol.WriteResult {
+        return self.applyMutation(.{ .thread_move = request });
     }
 
     /// Sync preserves metadata, drafts, turn receipts, and existing replay keys.
@@ -1686,6 +1693,12 @@ pub const Store = struct {
                 .workspace_id = request.workspace_id,
                 .local_thread_id = request.local_thread_id,
                 .close = true,
+            }),
+            .thread_move => |request| self.fingerprintValue(.{
+                .workspace_id = request.workspace_id,
+                .local_thread_id = request.local_thread_id,
+                .target_workspace_id = request.target_workspace_id,
+                .cwd = request.cwd,
             }),
             .chat_draft_set => |request| self.fingerprintValue(.{
                 .workspace_id = request.workspace_id,
@@ -3113,6 +3126,77 @@ pub const Store = struct {
         return true;
     }
 
+    /// Reassign an idle thread to another workspace. Messages follow the row
+    /// id; text-keyed turn, completion, and task rows are rewritten; orchestration
+    /// links are dropped because both link ends must share a workspace. The
+    /// thread lands open after every row in the target, and the source layout
+    /// loses its panes exactly as if the thread had been closed there.
+    fn applyThreadMove(self: *Self, request: store_protocol.ThreadMoveRequest) !void {
+        try self.requireIdleThread(request.workspace_id, request.local_thread_id);
+        const source_row = (try self.conn.row(
+            "select id, companion_thread_local_id from workspaces where workspace_id = ?1",
+            .{request.workspace_id},
+        )) orelse return error.ResourceNotFound;
+        defer source_row.deinit();
+        const source_row_id = source_row.int(0);
+        if (source_row.nullableText(1)) |companion| {
+            if (std.mem.eql(u8, companion, request.local_thread_id)) return error.Conflict;
+        }
+        const target_row = (try self.conn.row(
+            "select id from workspaces where workspace_id = ?1 and archived = 0",
+            .{request.target_workspace_id},
+        )) orelse return error.ResourceNotFound;
+        defer target_row.deinit();
+        const target_row_id = target_row.int(0);
+        const thread_row = (try self.conn.row(
+            "select id, repository_id from threads where workspace_id = ?1 and local_thread_id = ?2",
+            .{ source_row_id, request.local_thread_id },
+        )) orelse return error.ResourceNotFound;
+        defer thread_row.deinit();
+        const thread_row_id = thread_row.int(0);
+        // Committed routes are immutable, so a non-primary repository must
+        // already exist in the target workspace.
+        if (thread_row.nullableText(1)) |repository_id| {
+            if (!std.mem.eql(u8, repository_id, "primary")) {
+                const repository = (try self.conn.row(
+                    "select 1 from workspace_repositories where workspace_id = ?1 and repository_id = ?2",
+                    .{ target_row_id, repository_id },
+                )) orelse return error.Conflict;
+                repository.deinit();
+            }
+        }
+        if (try self.conn.row(
+            "select 1 from threads where workspace_id = ?1 and local_thread_id = ?2",
+            .{ target_row_id, request.local_thread_id },
+        )) |existing| {
+            existing.deinit();
+            return error.Conflict;
+        }
+
+        var before = try self.visibleThreadIds(source_row_id);
+        defer freeThreadIds(self.allocator, &before);
+        try self.conn.exec(
+            \\update threads
+            \\set workspace_id = ?1,
+            \\    open = 1,
+            \\    archived = 0,
+            \\    cwd = coalesce(?2, cwd),
+            \\    sort_index = (select coalesce(max(sort_index), -1) + 1 from threads other where other.workspace_id = ?1)
+            \\where id = ?3
+        , .{ target_row_id, request.cwd, thread_row_id });
+        const text_keyed = [_][:0]const u8{
+            "update chat_turns set workspace_id = ?1 where workspace_id = ?2 and local_thread_id = ?3",
+            "update or replace chat_completions set workspace_id = ?1 where workspace_id = ?2 and local_thread_id = ?3",
+            "update chat_tasks set workspace_id = ?1 where workspace_id = ?2 and local_thread_id = ?3",
+        };
+        for (text_keyed) |sql| try self.conn.exec(sql, .{ request.target_workspace_id, request.workspace_id, request.local_thread_id });
+        try self.conn.exec(
+            "delete from chat_links where workspace_id = ?1 and (local_thread_id = ?2 or parent_thread_id = ?2)",
+            .{ request.workspace_id, request.local_thread_id },
+        );
+        try self.dropClosedThreadPanes(source_row_id, request.local_thread_id, before.items);
+    }
+
     /// Snapshot-visible thread ids in order: the list chat pane ordinals in
     /// `workspace_layout_json` index into. Mirrors the snapshot thread query.
     fn visibleThreadIds(self: *Self, workspace_row_id: i64) !std.ArrayList([]u8) {
@@ -4157,6 +4241,7 @@ fn mutationHeader(mutation: Mutation) store_protocol.MutationHeader {
         .workspace_repository_binding_remove => |request| request.mutation,
         .thread_upsert => |request| request.mutation,
         .thread_close => |request| request.mutation,
+        .thread_move => |request| request.mutation,
         .thread_archive_set => |request| request.mutation,
         .chat_draft_set => |request| request.mutation,
         .message_append => |request| request.mutation,
@@ -4179,6 +4264,7 @@ fn mutationOperation(mutation: Mutation) []const u8 {
         .workspace_repository_binding_remove => WORKSPACE_REPOSITORY_BINDING_REMOVE_OPERATION,
         .thread_upsert => THREAD_UPSERT_OPERATION,
         .thread_close => THREAD_CLOSE_OPERATION,
+        .thread_move => THREAD_MOVE_OPERATION,
         .thread_archive_set => store_protocol.METHOD_CHAT_THREAD_ARCHIVE_SET,
         .chat_draft_set => CHAT_DRAFT_SET_OPERATION,
         .message_append => MESSAGE_APPEND_OPERATION,
@@ -4256,6 +4342,11 @@ fn validateMutation(mutation: Mutation) StoreError!void {
         },
         .thread_close => |request| {
             if (request.workspace_id.len == 0 or request.local_thread_id.len == 0) return error.InvalidParams;
+        },
+        .thread_move => |request| {
+            if (request.workspace_id.len == 0 or request.local_thread_id.len == 0 or request.target_workspace_id.len == 0) return error.InvalidParams;
+            if (std.mem.eql(u8, request.workspace_id, request.target_workspace_id)) return error.InvalidParams;
+            if (request.cwd) |cwd| if (cwd.len == 0) return error.InvalidParams;
         },
         .chat_draft_set => |request| {
             if (request.workspace_id.len == 0 or request.local_thread_id.len == 0) return error.InvalidParams;
@@ -5318,6 +5409,64 @@ test "thread close drops its panes from the stored layout and rebinds the rest" 
     try std.testing.expect(stored.rootContainsPane(c_pane));
     try std.testing.expectEqual(@as(usize, 0), stored.paneById(1).?.ref.chat.thread_index);
     try std.testing.expectEqual(@as(usize, 1), stored.paneById(c_pane).?.ref.chat.thread_index);
+}
+
+test "thread move reassigns the row, rekeys turn records, and detaches links" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+
+    var source = testWorkspace("src", "Source");
+    source.threads = &.{ testThread("a", "A"), testThread("b", "B") };
+    var target = testWorkspace("dst", "Target");
+    target.threads = &.{testThread("x", "X")};
+    const bootstrap = try store.replaceSnapshot(testSnapshotRequest("boot", null, true, testSnapshot(&.{ source, target })));
+    try store.conn.execNoArgs(
+        \\insert into chat_turns(turn_id, workspace_id, local_thread_id, status, started_at_ms, provider)
+        \\values ('t1', 'src', 'b', 'completed', 1, 'claude');
+        \\insert into chat_links(link_id, workspace_id, parent_thread_id, local_thread_id) values ('l1', 'src', 'a', 'b');
+    );
+
+    try std.testing.expectError(error.InvalidParams, store.moveThread(.{
+        .mutation = testHeader("same", bootstrap.store_revision),
+        .workspace_id = "src",
+        .local_thread_id = "b",
+        .target_workspace_id = "src",
+    }));
+    const moved = try store.moveThread(.{
+        .mutation = testHeader("move-b", bootstrap.store_revision),
+        .workspace_id = "src",
+        .local_thread_id = "b",
+        .target_workspace_id = "dst",
+        .cwd = "/src",
+    });
+    try std.testing.expect(moved.applied);
+
+    var row = (try store.conn.row(
+        "select w.workspace_id, t.sort_index, t.open, t.cwd from threads t join workspaces w on w.id = t.workspace_id where t.local_thread_id = 'b'",
+        .{},
+    )).?;
+    defer row.deinit();
+    try std.testing.expectEqualStrings("dst", row.text(0));
+    try std.testing.expectEqual(@as(i64, 1), row.int(1));
+    try std.testing.expectEqual(@as(i64, 1), row.int(2));
+    try std.testing.expectEqualStrings("/src", row.text(3));
+    var turn = (try store.conn.row("select workspace_id from chat_turns where turn_id = 't1'", .{})).?;
+    defer turn.deinit();
+    try std.testing.expectEqualStrings("dst", turn.text(0));
+    try std.testing.expect((try store.conn.row("select 1 from chat_links where link_id = 'l1'", .{})) == null);
+
+    // Moving it back while a turn is live is refused.
+    try store.conn.execNoArgs("update chat_turns set status = 'running' where turn_id = 't1'");
+    try std.testing.expectError(error.Conflict, store.moveThread(.{
+        .mutation = testHeader("move-back", moved.store_revision),
+        .workspace_id = "dst",
+        .local_thread_id = "b",
+        .target_workspace_id = "src",
+    }));
 }
 
 fn expectThreadOpenState(store: *Store, local_thread_id: []const u8, sort_index: i64, open: bool) !void {
