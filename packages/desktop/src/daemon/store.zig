@@ -12,6 +12,7 @@ const schema = @import("../db/schema.zig");
 const access_store = @import("access_store.zig");
 const connect_store = @import("connect_store.zig");
 const transcript_apply = @import("../chat/transcript_apply.zig");
+const workspace_layout = @import("../state/workspace_layout.zig");
 const platform_runtime = @import("platform_runtime");
 
 const store_protocol = headless.store;
@@ -177,6 +178,10 @@ pub const TurnCommitRequest = struct {
     /// observed by the worker. This keeps a concurrent manual rename intact.
     expected_thread_title: ?[]const u8 = null,
     generated_title: ?[]const u8 = null,
+    /// A prompt-only title this turn applied while it ran. The final title
+    /// may replace it as well as the fallback. Deliberately outside the
+    /// receipt fingerprint: it widens the guard, not the committed outcome.
+    previous_generated_title: ?[]const u8 = null,
     error_message: ?[]const u8 = null,
     failure_reason: ?store_protocol.ProviderFailureReason = null,
     user_message_id: ?[]const u8 = null,
@@ -1247,6 +1252,7 @@ pub const Store = struct {
                 request.workspace_id,
                 request.local_thread_id,
                 request.expected_thread_title.?,
+                request.previous_generated_title,
                 generated_title,
             ) catch |err| return mapStoreError(err);
         }
@@ -3100,13 +3106,136 @@ pub const Store = struct {
         )) orelse return error.ResourceNotFound;
         defer thread_row.deinit();
         if (thread_row.int(1) == 0) return false;
+        var before = try self.visibleThreadIds(workspace_row_id);
+        defer freeThreadIds(self.allocator, &before);
         try self.conn.exec(
             \\update threads
             \\set open = 0,
             \\    sort_index = (select coalesce(max(sort_index), -1) + 1 from threads other where other.workspace_id = ?1)
             \\where id = ?2
         , .{ workspace_row_id, thread_row.int(0) });
+        try self.dropClosedThreadPanes(workspace_row_id, request.local_thread_id, before.items);
         return true;
+    }
+
+    /// Snapshot-visible thread ids in order: the list chat pane ordinals in
+    /// `workspace_layout_json` index into. Mirrors the snapshot thread query.
+    fn visibleThreadIds(self: *Self, workspace_row_id: i64) !std.ArrayList([]u8) {
+        var ids: std.ArrayList([]u8) = .empty;
+        errdefer freeThreadIds(self.allocator, &ids);
+        var rows = try self.conn.rows(
+            \\select local_thread_id from threads
+            \\where workspace_id = ?1
+            \\  and local_thread_id is not null
+            \\  and (open = 1 or exists (
+            \\      select 1 from chat_turns turn
+            \\      join workspaces w on w.workspace_id = turn.workspace_id
+            \\      where w.id = threads.workspace_id
+            \\        and turn.local_thread_id = threads.local_thread_id
+            \\        and turn.status in ('accepted', 'running', 'waiting_approval')
+            \\  ))
+            \\order by sort_index
+        , .{workspace_row_id});
+        defer rows.deinit();
+        while (rows.next()) |row| {
+            const id = try self.allocator.dupe(u8, row.text(0));
+            ids.append(self.allocator, id) catch |err| {
+                self.allocator.free(id);
+                return err;
+            };
+        }
+        if (rows.err) |err| return err;
+        return ids;
+    }
+
+    fn freeThreadIds(allocator: std.mem.Allocator, ids: *std.ArrayList([]u8)) void {
+        for (ids.items) |id| allocator.free(id);
+        ids.deinit(allocator);
+    }
+
+    /// A thread closed by a daemon client (web) leaves the stored layout in
+    /// the same transaction: its chat panes close and every other chat pane
+    /// is rebound by identity to its new ordinal. Otherwise the desktop and
+    /// web would clamp the dead ordinal onto whichever thread slid into it.
+    fn dropClosedThreadPanes(self: *Self, workspace_row_id: i64, closed_thread_id: []const u8, before: []const []u8) !void {
+        const allocator = self.allocator;
+        const stored = stored: {
+            const row = (try self.conn.row(
+                "select workspace_layout_json, selected_thread_index from workspaces where id = ?1",
+                .{workspace_row_id},
+            )) orelse return;
+            defer row.deinit();
+            const json = row.nullableText(0) orelse return;
+            if (json.len == 0) return;
+            break :stored .{ .json = try allocator.dupe(u8, json), .selected = row.nullableInt(1) orelse 0 };
+        };
+        defer allocator.free(stored.json);
+
+        var after = try self.visibleThreadIds(workspace_row_id);
+        defer freeThreadIds(allocator, &after);
+
+        var layout: workspace_layout.WorkspaceLayout = .{};
+        defer layout.deinit(allocator);
+        // A layout this build cannot parse is left alone; the desktop's next
+        // flush rewrites it.
+        layout.applyPersistedWorkspaceJson(allocator, stored.json) catch return;
+
+        var doomed: std.ArrayList(workspace_layout.WorkspacePaneId) = .empty;
+        defer doomed.deinit(allocator);
+        var changed = false;
+        for (layout.panes.items) |*pane| switch (pane.ref) {
+            .chat => |*ref| {
+                if (ref.thread_index >= before.len) continue;
+                const thread_id = before[ref.thread_index];
+                if (std.mem.eql(u8, thread_id, closed_thread_id)) {
+                    try doomed.append(allocator, pane.id);
+                    continue;
+                }
+                const rebound = indexOfThreadId(after.items, thread_id) orelse continue;
+                if (rebound != ref.thread_index) {
+                    ref.thread_index = rebound;
+                    changed = true;
+                }
+            },
+            else => {},
+        };
+        for (doomed.items) |pane_id| {
+            var removed = layout.closePane(allocator, pane_id) orelse continue;
+            workspace_layout.deinitWorkspacePaneRef(&removed, allocator);
+            changed = true;
+        }
+
+        const selected_before: usize = std.math.cast(usize, stored.selected) orelse 0;
+        const selected_after: usize = selected: {
+            if (selected_before < before.len) {
+                if (indexOfThreadId(after.items, before[selected_before])) |index| {
+                    if (!std.mem.eql(u8, before[selected_before], closed_thread_id)) break :selected index;
+                }
+            }
+            break :selected @min(selected_before, if (after.items.len == 0) 0 else after.items.len - 1);
+        };
+        if (!changed and selected_after == selected_before) return;
+
+        const json = try layout.persistedWorkspaceJson(allocator);
+        defer allocator.free(json);
+        try self.conn.exec(
+            "update workspaces set workspace_layout_json = ?1, selected_thread_index = ?2 where id = ?3",
+            .{ json, @as(i64, @intCast(selected_after)), workspace_row_id },
+        );
+    }
+
+    fn indexOfThreadId(ids: []const []u8, thread_id: []const u8) ?usize {
+        for (ids, 0..) |id, index| {
+            if (std.mem.eql(u8, id, thread_id)) return index;
+        }
+        return null;
+    }
+
+    fn threadWorkspaceRowId(self: *Self, thread_row_id: i64) !i64 {
+        const row = (try self.conn.row("select workspace_id from threads where id = ?1", .{thread_row_id})) orelse
+            return error.ResourceNotFound;
+        defer row.deinit();
+        return row.int(0);
     }
 
     fn applyThreadArchiveSet(self: *Self, request: store_protocol.ThreadArchiveSetRequest) !bool {
@@ -3118,7 +3247,11 @@ pub const Store = struct {
         const archived = boolToInt(request.archived);
         const open = boolToInt(!request.archived);
         if (row.int(1) == archived and row.int(2) == open) return false;
+        const closing = row.int(2) != 0 and open == 0;
+        var before: std.ArrayList([]u8) = if (closing) try self.visibleThreadIds(try self.threadWorkspaceRowId(row.int(0))) else .empty;
+        defer freeThreadIds(self.allocator, &before);
         try self.conn.exec("update threads set archived = ?1, open = ?2 where id = ?3", .{ archived, open, row.int(0) });
+        if (closing) try self.dropClosedThreadPanes(try self.threadWorkspaceRowId(row.int(0)), request.local_thread_id, before.items);
         return true;
     }
 
@@ -3350,13 +3483,50 @@ pub const Store = struct {
         workspace_id: []const u8,
         local_thread_id: []const u8,
         expected_title: []const u8,
+        previous_generated_title: ?[]const u8,
         generated_title: []const u8,
     ) !void {
+        // A null ?5 never compares equal, so it only widens the guard when set.
         try self.conn.exec(
             "update threads set title = ?1 where workspace_id = (select id from workspaces where workspace_id = ?2) " ++
-                "and local_thread_id = ?3 and title = ?4",
-            .{ generated_title, workspace_id, local_thread_id, expected_title },
+                "and local_thread_id = ?3 and (title = ?4 or title = ?5)",
+            .{ generated_title, workspace_id, local_thread_id, expected_title, previous_generated_title },
         );
+    }
+
+    /// Apply a prompt-only automatic title while the opening turn still runs.
+    /// The eligibility guard and the write share one transaction so a
+    /// concurrent manual rename wins; a real change advances store_revision
+    /// so store observers see the title before the turn commits. Returns the
+    /// new revision, or null when the guard no longer matched.
+    pub fn applyInFlightAutomaticTitle(
+        self: *Self,
+        workspace_id: []const u8,
+        local_thread_id: []const u8,
+        expected_title: []const u8,
+        generated_title: []const u8,
+    ) StoreError!?u64 {
+        self.conn.execNoArgs("begin immediate") catch |err| return mapStoreError(err);
+        var transaction_open = true;
+        defer if (transaction_open) self.conn.rollback();
+
+        self.conn.exec(
+            "update threads set title = ?1 where workspace_id = (select id from workspaces where workspace_id = ?2) " ++
+                "and local_thread_id = ?3 and title = ?4 " ++
+                "and (select count(*) from messages m where m.thread_id = threads.id and m.role = 0) = 1",
+            .{ generated_title, workspace_id, local_thread_id, expected_title },
+        ) catch |err| return mapStoreError(err);
+        if (self.conn.changes() == 0) return null;
+        const revision = self.readStoreRevision() catch |err| return mapStoreError(err);
+        const next_revision = std.math.add(u64, revision, 1) catch return error.StoreUnavailable;
+        const next_revision_sql: i64 = std.math.cast(i64, next_revision) orelse return error.StoreUnavailable;
+        self.conn.exec(
+            "update store_state set store_revision = ?1 where id = 1",
+            .{next_revision_sql},
+        ) catch |err| return mapStoreError(err);
+        self.conn.commit() catch |err| return mapStoreError(err);
+        transaction_open = false;
+        return next_revision;
     }
 
     /// True only for the opening user prompt while the durable title still
@@ -5152,6 +5322,44 @@ test "snapshot replace carries thread closes atomically with the layout" {
     try expectThreadOpenState(&store, "a", 0, true);
     try expectThreadOpenState(&store, "c", 1, true);
     try expectThreadOpenState(&store, "b", 2, true);
+}
+
+test "thread close drops its panes from the stored layout and rebinds the rest" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer allocator.free(db_path);
+    var store = try Store.init(allocator, db_path);
+    defer store.deinit();
+
+    var layout = try workspace_layout.WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+    const b_pane = try layout.createChatPane(allocator, 1);
+    try layout.splitPaneWithLeaf(allocator, 1, b_pane, .vertical, true);
+    const c_pane = try layout.createChatPane(allocator, 2);
+    try layout.splitPaneWithLeaf(allocator, b_pane, c_pane, .vertical, true);
+    const layout_json = try layout.persistedWorkspaceJson(allocator);
+    defer allocator.free(layout_json);
+
+    var workspace = testWorkspace("ws", "WS");
+    workspace.workspace_layout_json = layout_json;
+    workspace.selected_thread_index = 2;
+    workspace.threads = &.{ testThread("a", "A"), testThread("b", "B"), testThread("c", "C") };
+    const bootstrap = try store.replaceSnapshot(testSnapshotRequest("boot", null, true, testSnapshot(&.{workspace})));
+    _ = try store.closeThread(.{ .mutation = testHeader("close-b", bootstrap.store_revision), .workspace_id = "ws", .local_thread_id = "b" });
+
+    var row = (try store.conn.row("select workspace_layout_json, selected_thread_index from workspaces where workspace_id = 'ws'", .{})).?;
+    defer row.deinit();
+    try std.testing.expectEqual(@as(i64, 1), row.int(1));
+    var stored: workspace_layout.WorkspaceLayout = .{};
+    defer stored.deinit(allocator);
+    try stored.applyPersistedWorkspaceJson(allocator, row.text(0));
+    try std.testing.expectEqual(@as(usize, 2), stored.panes.items.len);
+    try std.testing.expect(stored.paneById(b_pane) == null);
+    try std.testing.expect(stored.rootContainsPane(c_pane));
+    try std.testing.expectEqual(@as(usize, 0), stored.paneById(1).?.ref.chat.thread_index);
+    try std.testing.expectEqual(@as(usize, 1), stored.paneById(c_pane).?.ref.chat.thread_index);
 }
 
 fn expectThreadOpenState(store: *Store, local_thread_id: []const u8, sort_index: i64, open: bool) !void {
@@ -7072,6 +7280,82 @@ test "turn acceptance provider switch clears stale identity without touching GUI
     try std.testing.expect(failed.nullableText(0) == null);
     try std.testing.expect(failed.nullableText(1) == null);
     try std.testing.expectEqualStrings("failed", failed.text(2));
+}
+
+test "in-flight automatic titles apply mid-turn and yield to refinement or manual renames" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+
+    const workspace = testWorkspace("workspace-early-title", "Early title workspace");
+    _ = try store.upsertWorkspace(.{
+        .mutation = testHeader("early-title-workspace", null),
+        .workspace = workspace,
+    });
+    _ = try store.acceptTurn(.{
+        .mutation = testHeader("turn:early-title:accept", null),
+        .turn_id = "turn-early-title",
+        .workspace = workspace,
+        .thread = .{ .local_thread_id = "thread-early-title", .title = "Explain early titles", .provider = "codex" },
+        .started_at_ms = 10,
+        .provider = "codex",
+        .harness = "local_cli",
+        .user_message = .{
+            .message_id = "early-title-user",
+            .role = "user",
+            .author = "You",
+            .body = "Explain early titles",
+        },
+    });
+
+    const before = try store.storeRevision();
+    try std.testing.expect((try store.applyInFlightAutomaticTitle(workspace.workspace_id, "thread-early-title", "Wrong fallback", "Nope")) == null);
+    try std.testing.expectEqual(before, try store.storeRevision());
+    try std.testing.expectEqual(before + 1, (try store.applyInFlightAutomaticTitle(workspace.workspace_id, "thread-early-title", "Explain early titles", "Early Titles")).?);
+    try std.testing.expectEqual(before + 1, try store.storeRevision());
+    try std.testing.expect(try store.threadTitleEquals(workspace.workspace_id, "thread-early-title", "Early Titles"));
+
+    // The completion title may replace the in-flight title it refines.
+    _ = try store.commitTurn(.{
+        .turn_id = "turn-early-title",
+        .workspace_id = workspace.workspace_id,
+        .local_thread_id = "thread-early-title",
+        .status = .completed,
+        .started_at_ms = 10,
+        .finished_at_ms = 20,
+        .provider = "codex",
+        .expected_thread_title = "Explain early titles",
+        .previous_generated_title = "Early Titles",
+        .generated_title = "Refined Early Titles",
+    });
+    try std.testing.expect(try store.threadTitleEquals(workspace.workspace_id, "thread-early-title", "Refined Early Titles"));
+
+    // A manual rename before the in-flight write keeps the user's title.
+    _ = try store.acceptTurn(.{
+        .mutation = testHeader("turn:early-title-manual:accept", null),
+        .turn_id = "turn-early-title-manual",
+        .workspace = workspace,
+        .thread = .{ .local_thread_id = "thread-early-title-manual", .title = "Rename me", .provider = "codex" },
+        .started_at_ms = 30,
+        .provider = "codex",
+        .harness = "local_cli",
+        .user_message = .{
+            .message_id = "early-title-manual-user",
+            .role = "user",
+            .author = "You",
+            .body = "Rename me",
+        },
+    });
+    _ = try store.upsertThread(.{
+        .mutation = testHeader("early-title-manual-rename", null),
+        .workspace_id = workspace.workspace_id,
+        .thread = testThread("thread-early-title-manual", "My Manual Title"),
+    });
+    try std.testing.expect((try store.applyInFlightAutomaticTitle(workspace.workspace_id, "thread-early-title-manual", "Rename me", "Should Not Win")) == null);
+    try std.testing.expect(try store.threadTitleEquals(workspace.workspace_id, "thread-early-title-manual", "My Manual Title"));
 }
 
 test "daemon turn titles commit the first prompt and preserve later manual renames" {

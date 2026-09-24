@@ -9,8 +9,15 @@ const unavailable = [
   'workspace-import-codex', 'workspace-import-opencode', 'workspace-import-claude',
   'thread-regenerate-title', 'thread-handoff', 'thread-open-tui', 'thread-open-chat',
   'pane-split-chat-right', 'pane-split-chat-down', 'pane-split-terminal-right', 'pane-split-terminal-down',
-  'pane-close',
 ]
+
+test('desktop-tiled chat and daemon terminal panes close from the web; browser panes do not', () => {
+  const close = { action: 'pane-close', label: 'Close pane' }
+  expect(sidebarMenuAvailability(close, pane).disabled).not.toBe(true)
+  expect(sidebarMenuAvailability(close, { ...pane, kind: 'terminal', thread_id: undefined, session_id: 's' }).disabled).not.toBe(true)
+  expect(sidebarMenuAvailability(close, { ...pane, kind: 'browser', thread_id: undefined }).label).toContain(DESKTOP_ACTION_REASON)
+  expect(sidebarMenuAvailability(close, { ...pane, kind: 'terminal', thread_id: undefined }).label).toContain(DESKTOP_ACTION_REASON)
+})
 
 for (const action of unavailable) {
   test(`${action} is visibly disabled and direct store dispatch reports why without RPC`, async () => {

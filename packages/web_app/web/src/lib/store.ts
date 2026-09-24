@@ -3599,9 +3599,11 @@ export function createAppStore() {
     }
     if (maximizedPaneId() === pane.pane_id) setMaximizedPaneId(null)
     publishPanes(workspaces())
-    // A daemon-only chat pane closes its thread in the store so the snapshot
-    // stops projecting it; History reopens it. No desktop transport needed.
-    if (pane.kind === 'chat' && pane.native_pane_id == null && !pane.session_id) {
+    // A chat pane closes its thread in the store so the snapshot stops
+    // projecting it; History reopens it. For a desktop-tiled chat the daemon
+    // drops its pane from the stored layout in the same write, and the
+    // desktop follows on its next projection refresh.
+    if (pane.kind === 'chat' && !pane.session_id) {
       if (!pane.thread_id) return
       const client_id = await ensureClientId()
       const closed = await interactiveCall('chat.thread.close', {

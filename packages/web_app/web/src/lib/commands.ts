@@ -99,8 +99,16 @@ const DESKTOP_SIDEBAR_ACTIONS = new Set([
 export function sidebarActionUnavailableReason(action: string, pane?: LivePane): string | null {
   if (DESKTOP_SIDEBAR_ACTIONS.has(action)) return DESKTOP_ACTION_REASON
   if (action === 'thread-sync' && pane?.profile_id && pane.profile_id !== 'local') return DESKTOP_ACTION_REASON
-  if (action === 'pane-close' && pane?.native_pane_id != null && !(pane.kind === 'terminal' && pane.session_id)) return DESKTOP_ACTION_REASON
+  // Chats close through the daemon store (which also prunes the stored
+  // layout), and daemon-backed terminals through session.kill. Only desktop
+  // panes with no daemon identity (browser, stopped terminal) need the app.
+  if (action === 'pane-close' && pane?.native_pane_id != null && !paneClosableFromWeb(pane)) return DESKTOP_ACTION_REASON
   return null
+}
+
+function paneClosableFromWeb(pane: LivePane): boolean {
+  if (pane.kind === 'terminal') return Boolean(pane.session_id)
+  return pane.kind === 'chat' && Boolean(pane.thread_id)
 }
 
 /** Keep the menu and direct dispatch in agreement without a desktop transport. */
