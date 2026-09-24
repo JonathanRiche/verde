@@ -1572,7 +1572,6 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
             ref={(node) => { filePicker = node }}
             type="file"
             class="hidden"
-            accept="image/png,image/jpeg,image/webp,image/gif,image/bmp"
             multiple
             onChange={(event) => {
               const files = Array.from(event.currentTarget.files ?? [])
@@ -1585,8 +1584,8 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
             class="grid h-8 w-8 shrink-0 place-items-center rounded-full text-[var(--text-muted)] hover:bg-[var(--panel-alt)] hover:text-[var(--text)] disabled:opacity-35"
             disabled={uploading() || store.sending()}
             onClick={() => filePicker?.click()}
-            aria-label="Attach image"
-            title="Attach image (PNG, JPEG, WebP, GIF, or BMP; up to 10 MB)"
+            aria-label="Attach files"
+            title="Attach files (images up to 10 MB, other files up to 50 MB)"
           >
             <Show
               when={!uploading()}

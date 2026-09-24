@@ -23,6 +23,8 @@ pub const MAX_RPC_FRAME_BYTES: usize = daemon_mod.MAX_GATEWAY_RPC_BYTES;
 const MIN_CHANGES_RETRY_MS: u64 = 250;
 const WEB_CHAT_IMAGE_DIR = "web-chat-images";
 const MAX_CHAT_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+const WEB_CHAT_FILE_DIR = "web-chat-files";
+const MAX_CHAT_FILE_BYTES: usize = 50 * 1024 * 1024;
 /// Workspace files opened from chat citations are read into memory.
 const MAX_SERVED_FILE_BYTES: usize = 32 * 1024 * 1024;
 const CSP = "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; worker-src 'self' blob:; frame-src 'self' blob:";
@@ -1193,6 +1195,41 @@ fn handleApi(
                 .mime = mime,
                 .byte_size = body.len,
                 .attachment_id = stored.attachment_id,
+            },
+        }, .{}, &writer.writer);
+        const response = try writer.toOwnedSlice();
+        defer allocator.free(response);
+        try respondJson(request, .created, response);
+        return;
+    }
+
+    // Non-image chat files (PDFs, documents, archives, ...) are stored on the
+    // gateway host under their original name. The web composer inserts the
+    // returned path into the prompt, and the agent reads the file from there.
+    if (std.mem.eql(u8, split.path, "/api/chat-file") and request.head.method == .POST) {
+        if (!try authorizeApiContext(allocator, daemon, auth, auth_context, headless.access_protocol.scopeBit(.chat_write), request)) return;
+        const raw_name = queryValue(split.query, "name") orelse "";
+        const decoded_name = try decodeQueryComponent(allocator, raw_name);
+        defer allocator.free(decoded_name);
+        const file_name = try sanitizeChatFileName(allocator, decoded_name);
+        defer allocator.free(file_name);
+        const body_reader = try request.readerExpectContinue(&.{});
+        const body = body_reader.allocRemaining(allocator, .limited(MAX_CHAT_FILE_BYTES)) catch {
+            request.head.keep_alive = false;
+            try respondJson(request, .payload_too_large, "{\"ok\":false,\"error\":\"file_too_large\"}");
+            return;
+        };
+        defer allocator.free(body);
+        const stored = try storeChatFile(allocator, io, config.pref_path, file_name, body);
+        defer stored.deinit(allocator);
+        var writer: std.Io.Writer.Allocating = .init(allocator);
+        defer writer.deinit();
+        try std.json.Stringify.value(.{
+            .ok = true,
+            .file = .{
+                .path = stored.path,
+                .name = file_name,
+                .byte_size = body.len,
             },
         }, .{}, &writer.writer);
         const response = try writer.toOwnedSlice();
@@ -2494,6 +2531,64 @@ fn attachmentMime(value: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Keeps an uploaded file's basename readable for the agent while making it
+/// safe as one path component: no separators, no leading dots, bounded length.
+fn sanitizeChatFileName(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    const base = if (std.mem.lastIndexOfAny(u8, raw, "/\\")) |slash| raw[slash + 1 ..] else raw;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (base) |byte| {
+        if (out.items.len >= 120) break;
+        const safe = std.ascii.isAlphanumeric(byte) or byte == '.' or byte == '-' or byte == '_';
+        if (byte == '.' and out.items.len == 0) continue;
+        try out.append(allocator, if (safe) byte else '_');
+    }
+    if (out.items.len == 0) try out.appendSlice(allocator, "file");
+    return out.toOwnedSlice(allocator);
+}
+
+fn storeChatFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    pref_path: []const u8,
+    file_name: []const u8,
+    bytes: []const u8,
+) !StoredChatImage {
+    const root = try std.fs.path.join(allocator, &.{ pref_path, WEB_CHAT_FILE_DIR });
+    defer allocator.free(root);
+    std.Io.Dir.createDirAbsolute(io, root, .default_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    const timestamp = std.Io.Clock.real.now(io);
+    const timestamp_ns: u128 = @intCast(@max(timestamp.nanoseconds, 0));
+    const content_hash = std.hash.Wyhash.hash(0, bytes);
+    var attempt: usize = 0;
+    while (attempt < 256) : (attempt += 1) {
+        const upload_id = try std.fmt.allocPrint(allocator, "web-{x}-{x}-{d}", .{ timestamp_ns, content_hash, attempt });
+        errdefer allocator.free(upload_id);
+        const directory = try std.fs.path.join(allocator, &.{ root, upload_id });
+        defer allocator.free(directory);
+        std.Io.Dir.createDirAbsolute(io, directory, .default_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                allocator.free(upload_id);
+                continue;
+            },
+            else => return err,
+        };
+        const path = try std.fs.path.join(allocator, &.{ directory, file_name });
+        errdefer allocator.free(path);
+        const created = try std.Io.Dir.createFileAbsolute(io, path, .{ .exclusive = true });
+        defer created.close(io);
+        var write_buffer: [8 * 1024]u8 = undefined;
+        var writer = created.writer(io, &write_buffer);
+        try writer.interface.writeAll(bytes);
+        try writer.interface.flush();
+        return .{ .path = path, .attachment_id = upload_id };
+    }
+    return error.PathAlreadyExists;
+}
+
 const StoredChatImage = struct {
     path: []u8,
     attachment_id: []u8,
@@ -2994,6 +3089,7 @@ test "every api route and exact websocket target require authentication" {
         "/api/status",
         "/api/snapshot",
         "/api/attachment",
+        "/api/chat-file",
         "/api/file",
         "/api/preview",
         "/api/rpc",
@@ -3432,6 +3528,23 @@ test "query component decoding resolves percent escapes and plus" {
     const plus = try decodeQueryComponent(std.testing.allocator, "/tmp/a+b.txt");
     defer std.testing.allocator.free(plus);
     try std.testing.expectEqualStrings("/tmp/a b.txt", plus);
+}
+
+test "chat file names stay one readable path component" {
+    const allocator = std.testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "Pitch Deck (final).pdf", "Pitch_Deck__final_.pdf" },
+        .{ "../../etc/passwd", "passwd" },
+        .{ "C:\\Users\\me\\report.docx", "report.docx" },
+        .{ "..hidden", "hidden" },
+        .{ "", "file" },
+        .{ "/", "file" },
+    };
+    for (cases) |case| {
+        const name = try sanitizeChatFileName(allocator, case[0]);
+        defer allocator.free(name);
+        try std.testing.expectEqualStrings(case[1], name);
+    }
 }
 
 test "attachment disposition quotes and sanitizes the basename" {

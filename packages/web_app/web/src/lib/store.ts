@@ -30,6 +30,7 @@ import {
   fetchRpc,
   unwrapList,
   unwrapResult,
+  uploadChatFile,
   uploadChatImage,
   type EventHandler,
 } from './live'
@@ -153,6 +154,7 @@ export interface SidebarContextActionRequest {
 }
 
 const MAX_CHAT_IMAGE_BYTES = 10 * 1024 * 1024
+const MAX_CHAT_FILE_BYTES = 50 * 1024 * 1024
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' ? (value as Record<string, unknown>) : null
@@ -2724,14 +2726,58 @@ export function createAppStore() {
     return (attachmentUploads()[paneKey(pane.workspace_id, pane.pane_id)] ?? 0) > 0
   }
 
+  /// Non-image files (PDFs, documents, ...) are not provider image blocks.
+  /// Store them on the gateway host and put their paths in the draft, so the
+  /// agent reads them with its own file tools, like a path dropped into a CLI.
+  const attachDocuments = async (pane: LivePane, files: File[]) => {
+    if (connectionFor(pane) !== 'local') {
+      setNotice('File attachments need a local chat connection. Images still work.')
+      return
+    }
+    const sized = files.filter((file) => {
+      if (file.size <= MAX_CHAT_FILE_BYTES) return true
+      setNotice(`${file.name || 'That file'} is larger than 50 MB.`)
+      return false
+    })
+    if (sized.length === 0) return
+    const key = paneKey(pane.workspace_id, pane.pane_id)
+    setAttachmentUploads((prev) => ({ ...prev, [key]: (prev[key] ?? 0) + sized.length }))
+    try {
+      const results = await Promise.allSettled(sized.map((file) => uploadChatFile(file)))
+      const paths: string[] = []
+      let failure: string | null = null
+      for (const result of results) {
+        if (result.status === 'fulfilled') paths.push(result.value)
+        else failure ??= result.reason instanceof Error ? result.reason.message : 'file upload failed'
+      }
+      if (paths.length > 0) {
+        const draft = draftFor(pane)
+        const separator = draft.length === 0 || draft.endsWith('\n') ? '' : '\n'
+        const lines = paths.map((path) => `Attached file: ${path}`).join('\n')
+        setDraftFor(pane, `${draft}${separator}${lines}\n`)
+        setComposerNonce((value) => value + 1)
+      }
+      if (failure) setNotice(failure)
+    } finally {
+      setAttachmentUploads((prev) => {
+        const next = { ...prev }
+        const remaining = (next[key] ?? 0) - sized.length
+        if (remaining > 0) next[key] = remaining
+        else delete next[key]
+        return next
+      })
+    }
+  }
+
   const attachFiles = async (pane: LivePane, selected: File[]) => {
     if (selected.length === 0) return
     const key = paneKey(pane.workspace_id, pane.pane_id)
     const accepted: Array<{ file: File; mime: string }> = []
+    const documents: File[] = []
     for (const file of selected) {
       const mime = imageMimeForFile(file)
       if (!mime) {
-        setNotice(`${file.name || 'That file'} is not a supported image.`)
+        documents.push(file)
         continue
       }
       if (file.size > MAX_CHAT_IMAGE_BYTES) {
@@ -2740,6 +2786,7 @@ export function createAppStore() {
       }
       accepted.push({ file, mime })
     }
+    if (documents.length > 0) await attachDocuments(pane, documents)
     if (accepted.length === 0) return
     setAttachmentUploads((prev) => ({ ...prev, [key]: (prev[key] ?? 0) + accepted.length }))
     setNotice(null)

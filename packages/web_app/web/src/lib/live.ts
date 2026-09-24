@@ -292,6 +292,27 @@ export async function uploadChatImage(file: File, mime: string): Promise<Attachm
   return { ...payload.attachment, name: file.name }
 }
 
+/// Uploads a non-image chat file to the gateway host and returns the absolute
+/// path the agent can read it from.
+export async function uploadChatFile(file: File): Promise<string> {
+  const query = new URLSearchParams({ name: file.name || 'file' })
+  const response = await fetch(`/api/chat-file?${query.toString()}`, {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'content-type': 'application/octet-stream' },
+    body: file,
+  })
+  const payload = (await response.json().catch(() => null)) as
+    | { file?: { path?: string }; error?: string }
+    | null
+  const path = payload?.file?.path
+  if (!response.ok || !path) {
+    const reason = payload?.error?.replaceAll('_', ' ') ?? `upload failed (${response.status})`
+    throw new Error(`${file.name || 'File'}: ${reason}`)
+  }
+  return path
+}
+
 export async function deleteChatImage(attachment: Attachment): Promise<void> {
   const id = webChatAttachmentId(attachment)
   if (!id) return
