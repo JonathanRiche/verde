@@ -15,8 +15,16 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption([:0]const u8, "version", version_z);
 
+    // Only the std-only QR encoder is shared from headless; the server stays
+    // dependency-light and does not import the full headless package.
+    const qr_module = b.createModule(.{
+        .root_source_file = b.path("../headless/src/qr.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const imports = [_]std.Build.Module.Import{
         .{ .name = "build_options", .module = build_options.createModule() },
+        .{ .name = "verde_qr", .module = qr_module },
     };
     const exe = b.addExecutable(.{
         .name = "verde-server",

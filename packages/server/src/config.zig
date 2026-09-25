@@ -35,6 +35,8 @@ pub const Options = struct {
     tailscale_https_port: u16 = DEFAULT_TAILSCALE_HTTPS_PORT,
     tailscale: bool = false,
     json: bool = false,
+    /// Suppresses the terminal QR code; it is also off for JSON or non-TTY output.
+    no_qr: bool = false,
     no_start: bool = false,
     headless: bool = false,
     install_service: bool = false,
@@ -78,6 +80,8 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) !Options {
             index += 1;
             if (index >= argv.len or options.descriptor_file != null) return error.InvalidArguments;
             options.descriptor_file = argv[index];
+        } else if (std.mem.eql(u8, arg, "--no-qr") and (command == .pair_create or command == .serve)) {
+            options.no_qr = true;
         } else if (std.mem.eql(u8, arg, "--no-start") and command == .service_install) {
             options.no_start = true;
         } else if (std.mem.eql(u8, arg, "--data-dir")) {
@@ -186,6 +190,23 @@ test "parses operator and delegated commands without accepting raw tokens" {
     try std.testing.expectEqualSlices([]const u8, &.{ "--expires", "10m", "--scope", "runtime:read" }, parsed.delegate_args);
     try std.testing.expectError(error.InvalidArguments, parse(std.testing.allocator, &.{ "verde-server", "serve", "--token", "secret" }));
     try std.testing.expectError(error.InvalidArguments, parse(std.testing.allocator, &.{ "verde-server", "pair", "list", "--token=secret" }));
+}
+
+test "--no-qr is consumed for pair create and serve only" {
+    var pair = try parse(std.testing.allocator, &.{ "verde-server", "pair", "create", "--label", "Phone", "--no-qr" });
+    defer deinit(&pair, std.testing.allocator);
+    try std.testing.expect(pair.no_qr);
+    try std.testing.expectEqualSlices([]const u8, &.{ "--label", "Phone" }, pair.delegate_args);
+
+    var serve = try parse(std.testing.allocator, &.{ "verde-server", "serve", "--tailscale", "--no-qr" });
+    defer deinit(&serve, std.testing.allocator);
+    try std.testing.expect(serve.no_qr);
+
+    var default_pair = try parse(std.testing.allocator, &.{ "verde-server", "pair", "create" });
+    defer deinit(&default_pair, std.testing.allocator);
+    try std.testing.expect(!default_pair.no_qr);
+
+    try std.testing.expectError(error.InvalidArguments, parse(std.testing.allocator, &.{ "verde-server", "status", "--no-qr" }));
 }
 
 test "service and gateway options validate bounds" {

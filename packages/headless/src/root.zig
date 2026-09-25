@@ -18,6 +18,7 @@ pub const session_protocol = @import("session_protocol.zig");
 pub const access_protocol = @import("access_protocol.zig");
 pub const connect_protocol = @import("connect_protocol.zig");
 pub const attachment_protocol = @import("attachment_protocol.zig");
+pub const qr = @import("qr.zig");
 pub const dispatch = @import("dispatch.zig");
 pub const client = @import("client.zig");
 pub const push_seal = @import("push_seal.zig");

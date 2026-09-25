@@ -9,10 +9,17 @@ const service = @import("service.zig");
 const supervisor = @import("supervisor.zig");
 const tailscale = @import("tailscale.zig");
 const oidc = @import("oidc.zig");
+const qr = @import("verde_qr");
 
 const VERSION: []const u8 = build_options.version;
 const PUBLIC_READINESS_REQUEST_TIMEOUT_MS: u32 = 2_000;
 const PUBLIC_READINESS_ATTEMPTS: usize = 15;
+/// Universal link / Android App Link prefix for phone pairing. Opening it in a
+/// phone browser never sends the fragment (the one-time code) to the server.
+const APP_LINK_PAIR_BASE: []const u8 = "https://verdeai.dev/pair";
+/// The pair App Link is about 180 bytes; 20 leaves room for long hosts
+/// while staying scannable from a terminal.
+const PAIR_QR_MAX_VERSION: u8 = 20;
 
 const Resolved = struct {
     allocator: std.mem.Allocator,
@@ -220,7 +227,11 @@ fn runTailscaleServe(io: std.Io, allocator: std.mem.Allocator, resolved: Resolve
         "Verde is installed as a background service and Tailscale terminates HTTPS at {s}.\n",
         .{prepared.origin},
     );
-    try printPairGrant(io, allocator, managed, prepared.origin);
+    try printPairGrant(io, allocator, managed, prepared.origin, .{
+        .daemon_args = &.{ "--label", "Tailscale" },
+        .attempts = 30,
+        .show_qr = !options.no_qr and !options.json,
+    });
 }
 
 fn runTailscaleDoctor(
@@ -274,12 +285,31 @@ fn emitTailscaleDiagnostic(
     , .{diagnostic.suggested_https_port.?});
 }
 
-fn printPairGrant(io: std.Io, allocator: std.mem.Allocator, resolved: Resolved, origin: []const u8) !void {
-    var attempts: usize = 0;
-    while (attempts < 30) : (attempts += 1) {
-        const result = try runCaptured(allocator, io, &.{
-            resolved.artifacts.daemon, "pair", "create", "--label", "Tailscale", "--data-dir", resolved.runtime.data_dir, "--json",
-        });
+const PairGrantOptions = struct {
+    /// Extra `verde-daemon pair create` arguments, such as `--label`.
+    daemon_args: []const []const u8,
+    /// Retries cover a daemon that is still starting after service install.
+    attempts: usize,
+    /// Requested by the caller; still suppressed when stdout is not a TTY.
+    show_qr: bool,
+};
+
+fn printPairGrant(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    resolved: Resolved,
+    origin: []const u8,
+    options: PairGrantOptions,
+) !void {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.appendSlice(allocator, &.{ resolved.artifacts.daemon, "pair", "create" });
+    try argv.appendSlice(allocator, options.daemon_args);
+    try argv.appendSlice(allocator, &.{ "--data-dir", resolved.runtime.data_dir, "--json" });
+
+    var attempt: usize = 0;
+    while (attempt < options.attempts) : (attempt += 1) {
+        const result = try runCaptured(allocator, io, argv.items);
         defer {
             std.crypto.secureZero(u8, result.stdout);
             allocator.free(result.stdout);
@@ -305,15 +335,28 @@ fn printPairGrant(io: std.Io, allocator: std.mem.Allocator, resolved: Resolved, 
             if (!parsed.value.ok or parsed.value.result.access_protocol_version != 1) return error.PairGrantFailed;
             try validateLowerHex(parsed.value.result.runtime_id, 32);
             try validateLowerHex(parsed.value.result.instance_id, 32);
-            const pair_url = try pairUrlAlloc(allocator, origin, parsed.value.result.grant_id, parsed.value.result.pairing_token);
+            const grant = parsed.value.result;
+            const pair_url = try pairUrlAlloc(allocator, origin, grant.grant_id, grant.pairing_token);
             defer {
                 std.crypto.secureZero(u8, pair_url);
                 allocator.free(pair_url);
+            }
+            const app_link = try appLinkUrlAlloc(allocator, origin, grant.grant_id, grant.pairing_token);
+            defer {
+                std.crypto.secureZero(u8, app_link);
+                allocator.free(app_link);
             }
             try writeSensitiveStdout(io,
                 \\Open or paste this once in Verde:
                 \\{s}
                 \\
+                \\On a phone, open this link or scan the QR code when shown:
+                \\{s}
+                \\
+                \\
+            , .{ pair_url, app_link });
+            if (options.show_qr and (std.Io.File.stdout().isTty(io) catch false)) try writePairQr(io, app_link);
+            try writeSensitiveStdout(io,
                 \\Manual fallback
                 \\Host: {s}
                 \\Grant ID: {s}
@@ -321,15 +364,52 @@ fn printPairGrant(io: std.Io, allocator: std.mem.Allocator, resolved: Resolved, 
                 \\Runtime: {s} / {s}
                 \\Expires: {d}
                 \\
-            , .{ pair_url, origin, parsed.value.result.grant_id, parsed.value.result.pairing_token, parsed.value.result.runtime_id, parsed.value.result.instance_id, parsed.value.result.expires_at_ms });
+            , .{ origin, grant.grant_id, grant.pairing_token, grant.runtime_id, grant.instance_id, grant.expires_at_ms });
             return;
+        }
+        if (attempt + 1 == options.attempts) {
+            try writeStderr(io, "{s}", .{result.stderr});
+            break;
         }
         try std.Io.sleep(io, .fromMilliseconds(100), .awake);
     }
     return error.PairGrantFailed;
 }
 
+/// Renders the App Link as a terminal QR code. The symbol and staging buffer
+/// encode the one-time code, so both are wiped.
+fn writePairQr(io: std.Io, app_link: []const u8) !void {
+    var code = qr.encodeBytes(app_link, .{ .ecc = .medium, .max_version = PAIR_QR_MAX_VERSION }) catch |err| switch (err) {
+        error.DataTooLong => return writeStderr(io, "warning: pair link too long for a terminal QR code\n", .{}),
+        error.InvalidVersionRange => unreachable,
+    };
+    defer code.wipe();
+    var buffer: [16 * 1024]u8 = undefined;
+    defer std.crypto.secureZero(u8, &buffer);
+    var writer = std.Io.File.stdout().writerStreaming(io, &buffer);
+    try qr.writeHalfBlocks(&code, &writer.interface, .{});
+    try writer.interface.writeByte('\n');
+    try writer.interface.flush();
+}
+
+/// `verde://pair` import URL for the desktop and paste flows.
 fn pairUrlAlloc(allocator: std.mem.Allocator, origin: []const u8, grant_id: []const u8, code: []const u8) ![]u8 {
+    return pairLinkAlloc(allocator, "verde://pair", origin, grant_id, code);
+}
+
+/// `https://verdeai.dev/pair` App Link that opens the phone app when installed.
+fn appLinkUrlAlloc(allocator: std.mem.Allocator, origin: []const u8, grant_id: []const u8, code: []const u8) ![]u8 {
+    return pairLinkAlloc(allocator, APP_LINK_PAIR_BASE, origin, grant_id, code);
+}
+
+/// Host and grant ID go in the query; the one-time code only in the fragment.
+fn pairLinkAlloc(
+    allocator: std.mem.Allocator,
+    base: []const u8,
+    origin: []const u8,
+    grant_id: []const u8,
+    code: []const u8,
+) ![]u8 {
     try validateHttpsOrigin(origin);
     try validateLowerHex(grant_id, 32);
     try validateLowerHex(code, 64);
@@ -345,8 +425,8 @@ fn pairUrlAlloc(allocator: std.mem.Allocator, origin: []const u8, grant_id: []co
     }
     const host = try encoded.toOwnedSlice();
     defer allocator.free(host);
-    return std.fmt.allocPrint(allocator, "verde://pair?host={s}&grant_id={s}#code={s}", .{
-        host, grant_id, code,
+    return std.fmt.allocPrint(allocator, "{s}?host={s}&grant_id={s}#code={s}", .{
+        base, host, grant_id, code,
     });
 }
 
@@ -440,6 +520,20 @@ fn runStatus(io: std.Io, allocator: std.mem.Allocator, resolved: Resolved, json:
 }
 
 fn runDelegate(io: std.Io, allocator: std.mem.Allocator, resolved: Resolved, options: config.Options) !void {
+    if (options.command == .pair_create and !options.json) {
+        // With a saved Tailscale origin the grant becomes a complete pair
+        // link (and QR code); otherwise show the daemon's plain grant.
+        if (tailscale.savedOrigin(io, allocator, resolved.runtime.state_dir)) |origin| {
+            defer allocator.free(origin);
+            return printPairGrant(io, allocator, resolved, origin, .{
+                .daemon_args = options.delegate_args,
+                .attempts = 1,
+                .show_qr = !options.no_qr,
+            });
+        } else |_| {
+            try writeStderr(io, "note: no saved HTTPS origin; run `verde-server serve --tailscale` to print a pair link and QR code\n", .{});
+        }
+    }
     var args: std.ArrayList([]const u8) = .empty;
     defer args.deinit(allocator);
     try args.append(allocator, resolved.artifacts.daemon);
@@ -1083,10 +1177,11 @@ fn printHelp(io: std.Io) !void {
         \\
         \\Usage:
         \\  verde-server init [--data-dir PATH] [--token-file PATH]
-        \\  verde-server serve [--tailscale] [--tailscale-https-port PORT] [--data-dir PATH] [--token-file PATH] [--gateway-port PORT]
+        \\  verde-server serve [--tailscale] [--tailscale-https-port PORT] [--no-qr] [--data-dir PATH] [--token-file PATH] [--gateway-port PORT]
         \\  verde-server status [--json]
         \\  verde-server tailscale doctor|status [--tailscale-https-port PORT] [--json]
-        \\  verde-server pair create|list|revoke [daemon pair options]
+        \\  verde-server pair create [--no-qr] [daemon pair options]
+        \\  verde-server pair list|revoke [daemon pair options]
         \\  verde-server device list|revoke [daemon device options]
         \\  verde-server connect [--headless] [--install-service]
         \\  verde-server connect status|unlink|logout [--json]
@@ -1103,6 +1198,8 @@ fn printHelp(io: std.Io) !void {
         \\only the requested unoccupied Tailscale HTTPS listener. It never replaces
         \\another route. Use `tailscale doctor --json` before setup or select a
         \\dedicated listener with `--tailscale-https-port`; Pair uses that exact URL.
+        \\With that saved URL, `pair create` prints the Verde import link, a phone
+        \\App Link, and (on a terminal, unless --no-qr or --json) a QR code.
         \\`connect` discovers its saved or environment-configured control plane,
         \\uses OIDC device authorization, and removes the provider bearer after
         \\linking. --control-plane, --descriptor-file, and --credential-file are
@@ -1201,6 +1298,28 @@ test "Pair URL keeps the one-time code in the fragment" {
     );
     const query_end = std.mem.indexOfScalar(u8, url, '#').?;
     try std.testing.expect(std.mem.indexOf(u8, url[0..query_end], "ab" ** 8) == null);
+}
+
+test "App Link escapes the HTTPS origin and keeps the code only in the fragment" {
+    const url = try appLinkUrlAlloc(
+        std.testing.allocator,
+        "https://runtime.tail.ts.net:8443",
+        "0123456789abcdef0123456789abcdef",
+        "ab" ** 32,
+    );
+    defer std.testing.allocator.free(url);
+    try std.testing.expectEqualStrings(
+        "https://verdeai.dev/pair?host=https%3A%2F%2Fruntime.tail.ts.net%3A8443&grant_id=0123456789abcdef0123456789abcdef#code=" ++ "ab" ** 32,
+        url,
+    );
+    const fragment = std.mem.indexOfScalar(u8, url, '#').?;
+    try std.testing.expect(std.mem.indexOf(u8, url[0..fragment], "ab" ** 8) == null);
+    try std.testing.expectError(error.InvalidPairGrantResponse, appLinkUrlAlloc(
+        std.testing.allocator,
+        "https://runtime.tail.ts.net",
+        "invalid",
+        "ab" ** 32,
+    ));
 }
 
 test "Pair URL preserves a dedicated Tailscale HTTPS port" {
