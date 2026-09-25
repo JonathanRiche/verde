@@ -39,8 +39,23 @@ extension SecureStorage {
     }
 }
 
+protocol KeychainAPI {
+    func copy(_ query: CFDictionary, _ result: UnsafeMutablePointer<CFTypeRef?>) -> OSStatus
+    func update(_ query: CFDictionary, _ attributes: CFDictionary) -> OSStatus
+    func add(_ query: CFDictionary) -> OSStatus
+    func remove(_ query: CFDictionary) -> OSStatus
+}
+
+struct SystemKeychainAPI: KeychainAPI {
+    func copy(_ query: CFDictionary, _ result: UnsafeMutablePointer<CFTypeRef?>) -> OSStatus { SecItemCopyMatching(query, result) }
+    func update(_ query: CFDictionary, _ attributes: CFDictionary) -> OSStatus { SecItemUpdate(query, attributes) }
+    func add(_ query: CFDictionary) -> OSStatus { SecItemAdd(query, nil) }
+    func remove(_ query: CFDictionary) -> OSStatus { SecItemDelete(query) }
+}
+
 struct KeychainStorage: SecureStorage {
     var service = "dev.verdeai.app.core"
+    var api: KeychainAPI = SystemKeychainAPI()
 
     func query(_ key: String) -> [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,
@@ -52,7 +67,7 @@ struct KeychainStorage: SecureStorage {
         request[kSecReturnData as String] = true
         request[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: CFTypeRef?
-        let status = SecItemCopyMatching(request as CFDictionary, &result)
+        let status = api.copy(request as CFDictionary, &result)
         if status == errSecItemNotFound { return nil }
         try check(status)
         guard let value = result as? Data else { throw StorageError(code: .io) }
@@ -61,13 +76,13 @@ struct KeychainStorage: SecureStorage {
     func put(_ key: String, value: Data) throws {
         let attributes: [String: Any] = [kSecValueData as String: value,
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly]
-        let status = SecItemUpdate(query(key) as CFDictionary, attributes as CFDictionary)
+        let status = api.update(query(key) as CFDictionary, attributes as CFDictionary)
         if status == errSecItemNotFound {
-            try check(SecItemAdd(query(key).merging(attributes) { _, new in new } as CFDictionary, nil))
+            try check(api.add(query(key).merging(attributes) { _, new in new } as CFDictionary))
         } else { try check(status) }
     }
     func delete(_ key: String) throws {
-        let status = SecItemDelete(query(key) as CFDictionary)
+        let status = api.remove(query(key) as CFDictionary)
         if status != errSecItemNotFound { try check(status) }
     }
     private func check(_ status: OSStatus) throws {

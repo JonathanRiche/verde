@@ -19,24 +19,29 @@ private final class ChallengeSender: NSObject, URLAuthenticationChallengeSender 
 }
 
 final class TLSPolicyTests: XCTestCase {
-    private let pin = "JCjx4fTLVN9aCYHufO_Rq-8__R-lSX-DngXJM4KDSvU"
+    private let pin = "M6eHc4YC-5fLSGdFbY2Aj3och0IY0RWvaIhL1Shp_w4"
 
     private func trust(anchored: Bool) throws -> SecTrust {
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "bridge", withExtension: "cer"))
         let data = try Data(contentsOf: url)
         let cert = try XCTUnwrap(SecCertificateCreateWithData(nil, data as CFData))
+        let rootURL = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "root", withExtension: "cer"))
+        let root = try XCTUnwrap(SecCertificateCreateWithData(nil, try Data(contentsOf: rootURL) as CFData))
         var trust: SecTrust?
-        XCTAssertEqual(SecTrustCreateWithCertificates(cert, SecPolicyCreateSSL(true, "bridge.invalid" as CFString), &trust), errSecSuccess)
+        XCTAssertEqual(SecTrustCreateWithCertificates([cert, root] as CFArray, SecPolicyCreateSSL(true, "bridge.invalid" as CFString), &trust), errSecSuccess)
         let result = try XCTUnwrap(trust)
         // A fixed date inside the fixture validity avoids clock-dependent tests.
         SecTrustSetVerifyDate(result, Date(timeIntervalSince1970: 1_800_000_000) as CFDate)
         SecTrustSetNetworkFetchAllowed(result, false)
-        if anchored { SecTrustSetAnchorCertificates(result, [cert] as CFArray) }
+        if anchored { SecTrustSetAnchorCertificates(result, [root] as CFArray) }
         return result
     }
 
     func testDERSPKIAndSystemTrust() throws {
-        let inspected = TLSPolicy.inspect(try trust(anchored: true), host: "bridge.invalid")
+        let fixture = try trust(anchored: true)
+        var error: CFError?
+        XCTAssertTrue(SecTrustEvaluateWithError(fixture, &error), String(describing: error))
+        let inspected = TLSPolicy.inspect(fixture, host: "bridge.invalid")
         XCTAssertTrue(inspected.0); XCTAssertEqual(inspected.1, pin)
         XCTAssertFalse(TLSPolicy.inspect(try trust(anchored: false), host: "bridge.invalid").0)
         XCTAssertFalse(TLSPolicy.inspect(try trust(anchored: true), host: "other.invalid").0)

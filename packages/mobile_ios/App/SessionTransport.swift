@@ -16,7 +16,13 @@ final class SessionTransport: CoreTransport {
             case .ws_open(let e): self.start(id: e.effect_id, effect: effect, emit: emit)
             case .http_cancel(let e): self.operations[e.request_id]?.cancel()
             case .ws_close(let e): self.operations[e.socket_id]?.close(code: e.code)
-            case .ws_send(let e): self.operations[e.socket_id]?.send(e.text)
+            case .ws_send(let e):
+                if let socket = self.operations[e.socket_id] { socket.send(e.text) }
+                else {
+                    emit(.ws_closed(EventWsClosed(now_ms: 0, wall_time_ms: 0, socket_id: e.socket_id,
+                        generation: e.generation, code: nil, clean: false,
+                        error: TransportFailure(kind: .network, code: .unavailable))))
+                }
             default: preconditionFailure("transport_effect_required")
             }
         }
@@ -131,6 +137,11 @@ final class SessionOperation: NSObject, URLSessionDataDelegate, URLSessionWebSoc
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.timeoutIntervalForRequest = 30
         config.timeoutIntervalForResource = 30
+        if case .http_request(let e) = effect {
+            // Parked RPCs carry longer core deadlines than interactive requests.
+            config.timeoutIntervalForRequest = Double(e.timeout_ms) / 1000
+            config.timeoutIntervalForResource = Double(e.timeout_ms) / 1000
+        }
         let delegates = OperationQueue()
         delegates.maxConcurrentOperationCount = 1
         delegates.underlyingQueue = queue

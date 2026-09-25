@@ -30,7 +30,7 @@ final class CoreHostTests: XCTestCase {
     @MainActor
     func testEffectRoundTripsAndStore() async throws {
         let key = "vc/1/I02-\(UUID().uuidString)/credential"
-        let storage = KeychainStorage(service: "dev.verdeai.app.I02.tests")
+        let storage = KeychainStorage(service: "dev.verdeai.app.I02.tests", api: FakeKeychainAPI())
         defer { try? storage.delete(key) }
         let tls = Tls(origin: "https://bridge.invalid", spki_sha256: "pin")
         let effects: [Effect] = [
@@ -116,7 +116,7 @@ final class CoreHostTests: XCTestCase {
     }
 
     func testKeychainProtectionAndAtomicReplacement() throws {
-        let storage = KeychainStorage(service: "dev.verdeai.app.I02.tests")
+        let storage = KeychainStorage(service: "dev.verdeai.app.I02.tests", api: FakeKeychainAPI())
         let key = UUID().uuidString
         defer { try? storage.delete(key) }
         try storage.put(key, value: Data([1]))
@@ -125,7 +125,7 @@ final class CoreHostTests: XCTestCase {
         var query = storage.query(key)
         query[kSecReturnAttributes as String] = true
         var result: CFTypeRef?
-        XCTAssertEqual(SecItemCopyMatching(query as CFDictionary, &result), errSecSuccess)
+        XCTAssertEqual(storage.api.copy(query as CFDictionary, &result), errSecSuccess)
         let attributes = try XCTUnwrap(result as? [String: Any])
         XCTAssertEqual(attributes[kSecAttrAccessible as String] as? String, kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly as String)
         XCTAssertEqual(attributes[kSecAttrSynchronizable as String] as? Bool, false)
@@ -150,5 +150,37 @@ final class CoreHostTests: XCTestCase {
         if case .secure_store_done(let e) = storage.execute(.secure_store_delete(EffectSecureStoreDelete(effect_id: "delete", generation: "8", key: "key"))) {
             XCTAssertEqual(e.error?.code, .io); XCTAssertEqual(e.generation, "8")
         } else { XCTFail() }
+    }
+}
+
+// Unsigned simulator apps have no Keychain entitlement. Exercise the exact
+// SecItem queries/atomic update path through this isolated Security API fixture.
+private final class FakeKeychainAPI: KeychainAPI {
+    private var records: [String: [String: Any]] = [:]
+    private func attributes(_ query: CFDictionary) -> [String: Any] { query as! [String: Any] }
+    private func key(_ query: [String: Any]) -> String { query[kSecAttrAccount as String] as! String }
+    func copy(_ query: CFDictionary, _ result: UnsafeMutablePointer<CFTypeRef?>) -> OSStatus {
+        let query = attributes(query)
+        XCTAssertEqual(query[kSecAttrSynchronizable as String] as? Bool, false)
+        guard let record = records[key(query)] else { return errSecItemNotFound }
+        if query[kSecReturnAttributes as String] as? Bool == true { result.pointee = record as CFDictionary }
+        else { result.pointee = record[kSecValueData as String] as! CFData }
+        return errSecSuccess
+    }
+    func update(_ query: CFDictionary, _ values: CFDictionary) -> OSStatus {
+        let id = key(attributes(query))
+        guard let record = records[id] else { return errSecItemNotFound }
+        records[id] = record.merging(attributes(values)) { _, new in new }
+        return errSecSuccess
+    }
+    func add(_ query: CFDictionary) -> OSStatus {
+        let record = attributes(query)
+        XCTAssertEqual(record[kSecAttrSynchronizable as String] as? Bool, false)
+        XCTAssertEqual(record[kSecAttrAccessible as String] as? String, kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly as String)
+        records[key(record)] = record
+        return errSecSuccess
+    }
+    func remove(_ query: CFDictionary) -> OSStatus {
+        records.removeValue(forKey: key(attributes(query))) == nil ? errSecItemNotFound : errSecSuccess
     }
 }
