@@ -6822,7 +6822,9 @@ pub const Daemon = struct {
                 const task = jsonString(params.object.get("task_id") orelse .null) orelse return error.InvalidParams;
                 const reason = jsonString(params.object.get("reason") orelse .null) orelse return error.InvalidParams;
                 if (reason.len == 0 or reason.len > 16384) return error.InvalidParams;
-                {
+                var attention_arena: std.heap.ArenaAllocator = .init(self.allocator);
+                defer attention_arena.deinit();
+                const payload = blk: {
                     lockDaemon(self);
                     defer self.mutex.unlock();
                     const turn = self.findChatTurn(task) orelse return error.ResourceNotFound;
@@ -6832,11 +6834,15 @@ pub const Daemon = struct {
                     const owned = try self.allocator.dupe(u8, reason);
                     if (turn.blocked_reason) |old| self.allocator.free(old);
                     turn.blocked_reason = owned;
-                }
+                    break :blk try attentionPayloadLocked(self, turn, attention_arena.allocator(), "input_needed");
+                };
+                var threaded: std.Io.Threaded = .init(self.allocator, .{});
+                defer threaded.deinit();
                 {
                     lockStoreService(svc);
                     defer svc.mutex.unlock();
                     try chat_links.updateTask(svc.store.conn, task, "blocked", reason, null, null, nowMs());
+                    push.enqueueAttention(svc.store.conn, attention_arena.allocator(), threaded.io(), payload, nowMs()) catch |err| log.warn("attention enqueue failed: {s}", .{@errorName(err)});
                 }
                 self.signalTurnEventWaiters();
                 dispatchParentDeliveries(self);
@@ -10511,6 +10517,19 @@ fn commitChatTurnDurable(daemon: *Daemon, turn: *ChatTurn) !void {
         } else null,
         .client_id = "daemon",
     });
+    if (chatTurnStatusIsTerminal(status)) {
+        var threaded: std.Io.Threaded = .init(daemon.allocator, .{});
+        defer threaded.deinit();
+        push.enqueueAttention(service.store.conn, arena, threaded.io(), .{
+            .runtime_id = daemon.runtime_id,
+            .workspace_id = workspace_id,
+            .thread_id = local_thread_id,
+            .turn_id = turn_id,
+            .kind = @tagName(status),
+            .title = generated_title orelse thread_title,
+            .snippet = error_message orelse reply_text,
+        }, nowMs()) catch |err| log.warn("attention enqueue failed: {s}", .{@errorName(err)});
+    }
     const generated_title_applied = if (generated_title) |title|
         try service.store.threadTitleEquals(workspace_id, local_thread_id, title)
     else
@@ -15944,8 +15963,43 @@ fn publishChatTurnDurable(daemon: *Daemon, turn: *ChatTurn, worker_done: bool) v
     }
 }
 
+/// Caller holds the turn mutex; returned strings belong to the supplied arena.
+fn attentionPayloadLocked(daemon: *Daemon, turn: *ChatTurn, arena: std.mem.Allocator, kind: []const u8) !push.Payload {
+    return .{
+        .runtime_id = daemon.runtime_id,
+        .workspace_id = try arena.dupe(u8, turn.workspace_id),
+        .thread_id = try arena.dupe(u8, turn.local_thread_id),
+        .turn_id = try arena.dupe(u8, turn.turn_id),
+        .kind = kind,
+        .title = try arena.dupe(u8, turn.request.thread_title),
+        .snippet = try arena.dupe(u8, if (turn.pending_approval) |approval| approval.body else turn.blocked_reason orelse ""),
+    };
+}
+
+fn publishTurnAttention(daemon: *Daemon, turn: *ChatTurn, kind: []const u8) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(daemon.allocator);
+    defer arena_state.deinit();
+    const payload = blk: {
+        lockTurn(turn);
+        defer turn.mutex.unlock();
+        break :blk try attentionPayloadLocked(daemon, turn, arena_state.allocator(), kind);
+    };
+    lockDaemon(daemon);
+    const service = daemon.store_service;
+    if (service) |svc| _ = svc.in_flight.fetchAdd(1, .monotonic);
+    daemon.mutex.unlock();
+    const svc = service orelse return;
+    defer _ = svc.in_flight.fetchSub(1, .monotonic);
+    var threaded: std.Io.Threaded = .init(daemon.allocator, .{});
+    defer threaded.deinit();
+    lockStoreService(svc);
+    defer svc.mutex.unlock();
+    try push.enqueueAttention(svc.store.conn, arena_state.allocator(), threaded.io(), payload, nowMs());
+}
+
 /// Persist a task's non-terminal input state before waking subscribers.
 fn publishTaskApproval(daemon: *Daemon, turn: *ChatTurn, waiting: bool) !void {
+    if (waiting) publishTurnAttention(daemon, turn, "approval_pending") catch |err| log.warn("attention enqueue failed: {s}", .{@errorName(err)});
     if (turn.task_owner == null) return;
     var arena_state: std.heap.ArenaAllocator = .init(daemon.allocator);
     defer arena_state.deinit();
@@ -22265,4 +22319,77 @@ test "device self service returns metadata and revokes credentials push registra
     const response = try daemon.handleRequest(revoke);
     defer a.free(response);
     try std.testing.expect(std.mem.indexOf(u8, response, "\"revoked\":false") != null);
+}
+
+test "attention fake turns enqueue sealed terminal approval and blocked events once per inactive device" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testStoreDbPath(&tmp);
+    defer a.free(path);
+    var daemon = Daemon.init(a);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, path);
+    defer detachTestStoreService(&daemon);
+    const conn = daemon.store_service.?.store.conn;
+    var device = try push.createTestDevice(conn);
+    defer device.clear();
+    var active = try push.createTestDevice(conn);
+    defer active.clear();
+    const key = headless.push_seal.generateKeyPair(std.testing.io);
+    var key_buffer: [43]u8 = undefined;
+    const public_key = std.base64.url_safe_no_pad.Encoder.encode(&key_buffer, &key.public_key);
+    for ([_][]const u8{ &device.device_id, &active.device_id }) |id| {
+        try push.register(conn, a, std.testing.io, id, "android", "fixture-token", public_key);
+    }
+    // Future time keeps this device active throughout the finite synchronous fixture.
+    try conn.exec("update runtime_devices set last_used_at_ms=? where device_id=?", .{ nowMs() + 60000, &active.device_id });
+    const turn = try appendTestChatTurn(&daemon, a, "attention-turn", "attention-workspace", "/tmp/attention", "Attention fixture", "fixture", .running, nowMs());
+    turn.pending_approval = .{ .call_id = try a.dupe(u8, "approval"), .title = try a.dupe(u8, "Approve"), .body = try a.dupe(u8, "é" ** 250) };
+    turn.status = .waiting_approval;
+    // Ordinary turns also notify; no task_owner is needed for an approval.
+    try publishTaskApproval(&daemon, turn, true);
+    try publishTaskApproval(&daemon, turn, true);
+    turn.pending_approval.?.deinit(a);
+    turn.pending_approval = null;
+    turn.status = .running;
+    turn.task_owner = try a.dupe(u8, "fixture");
+    const response = try daemon.handleRequest("{\"id\":1,\"method\":\"chat.tasks.blocked\",\"params\":{\"task_id\":\"attention-turn\",\"reason\":\"Input needed\"}}");
+    defer a.free(response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, response, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("error") == null);
+    for ([_]ChatTurnStatus{ .completed, .failed, .aborted }) |status| {
+        const terminal = try appendTestChatTurn(&daemon, a, @tagName(status), "attention-workspace", "/tmp/attention", "Attention fixture", "fixture", .running, nowMs());
+        terminal.status = status;
+        terminal.result_reply_text = try a.dupe(u8, "é" ** 250);
+        terminal.finished_at_ms = nowMs();
+        try commitChatTurnDurable(&daemon, terminal);
+        try commitChatTurnDurable(&daemon, terminal);
+    }
+    var rows = try conn.rows("select device_id,kind,dedupe_key,sealed_payload from device_push_outbox order by id", .{});
+    defer rows.deinit();
+    const kinds = [_][]const u8{ "approval_pending", "input_needed", "completed", "failed", "aborted" };
+    var count: usize = 0;
+    while (rows.next()) |row| : (count += 1) {
+        try std.testing.expect(count < kinds.len);
+        try std.testing.expectEqualStrings(&device.device_id, row.text(0));
+        try std.testing.expectEqualStrings(kinds[count], row.text(1));
+        const plaintext = try headless.push_seal.open(a, key.secret_key, row.text(3));
+        defer a.free(plaintext);
+        try std.testing.expect(plaintext.len <= push.MAX_PLAINTEXT_BYTES);
+        var payload = try std.json.parseFromSlice(push.Payload, a, plaintext, .{});
+        defer payload.deinit();
+        try std.testing.expect(std.mem.eql(u8, daemon.runtime_id, payload.value.runtime_id));
+        try std.testing.expect(std.mem.eql(u8, "attention-workspace", payload.value.workspace_id));
+        try std.testing.expect(std.mem.eql(u8, "local-thread", payload.value.thread_id));
+        try std.testing.expect(std.mem.eql(u8, kinds[count], payload.value.kind));
+        try std.testing.expect(std.mem.eql(u8, "Attention fixture", payload.value.title));
+        try std.testing.expect(std.mem.eql(u8, if (count == 1) "Input needed" else "é" ** 200, payload.value.snippet));
+        const dedupe = try std.fmt.allocPrint(a, "{s}:{s}", .{ payload.value.turn_id, payload.value.kind });
+        defer a.free(dedupe);
+        try std.testing.expectEqualStrings(dedupe, row.text(2));
+    }
+    if (rows.err) |err| return err;
+    try std.testing.expectEqual(kinds.len, count);
 }

@@ -111,6 +111,7 @@ pub const Payload = struct {
 /// Trim whole UTF-8 codepoints, accounting for JSON escaping before sealing.
 pub fn encodePayload(allocator: std.mem.Allocator, payload: Payload) ![]u8 {
     var bounded = payload;
+    bounded.snippet = snippetPrefix(bounded.snippet);
     while (true) {
         const bytes = try std.json.Stringify.valueAlloc(allocator, bounded, .{});
         if (bytes.len <= MAX_PLAINTEXT_BYTES) return bytes;
@@ -118,6 +119,41 @@ pub fn encodePayload(allocator: std.mem.Allocator, payload: Payload) ![]u8 {
         allocator.free(bytes);
         if (bounded.snippet.len > 0) bounded.snippet = trimBytes(bounded.snippet, excess) else if (bounded.title.len > 0) bounded.title = trimBytes(bounded.title, excess) else return error.PushPayloadTooLarge;
     }
+}
+
+/// Gateway WebSocket activity is not exposed to the daemon. Credential use is
+/// the per-device proxy (HTTP authentication and WS ticket issuance both touch it).
+pub const ACTIVE_DEVICE_WINDOW_MS: i64 = 30 * std.time.ms_per_s;
+
+/// Fan out under the store mutex. Never persist unsealed notification content.
+pub fn enqueueAttention(conn: zqlite.Conn, allocator: std.mem.Allocator, io: std.Io, payload: Payload, now_ms: i64) !void {
+    const dedupe = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ payload.turn_id, payload.kind });
+    defer allocator.free(dedupe);
+    var rows = try conn.rows(
+        \\select r.device_id from device_push_registrations r join (
+        \\ select device_id,last_used_at_ms,revoked_at_ms from runtime_devices
+        \\ union all select device_id,last_used_at_ms,revoked_at_ms from runtime_connect_devices
+        \\) d using(device_id) where d.revoked_at_ms is null
+        \\ and (d.last_used_at_ms is null or d.last_used_at_ms < ?1)
+    , .{now_ms - ACTIVE_DEVICE_WINDOW_MS});
+    defer rows.deinit();
+    while (rows.next()) |row| {
+        _ = try enqueue(conn, allocator, io, row.text(0), dedupe, payload, now_ms);
+    }
+    if (rows.err) |err| return err;
+}
+
+/// A character here is one Unicode codepoint; never split a UTF-8 sequence.
+fn snippetPrefix(value: []const u8) []const u8 {
+    var end: usize = 0;
+    var count: usize = 0;
+    while (end < value.len and count < 200) : (count += 1) {
+        const len = std.unicode.utf8ByteSequenceLength(value[end]) catch break;
+        if (end + len > value.len) break;
+        _ = std.unicode.utf8Decode(value[end..][0..len]) catch break;
+        end += len;
+    }
+    return value[0..end];
 }
 
 fn trimBytes(value: []const u8, amount: usize) []const u8 {
@@ -409,4 +445,46 @@ test "push outbox delivers through loopback retries dedupes survives reopen and 
     try std.testing.expect(try access_store.revokeDevice(store.conn, &connected.device_id, 10000));
     try std.testing.expect(try next(store.conn, arena.allocator(), 10000) == null);
     try std.testing.expectError(error.PushNotRegistered, enqueue(store.conn, a, std.testing.io, &connected.device_id, "connect-turn-2", payload, 10000));
+}
+
+test "attention fans out to paired and Connect devices beyond the activity cutoff" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buffer);
+    const path = try std.fs.path.join(a, &.{ path_buffer[0..path_len], "attention.sqlite" });
+    defer a.free(path);
+    var store = try @import("store.zig").Store.init(a, path);
+    defer store.deinit();
+    var paired = try createTestDevice(store.conn);
+    defer paired.clear();
+    var connected = try access_store.issueConnectDeviceLocked(std.testing.io, store.conn, .{
+        .connect_grant_id = "attention-grant",
+        .connect_device_id = "attention-phone",
+        .device_key_thumbprint = "fixture-thumbprint",
+        .issuer = "https://fixture.test",
+        .device_label = "Connect phone",
+        .scope_mask = headless.access_protocol.scopeBit(.device_write),
+        .now_ms = 2000,
+    });
+    defer connected.clear();
+    const key = seal.generateKeyPair(std.testing.io);
+    var key_buffer: [43]u8 = undefined;
+    const public_key = std.base64.url_safe_no_pad.Encoder.encode(&key_buffer, &key.public_key);
+    for ([_][]const u8{ &paired.device_id, &connected.device_id }) |id| {
+        try register(store.conn, a, std.testing.io, id, "ios", "fixture-token", public_key);
+    }
+    _ = try access_store.authenticateDevice(store.conn, &paired.device_id, &paired.device_credential, &.{"device:write"}, 3000);
+    _ = try access_store.authenticateDevice(store.conn, &connected.device_id, &connected.device_credential, &.{"device:write"}, 3000);
+    const payload: Payload = .{ .runtime_id = "runtime", .turn_id = "turn", .kind = "completed", .title = "Fixture" };
+    try enqueueAttention(store.conn, a, std.testing.io, payload, 3000 + ACTIVE_DEVICE_WINDOW_MS);
+    var before = (try store.conn.row("select count(*) from device_push_outbox", .{})).?;
+    try std.testing.expectEqual(@as(i64, 0), before.int(0));
+    before.deinit();
+    try enqueueAttention(store.conn, a, std.testing.io, payload, 3001 + ACTIVE_DEVICE_WINDOW_MS);
+    try enqueueAttention(store.conn, a, std.testing.io, payload, 3002 + ACTIVE_DEVICE_WINDOW_MS);
+    var after = (try store.conn.row("select count(*) from device_push_outbox", .{})).?;
+    try std.testing.expectEqual(@as(i64, 2), after.int(0));
+    after.deinit();
 }
