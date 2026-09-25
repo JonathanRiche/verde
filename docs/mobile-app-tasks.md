@@ -147,11 +147,11 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | K-07 | Auth in core | core | linux | K-06, A-05 | done (ffb390ec) |
 | K-08 | RPC client + target pinning | core | linux | K-06 | done (fd4cfc22) |
 | K-09 | Sync + projection | core | linux | K-08 | done (dfbd6d6f) |
-| K-10 | Chat engine | core | linux | K-09 | in_progress (astra cli-thread-1790362328697-dc5576a2ceb2b5f4) |
+| K-10 | Chat engine | core | linux | K-09 | done (97656ebd) |
 | K-11 | Markdown AST / highlight spans / diff parse exports | core | linux | K-06 | done (93000154, c37e038c) |
 | K-12 | Terminal handle + PTY pump | core | linux | K-06 | done (a7650965) |
-| K-13 | Allowlist coverage test | core | linux | K-10, A-02 | todo |
-| K-14 | Contract suite vs real gateway + daemon | core | linux | K-10 | todo |
+| K-13 | Allowlist coverage test | core | linux | K-10, A-02 | in_progress (astra cli-thread-1790364654955-96c6bdb46115cff2) |
+| K-14 | Contract suite vs real gateway + daemon | core | linux | K-10 | in_progress (astra cli-thread-1790364656597-1ab894b191d83847) |
 | K-15 | Kotlin/Swift model codegen from Zig types | core | linux | K-06 | done (fdb77f3d) |
 | K-16 | Delta-mode sync | core | linux | K-09, A-11 | in_progress (astra cli-thread-1790364215750-82de15a4a4901ec8) |
 | K-17 | Attention state machine + push decrypt | core | linux | K-09, A-12 | todo |
@@ -858,6 +858,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
     persistence effects.
 - **Done when:** harness tests replay recorded tail event streams and match
   the committed transcripts. Follow-up and approval state tests pass.
+- **Done (97656ebd).** The core's chat engine covers transcript paging and tails, staged sends, drafts and follow-ups persisted per thread, approvals, shell confirmation, and composer queries. A follow-up is dispatched only after storage acknowledges it, so a restart never silently resends uncertain work. A send refreshes the transcript, so A-09's access-cap notice shows while the turn is running. The shared reducer gained a `streaming` option that keeps live tool states. Fixtures were recorded against a temporary daemon with a stub provider. `mobile-core-test`, `mobile-core-android` and `mobile-models-check` pass. Documented in `docs/chat.md`: receipts restore lazily per thread, persistence has a 512 KiB budget, and usage cards follow the web client.
 
 #### K-11 · Markdown AST / highlight spans / diff parse exports
 - **depends:** K-06
