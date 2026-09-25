@@ -1640,6 +1640,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .runtime_wizard_select => state.selectRuntimeWizardConnectRuntime(hit.index),
             .runtime_wizard_input => focusModalInput(state, runtimeWizardFocusForIndex(hit.index), hit.rect, x, clicks),
             .settings_runtime_action => state.applyRuntimeRowAction(hit.index),
+            .settings_phone_action => settings_modal.applyPhoneAction(state, hit.index),
             .settings_cancel, .settings_close, .settings_save => state.closeSettingsPanel(),
             .settings_category => settings_modal.applySettingsCategory(state, hit.index),
             .settings_open_option => settings_modal.applyOpenActionOption(state, hit.index),

@@ -246,6 +246,7 @@ pub fn hookSuccessNotice(kind: HookKind, installed: bool) []const u8 {
 }
 
 pub const State = struct {
+    phone: @import("phone_pairing.zig").State = .{},
     mcp_onboarding_visible: bool = false,
     provider_onboarding_visible: bool = false,
     provider_onboarding_dismissed: bool = false,
@@ -508,6 +509,7 @@ pub fn openSettingsToCategory(self: anytype, category: Category) void {
         log.warn("failed to inspect provider integrations through daemon: {s}", .{@errorName(err)});
     }
     self.settings_controller.active_category = category;
+    if (category == .connections) self.settings_controller.phone.start(self.storage.pref_path, .list, null);
     self.settings_controller.scroll_y = 0.0;
     self.settings_controller.hover_control = null;
     self.settings_controller.hover_category = null;
@@ -539,6 +541,7 @@ pub fn selectSettingsCategory(self: anytype, category: Category) void {
         // Install/sign-in state changes outside Verde; refresh it when the page opens.
         if (category == .providers) self.startProviderReadinessCheck();
     }
+    if (category == .connections) self.settings_controller.phone.start(self.storage.pref_path, .list, null) else self.settings_controller.phone.close();
     closeSettingsDropdowns(self);
     self.markDirty();
 }
@@ -615,6 +618,7 @@ pub fn cancelSettingsModal(self: anytype) void {
 }
 
 pub fn closeSettingsPanel(self: anytype) void {
+    self.settings_controller.phone.close();
     if (self.settings_controller.modal_closing) return;
     if (self.runtime_connections.wizard_open) self.cancelRuntimeConnectionWizard();
     beginSettingsModalClose(self);
@@ -1344,6 +1348,7 @@ pub fn startAutomaticUpdateCheck(self: anytype) void {
 }
 
 pub fn pollUpdateCheck(self: anytype) void {
+    if (self.settings_controller.phone.poll(@import("platform_runtime").unixTimestampMs())) self.markDirty();
     const previous = self.settings_controller.update.status;
     self.settings_controller.update.poll();
     if (self.settings_controller.update.status != previous) self.markDirty();

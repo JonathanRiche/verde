@@ -295,6 +295,7 @@ const SettingsLayout = struct {
     workspace_scroll_horizontal: palette.Rect,
     workspace_scroll_vertical: palette.Rect,
     workspace_scroll_direction_hint_y: f32,
+    phone_card: palette.Rect,
     runtimes_card: palette.Rect,
     runtimes: RuntimeCardPlan,
     integrations_card: palette.Rect,
@@ -486,6 +487,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .h = @max(modal.h - header.h, 0.0),
     };
     const content_w = content.w;
+    const phone_h = phoneCard(state, .{ .x = 0, .y = 0, .w = content_w, .h = 0 }, .{ .x = 0, .y = 0, .w = 0, .h = 0 }, false, null);
     const runtimes_w = content_w;
     const runtimes_h = planRuntimeCard(state, 0.0, 0.0, runtimes_w, m).height;
     const integrations_h = m.card_pad * 2.0 + m.title_h + m.row_gap * 2.0 + m.label_h * 4.0 + m.row_h * 8.0 + m.inner_gap * 10.0;
@@ -508,7 +510,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .providers => providers_h,
         .terminal => terminal_h,
         .browser => browser_h,
-        .connections => runtimes_h,
+        .connections => phone_h + m.card_gap + runtimes_h,
         .agents => integrations_h,
         .app => app_page_h,
     };
@@ -761,6 +763,8 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
 
     y = if (category == .connections) page_y else offscreen_y;
 
+    const phone_card: palette.Rect = .{ .x = content_x, .y = y, .w = content_w, .h = phone_h };
+    y += phone_h + m.card_gap;
     const runtimes_card: palette.Rect = .{ .x = content_x, .y = y, .w = content_w, .h = runtimes_h };
     const runtimes = planRuntimeCard(state, content_x, y, content_w, m);
     y = if (category == .agents) page_y else offscreen_y;
@@ -918,6 +922,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .workspace_scroll_horizontal = workspace_scroll_horizontal,
         .workspace_scroll_vertical = workspace_scroll_vertical,
         .workspace_scroll_direction_hint_y = workspace_scroll_direction_hint_y,
+        .phone_card = phone_card,
         .runtimes_card = runtimes_card,
         .runtimes = runtimes,
         .integrations_card = integrations_card,
@@ -1362,6 +1367,7 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
         queueControlHit(state, layout.notifications_toggle, layout.body_clip, .notifications_toggle, queue_hit);
     }
     if (category == .connections) {
+        _ = phoneCard(state, layout.phone_card, layout.body_clip, false, queue_hit);
         registerRuntimeCardHits(state, layout, queue_hit);
     }
     registerThemeOptionHits(state, layout, queue_hit);
@@ -1559,6 +1565,8 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     } else if (category == .providers) {
         drawProvidersCard(state, layout, m);
     } else if (category == .connections) {
+        drawCard(state, layout.phone_card, layout.body_clip);
+        _ = phoneCard(state, layout.phone_card, layout.body_clip, true, null);
         drawRuntimeCard(state, layout);
     } else if (category == .agents) {
         drawCard(state, layout.integrations_card, layout.body_clip);
@@ -1813,6 +1821,10 @@ pub fn updateHover(state: *runtime.AppState, x: f32, y: f32) void {
         }
         if ((hit.action == .settings_new_chat_provider_option or hit.action == .settings_new_chat_model_option or hit.action == .settings_new_chat_reasoning_option) and rectContains(hit.rect, x, y)) {
             new_chat_hover = hit.index;
+            break;
+        }
+        if (hit.action == .settings_phone_action and rectContains(hit.rect, x, y)) {
+            runtime_hover = hit.index | PHONE_HOVER_BIT;
             break;
         }
         if (hit.action == .settings_runtime_action and rectContains(hit.rect, x, y)) {
@@ -4349,4 +4361,180 @@ test "clicking outside the docked settings column dismisses it" {
     );
     try std.testing.expect(topModalActionAt(&state, layout.modal.x + 8.0, layout.header.y + layout.header.h * 0.5).? != .modal_dismiss);
     try std.testing.expectEqual(runtime.PaletteModalAction.settings_close, topModalActionAt(&state, layout.close.x + 1.0, layout.close.y + 1.0).?);
+}
+
+const PHONE_HOVER_BIT: usize = 1 << (@bitSizeOf(usize) - 1);
+
+/// Break at measured UTF-8 boundaries, including inside the unbroken App Link.
+/// The same slices determine card height and rendered lines.
+const PhoneLines = struct {
+    value: []const u8,
+    width: f32,
+    offset: usize = 0,
+
+    fn next(self: *PhoneLines) ?[]const u8 {
+        while (self.offset < self.value.len and self.value[self.offset] == ' ') self.offset += 1;
+        if (self.offset == self.value.len) return null;
+        const start = self.offset;
+        var end = start;
+        var space: ?usize = null;
+        while (end < self.value.len) {
+            const count = std.unicode.utf8ByteSequenceLength(self.value[end]) catch 1;
+            const next_end = @min(end + count, self.value.len);
+            if (end > start and text_measure.textWidth(.ui, theme.scaledUi(NOTES_FONT_SIZE), self.value[start..next_end]) > self.width) break;
+            if (self.value[end] == ' ') space = end;
+            end = next_end;
+        }
+        if (end < self.value.len) if (space) |boundary| {
+            if (boundary > start) end = boundary;
+        };
+        self.offset = end;
+        return self.value[start..end];
+    }
+};
+
+// Phone pairing shares one measured layout for rendering, clipping and hit testing.
+const PhoneCard = struct {
+    state: *runtime.AppState,
+    x: f32,
+    y: f32,
+    w: f32,
+    clip: palette.Rect,
+    draw: bool,
+    queue_hit: ?*const fn (*runtime.AppState, palette.Rect, runtime.PaletteModalAction, usize) void,
+
+    fn text(self: *PhoneCard, value: []const u8) void {
+        var lines: PhoneLines = .{ .value = value, .width = self.w };
+        while (lines.next()) |line| {
+            const rect: palette.Rect = .{ .x = self.x, .y = self.y, .w = self.w, .h = notesLineHeight() };
+            if (self.draw) queueText(self.state, rect, line, paletteColor(textLabel()), theme.scaledUi(NOTES_FONT_SIZE), self.clip);
+            self.y += rect.h;
+        }
+        self.y += theme.scaledUi(8.0);
+    }
+
+    fn button(self: *PhoneCard, label: []const u8, action: usize, enabled: bool) void {
+        const rect: palette.Rect = .{ .x = self.x, .y = self.y, .w = self.w, .h = theme.scaledUi(30.0) };
+        if (self.draw) drawActionButton(self.state, rect, label, if (enabled) .secondary else .disabled, self.state.settings_controller.hover_runtime_action == (action | PHONE_HOVER_BIT), self.clip);
+        if (enabled) if (self.queue_hit) |queue| {
+            if (intersectRect(rect, self.clip)) |visible| queue(self.state, visible, .settings_phone_action, action);
+        };
+        self.y += rect.h + theme.scaledUi(8.0);
+    }
+};
+
+fn phoneCard(state: *runtime.AppState, rect: palette.Rect, clip: palette.Rect, draw: bool, queue_hit: ?*const fn (*runtime.AppState, palette.Rect, runtime.PaletteModalAction, usize) void) f32 {
+    // Pairing is local-owner management; remote connection credentials never enter this card.
+    const phone = &state.settings_controller.phone;
+    const pad = theme.scaledUi(14.0);
+    var card: PhoneCard = .{ .state = state, .x = rect.x + pad, .y = rect.y + pad, .w = @max(rect.w - pad * 2, 1), .clip = clip, .draw = draw, .queue_hit = queue_hit };
+    const idle = phone.pending == null;
+    card.text("Paired devices · This machine");
+    card.text(phone.notice);
+    card.button(if (phone.opened) "Close pairing" else "Pair a phone", 0, true);
+    if (phone.opened) {
+        card.text("Run verde-server serve --tailscale for this runtime, then copy its HTTPS host URL (https://your-host.ts.net).");
+        card.button("Paste host URL", 1, idle);
+        if (phone.host_len > 0) card.text(phone.host[0..phone.host_len]);
+        // A-09's preset picker belongs here, before explicit grant creation.
+        card.button("Create pairing link", 2, idle and phone.host_len > 0 and phone.grant == null);
+        if (phone.grant) |grant| {
+            if (grant.qr) |*qr| {
+                // Integer modules and a four-module white quiet zone keep the local symbol scannable.
+                const modules: f32 = @floatFromInt(@as(u16, qr.size) + 8);
+                const unit = @max(1.0, @floor(@min(card.w, theme.scaledUi(320.0)) / modules));
+                const side = modules * unit;
+                const box: palette.Rect = .{ .x = @floor(card.x), .y = @floor(card.y), .w = side, .h = side };
+                if (draw) {
+                    queueRoundedRectClipped(state, box, .{ .r = 1, .g = 1, .b = 1, .a = current_fade_alpha }, 0, clip);
+                    for (0..qr.size) |y| for (0..qr.size) |x| {
+                        if (qr.isDark(@intCast(x), @intCast(y))) queueRoundedRectClipped(state, .{
+                            .x = box.x + @as(f32, @floatFromInt(x + 4)) * unit,
+                            .y = box.y + @as(f32, @floatFromInt(y + 4)) * unit,
+                            .w = unit,
+                            .h = unit,
+                        }, .{ .r = 0, .g = 0, .b = 0, .a = current_fade_alpha }, 0, clip);
+                    };
+                }
+                card.y += side + theme.scaledUi(12.0);
+            }
+            var buf: [80]u8 = undefined;
+            const seconds = @divFloor(@max(grant.expires_at_ms - @import("platform_runtime").unixTimestampMs(), 0) + 999, 1000);
+            card.text(std.fmt.bufPrint(&buf, "Expires in {d}:{d:0>2}", .{ @divFloor(seconds, 60), @mod(seconds, 60) }) catch "");
+            if (grant.link) |link| card.text(link);
+            card.button("Copy link", 3, seconds > 0);
+        }
+    }
+    card.button("Refresh devices", 4, idle);
+    if (phone.devices_result != null and phone.devices().len == 0) card.text("No paired devices yet.");
+    for (phone.devices(), 0..) |device, index| {
+        card.text(device.label);
+        var buf: [1024]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        writer.print("Source: {s} · Last seen: ", .{@tagName(device.source)}) catch {};
+        if (device.last_used_at_ms) |last| {
+            const age = @divFloor(@max(@import("platform_runtime").unixTimestampMs() - last, 0), 1000);
+            writer.print("{d}s ago", .{age}) catch {};
+        } else writer.writeAll("Never") catch {};
+        card.text(writer.buffered());
+        writer = .fixed(&buf);
+        writer.writeAll("Scopes: ") catch {};
+        for (device.scopes, 0..) |scope, i| {
+            if (i > 0) writer.writeAll(", ") catch {};
+            writer.writeAll(scope) catch {};
+        }
+        card.text(writer.buffered());
+        const confirming = phone.confirm_revoke == index;
+        card.button(if (device.revoked_at_ms != null) "Revoked" else if (confirming) "Confirm revoke" else "Revoke", 16 + index * 2, idle and device.revoked_at_ms == null);
+        if (confirming) card.button("Keep device", 17 + index * 2, idle);
+        card.y += theme.scaledUi(10.0);
+    }
+    return card.y - rect.y + pad;
+}
+
+pub fn applyPhoneAction(state: *runtime.AppState, action: usize) void {
+    const phone = &state.settings_controller.phone;
+    switch (action) {
+        0 => if (phone.opened) {
+            phone.close();
+        } else {
+            phone.opened = true;
+        },
+        1 => {
+            const raw = sdl.getClipboardText() catch {
+                phone.notice = "Could not read the clipboard.";
+                state.markDirty();
+                return;
+            };
+            const text = std.mem.span(raw);
+            defer {
+                std.crypto.secureZero(u8, @constCast(text));
+                sdl.free(@ptrCast(raw));
+            }
+            phone.setHost(text) catch {
+                phone.notice = "Paste an HTTPS host URL without credentials, a path, query, or fragment.";
+                state.markDirty();
+                return;
+            };
+            phone.notice = "Host set. Create a link when ready to scan.";
+        },
+        2 => phone.start(state.storage.pref_path, .create, null),
+        3 => if (phone.grant) |grant| {
+            if (grant.expires_at_ms > @import("platform_runtime").unixTimestampMs()) if (grant.link) |link| {
+                phone.notice = if (state.setClipboardText(link)) "Pairing link copied." else "Could not copy the link.";
+            };
+        },
+        4 => phone.start(state.storage.pref_path, .list, null),
+        else => {
+            if (action < 16 or phone.pending != null) return;
+            const index = (action - 16) / 2;
+            if (index >= phone.devices().len) return;
+            if (action % 2 == 1) {
+                phone.confirm_revoke = null;
+            } else if (phone.confirm_revoke == index) {
+                phone.start(state.storage.pref_path, .revoke, phone.devices()[index].device_id);
+            } else phone.confirm_revoke = index;
+        },
+    }
+    state.markDirty();
 }

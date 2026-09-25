@@ -2201,6 +2201,7 @@ pub const PaletteModalAction = enum {
     settings_category,
     settings_open_option,
     settings_runtime_action,
+    settings_phone_action,
     settings_theme_option,
     settings_title_provider_option,
     settings_title_model_option,
@@ -13475,6 +13476,7 @@ pub const AppState = struct {
                 .settings_category,
                 .settings_open_option,
                 .settings_runtime_action,
+                .settings_phone_action,
                 .settings_theme_option,
                 .settings_title_provider_option,
                 .settings_title_model_option,
@@ -14683,6 +14685,7 @@ pub const AppState = struct {
         runtime_log.diagnostic("AppState.deinit background task poller finished", .{});
         self.finishTranscriptHydrationWorker();
         runtime_log.diagnostic("AppState.deinit transcript hydration finished", .{});
+        self.settings_controller.phone.deinit();
         self.settings_controller.update.deinit();
         self.settings_controller.package_update_probe.deinit();
         runtime_log.diagnostic("AppState.deinit updater finished", .{});
