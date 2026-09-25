@@ -1319,9 +1319,27 @@ fn handleWorkspaceFile(
         try respondJson(request, .bad_request, "{\"ok\":false,\"error\":\"invalid_path\"}");
         return;
     }
-    // Symlinks are followed here, so every later check sees the real file.
-    const served_path = try confineServedFilePath(allocator, io, daemon, decoded, request) orelse return;
-    defer allocator.free(served_path);
+    var lister: WorkspaceRootLister = .{ .allocator = allocator, .daemon = daemon };
+    const paths = daemon.workspace_roots.snapshot(allocator, io, auth_mod.nowMillis(io), &lister) catch |err| switch (err) {
+        error.Canceled, error.OutOfMemory => return err,
+        else => return respondDaemonUnavailable(request),
+    };
+    const roots: served_files.Roots = .{ .paths = paths };
+    defer roots.deinit(allocator);
+    const file = roots.open(allocator, io, decoded) catch |err| switch (err) {
+        error.PathOutsideWorkspace => return respondJson(request, .forbidden, "{\"ok\":false,\"error\":\"path_outside_workspace\"}"),
+        error.FileNotFound => return respondJson(request, .not_found, "{\"ok\":false,\"error\":\"file_not_found\"}"),
+        error.OutOfMemory, error.Canceled => return err,
+    };
+    defer file.close(io);
+    // The descriptor supplies both the bytes and the name used for type checks.
+    // Never reopen this path: the workspace may change after authorization.
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = file.realPath(io, &path_buffer) catch
+        return respondJson(request, .forbidden, "{\"ok\":false,\"error\":\"path_outside_workspace\"}");
+    const served_path = path_buffer[0..path_len];
+    const stat = try file.stat(io);
+    if (stat.size > MAX_SERVED_FILE_BYTES) return respondJson(request, .payload_too_large, "{\"ok\":false,\"error\":\"file_too_large\"}");
     if (executableDocumentPath(served_path)) {
         try respondJson(request, .unsupported_media_type, "{\"ok\":false,\"error\":\"unsupported_document_type\"}");
         return;
@@ -1333,7 +1351,7 @@ fn handleWorkspaceFile(
             try respondJson(request, .bad_request, "{\"ok\":false,\"error\":\"unsupported_document_type\"}");
             return;
         }
-        const pdf_path = office_preview.previewPdf(allocator, io, config.pref_path, env_map, served_path) catch |err| switch (err) {
+        const pdf = office_preview.previewPdf(allocator, io, config.pref_path, env_map, served_path, file, MAX_SERVED_FILE_BYTES) catch |err| switch (err) {
             error.SourceNotFound => {
                 try respondJson(request, .not_found, "{\"ok\":false,\"error\":\"file_not_found\"}");
                 return;
@@ -1348,8 +1366,8 @@ fn handleWorkspaceFile(
             },
             error.OutOfMemory => return error.OutOfMemory,
         };
-        defer allocator.free(pdf_path);
-        const bytes = std.Io.Dir.cwd().readFileAlloc(io, pdf_path, allocator, .limited(MAX_SERVED_FILE_BYTES)) catch {
+        defer pdf.close(io);
+        const bytes = served_files.readAlloc(allocator, io, pdf, MAX_SERVED_FILE_BYTES) catch {
             try respondJson(request, .internal_server_error, "{\"ok\":false,\"error\":\"preview_conversion_failed\"}");
             return;
         };
@@ -1358,7 +1376,7 @@ fn handleWorkspaceFile(
         return;
     }
 
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, served_path, allocator, .limited(MAX_SERVED_FILE_BYTES)) catch |err| switch (err) {
+    const bytes = served_files.readAlloc(allocator, io, file, MAX_SERVED_FILE_BYTES) catch |err| switch (err) {
         error.StreamTooLong => {
             try respondJson(request, .payload_too_large, "{\"ok\":false,\"error\":\"file_too_large\"}");
             return;

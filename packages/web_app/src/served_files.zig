@@ -2,12 +2,13 @@
 //!
 //! A chat citation can name any absolute path, and a paired phone only needs
 //! `repository:read` to follow it. Before the gateway reads a document it
-//! resolves the request with realpath and requires the result to sit inside a
+//! opens the request beneath a held directory descriptor for a
 //! workspace path or repository binding root reported by the daemon. Roots are
 //! cached briefly so a burst of citation clicks does not page `workspace.list`
 //! on every request.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const headless = @import("headless");
 
 const log = std.log.scoped(.web_served_files);
@@ -38,19 +39,36 @@ pub const Roots = struct {
         allocator.free(self.paths);
     }
 
-    /// Resolve `requested` with realpath and keep it only when it sits inside a
-    /// root. Comparison is component-aware so `/a/bc` never matches root `/a/b`.
+    /// Open beneath a registered root. The kernel resolves relative symlinks
+    /// while enforcing confinement; the returned descriptor is the authority.
+    pub fn open(self: Roots, allocator: std.mem.Allocator, io: std.Io, requested: []const u8) ConfineError!std.Io.File {
+        if (requested.len == 0 or !std.fs.path.isAbsolute(requested) or
+            std.mem.indexOfScalar(u8, requested, 0) != null) return error.PathOutsideWorkspace;
+        for (self.paths) |root| {
+            if (!pathWithinRoot(requested, root)) continue;
+            // Cached roots are canonical absolute paths. Refuse symlink swaps
+            // in any component of the root itself as well as its final name.
+            const base = try openRoot(io, root);
+            defer base.close(io);
+            const relative = std.mem.trimStart(u8, requested[root.len..], "/");
+            const file = try openBeneath(allocator, io, base, if (relative.len == 0) "." else relative);
+            errdefer file.close(io);
+            const stat = file.stat(io) catch return error.PathOutsideWorkspace;
+            if (stat.kind != .file) return error.PathOutsideWorkspace;
+            return file;
+        }
+        return error.PathOutsideWorkspace;
+    }
+
+    /// Compatibility helper for path-only callers. Reading must use `open`
+    /// and retain its descriptor, never reopen this diagnostic path.
     pub fn confine(self: Roots, allocator: std.mem.Allocator, io: std.Io, requested: []const u8) ConfineError![]u8 {
-        if (requested.len == 0 or !std.fs.path.isAbsolute(requested)) return error.PathOutsideWorkspace;
-        const resolved = realPathAlloc(allocator, io, requested) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.Canceled => return error.Canceled,
-            // Only paths already under a root may learn whether they exist.
-            else => return if (self.containsLexically(requested)) error.FileNotFound else error.PathOutsideWorkspace,
-        };
-        errdefer allocator.free(resolved);
-        if (!self.containsLexically(resolved)) return error.PathOutsideWorkspace;
-        return resolved;
+        const file = try self.open(allocator, io, requested);
+        defer file.close(io);
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const len = file.realPath(io, &buffer) catch return error.PathOutsideWorkspace;
+        if (!self.containsLexically(buffer[0..len])) return error.PathOutsideWorkspace;
+        return allocator.dupe(u8, buffer[0..len]);
     }
 
     fn containsLexically(self: Roots, path: []const u8) bool {
@@ -60,6 +78,82 @@ pub const Roots = struct {
         return false;
     }
 };
+
+fn openRoot(io: std.Io, path: []const u8) ConfineError!std.Io.Dir {
+    var dir = std.Io.Dir.openDirAbsolute(io, "/", .{}) catch return error.PathOutsideWorkspace;
+    errdefer dir.close(io);
+    var parts = std.mem.tokenizeScalar(u8, path, '/');
+    while (parts.next()) |part| {
+        if (std.mem.eql(u8, part, "..")) return error.PathOutsideWorkspace;
+        const next = dir.openDir(io, part, .{ .follow_symlinks = false }) catch return error.PathOutsideWorkspace;
+        dir.close(io);
+        dir = next;
+    }
+    return dir;
+}
+
+fn openBeneath(allocator: std.mem.Allocator, io: std.Io, root: std.Io.Dir, relative: []const u8) ConfineError!std.Io.File {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const path_z = try allocator.dupeZ(u8, relative);
+        defer allocator.free(path_z);
+        // Linux open_how ABI. std has no openat2 wrapper yet.
+        const RESOLVE_BENEATH: u64 = 0x08;
+        const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+        const How = extern struct { flags: u64, mode: u64 = 0, resolve: u64 = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS };
+        const flags: linux.O = .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NONBLOCK = true, .NOCTTY = true };
+        const how: How = .{ .flags = @as(u32, @bitCast(flags)) };
+        while (true) {
+            const rc = linux.syscall4(.openat2, @bitCast(@as(isize, root.handle)), @intFromPtr(path_z.ptr), @intFromPtr(&how), @sizeOf(How));
+            switch (linux.errno(rc)) {
+                .SUCCESS => return .{ .handle = @intCast(rc), .flags = .{ .nonblocking = true } },
+                .INTR => continue,
+                .NOENT => return error.FileNotFound,
+                .NOSYS => break, // Old kernels use the conservative walk below.
+                else => return error.PathOutsideWorkspace,
+            }
+        }
+    }
+    return openNoFollow(io, root, relative);
+}
+
+// Portable POSIX fallback: each component is opened relative to the previous
+// descriptor. Symlinks and parent traversal are conservatively rejected.
+fn openNoFollow(io: std.Io, root: std.Io.Dir, relative: []const u8) ConfineError!std.Io.File {
+    var dir = root;
+    defer if (dir.handle != root.handle) dir.close(io);
+    var parts = std.mem.tokenizeScalar(u8, relative, '/');
+    while (parts.next()) |part| {
+        if (std.mem.eql(u8, part, "..")) return error.PathOutsideWorkspace;
+        const last = parts.peek() == null;
+        const flags: std.posix.O = .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NONBLOCK = true, .NOCTTY = true, .NOFOLLOW = true, .DIRECTORY = !last };
+        const fd = std.posix.openat(dir.handle, part, flags, 0) catch |err| return switch (err) {
+            error.FileNotFound => error.FileNotFound,
+            else => error.PathOutsideWorkspace,
+        };
+        if (last) return .{ .handle = fd, .flags = .{ .nonblocking = true } };
+        if (dir.handle != root.handle) dir.close(io);
+        dir = .{ .handle = fd };
+    }
+    return error.PathOutsideWorkspace;
+}
+
+/// Read only the already-authorized descriptor, with a hard allocation limit.
+pub fn readAlloc(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File, limit: usize) ![]u8 {
+    var reader = file.reader(io, &.{});
+    return reader.interface.allocRemaining(allocator, .limited(limit));
+}
+
+/// Cache files must be regular and must not follow symlinks, even on Linux.
+pub fn openCacheFile(io: std.Io, path: []const u8) ConfineError!std.Io.File {
+    const parent = try openRoot(io, std.fs.path.dirname(path) orelse return error.PathOutsideWorkspace);
+    defer parent.close(io);
+    const file = try openNoFollow(io, parent, std.fs.path.basename(path));
+    errdefer file.close(io);
+    const stat = file.stat(io) catch return error.PathOutsideWorkspace;
+    if (stat.kind != .file) return error.PathOutsideWorkspace;
+    return file;
+}
 
 /// Owned realpath of an absolute path. The std `*Alloc` variants return a
 /// sentinel-terminated slice, which the caller could not free as `[]u8`.
@@ -450,4 +544,131 @@ test "root cache refuses to serve when the daemon list fails" {
     defer cache.deinit(allocator);
     try std.testing.expectError(error.WorkspaceListFailed, cache.snapshot(allocator, io, 0, &lister));
     try std.testing.expectEqual(@as(usize, 1), lister.calls);
+}
+
+test "descriptor confinement survives file and ancestor swaps and rejects dangling escapes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tree = try TestTree.init(allocator, io);
+    defer tree.deinit(allocator);
+    try tree.tmp.dir.createDirPath(io, "root/docs");
+    try tree.tmp.dir.createDirPath(io, "outside");
+    try tree.writeFile(io, "root/docs/report.pdf");
+    try tree.tmp.dir.writeFile(io, .{ .sub_path = "outside/report.pdf", .data = "secret" });
+    const roots = try testRoots(allocator, tree, &.{"root"});
+    defer roots.deinit(allocator);
+    const requested = try tree.path(allocator, "root/docs/report.pdf");
+    defer allocator.free(requested);
+    const checked = try roots.confine(allocator, io, requested);
+    defer allocator.free(checked);
+    const held = try roots.open(allocator, io, requested);
+    defer held.close(io);
+    try tree.tmp.dir.deleteFile(io, "root/docs/report.pdf");
+    try tree.tmp.dir.symLink(io, "../../outside/report.pdf", "root/docs/report.pdf", .{});
+    try std.testing.expectError(error.PathOutsideWorkspace, roots.open(allocator, io, checked));
+    const bytes = try readAlloc(allocator, io, held, 100);
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings("%PDF-1.4\n", bytes);
+
+    // A relative escaping link must be forbidden even if its target is absent.
+    try tree.tmp.dir.deleteFile(io, "outside/report.pdf");
+    try std.testing.expectError(error.PathOutsideWorkspace, roots.open(allocator, io, requested));
+    try tree.tmp.dir.deleteTree(io, "root/docs");
+    try tree.tmp.dir.symLink(io, "../outside", "root/docs", .{});
+    try std.testing.expectError(error.PathOutsideWorkspace, roots.open(allocator, io, requested));
+    try tree.tmp.dir.deleteTree(io, "outside");
+    try std.testing.expectError(error.PathOutsideWorkspace, roots.open(allocator, io, requested));
+
+    // Root components themselves may not be replaced by symlinks either.
+    try tree.tmp.dir.deleteTree(io, "root");
+    try tree.tmp.dir.symLink(io, "outside", "root", .{});
+    try std.testing.expectError(error.PathOutsideWorkspace, roots.open(allocator, io, requested));
+}
+
+test "in-root relative symlinks remain readable on Linux" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tree = try TestTree.init(allocator, io);
+    defer tree.deinit(allocator);
+    try tree.tmp.dir.createDirPath(io, "root/docs");
+    try tree.writeFile(io, "root/docs/report.pdf");
+    try tree.tmp.dir.symLink(io, "docs/report.pdf", "root/link.pdf", .{});
+    const roots = try testRoots(allocator, tree, &.{"root"});
+    defer roots.deinit(allocator);
+    const requested = try tree.path(allocator, "root/link.pdf");
+    defer allocator.free(requested);
+    const file = try roots.open(allocator, io, requested);
+    defer file.close(io);
+    const bytes = try readAlloc(allocator, io, file, 100);
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings("%PDF-1.4\n", bytes);
+}
+
+test "directories and FIFO documents are rejected within a finite deadline" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tree = try TestTree.init(allocator, io);
+    defer tree.deinit(allocator);
+    try tree.tmp.dir.createDirPath(io, "root/directory.pdf");
+    const roots = try testRoots(allocator, tree, &.{"root"});
+    defer roots.deinit(allocator);
+    const directory = try tree.path(allocator, "root/directory.pdf");
+    defer allocator.free(directory);
+    try std.testing.expectError(error.PathOutsideWorkspace, roots.open(allocator, io, directory));
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.mknodat(tree.tmp.dir.handle, "root/fifo.pdf", 0o010600, 0)));
+    const fifo = try tree.path(allocator, "root/fifo.pdf");
+    defer allocator.free(fifo);
+
+    // If NONBLOCK regresses, supply a writer after the deadline to unblock
+    // open, fail the test, and join deterministically rather than hanging CI.
+    const Watchdog = struct {
+        io: std.Io,
+        dir: std.Io.Dir,
+        done: std.atomic.Value(u32) = .init(0),
+        expired: std.atomic.Value(bool) = .init(false),
+        writer: ?std.Io.File = null,
+        fn run(self: *@This()) void {
+            const deadline = std.Io.Clock.awake.now(self.io).toMilliseconds() + 1000;
+            while (self.done.load(.acquire) == 0) {
+                if (std.Io.Clock.awake.now(self.io).toMilliseconds() >= deadline) {
+                    self.expired.store(true, .release);
+                    const fd = std.posix.openat(self.dir.handle, "root/fifo.pdf", .{ .ACCMODE = .RDWR, .NONBLOCK = true, .CLOEXEC = true }, 0) catch return;
+                    self.writer = .{ .handle = fd, .flags = .{ .nonblocking = true } };
+                    return;
+                }
+                self.io.futexWaitTimeout(u32, &self.done.raw, 0, .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } }) catch return;
+            }
+        }
+    };
+    var watchdog: Watchdog = .{ .io = io, .dir = tree.tmp.dir };
+    const thread = try std.Thread.spawn(.{}, Watchdog.run, .{&watchdog});
+    defer {
+        watchdog.done.store(1, .release);
+        io.futexWake(u32, &watchdog.done.raw, 1);
+        thread.join();
+        if (watchdog.writer) |writer| writer.close(io);
+    }
+    try std.testing.expectError(error.PathOutsideWorkspace, roots.open(allocator, io, fifo));
+    try std.testing.expect(!watchdog.expired.load(.acquire));
+}
+
+test "preview cache opens reject symlinks and directories" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tree = try TestTree.init(allocator, io);
+    defer tree.deinit(allocator);
+    try tree.writeFile(io, "regular.pdf");
+    try tree.tmp.dir.symLink(io, "regular.pdf", "link.pdf", .{});
+    try tree.tmp.dir.createDir(io, "directory.pdf", .default_dir);
+    const regular = try tree.path(allocator, "regular.pdf");
+    defer allocator.free(regular);
+    const file = try openCacheFile(io, regular);
+    file.close(io);
+    for ([_][]const u8{ "link.pdf", "directory.pdf" }) |name| {
+        const path = try tree.path(allocator, name);
+        defer allocator.free(path);
+        try std.testing.expectError(error.PathOutsideWorkspace, openCacheFile(io, path));
+    }
 }
