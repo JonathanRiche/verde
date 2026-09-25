@@ -28,16 +28,18 @@ xcodebuild -create-xcframework \
 # Check Swift can import the module and link its C symbol for both platforms.
 for slice in device simulator; do
     if [[ $slice == device ]]; then
+        sdk_name=iphoneos
         sdk=$device_sdk
         target=arm64-apple-ios17.0
         identifier=ios-arm64
     else
+        sdk_name=iphonesimulator
         sdk=$simulator_sdk
         target=arm64-apple-ios17.0-simulator
         identifier=ios-arm64-simulator
     fi
     library="$staging/VerdeClient.xcframework/$identifier"
-    xcrun swiftc -sdk "$sdk" -target "$target" \
+    xcrun --sdk "$sdk_name" swiftc -sdk "$sdk" -target "$target" \
         -I "$library/Headers" -L "$library" -lverde_client \
         tests/ios_smoke.swift -o "$staging/smoke-$slice"
     echo "Swift import/link smoke passed: $target"
