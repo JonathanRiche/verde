@@ -172,7 +172,8 @@ fn addIosSteps(b: *std.Build, optimize: std.builtin.OptimizeMode, options: *std.
             .linkage = .static,
             .root_module = module,
             .use_llvm = true,
-            .use_lld = true,
+            // Zig 0.16 rejects LLD for Mach-O, including static archives.
+            .use_lld = false,
         });
         const install = b.addInstallArtifact(lib, .{
             .dest_dir = .{ .override = .{ .custom = "lib/ios/" ++ slice[0] } },

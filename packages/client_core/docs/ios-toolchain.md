@@ -9,9 +9,10 @@ mise run mobile-core-ios
 This runs `zig build ios-xcframework --release=safe` in `packages/client_core`.
 The packaging script discovers the iPhoneOS and iPhoneSimulator SDKs with
 `xcrun --sdk <sdk> --show-sdk-path`, then invokes the `ios-libs` build step
-with those paths. Both static libraries use LLVM/LLD, arm64 and a minimum
+with those paths. Both static libraries use the LLVM backend, arm64 and a minimum
 deployment target of iOS 17. No signing identity or simulator runtime is
-required to build the framework.
+required to build the framework. Zig 0.16 rejects LLD for Mach-O, so these
+static archives use Zig's default Mach-O path; Swift links with Xcode.
 
 Output: `packages/client_core/zig-out/lib/VerdeClient.xcframework` with
 `ios-arm64` and `ios-arm64-simulator` slices. Each contains
