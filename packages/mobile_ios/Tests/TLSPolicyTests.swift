@@ -19,7 +19,7 @@ private final class ChallengeSender: NSObject, URLAuthenticationChallengeSender 
 }
 
 final class TLSPolicyTests: XCTestCase {
-    private let pin = "M6eHc4YC-5fLSGdFbY2Aj3och0IY0RWvaIhL1Shp_w4"
+    private let pin = "33a787738602fb97cb4867456d8d808f7a1c874218d115af68884bd52869ff0e"
 
     private func trust(anchored: Bool) throws -> SecTrust {
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "bridge", withExtension: "cer"))
@@ -51,7 +51,7 @@ final class TLSPolicyTests: XCTestCase {
     func testDelegateRejectsMismatchAndUntrustedPinBeforeAuthorizingRequest() async throws {
         let session = URLSession(configuration: .ephemeral)
         defer { session.invalidateAndCancel() }
-        for (anchored, expected, allowed) in [(true, pin, true), (true, "changed", false), (false, pin, false)] {
+        for (anchored, expected, allowed) in [(true, pin, true), (true, String(repeating: "0", count: 64), false), (true, "M6eHc4YC-5fLSGdFbY2Aj3och0IY0RWvaIhL1Shp_w4", false), (false, pin, false)] {
             let effect = Effect.http_request(EffectHttpRequest(effect_id: "http", generation: "1", method: "POST",
                 url: "https://bridge.invalid/api/rpc", headers: [], body_base64: "c2VjcmV0", timeout_ms: 1000,
                 max_response_bytes: 256, tls: Tls(origin: "https://bridge.invalid", spki_sha256: expected)))

@@ -66,9 +66,8 @@ enum TLSPolicy {
               let chain = SecTrustCopyCertificateChain(trust) as? [SecCertificate],
               let leaf = chain.first,
               let spki = spki(certificate: SecCertificateCopyData(leaf) as Data) else { return (false, nil) }
-        let hash = Data(SHA256.hash(data: spki)).base64EncodedString()
-            .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "=", with: "")
+        // K-07 persists and compares canonical lowercase SHA-256 hex.
+        let hash = SHA256.hash(data: spki).map { String(format: "%02x", $0) }.joined()
         return (true, hash)
     }
 

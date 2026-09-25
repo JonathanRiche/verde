@@ -32,7 +32,7 @@ final class CoreHostTests: XCTestCase {
         let key = "vc/1/I02-\(UUID().uuidString)/credential"
         let storage = KeychainStorage(service: "dev.verdeai.app.I02.tests", api: FakeKeychainAPI())
         defer { try? storage.delete(key) }
-        let tls = Tls(origin: "https://bridge.invalid", spki_sha256: "pin")
+        let tls = Tls(origin: "https://bridge.invalid", spki_sha256: String(repeating: "a", count: 64))
         let effects: [Effect] = [
             .secure_store_put(EffectSecureStorePut(effect_id: "put", generation: "1", key: key, value_base64: Data([0, 255, 42]).base64EncodedString())),
             .secure_store_get(EffectSecureStoreGet(effect_id: "get", generation: "1", key: key)),
@@ -80,7 +80,7 @@ final class CoreHostTests: XCTestCase {
         transport.onEffect = { effect, emit in
             switch effect {
             case .http_request(let e):
-                let failure = e.effect_id == "pin" ? TLSPolicy.failure(systemTrusted: true, observed: "other", expected: "pin") : nil
+                let failure = e.effect_id == "pin" ? TLSPolicy.failure(systemTrusted: true, observed: String(repeating: "b", count: 64), expected: String(repeating: "a", count: 64)) : nil
                 emit(.http_response(EventHttpResponse(now_ms: 0, wall_time_ms: 0,
                     effect_id: e.effect_id, generation: e.generation, status: failure == nil ? 403 : nil,
                     headers: [], body_base64: failure == nil ? "e30=" : nil, error: failure)))

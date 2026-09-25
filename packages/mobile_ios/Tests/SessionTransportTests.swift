@@ -6,7 +6,7 @@ final class SessionTransportTests: XCTestCase {
         .http_request(EffectHttpRequest(effect_id: "request", generation: "9007199254740993",
             method: "POST", url: "https://bridge.invalid/api/rpc", headers: [], body_base64: nil,
             timeout_ms: 35000, max_response_bytes: limit,
-            tls: Tls(origin: "https://bridge.invalid", spki_sha256: "fixture")))
+            tls: Tls(origin: "https://bridge.invalid", spki_sha256: String(repeating: "a", count: 64))))
     }
 
     func testHTTPBytesStatusRedirectAndSingleCompletion() throws {
@@ -59,7 +59,7 @@ final class SessionTransportTests: XCTestCase {
         let url = try XCTUnwrap(URL(string: "wss://bridge.invalid/ws"))
         let task = session.webSocketTask(with: url, protocols: ["verde.v1", "verde.ticket.fixture"])
         let effect = Effect.ws_open(EffectWsOpen(effect_id: "socket", generation: "2", url: url.absoluteString,
-            protocols: ["verde.v1", "verde.ticket.fixture"], tls: Tls(origin: "https://bridge.invalid", spki_sha256: "pin"), max_message_bytes: 4))
+            protocols: ["verde.v1", "verde.ticket.fixture"], tls: Tls(origin: "https://bridge.invalid", spki_sha256: String(repeating: "a", count: 64)), max_message_bytes: 4))
         var events: [Event] = []
         let operation = SessionOperation(effect: effect, queue: DispatchQueue(label: "ws.fixture"), emit: { events.append($0) }, ended: {})
         operation.urlSession(session, webSocketTask: task, didOpenWithProtocol: "verde.v1")
