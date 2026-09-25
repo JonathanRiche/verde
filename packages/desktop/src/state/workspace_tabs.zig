@@ -15,10 +15,6 @@ const WorkspacePaneId = workspace_layout.WorkspacePaneId;
 
 pub const WorkspaceTabId = WorkspacePaneId;
 
-/// Upper bound on tabs collected per workspace; matches the pane-rect budget
-/// the scrolling layout already caps at.
-pub const MAX_WORKSPACE_TABS: usize = 16;
-
 pub const WorkspaceTab = struct {
     id: WorkspaceTabId,
     /// First pane of the tab in persisted pane order. The scrolling layout
@@ -34,22 +30,44 @@ pub const WorkspaceTab = struct {
 /// order, first occurrence of each tile). Panes outside the root tree,
 /// such as a detached quick pane, are not tabs.
 pub fn collect(layout: *const WorkspaceLayout, buffer: []WorkspaceTab) []WorkspaceTab {
+    var iterator = Iterator{ .layout = layout };
     var count: usize = 0;
-    for (layout.panes.items) |pane| {
-        if (!layout.rootContainsPane(pane.id)) continue;
-        const tab_id = layout.scrollGroupIdForPane(pane.id) orelse continue;
-        if (indexOfTab(buffer[0..count], tab_id) != null) continue;
-        if (count >= buffer.len) break;
-        buffer[count] = .{
-            .id = tab_id,
-            .representative_pane_id = pane.id,
-            .preferred_pane_id = layout.preferredScrollGroupPaneId(tab_id) orelse pane.id,
-            .pane_count = layout.scrollGroupPaneCount(tab_id),
-        };
+    while (count < buffer.len) {
+        buffer[count] = iterator.next() orelse break;
         count += 1;
     }
     return buffer[0..count];
 }
+
+/// Visits every rooted tab without imposing a rendering or buffer limit.
+pub const Iterator = struct {
+    layout: *const WorkspaceLayout,
+    pane_index: usize = 0,
+
+    pub fn next(self: *Iterator) ?WorkspaceTab {
+        while (self.pane_index < self.layout.panes.items.len) {
+            const index = self.pane_index;
+            self.pane_index += 1;
+            const pane = self.layout.panes.items[index];
+            const tab_id = tabIdForPane(self.layout, pane.id) orelse continue;
+            var seen = false;
+            for (self.layout.panes.items[0..index]) |earlier| {
+                if (tabIdForPane(self.layout, earlier.id) == tab_id) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) continue;
+            return .{
+                .id = tab_id,
+                .representative_pane_id = pane.id,
+                .preferred_pane_id = self.layout.preferredScrollGroupPaneId(tab_id) orelse pane.id,
+                .pane_count = self.layout.scrollGroupPaneCount(tab_id),
+            };
+        }
+        return null;
+    }
+};
 
 /// Tab that owns `pane_id`, or null for panes outside the root tree.
 pub fn tabIdForPane(layout: *const WorkspaceLayout, pane_id: WorkspacePaneId) ?WorkspaceTabId {
@@ -88,7 +106,7 @@ test "a split tile is one tab and standalone panes are their own tabs" {
     const standalone_pane_id = try layout.createTerminalPane(allocator, 11);
     try layout.splitPaneWithLeaf(allocator, tiled_pane_id, standalone_pane_id, .vertical, true);
 
-    var buffer: [MAX_WORKSPACE_TABS]WorkspaceTab = undefined;
+    var buffer: [16]WorkspaceTab = undefined;
     const tabs = collect(&layout, &buffer);
     try std.testing.expectEqual(@as(usize, 2), tabs.len);
     try std.testing.expectEqual(@as(WorkspaceTabId, 1), tabs[0].id);
@@ -115,10 +133,38 @@ test "tabs skip panes outside the root tree" {
 
     // A pane record with no leaf in the tree (e.g. a detached quick pane).
     const orphan_pane_id = try layout.createTerminalPane(allocator, 12);
-    var buffer: [MAX_WORKSPACE_TABS]WorkspaceTab = undefined;
+    var buffer: [16]WorkspaceTab = undefined;
     const tabs = collect(&layout, &buffer);
     try std.testing.expectEqual(@as(usize, 1), tabs.len);
     try std.testing.expectEqual(@as(?WorkspaceTabId, null), tabIdForPane(&layout, orphan_pane_id));
     try std.testing.expectEqual(@as(?usize, null), indexOfPane(&layout, tabs, orphan_pane_id));
     try std.testing.expectEqual(@as(?usize, null), indexOfTab(tabs, 999));
+}
+
+test "tabs remain reachable beyond the former sixteen group limit" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+    var last: WorkspacePaneId = 1;
+    for (0..40) |index| {
+        const pane_id = try layout.createTerminalPane(allocator, @intCast(index + 1));
+        try layout.splitPaneWithLeaf(allocator, last, pane_id, .vertical, true);
+        last = pane_id;
+    }
+    // A late split joins its existing tab; a detached pane is never a tab.
+    const child = try layout.createTerminalPane(allocator, 100);
+    try layout.splitPaneWithLeaf(allocator, last, child, .horizontal, true);
+    try std.testing.expect(layout.joinPaneToScrollGroup(last, child));
+    try std.testing.expect(layout.rememberScrollGroupFocusedPane(child));
+    const detached = try layout.createTerminalPane(allocator, 101);
+    const buffer = try allocator.alloc(WorkspaceTab, layout.panes.items.len);
+    defer allocator.free(buffer);
+    const tabs = collect(&layout, buffer);
+    try std.testing.expectEqual(@as(usize, 41), tabs.len);
+    try std.testing.expectEqual(layout.visibleTabCount(), tabs.len);
+    try std.testing.expectEqual(last, tabs[40].id);
+    try std.testing.expectEqual(child, tabs[40].preferred_pane_id);
+    try std.testing.expectEqual(@as(usize, 2), tabs[40].pane_count);
+    try std.testing.expectEqual(@as(?usize, 40), indexOfPane(&layout, tabs, child));
+    try std.testing.expectEqual(@as(?usize, null), indexOfPane(&layout, tabs, detached));
 }

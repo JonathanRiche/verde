@@ -816,9 +816,7 @@ fn growScrollingPaneInDirection(
 
     const vertical = state.app_config.workspace_scroll_direction == .vertical;
     const gap = theme.scaledUi(state.app_config.workspace_pane_gap);
-    var group_ids: [MAX_WORKSPACE_PANE_RECTS]runtime.WorkspacePaneId = undefined;
-    var representative_pane_ids: [MAX_WORKSPACE_PANE_RECTS]runtime.WorkspacePaneId = undefined;
-    const group_count = collectScrollingGroups(layout, &group_ids, &representative_pane_ids);
+    const group_count = layout.visibleTabCount();
     const raw_viewport_extent = if (vertical) last_workspace_rect.h else last_workspace_rect.w;
     const viewport_extent = scrollingViewportExtent(raw_viewport_extent, gap, group_count, state.app_config.workspace_panes_per_view);
     const ui_scale = theme.uiScaleFactor();
@@ -1808,9 +1806,13 @@ fn renderScrollingStrip(
         layout.scroll_snap_deadline_ms = 0;
         layout.clearScrollSkipSlide();
     }
-    var group_ids: [MAX_WORKSPACE_PANE_RECTS]runtime.WorkspacePaneId = undefined;
-    var representative_pane_ids: [MAX_WORKSPACE_PANE_RECTS]runtime.WorkspacePaneId = undefined;
-    const pane_count = collectScrollingGroups(layout, &group_ids, &representative_pane_ids);
+    // Geometry covers the entire strip; the visible-pane hit cache is not
+    // a limit on how many tabs a workspace can contain.
+    const allocator = state.palette_frame_text_arena.allocator();
+    const capacity = layout.panes.items.len;
+    const group_ids = allocator.alloc(runtime.WorkspacePaneId, capacity) catch return;
+    const representative_pane_ids = allocator.alloc(runtime.WorkspacePaneId, capacity) catch return;
+    const pane_count = collectScrollingGroups(layout, group_ids, representative_pane_ids);
     const viewport = scrollingViewportRect(workspace, gap, pane_count, state.app_config.workspace_panes_per_view);
     const target_viewport_width = scrollingViewportExtent(target_workspace_width, gap, pane_count, state.app_config.workspace_panes_per_view);
     const viewport_has_margins = scrollingViewportUsesMargins(pane_count, state.app_config.workspace_panes_per_view);
@@ -1823,7 +1825,7 @@ fn renderScrollingStrip(
         layout.scroll_pane_extent_ratio_override,
         theme.uiScaleFactor(),
     );
-    var extents: [MAX_WORKSPACE_PANE_RECTS]f32 = undefined;
+    const extents = allocator.alloc(f32, pane_count) catch return;
     resolveScrollingGroupExtents(
         layout,
         group_ids[0..pane_count],
@@ -1843,7 +1845,7 @@ fn renderScrollingStrip(
         layout.scroll_pane_extent_ratio_override,
         theme.uiScaleFactor(),
     );
-    var target_extents: [MAX_WORKSPACE_PANE_RECTS]f32 = undefined;
+    const target_extents = allocator.alloc(f32, pane_count) catch return;
     resolveScrollingGroupExtents(
         layout,
         group_ids[0..pane_count],
@@ -2377,9 +2379,13 @@ fn appendScrollingResizeHit(
 }
 
 fn scrollGroupIndexForPane(layout: *const runtime.WorkspaceLayout, pane_id: runtime.WorkspacePaneId) ?usize {
-    var tab_buffer: [MAX_WORKSPACE_PANE_RECTS]runtime.WorkspaceTab = undefined;
-    const tabs = runtime.workspace_tabs.collect(layout, &tab_buffer);
-    return runtime.workspace_tabs.indexOfPane(layout, tabs, pane_id);
+    const group_id = runtime.workspace_tabs.tabIdForPane(layout, pane_id) orelse return null;
+    var iterator = runtime.workspace_tabs.Iterator{ .layout = layout };
+    var index: usize = 0;
+    while (iterator.next()) |tab| : (index += 1) {
+        if (tab.id == group_id) return index;
+    }
+    return null;
 }
 
 fn scrollingPaneExtent(viewport_extent: f32, gap: f32, panes_per_view: u8) f32 {
@@ -2444,18 +2450,19 @@ fn scrollingMaxOffset(viewport_extent: f32, pane_extent: f32, gap: f32, pane_cou
 
 fn collectScrollingGroups(
     layout: *const runtime.WorkspaceLayout,
-    group_ids: *[MAX_WORKSPACE_PANE_RECTS]runtime.WorkspacePaneId,
-    representative_pane_ids: *[MAX_WORKSPACE_PANE_RECTS]runtime.WorkspacePaneId,
+    group_ids: []runtime.WorkspacePaneId,
+    representative_pane_ids: []runtime.WorkspacePaneId,
 ) usize {
     // Scrolling items are exactly the workspace tabs, so the strip and the
     // tab bar can never disagree about item count or order.
-    var tab_buffer: [MAX_WORKSPACE_PANE_RECTS]runtime.WorkspaceTab = undefined;
-    const tabs = runtime.workspace_tabs.collect(layout, &tab_buffer);
-    for (tabs, 0..) |tab, index| {
-        group_ids[index] = tab.id;
-        representative_pane_ids[index] = tab.representative_pane_id;
+    var iterator = runtime.workspace_tabs.Iterator{ .layout = layout };
+    var count: usize = 0;
+    while (iterator.next()) |tab| {
+        group_ids[count] = tab.id;
+        representative_pane_ids[count] = tab.representative_pane_id;
+        count += 1;
     }
-    return tabs.len;
+    return count;
 }
 
 fn resolveScrollingGroupExtents(
@@ -4261,4 +4268,41 @@ test "skip slide origins move one pane width from and to the viewport" {
     const end_back = skipSlideScreenOrigins(-1, 1.0, step);
     try std.testing.expectApproxEqAbs(step, end_back.from, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), end_back.to, 0.0001);
+}
+
+test "scrolling strip reveals every group beyond the visible rect budget" {
+    const allocator = std.testing.allocator;
+    var layout = try runtime.WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+    var last: runtime.WorkspacePaneId = 1;
+    for (0..40) |index| {
+        const pane_id = try layout.createTerminalPane(allocator, @intCast(index + 1));
+        try layout.splitPaneWithLeaf(allocator, last, pane_id, .vertical, true);
+        last = pane_id;
+    }
+    const capacity = layout.panes.items.len;
+    const ids = try allocator.alloc(runtime.WorkspacePaneId, capacity);
+    defer allocator.free(ids);
+    const representatives = try allocator.alloc(runtime.WorkspacePaneId, capacity);
+    defer allocator.free(representatives);
+    const count = collectScrollingGroups(&layout, ids, representatives);
+    try std.testing.expectEqual(@as(usize, 41), count);
+    const extents = try allocator.alloc(f32, count);
+    defer allocator.free(extents);
+    // Both axes and viewport changes share these one-dimensional bounds.
+    for ([_]f32{ 600.0, 1200.0, 2400.0 }) |viewport| {
+        resolveScrollingGroupExtents(&layout, ids, representatives, viewport / 2.0, viewport, 12.0, 1.0, extents);
+        const max_offset = scrollingStripMaxOffset(viewport, extents, 12.0);
+        for (ids, 0..) |pane_id, index| {
+            try std.testing.expectEqual(@as(?usize, index), scrollGroupIndexForPane(&layout, pane_id));
+            const target = revealedScrollTargetForPane(0.0, viewport, extents, 12.0, index, max_offset);
+            const origin = scrollingPaneOrigin(extents, 12.0, index);
+            try std.testing.expect(target <= max_offset);
+            try std.testing.expect(origin >= target);
+            try std.testing.expect(origin + extents[index] <= target + viewport);
+            const available = scrollingEdgeAvailability(index, count);
+            try std.testing.expectEqual(index > 0, available.previous);
+            try std.testing.expectEqual(index + 1 < count, available.next);
+        }
+    }
 }

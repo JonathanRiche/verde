@@ -7709,8 +7709,9 @@ pub const AppState = struct {
     pub fn selectWorkspaceTab(self: *AppState, index: usize, tab_id: WorkspaceTabId) bool {
         if (index >= self.project_controller.projects.items.len) return false;
         const layout = &self.project_controller.projects.items[index].workspace_layout;
-        var tab_buffer: [workspace_tabs.MAX_WORKSPACE_TABS]WorkspaceTab = undefined;
-        const tabs = workspace_tabs.collect(layout, &tab_buffer);
+        const tab_buffer = self.allocator.alloc(WorkspaceTab, layout.panes.items.len) catch return false;
+        defer self.allocator.free(tab_buffer);
+        const tabs = workspace_tabs.collect(layout, tab_buffer);
         const tab_index = workspace_tabs.indexOfTab(tabs, tab_id) orelse return false;
         self.focusWorkspaceOpenPaneFromSidebar(index, tabs[tab_index].preferred_pane_id);
         return true;
@@ -7723,8 +7724,9 @@ pub const AppState = struct {
         if (self.project_controller.projects.items.len == 0) return false;
         const project_index = self.project_controller.selected_index;
         const layout = &self.project_controller.projects.items[project_index].workspace_layout;
-        var tab_buffer: [workspace_tabs.MAX_WORKSPACE_TABS]WorkspaceTab = undefined;
-        const tabs = workspace_tabs.collect(layout, &tab_buffer);
+        const tab_buffer = self.allocator.alloc(WorkspaceTab, layout.panes.items.len) catch return false;
+        defer self.allocator.free(tab_buffer);
+        const tabs = workspace_tabs.collect(layout, tab_buffer);
         if (tab_index >= tabs.len) return false;
         return self.selectWorkspaceTab(project_index, tabs[tab_index].id);
     }

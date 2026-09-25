@@ -1047,13 +1047,12 @@ fn tabCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, st
                 return try errorResponseAlloc(allocator, id_value, "invalid_request", "tab.add kind must be chat or terminal")
         else
             null;
-        var tab_buffer: [app_state.workspace_tabs.MAX_WORKSPACE_TABS]app_state.WorkspaceTab = undefined;
         const layout = &state.project_controller.projects.items[project_index].workspace_layout;
-        const tabs_before = app_state.workspace_tabs.collect(layout, &tab_buffer).len;
+        const tabs_before = layout.visibleTabCount();
         if (paramIsNonNull(params, "focus") and boolParam(params, "focus") == null)
             return try errorResponseAlloc(allocator, id_value, "invalid_request", "tab.add focus must be a boolean");
         state.addWorkspaceTabWithFocus(project_index, kind, boolParam(params, "focus") orelse true);
-        const tabs_after = app_state.workspace_tabs.collect(layout, &tab_buffer).len;
+        const tabs_after = layout.visibleTabCount();
         if (tabs_after <= tabs_before) return try errorResponseAlloc(allocator, id_value, "rejected", "tab add did not apply");
         return try panesResponseForProject(allocator, id_value, state, project_index);
     }
@@ -1064,8 +1063,9 @@ fn tabCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, st
 /// (any member pane) so callers can address a tab however `panes` reported it.
 fn resolveTabId(state: *app_state.AppState, project_index: usize, params: std.json.Value) ?app_state.WorkspaceTabId {
     const layout = &state.project_controller.projects.items[project_index].workspace_layout;
-    var tab_buffer: [app_state.workspace_tabs.MAX_WORKSPACE_TABS]app_state.WorkspaceTab = undefined;
-    const tabs = app_state.workspace_tabs.collect(layout, &tab_buffer);
+    const tab_buffer = state.allocator.alloc(app_state.WorkspaceTab, layout.panes.items.len) catch return null;
+    defer state.allocator.free(tab_buffer);
+    const tabs = app_state.workspace_tabs.collect(layout, tab_buffer);
     if (u32Param(params, "tab") orelse u32Param(params, "tab_id")) |tab_id| {
         return if (app_state.workspace_tabs.indexOfTab(tabs, tab_id) != null) tab_id else null;
     }
@@ -2333,10 +2333,10 @@ fn writeProjectPanes(s: *std.json.Stringify, state: *app_state.AppState, project
 /// its members so clients can map tabs back to panes without re-deriving
 /// the grouping rule.
 fn writeWorkspaceTabs(s: *std.json.Stringify, layout: *const app_state.WorkspaceLayout) !void {
-    var tab_buffer: [app_state.workspace_tabs.MAX_WORKSPACE_TABS]app_state.WorkspaceTab = undefined;
-    const tabs = app_state.workspace_tabs.collect(layout, &tab_buffer);
+    var iterator = app_state.workspace_tabs.Iterator{ .layout = layout };
     try s.beginArray();
-    for (tabs, 0..) |tab, index| {
+    var index: usize = 0;
+    while (iterator.next()) |tab| : (index += 1) {
         try s.beginObject();
         try s.objectField("tab_id");
         try s.write(tab.id);

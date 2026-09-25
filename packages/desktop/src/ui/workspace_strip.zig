@@ -148,8 +148,8 @@ pub fn render(state: *runtime.AppState, strip: palette.Rect) void {
     if (state.project_controller.projects.items.len == 0) return;
     const project_index = state.project_controller.selected_index;
     const layout = &state.project_controller.projects.items[project_index].workspace_layout;
-    var tab_buffer: [runtime.workspace_tabs.MAX_WORKSPACE_TABS]runtime.WorkspaceTab = undefined;
-    const tabs = runtime.workspace_tabs.collect(layout, &tab_buffer);
+    const tab_buffer = state.palette_frame_text_arena.allocator().alloc(runtime.WorkspaceTab, layout.panes.items.len) catch return;
+    const tabs = runtime.workspace_tabs.collect(layout, tab_buffer);
     const focused_tab_id = runtime.workspace_tabs.focusedTabId(layout);
     const cap = tabWidthCap(strip.w, tabs.len);
     const gap = theme.scaledUi(TAB_GAP_UI);
@@ -580,7 +580,7 @@ test "workspace strip tabs follow tiles: a split tile is one tab and activation 
     try std.testing.expect(state.splitCurrentProjectWorkspacePaneTiledWithChatPlacement(first_pane_id, .vertical, true));
     var layout = &state.project_controller.projects.items[0].workspace_layout;
     const tiled_pane_id = layout.focused_pane_id orelse return error.TestExpectedEqual;
-    var tab_buffer: [runtime.workspace_tabs.MAX_WORKSPACE_TABS]runtime.WorkspaceTab = undefined;
+    var tab_buffer: [16]runtime.WorkspaceTab = undefined;
     var tabs = runtime.workspace_tabs.collect(layout, &tab_buffer);
     try std.testing.expectEqual(@as(usize, 1), tabs.len);
     try std.testing.expectEqual(@as(usize, 2), tabs[0].pane_count);

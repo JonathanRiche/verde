@@ -2158,8 +2158,8 @@ fn renderOpenPanesSection(
     const indent = theme.scaledUi(SIDEBAR_ROW_INDENT_CSS);
     // Ctrl+N badges number tabs, so a split tile shares one ordinal and its
     // mini-rows show none.
-    var tab_buffer: [native_state.workspace_tabs.MAX_WORKSPACE_TABS]native_state.WorkspaceTab = undefined;
-    const tabs = native_state.workspace_tabs.collect(layout, &tab_buffer);
+    const tab_buffer = state.palette_frame_text_arena.allocator().alloc(native_state.WorkspaceTab, layout.panes.items.len) catch return y;
+    const tabs = native_state.workspace_tabs.collect(layout, tab_buffer);
     for (layout.panes.items, 0..) |*pane, pane_index| {
         const group_id = layout.scrollGroupIdForPane(pane.id) orelse continue;
         const group_count = layout.scrollGroupPaneCount(group_id);
