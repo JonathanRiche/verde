@@ -123,7 +123,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | A-05 | Idempotent pair exchange | host | linux | — | done (a36897f0) |
 | A-06 | Terminal QR + App Link pair URL | host | linux | — | done (b0f6e50b; phone-camera scan pending human-verify) |
 | A-07 | Desktop "Pair a phone" + Paired devices UI | host | linux | A-04, A-06 | in_progress (astra cli-thread-1790358128115-7a42b2851781fae5) |
-| A-08 | Web Settings paired-devices list | host | linux | A-04 | in_progress (astra cli-thread-1790358129786-a7d425ec177b30d6) |
+| A-08 | Web Settings paired-devices list | host | linux | A-04 | done (f6ff1cb9) |
 | A-09 | Pairing presets + access-mode cap | host | linux | A-02, H-08 | in_progress (astra cli-thread-1790358126217-4e98de9791a367a4) |
 | A-10 | `mobile.min_client` + capability flags | host | linux | — | done (f8aa0db8) |
 | A-11 | Delta change feed on the gateway | host | linux | A-10 | done (1b1a7d34) |
@@ -431,6 +431,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
   sessions.
 - **Done when:** `mise run web-app-types`, `bun test` in `packages/web_app`
   and `mise run web-app` pass.
+- **Done (f6ff1cb9).** The gateway exposes no session role, so Settings calls `device.list` when it opens. On success it shows the list with Revoke and refetches after each revoke. A `forbidden` rejection (a paired-device session) hides the section. Any other error shows "Couldn't load devices" inline with Retry. The preset is shown when present. Hiding is presentation only; the gateway enforces owner-only access. `web-app-types`, `bun test` (247 passed) and `web-app` pass.
 
 #### A-09 · Pairing presets + access-mode cap
 - **depends:** A-02, H-08
