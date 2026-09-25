@@ -198,6 +198,11 @@ pub const Backend = struct {
         try self.platform.postJson(json);
     }
 
+    /// Imports cookies into the platform browser store; values are never logged.
+    pub fn importCookies(self: *Backend, json: []const u8) !void {
+        try self.platform.importCookies(json);
+    }
+
     /// Navigates backward using the platform API or the shared JavaScript fallback.
     pub fn goBack(self: *Backend) !void {
         try self.platform.goBack();

@@ -2269,6 +2269,9 @@ pub fn pollBrowser(self: anytype) bool {
             .context_menu_dismissed => {
                 self.clearBrowserContextMenuLocal();
             },
+            .cookies_imported => |count| {
+                self.noteCookieImportCompleted(count);
+            },
             .failed => |message| {
                 self.browser_controller.runtime.status = .failed;
                 self.setActiveBrowserTabLoadState(false, true);

@@ -69,7 +69,7 @@ pub fn apply(runtime: anytype, tab: ?*BrowserTabRef, allocator: std.mem.Allocato
                 runtime.setLastError("Browser bridge message rejected by origin policy.") catch {};
             }
         },
-        .cursor_changed, .context_menu, .context_menu_dismissed => {},
+        .cursor_changed, .context_menu, .context_menu_dismissed, .cookies_imported => {},
     }
     return false;
 }

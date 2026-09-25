@@ -131,6 +131,16 @@ pub const Controller = struct {
         }
     }
 
+    /// Imports cookies into the browser cookie store. Values are never logged;
+    /// not reachable from MCP tools (GUI/CLI entry points only).
+    pub fn importCookies(self: *Controller, json: []const u8) !void {
+        const backend = try self.ensureBackend();
+        switch (backend.*) {
+            .native_webview => |*active| try active.importCookies(json),
+            .stub => |*active| try active.importCookies(json),
+        }
+    }
+
     /// Navigates backward using the backend's native history API when available.
     pub fn goBack(self: *Controller) !void {
         const backend = try self.ensureBackend();

@@ -63,6 +63,12 @@ int verde_macos_webview_post_json(void *handle, const char *json) {
     return 0;
 }
 
+int verde_macos_webview_import_cookies(void *handle, const char *json) {
+    (void)handle;
+    (void)json;
+    return 0;
+}
+
 int verde_macos_webview_go_back(void *handle) {
     (void)handle;
     return 0;

@@ -23,6 +23,7 @@ pub const CommandKind = enum {
     context_menu_activate,
     context_menu_dismiss,
     frame_release,
+    import_cookies,
     quit,
 };
 
@@ -67,6 +68,7 @@ pub const EventKind = enum {
     context_menu_dismissed,
     cursor_changed,
     frame_ready,
+    cookies_imported,
     failed,
 };
 

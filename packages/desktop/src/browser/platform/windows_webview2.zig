@@ -165,6 +165,12 @@ pub const Controller = struct {
         if (verde_windows_webview2_go_back(handle) == 0) return error.BrowserUnavailable;
     }
 
+    pub fn importCookies(self: *Controller, json: []const u8) !void {
+        _ = self;
+        _ = json;
+        return error.BrowserUnavailable;
+    }
+
     pub fn goForward(self: *Controller) !void {
         const handle = try self.ensureWebView();
         if (verde_windows_webview2_go_forward(handle) == 0) return error.BrowserUnavailable;

@@ -24,6 +24,7 @@ test {
     _ = @import("daemon/shell_command.zig");
     _ = @import("daemon/workspace_file_search.zig");
     _ = @import("daemon/browser_history.zig");
+    _ = @import("daemon/browser_cookie_import.zig");
     _ = @import("db/client.zig");
     _ = @import("state/browser_suggestions.zig");
     _ = @import("state/browser_history_controller.zig");

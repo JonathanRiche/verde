@@ -115,6 +115,7 @@ const BrowserOverflowAction = union(enum) {
     open_external,
     toggle_inspector,
     clear_history,
+    import_cookies,
     close_pane,
 };
 
@@ -1231,7 +1232,7 @@ fn renderToolbarOverflowMenu(
         @as(usize, if (copy_visible) 0 else 1) +
         @as(usize, if (external_visible) 0 else 1) +
         @as(usize, if (inspector_visible) 0 else 1);
-    const action_rows: usize = 7 + hidden_action_rows;
+    const action_rows: usize = 8 + hidden_action_rows;
     const row_count = max_tab_rows + action_rows;
     const menu_h = pad * 2.0 + row_h * @as(f32, @floatFromInt(row_count));
     const min_x = palette_toolbar_rect.x + theme.scaledUi(4.0);
@@ -1286,6 +1287,8 @@ fn renderToolbarOverflowMenu(
         y += row_h;
     }
     renderToolbarOverflowRow(state, overflowRowRect(y, row_h, pad, menu_w), "Clear browsing history", .clear_history, true);
+    y += row_h;
+    renderToolbarOverflowRow(state, overflowRowRect(y, row_h, pad, menu_w), "Import cookies\xE2\x80\xA6", .import_cookies, true);
     y += row_h;
     renderToolbarOverflowRow(state, overflowRowRect(y, row_h, pad, menu_w), "Close browser pane", .close_pane, pane_id != null);
 }
@@ -1352,6 +1355,7 @@ fn activateOverflowAction(state: *app_state.AppState, action: BrowserOverflowAct
         .open_external => state.openCurrentBrowserUrlExternally(),
         .toggle_inspector => if (state.canUseBrowserInspector()) state.toggleBrowserInspector(),
         .clear_history => browser_history_controller.clearBrowserHistory(state),
+        .import_cookies => state.beginCookieImport(),
         .close_pane => if (state.currentProjectVisibleBrowserPaneId()) |pane_id| {
             _ = state.closeCurrentProjectWorkspacePane(pane_id);
         },

@@ -57,6 +57,7 @@ const composer_controller = @import("state/composer_controller.zig");
 const companion_controller = @import("state/companion_controller.zig");
 const linked_chats_controller = @import("state/linked_chats_controller.zig");
 const browser_controller = @import("state/browser_controller.zig");
+const cookie_import_controller = @import("state/cookie_import_controller.zig");
 const workspace_controller = @import("state/workspace_controller.zig");
 const lifecycle_controller = @import("state/lifecycle_controller.zig");
 const chat_controller = @import("state/chat_controller.zig");
@@ -2141,6 +2142,11 @@ pub const PaletteModalAction = enum {
     thread_import_cancel,
     thread_import_submit,
     thread_import_select,
+    cookie_import_source_select,
+    cookie_import_domain_toggle,
+    cookie_import_cancel,
+    cookie_import_submit,
+    cookie_import_search_input,
     handoff_cancel,
     handoff_prepare,
     handoff_menu_toggle,
@@ -2269,6 +2275,7 @@ pub const BackgroundTaskActionHit = struct {
 };
 
 pub const PaletteModalTextFocus = enum {
+    cookie_import_search,
     none,
     project_rename,
     thread_import,
@@ -4708,6 +4715,8 @@ pub const AppState = struct {
     settings_controller: settings_controller.State,
     /// Settings › Runtimes & connections card and SSH wizard state.
     runtime_connections: runtime_connections_controller.State = .{},
+    /// Browser "Import cookies…" flow (per-site, agent-safety gated).
+    cookie_import: cookie_import_controller.State = .{},
     app_config_file_mtime: i128,
     app_config_runtime_sync_pending: bool,
     project_directory_browse_requested: bool,
@@ -5725,6 +5734,7 @@ pub const AppState = struct {
             self.rename_project_index != null or
             self.transcriptSelectionBuffer() != null or
             self.thread_import_provider != null or
+            self.cookie_import.open or
             self.handoff_controller.sheet_open or
             self.project_controller.show_creator or
             self.settings_controller.modal_visible or
@@ -8157,6 +8167,15 @@ pub const AppState = struct {
     pub const commandPaletteQuery = command_controller.commandPaletteQuery;
     pub const commandPaletteQueryBuffer = command_controller.commandPaletteQueryBuffer;
     pub const pollProviderSlashCatalog = command_controller.pollProviderSlashCatalog;
+    pub const beginCookieImport = cookie_import_controller.beginCookieImport;
+    pub const cancelCookieImport = cookie_import_controller.cancelCookieImport;
+    pub const cookieImportOpen = cookie_import_controller.cookieImportOpen;
+    pub const selectCookieImportSource = cookie_import_controller.selectCookieImportSource;
+    pub const toggleCookieImportDomain = cookie_import_controller.toggleCookieImportDomain;
+    pub const submitCookieImport = cookie_import_controller.submitCookieImport;
+    pub const pollCookieImport = cookie_import_controller.pollCookieImport;
+    pub const noteCookieImportCompleted = cookie_import_controller.noteCookieImportCompleted;
+    pub const cookieImportFilteredIndices = cookie_import_controller.cookieImportFilteredIndices;
     pub const flushIfDirty = lifecycle_controller.flushIfDirty;
     pub const pollFlushWorker = lifecycle_controller.pollFlushWorker;
     pub const flushDirtyBlocking = lifecycle_controller.flushDirtyBlocking;
@@ -13478,6 +13497,10 @@ pub const AppState = struct {
                 .settings_save,
                 .command_palette_row,
                 .command_palette_action_row,
+                .cookie_import_source_select,
+                .cookie_import_domain_toggle,
+                .cookie_import_cancel,
+                .cookie_import_submit,
                 => true,
                 .modal_dismiss,
                 .modal_block,
@@ -13488,6 +13511,7 @@ pub const AppState = struct {
                 .runtime_credential_input,
                 .runtime_wizard_input,
                 .command_palette_input,
+                .cookie_import_search_input,
                 => false,
             };
             if (interactive and hit.rect.contains(point)) return true;
@@ -14718,6 +14742,7 @@ pub const AppState = struct {
         self.transcript_controller.markdown_entries.deinit(self.allocator);
         self.transcript_controller.diff_view_cache.deinit(self.allocator);
         self.browser_controller.deinit(self.allocator);
+        self.cookie_import.deinit();
         self.releaseAllImageTextures();
         self.thread_import_threads.deinit(self.allocator);
         if (self.handoff_controller.preview) |preview| self.allocator.free(preview);

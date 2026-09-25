@@ -19,6 +19,7 @@ const repository_path = @import("../daemon/repository_path.zig");
 const shell_command = @import("../daemon/shell_command.zig");
 const bang_commands = @import("../workspace/bang_commands.zig");
 const workspace_file_search = @import("../daemon/workspace_file_search.zig");
+const browser_cookie_import = @import("../daemon/browser_cookie_import.zig");
 const access_store = @import("../daemon/access_store.zig");
 const connect_auth = @import("../daemon/connect_auth.zig");
 const connect_client = @import("../daemon/connect_client.zig");
@@ -2951,6 +2952,9 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, store_protocol.METHOD_CONFIG_UI_SET)) return try self.configUiSetResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_WORKSPACE_RESOLVE)) return try self.workspaceResolveResponse(id_value, params);
         if (std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_FILES_SEARCH)) return try workspaceFilesSearchResponse(self, id_value, params);
+        if (std.mem.eql(u8, method, store_protocol.METHOD_BROWSER_COOKIE_SOURCES_LIST)) return try browserCookieSourcesListResponse(self, id_value);
+        if (std.mem.eql(u8, method, store_protocol.METHOD_BROWSER_COOKIE_DOMAINS_LIST)) return try browserCookieDomainsListResponse(self, id_value, params);
+        if (std.mem.eql(u8, method, store_protocol.METHOD_BROWSER_COOKIE_EXPORT)) return try browserCookieExportResponse(self, id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_PROCESS_LIST)) return try self.processListResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_PROCESS_DEFINITIONS)) return try self.processDefinitionsResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_PROCESS_INSPECT)) return try self.processInspectResponse(id_value, params);
@@ -12594,6 +12598,9 @@ fn methodRunsUnlocked(method: []const u8) bool {
         // Composer file search resolves its route under short lockDaemon/store
         // windows, then lists files (git subprocess/walk) with no lock held.
         std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_FILES_SEARCH) or
+        std.mem.eql(u8, method, store_protocol.METHOD_BROWSER_COOKIE_SOURCES_LIST) or
+        std.mem.eql(u8, method, store_protocol.METHOD_BROWSER_COOKIE_DOMAINS_LIST) or
+        std.mem.eql(u8, method, store_protocol.METHOD_BROWSER_COOKIE_EXPORT) or
         // Local access administration is daemon-owned SQLite work and takes
         // only its own short lockDaemon bookkeeping window.
         isAccessMethod(method) or
@@ -14105,7 +14112,199 @@ fn browserHistoryResponse(daemon: *Daemon, id_value: std.json.Value, method: []c
     return try okValueResponse(allocator, id_value, .{ .cleared = true });
 }
 
+fn workspaceFilesSearchResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+    const allocator = daemon.allocator;
+    if (params != .object) {
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "file search params must be an object");
+    }
+    const query = jsonString(params.object.get("query") orelse .null) orelse "";
+    if (query.len > workspace_file_search.MAX_QUERY_BYTES or std.mem.indexOfAny(u8, query, "\x00\r\n") != null) {
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid file search query");
+    }
+    const limit: usize = switch (params.object.get("limit") orelse .null) {
+        .null => workspace_file_search.DEFAULT_LIMIT,
+        .integer => |value| if (value >= 1) @intCast(@min(value, @as(i64, workspace_file_search.MAX_LIMIT))) else {
+            return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid file search limit");
+        },
+        else => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid file search limit"),
+    };
 
+    // Route resolution is shared with chat.turn.start; the primary repository
+    // is the default so plain workspace chats need not name it.
+    var route_params: std.json.ObjectMap = .empty;
+    defer route_params.deinit(allocator);
+    for ([_][]const u8{ "workspace_id", "relative_cwd", "project_path", "cwd" }) |key| {
+        if (params.object.get(key)) |value| try route_params.put(allocator, key, value);
+    }
+    try route_params.put(allocator, "repository_id", switch (params.object.get("repository_id") orelse .null) {
+        .null => .{ .string = store_protocol.PRIMARY_REPOSITORY_ID },
+        else => |value| value,
+    });
+    var route = (resolveChatExecutionRoute(daemon, .{ .object = route_params }) catch |err| return switch (err) {
+        error.InvalidParams, error.RouteAttachmentsUnsupported => try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid repository route params"),
+        error.CapabilityUnavailable => try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "repository checkout is unavailable on this runtime"),
+        error.ResourceNotFound => try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_RESOURCE_NOT_FOUND, "repository binding not found on this runtime"),
+        error.StoreCorrupt => try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_STORE_CORRUPT, "store is corrupt"),
+        error.StoreUnavailable => try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_STORE_UNAVAILABLE, "store is unavailable"),
+        error.OutOfMemory => error.OutOfMemory,
+    }) orelse return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid repository route params");
+    defer route.deinit(allocator);
+
+    var results = workspace_file_search.search(allocator, route.cwd orelse route.project_path, query, limit) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.SearchUnavailable => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "repository files could not be listed"),
+    };
+    defer results.deinit();
+    return try okValueResponse(allocator, id_value, .{
+        .repository_id = route.repository_id,
+        .relative_cwd = route.relative_cwd,
+        .query = query,
+        .files = results.files,
+        .total_files = results.total_files,
+        .truncated = results.truncated,
+        .source = @tagName(results.source),
+    });
+}
+
+// Browser cookie import: read source cookie stores from other installed
+// browsers so the GUI can present a per-site import picker. Cookie values are
+// never logged; these handlers run unlocked (file I/O) and are not web-exposed
+// (see web_runtime allowlist) nor surfaced through MCP tools.
+fn browserCookieSourcesListResponse(daemon: *Daemon, id_value: std.json.Value) ![]u8 {
+    const allocator = daemon.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded: std.Io.Threaded = .init(arena, .{});
+    defer threaded.deinit();
+    const sources = browser_cookie_import.discoverSources(arena, threaded.io()) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    var list = try arena.alloc(struct {
+        id: []const u8,
+        label: []const u8,
+        family: []const u8,
+        browser_id: []const u8,
+    }, sources.len);
+    for (sources, 0..) |source, i| {
+        list[i] = .{
+            .id = source.id,
+            .label = source.label,
+            .family = @tagName(source.family),
+            .browser_id = source.browser_id,
+        };
+    }
+    return try okValueResponse(allocator, id_value, .{ .sources = list });
+}
+
+fn resolveCookieSource(arena: std.mem.Allocator, io: std.Io, source_id: []const u8) !?browser_cookie_import.Source {
+    const sources = try browser_cookie_import.discoverSources(arena, io);
+    for (sources) |source| {
+        if (std.mem.eql(u8, source.id, source_id)) return source;
+    }
+    return null;
+}
+
+fn browserCookieDomainsListResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+    const allocator = daemon.allocator;
+    if (params != .object) {
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "cookie domains params must be an object");
+    }
+    const source_id = jsonString(params.object.get("source_id") orelse .null) orelse
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "source_id is required");
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded: std.Io.Threaded = .init(arena, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const source = (try resolveCookieSource(arena, io, source_id)) orelse
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_RESOURCE_NOT_FOUND, "cookie source not found");
+    const cookies = browser_cookie_import.readSourceCookies(arena, io, source) catch |err|
+        return try cookieReadError(allocator, id_value, err);
+    const domains = try browser_cookie_import.summarizeDomains(arena, cookies);
+    return try okValueResponse(allocator, id_value, .{
+        .source_id = source_id,
+        .total_cookies = cookies.len,
+        .domains = domains,
+    });
+}
+
+fn browserCookieExportResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+    const allocator = daemon.allocator;
+    if (params != .object) {
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "cookie export params must be an object");
+    }
+    const source_id = jsonString(params.object.get("source_id") orelse .null) orelse
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "source_id is required");
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded: std.Io.Threaded = .init(arena, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Optional domain allowlist; when absent, export everything.
+    var allow: ?std.StringHashMapUnmanaged(void) = null;
+    if (params.object.get("domains")) |value| {
+        if (value == .array) {
+            var set: std.StringHashMapUnmanaged(void) = .empty;
+            for (value.array.items) |item| {
+                if (item == .string) try set.put(arena, item.string, {});
+            }
+            allow = set;
+        }
+    }
+
+    const source = (try resolveCookieSource(arena, io, source_id)) orelse
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_RESOURCE_NOT_FOUND, "cookie source not found");
+    const cookies = browser_cookie_import.readSourceCookies(arena, io, source) catch |err|
+        return try cookieReadError(allocator, id_value, err);
+
+    const Exported = struct {
+        host: []const u8,
+        name: []const u8,
+        value: []const u8,
+        path: []const u8,
+        expires_unix: i64,
+        secure: bool,
+        http_only: bool,
+        same_site: i8,
+    };
+    var out: std.ArrayList(Exported) = .empty;
+    for (cookies) |cookie| {
+        if (allow) |set| {
+            const domain = if (cookie.host.len != 0 and cookie.host[0] == '.') cookie.host[1..] else cookie.host;
+            if (!set.contains(domain)) continue;
+        }
+        try out.append(arena, .{
+            .host = cookie.host,
+            .name = cookie.name,
+            .value = cookie.value,
+            .path = cookie.path,
+            .expires_unix = cookie.expires_unix,
+            .secure = cookie.secure,
+            .http_only = cookie.http_only,
+            .same_site = @intFromEnum(cookie.same_site),
+        });
+    }
+    return try okValueResponse(allocator, id_value, .{
+        .source_id = source_id,
+        .cookies = out.items,
+    });
+}
+
+fn cookieReadError(allocator: std.mem.Allocator, id_value: std.json.Value, err: anyerror) ![]u8 {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.KeyringUnavailable => try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "the system keyring is unavailable; cannot decrypt this browser's cookies"),
+        error.UnsupportedPlatform => try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "importing from this browser is not supported on this platform"),
+        else => try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_STORE_UNAVAILABLE, "could not read the source cookie store"),
+    };
+}
 
 fn jsonArrayHasItems(value: ?std.json.Value) error{InvalidParams}!bool {
     const present = value orelse return false;

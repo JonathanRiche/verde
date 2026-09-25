@@ -112,6 +112,7 @@ const STATIC_COMMANDS = [_]Command{
     .{ .id = "browser.tab.move_left", .title = "Browser: Move Active Tab Left", .keywords = "web page reorder", .section = .panes, .run = runMoveBrowserTabLeft, .enabled = canMoveBrowserTabLeft },
     .{ .id = "browser.tab.move_right", .title = "Browser: Move Active Tab Right", .keywords = "web page reorder", .section = .panes, .run = runMoveBrowserTabRight, .enabled = canMoveBrowserTabRight },
     .{ .id = "browser.tab.close", .title = "Browser: Close Active Tab", .keywords = "web page remove", .section = .panes, .run = runCloseBrowserTab, .enabled = hasBrowserTab },
+    .{ .id = "browser.cookies.import", .title = "Browser: Import Cookies\xE2\x80\xA6", .keywords = "cookies login session import sign in firefox chrome", .section = .panes, .run = runImportCookies, .enabled = hasBrowserPane },
     .{ .id = "pane.close", .title = "Close Pane", .section = .panes, .keybind = .workspace_close, .run = runClosePane, .enabled = hasProjects },
     .{ .id = "pane.zoom", .title = "Zoom Pane", .keywords = "maximize restore fullscreen", .section = .panes, .keybind = .workspace_toggle_maximize, .run = runZoomPane, .enabled = hasProjects },
     .{ .id = "pane.previous", .title = "Previous Pane", .keywords = "niri scroll focus left up back", .section = .panes, .keybind = .workspace_previous_pane, .run = runPreviousPane, .enabled = canFocusPreviousPane },
@@ -1367,6 +1368,10 @@ fn runToggleBrowser(state: *runtime.AppState) void {
 
 fn runNewBrowserTab(state: *runtime.AppState) void {
     state.createBrowserTab();
+}
+
+fn runImportCookies(state: *runtime.AppState) void {
+    state.beginCookieImport();
 }
 
 fn runDuplicateBrowserTab(state: *runtime.AppState) void {

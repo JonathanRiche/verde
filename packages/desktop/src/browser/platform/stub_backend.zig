@@ -149,6 +149,12 @@ pub const Controller = struct {
         });
     }
 
+    /// Records a cookie import by echoing a completion event; values are dropped.
+    pub fn importCookies(self: *Controller, json: []const u8) !void {
+        _ = json;
+        try self.queue.push(self.allocator, .{ .cookies_imported = 0 });
+    }
+
     /// Accepts pane resizes so the stub can satisfy the full browser backend contract.
     pub fn resizePane(self: *Controller, width: u32, height: u32) !void {
         _ = self;

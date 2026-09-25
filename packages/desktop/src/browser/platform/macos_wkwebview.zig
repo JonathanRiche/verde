@@ -17,6 +17,7 @@ const EventKind = enum(c_int) {
     js_message = 6,
     eval_result = 7,
     failed = 8,
+    cookies_imported = 12,
 };
 
 extern fn verde_macos_webview_create(ns_window: ?*anyopaque) ?*anyopaque;
@@ -29,6 +30,7 @@ extern fn verde_macos_webview_navigate(handle: ?*anyopaque, url: [*:0]const u8) 
 extern fn verde_macos_webview_eval(handle: ?*anyopaque, js: [*:0]const u8) c_int;
 extern fn verde_macos_webview_post_json(handle: ?*anyopaque, json: [*:0]const u8) c_int;
 extern fn verde_macos_webview_go_back(handle: ?*anyopaque) c_int;
+extern fn verde_macos_webview_import_cookies(handle: ?*anyopaque, json: [*:0]const u8) c_int;
 extern fn verde_macos_webview_go_forward(handle: ?*anyopaque) c_int;
 extern fn verde_macos_webview_reload(handle: ?*anyopaque) c_int;
 extern fn verde_macos_webview_focus(handle: ?*anyopaque) c_int;
@@ -167,6 +169,13 @@ pub const Controller = struct {
         if (verde_macos_webview_go_back(handle) == 0) return error.BrowserUnavailable;
     }
 
+    pub fn importCookies(self: *Controller, json: []const u8) !void {
+        const handle = try self.ensureWebView();
+        const z = try self.allocator.dupeZ(u8, json);
+        defer self.allocator.free(z);
+        if (verde_macos_webview_import_cookies(handle, z.ptr) == 0) return error.EvalFailed;
+    }
+
     pub fn goForward(self: *Controller) !void {
         const handle = try self.ensureWebView();
         if (verde_macos_webview_go_forward(handle) == 0) return error.BrowserUnavailable;
@@ -248,6 +257,7 @@ pub const Controller = struct {
             .document_loaded => .document_loaded,
             .js_message => .{ .js_message = self.allocator.dupe(u8, payload) catch return null },
             .eval_result => .{ .eval_result = self.allocator.dupe(u8, payload) catch return null },
+            .cookies_imported => .{ .cookies_imported = std.fmt.parseUnsigned(u32, payload, 10) catch 0 },
             .failed => .{ .failed = self.allocator.dupe(u8, payload) catch return null },
         };
     }

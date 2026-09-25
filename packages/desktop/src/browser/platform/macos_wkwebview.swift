@@ -11,6 +11,7 @@ private enum VerdeMacBrowserEventKind: Int32 {
     case jsMessage = 6
     case evalResult = 7
     case failed = 8
+    case cookiesImported = 12
 }
 
 private final class VerdeMacBrowserEvent {
@@ -219,6 +220,41 @@ private final class VerdeMacBrowser: NSObject, WKScriptMessageHandler, WKNavigat
         webView.evaluateJavaScript(script) { [weak self] _, error in
             guard let self, !self.invalidated, let error else { return }
             self.queueEvent(.failed, payload: error.localizedDescription)
+        }
+    }
+
+    func importCookies(_ json: String) {
+        guard let data = json.data(using: .utf8),
+              let array = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else {
+            self.queueEvent(.cookiesImported, payload: "0")
+            return
+        }
+        let store = webView.configuration.websiteDataStore.httpCookieStore
+        var added = 0
+        let group = DispatchGroup()
+        for entry in array {
+            guard let name = entry["name"] as? String,
+                  let value = entry["value"] as? String,
+                  let host = entry["host"] as? String else { continue }
+            let path = (entry["path"] as? String) ?? "/"
+            var props: [HTTPCookiePropertyKey: Any] = [
+                .name: name,
+                .value: value,
+                .domain: host,
+                .path: path,
+            ]
+            if let secure = entry["secure"] as? Bool, secure { props[.secure] = "TRUE" }
+            if let expires = entry["expires_unix"] as? NSNumber, expires.doubleValue > 0 {
+                props[.expires] = Date(timeIntervalSince1970: expires.doubleValue)
+            }
+            guard let cookie = HTTPCookie(properties: props) else { continue }
+            added += 1
+            group.enter()
+            store.setCookie(cookie) { group.leave() }
+        }
+        let count = added
+        group.notify(queue: .main) { [weak self] in
+            self?.queueEvent(.cookiesImported, payload: String(count))
         }
     }
 
@@ -526,6 +562,15 @@ public func verde_macos_webview_post_json(_ handle: UnsafeMutableRawPointer?, _ 
     onMain {
         guard let browser = browserFromOpaque(handle), let json else { return 0 }
         browser.postJson(stringFromCString(json))
+        return 1
+    }
+}
+
+@_cdecl("verde_macos_webview_import_cookies")
+public func verde_macos_webview_import_cookies(_ handle: UnsafeMutableRawPointer?, _ json: UnsafePointer<CChar>?) -> Int32 {
+    onMain {
+        guard let browser = browserFromOpaque(handle), let json else { return 0 }
+        browser.importCookies(stringFromCString(json))
         return 1
     }
 }

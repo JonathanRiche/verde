@@ -113,6 +113,7 @@ pub const Event = union(enum) {
     eval_result: []u8,
     context_menu: []u8,
     context_menu_dismissed,
+    cookies_imported: u32,
     failed: []u8,
 
     /// Releases any heap-allocated payloads carried by the event.

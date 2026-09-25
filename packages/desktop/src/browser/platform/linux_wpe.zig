@@ -784,6 +784,13 @@ pub const Controller = struct {
         try self.sendCommand(.{ .kind = .go_forward });
     }
 
+    /// Imports cookies into the shared network session via the helper. The JSON
+    /// payload is an array of cookie objects; values are never logged. Sent
+    /// regardless of presentation mode since the helper owns the cookie store.
+    pub fn importCookies(self: *Controller, json: []const u8) !void {
+        try self.sendCommand(.{ .kind = .import_cookies, .payload = json });
+    }
+
     /// Reloads the helper page using WPE WebKit navigation.
     pub fn reload(self: *Controller) !void {
         if (waylandSubsurfaceEnabled()) return;
@@ -1138,6 +1145,7 @@ fn commandWakesFrame(kind: ipc.CommandKind) bool {
         .key_input,
         .text_input,
         .context_menu_activate,
+        .import_cookies,
         => true,
         .hide, .set_host_window, .blur, .context_menu_dismiss, .frame_release, .quit => false,
     };
@@ -1265,6 +1273,7 @@ fn convertHelperEvent(allocator: std.mem.Allocator, event: ipc.Event) !browser_t
         .context_menu => .{ .context_menu = try allocator.dupe(u8, event.payload orelse "{}") },
         .context_menu_dismissed => .context_menu_dismissed,
         .cursor_changed => .{ .cursor_changed = browser_types.CursorShape.parse(event.payload orelse "default") },
+        .cookies_imported => .{ .cookies_imported = std.fmt.parseUnsigned(u32, event.payload orelse "0", 10) catch 0 },
         .failed => .{ .failed = try allocator.dupe(u8, event.payload orelse "Linux browser helper failed.") },
         .frame_ready => unreachable,
     };

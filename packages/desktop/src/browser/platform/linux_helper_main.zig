@@ -31,6 +31,18 @@ extern fn verde_browser_linux_key_input(browser: ?*RawBrowser, key_code: c_uint,
 extern fn verde_browser_linux_text_input(browser: ?*RawBrowser, text: [*:0]const u8, modifiers: c_uint) c_int;
 extern fn verde_browser_linux_context_menu_activate(browser: ?*RawBrowser, index: c_uint) c_int;
 extern fn verde_browser_linux_context_menu_dismiss(browser: ?*RawBrowser) c_int;
+extern fn verde_browser_linux_add_cookie(
+    browser: ?*RawBrowser,
+    name: [*:0]const u8,
+    value: [*:0]const u8,
+    domain: [*:0]const u8,
+    path: [*:0]const u8,
+    expires_unix: i64,
+    secure: c_int,
+    http_only: c_int,
+    same_site: c_int,
+) c_int;
+extern fn verde_browser_linux_queue_cookies_imported(browser: ?*RawBrowser, count: c_int) void;
 extern fn verde_browser_linux_poll_event(browser: ?*RawBrowser, kind: *c_int, payload: *?[*:0]u8) c_int;
 extern fn verde_browser_linux_poll_frame(browser: ?*RawBrowser, path: *?[*:0]u8, sequence: *u64, slot: *c_int, width: *c_int, height: *c_int, byte_len: *usize, exported_at_ns: *u64, published_at_ns: *u64) c_int;
 extern fn verde_browser_linux_release_frame_slot(browser: ?*RawBrowser, slot: c_uint, sequence: u64) c_int;
@@ -339,6 +351,11 @@ fn applyCommand(allocator: std.mem.Allocator, browser: *RawBrowser, command: ipc
         },
         .context_menu_dismiss => _ = verde_browser_linux_context_menu_dismiss(browser),
         .frame_release => _ = verde_browser_linux_release_frame_slot(browser, command.frame_slot, command.frame_sequence),
+        .import_cookies => {
+            const payload = command.payload orelse return true;
+            const imported = importCookies(allocator, browser, payload);
+            verde_browser_linux_queue_cookies_imported(browser, imported);
+        },
         .quit => return false,
     }
     return true;
@@ -420,6 +437,77 @@ fn flushBrowserFrames(
     return count;
 }
 
+/// Parses a JSON cookie array (from the desktop app) and injects each cookie
+/// into the shared network session via the C shim. Returns the count added.
+/// Cookie names/values are never logged.
+fn importCookies(allocator: std.mem.Allocator, browser: *RawBrowser, payload: []const u8) c_int {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch return -1;
+    defer parsed.deinit();
+    if (parsed.value != .array) return -1;
+    var added: c_int = 0;
+    for (parsed.value.array.items) |item| {
+        if (item != .object) continue;
+        const obj = item.object;
+        const host = jsonStr(obj.get("host")) orelse continue;
+        const name = jsonStr(obj.get("name")) orelse continue;
+        const value = jsonStr(obj.get("value")) orelse continue;
+        const path = jsonStr(obj.get("path")) orelse "/";
+        const expires_unix = jsonInt(obj.get("expires_unix")) orelse 0;
+        const secure = jsonBool(obj.get("secure"));
+        const http_only = jsonBool(obj.get("http_only"));
+        const same_site: i64 = jsonInt(obj.get("same_site")) orelse -1;
+
+        const host_z = allocator.dupeZ(u8, host) catch continue;
+        defer allocator.free(host_z);
+        const name_z = allocator.dupeZ(u8, name) catch continue;
+        defer allocator.free(name_z);
+        const value_z = allocator.dupeZ(u8, value) catch continue;
+        defer allocator.free(value_z);
+        const path_z = allocator.dupeZ(u8, path) catch continue;
+        defer allocator.free(path_z);
+
+        const rc = verde_browser_linux_add_cookie(
+            browser,
+            name_z,
+            value_z,
+            host_z,
+            path_z,
+            expires_unix,
+            if (secure) 1 else 0,
+            if (http_only) 1 else 0,
+            @intCast(same_site),
+        );
+        if (rc == 0) added += 1;
+    }
+    return added;
+}
+
+fn jsonStr(value: ?std.json.Value) ?[]const u8 {
+    const v = value orelse return null;
+    return switch (v) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+fn jsonInt(value: ?std.json.Value) ?i64 {
+    const v = value orelse return null;
+    return switch (v) {
+        .integer => |i| i,
+        .float => |fl| @intFromFloat(fl),
+        else => null,
+    };
+}
+
+fn jsonBool(value: ?std.json.Value) bool {
+    const v = value orelse return false;
+    return switch (v) {
+        .bool => |b| b,
+        .integer => |i| i != 0,
+        else => false,
+    };
+}
+
 /// Maps the C helper event code into the shared JSON protocol enum.
 fn mapEventKind(raw_kind: c_int) ipc.EventKind {
     return switch (raw_kind) {
@@ -433,6 +521,7 @@ fn mapEventKind(raw_kind: c_int) ipc.EventKind {
         9 => .context_menu,
         10 => .context_menu_dismissed,
         11 => .cursor_changed,
+        12 => .cookies_imported,
         else => .failed,
     };
 }

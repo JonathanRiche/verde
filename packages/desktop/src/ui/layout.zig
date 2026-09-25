@@ -18,6 +18,7 @@ const command_palette = @import("command_palette.zig");
 const companion = @import("companion.zig");
 const handoff_sheet = @import("handoff_sheet.zig");
 const companion_controller = @import("../state/companion_controller.zig");
+const cookie_import_controller = @import("../state/cookie_import_controller.zig");
 const profiler = @import("../runtime/profiler.zig");
 const app_config = @import("../app/config.zig");
 
@@ -83,6 +84,7 @@ pub fn refreshPaletteModalHits(state: *runtime.AppState, width: f32, height: f32
     registerWorkspaceAddModalHits(state, width, height);
     registerWorkspaceRenameModalHits(state, width, height);
     registerThreadImportModalHits(state, width, height);
+    registerCookieImportModalHits(state, width, height);
     settings_modal.registerHits(state, width, height, queueModalHit);
     registerWorkspaceSettingsModalHits(state, width, height);
     registerRuntimeWizardModalHits(state, width, height);
@@ -213,6 +215,7 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     renderWorkspaceAddModal(state, width, height);
     renderWorkspaceRenameModal(state, width, height);
     renderThreadImportModal(state, width, height);
+    renderCookieImportModal(state, width, height);
     renderProviderOnboardingModal(state, width, height);
     renderMcpOnboardingModal(state, width, height);
     settings_modal.render(state, width, height);
@@ -1319,6 +1322,7 @@ fn focusedCursorReadOnly(state: *runtime.AppState) usize {
     return switch (state.palette_modal_text_focus) {
         .project_rename => state.project_rename_cursor,
         .thread_import => state.thread_import_cursor,
+        .cookie_import_search => state.cookie_import.search_cursor,
         .project_import_name => state.project_import_name_cursor,
         .project_import => state.project_import_cursor,
         .runtime_credential => state.runtime_credential_token_cursor,
@@ -1415,6 +1419,7 @@ fn focusedValue(state: *runtime.AppState) []const u8 {
     return switch (state.palette_modal_text_focus) {
         .project_rename => state.renameInput(),
         .thread_import => state.threadImportThreadId(),
+        .cookie_import_search => state.cookie_import.searchQuery(),
         .project_import_name => state.importProjectNameDraft(),
         .project_import => state.importDirectoryDraft(),
         .runtime_credential => state.runtimeCredentialToken(),
@@ -1597,6 +1602,10 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .thread_import_cancel => state.cancelThreadImport(),
             .thread_import_submit => state.importSelectedThread(),
             .thread_import_select => state.selectThreadImport(hit.index),
+            .cookie_import_source_select => state.selectCookieImportSource(hit.index),
+            .cookie_import_domain_toggle => state.toggleCookieImportDomain(hit.index),
+            .cookie_import_cancel => state.cancelCookieImport(),
+            .cookie_import_submit => state.submitCookieImport(),
             .handoff_cancel => state.cancelHandoff(),
             .handoff_prepare => state.prepareHandoffTarget(),
             .handoff_menu_toggle => handoff_sheet.toggleMenu(state, hit.index),
@@ -1705,6 +1714,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             },
             .project_rename_input => focusModalInput(state, .project_rename, hit.rect, x, clicks),
             .thread_import_input => focusModalInput(state, .thread_import, hit.rect, x, clicks),
+            .cookie_import_search_input => focusModalInput(state, .cookie_import_search, hit.rect, x, clicks),
             .project_import_name_input => focusModalInput(state, .project_import_name, hit.rect, x, clicks),
             .project_import_input => focusModalInput(state, .project_import, hit.rect, x, clicks),
             .command_palette_input => focusModalInput(state, .command_palette, hit.rect, x, clicks),
@@ -1787,6 +1797,7 @@ pub fn handlePaletteTextInput(state: *runtime.AppState, text: []const u8) bool {
     return switch (state.palette_modal_text_focus) {
         .project_rename => insertIntoZBuffer(state.renameBuffer(), &state.project_rename_cursor, text),
         .thread_import => insertIntoZBuffer(state.threadImportThreadIdBuffer(), &state.thread_import_cursor, text),
+        .cookie_import_search => insertIntoZBuffer(state.cookie_import.searchBuffer(), &state.cookie_import.search_cursor, text),
         .project_import_name => insertIntoZBuffer(state.importProjectNameBuffer(), &state.project_import_name_cursor, text),
         .project_import => insertIntoZBuffer(state.importPathBuffer(), &state.project_import_cursor, text),
         .runtime_credential => unreachable,
@@ -1851,6 +1862,7 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
         state.rename_project_index != null or
         state.transcriptSelectionBuffer() != null or
         state.thread_import_provider != null or
+        state.cookie_import.open or
         state.handoff_controller.sheet_open or
         state.project_controller.show_creator or
         state.settings_controller.modal_visible or
@@ -1935,6 +1947,10 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
             }
             if (state.palette_modal_text_focus == .thread_import) {
                 state.importSelectedThread();
+                return true;
+            }
+            if (state.cookie_import.open) {
+                state.submitCookieImport();
                 return true;
             }
             if (state.palette_modal_text_focus == .project_import or state.palette_modal_text_focus == .project_import_name) {
@@ -2055,6 +2071,8 @@ fn dismissTopModal(state: *runtime.AppState) void {
         state.cancelProjectRename();
     } else if (state.thread_import_provider != null) {
         state.cancelThreadImport();
+    } else if (state.cookie_import.open) {
+        state.cancelCookieImport();
     } else if (state.handoff_controller.sheet_open) {
         if (state.handoff_controller.menu != null) {
             state.setHandoffMenu(null);
@@ -2131,6 +2149,7 @@ fn focusedCursor(state: *runtime.AppState) ?*usize {
     return switch (state.palette_modal_text_focus) {
         .project_rename => &state.project_rename_cursor,
         .thread_import => &state.thread_import_cursor,
+        .cookie_import_search => &state.cookie_import.search_cursor,
         .project_import_name => &state.project_import_name_cursor,
         .project_import => &state.project_import_cursor,
         .runtime_credential => &state.runtime_credential_token_cursor,
@@ -2152,6 +2171,7 @@ fn focusedBuffer(state: *runtime.AppState) ?[:0]u8 {
     return switch (state.palette_modal_text_focus) {
         .project_rename => state.renameBuffer(),
         .thread_import => state.threadImportThreadIdBuffer(),
+        .cookie_import_search => state.cookie_import.searchBuffer(),
         .project_import_name => state.importProjectNameBuffer(),
         .project_import => state.importPathBuffer(),
         .runtime_credential => state.runtimeCredentialTokenBuffer(),
@@ -2173,6 +2193,7 @@ fn focusedTextLen(state: *runtime.AppState) usize {
     return switch (state.palette_modal_text_focus) {
         .project_rename => state.renameInput().len,
         .thread_import => state.threadImportThreadId().len,
+        .cookie_import_search => state.cookie_import.searchQuery().len,
         .project_import_name => state.importProjectNameDraft().len,
         .project_import => state.importDirectoryDraft().len,
         .runtime_credential => state.runtimeCredentialToken().len,
@@ -3712,4 +3733,197 @@ test "runtime wizard fields honor the modal text-input contract and port filteri
     state.runtime_connections.gateway_port_cursor = 4;
     try std.testing.expect(deleteModalText(&state, true));
     try std.testing.expectEqualStrings("678", state.runtime_connections.fieldValue(.gateway_port));
+}
+
+// ---------------------------------------------------------------------------
+// Browser "Import cookies…" modal (per-site, agent-safety gated)
+// ---------------------------------------------------------------------------
+
+const CookieImportGeometry = struct {
+    modal: palette.Rect,
+    warning: palette.Rect,
+    source_list: palette.Rect,
+    search: palette.Rect,
+    domain_list: palette.Rect,
+    cancel: palette.Rect,
+    submit: palette.Rect,
+    row_h: f32,
+    source_row_h: f32,
+};
+
+fn cookieImportGeometry(width: f32, height: f32) CookieImportGeometry {
+    const modal_w = theme.clampf(width * 0.44, theme.scaledUi(480.0), theme.scaledUi(660.0));
+    const modal_h = theme.clampf(height * 0.72, theme.scaledUi(460.0), theme.scaledUi(660.0));
+    const modal: palette.Rect = .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
+    const pad = theme.scaledUi(18.0);
+    const inner_w = modal.w - pad * 2.0;
+    var y = modal.y + pad + theme.scaledUi(26.0); // heading
+    const warning: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = inner_w, .h = theme.scaledUi(36.0) };
+    y += theme.scaledUi(42.0);
+    const source_list: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = inner_w, .h = theme.scaledUi(96.0) };
+    y += source_list.h + theme.scaledUi(10.0);
+    const search: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = inner_w, .h = theme.scaledUi(32.0) };
+    y += search.h + theme.scaledUi(10.0);
+    const button_h = theme.scaledUi(34.0);
+    const button_y = modal.y + modal.h - pad - button_h;
+    const domain_list: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = inner_w, .h = button_y - theme.scaledUi(12.0) - y };
+    const gap = theme.scaledUi(10.0);
+    const button_w = (inner_w - gap) * 0.5;
+    const cancel: palette.Rect = .{ .x = modal.x + pad, .y = button_y, .w = button_w, .h = button_h };
+    const submit: palette.Rect = .{ .x = cancel.x + button_w + gap, .y = button_y, .w = button_w, .h = button_h };
+    return .{
+        .modal = modal,
+        .warning = warning,
+        .source_list = source_list,
+        .search = search,
+        .domain_list = domain_list,
+        .cancel = cancel,
+        .submit = submit,
+        .row_h = theme.scaledUi(28.0),
+        .source_row_h = theme.scaledUi(28.0),
+    };
+}
+
+fn registerCookieImportModalHits(state: *runtime.AppState, width: f32, height: f32) void {
+    if (!state.cookie_import.open) return;
+    const geo = cookieImportGeometry(width, height);
+    registerModalChromeHits(state, width, height, geo.modal, true);
+
+    // Source rows.
+    for (state.cookie_import.sources.items, 0..) |_, index| {
+        const row: palette.Rect = .{ .x = geo.source_list.x + theme.scaledUi(4.0), .y = geo.source_list.y + theme.scaledUi(4.0) + @as(f32, @floatFromInt(index)) * geo.source_row_h, .w = geo.source_list.w - theme.scaledUi(8.0), .h = geo.source_row_h - theme.scaledUi(2.0) };
+        if (row.y + row.h > geo.source_list.y + geo.source_list.h) break;
+        queueModalHit(state, row, .cookie_import_source_select, index);
+    }
+
+    // Search field (only actionable once a source is chosen, but always hit-registered).
+    queueModalHit(state, geo.search, .cookie_import_search_input, 0);
+
+    // Domain rows (filtered).
+    var visible: usize = 0;
+    for (state.cookie_import.domains.items, 0..) |domain, index| {
+        const query = state.cookie_import.searchQuery();
+        if (query.len != 0 and std.mem.indexOf(u8, domain.domain, query) == null) continue;
+        const row_y = geo.domain_list.y + theme.scaledUi(4.0) + @as(f32, @floatFromInt(visible)) * geo.row_h - state.cookie_import.domain_scroll;
+        visible += 1;
+        if (row_y + geo.row_h < geo.domain_list.y or row_y > geo.domain_list.y + geo.domain_list.h) continue;
+        const row: palette.Rect = .{ .x = geo.domain_list.x + theme.scaledUi(4.0), .y = row_y, .w = geo.domain_list.w - theme.scaledUi(8.0), .h = geo.row_h - theme.scaledUi(2.0) };
+        queueModalHit(state, row, .cookie_import_domain_toggle, index);
+    }
+
+    queueModalHit(state, geo.cancel, .cookie_import_cancel, 0);
+    queueModalHit(state, geo.submit, .cookie_import_submit, 0);
+}
+
+pub fn updateCookieImportModalHover(state: *runtime.AppState, x: f32, y: f32) void {
+    if (!state.cookie_import.open) {
+        if (state.cookie_import.hover_index != null or state.cookie_import.source_hover_index != null) {
+            state.cookie_import.hover_index = null;
+            state.cookie_import.source_hover_index = null;
+            state.markDirty();
+        }
+        return;
+    }
+    var new_domain: ?usize = null;
+    var new_source: ?usize = null;
+    var i = state.palette_modal_hits.items.len;
+    while (i > 0) {
+        i -= 1;
+        const hit = state.palette_modal_hits.items[i];
+        if (!rectContainsModalPoint(hit.rect, x, y)) continue;
+        if (hit.action == .cookie_import_domain_toggle) {
+            new_domain = hit.index;
+            break;
+        } else if (hit.action == .cookie_import_source_select) {
+            new_source = hit.index;
+            break;
+        }
+    }
+    if (state.cookie_import.hover_index != new_domain or state.cookie_import.source_hover_index != new_source) {
+        state.cookie_import.hover_index = new_domain;
+        state.cookie_import.source_hover_index = new_source;
+        state.markDirty();
+    }
+}
+
+pub fn handleCookieImportWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y: f32, wheel_y: f32) bool {
+    if (!state.cookie_import.open) return false;
+    const geo = cookieImportGeometry(width, height);
+    if (!(x >= geo.domain_list.x and x <= geo.domain_list.x + geo.domain_list.w and y >= geo.domain_list.y and y <= geo.domain_list.y + geo.domain_list.h)) return false;
+    const step = theme.scaledUi(48.0);
+    var visible: usize = 0;
+    for (state.cookie_import.domains.items) |domain| {
+        const query = state.cookie_import.searchQuery();
+        if (query.len != 0 and std.mem.indexOf(u8, domain.domain, query) == null) continue;
+        visible += 1;
+    }
+    const content_h = @as(f32, @floatFromInt(visible)) * geo.row_h + theme.scaledUi(8.0);
+    const max_scroll = @max(0.0, content_h - geo.domain_list.h);
+    state.cookie_import.domain_scroll = std.math.clamp(state.cookie_import.domain_scroll - wheel_y * step, 0.0, max_scroll);
+    state.markDirty();
+    return true;
+}
+
+fn renderCookieImportModal(state: *runtime.AppState, width: f32, height: f32) void {
+    if (!state.cookie_import.open) return;
+    const geo = cookieImportGeometry(width, height);
+    drawModalChromeVisual(state, width, height, geo.modal);
+    const pad = theme.scaledUi(18.0);
+    const modal = geo.modal;
+
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = modal.y + pad, .w = modal.w - pad * 2.0, .h = theme.scaledUi(24.0) }, "Import cookies from another browser", paletteColor(theme.COLOR_WHITE), theme.scaledUi(17.0), modal);
+    queuePaletteText(state, geo.warning, cookie_import_controller.AGENT_WARNING, paletteColor(theme.COLOR_YELLOW), theme.scaledUi(12.5), modal);
+
+    // Source list.
+    queuePaletteRoundedRect(state, geo.source_list, paletteColor(theme.sink(theme.COLOR_PANEL_ALT, 0.03)), theme.scaledUi(8.0));
+    queuePaletteBorder(state, geo.source_list, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0), theme.scaledUi(1.0));
+    if (state.cookie_import.sources.items.len == 0) {
+        queuePaletteText(state, .{ .x = geo.source_list.x + theme.scaledUi(10.0), .y = geo.source_list.y + theme.scaledUi(10.0), .w = geo.source_list.w - theme.scaledUi(20.0), .h = theme.scaledUi(20.0) }, "Searching for installed browsers…", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), geo.source_list);
+    } else {
+        for (state.cookie_import.sources.items, 0..) |source, index| {
+            const row: palette.Rect = .{ .x = geo.source_list.x + theme.scaledUi(4.0), .y = geo.source_list.y + theme.scaledUi(4.0) + @as(f32, @floatFromInt(index)) * geo.source_row_h, .w = geo.source_list.w - theme.scaledUi(8.0), .h = geo.source_row_h - theme.scaledUi(2.0) };
+            if (row.y + row.h > geo.source_list.y + geo.source_list.h) break;
+            const selected = state.cookie_import.selected_source_index != null and state.cookie_import.selected_source_index.? == index;
+            const hovered = state.cookie_import.source_hover_index != null and state.cookie_import.source_hover_index.? == index;
+            if (selected) {
+                queuePaletteRoundedRect(state, row, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(6.0));
+            } else if (hovered) {
+                queuePaletteRoundedRect(state, row, paletteColor(theme.raise(theme.COLOR_PANEL_MUTED, 0.06)), theme.scaledUi(6.0));
+            }
+            const mark = if (selected) "\xE2\x97\x89 " else "";
+            var label_buf: [192]u8 = undefined;
+            const label = std.fmt.bufPrint(&label_buf, "{s}{s}", .{ mark, source.label }) catch source.label;
+            queuePaletteText(state, .{ .x = row.x + theme.scaledUi(8.0), .y = row.y + theme.scaledUi(5.0), .w = row.w - theme.scaledUi(16.0), .h = theme.scaledUi(18.0) }, label, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), row);
+        }
+    }
+
+    // Search field.
+    drawTextField(state, geo.search, state.cookie_import.searchQuery(), "Filter sites…", state.palette_modal_text_focus == .cookie_import_search, state.cookie_import.search_cursor);
+
+    // Domain list.
+    queuePaletteRoundedRect(state, geo.domain_list, paletteColor(theme.sink(theme.COLOR_PANEL_ALT, 0.03)), theme.scaledUi(8.0));
+    queuePaletteBorder(state, geo.domain_list, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0), theme.scaledUi(1.0));
+    if (state.cookie_import.selected_source_index == null) {
+        queuePaletteText(state, .{ .x = geo.domain_list.x + theme.scaledUi(12.0), .y = geo.domain_list.y + theme.scaledUi(12.0), .w = geo.domain_list.w - theme.scaledUi(24.0), .h = theme.scaledUi(20.0) }, "Pick a browser above to see its sites.", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), geo.domain_list);
+    } else {
+        var visible: usize = 0;
+        for (state.cookie_import.domains.items, 0..) |domain, index| {
+            const query = state.cookie_import.searchQuery();
+            if (query.len != 0 and std.mem.indexOf(u8, domain.domain, query) == null) continue;
+            const row_y = geo.domain_list.y + theme.scaledUi(4.0) + @as(f32, @floatFromInt(visible)) * geo.row_h - state.cookie_import.domain_scroll;
+            visible += 1;
+            if (row_y + geo.row_h < geo.domain_list.y or row_y > geo.domain_list.y + geo.domain_list.h) continue;
+            const row: palette.Rect = .{ .x = geo.domain_list.x + theme.scaledUi(4.0), .y = row_y, .w = geo.domain_list.w - theme.scaledUi(8.0), .h = geo.row_h - theme.scaledUi(2.0) };
+            const hovered = state.cookie_import.hover_index != null and state.cookie_import.hover_index.? == index;
+            if (hovered) queuePaletteRoundedRect(state, row, paletteColor(theme.raise(theme.COLOR_PANEL_MUTED, 0.06)), theme.scaledUi(6.0));
+            const check = if (domain.selected) "\xE2\x9C\x93 " else "  ";
+            var line_buf: [256]u8 = undefined;
+            const line = std.fmt.bufPrint(&line_buf, "{s}{s}  ({d})", .{ check, domain.domain, domain.count }) catch domain.domain;
+            const col = if (domain.selected) theme.COLOR_GREEN else theme.COLOR_WHITE;
+            queuePaletteText(state, .{ .x = row.x + theme.scaledUi(8.0), .y = row.y + theme.scaledUi(5.0), .w = row.w - theme.scaledUi(16.0), .h = theme.scaledUi(18.0) }, line, paletteColor(col), theme.scaledUi(13.0), row);
+        }
+    }
+
+    drawActionButton(state, geo.cancel, "Cancel", theme.COLOR_PANEL_MUTED);
+    drawActionButton(state, geo.submit, "Import selected", theme.COLOR_GREEN);
 }

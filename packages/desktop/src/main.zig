@@ -613,6 +613,7 @@ fn mainInner(init: std.process.Init) !void {
                 app_state.pollGrokModelOptionsCache();
                 app_state.pollMuseModelOptionsCache();
                 app_state.pollProviderReadiness();
+                app_state.pollCookieImport();
                 app_state.pollUpdateCheck();
             }
         }.run, .{&state});
@@ -2294,6 +2295,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             }
             state.notePaletteWorkspaceMouseMotion(event.motion.x, event.motion.y);
             ui_layout.updateThreadImportModalHover(state, event.motion.x, event.motion.y);
+            ui_layout.updateCookieImportModalHover(state, event.motion.x, event.motion.y);
             ui_layout.updateSettingsModalHover(state, event.motion.x, event.motion.y);
             ui_layout.updateCommandPaletteHover(state, event.motion.x, event.motion.y);
             const modal_owns_motion = ui_layout.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
@@ -2529,6 +2531,16 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             var input_fb_h: c_int = 0;
             getWindowSizeInPixels(window, &input_fb_w, &input_fb_h);
             if (ui_layout.handleCommandPaletteWheel(
+                state,
+                @floatFromInt(input_fb_w),
+                @floatFromInt(input_fb_h),
+                event.wheel.mouse_x,
+                event.wheel.mouse_y,
+                event.wheel.y,
+            )) {
+                return true;
+            }
+            if (ui_layout.handleCookieImportWheel(
                 state,
                 @floatFromInt(input_fb_w),
                 @floatFromInt(input_fb_h),

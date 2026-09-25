@@ -18,6 +18,7 @@
 #include <wpe/fdo.h>
 #include <wpe/fdo-egl.h>
 #include <wpe/webkit.h>
+#include <libsoup/soup.h>
 
 #define VERDE_BROWSER_LINUX_FRAME_SLOT_COUNT 3
 #define VERDE_BROWSER_LINUX_FRAME_BYTES_MAX (4096u * 2160u * 4u)
@@ -48,6 +49,7 @@ enum verde_browser_linux_event_kind {
     VERDE_BROWSER_LINUX_EVENT_CONTEXT_MENU = 9,
     VERDE_BROWSER_LINUX_EVENT_CONTEXT_MENU_DISMISSED = 10,
     VERDE_BROWSER_LINUX_EVENT_CURSOR_CHANGED = 11,
+    VERDE_BROWSER_LINUX_EVENT_COOKIES_IMPORTED = 12,
 };
 
 enum verde_browser_linux_modifier_bits {
@@ -1499,6 +1501,58 @@ static WebKitNetworkSession *verde_browser_linux_network_session(void) {
     g_free(cache_dir);
     g_free(data_dir);
     return session;
+}
+
+// Injects a single cookie into the shared network session's cookie store.
+// Cookie names/values are never logged. Returns 0 on dispatch, -1 on bad args.
+// The `browser` argument is unused: all panes share one network session so the
+// import is visible everywhere.
+int verde_browser_linux_add_cookie(
+    struct verde_browser_linux *browser,
+    const char *name,
+    const char *value,
+    const char *domain,
+    const char *path,
+    int64_t expires_unix,
+    int secure,
+    int http_only,
+    int same_site) {
+    (void)browser;
+    if (name == NULL || value == NULL || domain == NULL) return -1;
+    const char *cookie_path = (path != NULL && path[0] != '\0') ? path : "/";
+
+    SoupCookie *cookie = soup_cookie_new(name, value, domain, cookie_path, -1);
+    if (cookie == NULL) return -1;
+    if (expires_unix > 0) {
+        GDateTime *expires = g_date_time_new_from_unix_utc(expires_unix);
+        if (expires != NULL) {
+            soup_cookie_set_expires(cookie, expires);
+            g_date_time_unref(expires);
+        }
+    }
+    soup_cookie_set_secure(cookie, secure != 0);
+    soup_cookie_set_http_only(cookie, http_only != 0);
+    SoupSameSitePolicy policy = SOUP_SAME_SITE_POLICY_LAX;
+    switch (same_site) {
+        case 0: policy = SOUP_SAME_SITE_POLICY_NONE; break;
+        case 1: policy = SOUP_SAME_SITE_POLICY_LAX; break;
+        case 2: policy = SOUP_SAME_SITE_POLICY_STRICT; break;
+        default: policy = SOUP_SAME_SITE_POLICY_LAX; break;
+    }
+    soup_cookie_set_same_site_policy(cookie, policy);
+
+    WebKitCookieManager *manager =
+        webkit_network_session_get_cookie_manager(verde_browser_linux_network_session());
+    webkit_cookie_manager_add_cookie(manager, cookie, NULL, NULL, NULL);
+    soup_cookie_free(cookie);
+    return 0;
+}
+
+// Queues the completion event carrying the number of imported cookies.
+void verde_browser_linux_queue_cookies_imported(struct verde_browser_linux *browser, int count) {
+    char payload[32];
+    snprintf(payload, sizeof(payload), "%d", count);
+    verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_COOKIES_IMPORTED, payload);
 }
 
 

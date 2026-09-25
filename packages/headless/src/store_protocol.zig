@@ -39,6 +39,9 @@ pub const METHOD_WORKSPACE_REPOSITORY_MANIFEST_GET: []const u8 =
 /// route. Clients send `{workspace_id, repository_id?, relative_cwd?, query,
 /// limit?}`; results are root-relative paths only.
 pub const METHOD_WORKSPACE_FILES_SEARCH: []const u8 = "workspace.files.search";
+pub const METHOD_BROWSER_COOKIE_SOURCES_LIST: []const u8 = "browser.cookies.sources.list";
+pub const METHOD_BROWSER_COOKIE_DOMAINS_LIST: []const u8 = "browser.cookies.domains.list";
+pub const METHOD_BROWSER_COOKIE_EXPORT: []const u8 = "browser.cookies.export";
 pub const METHOD_WORKSPACE_REPOSITORY_UPSERT: []const u8 =
     "workspace.repository.upsert";
 pub const METHOD_WORKSPACE_REPOSITORY_REMOVE: []const u8 =
