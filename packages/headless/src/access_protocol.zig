@@ -326,6 +326,11 @@ pub const PAIRED_RPC_METHODS = [_]PairedRpcMethod{
     .{ .method = "workspace.repository.binding.upsert", .scope_mask = REPOSITORY_WRITE },
     .{ .method = "workspace.repository.binding.remove", .scope_mask = REPOSITORY_WRITE },
 
+    // Push registration is bound to the authenticated device by the gateway.
+    .{ .method = "device.push.register", .scope_mask = scopeBit(.device_write) },
+    .{ .method = "device.push.unregister", .scope_mask = scopeBit(.device_write) },
+    .{ .method = "device.push.test", .scope_mask = scopeBit(.device_write) },
+
     // Managed processes run arbitrary project commands, so they sit behind
     // their own opt-in scopes rather than terminal or repository authority.
     .{ .method = "process.list", .scope_mask = PROCESS_READ },
@@ -834,4 +839,12 @@ test "pair exchange accepts only canonical optional client nonces" {
         try std.testing.expectError(error.InvalidGrantId, parsePairingGrantExchangeRequest(std.testing.allocator, body));
     }
     try std.testing.expectError(error.DuplicateField, parsePairingGrantExchangeRequest(std.testing.allocator, prefix ++ ",\"client_nonce\":null,\"client_nonce\":null}"));
+}
+
+test "push RPCs require the opt-in device write scope" {
+    for ([_][]const u8{ "device.push.register", "device.push.unregister", "device.push.test" }) |method| {
+        try std.testing.expectEqual(@as(?u16, scopeBit(.device_write)), requiredScopeMaskForRpc(method));
+        try std.testing.expect((try scopeMask(&DEFAULT_SCOPE_NAMES)) & requiredScopeMaskForRpc(method).? == 0);
+    }
+    try std.testing.expect(requiredScopeMaskForRpc("device.push.unknown") == null);
 }

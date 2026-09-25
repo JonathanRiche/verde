@@ -26,6 +26,22 @@ pub const Manager = struct {
         defer parsed.deinit();
         const root = &parsed.value.object;
         const method = root.get("method").?.string;
+        if (std.mem.eql(u8, method, "device.push.register") or
+            std.mem.eql(u8, method, "device.push.unregister") or
+            std.mem.eql(u8, method, "device.push.test"))
+        {
+            // The private daemon trusts only the gateway's authenticated device
+            // identity. Never allow a paired caller to select another phone.
+            const arena = parsed.arena.allocator();
+            if (!root.contains("params") or root.get("params").? == .null)
+                try root.put(arena, "params", .{ .object = .empty });
+            const params = root.getPtr("params").?;
+            if (params.* != .object) return (try daemon.callRaw(raw)).json;
+            try params.object.put(arena, "device_id", .{ .string = &claims.device_id });
+            const encoded = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
+            defer allocator.free(encoded);
+            return (try daemon.callRaw(encoded)).json;
+        }
         // Unknown fields and object key order are not part of a runtime identity.
         // Let the daemon report malformed envelopes without creating a cache slot.
         const target: ?protocol.RequestTarget = if (root.get("target")) |value|
@@ -341,4 +357,31 @@ test "paired shutdown cleanup cancels an unresponsive daemon within its deadline
     try std.testing.expectEqual(@as(usize, 1), manager.entries[0].len);
     try std.testing.expectEqual(@as(usize, 1), manager.entries[1].len);
     try std.testing.expectEqual(@as(i64, 0), manager.entries[1].deadline_ms);
+}
+
+test "push RPC forwarding binds every operation to the authenticated device" {
+    const FakeDaemon = struct {
+        pub fn callRaw(_: *@This(), raw: []const u8) !struct { json: []u8 } {
+            return .{ .json = try std.testing.allocator.dupe(u8, raw) };
+        }
+    };
+    const a = std.testing.allocator;
+    var manager: Manager = .{};
+    var daemon: FakeDaemon = .{};
+    const claims: auth.PairClaims = .{ .device_id = @splat('a'), .scope_mask = access.scopeBit(.device_write), .deadline_ms = auth.nowMillis(std.testing.io) + 60000 };
+    for ([_][]const u8{ "device.push.register", "device.push.unregister", "device.push.test" }) |method| {
+        const raw = try std.json.Stringify.valueAlloc(a, .{ .id = 1, .method = method, .params = .{ .device_id = "forged-other-phone", .platform = "android", .send_token = "fixture", .public_key = "fixture" } }, .{});
+        defer a.free(raw);
+        const forwarded = try manager.forward(a, std.testing.io, claims, raw, &daemon);
+        defer a.free(forwarded);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, forwarded, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(&claims.device_id, parsed.value.object.get("params").?.object.get("device_id").?.string);
+        try std.testing.expectEqualStrings(method, parsed.value.object.get("method").?.string);
+    }
+    const no_params = try manager.forward(a, std.testing.io, claims, "{\"id\":1,\"method\":\"device.push.unregister\"}", &daemon);
+    defer a.free(no_params);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, no_params, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(&claims.device_id, parsed.value.object.get("params").?.object.get("device_id").?.string);
 }

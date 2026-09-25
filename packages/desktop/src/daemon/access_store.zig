@@ -30,51 +30,98 @@ pub const PruneResult = struct {
 /// capability. Public exchange is enabled only when the gateway enforcement
 /// slice is installed as a whole.
 pub fn initialize(conn: zqlite.Conn) !void {
-    try conn.execNoArgs(
-        \\create table if not exists runtime_pairing_grants (
-        \\    grant_id text primary key check(length(grant_id) = 32),
-        \\    verifier blob not null check(length(verifier) = 32),
-        \\    label text,
-        \\    scopes integer not null check(scopes > 0 and scopes <= 255),
-        \\    created_at_ms integer not null,
-        \\    expires_at_ms integer not null,
-        \\    consumed_at_ms integer,
-        \\    revoked_at_ms integer
-        \\);
-        \\create table if not exists runtime_pairing_retries (
-        \\    grant_id text primary key references runtime_pairing_grants(grant_id) on delete cascade,
-        \\    nonce_hash blob not null check(length(nonce_hash) = 32)
-        \\);
-        \\create table if not exists runtime_devices (
-        \\    device_id text primary key check(length(device_id) = 32),
-        \\    grant_id text not null unique references runtime_pairing_grants(grant_id),
-        \\    credential_verifier blob not null check(length(credential_verifier) = 32),
-        \\    label text not null,
-        \\    scopes integer not null check(scopes > 0 and scopes <= 255),
-        \\    created_at_ms integer not null,
-        \\    last_used_at_ms integer,
-        \\    revoked_at_ms integer
-        \\);
-        \\create table if not exists runtime_connect_devices (
-        \\    device_id text primary key check(length(device_id) = 32),
-        \\    connect_grant_id text not null unique,
-        \\    connect_device_id text not null,
-        \\    device_key_thumbprint text not null,
-        \\    issuer text not null,
-        \\    credential_verifier blob not null check(length(credential_verifier) = 32),
-        \\    label text not null,
-        \\    scopes integer not null check(scopes > 0 and scopes <= 255),
-        \\    created_at_ms integer not null,
-        \\    last_used_at_ms integer,
-        \\    revoked_at_ms integer
-        \\);
-        \\create index if not exists runtime_pairing_grants_created
-        \\    on runtime_pairing_grants(created_at_ms desc);
-        \\create index if not exists runtime_devices_created
-        \\    on runtime_devices(created_at_ms desc);
-        \\create index if not exists runtime_connect_devices_created
-        \\    on runtime_connect_devices(created_at_ms desc);
-    );
+    try conn.execNoArgs(ACCESS_SCHEMA);
+    try migrateScopeConstraints(conn);
+}
+
+const ACCESS_SCHEMA =
+    \\create table if not exists runtime_pairing_grants (
+    \\    grant_id text primary key check(length(grant_id) = 32),
+    \\    verifier blob not null check(length(verifier) = 32),
+    \\    label text,
+    \\    scopes integer not null check(scopes > 0 and scopes <= 2047),
+    \\    created_at_ms integer not null,
+    \\    expires_at_ms integer not null,
+    \\    consumed_at_ms integer,
+    \\    revoked_at_ms integer
+    \\);
+    \\create table if not exists runtime_pairing_retries (
+    \\    grant_id text primary key references runtime_pairing_grants(grant_id) on delete cascade,
+    \\    nonce_hash blob not null check(length(nonce_hash) = 32)
+    \\);
+    \\create table if not exists runtime_devices (
+    \\    device_id text primary key check(length(device_id) = 32),
+    \\    grant_id text not null unique references runtime_pairing_grants(grant_id),
+    \\    credential_verifier blob not null check(length(credential_verifier) = 32),
+    \\    label text not null,
+    \\    scopes integer not null check(scopes > 0 and scopes <= 2047),
+    \\    created_at_ms integer not null,
+    \\    last_used_at_ms integer,
+    \\    revoked_at_ms integer
+    \\);
+    \\create table if not exists runtime_connect_devices (
+    \\    device_id text primary key check(length(device_id) = 32),
+    \\    connect_grant_id text not null unique,
+    \\    connect_device_id text not null,
+    \\    device_key_thumbprint text not null,
+    \\    issuer text not null,
+    \\    credential_verifier blob not null check(length(credential_verifier) = 32),
+    \\    label text not null,
+    \\    scopes integer not null check(scopes > 0 and scopes <= 2047),
+    \\    created_at_ms integer not null,
+    \\    last_used_at_ms integer,
+    \\    revoked_at_ms integer
+    \\);
+    \\create index if not exists runtime_pairing_grants_created
+    \\    on runtime_pairing_grants(created_at_ms desc);
+    \\create index if not exists runtime_devices_created
+    \\    on runtime_devices(created_at_ms desc);
+    \\create index if not exists runtime_connect_devices_created
+    \\    on runtime_connect_devices(created_at_ms desc);
+;
+
+/// SQLite cannot alter CHECK constraints. Rebuild only the three legacy access
+/// tables, preserving stored masks, credentials, ids, and pairing retry hashes.
+fn migrateScopeConstraints(conn: zqlite.Conn) !void {
+    const tables = [_][]const u8{ "runtime_pairing_grants", "runtime_devices", "runtime_connect_devices" };
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var definitions: [tables.len]?[]const u8 = @splat(null);
+    var needed = false;
+    for (tables, 0..) |name, index| {
+        var row = (try conn.row("select sql from sqlite_master where type='table' and name=?1", .{name})).?;
+        defer row.deinit();
+        const sql = row.text(0);
+        if (std.mem.indexOf(u8, sql, "scopes <= 255") == null) continue;
+        const body = std.mem.indexOfScalar(u8, sql, '(') orelse return error.AccessStoreCorrupt;
+        definitions[index] = try std.mem.replaceOwned(u8, allocator, sql[body..], "scopes <= 255", "scopes <= 2047");
+        needed = true;
+    }
+    if (!needed) return;
+    var fk_row = (try conn.row("pragma foreign_keys", .{})).?;
+    const foreign_keys = fk_row.int(0) != 0;
+    fk_row.deinit();
+    // Must happen outside the transaction. Re-enable the caller's enforcement
+    // after commit or rollback; foreign_key_check still runs before commit.
+    try conn.execNoArgs("pragma foreign_keys=off");
+    defer if (foreign_keys) conn.execNoArgs("pragma foreign_keys=on") catch {};
+    try conn.execNoArgs("begin immediate");
+    errdefer conn.rollback();
+    for (tables, definitions) |name, definition| {
+        const body = definition orelse continue;
+        const sql = try std.fmt.allocPrintSentinel(allocator, "create table {s}_scope_upgrade {s}; insert into {s}_scope_upgrade select * from {s}; drop table {s}; alter table {s}_scope_upgrade rename to {s};", .{ name, body, name, name, name, name, name }, 0);
+        try conn.execNoArgs(sql);
+    }
+    // Recreate the indexes dropped with their tables. IF NOT EXISTS also keeps
+    // this safe for mixed databases where only a subset needed migration.
+    try conn.execNoArgs(ACCESS_SCHEMA);
+    if (try conn.row("pragma foreign_key_check", .{})) |result| {
+        var row = result;
+        row.deinit();
+        return error.AccessStoreCorrupt;
+    }
+    try conn.commit();
 }
 
 /// Raw grant material issued exactly once to a local administrator.
@@ -1394,4 +1441,53 @@ test "count pressure evicts only the oldest eligible terminal records" {
         "select 1 from runtime_pairing_grants where grant_id = ?1",
         .{device_grants[0]},
     )) == null);
+}
+
+test "push scope migration preserves legacy credentials retries and masks while accepting opt-in scopes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(std.testing.io, &buffer);
+    const path = try std.fs.path.joinZ(a, &.{ buffer[0..len], "legacy.sqlite" });
+    defer a.free(path);
+    const conn = try zqlite.open(path, zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
+    defer conn.close();
+    try conn.execNoArgs("pragma foreign_keys=on");
+    const legacy_sql = try std.mem.replaceOwned(u8, a, ACCESS_SCHEMA, "scopes <= 2047", "scopes <= 255");
+    defer a.free(legacy_sql);
+    const legacy_z = try a.dupeZ(u8, legacy_sql);
+    defer a.free(legacy_z);
+    try conn.execNoArgs(legacy_z);
+    var grant = try createPairingGrant(std.testing.io, conn, .{ .access_protocol_version = access.ACCESS_PROTOCOL_VERSION, .ttl_seconds = 60, .scopes = &.{"runtime:read"} }, 1000);
+    defer grant.clear();
+    const request: access.PairingGrantExchangeRequest = .{ .access_protocol_version = access.ACCESS_PROTOCOL_VERSION, .grant_id = &grant.grant_id, .pairing_token = .{ .bytes = &grant.pairing_token }, .device_label = "Legacy", .client_nonce = "a" ** 32 };
+    var device = try exchangePairingGrant(std.testing.io, conn, request, 2000);
+    defer device.clear();
+    var connect_device = try issueConnectDeviceLocked(std.testing.io, conn, .{ .connect_grant_id = "legacy-grant", .connect_device_id = "remote-phone", .device_key_thumbprint = "thumbprint", .issuer = "https://fixture.test", .device_label = "Legacy Connect", .scope_mask = access.scopeBit(.runtime_read), .now_ms = 2000 });
+    defer connect_device.clear();
+    try initialize(conn);
+    try initialize(conn); // Upgrade is idempotent.
+    try std.testing.expectEqual(access.scopeBit(.runtime_read), try authenticateDevice(conn, &device.device_id, &device.device_credential, &.{"runtime:read"}, 3000));
+    try std.testing.expectEqual(access.scopeBit(.runtime_read), try authenticateDevice(conn, &connect_device.device_id, &connect_device.device_credential, &.{"runtime:read"}, 3000));
+    try std.testing.expectError(error.DeviceAuthorizationRejected, authorizeDevice(conn, &device.device_id, &.{"device:write"}));
+    var retried = try exchangePairingGrant(std.testing.io, conn, request, 3000);
+    defer retried.clear();
+    try std.testing.expect(std.mem.eql(u8, &device.device_credential, &retried.device_credential));
+    try std.testing.expectEqualStrings(&device.device_id, &retried.device_id);
+    var opted = try createPairingGrant(std.testing.io, conn, .{ .access_protocol_version = access.ACCESS_PROTOCOL_VERSION, .ttl_seconds = 60, .scopes = &access.ALL_SCOPE_NAMES }, 4000);
+    defer opted.clear();
+    var opted_device = try exchangePairingGrant(std.testing.io, conn, .{ .access_protocol_version = access.ACCESS_PROTOCOL_VERSION, .grant_id = &opted.grant_id, .pairing_token = .{ .bytes = &opted.pairing_token }, .device_label = "Opted in" }, 5000);
+    defer opted_device.clear();
+    try std.testing.expectEqual(access.scopeBit(.device_write), try authorizeDevice(conn, &opted_device.device_id, &.{"device:write"}));
+    var opted_connect = try issueConnectDeviceLocked(std.testing.io, conn, .{ .connect_grant_id = "new-grant", .connect_device_id = "new-phone", .device_key_thumbprint = "new-thumbprint", .issuer = "https://fixture.test", .device_label = "Connect opted in", .scope_mask = try access.scopeMask(&access.ALL_SCOPE_NAMES), .now_ms = 5000 });
+    defer opted_connect.clear();
+    try std.testing.expectEqual(access.scopeBit(.device_write), try authorizeDevice(conn, &opted_connect.device_id, &.{"device:write"}));
+    try std.testing.expectError(error.ConstraintCheck, conn.exec("update runtime_devices set scopes=2048 where device_id=?1", .{&opted_device.device_id}));
+    try std.testing.expectError(error.ConstraintCheck, conn.exec("update runtime_connect_devices set scopes=2048 where device_id=?1", .{&opted_connect.device_id}));
+    try std.testing.expectError(error.ConstraintCheck, conn.exec("update runtime_pairing_grants set scopes=2048 where grant_id=?1", .{&opted.grant_id}));
+    var fk = (try conn.row("pragma foreign_keys", .{})).?;
+    defer fk.deinit();
+    try std.testing.expectEqual(@as(i64, 1), fk.int(0));
+    try std.testing.expect(try conn.row("pragma foreign_key_check", .{}) == null);
 }

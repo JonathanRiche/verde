@@ -11,6 +11,7 @@ const zqlite = @import("zqlite");
 const harness = @import("../providers/harness.zig");
 const headless = @import("headless");
 const session_protocol = headless.session_protocol;
+const push = @import("../daemon/push.zig");
 const app_config = @import("../app/config.zig");
 const chat_threads = @import("../chat/threads.zig");
 const db_types = @import("../db/types.zig");
@@ -2441,6 +2442,7 @@ pub const Daemon = struct {
     test_retention_override_ms: ?i64 = null,
     /// Null until post-bind production (or hermetic override) store construction.
     store_service: ?*StoreService = null,
+    push_relay_url: []const u8 = push.DEFAULT_RELAY_URL,
     /// Nonce-scoped change journal (M5-P2). A fresh Daemon IS the instance-start
     /// reset: `instance_nonce` is fixed for this Daemon's lifetime and the
     /// journal starts empty with it, so change_seq restarts at 1 per instance.
@@ -2889,6 +2891,7 @@ pub const Daemon = struct {
         // Store methods own their drain/capability precedence and unlock
         // lockDaemon for SQLite work; route before the generic mutator drain gate.
         if (isStoreMethod(method)) return try self.handleStoreRequest(id_value, method, params);
+        if (isPushMethod(method)) return try self.handlePushRequest(id_value, method, params);
         if (isAccessMethod(method)) return try self.handleAccessRequest(id_value, method, params);
         if (isConnectMethod(method)) return try self.handleConnectRequest(id_value, method, params);
         // chat.turn.start owns its drain check under lockDaemon (unlocked serve
@@ -3323,6 +3326,45 @@ pub const Daemon = struct {
         lockStoreService(service);
         defer service.mutex.unlock();
         try connect_store.recordUnlinked(service.store.conn, nowMs());
+    }
+
+    fn handlePushRequest(self: *Daemon, id_value: std.json.Value, method: []const u8, params: std.json.Value) ![]u8 {
+        if (params != .object) return errorResponseAlloc(self.allocator, id_value, "invalid_params", "push params must be an object");
+        const device = params.object.get("device_id") orelse return errorResponseAlloc(self.allocator, id_value, "invalid_params", "authenticated device is required");
+        if (device != .string) return errorResponseAlloc(self.allocator, id_value, "invalid_params", "invalid device identity");
+        lockDaemon(self);
+        const service = self.store_service;
+        const accepting = self.accepting_mutations and service != null and !service.?.draining;
+        if (accepting) _ = service.?.in_flight.fetchAdd(1, .monotonic);
+        self.mutex.unlock();
+        if (!accepting) return errorResponseAlloc(self.allocator, id_value, "capability_unavailable", "push store unavailable");
+        const svc = service.?;
+        defer _ = svc.in_flight.fetchSub(1, .monotonic);
+        lockStoreService(svc);
+        defer svc.mutex.unlock();
+        _ = access_store.authorizeDevice(svc.store.conn, device.string, &.{"device:write"}) catch return errorResponseAlloc(self.allocator, id_value, "device_authorization_rejected", "device authorization rejected");
+        var threaded = std.Io.Threaded.init_single_threaded;
+        if (std.mem.eql(u8, method, "device.push.register")) {
+            const platform = params.object.get("platform") orelse return errorResponseAlloc(self.allocator, id_value, "invalid_params", "platform required");
+            const token = params.object.get("send_token") orelse return errorResponseAlloc(self.allocator, id_value, "invalid_params", "send token required");
+            const key = params.object.get("public_key") orelse return errorResponseAlloc(self.allocator, id_value, "invalid_public_key", "public key required");
+            if (platform != .string or token != .string) return errorResponseAlloc(self.allocator, id_value, "invalid_params", "invalid registration");
+            if (key != .string) return errorResponseAlloc(self.allocator, id_value, "invalid_public_key", "invalid public key");
+            push.register(svc.store.conn, self.allocator, threaded.io(), device.string, platform.string, token.string, key.string) catch |err| return pushErrorResponse(self.allocator, id_value, err);
+        } else if (std.mem.eql(u8, method, "device.push.unregister")) {
+            push.unregister(svc.store.conn, device.string) catch |err| return pushErrorResponse(self.allocator, id_value, err);
+        } else {
+            if (self.push_relay_url.len == 0) return errorResponseAlloc(self.allocator, id_value, "relay_not_configured", "push relay is not configured");
+            var nonce: [16]u8 = undefined;
+            threaded.io().random(&nonce);
+            const dedupe = std.fmt.bytesToHex(&nonce, .lower);
+            _ = push.enqueue(svc.store.conn, self.allocator, threaded.io(), device.string, &dedupe, .{
+                .runtime_id = self.runtime_id,
+                .kind = "test",
+                .title = "Verde push test",
+            }, nowMs()) catch |err| return pushErrorResponse(self.allocator, id_value, err);
+        }
+        return okValueResponse(self.allocator, id_value, .{ .accepted = true });
     }
 
     /// Access storage stays behind the private session-daemon endpoint. Local
@@ -9495,7 +9537,11 @@ fn runSessionizerServer(allocator: std.mem.Allocator, pref_path: []const u8, opt
     const pid_path = try pidFilePath(allocator, pref_path);
     defer allocator.free(pid_path);
 
+    var push_config = try app_config.readRootValue(allocator);
+    defer if (push_config) |*config| config.deinit();
+    const push_relay_url = if (push_config) |config| try push.relayUrlFromConfig(config.value) else push.DEFAULT_RELAY_URL;
     var daemon = Daemon.initWithPrefPath(allocator, pref_path);
+    daemon.push_relay_url = push_relay_url;
     defer {
         // Provider processes are daemon-owned and can outlive the socket if a
         // normal shutdown skips the idle-exit cleanup path. Join/cancel every
@@ -9610,6 +9656,7 @@ const SessionizerServerContext = struct {
     ready_callback: ?DaemonReadyCallback = null,
     mcp_server: ?mcp_http.Server = null,
     drain_thread: ?std.Thread = null,
+    push_thread: ?std.Thread = null,
     pid_published: bool = false,
 };
 
@@ -9631,6 +9678,7 @@ fn sessionizerServerReady(raw_context: *anyopaque) !void {
         };
     }
     dispatchParentDeliveries(context.daemon);
+    context.push_thread = try std.Thread.spawn(.{}, pushSenderThread, .{context});
     context.drain_thread = try std.Thread.spawn(.{}, drainSessionsThread, .{DrainThreadContext{
         .daemon = context.daemon,
         .endpoint = context.endpoint,
@@ -9658,6 +9706,7 @@ fn sessionizerServerClosing(raw_context: *anyopaque) void {
     const context: *SessionizerServerContext = @ptrCast(@alignCast(raw_context));
     context.stop_requested.store(true, .release);
     joinDrainThread(context);
+    joinPushThread(context);
     finalizeSessionizerStore(context);
 }
 
@@ -12593,6 +12642,7 @@ fn methodRunsUnlocked(method: []const u8) bool {
         std.mem.eql(u8, method, store_protocol.METHOD_BROWSER_COOKIE_EXPORT) or
         // Local access administration is daemon-owned SQLite work and takes
         // only its own short lockDaemon bookkeeping window.
+        isPushMethod(method) or
         isAccessMethod(method) or
         // Connect owns bounded filesystem/network work and takes the SQLite
         // mutex only for its short durable transitions.
@@ -12603,6 +12653,21 @@ fn methodRunsUnlocked(method: []const u8) bool {
         // Shared config writes have their own leaf lock and filesystem I/O.
         std.mem.eql(u8, method, store_protocol.METHOD_CONFIG_FAVORITE_MODEL_SET) or
         std.mem.eql(u8, method, store_protocol.METHOD_CONFIG_UI_SET);
+}
+
+fn isPushMethod(method: []const u8) bool {
+    return std.mem.eql(u8, method, "device.push.register") or std.mem.eql(u8, method, "device.push.unregister") or std.mem.eql(u8, method, "device.push.test");
+}
+
+fn pushErrorResponse(allocator: std.mem.Allocator, id: std.json.Value, err: anyerror) ![]u8 {
+    const code: []const u8 = switch (err) {
+        error.InvalidPublicKey => "invalid_public_key",
+        error.InvalidParams => "invalid_params",
+        error.PushNotRegistered => "push_not_registered",
+        error.PushOutboxFull => "push_outbox_full",
+        else => "push_store_unavailable",
+    };
+    return errorResponseAlloc(allocator, id, code, code);
 }
 
 fn isAccessMethod(method: []const u8) bool {
@@ -12874,6 +12939,41 @@ fn drainSessionsThread(context: DrainThreadContext) void {
     }
 }
 
+fn pushSenderThread(context: *SessionizerServerContext) void {
+    const daemon = context.daemon;
+    while (!context.stop_requested.load(.acquire)) {
+        if (daemon.push_relay_url.len != 0) sendNextPush(daemon);
+        sleepMs(200);
+    }
+}
+
+fn sendNextPush(daemon: *Daemon) void {
+    if (daemon.push_relay_url.len == 0) return;
+    lockDaemon(daemon);
+    const service = daemon.store_service;
+    const active = service != null and !service.?.draining and daemon.accepting_mutations;
+    if (active) _ = service.?.in_flight.fetchAdd(1, .monotonic);
+    daemon.mutex.unlock();
+    if (!active) return;
+    const svc = service.?;
+    defer _ = svc.in_flight.fetchSub(1, .monotonic);
+    var arena = std.heap.ArenaAllocator.init(daemon.allocator);
+    defer arena.deinit();
+    lockStoreService(svc);
+    const delivery = push.next(svc.store.conn, arena.allocator(), nowMs()) catch null;
+    svc.mutex.unlock();
+    const item = delivery orelse return;
+    const status = push.send(daemon.allocator, daemon.push_relay_url, item) catch null;
+    lockStoreService(svc);
+    defer svc.mutex.unlock();
+    push.complete(svc.store.conn, item.id, status, nowMs()) catch {};
+}
+
+fn joinPushThread(context: *SessionizerServerContext) void {
+    if (context.push_thread) |thread| thread.join();
+    context.push_thread = null;
+}
+
 fn joinDrainThread(context: *SessionizerServerContext) void {
     if (context.drain_thread == null) return;
     platform_ipc.wake(context.daemon.allocator, context.endpoint, .{
@@ -12891,6 +12991,7 @@ fn finishSessionizerServer(context: *SessionizerServerContext) void {
     context.stop_requested.store(true, .release);
     stopMcpHttpServer(context);
     joinDrainThread(context);
+    joinPushThread(context);
     // Store finalization is primarily done in on_closing (before endpoint
     // release). This call is a no-op when that already ran.
     finalizeSessionizerStore(context);
@@ -22006,4 +22107,54 @@ test "P2 paired RPC additions reach the session daemon dispatcher" {
             try std.testing.expect(parsed.value.object.get("result").?.object.contains("client_id"));
         }
     }
+}
+
+test "push RPC registration validates keys and test fails typed when relay unset" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testStoreDbPath(&tmp);
+    defer a.free(path);
+    var daemon = Daemon.init(a);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, path);
+    defer detachTestStoreService(&daemon);
+    var device = try push.createTestDevice(daemon.store_service.?.store.conn);
+    defer device.clear();
+    const key = headless.push_seal.generateKeyPair(std.testing.io);
+    var key_buffer: [43]u8 = undefined;
+    const public_key = std.base64.url_safe_no_pad.Encoder.encode(&key_buffer, &key.public_key);
+    for ([_][]const u8{ "device.push.register", "device.push.unregister", "device.push.test" }) |method| {
+        try std.testing.expect(methodRunsUnlocked(method));
+        const request = try std.json.Stringify.valueAlloc(a, .{ .id = 1, .method = method, .params = .{ .device_id = &device.device_id, .platform = "android", .send_token = "fixture-token", .public_key = public_key } }, .{});
+        defer a.free(request);
+        const response = try daemon.handleRequest(request);
+        defer a.free(response);
+        if (std.mem.eql(u8, method, "device.push.test")) {
+            try std.testing.expect(std.mem.indexOf(u8, response, "relay_not_configured") != null);
+        } else {
+            try std.testing.expect(std.mem.indexOf(u8, response, "\"accepted\":true") != null);
+        }
+    }
+    try push.register(daemon.store_service.?.store.conn, a, std.testing.io, &device.device_id, "android", "fixture-token", public_key);
+    _ = try push.enqueue(daemon.store_service.?.store.conn, a, std.testing.io, &device.device_id, "idle-fixture", .{ .runtime_id = daemon.runtime_id, .kind = "done", .title = "Fixture" }, nowMs());
+    sendNextPush(&daemon);
+    var queued = (try daemon.store_service.?.store.conn.row("select attempts from device_push_outbox", .{})).?;
+    try std.testing.expectEqual(@as(i64, 0), queued.int(0));
+    queued.deinit();
+    // Enqueue the configured test without starting a sender or contacting a relay.
+    daemon.push_relay_url = "https://relay.example.test";
+    const configured_request = try std.json.Stringify.valueAlloc(a, .{ .id = 1, .method = "device.push.test", .params = .{ .device_id = &device.device_id } }, .{});
+    defer a.free(configured_request);
+    const configured_response = try daemon.handleRequest(configured_request);
+    defer a.free(configured_response);
+    try std.testing.expect(std.mem.indexOf(u8, configured_response, "\"accepted\":true") != null);
+    var test_row = (try daemon.store_service.?.store.conn.row("select count(*) from device_push_outbox where kind='test'", .{})).?;
+    try std.testing.expectEqual(@as(i64, 1), test_row.int(0));
+    test_row.deinit();
+    const invalid = try std.json.Stringify.valueAlloc(a, .{ .id = 1, .method = "device.push.register", .params = .{ .device_id = &device.device_id, .platform = "ios", .send_token = "fixture-token", .public_key = "A" ** 43 } }, .{});
+    defer a.free(invalid);
+    const response = try daemon.handleRequest(invalid);
+    defer a.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "invalid_public_key") != null);
 }

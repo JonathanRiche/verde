@@ -483,6 +483,7 @@ pub const Store = struct {
             schema.initializeToVersion(conn, schema.MAX_SUPPORTED_VERSION) catch |err| return mapOpenError(err);
         }
         access_store.initialize(conn) catch |err| return mapOpenError(err);
+        @import("push.zig").initialize(conn) catch |err| return mapOpenError(err);
         if (runtime_identity) |identity| {
             connect_store.initialize(conn, identity.runtime_id, identity.instance_id) catch |err|
                 return mapOpenError(err);
