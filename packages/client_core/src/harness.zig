@@ -218,8 +218,6 @@ test "every constructor, staging, effect and output allocation failure rolls bac
 
 test "all future feature intents fail visibly with unsupported and no I/O" {
     const cases = [_]struct { tag: []const u8, payload: []const u8 }{
-        .{ .tag = "pair", .payload = ",\"link\":\"verde://pair#code\",\"device_label\":\"phone\",\"client_nonce\":\"nonce\"" },
-        .{ .tag = "trust_decision", .payload = ",\"proposal_id\":\"p\",\"accept\":true" },
         .{ .tag = "retry_connection", .payload = "" },
         .{ .tag = "focus", .payload = ",\"workspace_id\":null,\"thread_id\":null,\"terminal_id\":null" },
         .{ .tag = "thread_open", .payload = "" },

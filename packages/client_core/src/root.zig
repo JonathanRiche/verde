@@ -139,4 +139,5 @@ test {
     _ = @import("harness.zig");
     _ = @import("rpc_test.zig");
     _ = @import("model_contract_test.zig");
+    _ = @import("auth_harness.zig");
 }

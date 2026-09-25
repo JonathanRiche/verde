@@ -2,6 +2,7 @@
 //! only a fully encoded batch commits its state and correlation tables.
 const std = @import("std");
 pub const rpc = @import("rpc.zig");
+const auth = @import("auth.zig");
 const profile = @import("verde_remote").profile;
 const A = std.mem.Allocator;
 const V = std.json.Value;
@@ -52,6 +53,7 @@ pub const Pending = struct {
 pub const State = struct {
     config: Config,
     rpc: rpc.State = .{},
+    auth: auth.State = .{},
     lifecycle: Lifecycle = .created,
     revision: u64 = 0,
     generation: u64 = 0,
@@ -115,16 +117,16 @@ pub const Host = struct {
                 .host_id = s.config.host_id,
                 .label = s.config.label,
                 .https_url = s.config.https_url,
-                .runtime_id = s.rpc.runtime_id,
-                .instance_id = s.rpc.instance_id,
-                .phase = @tagName(s.rpc.phase),
+                .runtime_id = s.rpc.runtime_id orelse if (s.auth.pin) |pin| pin.runtime_id else null,
+                .instance_id = s.rpc.instance_id orelse if (s.auth.pin) |pin| pin.instance_id else null,
+                .phase = if (s.auth.proposal != null or s.auth.blocked or s.auth.retry != null) s.auth.phase else if (s.rpc.bearer != null) @tagName(s.rpc.phase) else s.auth.phase,
                 .lifecycle = @tagName(s.lifecycle),
                 .auth_state = s.auth_state,
                 .sync_state = if (s.stale) "stale" else "empty",
                 .capabilities = [0]V{},
-                .scopes = [0]V{},
-                .retry_at_ms = @as(?i64, null),
-                .trust_proposal = @as(?u8, null),
+                .scopes = if (s.auth.credential) |c| c.scopes else &.{},
+                .retry_at_ms = s.auth.retry_at_ms,
+                .trust_proposal = s.auth.proposal,
                 .update_required = s.rpc.update_required,
                 .@"error" = s.host_error,
             }}, .operations = operations });
@@ -156,6 +158,7 @@ pub const Transaction = struct {
     state: State,
     effects: std.ArrayList(V) = .empty,
     changed: bool = false,
+    completion_matched: bool = false,
 
     pub fn init(host: *const Host) ApiError!Transaction {
         var arena = std.heap.ArenaAllocator.init(host.allocator);
@@ -215,6 +218,7 @@ pub const Transaction = struct {
         if (self.state.generation == std.math.maxInt(u64)) return error.ResourceLimit;
         try rpc.invalidate(self);
         self.state.generation += 1;
+        auth.invalidated(self);
         var i: usize = 0;
         while (i < self.state.pending.len) {
             const p = self.state.pending[i];
@@ -238,7 +242,7 @@ pub const Transaction = struct {
         }
     }
 
-    fn remove(self: *Transaction, index: usize) ApiError!void {
+    pub fn remove(self: *Transaction, index: usize) ApiError!void {
         const old = self.state.pending;
         const next = try self.allocator().alloc(Pending, old.len - 1);
         @memcpy(next[0..index], old[0..index]);
@@ -247,6 +251,7 @@ pub const Transaction = struct {
     }
 
     pub fn apply(self: *Transaction, event: V) ApiError!void {
+        self.completion_matched = false;
         try version(event);
         const tag = try string(event, "type");
         const now = try integer(event, "now_ms");
@@ -273,6 +278,7 @@ pub const Transaction = struct {
             }
             self.changed = true;
         } else if (eq(tag, "shutdown")) {
+            auth.suspendSession(self);
             try self.invalidateTransport();
             s.pending = &.{};
             s.lifecycle = .stopped;
@@ -283,6 +289,7 @@ pub const Transaction = struct {
             const next: Lifecycle = if (eq(tag, "foreground")) .foreground else .background;
             if (s.lifecycle != next) {
                 if (next == .background) {
+                    auth.suspendSession(self);
                     try self.invalidateTransport();
                     s.stale = true;
                 }
@@ -294,6 +301,7 @@ pub const Transaction = struct {
             const id = try string(event, "network_id");
             if (s.lifecycle == .created) return error.InvalidLifecycle;
             if (s.network_available != available or !eq(s.network_id, id)) {
+                auth.suspendSession(self);
                 try self.invalidateTransport();
                 s.network_available = available;
                 s.network_id = id;
@@ -311,6 +319,7 @@ pub const Transaction = struct {
             };
             if (s.receipts.len == MAX_RECEIPTS) return error.ResourceLimit;
             try append(Receipt, self.allocator(), &s.receipts, .{ .digest = digest, .operation = .{ .intent_id = id, .@"error" = .{ .code = "unsupported", .message = "Intent is not implemented.", .intent_id = id } } });
+            _ = try auth.intent(self, tag, event);
             self.changed = true;
         } else if (eq(tag, "terminal_reply")) {
             _ = try string(event, "terminal_id");
@@ -319,7 +328,9 @@ pub const Transaction = struct {
             return error.InvalidLifecycle;
         } else {
             try self.complete(tag, event);
+            if (!self.completion_matched) return;
         }
+        try auth.advance(self);
     }
 
     fn complete(self: *Transaction, tag: []const u8, event: V) ApiError!void {
@@ -376,12 +387,17 @@ pub const Transaction = struct {
                 if (!eq(p.key, try string(event, "key"))) return;
             }
             if (kind == .socket and !eq(tag, "ws_closed")) return;
+            self.completion_matched = true;
             try self.remove(i);
-            if (kind == .http and eq(p.key, "rpc")) try rpc.complete(self, id, event);
+            if (kind == .http and eq(p.key, "rpc")) {
+                if (!try @import("auth_rpc.zig").intercept(self, id, event)) try rpc.complete(self, id, event);
+            }
             if (kind == .timer and self.state.now_ms.? < p.deadline) {
                 // Replacement gives an early delivery a new ID; duplicate early callbacks are stale.
                 try self.setTimer(p.purpose, @intCast(p.deadline - self.state.now_ms.?));
+                return;
             }
+            if (try auth.complete(self, p, event)) return;
             if (kind == .store_get) {
                 if ((try field(event, "error")) != .null) {
                     self.state.host_error = .{ .domain = "storage", .code = try string(try field(event, "error"), "code"), .message = "Stored profile could not be loaded.", .retryable = true };
@@ -460,7 +476,7 @@ fn parseLimit(a: A, input: []const u8, limit: usize) ApiError!V {
     }
     return std.json.parseFromSliceLeaky(V, a, input, .{ .allocate = .alloc_always, .max_value_len = limit }) catch |err| return mapError(err);
 }
-fn decode(comptime T: type, a: A, value: V) ApiError!T {
+pub fn decode(comptime T: type, a: A, value: V) ApiError!T {
     try validateShape(T, value);
     return std.json.parseFromValueLeaky(T, a, value, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |err| return mapError(err);
 }
@@ -500,7 +516,7 @@ fn validateShape(comptime T: type, value: V) ApiError!void {
         else => @compileError("unsupported wire schema type"),
     }
 }
-fn encode(a: A, value: anytype) ApiError![]u8 {
+pub fn encode(a: A, value: anytype) ApiError![]u8 {
     return std.json.Stringify.valueAlloc(a, value, .{}) catch |err| return mapError(err);
 }
 fn valueOf(a: A, value: anytype) ApiError!V {
@@ -517,19 +533,19 @@ fn counter(s: []const u8) ApiError!u64 {
 fn version(v: V) ApiError!void {
     if (try integer(v, "api_version") != 1) return error.UnsupportedVersion;
 }
-fn field(v: V, key: []const u8) ApiError!V {
+pub fn field(v: V, key: []const u8) ApiError!V {
     if (v != .object) return error.InvalidArgument;
     return v.object.get(key) orelse error.InvalidArgument;
 }
-fn string(v: V, key: []const u8) ApiError![]const u8 {
+pub fn string(v: V, key: []const u8) ApiError![]const u8 {
     const f = try field(v, key);
     return if (f == .string) f.string else error.InvalidArgument;
 }
-fn integer(v: V, key: []const u8) ApiError!i64 {
+pub fn integer(v: V, key: []const u8) ApiError!i64 {
     const f = try field(v, key);
     return if (f == .integer) f.integer else error.InvalidArgument;
 }
-fn boolean(v: V, key: []const u8) ApiError!bool {
+pub fn boolean(v: V, key: []const u8) ApiError!bool {
     const f = try field(v, key);
     return if (f == .bool) f.bool else error.InvalidArgument;
 }

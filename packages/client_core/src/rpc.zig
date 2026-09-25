@@ -30,6 +30,10 @@ pub const Call = struct {
     mutation: bool,
     intent_id: ?[]const u8,
     response_cap: usize,
+    body_base64: []const u8 = "",
+    timeout_ms: u32 = 15000,
+    auth_retried: bool = false,
+    awaiting_auth: bool = false,
 };
 pub const Result = struct {
     id: u64,
@@ -115,7 +119,7 @@ pub fn request(tx: *host.Transaction, method: []const u8, params: anytype, optio
         .tls = .{ .origin = origin, .spki_sha256 = s.spki_sha256.? },
     });
     try tx.track(.http, effect_id, "rpc");
-    try append(Call, a, &s.calls, .{ .effect_id = effect_id, .id = id, .method = try a.dupe(u8, method), .mutation = options.mutation, .intent_id = if (options.intent_id) |intent| try a.dupe(u8, intent) else null, .response_cap = cap });
+    try append(Call, a, &s.calls, .{ .effect_id = effect_id, .id = id, .method = try a.dupe(u8, method), .mutation = options.mutation, .intent_id = if (options.intent_id) |intent| try a.dupe(u8, intent) else null, .response_cap = cap, .body_base64 = try encodeBase64(a, bytes), .timeout_ms = options.parked_wait_ms + 15_000 });
     s.next_id += 1;
     return id;
 }
