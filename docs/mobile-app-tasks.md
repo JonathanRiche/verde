@@ -133,7 +133,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | A-15 | Harden served-file open (TOCTOU, special files, leak, logs) | host | linux | A-01 | done (310be446) |
 | A-16 | `workspace.list` exposes repository binding roots | host | linux | A-01, A-02 | done (fb84ca8c) |
 | A-17 | Daemon-native workspace close | host | linux | A-02 | done (c95ae1d3) |
-| A-18 | Daemon-native subagent open | host | linux | A-02 | in_progress (claude opus cli-thread-1790366343619-3f19839721e6f20f; also rejects chat.turn.start on archived workspaces) |
+| A-18 | Daemon-native subagent open | host | linux | A-02 | done (46e797f9) |
 | W-01 | App Link / universal link files + pair landing page | website | linux | H-03, H-04 | todo |
 | C-01 | Spike: APNs reachability from Workers | cloud | linux | — | done (research; recorded in plan §8, see C-02) |
 | C-02 | Push relay Worker | cloud | linux | C-01, A-12 | human (code done in verde-cloud c16126bd + redirect fix 566e572; APNs reachability from Workers verified 5a3f208; production deploy waits on H-05 keys + owner deploy approval) |
@@ -626,6 +626,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 - **Why (A-02):** `chat.open_subagent` exists only in the desktop GUI; mobile has no daemon equivalent.
 - **Do:** add a daemon RPC that creates a linked child thread (parent link, provider/model, prompt), matching what the web and desktop clients show as subagents; map it to `chat:write`.
 - **Done when:** tests cover link creation and paired-device reachability; `$ZB daemon-test` and `$ZB headless-test` pass.
+- **Done (46e797f9).** The daemon now handles `chat.subagent.open` (scope `chat:write`). It writes the same thread and `chat_links` rows that MCP `open_chat` plus `chat.links.create` do, so desktop and web show the children with no changes. With `prompt` it starts the child's first turn linked to the parent. Retries are idempotent: an existing child is re-linked and turns are deduplicated by `turn_id`. The GUI's `chat.open_subagent` (a read-only view of a provider's in-turn subagent) stays desktop-only. `chat.turn.start` and `chat.subagent.open` now reject archived workspaces with `workspace_archived` under the close lock. `core.changes.mode` maps directly to the `core.changes` scope, and K-13's alias table is gone. `daemon-test` passes 602, and `headless-test`, `web-app-test`, `mobile-core-test` and `dev-build` pass. `headless-daemon-it` fails with `AdoptDirtyNotMarked`, which also fails on clean master; a fix task is running.
 
 ### Website / cloud lane
 
