@@ -119,16 +119,16 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | A-01 | Confine `/api/file` + `/api/preview` | host | linux | — | done (363bece0) |
 | A-02 | Paired-device allowlist parity + new scopes | host | linux | — | done (a570cce2) |
 | A-03 | Confined directory-list RPC | host | linux | A-02 | todo |
-| A-04 | Device self-service RPCs | host | linux | A-02 | todo |
+| A-04 | Device self-service RPCs | host | linux | A-02 | in_progress (astra cli-thread-1790357298383-17136903f7e4129f) |
 | A-05 | Idempotent pair exchange | host | linux | — | done (a36897f0) |
 | A-06 | Terminal QR + App Link pair URL | host | linux | — | done (b0f6e50b; phone-camera scan pending human-verify) |
 | A-07 | Desktop "Pair a phone" + Paired devices UI | host | linux | A-04, A-06 | todo |
 | A-08 | Web Settings paired-devices list | host | linux | A-04 | todo |
 | A-09 | Pairing presets + access-mode cap | host | linux | A-02, H-08 | todo |
 | A-10 | `mobile.min_client` + capability flags | host | linux | — | done (f8aa0db8) |
-| A-11 | Delta change feed on the gateway | host | linux | A-10 | in_progress (astra cli-thread-1790353790179-3cdf8d62d8cee8f1) |
+| A-11 | Delta change feed on the gateway | host | linux | A-10 | review (1b1a7d34 landed; final verification pending after daemon restart) |
 | A-12 | Push crypto module (seal/open) | host | linux | — | done (7f5c621f) |
-| A-13 | Push outbox + `device.push.*` RPCs | host | linux | A-02, A-12 | in_progress (astra cli-thread-1790353399616-db0f6eeff8912a74) |
+| A-13 | Push outbox + `device.push.*` RPCs | host | linux | A-02, A-12 | done (8827ee2a) |
 | A-14 | Attention events → outbox | host | linux | A-13 | todo |
 | A-15 | Harden served-file open (TOCTOU, special files, leak, logs) | host | linux | A-01 | done (310be446) |
 | A-16 | `workspace.list` exposes repository binding roots | host | linux | A-01, A-02 | done (fb84ca8c) |
@@ -143,7 +143,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | K-03 | Core API spec (events, effects, queries) | core | linux | K-01 | done (a5a81401; reviewed) |
 | K-04 | Extract shared remote-client modules from desktop | core | linux | K-01 | done (e1111a8c) |
 | K-05 | Split `headless/client.zig` codec from I/O | core | linux | K-01 | done (b12e4c17) |
-| K-06 | Sans-IO host engine + C ABI | core | linux | K-03, K-04, K-05 | in_progress (astra cli-thread-1790353141333-1019127d2dccf44d) |
+| K-06 | Sans-IO host engine + C ABI | core | linux | K-03, K-04, K-05 | review (e3e60c35, e4a0e6ab landed; final verification pending after daemon restart) |
 | K-07 | Auth in core | core | linux | K-06, A-05 | todo |
 | K-08 | RPC client + target pinning | core | linux | K-06 | todo |
 | K-09 | Sync + projection | core | linux | K-08 | todo |
