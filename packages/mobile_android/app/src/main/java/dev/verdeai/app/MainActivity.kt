@@ -14,20 +14,29 @@ import dev.verdeai.core.EffectExecutor
 
 class MainActivity : ComponentActivity() {
     private lateinit var hosts: HostsModel
+    private lateinit var browse: BrowseModel
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
-        hosts = ViewModelProvider(this, object : ViewModelProvider.Factory {
+        val app = application as VerdeApplication
+        val cache = ViewCache(app.viewCache)
+        // ProcessLifecycleOwner + ConnectivityManager feed every host core (foreground/background/network_changed).
+        val provider = ViewModelProvider(this, object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
-            override fun <T : ViewModel> create(modelClass: Class<T>): T = HostsModel(
-                (application as VerdeApplication).secureStore) { saved ->
-                CoreHost.create(Config(1, saved.id, saved.label, null, null, 1, "", 0uL),
-                    EffectExecutor((application as VerdeApplication).secureStore, saved.id))
+            override fun <T : ViewModel> create(modelClass: Class<T>): T = when (modelClass) {
+                HostsModel::class.java -> HostsModel(app.secureStore, app.signals, cache) { saved ->
+                    CoreHost.create(Config(1, saved.id, saved.label, null, null, 1, "", 0uL),
+                        EffectExecutor(app.secureStore, saved.id))
+                }
+                BrowseModel::class.java -> BrowseModel(hosts, cache, app.signals)
+                else -> error("unknown model")
             } as T
-        })[HostsModel::class.java]
+        })
+        hosts = provider[HostsModel::class.java]
+        browse = provider[BrowseModel::class.java]
         consumePairIntent(intent)
-        setContent { HostsScreen(hosts) }
+        setContent { VerdeApp(hosts, browse) }
     }
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
@@ -38,8 +47,6 @@ class MainActivity : ComponentActivity() {
         intent = Intent(this, MainActivity::class.java)
         link?.let(hosts::receiveLink)
     }
-    override fun onStart() { super.onStart(); hosts.foreground(true) }
-    override fun onStop() { hosts.foreground(false); super.onStop() }
 }
 
 /** Routing only: the core validates the complete link after the user's Continue action. */

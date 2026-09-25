@@ -31,6 +31,7 @@ class HostsScreenTest {
     private val cores = CopyOnWriteArrayList<FakeCore>()
     private var offline = false
     private var revoked = false
+    private var used = 0
     private fun await(condition: () -> Boolean) = compose.waitUntil(5000) {
         shadowOf(Looper.getMainLooper()).idle(); condition()
     }
@@ -52,7 +53,7 @@ class HostsScreenTest {
             })[HostsModel::class.java]
             model.foreground(true)
         }
-        compose.setContent { HostsScreen(model) }
+        compose.setContent { HostsScreen(model, onUse={ used++ }) }
         if (waitReady) await { !model.state.value.loading && model.state.value.rows.all { it.view?.lifecycle == Lifecycle.foreground } }
     }
     private fun row(id: String) = model.state.value.rows.single { it.saved.id == id }
@@ -67,9 +68,8 @@ class HostsScreenTest {
         compose.onNodeWithText("Beta",useUnmergedTree=true).assertExists()
         compose.onNodeWithText("Use Beta").performScrollTo().performClick()
         await { model.state.value.active == "beta" && !model.state.value.busy }
-        compose.onNodeWithText("Home").assertExists()
-        compose.onNodeWithText("Beta").assertExists()
-        compose.onNodeWithText("Switch host").performClick()
+        // Navigation to Home belongs to VerdeApp; the host list only reports the choice.
+        assertEquals(1,used)
         compose.onNodeWithText("Hosts").assertExists()
         val saved=CoreJson.decodeFromString<HostCatalog>(store.values[HostsModel.CATALOG_KEY]!!)
         assertEquals("beta",saved.active)

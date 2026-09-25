@@ -86,6 +86,27 @@ test "sync recorded daemon snapshot and catalog pages project native models with
     try expect(ws.threads[0].last_activity_at_ms.? == 1700000000000);
 }
 
+test "retry_connection re-reads snapshot and catalog only while ready" {
+    var h = try init();
+    defer h.deinit();
+    var tx = try host.Transaction.init(&h);
+    defer tx.deinit();
+    try fixture(&tx);
+    tx.state.sync.@"error" = .{ .domain = "rpc", .code = "catalog_changed", .message = "Changed", .retryable = true };
+    const retry = "{\"api_version\":1,\"type\":\"retry_connection\",\"now_ms\":1,\"wall_time_ms\":1700000050000,\"intent_id\":\"refresh-1\"}";
+    try tx.apply(try host.parse(tx.allocator(), retry));
+    try expect(tx.state.sync.snapshot_id != null and tx.state.sync.loading);
+    try expect(tx.state.sync.@"error" == null);
+    try respond(&tx, snapshot);
+    try respond(&tx, first);
+    try respond(&tx, last);
+    try expect(!tx.state.sync.loading and tx.state.sync.cursor.? == 9);
+    tx.state.rpc.phase = .disabled;
+    const offline = "{\"api_version\":1,\"type\":\"retry_connection\",\"now_ms\":1,\"wall_time_ms\":1700000050000,\"intent_id\":\"refresh-2\"}";
+    try tx.apply(try host.parse(tx.allocator(), offline));
+    try expect(tx.state.sync.snapshot_id == null and !tx.state.sync.loading);
+}
+
 test "legacy invalidations coalesce and do not advance cursor past applied data" {
     var h = try init();
     defer h.deinit();

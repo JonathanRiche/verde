@@ -8,6 +8,7 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.ViewModel
 import dev.verdeai.core.*
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.*
 import java.net.URLEncoder
 import java.security.SecureRandom
@@ -15,6 +16,8 @@ import java.util.UUID
 
 class VerdeApplication : Application() {
     val secureStore by lazy { AndroidSecureStore(this) }
+    val viewCache by lazy { AndroidSecureStore(this, "view-cache") }
+    internal val signals: AppSignals by lazy { AndroidAppSignals(this) }
 }
 
 internal data class PairingState(
@@ -43,6 +46,10 @@ internal class PairingModel(private val createHost: suspend () -> CoreHost) : Vi
     var code by mutableStateOf("")
     var deviceLabel by mutableStateOf(Build.MODEL)
     private var pairIntent: String? = null
+    // Lifecycle/network events are delivered in call order, after `start`, and deduplicated.
+    private val signals = Channel<(Long, Long) -> Event>(Channel.UNLIMITED)
+    private var lastForeground: Boolean? = null
+    private var lastNetwork: NetworkState? = null
     private val host = scope.async { createHost().also {
         try { it.send { n,w -> EventStart(now_ms=n, wall_time_ms=w, foreground=false, network_available=true) } }
         catch (e: Exception) { it.close(); throw e }
@@ -57,7 +64,12 @@ internal class PairingModel(private val createHost: suspend () -> CoreHost) : Vi
                         operation=query?.data?.operations?.find { op -> op.intent_id == pairIntent } ?: it.operation) }
                 } }
                 launch { core.failed.collect { failed -> if (failed) mutableState.update { it.copy(fatal=true) } } }
-            } catch (_: Exception) { mutableState.update { it.copy(fatal=true) } }
+                for (signal in signals) {
+                    try { core.send(signal) }
+                    catch (_: CoreInputRejected) { }
+                }
+            } catch (e: CancellationException) { throw e }
+            catch (_: Exception) { mutableState.update { it.copy(fatal=true) } }
         }
     }
 
@@ -90,11 +102,15 @@ internal class PairingModel(private val createHost: suspend () -> CoreHost) : Vi
     fun retry() = action { core -> core.send { n,w -> EventRetryConnection(now_ms=n,
         wall_time_ms=w, intent_id=UUID.randomUUID().toString()) } }
     fun foreground(active: Boolean) {
-        scope.launch {
-            try { host.await().send { n,w -> if (active) EventForeground(now_ms=n, wall_time_ms=w)
-                else EventBackground(now_ms=n, wall_time_ms=w) } }
-            catch (_: Exception) { mutableState.update { it.copy(fatal=true) } }
-        }
+        if (lastForeground == active) return
+        lastForeground = active
+        signals.trySend { n,w -> if (active) EventForeground(now_ms=n, wall_time_ms=w) else EventBackground(now_ms=n, wall_time_ms=w) }
+    }
+    /** The core invalidates transport on a changed route and reconnects with its jittered backoff. */
+    fun network(state: NetworkState) {
+        if (lastNetwork == state) return
+        lastNetwork = state
+        signals.trySend { n,w -> EventNetworkChanged(now_ms=n, wall_time_ms=w, available=state.available, network_id=state.id) }
     }
     fun notice(text: String?) { mutableState.update { it.copy(notice=text) } }
     private fun clearInputs() { link=""; manualHost=""; grant=""; code="" }
@@ -116,6 +132,7 @@ internal class PairingModel(private val createHost: suspend () -> CoreHost) : Vi
     override fun onCleared() = dispose()
     internal fun dispose() {
         clearInputs()
+        signals.close()
         // Own cleanup beyond scope cancellation; CoreHost closes its dispatcher/executor.
         scope.launch {
             try { host.await().close() } catch (_: Exception) { }

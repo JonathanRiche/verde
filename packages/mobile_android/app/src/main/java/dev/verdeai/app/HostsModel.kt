@@ -21,6 +21,8 @@ internal data class HostsState(val rows: List<HostRow> = emptyList(), val active
 
 /** Owns platform host identities/selection only; every protocol action belongs to its core. */
 internal class HostsModel(private val store: SecureStore,
+    private val signals: AppSignals? = null,
+    private val cache: ViewCache? = null,
     private val createHost: suspend (SavedHost) -> CoreHost) : ViewModel() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val mutableState = MutableStateFlow(HostsState())
@@ -30,13 +32,27 @@ internal class HostsModel(private val store: SecureStore,
     private val operations = mutableMapOf<String, String>()
     private var catalog = HostCatalog(emptyList(), null)
     private var foreground = false
+    private var network: NetworkState? = null
+    private val opened = MutableStateFlow<Set<String>>(emptySet())
     private var pendingLink: String? = null
     private var closed = false
-    init { load() }
+    init {
+        // Read the current signals first so each new core gets start → network → foreground.
+        signals?.let { source ->
+            scope.launch { source.network.collect { network(it) } }
+            scope.launch { source.foreground.collect { foreground(it) } }
+        }
+        load()
+    }
 
     fun pairing(id: String): PairingModel? = sessions[id]
     // D-05 consumes projections from this handle; runtime data is never merged across hosts.
-    suspend fun activeCore(): CoreHost? = state.value.active?.let { sessions[it]?.coreHost() }
+    suspend fun activeCore(): CoreHost? = state.value.active?.let { core(it) }
+    /** Waits until the saved host's handle is opened; null once it has been removed. */
+    suspend fun core(id: String): CoreHost? {
+        opened.first { id in it || catalog.hosts.none { host -> host.id == id } }
+        return sessions[id]?.coreHost()
+    }
 
     fun load() {
         if (state.value.busy || closed) return
@@ -64,10 +80,17 @@ internal class HostsModel(private val store: SecureStore,
         if (sessions.containsKey(saved.id)) return
         val pairing = PairingModel { createHost(saved) }
         sessions[saved.id] = pairing
+        network?.let(pairing::network)
         pairing.foreground(foreground)
+        opened.update { it + saved.id }
         observers[saved.id] = scope.launch {
+            var cleared = false
             launch { pairing.state.collect { value ->
                 row(saved.id) { it.copy(view=value.host, fatal=value.fatal) }
+                // Local removal or a missing credential retires this host's warm-start cache.
+                val state = value.host?.auth_state
+                if (state in WIPED && !cleared) { cleared=true; cache?.clear(saved.id) }
+                else if (state == "paired") cleared=false
             } }
             try { pairing.coreHost().hosts.collect { value ->
                 row(saved.id) { it.copy(operation=value?.data?.operations?.find { op -> op.intent_id == operations[saved.id] }) }
@@ -120,6 +143,10 @@ internal class HostsModel(private val store: SecureStore,
         foreground=active
         sessions.values.forEach { it.foreground(active) }
     }
+    fun network(state: NetworkState) {
+        network=state
+        sessions.values.forEach { it.network(state) }
+    }
     fun signOut(id: String, forget: Boolean = false) = action(id) { core, intent ->
         core.send { n,w -> if (forget) EventForgetHost(now_ms=n, wall_time_ms=w, intent_id=intent, host_id=id)
             else EventSignOut(now_ms=n, wall_time_ms=w, intent_id=intent, host_id=id) }
@@ -149,7 +176,9 @@ internal class HostsModel(private val store: SecureStore,
         persist(HostCatalog(remaining, active))
         observers.remove(id)?.cancel()
         sessions.remove(id)?.dispose()
+        opened.update { it - id }
         operations.remove(id)
+        cache?.clear(id)
         mutableState.update { it.copy(rows=it.rows.filterNot { row -> row.saved.id == id }, active=active,
             pairing=it.pairing?.takeUnless { pair -> pair == id }) }
     }
@@ -159,7 +188,10 @@ internal class HostsModel(private val store: SecureStore,
         sessions.values.forEach { it.dispose() }
         scope.cancel()
     }
-    companion object { const val CATALOG_KEY = "android/1/hosts" }
+    companion object {
+        const val CATALOG_KEY = "android/1/hosts"
+        val WIPED = setOf("unpaired", "signing_out", "signed_out")
+    }
 }
 
 internal fun hostStatus(row: HostRow): String = when {

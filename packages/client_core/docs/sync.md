@@ -24,7 +24,9 @@ section defaults even for omitted scopes, so field presence alone cannot decide
 whether to clear a section. K-09's HTTP and legacy gateway snapshots request all
 five scopes. The scoped helper preserves omitted sections for future callers.
 `incomplete_scopes` remains visible in Home. Failures preserve the last usable
-view and mark it stale. Background/network invalidation cancels transport via
+view and mark it stale. A `retry_connection` intent (D-05 pull-to-refresh) also
+requests a fresh snapshot and catalog when the connection is ready, which clears
+a retryable sync error; it is a no-op for sync otherwise. Background/network invalidation cancels transport via
 K-06/K-08; K-07 owns reconnect scheduling.
 
 `projection.zig` ports the detached branches of web `store.ts`: persisted layout

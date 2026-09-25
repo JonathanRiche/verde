@@ -345,6 +345,8 @@ pub const Transaction = struct {
             _ = try chat.intent(self, tag, event);
             _ = try push.intent(self, tag, event);
             try attention.intent(self, tag, event);
+            // Pull-to-refresh: an explicit retry also re-reads a ready connection's snapshot and catalog.
+            if (eq(tag, "retry_connection")) try sync.refresh(self);
             self.changed = true;
         } else if (eq(tag, "terminal_reply")) {
             _ = try string(event, "terminal_id");

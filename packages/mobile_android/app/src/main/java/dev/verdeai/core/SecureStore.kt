@@ -25,12 +25,15 @@ interface SecureStore {
     suspend fun delete(key: String)
 }
 
-/** Share one instance per application. DataStore commits encrypted replacements atomically. */
-class AndroidSecureStore(context: Context) : SecureStore {
+/**
+ * Share one instance per file per application. DataStore commits encrypted replacements atomically.
+ * `fileName` separates the credential store from larger, disposable records such as view caches.
+ */
+class AndroidSecureStore(context: Context, fileName: String = "core-credentials") : SecureStore {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val store: DataStore<Map<String, String>> = DataStoreFactory.create(
         serializer = CredentialSerializer(), scope = scope,
-        produceFile = { java.io.File(context.applicationContext.noBackupFilesDir, "core-credentials") },
+        produceFile = { java.io.File(context.applicationContext.noBackupFilesDir, fileName) },
     )
     override suspend fun get(key: String) = store.data.first()[key]
     override suspend fun put(key: String, value: String) { store.updateData { it + (key to value) } }
