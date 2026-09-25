@@ -1945,13 +1945,15 @@ test "browser tabs and a detached quick pane each keep their scrolling column co
     defer layout.deinit(allocator);
 
     const browser_pane_id = try layout.ensureBrowserPane(allocator);
-    const browser_pane_ref = layout.paneByIdMutable(browser_pane_id) orelse return error.TestExpectedEqual;
-    const browser = switch (browser_pane_ref.ref) {
-        .browser => |*ref| ref,
-        else => return error.TestExpectedEqual,
-    };
-    try browser.tabs.append(allocator, .{});
-    try browser.tabs.append(allocator, .{});
+    {
+        const browser_pane_ref = layout.paneByIdMutable(browser_pane_id) orelse return error.TestExpectedEqual;
+        const browser = switch (browser_pane_ref.ref) {
+            .browser => |*ref| ref,
+            else => return error.TestExpectedEqual,
+        };
+        try browser.tabs.append(allocator, .{});
+        try browser.tabs.append(allocator, .{});
+    }
 
     const quick_pane_id = try layout.createTerminalPane(allocator, 7);
     layout.quick_pane = .{
@@ -1960,6 +1962,12 @@ test "browser tabs and a detached quick pane each keep their scrolling column co
         .return_focus_pane_id = browser_pane_id,
     };
 
+    // Creating the quick pane can relocate the pane array; look up the browser again by ID.
+    const browser_pane_ref = layout.paneById(browser_pane_id) orelse return error.TestExpectedEqual;
+    const browser = switch (browser_pane_ref.ref) {
+        .browser => |ref| ref,
+        else => return error.TestExpectedEqual,
+    };
     try std.testing.expectEqual(@as(usize, 3), browser.tabs.items.len);
     try std.testing.expectEqual(@as(usize, 2), layout.visiblePaneCount());
     try std.testing.expect(!layout.rootContainsPane(quick_pane_id));
