@@ -5,34 +5,10 @@ const manager_mod = @import("manager.zig");
 const profile = @import("profile.zig");
 const profile_store = @import("profile_store.zig");
 
-/// The authoritative complete identity reread while the profile lock was
-/// held. Both strings are owned so no profile-store borrow crosses the lock.
-pub const PersistedPin = struct {
-    allocator: std.mem.Allocator,
-    runtime_id: []u8,
-    instance_id: []u8,
-    wrote_profile: bool,
-    recovered_after_save_error: bool,
-
-    pub fn deinit(self: *PersistedPin) void {
-        self.allocator.free(self.runtime_id);
-        self.allocator.free(self.instance_id);
-        self.* = undefined;
-    }
-
-    pub fn borrowed(self: *const PersistedPin) manager_mod.PersistedIdentity {
-        return .{
-            .runtime_id = self.runtime_id,
-            .instance_id = self.instance_id,
-        };
-    }
-};
-
-pub const CommitResult = struct {
-    adoption: manager_mod.PinAdoption,
-    wrote_profile: bool,
-    recovered_after_save_error: bool,
-};
+const shared_pin = @import("verde_remote").pin_controller;
+pub const PersistedPin = shared_pin.PersistedPin;
+pub const CommitResult = shared_pin.CommitResult;
+const shouldPersistProposal = shared_pin.shouldPersistProposal;
 
 /// Persists a first-contact proposal under one cross-process transaction and
 /// returns only the complete pair reread from disk. A complete pair already
@@ -123,21 +99,6 @@ fn findProfile(profiles: []profile.Profile, profile_id: []const u8) ?*profile.Pr
         if (std.mem.eql(u8, configured.id, profile_id)) return configured;
     }
     return null;
-}
-
-fn shouldPersistProposal(
-    configured: *const profile.Profile,
-    proposal: *const manager_mod.RuntimePinProposal,
-) !bool {
-    if (configured.expected_runtime_id) |runtime_id| {
-        if (configured.expected_instance_id != null) return false;
-        if (!std.mem.eql(u8, runtime_id, proposal.runtime_id)) {
-            return error.RuntimeIdentityPinConflict;
-        }
-        return true;
-    }
-    if (configured.expected_instance_id != null) return error.InvalidExpectedIdentityPair;
-    return true;
 }
 
 fn testPathAlloc(allocator: std.mem.Allocator, dir: std.Io.Dir) ![]u8 {

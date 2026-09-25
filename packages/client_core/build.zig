@@ -40,7 +40,18 @@ pub fn build(b: *std.Build) void {
     options.addOption([:0]const u8, "version", zon.version);
 
     addIosSteps(b, optimize, options);
-    addTestStep(b, target, optimize, options);
+    const headless = b.createModule(.{
+        .root_source_file = b.path("../headless/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const remote = b.addModule("verde_remote", .{
+        .root_source_file = b.path("src/shared/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "headless", .module = headless }},
+    });
+    addTestStep(b, target, optimize, options, remote);
     addAndroidStep(b, optimize, options, ndk_option orelse b.graph.environ_map.get("ANDROID_NDK_HOME"));
 }
 
@@ -49,8 +60,11 @@ fn addTestStep(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     options: *std.Build.Step.Options,
+    remote: *std.Build.Module,
 ) void {
     const test_step = b.step("test", "Run unit tests and the C ABI smoke test");
+    const remote_tests = b.addTest(.{ .root_module = remote, .use_llvm = true });
+    test_step.dependOn(&b.addRunArtifact(remote_tests).step);
 
     const unit_tests = b.addTest(.{
         .root_module = createCoreModule(b, target, optimize, options),

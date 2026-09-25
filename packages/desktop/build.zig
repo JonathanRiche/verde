@@ -97,6 +97,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const remote_module = b.createModule(.{
+        .root_source_file = b.path("../client_core/src/shared/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "headless", .module = headless_module }},
+    });
     // Browser contract tests use a narrower module root than the full app, so
     // portable platform helpers must be explicit imports instead of escaping it.
     const platform_runtime_module = b.createModule(.{
@@ -203,6 +209,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "build_options", .module = daemon_build_options_module },
                 .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
                 .{ .name = "headless", .module = headless_module },
+                .{ .name = "verde_remote", .module = remote_module },
                 .{ .name = "toml", .module = toml_module },
                 .{ .name = "platform_paths", .module = platform_paths_module },
                 .{ .name = "platform_runtime", .module = platform_runtime_module },
@@ -239,6 +246,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
                 .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
                 .{ .name = "headless", .module = headless_module },
+                .{ .name = "verde_remote", .module = remote_module },
                 .{ .name = "toml", .module = toml_module },
                 .{ .name = "loop_wakeup", .module = loop_wakeup_module },
                 .{ .name = "palette", .module = palette_module },
@@ -350,6 +358,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
                 .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
                 .{ .name = "headless", .module = headless_module },
+                .{ .name = "verde_remote", .module = remote_module },
                 .{ .name = "toml", .module = toml_module },
                 .{ .name = "loop_wakeup", .module = loop_wakeup_module },
                 .{ .name = "palette", .module = palette_module },
@@ -531,6 +540,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "headless", .module = headless_module },
+                .{ .name = "verde_remote", .module = remote_module },
                 .{ .name = "toml", .module = toml_module },
                 .{ .name = "platform_paths", .module = platform_paths_module },
                 .{ .name = "platform_runtime", .module = platform_runtime_module },
@@ -576,6 +586,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
                 .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
                 .{ .name = "headless", .module = headless_module },
+                .{ .name = "verde_remote", .module = remote_module },
                 .{ .name = "toml", .module = toml_module },
                 .{ .name = "loop_wakeup", .module = loop_wakeup_module },
                 .{ .name = "palette", .module = palette.module("palette") },
@@ -665,6 +676,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
                 .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
                 .{ .name = "headless", .module = headless_module },
+                .{ .name = "verde_remote", .module = remote_module },
                 .{ .name = "toml", .module = toml_module },
                 .{ .name = "loop_wakeup", .module = loop_wakeup_module },
                 .{ .name = "palette", .module = palette.module("palette") },

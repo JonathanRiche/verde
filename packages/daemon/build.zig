@@ -32,6 +32,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const remote_module = b.createModule(.{
+        .root_source_file = b.path("../client_core/src/shared/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "headless", .module = headless_module }},
+    });
     const platform_runtime_module = b.createModule(.{
         .root_source_file = b.path("../desktop/src/platform/runtime.zig"),
         .target = target,
@@ -57,6 +63,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "build_options", .module = build_options_module },
         .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
         .{ .name = "headless", .module = headless_module },
+        .{ .name = "verde_remote", .module = remote_module },
         .{ .name = "toml", .module = toml_module },
         .{ .name = "platform_paths", .module = platform_paths_module },
         .{ .name = "platform_runtime", .module = platform_runtime_module },

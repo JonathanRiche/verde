@@ -14,10 +14,16 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const remote_module = b.createModule(.{
+        .root_source_file = b.path("../client_core/src/shared/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "headless", .module = headless_module }},
+    });
 
     const known_folders = b.createModule(.{ .root_source_file = b.path("../desktop/src/platform/windows/known_folders.zig"), .target = target, .optimize = optimize });
     const paths = b.createModule(.{ .root_source_file = b.path("../desktop/src/platform/paths.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "platform_windows_known_folders", .module = known_folders }} });
-    const runtime = b.createModule(.{ .root_source_file = b.path("../desktop/src/web_runtime.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "headless", .module = headless_module }, .{ .name = "platform_paths", .module = paths } } });
+    const runtime = b.createModule(.{ .root_source_file = b.path("../desktop/src/web_runtime.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "headless", .module = headless_module }, .{ .name = "verde_remote", .module = remote_module }, .{ .name = "platform_paths", .module = paths } } });
 
     const exe = b.addExecutable(.{
         .name = "verde-web",
@@ -27,6 +33,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "headless", .module = headless_module },
+                .{ .name = "verde_remote", .module = remote_module },
                 .{ .name = "web_runtime", .module = runtime },
             },
         }),
@@ -47,6 +54,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "headless", .module = headless_module },
+                .{ .name = "verde_remote", .module = remote_module },
                 .{ .name = "web_runtime", .module = runtime },
             },
         }),

@@ -271,34 +271,9 @@ pub const RpcCallResult = union(enum) {
     }
 };
 
-/// Owned first-contact identity proposal. Controllers persist under the
-/// profile-store lock, reread the authoritative pair, then acknowledge this
-/// exact generation. No borrowed manager state crosses that transaction.
-pub const RuntimePinProposal = struct {
-    allocator: std.mem.Allocator,
-    profile_id: []u8,
-    generation: u64,
-    runtime_id: []u8,
-    instance_id: []u8,
-
-    pub fn deinit(self: *RuntimePinProposal) void {
-        self.allocator.free(self.profile_id);
-        self.allocator.free(self.runtime_id);
-        self.allocator.free(self.instance_id);
-        self.* = undefined;
-    }
-};
-
-pub const PersistedIdentity = struct {
-    runtime_id: []const u8,
-    instance_id: []const u8,
-};
-
-pub const PinAdoption = enum {
-    committed_current,
-    reconnect_required,
-    installed_disabled,
-};
+pub const RuntimePinProposal = @import("verde_remote").pin_controller.RuntimePinProposal;
+pub const PersistedIdentity = @import("verde_remote").pin_controller.PersistedIdentity;
+pub const PinAdoption = @import("verde_remote").pin_controller.PinAdoption;
 
 /// Selects a candidate numeric loopback port. The supervisor must bind and
 /// continuously own it before a bearer lease can be minted.
