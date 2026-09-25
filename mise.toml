@@ -110,6 +110,11 @@ description = "Runs the mobile client core (packages/client_core) unit tests and
 dir = "packages/client_core"
 run = "zig build test --release=safe"
 
+[tasks.mobile-core-contract]
+description = "Runs the mobile client core contract suite against a temporary headless daemon and verde-web on loopback (Linux)."
+dir = "packages/client_core"
+run = "zig build contract --release=safe"
+
 [tasks.mobile-core-android]
 description = "Cross-builds libverde_client.so for Android arm64-v8a and x86_64 against the NDK and checks NEEDED libraries and 16 KB page alignment."
 dir = "packages/client_core"

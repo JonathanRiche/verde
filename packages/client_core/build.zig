@@ -53,6 +53,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "headless", .module = headless }},
     });
     addTestStep(b, target, optimize, options, remote);
+    addContractStep(b, target, optimize, options);
     addAndroidStep(b, optimize, options, ndk_option orelse b.graph.environ_map.get("ANDROID_NDK_HOME"));
 }
 
@@ -94,6 +95,46 @@ fn addTestStep(
 
     const fmt_check = b.addFmt(.{ .paths = &.{ "src", "build.zig", "build.zig.zon" }, .check = true });
     test_step.dependOn(&fmt_check.step);
+}
+
+/// K-14: the real core against a temporary daemon and verde-web. Kept out of
+/// `test` so the fast unit suite never builds or spawns runtime processes.
+fn addContractStep(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    options: *std.Build.Step.Options,
+) void {
+    const contract_step = b.step("contract", "Run the core contract suite against a temporary daemon and verde-web");
+    if (b.graph.host.result.os.tag != .linux) {
+        contract_step.dependOn(&b.addFail("contract runs on Linux build hosts only").step);
+        return;
+    }
+    const prefix = b.pathJoin(&.{ b.install_prefix, "contract" });
+    const builds = [_]struct { dir: []const u8, args: []const []const u8 }{
+        .{ .dir = "../daemon", .args = &.{"daemon-exe"} },
+        .{ .dir = "../web_app", .args = &.{"install"} },
+    };
+    const contract_options = b.addOptions();
+    contract_options.addOption([]const u8, "daemon_exe", b.pathJoin(&.{ prefix, "bin", "verde-daemon" }));
+    contract_options.addOption([]const u8, "web_exe", b.pathJoin(&.{ prefix, "bin", "verde-web" }));
+
+    const module = createCoreModule(b, target, optimize, options);
+    module.root_source_file = b.path("src/contract_suite.zig");
+    module.addOptions("contract_options", contract_options);
+    // Imported core files carry their own unit tests; those belong to `test`.
+    const suite = b.addTest(.{ .name = "contract", .root_module = module, .use_llvm = true, .filters = &.{"K-14 contract"} });
+    const run = b.addRunArtifact(suite);
+    run.has_side_effects = true;
+    for (builds) |item| {
+        const build_cmd = b.addSystemCommand(&.{ b.graph.zig_exe, "build" });
+        build_cmd.addArgs(item.args);
+        build_cmd.addArgs(&.{ "--release=safe", "--prefix", prefix });
+        build_cmd.setCwd(b.path(item.dir));
+        build_cmd.has_side_effects = true;
+        run.step.dependOn(&build_cmd.step);
+    }
+    contract_step.dependOn(&run.step);
 }
 
 fn addAndroidStep(

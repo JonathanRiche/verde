@@ -104,6 +104,10 @@ pub fn build(b: *std.Build) void {
     const daemon_step = b.step("daemon", "Build and install the GUI-free Verde daemon");
     daemon_step.dependOn(&install_daemon.step);
     daemon_step.dependOn(&install_provider_bridge.step);
+    // Hermetic suites (client_core `contract`) need only the executable; the
+    // provider bridge bundle requires installed JS dependencies.
+    const daemon_exe_step = b.step("daemon-exe", "Build and install only the verde-daemon executable");
+    daemon_exe_step.dependOn(&install_daemon.step);
 
     const daemon_tests = b.addTest(.{
         .root_module = b.createModule(.{
