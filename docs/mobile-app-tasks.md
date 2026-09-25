@@ -172,7 +172,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | D-15 | App lock + secure screen | android | linux | D-05 | todo |
 | D-16 | Maestro flows + UI tests | android | linux+phone | D-08, D-09 | todo |
 | D-17 | Release build + Play internal track | android | linux | D-16, H-03 | todo |
-| I-01 | iOS project scaffold (XcodeGen) | ios | mac | K-02 | in_progress (astra cli-thread-1790352011729-c88d8c873c238e33) |
+| I-01 | iOS project scaffold (XcodeGen) | ios | mac | K-02 | done (bdfcfd3e; unsigned simulator only until H-04) |
 | I-02 | Core bridge + effect executor | ios | mac | I-01, K-06, K-15 | todo |
 | I-03 | Pairing flow | ios | mac+phone | I-02, K-07, A-06 | todo |
 | I-04 | Hosts + Home + Workspaces + lifecycle | ios | mac | I-03, D-05 | todo |
@@ -1112,6 +1112,7 @@ Shared rules:
     and `mobile-ios-test`. The screen shows `vc_version()`.
   - Add the root `AGENTS.md` link.
 - **Done when:** both mise tasks pass over SSH.
+- **Done (bdfcfd3e).** `packages/mobile_ios` holds the XcodeGen `project.yml` (App, a placeholder NotificationServiceExtension, Tests) linking `VerdeClient.xcframework`, plus `scripts/xcode.sh`. The mise tasks rebuild the xcframework and generate the project, and the tests run on a temporary simulator that is deleted afterwards. `mobile-ios-build` and `mobile-ios-test` pass over SSH (unsigned, no warnings). First simulator boot on the Mac takes about 8 minutes. Signing waits for H-04; building with the newer CI SDK is checked in I-12.
 
 #### I-02 · Core bridge + effect executor
 - **depends:** I-01, K-06, K-15
