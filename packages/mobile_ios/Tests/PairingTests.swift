@@ -26,6 +26,7 @@ private final class PairTransport: CoreTransport {
     let storage: PairStorage
     let prefix: String
     var loseExchange = false
+    var rejectExchange = false
     private let lock = NSLock()
     private var exchanges = 0
     private var firstBody: String?
@@ -57,6 +58,11 @@ private final class PairTransport: CoreTransport {
                     emit(.http_response(EventHttpResponse(now_ms: 0, wall_time_ms: 0, effect_id: e.effect_id,
                         generation: e.generation, status: nil, headers: [], body_base64: nil,
                         error: TransportFailure(kind: .network, code: .offline))))
+                    return
+                }
+                if rejectExchange {
+                    emit(.http_response(EventHttpResponse(now_ms: 0, wall_time_ms: 0, effect_id: e.effect_id,
+                        generation: e.generation, status: 401, headers: [], body_base64: "e30=", error: nil)))
                     return
                 }
                 XCTAssertTrue((try? storage.get(prefix + "/profile")) != nil)
@@ -161,6 +167,23 @@ final class PairingTests: XCTestCase {
         await model.receive(valid)
         try await until { model.row?.trust_proposal != nil }
         XCTAssertNil(model.inputError)
+        await model.stop()
+    }
+
+    func testColdLinkWaitsForStorageAndExpiredGrantAllowsNewInput() async throws {
+        let (model, _, transport) = try fixture()
+        transport.rejectExchange = true
+        await model.open(try XCTUnwrap(URL(string: fixtureLink())))
+        try await until { model.row?.auth_state == "unpaired" }
+        // The view invokes this when the hosts revision changes after reads.
+        await model.submitPending()
+        try await until { model.row?.trust_proposal != nil }
+        await model.trust(try XCTUnwrap(model.row?.trust_proposal), accept: true)
+        try await until { model.error?.code == "auth_rejected" }
+        XCTAssertFalse(model.busy)
+        XCTAssertFalse(model.paired)
+        XCTAssertNotNil(model.errorText)
+        XCTAssertFalse(transport.observations().2)
         await model.stop()
     }
 
