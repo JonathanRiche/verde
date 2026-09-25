@@ -14112,60 +14112,6 @@ fn browserHistoryResponse(daemon: *Daemon, id_value: std.json.Value, method: []c
     return try okValueResponse(allocator, id_value, .{ .cleared = true });
 }
 
-fn workspaceFilesSearchResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
-    const allocator = daemon.allocator;
-    if (params != .object) {
-        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "file search params must be an object");
-    }
-    const query = jsonString(params.object.get("query") orelse .null) orelse "";
-    if (query.len > workspace_file_search.MAX_QUERY_BYTES or std.mem.indexOfAny(u8, query, "\x00\r\n") != null) {
-        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid file search query");
-    }
-    const limit: usize = switch (params.object.get("limit") orelse .null) {
-        .null => workspace_file_search.DEFAULT_LIMIT,
-        .integer => |value| if (value >= 1) @intCast(@min(value, @as(i64, workspace_file_search.MAX_LIMIT))) else {
-            return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid file search limit");
-        },
-        else => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid file search limit"),
-    };
-
-    // Route resolution is shared with chat.turn.start; the primary repository
-    // is the default so plain workspace chats need not name it.
-    var route_params: std.json.ObjectMap = .empty;
-    defer route_params.deinit(allocator);
-    for ([_][]const u8{ "workspace_id", "relative_cwd", "project_path", "cwd" }) |key| {
-        if (params.object.get(key)) |value| try route_params.put(allocator, key, value);
-    }
-    try route_params.put(allocator, "repository_id", switch (params.object.get("repository_id") orelse .null) {
-        .null => .{ .string = store_protocol.PRIMARY_REPOSITORY_ID },
-        else => |value| value,
-    });
-    var route = (resolveChatExecutionRoute(daemon, .{ .object = route_params }) catch |err| return switch (err) {
-        error.InvalidParams, error.RouteAttachmentsUnsupported => try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid repository route params"),
-        error.CapabilityUnavailable => try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "repository checkout is unavailable on this runtime"),
-        error.ResourceNotFound => try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_RESOURCE_NOT_FOUND, "repository binding not found on this runtime"),
-        error.StoreCorrupt => try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_STORE_CORRUPT, "store is corrupt"),
-        error.StoreUnavailable => try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_STORE_UNAVAILABLE, "store is unavailable"),
-        error.OutOfMemory => error.OutOfMemory,
-    }) orelse return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid repository route params");
-    defer route.deinit(allocator);
-
-    var results = workspace_file_search.search(allocator, route.cwd orelse route.project_path, query, limit) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.SearchUnavailable => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "repository files could not be listed"),
-    };
-    defer results.deinit();
-    return try okValueResponse(allocator, id_value, .{
-        .repository_id = route.repository_id,
-        .relative_cwd = route.relative_cwd,
-        .query = query,
-        .files = results.files,
-        .total_files = results.total_files,
-        .truncated = results.truncated,
-        .source = @tagName(results.source),
-    });
-}
-
 // Browser cookie import: read source cookie stores from other installed
 // browsers so the GUI can present a per-site import picker. Cookie values are
 // never logged; these handlers run unlocked (file I/O) and are not web-exposed
