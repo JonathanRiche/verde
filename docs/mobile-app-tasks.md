@@ -122,7 +122,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | A-04 | Device self-service RPCs | host | linux | A-02 | done (42a3582b) |
 | A-05 | Idempotent pair exchange | host | linux | — | done (a36897f0) |
 | A-06 | Terminal QR + App Link pair URL | host | linux | — | done (b0f6e50b; phone-camera scan pending human-verify) |
-| A-07 | Desktop "Pair a phone" + Paired devices UI | host | linux | A-04, A-06 | in_progress (b7499bdf; preset-picker follow-up running in astra cli-thread-1790358128115-7a42b2851781fae5; human-verify pending) |
+| A-07 | Desktop "Pair a phone" + Paired devices UI | host | linux | A-04, A-06 | done (b7499bdf, b5a0d579; human-verify pending) |
 | A-08 | Web Settings paired-devices list | host | linux | A-04 | done (f6ff1cb9) |
 | A-09 | Pairing presets + access-mode cap | host | linux | A-02, H-08 | done (c844e093) |
 | A-10 | `mobile.min_client` + capability flags | host | linux | — | done (f8aa0db8) |
@@ -423,6 +423,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
   - Read `packages/desktop/AGENTS.md` first.
 - **Done when:** `mise run dev-build` passes. The owner relaunches and
   checks that the QR code shows and revoke works (human-verify).
+- **Done (b7499bdf, b5a0d579).** Desktop **Settings → Connections → Pair a phone** shows a QR code and link with a countdown and an explicit Copy link button. A preset picker offers Full (the default), Chat and Monitor, and requests send only `preset`. The picker locks while a link is shown, so the QR always matches the chosen preset. The Paired devices list shows each device's preset and access cap ("Custom / legacy" and "No cap" when empty) and can revoke with confirmation. `dev-build` passes and the focused tests pass 8/8. The owner still needs to check it visually and with a real device.
 
 #### A-08 · Web Settings paired-devices list
 - **depends:** A-04 · **touches:** `packages/web_app/web/src/ui/Overlays.tsx`
