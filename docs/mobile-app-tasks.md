@@ -134,10 +134,10 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | A-16 | `workspace.list` exposes repository binding roots | host | linux | A-01, A-02 | todo |
 | W-01 | App Link / universal link files + pair landing page | website | linux | H-03, H-04 | todo |
 | C-01 | Spike: APNs reachability from Workers | cloud | linux | — | done (research; recorded in plan §8, see C-02) |
-| C-02 | Push relay Worker | cloud | linux | C-01, A-12 | in_progress (astra cli-thread-1790351701612-fc3bbcd7eb28e252; no deploy without owner) |
+| C-02 | Push relay Worker | cloud | linux | C-01, A-12 | blocked: verde-cloud has no remote and its Alchemy baseline is uncommitted; owner to commit/configure (astra cli-thread-1790351701612-fc3bbcd7eb28e252) |
 | C-03 | Demo runtime for store review | cloud | linux | A-09 | todo |
 | K-01 | Core skeleton + Android toolchain proof | core | linux | — | done (951a5a5a) |
-| K-02 | iOS xcframework toolchain proof | core | mac | K-01, H-01, H-02 | in_progress (astra cli-thread-1790351694620-a58b60386b2b6e42) |
+| K-02 | iOS xcframework toolchain proof | core | mac | K-01, H-01, H-02 | done (e2f73abb) |
 | K-03 | Core API spec (events, effects, queries) | core | linux | K-01 | in_progress (astra cli-thread-1790351696474-542beadf66cd5ddc) |
 | K-04 | Extract shared remote-client modules from desktop | core | linux | K-01 | in_progress (astra cli-thread-1790351697558-48a6b174381d69dd) |
 | K-05 | Split `headless/client.zig` codec from I/O | core | linux | K-01 | in_progress (astra cli-thread-1790351698860-7ab2d678d434063c) |
@@ -170,7 +170,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | D-15 | App lock + secure screen | android | linux | D-05 | todo |
 | D-16 | Maestro flows + UI tests | android | linux+phone | D-08, D-09 | todo |
 | D-17 | Release build + Play internal track | android | linux | D-16, H-03 | todo |
-| I-01 | iOS project scaffold (XcodeGen) | ios | mac | K-02 | todo |
+| I-01 | iOS project scaffold (XcodeGen) | ios | mac | K-02 | in_progress (astra cli-thread-1790352011729-c88d8c873c238e33) |
 | I-02 | Core bridge + effect executor | ios | mac | I-01, K-06, K-15 | todo |
 | I-03 | Pairing flow | ios | mac+phone | I-02, K-07, A-06 | todo |
 | I-04 | Hosts + Home + Workspaces + lifecycle | ios | mac | I-03, D-05 | todo |
@@ -700,6 +700,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
   `xcodebuild -create-xcframework` → `VerdeClient.xcframework` with a
   module map. mise task `mobile-core-ios`.
 - **Done when:** `ssh mac 'cd ~/development/verde && git pull --ff-only && mise run mobile-core-ios'` succeeds; I-01 links it.
+- **Done (e2f73abb).** Static arm64 device + simulator slices → `packages/client_core/zig-out/lib/VerdeClient.xcframework` with `include/module.modulemap`; a Swift import/link smoke runs per slice. SDK discovery lives in `scripts/build-ios-xcframework.sh` (Mac only), documented in `docs/ios-toolchain.md`. LLVM stays on; LLD is off for these archives because Zig 0.16 rejects it for Mach-O.
 
 #### K-03 · Core API spec
 - **Do:** write `packages/client_core/docs/core-api.md`:
