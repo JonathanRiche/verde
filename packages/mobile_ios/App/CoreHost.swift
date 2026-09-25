@@ -197,6 +197,14 @@ actor CoreHost {
         core.close()
     }
     deinit {
+        if !stopped {
+            // Explicit shutdown is preferred. Dropping a host still seals the
+            // native lifecycle before tearing down all owned platform work.
+            let event = Event.shutdown(EventShutdown(
+                now_ms: Int64(ProcessInfo.processInfo.systemUptime * 1000),
+                wall_time_ms: Int64(Date().timeIntervalSince1970 * 1000)))
+            if let bytes = try? JSONEncoder().encode(event) { _ = try? core.handle(bytes) }
+        }
         continuation.finish()
         pump?.cancel()
         timers.values.forEach { $0.cancel() }

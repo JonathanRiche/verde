@@ -68,6 +68,24 @@ final class TLSPolicyTests: XCTestCase {
         }
     }
 
+    func testProbeCancelsBeforeHTTPAndReturnsPeer() throws {
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        var events: [Event] = []
+        let operation = SessionOperation(effect: .tls_probe(EffectTlsProbe(effect_id: "probe", generation: "7", origin: "https://bridge.invalid")),
+            queue: DispatchQueue(label: "probe.fixture"), emit: { events.append($0) }, ended: {})
+        let challenge = URLAuthenticationChallenge(protectionSpace: TrustSpace(try trust(anchored: true)),
+            proposedCredential: nil, previousFailureCount: 0, failureResponse: nil, error: nil, sender: ChallengeSender())
+        operation.urlSession(session, didReceive: challenge) { disposition, credential in
+            XCTAssertEqual(disposition, .cancelAuthenticationChallenge); XCTAssertNil(credential)
+        }
+        operation.cancel()
+        XCTAssertEqual(events.count, 1)
+        guard case .tls_peer(let peer) = events.first else { return XCTFail() }
+        XCTAssertTrue(peer.system_trusted); XCTAssertEqual(peer.spki_sha256, pin)
+        XCTAssertEqual(peer.effect_id, "probe"); XCTAssertEqual(peer.generation, "7")
+    }
+
     func testOriginValidation() {
         XCTAssertNotNil(TLSPolicy.endpoint("wss://bridge.invalid/ws", origin: "https://bridge.invalid", websocket: true))
         for raw in ["http://bridge.invalid", "https://other.invalid", "https://bridge.invalid:444", "https://user@bridge.invalid", "https://bridge.invalid/#fragment"] {
