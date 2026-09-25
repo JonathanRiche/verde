@@ -136,7 +136,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | A-18 | Daemon-native subagent open | host | linux | A-02 | todo |
 | W-01 | App Link / universal link files + pair landing page | website | linux | H-03, H-04 | todo |
 | C-01 | Spike: APNs reachability from Workers | cloud | linux | — | done (research; recorded in plan §8, see C-02) |
-| C-02 | Push relay Worker | cloud | linux | C-01, A-12 | human (code done in verde-cloud c16126bd; waiting on owner approval to deploy the throwaway APNs probe) |
+| C-02 | Push relay Worker | cloud | linux | C-01, A-12 | human (code done in verde-cloud c16126bd; owner-approved probe run 2026-09-25 was inconclusive (502), diagnostic retry running; production deploy needs H-05 keys) |
 | C-03 | Demo runtime for store review | cloud | linux | A-09 | todo |
 | K-01 | Core skeleton + Android toolchain proof | core | linux | — | done (951a5a5a) |
 | K-02 | iOS xcframework toolchain proof | core | mac | K-01, H-01, H-02 | done (e2f73abb) |
@@ -149,11 +149,11 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | K-09 | Sync + projection | core | linux | K-08 | done (dfbd6d6f) |
 | K-10 | Chat engine | core | linux | K-09 | in_progress (astra cli-thread-1790362328697-dc5576a2ceb2b5f4) |
 | K-11 | Markdown AST / highlight spans / diff parse exports | core | linux | K-06 | done (93000154, c37e038c) |
-| K-12 | Terminal handle + PTY pump | core | linux | K-06 | in_progress (astra cli-thread-1790362330364-2f0c30d725920233) |
+| K-12 | Terminal handle + PTY pump | core | linux | K-06 | done (a7650965) |
 | K-13 | Allowlist coverage test | core | linux | K-10, A-02 | todo |
 | K-14 | Contract suite vs real gateway + daemon | core | linux | K-10 | todo |
 | K-15 | Kotlin/Swift model codegen from Zig types | core | linux | K-06 | done (fdb77f3d) |
-| K-16 | Delta-mode sync | core | linux | K-09, A-11 | todo |
+| K-16 | Delta-mode sync | core | linux | K-09, A-11 | in_progress (astra cli-thread-1790364215750-82de15a4a4901ec8) |
 | K-17 | Attention state machine + push decrypt | core | linux | K-09, A-12 | todo |
 | D-01 | Android project scaffold | android | linux | K-01 | done (ee3c19df; on-device version display pending human-verify) |
 | D-02 | Core bridge + effect executor | android | linux | D-01, K-06, K-15 | done (0f7fb9c6) |
@@ -883,6 +883,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
     desktop-native panes.
 - **Done when:** tests feed VT fixtures and assert the snapshots; the
   handle builds for both targets.
+- **Done (a7650965).** The core has a terminal handle backed by Ghostty's VT, with C and JNI entry points, and a PTY pump that uses `session.*` only. The tail offset advances only after `terminal_applied`, and input and paste are sent in order. Replay truncation is detected from either the `truncated` flag or a gap in the legacy offset. Timers are re-armed by a stable purpose, which fixed a bug where an early timer lost its terminal. The grid, cursor, modes and pump state are registered for codegen. `mobile-core-test` passes 121/121, both Android ABIs build, `mobile-models-check` passes, and the iOS device and simulator Swift link smoke tests pass. Scrollback follows Ghostty's page granularity, documented in `docs/`.
 
 #### K-13 · Allowlist coverage test
 - **depends:** K-10, A-02
