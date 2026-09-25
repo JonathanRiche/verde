@@ -169,9 +169,11 @@ pub const State = struct {
         return true;
     }
 
-    /// Replaces the editable URL field with a new value.
+    /// Replaces the editable URL field with a new value. The engine's blank
+    /// placeholder page shows as an empty field, like a normal new tab.
     pub fn setAddress(self: *State, value: []const u8) void {
         @memset(&self.address_storage, 0);
+        if (isBlankPageUrl(value)) return;
         const len = @min(value.len, self.address_storage.len - 1);
         @memcpy(self.address_storage[0..len], value[0..len]);
     }
@@ -231,3 +233,16 @@ pub const State = struct {
         slot.* = if (value) |slice| try self.allocator.dupe(u8, slice) else null;
     }
 };
+
+/// Reports whether `url` is the engine's blank placeholder page, which the UI
+/// presents as an empty new tab rather than a navigable address.
+pub fn isBlankPageUrl(url: []const u8) bool {
+    return std.mem.eql(u8, std.mem.trim(u8, url, &std.ascii.whitespace), "about:blank");
+}
+
+test "blank placeholder page is recognized for the empty address field" {
+    try std.testing.expect(isBlankPageUrl("about:blank"));
+    try std.testing.expect(isBlankPageUrl(" about:blank\n"));
+    try std.testing.expect(!isBlankPageUrl("https://example.com"));
+    try std.testing.expect(!isBlankPageUrl(""));
+}

@@ -3184,7 +3184,9 @@ pub fn browserTabTitle(self: anytype, index: usize) []const u8 {
     const ref = self.visibleBrowserPaneRefMutable() orelse return "New tab";
     if (index >= ref.tabs.items.len) return "New tab";
     const tab = &ref.tabs.items[index];
-    return tab.title orelse tab.url orelse "New tab";
+    if (tab.title) |title| if (title.len > 0 and !browser_runtime.isBlankPageUrl(title)) return title;
+    const url = tab.url orelse return "New tab";
+    return if (url.len == 0 or browser_runtime.isBlankPageUrl(url)) "New tab" else url;
 }
 
 pub fn browserTabPinned(self: anytype, index: usize) bool {

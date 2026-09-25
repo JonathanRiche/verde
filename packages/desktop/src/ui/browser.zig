@@ -1663,7 +1663,7 @@ fn browserSecurityNotice(url: ?[]const u8) []const u8 {
 fn renderPaletteAddressField(state: *app_state.AppState, rect: palette.Rect) void {
     const focused = state.browser_controller.address_focused;
     const address = state.browserState().addressInput();
-    const text = if (address.len == 0 and !focused) "https://example.com" else address;
+    const text = if (address.len == 0 and !focused) "Search or enter address" else address;
     const font_size = theme.scaledUi(14.0);
     const pad_x = theme.scaledUi(10.0);
     const security_slot = theme.scaledUi(20.0);

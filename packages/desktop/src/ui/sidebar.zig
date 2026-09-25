@@ -2653,10 +2653,10 @@ fn browserPaneTitle(pane: *const native_state.WorkspacePane) []const u8 {
     };
     const tab = ref.activeTabConst() orelse return "Browser";
     if (tab.title) |title| {
-        if (title.len > 0) return title;
+        if (title.len > 0 and !std.mem.eql(u8, title, "about:blank")) return title;
     }
     const url = tab.url orelse return "Browser";
-    if (url.len == 0) return "Browser";
+    if (url.len == 0 or std.mem.eql(u8, url, "about:blank")) return "New tab";
     return url;
 }
 
