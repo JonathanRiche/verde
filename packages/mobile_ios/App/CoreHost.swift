@@ -10,6 +10,8 @@ protocol HostCore: AnyObject {
     func close()
 }
 
+private struct RejectedEvent: Error { let status: Int32 }
+
 enum CoreBridgeError: Error { case status(Int32), closed, invalidOutput }
 
 final class NativeHostCore: HostCore {
@@ -129,10 +131,18 @@ actor CoreHost {
             }
             object["now_ms"] = .integer(Int64(ProcessInfo.processInfo.systemUptime * 1000))
             object["wall_time_ms"] = .integer(Int64(Date().timeIntervalSince1970 * 1000))
-            let batch = try JSONDecoder().decode(EffectBatch.self, from:
-                core.handle(JSONEncoder().encode(JSONValue.object(object))))
+            let output: Data
+            do { output = try core.handle(JSONEncoder().encode(JSONValue.object(object))) }
+            catch CoreBridgeError.status(let status) where status == 1 || status == 4 || status == 5 {
+                // Transactional input/lifecycle/resource rejection returns no
+                // effects and leaves the handle usable (e.g. a malformed link).
+                throw RejectedEvent(status: status)
+            }
+            let batch = try JSONDecoder().decode(EffectBatch.self, from: output)
             try dispatch(batch.effects)
             if case .shutdown = event { finish() }
+        } catch let rejected as RejectedEvent {
+            throw CoreBridgeError.status(rejected.status)
         } catch {
             // A lost/undecodable batch is fatal; never replay partially dispatched work.
             finish()

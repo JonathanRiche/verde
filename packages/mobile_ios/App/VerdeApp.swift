@@ -8,17 +8,8 @@ enum ClientCore {
 
 @main
 struct VerdeApp: App {
+    @State private var pairing = PairingModel.live(deviceLabel: UIDevice.current.name)
     var body: some Scene {
-        WindowGroup {
-            VStack(spacing: 12) {
-                Text("Verde")
-                    .font(.largeTitle)
-                Text("Core \(ClientCore.version)")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .accessibilityIdentifier("coreVersion")
-            }
-            .padding()
-        }
+        WindowGroup { PairingView(model: pairing) }
     }
 }
