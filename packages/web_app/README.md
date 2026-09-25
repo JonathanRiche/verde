@@ -167,3 +167,18 @@ readiness, runtime IDs, and workspace defaults. Credentials and remote endpoints
 remain server-side. The bridge permits only chat execution/control/read methods
 and repository inspection. Remote web-chat image uploads are currently rejected
 with the draft attachments retained; local uploads continue to work.
+
+### Confined directory browsing
+
+Paired clients can call daemon RPC `workspace.directory.list {"path":"/absolute/path"}`
+with `repository:read`; `workspace.directory.v1` advertises support. It returns
+`{path,parent,directories:[{name,path}]}` with directories only (maximum 4096).
+The daemon allows its home directory, parents of existing persisted workspace
+directories, and additional absolute roots in its colon-separated
+`VERDE_DIRECTORY_ROOTS` environment variable. Missing roots are ignored. No
+client-supplied root is accepted. Parent navigation stops at the policy boundary.
+Paths containing `..`, escaping symlinks, and non-directory entries are rejected
+or omitted. Linux permits relative in-root directory symlinks; the portable
+fallback rejects symlinks. Listing uses a descriptor opened beneath the root,
+so the desktop need not be running. The legacy `web.directory.list` remains
+blocked.

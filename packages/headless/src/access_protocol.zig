@@ -343,6 +343,7 @@ pub const PAIRED_RPC_METHODS = [_]PairedRpcMethod{
     .{ .method = "workspace.resolve", .scope_mask = REPOSITORY_READ },
     .{ .method = "workspace.list", .scope_mask = REPOSITORY_READ },
     .{ .method = "workspace.repository.manifest.get", .scope_mask = REPOSITORY_READ },
+    .{ .method = "workspace.directory.list", .scope_mask = REPOSITORY_READ },
     .{ .method = "workspace.files.search", .scope_mask = REPOSITORY_READ },
 
     .{ .method = "workspace.upsert", .scope_mask = REPOSITORY_WRITE },
@@ -933,4 +934,8 @@ test "pairing presets have exact scopes and caps" {
     try std.testing.expect(!scopeMaskContains(chat, requiredScopeMaskForRpc("chat.shell.run").?));
     try std.testing.expect(!scopeMaskContains(monitor, requiredScopeMaskForRpc("chat.turn.start").?));
     try std.testing.expect(scopeMaskContains(chat, requiredScopeMaskForRpc("chat.turn.approve").?));
+}
+
+test "directory browsing requires repository read for paired devices" {
+    try std.testing.expectEqual(@as(?u16, REPOSITORY_READ), requiredScopeMaskForRpc("workspace.directory.list"));
 }

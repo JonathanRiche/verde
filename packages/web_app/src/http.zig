@@ -4006,3 +4006,11 @@ test "paired preset RPC policy permits only each preset's selected authority" {
         try std.testing.expectEqual(PairedRpcPolicy{ .authorize = access.requiredScopeMaskForRpc(method).? }, pairedRpcPolicy(method, monitor));
     }
 }
+
+test "paired directory listing uses repository read and the daemon route" {
+    const read = headless.access_protocol.scopeBit(.repository_read);
+    try std.testing.expect(!blockedRpcMethod("workspace.directory.list"));
+    try std.testing.expect(@import("web_runtime").allowedMethod("workspace.directory.list"));
+    try std.testing.expectEqual(@as(PairedRpcPolicy, .{ .authorize = read }), pairedRpcPolicy("workspace.directory.list", read));
+    try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy("workspace.directory.list", 0));
+}

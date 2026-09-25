@@ -377,6 +377,7 @@ pub const RUNTIME_CAPABILITY_NAMES = RUNTIME_CAPABILITY_NAMES_BASE ++
         "chat.repository_route.v1",
         attachment_protocol.CHAT_ATTACHMENT_CAPABILITY,
         access_protocol.PAIR_RUNTIME_CAPABILITY,
+        WORKSPACE_DIRECTORY_CAPABILITY,
         DEVICE_PUSH_CAPABILITY,
         ACCESS_PAIR_IDEMPOTENT_CAPABILITY,
     };
@@ -398,9 +399,7 @@ pub const ACCESS_PAIR_IDEMPOTENT_CAPABILITY: []const u8 = "access.pair.idempoten
 /// RUNTIME_CAPABILITY_NAMES_BASE (available without the durable store) or the
 /// store-backed tail of RUNTIME_CAPABILITY_NAMES, in the same commit as the
 /// feature and its tests. Gateway-only features are advertised by the gateway.
-pub const PENDING_RUNTIME_CAPABILITY_NAMES = [_][]const u8{
-    WORKSPACE_DIRECTORY_CAPABILITY,
-};
+pub const PENDING_RUNTIME_CAPABILITY_NAMES = [_][]const u8{};
 
 /// Runtime generation a remote JSON-RPC request intends to reach. Keeping
 /// this at the envelope level lets the daemon reject a stale or misdirected
@@ -1169,4 +1168,13 @@ test "store-backed runtimes advertise idempotent pairing" {
         if (std.mem.eql(u8, capability, ACCESS_PAIR_IDEMPOTENT_CAPABILITY)) return;
     }
     return error.TestExpectedEqual;
+}
+
+test "store-backed runtimes advertise confined directory browsing" {
+    var advertised = false;
+    for (RUNTIME_CAPABILITY_NAMES) |name| {
+        if (std.mem.eql(u8, name, WORKSPACE_DIRECTORY_CAPABILITY)) advertised = true;
+    }
+    try std.testing.expect(advertised);
+    for (RUNTIME_CAPABILITY_NAMES_BASE) |name| try std.testing.expect(!std.mem.eql(u8, name, WORKSPACE_DIRECTORY_CAPABILITY));
 }

@@ -39,6 +39,7 @@ const platform_live_endpoint = @import("../platform/live_endpoint.zig");
 const workspace_identity = @import("../platform/workspace_identity.zig");
 const stack = @import("../workspace/stack.zig");
 const platform_runtime = @import("platform_runtime");
+const directory_browser = @import("../daemon/directory_browser.zig");
 const process_env = @import("../platform/env.zig");
 const provider_cli_version = @import("../providers/cli_version.zig");
 const provider_hooks = @import("../providers/hooks.zig");
@@ -2892,6 +2893,7 @@ pub const Daemon = struct {
     fn handleMethodRequest(self: *Daemon, id_value: std.json.Value, method: []const u8, params: std.json.Value) ![]u8 {
         // Store methods own their drain/capability precedence and unlock
         // lockDaemon for SQLite work; route before the generic mutator drain gate.
+        if (std.mem.eql(u8, method, directory_browser.METHOD)) return try workspaceDirectoryListResponse(self, id_value, params);
         if (isStoreMethod(method)) return try self.handleStoreRequest(id_value, method, params);
         if (isPushMethod(method)) return try self.handlePushRequest(id_value, method, params);
         if (isAccessMethod(method)) return try self.handleAccessRequest(id_value, method, params);
@@ -12676,7 +12678,8 @@ const ServerRequestClass = enum { slow_registry, store, unlocked_method, normal 
 fn methodRunsUnlocked(method: []const u8) bool {
     // M4-P4: ledger identity guard on accept must read SQLite under the store
     // mutex only; the `.normal` outer lockDaemon window cannot nest that work.
-    return std.mem.startsWith(u8, method, "chat.links.") or std.mem.startsWith(u8, method, "chat.tasks.") or
+    return std.mem.eql(u8, method, directory_browser.METHOD) or
+        std.mem.startsWith(u8, method, "chat.links.") or std.mem.startsWith(u8, method, "chat.tasks.") or
         // Browser history is per-keystroke SQLite work under the store mutex
         // only; it pins in_flight and checks the drain flag itself.
         std.mem.startsWith(u8, method, "browser.history.") or
@@ -14240,6 +14243,62 @@ fn browserHistoryResponse(daemon: *Daemon, id_value: std.json.Value, method: []c
         };
     }
     return try okValueResponse(allocator, id_value, .{ .cleared = true });
+}
+
+fn workspaceDirectoryListResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+    return workspaceDirectoryListWithEnvironment(daemon, id_value, params, if (std.c.getenv("HOME")) |value| std.mem.span(value) else null, if (std.c.getenv(directory_browser.ROOTS_ENV)) |value| std.mem.span(value) else null);
+}
+
+fn workspaceDirectoryListWithEnvironment(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value, home: ?[]const u8, configured_roots: ?[]const u8) ![]u8 {
+    const allocator = daemon.allocator;
+    const path = if (params == .object) jsonString(params.object.get("path") orelse .null) else null;
+    if (path == null or !directory_browser.validPath(path.?)) {
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "directory path must be absolute without parent traversal");
+    }
+    var arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var roots: std.ArrayList([]const u8) = .empty;
+    var workspace_paths: std.ArrayList([]const u8) = .empty;
+    lockDaemon(daemon);
+    const service = daemon.store_service;
+    if (service) |svc| _ = svc.in_flight.fetchAdd(1, .monotonic);
+    daemon.mutex.unlock();
+    const svc = service orelse return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_STORE_UNAVAILABLE, "store is unavailable");
+    defer _ = svc.in_flight.fetchSub(1, .monotonic);
+    {
+        lockStoreService(svc);
+        defer svc.mutex.unlock();
+        var rows = svc.store.conn.rows("select path from workspaces", .{}) catch return try storeErrorResponse(allocator, id_value, error.StoreUnavailable);
+        defer rows.deinit();
+        while (rows.next()) |row| try workspace_paths.append(arena, try arena.dupe(u8, row.text(0)));
+        if (rows.err) |_| return try storeErrorResponse(allocator, id_value, error.StoreUnavailable);
+    }
+    // Only persisted host state/environment supplies roots; RPC params cannot
+    // widen policy. Filesystem operations happen outside the SQLite mutex.
+    if (home) |value| try directory_browser.appendRoot(arena, io, &roots, value);
+    for (workspace_paths.items) |workspace_path| {
+        if (!directory_browser.validPath(workspace_path)) continue;
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const workspace_dir = std.Io.Dir.openDirAbsolute(io, workspace_path, .{}) catch continue;
+        defer workspace_dir.close(io);
+        const len = workspace_dir.realPath(io, &buffer) catch continue;
+        if (std.fs.path.dirname(buffer[0..len])) |parent| try directory_browser.appendRoot(arena, io, &roots, parent);
+    }
+    if (configured_roots) |configured| {
+        var paths = std.mem.tokenizeScalar(u8, configured, ':');
+        while (paths.next()) |root| try directory_browser.appendRoot(arena, io, &roots, root);
+    }
+    const result = directory_browser.list(arena, io, roots.items, path.?) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.ResponseTooLarge => error.ResponseTooLarge,
+        error.FileNotFound, error.NotDir => try errorResponseAlloc(allocator, id_value, "not_found", "directory not found"),
+        else => try errorResponseAlloc(allocator, id_value, "path_outside_roots", "directory is outside allowed roots or inaccessible"),
+    };
+    return try okValueResponse(allocator, id_value, result);
 }
 
 fn workspaceFilesSearchResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
@@ -22485,4 +22544,60 @@ fn expectPresetResponse(value: std.json.Value, preset: access_protocol.PairingPr
     var mask: u16 = 0;
     for (scopes) |scope| mask |= access_protocol.scopeBit(try access_protocol.parseScope(scope.string));
     try std.testing.expectEqual(try access_protocol.scopeMask(preset.scopes()), mask);
+}
+
+test "directory RPC uses durable workspace parents and host roots without desktop state" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_][]const u8{ "home/child", "projects/repo", "configured/child", "outside/secret" }) |path| try tmp.dir.createDirPath(io, path);
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &buffer);
+    const base = buffer[0..len];
+    const home = try std.fs.path.join(arena, &.{ base, "home" });
+    const configured = try std.fs.path.join(arena, &.{ base, "configured" });
+    const repo = try std.fs.path.join(arena, &.{ base, "projects/repo" });
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    const service = try allocator.create(StoreService);
+    service.* = .{ .store = daemon_store.Store.initWithRuntimeIdentity(allocator, db_path, .none, .{
+        .runtime_id = daemon.runtime_id,
+        .instance_id = daemon.instance_id,
+    }) catch |err| {
+        allocator.destroy(service);
+        return err;
+    } };
+    daemon.store_service = service;
+    defer detachTestStoreService(&daemon);
+    _ = try service.store.upsertWorkspace(.{
+        .mutation = .{ .request_key = "directory-policy", .client_id = "test" },
+        .workspace = .{ .workspace_id = "repo", .label = "Repository", .path = repo },
+    });
+    for ([_][]const u8{ "home", "projects", "configured", "outside" }, 0..) |suffix, i| {
+        var params: std.json.ObjectMap = .empty;
+        try params.put(arena, "path", .{ .string = try std.fs.path.join(arena, &.{ base, suffix }) });
+        const response = try workspaceDirectoryListWithEnvironment(&daemon, .{ .integer = 1 }, .{ .object = params }, home, configured);
+        defer allocator.free(response);
+        var parsed = try headless.parseResponse(allocator, response);
+        defer parsed.deinit();
+        try std.testing.expectEqual(i < 3, parsed.response.isOk());
+        if (i < 3) {
+            const result = parsed.response.result.?.object;
+            try std.testing.expect(result.get("parent").? == .null);
+            try std.testing.expectEqual(@as(usize, 1), result.get("directories").?.array.items.len);
+        } else try std.testing.expect(std.mem.indexOf(u8, response, "path_outside_roots") != null);
+    }
+    // Real dispatch reaches the daemon handler without invoking Desktop Live.
+    const invalid = try daemon.handleRequest(
+        \\{"id":2,"method":"workspace.directory.list","params":{"path":"../escape"}}
+    );
+    defer allocator.free(invalid);
+    try std.testing.expect(std.mem.indexOf(u8, invalid, "invalid_params") != null);
+    try std.testing.expect(methodRunsUnlocked(directory_browser.METHOD));
 }
