@@ -125,7 +125,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | A-07 | Desktop "Pair a phone" + Paired devices UI | host | linux | A-04, A-06 | todo |
 | A-08 | Web Settings paired-devices list | host | linux | A-04 | todo |
 | A-09 | Pairing presets + access-mode cap | host | linux | A-02, H-08 | todo |
-| A-10 | `mobile.min_client` + capability flags | host | linux | — | in_progress (cli-thread-1790350351170-d56ab99abb804210) |
+| A-10 | `mobile.min_client` + capability flags | host | linux | — | done (f8aa0db8) |
 | A-11 | Delta change feed on the gateway | host | linux | A-10 | todo |
 | A-12 | Push crypto module (seal/open) | host | linux | — | done (7f5c621f) |
 | A-13 | Push outbox + `device.push.*` RPCs | host | linux | A-02, A-12 | todo |
@@ -446,6 +446,15 @@ exact question and stop. Report: commit sha, files changed, verification output,
   `device.push.v1`, `workspace.directory.v1`, `access.pair.idempotent.v1`).
   Keep them in `RUNTIME_CAPABILITY_NAMES`.
 - **Done when:** tests pass; `$ZB headless-test` passes.
+- **Done (f8aa0db8).** `MOBILE_MIN_CLIENT = 1` in `protocol.zig`;
+  `core.status` / `core.capabilities` carry `"mobile":{"min_client":1}`
+  (older hosts decode as 0 = not advertised). The four future names live in
+  `PENDING_RUNTIME_CAPABILITY_NAMES` and are not advertised; each later
+  task moves its constant into the advertised list in the same commit as
+  the feature. Notes: A-05 should also add `access.pair.idempotent.v1` to
+  the gateway's hard-coded pairing descriptor in `http.zig`; A-11 must
+  decide whether the gateway adds `core.changes.delta.v1` itself (the
+  feature is gateway-side but the list comes from the daemon).
 
 #### A-11 · Delta change feed on the gateway
 - **depends:** A-10 · **touches:** `packages/web_app/src/http.zig`
