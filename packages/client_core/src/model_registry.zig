@@ -1,6 +1,7 @@
 //! The single list of exported native models; see docs/model-codegen.md.
 const wire = @import("wire.zig");
 const rendering = @import("rendering.zig");
+const chat = @import("chat_models.zig");
 const projection = @import("projection.zig");
 const terminal = @import("terminal.zig");
 const pump = @import("terminal_pump.zig");
@@ -12,6 +13,26 @@ pub const types = .{
     .{ "TerminalSnapshot", terminal.Snapshot },
     .{ "TerminalView", pump.View },
     .{ "TerminalQuery", wire.Query(pump.View) },
+    .{ "ChatAttachment", chat.Attachment },
+    .{ "ChatTool", chat.Tool },
+    .{ "ChatRow", chat.Row },
+    .{ "ChatTurn", chat.Turn },
+    .{ "ChatApproval", chat.Approval },
+    .{ "ChatFollowup", chat.Followup },
+    .{ "ChatSelection", chat.Selection },
+    .{ "ChatChoice", chat.Choice },
+    .{ "ChatCatalogs", chat.Catalogs },
+    .{ "ChatDraft", chat.Draft },
+    .{ "ChatMention", chat.Mention },
+    .{ "ChatShellConfirmation", chat.ShellConfirmation },
+    .{ "ChatUsageLimit", chat.UsageLimit },
+    .{ "ChatUsageStat", chat.UsageStat },
+    .{ "ChatUsage", chat.Usage },
+    .{ "ChatPage", chat.Page },
+    .{ "ChatThreadView", chat.ThreadView },
+    .{ "ChatComposerView", chat.ComposerView },
+    .{ "ThreadQuery", wire.Query(chat.ThreadView) },
+    .{ "ComposerQuery", wire.Query(chat.ComposerView) },
     .{ "Config", wire.Config },
     .{ "Lifecycle", wire.Lifecycle },
     .{ "LocalError", wire.LocalError },

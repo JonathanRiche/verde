@@ -216,28 +216,9 @@ test "every constructor, staging, effect and output allocation failure rolls bac
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationScenario, .{});
 }
 
-test "all future feature intents fail visibly with unsupported and no I/O" {
+test "retry without a started host fails visibly and emits no I/O" {
     const cases = [_]struct { tag: []const u8, payload: []const u8 }{
         .{ .tag = "retry_connection", .payload = "" },
-        .{ .tag = "focus", .payload = ",\"workspace_id\":null,\"thread_id\":null,\"terminal_id\":null" },
-        .{ .tag = "thread_open", .payload = "" },
-        .{ .tag = "thread_load_older", .payload = "" },
-        .{ .tag = "history_search", .payload = ",\"query\":\"find\"" },
-        .{ .tag = "history_load_more", .payload = "" },
-        .{ .tag = "draft_set", .payload = ",\"text\":\"draft\",\"attachments\":[]" },
-        .{ .tag = "composer_select", .payload = ",\"provider\":null,\"model\":null,\"effort\":null,\"access\":null,\"speed\":null" },
-        .{ .tag = "send", .payload = ",\"draft_revision\":\"1\"" },
-        .{ .tag = "turn_cancel", .payload = ",\"turn_id\":\"turn\"" },
-        .{ .tag = "followup_submit", .payload = ",\"draft_revision\":\"1\",\"kind\":\"queue\"" },
-        .{ .tag = "followup_retry", .payload = ",\"followup_id\":\"f\"" },
-        .{ .tag = "followup_pull_back", .payload = ",\"followup_id\":\"f\"" },
-        .{ .tag = "followup_cancel", .payload = ",\"followup_id\":\"f\"" },
-        .{ .tag = "approval_decide", .payload = ",\"turn_id\":\"turn\",\"call_id\":\"c\",\"decision\":\"approve\"" },
-        .{ .tag = "shell_prepare", .payload = ",\"command\":\"ls\"" },
-        .{ .tag = "shell_confirm", .payload = ",\"confirmation_id\":\"c\",\"accept\":false" },
-        .{ .tag = "slash_search", .payload = ",\"query\":\"q\"" },
-        .{ .tag = "slash_run", .payload = ",\"command\":\"c\",\"args\":\"\"" },
-        .{ .tag = "mention_search", .payload = ",\"query\":\"q\"" },
     };
     for (cases) |case| {
         var f = try Fixture.init();

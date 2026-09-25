@@ -1,0 +1,59 @@
+[
+  {
+    "status": "running",
+    "started_at_ms": 1790363190811,
+    "events": [],
+    "next_seq": 1,
+    "page_last_seq": 0,
+    "has_more_events": false,
+    "provider_thread_id": null,
+    "active_turn_id": null,
+    "user_message_id": "fixture-user",
+    "user_prompt": "Fixture prompt",
+    "result_reply_text": null,
+    "generated_title": null,
+    "generated_title_expected": null,
+    "generated_title_previous": null,
+    "error_message": null,
+    "failure_reason": null,
+    "pending_approval": null,
+    "committed_store_revision": null,
+    "events_compacted_before_seq": null,
+    "durability_pending": true,
+    "durability_error": null
+  },
+  {
+    "status": "completed",
+    "started_at_ms": 1790363190811,
+    "events": [
+      {
+        "seq": 1,
+        "kind": "assistant_delta",
+        "payload_json": "{\"text\":\"stub-ok\"}"
+      },
+      {
+        "seq": 2,
+        "kind": "completed",
+        "payload_json": "{}"
+      }
+    ],
+    "next_seq": 3,
+    "page_last_seq": 2,
+    "has_more_events": false,
+    "provider_thread_id": "stub-provider-thread",
+    "active_turn_id": null,
+    "user_message_id": "fixture-user",
+    "user_prompt": "Fixture prompt",
+    "result_reply_text": "stub-ok",
+    "generated_title": null,
+    "generated_title_expected": null,
+    "generated_title_previous": null,
+    "error_message": null,
+    "failure_reason": null,
+    "pending_approval": null,
+    "committed_store_revision": 48,
+    "events_compacted_before_seq": null,
+    "durability_pending": false,
+    "durability_error": null
+  }
+]

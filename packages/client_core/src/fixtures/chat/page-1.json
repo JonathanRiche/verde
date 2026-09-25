@@ -1,0 +1,76 @@
+{
+  "messages": [
+    {
+      "sort_index": 0,
+      "message_id": "old-0",
+      "role": "system",
+      "author": "Fixture",
+      "body": "History 0",
+      "images": [],
+      "image": null,
+      "tool_call_id": null,
+      "tool_call_kind": null,
+      "tool_call_status": null,
+      "created_at_ms": null,
+      "updated_at_ms": null
+    },
+    {
+      "sort_index": 1,
+      "message_id": "old-1",
+      "role": "system",
+      "author": "Fixture",
+      "body": "History 1",
+      "images": [],
+      "image": null,
+      "tool_call_id": null,
+      "tool_call_kind": null,
+      "tool_call_status": null,
+      "created_at_ms": null,
+      "updated_at_ms": null
+    },
+    {
+      "sort_index": 2,
+      "message_id": "old-2",
+      "role": "system",
+      "author": "Fixture",
+      "body": "History 2",
+      "images": [],
+      "image": null,
+      "tool_call_id": null,
+      "tool_call_kind": null,
+      "tool_call_status": null,
+      "created_at_ms": null,
+      "updated_at_ms": null
+    },
+    {
+      "sort_index": 3,
+      "message_id": "old-3",
+      "role": "system",
+      "author": "Fixture",
+      "body": "History 3",
+      "images": [],
+      "image": null,
+      "tool_call_id": null,
+      "tool_call_kind": null,
+      "tool_call_status": null,
+      "created_at_ms": null,
+      "updated_at_ms": null
+    },
+    {
+      "sort_index": 4,
+      "message_id": "old-4",
+      "role": "system",
+      "author": "Fixture",
+      "body": "History 4",
+      "images": [],
+      "image": null,
+      "tool_call_id": null,
+      "tool_call_kind": null,
+      "tool_call_status": null,
+      "created_at_ms": null,
+      "updated_at_ms": null
+    }
+  ],
+  "next_cursor": null,
+  "store_revision": 46
+}

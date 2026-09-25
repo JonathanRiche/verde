@@ -23,6 +23,8 @@ pub const WorkerStatus = enum {
 };
 
 pub const WorkerOutcome = struct {
+    /// Live overlays preserve in-progress tool states; durable callers keep the default.
+    streaming: bool = false,
     status: WorkerStatus,
     provider: []const u8 = "",
     reply_text: []const u8 = "",
@@ -112,7 +114,7 @@ pub fn apply(
     }
 
     try flushAssistant(allocator, &rows, &partial_text, outcome.provider);
-    cancelLingeringTools(allocator, &rows);
+    if (!outcome.streaming) cancelLingeringTools(allocator, &rows);
 
     switch (outcome.status) {
         .completed => {

@@ -1,0 +1,21 @@
+//! Native chat views. Byte counts and local/stream cursors are decimal strings.
+const h = @import("host.zig");
+const p = @import("projection.zig");
+pub const Attachment = struct { local_id: []const u8, name: []const u8, mime: []const u8, byte_size: []const u8, attachment_id: ?[]const u8 = null, reference: ?[]const u8 = null, uploaded_bytes: []const u8 = "0", status: []const u8 = "local", @"error": ?h.LocalError = null };
+pub const Tool = struct { id: []const u8, kind: []const u8, status: []const u8 };
+pub const Row = struct { id: []const u8, role: []const u8, kind: []const u8 = "message", author: []const u8 = "", body: []const u8, created_at_ms: ?i64 = null, delivery: []const u8 = "committed", attachments: []const Attachment = &.{}, tool: ?Tool = null };
+pub const Turn = struct { turn_id: []const u8, status: []const u8, after_seq: []const u8 = "0", started_at_ms: ?i64 = null, elapsed_ms: i64 = 0, stop_pending: bool = false };
+pub const Approval = struct { turn_id: []const u8, call_id: []const u8, title: []const u8, body: []const u8, resolution: []const u8 = "idle", @"error": ?h.LocalError = null };
+pub const Followup = struct { id: []const u8, kind: []const u8, state: []const u8 = "pending", delivery: []const u8 = "unsent", turn_id: []const u8, steer_id: []const u8, next_turn_id: []const u8, text: []const u8, attachments: []const Attachment = &.{}, paused: bool = false, can_retry: bool = false, can_pull_back: bool = true, @"error": ?h.LocalError = null };
+pub const Selection = struct { provider: ?[]const u8 = null, model: ?[]const u8 = null, effort: ?[]const u8 = null, access: ?[]const u8 = null, speed: ?[]const u8 = null };
+pub const Choice = struct { id: []const u8, label: []const u8, enabled: bool = true, reason: ?[]const u8 = null, favorite: bool = false };
+pub const Catalogs = struct { models: []const Choice = &.{}, efforts: []const Choice = &.{}, access: []const Choice = &.{}, speeds: []const Choice = &.{}, slash: []const Choice = &.{} };
+pub const Draft = struct { revision: []const u8, text: []const u8, attachments: []const Attachment, persisted: bool };
+pub const Mention = struct { path: []const u8, label: []const u8 };
+pub const ShellConfirmation = struct { id: []const u8, command: []const u8, cwd: []const u8 };
+pub const UsageLimit = struct { label: []const u8, percent_left: u8, reset: []const u8 };
+pub const UsageStat = struct { label: []const u8, value: []const u8 };
+pub const Usage = struct { provider: []const u8, limits: []const UsageLimit = &.{}, stats: []const UsageStat = &.{}, recent: []const UsageStat = &.{} };
+pub const Page = struct { has_older: bool, cursor: ?[]const u8, loading: bool };
+pub const ThreadView = struct { thread: p.ThreadSummary, rows: []const Row, page: Page, turn: ?Turn, approval: ?Approval, usage: ?Usage, stale: bool, @"error": ?h.LocalError };
+pub const ComposerView = struct { draft: Draft, selection: Selection, catalogs: Catalogs, mentions: []const Mention, provider_ready: bool, can_send: bool, can_stop: bool, send_operation: ?h.Operation, followup: ?Followup, shell_confirmation: ?ShellConfirmation, @"error": ?h.LocalError };

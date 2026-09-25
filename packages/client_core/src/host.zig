@@ -5,6 +5,7 @@ pub const rpc = @import("rpc.zig");
 const auth = @import("auth.zig");
 pub const sync = @import("sync.zig");
 const terminal = @import("terminal_pump.zig");
+pub const chat = @import("chat.zig");
 const profile = @import("verde_remote").profile;
 const A = std.mem.Allocator;
 const V = std.json.Value;
@@ -58,6 +59,7 @@ pub const State = struct {
     auth: auth.State = .{},
     sync: sync.State = .{},
     terminal: terminal.State = .{},
+    chat: chat.State = .{},
     lifecycle: Lifecycle = .created,
     revision: u64 = 0,
     generation: u64 = 0,
@@ -104,6 +106,7 @@ pub const Host = struct {
         try tx.apply(event);
         try sync.pump(&tx);
         try terminal.pump(&tx);
+        try chat.pump(&tx);
         return tx.commit(self, output_allocator);
     }
 
@@ -141,6 +144,9 @@ pub const Host = struct {
             if (data == .null) failure = .{ .code = "not_found", .message = "Unknown terminal." };
         } else if (eq(selector, "home") or eq(selector, "workspaces")) {
             data = try sync.query(a, s, selector);
+            if (eq(selector, "workspaces") and s.chat.history_epoch > 0) try data.object.put(a, "history", try valueOf(a, s.chat.history));
+        } else if (try chat.query(a, s, selector)) |chat_view| {
+            data = chat_view;
         } else {
             failure = .{ .code = "not_found", .message = "Unknown selector or resource." };
             if (std.mem.startsWith(u8, std.mem.trimStart(u8, selector, " \t\r\n"), "{")) {
@@ -323,6 +329,7 @@ pub const Transaction = struct {
             try append(Receipt, self.allocator(), &s.receipts, .{ .digest = digest, .operation = .{ .intent_id = id, .@"error" = .{ .code = "unsupported", .message = "Intent is not implemented.", .intent_id = id } } });
             _ = try auth.intent(self, tag, event);
             _ = try terminal.intent(self, tag, event);
+            _ = try chat.intent(self, tag, event);
             self.changed = true;
         } else if (eq(tag, "terminal_reply")) {
             _ = try string(event, "terminal_id");
@@ -404,6 +411,7 @@ pub const Transaction = struct {
             }
             if (try auth.complete(self, p, event)) return;
             if (try terminal.complete(self, p, event)) return;
+            if (try chat.complete(self, p, event)) return;
             if (kind == .store_get) {
                 if ((try field(event, "error")) != .null) {
                     self.state.host_error = .{ .domain = "storage", .code = try string(try field(event, "error"), "code"), .message = "Stored profile could not be loaded.", .retryable = true };
@@ -422,7 +430,7 @@ pub const Transaction = struct {
         if (self.changed) {
             if (self.state.revision == std.math.maxInt(u64)) return error.ResourceLimit;
             self.state.revision += 1;
-            _ = try self.emit("state_changed", .{ .revision = try decimal(self.allocator(), self.state.revision), .scopes = [_][]const u8{ "hosts", "home", "workspaces" } });
+            _ = try self.emit("state_changed", .{ .revision = try decimal(self.allocator(), self.state.revision), .scopes = try chat.scopes(self) });
             try terminal.queryScopes(self);
         }
         // Retain only state, never the call's decoded secrets or effect payloads.

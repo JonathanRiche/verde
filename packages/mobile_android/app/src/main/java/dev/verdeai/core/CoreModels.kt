@@ -85,6 +85,195 @@ data class TerminalQuery(
 )
 
 @Serializable
+data class ChatAttachment(
+    val `local_id`: String,
+    val `name`: String,
+    val `mime`: String,
+    val `byte_size`: String,
+    val `attachment_id`: String? = null,
+    val `reference`: String? = null,
+    val `uploaded_bytes`: String = "0",
+    val `status`: String = "local",
+    val `error`: LocalError? = null,
+)
+
+@Serializable
+data class ChatTool(
+    val `id`: String,
+    val `kind`: String,
+    val `status`: String,
+)
+
+@Serializable
+data class ChatRow(
+    val `id`: String,
+    val `role`: String,
+    val `kind`: String = "message",
+    val `author`: String = "",
+    val `body`: String,
+    val `created_at_ms`: Long? = null,
+    val `delivery`: String = "committed",
+    val `attachments`: List<ChatAttachment> = emptyList(),
+    val `tool`: ChatTool? = null,
+)
+
+@Serializable
+data class ChatTurn(
+    val `turn_id`: String,
+    val `status`: String,
+    val `after_seq`: String = "0",
+    val `started_at_ms`: Long? = null,
+    val `elapsed_ms`: Long = 0,
+    val `stop_pending`: Boolean = false,
+)
+
+@Serializable
+data class ChatApproval(
+    val `turn_id`: String,
+    val `call_id`: String,
+    val `title`: String,
+    val `body`: String,
+    val `resolution`: String = "idle",
+    val `error`: LocalError? = null,
+)
+
+@Serializable
+data class ChatFollowup(
+    val `id`: String,
+    val `kind`: String,
+    val `state`: String = "pending",
+    val `delivery`: String = "unsent",
+    val `turn_id`: String,
+    val `steer_id`: String,
+    val `next_turn_id`: String,
+    val `text`: String,
+    val `attachments`: List<ChatAttachment> = emptyList(),
+    val `paused`: Boolean = false,
+    val `can_retry`: Boolean = false,
+    val `can_pull_back`: Boolean = true,
+    val `error`: LocalError? = null,
+)
+
+@Serializable
+data class ChatSelection(
+    val `provider`: String? = null,
+    val `model`: String? = null,
+    val `effort`: String? = null,
+    val `access`: String? = null,
+    val `speed`: String? = null,
+)
+
+@Serializable
+data class ChatChoice(
+    val `id`: String,
+    val `label`: String,
+    val `enabled`: Boolean = true,
+    val `reason`: String? = null,
+    val `favorite`: Boolean = false,
+)
+
+@Serializable
+data class ChatCatalogs(
+    val `models`: List<ChatChoice> = emptyList(),
+    val `efforts`: List<ChatChoice> = emptyList(),
+    val `access`: List<ChatChoice> = emptyList(),
+    val `speeds`: List<ChatChoice> = emptyList(),
+    val `slash`: List<ChatChoice> = emptyList(),
+)
+
+@Serializable
+data class ChatDraft(
+    val `revision`: String,
+    val `text`: String,
+    val `attachments`: List<ChatAttachment>,
+    val `persisted`: Boolean,
+)
+
+@Serializable
+data class ChatMention(
+    val `path`: String,
+    val `label`: String,
+)
+
+@Serializable
+data class ChatShellConfirmation(
+    val `id`: String,
+    val `command`: String,
+    val `cwd`: String,
+)
+
+@Serializable
+data class ChatUsageLimit(
+    val `label`: String,
+    val `percent_left`: Int,
+    val `reset`: String,
+)
+
+@Serializable
+data class ChatUsageStat(
+    val `label`: String,
+    val `value`: String,
+)
+
+@Serializable
+data class ChatUsage(
+    val `provider`: String,
+    val `limits`: List<ChatUsageLimit> = emptyList(),
+    val `stats`: List<ChatUsageStat> = emptyList(),
+    val `recent`: List<ChatUsageStat> = emptyList(),
+)
+
+@Serializable
+data class ChatPage(
+    val `has_older`: Boolean,
+    val `cursor`: String?,
+    val `loading`: Boolean,
+)
+
+@Serializable
+data class ChatThreadView(
+    val `thread`: ThreadSummary,
+    val `rows`: List<ChatRow>,
+    val `page`: ChatPage,
+    val `turn`: ChatTurn?,
+    val `approval`: ChatApproval?,
+    val `usage`: ChatUsage?,
+    val `stale`: Boolean,
+    val `error`: LocalError?,
+)
+
+@Serializable
+data class ChatComposerView(
+    val `draft`: ChatDraft,
+    val `selection`: ChatSelection,
+    val `catalogs`: ChatCatalogs,
+    val `mentions`: List<ChatMention>,
+    val `provider_ready`: Boolean,
+    val `can_send`: Boolean,
+    val `can_stop`: Boolean,
+    val `send_operation`: Operation?,
+    val `followup`: ChatFollowup?,
+    val `shell_confirmation`: ChatShellConfirmation?,
+    val `error`: LocalError?,
+)
+
+@Serializable
+data class ThreadQuery(
+    val `api_version`: Long,
+    val `revision`: String,
+    val `data`: ChatThreadView?,
+    val `error`: LocalError?,
+)
+
+@Serializable
+data class ComposerQuery(
+    val `api_version`: Long,
+    val `revision`: String,
+    val `data`: ChatComposerView?,
+    val `error`: LocalError?,
+)
+
+@Serializable
 data class Config(
     val `api_version`: Long,
     val `host_id`: String,

@@ -325,6 +325,802 @@ extension TerminalQuery {
     }
 }
 
+struct ChatAttachment: Codable {
+    var `local_id`: String
+    var `name`: String
+    var `mime`: String
+    var `byte_size`: String
+    var `attachment_id`: String? = nil
+    var `reference`: String? = nil
+    var `uploaded_bytes`: String = "0"
+    var `status`: String = "local"
+    var `error`: LocalError? = nil
+}
+
+extension ChatAttachment {
+    private enum CodingKeys: String, CodingKey {
+        case `local_id`
+        case `name`
+        case `mime`
+        case `byte_size`
+        case `attachment_id`
+        case `reference`
+        case `uploaded_bytes`
+        case `status`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`local_id` = try c.decode(String.self, forKey: .`local_id`)
+        self.`name` = try c.decode(String.self, forKey: .`name`)
+        self.`mime` = try c.decode(String.self, forKey: .`mime`)
+        self.`byte_size` = try c.decode(String.self, forKey: .`byte_size`)
+        if !c.contains(.`attachment_id`) { self.`attachment_id` = nil } else {
+        self.`attachment_id` = try c.decodeIfPresent(String.self, forKey: .`attachment_id`)
+        }
+        if !c.contains(.`reference`) { self.`reference` = nil } else {
+        self.`reference` = try c.decodeIfPresent(String.self, forKey: .`reference`)
+        }
+        if !c.contains(.`uploaded_bytes`) { self.`uploaded_bytes` = "0" } else {
+        self.`uploaded_bytes` = try c.decode(String.self, forKey: .`uploaded_bytes`)
+        }
+        if !c.contains(.`status`) { self.`status` = "local" } else {
+        self.`status` = try c.decode(String.self, forKey: .`status`)
+        }
+        if !c.contains(.`error`) { self.`error` = nil } else {
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`local_id`, forKey: .`local_id`)
+        try c.encode(self.`name`, forKey: .`name`)
+        try c.encode(self.`mime`, forKey: .`mime`)
+        try c.encode(self.`byte_size`, forKey: .`byte_size`)
+        try c.encode(self.`attachment_id`, forKey: .`attachment_id`)
+        try c.encode(self.`reference`, forKey: .`reference`)
+        try c.encode(self.`uploaded_bytes`, forKey: .`uploaded_bytes`)
+        try c.encode(self.`status`, forKey: .`status`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct ChatTool: Codable {
+    var `id`: String
+    var `kind`: String
+    var `status`: String
+}
+
+extension ChatTool {
+    private enum CodingKeys: String, CodingKey {
+        case `id`
+        case `kind`
+        case `status`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`id` = try c.decode(String.self, forKey: .`id`)
+        self.`kind` = try c.decode(String.self, forKey: .`kind`)
+        self.`status` = try c.decode(String.self, forKey: .`status`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`id`, forKey: .`id`)
+        try c.encode(self.`kind`, forKey: .`kind`)
+        try c.encode(self.`status`, forKey: .`status`)
+    }
+}
+
+struct ChatRow: Codable {
+    var `id`: String
+    var `role`: String
+    var `kind`: String = "message"
+    var `author`: String = ""
+    var `body`: String
+    var `created_at_ms`: Int64? = nil
+    var `delivery`: String = "committed"
+    var `attachments`: [ChatAttachment] = []
+    var `tool`: ChatTool? = nil
+}
+
+extension ChatRow {
+    private enum CodingKeys: String, CodingKey {
+        case `id`
+        case `role`
+        case `kind`
+        case `author`
+        case `body`
+        case `created_at_ms`
+        case `delivery`
+        case `attachments`
+        case `tool`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`id` = try c.decode(String.self, forKey: .`id`)
+        self.`role` = try c.decode(String.self, forKey: .`role`)
+        if !c.contains(.`kind`) { self.`kind` = "message" } else {
+        self.`kind` = try c.decode(String.self, forKey: .`kind`)
+        }
+        if !c.contains(.`author`) { self.`author` = "" } else {
+        self.`author` = try c.decode(String.self, forKey: .`author`)
+        }
+        self.`body` = try c.decode(String.self, forKey: .`body`)
+        if !c.contains(.`created_at_ms`) { self.`created_at_ms` = nil } else {
+        self.`created_at_ms` = try c.decodeIfPresent(Int64.self, forKey: .`created_at_ms`)
+        }
+        if !c.contains(.`delivery`) { self.`delivery` = "committed" } else {
+        self.`delivery` = try c.decode(String.self, forKey: .`delivery`)
+        }
+        if !c.contains(.`attachments`) { self.`attachments` = [] } else {
+        self.`attachments` = try c.decode([ChatAttachment].self, forKey: .`attachments`)
+        }
+        if !c.contains(.`tool`) { self.`tool` = nil } else {
+        self.`tool` = try c.decodeIfPresent(ChatTool.self, forKey: .`tool`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`id`, forKey: .`id`)
+        try c.encode(self.`role`, forKey: .`role`)
+        try c.encode(self.`kind`, forKey: .`kind`)
+        try c.encode(self.`author`, forKey: .`author`)
+        try c.encode(self.`body`, forKey: .`body`)
+        try c.encode(self.`created_at_ms`, forKey: .`created_at_ms`)
+        try c.encode(self.`delivery`, forKey: .`delivery`)
+        try c.encode(self.`attachments`, forKey: .`attachments`)
+        try c.encode(self.`tool`, forKey: .`tool`)
+    }
+}
+
+struct ChatTurn: Codable {
+    var `turn_id`: String
+    var `status`: String
+    var `after_seq`: String = "0"
+    var `started_at_ms`: Int64? = nil
+    var `elapsed_ms`: Int64 = 0
+    var `stop_pending`: Bool = false
+}
+
+extension ChatTurn {
+    private enum CodingKeys: String, CodingKey {
+        case `turn_id`
+        case `status`
+        case `after_seq`
+        case `started_at_ms`
+        case `elapsed_ms`
+        case `stop_pending`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`turn_id` = try c.decode(String.self, forKey: .`turn_id`)
+        self.`status` = try c.decode(String.self, forKey: .`status`)
+        if !c.contains(.`after_seq`) { self.`after_seq` = "0" } else {
+        self.`after_seq` = try c.decode(String.self, forKey: .`after_seq`)
+        }
+        if !c.contains(.`started_at_ms`) { self.`started_at_ms` = nil } else {
+        self.`started_at_ms` = try c.decodeIfPresent(Int64.self, forKey: .`started_at_ms`)
+        }
+        if !c.contains(.`elapsed_ms`) { self.`elapsed_ms` = 0 } else {
+        self.`elapsed_ms` = try c.decode(Int64.self, forKey: .`elapsed_ms`)
+        }
+        if !c.contains(.`stop_pending`) { self.`stop_pending` = false } else {
+        self.`stop_pending` = try c.decode(Bool.self, forKey: .`stop_pending`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`turn_id`, forKey: .`turn_id`)
+        try c.encode(self.`status`, forKey: .`status`)
+        try c.encode(self.`after_seq`, forKey: .`after_seq`)
+        try c.encode(self.`started_at_ms`, forKey: .`started_at_ms`)
+        try c.encode(self.`elapsed_ms`, forKey: .`elapsed_ms`)
+        try c.encode(self.`stop_pending`, forKey: .`stop_pending`)
+    }
+}
+
+struct ChatApproval: Codable {
+    var `turn_id`: String
+    var `call_id`: String
+    var `title`: String
+    var `body`: String
+    var `resolution`: String = "idle"
+    var `error`: LocalError? = nil
+}
+
+extension ChatApproval {
+    private enum CodingKeys: String, CodingKey {
+        case `turn_id`
+        case `call_id`
+        case `title`
+        case `body`
+        case `resolution`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`turn_id` = try c.decode(String.self, forKey: .`turn_id`)
+        self.`call_id` = try c.decode(String.self, forKey: .`call_id`)
+        self.`title` = try c.decode(String.self, forKey: .`title`)
+        self.`body` = try c.decode(String.self, forKey: .`body`)
+        if !c.contains(.`resolution`) { self.`resolution` = "idle" } else {
+        self.`resolution` = try c.decode(String.self, forKey: .`resolution`)
+        }
+        if !c.contains(.`error`) { self.`error` = nil } else {
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`turn_id`, forKey: .`turn_id`)
+        try c.encode(self.`call_id`, forKey: .`call_id`)
+        try c.encode(self.`title`, forKey: .`title`)
+        try c.encode(self.`body`, forKey: .`body`)
+        try c.encode(self.`resolution`, forKey: .`resolution`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct ChatFollowup: Codable {
+    var `id`: String
+    var `kind`: String
+    var `state`: String = "pending"
+    var `delivery`: String = "unsent"
+    var `turn_id`: String
+    var `steer_id`: String
+    var `next_turn_id`: String
+    var `text`: String
+    var `attachments`: [ChatAttachment] = []
+    var `paused`: Bool = false
+    var `can_retry`: Bool = false
+    var `can_pull_back`: Bool = true
+    var `error`: LocalError? = nil
+}
+
+extension ChatFollowup {
+    private enum CodingKeys: String, CodingKey {
+        case `id`
+        case `kind`
+        case `state`
+        case `delivery`
+        case `turn_id`
+        case `steer_id`
+        case `next_turn_id`
+        case `text`
+        case `attachments`
+        case `paused`
+        case `can_retry`
+        case `can_pull_back`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`id` = try c.decode(String.self, forKey: .`id`)
+        self.`kind` = try c.decode(String.self, forKey: .`kind`)
+        if !c.contains(.`state`) { self.`state` = "pending" } else {
+        self.`state` = try c.decode(String.self, forKey: .`state`)
+        }
+        if !c.contains(.`delivery`) { self.`delivery` = "unsent" } else {
+        self.`delivery` = try c.decode(String.self, forKey: .`delivery`)
+        }
+        self.`turn_id` = try c.decode(String.self, forKey: .`turn_id`)
+        self.`steer_id` = try c.decode(String.self, forKey: .`steer_id`)
+        self.`next_turn_id` = try c.decode(String.self, forKey: .`next_turn_id`)
+        self.`text` = try c.decode(String.self, forKey: .`text`)
+        if !c.contains(.`attachments`) { self.`attachments` = [] } else {
+        self.`attachments` = try c.decode([ChatAttachment].self, forKey: .`attachments`)
+        }
+        if !c.contains(.`paused`) { self.`paused` = false } else {
+        self.`paused` = try c.decode(Bool.self, forKey: .`paused`)
+        }
+        if !c.contains(.`can_retry`) { self.`can_retry` = false } else {
+        self.`can_retry` = try c.decode(Bool.self, forKey: .`can_retry`)
+        }
+        if !c.contains(.`can_pull_back`) { self.`can_pull_back` = true } else {
+        self.`can_pull_back` = try c.decode(Bool.self, forKey: .`can_pull_back`)
+        }
+        if !c.contains(.`error`) { self.`error` = nil } else {
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`id`, forKey: .`id`)
+        try c.encode(self.`kind`, forKey: .`kind`)
+        try c.encode(self.`state`, forKey: .`state`)
+        try c.encode(self.`delivery`, forKey: .`delivery`)
+        try c.encode(self.`turn_id`, forKey: .`turn_id`)
+        try c.encode(self.`steer_id`, forKey: .`steer_id`)
+        try c.encode(self.`next_turn_id`, forKey: .`next_turn_id`)
+        try c.encode(self.`text`, forKey: .`text`)
+        try c.encode(self.`attachments`, forKey: .`attachments`)
+        try c.encode(self.`paused`, forKey: .`paused`)
+        try c.encode(self.`can_retry`, forKey: .`can_retry`)
+        try c.encode(self.`can_pull_back`, forKey: .`can_pull_back`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct ChatSelection: Codable {
+    var `provider`: String? = nil
+    var `model`: String? = nil
+    var `effort`: String? = nil
+    var `access`: String? = nil
+    var `speed`: String? = nil
+}
+
+extension ChatSelection {
+    private enum CodingKeys: String, CodingKey {
+        case `provider`
+        case `model`
+        case `effort`
+        case `access`
+        case `speed`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`provider`) { self.`provider` = nil } else {
+        self.`provider` = try c.decodeIfPresent(String.self, forKey: .`provider`)
+        }
+        if !c.contains(.`model`) { self.`model` = nil } else {
+        self.`model` = try c.decodeIfPresent(String.self, forKey: .`model`)
+        }
+        if !c.contains(.`effort`) { self.`effort` = nil } else {
+        self.`effort` = try c.decodeIfPresent(String.self, forKey: .`effort`)
+        }
+        if !c.contains(.`access`) { self.`access` = nil } else {
+        self.`access` = try c.decodeIfPresent(String.self, forKey: .`access`)
+        }
+        if !c.contains(.`speed`) { self.`speed` = nil } else {
+        self.`speed` = try c.decodeIfPresent(String.self, forKey: .`speed`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`provider`, forKey: .`provider`)
+        try c.encode(self.`model`, forKey: .`model`)
+        try c.encode(self.`effort`, forKey: .`effort`)
+        try c.encode(self.`access`, forKey: .`access`)
+        try c.encode(self.`speed`, forKey: .`speed`)
+    }
+}
+
+struct ChatChoice: Codable {
+    var `id`: String
+    var `label`: String
+    var `enabled`: Bool = true
+    var `reason`: String? = nil
+    var `favorite`: Bool = false
+}
+
+extension ChatChoice {
+    private enum CodingKeys: String, CodingKey {
+        case `id`
+        case `label`
+        case `enabled`
+        case `reason`
+        case `favorite`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`id` = try c.decode(String.self, forKey: .`id`)
+        self.`label` = try c.decode(String.self, forKey: .`label`)
+        if !c.contains(.`enabled`) { self.`enabled` = true } else {
+        self.`enabled` = try c.decode(Bool.self, forKey: .`enabled`)
+        }
+        if !c.contains(.`reason`) { self.`reason` = nil } else {
+        self.`reason` = try c.decodeIfPresent(String.self, forKey: .`reason`)
+        }
+        if !c.contains(.`favorite`) { self.`favorite` = false } else {
+        self.`favorite` = try c.decode(Bool.self, forKey: .`favorite`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`id`, forKey: .`id`)
+        try c.encode(self.`label`, forKey: .`label`)
+        try c.encode(self.`enabled`, forKey: .`enabled`)
+        try c.encode(self.`reason`, forKey: .`reason`)
+        try c.encode(self.`favorite`, forKey: .`favorite`)
+    }
+}
+
+struct ChatCatalogs: Codable {
+    var `models`: [ChatChoice] = []
+    var `efforts`: [ChatChoice] = []
+    var `access`: [ChatChoice] = []
+    var `speeds`: [ChatChoice] = []
+    var `slash`: [ChatChoice] = []
+}
+
+extension ChatCatalogs {
+    private enum CodingKeys: String, CodingKey {
+        case `models`
+        case `efforts`
+        case `access`
+        case `speeds`
+        case `slash`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`models`) { self.`models` = [] } else {
+        self.`models` = try c.decode([ChatChoice].self, forKey: .`models`)
+        }
+        if !c.contains(.`efforts`) { self.`efforts` = [] } else {
+        self.`efforts` = try c.decode([ChatChoice].self, forKey: .`efforts`)
+        }
+        if !c.contains(.`access`) { self.`access` = [] } else {
+        self.`access` = try c.decode([ChatChoice].self, forKey: .`access`)
+        }
+        if !c.contains(.`speeds`) { self.`speeds` = [] } else {
+        self.`speeds` = try c.decode([ChatChoice].self, forKey: .`speeds`)
+        }
+        if !c.contains(.`slash`) { self.`slash` = [] } else {
+        self.`slash` = try c.decode([ChatChoice].self, forKey: .`slash`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`models`, forKey: .`models`)
+        try c.encode(self.`efforts`, forKey: .`efforts`)
+        try c.encode(self.`access`, forKey: .`access`)
+        try c.encode(self.`speeds`, forKey: .`speeds`)
+        try c.encode(self.`slash`, forKey: .`slash`)
+    }
+}
+
+struct ChatDraft: Codable {
+    var `revision`: String
+    var `text`: String
+    var `attachments`: [ChatAttachment]
+    var `persisted`: Bool
+}
+
+extension ChatDraft {
+    private enum CodingKeys: String, CodingKey {
+        case `revision`
+        case `text`
+        case `attachments`
+        case `persisted`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`revision` = try c.decode(String.self, forKey: .`revision`)
+        self.`text` = try c.decode(String.self, forKey: .`text`)
+        self.`attachments` = try c.decode([ChatAttachment].self, forKey: .`attachments`)
+        self.`persisted` = try c.decode(Bool.self, forKey: .`persisted`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`revision`, forKey: .`revision`)
+        try c.encode(self.`text`, forKey: .`text`)
+        try c.encode(self.`attachments`, forKey: .`attachments`)
+        try c.encode(self.`persisted`, forKey: .`persisted`)
+    }
+}
+
+struct ChatMention: Codable {
+    var `path`: String
+    var `label`: String
+}
+
+extension ChatMention {
+    private enum CodingKeys: String, CodingKey {
+        case `path`
+        case `label`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`path` = try c.decode(String.self, forKey: .`path`)
+        self.`label` = try c.decode(String.self, forKey: .`label`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`path`, forKey: .`path`)
+        try c.encode(self.`label`, forKey: .`label`)
+    }
+}
+
+struct ChatShellConfirmation: Codable {
+    var `id`: String
+    var `command`: String
+    var `cwd`: String
+}
+
+extension ChatShellConfirmation {
+    private enum CodingKeys: String, CodingKey {
+        case `id`
+        case `command`
+        case `cwd`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`id` = try c.decode(String.self, forKey: .`id`)
+        self.`command` = try c.decode(String.self, forKey: .`command`)
+        self.`cwd` = try c.decode(String.self, forKey: .`cwd`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`id`, forKey: .`id`)
+        try c.encode(self.`command`, forKey: .`command`)
+        try c.encode(self.`cwd`, forKey: .`cwd`)
+    }
+}
+
+struct ChatUsageLimit: Codable {
+    var `label`: String
+    var `percent_left`: UInt8
+    var `reset`: String
+}
+
+extension ChatUsageLimit {
+    private enum CodingKeys: String, CodingKey {
+        case `label`
+        case `percent_left`
+        case `reset`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`label` = try c.decode(String.self, forKey: .`label`)
+        self.`percent_left` = try c.decode(UInt8.self, forKey: .`percent_left`)
+        self.`reset` = try c.decode(String.self, forKey: .`reset`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`label`, forKey: .`label`)
+        try c.encode(self.`percent_left`, forKey: .`percent_left`)
+        try c.encode(self.`reset`, forKey: .`reset`)
+    }
+}
+
+struct ChatUsageStat: Codable {
+    var `label`: String
+    var `value`: String
+}
+
+extension ChatUsageStat {
+    private enum CodingKeys: String, CodingKey {
+        case `label`
+        case `value`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`label` = try c.decode(String.self, forKey: .`label`)
+        self.`value` = try c.decode(String.self, forKey: .`value`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`label`, forKey: .`label`)
+        try c.encode(self.`value`, forKey: .`value`)
+    }
+}
+
+struct ChatUsage: Codable {
+    var `provider`: String
+    var `limits`: [ChatUsageLimit] = []
+    var `stats`: [ChatUsageStat] = []
+    var `recent`: [ChatUsageStat] = []
+}
+
+extension ChatUsage {
+    private enum CodingKeys: String, CodingKey {
+        case `provider`
+        case `limits`
+        case `stats`
+        case `recent`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`provider` = try c.decode(String.self, forKey: .`provider`)
+        if !c.contains(.`limits`) { self.`limits` = [] } else {
+        self.`limits` = try c.decode([ChatUsageLimit].self, forKey: .`limits`)
+        }
+        if !c.contains(.`stats`) { self.`stats` = [] } else {
+        self.`stats` = try c.decode([ChatUsageStat].self, forKey: .`stats`)
+        }
+        if !c.contains(.`recent`) { self.`recent` = [] } else {
+        self.`recent` = try c.decode([ChatUsageStat].self, forKey: .`recent`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`provider`, forKey: .`provider`)
+        try c.encode(self.`limits`, forKey: .`limits`)
+        try c.encode(self.`stats`, forKey: .`stats`)
+        try c.encode(self.`recent`, forKey: .`recent`)
+    }
+}
+
+struct ChatPage: Codable {
+    var `has_older`: Bool
+    var `cursor`: String?
+    var `loading`: Bool
+}
+
+extension ChatPage {
+    private enum CodingKeys: String, CodingKey {
+        case `has_older`
+        case `cursor`
+        case `loading`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`has_older` = try c.decode(Bool.self, forKey: .`has_older`)
+        self.`cursor` = try c.decodeIfPresent(String.self, forKey: .`cursor`)
+        self.`loading` = try c.decode(Bool.self, forKey: .`loading`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`has_older`, forKey: .`has_older`)
+        try c.encode(self.`cursor`, forKey: .`cursor`)
+        try c.encode(self.`loading`, forKey: .`loading`)
+    }
+}
+
+struct ChatThreadView: Codable {
+    var `thread`: ThreadSummary
+    var `rows`: [ChatRow]
+    var `page`: ChatPage
+    var `turn`: ChatTurn?
+    var `approval`: ChatApproval?
+    var `usage`: ChatUsage?
+    var `stale`: Bool
+    var `error`: LocalError?
+}
+
+extension ChatThreadView {
+    private enum CodingKeys: String, CodingKey {
+        case `thread`
+        case `rows`
+        case `page`
+        case `turn`
+        case `approval`
+        case `usage`
+        case `stale`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`thread` = try c.decode(ThreadSummary.self, forKey: .`thread`)
+        self.`rows` = try c.decode([ChatRow].self, forKey: .`rows`)
+        self.`page` = try c.decode(ChatPage.self, forKey: .`page`)
+        self.`turn` = try c.decodeIfPresent(ChatTurn.self, forKey: .`turn`)
+        self.`approval` = try c.decodeIfPresent(ChatApproval.self, forKey: .`approval`)
+        self.`usage` = try c.decodeIfPresent(ChatUsage.self, forKey: .`usage`)
+        self.`stale` = try c.decode(Bool.self, forKey: .`stale`)
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`thread`, forKey: .`thread`)
+        try c.encode(self.`rows`, forKey: .`rows`)
+        try c.encode(self.`page`, forKey: .`page`)
+        try c.encode(self.`turn`, forKey: .`turn`)
+        try c.encode(self.`approval`, forKey: .`approval`)
+        try c.encode(self.`usage`, forKey: .`usage`)
+        try c.encode(self.`stale`, forKey: .`stale`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct ChatComposerView: Codable {
+    var `draft`: ChatDraft
+    var `selection`: ChatSelection
+    var `catalogs`: ChatCatalogs
+    var `mentions`: [ChatMention]
+    var `provider_ready`: Bool
+    var `can_send`: Bool
+    var `can_stop`: Bool
+    var `send_operation`: Operation?
+    var `followup`: ChatFollowup?
+    var `shell_confirmation`: ChatShellConfirmation?
+    var `error`: LocalError?
+}
+
+extension ChatComposerView {
+    private enum CodingKeys: String, CodingKey {
+        case `draft`
+        case `selection`
+        case `catalogs`
+        case `mentions`
+        case `provider_ready`
+        case `can_send`
+        case `can_stop`
+        case `send_operation`
+        case `followup`
+        case `shell_confirmation`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`draft` = try c.decode(ChatDraft.self, forKey: .`draft`)
+        self.`selection` = try c.decode(ChatSelection.self, forKey: .`selection`)
+        self.`catalogs` = try c.decode(ChatCatalogs.self, forKey: .`catalogs`)
+        self.`mentions` = try c.decode([ChatMention].self, forKey: .`mentions`)
+        self.`provider_ready` = try c.decode(Bool.self, forKey: .`provider_ready`)
+        self.`can_send` = try c.decode(Bool.self, forKey: .`can_send`)
+        self.`can_stop` = try c.decode(Bool.self, forKey: .`can_stop`)
+        self.`send_operation` = try c.decodeIfPresent(Operation.self, forKey: .`send_operation`)
+        self.`followup` = try c.decodeIfPresent(ChatFollowup.self, forKey: .`followup`)
+        self.`shell_confirmation` = try c.decodeIfPresent(ChatShellConfirmation.self, forKey: .`shell_confirmation`)
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`draft`, forKey: .`draft`)
+        try c.encode(self.`selection`, forKey: .`selection`)
+        try c.encode(self.`catalogs`, forKey: .`catalogs`)
+        try c.encode(self.`mentions`, forKey: .`mentions`)
+        try c.encode(self.`provider_ready`, forKey: .`provider_ready`)
+        try c.encode(self.`can_send`, forKey: .`can_send`)
+        try c.encode(self.`can_stop`, forKey: .`can_stop`)
+        try c.encode(self.`send_operation`, forKey: .`send_operation`)
+        try c.encode(self.`followup`, forKey: .`followup`)
+        try c.encode(self.`shell_confirmation`, forKey: .`shell_confirmation`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct ThreadQuery: Codable {
+    var `api_version`: UInt32
+    var `revision`: String
+    var `data`: ChatThreadView?
+    var `error`: LocalError?
+}
+
+extension ThreadQuery {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `revision`
+        case `data`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        self.`revision` = try c.decode(String.self, forKey: .`revision`)
+        self.`data` = try c.decodeIfPresent(ChatThreadView.self, forKey: .`data`)
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`revision`, forKey: .`revision`)
+        try c.encode(self.`data`, forKey: .`data`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct ComposerQuery: Codable {
+    var `api_version`: UInt32
+    var `revision`: String
+    var `data`: ChatComposerView?
+    var `error`: LocalError?
+}
+
+extension ComposerQuery {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `revision`
+        case `data`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        self.`revision` = try c.decode(String.self, forKey: .`revision`)
+        self.`data` = try c.decodeIfPresent(ChatComposerView.self, forKey: .`data`)
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`revision`, forKey: .`revision`)
+        try c.encode(self.`data`, forKey: .`data`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
 struct Config: Codable {
     var `api_version`: UInt32
     var `host_id`: String

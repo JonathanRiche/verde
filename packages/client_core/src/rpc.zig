@@ -37,6 +37,7 @@ pub const Call = struct {
     awaiting_auth: bool = false,
 };
 pub const Result = struct {
+    steer_can_fallback: bool = false,
     id: u64,
     intent_id: ?[]const u8,
     value: ?V = null,
@@ -211,7 +212,13 @@ fn receive(tx: *host.Transaction, call: Call, event: V) host.ApiError!void {
             _ = try beginHandshake(tx);
             return;
         }
-        return finish(tx, call, null, rpcError(remote));
+        try finish(tx, call, null, rpcError(remote));
+        if (eq(u8, call.method, "chat.turn.steer") and eq(u8, remote.code, "invalid_state")) {
+            inline for (.{ "provider does not support daemon steering", "turn cannot accept steering now", "provider thread is not ready", "Codex active turn is not ready" }) |message| {
+                if (eq(u8, remote.message, message)) @constCast(&tx.state.rpc.results[tx.state.rpc.results.len - 1]).steer_can_fallback = true;
+            }
+        }
+        return;
     }
     if (eq(u8, call.method, "core.status")) {
         const status_result = c.decodeStatus(&parsed) catch |err| {

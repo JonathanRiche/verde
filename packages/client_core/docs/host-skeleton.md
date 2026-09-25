@@ -77,3 +77,7 @@ Zig's per-thread alternate signal stack are disabled for the library.
 Native wire models and the single export registry are documented in
 [model-codegen.md](model-codegen.md). D-02/I-02 consume the committed generated
 Kotlin/Swift files; new core features append their exported types to that registry.
+
+K-10 implements chat intents and thread/composer queries in [chat.md](chat.md).
+Chat dispatch is explicitly limited to its own intent tags so later auth and
+terminal additions retain their own operation outcomes.
