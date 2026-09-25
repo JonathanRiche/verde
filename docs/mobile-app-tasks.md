@@ -142,7 +142,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | K-02 | iOS xcframework toolchain proof | core | mac | K-01, H-01, H-02 | done (e2f73abb) |
 | K-03 | Core API spec (events, effects, queries) | core | linux | K-01 | done (a5a81401; reviewed) |
 | K-04 | Extract shared remote-client modules from desktop | core | linux | K-01 | in_progress (astra cli-thread-1790351697558-48a6b174381d69dd) |
-| K-05 | Split `headless/client.zig` codec from I/O | core | linux | K-01 | in_progress (astra cli-thread-1790351698860-7ab2d678d434063c) |
+| K-05 | Split `headless/client.zig` codec from I/O | core | linux | K-01 | done (b12e4c17) |
 | K-06 | Sans-IO host engine + C ABI | core | linux | K-03, K-04, K-05 | todo |
 | K-07 | Auth in core | core | linux | K-06, A-05 | todo |
 | K-08 | RPC client + target pinning | core | linux | K-06 | todo |
@@ -760,6 +760,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
   socket calls, so the core can use the codec without `std.Io`. Existing
   callers keep working.
 - **Done when:** `$ZB headless-test` and `$ZB runtime-test` pass.
+- **Done (b12e4c17).** Pure request encoding and response decoding are in `packages/headless/src/client_codec.zig`; `client.zig` keeps the socket I/O and its existing API. `headless-test` passes. `runtime-test` matches the baseline (367 passed) apart from the pre-existing `state.workspace_layout` "browser tabs and a detached quick pane" crash, which is owned elsewhere.
 
 #### K-06 · Sans-IO host engine + C ABI
 - **depends:** K-03, K-04, K-05
