@@ -130,6 +130,8 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | A-12 | Push crypto module (seal/open) | host | linux | — | in_progress (cli-thread-1790350349138-67bd0d430b1a2acf) |
 | A-13 | Push outbox + `device.push.*` RPCs | host | linux | A-02, A-12 | todo |
 | A-14 | Attention events → outbox | host | linux | A-13 | todo |
+| A-15 | Harden served-file open (TOCTOU, special files, leak, logs) | host | linux | A-01 | in_progress (orchestrator subagent, worktree ../verde-wt/A-15) |
+| A-16 | `workspace.list` exposes repository binding roots | host | linux | A-01, A-02 | todo |
 | W-01 | App Link / universal link files + pair landing page | website | linux | H-03, H-04 | todo |
 | C-01 | Spike: APNs reachability from Workers | cloud | linux | — | done (research; recorded in plan §8, see C-02) |
 | C-02 | Push relay Worker | cloud | linux | C-01, A-12 | todo |
@@ -318,6 +320,10 @@ exact question and stop. Report: commit sha, files changed, verification output,
     rejected; a sibling-prefix root (`/a/b` vs `/a/bc`) rejected; outside
     rejected.
   - `mise run web-app-test` and `mise run web-app` pass.
+- **Done (363bece0).** A read-only audit (Codex, 2026-09-25) cleared the
+  stable-path checks, cache ownership and authorization, and raised the
+  follow-ups now tracked as A-15 (open-time hardening) and A-16 (daemon
+  binding roots).
 
 #### A-02 · Paired-device allowlist parity + new scopes
 - **touches:** `packages/headless/src/access_protocol.zig`, the gateway auth
@@ -504,6 +510,67 @@ exact question and stop. Report: commit sha, files changed, verification output,
   in-app notices).
 - **Done when:** tests drive a fake turn through each state and assert the
   outbox rows. `$ZB daemon-test` passes.
+
+#### A-15 · Harden served-file open (TOCTOU, special files, leak, logs)
+- **depends:** A-01 · **touches:** `packages/web_app/src/served_files.zig`,
+  `packages/web_app/src/http.zig` (`handleWorkspaceFile` only),
+  `packages/web_app/src/office_preview.zig`
+- **Why (audit of 363bece0):**
+  1. High: confinement checks a pathname, then the read (and LibreOffice's
+     own reopen for `/api/preview`) follows the pathname again. A symlink
+     swapped in between — on the file or any ancestor — escapes the root,
+     and the extension check still sees the approved name.
+  2. Medium: FIFOs and other special files pass confinement; an open on a
+     FIFO with no writer blocks a gateway connection slot indefinitely.
+  3. Low: an in-root symlink whose outside target is missing yields 404
+     while an existing target yields 403, so escaping links can probe
+     outside existence. Escaping directory symlinks let callers probe
+     names under the target.
+  4. Low: `office_preview.zig` error branches log the resolved path and raw
+     converter stderr.
+- **Do:**
+  - Open through the root, not the pathname: hold the confined root as a
+    directory descriptor and open the relative remainder with
+    `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)` on Linux (in-root
+    symlinks stay allowed; escapes fail at the kernel). On other OSes fall
+    back to `O_NOFOLLOW` per component or an equivalent walk. Add
+    `O_NONBLOCK | O_NOCTTY` (or the openat2 equivalent) so special files
+    never block; `fstat` the descriptor and serve regular files only.
+  - Serve from that descriptor. For office previews, copy the descriptor's
+    bytes into a private per-conversion temp directory and convert the copy;
+    never hand the original pathname to the converter. Validate cache files
+    are regular files, not symlinks.
+  - Map any escape (kernel `EXDEV`/`ELOOP` from `RESOLVE_BENEATH`, or a
+    realpath outside the root, dangling or not) to 403
+    `path_outside_workspace`; only a genuinely missing in-root object is 404.
+  - Replace path logging in `office_preview.zig` with an opaque request id
+    and a bounded, sanitised error string.
+- **Done when:** tests cover: swap-after-check (create file, confine, replace
+  with an escaping symlink, assert the open fails/403), an escaping ancestor
+  directory symlink, dangling escaping file and directory symlinks → 403,
+  a FIFO → rejected without blocking (finite deadline), a directory →
+  rejected, and the five A-01 cases still pass. `mise run web-app-test` and
+  `mise run web-app` pass. The `Security contract` in `packages/web_app/AGENTS.md`
+  states that files are opened beneath the root descriptor.
+
+#### A-16 · `workspace.list` exposes repository binding roots
+- **depends:** A-01, A-02 · **touches:** `packages/desktop/src/terminal/sessionizer.zig`
+  (the `workspace.list` projection), possibly `store_protocol.zig`
+- **Why (audit of 363bece0):** the gateway's `RootCache` expects each
+  workspace entry to carry its repository bindings, but the daemon
+  synthesizes only a primary binding whose root is the workspace path and
+  never loads the stored repository manifest. Files under a secondary
+  repository root therefore get 403 from `/api/file`, and the A-01 fixture
+  test masks this by supplying data the daemon does not produce.
+- **Do:** make the daemon's `workspace.list` projection include the real
+  bindings from the repository manifest (id, `root_path`, `runtime_id`,
+  availability). The gateway collector then keeps only bindings that belong
+  to the serving runtime and are available. Add a daemon test with a
+  two-repository workspace and a gateway test that uses the daemon's actual
+  response shape.
+- **Done when:** `$ZB daemon-test`, `$ZB headless-test` and
+  `mise run web-app-test` pass; a file under a secondary binding root is
+  served and one outside all bindings is 403.
 
 ### Website / cloud lane
 
