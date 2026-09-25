@@ -180,9 +180,13 @@ fn addIosSteps(b: *std.Build, optimize: std.builtin.OptimizeMode, options: *std.
             .os_version_min = .{ .semver = .{ .major = 17, .minor = 0, .patch = 0 } },
         });
         const module = createCoreModule(b, target, optimize, options);
-        module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ slice[2], "usr/include" }) });
+        // C source and @cImport include paths are module-local. Tree-sitter's
+        // transitive module needs the same device/simulator SDK as the core.
+        for (module.getGraph().modules) |dependency| {
+            dependency.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ slice[2], "usr/include" }) });
+            dependency.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ slice[2], "System/Library/Frameworks" }) });
+        }
         module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ slice[2], "usr/lib" }) });
-        module.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ slice[2], "System/Library/Frameworks" }) });
         const lib = b.addLibrary(.{
             .name = lib_name,
             .linkage = .static,
