@@ -617,7 +617,8 @@ exact question and stop. Report: commit sha, files changed, verification output,
 - **depends:** A-02 · **touches:** `packages/desktop/src/terminal/sessionizer.zig` (daemon dispatch), `access_protocol.zig`
 - **Why (A-02):** `workspace.close` is handled only by the desktop GUI. Paired devices can archive through `workspace.upsert {archived:true}`, but that doesn't stop the workspace's sessions or turns the way the GUI close does.
 - **Do:** add a daemon RPC with the GUI's close semantics (archive, stop or detach its sessions, end running turns as the GUI does) that works with the desktop closed; map it to `repository:write`. Make the desktop's close path call it where possible.
-- **Done when:** a daemon test closes a workspace that has a live session and a running turn; `$ZB daemon-test`, `$ZB headless-test` and `mise run web-app-test` pass.
+- **Done when:** a daemon test first rejects close with `workspace_busy` while a turn is running, leaving the workspace intact. After the turn ends, it closes a workspace that has a live session, and asserts the session is terminated and the workspace archived. `$ZB daemon-test`, `$ZB headless-test` and `mise run web-app-test` pass.
+- **Decision (orchestrator):** keep the GUI semantics. `closeProjectAtIndexResult` rejects close while turns are pending or background tasks are running, and never aborts turns. The daemon RPC does the same and returns a structured `workspace_busy` error with counts.
 
 #### A-18 · Daemon-native subagent open
 - **depends:** A-02 · **touches:** `sessionizer.zig`, `access_protocol.zig`
