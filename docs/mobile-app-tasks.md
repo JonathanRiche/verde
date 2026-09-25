@@ -136,23 +136,23 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | A-18 | Daemon-native subagent open | host | linux | A-02 | todo |
 | W-01 | App Link / universal link files + pair landing page | website | linux | H-03, H-04 | todo |
 | C-01 | Spike: APNs reachability from Workers | cloud | linux | — | done (research; recorded in plan §8, see C-02) |
-| C-02 | Push relay Worker | cloud | linux | C-01, A-12 | blocked: verde-cloud has no remote and its Alchemy baseline is uncommitted; owner to commit/configure (astra cli-thread-1790351701612-fc3bbcd7eb28e252) |
+| C-02 | Push relay Worker | cloud | linux | C-01, A-12 | in_progress (astra cli-thread-1790351701612-fc3bbcd7eb28e252; owner approved private repo JonathanRiche/verde-cloud + push; no deploy) |
 | C-03 | Demo runtime for store review | cloud | linux | A-09 | todo |
 | K-01 | Core skeleton + Android toolchain proof | core | linux | — | done (951a5a5a) |
 | K-02 | iOS xcframework toolchain proof | core | mac | K-01, H-01, H-02 | done (e2f73abb) |
 | K-03 | Core API spec (events, effects, queries) | core | linux | K-01 | done (a5a81401; reviewed) |
 | K-04 | Extract shared remote-client modules from desktop | core | linux | K-01 | done (e1111a8c) |
 | K-05 | Split `headless/client.zig` codec from I/O | core | linux | K-01 | done (b12e4c17) |
-| K-06 | Sans-IO host engine + C ABI | core | linux | K-03, K-04, K-05 | review (e3e60c35, e4a0e6ab landed; final verification pending after daemon restart) |
-| K-07 | Auth in core | core | linux | K-06, A-05 | todo |
-| K-08 | RPC client + target pinning | core | linux | K-06 | todo |
+| K-06 | Sans-IO host engine + C ABI | core | linux | K-03, K-04, K-05 | done (e3e60c35, e4a0e6ab) |
+| K-07 | Auth in core | core | linux | K-06, A-05 | in_progress (astra cli-thread-1790357476513-23b8f29726d0ac38) |
+| K-08 | RPC client + target pinning | core | linux | K-06 | in_progress (astra cli-thread-1790357478254-e0a61e540f9105c7) |
 | K-09 | Sync + projection | core | linux | K-08 | todo |
 | K-10 | Chat engine | core | linux | K-09 | todo |
-| K-11 | Markdown AST / highlight spans / diff parse exports | core | linux | K-06 | todo |
+| K-11 | Markdown AST / highlight spans / diff parse exports | core | linux | K-06 | in_progress (astra cli-thread-1790357482042-cf07694f30ac6c1f) |
 | K-12 | Terminal handle + PTY pump | core | linux | K-06 | todo |
 | K-13 | Allowlist coverage test | core | linux | K-10, A-02 | todo |
 | K-14 | Contract suite vs real gateway + daemon | core | linux | K-10 | todo |
-| K-15 | Kotlin/Swift model codegen from Zig types | core | linux | K-06 | todo |
+| K-15 | Kotlin/Swift model codegen from Zig types | core | linux | K-06 | in_progress (astra cli-thread-1790357480032-7a74f77336fa56ea) |
 | K-16 | Delta-mode sync | core | linux | K-09, A-11 | todo |
 | K-17 | Attention state machine + push decrypt | core | linux | K-09, A-12 | todo |
 | D-01 | Android project scaffold | android | linux | K-01 | done (ee3c19df; on-device version display pending human-verify) |
@@ -780,6 +780,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
   - A deterministic test harness that scripts events and asserts effects.
 - **Done when:** harness tests pass under `mise run mobile-core-test`; the
   `.so` and xcframework still build.
+- **Done (e3e60c35, e4a0e6ab).** Transactional host engine (`src/host.zig`), C ABI and JNI wrappers (`include/verde_client.h`, `src/jni.zig`; 11 exports), a deterministic harness (`src/harness.zig`), and a custom panic handler: the Android `.so` has no TLS sections or signal-stack/default-panic symbols and needs only `liblog.so` and `libc.so`. The iOS archives bundle compiler-runtime helpers. `mobile-core-test` passes 63/63, and the Android and iOS builds pass. Spec interpretations are in `packages/client_core/docs/host-skeleton.md`: resource budgets, the diagnostic-code allowlist, fresh IDs for early timer re-arms, and persisted-receipt discovery deferred until the storage format exists. Intents owned by K-07 through K-12 return `unsupported`.
 
 #### K-07 · Auth in core
 - **depends:** K-06, A-05
