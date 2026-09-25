@@ -10,6 +10,81 @@ import kotlinx.serialization.json.JsonElement
 val CoreJson = Json { ignoreUnknownKeys = true; encodeDefaults = true; explicitNulls = true }
 
 @Serializable
+data class TerminalConfig(
+    val `api_version`: Long = 1,
+    val `cols`: Int,
+    val `rows`: Int,
+    val `scrollback_rows`: Long,
+)
+
+@Serializable
+enum class TerminalCursorShape {
+    `block`,
+    `underline`,
+    `bar`,
+}
+
+@Serializable
+data class TerminalCursor(
+    val `row`: Int,
+    val `col`: Int,
+    val `visible`: Boolean,
+    val `shape`: TerminalCursorShape,
+)
+
+@Serializable
+data class TerminalCell(
+    val `text`: String,
+    val `width`: Int,
+    val `fg`: String,
+    val `bg`: String,
+    val `bold`: Boolean,
+    val `italic`: Boolean,
+    val `underline`: Boolean,
+    val `strikethrough`: Boolean,
+    val `inverse`: Boolean,
+)
+
+@Serializable
+data class TerminalSnapshot(
+    val `api_version`: Long = 1,
+    val `revision`: String,
+    val `cols`: Int,
+    val `rows`: Int,
+    val `scroll_offset`: Long,
+    val `scrollback_rows`: Long,
+    val `reply_bytes_base64`: String,
+    val `reverse_video`: Boolean,
+    val `vt_modes`: VtModes,
+    val `cursor`: TerminalCursor,
+    val `cells`: List<TerminalCell>,
+    val `title`: String,
+)
+
+@Serializable
+data class TerminalView(
+    val `terminal_id`: String,
+    val `workspace_id`: String = "",
+    val `label`: String = "Terminal",
+    val `session_status`: String = "running",
+    val `attached`: Boolean = false,
+    val `cols`: Int = 80,
+    val `rows`: Int = 24,
+    val `next_offset`: String? = null,
+    val `grid_revision`: String = "0",
+    val `stale`: Boolean = true,
+    val `error`: LocalError? = null,
+)
+
+@Serializable
+data class TerminalQuery(
+    val `api_version`: Long,
+    val `revision`: String,
+    val `data`: TerminalView?,
+    val `error`: LocalError?,
+)
+
+@Serializable
 data class Config(
     val `api_version`: Long,
     val `host_id`: String,

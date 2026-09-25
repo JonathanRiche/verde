@@ -38,5 +38,17 @@ int main(int argc, char **argv) {
     vc_host_free(NULL);
     host = (vc_host *)1;
     if (vc_host_new(NULL, 1, &host) != 1 || host) return 8;
+    const unsigned char term_config[] = "{\"api_version\":1,\"cols\":20,\"rows\":4,\"scrollback_rows\":10}";
+    vc_term *term = NULL;
+    if (vc_term_new(term_config, sizeof(term_config)-1, &term) || !term) return 11;
+    if (vc_term_write(term, (const unsigned char *)"abc", 3)) return 12;
+    if (vc_term_resize(term, 24, 6) || vc_term_scroll(term, 2)) return 13;
+    if (vc_term_snapshot(term, &snapshot) || !snapshot.len) return 14;
+    vc_term_free(term);
+    if (snapshot.ptr[0] != '{') return 15;
+    vc_buf_free(snapshot);
+    vc_term_free(NULL);
+    term = (vc_term *)1;
+    if (vc_term_new(NULL, 1, &term) != 1 || term) return 16;
     return 0;
 }

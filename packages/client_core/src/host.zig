@@ -4,6 +4,7 @@ const std = @import("std");
 pub const rpc = @import("rpc.zig");
 const auth = @import("auth.zig");
 pub const sync = @import("sync.zig");
+const terminal = @import("terminal_pump.zig");
 const profile = @import("verde_remote").profile;
 const A = std.mem.Allocator;
 const V = std.json.Value;
@@ -56,6 +57,7 @@ pub const State = struct {
     rpc: rpc.State = .{},
     auth: auth.State = .{},
     sync: sync.State = .{},
+    terminal: terminal.State = .{},
     lifecycle: Lifecycle = .created,
     revision: u64 = 0,
     generation: u64 = 0,
@@ -101,6 +103,7 @@ pub const Host = struct {
         if (input.len > MAX_INPUT and !eq(try string(event, "type"), "http_response") and !eq(try string(event, "type"), "ws_message")) return error.ResourceLimit;
         try tx.apply(event);
         try sync.pump(&tx);
+        try terminal.pump(&tx);
         return tx.commit(self, output_allocator);
     }
 
@@ -133,6 +136,9 @@ pub const Host = struct {
                 .update_required = s.rpc.update_required,
                 .@"error" = s.host_error,
             }}, .operations = operations });
+        } else if (std.mem.startsWith(u8, selector, "terminal:")) {
+            data = (try terminal.query(a, s, selector[9..])) orelse .null;
+            if (data == .null) failure = .{ .code = "not_found", .message = "Unknown terminal." };
         } else if (eq(selector, "home") or eq(selector, "workspaces")) {
             data = try sync.query(a, s, selector);
         } else {
@@ -212,6 +218,7 @@ pub const Transaction = struct {
     pub fn invalidateTransport(self: *Transaction) ApiError!void {
         if (self.state.generation == std.math.maxInt(u64)) return error.ResourceLimit;
         try rpc.invalidate(self);
+        terminal.invalidate(self);
         self.state.generation += 1;
         auth.invalidated(self);
         var i: usize = 0;
@@ -315,12 +322,12 @@ pub const Transaction = struct {
             if (s.receipts.len == MAX_RECEIPTS) return error.ResourceLimit;
             try append(Receipt, self.allocator(), &s.receipts, .{ .digest = digest, .operation = .{ .intent_id = id, .@"error" = .{ .code = "unsupported", .message = "Intent is not implemented.", .intent_id = id } } });
             _ = try auth.intent(self, tag, event);
+            _ = try terminal.intent(self, tag, event);
             self.changed = true;
         } else if (eq(tag, "terminal_reply")) {
             _ = try string(event, "terminal_id");
             try base64(try string(event, "bytes_base64"));
-            // No VT/session exists in the skeleton, and raw replies have no intent receipt.
-            return error.InvalidLifecycle;
+            try terminal.reply(self, event);
         } else {
             try self.complete(tag, event);
             if (!self.completion_matched) return;
@@ -396,6 +403,7 @@ pub const Transaction = struct {
                 return;
             }
             if (try auth.complete(self, p, event)) return;
+            if (try terminal.complete(self, p, event)) return;
             if (kind == .store_get) {
                 if ((try field(event, "error")) != .null) {
                     self.state.host_error = .{ .domain = "storage", .code = try string(try field(event, "error"), "code"), .message = "Stored profile could not be loaded.", .retryable = true };
@@ -415,6 +423,7 @@ pub const Transaction = struct {
             if (self.state.revision == std.math.maxInt(u64)) return error.ResourceLimit;
             self.state.revision += 1;
             _ = try self.emit("state_changed", .{ .revision = try decimal(self.allocator(), self.state.revision), .scopes = [_][]const u8{ "hosts", "home", "workspaces" } });
+            try terminal.queryScopes(self);
         }
         // Retain only state, never the call's decoded secrets or effect payloads.
         var retained = std.heap.ArenaAllocator.init(host.allocator);

@@ -59,8 +59,8 @@ with equivalent transactional ownership without changing the ABI.
   `certificate`, `hostname`, `pin_mismatch`, `unavailable`, `resource`.
   Adapters must map diagnostics into this vocabulary. Platform failures use
   exactly the five specified codes. Arbitrary exception text is rejected.
-- `terminal_reply` has no intent ID and no terminal can exist yet; it returns
-  invalid lifecycle rather than pretending bytes were delivered. K-12 owns it.
+- K-12 now routes `terminal_reply` through the attached session pump; see
+  [terminal.md](terminal.md) for its C/JNI handles and acknowledgement contract.
 
 The harness covers ownership, independent hosts, ordered dispatch/out-of-order
 completion, cancellations, generations, timer replacement/early delivery,

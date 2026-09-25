@@ -39,6 +39,15 @@ vc_status vc_host_handle(vc_host *host, const unsigned char *json, size_t len, v
  * See docs/rendering.md for byte offsets, budgets, and query-envelope errors. */
 vc_status vc_host_query(vc_host *host, const unsigned char *selector, size_t len, vc_buf *out);
 void vc_buf_free(vc_buf buf);
+/* Independent serialized VT handle; free never kills the remote session.
+ * Snapshot drains device replies only after successful output allocation.
+ * Positive scroll deltas move toward older history. */
+vc_status vc_term_new(const unsigned char *json, size_t len, vc_term **out);
+void vc_term_free(vc_term *term);
+vc_status vc_term_write(vc_term *term, const unsigned char *bytes, size_t len);
+vc_status vc_term_resize(vc_term *term, uint16_t cols, uint16_t rows);
+vc_status vc_term_scroll(vc_term *term, int32_t delta_rows);
+vc_status vc_term_snapshot(vc_term *term, vc_buf *out);
 
 #ifdef __cplusplus
 }

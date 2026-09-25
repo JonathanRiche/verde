@@ -35,6 +35,296 @@ indirect enum JSONValue: Codable {
     }
 }
 
+struct TerminalConfig: Codable {
+    var `api_version`: UInt32 = 1
+    var `cols`: UInt16
+    var `rows`: UInt16
+    var `scrollback_rows`: UInt32
+}
+
+extension TerminalConfig {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `cols`
+        case `rows`
+        case `scrollback_rows`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`cols` = try c.decode(UInt16.self, forKey: .`cols`)
+        self.`rows` = try c.decode(UInt16.self, forKey: .`rows`)
+        self.`scrollback_rows` = try c.decode(UInt32.self, forKey: .`scrollback_rows`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`cols`, forKey: .`cols`)
+        try c.encode(self.`rows`, forKey: .`rows`)
+        try c.encode(self.`scrollback_rows`, forKey: .`scrollback_rows`)
+    }
+}
+
+enum TerminalCursorShape: String, Codable {
+    case `block`
+    case `underline`
+    case `bar`
+}
+
+struct TerminalCursor: Codable {
+    var `row`: UInt16
+    var `col`: UInt16
+    var `visible`: Bool
+    var `shape`: TerminalCursorShape
+}
+
+extension TerminalCursor {
+    private enum CodingKeys: String, CodingKey {
+        case `row`
+        case `col`
+        case `visible`
+        case `shape`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`row` = try c.decode(UInt16.self, forKey: .`row`)
+        self.`col` = try c.decode(UInt16.self, forKey: .`col`)
+        self.`visible` = try c.decode(Bool.self, forKey: .`visible`)
+        self.`shape` = try c.decode(TerminalCursorShape.self, forKey: .`shape`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`row`, forKey: .`row`)
+        try c.encode(self.`col`, forKey: .`col`)
+        try c.encode(self.`visible`, forKey: .`visible`)
+        try c.encode(self.`shape`, forKey: .`shape`)
+    }
+}
+
+struct TerminalCell: Codable {
+    var `text`: String
+    var `width`: UInt8
+    var `fg`: String
+    var `bg`: String
+    var `bold`: Bool
+    var `italic`: Bool
+    var `underline`: Bool
+    var `strikethrough`: Bool
+    var `inverse`: Bool
+}
+
+extension TerminalCell {
+    private enum CodingKeys: String, CodingKey {
+        case `text`
+        case `width`
+        case `fg`
+        case `bg`
+        case `bold`
+        case `italic`
+        case `underline`
+        case `strikethrough`
+        case `inverse`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`text` = try c.decode(String.self, forKey: .`text`)
+        self.`width` = try c.decode(UInt8.self, forKey: .`width`)
+        self.`fg` = try c.decode(String.self, forKey: .`fg`)
+        self.`bg` = try c.decode(String.self, forKey: .`bg`)
+        self.`bold` = try c.decode(Bool.self, forKey: .`bold`)
+        self.`italic` = try c.decode(Bool.self, forKey: .`italic`)
+        self.`underline` = try c.decode(Bool.self, forKey: .`underline`)
+        self.`strikethrough` = try c.decode(Bool.self, forKey: .`strikethrough`)
+        self.`inverse` = try c.decode(Bool.self, forKey: .`inverse`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`text`, forKey: .`text`)
+        try c.encode(self.`width`, forKey: .`width`)
+        try c.encode(self.`fg`, forKey: .`fg`)
+        try c.encode(self.`bg`, forKey: .`bg`)
+        try c.encode(self.`bold`, forKey: .`bold`)
+        try c.encode(self.`italic`, forKey: .`italic`)
+        try c.encode(self.`underline`, forKey: .`underline`)
+        try c.encode(self.`strikethrough`, forKey: .`strikethrough`)
+        try c.encode(self.`inverse`, forKey: .`inverse`)
+    }
+}
+
+struct TerminalSnapshot: Codable {
+    var `api_version`: UInt32 = 1
+    var `revision`: String
+    var `cols`: UInt16
+    var `rows`: UInt16
+    var `scroll_offset`: UInt32
+    var `scrollback_rows`: UInt32
+    var `reply_bytes_base64`: String
+    var `reverse_video`: Bool
+    var `vt_modes`: VtModes
+    var `cursor`: TerminalCursor
+    var `cells`: [TerminalCell]
+    var `title`: String
+}
+
+extension TerminalSnapshot {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `revision`
+        case `cols`
+        case `rows`
+        case `scroll_offset`
+        case `scrollback_rows`
+        case `reply_bytes_base64`
+        case `reverse_video`
+        case `vt_modes`
+        case `cursor`
+        case `cells`
+        case `title`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`revision` = try c.decode(String.self, forKey: .`revision`)
+        self.`cols` = try c.decode(UInt16.self, forKey: .`cols`)
+        self.`rows` = try c.decode(UInt16.self, forKey: .`rows`)
+        self.`scroll_offset` = try c.decode(UInt32.self, forKey: .`scroll_offset`)
+        self.`scrollback_rows` = try c.decode(UInt32.self, forKey: .`scrollback_rows`)
+        self.`reply_bytes_base64` = try c.decode(String.self, forKey: .`reply_bytes_base64`)
+        self.`reverse_video` = try c.decode(Bool.self, forKey: .`reverse_video`)
+        self.`vt_modes` = try c.decode(VtModes.self, forKey: .`vt_modes`)
+        self.`cursor` = try c.decode(TerminalCursor.self, forKey: .`cursor`)
+        self.`cells` = try c.decode([TerminalCell].self, forKey: .`cells`)
+        self.`title` = try c.decode(String.self, forKey: .`title`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`revision`, forKey: .`revision`)
+        try c.encode(self.`cols`, forKey: .`cols`)
+        try c.encode(self.`rows`, forKey: .`rows`)
+        try c.encode(self.`scroll_offset`, forKey: .`scroll_offset`)
+        try c.encode(self.`scrollback_rows`, forKey: .`scrollback_rows`)
+        try c.encode(self.`reply_bytes_base64`, forKey: .`reply_bytes_base64`)
+        try c.encode(self.`reverse_video`, forKey: .`reverse_video`)
+        try c.encode(self.`vt_modes`, forKey: .`vt_modes`)
+        try c.encode(self.`cursor`, forKey: .`cursor`)
+        try c.encode(self.`cells`, forKey: .`cells`)
+        try c.encode(self.`title`, forKey: .`title`)
+    }
+}
+
+struct TerminalView: Codable {
+    var `terminal_id`: String
+    var `workspace_id`: String = ""
+    var `label`: String = "Terminal"
+    var `session_status`: String = "running"
+    var `attached`: Bool = false
+    var `cols`: UInt16 = 80
+    var `rows`: UInt16 = 24
+    var `next_offset`: String? = nil
+    var `grid_revision`: String = "0"
+    var `stale`: Bool = true
+    var `error`: LocalError? = nil
+}
+
+extension TerminalView {
+    private enum CodingKeys: String, CodingKey {
+        case `terminal_id`
+        case `workspace_id`
+        case `label`
+        case `session_status`
+        case `attached`
+        case `cols`
+        case `rows`
+        case `next_offset`
+        case `grid_revision`
+        case `stale`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`terminal_id` = try c.decode(String.self, forKey: .`terminal_id`)
+        if !c.contains(.`workspace_id`) { self.`workspace_id` = "" } else {
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        }
+        if !c.contains(.`label`) { self.`label` = "Terminal" } else {
+        self.`label` = try c.decode(String.self, forKey: .`label`)
+        }
+        if !c.contains(.`session_status`) { self.`session_status` = "running" } else {
+        self.`session_status` = try c.decode(String.self, forKey: .`session_status`)
+        }
+        if !c.contains(.`attached`) { self.`attached` = false } else {
+        self.`attached` = try c.decode(Bool.self, forKey: .`attached`)
+        }
+        if !c.contains(.`cols`) { self.`cols` = 80 } else {
+        self.`cols` = try c.decode(UInt16.self, forKey: .`cols`)
+        }
+        if !c.contains(.`rows`) { self.`rows` = 24 } else {
+        self.`rows` = try c.decode(UInt16.self, forKey: .`rows`)
+        }
+        if !c.contains(.`next_offset`) { self.`next_offset` = nil } else {
+        self.`next_offset` = try c.decodeIfPresent(String.self, forKey: .`next_offset`)
+        }
+        if !c.contains(.`grid_revision`) { self.`grid_revision` = "0" } else {
+        self.`grid_revision` = try c.decode(String.self, forKey: .`grid_revision`)
+        }
+        if !c.contains(.`stale`) { self.`stale` = true } else {
+        self.`stale` = try c.decode(Bool.self, forKey: .`stale`)
+        }
+        if !c.contains(.`error`) { self.`error` = nil } else {
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`terminal_id`, forKey: .`terminal_id`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`label`, forKey: .`label`)
+        try c.encode(self.`session_status`, forKey: .`session_status`)
+        try c.encode(self.`attached`, forKey: .`attached`)
+        try c.encode(self.`cols`, forKey: .`cols`)
+        try c.encode(self.`rows`, forKey: .`rows`)
+        try c.encode(self.`next_offset`, forKey: .`next_offset`)
+        try c.encode(self.`grid_revision`, forKey: .`grid_revision`)
+        try c.encode(self.`stale`, forKey: .`stale`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct TerminalQuery: Codable {
+    var `api_version`: UInt32
+    var `revision`: String
+    var `data`: TerminalView?
+    var `error`: LocalError?
+}
+
+extension TerminalQuery {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `revision`
+        case `data`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        self.`revision` = try c.decode(String.self, forKey: .`revision`)
+        self.`data` = try c.decodeIfPresent(TerminalView.self, forKey: .`data`)
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`revision`, forKey: .`revision`)
+        try c.encode(self.`data`, forKey: .`data`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
 struct Config: Codable {
     var `api_version`: UInt32
     var `host_id`: String

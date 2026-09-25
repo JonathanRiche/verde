@@ -1,0 +1,25 @@
+{
+  "created": true,
+  "session": {
+    "id": "k12-fixture",
+    "session_id": "k12-fixture",
+    "workspace_id": "",
+    "workspace_path": "",
+    "cwd": "/tmp/k12-fixture",
+    "label": "/bin/sh -c printf '\u001b[2J\u001b[H\u001b]2;Fixture\u0007\u001b[1;31mRED\u001b[0m\r\nwide: 界 é\r\n\u001b[?1h\u001b[?2004h'; exec /bin/cat",
+    "command": "/bin/sh -c printf '\u001b[2J\u001b[H\u001b]2;Fixture\u0007\u001b[1;31mRED\u001b[0m\r\nwide: 界 é\r\n\u001b[?1h\u001b[?2004h'; exec /bin/cat",
+    "dock_id": 0,
+    "pane_id": 0,
+    "running": true,
+    "status": "running",
+    "exit_status": null,
+    "stream_eof": false,
+    "output_reader_status": "unavailable",
+    "output_reader_error_code": null,
+    "input_writer_status": "unavailable",
+    "input_writer_error_code": null,
+    "cols": 20,
+    "rows": 4,
+    "attached_clients": 0
+  }
+}

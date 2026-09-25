@@ -238,12 +238,6 @@ test "all future feature intents fail visibly with unsupported and no I/O" {
         .{ .tag = "slash_search", .payload = ",\"query\":\"q\"" },
         .{ .tag = "slash_run", .payload = ",\"command\":\"c\",\"args\":\"\"" },
         .{ .tag = "mention_search", .payload = ",\"query\":\"q\"" },
-        .{ .tag = "terminal_create", .payload = ",\"cwd\":null,\"cols\":80,\"rows\":24" },
-        .{ .tag = "terminal_attach", .payload = "" },
-        .{ .tag = "terminal_detach", .payload = "" },
-        .{ .tag = "terminal_input", .payload = ",\"vt_modes\":{\"application_cursor\":false,\"bracketed_paste\":false},\"input\":{\"kind\":\"text\",\"text\":\"hi\",\"ctrl\":false,\"alt\":false,\"shift\":false}" },
-        .{ .tag = "terminal_resize", .payload = ",\"cols\":80,\"rows\":24" },
-        .{ .tag = "terminal_kill", .payload = "" },
     };
     for (cases) |case| {
         var f = try Fixture.init();

@@ -1,0 +1,10 @@
+{
+  "id": "k12-fixture",
+  "running": true,
+  "exit_status": null,
+  "text": "\u001b[2J\u001b[H\u001b]2;Fixture\u0007\u001b[1;31mRED\u001b[0m\r\r\nwide: 界 é\r\r\n\u001b[?1h\u001b[?2004h",
+  "offset": 0,
+  "next_offset": 65,
+  "cols": 20,
+  "rows": 4
+}

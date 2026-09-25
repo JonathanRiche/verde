@@ -2,7 +2,16 @@
 const wire = @import("wire.zig");
 const rendering = @import("rendering.zig");
 const projection = @import("projection.zig");
+const terminal = @import("terminal.zig");
+const pump = @import("terminal_pump.zig");
 pub const types = .{
+    .{ "TerminalConfig", terminal.Config },
+    .{ "TerminalCursorShape", terminal.CursorShape },
+    .{ "TerminalCursor", terminal.Cursor },
+    .{ "TerminalCell", terminal.Cell },
+    .{ "TerminalSnapshot", terminal.Snapshot },
+    .{ "TerminalView", pump.View },
+    .{ "TerminalQuery", wire.Query(pump.View) },
     .{ "Config", wire.Config },
     .{ "Lifecycle", wire.Lifecycle },
     .{ "LocalError", wire.LocalError },

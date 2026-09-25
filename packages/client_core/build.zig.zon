@@ -4,6 +4,10 @@
     .fingerprint = 0xfe79e8a9e166a459,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        .ghostty = .{
+            .url = "https://github.com/ghostty-org/ghostty/archive/d760ee96e54657416eb427b793c7e839f003df7d.tar.gz",
+            .hash = "ghostty-1.3.2-dev-5UdBC_6FQgWGrD6VNNvHKYwtJ0pHa2PRFlw8OIVsvdKY",
+        },
         .zig_markdown = .{ .path = "../zig_markdown" },
         .zig_dif = .{ .path = "../zig_dif" },
     },

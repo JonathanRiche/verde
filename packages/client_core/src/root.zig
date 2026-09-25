@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 pub const engine = @import("host.zig");
 const jni = @import("jni.zig");
+pub const terminal = @import("terminal.zig");
 
 /// Core version from `build.zig.zon`, NUL-terminated for C callers.
 pub const version: [:0]const u8 = build_options.version;
@@ -18,8 +19,20 @@ comptime {
     @export(&vcHostFree, .{ .name = "vc_host_free" });
     @export(&vcHostHandle, .{ .name = "vc_host_handle" });
     @export(&vcHostQuery, .{ .name = "vc_host_query" });
+    @export(&vcTermNew, .{ .name = "vc_term_new" });
+    @export(&vcTermFree, .{ .name = "vc_term_free" });
+    @export(&vcTermWrite, .{ .name = "vc_term_write" });
+    @export(&vcTermResize, .{ .name = "vc_term_resize" });
+    @export(&vcTermScroll, .{ .name = "vc_term_scroll" });
+    @export(&vcTermSnapshot, .{ .name = "vc_term_snapshot" });
     @export(&vcBufFree, .{ .name = "vc_buf_free" });
     if (builtin.abi.isAndroid()) {
+        @export(&jni.termNew, .{ .name = "Java_dev_verdeai_core_Native_termNew" });
+        @export(&jni.termFree, .{ .name = "Java_dev_verdeai_core_Native_termFree" });
+        @export(&jni.termWrite, .{ .name = "Java_dev_verdeai_core_Native_termWrite" });
+        @export(&jni.termResize, .{ .name = "Java_dev_verdeai_core_Native_termResize" });
+        @export(&jni.termScroll, .{ .name = "Java_dev_verdeai_core_Native_termScroll" });
+        @export(&jni.termSnapshot, .{ .name = "Java_dev_verdeai_core_Native_termSnapshot" });
         @export(&jni.hostNew, .{ .name = "Java_dev_verdeai_core_Native_hostNew" });
         @export(&jni.hostFree, .{ .name = "Java_dev_verdeai_core_Native_hostFree" });
         @export(&jni.hostHandle, .{ .name = "Java_dev_verdeai_core_Native_hostHandle" });
@@ -68,7 +81,7 @@ test "JNI version entry point returns the version through NewStringUTF" {
 
 // Panics contain a fixed diagnostic only. Do not format panic messages, which
 // may contain caller data. Mobile libraries must not install signal handlers.
-pub const std_options: std.Options = .{ .enable_segfault_handler = false, .signal_stack_size = 0 };
+pub const std_options: std.Options = .{ .logFn = quietLog, .enable_segfault_handler = false, .signal_stack_size = 0 };
 pub const panic = std.debug.FullPanic(corePanic);
 extern "log" fn __android_log_write(priority: c_int, tag: [*:0]const u8, text: [*:0]const u8) c_int;
 fn corePanic(_: []const u8, _: ?usize) noreturn {
@@ -139,6 +152,45 @@ test {
     _ = @import("harness.zig");
     _ = @import("rpc_test.zig");
     _ = @import("sync_test.zig");
+    _ = @import("terminal_test.zig");
     _ = @import("model_contract_test.zig");
     _ = @import("auth_harness.zig");
+}
+
+// Upstream parser diagnostics can include escape payloads. Never log them.
+fn quietLog(comptime _: std.log.Level, comptime _: @EnumLiteral(), comptime _: []const u8, _: anytype) void {}
+pub fn vcTermNew(ptr: ?[*]const u8, len: usize, out: ?*?*terminal.Terminal) callconv(.c) i32 {
+    const result = out orelse return 1;
+    result.* = null;
+    const input = inputSlice(ptr, len) catch |err| return status(err);
+    result.* = terminal.Terminal.create(std.heap.c_allocator, input) catch |err| return status(err);
+    return 0;
+}
+pub fn vcTermFree(term: ?*terminal.Terminal) callconv(.c) void {
+    if (term) |t| t.destroy();
+}
+pub fn vcTermWrite(term: ?*terminal.Terminal, ptr: ?[*]const u8, len: usize) callconv(.c) i32 {
+    const t = term orelse return 1;
+    const bytes = inputSlice(ptr, len) catch |err| return status(err);
+    t.write(bytes) catch |err| return status(err);
+    return 0;
+}
+pub fn vcTermResize(term: ?*terminal.Terminal, cols: u16, rows: u16) callconv(.c) i32 {
+    const t = term orelse return 1;
+    t.resize(cols, rows) catch |err| return status(err);
+    return 0;
+}
+pub fn vcTermScroll(term: ?*terminal.Terminal, delta: i32) callconv(.c) i32 {
+    const t = term orelse return 1;
+    t.scroll(delta) catch |err| return status(err);
+    return 0;
+}
+pub fn vcTermSnapshot(term: ?*terminal.Terminal, out: ?*Buf) callconv(.c) i32 {
+    const result = out orelse return 1;
+    result.* = .{};
+    const t = term orelse return 1;
+    const bytes = t.snapshot(std.heap.c_allocator) catch |err| return status(err);
+    result.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    t.consumeReplies();
+    return 0;
 }

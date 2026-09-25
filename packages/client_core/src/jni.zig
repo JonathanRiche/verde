@@ -195,4 +195,69 @@ test "JNI host wrappers copy inputs and outputs and roll back JVM allocation fai
     try std.testing.expect(std.mem.indexOf(u8, Vm.output[0..Vm.output_len], "jni") != null);
     Vm.input = "{}";
     try std.testing.expect(hostHandle(&table, null, token, input, out_status) == null and Vm.code == 1);
+    Vm.input = "{\"api_version\":1,\"cols\":8,\"rows\":2,\"scrollback_rows\":0}";
+    const term_token = termNew(&table, null, input, out_status);
+    try std.testing.expect(term_token != 0 and Vm.code == 0);
+    defer termFree(&table, null, term_token);
+    Vm.input = "\x1b[6n";
+    try std.testing.expect(termWrite(&table, null, term_token, input) == 0);
+    Vm.fail_output = true;
+    try std.testing.expect(termSnapshot(&table, null, term_token, out_status) == null and Vm.code == 3);
+    try std.testing.expect(termPointer(term_token).?.replies.items.len > 0);
+    Vm.fail_output = false;
+    try std.testing.expect(termSnapshot(&table, null, term_token, out_status) != null and Vm.code == 0);
+    try std.testing.expect(termPointer(term_token).?.replies.items.len == 0);
+    try std.testing.expect(termResize(&table, null, term_token, 0, 2) == 1);
+    try std.testing.expect(termResize(&table, null, term_token, 10, 2) == 0);
+    try std.testing.expect(termScroll(&table, null, term_token, 1) == 0);
+}
+
+fn termPointer(token: i64) ?*abi.terminal.Terminal {
+    return if (token == 0) null else @ptrFromInt(@as(u64, @bitCast(token)));
+}
+pub fn termNew(env: Env, _: jclass, array: jobject, out_status: jobject) callconv(.c) i64 {
+    if (!setStatus(env, out_status, 1)) return 0;
+    const bytes = copyInput(env, array, core.MAX_INPUT) catch |err| {
+        _ = setStatus(env, out_status, abi.status(err));
+        return 0;
+    };
+    defer std.heap.c_allocator.free(bytes);
+    var term: ?*abi.terminal.Terminal = null;
+    const code = abi.vcTermNew(bytes.ptr, bytes.len, &term);
+    if (!setStatus(env, out_status, code)) {
+        abi.vcTermFree(term);
+        return 0;
+    }
+    return if (term) |t| @bitCast(@as(u64, @intFromPtr(t))) else 0;
+}
+pub fn termFree(_: Env, _: jclass, token: i64) callconv(.c) void {
+    abi.vcTermFree(termPointer(token));
+}
+pub fn termWrite(env: Env, _: jclass, token: i64, array: jobject) callconv(.c) i32 {
+    const bytes = copyInput(env, array, core.MAX_INPUT) catch |err| return abi.status(err);
+    defer std.heap.c_allocator.free(bytes);
+    return abi.vcTermWrite(termPointer(token), bytes.ptr, bytes.len);
+}
+pub fn termResize(_: Env, _: jclass, token: i64, cols: i32, rows: i32) callconv(.c) i32 {
+    if (cols <= 0 or rows <= 0 or cols > 65535 or rows > 65535) return 1;
+    return abi.vcTermResize(termPointer(token), @intCast(cols), @intCast(rows));
+}
+pub fn termScroll(_: Env, _: jclass, token: i64, delta: i32) callconv(.c) i32 {
+    return abi.vcTermScroll(termPointer(token), delta);
+}
+pub fn termSnapshot(env: Env, _: jclass, token: i64, out_status: jobject) callconv(.c) jobject {
+    if (!setStatus(env, out_status, 1)) return null;
+    const term = termPointer(token) orelse return null;
+    const bytes = term.snapshot(std.heap.c_allocator) catch |err| {
+        _ = setStatus(env, out_status, abi.status(err));
+        return null;
+    };
+    defer std.heap.c_allocator.free(bytes);
+    const result = copyOutput(env, bytes) orelse {
+        _ = setStatus(env, out_status, 3);
+        return null;
+    };
+    if (!setStatus(env, out_status, 0)) return null;
+    term.consumeReplies();
+    return result;
 }

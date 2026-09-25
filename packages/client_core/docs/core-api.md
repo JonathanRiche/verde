@@ -238,7 +238,7 @@ Optional values below may be null. These are new local names, not RPC names.
 | `shell_prepare` / `shell_confirm` | `workspace_id,thread_id,command` / `confirmation_id,accept`; confirmation is bound to exact command, cwd, host and thread. |
 | `slash_search` / `slash_run` | `workspace_id,thread_id,query` / `workspace_id,thread_id,command,args`; use daemon catalogs. |
 | `mention_search` | `workspace_id,thread_id,query`; latest query wins; no local file reads. |
-| `terminal_create` | `workspace_id,cwd,cols,rows`; desktop-native open when available, otherwise daemon session. |
+| `terminal_create` | `workspace_id,cwd,cols,rows`; daemon session only (paired mobile uses `session.*`). |
 | `terminal_attach` / `terminal_detach` | `terminal_id`; subscribe/unsubscribe local pumping, does not kill the remote session. |
 | `terminal_input` | `terminal_id,vt_modes:{application_cursor,bracketed_paste},input:{kind:text|key|paste,text?,key?,ctrl,alt,shift}`; core encodes keys and ordered paste chunks. |
 | `terminal_resize` | `terminal_id,cols,rows`; positive bounded grid, coalesce pending resize. |
@@ -476,9 +476,9 @@ returned as `reply_bytes_base64` by `vc_term_snapshot` (drained on snapshot);
 the adapter submits a `terminal_reply` event with `terminal_id,bytes_base64`.
 That event is distinct from a user intent and routes the raw reply through
 `session.write`, with no logging or automatic replay.
-Use `session.create/resize/write/kill`; try `terminal.open` for native desktop
-panes only when available, fall back to session creation only on explicit
-unavailability, never a timeout that could have opened a pane already.
+Use `session.create/resize/write/kill` only. A-02 deliberately leaves desktop
+`terminal.*` unmapped for paired devices. K-12 implementation details and
+bounds are in [terminal.md](terminal.md).
 
 ## 11. Errors and recovery
 

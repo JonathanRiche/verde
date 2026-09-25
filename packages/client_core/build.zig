@@ -219,6 +219,9 @@ fn createCoreModule(
     });
     const headless = b.createModule(.{ .root_source_file = b.path("../headless/src/root.zig"), .target = target, .optimize = optimize });
     const remote = b.createModule(.{ .root_source_file = b.path("src/shared/root.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "headless", .module = headless }} });
+    // Same upstream pin as desktop; pure Zig paths keep mobile free of C++ runtime dependencies.
+    const ghostty = b.dependency("ghostty", .{ .target = target, .optimize = optimize, .@"app-runtime" = .none, .@"emit-lib-vt" = true, .simd = false, .@"emit-xcframework" = false });
+    module.addImport("ghostty-vt", ghostty.module("ghostty-vt"));
     module.addImport("verde_remote", remote);
     module.addImport("headless", headless);
     const markdown = b.dependency("zig_markdown", .{ .target = target, .optimize = optimize });
