@@ -1531,7 +1531,9 @@ fn handleRpc(
         return;
     };
     defer allocator.free(result.json);
-    try respondJson(request, .ok, result.json);
+    const forwarded = try forwardedCapabilities(allocator, parsed.request.method, result.json);
+    defer allocator.free(forwarded);
+    try respondJson(request, .ok, forwarded);
 }
 
 fn respondDaemonStatus(
@@ -1544,10 +1546,12 @@ fn respondDaemonStatus(
         return;
     };
     defer allocator.free(result.json);
+    const forwarded = try forwardedCapabilities(allocator, "core.status", result.json);
+    defer allocator.free(forwarded);
     try respondJson(
         request,
         if (rpcSucceeded(allocator, result.json)) .ok else .service_unavailable,
-        result.json,
+        forwarded,
     );
 }
 
@@ -1671,6 +1675,81 @@ fn jsonString(value: std.json.Value) ?[]const u8 {
     };
 }
 
+// Only network clients can opt into the gateway's delta feed. Preserve the
+// daemon envelope (including future fields) while adding this transport promise.
+fn forwardedCapabilities(allocator: std.mem.Allocator, method: []const u8, json: []const u8) ![]u8 {
+    if (!std.mem.eql(u8, method, "core.status") and !std.mem.eql(u8, method, "core.capabilities"))
+        return allocator.dupe(u8, json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return allocator.dupe(u8, json);
+    const result = parsed.value.object.getPtr("result") orelse return allocator.dupe(u8, json);
+    if (result.* != .object) return allocator.dupe(u8, json);
+    const capabilities = result.object.getPtr("runtime_capabilities") orelse return allocator.dupe(u8, json);
+    if (capabilities.* != .array) return allocator.dupe(u8, json);
+    if (!statusAdvertisesCapability(result.*, headless.protocol.CORE_CHANGES_DELTA_CAPABILITY))
+        try capabilities.array.append(.{ .string = headless.protocol.CORE_CHANGES_DELTA_CAPABILITY });
+    return std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
+}
+
+const ChangeFeed = struct {
+    delta: bool = false,
+    cursor: ?u64 = null,
+    generation: u64 = 0,
+    snapshot_cursor: ?u64 = null,
+    nonce: ?[]u8 = null,
+
+    fn deinit(self: *ChangeFeed, allocator: std.mem.Allocator) void {
+        if (self.nonce) |nonce| allocator.free(nonce);
+    }
+
+    fn setMode(self: *ChangeFeed, allocator: std.mem.Allocator, params: std.json.Value) !void {
+        if (params != .object) return error.InvalidMode;
+        if (params.object.get("cursor")) |cursor| {
+            switch (cursor) {
+                .null => {},
+                .integer => |value| if (value < 0) {
+                    return error.InvalidMode;
+                },
+                .number_string => |value| for (value) |byte| {
+                    if (!std.ascii.isDigit(byte)) return error.InvalidMode;
+                },
+                else => return error.InvalidMode,
+            }
+        }
+        const Mode = struct { mode: []const u8, cursor: ?u64 = null };
+        var parsed = std.json.parseFromValue(Mode, allocator, params, .{}) catch return error.InvalidMode;
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, parsed.value.mode, "delta")) return error.InvalidMode;
+        self.delta = true;
+        self.cursor = parsed.value.cursor orelse self.snapshot_cursor;
+        self.generation +%= 1;
+    }
+
+    fn observeNonce(self: *ChangeFeed, allocator: std.mem.Allocator, result: std.json.Value) !bool {
+        if (result != .object) return false;
+        const envelope = result.object.get("envelope") orelse return false;
+        if (envelope != .object) return false;
+        const nonce = jsonString(envelope.object.get("instance_nonce") orelse .null) orelse return false;
+        const changed = if (self.nonce) |previous| !std.mem.eql(u8, previous, nonce) else false;
+        const copy = try allocator.dupe(u8, nonce);
+        if (self.nonce) |previous| allocator.free(previous);
+        self.nonce = copy;
+        return changed;
+    }
+
+    fn needsSnapshot(self: *ChangeFeed, allocator: std.mem.Allocator, json: []const u8) !bool {
+        if (!self.delta) return !isHeartbeat(json);
+        var parsed = try headless.parseResponse(allocator, json);
+        defer parsed.deinit();
+        const result = parsed.response.result orelse return error.InvalidChanges;
+        if (result != .object) return error.InvalidChanges;
+        const changed = try self.observeNonce(allocator, result);
+        const expired = result.object.get("expired") orelse .null;
+        return changed or (expired == .bool and expired.bool);
+    }
+};
+
 const WsSession = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1680,6 +1759,10 @@ const WsSession = struct {
     socket: *std.http.Server.WebSocket,
     runtime_target: ?SessionRuntimeTarget = null,
     write_mutex: std.Io.Mutex = .init,
+    // Never hold this while long-polling. Generation checks discard polls
+    // started before an opt-in/resume, and serialize its ack with pushes.
+    feed_mutex: std.Io.Mutex = .init,
+    feed: ChangeFeed = .{},
     closed: std.atomic.Value(bool) = .init(false),
 
     fn send(self: *WsSession, payload: []const u8) !void {
@@ -1748,6 +1831,7 @@ fn serveWebSocket(
         .socket = socket,
     };
     defer session.authentication.clear();
+    defer session.feed.deinit(allocator);
 
     try sendHello(&session);
     var poll_task = try io.concurrent(pollChanges, .{&session});
@@ -1790,7 +1874,7 @@ fn serveWebSocket(
                     session.send(encoded) catch {};
                     continue;
                 }
-                if (!session.rpcAllowed(parsed.request.method)) {
+                if (!session.rpcAllowed(if (std.mem.eql(u8, parsed.request.method, "core.changes.mode")) "core.changes" else parsed.request.method)) {
                     const encoded = try headless.encodeErrorResponse(
                         allocator,
                         parsed.request.id,
@@ -1813,6 +1897,26 @@ fn serveWebSocket(
                     continue;
                 }
 
+                if (std.mem.eql(u8, parsed.request.method, "core.changes.mode")) {
+                    try session.feed_mutex.lock(io);
+                    defer session.feed_mutex.unlock(io);
+                    const target = session.runtime_target.?.borrowed();
+                    const requested = parsed.request.target.?;
+                    const valid_target = std.mem.eql(u8, target.runtime_id, requested.runtime_id) and
+                        std.mem.eql(u8, target.instance_id, requested.instance_id);
+                    const encoded = if (!valid_target)
+                        try headless.encodeErrorResponse(allocator, parsed.request.id, headless.protocol.ERR_RUNTIME_IDENTITY_MISMATCH, "mode target differs from WebSocket runtime")
+                    else blk: {
+                        session.feed.setMode(allocator, parsed.request.params) catch {
+                            break :blk try headless.encodeErrorResponse(allocator, parsed.request.id, "invalid_params", "expected {mode: delta, cursor?: unsigned integer}");
+                        };
+                        break :blk try headless.encodeOkResponse(allocator, parsed.request.id, .{ .mode = "delta", .cursor = session.feed.cursor });
+                    };
+                    defer allocator.free(encoded);
+                    try session.send(encoded);
+                    continue;
+                }
+
                 const result = (if (session.authentication == .pair)
                     callPairedRpc(allocator, daemon, auth, session.authentication.pair, trimmed)
                 else
@@ -1824,7 +1928,9 @@ fn serveWebSocket(
                     continue;
                 };
                 defer allocator.free(result.json);
-                session.send(result.json) catch {};
+                const forwarded = try forwardedCapabilities(allocator, parsed.request.method, result.json);
+                defer allocator.free(forwarded);
+                session.send(forwarded) catch {};
             },
             else => {},
         }
@@ -1842,10 +1948,12 @@ fn sendHello(session: *WsSession) !void {
     if (!rpcSucceeded(session.allocator, status.json)) return error.DaemonUnavailable;
     session.runtime_target = try SessionRuntimeTarget.fromStatusEnvelope(session.allocator, status.json);
 
+    const status_forwarded = try forwardedCapabilities(session.allocator, "core.status", status.json);
+    defer session.allocator.free(status_forwarded);
     const hello = try std.fmt.allocPrint(
         session.allocator,
         "{{\"jsonrpc\":\"2.0\",\"method\":\"core.hello\",\"params\":{{\"source\":\"daemon\",\"status_envelope\":{s}}}}}",
-        .{status.json},
+        .{status_forwarded},
     );
     defer session.allocator.free(hello);
     if (!session.authenticationValid()) {
@@ -1867,7 +1975,6 @@ fn sendNotification(session: *WsSession, method: []const u8, payload: []const u8
 }
 
 fn pollChanges(session: *WsSession) void {
-    var cursor: ?u64 = null;
     while (!session.closed.load(.acquire)) {
         if (!session.authenticationValid()) {
             session.closeExpired();
@@ -1875,34 +1982,52 @@ fn pollChanges(session: *WsSession) void {
         }
         const started_ms = monotonicMillis(session.io);
         const target = if (session.runtime_target) |*value| value.borrowed() else return;
+        session.feed_mutex.lock(session.io) catch return;
+        const cursor = session.feed.cursor;
+        const generation = session.feed.generation;
+        session.feed_mutex.unlock(session.io);
         const result = session.daemon.callMethodTargeted("core.changes", changesParams(cursor), target) catch {
             sleepMs(session.io, 1_000) catch return;
             continue;
         };
         defer session.allocator.free(result.json);
-        if (!rpcSucceeded(session.allocator, result.json)) {
-            session.closeExpired();
-            return;
+        {
+            session.feed_mutex.lock(session.io) catch return;
+            defer session.feed_mutex.unlock(session.io);
+            if (generation != session.feed.generation) continue;
+            if (!rpcSucceeded(session.allocator, result.json)) {
+                session.closeExpired();
+                return;
+            }
+            if (!session.authenticationValid()) {
+                session.closeExpired();
+                return;
+            }
+
+            const note = std.fmt.allocPrint(
+                session.allocator,
+                "{{\"jsonrpc\":\"2.0\",\"method\":\"core.changes\",\"params\":{s}}}",
+                .{result.json},
+            ) catch continue;
+            defer session.allocator.free(note);
+            session.send(note) catch {
+                session.closed.store(true, .release);
+                return;
+            };
+
+            session.feed.cursor = extractNextCursor(result.json) orelse session.feed.cursor;
+            const resync = session.feed.needsSnapshot(session.allocator, result.json) catch {
+                session.closeExpired();
+                return;
+            };
+            if (resync) pushSnapshot(session) catch {
+                // Continuing after a failed delta resync would silently lose state.
+                if (session.feed.delta) {
+                    session.closeExpired();
+                    return;
+                }
+            };
         }
-        if (!session.authenticationValid()) {
-            session.closeExpired();
-            return;
-        }
-
-        const note = std.fmt.allocPrint(
-            session.allocator,
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"core.changes\",\"params\":{s}}}",
-            .{result.json},
-        ) catch continue;
-        defer session.allocator.free(note);
-        session.send(note) catch {
-            session.closed.store(true, .release);
-            return;
-        };
-
-        cursor = extractNextCursor(result.json) orelse cursor;
-        if (!isHeartbeat(result.json)) pushSnapshot(session) catch {};
-
         const elapsed_ms = monotonicMillis(session.io) -| started_ms;
         if (elapsed_ms < MIN_CHANGES_RETRY_MS) {
             sleepMs(session.io, MIN_CHANGES_RETRY_MS - elapsed_ms) catch return;
@@ -1929,6 +2054,24 @@ fn pushSnapshot(session: *WsSession) !void {
         return error.AuthenticationExpired;
     }
     try sendNotification(session, "core.snapshot", snapshot.json);
+    var parsed = try headless.parseResponse(session.allocator, snapshot.json);
+    defer parsed.deinit();
+    if (parsed.response.result) |result| {
+        _ = try session.feed.observeNonce(session.allocator, result);
+        if (result == .object) {
+            if (result.object.get("change_cursor")) |value| {
+                const cursor: ?u64 = switch (value) {
+                    .integer => |number| if (number >= 0) @intCast(number) else null,
+                    .number_string => |number| std.fmt.parseInt(u64, number, 10) catch null,
+                    else => null,
+                };
+                if (cursor) |number| {
+                    session.feed.snapshot_cursor = number;
+                    if (session.feed.delta) session.feed.cursor = number;
+                }
+            }
+        }
+    }
 }
 
 fn isHeartbeat(json: []const u8) bool {
@@ -3663,4 +3806,81 @@ test "paired gateway dispatches every allowlisted RPC and binds process ownershi
     // sessionizer.zig; this gate exercises the policy shared by HTTP and WS
     // together with the actual paired-client forwarder (no live runtime).
     try std.testing.expect(daemon.calls >= access.PAIRED_RPC_METHODS.len);
+}
+
+test "delta opt-in validates params and resumes from explicit or snapshot cursor" {
+    const allocator = std.testing.allocator;
+    var feed: ChangeFeed = .{ .snapshot_cursor = 18 };
+    defer feed.deinit(allocator);
+    for ([_][]const u8{ "{}", "null", "{\"mode\":\"legacy\"}", "{\"mode\":\"delta\",\"cursor\":-1}", "{\"mode\":\"delta\",\"cursor\":\"12\"}" }) |json| {
+        var params = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+        defer params.deinit();
+        try std.testing.expectError(error.InvalidMode, feed.setMode(allocator, params.value));
+        try std.testing.expect(!feed.delta);
+    }
+    var params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"mode\":\"delta\",\"cursor\":0}", .{});
+    defer params.deinit();
+    try feed.setMode(allocator, params.value);
+    try std.testing.expectEqual(@as(?u64, 0), changesParams(feed.cursor).cursor);
+    try std.testing.expectEqual(@as(u64, 1), feed.generation);
+    _ = params.value.object.swapRemove("cursor");
+    try feed.setMode(allocator, params.value);
+    try std.testing.expectEqual(@as(?u64, 18), feed.cursor);
+    try std.testing.expectEqual(@as(u64, 2), feed.generation);
+}
+
+test "delta changes resync on expiry or nonce change but legacy snapshots every change" {
+    const allocator = std.testing.allocator;
+    var delta: ChangeFeed = .{ .delta = true };
+    defer delta.deinit(allocator);
+    var legacy: ChangeFeed = .{};
+    defer legacy.deinit(allocator);
+    const cases = .{
+        .{ "a", false, false, false },
+        .{ "a", false, true, false },
+        .{ "a", true, false, true },
+        .{ "a", false, false, false },
+        .{ "b", false, true, true },
+        .{ "b", false, true, false },
+    };
+    inline for (cases) |case| {
+        const json = try headless.encodeOkResponse(allocator, 1, .{
+            .entries = .{},
+            .next_cursor = 7,
+            .envelope = .{ .instance_nonce = case[0] },
+            .expired = case[1],
+            .heartbeat = case[2],
+        });
+        defer allocator.free(json);
+        try std.testing.expectEqual(case[3], try delta.needsSnapshot(allocator, json));
+        try std.testing.expectEqual(!case[2], try legacy.needsSnapshot(allocator, json));
+    }
+}
+
+test "gateway alone adds delta capability once and preserves response fields" {
+    const allocator = std.testing.allocator;
+    for (headless.protocol.RUNTIME_CAPABILITY_NAMES) |name|
+        try std.testing.expect(!std.mem.eql(u8, name, headless.protocol.CORE_CHANGES_DELTA_CAPABILITY));
+    const original = "{\"jsonrpc\":\"2.0\",\"id\":42,\"ok\":true,\"result\":{\"runtime_capabilities\":[\"rpc.target.v1\"],\"mobile\":{\"min_client\":1},\"future\":true}}";
+    for ([_][]const u8{ "core.status", "core.capabilities" }) |method| {
+        const once = try forwardedCapabilities(allocator, method, original);
+        defer allocator.free(once);
+        const twice = try forwardedCapabilities(allocator, method, once);
+        defer allocator.free(twice);
+        try std.testing.expectEqualStrings(once, twice);
+        var parsed = try headless.parseResponse(allocator, twice);
+        defer parsed.deinit();
+        const result = parsed.response.result.?;
+        try std.testing.expect(statusAdvertisesCapability(result, headless.protocol.CORE_CHANGES_DELTA_CAPABILITY));
+        try std.testing.expectEqual(@as(usize, 2), result.object.get("runtime_capabilities").?.array.items.len);
+        try std.testing.expect(result.object.get("future").?.bool);
+        try std.testing.expectEqual(@as(i64, 1), result.object.get("mobile").?.object.get("min_client").?.integer);
+    }
+    const untouched = try forwardedCapabilities(allocator, "core.snapshot", original);
+    defer allocator.free(untouched);
+    try std.testing.expectEqualStrings(original, untouched);
+    const failure = "{\"id\":42,\"ok\":false,\"error\":{\"code\":\"unavailable\",\"message\":\"offline\"}}";
+    const forwarded = try forwardedCapabilities(allocator, "core.status", failure);
+    defer allocator.free(forwarded);
+    try std.testing.expectEqualStrings(failure, forwarded);
 }

@@ -111,6 +111,24 @@ Do not start duplicate gateway or Vite processes. Inspect `ss -ltnp | rg ':(6783
 - `GET /api/status` and `GET /api/snapshot` are authenticated convenience wrappers over `core.status` and `core.snapshot`.
 - Exact `GET /ws` upgrades to the authenticated WebSocket projection. It sends the initial snapshot, pushes bounded `core.changes`, and accepts client RPC calls.
 
+The gateway adds `core.changes.delta.v1` to forwarded `core.status` and
+`core.capabilities` responses, including the status in `core.hello`. The daemon
+alone does not advertise it. After hello, send a targeted WebSocket RPC
+`core.changes.mode` with `{"mode":"delta","cursor":123}` to resume at a saved
+cursor; omit `cursor` to use the initial snapshot's `change_cursor`. The response
+acknowledges `{mode,cursor}`. The existing initial snapshot precedes opt-in.
+After the acknowledgement, only `core.changes` notifications follow (with the
+same response envelope as legacy mode), except for one recovery snapshot on
+`expired` or an `envelope.instance_nonce` change. Recovery reseeds polling from
+the snapshot cursor. A failed recovery closes the connection for reconnect;
+runtime-target mismatches still fail closed. Legacy clients retain their existing
+snapshot behavior. Keep interactive and parked calls on `/api/rpc`; WebSocket
+RPC dispatch is still sequential.
+
+The loopback integration regression uses a temporary daemon fixture and no user
+state: after `mise run web-app`, run
+`python3 packages/web_app/tests/delta_feed.py` from the repository root.
+
 `core.subscribe` remains reserved. The gateway paces daemon `core.changes` polling and fans changes out over authenticated WebSockets.
 
 ## Options

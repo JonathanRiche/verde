@@ -383,7 +383,7 @@ pub const RUNTIME_CAPABILITY_NAMES = RUNTIME_CAPABILITY_NAMES_BASE ++
 // Mobile capability names. Advertising a name promises the feature works;
 // names remain pending below until their owning task ships.
 
-/// Delta-mode `core.changes` feed on the gateway (task A-11).
+/// Delta-mode `core.changes` feed. Advertised by the gateway, never the daemon.
 pub const CORE_CHANGES_DELTA_CAPABILITY: []const u8 = "core.changes.delta.v1";
 /// Device push registration and sealed wake-ups (task A-13).
 pub const DEVICE_PUSH_CAPABILITY: []const u8 = "device.push.v1";
@@ -396,9 +396,8 @@ pub const ACCESS_PAIR_IDEMPOTENT_CAPABILITY: []const u8 = "access.pair.idempoten
 /// To turn one on, the owning task moves its constant from this list into
 /// RUNTIME_CAPABILITY_NAMES_BASE (available without the durable store) or the
 /// store-backed tail of RUNTIME_CAPABILITY_NAMES, in the same commit as the
-/// feature and its tests.
+/// feature and its tests. Gateway-only features are advertised by the gateway.
 pub const PENDING_RUNTIME_CAPABILITY_NAMES = [_][]const u8{
-    CORE_CHANGES_DELTA_CAPABILITY,
     DEVICE_PUSH_CAPABILITY,
     WORKSPACE_DIRECTORY_CAPABILITY,
 };
