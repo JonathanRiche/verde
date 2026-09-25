@@ -118,13 +118,13 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | H-08 | Choose pairing permission presets | human | — | — | done (owner: Full default) |
 | A-01 | Confine `/api/file` + `/api/preview` | host | linux | — | done (363bece0) |
 | A-02 | Paired-device allowlist parity + new scopes | host | linux | — | done (a570cce2) |
-| A-03 | Confined directory-list RPC | host | linux | A-02 | todo |
+| A-03 | Confined directory-list RPC | host | linux | A-02 | in_progress (astra cli-thread-1790362331784-8004a4c995475ec2) |
 | A-04 | Device self-service RPCs | host | linux | A-02 | done (42a3582b) |
 | A-05 | Idempotent pair exchange | host | linux | — | done (a36897f0) |
 | A-06 | Terminal QR + App Link pair URL | host | linux | — | done (b0f6e50b; phone-camera scan pending human-verify) |
-| A-07 | Desktop "Pair a phone" + Paired devices UI | host | linux | A-04, A-06 | in_progress (astra cli-thread-1790358128115-7a42b2851781fae5) |
+| A-07 | Desktop "Pair a phone" + Paired devices UI | host | linux | A-04, A-06 | in_progress (b7499bdf; preset-picker follow-up running in astra cli-thread-1790358128115-7a42b2851781fae5; human-verify pending) |
 | A-08 | Web Settings paired-devices list | host | linux | A-04 | done (f6ff1cb9) |
-| A-09 | Pairing presets + access-mode cap | host | linux | A-02, H-08 | in_progress (astra cli-thread-1790358126217-4e98de9791a367a4) |
+| A-09 | Pairing presets + access-mode cap | host | linux | A-02, H-08 | done (c844e093) |
 | A-10 | `mobile.min_client` + capability flags | host | linux | — | done (f8aa0db8) |
 | A-11 | Delta change feed on the gateway | host | linux | A-10 | done (1b1a7d34) |
 | A-12 | Push crypto module (seal/open) | host | linux | — | done (7f5c621f) |
@@ -144,20 +144,20 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | K-04 | Extract shared remote-client modules from desktop | core | linux | K-01 | done (e1111a8c) |
 | K-05 | Split `headless/client.zig` codec from I/O | core | linux | K-01 | done (b12e4c17) |
 | K-06 | Sans-IO host engine + C ABI | core | linux | K-03, K-04, K-05 | done (e3e60c35, e4a0e6ab) |
-| K-07 | Auth in core | core | linux | K-06, A-05 | in_progress (astra cli-thread-1790357476513-23b8f29726d0ac38) |
+| K-07 | Auth in core | core | linux | K-06, A-05 | done (ffb390ec) |
 | K-08 | RPC client + target pinning | core | linux | K-06 | done (fd4cfc22) |
-| K-09 | Sync + projection | core | linux | K-08 | in_progress (astra cli-thread-1790358280856-f9b7d587adbcf044) |
-| K-10 | Chat engine | core | linux | K-09 | todo |
-| K-11 | Markdown AST / highlight spans / diff parse exports | core | linux | K-06 | in_progress (astra cli-thread-1790357482042-cf07694f30ac6c1f) |
-| K-12 | Terminal handle + PTY pump | core | linux | K-06 | todo |
+| K-09 | Sync + projection | core | linux | K-08 | done (dfbd6d6f) |
+| K-10 | Chat engine | core | linux | K-09 | in_progress (astra cli-thread-1790362328697-dc5576a2ceb2b5f4) |
+| K-11 | Markdown AST / highlight spans / diff parse exports | core | linux | K-06 | done (93000154, c37e038c) |
+| K-12 | Terminal handle + PTY pump | core | linux | K-06 | in_progress (astra cli-thread-1790362330364-2f0c30d725920233) |
 | K-13 | Allowlist coverage test | core | linux | K-10, A-02 | todo |
 | K-14 | Contract suite vs real gateway + daemon | core | linux | K-10 | todo |
 | K-15 | Kotlin/Swift model codegen from Zig types | core | linux | K-06 | done (fdb77f3d) |
 | K-16 | Delta-mode sync | core | linux | K-09, A-11 | todo |
 | K-17 | Attention state machine + push decrypt | core | linux | K-09, A-12 | todo |
 | D-01 | Android project scaffold | android | linux | K-01 | done (ee3c19df; on-device version display pending human-verify) |
-| D-02 | Core bridge + effect executor | android | linux | D-01, K-06, K-15 | in_progress (astra cli-thread-1790358684331-7bfbe8a46dde9004) |
-| D-03 | Pairing flow | android | linux+phone | D-02, K-07, A-06, H-06, H-07 | todo |
+| D-02 | Core bridge + effect executor | android | linux | D-01, K-06, K-15 | done (0f7fb9c6) |
+| D-03 | Pairing flow | android | linux+phone | D-02, K-07, A-06, H-06, H-07 | in_progress (astra cli-thread-1790362326049-d70c7a394ff4ae6b) |
 | D-04 | Hosts list + switcher + sign out | android | linux | D-03, A-04 | todo |
 | D-05 | Home + Workspaces + lifecycle | android | linux+phone | D-04, K-09 | todo |
 | D-06 | Transcript screen | android | linux | D-05, K-10, K-11 | todo |
@@ -173,8 +173,8 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | D-16 | Maestro flows + UI tests | android | linux+phone | D-08, D-09 | todo |
 | D-17 | Release build + Play internal track | android | linux | D-16, H-03 | todo |
 | I-01 | iOS project scaffold (XcodeGen) | ios | mac | K-02 | done (bdfcfd3e; unsigned simulator only until H-04) |
-| I-02 | Core bridge + effect executor | ios | mac | I-01, K-06, K-15 | in_progress (astra cli-thread-1790358685979-0beca7f711e941b3) |
-| I-03 | Pairing flow | ios | mac+phone | I-02, K-07, A-06 | todo |
+| I-02 | Core bridge + effect executor | ios | mac | I-01, K-06, K-15 | done (f389ab00, b6dc5f03, 69c813af, 10b4f4cd) |
+| I-03 | Pairing flow | ios | mac+phone | I-02, K-07, A-06 | in_progress (astra cli-thread-1790362327142-40da049010c5c3e5) |
 | I-04 | Hosts + Home + Workspaces + lifecycle | ios | mac | I-03, D-05 | todo |
 | I-05 | Transcript + diff + approvals | ios | mac | I-04, D-06, D-07, D-09 | todo |
 | I-06 | Composer + pickers + attachments + follow-ups | ios | mac | I-05, D-08 | todo |
@@ -445,6 +445,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 - **Done when:** tests cover each preset's scopes and the cap being
   enforced. `$ZB headless-test`, `$ZB server-test` and
   `mise run web-app-test` pass.
+- **Done (c844e093).** Three presets: Full (the default), Chat and Monitor, listed in `access_protocol.PAIRING_PRESETS`. Pass `"preset":"<name>"` to `daemon.access.pairing.create` and omit `scopes`. Each device's cap is stored. The gateway lowers over-cap requests to the cap and adds a notice to the transcript. Running a supervised shell needs confirmation. Create, exchange, list and self responses carry nullable `preset` and `max_access_mode`. `headless-test`, `server-test`, `daemon-test` and `web-app-test` pass.
 
 #### A-10 · `mobile.min_client` + capability flags
 - **Do:** `core.capabilities` / `core.status` advertise `mobile.min_client`
@@ -803,6 +804,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 - **Done when:** harness tests cover the happy path, lost exchange response
   → retry OK, expired grant, revoked device → re-pair state, and token
   refresh. `mise run mobile-core-test` passes.
+- **Done (ffb390ec).** Pairing and authentication run in the core (`auth.zig`, `auth_rpc.zig`, and `docs/auth.md`). Credentials persist across restarts, and only one authentication runs at a time. SPKI pins are canonical lowercase 64-character hex. Exchange retries happen only when the server capability allows them. Tokens with two minutes or less remaining are refreshed rather than used. `mobile-core-test` passes 103/103, and `mobile-core-android` and `mobile-models-check` pass.
 
 #### K-08 · RPC client + target pinning
 - **depends:** K-06
@@ -830,6 +832,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
   - Page through `chat.thread.list`.
 - **Done when:** harness tests use recorded fixture snapshots, taken from a
   temp daemon rather than the user's.
+- **Done (dfbd6d6f).** The core has the legacy sync path, paged thread catalogs, and the workspace and Home projections, and its types are registered for codegen. Fixtures were recorded against a temporary daemon with isolated state. `mobile-core-test` (including 9 sync tests), `mobile-core-android` and `mobile-models-check` pass. Delta mode is K-16.
 
 #### K-10 · Chat engine
 - **depends:** K-09
@@ -862,6 +865,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
   - Citation links → abstract `{path, line}` targets.
 - **Done when:** golden tests pass, including the web app's markdown/diff
   test cases ported over.
+- **Done (93000154, c37e038c).** Markdown, syntax highlighting and diffs render through bounded queries, with golden tests. Highlighting covers JS/JSX, TS, TSX and JSON; other languages show as plain text. The Android library grew by about 3.4 MiB per ABI (stripped: 3.77 MiB on arm64, 3.85 MiB on x86_64). iOS archives are about 8.3 MB. `mobile-core-test` passes 86/86, `mobile-core-android` passes, and the iOS import and link smoke test passes on the Mac.
 
 #### K-12 · Terminal handle + PTY pump
 - **depends:** K-06
@@ -962,6 +966,7 @@ human-verify step.
       no backup: `android:allowBackup=false` for the credential store).
   - `StateFlow` of view models refreshed on `state_changed`.
 - **Done when:** unit tests with a fake core cover the effect round-trips.
+- **Done (0f7fb9c6).** Added `CoreHost.kt` (runs the core on one thread), `EffectExecutor.kt` (OkHttp HTTP with the pin checked on every connection, WebSockets, timers) and `SecureStore.kt` (Keystore-wrapped keys, no backup). `mobile-android-test` passes 13 tests and `mobile-android-build` succeeds. Checking JNI and the Keystore on a real device is still open.
 
 #### D-03 · Pairing flow
 - **depends:** D-02, K-07, A-06, H-06, H-07
@@ -1133,6 +1138,7 @@ Shared rules:
   with protocols; Keychain (`AfterFirstUnlockThisDeviceOnly`, not synced);
   an `@Observable` view-model store.
 - **Done when:** XCTest with a fake core passes.
+- **Done (f389ab00..10b4f4cd).** Added `CoreHost.swift` (an actor), `SessionTransport.swift` (URLSession with the pin checked in the delegate, WebSockets) and `KeychainStorage.swift` (this device only). XCTest passes 16/0 on the Mac. Keychain was tested through an injected fixture; testing on a signed device is still open. The pin format differs from K-07's lowercase hex; I-03 fixes this first.
 
 #### I-03 · Pairing flow
 - **depends:** I-02, K-07, A-06
