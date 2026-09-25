@@ -8160,7 +8160,8 @@ test "M4-P5 amendment: incomplete adoption retries to a single identity set" {
         AdoptionOutcome.incomplete,
         adoptTranscriptIdentitiesFromStoreMessages(&state, &thread, store_rows),
     );
-    try std.testing.expect(state.dirty);
+    // Daemon-owned adoption is projection-only; it never schedules a flush.
+    try std.testing.expect(!state.dirty);
     try std.testing.expectEqualStrings("turn:t1:user", thread.messages.items[0].message_id.?);
     try std.testing.expect(thread.messages.items[1].message_id == null);
 
@@ -8238,7 +8239,8 @@ test "terminal adoption hydrates the committed suffix of a bounded transcript" {
         AdoptionOutcome.complete,
         adoptTranscriptIdentitiesFromStoreMessages(&state, &thread, store_parsed.value.array.items),
     );
-    try std.testing.expect(state.dirty);
+    // Daemon-owned adoption is projection-only; it never schedules a flush.
+    try std.testing.expect(!state.dirty);
     try std.testing.expectEqual(@as(usize, 4), thread.messages.items.len);
     try std.testing.expectEqualStrings("turn:t1:user", thread.messages.items[0].message_id.?);
     try std.testing.expectEqualStrings("turn:t1:msg:1", thread.messages.items[1].message_id.?);

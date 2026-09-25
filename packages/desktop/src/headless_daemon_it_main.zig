@@ -81,6 +81,9 @@ const c = struct {
 /// permanent daemon+socket when persistent-by-default is enabled.
 const IT_SAFETY_IDLE_EXIT_MS = "30000";
 const IT_DAEMON_PREF_PATH_ENV = "VERDE_IT_DAEMON_PREF_PATH";
+/// CLI executable path the `--core-cli` arm hands to the core handler. Its
+/// directory holds the `verde-daemon` sibling that autostart execs.
+const IT_CORE_CLI_EXE_ENV = "VERDE_IT_CORE_CLI_EXE";
 const CORE_CLI_SUBPROCESS_TIMEOUT_MS: i64 = 40_000;
 const CORE_CLI_MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 
@@ -171,8 +174,13 @@ pub fn main(init: std.process.Init) !void {
             while (iterator.next()) |core_arg| try core_argv.append(allocator, core_arg);
             const self_exe = try std.process.executablePathAlloc(io, allocator);
             defer allocator.free(self_exe);
+            // Autostart execs `verde-daemon` beside the CLI executable (the
+            // installed layout); the parent points that at a tmpDir bin whose
+            // sibling re-enters this binary's `__session-daemon` arm.
+            const cli_exe = (try itGetEnvAlloc(allocator, IT_CORE_CLI_EXE_ENV)) orelse try allocator.dupe(u8, self_exe);
+            defer allocator.free(cli_exe);
             const out: cli_output.Output = .{ .io = io };
-            try cli_main.handleCore(allocator, out, io, self_exe, core_argv.items);
+            try cli_main.handleCore(allocator, out, io, cli_exe, core_argv.items);
             return;
         }
         if (std.mem.eql(u8, arg, "__session-daemon")) {
@@ -5294,7 +5302,9 @@ fn runM5P4WorkspaceBeltScenario(allocator: std.mem.Allocator, io: std.Io) !void 
     for (captured_result.snapshot.workspaces) |workspace| {
         if (!std.mem.eql(u8, workspace.workspace_id, "ws-belt-it")) continue;
         captured_mutation = true;
-        if (workspace.threads.len == 0 or workspace.threads[0].messages.len < 2)
+        // core.snapshot is message-less (b0df8d1b): the transcript is carried
+        // as its durable extent and hydrated on demand, never inline.
+        if (workspace.threads.len == 0 or workspace.threads[0].message_offset < 2)
             return error.M5P4BeltCaptureTranscriptMissing;
     }
     if (!captured_mutation) return error.M5P4BeltCaptureMutationMissing;
@@ -5315,7 +5325,8 @@ fn runM5P4WorkspaceBeltScenario(allocator: std.mem.Allocator, io: std.Io) !void 
         try gui_state.applyDaemonProjectionRefresh(captured_result);
         const rendered = gui_state.projectForDaemonId("ws-belt-it") orelse return error.M5P4BeltApplyWorkspaceMissing;
         const rendered_thread = rendered.threads.items[0];
-        if (rendered_thread.messages.items.len < 2) return error.M5P4BeltApplyTranscriptMissing;
+        if (rendered_thread.persisted_message_offset + rendered_thread.messages.items.len < 2)
+            return error.M5P4BeltApplyTranscriptMissing;
         var flush_payload = try gui_state.buildPersistedState(allocator);
         defer flush_payload.deinit();
         const observed_revision = gui_storage.currentProjectionObservedRevision();
@@ -5357,13 +5368,23 @@ fn runM5P4WorkspaceBeltScenario(allocator: std.mem.Allocator, io: std.Io) !void 
                 for (workspace.threads) |thread| {
                     if (!std.mem.eql(u8, thread.local_thread_id, "thread-belt-it")) continue;
                     saw_thread = true;
-                    // Stub turn commits user prompt + assistant reply.
-                    if (thread.messages.len < 2) return error.M5P4BeltTranscriptLost;
+                    // Stub turn commits user prompt + assistant reply; the
+                    // message-less snapshot reports them as the extent.
+                    if (thread.message_offset < 2) return error.M5P4BeltTranscriptLost;
                 }
                 if (!saw_thread) return error.M5P4BeltThreadLost;
             }
         }
         if (!saw_belt) return error.M5P4BeltWorkspaceLost;
+
+        // The durable rows themselves survived the flush.
+        var get = try client.call(headless.store.METHOD_CHAT_THREAD_GET, .{
+            .workspace_id = "ws-belt-it",
+            .local_thread_id = "thread-belt-it",
+        });
+        defer get.deinit();
+        if (!get.response.isOk()) return error.M5P4BeltTranscriptReadFailed;
+        if ((try client.decodeThreadGet(&get)).thread.messages.len < 2) return error.M5P4BeltTranscriptLost;
     }
 
     // Once the projection revision includes the committed turn, omission is
@@ -5467,6 +5488,9 @@ fn runCoreCliSubprocessAlloc(
     const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
     defer allocator.free(store_dir);
     try env_map.put(sessionizer.SESSION_DAEMON_STORE_DIR_ENV_NAME, store_dir);
+    const cli_exe = try installCoreCliDaemonSibling(allocator, io, self_exe, pref_path);
+    defer allocator.free(cli_exe);
+    try env_map.put(IT_CORE_CLI_EXE_ENV, cli_exe);
 
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
@@ -5493,6 +5517,35 @@ fn runCoreCliSubprocessAlloc(
     kill_on_unwind = false;
     if (term != .exited or term.exited != 0) return error.CoreCliExitCode;
     return bytes;
+}
+
+/// Mirror the installed `bin/verde` + `bin/verde-daemon` layout in the tmpDir:
+/// CLI autostart spawns the daemon sibling of its executable, never itself.
+/// The sibling is this IT binary, which serves `__session-daemon`. Idempotent;
+/// returns the owned CLI executable path whose directory holds the sibling.
+fn installCoreCliDaemonSibling(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    self_exe: []const u8,
+    pref_path: []const u8,
+) ![]u8 {
+    const bin_dir = try std.fs.path.join(allocator, &.{ pref_path, "bin" });
+    defer allocator.free(bin_dir);
+    try std.Io.Dir.cwd().createDirPath(io, bin_dir);
+    const daemon_name = if (builtin.os.tag == .windows) "verde-daemon.exe" else "verde-daemon";
+    const daemon_path = try std.fs.path.join(allocator, &.{ bin_dir, daemon_name });
+    defer allocator.free(daemon_path);
+    if (builtin.os.tag == .windows) {
+        // Copy once: an autostarted daemon may still be running this image.
+        std.Io.Dir.cwd().access(io, daemon_path, .{}) catch
+            try std.Io.Dir.copyFile(std.Io.Dir.cwd(), self_exe, std.Io.Dir.cwd(), daemon_path, io, .{});
+    } else {
+        std.Io.Dir.cwd().symLink(io, self_exe, daemon_path, .{}) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
+    return std.fs.path.join(allocator, &.{ bin_dir, if (builtin.os.tag == .windows) "verde.exe" else "verde" });
 }
 
 fn prepareCoreCliDaemonForCleanup(allocator: std.mem.Allocator, pref_path: []const u8) void {
@@ -9930,7 +9983,10 @@ fn runChatAdoptionRetryDurabilityScenario(allocator: std.mem.Allocator, io: std.
             const id = message.message_id orelse return error.AdoptIdMissing;
             if (!std.mem.startsWith(u8, id, "turn:")) return error.AdoptIdNamespace;
         }
-        if (!adopt_self.dirty) return error.AdoptDirtyNotMarked;
+        // Daemon-owned turns are projection-only (d2c668bf): the adopted ids
+        // already live in the durable store, so adoption must not schedule a
+        // full GUI snapshot flush. Any later flush still carries these ids.
+        if (adopt_self.dirty) return error.AdoptMarkedDirty;
 
         // Genuine GUI flush of the converged projection, then re-read: the
         // durable transcript keeps exactly one row per identity.
