@@ -1,9 +1,10 @@
 //! Transport-neutral typed client for the headless protocol.
 //!
-//! Builds request envelopes and parses response envelopes. The caller injects
-//! a send function so unit tests need no sockets or daemon process.
+//! The caller injects a send function. Pure encoding and decoding live in
+//! `client_codec.zig`, also exposed as `codec` for transport-owning clients.
 
 const std = @import("std");
+pub const codec = @import("client_codec.zig");
 const protocol = @import("protocol.zig");
 const registry = @import("registry_protocol.zig");
 const store_protocol = @import("store_protocol.zig");
@@ -235,25 +236,7 @@ pub fn verifyRuntimeHandshake(
     }
 }
 
-const ConfiguredRequestTarget = struct {
-    runtime_id: [32]u8,
-    instance_id: [32]u8,
-
-    fn init(target: protocol.RequestTarget) !ConfiguredRequestTarget {
-        try protocol.validateRequestTarget(target);
-        var configured: ConfiguredRequestTarget = undefined;
-        @memcpy(configured.runtime_id[0..], target.runtime_id);
-        @memcpy(configured.instance_id[0..], target.instance_id);
-        return configured;
-    }
-
-    fn borrow(self: *const ConfiguredRequestTarget) protocol.RequestTarget {
-        return .{
-            .runtime_id = &self.runtime_id,
-            .instance_id = &self.instance_id,
-        };
-    }
-};
+const ConfiguredRequestTarget = codec.ConfiguredRequestTarget;
 
 pub const Client = struct {
     allocator: std.mem.Allocator,
@@ -380,38 +363,10 @@ pub const Client = struct {
         };
     }
 
-    /// Build a request envelope without sending (useful for custom transports).
-    pub fn encodeRequest(self: *Client, method: []const u8, params: anytype) !struct { id: u64, json: []u8 } {
-        const id = self.next_id;
-        self.next_id += 1;
-        const json = try self.encodeRequestWithId(id, method, params);
-        return .{ .id = id, .json = json };
-    }
-
-    /// Build a request envelope with an explicit id without advancing the generated id.
-    pub fn encodeRequestWithId(self: *Client, id: u64, method: []const u8, params: anytype) ![]u8 {
-        if (self.request_target) |*target| {
-            return try protocol.encodeTargetedRequest(self.allocator, id, method, params, target.borrow());
-        }
-        return try protocol.encodeRequest(self.allocator, id, method, params);
-    }
-
-    /// Parse a response envelope produced by any transport.
-    pub fn parseResponse(self: *Client, response_json: []const u8) !protocol.ParsedResponse {
-        return try protocol.parseResponse(self.allocator, response_json);
-    }
-
-    /// Parse and correlate a response with the request that produced it.
-    /// Numeric mismatches return `error.ResponseIdMismatch`; null-id errors are
-    /// uncorrelated daemon failures and remain valid error responses.
-    pub fn parseResponseWithId(self: *Client, request_id: u64, response_json: []const u8) !protocol.ParsedResponse {
-        var parsed = try protocol.parseResponse(self.allocator, response_json);
-        errdefer parsed.deinit();
-        if (parsed.response.id) |response_id| {
-            if (response_id != request_id) return error.ResponseIdMismatch;
-        }
-        return parsed;
-    }
+    pub const encodeRequest = codec.methodsFor(Client).encodeRequest;
+    pub const encodeRequestWithId = codec.methodsFor(Client).encodeRequestWithId;
+    pub const parseResponse = codec.methodsFor(Client).parseResponse;
+    pub const parseResponseWithId = codec.methodsFor(Client).parseResponseWithId;
 
     /// Perform the client-side protocol handshake using the daemon's advertised
     /// `core.status` range. Call this before normal calls when using `Client` as
@@ -435,327 +390,54 @@ pub const Client = struct {
         return result;
     }
 
-    /// Return the version selected by the most recent successful status or
-    /// capabilities decode. Before a successful handshake this returns
-    /// `error.HandshakeRequired`.
-    pub fn negotiatedProtocolVersion(self: *const Client) !u32 {
-        return self.negotiated_version orelse error.HandshakeRequired;
-    }
-
-    /// Decode a successful `core.status` response into its typed result.
-    pub fn decodeStatus(self: *Client, parsed: *const protocol.ParsedResponse) !protocol.StatusResult {
-        const status = try self.decodeResult(protocol.StatusResult, parsed);
-        _ = try self.recordNegotiatedRange(status.min_supported, status.max_supported);
-        return status;
-    }
-
-    /// Decode a successful `core.capabilities` response into its typed result.
-    pub fn decodeCapabilities(self: *Client, parsed: *const protocol.ParsedResponse) !protocol.CapabilitiesResult {
-        const capabilities = try self.decodeResult(protocol.CapabilitiesResult, parsed);
-        _ = try self.recordNegotiatedRange(capabilities.min_supported, capabilities.max_supported);
-        return capabilities;
-    }
-
-    /// Decode a successful `process.list` response.
-    pub fn decodeProcessList(self: *Client, parsed: *const protocol.ParsedResponse) !registry.ProcessListResult {
-        return try self.decodeResult(registry.ProcessListResult, parsed);
-    }
-
-    /// Decode a successful `lease.check` response.
-    pub fn decodeLeaseCheck(self: *Client, parsed: *const protocol.ParsedResponse) !registry.LeaseCheckResult {
-        return try self.decodeResult(registry.LeaseCheckResult, parsed);
-    }
-
-    /// Decode a successful `lease.acquire` response.
-    pub fn decodeLeaseAcquire(self: *Client, parsed: *const protocol.ParsedResponse) !registry.LeaseAcquireResult {
-        return try self.decodeResult(registry.LeaseAcquireResult, parsed);
-    }
-
-    /// Decode a successful `lease.renew` response.
-    pub fn decodeLeaseRenew(self: *Client, parsed: *const protocol.ParsedResponse) !registry.LeaseRenewResult {
-        return try self.decodeResult(registry.LeaseRenewResult, parsed);
-    }
-
-    /// Decode a successful `lease.release` response.
-    pub fn decodeLeaseRelease(self: *Client, parsed: *const protocol.ParsedResponse) !registry.LeaseReleaseResult {
-        return try self.decodeResult(registry.LeaseReleaseResult, parsed);
-    }
-
-    /// Decode a successful `daemon.notifications` response.
-    pub fn decodeNotifications(self: *Client, parsed: *const protocol.ParsedResponse) !registry.NotificationsResult {
-        return try self.decodeResult(registry.NotificationsResult, parsed);
-    }
-
-    /// Decode a successful `daemon.client.register` response.
-    pub fn decodeClientRegister(self: *Client, parsed: *const protocol.ParsedResponse) !registry.ClientRegisterResult {
-        return try self.decodeResult(registry.ClientRegisterResult, parsed);
-    }
-
-    /// Decode a successful `daemon.client.heartbeat` response.
-    pub fn decodeClientHeartbeat(self: *Client, parsed: *const protocol.ParsedResponse) !registry.ClientHeartbeatResult {
-        return try self.decodeResult(registry.ClientHeartbeatResult, parsed);
-    }
-
-    /// Decode a successful `daemon.client.close` response.
-    pub fn decodeClientClose(self: *Client, parsed: *const protocol.ParsedResponse) !registry.ClientCloseResult {
-        return try self.decodeResult(registry.ClientCloseResult, parsed);
-    }
-
-    /// Decode a successful `daemon.stop` response.
-    pub fn decodeDaemonStop(self: *Client, parsed: *const protocol.ParsedResponse) !registry.DaemonStopResult {
-        return try self.decodeResult(registry.DaemonStopResult, parsed);
-    }
-
-    /// Decode a successful `workspace.resolve` response.
-    pub fn decodeWorkspaceResolve(self: *Client, parsed: *const protocol.ParsedResponse) !registry.WorkspaceResolveResult {
-        return try self.decodeResult(registry.WorkspaceResolveResult, parsed);
-    }
-
-    /// Decode a successful store write response.
-    pub fn decodeWriteResult(self: *Client, parsed: *const protocol.ParsedResponse) !store_protocol.WriteResult {
-        return try self.decodeResult(store_protocol.WriteResult, parsed);
-    }
-
-    /// Decode a successful daemon store status response.
-    pub fn decodeStoreStatus(self: *Client, parsed: *const protocol.ParsedResponse) !store_protocol.StoreStatusResult {
-        return try self.decodeResult(store_protocol.StoreStatusResult, parsed);
-    }
-
-    /// Decode one durable thread read with allocations independent of the
-    /// response envelope's parse arena.
-    pub fn decodeThreadGet(self: *Client, parsed: *const protocol.ParsedResponse) !store_protocol.ThreadGetResult {
-        return try self.decodeResult(store_protocol.ThreadGetResult, parsed);
-    }
-
-    /// Decode a bounded workspace list with repository projections.
-    pub fn decodeWorkspaceList(self: *Client, parsed: *const protocol.ParsedResponse) !store_protocol.WorkspaceListResult {
-        return try self.decodeResult(store_protocol.WorkspaceListResult, parsed);
-    }
-
-    /// Decode one bounded, allocator-owned repository manifest projection.
-    pub fn decodeWorkspaceRepositoryManifest(
-        self: *Client,
-        parsed: *const protocol.ParsedResponse,
-    ) !store_protocol.WorkspaceRepositoryManifestResult {
-        return try self.decodeResult(store_protocol.WorkspaceRepositoryManifestResult, parsed);
-    }
-
-    /// Decode a bounded durable thread metadata list.
-    pub fn decodeThreadList(self: *Client, parsed: *const protocol.ParsedResponse) !store_protocol.ThreadListResult {
-        return try self.decodeResult(store_protocol.ThreadListResult, parsed);
-    }
-
-    /// Decode a bounded bidirectional transcript page.
-    pub fn decodeMessageList(self: *Client, parsed: *const protocol.ParsedResponse) !store_protocol.MessageListResult {
-        return try self.decodeResult(store_protocol.MessageListResult, parsed);
-    }
-
-    pub fn decodeSurfaceCompletionObserve(self: *Client, parsed: *const protocol.ParsedResponse) !store_protocol.SurfaceCompletionObserveResult {
-        return try self.decodeResult(store_protocol.SurfaceCompletionObserveResult, parsed);
-    }
-
-    pub fn decodeSurfaceCommitProofClassify(self: *Client, parsed: *const protocol.ParsedResponse) !store_protocol.SurfaceCommitProofClassifyResult {
-        return try self.decodeResult(store_protocol.SurfaceCommitProofClassifyResult, parsed);
-    }
-
-    /// Decode the dynamic model catalog returned by one provider runtime.
-    pub fn decodeProviderModelsList(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.ModelsListResult {
-        return try self.decodeResult(providers_protocol.ModelsListResult, parsed);
-    }
-
-    /// Decode runtime-scoped installation/authentication status for providers.
-    pub fn decodeProviderStatus(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.StatusResult {
-        return try self.decodeResult(providers_protocol.StatusResult, parsed);
-    }
-
-    pub fn decodeProviderAuthStatus(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.AuthStatusResult {
-        return try self.decodeResult(providers_protocol.AuthStatusResult, parsed);
-    }
-
-    pub fn decodeProviderThreadsList(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.ThreadsListResult {
-        return try self.decodeResult(providers_protocol.ThreadsListResult, parsed);
-    }
-
-    pub fn decodeProviderThreadRead(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.ThreadReadResult {
-        return try self.decodeResult(providers_protocol.ThreadReadResult, parsed);
-    }
-
-    pub fn decodeProviderThreadInterrupt(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.ThreadControlResult {
-        return try self.decodeResult(providers_protocol.ThreadControlResult, parsed);
-    }
-
-    pub fn decodeProviderThreadSteer(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.ThreadControlResult {
-        return try self.decodeResult(providers_protocol.ThreadControlResult, parsed);
-    }
-
-    pub fn decodeProviderSlashList(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.SlashListResult {
-        return try self.decodeResult(providers_protocol.SlashListResult, parsed);
-    }
-
-    pub fn decodeProviderSlashRun(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.SlashRunResult {
-        return try self.decodeResult(providers_protocol.SlashRunResult, parsed);
-    }
-
-    pub fn decodeProviderCodexBackgroundStatus(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.CodexBackgroundStatusResult {
-        return try self.decodeResult(providers_protocol.CodexBackgroundStatusResult, parsed);
-    }
-
-    pub fn decodeProviderCodexBackgroundTerminate(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.CodexBackgroundTerminateResult {
-        return try self.decodeResult(providers_protocol.CodexBackgroundTerminateResult, parsed);
-    }
-
-    pub fn decodeProviderIntegrationsInspect(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.IntegrationsInspectResult {
-        return try self.decodeResult(providers_protocol.IntegrationsInspectResult, parsed);
-    }
-
-    pub fn decodeProviderHooksSet(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.HooksSetResult {
-        return try self.decodeResult(providers_protocol.HooksSetResult, parsed);
-    }
-
-    pub fn decodeProviderMcpSet(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.McpSetResult {
-        return try self.decodeResult(providers_protocol.McpSetResult, parsed);
-    }
-
-    pub fn decodeProviderTitleGenerate(self: *Client, parsed: *const protocol.ParsedResponse) !providers_protocol.TitleGenerateResult {
-        return try self.decodeResult(providers_protocol.TitleGenerateResult, parsed);
-    }
-
-    /// Decode one durable turn-ledger record.
-    pub fn decodeTurnRecord(self: *Client, parsed: *const protocol.ParsedResponse) !store_protocol.TurnRecord {
-        return try self.decodeResult(store_protocol.TurnRecord, parsed);
-    }
-
-    /// Decode a successful `core.changes` journal poll.
-    pub fn decodeChanges(self: *Client, parsed: *const protocol.ParsedResponse) !changes_protocol.ChangesResult {
-        return try self.decodeResult(changes_protocol.ChangesResult, parsed);
-    }
-
-    /// Decode a successful scoped composite `core.snapshot` response.
-    pub fn decodeCompositeSnapshot(self: *Client, parsed: *const protocol.ParsedResponse) !store_protocol.CoreSnapshotResult {
-        return try self.decodeResult(store_protocol.CoreSnapshotResult, parsed);
-    }
-
-    /// Decode the owner-only grant creation result with strict access-protocol
-    /// fields. Unlike the legacy tolerant decoders, unknown fields fail closed.
-    pub fn decodePairingGrantCreate(
-        self: *Client,
-        parsed: *const protocol.ParsedResponse,
-    ) !access_protocol.PairingGrantCreateResult {
-        const result = try self.decodeStrictResult(access_protocol.PairingGrantCreateResult, parsed);
-        try validateAccessResultHeader(result.access_protocol_version, result.runtime_id, result.instance_id);
-        try access_protocol.validateGrantId(result.grant_id);
-        try access_protocol.validateSecret(result.pairing_token.reveal());
-        try access_protocol.validateScopeNames(result.scopes);
-        if (result.expires_at_ms < 0) return error.InvalidAccessResponse;
-        return result;
-    }
-
-    /// Decode non-secret pairing grant metadata with strict v1 fields.
-    pub fn decodePairingGrantList(
-        self: *Client,
-        parsed: *const protocol.ParsedResponse,
-    ) !access_protocol.PairingGrantListResult {
-        const result = try self.decodeStrictResult(access_protocol.PairingGrantListResult, parsed);
-        try validateAccessResultHeader(result.access_protocol_version, result.runtime_id, result.instance_id);
-        for (result.grants) |grant| {
-            try access_protocol.validateGrantId(grant.grant_id);
-            if (grant.label) |label| try access_protocol.validateDeviceLabel(label);
-            try access_protocol.validateScopeNames(grant.scopes);
-            if (grant.created_at_ms < 0 or grant.expires_at_ms < grant.created_at_ms or
-                (grant.consumed_at_ms != null and grant.consumed_at_ms.? < 0) or
-                (grant.revoked_at_ms != null and grant.revoked_at_ms.? < 0))
-            {
-                return error.InvalidAccessResponse;
-            }
-        }
-        return result;
-    }
-
-    pub fn decodePairingGrantRevoke(
-        self: *Client,
-        parsed: *const protocol.ParsedResponse,
-    ) !access_protocol.PairingGrantRevokeResult {
-        const result = try self.decodeStrictResult(access_protocol.PairingGrantRevokeResult, parsed);
-        try validateAccessProtocolVersion(result.access_protocol_version);
-        try access_protocol.validateGrantId(result.grant_id);
-        return result;
-    }
-
-    /// Decode non-secret device metadata with strict v1 fields.
-    pub fn decodeDeviceList(
-        self: *Client,
-        parsed: *const protocol.ParsedResponse,
-    ) !access_protocol.DeviceListResult {
-        const result = try self.decodeStrictResult(access_protocol.DeviceListResult, parsed);
-        try validateAccessResultHeader(result.access_protocol_version, result.runtime_id, result.instance_id);
-        for (result.devices) |device| {
-            try access_protocol.validateDeviceId(device.device_id);
-            if (device.grant_id) |grant_id| try access_protocol.validateGrantId(grant_id);
-            try access_protocol.validateDeviceLabel(device.label);
-            try access_protocol.validateScopeNames(device.scopes);
-            if (device.created_at_ms < 0 or
-                (device.last_used_at_ms != null and device.last_used_at_ms.? < 0) or
-                (device.revoked_at_ms != null and device.revoked_at_ms.? < 0))
-            {
-                return error.InvalidAccessResponse;
-            }
-        }
-        return result;
-    }
-
-    pub fn decodeDeviceRevoke(
-        self: *Client,
-        parsed: *const protocol.ParsedResponse,
-    ) !access_protocol.DeviceRevokeResult {
-        const result = try self.decodeStrictResult(access_protocol.DeviceRevokeResult, parsed);
-        try validateAccessProtocolVersion(result.access_protocol_version);
-        try access_protocol.validateDeviceId(result.device_id);
-        return result;
-    }
-
-    /// Decode the owner-only Connect projection without accepting future
-    /// fields or a response for another runtime generation.
-    pub fn decodeConnectStatus(
-        self: *Client,
-        parsed: *const protocol.ParsedResponse,
-    ) !connect_protocol.StatusResult {
-        const result = try self.decodeStrictResult(connect_protocol.StatusResult, parsed);
-        try validateConnectProtocolVersion(result.connect_protocol_version);
-        protocol.validateRequestTarget(.{
-            .runtime_id = result.runtime_id,
-            .instance_id = result.instance_id,
-        }) catch return error.InvalidConnectResponse;
-        if (self.request_target) |target| {
-            const expected = target.borrow();
-            if (!std.mem.eql(u8, result.runtime_id, expected.runtime_id) or
-                !std.mem.eql(u8, result.instance_id, expected.instance_id))
-            {
-                return error.RuntimeIdentityMismatch;
-            }
-        }
-        if (result.retry_attempt > 1024 or
-            (result.next_retry_at_ms != null and result.next_retry_at_ms.? < 0))
-        {
-            return error.InvalidConnectResponse;
-        }
-        return result;
-    }
-
-    pub fn decodeConnectBootstrapConsume(
-        self: *Client,
-        parsed: *const protocol.ParsedResponse,
-    ) !connect_protocol.BootstrapConsumeResult {
-        const result = try self.decodeStrictResult(connect_protocol.BootstrapConsumeResult, parsed);
-        try validateConnectProtocolVersion(result.connect_protocol_version);
-        try access_protocol.validateScopeNames(result.scopes);
-        protocol.validateRequestTarget(.{
-            .runtime_id = result.runtime_id,
-            .instance_id = result.instance_id,
-        }) catch return error.InvalidConnectResponse;
-        access_protocol.validateDeviceId(result.device_id) catch return error.InvalidConnectResponse;
-        access_protocol.validateSecret(result.device_credential.reveal()) catch return error.InvalidConnectResponse;
-        return result;
-    }
+    pub const negotiatedProtocolVersion = codec.methodsFor(Client).negotiatedProtocolVersion;
+    pub const decodeStatus = codec.methodsFor(Client).decodeStatus;
+    pub const decodeCapabilities = codec.methodsFor(Client).decodeCapabilities;
+    pub const decodeProcessList = codec.methodsFor(Client).decodeProcessList;
+    pub const decodeLeaseCheck = codec.methodsFor(Client).decodeLeaseCheck;
+    pub const decodeLeaseAcquire = codec.methodsFor(Client).decodeLeaseAcquire;
+    pub const decodeLeaseRenew = codec.methodsFor(Client).decodeLeaseRenew;
+    pub const decodeLeaseRelease = codec.methodsFor(Client).decodeLeaseRelease;
+    pub const decodeNotifications = codec.methodsFor(Client).decodeNotifications;
+    pub const decodeClientRegister = codec.methodsFor(Client).decodeClientRegister;
+    pub const decodeClientHeartbeat = codec.methodsFor(Client).decodeClientHeartbeat;
+    pub const decodeClientClose = codec.methodsFor(Client).decodeClientClose;
+    pub const decodeDaemonStop = codec.methodsFor(Client).decodeDaemonStop;
+    pub const decodeWorkspaceResolve = codec.methodsFor(Client).decodeWorkspaceResolve;
+    pub const decodeWriteResult = codec.methodsFor(Client).decodeWriteResult;
+    pub const decodeStoreStatus = codec.methodsFor(Client).decodeStoreStatus;
+    pub const decodeThreadGet = codec.methodsFor(Client).decodeThreadGet;
+    pub const decodeWorkspaceList = codec.methodsFor(Client).decodeWorkspaceList;
+    pub const decodeWorkspaceRepositoryManifest = codec.methodsFor(Client).decodeWorkspaceRepositoryManifest;
+    pub const decodeThreadList = codec.methodsFor(Client).decodeThreadList;
+    pub const decodeMessageList = codec.methodsFor(Client).decodeMessageList;
+    pub const decodeSurfaceCompletionObserve = codec.methodsFor(Client).decodeSurfaceCompletionObserve;
+    pub const decodeSurfaceCommitProofClassify = codec.methodsFor(Client).decodeSurfaceCommitProofClassify;
+    pub const decodeProviderModelsList = codec.methodsFor(Client).decodeProviderModelsList;
+    pub const decodeProviderStatus = codec.methodsFor(Client).decodeProviderStatus;
+    pub const decodeProviderAuthStatus = codec.methodsFor(Client).decodeProviderAuthStatus;
+    pub const decodeProviderThreadsList = codec.methodsFor(Client).decodeProviderThreadsList;
+    pub const decodeProviderThreadRead = codec.methodsFor(Client).decodeProviderThreadRead;
+    pub const decodeProviderThreadInterrupt = codec.methodsFor(Client).decodeProviderThreadInterrupt;
+    pub const decodeProviderThreadSteer = codec.methodsFor(Client).decodeProviderThreadSteer;
+    pub const decodeProviderSlashList = codec.methodsFor(Client).decodeProviderSlashList;
+    pub const decodeProviderSlashRun = codec.methodsFor(Client).decodeProviderSlashRun;
+    pub const decodeProviderCodexBackgroundStatus = codec.methodsFor(Client).decodeProviderCodexBackgroundStatus;
+    pub const decodeProviderCodexBackgroundTerminate = codec.methodsFor(Client).decodeProviderCodexBackgroundTerminate;
+    pub const decodeProviderIntegrationsInspect = codec.methodsFor(Client).decodeProviderIntegrationsInspect;
+    pub const decodeProviderHooksSet = codec.methodsFor(Client).decodeProviderHooksSet;
+    pub const decodeProviderMcpSet = codec.methodsFor(Client).decodeProviderMcpSet;
+    pub const decodeProviderTitleGenerate = codec.methodsFor(Client).decodeProviderTitleGenerate;
+    pub const decodeTurnRecord = codec.methodsFor(Client).decodeTurnRecord;
+    pub const decodeChanges = codec.methodsFor(Client).decodeChanges;
+    pub const decodeCompositeSnapshot = codec.methodsFor(Client).decodeCompositeSnapshot;
+    pub const decodePairingGrantCreate = codec.methodsFor(Client).decodePairingGrantCreate;
+    pub const decodePairingGrantList = codec.methodsFor(Client).decodePairingGrantList;
+    pub const decodePairingGrantRevoke = codec.methodsFor(Client).decodePairingGrantRevoke;
+    pub const decodeDeviceList = codec.methodsFor(Client).decodeDeviceList;
+    pub const decodeDeviceRevoke = codec.methodsFor(Client).decodeDeviceRevoke;
+    pub const decodeConnectStatus = codec.methodsFor(Client).decodeConnectStatus;
+    pub const decodeConnectBootstrapConsume = codec.methodsFor(Client).decodeConnectBootstrapConsume;
 
     /// Send a bootstrap grant over the owner-only daemon transport. The
     /// request DTO deliberately redacts under generic serialization, so this
@@ -993,51 +675,6 @@ pub const Client = struct {
         return requireCapabilityChecked(capabilities, feature);
     }
 
-    fn recordNegotiatedRange(self: *Client, daemon_min: u32, daemon_max: u32) !u32 {
-        self.negotiated_version = null;
-        const negotiated_version = try protocol.negotiateProtocolVersion(
-            .{
-                .min = protocol.MIN_SUPPORTED_PROTOCOL_VERSION,
-                .max = protocol.MAX_SUPPORTED_PROTOCOL_VERSION,
-            },
-            .{ .min = daemon_min, .max = daemon_max },
-        );
-        self.negotiated_version = negotiated_version;
-        return negotiated_version;
-    }
-
-    fn resultValue(_: *Client, parsed: *const protocol.ParsedResponse) !std.json.Value {
-        if (parsed.response.err) |remote_error| {
-            if (std.mem.eql(u8, remote_error.code, protocol.ERR_RUNTIME_IDENTITY_MISSING)) {
-                return error.RuntimeIdentityMissing;
-            }
-            if (std.mem.eql(u8, remote_error.code, protocol.ERR_RUNTIME_IDENTITY_MISMATCH)) {
-                return error.RuntimeIdentityMismatch;
-            }
-            return error.RemoteError;
-        }
-        return parsed.response.result orelse error.InvalidResponse;
-    }
-
-    /// Re-encode the parsed result before typed parsing so `.alloc_always`
-    /// produces values independent of the response envelope's arena.
-    fn decodeResult(self: *Client, comptime T: type, parsed: *const protocol.ParsedResponse) !T {
-        const result = try self.resultValue(parsed);
-        const result_json = try std.json.Stringify.valueAlloc(self.allocator, result, .{});
-        defer self.allocator.free(result_json);
-        return try std.json.parseFromSliceLeaky(T, self.allocator, result_json, .{
-            .ignore_unknown_fields = true,
-            .allocate = .alloc_always,
-        });
-    }
-
-    /// Access credentials and grants use strict, versioned objects. Parsing
-    /// directly from the response DOM avoids another plaintext secret copy.
-    fn decodeStrictResult(self: *Client, comptime T: type, parsed: *const protocol.ParsedResponse) !T {
-        const result = try self.resultValue(parsed);
-        return try std.json.parseFromValueLeaky(T, self.allocator, result, .{});
-    }
-
     fn send(self: *Client, request_json: []const u8) ![]u8 {
         const transport = self.transport orelse return error.TransportUnavailable;
         const context = self.transport_ctx orelse return error.TransportUnavailable;
@@ -1045,35 +682,7 @@ pub const Client = struct {
     }
 };
 
-fn validateAccessProtocolVersion(version: u32) !void {
-    if (version != access_protocol.ACCESS_PROTOCOL_VERSION) {
-        return error.IncompatibleAccessProtocol;
-    }
-}
-
-fn validateConnectProtocolVersion(version: u32) !void {
-    if (version != connect_protocol.CONNECT_PROTOCOL_VERSION) {
-        return error.IncompatibleConnectProtocol;
-    }
-}
-
-fn validConnectPrefixedId(value: []const u8, prefix: []const u8) bool {
-    if (value.len != prefix.len + 32 or !std.mem.startsWith(u8, value, prefix)) return false;
-    for (value[prefix.len..]) |byte| if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
-    return true;
-}
-
-fn validateAccessResultHeader(
-    version: u32,
-    runtime_id: []const u8,
-    instance_id: []const u8,
-) !void {
-    try validateAccessProtocolVersion(version);
-    protocol.validateRequestTarget(.{
-        .runtime_id = runtime_id,
-        .instance_id = instance_id,
-    }) catch return error.InvalidAccessResponse;
-}
+const validateConnectProtocolVersion = codec.validateConnectProtocolVersion;
 
 const MockTransport = struct {
     allocator: std.mem.Allocator,
