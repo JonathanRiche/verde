@@ -130,7 +130,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | A-12 | Push crypto module (seal/open) | host | linux | — | done (7f5c621f) |
 | A-13 | Push outbox + `device.push.*` RPCs | host | linux | A-02, A-12 | todo |
 | A-14 | Attention events → outbox | host | linux | A-13 | todo |
-| A-15 | Harden served-file open (TOCTOU, special files, leak, logs) | host | linux | A-01 | in_progress (astra cli-thread-1790351693456-5bdf3a2df64f4b75) |
+| A-15 | Harden served-file open (TOCTOU, special files, leak, logs) | host | linux | A-01 | done (310be446) |
 | A-16 | `workspace.list` exposes repository binding roots | host | linux | A-01, A-02 | todo |
 | W-01 | App Link / universal link files + pair landing page | website | linux | H-03, H-04 | todo |
 | C-01 | Spike: APNs reachability from Workers | cloud | linux | — | done (research; recorded in plan §8, see C-02) |
@@ -578,6 +578,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
   rejected, and the five A-01 cases still pass. `mise run web-app-test` and
   `mise run web-app` pass. The `Security contract` in `packages/web_app/AGENTS.md`
   states that files are opened beneath the root descriptor.
+- **Done (310be446).** Files open beneath the root descriptor (`served_files.zig`); FIFOs are rejected within a finite deadline; office previews convert a private copy; escapes return 403 consistently; `office_preview.zig` no longer logs paths. `web-app-test` passes 67/67 and `web-app` builds. The non-Linux fallback was not runtime-tested.
 
 #### A-16 · `workspace.list` exposes repository binding roots
 - **depends:** A-01, A-02 · **touches:** `packages/desktop/src/terminal/sessionizer.zig`
