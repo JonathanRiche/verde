@@ -131,7 +131,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | A-13 | Push outbox + `device.push.*` RPCs | host | linux | A-02, A-12 | todo |
 | A-14 | Attention events → outbox | host | linux | A-13 | todo |
 | W-01 | App Link / universal link files + pair landing page | website | linux | H-03, H-04 | todo |
-| C-01 | Spike: APNs reachability from Workers | cloud | linux | — | todo |
+| C-01 | Spike: APNs reachability from Workers | cloud | linux | — | in_progress (orchestrator research subagent) |
 | C-02 | Push relay Worker | cloud | linux | C-01, A-12 | todo |
 | C-03 | Demo runtime for store review | cloud | linux | A-09 | todo |
 | K-01 | Core skeleton + Android toolchain proof | core | linux | — | todo |
