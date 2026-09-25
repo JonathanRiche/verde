@@ -6,6 +6,7 @@ const palette = @import("palette");
 const sdl = @import("zsdl3");
 const app_config = @import("../app/config.zig");
 const provider_cli_version = @import("../providers/cli_version.zig");
+const phone_pairing = @import("../state/phone_pairing.zig");
 const settings_controller = @import("../state/settings_controller.zig");
 const updater = @import("../app/updater.zig");
 const theme = @import("theme.zig");
@@ -4363,6 +4364,11 @@ test "clicking outside the docked settings column dismisses it" {
     try std.testing.expectEqual(runtime.PaletteModalAction.settings_close, topModalActionAt(&state, layout.close.x + 1.0, layout.close.y + 1.0).?);
 }
 
+const PHONE_PRESET_ACTION: usize = 5;
+comptime {
+    std.debug.assert(PHONE_PRESET_ACTION + phone_pairing.PAIRING_PRESETS.len <= 16);
+}
+
 const PHONE_HOVER_BIT: usize = 1 << (@bitSizeOf(usize) - 1);
 
 /// Break at measured UTF-8 boundaries, including inside the unbroken App Link.
@@ -4414,8 +4420,12 @@ const PhoneCard = struct {
     }
 
     fn button(self: *PhoneCard, label: []const u8, action: usize, enabled: bool) void {
+        self.choice(label, action, enabled, false);
+    }
+
+    fn choice(self: *PhoneCard, label: []const u8, action: usize, enabled: bool, selected: bool) void {
         const rect: palette.Rect = .{ .x = self.x, .y = self.y, .w = self.w, .h = theme.scaledUi(30.0) };
-        if (self.draw) drawActionButton(self.state, rect, label, if (enabled) .secondary else .disabled, self.state.settings_controller.hover_runtime_action == (action | PHONE_HOVER_BIT), self.clip);
+        if (self.draw) drawActionButton(self.state, rect, label, if (selected) .primary else if (enabled) .secondary else .disabled, self.state.settings_controller.hover_runtime_action == (action | PHONE_HOVER_BIT), self.clip);
         if (enabled) if (self.queue_hit) |queue| {
             if (intersectRect(rect, self.clip)) |visible| queue(self.state, visible, .settings_phone_action, action);
         };
@@ -4436,7 +4446,12 @@ fn phoneCard(state: *runtime.AppState, rect: palette.Rect, clip: palette.Rect, d
         card.text("Run verde-server serve --tailscale for this runtime, then copy its HTTPS host URL (https://your-host.ts.net).");
         card.button("Paste host URL", 1, idle);
         if (phone.host_len > 0) card.text(phone.host[0..phone.host_len]);
-        // A-09's preset picker belongs here, before explicit grant creation.
+        card.text("Permissions");
+        for (phone_pairing.PAIRING_PRESETS, 0..) |preset, index| {
+            card.choice(phone_pairing.presetLabel(preset), PHONE_PRESET_ACTION + index, idle and phone.grant == null, phone.preset == preset);
+            card.text(phone_pairing.presetDescription(preset));
+        }
+        if (phone.grant != null) card.text("Close pairing to choose permissions for a new link.");
         card.button("Create pairing link", 2, idle and phone.host_len > 0 and phone.grant == null);
         if (phone.grant) |grant| {
             if (grant.qr) |*qr| {
@@ -4478,6 +4493,9 @@ fn phoneCard(state: *runtime.AppState, rect: palette.Rect, clip: palette.Rect, d
         } else writer.writeAll("Never") catch {};
         card.text(writer.buffered());
         writer = .fixed(&buf);
+        writer.print("Preset: {s} · Max access mode: {s}", .{ phone_pairing.presetLabel(device.preset), phone_pairing.accessModeLabel(device.max_access_mode) }) catch {};
+        card.text(writer.buffered());
+        writer = .fixed(&buf);
         writer.writeAll("Scopes: ") catch {};
         for (device.scopes, 0..) |scope, i| {
             if (i > 0) writer.writeAll(", ") catch {};
@@ -4494,6 +4512,11 @@ fn phoneCard(state: *runtime.AppState, rect: palette.Rect, clip: palette.Rect, d
 
 pub fn applyPhoneAction(state: *runtime.AppState, action: usize) void {
     const phone = &state.settings_controller.phone;
+    if (action >= PHONE_PRESET_ACTION and action < PHONE_PRESET_ACTION + phone_pairing.PAIRING_PRESETS.len) {
+        phone.selectPreset(action - PHONE_PRESET_ACTION);
+        state.markDirty();
+        return;
+    }
     switch (action) {
         0 => if (phone.opened) {
             phone.close();

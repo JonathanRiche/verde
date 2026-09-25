@@ -6,11 +6,37 @@ const daemon = @import("../daemon/client.zig");
 const clock = @import("platform_runtime");
 const allocator = std.heap.page_allocator;
 
+pub const PAIRING_PRESETS = access.PAIRING_PRESETS;
+
+pub fn presetLabel(preset: ?access.PairingPreset) []const u8 {
+    return if (preset) |value| switch (value) {
+        .full => "Full",
+        .chat => "Chat",
+        .monitor => "Monitor",
+    } else "Custom / legacy";
+}
+
+pub fn presetDescription(preset: access.PairingPreset) []const u8 {
+    return switch (preset) {
+        .full => "All permissions, including terminal, repository and process writes. No access-mode cap.",
+        .chat => "Chat with supervised access; read terminals and repositories; receive push notifications.",
+        .monitor => "Read-only chats, terminals, repositories and processes; receive push notifications.",
+    };
+}
+
+pub fn accessModeLabel(mode: ?access.AccessMode) []const u8 {
+    return if (mode) |value| switch (value) {
+        .supervised => "Supervised",
+        .full_access => "Full access",
+    } else "No cap";
+}
+
 pub const Operation = enum { list, create, revoke };
 pub const State = struct {
     host: [2048]u8 = @splat(0),
     host_len: usize = 0,
     opened: bool = false,
+    preset: access.PairingPreset = .full,
     notice: []const u8 = "Devices paired with this machine.",
     pending: ?*Job = null,
     devices_result: ?*Job = null,
@@ -31,6 +57,7 @@ pub const State = struct {
 
     pub fn close(self: *State) void {
         self.opened = false;
+        self.preset = .full;
         self.discard_grant = true;
         self.confirm_revoke = null;
         self.clearGrant();
@@ -55,13 +82,19 @@ pub const State = struct {
         self.host_len = host.len;
     }
 
+    /// Freeze the selection while creating or displaying a grant so its label stays accurate.
+    pub fn selectPreset(self: *State, index: usize) void {
+        if (index >= PAIRING_PRESETS.len or self.pending != null or self.grant != null) return;
+        self.preset = PAIRING_PRESETS[index];
+    }
+
     pub fn start(self: *State, pref_path: []const u8, operation: Operation, device_id: ?[]const u8) void {
         if (self.pending != null) return;
         if (operation == .create and self.host_len == 0) {
             self.notice = "Paste this machine's HTTPS gateway URL first.";
             return;
         }
-        const job = Job.create(pref_path, operation, self.host[0..self.host_len], device_id) catch {
+        const job = Job.create(pref_path, operation, self.host[0..self.host_len], device_id, self.preset) catch {
             self.notice = "Could not start the daemon request.";
             return;
         };
@@ -113,6 +146,7 @@ pub const Job = struct {
     arena: std.heap.ArenaAllocator,
     pref_path: []const u8,
     operation: Operation,
+    preset: access.PairingPreset = .full,
     host: []const u8,
     device_id: ?[]const u8,
     thread: ?std.Thread = null,
@@ -125,9 +159,10 @@ pub const Job = struct {
     qr: ?headless.qr.QrCode = null,
     expires_at_ms: i64 = 0,
 
-    fn create(pref_path: []const u8, operation: Operation, host: []const u8, device_id: ?[]const u8) !*Job {
+    fn create(pref_path: []const u8, operation: Operation, host: []const u8, device_id: ?[]const u8, preset: access.PairingPreset) !*Job {
         const job = try allocator.create(Job);
         job.* = .{ .arena = .init(allocator), .pref_path = "", .operation = operation, .host = "", .device_id = null };
+        job.preset = preset;
         errdefer job.destroy();
         const a = job.arena.allocator();
         job.pref_path = try a.dupe(u8, pref_path);
@@ -162,11 +197,10 @@ pub const Job = struct {
     fn runClient(self: *Job, client: *headless.Client) !void {
         const a = self.arena.allocator();
         if (self.operation == .create) {
-            // Keep this request construction separate so A-09 can supply its preset.
-            var response = try client.call(access.METHOD_DAEMON_PAIRING_GRANT_CREATE, access.PairingGrantCreateRequest{
+            // Omit scopes entirely: the daemon resolves the preset and its access cap.
+            var response = try client.call(access.METHOD_DAEMON_PAIRING_GRANT_CREATE, .{
                 .access_protocol_version = access.ACCESS_PROTOCOL_VERSION,
-                .label = "Phone",
-                .scopes = &access.DEFAULT_SCOPE_NAMES,
+                .preset = self.preset,
             });
             defer response.deinit();
             const value = response.response.result orelse return error.DaemonRequestFailed;
@@ -287,17 +321,61 @@ test "phone pairing failed refresh preserves list and successful revoke replaces
 
 test "phone pairing local RPC grant becomes an App Link and local QR" {
     const Fixture = struct {
-        fn send(_: *anyopaque, _: []const u8) ![]u8 {
+        fn send(ctx: *anyopaque, request_json: []const u8) ![]u8 {
+            const expected: *access.PairingPreset = @ptrCast(@alignCast(ctx));
+            var request = try headless.protocol.parseRequest(std.testing.allocator, request_json);
+            defer request.deinit();
+            try std.testing.expectEqualStrings(access.METHOD_DAEMON_PAIRING_GRANT_CREATE, request.request.method);
+            const params = request.request.params.object;
+            try std.testing.expectEqual(@as(usize, 2), params.count());
+            try std.testing.expectEqualStrings(@tagName(expected.*), params.get("preset").?.string);
+            try std.testing.expectEqual(@as(i64, 1), params.get("access_protocol_version").?.integer);
+            try std.testing.expect(params.get("scopes") == null);
             return std.fmt.allocPrint(allocator, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"access_protocol_version\":1,\"runtime_id\":\"" ++ "a" ** 32 ++ "\",\"instance_id\":\"" ++ "b" ** 32 ++ "\",\"grant_id\":\"" ++ "c" ** 32 ++ "\",\"pairing_token\":\"" ++ "d" ** 64 ++ "\",\"expires_at_ms\":{d},\"scopes\":[\"runtime:read\"]}}}}", .{clock.unixTimestampMs() + 60000});
         }
     };
-    const job = try fixtureJob(.create);
-    defer job.destroy();
-    job.host = "https://fixture.ts.net";
-    var context: u8 = 0;
-    var client = headless.Client.init(allocator, &context, Fixture.send);
-    try job.runClient(&client);
-    try std.testing.expect(std.mem.startsWith(u8, job.link.?, "https://verdeai.dev/pair?host=https%3A%2F%2Ffixture.ts.net&grant_id="));
-    try std.testing.expect(std.mem.endsWith(u8, job.link.?, "#code=" ++ "d" ** 64));
-    try std.testing.expect(job.qr != null and job.qr.?.size > 0);
+    for (PAIRING_PRESETS) |preset| {
+        const job = try fixtureJob(.create);
+        job.preset = preset;
+        defer job.destroy();
+        job.host = "https://fixture.ts.net";
+        var context = preset;
+        var client = headless.Client.init(allocator, &context, Fixture.send);
+        try job.runClient(&client);
+        try std.testing.expect(std.mem.startsWith(u8, job.link.?, "https://verdeai.dev/pair?host=https%3A%2F%2Ffixture.ts.net&grant_id="));
+        try std.testing.expect(std.mem.endsWith(u8, job.link.?, "#code=" ++ "d" ** 64));
+        try std.testing.expect(job.qr != null and job.qr.?.size > 0);
+    }
+}
+
+test "phone pairing presets default to Full and freeze for in-flight or displayed grants" {
+    var state: State = .{};
+    defer state.deinit();
+    try std.testing.expectEqual(access.PairingPreset.full, state.preset);
+    for (PAIRING_PRESETS, 0..) |preset, index| {
+        state.selectPreset(index);
+        try std.testing.expectEqual(preset, state.preset);
+        try std.testing.expect(presetDescription(preset).len > 0);
+    }
+    state.selectPreset(PAIRING_PRESETS.len);
+    try std.testing.expectEqual(access.PairingPreset.monitor, state.preset);
+    state.pending = try fixtureJob(.create);
+    state.selectPreset(0);
+    try std.testing.expectEqual(access.PairingPreset.monitor, state.preset);
+    state.pending.?.expires_at_ms = 2000;
+    _ = state.poll(1000);
+    state.selectPreset(0);
+    try std.testing.expectEqual(access.PairingPreset.monitor, state.preset);
+    state.close();
+    try std.testing.expectEqual(access.PairingPreset.full, state.preset);
+}
+
+test "phone pairing device preset and access cap labels preserve null semantics" {
+    try std.testing.expectEqualStrings("Custom / legacy", presetLabel(null));
+    try std.testing.expectEqualStrings("Full", presetLabel(.full));
+    try std.testing.expectEqualStrings("Chat", presetLabel(.chat));
+    try std.testing.expectEqualStrings("Monitor", presetLabel(.monitor));
+    try std.testing.expectEqualStrings("No cap", accessModeLabel(null));
+    try std.testing.expectEqualStrings("Supervised", accessModeLabel(.supervised));
+    try std.testing.expectEqualStrings("Full access", accessModeLabel(.full_access));
 }
