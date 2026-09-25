@@ -127,7 +127,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | A-09 | Pairing presets + access-mode cap | host | linux | A-02, H-08 | todo |
 | A-10 | `mobile.min_client` + capability flags | host | linux | — | in_progress (cli-thread-1790350351170-d56ab99abb804210) |
 | A-11 | Delta change feed on the gateway | host | linux | A-10 | todo |
-| A-12 | Push crypto module (seal/open) | host | linux | — | in_progress (cli-thread-1790350349138-67bd0d430b1a2acf) |
+| A-12 | Push crypto module (seal/open) | host | linux | — | done (7f5c621f) |
 | A-13 | Push outbox + `device.push.*` RPCs | host | linux | A-02, A-12 | todo |
 | A-14 | Attention events → outbox | host | linux | A-13 | todo |
 | A-15 | Harden served-file open (TOCTOU, special files, leak, logs) | host | linux | A-01 | in_progress (orchestrator subagent, worktree ../verde-wt/A-15) |
@@ -477,6 +477,13 @@ exact question and stop. Report: commit sha, files changed, verification output,
   rejected, size limit, and fixed test vectors (so the Kotlin/Swift sides
   can't drift, even though they call this same code).
   `$ZB headless-test` passes.
+- **Done (7f5c621f).** `packages/headless/src/push_seal.zig`: envelope =
+  version `0x01` ‖ ephemeral pub (32) ‖ ciphertext ‖ tag (16), base64url
+  unpadded; HKDF-SHA256 salt = ephemeral pub ‖ recipient pub, info
+  `verde-push-v1`, output 32-byte key + 12-byte nonce; AAD = the 33-byte
+  header. Fixed vector uses the RFC 7748 §6.1 keys. Note: a full 3 KiB
+  plaintext seals to a 4162-char envelope, above the 4096-byte FCM/APNs
+  payload limits — A-13 caps the plaintext (see A-13).
 
 #### A-13 · Push outbox + `device.push.*` RPCs
 - **depends:** A-02, A-12 · **touches:** `packages/desktop/src/daemon/store.zig`,
@@ -486,8 +493,17 @@ exact question and stop. Report: commit sha, files changed, verification output,
     `device.push.unregister` and `device.push.test` (scope
     `device:write`). Stored per device and cleared when the device is
     revoked.
+  - Wire format for `public_key`: base64url (unpadded) of the raw 32-byte
+    X25519 public key, matching the envelope encoding. Validate it at
+    registration by running `push_seal.seal` once (it rejects low-order
+    keys) and return `invalid_public_key` on failure.
   - A durable outbox table: `(device_id, kind, dedupe_key, sealed_payload,
     attempts, next_attempt_at)`.
+  - Payload budget: the envelope for a 3 KiB plaintext is 4162 characters,
+    over the 4096-byte FCM/APNs limits once wrapped in JSON. Cap the sealed
+    plaintext at **2560 bytes** (truncate `snippet`, then `title`, before
+    sealing) so the relay's JSON body stays under 4 KB with room for the
+    placeholder alert and `collapse_id`.
   - A sender loop posts `{send_token, ciphertext, collapse_id}` to the relay
     URL (config `push.relay_url`, default the production relay) with
     exponential backoff. It drops entries after N attempts and on relay 410
@@ -863,7 +879,10 @@ exact question and stop. Report: commit sha, files changed, verification output,
   - Port `notify.ts` `advanceAttention` / `notificationStatus`, which
     suppress notices for the focused pane.
   - `vc_push_open(secret, envelope)` using `push_seal.zig`, returning a
-    notification view model (title, body, deep link, actions allowed).
+    notification view model (title, body, deep link, actions allowed). Any
+    `open` error → the generic "A Verde chat needs attention" model;
+    `UnsupportedVersion` additionally sets an `update_required` flag so the
+    app can prompt for an update.
   - Build this small enough for the iOS NSE memory limit.
 - **Done when:** tests use A-12's fixed vectors.
 
