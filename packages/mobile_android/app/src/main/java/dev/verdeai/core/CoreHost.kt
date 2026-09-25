@@ -106,7 +106,17 @@ class CoreHost private constructor(
                     val snapshot = read(it)
                     updated[it] = snapshot
                     when (it) {
-                        "hosts" -> mutableHosts.value = CoreJson.decodeFromString<HostsQuery>(snapshot.toString())
+                        "hosts" -> {
+                            val hosts = CoreJson.decodeFromString<HostsQuery>(snapshot.toString())
+                            if (hosts.data?.items?.any { host -> host.auth_state == "signing_out" || host.auth_state == "signed_out" } == true) {
+                                // A core-driven wipe also retires any platform-cached projections.
+                                updated.clear()
+                                updated[it] = snapshot
+                                mutableHome.value = null
+                                mutableWorkspaces.value = null
+                            }
+                            mutableHosts.value = hosts
+                        }
                         "home" -> mutableHome.value = CoreJson.decodeFromString<HomeQuery>(snapshot.toString())
                         "workspaces" -> mutableWorkspaces.value = CoreJson.decodeFromString<WorkspacesQuery>(snapshot.toString())
                     }

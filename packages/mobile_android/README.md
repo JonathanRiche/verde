@@ -92,8 +92,8 @@ when submitted. Incoming Intent data is consumed once and removed; a link never
 automatically confirms trust or replaces an exchange in progress. Screenshots
 and recent-task previews are protected. Rotation retains the ViewModel/host;
 background stops transport through the core, and finishing closes the handle.
-A stable `primary` host slot restores encrypted pairing on process restart;
-D-04 will add the host catalog/switcher. No Home/workspace browsing is added here.
+The D-04 catalog migrates the stable `primary` slot and restores encrypted pairing
+on process restart. Home/workspace browsing remains D-05.
 
 The manifest requests HTTPS App Link verification. OS auto-opening also requires
 W-01's deployed `/.well-known/assetlinks.json` to contain the installed signing
@@ -132,3 +132,65 @@ app settings. No website or signing association is changed by D-03.
 No phone or local emulator was available during D-03 automation. Secure-store
 failure/retry and pending-link protection are covered by fake-core JVM tests;
 real Keystore, camera, JNI and OS App Link verification require these phone checks.
+
+## Hosts and sign-out (D-04)
+
+`HostsModel` owns a separate `PairingModel`/`CoreHost` per catalog entry. The
+Keystore-backed store holds the native catalog under `android/1/hosts`; it
+contains only local IDs, labels and the active ID. Core records remain opaque.
+New profiles use UUIDs; the first launch without a catalog preserves D-03's
+`primary` slot. Catalog writes must succeed before selection/add/remove commits.
+A locked or unreadable catalog shows a retry action, never silently replaces it.
+The list concatenates each handle's host projection and shows a text status plus
+a dot. Selection survives recreation and process restart. `activeCore()` is the
+D-05 integration point for Home/workspace projections; never merge those across
+hosts. Activity foreground/background continues to reach every loaded handle;
+process lifecycle/connectivity refinement belongs to D-05.
+
+Sign-out sends only generated `EventSignOut` to the chosen core. Kotlin does not
+construct RPCs, interpret credentials or delete core storage directly. The core
+owns revocation, uncertainty, cancellation, and acknowledged credential/pin
+deletion. Unconfirmed sign-out offers an explicit “Remove from this phone anyway”
+confirmation and warns about revoking the device on the desktop. That sends
+`EventForgetHost`. A delete error offers `EventRetryConnection`. The host remains
+visible until the core reports `signed_out`; only then can its catalog entry be
+removed, or the same host slot paired again. Removing the active entry selects
+the next saved host; other credentials stay untouched. The app retains no local
+workspace cache yet. The catalog is capped at 32 entries.
+
+JVM/Robolectric tests use fake cores on API 29 and 35. They exercise multiple
+handles, restored selection, primary-slot migration, confirmation/cancellation,
+offline/repair states, host-scoped storage effects, blocked delete acknowledgements,
+failed-delete retry and catalog failure recovery. Core harness tests separately
+exercise the real revoke RPC and storage protocol. No phone/emulator was available.
+
+### Exact on-phone checks (H-06/H-07 pending)
+
+1. Install the retained APK with `adb -s SERIAL install -r /home/rtg/development/verde-wt/artifacts/D-04/SHA/app-debug.apk`.
+   Launch with `adb -s SERIAL shell am start -n dev.verdeai.app/.MainActivity`.
+2. For an upgrade from D-03, confirm “My host” restores its existing pairing.
+   Otherwise open “Pair / review host” and pair using a fresh host QR/link; confirm
+   the displayed trust proposal. Return using “Back to hosts”.
+3. Tap “Add host”, enter a distinct label, continue and pair a second runtime.
+   Confirm both rows and their status text/dots. Use each host, then “Switch host”.
+   Rotate, background/foreground, and force-stop/reopen; confirm selection and both
+   pairings survive and the selected label always belongs to the intended host.
+4. With both hosts reachable, tap “Sign out of host” on one row. Cancel once and
+   confirm it stays connected. Confirm sign-out the second time; verify the row
+   becomes “Signed out” only after removal, and desktop Paired devices shows that
+   device revoked. The other host must remain usable. Tap “Pair again”, use a fresh
+   grant and confirm a new trust prompt and successful pairing in the same slot.
+5. Turn off Tailscale or stop that host, then sign out. Verify unconfirmed wording;
+   cancel “Remove from this phone anyway” once and confirm the pairing persists.
+   Restore connectivity and retry sign-out, or repeat offline and confirm “Remove
+   anyway”. Verify the desktop warning and eventual local Signed out state. If
+   forgotten offline, revoke the orphaned device from desktop Paired devices.
+6. Revoke a paired phone from the desktop, then foreground/retry on Android.
+   Confirm “Pair again” authorization status rather than a generic network error;
+   local sign-out must still finish. Remove the active signed-out row and confirm
+   selection falls back to the other host. Remove the last row and confirm the
+   empty list offers Add host.
+7. Keystore locked/failing writes and delayed deletion acknowledgements are
+   deterministically covered by Robolectric. On a device, verify credential restore
+   after lock/unlock and process restart; do not induce failure by deleting app
+   files or keys. Native JNI, real Keystore, VPN and TLS behavior remain phone checks.

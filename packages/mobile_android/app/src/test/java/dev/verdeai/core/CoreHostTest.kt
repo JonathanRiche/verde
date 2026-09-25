@@ -31,6 +31,7 @@ class CoreHostTest {
         var thread = 0L
         var freed = false
         var queryStatus: Int? = null
+        var authState: String? = null
         val selectors = mutableListOf<String>()
         private fun checkThread() {
             val current = Thread.currentThread().id
@@ -49,6 +50,8 @@ class CoreHostTest {
         override fun query(host: Long, selector: String): ByteArray {
             checkThread(); check(!freed); selectors.add(selector)
             queryStatus?.let { throw CoreFailure(it) }
+            if (selector == "hosts" && authState != null) return CoreJson.encodeToString(
+                HostsQuery(1,"2",HostsView(listOf(HostView("test","Test",null,null,null,"disabled",Lifecycle.foreground,authState!!,"empty",emptyList(),emptyList(),null,null,false,null)),emptyList()),null)).encodeToByteArray()
             return """{"api_version":1,"revision":"2","data":null,"error":null}""".encodeToByteArray()
         }
         override fun free(host: Long) { checkThread(); check(!freed); freed = true }
@@ -103,6 +106,22 @@ class CoreHostTest {
             assertEquals(PlatformFailureCode.io, core.next<EventSecureStoreValue>().error?.code)
         } finally { host.close() }
         assertTrue(core.freed)
+    }
+
+    @Test fun coreWipeRetiresCachedThreadAndComposerViews() = runBlocking {
+        val core = FakeCore()
+        val host = CoreHost.create(config, executor(), core)
+        try {
+            core.effects=listOf(EffectStateChanged("view","1","1",listOf("hosts","thread:fixture","composer:fixture")))
+            start(host)
+            assertTrue(host.views.value.containsKey("thread:fixture"))
+            core.authState="signing_out"
+            core.effects=listOf(EffectStateChanged("wipe","1","2",listOf("hosts")))
+            host.send { n,w -> EventForgetHost(now_ms=n,wall_time_ms=w,intent_id="forget",host_id="test") }
+            assertEquals(setOf("hosts"),host.views.value.keys)
+            assertNull(host.home.value)
+            assertNull(host.workspaces.value)
+        } finally { host.close() }
     }
 
     private class TlsFixture : AutoCloseable {

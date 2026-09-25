@@ -111,7 +111,10 @@ internal class PairingModel(private val createHost: suspend () -> CoreHost) : Vi
             finally { mutableState.update { it.copy(busy=false) } }
         }
     }
-    override fun onCleared() {
+    internal suspend fun coreHost(): CoreHost = host.await()
+
+    override fun onCleared() = dispose()
+    internal fun dispose() {
         clearInputs()
         // Own cleanup beyond scope cancellation; CoreHost closes its dispatcher/executor.
         scope.launch {
