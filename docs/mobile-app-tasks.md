@@ -138,7 +138,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | C-03 | Demo runtime for store review | cloud | linux | A-09 | todo |
 | K-01 | Core skeleton + Android toolchain proof | core | linux | — | done (951a5a5a) |
 | K-02 | iOS xcframework toolchain proof | core | mac | K-01, H-01, H-02 | done (e2f73abb) |
-| K-03 | Core API spec (events, effects, queries) | core | linux | K-01 | in_progress (astra cli-thread-1790351696474-542beadf66cd5ddc) |
+| K-03 | Core API spec (events, effects, queries) | core | linux | K-01 | done (a5a81401; reviewed) |
 | K-04 | Extract shared remote-client modules from desktop | core | linux | K-01 | in_progress (astra cli-thread-1790351697558-48a6b174381d69dd) |
 | K-05 | Split `headless/client.zig` codec from I/O | core | linux | K-01 | in_progress (astra cli-thread-1790351698860-7ab2d678d434063c) |
 | K-06 | Sans-IO host engine + C ABI | core | linux | K-03, K-04, K-05 | todo |
@@ -719,6 +719,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
     threading rules (single-threaded per host).
 - **Done when:** the spec is reviewed by the orchestrator and consistent
   with plan §5. It gates K-06.
+- **Done (a5a81401), reviewed.** `packages/client_core/docs/core-api.md` rev 1: one serialized host handle per profile; effect IDs + `generation` reject stale completions; acknowledged storage effects (`secure_store_done`); intent receipts so uncertain mutations never replay; TLS = system trust **and** SPKI pin via `tls_probe`/`tls_peer`; separate `vc_term` handles with `terminal_output`/`terminal_applied`. Additions beyond the plan sketch are listed in §4. Note for K-12: `terminal_create` says "desktop-native open when available", but A-02 leaves `terminal.open`/`tail`/`screen`/`write`/`key` unmapped for paired devices (desktop-only, plan rule 3) — mobile terminals use `session.*` only.
 
 #### K-04 · Extract shared remote-client modules from desktop
 - **touches:** `packages/desktop/src/runtime/*`, `packages/desktop/src/chat/*`,
