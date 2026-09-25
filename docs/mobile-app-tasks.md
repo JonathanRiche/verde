@@ -157,8 +157,8 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | K-17 | Attention state machine + push decrypt | core | linux | K-09, A-12 | todo |
 | D-01 | Android project scaffold | android | linux | K-01 | done (ee3c19df; on-device version display pending human-verify) |
 | D-02 | Core bridge + effect executor | android | linux | D-01, K-06, K-15 | done (0f7fb9c6) |
-| D-03 | Pairing flow | android | linux+phone | D-02, K-07, A-06, H-06, H-07 | in_progress (astra cli-thread-1790362326049-d70c7a394ff4ae6b) |
-| D-04 | Hosts list + switcher + sign out | android | linux | D-03, A-04 | todo |
+| D-03 | Pairing flow | android | linux+phone | D-02, K-07, A-06, H-06, H-07 | done (13f210cf; phone verify pending H-06/H-07; verified App Links need W-01) |
+| D-04 | Hosts list + switcher + sign out | android | linux | D-03, A-04 | in_progress (astra cli-thread-1790363520707-da29d316f8961d4b) |
 | D-05 | Home + Workspaces + lifecycle | android | linux+phone | D-04, K-09 | todo |
 | D-06 | Transcript screen | android | linux | D-05, K-10, K-11 | todo |
 | D-07 | Diff card | android | linux | D-06 | todo |
@@ -979,6 +979,7 @@ human-verify step.
     errors (grant expired / used / host unreachable → "Is Tailscale on?").
 - **Done when:** unit tests pass. Human-verify: the owner scans the QR code
   from A-06 on their Android phone and lands on an empty Home screen.
+- **Done (13f210cf).** The Android pairing screen offers QR scan, App Link and custom-scheme links, paste and manual entry. The user confirms the host, and the core then runs the exchange and stores the credential. Error and retry states cover trust or camera denial, malformed links, expired or used grants, and a storage failure, which retries without sending the grant again. `CoreHost` now recovers from rejected input, while effect failures still close the host. `mobile-android-test` passes 30/0, and the APK build and `mobile-models-check` pass. No emulator was available, so camera and link routing are on the phone checklist. Verified App Links need W-01 to publish the signing association.
 
 #### D-04 · Hosts list + switcher + sign out
 - **depends:** D-03, A-04
