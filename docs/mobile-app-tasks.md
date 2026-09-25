@@ -141,9 +141,9 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | K-01 | Core skeleton + Android toolchain proof | core | linux | — | done (951a5a5a) |
 | K-02 | iOS xcframework toolchain proof | core | mac | K-01, H-01, H-02 | done (e2f73abb) |
 | K-03 | Core API spec (events, effects, queries) | core | linux | K-01 | done (a5a81401; reviewed) |
-| K-04 | Extract shared remote-client modules from desktop | core | linux | K-01 | in_progress (astra cli-thread-1790351697558-48a6b174381d69dd) |
+| K-04 | Extract shared remote-client modules from desktop | core | linux | K-01 | done (e1111a8c) |
 | K-05 | Split `headless/client.zig` codec from I/O | core | linux | K-01 | done (b12e4c17) |
-| K-06 | Sans-IO host engine + C ABI | core | linux | K-03, K-04, K-05 | todo |
+| K-06 | Sans-IO host engine + C ABI | core | linux | K-03, K-04, K-05 | in_progress (astra cli-thread-1790353141333-1019127d2dccf44d) |
 | K-07 | Auth in core | core | linux | K-06, A-05 | todo |
 | K-08 | RPC client + target pinning | core | linux | K-06 | todo |
 | K-09 | Sync + projection | core | linux | K-08 | todo |
@@ -754,6 +754,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 - **Done when:** `$ZB headless-test`, `$ZB runtime-test` and
   `mise run dev-build` pass, and the moved tests run under
   `mise run mobile-core-test`.
+- **Done (e1111a8c).** Module `verde_remote` in `packages/client_core/src/shared/` contains `connection`, `thread_binding`, `transcript_apply` and `threads` (moved byte for byte), plus the pure parts of `pin_controller`, `profile`, `pair_client` and `slash_commands`. Randomness is passed in by the caller. The desktop keeps the I/O (pin persistence, `Manager`, the profile store) and re-exports the existing names; the daemon and web_app builds import the module too. `mobile-core-test` passes 51/51, and `headless-test` and `dev-build` pass. `runtime-test`: 334 passed plus the pre-existing `workspace_layout.zig:1963` crash.
 
 #### K-05 · Split `headless/client.zig` codec from I/O
 - **Do:** separate request encoding and response decoding (pure) from the
