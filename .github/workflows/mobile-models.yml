@@ -1,0 +1,21 @@
+name: Mobile model staleness
+on:
+  pull_request: {}
+  push:
+    branches: [master]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Zig 0.16.0
+        run: |
+          curl -fL --retry 5 https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz -o zig.tar.xz
+          tar -xf zig.tar.xz
+          echo "$PWD/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
+      - name: Check committed native models
+        working-directory: packages/client_core
+        run: zig build models-check --release=safe

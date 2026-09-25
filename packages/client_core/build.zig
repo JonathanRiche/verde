@@ -39,6 +39,7 @@ pub fn build(b: *std.Build) void {
     const options = b.addOptions();
     options.addOption([:0]const u8, "version", zon.version);
 
+    addModelSteps(b, options);
     addIosSteps(b, optimize, options);
     const headless = b.createModule(.{
         .root_source_file = b.path("../headless/src/root.zig"),
@@ -245,4 +246,29 @@ fn androidLibcFile(b: *std.Build, sysroot: []const u8, triple: []const u8) []con
         \\gcc_dir=
         \\
     , .{ sysroot, sysroot, triple, sysroot, triple, android_api_level });
+}
+
+/// Reflection runs at comptime; generated cache files are compared without touching sources.
+fn addModelSteps(b: *std.Build, options: *std.Build.Step.Options) void {
+    // Use the core's module wiring so registry entries can refer to shared types.
+    const module = createCoreModule(b, b.graph.host, .ReleaseSafe, options);
+    module.root_source_file = b.path("src/generate_models.zig");
+    const generator = b.addExecutable(.{ .name = "generate-models", .root_module = module, .use_llvm = true });
+    const kotlin_run = b.addRunArtifact(generator);
+    kotlin_run.addArg("kotlin");
+    const kotlin = kotlin_run.captureStdOut(.{});
+    const swift_run = b.addRunArtifact(generator);
+    swift_run.addArg("swift");
+    const swift = swift_run.captureStdOut(.{});
+    for ([_][]const u8{ "generate", "check" }) |mode| {
+        const run = b.addSystemCommand(&.{"bash"});
+        run.addFileArg(b.path("scripts/models.sh"));
+        run.addArg(mode);
+        run.addFileArg(kotlin);
+        run.addArg(b.pathFromRoot("../mobile_android/app/src/main/java/dev/verdeai/core/CoreModels.kt"));
+        run.addFileArg(swift);
+        run.addArg(b.pathFromRoot("../mobile_ios/App/CoreModels.swift"));
+        run.has_side_effects = true;
+        b.step(b.fmt("models-{s}", .{mode}), b.fmt("{s} committed Kotlin and Swift models", .{mode})).dependOn(&run.step);
+    }
 }

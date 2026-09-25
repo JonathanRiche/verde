@@ -1,6 +1,7 @@
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.kotlin.serialization)
     alias(libs.plugins.kotlin.compose)
 }
 
@@ -44,6 +45,7 @@ android {
 tasks.named("preBuild") { dependsOn(syncNativeLibraries) }
 
 dependencies {
+    implementation(libs.kotlinx.serialization.json)
     implementation(platform(libs.compose.bom))
     implementation(libs.activity.compose)
     implementation(libs.compose.material3)

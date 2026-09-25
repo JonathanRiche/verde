@@ -1,0 +1,26 @@
+//! The single list of exported native models; see docs/model-codegen.md.
+const wire = @import("wire.zig");
+pub const types = .{
+    .{ "Config", wire.Config },
+    .{ "Lifecycle", wire.Lifecycle },
+    .{ "LocalError", wire.LocalError },
+    .{ "Operation", wire.Operation },
+    .{ "TransportFailure", wire.TransportFailure },
+    .{ "PlatformFailure", wire.PlatformFailure },
+    .{ "Header", wire.Header },
+    .{ "Tls", wire.Tls },
+    .{ "VtModes", wire.VtModes },
+    .{ "AttachmentInput", wire.AttachmentInput },
+    .{ "Event", wire.Event },
+    .{ "Effect", wire.Effect },
+    .{ "EffectBatch", wire.EffectBatch },
+    .{ "TrustProposal", wire.TrustProposal },
+    .{ "HostView", wire.HostView },
+    .{ "HostsView", wire.HostsView },
+    .{ "HomeView", wire.HomeView },
+    .{ "HistoryView", wire.HistoryView },
+    .{ "WorkspacesView", wire.WorkspacesView },
+    .{ "HostsQuery", wire.Query(wire.HostsView) },
+    .{ "HomeQuery", wire.Query(wire.HomeView) },
+    .{ "WorkspacesQuery", wire.Query(wire.WorkspacesView) },
+};

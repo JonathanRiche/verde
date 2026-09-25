@@ -73,3 +73,7 @@ is used.
 Panics emit only `core_invariant_failure` via Android liblog or iOS stderr,
 then abort. They never print the panic text or backtrace. Signal handling and
 Zig's per-thread alternate signal stack are disabled for the library.
+
+Native wire models and the single export registry are documented in
+[model-codegen.md](model-codegen.md). D-02/I-02 consume the committed generated
+Kotlin/Swift files; new core features append their exported types to that registry.

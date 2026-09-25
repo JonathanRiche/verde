@@ -137,3 +137,13 @@ run = "bash packages/mobile_android/run-gradle.sh assembleDebug"
 [tasks.mobile-android-test]
 description = "Runs Android JVM and Robolectric tests."
 run = "bash packages/mobile_android/run-gradle.sh testDebugUnitTest"
+
+[tasks.mobile-models-generate]
+description = "Regenerates committed Kotlin and Swift models from the Zig export registry."
+dir = "packages/client_core"
+run = "zig build models-generate --release=safe"
+
+[tasks.mobile-models-check]
+description = "Fails if committed Kotlin or Swift models are stale."
+dir = "packages/client_core"
+run = "zig build models-check --release=safe"
