@@ -1,0 +1,171 @@
+//! Build graph for the Verde mobile client core (`libverde_client`).
+//!
+//! Steps:
+//! - `test`: Zig unit tests plus a C smoke test of `include/verde_client.h`
+//!   against the host shared library.
+//! - `android-libs`: `libverde_client.so` for arm64-v8a and x86_64 against the
+//!   NDK sysroot (`ANDROID_NDK_HOME` or `-Dandroid-ndk`), installed to
+//!   `zig-out/lib/android/<abi>/` and checked for allowed NEEDED entries.
+
+const std = @import("std");
+const zon = @import("build.zig.zon");
+
+const lib_name = "verde_client";
+/// Matches the Android app's minSdk (Android 10).
+const android_api_level: u32 = 29;
+/// Android 15+ devices may use 16 KB pages; Play requires aligned segments.
+const android_page_size: u64 = 16 * 1024;
+
+const AndroidAbi = struct {
+    /// Directory name under `jniLibs/`.
+    name: []const u8,
+    arch: std.Target.Cpu.Arch,
+    /// NDK sysroot triple directory.
+    triple: []const u8,
+};
+
+const android_abis = [_]AndroidAbi{
+    .{ .name = "arm64-v8a", .arch = .aarch64, .triple = "aarch64-linux-android" },
+    .{ .name = "x86_64", .arch = .x86_64, .triple = "x86_64-linux-android" },
+};
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+    const ndk_option = b.option([]const u8, "android-ndk", "Android NDK root (default: $ANDROID_NDK_HOME)");
+
+    const options = b.addOptions();
+    options.addOption([:0]const u8, "version", zon.version);
+
+    addTestStep(b, target, optimize, options);
+    addAndroidStep(b, optimize, options, ndk_option orelse b.graph.environ_map.get("ANDROID_NDK_HOME"));
+}
+
+fn addTestStep(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    options: *std.Build.Step.Options,
+) void {
+    const test_step = b.step("test", "Run unit tests and the C ABI smoke test");
+
+    const unit_tests = b.addTest(.{
+        .root_module = createCoreModule(b, target, optimize, options),
+        .use_llvm = true,
+    });
+    test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+
+    const host_lib = addCoreLibrary(b, createCoreModule(b, target, optimize, options));
+    const smoke_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    smoke_module.addIncludePath(b.path("include"));
+    smoke_module.addCSourceFile(.{ .file = b.path("tests/abi_smoke.c"), .flags = &.{ "-std=c11", "-Wall", "-Werror" } });
+    smoke_module.linkLibrary(host_lib);
+    const smoke = b.addExecutable(.{ .name = "abi_smoke", .root_module = smoke_module, .use_llvm = true });
+    const run_smoke = b.addRunArtifact(smoke);
+    run_smoke.addArg(zon.version);
+    run_smoke.expectExitCode(0);
+    test_step.dependOn(&run_smoke.step);
+
+    const fmt_check = b.addFmt(.{ .paths = &.{ "src", "build.zig", "build.zig.zon" }, .check = true });
+    test_step.dependOn(&fmt_check.step);
+}
+
+fn addAndroidStep(
+    b: *std.Build,
+    optimize: std.builtin.OptimizeMode,
+    options: *std.Build.Step.Options,
+    ndk_root: ?[]const u8,
+) void {
+    const android_step = b.step("android-libs", "Build libverde_client.so for Android arm64-v8a and x86_64");
+    const ndk = ndk_root orelse {
+        android_step.dependOn(&b.addFail("android-libs needs the Android NDK: set ANDROID_NDK_HOME or pass -Dandroid-ndk=<path>").step);
+        return;
+    };
+    const host_tag = switch (b.graph.host.result.os.tag) {
+        .linux => "linux-x86_64",
+        .macos => "darwin-x86_64",
+        else => {
+            android_step.dependOn(&b.addFail("android-libs supports Linux and macOS build hosts only").step);
+            return;
+        },
+    };
+    const prebuilt = b.pathJoin(&.{ ndk, "toolchains", "llvm", "prebuilt", host_tag });
+    const sysroot = b.pathJoin(&.{ prebuilt, "sysroot" });
+    const readelf = b.pathJoin(&.{ prebuilt, "bin", "llvm-readelf" });
+    const libc_files = b.addWriteFiles();
+
+    for (android_abis) |abi| {
+        const target = b.resolveTargetQuery(.{
+            .cpu_arch = abi.arch,
+            .os_tag = .linux,
+            .abi = .android,
+            .android_api_level = android_api_level,
+        });
+        const lib = addCoreLibrary(b, createCoreModule(b, target, optimize, options));
+        lib.setLibCFile(libc_files.add(
+            b.fmt("libc-{s}.txt", .{abi.triple}),
+            androidLibcFile(b, sysroot, abi.triple),
+        ));
+        lib.link_z_max_page_size = android_page_size;
+        lib.link_z_common_page_size = android_page_size;
+
+        const install = b.addInstallArtifact(lib, .{
+            .dest_dir = .{ .override = .{ .custom = b.fmt("lib/android/{s}", .{abi.name}) } },
+        });
+        android_step.dependOn(&install.step);
+
+        const check = b.addSystemCommand(&.{"bash"});
+        check.addFileArg(b.path("scripts/check-android-lib.sh"));
+        check.addArg(readelf);
+        check.addFileArg(lib.getEmittedBin());
+        check.setName(b.fmt("check {s} {s}", .{ lib_name, abi.name }));
+        check.expectExitCode(0);
+        android_step.dependOn(&check.step);
+    }
+}
+
+fn createCoreModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    options: *std.Build.Step.Options,
+) *std.Build.Module {
+    const module = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    module.addOptions("build_options", options);
+    return module;
+}
+
+/// Shared library with an unversioned soname, built with LLVM (the
+/// self-hosted x86 backend miscompiles Verde code).
+fn addCoreLibrary(b: *std.Build, module: *std.Build.Module) *std.Build.Step.Compile {
+    return b.addLibrary(.{
+        .name = lib_name,
+        .linkage = .dynamic,
+        .root_module = module,
+        .use_llvm = true,
+        .use_lld = true,
+    });
+}
+
+/// Zig libc installation file pointing at the NDK's bionic headers and the
+/// API-level crt objects / stub libraries.
+fn androidLibcFile(b: *std.Build, sysroot: []const u8, triple: []const u8) []const u8 {
+    return b.fmt(
+        \\include_dir={s}/usr/include
+        \\sys_include_dir={s}/usr/include/{s}
+        \\crt_dir={s}/usr/lib/{s}/{d}
+        \\msvc_lib_dir=
+        \\kernel32_lib_dir=
+        \\gcc_dir=
+        \\
+    , .{ sysroot, sysroot, triple, sysroot, triple, android_api_level });
+}

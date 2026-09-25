@@ -1,0 +1,16 @@
+.{
+    .name = .verde_client_core,
+    .version = "0.1.0",
+    .fingerprint = 0xfe79e8a9e166a459,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "AGENTS.md",
+        "build.zig",
+        "build.zig.zon",
+        "docs",
+        "include",
+        "scripts",
+        "src",
+        "tests",
+    },
+}

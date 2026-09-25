@@ -54,3 +54,4 @@ Read the relevant file before working on that subsystem, including changes from 
 - [Website](packages/website/AGENTS.md)
 - [Tree-sitter package](packages/zig_treesitter/AGENTS.md)
 - [Browser inspector](packages/browser_extensions/inspector/AGENTS.md)
+- [Mobile client core](packages/client_core/AGENTS.md)

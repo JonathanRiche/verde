@@ -104,3 +104,13 @@ run = "bun run dev"
 [tasks.runtime-container]
 description = "Builds the non-root standalone daemon/gateway container image from target-pinned artifacts."
 run = "bash scripts/release/build-runtime-container.sh"
+
+[tasks.mobile-core-test]
+description = "Runs the mobile client core (packages/client_core) unit tests and C ABI smoke test on the host."
+dir = "packages/client_core"
+run = "zig build test --release=safe"
+
+[tasks.mobile-core-android]
+description = "Cross-builds libverde_client.so for Android arm64-v8a and x86_64 against the NDK and checks NEEDED libraries and 16 KB page alignment."
+dir = "packages/client_core"
+run = "bash -c 'export ANDROID_NDK_HOME=\"${ANDROID_NDK_HOME:-${ANDROID_HOME:-$HOME/Android/Sdk}/ndk/30.0.16248370}\" && zig build android-libs --release=safe'"
