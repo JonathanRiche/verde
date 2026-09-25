@@ -117,10 +117,10 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | H-07 | Android phone dev setup (adb) | human | phone | — | human |
 | H-08 | Choose pairing permission presets | human | — | — | done (owner: Full default) |
 | A-01 | Confine `/api/file` + `/api/preview` | host | linux | — | done (363bece0) |
-| A-02 | Paired-device allowlist parity + new scopes | host | linux | — | in_progress (astra cli-thread-1790351685803-38d5dc7e76ddb6bc; resumes ../verde-wt/A-02) |
+| A-02 | Paired-device allowlist parity + new scopes | host | linux | — | done (a570cce2) |
 | A-03 | Confined directory-list RPC | host | linux | A-02 | todo |
 | A-04 | Device self-service RPCs | host | linux | A-02 | todo |
-| A-05 | Idempotent pair exchange | host | linux | — | todo |
+| A-05 | Idempotent pair exchange | host | linux | — | in_progress (astra cli-thread-1790352652199-916412030c97f80f) |
 | A-06 | Terminal QR + App Link pair URL | host | linux | — | done (b0f6e50b; phone-camera scan pending human-verify) |
 | A-07 | Desktop "Pair a phone" + Paired devices UI | host | linux | A-04, A-06 | todo |
 | A-08 | Web Settings paired-devices list | host | linux | A-04 | todo |
@@ -131,7 +131,9 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | A-13 | Push outbox + `device.push.*` RPCs | host | linux | A-02, A-12 | todo |
 | A-14 | Attention events → outbox | host | linux | A-13 | todo |
 | A-15 | Harden served-file open (TOCTOU, special files, leak, logs) | host | linux | A-01 | done (310be446) |
-| A-16 | `workspace.list` exposes repository binding roots | host | linux | A-01, A-02 | todo |
+| A-16 | `workspace.list` exposes repository binding roots | host | linux | A-01, A-02 | in_progress (astra cli-thread-1790352652979-9722438f168ff936) |
+| A-17 | Daemon-native workspace close | host | linux | A-02 | todo |
+| A-18 | Daemon-native subagent open | host | linux | A-02 | todo |
 | W-01 | App Link / universal link files + pair landing page | website | linux | H-03, H-04 | todo |
 | C-01 | Spike: APNs reachability from Workers | cloud | linux | — | done (research; recorded in plan §8, see C-02) |
 | C-02 | Push relay Worker | cloud | linux | C-01, A-12 | blocked: verde-cloud has no remote and its Alchemy baseline is uncommitted; owner to commit/configure (astra cli-thread-1790351701612-fc3bbcd7eb28e252) |
@@ -349,6 +351,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
   - Tests cover each new mapping plus the reachability test.
   - `$ZB headless-test`, `mise run web-app-test` and `$ZB server-test`
     pass.
+- **Done (a570cce2).** New opt-in scopes `process:read`, `process:write`, `device:write` (not in the default grant). Mapped: `provider.threads.list` (`chat:read`), `provider.title.generate` (`chat:write`), `process.list`/`process.definitions` (`process:read`), `process.start`/`restart`/`stop` (`process:write`; the gateway binds `client_id` to the paired session), `daemon.client.register` (`runtime:read`). **Deferred** because their handlers exist only in the desktop GUI (`ipc/server.zig`, plan rule 3): `workspace.create`/`rename` (mobile uses `workspace.upsert`), `workspace.close` (`workspace.upsert` with `archived:true` covers metadata only; full close is A-17), `chat.open_subagent` (A-18), and `terminal.open`/`tail`/`screen`/`write`/`key` (mobile uses `session.create`/`tail`/`screen`/`write`, with keys encoded in the core). `headless-test`, `web-app-test` and `server-test` pass; a daemon dispatch test proves each mapped method has a handler.
 
 #### A-03 · Confined directory-list RPC
 - **depends:** A-02 · **touches:** the daemon dispatch and the gateway
@@ -598,6 +601,18 @@ exact question and stop. Report: commit sha, files changed, verification output,
 - **Done when:** `$ZB daemon-test`, `$ZB headless-test` and
   `mise run web-app-test` pass; a file under a secondary binding root is
   served and one outside all bindings is 403.
+
+#### A-17 · Daemon-native workspace close
+- **depends:** A-02 · **touches:** `packages/desktop/src/terminal/sessionizer.zig` (daemon dispatch), `access_protocol.zig`
+- **Why (A-02):** `workspace.close` is handled only by the desktop GUI. Paired devices can archive through `workspace.upsert {archived:true}`, but that doesn't stop the workspace's sessions or turns the way the GUI close does.
+- **Do:** add a daemon RPC with the GUI's close semantics (archive, stop or detach its sessions, end running turns as the GUI does) that works with the desktop closed; map it to `repository:write`. Make the desktop's close path call it where possible.
+- **Done when:** a daemon test closes a workspace that has a live session and a running turn; `$ZB daemon-test`, `$ZB headless-test` and `mise run web-app-test` pass.
+
+#### A-18 · Daemon-native subagent open
+- **depends:** A-02 · **touches:** `sessionizer.zig`, `access_protocol.zig`
+- **Why (A-02):** `chat.open_subagent` exists only in the desktop GUI; mobile has no daemon equivalent.
+- **Do:** add a daemon RPC that creates a linked child thread (parent link, provider/model, prompt), matching what the web and desktop clients show as subagents; map it to `chat:write`.
+- **Done when:** tests cover link creation and paired-device reachability; `$ZB daemon-test` and `$ZB headless-test` pass.
 
 ### Website / cloud lane
 
