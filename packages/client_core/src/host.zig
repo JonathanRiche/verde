@@ -1,10 +1,12 @@
 //! Transactional, sans-IO host skeleton. Feature engines plug into Transaction;
 //! only a fully encoded batch commits its state and correlation tables.
 const std = @import("std");
+pub const rpc = @import("rpc.zig");
 const profile = @import("verde_remote").profile;
 const A = std.mem.Allocator;
 const V = std.json.Value;
 pub const MAX_INPUT = 1024 * 1024;
+pub const MAX_HTTP_INPUT = 12 * 1024 * 1024;
 pub const MAX_RECEIPTS = 1024;
 pub const MAX_PENDING = 256;
 pub const ApiError = error{ InvalidArgument, UnsupportedVersion, OutOfMemory, InvalidLifecycle, ResourceLimit };
@@ -49,6 +51,7 @@ pub const Pending = struct {
 };
 pub const State = struct {
     config: Config,
+    rpc: rpc.State = .{},
     lifecycle: Lifecycle = .created,
     revision: u64 = 0,
     generation: u64 = 0,
@@ -90,7 +93,8 @@ pub const Host = struct {
     pub fn handle(self: *Host, input: []const u8, output_allocator: A) ApiError![]u8 {
         var tx = try Transaction.init(self);
         defer tx.deinit();
-        const event = try parse(tx.allocator(), input);
+        const event = try parseLimit(tx.allocator(), input, MAX_HTTP_INPUT);
+        if (input.len > MAX_INPUT and !eq(try string(event, "type"), "http_response")) return error.ResourceLimit;
         try tx.apply(event);
         return tx.commit(self, output_allocator);
     }
@@ -111,9 +115,9 @@ pub const Host = struct {
                 .host_id = s.config.host_id,
                 .label = s.config.label,
                 .https_url = s.config.https_url,
-                .runtime_id = @as(?[]const u8, null),
-                .instance_id = @as(?[]const u8, null),
-                .phase = "disabled",
+                .runtime_id = s.rpc.runtime_id,
+                .instance_id = s.rpc.instance_id,
+                .phase = @tagName(s.rpc.phase),
                 .lifecycle = @tagName(s.lifecycle),
                 .auth_state = s.auth_state,
                 .sync_state = if (s.stale) "stale" else "empty",
@@ -121,7 +125,7 @@ pub const Host = struct {
                 .scopes = [0]V{},
                 .retry_at_ms = @as(?i64, null),
                 .trust_proposal = @as(?u8, null),
-                .update_required = false,
+                .update_required = s.rpc.update_required,
                 .@"error" = s.host_error,
             }}, .operations = operations });
         } else if (eq(selector, "home")) {
@@ -208,6 +212,7 @@ pub const Transaction = struct {
 
     pub fn invalidateTransport(self: *Transaction) ApiError!void {
         if (self.state.generation == std.math.maxInt(u64)) return error.ResourceLimit;
+        try rpc.invalidate(self);
         self.state.generation += 1;
         var i: usize = 0;
         while (i < self.state.pending.len) {
@@ -371,6 +376,7 @@ pub const Transaction = struct {
             }
             if (kind == .socket and !eq(tag, "ws_closed")) return;
             try self.remove(i);
+            if (kind == .http and eq(p.key, "rpc")) try rpc.complete(self, id, event);
             if (kind == .timer and self.state.now_ms.? < p.deadline) {
                 // Replacement gives an early delivery a new ID; duplicate early callbacks are stale.
                 try self.setTimer(p.purpose, @intCast(p.deadline - self.state.now_ms.?));
@@ -423,7 +429,10 @@ pub fn mapError(err: anyerror) ApiError {
     };
 }
 pub fn parse(a: A, input: []const u8) ApiError!V {
-    if (input.len > MAX_INPUT) return error.ResourceLimit;
+    return parseLimit(a, input, MAX_INPUT);
+}
+fn parseLimit(a: A, input: []const u8, limit: usize) ApiError!V {
+    if (input.len > limit) return error.ResourceLimit;
     if (!std.unicode.utf8ValidateSlice(input)) return error.InvalidArgument;
     // Bound recursive canonicalization and encoding before creating a DOM.
     var depth: usize = 0;
@@ -448,7 +457,7 @@ pub fn parse(a: A, input: []const u8) ApiError!V {
             depth -= 1;
         }
     }
-    return std.json.parseFromSliceLeaky(V, a, input, .{ .allocate = .alloc_always, .max_value_len = MAX_INPUT }) catch |err| return mapError(err);
+    return std.json.parseFromSliceLeaky(V, a, input, .{ .allocate = .alloc_always, .max_value_len = limit }) catch |err| return mapError(err);
 }
 fn decode(comptime T: type, a: A, value: V) ApiError!T {
     try validateShape(T, value);

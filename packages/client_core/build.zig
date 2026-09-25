@@ -215,6 +215,7 @@ fn createCoreModule(
     const headless = b.createModule(.{ .root_source_file = b.path("../headless/src/root.zig"), .target = target, .optimize = optimize });
     const remote = b.createModule(.{ .root_source_file = b.path("src/shared/root.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "headless", .module = headless }} });
     module.addImport("verde_remote", remote);
+    module.addImport("headless", headless);
     if (target.result.abi.isAndroid()) module.linkSystemLibrary("log", .{});
     module.addOptions("build_options", options);
     return module;

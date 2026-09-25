@@ -48,11 +48,11 @@ fn setStatus(env: Env, out: jobject, code: i32) bool {
     function(*const fn (Env, jobject, i32, i32, *const i32) callconv(.c) void, env, 211)(env, out, 0, 1, &code);
     return !exception(env);
 }
-fn copyInput(env: Env, array: jobject) core.ApiError![]u8 {
+fn copyInput(env: Env, array: jobject, limit: usize) core.ApiError![]u8 {
     if (array == null) return error.InvalidArgument;
     const len = length(env, array);
     if (exception(env) or len < 0) return error.InvalidArgument;
-    if (len > core.MAX_INPUT) return error.ResourceLimit;
+    if (len > limit) return error.ResourceLimit;
     const bytes = try std.heap.c_allocator.alloc(u8, @intCast(len));
     errdefer std.heap.c_allocator.free(bytes);
     function(*const fn (Env, jobject, i32, i32, [*]u8) callconv(.c) void, env, 200)(env, array, 0, len, bytes.ptr);
@@ -74,7 +74,7 @@ fn hostPointer(token: i64) ?*core.Host {
 /// status must have at least one element; receives the exact vc_status.
 pub fn hostNew(env: Env, _: jclass, array: jobject, out_status: jobject) callconv(.c) i64 {
     if (!setStatus(env, out_status, 1)) return 0;
-    const bytes = copyInput(env, array) catch |err| {
+    const bytes = copyInput(env, array, core.MAX_INPUT) catch |err| {
         _ = setStatus(env, out_status, abi.status(err));
         return 0;
     };
@@ -103,7 +103,7 @@ pub fn hostQuery(env: Env, _: jclass, token: i64, array: jobject, out_status: jo
 fn hostCall(env: Env, token: i64, array: jobject, out_status: jobject, query: bool) jobject {
     if (!setStatus(env, out_status, 1)) return null;
     const host = hostPointer(token) orelse return null;
-    const input = copyInput(env, array) catch |err| {
+    const input = copyInput(env, array, if (query) core.MAX_INPUT else core.MAX_HTTP_INPUT) catch |err| {
         _ = setStatus(env, out_status, abi.status(err));
         return null;
     };
