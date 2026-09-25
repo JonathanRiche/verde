@@ -7162,16 +7162,29 @@ pub const AppState = struct {
             return false;
         }
 
+        self.project_controller.archived_projects.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+            self.setSidebarNotice(@errorName(err));
+            return false;
+        };
+        // The daemon owns the durable busy check, PTY teardown and archive
+        // (shared with paired devices). It runs before any local mutation so a
+        // rejection leaves this workspace untouched.
+        if (self.project_controller.projects.items[index].herdr_link == null) {
+            _ = self.storage.closeWorkspace(self.project_controller.projects.items[index].id) catch |err| {
+                self.setSidebarNotice(if (err == error.WorkspaceBusy)
+                    "Stop this workspace's running requests and background tasks before closing it."
+                else
+                    "Workspace close failed.");
+                return false;
+            };
+        }
+
         self.cancelThreadImport();
         const closed_selected_project = self.project_controller.selected_index == index;
         const closed_active_browser = if (self.browser_controller.runtime_project_index) |runtime_index|
             runtime_index == index
         else
             false;
-        self.project_controller.archived_projects.ensureUnusedCapacity(self.allocator, 1) catch |err| {
-            self.setSidebarNotice(@errorName(err));
-            return false;
-        };
         if (!self.prepareProjectTerminalSessionsForTeardown(index, .workspace_closed)) {
             self.setSidebarNotice("Failed to retain workspace terminal lifecycle.");
             return false;

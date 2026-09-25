@@ -262,7 +262,7 @@ const PROCESS_READ: u16 = scopeBit(.process_read);
 const PROCESS_WRITE: u16 = scopeBit(.process_write);
 
 /// The complete paired-session allowlist. Every entry must be dispatched by
-/// the runtime daemon. Desktop-only workspace.create/rename/close,
+/// the runtime daemon. Desktop-only workspace.create/rename,
 /// chat.open_subagent and terminal.open/tail/screen/write/key are intentionally
 /// excluded: they need the desktop app. Mobile uses workspace.upsert,
 /// chat.thread.* and session.* instead; GUI-only lifecycle gaps need new RPCs.
@@ -346,6 +346,7 @@ pub const PAIRED_RPC_METHODS = [_]PairedRpcMethod{
     .{ .method = "workspace.directory.list", .scope_mask = REPOSITORY_READ },
     .{ .method = "workspace.files.search", .scope_mask = REPOSITORY_READ },
 
+    .{ .method = "workspace.close", .scope_mask = REPOSITORY_WRITE },
     .{ .method = "workspace.upsert", .scope_mask = REPOSITORY_WRITE },
     .{ .method = "workspace.repository.upsert", .scope_mask = REPOSITORY_WRITE },
     .{ .method = "workspace.repository.remove", .scope_mask = REPOSITORY_WRITE },
@@ -869,6 +870,7 @@ test "new access scopes are opt-in and preserve stored scope bits" {
 
 test "P2 daemon RPC mappings require their exact scopes and desktop methods stay excluded" {
     const cases = .{
+        .{ "workspace.close", Scope.repository_write },
         .{ "provider.threads.list", Scope.chat_read },
         .{ "provider.title.generate", Scope.chat_write },
         .{ "process.list", Scope.process_read },
@@ -880,10 +882,11 @@ test "P2 daemon RPC mappings require their exact scopes and desktop methods stay
     };
     inline for (cases) |case| try std.testing.expectEqual(scopeBit(case[1]), requiredScopeMaskForRpc(case[0]).?);
     for ([_][]const u8{
-        "workspace.create", "workspace.rename",   "workspace.close", "chat.open_subagent",
-        "terminal.open",    "terminal.tail",      "terminal.screen", "terminal.write",
-        "terminal.key",     "workspaces",         "panes",           "chat.status",
-        "config.ui.set",    "web.directory.list",
+        "workspace.create",   "workspace.rename", "chat.open_subagent",
+        "terminal.open",      "terminal.tail",    "terminal.screen",
+        "terminal.write",     "terminal.key",     "workspaces",
+        "panes",              "chat.status",      "config.ui.set",
+        "web.directory.list",
     }) |method| try std.testing.expect(requiredScopeMaskForRpc(method) == null);
 }
 

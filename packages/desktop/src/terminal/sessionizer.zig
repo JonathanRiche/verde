@@ -2430,6 +2430,9 @@ pub const Daemon = struct {
     /// Serializes verde.json snapshots and web-originated favorite updates.
     /// It is independent of lockDaemon so filesystem I/O never delays chat.
     config_mutex: ParkingMutex = .{},
+    /// Serializes workspace close with chat-turn admission. Taken before
+    /// lockDaemon/store locks, never while holding them.
+    workspace_lifecycle_mutex: ParkingMutex = .{},
     idle_since_ms: ?i64 = null,
     /// null = persistent (no idle exit). Tests set VERDE_SESSION_DAEMON_IDLE_EXIT_MS.
     idle_exit_ms: ?i64 = null,
@@ -2894,6 +2897,7 @@ pub const Daemon = struct {
         // Store methods own their drain/capability precedence and unlock
         // lockDaemon for SQLite work; route before the generic mutator drain gate.
         if (std.mem.eql(u8, method, directory_browser.METHOD)) return try workspaceDirectoryListResponse(self, id_value, params);
+        if (std.mem.eql(u8, method, "workspace.close")) return try self.workspaceCloseResponse(id_value, params);
         if (isStoreMethod(method)) return try self.handleStoreRequest(id_value, method, params);
         if (isPushMethod(method)) return try self.handlePushRequest(id_value, method, params);
         if (isAccessMethod(method)) return try self.handleAccessRequest(id_value, method, params);
@@ -6924,6 +6928,93 @@ pub const Daemon = struct {
         }
     }
 
+    /// Close by stable workspace_id (legacy web clients send workspace).
+    /// workspace_busy carries pending_turns/running_tasks without side effects;
+    /// successful close archives and requests the same PTY termination as GUI.
+    fn workspaceCloseResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        if (params != .object) return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "workspace.close requires workspace_id");
+        const workspace_id = jsonString(params.object.get("workspace_id") orelse params.object.get("workspace") orelse .null) orelse
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "workspace.close requires workspace_id");
+        if (workspace_id.len == 0) return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "workspace_id cannot be empty");
+        self.workspace_lifecycle_mutex.lock();
+        defer self.workspace_lifecycle_mutex.unlock();
+        lockDaemon(self);
+        if (!self.accepting_mutations) {
+            self.mutex.unlock();
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "daemon is preparing shutdown");
+        }
+        const service = self.store_service orelse {
+            self.mutex.unlock();
+            return try storeErrorResponse(self.allocator, id_value, error.StoreUnavailable);
+        };
+        _ = service.in_flight.fetchAdd(1, .monotonic);
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        var pending_turn_ids: std.ArrayList([]const u8) = .empty;
+        for (self.chat_turns.items) |turn| {
+            if (!std.mem.eql(u8, turn.workspace_id, workspace_id)) continue;
+            lockTurn(turn);
+            const pending = switch (chatTurnPublishedStatus(turn)) {
+                .running, .waiting_approval => true,
+                else => false,
+            };
+            if (pending) {
+                const owned_id = arena.allocator().dupe(u8, turn.turn_id) catch |err| {
+                    turn.mutex.unlock();
+                    self.mutex.unlock();
+                    _ = service.in_flight.fetchSub(1, .monotonic);
+                    return err;
+                };
+                pending_turn_ids.append(arena.allocator(), owned_id) catch |err| {
+                    turn.mutex.unlock();
+                    self.mutex.unlock();
+                    _ = service.in_flight.fetchSub(1, .monotonic);
+                    return err;
+                };
+            }
+            turn.mutex.unlock();
+        }
+        self.mutex.unlock();
+        defer _ = service.in_flight.fetchSub(1, .monotonic);
+        const result = blk: {
+            lockStoreService(service);
+            defer service.mutex.unlock();
+            const closed = service.store.closeWorkspace(workspace_id, pending_turn_ids.items) catch |err|
+                return try storeErrorResponse(self.allocator, id_value, err);
+            // Publish before releasing the store lock, like commit hooks, so
+            // later mutations cannot overtake this durable revision.
+            if (closed.applied) self.appendJournalEntry(.workspace, workspace_id, workspace_id, .{ .store = closed.store_revision });
+            break :blk closed;
+        };
+        if (result.pending_turns != 0 or result.running_tasks != 0) {
+            const data_json = try std.json.Stringify.valueAlloc(self.allocator, .{
+                .pending_turns = result.pending_turns,
+                .running_tasks = result.running_tasks,
+            }, .{});
+            defer self.allocator.free(data_json);
+            var data = try std.json.parseFromSlice(std.json.Value, self.allocator, data_json, .{});
+            defer data.deinit();
+            return try errorResponseAllocWithData(self.allocator, id_value, "workspace_busy", "Stop this workspace's running requests and background tasks before closing it.", data.value);
+        }
+        // Like GUI teardown, signal live PTYs and retain ownership until the
+        // normal drain observes exit. Never wait for a child under lockDaemon.
+        lockDaemon(self);
+        for (self.sessions.items) |session| {
+            if (!std.mem.eql(u8, session.registry_workspace_id orelse session.project_id, workspace_id)) continue;
+            if (session.running and session.terminate()) self.noteSessionExitInRegistry(session, "workspace closed", nowMs());
+        }
+        if (self.registry.workspace(workspace_id)) |workspace| {
+            for (workspace.managed_processes.items) |*process| {
+                process.transition(.stop, nowMs()) catch {};
+                process.explicit_stop = true;
+                process.runtime.explicit_stop = true;
+            }
+        }
+        self.bumpRegistryRevision(.{ .topic = .process, .resource_id = "*", .workspace_id = workspace_id });
+        self.mutex.unlock();
+        return try okValueResponse(self.allocator, id_value, .{ .workspace_id = workspace_id, .archived = true, .store_revision = result.store_revision });
+    }
+
     /// Accept a new turn. Runs unlocked on the serve path (see
     /// `methodRunsUnlocked`) so the MAJOR-R1 ledger identity guard can consult
     /// SQLite under the store service mutex without ever nesting under
@@ -7095,6 +7186,10 @@ pub const Daemon = struct {
             try chat_links.createTask(svc.store.conn, turn.turn_id, turn.workspace_id, turn.local_thread_id, owner, turn.started_at_ms);
         }
 
+        // workspace.close samples chat_turns under this mutex, so admission
+        // cannot slip a turn into a workspace between its busy check and archive.
+        self.workspace_lifecycle_mutex.lock();
+        defer self.workspace_lifecycle_mutex.unlock();
         lockDaemon(self);
         // Re-check after the unlocked ledger window (concurrent start / race).
         if (self.findChatTurn(turn_id)) |existing| {
@@ -12678,7 +12773,7 @@ const ServerRequestClass = enum { slow_registry, store, unlocked_method, normal 
 fn methodRunsUnlocked(method: []const u8) bool {
     // M4-P4: ledger identity guard on accept must read SQLite under the store
     // mutex only; the `.normal` outer lockDaemon window cannot nest that work.
-    return std.mem.eql(u8, method, directory_browser.METHOD) or
+    return std.mem.eql(u8, method, "workspace.close") or std.mem.eql(u8, method, directory_browser.METHOD) or
         std.mem.startsWith(u8, method, "chat.links.") or std.mem.startsWith(u8, method, "chat.tasks.") or
         // Browser history is per-keystroke SQLite work under the store mutex
         // only; it pins in_flight and checks the drain flag itself.
@@ -22256,6 +22351,7 @@ test "P2 paired RPC additions reach the session daemon dispatcher" {
         "process.list",          "process.definitions",
         "process.start",         "process.restart",
         "process.stop",          "daemon.client.register",
+        "workspace.close",
     };
     for (methods) |method| {
         try std.testing.expect(headless.access_protocol.requiredScopeMaskForRpc(method) != null);
@@ -22600,4 +22696,99 @@ test "directory RPC uses durable workspace parents and host roots without deskto
     defer allocator.free(invalid);
     try std.testing.expect(std.mem.indexOf(u8, invalid, "invalid_params") != null);
     try std.testing.expect(methodRunsUnlocked(directory_browser.METHOD));
+}
+
+test "workspace close rejects busy without side effects then terminates sessions and archives" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testStoreDbPath(&tmp);
+    defer a.free(path);
+    var daemon = Daemon.init(a);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, path);
+    defer detachTestStoreService(&daemon);
+    const store = &daemon.store_service.?.store;
+    _ = try store.upsertWorkspace(.{
+        .mutation = .{ .request_key = "close-workspace", .client_id = "test" },
+        .workspace = .{ .workspace_id = "close-ws", .label = "Close", .path = ".", .terminal_layout_json = "{\"tabs\":[{\"nodes\":[{\"session_id\":\"close-session\",\"kind\":\"leaf\"}]}]}" },
+    });
+    const turn = try appendTestChatTurn(&daemon, a, "close-turn", "close-ws", ".", "Close", "test", .running, 1);
+    const created = try testWorkspaceCloseRpc(&daemon,
+        \\{"id":1,"method":"session.create","params":{"id":"close-session","workspace_id":"close-ws","cwd":".","command":["/bin/cat"]}}
+    );
+    defer a.free(created);
+    try std.testing.expect(try testSessionCreateResponseWasCreated(a, created));
+    const session = daemon.find("close-session").?;
+    const revision = try store.storeRevision();
+    const request =
+        \\{"id":2,"method":"workspace.close","params":{"workspace_id":"close-ws"}}
+    ;
+    const rejected = try testWorkspaceCloseRpc(&daemon, request);
+    defer a.free(rejected);
+    var busy = try std.json.parseFromSlice(std.json.Value, a, rejected, .{});
+    defer busy.deinit();
+    const err = busy.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings("workspace_busy", err.get("code").?.string);
+    try std.testing.expectEqual(@as(i64, 1), err.get("data").?.object.get("pending_turns").?.integer);
+    try std.testing.expectEqual(revision, try store.storeRevision());
+    try std.testing.expect(session.running);
+    try std.testing.expect(!turn.cancel_requested);
+    const row = (try store.conn.row("select archived, terminal_layout_json from workspaces where workspace_id = 'close-ws'", .{})).?;
+    try std.testing.expectEqual(@as(i64, 0), row.int(0));
+    try std.testing.expect(std.mem.indexOf(u8, row.text(1), "close-session") != null);
+    row.deinit();
+
+    // The turn ends; a provider background command it left running still
+    // blocks close, exactly like the GUI's transcript-derived task check.
+    turn.status = .completed;
+    turn.worker_done = true;
+    _ = try store.upsertThread(.{
+        .mutation = .{ .request_key = "close-thread", .client_id = "test" },
+        .workspace_id = "close-ws",
+        .thread = .{ .local_thread_id = "close-thread", .title = "Close" },
+    });
+    _ = try store.appendMessage(.{
+        .mutation = .{ .request_key = "close-bg-start", .client_id = "test" },
+        .workspace_id = "close-ws",
+        .thread_id = "close-thread",
+        .message = .{ .message_id = "close-bg-start", .role = "system", .author = "Background command", .body = "sleep 30\n\nVerde task ID: close-bg" },
+    });
+    const task_revision = try store.storeRevision();
+    const task_rejected = try testWorkspaceCloseRpc(&daemon, request);
+    defer a.free(task_rejected);
+    try std.testing.expect(std.mem.indexOf(u8, task_rejected, "\"workspace_busy\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, task_rejected, "\"pending_turns\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, task_rejected, "\"running_tasks\":1") != null);
+    try std.testing.expectEqual(task_revision, try store.storeRevision());
+    try std.testing.expect(session.running);
+    _ = try store.appendMessage(.{
+        .mutation = .{ .request_key = "close-bg-done", .client_id = "test" },
+        .workspace_id = "close-ws",
+        .thread_id = "close-thread",
+        .message = .{ .message_id = "close-bg-done", .sort_index = 1, .role = "system", .author = "Background task completed", .body = "sleep 30\n\nVerde task ID: close-bg" },
+    });
+    const revision_before_close = try store.storeRevision();
+    const closed = try testWorkspaceCloseRpc(&daemon, request);
+    defer a.free(closed);
+    try std.testing.expect(std.mem.indexOf(u8, closed, "\"archived\":true") != null);
+    try std.testing.expect(daemon.waitForManagedSessionStopped("close-session", 2000));
+    const archived = (try store.conn.row("select archived, terminal_layout_json from workspaces where workspace_id = 'close-ws'", .{})).?;
+    defer archived.deinit();
+    try std.testing.expectEqual(@as(i64, 1), archived.int(0));
+    try std.testing.expect(std.mem.indexOf(u8, archived.text(1), "close-session") == null);
+    try std.testing.expectEqual(revision_before_close + 1, try store.storeRevision());
+    const again = try testWorkspaceCloseRpc(&daemon,
+        \\{"id":3,"method":"workspace.close","params":{"workspace":"close-ws"}}
+    );
+    defer a.free(again);
+    try std.testing.expect(std.mem.indexOf(u8, again, "\"archived\":true") != null);
+    try std.testing.expectEqual(revision_before_close + 1, try store.storeRevision());
+}
+
+fn testWorkspaceCloseRpc(daemon: *Daemon, request: []const u8) ![]u8 {
+    const owned = try daemon.allocator.dupe(u8, request);
+    defer daemon.allocator.free(owned);
+    return handleSessionizerRequestBytes(daemon, owned);
 }

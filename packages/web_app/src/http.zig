@@ -4014,3 +4014,11 @@ test "paired directory listing uses repository read and the daemon route" {
     try std.testing.expectEqual(@as(PairedRpcPolicy, .{ .authorize = read }), pairedRpcPolicy("workspace.directory.list", read));
     try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy("workspace.directory.list", 0));
 }
+
+test "workspace close is daemon routed and requires repository write" {
+    const write = headless.access_protocol.scopeBit(.repository_write);
+    try std.testing.expect(!blockedRpcMethod("workspace.close"));
+    try std.testing.expect(@import("web_runtime").allowedMethod("workspace.close"));
+    try std.testing.expectEqual(@as(PairedRpcPolicy, .{ .authorize = write }), pairedRpcPolicy("workspace.close", write));
+    try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy("workspace.close", headless.access_protocol.scopeBit(.repository_read)));
+}

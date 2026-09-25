@@ -449,6 +449,33 @@ pub const Storage = struct {
         return loaded;
     }
 
+    /// Runs the daemon-owned `workspace.close` (busy check, PTY teardown,
+    /// archive). Returns false when the daemon predates the RPC or has no row
+    /// for this workspace (never persisted) so the GUI close proceeds locally.
+    /// Busy and transport failures must never fall through.
+    pub fn closeWorkspace(self: *const Storage, workspace_id: []const u8) !bool {
+        // Unit tests never reach a live daemon; the GUI path stays local there.
+        if (builtin.is_test) return false;
+        // Offline, the GUI keeps its pre-daemon close (unsaved until the
+        // daemon returns) instead of refusing to close.
+        if (!self.isPersistenceAvailable()) return false;
+        var transport: daemon_client.HeadlessTransport = .{ .allocator = self.allocator, .pref_path = self.pref_path, .timeout_ms = 5_000 };
+        var client = daemon_client.headlessClient(self.allocator, &transport);
+        self.beginSelfProjectionWrite();
+        defer self.endSelfProjectionWrite();
+        var parsed = try client.call("workspace.close", .{ .workspace_id = workspace_id });
+        defer parsed.deinit();
+        if (parsed.response.err) |err| {
+            if (std.mem.eql(u8, err.code, "workspace_busy")) return error.WorkspaceBusy;
+            if (std.mem.eql(u8, err.code, "unknown_method") or std.mem.eql(u8, err.code, "method_not_found") or
+                std.mem.eql(u8, err.code, "resource_not_found")) return false;
+            return error.WorkspaceCloseFailed;
+        }
+        // The local archive and terminal layout still go through the normal
+        // projection flush; do not mark the whole projection observed here.
+        return true;
+    }
+
     /// Closes one thread in the daemon so it leaves the composite snapshot.
     /// No revision guard: closing is idempotent and never races a flush for
     /// the same outcome (an omitted committed row is left alone by replace).

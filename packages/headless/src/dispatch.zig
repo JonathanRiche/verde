@@ -50,6 +50,7 @@ const MUTATING_METHODS = [_][]const u8{
     "daemon.stop",
     // Full store mutation surface.
     "state.snapshot.replace",
+    "workspace.close",
     "workspace.upsert",
     "workspace.repository.upsert",
     "workspace.repository.remove",
@@ -451,6 +452,7 @@ test "reads are not mutators and store mutators drain" {
     // Full store mutation surface must drain with the rest of the mutator set.
     const store_mutators = [_][]const u8{
         "state.snapshot.replace",
+        "workspace.close",
         "workspace.upsert",
         "workspace.repository.upsert",
         "workspace.repository.remove",

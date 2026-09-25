@@ -8,6 +8,8 @@ const std = @import("std");
 const zqlite = @import("zqlite");
 const headless = @import("headless");
 
+const background_tasks = @import("../chat/background_tasks.zig");
+const db_types = @import("../db/types.zig");
 const schema = @import("../db/schema.zig");
 const access_store = @import("access_store.zig");
 const connect_store = @import("connect_store.zig");
@@ -553,6 +555,135 @@ pub const Store = struct {
     /// Return the durable revision currently recorded by the store.
     pub fn storeRevision(self: *const Self) StoreError!u64 {
         return self.readStoreRevision() catch |err| return mapStoreError(err);
+    }
+
+    pub const WorkspaceCloseResult = struct {
+        applied: bool = false,
+        pending_turns: usize,
+        running_tasks: usize,
+        store_revision: u64,
+    };
+
+    /// Check busy state and archive without replacing unrelated workspace data.
+    /// The daemon serializes turn admission around this transaction.
+    pub fn closeWorkspace(self: *Self, workspace_id: []const u8, pending_turn_ids: []const []const u8) StoreError!WorkspaceCloseResult {
+        return self.closeWorkspaceInternal(workspace_id, pending_turn_ids) catch |err| return mapStoreError(err);
+    }
+
+    fn closeWorkspaceInternal(self: *Self, workspace_id: []const u8, pending_turn_ids: []const []const u8) !WorkspaceCloseResult {
+        try self.conn.execNoArgs("begin immediate");
+        var committed = false;
+        defer if (!committed) self.conn.rollback();
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const archived, const layout_json, const docks_json = blk: {
+            const workspace = (try self.conn.row("select archived, terminal_layout_json, terminal_docks_json from workspaces where workspace_id = ?1", .{workspace_id})) orelse return error.ResourceNotFound;
+            defer workspace.deinit();
+            break :blk .{
+                workspace.int(0) != 0,
+                if (workspace.nullableText(1)) |text| try a.dupe(u8, text) else null,
+                if (workspace.nullableText(2)) |text| try a.dupe(u8, text) else null,
+            };
+        };
+        // chat_tasks rows mirror delegated turns (task_id == turn_id), so the
+        // turn ledger already covers them; counting both would double-report.
+        const counts = (try self.conn.row(
+            "select count(*) from chat_turns where workspace_id = ?1 and status in ('accepted','running','waiting_approval')",
+            .{workspace_id},
+        )).?;
+        defer counts.deinit();
+        var result: WorkspaceCloseResult = .{
+            .pending_turns = @intCast(counts.int(0)),
+            .running_tasks = try self.runningBackgroundTaskCount(workspace_id),
+            .store_revision = try self.storeRevision(),
+        };
+        // Admission can precede its durable acceptance. Count the union of
+        // volatile and durable running turns without double-counting either.
+        for (pending_turn_ids) |turn_id| {
+            const durable = try self.conn.row("select 1 from chat_turns where turn_id = ?1 and workspace_id = ?2 and status in ('accepted','running','waiting_approval')", .{ turn_id, workspace_id });
+            if (durable) |row| row.deinit() else result.pending_turns += 1;
+        }
+        if (result.pending_turns != 0 or result.running_tasks != 0) return result;
+        if (!archived) {
+            result.applied = true;
+            const layout = try closedTerminalLayout(a, layout_json, false);
+            const docks = try closedTerminalLayout(a, docks_json, true);
+            try self.conn.exec("update workspaces set archived = 1, terminal_layout_json = ?2, terminal_docks_json = ?3 where workspace_id = ?1", .{ workspace_id, layout, docks });
+            result.store_revision = std.math.add(u64, result.store_revision, 1) catch return error.StoreUnavailable;
+            const revision_sql = std.math.cast(i64, result.store_revision) orelse return error.StoreUnavailable;
+            try self.conn.exec("update store_state set store_revision = ?1 where id = 1", .{revision_sql});
+        }
+        try self.conn.commit();
+        committed = true;
+        return result;
+    }
+
+    /// Drops terminal session ids, as GUI teardown does, so a reopened
+    /// workspace starts fresh shells. Unparseable layouts are kept verbatim.
+    fn closedTerminalLayout(allocator: std.mem.Allocator, raw: ?[]const u8, docks: bool) !?[]const u8 {
+        const text = raw orelse return null;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, text, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return text,
+        };
+        defer parsed.deinit();
+        if (docks and parsed.value == .array) {
+            for (parsed.value.array.items) |*dock| {
+                if (dock.* != .object) continue;
+                if (dock.object.getPtr("layout")) |layout| {
+                    if (layout.* == .string) layout.* = .{ .string = (try closedTerminalLayout(allocator, layout.string, false)).? };
+                }
+            }
+        } else clearTerminalSessionIds(&parsed.value);
+        return try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
+    }
+
+    fn clearTerminalSessionIds(value: *std.json.Value) void {
+        if (value.* != .object) return;
+        const tabs = value.object.getPtr("tabs") orelse return;
+        if (tabs.* != .array) return;
+        for (tabs.array.items) |*tab| {
+            if (tab.* != .object) continue;
+            const nodes = tab.object.getPtr("nodes") orelse continue;
+            if (nodes.* != .array) continue;
+            for (nodes.array.items) |*node| {
+                if (node.* != .object) continue;
+                if (node.object.getPtr("session_id")) |id| id.* = .null;
+            }
+        }
+    }
+
+    /// Replays the GUI's transcript-derived provider background tasks (see
+    /// ChatThread.rebuildBackgroundTasksFromMessages) per thread. Only the
+    /// reducer's event authors are read, so ordinary transcript bodies stay on disk.
+    fn runningBackgroundTaskCount(self: *Self, workspace_id: []const u8) !usize {
+        var rows = try self.conn.rows(
+            \\select m.thread_id, m.role, m.author, m.body from messages m
+            \\join threads t on t.id = m.thread_id join workspaces w on w.id = t.workspace_id
+            \\where w.workspace_id = ?1 and m.author in ('Background command', 'Backgrounded command',
+            \\  'Background task completed', 'Background task failed', 'Background task stopped',
+            \\  'Conversation interrupted', '__verde_codex_background_snapshot')
+            \\order by m.thread_id, m.sort_index
+        ,
+            .{workspace_id},
+        );
+        defer rows.deinit();
+        var replay: background_tasks.Replay = .{};
+        defer replay.deinit(self.allocator);
+        var thread_id: ?i64 = null;
+        var count: usize = 0;
+        while (rows.next()) |row| {
+            if (thread_id != null and thread_id.? != row.int(0)) {
+                count += replay.runningCount();
+                replay.deinit(self.allocator);
+                replay = .{};
+            }
+            thread_id = row.int(0);
+            if (db_types.decodeStoredChatRole(row.int(1), row.text(2)) == .system) try replay.apply(self.allocator, row.text(2), row.text(3));
+        }
+        if (rows.err) |err| return err;
+        return count + replay.runningCount();
     }
 
     /// Apply one supported mutation serially and return its durable receipt.
@@ -9736,4 +9867,41 @@ test "thread sync replaces durable history atomically and preserves metadata" {
     const row = (try store.conn.row("select body from messages order by sort_index", .{})).?;
     defer row.deinit();
     try std.testing.expectEqualStrings("question", row.text(0));
+}
+
+test "workspace close replays provider background tasks and preserves other workspaces" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testDbPath(&tmp);
+    defer a.free(path);
+    var store = try Store.init(a, path);
+    defer store.deinit();
+    _ = try store.upsertWorkspace(.{ .mutation = testHeader("close-ws", null), .workspace = testWorkspace("ws", "WS") });
+    _ = try store.upsertWorkspace(.{ .mutation = testHeader("other-ws", null), .workspace = testWorkspace("other", "Other") });
+    _ = try store.upsertThread(.{ .mutation = testHeader("close-thread", null), .workspace_id = "ws", .thread = testThread("thread", "Thread") });
+    const body = "sleep 30\n\nProvider: codex\nProvider thread ID: provider-thread\nCodex item ID: item-1\nProcess ID: process-1";
+    _ = try store.appendMessage(.{ .mutation = testHeader("bg-start", null), .workspace_id = "ws", .thread_id = "thread", .message = .{
+        .message_id = "bg-start",
+        .role = "system",
+        .author = "Background command",
+        .body = body,
+    } });
+    const revision = try store.storeRevision();
+    const busy = try store.closeWorkspace("ws", &.{});
+    try std.testing.expectEqual(@as(usize, 1), busy.running_tasks);
+    try std.testing.expectEqual(revision, try store.storeRevision());
+    try std.testing.expectError(error.ResourceNotFound, store.closeWorkspace("missing", &.{}));
+    _ = try store.appendMessage(.{ .mutation = testHeader("bg-snapshot", null), .workspace_id = "ws", .thread_id = "thread", .message = .{
+        .message_id = "bg-snapshot",
+        .sort_index = 1,
+        .role = "system",
+        .author = "__verde_codex_background_snapshot",
+        .body = "Provider thread ID: provider-thread",
+    } });
+    const closed = try store.closeWorkspace("ws", &.{});
+    try std.testing.expectEqual(@as(usize, 0), closed.running_tasks);
+    const row = (try store.conn.row("select archived from workspaces where workspace_id = 'other'", .{})).?;
+    defer row.deinit();
+    try std.testing.expectEqual(@as(i64, 0), row.int(0));
 }
