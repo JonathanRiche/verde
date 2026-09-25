@@ -119,3 +119,13 @@ run = "bash -c 'export ANDROID_NDK_HOME=\"${ANDROID_NDK_HOME:-${ANDROID_HOME:-$H
 description = "Builds the arm64 iOS device and simulator VerdeClient.xcframework using the selected Xcode SDKs."
 dir = "packages/client_core"
 run = "zig build ios-xcframework --release=safe"
+
+[tasks.mobile-ios-build]
+description = "Generates and builds the iOS app and notification extension for the simulator without signing."
+depends = ["mobile-core-ios"]
+run = "bash packages/mobile_ios/scripts/xcode.sh build"
+
+[tasks.mobile-ios-test]
+description = "Runs the iOS core-link XCTest on a disposable simulator without signing."
+depends = ["mobile-core-ios"]
+run = "bash packages/mobile_ios/scripts/xcode.sh test"
