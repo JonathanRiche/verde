@@ -365,10 +365,28 @@ The relay is a Cloudflare Worker next to the existing Alchemy stack in
 verde-cloud. It needs an FCM service account (Phase 6) and an APNs `.p8` key
 (Phase 8) as Worker secrets.
 
-**Check before building the relay:** APNs only accepts HTTP/2, and Worker
-outbound `fetch` may not reach it directly. If it can't, send iOS pushes
-through FCM too: upload the APNs key to Firebase, and the iOS app uses
-FirebaseMessaging tokens. The rest of the design is unchanged.
+**Decision (C-01, 2026-09-25): iOS goes direct to APNs from the relay;
+FCM is Android-only.** Production Workers `fetch()` reaches APNs: subrequests
+leave through Cloudflare's proxy stack, which negotiates HTTP/2 with the
+origin via ALPN, so the HTTP/2-only endpoint accepts them. Evidence: the
+workerd maintainer's statement plus the reporter's production result in
+cloudflare/workerd#4841 (Aug 2025), workerd#5266 ("fetch in a real Worker
+uses HTTP/2 when possible"), and the MIT `@fivesheepco/cloudflare-apns2`
+client, which is a plain `fetch()` to `api.push.apple.com:443` plus a
+WebCrypto ES256 JWT. Caveats: this is edge behaviour, not a documented
+Workers guarantee, and local `wrangler dev` / workerd is HTTP/1.1-only with no
+plans to change, so APNs is mocked in tests and smoke-tested only on a
+deployed preview; C-02 begins by running the sandbox probe once on our
+account and recording the `reason` response. The Sockets API is not a
+fallback (no HTTP/2 client exists for it). Payload shape for both paths: a
+placeholder `aps.alert` ("A Verde chat needs attention") plus
+`mutable-content: 1` so the NSE swaps in the decrypted content,
+`apns-priority: 10`, `apns-collapse-id`, at most 4 KB; the relay stores the
+APNs `environment` (production/sandbox) with each iOS token. Fallback if the
+HTTP/2 path ever regresses: FCM HTTP v1 with the `.p8` uploaded to Firebase
+(4096-byte limit; data-only iOS messages are forced to priority 5, so the
+placeholder alert is required there too). That is a relay-side backend swap
+plus an iOS token-type change in the app.
 
 ## 9. Phases
 

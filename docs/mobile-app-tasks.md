@@ -131,7 +131,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | A-13 | Push outbox + `device.push.*` RPCs | host | linux | A-02, A-12 | todo |
 | A-14 | Attention events → outbox | host | linux | A-13 | todo |
 | W-01 | App Link / universal link files + pair landing page | website | linux | H-03, H-04 | todo |
-| C-01 | Spike: APNs reachability from Workers | cloud | linux | — | in_progress (orchestrator research subagent) |
+| C-01 | Spike: APNs reachability from Workers | cloud | linux | — | done (research; recorded in plan §8, see C-02) |
 | C-02 | Push relay Worker | cloud | linux | C-01, A-12 | todo |
 | C-03 | Demo runtime for store review | cloud | linux | A-09 | todo |
 | K-01 | Core skeleton + Android toolchain proof | core | linux | — | in_progress (cli-thread-1790350345069-6d46ff988958492f) |
@@ -271,8 +271,11 @@ exact question and stop. Report: commit sha, files changed, verification output,
   2. Download `google-services.json` and keep it **outside** the repo; the
      build reads its path from an environment variable.
   3. Create a service-account key for FCM HTTP v1.
-  4. Create an APNs Auth Key (`.p8`) in the Apple portal. If C-01 decides
-     iOS goes through FCM, upload the key to Firebase.
+  4. Create an APNs Auth Key (`.p8`) in the Apple portal and note its Key
+     ID and the Team ID. C-01 decided iOS goes **direct to APNs** from the
+     relay, so the key becomes a Worker secret (C-02) and is **not**
+     uploaded to Firebase. Firebase is needed for the Android app and the
+     FCM service account only.
 - **Done when:** the files are stored where C-02/D-14 expect them (paths
   given by those tasks) and none of them is in git.
 
@@ -526,6 +529,10 @@ exact question and stop. Report: commit sha, files changed, verification output,
   Record the result in `mobile-app-plan.md` §8 and in C-02/I-10.
 - **Done when:** the decision is written down with evidence (a doc link or
   a spike result).
+- **Result (2026-09-25): direct APNs works from deployed Workers** (edge
+  negotiates HTTP/2 to origin; workerd#4841, workerd#5266,
+  `@fivesheepco/cloudflare-apns2`), not from `wrangler dev`. Decision and
+  caveats are in plan §8. Follow-ups are folded into C-02, I-10 and H-05.
 
 #### C-02 · Push relay Worker
 - **depends:** C-01, A-12 · **touches:** `verde-cloud` (read its
@@ -534,12 +541,27 @@ exact question and stop. Report: commit sha, files changed, verification output,
   - `POST /v1/register {platform, push_token}` returns `{send_token}`: an
     HMAC-bound, revocable capability for that one token. D1 stores only a
     token hash mapped to the push token.
-  - `POST /v1/send {send_token, ciphertext, collapse_id}` →
-    FCM HTTP v1 (and APNs or FCM-for-iOS per C-01). High priority,
-    `mutable-content` for the iOS NSE.
+  - `POST /v1/send {send_token, ciphertext, collapse_id}` → a
+    `PushBackend` interface with two implementations chosen by the
+    registration's `platform`: **FCM HTTP v1 for Android** and **direct APNs
+    for iOS** (per C-01: plain `fetch()` to `api.push.apple.com` /
+    `api.sandbox.push.apple.com` with a WebCrypto ES256 JWT cached and
+    refreshed under 50 minutes; `apns-push-type: alert`, `apns-priority: 10`,
+    `apns-collapse-id`, `apns-topic` = bundle id). Both send a placeholder
+    `aps.alert` plus `mutable-content: 1` and the ciphertext under a custom
+    key, at most 4 KB.
+  - iOS registrations carry `environment: "production" | "sandbox"` (debug
+    builds get sandbox tokens); store it with the token hash and pick the
+    APNs host from it.
+  - **First step:** deploy the C-01 probe Worker once (throwaway `wrangler`
+    project, sandbox host, all-zero token) and record the APNs JSON `reason`
+    in the task report; then delete it. `wrangler dev` cannot reach APNs, so
+    unit tests mock both backends.
   - `DELETE /v1/register`.
   - Per-token and per-IP rate limits. Return 410 when the push token is
-    invalid. No content logging.
+    invalid (FCM `UNREGISTERED`/404 or `INVALID_ARGUMENT` with a valid
+    payload; APNs 400 `BadDeviceToken` / 410 `Unregistered`). No content
+    logging.
   - Secrets (FCM service account, APNs key) are Worker secrets from H-05.
 - **Done when:** unit tests use mocked FCM/APNs; `bun run check` passes in
   verde-cloud. Deploy only when the owner says so (human-verify).
@@ -1016,10 +1038,15 @@ Shared rules:
 #### I-10 · Push + NSE + actionable notifications
 - **depends:** I-05, K-17, C-02, H-05
 - **Do:**
-  - APNs (or FCM-for-iOS per C-01) → relay register → `send_token` →
-    X25519 key in the shared Keychain access group → `device.push.register`.
+  - Native APNs only (no Firebase SDK in the iOS target or the NSE, per
+    C-01): `UNUserNotificationCenter` + the raw device token from
+    `didRegisterForRemoteNotificationsWithDeviceToken` (hex) and the build's
+    APNs environment → relay register → `send_token` → X25519 key in the
+    shared Keychain access group → `device.push.register`.
   - The NSE links a minimal core slice and decrypts with `vc_push_open`
-    (mind the NSE memory limit).
+    (mind the NSE memory limit). It replaces the relay's placeholder alert;
+    if decryption fails the placeholder ("A Verde chat needs attention")
+    shows as-is.
   - Categories:
     - Approve/Deny use `.authenticationRequired` (lock screen after Face
       ID, decision 5).
