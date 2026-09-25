@@ -152,11 +152,11 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | K-12 | Terminal handle + PTY pump | core | linux | K-06 | todo |
 | K-13 | Allowlist coverage test | core | linux | K-10, A-02 | todo |
 | K-14 | Contract suite vs real gateway + daemon | core | linux | K-10 | todo |
-| K-15 | Kotlin/Swift model codegen from Zig types | core | linux | K-06 | in_progress (astra cli-thread-1790357480032-7a74f77336fa56ea) |
+| K-15 | Kotlin/Swift model codegen from Zig types | core | linux | K-06 | done (fdb77f3d) |
 | K-16 | Delta-mode sync | core | linux | K-09, A-11 | todo |
 | K-17 | Attention state machine + push decrypt | core | linux | K-09, A-12 | todo |
 | D-01 | Android project scaffold | android | linux | K-01 | done (ee3c19df; on-device version display pending human-verify) |
-| D-02 | Core bridge + effect executor | android | linux | D-01, K-06, K-15 | todo |
+| D-02 | Core bridge + effect executor | android | linux | D-01, K-06, K-15 | in_progress (astra cli-thread-1790358684331-7bfbe8a46dde9004) |
 | D-03 | Pairing flow | android | linux+phone | D-02, K-07, A-06, H-06, H-07 | todo |
 | D-04 | Hosts list + switcher + sign out | android | linux | D-03, A-04 | todo |
 | D-05 | Home + Workspaces + lifecycle | android | linux+phone | D-04, K-09 | todo |
@@ -173,7 +173,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | D-16 | Maestro flows + UI tests | android | linux+phone | D-08, D-09 | todo |
 | D-17 | Release build + Play internal track | android | linux | D-16, H-03 | todo |
 | I-01 | iOS project scaffold (XcodeGen) | ios | mac | K-02 | done (bdfcfd3e; unsigned simulator only until H-04) |
-| I-02 | Core bridge + effect executor | ios | mac | I-01, K-06, K-15 | todo |
+| I-02 | Core bridge + effect executor | ios | mac | I-01, K-06, K-15 | in_progress (astra cli-thread-1790358685979-0beca7f711e941b3) |
 | I-03 | Pairing flow | ios | mac+phone | I-02, K-07, A-06 | todo |
 | I-04 | Hosts + Home + Workspaces + lifecycle | ios | mac | I-03, D-05 | todo |
 | I-05 | Transcript + diff + approvals | ios | mac | I-04, D-06, D-07, D-09 | todo |
@@ -904,6 +904,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
   with a "do not edit" header.
 - **Done when:** codegen is deterministic and a CI check fails when the
   generated files are stale.
+- **Done (fdb77f3d).** All generated types come from one list, `src/model_registry.zig`, and produce `CoreModels.kt` and `CoreModels.swift`. The generator keeps wire field names and decimal-string counters, and generates codecs for tagged unions. `mise run mobile-models-generate` regenerates the files, and `mise run mobile-models-check` fails when they are stale; it also runs in CI. Codec tests pass on Android (5) and iOS (5). To add a type, append `.{ "NativeName", module.Type }` to the registry and regenerate (`docs/model-codegen.md`). K-09 fills in the empty collection placeholders.
 
 #### K-16 · Delta-mode sync
 - **depends:** K-09, A-11
