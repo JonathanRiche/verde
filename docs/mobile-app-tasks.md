@@ -154,7 +154,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | K-14 | Contract suite vs real gateway + daemon | core | linux | K-10 | done (42fdab6d, 34f0daef) |
 | K-15 | Kotlin/Swift model codegen from Zig types | core | linux | K-06 | done (fdb77f3d) |
 | K-16 | Delta-mode sync | core | linux | K-09, A-11 | done (9418aef0) |
-| K-17 | Attention state machine + push decrypt | core | linux | K-09, A-12 | in_progress (claude opus cli-thread-1790367137391-d31936316ac882ae; also extends sign-out wipe to chat drafts/push records) |
+| K-17 | Attention state machine + push decrypt | core | linux | K-09, A-12 | done (5d80f03d) |
 | D-01 | Android project scaffold | android | linux | K-01 | done (ee3c19df; on-device version display pending human-verify) |
 | D-02 | Core bridge + effect executor | android | linux | D-01, K-06, K-15 | done (0f7fb9c6) |
 | D-03 | Pairing flow | android | linux+phone | D-02, K-07, A-06, H-06, H-07 | done (13f210cf; phone verify pending H-06/H-07; verified App Links need W-01) |
@@ -942,6 +942,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
     app can prompt for an update.
   - Build this small enough for the iOS NSE memory limit.
 - **Done when:** tests use A-12's fixed vectors.
+- **Done (5d80f03d).** New `attention.zig` tracks each thread as unread, needs approval, failed or blocked, and the `home` and `workspaces` rows carry `attention_kind`. The state persists; viewing a thread clears it; the focused thread is suppressed only in the foreground. `vc_push_open` (C and JNI) decrypts push payloads without a running host. It takes JSON holding the envelope, all stored per-host key records and a `recent` dedupe list, and every decrypt failure returns one generic model. The new `push_register` event calls `device.push.register`, and `push_received` covers the push-only `blocked` kind. There is one push key per host, at `vc/1/<host>/push`. The sign-out wipe now covers chat drafts and follow-ups (through a new `chat_index`), push keys and attention records. `mobile-core-test` passes 166, and `mobile-core-android` and `mobile-models-check` pass. Follow-ups: the daemon push payload has no `call_id`, so approve-from-notification must fetch it first; Android and iOS still have to register and forward pushes (D-14/I-10); the iOS extension needs App Group keychain access; the Swift wrapper and `mobile-core-ios` build weren't exercised.
 
 ### Android lane (`packages/mobile_android`)
 
