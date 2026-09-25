@@ -136,7 +136,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | A-18 | Daemon-native subagent open | host | linux | A-02 | todo |
 | W-01 | App Link / universal link files + pair landing page | website | linux | H-03, H-04 | todo |
 | C-01 | Spike: APNs reachability from Workers | cloud | linux | — | done (research; recorded in plan §8, see C-02) |
-| C-02 | Push relay Worker | cloud | linux | C-01, A-12 | human (code done in verde-cloud c16126bd; owner-approved probe run 2026-09-25 was inconclusive (502), diagnostic retry running; production deploy needs H-05 keys) |
+| C-02 | Push relay Worker | cloud | linux | C-01, A-12 | human (code done in verde-cloud c16126bd + redirect fix 566e572; APNs reachability from Workers verified 5a3f208; production deploy waits on H-05 keys + owner deploy approval) |
 | C-03 | Demo runtime for store review | cloud | linux | A-09 | todo |
 | K-01 | Core skeleton + Android toolchain proof | core | linux | — | done (951a5a5a) |
 | K-02 | iOS xcframework toolchain proof | core | mac | K-01, H-01, H-02 | done (e2f73abb) |
@@ -686,6 +686,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
   - Secrets (FCM service account, APNs key) are Worker secrets from H-05.
 - **Done when:** unit tests use mocked FCM/APNs; `bun run check` passes in
   verde-cloud. Deploy only when the owner says so (human-verify).
+- **Probe (verde-cloud 566e572, 5a3f208).** The first owner-approved throwaway probe exposed a relay bug: Workers throws on `redirect: "error"` before sending the request. APNs, FCM OAuth, FCM delivery and the probe now use `redirect: "manual"`, and any 3xx or opaque redirect is a hard failure; tests cover this, and `bun run check` passes 125/0. The fixed probe got a reply from the APNs sandbox: HTTP 403 `MissingProviderToken` with `apns-id` present, which confirms Workers can reach APNs. The probe was deleted, and Cloudflare now returns 10007 for it. The relay is not deployed to production yet.
 - **Status (2026-09-25).** The repo is now the private `JonathanRiche/verde-cloud` (baseline `5e251739`). The relay is `services/push-relay` (`c16126bd`): Worker, D1 migration, HMAC send-token capabilities, IP and device rate limits, FCM and APNs backends, and a probe config. `bun run check` passes: 85 tests, 24 of them relay tests with FCM, APNs and OAuth mocked. Secret scans of the baseline and history were clean. Still open: owner approval to deploy the throwaway APNs probe; then the H-05 credentials, a separate approval for the production deploy, and setting A-13's `DEFAULT_RELAY_URL`.
 
 #### C-03 · Demo runtime for store review
