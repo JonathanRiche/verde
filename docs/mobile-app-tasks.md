@@ -132,8 +132,8 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | A-14 | Attention events → outbox | host | linux | A-13 | done (8832302d) |
 | A-15 | Harden served-file open (TOCTOU, special files, leak, logs) | host | linux | A-01 | done (310be446) |
 | A-16 | `workspace.list` exposes repository binding roots | host | linux | A-01, A-02 | done (fb84ca8c) |
-| A-17 | Daemon-native workspace close | host | linux | A-02 | in_progress (claude opus cli-thread-1790365213012-89bd9f0035e48660; took over paused Codex WIP) |
-| A-18 | Daemon-native subagent open | host | linux | A-02 | todo |
+| A-17 | Daemon-native workspace close | host | linux | A-02 | done (c95ae1d3) |
+| A-18 | Daemon-native subagent open | host | linux | A-02 | in_progress (claude opus cli-thread-1790366343619-3f19839721e6f20f; also rejects chat.turn.start on archived workspaces) |
 | W-01 | App Link / universal link files + pair landing page | website | linux | H-03, H-04 | todo |
 | C-01 | Spike: APNs reachability from Workers | cloud | linux | — | done (research; recorded in plan §8, see C-02) |
 | C-02 | Push relay Worker | cloud | linux | C-01, A-12 | human (code done in verde-cloud c16126bd + redirect fix 566e572; APNs reachability from Workers verified 5a3f208; production deploy waits on H-05 keys + owner deploy approval) |
@@ -619,6 +619,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 - **Do:** add a daemon RPC with the GUI's close semantics (archive, stop or detach its sessions, end running turns as the GUI does) that works with the desktop closed; map it to `repository:write`. Make the desktop's close path call it where possible.
 - **Done when:** a daemon test first rejects close with `workspace_busy` while a turn is running, leaving the workspace intact. After the turn ends, it closes a workspace that has a live session, and asserts the session is terminated and the workspace archived. `$ZB daemon-test`, `$ZB headless-test` and `mise run web-app-test` pass.
 - **Decision (orchestrator):** keep the GUI semantics. `closeProjectAtIndexResult` rejects close while turns are pending or background tasks are running, and never aborts turns. The daemon RPC does the same and returns a structured `workspace_busy` error with counts.
+- **Done (c95ae1d3).** The daemon now handles `workspace.close` (scope `repository:write`) with the GUI's semantics. While turns are pending or background tasks are running, it rejects with `workspace_busy` and `{pending_turns, running_tasks}` and changes nothing. Otherwise it stops live sessions and managed processes, clears saved session IDs, and archives; closing an already-archived workspace is a no-op. A lock serializes the busy check with turn starts. The desktop close path calls the daemon first and falls back to the local close only for an older or offline daemon or an unsaved workspace. The web client now gets the real close. `daemon-test` passes 600/600, and `headless-test`, `web-app-test` and the `dev-build` step pass. Follow-ups: if a background process dies while the desktop is closed, the workspace can't be closed until the desktop runs once (the daemon could check saved PIDs itself). The mobile apps don't call close or handle `workspace_busy` yet (D-10/I-07). A-18 makes `chat.turn.start` reject archived workspaces.
 
 #### A-18 · Daemon-native subagent open
 - **depends:** A-02 · **touches:** `sessionizer.zig`, `access_protocol.zig`
