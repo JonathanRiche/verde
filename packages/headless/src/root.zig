@@ -20,6 +20,7 @@ pub const connect_protocol = @import("connect_protocol.zig");
 pub const attachment_protocol = @import("attachment_protocol.zig");
 pub const dispatch = @import("dispatch.zig");
 pub const client = @import("client.zig");
+pub const push_seal = @import("push_seal.zig");
 // Deliberate second alias for store_protocol: `.store` predates it and is
 // consumed by the daemon store and IT binary; consolidate to one name only
 // when those consumers' owning chunks are free to edit.
