@@ -129,7 +129,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | A-11 | Delta change feed on the gateway | host | linux | A-10 | done (1b1a7d34) |
 | A-12 | Push crypto module (seal/open) | host | linux | — | done (7f5c621f) |
 | A-13 | Push outbox + `device.push.*` RPCs | host | linux | A-02, A-12 | done (8827ee2a) |
-| A-14 | Attention events → outbox | host | linux | A-13 | in_progress (astra cli-thread-1790358124802-9d51ce6223fd6862) |
+| A-14 | Attention events → outbox | host | linux | A-13 | done (8832302d) |
 | A-15 | Harden served-file open (TOCTOU, special files, leak, logs) | host | linux | A-01 | done (310be446) |
 | A-16 | `workspace.list` exposes repository binding roots | host | linux | A-01, A-02 | done (fb84ca8c) |
 | A-17 | Daemon-native workspace close | host | linux | A-02 | todo |
@@ -545,6 +545,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
   in-app notices).
 - **Done when:** tests drive a fake turn through each state and assert the
   outbox rows. `$ZB daemon-test` passes.
+- **Done (8832302d).** All five attention events (completed, failed, aborted, approval pending, `chat.tasks.blocked`) write sealed outbox rows with dedupe key `turn_id:kind`. Snippets are capped at 200 codepoints, within the 2560-byte plaintext limit. Devices whose `last_used_at_ms` is within `ACTIVE_DEVICE_WINDOW_MS` (30 s) are skipped; this is a proxy for WS activity, so a quiet long-lived socket counts as inactive. Exact gateway WS activity is a follow-up. Changes are in `daemon/push.zig` and `sessionizer.zig`. `daemon-test` passes. Delivery still needs C-02's relay URL.
 
 #### A-15 · Harden served-file open (TOCTOU, special files, leak, logs)
 - **depends:** A-01 · **touches:** `packages/web_app/src/served_files.zig`,
