@@ -190,6 +190,9 @@ fn addIosSteps(b: *std.Build, optimize: std.builtin.OptimizeMode, options: *std.
             // Zig 0.16 rejects LLD for Mach-O, including static archives.
             .use_lld = false,
         });
+        // Swift's linker does not supply Zig's f128 JSON-decoding helpers.
+        // Ship compiler-rt inside each self-contained static archive.
+        lib.bundle_compiler_rt = true;
         const install = b.addInstallArtifact(lib, .{
             .dest_dir = .{ .override = .{ .custom = "lib/ios/" ++ slice[0] } },
         });
