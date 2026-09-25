@@ -121,7 +121,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | A-03 | Confined directory-list RPC | host | linux | A-02 | todo |
 | A-04 | Device self-service RPCs | host | linux | A-02 | todo |
 | A-05 | Idempotent pair exchange | host | linux | — | todo |
-| A-06 | Terminal QR + App Link pair URL | host | linux | — | in_progress (astra cli-thread-1790351691709-a61e00e9f6f61aef; resumes ../verde-wt/A-06) |
+| A-06 | Terminal QR + App Link pair URL | host | linux | — | done (b0f6e50b; phone-camera scan pending human-verify) |
 | A-07 | Desktop "Pair a phone" + Paired devices UI | host | linux | A-04, A-06 | todo |
 | A-08 | Web Settings paired-devices list | host | linux | A-04 | todo |
 | A-09 | Pairing presets + access-mode cap | host | linux | A-02, H-08 | todo |
@@ -404,6 +404,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
   - `$ZB server-test` passes.
   - Manual check: the phone camera scans the printed QR code (human-verify
     once apps exist; for now any QR scanner app shows the URL).
+- **Done (b0f6e50b).** Encoder in `packages/headless/src/qr.zig` (exported from headless `root.zig` for A-07); `verde-server pair create` prints the half-block QR plus the App Link, suppressed by `--no-qr`, `--json` or a non-TTY. 684 reference comparisons match; ZBar decodes the rendered terminal QR to the exact App Link. Still open: a physical phone-camera scan (owner).
 
 #### A-07 · Desktop "Pair a phone" + Paired devices UI
 - **depends:** A-04, A-06 · **touches:**
