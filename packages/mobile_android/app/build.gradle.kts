@@ -45,6 +45,11 @@ android {
 tasks.named("preBuild") { dependsOn(syncNativeLibraries) }
 
 dependencies {
+    implementation(libs.camera.camera2)
+    implementation(libs.camera.lifecycle)
+    implementation(libs.camera.view)
+    implementation(libs.barcode.scanning)
+    implementation(libs.lifecycle.viewmodel.compose)
     implementation(libs.coroutines)
     implementation(libs.datastore)
     implementation(libs.okhttp)

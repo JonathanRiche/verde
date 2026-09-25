@@ -30,6 +30,7 @@ class CoreHostTest {
         var reaction: (Event) -> List<Effect> = { emptyList() }
         var thread = 0L
         var freed = false
+        var queryStatus: Int? = null
         val selectors = mutableListOf<String>()
         private fun checkThread() {
             val current = Thread.currentThread().id
@@ -47,6 +48,7 @@ class CoreHostTest {
         }
         override fun query(host: Long, selector: String): ByteArray {
             checkThread(); check(!freed); selectors.add(selector)
+            queryStatus?.let { throw CoreFailure(it) }
             return """{"api_version":1,"revision":"2","data":null,"error":null}""".encodeToByteArray()
         }
         override fun free(host: Long) { checkThread(); check(!freed); freed = true }
@@ -61,6 +63,19 @@ class CoreHostTest {
         return EffectExecutor(store, "test", { clock.incrementAndGet() }, { 1000 }, baseClient=client)
     }
     private suspend fun start(host: CoreHost) = host.send { n,w -> EventStart(now_ms=n, wall_time_ms=w, foreground=true, network_available=true) }
+
+    @Test fun inputStatusFromQueryAfterBatchRemainsFatal() = runBlocking {
+        val core = FakeCore()
+        core.queryStatus = 1
+        core.effects = listOf(EffectStateChanged("view", "1", "1", listOf("hosts")))
+        val host = CoreHost.create(config, executor(), core)
+        try {
+            try { start(host); fail("Expected batch failure") }
+            catch (_: CoreFailure) { }
+            assertTrue(host.failed.value)
+            assertTrue(core.freed)
+        } finally { host.close() }
+    }
 
     @Test fun storageTimersViewsAndShutdown() = runBlocking {
         val core = FakeCore()

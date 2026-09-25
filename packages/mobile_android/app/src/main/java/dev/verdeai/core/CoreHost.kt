@@ -20,6 +20,7 @@ interface CoreBridge {
 }
 
 class CoreFailure(val status: Int) : Exception("core_call_failed")
+class CoreInputRejected(val status: Int) : Exception("core_input_rejected")
 
 object JniCoreBridge : CoreBridge {
     override fun create(config: ByteArray): Long {
@@ -76,7 +77,7 @@ class CoreHost private constructor(
     suspend fun send(event: (Long, Long) -> Event) = withContext(dispatcher) {
         check(!closed) { "host_closed" }
         try { dispatch(event(executor.now(), executor.wall())) }
-        catch (_: Exception) { fail(); throw CoreFailure(-1) }
+        catch (e: CoreInputRejected) { throw e } catch (_: Exception) { fail(); throw CoreFailure(-1) }
     }
 
     suspend fun query(selector: String): JsonElement = withContext(dispatcher) {
@@ -88,7 +89,14 @@ class CoreHost private constructor(
     private fun read(selector: String) = CoreJson.parseToJsonElement(core.query(handle, selector).decodeToString())
 
     private fun dispatch(event: Event) {
-        val bytes = core.handle(handle, CoreJson.encodeToString<Event>(event).encodeToByteArray())
+        val bytes = try {
+            core.handle(handle, CoreJson.encodeToString<Event>(event).encodeToByteArray())
+        } catch (e: CoreFailure) {
+            // Only a rejected call (before any effects) is recoverable. Decode,
+            // query and effect failures must still tear down the host.
+            if (e.status == 1 || e.status == 4) throw CoreInputRejected(e.status)
+            throw e
+        }
         val batch = CoreJson.decodeFromString<EffectBatch>(bytes.decodeToString())
         check(batch.api_version == 1L) { "unsupported_core_revision" }
         for (effect in batch.effects) {
