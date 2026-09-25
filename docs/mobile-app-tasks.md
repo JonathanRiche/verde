@@ -158,8 +158,8 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | D-01 | Android project scaffold | android | linux | K-01 | done (ee3c19df; on-device version display pending human-verify) |
 | D-02 | Core bridge + effect executor | android | linux | D-01, K-06, K-15 | done (0f7fb9c6) |
 | D-03 | Pairing flow | android | linux+phone | D-02, K-07, A-06, H-06, H-07 | done (13f210cf; phone verify pending H-06/H-07; verified App Links need W-01) |
-| D-04 | Hosts list + switcher + sign out | android | linux | D-03, A-04 | in_progress (claude opus cli-thread-1790365209329-309f979d78cceae0; took over paused Codex WIP) |
-| D-05 | Home + Workspaces + lifecycle | android | linux+phone | D-04, K-09 | todo |
+| D-04 | Hosts list + switcher + sign out | android | linux | D-03, A-04 | done (f086c429, 7ab2629e; phone verify pending H-06/H-07) |
+| D-05 | Home + Workspaces + lifecycle | android | linux+phone | D-04, K-09 | in_progress (claude opus cli-thread-1790365625335-7f1cfe4d9c58a022) |
 | D-06 | Transcript screen | android | linux | D-05, K-10, K-11 | todo |
 | D-07 | Diff card | android | linux | D-06 | todo |
 | D-08 | Composer + pickers + attachments + follow-ups | android | linux | D-06 | todo |
@@ -991,6 +991,7 @@ human-verify step.
 - **Do:** multi-host list with a status dot; switching host; "Sign out of
   host" calls `device.self.revoke` and wipes local data.
 - **Done when:** tests pass.
+- **Done (f086c429, 7ab2629e).** The core gained a `sign_out` intent (in `signout.zig`). It revokes through `device.self.revoke` and reports `signed_out` only after the storage delete is acknowledged. An uncertain or offline outcome reports `sign_out_unconfirmed`. A `forget_host` intent wipes locally, and is accepted while a revoke is still waiting. The Android app gained a hosts list, an active-host switcher and sign-out, with offline, revoked and unreachable states. `mobile-core-test` passes 144/144, `mobile-android-test` passes 47/0, and the core Android builds, model check and APK build pass. If the app dies between the two deletes, the pin can remain without a credential until that slot is paired again (documented in `auth.md`). For D-05: read data through `HostsModel.activeCore()`, and use `ProcessLifecycleOwner` and `ConnectivityManager`.
 
 #### D-05 · Home + Workspaces + lifecycle
 - **depends:** D-04, K-09
