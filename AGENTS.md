@@ -56,3 +56,4 @@ Read the relevant file before working on that subsystem, including changes from 
 - [Browser inspector](packages/browser_extensions/inspector/AGENTS.md)
 - [Mobile client core](packages/client_core/AGENTS.md)
 - [iOS app](packages/mobile_ios/AGENTS.md)
+- [Android app](packages/mobile_android/AGENTS.md)

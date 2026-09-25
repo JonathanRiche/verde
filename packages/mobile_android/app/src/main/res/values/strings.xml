@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Verde</string>
+    <string name="core_version">Core version: %1$s</string>
+</resources>

@@ -129,3 +129,11 @@ run = "bash packages/mobile_ios/scripts/xcode.sh build"
 description = "Runs the iOS core-link XCTest on a disposable simulator without signing."
 depends = ["mobile-core-ios"]
 run = "bash packages/mobile_ios/scripts/xcode.sh test"
+
+[tasks.mobile-android-build]
+description = "Builds the Android debug APK, including both Zig JNI libraries."
+run = "bash packages/mobile_android/run-gradle.sh assembleDebug"
+
+[tasks.mobile-android-test]
+description = "Runs Android JVM and Robolectric tests."
+run = "bash packages/mobile_android/run-gradle.sh testDebugUnitTest"
