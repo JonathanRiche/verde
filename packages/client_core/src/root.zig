@@ -151,6 +151,7 @@ pub fn vcBufFree(buf: Buf) callconv(.c) void {
 test {
     _ = @import("harness.zig");
     _ = @import("rpc_test.zig");
+    _ = @import("allowlist_test.zig");
     _ = @import("sync_test.zig");
     _ = @import("terminal_test.zig");
     _ = @import("chat_test.zig");

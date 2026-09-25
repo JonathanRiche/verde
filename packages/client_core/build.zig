@@ -71,7 +71,11 @@ fn addTestStep(
         .root_module = createCoreModule(b, target, optimize, options),
         .use_llvm = true,
     });
-    test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+    const run_unit_tests = b.addRunArtifact(unit_tests);
+    // The allowlist audit parses `src/`; run from the package root regardless
+    // of where `zig build` was invoked.
+    run_unit_tests.setCwd(b.path("."));
+    test_step.dependOn(&run_unit_tests.step);
 
     const host_lib = addCoreLibrary(b, createCoreModule(b, target, optimize, options));
     const smoke_module = b.createModule(.{
