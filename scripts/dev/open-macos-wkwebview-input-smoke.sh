@@ -6,7 +6,7 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 1
 fi
 
-APP_PATH="${1:-/Users/macuser/Applications/Verde.app}"
+APP_PATH="${1:-${HOME}/Applications/Verde.app}"
 START_URL="${VERDE_BROWSER_START_URL:-http://127.0.0.1:8879/input-regression.html}"
 
 if [[ ! -d "$APP_PATH" ]]; then

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_BIN="${VERDE_APP_BIN:-/Users/macuser/Applications/Verde.app/Contents/MacOS/verde}"
+APP_BIN="${VERDE_APP_BIN:-${HOME}/Applications/Verde.app/Contents/MacOS/verde}"
 LABEL="${1:-manual-status-step}"
 OUT_DIR="${VERDE_MAC_WEBVIEW_EVIDENCE_DIR:-notes/mac-webview-smoke/manual-evidence}"
 

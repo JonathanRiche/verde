@@ -7,7 +7,7 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-APP_PATH="${VERDE_APP_PATH:-/Users/macuser/Applications/Verde.app}"
+APP_PATH="${VERDE_APP_PATH:-${HOME}/Applications/Verde.app}"
 HOST="${VERDE_MAC_WEBVIEW_SMOKE_HOST:-127.0.0.1}"
 PORT="${VERDE_MAC_WEBVIEW_SMOKE_PORT:-8879}"
 START_URL="${VERDE_BROWSER_START_URL:-http://$HOST:$PORT/input-regression.html}"

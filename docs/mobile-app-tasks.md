@@ -1,0 +1,1076 @@
+# Verde Mobile — Orchestrator Task List
+
+This file is the work queue for building the mobile apps. The design lives
+in [`mobile-app-plan.md`](mobile-app-plan.md); read it before dispatching or
+doing any task. Every task below is sized for one agent working in one
+session.
+
+---
+
+## Part A — Orchestrator protocol
+
+### A1. Loop
+
+1. Read the **Status board** (Part B).
+2. A task is **ready** when its status is `todo` and every task in its
+   `depends` line is `done`.
+3. Dispatch ready tasks, one agent per task. Tasks can run in parallel only
+   if their `touches` areas don't overlap (see A4).
+4. When an agent finishes, check its report against the task's **Done when**
+   list. Set the status to `done (<commit sha>)`, or back to `todo` with a
+   note, or to `blocked: <reason>`.
+5. `human` tasks go to the owner. Tell them exactly what to do and what to
+   send back. Don't spin on them; keep dispatching other lanes.
+6. Only the orchestrator edits the Status board. Agents report; they don't
+   edit this file.
+
+### A2. How to dispatch
+
+- **Linux tasks:** open a Verde chat in workspace `baaa819e66d8f3be`
+  (`/home/rtg/development/verde`) with `open_chat` and send the task using
+  the brief template in A3. Pass the orchestrator's `parent_thread_id` so
+  completion and blocked status come back automatically. Subagents with
+  worktree isolation work too.
+- **Mac tasks** (`machine: mac`): the agent still runs on Linux. It edits
+  files in the Linux checkout, commits, and pushes. It then drives the Mac
+  over SSH:
+  ```sh
+  ssh mac 'cd ~/development/verde && git pull --ff-only && <build/test command>'
+  ```
+  `mac` is the SSH alias created in H-01. Never hand-edit files on the Mac;
+  everything goes through git. Swift sources and the XcodeGen `project.yml`
+  are plain text, so they can be edited on Linux.
+- **Phone tasks** (`machine: phone`):
+  - Android: the agent uses `adb` from Linux, either over USB or wireless
+    adb across Tailscale.
+  - iOS devices: driven through the Mac (`xcrun devicectl`).
+  - Anything that needs a hand on a phone, like scanning a QR code or
+    judging how the app feels, has a `human-verify` step. The owner does
+    that step and reports back.
+
+### A3. Agent brief template
+
+```
+You are doing task <ID> from docs/mobile-app-tasks.md in /home/rtg/development/verde.
+Read: AGENTS.md (and its scoped rules for the areas you touch), docs/mobile-app-plan.md,
+and the full text of task <ID>. Do only that task.
+Work in a git worktree (git worktree add ../verde-wt/<ID> master), rebase onto master
+before committing, and commit directly to master with a message starting "mobile(<ID>):".
+Run the task's verification commands and include their results in your report.
+If you are blocked on a decision or on a human step, call report_chat_blocked with the
+exact question and stop. Report: commit sha, files changed, verification output, follow-ups.
+```
+
+### A4. Rules that apply to every task
+
+- **The working tree is shared.** Other people's and agents' work lives in
+  `/home/rtg/development/verde`, and there can be large uncommitted diffs.
+  Always use a worktree. Never revert, stash or commit changes you didn't
+  make.
+- **Branching:** commit straight to master; no feature branches. Keep one
+  commit per task where possible, and never force-push.
+- **Serialization hotspots.** Tasks that touch the same file must not run
+  at the same time:
+  - `packages/headless/src/access_protocol.zig`
+  - `packages/web_app/src/http.zig`
+  - `packages/desktop/src/terminal/sessionizer.zig`
+  - `packages/desktop/src/daemon/store.zig`
+- **Builds.** Follow the root `AGENTS.md`:
+  - Lease `build` for full Zig builds, and `port:<n>` for any listener.
+  - Never run bare `zig build`. Lower-level targets take
+    `--release=safe -Dbrowser-backend=native_webview`.
+  - Never restart Verde, and never run `mise run dev`, `mise run dev-term`
+    or `zig build run` from inside Verde.
+- **Verification commands** used throughout this file:
+  - `ZB="zig build --release=safe -Dbrowser-backend=native_webview"`, then
+    `$ZB headless-test`, `$ZB runtime-test`, `$ZB server-test`,
+    `$ZB daemon-test`.
+  - `mise run web-app-test`, `mise run web-app`.
+  - `mise run dev-build` (desktop UI changes).
+  - Mobile tasks add their own commands (D-01, I-01, K-01).
+- **Tests** use temporary state, loopback fixtures and finite deadlines. No
+  live providers, no user daemon, no network services.
+- **Secrets** never go into the repo, logs or reports. That covers signing
+  keys, keystore passwords, APNs `.p8` keys, FCM service accounts and pair
+  codes. Keep them in environment variables or files outside the repo, and
+  have the owner supply them (human tasks).
+- **Docs:** any task that adds a package also adds its `AGENTS.md` and a
+  link in the root `AGENTS.md` scoped-rules list.
+
+### A5. Status values
+
+`todo` · `in_progress (<agent/thread>)` · `review` · `done (<sha>)` ·
+`blocked: <reason>` · `human` (waiting on the owner)
+
+---
+
+## Part B — Status board
+
+| ID | Title | Lane | Machine | Depends | Status |
+|---|---|---|---|---|---|
+| H-01 | Mac SSH access + alias | human | mac | — | done |
+| H-02 | Xcode 16.2 + Apple ID on the Mac | human | mac | H-01 | done (team sign-in after H-04) |
+| H-03 | Google Play developer account | human | — | — | human |
+| H-04 | Apple Developer Program | human | — | — | human |
+| H-05 | Firebase project + FCM/APNs keys | human | — | H-03, H-04 | human |
+| H-06 | Tailscale on both phones | human | phone | — | human |
+| H-07 | Android phone dev setup (adb) | human | phone | — | human |
+| H-08 | Choose pairing permission presets | human | — | — | done (owner: Full default) |
+| A-01 | Confine `/api/file` + `/api/preview` | host | linux | — | todo |
+| A-02 | Paired-device allowlist parity + new scopes | host | linux | — | todo |
+| A-03 | Confined directory-list RPC | host | linux | A-02 | todo |
+| A-04 | Device self-service RPCs | host | linux | A-02 | todo |
+| A-05 | Idempotent pair exchange | host | linux | — | todo |
+| A-06 | Terminal QR + App Link pair URL | host | linux | — | todo |
+| A-07 | Desktop "Pair a phone" + Paired devices UI | host | linux | A-04, A-06 | todo |
+| A-08 | Web Settings paired-devices list | host | linux | A-04 | todo |
+| A-09 | Pairing presets + access-mode cap | host | linux | A-02, H-08 | todo |
+| A-10 | `mobile.min_client` + capability flags | host | linux | — | todo |
+| A-11 | Delta change feed on the gateway | host | linux | A-10 | todo |
+| A-12 | Push crypto module (seal/open) | host | linux | — | todo |
+| A-13 | Push outbox + `device.push.*` RPCs | host | linux | A-02, A-12 | todo |
+| A-14 | Attention events → outbox | host | linux | A-13 | todo |
+| W-01 | App Link / universal link files + pair landing page | website | linux | H-03, H-04 | todo |
+| C-01 | Spike: APNs reachability from Workers | cloud | linux | — | todo |
+| C-02 | Push relay Worker | cloud | linux | C-01, A-12 | todo |
+| C-03 | Demo runtime for store review | cloud | linux | A-09 | todo |
+| K-01 | Core skeleton + Android toolchain proof | core | linux | — | todo |
+| K-02 | iOS xcframework toolchain proof | core | mac | K-01, H-01, H-02 | todo |
+| K-03 | Core API spec (events, effects, queries) | core | linux | K-01 | todo |
+| K-04 | Extract shared remote-client modules from desktop | core | linux | K-01 | todo |
+| K-05 | Split `headless/client.zig` codec from I/O | core | linux | K-01 | todo |
+| K-06 | Sans-IO host engine + C ABI | core | linux | K-03, K-04, K-05 | todo |
+| K-07 | Auth in core | core | linux | K-06, A-05 | todo |
+| K-08 | RPC client + target pinning | core | linux | K-06 | todo |
+| K-09 | Sync + projection | core | linux | K-08 | todo |
+| K-10 | Chat engine | core | linux | K-09 | todo |
+| K-11 | Markdown AST / highlight spans / diff parse exports | core | linux | K-06 | todo |
+| K-12 | Terminal handle + PTY pump | core | linux | K-06 | todo |
+| K-13 | Allowlist coverage test | core | linux | K-10, A-02 | todo |
+| K-14 | Contract suite vs real gateway + daemon | core | linux | K-10 | todo |
+| K-15 | Kotlin/Swift model codegen from Zig types | core | linux | K-06 | todo |
+| K-16 | Delta-mode sync | core | linux | K-09, A-11 | todo |
+| K-17 | Attention state machine + push decrypt | core | linux | K-09, A-12 | todo |
+| D-01 | Android project scaffold | android | linux | K-01 | todo |
+| D-02 | Core bridge + effect executor | android | linux | D-01, K-06, K-15 | todo |
+| D-03 | Pairing flow | android | linux+phone | D-02, K-07, A-06, H-06, H-07 | todo |
+| D-04 | Hosts list + switcher + sign out | android | linux | D-03, A-04 | todo |
+| D-05 | Home + Workspaces + lifecycle | android | linux+phone | D-04, K-09 | todo |
+| D-06 | Transcript screen | android | linux | D-05, K-10, K-11 | todo |
+| D-07 | Diff card | android | linux | D-06 | todo |
+| D-08 | Composer + pickers + attachments + follow-ups | android | linux | D-06 | todo |
+| D-09 | Approvals card | android | linux | D-06 | todo |
+| D-10 | History, new chat, workspace management | android | linux | D-05, A-03 | todo |
+| D-11 | Native terminal view | android | linux+phone | D-05, K-12 | todo |
+| D-12 | File viewer | android | linux | D-06, A-01 | todo |
+| D-13 | Theme + reduced motion | android | linux | D-05 | todo |
+| D-14 | Push + actionable notifications | android | linux+phone | D-09, K-17, A-14, C-02, H-05 | todo |
+| D-15 | App lock + secure screen | android | linux | D-05 | todo |
+| D-16 | Maestro flows + UI tests | android | linux+phone | D-08, D-09 | todo |
+| D-17 | Release build + Play internal track | android | linux | D-16, H-03 | todo |
+| I-01 | iOS project scaffold (XcodeGen) | ios | mac | K-02 | todo |
+| I-02 | Core bridge + effect executor | ios | mac | I-01, K-06, K-15 | todo |
+| I-03 | Pairing flow | ios | mac+phone | I-02, K-07, A-06 | todo |
+| I-04 | Hosts + Home + Workspaces + lifecycle | ios | mac | I-03, D-05 | todo |
+| I-05 | Transcript + diff + approvals | ios | mac | I-04, D-06, D-07, D-09 | todo |
+| I-06 | Composer + pickers + attachments + follow-ups | ios | mac | I-05, D-08 | todo |
+| I-07 | History, new chat, workspace management | ios | mac | I-04, D-10 | todo |
+| I-08 | Native terminal view | ios | mac+phone | I-04, D-11 | todo |
+| I-09 | File viewer, theme, app lock | ios | mac | I-05, D-12, D-13, D-15 | todo |
+| I-10 | Push + NSE + actionable notifications | ios | mac+phone | I-05, K-17, C-02, H-05 | todo |
+| I-11 | XCUITest / Maestro flows | ios | mac | I-06 | todo |
+| I-12 | TestFlight pipeline (GitHub Actions) | ios | ci | I-11, H-04 | todo |
+| R-01 | Store listings, privacy / data-safety forms | release | human | D-17, I-12, C-03 | todo |
+
+---
+
+## Part C — Tasks
+
+### Human setup
+
+#### H-01 · Mac SSH access + alias
+- **machine:** mac · **depends:** —
+- **Status: done (2026-09-25).** `ssh -o BatchMode=yes mac 'uname -sm'` prints
+  `Darwin arm64`. The alias `mac` is defined in the operator's own
+  `~/.ssh/config`; the host name and user stay out of the repo. It uses
+  plain macOS Remote Login over the tailnet.
+  Tailscale SSH is **not** an option: the Mac runs the GUI Tailscale app, which
+  can't act as a Tailscale SSH server.
+- The Ghostty terminfo is installed on the Mac (`infocmp -x xterm-ghostty | ssh mac 'tic -x -'`),
+  so interactive Verde panes work. For scripted commands, prefix with
+  `TERM=xterm-256color GIT_PAGER=cat`.
+
+#### H-02 · Xcode 16.2 + Apple ID on the Mac
+- **machine:** mac · **depends:** H-01
+- **Inventory (2026-09-25):**
+  - Mac mini M2, **macOS 14.6 Sonoma**, about 65 GiB free.
+  - brew, mise, Zig 0.16.0 and xcodegen 2.46.0 are installed.
+  - The repo is cloned at `~/development/verde` and is up to date with
+    `origin/master`.
+  - Only the Command Line Tools are installed; there is no Xcode.
+- **Decision: the Mac stays on macOS 14.**
+  - Sonoma can run at most Xcode 16.2 (iOS 18.2 SDK). That covers all
+    development: simulator builds, the Zig xcframework, and development or
+    ad-hoc installs on the iPhone.
+  - App Store Connect uploads (including TestFlight) need Xcode 26+. Those
+    run on GitHub Actions macOS runners instead (I-12); they are free
+    because the repo is public.
+  - Swift code must therefore compile under both SDKs (18.2 locally, 26 in
+    CI).
+  - Homebrew treats macOS 14 as Tier 3 (no bottles), so installs are slower
+    but still work.
+- **Status (2026-09-25): Xcode done; team sign-in waits for H-04.**
+  - Xcode 16.2 (16C5032a) is at `/Applications/Xcode-16.2.0.app` and
+    selected with `xcode-select`. The license is accepted and first launch
+    has run.
+  - The iPhoneOS 18.2 SDK compiles a SwiftUI test app for arm64. The iOS
+    18.3.1 simulator runtime was downloaded with
+    `xcodebuild -downloadPlatform iOS` (log at `~/xcode-ios-runtime.log`).
+  - Getting Xcode onto macOS 14: Homebrew's `xcodes` formula refuses to
+    install on macOS older than Sequoia, but the prebuilt binary (`xcodes.zip`
+    from the GitHub release) runs on macOS 13+, so it went into
+    `/opt/homebrew/bin/xcodes`. Run `xcodes signout` on the Mac to clear any
+    cached Apple ID login.
+  - `~/.zshenv` now puts `~/.local/bin`, the mise shims and `/opt/homebrew/bin`
+    on the PATH, so non-interactive `ssh mac '…'` commands find `mise`,
+    `zig`, `xcodegen` and `brew` (backup at `~/.zshenv.bak-verde`).
+  - Still to do: step 3 below, after H-04.
+- **Do (owner):**
+  1. Download Xcode 16.2 from developer.apple.com/download/all (Apple ID
+     sign-in), or install it with `xcodes install 16.2`. Move it to
+     `/Applications/Xcode.app`.
+  2. Run `sudo xcodebuild -license accept` and
+     `sudo xcode-select -s /Applications/Xcode.app`. Install the iOS 18.2
+     platform if Xcode prompts for it.
+  3. Sign in to the Apple ID / team in Xcode → Settings → Accounts (after
+     H-04). Register the iPhone's UDID as a development device.
+- **Early check (agent, as soon as Xcode is in):** install a hello-world app
+  on the iPhone. If the phone runs iOS 26 and Xcode 16.2 refuses to deploy
+  to it (missing device support), fall back to upgrading macOS to 26/27.
+  `softwareupdate` offers macOS 27; it needs the admin password and a
+  restart.
+- **Done when:** `ssh mac 'xcodebuild -version && xcodegen --version && cd ~/development/verde && mise exec -- zig version'` succeeds, and a signed build runs on the iPhone.
+
+#### H-03 · Google Play developer account
+- **Do:** register the account (one-time fee). Reserve the application ID
+  `dev.verdeai.app` (change it here if you prefer another one).
+- **Done when:** the Play Console app exists; the ID is recorded here.
+
+#### H-04 · Apple Developer Program
+- **Do:** enrol (annual fee). Create the App ID `dev.verdeai.app` with the
+  capabilities Push Notifications, Associated Domains and App Groups (used
+  by the NSE).
+- **Done when:** the Team ID is recorded here, and the Mac's Xcode shows the
+  team.
+
+#### H-05 · Firebase project + push keys
+- **depends:** H-03, H-04
+- **Do:**
+  1. Create a Firebase project, and inside it an Android app with ID
+     `dev.verdeai.app`.
+  2. Download `google-services.json` and keep it **outside** the repo; the
+     build reads its path from an environment variable.
+  3. Create a service-account key for FCM HTTP v1.
+  4. Create an APNs Auth Key (`.p8`) in the Apple portal. If C-01 decides
+     iOS goes through FCM, upload the key to Firebase.
+- **Done when:** the files are stored where C-02/D-14 expect them (paths
+  given by those tasks) and none of them is in git.
+
+#### H-06 · Tailscale on both phones
+- **Done when:** both phones are on the tailnet and can open
+  `https://<host>.ts.net` (the web app) in a browser.
+
+#### H-07 · Android phone dev setup
+- **Do:** turn on Developer options → USB debugging (or Wireless debugging
+  over the tailnet). Accept this machine's key.
+- **Done when:** `adb devices` lists the phone.
+
+#### H-08 · Choose pairing permission presets
+- **Decided (2026-09-25):** three presets.
+  - **Full** (default): all scopes, including `terminal:write`,
+    `process:*` and `device:write`; no access-mode cap.
+  - **Chat**: read everything, chat and approve, no terminal write or
+    processes; turns capped at approval-required.
+  - **Monitor**: read-only plus push.
+- Over-cap requests are clamped to the cap, with a notice in the turn. This
+  was proposed and not objected to; confirm with the owner if A-09 needs to
+  reject instead.
+
+### Host lane (verde repo)
+
+#### A-01 · Confine `/api/file` + `/api/preview`
+- **touches:** `packages/web_app/src/http.zig` (+ a new helper module if
+  cleaner)
+- **Why:** `validServedFilePath` accepts any absolute path, for example
+  `~/.ssh/id_ed25519`, for any caller with `repository:read`.
+- **Do:**
+  - Resolve the path with realpath, following symlinks. Allow it only if it
+    lies inside a registered workspace/repository root, taken from daemon
+    `workspace.list` / repository bindings and cached with a short TTL.
+  - Keep the existing extension and size checks.
+  - Return 403 `path_outside_workspace`.
+  - Update the "Security contract" section of `packages/web_app/AGENTS.md`.
+- **Done when:**
+  - Tests cover: inside root OK; `..` rejected; a symlink escaping the root
+    rejected; a sibling-prefix root (`/a/b` vs `/a/bc`) rejected; outside
+    rejected.
+  - `mise run web-app-test` and `mise run web-app` pass.
+
+#### A-02 · Paired-device allowlist parity + new scopes
+- **touches:** `packages/headless/src/access_protocol.zig`, the gateway auth
+  wiring, the `verde-server` pair/device CLI help
+- **Do:**
+  - Add scopes `process:read`, `process:write` and `device:write`.
+    Existing grants keep their stored scopes, and new scopes are **not** in
+    the default grant.
+  - Map these in `requiredScopeMaskForRpc`, following plan P2:
+    - `workspace.create`, `workspace.rename`, `workspace.close` →
+      `repository:write`
+    - `chat.open_subagent`, `provider.threads.list` → `chat:read`
+    - `provider.title.generate` → `chat:write`
+    - `terminal.open`, `terminal.tail`, `terminal.screen` →
+      `terminal:read`/`terminal:write` as appropriate
+    - `terminal.write`, `terminal.key` → `terminal:write`
+    - `process.list`, `process.definitions` → `process:read`
+    - `process.start`, `process.restart`, `process.stop` → `process:write`
+    - `daemon.client.register` → `runtime:read`
+  - Make sure each method is actually dispatched for paired clients (check
+    the gateway's paired-client path and `paired_clients.zig`).
+- **Done when:**
+  - Tests cover each new mapping plus the reachability test.
+  - `$ZB headless-test`, `mise run web-app-test` and `$ZB server-test`
+    pass.
+
+#### A-03 · Confined directory-list RPC
+- **depends:** A-02 · **touches:** the daemon dispatch and the gateway
+  `directory_browser.zig`
+- **Do:** add a daemon RPC `workspace.directory.list {path}` with scope
+  `repository:read`. Confine it to allowed roots: the home directory,
+  existing workspace parents, and configured roots, mirroring
+  `web.directory.list` policy. Directories only; no file contents. The web
+  gateway's `web.directory.list` may delegate to it.
+- **Done when:** tests cover confinement and listing; `$ZB headless-test`
+  and `mise run web-app-test` pass.
+
+#### A-04 · Device self-service RPCs
+- **depends:** A-02
+- **Do:**
+  - `device.self.get` (scope `device:read`) returns this device's label,
+    scopes, created and last-seen times.
+  - `device.self.revoke` lets a device sign itself out. It clears the
+    device's tokens and closes its sockets.
+  - `device.list` / `device.revoke` for **owner** callers only (the web
+    owner session and the desktop), for the A-07/A-08 UIs.
+- **Done when:** tests cover self-revoke invalidating the next call, and a
+  paired device being unable to list or revoke other devices.
+  `$ZB headless-test` and `mise run web-app-test` pass.
+
+#### A-05 · Idempotent pair exchange
+- **touches:** `access_protocol.zig`, the daemon grant consume path, the
+  gateway `/auth/pair/exchange`
+- **Do:** accept an optional `client_nonce` (32 hex characters). A repeat
+  exchange with the same grant and nonce inside the grant TTL returns the
+  **same** device and credential instead of failing. A different nonce
+  still fails. Store only a hash of the nonce.
+- **Done when:** tests cover a lost-response retry succeeding, a
+  different-nonce replay failing, and a retry after the TTL failing.
+  `docs/serve-pair-connect.md` is updated. `$ZB headless-test` and
+  `mise run web-app-test` pass.
+
+#### A-06 · Terminal QR + App Link pair URL
+- **touches:** `packages/server/src/main.zig` (`printPairGrant`), a new small
+  QR encoder module (pure Zig with tests; or vendor a vetted MIT/BSD
+  encoder)
+- **Do:**
+  - `verde-server pair create` prints a UTF-8 half-block QR code of the
+    pair URL on a TTY. `--no-qr` turns it off; it is automatically off when
+    output isn't a TTY or when `--json` is used.
+  - Also print the App Link form
+    `https://verdeai.dev/pair?host=…&grant_id=…#code=…`. The code stays in
+    the fragment.
+  - Put the QR encoder somewhere the desktop can reuse it (A-07).
+- **Done when:**
+  - The QR encoder's test vectors decode correctly (compare against known
+    outputs).
+  - `$ZB server-test` passes.
+  - Manual check: the phone camera scans the printed QR code (human-verify
+    once apps exist; for now any QR scanner app shows the URL).
+
+#### A-07 · Desktop "Pair a phone" + Paired devices UI
+- **depends:** A-04, A-06 · **touches:**
+  `packages/desktop/src/ui/settings_modal.zig`, the desktop state, the
+  daemon pair create path
+- **Do:**
+  - Settings gets a "Pair a phone" button. It creates a grant (preset
+    picker once A-09 lands) and shows the QR code (rendered from the A-06
+    encoder), the App Link, the expiry countdown and "copy link".
+  - Add a "Paired devices" list: label, source, last seen, scopes, Revoke.
+  - Read `packages/desktop/AGENTS.md` first.
+- **Done when:** `mise run dev-build` passes. The owner relaunches and
+  checks that the QR code shows and revoke works (human-verify).
+
+#### A-08 · Web Settings paired-devices list
+- **depends:** A-04 · **touches:** `packages/web_app/web/src/ui/Overlays.tsx`
+  (Settings), `lib/store.ts`
+- **Do:** owner-session-only list with Revoke. Hidden for paired-device
+  sessions.
+- **Done when:** `mise run web-app-types`, `bun test` in `packages/web_app`
+  and `mise run web-app` pass.
+
+#### A-09 · Pairing presets + access-mode cap
+- **depends:** A-02, H-08
+- **Do:** implement the preset list decided in H-08:
+  - `verde-server pair create --preset <name>`, the desktop dialog option,
+    and the grant record storing the preset's scopes.
+  - Add an optional per-device `max_access_mode`. `chat.turn.start` and
+    `chat.shell.run` from that device are rejected, or clamped (as H-08
+    decides), when they ask for more.
+  - Show the preset in the device lists.
+- **Done when:** tests cover each preset's scopes and the cap being
+  enforced. `$ZB headless-test`, `$ZB server-test` and
+  `mise run web-app-test` pass.
+
+#### A-10 · `mobile.min_client` + capability flags
+- **Do:** `core.capabilities` / `core.status` advertise `mobile.min_client`
+  (an integer protocol revision for the mobile core), and the new
+  capability names as they land (`core.changes.delta.v1`,
+  `device.push.v1`, `workspace.directory.v1`, `access.pair.idempotent.v1`).
+  Keep them in `RUNTIME_CAPABILITY_NAMES`.
+- **Done when:** tests pass; `$ZB headless-test` passes.
+
+#### A-11 · Delta change feed on the gateway
+- **depends:** A-10 · **touches:** `packages/web_app/src/http.zig`
+  (`serveWebSocket`, `pollChanges`)
+- **Do:**
+  - Clients opt in with a WS request `core.changes.mode {mode:"delta",
+    cursor?}` right after `core.hello`.
+  - In delta mode:
+    - forward `core.changes` entries only;
+    - resume from the client's cursor;
+    - send no automatic `core.snapshot` after changes;
+    - send one snapshot on `expired` or when the `instance_nonce` changes.
+  - Default mode is unchanged for the web app.
+- **Done when:** gateway tests cover delta mode and resume-from-cursor, and
+  confirm that legacy mode behaves exactly as before.
+  `mise run web-app-test` and `mise run web-app` pass.
+
+#### A-12 · Push crypto module
+- **touches:** new `packages/headless/src/push_seal.zig` (shared by the
+  daemon and the core)
+- **Do:**
+  - Sealed box: ephemeral X25519 → HKDF-SHA256 (info
+    `"verde-push-v1"`) → ChaCha20-Poly1305, all from `std.crypto`.
+  - API: `seal(recipient_pub, plaintext) → envelope` and
+    `open(recipient_secret, envelope) → plaintext`.
+  - The envelope is versioned and base64url. Maximum plaintext is 3 KiB
+    (FCM/APNs payload limits).
+- **Done when:** tests cover round-trip, tampering rejected, wrong key
+  rejected, size limit, and fixed test vectors (so the Kotlin/Swift sides
+  can't drift, even though they call this same code).
+  `$ZB headless-test` passes.
+
+#### A-13 · Push outbox + `device.push.*` RPCs
+- **depends:** A-02, A-12 · **touches:** `packages/desktop/src/daemon/store.zig`,
+  the daemon dispatch, a new daemon push module
+- **Do:**
+  - `device.push.register {platform, send_token, public_key}`,
+    `device.push.unregister` and `device.push.test` (scope
+    `device:write`). Stored per device and cleared when the device is
+    revoked.
+  - A durable outbox table: `(device_id, kind, dedupe_key, sealed_payload,
+    attempts, next_attempt_at)`.
+  - A sender loop posts `{send_token, ciphertext, collapse_id}` to the relay
+    URL (config `push.relay_url`, default the production relay) with
+    exponential backoff. It drops entries after N attempts and on relay 410
+    ("token gone").
+  - Never log payloads or send tokens.
+- **Done when:** tests use a loopback fake relay and cover delivery, retry,
+  dedupe, revoke clearing registrations, and 410 handling.
+  `$ZB daemon-test` and `$ZB headless-test` pass.
+
+#### A-14 · Attention events → outbox
+- **depends:** A-13
+- **Do:** enqueue for every push-registered device on these events:
+  - a turn reaching completed, failed or aborted;
+  - an approval becoming pending;
+  - `chat.tasks.blocked` (input needed).
+
+  The payload is `{runtime_id, workspace_id, thread_id, turn_id, kind,
+  title, snippet≤200 chars}`. The dedupe key is `turn_id:kind`. Skip
+  devices that were active on the WS within the last N seconds (they get
+  in-app notices).
+- **Done when:** tests drive a fake turn through each state and assert the
+  outbox rows. `$ZB daemon-test` passes.
+
+### Website / cloud lane
+
+#### W-01 · App Link / universal link files + pair landing page
+- **depends:** H-03, H-04 (signing fingerprint, Team ID) · **touches:**
+  `packages/website` (read its `AGENTS.md`)
+- **Do:**
+  - Serve `/.well-known/assetlinks.json` (Android package + SHA-256 signing
+    fingerprint) and `/.well-known/apple-app-site-association` (`appID`
+    `<TeamID>.dev.verdeai.app`, paths `/pair`, `/h/*`).
+  - A static `/pair` page. It **never** reads the fragment on the server and
+    sends no analytics. It shows "Open in Verde / Get the app / Use the
+    desktop app" and passes the fragment to `verde://pair` client-side.
+- **Done when:** the website build passes; the files are served with the
+  right content type; a manual link check passes after deploy
+  (human-verify).
+
+#### C-01 · Spike: APNs reachability from Workers
+- **touches:** `verde-cloud` scratch only
+- **Do:** find out whether a Cloudflare Worker can send to APNs (HTTP/2
+  only) directly. If it can't, the decision is: send iOS through FCM (APNs
+  key uploaded to Firebase; the iOS app uses FirebaseMessaging tokens).
+  Record the result in `mobile-app-plan.md` §8 and in C-02/I-10.
+- **Done when:** the decision is written down with evidence (a doc link or
+  a spike result).
+
+#### C-02 · Push relay Worker
+- **depends:** C-01, A-12 · **touches:** `verde-cloud` (read its
+  `AGENTS.md`/README; Alchemy v2, OAuth profile, stage `prod`)
+- **Do:**
+  - `POST /v1/register {platform, push_token}` returns `{send_token}`: an
+    HMAC-bound, revocable capability for that one token. D1 stores only a
+    token hash mapped to the push token.
+  - `POST /v1/send {send_token, ciphertext, collapse_id}` →
+    FCM HTTP v1 (and APNs or FCM-for-iOS per C-01). High priority,
+    `mutable-content` for the iOS NSE.
+  - `DELETE /v1/register`.
+  - Per-token and per-IP rate limits. Return 410 when the push token is
+    invalid. No content logging.
+  - Secrets (FCM service account, APNs key) are Worker secrets from H-05.
+- **Done when:** unit tests use mocked FCM/APNs; `bun run check` passes in
+  verde-cloud. Deploy only when the owner says so (human-verify).
+
+#### C-03 · Demo runtime for store review
+- **depends:** A-09
+- **Do:** a sandboxed daemon with a scripted/mock provider (no real LLM
+  keys) and seeded workspaces. It runs behind a public HTTPS proxy that
+  meets the gateway's trusted-proxy envelope, paired with a
+  restricted-preset grant. Document how to issue a fresh pair code for
+  reviewers.
+- **Done when:** a fresh phone can pair and run a scripted chat; the runbook
+  lives in `docs/`.
+
+### Core lane (`packages/client_core`)
+
+#### K-01 · Core skeleton + Android toolchain proof
+- **Do:**
+  - Create `packages/client_core` with `build.zig` / `build.zig.zon` and an
+    `AGENTS.md`.
+  - Export `vc_version()` over a C ABI (`include/verde_client.h`) and a
+    Zig-written JNI entry point `Java_dev_verdeai_core_Native_version`.
+  - Build step `android-libs` produces `libverde_client.so` for
+    `aarch64-linux-android` and `x86_64-linux-android` against the NDK
+    sysroot (`ANDROID_NDK_HOME`), with the LLVM backend.
+  - mise tasks `mobile-core-test` and `mobile-core-android`.
+  - Document the NDK/SDK install for this Linux box.
+- **Done when:** `mise run mobile-core-test` passes, the `.so` files are
+  built, and `readelf -d` shows the expected NEEDED libraries only. D-01
+  loads it.
+
+#### K-02 · iOS xcframework toolchain proof
+- **depends:** K-01, H-01, H-02 · **machine:** mac
+- **Do:** build step `ios-xcframework` builds static libraries for
+  `aarch64-ios` and `aarch64-ios-simulator` against
+  `xcrun --sdk iphoneos/iphonesimulator --show-sdk-path`, then runs
+  `xcodebuild -create-xcframework` → `VerdeClient.xcframework` with a
+  module map. mise task `mobile-core-ios`.
+- **Done when:** `ssh mac 'cd ~/development/verde && git pull --ff-only && mise run mobile-core-ios'` succeeds; I-01 links it.
+
+#### K-03 · Core API spec
+- **Do:** write `packages/client_core/docs/core-api.md`:
+  - Host lifecycle, and the **event** types (platform → core): `start`,
+    `foreground`, `background`, `network_changed`, `http_response`,
+    `ws_open`, `ws_message`, `ws_closed`, `timer_fired`,
+    `secure_store_value`, plus user intents.
+  - The **effect** types (core → platform): `http_request`, `ws_open`,
+    `ws_send`, `ws_close`, `set_timer`, `cancel_timer`, `secure_store_put`,
+    `secure_store_get`, `secure_store_delete`, `state_changed{scopes}`,
+    `notify`, `log`.
+  - **Queries** and their view-model shapes: `hosts`, `home`,
+    `workspaces`, `thread:<id>`, `composer:<thread>`, `terminal:<id>`.
+  - Correlation IDs, error model, memory ownership (`vc_buf_free`),
+    threading rules (single-threaded per host).
+- **Done when:** the spec is reviewed by the orchestrator and consistent
+  with plan §5. It gates K-06.
+
+#### K-04 · Extract shared remote-client modules from desktop
+- **touches:** `packages/desktop/src/runtime/*`, `packages/desktop/src/chat/*`,
+  the desktop `build.zig`
+- **Do:**
+  - Move `connection.zig`, `pin_controller.zig`, `thread_binding.zig`,
+    `transcript_apply.zig`, the pure parts of `profile.zig` /
+    `pair_client.zig` / `threads.zig` / `slash_commands.zig` into a shared
+    Zig module (`packages/client_core/src/shared/`, exposed as module
+    `verde_remote`).
+  - The desktop imports from there, with no behaviour change. I/O stays in
+    the desktop (`gateway_transport.zig`, `manager.zig`,
+    `credential_store.zig`).
+  - These desktop files may be under active edit by others: rebase
+    carefully and keep diffs to moves plus import changes.
+- **Done when:** `$ZB headless-test`, `$ZB runtime-test` and
+  `mise run dev-build` pass, and the moved tests run under
+  `mise run mobile-core-test`.
+
+#### K-05 · Split `headless/client.zig` codec from I/O
+- **Do:** separate request encoding and response decoding (pure) from the
+  socket calls, so the core can use the codec without `std.Io`. Existing
+  callers keep working.
+- **Done when:** `$ZB headless-test` and `$ZB runtime-test` pass.
+
+#### K-06 · Sans-IO host engine + C ABI
+- **depends:** K-03, K-04, K-05
+- **Do:**
+  - Implement the K-03 spec skeleton: `vc_host_new/free/handle/query`,
+    `vc_buf_free`, JSON in/out, a per-host arena strategy, the effect
+    queue, a timer model and correlation IDs.
+  - JNI wrappers in Zig mirroring the C ABI.
+  - A deterministic test harness that scripts events and asserts effects.
+- **Done when:** harness tests pass under `mise run mobile-core-test`; the
+  `.so` and xcframework still build.
+
+#### K-07 · Auth in core
+- **depends:** K-06, A-05
+- **Do:**
+  - Parse pair links: the `verde://pair` form and the App Link form,
+    fragment only.
+  - Exchange with `client_nonce`, retried safely.
+  - Keep the device credential through `secure_store_*` effects.
+  - Token manager: refresh 2 minutes before expiry, single-flight, retry
+    on 401 once, then flag "re-pair needed".
+  - Mint tickets and build the WS subprotocol headers.
+  - Read `/.well-known/verde-runtime` for discovery, and apply TOFU pin
+    decisions through `pin_controller`.
+- **Done when:** harness tests cover the happy path, lost exchange response
+  → retry OK, expired grant, revoked device → re-pair state, and token
+  refresh. `mise run mobile-core-test` passes.
+
+#### K-08 · RPC client + target pinning
+- **depends:** K-06
+- **Do:**
+  - Envelope ids and the `target {runtime_id, instance_id}` on every call
+    except `core.status`.
+  - Route calls: `/api/rpc` for interactive and parked calls, the WS for
+    pushes (plan P4).
+  - Typed errors and `connection.FailureKind` retry classes.
+  - A changed `instance_id` triggers a full resync, not an error screen.
+- **Done when:** harness tests pass.
+
+#### K-09 · Sync + projection
+- **depends:** K-08
+- **Do:**
+  - Snapshot (`core.snapshot` scopes `workspaces, registry, sessions,
+    turns, config`) plus WS `core.changes` handling (legacy mode for now).
+  - Project into the view models: hosts, home/active list, workspaces →
+    threads/terminals.
+  - Port the projection rules from web `store.ts` (`panesForWorkspace`,
+    `parseWorkspaceLayout`, `mergeThreadCatalogSettings`, attention
+    ordering) where the desktop has no Zig equivalent. **No**
+    `workspaces` / `panes` / `chat.status` desktop-mirror calls.
+  - Page through `chat.thread.list`.
+- **Done when:** harness tests use recorded fixture snapshots, taken from a
+  temp daemon rather than the user's.
+
+#### K-10 · Chat engine
+- **depends:** K-09
+- **Do:**
+  - Transcript paging (`chat.message.list`, 40 per page, cursor; fallback
+    `chat.thread.get`).
+  - Tail loop (`chat.turn.tail`, `after_seq` cursor, resumes after
+    failures) → `transcript_apply` overlay → commit on terminal status.
+  - Send pipeline: optimistic user row → `chat.thread.upsert` → attachment
+    chunks (`chat.attachment.create/append/commit`) → `chat.turn.start` →
+    tail.
+  - Stop (`chat.turn.cancel`), follow-ups queue/steer with the web state
+    machine (port `followups.ts`), approvals (`approvalFromTurn`,
+    `chat.turn.approve`).
+  - Shell mode confirm (`chat.shell.run`), slash commands
+    (`provider.slash.list/run`), models / effort / access catalogs (port
+    `models.ts`), usage parsing (`usage.ts`), history buckets
+    (`history.ts`), `@` search via `workspace.files.search`, draft
+    persistence effects.
+- **Done when:** harness tests replay recorded tail event streams and match
+  the committed transcripts. Follow-up and approval state tests pass.
+
+#### K-11 · Markdown AST / highlight spans / diff parse exports
+- **depends:** K-06
+- **Do:**
+  - Query/utility calls exposing: `zig_markdown` → a compact AST JSON;
+    `zig_treesitter` highlight spans for code blocks (cross-compiled for
+    both targets); `zig_dif` / `VERDE_DIFF_V2` parsing → hunks with
+    word-level spans (match web `parseDiffV2`).
+  - Citation links → abstract `{path, line}` targets.
+- **Done when:** golden tests pass, including the web app's markdown/diff
+  test cases ported over.
+
+#### K-12 · Terminal handle + PTY pump
+- **depends:** K-06
+- **Do:**
+  - `vc_term_new/write/resize/snapshot/scroll/free` over libghostty-vt,
+    using the same pin as the desktop `build.zig.zon`.
+  - Pump logic as effects: `session.tail` offsets, trimming the first
+    replay (`alignPtyStream` equivalent), 160 ms active / 1 s idle, paused
+    when backgrounded.
+  - Key encoding: Ctrl, Alt, named keys, paste in 4 KB chunks.
+  - `session.create/resize/write/kill` and `terminal.open` for
+    desktop-native panes.
+- **Done when:** tests feed VT fixtures and assert the snapshots; the
+  handle builds for both targets.
+
+#### K-13 · Allowlist coverage test
+- **depends:** K-10, A-02
+- **Do:** a comptime or test-time list of every RPC method the core can
+  send. Assert that each one has `requiredScopeMaskForRpc(method) != null`.
+- **Done when:** the test fails if a method is added without an allowlist
+  entry; `mise run mobile-core-test` passes.
+
+#### K-14 · Contract suite vs real gateway + daemon
+- **depends:** K-10
+- **Do:** a `runtime-test`-style suite:
+  - start a temp headless daemon plus `verde-web` on loopback, with temp
+    state and a loopback-only proxy that fakes the trusted-proxy envelope;
+  - create a pair grant, then drive the core through pair → token → ticket
+    → WS → snapshot → create thread → mock turn → tail → approve →
+    revoke.
+  - Lease the ports.
+- **Done when:** the suite passes locally with finite deadlines and is
+  wired into `mise run mobile-core-test` (or a separate
+  `mobile-core-contract` task).
+
+#### K-15 · Kotlin/Swift model codegen
+- **depends:** K-06
+- **Do:** a Zig build step that walks the view-model and event/effect types
+  at comptime and emits Kotlin `@Serializable` data classes and Swift
+  `Codable` structs into the app packages. Generated files are committed
+  with a "do not edit" header.
+- **Done when:** codegen is deterministic and a CI check fails when the
+  generated files are stale.
+
+#### K-16 · Delta-mode sync
+- **depends:** K-09, A-11
+- **Do:** opt into `core.changes.mode delta` when advertised. Fetch only
+  changed resources, persist the cursor per host, and fall back to legacy
+  mode on older hosts.
+- **Done when:** a contract test shows no full snapshots after hello, and a
+  legacy-host test still passes.
+
+#### K-17 · Attention state machine + push decrypt
+- **depends:** K-09, A-12
+- **Do:**
+  - Port `notify.ts` `advanceAttention` / `notificationStatus`, which
+    suppress notices for the focused pane.
+  - `vc_push_open(secret, envelope)` using `push_seal.zig`, returning a
+    notification view model (title, body, deep link, actions allowed).
+  - Build this small enough for the iOS NSE memory limit.
+- **Done when:** tests use A-12's fixed vectors.
+
+### Android lane (`packages/mobile_android`)
+
+Shared rules: Kotlin, Compose, Material 3, min SDK 29, application ID
+`dev.verdeai.app` (from H-03). Verification is `mise run mobile-android-test`
+(unit + Robolectric) and `mise run mobile-android-build` (`assembleDebug`).
+Tasks marked `+phone` also install with `adb install` and include a
+human-verify step.
+
+#### D-01 · Android project scaffold
+- **depends:** K-01
+- **Do:**
+  - Gradle KTS project, version catalog, Compose BOM, the `dev.verdeai.app`
+    ID and an `AGENTS.md` (security contract from plan §7).
+  - A Gradle task that calls `zig build android-libs` and copies the
+    `.so` files into `jniLibs`.
+  - mise tasks `mobile-android-build` and `mobile-android-test`.
+  - An empty screen showing `vc_version()`.
+  - Add the root `AGENTS.md` scoped-rules link.
+- **Done when:** both mise tasks pass; the APK runs in the emulator or on
+  the phone and shows the core version.
+
+#### D-02 · Core bridge + effect executor
+- **depends:** D-01, K-06, K-15
+- **Do:**
+  - `CoreHost` wrapper on a single-thread coroutine dispatcher per host.
+  - Effect executor:
+    - OkHttp for HTTP;
+    - OkHttp WebSocket with the `Sec-WebSocket-Protocol` header;
+    - coroutine timers;
+    - secure storage (Keystore-wrapped keys + EncryptedFile/DataStore,
+      no backup: `android:allowBackup=false` for the credential store).
+  - `StateFlow` of view models refreshed on `state_changed`.
+- **Done when:** unit tests with a fake core cover the effect round-trips.
+
+#### D-03 · Pairing flow
+- **depends:** D-02, K-07, A-06, H-06, H-07
+- **Do:**
+  - Onboarding: scan (CameraX + ML Kit), paste link, or manual entry.
+  - Intent filters for `verde://pair` and the App Link
+    `https://verdeai.dev/pair`.
+  - Device label defaults to the phone model. TOFU trust prompt; clear
+    errors (grant expired / used / host unreachable → "Is Tailscale on?").
+- **Done when:** unit tests pass. Human-verify: the owner scans the QR code
+  from A-06 on their Android phone and lands on an empty Home screen.
+
+#### D-04 · Hosts list + switcher + sign out
+- **depends:** D-03, A-04
+- **Do:** multi-host list with a status dot; switching host; "Sign out of
+  host" calls `device.self.revoke` and wipes local data.
+- **Done when:** tests pass.
+
+#### D-05 · Home + Workspaces + lifecycle
+- **depends:** D-04, K-09
+- **Do:**
+  - Navigation Compose. Home lists active/needs-attention panes with status
+    and a timer. Workspaces lists workspaces → chats/terminals, with
+    long-press menus.
+  - `ProcessLifecycleOwner` → core foreground/background events;
+    `ConnectivityManager` → `network_changed`.
+  - Local cache for a warm start.
+- **Done when:** tests pass. Human-verify: live status updates while a
+  desktop chat runs; background → foreground recovers within about 2 s.
+
+#### D-06 · Transcript screen
+- **depends:** D-05, K-10, K-11
+- **Do:**
+  - Reversed `LazyColumn`. Markdown AST → `AnnotatedString`, code blocks
+    with highlight spans and copy, grouped tool/command cards, subagent
+    cards, Working/Thinking row with a timer.
+  - Images with Coil, loaded through authenticated requests. Citation
+    chips → file viewer (D-12). Load older on scroll.
+- **Done when:** screenshot/UI tests of a fixture transcript pass;
+  scrolling a 500-message fixture holds frame rate on the phone
+  (human-verify).
+
+#### D-07 · Diff card
+- **depends:** D-06
+- **Do:** stacked diff, per-file collapse, word-level highlights,
+  horizontal scroll.
+- **Done when:** golden tests against K-11 fixtures pass.
+
+#### D-08 · Composer + pickers + attachments + follow-ups
+- **depends:** D-06
+- **Do:**
+  - Multiline input with `imePadding`, send/stop, per-thread drafts.
+  - Provider/model, effort, access and speed bottom sheets, with favourites.
+  - Attachments from the Photo Picker, camera and SAF, sent through core
+    chunk upload.
+  - Slash and `@` suggestion strip; follow-up queue/steer UI; shell-mode
+    confirm sheet.
+- **Done when:** UI tests pass. Human-verify: a full round trip on the
+  phone (send, stream, stop, attach a photo, queue a follow-up).
+
+#### D-09 · Approvals card
+- **depends:** D-06
+- **Do:** inline Approve/Deny with a haptic; pending state; reflects
+  approvals made elsewhere (desktop/web).
+- **Done when:** tests pass; human-verify on a real approval.
+
+#### D-10 · History, new chat, workspace management
+- **depends:** D-05, A-03
+- **Do:**
+  - History: search, buckets, archive/unarchive, closed workspaces.
+  - "New chat" sheet (workspace, provider/model, cwd).
+  - Add workspace (path + `workspace.directory.list` browser),
+    rename/close.
+  - Thread menu: rename, regenerate title, sync, close.
+- **Done when:** tests pass.
+
+#### D-11 · Native terminal view
+- **depends:** D-05, K-12
+- **Do:**
+  - Compose `Canvas` renderer from the K-12 snapshot: monospace metrics,
+    colours from the host theme, cursor.
+  - Accessory key row (Esc, Tab, Ctrl, Alt, arrows, `|`, `~`, `/`), IME
+    input, hardware keyboard, pinch zoom (font size), long-press selection
+    → clipboard (never logged).
+  - Resize → `session.resize`; landscape support.
+- **Done when:** tests pass. Human-verify: nvim and htop usable on the
+  phone.
+
+#### D-12 · File viewer
+- **depends:** D-06, A-01
+- **Do:** PDF with `PdfRenderer` (office files through `/api/preview`);
+  markdown/text native; Share / Open with. Files go to cache storage only
+  and are cleared on sign-out.
+- **Done when:** tests pass.
+
+#### D-13 · Theme + reduced motion
+- **depends:** D-05
+- **Do:** host theme from `/api/theme` → Material colour scheme (reuse the
+  web colour math via the core, or port it). User override:
+  host / system / dynamic colour. Honour the OS "remove animations" setting
+  and the host's reduced-motion flags.
+- **Done when:** tests pass.
+
+#### D-14 · Push + actionable notifications
+- **depends:** D-09, K-17, A-14, C-02, H-05
+- **Do:**
+  - FCM token → relay `/v1/register` → `send_token` → generate an X25519
+    key (Keystore-protected) → `device.push.register` on each host.
+  - `FirebaseMessagingService` decrypts via `vc_push_open`. Notification
+    channels: Attention, Completed, Running.
+  - Actions:
+    - Approve/Deny use `setAuthenticationRequired(true)`, so they work from
+      the lock screen after a biometric/unlock (decision 5).
+    - Reply uses RemoteInput → a queued follow-up.
+  - Deep links to the pane. Ongoing "running turn" notification with a
+    Stop action.
+  - Handle token refresh and re-register.
+- **Done when:** tests pass. Human-verify: phone locked → turn finishes →
+  notification; approve from the lock screen after a fingerprint.
+
+#### D-15 · App lock + secure screen
+- **depends:** D-05
+- **Do:** optional BiometricPrompt gate on launch and after N minutes in the
+  background. Optional `FLAG_SECURE`.
+- **Done when:** tests pass.
+
+#### D-16 · Maestro flows + UI tests
+- **depends:** D-08, D-09
+- **Do:** Maestro flows run against a K-14-style fixture host: pair, send,
+  stop, approve, terminal input, background/resume. mise task
+  `mobile-android-e2e`.
+- **Done when:** the flows pass on the emulator; they also run on the phone.
+
+#### D-17 · Release build + Play internal track
+- **depends:** D-16, H-03
+- **Do:** release signing from an owner-provided keystore outside the repo
+  (environment variables), R8 config, and Zig `.so` debug symbols uploaded
+  to Play. An upload script (Gradle Play Publisher or fastlane supply)
+  pushes to the internal track. A versioning scheme separate from desktop.
+- **Done when:** the owner installs from the Play internal track
+  (human-verify).
+
+### iOS lane (`packages/mobile_ios`)
+
+Shared rules:
+- Swift, SwiftUI, iOS 17+, bundle ID `dev.verdeai.app`, XcodeGen
+  `project.yml`.
+- Agents edit on Linux, commit and push. Builds and tests run on the Mac
+  through `ssh mac 'cd ~/development/verde && git pull --ff-only && mise run mobile-ios-test'`.
+- Each screen task **translates the finished Android screen** (named in
+  `depends`) so behaviour matches; the core already provides the view
+  models.
+
+#### I-01 · iOS project scaffold
+- **depends:** K-02
+- **Do:**
+  - XcodeGen `project.yml` with targets App, NotificationServiceExtension
+    (placeholder) and Tests; links `VerdeClient.xcframework`; adds an
+    `AGENTS.md`.
+  - mise tasks `mobile-ios-build` (xcodegen + `xcodebuild build`, simulator)
+    and `mobile-ios-test`. The screen shows `vc_version()`.
+  - Add the root `AGENTS.md` link.
+- **Done when:** both mise tasks pass over SSH.
+
+#### I-02 · Core bridge + effect executor
+- **depends:** I-01, K-06, K-15
+- **Do:** an `actor CoreHost`; URLSession HTTP; `URLSessionWebSocketTask`
+  with protocols; Keychain (`AfterFirstUnlockThisDeviceOnly`, not synced);
+  an `@Observable` view-model store.
+- **Done when:** XCTest with a fake core passes.
+
+#### I-03 · Pairing flow
+- **depends:** I-02, K-07, A-06
+- **Do:** VisionKit `DataScannerViewController`, paste, manual entry;
+  `verde://` URL scheme plus the Associated Domains universal link; TOFU
+  prompt; same errors as D-03.
+- **Done when:** tests pass. Human-verify: pairing works on the test
+  iPhone (development install through the Mac).
+
+#### I-04 · Hosts + Home + Workspaces + lifecycle
+- **depends:** I-03, D-05
+- **Do:** translate D-04/D-05. `scenePhase` → foreground/background;
+  `NWPathMonitor` → `network_changed`.
+- **Done when:** tests pass.
+
+#### I-05 · Transcript + diff + approvals
+- **depends:** I-04, D-06, D-07, D-09
+- **Do:** translate. Markdown AST → `AttributedString`; highlight spans;
+  lazy list performance on long transcripts.
+- **Done when:** tests pass; scrolling human-verified.
+
+#### I-06 · Composer + pickers + attachments + follow-ups
+- **depends:** I-05, D-08
+- **Do:** translate. PhotosPicker, camera, document picker; keyboard
+  avoidance.
+- **Done when:** tests pass; round trip human-verified.
+
+#### I-07 · History, new chat, workspace management
+- **depends:** I-04, D-10
+- **Done when:** tests pass.
+
+#### I-08 · Native terminal view
+- **depends:** I-04, D-11
+- **Do:** translate. A Core Text / Canvas renderer, `inputAccessoryView` key
+  row, hardware keyboard (`UIKeyCommand`), pinch zoom, selection.
+- **Done when:** tests pass; nvim usable (human-verify).
+
+#### I-09 · File viewer, theme, app lock
+- **depends:** I-05, D-12, D-13, D-15
+- **Do:** PDFKit viewer, theme mapping, Face ID gate, app-switcher privacy
+  blur.
+- **Done when:** tests pass.
+
+#### I-10 · Push + NSE + actionable notifications
+- **depends:** I-05, K-17, C-02, H-05
+- **Do:**
+  - APNs (or FCM-for-iOS per C-01) → relay register → `send_token` →
+    X25519 key in the shared Keychain access group → `device.push.register`.
+  - The NSE links a minimal core slice and decrypts with `vc_push_open`
+    (mind the NSE memory limit).
+  - Categories:
+    - Approve/Deny use `.authenticationRequired` (lock screen after Face
+      ID, decision 5).
+    - Reply uses `UNTextInputNotificationAction`.
+  - Deep links.
+- **Done when:** tests pass. Human-verify: locked iPhone → notification →
+  approve after Face ID.
+
+#### I-11 · XCUITest / Maestro flows
+- **depends:** I-06
+- **Do:** the same flows as D-16 on the simulator; mise task
+  `mobile-ios-e2e`.
+- **Done when:** the flows pass over SSH.
+
+#### I-12 · TestFlight pipeline (GitHub Actions)
+- **depends:** I-11, H-04 · **machine:** ci (GitHub-hosted macOS runner with Xcode 26+)
+- **Why CI:** the Mac mini stays on macOS 14 / Xcode 16.2, which App Store
+  Connect no longer accepts (see H-02).
+- **Do:** add `.github/workflows/mobile-ios.yml`, triggered by
+  `workflow_dispatch` and by `mobile-ios-v*` tags. Steps:
+  1. Check out the repo, install Zig through mise, and build the xcframework
+     (K-02 script).
+  2. Run `xcodegen`, then `xcodebuild archive` and `-exportArchive` with the
+     newest Xcode on the runner.
+  3. Upload to TestFlight with an App Store Connect API key.
+- **Secrets:** the owner stores the distribution certificate (.p12 plus
+  password), the provisioning profile (or uses API-key-based automatic
+  signing), and the API key ID, issuer and .p8 in GitHub Actions secrets.
+  They are never in the repo. Use a temporary keychain and delete it at the
+  end of the job.
+- **Done when:** a dispatched run uploads a build that appears in TestFlight
+  and installs on the iPhone (human-verify).
+
+
+### Release
+
+#### R-01 · Store listings and privacy forms
+- **depends:** D-17, I-12, C-03 · **human-led**; agents draft the text
+- **Do:** listing copy and screenshots; the Play data-safety form and Apple
+  privacy labels (no tracking; credentials on the device; push content
+  end-to-end encrypted); review notes with the demo host pair instructions;
+  support URL and privacy policy page on the website.
+- **Done when:** both apps are submitted.
+
+---
+
+## Part D — Backlog (after v1, not yet broken into tasks)
+
+Live Activity (iOS) · share target (both) · tablet/iPad two-pane · processes
+screen (`process:*`) · command palette sheet · home-screen widgets ·
+UnifiedPush/ntfy for self-hosters · embedded tailnet (libtailscale) or
+Connect relay so the Tailscale app isn't required · Connect login on mobile
+(custom-scheme redirect) · wasm build of the core for the web app · move the
+web app to delta mode and off the desktop-mirror RPCs.

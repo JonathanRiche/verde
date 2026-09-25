@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-APP_BIN="${1:-/Users/macuser/Applications/Verde.app/Contents/MacOS/verde}"
+APP_BIN="${1:-${HOME}/Applications/Verde.app/Contents/MacOS/verde}"
 START_URL="${VERDE_BROWSER_START_URL:-about:blank}"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then

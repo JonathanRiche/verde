@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-APP_DIR="${1:-/Users/macuser/Applications/Verde.app}"
+APP_DIR="${1:-${HOME}/Applications/Verde.app}"
 
 cd "$REPO_ROOT"
 
