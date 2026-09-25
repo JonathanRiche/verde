@@ -327,6 +327,8 @@ fn printPairGrant(
                     pairing_token: []const u8,
                     expires_at_ms: i64,
                     scopes: []const []const u8,
+                    preset: ?[]const u8 = null,
+                    max_access_mode: ?[]const u8 = null,
                 },
             };
             var parsed = std.json.parseFromSlice(Wire, allocator, result.stdout, .{ .ignore_unknown_fields = false }) catch
@@ -1180,7 +1182,7 @@ fn printHelp(io: std.Io) !void {
         \\  verde-server serve [--tailscale] [--tailscale-https-port PORT] [--no-qr] [--data-dir PATH] [--token-file PATH] [--gateway-port PORT]
         \\  verde-server status [--json]
         \\  verde-server tailscale doctor|status [--tailscale-https-port PORT] [--json]
-        \\  verde-server pair create [--no-qr] [daemon pair options]
+        \\  verde-server pair create [--preset full|chat|monitor] [--no-qr] [daemon pair options]
         \\  verde-server pair list|revoke [daemon pair options]
         \\  verde-server device list|revoke [daemon device options]
         \\  verde-server connect [--headless] [--install-service]
@@ -1194,9 +1196,9 @@ fn printHelp(io: std.Io) !void {
         \\All paths passed to services are absolute. Pair/device operations delegate
         \\to the owner-only daemon transport. Raw tokens are never accepted in argv.
         \\Pair create accepts repeated --scope SCOPE options (an explicit grant set).
-        \\Default scopes: runtime:read, chat:read, chat:write, terminal:read,
-        \\terminal:write, repository:read, repository:write, device:read.
-        \\Opt-in scopes: process:read, process:write, device:write.
+        \\Presets: full (default, all scopes, uncapped), chat (read/chat/approve,
+        \\supervised turns, no terminal writes or processes), monitor (read + push).
+        \\--preset cannot be combined with --scope (custom scopes).
         \\Existing grants and devices keep their stored scopes; new scopes are not
         \\added automatically. Device list shows granted scopes; revoke removes access.
         \\The production gateway port defaults to 7420. `serve --tailscale`

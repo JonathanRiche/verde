@@ -32,6 +32,24 @@ pub const PruneResult = struct {
 pub fn initialize(conn: zqlite.Conn) !void {
     try conn.execNoArgs(ACCESS_SCHEMA);
     try migrateScopeConstraints(conn);
+    try migratePresetColumns(conn);
+}
+
+// Nullable columns preserve the exact authority of existing devices and grants.
+fn migratePresetColumns(conn: zqlite.Conn) !void {
+    inline for (.{ "runtime_pairing_grants", "runtime_devices", "runtime_connect_devices" }) |table| {
+        inline for (.{ "preset", "max_access_mode" }) |column| {
+            var row = try conn.row("select name from pragma_table_info('" ++ table ++ "') where name = ?1", .{column});
+            if (row) |*found| found.deinit() else try conn.execNoArgs("alter table " ++ table ++ " add column " ++ column ++ " text");
+        }
+    }
+}
+
+fn storedEnum(comptime T: type, value: ?[]const u8) !?T {
+    return if (value) |text| std.meta.stringToEnum(T, text) orelse return error.AccessStoreCorrupt else null;
+}
+fn enumName(value: anytype) ?[]const u8 {
+    return if (value) |tag| @tagName(tag) else null;
 }
 
 const ACCESS_SCHEMA =
@@ -40,6 +58,8 @@ const ACCESS_SCHEMA =
     \\    verifier blob not null check(length(verifier) = 32),
     \\    label text,
     \\    scopes integer not null check(scopes > 0 and scopes <= 2047),
+    \\    preset text,
+    \\    max_access_mode text,
     \\    created_at_ms integer not null,
     \\    expires_at_ms integer not null,
     \\    consumed_at_ms integer,
@@ -55,6 +75,8 @@ const ACCESS_SCHEMA =
     \\    credential_verifier blob not null check(length(credential_verifier) = 32),
     \\    label text not null,
     \\    scopes integer not null check(scopes > 0 and scopes <= 2047),
+    \\    preset text,
+    \\    max_access_mode text,
     \\    created_at_ms integer not null,
     \\    last_used_at_ms integer,
     \\    revoked_at_ms integer
@@ -68,6 +90,8 @@ const ACCESS_SCHEMA =
     \\    credential_verifier blob not null check(length(credential_verifier) = 32),
     \\    label text not null,
     \\    scopes integer not null check(scopes > 0 and scopes <= 2047),
+    \\    preset text,
+    \\    max_access_mode text,
     \\    created_at_ms integer not null,
     \\    last_used_at_ms integer,
     \\    revoked_at_ms integer
@@ -126,6 +150,8 @@ fn migrateScopeConstraints(conn: zqlite.Conn) !void {
 
 /// Raw grant material issued exactly once to a local administrator.
 pub const IssuedPairingGrant = struct {
+    preset: ?access.PairingPreset = null,
+    max_access_mode: ?access.AccessMode = null,
     grant_id: [access.GRANT_ID_HEX_BYTES]u8,
     pairing_token: [access.SECRET_HEX_BYTES]u8,
     expires_at_ms: i64,
@@ -150,12 +176,16 @@ pub const IssuedPairingGrant = struct {
             .pairing_token = .{ .bytes = self.pairing_token[0..] },
             .expires_at_ms = self.expires_at_ms,
             .scopes = scope_names,
+            .preset = self.preset,
+            .max_access_mode = self.max_access_mode,
         };
     }
 };
 
 /// Device credential returned after an atomic grant exchange or matching retry.
 pub const IssuedDevice = struct {
+    preset: ?access.PairingPreset = null,
+    max_access_mode: ?access.AccessMode = null,
     device_id: [access.DEVICE_ID_HEX_BYTES]u8,
     device_credential: [access.SECRET_HEX_BYTES]u8,
     scope_mask: u16,
@@ -178,11 +208,15 @@ pub const IssuedDevice = struct {
             .device_id = self.device_id[0..],
             .device_credential = .{ .bytes = self.device_credential[0..] },
             .scopes = scope_names,
+            .preset = self.preset,
+            .max_access_mode = self.max_access_mode,
         };
     }
 };
 
 pub const OwnedPairingGrant = struct {
+    preset: ?access.PairingPreset = null,
+    max_access_mode: ?access.AccessMode = null,
     grant_id: []u8,
     label: ?[]u8,
     scope_mask: u16,
@@ -209,6 +243,8 @@ pub const OwnedPairingGrantList = struct {
 };
 
 pub const OwnedDevice = struct {
+    preset: ?access.PairingPreset = null,
+    max_access_mode: ?access.AccessMode = null,
     device_id: []u8,
     grant_id: ?[]u8,
     source: access.DeviceSource,
@@ -251,13 +287,18 @@ pub fn createPairingGrant(
     }
     try access.validatePairingTtl(request.ttl_seconds);
     if (request.label) |label| try access.validateDeviceLabel(label);
-    const scope_mask = try access.scopeMask(request.scopes);
+    if (request.preset != null and request.scopes.len != 0) return error.DuplicateAccessScope;
+    const preset: ?access.PairingPreset = if (request.scopes.len == 0) request.preset orelse .full else null;
+    const scope_mask = try access.scopeMask(if (preset) |value| value.scopes() else request.scopes);
+    const cap = if (preset) |value| value.maxAccessMode() orelse request.max_access_mode else request.max_access_mode;
 
     var issued: IssuedPairingGrant = .{
         .grant_id = try secureHex(access.GRANT_ID_BYTES, io),
         .pairing_token = try secureHex(access.SECRET_BYTES, io),
         .expires_at_ms = saturatingAdd(now_ms, @as(i64, request.ttl_seconds) * 1000),
         .scope_mask = scope_mask,
+        .preset = preset,
+        .max_access_mode = cap,
     };
     errdefer issued.clear();
     var verifier = secretVerifier(
@@ -290,8 +331,8 @@ pub fn createPairingGrant(
 
     try conn.exec(
         \\insert into runtime_pairing_grants
-        \\    (grant_id, verifier, label, scopes, created_at_ms, expires_at_ms)
-        \\values (?1, ?2, ?3, ?4, ?5, ?6)
+        \\    (grant_id, verifier, label, scopes, created_at_ms, expires_at_ms, preset, max_access_mode)
+        \\values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
     , .{
         issued.grant_id[0..],
         zqlite.blob(verifier[0..]),
@@ -299,6 +340,8 @@ pub fn createPairingGrant(
         @as(i64, scope_mask),
         now_ms,
         issued.expires_at_ms,
+        enumName(preset),
+        enumName(cap),
     });
     try conn.commit();
     transaction_open = false;
@@ -329,7 +372,7 @@ pub fn exchangePairingGrant(
     var transaction_open = true;
     defer if (transaction_open) conn.rollback();
     var row = (try conn.row(
-        \\select verifier, scopes, expires_at_ms, consumed_at_ms, revoked_at_ms
+        \\select verifier, scopes, expires_at_ms, consumed_at_ms, revoked_at_ms, preset, max_access_mode
         \\from runtime_pairing_grants where grant_id = ?1
     , .{request.grant_id})) orelse return error.PairingGrantRejected;
 
@@ -341,6 +384,14 @@ pub fn exchangePairingGrant(
     const expires_at_ms = row.int(2);
     const consumed_at_ms = row.nullableInt(3);
     const revoked_at_ms = row.nullableInt(4);
+    const preset = storedEnum(access.PairingPreset, row.nullableText(5)) catch |err| {
+        row.deinit();
+        return err;
+    };
+    const cap = storedEnum(access.AccessMode, row.nullableText(6)) catch |err| {
+        row.deinit();
+        return err;
+    };
     var candidate = secretVerifier(
         GRANT_VERIFIER_DOMAIN,
         request.grant_id,
@@ -375,6 +426,8 @@ pub fn exchangePairingGrant(
             .device_id = device_id[0..access.DEVICE_ID_HEX_BYTES].*,
             .device_credential = retryCredential(request, device_id),
             .scope_mask = try checkedScopeMask(retry.int(3)),
+            .preset = preset,
+            .max_access_mode = cap,
         };
         errdefer issued.clear();
         var verifier = secretVerifier(DEVICE_VERIFIER_DOMAIN, device_id, &issued.device_credential);
@@ -408,6 +461,8 @@ pub fn exchangePairingGrant(
         .device_id = try secureHex(access.DEVICE_ID_BYTES, io),
         .device_credential = try secureHex(access.SECRET_BYTES, io),
         .scope_mask = 0,
+        .preset = preset,
+        .max_access_mode = cap,
     };
     errdefer issued.clear();
     if (try deviceIdExists(conn, issued.device_id[0..])) return error.RandomCollision;
@@ -428,8 +483,8 @@ pub fn exchangePairingGrant(
     defer std.crypto.secureZero(u8, device_verifier[0..]);
     try conn.exec(
         \\insert into runtime_devices
-        \\    (device_id, grant_id, credential_verifier, label, scopes, created_at_ms)
-        \\values (?1, ?2, ?3, ?4, ?5, ?6)
+        \\    (device_id, grant_id, credential_verifier, label, scopes, created_at_ms, preset, max_access_mode)
+        \\values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
     , .{
         issued.device_id[0..],
         request.grant_id,
@@ -437,6 +492,8 @@ pub fn exchangePairingGrant(
         request.device_label,
         @as(i64, scope_mask),
         now_ms,
+        enumName(preset),
+        enumName(cap),
     });
     try conn.exec(
         \\update runtime_pairing_grants set consumed_at_ms = ?2
@@ -650,7 +707,7 @@ pub fn listPairingGrants(
     }
     var rows = try conn.rows(
         \\select grant_id, label, scopes, created_at_ms, expires_at_ms,
-        \\       consumed_at_ms, revoked_at_ms
+        \\       consumed_at_ms, revoked_at_ms, preset, max_access_mode
         \\from runtime_pairing_grants order by created_at_ms desc, grant_id
     , .{});
     defer rows.deinit();
@@ -671,6 +728,8 @@ pub fn listPairingGrants(
             .expires_at_ms = row.int(4),
             .consumed_at_ms = row.nullableInt(5),
             .revoked_at_ms = row.nullableInt(6),
+            .preset = try storedEnum(access.PairingPreset, row.nullableText(7)),
+            .max_access_mode = try storedEnum(access.AccessMode, row.nullableText(8)),
         });
     }
     if (rows.err) |err| return err;
@@ -678,6 +737,8 @@ pub fn listPairingGrants(
 }
 
 pub const OwnedSelfDevice = struct {
+    preset: ?access.PairingPreset = null,
+    max_access_mode: ?access.AccessMode = null,
     device_id: []u8,
     label: []u8,
     scope_mask: u16,
@@ -695,10 +756,10 @@ pub const OwnedSelfDevice = struct {
 pub fn getDevice(allocator: std.mem.Allocator, conn: zqlite.Conn, device_id: []const u8) !OwnedSelfDevice {
     try access.validateDeviceId(device_id);
     var row = (try conn.row(
-        \\select label, scopes, created_at_ms, last_used_at_ms from (
-        \\ select device_id, label, scopes, created_at_ms, last_used_at_ms, revoked_at_ms from runtime_devices
+        \\select label, scopes, created_at_ms, last_used_at_ms, preset, max_access_mode from (
+        \\ select device_id, label, scopes, created_at_ms, last_used_at_ms, revoked_at_ms, preset, max_access_mode from runtime_devices
         \\ union all
-        \\ select device_id, label, scopes, created_at_ms, last_used_at_ms, revoked_at_ms from runtime_connect_devices
+        \\ select device_id, label, scopes, created_at_ms, last_used_at_ms, revoked_at_ms, preset, max_access_mode from runtime_connect_devices
         \\) where device_id = ?1 and revoked_at_ms is null
     , .{device_id})) orelse return error.DeviceAuthorizationRejected;
     defer row.deinit();
@@ -712,6 +773,8 @@ pub fn getDevice(allocator: std.mem.Allocator, conn: zqlite.Conn, device_id: []c
         .scope_mask = try checkedScopeMask(row.int(1)),
         .created_at_ms = row.int(2),
         .last_used_at_ms = row.nullableInt(3),
+        .preset = try storedEnum(access.PairingPreset, row.nullableText(4)),
+        .max_access_mode = try storedEnum(access.AccessMode, row.nullableText(5)),
     };
 }
 
@@ -729,7 +792,7 @@ pub fn listDevices(
     }
     var rows = try conn.rows(
         \\select device_id, grant_id, label, scopes, created_at_ms,
-        \\       last_used_at_ms, revoked_at_ms
+        \\       last_used_at_ms, revoked_at_ms, preset, max_access_mode
         \\from runtime_devices order by created_at_ms desc, device_id
     , .{});
     defer rows.deinit();
@@ -756,12 +819,14 @@ pub fn listDevices(
             .created_at_ms = row.int(4),
             .last_used_at_ms = row.nullableInt(5),
             .revoked_at_ms = row.nullableInt(6),
+            .preset = try storedEnum(access.PairingPreset, row.nullableText(7)),
+            .max_access_mode = try storedEnum(access.AccessMode, row.nullableText(8)),
         });
     }
     if (rows.err) |err| return err;
     var connect_rows = try conn.rows(
         \\select device_id, connect_grant_id, label, scopes, created_at_ms,
-        \\       last_used_at_ms, revoked_at_ms
+        \\       last_used_at_ms, revoked_at_ms, preset, max_access_mode
         \\from runtime_connect_devices order by created_at_ms desc, device_id
     , .{});
     defer connect_rows.deinit();
@@ -787,6 +852,8 @@ pub fn listDevices(
             .created_at_ms = row.int(4),
             .last_used_at_ms = row.nullableInt(5),
             .revoked_at_ms = row.nullableInt(6),
+            .preset = try storedEnum(access.PairingPreset, row.nullableText(7)),
+            .max_access_mode = try storedEnum(access.AccessMode, row.nullableText(8)),
         });
     }
     if (connect_rows.err) |err| return err;
@@ -1402,19 +1469,19 @@ test "count pressure evicts only the oldest eligible terminal records" {
     const third_grant = "00000000000000000000000000000003";
     const active_grant = "00000000000000000000000000000004";
     try conn.exec(
-        "insert into runtime_pairing_grants values (?1, zeroblob(32), null, 1, 10, 2000, 100, null)",
+        "insert into runtime_pairing_grants (grant_id, verifier, label, scopes, created_at_ms, expires_at_ms, consumed_at_ms, revoked_at_ms) values (?1, zeroblob(32), null, 1, 10, 2000, 100, null)",
         .{first_grant},
     );
     try conn.exec(
-        "insert into runtime_pairing_grants values (?1, zeroblob(32), null, 1, 20, 2000, null, 200)",
+        "insert into runtime_pairing_grants (grant_id, verifier, label, scopes, created_at_ms, expires_at_ms, consumed_at_ms, revoked_at_ms) values (?1, zeroblob(32), null, 1, 20, 2000, null, 200)",
         .{second_grant},
     );
     try conn.exec(
-        "insert into runtime_pairing_grants values (?1, zeroblob(32), null, 1, 30, 500, null, null)",
+        "insert into runtime_pairing_grants (grant_id, verifier, label, scopes, created_at_ms, expires_at_ms, consumed_at_ms, revoked_at_ms) values (?1, zeroblob(32), null, 1, 30, 500, null, null)",
         .{third_grant},
     );
     try conn.exec(
-        "insert into runtime_pairing_grants values (?1, zeroblob(32), null, 1, 40, 2000, null, null)",
+        "insert into runtime_pairing_grants (grant_id, verifier, label, scopes, created_at_ms, expires_at_ms, consumed_at_ms, revoked_at_ms) values (?1, zeroblob(32), null, 1, 40, 2000, null, null)",
         .{active_grant},
     );
     try conn.execNoArgs("begin immediate");
@@ -1452,16 +1519,16 @@ test "count pressure evicts only the oldest eligible terminal records" {
     for (device_grants, device_ids, 0..) |grant_id, device_id, index| {
         const timestamp: i64 = @intCast(100 + index);
         try conn.exec(
-            "insert into runtime_pairing_grants values (?1, zeroblob(32), null, 1, ?2, 2000, ?2, null)",
+            "insert into runtime_pairing_grants (grant_id, verifier, label, scopes, created_at_ms, expires_at_ms, consumed_at_ms, revoked_at_ms) values (?1, zeroblob(32), null, 1, ?2, 2000, ?2, null)",
             .{ grant_id, timestamp },
         );
         try conn.exec(
-            "insert into runtime_devices values (?1, ?2, zeroblob(32), 'Device', 1, ?3, null, ?3)",
+            "insert into runtime_devices (device_id, grant_id, credential_verifier, label, scopes, created_at_ms, last_used_at_ms, revoked_at_ms) values (?1, ?2, zeroblob(32), 'Device', 1, ?3, null, ?3)",
             .{ device_id, grant_id, timestamp },
         );
     }
     try conn.exec(
-        "insert into runtime_pairing_grants values (?1, zeroblob(32), null, 1, 500, 2000, null, null)",
+        "insert into runtime_pairing_grants (grant_id, verifier, label, scopes, created_at_ms, expires_at_ms, consumed_at_ms, revoked_at_ms) values (?1, zeroblob(32), null, 1, 500, 2000, null, null)",
         .{active_grant},
     );
     try conn.execNoArgs("begin immediate");
@@ -1528,4 +1595,46 @@ test "push scope migration preserves legacy credentials retries and masks while 
     defer fk.deinit();
     try std.testing.expectEqual(@as(i64, 1), fk.int(0));
     try std.testing.expect(try conn.row("pragma foreign_key_check", .{}) == null);
+}
+
+test "preset column migration keeps legacy masks and new defaults persist caps" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(std.testing.io, &buffer);
+    const path = try std.fs.path.joinZ(a, &.{ buffer[0..len], "presets.sqlite" });
+    defer a.free(path);
+    const conn = try zqlite.open(path, zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
+    defer conn.close();
+    const old = try std.mem.replaceOwned(u8, a, ACCESS_SCHEMA, "    preset text,\n    max_access_mode text,\n", "");
+    defer a.free(old);
+    const old_z = try a.dupeZ(u8, old);
+    defer a.free(old_z);
+    try conn.execNoArgs(old_z);
+    try conn.exec("insert into runtime_pairing_grants (grant_id, verifier, scopes, created_at_ms, expires_at_ms) values (?1, ?2, 255, 1000, 60000)", .{ "a" ** 32, zqlite.blob(&(@as([32]u8, @splat(1)))) });
+    try conn.exec("insert into runtime_devices (device_id, grant_id, credential_verifier, label, scopes, created_at_ms) values (?1, ?2, ?3, 'Legacy', 255, 2000)", .{ "b" ** 32, "a" ** 32, zqlite.blob(&(@as([32]u8, @splat(2)))) });
+    try initialize(conn);
+    try initialize(conn);
+    var old_device = try getDevice(a, conn, "b" ** 32);
+    defer old_device.deinit(a);
+    try std.testing.expectEqual(@as(u16, 255), old_device.scope_mask);
+    try std.testing.expect(old_device.preset == null and old_device.max_access_mode == null);
+    var full = try createPairingGrant(std.testing.io, conn, .{ .access_protocol_version = 1 }, 3000);
+    defer full.clear();
+    try std.testing.expectEqual(@as(?access.PairingPreset, .full), full.preset);
+    try std.testing.expectEqual(try access.scopeMask(&access.ALL_SCOPE_NAMES), full.scope_mask);
+    try std.testing.expect(full.max_access_mode == null);
+    var custom = try createPairingGrant(std.testing.io, conn, .{ .access_protocol_version = 1, .scopes = &access.ALL_SCOPE_NAMES, .max_access_mode = .supervised }, 4000);
+    defer custom.clear();
+    try std.testing.expect(custom.preset == null);
+    var device = try exchangePairingGrant(std.testing.io, conn, .{ .access_protocol_version = 1, .grant_id = &custom.grant_id, .pairing_token = .{ .bytes = &custom.pairing_token }, .device_label = "Custom capped" }, 5000);
+    defer device.clear();
+    const reopened = try zqlite.open(path, zqlite.OpenFlags.EXResCode);
+    defer reopened.close();
+    var stored = try getDevice(a, reopened, &device.device_id);
+    defer stored.deinit(a);
+    try std.testing.expectEqual(@as(?access.AccessMode, .supervised), stored.max_access_mode);
+    try std.testing.expect(stored.preset == null);
+    try std.testing.expectError(error.DuplicateAccessScope, createPairingGrant(std.testing.io, conn, .{ .access_protocol_version = 1, .preset = .chat, .scopes = &access.ALL_SCOPE_NAMES }, 6000));
 }

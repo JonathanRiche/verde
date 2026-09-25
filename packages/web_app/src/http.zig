@@ -3213,6 +3213,10 @@ fn respondPairExchangeResult(
     try json.write(result.device_id);
     try json.objectField("device_credential");
     try json.write(result.device_credential.reveal());
+    try json.objectField("preset");
+    try json.write(result.preset);
+    try json.objectField("max_access_mode");
+    try json.write(result.max_access_mode);
     try json.objectField("scopes");
     try json.write(result.scopes);
     try json.endObject();
@@ -3781,6 +3785,15 @@ test "paired gateway dispatches every allowlisted RPC and binds process ownershi
             self.calls += 1;
             var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
             defer parsed.deinit();
+            if (std.mem.eql(u8, parsed.value.object.get("method").?.string, headless.access_protocol.METHOD_DAEMON_DEVICE_AUTHORIZE)) {
+                const params = parsed.value.object.get("params").?.object;
+                return .{ .json = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .result = .{
+                    .access_protocol_version = 1,
+                    .device_id = params.get("device_id").?.string,
+                    .scopes = params.get("required_scopes").?,
+                    .max_access_mode = @as(?headless.access_protocol.AccessMode, null),
+                } }, .{}) };
+            }
             if (std.mem.eql(u8, parsed.value.object.get("method").?.string, "daemon.client.register")) {
                 const params = parsed.value.object.get("params").?.object;
                 try std.testing.expect(!params.get("persistent").?.bool);
@@ -3971,5 +3984,25 @@ test "successful self and owner revoke invalidate the next token call and ticket
         try std.testing.expect((try auth.pair_credentials.validateAccessToken(io, &token.value, 1002)) == null);
         try std.testing.expect((try auth.pair_credentials.consumeWebSocketTicket(io, &ticket.value, 1002)) == null);
         try std.testing.expect((try auth.pair_credentials.validateAccessToken(io, &other_token.value, 1002)) != null);
+    }
+}
+
+test "paired preset RPC policy permits only each preset's selected authority" {
+    const access = headless.access_protocol;
+    const full = try access.scopeMask(access.PairingPreset.full.scopes());
+    const chat = try access.scopeMask(access.PairingPreset.chat.scopes());
+    const monitor = try access.scopeMask(access.PairingPreset.monitor.scopes());
+    for (access.PAIRED_RPC_METHODS) |entry| try std.testing.expectEqual(PairedRpcPolicy{ .authorize = entry.scope_mask }, pairedRpcPolicy(entry.method, full));
+    for ([_][]const u8{ "chat.turn.start", "chat.turn.approve", "device.push.register" }) |method| {
+        try std.testing.expectEqual(PairedRpcPolicy{ .authorize = access.requiredScopeMaskForRpc(method).? }, pairedRpcPolicy(method, chat));
+    }
+    for ([_][]const u8{ "chat.shell.run", "session.write", "process.list", "process.start", "workspace.upsert" }) |method| {
+        try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy(method, chat));
+    }
+    for ([_][]const u8{ "chat.turn.start", "chat.turn.approve", "chat.shell.run", "session.write", "process.start", "workspace.upsert" }) |method| {
+        try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy(method, monitor));
+    }
+    for ([_][]const u8{ "core.snapshot", "process.list", "device.push.register" }) |method| {
+        try std.testing.expectEqual(PairedRpcPolicy{ .authorize = access.requiredScopeMaskForRpc(method).? }, pairedRpcPolicy(method, monitor));
     }
 }

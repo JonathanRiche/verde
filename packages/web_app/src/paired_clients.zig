@@ -4,6 +4,8 @@ const auth = @import("auth.zig");
 const access = @import("headless").access_protocol;
 const protocol = @import("headless").protocol;
 
+pub const ACCESS_CAP_NOTICE = "This device is limited to approval-required access. The request was clamped to supervised mode; shell commands require explicit approval.";
+
 pub const Manager = struct {
     const Entry = struct {
         device_id: [32]u8 = @splat(0),
@@ -18,10 +20,138 @@ pub const Manager = struct {
     mutex: std.Io.Mutex = .init,
     entries: [auth.MAX_ACCESS_TOKENS]Entry = @splat(.{}),
 
+    /// Re-read the durable device policy for every execution request. Tokens
+    /// carry scopes, never a cached cap that could outlive a policy change.
+    pub fn forward(self: *Manager, allocator: std.mem.Allocator, io: std.Io, claims: auth.PairClaims, raw: []const u8, daemon: anytype) ![]u8 {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        const root = &parsed.value.object;
+        const method = root.get("method").?.string;
+        const shell = std.mem.eql(u8, method, "chat.shell.run");
+        if (!shell and !std.mem.eql(u8, method, "chat.turn.start"))
+            return self.forwardUnchecked(allocator, io, claims, raw, daemon);
+        const target: ?protocol.RequestTarget = if (root.get("target")) |value|
+            protocol.parseRequestTarget(value) catch return self.forwardUnchecked(allocator, io, claims, raw, daemon)
+        else
+            null;
+        const required = access.requiredScopeMaskForRpc(method).?;
+        const scopes = try access.scopeNamesAlloc(allocator, required);
+        defer allocator.free(scopes);
+        const query = try std.json.Stringify.valueAlloc(allocator, .{
+            .id = root.get("id") orelse .null,
+            .target = target,
+            .method = access.METHOD_DAEMON_DEVICE_AUTHORIZE,
+            .params = access.DeviceAuthorizeRequest{
+                .access_protocol_version = access.ACCESS_PROTOCOL_VERSION,
+                .device_id = &claims.device_id,
+                .required_scopes = scopes,
+            },
+        }, .{ .emit_null_optional_fields = false });
+        defer allocator.free(query);
+        const authorized = try daemon.callRaw(query);
+        defer allocator.free(authorized.json);
+        var response = try std.json.parseFromSlice(std.json.Value, allocator, authorized.json, .{});
+        defer response.deinit();
+        const result = response.value.object.get("result") orelse return allocator.dupe(u8, authorized.json);
+        var policy = try std.json.parseFromValue(access.DeviceAuthorizationResult, allocator, result, .{});
+        defer policy.deinit();
+        if (policy.value.access_protocol_version != access.ACCESS_PROTOCOL_VERSION or
+            !std.mem.eql(u8, policy.value.device_id, &claims.device_id) or
+            try access.scopeMask(policy.value.scopes) != required) return error.InvalidDevicePolicy;
+        if (policy.value.max_access_mode != .supervised)
+            return self.forwardUnchecked(allocator, io, claims, raw, daemon);
+        const params = root.getPtr("params") orelse return self.forwardUnchecked(allocator, io, claims, raw, daemon);
+        if (params.* != .object) return self.forwardUnchecked(allocator, io, claims, raw, daemon);
+        const requested = params.object.get("access_mode") orelse .null;
+        // Missing, null and unrecognized values all mean full_access to the daemon.
+        const clamped = shell or requested != .string or !std.mem.eql(u8, requested.string, "supervised");
+        if (!clamped) return self.forwardUnchecked(allocator, io, claims, raw, daemon);
+        if (!shell) try params.object.put(parsed.arena.allocator(), "access_mode", .{ .string = "supervised" });
+
+        // A durable system row makes the policy visible to every client, including
+        // reconnects. Its stable key prevents duplicate turn notices on retry.
+        const workspace = params.object.get("workspace_id") orelse return error.InvalidCappedRequest;
+        const thread = params.object.get("local_thread_id") orelse return error.InvalidCappedRequest;
+        if (workspace != .string or thread != .string) return error.InvalidCappedRequest;
+        const turn_id = params.object.get("turn_id") orelse .null;
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(if (!shell and turn_id == .string) turn_id.string else raw, &digest, .{});
+        const key = try std.fmt.allocPrint(allocator, "access-cap:{s}:{s}", .{ claims.device_id, std.fmt.bytesToHex(digest, .lower) });
+        defer allocator.free(key);
+        const notice = try std.json.Stringify.valueAlloc(allocator, .{
+            .id = root.get("id") orelse .null,
+            .target = target,
+            .method = "chat.message.append",
+            .params = .{
+                .mutation = .{ .client_id = "gateway", .request_key = key },
+                .workspace_id = workspace.string,
+                .thread_id = thread.string,
+                .message = .{
+                    .message_id = key,
+                    .role = "system",
+                    .author = "Verde",
+                    .body = ACCESS_CAP_NOTICE,
+                },
+            },
+        }, .{ .emit_null_optional_fields = false });
+        defer allocator.free(notice);
+        // Start first so daemon-created threads exist. A retry of the same
+        // turn ID is idempotent; if notice persistence fails, return that error
+        // and the retry can repair the notice without starting another turn.
+        const encoded = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
+        defer allocator.free(encoded);
+        const started = if (!shell) try self.forwardUnchecked(allocator, io, claims, encoded, daemon) else null;
+        defer if (started) |value| allocator.free(value);
+        if (started) |value| {
+            var accepted = try std.json.parseFromSlice(std.json.Value, allocator, value, .{});
+            defer accepted.deinit();
+            if (accepted.value.object.contains("error")) return allocator.dupe(u8, value);
+        }
+        var appended = try self.forwardUnchecked(allocator, io, claims, notice, daemon);
+        defer allocator.free(appended);
+        // Acceptance stages a new thread on the daemon worker. Wait only for
+        // that short race; all other persistence failures are returned intact.
+        if (started != null) {
+            var attempt: usize = 0;
+            while (attempt < 40 and try missingNoticeThread(allocator, appended)) : (attempt += 1) {
+                try std.Io.sleep(io, .fromMilliseconds(25), .awake);
+                const retry = try self.forwardUnchecked(allocator, io, claims, notice, daemon);
+                allocator.free(appended);
+                appended = retry;
+            }
+        }
+        var receipt = try std.json.parseFromSlice(std.json.Value, allocator, appended, .{});
+        defer receipt.deinit();
+        if (receipt.value.object.contains("error")) return allocator.dupe(u8, appended);
+        if (!receipt.value.object.contains("result")) return error.InvalidNoticeReceipt;
+        if (shell) {
+            const confirmed = params.object.get("confirmed") orelse .null;
+            if (confirmed != .bool or !confirmed.bool) return std.json.Stringify.valueAlloc(allocator, .{
+                .jsonrpc = "2.0",
+                .id = root.get("id") orelse .null,
+                .@"error" = .{
+                    .code = @import("headless").store_protocol.ERR_SHELL_CONFIRMATION_REQUIRED,
+                    .message = ACCESS_CAP_NOTICE,
+                },
+            }, .{});
+        }
+        if (started) |value| return allocator.dupe(u8, value);
+        return self.forwardUnchecked(allocator, io, claims, encoded, daemon);
+    }
+
+    fn missingNoticeThread(allocator: std.mem.Allocator, raw: []const u8) !bool {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+        defer parsed.deinit();
+        const err = parsed.value.object.get("error") orelse return false;
+        if (err != .object) return false;
+        const code = err.object.get("code") orelse return false;
+        return code == .string and std.mem.eql(u8, code.string, protocol.ERR_RESOURCE_NOT_FOUND);
+    }
+
     /// Called only after method scope and device authorization, for both transports.
     /// Registration parameters are gateway-owned; mutation identities cannot be
     /// borrowed from another session (including an owner browser).
-    pub fn forward(self: *Manager, allocator: std.mem.Allocator, io: std.Io, claims: auth.PairClaims, raw: []const u8, daemon: anytype) ![]u8 {
+    fn forwardUnchecked(self: *Manager, allocator: std.mem.Allocator, io: std.Io, claims: auth.PairClaims, raw: []const u8, daemon: anytype) ![]u8 {
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{ .allocate = .alloc_always });
         defer parsed.deinit();
         const root = &parsed.value.object;
@@ -386,4 +516,93 @@ test "push RPC forwarding binds every operation to the authenticated device" {
     var parsed = try std.json.parseFromSlice(std.json.Value, a, no_params, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings(&claims.device_id, parsed.value.object.get("params").?.object.get("device_id").?.string);
+}
+
+test "paired execution clamps defaults and elevated modes with durable notices and shell approval" {
+    const FakeDaemon = struct {
+        cap: ?access.AccessMode = .supervised,
+        notices: usize = 0,
+        executions: usize = 0,
+        fail_notice: bool = false,
+        missing_thread_once: bool = true,
+        reject_device: bool = false,
+        last_notice: [128]u8 = @splat(0),
+        last_notice_len: usize = 0,
+        pub fn callRaw(self: *@This(), raw: []const u8) !struct { json: []u8 } {
+            const a = std.testing.allocator;
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+            defer parsed.deinit();
+            const root = parsed.value.object;
+            const method = root.get("method").?.string;
+            const params = root.get("params").?.object;
+            if (std.mem.eql(u8, method, access.METHOD_DAEMON_DEVICE_AUTHORIZE)) {
+                try std.testing.expectEqualStrings("a" ** 32, params.get("device_id").?.string);
+                if (self.reject_device) return .{ .json = try a.dupe(u8, "{\"error\":{\"code\":\"authentication_rejected\"}}") };
+                return .{ .json = try std.json.Stringify.valueAlloc(a, .{ .result = .{ .access_protocol_version = 1, .device_id = "a" ** 32, .scopes = params.get("required_scopes").?, .max_access_mode = self.cap } }, .{}) };
+            }
+            if (std.mem.eql(u8, method, "daemon.client.register")) return .{ .json = try a.dupe(u8, "{\"result\":{\"client_id\":\"fixture\"}}") };
+            if (std.mem.eql(u8, method, "chat.message.append")) {
+                self.notices += 1;
+                const key = params.get("message").?.object.get("message_id").?.string;
+                self.last_notice_len = key.len;
+                @memcpy(self.last_notice[0..key.len], key);
+                if (self.missing_thread_once) {
+                    self.missing_thread_once = false;
+                    return .{ .json = try a.dupe(u8, "{\"error\":{\"code\":\"resource_not_found\"}}") };
+                }
+                try std.testing.expectEqualStrings("fixture", params.get("mutation").?.object.get("client_id").?.string);
+                try std.testing.expectEqualStrings("system", params.get("message").?.object.get("role").?.string);
+                try std.testing.expectEqualStrings(ACCESS_CAP_NOTICE, params.get("message").?.object.get("body").?.string);
+                return .{ .json = try a.dupe(u8, if (self.fail_notice) "{\"error\":{\"code\":\"store_unavailable\"}}" else "{\"result\":{\"applied\":true}}") };
+            }
+            self.executions += 1;
+            return .{ .json = try a.dupe(u8, raw) };
+        }
+    };
+    const a = std.testing.allocator;
+    const claims: auth.PairClaims = .{ .device_id = @splat('a'), .scope_mask = 0xffff, .deadline_ms = auth.nowMillis(std.testing.io) + 60000 };
+    var manager: Manager = .{};
+    var daemon: FakeDaemon = .{};
+    for ([_][]const u8{ "", ",\"access_mode\":null", ",\"access_mode\":\"full_access\"", ",\"access_mode\":\"unknown\"", ",\"access_mode\":42", ",\"access_mode\":\"supervised\"" }, 0..) |mode, index| {
+        const raw = try std.fmt.allocPrint(a, "{{\"id\":1,\"method\":\"chat.turn.start\",\"params\":{{\"workspace_id\":\"ws\",\"local_thread_id\":\"thread\",\"turn_id\":\"turn-{d}\"{s}}}}}", .{ index, mode });
+        defer a.free(raw);
+        const forwarded = try manager.forward(a, std.testing.io, claims, raw, &daemon);
+        defer a.free(forwarded);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, forwarded, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("supervised", parsed.value.object.get("params").?.object.get("access_mode").?.string);
+    }
+    try std.testing.expectEqual(@as(usize, 6), daemon.notices);
+    try std.testing.expectEqual(@as(usize, 6), daemon.executions);
+    for ([_]bool{ false, true }) |confirmed| {
+        const raw = try std.json.Stringify.valueAlloc(a, .{ .id = 2, .method = "chat.shell.run", .params = .{ .workspace_id = "ws", .local_thread_id = "thread", .command = "pwd", .confirmed = confirmed } }, .{});
+        defer a.free(raw);
+        const response = try manager.forward(a, std.testing.io, claims, raw, &daemon);
+        defer a.free(response);
+        if (!confirmed) try std.testing.expect(std.mem.indexOf(u8, response, "confirmation_required") != null);
+    }
+    try std.testing.expectEqual(@as(usize, 7), daemon.executions);
+    const raw = "{\"id\":3,\"method\":\"chat.turn.start\",\"params\":{\"workspace_id\":\"ws\",\"local_thread_id\":\"thread\",\"turn_id\":\"last\",\"access_mode\":\"full_access\"}}";
+    daemon.fail_notice = true;
+    const failed = try manager.forward(a, std.testing.io, claims, raw, &daemon);
+    defer a.free(failed);
+    try std.testing.expect(std.mem.indexOf(u8, failed, "store_unavailable") != null);
+    try std.testing.expectEqual(@as(usize, 8), daemon.executions);
+    const failed_key = daemon.last_notice;
+    const failed_key_len = daemon.last_notice_len;
+    daemon.fail_notice = false;
+    const repaired = try manager.forward(a, std.testing.io, claims, raw, &daemon);
+    defer a.free(repaired);
+    try std.testing.expectEqualStrings(failed_key[0..failed_key_len], daemon.last_notice[0..daemon.last_notice_len]);
+    daemon.reject_device = true;
+    const rejected = try manager.forward(a, std.testing.io, claims, raw, &daemon);
+    defer a.free(rejected);
+    try std.testing.expect(std.mem.indexOf(u8, rejected, "authentication_rejected") != null);
+    try std.testing.expectEqual(@as(usize, 9), daemon.executions);
+    daemon.reject_device = false;
+    daemon.cap = null;
+    const uncapped = try manager.forward(a, std.testing.io, claims, raw, &daemon);
+    defer a.free(uncapped);
+    try std.testing.expectEqualStrings(raw, uncapped);
+    try std.testing.expectEqual(@as(usize, 10), daemon.executions);
 }

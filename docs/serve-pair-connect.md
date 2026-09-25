@@ -280,7 +280,8 @@ runtime:read
 chat:read chat:write
 terminal:read terminal:write
 repository:read repository:write
-device:read
+process:read process:write
+device:read device:write
 ```
 
 Pairing and device records are runtime-owned durable data. They are keyed to
@@ -321,7 +322,7 @@ all four categories. The gateway revalidates expiry and current device status
 before every received RPC and before and after each bounded change poll, so an
 expired token or revoked device closes an existing socket without waiting for
 reconnect. Individual RPCs still require their exact read/write scope; unknown,
-process-control, lease, daemon-lifecycle, and private access methods fail
+lease, daemon-lifecycle, and private access methods fail
 closed. Specialized `/api/*` routes use the same scope checks.
 
 Pair exchange, failed device authentication, and failed access-token/ticket
@@ -567,3 +568,35 @@ plane. Connect users may self-host the reference service with a compatible
 OIDC provider and endpoint adapter; a Verde account or Verde-operated relay is
 not required. Private Verde Cloud deployment and subscription features are not
 an open-source completion gate.
+
+## Pairing permission presets
+
+`verde-server pair create --preset full|chat|monitor` (also accepted by
+`verde-daemon pair create`) selects a durable preset. Omitting both `--preset`
+and `--scope` selects **Full**. Explicit `--scope` options create a custom
+grant and cannot be combined with `--preset`.
+
+- **Full:** every supported scope, including terminal writes, process reads
+  and writes, and device writes; no access-mode cap.
+- **Chat:** runtime, chat, terminal, repository and device reads, chat writes
+  (including approvals), and device writes for push; no process scopes,
+  terminal writes or repository writes. Turns are capped at `supervised`.
+- **Monitor:** all read scopes plus device writes for push; no chat, terminal,
+  repository or process writes.
+
+For the desktop picker, use `headless.access_protocol.PAIRING_PRESETS` and
+send the selected enum as `preset` in `daemon.access.pairing.create`, with
+`access_protocol_version: 1` and optional `label` / `ttl_seconds`. Omit
+`scopes`; do not send the old default scope array alongside the preset.
+Grant create/list/exchange and device list/self responses expose nullable
+`preset` and `max_access_mode`. Existing records remain custom/legacy
+(`preset: null`) with unchanged scopes and no cap. Custom scope requests may
+set `max_access_mode: "supervised"` independently.
+
+The paired-client gateway reads the stored cap for each `chat.turn.start`
+and `chat.shell.run`. Over-cap (including omitted/default) turn modes become
+`supervised`; shell execution under that cap requires `confirmed: true`.
+The gateway persists a system notice in the chat transcript. Notices for
+turn starts use a stable message identity so retries do not duplicate them.
+The Chat preset itself lacks terminal-write authority, so shell requests
+are scope-denied before cap enforcement. Owner requests are unchanged.

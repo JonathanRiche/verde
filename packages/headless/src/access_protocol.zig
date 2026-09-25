@@ -138,9 +138,9 @@ pub const ALL_SCOPE_NAMES = names: {
     break :names names;
 };
 
-/// Single-user default grant. Process control and device writes are opt-in:
-/// they are never added to this set, so existing and default grants keep the
-/// authority they were issued with.
+/// Legacy scope selection retained for existing clients and explicit grants.
+/// New pairing grants without explicit scopes use PairingPreset.full instead.
+/// Keeping this array frozen does not silently widen legacy token requests.
 pub const DEFAULT_SCOPE_NAMES = [_][]const u8{
     Scope.runtime_read.wireName(),
     Scope.chat_read.wireName(),
@@ -151,6 +151,27 @@ pub const DEFAULT_SCOPE_NAMES = [_][]const u8{
     Scope.repository_write.wireName(),
     Scope.device_read.wireName(),
 };
+
+/// Preset names are stable wire values; custom/legacy grants have no preset.
+pub const PairingPreset = enum {
+    full,
+    chat,
+    monitor,
+
+    pub fn scopes(self: PairingPreset) []const []const u8 {
+        return switch (self) {
+            .full => &ALL_SCOPE_NAMES,
+            .chat => &.{ "runtime:read", "chat:read", "chat:write", "terminal:read", "repository:read", "device:read", "device:write" },
+            .monitor => &.{ "runtime:read", "chat:read", "terminal:read", "repository:read", "device:read", "process:read", "device:write" },
+        };
+    }
+
+    pub fn maxAccessMode(self: PairingPreset) ?AccessMode {
+        return if (self == .chat) .supervised else null;
+    }
+};
+pub const PAIRING_PRESETS = [_]PairingPreset{ .full, .chat, .monitor };
+pub const AccessMode = enum { supervised, full_access };
 
 /// Parse one stable scope spelling without accepting case or separator aliases.
 pub fn parseScope(value: []const u8) !Scope {
@@ -403,7 +424,10 @@ pub const PairingGrantCreateRequest = struct {
     access_protocol_version: u32,
     label: ?[]const u8 = null,
     ttl_seconds: u32 = DEFAULT_PAIRING_TTL_SECONDS,
-    scopes: []const []const u8,
+    /// Omit scopes to select a preset (Full by default). Explicit scopes are custom.
+    scopes: []const []const u8 = &.{},
+    preset: ?PairingPreset = null,
+    max_access_mode: ?AccessMode = null,
 };
 
 pub const PairingGrantListRequest = struct {
@@ -413,6 +437,8 @@ pub const PairingGrantListRequest = struct {
 /// Secret-bearing local result for a future explicit administrator surface.
 /// Generic serialization redacts the token; wire output must be deliberate.
 pub const PairingGrantCreateResult = struct {
+    preset: ?PairingPreset = null,
+    max_access_mode: ?AccessMode = null,
     access_protocol_version: u32,
     runtime_id: []const u8,
     instance_id: []const u8,
@@ -424,6 +450,8 @@ pub const PairingGrantCreateResult = struct {
 
 /// Durable non-secret administrator view of a one-time pairing grant.
 pub const PairingGrantRecord = struct {
+    preset: ?PairingPreset = null,
+    max_access_mode: ?AccessMode = null,
     grant_id: []const u8,
     label: ?[]const u8 = null,
     scopes: []const []const u8,
@@ -484,6 +512,8 @@ pub fn parsePairingGrantExchangeRequest(
 /// Long-lived device material is returned once and stored by clients only in
 /// their OS credential store. The runtime retains a verifier, not this value.
 pub const PairingGrantExchangeResult = struct {
+    preset: ?PairingPreset = null,
+    max_access_mode: ?AccessMode = null,
     access_protocol_version: u32,
     runtime_id: []const u8,
     instance_id: []const u8,
@@ -504,6 +534,8 @@ pub const RuntimeEndpointMetadata = struct {
 };
 
 pub const DeviceRecord = struct {
+    preset: ?PairingPreset = null,
+    max_access_mode: ?AccessMode = null,
     device_id: []const u8,
     grant_id: ?[]const u8 = null,
     source: DeviceSource = .pair,
@@ -522,6 +554,8 @@ pub const DeviceSelfRequest = struct {
 };
 
 pub const DeviceSelfResult = struct {
+    preset: ?PairingPreset = null,
+    max_access_mode: ?AccessMode = null,
     device_id: []const u8,
     label: []const u8,
     scopes: []const []const u8,
@@ -620,6 +654,8 @@ pub const DeviceAuthorizeRequest = struct {
 };
 
 pub const DeviceAuthorizationResult = struct {
+    preset: ?PairingPreset = null,
+    max_access_mode: ?AccessMode = null,
     access_protocol_version: u32,
     device_id: []const u8,
     scopes: []const []const u8,
@@ -878,4 +914,23 @@ test "device self service is scoped and administration is owner only" {
     for ([_][]const u8{ METHOD_DEVICE_LIST, METHOD_DEVICE_REVOKE }) |method| {
         try std.testing.expect(requiredScopeMaskForRpc(method) == null);
     }
+}
+
+test "pairing presets have exact scopes and caps" {
+    try std.testing.expectEqual(try scopeMask(&ALL_SCOPE_NAMES), try scopeMask(PairingPreset.full.scopes()));
+    try std.testing.expectEqual(@as(?AccessMode, null), PairingPreset.full.maxAccessMode());
+    const chat = try scopeMask(PairingPreset.chat.scopes());
+    const monitor = try scopeMask(PairingPreset.monitor.scopes());
+    try std.testing.expectEqual(@as(?AccessMode, .supervised), PairingPreset.chat.maxAccessMode());
+    try std.testing.expectEqual(@as(?AccessMode, null), PairingPreset.monitor.maxAccessMode());
+    try std.testing.expectEqual(try scopeMask(&.{ "runtime:read", "chat:read", "chat:write", "terminal:read", "repository:read", "device:read", "device:write" }), chat);
+    try std.testing.expectEqual(try scopeMask(&.{ "runtime:read", "chat:read", "terminal:read", "repository:read", "device:read", "process:read", "device:write" }), monitor);
+    for (PAIRING_PRESETS) |preset| {
+        const mask = try scopeMask(preset.scopes());
+        try std.testing.expect(scopeMaskContains(mask, webSocketBootstrapScopeMask()));
+        try std.testing.expect(scopeMaskContains(mask, requiredScopeMaskForRpc("device.push.register").?));
+    }
+    try std.testing.expect(!scopeMaskContains(chat, requiredScopeMaskForRpc("chat.shell.run").?));
+    try std.testing.expect(!scopeMaskContains(monitor, requiredScopeMaskForRpc("chat.turn.start").?));
+    try std.testing.expect(scopeMaskContains(chat, requiredScopeMaskForRpc("chat.turn.approve").?));
 }

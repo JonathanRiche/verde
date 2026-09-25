@@ -3468,6 +3468,8 @@ pub const Daemon = struct {
                     record.* = .{
                         .grant_id = grant.grant_id,
                         .label = grant.label,
+                        .preset = grant.preset,
+                        .max_access_mode = grant.max_access_mode,
                         .scopes = access_protocol.scopeNamesAlloc(arena, grant.scope_mask) catch |err|
                             return try accessAdminErrorResponse(self.allocator, id_value, err),
                         .created_at_ms = grant.created_at_ms,
@@ -3506,6 +3508,8 @@ pub const Daemon = struct {
                 break :response try okValueResponse(self.allocator, id_value, access_protocol.DeviceSelfResult{
                     .device_id = device.device_id,
                     .label = device.label,
+                    .preset = device.preset,
+                    .max_access_mode = device.max_access_mode,
                     .scopes = try access_protocol.scopeNamesAlloc(arena, device.scope_mask),
                     .created_at_ms = device.created_at_ms,
                     .last_used_at_ms = device.last_used_at_ms,
@@ -3526,6 +3530,8 @@ pub const Daemon = struct {
                         .source = device.source,
                         .source_id = device.source_id,
                         .label = device.label,
+                        .preset = device.preset,
+                        .max_access_mode = device.max_access_mode,
                         .scopes = access_protocol.scopeNamesAlloc(arena, device.scope_mask) catch |err|
                             return try accessAdminErrorResponse(self.allocator, id_value, err),
                         .created_at_ms = device.created_at_ms,
@@ -3586,7 +3592,12 @@ pub const Daemon = struct {
                     authenticate_request.requested_scopes,
                     now_ms,
                 ) catch |err| return try accessAdminErrorResponse(self.allocator, id_value, err);
+                var device = access_store.getDevice(self.allocator, service.store.conn, authenticate_request.device_id) catch |err|
+                    return try accessAdminErrorResponse(self.allocator, id_value, err);
+                defer device.deinit(self.allocator);
                 const result: access_protocol.DeviceAuthorizationResult = .{
+                    .preset = device.preset,
+                    .max_access_mode = device.max_access_mode,
                     .access_protocol_version = access_protocol.ACCESS_PROTOCOL_VERSION,
                     .device_id = authenticate_request.device_id,
                     .scopes = access_protocol.scopeNamesAlloc(arena, scope_mask) catch |err|
@@ -3600,7 +3611,12 @@ pub const Daemon = struct {
                     authorize_request.device_id,
                     authorize_request.required_scopes,
                 ) catch |err| return try accessAdminErrorResponse(self.allocator, id_value, err);
+                var device = access_store.getDevice(self.allocator, service.store.conn, authorize_request.device_id) catch |err|
+                    return try accessAdminErrorResponse(self.allocator, id_value, err);
+                defer device.deinit(self.allocator);
                 const result: access_protocol.DeviceAuthorizationResult = .{
+                    .preset = device.preset,
+                    .max_access_mode = device.max_access_mode,
                     .access_protocol_version = access_protocol.ACCESS_PROTOCOL_VERSION,
                     .device_id = authorize_request.device_id,
                     .scopes = access_protocol.scopeNamesAlloc(arena, scope_mask) catch |err|
@@ -12564,6 +12580,10 @@ fn pairingGrantCreateResponse(
     try json.write(issued.pairing_token[0..]);
     try json.objectField("expires_at_ms");
     try json.write(issued.expires_at_ms);
+    try json.objectField("preset");
+    try json.write(issued.preset);
+    try json.objectField("max_access_mode");
+    try json.write(issued.max_access_mode);
     try json.objectField("scopes");
     try json.write(scope_names);
     try json.endObject();
@@ -12600,6 +12620,10 @@ fn pairingGrantExchangeResponse(
     try json.write(issued.device_id[0..]);
     try json.objectField("device_credential");
     try json.write(issued.device_credential[0..]);
+    try json.objectField("preset");
+    try json.write(issued.preset);
+    try json.objectField("max_access_mode");
+    try json.write(issued.max_access_mode);
     try json.objectField("scopes");
     try json.write(scope_names);
     try json.endObject();
@@ -22392,4 +22416,73 @@ test "attention fake turns enqueue sealed terminal approval and blocked events o
     }
     if (rows.err) |err| return err;
     try std.testing.expectEqual(kinds.len, count);
+}
+
+test "pair preset and cap survive create exchange device list and self responses" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testStoreDbPath(&tmp);
+    defer a.free(path);
+    var daemon = Daemon.init(a);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, path);
+    defer detachTestStoreService(&daemon);
+    for (access_protocol.PAIRING_PRESETS) |preset| {
+        const create = try std.json.Stringify.valueAlloc(a, .{ .id = 1, .method = access_protocol.METHOD_DAEMON_PAIRING_GRANT_CREATE, .params = .{ .access_protocol_version = 1, .preset = preset } }, .{});
+        defer a.free(create);
+        const created = try daemon.handleRequest(create);
+        defer a.free(created);
+        var grant = try std.json.parseFromSlice(std.json.Value, a, created, .{});
+        defer grant.deinit();
+        const grant_result = grant.value.object.get("result").?;
+        try expectPresetResponse(grant_result, preset);
+        const exchange = try std.json.Stringify.valueAlloc(a, .{ .id = 2, .method = access_protocol.METHOD_DAEMON_PAIRING_EXCHANGE, .params = .{ .access_protocol_version = 1, .grant_id = grant_result.object.get("grant_id").?.string, .pairing_token = grant_result.object.get("pairing_token").?.string, .device_label = "Preset fixture", .client_nonce = "a" ** 32 } }, .{});
+        defer a.free(exchange);
+        for (0..2) |_| {
+            const exchanged = try daemon.handleRequest(exchange);
+            defer a.free(exchanged);
+            var device = try std.json.parseFromSlice(std.json.Value, a, exchanged, .{});
+            defer device.deinit();
+            const device_result = device.value.object.get("result").?;
+            try expectPresetResponse(device_result, preset);
+            const authorize_request = try std.json.Stringify.valueAlloc(a, .{ .id = 5, .method = access_protocol.METHOD_DAEMON_DEVICE_AUTHORIZE, .params = .{ .access_protocol_version = 1, .device_id = device_result.object.get("device_id").?.string, .required_scopes = preset.scopes() } }, .{});
+            defer a.free(authorize_request);
+            const authorized = try daemon.handleRequest(authorize_request);
+            defer a.free(authorized);
+            var authorization = try std.json.parseFromSlice(std.json.Value, a, authorized, .{});
+            defer authorization.deinit();
+            try expectPresetResponse(authorization.value.object.get("result").?, preset);
+            const self_request = try std.json.Stringify.valueAlloc(a, .{ .id = 3, .method = "device.self.get", .params = .{ .device_id = device_result.object.get("device_id").?.string } }, .{});
+            defer a.free(self_request);
+            const self_response = try daemon.handleRequest(self_request);
+            defer a.free(self_response);
+            var self = try std.json.parseFromSlice(std.json.Value, a, self_response, .{});
+            defer self.deinit();
+            try expectPresetResponse(self.value.object.get("result").?, preset);
+        }
+    }
+    for ([_][]const u8{ "device.list", access_protocol.METHOD_DAEMON_PAIRING_GRANT_LIST }) |method| {
+        const request = try std.json.Stringify.valueAlloc(a, .{ .id = 4, .method = method, .params = .{ .access_protocol_version = 1 } }, .{});
+        defer a.free(request);
+        const response = try daemon.handleRequest(request);
+        defer a.free(response);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, response, .{});
+        defer parsed.deinit();
+        const entries = parsed.value.object.get("result").?.object.get(if (std.mem.eql(u8, method, "device.list")) "devices" else "grants").?.array.items;
+        try std.testing.expectEqual(@as(usize, 3), entries.len);
+        for (entries) |entry| try expectPresetResponse(entry, std.meta.stringToEnum(access_protocol.PairingPreset, entry.object.get("preset").?.string).?);
+    }
+}
+
+fn expectPresetResponse(value: std.json.Value, preset: access_protocol.PairingPreset) !void {
+    try std.testing.expectEqualStrings(@tagName(preset), value.object.get("preset").?.string);
+    const cap = value.object.get("max_access_mode").?;
+    if (preset.maxAccessMode()) |expected| {
+        try std.testing.expectEqualStrings(@tagName(expected), cap.string);
+    } else try std.testing.expect(cap == .null);
+    const scopes = value.object.get("scopes").?.array.items;
+    var mask: u16 = 0;
+    for (scopes) |scope| mask |= access_protocol.scopeBit(try access_protocol.parseScope(scope.string));
+    try std.testing.expectEqual(try access_protocol.scopeMask(preset.scopes()), mask);
 }

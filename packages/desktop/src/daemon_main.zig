@@ -127,6 +127,7 @@ const PairOptions = struct {
     id: ?[]const u8 = null,
     scopes: [access_protocol.MAX_SCOPE_COUNT][]const u8 = @splat(""),
     scope_count: usize = 0,
+    preset: ?access_protocol.PairingPreset = null,
 };
 
 const RepositoryBindOptions = struct {
@@ -915,11 +916,12 @@ fn handleAccessAdministration(
     switch (options.command) {
         .pair_create => {
             const scopes: []const []const u8 = if (options.pair.scope_count == 0)
-                access_protocol.DEFAULT_SCOPE_NAMES[0..]
+                &.{}
             else
                 options.pair.scopes[0..options.pair.scope_count];
             try access_protocol.validatePairingTtl(options.pair.ttl_seconds);
-            try access_protocol.validateScopeNames(scopes);
+            if (scopes.len != 0) try access_protocol.validateScopeNames(scopes);
+            if (options.pair.preset != null and scopes.len != 0) return error.InvalidArguments;
             if (options.pair.label) |label| try access_protocol.validateDeviceLabel(label);
             var parsed = try client.call(
                 access_protocol.METHOD_DAEMON_PAIRING_GRANT_CREATE,
@@ -928,6 +930,7 @@ fn handleAccessAdministration(
                     .label = options.pair.label,
                     .ttl_seconds = options.pair.ttl_seconds,
                     .scopes = scopes,
+                    .preset = options.pair.preset,
                 },
             );
             defer parsed.deinit();
@@ -1029,6 +1032,7 @@ fn handleAccessAdministration(
                     },
                 );
                 try writeScopeLine(io, device.scopes);
+                try writeStdout(io, "  Preset: {s}; max access: {s}\n", .{ if (device.preset) |v| @tagName(v) else "custom/legacy", if (device.max_access_mode) |v| @tagName(v) else "uncapped" });
             }
         },
         .device_revoke => {
@@ -1090,6 +1094,8 @@ fn writePairingGrantCreateOutput(
                 // This is the only CLI JSON boundary that deliberately
                 // reveals a one-time pairing token.
                 .pairing_token = result.pairing_token.reveal(),
+                .preset = result.preset,
+                .max_access_mode = result.max_access_mode,
                 .expires_at_ms = result.expires_at_ms,
                 .scopes = result.scopes,
             },
@@ -1436,7 +1442,11 @@ fn parseArgs(argv: []const []const u8) ParseError!Options {
                 if (result.pair.expires_set) return error.InvalidArguments;
                 result.pair.ttl_seconds = try parsePairingExpiry(value);
                 result.pair.expires_set = true;
+            } else if (command == .pair_create and std.mem.eql(u8, arg, "--preset")) {
+                if (result.pair.preset != null or result.pair.scope_count != 0) return error.InvalidArguments;
+                result.pair.preset = std.meta.stringToEnum(access_protocol.PairingPreset, value) orelse return error.InvalidArguments;
             } else if (command == .pair_create and std.mem.eql(u8, arg, "--scope")) {
+                if (result.pair.preset != null) return error.InvalidArguments;
                 if (result.pair.scope_count >= result.pair.scopes.len) return error.InvalidArguments;
                 _ = access_protocol.parseScope(value) catch return error.InvalidArguments;
                 for (result.pair.scopes[0..result.pair.scope_count]) |existing| {
@@ -1689,7 +1699,7 @@ fn printHelp(io: std.Io, stderr: bool) !void {
         \\  verde-daemon workspace show --workspace ID [--data-dir PATH] [--json]
         \\  verde-daemon workspace bind --workspace ID --label LABEL --root PATH [--data-dir PATH] [--json]
         \\  verde-daemon workspace repository bind --workspace ID --repository ID --label LABEL --root PATH [options]
-        \\  verde-daemon pair create [--expires 10m] [--label TEXT] [--scope SCOPE]... [--data-dir PATH] [--json]
+        \\  verde-daemon pair create [--preset full|chat|monitor] [--expires 10m] [--label TEXT] [--scope SCOPE]... [--data-dir PATH] [--json]
         \\  verde-daemon pair list [--data-dir PATH] [--json]
         \\  verde-daemon pair revoke --id ID [--data-dir PATH] [--json]
         \\  verde-daemon device list [--data-dir PATH] [--json]
@@ -1712,11 +1722,10 @@ fn printHelp(io: std.Io, stderr: bool) !void {
         \\otherwise notify requires an explicit --data-dir.
         \\Workspace commands require a running daemon; binding requires an existing checkout.
         \\Pair/device commands require a running daemon. A created pairing token is
-        \\printed exactly once; store it as a secret. Omitting --scope grants the
-        \\single-user default: runtime:read, chat:read, chat:write, terminal:read,
-        \\terminal:write, repository:read, repository:write, device:read.
-        \\Opt-in only: process:read, process:write, device:write. Explicit --scope
-        \\options replace the default set. Existing grants/devices keep stored scopes.
+        \\printed exactly once; store it as a secret. --preset full (default) grants
+        \\all scopes without a cap; chat reads/chat/approves with supervised turns;
+        \\monitor is read-only plus push. --scope creates a custom grant and cannot
+        \\be combined with --preset. Existing grants retain their stored authority.
         \\Expiry accepts s, m, or h (max 1h).
         \\Repository bind options: --vcs-identity URL, --default-branch NAME,
         \\--default, --data-dir PATH, and --json. No checkout data is modified.
@@ -2054,4 +2063,18 @@ test "signal watcher recognizes only an accepted prepare-shutdown result" {
 // Include the daemon's RPC/store regression tests in its owning test target.
 test {
     _ = sessionizer;
+}
+
+test "pair create parses presets and rejects ambiguous scope selections" {
+    for (access_protocol.PAIRING_PRESETS) |preset| {
+        const options = try parseArgs(&.{ "verde-daemon", "pair", "create", "--preset", @tagName(preset) });
+        try std.testing.expectEqual(@as(?access_protocol.PairingPreset, preset), options.pair.preset);
+        try std.testing.expectEqual(@as(usize, 0), options.pair.scope_count);
+    }
+    for ([_][]const []const u8{
+        &.{ "verde-daemon", "pair", "create", "--preset", "unknown" },
+        &.{ "verde-daemon", "pair", "create", "--preset", "chat", "--scope", "runtime:read" },
+        &.{ "verde-daemon", "pair", "create", "--scope", "runtime:read", "--preset", "chat" },
+        &.{ "verde-daemon", "pair", "create", "--preset", "chat", "--preset", "full" },
+    }) |args| try std.testing.expectError(error.InvalidArguments, parseArgs(args));
 }

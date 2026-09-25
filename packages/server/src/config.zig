@@ -267,3 +267,12 @@ test "Connect onboarding and lifecycle commands are explicit" {
     defer deinit(&status, std.testing.allocator);
     try std.testing.expectEqual(Command.connect_status, status.command);
 }
+
+test "pair create delegates each preset to the daemon" {
+    for ([_][]const u8{ "full", "chat", "monitor" }) |preset| {
+        var parsed = try parse(std.testing.allocator, &.{ "verde-server", "pair", "create", "--preset", preset });
+        defer deinit(&parsed, std.testing.allocator);
+        try std.testing.expectEqual(Command.pair_create, parsed.command);
+        try std.testing.expectEqualSlices([]const u8, &.{ "--preset", preset }, parsed.delegate_args);
+    }
+}
