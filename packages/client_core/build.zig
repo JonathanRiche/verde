@@ -127,6 +127,7 @@ fn addAndroidStep(
             b.fmt("libc-{s}.txt", .{abi.triple}),
             androidLibcFile(b, sysroot, abi.triple),
         ));
+        lib.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "usr/lib", abi.triple, "29" }) });
         lib.link_z_max_page_size = android_page_size;
         lib.link_z_common_page_size = android_page_size;
 
@@ -208,6 +209,10 @@ fn createCoreModule(
         .optimize = optimize,
         .link_libc = true,
     });
+    const headless = b.createModule(.{ .root_source_file = b.path("../headless/src/root.zig"), .target = target, .optimize = optimize });
+    const remote = b.createModule(.{ .root_source_file = b.path("src/shared/root.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "headless", .module = headless }} });
+    module.addImport("verde_remote", remote);
+    if (target.result.abi.isAndroid()) module.linkSystemLibrary("log", .{});
     module.addOptions("build_options", options);
     return module;
 }

@@ -24,4 +24,17 @@ while read -r align; do
     fi
 done < <("$readelf" -lW "$lib" | awk '$1 == "LOAD" { print $NF }')
 
+# A custom mobile panic handler must not regress to Zig's 256 KiB alternate
+# signal stack. Inspect sections and symbols even when the ABI smoke passes.
+if "$readelf" -sW "$lib" | grep -E 'signal_stack|defaultPanic' > /dev/null; then
+    echo "$lib: default panic/signal stack symbol found" >&2
+    status=1
+fi
+while read -r size; do
+    if (( 16#$size >= 0x40000 )); then
+        echo "$lib: oversized thread-local section ($size bytes hex)" >&2
+        status=1
+    fi
+done < <("$readelf" -SW "$lib" | awk '{ for (i=1; i<=NF; i++) if ($i == ".tbss" || $i == ".tdata") print $(i+4) }')
+
 exit "$status"
