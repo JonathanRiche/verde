@@ -119,17 +119,17 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | A-01 | Confine `/api/file` + `/api/preview` | host | linux | — | done (363bece0) |
 | A-02 | Paired-device allowlist parity + new scopes | host | linux | — | done (a570cce2) |
 | A-03 | Confined directory-list RPC | host | linux | A-02 | todo |
-| A-04 | Device self-service RPCs | host | linux | A-02 | in_progress (astra cli-thread-1790357298383-17136903f7e4129f) |
+| A-04 | Device self-service RPCs | host | linux | A-02 | done (42a3582b) |
 | A-05 | Idempotent pair exchange | host | linux | — | done (a36897f0) |
 | A-06 | Terminal QR + App Link pair URL | host | linux | — | done (b0f6e50b; phone-camera scan pending human-verify) |
-| A-07 | Desktop "Pair a phone" + Paired devices UI | host | linux | A-04, A-06 | todo |
-| A-08 | Web Settings paired-devices list | host | linux | A-04 | todo |
-| A-09 | Pairing presets + access-mode cap | host | linux | A-02, H-08 | todo |
+| A-07 | Desktop "Pair a phone" + Paired devices UI | host | linux | A-04, A-06 | in_progress (astra cli-thread-1790358128115-7a42b2851781fae5) |
+| A-08 | Web Settings paired-devices list | host | linux | A-04 | in_progress (astra cli-thread-1790358129786-a7d425ec177b30d6) |
+| A-09 | Pairing presets + access-mode cap | host | linux | A-02, H-08 | in_progress (astra cli-thread-1790358126217-4e98de9791a367a4) |
 | A-10 | `mobile.min_client` + capability flags | host | linux | — | done (f8aa0db8) |
 | A-11 | Delta change feed on the gateway | host | linux | A-10 | done (1b1a7d34) |
 | A-12 | Push crypto module (seal/open) | host | linux | — | done (7f5c621f) |
 | A-13 | Push outbox + `device.push.*` RPCs | host | linux | A-02, A-12 | done (8827ee2a) |
-| A-14 | Attention events → outbox | host | linux | A-13 | todo |
+| A-14 | Attention events → outbox | host | linux | A-13 | in_progress (astra cli-thread-1790358124802-9d51ce6223fd6862) |
 | A-15 | Harden served-file open (TOCTOU, special files, leak, logs) | host | linux | A-01 | done (310be446) |
 | A-16 | `workspace.list` exposes repository binding roots | host | linux | A-01, A-02 | done (fb84ca8c) |
 | A-17 | Daemon-native workspace close | host | linux | A-02 | todo |
@@ -376,6 +376,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 - **Done when:** tests cover self-revoke invalidating the next call, and a
   paired device being unable to list or revoke other devices.
   `$ZB headless-test` and `mise run web-app-test` pass.
+- **Done (42a3582b).** `device.self.get` and `device.self.revoke` are bound to the authenticated device, and any caller-supplied device ID is ignored. Self-revoke needs only `device:read`, so devices with the default grant can sign themselves out. It invalidates the device's tokens and tickets, closes its socket, and clears its push data through A-13's revoke path. `device.list` and `device.revoke` are for owner callers only, on both HTTP and WebSocket. `headless-test`, `web-app-test` and `daemon-test` pass. The running daemon and gateway need a relaunch to pick this up.
 
 #### A-05 · Idempotent pair exchange
 - **touches:** `access_protocol.zig`, the daemon grant consume path, the
