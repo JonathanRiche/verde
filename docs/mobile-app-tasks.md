@@ -151,7 +151,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | K-11 | Markdown AST / highlight spans / diff parse exports | core | linux | K-06 | done (93000154, c37e038c) |
 | K-12 | Terminal handle + PTY pump | core | linux | K-06 | done (a7650965) |
 | K-13 | Allowlist coverage test | core | linux | K-10, A-02 | done (15823136) |
-| K-14 | Contract suite vs real gateway + daemon | core | linux | K-10 | in_progress (claude opus cli-thread-1790365217704-eb78988ef08f44fe; took over paused Codex WIP) |
+| K-14 | Contract suite vs real gateway + daemon | core | linux | K-10 | done (42fdab6d, 34f0daef) |
 | K-15 | Kotlin/Swift model codegen from Zig types | core | linux | K-06 | done (fdb77f3d) |
 | K-16 | Delta-mode sync | core | linux | K-09, A-11 | done (9418aef0) |
 | K-17 | Attention state machine + push decrypt | core | linux | K-09, A-12 | in_progress (claude opus cli-thread-1790367137391-d31936316ac882ae; also extends sign-out wipe to chat drafts/push records) |
@@ -908,6 +908,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 - **Done when:** the suite passes locally with finite deadlines and is
   wired into `mise run mobile-core-test` (or a separate
   `mobile-core-contract` task).
+- **Done (42fdab6d, 34f0daef).** `mise run mobile-core-contract` (`contract_test.zig`, documented in `docs/contract-suite.md`) runs the real core against a temporary headless daemon and verde-web behind a loopback envelope proxy. It covers pair grant, pair, trust, token, ticket and WS, snapshot, create thread, a stub turn with an approval, approve, completion, and D-04's `sign_out` revoke (which sets `revoked_at_ms`). It passed twice, in about 0.7–0.9 s warm, with 30 s waits and a 240 s watchdog. `mobile-core-test` still passes 156/156. It runs on Linux only. Findings: (1) the core has no create-thread intent, so D-10/I-07 need one (the suite uses `chat.thread.upsert` over RPC); (2) the daemon ignores SIGTERM while a turn waits for approval, because `prepareShutdown` waits for keep-alive turns. That may be intended drain behavior but needs a decision or a timeout. (3) `verde-web` rejects `--port 0`.
 
 #### K-15 · Kotlin/Swift model codegen
 - **depends:** K-06
