@@ -116,7 +116,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | H-06 | Tailscale on both phones | human | phone | — | human |
 | H-07 | Android phone dev setup (adb) | human | phone | — | human |
 | H-08 | Choose pairing permission presets | human | — | — | done (owner: Full default) |
-| A-01 | Confine `/api/file` + `/api/preview` | host | linux | — | todo |
+| A-01 | Confine `/api/file` + `/api/preview` | host | linux | — | in_progress (cli-thread-1790349942539-3e2fafd1c5315e39) |
 | A-02 | Paired-device allowlist parity + new scopes | host | linux | — | todo |
 | A-03 | Confined directory-list RPC | host | linux | A-02 | todo |
 | A-04 | Device self-service RPCs | host | linux | A-02 | todo |
