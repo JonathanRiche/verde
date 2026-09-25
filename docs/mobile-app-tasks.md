@@ -153,7 +153,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | K-15 | Kotlin/Swift model codegen from Zig types | core | linux | K-06 | todo |
 | K-16 | Delta-mode sync | core | linux | K-09, A-11 | todo |
 | K-17 | Attention state machine + push decrypt | core | linux | K-09, A-12 | todo |
-| D-01 | Android project scaffold | android | linux | K-01 | in_progress (astra cli-thread-1790351700581-d71ad83f1c85ef6b) |
+| D-01 | Android project scaffold | android | linux | K-01 | done (ee3c19df; on-device version display pending human-verify) |
 | D-02 | Core bridge + effect executor | android | linux | D-01, K-06, K-15 | todo |
 | D-03 | Pairing flow | android | linux+phone | D-02, K-07, A-06, H-06, H-07 | todo |
 | D-04 | Hosts list + switcher + sign out | android | linux | D-03, A-04 | todo |
@@ -918,6 +918,7 @@ human-verify step.
   - Add the root `AGENTS.md` scoped-rules link.
 - **Done when:** both mise tasks pass; the APK runs in the emulator or on
   the phone and shows the core version.
+- **Done (ee3c19df).** `packages/mobile_android` (Gradle KTS, Compose, `dev.verdeai.app`, min SDK 29); an explicit `preBuild` dependency runs `zig build android-libs` and packages both ABIs (16 KB alignment checked). `mobile-android-build` and `mobile-android-test` pass (Robolectric on API 29 and 35). Still open: install on a phone or emulator and confirm it shows the core version (needs H-07 or an AVD).
 
 #### D-02 · Core bridge + effect executor
 - **depends:** D-01, K-06, K-15
