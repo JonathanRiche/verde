@@ -3197,7 +3197,7 @@ extension HostsView {
 }
 
 struct HomeView: Codable {
-    var `items`: [JSONValue]
+    var `items`: [Pane]
     var `loading`: Bool
     var `stale`: Bool
     var `incomplete_scopes`: [String]
@@ -3214,7 +3214,7 @@ extension HomeView {
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        self.`items` = try c.decode([JSONValue].self, forKey: .`items`)
+        self.`items` = try c.decode([Pane].self, forKey: .`items`)
         self.`loading` = try c.decode(Bool.self, forKey: .`loading`)
         self.`stale` = try c.decode(Bool.self, forKey: .`stale`)
         self.`incomplete_scopes` = try c.decode([String].self, forKey: .`incomplete_scopes`)
@@ -3232,7 +3232,7 @@ extension HomeView {
 
 struct HistoryView: Codable {
     var `query`: String
-    var `items`: [JSONValue]
+    var `items`: [ThreadSummary]
     var `next_cursor`: String?
     var `loading`: Bool
     var `error`: LocalError?
@@ -3249,7 +3249,7 @@ extension HistoryView {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.`query` = try c.decode(String.self, forKey: .`query`)
-        self.`items` = try c.decode([JSONValue].self, forKey: .`items`)
+        self.`items` = try c.decode([ThreadSummary].self, forKey: .`items`)
         self.`next_cursor` = try c.decodeIfPresent(String.self, forKey: .`next_cursor`)
         self.`loading` = try c.decode(Bool.self, forKey: .`loading`)
         self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
@@ -3265,7 +3265,7 @@ extension HistoryView {
 }
 
 struct WorkspacesView: Codable {
-    var `items`: [JSONValue]
+    var `items`: [Workspace]
     var `loading`: Bool
     var `stale`: Bool
     var `error`: LocalError?
@@ -3282,7 +3282,7 @@ extension WorkspacesView {
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        self.`items` = try c.decode([JSONValue].self, forKey: .`items`)
+        self.`items` = try c.decode([Workspace].self, forKey: .`items`)
         self.`loading` = try c.decode(Bool.self, forKey: .`loading`)
         self.`stale` = try c.decode(Bool.self, forKey: .`stale`)
         self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
@@ -3751,5 +3751,167 @@ extension DiffQuery {
         try c.encode(self.`revision`, forKey: .`revision`)
         try c.encode(self.`data`, forKey: .`data`)
         try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct Pane: Codable {
+    var `id`: String
+    var `workspace_id`: String
+    var `kind`: String
+    var `title`: String
+    var `thread_id`: String? = nil
+    var `terminal_id`: String? = nil
+    var `status`: String = "idle"
+    var `attention`: Bool = false
+    var `started_at_ms`: Int64? = nil
+    var `can_stop`: Bool = false
+}
+
+extension Pane {
+    private enum CodingKeys: String, CodingKey {
+        case `id`
+        case `workspace_id`
+        case `kind`
+        case `title`
+        case `thread_id`
+        case `terminal_id`
+        case `status`
+        case `attention`
+        case `started_at_ms`
+        case `can_stop`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`id` = try c.decode(String.self, forKey: .`id`)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        self.`kind` = try c.decode(String.self, forKey: .`kind`)
+        self.`title` = try c.decode(String.self, forKey: .`title`)
+        if !c.contains(.`thread_id`) { self.`thread_id` = nil } else {
+        self.`thread_id` = try c.decodeIfPresent(String.self, forKey: .`thread_id`)
+        }
+        if !c.contains(.`terminal_id`) { self.`terminal_id` = nil } else {
+        self.`terminal_id` = try c.decodeIfPresent(String.self, forKey: .`terminal_id`)
+        }
+        if !c.contains(.`status`) { self.`status` = "idle" } else {
+        self.`status` = try c.decode(String.self, forKey: .`status`)
+        }
+        if !c.contains(.`attention`) { self.`attention` = false } else {
+        self.`attention` = try c.decode(Bool.self, forKey: .`attention`)
+        }
+        if !c.contains(.`started_at_ms`) { self.`started_at_ms` = nil } else {
+        self.`started_at_ms` = try c.decodeIfPresent(Int64.self, forKey: .`started_at_ms`)
+        }
+        if !c.contains(.`can_stop`) { self.`can_stop` = false } else {
+        self.`can_stop` = try c.decode(Bool.self, forKey: .`can_stop`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`id`, forKey: .`id`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`kind`, forKey: .`kind`)
+        try c.encode(self.`title`, forKey: .`title`)
+        try c.encode(self.`thread_id`, forKey: .`thread_id`)
+        try c.encode(self.`terminal_id`, forKey: .`terminal_id`)
+        try c.encode(self.`status`, forKey: .`status`)
+        try c.encode(self.`attention`, forKey: .`attention`)
+        try c.encode(self.`started_at_ms`, forKey: .`started_at_ms`)
+        try c.encode(self.`can_stop`, forKey: .`can_stop`)
+    }
+}
+
+struct ThreadSummary: Codable {
+    var `workspace_id`: String
+    var `thread_id`: String
+    var `title`: String
+    var `provider`: String
+    var `model`: String?
+    var `cwd`: String?
+    var `open`: Bool
+    var `archived`: Bool
+    var `last_activity_at_ms`: Int64?
+    var `status`: String
+    var `history_bucket`: String
+}
+
+extension ThreadSummary {
+    private enum CodingKeys: String, CodingKey {
+        case `workspace_id`
+        case `thread_id`
+        case `title`
+        case `provider`
+        case `model`
+        case `cwd`
+        case `open`
+        case `archived`
+        case `last_activity_at_ms`
+        case `status`
+        case `history_bucket`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        self.`thread_id` = try c.decode(String.self, forKey: .`thread_id`)
+        self.`title` = try c.decode(String.self, forKey: .`title`)
+        self.`provider` = try c.decode(String.self, forKey: .`provider`)
+        self.`model` = try c.decodeIfPresent(String.self, forKey: .`model`)
+        self.`cwd` = try c.decodeIfPresent(String.self, forKey: .`cwd`)
+        self.`open` = try c.decode(Bool.self, forKey: .`open`)
+        self.`archived` = try c.decode(Bool.self, forKey: .`archived`)
+        self.`last_activity_at_ms` = try c.decodeIfPresent(Int64.self, forKey: .`last_activity_at_ms`)
+        self.`status` = try c.decode(String.self, forKey: .`status`)
+        self.`history_bucket` = try c.decode(String.self, forKey: .`history_bucket`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`thread_id`, forKey: .`thread_id`)
+        try c.encode(self.`title`, forKey: .`title`)
+        try c.encode(self.`provider`, forKey: .`provider`)
+        try c.encode(self.`model`, forKey: .`model`)
+        try c.encode(self.`cwd`, forKey: .`cwd`)
+        try c.encode(self.`open`, forKey: .`open`)
+        try c.encode(self.`archived`, forKey: .`archived`)
+        try c.encode(self.`last_activity_at_ms`, forKey: .`last_activity_at_ms`)
+        try c.encode(self.`status`, forKey: .`status`)
+        try c.encode(self.`history_bucket`, forKey: .`history_bucket`)
+    }
+}
+
+struct Workspace: Codable {
+    var `workspace_id`: String
+    var `label`: String
+    var `path`: String
+    var `open`: Bool
+    var `panes`: [Pane]
+    var `threads`: [ThreadSummary]
+}
+
+extension Workspace {
+    private enum CodingKeys: String, CodingKey {
+        case `workspace_id`
+        case `label`
+        case `path`
+        case `open`
+        case `panes`
+        case `threads`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        self.`label` = try c.decode(String.self, forKey: .`label`)
+        self.`path` = try c.decode(String.self, forKey: .`path`)
+        self.`open` = try c.decode(Bool.self, forKey: .`open`)
+        self.`panes` = try c.decode([Pane].self, forKey: .`panes`)
+        self.`threads` = try c.decode([ThreadSummary].self, forKey: .`threads`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`label`, forKey: .`label`)
+        try c.encode(self.`path`, forKey: .`path`)
+        try c.encode(self.`open`, forKey: .`open`)
+        try c.encode(self.`panes`, forKey: .`panes`)
+        try c.encode(self.`threads`, forKey: .`threads`)
     }
 }

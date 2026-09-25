@@ -3,6 +3,7 @@
 const std = @import("std");
 pub const rpc = @import("rpc.zig");
 const auth = @import("auth.zig");
+pub const sync = @import("sync.zig");
 const profile = @import("verde_remote").profile;
 const A = std.mem.Allocator;
 const V = std.json.Value;
@@ -54,6 +55,7 @@ pub const State = struct {
     config: Config,
     rpc: rpc.State = .{},
     auth: auth.State = .{},
+    sync: sync.State = .{},
     lifecycle: Lifecycle = .created,
     revision: u64 = 0,
     generation: u64 = 0,
@@ -96,8 +98,9 @@ pub const Host = struct {
         var tx = try Transaction.init(self);
         defer tx.deinit();
         const event = try parseLimit(tx.allocator(), input, MAX_HTTP_INPUT);
-        if (input.len > MAX_INPUT and !eq(try string(event, "type"), "http_response")) return error.ResourceLimit;
+        if (input.len > MAX_INPUT and !eq(try string(event, "type"), "http_response") and !eq(try string(event, "type"), "ws_message")) return error.ResourceLimit;
         try tx.apply(event);
+        try sync.pump(&tx);
         return tx.commit(self, output_allocator);
     }
 
@@ -122,24 +125,16 @@ pub const Host = struct {
                 .phase = if (s.auth.proposal != null or s.auth.blocked or s.auth.retry != null) s.auth.phase else if (s.rpc.bearer != null) @tagName(s.rpc.phase) else s.auth.phase,
                 .lifecycle = @tagName(s.lifecycle),
                 .auth_state = s.auth_state,
-                .sync_state = if (s.stale) "stale" else "empty",
-                .capabilities = [0]V{},
+                .sync_state = if (s.sync.loading) "loading" else if (s.stale) "stale" else if (s.sync.snapshot != .null) "ready" else "empty",
+                .capabilities = s.rpc.runtime_capabilities,
                 .scopes = if (s.auth.credential) |c| c.scopes else &.{},
                 .retry_at_ms = s.auth.retry_at_ms,
                 .trust_proposal = s.auth.proposal,
                 .update_required = s.rpc.update_required,
                 .@"error" = s.host_error,
             }}, .operations = operations });
-        } else if (eq(selector, "home")) {
-            data = try valueOf(a, .{ .items = [0]V{}, .loading = false, .stale = s.stale, .incomplete_scopes = [0]V{}, .@"error" = @as(?u8, null) });
-        } else if (eq(selector, "workspaces")) {
-            data = try valueOf(a, .{ .items = [0]V{}, .loading = false, .stale = s.stale, .@"error" = @as(?u8, null), .history = .{
-                .query = "",
-                .items = [0]V{},
-                .next_cursor = @as(?[]const u8, null),
-                .loading = false,
-                .@"error" = @as(?u8, null),
-            } });
+        } else if (eq(selector, "home") or eq(selector, "workspaces")) {
+            data = try sync.query(a, s, selector);
         } else {
             failure = .{ .code = "not_found", .message = "Unknown selector or resource." };
             if (std.mem.startsWith(u8, std.mem.trimStart(u8, selector, " \t\r\n"), "{")) {
@@ -386,8 +381,11 @@ pub const Transaction = struct {
             if (kind == .store_get or kind == .store_put) {
                 if (!eq(p.key, try string(event, "key"))) return;
             }
-            if (kind == .socket and !eq(tag, "ws_closed")) return;
             self.completion_matched = true;
+            if (kind == .socket and !eq(tag, "ws_closed")) {
+                if (eq(tag, "ws_message")) try sync.push(self, try string(event, "text"));
+                return;
+            }
             try self.remove(i);
             if (kind == .http and eq(p.key, "rpc")) {
                 if (!try @import("auth_rpc.zig").intercept(self, id, event)) try rpc.complete(self, id, event);
@@ -448,7 +446,7 @@ pub fn mapError(err: anyerror) ApiError {
 pub fn parse(a: A, input: []const u8) ApiError!V {
     return parseLimit(a, input, MAX_INPUT);
 }
-fn parseLimit(a: A, input: []const u8, limit: usize) ApiError!V {
+pub fn parseLimit(a: A, input: []const u8, limit: usize) ApiError!V {
     if (input.len > limit) return error.ResourceLimit;
     if (!std.unicode.utf8ValidateSlice(input)) return error.InvalidArgument;
     // Bound recursive canonicalization and encoding before creating a DOM.

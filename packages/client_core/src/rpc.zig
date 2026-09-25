@@ -20,6 +20,7 @@ pub const State = struct {
     limits: protocol.RuntimeLimits = .{},
     update_required: bool = false,
     full_resync: bool = false,
+    runtime_capabilities: []const []const u8 = &.{},
     calls: []const Call = &.{},
     results: []const Result = &.{},
 };
@@ -231,6 +232,9 @@ fn receive(tx: *host.Transaction, call: Call, event: V) host.ApiError!void {
             return;
         }
         if (caps.mobile.min_client > tx.state.config.client_revision or caps.protocol.major != protocol.RUNTIME_PROTOCOL_MAJOR) return handshakeFailure(tx, call, .protocol, "update_required");
+        const names = try a.alloc([]const u8, caps.runtime_capabilities.len);
+        for (caps.runtime_capabilities, names) |name, *copy| copy.* = try a.dupe(u8, name);
+        tx.state.rpc.runtime_capabilities = names;
         tx.state.rpc.phase = .ready;
         tx.state.rpc.full_resync = true;
         tx.state.host_error = null;

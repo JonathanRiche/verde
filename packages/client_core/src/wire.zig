@@ -94,10 +94,10 @@ pub const HostView = struct {
     @"error": ?LocalError,
 };
 pub const HostsView = struct { items: []const HostView, operations: []const Operation };
-// K-06 returns empty collections. K-09 owns the future populated item types.
-pub const HomeView = struct { items: []const std.json.Value, loading: bool, stale: bool, incomplete_scopes: []const []const u8, @"error": ?LocalError };
-pub const HistoryView = struct { query: []const u8, items: []const std.json.Value, next_cursor: ?[]const u8, loading: bool, @"error": ?LocalError };
-pub const WorkspacesView = struct { items: []const std.json.Value, loading: bool, stale: bool, @"error": ?LocalError, history: HistoryView };
+const projection = @import("projection.zig");
+pub const HomeView = struct { items: []const projection.Pane, loading: bool, stale: bool, incomplete_scopes: []const []const u8, @"error": ?LocalError };
+pub const HistoryView = struct { query: []const u8, items: []const projection.ThreadSummary, next_cursor: ?[]const u8, loading: bool, @"error": ?LocalError };
+pub const WorkspacesView = struct { items: []const projection.Workspace, loading: bool, stale: bool, @"error": ?LocalError, history: HistoryView };
 pub fn Query(comptime T: type) type {
     return struct { api_version: u32, revision: []const u8, data: ?T, @"error": ?LocalError };
 }

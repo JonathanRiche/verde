@@ -844,7 +844,7 @@ data class HostsView(
 
 @Serializable
 data class HomeView(
-    val `items`: List<JsonElement>,
+    val `items`: List<Pane>,
     val `loading`: Boolean,
     val `stale`: Boolean,
     val `incomplete_scopes`: List<String>,
@@ -854,7 +854,7 @@ data class HomeView(
 @Serializable
 data class HistoryView(
     val `query`: String,
-    val `items`: List<JsonElement>,
+    val `items`: List<ThreadSummary>,
     val `next_cursor`: String?,
     val `loading`: Boolean,
     val `error`: LocalError?,
@@ -862,7 +862,7 @@ data class HistoryView(
 
 @Serializable
 data class WorkspacesView(
-    val `items`: List<JsonElement>,
+    val `items`: List<Workspace>,
     val `loading`: Boolean,
     val `stale`: Boolean,
     val `error`: LocalError?,
@@ -983,4 +983,43 @@ data class DiffQuery(
     val `revision`: String,
     val `data`: DiffView?,
     val `error`: LocalError?,
+)
+
+@Serializable
+data class Pane(
+    val `id`: String,
+    val `workspace_id`: String,
+    val `kind`: String,
+    val `title`: String,
+    val `thread_id`: String? = null,
+    val `terminal_id`: String? = null,
+    val `status`: String = "idle",
+    val `attention`: Boolean = false,
+    val `started_at_ms`: Long? = null,
+    val `can_stop`: Boolean = false,
+)
+
+@Serializable
+data class ThreadSummary(
+    val `workspace_id`: String,
+    val `thread_id`: String,
+    val `title`: String,
+    val `provider`: String,
+    val `model`: String?,
+    val `cwd`: String?,
+    val `open`: Boolean,
+    val `archived`: Boolean,
+    val `last_activity_at_ms`: Long?,
+    val `status`: String,
+    val `history_bucket`: String,
+)
+
+@Serializable
+data class Workspace(
+    val `workspace_id`: String,
+    val `label`: String,
+    val `path`: String,
+    val `open`: Boolean,
+    val `panes`: List<Pane>,
+    val `threads`: List<ThreadSummary>,
 )

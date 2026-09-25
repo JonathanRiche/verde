@@ -1,0 +1,52 @@
+{
+  "snapshot": {
+    "schema_version": 1,
+    "store_revision": 1,
+    "selected_workspace_index": 0,
+    "sidebar_collapsed": false,
+    "workspaces": [],
+    "surface_states": [],
+    "chat_completions": [],
+    "provider": null,
+    "harness": null,
+    "draft": null,
+    "messages": null,
+    "closed_threads": []
+  },
+  "store_revision": 1,
+  "envelope": {
+    "instance_nonce": "29d8ce68aa65f99226c2d5c8b2e6ecfa",
+    "registry_revision": 1
+  },
+  "change_cursor": 9,
+  "processes": [],
+  "leases": [],
+  "sessions": [],
+  "turns": [],
+  "config": {
+    "ui": {
+      "workspace_pane_gap": 12,
+      "workspace_panes_per_view": 1,
+      "workspace_split_default_pane": "chat",
+      "workspace_scroll_direction": "horizontal",
+      "workspace_scroll_mode": "automatic",
+      "workspace_scroll_threshold": 3,
+      "unzoom_on_pane_navigation": false,
+      "reduced_motion": false,
+      "reduced_motion_parts": {
+        "pane_scroll": true,
+        "pane_layout": false,
+        "status_pulse": false,
+        "chat": false,
+        "chrome": false
+      }
+    },
+    "chat": {
+      "favorite_models": [],
+      "title_provider": "codex",
+      "title_model": "gpt-6-luna"
+    },
+    "keybinds": null
+  },
+  "incomplete_scopes": []
+}

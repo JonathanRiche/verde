@@ -1,0 +1,76 @@
+{
+  "snapshot": {
+    "schema_version": 1,
+    "store_revision": 1,
+    "selected_workspace_index": 0,
+    "sidebar_collapsed": false,
+    "workspaces": [
+      {
+        "workspace_id": "fixture-ws",
+        "label": "Fixture workspace",
+        "path": "/tmp/k09-fixture-project",
+        "repositories": [],
+        "default_repository_id": null,
+        "archived": false,
+        "unread_count": 0,
+        "collapsed": false,
+        "thread_list_expanded": false,
+        "terminal_height": null,
+        "terminal_layout_json": null,
+        "terminal_docks_json": null,
+        "workspace_layout_json": "{\"v\": 2, \"focused\": 1, \"panes\": [{\"id\": 1, \"kind\": \"chat\", \"thread\": 0}, {\"id\": 2, \"kind\": \"chat\", \"thread\": 0}, {\"id\": 3, \"kind\": \"terminal\", \"dock\": 7}, {\"id\": 4, \"kind\": \"browser\"}]}",
+        "selected_thread_index": 0,
+        "companion_thread_local_id": null,
+        "herdr_link": null,
+        "provider": "opencode",
+        "harness": "local_cli",
+        "draft": "",
+        "threads": [],
+        "messages": []
+      }
+    ],
+    "surface_states": [],
+    "chat_completions": [],
+    "provider": null,
+    "harness": null,
+    "draft": null,
+    "messages": null,
+    "closed_threads": []
+  },
+  "store_revision": 1,
+  "envelope": {
+    "instance_nonce": "29d8ce68aa65f99226c2d5c8b2e6ecfa",
+    "registry_revision": 1
+  },
+  "change_cursor": 9,
+  "processes": [],
+  "leases": [],
+  "sessions": [],
+  "turns": [],
+  "config": {
+    "ui": {
+      "workspace_pane_gap": 12,
+      "workspace_panes_per_view": 1,
+      "workspace_split_default_pane": "chat",
+      "workspace_scroll_direction": "horizontal",
+      "workspace_scroll_mode": "automatic",
+      "workspace_scroll_threshold": 3,
+      "unzoom_on_pane_navigation": false,
+      "reduced_motion": false,
+      "reduced_motion_parts": {
+        "pane_scroll": true,
+        "pane_layout": false,
+        "status_pulse": false,
+        "chat": false,
+        "chrome": false
+      }
+    },
+    "chat": {
+      "favorite_models": [],
+      "title_provider": "codex",
+      "title_model": "gpt-6-luna"
+    },
+    "keybinds": null
+  },
+  "incomplete_scopes": []
+}

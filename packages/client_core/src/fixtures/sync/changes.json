@@ -1,0 +1,85 @@
+{
+  "entries": [
+    {
+      "change_seq": 1,
+      "topic": "workspace",
+      "resource_id": "fixture-ws",
+      "workspace_id": "fixture-ws",
+      "store_revision": 1,
+      "registry_revision": null
+    },
+    {
+      "change_seq": 2,
+      "topic": "chat.thread",
+      "resource_id": "layout-thread",
+      "workspace_id": "fixture-ws",
+      "store_revision": 1,
+      "registry_revision": null
+    },
+    {
+      "change_seq": 3,
+      "topic": "chat.thread",
+      "resource_id": "web-thread-fixture",
+      "workspace_id": "fixture-ws",
+      "store_revision": 1,
+      "registry_revision": null
+    },
+    {
+      "change_seq": 4,
+      "topic": "chat.thread",
+      "resource_id": "subagent:fixture",
+      "workspace_id": "fixture-ws",
+      "store_revision": 1,
+      "registry_revision": null
+    },
+    {
+      "change_seq": 5,
+      "topic": "workspace",
+      "resource_id": "*",
+      "workspace_id": null,
+      "store_revision": 1,
+      "registry_revision": null
+    },
+    {
+      "change_seq": 6,
+      "topic": "chat.thread",
+      "resource_id": "*",
+      "workspace_id": null,
+      "store_revision": 1,
+      "registry_revision": null
+    },
+    {
+      "change_seq": 7,
+      "topic": "chat.turn",
+      "resource_id": "*",
+      "workspace_id": null,
+      "store_revision": 1,
+      "registry_revision": null
+    },
+    {
+      "change_seq": 8,
+      "topic": "chat.completion",
+      "resource_id": "*",
+      "workspace_id": null,
+      "store_revision": 1,
+      "registry_revision": null
+    },
+    {
+      "change_seq": 9,
+      "topic": "surface",
+      "resource_id": "*",
+      "workspace_id": null,
+      "store_revision": 1,
+      "registry_revision": null
+    }
+  ],
+  "next_cursor": 9,
+  "journal_floor_seq": 0,
+  "expired": false,
+  "heartbeat": false,
+  "envelope": {
+    "instance_nonce": "29d8ce68aa65f99226c2d5c8b2e6ecfa",
+    "registry_revision": 1
+  },
+  "store_revision": 1
+}

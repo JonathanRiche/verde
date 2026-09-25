@@ -1,0 +1,29 @@
+{
+  "threads": [
+    {
+      "local_thread_id": "subagent:fixture",
+      "title": "Child",
+      "workspace_id": "fixture-ws",
+      "open": true,
+      "sort_index": 2,
+      "archived": false,
+      "committed": true,
+      "last_activity_at": 1700000020,
+      "provider_thread_id": null,
+      "model_ref": null,
+      "reasoning_effort": null,
+      "reasoning_variant": null,
+      "fast_mode": null,
+      "access_mode": null,
+      "provider": "codex",
+      "harness": "local_cli",
+      "cwd": null,
+      "profile_id": null,
+      "runtime_id": null,
+      "repository_id": null,
+      "repository_cwd": null
+    }
+  ],
+  "next_cursor": null,
+  "store_revision": 1
+}
