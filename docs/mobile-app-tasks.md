@@ -128,10 +128,10 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | A-10 | `mobile.min_client` + capability flags | host | linux | — | done (f8aa0db8) |
 | A-11 | Delta change feed on the gateway | host | linux | A-10 | todo |
 | A-12 | Push crypto module (seal/open) | host | linux | — | done (7f5c621f) |
-| A-13 | Push outbox + `device.push.*` RPCs | host | linux | A-02, A-12 | todo |
+| A-13 | Push outbox + `device.push.*` RPCs | host | linux | A-02, A-12 | in_progress (astra cli-thread-1790353399616-db0f6eeff8912a74) |
 | A-14 | Attention events → outbox | host | linux | A-13 | todo |
 | A-15 | Harden served-file open (TOCTOU, special files, leak, logs) | host | linux | A-01 | done (310be446) |
-| A-16 | `workspace.list` exposes repository binding roots | host | linux | A-01, A-02 | in_progress (astra cli-thread-1790352652979-9722438f168ff936) |
+| A-16 | `workspace.list` exposes repository binding roots | host | linux | A-01, A-02 | done (fb84ca8c) |
 | A-17 | Daemon-native workspace close | host | linux | A-02 | todo |
 | A-18 | Daemon-native subagent open | host | linux | A-02 | todo |
 | W-01 | App Link / universal link files + pair landing page | website | linux | H-03, H-04 | todo |
@@ -601,6 +601,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 - **Done when:** `$ZB daemon-test`, `$ZB headless-test` and
   `mise run web-app-test` pass; a file under a secondary binding root is
   served and one outside all bindings is 403.
+- **Done (fb84ca8c).** The daemon's `workspace.list` now loads the stored repository manifest: every binding with `root_path`, `runtime_id` and availability, plus the serving runtime ID (`store_protocol.zig`). The gateway's `RootCache` keeps only available bindings that belong to the serving runtime. A new daemon test covers a stored secondary binding, and a gateway test uses the real response type to serve a file under a secondary root and reject foreign, unavailable and outside roots. `headless-test` and `web-app-test` pass; `daemon-test` fails only on the pre-existing `workspace_layout` crash.
 
 #### A-17 · Daemon-native workspace close
 - **depends:** A-02 · **touches:** `packages/desktop/src/terminal/sessionizer.zig` (daemon dispatch), `access_protocol.zig`
