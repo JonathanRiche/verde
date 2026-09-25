@@ -37,7 +37,7 @@ final class TLSPolicyTests: XCTestCase {
         return result
     }
 
-    func testDERSPKIAndSystemTrust() throws {
+    func testDERSPKIAndSystemTrust() async throws {
         let fixture = try trust(anchored: true)
         var error: CFError?
         XCTAssertTrue(SecTrustEvaluateWithError(fixture, &error), String(describing: error))
@@ -48,7 +48,7 @@ final class TLSPolicyTests: XCTestCase {
         XCTAssertNil(TLSPolicy.spki(certificate: Data([0x30, 0x84, 0xff, 0xff, 0xff, 0xff])))
     }
 
-    func testDelegateRejectsMismatchAndUntrustedPinBeforeAuthorizingRequest() throws {
+    func testDelegateRejectsMismatchAndUntrustedPinBeforeAuthorizingRequest() async throws {
         let session = URLSession(configuration: .ephemeral)
         defer { session.invalidateAndCancel() }
         for (anchored, expected, allowed) in [(true, pin, true), (true, "changed", false), (false, pin, false)] {
@@ -68,7 +68,7 @@ final class TLSPolicyTests: XCTestCase {
         }
     }
 
-    func testProbeCancelsBeforeHTTPAndReturnsPeer() throws {
+    func testProbeCancelsBeforeHTTPAndReturnsPeer() async throws {
         let session = URLSession(configuration: .ephemeral)
         defer { session.invalidateAndCancel() }
         var events: [Event] = []
