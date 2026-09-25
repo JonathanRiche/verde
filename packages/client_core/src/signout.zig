@@ -9,7 +9,7 @@ pub const State = struct {
     intent_id: ?[]const u8 = null,
     rpc_id: ?u64 = null,
     wiping: bool = false,
-    record: enum { credential, profile } = .credential,
+    record: enum { credential, profile, sync } = .credential,
     delete_pending: bool = false,
     delete_failed: bool = false,
 };
@@ -118,8 +118,9 @@ pub fn complete(tx: *h.Transaction, p: h.Pending, event: V) E!bool {
     if ((try h.field(event, "error")) != .null) {
         s.delete_failed = true;
         outcome(tx, "failed", .{ .domain = "storage", .code = "sign_out_delete_failed", .message = "Local removal could not complete. Unlock the device and retry.", .retryable = true });
-    } else if (s.record == .credential) {
-        s.record = .profile;
+    } else if (s.record != .sync) {
+        // K-16's resume checkpoint holds workspace/thread metadata; remove it last.
+        s.record = if (s.record == .credential) .profile else .sync;
         try deleteRecord(tx);
     } else {
         s.wiping = false;

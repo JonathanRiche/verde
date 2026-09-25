@@ -1,0 +1,6 @@
+{
+  "daemon_sha256": "ae24fca56da14a1be8d0c3c0183c29156cb5f0c2a4eb7d10a94435a62bffc998",
+  "gateway_sha256": "2c5e26293293a8e89cd9d53b30b00241dae95d0003479c4c7ae3fac0c4809269",
+  "protocol_version": 28,
+  "isolation": "TemporaryDirectory; private Unix socket; 127.0.0.1 gateway on a leased port; isolated HOME/XDG config/data; synthetic thread only; no providers"
+}

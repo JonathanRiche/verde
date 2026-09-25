@@ -1,4 +1,6 @@
-//! Legacy snapshot/push sync. Cursors advance only after snapshot and catalog commit.
+//! Snapshot/push sync. Cursors advance only after snapshot and catalog commit.
+//! K-16 delta mode (sync_delta.zig) reuses this seed, merge and projection path.
+pub const delta = @import("sync_delta.zig");
 const std = @import("std");
 const host = @import("host.zig");
 const rpc = @import("rpc.zig");
@@ -7,6 +9,7 @@ const store = @import("headless").store_protocol;
 const V = std.json.Value;
 const eq = host.eq;
 pub const State = struct {
+    delta: delta.State = .{},
     snapshot: V = .null,
     catalog: []const V = &.{},
     has_catalog: bool = false,
@@ -22,7 +25,7 @@ pub const State = struct {
     loading: bool = false,
     @"error": ?host.LocalError = null,
 };
-const scopes = [_][]const u8{ "workspaces", "registry", "sessions", "turns", "config" };
+pub const scopes = [_][]const u8{ "workspaces", "registry", "sessions", "turns", "config" };
 fn append(comptime T: type, tx: *host.Transaction, dest: *[]const T, item: T) !void {
     const next = try tx.allocator().alloc(T, dest.len + 1);
     @memcpy(next[0..dest.len], dest.*);
@@ -36,11 +39,22 @@ pub fn refresh(tx: *host.Transaction) host.ApiError!void {
         return;
     }
     if (tx.state.rpc.phase != .ready or tx.state.lifecycle != .foreground or !tx.state.network_available) return;
-    s.snapshot_id = try rpc.request(tx, "core.snapshot", .{ .scopes = scopes }, .{ .mutation = false, .legacy_snapshot = true, .intent_id = "@sync" });
+    try startSnapshot(tx, &scopes);
+}
+/// Issues the owned snapshot read; K-16 passes a subset for scoped refreshes.
+pub fn startSnapshot(tx: *host.Transaction, requested: []const []const u8) host.ApiError!void {
+    const s = &tx.state.sync;
+    s.snapshot_id = try rpc.request(tx, "core.snapshot", .{ .scopes = requested }, .{ .mutation = false, .legacy_snapshot = true, .intent_id = "@sync" });
     s.loading = true;
     s.dirty = false;
     s.@"error" = null;
     tx.changed = true;
+}
+/// Clears sync inputs but keeps delta checkpoint/socket bookkeeping.
+pub fn reset(tx: *host.Transaction) void {
+    const d = tx.state.sync.delta;
+    tx.state.sync = .{ .delta = d };
+    delta.clearWork(&tx.state.sync.delta);
 }
 fn page(tx: *host.Transaction, cursor: ?[]const u8) host.ApiError!void {
     const limit = @min(@as(u32, 100), tx.state.rpc.limits.max_page_items);
@@ -100,7 +114,22 @@ pub fn applySnapshotScopes(tx: *host.Transaction, value: V, requested: []const [
             }
             if (!included) continue;
         }
-        if (eq(entry.key_ptr.*, "snapshot") and p.get(merged, "snapshot") == .object) {
+        if (eq(key, "incomplete_scopes") and requested.len < scopes.len) {
+            // A scoped read reports only its own scopes; keep the others' flags.
+            var incomplete: std.array_list.Managed(V) = .init(tx.allocator());
+            for (p.rows(p.get(merged, key))) |old| {
+                var keep = false;
+                for (scopes) |known| {
+                    if (old == .string and eq(old.string, known)) keep = true;
+                }
+                for (requested) |item| {
+                    if (old == .string and eq(old.string, item)) keep = false;
+                }
+                if (keep) try incomplete.append(old);
+            }
+            for (p.rows(entry.value_ptr.*)) |item| try incomplete.append(item);
+            try merged.object.put(tx.allocator(), key, .{ .array = incomplete });
+        } else if (eq(entry.key_ptr.*, "snapshot") and p.get(merged, "snapshot") == .object) {
             var durable = p.get(merged, "snapshot");
             var fields = entry.value_ptr.object.iterator();
             while (fields.next()) |f| try durable.object.put(tx.allocator(), f.key_ptr.*, f.value_ptr.*);
@@ -200,19 +229,20 @@ fn receivePage(tx: *host.Transaction, value: V) host.ApiError!void {
     s.has_catalog = true;
     s.staged = &.{};
     s.loading = false;
-    s.cursor = p.uint(p.get(s.snapshot, "change_cursor"));
+    s.cursor = s.delta.active_cursor orelse p.uint(p.get(s.snapshot, "change_cursor"));
     tx.state.stale = s.dirty;
     tx.changed = true;
-    if (s.dirty) try refresh(tx);
+    if (s.dirty) try refresh(tx) else try delta.finish(tx);
 }
 /// Drain only owned result IDs; other feature engines retain their outcomes.
 pub fn pump(tx: *host.Transaction) host.ApiError!void {
     const s = &tx.state.sync;
-    if (rpc.takeFullResync(tx)) {
-        s.* = .{};
+    if (rpc.takeFullResync(tx) and !try delta.handshake(tx)) {
+        reset(tx);
         tx.state.stale = true;
         try refresh(tx);
     }
+    try delta.negotiate(tx);
     const count = tx.state.rpc.results.len;
     for (0..count) |_| {
         const result = rpc.takeResult(tx).?;
@@ -224,15 +254,34 @@ pub fn pump(tx: *host.Transaction) host.ApiError!void {
             continue;
         }
         if (snapshot) s.snapshot_id = null else s.page_id = null;
+        const scoped = s.delta.active_cursor != null;
         if (result.@"error") |err| {
             if (catalog and err.rpc_code != null and eq(err.rpc_code.?, "revision_expired") and tx.state.rpc.phase == .ready) {
                 try restartPages(tx);
+            } else if (scoped and tx.state.rpc.phase != .ready) {
+                delta.abandon(tx);
+            } else if (scoped) {
+                try delta.fallback(tx, false);
+                if (s.snapshot_id == null) errorState(tx, err);
             } else errorState(tx, err);
             continue;
         }
         if (snapshot) {
-            try applySnapshot(tx, result.value orelse .null);
-            if (s.@"error" != null) continue;
+            const value = result.value orelse .null;
+            const nonce = p.s(p.get(unwrap(value), "envelope"), "instance_nonce");
+            if (scoped and nonce.len > 0 and !eq(nonce, s.nonce)) {
+                try delta.fallback(tx, false);
+                continue;
+            }
+            try applySnapshotScopes(tx, value, if (scoped) s.delta.active_scopes else &scopes);
+            if (s.@"error" != null) {
+                if (scoped) try delta.fallback(tx, false);
+                continue;
+            }
+            if (scoped and !s.delta.active_catalog) {
+                try delta.finish(tx);
+                continue;
+            }
             s.staged = &.{};
             s.page_revision = null;
             s.page_restarts = 0;
@@ -241,8 +290,12 @@ pub fn pump(tx: *host.Transaction) host.ApiError!void {
         } else try receivePage(tx, result.value orelse .null);
     }
 }
-/// Called only after host socket ID and generation validation. WS is push-only.
+/// Called only after host socket ID and generation validation. The only WS
+/// request is K-16's `core.changes.mode`; everything else is push-only.
 pub fn push(tx: *host.Transaction, text: []const u8) host.ApiError!void {
+    return pushFrom(tx, null, text);
+}
+pub fn pushFrom(tx: *host.Transaction, socket: ?[]const u8, text: []const u8) host.ApiError!void {
     const note = host.parseLimit(tx.allocator(), text, 8 * 1024 * 1024) catch |err| {
         if (err == error.OutOfMemory) return err;
         try tx.invalidateTransport();
@@ -250,6 +303,7 @@ pub fn push(tx: *host.Transaction, text: []const u8) host.ApiError!void {
         tx.state.rpc.phase = .failed;
         return;
     };
+    if (try delta.control(tx, note)) return;
     const method = p.s(note, "method");
     const params = p.get(note, "params");
     const value = unwrap(params);
@@ -268,12 +322,16 @@ pub fn push(tx: *host.Transaction, text: []const u8) host.ApiError!void {
         if (tx.state.rpc.instance_id) |expected| {
             if (!eq(expected, instance)) {
                 try tx.invalidateTransport();
-                tx.state.sync = .{};
+                reset(tx);
                 _ = try rpc.beginHandshake(tx);
                 return;
             }
         }
+        try delta.hello(tx, socket);
     } else if (eq(method, "core.snapshot")) {
+        // Delta recovery snapshots and pre-opt-in pushes are covered by the
+        // cursor replay; the core refreshes over HTTP instead.
+        if (tx.state.sync.delta.enabled or delta.ignoreFeed(tx)) return;
         // An in-flight HTTP snapshot/catalog owns the refresh boundary. A push
         // cannot cancel it or move its cursor; schedule a follow-up instead.
         if (tx.state.sync.loading) {
@@ -290,6 +348,8 @@ pub fn push(tx: *host.Transaction, text: []const u8) host.ApiError!void {
             try page(tx, null);
         }
     } else if (eq(method, "core.changes")) {
+        if (delta.ignoreFeed(tx)) return;
+        if (tx.state.sync.delta.enabled) return delta.changes(tx, params);
         const nonce = p.s(p.get(value, "envelope"), "instance_nonce");
         const changed = nonce.len > 0 and tx.state.sync.nonce.len > 0 and !eq(nonce, tx.state.sync.nonce);
         if (changed or p.yes(p.get(value, "expired")) or eq(p.s(p.get(params, "error"), "code"), "revision_expired")) {
@@ -299,7 +359,7 @@ pub fn push(tx: *host.Transaction, text: []const u8) host.ApiError!void {
                 tx.state.stale = true;
                 return;
             }
-            tx.state.sync = .{};
+            reset(tx);
             if (changed) tx.state.sync.nonce = nonce;
             tx.state.stale = true;
         }

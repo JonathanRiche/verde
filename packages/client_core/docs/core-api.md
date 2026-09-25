@@ -177,7 +177,7 @@ state must recover without assuming callbacks were delivered.
 | `http_request` | `method,url,headers:[{name,value}],body_base64:string|null,timeout_ms,max_response_bytes,tls:{origin,spki_sha256}`. Report one `http_response`; no automatic application-level retry, redirects or cookie/Origin injection. Enforce the response byte cap while streaming. |
 | `http_cancel` | `request_id`; cancel locally, never interpreted as undoing a daemon mutation. Late responses are harmless. |
 | `ws_open` | `url,protocols:[string],tls:{origin,spki_sha256},max_message_bytes`; protocols include `verde.v1` and a single-use `verde.ticket.<ticket>`, never a ticket in the URL. |
-| `ws_send` | `socket_id,text`; ordered on that socket. Send failures report `ws_closed`; no interactive/parked RPCs here. Reserved for negotiated feed controls in K-16. |
+| `ws_send` | `socket_id,text`; ordered on that socket. Send failures report `ws_closed`; no interactive/parked RPCs here. Used only for K-16's `core.changes.mode` opt-in (see `sync.md`). |
 | `ws_close` | `socket_id,code`; idempotent local close. |
 | `set_timer` | `timer_id,delay_ms,purpose`; one-shot monotonic timer. `purpose` is a non-sensitive enum for tests/diagnostics. |
 | `cancel_timer` | `timer_id`; idempotent cancellation. |
@@ -206,8 +206,8 @@ does not implement SPKI validation. K-04/K-07 reuse the pure decision rules,
 not its filesystem implementation or an imaginary existing TLS API.
 
 Storage keys are scoped as `vc/1/<host_id>/<record>`, where host IDs are locally
-generated safe components. Records are `profile`, `credential`, and encoded
-thread-specific `draft`/`followup` receipts. Never concatenate unescaped daemon
+generated safe components. Records are `profile`, `credential`, K-16's `sync`
+resume checkpoint, and encoded thread-specific `draft`/`followup` receipts. Never concatenate unescaped daemon
 IDs into paths. Platforms may implement content receipts in encrypted app-local
 storage behind this interface; credentials use Keystore/Keychain and no cloud
 backup. Access tokens and WS tickets remain in memory only. Missing credentials
@@ -222,8 +222,8 @@ Optional values below may be null. These are new local names, not RPC names.
 
 | Intent | Payload / result |
 | --- | --- |
-| `sign_out` | `host_id`; revoke this handle’s authenticated device, then delete credential and pin. `auth_state:signed_out` only after both delete acknowledgements. Offline/ambiguous outcomes report operation error `sign_out_unconfirmed` without wiping. |
-| `forget_host` | `host_id`; explicitly delete local credential and pin without revocation. The UI must warn that the device may remain listed on the desktop. |
+| `sign_out` | `host_id`; revoke this handle’s authenticated device, then delete credential, pin and the K-16 sync checkpoint. `auth_state:signed_out` only after every delete acknowledgement. Offline/ambiguous outcomes report operation error `sign_out_unconfirmed` without wiping. |
+| `forget_host` | `host_id`; explicitly delete local credential, pin and sync checkpoint without revocation. The UI must warn that the device may remain listed on the desktop. |
 | `pair` | `link,device_label,client_nonce`; parse supported custom/App Link form, code only from fragment. Keep nonce stable across a lost exchange response. Manual entry is normalized by the platform to the same link. |
 | `trust_decision` | `proposal_id,accept:bool`; reject stale proposals. Denial leaves host disabled without auth traffic. |
 | `retry_connection` | Retry a recoverable connection; cannot override identity/TLS rejection. |
@@ -354,7 +354,7 @@ existing gateway pushes. Changes contain identities/revisions, not resource
 payloads. Coalesce invalidations while refresh is in flight and perform another
 refresh if a later change arrived; never advance a cursor beyond incorporated
 state. Do not opt into delta mode in K-09. K-16 adds negotiated delta behavior
-after A-11; `expired`, a changed `instance_nonce`, or `revision_expired` requires
+after A-11 (`sync.md`, "K-16 delta mode"); `expired`, a changed `instance_nonce`, or `revision_expired` requires
 a full snapshot and cursor reseed. `instance_nonce` is the registry revision
 namespace, not `instance_id` or the TLS pin. Never call the desktop-mirror RPCs
 `workspaces`, `panes` or `chat.status`.

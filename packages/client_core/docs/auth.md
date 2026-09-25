@@ -93,7 +93,8 @@ handle.
 
 Once removal starts, transport/timers are cancelled, in-memory tokens and
 projections are dropped, and `auth_state` becomes `signing_out`. The core deletes
-`credential`, then `profile`, waiting for each secure-store acknowledgement.
+`credential`, then `profile`, then K-16's `sync` resume checkpoint (cached
+workspace/thread metadata), waiting for each secure-store acknowledgement.
 Failure leaves `sign_out_delete_failed` visible; `retry_connection` (or a new
 removal intent) retries the failed delete without repeating remote revocation.
 Only the final acknowledgement produces `auth_state:signed_out` and a succeeded

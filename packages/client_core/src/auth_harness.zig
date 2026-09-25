@@ -336,7 +336,10 @@ fn finishRemoval(f: *Fixture, first: V) !void {
     try expect(f.host.state.auth.token == null and f.host.state.rpc.bearer == null);
     const second = try find(try f.done(first), "secure_store_delete");
     try expect(h.eq(f.host.state.auth_state, "signing_out"));
-    _ = try f.done(second);
+    const third = try find(try f.done(second), "secure_store_delete");
+    try expect(std.mem.endsWith(u8, get(third, "key").string, "/sync"));
+    try expect(h.eq(f.host.state.auth_state, "signing_out"));
+    _ = try f.done(third);
     try expect(h.eq(f.host.state.auth_state, "signed_out"));
     try expect(f.host.state.auth.pin == null and f.host.state.auth.credential == null);
     try expect(f.host.state.config.https_url == null);
@@ -396,7 +399,9 @@ test "sign out delete failure retries failed record and ignores duplicate acknow
     try expect(h.eq(get(retried, "key").string, get(second, "key").string));
     _ = try f.done(second);
     try expect(h.eq(f.host.state.auth_state, "signing_out"));
-    _ = try f.done(retried);
+    const sync_record = try find(try f.done(retried), "secure_store_delete");
+    try expect(h.eq(f.host.state.auth_state, "signing_out"));
+    _ = try f.done(sync_record);
     try expect(h.eq(f.host.state.auth_state, "signed_out"));
 }
 test "sign out rejects another host and duplicate intent cannot repeat revoke" {

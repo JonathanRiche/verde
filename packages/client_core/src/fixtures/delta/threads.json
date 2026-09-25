@@ -1,0 +1,29 @@
+{
+  "threads": [
+    {
+      "local_thread_id": "delta-thread",
+      "title": "After delta",
+      "workspace_id": "delta-ws",
+      "open": true,
+      "sort_index": 0,
+      "archived": false,
+      "committed": true,
+      "last_activity_at": null,
+      "provider_thread_id": null,
+      "model_ref": null,
+      "reasoning_effort": null,
+      "reasoning_variant": null,
+      "fast_mode": null,
+      "access_mode": null,
+      "provider": "codex",
+      "harness": "local_cli",
+      "cwd": null,
+      "profile_id": null,
+      "runtime_id": null,
+      "repository_id": null,
+      "repository_cwd": null
+    }
+  ],
+  "next_cursor": null,
+  "store_revision": 2
+}

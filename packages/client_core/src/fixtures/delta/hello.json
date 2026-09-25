@@ -1,0 +1,94 @@
+{
+  "jsonrpc": "2.0",
+  "method": "core.hello",
+  "params": {
+    "source": "daemon",
+    "status_envelope": {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "result": {
+        "runtime_id": "d40f605fc5a3db508e2643f2526f1f5b",
+        "instance_id": "edcba411e7d2c0054f67f0d55e8911fc",
+        "server_version": "0.0.0",
+        "protocol": {
+          "major": 1,
+          "minor": 0
+        },
+        "runtime_capabilities": [
+          "rpc.target.v1",
+          "core.snapshot.v1",
+          "core.changes.v1",
+          "chat.turns.v1",
+          "pty.raw.v1",
+          "workspaces.page.v1",
+          "threads.page.v1",
+          "messages.page.v1",
+          "providers.status.v1",
+          "repositories.compat.v1",
+          "repositories.manifest.v1",
+          "chat.repository_route.v1",
+          "chat.attachments.v1",
+          "access.pair.v1",
+          "core.changes.delta.v1"
+        ],
+        "limits": {
+          "max_request_bytes": 1048576,
+          "max_response_bytes": 1048576,
+          "max_attachment_bytes": 52428800,
+          "max_parked_wait_ms": 25000,
+          "default_page_items": 100,
+          "max_page_items": 200
+        },
+        "mobile": {
+          "min_client": 1
+        },
+        "headless_protocol_version": 1,
+        "min_supported": 1,
+        "max_supported": 1,
+        "protocol_version": 28,
+        "pid": 3129008,
+        "session_count": 0,
+        "chat_turn_count": 0,
+        "capabilities": {
+          "terminal_raw": true,
+          "terminal_grid": false,
+          "chat": true,
+          "processes": false,
+          "leases": false,
+          "browser_execution": false,
+          "browser_presentation": false,
+          "browser": {
+            "available": false,
+            "features": {
+              "session_state": false,
+              "create": false,
+              "navigation": false,
+              "history": false,
+              "javascript_eval": false,
+              "dom_inspection": false,
+              "selector_actions": false,
+              "form_input": false,
+              "low_level_pointer": false,
+              "screenshot": false,
+              "lifecycle_restart": false,
+              "lifecycle_reset": false,
+              "frame_streaming": false,
+              "downloads": false,
+              "uploads": false
+            }
+          },
+          "store": true,
+          "snapshots": true,
+          "changes": true,
+          "subscriptions": false,
+          "workspace_pagination": true,
+          "thread_pagination": true,
+          "message_pagination": true,
+          "provider_status": true,
+          "repository_projection": true,
+          "repository_manifests": true
+        }
+      }
+    }
+  }
+}

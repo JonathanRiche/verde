@@ -225,6 +225,7 @@ pub const Transaction = struct {
         if (self.state.generation == std.math.maxInt(u64)) return error.ResourceLimit;
         try rpc.invalidate(self);
         terminal.invalidate(self);
+        sync.delta.invalidate(self);
         self.state.generation += 1;
         auth.invalidated(self);
         var i: usize = 0;
@@ -397,7 +398,7 @@ pub const Transaction = struct {
             }
             self.completion_matched = true;
             if (kind == .socket and !eq(tag, "ws_closed")) {
-                if (eq(tag, "ws_message")) try sync.push(self, try string(event, "text"));
+                if (eq(tag, "ws_message")) try sync.pushFrom(self, p.id, try string(event, "text"));
                 return;
             }
             try self.remove(i);
@@ -409,6 +410,7 @@ pub const Transaction = struct {
                 try self.setTimer(p.purpose, @intCast(p.deadline - self.state.now_ms.?));
                 return;
             }
+            if (try sync.delta.complete(self, p, event)) return;
             if (try auth.complete(self, p, event)) return;
             if (try terminal.complete(self, p, event)) return;
             if (try chat.complete(self, p, event)) return;

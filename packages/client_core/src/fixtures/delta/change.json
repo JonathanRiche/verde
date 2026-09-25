@@ -1,0 +1,29 @@
+{
+  "jsonrpc": "2.0",
+  "method": "core.changes",
+  "params": {
+    "jsonrpc": "2.0",
+    "id": 3,
+    "result": {
+      "entries": [
+        {
+          "change_seq": 8,
+          "topic": "chat.thread",
+          "resource_id": "delta-thread",
+          "workspace_id": "delta-ws",
+          "store_revision": 2,
+          "registry_revision": null
+        }
+      ],
+      "next_cursor": 8,
+      "journal_floor_seq": 0,
+      "expired": false,
+      "heartbeat": false,
+      "envelope": {
+        "instance_nonce": "e87b9e17555fc629a0651eec94b8d5d5",
+        "registry_revision": 1
+      },
+      "store_revision": 2
+    }
+  }
+}
