@@ -132,7 +132,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | A-14 | Attention events → outbox | host | linux | A-13 | done (8832302d) |
 | A-15 | Harden served-file open (TOCTOU, special files, leak, logs) | host | linux | A-01 | done (310be446) |
 | A-16 | `workspace.list` exposes repository binding roots | host | linux | A-01, A-02 | done (fb84ca8c) |
-| A-17 | Daemon-native workspace close | host | linux | A-02 | paused (Codex usage limit until 2026-09-26 04:15; resume astra cli-thread-1790363635251-4cb0809baa57de93; WIP in ../verde-wt/A-17) |
+| A-17 | Daemon-native workspace close | host | linux | A-02 | in_progress (claude opus cli-thread-1790365213012-89bd9f0035e48660; took over paused Codex WIP) |
 | A-18 | Daemon-native subagent open | host | linux | A-02 | todo |
 | W-01 | App Link / universal link files + pair landing page | website | linux | H-03, H-04 | todo |
 | C-01 | Spike: APNs reachability from Workers | cloud | linux | — | done (research; recorded in plan §8, see C-02) |
@@ -150,15 +150,15 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | K-10 | Chat engine | core | linux | K-09 | done (97656ebd) |
 | K-11 | Markdown AST / highlight spans / diff parse exports | core | linux | K-06 | done (93000154, c37e038c) |
 | K-12 | Terminal handle + PTY pump | core | linux | K-06 | done (a7650965) |
-| K-13 | Allowlist coverage test | core | linux | K-10, A-02 | paused (Codex usage limit until 2026-09-26 04:15; resume astra cli-thread-1790364654955-96c6bdb46115cff2; WIP in ../verde-wt/K-13) |
-| K-14 | Contract suite vs real gateway + daemon | core | linux | K-10 | paused (Codex usage limit until 2026-09-26 04:15; resume astra cli-thread-1790364656597-1ab894b191d83847; WIP in ../verde-wt/K-14) |
+| K-13 | Allowlist coverage test | core | linux | K-10, A-02 | in_progress (claude opus cli-thread-1790365216103-1771f2d8ae7fdac0; took over paused Codex WIP) |
+| K-14 | Contract suite vs real gateway + daemon | core | linux | K-10 | in_progress (claude opus cli-thread-1790365217704-eb78988ef08f44fe; took over paused Codex WIP) |
 | K-15 | Kotlin/Swift model codegen from Zig types | core | linux | K-06 | done (fdb77f3d) |
-| K-16 | Delta-mode sync | core | linux | K-09, A-11 | paused (Codex usage limit until 2026-09-26 04:15; resume astra cli-thread-1790364215750-82de15a4a4901ec8; WIP in ../verde-wt/K-16) |
+| K-16 | Delta-mode sync | core | linux | K-09, A-11 | in_progress (claude opus cli-thread-1790365214460-8bfb42a8f4da5dce; took over paused Codex WIP) |
 | K-17 | Attention state machine + push decrypt | core | linux | K-09, A-12 | todo |
 | D-01 | Android project scaffold | android | linux | K-01 | done (ee3c19df; on-device version display pending human-verify) |
 | D-02 | Core bridge + effect executor | android | linux | D-01, K-06, K-15 | done (0f7fb9c6) |
 | D-03 | Pairing flow | android | linux+phone | D-02, K-07, A-06, H-06, H-07 | done (13f210cf; phone verify pending H-06/H-07; verified App Links need W-01) |
-| D-04 | Hosts list + switcher + sign out | android | linux | D-03, A-04 | paused (Codex usage limit until 2026-09-26 04:15; resume astra cli-thread-1790363520707-da29d316f8961d4b; WIP in ../verde-wt/D-04) |
+| D-04 | Hosts list + switcher + sign out | android | linux | D-03, A-04 | in_progress (claude opus cli-thread-1790365209329-309f979d78cceae0; took over paused Codex WIP) |
 | D-05 | Home + Workspaces + lifecycle | android | linux+phone | D-04, K-09 | todo |
 | D-06 | Transcript screen | android | linux | D-05, K-10, K-11 | todo |
 | D-07 | Diff card | android | linux | D-06 | todo |
