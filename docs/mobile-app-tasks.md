@@ -174,7 +174,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | D-17 | Release build + Play internal track | android | linux | D-16, H-03 | todo |
 | I-01 | iOS project scaffold (XcodeGen) | ios | mac | K-02 | done (bdfcfd3e; unsigned simulator only until H-04) |
 | I-02 | Core bridge + effect executor | ios | mac | I-01, K-06, K-15 | done (f389ab00, b6dc5f03, 69c813af, 10b4f4cd) |
-| I-03 | Pairing flow | ios | mac+phone | I-02, K-07, A-06 | in_progress (astra cli-thread-1790362327142-40da049010c5c3e5) |
+| I-03 | Pairing flow | ios | mac+phone | I-02, K-07, A-06 | done (abe0dafd..ce41f917; phone verify pending H-06, universal links pending H-04) |
 | I-04 | Hosts + Home + Workspaces + lifecycle | ios | mac | I-03, D-05 | todo |
 | I-05 | Transcript + diff + approvals | ios | mac | I-04, D-06, D-07, D-09 | todo |
 | I-06 | Composer + pickers + attachments + follow-ups | ios | mac | I-05, D-08 | todo |
@@ -1148,6 +1148,7 @@ Shared rules:
   prompt; same errors as D-03.
 - **Done when:** tests pass. Human-verify: pairing works on the test
   iPhone (development install through the Mac).
+- **Done (abe0dafd, ffd974f4, a6a96c69, ce41f917).** iOS pins now use the core's lowercase hex (`abe0dafd`). The app has a pairing screen with QR scan, paste and manual entry, handlers for both link forms, host trust confirmation, retry after a storage failure, and a retry when a reply is lost; the tests drive the real core. A malformed link now shows an error the user can retry instead of closing the host, and the app obscures its view when inactive. `mobile-ios-build` succeeds on Xcode 16.2 and `mobile-ios-test` passes 22/0. On-phone steps are in `packages/mobile_ios/docs/pairing.md`. Associated Domains waits on H-04, and testing on a phone waits on H-06.
 
 #### I-04 · Hosts + Home + Workspaces + lifecycle
 - **depends:** I-03, D-05
