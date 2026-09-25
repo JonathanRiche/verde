@@ -2,6 +2,7 @@
 
 Follow the [root Zig rules](../../AGENTS.md). Design: [mobile app plan §5](../../docs/mobile-app-plan.md).
 Android toolchain setup: [docs/android-toolchain.md](docs/android-toolchain.md).
+iOS toolchain setup: [docs/ios-toolchain.md](docs/ios-toolchain.md).
 
 - **Sans-IO.** The core never opens sockets, reads files, spawns threads or reads the clock on its own. The platform feeds events in and performs the effects the core returns.
 - **C ABI.** Every export uses the `vc_` prefix and is declared in `include/verde_client.h`; keep the header and `src/root.zig` exports in sync (the `test` step compiles `tests/abi_smoke.c` against both). Returned buffers are core-owned and freed with `vc_buf_free`; never keep caller pointers across calls. Static strings (e.g. `vc_version`) are never freed.

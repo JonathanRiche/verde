@@ -1,0 +1,4 @@
+module VerdeClient {
+    header "verde_client.h"
+    export *
+}

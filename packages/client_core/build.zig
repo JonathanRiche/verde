@@ -6,6 +6,8 @@
 //! - `android-libs`: `libverde_client.so` for arm64-v8a and x86_64 against the
 //!   NDK sysroot (`ANDROID_NDK_HOME` or `-Dandroid-ndk`), installed to
 //!   `zig-out/lib/android/<abi>/` and checked for allowed NEEDED entries.
+//! - `ios-xcframework`: device + simulator arm64 static libraries packaged
+//!   as `zig-out/lib/VerdeClient.xcframework` (macOS with Xcode).
 
 const std = @import("std");
 const zon = @import("build.zig.zon");
@@ -37,6 +39,7 @@ pub fn build(b: *std.Build) void {
     const options = b.addOptions();
     options.addOption([:0]const u8, "version", zon.version);
 
+    addIosSteps(b, optimize, options);
     addTestStep(b, target, optimize, options);
     addAndroidStep(b, optimize, options, ndk_option orelse b.graph.environ_map.get("ANDROID_NDK_HOME"));
 }
@@ -125,6 +128,56 @@ fn addAndroidStep(
         check.setName(b.fmt("check {s} {s}", .{ lib_name, abi.name }));
         check.expectExitCode(0);
         android_step.dependOn(&check.step);
+    }
+}
+
+/// SDK discovery and packaging run only when explicitly requested, so host
+/// tests and Android builds do not require Xcode (even on macOS).
+fn addIosSteps(b: *std.Build, optimize: std.builtin.OptimizeMode, options: *std.Build.Step.Options) void {
+    const package_step = b.step("ios-xcframework", "Package the iOS device and simulator libraries (requires Xcode)");
+    const package = b.addSystemCommand(&.{"bash"});
+    package.addFileArg(b.path("scripts/build-ios-xcframework.sh"));
+    package.addArg(b.graph.zig_exe);
+    package.addArg(@tagName(optimize));
+    package.addArg(b.install_prefix);
+    package.setCwd(b.path("."));
+    package_step.dependOn(&package.step);
+
+    // The packaging script supplies the SDKs discovered by xcrun. Keeping the
+    // libraries in the build graph shares core module wiring with other targets.
+    const libs_step = b.step("ios-libs", "Build iOS static libraries with explicit SDK paths");
+    const device_sdk = b.option([]const u8, "ios-sdk", "iPhoneOS SDK path");
+    const simulator_sdk = b.option([]const u8, "ios-simulator-sdk", "iPhoneSimulator SDK path");
+    if (device_sdk == null or simulator_sdk == null) {
+        libs_step.dependOn(&b.addFail("ios-libs needs -Dios-sdk and -Dios-simulator-sdk; use ios-xcframework for automatic discovery").step);
+        return;
+    }
+    const slices = .{
+        .{ "device", std.Target.Abi.none, device_sdk.? },
+        .{ "simulator", std.Target.Abi.simulator, simulator_sdk.? },
+    };
+    inline for (slices) |slice| {
+        const target = b.resolveTargetQuery(.{
+            .cpu_arch = .aarch64,
+            .os_tag = .ios,
+            .abi = slice[1],
+            .os_version_min = .{ .semver = .{ .major = 17, .minor = 0, .patch = 0 } },
+        });
+        const module = createCoreModule(b, target, optimize, options);
+        module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ slice[2], "usr/include" }) });
+        module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ slice[2], "usr/lib" }) });
+        module.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ slice[2], "System/Library/Frameworks" }) });
+        const lib = b.addLibrary(.{
+            .name = lib_name,
+            .linkage = .static,
+            .root_module = module,
+            .use_llvm = true,
+            .use_lld = true,
+        });
+        const install = b.addInstallArtifact(lib, .{
+            .dest_dir = .{ .override = .{ .custom = "lib/ios/" ++ slice[0] } },
+        });
+        libs_step.dependOn(&install.step);
     }
 }
 
