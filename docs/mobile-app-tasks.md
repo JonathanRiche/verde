@@ -150,7 +150,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | K-10 | Chat engine | core | linux | K-09 | done (97656ebd) |
 | K-11 | Markdown AST / highlight spans / diff parse exports | core | linux | K-06 | done (93000154, c37e038c) |
 | K-12 | Terminal handle + PTY pump | core | linux | K-06 | done (a7650965) |
-| K-13 | Allowlist coverage test | core | linux | K-10, A-02 | in_progress (claude opus cli-thread-1790365216103-1771f2d8ae7fdac0; took over paused Codex WIP) |
+| K-13 | Allowlist coverage test | core | linux | K-10, A-02 | done (15823136) |
 | K-14 | Contract suite vs real gateway + daemon | core | linux | K-10 | in_progress (claude opus cli-thread-1790365217704-eb78988ef08f44fe; took over paused Codex WIP) |
 | K-15 | Kotlin/Swift model codegen from Zig types | core | linux | K-06 | done (fdb77f3d) |
 | K-16 | Delta-mode sync | core | linux | K-09, A-11 | done (9418aef0) |
@@ -894,6 +894,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
   send. Assert that each one has `requiredScopeMaskForRpc(method) != null`.
 - **Done when:** the test fails if a method is added without an allowlist
   entry; `mise run mobile-core-test` passes.
+- **Done (15823136).** `allowlist_test.zig` collects every RPC method at test time by parsing the core's own sources: `request` calls, the `chat.call` and `terminal_pump.queue` wrappers, and hand-built `.method` fields. It asserts each has `requiredScopeMaskForRpc(method) != null`. The test also fails when a method isn't a plain string, when a wrapper is renamed or unused, or when a file other than `rpc.zig`/`auth_rpc.zig` names `/api/rpc`. It covers 28 methods and found none unmapped. Exemptions are the auth HTTP endpoints, the resend after a token refresh, and inbound WS notifications. `core.changes.mode` currently maps only through the gateway's `core.changes` special case; A-18 is adding a direct allowlist entry. `mobile-core-test` passes 156/156.
 
 #### K-14 · Contract suite vs real gateway + daemon
 - **depends:** K-10
