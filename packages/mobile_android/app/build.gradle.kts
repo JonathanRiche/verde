@@ -45,6 +45,11 @@ android {
 tasks.named("preBuild") { dependsOn(syncNativeLibraries) }
 
 dependencies {
+    implementation(libs.coroutines)
+    implementation(libs.datastore)
+    implementation(libs.okhttp)
+    testImplementation(libs.okhttp.mockwebserver)
+    testImplementation(libs.okhttp.tls)
     implementation(libs.kotlinx.serialization.json)
     implementation(platform(libs.compose.bom))
     implementation(libs.activity.compose)
