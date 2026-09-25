@@ -153,8 +153,8 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | K-13 | Allowlist coverage test | core | linux | K-10, A-02 | in_progress (claude opus cli-thread-1790365216103-1771f2d8ae7fdac0; took over paused Codex WIP) |
 | K-14 | Contract suite vs real gateway + daemon | core | linux | K-10 | in_progress (claude opus cli-thread-1790365217704-eb78988ef08f44fe; took over paused Codex WIP) |
 | K-15 | Kotlin/Swift model codegen from Zig types | core | linux | K-06 | done (fdb77f3d) |
-| K-16 | Delta-mode sync | core | linux | K-09, A-11 | in_progress (claude opus cli-thread-1790365214460-8bfb42a8f4da5dce; took over paused Codex WIP) |
-| K-17 | Attention state machine + push decrypt | core | linux | K-09, A-12 | todo |
+| K-16 | Delta-mode sync | core | linux | K-09, A-11 | done (9418aef0) |
+| K-17 | Attention state machine + push decrypt | core | linux | K-09, A-12 | in_progress (claude opus cli-thread-1790367137391-d31936316ac882ae; also extends sign-out wipe to chat drafts/push records) |
 | D-01 | Android project scaffold | android | linux | K-01 | done (ee3c19df; on-device version display pending human-verify) |
 | D-02 | Core bridge + effect executor | android | linux | D-01, K-06, K-15 | done (0f7fb9c6) |
 | D-03 | Pairing flow | android | linux+phone | D-02, K-07, A-06, H-06, H-07 | done (13f210cf; phone verify pending H-06/H-07; verified App Links need W-01) |
@@ -925,6 +925,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
   mode on older hosts.
 - **Done when:** a contract test shows no full snapshots after hello, and a
   legacy-host test still passes.
+- **Done (9418aef0).** Delta sync lives in the new `sync_delta.zig`. After `core.hello` the client does one legacy load and then opts in at that cursor. Each change topic reloads only its own section: per section, not per item, so a thread change reloads the whole thread list. An expired cursor, a changed daemon nonce, an error notice or a failed refresh triggers a legacy reload and a fresh opt-in. After 3 fallbacks, a rejected opt-in or a 10 s ack timeout, that connection stays on legacy sync. The cursor and cached state are saved per host in the secure store, so reconnects and cold starts resume without a full snapshot. The sign-out wipe now also deletes the sync record. Fixtures were recorded against a temporary daemon and gateway. `mobile-core-test` passes 154/154, and `mobile-core-android` and `mobile-models-check` pass. Follow-ups: reload a single thread instead of the list, and debounce or limit the size of the saved record.
 
 #### K-17 · Attention state machine + push decrypt
 - **depends:** K-09, A-12
