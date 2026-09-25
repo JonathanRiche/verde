@@ -117,11 +117,11 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | H-07 | Android phone dev setup (adb) | human | phone | — | human |
 | H-08 | Choose pairing permission presets | human | — | — | done (owner: Full default) |
 | A-01 | Confine `/api/file` + `/api/preview` | host | linux | — | done (363bece0) |
-| A-02 | Paired-device allowlist parity + new scopes | host | linux | — | in_progress (orchestrator subagent, worktree ../verde-wt/A-02) |
+| A-02 | Paired-device allowlist parity + new scopes | host | linux | — | in_progress (astra cli-thread-1790351685803-38d5dc7e76ddb6bc; resumes ../verde-wt/A-02) |
 | A-03 | Confined directory-list RPC | host | linux | A-02 | todo |
 | A-04 | Device self-service RPCs | host | linux | A-02 | todo |
 | A-05 | Idempotent pair exchange | host | linux | — | todo |
-| A-06 | Terminal QR + App Link pair URL | host | linux | — | in_progress (cli-thread-1790350347107-861dd72a5650efc0) |
+| A-06 | Terminal QR + App Link pair URL | host | linux | — | in_progress (astra cli-thread-1790351691709-a61e00e9f6f61aef; resumes ../verde-wt/A-06) |
 | A-07 | Desktop "Pair a phone" + Paired devices UI | host | linux | A-04, A-06 | todo |
 | A-08 | Web Settings paired-devices list | host | linux | A-04 | todo |
 | A-09 | Pairing presets + access-mode cap | host | linux | A-02, H-08 | todo |
@@ -130,17 +130,17 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | A-12 | Push crypto module (seal/open) | host | linux | — | done (7f5c621f) |
 | A-13 | Push outbox + `device.push.*` RPCs | host | linux | A-02, A-12 | todo |
 | A-14 | Attention events → outbox | host | linux | A-13 | todo |
-| A-15 | Harden served-file open (TOCTOU, special files, leak, logs) | host | linux | A-01 | in_progress (orchestrator subagent, worktree ../verde-wt/A-15) |
+| A-15 | Harden served-file open (TOCTOU, special files, leak, logs) | host | linux | A-01 | in_progress (astra cli-thread-1790351693456-5bdf3a2df64f4b75) |
 | A-16 | `workspace.list` exposes repository binding roots | host | linux | A-01, A-02 | todo |
 | W-01 | App Link / universal link files + pair landing page | website | linux | H-03, H-04 | todo |
 | C-01 | Spike: APNs reachability from Workers | cloud | linux | — | done (research; recorded in plan §8, see C-02) |
-| C-02 | Push relay Worker | cloud | linux | C-01, A-12 | todo |
+| C-02 | Push relay Worker | cloud | linux | C-01, A-12 | in_progress (astra cli-thread-1790351701612-fc3bbcd7eb28e252; no deploy without owner) |
 | C-03 | Demo runtime for store review | cloud | linux | A-09 | todo |
 | K-01 | Core skeleton + Android toolchain proof | core | linux | — | done (951a5a5a) |
-| K-02 | iOS xcframework toolchain proof | core | mac | K-01, H-01, H-02 | in_progress (orchestrator subagent, worktree ../verde-wt/K-02) |
-| K-03 | Core API spec (events, effects, queries) | core | linux | K-01 | in_progress (orchestrator subagent, worktree ../verde-wt/K-03) |
-| K-04 | Extract shared remote-client modules from desktop | core | linux | K-01 | in_progress (orchestrator subagent, worktree ../verde-wt/K-04) |
-| K-05 | Split `headless/client.zig` codec from I/O | core | linux | K-01 | in_progress (orchestrator subagent, worktree ../verde-wt/K-05) |
+| K-02 | iOS xcframework toolchain proof | core | mac | K-01, H-01, H-02 | in_progress (astra cli-thread-1790351694620-a58b60386b2b6e42) |
+| K-03 | Core API spec (events, effects, queries) | core | linux | K-01 | in_progress (astra cli-thread-1790351696474-542beadf66cd5ddc) |
+| K-04 | Extract shared remote-client modules from desktop | core | linux | K-01 | in_progress (astra cli-thread-1790351697558-48a6b174381d69dd) |
+| K-05 | Split `headless/client.zig` codec from I/O | core | linux | K-01 | in_progress (astra cli-thread-1790351698860-7ab2d678d434063c) |
 | K-06 | Sans-IO host engine + C ABI | core | linux | K-03, K-04, K-05 | todo |
 | K-07 | Auth in core | core | linux | K-06, A-05 | todo |
 | K-08 | RPC client + target pinning | core | linux | K-06 | todo |
@@ -153,7 +153,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | K-15 | Kotlin/Swift model codegen from Zig types | core | linux | K-06 | todo |
 | K-16 | Delta-mode sync | core | linux | K-09, A-11 | todo |
 | K-17 | Attention state machine + push decrypt | core | linux | K-09, A-12 | todo |
-| D-01 | Android project scaffold | android | linux | K-01 | in_progress (orchestrator subagent, worktree ../verde-wt/D-01) |
+| D-01 | Android project scaffold | android | linux | K-01 | in_progress (astra cli-thread-1790351700581-d71ad83f1c85ef6b) |
 | D-02 | Core bridge + effect executor | android | linux | D-01, K-06, K-15 | todo |
 | D-03 | Pairing flow | android | linux+phone | D-02, K-07, A-06, H-06, H-07 | todo |
 | D-04 | Hosts list + switcher + sign out | android | linux | D-03, A-04 | todo |
