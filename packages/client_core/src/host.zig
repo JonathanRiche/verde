@@ -581,14 +581,16 @@ fn append(comptime T: type, a: A, slice: *[]const T, item: T) ApiError!void {
     next[slice.len] = item;
     slice.* = next;
 }
-const intents = [_][]const u8{ "pair", "trust_decision", "retry_connection", "focus", "thread_open", "thread_load_older", "history_search", "history_load_more", "draft_set", "composer_select", "send", "turn_cancel", "followup_submit", "followup_retry", "followup_pull_back", "followup_cancel", "approval_decide", "shell_prepare", "shell_confirm", "slash_search", "slash_run", "mention_search", "terminal_create", "terminal_attach", "terminal_detach", "terminal_input", "terminal_resize", "terminal_kill" };
+const intents = [_][]const u8{ "sign_out", "forget_host", "pair", "trust_decision", "retry_connection", "focus", "thread_open", "thread_load_older", "history_search", "history_load_more", "draft_set", "composer_select", "send", "turn_cancel", "followup_submit", "followup_retry", "followup_pull_back", "followup_cancel", "approval_decide", "shell_prepare", "shell_confirm", "slash_search", "slash_run", "mention_search", "terminal_create", "terminal_attach", "terminal_detach", "terminal_input", "terminal_resize", "terminal_kill" };
 fn isIntent(tag: []const u8) bool {
     for (intents) |intent| if (eq(tag, intent)) return true;
     return false;
 }
 
 fn validateIntent(a: A, tag: []const u8, event: V) ApiError!void {
-    if (eq(tag, "pair")) {
+    if (eq(tag, "sign_out") or eq(tag, "forget_host")) {
+        _ = try string(event, "host_id");
+    } else if (eq(tag, "pair")) {
         _ = try decode(struct { link: []const u8, device_label: []const u8, client_nonce: []const u8 }, a, event);
     } else if (eq(tag, "trust_decision")) {
         _ = try decode(struct { proposal_id: []const u8, accept: bool }, a, event);
@@ -668,6 +670,7 @@ fn intentDigest(a: A, event: V) ApiError![32]u8 {
 fn receiptField(context: []const u8, key: []const u8, top: bool) bool {
     if (top and (eq(key, "type") or eq(key, "api_version") or eq(key, "intent_id"))) return true;
     const fields: []const u8 = blk: {
+        if (eq(context, "sign_out") or eq(context, "forget_host")) break :blk "host_id";
         if (eq(context, "pair")) break :blk "link device_label client_nonce";
         if (eq(context, "trust_decision")) break :blk "proposal_id accept";
         if (eq(context, "retry_connection")) break :blk "";

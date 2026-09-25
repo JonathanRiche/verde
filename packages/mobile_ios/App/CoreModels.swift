@@ -1439,6 +1439,8 @@ extension AttachmentInput {
 }
 
 enum Event: Codable {
+    case `sign_out`(EventSignOut)
+    case `forget_host`(EventForgetHost)
     case `start`(EventStart)
     case `foreground`(EventForeground)
     case `background`(EventBackground)
@@ -1486,6 +1488,8 @@ enum Event: Codable {
         let c = try decoder.container(keyedBy: ModelDiscriminator.self)
         let tag = try c.decode(String.self, forKey: .type)
         switch tag {
+        case "sign_out": self = .`sign_out`(try EventSignOut(from: decoder))
+        case "forget_host": self = .`forget_host`(try EventForgetHost(from: decoder))
         case "start": self = .`start`(try EventStart(from: decoder))
         case "foreground": self = .`foreground`(try EventForeground(from: decoder))
         case "background": self = .`background`(try EventBackground(from: decoder))
@@ -1534,6 +1538,8 @@ enum Event: Codable {
     }
     func encode(to encoder: Encoder) throws {
         switch self {
+        case .`sign_out`(let value): try value.encode(to: encoder)
+        case .`forget_host`(let value): try value.encode(to: encoder)
         case .`start`(let value): try value.encode(to: encoder)
         case .`foreground`(let value): try value.encode(to: encoder)
         case .`background`(let value): try value.encode(to: encoder)
@@ -1578,6 +1584,82 @@ enum Event: Codable {
         case .`terminal_resize`(let value): try value.encode(to: encoder)
         case .`terminal_input`(let value): try value.encode(to: encoder)
         }
+    }
+}
+
+struct EventSignOut: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `host_id`: String
+}
+
+extension EventSignOut {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `host_id`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`host_id` = try c.decode(String.self, forKey: .`host_id`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`host_id`, forKey: .`host_id`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("sign_out", forKey: .type)
+    }
+}
+
+struct EventForgetHost: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `host_id`: String
+}
+
+extension EventForgetHost {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `host_id`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`host_id` = try c.decode(String.self, forKey: .`host_id`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`host_id`, forKey: .`host_id`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("forget_host", forKey: .type)
     }
 }
 

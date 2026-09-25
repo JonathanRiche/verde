@@ -138,7 +138,7 @@ never drain effects, start requests or advance timers.
 The connection phase follows existing `connection.Phase`: `disabled`,
 `connecting`, `handshaking`, `awaiting_trust`, `ready`, `failed`, `reconnecting`.
 The local host model adds `lifecycle` (`created`, `foreground`, `background`,
-`stopped`), `auth_state` (`loading`, `unpaired`, `paired`, `repair_required`)
+`stopped`), `auth_state` (`loading`, `unpaired`, `paired`, `repair_required`, `signing_out`, `signed_out`)
 and `sync_state` (`empty`, `loading`, `ready`, `stale`). These are orthogonal.
 
 | Event | Payload and behavior |
@@ -222,6 +222,8 @@ Optional values below may be null. These are new local names, not RPC names.
 
 | Intent | Payload / result |
 | --- | --- |
+| `sign_out` | `host_id`; revoke this handle’s authenticated device, then delete credential and pin. `auth_state:signed_out` only after both delete acknowledgements. Offline/ambiguous outcomes report operation error `sign_out_unconfirmed` without wiping. |
+| `forget_host` | `host_id`; explicitly delete local credential and pin without revocation. The UI must warn that the device may remain listed on the desktop. |
 | `pair` | `link,device_label,client_nonce`; parse supported custom/App Link form, code only from fragment. Keep nonce stable across a lost exchange response. Manual entry is normalized by the platform to the same link. |
 | `trust_decision` | `proposal_id,accept:bool`; reject stale proposals. Denial leaves host disabled without auth traffic. |
 | `retry_connection` | Retry a recoverable connection; cannot override identity/TLS rejection. |

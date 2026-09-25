@@ -390,6 +390,26 @@ data class AttachmentInput(
 sealed class Event
 
 @Serializable
+@SerialName("sign_out")
+data class EventSignOut(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `host_id`: String,
+) : Event()
+
+@Serializable
+@SerialName("forget_host")
+data class EventForgetHost(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `host_id`: String,
+) : Event()
+
+@Serializable
 @SerialName("start")
 data class EventStart(
     val `api_version`: Long = 1,

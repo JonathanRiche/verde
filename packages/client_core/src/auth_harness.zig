@@ -314,3 +314,124 @@ test "auth stale completion cannot trigger refresh even after wall expiry" {
     try expect(get(stale, "effects").array.items.len == 0);
     _ = try findUrl(try f.event("foreground", .{}), "/auth/access-token");
 }
+
+// Establish auth through real events; handshake/snapshot behavior is covered by
+// the RPC/sync harnesses. These tests isolate removal from those consumers.
+fn readyForRemoval(f: *Fixture) !void {
+    _ = try f.token(try f.credential(try f.exchange(true)));
+    f.host.state.rpc.phase = .ready;
+    f.host.state.rpc.instance_id = instance_id;
+}
+fn removal(f: *Fixture, tag: []const u8, id: []const u8) !V {
+    return f.event(tag, .{ .intent_id = id, .host_id = "phone" });
+}
+fn revokeResponse(f: *Fixture, effect: V) !V {
+    const request = try h.parse(f.arena.allocator(), try auth.decode64(f.arena.allocator(), get(effect, "body_base64").string));
+    try expect(h.eq(get(request, "method").string, "device.self.revoke"));
+    try expect(h.eq(get(get(request, "target"), "runtime_id").string, runtime_id));
+    return f.response(effect, 200, .{ .jsonrpc = "2.0", .id = get(request, "id").integer, .result = .{ .access_protocol_version = 1, .revoked = true, .device_id = device_id } });
+}
+fn finishRemoval(f: *Fixture, first: V) !void {
+    try expect(h.eq(f.host.state.auth_state, "signing_out"));
+    try expect(f.host.state.auth.token == null and f.host.state.rpc.bearer == null);
+    const second = try find(try f.done(first), "secure_store_delete");
+    try expect(h.eq(f.host.state.auth_state, "signing_out"));
+    _ = try f.done(second);
+    try expect(h.eq(f.host.state.auth_state, "signed_out"));
+    try expect(f.host.state.auth.pin == null and f.host.state.auth.credential == null);
+    try expect(f.host.state.config.https_url == null);
+}
+test "sign out correlates revoke then waits for both deletes and permits re-pair" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try readyForRemoval(&f);
+    const request = try findUrl(try removal(&f, "sign_out", "out"), "/api/rpc");
+    try expect(h.eq(f.host.state.auth_state, "paired"));
+    const batch = try revokeResponse(&f, request);
+    _ = try find(batch, "cancel_timer");
+    try finishRemoval(&f, try find(batch, "secure_store_delete"));
+    // A new operation ID on the same profile can start a complete new pairing.
+    const probe = try find(try f.event("pair", .{ .intent_id = "pair-again", .link = link, .device_label = "Phone", .client_nonce = "9" ** 32 }), "tls_probe");
+    const discovery = try find(try f.event("tls_peer", .{ .effect_id = get(probe, "effect_id").string, .generation = get(probe, "generation").string, .origin = "https://host.example", .spki_sha256 = pin, .system_trusted = true }), "http_request");
+    _ = try f.response(discovery, 200, .{ .access_protocol_version = 1, .runtime_id = runtime_id, .instance_id = instance_id, .https_url = "https://host.example", .wss_url = "wss://host.example/ws", .capabilities = .{"access.pair.v1"} });
+    const write = try find(try f.event("trust_decision", .{ .intent_id = "trust-again", .proposal_id = f.host.state.auth.proposal.?.id, .accept = true }), "secure_store_put");
+    _ = try f.credential(try find(try f.done(write), "http_request"));
+    try expect(h.eq(f.host.state.auth_state, "paired"));
+}
+test "sign out definitively revoked credential wipes without network" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const mint = try f.credential(try f.exchange(true));
+    const again = try find(try f.response(mint, 401, .{}), "http_request");
+    _ = try f.response(again, 401, .{});
+    try expect(f.host.state.auth.credential_invalid);
+    const batch = try removal(&f, "sign_out", "out");
+    try no(batch, "http_request");
+    try finishRemoval(&f, try find(batch, "secure_store_delete"));
+}
+test "sign out offline and lost revoke remain unconfirmed until explicit forget" {
+    for ([_]bool{ false, true }) |lost| {
+        var f = try Fixture.init();
+        defer f.deinit();
+        try readyForRemoval(&f);
+        if (!lost) _ = try f.event("network_changed", .{ .available = false, .network_id = "offline" });
+        var batch = try removal(&f, "sign_out", "out");
+        if (lost) batch = try f.lost(try findUrl(batch, "/api/rpc"));
+        try no(batch, "secure_store_delete");
+        try expect(h.eq(f.host.state.host_error.?.code, "sign_out_unconfirmed"));
+        try expect(f.host.state.auth.credential != null);
+        try finishRemoval(&f, try find(try removal(&f, "forget_host", "forget"), "secure_store_delete"));
+    }
+}
+test "sign out delete failure retries failed record and ignores duplicate acknowledgements" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try readyForRemoval(&f);
+    const first = try find(try removal(&f, "forget_host", "forget"), "secure_store_delete");
+    const second = try find(try f.done(first), "secure_store_delete");
+    _ = try f.event("secure_store_done", .{ .effect_id = get(second, "effect_id").string, .generation = get(second, "generation").string, .key = get(second, "key").string, .@"error" = .{ .code = "locked" } });
+    try expect(h.eq(f.host.state.auth_state, "signing_out"));
+    try expect(h.eq(f.host.state.host_error.?.code, "sign_out_delete_failed"));
+    const retried = try find(try f.event("retry_connection", .{ .intent_id = "retry-delete" }), "secure_store_delete");
+    try expect(h.eq(get(retried, "key").string, get(second, "key").string));
+    _ = try f.done(second);
+    try expect(h.eq(f.host.state.auth_state, "signing_out"));
+    _ = try f.done(retried);
+    try expect(h.eq(f.host.state.auth_state, "signed_out"));
+}
+test "sign out rejects another host and duplicate intent cannot repeat revoke" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try readyForRemoval(&f);
+    try std.testing.expectError(error.InvalidArgument, f.event("sign_out", .{ .intent_id = "wrong", .host_id = "another" }));
+    _ = try removal(&f, "sign_out", "out");
+    try no(try removal(&f, "sign_out", "out"), "http_request");
+    try std.testing.expectError(error.InvalidArgument, f.event("sign_out", .{ .intent_id = "out", .host_id = "another" }));
+}
+
+test "sign out repeated unauthorized RPC refresh wipes only after definitive rejection" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try readyForRemoval(&f);
+    const request = try findUrl(try removal(&f, "sign_out", "out"), "/api/rpc");
+    const refresh = try findUrl(try f.response(request, 401, .{}), "/auth/access-token");
+    try expect(f.host.state.auth.credential != null);
+    const retried = try findUrl(try f.token(refresh), "/api/rpc");
+    try finishRemoval(&f, try find(try f.response(retried, 401, .{}), "secure_store_delete"));
+}
+
+test "forget host still wipes while revoke waits on a failed token refresh" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try readyForRemoval(&f);
+    const request = try findUrl(try removal(&f, "sign_out", "out"), "/api/rpc");
+    const refresh = try findUrl(try f.response(request, 401, .{}), "/auth/access-token");
+    _ = try f.lost(refresh);
+    try expect(f.host.state.auth.removal.rpc_id != null);
+    try std.testing.expectError(error.InvalidLifecycle, removal(&f, "sign_out", "out-again"));
+    try finishRemoval(&f, try find(try removal(&f, "forget_host", "forget"), "secure_store_delete"));
+    for (f.host.state.receipts) |r| {
+        if (h.eq(r.operation.intent_id, "out")) try expect(h.eq(r.operation.state, "uncertain"));
+        if (h.eq(r.operation.intent_id, "forget")) try expect(h.eq(r.operation.state, "succeeded"));
+    }
+}

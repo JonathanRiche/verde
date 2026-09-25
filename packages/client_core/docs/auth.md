@@ -71,3 +71,36 @@ Conservative choices: discovery is required before credential transmission;
 tokens with two minutes or less remaining are rejected to avoid refresh loops;
 HTTP auth bodies are capped at 64 KiB; no redirects, cookies or Origin injection
 are permitted. The adapter's existing HTTP contract enforces these restrictions.
+
+## D-04 sign-out and local removal
+
+`sign_out {host_id}` uses targeted, authenticated `device.self.revoke` and
+consumes only its correlated RPC result. A rejected access token follows the
+normal single refresh/retry flow; only a definitive repeated unauthorized
+result marks the credential invalid. An identity mismatch or ordinary transport
+failure never counts as revocation. Already invalid credentials can be removed
+without another RPC. A successful result must have the expected device identity
+and access protocol version.
+
+Offline, unavailable authentication, timeout, cancellation and ambiguous
+responses return an `uncertain` operation with `sign_out_unconfirmed`; persisted
+credentials remain intact. The UI may retry with a new intent ID or explicitly
+send `forget_host {host_id}`, warning that the device may still be listed on the
+desktop and should be revoked there. `forget_host` is also accepted while a
+revoke is still pending (for example behind a stalled token refresh); that
+`sign_out` operation then becomes `uncertain`. Neither intent can target another
+handle.
+
+Once removal starts, transport/timers are cancelled, in-memory tokens and
+projections are dropped, and `auth_state` becomes `signing_out`. The core deletes
+`credential`, then `profile`, waiting for each secure-store acknowledgement.
+Failure leaves `sign_out_delete_failed` visible; `retry_connection` (or a new
+removal intent) retries the failed delete without repeating remote revocation.
+Only the final acknowledgement produces `auth_state:signed_out` and a succeeded
+operation. Outstanding storage writes/reads must finish before removal starts.
+A new pairing intent can then reuse the same host ID with fresh trust. Shutdown
+still preserves pairing; it is not sign-out. Process interruption between deletes
+can leave a pin but no credential, so no authenticated traffic can resume.
+
+These intents are exported through the existing `Event` registry entry as
+`EventSignOut` and `EventForgetHost`; no new C or JNI functions are required.

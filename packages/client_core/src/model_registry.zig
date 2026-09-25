@@ -43,6 +43,7 @@ pub const types = .{
     .{ "Tls", wire.Tls },
     .{ "VtModes", wire.VtModes },
     .{ "AttachmentInput", wire.AttachmentInput },
+    // Includes sign_out and forget_host payload types (EventSignOut/EventForgetHost).
     .{ "Event", wire.Event },
     .{ "Effect", wire.Effect },
     .{ "EffectBatch", wire.EffectBatch },

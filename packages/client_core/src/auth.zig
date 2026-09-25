@@ -7,6 +7,7 @@ const access = @import("headless").access_protocol;
 const V = std.json.Value;
 const E = h.ApiError;
 const eq = h.eq;
+const signout = @import("signout.zig");
 
 pub const Pin = struct {
     version: u32 = 1,
@@ -20,6 +21,8 @@ pub const Proposal = @import("wire.zig").TrustProposal;
 pub const Credential = struct { version: u32 = 1, runtime_id: []const u8, device_id: []const u8, device_credential: []const u8, scopes: []const []const u8 };
 const Pair = struct { origin: []const u8, grant_id: []const u8, code: []const u8, nonce: []const u8, label: []const u8, intent_id: []const u8 };
 pub const State = struct {
+    removal: signout.State = .{},
+    credential_invalid: bool = false,
     profile_loaded: bool = false,
     credential_loaded: bool = false,
     pin: ?Pin = null,
@@ -137,6 +140,8 @@ fn store(tx: *h.Transaction, record: []const u8, value: anytype) E!void {
 pub fn intent(tx: *h.Transaction, tag: []const u8, event: V) E!bool {
     const s = &tx.state.auth;
     const id = try h.string(event, "intent_id");
+    if (try signout.intent(tx, tag, event)) return true;
+    if (s.removal.wiping or s.removal.rpc_id != null) return error.InvalidLifecycle;
     if (eq(tag, "pair")) {
         if (!s.profile_loaded or !s.credential_loaded or storagePending(tx) or tx.state.lifecycle != .foreground) return error.InvalidLifecycle;
         const link = try parseLink(tx.allocator(), try h.string(event, "link"));
@@ -147,6 +152,8 @@ pub fn intent(tx: *h.Transaction, tag: []const u8, event: V) E!bool {
         if (s.pair != null) return error.InvalidLifecycle;
         suspendSession(tx);
         try tx.invalidateTransport();
+        s.credential_invalid = false;
+        s.removal = .{};
         s.pair = .{ .origin = link.origin, .grant_id = link.grant_id, .code = link.code, .nonce = nonce, .label = label, .intent_id = id };
         s.blocked = false;
         s.token = null;
@@ -247,7 +254,10 @@ fn mint(tx: *h.Transaction) E!void {
 /// Single-flight entry for HTTP consumers. Only a proven 401 may call this;
 /// the consumer retains its request and retries once after a new token arrives.
 pub fn unauthorized(tx: *h.Transaction, already_retried: bool) E!void {
-    if (already_retried) return repair(tx);
+    if (already_retried) {
+        tx.state.auth.credential_invalid = true;
+        return repair(tx);
+    }
     tx.state.auth.token = null;
     h.rpc.clearBearer(tx);
     tx.state.auth.expires_at_ms = 0;
@@ -262,6 +272,7 @@ fn repair(tx: *h.Transaction) E!void {
     fail(tx, "repair_required", false);
 }
 pub fn advance(tx: *h.Transaction) E!void {
+    try signout.advance(tx);
     const s = &tx.state.auth;
     if (tx.state.lifecycle == .stopped) {
         s.* = .{};
@@ -390,6 +401,7 @@ fn adopt(tx: *h.Transaction) E!void {
 pub fn complete(tx: *h.Transaction, p: h.Pending, event: V) E!bool {
     const s = &tx.state.auth;
     const a = tx.allocator();
+    if (try signout.complete(tx, p, event)) return true;
     if (p.kind == .store_get or p.kind == .store_put) {
         const is_profile = std.mem.endsWith(u8, p.key, "/profile");
         const is_credential = std.mem.endsWith(u8, p.key, "/credential");
@@ -472,7 +484,10 @@ pub fn complete(tx: *h.Transaction, p: h.Pending, event: V) E!bool {
     }
     const status = try h.integer(event, "status");
     if (status == 401 and (eq(p.key, "auth_ticket") or eq(p.key, "auth_token"))) {
-        if (s.unauthorized_retried) try repair(tx) else {
+        if (s.unauthorized_retried) {
+            s.credential_invalid = true;
+            try repair(tx);
+        } else {
             s.unauthorized_retried = true;
             try unauthorized(tx, false);
         }
