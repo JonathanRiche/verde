@@ -1368,6 +1368,82 @@ function projectPanes(
   return next
 }
 
+export interface PairedDevice {
+  device_id: string
+  label: string
+  scopes: string[]
+  last_used_at_ms?: number | null
+  revoked_at_ms?: number | null
+  preset?: string | null
+}
+
+export function createPairedDevicesSettings(rpc = fetchRpc) {
+  const [status, setStatus] = createSignal<'idle' | 'loading' | 'ready' | 'hidden' | 'error'>('idle')
+  const [devices, setDevices] = createSignal<PairedDevice[]>([])
+  const [revoking, setRevoking] = createSignal<string | null>(null)
+  const [revokeError, setRevokeError] = createSignal<string | null>(null)
+  let open = false
+  let generation = 0
+
+  const refresh = async () => {
+    if (!open || status() === 'loading' || status() === 'hidden') return
+    const current = generation
+    setStatus('loading')
+    try {
+      const response = await rpc('device.list', { access_protocol_version: 1 })
+      if (current !== generation) return
+      // The gateway enforces owner-only RPCs; hiding this section is presentation, not a security boundary.
+      if (response.error?.code === 'forbidden') {
+        setDevices([])
+        setStatus('hidden')
+        return
+      }
+      const result = unwrapResult<{ devices: PairedDevice[] }>(response)
+      if (response.error || response.ok === false || !Array.isArray(result?.devices)) throw new Error('invalid device list')
+      setDevices(result.devices)
+      setStatus('ready')
+    } catch {
+      if (current === generation) setStatus('error')
+    }
+  }
+
+  const setOpen = (value: boolean) => {
+    if (open === value) return
+    open = value
+    generation++
+    setDevices([])
+    setRevoking(null)
+    setRevokeError(null)
+    setStatus('idle')
+    if (open) void refresh()
+  }
+
+  const revoke = async (device_id: string) => {
+    if (!open || status() !== 'ready' || revoking()) return
+    const current = generation
+    setRevoking(device_id)
+    setRevokeError(null)
+    try {
+      const response = await rpc('device.revoke', { access_protocol_version: 1, device_id })
+      if (current !== generation) return
+      if (response.error?.code === 'forbidden') {
+        setDevices([])
+        setStatus('hidden')
+        return
+      }
+      const result = unwrapResult<{ revoked: boolean }>(response)
+      if (response.error || response.ok === false || result?.revoked !== true) throw new Error('revoke failed')
+      await refresh()
+    } catch {
+      if (current === generation) setRevokeError("Couldn't revoke device. Try again.")
+    } finally {
+      if (current === generation) setRevoking(null)
+    }
+  }
+
+  return { status, devices, revoking, revokeError, setOpen, refresh, revoke }
+}
+
 export function createAppStore() {
   const client = new LiveClient()
   const composerCache = readComposerCache()
@@ -1385,7 +1461,12 @@ export function createAppStore() {
     createSignal<DraftAttachmentMap>(composerCache.attachments)
   const [attachmentUploads, setAttachmentUploads] = createSignal<AttachmentUploadMap>({})
   const [paletteOpen, setPaletteOpen] = createSignal(false)
-  const [settingsOpen, setSettingsOpen] = createSignal(false)
+  const [settingsOpen, writeSettingsOpen] = createSignal(false)
+  const pairedDevices = createPairedDevicesSettings()
+  const setSettingsOpen = (open: boolean) => {
+    writeSettingsOpen(open)
+    pairedDevices.setOpen(open)
+  }
   const [workspaceDialogOpen, setWorkspaceDialogOpen] = createSignal(false)
   const [drawerOpen, setDrawerOpen] = createSignal(false)
   const [sidebarCollapsed, setSidebarCollapsed] = createSignal(false)
@@ -4823,6 +4904,7 @@ export function createAppStore() {
     resizePaneSplit,
     paletteOpen,
     setPaletteOpen,
+    pairedDevices,
     settingsOpen,
     setSettingsOpen,
     workspaceDialogOpen,

@@ -335,6 +335,7 @@ export function Settings() {
 
             <MotionSettings />
             <WorkspaceSettings />
+            <PairedDevicesSettings />
 
             <SettingsSection title="Notifications">
               <div class="flex min-h-[44px] items-center justify-between gap-4 border-b border-[var(--border-muted)] py-2">
@@ -384,6 +385,49 @@ export function Settings() {
           </div>
         </div>
       </div>
+    </Show>
+  )
+}
+
+function PairedDevicesSettings() {
+  const devices = store.pairedDevices
+  const button = 'min-h-[44px] shrink-0 rounded-[7px] border border-[var(--border-muted)] px-3 text-[12px] hover:bg-[var(--accent-hover)] disabled:opacity-40'
+  return (
+    <Show when={devices.status() !== 'hidden'}>
+      <SettingsSection title="Paired devices">
+        <Show when={devices.status() === 'loading'}>
+          <p role="status" class="py-2 text-[var(--text-muted)]">Loading devices…</p>
+        </Show>
+        <Show when={devices.status() === 'error'}>
+          <div class="flex items-center justify-between gap-4 py-2">
+            <p role="alert">Couldn't load devices</p>
+            <button type="button" class={button} onClick={() => void devices.refresh()}>Retry</button>
+          </div>
+        </Show>
+        <Show when={devices.status() === 'ready'}>
+          <For each={devices.devices()} fallback={<p class="py-2 text-[var(--text-muted)]">No paired devices.</p>}>
+            {(device) => (
+              <div class="flex items-center justify-between gap-4 border-b border-[var(--border-muted)] py-2">
+                <div class="min-w-0 break-words">
+                  <div>{device.label || device.device_id}</div>
+                  <p class="mt-1 text-[12px] text-[var(--text-muted)]">
+                    Last seen: {device.last_used_at_ms == null ? 'Never' : new Date(device.last_used_at_ms).toLocaleString()}
+                  </p>
+                  <p class="mt-1 text-[12px] text-[var(--text-muted)]">Scopes: {device.scopes.join(', ') || 'None'}</p>
+                  <Show when={device.preset}><p class="mt-1 text-[12px] text-[var(--text-muted)]">Preset: {device.preset}</p></Show>
+                </div>
+                <Show when={device.revoked_at_ms == null} fallback={<span class="text-[12px] text-[var(--text-muted)]">Revoked</span>}>
+                  <button type="button" class={button} aria-label={`Revoke ${device.label || device.device_id}`}
+                    disabled={devices.revoking() !== null} onClick={() => void devices.revoke(device.device_id)}>
+                    {devices.revoking() === device.device_id ? 'Revoking…' : 'Revoke'}
+                  </button>
+                </Show>
+              </div>
+            )}
+          </For>
+        </Show>
+        <Show when={devices.revokeError()}><p role="alert" class="mt-2 text-[var(--warning)]">{devices.revokeError()}</p></Show>
+      </SettingsSection>
     </Show>
   )
 }
