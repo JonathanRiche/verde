@@ -528,6 +528,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 - **Done when:** tests use a loopback fake relay and cover delivery, retry,
   dedupe, revoke clearing registrations, and 410 handling.
   `$ZB daemon-test` and `$ZB headless-test` pass.
+- **Done (8827ee2a).** Push registrations and a durable outbox live in `daemon/push.zig` and `store.zig`, and revoking a device clears its registrations. The access tables' column limit is raised to 2047, with a migration for existing databases. `device.push.v1` is advertised. `push.relay_url` works as decided above; `DEFAULT_RELAY_URL` is empty until C-02. Nothing logs payloads, send tokens or relay URLs. `daemon-test` and `headless-test` pass on `780a4557`, and the daemon suite no longer hits the layout crash.
 
 #### A-14 · Attention events → outbox
 - **depends:** A-13
