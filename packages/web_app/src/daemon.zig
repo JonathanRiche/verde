@@ -4,6 +4,7 @@ const std = @import("std");
 const headless = @import("headless");
 
 const config_mod = @import("config.zig");
+const served_files = @import("served_files.zig");
 
 const protocol = headless.protocol;
 const access_protocol = headless.access_protocol;
@@ -25,6 +26,8 @@ pub const Daemon = struct {
     config: config_mod,
     runtime_router: @import("web_runtime").Router,
     next_id: std.atomic.Value(u64) = .init(1),
+    /// Registered roots that bound `/api/file` and `/api/preview`.
+    workspace_roots: served_files.RootCache = .{},
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: config_mod) Daemon {
         return .{
@@ -33,6 +36,12 @@ pub const Daemon = struct {
             .config = config,
             .runtime_router = @import("web_runtime").Router.init(allocator, io),
         };
+    }
+
+    pub fn deinit(self: *Daemon) void {
+        self.workspace_roots.deinit(self.allocator);
+        self.runtime_router.deinit();
+        self.* = undefined;
     }
 
     pub fn callRaw(self: *Daemon, request_json: []const u8) !CallResult {

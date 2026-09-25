@@ -7,6 +7,7 @@ const auth_mod = @import("auth.zig");
 const config_mod = @import("config.zig");
 const daemon_mod = @import("daemon.zig");
 const office_preview = @import("office_preview.zig");
+const served_files = @import("served_files.zig");
 const theme_mod = @import("theme.zig");
 
 const log = std.log.scoped(.web_http);
@@ -1318,18 +1319,21 @@ fn handleWorkspaceFile(
         try respondJson(request, .bad_request, "{\"ok\":false,\"error\":\"invalid_path\"}");
         return;
     }
-    if (executableDocumentPath(decoded)) {
+    // Symlinks are followed here, so every later check sees the real file.
+    const served_path = try confineServedFilePath(allocator, io, daemon, decoded, request) orelse return;
+    defer allocator.free(served_path);
+    if (executableDocumentPath(served_path)) {
         try respondJson(request, .unsupported_media_type, "{\"ok\":false,\"error\":\"unsupported_document_type\"}");
         return;
     }
 
     const preview = std.mem.eql(u8, split.path, "/api/preview");
     if (preview) {
-        if (!office_preview.convertible(decoded)) {
+        if (!office_preview.convertible(served_path)) {
             try respondJson(request, .bad_request, "{\"ok\":false,\"error\":\"unsupported_document_type\"}");
             return;
         }
-        const pdf_path = office_preview.previewPdf(allocator, io, config.pref_path, env_map, decoded) catch |err| switch (err) {
+        const pdf_path = office_preview.previewPdf(allocator, io, config.pref_path, env_map, served_path) catch |err| switch (err) {
             error.SourceNotFound => {
                 try respondJson(request, .not_found, "{\"ok\":false,\"error\":\"file_not_found\"}");
                 return;
@@ -1354,7 +1358,7 @@ fn handleWorkspaceFile(
         return;
     }
 
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, decoded, allocator, .limited(MAX_SERVED_FILE_BYTES)) catch |err| switch (err) {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, served_path, allocator, .limited(MAX_SERVED_FILE_BYTES)) catch |err| switch (err) {
         error.StreamTooLong => {
             try respondJson(request, .payload_too_large, "{\"ok\":false,\"error\":\"file_too_large\"}");
             return;
@@ -1366,12 +1370,65 @@ fn handleWorkspaceFile(
     };
     defer allocator.free(bytes);
     if (queryValue(split.query, "download") != null) {
+        // The cited name is what the user clicked; the resolved path decides the type.
         const disposition = try attachmentDisposition(allocator, decoded);
         defer allocator.free(disposition);
-        try respondDownload(request, servedFileMime(decoded), disposition, bytes);
+        try respondDownload(request, servedFileMime(served_path), disposition, bytes);
         return;
     }
-    try respondFramedFile(request, servedFileMime(decoded), bytes);
+    try respondFramedFile(request, servedFileMime(served_path), bytes);
+}
+
+const WorkspaceRootLister = struct {
+    allocator: std.mem.Allocator,
+    daemon: *daemon_mod.Daemon,
+
+    pub fn list(self: *WorkspaceRootLister, cursor: ?[]const u8) ![]u8 {
+        const result = try callMethodTargetedAfterBootstrap(
+            self.allocator,
+            self.daemon,
+            headless.store_protocol.METHOD_WORKSPACE_LIST,
+            headless.store_protocol.WorkspaceListRequest{
+                .limit = served_files.LIST_PAGE_LIMIT,
+                .cursor = cursor,
+                .include_archived = true,
+            },
+        );
+        return result.json;
+    }
+};
+
+/// Resolves a cited document against the daemon's registered workspace and
+/// repository roots. Answers the request itself and returns null when the
+/// document may not be served.
+fn confineServedFilePath(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    daemon: *daemon_mod.Daemon,
+    requested: []const u8,
+    request: *std.http.Server.Request,
+) !?[]u8 {
+    var lister: WorkspaceRootLister = .{ .allocator = allocator, .daemon = daemon };
+    const paths = daemon.workspace_roots.snapshot(allocator, io, auth_mod.nowMillis(io), &lister) catch |err| switch (err) {
+        error.Canceled, error.OutOfMemory => return err,
+        else => {
+            try respondDaemonUnavailable(request);
+            return null;
+        },
+    };
+    const roots: served_files.Roots = .{ .paths = paths };
+    defer roots.deinit(allocator);
+    return roots.confine(allocator, io, requested) catch |err| switch (err) {
+        error.PathOutsideWorkspace => {
+            try respondJson(request, .forbidden, "{\"ok\":false,\"error\":\"path_outside_workspace\"}");
+            return null;
+        },
+        error.FileNotFound => {
+            try respondJson(request, .not_found, "{\"ok\":false,\"error\":\"file_not_found\"}");
+            return null;
+        },
+        error.OutOfMemory, error.Canceled => return err,
+    };
 }
 
 fn handleRpc(
@@ -2428,8 +2485,8 @@ fn decodeQueryComponent(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     return shrunk;
 }
 
-/// Served file paths must be absolute and free of traversal segments so a
-/// citation link can never be a relative escape from a logged path.
+/// Cheap lexical gate before the realpath confinement in `served_files`:
+/// served file paths must be absolute and free of traversal segments.
 fn validServedFilePath(path: []const u8) bool {
     if (path.len == 0 or !std.fs.path.isAbsolute(path)) return false;
     if (std.mem.indexOfScalar(u8, path, 0) != null) return false;

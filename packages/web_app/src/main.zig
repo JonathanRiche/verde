@@ -6,6 +6,7 @@ const auth_mod = @import("auth.zig");
 const config_mod = @import("config.zig");
 const daemon_mod = @import("daemon.zig");
 const http_mod = @import("http.zig");
+const served_files_mod = @import("served_files.zig");
 const theme_mod = @import("theme.zig");
 
 pub fn main(init: std.process.Init) void {
@@ -54,7 +55,7 @@ fn run(init: std.process.Init) !void {
     defer auth.deinit();
 
     var daemon = daemon_mod.Daemon.init(init.gpa, init.io, config);
-    defer daemon.runtime_router.deinit();
+    defer daemon.deinit();
     try http_mod.serve(init.gpa, init.io, config, &daemon, &auth, init.environ_map);
 }
 
@@ -64,5 +65,6 @@ test {
     _ = config_mod;
     _ = daemon_mod;
     _ = http_mod;
+    _ = served_files_mod;
     _ = theme_mod;
 }
