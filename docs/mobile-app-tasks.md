@@ -136,11 +136,11 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | C-01 | Spike: APNs reachability from Workers | cloud | linux | — | done (research; recorded in plan §8, see C-02) |
 | C-02 | Push relay Worker | cloud | linux | C-01, A-12 | todo |
 | C-03 | Demo runtime for store review | cloud | linux | A-09 | todo |
-| K-01 | Core skeleton + Android toolchain proof | core | linux | — | in_progress (cli-thread-1790350345069-6d46ff988958492f) |
-| K-02 | iOS xcframework toolchain proof | core | mac | K-01, H-01, H-02 | todo |
-| K-03 | Core API spec (events, effects, queries) | core | linux | K-01 | todo |
-| K-04 | Extract shared remote-client modules from desktop | core | linux | K-01 | todo |
-| K-05 | Split `headless/client.zig` codec from I/O | core | linux | K-01 | todo |
+| K-01 | Core skeleton + Android toolchain proof | core | linux | — | done (951a5a5a) |
+| K-02 | iOS xcframework toolchain proof | core | mac | K-01, H-01, H-02 | in_progress (orchestrator subagent, worktree ../verde-wt/K-02) |
+| K-03 | Core API spec (events, effects, queries) | core | linux | K-01 | in_progress (orchestrator subagent, worktree ../verde-wt/K-03) |
+| K-04 | Extract shared remote-client modules from desktop | core | linux | K-01 | in_progress (orchestrator subagent, worktree ../verde-wt/K-04) |
+| K-05 | Split `headless/client.zig` codec from I/O | core | linux | K-01 | in_progress (orchestrator subagent, worktree ../verde-wt/K-05) |
 | K-06 | Sans-IO host engine + C ABI | core | linux | K-03, K-04, K-05 | todo |
 | K-07 | Auth in core | core | linux | K-06, A-05 | todo |
 | K-08 | RPC client + target pinning | core | linux | K-06 | todo |
@@ -153,7 +153,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | K-15 | Kotlin/Swift model codegen from Zig types | core | linux | K-06 | todo |
 | K-16 | Delta-mode sync | core | linux | K-09, A-11 | todo |
 | K-17 | Attention state machine + push decrypt | core | linux | K-09, A-12 | todo |
-| D-01 | Android project scaffold | android | linux | K-01 | todo |
+| D-01 | Android project scaffold | android | linux | K-01 | in_progress (orchestrator subagent, worktree ../verde-wt/D-01) |
 | D-02 | Core bridge + effect executor | android | linux | D-01, K-06, K-15 | todo |
 | D-03 | Pairing flow | android | linux+phone | D-02, K-07, A-06, H-06, H-07 | todo |
 | D-04 | Hosts list + switcher + sign out | android | linux | D-03, A-04 | todo |
@@ -659,6 +659,13 @@ exact question and stop. Report: commit sha, files changed, verification output,
 - **Done when:** `mise run mobile-core-test` passes, the `.so` files are
   built, and `readelf -d` shows the expected NEEDED libraries only. D-01
   loads it.
+- **Done (951a5a5a).** NEEDED is `libc.so` + `libdl.so` only; segments are
+  16 KB-aligned. The NDK lives under `$HOME/Android/Sdk`
+  (`packages/client_core/docs/android-toolchain.md`); Gradle needs
+  `ANDROID_HOME`, the Zig build `ANDROID_NDK_HOME`. Kotlin side for D-01:
+  `System.loadLibrary("verde_client")` then
+  `object Native { @JvmStatic external fun version(): String }` in package
+  `dev.verdeai.core`.
 
 #### K-02 · iOS xcframework toolchain proof
 - **depends:** K-01, H-01, H-02 · **machine:** mac
@@ -717,6 +724,10 @@ exact question and stop. Report: commit sha, files changed, verification output,
     `vc_buf_free`, JSON in/out, a per-host arena strategy, the effect
     queue, a timer model and correlation IDs.
   - JNI wrappers in Zig mirroring the C ABI.
+  - Replace the default panic handler with one that logs through `liblog`
+    on Android (and `os_log`/stderr on iOS). K-01 found that the std
+    default drags a 256 KB per-thread signal stack into the `.so`; a
+    custom handler should drop it. Verify with `readelf -S`/`nm`.
   - A deterministic test harness that scripts events and asserts effects.
 - **Done when:** harness tests pass under `mise run mobile-core-test`; the
   `.so` and xcframework still build.

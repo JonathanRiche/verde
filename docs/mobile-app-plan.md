@@ -205,7 +205,7 @@ Compose/SwiftUI ──> vc_host_handle(host, event) ──> [ {http_request…},
   API (`vc_term_new`, `write`, `resize`, `snapshot`, `scroll`).
 - **Android:** `libverde_client.so` built by Zig for `aarch64-linux-android`
   (plus `x86_64-linux-android` for the emulator) against the NDK libc. The
-  JNI entry points (`Java_dev_verde_core_Native_*`) are written in Zig
+  JNI entry points (`Java_dev_verdeai_core_Native_*`, package `dev.verdeai.core`) are written in Zig
   directly, so no C shim is needed. Kotlin wraps them in a coroutine
   single-thread dispatcher per host.
 - **iOS:** static library for `aarch64-ios` and `aarch64-ios-simulator`,
