@@ -120,13 +120,13 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | A-02 | Paired-device allowlist parity + new scopes | host | linux | — | done (a570cce2) |
 | A-03 | Confined directory-list RPC | host | linux | A-02 | todo |
 | A-04 | Device self-service RPCs | host | linux | A-02 | todo |
-| A-05 | Idempotent pair exchange | host | linux | — | in_progress (astra cli-thread-1790352652199-916412030c97f80f) |
+| A-05 | Idempotent pair exchange | host | linux | — | done (a36897f0) |
 | A-06 | Terminal QR + App Link pair URL | host | linux | — | done (b0f6e50b; phone-camera scan pending human-verify) |
 | A-07 | Desktop "Pair a phone" + Paired devices UI | host | linux | A-04, A-06 | todo |
 | A-08 | Web Settings paired-devices list | host | linux | A-04 | todo |
 | A-09 | Pairing presets + access-mode cap | host | linux | A-02, H-08 | todo |
 | A-10 | `mobile.min_client` + capability flags | host | linux | — | done (f8aa0db8) |
-| A-11 | Delta change feed on the gateway | host | linux | A-10 | todo |
+| A-11 | Delta change feed on the gateway | host | linux | A-10 | in_progress (astra cli-thread-1790353790179-3cdf8d62d8cee8f1) |
 | A-12 | Push crypto module (seal/open) | host | linux | — | done (7f5c621f) |
 | A-13 | Push outbox + `device.push.*` RPCs | host | linux | A-02, A-12 | in_progress (astra cli-thread-1790353399616-db0f6eeff8912a74) |
 | A-14 | Attention events → outbox | host | linux | A-13 | todo |
@@ -388,6 +388,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
   different-nonce replay failing, and a retry after the TTL failing.
   `docs/serve-pair-connect.md` is updated. `$ZB headless-test` and
   `mise run web-app-test` pass.
+- **Done (a36897f0).** In `daemon/access_store.zig`, a retried exchange with the same grant and `client_nonce` returns the same device. Only a hash of the nonce is stored; the retry credential is derived from the presented grant secret plus the nonce, so it survives a daemon restart without storing a recoverable credential. Retries stop at the grant's original expiry or when the device is revoked. `access.pair.idempotent.v1` is advertised by the daemon and in the gateway pairing descriptor. `headless-test` and `web-app-test` pass, and the focused access-store tests pass 7/7. A running runtime needs a relaunch to pick this up.
 
 #### A-06 · Terminal QR + App Link pair URL
 - **touches:** `packages/server/src/main.zig` (`printPairGrant`), a new small
@@ -499,6 +500,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
   payload limits — A-13 caps the plaintext (see A-13).
 
 #### A-13 · Push outbox + `device.push.*` RPCs
+- **Decision (orchestrator):** `push.relay_url` is the relay's https base URL, and the daemon appends `/v1/send`. The default stays empty until C-02 deploys the relay. With no URL set, registrations and outbox rows are still stored, the sender stays idle, and `device.push.test` returns `relay_not_configured`. C-02 sets the production default.
 - **depends:** A-02, A-12 · **touches:** `packages/desktop/src/daemon/store.zig`,
   the daemon dispatch, a new daemon push module
 - **Do:**
