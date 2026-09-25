@@ -145,8 +145,8 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | K-05 | Split `headless/client.zig` codec from I/O | core | linux | K-01 | done (b12e4c17) |
 | K-06 | Sans-IO host engine + C ABI | core | linux | K-03, K-04, K-05 | done (e3e60c35, e4a0e6ab) |
 | K-07 | Auth in core | core | linux | K-06, A-05 | in_progress (astra cli-thread-1790357476513-23b8f29726d0ac38) |
-| K-08 | RPC client + target pinning | core | linux | K-06 | in_progress (astra cli-thread-1790357478254-e0a61e540f9105c7) |
-| K-09 | Sync + projection | core | linux | K-08 | todo |
+| K-08 | RPC client + target pinning | core | linux | K-06 | done (fd4cfc22) |
+| K-09 | Sync + projection | core | linux | K-08 | in_progress (astra cli-thread-1790358280856-f9b7d587adbcf044) |
 | K-10 | Chat engine | core | linux | K-09 | todo |
 | K-11 | Markdown AST / highlight spans / diff parse exports | core | linux | K-06 | in_progress (astra cli-thread-1790357482042-cf07694f30ac6c1f) |
 | K-12 | Terminal handle + PTY pump | core | linux | K-06 | todo |
@@ -812,6 +812,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
   - Typed errors and `connection.FailureKind` retry classes.
   - A changed `instance_id` triggers a full resync, not an error screen.
 - **Done when:** harness tests pass.
+- **Done (fd4cfc22).** `src/rpc.zig` sends independent `/api/rpc` requests with numeric IDs and pins `target` on every call except `core.status`, reusing the K-05 codec. Failures are typed, and a 403 scope denial is kept distinct from an auth failure. After a transport loss a mutation is reported as uncertain and never replayed. A changed `instance_id` cancels old work, repeats the handshake and signals a full resync. JNI allows bounded large responses for snapshots, with a 1 MiB limit on everything else. The K-07 and K-09 integration points (`attachBearer`, `beginHandshake`, the resync signal) are described in `packages/client_core/docs/rpc.md`.
 
 #### K-09 · Sync + projection
 - **depends:** K-08
