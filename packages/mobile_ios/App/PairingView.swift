@@ -93,6 +93,8 @@ struct PairingView: View {
                     }
                 }
             }
+            .blur(radius: scenePhase == .active ? 0 : 12)
+            .privacySensitive()
             .navigationTitle("Pair with Verde")
             .task { await model.start() }
             .onChange(of: model.store.hosts?.revision) { _, _ in Task { await model.submitPending() } }

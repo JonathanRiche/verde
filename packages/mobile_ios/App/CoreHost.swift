@@ -131,9 +131,14 @@ actor CoreHost {
             }
             object["now_ms"] = .integer(Int64(ProcessInfo.processInfo.systemUptime * 1000))
             object["wall_time_ms"] = .integer(Int64(Date().timeIntervalSince1970 * 1000))
+            let isPairingIntent: Bool
+            switch event {
+            case .pair, .trust_decision, .retry_connection: isPairingIntent = true
+            default: isPairingIntent = false
+            }
             let output: Data
             do { output = try core.handle(JSONEncoder().encode(JSONValue.object(object))) }
-            catch CoreBridgeError.status(let status) where status == 1 || status == 4 || status == 5 {
+            catch CoreBridgeError.status(let status) where isPairingIntent && (status == 1 || status == 4 || status == 5) {
                 // Transactional input/lifecycle/resource rejection returns no
                 // effects and leaves the handle usable (e.g. a malformed link).
                 throw RejectedEvent(status: status)
