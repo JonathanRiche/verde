@@ -118,7 +118,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | H-08 | Choose pairing permission presets | human | — | — | done (owner: Full default) |
 | A-01 | Confine `/api/file` + `/api/preview` | host | linux | — | done (363bece0) |
 | A-02 | Paired-device allowlist parity + new scopes | host | linux | — | done (a570cce2) |
-| A-03 | Confined directory-list RPC | host | linux | A-02 | in_progress (astra cli-thread-1790362331784-8004a4c995475ec2) |
+| A-03 | Confined directory-list RPC | host | linux | A-02 | done (88306008) |
 | A-04 | Device self-service RPCs | host | linux | A-02 | done (42a3582b) |
 | A-05 | Idempotent pair exchange | host | linux | — | done (a36897f0) |
 | A-06 | Terminal QR + App Link pair URL | host | linux | — | done (b0f6e50b; phone-camera scan pending human-verify) |
@@ -132,7 +132,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | A-14 | Attention events → outbox | host | linux | A-13 | done (8832302d) |
 | A-15 | Harden served-file open (TOCTOU, special files, leak, logs) | host | linux | A-01 | done (310be446) |
 | A-16 | `workspace.list` exposes repository binding roots | host | linux | A-01, A-02 | done (fb84ca8c) |
-| A-17 | Daemon-native workspace close | host | linux | A-02 | todo |
+| A-17 | Daemon-native workspace close | host | linux | A-02 | in_progress (astra cli-thread-1790363635251-4cb0809baa57de93) |
 | A-18 | Daemon-native subagent open | host | linux | A-02 | todo |
 | W-01 | App Link / universal link files + pair landing page | website | linux | H-03, H-04 | todo |
 | C-01 | Spike: APNs reachability from Workers | cloud | linux | — | done (research; recorded in plan §8, see C-02) |
@@ -158,7 +158,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | D-01 | Android project scaffold | android | linux | K-01 | done (ee3c19df; on-device version display pending human-verify) |
 | D-02 | Core bridge + effect executor | android | linux | D-01, K-06, K-15 | done (0f7fb9c6) |
 | D-03 | Pairing flow | android | linux+phone | D-02, K-07, A-06, H-06, H-07 | done (13f210cf; phone verify pending H-06/H-07; verified App Links need W-01) |
-| D-04 | Hosts list + switcher + sign out | android | linux | D-03, A-04 | in_progress (astra cli-thread-1790363520707-da29d316f8961d4b) |
+| D-04 | Hosts list + switcher + sign out | android | linux | D-03, A-04 | in_progress (astra cli-thread-1790363520707-da29d316f8961d4b; includes approved core sign_out/forget_host intents) |
 | D-05 | Home + Workspaces + lifecycle | android | linux+phone | D-04, K-09 | todo |
 | D-06 | Transcript screen | android | linux | D-05, K-10, K-11 | todo |
 | D-07 | Diff card | android | linux | D-06 | todo |
@@ -363,6 +363,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
   gateway's `web.directory.list` may delegate to it.
 - **Done when:** tests cover confinement and listing; `$ZB headless-test`
   and `mise run web-app-test` pass.
+- **Done (88306008).** The daemon now handles `workspace.directory.list` (scope `repository:read`) in the new `daemon/directory_browser.zig`. It opens paths beneath the root descriptor, following the A-15 approach. Allowed roots are the home directory, existing workspace parents, and the paths in `VERDE_DIRECTORY_ROOTS`. Results are directories only, and it works with the desktop closed. The old `web.directory.list` handler was already disabled and stays disabled. Tests cover symlink escapes and swaps, `..` traversal, files and FIFOs, and roots outside the policy. `headless-test`, `daemon-test` and `web-app-test` pass. The non-Linux fallback was not runtime-tested.
 
 #### A-04 · Device self-service RPCs
 - **depends:** A-02
