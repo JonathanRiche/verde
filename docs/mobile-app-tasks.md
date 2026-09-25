@@ -126,7 +126,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | A-08 | Web Settings paired-devices list | host | linux | A-04 | todo |
 | A-09 | Pairing presets + access-mode cap | host | linux | A-02, H-08 | todo |
 | A-10 | `mobile.min_client` + capability flags | host | linux | — | done (f8aa0db8) |
-| A-11 | Delta change feed on the gateway | host | linux | A-10 | review (1b1a7d34 landed; final verification pending after daemon restart) |
+| A-11 | Delta change feed on the gateway | host | linux | A-10 | done (1b1a7d34) |
 | A-12 | Push crypto module (seal/open) | host | linux | — | done (7f5c621f) |
 | A-13 | Push outbox + `device.push.*` RPCs | host | linux | A-02, A-12 | done (8827ee2a) |
 | A-14 | Attention events → outbox | host | linux | A-13 | todo |
@@ -476,6 +476,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 - **Done when:** gateway tests cover delta mode and resume-from-cursor, and
   confirm that legacy mode behaves exactly as before.
   `mise run web-app-test` and `mise run web-app` pass.
+- **Done (1b1a7d34).** The gateway adds `core.changes.delta.v1` to the `core.status` and `core.capabilities` it forwards, including hello's status envelope; the daemon does not advertise this gateway-only feature. Clients opt in with a targeted `core.changes.mode` and resume from an explicit cursor or the initial snapshot cursor. Stale polls are discarded. Delta mode sends a recovery snapshot on `expired` or an `instance_nonce` change and closes if recovery fails. Legacy mode is unchanged. The loopback regression is `packages/web_app/tests/delta_feed.py`. `web-app-test`, `web-app` and `headless-test` pass. WebSocket RPC stays sequential, so interactive and parked calls use `/api/rpc` (K-08).
 
 #### A-12 · Push crypto module
 - **touches:** new `packages/headless/src/push_seal.zig` (shared by the
