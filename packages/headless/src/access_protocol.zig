@@ -438,14 +438,15 @@ pub const PairingGrantRevokeResult = struct {
     grant_id: []const u8,
 };
 
-/// Remote one-time exchange. Authentication inputs are deliberately strict;
-/// future fields require a negotiated protocol version instead of silent
-/// acceptance by version-1 decoders.
+/// Remote exchange with optional retry recovery on capable hosts.
+/// Authentication inputs reject unknown fields instead of silently accepting them.
 pub const PairingGrantExchangeRequest = struct {
     access_protocol_version: u32,
     grant_id: []const u8,
     pairing_token: Secret,
     device_label: []const u8,
+    /// Random 16-byte value encoded as canonical lowercase hex, reused on retries.
+    client_nonce: ?[]const u8 = null,
 };
 
 /// Strict authentication-input parser. Unknown/duplicate fields, missing
@@ -463,6 +464,7 @@ pub fn parsePairingGrantExchangeRequest(
     try validateGrantId(parsed.value.grant_id);
     try validateSecret(parsed.value.pairing_token.reveal());
     try validateDeviceLabel(parsed.value.device_label);
+    if (parsed.value.client_nonce) |nonce| try validateGrantId(nonce);
     return parsed;
 }
 
@@ -819,4 +821,17 @@ test "P2 daemon RPC mappings require their exact scopes and desktop methods stay
         "terminal.key",     "workspaces",         "panes",           "chat.status",
         "config.ui.set",    "web.directory.list",
     }) |method| try std.testing.expect(requiredScopeMaskForRpc(method) == null);
+}
+
+test "pair exchange accepts only canonical optional client nonces" {
+    const prefix = "{\"access_protocol_version\":1,\"grant_id\":\"0123456789abcdef0123456789abcdef\",\"pairing_token\":\"" ++ "a" ** SECRET_HEX_BYTES ++ "\",\"device_label\":\"Phone\"";
+    var parsed = try parsePairingGrantExchangeRequest(std.testing.allocator, prefix ++ ",\"client_nonce\":\"0123456789abcdef0123456789abcdef\"}");
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", parsed.value.client_nonce.?);
+    for ([_][]const u8{ "", "a" ** 31, "a" ** 33, "A" ** 32, "g" ** 32 }) |nonce| {
+        const body = try std.fmt.allocPrint(std.testing.allocator, "{s},\"client_nonce\":\"{s}\"}}", .{ prefix, nonce });
+        defer std.testing.allocator.free(body);
+        try std.testing.expectError(error.InvalidGrantId, parsePairingGrantExchangeRequest(std.testing.allocator, body));
+    }
+    try std.testing.expectError(error.DuplicateField, parsePairingGrantExchangeRequest(std.testing.allocator, prefix ++ ",\"client_nonce\":null,\"client_nonce\":null}"));
 }

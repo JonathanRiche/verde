@@ -1,7 +1,7 @@
 //! Durable, daemon-owned pairing grants and scoped device verifiers.
 //!
 //! The tables live in the runtime's identity-bound `state.sqlite`. Raw grant
-//! tokens and device credentials are returned once, zeroed by their owners,
+//! tokens and device credentials are zeroed by their owners,
 //! and never enter SQLite or this module's logs.
 
 const std = @import("std");
@@ -40,6 +40,10 @@ pub fn initialize(conn: zqlite.Conn) !void {
         \\    expires_at_ms integer not null,
         \\    consumed_at_ms integer,
         \\    revoked_at_ms integer
+        \\);
+        \\create table if not exists runtime_pairing_retries (
+        \\    grant_id text primary key references runtime_pairing_grants(grant_id) on delete cascade,
+        \\    nonce_hash blob not null check(length(nonce_hash) = 32)
         \\);
         \\create table if not exists runtime_devices (
         \\    device_id text primary key check(length(device_id) = 32),
@@ -103,7 +107,7 @@ pub const IssuedPairingGrant = struct {
     }
 };
 
-/// Device credential returned exactly once after an atomic grant exchange.
+/// Device credential returned after an atomic grant exchange or matching retry.
 pub const IssuedDevice = struct {
     device_id: [access.DEVICE_ID_HEX_BYTES]u8,
     device_credential: [access.SECRET_HEX_BYTES]u8,
@@ -255,7 +259,8 @@ pub fn createPairingGrant(
 }
 
 /// Consume a valid grant exactly once and atomically persist a new device
-/// verifier. Every invalid/expired/replayed grant returns the same error.
+/// verifier. A matching nonce can recover that device until grant expiry.
+/// Every invalid/expired/replayed grant returns the same error.
 pub fn exchangePairingGrant(
     io: std.Io,
     conn: zqlite.Conn,
@@ -269,6 +274,9 @@ pub fn exchangePairingGrant(
     access.validateGrantId(request.grant_id) catch return error.PairingGrantRejected;
     access.validateSecret(request.pairing_token.reveal()) catch return error.PairingGrantRejected;
     try access.validateDeviceLabel(request.device_label);
+    if (request.client_nonce) |nonce| {
+        access.validateGrantId(nonce) catch return error.PairingGrantRejected;
+    }
 
     try conn.execNoArgs("begin immediate");
     var transaction_open = true;
@@ -294,12 +302,44 @@ pub fn exchangePairingGrant(
     defer std.crypto.secureZero(u8, candidate[0..]);
     if (stored_verifier.len != candidate.len or
         !std.crypto.timing_safe.eql(Digest, stored_verifier[0..@sizeOf(Digest)].*, candidate) or
-        consumed_at_ms != null or revoked_at_ms != null or now_ms >= expires_at_ms)
+        revoked_at_ms != null or now_ms >= expires_at_ms)
     {
         row.deinit();
         return error.PairingGrantRejected;
     }
     row.deinit();
+
+    if (consumed_at_ms != null) {
+        const nonce = request.client_nonce orelse return error.PairingGrantRejected;
+        var retry = (try conn.row(
+            \\select r.nonce_hash, d.device_id, d.credential_verifier, d.scopes
+            \\from runtime_pairing_retries r join runtime_devices d on d.grant_id = r.grant_id
+            \\where r.grant_id = ?1 and d.revoked_at_ms is null
+        , .{request.grant_id})) orelse return error.PairingGrantRejected;
+        defer retry.deinit();
+        const nonce_hash = secretVerifier("verde-pairing-nonce-v1", request.grant_id, nonce);
+        const stored_hash = retry.blob(0);
+        if (stored_hash.len != nonce_hash.len or
+            !std.crypto.timing_safe.eql(Digest, stored_hash[0..32].*, nonce_hash))
+            return error.PairingGrantRejected;
+        const device_id = retry.text(1);
+        try access.validateDeviceId(device_id);
+        var issued: IssuedDevice = .{
+            .device_id = device_id[0..access.DEVICE_ID_HEX_BYTES].*,
+            .device_credential = retryCredential(request, device_id),
+            .scope_mask = try checkedScopeMask(retry.int(3)),
+        };
+        errdefer issued.clear();
+        var verifier = secretVerifier(DEVICE_VERIFIER_DOMAIN, device_id, &issued.device_credential);
+        defer std.crypto.secureZero(u8, &verifier);
+        const stored = retry.blob(2);
+        if (stored.len != verifier.len or
+            !std.crypto.timing_safe.eql(Digest, stored[0..32].*, verifier))
+            return error.PairingGrantRejected;
+        try conn.commit();
+        transaction_open = false;
+        return issued;
+    }
 
     // Capacity state is visible only after the one-time credential has been
     // proven. Invalid or replayed tokens retain one uniform rejection path and
@@ -324,6 +364,14 @@ pub fn exchangePairingGrant(
     };
     errdefer issued.clear();
     if (try deviceIdExists(conn, issued.device_id[0..])) return error.RandomCollision;
+    if (request.client_nonce) |nonce| {
+        issued.device_credential = retryCredential(request, &issued.device_id);
+        const nonce_hash = secretVerifier("verde-pairing-nonce-v1", request.grant_id, nonce);
+        try conn.exec(
+            "insert into runtime_pairing_retries (grant_id, nonce_hash) values (?1, ?2)",
+            .{ request.grant_id, zqlite.blob(&nonce_hash) },
+        );
+    }
 
     var device_verifier = secretVerifier(
         DEVICE_VERIFIER_DOMAIN,
@@ -752,6 +800,12 @@ fn pruneLockedToLimits(
         , .{ now_ms, grant_excess });
         grants_removed += conn.changes();
     }
+    // Also clean up without relying on the connection enabling foreign keys.
+    try conn.exec(
+        \\delete from runtime_pairing_retries where grant_id not in (
+        \\    select grant_id from runtime_pairing_grants where expires_at_ms > ?1
+        \\)
+    , .{now_ms});
     return .{
         .grants_removed = grants_removed,
         .devices_removed = devices_removed,
@@ -811,6 +865,21 @@ fn secureHex(comptime byte_len: usize, io: std.Io) ![byte_len * 2]u8 {
     defer std.crypto.secureZero(u8, entropy[0..]);
     try std.Io.randomSecure(io, entropy[0..]);
     return std.fmt.bytesToHex(entropy, .lower);
+}
+
+// Reconstruct only while the client still proves both original secrets. Neither
+// the grant verifier nor the stored nonce hash can derive a device credential.
+fn retryCredential(request: access.PairingGrantExchangeRequest, device_id: []const u8) [access.SECRET_HEX_BYTES]u8 {
+    var mac = std.crypto.auth.hmac.sha2.HmacSha256.init(request.pairing_token.reveal());
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&mac));
+    mac.update("verde-pairing-retry-credential-v1\x00");
+    mac.update(request.grant_id);
+    mac.update(device_id);
+    mac.update(request.client_nonce.?);
+    var digest: Digest = undefined;
+    defer std.crypto.secureZero(u8, &digest);
+    mac.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
 }
 
 fn secretVerifier(domain: []const u8, id: []const u8, secret: []const u8) Digest {
@@ -873,6 +942,10 @@ test "pairing grant exchange is one-time, scoped, revocable, and verifier-only" 
         error.PairingGrantRejected,
         exchangePairingGrant(std.testing.io, conn, exchange_request, 2_001),
     );
+
+    var nonce_replay = exchange_request;
+    nonce_replay.client_nonce = "c" ** 32;
+    try std.testing.expectError(error.PairingGrantRejected, exchangePairingGrant(std.testing.io, conn, nonce_replay, 2_002));
 
     const requested_mask = try access.scopeMask(&.{ "runtime:read", "chat:write" });
     const granted_mask = try authenticateDevice(
@@ -938,6 +1011,68 @@ test "pairing grant exchange is one-time, scoped, revocable, and verifier-only" 
             4_002,
         ),
     );
+}
+
+test "pairing nonce recovers a lost response across connections only within TTL" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buffer);
+    const path = try std.fs.path.joinZ(std.testing.allocator, &.{ path_buffer[0..path_len], "access.sqlite" });
+    defer std.testing.allocator.free(path);
+    const flags = zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode;
+    const conn = try zqlite.open(path, flags);
+    defer conn.close();
+    try initialize(conn);
+    try conn.execNoArgs("drop table runtime_pairing_retries");
+    try initialize(conn); // Upgrade a database with the original access tables.
+    var grant = try createPairingGrant(std.testing.io, conn, .{
+        .access_protocol_version = access.ACCESS_PROTOCOL_VERSION,
+        .ttl_seconds = 60,
+        .scopes = &.{"runtime:read"},
+    }, 1_000);
+    defer grant.clear();
+    var request: access.PairingGrantExchangeRequest = .{
+        .access_protocol_version = access.ACCESS_PROTOCOL_VERSION,
+        .grant_id = &grant.grant_id,
+        .pairing_token = .{ .bytes = &grant.pairing_token },
+        .device_label = "Phone",
+        .client_nonce = "0123456789abcdef0123456789abcdef",
+    };
+    var first = try exchangePairingGrant(std.testing.io, conn, request, 2_000);
+    defer first.clear();
+    const reopened = try zqlite.open(path, flags);
+    defer reopened.close();
+    // Reconstruct from durable verifiers, with no gateway/daemon memory cache.
+    request.device_label = "Retry label must not change the original device";
+    var retry = try exchangePairingGrant(std.testing.io, reopened, request, 60_999);
+    defer retry.clear();
+    try std.testing.expectEqualSlices(u8, &first.device_id, &retry.device_id);
+    try std.testing.expectEqualSlices(u8, &first.device_credential, &retry.device_credential);
+    try std.testing.expectEqual(first.scope_mask, retry.scope_mask);
+    try std.testing.expectEqual(@as(i64, 1), try countRows(conn, "runtime_devices"));
+    var devices = try listDevices(std.testing.allocator, conn, 60_999);
+    defer devices.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("Phone", devices.items[0].label);
+    _ = try authenticateDevice(conn, &retry.device_id, &retry.device_credential, &.{"runtime:read"}, 60_999);
+    var row = (try conn.row("select nonce_hash from runtime_pairing_retries", .{})).?;
+    try std.testing.expectEqual(@as(usize, 32), row.blob(0).len);
+    try std.testing.expect(!std.mem.eql(u8, row.blob(0), request.client_nonce.?));
+    row.deinit();
+    try std.testing.expectError(error.PairingGrantRejected, exchangePairingGrant(std.testing.io, conn, request, 61_000));
+    const original_nonce = request.client_nonce;
+    request.client_nonce = "f" ** 32;
+    try std.testing.expectError(error.PairingGrantRejected, exchangePairingGrant(std.testing.io, conn, request, 3_000));
+    request.client_nonce = null;
+    try std.testing.expectError(error.PairingGrantRejected, exchangePairingGrant(std.testing.io, conn, request, 3_000));
+    request.client_nonce = original_nonce;
+    request.pairing_token = .{ .bytes = "0" ** access.SECRET_HEX_BYTES };
+    try std.testing.expectError(error.PairingGrantRejected, exchangePairingGrant(std.testing.io, conn, request, 3_000));
+    request.pairing_token = .{ .bytes = &grant.pairing_token };
+    try std.testing.expect(try revokeDevice(conn, &first.device_id, 3_000));
+    try std.testing.expectError(error.PairingGrantRejected, exchangePairingGrant(std.testing.io, conn, request, 3_001));
+    _ = try prune(conn, 61_000, DEFAULT_RETENTION_MS);
+    try std.testing.expectEqual(@as(i64, 0), try countRows(conn, "runtime_pairing_retries"));
 }
 
 test "expired or revoked grants fail closed without creating devices" {

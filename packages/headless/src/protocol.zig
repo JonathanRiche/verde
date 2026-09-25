@@ -377,11 +377,11 @@ pub const RUNTIME_CAPABILITY_NAMES = RUNTIME_CAPABILITY_NAMES_BASE ++
         "chat.repository_route.v1",
         attachment_protocol.CHAT_ATTACHMENT_CAPABILITY,
         access_protocol.PAIR_RUNTIME_CAPABILITY,
+        ACCESS_PAIR_IDEMPOTENT_CAPABILITY,
     };
 
-// Mobile capability names reserved for features that have not landed yet.
-// Advertising a name promises the feature works, so none of these appear in
-// RUNTIME_CAPABILITY_NAMES(_BASE) until its owning task ships.
+// Mobile capability names. Advertising a name promises the feature works;
+// names remain pending below until their owning task ships.
 
 /// Delta-mode `core.changes` feed on the gateway (task A-11).
 pub const CORE_CHANGES_DELTA_CAPABILITY: []const u8 = "core.changes.delta.v1";
@@ -401,7 +401,6 @@ pub const PENDING_RUNTIME_CAPABILITY_NAMES = [_][]const u8{
     CORE_CHANGES_DELTA_CAPABILITY,
     DEVICE_PUSH_CAPABILITY,
     WORKSPACE_DIRECTORY_CAPABILITY,
-    ACCESS_PAIR_IDEMPOTENT_CAPABILITY,
 };
 
 /// Runtime generation a remote JSON-RPC request intends to reach. Keeping
@@ -1164,4 +1163,11 @@ test "granular feature and unavailable error helpers use stable names" {
     const unavailable = capabilityUnavailable(.browser_screenshot);
     try std.testing.expectEqualStrings(ERR_CAPABILITY_UNAVAILABLE, unavailable.code);
     try std.testing.expectEqualStrings("browser.screenshot capability is unavailable", unavailable.message);
+}
+
+test "store-backed runtimes advertise idempotent pairing" {
+    for (RUNTIME_CAPABILITY_NAMES) |capability| {
+        if (std.mem.eql(u8, capability, ACCESS_PAIR_IDEMPOTENT_CAPABILITY)) return;
+    }
+    return error.TestExpectedEqual;
 }

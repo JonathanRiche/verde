@@ -184,6 +184,10 @@ fn encodeSecretTargetedRequest(
             try json.write(params.pairing_token.reveal());
             try json.objectField("device_label");
             try json.write(params.device_label);
+            if (params.client_nonce) |nonce| {
+                try json.objectField("client_nonce");
+                try json.write(nonce);
+            }
         },
         .device_authenticate => |params| {
             try json.objectField("access_protocol_version");
@@ -296,6 +300,7 @@ const TestTransport = struct {
                 "a" ** access_protocol.SECRET_HEX_BYTES,
                 params.object.get("pairing_token").?.string,
             );
+            try std.testing.expectEqualStrings("c" ** 32, params.object.get("client_nonce").?.string);
         } else if (std.mem.eql(u8, parsed.request.method, access_protocol.METHOD_DAEMON_DEVICE_AUTHENTICATE)) {
             try std.testing.expectEqualStrings(
                 "b" ** access_protocol.SECRET_HEX_BYTES,
@@ -337,6 +342,7 @@ test "access bridges deliberately reveal only transient daemon request secrets" 
         .grant_id = "fedcba9876543210fedcba9876543210",
         .pairing_token = .{ .bytes = "a" ** access_protocol.SECRET_HEX_BYTES },
         .device_label = "Test device",
+        .client_nonce = "c" ** 32,
     };
     const generic = try protocol.encodeTargetedRequest(
         std.testing.allocator,

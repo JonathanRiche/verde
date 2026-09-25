@@ -652,7 +652,7 @@ fn handleRuntimeMetadata(
         .instance_id = &target.instance_id,
         .https_url = config.trusted_proxy_origin,
         .wss_url = wss_url,
-        .capabilities = &.{headless.access_protocol.PAIR_RUNTIME_CAPABILITY},
+        .capabilities = &.{ headless.access_protocol.PAIR_RUNTIME_CAPABILITY, headless.protocol.ACCESS_PAIR_IDEMPOTENT_CAPABILITY },
     };
     const body = try std.json.Stringify.valueAlloc(allocator, metadata, .{});
     defer allocator.free(body);

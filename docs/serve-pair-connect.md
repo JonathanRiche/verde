@@ -90,7 +90,8 @@ Serve/Pair and a runnable self-hostable Connect reference control plane. A
 private Verde Cloud deployment may operate and extend that reference service,
 but it is not required.
 
-Store-backed runtimes now advertise `access.pair.v1`. The implementation has
+Store-backed runtimes now advertise `access.pair.v1` and
+`access.pair.idempotent.v1`. The implementation has
 frozen scope names, strict/redacting DTOs, and durable
 identity-bound tables for one-time grants and revocable device verifiers. The
 owner-only `verde-daemon pair ...` and `verde-daemon device ...` administrator
@@ -244,11 +245,24 @@ a narrowly scoped, revocable device relationship.
 7. Later sessions use the device credential to obtain short-lived access and
    WebSocket credentials. The original pairing grant is never reused.
 
-Grant consumption and device creation are one atomic operation. If the runtime
-commits that operation but the gateway or client disconnects before the
-one-time device credential is received, retrying the grant correctly fails as
-a replay. The operator must revoke the orphaned device when identifiable and
-create a new grant; the runtime never reissues the lost credential.
+Grant consumption and device creation are one atomic operation. Clients may
+include an optional `client_nonce` in the JSON body of `POST /auth/pair/exchange`:
+a cryptographically random 32-character lowercase hexadecimal value generated
+once per pairing attempt. Retain the nonce and grant secret until the response
+is safely received. On hosts advertising `access.pair.idempotent.v1`, retrying
+with the same grant secret and nonce before the original grant expiry returns
+the same device ID, credential, and scopes, even after a daemon restart. The
+original device label is retained. Concurrent exchanges are serialized.
+
+The runtime stores only a domain-separated nonce hash and device credential
+verifier; it reconstructs the credential using HMAC-SHA256 keyed by the supplied
+grant secret and bound to the grant ID, device ID, and nonce. It never stores
+the raw nonce or recoverable device credential. A different or omitted nonce,
+an incorrect grant secret, an expired grant (including its exact expiry time),
+or a revoked device fails closed. Retrying never creates a second device or
+extends the grant TTL. Exchanges without a nonce retain the original one-time
+semantics: a lost response requires revoking the orphaned device and creating
+a new grant. After successful pairing, discard the grant secret and nonce.
 
 A browser-oriented pairing link may carry the one-time grant only in the URL
 fragment so the page origin does not receive it in an HTTP request. That is a
