@@ -121,20 +121,20 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | A-03 | Confined directory-list RPC | host | linux | A-02 | todo |
 | A-04 | Device self-service RPCs | host | linux | A-02 | todo |
 | A-05 | Idempotent pair exchange | host | linux | — | todo |
-| A-06 | Terminal QR + App Link pair URL | host | linux | — | todo |
+| A-06 | Terminal QR + App Link pair URL | host | linux | — | in_progress (cli-thread-1790350347107-861dd72a5650efc0) |
 | A-07 | Desktop "Pair a phone" + Paired devices UI | host | linux | A-04, A-06 | todo |
 | A-08 | Web Settings paired-devices list | host | linux | A-04 | todo |
 | A-09 | Pairing presets + access-mode cap | host | linux | A-02, H-08 | todo |
-| A-10 | `mobile.min_client` + capability flags | host | linux | — | todo |
+| A-10 | `mobile.min_client` + capability flags | host | linux | — | in_progress (cli-thread-1790350351170-d56ab99abb804210) |
 | A-11 | Delta change feed on the gateway | host | linux | A-10 | todo |
-| A-12 | Push crypto module (seal/open) | host | linux | — | todo |
+| A-12 | Push crypto module (seal/open) | host | linux | — | in_progress (cli-thread-1790350349138-67bd0d430b1a2acf) |
 | A-13 | Push outbox + `device.push.*` RPCs | host | linux | A-02, A-12 | todo |
 | A-14 | Attention events → outbox | host | linux | A-13 | todo |
 | W-01 | App Link / universal link files + pair landing page | website | linux | H-03, H-04 | todo |
 | C-01 | Spike: APNs reachability from Workers | cloud | linux | — | in_progress (orchestrator research subagent) |
 | C-02 | Push relay Worker | cloud | linux | C-01, A-12 | todo |
 | C-03 | Demo runtime for store review | cloud | linux | A-09 | todo |
-| K-01 | Core skeleton + Android toolchain proof | core | linux | — | todo |
+| K-01 | Core skeleton + Android toolchain proof | core | linux | — | in_progress (cli-thread-1790350345069-6d46ff988958492f) |
 | K-02 | iOS xcframework toolchain proof | core | mac | K-01, H-01, H-02 | todo |
 | K-03 | Core API spec (events, effects, queries) | core | linux | K-01 | todo |
 | K-04 | Extract shared remote-client modules from desktop | core | linux | K-01 | todo |
