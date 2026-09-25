@@ -25,9 +25,27 @@ pub const RUNTIME_PROTOCOL_MINOR: u32 = 0;
 /// fit through the loopback HTTP and WebSocket gateway.
 pub const RUNTIME_MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 
+/// Oldest mobile client-core protocol revision this runtime serves, advertised
+/// as `mobile.min_client` by core.status / core.capabilities. Mobile apps
+/// compare it with their own compiled-in revision and show an update screen
+/// when they are older. Bump it only when a runtime change stops serving
+/// clients built against the previous revision.
+pub const MOBILE_MIN_CLIENT: u32 = 1;
+
 pub const RuntimeProtocolVersion = struct {
     major: u32 = RUNTIME_PROTOCOL_MAJOR,
     minor: u32 = RUNTIME_PROTOCOL_MINOR,
+};
+
+/// Mobile compatibility block serialized as `"mobile":{"min_client":N}`.
+pub const MobileCompatibility = struct {
+    /// Zero when decoding a runtime that predates the field; runtimes built
+    /// from this revision always send `MOBILE_MIN_CLIENT`.
+    min_client: u32 = 0,
+
+    pub fn current() MobileCompatibility {
+        return .{ .min_client = MOBILE_MIN_CLIENT };
+    }
 };
 
 /// Limits advertised by the runtime handshake. Clients must still accept a
@@ -361,6 +379,31 @@ pub const RUNTIME_CAPABILITY_NAMES = RUNTIME_CAPABILITY_NAMES_BASE ++
         access_protocol.PAIR_RUNTIME_CAPABILITY,
     };
 
+// Mobile capability names reserved for features that have not landed yet.
+// Advertising a name promises the feature works, so none of these appear in
+// RUNTIME_CAPABILITY_NAMES(_BASE) until its owning task ships.
+
+/// Delta-mode `core.changes` feed on the gateway (task A-11).
+pub const CORE_CHANGES_DELTA_CAPABILITY: []const u8 = "core.changes.delta.v1";
+/// Device push registration and sealed wake-ups (task A-13).
+pub const DEVICE_PUSH_CAPABILITY: []const u8 = "device.push.v1";
+/// Remote workspace directory browsing (task A-03).
+pub const WORKSPACE_DIRECTORY_CAPABILITY: []const u8 = "workspace.directory.v1";
+/// Idempotent pair-code exchange (task A-05).
+pub const ACCESS_PAIR_IDEMPOTENT_CAPABILITY: []const u8 = "access.pair.idempotent.v1";
+
+/// Reserved names that must not be advertised yet; tests assert their absence.
+/// To turn one on, the owning task moves its constant from this list into
+/// RUNTIME_CAPABILITY_NAMES_BASE (available without the durable store) or the
+/// store-backed tail of RUNTIME_CAPABILITY_NAMES, in the same commit as the
+/// feature and its tests.
+pub const PENDING_RUNTIME_CAPABILITY_NAMES = [_][]const u8{
+    CORE_CHANGES_DELTA_CAPABILITY,
+    DEVICE_PUSH_CAPABILITY,
+    WORKSPACE_DIRECTORY_CAPABILITY,
+    ACCESS_PAIR_IDEMPOTENT_CAPABILITY,
+};
+
 /// Runtime generation a remote JSON-RPC request intends to reach. Keeping
 /// this at the envelope level lets the daemon reject a stale or misdirected
 /// request before any method-specific params are decoded or acted upon.
@@ -377,6 +420,7 @@ pub const StatusResult = struct {
     protocol: RuntimeProtocolVersion = .{},
     runtime_capabilities: []const []const u8 = &.{},
     limits: RuntimeLimits = .{},
+    mobile: MobileCompatibility = .{},
     headless_protocol_version: u32,
     min_supported: u32,
     max_supported: u32,
@@ -396,6 +440,7 @@ pub const CapabilitiesResult = struct {
     protocol: RuntimeProtocolVersion = .{},
     runtime_capabilities: []const []const u8 = &.{},
     limits: RuntimeLimits = .{},
+    mobile: MobileCompatibility = .{},
     headless_protocol_version: u32,
     min_supported: u32,
     max_supported: u32,
@@ -785,6 +830,33 @@ test "runtime capabilities advertise request target validation" {
         if (std.mem.eql(u8, capability, "rpc.target.v1")) found = true;
     }
     try std.testing.expect(found);
+}
+
+test "reserved mobile capability names are defined but not advertised yet" {
+    try std.testing.expectEqualStrings("core.changes.delta.v1", CORE_CHANGES_DELTA_CAPABILITY);
+    try std.testing.expectEqualStrings("device.push.v1", DEVICE_PUSH_CAPABILITY);
+    try std.testing.expectEqualStrings("workspace.directory.v1", WORKSPACE_DIRECTORY_CAPABILITY);
+    try std.testing.expectEqualStrings("access.pair.idempotent.v1", ACCESS_PAIR_IDEMPOTENT_CAPABILITY);
+    for (PENDING_RUNTIME_CAPABILITY_NAMES) |pending| {
+        for (RUNTIME_CAPABILITY_NAMES) |capability| {
+            try std.testing.expect(!std.mem.eql(u8, capability, pending));
+        }
+        for (RUNTIME_CAPABILITY_NAMES_BASE) |capability| {
+            try std.testing.expect(!std.mem.eql(u8, capability, pending));
+        }
+    }
+}
+
+test "status from a runtime without mobile.min_client decodes as unadvertised" {
+    const legacy =
+        \\{"headless_protocol_version":1,"min_supported":1,"max_supported":1,"protocol_version":18,"pid":1,"session_count":0,"chat_turn_count":0,"capabilities":{"terminal_raw":true,"terminal_grid":false,"chat":false,"processes":false,"leases":false,"browser_execution":false,"browser_presentation":false}}
+    ;
+    const parsed = try std.json.parseFromSlice(StatusResult, std.testing.allocator, legacy, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u32, 0), parsed.value.mobile.min_client);
+    try std.testing.expectEqual(MOBILE_MIN_CLIENT, MobileCompatibility.current().min_client);
 }
 
 test "store-backed runtimes advertise complete Pair transport enforcement" {

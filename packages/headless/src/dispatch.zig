@@ -180,6 +180,7 @@ fn buildStatus(ctx: Context) protocol.StatusResult {
         .protocol = .{},
         .runtime_capabilities = runtimeCapabilities(ctx.store_ready),
         .limits = .{},
+        .mobile = .current(),
         .headless_protocol_version = protocol.HEADLESS_PROTOCOL_VERSION,
         .min_supported = protocol.MIN_SUPPORTED_PROTOCOL_VERSION,
         .max_supported = protocol.MAX_SUPPORTED_PROTOCOL_VERSION,
@@ -199,6 +200,7 @@ fn buildCapabilities(ctx: Context) protocol.CapabilitiesResult {
         .protocol = .{},
         .runtime_capabilities = runtimeCapabilities(ctx.store_ready),
         .limits = .{},
+        .mobile = .current(),
         .headless_protocol_version = protocol.HEADLESS_PROTOCOL_VERSION,
         .min_supported = protocol.MIN_SUPPORTED_PROTOCOL_VERSION,
         .max_supported = protocol.MAX_SUPPORTED_PROTOCOL_VERSION,
@@ -299,6 +301,38 @@ test "core.capabilities content" {
     try std.testing.expect(!caps.capabilities.browser_presentation);
     try std.testing.expect(!caps.capabilities.browser.available);
     try std.testing.expect(!caps.capabilities.isFeatureAvailable(.browser_screenshot));
+}
+
+test "core.status and core.capabilities payloads carry mobile.min_client and only landed capability names" {
+    const allocator = std.testing.allocator;
+    for ([_]bool{ true, false }) |store_ready| {
+        var ctx = fakeContext();
+        ctx.store_ready = store_ready;
+        inline for (.{ "core.status", "core.capabilities" }) |method| {
+            const response = dispatch(6, method, .null, ctx);
+            const encoded = switch (response.body) {
+                .status => |result| try protocol.encodeOkResponse(allocator, response.id, result),
+                .capabilities => |result| try protocol.encodeOkResponse(allocator, response.id, result),
+                .err => return error.TestUnexpectedResult,
+            };
+            defer allocator.free(encoded);
+
+            var parsed = try protocol.parseResponse(allocator, encoded);
+            defer parsed.deinit();
+            const result = parsed.response.result.?.object;
+            try std.testing.expectEqual(
+                @as(i64, protocol.MOBILE_MIN_CLIENT),
+                result.get("mobile").?.object.get("min_client").?.integer,
+            );
+            const advertised = result.get("runtime_capabilities").?.array.items;
+            try std.testing.expect(advertised.len > 0);
+            for (advertised) |name| {
+                for (protocol.PENDING_RUNTIME_CAPABILITY_NAMES) |pending| {
+                    try std.testing.expect(!std.mem.eql(u8, name.string, pending));
+                }
+            }
+        }
+    }
 }
 
 test "unknown method yields unknown_method" {
