@@ -120,7 +120,7 @@ fn addContractStep(
     contract_options.addOption([]const u8, "web_exe", b.pathJoin(&.{ prefix, "bin", "verde-web" }));
 
     const module = createCoreModule(b, target, optimize, options);
-    module.root_source_file = b.path("src/contract_suite.zig");
+    module.root_source_file = b.path("src/contract_test.zig");
     module.addOptions("contract_options", contract_options);
     // Imported core files carry their own unit tests; those belong to `test`.
     const suite = b.addTest(.{ .name = "contract", .root_module = module, .use_llvm = true, .filters = &.{"K-14 contract"} });

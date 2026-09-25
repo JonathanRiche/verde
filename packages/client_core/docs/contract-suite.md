@@ -1,6 +1,6 @@
 # Core contract suite (K-14)
 
-`src/contract_suite.zig` drives the **real** client core (`Host.handle`, the
+`src/contract_test.zig` drives the **real** client core (`Host.handle`, the
 same effect/event contract the Android and iOS adapters implement) against a
 real temporary `verde-daemon serve` and `verde-web`. Run it from the repository
 root:
