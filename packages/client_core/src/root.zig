@@ -9,6 +9,7 @@ const build_options = @import("build_options");
 pub const engine = @import("host.zig");
 const jni = @import("jni.zig");
 pub const terminal = @import("terminal.zig");
+const push = @import("push.zig");
 
 /// Core version from `build.zig.zon`, NUL-terminated for C callers.
 pub const version: [:0]const u8 = build_options.version;
@@ -26,6 +27,7 @@ comptime {
     @export(&vcTermScroll, .{ .name = "vc_term_scroll" });
     @export(&vcTermSnapshot, .{ .name = "vc_term_snapshot" });
     @export(&vcBufFree, .{ .name = "vc_buf_free" });
+    @export(&vcPushOpen, .{ .name = "vc_push_open" });
     if (builtin.abi.isAndroid()) {
         @export(&jni.termNew, .{ .name = "Java_dev_verdeai_core_Native_termNew" });
         @export(&jni.termFree, .{ .name = "Java_dev_verdeai_core_Native_termFree" });
@@ -38,6 +40,7 @@ comptime {
         @export(&jni.hostHandle, .{ .name = "Java_dev_verdeai_core_Native_hostHandle" });
         @export(&jni.hostQuery, .{ .name = "Java_dev_verdeai_core_Native_hostQuery" });
         @export(&javaNativeVersion, .{ .name = "Java_dev_verdeai_core_Native_version" });
+        @export(&jni.pushOpen, .{ .name = "Java_dev_verdeai_core_Native_pushOpen" });
     }
 }
 
@@ -145,6 +148,16 @@ pub fn vcHostQuery(host: ?*engine.Host, ptr: ?[*]const u8, len: usize, out: ?*Bu
     result.* = .{ .ptr = bytes.ptr, .len = bytes.len };
     return 0;
 }
+/// Pure K-17 push decrypt; needs no host. See docs/push.md.
+pub fn vcPushOpen(ptr: ?[*]const u8, len: usize, out: ?*Buf) callconv(.c) i32 {
+    const result = out orelse return 1;
+    result.* = .{};
+    if (len > push.MAX_OPEN_INPUT) return 5;
+    const input = inputSlice(ptr, len) catch |err| return status(err);
+    const bytes = push.openJson(std.heap.c_allocator, input) catch |err| return status(err);
+    result.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return 0;
+}
 pub fn vcBufFree(buf: Buf) callconv(.c) void {
     if (buf.ptr) |ptr| std.heap.c_allocator.free(ptr[0..buf.len]);
 }
@@ -157,6 +170,7 @@ test {
     _ = @import("chat_test.zig");
     _ = @import("model_contract_test.zig");
     _ = @import("auth_harness.zig");
+    _ = @import("attention_test.zig");
 }
 
 // Upstream parser diagnostics can include escape payloads. Never log them.

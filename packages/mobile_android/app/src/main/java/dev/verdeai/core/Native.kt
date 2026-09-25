@@ -16,4 +16,5 @@ object Native {
     @JvmStatic external fun termScroll(term: Long, deltaRows: Int): Int
     @JvmStatic external fun termSnapshot(term: Long, status: IntArray): ByteArray?
     @JvmStatic external fun version(): String
+    @JvmStatic external fun pushOpen(json: ByteArray, status: IntArray): ByteArray?
 }

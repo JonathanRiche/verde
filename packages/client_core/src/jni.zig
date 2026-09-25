@@ -100,6 +100,33 @@ pub fn hostHandle(env: Env, _: jclass, token: i64, array: jobject, out_status: j
 pub fn hostQuery(env: Env, _: jclass, token: i64, array: jobject, out_status: jobject) callconv(.c) jobject {
     return hostCall(env, token, array, out_status, true);
 }
+/// Kotlin: @JvmStatic external fun pushOpen(json: ByteArray, status: IntArray): ByteArray?
+/// Pure K-17 decrypt for the messaging service; no host handle is needed.
+pub fn pushOpen(env: Env, _: jclass, array: jobject, out_status: jobject) callconv(.c) jobject {
+    if (!setStatus(env, out_status, 1)) return null;
+    const input = copyInput(env, array, @import("push.zig").MAX_OPEN_INPUT) catch |err| {
+        _ = setStatus(env, out_status, abi.status(err));
+        return null;
+    };
+    defer {
+        // The request carries the stored push key records.
+        std.crypto.secureZero(u8, input);
+        std.heap.c_allocator.free(input);
+    }
+    var buf: abi.Buf = .{};
+    const code = abi.vcPushOpen(input.ptr, input.len, &buf);
+    defer abi.vcBufFree(buf);
+    if (code != 0) {
+        _ = setStatus(env, out_status, code);
+        return null;
+    }
+    const result = copyOutput(env, buf.ptr.?[0..buf.len]) orelse {
+        _ = setStatus(env, out_status, 3);
+        return null;
+    };
+    if (!setStatus(env, out_status, 0)) return null;
+    return result;
+}
 fn hostCall(env: Env, token: i64, array: jobject, out_status: jobject, query: bool) jobject {
     if (!setStatus(env, out_status, 1)) return null;
     const host = hostPointer(token) orelse return null;

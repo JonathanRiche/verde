@@ -15,6 +15,8 @@ pub const Pane = struct {
     attention: bool = false,
     started_at_ms: ?i64 = null,
     can_stop: bool = false,
+    /// K-17 thread attention (unread, needs_approval, blocked, failed).
+    attention_kind: ?[]const u8 = null,
 };
 pub const ThreadSummary = struct {
     workspace_id: []const u8,

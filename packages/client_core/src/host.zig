@@ -6,6 +6,9 @@ const auth = @import("auth.zig");
 pub const sync = @import("sync.zig");
 const terminal = @import("terminal_pump.zig");
 pub const chat = @import("chat.zig");
+pub const push = @import("push.zig");
+pub const attention = @import("attention.zig");
+const chat_index = @import("chat_index.zig");
 const profile = @import("verde_remote").profile;
 const A = std.mem.Allocator;
 const V = std.json.Value;
@@ -60,6 +63,9 @@ pub const State = struct {
     sync: sync.State = .{},
     terminal: terminal.State = .{},
     chat: chat.State = .{},
+    push: push.State = .{},
+    attention: attention.State = .{},
+    chat_index: chat_index.State = .{},
     lifecycle: Lifecycle = .created,
     revision: u64 = 0,
     generation: u64 = 0,
@@ -107,6 +113,9 @@ pub const Host = struct {
         try sync.pump(&tx);
         try terminal.pump(&tx);
         try chat.pump(&tx);
+        try push.pump(&tx);
+        try chat_index.pump(&tx);
+        try attention.pump(&tx);
         return tx.commit(self, output_allocator);
     }
 
@@ -145,6 +154,9 @@ pub const Host = struct {
         } else if (eq(selector, "home") or eq(selector, "workspaces")) {
             data = try sync.query(a, s, selector);
             if (eq(selector, "workspaces") and s.chat.history_epoch > 0) try data.object.put(a, "history", try valueOf(a, s.chat.history));
+            try attention.annotate(a, s, selector, &data);
+        } else if (try attention.query(a, s, selector)) |attention_view| {
+            data = attention_view;
         } else if (try chat.query(a, s, selector)) |chat_view| {
             data = chat_view;
         } else {
@@ -331,11 +343,16 @@ pub const Transaction = struct {
             _ = try auth.intent(self, tag, event);
             _ = try terminal.intent(self, tag, event);
             _ = try chat.intent(self, tag, event);
+            _ = try push.intent(self, tag, event);
+            try attention.intent(self, tag, event);
             self.changed = true;
         } else if (eq(tag, "terminal_reply")) {
             _ = try string(event, "terminal_id");
             try base64(try string(event, "bytes_base64"));
             try terminal.reply(self, event);
+        } else if (eq(tag, "push_received")) {
+            if (s.lifecycle == .created) return error.InvalidLifecycle;
+            try attention.received(self, event);
         } else {
             try self.complete(tag, event);
             if (!self.completion_matched) return;
@@ -414,6 +431,9 @@ pub const Transaction = struct {
             if (try auth.complete(self, p, event)) return;
             if (try terminal.complete(self, p, event)) return;
             if (try chat.complete(self, p, event)) return;
+            if (try push.complete(self, p, event)) return;
+            if (try attention.complete(self, p, event)) return;
+            if (try chat_index.complete(self, p, event)) return;
             if (kind == .store_get) {
                 if ((try field(event, "error")) != .null) {
                     self.state.host_error = .{ .domain = "storage", .code = try string(try field(event, "error"), "code"), .message = "Stored profile could not be loaded.", .retryable = true };
@@ -432,7 +452,7 @@ pub const Transaction = struct {
         if (self.changed) {
             if (self.state.revision == std.math.maxInt(u64)) return error.ResourceLimit;
             self.state.revision += 1;
-            _ = try self.emit("state_changed", .{ .revision = try decimal(self.allocator(), self.state.revision), .scopes = try chat.scopes(self) });
+            _ = try self.emit("state_changed", .{ .revision = try decimal(self.allocator(), self.state.revision), .scopes = try withAttention(self) });
             try terminal.queryScopes(self);
         }
         // Retain only state, never the call's decoded secrets or effect payloads.
@@ -577,13 +597,18 @@ fn base64(s: []const u8) ApiError!void {
     }
 }
 
+fn withAttention(tx: *Transaction) ApiError![]const []const u8 {
+    var scopes = try chat.scopes(tx);
+    try append([]const u8, tx.allocator(), &scopes, "attention");
+    return scopes;
+}
 fn append(comptime T: type, a: A, slice: *[]const T, item: T) ApiError!void {
     const next = try a.alloc(T, slice.len + 1);
     @memcpy(next[0..slice.len], slice.*);
     next[slice.len] = item;
     slice.* = next;
 }
-const intents = [_][]const u8{ "sign_out", "forget_host", "pair", "trust_decision", "retry_connection", "focus", "thread_open", "thread_load_older", "history_search", "history_load_more", "draft_set", "composer_select", "send", "turn_cancel", "followup_submit", "followup_retry", "followup_pull_back", "followup_cancel", "approval_decide", "shell_prepare", "shell_confirm", "slash_search", "slash_run", "mention_search", "terminal_create", "terminal_attach", "terminal_detach", "terminal_input", "terminal_resize", "terminal_kill" };
+const intents = [_][]const u8{ "sign_out", "forget_host", "pair", "trust_decision", "retry_connection", "focus", "thread_open", "thread_load_older", "history_search", "history_load_more", "draft_set", "composer_select", "send", "turn_cancel", "followup_submit", "followup_retry", "followup_pull_back", "followup_cancel", "approval_decide", "shell_prepare", "shell_confirm", "slash_search", "slash_run", "mention_search", "terminal_create", "terminal_attach", "terminal_detach", "terminal_input", "terminal_resize", "terminal_kill", "push_register" };
 fn isIntent(tag: []const u8) bool {
     for (intents) |intent| if (eq(tag, intent)) return true;
     return false;
@@ -602,6 +627,8 @@ fn validateIntent(a: A, tag: []const u8, event: V) ApiError!void {
         _ = try decode(struct { query: []const u8, workspace_id: ?[]const u8 }, a, event);
     } else if (eq(tag, "shell_confirm")) {
         _ = try decode(struct { confirmation_id: []const u8, accept: bool }, a, event);
+    } else if (eq(tag, "push_register")) {
+        try push.validate(a, event);
     } else if (eq(tag, "terminal_create")) {
         _ = try decode(struct { workspace_id: []const u8, cwd: ?[]const u8, cols: u16, rows: u16 }, a, event);
     } else if (std.mem.startsWith(u8, tag, "terminal_")) {
@@ -704,6 +731,7 @@ fn receiptField(context: []const u8, key: []const u8, top: bool) bool {
         if (eq(context, "terminal_attach")) break :blk "terminal_id";
         if (eq(context, "terminal_detach")) break :blk "terminal_id";
         if (eq(context, "terminal_kill")) break :blk "terminal_id";
+        if (eq(context, "push_register")) break :blk "platform send_token key_seed_base64";
         break :blk "";
     };
     var names = std.mem.tokenizeScalar(u8, fields, ' ');

@@ -157,6 +157,7 @@ and `sync_state` (`empty`, `loading`, `ready`, `stale`). These are orthogonal.
 | `tls_peer` | `effect_id,generation,origin,spki_sha256,system_trusted:bool`; preflight result for the same origin, before sending sensitive bytes (see below). |
 | `terminal_applied` | `effect_id,generation,terminal_id,grid_revision,error:PlatformFailure|null`; acknowledgement that a PTY output batch reached its VT handle. |
 | `terminal_reply` | `terminal_id,bytes_base64`; raw VT-generated device reply, as described in §10. |
+| `push_received` | `workspace_id,thread_id,turn_id,kind`; a push the platform opened while this handle is loaded (K-17). Updates attention without another `notify`; see [push.md](push.md). |
 | `shutdown` | Stop all networking/timers, invalidate callbacks and emit needed cancellations; does not revoke or erase pairing. No later event except duplicate shutdown is accepted. |
 
 `TransportFailure` is a new local shape `{kind,code}`: `kind` is `network`,
@@ -222,8 +223,8 @@ Optional values below may be null. These are new local names, not RPC names.
 
 | Intent | Payload / result |
 | --- | --- |
-| `sign_out` | `host_id`; revoke this handle’s authenticated device, then delete credential, pin and the K-16 sync checkpoint. `auth_state:signed_out` only after every delete acknowledgement. Offline/ambiguous outcomes report operation error `sign_out_unconfirmed` without wiping. |
-| `forget_host` | `host_id`; explicitly delete local credential, pin and sync checkpoint without revocation. The UI must warn that the device may remain listed on the desktop. |
+| `sign_out` | `host_id`; revoke this handle’s authenticated device, then delete credential, pin, the K-16 sync checkpoint and the K-17 attention, push-key, chat-draft/follow-up and chat-index records. `auth_state:signed_out` only after every delete acknowledgement. Offline/ambiguous outcomes report operation error `sign_out_unconfirmed` without wiping. |
+| `forget_host` | `host_id`; explicitly delete the same local records as `sign_out` without revocation. The UI must warn that the device may remain listed on the desktop. |
 | `pair` | `link,device_label,client_nonce`; parse supported custom/App Link form, code only from fragment. Keep nonce stable across a lost exchange response. Manual entry is normalized by the platform to the same link. |
 | `trust_decision` | `proposal_id,accept:bool`; reject stale proposals. Denial leaves host disabled without auth traffic. |
 | `retry_connection` | Retry a recoverable connection; cannot override identity/TLS rejection. |
@@ -245,6 +246,7 @@ Optional values below may be null. These are new local names, not RPC names.
 | `terminal_input` | `terminal_id,vt_modes:{application_cursor,bracketed_paste},input:{kind:text|key|paste,text?,key?,ctrl,alt,shift}`; core encodes keys and ordered paste chunks. |
 | `terminal_resize` | `terminal_id,cols,rows`; positive bounded grid, coalesce pending resize. |
 | `terminal_kill` | `terminal_id`; explicit session kill. |
+| `push_register` | `platform:android|ios,send_token,key_seed_base64`; keep this host's push key and call `device.push.register` (K-17, [push.md](push.md)). Needs `device:write`. |
 
 `AttachmentInput` (new local type) is `{local_id,name,mime,byte_size,
 bytes_base64}`. Platform reads picker data before the event; the core never
@@ -279,6 +281,7 @@ Fields marked `?` mean nullable, not unspecified data.
 | `workspaces` | `{items:[Workspace],loading,stale,error:Error?,history:{query,items:[ThreadSummary],next_cursor:string?,loading,error:Error?}}` |
 | `thread:<id>` | `{thread:ThreadSummary,rows:[Row],page:{has_older,cursor:string?,loading},turn:Turn?,approval:Approval?,usage:Usage?,stale,error:Error?}` |
 | `composer:<thread>` | `{draft:{revision,text,attachments:[Attachment],persisted},selection:{provider,model,effort,access,speed},catalogs:{models:[Choice],efforts:[Choice],access:[Choice],speeds:[Choice],slash:[Choice]},mentions:[{path,label}],provider_ready,can_send,can_stop,send_operation:Operation?,followup:Followup?,shell_confirmation:{id,command,cwd}?,error:Error?}` |
+| `attention` | `{items:[AttentionItem],count,loading}`; K-17 per-thread attention, newest first ([push.md](push.md)). |
 | `terminal:<id>` | `{terminal_id,workspace_id,label,session_status,attached,cols,rows,next_offset:string?,grid_revision,stale,error:Error?}`; grid cells come from the independent VT snapshot below. |
 
 Supporting shapes:
@@ -288,7 +291,8 @@ Supporting shapes:
   trust_proposal:{id,origin,spki_sha256,runtime_id?}?,update_required,error?}`.
 - `Workspace`: `{workspace_id,label,path,open,panes:[Pane],threads:[ThreadSummary]}`.
 - `Pane`: `{id,workspace_id,kind:chat|terminal|browser,title,thread_id?,
-  terminal_id?,status,attention,started_at_ms?,can_stop}`. Browser is a
+  terminal_id?,status,attention,attention_kind?,started_at_ms?,can_stop}`.
+  `attention_kind` is `unread|needs_approval|blocked|failed` (K-17). Browser is a
   placeholder only. Never synthesize a working terminal from a missing session.
 - `ThreadSummary`: `{workspace_id,thread_id,title,provider,model?,cwd?,open,
   archived,last_activity_at_ms?,status,history_bucket}`. Normalize the existing
@@ -481,6 +485,15 @@ That event is distinct from a user intent and routes the raw reply through
 Use `session.create/resize/write/kill` only. A-02 deliberately leaves desktop
 `terminal.*` unmapped for paired devices. K-12 implementation details and
 bounds are in [terminal.md](terminal.md).
+
+## 10a. Push and attention (K-17)
+
+`vc_status vc_push_open(const unsigned char *json, size_t len, vc_buf *out)`
+is a pure function that needs no host handle, for notification extensions. It
+takes the envelope plus the stored push records and returns a
+`PushNotification`. Any decrypt failure returns a generic model, never an
+error status. Registration, the attention state machine and the record
+formats are in [push.md](push.md).
 
 ## 11. Errors and recovery
 

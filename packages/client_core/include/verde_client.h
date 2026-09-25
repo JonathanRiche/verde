@@ -39,6 +39,14 @@ vc_status vc_host_handle(vc_host *host, const unsigned char *json, size_t len, v
  * See docs/rendering.md for byte offsets, budgets, and query-envelope errors. */
 vc_status vc_host_query(vc_host *host, const unsigned char *selector, size_t len, vc_buf *out);
 void vc_buf_free(vc_buf buf);
+/* Pure push decrypt (K-17): no host, clock or entropy; safe in a notification
+ * extension. Input is JSON {api_version:1, envelope, keys:[{host_id,
+ * record_base64}], recent?:[dedupe_key]} where record_base64 is the stored
+ * value of vc/1/<host_id>/push. Output is a PushNotification JSON model;
+ * every envelope, key or payload failure still returns 0 with the generic
+ * "A Verde chat needs attention" model (update_required on a newer envelope
+ * version). Nonzero status means a malformed request. Free with vc_buf_free. */
+vc_status vc_push_open(const unsigned char *json, size_t len, vc_buf *out);
 /* Independent serialized VT handle; free never kills the remote session.
  * Snapshot drains device replies only after successful output allocation.
  * Positive scroll deltas move toward older history. */

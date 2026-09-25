@@ -111,6 +111,10 @@ fn key(tx: *h.Transaction, t: *const Thread) E![]const u8 {
     std.crypto.hash.sha2.Sha256.hash(try h.encode(tx.allocator(), .{ t.workspace_id, t.id }), &digest, .{});
     return std.fmt.allocPrint(tx.allocator(), "vc/1/{s}/chat/{s}", .{ tx.state.config.host_id, std.fmt.bytesToHex(digest, .lower) });
 }
+/// K-17: sign-out and the chat index derive record keys the same way.
+pub fn recordKey(tx: *h.Transaction, t: *const Thread) E![]const u8 {
+    return key(tx, t);
+}
 fn ensure(tx: *h.Transaction, ws: []const u8, id: []const u8) E!?usize {
     if (ws.len == 0 or id.len == 0) return null;
     for (tx.state.chat.threads, 0..) |t, i| if (eq(t.workspace_id, ws) and eq(t.id, id)) return i;

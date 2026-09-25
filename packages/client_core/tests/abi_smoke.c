@@ -4,6 +4,13 @@
 #include <stdio.h>
 #include <string.h>
 
+static int contains(vc_buf buf, const char *needle) {
+    size_t n = strlen(needle);
+    for (size_t i = 0; buf.ptr && i + n <= buf.len; i++)
+        if (memcmp(buf.ptr + i, needle, n) == 0) return 1;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "usage: abi_smoke <expected-version>\n");
@@ -50,5 +57,12 @@ int main(int argc, char **argv) {
     vc_term_free(NULL);
     term = (vc_term *)1;
     if (vc_term_new(NULL, 1, &term) != 1 || term) return 16;
+    /* No key: the pure push opener still returns the generic model. */
+    const unsigned char push[] = "{\"api_version\":1,\"envelope\":\"AQ\",\"keys\":[]}";
+    vc_buf notice = {0};
+    if (vc_push_open(push, sizeof(push)-1, &notice) || !notice.len) return 17;
+    if (!contains(notice, "A Verde chat needs attention")) return 18;
+    vc_buf_free(notice);
+    if (vc_push_open(NULL, 1, &notice) != 1 || notice.ptr) return 19;
     return 0;
 }

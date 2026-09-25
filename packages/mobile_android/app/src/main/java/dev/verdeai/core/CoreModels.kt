@@ -903,6 +903,30 @@ data class EventTerminalResize(
 ) : Event()
 
 @Serializable
+@SerialName("push_register")
+data class EventPushRegister(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `platform`: String,
+    val `send_token`: String,
+    val `key_seed_base64`: String,
+) : Event()
+
+@Serializable
+@SerialName("push_received")
+data class EventPushReceived(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `workspace_id`: String,
+    val `thread_id`: String,
+    val `turn_id`: String,
+    val `kind`: String,
+) : Event()
+
+@Serializable
 enum class EventTerminalInputInputKind {
     `text`,
     `key`,
@@ -1281,6 +1305,7 @@ data class Pane(
     val `attention`: Boolean = false,
     val `started_at_ms`: Long? = null,
     val `can_stop`: Boolean = false,
+    val `attention_kind`: String? = null,
 )
 
 @Serializable
@@ -1306,4 +1331,83 @@ data class Workspace(
     val `open`: Boolean,
     val `panes`: List<Pane>,
     val `threads`: List<ThreadSummary>,
+)
+
+@Serializable
+data class PushOpenKey(
+    val `host_id`: String,
+    val `record_base64`: String,
+)
+
+@Serializable
+data class PushOpenRequest(
+    val `api_version`: Long,
+    val `envelope`: String,
+    val `keys`: List<PushOpenKey>,
+    val `recent`: List<String>? = null,
+)
+
+@Serializable
+data class PushNotification(
+    val `api_version`: Long,
+    val `opened`: Boolean,
+    val `update_required`: Boolean,
+    val `error`: String?,
+    val `host_id`: String?,
+    val `workspace_id`: String?,
+    val `thread_id`: String?,
+    val `turn_id`: String?,
+    val `kind`: String,
+    val `attention`: String?,
+    val `channel`: String,
+    val `title`: String,
+    val `body`: String,
+    val `deep_link`: String,
+    val `actions`: List<String>,
+    val `dedupe_key`: String?,
+    val `duplicate`: Boolean,
+)
+
+@Serializable
+enum class AttentionKind {
+    `unread`,
+    `needs_approval`,
+    `blocked`,
+    `failed`,
+}
+
+@Serializable
+enum class AttentionStatus {
+    `idle`,
+    `working`,
+    `done`,
+    `waiting`,
+    `error`,
+}
+
+@Serializable
+data class AttentionItem(
+    val `workspace_id`: String,
+    val `thread_id`: String,
+    val `turn_id`: String?,
+    val `kind`: AttentionKind,
+    val `status`: AttentionStatus,
+    val `since_ms`: Long,
+    val `title`: String,
+    val `deep_link`: String,
+)
+
+@Serializable
+data class AttentionView(
+    val `items`: List<AttentionItem>,
+    val `count`: Long,
+    val `loading`: Boolean,
+)
+
+@Serializable
+data class AttentionQuery(
+    val `api_version`: Long,
+    val `revision`: String,
+    val `data`: AttentionView?,
+    val `error`: LocalError?,
 )

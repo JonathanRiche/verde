@@ -5,6 +5,8 @@ const chat = @import("chat_models.zig");
 const projection = @import("projection.zig");
 const terminal = @import("terminal.zig");
 const pump = @import("terminal_pump.zig");
+const push = @import("push.zig");
+const attention = @import("attention.zig");
 pub const types = .{
     .{ "TerminalConfig", terminal.Config },
     .{ "TerminalCursorShape", terminal.CursorShape },
@@ -71,4 +73,12 @@ pub const types = .{
     .{ "Pane", projection.Pane },
     .{ "ThreadSummary", projection.ThreadSummary },
     .{ "Workspace", projection.Workspace },
+    .{ "PushOpenKey", push.OpenKey },
+    .{ "PushOpenRequest", push.OpenRequest },
+    .{ "PushNotification", push.Notification },
+    .{ "AttentionKind", attention.Kind },
+    .{ "AttentionStatus", attention.Status },
+    .{ "AttentionItem", attention.Item },
+    .{ "AttentionView", attention.View },
+    .{ "AttentionQuery", wire.Query(attention.View) },
 };

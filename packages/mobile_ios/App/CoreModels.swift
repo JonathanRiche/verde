@@ -1483,6 +1483,8 @@ enum Event: Codable {
     case `terminal_detach`(EventTerminalDetach)
     case `terminal_kill`(EventTerminalKill)
     case `terminal_resize`(EventTerminalResize)
+    case `push_register`(EventPushRegister)
+    case `push_received`(EventPushReceived)
     case `terminal_input`(EventTerminalInput)
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: ModelDiscriminator.self)
@@ -1532,6 +1534,8 @@ enum Event: Codable {
         case "terminal_detach": self = .`terminal_detach`(try EventTerminalDetach(from: decoder))
         case "terminal_kill": self = .`terminal_kill`(try EventTerminalKill(from: decoder))
         case "terminal_resize": self = .`terminal_resize`(try EventTerminalResize(from: decoder))
+        case "push_register": self = .`push_register`(try EventPushRegister(from: decoder))
+        case "push_received": self = .`push_received`(try EventPushReceived(from: decoder))
         case "terminal_input": self = .`terminal_input`(try EventTerminalInput(from: decoder))
         default: throw DecodingError.dataCorruptedError(forKey: .type, in: c, debugDescription: "Unknown model tag")
         }
@@ -1582,6 +1586,8 @@ enum Event: Codable {
         case .`terminal_detach`(let value): try value.encode(to: encoder)
         case .`terminal_kill`(let value): try value.encode(to: encoder)
         case .`terminal_resize`(let value): try value.encode(to: encoder)
+        case .`push_register`(let value): try value.encode(to: encoder)
+        case .`push_received`(let value): try value.encode(to: encoder)
         case .`terminal_input`(let value): try value.encode(to: encoder)
         }
     }
@@ -3513,6 +3519,98 @@ extension EventTerminalResize {
     }
 }
 
+struct EventPushRegister: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `platform`: String
+    var `send_token`: String
+    var `key_seed_base64`: String
+}
+
+extension EventPushRegister {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `platform`
+        case `send_token`
+        case `key_seed_base64`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`platform` = try c.decode(String.self, forKey: .`platform`)
+        self.`send_token` = try c.decode(String.self, forKey: .`send_token`)
+        self.`key_seed_base64` = try c.decode(String.self, forKey: .`key_seed_base64`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`platform`, forKey: .`platform`)
+        try c.encode(self.`send_token`, forKey: .`send_token`)
+        try c.encode(self.`key_seed_base64`, forKey: .`key_seed_base64`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("push_register", forKey: .type)
+    }
+}
+
+struct EventPushReceived: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `workspace_id`: String
+    var `thread_id`: String
+    var `turn_id`: String
+    var `kind`: String
+}
+
+extension EventPushReceived {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `workspace_id`
+        case `thread_id`
+        case `turn_id`
+        case `kind`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        self.`thread_id` = try c.decode(String.self, forKey: .`thread_id`)
+        self.`turn_id` = try c.decode(String.self, forKey: .`turn_id`)
+        self.`kind` = try c.decode(String.self, forKey: .`kind`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`thread_id`, forKey: .`thread_id`)
+        try c.encode(self.`turn_id`, forKey: .`turn_id`)
+        try c.encode(self.`kind`, forKey: .`kind`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("push_received", forKey: .type)
+    }
+}
+
 enum EventTerminalInputInputKind: String, Codable {
     case `text`
     case `key`
@@ -4933,6 +5031,7 @@ struct Pane: Codable {
     var `attention`: Bool = false
     var `started_at_ms`: Int64? = nil
     var `can_stop`: Bool = false
+    var `attention_kind`: String? = nil
 }
 
 extension Pane {
@@ -4947,6 +5046,7 @@ extension Pane {
         case `attention`
         case `started_at_ms`
         case `can_stop`
+        case `attention_kind`
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -4972,6 +5072,9 @@ extension Pane {
         if !c.contains(.`can_stop`) { self.`can_stop` = false } else {
         self.`can_stop` = try c.decode(Bool.self, forKey: .`can_stop`)
         }
+        if !c.contains(.`attention_kind`) { self.`attention_kind` = nil } else {
+        self.`attention_kind` = try c.decodeIfPresent(String.self, forKey: .`attention_kind`)
+        }
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -4985,6 +5088,7 @@ extension Pane {
         try c.encode(self.`attention`, forKey: .`attention`)
         try c.encode(self.`started_at_ms`, forKey: .`started_at_ms`)
         try c.encode(self.`can_stop`, forKey: .`can_stop`)
+        try c.encode(self.`attention_kind`, forKey: .`attention_kind`)
     }
 }
 
@@ -5081,5 +5185,258 @@ extension Workspace {
         try c.encode(self.`open`, forKey: .`open`)
         try c.encode(self.`panes`, forKey: .`panes`)
         try c.encode(self.`threads`, forKey: .`threads`)
+    }
+}
+
+struct PushOpenKey: Codable {
+    var `host_id`: String
+    var `record_base64`: String
+}
+
+extension PushOpenKey {
+    private enum CodingKeys: String, CodingKey {
+        case `host_id`
+        case `record_base64`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`host_id` = try c.decode(String.self, forKey: .`host_id`)
+        self.`record_base64` = try c.decode(String.self, forKey: .`record_base64`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`host_id`, forKey: .`host_id`)
+        try c.encode(self.`record_base64`, forKey: .`record_base64`)
+    }
+}
+
+struct PushOpenRequest: Codable {
+    var `api_version`: UInt32
+    var `envelope`: String
+    var `keys`: [PushOpenKey]
+    var `recent`: [String]? = nil
+}
+
+extension PushOpenRequest {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `envelope`
+        case `keys`
+        case `recent`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        self.`envelope` = try c.decode(String.self, forKey: .`envelope`)
+        self.`keys` = try c.decode([PushOpenKey].self, forKey: .`keys`)
+        if !c.contains(.`recent`) { self.`recent` = nil } else {
+        self.`recent` = try c.decodeIfPresent([String].self, forKey: .`recent`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`envelope`, forKey: .`envelope`)
+        try c.encode(self.`keys`, forKey: .`keys`)
+        try c.encode(self.`recent`, forKey: .`recent`)
+    }
+}
+
+struct PushNotification: Codable {
+    var `api_version`: UInt32
+    var `opened`: Bool
+    var `update_required`: Bool
+    var `error`: String?
+    var `host_id`: String?
+    var `workspace_id`: String?
+    var `thread_id`: String?
+    var `turn_id`: String?
+    var `kind`: String
+    var `attention`: String?
+    var `channel`: String
+    var `title`: String
+    var `body`: String
+    var `deep_link`: String
+    var `actions`: [String]
+    var `dedupe_key`: String?
+    var `duplicate`: Bool
+}
+
+extension PushNotification {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `opened`
+        case `update_required`
+        case `error`
+        case `host_id`
+        case `workspace_id`
+        case `thread_id`
+        case `turn_id`
+        case `kind`
+        case `attention`
+        case `channel`
+        case `title`
+        case `body`
+        case `deep_link`
+        case `actions`
+        case `dedupe_key`
+        case `duplicate`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        self.`opened` = try c.decode(Bool.self, forKey: .`opened`)
+        self.`update_required` = try c.decode(Bool.self, forKey: .`update_required`)
+        self.`error` = try c.decodeIfPresent(String.self, forKey: .`error`)
+        self.`host_id` = try c.decodeIfPresent(String.self, forKey: .`host_id`)
+        self.`workspace_id` = try c.decodeIfPresent(String.self, forKey: .`workspace_id`)
+        self.`thread_id` = try c.decodeIfPresent(String.self, forKey: .`thread_id`)
+        self.`turn_id` = try c.decodeIfPresent(String.self, forKey: .`turn_id`)
+        self.`kind` = try c.decode(String.self, forKey: .`kind`)
+        self.`attention` = try c.decodeIfPresent(String.self, forKey: .`attention`)
+        self.`channel` = try c.decode(String.self, forKey: .`channel`)
+        self.`title` = try c.decode(String.self, forKey: .`title`)
+        self.`body` = try c.decode(String.self, forKey: .`body`)
+        self.`deep_link` = try c.decode(String.self, forKey: .`deep_link`)
+        self.`actions` = try c.decode([String].self, forKey: .`actions`)
+        self.`dedupe_key` = try c.decodeIfPresent(String.self, forKey: .`dedupe_key`)
+        self.`duplicate` = try c.decode(Bool.self, forKey: .`duplicate`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`opened`, forKey: .`opened`)
+        try c.encode(self.`update_required`, forKey: .`update_required`)
+        try c.encode(self.`error`, forKey: .`error`)
+        try c.encode(self.`host_id`, forKey: .`host_id`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`thread_id`, forKey: .`thread_id`)
+        try c.encode(self.`turn_id`, forKey: .`turn_id`)
+        try c.encode(self.`kind`, forKey: .`kind`)
+        try c.encode(self.`attention`, forKey: .`attention`)
+        try c.encode(self.`channel`, forKey: .`channel`)
+        try c.encode(self.`title`, forKey: .`title`)
+        try c.encode(self.`body`, forKey: .`body`)
+        try c.encode(self.`deep_link`, forKey: .`deep_link`)
+        try c.encode(self.`actions`, forKey: .`actions`)
+        try c.encode(self.`dedupe_key`, forKey: .`dedupe_key`)
+        try c.encode(self.`duplicate`, forKey: .`duplicate`)
+    }
+}
+
+enum AttentionKind: String, Codable {
+    case `unread`
+    case `needs_approval`
+    case `blocked`
+    case `failed`
+}
+
+enum AttentionStatus: String, Codable {
+    case `idle`
+    case `working`
+    case `done`
+    case `waiting`
+    case `error`
+}
+
+struct AttentionItem: Codable {
+    var `workspace_id`: String
+    var `thread_id`: String
+    var `turn_id`: String?
+    var `kind`: AttentionKind
+    var `status`: AttentionStatus
+    var `since_ms`: Int64
+    var `title`: String
+    var `deep_link`: String
+}
+
+extension AttentionItem {
+    private enum CodingKeys: String, CodingKey {
+        case `workspace_id`
+        case `thread_id`
+        case `turn_id`
+        case `kind`
+        case `status`
+        case `since_ms`
+        case `title`
+        case `deep_link`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        self.`thread_id` = try c.decode(String.self, forKey: .`thread_id`)
+        self.`turn_id` = try c.decodeIfPresent(String.self, forKey: .`turn_id`)
+        self.`kind` = try c.decode(AttentionKind.self, forKey: .`kind`)
+        self.`status` = try c.decode(AttentionStatus.self, forKey: .`status`)
+        self.`since_ms` = try c.decode(Int64.self, forKey: .`since_ms`)
+        self.`title` = try c.decode(String.self, forKey: .`title`)
+        self.`deep_link` = try c.decode(String.self, forKey: .`deep_link`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`thread_id`, forKey: .`thread_id`)
+        try c.encode(self.`turn_id`, forKey: .`turn_id`)
+        try c.encode(self.`kind`, forKey: .`kind`)
+        try c.encode(self.`status`, forKey: .`status`)
+        try c.encode(self.`since_ms`, forKey: .`since_ms`)
+        try c.encode(self.`title`, forKey: .`title`)
+        try c.encode(self.`deep_link`, forKey: .`deep_link`)
+    }
+}
+
+struct AttentionView: Codable {
+    var `items`: [AttentionItem]
+    var `count`: UInt32
+    var `loading`: Bool
+}
+
+extension AttentionView {
+    private enum CodingKeys: String, CodingKey {
+        case `items`
+        case `count`
+        case `loading`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`items` = try c.decode([AttentionItem].self, forKey: .`items`)
+        self.`count` = try c.decode(UInt32.self, forKey: .`count`)
+        self.`loading` = try c.decode(Bool.self, forKey: .`loading`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`items`, forKey: .`items`)
+        try c.encode(self.`count`, forKey: .`count`)
+        try c.encode(self.`loading`, forKey: .`loading`)
+    }
+}
+
+struct AttentionQuery: Codable {
+    var `api_version`: UInt32
+    var `revision`: String
+    var `data`: AttentionView?
+    var `error`: LocalError?
+}
+
+extension AttentionQuery {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `revision`
+        case `data`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        self.`revision` = try c.decode(String.self, forKey: .`revision`)
+        self.`data` = try c.decodeIfPresent(AttentionView.self, forKey: .`data`)
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`revision`, forKey: .`revision`)
+        try c.encode(self.`data`, forKey: .`data`)
+        try c.encode(self.`error`, forKey: .`error`)
     }
 }

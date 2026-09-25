@@ -331,6 +331,22 @@ fn revokeResponse(f: *Fixture, effect: V) !V {
     try expect(h.eq(get(get(request, "target"), "runtime_id").string, runtime_id));
     return f.response(effect, 200, .{ .jsonrpc = "2.0", .id = get(request, "id").integer, .result = .{ .access_protocol_version = 1, .revoked = true, .device_id = device_id } });
 }
+/// K-17: after the sync checkpoint, attention and push records go, then the
+/// chat index is read and deleted (no chat records exist in these tests).
+fn finishK17Records(f: *Fixture, sync_delete: V) !void {
+    const attention = try find(try f.done(sync_delete), "secure_store_delete");
+    try expect(std.mem.endsWith(u8, get(attention, "key").string, "/attention"));
+    const push = try find(try f.done(attention), "secure_store_delete");
+    try expect(std.mem.endsWith(u8, get(push, "key").string, "/push"));
+    const index_read = try find(try f.done(push), "secure_store_get");
+    try expect(std.mem.endsWith(u8, get(index_read, "key").string, "/chat_index"));
+    try expect(h.eq(f.host.state.auth_state, "signing_out"));
+    const batch = try f.event("secure_store_value", .{ .effect_id = get(index_read, "effect_id").string, .generation = get(index_read, "generation").string, .key = get(index_read, "key").string, .value_base64 = @as(?u8, null), .@"error" = @as(?u8, null) });
+    const index_delete = try find(batch, "secure_store_delete");
+    try expect(std.mem.endsWith(u8, get(index_delete, "key").string, "/chat_index"));
+    try expect(h.eq(f.host.state.auth_state, "signing_out"));
+    _ = try f.done(index_delete);
+}
 fn finishRemoval(f: *Fixture, first: V) !void {
     try expect(h.eq(f.host.state.auth_state, "signing_out"));
     try expect(f.host.state.auth.token == null and f.host.state.rpc.bearer == null);
@@ -339,7 +355,7 @@ fn finishRemoval(f: *Fixture, first: V) !void {
     const third = try find(try f.done(second), "secure_store_delete");
     try expect(std.mem.endsWith(u8, get(third, "key").string, "/sync"));
     try expect(h.eq(f.host.state.auth_state, "signing_out"));
-    _ = try f.done(third);
+    try finishK17Records(f, third);
     try expect(h.eq(f.host.state.auth_state, "signed_out"));
     try expect(f.host.state.auth.pin == null and f.host.state.auth.credential == null);
     try expect(f.host.state.config.https_url == null);
@@ -401,7 +417,7 @@ test "sign out delete failure retries failed record and ignores duplicate acknow
     try expect(h.eq(f.host.state.auth_state, "signing_out"));
     const sync_record = try find(try f.done(retried), "secure_store_delete");
     try expect(h.eq(f.host.state.auth_state, "signing_out"));
-    _ = try f.done(sync_record);
+    try finishK17Records(&f, sync_record);
     try expect(h.eq(f.host.state.auth_state, "signed_out"));
 }
 test "sign out rejects another host and duplicate intent cannot repeat revoke" {
