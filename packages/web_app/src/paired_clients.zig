@@ -28,7 +28,9 @@ pub const Manager = struct {
         const method = root.get("method").?.string;
         if (std.mem.eql(u8, method, "device.push.register") or
             std.mem.eql(u8, method, "device.push.unregister") or
-            std.mem.eql(u8, method, "device.push.test"))
+            std.mem.eql(u8, method, "device.push.test") or
+            std.mem.eql(u8, method, access.METHOD_DEVICE_SELF_GET) or
+            std.mem.eql(u8, method, access.METHOD_DEVICE_SELF_REVOKE))
         {
             // The private daemon trusts only the gateway's authenticated device
             // identity. Never allow a paired caller to select another phone.
@@ -369,7 +371,7 @@ test "push RPC forwarding binds every operation to the authenticated device" {
     var manager: Manager = .{};
     var daemon: FakeDaemon = .{};
     const claims: auth.PairClaims = .{ .device_id = @splat('a'), .scope_mask = access.scopeBit(.device_write), .deadline_ms = auth.nowMillis(std.testing.io) + 60000 };
-    for ([_][]const u8{ "device.push.register", "device.push.unregister", "device.push.test" }) |method| {
+    for ([_][]const u8{ "device.push.register", "device.push.unregister", "device.push.test", access.METHOD_DEVICE_SELF_GET, access.METHOD_DEVICE_SELF_REVOKE }) |method| {
         const raw = try std.json.Stringify.valueAlloc(a, .{ .id = 1, .method = method, .params = .{ .device_id = "forged-other-phone", .platform = "android", .send_token = "fixture", .public_key = "fixture" } }, .{});
         defer a.free(raw);
         const forwarded = try manager.forward(a, std.testing.io, claims, raw, &daemon);

@@ -218,6 +218,8 @@ const AccessRequest = union(enum) {
     pairing_create: access_protocol.PairingGrantCreateRequest,
     pairing_list: access_protocol.PairingGrantListRequest,
     pairing_revoke: access_protocol.PairingGrantRevokeRequest,
+    device_self_get: access_protocol.DeviceSelfRequest,
+    device_self_revoke: access_protocol.DeviceRevokeRequest,
     device_list: access_protocol.DeviceListRequest,
     device_revoke: access_protocol.DeviceRevokeRequest,
     pairing_exchange: access_protocol.PairingGrantExchangeRequest,
@@ -3368,8 +3370,8 @@ pub const Daemon = struct {
     }
 
     /// Access storage stays behind the private session-daemon endpoint. Local
-    /// administrators and the loopback gateway use distinct methods; none can
-    /// be forwarded by the gateway's generic RPC surfaces.
+    /// administrators and the loopback gateway use private bridge methods.
+    /// Public device aliases are restricted or identity-bound by the gateway.
     fn handleAccessRequest(
         self: *Daemon,
         id_value: std.json.Value,
@@ -3495,6 +3497,20 @@ pub const Daemon = struct {
                 };
                 break :response try okValueResponse(self.allocator, id_value, result);
             },
+            .device_self_get => |self_request| response: {
+                _ = access_store.authorizeDevice(service.store.conn, self_request.device_id, &.{"device:read"}) catch |err|
+                    return try accessAdminErrorResponse(self.allocator, id_value, err);
+                var device = access_store.getDevice(self.allocator, service.store.conn, self_request.device_id) catch |err|
+                    return try accessAdminErrorResponse(self.allocator, id_value, err);
+                defer device.deinit(self.allocator);
+                break :response try okValueResponse(self.allocator, id_value, access_protocol.DeviceSelfResult{
+                    .device_id = device.device_id,
+                    .label = device.label,
+                    .scopes = try access_protocol.scopeNamesAlloc(arena, device.scope_mask),
+                    .created_at_ms = device.created_at_ms,
+                    .last_used_at_ms = device.last_used_at_ms,
+                });
+            },
             .device_list => response: {
                 var devices = access_store.listDevices(
                     self.allocator,
@@ -3525,7 +3541,11 @@ pub const Daemon = struct {
                 };
                 break :response try okValueResponse(self.allocator, id_value, result);
             },
-            .device_revoke => |revoke_request| response: {
+            .device_revoke, .device_self_revoke => |revoke_request| response: {
+                if (request == .device_self_revoke) {
+                    _ = access_store.authorizeDevice(service.store.conn, revoke_request.device_id, &.{"device:read"}) catch |err|
+                        return try accessAdminErrorResponse(self.allocator, id_value, err);
+                }
                 const revoked = access_store.revokeDevice(
                     service.store.conn,
                     revoke_request.device_id,
@@ -12218,6 +12238,19 @@ fn decodeAccessRequest(
     method: []const u8,
     params: std.json.Value,
 ) !AccessRequest {
+    if (std.mem.eql(u8, method, access_protocol.METHOD_DEVICE_SELF_GET) or
+        std.mem.eql(u8, method, access_protocol.METHOD_DEVICE_SELF_REVOKE) or
+        std.mem.eql(u8, method, access_protocol.METHOD_DEVICE_REVOKE))
+    {
+        const request = try std.json.parseFromValueLeaky(access_protocol.DeviceSelfRequest, allocator, params, .{});
+        if (std.mem.eql(u8, method, access_protocol.METHOD_DEVICE_SELF_GET)) return .{ .device_self_get = request };
+        const revoke: access_protocol.DeviceRevokeRequest = .{ .access_protocol_version = request.access_protocol_version, .device_id = request.device_id };
+        return if (std.mem.eql(u8, method, access_protocol.METHOD_DEVICE_SELF_REVOKE)) .{ .device_self_revoke = revoke } else .{ .device_revoke = revoke };
+    }
+    if (std.mem.eql(u8, method, access_protocol.METHOD_DEVICE_LIST)) {
+        const request = try std.json.parseFromValueLeaky(struct { access_protocol_version: u32 = access_protocol.ACCESS_PROTOCOL_VERSION }, allocator, params, .{});
+        return .{ .device_list = .{ .access_protocol_version = request.access_protocol_version } };
+    }
     if (std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_GRANT_CREATE)) {
         return .{ .pairing_create = try std.json.parseFromValueLeaky(
             access_protocol.PairingGrantCreateRequest,
@@ -12671,7 +12704,11 @@ fn pushErrorResponse(allocator: std.mem.Allocator, id: std.json.Value, err: anye
 }
 
 fn isAccessMethod(method: []const u8) bool {
-    return std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_GRANT_CREATE) or
+    return std.mem.eql(u8, method, access_protocol.METHOD_DEVICE_SELF_GET) or
+        std.mem.eql(u8, method, access_protocol.METHOD_DEVICE_SELF_REVOKE) or
+        std.mem.eql(u8, method, access_protocol.METHOD_DEVICE_LIST) or
+        std.mem.eql(u8, method, access_protocol.METHOD_DEVICE_REVOKE) or
+        std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_GRANT_CREATE) or
         std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_GRANT_LIST) or
         std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_GRANT_REVOKE) or
         std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_DEVICE_LIST) or
@@ -22157,4 +22194,75 @@ test "push RPC registration validates keys and test fails typed when relay unset
     const response = try daemon.handleRequest(invalid);
     defer a.free(response);
     try std.testing.expect(std.mem.indexOf(u8, response, "invalid_public_key") != null);
+}
+
+test "device self service returns metadata and revokes credentials push registration and outbox" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testStoreDbPath(&tmp);
+    defer a.free(path);
+    var daemon = Daemon.init(a);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, path);
+    defer detachTestStoreService(&daemon);
+    const conn = daemon.store_service.?.store.conn;
+    var grant = try access_store.createPairingGrant(std.testing.io, conn, .{
+        .access_protocol_version = 1,
+        .scopes = &.{ "device:read", "device:write" },
+    }, 1000);
+    defer grant.clear();
+    var device = try access_store.exchangePairingGrant(std.testing.io, conn, .{
+        .access_protocol_version = 1,
+        .grant_id = &grant.grant_id,
+        .pairing_token = .{ .bytes = &grant.pairing_token },
+        .device_label = "Self fixture",
+    }, 2000);
+    defer device.clear();
+    _ = try access_store.authenticateDevice(conn, &device.device_id, &device.device_credential, &.{"device:read"}, 3000);
+    const key = headless.push_seal.generateKeyPair(std.testing.io);
+    var key_buffer: [43]u8 = undefined;
+    try push.register(conn, a, std.testing.io, &device.device_id, "android", "fixture-token", std.base64.url_safe_no_pad.Encoder.encode(&key_buffer, &key.public_key));
+    _ = try push.enqueue(conn, a, std.testing.io, &device.device_id, "self-fixture", .{
+        .runtime_id = daemon.runtime_id,
+        .kind = "done",
+        .title = "Fixture",
+    }, 4000);
+
+    for ([_][]const u8{ "device.self.get", "device.list", "device.self.revoke", "device.self.get" }, 0..) |method, index| {
+        const raw = if (index == 1)
+            try std.json.Stringify.valueAlloc(a, .{ .id = 1, .method = method, .params = struct {}{} }, .{})
+        else
+            try std.json.Stringify.valueAlloc(a, .{ .id = 1, .method = method, .params = .{ .device_id = &device.device_id } }, .{});
+        defer a.free(raw);
+        try std.testing.expect(methodRunsUnlocked(method));
+        const response = try daemon.handleRequest(raw);
+        defer a.free(response);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, response, .{});
+        defer parsed.deinit();
+        if (index == 3) {
+            try std.testing.expectEqualStrings("authentication_rejected", parsed.value.object.get("error").?.object.get("code").?.string);
+        } else {
+            try std.testing.expect(!parsed.value.object.contains("error"));
+            const result = parsed.value.object.get("result").?;
+            if (index == 0) {
+                try std.testing.expectEqualStrings("Self fixture", result.object.get("label").?.string);
+                try std.testing.expectEqual(@as(i64, 2000), result.object.get("created_at_ms").?.integer);
+                try std.testing.expectEqual(@as(i64, 3000), result.object.get("last_used_at_ms").?.integer);
+                try std.testing.expectEqual(@as(usize, 2), result.object.get("scopes").?.array.items.len);
+                try std.testing.expect(!result.object.contains("credential_verifier"));
+            } else if (index == 1) {
+                try std.testing.expectEqual(@as(usize, 1), result.object.get("devices").?.array.items.len);
+            } else try std.testing.expect(result.object.get("revoked").?.bool);
+        }
+    }
+    try std.testing.expectError(error.DeviceAuthenticationRejected, access_store.authenticateDevice(conn, &device.device_id, &device.device_credential, &.{"device:read"}, nowMs()));
+    var row = (try conn.row("select (select count(*) from device_push_registrations) + (select count(*) from device_push_outbox)", .{})).?;
+    defer row.deinit();
+    try std.testing.expectEqual(@as(i64, 0), row.int(0));
+    const revoke = try std.json.Stringify.valueAlloc(a, .{ .id = 1, .method = "device.revoke", .params = .{ .device_id = &device.device_id } }, .{});
+    defer a.free(revoke);
+    const response = try daemon.handleRequest(revoke);
+    defer a.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"revoked\":false") != null);
 }

@@ -42,6 +42,11 @@ pub const MAX_PAIR_EXCHANGE_BODY_BYTES: usize = 4 * 1024;
 pub const METHOD_DAEMON_PAIRING_GRANT_CREATE: []const u8 = "daemon.access.pairing.create";
 pub const METHOD_DAEMON_PAIRING_GRANT_LIST: []const u8 = "daemon.access.pairing.list";
 pub const METHOD_DAEMON_PAIRING_GRANT_REVOKE: []const u8 = "daemon.access.pairing.revoke";
+pub const METHOD_DEVICE_SELF_GET: []const u8 = "device.self.get";
+pub const METHOD_DEVICE_SELF_REVOKE: []const u8 = "device.self.revoke";
+pub const METHOD_DEVICE_LIST: []const u8 = "device.list";
+pub const METHOD_DEVICE_REVOKE: []const u8 = "device.revoke";
+
 pub const METHOD_DAEMON_DEVICE_LIST: []const u8 = "daemon.access.device.list";
 pub const METHOD_DAEMON_DEVICE_REVOKE: []const u8 = "daemon.access.device.revoke";
 // Gateway-only bridge RPCs. These remain blocked from generic HTTP and
@@ -326,7 +331,10 @@ pub const PAIRED_RPC_METHODS = [_]PairedRpcMethod{
     .{ .method = "workspace.repository.binding.upsert", .scope_mask = REPOSITORY_WRITE },
     .{ .method = "workspace.repository.binding.remove", .scope_mask = REPOSITORY_WRITE },
 
-    // Push registration is bound to the authenticated device by the gateway.
+    // Self-service and push calls are bound to the authenticated device by the gateway.
+    .{ .method = METHOD_DEVICE_SELF_GET, .scope_mask = scopeBit(.device_read) },
+    // Signing out must remain available to default (non-device:write) grants.
+    .{ .method = METHOD_DEVICE_SELF_REVOKE, .scope_mask = scopeBit(.device_read) },
     .{ .method = "device.push.register", .scope_mask = scopeBit(.device_write) },
     .{ .method = "device.push.unregister", .scope_mask = scopeBit(.device_write) },
     .{ .method = "device.push.test", .scope_mask = scopeBit(.device_write) },
@@ -505,6 +513,20 @@ pub const DeviceRecord = struct {
     created_at_ms: i64,
     last_used_at_ms: ?i64 = null,
     revoked_at_ms: ?i64 = null,
+};
+
+/// Identity is supplied by the gateway, never trusted from paired input.
+pub const DeviceSelfRequest = struct {
+    access_protocol_version: u32 = ACCESS_PROTOCOL_VERSION,
+    device_id: []const u8,
+};
+
+pub const DeviceSelfResult = struct {
+    device_id: []const u8,
+    label: []const u8,
+    scopes: []const []const u8,
+    created_at_ms: i64,
+    last_used_at_ms: ?i64,
 };
 
 pub const DeviceSource = enum { pair, connect };
@@ -847,4 +869,13 @@ test "push RPCs require the opt-in device write scope" {
         try std.testing.expect((try scopeMask(&DEFAULT_SCOPE_NAMES)) & requiredScopeMaskForRpc(method).? == 0);
     }
     try std.testing.expect(requiredScopeMaskForRpc("device.push.unknown") == null);
+}
+
+test "device self service is scoped and administration is owner only" {
+    for ([_][]const u8{ METHOD_DEVICE_SELF_GET, METHOD_DEVICE_SELF_REVOKE }) |method| {
+        try std.testing.expectEqual(scopeBit(.device_read), requiredScopeMaskForRpc(method).?);
+    }
+    for ([_][]const u8{ METHOD_DEVICE_LIST, METHOD_DEVICE_REVOKE }) |method| {
+        try std.testing.expect(requiredScopeMaskForRpc(method) == null);
+    }
 }

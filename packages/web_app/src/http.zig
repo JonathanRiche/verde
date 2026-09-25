@@ -1531,6 +1531,7 @@ fn handleRpc(
         return;
     };
     defer allocator.free(result.json);
+    try clearRevokedDevice(allocator, daemon, auth, parsed.request.method, result.json);
     const forwarded = try forwardedCapabilities(allocator, parsed.request.method, result.json);
     defer allocator.free(forwarded);
     try respondJson(request, .ok, forwarded);
@@ -1928,9 +1929,14 @@ fn serveWebSocket(
                     continue;
                 };
                 defer allocator.free(result.json);
+                try clearRevokedDevice(allocator, daemon, auth, parsed.request.method, result.json);
                 const forwarded = try forwardedCapabilities(allocator, parsed.request.method, result.json);
                 defer allocator.free(forwarded);
                 session.send(forwarded) catch {};
+                if (std.mem.eql(u8, parsed.request.method, headless.access_protocol.METHOD_DEVICE_SELF_REVOKE) and rpcSucceeded(allocator, result.json)) {
+                    session.closeExpired();
+                    break;
+                }
             },
             else => {},
         }
@@ -2231,6 +2237,28 @@ fn pairedRpcPolicy(method: []const u8, scope_mask: u16) PairedRpcPolicy {
 
 fn callPairedRpc(allocator: std.mem.Allocator, daemon: *daemon_mod.Daemon, auth: *auth_mod.Service, claims: auth_mod.PairClaims, raw: []const u8) !daemon_mod.CallResult {
     return .{ .json = try auth.paired_clients.forward(allocator, daemon.io, claims, raw, daemon) };
+}
+
+/// Clear access tokens and tickets immediately after a successful revoke.
+/// Other sockets observe durable revocation before/after their bounded poll.
+fn clearRevokedDevice(allocator: std.mem.Allocator, daemon: anytype, auth: *auth_mod.Service, method: []const u8, raw: []const u8) !void {
+    const access = headless.access_protocol;
+    if (!std.mem.eql(u8, method, access.METHOD_DEVICE_SELF_REVOKE) and
+        !std.mem.eql(u8, method, access.METHOD_DEVICE_REVOKE)) return;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object or parsed.value.object.contains("error")) return;
+    const result = parsed.value.object.get("result") orelse return;
+    if (result != .object) return;
+    const revoked = result.object.get("revoked") orelse return;
+    if (revoked != .bool) return;
+    const device = result.object.get("device_id") orelse return;
+    if (device != .string) return;
+    access.validateDeviceId(device.string) catch return;
+    try auth.pair_credentials.clearDeviceCredentials(daemon.io, device.string);
+    auth.paired_clients.closeDevice(allocator, daemon.io, daemon, device.string) catch |err| {
+        if (err == error.Canceled) return error.Canceled;
+    };
 }
 
 fn authorizeApiContext(
@@ -3883,4 +3911,65 @@ test "gateway alone adds delta capability once and preserves response fields" {
     const forwarded = try forwardedCapabilities(allocator, "core.status", failure);
     defer allocator.free(forwarded);
     try std.testing.expectEqualStrings(failure, forwarded);
+}
+
+test "device management is available to owners and denied to every paired scope" {
+    const access = headless.access_protocol;
+    for ([_][]const u8{ access.METHOD_DEVICE_LIST, access.METHOD_DEVICE_REVOKE }) |method| {
+        try std.testing.expect(!blockedRpcMethod(method));
+        try std.testing.expectEqual(PairedRpcPolicy.forbidden, pairedRpcPolicy(method, 0xffff));
+        // rpcAllowed's owner branches do not borrow the transport or daemon.
+        var session: WsSession = undefined;
+        session.authentication = .{ .owner_session = @splat('a') };
+        try std.testing.expect(session.rpcAllowed(method));
+        session.authentication = .owner_bearer;
+        try std.testing.expect(session.rpcAllowed(method));
+        session.authentication = .{ .pair = .{ .device_id = @splat('b'), .scope_mask = 0xffff, .deadline_ms = 1000 } };
+        try std.testing.expect(!session.rpcAllowed(method));
+    }
+    for ([_][]const u8{ access.METHOD_DEVICE_SELF_GET, access.METHOD_DEVICE_SELF_REVOKE }) |method| {
+        try std.testing.expect(!blockedRpcMethod(method));
+        try std.testing.expectEqual(PairedRpcPolicy{ .authorize = access.scopeBit(.device_read) }, pairedRpcPolicy(method, try access.scopeMask(&access.DEFAULT_SCOPE_NAMES)));
+        try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy(method, access.scopeBit(.device_write)));
+    }
+}
+
+test "successful self and owner revoke invalidate the next token call and ticket only for that device" {
+    const FakeDaemon = struct {
+        io: std.Io = std.testing.io,
+        pub fn callRaw(_: *@This(), _: []const u8) !daemon_mod.CallResult {
+            return .{ .json = try std.testing.allocator.dupe(u8, "{\"result\":{}}") };
+        }
+    };
+    var daemon: FakeDaemon = .{};
+    var auth: auth_mod.Service = .{
+        .token = .{ .digest = @splat(0) },
+        .sessions = try auth_mod.SessionManager.init(.{}),
+        .rate_limiter = try auth_mod.LoginRateLimiter.init(.{}),
+        .pair_rate_limiter = try auth_mod.LoginRateLimiter.init(.{}),
+        .connect_rate_limiter = try auth_mod.LoginRateLimiter.init(.{}),
+        .device_rate_limiter = try auth_mod.LoginRateLimiter.init(.{}),
+        .ticket_rate_limiter = try auth_mod.LoginRateLimiter.init(.{}),
+        .pair_credentials = try auth_mod.PairCredentialManager.init(.{}),
+    };
+    defer auth.deinit();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const device = "a" ** 32;
+    const other = "b" ** 32;
+    for ([_][]const u8{ "device.self.revoke", "device.revoke" }) |method| {
+        var token = try auth.pair_credentials.issueAccessToken(io, device, 1, 1000, 1000);
+        defer token.clear();
+        var other_token = try auth.pair_credentials.issueAccessToken(io, other, 1, 1000, 1000);
+        defer other_token.clear();
+        const claims = (try auth.pair_credentials.validateAccessToken(io, &token.value, 1001)).?;
+        var ticket = try auth.pair_credentials.issueWebSocketTicket(io, claims, 1001, 1001);
+        defer ticket.clear();
+        try clearRevokedDevice(a, &daemon, &auth, method, "{\"error\":{\"code\":\"invalid_params\"}}");
+        try std.testing.expect((try auth.pair_credentials.validateAccessToken(io, &token.value, 1002)) != null);
+        try clearRevokedDevice(a, &daemon, &auth, method, "{\"result\":{\"revoked\":true,\"device_id\":\"" ++ device ++ "\"}}");
+        try std.testing.expect((try auth.pair_credentials.validateAccessToken(io, &token.value, 1002)) == null);
+        try std.testing.expect((try auth.pair_credentials.consumeWebSocketTicket(io, &ticket.value, 1002)) == null);
+        try std.testing.expect((try auth.pair_credentials.validateAccessToken(io, &other_token.value, 1002)) != null);
+    }
 }

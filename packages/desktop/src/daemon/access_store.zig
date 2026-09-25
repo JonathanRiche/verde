@@ -677,6 +677,44 @@ pub fn listPairingGrants(
     return .{ .items = try items.toOwnedSlice(allocator) };
 }
 
+pub const OwnedSelfDevice = struct {
+    device_id: []u8,
+    label: []u8,
+    scope_mask: u16,
+    created_at_ms: i64,
+    last_used_at_ms: ?i64,
+
+    pub fn deinit(self: *OwnedSelfDevice, allocator: std.mem.Allocator) void {
+        allocator.free(self.device_id);
+        allocator.free(self.label);
+        self.* = undefined;
+    }
+};
+
+/// Read one active device without exposing other devices or credential material.
+pub fn getDevice(allocator: std.mem.Allocator, conn: zqlite.Conn, device_id: []const u8) !OwnedSelfDevice {
+    try access.validateDeviceId(device_id);
+    var row = (try conn.row(
+        \\select label, scopes, created_at_ms, last_used_at_ms from (
+        \\ select device_id, label, scopes, created_at_ms, last_used_at_ms, revoked_at_ms from runtime_devices
+        \\ union all
+        \\ select device_id, label, scopes, created_at_ms, last_used_at_ms, revoked_at_ms from runtime_connect_devices
+        \\) where device_id = ?1 and revoked_at_ms is null
+    , .{device_id})) orelse return error.DeviceAuthorizationRejected;
+    defer row.deinit();
+    const owned_id = try allocator.dupe(u8, device_id);
+    errdefer allocator.free(owned_id);
+    const label = try allocator.dupe(u8, row.text(0));
+    errdefer allocator.free(label);
+    return .{
+        .device_id = owned_id,
+        .label = label,
+        .scope_mask = try checkedScopeMask(row.int(1)),
+        .created_at_ms = row.int(2),
+        .last_used_at_ms = row.nullableInt(3),
+    };
+}
+
 /// List only non-secret device metadata for local administration.
 pub fn listDevices(
     allocator: std.mem.Allocator,
