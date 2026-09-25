@@ -44,13 +44,6 @@ const forwarders = [_]Forwarder{
     .{ .file = "terminal_pump.zig", .name = "queue", .method_arg = 2, .forwarded = "action.method" },
 };
 
-/// Methods the gateway authorizes under another allowlist entry. Mirrors
-/// `packages/web_app/src/http.zig`, which checks `core.changes.mode` (K-16's
-/// WebSocket delta opt-in) as `core.changes`.
-const gateway_aliases = [_]struct { method: []const u8, authorized_as: []const u8 }{
-    .{ .method = "core.changes.mode", .authorized_as = "core.changes" },
-};
-
 const rpc_endpoint_files = [_][]const u8{ "rpc.zig", "auth_rpc.zig" };
 
 test "every RPC the core can send has a paired-device allowlist entry" {
@@ -71,7 +64,7 @@ test "every RPC the core can send has a paired-device allowlist entry" {
         failed = true;
     }
     for (audit.methods.items) |method| {
-        if (requiredScope(method) == null) {
+        if (access.requiredScopeMaskForRpc(method) == null) {
             std.debug.print("\nunmapped core RPC: {s}\n", .{method});
             failed = true;
         }
@@ -79,19 +72,10 @@ test "every RPC the core can send has a paired-device allowlist entry" {
     if (failed) return error.UnmappedCoreRpc;
 }
 
-test "gateway aliases stay unmapped and resolve to a mapped method" {
-    for (gateway_aliases) |alias| {
-        try std.testing.expect(access.requiredScopeMaskForRpc(alias.method) == null);
-        try std.testing.expect(access.requiredScopeMaskForRpc(alias.authorized_as) != null);
-    }
-}
-
-fn requiredScope(method: []const u8) ?u16 {
-    if (access.requiredScopeMaskForRpc(method)) |mask| return mask;
-    for (gateway_aliases) |alias| {
-        if (eq(u8, alias.method, method)) return access.requiredScopeMaskForRpc(alias.authorized_as);
-    }
-    return null;
+test "WebSocket delta opt-in is mapped directly under the core.changes scope" {
+    // K-16 sends `core.changes.mode` on the feed socket; the gateway answers it
+    // locally but authorizes it through the same allowlist, with no alias.
+    try std.testing.expectEqual(access.requiredScopeMaskForRpc("core.changes").?, access.requiredScopeMaskForRpc("core.changes.mode").?);
 }
 
 const Audit = struct {

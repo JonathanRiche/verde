@@ -122,6 +122,9 @@ pub const ERR_PROTOCOL_INCOMPATIBLE: []const u8 = "protocol_incompatible";
 /// The requested native chat provider is not installed or otherwise has an
 /// exact provider-specific unavailable failure. Never infer this from text.
 pub const ERR_PROVIDER_UNAVAILABLE: []const u8 = "provider_unavailable";
+/// The workspace row is archived, so it accepts no new chats or turns until a
+/// client reopens it (`workspace.upsert` with `archived:false`).
+pub const ERR_WORKSPACE_ARCHIVED: []const u8 = "workspace_archived";
 
 /// Typed protocol error carried inside a response envelope.
 pub const Error = struct {

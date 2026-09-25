@@ -7128,6 +7128,10 @@ pub const AppState = struct {
         self.restorePersistedBrowserPaneAfterProjectSelection(self.project_controller.selected_index);
         self.syncRenameBuffer();
         self.markDirty();
+        // The daemon rejects chat.turn.start for archived workspace rows, so
+        // push the reopen (archived=false) now instead of after the debounce;
+        // a send right after reopening would otherwise race the flush.
+        if (!builtin.is_test) self.flushDirtyNow();
     }
 
     pub fn reopenClosedProjectAtIndex(self: *AppState, archived_index: usize) bool {

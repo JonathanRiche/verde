@@ -2898,6 +2898,7 @@ pub const Daemon = struct {
         // lockDaemon for SQLite work; route before the generic mutator drain gate.
         if (std.mem.eql(u8, method, directory_browser.METHOD)) return try workspaceDirectoryListResponse(self, id_value, params);
         if (std.mem.eql(u8, method, "workspace.close")) return try self.workspaceCloseResponse(id_value, params);
+        if (std.mem.eql(u8, method, "chat.subagent.open")) return try self.chatSubagentOpenResponse(id_value, params);
         if (isStoreMethod(method)) return try self.handleStoreRequest(id_value, method, params);
         if (isPushMethod(method)) return try self.handlePushRequest(id_value, method, params);
         if (isAccessMethod(method)) return try self.handleAccessRequest(id_value, method, params);
@@ -7015,6 +7016,203 @@ pub const Daemon = struct {
         return try okValueResponse(self.allocator, id_value, .{ .workspace_id = workspace_id, .archived = true, .store_revision = result.store_revision });
     }
 
+    /// Whether a durable workspace row is archived. Missing rows (unsaved GUI
+    /// workspaces, storeless tests) keep their prior admission behavior.
+    /// Callers must not hold lockDaemon or the store mutex.
+    fn workspaceArchivedForAdmission(self: *Daemon, workspace_id: []const u8) daemon_store.StoreError!bool {
+        lockDaemon(self);
+        const service = self.store_service;
+        if (service) |svc| _ = svc.in_flight.fetchAdd(1, .monotonic);
+        self.mutex.unlock();
+        const svc = service orelse return false;
+        defer _ = svc.in_flight.fetchSub(1, .monotonic);
+        lockStoreService(svc);
+        defer svc.mutex.unlock();
+        return (try svc.store.workspaceArchived(workspace_id)) orelse false;
+    }
+
+    /// Daemon-native linked child chat (A-18): the same durable shape MCP
+    /// open_chat + chat.links.create produce, so `chat.links.list` and the
+    /// desktop/web linked-chat drawers show it without the GUI running. The
+    /// optional prompt starts the first child turn through chat.turn.start
+    /// with parent_thread_id, so status and completions flow to the parent.
+    /// A retry naming an existing child only re-links it; its turn starts
+    /// again only when the caller supplies a turn_id (deduped as usual).
+    fn chatSubagentOpenResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        lockDaemon(self);
+        if (!self.accepting_mutations) {
+            self.mutex.unlock();
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "daemon is preparing shutdown and is not accepting mutations");
+        }
+        self.mutex.unlock();
+        const invalid = struct {
+            fn response(allocator: std.mem.Allocator, id: std.json.Value, message: []const u8) ![]u8 {
+                return errorResponseAlloc(allocator, id, headless.protocol.ERR_INVALID_PARAMS, message);
+            }
+        }.response;
+        if (params != .object) return try invalid(self.allocator, id_value, "params must be an object");
+        const object = params.object;
+        const workspace_id = (optionalObjectString(object, "workspace_id") catch null) orelse
+            return try invalid(self.allocator, id_value, "chat.subagent.open requires workspace_id");
+        const parent_thread_id = (optionalObjectString(object, "parent_thread_id") catch null) orelse
+            (optionalObjectString(object, "parent_local_thread_id") catch null) orelse
+            return try invalid(self.allocator, id_value, "chat.subagent.open requires parent_thread_id");
+        const provider_text = (optionalObjectString(object, "provider") catch null) orelse
+            return try invalid(self.allocator, id_value, "chat.subagent.open requires provider");
+        if (workspace_id.len == 0 or parent_thread_id.len == 0) return try invalid(self.allocator, id_value, "workspace_id and parent_thread_id cannot be empty");
+        _ = parseEnum(harness.Provider, provider_text) orelse return try invalid(self.allocator, id_value, "invalid provider");
+        const model = optionalObjectString(object, "model") catch return try invalid(self.allocator, id_value, "model must be a string");
+        const model_ref = model orelse (optionalObjectString(object, "model_ref") catch return try invalid(self.allocator, id_value, "model_ref must be a string"));
+        const reasoning_effort = optionalObjectString(object, "reasoning_effort") catch return try invalid(self.allocator, id_value, "reasoning_effort must be a string");
+        if (reasoning_effort) |value| _ = parseEnum(harness.ReasoningEffort, value) orelse return try invalid(self.allocator, id_value, "invalid reasoning_effort");
+        const reasoning_variant = optionalObjectString(object, "reasoning_variant") catch return try invalid(self.allocator, id_value, "reasoning_variant must be a string");
+        const fast_mode_value = object.get("fast_mode") orelse .null;
+        const fast_mode: ?bool = if (fast_mode_value == .null) null else jsonBool(fast_mode_value) orelse return try invalid(self.allocator, id_value, "fast_mode must be a boolean");
+        const title_param = optionalObjectString(object, "title") catch return try invalid(self.allocator, id_value, "title must be a string");
+        const prompt = optionalObjectString(object, "prompt") catch return try invalid(self.allocator, id_value, "prompt must be a string");
+        if (prompt) |value| if (std.mem.trim(u8, value, &std.ascii.whitespace).len == 0) return try invalid(self.allocator, id_value, "prompt cannot be empty");
+        const requested_turn_id = optionalObjectString(object, "turn_id") catch return try invalid(self.allocator, id_value, "turn_id must be a string");
+        if (requested_turn_id) |value| if (value.len == 0) return try invalid(self.allocator, id_value, "turn_id cannot be empty");
+        const requested_child = optionalObjectString(object, "local_thread_id") catch return try invalid(self.allocator, id_value, "local_thread_id must be a string");
+        if (requested_child) |child| {
+            // `subagent:` ids are the GUI's read-only provider-card views.
+            if (child.len == 0 or std.mem.startsWith(u8, child, "subagent:") or std.mem.eql(u8, child, parent_thread_id))
+                return try invalid(self.allocator, id_value, "invalid local_thread_id");
+        }
+
+        var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const child_id = requested_child orelse blk: {
+            var random_bytes: [8]u8 = undefined;
+            std.Io.Threaded.global_single_threaded.io().random(&random_bytes);
+            break :blk try std.fmt.allocPrint(arena, "daemon-thread-{d}-{s}", .{ nowMs(), std.fmt.bytesToHex(random_bytes, .lower) });
+        };
+
+        lockDaemon(self);
+        const service = self.store_service;
+        if (service) |svc| _ = svc.in_flight.fetchAdd(1, .monotonic);
+        self.mutex.unlock();
+        const svc = service orelse return try storeErrorResponse(self.allocator, id_value, error.StoreUnavailable);
+        defer _ = svc.in_flight.fetchSub(1, .monotonic);
+
+        var created = false;
+        var workspace_path: []const u8 = undefined;
+        var link_id: []const u8 = undefined;
+        var store_revision: u64 = 0;
+        {
+            // Serializes with workspace.close so a child cannot land in a
+            // workspace between its archive check and the archive commit.
+            self.workspace_lifecycle_mutex.lock();
+            defer self.workspace_lifecycle_mutex.unlock();
+            lockStoreService(svc);
+            defer svc.mutex.unlock();
+            const conn = svc.store.conn;
+            const workspace_row = (conn.row("select archived,path from workspaces where workspace_id=?", .{workspace_id}) catch
+                return try storeErrorResponse(self.allocator, id_value, error.StoreUnavailable)) orelse
+                return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_RESOURCE_NOT_FOUND, "workspace not found");
+            const archived = workspace_row.int(0) != 0;
+            workspace_path = try arena.dupe(u8, workspace_row.text(1));
+            workspace_row.deinit();
+            if (archived) return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_WORKSPACE_ARCHIVED, "workspace is archived; reopen it before starting chats");
+            const thread_sql = "select 1 from threads t join workspaces w on w.id=t.workspace_id where w.workspace_id=? and t.local_thread_id=?";
+            const parent_row = (conn.row(thread_sql, .{ workspace_id, parent_thread_id }) catch
+                return try storeErrorResponse(self.allocator, id_value, error.StoreUnavailable)) orelse
+                return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_RESOURCE_NOT_FOUND, "parent thread not found");
+            parent_row.deinit();
+            const child_row = conn.row(thread_sql, .{ workspace_id, child_id }) catch
+                return try storeErrorResponse(self.allocator, id_value, error.StoreUnavailable);
+            if (child_row) |row| {
+                row.deinit();
+                store_revision = svc.store.storeRevision() catch |err| return try storeErrorResponse(self.allocator, id_value, err);
+            } else {
+                const request_key = try std.fmt.allocPrint(arena, "daemon:chat.subagent.open:{s}", .{child_id});
+                const write = svc.store.upsertThread(.{
+                    .mutation = .{ .request_key = request_key, .client_id = "daemon" },
+                    .workspace_id = workspace_id,
+                    .thread = .{
+                        .local_thread_id = child_id,
+                        .title = title_param orelse "New Chat",
+                        .provider = provider_text,
+                        .harness = "local_cli",
+                        .model_ref = model_ref,
+                        .reasoning_effort = reasoning_effort,
+                        .reasoning_variant = reasoning_variant,
+                        .fast_mode = if (fast_mode) |value| (if (value) "on" else "off") else null,
+                        .last_activity_at = @divTrunc(nowMs(), std.time.ms_per_s),
+                    },
+                }) catch |err| return try storeErrorResponse(self.allocator, id_value, err);
+                store_revision = write.store_revision;
+                created = true;
+            }
+            chat_links.link(conn, self.allocator, workspace_id, parent_thread_id, child_id) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvalidParams => return try invalid(self.allocator, id_value, "child cannot be linked under this parent"),
+                else => return try storeErrorResponse(self.allocator, id_value, error.StoreUnavailable),
+            };
+            const link_row = (conn.row("select link_id from chat_links where workspace_id=? and parent_thread_id=? and local_thread_id=?", .{ workspace_id, parent_thread_id, child_id }) catch
+                return try storeErrorResponse(self.allocator, id_value, error.StoreUnavailable)) orelse
+                return try storeErrorResponse(self.allocator, id_value, error.Internal);
+            link_id = try arena.dupe(u8, link_row.text(0));
+            link_row.deinit();
+        }
+
+        var turn_id: ?[]const u8 = null;
+        var turn_created: ?bool = null;
+        var turn_error: ?struct { code: []const u8, message: []const u8 } = null;
+        if (prompt) |text| start: {
+            if (!created and requested_turn_id == null) break :start;
+            const minted_turn_id = requested_turn_id orelse blk: {
+                var random_bytes: [8]u8 = undefined;
+                std.Io.Threaded.global_single_threaded.io().random(&random_bytes);
+                break :blk try std.fmt.allocPrint(arena, "daemon-turn-{d}-{s}", .{ nowMs(), std.fmt.bytesToHex(random_bytes, .lower) });
+            };
+            turn_id = minted_turn_id;
+            const thread_title: []const u8 = title_param orelse try chat_threads.makeThreadTitle(arena, text);
+            const raw = try std.json.Stringify.valueAlloc(arena, .{
+                .turn_id = minted_turn_id,
+                .workspace_id = workspace_id,
+                .local_thread_id = child_id,
+                .parent_thread_id = parent_thread_id,
+                .project_path = workspace_path,
+                .prompt = text,
+                .thread_title = thread_title,
+                .provider = provider_text,
+                .harness = "local_cli",
+                .model_ref = model_ref,
+                .reasoning_effort = reasoning_effort,
+                .opencode_reasoning_variant = reasoning_variant,
+                .fast_mode = fast_mode orelse false,
+                .require_provider_ready = jsonBool(object.get("require_provider_ready") orelse .null) orelse false,
+            }, .{ .emit_null_optional_fields = false });
+            const turn_params = try std.json.parseFromSliceLeaky(std.json.Value, arena, raw, .{});
+            const turn_response = try self.chatTurnStartResponse(.{ .integer = 1 }, turn_params);
+            defer self.allocator.free(turn_response);
+            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, turn_response, .{ .allocate = .alloc_always });
+            if (parsed == .object) {
+                if (parsed.object.get("result")) |result| {
+                    if (result == .object) turn_created = jsonBool(result.object.get("created") orelse .null);
+                } else if (parsed.object.get("error")) |err_value| {
+                    if (err_value == .object) turn_error = .{
+                        .code = jsonString(err_value.object.get("code") orelse .null) orelse headless.protocol.ERR_INTERNAL,
+                        .message = jsonString(err_value.object.get("message") orelse .null) orelse "chat turn start failed",
+                    };
+                }
+            }
+        }
+        return try okValueResponse(self.allocator, id_value, .{
+            .workspace_id = workspace_id,
+            .parent_thread_id = parent_thread_id,
+            .local_thread_id = child_id,
+            .link_id = link_id,
+            .created = created,
+            .store_revision = store_revision,
+            .turn_id = turn_id,
+            .turn_created = turn_created,
+            .turn_error = turn_error,
+        });
+    }
+
     /// Accept a new turn. Runs unlocked on the serve path (see
     /// `methodRunsUnlocked`) so the MAJOR-R1 ledger identity guard can consult
     /// SQLite under the store service mutex without ever nesting under
@@ -7173,6 +7371,26 @@ pub const Daemon = struct {
         errdefer turn.deinit(self.allocator);
         // Wire the wake path before the turn is reachable by any worker.
         turn.daemon = self;
+        // workspace.close samples chat_turns under this mutex, so admission
+        // cannot slip a turn into a workspace between its busy check and
+        // archive. Taken before task/link rows so an archived workspace
+        // rejects without side effects (mobile can reach closed workspaces).
+        self.workspace_lifecycle_mutex.lock();
+        defer self.workspace_lifecycle_mutex.unlock();
+        const archived = self.workspaceArchivedForAdmission(turn.workspace_id) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return try storeErrorResponse(self.allocator, id_value, err),
+        };
+        if (archived) {
+            const response = try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_WORKSPACE_ARCHIVED,
+                "workspace is archived; reopen it before starting chats",
+            );
+            turn.deinit(self.allocator);
+            return response;
+        }
         if (turn.task_owner) |owner| {
             lockDaemon(self);
             const task_service = self.store_service;
@@ -7186,10 +7404,6 @@ pub const Daemon = struct {
             try chat_links.createTask(svc.store.conn, turn.turn_id, turn.workspace_id, turn.local_thread_id, owner, turn.started_at_ms);
         }
 
-        // workspace.close samples chat_turns under this mutex, so admission
-        // cannot slip a turn into a workspace between its busy check and archive.
-        self.workspace_lifecycle_mutex.lock();
-        defer self.workspace_lifecycle_mutex.unlock();
         lockDaemon(self);
         // Re-check after the unlocked ledger window (concurrent start / race).
         if (self.findChatTurn(turn_id)) |existing| {
@@ -12773,7 +12987,8 @@ const ServerRequestClass = enum { slow_registry, store, unlocked_method, normal 
 fn methodRunsUnlocked(method: []const u8) bool {
     // M4-P4: ledger identity guard on accept must read SQLite under the store
     // mutex only; the `.normal` outer lockDaemon window cannot nest that work.
-    return std.mem.eql(u8, method, "workspace.close") or std.mem.eql(u8, method, directory_browser.METHOD) or
+    return std.mem.eql(u8, method, "workspace.close") or std.mem.eql(u8, method, "chat.subagent.open") or
+        std.mem.eql(u8, method, directory_browser.METHOD) or
         std.mem.startsWith(u8, method, "chat.links.") or std.mem.startsWith(u8, method, "chat.tasks.") or
         // Browser history is per-keystroke SQLite work under the store mutex
         // only; it pins in_flight and checks the drain flag itself.
@@ -19069,6 +19284,7 @@ test "draining dispatcher rejects every state mutator" {
         "chat.turn.cancel",
         "chat.turn.consume",
         "chat.shell.run",
+        "chat.subagent.open",
         "process.start",
         "process.stop",
         "process.restart",
@@ -22351,7 +22567,7 @@ test "P2 paired RPC additions reach the session daemon dispatcher" {
         "process.list",          "process.definitions",
         "process.start",         "process.restart",
         "process.stop",          "daemon.client.register",
-        "workspace.close",
+        "workspace.close",       "chat.subagent.open",
     };
     for (methods) |method| {
         try std.testing.expect(headless.access_protocol.requiredScopeMaskForRpc(method) != null);
@@ -22785,6 +23001,196 @@ test "workspace close rejects busy without side effects then terminates sessions
     defer a.free(again);
     try std.testing.expect(std.mem.indexOf(u8, again, "\"archived\":true") != null);
     try std.testing.expectEqual(revision_before_close + 1, try store.storeRevision());
+}
+
+fn testSubagentSeedWorkspace(store: *daemon_store.Store, workspace_id: []const u8) !void {
+    _ = try store.upsertWorkspace(.{
+        .mutation = .{ .request_key = "subagent-workspace", .client_id = "test" },
+        .workspace = .{ .workspace_id = workspace_id, .label = "Subagents", .path = "." },
+    });
+    _ = try store.upsertThread(.{
+        .mutation = .{ .request_key = "subagent-parent", .client_id = "test" },
+        .workspace_id = workspace_id,
+        .thread = .{ .local_thread_id = "parent", .title = "Parent", .provider = "claude" },
+    });
+}
+
+fn testSubagentRpcErrorCode(allocator: std.mem.Allocator, response: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const err = parsed.value.object.get("error") orelse return error.TestExpectedError;
+    return allocator.dupe(u8, err.object.get("code").?.string);
+}
+
+test "chat.subagent.open creates a durable linked child the links list returns" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testStoreDbPath(&tmp);
+    defer a.free(path);
+    var daemon = Daemon.init(a);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, path);
+    defer detachTestStoreService(&daemon);
+    const store = &daemon.store_service.?.store;
+    try testSubagentSeedWorkspace(store, "sub-ws");
+
+    const request =
+        \\{"id":1,"method":"chat.subagent.open","params":{"workspace_id":"sub-ws","parent_thread_id":"parent","provider":"codex","model":"gpt-5.5","reasoning_effort":"high","fast_mode":true,"local_thread_id":"child-1","title":"Research"}}
+    ;
+    const opened = try testWorkspaceCloseRpc(&daemon, request);
+    defer a.free(opened);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, opened, .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("result").?.object;
+    try std.testing.expect(result.get("created").?.bool);
+    try std.testing.expectEqualStrings("child-1", result.get("local_thread_id").?.string);
+    try std.testing.expectEqualStrings("parent", result.get("parent_thread_id").?.string);
+    try std.testing.expect(std.mem.startsWith(u8, result.get("link_id").?.string, "link:"));
+    try std.testing.expect(result.get("turn_id").? == .null);
+    // No prompt means no provider work.
+    try std.testing.expectEqual(@as(usize, 0), daemon.chat_turns.items.len);
+    const revision = try store.storeRevision();
+    try std.testing.expectEqual(@as(i64, @intCast(revision)), result.get("store_revision").?.integer);
+    {
+        const row = (try store.conn.row(
+            "select t.title,t.model_ref,t.reasoning_effort is not null,t.fast_mode,t.archived from threads t join workspaces w on w.id=t.workspace_id where w.workspace_id='sub-ws' and t.local_thread_id='child-1'",
+            .{},
+        )).?;
+        defer row.deinit();
+        try std.testing.expectEqualStrings("Research", row.text(0));
+        try std.testing.expectEqualStrings("gpt-5.5", row.text(1));
+        try std.testing.expectEqual(@as(i64, 1), row.int(2));
+        try std.testing.expectEqual(@as(i64, 1), row.int(3));
+        try std.testing.expectEqual(@as(i64, 0), row.int(4));
+    }
+    const listed = try testWorkspaceCloseRpc(&daemon,
+        \\{"id":2,"method":"chat.links.list","params":{"workspace_id":"sub-ws","parent_thread_id":"parent"}}
+    );
+    defer a.free(listed);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"child-1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, result.get("link_id").?.string) != null);
+
+    // A retry re-links without rewriting the child or bumping the revision.
+    const retried = try testWorkspaceCloseRpc(&daemon, request);
+    defer a.free(retried);
+    var retry_parsed = try std.json.parseFromSlice(std.json.Value, a, retried, .{});
+    defer retry_parsed.deinit();
+    const retry_result = retry_parsed.value.object.get("result").?.object;
+    try std.testing.expect(!retry_result.get("created").?.bool);
+    try std.testing.expectEqualStrings(result.get("link_id").?.string, retry_result.get("link_id").?.string);
+    try std.testing.expectEqual(revision, try store.storeRevision());
+    {
+        const row = (try store.conn.row("select count(*) from chat_links where workspace_id='sub-ws' and parent_thread_id='parent'", .{})).?;
+        defer row.deinit();
+        try std.testing.expectEqual(@as(i64, 1), row.int(0));
+    }
+
+    // The daemon mints a child id when the caller does not.
+    const minted = try testWorkspaceCloseRpc(&daemon,
+        \\{"id":3,"method":"chat.subagent.open","params":{"workspace_id":"sub-ws","parent_local_thread_id":"parent","provider":"claude"}}
+    );
+    defer a.free(minted);
+    try std.testing.expect(std.mem.indexOf(u8, minted, "\"local_thread_id\":\"daemon-thread-") != null);
+    try std.testing.expect(std.mem.indexOf(u8, minted, "\"created\":true") != null);
+
+    const cases = [_]struct { request: []const u8, code: []const u8 }{
+        .{ .request =
+        \\{"id":4,"method":"chat.subagent.open","params":{"workspace_id":"sub-ws","parent_thread_id":"missing","provider":"codex"}}
+        , .code = "resource_not_found" },
+        .{ .request =
+        \\{"id":5,"method":"chat.subagent.open","params":{"workspace_id":"missing-ws","parent_thread_id":"parent","provider":"codex"}}
+        , .code = "resource_not_found" },
+        .{ .request =
+        \\{"id":6,"method":"chat.subagent.open","params":{"workspace_id":"sub-ws","parent_thread_id":"parent","provider":"nope"}}
+        , .code = "invalid_params" },
+        .{ .request =
+        \\{"id":7,"method":"chat.subagent.open","params":{"workspace_id":"sub-ws","parent_thread_id":"parent","provider":"codex","local_thread_id":"subagent:parent:tool"}}
+        , .code = "invalid_params" },
+        .{ .request =
+        \\{"id":8,"method":"chat.subagent.open","params":{"workspace_id":"sub-ws","parent_thread_id":"parent","provider":"codex","local_thread_id":"parent"}}
+        , .code = "invalid_params" },
+        .{ .request =
+        \\{"id":9,"method":"chat.subagent.open","params":{"workspace_id":"sub-ws","parent_thread_id":"parent","provider":"codex","prompt":"   "}}
+        , .code = "invalid_params" },
+        // A child may not adopt its own ancestor (cycle).
+        .{ .request =
+        \\{"id":10,"method":"chat.subagent.open","params":{"workspace_id":"sub-ws","parent_thread_id":"child-1","provider":"codex","local_thread_id":"parent"}}
+        , .code = "invalid_params" },
+    };
+    const before_errors = try store.storeRevision();
+    for (cases) |case| {
+        const response = try testWorkspaceCloseRpc(&daemon, case.request);
+        defer a.free(response);
+        const code = try testSubagentRpcErrorCode(a, response);
+        defer a.free(code);
+        try std.testing.expectEqualStrings(case.code, code);
+    }
+    try std.testing.expectEqual(before_errors, try store.storeRevision());
+    try std.testing.expectEqual(@as(usize, 0), daemon.chat_turns.items.len);
+}
+
+test "archived workspaces reject chat.subagent.open and chat.turn.start without side effects" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testStoreDbPath(&tmp);
+    defer a.free(path);
+    var daemon = Daemon.init(a);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, path);
+    defer detachTestStoreService(&daemon);
+    const store = &daemon.store_service.?.store;
+    try testSubagentSeedWorkspace(store, "arch-ws");
+    const closed = try testWorkspaceCloseRpc(&daemon,
+        \\{"id":1,"method":"workspace.close","params":{"workspace_id":"arch-ws"}}
+    );
+    defer a.free(closed);
+    try std.testing.expect(std.mem.indexOf(u8, closed, "\"archived\":true") != null);
+    const revision = try store.storeRevision();
+
+    const requests = [_][]const u8{
+        \\{"id":2,"method":"chat.subagent.open","params":{"workspace_id":"arch-ws","parent_thread_id":"parent","provider":"codex","local_thread_id":"arch-child","prompt":"hello"}}
+        ,
+        \\{"id":3,"method":"chat.turn.start","params":{"turn_id":"arch-turn","workspace_id":"arch-ws","local_thread_id":"parent","project_path":".","prompt":"hello","thread_title":"Parent","provider":"codex"}}
+        ,
+        // Linked delegation must not leave link/task rows behind either.
+        \\{"id":4,"method":"chat.turn.start","params":{"turn_id":"arch-task-turn","workspace_id":"arch-ws","local_thread_id":"parent","parent_thread_id":"other","task_owner":"verde","project_path":".","prompt":"hello","thread_title":"Parent","provider":"codex"}}
+        ,
+    };
+    for (requests) |request| {
+        const response = try testWorkspaceCloseRpc(&daemon, request);
+        defer a.free(response);
+        const code = try testSubagentRpcErrorCode(a, response);
+        defer a.free(code);
+        try std.testing.expectEqualStrings(headless.protocol.ERR_WORKSPACE_ARCHIVED, code);
+    }
+    try std.testing.expectEqual(revision, try store.storeRevision());
+    try std.testing.expectEqual(@as(usize, 0), daemon.chat_turns.items.len);
+    inline for (.{
+        "select count(*) from threads where local_thread_id='arch-child'",
+        "select count(*) from chat_links",
+        "select count(*) from chat_tasks",
+        "select count(*) from chat_turns",
+    }) |sql| {
+        const row = (try store.conn.row(sql, .{})).?;
+        defer row.deinit();
+        try std.testing.expectEqual(@as(i64, 0), row.int(0));
+    }
+    try std.testing.expect(try store.workspaceArchived("arch-ws") orelse false);
+    try std.testing.expect(try store.workspaceArchived("never-saved") == null);
+
+    // Reopening (workspace.upsert archived:false) admits subagents again.
+    _ = try store.upsertWorkspace(.{
+        .mutation = .{ .request_key = "arch-reopen", .client_id = "test" },
+        .workspace = .{ .workspace_id = "arch-ws", .label = "Subagents", .path = "." },
+    });
+    try std.testing.expect(!(try store.workspaceArchived("arch-ws")).?);
+    const reopened = try testWorkspaceCloseRpc(&daemon,
+        \\{"id":5,"method":"chat.subagent.open","params":{"workspace_id":"arch-ws","parent_thread_id":"parent","provider":"codex","local_thread_id":"arch-child"}}
+    );
+    defer a.free(reopened);
+    try std.testing.expect(std.mem.indexOf(u8, reopened, "\"created\":true") != null);
 }
 
 fn testWorkspaceCloseRpc(daemon: *Daemon, request: []const u8) ![]u8 {

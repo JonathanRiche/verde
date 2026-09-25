@@ -109,7 +109,7 @@ pub const Router = struct {
 };
 
 pub fn allowedMethod(method: []const u8) bool {
-    inline for (.{ "chat.turn.start", "chat.turn.list", "chat.turn.tail", "chat.turn.cancel", "chat.turn.approve", "chat.turn.steer", "chat.followup", "chat.thread.get", "workspace.repository.manifest.get", "workspace.files.search", "workspace.directory.list", "workspace.close", "provider.models.list", "providers.status", "chat.message.list", "provider.slash.list", "provider.slash.run", "provider.thread.sync", "chat.shell.run", "chat.attachment.create", "chat.attachment.append", "chat.attachment.commit" }) |allowed| {
+    inline for (.{ "chat.turn.start", "chat.turn.list", "chat.turn.tail", "chat.turn.cancel", "chat.turn.approve", "chat.turn.steer", "chat.followup", "chat.thread.get", "workspace.repository.manifest.get", "workspace.files.search", "workspace.directory.list", "workspace.close", "chat.subagent.open", "provider.models.list", "providers.status", "chat.message.list", "provider.slash.list", "provider.slash.run", "provider.thread.sync", "chat.shell.run", "chat.attachment.create", "chat.attachment.append", "chat.attachment.commit" }) |allowed| {
         if (std.mem.eql(u8, method, allowed)) return true;
     }
     return false;

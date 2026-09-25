@@ -261,14 +261,19 @@ const REPOSITORY_WRITE: u16 = scopeBit(.repository_write);
 const PROCESS_READ: u16 = scopeBit(.process_read);
 const PROCESS_WRITE: u16 = scopeBit(.process_write);
 
-/// The complete paired-session allowlist. Every entry must be dispatched by
-/// the runtime daemon. Desktop-only workspace.create/rename,
-/// chat.open_subagent and terminal.open/tail/screen/write/key are intentionally
-/// excluded: they need the desktop app. Mobile uses workspace.upsert,
+/// The complete paired-session allowlist. Every entry except the gateway-local
+/// `core.changes.mode` must be dispatched by the runtime daemon. Desktop-only workspace.create/rename,
+/// chat.open_subagent (the GUI's read-only provider-subagent view) and
+/// terminal.open/tail/screen/write/key are intentionally excluded: they need
+/// the desktop app. Mobile uses workspace.upsert, chat.subagent.open,
 /// chat.thread.* and session.* instead; GUI-only lifecycle gaps need new RPCs.
 pub const PAIRED_RPC_METHODS = [_]PairedRpcMethod{
     .{ .method = "core.snapshot", .scope_mask = SNAPSHOT_READ_MASK },
     .{ .method = "core.changes", .scope_mask = SNAPSHOT_READ_MASK },
+    // K-16 WebSocket delta opt-in. The gateway answers it on the feed socket
+    // itself (never forwarded to the daemon, refused on /api/rpc), under the
+    // same scope as the core.changes stream it configures.
+    .{ .method = "core.changes.mode", .scope_mask = SNAPSHOT_READ_MASK },
 
     .{ .method = "core.status", .scope_mask = RUNTIME_READ },
     .{ .method = "core.capabilities", .scope_mask = RUNTIME_READ },
@@ -300,6 +305,7 @@ pub const PAIRED_RPC_METHODS = [_]PairedRpcMethod{
     // advertised chat.attachments.v1 capability and this allowlist cannot
     // drift apart silently (see the protocol.zig reachability test).
     .{ .method = "chat.links.create", .scope_mask = CHAT_WRITE },
+    .{ .method = "chat.subagent.open", .scope_mask = CHAT_WRITE },
     .{ .method = "chat.links.clear", .scope_mask = CHAT_WRITE },
     .{ .method = "chat.tasks.blocked", .scope_mask = CHAT_WRITE },
     .{ .method = "chat.turn.start", .scope_mask = CHAT_WRITE },
@@ -871,6 +877,7 @@ test "new access scopes are opt-in and preserve stored scope bits" {
 test "P2 daemon RPC mappings require their exact scopes and desktop methods stay excluded" {
     const cases = .{
         .{ "workspace.close", Scope.repository_write },
+        .{ "chat.subagent.open", Scope.chat_write },
         .{ "provider.threads.list", Scope.chat_read },
         .{ "provider.title.generate", Scope.chat_write },
         .{ "process.list", Scope.process_read },
@@ -881,6 +888,8 @@ test "P2 daemon RPC mappings require their exact scopes and desktop methods stay
         .{ "daemon.client.register", Scope.runtime_read },
     };
     inline for (cases) |case| try std.testing.expectEqual(scopeBit(case[1]), requiredScopeMaskForRpc(case[0]).?);
+    // The delta opt-in is authorized exactly like the stream it configures.
+    try std.testing.expectEqual(requiredScopeMaskForRpc("core.changes").?, requiredScopeMaskForRpc("core.changes.mode").?);
     for ([_][]const u8{
         "workspace.create",   "workspace.rename", "chat.open_subagent",
         "terminal.open",      "terminal.tail",    "terminal.screen",

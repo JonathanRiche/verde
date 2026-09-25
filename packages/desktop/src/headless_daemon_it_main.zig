@@ -243,6 +243,7 @@ pub fn main(init: std.process.Init) !void {
     // Self-gates POSIX-only (bounded pipe reads use std.posix.poll).
     try runChatMcpToolLayerScenario(allocator, io);
     try runChatOrchestrationScenario(allocator, io);
+    try runChatSubagentOpenScenario(allocator, io); // A-18
     // M4-P5 fix amendment: failed-first identity adoption converges via retry
     // to a single identity set across flush + daemon restart. POSIX-gated.
     try runChatAdoptionRetryDurabilityScenario(allocator, io);
@@ -10744,6 +10745,92 @@ fn runLifecycleIdleExitOverride(allocator: std.mem.Allocator, io: std.Io) !void 
 
 /// Orchestration regression: real MCP task calls, durable linkage, immediate
 /// watch snapshots, parent continuation, and clear without deletion.
+/// A-18: daemon-native linked child with an initial prompt. No GUI, no MCP:
+/// the child row, link, delegated task and completion all come from
+/// chat.subagent.open over the stub provider.
+fn runChatSubagentOpenScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref = try makePrefPath(allocator, "subagent-open");
+    defer allocator.free(pref);
+    defer std.Io.Dir.cwd().deleteTree(io, pref) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref);
+    var isolation = try EndpointIsolation.install(allocator, pref);
+    defer isolation.deinit(allocator);
+    const exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(exe);
+    var daemon = try spawnIsolatedDaemonWithEnv(allocator, io, exe, pref, .{ .store_dir = pref, .chat_stub = true });
+    defer daemon.kill(io);
+    var arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var transport: sessionizer.HeadlessTransport = .{ .allocator = arena, .pref_path = pref };
+    var client = sessionizer.headlessClient(arena, &transport);
+    var registered = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    const client_id = (try client.decodeClientRegister(&registered)).client_id;
+    var workspace = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, headless.store.WorkspaceUpsertRequest{
+        .mutation = .{ .request_key = "sub-ws", .client_id = client_id },
+        .workspace = .{ .workspace_id = "sub", .label = "Subagents", .path = pref },
+    });
+    if (!workspace.response.isOk()) return error.SubagentWorkspace;
+    var parent = try client.call(headless.store.METHOD_CHAT_THREAD_UPSERT, headless.store.ThreadUpsertRequest{
+        .mutation = .{ .request_key = "sub-parent", .client_id = client_id },
+        .workspace_id = "sub",
+        .thread = .{ .local_thread_id = "sub-parent", .title = "Parent", .provider = "codex", .harness = "local_cli" },
+    });
+    if (!parent.response.isOk()) return error.SubagentParent;
+    var opened = try client.call("chat.subagent.open", .{
+        .workspace_id = "sub",
+        .parent_thread_id = "sub-parent",
+        .provider = "codex",
+        .local_thread_id = "sub-child",
+        .turn_id = "sub-child-turn",
+        .prompt = "hello subagent",
+    });
+    if (!opened.response.isOk()) {
+        std.debug.print("chat.subagent.open rejected: {any}\n", .{opened.response.err});
+        return error.SubagentOpenRejected;
+    }
+    const result = opened.response.result.?;
+    if (!jsonObjectField(result, "created").?.bool) return error.SubagentNotCreated;
+    if (!std.mem.eql(u8, jsonObjectField(result, "turn_id").?.string, "sub-child-turn")) return error.SubagentTurnId;
+    if (jsonObjectField(result, "turn_created").? != .bool or !jsonObjectField(result, "turn_created").?.bool) return error.SubagentTurnNotStarted;
+    try waitChatTurnTerminal(io, &client, "sub-child-turn", true);
+    // The linked turn is a delegated task, so status reaches the drawer.
+    var task = try client.call("chat.tasks.get", .{ .task_id = "sub-child-turn" });
+    if (!task.response.isOk()) return error.SubagentTaskMissing;
+    if (!std.mem.eql(u8, jsonObjectField(task.response.result.?, "status").?.string, "completed")) return error.SubagentTaskStatus;
+    var links = try client.call("chat.links.list", .{ .workspace_id = "sub", .parent_thread_id = "sub-parent" });
+    if (!links.response.isOk()) return error.SubagentLinks;
+    const rows = jsonObjectField(links.response.result.?, "links").?.array.items;
+    if (rows.len != 1 or !std.mem.eql(u8, jsonObjectField(rows[0], "local_thread_id").?.string, "sub-child")) return error.SubagentLinkIdentity;
+    if (!std.mem.eql(u8, jsonObjectField(rows[0], "turn_id").?.string, "sub-child-turn")) return error.SubagentLinkTurn;
+    // Retrying with the same turn id dedups instead of re-running work.
+    var retried = try client.call("chat.subagent.open", .{
+        .workspace_id = "sub",
+        .parent_thread_id = "sub-parent",
+        .provider = "codex",
+        .local_thread_id = "sub-child",
+        .turn_id = "sub-child-turn",
+        .prompt = "hello subagent",
+    });
+    if (!retried.response.isOk()) return error.SubagentRetryRejected;
+    if (jsonObjectField(retried.response.result.?, "created").?.bool) return error.SubagentRetryRecreated;
+    // Either the live turn dedups (turn_created=false) or the consumed id is
+    // refused via turn_error; a second provider run is the only failure.
+    const retry_created = jsonObjectField(retried.response.result.?, "turn_created") orelse .null;
+    if (retry_created == .bool and retry_created.bool) return error.SubagentRetryReplayed;
+    // The completion is delivered to the parent as a child-event turn.
+    const parent_turn = "child-event:sub-child-turn:sub-parent:2";
+    const deadline = platform_runtime.unixTimestampMs() + 10000;
+    while (true) {
+        var tail = try client.call("chat.turn.tail", .{ .turn_id = parent_turn });
+        if (tail.response.isOk()) break;
+        if (platform_runtime.unixTimestampMs() >= deadline) return error.SubagentParentNotResumed;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try waitChatTurnTerminal(io, &client, parent_turn, true);
+    std.debug.print("headless-daemon-it: chat.subagent.open scenario ok\n", .{});
+}
+
 fn runChatOrchestrationScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     const pref = try makePrefPath(allocator, "orchestration");
     defer allocator.free(pref);

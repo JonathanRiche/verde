@@ -1489,7 +1489,12 @@ fn handleRpc(
         return;
     }
     if (auth_context == .pair) {
-        switch (pairedRpcPolicy(parsed.request.method, auth_context.pair.scope_mask)) {
+        // Feed controls only exist on the WebSocket that owns the feed.
+        const policy: PairedRpcPolicy = if (websocketOnlyRpcMethod(parsed.request.method))
+            .forbidden
+        else
+            pairedRpcPolicy(parsed.request.method, auth_context.pair.scope_mask);
+        switch (policy) {
             .forbidden => {
                 const forbidden = try headless.encodeErrorResponse(
                     allocator,
@@ -1875,7 +1880,7 @@ fn serveWebSocket(
                     session.send(encoded) catch {};
                     continue;
                 }
-                if (!session.rpcAllowed(if (std.mem.eql(u8, parsed.request.method, "core.changes.mode")) "core.changes" else parsed.request.method)) {
+                if (!session.rpcAllowed(parsed.request.method)) {
                     const encoded = try headless.encodeErrorResponse(
                         allocator,
                         parsed.request.id,
@@ -2227,6 +2232,12 @@ const PairedRpcPolicy = union(enum) {
     /// Forward after the daemon re-authorizes the device for this mask.
     authorize: u16,
 };
+
+/// Allowlisted methods the gateway answers on the feed WebSocket itself. Paired
+/// `/api/rpc` refuses them rather than forwarding to the daemon.
+fn websocketOnlyRpcMethod(method: []const u8) bool {
+    return std.mem.eql(u8, method, "core.changes.mode");
+}
 
 fn pairedRpcPolicy(method: []const u8, scope_mask: u16) PairedRpcPolicy {
     if (blockedRpcMethod(method)) return .forbidden;
@@ -4021,4 +4032,28 @@ test "workspace close is daemon routed and requires repository write" {
     try std.testing.expect(@import("web_runtime").allowedMethod("workspace.close"));
     try std.testing.expectEqual(@as(PairedRpcPolicy, .{ .authorize = write }), pairedRpcPolicy("workspace.close", write));
     try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy("workspace.close", headless.access_protocol.scopeBit(.repository_read)));
+}
+
+test "delta opt-in is authorized like core.changes and stays WebSocket-only" {
+    const access = headless.access_protocol;
+    for ([_]u16{ 0, access.scopeBit(.chat_read), access.scopeBit(.runtime_read), access.scopeBit(.chat_write), try access.scopeMask(&access.DEFAULT_SCOPE_NAMES), 0xffff }) |mask| {
+        try std.testing.expectEqual(pairedRpcPolicy("core.changes", mask), pairedRpcPolicy("core.changes.mode", mask));
+    }
+    try std.testing.expect(!blockedRpcMethod("core.changes.mode"));
+    try std.testing.expect(websocketOnlyRpcMethod("core.changes.mode"));
+    try std.testing.expect(!websocketOnlyRpcMethod("core.changes"));
+    for (access.PAIRED_RPC_METHODS) |entry| {
+        if (!std.mem.eql(u8, entry.method, "core.changes.mode")) try std.testing.expect(!websocketOnlyRpcMethod(entry.method));
+    }
+}
+
+test "subagent open is daemon routed and requires chat write" {
+    const write = headless.access_protocol.scopeBit(.chat_write);
+    try std.testing.expect(!blockedRpcMethod("chat.subagent.open"));
+    try std.testing.expect(@import("web_runtime").allowedMethod("chat.subagent.open"));
+    try std.testing.expectEqual(@as(PairedRpcPolicy, .{ .authorize = write }), pairedRpcPolicy("chat.subagent.open", write));
+    try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy("chat.subagent.open", headless.access_protocol.scopeBit(.chat_read)));
+    try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy("chat.subagent.open", headless.access_protocol.scopeBit(.repository_write)));
+    // The GUI's read-only provider-subagent view stays desktop-only.
+    try std.testing.expectEqual(PairedRpcPolicy.forbidden, pairedRpcPolicy("chat.open_subagent", 0xffff));
 }

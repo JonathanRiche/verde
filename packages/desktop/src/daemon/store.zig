@@ -570,6 +570,15 @@ pub const Store = struct {
         return self.closeWorkspaceInternal(workspace_id, pending_turn_ids) catch |err| return mapStoreError(err);
     }
 
+    /// Archived flag of a durable workspace row, or null when no row exists
+    /// (unsaved GUI workspaces keep their pre-store admission behavior).
+    pub fn workspaceArchived(self: *Self, workspace_id: []const u8) StoreError!?bool {
+        const row = (self.conn.row("select archived from workspaces where workspace_id = ?1", .{workspace_id}) catch |err|
+            return mapStoreError(err)) orelse return null;
+        defer row.deinit();
+        return row.int(0) != 0;
+    }
+
     fn closeWorkspaceInternal(self: *Self, workspace_id: []const u8, pending_turn_ids: []const []const u8) !WorkspaceCloseResult {
         try self.conn.execNoArgs("begin immediate");
         var committed = false;
