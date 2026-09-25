@@ -23,9 +23,14 @@ int main(int argc, char **argv) {
     if (vc_host_handle(host, start, sizeof(start)-1, &batch) || !batch.len) return 4;
     vc_buf_free(batch);
     if (vc_host_query(host, (const unsigned char *)"hosts", 5, &snapshot) || !snapshot.len) return 5;
+    const unsigned char utility[] = "{\"utility\":\"markdown\",\"text\":\"# hello\"}";
+    vc_buf rendered = {0};
+    if (vc_host_query(host, utility, sizeof(utility)-1, &rendered) || !rendered.len) return 9;
     if (vc_host_handle(host, stop, sizeof(stop)-1, &batch)) return 6;
     vc_buf_free(batch);
     vc_host_free(host);
+    if (!rendered.ptr || rendered.ptr[0] != '{') return 10;
+    vc_buf_free(rendered);
     /* Snapshot remains readable after destroying the host. */
     if (snapshot.ptr[0] != '{') return 7;
     vc_buf_free(snapshot);

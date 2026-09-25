@@ -3,6 +3,10 @@
     .version = "0.1.0",
     .fingerprint = 0xfe79e8a9e166a459,
     .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .zig_markdown = .{ .path = "../zig_markdown" },
+        .zig_dif = .{ .path = "../zig_dif" },
+    },
     .paths = .{
         "AGENTS.md",
         "build.zig",

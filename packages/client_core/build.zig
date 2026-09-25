@@ -217,6 +217,10 @@ fn createCoreModule(
     const remote = b.createModule(.{ .root_source_file = b.path("src/shared/root.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "headless", .module = headless }} });
     module.addImport("verde_remote", remote);
     module.addImport("headless", headless);
+    const markdown = b.dependency("zig_markdown", .{ .target = target, .optimize = optimize });
+    const dif = b.dependency("zig_dif", .{ .target = target, .optimize = optimize });
+    module.addImport("zig_markdown", markdown.module("zig_markdown"));
+    module.addImport("zig_dif", dif.module("zig_dif"));
     if (target.result.abi.isAndroid()) module.linkSystemLibrary("log", .{});
     module.addOptions("build_options", options);
     return module;

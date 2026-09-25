@@ -1,0 +1,1 @@
+{"files":[{"old_path":"a/x.ts","new_path":"b/x.ts","binary":false,"hunks":[{"old_start":1,"old_count":1,"new_start":1,"new_count":1,"lines":[{"kind":"delete","text":"const a = 1;","old_line":1,"new_line":null,"spans":[{"start":10,"end":11,"kind":"delete"}]},{"kind":"add","text":"const a = 2;","old_line":null,"new_line":1,"spans":[{"start":10,"end":11,"kind":"add"}]}]}]}]}

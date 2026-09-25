@@ -3387,3 +3387,369 @@ extension WorkspacesQuery {
         try c.encode(self.`error`, forKey: .`error`)
     }
 }
+
+struct RenderSpan: Codable {
+    var `start`: UInt64
+    var `end`: UInt64
+    var `kind`: String
+}
+
+extension RenderSpan {
+    private enum CodingKeys: String, CodingKey {
+        case `start`
+        case `end`
+        case `kind`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`start` = try c.decode(UInt64.self, forKey: .`start`)
+        self.`end` = try c.decode(UInt64.self, forKey: .`end`)
+        self.`kind` = try c.decode(String.self, forKey: .`kind`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`start`, forKey: .`start`)
+        try c.encode(self.`end`, forKey: .`end`)
+        try c.encode(self.`kind`, forKey: .`kind`)
+    }
+}
+
+struct FileCitation: Codable {
+    var `path`: String
+    var `line`: UInt64? = nil
+}
+
+extension FileCitation {
+    private enum CodingKeys: String, CodingKey {
+        case `path`
+        case `line`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`path` = try c.decode(String.self, forKey: .`path`)
+        if !c.contains(.`line`) { self.`line` = nil } else {
+        self.`line` = try c.decodeIfPresent(UInt64.self, forKey: .`line`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`path`, forKey: .`path`)
+        try c.encode(self.`line`, forKey: .`line`)
+    }
+}
+
+struct MarkdownNode: Codable {
+    var `kind`: String
+    var `start`: UInt64
+    var `end`: UInt64
+    var `text`: String? = nil
+    var `level`: UInt8? = nil
+    var `ordered`: Bool? = nil
+    var `url`: String? = nil
+    var `language`: String? = nil
+    var `children`: [MarkdownNode] = []
+    var `citation`: FileCitation? = nil
+}
+
+extension MarkdownNode {
+    private enum CodingKeys: String, CodingKey {
+        case `kind`
+        case `start`
+        case `end`
+        case `text`
+        case `level`
+        case `ordered`
+        case `url`
+        case `language`
+        case `children`
+        case `citation`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`kind` = try c.decode(String.self, forKey: .`kind`)
+        self.`start` = try c.decode(UInt64.self, forKey: .`start`)
+        self.`end` = try c.decode(UInt64.self, forKey: .`end`)
+        if !c.contains(.`text`) { self.`text` = nil } else {
+        self.`text` = try c.decodeIfPresent(String.self, forKey: .`text`)
+        }
+        if !c.contains(.`level`) { self.`level` = nil } else {
+        self.`level` = try c.decodeIfPresent(UInt8.self, forKey: .`level`)
+        }
+        if !c.contains(.`ordered`) { self.`ordered` = nil } else {
+        self.`ordered` = try c.decodeIfPresent(Bool.self, forKey: .`ordered`)
+        }
+        if !c.contains(.`url`) { self.`url` = nil } else {
+        self.`url` = try c.decodeIfPresent(String.self, forKey: .`url`)
+        }
+        if !c.contains(.`language`) { self.`language` = nil } else {
+        self.`language` = try c.decodeIfPresent(String.self, forKey: .`language`)
+        }
+        if !c.contains(.`children`) { self.`children` = [] } else {
+        self.`children` = try c.decode([MarkdownNode].self, forKey: .`children`)
+        }
+        if !c.contains(.`citation`) { self.`citation` = nil } else {
+        self.`citation` = try c.decodeIfPresent(FileCitation.self, forKey: .`citation`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`kind`, forKey: .`kind`)
+        try c.encode(self.`start`, forKey: .`start`)
+        try c.encode(self.`end`, forKey: .`end`)
+        try c.encode(self.`text`, forKey: .`text`)
+        try c.encode(self.`level`, forKey: .`level`)
+        try c.encode(self.`ordered`, forKey: .`ordered`)
+        try c.encode(self.`url`, forKey: .`url`)
+        try c.encode(self.`language`, forKey: .`language`)
+        try c.encode(self.`children`, forKey: .`children`)
+        try c.encode(self.`citation`, forKey: .`citation`)
+    }
+}
+
+struct MarkdownView: Codable {
+    var `nodes`: [MarkdownNode]
+}
+
+extension MarkdownView {
+    private enum CodingKeys: String, CodingKey {
+        case `nodes`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`nodes` = try c.decode([MarkdownNode].self, forKey: .`nodes`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`nodes`, forKey: .`nodes`)
+    }
+}
+
+struct HighlightView: Codable {
+    var `spans`: [RenderSpan]
+}
+
+extension HighlightView {
+    private enum CodingKeys: String, CodingKey {
+        case `spans`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`spans` = try c.decode([RenderSpan].self, forKey: .`spans`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`spans`, forKey: .`spans`)
+    }
+}
+
+struct DiffLine: Codable {
+    var `kind`: String
+    var `text`: String
+    var `old_line`: UInt64? = nil
+    var `new_line`: UInt64? = nil
+    var `spans`: [RenderSpan] = []
+}
+
+extension DiffLine {
+    private enum CodingKeys: String, CodingKey {
+        case `kind`
+        case `text`
+        case `old_line`
+        case `new_line`
+        case `spans`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`kind` = try c.decode(String.self, forKey: .`kind`)
+        self.`text` = try c.decode(String.self, forKey: .`text`)
+        if !c.contains(.`old_line`) { self.`old_line` = nil } else {
+        self.`old_line` = try c.decodeIfPresent(UInt64.self, forKey: .`old_line`)
+        }
+        if !c.contains(.`new_line`) { self.`new_line` = nil } else {
+        self.`new_line` = try c.decodeIfPresent(UInt64.self, forKey: .`new_line`)
+        }
+        if !c.contains(.`spans`) { self.`spans` = [] } else {
+        self.`spans` = try c.decode([RenderSpan].self, forKey: .`spans`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`kind`, forKey: .`kind`)
+        try c.encode(self.`text`, forKey: .`text`)
+        try c.encode(self.`old_line`, forKey: .`old_line`)
+        try c.encode(self.`new_line`, forKey: .`new_line`)
+        try c.encode(self.`spans`, forKey: .`spans`)
+    }
+}
+
+struct DiffHunk: Codable {
+    var `old_start`: UInt64
+    var `old_count`: UInt64
+    var `new_start`: UInt64
+    var `new_count`: UInt64
+    var `lines`: [DiffLine]
+}
+
+extension DiffHunk {
+    private enum CodingKeys: String, CodingKey {
+        case `old_start`
+        case `old_count`
+        case `new_start`
+        case `new_count`
+        case `lines`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`old_start` = try c.decode(UInt64.self, forKey: .`old_start`)
+        self.`old_count` = try c.decode(UInt64.self, forKey: .`old_count`)
+        self.`new_start` = try c.decode(UInt64.self, forKey: .`new_start`)
+        self.`new_count` = try c.decode(UInt64.self, forKey: .`new_count`)
+        self.`lines` = try c.decode([DiffLine].self, forKey: .`lines`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`old_start`, forKey: .`old_start`)
+        try c.encode(self.`old_count`, forKey: .`old_count`)
+        try c.encode(self.`new_start`, forKey: .`new_start`)
+        try c.encode(self.`new_count`, forKey: .`new_count`)
+        try c.encode(self.`lines`, forKey: .`lines`)
+    }
+}
+
+struct DiffFile: Codable {
+    var `old_path`: String?
+    var `new_path`: String?
+    var `binary`: Bool
+    var `hunks`: [DiffHunk]
+}
+
+extension DiffFile {
+    private enum CodingKeys: String, CodingKey {
+        case `old_path`
+        case `new_path`
+        case `binary`
+        case `hunks`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`old_path` = try c.decodeIfPresent(String.self, forKey: .`old_path`)
+        self.`new_path` = try c.decodeIfPresent(String.self, forKey: .`new_path`)
+        self.`binary` = try c.decode(Bool.self, forKey: .`binary`)
+        self.`hunks` = try c.decode([DiffHunk].self, forKey: .`hunks`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`old_path`, forKey: .`old_path`)
+        try c.encode(self.`new_path`, forKey: .`new_path`)
+        try c.encode(self.`binary`, forKey: .`binary`)
+        try c.encode(self.`hunks`, forKey: .`hunks`)
+    }
+}
+
+struct DiffView: Codable {
+    var `files`: [DiffFile]
+}
+
+extension DiffView {
+    private enum CodingKeys: String, CodingKey {
+        case `files`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`files` = try c.decode([DiffFile].self, forKey: .`files`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`files`, forKey: .`files`)
+    }
+}
+
+struct MarkdownQuery: Codable {
+    var `api_version`: UInt32
+    var `revision`: String
+    var `data`: MarkdownView?
+    var `error`: LocalError?
+}
+
+extension MarkdownQuery {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `revision`
+        case `data`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        self.`revision` = try c.decode(String.self, forKey: .`revision`)
+        self.`data` = try c.decodeIfPresent(MarkdownView.self, forKey: .`data`)
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`revision`, forKey: .`revision`)
+        try c.encode(self.`data`, forKey: .`data`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct HighlightQuery: Codable {
+    var `api_version`: UInt32
+    var `revision`: String
+    var `data`: HighlightView?
+    var `error`: LocalError?
+}
+
+extension HighlightQuery {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `revision`
+        case `data`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        self.`revision` = try c.decode(String.self, forKey: .`revision`)
+        self.`data` = try c.decodeIfPresent(HighlightView.self, forKey: .`data`)
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`revision`, forKey: .`revision`)
+        try c.encode(self.`data`, forKey: .`data`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct DiffQuery: Codable {
+    var `api_version`: UInt32
+    var `revision`: String
+    var `data`: DiffView?
+    var `error`: LocalError?
+}
+
+extension DiffQuery {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `revision`
+        case `data`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        self.`revision` = try c.decode(String.self, forKey: .`revision`)
+        self.`data` = try c.decodeIfPresent(DiffView.self, forKey: .`data`)
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`revision`, forKey: .`revision`)
+        try c.encode(self.`data`, forKey: .`data`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}

@@ -35,6 +35,8 @@ typedef int32_t vc_status;
 vc_status vc_host_new(const unsigned char *json, size_t len, vc_host **out);
 void vc_host_free(vc_host *host);
 vc_status vc_host_handle(vc_host *host, const unsigned char *json, size_t len, vc_buf *out);
+/* Pure query; selectors also accept JSON markdown/highlight/diff utilities.
+ * See docs/rendering.md for byte offsets, budgets, and query-envelope errors. */
 vc_status vc_host_query(vc_host *host, const unsigned char *selector, size_t len, vc_buf *out);
 void vc_buf_free(vc_buf buf);
 

@@ -892,3 +892,95 @@ data class WorkspacesQuery(
     val `data`: WorkspacesView?,
     val `error`: LocalError?,
 )
+
+@Serializable
+data class RenderSpan(
+    val `start`: ULong,
+    val `end`: ULong,
+    val `kind`: String,
+)
+
+@Serializable
+data class FileCitation(
+    val `path`: String,
+    val `line`: ULong? = null,
+)
+
+@Serializable
+data class MarkdownNode(
+    val `kind`: String,
+    val `start`: ULong,
+    val `end`: ULong,
+    val `text`: String? = null,
+    val `level`: Int? = null,
+    val `ordered`: Boolean? = null,
+    val `url`: String? = null,
+    val `language`: String? = null,
+    val `children`: List<MarkdownNode> = emptyList(),
+    val `citation`: FileCitation? = null,
+)
+
+@Serializable
+data class MarkdownView(
+    val `nodes`: List<MarkdownNode>,
+)
+
+@Serializable
+data class HighlightView(
+    val `spans`: List<RenderSpan>,
+)
+
+@Serializable
+data class DiffLine(
+    val `kind`: String,
+    val `text`: String,
+    val `old_line`: ULong? = null,
+    val `new_line`: ULong? = null,
+    val `spans`: List<RenderSpan> = emptyList(),
+)
+
+@Serializable
+data class DiffHunk(
+    val `old_start`: ULong,
+    val `old_count`: ULong,
+    val `new_start`: ULong,
+    val `new_count`: ULong,
+    val `lines`: List<DiffLine>,
+)
+
+@Serializable
+data class DiffFile(
+    val `old_path`: String?,
+    val `new_path`: String?,
+    val `binary`: Boolean,
+    val `hunks`: List<DiffHunk>,
+)
+
+@Serializable
+data class DiffView(
+    val `files`: List<DiffFile>,
+)
+
+@Serializable
+data class MarkdownQuery(
+    val `api_version`: Long,
+    val `revision`: String,
+    val `data`: MarkdownView?,
+    val `error`: LocalError?,
+)
+
+@Serializable
+data class HighlightQuery(
+    val `api_version`: Long,
+    val `revision`: String,
+    val `data`: HighlightView?,
+    val `error`: LocalError?,
+)
+
+@Serializable
+data class DiffQuery(
+    val `api_version`: Long,
+    val `revision`: String,
+    val `data`: DiffView?,
+    val `error`: LocalError?,
+)

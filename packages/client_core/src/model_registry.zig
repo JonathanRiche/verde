@@ -1,5 +1,6 @@
 //! The single list of exported native models; see docs/model-codegen.md.
 const wire = @import("wire.zig");
+const rendering = @import("rendering.zig");
 pub const types = .{
     .{ "Config", wire.Config },
     .{ "Lifecycle", wire.Lifecycle },
@@ -23,4 +24,16 @@ pub const types = .{
     .{ "HostsQuery", wire.Query(wire.HostsView) },
     .{ "HomeQuery", wire.Query(wire.HomeView) },
     .{ "WorkspacesQuery", wire.Query(wire.WorkspacesView) },
+    .{ "RenderSpan", rendering.Span },
+    .{ "FileCitation", rendering.markdown.Citation },
+    .{ "MarkdownNode", rendering.markdown.Node },
+    .{ "MarkdownView", rendering.markdown.Markdown },
+    .{ "HighlightView", rendering.Highlight },
+    .{ "DiffLine", rendering.diff.Line },
+    .{ "DiffHunk", rendering.diff.Hunk },
+    .{ "DiffFile", rendering.diff.File },
+    .{ "DiffView", rendering.diff.Diff },
+    .{ "MarkdownQuery", wire.Query(rendering.markdown.Markdown) },
+    .{ "HighlightQuery", wire.Query(rendering.Highlight) },
+    .{ "DiffQuery", wire.Query(rendering.diff.Diff) },
 };

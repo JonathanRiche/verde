@@ -1,10 +1,10 @@
 # K-06 host skeleton
 
-Implements [core-api.md revision 1](core-api.md). Auth, RPC, projection,
-rendering and VT engines remain K-07–K-12. Every listed feature intent returns
-a failed `unsupported` operation in `hosts.operations`; no feature intent
-starts transport or storage work. Utilities return query `unsupported` errors.
-Unknown selectors/resources return `not_found`.
+Implements the [core-api.md revision 1](core-api.md) boundary. The original
+K-06 skeleton returned failed `unsupported` operations for feature intents;
+K-07–K-12 supply the feature engines. K-11 implements pure markdown/highlight/
+diff utility queries; see [rendering.md](rendering.md). Unknown utilities return
+`unsupported`; unknown selectors/resources return `not_found`.
 
 The C header, `root.zig` exports and Zig JNI wrappers are maintained together.
 JNI methods for `dev.verdeai.core.Native` (declare `@JvmStatic external fun`):

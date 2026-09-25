@@ -140,10 +140,11 @@ pub const Host = struct {
             } });
         } else {
             failure = .{ .code = "not_found", .message = "Unknown selector or resource." };
-            if (std.mem.startsWith(u8, selector, "{")) {
+            if (std.mem.startsWith(u8, std.mem.trimStart(u8, selector, " \t\r\n"), "{")) {
                 const utility = try parse(a, selector);
-                _ = try string(utility, "utility");
-                failure = .{ .code = "unsupported", .message = "Utility is not implemented." };
+                const rendered = try @import("rendering.zig").query(a, utility);
+                data = rendered.data;
+                failure = rendered.failure;
             }
         }
         return encode(output_allocator, .{ .api_version = 1, .revision = try decimal(a, s.revision), .data = data, .@"error" = failure });
