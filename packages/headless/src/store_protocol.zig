@@ -732,6 +732,8 @@ pub const WorkspaceListRequest = struct {
 };
 
 pub const WorkspaceListResult = struct {
+    /// Serving daemon identity; binding roots are local only when this matches.
+    runtime_id: []const u8 = "",
     workspaces: []const WorkspaceListItem = &.{},
     next_cursor: ?[]const u8 = null,
     store_revision: u64 = 0,

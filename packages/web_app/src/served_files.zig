@@ -245,7 +245,7 @@ fn fetchRoots(allocator: std.mem.Allocator, io: std.Io, lister: anytype) !std.Ar
     return error.WorkspaceListTooLong;
 }
 
-/// Appends every workspace `path` and repository binding `root_path` from one
+/// Appends workspace `path` and available, serving-runtime binding `root_path` from one
 /// `workspace.list` envelope, resolved with realpath. Roots that do not exist
 /// on this host are skipped: nothing beneath them can be read anyway. Returns
 /// the owned next cursor when the daemon has more pages.
@@ -260,6 +260,7 @@ fn collectRootsFromResponse(
     if (!parsed.response.isOk()) return error.WorkspaceListFailed;
     const result = parsed.response.result orelse return error.WorkspaceListFailed;
     if (result != .object) return error.WorkspaceListFailed;
+    const runtime_id = result.object.get("runtime_id") orelse .null;
     const workspaces = result.object.get("workspaces") orelse return error.WorkspaceListFailed;
     if (workspaces != .array) return error.WorkspaceListFailed;
     for (workspaces.array.items) |workspace| {
@@ -273,6 +274,11 @@ fn collectRootsFromResponse(
             if (bindings != .array) continue;
             for (bindings.array.items) |binding| {
                 if (binding != .object) continue;
+                const binding_runtime = binding.object.get("runtime_id") orelse continue;
+                const availability = binding.object.get("availability") orelse continue;
+                if (runtime_id != .string or runtime_id.string.len == 0 or binding_runtime != .string) continue;
+                if (!std.mem.eql(u8, runtime_id.string, binding_runtime.string)) continue;
+                if (availability != .string or !std.mem.eql(u8, availability.string, "available")) continue;
                 if (binding.object.get("root_path")) |path| try appendRoot(allocator, io, roots, path);
             }
         }
@@ -490,7 +496,7 @@ test "root cache collects workspace paths and repository bindings across pages" 
 
     const page_one = try std.fmt.allocPrint(
         allocator,
-        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"workspaces\":[{{\"workspace_id\":\"w1\",\"label\":\"one\",\"path\":\"{s}\",\"repositories\":[{{\"repository_id\":\"primary\",\"label\":\"one\",\"bindings\":[{{\"runtime_id\":\"r\",\"root_path\":\"{s}\"}},{{\"runtime_id\":\"r\",\"root_path\":\"{s}\"}}]}}]}}],\"next_cursor\":\"1\",\"store_revision\":3}}}}",
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"runtime_id\":\"r\",\"workspaces\":[{{\"workspace_id\":\"w1\",\"label\":\"one\",\"path\":\"{s}\",\"repositories\":[{{\"repository_id\":\"primary\",\"label\":\"one\",\"bindings\":[{{\"runtime_id\":\"r\",\"availability\":\"available\",\"root_path\":\"{s}\"}},{{\"runtime_id\":\"r\",\"availability\":\"available\",\"root_path\":\"{s}\"}}]}}]}}],\"next_cursor\":\"1\",\"store_revision\":3}}}}",
         .{ ws_one, checkout, missing },
     );
     defer allocator.free(page_one);
@@ -670,5 +676,67 @@ test "preview cache opens reject symlinks and directories" {
         const path = try tree.path(allocator, name);
         defer allocator.free(path);
         try std.testing.expectError(error.PathOutsideWorkspace, openCacheFile(io, path));
+    }
+}
+
+test "root cache serves secondary checkout from workspace list DTO and rejects foreign bindings" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tree = try TestTree.init(allocator, io);
+    defer tree.deinit(allocator);
+    var paths: [5][]u8 = undefined;
+    var filled: usize = 0;
+    defer for (paths[0..filled]) |path| allocator.free(path);
+    for ([_][]const u8{ "primary", "secondary", "remote", "missing", "outside" }, 0..) |name, i| {
+        try tree.tmp.dir.createDirPath(io, name);
+        paths[i] = try tree.path(allocator, name);
+        filled += 1;
+        const document = try std.fs.path.join(allocator, &.{ name, "report.pdf" });
+        defer allocator.free(document);
+        try tree.writeFile(io, document);
+    }
+    // Serialize the same typed result as the daemon's workspace.list handler.
+    const result: headless.store_protocol.WorkspaceListResult = .{
+        .runtime_id = "0123456789abcdef0123456789abcdef",
+        .workspaces = &.{.{
+            .workspace_id = "two-repos",
+            .label = "Two repositories",
+            .path = paths[0],
+            .default_repository_id = "secondary",
+            .repositories = &.{
+                .{ .repository_id = "primary", .label = "Primary", .bindings = &.{
+                    .{ .runtime_id = "0123456789abcdef0123456789abcdef", .root_path = paths[0] },
+                } },
+                .{ .repository_id = "secondary", .label = "Secondary", .bindings = &.{
+                    .{ .runtime_id = "0123456789abcdef0123456789abcdef", .root_path = paths[1] },
+                    .{ .runtime_id = "fedcba9876543210fedcba9876543210", .root_path = paths[2] },
+                } },
+                .{ .repository_id = "unavailable", .label = "Unavailable", .bindings = &.{
+                    .{ .runtime_id = "0123456789abcdef0123456789abcdef", .root_path = paths[3], .availability = "missing" },
+                } },
+            },
+        }},
+    };
+    const response = try headless.protocol.encodeOkResponse(allocator, 1, result);
+    defer allocator.free(response);
+    var lister: FixtureLister = .{ .allocator = allocator, .pages = &.{response} };
+    var cache: RootCache = .{};
+    defer cache.deinit(allocator);
+    const roots: Roots = .{ .paths = try cache.snapshot(allocator, io, 0, &lister) };
+    defer roots.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), roots.paths.len);
+    for (paths, 0..) |path, i| {
+        const document = try std.fs.path.join(allocator, &.{ path, "report.pdf" });
+        defer allocator.free(document);
+        if (i < 2) {
+            const file = try roots.open(allocator, io, document);
+            defer file.close(io);
+            const bytes = try readAlloc(allocator, io, file, 100);
+            defer allocator.free(bytes);
+            try std.testing.expectEqualStrings("%PDF-1.4\n", bytes);
+        } else {
+            // handleWorkspaceFile maps this confinement error to HTTP 403.
+            try std.testing.expectError(error.PathOutsideWorkspace, roots.open(allocator, io, document));
+        }
     }
 }

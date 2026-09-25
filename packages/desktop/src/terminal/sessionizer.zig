@@ -10885,31 +10885,6 @@ fn encodeMessageIndex(
     return std.fmt.allocPrint(allocator, "{c}:{d}", .{ prefix, index }) catch return error.OutOfMemory;
 }
 
-fn makePrimaryRepository(
-    allocator: std.mem.Allocator,
-    runtime_id: []const u8,
-    root_path: []const u8,
-) daemon_store.StoreError!store_protocol.Repository {
-    const repository_id = allocator.dupe(u8, store_protocol.PRIMARY_REPOSITORY_ID) catch return error.OutOfMemory;
-    errdefer allocator.free(repository_id);
-    const label = allocator.dupe(u8, "Primary") catch return error.OutOfMemory;
-    errdefer allocator.free(label);
-    const binding_runtime_id = allocator.dupe(u8, runtime_id) catch return error.OutOfMemory;
-    errdefer allocator.free(binding_runtime_id);
-    const binding_root_path = allocator.dupe(u8, root_path) catch return error.OutOfMemory;
-    errdefer allocator.free(binding_root_path);
-    const bindings = allocator.alloc(store_protocol.RepositoryBinding, 1) catch return error.OutOfMemory;
-    bindings[0] = .{
-        .runtime_id = binding_runtime_id,
-        .root_path = binding_root_path,
-    };
-    return .{
-        .repository_id = repository_id,
-        .label = label,
-        .bindings = bindings,
-    };
-}
-
 fn freeRepository(allocator: std.mem.Allocator, repository: store_protocol.Repository) void {
     allocator.free(repository.repository_id);
     allocator.free(repository.label);
@@ -10918,6 +10893,7 @@ fn freeRepository(allocator: std.mem.Allocator, repository: store_protocol.Repos
     for (repository.bindings) |binding| {
         allocator.free(binding.runtime_id);
         allocator.free(binding.root_path);
+        allocator.free(binding.availability);
     }
     if (repository.bindings.len > 0) allocator.free(repository.bindings);
 }
@@ -10926,6 +10902,7 @@ fn freeWorkspaceListItem(allocator: std.mem.Allocator, item: store_protocol.Work
     allocator.free(item.workspace_id);
     allocator.free(item.label);
     allocator.free(item.path);
+    allocator.free(item.default_repository_id);
     for (item.repositories) |repository| freeRepository(allocator, repository);
     if (item.repositories.len > 0) allocator.free(item.repositories);
 }
@@ -10963,19 +10940,20 @@ fn loadWorkspaceListResult(
         errdefer allocator.free(label);
         const path = allocator.dupe(u8, row.text(2)) catch return error.OutOfMemory;
         errdefer allocator.free(path);
-        const repository = try makePrimaryRepository(allocator, runtime_id, row.text(2));
-        errdefer freeRepository(allocator, repository);
-        const repositories = allocator.alloc(store_protocol.Repository, 1) catch return error.OutOfMemory;
-        repositories[0] = repository;
-        errdefer allocator.free(repositories);
+        // The stored manifest owns all bindings, including secondary checkouts.
+        // Transfer its allocations into the list item after append succeeds.
+        var manifest = try store.loadWorkspaceRepositoryManifest(workspace_id);
+        errdefer manifest.deinit(allocator);
         items.append(allocator, .{
             .workspace_id = workspace_id,
             .label = label,
             .path = path,
             .sort_index = std.math.cast(usize, row.int(3)) orelse return error.StoreCorrupt,
             .archived = row.int(4) != 0,
-            .repositories = repositories,
+            .repositories = manifest.repositories,
+            .default_repository_id = manifest.default_repository_id,
         }) catch return error.OutOfMemory;
+        allocator.free(manifest.workspace_id);
     }
     if (rows.err) |_| return error.StoreUnavailable;
 
@@ -10997,6 +10975,7 @@ fn loadWorkspaceListResult(
     } else null;
     errdefer if (next_cursor) |value| allocator.free(value);
     return .{
+        .runtime_id = runtime_id,
         .workspaces = items.toOwnedSlice(allocator) catch return error.OutOfMemory,
         .next_cursor = next_cursor,
         .store_revision = store_revision,
@@ -14291,6 +14270,89 @@ fn jsonValueIsPresent(value: ?std.json.Value) bool {
         .null => false,
         else => true,
     };
+}
+
+test "workspace list exposes stored secondary repository bindings" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+    try tmp.dir.createDirPath(std.testing.io, "secondary");
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const temporary_root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const repository_root = try std.fs.path.join(allocator, &.{ root_buffer[0..temporary_root_len], "repo" });
+    defer allocator.free(repository_root);
+    const secondary_root = try std.fs.path.join(allocator, &.{ root_buffer[0..temporary_root_len], "secondary" });
+    defer allocator.free(secondary_root);
+
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    const service = try allocator.create(StoreService);
+    const store = daemon_store.Store.initWithRuntimeIdentity(allocator, db_path, .none, .{
+        .runtime_id = daemon.runtime_id,
+        .instance_id = daemon.instance_id,
+    }) catch |err| {
+        allocator.destroy(service);
+        return err;
+    };
+    service.* = .{
+        .store = store,
+    };
+    daemon.store_service = service;
+    defer detachTestStoreService(&daemon);
+
+    {
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        _ = try service.store.upsertWorkspace(.{
+            .mutation = .{ .request_key = "route-workspace", .client_id = "route-test" },
+            .workspace = .{
+                .workspace_id = "route-workspace",
+                .label = "Route workspace",
+                .path = repository_root,
+                .default_repository_id = "secondary",
+                .repositories = &.{
+                    .{ .repository_id = "primary", .label = "Primary", .bindings = &.{
+                        .{ .runtime_id = daemon.runtime_id, .root_path = repository_root },
+                    } },
+                    .{ .repository_id = "secondary", .label = "Secondary", .bindings = &.{
+                        .{ .runtime_id = daemon.runtime_id, .root_path = secondary_root },
+                        .{ .runtime_id = "0123456789abcdef0123456789abcdef", .root_path = "/remote/checkout", .availability = "missing" },
+                    } },
+                },
+            },
+        });
+    }
+
+    const response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"workspace.list","params":{}}
+    );
+    defer allocator.free(response);
+    var parsed = try headless.parseResponse(allocator, response);
+    defer parsed.deinit();
+    try std.testing.expect(parsed.response.isOk());
+    const result = parsed.response.result.?.object;
+    try std.testing.expectEqualStrings(daemon.runtime_id, result.get("runtime_id").?.string);
+    const workspace = result.get("workspaces").?.array.items[0].object;
+    try std.testing.expectEqualStrings("secondary", workspace.get("default_repository_id").?.string);
+    const repositories = workspace.get("repositories").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), repositories.len);
+    const secondary = repositories[1].object;
+    try std.testing.expectEqualStrings("secondary", secondary.get("repository_id").?.string);
+    const bindings = secondary.get("bindings").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), bindings.len);
+    for (bindings) |binding| {
+        const value = binding.object;
+        if (std.mem.eql(u8, daemon.runtime_id, value.get("runtime_id").?.string)) {
+            try std.testing.expectEqualStrings(secondary_root, value.get("root_path").?.string);
+            try std.testing.expectEqualStrings("available", value.get("availability").?.string);
+        } else {
+            try std.testing.expectEqualStrings("/remote/checkout", value.get("root_path").?.string);
+            try std.testing.expectEqualStrings("missing", value.get("availability").?.string);
+        }
+    }
 }
 
 test "repository-routed chat resolves only the daemon binding and persists the stable route" {
