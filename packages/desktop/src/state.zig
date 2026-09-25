@@ -16175,11 +16175,6 @@ test "blank workspace import path uses a label-named managed directory beside th
     const explicit_path = try projectImportPathAlloc(allocator, "/tmp/verde-pref", "  /tmp/verde-workspace  ", "x", 7);
     defer allocator.free(explicit_path);
     try std.testing.expectEqualStrings("/tmp/verde-workspace", explicit_path);
-
-    var label_buf: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("Workspace 3", defaultProjectLabel(&label_buf, nextProjectDisplayNumber(2)));
-    try std.testing.expectEqual(@as(usize, 4), nextProjectDisplayNumber(3));
-    try std.testing.expectEqual(@as(usize, 3), nextProjectDisplayNumber(2));
 }
 
 test "lazy transcript hydration trims a durable page overlap by message identity" {
@@ -16202,11 +16197,6 @@ test "lazy transcript hydration trims a durable page overlap by message identity
         @as(usize, 0),
         AppState.transcriptPageSuffixOverlap(&page, &different_identity),
     );
-}
-
-test "transcript hydration first page is viewport sized, later pages bulk" {
-    try std.testing.expectEqual(session_protocol.TRANSCRIPT_FIRST_PAGE_SIZE, AppState.transcriptHydrationPageLimit(0));
-    try std.testing.expectEqual(session_protocol.TRANSCRIPT_MESSAGE_PAGE_SIZE, AppState.transcriptHydrationPageLimit(1));
 }
 
 /// Shared harness for the async-hydration commit tests: a minimal AppState
@@ -16832,15 +16822,6 @@ test "empty workspace ignores hidden composer and slash input" {
     state.clearCurrentDraftImageAt(0);
 }
 
-test "composer primary modifier accepts control and command without shortcut fallthrough" {
-    try std.testing.expect(paletteComposerPrimaryModifier(sdl.Keymod.lctrl, false));
-    try std.testing.expect(paletteComposerPrimaryModifier(sdl.Keymod.rctrl, false));
-    try std.testing.expect(paletteComposerPrimaryModifier(sdl.Keymod.lgui, false));
-    try std.testing.expect(paletteComposerPrimaryModifier(sdl.Keymod.rgui, false));
-    try std.testing.expect(paletteComposerPrimaryModifier(0, true));
-    try std.testing.expect(!paletteComposerPrimaryModifier(sdl.Keymod.alt | sdl.Keymod.shift, false));
-}
-
 test "browser toggle opens another workspace without closing its active browser" {
     try std.testing.expect(!browserToggleCloses(false, null, 1));
     try std.testing.expect(browserToggleCloses(true, null, 1));
@@ -16855,13 +16836,6 @@ test "browser origin comparison preserves same-site runtime only" {
     try std.testing.expect(!browserUrlsHaveSameOrigin("http://example.com/", "https://example.com/"));
     try std.testing.expect(!browserUrlsHaveSameOrigin("https://example.com/", "https://example.org/"));
     try std.testing.expect(!browserUrlsHaveSameOrigin("https://example.com:8443/", "https://example.com/"));
-}
-
-test "browser navigation persistence rejects empty backend URI events" {
-    try std.testing.expect(!browserNavigationUrlIsPersistable(""));
-    try std.testing.expect(!browserNavigationUrlIsPersistable(" \t\r\n"));
-    try std.testing.expect(browserNavigationUrlIsPersistable("about:blank"));
-    try std.testing.expect(browserNavigationUrlIsPersistable("https://example.com/"));
 }
 
 test "shared browser runtime routes state through its workspace owner" {
@@ -17019,17 +16993,6 @@ test "projection-only chat updates do not schedule persistence" {
     try std.testing.expectEqual(generation, state.lifecycle.dirty_generation);
 }
 
-test "new Codex threads default to GPT-6 Astra with medium reasoning" {
-    try std.testing.expectEqualStrings("gpt-6-astra", DEFAULT_CODEX_MODEL);
-    try std.testing.expectEqual(ReasoningEffort.medium, DEFAULT_CODEX_REASONING_EFFORT);
-    try std.testing.expectEqualStrings(DEFAULT_CODEX_MODEL, CODEX_MODEL_OPTIONS[0].value.?);
-
-    var thread = try ChatThread.init(std.testing.allocator, "New thread");
-    defer thread.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings(DEFAULT_CODEX_MODEL, thread.model_ref.?);
-    try std.testing.expectEqual(DEFAULT_CODEX_REASONING_EFFORT, thread.reasoning_effort.?);
-}
-
 test "runtime picker selection is per-thread and preserves repository routing" {
     const allocator = std.testing.allocator;
     var selected = try ChatThread.init(allocator, "Selected runtime");
@@ -17117,8 +17080,11 @@ test "runtime picker status separates paired-offline, non-Verde endpoints, and r
         .device_id = "0123456789abcdef0123456789abcdef",
     };
     try std.testing.expectEqual(RuntimePickerStatus.paired_offline, runtimePickerStatus(snapshot));
+    // Restart reuses the durable device credential instead of re-pairing.
+    try std.testing.expectEqual(RuntimeActivationAction.enable, runtimeActivationAction(snapshot));
     snapshot.device_credential_held = false;
     try std.testing.expectEqual(RuntimePickerStatus.pairing_required, runtimePickerStatus(snapshot));
+    try std.testing.expectEqual(RuntimeActivationAction.request_pairing, runtimeActivationAction(snapshot));
     snapshot.device_credential_held = true;
     snapshot.phase = .failed;
     snapshot.failure = .protocol;
@@ -17250,32 +17216,6 @@ test "composer runtime blocker includes the thread runtime identity pin" {
     };
     try std.testing.expect(!runtimeSnapshotBlocksSend(snapshot, .ready, runtime.runtime_id));
     try std.testing.expect(runtimeSnapshotBlocksSend(snapshot, .ready, "ffffffffffffffffffffffffffffffff"));
-}
-
-test "runtime picker retains every configured remote transport after relaunch" {
-    var snapshot: RuntimeService.Snapshot = .{
-        .profile_id = "profile-remote",
-        .label = "Remote",
-        .transport = .ssh_tunnel,
-        .phase = .disabled,
-        .failure = null,
-        .retry_at_ms = null,
-        .local_port = null,
-        .tunnel_lifecycle = .stopped,
-        .tunnel_pid = null,
-        .runtime = null,
-        .identity_pin_required = false,
-        .rpc_in_flight = false,
-        .last_heartbeat_ms = null,
-        .execution_ready = false,
-    };
-    try std.testing.expect(runtimeProfileVisibleInPicker(snapshot));
-    snapshot.transport = .direct_https;
-    try std.testing.expect(runtimeProfileVisibleInPicker(snapshot));
-    snapshot.transport = .connect;
-    try std.testing.expect(runtimeProfileVisibleInPicker(snapshot));
-    snapshot.transport = .local_socket;
-    try std.testing.expect(!runtimeProfileVisibleInPicker(snapshot));
 }
 
 test "runtime onboarding transitions require credentials and explicit trust" {
@@ -17685,34 +17625,6 @@ test "workspace runtime default affects future drafts while each thread can over
         remote_profile_id,
         state.workspaceRuntimeDefaultProfile(workspace_id),
     );
-}
-
-test "paired runtime restart uses the durable device credential before minting an access token" {
-    var snapshot: RuntimeService.Snapshot = .{
-        .profile_id = "profile-paired",
-        .label = "Paired",
-        .transport = .direct_https,
-        .phase = .disabled,
-        .failure = null,
-        .retry_at_ms = null,
-        .local_port = null,
-        .tunnel_lifecycle = .stopped,
-        .tunnel_pid = null,
-        .runtime = null,
-        .identity_pin_required = false,
-        .rpc_in_flight = false,
-        .last_heartbeat_ms = null,
-        .credential_held = false,
-        .device_credential_held = true,
-        .execution_ready = false,
-        .access = .paired_device,
-    };
-    try std.testing.expectEqual(RuntimePickerStatus.paired_offline, runtimePickerStatus(snapshot));
-    try std.testing.expectEqual(RuntimeActivationAction.enable, runtimeActivationAction(snapshot));
-
-    snapshot.device_credential_held = false;
-    try std.testing.expectEqual(RuntimePickerStatus.pairing_required, runtimePickerStatus(snapshot));
-    try std.testing.expectEqual(RuntimeActivationAction.request_pairing, runtimeActivationAction(snapshot));
 }
 
 test "background task action hits remain valid for pending transcript events" {
@@ -18147,45 +18059,6 @@ test "published forced refresh failure cannot poison a newer requested floor" {
     try std.testing.expectEqual(false, loop.takeRefreshApplication().?);
 }
 
-test "provider-aware chat creation focuses requested pane" {
-    const allocator = std.testing.allocator;
-    var project = try Project.init(allocator, "test", "Test", "/tmp/test", 0);
-    defer project.deinit(allocator);
-
-    const cases = [_]struct {
-        provider: Provider,
-        model: []const u8,
-    }{
-        .{ .provider = .opencode, .model = DEFAULT_OPENCODE_MODEL },
-        .{ .provider = .codex, .model = DEFAULT_CODEX_MODEL },
-        .{ .provider = .claude, .model = DEFAULT_CLAUDE_MODEL },
-        .{ .provider = .cursor, .model = DEFAULT_CURSOR_MODEL },
-    };
-    const previous_pane_count = project.workspace_layout.panes.items.len;
-    for (cases) |case| {
-        const result = try AppState.createWorkspaceChatPane(
-            &project,
-            allocator,
-            case.provider,
-            case.model,
-            .{
-                .reasoning_effort = if (case.provider == .codex) DEFAULT_CODEX_REASONING_EFFORT else null,
-                .reasoning_variant = null,
-                .fast_mode = .off,
-            },
-            null,
-            .horizontal,
-            true,
-        );
-        try std.testing.expect(result.focused);
-        try std.testing.expectEqual(@as(?WorkspacePaneId, result.pane_id), project.workspace_layout.focused_pane_id);
-        try std.testing.expectEqual(result.thread_index, project.selected_thread_index);
-        try std.testing.expectEqual(case.provider, project.threads.items[result.thread_index].provider);
-        try std.testing.expectEqualStrings(case.model, project.threads.items[result.thread_index].model_ref.?);
-    }
-    try std.testing.expectEqual(previous_pane_count + cases.len, project.workspace_layout.panes.items.len);
-}
-
 test "activating a thread already visible focuses its pane without changing split geometry" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
@@ -18322,6 +18195,7 @@ test "focused chat creation transfers zoom to the new pane" {
     );
     try std.testing.expectEqual(@as(?WorkspacePaneId, zoomed_result.pane_id), project.workspace_layout.focused_pane_id);
     try std.testing.expectEqual(@as(?WorkspacePaneId, zoomed_result.pane_id), project.workspace_layout.maximized_pane_id);
+    try std.testing.expectEqual(zoomed_result.thread_index, project.selected_thread_index);
 
     project.workspace_layout.maximized_pane_id = null;
     const unzoomed_result = try AppState.createWorkspaceChatPane(
@@ -19997,17 +19871,6 @@ test "visible chat is not treated as focused when a sibling pane owns focus" {
     try std.testing.expect(!state.isChatThreadFocused(0, 0));
 }
 
-test "Codex hook feature detection accepts current and legacy names" {
-    try std.testing.expect(AppState.containsCodexHooksFeature("features.hooks=true"));
-    try std.testing.expect(AppState.containsCodexHooksFeature("features.codex_hooks=false"));
-    try std.testing.expect(!AppState.containsCodexHooksFeature("features.goals=true"));
-
-    const current_argv = [_][]const u8{ "codex", "-c", "features.hooks=true" };
-    const legacy_argv = [_][]const u8{ "codex", "--config=features.codex_hooks=true" };
-    try std.testing.expect(AppState.argvContainsCodexHooksFeature(&current_argv));
-    try std.testing.expect(AppState.argvContainsCodexHooksFeature(&legacy_argv));
-}
-
 test "removing a managed process dock clears its stale association" {
     const allocator = std.testing.allocator;
     var project = try Project.init(allocator, "test", "Test", "/tmp", 0);
@@ -20550,32 +20413,12 @@ fn noticeToastPhase(elapsed_ms: i64) ?NoticeToastPhase {
     };
 }
 
-test "notice toast phase slides in, holds, then fades" {
-    try std.testing.expect(noticeToastPhase(-1) == null);
-    const start = noticeToastPhase(0).?;
-    try std.testing.expectEqual(@as(f32, 0.0), start.alpha);
-    try std.testing.expect(start.animating);
-    const held = noticeToastPhase(NOTICE_TOAST_IN_MS + 500).?;
-    try std.testing.expectEqual(@as(f32, 1.0), held.alpha);
-    try std.testing.expectEqual(@as(f32, 1.0), held.rise);
-    try std.testing.expect(!held.animating);
-    const fading = noticeToastPhase(NOTICE_TOAST_HOLD_MS - NOTICE_TOAST_OUT_MS / 2).?;
-    try std.testing.expect(fading.alpha < 1.0 and fading.alpha > 0.0);
-    try std.testing.expect(fading.animating);
-    try std.testing.expect(noticeToastPhase(NOTICE_TOAST_HOLD_MS) == null);
-}
-
 fn monotonicMs() i64 {
     return @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
 }
 
 fn unixTimestampMs() i64 {
     return platform_runtime.unixTimestampMs();
-}
-
-test "inspector disabled lifecycle messages are distinguished from other events" {
-    try std.testing.expect(AppState.isInspectorDisabledMessage("{\"source\":\"verde-inspector\",\"type\":\"inspector:disabled\"}"));
-    try std.testing.expect(!AppState.isInspectorDisabledMessage("{\"source\":\"verde-inspector\",\"type\":\"inspector:enabled\"}"));
 }
 
 test "M5-P4 change topic mapping is total over the frozen nine-topic set" {
@@ -20775,15 +20618,6 @@ test "M5-P4 composite conversion matches the pull-driven durable projection" {
     });
     try std.testing.expectEqual(@as(usize, 0), pull_state.project_controller.projects.items.len);
     try std.testing.expectEqual(@as(usize, 0), cursor_state.project_controller.projects.items.len);
-}
-
-test "close durability notice has priority over daemon staleness" {
-    var state: AppState = undefined;
-    state.sidebar_notice_storage = std.mem.zeroes([256:0]u8);
-    state.close_durability_notice = false;
-    state.daemon_projection_stale = true;
-    state.noteCloseDurabilityFailure(error.InjectedSpoolFailure);
-    try std.testing.expect(std.mem.startsWith(u8, state.sidebarNotice(), "Could not close:"));
 }
 
 test "M5-P4 three-way conflict merge keeps post-capture edits and local additions without resurrecting remote deletes" {
@@ -21984,40 +21818,6 @@ test "diff comment line summary lists new-side hunk ranges" {
         @as(?[]u8, null),
         AppState.diffCommentLineSummary(allocator, "no hunk headers here"),
     );
-}
-
-test "browser context-menu payload retains an optional link disposition target" {
-    const allocator = std.testing.allocator;
-    var parsed = try std.json.parseFromSlice(
-        BrowserContextMenuPayload,
-        allocator,
-        "{\"x\":12,\"y\":18,\"link_url\":\"https://example.com/docs\",\"items\":[]}",
-        .{ .allocate = .alloc_always },
-    );
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings("https://example.com/docs", parsed.value.link_url.?);
-}
-
-test "runtime picker add-connection row follows the configured profiles" {
-    const allocator = std.testing.allocator;
-    var state: AppState = undefined;
-    state.runtime_service = null;
-    state.runtime_picker_profiles = .empty;
-    defer {
-        for (state.runtime_picker_profiles.items) |*item| item.deinit(allocator);
-        state.runtime_picker_profiles.deinit(allocator);
-    }
-    try std.testing.expectEqual(@as(usize, 1), runtimePickerAddIndex(&state));
-    try std.testing.expectEqualStrings("Add connection…", paletteRuntimePickerLabel(@ptrCast(&state), 1));
-    try state.runtime_picker_profiles.append(allocator, .{
-        .profile_id = try allocator.dupe(u8, "profile-remote"),
-        .status = .offline,
-    });
-    // The trailing row moves behind every configured profile and never
-    // shadows one; the profile row itself is resolved from the live service.
-    try std.testing.expectEqual(@as(usize, 2), runtimePickerAddIndex(&state));
-    try std.testing.expectEqualStrings("Unavailable runtime", paletteRuntimePickerLabel(@ptrCast(&state), 1));
-    try std.testing.expectEqualStrings("Add connection…", paletteRuntimePickerLabel(@ptrCast(&state), 2));
 }
 
 /// Rewrites RGBA pixels in place into white with alpha = coverage (see

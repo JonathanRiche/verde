@@ -70,10 +70,6 @@ export function workspaceSelectIntent(
   return { kind: 'open-new-chat', workspace_id: selected_workspace_id }
 }
 
-export function threadAfterWorkspaceSelect<T extends object>(thread: T): T {
-  return thread
-}
-
 /**
  * After a snapshot/reconnect, keep the open pane's workspace. The desktop
  * selected-workspace index is used only when nothing is focused or restorable.

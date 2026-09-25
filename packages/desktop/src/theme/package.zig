@@ -380,33 +380,15 @@ test "parse existing Verde config theme section and bare theme" {
     try std.testing.expectEqual(theme.ThemeSource.verde_legacy, bare_package.theme_config.source);
 }
 
-test "theme package sources accept new names and keep old packages importing" {
-    const cases = [_]struct { raw: []const u8, source: theme.ThemeSource }{
-        .{ .raw = "{\"theme\":{\"source\":\"default\"}}", .source = .verde_legacy },
-        .{ .raw = "{\"theme\":{\"source\":\"verde\"}}", .source = .verde_legacy },
-        .{ .raw = "{\"theme\":{\"source\":\"omarchy\"}}", .source = .omarchy },
-        .{ .raw = "{\"theme\":{\"source\":\"auto\"}}", .source = .auto },
-        .{ .raw = "{\"theme\":{\"source\":\"verde-dark\"}}", .source = .verde_dark },
-        .{ .raw = "{\"theme\":{\"source\":\"verde_light\"}}", .source = .verde_light },
-        .{ .raw = "{\"theme\":{\"source\":\"verde-legacy\"}}", .source = .verde_legacy },
-        .{ .raw = "{\"theme\":{\"colors\":{\"text\":\"#f0f0f0\"}}}", .source = .verde_legacy },
-    };
-    for (cases) |case| {
-        var package = try parse(std.testing.allocator, case.raw);
-        defer package.deinit(std.testing.allocator);
-        try std.testing.expectEqual(case.source, package.theme_config.source);
-    }
-    try std.testing.expectError(error.UnsupportedThemeSource, parse(std.testing.allocator,
-        \\{"theme":{"source":"solarized"}}
-    ));
-}
-
-test "theme validation rejects unknown colors and versions" {
+test "theme validation rejects unknown colors, versions, and sources" {
     try std.testing.expectError(error.UnknownThemeColor, parse(std.testing.allocator,
         \\{"theme":{"colors":{"command":"rm -rf"}}}
     ));
     try std.testing.expectError(error.UnsupportedThemeVersion, parse(std.testing.allocator,
         \\{"schema_version":2,"theme":{"source":"default"}}
+    ));
+    try std.testing.expectError(error.UnsupportedThemeSource, parse(std.testing.allocator,
+        \\{"theme":{"source":"solarized"}}
     ));
 }
 

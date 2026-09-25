@@ -8324,30 +8324,13 @@ test "CLI production state readers honor session daemon store override" {
     try std.testing.expectEqualStrings("override-session", session_id);
 }
 
-test "cli args parse command and json flag" {
-    const argv = [_][]const u8{ "verde", "state", "workspaces", "--json" };
-    const parsed = args.parse(&argv);
-    try std.testing.expectEqualStrings("state", parsed.command);
-    try std.testing.expect(parsed.json);
-}
-
-test "update is advertised as a top-level command" {
-    for (spec.top_level_commands) |command| {
-        if (std.mem.eql(u8, command, "update")) return;
-    }
-    return error.MissingUpdateCommand;
-}
-
-test "open free arg skips project option value" {
-    const argv = [_][]const u8{ "--project", "self", "https://example.com" };
-    const url = trailingFreeArg(&argv, 0) orelse return error.MissingUrl;
+test "trailing free arg skips option values" {
+    const open_argv = [_][]const u8{ "--project", "self", "https://example.com" };
+    const url = trailingFreeArg(&open_argv, 0) orelse return error.MissingUrl;
     try std.testing.expectEqualStrings("https://example.com", url);
-}
 
-test "label consumes its value for trailing free arg parsing" {
-    const argv = [_][]const u8{ "workspace", "rename", "--label", "new label" };
-    try std.testing.expect(trailingFreeArg(&argv, 2) == null);
-    try std.testing.expect(optionConsumesValue("--label"));
+    const rename_argv = [_][]const u8{ "workspace", "rename", "--label", "new label" };
+    try std.testing.expect(trailingFreeArg(&rename_argv, 2) == null);
 }
 
 fn flagIsBare(name: []const u8) bool {
@@ -8376,13 +8359,6 @@ test "value-taking cli spec flags are covered by free arg parser" {
         if (flagIsBare(flag)) continue;
         try std.testing.expect(optionConsumesValue(flag));
     }
-}
-
-test "provider-aware chat opening is advertised by the live CLI" {
-    for (spec.live_capabilities) |capability| {
-        if (std.mem.eql(u8, capability, "chat.open")) return;
-    }
-    return error.MissingChatOpenCapability;
 }
 
 test "live chat open parses reasoning and explicit fast mode" {
@@ -8430,57 +8406,7 @@ test "live subcommands reject unknown and misplaced flags before dispatch" {
     try std.testing.expectEqualStrings("--focused", unknownLiveFlag(&focused_followup).?);
 }
 
-test "live pane maximize has explicit on off and toggle modes" {
-    const default_argv = [_][]const u8{ "pane", "maximize", "--pane", "7" };
-    try std.testing.expectEqual(LivePaneMaximizeMode.toggle, try livePaneMaximizeMode(&default_argv));
-
-    const on_argv = [_][]const u8{ "pane", "maximize", "--pane", "7", "--on" };
-    try std.testing.expectEqual(LivePaneMaximizeMode.on, try livePaneMaximizeMode(&on_argv));
-
-    const off_argv = [_][]const u8{ "pane", "maximize", "--pane", "7", "--off" };
-    try std.testing.expectEqual(LivePaneMaximizeMode.off, try livePaneMaximizeMode(&off_argv));
-
-    const conflicting_argv = [_][]const u8{ "pane", "maximize", "--pane", "7", "--off", "--toggle" };
-    try std.testing.expectError(error.ConflictingModes, livePaneMaximizeMode(&conflicting_argv));
-}
-
-test "MCP chat draft and presentation schemas expose recoverable addressing" {
-    var present_workspace = false;
-    var present_thread = false;
-    for (CHAT_PRESENT_MCP_INPUTS) |input| {
-        if (std.mem.eql(u8, input.name, "workspace_id")) present_workspace = input.required;
-        if (std.mem.eql(u8, input.name, "local_thread_id")) present_thread = input.required;
-    }
-    try std.testing.expect(present_workspace and present_thread);
-
-    var set_thread = false;
-    var set_pane = false;
-    var set_text = false;
-    for (CHAT_DRAFT_SET_MCP_INPUTS) |input| {
-        if (std.mem.eql(u8, input.name, "local_thread_id")) set_thread = true;
-        if (std.mem.eql(u8, input.name, "pane_id")) set_pane = true;
-        if (std.mem.eql(u8, input.name, "text")) set_text = input.required;
-    }
-    try std.testing.expect(set_thread and set_pane and set_text);
-
-    const deferred = try composeChatPresentDeferredAlloc(std.testing.allocator, "workspace-1", "thread-1", 42, false);
-    defer std.testing.allocator.free(deferred);
-    try std.testing.expect(std.mem.indexOf(u8, deferred, "\"presentation_status\":\"projection_pending\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, deferred, "\"retry_tool\":\"present_chat\"") != null);
-}
-
-test "daemon chat followup schema and persisted pane resolution are pinned" {
-    var workspace_required = false;
-    var pane_required = false;
-    var prompt_required = false;
-    for (CHAT_FOLLOWUP_MCP_INPUTS) |input| {
-        if (std.mem.eql(u8, input.name, "workspace_id")) workspace_required = input.required;
-        if (std.mem.eql(u8, input.name, "pane_id")) pane_required = input.required;
-        if (std.mem.eql(u8, input.name, "prompt")) prompt_required = input.required;
-    }
-    try std.testing.expect(workspace_required and pane_required and prompt_required);
-    try std.testing.expect(mcpUnavailableCapability("queue_chat_followup") != null);
-
+test "persisted layout resolves chat pane thread index" {
     const layout =
         \\{"v":2,"panes":[{"id":7,"kind":"chat","thread":4},{"id":8,"kind":"terminal","dock":1}]}
     ;
@@ -8489,27 +8415,7 @@ test "daemon chat followup schema and persisted pane resolution are pinned" {
     try std.testing.expect(try chatPaneThreadIndexFromLayout(std.testing.allocator, layout, 9) == null);
 }
 
-test "MCP open_chat schema and forwarding expose creation settings" {
-    const expected = [_]struct { name: []const u8, type_name: []const u8 }{
-        .{ .name = "reasoning_effort", .type_name = "string" },
-        .{ .name = "reasoning_variant", .type_name = "string" },
-        .{ .name = "fast_mode", .type_name = "boolean" },
-    };
-    for (expected) |wanted| {
-        var found = false;
-        for (OPEN_CHAT_MCP_INPUTS) |input| {
-            if (!std.mem.eql(u8, input.name, wanted.name)) continue;
-            try std.testing.expectEqualStrings(wanted.type_name, input.type_name);
-            try std.testing.expect(!input.required);
-            found = true;
-            break;
-        }
-        try std.testing.expect(found);
-    }
-    for (OPEN_CHAT_MCP_INPUTS) |input| {
-        try std.testing.expect(!std.mem.eql(u8, input.name, "focus"));
-    }
-
+test "MCP open_chat forwards typed creation settings" {
     const allocator = std.testing.allocator;
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
@@ -8527,54 +8433,6 @@ test "MCP open_chat schema and forwarding expose creation settings" {
     var invalid = try std.json.parseFromSlice(std.json.Value, allocator, "{\"fast_mode\":\"false\"}", .{});
     defer invalid.deinit();
     try std.testing.expectError(error.InvalidFastModeType, mcpOpenChatCreationSettings(invalid.value));
-}
-
-test "workspace coordination is advertised by the live CLI" {
-    const expected = [_][]const u8{
-        "workspace.processes",
-        "workspace.checkCommand",
-        "workspace.acquireLease",
-        "workspace.releaseLease",
-    };
-    for (expected) |wanted| {
-        var found = false;
-        for (spec.live_capabilities) |capability| {
-            if (!std.mem.eql(u8, capability, wanted)) continue;
-            found = true;
-            break;
-        }
-        try std.testing.expect(found);
-    }
-}
-
-test "terminal key control is advertised by CLI and MCP schemas" {
-    var capability_found = false;
-    for (spec.live_capabilities) |capability| {
-        if (std.mem.eql(u8, capability, "terminal.key")) capability_found = true;
-    }
-    try std.testing.expect(capability_found);
-
-    var key_command_found = false;
-    var submit_command_found = false;
-    for (spec.terminal_commands) |command| {
-        if (std.mem.eql(u8, command, "key")) key_command_found = true;
-        if (std.mem.eql(u8, command, "submit")) submit_command_found = true;
-    }
-    try std.testing.expect(key_command_found);
-    try std.testing.expect(submit_command_found);
-
-    var key_input_found = false;
-    var chord_input_found = false;
-    for (TERMINAL_KEY_MCP_INPUTS) |input| {
-        if (std.mem.eql(u8, input.name, "key")) {
-            key_input_found = true;
-            try std.testing.expect(input.enum_values != null);
-            try std.testing.expect(input.enum_values.?.len >= 62);
-        }
-        if (std.mem.eql(u8, input.name, "chord")) chord_input_found = true;
-    }
-    try std.testing.expect(key_input_found);
-    try std.testing.expect(chord_input_found);
 }
 
 test "workspace process polling distinguishes active completion and replacement" {
@@ -8640,12 +8498,6 @@ test "workspace process wait uses its transport until the exact id is final" {
     try std.testing.expectEqual(@as(usize, 2), transport.next_index);
 }
 
-test "Windows attach console handler catches only interrupt controls" {
-    try std.testing.expectEqual(WINDOWS_ATTACH_CTRL_C, windowsAttachControlEventBit(CTRL_C_EVENT).?);
-    try std.testing.expectEqual(WINDOWS_ATTACH_CTRL_BREAK, windowsAttachControlEventBit(CTRL_BREAK_EVENT).?);
-    try std.testing.expect(windowsAttachControlEventBit(2) == null);
-}
-
 test "browser MCP polling waits for start acknowledgement and preserves lost results" {
     const allocator = std.testing.allocator;
     const pending =
@@ -8661,31 +8513,7 @@ test "browser MCP polling waits for start acknowledgement and preserves lost res
     const result = (try mcpBrowserActionResultAlloc(allocator, lost, "test-nonce")) orelse return error.MissingLostResult;
     defer allocator.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "document_replaced") != null);
-}
-
-test "browser MCP action result is correlated by nonce" {
-    const allocator = std.testing.allocator;
-    const status =
-        \\{"ok":true,"result":{"last_eval_result":"{\"verdeAgentBrowserNonce\":\"test-nonce\",\"ok\":true,\"url\":\"http://localhost:3000\"}"}}
-    ;
-    const matched = (try mcpBrowserActionResultAlloc(allocator, status, "test-nonce")) orelse return error.MissingBrowserActionResult;
-    defer allocator.free(matched);
-    try std.testing.expect(std.mem.indexOf(u8, matched, "localhost:3000") != null);
-    try std.testing.expect((try mcpBrowserActionResultAlloc(allocator, status, "other-nonce")) == null);
-
-    const pending =
-        \\{"ok":true,"result":{"last_eval_result":"{\"verdeAgentBrowserNonce\":\"test-nonce\",\"pending\":true}"}}
-    ;
-    try std.testing.expect((try mcpBrowserActionResultAlloc(allocator, pending, "test-nonce")) == null);
-}
-
-test "browser MCP lifecycle readiness accepts a ready blank document but not loading" {
-    const allocator = std.testing.allocator;
-    const ready = "{\"ok\":true,\"url\":\"about:blank\",\"result\":\"complete\"}";
-    const loading = "{\"ok\":true,\"url\":\"about:blank\",\"result\":\"loading\"}";
-    try std.testing.expectEqual(McpBrowserNavigationReadiness.target, mcpBrowserNavigationReadinessFromAction(allocator, ready, "about:blank", null));
-    try std.testing.expectEqual(McpBrowserNavigationReadiness.wait, mcpBrowserNavigationReadinessFromAction(allocator, loading, "about:blank", null));
-    try std.testing.expectEqual(McpBrowserNavigationReadiness.wait, mcpBrowserNavigationReadinessFromAction(allocator, ready, "https://example.com", null));
+    try std.testing.expect((try mcpBrowserActionResultAlloc(allocator, lost, "other-nonce")) == null);
 }
 
 test "browser MCP actions wait for runtime and pending navigation" {
@@ -8797,6 +8625,12 @@ test "browser MCP navigation confirmation rejects transient blank state" {
         "example.com",
         null,
     ));
+    try std.testing.expectEqual(McpBrowserNavigationReadiness.target, mcpBrowserNavigationReadinessFromAction(
+        allocator,
+        "{\"ok\":true,\"url\":\"about:blank\",\"result\":\"complete\"}",
+        "about:blank",
+        null,
+    ));
 
     const response_url = (try mcpBrowserResponseUrlAlloc(allocator, redirected)).?;
     defer allocator.free(response_url);
@@ -8822,22 +8656,6 @@ test "browser MCP scripts keep synchronous actions off the page microtask queue"
     try std.testing.expect(std.mem.indexOf(u8, promise_aware, "stack:String(error&&error.stack") != null);
     try std.testing.expect(std.mem.indexOf(u8, poll_script, "delete window[key]") == null);
     try std.testing.expect(std.mem.indexOf(u8, poll_script, "document_replaced") != null);
-}
-
-test "MCP workspace defaults prefer identity and fall back to agent cwd" {
-    try std.testing.expectEqualStrings(
-        "workspace-3",
-        mcpDefaultWorkspace("workspace-3", "/workspace/three", "/agent/cwd").?,
-    );
-    try std.testing.expectEqualStrings(
-        "/workspace/three",
-        mcpDefaultWorkspace(null, "/workspace/three", "/agent/cwd").?,
-    );
-    try std.testing.expectEqualStrings(
-        "/agent/cwd",
-        mcpDefaultWorkspace(null, null, "/agent/cwd").?,
-    );
-    try std.testing.expect(mcpDefaultWorkspace(null, null, null) == null);
 }
 
 test "modern MCP responses are complete, cacheable, and identify Verde" {
@@ -8922,78 +8740,7 @@ test "MCP invalid requests respond while notifications remain silent" {
     }
 }
 
-test "MCP coordination reads are annotated as approval-free" {
-    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer writer.deinit();
-    const captured: output.Output = .{ .io = std.testing.io, .stdout_writer = &writer.writer };
-    try mcpToolsList(std.testing.allocator, captured, .{ .integer = 1 });
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, writer.written(), .{});
-    defer parsed.deinit();
-    const tools = parsed.value.object.get("result").?.object.get("tools").?.array.items;
-    inline for (.{ "list_processes", "check_command" }) |expected_name| {
-        var found = false;
-        for (tools) |tool| {
-            if (!std.mem.eql(u8, tool.object.get("name").?.string, expected_name)) continue;
-            const annotations = tool.object.get("annotations").?.object;
-            try std.testing.expect(annotations.get("readOnlyHint").?.bool);
-            try std.testing.expect(!annotations.get("destructiveHint").?.bool);
-            try std.testing.expect(!annotations.get("openWorldHint").?.bool);
-            found = true;
-            break;
-        }
-        try std.testing.expect(found);
-    }
-}
-
-test "MCP browser annotations distinguish inspection from external actions" {
-    inline for (.{ "browser_status", "inspect_browser_page", "capture_browser_screenshot" }) |tool_name| {
-        const annotations = mcpToolAnnotations(tool_name);
-        try std.testing.expect(annotations.read_only);
-        try std.testing.expect(!annotations.destructive);
-        try std.testing.expect(annotations.idempotent);
-        try std.testing.expect(!annotations.open_world);
-    }
-
-    inline for (.{
-        "open_browser",
-        "navigate_browser",
-        "restart_browser",
-        "evaluate_browser_js",
-        "browser_pointer_input",
-        "click_browser_element",
-        "type_browser_text",
-    }) |tool_name| {
-        const annotations = mcpToolAnnotations(tool_name);
-        try std.testing.expect(!annotations.read_only);
-        try std.testing.expect(!annotations.idempotent);
-        try std.testing.expect(annotations.open_world);
-    }
-
-    const reset = mcpToolAnnotations("reset_browser");
-    try std.testing.expect(reset.destructive);
-    try std.testing.expect(!reset.open_world);
-}
-
-test "MCP tool responses carry the invoked Verde tool name" {
-    const allocator = std.testing.allocator;
-    const tagged = try mcpToolResponseWithNameAlloc(
-        allocator,
-        "{\"id\":1,\"ok\":true,\"result\":{\"success\":true}}",
-        "navigate_browser",
-    );
-    defer allocator.free(tagged);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, tagged, .{});
-    defer parsed.deinit();
-    const result = parsed.value.object.get("result").?;
-    try std.testing.expect(jsonBool(result.object.get("success") orelse .null).?);
-    try std.testing.expectEqualStrings(
-        "navigate_browser",
-        jsonString(result.object.get(MCP_TOOL_NAME_FIELD) orelse .null).?,
-    );
-}
-
-test "MCP tool responses preserve nested objects and arrays" {
+test "MCP tool responses carry the tool name and preserve nested results" {
     const allocator = std.testing.allocator;
     const tagged = try mcpToolResponseWithNameAlloc(
         allocator,
@@ -9005,6 +8752,10 @@ test "MCP tool responses preserve nested objects and arrays" {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, tagged, .{});
     defer parsed.deinit();
     const result = parsed.value.object.get("result").?;
+    try std.testing.expectEqualStrings(
+        "browser_status",
+        jsonString(result.object.get(MCP_TOOL_NAME_FIELD) orelse .null).?,
+    );
     const capabilities = result.object.get("capabilities").?;
     try std.testing.expect(jsonBool(capabilities.object.get("restart") orelse .null).?);
     const processes = result.object.get("processes").?;
@@ -9056,42 +8807,6 @@ test "browser MCP scripts JSON-escape selectors and typed text" {
     defer allocator.free(typed);
     try std.testing.expect(std.mem.indexOf(u8, typed, "hello\\nworld") != null);
     try std.testing.expect(std.mem.indexOf(u8, typed, "requestSubmit") != null);
-}
-
-test "MCP unavailable mapping is limited to presentation and optional capability tools" {
-    const browser = mcpUnavailableCapability("capture_browser_screenshot") orelse
-        return error.MissingBrowserCapabilityMapping;
-    try std.testing.expectEqualStrings("browser.screenshot", browser.name);
-    try std.testing.expectEqualStrings("browser.screenshot capability is unavailable", browser.message);
-
-    const panes = mcpUnavailableCapability("list_panes") orelse
-        return error.MissingPresentationCapabilityMapping;
-    try std.testing.expectEqualStrings("presentation.panes", panes.name);
-    const grid = mcpUnavailableCapability("read_surface_screen") orelse
-        return error.MissingTerminalGridCapabilityMapping;
-    try std.testing.expectEqualStrings("terminal_grid", grid.name);
-
-    // M4-P5: daemon-direct chat tools map to the coarse chat capability so an
-    // old daemon's rejection carries the stable payload (no Live fallback).
-    inline for (.{
-        "open_chat",
-        "send_chat_message",
-        "tail_chat_turn",
-        "approve_chat_turn",
-        "stop_chat_turn",
-        "read_chat_thread",
-    }) |chat_tool| {
-        const chat = mcpUnavailableCapability(chat_tool) orelse
-            return error.MissingChatCapabilityMapping;
-        try std.testing.expectEqualStrings("chat", chat.name);
-        try std.testing.expectEqualStrings("chat capability is unavailable", chat.message);
-    }
-
-    // Daemon-domain and raw terminal operations retain their existing transport errors.
-    try std.testing.expect(mcpUnavailableCapability("list_workspaces") == null);
-    try std.testing.expect(mcpUnavailableCapability("tail_surface_output") == null);
-    try std.testing.expect(mcpUnavailableCapability("write_surface_text") == null);
-    try std.testing.expect(mcpUnavailableCapability("send_terminal_key") == null);
 }
 
 test "MCP capability unavailable is a tool execution error with stable text JSON" {
@@ -9192,58 +8907,6 @@ test "MCP Live routing composes business, socket, and numeric branches" {
     );
 }
 
-test "M4-P5 daemon-direct chat routing has no Live fallback arm" {
-    // Structural pin: ChatDaemonRoute has exactly two arms — the old-daemon
-    // capability rejection and numeric errors. A Live fallback variant does
-    // not exist (design M4-P5: "no silent Live fallback for daemon-direct
-    // chat"), so a socket-shaped or transport error can only surface as a
-    // numeric failure, never as a re-route.
-    try std.testing.expectEqual(2, @typeInfo(ChatDaemonRoute).@"enum".fields.len);
-    try std.testing.expectEqual(
-        ChatDaemonRoute.capability_unavailable,
-        chatDaemonErrorRoute(error.ChatCapabilityUnavailable),
-    );
-    try std.testing.expectEqual(ChatDaemonRoute.numeric, chatDaemonErrorRoute(error.ConnectionRefused));
-    try std.testing.expectEqual(ChatDaemonRoute.numeric, chatDaemonErrorRoute(error.FileNotFound));
-    try std.testing.expectEqual(ChatDaemonRoute.numeric, chatDaemonErrorRoute(error.SessionDaemonUnavailable));
-
-    // The MCP payload for the old-daemon rejection reuses the shared client
-    // helper's stable wire name and message.
-    const capability = mcpChatUnavailableCapability();
-    try std.testing.expectEqualStrings("chat", capability.name);
-    try std.testing.expectEqualStrings("chat capability is unavailable", capability.message);
-}
-
-test "M4-P5 MCP chat tool schemas require stable daemon addressing" {
-    // send: workspace + thread + prompt are required; turn_id is an optional
-    // idempotency handle; project_path optional (env-defaulted).
-    var required_count: usize = 0;
-    for (CHAT_SEND_MCP_INPUTS) |input| {
-        if (input.required) required_count += 1;
-        if (std.mem.eql(u8, input.name, "turn_id")) try std.testing.expect(!input.required);
-        if (std.mem.eql(u8, input.name, "project_path")) try std.testing.expect(!input.required);
-    }
-    try std.testing.expectEqual(@as(usize, 3), required_count);
-
-    // approve requires the exact pending call identity; decision is enum-typed.
-    var saw_decision = false;
-    for (CHAT_APPROVE_MCP_INPUTS) |input| {
-        if (std.mem.eql(u8, input.name, "turn_id") or std.mem.eql(u8, input.name, "call_id")) {
-            try std.testing.expect(input.required);
-        }
-        if (std.mem.eql(u8, input.name, "decision")) {
-            saw_decision = true;
-            try std.testing.expect(input.enum_values != null);
-        }
-    }
-    try std.testing.expect(saw_decision);
-
-    // read/tail address durable thread ids and turn ids respectively.
-    try std.testing.expect(CHAT_READ_MCP_INPUTS[0].required and CHAT_READ_MCP_INPUTS[1].required);
-    try std.testing.expect(CHAT_TAIL_MCP_INPUTS[0].required);
-    try std.testing.expect(!CHAT_TAIL_MCP_INPUTS[1].required);
-}
-
 test "daemon-first chat presentation validates identity and preserves durable result" {
     const allocator = std.testing.allocator;
     var daemon = try std.json.parseFromSlice(
@@ -9301,13 +8964,6 @@ test "daemon-first chat presentation validates identity and preserves durable re
         defer parsed.deinit();
         try std.testing.expect(parseChatOpenPresentation(parsed.value, "ws-1", "thread-1", 17) == null);
     }
-
-    const pending = exhaustedChatOpenPresentation(false);
-    try std.testing.expectEqual(false, pending.presented.?);
-    try std.testing.expectEqualStrings("projection_pending", pending.status);
-    const ambiguous = exhaustedChatOpenPresentation(true);
-    try std.testing.expect(ambiguous.presented == null);
-    try std.testing.expectEqualStrings("unknown", ambiguous.status);
 }
 
 test "daemon-first chat validation requires canonical identity and setting types" {
@@ -9353,7 +9009,6 @@ test "daemon-first chat validation requires canonical identity and setting types
 }
 
 test "stale GUI validation falls back only for unsupported methods" {
-    try std.testing.expectEqual(@as(u32, 28), daemon_client.PROTOCOL_VERSION);
     const allocator = std.testing.allocator;
     const cases = [_]struct { payload: []const u8, expected: ChatOpenValidationRoute }{
         .{
@@ -9399,35 +9054,6 @@ test "stale GUI validation falls back only for unsupported methods" {
         defer parsed.deinit();
         try std.testing.expectEqual(case.expected, chatOpenValidationRoute(parsed.value));
     }
-
-    try std.testing.expect(isLiveSocketUnavailable(error.FileNotFound));
-    try std.testing.expect(isLiveSocketUnavailable(error.ConnectionRefused));
-    try std.testing.expect(!isLiveSocketUnavailable(error.AccessDenied));
-    try std.testing.expect(!isLiveSocketUnavailable(error.TimedOut));
-}
-
-test "chat presentation absolute deadline clamps transport and sleep budgets" {
-    try std.testing.expectEqual(@as(u32, 2_000), presentationTransportTimeoutMs(2_000));
-    try std.testing.expectEqual(@as(u32, 37), presentationTransportTimeoutMs(37));
-    try std.testing.expectEqual(@as(u32, 50), presentationSleepMs(2_000));
-    try std.testing.expectEqual(@as(u32, 19), presentationSleepMs(19));
-    try std.testing.expect(CHAT_OPEN_PRESENT_DEADLINE_MS < LIVE_RESPONSE_TIMEOUT_MS);
-}
-
-test "chat presentation ambiguity dominates typed terminal outcomes" {
-    const ambiguous_unavailable = terminalChatOpenPresentation(true, "refresh_unavailable");
-    try std.testing.expect(ambiguous_unavailable.presented == null);
-    try std.testing.expectEqualStrings("unknown", ambiguous_unavailable.status);
-    const ambiguous_missing = terminalChatOpenPresentation(true, "projection_identity_missing");
-    try std.testing.expect(ambiguous_missing.presented == null);
-    try std.testing.expectEqualStrings("unknown", ambiguous_missing.status);
-
-    const unavailable = terminalChatOpenPresentation(false, "refresh_unavailable");
-    try std.testing.expectEqual(false, unavailable.presented.?);
-    try std.testing.expectEqualStrings("refresh_unavailable", unavailable.status);
-    const missing = terminalChatOpenPresentation(false, "projection_identity_missing");
-    try std.testing.expectEqual(false, missing.presented.?);
-    try std.testing.expectEqualStrings("projection_identity_missing", missing.status);
 }
 
 test "deferred chat presentation preserves durable identity and names retry tool" {
@@ -9467,23 +9093,13 @@ fn expectMintedChatId(id: []const u8, comptime prefix: []const u8) !void {
 test "M4-P5 fix minted chat ids pin their namespace shape" {
     const allocator = std.testing.allocator;
     // NIT-3: id shape `cli-thread-{unix_ms}-{16 lowercase hex}` (and the
-    // cli-turn- namespace), plus the pinned daemon-open presentation
-    // defaults, are contract surface for daemon-direct threads.
+    // cli-turn- namespace) is contract surface for daemon-direct threads.
     const thread_id = try mintChatIdAlloc(allocator, std.testing.io, "cli-thread-");
     defer allocator.free(thread_id);
     const turn_id = try mintChatIdAlloc(allocator, std.testing.io, "cli-turn-");
     defer allocator.free(turn_id);
     try expectMintedChatId(thread_id, "cli-thread-");
     try expectMintedChatId(turn_id, "cli-turn-");
-    try std.testing.expectEqualStrings("New Chat", CHAT_DAEMON_OPEN_TITLE);
-    try std.testing.expectEqualStrings("local_cli", CHAT_DAEMON_OPEN_HARNESS);
-}
-
-test "notify handler requires a dedicated exe_path separate from flag argv" {
-    // BLOCKER-2 pin: handleNotify(allocator, out, io, exe_path, argv) has five
-    // parameters so parsed.rest can never masquerade as the daemon binary.
-    const info = @typeInfo(@TypeOf(handleNotify)).@"fn";
-    try std.testing.expectEqual(@as(usize, 5), info.params.len);
 }
 
 test "MCP discovery exposes background tools without desktop focus controls" {

@@ -2661,7 +2661,35 @@ const MAX_DETAIL_LINES: usize = 40;
 const DETAIL_LINE_BYTES: usize = 240;
 const RowAction = runtime_connections.RowAction;
 
+const RUNTIME_SUBTITLE = "Where chats run. Select a row for repository and provider readiness · Local, SSH, Direct / Tailnet, or Connect";
+const RUNTIME_HINT = "Tokens stay in memory only · started chats keep their pinned runtime · defaults apply to new chats in the selected workspace";
+
+/// Geometry tokens for the runtime row tiles. Rows are bordered tiles inside
+/// the card so each runtime reads as one unit, with padded content instead of
+/// controls flush against the tile edge.
+const RuntimeTileMetrics = struct {
+    pad: f32,
+    title_h: f32,
+    desc_h: f32,
+    button_h: f32,
+    detail_line_h: f32,
+    chevron: f32,
+
+    fn init() RuntimeTileMetrics {
+        return .{
+            .pad = theme.scaledUi(12.0),
+            .title_h = theme.scaledUi(18.0),
+            .desc_h = theme.scaledUi(16.0),
+            .button_h = theme.scaledUi(30.0),
+            .detail_line_h = theme.scaledUi(19.0),
+            .chevron = theme.scaledUi(14.0),
+        };
+    }
+};
+
 const RuntimeRowPlan = struct {
+    /// Full bordered tile for the row, including buttons and details.
+    tile: palette.Rect,
     /// Clickable header (title, badge, description) that expands the row.
     header: palette.Rect,
     buttons: [MAX_ROW_BUTTONS]palette.Rect,
@@ -2679,8 +2707,10 @@ const RuntimeCardPlan = struct {
     rows: [MAX_RUNTIME_ROWS]RuntimeRowPlan,
     row_count: usize,
     add_button: palette.Rect,
+    subtitle_h: f32,
     notice_y: f32,
     hint_y: f32,
+    hint_h: f32,
     height: f32,
 };
 
@@ -2728,7 +2758,7 @@ fn buttonWidth(label: []const u8) f32 {
 
 /// Lays out one row's buttons left-to-right, wrapping to a new line when the
 /// content width is exhausted. Returns the y after the last line.
-fn packRowButtons(plan: *RuntimeRowPlan, x: f32, y_start: f32, w: f32, m: Metrics) f32 {
+fn packRowButtons(plan: *RuntimeRowPlan, x: f32, y_start: f32, w: f32, button_h: f32, m: Metrics) f32 {
     var y = y_start;
     var cursor_x = x;
     var placed_any = false;
@@ -2736,13 +2766,13 @@ fn packRowButtons(plan: *RuntimeRowPlan, x: f32, y_start: f32, w: f32, m: Metric
         const bw = @min(buttonWidth(plan.button_labels[index]), w);
         if (placed_any and cursor_x + bw > x + w) {
             cursor_x = x;
-            y += m.row_h + m.inner_gap;
+            y += button_h + m.inner_gap;
         }
-        plan.buttons[index] = .{ .x = cursor_x, .y = y, .w = bw, .h = m.row_h };
+        plan.buttons[index] = .{ .x = cursor_x, .y = y, .w = bw, .h = button_h };
         cursor_x += bw + m.inner_gap;
         placed_any = true;
     }
-    return if (plan.button_count == 0) y_start else y + m.row_h;
+    return if (plan.button_count == 0) y_start else y + button_h;
 }
 
 fn pushButton(plan: *RuntimeRowPlan, action: RowAction, label: []const u8, style: ButtonStyle) void {
@@ -2965,32 +2995,44 @@ fn runtimeDetailLineCount(state: *const runtime.AppState, profile_id: ?[]const u
 fn planRuntimeCard(state: *const runtime.AppState, x: f32, y: f32, w: f32, m: Metrics) RuntimeCardPlan {
     var plan: RuntimeCardPlan = undefined;
     plan.row_count = 0;
+    const t = RuntimeTileMetrics.init();
     const inner_x = x + m.card_pad;
     const inner_w = w - m.card_pad * 2.0;
-    // Title, then a one-line explainer before the rows.
-    var cursor_y = y + m.card_pad + m.title_h + m.inner_gap + m.label_h + m.row_gap;
+    // Title, then a wrapped explainer before the rows.
+    plan.subtitle_h = wrappedNotesRows(RUNTIME_SUBTITLE, inner_w) * notesLineHeight();
+    var cursor_y = y + m.card_pad + m.title_h + m.inner_gap + plan.subtitle_h + m.row_gap;
     const total_rows = @min(1 + state.runtime_picker_profiles.items.len, MAX_RUNTIME_ROWS);
+    const content_x = inner_x + t.pad;
+    const content_w = @max(inner_w - t.pad * 2.0, 0.0);
     for (0..total_rows) |row| {
         const profile_id = runtimeRowProfileId(state, row);
         var row_plan: RuntimeRowPlan = undefined;
         row_plan.expanded = state.runtime_connections.isExpanded(profile_id);
-        // Title line plus description line.
-        row_plan.header = .{ .x = inner_x, .y = cursor_y, .w = inner_w, .h = m.row_h + m.label_h };
-        var next_y = row_plan.header.y + row_plan.header.h + m.inner_gap;
+        // Title line plus description line; the header spans the tile width
+        // so the whole top of the tile toggles expansion.
+        row_plan.header = .{ .x = inner_x, .y = cursor_y, .w = inner_w, .h = t.pad + t.title_h + theme.scaledUi(4.0) + t.desc_h + t.pad };
+        var next_y = row_plan.header.y + row_plan.header.h;
         planRuntimeRowButtons(state, &row_plan, profile_id);
-        next_y = packRowButtons(&row_plan, inner_x, next_y, inner_w, m);
-        row_plan.detail_y = next_y + m.inner_gap;
+        if (row_plan.button_count > 0) next_y = packRowButtons(&row_plan, content_x, next_y, content_w, t.button_h, m) + t.pad;
+        // Details sit below a hairline divider, padded on both sides.
+        row_plan.detail_y = next_y + t.pad;
         row_plan.detail_line_count = if (row_plan.expanded) runtimeDetailLineCount(state, profile_id) else 0;
-        if (row_plan.expanded) next_y = row_plan.detail_y + @as(f32, @floatFromInt(row_plan.detail_line_count)) * m.label_h;
+        if (row_plan.expanded and row_plan.detail_line_count > 0) {
+            next_y = row_plan.detail_y + @as(f32, @floatFromInt(row_plan.detail_line_count)) * t.detail_line_h + t.pad;
+        }
         row_plan.bottom = next_y;
+        row_plan.tile = .{ .x = inner_x, .y = cursor_y, .w = inner_w, .h = next_y - cursor_y };
         plan.rows[plan.row_count] = row_plan;
         plan.row_count += 1;
-        cursor_y = next_y + m.row_gap;
+        cursor_y = next_y + m.inner_gap;
     }
+    cursor_y += m.row_gap - m.inner_gap;
     plan.add_button = .{ .x = inner_x, .y = cursor_y, .w = @min(buttonWidth("Add connection…"), inner_w), .h = m.row_h };
-    plan.notice_y = plan.add_button.y + m.row_h + m.inner_gap;
-    plan.hint_y = plan.notice_y + m.label_h + m.inner_gap;
-    plan.height = (plan.hint_y + m.label_h + m.card_pad) - y;
+    const notice_h: f32 = if (state.runtime_connections.cardNotice().len > 0) m.label_h + m.inner_gap else 0.0;
+    plan.notice_y = plan.add_button.y + m.row_h + m.row_gap;
+    plan.hint_y = plan.notice_y + notice_h;
+    plan.hint_h = wrappedNotesRows(RUNTIME_HINT, inner_w) * notesLineHeight();
+    plan.height = (plan.hint_y + plan.hint_h + m.card_pad) - y;
     return plan;
 }
 
@@ -3026,27 +3068,36 @@ fn runtimeStatusColor(status: runtime.RuntimePickerStatus) [4]f32 {
 // actions, and readiness details for the expanded row.
 fn drawRuntimeCard(state: *runtime.AppState, layout: SettingsLayout) void {
     const m = metrics();
+    const t = RuntimeTileMetrics.init();
     const card = layout.runtimes_card;
     const clip = layout.body_clip;
     const plan = &layout.runtimes;
+    drawCard(state, card, clip);
     drawCardTitle(state, card, "Runtimes & connections", clip);
-    queueText(state, .{
+    queueWrappedText(state, .{
         .x = card.x + m.card_pad,
         .y = card.y + m.card_pad + m.title_h + m.inner_gap,
         .w = card.w - m.card_pad * 2.0,
-        .h = m.label_h,
-    }, "Where chats run. Select a row for repository and provider readiness · Local, SSH, Direct / Tailnet, or Connect", paletteColor(textHint()), theme.scaledUi(12.0), clip);
+        .h = plan.subtitle_h,
+    }, RUNTIME_SUBTITLE, paletteColor(textHint()), theme.scaledUi(12.0), clip);
 
     for (0..plan.row_count) |row| {
         const row_plan = &plan.rows[row];
         const profile_id = runtimeRowProfileId(state, row);
         const header = row_plan.header;
+        const tile = row_plan.tile;
         const header_hovered = isRuntimeActionHovered(state, runtime_connections.encodeRowAction(row, .expand));
-        if (row_plan.expanded) {
-            queueRoundedRectClipped(state, .{ .x = header.x, .y = header.y, .w = header.w, .h = row_plan.bottom - header.y }, paletteColor(controlSurface()), radiusSm(), clip);
-        } else if (header_hovered) {
-            queueRoundedRectClipped(state, header, paletteColor(controlHoverSurface()), radiusSm(), clip);
+        const is_default = runtimeRowIsWorkspaceDefault(state, profile_id);
+
+        // Tile surface: raised slightly above the card; the header band
+        // brightens on hover so the expand affordance is discoverable.
+        queueRoundedRectClipped(state, tile, paletteColor(raisedSurface(0.13)), radiusSm(), clip);
+        if (header_hovered) {
+            const band: palette.Rect = .{ .x = header.x, .y = header.y, .w = header.w, .h = @min(header.h, tile.h) };
+            queueRoundedRectClipped(state, band, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 10)), radiusSm(), clip);
         }
+        const border_color = if (is_default) theme.withAlpha(theme.accent(), 110) else theme.withAlpha(theme.COLOR_WHITE, if (row_plan.expanded) 34 else 22);
+        queueBorderClipped(state, tile, paletteColor(border_color), radiusSm(), theme.scaledUi(1.0), clip);
 
         var title: []const u8 = "Local";
         var description: []const u8 = "Runs on this machine";
@@ -3093,35 +3144,49 @@ fn drawRuntimeCard(state: *runtime.AppState, layout: SettingsLayout) void {
                 description = runtime.runtimePickerStatusDescription(.unavailable);
             }
         }
-        const is_default = runtimeRowIsWorkspaceDefault(state, profile_id);
-        const pad_x = theme.scaledUi(10.0);
-        const badge_w = if (badge.len > 0) text_measure.textWidth(.ui, theme.scaledUi(11.5), badge) + theme.scaledUi(16.0) else 0.0;
-        queueText(state, .{
-            .x = header.x + pad_x,
-            .y = header.y + (m.row_h - theme.scaledUi(16.0)) * 0.5,
-            .w = header.w - pad_x * 2.0 - badge_w - m.inner_gap,
-            .h = theme.scaledUi(16.0),
-        }, title, paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), clip);
+
+        // Header: title + status badge + expand chevron on the first line,
+        // description on the second.
+        const title_y = header.y + t.pad;
+        const chevron_rect: palette.Rect = .{
+            .x = header.x + header.w - t.pad - t.chevron,
+            .y = title_y + (t.title_h - t.chevron) * 0.5,
+            .w = t.chevron,
+            .h = t.chevron,
+        };
+        queueIconText(state, chevron_rect, if (row_plan.expanded) NF_COD_CHEVRON_UP else NF_COD_CHEVRON_DOWN, paletteColor(if (header_hovered) theme.COLOR_WHITE else textLabel()), t.chevron, clip);
+        var right_edge = chevron_rect.x - m.inner_gap;
         if (badge.len > 0) {
+            const badge_font = theme.scaledUi(11.5);
+            const badge_h = theme.scaledUi(20.0);
+            const badge_w = text_measure.textWidth(.ui, badge_font, badge) + theme.scaledUi(16.0);
             const badge_rect: palette.Rect = .{
-                .x = header.x + header.w - pad_x - badge_w,
-                .y = header.y + (m.row_h - theme.scaledUi(22.0)) * 0.5,
+                .x = right_edge - badge_w,
+                .y = title_y + (t.title_h - badge_h) * 0.5,
                 .w = badge_w,
-                .h = theme.scaledUi(22.0),
+                .h = badge_h,
             };
-            queueRoundedRectClipped(state, badge_rect, paletteColor(theme.withAlpha(badge_color, 40)), radiusSm(), clip);
-            queueCenteredText(state, badge_rect, badge, paletteColor(badge_color), theme.scaledUi(11.5), clip);
+            queueRoundedRectClipped(state, badge_rect, paletteColor(theme.withAlpha(badge_color, 40)), badge_h * 0.5, clip);
+            queueCenteredText(state, badge_rect, badge, paletteColor(badge_color), badge_font, clip);
+            right_edge = badge_rect.x - m.inner_gap;
         }
+        const title_x = header.x + t.pad;
+        queueText(state, .{
+            .x = title_x,
+            .y = title_y,
+            .w = @max(right_edge - title_x, 0.0),
+            .h = t.title_h,
+        }, title, paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), clip);
         var desc_buf: [360]u8 = undefined;
         const description_text = if (is_default)
             std.fmt.bufPrint(&desc_buf, "{s} · workspace default", .{description}) catch description
         else
             description;
         queueText(state, .{
-            .x = header.x + pad_x,
-            .y = header.y + m.row_h,
-            .w = header.w - pad_x * 2.0,
-            .h = m.label_h,
+            .x = title_x,
+            .y = title_y + t.title_h + theme.scaledUi(4.0),
+            .w = header.w - t.pad * 2.0,
+            .h = t.desc_h,
         }, description_text, paletteColor(textHint()), theme.scaledUi(12.0), clip);
 
         for (0..row_plan.button_count) |index| {
@@ -3129,22 +3194,41 @@ fn drawRuntimeCard(state: *runtime.AppState, layout: SettingsLayout) void {
             drawActionButton(state, row_plan.buttons[index], row_plan.button_labels[index], row_plan.button_styles[index], isRuntimeActionHovered(state, action_index), clip);
         }
 
-        if (row_plan.expanded) {
+        if (row_plan.expanded and row_plan.detail_line_count > 0) {
+            const divider_y = row_plan.detail_y - t.pad;
+            queueRoundedRectClipped(state, .{ .x = tile.x + 1.0, .y = divider_y, .w = tile.w - 2.0, .h = 1.0 }, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 18)), 0.0, clip);
             var buffer: DetailBuffer = .{};
             collectRuntimeDetailLines(state, profile_id, &buffer);
+            const dot = theme.scaledUi(6.0);
+            const dot_indent = dot + theme.scaledUi(8.0);
             for (buffer.lines[0..buffer.count], 0..) |line, line_index| {
-                const color = switch (line.tone) {
+                const line_y = row_plan.detail_y + @as(f32, @floatFromInt(line_index)) * t.detail_line_h;
+                const text_h = theme.scaledUi(16.0);
+                const text_y = line_y + (t.detail_line_h - text_h) * 0.5;
+                // Status lines get a tone dot like the Providers page;
+                // headings and notes stay plain text.
+                const status_color: ?[4]f32 = switch (line.tone) {
+                    .good => theme.success(),
+                    .warning => theme.warning(),
+                    .normal, .muted => null,
+                };
+                var text_x = title_x;
+                if (status_color) |color| {
+                    queueRoundedRectClipped(state, .{ .x = title_x, .y = line_y + (t.detail_line_h - dot) * 0.5, .w = dot, .h = dot }, paletteColor(color), dot * 0.5, clip);
+                    text_x += dot_indent;
+                }
+                const text_color = switch (line.tone) {
                     .normal => theme.COLOR_WHITE,
                     .muted => textHint(),
+                    .good => textLabel(),
                     .warning => theme.warning(),
-                    .good => theme.success(),
                 };
                 queueText(state, .{
-                    .x = header.x + pad_x,
-                    .y = row_plan.detail_y + @as(f32, @floatFromInt(line_index)) * m.label_h,
-                    .w = header.w - pad_x * 2.0,
-                    .h = m.label_h,
-                }, line.text, paletteColor(color), theme.scaledUi(12.0), clip);
+                    .x = text_x,
+                    .y = text_y,
+                    .w = @max(tile.x + tile.w - t.pad - text_x, 0.0),
+                    .h = text_h,
+                }, line.text, paletteColor(text_color), theme.scaledUi(12.0), clip);
             }
         }
     }
@@ -3154,7 +3238,7 @@ fn drawRuntimeCard(state: *runtime.AppState, layout: SettingsLayout) void {
     if (notice.len > 0) {
         queueText(state, .{ .x = card.x + m.card_pad, .y = plan.notice_y, .w = card.w - m.card_pad * 2.0, .h = m.label_h }, notice, paletteColor(theme.COLOR_YELLOW), theme.scaledUi(12.0), clip);
     }
-    queueText(state, .{ .x = card.x + m.card_pad, .y = plan.hint_y, .w = card.w - m.card_pad * 2.0, .h = m.label_h }, "Tokens stay in memory only · started chats keep their pinned runtime · defaults apply to new chats in the selected workspace", paletteColor(textHint()), theme.scaledUi(12.0), clip);
+    queueWrappedText(state, .{ .x = card.x + m.card_pad, .y = plan.hint_y, .w = card.w - m.card_pad * 2.0, .h = plan.hint_h }, RUNTIME_HINT, paletteColor(textHint()), theme.scaledUi(12.0), clip);
 }
 
 fn drawCard(state: *runtime.AppState, rect: palette.Rect, clip: palette.Rect) void {
@@ -3816,7 +3900,9 @@ fn drawHairline(state: *runtime.AppState, x: f32, y: f32, w: f32) void {
 }
 
 fn queueCenteredText(state: *runtime.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect) void {
-    const estimated_w = @as(f32, @floatFromInt(value.len)) * font_size * 0.52;
+    // Measure the real advance so button labels sit centered instead of
+    // drifting left when a per-character estimate overshoots.
+    const estimated_w = text_measure.textWidth(.ui, font_size, value);
     queueText(state, .{
         .x = rect.x + @max((rect.w - estimated_w) * 0.5, theme.scaledUi(2.0)),
         .y = rect.y + (rect.h - font_size * 1.25) * 0.5,

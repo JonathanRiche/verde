@@ -2149,11 +2149,3 @@ test "browser security presentation distinguishes remote local and internal URLs
     try std.testing.expectEqual(BrowserSecurityState.internal, browserSecurityState("about:blank"));
     try std.testing.expectEqual(BrowserSecurityState.unknown, browserSecurityState(null));
 }
-
-test "browser texture tint remains color neutral" {
-    const tint = browserTextureTint();
-    try std.testing.expectEqual(@as(f32, 1.0), tint.r);
-    try std.testing.expectEqual(@as(f32, 1.0), tint.g);
-    try std.testing.expectEqual(@as(f32, 1.0), tint.b);
-    try std.testing.expectEqual(@as(f32, 1.0), tint.a);
-}

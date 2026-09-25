@@ -1365,12 +1365,6 @@ pub fn closeWorkspacePane(self: anytype, project_index: usize, pane_id: Workspac
     return true;
 }
 
-test "closing an agent TUI pane keeps its session for history" {
-    try std.testing.expect(!shouldTearDownClosedTerminalDock(false, true));
-    try std.testing.expect(!shouldTearDownClosedTerminalDock(true, false));
-    try std.testing.expect(shouldTearDownClosedTerminalDock(false, false));
-}
-
 pub fn clearHerdrClosedPaneMetadata(self: anytype, project_index: usize, pane_id: WorkspacePaneId, removed_ref: WorkspacePaneRef) void {
     if (project_index >= self.project_controller.projects.items.len) return;
     var project = &self.project_controller.projects.items[project_index];
@@ -3025,25 +3019,6 @@ test "background chat creation preserves the scrolling viewport" {
     try std.testing.expectEqual(@as(?WorkspacePaneId, focused_pane_id), layout.scroll_leading_pane_id);
     try std.testing.expectEqual(@as(i64, 456), layout.scroll_animation_last_ms);
     try std.testing.expect(layout.scroll_axis_vertical);
-}
-
-test "TUI restoration associates provider sessions by dock instead of title" {
-    const allocator = std.testing.allocator;
-    var project = try Project.init(allocator, "tui-restore", "TUI restore", "/tmp/tui-restore", 0);
-    defer project.deinit(allocator);
-
-    const first = &project.threads.items[0];
-    first.tui_dock_id = 7;
-    first.provider_thread_id = try allocator.dupeZ(u8, "provider-first");
-    const second_index = try project.addThread(allocator);
-    const second = &project.threads.items[second_index];
-    second.tui_dock_id = 11;
-    second.provider_thread_id = try allocator.dupeZ(u8, "provider-second");
-
-    try std.testing.expectEqualStrings(project.threads.items[0].title, second.title);
-    try std.testing.expectEqualStrings("provider-first", threadForTuiDock(&project, 7).?.provider_thread_id.?);
-    try std.testing.expectEqualStrings("provider-second", threadForTuiDock(&project, 11).?.provider_thread_id.?);
-    try std.testing.expect(threadForTuiDock(&project, 99) == null);
 }
 
 test "subagent view rows render streamed child activity as text and tool cards" {

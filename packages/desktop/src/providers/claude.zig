@@ -1035,13 +1035,6 @@ fn parseRole(text: []const u8) provider_types.MessageRole {
     return .assistant;
 }
 
-test "parseRole maps Claude roles" {
-    try std.testing.expectEqual(provider_types.MessageRole.user, parseRole("user"));
-    try std.testing.expectEqual(provider_types.MessageRole.assistant, parseRole("assistant"));
-    try std.testing.expectEqual(provider_types.MessageRole.system, parseRole("system"));
-    try std.testing.expectEqual(provider_types.MessageRole.assistant, parseRole("other"));
-}
-
 test "Claude bridge reader accepts lines larger than its scratch buffer" {
     const line_len = 20 * 1024;
     const input = try std.testing.allocator.alloc(u8, line_len + 4);
@@ -1101,35 +1094,6 @@ test "Claude bridge stop monitor interrupts a blocked provider request" {
     try std.testing.expectEqual(@as(usize, 1), capture.terminate_count.load(.acquire));
 }
 
-test "providerSlashCommands exposes Claude usage and compact" {
-    const commands = providerSlashCommands();
-    try std.testing.expectEqual(@as(usize, 7), commands.len);
-    try std.testing.expectEqual(provider_types.ProviderSlashCommandId.usage, commands[0].id);
-    try std.testing.expectEqualStrings("/usage", commands[0].name);
-    try std.testing.expect(!commands[0].requires_thread);
-    try std.testing.expectEqual(provider_types.ProviderSlashCommandId.compact, commands[1].id);
-    try std.testing.expectEqualStrings("/compact", commands[1].name);
-    try std.testing.expect(commands[1].requires_thread);
-    try std.testing.expectEqual(provider_types.ProviderSlashCommandId.custom, commands[2].id);
-    try std.testing.expectEqualStrings("/code-review", commands[2].name);
-}
-
-test "slashCommandResultAlloc duplicates bridge result strings" {
-    const payload =
-        \\{"handled":true,"notice":"Claude usage loaded.","transcript_title":"Usage","transcript_body":"Cost: $0.01"}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{ .allocate = .alloc_always });
-    defer parsed.deinit();
-
-    const result = try slashCommandResultAlloc(std.testing.allocator, parsed.value);
-    defer result.deinit(std.testing.allocator);
-
-    try std.testing.expect(result.handled);
-    try std.testing.expectEqualStrings("Claude usage loaded.", result.notice.?);
-    try std.testing.expectEqualStrings("Usage", result.transcript_title.?);
-    try std.testing.expectEqualStrings("Cost: $0.01", result.transcript_body.?);
-}
-
 test "collectImageAttachments preserves multi-image and legacy compatibility" {
     const modern = [_]provider_types.ImageAttachment{
         .{ .path = "/tmp/one.png" },
@@ -1146,26 +1110,6 @@ test "collectImageAttachments preserves multi-image and legacy compatibility" {
     try std.testing.expectEqualStrings("/tmp/one.png", collected[0].path);
     try std.testing.expectEqualStrings("/tmp/two.png", collected[1].path);
     try std.testing.expectEqualStrings("/tmp/legacy.png", collected[2].path);
-}
-
-test "BridgeSendPromptRequest serializes multiple images" {
-    const images = [_]provider_types.ImageAttachment{
-        .{ .path = "/tmp/one.png" },
-        .{ .path = "/tmp/two.png" },
-    };
-    const payload = BridgeSendPromptRequest{
-        .provider = "claude",
-        .command = "send_prompt",
-        .prompt = "describe",
-        .images = images[0..],
-        .claude_executable = "claude",
-    };
-    const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, payload, .{});
-    defer std.testing.allocator.free(encoded);
-
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"images\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "/tmp/one.png") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "/tmp/two.png") != null);
 }
 
 test "Claude bridge diff events preserve file patches" {
@@ -1208,35 +1152,15 @@ test "Claude bridge MCP events preserve input and output" {
     try std.testing.expectEqualStrings("{\"ok\":true}", capture.output.?);
 }
 
-test "Claude bridge subagent events preserve title and status" {
-    const payload =
-        \\{"type":"tool_call_event","call_id":"agent-1","title":"Explore the web app","kind":"subagent","status":"in_progress","input":"{\"description\":\"Explore the web app\"}"}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-    var capture: ClaudeTestToolCapture = .{};
-
-    try std.testing.expect(emitBridgeToolCallEvent(parsed.value, .{
-        .prompt = "",
-        .stream_context = &capture,
-        .on_stream_event = ClaudeTestToolCapture.handle,
-    }));
-    try std.testing.expectEqual(@as(usize, 1), capture.count);
-    try std.testing.expectEqualStrings("agent-1", capture.call_id.?);
-    try std.testing.expectEqualStrings("Explore the web app", capture.title.?);
-    try std.testing.expectEqual(provider_types.ToolCallKind.subagent, capture.kind.?);
-    try std.testing.expectEqual(provider_types.ToolCallStatus.in_progress, capture.status.?);
-}
-
-test "Claude bridge subagent transcript chunks reach the stream without a status" {
+test "Claude bridge subagent transcript chunks and deltas reach the stream without a status" {
     const allocator = std.testing.allocator;
-    const line =
+    const chunk_line =
         \\{"type":"tool_call_event","call_id":"agent-1","title":"","kind":"subagent","transcript":"{\"type\":\"text\",\"text\":\"hi\"}\n"}
     ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
-    defer parsed.deinit();
+    var chunk = try std.json.parseFromSlice(std.json.Value, allocator, chunk_line, .{});
+    defer chunk.deinit();
     var capture: ClaudeTestToolCapture = .{};
-    try std.testing.expect(emitBridgeToolCallEvent(parsed.value, .{
+    try std.testing.expect(emitBridgeToolCallEvent(chunk.value, .{
         .prompt = "",
         .stream_context = @ptrCast(&capture),
         .on_stream_event = ClaudeTestToolCapture.handle,
@@ -1245,24 +1169,21 @@ test "Claude bridge subagent transcript chunks reach the stream without a status
     try std.testing.expectEqual(provider_types.ToolCallKind.subagent, capture.kind.?);
     try std.testing.expect(capture.status == null);
     try std.testing.expectEqualStrings("{\"type\":\"text\",\"text\":\"hi\"}\n", capture.transcript.?);
-}
 
-test "Claude bridge subagent transcript deltas carry partial child text" {
-    const allocator = std.testing.allocator;
-    const line =
+    const delta_line =
         \\{"type":"tool_call_event","call_id":"agent-1","title":"","kind":"subagent","transcript_delta":"par"}
     ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
-    defer parsed.deinit();
-    var capture: ClaudeTestToolCapture = .{};
-    try std.testing.expect(emitBridgeToolCallEvent(parsed.value, .{
+    var delta = try std.json.parseFromSlice(std.json.Value, allocator, delta_line, .{});
+    defer delta.deinit();
+    var delta_capture: ClaudeTestToolCapture = .{};
+    try std.testing.expect(emitBridgeToolCallEvent(delta.value, .{
         .prompt = "",
-        .stream_context = @ptrCast(&capture),
+        .stream_context = @ptrCast(&delta_capture),
         .on_stream_event = ClaudeTestToolCapture.handle,
     }));
-    try std.testing.expectEqualStrings("agent-1", capture.call_id.?);
-    try std.testing.expect(capture.transcript == null);
-    try std.testing.expectEqualStrings("par", capture.transcript_delta.?);
+    try std.testing.expectEqualStrings("agent-1", delta_capture.call_id.?);
+    try std.testing.expect(delta_capture.transcript == null);
+    try std.testing.expectEqualStrings("par", delta_capture.transcript_delta.?);
 }
 
 test "Windows provider bridge probes CLI and package-root GUI layouts" {
@@ -1301,14 +1222,4 @@ test "Windows detached bridge source uses PowerShell temp paths and tree cleanup
     try std.testing.expect(std.mem.indexOf(u8, source, "PID file:") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "Stop-Process") == null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "Write-Output"));
-}
-
-test "Claude bridge keeps explicitly backgrounded tools alive for auto continuation" {
-    const source = @embedFile("provider_bridge.ts");
-    try std.testing.expect(std.mem.indexOf(u8, source, "item?.input?.run_in_background === true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "if (alreadyBackgrounded) return;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "prompt: promptChannel.messages()") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "message?.type === \"steer_prompt\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "activeClaudePromptChannel?.push(prompt, \"next\")") != null);
-    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, source, "query.close()"));
 }

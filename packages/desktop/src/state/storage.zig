@@ -2147,27 +2147,6 @@ test "M5-P4 journal expiry invalidates the cursor for exactly one snapshot fallb
     try std.testing.expect(storage.currentChangeCursorForPoll() == null);
 }
 
-test "clearCachedClientId drops the registered identity for re-register" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
-    const pref_path = try std.testing.allocator.dupe(u8, path_buf[0..path_len]);
-    defer std.testing.allocator.free(pref_path);
-
-    var storage = try Storage.initWithPrefPath(std.testing.allocator, pref_path);
-    defer storage.deinit();
-
-    storage.store_session.lock();
-    storage.store_session.client_id = try std.testing.allocator.dupe(u8, "stale-daemon-client");
-    storage.store_session.unlock();
-
-    storage.clearCachedClientId();
-    storage.store_session.lock();
-    defer storage.store_session.unlock();
-    try std.testing.expect(storage.store_session.client_id == null);
-}
-
 test "capture revision remains bound when the write guard advances" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

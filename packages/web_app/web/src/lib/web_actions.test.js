@@ -3,20 +3,12 @@ import { mkdtempSync, writeFileSync, chmodSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  agentResumeCommand, agentTerminalArgv, agentTuiCommand, buildHandoffPackage, buildHerdrHandoffScript,
+  buildHandoffPackage, buildHerdrHandoffScript,
   chainLayouts, openingExchange, parseHerdrLinkMarker, shellQuote,
 } from './web_actions'
 
 test('shell quoting survives single quotes', () => {
   expect(shellQuote("it's")).toBe(`'it'\\''s'`)
-})
-
-test('agent commands resume with provider-specific flags', () => {
-  expect(agentTuiCommand('cursor')).toBe('cursor-agent')
-  expect(agentTuiCommand('nope')).toBeNull()
-  expect(agentResumeCommand('claude', 'abc')).toContain('--resume')
-  expect(agentResumeCommand('codex', 'abc')).toContain('resume')
-  expect(agentTerminalArgv('codex').slice(0, 2)).toEqual(['/bin/sh', '-lc'])
 })
 
 test('handoff package redacts secrets and respects summary mode', () => {

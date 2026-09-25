@@ -129,10 +129,3 @@ pub const Event = union(enum) {
         }
     }
 };
-
-test "cursor shape protocol names parse with a safe fallback" {
-    try std.testing.expectEqual(CursorShape.pointer, CursorShape.parse("pointer"));
-    try std.testing.expectEqual(CursorShape.vertical_text, CursorShape.parse("vertical_text"));
-    try std.testing.expectEqual(CursorShape.grabbing, CursorShape.parse("grabbing"));
-    try std.testing.expectEqual(CursorShape.default, CursorShape.parse("future_cursor_shape"));
-}

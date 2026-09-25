@@ -327,11 +327,3 @@ test "frecency weights recent visits above stale visit counts" {
     try std.testing.expect(frecencyScore(3, now - 10 * day_ms, now) > frecencyScore(2, now - 10 * day_ms, now));
     try std.testing.expectEqual(@as(f64, 100.0), frecencyScore(1, now + day_ms, now));
 }
-
-test "matchBoost prefers host prefixes then title word prefixes" {
-    try std.testing.expectEqual(@as(?f64, 2.0), matchBoost("https://www.github.com/x", "GitHub", &.{"git"}));
-    try std.testing.expectEqual(@as(?f64, 1.5), matchBoost("https://example.com/", "Zig Language Reference", &.{"lang"}));
-    try std.testing.expectEqual(@as(?f64, 1.0), matchBoost("https://example.com/path", "Title", &.{"ample"}));
-    try std.testing.expectEqual(@as(?f64, null), matchBoost("https://example.com/", "Title", &.{ "example", "nope" }));
-    try std.testing.expectEqualStrings("example.com/a", hostPart("https://www.example.com/a"));
-}

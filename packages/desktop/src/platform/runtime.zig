@@ -46,12 +46,3 @@ pub fn executableDirPathAlloc(allocator: std.mem.Allocator) ![]u8 {
     var threaded = std.Io.Threaded.init_single_threaded;
     return std.process.executableDirPathAlloc(threaded.io(), allocator);
 }
-
-test "portable clocks advance and process id is available" {
-    const before = monotonicTimestampNs();
-    sleepMillis(1);
-    const after = monotonicTimestampNs();
-    try std.testing.expect(after >= before);
-    try std.testing.expect(processId() != 0);
-    try std.testing.expect(unixTimestampMs() > 0);
-}

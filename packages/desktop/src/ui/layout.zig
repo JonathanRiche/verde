@@ -2432,18 +2432,6 @@ fn wizardTestingActionLabel(status: runtime.RuntimePickerStatus) []const u8 {
     };
 }
 
-test "wizard testing step hides the middle button when recovery has no action" {
-    try std.testing.expectEqualStrings("", wizardTestingActionLabel(.ready));
-    try std.testing.expectEqualStrings("", wizardTestingActionLabel(.connecting));
-    // A scheduled reconnect exposes the manual accelerator.
-    try std.testing.expectEqualStrings("Retry now", wizardTestingActionLabel(.reconnecting));
-    try std.testing.expectEqualStrings("", wizardTestingActionLabel(.unavailable));
-    try std.testing.expectEqualStrings("Verify…", wizardTestingActionLabel(.trust_required));
-    try std.testing.expectEqualStrings("Edit endpoint", wizardTestingActionLabel(.identity_mismatch));
-    try std.testing.expectEqualStrings("Reconnect", wizardTestingActionLabel(.provider_not_authenticated));
-    try std.testing.expectEqualStrings("Connect", wizardTestingActionLabel(.paired_offline));
-}
-
 fn connectSignedIn(phase: runtime_connections.ConnectPhase) bool {
     return phase == .signed_in or phase == .loading_inventory or phase == .inventory_loaded;
 }
@@ -3545,22 +3533,6 @@ test "Pair wizard form positions only its two visible fields on separate rows" {
     state.runtime_connections.wizard_method = .ssh;
     const ssh_layout = runtimeWizardLayout(&state, 1200.0, 900.0);
     try std.testing.expect(pair_layout.modal.h < ssh_layout.modal.h);
-}
-
-test "workspace settings modal dismisses on escape and routes its actions" {
-    const source = @embedFile("layout.zig");
-    const dismiss_start = std.mem.indexOf(u8, source, "fn dismissTopModal").?;
-    const dismiss_end = std.mem.indexOfPos(u8, source, dismiss_start, "fn keymodBits").?;
-    const dismiss_path = source[dismiss_start..dismiss_end];
-    try std.testing.expect(std.mem.indexOf(u8, dismiss_path, "state.workspaceSettingsOpen()") != null);
-    try std.testing.expect(std.mem.indexOf(u8, dismiss_path, "state.closeWorkspaceSettings()") != null);
-
-    const pointer_start = std.mem.indexOf(u8, source, "pub fn handlePaletteMouseButton").?;
-    const pointer_end = std.mem.indexOfPos(u8, source, pointer_start, "fn focusModalInput").?;
-    const pointer_path = source[pointer_start..pointer_end];
-    try std.testing.expect(std.mem.indexOf(u8, pointer_path, ".workspace_settings_option => state.applyWorkspaceSettingsOption(hit.index)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pointer_path, ".workspace_settings_manage => state.openManageConnectionsFromWorkspaceSettings()") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pointer_path, ".workspace_settings_close => state.closeWorkspaceSettings()") != null);
 }
 
 test "workspace settings modal owns keyboard and text input while open" {

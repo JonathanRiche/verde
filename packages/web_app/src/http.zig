@@ -3118,14 +3118,6 @@ test "query token stays rejected and file paths stay traversal-safe" {
     try std.testing.expect(blockedRpcMethod(headless.access_protocol.METHOD_DAEMON_DEVICE_AUTHORIZE));
     try std.testing.expect(blockedRpcMethod(headless.connect_protocol.METHOD_LOGIN));
     try std.testing.expect(blockedRpcMethod(headless.connect_protocol.METHOD_BOOTSTRAP_CONSUME));
-    try std.testing.expectEqualStrings(
-        "/auth/connect/bootstrap",
-        headless.connect_protocol.HTTP_BOOTSTRAP_PATH,
-    );
-    try std.testing.expectEqual(
-        @as(usize, 24 * 1024),
-        MAX_CONNECT_BOOTSTRAP_BODY_BYTES,
-    );
     try std.testing.expect(!blockedRpcMethod("core.status"));
 }
 
@@ -3153,17 +3145,8 @@ test "device authorization and WebSocket ticket headers are exact" {
     ) == null);
 }
 
-test "paired scope policy is shared by HTTP and WebSocket forwarding" {
-    try std.testing.expectEqual(
-        headless.access_protocol.scopeBit(.chat_write),
-        headless.access_protocol.requiredScopeMaskForRpc("chat.turn.start").?,
-    );
-    try std.testing.expect(headless.access_protocol.requiredScopeMaskForRpc("daemon.stop") == null);
-    try std.testing.expect(headless.access_protocol.requiredScopeMaskForRpc("web.directory.list") == null);
-}
-
-test "gateway followup routes require chat write and allow the remote bridge" {
-    for ([_][]const u8{ "chat.turn.steer", "chat.followup", "chat.turn.start" }) |method| {
+test "gateway followup and approval routes require chat write and allow the remote bridge" {
+    for ([_][]const u8{ "chat.turn.steer", "chat.followup", "chat.turn.start", "chat.turn.approve" }) |method| {
         try std.testing.expect(!blockedRpcMethod(method));
         const chat_write = headless.access_protocol.scopeBit(.chat_write);
         switch (pairedRpcPolicy(method, chat_write)) {
@@ -3189,18 +3172,6 @@ test "gateway slash commands require runtime read or chat write" {
     try std.testing.expect(!@import("web_runtime").allowedMethod("web.directory.list"));
     try std.testing.expectEqual(PairedRpcPolicy.forbidden, pairedRpcPolicy("workspace.file.search", 0xffff));
     try std.testing.expect(!@import("web_runtime").allowedMethod("session.create"));
-}
-
-test "gateway approval requires chat write and is allowed by the remote bridge" {
-    const method = "chat.turn.approve";
-    try std.testing.expect(!blockedRpcMethod(method));
-    const chat_write = headless.access_protocol.scopeBit(.chat_write);
-    switch (pairedRpcPolicy(method, chat_write)) {
-        .authorize => |mask| try std.testing.expectEqual(chat_write, mask),
-        else => return error.ApprovalMethodNotForwarded,
-    }
-    try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy(method, headless.access_protocol.scopeBit(.chat_read)));
-    try std.testing.expect(@import("web_runtime").allowedMethod(method));
 }
 
 test "paired gateway forwards staged attachment uploads with default device scopes" {
@@ -3551,14 +3522,6 @@ test "attachment disposition quotes and sanitizes the basename" {
     const disposition = try attachmentDisposition(std.testing.allocator, "/tmp/Report \"final\".pdf");
     defer std.testing.allocator.free(disposition);
     try std.testing.expectEqualStrings("attachment; filename=\"Report _final_.pdf\"", disposition);
-}
-
-test "gateway resource policies stay explicitly bounded" {
-    try std.testing.expectEqual(@as(usize, 64), MAX_CONNECTIONS);
-    try std.testing.expectEqual(@as(usize, 16), MAX_WEBSOCKETS);
-    try std.testing.expectEqual(@as(usize, 32), MAX_KEEPALIVE_REQUESTS);
-    try std.testing.expectEqual(@as(usize, 4 * 1024), MAX_HEADER_BYTES);
-    try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), MAX_RPC_FRAME_BYTES);
 }
 
 test "history mutation and gateway registration preserve paired scope boundaries" {

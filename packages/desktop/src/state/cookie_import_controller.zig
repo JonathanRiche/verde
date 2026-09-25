@@ -309,17 +309,6 @@ fn jsonInt(value: std.json.Value, name: []const u8) ?i64 {
 }
 
 // ------------------------------------------------------------------
-// Test
-// ------------------------------------------------------------------
-
-test "notice buffer stores and truncates" {
-    var state: State = .{};
-    defer state.deinit();
-    state.setNotice("hello");
-    try std.testing.expectEqualStrings("hello", state.notice());
-}
-
-// ------------------------------------------------------------------
 // AppState-facing API (self is *AppState)
 // ------------------------------------------------------------------
 

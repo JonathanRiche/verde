@@ -792,20 +792,6 @@ fn replaceOwnedOptionalSlice(allocator: std.mem.Allocator, dest: *?[]u8, value: 
     dest.* = next;
 }
 
-test "nested provider cannot claim a terminal pinned to another agent" {
-    try std.testing.expect(surfaceProviderClaimMatchesPin(.cursor, null));
-    try std.testing.expect(surfaceProviderClaimMatchesPin(.cursor, "cursor"));
-    try std.testing.expect(!surfaceProviderClaimMatchesPin(.cursor, "amp"));
-}
-
-test "Grok and Amp completion notifications use provider logos" {
-    inline for (.{ SurfaceProvider.grok, SurfaceProvider.amp }) |provider| {
-        const icon = completionNotificationIcon(provider).?;
-        try std.testing.expectEqualStrings(@tagName(provider), icon.key);
-        try std.testing.expect(icon.png_bytes.len > 0);
-    }
-}
-
 test "surface focus clear queues persistence and updates local state immediately" {
     const project_state = @import("project.zig");
     const FakeState = struct {

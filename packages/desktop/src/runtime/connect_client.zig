@@ -1386,31 +1386,20 @@ test "OAuth callback percent-decodes opaque code and state" {
     try std.testing.expectEqualStrings("second/code", reversed);
 }
 
-test "OAuth callback rejects malformed percent escapes" {
+test "OAuth callback rejects malformed escapes and duplicate params and ignores favicon requests" {
     var code_buffer: [128]u8 = undefined;
     defer std.crypto.secureZero(u8, &code_buffer);
-    try std.testing.expectError(
-        error.InvalidCallback,
-        parseCallbackTarget("/callback?code=opaque%2&state=expected", "/callback", "expected", &code_buffer),
-    );
-}
-
-test "OAuth callback rejects duplicate state" {
-    var code_buffer: [128]u8 = undefined;
-    defer std.crypto.secureZero(u8, &code_buffer);
-    try std.testing.expectError(
-        error.InvalidCallback,
-        parseCallbackTarget("/callback?code=opaque&state=expected&state=expected", "/callback", "expected", &code_buffer),
-    );
-}
-
-test "OAuth callback rejects duplicate code and ignores favicon requests" {
-    var code_buffer: [128]u8 = undefined;
-    defer std.crypto.secureZero(u8, &code_buffer);
-    try std.testing.expectError(
-        error.InvalidCallback,
-        parseCallbackTarget("/callback?code=first&state=expected&code=second", "/callback", "expected", &code_buffer),
-    );
+    const invalid = [_][]const u8{
+        "/callback?code=opaque%2&state=expected",
+        "/callback?code=opaque&state=expected&state=expected",
+        "/callback?code=first&state=expected&code=second",
+    };
+    for (invalid) |target| {
+        try std.testing.expectError(
+            error.InvalidCallback,
+            parseCallbackTarget(target, "/callback", "expected", &code_buffer),
+        );
+    }
     try std.testing.expectError(
         error.NotCallback,
         parseCallbackTarget("/favicon.ico", "/callback", "expected", &code_buffer),

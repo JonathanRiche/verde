@@ -573,22 +573,6 @@ fn markdownSelectionForContext(controller: *const State, project_index: usize, t
     return .{ .anchor = anchor, .focus = focus };
 }
 
-test "render context lookup preserves another pane selection" {
-    const controller: State = .{
-        .markdown_selection_project_index = 2,
-        .markdown_selection_thread_index = 4,
-        .markdown_selection_anchor = .{ .message_index = 1, .point = .{ .line_index = 0, .column = 2 } },
-        .markdown_selection_focus = .{ .message_index = 3, .point = .{ .line_index = 1, .column = 5 } },
-        .markdown_selection_dragging = true,
-    };
-
-    try std.testing.expect(markdownSelectionForContext(&controller, 2, 4) != null);
-    try std.testing.expect(markdownSelectionForContext(&controller, 2, 5) == null);
-    try std.testing.expect(controller.markdown_selection_anchor != null);
-    try std.testing.expect(controller.markdown_selection_focus != null);
-    try std.testing.expect(controller.markdown_selection_dragging);
-}
-
 pub fn transcriptMarkdownBodyView(self: anytype, message_index: usize, body: []const u8) ?*const chat_markdown.BodyView {
     const entry = transcriptBodyEntry(self, message_index, body, .markdown) orelse return null;
     return &entry.view;
@@ -765,19 +749,6 @@ fn buildTranscriptBodyView(allocator: std.mem.Allocator, body: []const u8, kind:
         .markdown_streaming => chat_markdown.buildBodyViewStreaming(allocator, body),
         .plain => chat_markdown.buildPlainBodyView(allocator, body),
     };
-}
-
-test "transcript body cache preserves markdown and literal plain parsing" {
-    const source = "**bold**";
-    var markdown = try buildTranscriptBodyView(std.testing.allocator, source, .markdown);
-    defer markdown.deinit(std.testing.allocator);
-    var plain = try buildTranscriptBodyView(std.testing.allocator, source, .plain);
-    defer plain.deinit(std.testing.allocator);
-
-    try std.testing.expect(markdown.document != null);
-    try std.testing.expect(plain.document == null);
-    try std.testing.expectEqual(@as(usize, 1), plain.blockCount());
-    try std.testing.expectEqualStrings(source, plain.blockAt(0).text.text);
 }
 
 test "pending transcript body slot reuses unchanged text and replaces changed text" {

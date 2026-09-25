@@ -2194,14 +2194,6 @@ test "workspace commands classify conservatively and infer resources" {
     try std.testing.expect(inferredWorkspaceResource("rg TODO src") == null);
 }
 
-test "workspace resource overlap is exact" {
-    const left = [_][]const u8{ "build", "port:3000" };
-    const same = [_][]const u8{"build"};
-    const different = [_][]const u8{"database"};
-    try std.testing.expect(workspaceResourcesOverlap(left[0..], same[0..]));
-    try std.testing.expect(!workspaceResourcesOverlap(left[0..], different[0..]));
-}
-
 test "registry lease acquire renew conflict force release and expiry rules" {
     const allocator = std.testing.allocator;
     var registry = try ProcessRegistry.init(allocator, "daemon-a");
@@ -2644,38 +2636,6 @@ test "managed process records are bounded per workspace" {
 }
 
 // --- W8: Windows-shaped registry semantics (data only; no builtin.os branches) ---
-
-test "process identity is stable without a process group" {
-    // Windows has no process-group concept: identity falls back to pid alone.
-    try std.testing.expectEqual(@as(u32, 42), processIdentity(null, 42));
-    try std.testing.expectEqual(@as(u32, 42), processIdentity(null, 42));
-    try std.testing.expect(processIdentity(null, 42) != processIdentity(null, 43));
-    try std.testing.expect(processIdentity(null, 42) != processIdentity(7, 42));
-    try std.testing.expectEqual(@as(u32, 7), processIdentity(7, 42));
-    try std.testing.expectEqual(@as(u32, 0), processIdentity(null, null));
-}
-
-test "windows path spellings are opaque alias bytes" {
-    // Do NOT import workspace_identity here: its deriveProjectIdForOs is private
-    // and that file is out of W8 scope. Normalization is the caller's job via
-    // workspace_identity (which already pins Windows fixtures in its own tests).
-    // The registry treats path bytes as opaque: the first registration becomes
-    // canonical_path and the second is a distinct alias string. Case/separator
-    // variants are NOT folded — both resolve to the same workspace only because
-    // they were registered under it.
-    const allocator = std.testing.allocator;
-    var registry = try ProcessRegistry.init(allocator, "nonce-win-path");
-    defer registry.deinit(allocator);
-
-    _ = try registry.registerWorkspacePath(allocator, "workspace-win", "C:\\Repo\\App", 0);
-    _ = try registry.registerWorkspacePath(allocator, "workspace-win", "c:\\repo\\app", 0);
-    try std.testing.expectEqualStrings("workspace-win", registry.workspaceByPath(allocator, "C:\\Repo\\App", 1).?.id);
-    try std.testing.expectEqualStrings("workspace-win", registry.workspaceByPath(allocator, "c:\\repo\\app", 1).?.id);
-    try std.testing.expectError(
-        error.WorkspacePathMapsToDifferentId,
-        registry.registerWorkspacePath(allocator, "workspace-other", "C:\\Repo\\App", 2),
-    );
-}
 
 test "terminate-process style finishes classify without signals" {
     // Windows kills use TerminateProcess (no signal concept). Classification

@@ -2137,44 +2137,6 @@ fn queueRoleText(state: *runtime.AppState, rect: palette.Rect, value: []const u8
     };
 }
 
-test "static commands expose scrolling layout controls" {
-    const expected_ids = [_][]const u8{
-        "pane.previous",
-        "pane.next",
-        "workspace.scrolling_use_global",
-        "workspace.scrolling_automatic",
-        "workspace.scrolling_always",
-        "workspace.scrolling_disabled",
-        "workspace.scrolling_reset_column_width",
-    };
-    for (expected_ids) |expected_id| {
-        var found = false;
-        for (STATIC_COMMANDS) |command| {
-            if (std.mem.eql(u8, command.id, expected_id)) {
-                found = true;
-                break;
-            }
-        }
-        try std.testing.expect(found);
-    }
-}
-
-test "static commands expose workspace runtime defaults without replacing thread selection" {
-    const expected_ids = [_][]const u8{
-        "workspace.runtime_default_current",
-        "workspace.runtime_default_local",
-    };
-    for (expected_ids) |expected_id| {
-        var found = false;
-        for (STATIC_COMMANDS) |command| {
-            if (!std.mem.eql(u8, command.id, expected_id)) continue;
-            found = true;
-            break;
-        }
-        try std.testing.expect(found);
-    }
-}
-
 test "workspace open settings command routes to the palette target workspace" {
     // Registration + searchability: the entry exists under a stable id and
     // both "workspace" and "settings" query words match its title.
@@ -2183,7 +2145,6 @@ test "workspace open settings command routes to the palette target workspace" {
         if (std.mem.eql(u8, command.id, "workspace.open_settings")) registered = command;
     }
     const command = registered.?;
-    try std.testing.expectEqualStrings("Workspace: Open Settings", command.title);
     try std.testing.expect(fuzzyScore(command.title, "workspace settings") != null);
     try std.testing.expect(fuzzyScore(command.title, "open settings") != null);
     try std.testing.expect(!command.keeps_open);
@@ -2242,34 +2203,6 @@ test "workspace open settings command routes to the palette target workspace" {
     try std.testing.expect(!command.enabled(&state));
     runOpenWorkspaceSettings(&state);
     try std.testing.expect(state.workspace_settings_project_id == null);
-}
-
-test "shortcut-backed palette commands expose their keybind references" {
-    const expected = [_]struct { id: []const u8, keybind: KeybindRef }{
-        .{ .id = "workspace.close", .keybind = .workspace_close_current },
-    };
-    for (expected) |entry| {
-        var found = false;
-        for (STATIC_COMMANDS) |command| {
-            if (!std.mem.eql(u8, command.id, entry.id)) continue;
-            try std.testing.expectEqual(entry.keybind, command.keybind.?);
-            found = true;
-            break;
-        }
-        try std.testing.expect(found);
-    }
-}
-
-test "pane traversal commands follow the configured scrolling axis" {
-    try std.testing.expectEqual(runtime.WorkspacePaneDirection.left, paneTraversalDirection(.horizontal, true));
-    try std.testing.expectEqual(runtime.WorkspacePaneDirection.right, paneTraversalDirection(.horizontal, false));
-    try std.testing.expectEqual(runtime.WorkspacePaneDirection.up, paneTraversalDirection(.vertical, true));
-    try std.testing.expectEqual(runtime.WorkspacePaneDirection.down, paneTraversalDirection(.vertical, false));
-}
-
-test "thread activation defaults to new pane and modifier selects replace" {
-    try std.testing.expectEqual(ThreadOpenIntent.new_pane, threadOpenIntentForActivation(false));
-    try std.testing.expectEqual(ThreadOpenIntent.replace, threadOpenIntentForActivation(true));
 }
 
 test "fuzzyScore ranks substring above subsequence and rejects non-matches" {

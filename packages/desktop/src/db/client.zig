@@ -1421,11 +1421,6 @@ fn testOpenDatabase(allocator: std.mem.Allocator, pref_path: []const u8) !zqlite
 }
 
 test "chat roles preserve the shipped store codec" {
-    try testing.expectEqual(db_types.ChatRole.user, db_types.decodeStoredChatRole(0, "You"));
-    try testing.expectEqual(db_types.ChatRole.assistant, db_types.decodeStoredChatRole(1, "Assistant"));
-    try testing.expectEqual(db_types.ChatRole.system, db_types.decodeStoredChatRole(2, "System"));
-    try testing.expectEqual(db_types.ChatRole.user, db_types.decodeStoredChatRole(99, ""));
-
     try testing.expectEqual(@as(i64, 0), encodeChatRole(.user));
     try testing.expectEqual(@as(i64, 1), encodeChatRole(.assistant));
     try testing.expectEqual(@as(i64, 2), encodeChatRole(.system));

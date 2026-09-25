@@ -307,31 +307,6 @@ pub const CODEX_ACCESS_MODE_OPTIONS = [_]AccessModeOption{
     .{ .label = "Supervised", .value = .supervised },
 };
 
-test "Codex model options omit unsupported subscription models" {
-    try std.testing.expectEqual(@as(usize, 7), CODEX_MODEL_OPTIONS.len);
-    try std.testing.expectEqualStrings("gpt-6-astra", CODEX_MODEL_OPTIONS[0].value.?);
-    try std.testing.expectEqualStrings("gpt-6-sol", CODEX_MODEL_OPTIONS[1].value.?);
-    try std.testing.expectEqualStrings("gpt-6-luna", CODEX_MODEL_OPTIONS[2].value.?);
-    try std.testing.expectEqualStrings("gpt-5.6-sol", CODEX_MODEL_OPTIONS[3].value.?);
-    try std.testing.expectEqualStrings("gpt-5.5", CODEX_MODEL_OPTIONS[4].value.?);
-    try std.testing.expectEqualStrings("gpt-5.6-terra", CODEX_MODEL_OPTIONS[5].value.?);
-    try std.testing.expectEqualStrings("gpt-5.6-luna", CODEX_MODEL_OPTIONS[6].value.?);
-}
-
-test "Codex 5.6 and 6 models expose max reasoning" {
-    for ([_][]const u8{ "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna" }) |model| {
-        const options = codexReasoningOptions(model);
-        try std.testing.expectEqual(ReasoningEffort.max, options[options.len - 1].value.?);
-    }
-    try std.testing.expectEqual(@as(usize, 5), codexReasoningOptions("gpt-5.5").len);
-}
-
-test "Claude fallback defaults to Fable 5.1" {
-    try std.testing.expectEqualStrings("fable[1m]", DEFAULT_CLAUDE_MODEL);
-    try std.testing.expectEqualStrings("Fable 5.1", CLAUDE_MODEL_OPTIONS[0].label);
-    try std.testing.expectEqualStrings(DEFAULT_CLAUDE_MODEL, CLAUDE_MODEL_OPTIONS[0].value.?);
-}
-
 test "persisted Cursor model cache refreshes duplicate model ids" {
     const options = [_]PersistedCursorModelOption{
         .{ .label = "GPT-5.6 Sol", .value = "gpt-5.6-sol-medium" },

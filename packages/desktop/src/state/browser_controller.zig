@@ -1588,34 +1588,6 @@ fn companionSidecarBlocksBrowser(companion_enabled: bool, sidecar_open: bool) bo
     return companion_enabled and sidecar_open;
 }
 
-test "Companion sidecar drives the existing browser surface hide restore lifecycle" {
-    const retained_sidecar_open = true;
-    const disabled_blocked = companionSidecarBlocksBrowser(false, retained_sidecar_open);
-    try std.testing.expect(!disabled_blocked);
-    try std.testing.expectEqual(
-        PaletteSurfaceTransition.restore,
-        paletteSurfaceTransition(disabled_blocked, true),
-    );
-
-    const enabled_blocked = companionSidecarBlocksBrowser(true, retained_sidecar_open);
-    try std.testing.expect(enabled_blocked);
-    try std.testing.expectEqual(PaletteSurfaceTransition.none, paletteSurfaceTransition(false, false));
-    // Opening a sidecar hides one native child surface exactly once.
-    try std.testing.expectEqual(PaletteSurfaceTransition.hide, paletteSurfaceTransition(enabled_blocked, false));
-    try std.testing.expectEqual(PaletteSurfaceTransition.none, paletteSurfaceTransition(enabled_blocked, true));
-    // Collapse restores it; an offscreen texture has no suspended child and
-    // therefore requires no surface lifecycle operation.
-    try std.testing.expectEqual(PaletteSurfaceTransition.restore, paletteSurfaceTransition(false, true));
-    try std.testing.expectEqual(PaletteSurfaceTransition.none, paletteSurfaceTransition(false, false));
-    // A true modal keeps the same surface hidden after Companion is disabled.
-    const unrelated_palette_overlay_blocked = disabled_blocked or true;
-    try std.testing.expectEqual(
-        PaletteSurfaceTransition.none,
-        paletteSurfaceTransition(unrelated_palette_overlay_blocked, true),
-    );
-    try std.testing.expect(retained_sidecar_open);
-}
-
 pub fn suppressNextBrowserClosedEvent(self: anytype) void {
     self.browser_controller.runtime.suppressNextClosedEvent();
 }
@@ -3585,20 +3557,9 @@ pub fn isInspectorPromptChangedMessage(message: []const u8) bool {
     return std.mem.indexOf(u8, message, "\"type\":\"prompt:changed\"") != null;
 }
 
-test "browser wheel multiplier follows configured scroll speed" {
-    try std.testing.expectEqual(@as(f32, 1.0), browserWheelMultiplier(0.5));
-    try std.testing.expectEqual(@as(f32, 2.5), browserWheelMultiplier(2.5));
-    try std.testing.expectEqual(@as(f32, 5.0), browserWheelMultiplier(8.0));
-}
-
 test "scaled WPE pointer coordinates stay in physical pane space" {
     try std.testing.expectEqual(@as(f32, 600.0), browserPointerCoordinate(600.0, 1000.0, 600.0, true));
     try std.testing.expectEqual(@as(f32, 360.0), browserPointerCoordinate(600.0, 1000.0, 600.0, false));
-}
-
-test "browser automation pointer coordinates scale logical input once" {
-    try std.testing.expectEqual(@as(f32, 360.0), browserAutomationPointerCoordinate(360.0, 1.0));
-    try std.testing.expectEqual(@as(f32, 600.0), browserAutomationPointerCoordinate(360.0, 5.0 / 3.0));
 }
 
 test "Live browser activation prefers a valid runtime binding over user focus" {

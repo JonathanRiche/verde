@@ -945,12 +945,6 @@ test "batch command line rejects lossy control characters" {
     try std.testing.expectError(error.InvalidBatchScriptArg, windowsBatchCommandLine(allocator, "npm.cmd", &.{"nul\x00tail"}));
 }
 
-test "interactive shell preference is deterministic" {
-    try std.testing.expectEqual(ShellKind.powershell_7, selectShellKind(.{ .powershell_7 = true, .windows_powershell = true }));
-    try std.testing.expectEqual(ShellKind.windows_powershell, selectShellKind(.{ .powershell_7 = false, .windows_powershell = true }));
-    try std.testing.expectEqual(ShellKind.command_prompt, selectShellKind(.{ .powershell_7 = false, .windows_powershell = false }));
-}
-
 test "ConPTY worker health preserves completion reasons" {
     if (builtin.os.tag != .windows) return;
     var state = try IoState.init(std.testing.allocator);

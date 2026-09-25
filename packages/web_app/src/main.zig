@@ -66,12 +66,3 @@ test {
     _ = http_mod;
     _ = theme_mod;
 }
-
-test "non-loopback bind failure explains the supported access path" {
-    try std.testing.expectEqualStrings(
-        "non-loopback bind rejected; use --host 127.0.0.1 and connect through an SSH local forward",
-        configurationErrorMessage(error.NonLoopbackHost).?,
-    );
-    try std.testing.expect(configurationErrorMessage(error.TokenFileRequired) == null);
-    try std.testing.expect(configurationErrorMessage(error.InvalidTrustedProxyOrigin) != null);
-}

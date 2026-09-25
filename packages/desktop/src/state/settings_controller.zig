@@ -832,7 +832,7 @@ pub fn settingsChatTitleModelLabel(self: anytype, option_index: usize) []const u
     if (option_index >= options.len) return "Unknown model";
     if (self.settings_controller.draft.chat_title_provider == .codex) {
         if (options[option_index].value) |value| {
-            if (std.mem.eql(u8, value, app_config.DEFAULT_CHAT_TITLE_MODEL)) return "GPT-5.6 Luna (default)";
+            if (std.mem.eql(u8, value, app_config.DEFAULT_CHAT_TITLE_MODEL)) return "GPT-6 Luna (default)";
         }
     }
     return options[option_index].label;

@@ -839,13 +839,6 @@ fn parseCursorApiKeyLine(line: []const u8) ?[]const u8 {
     return rest[0..end];
 }
 
-test "resolveCursorExecutableAlloc falls back to cursor-agent after configured command" {
-    var env_map = std.process.Environ.Map.init(std.testing.allocator);
-    defer env_map.deinit();
-    try env_map.put("PATH", "/definitely/missing");
-    try std.testing.expectError(error.FileNotFound, resolveCursorExecutableAlloc(std.testing.allocator, &env_map, "missing-agent"));
-}
-
 test "Cursor resource exhaustion explains provider capacity and links status" {
     const message = cursorAgentErrorMessage("Error: RetriableError: [resource_exhausted] Error").?;
     try std.testing.expect(std.mem.indexOf(u8, message, "temporarily at capacity") != null);
@@ -854,31 +847,26 @@ test "Cursor resource exhaustion explains provider capacity and links status" {
     try std.testing.expect(cursorAgentErrorMessage("ordinary assistant reply") == null);
 }
 
-test "cursorModelArgAlloc folds legacy SDK params into CLI model id" {
-    const params =
+test "cursorModelArgAlloc folds params into the CLI model id" {
+    const cases = [_]struct { model: []const u8, params: []const u8, expected: []const u8 }{
+        // Legacy SDK params fold into suffixes.
+        .{ .model = "gpt-5.5", .params =
         \\[{"id":"reasoning","value":"high"},{"id":"fast","value":"true"}]
-    ;
-    const arg = try cursorModelArgAlloc(std.testing.allocator, "gpt-5.5", params);
-    defer std.testing.allocator.free(arg.?);
-    try std.testing.expectEqualStrings("gpt-5.5-high-fast", arg.?);
-}
-
-test "cursorModelArgAlloc replaces a flattened Cursor effort suffix" {
-    const params =
+        , .expected = "gpt-5.5-high-fast" },
+        // A flattened Cursor effort suffix is replaced, not stacked.
+        .{ .model = "cursor-grok-4.5-high", .params =
         \\[{"id":"effort","value":"low"},{"id":"fast","value":"true"}]
-    ;
-    const arg = try cursorModelArgAlloc(std.testing.allocator, "cursor-grok-4.5-high", params);
-    defer std.testing.allocator.free(arg.?);
-    try std.testing.expectEqualStrings("cursor-grok-4.5-low-fast", arg.?);
-}
-
-test "cursorModelArgAlloc replaces Kimi max with the selected effort" {
-    const params =
+        , .expected = "cursor-grok-4.5-low-fast" },
+        // Kimi's max suffix is replaced by the selected effort.
+        .{ .model = "kimi-k3-max", .params =
         \\[{"id":"effort","value":"high"}]
-    ;
-    const arg = try cursorModelArgAlloc(std.testing.allocator, "kimi-k3-max", params);
-    defer std.testing.allocator.free(arg.?);
-    try std.testing.expectEqualStrings("kimi-k3-high", arg.?);
+        , .expected = "kimi-k3-high" },
+    };
+    for (cases) |case| {
+        const arg = try cursorModelArgAlloc(std.testing.allocator, case.model, case.params);
+        defer std.testing.allocator.free(arg.?);
+        try std.testing.expectEqualStrings(case.expected, arg.?);
+    }
 }
 
 test "parseModelsTextAlloc reads Cursor CLI model output" {

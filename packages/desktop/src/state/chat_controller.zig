@@ -6382,10 +6382,15 @@ fn threadHasMessageId(thread: *const ChatThread, message_id: []const u8) bool {
     return false;
 }
 
-fn canApplyDaemonGeneratedTitle(current_title: []const u8, expected_title: []const u8) bool {
-    return expected_title.len > 0 and
-        (std.mem.eql(u8, current_title, expected_title) or
-            chat_threads.isPlaceholderThreadTitle(current_title));
+/// A daemon title may replace the fallback it was generated against, a
+/// placeholder, or the in-flight title it refines, but never a manual rename.
+fn canApplyDaemonGeneratedTitle(current_title: []const u8, expected_title: []const u8, previous_title: ?[]const u8) bool {
+    if (expected_title.len == 0) return false;
+    if (previous_title) |previous| {
+        if (std.mem.eql(u8, current_title, previous)) return true;
+    }
+    return std.mem.eql(u8, current_title, expected_title) or
+        chat_threads.isPlaceholderThreadTitle(current_title);
 }
 
 fn daemonProviderFailureMessage(reason: ?[]const u8, fallback: []const u8) []const u8 {
@@ -6400,10 +6405,13 @@ fn daemonProviderFailureMessage(reason: ?[]const u8, fallback: []const u8) []con
 }
 
 test "daemon generated title replaces a stale opening placeholder" {
-    try std.testing.expect(canApplyDaemonGeneratedTitle("Opening prompt", "Opening prompt"));
-    try std.testing.expect(canApplyDaemonGeneratedTitle("New thread", "Opening prompt"));
-    try std.testing.expect(canApplyDaemonGeneratedTitle("New Chat", "Opening prompt"));
-    try std.testing.expect(!canApplyDaemonGeneratedTitle("Manual title", "Opening prompt"));
+    try std.testing.expect(canApplyDaemonGeneratedTitle("Opening prompt", "Opening prompt", null));
+    try std.testing.expect(canApplyDaemonGeneratedTitle("New thread", "Opening prompt", null));
+    try std.testing.expect(canApplyDaemonGeneratedTitle("New Chat", "Opening prompt", null));
+    try std.testing.expect(!canApplyDaemonGeneratedTitle("Manual title", "Opening prompt", null));
+    // The completion refinement replaces the in-flight title it supersedes.
+    try std.testing.expect(canApplyDaemonGeneratedTitle("Early Title", "Opening prompt", "Early Title"));
+    try std.testing.expect(!canApplyDaemonGeneratedTitle("Manual title", "Opening prompt", "Early Title"));
 }
 
 pub fn applyDaemonChatTurnTail(self: anytype, thread: *ChatThread, response: []const u8) !bool {
@@ -6472,16 +6480,22 @@ pub fn applyDaemonChatTurnTailValue(self: anytype, thread: *ChatThread, root: st
     if (result.object.get("pending_approval")) |approval_value| {
         if (try syncDaemonPendingApprovalLocked(send_state, approval_value)) changed = true;
     }
-    if (std.mem.eql(u8, status_text, "completed")) {
-        if (jsonValueString(result.object.get("generated_title") orelse .null)) |generated_title| {
-            const expected_title = jsonValueString(result.object.get("generated_title_expected") orelse .null) orelse "";
-            if (canApplyDaemonGeneratedTitle(thread.title, expected_title)) {
-                const owned_title = try self.allocator.dupeZ(u8, generated_title);
-                self.allocator.free(thread.title);
-                thread.title = owned_title;
-                thread.committed = true;
-            }
+    // The daemon titles the opening prompt while the reply streams, then may
+    // refine it at completion, so adopt a durable title from any page.
+    if (jsonValueString(result.object.get("generated_title") orelse .null)) |generated_title| {
+        const expected_title = jsonValueString(result.object.get("generated_title_expected") orelse .null) orelse "";
+        const previous_title = jsonValueString(result.object.get("generated_title_previous") orelse .null);
+        if (!std.mem.eql(u8, thread.title, generated_title) and
+            canApplyDaemonGeneratedTitle(thread.title, expected_title, previous_title))
+        {
+            const owned_title = try self.allocator.dupeZ(u8, generated_title);
+            self.allocator.free(thread.title);
+            thread.title = owned_title;
+            thread.committed = true;
+            changed = true;
         }
+    }
+    if (std.mem.eql(u8, status_text, "completed")) {
         const provider_thread_id = jsonValueString(result.object.get("provider_thread_id") orelse .null) orelse send_state.provisional_provider_thread_id orelse "";
         const reply_text = jsonValueString(result.object.get("result_reply_text") orelse .null) orelse "";
         send_state.result = .{

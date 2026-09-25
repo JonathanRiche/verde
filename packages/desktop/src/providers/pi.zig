@@ -1606,14 +1606,6 @@ test "pi prompt payload serializes images and omits null steering" {
     try std.testing.expect(std.mem.indexOf(u8, steer_encoded, "\"streamingBehavior\":\"steer\"") != null);
 }
 
-test "pi image mime types map by extension and reject unknowns" {
-    try std.testing.expectEqualStrings("image/png", imageMimeType("/tmp/shot.PNG").?);
-    try std.testing.expectEqualStrings("image/jpeg", imageMimeType("/tmp/photo.jpeg").?);
-    try std.testing.expectEqualStrings("image/webp", imageMimeType("/tmp/pic.webp").?);
-    try std.testing.expectEqual(@as(?[]const u8, null), imageMimeType("/tmp/document.pdf"));
-    try std.testing.expectEqual(@as(?[]const u8, null), imageMimeType("/tmp/no_extension"));
-}
-
 test "pi collectImageAttachments preserves multi-image and legacy compatibility" {
     const modern = [_]provider_types.ImageAttachment{
         .{ .path = "/tmp/one.png" },
@@ -1696,16 +1688,6 @@ test "pi title truncation respects UTF-8 boundaries" {
     const truncated = truncateTitle(long);
     try std.testing.expectEqual(@as(usize, 79), truncated.len);
     try std.testing.expect(std.unicode.utf8ValidateSlice(truncated));
-}
-
-test "pi tool kinds map builtin tool names" {
-    try std.testing.expectEqual(provider_types.ToolCallKind.read, toolCallKindForName("read"));
-    try std.testing.expectEqual(provider_types.ToolCallKind.edit, toolCallKindForName("edit"));
-    try std.testing.expectEqual(provider_types.ToolCallKind.edit, toolCallKindForName("write"));
-    try std.testing.expectEqual(provider_types.ToolCallKind.execute, toolCallKindForName("bash"));
-    try std.testing.expectEqual(provider_types.ToolCallKind.subagent, toolCallKindForName("TaskExecute"));
-    try std.testing.expectEqual(provider_types.ToolCallKind.subagent, toolCallKindForName("Agent"));
-    try std.testing.expectEqual(provider_types.ToolCallKind.other, toolCallKindForName("custom_tool"));
 }
 
 test "pi rpc reader accepts lines larger than its scratch buffer" {

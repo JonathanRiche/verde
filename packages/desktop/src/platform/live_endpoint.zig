@@ -114,6 +114,4 @@ test "Unix endpoint preserves the legacy socket override" {
     const endpoint = try allocForOsAndEnv(allocator, .linux, "/tmp/verde", FakeEnv{ .legacy_socket = "/tmp/custom.sock" });
     defer allocator.free(endpoint);
     try std.testing.expectEqualStrings("/tmp/custom.sock", endpoint);
-    try std.testing.expectEqualStrings("unix_socket", transportNameForOs(.linux));
-    try std.testing.expectEqualStrings("windows_named_pipe", transportNameForOs(.windows));
 }

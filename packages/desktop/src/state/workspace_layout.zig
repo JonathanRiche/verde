@@ -2098,7 +2098,7 @@ test "new workspace panes are inserted immediately after focus" {
     try std.testing.expectEqual(fallback_terminal_id, layout.panes.items[layout.panes.items.len - 1].id);
 }
 
-test "workspace layout persists the scrolling target" {
+test "workspace layout persists the scrolling target and policy overrides" {
     const allocator = std.testing.allocator;
     var layout = try WorkspaceLayout.initDefaultChat(allocator);
     defer layout.deinit(allocator);
@@ -2109,6 +2109,10 @@ test "workspace layout persists the scrolling target" {
     layout.requestLeadingScrollReveal(1);
     layout.scroll_animation_last_ms = 900;
     layout.scroll_snap_deadline_ms = 1200;
+    layout.scroll_mode_override = .always;
+    layout.scroll_threshold_override = 8;
+    layout.scroll_pane_extent_override = 720.0;
+    layout.scroll_pane_extent_ratio_override = 0.45;
 
     try std.testing.expectEqual(@as(?WorkspacePaneId, 1), layout.scroll_leading_pane_id);
 
@@ -2126,6 +2130,12 @@ test "workspace layout persists the scrolling target" {
     try std.testing.expectEqual(@as(?WorkspacePaneId, null), restored.scroll_leading_pane_id);
     try std.testing.expectEqual(@as(i64, 0), restored.scroll_animation_last_ms);
     try std.testing.expectEqual(@as(i64, 0), restored.scroll_snap_deadline_ms);
+
+    try std.testing.expect(restored.hasScrollOverride());
+    try std.testing.expectEqual(app_config.WorkspaceScrollMode.always, restored.effectiveScrollMode(.automatic));
+    try std.testing.expectEqual(@as(u8, 8), restored.effectiveScrollThreshold(2));
+    try std.testing.expectApproxEqAbs(@as(f32, 720.0), restored.scroll_pane_extent_override.?, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.45), restored.scroll_pane_extent_ratio_override.?, 0.0001);
 }
 
 test "workspace layout round-trips nonuniform split and explicit focus exactly" {
@@ -2212,28 +2222,6 @@ test "restored scrolling tile navigation prunes interleaved standalone panes" {
 
     try std.testing.expectEqual(@as(?WorkspacePaneId, tiled_pane_id), restored.neighborPaneIdInScrollGroup(1, .right));
     try std.testing.expectEqual(@as(?WorkspacePaneId, 1), restored.neighborPaneIdInScrollGroup(tiled_pane_id, .left));
-}
-
-test "workspace layout persists scrolling policy overrides" {
-    const allocator = std.testing.allocator;
-    var layout = try WorkspaceLayout.initDefaultChat(allocator);
-    defer layout.deinit(allocator);
-    layout.scroll_mode_override = .always;
-    layout.scroll_threshold_override = 8;
-    layout.scroll_pane_extent_override = 720.0;
-    layout.scroll_pane_extent_ratio_override = 0.45;
-
-    const persisted = try layout.persistedWorkspaceJson(allocator);
-    defer allocator.free(persisted);
-    var restored = try WorkspaceLayout.initDefaultChat(allocator);
-    defer restored.deinit(allocator);
-    try restored.applyPersistedWorkspaceJson(allocator, persisted);
-
-    try std.testing.expect(restored.hasScrollOverride());
-    try std.testing.expectEqual(app_config.WorkspaceScrollMode.always, restored.effectiveScrollMode(.automatic));
-    try std.testing.expectEqual(@as(u8, 8), restored.effectiveScrollThreshold(2));
-    try std.testing.expectApproxEqAbs(@as(f32, 720.0), restored.scroll_pane_extent_override.?, 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.45), restored.scroll_pane_extent_ratio_override.?, 0.0001);
 }
 
 test "workspace layout ignores invalid scrolling policy overrides" {
@@ -2332,7 +2320,7 @@ test "closing a maximized pane transfers zoom to the left pane" {
     try std.testing.expectEqual(@as(?WorkspacePaneId, first_pane_id), layout.maximized_pane_id);
 }
 
-test "closing a focused pane focuses the pane to its left" {
+test "closing a focused pane focuses its left neighbor, or its right neighbor when leftmost" {
     const allocator = std.testing.allocator;
     var layout = try WorkspaceLayout.initDefaultChat(allocator);
     defer layout.deinit(allocator);
@@ -2348,23 +2336,8 @@ test "closing a focused pane focuses the pane to its left" {
     deinitWorkspacePaneRef(&removed_ref, allocator);
     try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.focused_pane_id);
 
-    layout.focused_pane_id = second_pane_id;
-    removed_ref = layout.closePane(allocator, second_pane_id) orelse return error.TestExpectedEqual;
-    deinitWorkspacePaneRef(&removed_ref, allocator);
-    try std.testing.expectEqual(@as(?WorkspacePaneId, first_pane_id), layout.focused_pane_id);
-}
-
-test "closing the leftmost focused pane focuses the pane to its right" {
-    const allocator = std.testing.allocator;
-    var layout = try WorkspaceLayout.initDefaultChat(allocator);
-    defer layout.deinit(allocator);
-
-    const first_pane_id = layout.panes.items[0].id;
-    const second_pane_id = try layout.createTerminalPane(allocator, 10);
-    try layout.splitPaneWithLeaf(allocator, first_pane_id, second_pane_id, .vertical, true);
-
     layout.focused_pane_id = first_pane_id;
-    var removed_ref = layout.closePane(allocator, first_pane_id) orelse return error.TestExpectedEqual;
+    removed_ref = layout.closePane(allocator, first_pane_id) orelse return error.TestExpectedEqual;
     deinitWorkspacePaneRef(&removed_ref, allocator);
     try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.focused_pane_id);
 }

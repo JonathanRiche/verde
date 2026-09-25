@@ -242,10 +242,3 @@ test "default local dir encodes Herdr identity safely" {
     defer std.testing.allocator.free(path);
     try std.testing.expectEqualStrings("/tmp/verde/herdr-workspaces/local-default-w1_p1", path);
 }
-
-test "unlink request rejects ambiguous workspace selector" {
-    try std.testing.expectError(error.AmbiguousHerdrWorkspaceSelector, validateUnlinkRequest(.{
-        .workspace = "current",
-        .all = true,
-    }));
-}

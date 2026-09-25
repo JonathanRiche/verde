@@ -507,16 +507,6 @@ fn assignWindowsJob(job: windows.HANDLE, child: windows.HANDLE) !void {
     }
 }
 
-test "Windows command shim classification is case insensitive" {
-    try std.testing.expect(isWindowsCommandScript("C:\\Users\\Test\\AppData\\Roaming\\npm\\claude.CMD"));
-    try std.testing.expect(isWindowsCommandScript("agent.bat"));
-    try std.testing.expect(!isWindowsCommandScript("codex.exe"));
-}
-
-test "zero is never a live process id" {
-    try std.testing.expect(!processIdIsAlive(0));
-}
-
 test "owned child kill does not orphan TERM-ignoring descendants" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 

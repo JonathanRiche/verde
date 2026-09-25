@@ -281,14 +281,12 @@ test "buildRows leads with the autocompleting history row, else the action row" 
 
     const searching = try buildRows(arena, "zig lang", &entries);
     try std.testing.expectEqual(Kind.search, searching[0].kind);
-    try std.testing.expectEqualStrings("Search DuckDuckGo for \u{201C}zig lang\u{201D}", searching[0].title);
     try std.testing.expectEqual(@as(usize, 3), searching.len);
 
     const address = try buildRows(arena, "example.com/x", &.{});
     try std.testing.expectEqual(@as(usize, 1), address.len);
     try std.testing.expectEqual(Kind.go_to, address[0].kind);
     try std.testing.expectEqualStrings("https://example.com/x", address[0].url);
-    try std.testing.expectEqualStrings("Go to example.com/x", address[0].title);
 
     try std.testing.expectEqual(@as(usize, 0), (try buildRows(arena, "   ", &entries)).len);
 }

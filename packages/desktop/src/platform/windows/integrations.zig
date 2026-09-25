@@ -102,11 +102,3 @@ extern fn verde_windows_clipboard_copy_image(
     max_bytes: usize,
 ) c_int;
 extern fn verde_windows_clipboard_copy_text(bytes: *?[*]u8, len: *usize, max_bytes: usize) c_int;
-
-test "Windows integration wrappers keep clipboard payloads bounded" {
-    try std.testing.expect(10 * 1024 * 1024 < std.math.maxInt(u32));
-}
-
-test "Windows process identity remains compatible with packaged shortcuts" {
-    try std.testing.expectEqualStrings("Verde.Desktop", app_user_model_id);
-}

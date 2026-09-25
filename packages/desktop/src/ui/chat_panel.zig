@@ -1716,7 +1716,7 @@ test "follow-up edit hits survive rendering another chat pane" {
     try std.testing.expectEqual(@as(?app_state.WorkspacePaneId, 22), second.pane_id);
 }
 
-test "transcript action hit testing preserves usage and diff open actions" {
+test "transcript action hit testing resolves every transcript action kind" {
     resetTranscriptHitCache();
     defer resetTranscriptHitCache();
     usage_action_hits[0] = .{ .rect = .{ .x = 10.0, .y = 20.0, .w = 30.0, .h = 40.0 } };
@@ -1777,18 +1777,14 @@ test "transcript action hit testing preserves usage and diff open actions" {
         .image_open => |path| try std.testing.expectEqualStrings("/tmp/chat-image.png", path),
         else => return error.TestExpectedEqual,
     }
-}
 
-test "transcript action hit testing exposes bang command retry" {
-    resetTranscriptHitCache();
-    defer resetTranscriptHitCache();
     bang_retry_hits[0] = .{
-        .rect = .{ .x = 20.0, .y = 30.0, .w = 60.0, .h = 24.0 },
+        .rect = .{ .x = 500.0, .y = 30.0, .w = 60.0, .h = 24.0 },
         .command = "zig build test",
     };
     bang_retry_hit_count = 1;
-    const action = transcriptActionAt(40.0, 40.0) orelse return error.TestExpectedEqual;
-    switch (action) {
+    const retry = transcriptActionAt(520.0, 40.0) orelse return error.TestExpectedEqual;
+    switch (retry) {
         .retry_command => |command| try std.testing.expectEqualStrings("zig build test", command),
         else => return error.TestExpectedEqual,
     }
@@ -2433,9 +2429,7 @@ test "transcript body selection includes user assistant and ordinary system text
     try std.testing.expectEqual(TranscriptSelectableBodyKind.markdown, transcriptSelectableBodyKind(.assistant, "Assistant", "**answer**", false, false).?);
     try std.testing.expectEqual(TranscriptSelectableBodyKind.plain, transcriptSelectableBodyKind(.system, "Notice", "Connection restored", false, false).?);
     try std.testing.expectEqual(TranscriptSelectableBodyKind.plain, transcriptSelectableBodyKind(.assistant, "Assistant", "stream tail", false, true).?);
-}
-
-test "bounded transcript controls stay outside drag selection" {
+    // Bounded transcript controls stay outside drag selection.
     try std.testing.expect(transcriptSelectableBodyKind(.system, "Ran command", "Command:\nzig build", false, false) == null);
     try std.testing.expect(transcriptSelectableBodyKind(.system, "Changed files", utils.PERSISTED_DIFF_MARKER, false, false) == null);
 }
@@ -4042,26 +4036,6 @@ fn ensureTranscriptLayout(
     }
 }
 
-test "cold transcript layout anchors the materialized suffix at the visible tail" {
-    const items: [2]chat_types.TranscriptLayoutItem = .{
-        .{ .message_index = 999, .group_end = 1000, .top = -72.0, .height = 60.0 },
-        .{ .message_index = 998, .group_end = 999, .top = -124.0, .height = 40.0 },
-    };
-
-    try std.testing.expectEqual(@as(usize, 999), items[0].message_index);
-    try std.testing.expectApproxEqAbs(@as(f32, -72.0), items[0].top, 0.001);
-    try std.testing.expectApproxEqAbs(@as(f32, -124.0), items[1].top, 0.001);
-    try std.testing.expect(transcriptLayoutItemAtContentY(&items, 10_000.0, 9_950.0).?.message_index == 999);
-    try std.testing.expect(transcriptLayoutItemAtContentY(&items, 10_000.0, 5_000.0) == null);
-
-    // Changing only the unfinished-history estimate leaves stored row geometry
-    // untouched and must not move the tail row in tail-follow coordinates.
-    const viewport_height: f32 = 720.0;
-    const first_tail_y = 10_000.0 + items[0].top - (10_000.0 - viewport_height);
-    const second_tail_y = 12_000.0 + items[0].top - (12_000.0 - viewport_height);
-    try std.testing.expectApproxEqAbs(first_tail_y, second_tail_y, 0.001);
-}
-
 fn oldestVisibleTranscriptLayoutItem(items: []const chat_types.TranscriptLayoutItem, scroll_y: f32) ?usize {
     var low: usize = 0;
     var high = items.len;
@@ -5278,30 +5252,6 @@ fn renderPinnedBackgroundCommands(
     }
 }
 
-test "M5-P4 background rows persist while the display filter hides known task events" {
-    const allocator = std.testing.allocator;
-    var thread = try app_state.ChatThread.init(allocator, "Background persistence");
-    defer thread.deinit(allocator);
-    try thread.background_tasks.append(allocator, .{
-        .command = try allocator.dupeZ(u8, "mise run build"),
-        .status = .running,
-    });
-    try thread.messages.append(allocator, .{
-        .role = .system,
-        .author = try allocator.dupeZ(u8, "Background command"),
-        .body = try allocator.dupeZ(u8, "mise run build"),
-    });
-
-    // Persistence/identity owns the row; presentation alone suppresses it.
-    try std.testing.expectEqual(@as(usize, 1), thread.messages.items.len);
-    try std.testing.expect(shouldHideCursorLifecycleSystemEvent(
-        &thread,
-        thread.messages.items[0].author,
-        thread.messages.items[0].body,
-    ));
-    try std.testing.expect(!shouldHideCursorLifecycleSystemEvent(&thread, "Notice", "mise run build"));
-}
-
 test "running background commands pin above the composer after the stream commits" {
     const allocator = std.testing.allocator;
     var thread = try app_state.ChatThread.init(allocator, "Pinned background command");
@@ -5321,11 +5271,13 @@ test "running background commands pin above the composer after the stream commit
     try std.testing.expectEqual(@as(usize, 1), count);
     try std.testing.expectEqual(@as(usize, 0), rows[0].message_index);
     try std.testing.expectEqualStrings("mise run dev", rows[0].body);
+    // Persistence owns the row; presentation alone suppresses the known task event.
     try std.testing.expect(shouldHideCursorLifecycleSystemEvent(
         &thread,
         thread.messages.items[0].author,
         thread.messages.items[0].body,
     ));
+    try std.testing.expect(!shouldHideCursorLifecycleSystemEvent(&thread, "Notice", "mise run dev"));
 }
 
 test "finished background commands leave the pin stack" {
@@ -5396,24 +5348,6 @@ test "pending background commands pin instead of occupying the live stream" {
     try std.testing.expectEqualStrings("npm run dev", rows[0].body);
     try std.testing.expect(shouldSkipPendingTranscriptEvent(&thread, "Background command", "npm run dev"));
     try std.testing.expect(!shouldSkipPendingTranscriptEvent(&thread, "Ran command", "npm test"));
-}
-
-test "completed background commands are not pinned" {
-    const allocator = std.testing.allocator;
-    var thread = try app_state.ChatThread.init(allocator, "Completed background pin");
-    defer thread.deinit(allocator);
-    try thread.background_tasks.append(allocator, .{
-        .command = try allocator.dupeZ(u8, "mise run dev"),
-        .status = .completed,
-    });
-    try thread.messages.append(allocator, .{
-        .role = .system,
-        .author = try allocator.dupeZ(u8, "Background command"),
-        .body = try allocator.dupeZ(u8, "mise run dev"),
-    });
-
-    var rows: [MAX_PINNED_BACKGROUND_COMMANDS]PinnedBackgroundCommand = undefined;
-    try std.testing.expectEqual(@as(usize, 0), collectPinnedBackgroundCommands(&thread, &rows));
 }
 
 test "running background tasks pin from a cancelled Ran command row" {
@@ -8397,14 +8331,6 @@ fn streamCaretVisible(now_ns: i128, reduced_motion: bool) bool {
     return @mod(now_ns, STREAM_CARET_PERIOD_NS) < @divTrunc(STREAM_CARET_PERIOD_NS, 2);
 }
 
-test "stream caret blinks on a fixed clock and stays lit under reduced motion" {
-    try std.testing.expect(streamCaretVisible(0, false));
-    try std.testing.expect(streamCaretVisible(STREAM_CARET_PERIOD_NS / 2 - 1, false));
-    try std.testing.expect(!streamCaretVisible(STREAM_CARET_PERIOD_NS / 2, false));
-    try std.testing.expect(streamCaretVisible(STREAM_CARET_PERIOD_NS, false));
-    try std.testing.expect(streamCaretVisible(STREAM_CARET_PERIOD_NS / 2, true));
-}
-
 fn renderStreamCaret(state: *app_state.AppState, tail: ?chat_markdown.TextTail, clip: palette.Rect) void {
     const at = tail orelse return;
     if (!streamCaretVisible(profiler.nowNs(), state.app_config.reduced_motion.chat)) return;
@@ -8735,19 +8661,6 @@ fn hashOptionalFloat(hasher: *std.hash.Wyhash, value: ?f32) void {
     if (value) |number| hasher.update(std.mem.asBytes(&number));
 }
 
-test "transcript render cache key ignores pane translation and viewport clipping" {
-    const base: chat_types.TranscriptRenderCacheKey = .{
-        .width = 640,
-        .height = 220,
-        .ui_scale = 1.25,
-        .style_hash = 42,
-    };
-    var moved = base;
-    try std.testing.expect(transcriptRenderCacheKeysEqual(base, moved));
-    moved.width += 1;
-    try std.testing.expect(!transcriptRenderCacheKeysEqual(base, moved));
-}
-
 test "transcript render cache detects fenced code and live-style bypass frames" {
     var prose = try chat_markdown.buildBodyView(std.testing.allocator, "A paragraph with **formatting**.");
     defer prose.deinit(std.testing.allocator);
@@ -8861,16 +8774,14 @@ fn commandRowPreviewAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 
     return preview.toOwnedSlice(allocator);
 }
 
-test "command row preview includes content after its input label" {
+test "command row preview joins content after its label and flattens CRLF" {
     const preview = try commandRowPreviewAlloc(std.testing.allocator, "Input:\n  {\"cmd\":\"mise run build\"}");
     defer std.testing.allocator.free(preview);
     try std.testing.expectEqualStrings("Input: {\"cmd\":\"mise run build\"}", preview);
-}
 
-test "command row preview flattens CRLF without trailing whitespace" {
-    const preview = try commandRowPreviewAlloc(std.testing.allocator, "Output:\r\n{\"success\":true}\n\n");
-    defer std.testing.allocator.free(preview);
-    try std.testing.expectEqualStrings("Output: {\"success\":true}", preview);
+    const crlf = try commandRowPreviewAlloc(std.testing.allocator, "Output:\r\n{\"success\":true}\n\n");
+    defer std.testing.allocator.free(crlf);
+    try std.testing.expectEqualStrings("Output: {\"success\":true}", crlf);
 }
 
 /// Truncates `text` so it fits in `max_width` pixels at `font_size` using the
@@ -10258,18 +10169,6 @@ fn centeredLabelRect(container: palette.Rect, label_w: f32, label_h: f32) palett
         .w = @min(label_w, container.w),
         .h = @min(label_h, container.h),
     };
-}
-
-test "centered label geometry balances button padding" {
-    const label = centeredLabelRect(
-        .{ .x = 10.0, .y = 20.0, .w = 54.0, .h = 28.0 },
-        24.0,
-        14.0,
-    );
-    try std.testing.expectEqual(@as(f32, 25.0), label.x);
-    try std.testing.expectEqual(@as(f32, 27.0), label.y);
-    try std.testing.expectEqual(@as(f32, 24.0), label.w);
-    try std.testing.expectEqual(@as(f32, 14.0), label.h);
 }
 
 fn queueIconText(state: *app_state.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect) void {

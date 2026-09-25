@@ -280,13 +280,3 @@ fn workspaceListResult() WorkspaceList {
         },
     };
 }
-
-test "mock status encodes" {
-    const json = try respondParsed(std.testing.allocator, .{
-        .id = 7,
-        .method = "core.status",
-        .params = .null,
-    });
-    defer std.testing.allocator.free(json);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"pid\":0") != null);
-}

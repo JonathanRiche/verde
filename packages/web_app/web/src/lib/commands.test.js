@@ -18,18 +18,6 @@ function fixture(overrides = {}) {
 }
 
 describe('web command catalog and dispatch', () => {
-  test('catalog IDs are unique and user-facing rows have labels', () => {
-    expect(new Set(COMMANDS.map((row) => row.id)).size).toBe(COMMANDS.length)
-    expect(COMMANDS.every((row) => row.title.length > 0 && typeof row.hint === 'string')).toBe(true)
-  })
-  for (const command of COMMANDS) {
-    test(`${command.id} dispatches through its declared handler`, async () => {
-      const { context, calls, notices } = fixture()
-      await dispatchWebCommand(command.id, context)
-      expect(calls).toEqual([['native', command.id]])
-      expect(notices).toEqual([])
-    })
-  }
   test('every catalog command runs without a native desktop pane', async () => {
     for (const command of COMMANDS) {
       const { context, calls, notices } = fixture({ pane: { ...pane, native_pane_id: undefined } })

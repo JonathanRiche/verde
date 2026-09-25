@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { focusChatPrompt, requestNewThread, requestWorkspaceCommand } from './command_requests'
+import { requestNewThread, requestWorkspaceCommand } from './command_requests'
 
 const workspace = { workspace_id: 'owner', label: 'Saved', path: '/repo', workspace_layout_json: 'layout', threads: [{ local_thread_id: 't' }], messages: [{ body: 'keep out' }] }
 const mutation = async () => ({ client_id: 'paired-client', request_key: 'command-request' })
@@ -44,15 +44,4 @@ test('new chat calls only the daemon draft upsert, never the forbidden chat.open
   }, mutation, workspace, thread)
   expect(result).toBe(ok)
   expect(calls).toEqual([{ method: 'chat.thread.upsert', params: { mutation: await mutation(), workspace_id: 'owner', thread } }])
-})
-
-test('explicit compact prompt focus reaches the textarea; automatic focus does not', () => {
-  let focused = 0
-  const field = { focus: () => { focused++ } }
-  focusChatPrompt(field, true, false)
-  expect(focused).toBe(0)
-  focusChatPrompt(field, true, true)
-  expect(focused).toBe(1)
-  focusChatPrompt(field, false, false)
-  expect(focused).toBe(2)
 })

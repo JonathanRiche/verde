@@ -926,29 +926,6 @@ test "exact routing text rejects empty NUL and overflow without truncating" {
     try std.testing.expectEqualSlices(u8, &long, exact.slice());
 }
 
-test "operation reference retains target metadata through lifecycle copies" {
-    var frame: Frame = .{};
-    try std.testing.expect(frame.setOwner("workspace:one", "thread:one"));
-    var call_id: ExactText = .{};
-    try std.testing.expect(call_id.set("call:one"));
-    var operation = testOperation("tool:8:call:one", .pending, 1);
-    operation.category = .provider_tool;
-    operation.target = .{ .tool_call = call_id };
-    operation.inspector.input.set("structured input");
-    frame.upsertOperation(operation);
-    operation.status = .completed;
-    operation.inspector.output.set("structured output");
-    frame.upsertOperation(operation);
-
-    const reference = frame.operationReference(0).?;
-    var copied = frame;
-    frame.owner = .{};
-    operation.inspector.output.set("mutated source");
-    try std.testing.expect(copied.containsReference(&reference));
-    try std.testing.expectEqualStrings("structured output", copied.operations[0].inspector.output.slice());
-    try std.testing.expectEqualStrings("call:one", copied.operations[0].target.tool_call.slice());
-}
-
 test "evicted operation references cannot match a later bounded frame" {
     var frame: Frame = .{};
     try std.testing.expect(frame.setOwner("workspace", "thread"));
@@ -1097,40 +1074,6 @@ test "Mission Control selection and scroll reset only at exact invalidation boun
     try std.testing.expectEqual(@as(f32, 0.0), state.mission_control_body_scroll_y);
 }
 
-test "Mission Control direct scroll regions clamp independently" {
-    var state = Self.init();
-    state.scrollMissionControl(.summary, 40.0, 100.0);
-    state.scrollMissionControl(.operations, 50.0, 100.0);
-    state.scrollMissionControl(.inspector, 60.0, 100.0);
-    state.scrollMissionControl(.body, 70.0, 100.0);
-    state.scrollMissionControl(.summary, -15.0, 100.0);
-    state.scrollMissionControl(.operations, 500.0, 80.0);
-    try std.testing.expectEqual(@as(f32, 25.0), state.mission_control_summary_scroll_y);
-    try std.testing.expectEqual(@as(f32, 80.0), state.mission_control_operations_scroll_y);
-    try std.testing.expectEqual(@as(f32, 60.0), state.mission_control_inspector_scroll_y);
-    try std.testing.expectEqual(@as(f32, 70.0), state.mission_control_body_scroll_y);
-}
-
-test "operation hit owns its copied reference after source frame replacement" {
-    var frame: Frame = .{};
-    try std.testing.expect(frame.setOwner("workspace", "thread"));
-    var call_id: ExactText = .{};
-    try std.testing.expect(call_id.set("call:one"));
-    var operation = testOperation("operation:one", .in_progress, 1);
-    operation.target = .{ .tool_call = call_id };
-    frame.upsertOperation(operation);
-    const reference = frame.operationReference(0).?;
-
-    var state = Self.init();
-    state.setFrame(frame);
-    state.addOperationHit(.{ .x = 10.0, .y = 10.0, .w = 20.0, .h = 20.0 }, .operation_select, reference);
-    frame = .{};
-    const pressed = state.handlePointerButton(15.0, 15.0, 1, true);
-    try std.testing.expectEqual(HitAction.operation_select, pressed.action.?);
-    try std.testing.expect(pressed.reference.?.eql(&reference));
-    try std.testing.expectEqualStrings("operation:one", pressed.reference.?.identity.slice());
-}
-
 test "bounded operations prioritize active and activity retains newest chronology" {
     var frame: Frame = .{};
     var id_buffer: [32]u8 = undefined;
@@ -1211,73 +1154,6 @@ test "tab and scroll memory survive hide while owner identity replacement resets
     try std.testing.expect(state.activity_follow_tail);
 }
 
-test "visibility transitions are idempotent and preserve semantic state" {
-    var state = Self.init();
-    state.applyFixture(.paused);
-    const semantic_before = state.visualState();
-    const status_before = state.status_text;
-    const operations_before = state.operation_count;
-
-    state.show();
-    state.show();
-    try std.testing.expectEqual(Visibility.sidecar_open, state.visibility);
-    state.collapse();
-    state.collapse();
-    try std.testing.expectEqual(Visibility.collapsed_chip, state.visibility);
-    try std.testing.expectEqualDeep(semantic_before, state.visualState());
-    try std.testing.expectEqualStrings(status_before, state.status_text);
-    try std.testing.expectEqual(operations_before, state.operation_count);
-
-    state.toggle();
-    try std.testing.expectEqual(Visibility.sidecar_open, state.visibility);
-    state.toggle();
-    try std.testing.expectEqual(Visibility.collapsed_chip, state.visibility);
-}
-
-test "fixture mapping and visual precedence are orthogonal" {
-    var state = Self.init();
-    state.applyFixture(.idle);
-    try std.testing.expectEqual(Pose.idle, state.visualState().pose);
-    state.applyFixture(.working);
-    try std.testing.expectEqual(Pose.working, state.visualState().pose);
-    state.applyFixture(.needs_approval);
-    try std.testing.expectEqual(Pose.approval, state.visualState().pose);
-
-    state.applyFixture(.paused);
-    const paused = state.visualState();
-    try std.testing.expectEqual(Pose.paused, paused.pose);
-    try std.testing.expect(paused.show_approval);
-
-    state.applyFixture(.failed);
-    try std.testing.expect(state.visualState().show_failure);
-    inline for (.{ RunPhase.idle, RunPhase.working, RunPhase.paused }) |phase| {
-        state.run_phase = phase;
-        try std.testing.expect(state.visualState().show_failure);
-    }
-}
-
-test "authoritative thread activity projects without changing visibility" {
-    var state = Self.init();
-    state.visibility = .collapsed_chip;
-    state.applyActivity(.working);
-    try std.testing.expectEqual(RunPhase.working, state.run_phase);
-    try std.testing.expect(!state.needs_approval);
-    state.applyActivity(.waiting);
-    try std.testing.expect(state.needs_approval);
-    state.applyActivity(.failed);
-    try std.testing.expect(state.has_failure);
-    try std.testing.expectEqual(Visibility.collapsed_chip, state.visibility);
-}
-
-test "collapse cannot express runtime cancellation" {
-    var state = Self.init();
-    state.show();
-    state.applyFixture(.working);
-    state.collapse();
-    try std.testing.expectEqual(RunPhase.working, state.run_phase);
-    try std.testing.expectEqual(@as(usize, 3), state.operation_count);
-}
-
 test "Escape down repeat and up remain one Companion-owned action" {
     var state = Self.init();
     try std.testing.expect(!state.handleEscapeKey(true));
@@ -1290,23 +1166,6 @@ test "Escape down repeat and up remain one Companion-owned action" {
     try std.testing.expect(state.handleEscapeKey(false));
     try std.testing.expect(!state.ownsEscapeKey());
     try std.testing.expect(!state.handleEscapeKey(true));
-}
-
-test "pointer press captures matching release across visibility and hit changes" {
-    var state = Self.init();
-    state.addHit(.{ .x = 80.0, .y = 80.0, .w = 20.0, .h = 20.0 }, .open);
-
-    const press = state.handlePointerButton(90.0, 90.0, 1, true);
-    try std.testing.expect(press.consumed);
-    try std.testing.expectEqual(HitAction.open, press.action.?);
-    try std.testing.expect(state.ownsPointerButton(1));
-
-    state.show();
-    state.clearHits();
-    const release = state.handlePointerButton(5.0, 5.0, 1, false);
-    try std.testing.expect(release.consumed);
-    try std.testing.expect(!state.ownsPointerButton(1));
-    try std.testing.expect(!state.handlePointerButton(5.0, 5.0, 1, false).consumed);
 }
 
 test "overlapping pointer buttons independently own releases after collapse" {

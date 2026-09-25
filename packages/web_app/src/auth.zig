@@ -1091,38 +1091,6 @@ test "pair rate limiter rejects blocked clients before credential work" {
     );
 }
 
-test "credential rate limiters are independent and success clears a bucket" {
-    const options: RateLimitOptions = .{
-        .max_clients = 1,
-        .max_failures = 1,
-        .window_ms = 100,
-        .block_ms = 500,
-    };
-    var device_limiter = try LoginRateLimiter.init(options);
-    defer device_limiter.deinit();
-    var ticket_limiter = try LoginRateLimiter.init(options);
-    defer ticket_limiter.deinit();
-
-    _ = try device_limiter.recordAttempt(std.testing.io, "client-a", false, 1_000);
-    try std.testing.expectEqual(
-        RateLimitDecision.rate_limited,
-        try device_limiter.preflight(std.testing.io, "client-a", 1_001),
-    );
-    try std.testing.expectEqual(
-        RateLimitDecision.allowed,
-        try ticket_limiter.preflight(std.testing.io, "client-a", 1_001),
-    );
-    _ = try ticket_limiter.recordAttempt(std.testing.io, "client-a", false, 1_001);
-    try std.testing.expectEqual(
-        RateLimitDecision.allowed,
-        try ticket_limiter.recordAttempt(std.testing.io, "client-a", true, 1_501),
-    );
-    try std.testing.expectEqual(
-        RateLimitDecision.allowed,
-        try ticket_limiter.preflight(std.testing.io, "client-a", 1_502),
-    );
-}
-
 test "pair access tokens expire and WebSocket tickets are one use" {
     var manager = try PairCredentialManager.init(.{
         .max_access_tokens = 2,

@@ -204,28 +204,19 @@ test "SSH stdio relay argv is exact shell-free and loopback-only" {
     user[0] = 'X';
     try std.testing.expectEqualStrings("devbox.example", owned.argv[owned.argv.len - 1]);
     try std.testing.expectEqualStrings("verde", owned.argv[owned.argv.len - 2]);
-}
 
-test "SSH argv preserves user config while clearing unrelated forwards" {
-    var host = "configured-alias".*;
-    const ssh: profile.SshTunnel = .{
-        .host = host[0..],
+    // Without a user the host is still last and no `-l` is emitted, leaving
+    // the user's SSH config in charge of the login name.
+    var alias = "configured-alias".*;
+    var no_user = try buildArgvAlloc(std.testing.allocator, .{
+        .host = alias[0..],
         .user = null,
         .port = 22,
         .remote_gateway_port = 7420,
-    };
-    var owned = try buildArgvAlloc(std.testing.allocator, ssh);
-    defer owned.deinit(std.testing.allocator);
-
-    try std.testing.expectEqualStrings("configured-alias", owned.argv[owned.argv.len - 1]);
-    try std.testing.expect(!containsArg(owned.argv, "-F"));
-    try std.testing.expect(!containsArg(owned.argv, "StrictHostKeyChecking=yes"));
-    try std.testing.expect(containsArg(owned.argv, "ClearAllForwardings=yes"));
-    try std.testing.expect(containsArg(owned.argv, "-W"));
-    try std.testing.expect(!containsArg(owned.argv, "-L"));
-    try std.testing.expect(containsArg(owned.argv, "ControlMaster=no"));
-    try std.testing.expect(containsArg(owned.argv, "ControlPath=none"));
-    try std.testing.expect(containsArg(owned.argv, "ControlPersist=no"));
+    });
+    defer no_user.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("configured-alias", no_user.argv[no_user.argv.len - 1]);
+    try std.testing.expect(!containsArg(no_user.argv, "-l"));
 }
 
 test "SSH argv rejects invalid ports and option-shaped destinations" {

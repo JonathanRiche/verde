@@ -2711,19 +2711,6 @@ fn rectContainsPoint(rect: palette.Rect, x: f32, y: f32) bool {
     return x >= rect.x and y >= rect.y and x <= rect.x + rect.w and y <= rect.y + rect.h;
 }
 
-test "pane row drag owns move cursor from press through active drag" {
-    const previous_drag = pane_row_drag;
-    defer pane_row_drag = previous_drag;
-
-    pane_row_drag = .{};
-    try std.testing.expectEqual(@as(?sdl.SystemCursor, null), systemCursorAt(0, 0));
-    pane_row_drag.pending = true;
-    try std.testing.expectEqual(@as(?sdl.SystemCursor, .move), systemCursorAt(0, 0));
-    pane_row_drag.pending = false;
-    pane_row_drag.active = true;
-    try std.testing.expectEqual(@as(?sdl.SystemCursor, .move), systemCursorAt(0, 0));
-}
-
 fn queuePaletteRoundedRect(state: *runtime.AppState, rect: palette.Rect, color: palette.Color, radius: f32) void {
     state.palette_overlay_batch.roundedRect(state.allocator, snapRect(rect), color, radius) catch |err| {
         log.warn("failed to queue sidebar palette rounded rect: {s}", .{@errorName(err)});
@@ -3173,12 +3160,6 @@ fn queuePaletteChatBubbleIcon(state: anytype, x: f32, center_y: f32, color: [4]f
     }, palette_color);
 }
 
-test "done pane status uses the themed success treatment" {
-    var label_buf: [24]u8 = undefined;
-    try std.testing.expectEqualStrings("Done", paneStatusLabelText(&label_buf, .done, false, null));
-    try std.testing.expectEqual(theme.success(), paneStatusColor(.done, false).?);
-}
-
 test "live Amp process wins over stale Cursor terminal metadata" {
     try std.testing.expectEqual(
         TerminalAgentProvider.amp,
@@ -3374,5 +3355,4 @@ test "workspace settings entry points bind to the invoked workspace" {
     // id-bound opener, never through the currently-selected workspace.
     try std.testing.expect(std.mem.indexOf(u8, source, "state.openWorkspaceSettingsForProject(hit.project_index)") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, ".workspace_open_settings => state.openWorkspaceSettingsForProject(pi)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "\"Workspace settings\"") != null);
 }

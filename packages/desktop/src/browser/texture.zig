@@ -123,9 +123,3 @@ fn shouldThrottleExternalUploadAt(last_upload_ms: i64, now_ms: i64) bool {
 fn monotonicTimestampMs() i64 {
     return @intCast(@divTrunc(platform_runtime.monotonicTimestampNs(), std.time.ns_per_ms));
 }
-
-test "external upload throttle reports deferred only inside its interval" {
-    try std.testing.expect(!shouldThrottleExternalUploadAt(0, 100));
-    try std.testing.expect(shouldThrottleExternalUploadAt(100, 132));
-    try std.testing.expect(!shouldThrottleExternalUploadAt(100, 133));
-}

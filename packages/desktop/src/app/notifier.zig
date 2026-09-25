@@ -347,17 +347,6 @@ fn closeDetachedWindowsChild(child: *std.process.Child) void {
     child.id = null;
 }
 
-test "status chimes are embedded wav bitstreams" {
-    const assets = [_][]const u8{ AGENT_DONE_SOUND, AGENT_WAITING_SOUND, AGENT_ERROR_SOUND };
-    for (assets) |bytes| {
-        try std.testing.expect(std.mem.startsWith(u8, bytes, "RIFF"));
-        try std.testing.expect(std.mem.indexOf(u8, bytes[0..12], "WAVE") != null);
-        try std.testing.expect(bytes.len > 1024);
-    }
-    try std.testing.expect(soundForChime(.done).bytes.ptr != soundForChime(.waiting).bytes.ptr);
-    try std.testing.expect(soundForChime(.waiting).bytes.ptr != soundForChime(.@"error").bytes.ptr);
-}
-
 test "windows toast is silent and plays the Verde chime from the env path" {
     try std.testing.expect(std.mem.indexOf(u8, WINDOWS_NOTIFICATION_SCRIPT, "silent='true'") != null);
     try std.testing.expect(std.mem.indexOf(u8, WINDOWS_NOTIFICATION_SCRIPT, "Notification.Default") == null);

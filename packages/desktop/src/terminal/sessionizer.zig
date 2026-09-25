@@ -1905,6 +1905,13 @@ const ChatTurn = struct {
     result_reply_text: ?[]u8 = null,
     generated_title: ?[:0]const u8 = null,
     generated_title_applied: bool = false,
+    /// The prompt-only title applied mid-turn and then superseded by the
+    /// completion refinement. Commit and GUI may replace it like the fallback.
+    previous_generated_title: ?[:0]const u8 = null,
+    /// Prompt-only title worker running beside the provider (opening turns).
+    title_thread: ?std.Thread = null,
+    /// Asks the prompt-only title worker to abandon its provider run.
+    title_stop: bool = false,
     error_message: ?[]u8 = null,
     failure_reason: ?ProviderFailureReason = null,
     pending_approval: ?PendingApproval = null,
@@ -1921,6 +1928,7 @@ const ChatTurn = struct {
             self.mutex.unlock();
             worker_thread.join();
         }
+        stopInFlightTitleWorker(self);
         if (self.blocked_reason) |v| allocator.free(v);
         if (self.task_owner) |v| allocator.free(v);
         if (self.parent_thread_id) |v| allocator.free(v);
@@ -1945,6 +1953,7 @@ const ChatTurn = struct {
         if (self.active_turn_id) |value| allocator.free(value);
         if (self.result_reply_text) |value| allocator.free(value);
         if (self.generated_title) |value| allocator.free(value);
+        if (self.previous_generated_title) |value| allocator.free(value);
         if (self.error_message) |value| allocator.free(value);
         if (self.pending_approval) |*approval| approval.deinit(allocator);
         if (self.approval_call_id) |value| allocator.free(value);
@@ -10300,6 +10309,7 @@ fn commitChatTurnDurable(daemon: *Daemon, turn: *ChatTurn) !void {
     const blocked_reason = if (turn.blocked_reason) |v| try arena.dupe(u8, v) else null;
     const reply_text = if (turn.result_reply_text) |text| try arena.dupe(u8, text) else "";
     const generated_title = if (turn.generated_title) |title| try arena.dupe(u8, title) else null;
+    const previous_generated_title = if (turn.previous_generated_title) |title| try arena.dupe(u8, title) else null;
     var events = try arena.alloc(transcript_apply.ChatEvent, turn.events.items.len);
     for (turn.events.items, 0..) |event, index| {
         events[index] = .{
@@ -10419,6 +10429,7 @@ fn commitChatTurnDurable(daemon: *Daemon, turn: *ChatTurn) !void {
         },
         .expected_thread_title = if (generated_title != null) thread_title else null,
         .generated_title = generated_title,
+        .previous_generated_title = if (generated_title != null) previous_generated_title else null,
         .error_message = error_message,
         .failure_reason = failure_reason,
         .user_message_id = user_message_id,
@@ -13543,12 +13554,19 @@ fn writeChatTurnTail(
     if (!has_more_events) {
         if (turn.result_reply_text) |value| try s.write(value) else try s.write(null);
     } else try s.write(null);
+    // Durable titles ride every page: the prompt-only title lands mid-turn
+    // (announced by a thread_title event) and the refinement at completion.
+    // Clients may replace the expected fallback or the superseded title.
     try s.objectField("generated_title");
-    if (!has_more_events and turn.generated_title_applied) {
+    if (turn.generated_title_applied) {
         if (turn.generated_title) |value| try s.write(value) else try s.write(null);
     } else try s.write(null);
     try s.objectField("generated_title_expected");
-    if (!has_more_events and turn.generated_title_applied) try s.write(turn.request.thread_title) else try s.write(null);
+    if (turn.generated_title_applied) try s.write(turn.request.thread_title) else try s.write(null);
+    try s.objectField("generated_title_previous");
+    if (turn.generated_title_applied) {
+        if (turn.previous_generated_title) |value| try s.write(value) else try s.write(null);
+    } else try s.write(null);
     try s.objectField("error_message");
     if (!has_more_events) {
         if (turn.error_message) |value| try s.write(value) else try s.write(null);
@@ -13624,6 +13642,8 @@ fn durableChatTurnTailResponse(
     try s.write(null);
     try s.objectField("generated_title_expected");
     try s.write(null);
+    try s.objectField("generated_title_previous");
+    try s.write(null);
     try s.objectField("error_message");
     if (record.error_message) |value| try s.write(value) else try s.write(null);
     try s.objectField("failure_reason");
@@ -13692,12 +13712,13 @@ fn chatTailMetadataUpperBound(turn: *const ChatTurn, include_prompt: bool, inclu
     if (turn.active_turn_id) |value| total = saturatedAdd(total, jsonStringUpperBound(value));
     if (turn.user_message_id) |value| total = saturatedAdd(total, jsonStringUpperBound(value));
     if (include_prompt) total = saturatedAdd(total, jsonStringUpperBound(turn.request.prompt));
+    if (turn.generated_title_applied) {
+        if (turn.generated_title) |value| total = saturatedAdd(total, jsonStringUpperBound(value));
+        if (turn.previous_generated_title) |value| total = saturatedAdd(total, jsonStringUpperBound(value));
+        total = saturatedAdd(total, jsonStringUpperBound(turn.request.thread_title));
+    }
     if (include_terminal_fields) {
         if (turn.result_reply_text) |value| total = saturatedAdd(total, jsonStringUpperBound(value));
-        if (turn.generated_title_applied) {
-            if (turn.generated_title) |value| total = saturatedAdd(total, jsonStringUpperBound(value));
-            total = saturatedAdd(total, jsonStringUpperBound(turn.request.thread_title));
-        }
         if (turn.error_message) |value| total = saturatedAdd(total, jsonStringUpperBound(value));
     }
     if (turn.pending_approval) |approval| {
@@ -13971,60 +13992,9 @@ fn resolveChatExecutionRoute(
     };
 }
 
-fn workspaceFilesSearchResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
-    const allocator = daemon.allocator;
-    if (params != .object) {
-        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "file search params must be an object");
-    }
-    const query = jsonString(params.object.get("query") orelse .null) orelse "";
-    if (query.len > workspace_file_search.MAX_QUERY_BYTES or std.mem.indexOfAny(u8, query, "\x00\r\n") != null) {
-        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid file search query");
-    }
-    const limit: usize = switch (params.object.get("limit") orelse .null) {
-        .null => workspace_file_search.DEFAULT_LIMIT,
-        .integer => |value| if (value >= 1) @intCast(@min(value, @as(i64, workspace_file_search.MAX_LIMIT))) else {
-            return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid file search limit");
-        },
-        else => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid file search limit"),
-    };
-
-    // Route resolution is shared with chat.turn.start; the primary repository
-    // is the default so plain workspace chats need not name it.
-    var route_params: std.json.ObjectMap = .empty;
-    defer route_params.deinit(allocator);
-    for ([_][]const u8{ "workspace_id", "relative_cwd", "project_path", "cwd" }) |key| {
-        if (params.object.get(key)) |value| try route_params.put(allocator, key, value);
-    }
-    try route_params.put(allocator, "repository_id", switch (params.object.get("repository_id") orelse .null) {
-        .null => .{ .string = store_protocol.PRIMARY_REPOSITORY_ID },
-        else => |value| value,
-    });
-    var route = (resolveChatExecutionRoute(daemon, .{ .object = route_params }) catch |err| return switch (err) {
-        error.InvalidParams, error.RouteAttachmentsUnsupported => try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid repository route params"),
-        error.CapabilityUnavailable => try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "repository checkout is unavailable on this runtime"),
-        error.ResourceNotFound => try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_RESOURCE_NOT_FOUND, "repository binding not found on this runtime"),
-        error.StoreCorrupt => try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_STORE_CORRUPT, "store is corrupt"),
-        error.StoreUnavailable => try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_STORE_UNAVAILABLE, "store is unavailable"),
-        error.OutOfMemory => error.OutOfMemory,
-    }) orelse return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid repository route params");
-    defer route.deinit(allocator);
-
-    var results = workspace_file_search.search(allocator, route.cwd orelse route.project_path, query, limit) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.SearchUnavailable => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "repository files could not be listed"),
-    };
-    defer results.deinit();
-    return try okValueResponse(allocator, id_value, .{
-        .repository_id = route.repository_id,
-        .relative_cwd = route.relative_cwd,
-        .query = query,
-        .files = results.files,
-        .total_files = results.total_files,
-        .truncated = results.truncated,
-        .source = @tagName(results.source),
-    });
-}
-
+/// `workspace.files.search`: composer `@` mention candidates relative to the
+/// chat's repository route. The root always comes from the stored workspace
+/// repository binding on this runtime; client paths are rejected.
 /// browser.history.{record,query,clear}: daemon-owned browsing history behind
 /// the GUI address-bar suggestions. Serves unlocked; SQLite work runs under
 /// the store mutex with `in_flight` pinned so shutdown drains it like
@@ -14110,6 +14080,60 @@ fn browserHistoryResponse(daemon: *Daemon, id_value: std.json.Value, method: []c
         };
     }
     return try okValueResponse(allocator, id_value, .{ .cleared = true });
+}
+
+fn workspaceFilesSearchResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+    const allocator = daemon.allocator;
+    if (params != .object) {
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "file search params must be an object");
+    }
+    const query = jsonString(params.object.get("query") orelse .null) orelse "";
+    if (query.len > workspace_file_search.MAX_QUERY_BYTES or std.mem.indexOfAny(u8, query, "\x00\r\n") != null) {
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid file search query");
+    }
+    const limit: usize = switch (params.object.get("limit") orelse .null) {
+        .null => workspace_file_search.DEFAULT_LIMIT,
+        .integer => |value| if (value >= 1) @intCast(@min(value, @as(i64, workspace_file_search.MAX_LIMIT))) else {
+            return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid file search limit");
+        },
+        else => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid file search limit"),
+    };
+
+    // Route resolution is shared with chat.turn.start; the primary repository
+    // is the default so plain workspace chats need not name it.
+    var route_params: std.json.ObjectMap = .empty;
+    defer route_params.deinit(allocator);
+    for ([_][]const u8{ "workspace_id", "relative_cwd", "project_path", "cwd" }) |key| {
+        if (params.object.get(key)) |value| try route_params.put(allocator, key, value);
+    }
+    try route_params.put(allocator, "repository_id", switch (params.object.get("repository_id") orelse .null) {
+        .null => .{ .string = store_protocol.PRIMARY_REPOSITORY_ID },
+        else => |value| value,
+    });
+    var route = (resolveChatExecutionRoute(daemon, .{ .object = route_params }) catch |err| return switch (err) {
+        error.InvalidParams, error.RouteAttachmentsUnsupported => try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid repository route params"),
+        error.CapabilityUnavailable => try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "repository checkout is unavailable on this runtime"),
+        error.ResourceNotFound => try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_RESOURCE_NOT_FOUND, "repository binding not found on this runtime"),
+        error.StoreCorrupt => try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_STORE_CORRUPT, "store is corrupt"),
+        error.StoreUnavailable => try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_STORE_UNAVAILABLE, "store is unavailable"),
+        error.OutOfMemory => error.OutOfMemory,
+    }) orelse return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid repository route params");
+    defer route.deinit(allocator);
+
+    var results = workspace_file_search.search(allocator, route.cwd orelse route.project_path, query, limit) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.SearchUnavailable => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "repository files could not be listed"),
+    };
+    defer results.deinit();
+    return try okValueResponse(allocator, id_value, .{
+        .repository_id = route.repository_id,
+        .relative_cwd = route.relative_cwd,
+        .query = query,
+        .files = results.files,
+        .total_files = results.total_files,
+        .truncated = results.truncated,
+        .source = @tagName(results.source),
+    });
 }
 
 // Browser cookie import: read source cookie stores from other installed
@@ -15231,72 +15255,73 @@ fn providerFailureMessage(reason: ProviderFailureReason) []const u8 {
     };
 }
 
-/// Generate an opening-exchange title under the same durable identity guard
-/// for GUI and headless turns. A manual rename changes the stored title away
-/// from the accepted fallback/placeholder, so the terminal commit cannot
-/// overwrite it.
-fn maybeGenerateAutomaticChatTurnTitle(daemon: *Daemon, turn: *ChatTurn) void {
-    if (turn.use_stub) return;
-
-    lockTurn(turn);
-    const completed = turn.status == .completed and turn.result_reply_text != null and turn.committed_store_revision == null;
-    const reply_text = turn.result_reply_text orelse "";
-    turn.mutex.unlock();
-    if (!completed) return;
-
-    var config = app_config.loadAppConfig(daemon.allocator) catch |err| {
-        log.warn("automatic chat title config load failed err={s}", .{@errorName(err)});
-        return;
-    };
-    defer config.deinit(daemon.allocator);
-    if (!config.automatic_chat_titles_enabled) return;
-
+/// The first-prompt fallback an automatic title may replace, or null when the
+/// turn's requested title is already a real (generated or manual) title.
+/// Caller owns `fallback_out`.
+fn automaticChatTurnExpectedTitle(
+    allocator: std.mem.Allocator,
+    turn: *const ChatTurn,
+    fallback_out: *?[:0]const u8,
+) ?[]const u8 {
     const fallback_prompt = if (std.mem.trim(u8, turn.request.prompt, &std.ascii.whitespace).len > 0)
         turn.request.prompt
     else
         "Image";
-    const fallback_title = chat_threads.makeThreadTitle(daemon.allocator, fallback_prompt) catch |err| {
+    const fallback_title = chat_threads.makeThreadTitle(allocator, fallback_prompt) catch |err| {
         log.warn("automatic chat fallback title failed err={s}", .{@errorName(err)});
-        return;
+        return null;
     };
-    defer daemon.allocator.free(fallback_title);
-    const expected_title = automaticTitleExpectedTitle(turn.request.thread_title, fallback_title) orelse return;
+    fallback_out.* = fallback_title;
+    return automaticTitleExpectedTitle(turn.request.thread_title, fallback_title);
+}
 
+/// True while the thread still holds `expected_title` and only its opening
+/// user prompt, so a manual rename or a later turn disqualifies the title.
+fn automaticChatTurnTitleStoreEligible(daemon: *Daemon, turn: *const ChatTurn, expected_title: []const u8) bool {
     lockDaemon(daemon);
     const service = daemon.store_service;
     if (service) |svc| _ = svc.in_flight.fetchAdd(1, .monotonic);
     daemon.mutex.unlock();
-    const svc = service orelse return;
+    const svc = service orelse return false;
     defer _ = svc.in_flight.fetchSub(1, .monotonic);
 
     lockStoreService(svc);
-    const eligible = svc.store.canGenerateAutomaticTitle(
+    defer svc.mutex.unlock();
+    return svc.store.canGenerateAutomaticTitle(
         turn.workspace_id,
         turn.local_thread_id,
         expected_title,
-    ) catch |err| blk: {
+    ) catch |err| {
         log.warn("automatic chat title eligibility failed err={s}", .{@errorName(err)});
-        break :blk false;
+        return false;
     };
-    svc.mutex.unlock();
-    if (!eligible) return;
+}
 
+/// Run the configured title model over the opening prompt and, when given,
+/// the first reply. An empty reply yields a prompt-only title.
+fn generateAutomaticChatTurnTitle(
+    allocator: std.mem.Allocator,
+    config: *const app_config.AppConfig,
+    turn: *ChatTurn,
+    reply_text: []const u8,
+    sink: send_runner.Sink,
+) ?[:0]const u8 {
     const user_text = if (std.mem.trim(u8, turn.request.prompt, &std.ascii.whitespace).len > 0)
         boundedTitleUtf8Prefix(turn.request.prompt, 4096)
     else
         "Image attachment";
     const title_prompt = chat_threads.makeTitleGenerationPrompt(
-        daemon.allocator,
+        allocator,
         user_text,
         boundedTitleUtf8Prefix(reply_text, 4096),
     ) catch |err| {
         log.warn("automatic chat title prompt failed err={s}", .{@errorName(err)});
-        return;
+        return null;
     };
-    defer daemon.allocator.free(title_prompt);
+    defer allocator.free(title_prompt);
 
     const provider = chatTitleProvider(config.chat_title_provider);
-    const result = send_runner.run(daemon.allocator, .{
+    const result = send_runner.run(allocator, .{
         .provider = provider,
         .harness_kind = .local_cli,
         .project_path = turn.request.project_path,
@@ -15305,25 +15330,170 @@ fn maybeGenerateAutomaticChatTurnTitle(daemon: *Daemon, turn: *ChatTurn) void {
         .model_ref = config.chatTitleModel(),
         .fast_mode = if (provider == .codex) .on else .off,
         .access_mode = .supervised,
-    }, .{}) catch |err| {
+    }, sink) catch |err| {
         log.warn("automatic chat title generation failed err={s}", .{@errorName(err)});
-        return;
+        return null;
     };
-    defer daemon.allocator.free(result.provider_thread_id);
-    defer daemon.allocator.free(result.reply_text);
+    defer allocator.free(result.provider_thread_id);
+    defer allocator.free(result.reply_text);
 
-    const generated_title = chat_threads.makeGeneratedThreadTitle(daemon.allocator, result.reply_text) catch |err| {
+    const generated_title = chat_threads.makeGeneratedThreadTitle(allocator, result.reply_text) catch |err| {
         log.warn("automatic chat title normalization failed err={s}", .{@errorName(err)});
-        return;
+        return null;
     } orelse {
         log.warn("automatic chat title provider returned an empty title", .{});
+        return null;
+    };
+    return generated_title;
+}
+
+/// Start the prompt-only title beside the provider turn. Only opening turns
+/// whose requested title is still the fallback qualify; the worker rechecks
+/// config and the durable guard off the turn thread.
+fn startInFlightAutomaticChatTurnTitle(daemon: *Daemon, turn: *ChatTurn) void {
+    var fallback: ?[:0]const u8 = null;
+    defer if (fallback) |value| daemon.allocator.free(value);
+    if (automaticChatTurnExpectedTitle(daemon.allocator, turn, &fallback) == null) return;
+    const thread = std.Thread.spawn(.{}, inFlightAutomaticChatTurnTitleThread, .{ daemon, turn }) catch |err| {
+        log.warn("automatic chat title worker spawn failed turn_id={s} err={s}", .{ turn.turn_id, @errorName(err) });
         return;
     };
+    lockTurn(turn);
+    turn.title_thread = thread;
+    turn.mutex.unlock();
+}
+
+/// Stop and join the prompt-only title worker. Completion joins it before
+/// refining so the two never race on the turn's title fields.
+fn stopInFlightTitleWorker(turn: *ChatTurn) void {
+    lockTurn(turn);
+    turn.title_stop = true;
+    const worker = turn.title_thread;
+    turn.title_thread = null;
+    turn.mutex.unlock();
+    if (worker) |thread| thread.join();
+}
+
+fn inFlightTitleShouldStop(context: ?*anyopaque) bool {
+    const turn = chatTurnFromContext(context) orelse return true;
+    lockTurn(turn);
+    defer turn.mutex.unlock();
+    // Failed and aborted turns finalize promptly; completion refines instead.
+    return turn.title_stop or turn.cancel_requested or
+        turn.status == .aborted or turn.status == .failed;
+}
+
+/// Name the thread from its opening prompt while the first reply streams.
+/// The durable write is guarded exactly like the completion title, so a
+/// manual rename made meanwhile wins.
+fn inFlightAutomaticChatTurnTitleThread(daemon: *Daemon, turn: *ChatTurn) void {
+    const allocator = daemon.allocator;
+    var config = app_config.loadAppConfig(allocator) catch |err| {
+        log.warn("automatic chat title config load failed err={s}", .{@errorName(err)});
+        return;
+    };
+    defer config.deinit(allocator);
+    if (!config.automatic_chat_titles_enabled) return;
+
+    var fallback: ?[:0]const u8 = null;
+    defer if (fallback) |value| allocator.free(value);
+    const expected_title = automaticChatTurnExpectedTitle(allocator, turn, &fallback) orelse return;
+    if (!automaticChatTurnTitleStoreEligible(daemon, turn, expected_title)) return;
+
+    const title = generateAutomaticChatTurnTitle(allocator, &config, turn, "", .{
+        .context = turn,
+        .on_should_stop = inFlightTitleShouldStop,
+    }) orelse return;
+    var owned_title: ?[:0]const u8 = title;
+    defer if (owned_title) |value| allocator.free(value);
+    if (inFlightTitleShouldStop(turn)) return;
+
+    lockDaemon(daemon);
+    const service = daemon.store_service;
+    if (service) |svc| _ = svc.in_flight.fetchAdd(1, .monotonic);
+    daemon.mutex.unlock();
+    const svc = service orelse return;
+    defer _ = svc.in_flight.fetchSub(1, .monotonic);
+    lockStoreService(svc);
+    const revision = svc.store.applyInFlightAutomaticTitle(
+        turn.workspace_id,
+        turn.local_thread_id,
+        expected_title,
+        title,
+    ) catch |err| blk: {
+        log.warn("automatic chat title write failed err={s}", .{@errorName(err)});
+        break :blk null;
+    };
+    svc.mutex.unlock();
+    const store_revision = revision orelse return;
+    daemon.appendJournalEntry(.chat_thread, turn.local_thread_id, turn.workspace_id, .{ .store = store_revision });
 
     lockTurn(turn);
-    if (turn.generated_title) |old| daemon.allocator.free(old);
-    turn.generated_title = generated_title;
+    if (turn.generated_title) |old| allocator.free(old);
+    turn.generated_title = title;
+    owned_title = null;
+    turn.generated_title_applied = true;
+    // Wakes tail long-polls; the title itself rides the tail metadata.
+    turn.appendStringEvent(allocator, "thread_title", "title", title);
     turn.mutex.unlock();
+    log.info("chat turn phase turn_id={s} phase=title_in_flight since_accept_ms={d}", .{ turn.turn_id, nowMs() - turn.started_at_ms });
+}
+
+/// Refine the opening title with the first reply under the same durable
+/// identity guard for GUI and headless turns. A manual rename changes the
+/// stored title away from the fallback or the in-flight title, so the
+/// terminal commit cannot overwrite it.
+fn maybeGenerateAutomaticChatTurnTitle(daemon: *Daemon, turn: *ChatTurn) void {
+    // Always settle the in-flight worker first; every terminal path passes
+    // through here before its durable commit.
+    stopInFlightTitleWorker(turn);
+    if (turn.use_stub) return;
+    const allocator = daemon.allocator;
+
+    lockTurn(turn);
+    const completed = turn.status == .completed and turn.result_reply_text != null and turn.committed_store_revision == null;
+    const reply_text = turn.result_reply_text orelse "";
+    const in_flight_title: ?[]u8 = blk: {
+        if (!completed or !turn.generated_title_applied) break :blk null;
+        const value = turn.generated_title orelse break :blk null;
+        break :blk allocator.dupe(u8, value) catch null;
+    };
+    turn.mutex.unlock();
+    defer if (in_flight_title) |value| allocator.free(value);
+    if (!completed) return;
+
+    var config = app_config.loadAppConfig(allocator) catch |err| {
+        log.warn("automatic chat title config load failed err={s}", .{@errorName(err)});
+        return;
+    };
+    defer config.deinit(allocator);
+    if (!config.automatic_chat_titles_enabled) return;
+
+    var fallback: ?[:0]const u8 = null;
+    defer if (fallback) |value| allocator.free(value);
+    const expected_title = automaticChatTurnExpectedTitle(allocator, turn, &fallback) orelse return;
+    const eligible = automaticChatTurnTitleStoreEligible(daemon, turn, expected_title) or
+        if (in_flight_title) |value| automaticChatTurnTitleStoreEligible(daemon, turn, value) else false;
+    if (!eligible) return;
+
+    const generated_title = generateAutomaticChatTurnTitle(allocator, &config, turn, reply_text, .{}) orelse return;
+
+    lockTurn(turn);
+    defer turn.mutex.unlock();
+    if (turn.generated_title) |old| {
+        if (in_flight_title != null and std.mem.eql(u8, old, generated_title)) {
+            // The refinement agreed with the in-flight title; keep it applied.
+            allocator.free(generated_title);
+            return;
+        }
+        if (in_flight_title != null) {
+            if (turn.previous_generated_title) |stale| allocator.free(stale);
+            turn.previous_generated_title = old;
+        } else allocator.free(old);
+    }
+    turn.generated_title = generated_title;
+    // The commit re-confirms the durable title before tails advertise it.
+    turn.generated_title_applied = false;
 }
 
 test "automatic title eligibility accepts every empty-thread presentation label" {
@@ -15441,6 +15611,9 @@ fn chatTurnThread(daemon: *Daemon, turn: *ChatTurn) void {
         return;
     }
     if (turn.provider_invocation_count) |count| count.* += 1;
+    // The opening prompt is durable now, so its title can be generated while
+    // the provider streams instead of after the turn completes.
+    if (!turn.use_stub) startInFlightAutomaticChatTurnTitle(daemon, turn);
     // NIT-3: use_stub already folded the env at creation; do not re-eval.
     if (turn.use_stub) {
         runStubChatTurn(allocator, turn);

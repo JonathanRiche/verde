@@ -4,7 +4,6 @@ import {
   owningWorkspaceId,
   reconcileViewSelection,
   resolveWorkspaceId,
-  threadAfterWorkspaceSelect,
   workspaceSelectIntent,
 } from './selection'
 
@@ -13,49 +12,15 @@ const catalogs = {
   verde: [{ local_thread_id: 'verde-thread' }],
 }
 
-describe('actions sheet uses the thread owning workspace', () => {
-  test('ignores the globally selected workspace when the thread lives elsewhere', () => {
-    expect(owningWorkspaceId(
-      { workspace_id: 'mirage', thread_id: 'verde-thread' },
-      catalogs,
-    )).toBe('verde')
-  })
-
-  test('keeps the pane workspace when it matches the thread catalog', () => {
-    expect(owningWorkspaceId(
-      { workspace_id: 'verde', thread_id: 'verde-thread' },
-      catalogs,
-    )).toBe('verde')
-  })
-
-  test('falls back to the pane workspace for an opening chat with no catalog row', () => {
-    expect(owningWorkspaceId(
-      { workspace_id: 'verde', thread_id: 'opening' },
-      catalogs,
-    )).toBe('verde')
-  })
+test('actions sheet uses the thread owning workspace, falling back to the pane workspace', () => {
+  expect(owningWorkspaceId({ workspace_id: 'mirage', thread_id: 'verde-thread' }, catalogs)).toBe('verde')
+  expect(owningWorkspaceId({ workspace_id: 'verde', thread_id: 'verde-thread' }, catalogs)).toBe('verde')
+  expect(owningWorkspaceId({ workspace_id: 'verde', thread_id: 'opening' }, catalogs)).toBe('verde')
 })
 
-describe('workspace switch does not mutate the current thread', () => {
-  const thread = {
-    workspace_id: 'verde',
-    local_thread_id: 'verde-thread',
-    title: 'Existing chat',
-    profile_id: 'local',
-  }
-
-  test('selecting another workspace only requests a new chat', () => {
-    expect(workspaceSelectIntent(thread.workspace_id, 'mirage')).toEqual({
-      kind: 'open-new-chat',
-      workspace_id: 'mirage',
-    })
-    expect(threadAfterWorkspaceSelect(thread)).toEqual(thread)
-  })
-
-  test('reselecting the owning workspace is a no-op', () => {
-    expect(workspaceSelectIntent(thread.workspace_id, 'verde')).toEqual({ kind: 'keep' })
-    expect(threadAfterWorkspaceSelect(thread)).toEqual(thread)
-  })
+test('selecting another workspace requests a new chat; reselecting the owner is a no-op', () => {
+  expect(workspaceSelectIntent('verde', 'mirage')).toEqual({ kind: 'open-new-chat', workspace_id: 'mirage' })
+  expect(workspaceSelectIntent('verde', 'verde')).toEqual({ kind: 'keep' })
 })
 
 describe('reconnect preserves selection', () => {

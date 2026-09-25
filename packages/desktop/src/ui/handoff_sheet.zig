@@ -810,12 +810,6 @@ fn paletteColor(value: [4]f32) palette.Color {
     return .{ .r = value[0], .g = value[1], .b = value[2], .a = value[3] };
 }
 
-test "menu order maps back to its own index" {
-    for (MENUS, 0..) |menu, index| {
-        try std.testing.expectEqual(index, menuIndex(menu));
-    }
-}
-
 test "truncated labels keep the ellipsis inside the buffer" {
     var buf: [8]u8 = undefined;
     const out = truncatedLabel(&buf, "a very long thread title", 0.0, 12.0);

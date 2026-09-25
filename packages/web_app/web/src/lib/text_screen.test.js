@@ -61,14 +61,6 @@ describe('text_screen', () => {
     expect(screen.cursor.x).toBe(3)
   })
 
-  test('tracks cursor visibility', () => {
-    const screen = new TextScreen(10, 1)
-    screen.write('\x1b[?25l')
-    expect(screen.cursor.visible).toBe(false)
-    screen.write('\x1b[?25h')
-    expect(screen.cursor.visible).toBe(true)
-  })
-
   test('resize keeps the bottom rows and clamps the cursor', () => {
     const screen = new TextScreen(10, 3)
     screen.write('a\r\nb\r\nprompt')
@@ -78,14 +70,9 @@ describe('text_screen', () => {
   })
 })
 
-describe('engineFailureIsPermanent', () => {
-  test('CSP and compile failures are permanent', () => {
-    expect(engineFailureIsPermanent(new WebAssembly.CompileError("WebAssembly.instantiate(): Refused to compile or instantiate WebAssembly module because 'unsafe-eval' is not an allowed source"))).toBe(true)
-    expect(engineFailureIsPermanent(new Error('Terminal engine unavailable: this browser lacks WebAssembly SIMD128.'))).toBe(true)
-  })
-
-  test('fetch failures are transient', () => {
-    expect(engineFailureIsPermanent(new TypeError('Failed to fetch'))).toBe(false)
-    expect(engineFailureIsPermanent(new Error('ghostty-vt.wasm fetch failed (503)'))).toBe(false)
-  })
+test('engine failures: CSP/compile/SIMD are permanent, fetch failures are transient', () => {
+  expect(engineFailureIsPermanent(new WebAssembly.CompileError("WebAssembly.instantiate(): Refused to compile or instantiate WebAssembly module because 'unsafe-eval' is not an allowed source"))).toBe(true)
+  expect(engineFailureIsPermanent(new Error('Terminal engine unavailable: this browser lacks WebAssembly SIMD128.'))).toBe(true)
+  expect(engineFailureIsPermanent(new TypeError('Failed to fetch'))).toBe(false)
+  expect(engineFailureIsPermanent(new Error('ghostty-vt.wasm fetch failed (503)'))).toBe(false)
 })

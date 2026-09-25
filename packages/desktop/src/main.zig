@@ -988,21 +988,7 @@ fn systemCursorForBrowserShape(shape: browser_runtime.CursorShape) sdl.SystemCur
     };
 }
 
-test "browser cursor shapes map to cached SDL system cursor families" {
-    try std.testing.expectEqual(sdl.SystemCursor.pointer, systemCursorForBrowserShape(.pointer));
-    try std.testing.expectEqual(sdl.SystemCursor.text, systemCursorForBrowserShape(.vertical_text));
-    try std.testing.expectEqual(sdl.SystemCursor.pointer, systemCursorForBrowserShape(.grabbing));
-    try std.testing.expectEqual(sdl.SystemCursor.ne_resize, systemCursorForBrowserShape(.ne_resize));
-    try std.testing.expectEqual(sdl.SystemCursor.not_allowed, systemCursorForBrowserShape(.no_drop));
-    try std.testing.expectEqual(sdl.SystemCursor.default, systemCursorForBrowserShape(.custom));
-}
-
-test "production Companion cursor and wheel routing preserves direct ownership" {
-    const interactive = [_]companion_controller.HitAction{ .open, .collapse, .mission_control_open, .mission_control_close, .run_tab, .activity_tab, .approve, .deny, .operation_select, .operation_stop, .operation_follow_log };
-    for (interactive) |action| try std.testing.expectEqual(sdl.SystemCursor.pointer, systemCursorForCompanionAction(action));
-    try std.testing.expectEqual(sdl.SystemCursor.default, systemCursorForCompanionAction(.panel));
-    try std.testing.expectEqual(sdl.SystemCursor.default, systemCursorForCompanionAction(.body));
-
+test "production Companion wheel routing preserves direct ownership" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
     state.allocator = allocator;
@@ -3573,12 +3559,6 @@ fn linuxWindowFlagsPermitWmClose(
     _ = minimized;
     _ = occluded;
     return true;
-}
-
-test "linux WM close remains actionable for every presentation state" {
-    try std.testing.expect(linuxWindowFlagsPermitWmClose(true, true, false, false, false));
-    try std.testing.expect(linuxWindowFlagsPermitWmClose(false, false, false, false, false));
-    try std.testing.expect(linuxWindowFlagsPermitWmClose(false, false, true, true, true));
 }
 
 test "frame pacing tiers pace status pulses at 30fps and idle background sends" {

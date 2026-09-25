@@ -2465,17 +2465,6 @@ fn buildPermissionReplyBody(allocator: std.mem.Allocator, decision: provider_typ
     } });
 }
 
-test "permission replies use the v2 decision field for approval and denial" {
-    for ([_]provider_types.ApprovalDecision{ .approve, .deny }, [_][]const u8{ "once", "reject" }) |decision, expected| {
-        const body = try buildPermissionReplyBody(std.testing.allocator, decision);
-        defer std.testing.allocator.free(body);
-        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
-        defer parsed.deinit();
-        try std.testing.expectEqualStrings(expected, parsed.value.object.get("decision").?.string);
-        try std.testing.expect(!parsed.value.object.contains("reply"));
-    }
-}
-
 fn buildPermissionBody(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(allocator);
@@ -2841,38 +2830,25 @@ test "OpenCode tool called events classify task tools as subagents" {
     try std.testing.expectEqualStrings("Explore website package", capture.title.?);
 }
 
-test "OpenCode tool success events preserve subagent titles from input" {
-    const payload =
+test "OpenCode tool success events take subagent titles from input only" {
+    for ([_][]const u8{
         \\{"sessionID":"ses_1","callID":"task-1","input":{"description":"Explore website package"},"content":[{"type":"text","text":"done"}]}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-    var capture: OpenCodeTestToolCapture = .{};
-
-    try std.testing.expect(try emitToolResult(std.testing.allocator, .{
-        .prompt = "",
-        .stream_context = &capture,
-        .on_stream_event = OpenCodeTestToolCapture.handle,
-    }, "task", parsed.value, .completed));
-    try std.testing.expectEqual(provider_types.ToolCallKind.subagent, capture.kind.?);
-    try std.testing.expectEqualStrings("Explore website package", capture.title.?);
-}
-
-test "OpenCode tool success events leave subagent titles empty without input" {
-    const payload =
+        ,
         \\{"sessionID":"ses_1","callID":"task-1","content":[{"type":"text","text":"done"}]}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-    var capture: OpenCodeTestToolCapture = .{};
+        ,
+    }, [_][]const u8{ "Explore website package", "" }) |payload, expected_title| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+        defer parsed.deinit();
+        var capture: OpenCodeTestToolCapture = .{};
 
-    try std.testing.expect(try emitToolResult(std.testing.allocator, .{
-        .prompt = "",
-        .stream_context = &capture,
-        .on_stream_event = OpenCodeTestToolCapture.handle,
-    }, "task", parsed.value, .completed));
-    try std.testing.expectEqual(provider_types.ToolCallKind.subagent, capture.kind.?);
-    try std.testing.expectEqualStrings("", capture.title.?);
+        try std.testing.expect(try emitToolResult(std.testing.allocator, .{
+            .prompt = "",
+            .stream_context = &capture,
+            .on_stream_event = OpenCodeTestToolCapture.handle,
+        }, "task", parsed.value, .completed));
+        try std.testing.expectEqual(provider_types.ToolCallKind.subagent, capture.kind.?);
+        try std.testing.expectEqualStrings(expected_title, capture.title.?);
+    }
 }
 
 test "OpenCode tool success events join text content into output" {

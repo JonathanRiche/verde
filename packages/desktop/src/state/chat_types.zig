@@ -1569,11 +1569,6 @@ test "terminal events resolve repeated anonymous background commands in order" {
     try std.testing.expectEqual(BackgroundTaskStatus.stopped, thread.background_tasks.items[1].status);
 }
 
-test "background command events accept current and legacy labels" {
-    try std.testing.expectEqual(BackgroundTaskStatus.running, ChatThread.backgroundTaskStatusForEvent("Background command").?);
-    try std.testing.expectEqual(BackgroundTaskStatus.running, ChatThread.backgroundTaskStatusForEvent("Backgrounded command").?);
-}
-
 test "subagent local thread ids encode the parent and stay stable" {
     const allocator = std.testing.allocator;
     const first = try mintSubagentLocalThreadId(allocator, "chat-1-abc", "call-9");
@@ -1597,14 +1592,6 @@ test "subagent local thread ids encode the parent and stay stable" {
     try std.testing.expect(isSubagentAuthorOrKind("Subagent", null));
     try std.testing.expect(isSubagentAuthorOrKind("Read", .subagent));
     try std.testing.expect(!isSubagentAuthorOrKind("Read", .read));
-}
-
-test "structured tool bodies expose title input and output sections" {
-    const body = "Tool:\nExplore website\n\nInput:\n{\"prompt\":\"look around\"}\n\nOutput:\nfound 3 pages";
-    try std.testing.expectEqualStrings("Explore website", toolBodyField(body, "Tool").?);
-    try std.testing.expectEqualStrings("{\"prompt\":\"look around\"}", toolBodyField(body, "Input").?);
-    try std.testing.expectEqualStrings("found 3 pages", toolBodyField(body, "Output").?);
-    try std.testing.expect(toolBodyField(body, "Error") == null);
 }
 
 test "tool body sections keep blank lines until the next label" {

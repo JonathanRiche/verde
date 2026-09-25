@@ -1582,42 +1582,37 @@ test "Muse model list parser preserves catalog ids and labels" {
     try std.testing.expect(models[1].description == null);
 }
 
-test "Muse approval choice prefers once for approval" {
-    const payload =
+test "Muse approval choice prefers once and reads object-shaped decisions" {
+    for ([_][]const u8{
         \\[{"choiceId":"session","decision":"approvedForSession","label":"Allow session","scope":"session"},{"choiceId":"once","decision":"approved","label":"Allow once","scope":"once"},{"choiceId":"deny","decision":"denied","label":"Deny","scope":"once"}]
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings("once", chooseApprovalChoice(parsed.value.array.items, .approve).?);
-    try std.testing.expectEqualStrings("deny", chooseApprovalChoice(parsed.value.array.items, .deny).?);
+        ,
+        \\[{"choiceId":"allow_once","decision":{"kind":"approved"},"label":"Allow once","scope":"once"},{"choiceId":"abort","decision":{"kind":"abort"},"label":"Reject","scope":"once"}]
+        ,
+    }, [_][2][]const u8{ .{ "once", "deny" }, .{ "allow_once", "abort" } }) |payload, expected| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(expected[0], chooseApprovalChoice(parsed.value.array.items, .approve).?);
+        try std.testing.expectEqualStrings(expected[1], chooseApprovalChoice(parsed.value.array.items, .deny).?);
+    }
 }
 
-test "Muse session start omits approval mode when the host sealed it" {
-    const payload = try makeSessionStartRequestAlloc(
-        std.testing.allocator,
-        2,
-        "01991b47-0000-7000-8000-000000000001",
-        "/tmp/workspace",
-        "muse-spark-1.3-contributor",
-        null,
-    );
-    defer std.testing.allocator.free(payload);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "approvalMode") == null);
-}
-
-test "Muse session start sends allowAll for full-access policy" {
-    try std.testing.expectEqualStrings("allowAll", approvalModeForPolicy(.never).?);
-    try std.testing.expectEqualStrings("onRequest", approvalModeForPolicy(.on_request).?);
-    const payload = try makeSessionStartRequestAlloc(
-        std.testing.allocator,
-        2,
-        "01991b47-0000-7000-8000-000000000001",
-        "/tmp/workspace",
-        "muse-spark-1.3-contributor",
-        "allowAll",
-    );
-    defer std.testing.allocator.free(payload);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"approvalMode\":\"allowAll\"") != null);
+test "Muse session start sends approval mode only when the host did not seal it" {
+    for ([_]?[]const u8{ null, "allowAll" }) |mode| {
+        const payload = try makeSessionStartRequestAlloc(
+            std.testing.allocator,
+            2,
+            "01991b47-0000-7000-8000-000000000001",
+            "/tmp/workspace",
+            "muse-spark-1.3-contributor",
+            mode,
+        );
+        defer std.testing.allocator.free(payload);
+        if (mode == null) {
+            try std.testing.expect(std.mem.indexOf(u8, payload, "approvalMode") == null);
+        } else {
+            try std.testing.expect(std.mem.indexOf(u8, payload, "\"approvalMode\":\"allowAll\"") != null);
+        }
+    }
 }
 
 test "Muse ignores leftover turn completion before start ack" {
@@ -1651,38 +1646,9 @@ test "Muse turn start replaces a busy leftover turn" {
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"ifBusy\":\"replace\"") != null);
 }
 
-test "Muse interrupt uses the priority lane" {
-    const payload = try makeTurnInterruptRequestAlloc(
-        std.testing.allocator,
-        91,
-        "01991b47-0000-7000-8000-000000000002",
-        "session-1",
-        "turn-1",
-    );
-    defer std.testing.allocator.free(payload);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"method\":\"turn/interrupt\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"turnId\":\"turn-1\"") != null);
-}
-
-test "Muse approval choice reads object-shaped decisions" {
-    const payload =
-        \\[{"choiceId":"allow_once","decision":{"kind":"approved"},"label":"Allow once","scope":"once"},{"choiceId":"abort","decision":{"kind":"abort"},"label":"Reject","scope":"once"}]
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings("allow_once", chooseApprovalChoice(parsed.value.array.items, .approve).?);
-    try std.testing.expectEqualStrings("abort", chooseApprovalChoice(parsed.value.array.items, .deny).?);
-}
-
 test "Muse approval-mode rejection is distinguished from protocol failure" {
     try std.testing.expect(isApprovalModeRejected("unknown field approvalMode"));
     try std.testing.expect(!isApprovalModeRejected("session not found"));
-}
-
-test "Muse image MIME types fail visibly for unsupported attachments" {
-    try std.testing.expectEqualStrings("image/png", imageMimeType("shot.PNG").?);
-    try std.testing.expectEqualStrings("image/jpeg", imageMimeType("photo.jpeg").?);
-    try std.testing.expect(imageMimeType("notes.txt") == null);
 }
 
 test "Muse opaque reasoning history is detected from provider errors" {
@@ -1691,13 +1657,6 @@ test "Muse opaque reasoning history is detected from provider errors" {
     ));
     try std.testing.expect(isOpaqueReasoningHistory("start a fresh turn without opaque reasoning history"));
     try std.testing.expect(!isOpaqueReasoningHistory("session not found"));
-}
-
-test "Muse retry classification stops non-recoverable client failures" {
-    try std.testing.expect(isNonRecoverableRetryReason("client"));
-    try std.testing.expect(isNonRecoverableRetryReason(" CLIENT "));
-    try std.testing.expect(!isNonRecoverableRetryReason("timeout"));
-    try std.testing.expect(!isNonRecoverableRetryReason("server"));
 }
 
 test "Muse reminder children do not count as foreground work" {

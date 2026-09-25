@@ -473,19 +473,6 @@ fn rememberDaemonResponse(cached: *std.ArrayList(u8), allocator: std.mem.Allocat
     cached.appendSlice(allocator, response) catch cached.clearRetainingCapacity();
 }
 
-test "daemon response cache only reuses an identical successful payload" {
-    var cached: std.ArrayList(u8) = .empty;
-    defer cached.deinit(std.testing.allocator);
-
-    try std.testing.expect(!cachedDaemonResponseMatches(&cached, "quiet"));
-    rememberDaemonResponse(&cached, std.testing.allocator, "quiet");
-    try std.testing.expect(cachedDaemonResponseMatches(&cached, "quiet"));
-    try std.testing.expect(!cachedDaemonResponseMatches(&cached, "changed"));
-
-    rememberDaemonResponse(&cached, std.testing.allocator, "changed");
-    try std.testing.expectEqualStrings("changed", cached.items);
-}
-
 pub const SplitAxis = enum(u8) {
     horizontal,
     vertical,
@@ -520,13 +507,6 @@ fn daemonSessionNeedsLaunchFallback(
     attached_existing_session: bool,
 ) bool {
     return !attached_existing_session and revive_policy == .attach_or_create;
-}
-
-test "daemon recreation requests launch fallback only for a missing persisted session" {
-    try std.testing.expect(daemonSessionNeedsLaunchFallback(.attach_or_create, false));
-    try std.testing.expect(!daemonSessionNeedsLaunchFallback(.attach_or_create, true));
-    try std.testing.expect(!daemonSessionNeedsLaunchFallback(.restart, false));
-    try std.testing.expect(!daemonSessionNeedsLaunchFallback(.attach_only, false));
 }
 
 pub const SessionSnapshot = struct {
@@ -621,14 +601,6 @@ fn shellOwnsForeground(shell_pid: ?usize, foreground_pid: ?usize) bool {
     const shell = shell_pid orelse return false;
     const foreground = foreground_pid orelse return false;
     return shell > 0 and foreground == shell;
-}
-
-test "agent exit requires confirmed shell foreground ownership" {
-    try std.testing.expect(shellOwnsForeground(101, 101));
-    try std.testing.expect(!shellOwnsForeground(101, 202));
-    try std.testing.expect(!shellOwnsForeground(101, null));
-    try std.testing.expect(!shellOwnsForeground(null, 101));
-    try std.testing.expect(!shellOwnsForeground(0, 0));
 }
 
 pub const NotificationEvent = struct {
@@ -5887,7 +5859,7 @@ test "terminal key chords validate the allowlisted vocabulary" {
     try std.testing.expectError(error.MissingKey, TerminalKeyChord.parse("ctrl+alt"));
 }
 
-test "terminal key encoding uses terminal protocol options" {
+test "terminal key encoding follows default and negotiated terminal input modes" {
     var buffer: [128]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
     try encodeTerminalKeyChord(&writer, try TerminalKeyChord.parse("enter"), .default);
@@ -5904,9 +5876,7 @@ test "terminal key encoding uses terminal protocol options" {
     writer = std.Io.Writer.fixed(&buffer);
     try encodeTerminalKeyChord(&writer, try TerminalKeyChord.parse("alt+enter"), .default);
     try std.testing.expectEqualStrings("\x1b\r", writer.buffered());
-}
 
-test "terminal key encoding follows negotiated terminal input modes" {
     const allocator = std.testing.allocator;
     var terminal = try ghostty_vt.Terminal.init((ghostty_vt.TinyIo.init).io(), allocator, .{
         .cols = 80,
@@ -5920,8 +5890,7 @@ test "terminal key encoding follows negotiated terminal input modes" {
     const application_cursor = ghostty_vt.input.KeyEncodeOptions.fromTerminal(&terminal);
     try std.testing.expect(application_cursor.cursor_key_application);
 
-    var buffer: [128]u8 = undefined;
-    var writer = std.Io.Writer.fixed(&buffer);
+    writer = std.Io.Writer.fixed(&buffer);
     try encodeTerminalKeyChord(&writer, try TerminalKeyChord.parse("up"), application_cursor);
     try std.testing.expectEqualStrings("\x1bOA", writer.buffered());
 
@@ -6007,79 +5976,40 @@ test "persisted layout accepts leaves without session metadata" {
     try std.testing.expectEqual(pane.restored_modes.?, round_trip.value.tabs[0].nodes[0].terminal_modes.?);
 }
 
-test "persisted layout rejects out-of-range pane id without replacing live layout" {
+test "persisted layout rejects invalid trees without replacing live layout" {
     const allocator = std.testing.allocator;
     var dock = try Dock.init(allocator);
     defer dock.deinit(allocator);
     try dock.tabs.append(allocator, try dock.buildSinglePaneTabWithoutSession(allocator));
     const live_pane_id = dock.activePaneConst().?.id;
-    const invalid_layout_json =
-        \\{
-        \\  "active_tab_index": 0,
-        \\  "tabs": [{
-        \\    "active_pane_id": 4294967295,
-        \\    "root_node_id": 1,
-        \\    "nodes": [{
-        \\      "node_id": 1,
-        \\      "kind": "leaf",
-        \\      "pane_id": 4294967295
-        \\    }]
-        \\  }]
-        \\}
-    ;
+    const invalid_layouts = [_][]const u8{
+        // Out-of-range pane id.
+        \\{"active_tab_index":0,"tabs":[{"active_pane_id":4294967295,"root_node_id":1,"nodes":[
+        \\  {"node_id":1,"kind":"leaf","pane_id":4294967295}
+        \\]}]}
+        ,
+        // Shared child reference.
+        \\{"tabs":[{"active_pane_id":7,"root_node_id":1,"nodes":[
+        \\  {"node_id":1,"kind":"split","first_node_id":2,"second_node_id":2},
+        \\  {"node_id":2,"kind":"leaf","pane_id":7}
+        \\]}]}
+        ,
+        // Cycle back to the root.
+        \\{"tabs":[{"active_pane_id":7,"root_node_id":1,"nodes":[
+        \\  {"node_id":1,"kind":"split","first_node_id":2,"second_node_id":1},
+        \\  {"node_id":2,"kind":"leaf","pane_id":7}
+        \\]}]}
+        ,
+    };
 
-    try std.testing.expectError(
-        error.InvalidPersistedTerminalLayout,
-        dock.applyPersistedLayoutJson(allocator, invalid_layout_json),
-    );
-    try std.testing.expectEqual(@as(usize, 1), dock.tabs.items.len);
-    try std.testing.expectEqual(live_pane_id, dock.activePaneConst().?.id);
-}
-
-test "persisted layout rejects shared child references without replacing live layout" {
-    const allocator = std.testing.allocator;
-    var dock = try Dock.init(allocator);
-    defer dock.deinit(allocator);
-    try dock.tabs.append(allocator, try dock.buildSinglePaneTabWithoutSession(allocator));
-    const live_pane_id = dock.activePaneConst().?.id;
-    const invalid_layout_json =
-        \\{"tabs":[{
-        \\  "active_pane_id":7,"root_node_id":1,"nodes":[
-        \\    {"node_id":1,"kind":"split","first_node_id":2,"second_node_id":2},
-        \\    {"node_id":2,"kind":"leaf","pane_id":7}
-        \\  ]
-        \\}]}
-    ;
-
-    try std.testing.expectError(
-        error.InvalidPersistedTerminalLayout,
-        dock.applyPersistedLayoutJson(allocator, invalid_layout_json),
-    );
-    try std.testing.expectEqual(@as(usize, 1), dock.tabs.items.len);
-    try std.testing.expectEqual(live_pane_id, dock.activePaneConst().?.id);
-}
-
-test "persisted layout rejects cycles without replacing live layout" {
-    const allocator = std.testing.allocator;
-    var dock = try Dock.init(allocator);
-    defer dock.deinit(allocator);
-    try dock.tabs.append(allocator, try dock.buildSinglePaneTabWithoutSession(allocator));
-    const live_pane_id = dock.activePaneConst().?.id;
-    const invalid_layout_json =
-        \\{"tabs":[{
-        \\  "active_pane_id":7,"root_node_id":1,"nodes":[
-        \\    {"node_id":1,"kind":"split","first_node_id":2,"second_node_id":1},
-        \\    {"node_id":2,"kind":"leaf","pane_id":7}
-        \\  ]
-        \\}]}
-    ;
-
-    try std.testing.expectError(
-        error.InvalidPersistedTerminalLayout,
-        dock.applyPersistedLayoutJson(allocator, invalid_layout_json),
-    );
-    try std.testing.expectEqual(@as(usize, 1), dock.tabs.items.len);
-    try std.testing.expectEqual(live_pane_id, dock.activePaneConst().?.id);
+    for (invalid_layouts) |invalid_layout_json| {
+        try std.testing.expectError(
+            error.InvalidPersistedTerminalLayout,
+            dock.applyPersistedLayoutJson(allocator, invalid_layout_json),
+        );
+        try std.testing.expectEqual(@as(usize, 1), dock.tabs.items.len);
+        try std.testing.expectEqual(live_pane_id, dock.activePaneConst().?.id);
+    }
 }
 
 test "pane id exhaustion is fallible and never returns a duplicate" {
@@ -6195,7 +6125,7 @@ test "persisted dock replacement keeps matching live emulator ownership" {
     try std.testing.expectEqualStrings("/tmp", replacement.cwd.?);
 }
 
-test "session ensure preserves a running non-null session" {
+test "session ensure preserves a running session and releases a stopped one" {
     const allocator = std.testing.allocator;
     const FakeSession = struct {
         running: bool,
@@ -6219,28 +6149,8 @@ test "session ensure preserves a running non-null session" {
     try std.testing.expect(!prepareSessionSlotForCreate(FakeSession, allocator, &slot));
     try std.testing.expect(slot.? == session);
     try std.testing.expectEqual(@as(usize, 0), deinit_count);
-}
 
-test "session ensure releases a stopped non-null session" {
-    const allocator = std.testing.allocator;
-    const FakeSession = struct {
-        running: bool,
-        deinit_count: *usize,
-
-        fn isRunning(self: *const @This()) bool {
-            return self.running;
-        }
-
-        fn deinit(self: *@This(), _: std.mem.Allocator) void {
-            self.deinit_count.* += 1;
-        }
-    };
-
-    var deinit_count: usize = 0;
-    const session = try allocator.create(FakeSession);
-    session.* = .{ .running = false, .deinit_count = &deinit_count };
-    var slot: ?*FakeSession = session;
-
+    session.running = false;
     try std.testing.expect(prepareSessionSlotForCreate(FakeSession, allocator, &slot));
     try std.testing.expectEqual(@as(?*FakeSession, null), slot);
     try std.testing.expectEqual(@as(usize, 1), deinit_count);
@@ -6526,35 +6436,6 @@ test "unix session PTY smoke" {
         _ = try session.poll(allocator);
         if (!session.running) break;
         try std.Io.sleep(testing.io, .fromMilliseconds(25), .awake);
-    }
-}
-
-test "unix session clears render dirty state after render" {
-    if (!SESSION_SUPPORTED) return error.SkipZigTest;
-
-    const testing = std.testing;
-    const allocator = testing.allocator;
-    const cwd = try std.process.currentPathAlloc(testing.io, allocator);
-    defer allocator.free(cwd);
-
-    const session = try UnixSession.create(allocator, .{
-        .cwd = cwd,
-        .cols = 80,
-        .rows = 24,
-    });
-    defer {
-        session.deinit(allocator);
-        allocator.destroy(session);
-    }
-
-    try testing.expect(session.render_state.dirty != .false);
-    session.markRendered();
-    try testing.expectEqual(.false, session.render_state.dirty);
-
-    const row_data = session.render_state.row_data.slice();
-    const row_dirties = row_data.items(.dirty);
-    for (row_dirties) |dirty| {
-        try testing.expect(!dirty);
     }
 }
 

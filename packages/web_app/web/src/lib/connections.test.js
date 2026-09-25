@@ -6,19 +6,14 @@ const catalog = {
   defaults: [{ workspace_id: 'mirage', profile_id: 'zod' }],
 }
 
-describe('workspace connection defaults', () => {
-  test('new chats inherit their own workspace default', () => {
-    expect(effectiveConnection({ committed: false }, 'mirage', catalog)).toBe('zod')
-    expect(effectiveConnection({ committed: false }, 'other', catalog)).toBe('local')
-  })
-  test('explicit Local and remote choices override defaults', () => {
-    expect(effectiveConnection({ profile_id: 'local' }, 'mirage', catalog)).toBe('local')
-    expect(effectiveConnection({ profile_id: 'another' }, 'mirage', catalog)).toBe('another')
-  })
-  test('committed legacy conversations do not move with defaults', () => {
-    expect(effectiveConnection({ committed: true }, 'mirage', catalog)).toBe('local')
-    expect(effectiveConnection({ provider_thread_id: 'existing' }, 'mirage', catalog)).toBe('local')
-  })
+test('workspace connection defaults apply only to new chats; explicit choices win', () => {
+  expect(effectiveConnection({ committed: false }, 'mirage', catalog)).toBe('zod')
+  expect(effectiveConnection({ committed: false }, 'other', catalog)).toBe('local')
+  expect(effectiveConnection({ profile_id: 'local' }, 'mirage', catalog)).toBe('local')
+  expect(effectiveConnection({ profile_id: 'another' }, 'mirage', catalog)).toBe('another')
+  // Committed legacy conversations do not move with defaults.
+  expect(effectiveConnection({ committed: true }, 'mirage', catalog)).toBe('local')
+  expect(effectiveConnection({ provider_thread_id: 'existing' }, 'mirage', catalog)).toBe('local')
 })
 
 const originalFetch = globalThis.fetch

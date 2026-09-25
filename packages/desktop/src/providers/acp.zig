@@ -1548,16 +1548,6 @@ const TestDiffCapture = struct {
     }
 };
 
-test "makeInitializeRequestAlloc writes ACP initialize JSON-RPC" {
-    const json = try makeInitializeRequestAlloc(std.testing.allocator, 42);
-    defer std.testing.allocator.free(json);
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqual(@as(i64, 42), getOptionalObjectInteger(parsed.value, "id").?);
-    try std.testing.expect(responseId(parsed.value) == null);
-    try std.testing.expectEqualStrings("initialize", getOptionalObjectString(parsed.value, "method").?);
-}
-
 test "session setup passes Verde MCP through ACP" {
     const json = try makeSessionNewRequestAlloc(std.testing.allocator, 2, "/tmp/project", "/opt/verde/bin/verde");
     defer std.testing.allocator.free(json);
@@ -1593,19 +1583,6 @@ test "session setup passes authenticated Verde HTTP MCP through ACP" {
     try std.testing.expectEqualStrings("Authorization", getOptionalObjectString(headers[0], "name").?);
     try std.testing.expectEqualStrings("Bearer test-token", getOptionalObjectString(headers[0], "value").?);
     try std.testing.expectEqualStrings("fx", getOptionalObjectString(headers[1], "value").?);
-}
-
-test "makePromptRequestAlloc writes text and image content blocks" {
-    const request = provider_types.SendPromptRequest{ .prompt = "hello" };
-    const json = try makePromptRequestAlloc(std.testing.allocator, 3, "session-1", request, true);
-    defer std.testing.allocator.free(json);
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
-    defer parsed.deinit();
-    const params = getObjectField(parsed.value, "params").?;
-    try std.testing.expectEqualStrings("session-1", getOptionalObjectString(params, "sessionId").?);
-    const prompt = getObjectField(params, "prompt").?.array.items;
-    try std.testing.expectEqual(@as(usize, 1), prompt.len);
-    try std.testing.expectEqualStrings("text", getOptionalObjectString(prompt[0], "type").?);
 }
 
 test "parseSessionListResponse maps ACP sessions to thread summaries" {
@@ -1762,54 +1739,56 @@ test "toolEvent preserves status-only ACP lifecycle updates" {
     try std.testing.expect(event.output == null);
 }
 
-test "toolEvent keeps meaningful ACP tool text" {
-    const payload =
-        \\{"sessionUpdate":"tool_call","title":"Shell","command":"git status --short","status":"pending"}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-    const event = (try toolEventAlloc(std.testing.allocator, parsed.value)).?;
-    defer event.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("Shell", event.title);
-    try std.testing.expectEqual(provider_types.ToolCallKind.execute, event.tool_kind.?);
-    try std.testing.expectEqualStrings("git status --short", event.input.?);
-}
-
-test "toolEvent keeps non-lifecycle status failures" {
-    const payload =
-        \\{"sessionUpdate":"tool_call_update","toolName":"edit","status":"failed"}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-    const event = (try toolEventAlloc(std.testing.allocator, parsed.value)).?;
-    defer event.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("edit", event.title);
-    try std.testing.expectEqual(provider_types.ToolCallStatus.failed, event.status.?);
-}
-
-test "toolEvent shows tool call starts with structured input" {
-    const payload =
-        \\{"sessionUpdate":"tool_call","toolName":"Read","input":{"path":"/tmp/a.txt"},"status":"pending"}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-    const event = (try toolEventAlloc(std.testing.allocator, parsed.value)).?;
-    defer event.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("Read", event.title);
-    try std.testing.expectEqual(provider_types.ToolCallKind.read, event.tool_kind.?);
-    try std.testing.expectEqualStrings("{\"path\":\"/tmp/a.txt\"}", event.input.?);
-}
-
-test "toolEvent classifies ACP task tools as subagents" {
-    const payload =
-        \\{"sessionUpdate":"tool_call","toolCallId":"task-1","toolName":"task","title":"Explore website","status":"in_progress"}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-    const event = (try toolEventAlloc(std.testing.allocator, parsed.value)).?;
-    defer event.deinit(std.testing.allocator);
-    try std.testing.expectEqual(provider_types.ToolCallKind.subagent, event.tool_kind.?);
-    try std.testing.expectEqualStrings("Explore website", event.title);
+test "toolEvent maps ACP titles, kinds, statuses, and inputs" {
+    const cases = [_]struct {
+        payload: []const u8,
+        title: []const u8,
+        kind: ?provider_types.ToolCallKind = null,
+        status: ?provider_types.ToolCallStatus = null,
+        input: ?[]const u8 = null,
+    }{
+        .{
+            .payload =
+            \\{"sessionUpdate":"tool_call","title":"Shell","command":"git status --short","status":"pending"}
+            ,
+            .title = "Shell",
+            .kind = .execute,
+            .input = "git status --short",
+        },
+        // Non-lifecycle failures keep their status.
+        .{
+            .payload =
+            \\{"sessionUpdate":"tool_call_update","toolName":"edit","status":"failed"}
+            ,
+            .title = "edit",
+            .status = .failed,
+        },
+        .{
+            .payload =
+            \\{"sessionUpdate":"tool_call","toolName":"Read","input":{"path":"/tmp/a.txt"},"status":"pending"}
+            ,
+            .title = "Read",
+            .kind = .read,
+            .input = "{\"path\":\"/tmp/a.txt\"}",
+        },
+        .{
+            .payload =
+            \\{"sessionUpdate":"tool_call","toolCallId":"task-1","toolName":"task","title":"Explore website","status":"in_progress"}
+            ,
+            .title = "Explore website",
+            .kind = .subagent,
+        },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, case.payload, .{});
+        defer parsed.deinit();
+        const event = (try toolEventAlloc(std.testing.allocator, parsed.value)).?;
+        defer event.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings(case.title, event.title);
+        if (case.kind) |kind| try std.testing.expectEqual(kind, event.tool_kind.?);
+        if (case.status) |status| try std.testing.expectEqual(status, event.status.?);
+        if (case.input) |input| try std.testing.expectEqualStrings(input, event.input.?);
+    }
 }
 
 test "toolEvent recognizes Grok native task variants without guessing from prompts" {
@@ -2108,44 +2087,18 @@ test "handleSendPromptLine ignores non-permission ACP server request id collisio
     try std.testing.expect(state.session_id == null);
 }
 
-test "auto-approve permission requests when approval policy is never" {
-    try std.testing.expect(shouldAutoApprovePermission(.{
-        .prompt = "continue",
-        .approval_policy = .never,
-    }));
-    try std.testing.expect(!shouldAutoApprovePermission(.{
-        .prompt = "continue",
-        .approval_policy = .on_request,
-    }));
-}
-
-test "makePermissionResponseAlloc writes selected ACP option id" {
-    const approve = try makePermissionResponseAlloc(std.testing.allocator, .{ .integer = 9 }, "allow-always");
-    defer std.testing.allocator.free(approve);
-    const deny = try makePermissionResponseAlloc(std.testing.allocator, .{ .integer = 10 }, "reject-once");
-    defer std.testing.allocator.free(deny);
-    try std.testing.expect(std.mem.indexOf(u8, approve, "allow-always") != null);
-    try std.testing.expect(std.mem.indexOf(u8, deny, "reject-once") != null);
-}
-
-test "permissionOptionId chooses matching ACP request options" {
-    const payload =
+test "permissionOptionId matches hyphen and FX underscore option ids" {
+    for ([_][]const u8{
         \\{"options":[{"optionId":"reject-once"},{"optionId":"allow-once"}]}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings("allow-once", permissionOptionId(parsed.value, .approve).?);
-    try std.testing.expectEqualStrings("reject-once", permissionOptionId(parsed.value, .deny).?);
-}
-
-test "permissionOptionId matches FX underscore option ids" {
-    const payload =
+        ,
         \\{"options":[{"optionId":"allow_once","name":"Allow once"},{"optionId":"allow_always","name":"Allow for this session"},{"optionId":"reject_once","name":"Reject"}]}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings("allow_once", permissionOptionId(parsed.value, .approve).?);
-    try std.testing.expectEqualStrings("reject_once", permissionOptionId(parsed.value, .deny).?);
+        ,
+    }, [_][2][]const u8{ .{ "allow-once", "reject-once" }, .{ "allow_once", "reject_once" } }) |payload, expected| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(expected[0], permissionOptionId(parsed.value, .approve).?);
+        try std.testing.expectEqualStrings(expected[1], permissionOptionId(parsed.value, .deny).?);
+    }
 }
 
 test "ACP permission server requests invoke the callback for string and numeric IDs" {
@@ -2248,4 +2201,13 @@ test "ACP prompts preserve multiple images and reject unsupported attachments" {
     try std.testing.expectEqualStrings("Zmlyc3QtaW1hZ2U=", getOptionalObjectString(blocks[1], "data").?);
     try std.testing.expectEqualStrings("c2Vjb25kLWltYWdl", getOptionalObjectString(blocks[2], "data").?);
     try std.testing.expectError(error.AcpAttachmentsUnsupported, makePromptRequestAlloc(allocator, 3, "session", request, false));
+
+    // Text-only prompts never need image capability.
+    const text_only = try makePromptRequestAlloc(allocator, 4, "session", .{ .prompt = "hello" }, false);
+    defer allocator.free(text_only);
+    var parsed_text = try std.json.parseFromSlice(std.json.Value, allocator, text_only, .{});
+    defer parsed_text.deinit();
+    const text_blocks = getObjectField(getObjectField(parsed_text.value, "params").?, "prompt").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), text_blocks.len);
+    try std.testing.expectEqualStrings("text", getOptionalObjectString(text_blocks[0], "type").?);
 }

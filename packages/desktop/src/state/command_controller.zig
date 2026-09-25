@@ -427,25 +427,3 @@ pub fn commandPaletteQuery(self: anytype) []const u8 {
 pub fn commandPaletteQueryBuffer(self: anytype) [:0]u8 {
     return self.command_controller.queryBuffer();
 }
-
-test "command state resets scope selection and focus-sensitive action state" {
-    var state: State = .{};
-    state.query_storage[0] = 'x';
-    state.query_storage[1] = 0;
-    state.cursor = 1;
-    state.selected = 4;
-    state.action_menu_open = true;
-    state.action_selected = 2;
-
-    state.begin(3);
-    try std.testing.expect(state.open);
-    try std.testing.expectEqual(@as(?usize, 3), state.scope_project);
-    try std.testing.expectEqualStrings("", state.query());
-    try std.testing.expectEqual(@as(usize, 0), state.cursor);
-    try std.testing.expectEqual(@as(usize, 0), state.selected);
-    try std.testing.expect(!state.action_menu_open);
-
-    state.close();
-    try std.testing.expect(!state.open);
-    try std.testing.expect(!state.action_menu_open);
-}

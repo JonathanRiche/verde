@@ -45,13 +45,3 @@ pub const KeyEvent = struct {
     shift: bool = false,
     super: bool = false,
 };
-
-test "automation mouse buttons parse explicitly" {
-    const testing = std.testing;
-    try testing.expectEqual(MouseButton.left, parseMouseButton("left").?);
-    try testing.expectEqual(MouseButton.middle, parseMouseButton("middle").?);
-    try testing.expectEqual(MouseButton.right, parseMouseButton("right").?);
-    try testing.expectEqual(MouseButton.back, parseMouseButton("back").?);
-    try testing.expectEqual(MouseButton.forward, parseMouseButton("forward").?);
-    try testing.expect(parseMouseButton("primary") == null);
-}

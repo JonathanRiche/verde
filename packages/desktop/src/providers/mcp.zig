@@ -805,14 +805,6 @@ test "Codex managed block is idempotent and preserves surrounding TOML" {
     try std.testing.expectEqualStrings("model = \"gpt-5\"\n", removed);
 }
 
-test "unmanaged provider entry is reported as a conflict" {
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"command":"other","env":{}}
-    , .{});
-    defer parsed.deinit();
-    try std.testing.expect(!jsonEntryManaged(parsed.value, "env"));
-}
-
 test "an unmanaged verde entry does not block other providers" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

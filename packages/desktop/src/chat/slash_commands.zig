@@ -122,63 +122,38 @@ const TEST_PROVIDER_COMMANDS = [_]provider_types.ProviderSlashCommand{
     },
 };
 
-test "parse recognizes provider slash commands and args" {
-    const parsed = parse(" /goal complete ", TEST_PROVIDER_COMMANDS[0..]);
-    try std.testing.expect(parsed == .provider);
-    try std.testing.expectEqual(provider_types.ProviderSlashCommandId.goal, parsed.provider.command.id);
-    try std.testing.expectEqualStrings("complete", parsed.provider.args);
-}
+test "parse classifies provider, local, literal, unknown, and ordinary input" {
+    const provider_cases = [_]struct { input: []const u8, id: provider_types.ProviderSlashCommandId, args: []const u8 }{
+        .{ .input = " /goal complete ", .id = .goal, .args = "complete" },
+        .{ .input = "/goal clear", .id = .goal, .args = "clear" },
+        .{ .input = "/compact", .id = .compact, .args = "" },
+        .{ .input = "/usage", .id = .usage, .args = "" },
+    };
+    for (provider_cases) |case| {
+        const parsed = parse(case.input, TEST_PROVIDER_COMMANDS[0..]);
+        try std.testing.expect(parsed == .provider);
+        try std.testing.expectEqual(case.id, parsed.provider.command.id);
+        try std.testing.expectEqualStrings(case.args, parsed.provider.args);
+    }
 
-test "parse recognizes codex phase one provider commands" {
-    const compact = parse("/compact", TEST_PROVIDER_COMMANDS[0..]);
-    try std.testing.expect(compact == .provider);
-    try std.testing.expectEqual(provider_types.ProviderSlashCommandId.compact, compact.provider.command.id);
-    try std.testing.expectEqualStrings("", compact.provider.args);
-
-    const usage = parse("/usage", TEST_PROVIDER_COMMANDS[0..]);
-    try std.testing.expect(usage == .provider);
-    try std.testing.expectEqual(provider_types.ProviderSlashCommandId.usage, usage.provider.command.id);
-    try std.testing.expectEqualStrings("", usage.provider.args);
-
-    const goal_clear = parse("/goal clear", TEST_PROVIDER_COMMANDS[0..]);
-    try std.testing.expect(goal_clear == .provider);
-    try std.testing.expectEqual(provider_types.ProviderSlashCommandId.goal, goal_clear.provider.command.id);
-    try std.testing.expectEqualStrings("clear", goal_clear.provider.args);
-
-    const goal_complete = parse("/goal complete", TEST_PROVIDER_COMMANDS[0..]);
-    try std.testing.expect(goal_complete == .provider);
-    try std.testing.expectEqual(provider_types.ProviderSlashCommandId.goal, goal_complete.provider.command.id);
-    try std.testing.expectEqualStrings("complete", goal_complete.provider.args);
-}
-
-test "parse recognizes local slash commands" {
-    const parsed = parse("/stack status", TEST_PROVIDER_COMMANDS[0..]);
-    try std.testing.expect(parsed == .local);
-    try std.testing.expectEqual(LocalSlashCommandId.stack, parsed.local.command.id);
-    try std.testing.expectEqualStrings("status", parsed.local.args);
-
+    const local = parse("/stack status", TEST_PROVIDER_COMMANDS[0..]);
+    try std.testing.expect(local == .local);
+    try std.testing.expectEqual(LocalSlashCommandId.stack, local.local.command.id);
+    try std.testing.expectEqualStrings("status", local.local.args);
     const handoff = parse("/handoff", TEST_PROVIDER_COMMANDS[0..]);
-    try std.testing.expect(handoff == .local);
     try std.testing.expectEqual(LocalSlashCommandId.handoff, handoff.local.command.id);
     try std.testing.expectEqualStrings("", handoff.local.args);
-}
 
-test "parse recognizes literal slash escape" {
-    const parsed = parse("//literal slash", TEST_PROVIDER_COMMANDS[0..]);
-    try std.testing.expect(parsed == .literal_prompt);
-    try std.testing.expectEqualStrings("/literal slash", parsed.literal_prompt);
-}
+    const literal = parse("//literal slash", TEST_PROVIDER_COMMANDS[0..]);
+    try std.testing.expect(literal == .literal_prompt);
+    try std.testing.expectEqualStrings("/literal slash", literal.literal_prompt);
 
-test "parse reports unknown slash commands" {
-    const parsed = parse("/unknown arg", TEST_PROVIDER_COMMANDS[0..]);
-    try std.testing.expect(parsed == .unknown);
-    try std.testing.expectEqualStrings("/unknown", parsed.unknown.name);
-    try std.testing.expectEqualStrings("arg", parsed.unknown.args);
-}
+    const unknown = parse("/unknown arg", TEST_PROVIDER_COMMANDS[0..]);
+    try std.testing.expect(unknown == .unknown);
+    try std.testing.expectEqualStrings("/unknown", unknown.unknown.name);
+    try std.testing.expectEqualStrings("arg", unknown.unknown.args);
 
-test "parse ignores ordinary prompts" {
-    const parsed = parse("please do /something", TEST_PROVIDER_COMMANDS[0..]);
-    try std.testing.expect(parsed == .not_slash);
+    try std.testing.expect(parse("please do /something", TEST_PROVIDER_COMMANDS[0..]) == .not_slash);
 }
 
 test "ordinary prompts do not need provider slash metadata" {

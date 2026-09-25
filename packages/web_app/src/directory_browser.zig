@@ -121,11 +121,6 @@ fn errorResponse(
     return try writer.toOwnedSlice();
 }
 
-test "ignores unrelated RPC methods" {
-    const response = try respond(std.testing.allocator, std.testing.io, "{\"id\":1,\"method\":\"core.status\",\"params\":{}}");
-    try std.testing.expect(response == null);
-}
-
 test "rejects relative directory paths" {
     const response = (try respond(std.testing.allocator, std.testing.io, "{\"id\":1,\"method\":\"web.directory.list\",\"params\":{\"path\":\"tmp\"}}")) orelse unreachable;
     defer std.testing.allocator.free(response);

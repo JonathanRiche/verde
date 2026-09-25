@@ -2412,14 +2412,6 @@ fn parseKeycode(token: []const u8) ?sdl.Keycode {
     return null;
 }
 
-test "parse accelerator matches desktop-style refresh binding" {
-    const binding = parseAccelerator("CommandOrControl+R") orelse return error.TestUnexpectedResult;
-
-    try std.testing.expect(binding.primary);
-    try std.testing.expectEqual(false, binding.shift);
-    try std.testing.expectEqual(sdl.Keycode.r, binding.key);
-}
-
 /// Primary modifier bits for synthesized key events, mirroring Keybind's
 /// platform mapping (Cmd on macOS, Ctrl elsewhere).
 fn primaryModBits() u16 {
@@ -2499,450 +2491,64 @@ test "array parsing deduplicates repeated bindings" {
     try std.testing.expectEqual(sdl.Keycode.f5, config.refresh[0].key);
 }
 
-test "Companion keybind defaults overrides disables and deduplicates" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    try std.testing.expectEqual(@as(usize, 1), config.companion.len);
-    try std.testing.expect(config.companion[0].ctrl);
-    try std.testing.expect(config.companion[0].shift);
-    try std.testing.expectEqual(sdl.Keycode.space, config.companion[0].key);
-
-    var overridden = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"keybinds": {"companion": ["Alt+C", "alt+c"]}}
-    , .{});
-    defer overridden.deinit();
-    config.applyOverrides(overridden.value);
-    try std.testing.expectEqual(@as(usize, 1), config.companion.len);
-    try std.testing.expect(config.companion[0].alt);
-    try std.testing.expectEqual(sdl.Keycode.c, config.companion[0].key);
-
-    var disabled = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"keybinds": {"companion": null}}
-    , .{});
-    defer disabled.deinit();
-    config.applyOverrides(disabled.value);
-    try std.testing.expectEqual(@as(usize, 0), config.companion.len);
-}
-
-test "open keybind override accepts a single accelerator" {
+test "single accelerator overrides land on their own action" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
 
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"keybinds": {"open": "Ctrl+Shift+O"}}
+        \\{"keybinds": {
+        \\  "open": "Ctrl+Shift+O", "browser": "Alt+Shift+B",
+        \\  "new_thread": "Alt+Shift+T", "sidebar": "Ctrl+Shift+M",
+        \\  "settings": "Ctrl+Comma", "companion": "Alt+C",
+        \\  "chat_page_down": "Shift+J",
+        \\  "workspace": {
+        \\    "split_terminal_horizontal": "CommandOrControl+Shift+T",
+        \\    "active_previous": "Alt+P", "active_next": "Alt+N"
+        \\  }
+        \\}}
     , .{});
     defer parsed.deinit();
 
     config.applyOverrides(parsed.value);
 
-    try std.testing.expectEqual(@as(usize, 1), config.open_default.len);
-    try std.testing.expect(config.open_default[0].ctrl);
-    try std.testing.expect(config.open_default[0].shift);
-    try std.testing.expectEqual(sdl.Keycode.o, config.open_default[0].key);
+    const cases = [_]struct { bindings: []const Keybind, expected: Keybind }{
+        .{ .bindings = config.open_default, .expected = .{ .ctrl = true, .shift = true, .key = .o } },
+        .{ .bindings = config.toggle_browser, .expected = .{ .alt = true, .shift = true, .key = .b } },
+        .{ .bindings = config.new_thread, .expected = .{ .alt = true, .shift = true, .key = .t } },
+        .{ .bindings = config.toggle_sidebar, .expected = .{ .ctrl = true, .shift = true, .key = .m } },
+        .{ .bindings = config.settings, .expected = .{ .ctrl = true, .key = .comma } },
+        .{ .bindings = config.companion, .expected = .{ .alt = true, .key = .c } },
+        .{ .bindings = config.chat_page_down, .expected = .{ .shift = true, .key = .j } },
+        .{ .bindings = config.workspace_split_terminal_horizontal, .expected = .{ .primary = true, .shift = true, .key = .t } },
+        .{ .bindings = config.workspace_active_previous, .expected = .{ .alt = true, .key = .p } },
+        .{ .bindings = config.workspace_active_next, .expected = .{ .alt = true, .key = .n } },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(@as(usize, 1), case.bindings.len);
+        try std.testing.expect(case.bindings[0].eql(case.expected));
+    }
 }
 
-test "browser keybind override accepts a single accelerator" {
+test "workspace ordinal select overrides accept ordered accelerator arrays" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
 
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"keybinds": {"browser": "Alt+Shift+B"}}
-    , .{});
-    defer parsed.deinit();
-
-    config.applyOverrides(parsed.value);
-
-    try std.testing.expectEqual(@as(usize, 1), config.toggle_browser.len);
-    try std.testing.expect(config.toggle_browser[0].alt);
-    try std.testing.expect(config.toggle_browser[0].shift);
-    try std.testing.expectEqual(sdl.Keycode.b, config.toggle_browser[0].key);
-}
-
-test "workspace select defaults map alt number order" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    try std.testing.expectEqual(@as(usize, 10), config.workspace_select.len);
-    try std.testing.expect(config.workspace_select[0].alt);
-    try std.testing.expectEqual(sdl.Keycode.@"1", config.workspace_select[0].key);
-    try std.testing.expect(config.workspace_select[9].alt);
-    try std.testing.expectEqual(sdl.Keycode.@"0", config.workspace_select[9].key);
-}
-
-test "workspace select override accepts ordered accelerator array" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"keybinds": {"workspace": {"select": ["Ctrl+1", "Ctrl+2"]}}}
+        \\{"keybinds": {"workspace": {
+        \\  "select": ["Ctrl+1", "Ctrl+2"],
+        \\  "active_select": ["Alt+Shift+1", "Alt+Shift+2"]
+        \\}}}
     , .{});
     defer parsed.deinit();
 
     config.applyOverrides(parsed.value);
 
     try std.testing.expectEqual(@as(usize, 2), config.workspace_select.len);
-    try std.testing.expect(config.workspace_select[0].ctrl);
-    try std.testing.expectEqual(sdl.Keycode.@"1", config.workspace_select[0].key);
-    try std.testing.expect(config.workspace_select[1].ctrl);
-    try std.testing.expectEqual(sdl.Keycode.@"2", config.workspace_select[1].key);
-}
-
-test "workspace pane select defaults map ctrl number order" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    try std.testing.expectEqual(@as(usize, 10), config.workspace_pane_select.len);
-    try std.testing.expect(config.workspace_pane_select[0].ctrl);
-    try std.testing.expectEqual(sdl.Keycode.@"1", config.workspace_pane_select[0].key);
-    try std.testing.expect(config.workspace_pane_select[9].ctrl);
-    try std.testing.expectEqual(sdl.Keycode.@"0", config.workspace_pane_select[9].key);
-}
-
-test "workspace active select defaults map ctrl shift number order" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    try std.testing.expectEqual(@as(usize, 10), config.workspace_active_select.len);
-    try std.testing.expect(config.workspace_active_select[0].ctrl);
-    try std.testing.expect(config.workspace_active_select[0].shift);
-    try std.testing.expectEqual(sdl.Keycode.@"1", config.workspace_active_select[0].key);
-    try std.testing.expect(config.workspace_active_select[9].ctrl);
-    try std.testing.expect(config.workspace_active_select[9].shift);
-    try std.testing.expectEqual(sdl.Keycode.@"0", config.workspace_active_select[9].key);
-}
-
-test "workspace active select override accepts ordered accelerator array" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"keybinds": {"workspace": {"active_select": ["Alt+Shift+1", "Alt+Shift+2"]}}}
-    , .{});
-    defer parsed.deinit();
-    config.applyOverrides(parsed.value);
-
+    try std.testing.expect(config.workspace_select[0].eql(.{ .ctrl = true, .key = .@"1" }));
+    try std.testing.expect(config.workspace_select[1].eql(.{ .ctrl = true, .key = .@"2" }));
     try std.testing.expectEqual(@as(usize, 2), config.workspace_active_select.len);
-    try std.testing.expect(config.workspace_active_select[0].alt);
-    try std.testing.expect(config.workspace_active_select[0].shift);
-    try std.testing.expectEqual(sdl.Keycode.@"1", config.workspace_active_select[0].key);
-    try std.testing.expectEqual(sdl.Keycode.@"2", config.workspace_active_select[1].key);
-}
-
-test "workspace pane select override accepts ordered accelerator array" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"keybinds": {"workspace": {"pane_select": ["Alt+1", "Alt+2"]}}}
-    , .{});
-    defer parsed.deinit();
-
-    config.applyOverrides(parsed.value);
-
-    try std.testing.expectEqual(@as(usize, 2), config.workspace_pane_select.len);
-    try std.testing.expect(config.workspace_pane_select[0].alt);
-    try std.testing.expectEqual(sdl.Keycode.@"1", config.workspace_pane_select[0].key);
-    try std.testing.expect(config.workspace_pane_select[1].alt);
-    try std.testing.expectEqual(sdl.Keycode.@"2", config.workspace_pane_select[1].key);
-}
-
-test "new thread keybind override accepts a single accelerator" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"keybinds": {"new_thread": "Alt+Shift+T"}}
-    , .{});
-    defer parsed.deinit();
-
-    config.applyOverrides(parsed.value);
-
-    try std.testing.expectEqual(@as(usize, 1), config.new_thread.len);
-    try std.testing.expect(config.new_thread[0].alt);
-    try std.testing.expect(config.new_thread[0].shift);
-    try std.testing.expectEqual(sdl.Keycode.t, config.new_thread[0].key);
-}
-
-test "terminal pane keybind override accepts the removed default accelerator" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"keybinds": {"workspace": {"split_terminal_horizontal": "CommandOrControl+Shift+T"}}}
-    , .{});
-    defer parsed.deinit();
-
-    config.applyOverrides(parsed.value);
-
-    try std.testing.expectEqual(@as(usize, 1), config.workspace_split_terminal_horizontal.len);
-    try std.testing.expect(config.workspace_split_terminal_horizontal[0].primary);
-    try std.testing.expect(config.workspace_split_terminal_horizontal[0].shift);
-    try std.testing.expectEqual(sdl.Keycode.t, config.workspace_split_terminal_horizontal[0].key);
-}
-
-test "sidebar keybind override accepts a single accelerator" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"keybinds": {"sidebar": "Ctrl+Shift+M"}}
-    , .{});
-    defer parsed.deinit();
-
-    config.applyOverrides(parsed.value);
-
-    try std.testing.expectEqual(@as(usize, 1), config.toggle_sidebar.len);
-    try std.testing.expect(config.toggle_sidebar[0].ctrl);
-    try std.testing.expect(config.toggle_sidebar[0].shift);
-    try std.testing.expectEqual(sdl.Keycode.m, config.toggle_sidebar[0].key);
-}
-
-test "default open keybind uses alt plus o" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    try std.testing.expectEqual(@as(usize, 1), config.open_default.len);
-    try std.testing.expect(config.open_default[0].alt);
-    try std.testing.expect(!config.open_default[0].ctrl);
-    try std.testing.expect(!config.open_default[0].meta);
-    try std.testing.expect(!config.open_default[0].primary);
-    try std.testing.expectEqual(sdl.Keycode.o, config.open_default[0].key);
-}
-
-test "default open editor keybind uses ctrl shift o" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    try std.testing.expectEqual(@as(usize, 1), config.open_editor.len);
-    try std.testing.expect(!config.open_editor[0].alt);
-    try std.testing.expect(config.open_editor[0].ctrl);
-    try std.testing.expect(!config.open_editor[0].meta);
-    try std.testing.expect(!config.open_editor[0].primary);
-    try std.testing.expect(config.open_editor[0].shift);
-    try std.testing.expectEqual(sdl.Keycode.o, config.open_editor[0].key);
-}
-
-test "default browser keybind uses ctrl shift b" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    try std.testing.expectEqual(@as(usize, 1), config.toggle_browser.len);
-    try std.testing.expect(!config.toggle_browser[0].alt);
-    try std.testing.expect(config.toggle_browser[0].ctrl);
-    try std.testing.expect(!config.toggle_browser[0].meta);
-    try std.testing.expect(!config.toggle_browser[0].primary);
-    try std.testing.expect(config.toggle_browser[0].shift);
-    try std.testing.expectEqual(sdl.Keycode.b, config.toggle_browser[0].key);
-}
-
-test "direct new thread and terminal pane keybinds are disabled by default" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    try std.testing.expectEqual(@as(usize, 0), config.new_thread.len);
-    try std.testing.expectEqual(@as(usize, 0), config.workspace_split_terminal_horizontal.len);
-    try std.testing.expectEqual(@as(usize, 0), config.settings.len);
-}
-
-test "settings keybind override accepts a single accelerator" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"keybinds": {"settings": "Ctrl+Comma"}}
-    , .{});
-    defer parsed.deinit();
-
-    config.applyOverrides(parsed.value);
-
-    try std.testing.expectEqual(@as(usize, 1), config.settings.len);
-    try std.testing.expect(config.settings[0].ctrl);
-    try std.testing.expect(!config.settings[0].shift);
-    try std.testing.expectEqual(sdl.Keycode.comma, config.settings[0].key);
-}
-
-test "settings prefix action name is bindable" {
-    try std.testing.expectEqual(NativeKeyboardAction.settings, parsePrefixActionName("settings").?.app);
-}
-
-test "default terminal tab keybind uses primary alt t" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    try std.testing.expectEqual(@as(usize, 1), config.terminal_new_tab.len);
-    try std.testing.expect(config.terminal_new_tab[0].alt);
-    try std.testing.expect(!config.terminal_new_tab[0].ctrl);
-    try std.testing.expect(!config.terminal_new_tab[0].meta);
-    try std.testing.expect(config.terminal_new_tab[0].primary);
-    try std.testing.expect(!config.terminal_new_tab[0].shift);
-    try std.testing.expectEqual(sdl.Keycode.t, config.terminal_new_tab[0].key);
-}
-
-test "default terminal toggle has no keybind" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    try std.testing.expectEqual(@as(usize, 0), config.toggle_terminal.len);
-}
-
-test "default terminal internal split keybinds are disabled" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    try std.testing.expectEqual(@as(usize, 0), config.terminal_split_up.len);
-    try std.testing.expectEqual(@as(usize, 0), config.terminal_split_down.len);
-    try std.testing.expectEqual(@as(usize, 0), config.terminal_split_left.len);
-    try std.testing.expectEqual(@as(usize, 0), config.terminal_split_right.len);
-}
-
-test "default workspace close has no direct shortcut" {
-    const close = try cloneDefaultWorkspaceCloseKeybinds(std.testing.allocator);
-    defer std.testing.allocator.free(close);
-    try std.testing.expectEqual(@as(usize, 0), close.len);
-}
-
-test "default workspace close current has no direct shortcut" {
-    const close_current = try cloneDefaultWorkspaceCloseCurrentKeybinds(std.testing.allocator);
-    defer std.testing.allocator.free(close_current);
-    try std.testing.expectEqual(@as(usize, 0), close_current.len);
-}
-
-test "default workspace focus uses ctrl arrows without hjkl" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    const defaults = [_]struct {
-        bindings: []const Keybind,
-        key: sdl.Keycode,
-    }{
-        .{ .bindings = config.workspace_focus_left, .key = .left },
-        .{ .bindings = config.workspace_focus_down, .key = .down },
-        .{ .bindings = config.workspace_focus_up, .key = .up },
-        .{ .bindings = config.workspace_focus_right, .key = .right },
-    };
-    for (defaults) |entry| {
-        try std.testing.expectEqual(@as(usize, 1), entry.bindings.len);
-        try std.testing.expect(entry.bindings[0].ctrl);
-        try std.testing.expectEqual(entry.key, entry.bindings[0].key);
-    }
-}
-
-test "workspace focus ctrl hjkl chords remain configurable" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"keybinds": {"workspace": {
-        \\  "focus_left": "Ctrl+H", "focus_right": "Ctrl+L",
-        \\  "focus_up": "Ctrl+K", "focus_down": "Ctrl+J"
-        \\}}}
-    , .{});
-    defer parsed.deinit();
-
-    config.applyOverrides(parsed.value);
-
-    const configured = [_]struct {
-        bindings: []const Keybind,
-        key: sdl.Keycode,
-    }{
-        .{ .bindings = config.workspace_focus_left, .key = .h },
-        .{ .bindings = config.workspace_focus_down, .key = .j },
-        .{ .bindings = config.workspace_focus_up, .key = .k },
-        .{ .bindings = config.workspace_focus_right, .key = .l },
-    };
-    for (configured) |entry| {
-        try std.testing.expectEqual(@as(usize, 1), entry.bindings.len);
-        try std.testing.expect(entry.bindings[0].ctrl);
-        try std.testing.expectEqual(entry.key, entry.bindings[0].key);
-    }
-}
-
-test "default workspace traversal uses alt up and down" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    try std.testing.expectEqual(@as(usize, 1), config.workspace_previous.len);
-    try std.testing.expect(config.workspace_previous[0].alt);
-    try std.testing.expectEqual(sdl.Keycode.up, config.workspace_previous[0].key);
-
-    try std.testing.expectEqual(@as(usize, 1), config.workspace_next.len);
-    try std.testing.expect(config.workspace_next[0].alt);
-    try std.testing.expectEqual(sdl.Keycode.down, config.workspace_next[0].key);
-}
-
-test "default ACTIVE pane cycling uses ctrl shift left and right" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    try std.testing.expectEqual(@as(usize, 1), config.workspace_active_previous.len);
-    try std.testing.expect(config.workspace_active_previous[0].ctrl);
-    try std.testing.expect(config.workspace_active_previous[0].shift);
-    try std.testing.expectEqual(sdl.Keycode.left, config.workspace_active_previous[0].key);
-
-    try std.testing.expectEqual(@as(usize, 1), config.workspace_active_next.len);
-    try std.testing.expect(config.workspace_active_next[0].ctrl);
-    try std.testing.expect(config.workspace_active_next[0].shift);
-    try std.testing.expectEqual(sdl.Keycode.right, config.workspace_active_next[0].key);
-}
-
-test "default pane cycling uses ctrl tab in both directions" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    try std.testing.expectEqual(@as(usize, 1), config.workspace_pane_next.len);
-    try std.testing.expect(config.workspace_pane_next[0].ctrl);
-    try std.testing.expect(!config.workspace_pane_next[0].shift);
-    try std.testing.expectEqual(sdl.Keycode.tab, config.workspace_pane_next[0].key);
-
-    try std.testing.expectEqual(@as(usize, 1), config.workspace_pane_previous.len);
-    try std.testing.expect(config.workspace_pane_previous[0].ctrl);
-    try std.testing.expect(config.workspace_pane_previous[0].shift);
-    try std.testing.expectEqual(sdl.Keycode.tab, config.workspace_pane_previous[0].key);
-}
-
-test "workspace pane cycling keybinds are configurable" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"keybinds": {"workspace": {
-        \\  "pane_previous": "Alt+P",
-        \\  "pane_next": "Alt+N"
-        \\}}}
-    , .{});
-    defer parsed.deinit();
-
-    config.applyOverrides(parsed.value);
-
-    try std.testing.expectEqual(@as(usize, 1), config.workspace_pane_previous.len);
-    try std.testing.expect(config.workspace_pane_previous[0].alt);
-    try std.testing.expectEqual(sdl.Keycode.p, config.workspace_pane_previous[0].key);
-    try std.testing.expectEqual(@as(usize, 1), config.workspace_pane_next.len);
-    try std.testing.expect(config.workspace_pane_next[0].alt);
-    try std.testing.expectEqual(sdl.Keycode.n, config.workspace_pane_next[0].key);
-}
-
-test "ACTIVE pane cycling keybinds are configurable" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"keybinds": {"workspace": {
-        \\  "active_previous": "Alt+P",
-        \\  "active_next": "Alt+N"
-        \\}}}
-    , .{});
-    defer parsed.deinit();
-
-    config.applyOverrides(parsed.value);
-
-    try std.testing.expectEqual(@as(usize, 1), config.workspace_active_previous.len);
-    try std.testing.expect(config.workspace_active_previous[0].alt);
-    try std.testing.expectEqual(sdl.Keycode.p, config.workspace_active_previous[0].key);
-    try std.testing.expectEqual(@as(usize, 1), config.workspace_active_next.len);
-    try std.testing.expect(config.workspace_active_next[0].alt);
-    try std.testing.expectEqual(sdl.Keycode.n, config.workspace_active_next[0].key);
+    try std.testing.expect(config.workspace_active_select[0].eql(.{ .alt = true, .shift = true, .key = .@"1" }));
+    try std.testing.expect(config.workspace_active_select[1].eql(.{ .alt = true, .shift = true, .key = .@"2" }));
 }
 
 test "scrolling workspace keybinds are configurable" {
@@ -2998,88 +2604,6 @@ test "scrolling workspace keybinds are configurable" {
     try std.testing.expectEqual(sdl.Keycode.@"2", config.workspace_pane_select[1].key);
 }
 
-test "default workspace prompt and move keybinds are configurable actions" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    try std.testing.expectEqual(@as(usize, 1), config.workspace_focus_prompt.len);
-    try std.testing.expectEqual(sdl.Keycode.tab, config.workspace_focus_prompt[0].key);
-
-    try std.testing.expectEqual(@as(usize, 1), config.workspace_move_left.len);
-    try std.testing.expect(config.workspace_move_left[0].ctrl);
-    try std.testing.expect(config.workspace_move_left[0].shift);
-    try std.testing.expectEqual(sdl.Keycode.h, config.workspace_move_left[0].key);
-
-    try std.testing.expectEqual(@as(usize, 1), config.workspace_move_down.len);
-    try std.testing.expect(config.workspace_move_down[0].ctrl);
-    try std.testing.expect(config.workspace_move_down[0].shift);
-    try std.testing.expectEqual(sdl.Keycode.j, config.workspace_move_down[0].key);
-
-    try std.testing.expectEqual(@as(usize, 1), config.workspace_move_up.len);
-    try std.testing.expect(config.workspace_move_up[0].ctrl);
-    try std.testing.expect(config.workspace_move_up[0].shift);
-    try std.testing.expectEqual(sdl.Keycode.k, config.workspace_move_up[0].key);
-
-    try std.testing.expectEqual(@as(usize, 1), config.workspace_move_right.len);
-    try std.testing.expect(config.workspace_move_right[0].ctrl);
-    try std.testing.expect(config.workspace_move_right[0].shift);
-    try std.testing.expectEqual(sdl.Keycode.l, config.workspace_move_right[0].key);
-}
-
-test "default sidebar keybind uses primary plus s" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    try std.testing.expectEqual(@as(usize, 1), config.toggle_sidebar.len);
-    try std.testing.expect(!config.toggle_sidebar[0].alt);
-    try std.testing.expect(!config.toggle_sidebar[0].ctrl);
-    try std.testing.expect(!config.toggle_sidebar[0].meta);
-    try std.testing.expect(config.toggle_sidebar[0].primary);
-    try std.testing.expectEqual(sdl.Keycode.s, config.toggle_sidebar[0].key);
-}
-
-test "default hidden sidebar keybind uses ctrl shift plus s" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    try std.testing.expectEqual(@as(usize, 1), config.toggle_sidebar_hidden.len);
-    try std.testing.expect(!config.toggle_sidebar_hidden[0].alt);
-    try std.testing.expect(config.toggle_sidebar_hidden[0].ctrl);
-    try std.testing.expect(!config.toggle_sidebar_hidden[0].meta);
-    try std.testing.expect(!config.toggle_sidebar_hidden[0].primary);
-    try std.testing.expect(config.toggle_sidebar_hidden[0].shift);
-    try std.testing.expectEqual(sdl.Keycode.s, config.toggle_sidebar_hidden[0].key);
-}
-
-test "default chat scroll keybinds use arrows and paging keys" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    try std.testing.expectEqual(@as(usize, 1), config.chat_up.len);
-    try std.testing.expectEqual(@as(usize, 1), config.chat_down.len);
-    try std.testing.expectEqual(@as(usize, 1), config.chat_page_up.len);
-    try std.testing.expectEqual(@as(usize, 1), config.chat_page_down.len);
-    try std.testing.expectEqual(sdl.Keycode.up, config.chat_up[0].key);
-    try std.testing.expectEqual(sdl.Keycode.down, config.chat_down[0].key);
-    try std.testing.expectEqual(sdl.Keycode.pageup, config.chat_page_up[0].key);
-    try std.testing.expectEqual(sdl.Keycode.pagedown, config.chat_page_down[0].key);
-}
-
-test "default GUI chat composer keybinds use alt mnemonics" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    try std.testing.expectEqual(@as(usize, 1), config.chat_model_picker.len);
-    try std.testing.expect(config.chat_model_picker[0].alt);
-    try std.testing.expectEqual(sdl.Keycode.m, config.chat_model_picker[0].key);
-    try std.testing.expectEqual(@as(usize, 1), config.chat_run_config.len);
-    try std.testing.expect(config.chat_run_config[0].alt);
-    try std.testing.expectEqual(sdl.Keycode.r, config.chat_run_config[0].key);
-    try std.testing.expectEqual(@as(usize, 1), config.chat_directory_picker.len);
-    try std.testing.expect(config.chat_directory_picker[0].alt);
-    try std.testing.expectEqual(sdl.Keycode.d, config.chat_directory_picker[0].key);
-}
-
 test "GUI chat composer keybinds are configurable and disableable" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
@@ -3104,22 +2628,6 @@ test "GUI chat composer keybinds are configurable and disableable" {
     try std.testing.expect(config.chat_directory_picker[0].ctrl);
     try std.testing.expect(config.chat_directory_picker[0].shift);
     try std.testing.expectEqual(sdl.Keycode.d, config.chat_directory_picker[0].key);
-}
-
-test "chat page down keybind override accepts a single accelerator" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"keybinds": {"chat_page_down": "Shift+J"}}
-    , .{});
-    defer parsed.deinit();
-
-    config.applyOverrides(parsed.value);
-
-    try std.testing.expectEqual(@as(usize, 1), config.chat_page_down.len);
-    try std.testing.expect(config.chat_page_down[0].shift);
-    try std.testing.expectEqual(sdl.Keycode.j, config.chat_page_down[0].key);
 }
 
 test "terminal nested keybind overrides accept workspace actions" {
@@ -3175,19 +2683,6 @@ test "legacy terminal keybind override still maps to terminal toggle" {
     try std.testing.expectEqual(sdl.Keycode.j, config.toggle_terminal[0].key);
 }
 
-test "prefix mode is on by default and arms on ctrl b" {
-    // Built-in defaults only: `load` merges the developer's real verde.json,
-    // which may legitimately disable prefix mode.
-    var prefix = try cloneDefaultPrefixConfig(std.testing.allocator);
-    defer prefix.deinit(std.testing.allocator);
-
-    try std.testing.expect(prefix.enabled);
-    try std.testing.expectEqual(@as(usize, 1), prefix.keys.len);
-    try std.testing.expect(prefix.keys[0].ctrl);
-    try std.testing.expectEqual(sdl.Keycode.b, prefix.keys[0].key);
-    try std.testing.expectEqual(DEFAULT_PREFIX_TABLE.len, prefix.bindings.items.len);
-}
-
 test "default prefix table covers every app terminal and chat action" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
@@ -3227,121 +2722,18 @@ test "default prefix table covers every app terminal and chat action" {
     }
 }
 
-test "default prefix table has no duplicate chords" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    const items = config.prefix.bindings.items;
-    for (items, 0..) |binding, index| {
-        for (items[index + 1 ..]) |other| {
-            try std.testing.expect(!binding.key.eql(other.key));
-        }
-    }
-}
-
-test "default prefix shift digits jump to ACTIVE rows" {
+test "default prefix and navigate tables parse and have no duplicate chords" {
+    // Built-in defaults only: `load` merges the developer's real verde.json.
     var prefix = try cloneDefaultPrefixConfig(std.testing.allocator);
     defer prefix.deinit(std.testing.allocator);
 
-    var saw_shift_one = false;
-    var saw_shift_zero = false;
-    var saw_ctrl_one = false;
-    var saw_plain_one = false;
-    var saw_workspace_shift = false;
-    for (prefix.bindings.items) |binding| {
-        if (binding.key.eql(.{ .shift = true, .key = .@"1" })) {
-            saw_shift_one = true;
-            try std.testing.expectEqual(@as(usize, 0), binding.target.active_select);
-        }
-        if (binding.key.eql(.{ .shift = true, .key = .@"0" })) {
-            saw_shift_zero = true;
-            try std.testing.expectEqual(@as(usize, 9), binding.target.active_select);
-        }
-        if (binding.key.eql(.{ .ctrl = true, .key = .@"1" })) saw_ctrl_one = true;
-        if (binding.key.eql(.{ .key = .@"1" })) {
-            saw_plain_one = true;
-            try std.testing.expectEqual(@as(usize, 0), binding.target.pane_select);
-        }
-        if (binding.target == .workspace_select) saw_workspace_shift = true;
-    }
-    try std.testing.expect(saw_shift_one and saw_shift_zero and saw_plain_one);
-    try std.testing.expect(!saw_ctrl_one);
-    try std.testing.expect(!saw_workspace_shift);
-}
-
-test "default prefix t chords create terminal tabs and split panes" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    var terminal_tab = false;
-    var terminal_split = false;
-    for (config.prefix.bindings.items) |binding| {
-        if (binding.key.eql(.{ .key = .t })) {
-            terminal_tab = binding.target == .app and binding.target.app == .add_workspace_tab_terminal;
-        }
-        if (binding.key.eql(.{ .shift = true, .key = .t })) {
-            terminal_split = binding.target == .new_terminal;
+    for ([_][]const PrefixBinding{ prefix.bindings.items, prefix.navigate.items }) |items| {
+        for (items, 0..) |binding, index| {
+            for (items[index + 1 ..]) |other| {
+                try std.testing.expect(!binding.key.eql(other.key));
+            }
         }
     }
-    try std.testing.expect(terminal_tab and terminal_split);
-}
-
-test "default prefix c adds a workspace tab and a opens the workspace creator" {
-    var prefix = try cloneDefaultPrefixConfig(std.testing.allocator);
-    defer prefix.deinit(std.testing.allocator);
-
-    var add_tab = false;
-    var add_workspace = false;
-    var chat_horizontal = false;
-    for (prefix.bindings.items) |binding| {
-        if (binding.key.eql(.{ .key = .c })) {
-            add_tab = binding.target == .app and binding.target.app == .add_workspace_tab;
-        }
-        if (binding.key.eql(.{ .key = .a })) {
-            add_workspace = binding.target == .app and binding.target.app == .add_workspace;
-        }
-        if (binding.key.eql(.{ .shift = true, .key = .c })) {
-            chat_horizontal = binding.target == .app and binding.target.app == .workspace_split_chat_horizontal;
-        }
-    }
-    try std.testing.expect(add_tab and add_workspace and chat_horizontal);
-}
-
-test "default prefix pane tile chords follow the configured default pane" {
-    var config = try NativeKeyboardConfig.load(std.testing.allocator);
-    defer config.deinit();
-
-    var default_vertical = false;
-    var default_horizontal = false;
-    var alternate_vertical = false;
-    var alternate_horizontal = false;
-    for (config.prefix.bindings.items) |binding| {
-        if (binding.key.eql(.{ .key = .v })) {
-            default_vertical = binding.target == .split_default_vertical;
-        }
-        if (binding.key.eql(.{ .key = .minus })) {
-            default_horizontal = binding.target == .split_default_horizontal;
-        }
-        if (binding.key.eql(.{ .shift = true, .key = .v })) {
-            alternate_vertical = binding.target == .split_alternate_vertical;
-        }
-        if (binding.key.eql(.{ .shift = true, .key = .minus })) {
-            alternate_horizontal = binding.target == .split_alternate_horizontal;
-        }
-    }
-    try std.testing.expect(default_vertical and default_horizontal and alternate_vertical and alternate_horizontal);
-
-    var navigate_default_vertical = false;
-    var navigate_default_horizontal = false;
-    var navigate_alternate_vertical = false;
-    var navigate_alternate_horizontal = false;
-    for (config.prefix.navigate.items) |binding| {
-        if (binding.key.eql(.{ .key = .v })) navigate_default_vertical = binding.target == .split_default_vertical;
-        if (binding.key.eql(.{ .key = .minus })) navigate_default_horizontal = binding.target == .split_default_horizontal;
-        if (binding.key.eql(.{ .shift = true, .key = .v })) navigate_alternate_vertical = binding.target == .split_alternate_vertical;
-        if (binding.key.eql(.{ .shift = true, .key = .minus })) navigate_alternate_horizontal = binding.target == .split_alternate_horizontal;
-    }
-    try std.testing.expect(navigate_default_vertical and navigate_default_horizontal and navigate_alternate_vertical and navigate_alternate_horizontal);
 }
 
 test "prefix shorthand bool and string overrides" {

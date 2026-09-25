@@ -24,7 +24,7 @@ pub const DEFAULT_BROWSER_SCROLL_SPEED: f32 = 2.5;
 pub const MIN_BROWSER_SCROLL_SPEED: f32 = 1.0;
 pub const MAX_BROWSER_SCROLL_SPEED: f32 = 5.0;
 pub const BROWSER_SCROLL_SPEED_STEP: f32 = 0.25;
-pub const DEFAULT_CHAT_TITLE_MODEL = "gpt-5.6-luna";
+pub const DEFAULT_CHAT_TITLE_MODEL = "gpt-6-luna";
 
 pub const ChatProvider = enum {
     codex,

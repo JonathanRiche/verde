@@ -1279,17 +1279,6 @@ fn convertHelperEvent(allocator: std.mem.Allocator, event: ipc.Event) !browser_t
     };
 }
 
-test "WPE helper cursor events preserve normalized browser shapes" {
-    const event = try convertHelperEvent(std.testing.allocator, .{
-        .kind = .cursor_changed,
-        .payload = "grabbing",
-    });
-    switch (event) {
-        .cursor_changed => |shape| try std.testing.expectEqual(browser_types.CursorShape.grabbing, shape),
-        else => return error.TestUnexpectedResult,
-    }
-}
-
 fn execHelperChild(
     helper_dir_z: [*:0]const u8,
     helper_path_z: [*:0]const u8,

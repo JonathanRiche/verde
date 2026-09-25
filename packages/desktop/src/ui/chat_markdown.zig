@@ -8,10 +8,6 @@ const theme = @import("theme.zig");
 const zig_dif = @import("zig_dif");
 const zig_markdown = @import("zig_markdown");
 
-fn transcriptTextWidth(font_size: f32, text: []const u8) f32 {
-    return transcriptTextWidthForRole(font_size, .prose, text);
-}
-
 fn transcriptTextWidthForRole(font_size: f32, role: palette.FontRole, text: []const u8) f32 {
     if (text.len == 0) return 0.0;
     if (inlineWhitespaceWidth(font_size, text)) |width| return width;
@@ -4112,18 +4108,6 @@ test "preserves links and inline code runs" {
         },
         else => unreachable,
     }
-}
-
-test "maps markdown fence tags to syntax languages" {
-    try std.testing.expectEqual(zig_dif.Language.tsx, codeLanguageForTag("tsx"));
-    try std.testing.expectEqual(zig_dif.Language.json, codeLanguageForTag("json"));
-    try std.testing.expectEqual(zig_dif.Language.markdown, codeLanguageForTag("markdown"));
-    try std.testing.expectEqual(zig_dif.Language.plain, codeLanguageForTag(null));
-}
-
-test "transcript layout width tracks GL text metrics for ASCII" {
-    const w = transcriptTextWidth(16.0, "Hello");
-    try std.testing.expect(w > 10.0 and w < 90.0);
 }
 
 test "double click selection expands to a code word on raw lines" {

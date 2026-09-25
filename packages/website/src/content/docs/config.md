@@ -83,7 +83,7 @@ A complete example:
   "chat": {
     "automatic_titles": true,
     "title_provider": "codex",
-    "title_model": "gpt-5.6-luna",
+    "title_model": "gpt-6-luna",
     "default_provider": "codex",
     "default_model": "gpt-5.6-sol",
     "default_reasoning": "low",
@@ -204,7 +204,7 @@ default to `system_browser` when `open.links` is not configured.
 Automatic titles are enabled by default and run after the opening user and
 assistant exchange completes. `chat.title_provider` accepts `codex`, `claude`,
 `cursor`, or `opencode`; `chat.title_model` is the model reference understood
-by that provider. The default is GPT-5.6 Luna from Codex / ChatGPT. A title
+by that provider. The default is GPT-6 Luna from Codex / ChatGPT. A title
 generation failure leaves Verde's prompt-derived fallback title unchanged.
 
 ## New chat defaults and favorite models

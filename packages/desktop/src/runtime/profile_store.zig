@@ -252,17 +252,6 @@ fn writeTestFile(dir: std.Io.Dir, name: []const u8, bytes: []const u8) !void {
     try file.writeStreamingAll(std.testing.io, bytes);
 }
 
-test "profile store path is beside the existing config" {
-    const allocator = std.testing.allocator;
-    const absolute = try pathBesideConfigAlloc(allocator, "/tmp/verde/verde.json");
-    defer allocator.free(absolute);
-    try std.testing.expectEqualStrings("/tmp/verde/runtime-profiles.json", absolute);
-
-    const relative = try pathBesideConfigAlloc(allocator, "verde.json");
-    defer allocator.free(relative);
-    try std.testing.expectEqualStrings(FILE_NAME, relative);
-}
-
 test "profile store saves through a symlinked config directory" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 

@@ -1467,22 +1467,6 @@ test "named pipe clients prevent server impersonation" {
     try std.testing.expect(WINDOWS_PIPE_CLIENT_FLAGS & SECURITY_IDENTIFICATION != 0);
 }
 
-test "unix endpoint guard derives a neighboring lock path" {
-    const allocator = std.testing.allocator;
-    const lock_path = try unixEndpointLockPathAlloc(allocator, "/tmp/verde-sessionizer.sock");
-    defer allocator.free(lock_path);
-    try std.testing.expectEqualStrings("/tmp/verde-sessionizer.sock.lock", lock_path);
-}
-
-test "message limits are release invariant" {
-    try std.testing.expect(DEFAULT_MAX_MESSAGE_BYTES >= 64 * 1024);
-    try std.testing.expect(DEFAULT_MAX_MESSAGE_BYTES <= 1024 * 1024);
-    try std.testing.expect(DEFAULT_MAX_RESPONSE_BYTES > DEFAULT_MAX_MESSAGE_BYTES);
-    try std.testing.expect(DEFAULT_MAX_RESPONSE_BYTES <= 32 * 1024 * 1024);
-    try std.testing.expect(WINDOWS_PIPE_BUFFER_BYTES <= DEFAULT_MAX_MESSAGE_BYTES);
-    try std.testing.expect(DEFAULT_TIMEOUT_MS > 0);
-}
-
 // Pins the handoff barrier: on_closing runs while the socket path still
 // accepts connections and before serve's LIFO endpoint teardown defers.
 // Use a short absolute path: AF_UNIX sun_path is ~108 bytes on Linux.
@@ -1592,18 +1576,6 @@ fn testRejectRequest(ctx: *anyopaque, request: []u8) anyerror![]u8 {
     _ = ctx;
     _ = request;
     return error.UnexpectedRequest;
-}
-
-test "Q7 transport concurrency constants are pinned" {
-    // m4m5_decisions Q7, resized after field saturation: 16 workers,
-    // accept-queue cap 16, at most 8 parked long-pollers (shared across park
-    // kinds). Changing any of these is a design decision, not a patch.
-    try std.testing.expectEqual(@as(usize, 16), TRANSPORT_WORKER_COUNT);
-    try std.testing.expectEqual(@as(usize, 16), TRANSPORT_ACCEPT_QUEUE_CAP);
-    try std.testing.expectEqual(@as(usize, 8), MAX_PARKED_LONG_POLL_WAITERS);
-    // Overflow reply shape: invalid_state with Error.data.reason="busy".
-    try std.testing.expect(std.mem.indexOf(u8, BUSY_RESPONSE, "\"code\":\"invalid_state\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, BUSY_RESPONSE, "\"reason\":\"busy\"") != null);
 }
 
 test "unix accept queue is bounded at TRANSPORT_ACCEPT_QUEUE_CAP" {

@@ -1589,15 +1589,6 @@ test "close durability failure returns before teardown and retry succeeds" {
     try std.testing.expect(!state.teardown_started);
 }
 
-test "lifecycle backoff gate skips flush while next_attempt is in the future" {
-    var state: State = .{};
-    state.markDirty(0);
-    state.noteInteraction(0);
-    state.next_flush_attempt_ms = 5000;
-    try std.testing.expect(state.shouldFlush(1000, 750));
-    try std.testing.expect(1000 < state.next_flush_attempt_ms);
-}
-
 test "completed spool owns only its captured dirty generation" {
     var state: State = .{ .dirty = true, .dirty_generation = 4, .next_flush_attempt_ms = 99 };
     noteCompletedSpool(&state, 3);

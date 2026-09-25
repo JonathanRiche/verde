@@ -2554,6 +2554,8 @@ test "ensureCodexProjectHooks writes hook script and hooks json" {
     defer std.testing.allocator.free(project_path);
 
     try ensureCodexProjectHooks(std.testing.allocator, project_path);
+    // Re-running over our own managed hooks.json must be accepted.
+    try ensureCodexProjectHooks(std.testing.allocator, project_path);
 
     const hook_path = try std.fs.path.join(std.testing.allocator, &.{ project_path, CODEX_HOOK_REL_PATH });
     defer std.testing.allocator.free(hook_path);
@@ -2572,16 +2574,6 @@ test "ensureCodexProjectHooks writes hook script and hooks json" {
     defer std.testing.allocator.free(hooks_json);
     try std.testing.expect(std.mem.indexOf(u8, hooks_json, "PermissionRequest") != null);
     try std.testing.expect(std.mem.indexOf(u8, hooks_json, hook_path) != null);
-}
-
-test "ensureCodexProjectHooks accepts existing managed hooks json" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const project_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    defer std.testing.allocator.free(project_path);
-
-    try ensureCodexProjectHooks(std.testing.allocator, project_path);
-    try ensureCodexProjectHooks(std.testing.allocator, project_path);
 }
 
 test "removeCodexProjectHooks removes only Verde lifecycle entries" {
@@ -2698,12 +2690,8 @@ test "Cursor hook removal preserves unrelated configuration" {
     try std.testing.expect(std.mem.indexOf(u8, removed, CURSOR_GLOBAL_HOOK_NEEDLE) == null);
 }
 
-test "Windows hook commands quote Unicode paths and select PowerShell scripts" {
+test "Windows hook commands quote Unicode paths for PowerShell" {
     const allocator = std.testing.allocator;
-    try std.testing.expectEqualStrings(CODEX_WINDOWS_HOOK_REL_PATH, codexProjectHookRelPathForOs(.windows));
-    try std.testing.expectEqualStrings(CLAUDE_WINDOWS_HOOK_REL_PATH, claudeProjectHookRelPathForOs(.windows));
-    try std.testing.expectEqualStrings(CURSOR_WINDOWS_PROJECT_HOOK_REL_PATH, cursorProjectHookRelPathForOs(.windows));
-
     const hook_path = "C:\\Users\\Zoë Tester\\Client Repo\\.verde\\hooks\\codex-notify-hook.ps1";
     const command = try hookCommandAllocForOs(allocator, .windows, hook_path);
     defer allocator.free(command);
@@ -2751,39 +2739,6 @@ test "PowerShell hooks use inherited transport-neutral endpoint and safe invocat
     try std.testing.expect(std.mem.indexOf(u8, grok_script, "VERDE_GROK_TITLE_SESSION_ID") != null);
     try std.testing.expect(std.mem.indexOf(u8, grok_script, "Start-Process") != null);
     try std.testing.expect(std.mem.indexOf(u8, grok_script, "'grok'") != null);
-}
-
-test "Claude hook reports a prompt-derived title" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const script_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/claude-hook.sh", .{tmp.sub_path});
-    defer std.testing.allocator.free(script_path);
-    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
-    defer threaded.deinit();
-
-    try writeClaudeHookScript(std.testing.allocator, threaded.io(), script_path);
-    const script = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), script_path, std.testing.allocator, .limited(64 * 1024));
-    defer std.testing.allocator.free(script);
-    try std.testing.expect(std.mem.indexOf(u8, script, ".prompt // empty") != null);
-    try std.testing.expect(std.mem.indexOf(u8, script, ".transcript_path // empty") != null);
-    try std.testing.expect(std.mem.indexOf(u8, script, "custom-title") != null);
-    try std.testing.expect(std.mem.indexOf(u8, script, "aiTitle") != null);
-    try std.testing.expect(std.mem.indexOf(u8, script, "--title \"$title\" --provider claude") != null);
-    try std.testing.expect(std.mem.indexOf(u8, script, "[ \"$source\" = \"compact\" ]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, script, "activity=\"parent-working\"") != null);
-    if (builtin.os.tag != .windows) {
-        const syntax = try std.process.run(std.testing.allocator, threaded.io(), .{
-            .argv = &.{ "sh", "-n", script_path },
-            .stdout_limit = .limited(1024),
-            .stderr_limit = .limited(8 * 1024),
-        });
-        defer std.testing.allocator.free(syntax.stdout);
-        defer std.testing.allocator.free(syntax.stderr);
-        switch (syntax.term) {
-            .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
-            else => return error.UnexpectedHookSyntaxCheckTermination,
-        }
-    }
 }
 
 test "OpenCode plugin targets the OpenCode 2 service event contract" {

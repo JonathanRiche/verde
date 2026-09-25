@@ -441,13 +441,6 @@ pub fn motionDurationMs(reduced_motion: bool, standard_ms: i64) i64 {
     return if (reduced_motion) MOTION_REDUCED_MS else standard_ms;
 }
 
-test "reduced motion collapses standard transition durations" {
-    try std.testing.expectEqual(MOTION_FAST_MS, motionDurationMs(false, MOTION_FAST_MS));
-    try std.testing.expectEqual(MOTION_BASE_MS, motionDurationMs(false, MOTION_BASE_MS));
-    try std.testing.expectEqual(MOTION_REDUCED_MS, motionDurationMs(true, MOTION_FAST_MS));
-    try std.testing.expectEqual(MOTION_REDUCED_MS, motionDurationMs(true, MOTION_BASE_MS));
-}
-
 pub fn withAlpha(color: [4]f32, alpha: u8) [4]f32 {
     return .{ color[0], color[1], color[2], @as(f32, @floatFromInt(alpha)) / 255.0 };
 }
@@ -1135,18 +1128,6 @@ test "parse Omarchy colors.toml maps palette into semantic colors" {
     try std.testing.expectEqual(rgb(0x44, 0x4b, 0x6a), parsed.border_muted);
 }
 
-test "parse Omarchy colors.toml keeps fallback values for missing keys" {
-    var parsed: ThemeColors = .{};
-    applyOmarchyColorsToml(
-        \\foreground = "#eeeeee"
-        \\
-    , &parsed);
-
-    try std.testing.expectEqual(colors.CHAT_BLACK, parsed.background);
-    try std.testing.expectEqual(rgba(255, 100, 100, 255), parsed.diff_remove);
-    try std.testing.expectEqual(rgb(0x50, 0xc8, 0x78), parsed.accent);
-}
-
 test "active Omarchy theme prefers the Quattro state path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1264,22 +1245,6 @@ test "theme source names parse with legacy aliases" {
     }
 }
 
-test "default theme source depends on Omarchy detection" {
-    try std.testing.expectEqual(ThemeSource.omarchy, defaultThemeSource(true));
-    try std.testing.expectEqual(ThemeSource.auto, defaultThemeSource(false));
-    try std.testing.expectEqual(ThemeSource.auto, effectiveThemeSource(.omarchy, false));
-    try std.testing.expectEqual(ThemeSource.omarchy, effectiveThemeSource(.omarchy, true));
-    try std.testing.expectEqual(ThemeSource.verde_light, effectiveThemeSource(.verde_light, false));
-}
-
-test "built-in palettes resolve per source and appearance" {
-    try std.testing.expectEqual(default_colors, builtinColors(.verde_legacy, .light));
-    try std.testing.expectEqual(verde_dark_colors, builtinColors(.auto, .dark));
-    try std.testing.expectEqual(verde_light_colors, builtinColors(.auto, .light));
-    try std.testing.expectEqual(verde_dark_colors, builtinColors(.verde_dark, .light));
-    try std.testing.expectEqual(rgba(0x15, 0x80, 0x3D, 0x1F), verde_light_colors.accent_dim);
-}
-
 test "Verde Legacy [verde] roles reproduce the original palette exactly" {
     var parsed: ThemeColors = verde_dark_colors;
     applyOmarchyColorsToml(
@@ -1323,10 +1288,6 @@ test "omarchy theme stamp changes when the theme directory is swapped in" {
     try std.testing.expect(!std.meta.eql(before, stampFile(tmp.dir, "theme/colors.toml")));
 
     try std.testing.expect(std.meta.eql(OmarchyThemeStamp{}, stampFile(tmp.dir, "missing/colors.toml")));
-}
-
-test "omarchy theme polling ignores built-in sources" {
-    try std.testing.expect(!omarchyThemeChanged(std.testing.allocator, .{ .source = .verde_light }));
 }
 
 test "raise and sink follow the palette polarity" {

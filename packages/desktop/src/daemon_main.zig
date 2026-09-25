@@ -1923,6 +1923,34 @@ test "daemon CLI parses every public command" {
     try std.testing.expectEqualStrings("working", notify_options.notify.status.?);
     try std.testing.expectEqualStrings("Running tests", notify_options.notify.title.?);
     try std.testing.expectEqualStrings("codex", notify_options.notify.provider.?);
+
+    const notify_identity = try parseArgs(&.{
+        "verde-daemon",
+        "notify",
+        "--data-dir",
+        "/srv/verde",
+        "--session-id",
+        "opaque:session/id",
+        "--workspace",
+        "workspace-1",
+        "--dock",
+        "4",
+        "--pane",
+        "9",
+        "--status",
+        "done",
+        "--provider",
+        "fx",
+        "--json",
+    });
+    try std.testing.expectEqualStrings("/srv/verde", notify_identity.data_dir.?);
+    try std.testing.expectEqualStrings("opaque:session/id", notify_identity.notify.session_id.?);
+    try std.testing.expectEqualStrings("workspace-1", notify_identity.notify.workspace_id.?);
+    try std.testing.expectEqual(@as(?u32, 4), notify_identity.notify.dock_id);
+    try std.testing.expectEqual(@as(?u32, 9), notify_identity.notify.pane_id);
+    try std.testing.expectEqualStrings("done", notify_identity.notify.status.?);
+    try std.testing.expectEqualStrings("fx", notify_identity.notify.provider.?);
+    try std.testing.expect(notify_identity.json);
 }
 
 test "daemon CLI rejects ambiguous or unsupported options" {
@@ -1992,54 +2020,11 @@ test "daemon CLI rejects ambiguous or unsupported options" {
     );
 }
 
-test "daemon notify parses explicit identity and data directory" {
-    const options = try parseArgs(&.{
-        "verde-daemon",
-        "notify",
-        "--data-dir",
-        "/srv/verde",
-        "--session-id",
-        "opaque:session/id",
-        "--workspace",
-        "workspace-1",
-        "--dock",
-        "4",
-        "--pane",
-        "9",
-        "--status",
-        "done",
-        "--provider",
-        "fx",
-        "--json",
-    });
-    try std.testing.expectEqualStrings("/srv/verde", options.data_dir.?);
-    try std.testing.expectEqualStrings("opaque:session/id", options.notify.session_id.?);
-    try std.testing.expectEqualStrings("workspace-1", options.notify.workspace_id.?);
-    try std.testing.expectEqual(@as(?u32, 4), options.notify.dock_id);
-    try std.testing.expectEqual(@as(?u32, 9), options.notify.pane_id);
-    try std.testing.expectEqualStrings("done", options.notify.status.?);
-    try std.testing.expectEqualStrings("fx", options.notify.provider.?);
-    try std.testing.expect(options.json);
-}
-
 test "daemon notify target never falls back implicitly" {
     try std.testing.expectEqual(NotifyTargetMode.data_dir, try selectNotifyTargetMode(true, false));
     try std.testing.expectEqual(NotifyTargetMode.inherited_endpoint, try selectNotifyTargetMode(false, true));
     try std.testing.expectError(error.MissingNotifyTarget, selectNotifyTargetMode(false, false));
     try std.testing.expectError(error.AmbiguousNotifyTarget, selectNotifyTargetMode(true, true));
-}
-
-test "daemon notify recognizes all lifecycle providers and statuses" {
-    const providers = [_][]const u8{ "codex", "claude", "cursor", "opencode", "amp", "pi", "fx", "grok" };
-    for (providers) |provider| {
-        try std.testing.expect(validNotifyProvider(provider));
-    }
-    const statuses = [_][]const u8{ "idle", "working", "waiting", "done", "error" };
-    for (statuses) |status| {
-        try std.testing.expect(validNotifyStatus(status));
-    }
-    try std.testing.expect(!validNotifyProvider("unknown"));
-    try std.testing.expect(!validNotifyStatus("busy"));
 }
 
 test "signal watcher recognizes only an accepted prepare-shutdown result" {

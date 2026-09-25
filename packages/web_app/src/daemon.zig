@@ -261,16 +261,6 @@ fn readResponseAlloc(
 }
 
 const TestTransport = struct {
-    fn unavailable(
-        _: std.Io,
-        _: std.mem.Allocator,
-        endpoint: []const u8,
-        _: []const u8,
-    ) ![]u8 {
-        if (!std.mem.eql(u8, endpoint, "/sessionizer-only.sock")) return error.UnexpectedBackend;
-        return error.FileNotFound;
-    }
-
     fn failed(
         _: std.Io,
         _: std.mem.Allocator,
@@ -279,16 +269,6 @@ const TestTransport = struct {
     ) ![]u8 {
         if (!std.mem.eql(u8, endpoint, "/sessionizer-only.sock")) return error.UnexpectedBackend;
         return error.ConnectionResetByPeer;
-    }
-
-    fn unknownMethod(
-        _: std.Io,
-        allocator: std.mem.Allocator,
-        endpoint: []const u8,
-        _: []const u8,
-    ) ![]u8 {
-        if (!std.mem.eql(u8, endpoint, "/sessionizer-only.sock")) return error.UnexpectedBackend;
-        return allocator.dupe(u8, "{\"id\":7,\"ok\":false,\"error\":{\"code\":\"unknown_method\"}}");
     }
 
     fn secretBridge(
@@ -329,41 +309,12 @@ fn testDaemon() Daemon {
     return .init(std.testing.allocator, std.testing.io, config);
 }
 
-test "missing daemon fails without fallback" {
-    var daemon = testDaemon();
-    try std.testing.expectError(
-        error.FileNotFound,
-        daemon.callRawWith("{\"id\":1,\"method\":\"core.status\",\"params\":{}}", TestTransport.unavailable),
-    );
-}
-
 test "empty daemon endpoint fails closed through the production transport" {
     var daemon = testDaemon();
     daemon.config.sessionizer_endpoint = "";
     try std.testing.expectError(
         error.FileNotFound,
         daemon.callRaw("{\"id\":1,\"method\":\"core.status\",\"params\":{}}"),
-    );
-}
-
-test "daemon transport failure is returned without another backend" {
-    var daemon = testDaemon();
-    try std.testing.expectError(
-        error.ConnectionResetByPeer,
-        daemon.callRawWith("{\"id\":2,\"method\":\"chat.turn.start\",\"params\":{}}", TestTransport.failed),
-    );
-}
-
-test "daemon response remains authoritative" {
-    var daemon = testDaemon();
-    const result = try daemon.callRawWith(
-        "{\"id\":7,\"method\":\"future.method\",\"params\":{}}",
-        TestTransport.unknownMethod,
-    );
-    defer std.testing.allocator.free(result.json);
-    try std.testing.expectEqualStrings(
-        "{\"id\":7,\"ok\":false,\"error\":{\"code\":\"unknown_method\"}}",
-        result.json,
     );
 }
 

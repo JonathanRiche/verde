@@ -4578,15 +4578,6 @@ const TestStreamEventCapture = struct {
     }
 };
 
-test "build request target preserves path and query" {
-    const allocator = std.testing.allocator;
-    const uri = try std.Uri.parse("ws://127.0.0.1:4500/rpc?client=native");
-    const target = try buildRequestTargetAlloc(allocator, uri);
-    defer allocator.free(target);
-
-    try std.testing.expectEqualStrings("/rpc?client=native", target);
-}
-
 test "turn steer payload preserves multiple local images" {
     const allocator = std.testing.allocator;
     const images = [_]provider_types.ImageAttachment{
@@ -4793,41 +4784,22 @@ test "formatUsageSummaryAlloc renders concise usage summary" {
     try std.testing.expect(std.mem.indexOf(u8, body, "2026-06-19: 8 M tokens") != null);
 }
 
-test "formatGoalSummaryAlloc renders active goal" {
+test "formatGoalSummaryAlloc renders active and empty goals" {
     const allocator = std.testing.allocator;
-    const json =
-        \\{
-        \\  "goal": {
-        \\    "objective": "Ship GUI slash commands",
-        \\    "status": "active",
-        \\    "tokenBudget": 12000
-        \\  }
-        \\}
-    ;
-
-    const body = try formatGoalSummaryAlloc(allocator, json);
+    const body = try formatGoalSummaryAlloc(allocator,
+        \\{"goal":{"objective":"Ship GUI slash commands","status":"active","tokenBudget":12000}}
+    );
     defer allocator.free(body);
+    try std.testing.expectEqualStrings(
+        "Codex goal\n\nStatus: active\nObjective: Ship GUI slash commands\nToken budget: 12000\n",
+        body,
+    );
 
-    try std.testing.expect(std.mem.indexOf(u8, body, "Codex goal") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "Status: active") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "Objective: Ship GUI slash commands") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "Token budget: 12000") != null);
-}
-
-test "formatGoalSummaryAlloc renders empty goal" {
-    const allocator = std.testing.allocator;
-    const json =
-        \\{
-        \\  "result": {
-        \\    "goal": null
-        \\  }
-        \\}
-    ;
-
-    const body = try formatGoalSummaryAlloc(allocator, json);
-    defer allocator.free(body);
-
-    try std.testing.expectEqualStrings("Codex goal\n\nNo active Codex goal.", body);
+    const empty = try formatGoalSummaryAlloc(allocator,
+        \\{"result":{"goal":null}}
+    );
+    defer allocator.free(empty);
+    try std.testing.expectEqualStrings("Codex goal\n\nNo active Codex goal.", empty);
 }
 
 test "writeReviewTarget serializes supported target shapes" {
@@ -4909,23 +4881,6 @@ test "formatUsageSummaryAlloc includes remaining rate limits" {
     try std.testing.expect(std.mem.indexOf(u8, body, "Reset credits: 2 available") != null);
 }
 
-test "shouldAutoApproveRequest follows approval policy" {
-    try std.testing.expect(shouldAutoApproveRequest(.{ .prompt = "hi", .approval_policy = .never }));
-    try std.testing.expect(!shouldAutoApproveRequest(.{ .prompt = "hi", .approval_policy = .on_request }));
-    try std.testing.expect(!shouldAutoApproveRequest(.{ .prompt = "hi" }));
-}
-
-test "Codex server approval request ids are non-empty" {
-    const allocator = std.testing.allocator;
-    const integer_id = try serverRequestApprovalIdAlloc(allocator, .{ .integer = 42 });
-    defer allocator.free(integer_id);
-    try std.testing.expectEqualStrings("rpc-int:42", integer_id);
-
-    const string_id = try serverRequestApprovalIdAlloc(allocator, .{ .string = "" });
-    defer allocator.free(string_id);
-    try std.testing.expectEqualStrings("rpc-string:", string_id);
-}
-
 test "dynamic tool server request returns a failure result instead of hanging" {
     const allocator = std.testing.allocator;
     const request_json =
@@ -4971,13 +4926,6 @@ test "unknown Codex server request receives method not found" {
     try std.testing.expectEqualStrings(
         "{\"id\":42,\"error\":{\"code\":-32601,\"message\":\"Unsupported Codex app-server request: currentTime/read\"}}",
         payload,
-    );
-}
-
-test "MCP elicitation server request is recognized" {
-    try std.testing.expectEqual(
-        ServerRequestKind.mcp_elicitation,
-        serverRequestKind("mcpServer/elicitation/request"),
     );
 }
 

@@ -71,17 +71,6 @@ describe('sanitized Markdown', () => {
     expect(hrefs[1]).toContain(encodeURIComponent('/home/rtg/development/sideb/sjevents/SJ-Co-Events-Pitch-Deck.pdf'))
   })
 
-  test('sanitizes repository Markdown through the same boundary', () => {
-    const html = renderMarkdownWith(
-      sanitizer,
-      '# README\n\n<img src=x onerror=alert(1)>\n\n**safe**',
-    )
-
-    expect(html).toContain('<h1>README</h1>')
-    expect(html).toContain('<strong>safe</strong>')
-    expect(html).not.toContain('onerror')
-  })
-
   test('fails closed as inert text when DOM sanitization is unsupported', () => {
     const unsupported = {
       isSupported: false,

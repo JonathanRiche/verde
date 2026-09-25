@@ -45,6 +45,10 @@ test {
     _ = @import("ui/handoff_sheet.zig");
     _ = @import("state/handoff_controller.zig");
     _ = @import("ui/workspace_strip.zig");
+    _ = @import("ui/browser.zig");
+    _ = @import("ui/chat_panel.zig");
+    _ = @import("ui/terminal_panel.zig");
+    _ = @import("ui/workspace_panes.zig");
     _ = @import("compile_tests/windows_conpty.zig");
     _ = @import("daemon/change_journal.zig");
     _ = @import("daemon/process_registry.zig");

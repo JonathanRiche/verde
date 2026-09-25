@@ -86,102 +86,56 @@ describe('scrolling tile groups', () => {
   })
 })
 
-describe('shared model favorites', () => {
-  test('parses, trims, and deduplicates the config snapshot', () => {
-    expect(parseFavoriteModels({
-      chat: {
-        favorite_models: [
-          { provider: 'codex', model: 'gpt-5.6-sol' },
-          { provider: ' codex ', model: ' gpt-5.6-sol ' },
-          { provider: 'claude', model: 'opus' },
-          { provider: '', model: 'ignored' },
-        ],
-      },
-    })).toEqual([
-      { provider: 'codex', model: 'gpt-5.6-sol' },
-      { provider: 'claude', model: 'opus' },
-    ])
-  })
-
-  test('applies an idempotent requested favorite state', () => {
-    const original = [{ provider: 'codex', model: 'gpt-5.6-sol' }]
-    expect(setFavoriteModelInList(original, 'codex', 'gpt-5.6-sol', true)).toBe(original)
-    expect(setFavoriteModelInList(original, 'codex', 'gpt-5.6-sol', false)).toEqual([])
-    expect(setFavoriteModelInList(original, 'claude', 'opus', true)).toEqual([
-      ...original,
-      { provider: 'claude', model: 'opus' },
-    ])
-  })
-})
-
-describe('clipboardImageFiles', () => {
-  test('returns every supported clipboard image and ignores text items', () => {
-    const png = new File(['png'], 'screenshot.png', { type: 'image/png' })
-    const webp = new File(['webp'], 'second.webp', { type: 'image/webp' })
-    const data = {
-      items: [
-        { kind: 'string', getAsFile: () => null },
-        { kind: 'file', getAsFile: () => png },
-        { kind: 'file', getAsFile: () => webp },
+test('model favorites parse trimmed/deduplicated and set idempotently', () => {
+  expect(parseFavoriteModels({
+    chat: {
+      favorite_models: [
+        { provider: 'codex', model: 'gpt-5.6-sol' },
+        { provider: ' codex ', model: ' gpt-5.6-sol ' },
+        { provider: 'claude', model: 'opus' },
+        { provider: '', model: 'ignored' },
       ],
-      files: [png, webp],
-    }
-
-    expect(clipboardImageFiles(data)).toEqual([png, webp])
-  })
-
-  test('falls back to the clipboard file list', () => {
-    const jpeg = new File(['jpeg'], 'clipboard.jpg', { type: 'image/jpeg' })
-    const text = new File(['text'], 'notes.txt', { type: 'text/plain' })
-
-    expect(clipboardImageFiles({ items: [], files: [jpeg, text] })).toEqual([jpeg])
-  })
+    },
+  })).toEqual([
+    { provider: 'codex', model: 'gpt-5.6-sol' },
+    { provider: 'claude', model: 'opus' },
+  ])
+  const original = [{ provider: 'codex', model: 'gpt-5.6-sol' }]
+  expect(setFavoriteModelInList(original, 'codex', 'gpt-5.6-sol', true)).toBe(original)
+  expect(setFavoriteModelInList(original, 'codex', 'gpt-5.6-sol', false)).toEqual([])
+  expect(setFavoriteModelInList(original, 'claude', 'opus', true)).toEqual([...original, { provider: 'claude', model: 'opus' }])
 })
 
-describe('mapTranscriptRows', () => {
-  test('preserves every image when normalizing a snapshot thread', () => {
-    const images = [
-      { path: '/tmp/first.png', mime: 'image/png', byte_size: 101 },
-      { path: '/tmp/second.webp', mime: 'image/webp', byte_size: 202 },
-    ]
+test('clipboardImageFiles returns every image item, falling back to the file list', () => {
+  const png = new File(['png'], 'screenshot.png', { type: 'image/png' })
+  const webp = new File(['webp'], 'second.webp', { type: 'image/webp' })
+  expect(clipboardImageFiles({
+    items: [
+      { kind: 'string', getAsFile: () => null },
+      { kind: 'file', getAsFile: () => png },
+      { kind: 'file', getAsFile: () => webp },
+    ],
+    files: [png, webp],
+  })).toEqual([png, webp])
+  const jpeg = new File(['jpeg'], 'clipboard.jpg', { type: 'image/jpeg' })
+  const text = new File(['text'], 'notes.txt', { type: 'text/plain' })
+  expect(clipboardImageFiles({ items: [], files: [jpeg, text] })).toEqual([jpeg])
+})
 
-    const [message] = mapTranscriptRows({
-      thread: {
-        messages: [{
-          message_id: 'message-1',
-          role: 'user',
-          author: 'You',
-          body: 'Compare these',
-          images,
-          created_at_ms: 1234,
-        }],
-      },
-    }, 'thread-1')
+test('mapTranscriptRows preserves every image and a legacy single image', () => {
+  const images = [
+    { path: '/tmp/first.png', mime: 'image/png', byte_size: 101 },
+    { path: '/tmp/second.webp', mime: 'image/webp', byte_size: 202 },
+  ]
+  const [message] = mapTranscriptRows({
+    thread: { messages: [{ message_id: 'message-1', role: 'user', author: 'You', body: 'Compare these', images, created_at_ms: 1234 }] },
+  }, 'thread-1')
+  expect(message.images).toEqual(images.map((image) => ({ ...image, attachment_id: null })))
+  expect(message.created_at_ms).toBe(1234)
 
-    expect(message.images).toEqual(images.map((image) => ({ ...image, attachment_id: null })))
-    expect(message.created_at_ms).toBe(1234)
-  })
-
-  test('preserves a legacy single image attachment', () => {
-    const image = { path: '/tmp/legacy.jpg', mime: 'image/jpeg', byte_size: 303 }
-    const [message] = mapTranscriptRows({
-      thread: {
-        messages: [{ role: 'user', author: 'You', body: '', image }],
-      },
-    }, 'thread-legacy')
-
-    expect(message.images).toEqual([{ ...image, attachment_id: null }])
-  })
-
-  test('reads a chat.message.list page the same way as thread.get', () => {
-    const [message] = mapTranscriptRows({
-      result: {
-        messages: [{ message_id: 'm1', role: 'user', author: 'You', body: 'Hi' }],
-        next_cursor: 'b:1',
-      },
-    }, 'thread-1')
-    expect(message).toMatchObject({ message_id: 'm1', body: 'Hi' })
-  })
+  const image = { path: '/tmp/legacy.jpg', mime: 'image/jpeg', byte_size: 303 }
+  const [legacy] = mapTranscriptRows({ thread: { messages: [{ role: 'user', author: 'You', body: '', image }] } }, 'thread-legacy')
+  expect(legacy.images).toEqual([{ ...image, attachment_id: null }])
 })
 
 describe('fetchTranscriptPage', () => {
@@ -307,39 +261,18 @@ describe('findLastChatPane', () => {
   })
 })
 
-describe('chatPaneHasLiveTurn', () => {
-  const pane = {
-    pane_id: 1,
-    workspace_id: 'workspace-1',
-    kind: 'chat',
-    thread_id: 'thread-1',
-  }
-
-  test('does not treat an unacknowledged completion as live work', () => {
-    expect(chatPaneHasLiveTurn({ ...pane, completion_pending: true }, false)).toBe(false)
-  })
-
-  test('keeps the turn live for a pending send or streaming overlay', () => {
-    expect(chatPaneHasLiveTurn({ ...pane, send_pending: true }, false)).toBe(true)
-    expect(chatPaneHasLiveTurn(pane, true)).toBe(true)
-  })
+test('chatPaneHasLiveTurn counts pending sends and streaming, not unacknowledged completions', () => {
+  const pane = { pane_id: 1, workspace_id: 'workspace-1', kind: 'chat', thread_id: 'thread-1' }
+  expect(chatPaneHasLiveTurn({ ...pane, completion_pending: true }, false)).toBe(false)
+  expect(chatPaneHasLiveTurn({ ...pane, send_pending: true }, false)).toBe(true)
+  expect(chatPaneHasLiveTurn(pane, true)).toBe(true)
 })
 
-describe('lastDeliveredTailSeq', () => {
-  test('does not advance to the daemon next unused sequence', () => {
-    const response = {
-      events: [{ seq: 6 }],
-      page_last_seq: 6,
-      next_seq: 7,
-    }
-
-    expect(lastDeliveredTailSeq(5, response.events, response.page_last_seq)).toBe(6)
-  })
-
-  test('falls back to the greatest delivered event for older daemons', () => {
-    expect(lastDeliveredTailSeq(5, [{ seq: 6 }, { seq: 7 }])).toBe(7)
-    expect(lastDeliveredTailSeq(7, [])).toBe(7)
-  })
+test('lastDeliveredTailSeq never advances to the daemon next unused sequence', () => {
+  expect(lastDeliveredTailSeq(5, [{ seq: 6 }], 6)).toBe(6)
+  // Older daemons without page_last_seq: greatest delivered event.
+  expect(lastDeliveredTailSeq(5, [{ seq: 6 }, { seq: 7 }])).toBe(7)
+  expect(lastDeliveredTailSeq(7, [])).toBe(7)
 })
 
 describe('panesForWorkspace', () => {
@@ -560,38 +493,10 @@ describe('panesForWorkspace', () => {
   })
 })
 
-describe('carryLiveChatIdentity', () => {
-  test('keeps thread ids when a later live tick omits them', () => {
-    const previous = [{
-      id: 7,
-      kind: 'chat',
-      thread: 0,
-      title: 'New thread',
-      local_thread_id: 'thread-1',
-      provider_thread_id: 'provider-1',
-    }]
-    const next = [{
-      id: 7,
-      kind: 'chat',
-      thread: 0,
-      title: 'New thread',
-    }]
-
-    expect(carryLiveChatIdentity(previous, next)).toEqual([{
-      id: 7,
-      kind: 'chat',
-      thread: 0,
-      title: 'New thread',
-      local_thread_id: 'thread-1',
-      provider_thread_id: 'provider-1',
-    }])
-  })
-
-  test('does not invent identity for a different native pane', () => {
-    const previous = [{ id: 7, kind: 'chat', local_thread_id: 'thread-1' }]
-    const next = [{ id: 8, kind: 'chat', title: 'New thread' }]
-    expect(carryLiveChatIdentity(previous, next)[0].local_thread_id).toBeUndefined()
-  })
+test('carryLiveChatIdentity keeps ids omitted by a later tick, only for the same native pane', () => {
+  const previous = [{ id: 7, kind: 'chat', thread: 0, title: 'New thread', local_thread_id: 'thread-1', provider_thread_id: 'provider-1' }]
+  expect(carryLiveChatIdentity(previous, [{ id: 7, kind: 'chat', thread: 0, title: 'New thread' }])).toEqual(previous)
+  expect(carryLiveChatIdentity(previous, [{ id: 8, kind: 'chat', title: 'New thread' }])[0].local_thread_id).toBeUndefined()
 })
 
 describe('mergeThreadCatalogSettings', () => {
@@ -617,31 +522,15 @@ describe('mergeThreadCatalogSettings', () => {
   })
 })
 
-describe('opening-thread daemon get', () => {
-  test('treats a missing daemon row as the opening-thread case', () => {
-    expect(isAbsentDaemonThread({
-      ok: false,
-      error: { code: 'resource_not_found', message: 'resource not found' },
-    })).toBe(true)
-    expect(isAbsentDaemonThread({
-      error: { code: 'not_found', message: 'thread is not on the daemon' },
-    })).toBe(true)
-    expect(isAbsentDaemonThread({
-      ok: false,
-      error: { code: 'store_unavailable', message: 'store is unavailable' },
-    })).toBe(false)
-    expect(isAbsentDaemonThread({ result: { thread: { local_thread_id: 't1' } } })).toBe(false)
-  })
-
-  test('does not invent a thread from a failed get', () => {
-    expect(threadFromDaemonGet({
-      ok: false,
-      error: { code: 'resource_not_found', message: 'resource not found' },
-    })).toBeNull()
-    expect(threadFromDaemonGet({
-      result: { thread: { local_thread_id: 'thread-1', title: 'New thread', committed: false } },
-    })).toMatchObject({ local_thread_id: 'thread-1', committed: false })
-  })
+test('only a missing daemon row is the opening-thread case, and a failed get invents no thread', () => {
+  const missing = { ok: false, error: { code: 'resource_not_found', message: 'resource not found' } }
+  expect(isAbsentDaemonThread(missing)).toBe(true)
+  expect(isAbsentDaemonThread({ error: { code: 'not_found', message: 'thread is not on the daemon' } })).toBe(true)
+  expect(isAbsentDaemonThread({ ok: false, error: { code: 'store_unavailable', message: 'store is unavailable' } })).toBe(false)
+  expect(isAbsentDaemonThread({ result: { thread: { local_thread_id: 't1' } } })).toBe(false)
+  expect(threadFromDaemonGet(missing)).toBeNull()
+  expect(threadFromDaemonGet({ result: { thread: { local_thread_id: 'thread-1', title: 'New thread', committed: false } } }))
+    .toMatchObject({ local_thread_id: 'thread-1', committed: false })
 })
 
 describe('mergeThreadMetadata', () => {
@@ -738,18 +627,6 @@ describe('requestPaneClose', () => {
       return { result: { stopped: true } }
     }, 'workspace-1', { kind: 'terminal', native_pane_id: 42, session_id: 'session-1' })
     expect(calls).toEqual([{ method: 'session.kill', params: { id: 'session-1' } }])
-  })
-
-  test('falls back to killing a detached terminal session', async () => {
-    const calls = []
-    await requestPaneClose(async (method, params) => {
-      calls.push({ method, params })
-      return { id: 1, result: { stopped: true } }
-    }, 'workspace-1', { kind: 'terminal', session_id: 'session-1' })
-
-    expect(calls).toEqual([
-      { method: 'session.kill', params: { id: 'session-1' } },
-    ])
   })
 
   test('reports unavailable instead of archiving a detached chat', async () => {

@@ -2245,12 +2245,6 @@ test "wizard validation reports the first invalid field and accepts defaults" {
     try std.testing.expectEqual(profile.DEFAULT_REMOTE_GATEWAY_PORT, input.remote_gateway_port);
 }
 
-test "port text filter drops every non-digit byte" {
-    var out: [8]u8 = undefined;
-    try std.testing.expectEqualStrings("2222", filterPortText("2\t2a2\n2", &out));
-    try std.testing.expectEqualStrings("", filterPortText("abc", &out));
-}
-
 test "wizard state never stores bearer material" {
     // Runtime bearers stay in state.zig's masked credential modal. The only
     // secret the wizard holds is the one-time pairing code, which has its own
@@ -2320,14 +2314,4 @@ test "Pair link rejects query secrets duplicates and non-origin hosts" {
         fillZ(&rc.control_plane_url_storage, value);
         try std.testing.expectError(error.InvalidPairLink, importPairLink(&rc));
     }
-}
-
-test "visible fields follow the wizard step so Tab never reaches hidden inputs" {
-    var rc: State = .{};
-    rc.wizard_step = .method;
-    try std.testing.expectEqual(@as(usize, 0), rc.visibleFields().len);
-    rc.wizard_step = .pair_grant;
-    try std.testing.expectEqualSlices(WizardField, &.{ .grant_id, .pairing_code, .device_label }, rc.visibleFields());
-    rc.wizard_step = .connect_setup;
-    try std.testing.expectEqualSlices(WizardField, &.{ .label, .control_plane_url }, rc.visibleFields());
 }

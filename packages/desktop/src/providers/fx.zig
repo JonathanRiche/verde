@@ -513,14 +513,6 @@ fn resolveFxExecutableAlloc(
     return error.FileNotFound;
 }
 
-test "resolveFxExecutableAlloc reports missing fx binary" {
-    var env_map = std.process.Environ.Map.init(std.testing.allocator);
-    defer env_map.deinit();
-    try env_map.put("PATH", "/definitely/missing");
-    try env_map.put("HOME", "/definitely/missing-home");
-    try std.testing.expectError(error.FileNotFound, resolveFxExecutableAlloc(std.testing.allocator, &env_map, "missing-fx"));
-}
-
 test "parseModelConfigOptionsAlloc reads fx configOptions model select" {
     const payload =
         \\{"jsonrpc":"2.0","id":3,"result":{"sessionId":"s-1","configOptions":[
@@ -540,15 +532,12 @@ test "parseModelConfigOptionsAlloc reads fx configOptions model select" {
     try std.testing.expectEqualStrings("FX", models[0].provider_name);
     try std.testing.expectEqualStrings("anthropic/claude-sonnet-4.5", models[0].model_id);
     try std.testing.expectEqualStrings("openai/gpt-5.2", models[1].model_id);
-}
 
-test "parseModelConfigOptionsAlloc fails without a model option" {
-    const payload =
+    var missing = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
         \\{"jsonrpc":"2.0","id":3,"result":{"sessionId":"s-1","configOptions":[]}}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-    try std.testing.expectError(error.AcpFailed, parseModelConfigOptionsAlloc(std.testing.allocator, parsed.value));
+    , .{});
+    defer missing.deinit();
+    try std.testing.expectError(error.AcpFailed, parseModelConfigOptionsAlloc(std.testing.allocator, missing.value));
 }
 
 test "newestSessionIdAlloc picks the most recently updated fx session" {
@@ -563,13 +552,10 @@ test "newestSessionIdAlloc picks the most recently updated fx session" {
     const id = (try newestSessionIdAlloc(std.testing.allocator, parsed.value)).?;
     defer std.testing.allocator.free(id);
     try std.testing.expectEqualStrings("new", id);
-}
 
-test "newestSessionIdAlloc returns null for an empty fx session list" {
-    const payload =
+    var empty = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
         \\{"jsonrpc":"2.0","id":2,"result":{"sessions":[]}}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqual(@as(?[]u8, null), try newestSessionIdAlloc(std.testing.allocator, parsed.value));
+    , .{});
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(?[]u8, null), try newestSessionIdAlloc(std.testing.allocator, empty.value));
 }

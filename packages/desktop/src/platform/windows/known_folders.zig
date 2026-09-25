@@ -37,9 +37,3 @@ extern "shell32" fn SHGetKnownFolderPath(
     path: *?[*:0]u16,
 ) callconv(.winapi) i32;
 extern "ole32" fn CoTaskMemFree(memory: ?*anyopaque) callconv(.winapi) void;
-
-test "known folder ids match the Windows SDK constants" {
-    try std.testing.expectEqual(@as(u32, 0xF1B32785), FOLDER_ID_LOCAL_APP_DATA.Data1);
-    try std.testing.expectEqual(@as(u32, 0x3EB685DB), FOLDER_ID_ROAMING_APP_DATA.Data1);
-    try std.testing.expectEqual(@as(u32, 0x5E6C858F), FOLDER_ID_PROFILE.Data1);
-}

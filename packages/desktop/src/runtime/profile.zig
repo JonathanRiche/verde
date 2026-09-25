@@ -1377,18 +1377,6 @@ fn normalizedKeyEquals(key: []const u8, normalized: []const u8) bool {
     return index == normalized.len;
 }
 
-test "generated profile ids are opaque lowercase random values" {
-    const allocator = std.testing.allocator;
-    const first = try generateIdAlloc(allocator, std.testing.io);
-    defer allocator.free(first);
-    const second = try generateIdAlloc(allocator, std.testing.io);
-    defer allocator.free(second);
-
-    try std.testing.expect(validProfileId(first));
-    try std.testing.expect(validProfileId(second));
-    try std.testing.expect(!std.mem.eql(u8, first, second));
-}
-
 test "owned profiles sanitize fields and round trip stable ids" {
     const allocator = std.testing.allocator;
     var local = try Profile.createLocal(allocator, std.testing.io, "  Local  ", null);

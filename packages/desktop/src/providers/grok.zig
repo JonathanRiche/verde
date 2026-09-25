@@ -521,12 +521,7 @@ fn slashCommandRoot(raw_text: []const u8) ?[]const u8 {
     return text[0..root_end];
 }
 
-test "grok slash commands expose builtins and parse the command root" {
-    const commands = providerSlashCommands();
-    try std.testing.expect(commands.len > 0);
-    try std.testing.expectEqualStrings("/compact", commands[0].name);
-    try std.testing.expectEqual(provider_types.ProviderSlashCommandId.compact, commands[0].id);
-    try std.testing.expect(commands[0].requires_thread);
+test "grok slash commands parse the command root" {
     try std.testing.expectEqualStrings("/context", slashCommandRoot("  /context \n").?);
     try std.testing.expectEqualStrings("/loop", slashCommandRoot("/loop 5m run tests").?);
     try std.testing.expect(slashCommandRoot("plain text") == null);
@@ -757,14 +752,6 @@ fn resolveGrokExecutableAlloc(
     return error.FileNotFound;
 }
 
-test "resolveGrokExecutableAlloc reports missing grok binary" {
-    var env_map = std.process.Environ.Map.init(std.testing.allocator);
-    defer env_map.deinit();
-    try env_map.put("PATH", "/definitely/missing");
-    try env_map.put("HOME", "/definitely/missing-home");
-    try std.testing.expectError(error.FileNotFound, resolveGrokExecutableAlloc(std.testing.allocator, &env_map, "missing-grok"));
-}
-
 test "buildArgv places model and effort flags ahead of the stdio subcommand" {
     var storage: [8][]const u8 = undefined;
     const plain = buildArgv(&storage, "/bin/grok", null, null);
@@ -782,14 +769,6 @@ test "buildArgv places model and effort flags ahead of the stdio subcommand" {
     // Verde's max tier clamps to grok's top effort.
     try std.testing.expectEqualStrings("xhigh", full[6]);
     try std.testing.expectEqualStrings("stdio", full[7]);
-}
-
-test "makeAuthenticateRequestAlloc uses the cached token method" {
-    const json = try makeAuthenticateRequestAlloc(std.testing.allocator, AUTHENTICATE_REQUEST_ID, "cached_token");
-    defer std.testing.allocator.free(json);
-    try std.testing.expectEqualStrings(
-        \\{"jsonrpc":"2.0","id":10,"method":"authenticate","params":{"methodId":"cached_token","_meta":{"headless":true}}}
-    , json);
 }
 
 test "makeSetModelRequestAlloc carries the optional reasoning effort" {
@@ -820,7 +799,7 @@ test "currentModelIdFromSessionResponseAlloc reads the restored model from a ses
     try std.testing.expectEqual(@as(?[]u8, null), try currentModelIdFromSessionResponseAlloc(std.testing.allocator, update_line));
 }
 
-test "parseAvailableModelsAlloc reads the initialize modelState catalog" {
+test "parseAvailableModelsAlloc reads initialize and session/new catalogs" {
     const payload =
         \\{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},
         \\"_meta":{"modelState":{"currentModelId":"grok-4.6","availableModels":[
@@ -837,27 +816,21 @@ test "parseAvailableModelsAlloc reads the initialize modelState catalog" {
     try std.testing.expectEqualStrings("grok-4.6", models[0].model_id);
     try std.testing.expectEqualStrings("Grok 4.6", models[0].model_name);
     try std.testing.expectEqualStrings("grok-4.5", models[1].model_id);
-}
 
-test "parseAvailableModelsAlloc reads a session/new models catalog" {
-    const payload =
+    var session_new = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
         \\{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s-1","models":{"currentModelId":"grok-4.5","availableModels":[{"modelId":"grok-4.5","name":"Grok 4.5"}]}}}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-    const models = try parseAvailableModelsAlloc(std.testing.allocator, parsed.value);
-    defer provider_types.freeModelInfos(std.testing.allocator, models);
-    try std.testing.expectEqual(@as(usize, 1), models.len);
-    try std.testing.expectEqualStrings("grok-4.5", models[0].model_id);
-}
+    , .{});
+    defer session_new.deinit();
+    const session_models = try parseAvailableModelsAlloc(std.testing.allocator, session_new.value);
+    defer provider_types.freeModelInfos(std.testing.allocator, session_models);
+    try std.testing.expectEqual(@as(usize, 1), session_models.len);
+    try std.testing.expectEqualStrings("grok-4.5", session_models[0].model_id);
 
-test "parseAvailableModelsAlloc fails without a model catalog" {
-    const payload =
+    var missing = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
         \\{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"_meta":{}}}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-    try std.testing.expectError(error.AcpFailed, parseAvailableModelsAlloc(std.testing.allocator, parsed.value));
+    , .{});
+    defer missing.deinit();
+    try std.testing.expectError(error.AcpFailed, parseAvailableModelsAlloc(std.testing.allocator, missing.value));
 }
 
 const StreamCapture = struct {

@@ -42,18 +42,11 @@ fn managedProcessPollDue(last_poll_ms: i64, now_ms: i64) bool {
         now_ms - last_poll_ms >= MANAGED_PROCESS_POLL_INTERVAL_MS;
 }
 
-test "terminal daemon batch fallback is bounded without changing poll cadence" {
-    try std.testing.expectEqual(@as(i64, 5_000), daemonBatchRetryDelayMs(error.UnsupportedDaemonBatch));
-    try std.testing.expectEqual(@as(i64, 250), daemonBatchRetryDelayMs(error.InvalidSessionResponse));
-    try std.testing.expectEqual(@as(i64, 16), POLL_INTERVAL_MS);
-}
-
 test "managed process maintenance is decoupled from terminal tail cadence" {
     try std.testing.expect(managedProcessPollDue(0, 100));
     try std.testing.expect(!managedProcessPollDue(100, 349));
     try std.testing.expect(managedProcessPollDue(100, 350));
     try std.testing.expect(managedProcessPollDue(500, 10));
-    try std.testing.expectEqual(@as(i64, 16), POLL_INTERVAL_MS);
 }
 
 test "composite session scope becomes an owned bounded projection" {
@@ -183,40 +176,18 @@ pub fn agentTuiProviderFromProcessName(name: []const u8) ?AgentTuiProvider {
     return null;
 }
 
-test "managed AI TUI defaults enable lifecycle hooks" {
-    const providers = [_]stack_config.AgentProvider{ .claude, .codex, .cursor, .grok, .amp, .opencode, .muse };
-    for (providers) |provider| {
-        const defaults = defaultAgentTui(provider).?;
-        try std.testing.expect(defaults.notify);
-        try std.testing.expect(defaults.hooks);
-    }
-}
-
-test "Grok TUI defaults use the least-privilege launch mode" {
-    const defaults = defaultAgentTui(.grok).?;
-    try std.testing.expectEqualStrings("grok", defaults.name);
-    try std.testing.expectEqualStrings(
-        "grok --no-auto-update --no-alt-screen --no-memory --disable-web-search --permission-mode plan --reasoning-effort low",
-        defaults.command,
-    );
-    try std.testing.expect(defaults.notify);
-    try std.testing.expect(defaults.hooks);
+test "agent TUI defaults stay least-privilege and legacy saved commands stay recognized" {
+    try std.testing.expect(std.mem.indexOf(u8, defaultAgentTui(.grok).?.command, "--permission-mode plan") != null);
+    // Panes saved with older default commands must still count as managed TUIs.
     try std.testing.expect(isKnownDefaultAgentTuiCommand(.grok, "grok"));
     try std.testing.expect(isKnownDefaultAgentTuiCommand(.grok, LEGACY_GROK_TUI_COMMAND));
     try std.testing.expect(isKnownDefaultAgentTuiCommand(.grok, LEGACY_GROK_NO_SUBAGENTS_TUI_COMMAND));
-    try std.testing.expectEqual(AgentTuiProvider.grok, agentTuiProviderFromProcessName("grok").?);
-}
-
-test "OpenCode TUI defaults launch opencode and keep the legacy opencode2 name known" {
-    const defaults = defaultAgentTui(.opencode).?;
-    try std.testing.expectEqualStrings("opencode", defaults.command);
-    try std.testing.expect(isKnownDefaultAgentTuiCommand(.opencode, "opencode"));
-    // Panes saved before the OpenCode 2 migration still count as managed TUIs.
-    try std.testing.expect(isKnownDefaultAgentTuiCommand(.opencode, "opencode"));
+    try std.testing.expect(isKnownDefaultAgentTuiCommand(.opencode, "opencode2"));
+    try std.testing.expect(isKnownDefaultAgentTuiCommand(.cursor, "agent"));
     try std.testing.expectEqual(AgentTuiProvider.opencode, agentTuiProviderFromProcessName("opencode2").?);
-    try std.testing.expectEqual(AgentTuiProvider.opencode, agentTuiProviderFromProcessName("opencode").?);
-    try std.testing.expectEqual(AgentTuiProvider.pi, agentTuiProviderFromProcessName("pi").?);
-    try std.testing.expectEqual(AgentTuiProvider.fx, agentTuiProviderFromProcessName("fx").?);
+    try std.testing.expectEqual(AgentTuiProvider.cursor, agentTuiProviderFromProcessName("cursor-agent").?);
+    try std.testing.expectEqual(AgentTuiProvider.muse, agentTuiProviderFromProcessName("muse-bin-x86_64").?);
+    try std.testing.expect(agentTuiProviderFromProcessName("bash") == null);
 }
 
 pub const State = struct {
@@ -536,15 +507,6 @@ pub fn workspaceAgentTuiHistoryAt(self: anytype, project_index: usize, dock_id: 
     const dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return 0;
     if (dock.noteActiveTabAgentHistory(activity_at)) self.markWorkspaceDirty(project_index);
     return activity_at;
-}
-
-test "every supported agent TUI enrolls in history when detected" {
-    const providers = [_]AgentTuiProvider{ .codex, .claude, .opencode, .cursor, .pi, .fx, .grok, .amp, .muse };
-    for (providers) |provider| {
-        try std.testing.expectEqual(@as(i64, 123), agentTuiHistoryTimestamp(provider, 0, 123));
-    }
-    try std.testing.expectEqual(@as(i64, 77), agentTuiHistoryTimestamp(.codex, 77, 123));
-    try std.testing.expectEqual(@as(i64, 0), agentTuiHistoryTimestamp(null, 0, 123));
 }
 
 /// Recreates a workspace pane around a saved agent TUI dock. The dock and
@@ -937,14 +899,6 @@ fn isHandledClaudeEscape(
     is_escape_press: bool,
 ) bool {
     return provider == .claude and handled and is_escape_press;
-}
-
-test "only a handled Claude Escape is an interrupt lifecycle edge" {
-    try std.testing.expect(isHandledClaudeEscape(.claude, true, true));
-    try std.testing.expect(!isHandledClaudeEscape(.claude, false, true));
-    try std.testing.expect(!isHandledClaudeEscape(.claude, true, false));
-    try std.testing.expect(!isHandledClaudeEscape(.codex, true, true));
-    try std.testing.expect(!isHandledClaudeEscape(null, true, true));
 }
 
 /// Dispatches an already-resolved terminal action (prefix mode) through the

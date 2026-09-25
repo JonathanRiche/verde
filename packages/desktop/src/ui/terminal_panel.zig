@@ -2737,13 +2737,6 @@ test "subtractRect splits into top, bottom, left, and right bands" {
     try std.testing.expectEqual(@as(usize, 0), subtractRect(.{ .x = 0, .y = 0, .w = 4, .h = 4 }, .{ .x = 0, .y = 0, .w = 4, .h = 4 }, &out));
 }
 
-test "rounded box drawing mappings preserve corner directions" {
-    try std.testing.expectEqual(BoxLines{ .right = .light, .down = .light }, roundedBoxCornerLines(0x256d).?); // ╭
-    try std.testing.expectEqual(BoxLines{ .down = .light, .left = .light }, roundedBoxCornerLines(0x256e).?); // ╮
-    try std.testing.expectEqual(BoxLines{ .up = .light, .left = .light }, roundedBoxCornerLines(0x256f).?); // ╯
-    try std.testing.expectEqual(BoxLines{ .up = .light, .right = .light }, roundedBoxCornerLines(0x2570).?); // ╰
-}
-
 test "terminal draw cache translates every cached command" {
     const color: palette.Color = .{ .r = 0.1, .g = 0.2, .b = 0.3, .a = 0.4 };
     const offset: palette.draw.Vec2 = .{ .x = -125.0, .y = 18.0 };

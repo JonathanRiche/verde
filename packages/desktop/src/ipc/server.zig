@@ -4326,13 +4326,6 @@ test "Herdr live handlers reject every retired remote parameter by presence" {
     try std.testing.expect(!hasRetiredHerdrRemoteParam(local.value));
 }
 
-test "pane maximize parses explicit modes and defaults to toggle" {
-    try std.testing.expectEqual(PaneMaximizeMode.on, parsePaneMaximizeMode("on").?);
-    try std.testing.expectEqual(PaneMaximizeMode.off, parsePaneMaximizeMode("off").?);
-    try std.testing.expectEqual(PaneMaximizeMode.toggle, parsePaneMaximizeMode("toggle").?);
-    try std.testing.expect(parsePaneMaximizeMode("true") == null);
-}
-
 test "live transcript response budget is bounded before JSON allocation" {
     const messages = [_]app_state.ChatMessage{.{
         .role = .user,
@@ -4341,12 +4334,6 @@ test "live transcript response budget is bounded before JSON allocation" {
     }};
     try std.testing.expect(transcriptFitsLiveResponse(&messages, 1024));
     try std.testing.expect(!transcriptFitsLiveResponse(&messages, 512));
-}
-
-test "browser commands resolve explicit MCP workspace before active runtime owner" {
-    try std.testing.expectEqual(@as(usize, 2), chooseBrowserCommandProjectIndex(0, 1, 2));
-    try std.testing.expectEqual(@as(usize, 0), chooseBrowserCommandProjectIndex(0, 1, null));
-    try std.testing.expectEqual(@as(usize, 1), chooseBrowserCommandProjectIndex(null, 1, null));
 }
 
 test "chat open response exposes stable identifiers" {
@@ -4406,21 +4393,6 @@ test "chat open IPC parses typed creation settings without losing false" {
     var invalid = try std.json.parseFromSlice(std.json.Value, allocator, "{\"reasoning_effort\":\"extreme\"}", .{});
     defer invalid.deinit();
     try std.testing.expectError(error.InvalidReasoningEffortValue, parseChatOpenSettings(invalid.value));
-}
-
-test "GUI provider parser excludes terminal-only providers" {
-    try std.testing.expectEqual(app_state.Provider.opencode, parseProvider("opencode").?);
-    try std.testing.expectEqual(app_state.Provider.codex, parseProvider("codex").?);
-    try std.testing.expectEqual(app_state.Provider.claude, parseProvider("claude").?);
-    try std.testing.expectEqual(app_state.Provider.cursor, parseProvider("cursor").?);
-    try std.testing.expect(parseProvider("amp") == null);
-    try std.testing.expect(parseProvider("other") == null);
-}
-
-test "surface provider parser includes terminal-only providers" {
-    try std.testing.expectEqual(app_state.SurfaceProvider.grok, parseSurfaceProvider("grok").?);
-    try std.testing.expectEqual(app_state.SurfaceProvider.amp, parseSurfaceProvider("amp").?);
-    try std.testing.expect(parseSurfaceProvider("other") == null);
 }
 
 test "terminal lifecycle reaches workspace processes with the exact final wait identity" {

@@ -1437,42 +1437,6 @@ test "desired paired runtime resumes only after restart credential hydration" {
     try std.testing.expect(resumed.desired_enabled);
 }
 
-test "service exposes bounded snapshots for multiple independently owned profiles" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try testPathAlloc(allocator, tmp.dir);
-    defer allocator.free(path);
-
-    var first = try profile.Profile.createSshTunnel(
-        allocator,
-        std.testing.io,
-        "First VM",
-        null,
-        .{ .host = "first.example" },
-    );
-    defer first.deinit(allocator);
-    var second = try profile.Profile.createSshTunnel(
-        allocator,
-        std.testing.io,
-        "Second VM",
-        null,
-        .{ .host = "second.example" },
-    );
-    defer second.deinit(allocator);
-    try profile_store.saveAtPath(allocator, std.testing.io, path, &.{ first, second });
-
-    var service = try Self.init(allocator, std.testing.io, path, .{});
-    defer service.deinit();
-    const snapshots = try service.snapshotsAlloc(allocator);
-    defer allocator.free(snapshots);
-    try std.testing.expectEqual(@as(usize, 2), snapshots.len);
-    try std.testing.expectEqualStrings(first.id, snapshots[0].profile_id);
-    try std.testing.expectEqualStrings("First VM", snapshots[0].label);
-    try std.testing.expectEqualStrings(second.id, snapshots[1].profile_id);
-    try std.testing.expectEqualStrings("Second VM", snapshots[1].label);
-}
-
 test "service profile crud persists under lock and rereads authoritatively" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

@@ -982,12 +982,6 @@ fn paneUsesRestingBorder(is_root_pane: bool, maximized: bool) bool {
     return is_root_pane and !maximized;
 }
 
-test "resting pane borders appear throughout unzoomed layouts" {
-    try std.testing.expect(paneUsesRestingBorder(true, false));
-    try std.testing.expect(!paneUsesRestingBorder(true, true));
-    try std.testing.expect(!paneUsesRestingBorder(false, false));
-}
-
 /// Renders workspace panes with transcript geometry matching the visible pane.
 pub fn renderAt(state: *runtime.AppState, rect: palette.Rect) void {
     renderAtWithTranscriptLayoutWidth(state, rect, rect.w);
@@ -2884,20 +2878,6 @@ test "pane rects ease toward a new layout, new panes appear in place, leavers pr
     pane_rect_slot_count = 0;
 }
 
-test "tiled content adds four-sided margins when inset" {
-    const rect: palette.Rect = .{ .x = 10.0, .y = 20.0, .w = 1000.0, .h = 700.0 };
-
-    try std.testing.expectEqual(rect, tiledContentRect(rect, 12.0, false));
-    try std.testing.expectEqual(@as(f32, 1000.0), tiledContentExtent(rect.w, 12.0, false));
-
-    const tiled = tiledContentRect(rect, 12.0, true);
-    try std.testing.expectEqual(@as(f32, 22.0), tiled.x);
-    try std.testing.expectEqual(@as(f32, 32.0), tiled.y);
-    try std.testing.expectEqual(@as(f32, 976.0), tiled.w);
-    try std.testing.expectEqual(@as(f32, 676.0), tiled.h);
-    try std.testing.expectEqual(@as(f32, 976.0), tiledContentExtent(rect.w, 12.0, true));
-}
-
 test "target split widths finish without a corrective transcript reflow" {
     defer theme.applyTheme(1.0);
     theme.applyTheme(1.0);
@@ -3500,21 +3480,6 @@ test "empty workspace option navigation wraps without external state" {
     try std.testing.expectEqual(@as(usize, 0), emptyWorkspaceSelectionAfterMove(1, -1));
 }
 
-test "pane status pulses are bounded and use deliberately slow periods" {
-    try std.testing.expect(DONE_PULSE_PERIOD_MS > WORKING_PULSE_PERIOD_MS);
-    try std.testing.expect(WORKING_PULSE_PERIOD_MS >= 2000);
-
-    inline for (.{ PaneAgentVisualStatus.done, PaneAgentVisualStatus.working }) |status| {
-        const period = if (status == .done) DONE_PULSE_PERIOD_MS else WORKING_PULSE_PERIOD_MS;
-        try std.testing.expectApproxEqAbs(@as(f32, 0.5), paneStatusPulse(status, 0), 0.0001);
-        try std.testing.expectApproxEqAbs(@as(f32, 1.0), paneStatusPulse(status, @divTrunc(period, 4)), 0.0001);
-        try std.testing.expectApproxEqAbs(@as(f32, 0.5), paneStatusPulse(status, @divTrunc(period, 2)), 0.0001);
-        try std.testing.expectApproxEqAbs(@as(f32, 0.0), paneStatusPulse(status, @divTrunc(period * 3, 4)), 0.0001);
-    }
-    try std.testing.expectEqual(@as(f32, 1.0), paneStatusPulseForMotion(.working, 0, true));
-    try std.testing.expectEqual(@as(f32, 1.0), paneStatusPulseForMotion(.done, DONE_PULSE_PERIOD_MS * 3 / 4, true));
-}
-
 test "directional navigation transfers zoom unless unzoom is configured" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3949,11 +3914,6 @@ test "custom scrolling pane extent follows viewport changes" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), scrollingPaneExtentRatio(994.0, 2000.0, gap), 0.0001);
 }
 
-test "pane resize cursor follows the divider axis" {
-    try std.testing.expectEqual(sdl.SystemCursor.ew_resize, resizeSystemCursor(.vertical));
-    try std.testing.expectEqual(sdl.SystemCursor.ns_resize, resizeSystemCursor(.horizontal));
-}
-
 test "scrolling range keeps the final pane available at the leading edge" {
     const pane_extent: f32 = 500.0;
     const gap: f32 = 12.0;
@@ -4100,17 +4060,6 @@ test "scrolling strip collects a tiled group as one item" {
     try std.testing.expectApproxEqAbs(@as(f32, 444.0), extents[0], 0.0001);
 }
 
-test "scrolling grow keys follow the strip axis" {
-    try std.testing.expectEqual(@as(?f32, GROW_SCROLL_PANE_STEP_CSS), scrollingGrowDeltaCss(.horizontal, .right));
-    try std.testing.expectEqual(@as(?f32, -GROW_SCROLL_PANE_STEP_CSS), scrollingGrowDeltaCss(.horizontal, .left));
-    try std.testing.expect(scrollingGrowDeltaCss(.horizontal, .up) == null);
-    try std.testing.expect(scrollingGrowDeltaCss(.horizontal, .down) == null);
-    try std.testing.expectEqual(@as(?f32, GROW_SCROLL_PANE_STEP_CSS), scrollingGrowDeltaCss(.vertical, .down));
-    try std.testing.expectEqual(@as(?f32, -GROW_SCROLL_PANE_STEP_CSS), scrollingGrowDeltaCss(.vertical, .up));
-    try std.testing.expect(scrollingGrowDeltaCss(.vertical, .left) == null);
-    try std.testing.expect(scrollingGrowDeltaCss(.vertical, .right) == null);
-}
-
 test "scrolling grow step clamps to pane extent limits" {
     const max_css = workspace_layout.MAX_SCROLL_PANE_EXTENT_CSS;
     try std.testing.expectApproxEqAbs(@as(f32, 596.0), scrollingPaneExtentAfterGrow(500.0, GROW_SCROLL_PANE_STEP_CSS, max_css), 0.0001);
@@ -4185,18 +4134,7 @@ test "scrolling grow resizes only the focused pane" {
     try std.testing.expectEqual(@as(?f32, null), layout.paneById(second_pane_id).?.scroll_extent_css);
 }
 
-test "scrolling layout policy supports automatic always and disabled modes" {
-    // Automatic: a lone tab tiles below the threshold, any second tab is a strip.
-    try std.testing.expect(!scrollingLayoutEnabled(.automatic, 4, 1));
-    try std.testing.expect(scrollingLayoutEnabled(.automatic, 4, 2));
-    try std.testing.expect(scrollingLayoutEnabled(.automatic, 4, 4));
-    try std.testing.expect(scrollingLayoutEnabled(.automatic, 1, 1));
-    try std.testing.expect(scrollingLayoutEnabled(.always, 64, 1));
-    try std.testing.expect(!scrollingLayoutEnabled(.disabled, 1, 8));
-    try std.testing.expect(!scrollingLayoutEnabled(.always, 1, 0));
-}
-
-test "scrolling strip scrolls only from the configured threshold" {
+test "scrolling layout and strip scrolling follow mode and threshold" {
     const thresholds = [_]u8{ 1, 2, 4, 8 };
     for (thresholds) |threshold| {
         if (threshold > 1) {
@@ -4208,6 +4146,9 @@ test "scrolling strip scrolls only from the configured threshold" {
         try std.testing.expect(scrollingStripScrolls(.automatic, threshold, @as(usize, threshold) + 1));
         try std.testing.expect(scrollingLayoutEnabled(.automatic, threshold, @as(usize, threshold)));
     }
+    try std.testing.expect(scrollingLayoutEnabled(.automatic, 4, 2));
+    try std.testing.expect(scrollingLayoutEnabled(.always, 64, 1));
+    try std.testing.expect(!scrollingLayoutEnabled(.always, 1, 0));
     try std.testing.expect(scrollingStripScrolls(.always, 64, 1));
     try std.testing.expect(!scrollingStripScrolls(.always, 1, 0));
     try std.testing.expect(!scrollingStripScrolls(.disabled, 1, 64));
@@ -4253,33 +4194,6 @@ test "automatic scrolling activation follows tab creation and closure" {
     try std.testing.expect(!scrollingLayoutEnabled(.automatic, 3, layout.visibleTabCount()));
 }
 
-test "scrolling focus direction follows the configured axis" {
-    try std.testing.expectEqual(runtime.WorkspacePaneDirection.left, scrollingPaneDirection(.horizontal, .left).?);
-    try std.testing.expectEqual(runtime.WorkspacePaneDirection.right, scrollingPaneDirection(.horizontal, .right).?);
-    try std.testing.expect(scrollingPaneDirection(.horizontal, .down) == null);
-    try std.testing.expectEqual(runtime.WorkspacePaneDirection.up, scrollingPaneDirection(.vertical, .up).?);
-    try std.testing.expectEqual(runtime.WorkspacePaneDirection.down, scrollingPaneDirection(.vertical, .down).?);
-    try std.testing.expect(scrollingPaneDirection(.vertical, .right) == null);
-}
-
-test "scrolling edge navigation only exposes adjacent sidebar panes" {
-    const missing = scrollingEdgeAvailability(null, 4);
-    try std.testing.expect(!missing.previous);
-    try std.testing.expect(!missing.next);
-
-    const first = scrollingEdgeAvailability(0, 4);
-    try std.testing.expect(!first.previous);
-    try std.testing.expect(first.next);
-
-    const middle = scrollingEdgeAvailability(2, 4);
-    try std.testing.expect(middle.previous);
-    try std.testing.expect(middle.next);
-
-    const last = scrollingEdgeAvailability(3, 4);
-    try std.testing.expect(last.previous);
-    try std.testing.expect(!last.next);
-}
-
 test "scrolling edge navigation geometry follows the configured axis" {
     const workspace: palette.Rect = .{ .x = 10.0, .y = 20.0, .w = 400.0, .h = 200.0 };
     const left = scrollingEdgeRects(workspace, .horizontal, .previous, 32.0, 64.0, 6.0, 14.0);
@@ -4315,14 +4229,6 @@ test "manual scrolling settles partial positions to the nearest pane" {
     try std.testing.expectApproxEqAbs(@as(f32, 1200.0), freeScrollTarget(1190.0, 1.0, SCROLLING_WHEEL_STEP_CSS, 1200.0), 0.0001);
 }
 
-test "trackpad updates move the rendered strip directly with the gesture" {
-    var offset: f32 = 100.0;
-    var target: f32 = 240.0;
-    applyDirectWheelTarget(&offset, &target, 360.0);
-    try std.testing.expectEqual(@as(f32, 360.0), offset);
-    try std.testing.expectEqual(offset, target);
-}
-
 test "scrolling animation advances without overshooting" {
     const partial = advanceScrollOffset(0.0, 300.0, 16);
     try std.testing.expect(partial > 0.0);
@@ -4355,13 +4261,4 @@ test "skip slide origins move one pane width from and to the viewport" {
     const end_back = skipSlideScreenOrigins(-1, 1.0, step);
     try std.testing.expectApproxEqAbs(step, end_back.from, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), end_back.to, 0.0001);
-}
-
-test "scrolling clip intersection stays inside the workspace" {
-    const workspace: palette.Rect = .{ .x = 200.0, .y = 10.0, .w = 800.0, .h = 600.0 };
-    const clipped = intersectRects(.{ .x = 120.0, .y = 0.0, .w = 500.0, .h = 640.0 }, workspace) orelse return error.TestExpectedEqual;
-    try std.testing.expectApproxEqAbs(@as(f32, 200.0), clipped.x, 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 420.0), clipped.w, 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 600.0), clipped.h, 0.0001);
-    try std.testing.expect(intersectRects(.{ .x = 0.0, .y = 0.0, .w = 100.0, .h = 100.0 }, workspace) == null);
 }

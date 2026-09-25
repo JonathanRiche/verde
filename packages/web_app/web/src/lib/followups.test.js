@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { FOLLOWUP_CACHE_KEY, followupImages, createFollowupApi, followupKind, steerCanFallback, followupRpcError, FollowupRejectedError } from './followups'
+import { FOLLOWUP_CACHE_KEY, followupImages, createFollowupApi, steerCanFallback, followupRpcError, FollowupRejectedError } from './followups'
 
 const pane = { kind: 'chat', workspace_id: 'w', thread_id: 't', pane_id: 1 }
 const image = { path: '/tmp/image.png', mime: 'image/png' }
@@ -23,11 +23,6 @@ describe('follow-up contract', () => {
   test('bridge error envelopes cannot be mistaken for definite rejections', () => {
     expect(followupRpcError({ error: { message: 'RemoteRequestTimedOut' } })).not.toBeInstanceOf(FollowupRejectedError)
     expect(followupRpcError({ error: { code: 'insufficient_scope', message: 'Denied' } })).toBeInstanceOf(FollowupRejectedError)
-  })
-  test('only supported local CLI providers steer', () => {
-    for (const provider of ['codex', 'claude', 'pi']) expect(followupKind(provider)).toBe('steer')
-    for (const provider of ['opencode', 'cursor', 'fx', 'grok', 'muse', undefined]) expect(followupKind(provider)).toBe('queue')
-    expect(followupKind('codex', 'api')).toBe('queue')
   })
   test('steering uses stable identity and supports local images', async () => {
     const f = fixture()

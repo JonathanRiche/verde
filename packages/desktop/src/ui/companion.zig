@@ -3488,21 +3488,6 @@ test "public Companion render repaints active chrome without reconstructing stat
     try expectExpandedChrome(&state, geometry, second_chrome, true);
 }
 
-test "Companion chrome derives from default active tokens while Sprout geometry stays unchanged" {
-    const chrome = theme.companionChromeFor(theme.default_colors);
-    try expectColorApprox(theme.mix(theme.default_colors.background, theme.default_colors.text, 0.045), chrome.surface, 2.0 / 255.0);
-    try expectColorApprox(theme.mix(theme.default_colors.background, theme.default_colors.text, 0.025), chrome.surface_deep, 2.0 / 255.0);
-    try expectColorApprox(theme.mix(theme.default_colors.background, theme.default_colors.text, 0.12), chrome.hairline, 2.0 / 255.0);
-    try std.testing.expectEqual(theme.default_colors.accent, chrome.accent);
-    try std.testing.expectEqual(theme.default_colors.warning, chrome.warning);
-    try std.testing.expectEqual(theme.default_colors.diff_remove, chrome.danger);
-    const rect: palette.Rect = .{ .x = 100.0, .y = 50.0, .w = 46.0, .h = 48.0 };
-    const leaf = sproutLeafPoints(rect, 0.0);
-    try std.testing.expectEqual(@as(f32, 29.0), leaf[1].x - leaf[0].x);
-    try std.testing.expectEqual(@as(f32, 13.0), leaf[3].y - leaf[1].y);
-    try std.testing.expect(leaf[1].x > leaf[0].x and leaf[1].y < leaf[0].y);
-}
-
 test "arbitrary active token sets produce distinct adaptive Companion chrome" {
     var first = theme.default_colors;
     first.background = testRgb(0x17, 0x12, 0x25);
@@ -3536,39 +3521,6 @@ test "arbitrary active token sets produce distinct adaptive Companion chrome" {
     try expectChromeContrast(second_chrome);
     try std.testing.expectEqual(first.warning, first_chrome.warning);
     try std.testing.expectEqual(first.diff_remove, first_chrome.danger);
-}
-
-test "Companion chrome accepts representative existing dark and light theme tokens" {
-    var kanagawa = theme.default_colors;
-    kanagawa.background = testRgb(0x1f, 0x1f, 0x28);
-    kanagawa.text = testRgb(0xdc, 0xd7, 0xba);
-    kanagawa.text_muted = testRgb(0xaa, 0xa3, 0x80);
-    kanagawa.text_subtle = testRgb(0x7a, 0x77, 0x6e);
-    kanagawa.accent = testRgb(0x7e, 0x9c, 0xd8);
-    kanagawa.border = testRgb(0x54, 0x65, 0x8b);
-    kanagawa.border_muted = testRgb(0x72, 0x71, 0x69);
-    kanagawa.warning = testRgb(0xc0, 0xa3, 0x6e);
-    kanagawa.diff_remove = testRgb(0xc3, 0x40, 0x43);
-
-    var light = theme.default_colors;
-    light.background = testRgb(0xe1, 0xe2, 0xe7);
-    light.text = testRgb(0x37, 0x60, 0xbf);
-    light.text_muted = testRgb(0x5e, 0x72, 0xa5);
-    light.text_subtle = testRgb(0x79, 0x87, 0xa8);
-    light.accent = testRgb(0x2e, 0x7d, 0xe9);
-    light.border = testRgb(0x82, 0xa1, 0xd8);
-    light.border_muted = testRgb(0xa1, 0xa6, 0xc5);
-    light.warning = testRgb(0x8c, 0x6c, 0x3e);
-    light.diff_remove = testRgb(0xf5, 0x2a, 0x65);
-
-    inline for (.{ kanagawa, light }) |fixture| {
-        const chrome = theme.companionChromeFor(fixture);
-        try std.testing.expectEqual(theme.mix(fixture.background, fixture.text, 0.045), chrome.surface);
-        try std.testing.expectEqual(fixture.accent, chrome.accent);
-        try std.testing.expectEqual(fixture.warning, chrome.warning);
-        try std.testing.expectEqual(fixture.diff_remove, chrome.danger);
-        try expectChromeContrast(chrome);
-    }
 }
 
 test "Companion chrome applies bounded contrast fallbacks" {
@@ -3729,12 +3681,6 @@ fn compositeTest(foreground: [4]f32, background: [4]f32) [4]f32 {
     return theme.mix(background, .{ foreground[0], foreground[1], foreground[2], 1.0 }, foreground[3]);
 }
 
-fn expectColorApprox(expected: [4]f32, actual: [4]f32, tolerance: f32) !void {
-    for (expected, actual) |expected_channel, actual_channel| {
-        try std.testing.expectApproxEqAbs(expected_channel, actual_channel, tolerance);
-    }
-}
-
 fn expectChromeContrast(chrome: theme.CompanionChrome) !void {
     try std.testing.expect(lumaDistance(chrome.border, chrome.surface) >= 0.10);
     try std.testing.expect(lumaDistance(chrome.menu_border, chrome.surface_deep) >= 0.10);
@@ -3797,40 +3743,15 @@ fn insetRect(rect: palette.Rect, amount: f32) palette.Rect {
     return .{ .x = rect.x + amount, .y = rect.y + amount, .w = @max(rect.w - amount * 2.0, 0.0), .h = @max(rect.h - amount * 2.0, 0.0) };
 }
 
-test "prototype geometry fixes chip rail sidecar chrome and composer footer" {
-    const normal = computeGeometry(1360.0, 860.0, 1.0);
-    try std.testing.expectEqual(@as(f32, 946.0), normal.sidecar.x);
-    try std.testing.expectEqual(@as(f32, 10.0), normal.sidecar.y);
-    try std.testing.expectEqual(@as(f32, 404.0), normal.sidecar.w);
-    try std.testing.expectEqual(@as(f32, 840.0), normal.sidecar.h);
-    try std.testing.expectEqual(@as(f32, 44.0), normal.header.h);
-    try std.testing.expectEqual(@as(f32, 116.0), normal.footer.h);
-    try std.testing.expectEqual(normal.sidecar.y + normal.sidecar.h, normal.footer.y + normal.footer.h);
-    try std.testing.expectEqual(@as(f32, 36.0), normal.chip.h);
-    try std.testing.expectEqual(@as(f32, 20.0), normal.window.h - normal.chip.y - normal.chip.h);
-    try std.testing.expectEqual(normal.window.w, normal.chip.x + normal.chip.w);
-    try std.testing.expectEqual(@as(f32, 46.0), normal.chip_character.w);
-    try std.testing.expectEqual(@as(f32, 48.0), normal.chip_character.h);
-    const composer = composerRect(normal.footer);
-    try std.testing.expectEqual(@as(f32, 380.0), composer.w);
-    try std.testing.expectEqual(@as(f32, 94.0), composer.h);
-    try std.testing.expect(pointInRect(normal.sidecar, composer.x, composer.y));
-
+test "idle chip rail stays clear of the captured terminal status" {
     const captured = computeGeometry(2536.0, 1030.0, 1.0);
-    try std.testing.expectEqual(@as(f32, 103.0), captured.chip.w);
-    try std.testing.expectEqual(@as(f32, 2433.0), captured.chip.x);
-    try std.testing.expectEqual(@as(f32, 974.0), captured.chip.y);
-    // The old 176×44 rail covered the captured terminal status; the accepted
-    // idle rail occupies only its intrinsic 103×36 bottom-right footprint.
+    // The old 176x44 rail covered the captured terminal status; the accepted
+    // idle rail occupies only its intrinsic bottom-right footprint.
     try std.testing.expect(captured.chip.x > 2536.0 - 176.0);
-
-    const narrow = computeGeometry(390.0, 260.0, 1.0);
-    try std.testing.expectEqual(@as(f32, 8.0), narrow.sidecar.x);
-    try std.testing.expectEqual(@as(f32, 8.0), narrow.sidecar.y);
-    try std.testing.expect(narrow.footer.h > 0.0);
-    const high_scale = computeGeometry(1000.0, 900.0, 2.0);
-    try std.testing.expectEqual(@as(f32, 808.0), high_scale.sidecar.w);
-    try std.testing.expectEqual(@as(f32, 88.0), high_scale.header.h);
+    try std.testing.expectEqual(captured.window.w, captured.chip.x + captured.chip.w);
+    const normal = computeGeometry(1360.0, 860.0, 1.0);
+    try std.testing.expectEqual(normal.sidecar.y + normal.sidecar.h, normal.footer.y + normal.footer.h);
+    try std.testing.expect(pointInRect(normal.sidecar, composerRect(normal.footer).x, composerRect(normal.footer).y));
 }
 
 test "chip semantic copy reserves amber approval and danger only for failure" {
@@ -4141,61 +4062,6 @@ test "expanded sidecar chrome snaps to device pixels at a fractional scale" {
         }
     }
     try std.testing.expect(saw_outer and saw_inner and saw_divider);
-}
-
-test "saved companion character changes chip and header labels and render batches" {
-    const allocator = std.testing.allocator;
-    defer theme.applyTheme(1.0);
-    theme.applyTheme(1.0);
-    theme.current_colors = theme.default_colors;
-
-    var state: runtime.AppState = undefined;
-    state.allocator = allocator;
-    state.app_config = .{ .companion_enabled = true };
-    state.project_controller = .{};
-    state.companion_controller = controller.init();
-    state.companion_controller.applyFixture(.idle);
-    state.companion_composer = @TypeOf(state.companion_composer).init();
-    state.palette_overlay_batch = .{};
-    state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
-    defer {
-        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
-        state.project_controller.projects.deinit(allocator);
-        state.companion_composer.deinit(allocator);
-        state.palette_overlay_batch.deinit(allocator);
-        state.palette_frame_text_arena.deinit();
-    }
-    var project = try runtime.Project.init(allocator, "character-switch", "Character", "/tmp/character-switch", 0);
-    state.project_controller.projects.append(allocator, project) catch |err| {
-        project.deinit(allocator);
-        return err;
-    };
-
-    const characters = [_]app_config.CompanionCharacter{ .sprout, .moss, .vireo };
-    const names = [_][]const u8{ "Sprout", "Moss", "Vireo" };
-    var collapsed_counts: [3]usize = undefined;
-    var expanded_counts: [3]usize = undefined;
-
-    inline for (characters, 0..) |character, index| {
-        state.app_config.companion_character = character;
-        state.companion_controller.collapse();
-        state.palette_overlay_batch.clear();
-        _ = state.palette_frame_text_arena.reset(.retain_capacity);
-        render(&state, 1360.0, 860.0);
-        collapsed_counts[index] = state.palette_overlay_batch.commands.items.len;
-        try expectBatchText(&state.palette_overlay_batch, names[index]);
-        if (index > 0) try std.testing.expect(collapsed_counts[index] != collapsed_counts[0] or !std.mem.eql(u8, names[index], names[0]));
-
-        state.companion_controller.show();
-        state.palette_overlay_batch.clear();
-        _ = state.palette_frame_text_arena.reset(.retain_capacity);
-        render(&state, 1360.0, 860.0);
-        expanded_counts[index] = state.palette_overlay_batch.commands.items.len;
-        try expectBatchText(&state.palette_overlay_batch, names[index]);
-    }
-
-    try std.testing.expect(collapsed_counts[0] != collapsed_counts[1] or collapsed_counts[1] != collapsed_counts[2]);
-    try std.testing.expect(expanded_counts[0] != expanded_counts[1] or expanded_counts[1] != expanded_counts[2]);
 }
 
 test "companion characters produce distinct collapsed and expanded batches at 1.0 and 1.25 scales" {

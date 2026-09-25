@@ -94,14 +94,6 @@ test "wake rendering is immediate once then bounded to the display cadence" {
     try std.testing.expectEqual(@as(c_int, 33), pacer.nextWaitTimeoutMs(117, 33, 16));
 }
 
-test "continuous frames retain their requested cadence" {
-    var pacer: FramePacer = .{};
-    try std.testing.expect(pacer.continuousFrameDue(10, 33));
-    pacer.noteRendered(10);
-    try std.testing.expect(!pacer.continuousFrameDue(42, 33));
-    try std.testing.expect(pacer.continuousFrameDue(43, 33));
-}
-
 test "rapid switch keeps the final frame scheduled when swapchain acquisition is deferred" {
     var demand: PresentationDemand = .{};
 

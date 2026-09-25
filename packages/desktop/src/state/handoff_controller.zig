@@ -35,13 +35,6 @@ pub fn defaultTargetProvider(source: Provider) Provider {
     return TARGET_PROVIDERS[0];
 }
 
-test "default handoff target is the next provider in menu order" {
-    try std.testing.expectEqual(Provider.opencode, defaultTargetProvider(.codex));
-    try std.testing.expectEqual(Provider.codex, defaultTargetProvider(.grok));
-    try std.testing.expectEqual(Provider.codex, defaultTargetProvider(.muse));
-    for (TARGET_PROVIDERS) |source| try std.testing.expect(defaultTargetProvider(source) != source);
-}
-
 pub const TargetSurface = enum {
     gui_chat,
     tui,

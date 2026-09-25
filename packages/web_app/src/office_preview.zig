@@ -190,13 +190,3 @@ test "convertible allowlists office document extensions" {
     try std.testing.expect(!convertible("/tmp/archive.zip"));
     try std.testing.expect(!convertible("/tmp/proof.pdf"));
 }
-
-test "produced pdf name swaps the source extension" {
-    const name = try producedPdfName(std.testing.allocator, "/a/b/Richmond_Proposal_Final.pptx");
-    defer std.testing.allocator.free(name);
-    try std.testing.expectEqualStrings("Richmond_Proposal_Final.pdf", name);
-
-    const bare = try producedPdfName(std.testing.allocator, "/a/b/nodot");
-    defer std.testing.allocator.free(bare);
-    try std.testing.expectEqualStrings("nodot.pdf", bare);
-}

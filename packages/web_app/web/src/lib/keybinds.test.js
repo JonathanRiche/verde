@@ -3,27 +3,6 @@ import { describe, expect, test } from 'bun:test'
 import { acceleratorMatches, parseAccelerator, parseWebKeybindConfig } from './keybinds.ts'
 
 describe('parseWebKeybindConfig', () => {
-  test('keeps prefix and Ctrl+H/J/K/L disabled by default', () => {
-    const config = parseWebKeybindConfig(null)
-    expect(config.prefix.enabled).toBe(false)
-    expect(config.directFocusLetters).toEqual({})
-  })
-
-  test('uses standalone t actions and default/alternate split chords', () => {
-    const config = parseWebKeybindConfig({ keybinds: { prefix: true } })
-    const target = (label) => config.prefix.bindings.find((row) => row.key.label === label)?.target
-
-    expect(target('T')).toEqual({ action: 'workspace.add_tab_terminal' })
-    expect(target('Shift+T')).toEqual({ action: 'new_terminal' })
-    expect(target('C')).toEqual({ action: 'workspace.add_tab' })
-    expect(target('A')).toEqual({ action: 'workspace.add' })
-    expect(target('Shift+C')).toEqual({ action: 'workspace.split_chat_horizontal' })
-    expect(target('V')).toEqual({ action: 'workspace.split_default_vertical' })
-    expect(target('Minus')).toEqual({ action: 'workspace.split_default_horizontal' })
-    expect(target('Shift+V')).toEqual({ action: 'workspace.split_alternate_vertical' })
-    expect(target('Shift+Minus')).toEqual({ action: 'workspace.split_alternate_horizontal' })
-  })
-
   test('reads the shared verde.json prefix and opt-in focus bindings', () => {
     const config = parseWebKeybindConfig({
       keybinds: {

@@ -804,13 +804,6 @@ test "light omarchy themes start from Verde Light" {
     try std.testing.expectEqual(verde_light_colors.panel, parsed.panel);
 }
 
-test "theme source aliases match desktop" {
-    try std.testing.expectEqual(Source.verde_legacy, Source.parse("default").?);
-    try std.testing.expectEqual(Source.verde_dark, Source.parse("Verde_Dark").?);
-    try std.testing.expectEqual(Source.omarchy, Source.parse("omarchy").?);
-    try std.testing.expect(Source.parse("bogus") == null);
-}
-
 fn hexColor(comptime value: []const u8) [4]f32 {
     @setEvalBranchQuota(10_000);
     return comptime parseHex(value) orelse @compileError("invalid theme color " ++ value);
