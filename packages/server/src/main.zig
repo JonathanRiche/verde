@@ -1193,6 +1193,12 @@ fn printHelp(io: std.Io) !void {
         \\
         \\All paths passed to services are absolute. Pair/device operations delegate
         \\to the owner-only daemon transport. Raw tokens are never accepted in argv.
+        \\Pair create accepts repeated --scope SCOPE options (an explicit grant set).
+        \\Default scopes: runtime:read, chat:read, chat:write, terminal:read,
+        \\terminal:write, repository:read, repository:write, device:read.
+        \\Opt-in scopes: process:read, process:write, device:write.
+        \\Existing grants and devices keep their stored scopes; new scopes are not
+        \\added automatically. Device list shows granted scopes; revoke removes access.
         \\The production gateway port defaults to 7420. `serve --tailscale`
         \\keeps verde-web on loopback, installs the user service, and configures
         \\only the requested unoccupied Tailscale HTTPS listener. It never replaces

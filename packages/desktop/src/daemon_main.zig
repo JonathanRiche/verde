@@ -1713,7 +1713,11 @@ fn printHelp(io: std.Io, stderr: bool) !void {
         \\Workspace commands require a running daemon; binding requires an existing checkout.
         \\Pair/device commands require a running daemon. A created pairing token is
         \\printed exactly once; store it as a secret. Omitting --scope grants the
-        \\documented single-user default scope set. Expiry accepts s, m, or h (max 1h).
+        \\single-user default: runtime:read, chat:read, chat:write, terminal:read,
+        \\terminal:write, repository:read, repository:write, device:read.
+        \\Opt-in only: process:read, process:write, device:write. Explicit --scope
+        \\options replace the default set. Existing grants/devices keep stored scopes.
+        \\Expiry accepts s, m, or h (max 1h).
         \\Repository bind options: --vcs-identity URL, --default-branch NAME,
         \\--default, --data-dir PATH, and --json. No checkout data is modified.
         \\Connect login imports a token from an owner-only file; credentials are

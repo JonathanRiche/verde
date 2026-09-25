@@ -94,6 +94,7 @@ pub const Secret = struct {
 };
 
 /// Stable authorization scopes enforced independently for every daemon RPC.
+/// Tag order is the durable scope-mask bit order: append new scopes only.
 pub const Scope = enum {
     runtime_read,
     chat_read,
@@ -103,6 +104,9 @@ pub const Scope = enum {
     repository_read,
     repository_write,
     device_read,
+    process_read,
+    process_write,
+    device_write,
 
     pub fn wireName(self: Scope) []const u8 {
         return switch (self) {
@@ -114,10 +118,24 @@ pub const Scope = enum {
             .repository_read => "repository:read",
             .repository_write => "repository:write",
             .device_read => "device:read",
+            .process_read => "process:read",
+            .process_write => "process:write",
+            .device_write => "device:write",
         };
     }
 };
 
+/// Every scope an administrator may grant, in durable bit order.
+pub const ALL_SCOPE_NAMES = names: {
+    const tags = std.meta.tags(Scope);
+    var names: [tags.len][]const u8 = undefined;
+    for (tags, 0..) |scope, index| names[index] = scope.wireName();
+    break :names names;
+};
+
+/// Single-user default grant. Process control and device writes are opt-in:
+/// they are never added to this set, so existing and default grants keep the
+/// authority they were issued with.
 pub const DEFAULT_SCOPE_NAMES = [_][]const u8{
     Scope.runtime_read.wireName(),
     Scope.chat_read.wireName(),
@@ -201,90 +219,129 @@ pub fn webSocketBootstrapScopeMask() u16 {
     return SNAPSHOT_READ_MASK;
 }
 
-/// Return the exact scope mask required to forward one runtime RPC through a
-/// paired session. Unknown and owner-only methods return null and therefore
-/// fail closed. This is the single policy used by HTTP and WebSocket paths.
-pub fn requiredScopeMaskForRpc(method: []const u8) ?u16 {
-    if (std.mem.eql(u8, method, "core.snapshot") or
-        std.mem.eql(u8, method, "core.changes")) return SNAPSHOT_READ_MASK;
+/// One paired-session RPC and the exact scope mask it requires.
+pub const PairedRpcMethod = struct {
+    method: []const u8,
+    scope_mask: u16,
+};
 
-    if (std.mem.eql(u8, method, "core.status") or
-        std.mem.eql(u8, method, "core.capabilities") or
-        std.mem.eql(u8, method, "status") or
-        std.mem.eql(u8, method, "provider.models.list") or
-        std.mem.eql(u8, method, "provider.slash.list") or
-        std.mem.eql(u8, method, "providers.status") or
-        std.mem.eql(u8, method, "daemon.storeStatus")) return scopeBit(.runtime_read);
+const RUNTIME_READ: u16 = scopeBit(.runtime_read);
+const CHAT_READ: u16 = scopeBit(.chat_read);
+const CHAT_WRITE: u16 = scopeBit(.chat_write);
+const TERMINAL_READ: u16 = scopeBit(.terminal_read);
+const TERMINAL_WRITE: u16 = scopeBit(.terminal_write);
+const REPOSITORY_READ: u16 = scopeBit(.repository_read);
+const REPOSITORY_WRITE: u16 = scopeBit(.repository_write);
+const PROCESS_READ: u16 = scopeBit(.process_read);
+const PROCESS_WRITE: u16 = scopeBit(.process_write);
 
-    if (std.mem.eql(u8, method, "chat.thread.get") or
-        std.mem.eql(u8, method, "chat.thread.list") or
-        std.mem.eql(u8, method, "chat.message.list") or
-        std.mem.eql(u8, method, "chat.links.list") or
-        std.mem.eql(u8, method, "chat.tasks.get") or
-        std.mem.eql(u8, method, "chat.tasks.watch") or
-        std.mem.eql(u8, method, "chat.turn.list") or
-        std.mem.eql(u8, method, "chat.turn.tail")) return scopeBit(.chat_read);
+/// The complete paired-session allowlist. Every entry must be dispatched by
+/// the runtime daemon. Desktop-only workspace.create/rename/close,
+/// chat.open_subagent and terminal.open/tail/screen/write/key are intentionally
+/// excluded: they need the desktop app. Mobile uses workspace.upsert,
+/// chat.thread.* and session.* instead; GUI-only lifecycle gaps need new RPCs.
+pub const PAIRED_RPC_METHODS = [_]PairedRpcMethod{
+    .{ .method = "core.snapshot", .scope_mask = SNAPSHOT_READ_MASK },
+    .{ .method = "core.changes", .scope_mask = SNAPSHOT_READ_MASK },
+
+    .{ .method = "core.status", .scope_mask = RUNTIME_READ },
+    .{ .method = "core.capabilities", .scope_mask = RUNTIME_READ },
+    .{ .method = "status", .scope_mask = RUNTIME_READ },
+    .{ .method = "provider.models.list", .scope_mask = RUNTIME_READ },
+    .{ .method = "provider.slash.list", .scope_mask = RUNTIME_READ },
+    .{ .method = "providers.status", .scope_mask = RUNTIME_READ },
+    .{ .method = "daemon.storeStatus", .scope_mask = RUNTIME_READ },
+    // The gateway intercepts registration and answers with its own bounded,
+    // non-persistent identity; caller params are never forwarded.
+    .{ .method = "daemon.client.register", .scope_mask = RUNTIME_READ },
+
+    .{ .method = "chat.thread.get", .scope_mask = CHAT_READ },
+    .{ .method = "chat.thread.list", .scope_mask = CHAT_READ },
+    .{ .method = "chat.message.list", .scope_mask = CHAT_READ },
+    .{ .method = "chat.links.list", .scope_mask = CHAT_READ },
+    .{ .method = "chat.tasks.get", .scope_mask = CHAT_READ },
+    .{ .method = "chat.tasks.watch", .scope_mask = CHAT_READ },
+    .{ .method = "chat.turn.list", .scope_mask = CHAT_READ },
+    .{ .method = "chat.turn.tail", .scope_mask = CHAT_READ },
+    .{ .method = "provider.threads.list", .scope_mask = CHAT_READ },
 
     // Composer shell mode appends to the transcript and executes arbitrary
     // commands, so it needs both chat and terminal write authority.
-    if (std.mem.eql(u8, method, "chat.shell.run")) return scopeBit(.chat_write) | scopeBit(.terminal_write);
+    .{ .method = "chat.shell.run", .scope_mask = CHAT_WRITE | TERMINAL_WRITE },
 
     // Staged attachment uploads share the chat-write authority of the turn
     // that will claim them. Named through the protocol constants so the
     // advertised chat.attachments.v1 capability and this allowlist cannot
     // drift apart silently (see the protocol.zig reachability test).
-    if (std.mem.eql(u8, method, "chat.links.create") or
-        std.mem.eql(u8, method, "chat.links.clear") or
-        std.mem.eql(u8, method, "chat.tasks.blocked") or
-        std.mem.eql(u8, method, "chat.turn.start") or
-        std.mem.eql(u8, method, "provider.slash.run") or
-        std.mem.eql(u8, method, attachment_protocol.METHOD_CHAT_ATTACHMENT_CREATE) or
-        std.mem.eql(u8, method, attachment_protocol.METHOD_CHAT_ATTACHMENT_APPEND) or
-        std.mem.eql(u8, method, attachment_protocol.METHOD_CHAT_ATTACHMENT_COMMIT) or
-        std.mem.eql(u8, method, "chat.turn.approve") or
-        std.mem.eql(u8, method, "chat.turn.steer") or
-        std.mem.eql(u8, method, "chat.followup") or
-        std.mem.eql(u8, method, "chat.turn.cancel") or
-        std.mem.eql(u8, method, "chat.turn.consume") or
-        std.mem.eql(u8, method, "chat.turn.record") or
-        std.mem.eql(u8, method, "chat.thread.upsert") or
-        std.mem.eql(u8, method, "chat.thread.close") or
-        std.mem.eql(u8, method, "chat.thread.move") or
-        std.mem.eql(u8, method, "chat.thread.archive.set") or
-        std.mem.eql(u8, method, "provider.thread.sync") or
-        std.mem.eql(u8, method, "chat.draft.set") or
-        std.mem.eql(u8, method, "chat.message.append") or
-        std.mem.eql(u8, method, "surface.upsert") or
-        std.mem.eql(u8, method, "surface.clear") or
-        std.mem.eql(u8, method, "notification.chatCompletion.upsert") or
-        std.mem.eql(u8, method, "notification.chatCompletion.clear")) return scopeBit(.chat_write);
+    .{ .method = "chat.links.create", .scope_mask = CHAT_WRITE },
+    .{ .method = "chat.links.clear", .scope_mask = CHAT_WRITE },
+    .{ .method = "chat.tasks.blocked", .scope_mask = CHAT_WRITE },
+    .{ .method = "chat.turn.start", .scope_mask = CHAT_WRITE },
+    .{ .method = "provider.slash.run", .scope_mask = CHAT_WRITE },
+    .{ .method = attachment_protocol.METHOD_CHAT_ATTACHMENT_CREATE, .scope_mask = CHAT_WRITE },
+    .{ .method = attachment_protocol.METHOD_CHAT_ATTACHMENT_APPEND, .scope_mask = CHAT_WRITE },
+    .{ .method = attachment_protocol.METHOD_CHAT_ATTACHMENT_COMMIT, .scope_mask = CHAT_WRITE },
+    .{ .method = "chat.turn.approve", .scope_mask = CHAT_WRITE },
+    .{ .method = "chat.turn.steer", .scope_mask = CHAT_WRITE },
+    .{ .method = "chat.followup", .scope_mask = CHAT_WRITE },
+    .{ .method = "chat.turn.cancel", .scope_mask = CHAT_WRITE },
+    .{ .method = "chat.turn.consume", .scope_mask = CHAT_WRITE },
+    .{ .method = "chat.turn.record", .scope_mask = CHAT_WRITE },
+    .{ .method = "chat.thread.upsert", .scope_mask = CHAT_WRITE },
+    .{ .method = "chat.thread.close", .scope_mask = CHAT_WRITE },
+    .{ .method = "chat.thread.move", .scope_mask = CHAT_WRITE },
+    .{ .method = "chat.thread.archive.set", .scope_mask = CHAT_WRITE },
+    .{ .method = "provider.thread.sync", .scope_mask = CHAT_WRITE },
+    .{ .method = "provider.title.generate", .scope_mask = CHAT_WRITE },
+    .{ .method = "chat.draft.set", .scope_mask = CHAT_WRITE },
+    .{ .method = "chat.message.append", .scope_mask = CHAT_WRITE },
+    .{ .method = "surface.upsert", .scope_mask = CHAT_WRITE },
+    .{ .method = "surface.clear", .scope_mask = CHAT_WRITE },
+    .{ .method = "notification.chatCompletion.upsert", .scope_mask = CHAT_WRITE },
+    .{ .method = "notification.chatCompletion.clear", .scope_mask = CHAT_WRITE },
 
-    if (std.mem.eql(u8, method, "session.list") or
-        std.mem.eql(u8, method, "session.inspect") or
-        std.mem.eql(u8, method, "session.tail") or
-        std.mem.eql(u8, method, "session.tail.batch") or
-        std.mem.eql(u8, method, "session.screen")) return scopeBit(.terminal_read);
+    .{ .method = "session.list", .scope_mask = TERMINAL_READ },
+    .{ .method = "session.inspect", .scope_mask = TERMINAL_READ },
+    .{ .method = "session.tail", .scope_mask = TERMINAL_READ },
+    .{ .method = "session.tail.batch", .scope_mask = TERMINAL_READ },
+    .{ .method = "session.screen", .scope_mask = TERMINAL_READ },
 
-    if (std.mem.eql(u8, method, "session.create") or
-        std.mem.eql(u8, method, "session.attach") or
-        std.mem.eql(u8, method, "session.detach") or
-        std.mem.eql(u8, method, "session.write") or
-        std.mem.eql(u8, method, "session.resize") or
-        std.mem.eql(u8, method, "session.kill") or
-        std.mem.eql(u8, method, "session.cleanup")) return scopeBit(.terminal_write);
+    .{ .method = "session.create", .scope_mask = TERMINAL_WRITE },
+    .{ .method = "session.attach", .scope_mask = TERMINAL_WRITE },
+    .{ .method = "session.detach", .scope_mask = TERMINAL_WRITE },
+    .{ .method = "session.write", .scope_mask = TERMINAL_WRITE },
+    .{ .method = "session.resize", .scope_mask = TERMINAL_WRITE },
+    .{ .method = "session.kill", .scope_mask = TERMINAL_WRITE },
+    .{ .method = "session.cleanup", .scope_mask = TERMINAL_WRITE },
 
-    if (std.mem.eql(u8, method, "workspace.resolve") or
-        std.mem.eql(u8, method, "workspace.list") or
-        std.mem.eql(u8, method, "workspace.repository.manifest.get") or
-        std.mem.eql(u8, method, "workspace.files.search")) return scopeBit(.repository_read);
+    .{ .method = "workspace.resolve", .scope_mask = REPOSITORY_READ },
+    .{ .method = "workspace.list", .scope_mask = REPOSITORY_READ },
+    .{ .method = "workspace.repository.manifest.get", .scope_mask = REPOSITORY_READ },
+    .{ .method = "workspace.files.search", .scope_mask = REPOSITORY_READ },
 
-    if (std.mem.eql(u8, method, "workspace.upsert") or
-        std.mem.eql(u8, method, "workspace.repository.upsert") or
-        std.mem.eql(u8, method, "workspace.repository.remove") or
-        std.mem.eql(u8, method, "workspace.repository.default.set") or
-        std.mem.eql(u8, method, "workspace.repository.binding.upsert") or
-        std.mem.eql(u8, method, "workspace.repository.binding.remove")) return scopeBit(.repository_write);
+    .{ .method = "workspace.upsert", .scope_mask = REPOSITORY_WRITE },
+    .{ .method = "workspace.repository.upsert", .scope_mask = REPOSITORY_WRITE },
+    .{ .method = "workspace.repository.remove", .scope_mask = REPOSITORY_WRITE },
+    .{ .method = "workspace.repository.default.set", .scope_mask = REPOSITORY_WRITE },
+    .{ .method = "workspace.repository.binding.upsert", .scope_mask = REPOSITORY_WRITE },
+    .{ .method = "workspace.repository.binding.remove", .scope_mask = REPOSITORY_WRITE },
 
+    // Managed processes run arbitrary project commands, so they sit behind
+    // their own opt-in scopes rather than terminal or repository authority.
+    .{ .method = "process.list", .scope_mask = PROCESS_READ },
+    .{ .method = "process.definitions", .scope_mask = PROCESS_READ },
+    .{ .method = "process.start", .scope_mask = PROCESS_WRITE },
+    .{ .method = "process.restart", .scope_mask = PROCESS_WRITE },
+    .{ .method = "process.stop", .scope_mask = PROCESS_WRITE },
+};
+
+/// Return the exact scope mask required to forward one runtime RPC through a
+/// paired session. Unknown and owner-only methods return null and therefore
+/// fail closed. This is the single policy used by HTTP and WebSocket paths.
+pub fn requiredScopeMaskForRpc(method: []const u8) ?u16 {
+    for (PAIRED_RPC_METHODS) |entry| {
+        if (std.mem.eql(u8, method, entry.method)) return entry.scope_mask;
+    }
     return null;
 }
 
@@ -712,7 +769,6 @@ test "paired RPC scope policy is exact and fails closed" {
         requiredScopeMaskForRpc("core.snapshot").?,
     );
     try std.testing.expect(requiredScopeMaskForRpc("daemon.stop") == null);
-    try std.testing.expect(requiredScopeMaskForRpc("process.start") == null);
     try std.testing.expect(requiredScopeMaskForRpc("future.method") == null);
     try std.testing.expect(requiredScopeMaskForRpc(METHOD_DAEMON_DEVICE_AUTHORIZE) == null);
 }
@@ -726,4 +782,41 @@ test "composer shell commands require chat and terminal write authority" {
     try std.testing.expect(scopeMaskContains(required, scopeBit(.chat_write)));
     try std.testing.expect(scopeMaskContains(required, scopeBit(.terminal_write)));
     try std.testing.expect(scopeMaskContains(try scopeMask(&DEFAULT_SCOPE_NAMES), required));
+}
+
+test "new access scopes are opt-in and preserve stored scope bits" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqual(@as(u16, 0xff), try scopeMask(&DEFAULT_SCOPE_NAMES));
+    const stored = try scopeNamesAlloc(allocator, 0xff);
+    defer allocator.free(stored);
+    try std.testing.expectEqualSlices([]const u8, &DEFAULT_SCOPE_NAMES, stored);
+    try validateScopeNames(&ALL_SCOPE_NAMES);
+    inline for (.{ Scope.process_read, Scope.process_write, Scope.device_write }, 8..) |scope, bit| {
+        try std.testing.expectEqual(@as(u16, 1) << bit, scopeBit(scope));
+        try std.testing.expectEqual(scope, try parseScope(scope.wireName()));
+        const names = try scopeNamesAlloc(allocator, scopeBit(scope));
+        defer allocator.free(names);
+        try std.testing.expectEqualStrings(scope.wireName(), names[0]);
+        try std.testing.expect(!scopeMaskContains(0xff, scopeBit(scope)));
+    }
+}
+
+test "P2 daemon RPC mappings require their exact scopes and desktop methods stay excluded" {
+    const cases = .{
+        .{ "provider.threads.list", Scope.chat_read },
+        .{ "provider.title.generate", Scope.chat_write },
+        .{ "process.list", Scope.process_read },
+        .{ "process.definitions", Scope.process_read },
+        .{ "process.start", Scope.process_write },
+        .{ "process.restart", Scope.process_write },
+        .{ "process.stop", Scope.process_write },
+        .{ "daemon.client.register", Scope.runtime_read },
+    };
+    inline for (cases) |case| try std.testing.expectEqual(scopeBit(case[1]), requiredScopeMaskForRpc(case[0]).?);
+    for ([_][]const u8{
+        "workspace.create", "workspace.rename",   "workspace.close", "chat.open_subagent",
+        "terminal.open",    "terminal.tail",      "terminal.screen", "terminal.write",
+        "terminal.key",     "workspaces",         "panes",           "chat.status",
+        "config.ui.set",    "web.directory.list",
+    }) |method| try std.testing.expect(requiredScopeMaskForRpc(method) == null);
 }

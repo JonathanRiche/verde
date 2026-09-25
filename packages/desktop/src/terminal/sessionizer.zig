@@ -21909,3 +21909,39 @@ test "answer-ready is durable and consumable while the provider worker still dra
     try std.testing.expectEqual(revision, turn.committed_store_revision.?);
     try std.testing.expectEqualStrings("Finished answer", turn.result_reply_text.?);
 }
+
+test "P2 paired RPC additions reach the session daemon dispatcher" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    const methods = [_][]const u8{
+        "provider.threads.list", "provider.title.generate",
+        "process.list",          "process.definitions",
+        "process.start",         "process.restart",
+        "process.stop",          "daemon.client.register",
+    };
+    for (methods) |method| {
+        try std.testing.expect(headless.access_protocol.requiredScopeMaskForRpc(method) != null);
+        // Invalid method-specific params exercise dispatch without providers,
+        // processes, filesystem discovery, or persistent user state.
+        const request = try std.json.Stringify.valueAlloc(allocator, .{
+            .id = 42,
+            .method = method,
+            .params = .{},
+        }, .{});
+        defer allocator.free(request);
+        const response = try handleSessionizerRequestBytes(&daemon, request);
+        defer allocator.free(response);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+        defer parsed.deinit();
+        if (parsed.value.object.get("error")) |err| {
+            const code = err.object.get("code").?.string;
+            try std.testing.expect(!std.mem.eql(u8, code, "method_not_found"));
+            try std.testing.expect(!std.mem.eql(u8, code, "unknown_method"));
+            try std.testing.expect(!std.mem.eql(u8, code, "internal_error"));
+        } else {
+            try std.testing.expectEqualStrings("daemon.client.register", method);
+            try std.testing.expect(parsed.value.object.get("result").?.object.contains("client_id"));
+        }
+    }
+}

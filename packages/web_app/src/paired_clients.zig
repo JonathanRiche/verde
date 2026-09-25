@@ -38,11 +38,14 @@ pub const Manager = struct {
         std.crypto.hash.sha2.Sha256.hash(target_json, &target_digest, .{});
         const register = std.mem.eql(u8, method, "daemon.client.register");
         const writes = access.scopeBit(.chat_write) | access.scopeBit(.repository_write);
+        const process_write = (access.requiredScopeMaskForRpc(method) orelse 0) & access.scopeBit(.process_write) != 0;
         // Extra params on a read must not turn read authority into registration.
-        if (!register and (access.requiredScopeMaskForRpc(method) orelse 0) & writes == 0) return (try daemon.callRaw(raw)).json;
+        if (!register and !process_write and (access.requiredScopeMaskForRpc(method) orelse 0) & writes == 0) return (try daemon.callRaw(raw)).json;
         const params = root.getPtr("params");
         const mutation = if (params) |value| if (value.* == .object) value.object.getPtr("mutation") else null else null;
-        if (!register and (mutation == null or mutation.?.* != .object)) return (try daemon.callRaw(raw)).json;
+        // Process ownership lives at params.client_id, not params.mutation.
+        if (process_write and (params == null or params.?.* != .object)) return (try daemon.callRaw(raw)).json;
+        if (!register and !process_write and (mutation == null or mutation.?.* != .object)) return (try daemon.callRaw(raw)).json;
 
         try self.mutex.lock(io);
         defer self.mutex.unlock(io);
@@ -94,7 +97,11 @@ pub const Manager = struct {
             .id = root.get("id") orelse .null,
             .result = .{ .client_id = client_id, .persistent = false },
         }, .{});
-        try mutation.?.object.put(parsed.arena.allocator(), "client_id", .{ .string = client_id });
+        if (process_write) {
+            try params.?.object.put(parsed.arena.allocator(), "client_id", .{ .string = client_id });
+        } else {
+            try mutation.?.object.put(parsed.arena.allocator(), "client_id", .{ .string = client_id });
+        }
         const encoded = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
         defer allocator.free(encoded);
         return (try daemon.callRaw(encoded)).json;

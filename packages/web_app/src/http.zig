@@ -2081,15 +2081,6 @@ const PairedRpcPolicy = union(enum) {
 
 fn pairedRpcPolicy(method: []const u8, scope_mask: u16) PairedRpcPolicy {
     if (blockedRpcMethod(method)) return .forbidden;
-    // Registration is intercepted below, never forwarded with browser params.
-    // Permit either store-writing scope; all actual writes retain their own gate.
-    if (std.mem.eql(u8, method, "daemon.client.register")) {
-        inline for (.{ .chat_write, .repository_write }) |scope| {
-            const mask = headless.access_protocol.scopeBit(scope);
-            if (headless.access_protocol.scopeMaskContains(scope_mask, mask)) return .{ .authorize = mask };
-        }
-        return .insufficient_scope;
-    }
     const required_mask = headless.access_protocol.requiredScopeMaskForRpc(method) orelse return .forbidden;
     if (!headless.access_protocol.scopeMaskContains(scope_mask, required_mask)) return .insufficient_scope;
     return .{ .authorize = required_mask };
@@ -3604,9 +3595,72 @@ test "history mutation and gateway registration preserve paired scope boundaries
     const write = access.scopeBit(.chat_write);
     try std.testing.expectEqual(pairedRpcPolicy("chat.thread.upsert", write), pairedRpcPolicy("chat.thread.archive.set", write));
     try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy("chat.thread.archive.set", access.scopeBit(.chat_read)));
-    try std.testing.expectEqual(PairedRpcPolicy{ .authorize = write }, pairedRpcPolicy("daemon.client.register", write));
+    try std.testing.expectEqual(PairedRpcPolicy{ .authorize = access.scopeBit(.runtime_read) }, pairedRpcPolicy("daemon.client.register", access.scopeBit(.runtime_read)));
     try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy("daemon.client.register", access.scopeBit(.chat_read)));
     try std.testing.expectEqual(PairedRpcPolicy.forbidden, pairedRpcPolicy("daemon.client.close", 0xffff));
     // Store metadata belongs to the local daemon, just like upsert.
     try std.testing.expectEqual(@import("web_runtime").allowedMethod("chat.thread.upsert"), @import("web_runtime").allowedMethod("chat.thread.archive.set"));
+}
+
+test "paired gateway dispatches every allowlisted RPC and binds process ownership" {
+    const access = headless.access_protocol;
+    const FakeDaemon = struct {
+        calls: usize = 0,
+        pub fn callRaw(self: *@This(), raw: []const u8) !daemon_mod.CallResult {
+            self.calls += 1;
+            var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+            defer parsed.deinit();
+            if (std.mem.eql(u8, parsed.value.object.get("method").?.string, "daemon.client.register")) {
+                const params = parsed.value.object.get("params").?.object;
+                try std.testing.expect(!params.get("persistent").?.bool);
+                try std.testing.expect(!params.contains("client_id"));
+                return .{ .json = try std.testing.allocator.dupe(u8,
+                    \\{"result":{"client_id":"paired-client"}}
+                ) };
+            }
+            return .{ .json = try std.testing.allocator.dupe(u8, raw) };
+        }
+    };
+    const allocator = std.testing.allocator;
+    var daemon: FakeDaemon = .{};
+    var manager: @import("paired_clients.zig").Manager = .{};
+    const default_mask = try access.scopeMask(&access.DEFAULT_SCOPE_NAMES);
+    for (access.PAIRED_RPC_METHODS) |entry| {
+        try std.testing.expectEqual(PairedRpcPolicy{ .authorize = entry.scope_mask }, pairedRpcPolicy(entry.method, entry.scope_mask));
+        try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy(entry.method, 0));
+        if (entry.scope_mask & (access.scopeBit(.process_read) | access.scopeBit(.process_write)) != 0) {
+            try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy(entry.method, default_mask));
+        }
+        const raw = try std.json.Stringify.valueAlloc(allocator, .{
+            .id = 42,
+            .method = entry.method,
+            .target = .{ .runtime_id = "a" ** 32, .instance_id = "b" ** 32 },
+            .params = .{ .client_id = "forged-owner", .persistent = true },
+        }, .{});
+        defer allocator.free(raw);
+        const claims: auth_mod.PairClaims = .{
+            .device_id = @splat('a'),
+            .scope_mask = entry.scope_mask,
+            .deadline_ms = auth_mod.nowMillis(std.testing.io) + 60_000,
+        };
+        const result = try manager.forward(allocator, std.testing.io, claims, raw, &daemon);
+        defer allocator.free(result);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+        defer parsed.deinit();
+        if (std.mem.eql(u8, entry.method, "daemon.client.register")) {
+            try std.testing.expectEqualStrings("paired-client", parsed.value.object.get("result").?.object.get("client_id").?.string);
+            try std.testing.expect(!parsed.value.object.get("result").?.object.get("persistent").?.bool);
+        } else {
+            try std.testing.expectEqualStrings(entry.method, parsed.value.object.get("method").?.string);
+            try std.testing.expectEqual(@as(i64, 42), parsed.value.object.get("id").?.integer);
+            try std.testing.expectEqualStrings("b" ** 32, parsed.value.object.get("target").?.object.get("instance_id").?.string);
+            if (entry.scope_mask == access.scopeBit(.process_write)) {
+                try std.testing.expectEqualStrings("paired-client", parsed.value.object.get("params").?.object.get("client_id").?.string);
+            }
+        }
+    }
+    // The real daemon dispatcher is exercised separately by the P2 test in
+    // sessionizer.zig; this gate exercises the policy shared by HTTP and WS
+    // together with the actual paired-client forwarder (no live runtime).
+    try std.testing.expect(daemon.calls >= access.PAIRED_RPC_METHODS.len);
 }
