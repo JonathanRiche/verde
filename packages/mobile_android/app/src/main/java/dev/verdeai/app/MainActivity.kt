@@ -8,6 +8,8 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
 import dev.verdeai.core.Config
 import dev.verdeai.core.CoreHost
 import dev.verdeai.core.EffectExecutor
@@ -18,8 +20,11 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        // Secure until the saved privacy setting loads; D-15's app lock then owns the flag.
         window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         val app = application as VerdeApplication
+        val lock = app.appLock
+        lifecycleScope.launch { lock.state.collect { applySecureWindow(this@MainActivity, it) } }
         val cache = ViewCache(app.viewCache)
         // ProcessLifecycleOwner + ConnectivityManager feed every host core (foreground/background/network_changed).
         val provider = ViewModelProvider(this, object : ViewModelProvider.Factory {
@@ -36,7 +41,12 @@ class MainActivity : ComponentActivity() {
         hosts = provider[HostsModel::class.java]
         browse = provider[BrowseModel::class.java]
         consumePairIntent(intent)
-        setContent { VerdeApp(hosts, browse) }
+        val auth = AndroidDeviceAuth(this)
+        setContent { VerdeApp(hosts, browse, lock = AppLockControls(lock, auth)) }
+    }
+    override fun onDestroy() {
+        if (isFinishing) (application as VerdeApplication).appLock.cancelPrompt()
+        super.onDestroy()
     }
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)

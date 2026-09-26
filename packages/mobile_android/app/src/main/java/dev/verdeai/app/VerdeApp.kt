@@ -35,6 +35,7 @@ internal object Routes {
     const val NEW_TERMINAL = "terminal-new/{ws}"
     /** D-12 viewer; the path is one encoded segment and 0 means "no line". */
     const val FILE = "file/{ws}/{line}/{end}/{path}"
+    const val SECURITY = "settings/security"
     fun workspace(ws: String) = "workspace/${Uri.encode(ws)}"
     fun thread(ws: String, thread: String) = "thread/${Uri.encode(ws)}/${Uri.encode(thread)}"
     fun terminal(ws: String, terminal: String) = "terminal/${Uri.encode(ws)}/${Uri.encode(terminal)}"
@@ -49,11 +50,13 @@ private val TABS = listOf(Tab(Routes.HOME, "Home", Icons.Filled.Home),
 
 /** App shell: bottom tabs over one NavHost. Every browse screen reads only the selected host's core. */
 @Composable
-internal fun VerdeApp(hosts: HostsModel, browse: BrowseModel, clock: UiClock = remember { UiClock() }) {
+internal fun VerdeApp(hosts: HostsModel, browse: BrowseModel, clock: UiClock = remember { UiClock() },
+    lock: AppLockControls? = null) {
     val hostsState by hosts.state.collectAsState()
     MaterialTheme {
-        CompositionLocalProvider(LocalUiClock provides clock) {
-            if (hostsState.loading) HostsScreen(hosts) else Shell(hosts, browse, hostsState)
+        CompositionLocalProvider(LocalUiClock provides clock, LocalAppLockControls provides lock) {
+            val app = @Composable { if (hostsState.loading) HostsScreen(hosts) else Shell(hosts, browse, hostsState) }
+            if (lock != null) AppLockGate(lock.model, lock.auth, app) else app()
         }
     }
 }
@@ -118,7 +121,13 @@ private fun Graph(nav: NavHostController, start: String, hosts: HostsModel, brow
                 onNewChat = { nav.navigate(ManageRoutes.newChat(null)) }, onHistory = { nav.navigate(ManageRoutes.HISTORY) })
         }
         composable(Routes.WORKSPACES) { WorkspacesScreen(browse, openWorkspace, showHosts, pair) { nav.navigate(ManageRoutes.ADD_WORKSPACE) } }
-        composable(Routes.HOSTS) { HostsScreen(hosts, onUse = { nav.tab(Routes.HOME) }) }
+        composable(Routes.HOSTS) {
+            val security = LocalAppLockControls.current?.let { { nav.navigate(Routes.SECURITY) } }
+            HostsScreen(hosts, onUse = { nav.tab(Routes.HOME) }, onSecurity = security)
+        }
+        composable(Routes.SECURITY) {
+            LocalAppLockControls.current?.let { SecuritySettingsScreen(it.model, it.auth) { nav.popBackStack() } }
+        }
         composable(Routes.WORKSPACE) { entry ->
             val ws = entry.arguments?.getString("ws").orEmpty()
             WorkspaceScreen(browse, ws, openPane, openThread, showHosts, pair, onNewTerminal = { nav.navigate(Routes.newTerminal(ws)) },

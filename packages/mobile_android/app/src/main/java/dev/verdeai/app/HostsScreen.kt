@@ -16,7 +16,7 @@ import androidx.compose.ui.unit.dp
 
 /** Host catalog, pairing and sign-out. `onUse` leaves for Home after selecting a paired host. */
 @Composable
-internal fun HostsScreen(model: HostsModel, onUse: () -> Unit = {}) {
+internal fun HostsScreen(model: HostsModel, onUse: () -> Unit = {}, onSecurity: (() -> Unit)? = null) {
     val state by model.state.collectAsState()
     var adding by remember { mutableStateOf(false) }
     var label by remember { mutableStateOf("") }
@@ -89,6 +89,7 @@ internal fun HostsScreen(model: HostsModel, onUse: () -> Unit = {}) {
                     Button(onClick={ adding=true }) { Text("Add host") }
                 }
             }
+            onSecurity?.let { open -> OutlinedButton(onClick=open) { Text("App lock & privacy") } }
         }
     }
     if (adding) AlertDialog(onDismissRequest={ adding=false }, title={ Text("Add host") },
