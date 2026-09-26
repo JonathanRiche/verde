@@ -163,7 +163,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | D-06 | Transcript screen | android | linux | D-05, K-10, K-11 | done (7dc772c2; phone verify pending) |
 | D-07 | Diff card | android | linux | D-06 | done (e369ee75, cc2bf9e7; phone verify pending) |
 | D-08 | Composer + pickers + attachments + follow-ups | android | linux | D-06 | in_progress (claude opus cli-thread-1790407267836-b7791f3bb1576d33) |
-| D-09 | Approvals card | android | linux | D-06 | in_progress (claude opus cli-thread-1790407269611-f227ceb059b64580) |
+| D-09 | Approvals card | android | linux | D-06 | done (5bb55bac) |
 | D-10 | History, new chat, workspace management | android | linux | D-05, A-03 | in_progress (claude opus cli-thread-1790406845038-4d8a9c2c8a809c73; includes core create-thread/workspace intents) |
 | D-11 | Native terminal view | android | linux+phone | D-05, K-12 | done (a114ffca; phone verify pending) |
 | D-12 | File viewer | android | linux | D-06, A-01 | in_progress (claude opus cli-thread-1790408971195-db5b6fa85bded5cb) |
@@ -176,7 +176,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | I-02 | Core bridge + effect executor | ios | mac | I-01, K-06, K-15 | done (f389ab00, b6dc5f03, 69c813af, 10b4f4cd) |
 | I-03 | Pairing flow | ios | mac+phone | I-02, K-07, A-06 | done (abe0dafd..ce41f917; phone verify pending H-06, universal links pending H-04) |
 | I-04 | Hosts + Home + Workspaces + lifecycle | ios | mac | I-03, D-05 | done (60cf296c, 5dd5ac0c, 5764f9a4, b21f2614; device verify pending) |
-| I-05 | Transcript + diff + approvals | ios | mac | I-04, D-06, D-07, D-09 | todo |
+| I-05 | Transcript + diff + approvals | ios | mac | I-04, D-06, D-07, D-09 | in_progress (claude opus) |
 | I-06 | Composer + pickers + attachments + follow-ups | ios | mac | I-05, D-08 | todo |
 | I-07 | History, new chat, workspace management | ios | mac | I-04, D-10 | todo |
 | I-08 | Native terminal view | ios | mac+phone | I-04, D-11 | done (f8ab43fc..c1b991c4; device verify pending) |
@@ -860,6 +860,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
     persistence effects.
 - **Done when:** harness tests replay recorded tail event streams and match
   the committed transcripts. Follow-up and approval state tests pass.
+- **Receipt fix (6b32c454).** Rolling receipt retention (256 settled, pending never evicted, cap 1280, backpressure at 1024 pending) replaces the fixed per-session budget and D-11 eviction. Follow-up in progress: announce `hosts` only on host changes; split operations into their own scope.
 - **Done (97656ebd).** The core's chat engine covers transcript paging and tails, staged sends, drafts and follow-ups persisted per thread, approvals, shell confirmation, and composer queries. A follow-up is dispatched only after storage acknowledges it, so a restart never silently resends uncertain work. A send refreshes the transcript, so A-09's access-cap notice shows while the turn is running. The shared reducer gained a `streaming` option that keeps live tool states. Fixtures were recorded against a temporary daemon with a stub provider. `mobile-core-test`, `mobile-core-android` and `mobile-models-check` pass. Documented in `docs/chat.md`: receipts restore lazily per thread, persistence has a 512 KiB budget, and usage cards follow the web client.
 
 #### K-11 · Markdown AST / highlight spans / diff parse exports
@@ -1049,6 +1050,7 @@ human-verify step.
 - **Do:** inline Approve/Deny with a haptic; pending state; reflects
   approvals made elsewhere (desktop/web).
 - **Done when:** tests pass; human-verify on a real approval.
+- **Done (5bb55bac).** Approvals.kt (logic, reusable by D-14) + ApprovalCard.kt (card, banner, stale/failed/answered-elsewhere states, haptics, TalkBack); 9 tests + recorded fixtures. Follow-ups: no "always allow" (daemon only approve/deny); core copies a failed approval into `thread.error`, so iOS must hide the duplicate too. Human verify pending.
 
 #### D-10 · History, new chat, workspace management
 - **depends:** D-05, A-03
