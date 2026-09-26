@@ -71,11 +71,12 @@ func hostView(_ id: String, _ label: String, phase: String = "ready", lifecycle:
              retry_at_ms: nil, trust_proposal: nil, update_required: false, error: nil)
 }
 
+private final class FixtureMarker {}
+
 /// Real K-09 core projections (see Fixtures/k09-*.json and the Android fixture README).
 enum K09 {
     private static func read<T: Decodable>(_ name: String) -> T {
-        final class Marker {}
-        guard let url = Bundle(for: Marker.self).url(forResource: "k09-\(name)", withExtension: "json"),
+        guard let url = Bundle(for: FixtureMarker.self).url(forResource: "k09-\(name)", withExtension: "json"),
               let data = try? Data(contentsOf: url), let value = try? JSONDecoder().decode(T.self, from: data) else {
             fatalError("missing k09 fixture")
         }
