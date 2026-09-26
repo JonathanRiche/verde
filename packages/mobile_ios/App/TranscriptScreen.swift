@@ -84,7 +84,7 @@ private struct TranscriptBody: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            StopBar(state: state, stop: model.stopTurn)
+            ChatComposer(model: model.input)
         }
         .environment(\.openURL, OpenURLAction { url in
             // File citations open in the I-09 viewer; until then they are inert, never sent to the system.

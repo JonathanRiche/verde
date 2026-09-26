@@ -58,6 +58,8 @@ final class ChatCore: HostCore {
     private var sequence = 0
     private var _thread: String
     private var _composer = "composer-idle"
+    private var draftView: ChatComposerView?
+    var rejectDraft = false
     private var _afterFocus: String?
     private var _missing = false
     private var _ensured = false
@@ -133,6 +135,18 @@ final class ChatCore: HostCore {
             } else {
                 setOperation(e.intent_id, "failed", LocalError(code: "stale_turn", message: ""))
             }
+        case .draft_set(let e):
+            if rejectDraft { setOperation(e.intent_id, "failed", LocalError(code: "resource_limit", message: "Draft is too large.")); break }
+            var view = try JSONDecoder().decode(ComposerQuery.self, from: SharedFixtures.data("d06", "composer-idle.json")).data!
+            view.draft = ChatDraft(revision: e.intent_id, text: e.text, attachments: e.attachments.map { ChatAttachment(local_id: $0.local_id, name: $0.name, mime: $0.mime, byte_size: $0.byte_size) }, persisted: true)
+            draftView = view
+            setOperation(e.intent_id, "succeeded")
+        case .send(let e):
+            if e.draft_revision == draftView?.draft.revision {
+                draftView?.draft.text = ""
+                draftView?.send_operation = CoreOperation(intent_id: e.intent_id, state: "pending", error: nil)
+                setOperation(e.intent_id, "pending")
+            } else { setOperation(e.intent_id, "failed", LocalError(code: "draft_unavailable", message: "Stale draft.")) }
         case .approval_decide(let e):
             if let onDecide = _onDecide { onDecide(self, e.intent_id) }
             else { _thread = "approval-pending"; setOperation(e.intent_id, "pending") }
@@ -163,6 +177,7 @@ final class ChatCore: HostCore {
         default:
             if selector.hasPrefix("thread:") { return _ensured ? SharedFixtures.data(directory, "\(_thread).json") : Self.notFound }
             if selector.hasPrefix("composer:") {
+                if let draftView { return try encoded(ComposerQuery(api_version: 1, revision: String(sequence), data: draftView, error: nil)) }
                 return _ensured && directory == "d06" ? SharedFixtures.data("d06", "\(_composer).json") : Self.notFound
             }
             if selector.hasPrefix("{") { return utility(selector) }

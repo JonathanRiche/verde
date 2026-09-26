@@ -1192,6 +1192,8 @@ Shared rules:
   avoidance.
 - **Done when:** tests pass; round trip human-verified.
 
+- **Implemented:** Swift composer with revision-checked send, debounced core drafts, provider/model/effort/access/speed pickers, caret-aware slash and file suggestions, shell confirmation, image Photos/camera/Files attachment pipeline, and steer/queue retry/pull-back/remove. Rejected UI intents leave the core usable. Mac scratch build and 92 tests pass, including empty WebSocket close handling. Device round trip and visual review remain pending. Attachments match Android’s image-only bounded draft contract.
+
 #### I-07 · History, new chat, workspace management
 - **depends:** I-04, D-10
 - **Done when:** tests pass.

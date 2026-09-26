@@ -206,6 +206,8 @@ actor CoreHost {
              .foreground, .background, .network_changed, .focus,
              // Chat intents (I-05): e.g. an overlapping page or an already-answered approval.
              .thread_load_older, .turn_cancel, .approval_decide,
+             .draft_set, .composer_select, .send, .slash_search, .slash_run, .mention_search,
+             .shell_confirm, .followup_submit, .followup_retry, .followup_pull_back, .followup_cancel,
              // Terminal intents: e.g. an unencodable key or the 32-record limit.
              // A rejected device reply is dropped, never replayed.
              .terminal_create, .terminal_attach, .terminal_detach, .terminal_kill,

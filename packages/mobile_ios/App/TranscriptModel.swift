@@ -136,6 +136,7 @@ final class TranscriptModel: DiffRenderSource {
     @ObservationIgnored private(set) var approvals: ApprovalController!
     /// Card disclosure state; survives lazy cell reuse.
     let disclosure = DisclosureStore()
+    @ObservationIgnored lazy var input = ComposerModel(chat: self)
 
     @ObservationIgnored private let browse: BrowseModel
     @ObservationIgnored private let unfocusDelay: TimeInterval

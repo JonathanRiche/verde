@@ -70,4 +70,25 @@ final class SessionTransportTests: XCTestCase {
         XCTAssertEqual(opened.protocol, "verde.v1"); XCTAssertEqual(opened.socket_id, "socket")
         XCTAssertTrue(closed.clean); XCTAssertEqual(closed.code, 1000)
     }
+    func testEmptyServerCloseCompletesOnceWithoutEchoingReservedCode() throws {
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let url = try XCTUnwrap(URL(string: "wss://bridge.invalid/ws"))
+        let task = session.webSocketTask(with: url)
+        let effect = Effect.ws_open(EffectWsOpen(effect_id: "socket", generation: "2", url: url.absoluteString,
+            protocols: ["verde.v1"], tls: Tls(origin: "https://bridge.invalid", spki_sha256: String(repeating: "a", count: 64)), max_message_bytes: 4))
+        var events: [Event] = []
+        var ended = 0
+        let operation = SessionOperation(effect: effect, queue: DispatchQueue(label: "ws.empty-close"), emit: { events.append($0) }, ended: { ended += 1 })
+        operation.urlSession(session, webSocketTask: task, didCloseWith: .noStatusReceived, reason: nil)
+        operation.cancel()
+        operation.urlSession(session, task: task, didCompleteWithError: URLError(.networkConnectionLost))
+        XCTAssertEqual(ended, 1)
+        XCTAssertEqual(events.count, 1)
+        guard case .ws_closed(let closed) = events.first else { return XCTFail() }
+        XCTAssertEqual(closed.code, 1005)
+        XCTAssertTrue(closed.clean)
+        XCTAssertNil(closed.error)
+    }
+
 }
