@@ -14,6 +14,8 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -180,7 +182,16 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState) {
                 maxLines = 6,
                 keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
             )
-            FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            if (view != null) {
+                FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    SettingsControls(view, state, provider) { picker = it }
+                }
+            }
+            // Keep actions anchored regardless of settings labels, font scale or turn state.
+            Row(Modifier.fillMaxWidth().testTag("composer-actions"),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                 AttachButton(enabled = view != null && !sendPending && !composer.busy,
                     onPhotos = { photos.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
                     onCamera = {
@@ -188,7 +199,7 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState) {
                         else permission.launch(Manifest.permission.CAMERA)
                     },
                     onFiles = { files.launch(arrayOf("image/*")) })
-                if (view != null) SettingsControls(view, state, provider) { picker = it }
+                Spacer(Modifier.weight(1f))
                 if (running) {
                     StopControl(state.stopping, state.canStop, model::stop, Modifier.testTag(COMPOSER_STOP))
                 }
@@ -320,18 +331,33 @@ private fun SettingsControls(view: ChatComposerView, state: TranscriptState, pro
         val providerLabel = PROVIDERS.find { it.first == provider }?.second ?: provider ?: "Provider"
         if (fresh) SettingChip("Provider", providerLabel) { open(ComposerPicker.Provider) }
         SettingChip("Model", label(c.models, s.model ?: c.models.firstOrNull()?.id) ?: "Model", provider) { open(ComposerPicker.Model) }
-        if (c.efforts.isNotEmpty()) SettingChip("Effort", label(c.efforts, s.effort) ?: "Default") { open(ComposerPicker.Effort) }
-        if (c.access.isNotEmpty()) SettingChip("Access", label(c.access, s.access) ?: "Access") { open(ComposerPicker.Access) }
-        if (c.speeds.size > 1) SettingChip("Speed", label(c.speeds, s.speed) ?: "Speed") { open(ComposerPicker.Speed) }
+        if (c.efforts.isNotEmpty()) SettingChip("Effort", label(c.efforts, s.effort) ?: "Default", icon = R.drawable.composer_reasoning,
+            fill = ((c.efforts.indexOfFirst { it.id == (s.effort ?: "") }.coerceAtLeast(0) + 1).toFloat() / c.efforts.size)) { open(ComposerPicker.Effort) }
+        if (c.access.isNotEmpty()) SettingChip("Access", label(c.access, s.access) ?: "Access",
+            icon = if ((s.access ?: c.access.firstOrNull()?.id) == "full_access") R.drawable.composer_unlocked else R.drawable.composer_locked) { open(ComposerPicker.Access) }
+        if (c.speeds.size > 1) SettingChip("Speed", label(c.speeds, s.speed) ?: "Speed",
+            icon = if (s.speed == "on") R.drawable.composer_fast else R.drawable.composer_standard) { open(ComposerPicker.Speed) }
 }
 
 @Composable
-private fun SettingChip(name: String, value: String, provider: String? = null, onClick: () -> Unit) {
-    AssistChip(onClick = onClick, leadingIcon = provider?.let { { ProviderGlyph(it, Modifier.size(14.dp)) } }, label = { Text(value, style = MaterialTheme.typography.labelMedium,
+private fun SettingChip(name: String, value: String, provider: String? = null,
+    icon: Int? = null, fill: Float = 1f, onClick: () -> Unit) {
+    AssistChip(onClick = onClick, leadingIcon = if (provider != null) {
+        { ProviderGlyph(provider, Modifier.size(14.dp)) }
+    } else icon?.let { resource -> {
+        Box(Modifier.size(16.dp)) {
+            if (fill < 1f) Icon(painterResource(resource), contentDescription = null,
+                tint = VerdeColors.Muted.copy(alpha = .32f), modifier = Modifier.fillMaxSize())
+            Icon(painterResource(resource), contentDescription = null, tint = VerdeColors.Muted,
+                modifier = Modifier.fillMaxSize().drawWithContent {
+                    clipRect(top = size.height * (1f - fill.coerceIn(0f, 1f))) { this@drawWithContent.drawContent() }
+                })
+        }
+    } }, label = { Text(value, style = MaterialTheme.typography.labelMedium,
         maxLines = 1, overflow = TextOverflow.Ellipsis) },
         shape = RoundedCornerShape(14.dp), border = null,
         colors = AssistChipDefaults.assistChipColors(containerColor = VerdeColors.PanelAlt, labelColor = VerdeColors.Muted),
-        modifier = Modifier.semantics { contentDescription = "$name: $value. Change" })
+        modifier = Modifier.widthIn(max = 220.dp).semantics { contentDescription = "$name: $value. Change" })
 }
 
 @OptIn(ExperimentalMaterial3Api::class)

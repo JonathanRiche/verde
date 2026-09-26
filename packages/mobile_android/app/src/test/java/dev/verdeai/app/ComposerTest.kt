@@ -6,6 +6,7 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.lifecycle.ViewModel
@@ -135,8 +136,28 @@ class ComposerTest {
         FocusClaim.owner=null
     }
 
+    @Config(qualifiers = "w320dp-h800dp")
+    @Test fun composerActionsStayAtTheRightEdgeWhileRunning() {
+        setup = { it.running() }
+        launch()
+        val actions = compose.onNodeWithTag("composer-actions").fetchSemanticsNode().boundsInRoot
+        val send = send().assertIsDisplayed().fetchSemanticsNode().boundsInRoot
+        val stop = compose.onNodeWithTag(COMPOSER_STOP).assertIsDisplayed().fetchSemanticsNode().boundsInRoot
+        val attach = compose.onNodeWithTag(COMPOSER_ATTACH).assertIsDisplayed().fetchSemanticsNode().boundsInRoot
+        // IconButton semantics exclude its 4dp minimum-touch-target inset.
+        val inset = with(compose.density) { 4.dp.toPx() }
+        assertEquals(actions.right - inset, send.right, 1f)
+        assertEquals(actions.left + inset, attach.left, 1f)
+        assertEquals(send.center.y, stop.center.y, 1f)
+        assertEquals(send.center.y, attach.center.y, 1f)
+        assertTrue(stop.right <= send.left)
+        assertTrue(attach.right <= stop.left)
+    }
+
     @Test fun typingIsBatchedIntoOneDraftAndSendUsesItsRevision() {
         launch()
+        assertEquals(compose.onNodeWithTag("composer-actions").fetchSemanticsNode().boundsInRoot.right -
+            with(compose.density) { 4.dp.toPx() }, send().fetchSemanticsNode().boundsInRoot.right, 1f)
         field().performTextInput("Fix the ")
         field().performTextInput("build")
         await { sent<EventDraftSet>().isNotEmpty() }
