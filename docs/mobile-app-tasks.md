@@ -159,13 +159,13 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | D-02 | Core bridge + effect executor | android | linux | D-01, K-06, K-15 | done (0f7fb9c6) |
 | D-03 | Pairing flow | android | linux+phone | D-02, K-07, A-06, H-06, H-07 | done (13f210cf; phone verify pending H-06/H-07; verified App Links need W-01) |
 | D-04 | Hosts list + switcher + sign out | android | linux | D-03, A-04 | done (f086c429, 7ab2629e; phone verify pending H-06/H-07) |
-| D-05 | Home + Workspaces + lifecycle | android | linux+phone | D-04, K-09 | in_progress (claude opus cli-thread-1790365625335-7f1cfe4d9c58a022) |
-| D-06 | Transcript screen | android | linux | D-05, K-10, K-11 | todo |
+| D-05 | Home + Workspaces + lifecycle | android | linux+phone | D-04, K-09 | done (44117855; phone verify pending H-06/H-07) |
+| D-06 | Transcript screen | android | linux | D-05, K-10, K-11 | in_progress (claude opus cli-thread-1790405365173-51c1a9aea695ce24) |
 | D-07 | Diff card | android | linux | D-06 | todo |
 | D-08 | Composer + pickers + attachments + follow-ups | android | linux | D-06 | todo |
 | D-09 | Approvals card | android | linux | D-06 | todo |
 | D-10 | History, new chat, workspace management | android | linux | D-05, A-03 | todo |
-| D-11 | Native terminal view | android | linux+phone | D-05, K-12 | todo |
+| D-11 | Native terminal view | android | linux+phone | D-05, K-12 | in_progress (claude opus cli-thread-1790405366306-80a778f6cd0e9eaa) |
 | D-12 | File viewer | android | linux | D-06, A-01 | todo |
 | D-13 | Theme + reduced motion | android | linux | D-05 | todo |
 | D-14 | Push + actionable notifications | android | linux+phone | D-09, K-17, A-14, C-02, H-05 | todo |
@@ -175,7 +175,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | I-01 | iOS project scaffold (XcodeGen) | ios | mac | K-02 | done (bdfcfd3e; unsigned simulator only until H-04) |
 | I-02 | Core bridge + effect executor | ios | mac | I-01, K-06, K-15 | done (f389ab00, b6dc5f03, 69c813af, 10b4f4cd) |
 | I-03 | Pairing flow | ios | mac+phone | I-02, K-07, A-06 | done (abe0dafd..ce41f917; phone verify pending H-06, universal links pending H-04) |
-| I-04 | Hosts + Home + Workspaces + lifecycle | ios | mac | I-03, D-05 | todo |
+| I-04 | Hosts + Home + Workspaces + lifecycle | ios | mac | I-03, D-05 | in_progress (claude opus cli-thread-1790405367953-3eaabcdee747f44e) |
 | I-05 | Transcript + diff + approvals | ios | mac | I-04, D-06, D-07, D-09 | todo |
 | I-06 | Composer + pickers + attachments + follow-ups | ios | mac | I-05, D-08 | todo |
 | I-07 | History, new chat, workspace management | ios | mac | I-04, D-10 | todo |
@@ -1010,6 +1010,7 @@ human-verify step.
   - Local cache for a warm start.
 - **Done when:** tests pass. Human-verify: live status updates while a
   desktop chat runs; background → foreground recovers within about 2 s.
+- **Done (44117855).** The Android app now has Home, Workspaces and Hosts bottom tabs. Home shows needs attention, running (with timers), recent chats and workspaces, with K-17 attention badges. Workspaces has a list and a detail screen showing panes and newest-first chats; archived chats are behind a toggle. Every screen has pull-to-refresh plus loading, empty, offline, error, unpaired and update-required states. `ProcessLifecycleOwner` and `ConnectivityManager` feed each host's core in order. The warm-start `ViewCache` is encrypted, excluded from backup and cleared on sign-out. In the core, `retry_connection` now also calls `sync.refresh`. `mobile-android-test` passes 71/0, and the APK build, `mobile-models-check` and `mobile-core-test` pass. The k09 fixtures predate K-17, so they should be regenerated. Stop buttons move to D-06.
 
 #### D-06 · Transcript screen
 - **depends:** D-05, K-10, K-11
