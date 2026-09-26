@@ -281,7 +281,7 @@ internal class FileViewerModel(
         host.send { n, w -> EventFileOpen(now_ms = n, wall_time_ms = w, intent_id = intent, path = target,
             kind = if (kind == ViewerKind.Office) FileKind.preview else FileKind.file, max_bytes = limit) }
         val op = withTimeoutOrNull(waitMs) {
-            host.hosts.map { q -> q?.data?.operations?.find { it.intent_id == intent } }.first { it != null && it.state != "pending" }
+            host.operations.map { q -> q?.data?.items?.find { it.intent_id == intent } }.first { it != null && it.state != "pending" }
         } ?: return FileViewState(loading = false, problem = FileProblem.Offline, retryable = true)
         if (op.state != "succeeded") {
             return FileViewState(loading = false, problem = fileProblem(op.error?.code), retryable = op.error?.retryable == true)

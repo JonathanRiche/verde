@@ -87,7 +87,7 @@ class CoreHostTest {
         core.effects = listOf(EffectSecureStorePut("put", "1", key, "YWJj"),
             EffectSecureStoreGet("get", "1", key), EffectSetTimer("timer", "1", "t", 200, "retry"),
             EffectSetTimer("cancel", "1", "cancelled", 10_000, "retry"), EffectCancelTimer("c", "1", "cancelled"),
-            EffectStateChanged("view", "1", "2", listOf("hosts", "home", "workspaces")))
+            EffectStateChanged("view", "1", "2", listOf("hosts", "operations", "home", "workspaces")))
         val host = CoreHost.create(config, executor(store), core)
         try {
             start(host)
@@ -95,7 +95,8 @@ class CoreHostTest {
             assertEquals("YWJj", core.next<EventSecureStoreValue>().value_base64)
             assertEquals("t", core.next<EventTimerFired>().timer_id)
             assertEquals("2", host.hosts.value?.revision)
-            assertEquals(3, host.views.value.size)
+            assertEquals("2", host.operations.value?.revision)
+            assertEquals(4, host.views.value.size)
             core.effects = listOf(EffectSecureStoreDelete("del", "1", key), EffectSecureStoreGet("missing", "1", key))
             host.send { n,w -> EventForeground(now_ms=n, wall_time_ms=w) }
             assertNull(core.next<EventSecureStoreDone>().error)

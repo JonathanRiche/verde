@@ -142,25 +142,11 @@ pub const Host = struct {
         var data: V = .null;
         var failure: ?LocalError = null;
         if (eq(selector, "hosts")) {
-            const operations = try a.alloc(Operation, s.receipts.len);
-            for (s.receipts, operations) |receipt, *op| op.* = receipt.operation;
-            data = try valueOf(a, .{ .items = .{.{
-                .host_id = s.config.host_id,
-                .label = s.config.label,
-                .https_url = s.config.https_url,
-                .runtime_id = s.rpc.runtime_id orelse if (s.auth.pin) |pin| pin.runtime_id else null,
-                .instance_id = s.rpc.instance_id orelse if (s.auth.pin) |pin| pin.instance_id else null,
-                .phase = if (s.auth.proposal != null or s.auth.blocked or s.auth.retry != null) s.auth.phase else if (s.rpc.bearer != null) @tagName(s.rpc.phase) else s.auth.phase,
-                .lifecycle = @tagName(s.lifecycle),
-                .auth_state = s.auth_state,
-                .sync_state = if (s.sync.loading) "loading" else if (s.stale) "stale" else if (s.sync.snapshot != .null) "ready" else "empty",
-                .capabilities = s.rpc.runtime_capabilities,
-                .scopes = if (s.auth.credential) |c| c.scopes else &.{},
-                .retry_at_ms = s.auth.retry_at_ms,
-                .trust_proposal = s.auth.proposal,
-                .update_required = s.rpc.update_required,
-                .@"error" = s.host_error,
-            }}, .operations = operations });
+            // `operations` stays for older callers, but is only fresh on a direct
+            // query: receipt changes announce the `operations` selector instead.
+            data = try valueOf(a, .{ .items = .{try parse(a, try hostItem(a, s))}, .operations = try operationsOf(a, s) });
+        } else if (eq(selector, "operations")) {
+            data = try valueOf(a, .{ .items = try operationsOf(a, s) });
         } else if (std.mem.startsWith(u8, selector, "terminal:")) {
             data = (try terminal.query(a, s, selector[9..])) orelse .null;
             if (data == .null) failure = .{ .code = "not_found", .message = "Unknown terminal." };
@@ -517,7 +503,7 @@ pub const Transaction = struct {
         if (self.changed) {
             if (self.state.revision == std.math.maxInt(u64)) return error.ResourceLimit;
             self.state.revision += 1;
-            _ = try self.emit("state_changed", .{ .revision = try decimal(self.allocator(), self.state.revision), .scopes = try withAttention(self) });
+            _ = try self.emit("state_changed", .{ .revision = try decimal(self.allocator(), self.state.revision), .scopes = try changedScopes(self, &host.state) });
             try terminal.queryScopes(self);
         }
         // Retain only state, never the call's decoded secrets or effect payloads.
@@ -667,11 +653,57 @@ fn base64(s: []const u8) ApiError!void {
     }
 }
 
-fn withAttention(tx: *Transaction) ApiError![]const []const u8 {
-    var scopes = try chat.scopes(tx);
-    try append([]const u8, tx.allocator(), &scopes, "attention");
-    try append([]const u8, tx.allocator(), &scopes, "manage");
-    return scopes;
+/// `hosts` and `operations` are announced only when their own data changed, so
+/// terminal output or a transcript tail never makes platforms re-read them.
+fn changedScopes(tx: *Transaction, before: *const State) ApiError![]const []const u8 {
+    const a = tx.allocator();
+    const host_changed = !eq(try hostItem(a, before), try hostItem(a, &tx.state));
+    const operations_changed = !sameOperations(before.receipts, tx.state.receipts);
+    const own: []const []const u8 = if (host_changed and operations_changed)
+        &.{ "hosts", "operations" }
+    else if (host_changed) &.{"hosts"} else if (operations_changed) &.{"operations"} else &.{};
+    return std.mem.concat(a, []const u8, &.{ own, try chat.scopes(tx), &.{ "attention", "manage" } });
+}
+/// The single `hosts` item, encoded; also the change fingerprint for that selector.
+fn hostItem(a: A, s: *const State) ApiError![]u8 {
+    return encode(a, .{
+        .host_id = s.config.host_id,
+        .label = s.config.label,
+        .https_url = s.config.https_url,
+        .runtime_id = s.rpc.runtime_id orelse if (s.auth.pin) |pin| pin.runtime_id else null,
+        .instance_id = s.rpc.instance_id orelse if (s.auth.pin) |pin| pin.instance_id else null,
+        .phase = if (s.auth.proposal != null or s.auth.blocked or s.auth.retry != null) s.auth.phase else if (s.rpc.bearer != null) @tagName(s.rpc.phase) else s.auth.phase,
+        .lifecycle = @tagName(s.lifecycle),
+        .auth_state = s.auth_state,
+        .sync_state = if (s.sync.loading) "loading" else if (s.stale) "stale" else if (s.sync.snapshot != .null) "ready" else "empty",
+        .capabilities = s.rpc.runtime_capabilities,
+        .scopes = if (s.auth.credential) |c| c.scopes else &.{},
+        .retry_at_ms = s.auth.retry_at_ms,
+        .trust_proposal = s.auth.proposal,
+        .update_required = s.rpc.update_required,
+        .@"error" = s.host_error,
+    });
+}
+fn operationsOf(a: A, s: *const State) ApiError![]const Operation {
+    const operations = try a.alloc(Operation, s.receipts.len);
+    for (s.receipts, operations) |receipt, *op| op.* = receipt.operation;
+    return operations;
+}
+/// Compares only what the `operations` selector exposes (not digests or flags).
+fn sameOperations(x: []const Receipt, y: []const Receipt) bool {
+    if (x.len != y.len) return false;
+    for (x, y) |a, b| if (!same(Operation, a.operation, b.operation)) return false;
+    return true;
+}
+fn same(comptime T: type, x: T, y: T) bool {
+    return switch (@typeInfo(T)) {
+        .optional => |info| if (x == null or y == null) x == null and y == null else same(info.child, x.?, y.?),
+        .@"struct" => |info| inline for (info.fields) |f| {
+            if (!same(f.type, @field(x, f.name), @field(y, f.name))) break false;
+        } else true,
+        .pointer => eq(x, y),
+        else => x == y,
+    };
 }
 fn append(comptime T: type, a: A, slice: *[]const T, item: T) ApiError!void {
     const next = try a.alloc(T, slice.len + 1);

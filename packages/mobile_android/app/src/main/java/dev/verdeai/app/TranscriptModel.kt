@@ -104,9 +104,9 @@ internal class TranscriptModel(
         }
         launch { host.failed.collect { failed -> if (failed) mutableState.update { it.copy(fatal=true) } } }
         var lastReady = false
-        combine(visible, host.hosts, browse.map { it.networkAvailable }) { shown, query, network ->
+        combine(visible, host.hosts, host.operations, browse.map { it.networkAvailable }) { shown, query, operations, network ->
             val view = query?.data?.items?.firstOrNull()
-            Gate(shown, ready(view), settling(view, network), failure(query))
+            Gate(shown, ready(view), settling(view, network), failure(operations))
         }
             .distinctUntilChanged()
             .collectLatest { gate ->
@@ -142,9 +142,9 @@ internal class TranscriptModel(
     private fun ready(view: HostView?) = view != null && view.phase == "ready" && view.auth_state == "paired" &&
         view.sync_state in setOf("ready", "stale")
 
-    private fun failure(query: HostsQuery?): String? {
+    private fun failure(query: OperationsQuery?): String? {
         val id = focusIntent ?: return null
-        val op = query?.data?.operations?.find { it.intent_id == id } ?: return null
+        val op = query?.data?.items?.find { it.intent_id == id } ?: return null
         return if (op.state == "failed") op.error?.code ?: "failed" else null
     }
 
@@ -219,14 +219,14 @@ internal class TranscriptModel(
     private val composerModel = lazy { ComposerModel(this, scope) }
     internal val composer: ComposerModel by composerModel
 
-    /** Intent outcomes of the connected host, as the core reports them in `hosts`. */
+    /** Intent outcomes of the connected host, as the core reports them in `operations`. */
     @OptIn(ExperimentalCoroutinesApi::class)
     internal val operations: Flow<List<Operation>> = connected
-        .flatMapLatest { host -> host?.hosts?.map { it?.data?.operations.orEmpty() } ?: flowOf(emptyList()) }
+        .flatMapLatest { host -> host?.operations?.map { it?.data?.items.orEmpty() } ?: flowOf(emptyList()) }
         .distinctUntilChanged()
 
     /** The newest outcome of one of this screen's intents. */
-    internal fun operation(id: String): Operation? = core?.hosts?.value?.data?.operations?.find { it.intent_id == id }
+    internal fun operation(id: String): Operation? = core?.operations?.value?.data?.items?.find { it.intent_id == id }
 
     /** The core's newest composer projection, read straight from the host (no collector lag). */
     internal fun latestComposer(): ChatComposerView? = decodeComposer(core?.views?.value?.get(composerSelector))
@@ -244,7 +244,7 @@ internal class TranscriptModel(
         catch (e: CoreInputRejected) {
             return Operation(id, "failed", LocalError(code=if (e.status == 5) "resource_limit" else "invalid_input", message=""))
         } catch (_: Exception) { mutableState.update { it.copy(fatal=true) }; return null }
-        return host.hosts.value?.data?.operations?.find { it.intent_id == id } ?: Operation(id, "pending", null)
+        return host.operations.value?.data?.items?.find { it.intent_id == id } ?: Operation(id, "pending", null)
     }
 
     // ---- K-11 rendering utilities (pure core queries; work offline) ----

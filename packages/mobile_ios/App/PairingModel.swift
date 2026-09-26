@@ -57,7 +57,7 @@ final class PairingModel {
     }
 
     var row: HostView? { store.hosts?.data?.items.first }
-    var operation: Operation? { store.hosts?.data?.operations.first { $0.intent_id == intentID } }
+    var operation: Operation? { store.operations?.data?.items.first { $0.intent_id == intentID } }
     var busy: Bool { submitting || pendingLink != nil || (intentID != nil && operation == nil) || operation?.state == "pending" }
     var paired: Bool { row?.auth_state == "paired" && operation?.state != "pending" }
     /// Paired with an accepted identity: a new link opens another host slot instead.

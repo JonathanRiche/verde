@@ -365,3 +365,49 @@ test "settled terminal receipts roll off with every other settled receipt while 
     try same(rejected.@"error".?.code, "backpressure");
     try expect(rejected.@"error".?.retryable);
 }
+
+/// Scopes of the batch's `state_changed`, or empty when nothing was committed.
+fn scopesOf(a: std.mem.Allocator, bytes: []const u8) ![]const V {
+    const batch = try h.parse(a, bytes);
+    for (p.get(batch, "effects").array.items) |e| if (h.eq(p.s(e, "type"), "state_changed")) return p.get(e, "scopes").array.items;
+    return &.{};
+}
+fn has(scopes: []const V, selector: []const u8) bool {
+    for (scopes) |scope| if (h.eq(scope.string, selector)) return true;
+    return false;
+}
+
+test "terminal output bursts announce the terminal view but never hosts or operations" {
+    var host = try h.Host.init(A, config);
+    defer host.deinit();
+    {
+        var tx = try h.Transaction.init(&host);
+        defer tx.deinit();
+        try ready(&tx);
+        try attach(&tx);
+        A.free(try tx.commit(&host, A));
+    }
+    const text = "burst\r\n";
+    var offset: u64 = 0;
+    for (0..8) |i| {
+        var tx = try h.Transaction.init(&host);
+        defer tx.deinit();
+        if (i > 0) {
+            tx.state.now_ms = tx.state.now_ms.? + 160;
+            try fire(&tx, try timer(&tx));
+        }
+        const tail = try h.parse(tx.allocator(), try h.encode(tx.allocator(), .{ .id = "k12-fixture", .text = text, .running = true, .offset = offset, .next_offset = offset + text.len }));
+        try response(&tx, try findCall(&tx, "session.tail"), tail);
+        try ack(&tx, try output(&tx), false);
+        offset += text.len;
+        const bytes = try tx.commit(&host, A);
+        defer A.free(bytes);
+        var arena = std.heap.ArenaAllocator.init(A);
+        defer arena.deinit();
+        const scopes = try scopesOf(arena.allocator(), bytes);
+        try expect(has(scopes, "terminal:k12-fixture"));
+        try expect(!has(scopes, "hosts"));
+        try expect(!has(scopes, "operations"));
+    }
+    try expect(host.state.terminal.rows[0].offset.? == offset);
+}

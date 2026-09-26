@@ -498,6 +498,9 @@ private final class TermCore: HostCore {
         case "hosts":
             return try encoded(HostsQuery(api_version: 1, revision: revision,
                                           data: HostsView(items: [row], operations: operations), error: nil))
+        case "operations":
+            return try encoded(OperationsQuery(api_version: 1, revision: revision,
+                                               data: OperationsView(items: operations), error: nil))
         default:
             let view = order.first { terminalSelector($0) == selector }.flatMap { terminals[$0] }
             return try encoded(TerminalQuery(api_version: 1, revision: revision, data: view, error: nil))

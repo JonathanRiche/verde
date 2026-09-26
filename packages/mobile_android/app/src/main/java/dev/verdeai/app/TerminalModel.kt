@@ -111,7 +111,7 @@ internal class TerminalModel(
             return
         } catch (_: Exception) { fail("Couldn't open a terminal."); return }
         if (created == null) {
-            val code = host.hosts.value?.data?.operations?.find { it.intent_id == intent }?.error?.code
+            val code = host.operations.value?.data?.items?.find { it.intent_id == intent }?.error?.code
             fail(when (code) {
                 "workspace_path_unavailable" -> "This workspace has no folder on the host."
                 "not_connected" -> "Not connected. Try again when the host is reachable."

@@ -479,3 +479,43 @@ test "chat draft keeps attachments by reference and composer marks desktop favor
     };
     try expect(starred == 1);
 }
+
+fn announced(batch: V, selector: []const u8) bool {
+    for (p.get(batch, "effects").array.items) |e| if (h.eq(p.s(e, "type"), "state_changed")) {
+        for (p.get(e, "scopes").array.items) |scope| if (h.eq(scope.string, selector)) return true;
+    };
+    return false;
+}
+
+test "chat transcript tail announces its thread but never hosts; receipts announce operations" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.open();
+    try f.seedTurn();
+    const selector = try chat.selectorFor(f.a(), "thread", ws, thread);
+    const tails = try h.parse(f.a(), @embedFile("fixtures/chat/tails.json"));
+    const operations = try f.host.query("operations", f.a());
+    for (tails.array.items, 0..) |tail_, i| {
+        if (i > 0) try f.tick(160);
+        const batch = try f.response("chat.turn.tail", tail_, null);
+        try expect(announced(batch, selector));
+        try expect(!announced(batch, "hosts"));
+        try expect(!announced(batch, "operations"));
+    }
+    try expect(f.host.state.chat.threads[0].after_seq == 2);
+    // Unannounced means unchanged: the retained receipts read exactly as before the tail.
+    try eql(try h.encode(f.a(), p.get(try h.parse(f.a(), operations), "data")), try h.encode(f.a(), p.get(try h.parse(f.a(), try f.host.query("operations", f.a())), "data")));
+
+    // Added (pending draft write), then settled by the storage acknowledgement.
+    const added = try f.intent("draft_set", .{ .text = "note", .attachments = .{} });
+    try expect(announced(added, "operations") and !announced(added, "hosts"));
+    const id = try std.fmt.allocPrint(f.a(), "intent-{d}", .{f.serial - 1});
+    const settled = try f.storage(null, false);
+    try expect(announced(settled, "operations") and !announced(settled, "hosts"));
+    const items = p.get(p.get(try h.parse(f.a(), try f.host.query("operations", f.a())), "data"), "items").array.items;
+    try eql(id, p.s(items[items.len - 1], "intent_id"));
+    try eql("succeeded", p.s(items[items.len - 1], "state"));
+
+    // A host-level change (lifecycle) is what announces hosts.
+    try expect(announced(try f.event("background", .{}), "hosts"));
+}

@@ -92,8 +92,8 @@ internal class HostsModel(private val store: SecureStore,
                 if (state in WIPED && !cleared) { cleared=true; cache?.clear(saved.id) }
                 else if (state == "paired") cleared=false
             } }
-            try { pairing.coreHost().hosts.collect { value ->
-                row(saved.id) { it.copy(operation=value?.data?.operations?.find { op -> op.intent_id == operations[saved.id] }) }
+            try { pairing.coreHost().operations.collect { value ->
+                row(saved.id) { it.copy(operation=value?.data?.items?.find { op -> op.intent_id == operations[saved.id] }) }
             } } catch (_: Exception) { row(saved.id) { it.copy(fatal=true) } }
         }
     }

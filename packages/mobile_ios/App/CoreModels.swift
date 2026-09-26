@@ -4923,6 +4923,24 @@ extension HostsView {
     }
 }
 
+struct OperationsView: Codable {
+    var `items`: [Operation]
+}
+
+extension OperationsView {
+    private enum CodingKeys: String, CodingKey {
+        case `items`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`items` = try c.decode([Operation].self, forKey: .`items`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`items`, forKey: .`items`)
+    }
+}
+
 struct HomeView: Codable {
     var `items`: [Pane]
     var `loading`: Bool
@@ -5044,6 +5062,36 @@ extension HostsQuery {
         self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
         self.`revision` = try c.decode(String.self, forKey: .`revision`)
         self.`data` = try c.decodeIfPresent(HostsView.self, forKey: .`data`)
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`revision`, forKey: .`revision`)
+        try c.encode(self.`data`, forKey: .`data`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct OperationsQuery: Codable {
+    var `api_version`: UInt32
+    var `revision`: String
+    var `data`: OperationsView?
+    var `error`: LocalError?
+}
+
+extension OperationsQuery {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `revision`
+        case `data`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        self.`revision` = try c.decode(String.self, forKey: .`revision`)
+        self.`data` = try c.decodeIfPresent(OperationsView.self, forKey: .`data`)
         self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
     }
     func encode(to encoder: Encoder) throws {

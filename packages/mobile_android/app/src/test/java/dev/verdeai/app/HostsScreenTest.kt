@@ -225,11 +225,12 @@ class HostsScreenTest {
                 }
                 else -> Unit
             }
-            effects.add(EffectStateChanged("view","1","1",listOf("hosts")))
+            effects.add(EffectStateChanged("view","1","1",listOf("hosts","operations")))
             return CoreJson.encodeToString(EffectBatch(1,"1",effects)).encodeToByteArray()
         }
-        override fun query(host: Long,selector: String)=CoreJson.encodeToString(
-            HostsQuery(1,"1",HostsView(listOf(row),listOfNotNull(op)),null)).encodeToByteArray()
+        override fun query(host: Long,selector: String)=(if (selector == "operations")
+            CoreJson.encodeToString(OperationsQuery(1,"1",OperationsView(listOfNotNull(op)),null))
+        else CoreJson.encodeToString(HostsQuery(1,"1",HostsView(listOf(row),listOfNotNull(op)),null))).encodeToByteArray()
         override fun free(host: Long) { freed=true }
     }
 }

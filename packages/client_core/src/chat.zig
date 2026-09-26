@@ -1200,7 +1200,8 @@ pub fn query(a: A, state: *const h.State, selector: []const u8) E!?V {
 }
 /// Include precise chat selectors in the coalesced host notification.
 pub fn scopes(tx: *h.Transaction) E![]const []const u8 {
-    var out: []const []const u8 = &.{ "hosts", "home", "workspaces" };
+    // `hosts`/`operations` are diffed separately by the host commit.
+    var out: []const []const u8 = &.{ "home", "workspaces" };
     for (tx.state.chat.threads) |t| {
         try add([]const u8, tx.allocator(), &out, try selectorFor(tx.allocator(), "thread", t.workspace_id, t.id));
         try add([]const u8, tx.allocator(), &out, try selectorFor(tx.allocator(), "composer", t.workspace_id, t.id));

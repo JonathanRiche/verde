@@ -109,7 +109,9 @@ pub const HostView = struct {
     update_required: bool,
     @"error": ?LocalError,
 };
+/// `operations` is kept for older callers; watch the `operations` selector instead.
 pub const HostsView = struct { items: []const HostView, operations: []const Operation };
+pub const OperationsView = struct { items: []const Operation };
 const projection = @import("projection.zig");
 pub const HomeView = struct { items: []const projection.Pane, loading: bool, stale: bool, incomplete_scopes: []const []const u8, @"error": ?LocalError };
 pub const HistoryView = struct { query: []const u8, items: []const projection.ThreadSummary, next_cursor: ?[]const u8, loading: bool, @"error": ?LocalError };

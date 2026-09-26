@@ -1259,6 +1259,11 @@ data class HostsView(
 )
 
 @Serializable
+data class OperationsView(
+    val `items`: List<Operation>,
+)
+
+@Serializable
 data class HomeView(
     val `items`: List<Pane>,
     val `loading`: Boolean,
@@ -1290,6 +1295,14 @@ data class HostsQuery(
     val `api_version`: Long,
     val `revision`: String,
     val `data`: HostsView?,
+    val `error`: LocalError?,
+)
+
+@Serializable
+data class OperationsQuery(
+    val `api_version`: Long,
+    val `revision`: String,
+    val `data`: OperationsView?,
     val `error`: LocalError?,
 )
 

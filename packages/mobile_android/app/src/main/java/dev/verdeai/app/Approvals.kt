@@ -52,7 +52,7 @@ catch (_: Exception) { DecideResult.Failed }
 
 /** Suspends until the core settles [intentId] (succeeded, failed or uncertain). */
 internal suspend fun awaitOperation(host: CoreHost, intentId: String): Operation =
-    host.hosts.mapNotNull { q -> q?.data?.operations?.find { it.intent_id == intentId }?.takeIf { it.state != "pending" } }.first()
+    host.operations.mapNotNull { q -> q?.data?.items?.find { it.intent_id == intentId }?.takeIf { it.state != "pending" } }.first()
 
 /**
  * The open thread's current approval as a decision target, or null. The core only tracks approvals

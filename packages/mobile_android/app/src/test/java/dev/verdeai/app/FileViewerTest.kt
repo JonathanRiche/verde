@@ -324,12 +324,13 @@ class FileViewerTest {
                     else -> { sink.put(decoded.intent_id, FileBody(body, null)); Operation(decoded.intent_id, "succeeded", null) }
                 }
             }
-            val effects=listOf<Effect>(EffectStateChanged("s${sequence++}","1","1",listOf("hosts","home","workspaces")))
+            val effects=listOf<Effect>(EffectStateChanged("s${sequence++}","1","1",listOf("hosts","operations","home","workspaces")))
             return CoreJson.encodeToString(EffectBatch(1,"1",effects)).encodeToByteArray()
         }
         override fun query(host: Long, selector: String): ByteArray = when {
             selector == "hosts" -> CoreJson.encodeToString(HostsQuery(1,"1",HostsView(listOf(HostView(saved.id,saved.label,null,null,null,
                 "ready",Lifecycle.foreground,auth,"ready",emptyList(),emptyList(),null,null,false,null)),operations.values.toList()),null))
+            selector == "operations" -> CoreJson.encodeToString(OperationsQuery(1,"1",OperationsView(operations.values.toList()),null))
             selector.startsWith("{") -> utility(Json.parseToJsonElement(selector).jsonObject)
             else -> """{"api_version":1,"revision":"1","data":null,"error":{"domain":"input","code":"not_found","message":""}}"""
         }.encodeToByteArray()

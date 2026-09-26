@@ -81,12 +81,16 @@ private final class HostsCore: HostCore {
         }
         events.append(event)
         effects.append(.state_changed(EffectStateChanged(effect_id: next(), generation: "1",
-            revision: String(sequence), scopes: ["hosts"])))
+            revision: String(sequence), scopes: ["hosts", "operations"])))
         return try encoded(EffectBatch(api_version: 1, revision: String(sequence), effects: effects))
     }
 
     func query(_ selector: String) throws -> Data {
         lock.lock(); defer { lock.unlock() }
+        if selector == "operations" {
+            return try encoded(OperationsQuery(api_version: 1, revision: String(sequence),
+                data: OperationsView(items: op.map { [$0] } ?? []), error: nil))
+        }
         return try encoded(HostsQuery(api_version: 1, revision: String(sequence),
             data: HostsView(items: [row], operations: op.map { [$0] } ?? []), error: nil))
     }

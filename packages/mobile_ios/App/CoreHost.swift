@@ -51,6 +51,8 @@ final class NativeHostCore: HostCore {
 @MainActor @Observable
 final class CoreViewStore {
     private(set) var hosts: HostsQuery?
+    /// Intent outcomes; announced only when a receipt is added, settled or evicted.
+    private(set) var operations: OperationsQuery?
     private(set) var home: HomeQuery?
     private(set) var workspaces: WorkspacesQuery?
     // Future selectors remain lossless until their typed models are registered.
@@ -68,6 +70,7 @@ final class CoreViewStore {
             for (selector, data) in updates {
                 switch selector {
                 case "hosts": hosts = try JSONDecoder().decode(HostsQuery.self, from: data)
+                case "operations": operations = try JSONDecoder().decode(OperationsQuery.self, from: data)
                 case "home": home = try JSONDecoder().decode(HomeQuery.self, from: data)
                 case "workspaces": workspaces = try JSONDecoder().decode(WorkspacesQuery.self, from: data)
                 default: break
@@ -80,7 +83,7 @@ final class CoreViewStore {
                     home = nil
                     workspaces = nil
                     synced = false
-                    snapshots = snapshots.filter { $0.key == "hosts" }
+                    snapshots = snapshots.filter { $0.key == "hosts" || $0.key == "operations" }
                 } else if row.sync_state == "ready" { synced = true }
             }
             self.notifications.append(contentsOf: notifications)
@@ -241,8 +244,8 @@ actor CoreHost {
                 return .created(id, register(id, replies: replies))
             }
         }
-        let hosts = (try? core.query("hosts")).flatMap { try? JSONDecoder().decode(HostsQuery.self, from: $0) }
-        return .failed(hosts?.data?.operations.first { $0.intent_id == event.intent_id }?.error?.code)
+        let operations = (try? core.query("operations")).flatMap { try? JSONDecoder().decode(OperationsQuery.self, from: $0) }
+        return .failed(operations?.data?.items.first { $0.intent_id == event.intent_id }?.error?.code)
     }
 
     /// Resolves the grid size from the terminal view (terminal.md: query before

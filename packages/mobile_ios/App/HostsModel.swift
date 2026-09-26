@@ -99,7 +99,7 @@ final class HostsModel {
         let session = sessions[saved.id]
         let intent = intents[saved.id]
         return HostRow(saved: saved, view: session?.row,
-                       operation: intent.flatMap { id in session?.store.hosts?.data?.operations.first { $0.intent_id == id } },
+                       operation: intent.flatMap { id in session?.store.operations?.data?.items.first { $0.intent_id == id } },
                        busy: acting.contains(saved.id), fatal: session?.fatal ?? false)
     }
 

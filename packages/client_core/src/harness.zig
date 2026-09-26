@@ -180,6 +180,9 @@ test "long sessions roll settled receipts off without teardown and keep in-fligh
         const batch = effects(try retryIntent(&f, try std.fmt.bufPrint(&name, "intent-{d}", .{i})));
         try expect(batch.len == 1);
         try eql("state_changed", get(batch[0], "type").string);
+        // Each admission adds (and past the window evicts) a receipt: operations, not hosts.
+        try expect(hasScope(batch[0], "operations"));
+        try expect(!hasScope(batch[0], "hosts"));
         try expect(f.host.state.receipts.len <= core.RECENT_RECEIPTS + 1);
     }
     // The in-flight receipt survives ten thousand newer intents and still deduplicates.
@@ -191,6 +194,11 @@ test "long sessions roll settled receipts off without teardown and keep in-fligh
     try expect(receiptIndex(&f, try std.fmt.bufPrint(&name, "intent-{d}", .{total - core.RECENT_RECEIPTS})) != null);
     try expect(receiptIndex(&f, try std.fmt.bufPrint(&name, "intent-{d}", .{total - core.RECENT_RECEIPTS - 1})) == null);
     try expect(get(get(try f.query("hosts"), "data"), "operations").array.items.len == core.RECENT_RECEIPTS + 1);
+    try expect(get(get(try f.query("operations"), "data"), "items").array.items.len == core.RECENT_RECEIPTS + 1);
+}
+fn hasScope(effect: V, selector: []const u8) bool {
+    for (get(effect, "scopes").array.items) |scope| if (core.eq(scope.string, selector)) return true;
+    return false;
 }
 
 test "recent settled receipts deduplicate and reject changed payloads" {

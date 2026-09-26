@@ -62,8 +62,10 @@ internal class PairingModel(private val createHost: suspend () -> CoreHost) : Vi
             try {
                 val core = host.await()
                 launch { core.hosts.collect { query ->
-                    mutableState.update { it.copy(host=query?.data?.items?.firstOrNull(),
-                        operation=query?.data?.operations?.find { op -> op.intent_id == pairIntent } ?: it.operation) }
+                    mutableState.update { it.copy(host=query?.data?.items?.firstOrNull()) }
+                } }
+                launch { core.operations.collect { query ->
+                    mutableState.update { it.copy(operation=query?.data?.items?.find { op -> op.intent_id == pairIntent } ?: it.operation) }
                 } }
                 launch { core.failed.collect { failed -> if (failed) mutableState.update { it.copy(fatal=true) } } }
                 for (signal in signals) {

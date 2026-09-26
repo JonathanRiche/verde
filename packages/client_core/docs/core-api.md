@@ -189,7 +189,7 @@ state must recover without assuming callbacks were delivered.
 | `secure_store_get` | `key`; return `secure_store_value`. |
 | `secure_store_put` | `key,value_base64`; atomic durable replacement; return `secure_store_done`. |
 | `secure_store_delete` | `key`; absent already is success; return `secure_store_done`. |
-| `state_changed` | `revision,scopes:[query-selector]`; coalesced once per batch, after state commit; platform re-queries affected selectors. |
+| `state_changed` | `revision,scopes:[query-selector]`; coalesced once per batch, after state commit; platform re-queries affected selectors. `hosts` and `operations` appear only when their own data changed (see §6). |
 | `notify` | `notification_id,kind,title,body,target:{host_id,workspace_id,thread_id},actions:[string]`; sensitive UI content, not a log. Platform chooses native presentation; focused-pane suppression is owned by the core (K-17). |
 | `log` | `level,code,fields`; fixed event codes and allowlisted counts/statuses only. No bodies, paths, URLs, headers, pair links, tokens, credentials, clipboard or provider error text. |
 | `tls_probe` | `origin`; platform performs system trust validation and obtains SPKI without transmitting pair/device secrets, reports `tls_peer`. |
@@ -274,7 +274,7 @@ config's `chat.favorite_models` for the selected provider (read-only).
 
 ## 6. Queries and new local view models
 
-Required UTF-8 selectors: `hosts`, `home`, `workspaces`, `thread:<id>`,
+Required UTF-8 selectors: `hosts`, `operations`, `home`, `workspaces`, `thread:<id>`,
 `composer:<thread>`, `terminal:<id>`, plus `attention` and `manage`. Thread suffix is a percent-encoded JSON
 array `[workspace_id,local_thread_id]`, terminal suffix an encoded session ID;
 decode once. This avoids collisions without assuming IDs are globally unique.
@@ -283,7 +283,12 @@ decode once. This avoids collisions without assuming IDs are globally unique.
 Each returns `{api_version:1,revision,data,error}`. `error` is null on success;
 unknown selector/resource returns `data:null` and a local typed error.
 `state_changed.scopes` uses these exact selectors; `workspaces` invalidates its
-history too. `revision` is a monotonically increasing local view revision,
+history too. `hosts` is announced only when a `Host` field changes (connection,
+auth, sync, lifecycle, trust, error, …) and `operations` only when a receipt is
+added, settled or evicted, so terminal output or a transcript tail never makes
+platforms re-read either. Other selectors are still announced on every commit.
+An unannounced selector keeps its last payload except `revision`, so platforms
+must not compare revisions across selectors. `revision` is a monotonically increasing local view revision,
 not the daemon store revision. Query results are complete immutable snapshots.
 Arrays use stable IDs and deterministic order; native widgets diff by ID.
 All shapes in this section are **new** local types for K-06/K-09–K-12/K-15.
@@ -291,7 +296,8 @@ Fields marked `?` mean nullable, not unspecified data.
 
 | Selector | `data` shape |
 | --- | --- |
-| `hosts` | `{items:[Host],operations:[Operation]}` (exactly this handle's host) |
+| `hosts` | `{items:[Host],operations:[Operation]}` (exactly this handle's host). `operations` is kept for older callers and is current only on a direct query; receipt changes do not announce `hosts`. |
+| `operations` | `{items:[Operation]}`: every retained receipt (up to 1280, oldest first; [host-skeleton.md](host-skeleton.md)). |
 | `home` | `{items:[Pane],loading,stale,incomplete_scopes:[string],error:Error?}`; attention/running order follows web projection, stable ID tie-break. |
 | `workspaces` | `{items:[Workspace],loading,stale,error:Error?,history:{query,items:[ThreadSummary],next_cursor:string?,loading,error:Error?}}` |
 | `thread:<id>` | `{thread:ThreadSummary,rows:[Row],page:{has_older,cursor:string?,loading},turn:Turn?,approval:Approval?,usage:Usage?,stale,error:Error?}` |
@@ -328,8 +334,8 @@ Supporting shapes:
 - `Usage`: `{input_tokens?,output_tokens?,cached_tokens?,cost?,currency?,
   context_used?,context_limit?}`; missing/unreported values remain null, not zero.
 - `Operation`: `{intent_id,state:pending|succeeded|failed|uncertain,error:Error?}`.
-  Keep asynchronous intent outcomes queryable in `hosts.operations` even if
-  their screen is no longer focused.
+  Keep asynchronous intent outcomes queryable in the `operations` selector
+  even if their screen is no longer focused; observe it, not `hosts`.
 
 ## 7. Auth, RPC and sync behavior
 

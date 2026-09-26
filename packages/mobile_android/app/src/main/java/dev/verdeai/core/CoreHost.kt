@@ -62,6 +62,9 @@ class CoreHost private constructor(
     val views: StateFlow<Map<String, JsonElement>> = mutableViews.asStateFlow()
     private val mutableHosts = MutableStateFlow<HostsQuery?>(null)
     val hosts = mutableHosts.asStateFlow()
+    /** Intent outcomes; announced only when a receipt is added, settled or evicted. */
+    private val mutableOperations = MutableStateFlow<OperationsQuery?>(null)
+    val operations = mutableOperations.asStateFlow()
     private val mutableHome = MutableStateFlow<HomeQuery?>(null)
     val home = mutableHome.asStateFlow()
     private val mutableWorkspaces = MutableStateFlow<WorkspacesQuery?>(null)
@@ -205,6 +208,7 @@ class CoreHost private constructor(
                             }
                             mutableHosts.value = hosts
                         }
+                        "operations" -> mutableOperations.value = CoreJson.decodeFromString<OperationsQuery>(snapshot.toString())
                         "home" -> mutableHome.value = CoreJson.decodeFromString<HomeQuery>(snapshot.toString())
                         "workspaces" -> mutableWorkspaces.value = CoreJson.decodeFromString<WorkspacesQuery>(snapshot.toString())
                     }

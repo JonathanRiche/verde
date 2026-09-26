@@ -343,13 +343,14 @@ class ApprovalTest {
                 is EventApprovalDecide -> onDecide(decoded.intent_id)
                 else -> Unit
             }
-            val scopes=mutableListOf("hosts","home","workspaces")
+            val scopes=mutableListOf("hosts","operations","home","workspaces")
             if (ensured) scopes+=listOf(chatSelector("thread", WS, THREAD), chatSelector("composer", WS, THREAD))
             effects.add(EffectStateChanged("s${sequence++}","1","1",scopes))
             return CoreJson.encodeToString(EffectBatch(1,"1",effects)).encodeToByteArray()
         }
         override fun query(host: Long, selector: String): ByteArray = when {
             selector == "hosts" -> CoreJson.encodeToString(HostsQuery(1,"1",HostsView(listOf(row),operations.values.toList()),null))
+            selector == "operations" -> CoreJson.encodeToString(OperationsQuery(1,"1",OperationsView(operations.values.toList()),null))
             selector == "home" -> CoreJson.encodeToString(HomeQuery(1,"1",HomeView(emptyList(),false,false,emptyList(),null),null))
             selector == "workspaces" -> CoreJson.encodeToString(WorkspacesQuery(1,"1",WorkspacesView(emptyList(),false,false,null,
                 HistoryView("",emptyList(),null,false,null)),null))

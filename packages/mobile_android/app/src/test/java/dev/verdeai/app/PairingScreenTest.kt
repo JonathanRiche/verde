@@ -196,11 +196,12 @@ class PairingScreenTest {
                 is EventRetryConnection -> if (row.error?.domain == "storage") effects.add(put())
                 else -> Unit
             }
-            effects.add(EffectStateChanged("view","1","1",listOf("hosts")))
+            effects.add(EffectStateChanged("view","1","1",listOf("hosts","operations")))
             return CoreJson.encodeToString(EffectBatch(1,"1",effects)).encodeToByteArray()
         }
-        override fun query(host: Long, selector: String) = CoreJson.encodeToString(
-            HostsQuery(1,"1",HostsView(listOf(this.row),listOfNotNull(operation)),null)).encodeToByteArray()
+        override fun query(host: Long, selector: String) = (if (selector == "operations")
+            CoreJson.encodeToString(OperationsQuery(1,"1",OperationsView(listOfNotNull(operation)),null))
+        else CoreJson.encodeToString(HostsQuery(1,"1",HostsView(listOf(this.row),listOfNotNull(operation)),null))).encodeToByteArray()
         override fun free(host: Long) { freed=true }
     }
 }
