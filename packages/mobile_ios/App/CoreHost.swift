@@ -107,13 +107,20 @@ actor CoreHost {
     private var timers: [String: Task<Void, Never>] = [:]
     private var publication: Task<Void, Never>?
     private var stopped = false
+    private let terminalBridge: TerminalBridge
+    // Output for an unregistered terminal reports `unavailable`.
+    private var terminals: [String: TerminalVT] = [:]
+    /// Latest `terminal:<id>` query results, used to find a newly created session.
+    private var terminalViews: [String: Data] = [:]
 
     init(core: HostCore, store: CoreViewStore,
-         transport: CoreTransport = SessionTransport(), storage: SecureStorage = KeychainStorage()) {
+         transport: CoreTransport = SessionTransport(), storage: SecureStorage = KeychainStorage(),
+         terminals: TerminalBridge = NativeTerminalBridge.shared) {
         self.core = core
         self.store = store
         self.transport = transport
         self.storage = storage
+        terminalBridge = terminals
         let channel = AsyncStream<Event>.makeStream()
         events = channel.stream
         continuation = channel.continuation
@@ -175,8 +182,87 @@ actor CoreHost {
     private static func recoverable(_ event: Event) -> Bool {
         switch event {
         case .pair, .trust_decision, .retry_connection, .sign_out, .forget_host,
-             .foreground, .background, .network_changed: return true
+             .foreground, .background, .network_changed, .focus,
+             // Terminal intents: e.g. an unencodable key or the 32-record limit.
+             // A rejected device reply is dropped, never replayed.
+             .terminal_create, .terminal_attach, .terminal_detach, .terminal_kill,
+             .terminal_resize, .terminal_input, .terminal_reply: return true
         default: return false
+        }
+    }
+
+    // MARK: Terminals (K-12)
+
+    enum TerminalCreation {
+        case created(String, TerminalVT)
+        /// The core's operation error code for the intent, if it recorded one.
+        case failed(String?)
+    }
+
+    /// Registers a VT for `id`'s `terminal_output` (one serialized executor per handle).
+    /// Device replies go back through `terminal_reply` unless `replies` is false.
+    func openTerminal(_ id: String, replies: Bool) throws -> TerminalVT {
+        guard !stopped else { throw CoreBridgeError.closed }
+        return register(id, replies: replies)
+    }
+
+    private func register(_ id: String, replies: Bool) -> TerminalVT {
+        let continuation = self.continuation
+        let vt = TerminalVT(bridge: terminalBridge) { bytes in
+            guard replies else { return }
+            continuation.yield(.terminal_reply(EventTerminalReply(now_ms: 0, wall_time_ms: 0,
+                terminal_id: id, bytes_base64: bytes.base64EncodedString())))
+        }
+        if let old = terminals.updateValue(vt, forKey: id) { Task { await old.close() } }
+        return vt
+    }
+
+    /// Detaches the pump (the daemon session keeps running) and frees the local VT.
+    func closeTerminal(_ id: String, _ vt: TerminalVT) async {
+        if terminals[id] === vt {
+            terminals[id] = nil
+            if !stopped {
+                // A rejection leaves nothing to undo; a fatal error already published the failure.
+                try? send(.terminal_detach(EventTerminalDetach(now_ms: 0, wall_time_ms: 0,
+                    intent_id: UUID().uuidString, terminal_id: id)))
+            }
+        }
+        await vt.close()
+    }
+
+    /// Sends `terminal_create`. Every committed change lists all terminal selectors,
+    /// so the only new selector after this batch is the new session's row. The VT is
+    /// registered in the same actor turn, so its first output cannot miss it.
+    func createTerminal(_ event: EventTerminalCreate, replies: Bool) throws -> TerminalCreation {
+        let before = Set(terminalViews.keys)
+        try send(.terminal_create(event))
+        for (selector, data) in terminalViews where !before.contains(selector) {
+            if let id = (try? JSONDecoder().decode(TerminalQuery.self, from: data))?.data?.terminal_id {
+                return .created(id, register(id, replies: replies))
+            }
+        }
+        let hosts = (try? core.query("hosts")).flatMap { try? JSONDecoder().decode(HostsQuery.self, from: $0) }
+        return .failed(hosts?.data?.operations.first { $0.intent_id == event.intent_id }?.error?.code)
+    }
+
+    /// Resolves the grid size from the terminal view (terminal.md: query before
+    /// recreating the VT), applies off the core actor, then reports `terminal_applied`.
+    private func terminalOutput(_ effect: EffectTerminalOutput, emit: @escaping (Event) -> Void) {
+        func applied(_ result: TerminalApplied) -> Event {
+            .terminal_applied(EventTerminalApplied(now_ms: 0, wall_time_ms: 0, effect_id: effect.effect_id,
+                generation: effect.generation, terminal_id: effect.terminal_id, grid_revision: result.gridRevision,
+                error: result.error.map { PlatformFailure(code: $0) }))
+        }
+        guard let vt = terminals[effect.terminal_id], let bytes = Data(base64Encoded: effect.bytes_base64) else {
+            emit(applied(TerminalApplied(gridRevision: "0", error: .unavailable)))
+            return
+        }
+        let view = (try? core.query(terminalSelector(effect.terminal_id)))
+            .flatMap { try? JSONDecoder().decode(TerminalQuery.self, from: $0) }?.data
+        let cols = view?.cols ?? 80, rows = view?.rows ?? 24
+        Task {
+            let result = await vt.apply(reset: effect.reset, bytes: bytes, cols: cols, rows: rows)
+            emit(applied(result))
         }
     }
 
@@ -208,14 +294,14 @@ actor CoreHost {
             case .secure_store_get, .secure_store_put, .secure_store_delete:
                 emit(storage.execute(effect))
             case .state_changed(let value):
-                for selector in value.scopes { updates[selector] = try core.query(selector) }
+                for selector in value.scopes {
+                    let data = try core.query(selector)
+                    updates[selector] = data
+                    if selector.hasPrefix("terminal:") { terminalViews[selector] = data }
+                }
             case .notify(let value): notices.append(value)
             case .log: break // No effect fields are sent to platform logs.
-            case .terminal_output(let value):
-                // The VT adapter is I-08/K-12. Report an explicit failure until attached.
-                emit(.terminal_applied(EventTerminalApplied(now_ms: 0, wall_time_ms: 0,
-                    effect_id: value.effect_id, generation: value.generation,
-                    terminal_id: value.terminal_id, grid_revision: "0", error: PlatformFailure(code: .unavailable))))
+            case .terminal_output(let value): terminalOutput(value, emit: emit)
             default: transport.execute(effect, emit: emit)
             }
         }
@@ -233,6 +319,9 @@ actor CoreHost {
         timers.removeAll()
         transport.stop()
         core.close()
+        let open = Array(terminals.values)
+        terminals.removeAll()
+        for vt in open { Task { await vt.close() } }
     }
     deinit {
         if !stopped {

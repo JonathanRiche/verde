@@ -5,6 +5,8 @@ enum BrowseRoute: Hashable {
     case workspace(String)
     case thread(workspace: String, thread: String)
     case terminal(workspace: String, terminal: String)
+    /// Each push is a distinct new session request.
+    case newTerminal(workspace: String, request: UUID)
 }
 
 func route(_ pane: Pane) -> BrowseRoute? {
@@ -284,6 +286,11 @@ struct WorkspaceScreen: View {
                 Section("Panes") {
                     if workspace.panes.isEmpty { Text("No open panes.") }
                     ForEach(workspace.panes, id: \.id) { PaneItem(pane: $0, now: now) }
+                    if canWrite(model.state.host) && !workspace.path.isEmpty {
+                        NavigationLink(value: BrowseRoute.newTerminal(workspace: workspaceID, request: UUID())) {
+                            Label("New terminal", systemImage: "plus.rectangle.on.rectangle")
+                        }
+                    }
                 }
                 let threads = workspaceThreads(workspace)
                 let current = threads.filter { !$0.archived }
@@ -334,25 +341,6 @@ struct ThreadPlaceholderScreen: View {
     }
 }
 
-struct TerminalPlaceholderScreen: View {
-    let model: BrowseModel
-    let workspaceID: String
-    let terminalID: String
-    var body: some View {
-        let state = model.state
-        let workspace = state.workspaces?.items.first { $0.workspace_id == workspaceID }
-        let pane = ((state.home?.items ?? []) + (workspace?.panes ?? []))
-            .first { $0.workspace_id == workspaceID && $0.terminal_id == terminalID }
-        List {
-            if let workspace { Text(workspace.label).font(.headline) }
-            Text(pane.map { paneLine($0, 0) } ?? "This terminal is no longer on the host.")
-            Text("The terminal view is coming in a later update.").foregroundStyle(.secondary)
-        }
-        .navigationTitle(pane?.title ?? "Terminal")
-        .navigationBarTitleDisplayMode(.inline)
-    }
-}
-
 /// One tab's stack: every browse route resolves against the selected host only.
 struct BrowseStack<Root: View>: View {
     let model: BrowseModel
@@ -365,7 +353,9 @@ struct BrowseStack<Root: View>: View {
                 switch route {
                 case .workspace(let id): WorkspaceScreen(model: model, workspaceID: id, actions: actions)
                 case .thread(let workspace, let thread): ThreadPlaceholderScreen(model: model, workspaceID: workspace, threadID: thread)
-                case .terminal(let workspace, let terminal): TerminalPlaceholderScreen(model: model, workspaceID: workspace, terminalID: terminal)
+                case .terminal(let workspace, let terminal):
+                    TerminalScreen(browse: model, workspaceID: workspace, terminalID: terminal)
+                case .newTerminal(let workspace, _): TerminalScreen(browse: model, workspaceID: workspace, terminalID: nil)
                 }
             }
         }
