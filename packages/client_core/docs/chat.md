@@ -53,6 +53,9 @@ bounded to 512 KiB and exhaustion returns resource_limit without committing.
 
 There is no daemon queue/pull-back RPC. Queue/steer receipts are durable before
 clearing the draft; a second durable `sending` receipt gates network dispatch.
+Host receipts that chat will still update (queued follow-up, send, unacked
+storage write, open request) count as in flight and survive rolling eviction,
+so a settled-looking follow-up keeps its dedupe until it is dispatched.
 Remote image follow-ups queue. Restored work is paused and restored `sending`
 is uncertain. Retry of uncertain delivery reads tail evidence instead of
 reinvoking a steer. Pull-back/cancel applies only to unsent work. Only the web's

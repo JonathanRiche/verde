@@ -322,7 +322,7 @@ test "terminal selectors decode once and failed batch allocation cannot consume 
     try expect(host.state.revision == revision and host.state.terminal.rows[0].actions.len == 0);
 }
 
-test "settled terminal input receipts evict oldest first while other receipts never evict" {
+test "settled terminal receipts roll off with every other settled receipt while pending input stays" {
     var host = try h.Host.init(A, config);
     defer host.deinit();
     var tx = try h.Transaction.init(&host);
@@ -332,7 +332,7 @@ test "settled terminal input receipts evict oldest first while other receipts ne
     const modes = .{ .application_cursor = false, .bracketed_paste = false };
     // The unanswered write keeps this receipt pending, so it must survive eviction.
     try event(&tx, "terminal_input", .{ .intent_id = "key-pending", .terminal_id = "k12-fixture", .vt_modes = modes, .input = .{ .kind = "text", .text = "x", .ctrl = false, .alt = false, .shift = false } });
-    for (0..h.MAX_TERMINAL_RECEIPTS + 10) |i| {
+    for (0..h.RECENT_RECEIPTS + 10) |i| {
         const id = try std.fmt.allocPrint(tx.allocator(), "key-{d}", .{i});
         try event(&tx, "terminal_input", .{ .intent_id = id, .terminal_id = "k12-fixture", .vt_modes = modes, .input = .{ .kind = "text", .text = "", .ctrl = false, .alt = false, .shift = false } });
     }
@@ -342,19 +342,26 @@ test "settled terminal input receipts evict oldest first while other receipts ne
             return null;
         }
     };
-    try expect(tx.state.receipts.len == 1 + h.MAX_TERMINAL_RECEIPTS);
-    try same(state.of(tx.state.receipts, "attach").?, "succeeded");
+    // One rolling window covers every settled kind: the attach receipt goes first.
+    try expect(tx.state.receipts.len == 1 + h.RECENT_RECEIPTS);
+    try expect(state.of(tx.state.receipts, "attach") == null);
     try same(state.of(tx.state.receipts, "key-pending").?, "pending");
-    try expect(state.of(tx.state.receipts, "key-10") == null and state.of(tx.state.receipts, "key-11") != null);
+    try expect(state.of(tx.state.receipts, "key-9") == null and state.of(tx.state.receipts, "key-10") != null);
     // A retained ID still deduplicates instead of writing again.
     try event(&tx, "terminal_input", .{ .intent_id = "key-pending", .terminal_id = "k12-fixture", .vt_modes = modes, .input = .{ .kind = "text", .text = "x", .ctrl = false, .alt = false, .shift = false } });
-    try expect(tx.state.receipts.len == 1 + h.MAX_TERMINAL_RECEIPTS and tx.state.terminal.rows[0].actions.len == 1);
-    // A table full of non-terminal receipts still rejects instead of evicting them.
-    const full = try tx.allocator().alloc(@TypeOf(tx.state.receipts[0]), h.MAX_RECEIPTS);
-    @memset(full, tx.state.receipts[0]);
+    try expect(tx.state.receipts.len == 1 + h.RECENT_RECEIPTS and tx.state.terminal.rows[0].actions.len == 1);
+    // A table full of in-flight receipts pushes back instead of evicting or failing the call.
+    const pending = tx.state.receipts[0];
+    try same(pending.operation.state, "pending");
+    const full = try tx.allocator().alloc(@TypeOf(pending), h.MAX_INFLIGHT_RECEIPTS);
+    @memset(full, pending);
     tx.state.receipts = full;
-    try std.testing.expectError(error.ResourceLimit, tx.apply(try h.parse(tx.allocator(),
-        \\{"api_version":1,"type":"terminal_input","now_ms":0,"wall_time_ms":0,"intent_id":"key-full","terminal_id":"k12-fixture","vt_modes":{"application_cursor":false,"bracketed_paste":false},"input":{"kind":"text","text":"","ctrl":false,"alt":false,"shift":false}}
-    )));
-    try expect(tx.state.receipts.len == h.MAX_RECEIPTS);
+    try tx.apply(try h.parse(tx.allocator(),
+        \\{"api_version":1,"type":"terminal_input","now_ms":0,"wall_time_ms":0,"intent_id":"key-full","terminal_id":"k12-fixture","vt_modes":{"application_cursor":false,"bracketed_paste":false},"input":{"kind":"text","text":"y","ctrl":false,"alt":false,"shift":false}}
+    ));
+    try expect(tx.state.receipts.len == h.MAX_INFLIGHT_RECEIPTS + 1 and tx.state.terminal.rows[0].actions.len == 1);
+    const rejected = tx.state.receipts[h.MAX_INFLIGHT_RECEIPTS].operation;
+    try same(rejected.state, "failed");
+    try same(rejected.@"error".?.code, "backpressure");
+    try expect(rejected.@"error".?.retryable);
 }

@@ -273,7 +273,7 @@ fn uploadChunk(tx: *h.Transaction, i: usize) E!void {
         try call(tx, i, .append, "chat.attachment.append", .{ .attachment_id = item.attachment_id.?, .offset = send.offset, .data = try rpc.encodeBase64(tx.allocator(), bytes[send.offset..end]) }, true, send.intent);
     }
 }
-/// Chat intents use the host's lifetime receipt deduplication before entering here.
+/// Chat intents use the host's rolling receipt deduplication before entering here.
 pub fn intent(tx: *h.Transaction, tag: []const u8, event: V) E!bool {
     var owned = false;
     inline for (.{ "focus", "thread_open", "thread_load_older", "history_search", "history_load_more", "draft_set", "composer_select", "send", "turn_cancel", "followup_submit", "followup_retry", "followup_pull_back", "followup_cancel", "approval_decide", "shell_prepare", "shell_confirm", "slash_search", "slash_run", "mention_search" }) |name| {
@@ -1131,6 +1131,18 @@ pub fn pump(tx: *h.Transaction) E!void {
         if (t.retry_at > (tx.state.now_ms orelse 0)) continue;
         if (t.reconcile and !t.loading) try page(tx, i, false, "") else if (active(t) and (t.focused or t.saved.followup != null or t.send_intent != null) and !t.reconcile) try tail(tx, i);
     }
+}
+/// Receipts chat will still update (queued follow-up, send, unacked storage or
+/// open requests) must survive host receipt eviction even while shown settled.
+pub fn holdsIntent(state: *const State, id: []const u8) bool {
+    for (state.requests) |request| if (eq(request.intent, id)) return true;
+    for (state.threads) |t| {
+        if (t.saved.followup != null and eq(t.followup_intent, id)) return true;
+        if (t.send_intent) |intent_id| if (eq(intent_id, id)) return true;
+        if (t.send) |send| if (eq(send.intent, id)) return true;
+        for (t.storage_intents) |intent_id| if (eq(intent_id, id)) return true;
+    }
+    return false;
 }
 /// Pure query using the revision-1 workspace-qualified identity.
 pub fn query(a: A, state: *const h.State, selector: []const u8) E!?V {

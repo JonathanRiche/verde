@@ -137,7 +137,7 @@ test "transport and storage invalidation are separate and cancellation order is 
     try expect(f.host.state.pending.len == 2);
 }
 
-test "receipts canonicalize ordering and time, reject changed payload and never evict" {
+test "receipts canonicalize ordering and time and reject changed payload" {
     var f = try Fixture.init();
     defer f.deinit();
     _ = try f.event(intent);
@@ -148,12 +148,102 @@ test "receipts canonicalize ordering and time, reject changed payload and never 
     const operation = get(get(try f.query("hosts"), "data"), "operations").array.items[0];
     try eql("unsupported", get(get(operation, "error"), "code").string);
     try std.testing.expectError(error.InvalidArgument, f.event("{\"api_version\":1,\"type\":\"history_load_more\",\"now_ms\":11,\"wall_time_ms\":100,\"intent_id\":\"intent-1\"}"));
-    // Fill the bounded table directly; each entry remains present on exhaustion.
-    const receipts = try f.host.arena.allocator().alloc(@TypeOf(f.host.state.receipts[0]), core.MAX_RECEIPTS);
-    @memset(receipts, f.host.state.receipts[0]);
+}
+
+fn retryIntent(f: *Fixture, id: []const u8) !V {
+    return f.event(try std.fmt.allocPrint(f.arena.allocator(), "{{\"api_version\":1,\"type\":\"retry_connection\",\"now_ms\":11,\"wall_time_ms\":100,\"intent_id\":\"{s}\"}}", .{id}));
+}
+fn receiptIndex(f: *Fixture, id: []const u8) ?usize {
+    for (f.host.state.receipts, 0..) |r, i| if (core.eq(r.operation.intent_id, id)) return i;
+    return null;
+}
+/// Replaces the retained table with `count` distinct receipts in `state`.
+fn fillReceipts(f: *Fixture, count: usize, state: []const u8) !void {
+    const a = f.host.arena.allocator();
+    const template = f.host.state.receipts[0];
+    const receipts = try a.alloc(@TypeOf(template), count);
+    for (receipts, 0..) |*r, i| {
+        r.* = template;
+        r.operation = .{ .intent_id = try std.fmt.allocPrint(a, "held-{d}", .{i}), .state = state, .@"error" = null };
+    }
     f.host.state.receipts = receipts;
-    try std.testing.expectError(error.ResourceLimit, f.event("{\"api_version\":1,\"type\":\"retry_connection\",\"now_ms\":11,\"wall_time_ms\":100,\"intent_id\":\"new\"}"));
+}
+
+test "long sessions roll settled receipts off without teardown and keep in-flight ones" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    _ = try retryIntent(&f, "held-0");
+    @constCast(f.host.state.receipts)[0].operation.state = "pending";
+    var name: [32]u8 = undefined;
+    const total = 10_050;
+    for (0..total) |i| {
+        const batch = effects(try retryIntent(&f, try std.fmt.bufPrint(&name, "intent-{d}", .{i})));
+        try expect(batch.len == 1);
+        try eql("state_changed", get(batch[0], "type").string);
+        try expect(f.host.state.receipts.len <= core.RECENT_RECEIPTS + 1);
+    }
+    // The in-flight receipt survives ten thousand newer intents and still deduplicates.
+    try expect(receiptIndex(&f, "held-0") != null);
+    try eql("pending", f.host.state.receipts[receiptIndex(&f, "held-0").?].operation.state);
+    try expect(effects(try retryIntent(&f, "held-0")).len == 0);
+    // The settled window keeps exactly the newest intents, oldest first.
+    try expect(f.host.state.receipts.len == core.RECENT_RECEIPTS + 1);
+    try expect(receiptIndex(&f, try std.fmt.bufPrint(&name, "intent-{d}", .{total - core.RECENT_RECEIPTS})) != null);
+    try expect(receiptIndex(&f, try std.fmt.bufPrint(&name, "intent-{d}", .{total - core.RECENT_RECEIPTS - 1})) == null);
+    try expect(get(get(try f.query("hosts"), "data"), "operations").array.items.len == core.RECENT_RECEIPTS + 1);
+}
+
+test "recent settled receipts deduplicate and reject changed payloads" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var name: [32]u8 = undefined;
+    for (0..core.RECENT_RECEIPTS * 3) |i| _ = try retryIntent(&f, try std.fmt.bufPrint(&name, "intent-{d}", .{i}));
+    const oldest = core.RECENT_RECEIPTS * 2;
+    for ([_]usize{ oldest, oldest + 17, core.RECENT_RECEIPTS * 3 - 1 }) |i| {
+        const id = try std.fmt.bufPrint(&name, "intent-{d}", .{i});
+        const snapshot = try f.host.query("hosts", f.arena.allocator());
+        try expect(effects(try retryIntent(&f, id)).len == 0);
+        try eql(snapshot, try f.host.query("hosts", f.arena.allocator()));
+        const changed = try std.fmt.allocPrint(f.arena.allocator(), "{{\"api_version\":1,\"type\":\"history_load_more\",\"now_ms\":11,\"wall_time_ms\":100,\"intent_id\":\"{s}\"}}", .{id});
+        try std.testing.expectError(error.InvalidArgument, f.event(changed));
+    }
+}
+
+test "in-flight receipts at the cap reject new intents with retryable backpressure" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    _ = try retryIntent(&f, "seed");
+    try fillReceipts(&f, core.MAX_INFLIGHT_RECEIPTS, "uncertain");
+    for (0..2) |_| {
+        const batch = effects(try retryIntent(&f, "blocked"));
+        try expect(batch.len == 1);
+        try eql("state_changed", get(batch[0], "type").string);
+        try expect(f.host.state.receipts.len == core.MAX_INFLIGHT_RECEIPTS + 1);
+        const op = f.host.state.receipts[receiptIndex(&f, "blocked").?].operation;
+        try eql("failed", op.state);
+        try eql("resource", op.@"error".?.domain);
+        try eql("backpressure", op.@"error".?.code);
+        try expect(op.@"error".?.retryable);
+        try eql("blocked", op.@"error".?.intent_id.?);
+    }
+    // A backpressure receipt still binds its ID to the original payload.
+    try std.testing.expectError(error.InvalidArgument, f.event("{\"api_version\":1,\"type\":\"history_load_more\",\"now_ms\":11,\"wall_time_ms\":100,\"intent_id\":\"blocked\"}"));
+    // Rejections are settled, so they never grow the table beyond the hard bound.
+    var name: [32]u8 = undefined;
+    for (0..core.RECENT_RECEIPTS + 8) |i| _ = try retryIntent(&f, try std.fmt.bufPrint(&name, "burst-{d}", .{i}));
     try expect(f.host.state.receipts.len == core.MAX_RECEIPTS);
+    for (0..core.MAX_INFLIGHT_RECEIPTS) |i| try expect(receiptIndex(&f, try std.fmt.bufPrint(&name, "held-{d}", .{i})) != null);
+    // Once one action resolves, retrying the same rejected ID is admitted and runs its engine.
+    const last = try std.fmt.bufPrint(&name, "burst-{d}", .{core.RECENT_RECEIPTS + 7});
+    try eql("backpressure", f.host.state.receipts[receiptIndex(&f, last).?].operation.@"error".?.code);
+    @constCast(f.host.state.receipts)[receiptIndex(&f, "held-0").?].operation.state = "succeeded";
+    _ = try retryIntent(&f, last);
+    try eql("unsupported", f.host.state.receipts[receiptIndex(&f, last).?].operation.@"error".?.code);
+    try expect(f.host.state.receipts.len <= core.MAX_RECEIPTS);
+    // An admitted intent that stays pending counts against the cap again.
+    @constCast(f.host.state.receipts)[receiptIndex(&f, last).?].operation.state = "pending";
+    _ = try retryIntent(&f, "later");
+    try eql("backpressure", f.host.state.receipts[receiptIndex(&f, "later").?].operation.@"error".?.code);
 }
 
 test "malformed JSON, framing, typed failures and lifecycle errors leave state unchanged" {

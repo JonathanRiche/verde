@@ -34,9 +34,16 @@ with equivalent transactional ownership without changing the ABI.
 
 ## Conservative choices where revision 1 leaves details open
 
-- Input limit: 1 MiB, JSON nesting: 64 levels, outstanding correlations: 256,
-  lifetime receipts: 1024. Exhaustion is `vc_status=5`; receipts never evict,
-  except settled `terminal_input`/`terminal_resize` receipts (D-11, [terminal.md](terminal.md)).
+- Input limit: 1 MiB, JSON nesting: 64 levels, outstanding correlations: 256.
+- Receipts roll: at most 1024 in flight (`pending`, `uncertain`, or held by
+  chat as a queued follow-up, send, unacked storage write or open request)
+  plus the 256 most recent settled ones, 1280 in total. Admitting an intent
+  evicts the oldest settled receipts first; in-flight receipts never evict.
+  Receipt volume never returns `vc_status=5` or tears the session down. With
+  1024 in flight, a new intent records a failed operation
+  `{domain:resource,code:backpressure,retryable:true}` without running any
+  engine; retrying that ID with the same payload is re-admitted once capacity
+  frees, and a changed payload still fails with status 1.
 - Host IDs are 1–128 ASCII letters/digits/underscore/hyphen. Nonces are exactly
   32 hexadecimal digits. URLs use shared `verde_remote.profile` endpoint-pair
   validation, including same authority and `/ws`. Both endpoints may be null.
@@ -65,7 +72,8 @@ with equivalent transactional ownership without changing the ABI.
 
 The harness covers ownership, independent hosts, ordered dispatch/out-of-order
 completion, cancellations, generations, timer replacement/early delivery,
-shutdown, failure shapes, malformed events, bounded receipts, unsupported
+shutdown, failure shapes, malformed events, rolling receipts (10k+ intents,
+recent-window dedupe, in-flight backpressure), unsupported
 intents, 64-bit counters, pure queries and allocation rollback. A fake JNI table
 also tests real slot indices and JVM allocation failure. The C smoke links and
 calls every implemented C export. No live daemon/provider or persistent state

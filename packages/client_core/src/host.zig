@@ -15,9 +15,13 @@ const A = std.mem.Allocator;
 const V = std.json.Value;
 pub const MAX_INPUT = 1024 * 1024;
 pub const MAX_HTTP_INPUT = 12 * 1024 * 1024;
-pub const MAX_RECEIPTS = 1024;
-/// Settled keystroke/resize receipts kept for deduplication; see terminal.md.
-pub const MAX_TERMINAL_RECEIPTS = 256;
+/// In-flight receipts (pending, uncertain or held by an engine) are never evicted.
+/// Reaching this many rejects new intents with retryable `backpressure`.
+pub const MAX_INFLIGHT_RECEIPTS = 1024;
+/// Settled receipts kept for replay deduplication; older ones evict first.
+pub const RECENT_RECEIPTS = 256;
+/// Hard bound on retained receipts: admission never grows the table past it.
+pub const MAX_RECEIPTS = MAX_INFLIGHT_RECEIPTS + RECENT_RECEIPTS;
 pub const MAX_PENDING = 256;
 pub const ApiError = error{ InvalidArgument, UnsupportedVersion, OutOfMemory, InvalidLifecycle, ResourceLimit };
 pub const Lifecycle = enum { created, foreground, background, stopped };
@@ -39,7 +43,8 @@ pub const LocalError = struct {
     delivery: ?[]const u8 = "rejected",
 };
 pub const Operation = struct { intent_id: []const u8, state: []const u8 = "failed", @"error": ?LocalError };
-const Receipt = struct { operation: Operation, digest: [32]u8, terminal: bool = false };
+/// `backpressure` marks a rejection that ran no engine, so its ID may be re-admitted.
+const Receipt = struct { operation: Operation, digest: [32]u8, backpressure: bool = false };
 pub const Config = struct {
     api_version: u32,
     host_id: []const u8,
@@ -341,14 +346,14 @@ pub const Transaction = struct {
             if (id.len == 0 or id.len > 256) return error.InvalidArgument;
             try validateIntent(self.allocator(), tag, event);
             const digest = try intentDigest(self.allocator(), event);
-            for (s.receipts) |r| if (eq(r.operation.intent_id, id)) {
+            for (s.receipts, 0..) |r, i| if (eq(r.operation.intent_id, id)) {
                 if (!std.mem.eql(u8, &r.digest, &digest)) return error.InvalidArgument;
-                return;
+                if (!r.backpressure) return;
+                // Nothing ran for a backpressure rejection; retrying the same ID is safe.
+                try self.dropReceipt(i);
+                break;
             };
-            const streamed = eq(tag, "terminal_input") or eq(tag, "terminal_resize");
-            if (streamed) try dropSettledTerminalReceipt(self);
-            if (s.receipts.len == MAX_RECEIPTS) return error.ResourceLimit;
-            try append(Receipt, self.allocator(), &s.receipts, .{ .digest = digest, .terminal = streamed, .operation = .{ .intent_id = id, .@"error" = .{ .code = "unsupported", .message = "Intent is not implemented.", .intent_id = id } } });
+            if (!try self.admitReceipt(id, digest)) return;
             _ = try auth.intent(self, tag, event);
             _ = try terminal.intent(self, tag, event);
             _ = try chat.intent(self, tag, event);
@@ -370,6 +375,49 @@ pub const Transaction = struct {
             if (!self.completion_matched) return;
         }
         try auth.advance(self);
+    }
+
+    /// Bounds the receipt table without evicting anything a replay could resend.
+    /// Returns false when the intent was rejected for backpressure instead.
+    fn admitReceipt(self: *Transaction, id: []const u8, digest: [32]u8) ApiError!bool {
+        const s = &self.state;
+        var in_flight: usize = 0;
+        for (s.receipts) |r| {
+            if (inFlight(s, r)) in_flight += 1;
+        }
+        var settled = s.receipts.len - in_flight;
+        var i: usize = 0;
+        // Oldest settled receipts go first; in-flight ones keep their dedupe forever.
+        while (settled >= RECENT_RECEIPTS and i < s.receipts.len) {
+            if (inFlight(s, s.receipts[i])) {
+                i += 1;
+            } else {
+                try self.dropReceipt(i);
+                settled -= 1;
+            }
+        }
+        self.changed = true;
+        if (in_flight >= MAX_INFLIGHT_RECEIPTS) {
+            try append(Receipt, self.allocator(), &s.receipts, .{ .digest = digest, .backpressure = true, .operation = .{ .intent_id = id, .@"error" = .{
+                .domain = "resource",
+                .code = "backpressure",
+                .message = "Too many actions are still in progress. Try again shortly.",
+                .failure_kind = "resource",
+                .retryable = true,
+                .intent_id = id,
+            } } });
+            return false;
+        }
+        try append(Receipt, self.allocator(), &s.receipts, .{ .digest = digest, .operation = .{ .intent_id = id, .@"error" = .{ .code = "unsupported", .message = "Intent is not implemented.", .intent_id = id } } });
+        return true;
+    }
+
+    fn dropReceipt(self: *Transaction, index: usize) ApiError!void {
+        const old = self.state.receipts;
+        const next = try self.allocator().alloc(Receipt, old.len - 1);
+        @memcpy(next[0..index], old[0..index]);
+        @memcpy(next[index..], old[index + 1 ..]);
+        self.state.receipts = next;
     }
 
     fn complete(self: *Transaction, tag: []const u8, event: V) ApiError!void {
@@ -480,6 +528,11 @@ pub const Transaction = struct {
     }
 };
 
+/// Unresolved outcomes, and receipts an engine will still update, are in flight.
+fn inFlight(s: *const State, r: Receipt) bool {
+    const state = r.operation.state;
+    return eq(state, "pending") or eq(state, "uncertain") or chat.holdsIntent(&s.chat, r.operation.intent_id);
+}
 pub fn eq(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
@@ -609,22 +662,6 @@ fn base64(s: []const u8) ApiError!void {
     }
 }
 
-/// Keystrokes would otherwise exhaust the lifetime receipt budget within minutes.
-/// Only settled terminal input/resize receipts leave, oldest first; others never evict.
-fn dropSettledTerminalReceipt(tx: *Transaction) ApiError!void {
-    const receipts = tx.state.receipts;
-    var count: usize = 0;
-    for (receipts) |r| count += @intFromBool(r.terminal);
-    if (count < MAX_TERMINAL_RECEIPTS and receipts.len < MAX_RECEIPTS) return;
-    for (receipts, 0..) |r, i| {
-        if (!r.terminal or !(eq(r.operation.state, "succeeded") or eq(r.operation.state, "failed"))) continue;
-        const next = try tx.allocator().alloc(Receipt, receipts.len - 1);
-        @memcpy(next[0..i], receipts[0..i]);
-        @memcpy(next[i..], receipts[i + 1 ..]);
-        tx.state.receipts = next;
-        return;
-    }
-}
 fn withAttention(tx: *Transaction) ApiError![]const []const u8 {
     var scopes = try chat.scopes(tx);
     try append([]const u8, tx.allocator(), &scopes, "attention");

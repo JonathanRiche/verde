@@ -106,10 +106,13 @@ pending credential write; only shutdown/removal invalidates those completions.
 
 A user intent has `intent_id`, retained in its operation result. Repeated IDs
 with identical payload return the existing outcome, never send twice; reuse
-with a different payload is rejected. Completed receipts are retained for the
-handle lifetime within a bounded budget; on exhaustion reject new intents
-with `resource_limit`, do not evict IDs and accidentally replay mutations.
-The one exception is terminal keystroke/resize receipts (see [terminal.md](terminal.md)).
+with a different payload is rejected. Receipts are bounded by a rolling limit,
+never by lifetime volume: in-flight receipts (`pending`, `uncertain`, or still
+referenced by an engine) are never evicted, so their IDs cannot be replayed into
+a second mutation; settled receipts stay deduplicated for a recent window and
+then evict oldest first. If in-flight receipts alone reach the cap, a new
+intent succeeds at the ABI with a failed `Operation` carrying the retryable
+`resource`/`backpressure` error; it ran nothing, so its ID may be retried.
 Persistence receipts extend this protection across process death where noted.
 Daemon RPC IDs are numeric `u64` as required by `protocol.Request`, independent
 of local correlation IDs. Match response IDs as well as the owning HTTP effect.
