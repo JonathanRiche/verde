@@ -389,7 +389,7 @@ private final class TermCore: HostCore {
     private var row: HostView
     private var terminals: [String: TerminalView] = [:]
     private var order: [String] = []
-    private var operations: [Operation] = []
+    private var operations: [VerdeApp.Operation] = []
     private var sequence = 0
     private var created = 0
     private var _rejected = 0
@@ -457,7 +457,7 @@ private final class TermCore: HostCore {
         case .terminal_resize(let e): terminals[e.terminal_id]?.cols = e.cols; terminals[e.terminal_id]?.rows = e.rows
         case .terminal_create(let e):
             if e.workspace_id == "no-path" {
-                operations.append(Operation(intent_id: e.intent_id, state: "failed",
+                operations.append(VerdeApp.Operation(intent_id: e.intent_id, state: "failed",
                     error: LocalError(code: "workspace_path_unavailable", message: "no path")))
             } else {
                 created += 1

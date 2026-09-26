@@ -57,9 +57,9 @@ struct TerminalApplied: Equatable {
 }
 
 /// Main-thread view of one VT: the latest grid and how often the emulator was rebuilt.
-/// Updated in order through the main queue; never logged.
+/// Updated in order through the main queue only (hence the unchecked Sendable); never logged.
 @Observable
-final class TerminalFeed {
+final class TerminalFeed: @unchecked Sendable {
     /// Latest full grid; kept across transient failures so the last screen stays visible.
     fileprivate(set) var snapshot: TerminalSnapshot?
     /// Emulator resets (initial replay, gap/reconnect replay, apply-failure recovery).
