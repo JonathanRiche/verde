@@ -136,6 +136,19 @@ class ComposerTest {
         FocusClaim.owner=null
     }
 
+    @Test fun promptHandleResizesAndDoubleTapRestoresCompactHeight() {
+        launch()
+        val initial = field().fetchSemanticsNode().boundsInRoot.height
+        compose.onNodeWithTag("composer-resize").performTouchInput {
+            swipe(center, center.copy(y = center.y - 100f))
+        }
+        val expanded = field().fetchSemanticsNode().boundsInRoot.height
+        assertTrue(expanded > initial)
+        compose.onNodeWithTag("composer-resize").performTouchInput { doubleClick() }
+        assertEquals(initial, field().fetchSemanticsNode().boundsInRoot.height, 1f)
+        assertTrue(sent<EventSend>().isEmpty())
+    }
+
     @Config(qualifiers = "w320dp-h800dp")
     @Test fun composerActionsStayAtTheRightEdgeWhileRunning() {
         setup = { it.running() }

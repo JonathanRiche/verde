@@ -9,6 +9,15 @@ import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.ui.res.painterResource
 import androidx.compose.foundation.focusGroup
+import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.semantics.CustomAccessibilityAction
+import androidx.compose.ui.semantics.customActions
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.focus.FocusRequester
@@ -145,6 +154,15 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState) {
         else -> view.can_send
     }
 
+    val density = LocalDensity.current
+    val screenHeight = LocalConfiguration.current.screenHeightDp.dp
+    val keyboardHeight = with(density) { WindowInsets.ime.getBottom(this).toDp() }
+    val maxFieldHeight = ((screenHeight - keyboardHeight) * .6f).coerceAtLeast(56.dp)
+    var resizedHeight by rememberSaveable { mutableStateOf<Float?>(null) }
+    var measuredHeight by remember { mutableStateOf(56f) }
+    val resizeField: (Float) -> Unit = { delta ->
+        resizedHeight = ((resizedHeight ?: measuredHeight) + delta).coerceIn(56f, maxFieldHeight.value)
+    }
     var composerFocused by remember { mutableStateOf(false) }
     Surface(color = VerdeColors.Panel, shape = RoundedCornerShape(14.dp),
         border = BorderStroke(if (composerFocused) 1.5.dp else 1.dp,
@@ -160,10 +178,33 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState) {
             }
             Suggestions(composer, view)
             if (attachments.isNotEmpty()) Attachments(attachments, sendPending || composer.busy, composer)
+            Box(Modifier.fillMaxWidth().height(24.dp).testTag("composer-resize")
+                .semantics {
+                    contentDescription = "Drag to resize the prompt box"
+                    customActions = listOf(
+                        CustomAccessibilityAction("Expand prompt box") { resizeField(56f); true },
+                        CustomAccessibilityAction("Shrink prompt box") { resizeField(-56f); true },
+                        CustomAccessibilityAction("Reset prompt box size") { resizedHeight = null; true },
+                    )
+                }
+                .pointerInput(maxFieldHeight, density) {
+                    detectVerticalDragGestures { change, amount ->
+                        change.consume()
+                        resizeField(-amount / density.density)
+                    }
+                }
+                .pointerInput(Unit) { detectTapGestures(onDoubleTap = { resizedHeight = null }) },
+                contentAlignment = Alignment.Center) {
+                Box(Modifier.size(40.dp, 4.dp).background(VerdeColors.Border, RoundedCornerShape(2.dp)))
+            }
             BasicTextField(
                 value = composer.field,
                 onValueChange = { if (!sendPending) composer.edit(it) },
-                modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp).focusRequester(fieldFocus).testTag(COMPOSER_FIELD),
+                modifier = Modifier.fillMaxWidth()
+                    .then(resizedHeight?.let { Modifier.height(it.dp.coerceIn(56.dp, maxFieldHeight)) }
+                        ?: Modifier.heightIn(min = 56.dp))
+                    .onSizeChanged { measuredHeight = it.height / density.density }
+                    .focusRequester(fieldFocus).testTag(COMPOSER_FIELD),
                 readOnly = sendPending,
                 decorationBox = { innerTextField ->
                     Box(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
@@ -179,14 +220,11 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState) {
                 },
                 cursorBrush = SolidColor(VerdeColors.Accent),
                 textStyle = MaterialTheme.typography.bodyLarge.copy(color = VerdeColors.Text),
-                maxLines = 6,
+                maxLines = if (resizedHeight == null) 6 else Int.MAX_VALUE,
                 keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
             )
             if (view != null) {
-                FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp),
-                    verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    SettingsControls(view, state, provider) { picker = it }
-                }
+                SettingsControls(view, state, provider) { picker = it }
             }
             // Keep actions anchored regardless of settings labels, font scale or turn state.
             Row(Modifier.fillMaxWidth().testTag("composer-actions"),
@@ -328,21 +366,31 @@ private fun SettingsControls(view: ChatComposerView, state: TranscriptState, pro
     // Like the desktop, the provider is fixed once a conversation has started.
     val fresh = state.thread?.rows?.isEmpty() == true && state.turn == null
 
-        val providerLabel = PROVIDERS.find { it.first == provider }?.second ?: provider ?: "Provider"
-        if (fresh) SettingChip("Provider", providerLabel) { open(ComposerPicker.Provider) }
-        SettingChip("Model", label(c.models, s.model ?: c.models.firstOrNull()?.id) ?: "Model", provider) { open(ComposerPicker.Model) }
-        if (c.efforts.isNotEmpty()) SettingChip("Effort", label(c.efforts, s.effort) ?: "Default", icon = R.drawable.composer_reasoning,
-            fill = ((c.efforts.indexOfFirst { it.id == (s.effort ?: "") }.coerceAtLeast(0) + 1).toFloat() / c.efforts.size)) { open(ComposerPicker.Effort) }
-        if (c.access.isNotEmpty()) SettingChip("Access", label(c.access, s.access) ?: "Access",
-            icon = if ((s.access ?: c.access.firstOrNull()?.id) == "full_access") R.drawable.composer_unlocked else R.drawable.composer_locked) { open(ComposerPicker.Access) }
-        if (c.speeds.size > 1) SettingChip("Speed", label(c.speeds, s.speed) ?: "Speed",
-            icon = if (s.speed == "on") R.drawable.composer_fast else R.drawable.composer_standard) { open(ComposerPicker.Speed) }
+    val providerLabel = PROVIDERS.find { it.first == provider }?.second ?: provider ?: "Provider"
+    if (fresh) SettingChip("Provider", providerLabel) { open(ComposerPicker.Provider) }
+    BoxWithConstraints(Modifier.fillMaxWidth()) {
+        val compact = maxWidth < 480.dp
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp),
+            verticalAlignment = Alignment.CenterVertically) {
+            SettingChip("Model", label(c.models, s.model ?: c.models.firstOrNull()?.id) ?: "Model", provider,
+                modifier = Modifier.weight(1f)) { open(ComposerPicker.Model) }
+            if (c.efforts.isNotEmpty()) SettingChip("Effort", label(c.efforts, s.effort) ?: "Default",
+                modifier = Modifier.widthIn(max = if (compact) 100.dp else 160.dp),
+                icon = R.drawable.composer_reasoning,
+                fill = ((c.efforts.indexOfFirst { it.id == (s.effort ?: "") }.coerceAtLeast(0) + 1).toFloat() / c.efforts.size)) { open(ComposerPicker.Effort) }
+            if (c.speeds.size > 1) SettingChip("Speed", label(c.speeds, s.speed) ?: "Speed", compact = compact,
+                icon = if (s.speed == "on") R.drawable.composer_fast else R.drawable.composer_standard) { open(ComposerPicker.Speed) }
+            if (c.access.isNotEmpty()) SettingChip("Access", label(c.access, s.access) ?: "Access", compact = compact,
+                icon = if ((s.access ?: c.access.firstOrNull()?.id) == "full_access") R.drawable.composer_unlocked else R.drawable.composer_locked) { open(ComposerPicker.Access) }
+        }
+    }
 }
 
 @Composable
 private fun SettingChip(name: String, value: String, provider: String? = null,
-    icon: Int? = null, fill: Float = 1f, onClick: () -> Unit) {
-    AssistChip(onClick = onClick, leadingIcon = if (provider != null) {
+    icon: Int? = null, fill: Float = 1f, compact: Boolean = false,
+    modifier: Modifier = Modifier, onClick: () -> Unit) {
+    val leading: (@Composable () -> Unit)? = if (provider != null) {
         { ProviderGlyph(provider, Modifier.size(14.dp)) }
     } else icon?.let { resource -> {
         Box(Modifier.size(16.dp)) {
@@ -353,11 +401,20 @@ private fun SettingChip(name: String, value: String, provider: String? = null,
                     clipRect(top = size.height * (1f - fill.coerceIn(0f, 1f))) { this@drawWithContent.drawContent() }
                 })
         }
-    } }, label = { Text(value, style = MaterialTheme.typography.labelMedium,
+    } }
+    val controlModifier = modifier.semantics { contentDescription = "$name: $value. Change" }
+    if (compact) {
+        FilledTonalIconButton(onClick = onClick, modifier = controlModifier.size(48.dp),
+            colors = IconButtonDefaults.filledTonalIconButtonColors(containerColor = VerdeColors.PanelAlt)) {
+            leading?.invoke()
+        }
+        return
+    }
+    AssistChip(onClick = onClick, leadingIcon = leading, label = { Text(value, style = MaterialTheme.typography.labelMedium,
         maxLines = 1, overflow = TextOverflow.Ellipsis) },
         shape = RoundedCornerShape(14.dp), border = null,
         colors = AssistChipDefaults.assistChipColors(containerColor = VerdeColors.PanelAlt, labelColor = VerdeColors.Muted),
-        modifier = Modifier.widthIn(max = 220.dp).semantics { contentDescription = "$name: $value. Change" })
+        modifier = controlModifier.widthIn(max = 220.dp))
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
