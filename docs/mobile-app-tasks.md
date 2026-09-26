@@ -164,7 +164,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | D-07 | Diff card | android | linux | D-06 | done (e369ee75, cc2bf9e7; phone verify pending) |
 | D-08 | Composer + pickers + attachments + follow-ups | android | linux | D-06 | in_progress (claude opus cli-thread-1790407267836-b7791f3bb1576d33) |
 | D-09 | Approvals card | android | linux | D-06 | done (5bb55bac) |
-| D-10 | History, new chat, workspace management | android | linux | D-05, A-03 | in_progress (claude opus cli-thread-1790406845038-4d8a9c2c8a809c73; includes core create-thread/workspace intents) |
+| D-10 | History, new chat, workspace management | android | linux | D-05, A-03 | done (fe7bd30e, b283f9cb) |
 | D-11 | Native terminal view | android | linux+phone | D-05, K-12 | done (a114ffca; phone verify pending) |
 | D-12 | File viewer | android | linux | D-06, A-01 | done (0df099c8) |
 | D-13 | Theme + reduced motion | android | linux | D-05 | todo |
@@ -1061,6 +1061,7 @@ human-verify step.
     rename/close.
   - Thread menu: rename, regenerate title, sync, close.
 - **Done when:** tests pass.
+- **Done (fe7bd30e, b283f9cb).** Core thread/workspace intents; Android history (search, buckets, closed workspaces), New chat sheet (workspace/provider/model/effort/access from host), Add workspace with `workspace.directory.list` picker (typed-path fallback on old daemons), close/reopen/rename; ManageTest. Gaps: thread archive/rename and new-chat cwd not built; model list not refetched after reconnect. Device smoke pending pairing.
 
 #### D-11 · Native terminal view
 - **depends:** D-05, K-12
