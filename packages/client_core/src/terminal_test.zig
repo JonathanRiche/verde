@@ -411,3 +411,15 @@ test "terminal output bursts announce the terminal view but never hosts or opera
     }
     try expect(host.state.terminal.rows[0].offset.? == offset);
 }
+
+test "VT answers primary device attributes across split input" {
+    const t = try vt.Terminal.create(A, "{\"api_version\":1,\"cols\":8,\"rows\":2,\"scrollback_rows\":0}");
+    defer t.destroy();
+    try t.write("\x1b[");
+    try t.write("c");
+    var grid = try snapshot(t);
+    defer grid.deinit();
+    const reply = try @import("auth.zig").decode64(A, grid.value.reply_bytes_base64);
+    defer A.free(reply);
+    try same("\x1b[?62;22c", reply);
+}

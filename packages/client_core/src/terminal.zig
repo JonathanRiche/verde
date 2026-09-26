@@ -6,6 +6,8 @@ const rpc = @import("rpc.zig");
 const A = std.mem.Allocator;
 const Stream = @TypeOf((@as(*vt.Terminal, undefined)).vtStream());
 const Handler = @FieldType(Stream, "handler");
+const DeviceAttributesFn = @typeInfo(@FieldType(Handler.Effects, "device_attributes")).optional.child;
+const DeviceAttributes = @typeInfo(@typeInfo(DeviceAttributesFn).pointer.child).@"fn".return_type.?;
 pub const Config = struct { api_version: u32 = 1, cols: u16, rows: u16, scrollback_rows: u32 };
 pub const CursorShape = enum { block, underline, bar };
 pub const Cursor = struct { row: u16, col: u16, visible: bool, shape: CursorShape };
@@ -54,6 +56,7 @@ pub const Terminal = struct {
         }) catch |err| return h.mapError(err), .stream = undefined };
         self.stream = self.terminal.vtStream();
         self.stream.handler.effects.write_pty = reply;
+        self.stream.handler.effects.device_attributes = deviceAttributes;
         return self;
     }
     pub fn destroy(self: *Terminal) void {
@@ -147,6 +150,12 @@ pub const Terminal = struct {
     }
     pub fn consumeReplies(self: *Terminal) void {
         self.replies.clearRetainingCapacity();
+    }
+    // Ghostty's readonly handler intentionally leaves DA unanswered. Advertise
+    // its conservative default (VT220 + ANSI colour), without unsupported image
+    // or clipboard capabilities, so shells can finish capability negotiation.
+    fn deviceAttributes(_: *Handler) DeviceAttributes {
+        return .{};
     }
     fn reply(handler: *Handler, bytes: [:0]const u8) void {
         const self: *Terminal = @fieldParentPtr("terminal", handler.terminal);
