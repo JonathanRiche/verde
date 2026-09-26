@@ -165,7 +165,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | D-08 | Composer + pickers + attachments + follow-ups | android | linux | D-06 | in_progress (claude opus cli-thread-1790407267836-b7791f3bb1576d33) |
 | D-09 | Approvals card | android | linux | D-06 | in_progress (claude opus cli-thread-1790407269611-f227ceb059b64580) |
 | D-10 | History, new chat, workspace management | android | linux | D-05, A-03 | in_progress (claude opus cli-thread-1790406845038-4d8a9c2c8a809c73; includes core create-thread/workspace intents) |
-| D-11 | Native terminal view | android | linux+phone | D-05, K-12 | in_progress (claude opus cli-thread-1790405366306-80a778f6cd0e9eaa) |
+| D-11 | Native terminal view | android | linux+phone | D-05, K-12 | done (a114ffca; phone verify pending) |
 | D-12 | File viewer | android | linux | D-06, A-01 | todo |
 | D-13 | Theme + reduced motion | android | linux | D-05 | todo |
 | D-14 | Push + actionable notifications | android | linux+phone | D-09, K-17, A-14, C-02, H-05 | todo |
@@ -179,7 +179,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | I-05 | Transcript + diff + approvals | ios | mac | I-04, D-06, D-07, D-09 | todo |
 | I-06 | Composer + pickers + attachments + follow-ups | ios | mac | I-05, D-08 | todo |
 | I-07 | History, new chat, workspace management | ios | mac | I-04, D-10 | todo |
-| I-08 | Native terminal view | ios | mac+phone | I-04, D-11 | todo |
+| I-08 | Native terminal view | ios | mac+phone | I-04, D-11 | in_progress (claude opus cli-thread-1790407724842-6fb190b3221c3e1d) |
 | I-09 | File viewer, theme, app lock | ios | mac | I-05, D-12, D-13, D-15 | todo |
 | I-10 | Push + NSE + actionable notifications | ios | mac+phone | I-05, K-17, C-02, H-05 | todo |
 | I-11 | XCUITest / Maestro flows | ios | mac | I-06 | todo |
@@ -1070,6 +1070,7 @@ human-verify step.
   - Resize → `session.resize`; landscape support.
 - **Done when:** tests pass. Human-verify: nvim and htop usable on the
   phone.
+- **Done (a114ffca).** The Android terminal draws the core's grid on a Canvas: colors, attributes, wide characters and the cursor. A key row offers Esc, Tab, sticky Ctrl and Alt, arrows, symbols, Home/End, PgUp/PgDn and Paste; the IME has suggestions off; hardware keys work, and all input goes through the core's key encoding. Gestures: tap opens the keyboard, drag scrolls back, pinch sets the font from 8 to 32 sp, and long-press selects, with copies marked sensitive. Resize is sent only while connected. Overlays cover offline, reconnecting, ended, gone, view-only and replay-gap states. New terminal appears on the workspace screen, and leaving detaches without killing the session. Focus goes through D-06's `FocusClaim`. In the core, settled keystroke and resize receipts evict beyond 256 (the general receipt fix will supersede this), resource-limit rejections are no longer fatal, and `zig build jvm-lib` builds the JNI test. `mobile-android-test` passes 110/110 and `mobile-core-test` 168/168. Follow-ups: host theme palette (D-13), no resize negotiation with the desktop, a 32-terminals-per-connection cap, no fit-to-screen in view-only, no screen reader access to the grid, and every core change re-reads all views.
 
 #### D-12 · File viewer
 - **depends:** D-06, A-01
