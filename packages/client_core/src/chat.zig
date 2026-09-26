@@ -1118,7 +1118,9 @@ pub fn pump(tx: *h.Transaction) E!void {
         for (tx.state.sync.catalog) |item| {
             if (!eq(p.s(item, "workspace_id"), t.workspace_id) or !eq(p.s(item, "local_thread_id"), t.id)) continue;
             const latest = std.json.parseFromValueLeaky(store.Thread, tx.allocator(), item, .{ .ignore_unknown_fields = true }) catch |e| return h.mapError(e);
-            if (!eq(latest.cwd orelse "", t.metadata.cwd orelse "") or !eq(latest.repository_id orelse "", t.metadata.repository_id orelse "") or !eq(latest.repository_cwd orelse "", t.metadata.repository_cwd orelse "")) {
+            // The host learns a stable runtime identity when the first turn starts.
+            // Retain it on subsequent upserts: committed routes cannot be cleared.
+            if (!eq(latest.profile_id orelse "", t.metadata.profile_id orelse "") or !eq(latest.runtime_id orelse "", t.metadata.runtime_id orelse "") or !eq(latest.cwd orelse "", t.metadata.cwd orelse "") or !eq(latest.repository_id orelse "", t.metadata.repository_id orelse "") or !eq(latest.repository_cwd orelse "", t.metadata.repository_cwd orelse "")) {
                 t.confirmation = null;
                 if (t.saved.followup) |*f| f.paused = true;
                 t.metadata = latest;

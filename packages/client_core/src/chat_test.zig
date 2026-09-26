@@ -531,3 +531,26 @@ test "chat transcript tail announces its thread but never hosts; receipts announ
     // A host-level change (lifecycle) is what announces hosts.
     try expect(announced(try f.event("background", .{}), "hosts"));
 }
+
+test "chat send retains runtime identity learned after the first turn" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.open();
+    // A catalog refresh after the initial turn learns the immutable route even
+    // though cwd and repository have not changed. Simulate resume generation.
+    var tx = try h.Transaction.init(&f.host);
+    defer tx.deinit();
+    const item = @constCast(&tx.state.sync.catalog[0]);
+    try item.object.put(tx.allocator(), "profile_id", .{ .string = "local" });
+    try item.object.put(tx.allocator(), "runtime_id", .{ .string = "0123456789abcdef0123456789abcdef" });
+    tx.state.generation += 1;
+    try chat.pump(&tx);
+    _ = try tx.commit(&f.host, f.a());
+    try f.draft("next turn");
+    const revision = p.s(p.get(p.get(try f.query("composer"), "data"), "draft"), "revision");
+    _ = try f.intent("send", .{ .draft_revision = revision });
+    try f.reply("daemon.client.register", .{ .client_id = "resumed-client" });
+    const settings = p.get(try f.params("chat.thread.upsert"), "thread");
+    try eql("0123456789abcdef0123456789abcdef", p.s(settings, "runtime_id"));
+    try eql("local", p.s(settings, "profile_id"));
+}
