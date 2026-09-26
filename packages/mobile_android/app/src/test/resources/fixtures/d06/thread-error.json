@@ -1,0 +1,41 @@
+{
+ "api_version": 1,
+ "revision": "3",
+ "data": {
+  "thread": {
+   "workspace_id": "chat-fixture-ws",
+   "thread_id": "chat-fixture-thread",
+   "title": "Chat fixture",
+   "provider": "codex",
+   "model": null,
+   "cwd": "",
+   "open": true,
+   "archived": false,
+   "last_activity_at_ms": null,
+   "status": "idle",
+   "history_bucket": "Older"
+  },
+  "rows": [],
+  "page": {
+   "has_older": false,
+   "cursor": null,
+   "loading": false
+  },
+  "turn": null,
+  "approval": null,
+  "usage": null,
+  "stale": false,
+  "error": {
+   "domain": "rpc",
+   "code": "remote_error",
+   "message": "The runtime rejected the request.",
+   "failure_kind": null,
+   "retryable": false,
+   "retry_after_ms": null,
+   "intent_id": "@chat",
+   "rpc_code": "internal_error",
+   "delivery": "rejected"
+  }
+ },
+ "error": null
+}

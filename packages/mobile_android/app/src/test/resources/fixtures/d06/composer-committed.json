@@ -1,0 +1,158 @@
+{
+ "api_version": 1,
+ "revision": "12",
+ "data": {
+  "draft": {
+   "revision": "0",
+   "text": "",
+   "attachments": [],
+   "persisted": true
+  },
+  "selection": {
+   "provider": "codex",
+   "model": null,
+   "effort": null,
+   "access": "full_access",
+   "speed": "off"
+  },
+  "catalogs": {
+   "models": [
+    {
+     "id": "gpt-6-astra",
+     "label": "GPT-6 Astra",
+     "enabled": true,
+     "reason": null,
+     "favorite": false
+    },
+    {
+     "id": "gpt-6-sol",
+     "label": "GPT-6 Sol",
+     "enabled": true,
+     "reason": null,
+     "favorite": false
+    },
+    {
+     "id": "gpt-6-luna",
+     "label": "GPT-6 Luna",
+     "enabled": true,
+     "reason": null,
+     "favorite": false
+    },
+    {
+     "id": "gpt-5.6-sol",
+     "label": "GPT-5.6 Sol",
+     "enabled": true,
+     "reason": null,
+     "favorite": false
+    },
+    {
+     "id": "gpt-5.5",
+     "label": "GPT-5.5",
+     "enabled": true,
+     "reason": null,
+     "favorite": false
+    },
+    {
+     "id": "gpt-5.6-terra",
+     "label": "GPT-5.6 Terra",
+     "enabled": true,
+     "reason": null,
+     "favorite": false
+    },
+    {
+     "id": "gpt-5.6-luna",
+     "label": "GPT-5.6 Luna",
+     "enabled": true,
+     "reason": null,
+     "favorite": false
+    }
+   ],
+   "efforts": [
+    {
+     "id": "",
+     "label": "Default",
+     "enabled": true,
+     "reason": null,
+     "favorite": false
+    },
+    {
+     "id": "low",
+     "label": "Low",
+     "enabled": true,
+     "reason": null,
+     "favorite": false
+    },
+    {
+     "id": "medium",
+     "label": "Medium",
+     "enabled": true,
+     "reason": null,
+     "favorite": false
+    },
+    {
+     "id": "high",
+     "label": "High",
+     "enabled": true,
+     "reason": null,
+     "favorite": false
+    },
+    {
+     "id": "xhigh",
+     "label": "Xhigh",
+     "enabled": true,
+     "reason": null,
+     "favorite": false
+    },
+    {
+     "id": "max",
+     "label": "Max",
+     "enabled": true,
+     "reason": null,
+     "favorite": false
+    }
+   ],
+   "access": [
+    {
+     "id": "supervised",
+     "label": "Supervised",
+     "enabled": true,
+     "reason": null,
+     "favorite": false
+    },
+    {
+     "id": "full_access",
+     "label": "Full access",
+     "enabled": true,
+     "reason": null,
+     "favorite": false
+    }
+   ],
+   "speeds": [
+    {
+     "id": "off",
+     "label": "Normal",
+     "enabled": true,
+     "reason": null,
+     "favorite": false
+    },
+    {
+     "id": "on",
+     "label": "Fast",
+     "enabled": true,
+     "reason": null,
+     "favorite": false
+    }
+   ],
+   "slash": []
+  },
+  "mentions": [],
+  "provider_ready": true,
+  "can_send": true,
+  "can_stop": false,
+  "send_operation": null,
+  "followup": null,
+  "shell_confirmation": null,
+  "error": null
+ },
+ "error": null
+}

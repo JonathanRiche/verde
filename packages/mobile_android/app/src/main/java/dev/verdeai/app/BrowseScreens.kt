@@ -32,7 +32,7 @@ internal const val BROWSE_LIST = "browse-list"
 internal val LocalUiClock = staticCompositionLocalOf { UiClock() }
 
 @Composable
-private fun rememberNow(enabled: Boolean): Long {
+internal fun rememberNow(enabled: Boolean): Long {
     val clock = LocalUiClock.current
     val now by produceState(clock.now(), enabled, clock) {
         value = clock.now()
@@ -427,27 +427,6 @@ internal fun WorkspaceScreen(
             }
             if (showArchived) items(archived, key = { "archived:" + it.thread_id }) { ThreadItem(it, now, null, onOpenThread) }
         }
-    }
-}
-
-/** D-06 replaces this with the transcript; it deliberately sends no focus/open intents yet. */
-@Composable
-internal fun ThreadPlaceholderScreen(model: BrowseModel, workspaceId: String, threadId: String, onBack: () -> Unit) {
-    val state by model.state.collectAsState()
-    val workspace = state.workspaces?.items?.find { it.workspace_id == workspaceId }
-    val thread = workspace?.threads?.find { it.thread_id == threadId }
-    val pane = (state.home?.items.orEmpty() + workspace?.panes.orEmpty()).find { it.workspace_id == workspaceId && it.thread_id == threadId }
-    val now = rememberNow(pane?.can_stop == true && pane.started_at_ms != null)
-    PlaceholderFrame(thread?.title ?: pane?.title ?: "Chat", onBack) {
-        workspace?.let { Text(it.label, style = MaterialTheme.typography.titleMedium) }
-        thread?.let { t ->
-            Text(listOfNotNull(t.provider, t.model).joinToString(" · "))
-            t.last_activity_at_ms?.let { Text("Last activity ${agoLabel(it, LocalUiClock.current.now())}") }
-        }
-        Text(pane?.let { paneLine(it, now) } ?: statusLabel(thread?.status ?: "idle"))
-        if (thread == null && pane == null) Text("This chat is no longer on the host.")
-        Text("The transcript view is coming in the next update. Open this chat in Verde on your computer for now.",
-            style = MaterialTheme.typography.bodyMedium)
     }
 }
 

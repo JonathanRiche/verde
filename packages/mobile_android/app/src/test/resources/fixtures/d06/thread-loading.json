@@ -1,0 +1,31 @@
+{
+ "api_version": 1,
+ "revision": "2",
+ "data": {
+  "thread": {
+   "workspace_id": "chat-fixture-ws",
+   "thread_id": "chat-fixture-thread",
+   "title": "Chat fixture",
+   "provider": "codex",
+   "model": null,
+   "cwd": "",
+   "open": true,
+   "archived": false,
+   "last_activity_at_ms": null,
+   "status": "idle",
+   "history_bucket": "Older"
+  },
+  "rows": [],
+  "page": {
+   "has_older": false,
+   "cursor": null,
+   "loading": true
+  },
+  "turn": null,
+  "approval": null,
+  "usage": null,
+  "stale": false,
+  "error": null
+ },
+ "error": null
+}

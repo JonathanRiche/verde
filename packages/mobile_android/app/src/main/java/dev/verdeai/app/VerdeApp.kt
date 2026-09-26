@@ -107,7 +107,7 @@ private fun Graph(nav: NavHostController, start: String, hosts: HostsModel, brow
         }
         composable(Routes.THREAD) { entry ->
             val args = entry.arguments
-            ThreadPlaceholderScreen(browse, args?.getString("ws").orEmpty(), args?.getString("thread").orEmpty()) { nav.popBackStack() }
+            ThreadRoute(hosts, browse, args?.getString("ws").orEmpty(), args?.getString("thread").orEmpty(), showHosts) { nav.popBackStack() }
         }
         composable(Routes.TERMINAL) { entry ->
             val args = entry.arguments

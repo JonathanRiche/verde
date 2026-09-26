@@ -109,14 +109,16 @@ class BrowseTest {
         awaitText("Unread")
     }
 
-    @Test fun tappingAChatOpensThePlaceholderAndBackReturnsHome() {
+    @Test fun tappingAChatOpensTheFocusedTranscriptAndBackUnfocuses() {
         launch()
         awaitText("Needs attention")
         compose.onAllNodesWithText("Layout chat")[0].performClick()
-        awaitText("The transcript view is coming", substring=true)
-        compose.onNodeWithText("Chat · Needs approval · 1:00", useUnmergedTree=true).assertExists()
+        // D-06: the transcript focuses its thread (K-17 attention clears) and loads from the core.
+        awaitText("Loading conversation…")
+        await { core.events.any { it is EventFocus && it.thread_id == "layout-thread" } }
         compose.onNodeWithContentDescription("Back").performClick()
         awaitText("Needs attention")
+        await { core.events.any { it is EventFocus && it.thread_id == null } }
     }
 
     @Test fun workspacesListDetailAndLongPressMenus() {
