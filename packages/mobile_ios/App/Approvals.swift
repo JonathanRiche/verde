@@ -38,7 +38,7 @@ extension ChatApproval {
 }
 
 enum DecideResult: Equatable {
-    /// The core accepted the intent; follow the intent id in `hosts.operations`.
+    /// The core accepted the intent; follow the intent id in the `operations` selector.
     case sent(String)
     /// The core refused the event outright (malformed or out of budget).
     case rejected
@@ -200,7 +200,7 @@ func phaseAnnouncement(from previous: ApprovalPhase, to next: ApprovalPhase) -> 
 
 /// One thread's approval decisions. Tracks this phone's decision through the core receipt and
 /// notices when the pending approval disappears, to say who resolved it. Driven by its owner:
-/// `update(thread:)` on every new thread projection, `settle(operations:)` on every hosts change.
+/// `update(thread:)` on every new thread projection, `settle(operations:)` on every `operations` change.
 @MainActor @Observable
 final class ApprovalController {
     static let outcomeDelay: TimeInterval = 4

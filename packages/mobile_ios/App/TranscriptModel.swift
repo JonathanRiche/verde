@@ -181,7 +181,7 @@ final class TranscriptModel: DiffRenderSource {
         threadSelector = chatSelector("thread", workspaceID, threadID)
         composerSelector = chatSelector("composer", workspaceID, threadID)
         approvals = ApprovalController(workspaceID: workspaceID, threadID: threadID, host: { [weak self] in self?.host },
-            operations: { [weak self] in self?.store?.hosts?.data?.operations }, outcomeDelay: outcomeDelay)
+            operations: { [weak self] in self?.store?.operations?.data?.items }, outcomeDelay: outcomeDelay)
     }
 
     var state: TranscriptState {
@@ -301,7 +301,7 @@ final class TranscriptModel: DiffRenderSource {
             _ = (b.hostID, b.fatal, b.networkAvailable, b.host?.phase, b.host?.auth_state, b.host?.sync_state,
                  b.host?.trust_proposal != nil, b.host?.update_required, session?.host != nil)
             if let store = session?.store {
-                _ = (store.snapshots[threadSelector], store.snapshots[composerSelector], store.hosts?.revision, store.failed)
+                _ = (store.snapshots[threadSelector], store.snapshots[composerSelector], store.hosts?.revision, store.operations?.revision, store.failed)
             }
         } onChange: { [weak self] in
             Task { @MainActor in
@@ -328,11 +328,11 @@ final class TranscriptModel: DiffRenderSource {
             composerData = composerBytes
             composer = composerBytes.flatMap { try? JSONDecoder().decode(ComposerQuery.self, from: $0) }?.data
         }
-        approvals.settle(operations: store.hosts?.data?.operations)
+        approvals.settle(operations: store.operations?.data?.items)
 
         let b = browse.state
         let gate = Gate(visible: visible, ready: ready(b.host), settling: settling(b.host, network: b.networkAvailable),
-                        failure: failure(store.hosts))
+                        failure: failure(store.operations))
         guard gate != lastGate else { return }
         lastGate = gate
         unfocusTask?.cancel()
@@ -375,8 +375,8 @@ final class TranscriptModel: DiffRenderSource {
         return view.phase == "ready" && view.auth_state == "paired" && ["ready", "stale"].contains(view.sync_state)
     }
 
-    private func failure(_ query: HostsQuery?) -> String? {
-        guard let id = focusIntent, let op = query?.data?.operations.first(where: { $0.intent_id == id }) else { return nil }
+    private func failure(_ query: OperationsQuery?) -> String? {
+        guard let id = focusIntent, let op = query?.data?.items.first(where: { $0.intent_id == id }) else { return nil }
         return op.state == "failed" ? (op.error?.code ?? "failed") : nil
     }
 

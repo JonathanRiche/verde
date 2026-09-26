@@ -53,6 +53,7 @@ final class ChatCore: HostCore {
     private var row: HostView
     private var _operations: [String: CoreOperation] = [:]
     private var order: [String] = []
+    private var operationsChanged = false
     private var network = true
     private var sequence = 0
     private var _thread: String
@@ -84,6 +85,7 @@ final class ChatCore: HostCore {
     /// Only call from `onDecide` (already under the lock).
     func setOperation(_ id: String, _ state: String, _ error: LocalError? = nil) {
         if _operations[id] == nil { order.append(id) }
+        operationsChanged = true
         _operations[id] = CoreOperation(intent_id: id, state: state, error: error)
     }
     func setThreadLocked(_ name: String) { _thread = name }
@@ -93,6 +95,7 @@ final class ChatCore: HostCore {
         lock.lock(); defer { lock.unlock() }
         let event = try JSONDecoder().decode(Event.self, from: bytes)
         events.append(event)
+        let hostBefore = try encoded(row)
         var effects: [Effect] = []
         func next() -> String { sequence += 1; return "e\(sequence)" }
         func connect() {
@@ -135,7 +138,10 @@ final class ChatCore: HostCore {
             else { _thread = "approval-pending"; setOperation(e.intent_id, "pending") }
         default: break
         }
-        var scopes = ["hosts", "home", "workspaces"]
+        // Like the real core: `hosts`/`operations` are announced only when they changed.
+        var scopes = ["home", "workspaces"]
+        if try encoded(row) != hostBefore { scopes.append("hosts") }
+        if operationsChanged { scopes.append("operations"); operationsChanged = false }
         if _ensured { scopes += [chatSelector("thread", chatWS, chatThread), chatSelector("composer", chatWS, chatThread)] }
         effects.append(.state_changed(EffectStateChanged(effect_id: next(), generation: "1", revision: String(sequence), scopes: scopes)))
         return try encoded(EffectBatch(api_version: 1, revision: String(sequence), effects: effects))
@@ -149,6 +155,9 @@ final class ChatCore: HostCore {
         case "hosts":
             return try encoded(HostsQuery(api_version: 1, revision: String(sequence),
                                           data: HostsView(items: [row], operations: order.compactMap { _operations[$0] }), error: nil))
+        case "operations":
+            return try encoded(OperationsQuery(api_version: 1, revision: String(sequence),
+                                               data: OperationsView(items: order.compactMap { _operations[$0] }), error: nil))
         case "home": return try encoded(K09.homeLive)
         case "workspaces": return try encoded(K09.workspacesLive)
         default:
