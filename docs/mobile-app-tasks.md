@@ -169,7 +169,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | D-12 | File viewer | android | linux | D-06, A-01 | in_progress (claude opus cli-thread-1790408971195-db5b6fa85bded5cb) |
 | D-13 | Theme + reduced motion | android | linux | D-05 | todo |
 | D-14 | Push + actionable notifications | android | linux+phone | D-09, K-17, A-14, C-02, H-05 | todo |
-| D-15 | App lock + secure screen | android | linux | D-05 | todo |
+| D-15 | App lock + secure screen | android | linux | D-05 | in_progress (claude opus cli-thread-1790409422541-c5120ca8c7ab6da2) |
 | D-16 | Maestro flows + UI tests | android | linux+phone | D-08, D-09 | todo |
 | D-17 | Release build + Play internal track | android | linux | D-16, H-03 | todo |
 | I-01 | iOS project scaffold (XcodeGen) | ios | mac | K-02 | done (bdfcfd3e; unsigned simulator only until H-04) |
@@ -179,7 +179,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | I-05 | Transcript + diff + approvals | ios | mac | I-04, D-06, D-07, D-09 | todo |
 | I-06 | Composer + pickers + attachments + follow-ups | ios | mac | I-05, D-08 | todo |
 | I-07 | History, new chat, workspace management | ios | mac | I-04, D-10 | todo |
-| I-08 | Native terminal view | ios | mac+phone | I-04, D-11 | in_progress (claude opus cli-thread-1790407724842-6fb190b3221c3e1d) |
+| I-08 | Native terminal view | ios | mac+phone | I-04, D-11 | done (f8ab43fc..c1b991c4; device verify pending) |
 | I-09 | File viewer, theme, app lock | ios | mac | I-05, D-12, D-13, D-15 | todo |
 | I-10 | Push + NSE + actionable notifications | ios | mac+phone | I-05, K-17, C-02, H-05 | todo |
 | I-11 | XCUITest / Maestro flows | ios | mac | I-06 | todo |
@@ -1195,6 +1195,7 @@ Shared rules:
 - **Do:** translate. A Core Text / Canvas renderer, `inputAccessoryView` key
   row, hardware keyboard (`UIKeyCommand`), pinch zoom, selection.
 - **Done when:** tests pass; nvim usable (human-verify).
+- **Done (f8ab43fc, ad6292d2, 36a2b67f, 0a4858e5, c1b991c4).** `Terminal.swift` bridges `vc_term_*` with one serialized emulator per session. `TerminalRender.swift` holds the drawing rules, and `TerminalModel.swift` gates input on connected, attached, running and write-paired, debounces resize by 150 ms, and makes Ctrl/Alt sticky for one input. `TerminalScreen.swift` draws with Core Text: autocorrect and prediction are off, hardware keys and forward delete work, tap, drag, pinch (8–32 pt) and long-press select work, copies are local-only with a 10-minute expiry, and a key row plus overlays match Android. New terminal appears on the workspace screen, and leaving detaches without killing the session. `mobile-ios-test` passes 63/0, with the real C ABI matching the K-12 snapshot. Follow-ups: XCUITest (I-11), device checks for CJK IME and clipboard expiry, and redrawing only changed rows if nvim is slow.
 
 #### I-09 · File viewer, theme, app lock
 - **depends:** I-05, D-12, D-13, D-15
