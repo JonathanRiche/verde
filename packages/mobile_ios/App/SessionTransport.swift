@@ -2,10 +2,11 @@ import Foundation
 import Security
 import CryptoKit
 
-/// A session belongs to exactly one effect and immutable TLS policy. Connections
-/// can never be reused for another origin/pin. No cookies, cache or redirects.
+/// HTTP connections are reused only for an immutable origin/pin pair. Probes
+/// and sockets retain their own sessions. No cookies, cache or redirects.
 final class SessionTransport: CoreTransport {
     private let queue = DispatchQueue(label: "dev.verdeai.core.transport")
+    private lazy var pool = HTTPConnectionPool(queue: queue)
     private var operations: [String: SessionOperation] = [:]
     private let files = FileBuffer()
     func takeFile(_ id: String) -> FileBytes? { files.take(id) }
@@ -37,7 +38,7 @@ final class SessionTransport: CoreTransport {
 
     static func refusal(_ effect: Effect) -> Event? { nil }
     private func start(id: String, effect: Effect, emit: @escaping (Event) -> Void) {
-        let operation = SessionOperation(effect: effect, queue: queue, emit: emit, fileReceived: { [files] id, bytes in files.put(id, bytes) }) { [weak self] in
+        let operation = SessionOperation(effect: effect, queue: queue, pool: pool, emit: emit, fileReceived: { [files] id, bytes in files.put(id, bytes) }) { [weak self] in
             self?.operations.removeValue(forKey: id)
         }
         operations[id] = operation
@@ -47,8 +48,100 @@ final class SessionTransport: CoreTransport {
         queue.async {
             let active = Array(self.operations.values)
             active.forEach { $0.cancel() }
+            self.pool.close()
             self.files.clear()
         }
+    }
+}
+
+/// Owned by one transport and used only on its serial queue. A trust change
+/// cancels old tasks as well as discarding idle connections.
+final class HTTPConnectionPool {
+    private let queue: DispatchQueue
+    private var current: PinnedHTTPSession?
+    init(queue: DispatchQueue) { self.queue = queue }
+    func connection(origin: String, pin: String) -> PinnedHTTPSession {
+        if let current, current.origin == origin, current.pin == pin { return current }
+        close()
+        let connection = PinnedHTTPSession(origin: origin, pin: pin, queue: queue)
+        current = connection
+        return connection
+    }
+    func close() { current?.close(); current = nil }
+    deinit { close() }
+}
+
+/// URLSession owns its delegate. Explicit close breaks that ownership and
+/// removes task routing; completing one request never closes another request.
+final class PinnedHTTPSession: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    let origin: String
+    let pin: String
+    private(set) var closed = false
+    private var operations: [Int: SessionOperation] = [:]
+    private(set) var session: URLSession!
+    init(origin: String, pin: String, queue: DispatchQueue) {
+        self.origin = origin; self.pin = pin
+        super.init()
+        let config = SessionOperation.configuration()
+        // Match the core's correlation limit. Foundation's default six HTTP/1
+        // connections let parked tails starve sends and terminal input.
+        config.httpMaximumConnectionsPerHost = 256
+        // Each operation enforces its own total deadline. A parked RPC must
+        // not shorten other requests sharing this session.
+        config.timeoutIntervalForResource = 24 * 60 * 60
+        let delegates = OperationQueue()
+        delegates.maxConcurrentOperationCount = 1
+        delegates.underlyingQueue = queue
+        session = URLSession(configuration: config, delegate: self, delegateQueue: delegates)
+    }
+    func attach(_ operation: SessionOperation, task: URLSessionTask) { operations[task.taskIdentifier] = operation }
+    func detach(_ task: URLSessionTask) { operations.removeValue(forKey: task.taskIdentifier) }
+    func close() {
+        guard !closed else { return }
+        closed = true
+        Array(operations.values).forEach { $0.cancel() }
+        operations.removeAll()
+        session.invalidateAndCancel()
+    }
+    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        authenticate(challenge, completionHandler)
+    }
+    func urlSession(_ session: URLSession, task: URLSessionTask, didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        authenticate(challenge, completionHandler)
+    }
+    private func authenticate(_ challenge: URLAuthenticationChallenge,
+                              _ complete: (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        let space = challenge.protectionSpace
+        guard !closed, space.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+              let trust = space.serverTrust, space.host == URL(string: origin)?.host,
+              space.port == (URL(string: origin)?.port ?? 443), !pin.isEmpty else {
+            complete(.cancelAuthenticationChallenge, nil)
+            reject(TransportFailure(kind: .tls, code: .certificate)); return
+        }
+        let (trusted, observed) = TLSPolicy.inspect(trust, host: space.host)
+        if let failure = TLSPolicy.failure(systemTrusted: trusted, observed: observed, expected: pin) {
+            complete(.cancelAuthenticationChallenge, nil); reject(failure)
+        } else { complete(.useCredential, URLCredential(trust: trust)) }
+    }
+    private func reject(_ failure: TransportFailure) {
+        Array(operations.values).forEach { $0.rejectTLS(failure) }
+    }
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
+    }
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        guard let operation = operations[dataTask.taskIdentifier] else { completionHandler(.cancel); return }
+        operation.urlSession(session, dataTask: dataTask, didReceive: response, completionHandler: completionHandler)
+    }
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        operations[dataTask.taskIdentifier]?.urlSession(session, dataTask: dataTask, didReceive: data)
+    }
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        operations[task.taskIdentifier]?.urlSession(session, task: task, didCompleteWithError: error)
     }
 }
 
@@ -119,8 +212,11 @@ final class SessionOperation: NSObject, URLSessionDataDelegate, URLSessionWebSoc
     private let queue: DispatchQueue
     private let emit: (Event) -> Void
     private let ended: () -> Void
+    private let pool: HTTPConnectionPool?
+    private var connection: PinnedHTTPSession?
+    private var deadline: DispatchWorkItem?
     private var session: URLSession?
-    private var task: URLSessionTask?
+    private(set) var task: URLSessionTask?
     private var finished = false
     private var failure: TransportFailure?
     private var body = Data()
@@ -128,13 +224,13 @@ final class SessionOperation: NSObject, URLSessionDataDelegate, URLSessionWebSoc
     private var pendingSends: [String] = []
     private var sending = false
 
-    init(effect: Effect, queue: DispatchQueue, emit: @escaping (Event) -> Void, fileReceived: @escaping (String, FileBytes) -> Void = { _, _ in }, ended: @escaping () -> Void) {
+    init(effect: Effect, queue: DispatchQueue, pool: HTTPConnectionPool? = nil, emit: @escaping (Event) -> Void, fileReceived: @escaping (String, FileBytes) -> Void = { _, _ in }, ended: @escaping () -> Void) {
         if case .file_fetch(let e) = effect {
             self.effect = .http_request(EffectHttpRequest(effect_id: e.effect_id, generation: e.generation, method: "GET", url: e.url, headers: e.headers, body_base64: nil, timeout_ms: e.timeout_ms, max_response_bytes: min(e.max_response_bytes, 32 * 1024 * 1024), tls: e.tls))
             fileIntent = e.intent_id
         } else { self.effect = effect; fileIntent = nil }
         self.fileReceived = fileReceived
-        self.queue = queue; self.emit = emit; self.ended = ended
+        self.queue = queue; self.pool = pool; self.emit = emit; self.ended = ended
     }
     private var policy: (origin: String, pin: String?) {
         switch effect {
@@ -144,7 +240,7 @@ final class SessionOperation: NSObject, URLSessionDataDelegate, URLSessionWebSoc
         default: preconditionFailure("session_effect_required")
         }
     }
-    func start() {
+    static func configuration() -> URLSessionConfiguration {
         let config = URLSessionConfiguration.ephemeral
         config.httpShouldSetCookies = false
         config.httpCookieStorage = nil
@@ -153,6 +249,10 @@ final class SessionOperation: NSObject, URLSessionDataDelegate, URLSessionWebSoc
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.timeoutIntervalForRequest = 30
         config.timeoutIntervalForResource = 30
+        return config
+    }
+    func start(resume: Bool = true) {
+        let config = Self.configuration()
         if case .http_request(let e) = effect {
             // Parked RPCs carry longer core deadlines than interactive requests.
             config.timeoutIntervalForRequest = Double(e.timeout_ms) / 1000
@@ -161,7 +261,10 @@ final class SessionOperation: NSObject, URLSessionDataDelegate, URLSessionWebSoc
         let delegates = OperationQueue()
         delegates.maxConcurrentOperationCount = 1
         delegates.underlyingQueue = queue
-        let session = URLSession(configuration: config, delegate: self, delegateQueue: delegates)
+        if case .http_request = effect, let pool {
+            connection = pool.connection(origin: policy.origin, pin: policy.pin ?? "")
+        }
+        let session = connection?.session ?? URLSession(configuration: config, delegate: self, delegateQueue: delegates)
         self.session = session
         switch effect {
         case .http_request(let e):
@@ -193,7 +296,15 @@ final class SessionOperation: NSObject, URLSessionDataDelegate, URLSessionWebSoc
             task = session.dataTask(with: request)
         default: return
         }
-        task?.resume()
+        if let task, let connection { connection.attach(self, task: task) }
+        if resume {
+            if case .http_request(let e) = effect {
+                let deadline = DispatchWorkItem { [weak self] in self?.fail(.timeout, .timeout) }
+                self.deadline = deadline
+                queue.asyncAfter(deadline: .now() + Double(e.timeout_ms) / 1000, execute: deadline)
+            }
+            task?.resume()
+        }
     }
 
     func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
@@ -314,6 +425,7 @@ final class SessionOperation: NSObject, URLSessionDataDelegate, URLSessionWebSoc
         }
     }
     func cancel() { fail(.cancelled, .cancelled) }
+    func rejectTLS(_ failure: TransportFailure) { fail(failure.kind, failure.code) }
     func close(code: UInt16) {
         guard !finished else { return }
         (task as? URLSessionWebSocketTask)?.cancel(with: .init(rawValue: Int(code)) ?? .normalClosure, reason: nil)
@@ -347,8 +459,11 @@ final class SessionOperation: NSObject, URLSessionDataDelegate, URLSessionWebSoc
     private func finish() {
         guard !finished else { return }
         finished = true
+        deadline?.cancel(); deadline = nil
+        if let task { connection?.detach(task) }
         task?.cancel()
-        session?.invalidateAndCancel()
+        if connection == nil { session?.invalidateAndCancel() }
+        connection = nil
         session = nil
         task = nil
         pendingSends.removeAll()

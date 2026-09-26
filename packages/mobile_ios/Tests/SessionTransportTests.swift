@@ -2,6 +2,62 @@ import XCTest
 @testable import VerdeApp
 
 final class SessionTransportTests: XCTestCase {
+    func testHTTPPoolReusesExactPolicyAndEvictsOnTrustChange() {
+        let queue = DispatchQueue(label: "pool.policy.fixture")
+        queue.sync {
+            let pool = HTTPConnectionPool(queue: queue)
+            defer { pool.close() }
+            let origin = "https://bridge.invalid", pin = String(repeating: "a", count: 64)
+            let first = pool.connection(origin: origin, pin: pin)
+            XCTAssertTrue(first === pool.connection(origin: origin, pin: pin))
+            var events: [Event] = []
+            let pending = SessionOperation(effect: request(), queue: queue, pool: pool, emit: { events.append($0) }, ended: {})
+            pending.start(resume: false)
+            let changedPin = pool.connection(origin: origin, pin: String(repeating: "b", count: 64))
+            XCTAssertFalse(first === changedPin)
+            XCTAssertTrue(first.closed)
+            XCTAssertNil(pending.task)
+            XCTAssertEqual(events.count, 1)
+            guard case .http_response(let cancelled) = events.first else { return XCTFail() }
+            XCTAssertEqual(cancelled.error?.code, .cancelled)
+            let changedOrigin = pool.connection(origin: "https://other.invalid", pin: changedPin.pin)
+            XCTAssertTrue(changedPin.closed)
+            XCTAssertFalse(changedOrigin === changedPin)
+            let restored = pool.connection(origin: origin, pin: pin)
+            XCTAssertTrue(changedOrigin.closed)
+            XCTAssertFalse(restored === first, "An old trusted connection cannot be resurrected")
+        }
+    }
+
+    func testSharedHTTPRequestsRouteIndependentlyAndSurviveSiblingCancellation() throws {
+        let queue = DispatchQueue(label: "pool.routing.fixture")
+        try queue.sync {
+            let pool = HTTPConnectionPool(queue: queue)
+            defer { pool.close() }
+            var firstEvents: [Event] = [], secondEvents: [Event] = []
+            let first = SessionOperation(effect: request(), queue: queue, pool: pool, emit: { firstEvents.append($0) }, ended: {})
+            let second = SessionOperation(effect: request(), queue: queue, pool: pool, emit: { secondEvents.append($0) }, ended: {})
+            first.start(resume: false); second.start(resume: false)
+            let connection = pool.connection(origin: "https://bridge.invalid", pin: String(repeating: "a", count: 64))
+            let task = try XCTUnwrap(second.task as? URLSessionDataTask)
+            first.cancel()
+            XCTAssertFalse(connection.closed)
+            XCTAssertEqual(firstEvents.count, 1)
+            XCTAssertTrue(secondEvents.isEmpty)
+            let response = try XCTUnwrap(HTTPURLResponse(url: task.originalRequest!.url!, statusCode: 200, httpVersion: nil, headerFields: nil))
+            connection.urlSession(connection.session, dataTask: task, didReceive: response) { XCTAssertEqual($0, .allow) }
+            connection.urlSession(connection.session, dataTask: task, didReceive: Data([1, 2]))
+            connection.urlSession(connection.session, task: task, didCompleteWithError: nil)
+            connection.urlSession(connection.session, task: task, didCompleteWithError: nil)
+            XCTAssertEqual(secondEvents.count, 1)
+            guard case .http_response(let result) = secondEvents.first else { return XCTFail() }
+            XCTAssertEqual(result.status, 200)
+            XCTAssertEqual(result.body_base64, Data([1, 2]).base64EncodedString())
+            XCTAssertFalse(connection.closed)
+            XCTAssertTrue(connection === pool.connection(origin: connection.origin, pin: connection.pin))
+        }
+    }
+
     private func request(limit: UInt32 = 4) -> Effect {
         .http_request(EffectHttpRequest(effect_id: "request", generation: "9007199254740993",
             method: "POST", url: "https://bridge.invalid/api/rpc", headers: [], body_base64: nil,
