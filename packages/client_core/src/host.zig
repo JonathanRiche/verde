@@ -15,6 +15,8 @@ const V = std.json.Value;
 pub const MAX_INPUT = 1024 * 1024;
 pub const MAX_HTTP_INPUT = 12 * 1024 * 1024;
 pub const MAX_RECEIPTS = 1024;
+/// Settled keystroke/resize receipts kept for deduplication; see terminal.md.
+pub const MAX_TERMINAL_RECEIPTS = 256;
 pub const MAX_PENDING = 256;
 pub const ApiError = error{ InvalidArgument, UnsupportedVersion, OutOfMemory, InvalidLifecycle, ResourceLimit };
 pub const Lifecycle = enum { created, foreground, background, stopped };
@@ -36,7 +38,7 @@ pub const LocalError = struct {
     delivery: ?[]const u8 = "rejected",
 };
 pub const Operation = struct { intent_id: []const u8, state: []const u8 = "failed", @"error": ?LocalError };
-const Receipt = struct { operation: Operation, digest: [32]u8 };
+const Receipt = struct { operation: Operation, digest: [32]u8, terminal: bool = false };
 pub const Config = struct {
     api_version: u32,
     host_id: []const u8,
@@ -338,8 +340,10 @@ pub const Transaction = struct {
                 if (!std.mem.eql(u8, &r.digest, &digest)) return error.InvalidArgument;
                 return;
             };
+            const streamed = eq(tag, "terminal_input") or eq(tag, "terminal_resize");
+            if (streamed) try dropSettledTerminalReceipt(self);
             if (s.receipts.len == MAX_RECEIPTS) return error.ResourceLimit;
-            try append(Receipt, self.allocator(), &s.receipts, .{ .digest = digest, .operation = .{ .intent_id = id, .@"error" = .{ .code = "unsupported", .message = "Intent is not implemented.", .intent_id = id } } });
+            try append(Receipt, self.allocator(), &s.receipts, .{ .digest = digest, .terminal = streamed, .operation = .{ .intent_id = id, .@"error" = .{ .code = "unsupported", .message = "Intent is not implemented.", .intent_id = id } } });
             _ = try auth.intent(self, tag, event);
             _ = try terminal.intent(self, tag, event);
             _ = try chat.intent(self, tag, event);
@@ -599,6 +603,22 @@ fn base64(s: []const u8) ApiError!void {
     }
 }
 
+/// Keystrokes would otherwise exhaust the lifetime receipt budget within minutes.
+/// Only settled terminal input/resize receipts leave, oldest first; others never evict.
+fn dropSettledTerminalReceipt(tx: *Transaction) ApiError!void {
+    const receipts = tx.state.receipts;
+    var count: usize = 0;
+    for (receipts) |r| count += @intFromBool(r.terminal);
+    if (count < MAX_TERMINAL_RECEIPTS and receipts.len < MAX_RECEIPTS) return;
+    for (receipts, 0..) |r, i| {
+        if (!r.terminal or !(eq(r.operation.state, "succeeded") or eq(r.operation.state, "failed"))) continue;
+        const next = try tx.allocator().alloc(Receipt, receipts.len - 1);
+        @memcpy(next[0..i], receipts[0..i]);
+        @memcpy(next[i..], receipts[i + 1 ..]);
+        tx.state.receipts = next;
+        return;
+    }
+}
 fn withAttention(tx: *Transaction) ApiError![]const []const u8 {
     var scopes = try chat.scopes(tx);
     try append([]const u8, tx.allocator(), &scopes, "attention");

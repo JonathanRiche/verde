@@ -35,7 +35,8 @@ with equivalent transactional ownership without changing the ABI.
 ## Conservative choices where revision 1 leaves details open
 
 - Input limit: 1 MiB, JSON nesting: 64 levels, outstanding correlations: 256,
-  lifetime receipts: 1024. Exhaustion is `vc_status=5`; receipts never evict.
+  lifetime receipts: 1024. Exhaustion is `vc_status=5`; receipts never evict,
+  except settled `terminal_input`/`terminal_resize` receipts (D-11, [terminal.md](terminal.md)).
 - Host IDs are 1–128 ASCII letters/digits/underscore/hyphen. Nonces are exactly
   32 hexadecimal digits. URLs use shared `verde_remote.profile` endpoint-pair
   validation, including same authority and `/ws`. Both endpoints may be null.

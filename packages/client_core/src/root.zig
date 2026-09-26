@@ -1,7 +1,7 @@
 //! Verde mobile client core.
 //!
-//! Exports the C ABI declared in `include/verde_client.h` and, on Android, the
-//! JNI entry points for `dev.verdeai.core.Native`.
+//! Exports the C ABI declared in `include/verde_client.h` and, on Android (and
+//! the `jvm-lib` test build), the JNI entry points for `dev.verdeai.core.Native`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -28,7 +28,8 @@ comptime {
     @export(&vcTermSnapshot, .{ .name = "vc_term_snapshot" });
     @export(&vcBufFree, .{ .name = "vc_buf_free" });
     @export(&vcPushOpen, .{ .name = "vc_push_open" });
-    if (builtin.abi.isAndroid()) {
+    // `jvm_jni` is the host test library for the Android app's JVM unit tests.
+    if (builtin.abi.isAndroid() or build_options.jvm_jni) {
         @export(&jni.termNew, .{ .name = "Java_dev_verdeai_core_Native_termNew" });
         @export(&jni.termFree, .{ .name = "Java_dev_verdeai_core_Native_termFree" });
         @export(&jni.termWrite, .{ .name = "Java_dev_verdeai_core_Native_termWrite" });

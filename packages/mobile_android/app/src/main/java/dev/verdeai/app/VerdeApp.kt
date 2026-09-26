@@ -28,9 +28,11 @@ internal object Routes {
     const val WORKSPACE = "workspace/{ws}"
     const val THREAD = "thread/{ws}/{thread}"
     const val TERMINAL = "terminal/{ws}/{terminal}"
+    const val NEW_TERMINAL = "terminal-new/{ws}"
     fun workspace(ws: String) = "workspace/${Uri.encode(ws)}"
     fun thread(ws: String, thread: String) = "thread/${Uri.encode(ws)}/${Uri.encode(thread)}"
     fun terminal(ws: String, terminal: String) = "terminal/${Uri.encode(ws)}/${Uri.encode(terminal)}"
+    fun newTerminal(ws: String) = "terminal-new/${Uri.encode(ws)}"
 }
 
 private data class Tab(val route: String, val label: String, val icon: ImageVector)
@@ -55,6 +57,8 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     val entry by nav.currentBackStackEntryAsState()
     val route = entry?.destination?.route
     val pairing = hostsState.pairing != null && route == Routes.HOSTS
+    // Terminals need the full height, and the tab bar would otherwise hide IME insets.
+    val immersive = route == Routes.TERMINAL || route == Routes.NEW_TERMINAL
     // Detail routes keep the tab they were opened from highlighted.
     var lastTab by rememberSaveable { mutableStateOf(start) }
     LaunchedEffect(route) { if (TABS.any { it.route == route }) lastTab = route!! }
@@ -62,7 +66,7 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     Scaffold(
         contentWindowInsets = WindowInsets.safeDrawing,
         bottomBar = {
-            if (!pairing) NavigationBar {
+            if (!pairing && !immersive) NavigationBar {
                 TABS.forEach { tab ->
                     NavigationBarItem(selected = currentTab == tab.route, onClick = { nav.tab(tab.route) },
                         icon = { Icon(tab.icon, contentDescription = null) },
@@ -103,7 +107,8 @@ private fun Graph(nav: NavHostController, start: String, hosts: HostsModel, brow
         composable(Routes.WORKSPACES) { WorkspacesScreen(browse, openWorkspace, showHosts, pair) }
         composable(Routes.HOSTS) { HostsScreen(hosts, onUse = { nav.tab(Routes.HOME) }) }
         composable(Routes.WORKSPACE) { entry ->
-            WorkspaceScreen(browse, entry.arguments?.getString("ws").orEmpty(), openPane, openThread, showHosts, pair) { nav.popBackStack() }
+            val ws = entry.arguments?.getString("ws").orEmpty()
+            WorkspaceScreen(browse, ws, openPane, openThread, showHosts, pair, onNewTerminal = { nav.navigate(Routes.newTerminal(ws)) }) { nav.popBackStack() }
         }
         composable(Routes.THREAD) { entry ->
             val args = entry.arguments
@@ -111,7 +116,10 @@ private fun Graph(nav: NavHostController, start: String, hosts: HostsModel, brow
         }
         composable(Routes.TERMINAL) { entry ->
             val args = entry.arguments
-            TerminalPlaceholderScreen(browse, args?.getString("ws").orEmpty(), args?.getString("terminal").orEmpty()) { nav.popBackStack() }
+            TerminalScreen(hosts, browse, args?.getString("ws").orEmpty(), args?.getString("terminal").orEmpty()) { nav.popBackStack() }
+        }
+        composable(Routes.NEW_TERMINAL) { entry ->
+            TerminalScreen(hosts, browse, entry.arguments?.getString("ws").orEmpty(), null) { nav.popBackStack() }
         }
     }
 }

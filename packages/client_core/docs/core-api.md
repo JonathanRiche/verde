@@ -109,6 +109,7 @@ with identical payload return the existing outcome, never send twice; reuse
 with a different payload is rejected. Completed receipts are retained for the
 handle lifetime within a bounded budget; on exhaustion reject new intents
 with `resource_limit`, do not evict IDs and accidentally replay mutations.
+The one exception is terminal keystroke/resize receipts (see [terminal.md](terminal.md)).
 Persistence receipts extend this protection across process death where noted.
 Daemon RPC IDs are numeric `u64` as required by `protocol.Request`, independent
 of local correlation IDs. Match response IDs as well as the owning HTTP effect.

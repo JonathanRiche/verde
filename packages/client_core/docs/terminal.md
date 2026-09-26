@@ -39,6 +39,14 @@ Ctrl/Alt/Shift named keys use standard escape encodings. Remaining queued input
 is discarded on a failed/uncertain write or transport invalidation. No ambiguous
 input is automatically retried. Pending unsent resize requests coalesce.
 
+Every keystroke is an intent, so `terminal_input` and `terminal_resize` receipts
+use a separate retention rule (D-11): the core keeps at most 256 of them. When
+that window or the 1024 receipt table is full, it drops the oldest *settled*
+(`succeeded`/`failed`) terminal receipt. Pending and uncertain ones never
+leave, and no other intent's receipt is evicted. IDs therefore deduplicate
+only within that window. Platforms mint a fresh ID for every keystroke and
+never resubmit input.
+
 Limits: 32 host terminal records, 256 queued actions per terminal, 1 MiB total
 queued text, 512 per grid dimension and 65,536 total cells, 10,000 configured
 scrollback rows with a 16 MiB byte ceiling, and 64 KiB queued device replies.

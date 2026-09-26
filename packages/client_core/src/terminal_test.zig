@@ -321,3 +321,40 @@ test "terminal selectors decode once and failed batch allocation cannot consume 
     , failing.allocator()));
     try expect(host.state.revision == revision and host.state.terminal.rows[0].actions.len == 0);
 }
+
+test "settled terminal input receipts evict oldest first while other receipts never evict" {
+    var host = try h.Host.init(A, config);
+    defer host.deinit();
+    var tx = try h.Transaction.init(&host);
+    defer tx.deinit();
+    try ready(&tx);
+    try attach(&tx);
+    const modes = .{ .application_cursor = false, .bracketed_paste = false };
+    // The unanswered write keeps this receipt pending, so it must survive eviction.
+    try event(&tx, "terminal_input", .{ .intent_id = "key-pending", .terminal_id = "k12-fixture", .vt_modes = modes, .input = .{ .kind = "text", .text = "x", .ctrl = false, .alt = false, .shift = false } });
+    for (0..h.MAX_TERMINAL_RECEIPTS + 10) |i| {
+        const id = try std.fmt.allocPrint(tx.allocator(), "key-{d}", .{i});
+        try event(&tx, "terminal_input", .{ .intent_id = id, .terminal_id = "k12-fixture", .vt_modes = modes, .input = .{ .kind = "text", .text = "", .ctrl = false, .alt = false, .shift = false } });
+    }
+    const state = struct {
+        fn of(receipts: anytype, id: []const u8) ?[]const u8 {
+            for (receipts) |r| if (h.eq(r.operation.intent_id, id)) return r.operation.state;
+            return null;
+        }
+    };
+    try expect(tx.state.receipts.len == 1 + h.MAX_TERMINAL_RECEIPTS);
+    try same(state.of(tx.state.receipts, "attach").?, "succeeded");
+    try same(state.of(tx.state.receipts, "key-pending").?, "pending");
+    try expect(state.of(tx.state.receipts, "key-10") == null and state.of(tx.state.receipts, "key-11") != null);
+    // A retained ID still deduplicates instead of writing again.
+    try event(&tx, "terminal_input", .{ .intent_id = "key-pending", .terminal_id = "k12-fixture", .vt_modes = modes, .input = .{ .kind = "text", .text = "x", .ctrl = false, .alt = false, .shift = false } });
+    try expect(tx.state.receipts.len == 1 + h.MAX_TERMINAL_RECEIPTS and tx.state.terminal.rows[0].actions.len == 1);
+    // A table full of non-terminal receipts still rejects instead of evicting them.
+    const full = try tx.allocator().alloc(@TypeOf(tx.state.receipts[0]), h.MAX_RECEIPTS);
+    @memset(full, tx.state.receipts[0]);
+    tx.state.receipts = full;
+    try std.testing.expectError(error.ResourceLimit, tx.apply(try h.parse(tx.allocator(),
+        \\{"api_version":1,"type":"terminal_input","now_ms":0,"wall_time_ms":0,"intent_id":"key-full","terminal_id":"k12-fixture","vt_modes":{"application_cursor":false,"bracketed_paste":false},"input":{"kind":"text","text":"","ctrl":false,"alt":false,"shift":false}}
+    )));
+    try expect(tx.state.receipts.len == h.MAX_RECEIPTS);
+}

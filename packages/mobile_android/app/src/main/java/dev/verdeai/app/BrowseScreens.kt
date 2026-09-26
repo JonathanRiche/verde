@@ -401,6 +401,7 @@ internal fun WorkspaceScreen(
     onOpenThread: (ThreadSummary) -> Unit,
     onHosts: () -> Unit,
     onPair: () -> Unit,
+    onNewTerminal: (() -> Unit)? = null,
     onBack: () -> Unit,
 ) {
     val state by model.state.collectAsState()
@@ -414,6 +415,9 @@ internal fun WorkspaceScreen(
         header("Panes")
         if (workspace.panes.isEmpty()) note("nopanes", "No open panes.")
         items(workspace.panes, key = { "pane:" + it.id }) { PaneItem(it, now, onOpenPane) }
+        if (onNewTerminal != null && canWrite(state.host) && workspace.path.isNotEmpty()) item(key = "new-terminal") {
+            TextButton(onClick = onNewTerminal, modifier = Modifier.padding(horizontal = 8.dp)) { Text("New terminal") }
+        }
         val threads = workspaceThreads(workspace)
         val (archived, current) = threads.partition { it.archived }
         header("Chats")
@@ -430,24 +434,3 @@ internal fun WorkspaceScreen(
     }
 }
 
-@Composable
-internal fun TerminalPlaceholderScreen(model: BrowseModel, workspaceId: String, terminalId: String, onBack: () -> Unit) {
-    val state by model.state.collectAsState()
-    val workspace = state.workspaces?.items?.find { it.workspace_id == workspaceId }
-    val pane = (state.home?.items.orEmpty() + workspace?.panes.orEmpty()).find { it.workspace_id == workspaceId && it.terminal_id == terminalId }
-    PlaceholderFrame(pane?.title ?: "Terminal", onBack) {
-        workspace?.let { Text(it.label, style = MaterialTheme.typography.titleMedium) }
-        Text(pane?.let { paneLine(it, 0) } ?: "This terminal is no longer on the host.")
-        Text("The terminal view is coming in a later update.", style = MaterialTheme.typography.bodyMedium)
-    }
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun PlaceholderFrame(title: String, onBack: () -> Unit, content: @Composable ColumnScope.() -> Unit) {
-    Column(Modifier.fillMaxSize()) {
-        TopAppBar(title = { Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-            navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") } })
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp), content = content)
-    }
-}

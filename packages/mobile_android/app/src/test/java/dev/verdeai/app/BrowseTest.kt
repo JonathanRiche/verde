@@ -141,9 +141,12 @@ class BrowseTest {
         list().performScrollToNode(hasText("htop"))
         compose.onNodeWithText("htop").performTouchInput { longClick() }
         compose.onNodeWithText("Open").performClick()
-        awaitText("The terminal view is coming in a later update.")
+        // The terminal screen attaches through the core (this fake core serves no terminal view).
+        awaitText("Opening terminal…")
+        await { core.events.any { it is EventTerminalAttach && it.terminal_id == "sess-7" } }
         compose.onNodeWithContentDescription("Back").performClick()
         awaitText("Panes")
+        await { core.events.any { it is EventTerminalDetach && it.terminal_id == "sess-7" } }
     }
 
     @Test fun pullToRefreshSendsRetryAndShowsTheRefreshedProjection() {

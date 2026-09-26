@@ -44,6 +44,17 @@ android {
 // AGP does not preserve task dependencies from the jniLibs source directory.
 tasks.named("preBuild") { dependsOn(syncNativeLibraries) }
 
+// Host-JVM build of the same core with the JNI exports, for JNI-level unit tests.
+val buildJvmCore by tasks.registering(Exec::class) {
+    workingDir(coreDirectory)
+    commandLine("zig", "build", "jvm-lib", "--release=safe")
+}
+tasks.withType<Test>().configureEach {
+    dependsOn(buildJvmCore)
+    systemProperty("java.library.path", coreDirectory.dir("zig-out/lib/jvm").asFile.absolutePath)
+    systemProperty("verde.core.fixtures", coreDirectory.dir("src/fixtures").asFile.absolutePath)
+}
+
 dependencies {
     implementation(libs.camera.camera2)
     implementation(libs.camera.lifecycle)

@@ -38,6 +38,7 @@ pub fn build(b: *std.Build) void {
 
     const options = b.addOptions();
     options.addOption([:0]const u8, "version", zon.version);
+    options.addOption(bool, "jvm_jni", false);
 
     addModelSteps(b, options);
     addIosSteps(b, optimize, options);
@@ -55,6 +56,19 @@ pub fn build(b: *std.Build) void {
     addTestStep(b, target, optimize, options, remote);
     addContractStep(b, target, optimize, options);
     addAndroidStep(b, optimize, options, ndk_option orelse b.graph.environ_map.get("ANDROID_NDK_HOME"));
+    addJvmStep(b, optimize);
+}
+
+/// D-11: a build-host library with the same JNI entry points, loaded only by the
+/// Android app's JVM unit tests (`zig-out/lib/jvm/`). Never packaged into an APK.
+fn addJvmStep(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
+    const jvm_step = b.step("jvm-lib", "Build the host libverde_client with JNI exports for JVM unit tests");
+    const options = b.addOptions();
+    options.addOption([:0]const u8, "version", zon.version);
+    options.addOption(bool, "jvm_jni", true);
+    const lib = addCoreLibrary(b, createCoreModule(b, b.graph.host, optimize, options));
+    const install = b.addInstallArtifact(lib, .{ .dest_dir = .{ .override = .{ .custom = "lib/jvm" } } });
+    jvm_step.dependOn(&install.step);
 }
 
 fn addTestStep(

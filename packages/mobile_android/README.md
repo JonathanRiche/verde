@@ -16,8 +16,10 @@ supply default `ANDROID_HOME` / `ANDROID_NDK_HOME` paths under `~/Android/Sdk`.
 The Gradle wrapper pins Gradle and verifies its distribution checksum.
 `assembleDebug` builds the Zig core with LLVM, checks its Android ELF files,
 and packages both arm64-v8a and x86_64 libraries from generated `jniLibs`.
-Tests run the pairing UI with a fake core through Robolectric on APIs 29 and 35;
-they do not load the Android JNI library into the host JVM.
+Tests run the UI with a fake core through Robolectric on APIs 29 and 35; they
+never load the Android JNI library. `TerminalJniTest` (plain JUnit) loads a host
+build of the same core with its JNI exports (`zig build jvm-lib`, run by Gradle
+before tests) to check the `vc_term_*` boundary.
 
 For the JNI smoke check, use an explicitly selected emulator/device:
 
@@ -194,3 +196,23 @@ exercise the real revoke RPC and storage protocol. No phone/emulator was availab
    deterministically covered by Robolectric. On a device, verify credential restore
    after lock/unlock and process restart; do not induce failure by deleting app
    files or keys. Native JNI, real Keystore, VPN and TLS behavior remain phone checks.
+
+## Terminal (D-11)
+
+Opening a terminal pane (or **New terminal** on a workspace, which sends
+`terminal_create`) shows a native Canvas renderer of the core's VT snapshot.
+The core pumps `session.tail`; the app only writes its `terminal_output` into a
+local VT, reports `terminal_applied`, and sends `terminal_input`,
+`terminal_resize` (from the measured grid) and device replies. Keys go through the
+core's encoder: an accessory row (Esc, Tab, sticky Ctrl/Alt, arrows, `|` `~` `/`
+`-`, Home/End, PgUp/PgDn, Paste), the soft keyboard (no suggestions or learning)
+and hardware keys. Drag scrolls the VT's page-granular scrollback, pinch changes
+the font size (8–32 sp), and long-press drag selects text for a sensitive
+clipboard copy. Hosts paired without `terminal:write` get a view-only screen.
+Leaving the screen detaches and frees the VT; it never kills the session.
+Terminal contents are never logged.
+
+On a phone, check that htop and nvim are usable: open each from a workspace,
+type, use arrows/Esc/Ctrl-c, rotate to landscape (the grid resizes), show and
+hide the keyboard, pinch to zoom, scroll back, copy a selection, and toggle
+airplane mode (offline notice, then a replay-gap notice after reconnecting).
