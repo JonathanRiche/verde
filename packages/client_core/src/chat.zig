@@ -1126,6 +1126,10 @@ pub fn pump(tx: *h.Transaction) E!void {
                 t.metadata = latest;
                 t.cwd = latest.cwd orelse t.cwd;
             }
+            // A generated/renamed title and activity can change without a route
+            // change. Do not write the initial "New Chat" metadata back on send.
+            t.metadata.title = latest.title;
+            t.metadata.last_activity_at = latest.last_activity_at;
         }
         if (t.turn == null) for (p.rows(p.get(tx.state.sync.snapshot, "turns"))) |turn| {
             if (!eq(p.s(turn, "workspace_id"), t.workspace_id) or !eq(p.s(turn, "local_thread_id"), t.id) or !activeStatus(p.s(turn, "status")) or p.s(turn, "turn_id").len == 0) continue;

@@ -554,3 +554,23 @@ test "chat send retains runtime identity learned after the first turn" {
     try eql("0123456789abcdef0123456789abcdef", p.s(settings, "runtime_id"));
     try eql("local", p.s(settings, "profile_id"));
 }
+
+test "chat keeps generated title and activity when route is unchanged" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.open();
+    var tx = try h.Transaction.init(&f.host);
+    defer tx.deinit();
+    const item = @constCast(&tx.state.sync.catalog[0]);
+    try item.object.put(tx.allocator(), "title", .{ .string = "Generated title" });
+    try item.object.put(tx.allocator(), "last_activity_at", .{ .integer = 1790460000 });
+    try chat.pump(&tx);
+    _ = try tx.commit(&f.host, f.a());
+    try f.draft("next turn");
+    const revision = p.s(p.get(p.get(try f.query("composer"), "data"), "draft"), "revision");
+    _ = try f.intent("send", .{ .draft_revision = revision });
+    try f.reply("daemon.client.register", .{ .client_id = "fixture-client" });
+    const settings = p.get(try f.params("chat.thread.upsert"), "thread");
+    try eql("Generated title", p.s(settings, "title"));
+    try std.testing.expectEqual(@as(?i64, 1790460000), p.num(p.get(settings, "last_activity_at")));
+}
