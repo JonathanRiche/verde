@@ -25,6 +25,8 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import java.time.Duration
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 
@@ -304,6 +306,35 @@ class ComposerTest {
         assertEquals(1, sent<EventSlashRun>().size)
     }
 
+    @Test fun settingsUpdateImmediatelyAndRapidPicksSaveInOrder() {
+        val gate = CountDownLatch(1)
+        setup = { it.selectionGate = gate }
+        launch()
+        try {
+            compose.runOnUiThread {
+                transcript.composer.select(ComposerPicker.Speed, "on")
+                transcript.composer.select(ComposerPicker.Model, "gpt-6-luna")
+                assertEquals("on", transcript.composer.pendingSelection?.speed)
+                assertEquals("gpt-6-luna", transcript.composer.pendingSelection?.model)
+            }
+            compose.onNodeWithContentDescription("Model: GPT-6 Luna. Change").assertExists()
+            assertTrue(sent<EventSend>().isEmpty())
+        } finally { gate.countDown() }
+        await { sent<EventComposerSelect>().size == 2 && transcript.composer.pendingSelection == null }
+        assertEquals("on", transcript.latestComposer()!!.selection.speed)
+        assertEquals("gpt-6-luna", transcript.latestComposer()!!.selection.model)
+    }
+
+    @Test fun rejectedSettingRestoresConfirmedSelectionAndShowsError() {
+        setup = { it.rejectSelection = true }
+        launch()
+        val original = transcript.latestComposer()!!.selection.speed
+        compose.runOnUiThread { transcript.composer.select(ComposerPicker.Speed, "on") }
+        await { sent<EventComposerSelect>().isNotEmpty() && transcript.composer.pendingSelection == null }
+        assertEquals(original, transcript.latestComposer()!!.selection.speed)
+        awaitText("That option isn't available for this model.")
+    }
+
     @Test fun pickersSelectFromTheCoreCatalogsWithFavouritesFirst() {
         setup={ it.fresh() }
         launch()
@@ -391,6 +422,8 @@ class ComposerTest {
             view=view.copy(draft=ChatDraft((view.draft.revision.toLong() + 1).toString(), text, attachments, false))
         }
 
+        var selectionGate: CountDownLatch? = null
+        var rejectSelection = false
         override fun create(config: ByteArray)=1L
         override fun handle(host: Long, event: ByteArray): ByteArray {
             val decoded=CoreJson.decodeFromString<Event>(event.decodeToString())
@@ -450,10 +483,14 @@ class ComposerTest {
                     op(decoded.intent_id, "succeeded")
                 }
                 is EventComposerSelect -> {
-                    val provider=decoded.provider ?: view.selection.provider
-                    view=view.copy(selection=ChatSelection(provider, decoded.model, decoded.effort, decoded.access, decoded.speed))
-                    draft(view.draft.text)
-                    op(decoded.intent_id, "succeeded")
+                    check(selectionGate?.await(15, TimeUnit.SECONDS) != false)
+                    if (rejectSelection) op(decoded.intent_id, "failed", "invalid_selection")
+                    else {
+                        val provider=decoded.provider ?: view.selection.provider
+                        view=view.copy(selection=ChatSelection(provider, decoded.model, decoded.effort, decoded.access, decoded.speed))
+                        draft(view.draft.text)
+                        op(decoded.intent_id, "succeeded")
+                    }
                 }
                 is EventTurnCancel -> op(decoded.intent_id, "pending")
                 else -> Unit

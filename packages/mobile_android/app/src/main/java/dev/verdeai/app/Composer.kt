@@ -104,7 +104,9 @@ private fun attachmentSize(bytes: Long) = if (bytes < 1024 * 1024) "${(bytes + 1
 @Composable
 internal fun ChatComposer(model: TranscriptModel, state: TranscriptState) {
     val composer = model.composer
-    val view = state.composer
+    val view = state.composer?.let { current ->
+        composer.pendingSelection?.let { current.copy(selection = it) } ?: current
+    }
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val lifecycle = LocalLifecycleOwner.current
@@ -148,7 +150,7 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState) {
     val action = composerAction(text)
     val hasContent = text.isNotBlank() || attachments.isNotEmpty()
     val ready = view?.provider_ready == true
-    val canSubmit = view != null && hasContent && !composer.busy && !sendPending && when {
+    val canSubmit = view != null && hasContent && composer.pendingSelection == null && !composer.busy && !sendPending && when {
         action is ComposerAction.Slash -> ready
         running -> ready && (action == ComposerAction.Shell || view.followup == null)
         else -> view.can_send
@@ -393,14 +395,7 @@ private fun SettingChip(name: String, value: String, provider: String? = null,
     val leading: (@Composable () -> Unit)? = if (provider != null) {
         { ProviderGlyph(provider, Modifier.size(14.dp)) }
     } else icon?.let { resource -> {
-        Box(Modifier.size(16.dp)) {
-            if (fill < 1f) Icon(painterResource(resource), contentDescription = null,
-                tint = VerdeColors.Muted.copy(alpha = .32f), modifier = Modifier.fillMaxSize())
-            Icon(painterResource(resource), contentDescription = null, tint = VerdeColors.Muted,
-                modifier = Modifier.fillMaxSize().drawWithContent {
-                    clipRect(top = size.height * (1f - fill.coerceIn(0f, 1f))) { this@drawWithContent.drawContent() }
-                })
-        }
+        SettingGlyph(resource, fill)
     } }
     val controlModifier = modifier.semantics { contentDescription = "$name: $value. Change" }
     if (compact) {
@@ -415,6 +410,19 @@ private fun SettingChip(name: String, value: String, provider: String? = null,
         shape = RoundedCornerShape(14.dp), border = null,
         colors = AssistChipDefaults.assistChipColors(containerColor = VerdeColors.PanelAlt, labelColor = VerdeColors.Muted),
         modifier = controlModifier.widthIn(max = 220.dp))
+}
+
+/** Shared glyph rendering for toolbar controls and their picker rows. */
+@Composable
+private fun SettingGlyph(resource: Int, fill: Float = 1f) {
+        Box(Modifier.size(16.dp)) {
+            if (fill < 1f) Icon(painterResource(resource), contentDescription = null,
+                tint = VerdeColors.Muted.copy(alpha = .32f), modifier = Modifier.fillMaxSize())
+            Icon(painterResource(resource), contentDescription = null, tint = VerdeColors.Muted,
+                modifier = Modifier.fillMaxSize().drawWithContent {
+                    clipRect(top = size.height * (1f - fill.coerceIn(0f, 1f))) { this@drawWithContent.drawContent() }
+                })
+        }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -438,8 +446,22 @@ private fun PickerSheet(kind: ComposerPicker, view: ChatComposerView, provider: 
                 VerdeListRow(
                     headlineContent = { Text(choice.label) },
                     supportingContent = if (!choice.enabled) ({ Text(choice.reason ?: "Unavailable") }) else null,
-                    leadingContent = if (kind == ComposerPicker.Provider) ({ ProviderGlyph(choice.id) }) else if (choice.favorite) ({ Icon(Icons.Filled.Star, contentDescription = "Favourite") }) else null,
-                    trailingContent = if (selected) ({ Icon(Icons.Filled.Check, contentDescription = "Selected") }) else null,
+                    leadingContent = {
+                        when (kind) {
+                            ComposerPicker.Provider -> ProviderGlyph(choice.id)
+                            ComposerPicker.Model -> ProviderGlyph(provider ?: "codex")
+                            ComposerPicker.Effort -> SettingGlyph(R.drawable.composer_reasoning,
+                                (choices.indexOf(choice) + 1).toFloat() / choices.size)
+                            ComposerPicker.Speed -> SettingGlyph(if (choice.id == "on") R.drawable.composer_fast else R.drawable.composer_standard)
+                            ComposerPicker.Access -> SettingGlyph(if (choice.id == "full_access") R.drawable.composer_unlocked else R.drawable.composer_locked)
+                        }
+                    },
+                    trailingContent = {
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            if (choice.favorite) Icon(Icons.Filled.Star, contentDescription = "Favourite", modifier = Modifier.size(18.dp))
+                            if (selected) Icon(Icons.Filled.Check, contentDescription = "Selected")
+                        }
+                    },
                     modifier = Modifier.fillMaxWidth().clickable(enabled = choice.enabled && !selected) { onPick(choice.id) },
                 )
             }

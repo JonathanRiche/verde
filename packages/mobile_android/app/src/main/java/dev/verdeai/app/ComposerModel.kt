@@ -136,6 +136,11 @@ internal class ComposerModel(
     /** A send, slash command or attachment change is being handed to the core. */
     var busy by mutableStateOf(false)
         private set
+    /** Immediate presentation while the core persists/reprojects a selection. */
+    var pendingSelection by mutableStateOf<ChatSelection?>(null)
+        private set
+    private val selectionLock = Mutex()
+    private var selectionVersion = 0L
     var mention by mutableStateOf<ComposerToken?>(null)
         private set
     var slash by mutableStateOf<ComposerToken?>(null)
@@ -278,7 +283,7 @@ internal class ComposerModel(
     }
 
     private inline fun action(crossinline block: suspend () -> Unit) {
-        if (busy) return
+        if (busy || pendingSelection != null) return
         busy = true
         notice = null
         scope.launch { try { block() } finally { busy = false } }
@@ -360,9 +365,9 @@ internal class ComposerModel(
         if (accept && composerAction(text) == ComposerAction.Shell) clearIfUnchanged(text)
     }
 
-    fun select(picker: ComposerPicker, id: String) = action {
-        val composer = chat.latestComposer() ?: return@action
-        val s = composer.selection
+    fun select(picker: ComposerPicker, id: String) {
+        if (busy) return
+        val s = pendingSelection ?: chat.latestComposer()?.selection ?: return
         val next = when (picker) {
             ComposerPicker.Provider -> ChatSelection(provider=id, model=null, effort=null, access=s.access, speed=null)
             ComposerPicker.Model -> s.copy(model=id)
@@ -370,11 +375,31 @@ internal class ComposerModel(
             ComposerPicker.Access -> s.copy(access=id)
             ComposerPicker.Speed -> s.copy(speed=id)
         }
-        var op = choose(next)
-        // A new model may not offer the old effort or speed; fall back to its defaults.
-        if (op?.state == "failed" && op.error?.code == "invalid_selection" && picker == ComposerPicker.Model) op = choose(next.copy(effort=null, speed=null))
-        if (op != null && op.state != "failed") slashRequested = false
-        fail(op)
+        val version = ++selectionVersion
+        pendingSelection = next
+        notice = null
+        scope.launch {
+            try {
+                selectionLock.withLock {
+                    var op = choose(next)
+                    // A new model may not offer the old effort or speed.
+                    if (op?.state == "failed" && op.error?.code == "invalid_selection" && picker == ComposerPicker.Model) {
+                        op = choose(next.copy(effort=null, speed=null))
+                    }
+                    if (op != null && op.state != "failed") {
+                        slashRequested = false
+                        val confirmed = chat.latestComposer()?.selection
+                        // Hand off to the UI projection without briefly showing its old value.
+                        withTimeoutOrNull(5_000) {
+                            chat.state.first { it.composer?.selection == confirmed }
+                        }
+                    }
+                    if (version == selectionVersion) fail(op)
+                }
+            } finally {
+                if (version == selectionVersion) pendingSelection = null
+            }
+        }
     }
 
     private suspend fun choose(s: ChatSelection) = chat.dispatch { id, n, w -> EventComposerSelect(now_ms=n, wall_time_ms=w, intent_id=id,
