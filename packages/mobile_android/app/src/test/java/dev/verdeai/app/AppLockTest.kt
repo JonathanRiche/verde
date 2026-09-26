@@ -91,6 +91,40 @@ class AppLockTest {
         assertTrue(lock.state.value.locked)
     }
 
+    @Test fun pickersVerdeOpensGetAShortGrace() {
+        enabled(RelockAfter.immediately)
+        val lock = model()
+        lock.unlock(auth); auth.finish(AuthOutcome.Success)
+        lock.expectResult()
+        away(AppLockModel.RESULT_GRACE_MS - 1)
+        assertFalse(lock.state.value.locked)
+        // Grace covers only the trip it was requested for.
+        away(1)
+        assertTrue(lock.state.value.locked)
+        lock.unlock(auth); auth.finish(AuthOutcome.Success)
+        lock.expectResult()
+        away(AppLockModel.RESULT_GRACE_MS)
+        assertTrue(lock.state.value.locked)
+        lock.unlock(auth); auth.finish(AuthOutcome.Success)
+        // A pick too quick to background Verde leaves no stale grace behind.
+        lock.expectResult()
+        lock.resumed()
+        away(1)
+        assertTrue(lock.state.value.locked)
+    }
+
+    @Test fun graceNeverShortensALongerSetting() {
+        enabled(RelockAfter.five_minutes)
+        val lock = model()
+        lock.unlock(auth); auth.finish(AuthOutcome.Success)
+        lock.expectResult()
+        away(RelockAfter.five_minutes.millis - 1)
+        assertFalse(lock.state.value.locked)
+        lock.expectResult()
+        away(RelockAfter.five_minutes.millis)
+        assertTrue(lock.state.value.locked)
+    }
+
     @Test fun cancellingThePromptDoesNotLoopIt() {
         enabled()
         val lock = model()

@@ -44,6 +44,16 @@ class MainActivity : ComponentActivity() {
         val auth = AndroidDeviceAuth(this)
         setContent { VerdeApp(hosts, browse, lock = AppLockControls(lock, auth)) }
     }
+    // Every ActivityResult launcher (pickers, camera) funnels through here.
+    @Deprecated("Deprecated in ComponentActivity")
+    override fun startActivityForResult(intent: Intent, requestCode: Int, options: Bundle?) {
+        (application as VerdeApplication).appLock.expectResult()
+        @Suppress("DEPRECATION") super.startActivityForResult(intent, requestCode, options)
+    }
+    override fun onResume() {
+        super.onResume()
+        (application as VerdeApplication).appLock.resumed()
+    }
     override fun onDestroy() {
         if (isFinishing) (application as VerdeApplication).appLock.cancelPrompt()
         super.onDestroy()

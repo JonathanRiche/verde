@@ -92,6 +92,8 @@ internal class AppLockModel(
     private var attempt = 0
     private var cancelPrompt: (() -> Unit)? = null
     private var promptClosedAway = false
+    private var resultPending = false
+    private var awayForResult = false
 
     init {
         scope.launch {
@@ -118,7 +120,11 @@ internal class AppLockModel(
     internal fun onForeground(visible: Boolean) {
         if (!visible) {
             // The system credential screen backgrounds Verde; that time is not "away".
-            if (!state.value.authenticating && backgroundedAt == null) backgroundedAt = now()
+            if (!state.value.authenticating && backgroundedAt == null) {
+                backgroundedAt = now()
+                awayForResult = resultPending
+            }
+            resultPending = false
             return
         }
         val since = backgroundedAt
@@ -127,12 +133,21 @@ internal class AppLockModel(
         promptClosedAway = false
         refresh()
         // Coming back from the credential screen is neither a relock nor a reason to re-prompt.
+        val forResult = awayForResult
+        awayForResult = false
         if (returningFromPrompt || since == null) return
         val current = state.value
+        // A picker or camera Verde opened gets a short grace so attaching a photo doesn't relock.
+        val limit = if (forResult) maxOf(current.settings.relock_after.millis, RESULT_GRACE_MS) else current.settings.relock_after.millis
         if (current.locked) mutableState.update { it.copy(autoPrompt = !it.authenticating) }
-        else if (current.loaded && current.settings.enabled && current.available &&
-            now() - since >= current.settings.relock_after.millis) lock()
+        else if (current.loaded && current.settings.enabled && current.available && now() - since >= limit) lock()
     }
+
+    /** Verde is starting an activity for a result (photo/file picker, camera). */
+    fun expectResult() { resultPending = true }
+
+    /** Verde is visible again; a result trip too short to count as background is over. */
+    fun resumed() { resultPending = false }
 
     fun lock() {
         if (!state.value.settings.enabled || !deviceSecure()) return
@@ -207,6 +222,7 @@ internal class AppLockModel(
 
     companion object {
         const val KEY = "android/1/app-lock"
+        const val RESULT_GRACE_MS = 60_000L
         const val NO_SCREEN_LOCK = "Set a screen lock on this phone to use app lock."
         private val LockJson = Json { ignoreUnknownKeys = true; encodeDefaults = true; coerceInputValues = true }
     }
