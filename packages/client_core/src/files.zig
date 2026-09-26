@@ -20,7 +20,7 @@ const FILE_TIMEOUT_MS: u32 = 30_000;
 /// Office conversion runs LibreOffice on the host.
 const PREVIEW_TIMEOUT_MS: u32 = 120_000;
 
-pub const Kind = enum { file, preview };
+pub const Kind = enum { file, preview, theme };
 const Fetch = struct {
     intent_id: []const u8,
     path: []const u8,
@@ -42,10 +42,10 @@ pub fn intent(tx: *h.Transaction, tag: []const u8, event: V) E!void {
     const a = tx.allocator();
     const id = try h.string(event, "intent_id");
     const r = try h.decode(struct { path: []const u8, kind: Kind, max_bytes: u32 }, a, event);
-    if (!validPath(r.path)) return settle(tx, id, failure("invalid_path", "This file link can't be opened.", false));
+    if (if (r.kind == .theme) !eq(r.path, "/") else !validPath(r.path)) return settle(tx, id, failure("invalid_path", "This file link can't be opened.", false));
     if (tx.state.files.fetches.len >= MAX_FETCHES) return settle(tx, id, failure("busy", "Too many files are loading.", true));
     if (gate(tx)) |err| return settle(tx, id, err);
-    const fetch: Fetch = .{ .intent_id = id, .path = r.path, .kind = r.kind, .max_bytes = @min(r.max_bytes, MAX_FILE_BYTES) };
+    const fetch: Fetch = .{ .intent_id = id, .path = r.path, .kind = r.kind, .max_bytes = @min(r.max_bytes, if (r.kind == .theme) 64 * 1024 else MAX_FILE_BYTES) };
     try add(tx, fetch);
     operation(tx, id, "pending", null);
     try pump(tx);
@@ -114,8 +114,12 @@ fn send(tx: *h.Transaction, f: Fetch) E![]const u8 {
     const origin = tx.state.config.https_url orelse return error.InvalidLifecycle;
     var url: std.ArrayList(u8) = .empty;
     try url.appendSlice(a, std.mem.trimEnd(u8, origin, "/"));
-    try url.appendSlice(a, if (f.kind == .preview) "/api/preview?path=" else "/api/file?path=");
-    for (f.path) |c| {
+    try url.appendSlice(a, switch (f.kind) {
+        .preview => "/api/preview?path=",
+        .file => "/api/file?path=",
+        .theme => "/api/theme",
+    });
+    for (if (f.kind == .theme) "" else f.path) |c| {
         if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~' or c == '/') {
             try url.append(a, c);
         } else try url.print(a, "%{X:0>2}", .{c});

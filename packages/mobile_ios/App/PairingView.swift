@@ -123,7 +123,7 @@ struct PairingView: View {
                     .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { scanning = false } } }
                 }
             }
-        }.tint(VerdeTheme.accent).font(VerdeTheme.ui()).foregroundStyle(VerdeTheme.text).preferredColorScheme(.dark)
+        }.tint(VerdeTheme.accent).font(VerdeTheme.ui()).foregroundStyle(VerdeTheme.text).preferredColorScheme(AppearanceSettings.shared.scheme)
     }
 
     private func clearSecrets() { link = ""; grant = ""; code = ""; manualHost = "" }

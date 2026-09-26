@@ -1215,6 +1215,8 @@ Shared rules:
   blur.
 - **Done when:** tests pass.
 
+- **Implemented:** native PDFKit/Office, downsampled zoomable images, Markdown/source and citation line reveal; bounded pinned file transport with platform-only bytes; explicit protected Share/Open-in copies with cleanup. Settings adds host/system/Verde theme mapping, reduced motion, device-owner app lock with Keychain settings and monotonic timeout, and a privacy window covering sheets/app-switcher snapshots. The additive core theme fetch regenerates both native models. Mac build and 109 tests, core 197 tests, model checks, Android build and 238 tests pass. A local ad-hoc-signed simulator reviewed Settings and background/resume. Real iPhone signing, Face ID, and file/Share hand-checks remain pending. See `packages/mobile_ios/docs/files-security.md`.
+
 #### I-10 · Push + NSE + actionable notifications
 - **depends:** I-05, K-17, C-02, H-05
 - **Do:**

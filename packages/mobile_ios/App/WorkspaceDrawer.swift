@@ -12,6 +12,7 @@ struct WorkspaceDrawer: View {
     let close: () -> Void
     let open: (BrowseRoute) -> Void
     let root: (RootTab) -> Void
+    let settings: () -> Void
     @State private var folded: Set<String> = []
     @State private var search = ""
     @State private var manage: ManageModel?
@@ -78,6 +79,7 @@ struct WorkspaceDrawer: View {
                 }.padding(.horizontal, 8)
             }
             Divider().overlay(VerdeTheme.border)
+            row("Settings", icon: "gearshape", action: settings).padding(.horizontal, 8)
             row(browse.state.row?.saved.label ?? "Hosts", icon: "desktopcomputer", selected: tab == .hosts) { root(.hosts) }.accessibilityIdentifier("drawer-hosts").padding(8)
         }
         .background(VerdeTheme.panel).foregroundStyle(VerdeTheme.text)

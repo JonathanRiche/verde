@@ -111,7 +111,7 @@ final class CoreHostTests: XCTestCase {
     /// are handled without failing the host: the fetch is refused with a bodiless transport
     /// failure so the core settles its intent, and the unknown effect is dropped.
     @MainActor
-    func testUnsupportedAndUnknownEffectsNeverFailTheHost() async throws {
+    func testUnknownEffectAndInvalidFileEndpointNeverFailTheHost() async throws {
         final class RawCore: HostCore {
             let responses = EventLog()
             var first = true
@@ -120,7 +120,7 @@ final class CoreHostTests: XCTestCase {
                 responses.append(event)
                 guard first else { return Data(#"{"api_version":1,"revision":"2","effects":[]}"#.utf8) }
                 first = false
-                return Data(#"{"api_version":1,"revision":"1","effects":[{"type":"hologram_project","effect_id":"future","generation":"1","beam":"on"},{"type":"file_fetch","effect_id":"fetch","generation":"7","intent_id":"intent-file","url":"https://bridge.invalid/api/file?path=/w/a.md","headers":[{"name":"Authorization","value":"Bearer t"}],"timeout_ms":3000,"max_response_bytes":1000,"tls":{"origin":"https://bridge.invalid","spki_sha256":"\#(String(repeating: "a", count: 64))"}},{"type":"state_changed","effect_id":"state","generation":"1","revision":"1","scopes":["hosts"]}]}"#.utf8)
+                return Data(#"{"api_version":1,"revision":"1","effects":[{"type":"hologram_project","effect_id":"future","generation":"1","beam":"on"},{"type":"file_fetch","effect_id":"fetch","generation":"7","intent_id":"intent-file","url":"http://bridge.invalid/api/file?path=/w/a.md","headers":[{"name":"Authorization","value":"Bearer t"}],"timeout_ms":3000,"max_response_bytes":1000,"tls":{"origin":"https://bridge.invalid","spki_sha256":"\#(String(repeating: "a", count: 64))"}},{"type":"state_changed","effect_id":"state","generation":"1","revision":"1","scopes":["hosts"]}]}"#.utf8)
             }
             func query(_ selector: String) throws -> Data {
                 Data(#"{"api_version":1,"revision":"1","data":{"items":[],"operations":[]},"error":null}"#.utf8)
@@ -133,11 +133,11 @@ final class CoreHostTests: XCTestCase {
         try await host.send(.start(EventStart(now_ms: 0, wall_time_ms: 0, foreground: true, network_available: true)))
         let responses = { core.responses.all.compactMap { event -> EventHttpResponse? in
             if case .http_response(let e) = event { return e }; return nil } }
-        try await waitUntil("file_fetch refused") { !responses().isEmpty && store.hosts != nil }
+        try await waitUntil("invalid file endpoint refused") { !responses().isEmpty && store.hosts != nil }
         let refusal = try XCTUnwrap(responses().first)
         XCTAssertEqual(refusal.effect_id, "fetch"); XCTAssertEqual(refusal.generation, "7")
         XCTAssertNil(refusal.status); XCTAssertNil(refusal.body_base64); XCTAssertTrue(refusal.headers.isEmpty)
-        XCTAssertEqual(refusal.error?.kind, .network); XCTAssertEqual(refusal.error?.code, .unavailable)
+        XCTAssertEqual(refusal.error?.kind, .tls); XCTAssertEqual(refusal.error?.code, .certificate)
         XCTAssertFalse(store.failed)
         // The host stays usable after both.
         try await host.send(.foreground(EventForeground(now_ms: 0, wall_time_ms: 0)))

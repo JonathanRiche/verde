@@ -115,6 +115,12 @@ struct EffectList: Decodable {
 protocol CoreTransport: AnyObject {
     func execute(_ effect: Effect, emit: @escaping (Event) -> Void)
     func stop()
+    func takeFile(_ id: String) -> FileBytes?
+    func discardFile(_ id: String)
+}
+extension CoreTransport {
+    func takeFile(_ id: String) -> FileBytes? { nil }
+    func discardFile(_ id: String) {}
 }
 
 actor CoreHost {
@@ -210,7 +216,7 @@ actor CoreHost {
              .shell_confirm, .followup_submit, .followup_retry, .followup_pull_back, .followup_cancel,
              .new_chat_select, .thread_create, .thread_rename, .thread_close, .thread_sync,
              .workspace_create, .workspace_rename, .workspace_archive, .workspace_close,
-             .directory_list, .history_search, .history_load_more,
+             .directory_list, .history_search, .history_load_more, .file_open,
              // Terminal intents: e.g. an unencodable key or the 32-record limit.
              // A rejected device reply is dropped, never replayed.
              .terminal_create, .terminal_attach, .terminal_detach, .terminal_kill,
@@ -224,6 +230,9 @@ actor CoreHost {
         guard !stopped else { throw CoreBridgeError.closed }
         return try core.query(selector)
     }
+
+    func takeFile(_ id: String) -> FileBytes? { transport.takeFile(id) }
+    func discardFile(_ id: String) { transport.discardFile(id) }
 
     // MARK: Terminals (K-12)
 

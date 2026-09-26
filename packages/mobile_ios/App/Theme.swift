@@ -2,19 +2,19 @@ import SwiftUI
 
 /// The web palette and the Android baseline, shared by every native screen.
 enum VerdeTheme {
-    static let background = Color(hex: 0x0d1213)
-    static let panel = Color(hex: 0x20272a)
-    static let alternate = Color(hex: 0x28292e)
-    static let mutedPanel = Color(hex: 0x38393e)
-    static let border = Color(hex: 0x3c474c)
-    static let text = Color(hex: 0xf0f0f5)
-    static let muted = Color(hex: 0xb9bbc3)
-    static let subtle = Color(hex: 0x787887)
-    static let accent = Color(hex: 0x50c878)
-    static let warning = Color(hex: 0xfbbf24)
-    static let danger = Color(hex: 0xff6464)
-    static let user = Color(hex: 0x2a4636)
-    static let assistant = Color(hex: 0x161c1e)
+    static var background: Color { AppearanceSettings.shared.color("background", fallback: 0x0d1213, light: 0xf5f7f6) }
+    static var panel: Color { AppearanceSettings.shared.color("panel", fallback: 0x20272a, light: 0xffffff) }
+    static var alternate: Color { AppearanceSettings.shared.color("panel_alt", fallback: 0x28292e, light: 0xe9eeeb) }
+    static var mutedPanel: Color { AppearanceSettings.shared.color("panel_muted", fallback: 0x38393e, light: 0xdde5e0) }
+    static var border: Color { AppearanceSettings.shared.color("border", fallback: 0x3c474c, light: 0xc2ccc6) }
+    static var text: Color { AppearanceSettings.shared.color("text", fallback: 0xf0f0f5, light: 0x15221b) }
+    static var muted: Color { AppearanceSettings.shared.color("text_muted", fallback: 0xb9bbc3, light: 0x46594e) }
+    static var subtle: Color { AppearanceSettings.shared.color("text_subtle", fallback: 0x787887, light: 0x607267) }
+    static var accent: Color { AppearanceSettings.shared.color("accent", fallback: 0x50c878, light: 0x197d43) }
+    static var warning: Color { AppearanceSettings.shared.color("warning", fallback: 0xfbbf24, light: 0xa36800) }
+    static var danger: Color { AppearanceSettings.shared.color("diff_remove", fallback: 0xff6464, light: 0xb52828) }
+    static var user: Color { AppearanceSettings.shared.color("selection", fallback: 0x2a4636, light: 0xd8eddf) }
+    static var assistant: Color { AppearanceSettings.shared.color("background", fallback: 0x161c1e, light: 0xffffff) }
     static func ui(_ size: CGFloat = 15, bold: Bool = false) -> Font { .custom(bold ? "NotoSans-Bold" : "NotoSans-Regular", size: size, relativeTo: .body) }
     static func display(_ size: CGFloat = 24) -> Font { .custom("CalSans-Regular", size: size, relativeTo: .title2) }
     static func mono(_ size: CGFloat = 13) -> Font { .custom("JetBrainsMonoNF-Regular", size: size, relativeTo: .body) }
@@ -61,9 +61,9 @@ struct Pulse: ViewModifier {
     var period = 1.6
     @Environment(\.accessibilityReduceMotion) private var reduced
     func body(content: Content) -> some View {
-        TimelineView(.animation(minimumInterval: 1 / 30, paused: !active || reduced)) { context in
+        TimelineView(.animation(minimumInterval: 1 / 30, paused: !active || reduced || AppearanceSettings.shared.reducedMotion)) { context in
             let phase = context.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: period) / period
-            content.opacity(active && !reduced ? minimum + (1 - minimum) * (1 - cos(phase * 2 * .pi)) / 2 : 1)
+            content.opacity(active && !reduced && !AppearanceSettings.shared.reducedMotion ? minimum + (1 - minimum) * (1 - cos(phase * 2 * .pi)) / 2 : 1)
         }
     }
 }

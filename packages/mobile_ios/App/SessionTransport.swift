@@ -7,10 +7,14 @@ import CryptoKit
 final class SessionTransport: CoreTransport {
     private let queue = DispatchQueue(label: "dev.verdeai.core.transport")
     private var operations: [String: SessionOperation] = [:]
+    private let files = FileBuffer()
+    func takeFile(_ id: String) -> FileBytes? { files.take(id) }
+    func discardFile(_ id: String) { files.discard(id) }
 
     func execute(_ effect: Effect, emit: @escaping (Event) -> Void) {
         queue.async {
             switch effect {
+            case .file_fetch(let e): self.start(id: e.effect_id, effect: effect, emit: emit)
             case .http_request(let e): self.start(id: e.effect_id, effect: effect, emit: emit)
             case .tls_probe(let e): self.start(id: e.effect_id, effect: effect, emit: emit)
             case .ws_open(let e): self.start(id: e.effect_id, effect: effect, emit: emit)
@@ -31,20 +35,9 @@ final class SessionTransport: CoreTransport {
         }
     }
 
-    /// The completion reporting `effect` as unsupported, if the core awaits one.
-    /// D-12 `file_fetch` has no iOS viewer until I-09: it fails like an unreachable
-    /// transport with no status, headers or body, so no file bytes are ever read.
-    static func refusal(_ effect: Effect) -> Event? {
-        switch effect {
-        case .file_fetch(let e):
-            return .http_response(EventHttpResponse(now_ms: 0, wall_time_ms: 0, effect_id: e.effect_id,
-                generation: e.generation, status: nil, headers: [], body_base64: nil,
-                error: TransportFailure(kind: .network, code: .unavailable)))
-        default: return nil
-        }
-    }
+    static func refusal(_ effect: Effect) -> Event? { nil }
     private func start(id: String, effect: Effect, emit: @escaping (Event) -> Void) {
-        let operation = SessionOperation(effect: effect, queue: queue, emit: emit) { [weak self] in
+        let operation = SessionOperation(effect: effect, queue: queue, emit: emit, fileReceived: { [files] id, bytes in files.put(id, bytes) }) { [weak self] in
             self?.operations.removeValue(forKey: id)
         }
         operations[id] = operation
@@ -54,6 +47,7 @@ final class SessionTransport: CoreTransport {
         queue.async {
             let active = Array(self.operations.values)
             active.forEach { $0.cancel() }
+            self.files.clear()
         }
     }
 }
@@ -120,6 +114,8 @@ enum TLSPolicy {
 
 final class SessionOperation: NSObject, URLSessionDataDelegate, URLSessionWebSocketDelegate, @unchecked Sendable {
     private let effect: Effect
+    private let fileIntent: String?
+    private let fileReceived: (String, FileBytes) -> Void
     private let queue: DispatchQueue
     private let emit: (Event) -> Void
     private let ended: () -> Void
@@ -132,8 +128,13 @@ final class SessionOperation: NSObject, URLSessionDataDelegate, URLSessionWebSoc
     private var pendingSends: [String] = []
     private var sending = false
 
-    init(effect: Effect, queue: DispatchQueue, emit: @escaping (Event) -> Void, ended: @escaping () -> Void) {
-        self.effect = effect; self.queue = queue; self.emit = emit; self.ended = ended
+    init(effect: Effect, queue: DispatchQueue, emit: @escaping (Event) -> Void, fileReceived: @escaping (String, FileBytes) -> Void = { _, _ in }, ended: @escaping () -> Void) {
+        if case .file_fetch(let e) = effect {
+            self.effect = .http_request(EffectHttpRequest(effect_id: e.effect_id, generation: e.generation, method: "GET", url: e.url, headers: e.headers, body_base64: nil, timeout_ms: e.timeout_ms, max_response_bytes: min(e.max_response_bytes, 32 * 1024 * 1024), tls: e.tls))
+            fileIntent = e.intent_id
+        } else { self.effect = effect; fileIntent = nil }
+        self.fileReceived = fileReceived
+        self.queue = queue; self.emit = emit; self.ended = ended
     }
     private var policy: (origin: String, pin: String?) {
         switch effect {
@@ -251,11 +252,14 @@ final class SessionOperation: NSObject, URLSessionDataDelegate, URLSessionWebSoc
         if let error { failure = failure ?? Self.map(error) }
         switch effect {
         case .http_request(let e):
+            if let fileIntent, failure == nil, let response, (200..<300).contains(response.statusCode) {
+                fileReceived(fileIntent, FileBytes(data: body, mime: response.mimeType))
+            }
             let headers = response?.allHeaderFields.map { Header(name: String(describing: $0.key), value: String(describing: $0.value)) } ?? []
             emit(.http_response(EventHttpResponse(now_ms: 0, wall_time_ms: 0,
                 effect_id: e.effect_id, generation: e.generation,
                 status: failure == nil ? response.map { UInt16($0.statusCode) } : nil,
-                headers: failure == nil ? headers : [], body_base64: failure == nil ? body.base64EncodedString() : nil, error: failure)))
+                headers: failure == nil && fileIntent == nil ? headers : [], body_base64: failure == nil && fileIntent == nil ? body.base64EncodedString() : nil, error: failure)))
         case .tls_probe(let e):
             emit(.tls_peer(EventTlsPeer(now_ms: 0, wall_time_ms: 0, effect_id: e.effect_id,
                 generation: e.generation, origin: e.origin, spki_sha256: "", system_trusted: false)))
@@ -348,6 +352,7 @@ final class SessionOperation: NSObject, URLSessionDataDelegate, URLSessionWebSoc
         session = nil
         task = nil
         pendingSends.removeAll()
+        body.removeAll()
         ended()
     }
     private static func map(_ error: Error) -> TransportFailure {

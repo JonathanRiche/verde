@@ -12,6 +12,7 @@ struct VerdeApp: App {
     @State private var browse: BrowseModel
 
     init() {
+        SharedFile.cleanup()
         VerdeTheme.configure()
         let hosts = HostsModel.live(deviceLabel: UIDevice.current.name)
         _hosts = State(initialValue: hosts)
@@ -38,8 +39,11 @@ struct RootView: View {
     @State private var drawer = false
     @Environment(\.accessibilityReduceMotion) private var reducedMotion
     @State private var monitor = NetworkMonitor()
+    @State private var lock = AppLock()
+    @State private var appearance = AppearanceSettings.shared
+    @State private var settings = false
 
-    var body: some View {
+    @ViewBuilder private var shell: some View {
         let actions = BrowseActions(hosts: { tab = .hosts }, pair: {
             tab = .hosts
             hosts.showPairing(hosts.active)
@@ -60,22 +64,51 @@ struct RootView: View {
                     WorkspaceDrawer(browse: browse, selected: path.last, tab: tab, close: { drawer = false }, open: { route in
                         if tab == .hosts { tab = .home }
                         path.append(route); drawer = false
-                    }, root: { next in tab = next; path = []; drawer = false })
+                    }, root: { next in tab = next; path = []; drawer = false }, settings: { drawer = false; settings = true })
                     .allowsHitTesting(true).disabled(false).zIndex(2)
                     .frame(width: min(380, geometry.size.width * 0.92))
                     .transition(.move(edge: .leading))
                 }
             }
-            .animation(reducedMotion ? nil : .easeOut(duration: 0.2), value: drawer)
+            .animation(reducedMotion || appearance.reducedMotion ? nil : .easeOut(duration: 0.2), value: drawer)
             .environment(\.openWorkspaceDrawer, { drawer = true })
             .background(VerdeTheme.background.ignoresSafeArea())
         }
-        .preferredColorScheme(.dark)
+    }
+
+    private var styled: some View {
+        shell
+        .preferredColorScheme(appearance.scheme)
         .tint(VerdeTheme.accent)
         .foregroundStyle(VerdeTheme.text)
         .font(VerdeTheme.ui())
         .scrollContentBackground(.hidden)
         .environment(\.defaultMinListRowHeight, 44)
+        .accessibilityHidden(lock.covered)
+        .background(SecurityShield(lock: lock, covered: lock.covered).frame(width: 0, height: 0))
+        .sheet(isPresented: $settings) { AppSettings(lock: lock, browse: browse) }
+    }
+
+    private var themeRefreshKey: String {
+        [browse.hostID ?? "", appearance.mode.rawValue, browse.state.host?.auth_state ?? "", String(!lock.inactive), String(lock.locked)].joined(separator: "/")
+    }
+    private var lifecycleContent: some View {
+        styled
+        .task(id: themeRefreshKey) {
+            if !lock.inactive && lock.loaded && !lock.locked { await appearance.refresh(browse) }
+        }
+        .onChange(of: lock.locked) { _, _ in hosts.foreground(!lock.inactive && lock.loaded && !lock.locked) }
+        // The shield owns another UIWindow; UIKit notifications keep its lifecycle
+        // independent of the covered SwiftUI view's scene environment.
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
+            lock.phase(.background)
+            hosts.foreground(false)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            lock.phase(.active)
+            hosts.foreground(lock.loaded && !lock.locked)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in lock.inactive = true }
         .onChange(of: hosts.active) { _, _ in
             // Routes belong to the previous host's projections.
             path = []
@@ -83,9 +116,17 @@ struct RootView: View {
         }
         .onChange(of: scenePhase, initial: true) { _, phase in
             // `.inactive` (app switcher, system sheets) keeps the current state.
-            if phase != .inactive { hosts.foreground(phase == .active) }
+            lock.phase(phase)
+            if phase != .inactive { hosts.foreground(phase == .active && lock.loaded && !lock.locked) }
         }
+    }
+
+    var body: some View {
+        lifecycleContent
         .task {
+            lock.load()
+            lock.phase(UIApplication.shared.applicationState == .active ? .active : .inactive)
+            hosts.foreground(!lock.inactive && lock.loaded && !lock.locked)
             // Prefer the first path so new cores get start → network → foreground.
             monitor.start { state in
                 hosts.network(state)

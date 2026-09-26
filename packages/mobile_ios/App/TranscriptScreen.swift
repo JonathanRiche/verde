@@ -69,6 +69,7 @@ struct TranscriptScreen: View {
 }
 
 private struct TranscriptBody: View {
+    @State private var file: ViewerRequest?
     let model: TranscriptModel
     let browse: BrowseModel
     let onHosts: () -> Void
@@ -94,10 +95,13 @@ private struct TranscriptBody: View {
             ChatComposer(model: model.input)
         }
         .environment(\.openURL, OpenURLAction { url in
-            // File citations open in the I-09 viewer; until then they are inert, never sent to the system.
-            if url.scheme == citationScheme { return .handled }
+            if url.scheme == citationScheme {
+                if let citation = citation(from: url) { file = ViewerRequest(citation: citation) }
+                return .handled
+            }
             return safeLinkUrl(url.absoluteString) != nil ? .systemAction : .discarded
         })
+        .sheet(item: $file) { request in FileViewer(browse: browse, workspaceID: model.workspaceID, citation: request.citation) }
     }
 }
 
@@ -156,6 +160,7 @@ private struct BottomOffsetKey: PreferenceKey {
 /// Starts at the newest row; older pages prepend above without moving the reading position,
 /// and new output is followed only while the reader is at the bottom.
 private struct TranscriptList: View {
+    @Environment(\.accessibilityReduceMotion) private var reducedMotion
     let model: TranscriptModel
     let page: ChatPage?
     let approval: ChatApproval?
@@ -214,7 +219,7 @@ private struct TranscriptList: View {
 
                     ApprovalBanner(approval: approval, cardVisible: cardVisible, controller: model.approvals) {
                         guard let approval else { return }
-                        withAnimation { proxy.scrollTo("approval:\(approval.turn_id):\(approval.call_id)", anchor: .center) }
+                        withAnimation(reducedMotion || AppearanceSettings.shared.reducedMotion ? nil : .default) { proxy.scrollTo("approval:\(approval.turn_id):\(approval.call_id)", anchor: .center) }
                     }
 
                     if !atBottom && !items.isEmpty {
@@ -223,7 +228,7 @@ private struct TranscriptList: View {
                             HStack {
                                 Spacer()
                                 Button {
-                                    withAnimation { proxy.scrollTo(bottomID, anchor: .bottom) }
+                                    withAnimation(reducedMotion || AppearanceSettings.shared.reducedMotion ? nil : .default) { proxy.scrollTo(bottomID, anchor: .bottom) }
                                 } label: {
                                     Image(systemName: "arrow.down").font(.body.weight(.semibold)).padding(12)
                                         .background(.regularMaterial, in: Circle()).shadow(radius: 2)

@@ -191,3 +191,16 @@ test "a 401 refreshes the bearer once and resends; a stale completion is ignored
     try eql("unauthorized", f.op(opened.id).@"error".?.code);
     try expect(f.host.state.files.fetches.len == 0);
 }
+
+test "theme fetch uses the authenticated endpoint and a small bounded response" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const invalid = try f.open("/other", "theme", 1024);
+    try expect(find(invalid.batch, "file_fetch") == null);
+    const opened = try f.open("/", "theme", files.MAX_FILE_BYTES);
+    const fetch = find(opened.batch, "file_fetch").?;
+    try eql("https://host.example/api/theme", fetch.object.get("url").?.string);
+    try expect(fetch.object.get("max_response_bytes").?.integer == 64 * 1024);
+    _ = try f.respond(fetch, 200, null);
+    try eql("succeeded", f.op(opened.id).state);
+}

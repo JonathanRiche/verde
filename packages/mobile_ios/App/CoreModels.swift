@@ -6074,6 +6074,7 @@ enum AttentionKind: String, Codable {
 enum FileKind: String, Codable {
     case `file`
     case `preview`
+    case `theme`
 }
 
 enum AttentionStatus: String, Codable {

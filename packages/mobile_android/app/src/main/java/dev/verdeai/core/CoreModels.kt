@@ -1559,6 +1559,7 @@ enum class AttentionKind {
 enum class FileKind {
     `file`,
     `preview`,
+    `theme`,
 }
 
 @Serializable
